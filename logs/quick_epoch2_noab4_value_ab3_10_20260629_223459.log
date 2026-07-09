@@ -1,0 +1,21 @@
+{'progress': 'scoreboard_chunk', 'track': '2p_no_trade', 'opponent': 'catanatron_value', 'chunk_index': 5, 'chunk_count': 10, 'games': 1, 'wins': 0}
+{'progress': 'scoreboard_chunk', 'track': '2p_no_trade', 'opponent': 'catanatron_value', 'chunk_index': 2, 'chunk_count': 10, 'games': 1, 'wins': 1}
+{'progress': 'scoreboard_chunk', 'track': '2p_no_trade', 'opponent': 'catanatron_value', 'chunk_index': 7, 'chunk_count': 10, 'games': 1, 'wins': 1}
+{'progress': 'scoreboard_chunk', 'track': '2p_no_trade', 'opponent': 'catanatron_value', 'chunk_index': 6, 'chunk_count': 10, 'games': 1, 'wins': 0}
+{'progress': 'scoreboard_chunk', 'track': '2p_no_trade', 'opponent': 'catanatron_value', 'chunk_index': 3, 'chunk_count': 10, 'games': 1, 'wins': 0}
+{'progress': 'scoreboard_chunk', 'track': '2p_no_trade', 'opponent': 'catanatron_value', 'chunk_index': 0, 'chunk_count': 10, 'games': 1, 'wins': 0}
+{'progress': 'scoreboard_chunk', 'track': '2p_no_trade', 'opponent': 'catanatron_value', 'chunk_index': 9, 'chunk_count': 10, 'games': 1, 'wins': 0}
+{'progress': 'scoreboard_chunk', 'track': '2p_no_trade', 'opponent': 'catanatron_value', 'chunk_index': 8, 'chunk_count': 10, 'games': 1, 'wins': 0}
+{'progress': 'scoreboard_chunk', 'track': '2p_no_trade', 'opponent': 'catanatron_ab3', 'chunk_index': 7, 'chunk_count': 10, 'games': 1, 'wins': 1}
+{'progress': 'scoreboard_chunk', 'track': '2p_no_trade', 'opponent': 'catanatron_ab3', 'chunk_index': 1, 'chunk_count': 10, 'games': 1, 'wins': 0}
+{'progress': 'scoreboard_chunk', 'track': '2p_no_trade', 'opponent': 'catanatron_ab3', 'chunk_index': 8, 'chunk_count': 10, 'games': 1, 'wins': 1}
+{'progress': 'scoreboard_chunk', 'track': '2p_no_trade', 'opponent': 'catanatron_value', 'chunk_index': 1, 'chunk_count': 10, 'games': 1, 'wins': 0}
+{'progress': 'scoreboard_chunk', 'track': '2p_no_trade', 'opponent': 'catanatron_ab3', 'chunk_index': 5, 'chunk_count': 10, 'games': 1, 'wins': 0}
+{'progress': 'scoreboard_chunk', 'track': '2p_no_trade', 'opponent': 'catanatron_value', 'chunk_index': 4, 'chunk_count': 10, 'games': 1, 'wins': 0}
+{'progress': 'scoreboard_chunk', 'track': '2p_no_trade', 'opponent': 'catanatron_ab3', 'chunk_index': 0, 'chunk_count': 10, 'games': 1, 'wins': 0}
+{'progress': 'scoreboard_chunk', 'track': '2p_no_trade', 'opponent': 'catanatron_ab3', 'chunk_index': 6, 'chunk_count': 10, 'games': 1, 'wins': 0}
+{'progress': 'scoreboard_chunk', 'track': '2p_no_trade', 'opponent': 'catanatron_ab3', 'chunk_index': 9, 'chunk_count': 10, 'games': 1, 'wins': 0}
+{'progress': 'scoreboard_chunk', 'track': '2p_no_trade', 'opponent': 'catanatron_ab3', 'chunk_index': 3, 'chunk_count': 10, 'games': 1, 'wins': 1}
+{'progress': 'scoreboard_chunk', 'track': '2p_no_trade', 'opponent': 'catanatron_ab3', 'chunk_index': 4, 'chunk_count': 10, 'games': 1, 'wins': 0}
+{'progress': 'scoreboard_chunk', 'track': '2p_no_trade', 'opponent': 'catanatron_ab3', 'chunk_index': 2, 'chunk_count': 10, 'games': 1, 'wins': 1}
+{'candidate': 'runs/bc/entity_graph_35m_2p10_hq_1000parts_cumulative_shardddp_bs4k_20260629_200420/checkpoint_epoch0002.pt', 'candidate_kind': 'checkpoint', 'games_per_matchup': 10, 'chunk_games': 1, 'chunks': 20, 'elapsed_sec': 36.363737647014204, 'device': 'cpu', 'workers': 20, 'paired_seeds': True, 'results': [{'games': 10, 'candidate': 'entity_graph', 'opponent': 'catanatron_ab3', 'wins': 4, 'win_rate': 0.4, 'elo_vs_opponent': -70.4365036222725, 'seat_wins': {'BLUE': 2, 'RED': 2}, 'avg_decisions': 253.1, 'moves_to_win': 261.5, 'avg_candidate_win_decisions': 261.5, 'avg_candidate_vp': 7.1, 'avg_best_opponent_vp': 8.8, 'avg_vp_margin': -1.7, 'track': '2p_no_trade', 'confidence_interval_95': [0.09635810565733854, 0.7036418943426614], 'illegal_action_count': 0, 'timeouts_or_stuck_games': 0, 'chunks': 10}, {'games': 10, 'candidate': 'entity_graph', 'opponent': 'catanatron_value', 'wins': 2, 'win_rate': 0.2, 'elo_vs_opponent': -240.82399653118495, 'seat_wins': {'BLUE': 1, 'RED': 1}, 'avg_decisions': 188.6, 'moves_to_win': 123.0, 'avg_candidate_win_decisions': 123.0, 'avg_candidate_vp': 6.7, 'avg_best_opponent_vp': 8.8, 'avg_vp_margin': -2.1, 'track': '2p_no_trade', 'confidence_interval_95': [0.0, 0.447922568557201], 'illegal_action_count': 0, 'timeouts_or_stuck_games': 0, 'chunks': 10}]}

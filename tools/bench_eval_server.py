@@ -1,0 +1,346 @@
+#!/usr/bin/env python3
+"""CAT-67 eval-server prototype benchmark: cross-game leaf batching vs
+per-worker in-process evaluators, on the real Gumbel self-play loop.
+
+Two arms, identical checkpoint / node budget / seeds / game count, only the
+evaluator differs:
+  --mode local   : each worker builds its OWN EntityGraphRustEvaluator (its own
+                   CUDA context) -- reproduces the production N-contexts-on-1-GPU
+                   layout that CAT-87 showed is context-thrash-bound.
+  --mode server  : one EvalServer process holds the single policy; each worker
+                   uses a RemoteEvalClient (featurize+postprocess local, only
+                   forward_legal_np centralized) -> one CUDA context, cross-game
+                   batched forwards.
+
+Throughput is measured with a START BARRIER: every worker builds its evaluator
+and does one warmup eval, then blocks; the parent releases all of them at once
+and times the concurrent play phase, so staggered per-worker setup (esp. the
+local arm's per-worker model load) is excluded and the GPU contention is real.
+
+  tools/bench_eval_server.py --checkpoint ckpt.pt --device cuda:0 \
+      --mode server --workers 8 --games 2 --public-observation \
+      --n-full 16 --n-fast 16 --p-full 0.25 --c-visit 50 --c-scale 0.03 \
+      --base-seed 9800000001
+
+  tools/bench_eval_server.py --parity --checkpoint ckpt.pt --device cuda:0 \
+      --public-observation --num-evals 128
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import multiprocessing as mp
+import queue as queue_mod
+import tempfile
+import time
+from pathlib import Path
+from typing import Any
+
+
+def _build_configs(a: dict[str, Any], worker_seed: int):
+    from catan_zero.rl.gumbel_self_play import COLORS, GumbelSelfPlayConfig
+    from catan_zero.search.gumbel_chance_mcts import GumbelChanceMCTSConfig
+
+    config = GumbelSelfPlayConfig(
+        colors=COLORS,
+        max_decisions=int(a["max_decisions"]),
+        temperature_move_fraction=float(a["temperature_move_fraction"]),
+        temperature_high=1.0,
+        temperature_low=0.0,
+        correct_rust_chance_spectra=bool(a["correct_rust_chance_spectra"]),
+    )
+    search_config = GumbelChanceMCTSConfig(
+        colors=COLORS,
+        max_depth=int(a["max_depth"]),
+        seed=int(worker_seed),
+        c_visit=float(a["c_visit"]),
+        c_scale=float(a["c_scale"]),
+        prior_temperature=1.0,
+        n_full=int(a["n_full"]),
+        n_fast=int(a["n_fast"]),
+        p_full=float(a["p_full"]),
+        correct_rust_chance_spectra=bool(a["correct_rust_chance_spectra"]),
+        lazy_interior_chance=bool(a["lazy_interior_chance"]),
+    )
+    return config, search_config
+
+
+def _worker(
+    mode: str,
+    wid: int,
+    a: dict[str, Any],
+    server_args: tuple | None,
+    ready_q: "mp.Queue",
+    start_event: "mp.Event",
+    result_q: "mp.Queue",
+) -> None:
+    import torch
+
+    torch.set_num_threads(1)
+    from catan_zero.rl.gumbel_self_play import COLORS, run_worker_games
+    from catan_zero.search.neural_rust_mcts import (
+        EntityGraphRustEvaluator,
+        EntityGraphRustEvaluatorConfig,
+    )
+
+    eval_config = EntityGraphRustEvaluatorConfig(
+        public_observation=bool(a["public_observation"]),
+        rust_featurize=True,
+    )
+
+    if mode == "server":
+        from catan_zero.search.eval_server import RemoteEvalClient
+
+        request_queue, response_queue, action_size, trained_masked = server_args
+        evaluator: Any = RemoteEvalClient(
+            request_queue,
+            response_queue,
+            wid,
+            action_size=action_size,
+            trained_with_masked_hidden_info=trained_masked,
+            config=eval_config,
+            client_timeout_ms=float(a["client_timeout_ms"]),
+        )
+    else:
+        evaluator = EntityGraphRustEvaluator.from_checkpoint(
+            a["checkpoint"], device=a["device"], config=eval_config
+        )
+
+    games = int(a["games"])
+    base_seed = int(a["base_seed"])
+    game_index_start = wid * games
+    worker_seed = base_seed + 100003 * (wid + 1)
+    config, search_config = _build_configs(a, worker_seed)
+
+    # Warmup: play ONE decision's worth of eval to warm topology + CUDA kernels,
+    # by running a 1-game/short probe is heavy; instead do a single evaluate on a
+    # fresh game's root so the barrier-timed phase is steady-state.
+    try:
+        import catanatron_rs
+
+        g = catanatron_rs.Game.simple(list(COLORS), seed=worker_seed)
+        legal = tuple(int(x) for x in g.playable_action_indices(list(COLORS), None))
+        if legal:
+            evaluator.evaluate(g, legal, root_color=str(g.current_color()), colors=COLORS)
+    except Exception as exc:  # pragma: no cover
+        result_q.put({"wid": wid, "error": f"warmup: {exc!r}"})
+        ready_q.put(wid)
+        start_event.wait()
+        return
+
+    ready_q.put(wid)
+    start_event.wait()
+
+    t0 = time.perf_counter()
+    with tempfile.TemporaryDirectory(prefix=f"cat67_w{wid}_") as td:
+        try:
+            summary = run_worker_games(
+                out_dir=Path(td),
+                games=games,
+                game_index_start=game_index_start,
+                base_seed=base_seed,
+                worker_seed=worker_seed,
+                config=config,
+                search_config=search_config,
+                evaluator=evaluator,
+                shard_size=100000,
+                fmt="npz",
+            )
+        except Exception as exc:  # pragma: no cover
+            result_q.put({"wid": wid, "error": f"play: {exc!r}"})
+            return
+    dt = time.perf_counter() - t0
+    result_q.put(
+        {
+            "wid": wid,
+            "rows": int(summary.get("rows", 0)),
+            "decisions": int(summary.get("decisions_total", 0)),
+            "games_completed": int(summary.get("games_completed", 0)),
+            "play_sec": dt,
+        }
+    )
+
+
+def _run_arm(mode: str, a: dict[str, Any]) -> dict[str, Any]:
+    ctx = mp.get_context("spawn")
+    workers = int(a["workers"])
+    ready_q = ctx.Queue()
+    start_event = ctx.Event()
+    result_q = ctx.Queue()
+
+    server = None
+    server_args_per_worker: list[tuple | None] = [None] * workers
+    if mode == "server":
+        from catan_zero.search.eval_server import EvalServer, EvalServerConfig
+
+        server = EvalServer(
+            a["checkpoint"],
+            num_clients=workers,
+            config=EvalServerConfig(
+                max_batch_size=int(a["max_batch_size"]),
+                max_wait_ms=float(a["max_wait_ms"]),
+                device=a["device"],
+            ),
+            public_observation=bool(a["public_observation"]),
+            mp_context=ctx,
+        )
+        server.start()
+        meta = server.wait_ready(timeout=180.0)
+        for wid in range(workers):
+            server_args_per_worker[wid] = (
+                server.request_queue,
+                server.response_queues[wid],
+                int(meta["action_size"]),
+                bool(meta["trained_with_masked_hidden_info"]),
+            )
+
+    procs = []
+    for wid in range(workers):
+        p = ctx.Process(
+            target=_worker,
+            args=(mode, wid, a, server_args_per_worker[wid], ready_q, start_event, result_q),
+            daemon=False,
+        )
+        p.start()
+        procs.append(p)
+
+    # Barrier: wait for all workers to finish setup + warmup.
+    ready = 0
+    ready_deadline = time.perf_counter() + 300.0
+    while ready < workers and time.perf_counter() < ready_deadline:
+        try:
+            ready_q.get(timeout=5.0)
+            ready += 1
+        except queue_mod.Empty:
+            pass
+    if ready < workers:
+        for p in procs:
+            p.terminate()
+        raise TimeoutError(f"only {ready}/{workers} workers reached the barrier")
+
+    wall0 = time.perf_counter()
+    start_event.set()
+
+    results = []
+    for _ in range(workers):
+        try:
+            results.append(result_q.get(timeout=1800.0))
+        except queue_mod.Empty:
+            break
+    for p in procs:
+        p.join(timeout=30.0)
+    wall = time.perf_counter() - wall0
+
+    server_stats = {}
+    if server is not None:
+        server_stats = server.stop()
+
+    errors = [r for r in results if "error" in r]
+    ok = [r for r in results if "error" not in r]
+    total_rows = sum(r["rows"] for r in ok)
+    total_games = sum(r["games_completed"] for r in ok)
+    return {
+        "mode": mode,
+        "workers": workers,
+        "wall_sec": wall,
+        "total_rows": total_rows,
+        "total_games": total_games,
+        "rows_per_hour": round(total_rows / wall * 3600) if wall > 0 else 0,
+        "rows_per_sec": round(total_rows / wall, 3) if wall > 0 else 0,
+        "per_worker": sorted(ok, key=lambda r: r["wid"]),
+        "errors": errors,
+        "server_stats": server_stats,
+    }
+
+
+def _parity(a: dict[str, Any]) -> dict[str, Any]:
+    import numpy as np
+    import torch
+
+    torch.set_num_threads(1)
+    from bench_leaf_eval_batching import _collect_leaf_states
+    from catan_zero.rl.gumbel_self_play import COLORS
+    from catan_zero.search.eval_server import EvalServer, EvalServerConfig, RemoteEvalClient
+    from catan_zero.search.neural_rust_mcts import (
+        EntityGraphRustEvaluator,
+        EntityGraphRustEvaluatorConfig,
+    )
+
+    cfg = EntityGraphRustEvaluatorConfig(
+        public_observation=bool(a["public_observation"]), rust_featurize=True
+    )
+    states = _collect_leaf_states(num_states=int(a["num_evals"]), seed=int(a["seed"]))
+
+    local = EntityGraphRustEvaluator.from_checkpoint(a["checkpoint"], device=a["device"], config=cfg)
+    local_res = [
+        local.evaluate(g, l, root_color=r, colors=COLORS) for (g, l, r) in states
+    ]
+
+    ctx = mp.get_context("spawn")
+    server = EvalServer(
+        a["checkpoint"], num_clients=1,
+        config=EvalServerConfig(max_batch_size=int(a["max_batch_size"]), max_wait_ms=0.0, device=a["device"]),
+        public_observation=bool(a["public_observation"]), mp_context=ctx,
+    )
+    server.start()
+    meta = server.wait_ready(timeout=180.0)
+    client = RemoteEvalClient(
+        server.request_queue, server.response_queues[0], 0,
+        action_size=int(meta["action_size"]),
+        trained_with_masked_hidden_info=bool(meta["trained_with_masked_hidden_info"]),
+        config=cfg,
+    )
+    srv_res = [client.evaluate(g, l, root_color=r, colors=COLORS) for (g, l, r) in states]
+    server.stop()
+
+    max_prior = 0.0
+    max_value = 0.0
+    for (pl, vl), (ps, vs) in zip(local_res, srv_res):
+        assert pl.keys() == ps.keys()
+        for k in pl:
+            max_prior = max(max_prior, abs(pl[k] - ps[k]))
+        max_value = max(max_value, abs(vl - vs))
+    return {
+        "num_evals": len(states),
+        "max_prior_absdiff": max_prior,
+        "max_value_absdiff": max_value,
+        "within_1e-5": bool(max_prior < 1e-5 and max_value < 1e-5),
+    }
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--checkpoint", required=True)
+    ap.add_argument("--device", default="cuda:0")
+    ap.add_argument("--mode", choices=["local", "server"], default="local")
+    ap.add_argument("--workers", type=int, default=8)
+    ap.add_argument("--games", type=int, default=2)
+    ap.add_argument("--base-seed", type=int, default=9800000001)
+    ap.add_argument("--public-observation", action="store_true")
+    ap.add_argument("--n-full", type=int, default=16)
+    ap.add_argument("--n-fast", type=int, default=16)
+    ap.add_argument("--p-full", type=float, default=0.25)
+    ap.add_argument("--c-visit", type=float, default=50.0)
+    ap.add_argument("--c-scale", type=float, default=0.03)
+    ap.add_argument("--max-decisions", type=int, default=600)
+    ap.add_argument("--max-depth", type=int, default=80)
+    ap.add_argument("--temperature-move-fraction", type=float, default=0.15)
+    ap.add_argument("--lazy-interior-chance", action="store_true")
+    ap.add_argument("--correct-rust-chance-spectra", action="store_true")
+    ap.add_argument("--max-batch-size", type=int, default=64)
+    ap.add_argument("--max-wait-ms", type=float, default=3.0)
+    ap.add_argument("--client-timeout-ms", type=float, default=20000.0)
+    ap.add_argument("--parity", action="store_true")
+    ap.add_argument("--num-evals", type=int, default=128)
+    ap.add_argument("--seed", type=int, default=7)
+    args = ap.parse_args()
+    a = vars(args)
+
+    if args.parity:
+        print(json.dumps(_parity(a), indent=2))
+        return
+    print(json.dumps(_run_arm(args.mode, a), indent=2, default=str))
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,18 @@
+2026-06-30T08:04:15+00:00 b200_queue rows=65536 min_rows=100000 import_root=runs/data/a100_imports
+2026-06-30T08:14:17+00:00 b200_queue rows=65536 min_rows=100000 import_root=runs/data/a100_imports
+Traceback (most recent call last):
+  File "<stdin>", line 20, in <module>
+  File "/home/ubuntu/catan-zero/.venv/lib/python3.11/site-packages/numpy/lib/_npyio_impl.py", line 471, in load
+    ret = NpzFile(fid, own_fid=own_fid, allow_pickle=allow_pickle,
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ubuntu/catan-zero/.venv/lib/python3.11/site-packages/numpy/lib/_npyio_impl.py", line 197, in __init__
+    _zip = zipfile_factory(fid)
+           ^^^^^^^^^^^^^^^^^^^^
+  File "/home/ubuntu/catan-zero/.venv/lib/python3.11/site-packages/numpy/lib/_npyio_impl.py", line 112, in zipfile_factory
+    return zipfile.ZipFile(file, *args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.11/zipfile.py", line 1329, in __init__
+    self._RealGetContents()
+  File "/usr/lib/python3.11/zipfile.py", line 1396, in _RealGetContents
+    raise BadZipFile("File is not a zip file")
+zipfile.BadZipFile: File is not a zip file

@@ -1,0 +1,23 @@
+.venv/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+uv.lock
+runs/
+checkpoints/
+*.pt
+# Top-level datasets only (anchored). The unanchored form also matched
+# src/catan_zero/data -- the colonist SOURCE package -- leaving it untracked
+# and breaking fresh worktrees/clones (task #75). runs/ covers runs/data.
+/data/
+*.npy
+*.parquet
+*memmap*/
+*.bundle
+/.catan_fleet.conf
+*.fleet.conf
+
+# CAT-137: fleet host config carries live IPs — keep out of the repo (use the .example + $FLEET_CONF)
+/configs/gpu_cluster_hosts.json
+# CAT-137/consolidator: runtime append-log (test exhaust), never a curated baseline
+configs/config_registry.jsonl

@@ -1,0 +1,506 @@
+"""Distributed-PPO backbone: the on-disk contract shared by the Modal actors and the
+GPU learner.
+
+The actor fleet (``tools/modal_ppo_factory.py``) and the learner
+(``tools/ppo_distributed_learner.py``) never talk directly — they coordinate ONLY through a
+shared run directory (a Modal volume path, or any shared filesystem):
+
+    {run_root}/
+      policy/
+        weights_v{N}.pt     # versioned weights for policy version N (self-describing)
+        current.pt          # back-compat copy/symlink of the latest weights_v{N}.pt
+        version.json        # {"version": int, "step": int, "updated_at": float, "weights": "weights_v{N}.pt"}
+      trajectories/
+        {worker_id}/
+          shard_000123.pkl  # a pickled list[PPOTrajectory] from one actor
+      consumed/
+        {worker_id}__shard_000123.pkl   # empty marker; learner marks shards it has ingested
+      checkpoints/          # periodic learner checkpoints
+      league/               # League.save() / League.load() (see league.py)
+      eval/                 # scoreboard json outputs
+
+This module owns: path layout, atomic weight versioning, and trajectory-shard read/write +
+the consumed-marker protocol. It is deliberately agnostic to the policy's checkpoint format —
+the learner passes a ``save_fn(path)`` (e.g. ``policy.save``) and the actor loads from the
+returned path with its own loader. Pure stdlib + pickle; no torch/env import at module load.
+"""
+from __future__ import annotations
+
+import json
+import os
+import pickle
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Callable, Iterator
+
+POLICY_DIRNAME = "policy"
+CURRENT_WEIGHTS_NAME = "current.pt"
+VERSION_FILENAME = "version.json"
+VERSIONED_WEIGHTS_GLOB = "weights_v*.pt"
+# How many old versioned weight files to keep on disk (newest N). The rest are GC'd by
+# publish_weights so a multi-day run does not accumulate hundreds of stale checkpoints.
+KEEP_VERSIONED_WEIGHTS = 3
+TRAJ_DIRNAME = "trajectories"
+CONSUMED_DIRNAME = "consumed"
+CHECKPOINTS_DIRNAME = "checkpoints"
+LEAGUE_DIRNAME = "league"
+EVAL_DIRNAME = "eval"
+
+
+# ----------------------------------------------------------------------------- paths
+def run_root(base: str | os.PathLike, run_name: str) -> Path:
+    return Path(base) / run_name
+
+
+def policy_dir(root: str | os.PathLike) -> Path:
+    return Path(root) / POLICY_DIRNAME
+
+
+def current_weights_path(root: str | os.PathLike) -> Path:
+    """Back-compat path to the latest weights (a copy of ``weights_v{N}.pt``).
+
+    Prefer ``read_version(root).path`` (which points at the version-stamped file) when you need
+    the bytes to match the policy version you stamp. ``current.pt`` is maintained for callers that
+    only want "the latest weights" and do not care about the version tie-break.
+    """
+    return policy_dir(root) / CURRENT_WEIGHTS_NAME
+
+
+def versioned_weights_path(root: str | os.PathLike, version: int) -> Path:
+    return policy_dir(root) / f"weights_v{int(version)}.pt"
+
+
+def version_path(root: str | os.PathLike) -> Path:
+    return policy_dir(root) / VERSION_FILENAME
+
+
+def trajectories_dir(root: str | os.PathLike, worker_id: str | None = None) -> Path:
+    base = Path(root) / TRAJ_DIRNAME
+    return base / worker_id if worker_id else base
+
+
+def consumed_dir(root: str | os.PathLike) -> Path:
+    return Path(root) / CONSUMED_DIRNAME
+
+
+def checkpoints_dir(root: str | os.PathLike) -> Path:
+    return Path(root) / CHECKPOINTS_DIRNAME
+
+
+def league_dir(root: str | os.PathLike) -> Path:
+    return Path(root) / LEAGUE_DIRNAME
+
+
+def eval_dir(root: str | os.PathLike) -> Path:
+    return Path(root) / EVAL_DIRNAME
+
+
+def ensure_run_dirs(root: str | os.PathLike) -> None:
+    for d in (policy_dir(root), trajectories_dir(root), consumed_dir(root),
+              checkpoints_dir(root), league_dir(root), eval_dir(root)):
+        Path(d).mkdir(parents=True, exist_ok=True)
+
+
+# ------------------------------------------------------------------- weight versioning
+@dataclass(frozen=True)
+class PublishedVersion:
+    version: int
+    step: int
+    updated_at: float
+    path: str  # absolute path to the version-stamped weights (weights_v{version}.pt)
+
+
+def _gc_versioned_weights(root: str | os.PathLike, *, keep: int = KEEP_VERSIONED_WEIGHTS) -> int:
+    """Delete all but the newest ``keep`` ``weights_v{N}.pt`` files. Returns count removed."""
+    pdir = policy_dir(root)
+    versioned: list[tuple[int, Path]] = []
+    for p in pdir.glob(VERSIONED_WEIGHTS_GLOB):
+        try:
+            n = int(p.stem.split("_v", 1)[1])
+        except (IndexError, ValueError):
+            continue
+        versioned.append((n, p))
+    versioned.sort(key=lambda t: t[0], reverse=True)
+    removed = 0
+    for _, p in versioned[keep:]:
+        try:
+            p.unlink()
+            removed += 1
+        except OSError:
+            pass
+    return removed
+
+
+def publish_weights(root: str | os.PathLike, save_fn: Callable[[str], Any], *, step: int) -> PublishedVersion:
+    """Atomically publish new weights so version and bytes can NEVER disagree (FIX H1).
+
+    ``save_fn(tmp_path)`` must write a loadable checkpoint. The protocol:
+
+      1. write ``weights_v{N}.tmp`` then ``os.replace`` -> ``weights_v{N}.pt`` (version-stamped,
+         atomic on the same fs);
+      2. refresh the back-compat ``current.pt`` copy (best-effort; not the source of truth);
+      3. atomically swap ``version.json`` to ``{"version": N, "weights": "weights_v{N}.pt", ...}``.
+
+    Because the weights filename is itself version-stamped, ``read_version`` returns
+    ``(version=N, path=weights_v{N}.pt)`` and an actor that stamps ``policy_version=N`` is
+    guaranteed to have loaded the matching bytes — even if the learner publishes N+1 in between.
+    Old ``weights_v{N}.pt`` files are GC'd keeping the newest ``KEEP_VERSIONED_WEIGHTS``.
+    """
+    pdir = policy_dir(root)
+    pdir.mkdir(parents=True, exist_ok=True)
+    prev = read_version(root)
+    version = (prev.version + 1) if prev else 1
+
+    final = versioned_weights_path(root, version)
+    tmp = final.with_suffix(final.suffix + ".tmp")
+    save_fn(str(tmp))
+    os.replace(tmp, final)  # atomic rename -> version-stamped weights
+
+    # Back-compat: refresh current.pt as a copy of the just-published weights. Best-effort:
+    # version.json (not current.pt) is the source of truth, so a failure here is non-fatal.
+    try:
+        cur = current_weights_path(root)
+        cur_tmp = cur.with_suffix(cur.suffix + ".tmp")
+        cur_tmp.write_bytes(final.read_bytes())
+        os.replace(cur_tmp, cur)
+    except OSError:
+        pass
+
+    meta = {
+        "version": version,
+        "step": int(step),
+        "updated_at": time.time(),
+        "weights": final.name,
+    }
+    vtmp = version_path(root).with_suffix(".json.tmp")
+    vtmp.write_text(json.dumps(meta))
+    os.replace(vtmp, version_path(root))  # atomic swap -> now points at weights_v{N}.pt
+
+    _gc_versioned_weights(root)
+    return PublishedVersion(version=version, step=int(step), updated_at=meta["updated_at"], path=str(final))
+
+
+def read_version(root: str | os.PathLike) -> PublishedVersion | None:
+    """Return the published version + the path to the version-stamped weights it describes.
+
+    The returned ``path`` points at ``weights_v{N}.pt`` (the file named in ``version.json``), so the
+    bytes always match ``version`` (FIX H1). Falls back to ``current.pt`` only for versions written
+    by the legacy publisher (no ``weights`` key); returns ``None`` if neither exists.
+    """
+    vp = version_path(root)
+    if not vp.exists():
+        return None
+    try:
+        meta = json.loads(vp.read_text())
+    except (json.JSONDecodeError, OSError):
+        return None
+    version = int(meta.get("version", 0))
+    weights_name = meta.get("weights")
+    if weights_name:
+        wpath = policy_dir(root) / str(weights_name)
+    else:  # legacy version.json without a versioned filename: fall back to current.pt
+        wpath = current_weights_path(root)
+    if not wpath.exists():
+        return None
+    return PublishedVersion(
+        version=version,
+        step=int(meta.get("step", 0)),
+        updated_at=float(meta.get("updated_at", 0.0)),
+        path=str(wpath),
+    )
+
+
+# --------------------------------------------------------------- trajectory shards
+def write_trajectory_shard(root: str | os.PathLike, worker_id: str, shard_index: int,
+                           trajectories: list[Any], *, policy_version: int) -> Path:
+    """Pickle a list[PPOTrajectory] to ``trajectories/{worker_id}/shard_{n:06d}.pkl`` atomically.
+
+    Wrapped in an envelope so the learner can filter by policy_version (staleness) and worker.
+    """
+    wdir = trajectories_dir(root, worker_id)
+    wdir.mkdir(parents=True, exist_ok=True)
+    path = wdir / f"shard_{shard_index:06d}.pkl"
+    tmp = path.with_suffix(".pkl.tmp")
+    envelope = {
+        "worker_id": worker_id,
+        "shard_index": int(shard_index),
+        "policy_version": int(policy_version),
+        "created_at": time.time(),
+        "trajectories": trajectories,
+    }
+    with open(tmp, "wb") as fh:
+        pickle.dump(envelope, fh, protocol=pickle.HIGHEST_PROTOCOL)
+    os.replace(tmp, path)
+    return path
+
+
+def read_trajectory_shard(path: str | os.PathLike) -> dict[str, Any]:
+    """Return the envelope dict; ``envelope['trajectories']`` is the list[PPOTrajectory]."""
+    with open(path, "rb") as fh:
+        return pickle.load(fh)
+
+
+def _consumed_marker(root: str | os.PathLike, shard_path: Path) -> Path:
+    # flatten {worker_id}/{shard}.pkl -> {worker_id}__{shard}.pkl marker
+    rel = shard_path.relative_to(trajectories_dir(root))
+    return consumed_dir(root) / str(rel).replace(os.sep, "__")
+
+
+def iter_unconsumed_shards(root: str | os.PathLike, *, max_shards: int | None = None,
+                           min_policy_version: int = 0, stable_secs: float = 0.0,
+                           with_envelope: bool = False, newest_first: bool = False,
+                           volume_reload_fn: Callable[[], Any] | None = None) -> Iterator[Any]:
+    """Yield shard paths not yet marked consumed.
+
+    ``min_policy_version`` drops over-stale shards (actor weights too old — staleness bound).
+    ``stable_secs`` skips shards written within the last N seconds (avoid reading mid-write on
+    filesystems without atomic rename guarantees; default 0 trusts the atomic rename).
+
+    FIX C2a (freshest-first): with the default ``newest_first=False`` shards are yielded
+    OLDEST-first (worker dir name asc, then ``shard_*`` index asc — the original behavior the
+    self-test relies on). With ``newest_first=True`` shards are yielded by ``policy_version`` DESC
+    then mtime DESC, so when actors outrun the learner it trains on the FRESHEST data instead of
+    the stalest. Reading the version requires deserializing the envelope; that deserialization is
+    reused (no second read) and is also surfaced when ``with_envelope=True``.
+
+    FIX 5 (efficiency): when ``with_envelope=True`` this yields ``(path, envelope)`` tuples,
+    reusing the envelope already deserialized for the staleness/ordering check so the learner does
+    NOT deserialize each shard a second time. With the default ``with_envelope=False`` it yields
+    bare ``Path`` objects (back-compatible; the ``__main__`` self-test relies on this). When
+    ``with_envelope`` (or ``newest_first``) is set, the envelope is deserialized even when
+    ``min_policy_version <= 0`` so callers always get a payload / a version to sort on.
+
+    FIX 6 (Modal volume visibility): an optional ``volume_reload_fn`` is invoked once up front so
+    a learner running as a Modal function can call ``volume.reload()`` and see actor writes before
+    listing shards. It is a no-op when ``None`` (plain-process runs).
+    """
+    if volume_reload_fn is not None:
+        try:
+            volume_reload_fn()
+        except Exception:  # reload is best-effort; never crash the learner on it
+            pass
+    base = trajectories_dir(root)
+    if not base.exists():
+        return
+    cdir = consumed_dir(root)
+    cdir.mkdir(parents=True, exist_ok=True)
+    now = time.time()
+    # When we need the envelope at all (staleness drop, payload, or version-based ordering) we
+    # must deserialize. newest_first additionally needs the version+mtime up front to sort.
+    need_envelope = min_policy_version > 0 or with_envelope or newest_first
+
+    if not newest_first:
+        # ---- streaming oldest-first (original behavior; cheap when no envelope needed) ----
+        count = 0
+        for worker in sorted(base.iterdir()):
+            if not worker.is_dir():
+                continue
+            for shard in sorted(worker.glob("shard_*.pkl")):
+                if _consumed_marker(root, shard).exists():
+                    continue
+                if stable_secs > 0.0 and (now - shard.stat().st_mtime) < stable_secs:
+                    continue
+                envelope = None
+                if need_envelope:
+                    try:
+                        envelope = read_trajectory_shard(shard)
+                    except (pickle.UnpicklingError, EOFError, OSError):
+                        continue
+                    if (
+                        min_policy_version > 0
+                        and int(envelope.get("policy_version", 0)) < min_policy_version
+                    ):
+                        mark_consumed(root, shard)  # too stale: drop it
+                        continue
+                yield (shard, envelope) if with_envelope else shard
+                count += 1
+                if max_shards is not None and count >= max_shards:
+                    return
+        return
+
+    # ---- newest-first: collect candidates, sort by policy_version DESC then mtime DESC ----
+    candidates: list[tuple[int, float, Path, Any]] = []
+    for worker in sorted(base.iterdir()):
+        if not worker.is_dir():
+            continue
+        for shard in sorted(worker.glob("shard_*.pkl")):
+            if _consumed_marker(root, shard).exists():
+                continue
+            try:
+                mtime = shard.stat().st_mtime
+            except OSError:
+                continue
+            if stable_secs > 0.0 and (now - mtime) < stable_secs:
+                continue
+            try:
+                envelope = read_trajectory_shard(shard)
+            except (pickle.UnpicklingError, EOFError, OSError):
+                continue
+            pv = int(envelope.get("policy_version", 0))
+            if min_policy_version > 0 and pv < min_policy_version:
+                mark_consumed(root, shard)  # too stale: drop it
+                continue
+            candidates.append((pv, mtime, shard, envelope))
+    candidates.sort(key=lambda t: (t[0], t[1]), reverse=True)  # version DESC, then mtime DESC
+    count = 0
+    for _, _, shard, envelope in candidates:
+        yield (shard, envelope) if with_envelope else shard
+        count += 1
+        if max_shards is not None and count >= max_shards:
+            return
+
+
+def sweep_drop_stale(root: str | os.PathLike, *, min_policy_version: int) -> int:
+    """Drop EVERY unconsumed shard whose ``policy_version < min_policy_version`` (FIX C2b).
+
+    Unlike ``iter_unconsumed_shards`` (which only inspects up to ``max_shards`` per call, so older
+    stale shards beyond that window accumulate forever), this scans ALL unconsumed shards and
+    ``mark_consumed``s the stale ones. This is the mechanism that actually bounds the trajectory
+    backlog when 600 actors outrun 1 learner. Returns the number of shards dropped.
+    """
+    base = trajectories_dir(root)
+    if not base.exists():
+        return 0
+    consumed_dir(root).mkdir(parents=True, exist_ok=True)
+    dropped = 0
+    for worker in sorted(base.iterdir()):
+        if not worker.is_dir():
+            continue
+        for shard in sorted(worker.glob("shard_*.pkl")):
+            if _consumed_marker(root, shard).exists():
+                continue
+            try:
+                envelope = read_trajectory_shard(shard)
+            except (pickle.UnpicklingError, EOFError, OSError):
+                continue
+            if int(envelope.get("policy_version", 0)) < min_policy_version:
+                mark_consumed(root, shard)
+                dropped += 1
+    return dropped
+
+
+def prune_consumed_markers(root: str | os.PathLike, *, older_than_secs: float) -> int:
+    """Delete consumed-marker files older than ``older_than_secs`` (FIX C4-support).
+
+    Each ingested shard leaves one empty marker inode in ``consumed/`` forever; over a multi-day
+    run with hundreds of thousands of shards these dominate the inode count. The learner calls this
+    periodically to prune markers old enough that their shards can no longer be re-listed. Returns
+    the number of markers pruned.
+    """
+    cdir = consumed_dir(root)
+    if not cdir.exists():
+        return 0
+    cutoff = time.time() - older_than_secs
+    pruned = 0
+    for marker in cdir.iterdir():
+        if not marker.is_file():
+            continue
+        try:
+            if marker.stat().st_mtime < cutoff:
+                marker.unlink()
+                pruned += 1
+        except OSError:
+            continue
+    return pruned
+
+
+def mark_consumed(root: str | os.PathLike, shard_path: str | os.PathLike) -> None:
+    """Mark a shard ingested: write its consumed-marker, then remove the shard (FIX M1).
+
+    Single-consumer invariant: exactly ONE learner consumes shards, so there is no race between
+    two markers. We always write the marker BEFORE removing the shard, so a crash between the two
+    leaves the shard discoverable-but-marked (it will be skipped, never double-ingested) rather
+    than lost. Removing an already-gone shard is ignored (idempotent / robust to retries).
+    """
+    marker = _consumed_marker(root, Path(shard_path))
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        marker.touch()  # record ingestion first
+    except OSError:
+        pass
+    try:
+        os.remove(shard_path)  # reclaim space; ignore if already gone
+    except FileNotFoundError:
+        pass
+    except OSError:
+        pass
+
+
+if __name__ == "__main__":  # lightweight self-test (no torch/env needed)
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as d:
+        root = run_root(d, "selftest")
+        ensure_run_dirs(root)
+        assert read_version(root) is None
+        v1 = publish_weights(root, lambda p: Path(p).write_text("w1"), step=10)
+        assert v1.version == 1 and Path(v1.path).read_text() == "w1"
+        v2 = publish_weights(root, lambda p: Path(p).write_text("w2"), step=20)
+        assert v2.version == 2 and read_version(root).version == 2
+
+        # FIX H1: read_version returns the VERSION-STAMPED weights path, and its bytes match the
+        # version (current.pt could be N+1 mid-publish; the versioned file never mis-stamps).
+        rv = read_version(root)
+        assert rv.path == str(versioned_weights_path(root, 2)), rv.path
+        assert Path(rv.path).name == "weights_v2.pt"
+        assert Path(rv.path).read_text() == "w2"
+        # current_weights_path stays back-compatible (latest weights, copy of weights_v2.pt).
+        assert current_weights_path(root).read_text() == "w2"
+        # FIX H1 GC: keep only the newest KEEP_VERSIONED_WEIGHTS versioned files.
+        for s in range(30, 30 + KEEP_VERSIONED_WEIGHTS + 2):
+            publish_weights(root, lambda p, s=s: Path(p).write_text(f"w{s}"), step=s)
+        versioned = sorted(policy_dir(root).glob(VERSIONED_WEIGHTS_GLOB))
+        assert len(versioned) == KEEP_VERSIONED_WEIGHTS, versioned
+        latest = read_version(root)
+        assert Path(latest.path).exists() and Path(latest.path).read_text() == f"w{30 + KEEP_VERSIONED_WEIGHTS + 1}"
+
+        p = write_trajectory_shard(root, "worker-A", 0, [{"fake": "traj"}], policy_version=2)
+        got = list(iter_unconsumed_shards(root))
+        assert got == [p], got
+        env = read_trajectory_shard(p)
+        assert env["trajectories"] == [{"fake": "traj"}] and env["policy_version"] == 2
+        mark_consumed(root, p)
+        assert list(iter_unconsumed_shards(root)) == []
+        # M1: marking an already-removed shard is a robust no-op (idempotent).
+        mark_consumed(root, p)
+
+        # staleness drop (default oldest-first path)
+        p2 = write_trajectory_shard(root, "worker-A", 1, [{"x": 1}], policy_version=1)
+        assert list(iter_unconsumed_shards(root, min_policy_version=2)) == []
+
+        # FIX C2a: newest_first yields by policy_version DESC then mtime DESC.
+        import tempfile as _t  # noqa: F401  (kept local; tempfile already imported)
+        a = write_trajectory_shard(root, "worker-A", 2, [{"v": 5}], policy_version=5)
+        b = write_trajectory_shard(root, "worker-B", 0, [{"v": 7}], policy_version=7)
+        c = write_trajectory_shard(root, "worker-C", 0, [{"v": 6}], policy_version=6)
+        oldest_first = list(iter_unconsumed_shards(root))  # default: worker dir asc
+        assert oldest_first == [a, b, c], oldest_first
+        newest = list(iter_unconsumed_shards(root, newest_first=True))
+        assert newest == [b, c, a], newest  # versions 7, 6, 5
+        # newest_first honours max_shards (freshest N) and with_envelope.
+        fresh1 = list(iter_unconsumed_shards(root, newest_first=True, max_shards=1, with_envelope=True))
+        assert len(fresh1) == 1 and fresh1[0][0] == b and fresh1[0][1]["policy_version"] == 7
+
+        # FIX C2b: sweep_drop_stale drops ALL stale shards, not just the first max_shards window.
+        for i in range(3, 13):
+            write_trajectory_shard(root, "worker-D", i, [{"old": i}], policy_version=4)
+        dropped = sweep_drop_stale(root, min_policy_version=6)
+        # worker-D (v4, x10) + a (v5) are below v6 -> 11 dropped; b/c (v7/v6) survive.
+        assert dropped == 11, dropped
+        survivors = sorted(s.name for s in [b, c])
+        remaining = sorted(s.name for s in iter_unconsumed_shards(root))
+        assert remaining == survivors, remaining
+
+        # FIX C4-support: prune_consumed_markers deletes old markers, keeps fresh ones.
+        markers = sorted(consumed_dir(root).iterdir())
+        assert markers, "expected consumed markers to exist"
+        old_marker = markers[0]
+        old_t = time.time() - 10_000
+        os.utime(old_marker, (old_t, old_t))
+        pruned = prune_consumed_markers(root, older_than_secs=3600)
+        assert pruned == 1, pruned
+        assert not old_marker.exists()
+        assert prune_consumed_markers(root, older_than_secs=3600) == 0  # rest are fresh
+
+        print("ppo_distributed self-test OK")

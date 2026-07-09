@@ -1,0 +1,156 @@
+{"progress": "rust_mcts_game", "game": 0, "seed": 1900, "candidate_color": "BLUE", "opponent_color": "RED", "winner": "RED", "candidate_won": false, "candidate_vp": 3, "opponent_vp": 10, "decisions": 171, "candidate_decisions": 72, "timed_out": false}
+{"progress": "rust_mcts_game", "game": 1, "seed": 1901, "candidate_color": "RED", "opponent_color": "BLUE", "winner": "BLUE", "candidate_won": false, "candidate_vp": 2, "opponent_vp": 10, "decisions": 149, "candidate_decisions": 62, "timed_out": false}
+{"progress": "rust_mcts_game", "game": 2, "seed": 1902, "candidate_color": "BLUE", "opponent_color": "RED", "winner": "RED", "candidate_won": false, "candidate_vp": 2, "opponent_vp": 10, "decisions": 172, "candidate_decisions": 71, "timed_out": false}
+{"progress": "rust_mcts_game", "game": 3, "seed": 1903, "candidate_color": "RED", "opponent_color": "BLUE", "winner": "BLUE", "candidate_won": false, "candidate_vp": 4, "opponent_vp": 10, "decisions": 174, "candidate_decisions": 81, "timed_out": false}
+{"progress": "rust_mcts_game", "game": 4, "seed": 1904, "candidate_color": "BLUE", "opponent_color": "RED", "winner": "RED", "candidate_won": false, "candidate_vp": 2, "opponent_vp": 10, "decisions": 139, "candidate_decisions": 60, "timed_out": false}
+{"progress": "rust_mcts_game", "game": 5, "seed": 1905, "candidate_color": "RED", "opponent_color": "BLUE", "winner": "BLUE", "candidate_won": false, "candidate_vp": 2, "opponent_vp": 10, "decisions": 158, "candidate_decisions": 69, "timed_out": false}
+{"progress": "rust_mcts_game", "game": 6, "seed": 1906, "candidate_color": "BLUE", "opponent_color": "RED", "winner": "RED", "candidate_won": false, "candidate_vp": 2, "opponent_vp": 10, "decisions": 212, "candidate_decisions": 102, "timed_out": false}
+{"progress": "rust_mcts_game", "game": 7, "seed": 1907, "candidate_color": "RED", "opponent_color": "BLUE", "winner": "BLUE", "candidate_won": false, "candidate_vp": 2, "opponent_vp": 10, "decisions": 131, "candidate_decisions": 60, "timed_out": false}
+{"progress": "rust_mcts_game", "game": 8, "seed": 1908, "candidate_color": "BLUE", "opponent_color": "RED", "winner": "RED", "candidate_won": false, "candidate_vp": 2, "opponent_vp": 10, "decisions": 166, "candidate_decisions": 69, "timed_out": false}
+{"progress": "rust_mcts_game", "game": 9, "seed": 1909, "candidate_color": "RED", "opponent_color": "BLUE", "winner": "BLUE", "candidate_won": false, "candidate_vp": 2, "opponent_vp": 10, "decisions": 226, "candidate_decisions": 102, "timed_out": false}
+{
+  "progress": "rust_mcts_summary",
+  "mode": "raw_neural",
+  "checkpoint": "runs/bc/entity_graph_35m_2p10_hq_1000parts_cumulative_shardddp_bs4k_20260629_200420/checkpoint_epoch0002.pt",
+  "opponent": "value_function",
+  "games": 10,
+  "wins": 0,
+  "win_rate": 0.0,
+  "avg_candidate_vp": 2.3,
+  "avg_opponent_vp": 10.0,
+  "timeouts": 0,
+  "elapsed_sec": 8.213643478986342,
+  "games_per_sec": 1.217486493732513,
+  "results": [
+    {
+      "game": 0,
+      "seed": 1900,
+      "candidate_color": "BLUE",
+      "opponent_color": "RED",
+      "winner": "RED",
+      "candidate_won": false,
+      "candidate_vp": 3,
+      "opponent_vp": 10,
+      "decisions": 171,
+      "candidate_decisions": 72,
+      "timed_out": false
+    },
+    {
+      "game": 1,
+      "seed": 1901,
+      "candidate_color": "RED",
+      "opponent_color": "BLUE",
+      "winner": "BLUE",
+      "candidate_won": false,
+      "candidate_vp": 2,
+      "opponent_vp": 10,
+      "decisions": 149,
+      "candidate_decisions": 62,
+      "timed_out": false
+    },
+    {
+      "game": 2,
+      "seed": 1902,
+      "candidate_color": "BLUE",
+      "opponent_color": "RED",
+      "winner": "RED",
+      "candidate_won": false,
+      "candidate_vp": 2,
+      "opponent_vp": 10,
+      "decisions": 172,
+      "candidate_decisions": 71,
+      "timed_out": false
+    },
+    {
+      "game": 3,
+      "seed": 1903,
+      "candidate_color": "RED",
+      "opponent_color": "BLUE",
+      "winner": "BLUE",
+      "candidate_won": false,
+      "candidate_vp": 4,
+      "opponent_vp": 10,
+      "decisions": 174,
+      "candidate_decisions": 81,
+      "timed_out": false
+    },
+    {
+      "game": 4,
+      "seed": 1904,
+      "candidate_color": "BLUE",
+      "opponent_color": "RED",
+      "winner": "RED",
+      "candidate_won": false,
+      "candidate_vp": 2,
+      "opponent_vp": 10,
+      "decisions": 139,
+      "candidate_decisions": 60,
+      "timed_out": false
+    },
+    {
+      "game": 5,
+      "seed": 1905,
+      "candidate_color": "RED",
+      "opponent_color": "BLUE",
+      "winner": "BLUE",
+      "candidate_won": false,
+      "candidate_vp": 2,
+      "opponent_vp": 10,
+      "decisions": 158,
+      "candidate_decisions": 69,
+      "timed_out": false
+    },
+    {
+      "game": 6,
+      "seed": 1906,
+      "candidate_color": "BLUE",
+      "opponent_color": "RED",
+      "winner": "RED",
+      "candidate_won": false,
+      "candidate_vp": 2,
+      "opponent_vp": 10,
+      "decisions": 212,
+      "candidate_decisions": 102,
+      "timed_out": false
+    },
+    {
+      "game": 7,
+      "seed": 1907,
+      "candidate_color": "RED",
+      "opponent_color": "BLUE",
+      "winner": "BLUE",
+      "candidate_won": false,
+      "candidate_vp": 2,
+      "opponent_vp": 10,
+      "decisions": 131,
+      "candidate_decisions": 60,
+      "timed_out": false
+    },
+    {
+      "game": 8,
+      "seed": 1908,
+      "candidate_color": "BLUE",
+      "opponent_color": "RED",
+      "winner": "RED",
+      "candidate_won": false,
+      "candidate_vp": 2,
+      "opponent_vp": 10,
+      "decisions": 166,
+      "candidate_decisions": 69,
+      "timed_out": false
+    },
+    {
+      "game": 9,
+      "seed": 1909,
+      "candidate_color": "RED",
+      "opponent_color": "BLUE",
+      "winner": "BLUE",
+      "candidate_won": false,
+      "candidate_vp": 2,
+      "opponent_vp": 10,
+      "decisions": 226,
+      "candidate_decisions": 102,
+      "timed_out": false
+    }
+  ]
+}

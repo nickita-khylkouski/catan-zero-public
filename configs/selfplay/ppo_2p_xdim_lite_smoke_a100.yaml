@@ -1,0 +1,39 @@
+{
+  "track": "2p_no_trade",
+  "algorithm": "ppo",
+  "arch": "xdim_lite",
+  "seed": 60628061,
+  "run_dir": "runs/self_play/ppo_2p_xdim_lite_smoke_a100",
+  "hidden_size": 512,
+  "vps_to_win": 5,
+  "iterations": 1,
+  "init_checkpoint": "runs/teacher/strong_bc_20260628_024017/xdim_lite_strong_bc.pt",
+  "rollout": {
+    "decisions_per_rank": 2048,
+    "workers": 1,
+    "max_decisions_per_game": 800,
+    "gamma": 0.997,
+    "gae_lambda": 0.95
+  },
+  "ppo": {
+    "epochs": 1,
+    "minibatch_size": 4096,
+    "clip_ratio": 0.15,
+    "entropy_coef": 0.01,
+    "value_coef": 0.5,
+    "max_grad_norm": 1.0,
+    "lr": 0.0002,
+    "value_clip_range": 0.2
+  },
+  "opponents": {
+    "baseline": "random"
+  },
+  "checkpoint": {
+    "every_iterations": 1,
+    "keep_last": 20
+  },
+  "eval": {
+    "dev_games": 512,
+    "promotion_games": 4096
+  }
+}

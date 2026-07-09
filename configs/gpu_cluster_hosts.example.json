@@ -1,0 +1,31 @@
+{
+  "ssh_key": "~/.ssh/gpu_access_ed25519",
+  "user": "ubuntu",
+  "remote_repo": "/home/ubuntu/catan-zero",
+  "hosts": [
+    {
+      "name": "gh200-1",
+      "host": "REPLACE_ME_gh200-1_ip",
+      "role": "learner_inference",
+      "expected_gpus": 1
+    },
+    {
+      "name": "gh200-2",
+      "host": "REPLACE_ME_gh200-2_ip",
+      "role": "learner_inference",
+      "expected_gpus": 1
+    },
+    {
+      "name": "gh200-3",
+      "host": "REPLACE_ME_gh200-3_ip",
+      "role": "learner_inference",
+      "expected_gpus": 1
+    },
+    {
+      "name": "h100-1",
+      "host": "REPLACE_ME_h100-1_ip",
+      "role": "learner_inference",
+      "expected_gpus": 1
+    }
+  ]
+}

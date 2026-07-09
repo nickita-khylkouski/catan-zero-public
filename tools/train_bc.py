@@ -1,0 +1,7263 @@
+from __future__ import annotations
+
+import argparse
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
+import io
+import json
+import math
+import os
+from pathlib import Path
+import subprocess
+import sys
+import time
+from typing import Sequence
+
+import numpy as np
+
+from catan_zero.rl.config_cli import add_config_flags, resolve_config
+from catan_zero.rl.pipeline_configs import TrainConfig
+from catan_zero.rl.torch_ppo import build_action_feature_table, create_ppo_policy
+from catan_zero.rl.xdim_lite_policy import (
+    XDimGraphPolicy,
+    XDimLitePolicy,
+    _array_sha256,
+    masked_logits,
+    normalize_observations,
+)
+from catan_zero.rl.entity_token_policy import EntityGraphPolicy
+from catan_zero.rl.entity_token_features import (
+    EDGE_FEATURE_SIZE,
+    EVENT_FEATURE_SIZE,
+    GLOBAL_FEATURE_SIZE,
+    HEX_FEATURE_SIZE,
+    PLAYER_FEATURE_SIZE,
+    VERTEX_FEATURE_SIZE,
+)
+
+# Make the sibling ``tools/`` modules importable (factory_common) whether this module is run
+# as a script (``python tools/train_bc.py``) or imported as a package submodule
+# (``from tools.train_bc import ...``, e.g. from tests) -- mirrors the same bootstrap already
+# used by ``tools/ppo_distributed_learner.py``.
+_TOOLS_DIR = Path(__file__).resolve().parent
+if str(_TOOLS_DIR) not in sys.path:
+    sys.path.insert(0, str(_TOOLS_DIR))
+
+from factory_common import parse_track, write_json
+import launcher_guards
+
+
+# Public-observation masking of hidden player info (task #72). Canonical
+# implementation lives in catan_zero.rl.entity_token_features (branch
+# f72-public-observation, now merged); import it as the single source of truth.
+from catan_zero.rl.entity_token_features import (
+    mask_player_tokens_public as _mask_player_tokens_public,
+)
+
+
+# Set once from --mask-hidden-info in main(); read by _entity_batch so both the
+# train and eval decode paths mask identically. The corpus stays UNMASKED on
+# disk -- one corpus serves both masked and unmasked training regimes.
+_MASK_HIDDEN_INFO_PLAYER_TOKENS = False
+
+
+ENTITY_BATCH_KEYS = (
+    "hex_tokens",
+    "hex_vertex_ids",
+    "hex_edge_ids",
+    "vertex_tokens",
+    "edge_tokens",
+    "edge_vertex_ids",
+    "player_tokens",
+    "global_tokens",
+    "legal_action_tokens",
+    "legal_action_target_ids",
+    "event_tokens",
+    "event_target_ids",
+    "hex_mask",
+    "vertex_mask",
+    "edge_mask",
+    "player_mask",
+    "legal_action_mask",
+    "event_mask",
+)
+
+ENTITY_FIELD_DTYPES = {
+    "hex_tokens": np.float16,
+    "hex_vertex_ids": np.int16,
+    "hex_edge_ids": np.int16,
+    "vertex_tokens": np.float16,
+    "edge_tokens": np.float16,
+    "edge_vertex_ids": np.int16,
+    "player_tokens": np.float16,
+    "global_tokens": np.float16,
+    "legal_action_tokens": np.float16,
+    "legal_action_target_ids": np.int16,
+    "event_tokens": np.float16,
+    "event_target_ids": np.int16,
+    "hex_mask": np.bool_,
+    "vertex_mask": np.bool_,
+    "edge_mask": np.bool_,
+    "player_mask": np.bool_,
+    "legal_action_mask": np.bool_,
+    "event_mask": np.bool_,
+}
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Train behavior cloning from teacher shards.")
+    parser.add_argument(
+        "--arch",
+        choices=("candidate", "xdim_lite", "xdim_graph", "entity_graph"),
+        default="candidate",
+    )
+    parser.add_argument("--data", required=True)
+    parser.add_argument(
+        "--data-format",
+        choices=("npz", "memmap"),
+        default="npz",
+        help=(
+            "npz (default): load and pad the whole corpus in host RAM via "
+            "load_teacher_data. memmap: stream a flat corpus built by "
+            "tools/build_memmap_corpus.py, materialising only per-batch rows "
+            "for the large token/obs columns (removes the half-host-RAM ceiling "
+            "on very large corpora). --data must point at the converted corpus "
+            "directory (with corpus_meta.json)."
+        ),
+    )
+    parser.add_argument(
+        "--data-loader-workers",
+        type=int,
+        default=0,
+        help=(
+            "Background prefetch threads for --data-format memmap. 0 (default) "
+            "reconstructs each batch synchronously in the train loop. >0 overlaps "
+            "per-batch reconstruction with GPU compute to recover the streaming "
+            "throughput cost; ignored for --data-format npz (batches are cheap views)."
+        ),
+    )
+    parser.add_argument(
+        "--data-loader-prefetch",
+        type=int,
+        default=2,
+        help="Batches to prefetch ahead when --data-loader-workers>0.",
+    )
+    parser.add_argument(
+        "--mask-hidden-info",
+        action="store_true",
+        help=(
+            "Public-observation training (hidden-info leak fix, f72): zero every "
+            "OPPONENT player-token's hidden slots (resource-hand composition, "
+            "unplayed dev-card identities, actual VP) at load time via "
+            "catan_zero.rl.entity_token_features.mask_player_tokens_public, keeping "
+            "public counts/VP and the actor's own hand. Makes the banked (omniscient) "
+            "corpus trainable on public-only inputs WITHOUT regeneration; pair with "
+            "EntityGraphRustEvaluatorConfig.public_observation=True at inference."
+        ),
+    )
+    parser.add_argument("--track", default="2p_no_trade")
+    parser.add_argument("--vps-to-win", type=int, default=10)
+    parser.add_argument(
+        "--graph-history-features",
+        action="store_true",
+        help=(
+            "Build the training environment with the graph/history observation "
+            "suffix. If omitted, train_bc.py auto-detects this when loaded shard "
+            "observation width matches the graph-history schema."
+        ),
+    )
+    parser.add_argument("--epochs", type=int, default=2)
+    parser.add_argument(
+        "--max-steps",
+        type=int,
+        default=0,
+        help=(
+            "Hard cap on optimizer steps, counted globally across epochs. With "
+            "--grad-accum-steps 1 (default) one optimizer step is one batch; with "
+            "--grad-accum-steps N one optimizer step is N micro-batches. 0 (default) "
+            "disables the cap and --epochs alone governs training length. When the "
+            "cap is hit mid-epoch, the batch loop stops but the normal end-of-epoch "
+            "bookkeeping (validation, per-epoch checkpoint) still runs for the "
+            "partial epoch, then training stops -- the final checkpoint save and "
+            "report.json are written exactly as they would be at natural completion."
+        ),
+    )
+    parser.add_argument(
+        "--grad-accum-steps",
+        type=int,
+        default=1,
+        help=(
+            "C1 multi-GPU big-net path: accumulate gradients over N consecutive "
+            "micro-batches, then take one optimizer step (effective batch = "
+            "--batch-size * N * world_size). Each micro-batch's loss is divided by "
+            "N before backward and grads accumulate, so N micro-batches of B rows "
+            "approximate one batch of N*B rows (exact when per-micro-batch weight "
+            "sums are equal, the standard grad-accum semantics). Under DDP the "
+            "non-stepping micro-batches run in model.no_sync() so gradients are "
+            "all-reduced once per optimizer step, not once per micro-batch. "
+            "--max-steps and the LR schedule count OPTIMIZER steps, not micro-batches. "
+            "N=1 (default) is byte-identical to the pre-C1 single-step-per-batch path. "
+            "Only supported for --arch entity_graph/xdim_graph (the _train_xdim_batch "
+            "trainer); other archs must use N=1."
+        ),
+    )
+    parser.add_argument("--batch-size", type=int, default=65536)
+    parser.add_argument(
+        "--validation-fraction",
+        type=float,
+        default=0.05,
+        help="Held-out fraction split by game_seed for validation diagnostics.",
+    )
+    parser.add_argument(
+        "--validation-max-samples",
+        type=int,
+        default=200_000,
+        help="Maximum held-out samples evaluated per epoch; 0 disables the cap.",
+    )
+    parser.add_argument("--validation-seed", type=int, default=17)
+    parser.add_argument(
+        "--validation-game-seed-ranges",
+        default="",
+        help="Comma-separated start:end (inclusive) game_seed ranges forming an EXPLICIT, "
+        "deterministic held-out validation set -- overrides --validation-fraction's random "
+        "game_seed permutation entirely when non-empty (task #65 value-head-repair-v2 "
+        "protocol: matches a holdout.json's documented ranges exactly, e.g. "
+        "'5006335:5006667,6406335:6406667'). These games are excluded from training "
+        "gradients and reported as validation telemetry each epoch -- same mechanism as "
+        "--validation-fraction, just with a precomputed selection instead of a random one. "
+        "--validation-max-samples still applies (subsamples the explicit set if it exceeds "
+        "the cap).",
+    )
+    parser.add_argument(
+        "--allow-missing-game-seed-validation-split",
+        action="store_true",
+        help="CAT-52: split_train_validation_indices refuses, by default, to build a "
+        "validation split from a corpus with no 'game_seed' column, because the old "
+        "silent default (treating each row as its own 'game') reproduces the round-11 "
+        "val-leak mechanism (a de facto ROW-LEVEL split). Pass this flag to explicitly "
+        "opt into that row-level behavior (e.g. for a synthetic/legacy corpus with no "
+        "game grouping at all) -- a loud warning is still printed when it fires.",
+    )
+    parser.add_argument(
+        "--hidden-size",
+        type=int,
+        default=None,
+        help=(
+            "Model width. Defaults to 768 for xdim_graph (~33.5M params with "
+            "4 graph layers) and 512 for other architectures."
+        ),
+    )
+    parser.add_argument(
+        "--graph-tokens",
+        type=int,
+        default=32,
+        help="Observation token count for --arch xdim_graph.",
+    )
+    parser.add_argument(
+        "--graph-layers",
+        type=int,
+        default=4,
+        help="Token message-passing layers for --arch xdim_graph/entity_graph.",
+    )
+    parser.add_argument(
+        "--attention-heads",
+        type=int,
+        default=8,
+        help="Attention heads for --arch xdim_graph/entity_graph.",
+    )
+    parser.add_argument(
+        "--graph-dropout",
+        type=float,
+        default=0.05,
+        help="Dropout probability for --arch xdim_graph/entity_graph blocks.",
+    )
+    parser.add_argument("--lr", type=float, default=2e-4)
+    parser.add_argument(
+        "--lr-warmup-steps",
+        type=int,
+        default=0,
+        help=(
+            "Linearly ramp the learning rate from 0 to --lr over this many batches at the "
+            "start of training, then hold at --lr. Checkpoints do not persist optimizer "
+            "state, so every resume restarts Adam's moment estimates from zero; a short "
+            "ramp (e.g. 500-1000) protects a repair run from that fresh-Adam transient."
+        ),
+    )
+    parser.add_argument(
+        "--lr-schedule",
+        choices=("flat", "cosine", "linear"),
+        default="flat",
+        help=(
+            "AUDIT FIX (LR decay): schedule applied AFTER --lr-warmup-steps completes. "
+            "'flat' (default) is a strict no-op matching pre-fix behavior -- LR holds at "
+            "--lr for the rest of training, exactly as before this flag existed. 'cosine' "
+            "and 'linear' decay smoothly from --lr down to 0 over the remaining steps, "
+            "reaching 0 at --max-steps if set, else at epochs x batches-per-epoch."
+        ),
+    )
+    parser.add_argument(
+        "--optimizer",
+        choices=("adam", "adamw"),
+        default="adam",
+        help="Optimizer for BC. Use adamw for production 35M transformer-style runs.",
+    )
+    parser.add_argument(
+        "--value-lr-mult",
+        type=float,
+        default=1.0,
+        help=(
+            "Multiplier on the LEARNING RATE of the value_head/final_vp_head/"
+            "value_uncertainty_head submodules only (whichever are present on the "
+            "model), via a second optimizer param group at --lr * this multiplier; "
+            "every other parameter keeps training at the base --lr. 1.0 (default) is "
+            "a pure no-op -- a single param group at --lr, bit-identical to every "
+            "training run before this flag existed. CAT-12/roadmap R6 (MuZero-"
+            "Reanalyse-style value-head LR decoupling, value-head LR ~=0.3x torso): "
+            "pass 0.3 to reproduce it. --lr-warmup-steps/--lr-schedule still apply, "
+            "scaled per group. Requires --arch entity_graph/xdim_lite/xdim_graph (the "
+            "model must expose at least one of value_head/final_vp_head/"
+            "value_uncertainty_head as a named submodule) -- SystemExit otherwise."
+        ),
+    )
+    parser.add_argument(
+        "--weight-decay",
+        type=float,
+        default=0.0,
+        help="Weight decay for --optimizer adamw.",
+    )
+    parser.add_argument(
+        "--fused-optimizer",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use PyTorch's fused CUDA optimizer implementation when available.",
+    )
+    parser.add_argument("--seed", type=int, default=1)
+    parser.add_argument(
+        "--symmetry-augment",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "f74: augment each entity_graph training batch with a random D6 hex "
+            "symmetry (12-fold) per row. Relabels board tokens + target ids while "
+            "keeping legal-action row order, so policy/value targets are unchanged. "
+            "Requires --arch entity_graph."
+        ),
+    )
+    parser.add_argument(
+        "--symmetry-augment-events",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "When --symmetry-augment is on, also relabel the event-log action-id "
+            "scalar (event dim 35) through the action permutation. Minor history "
+            "feature; disable to leave the event stream untouched."
+        ),
+    )
+    parser.add_argument(
+        "--soft-target-temperature",
+        type=float,
+        default=0.7,
+        help="Temperature used to convert target_scores into distillation targets.",
+    )
+    parser.add_argument(
+        "--soft-target-weight",
+        type=float,
+        default=0.7,
+        help="Blend weight for soft distillation where soft labels exist; 1.0 means pure soft loss.",
+    )
+    parser.add_argument(
+        "--soft-target-source",
+        choices=("prefer_policy", "prefer_scores", "policy", "scores"),
+        default="policy",
+        help="Which stored soft labels to train against. prefer_scores allows temperature retuning.",
+    )
+    parser.add_argument(
+        "--soft-target-min-legal-coverage",
+        type=float,
+        default=0.5,
+        help=(
+            "Minimum fraction of legal actions covered by a soft target before "
+            "using KL/distillation for that row. Low-coverage rows fall back to "
+            "hard CE so partial search labels do not silently mark unscored legal "
+            "actions as bad."
+        ),
+    )
+    parser.add_argument(
+        "--truncated-vp-margin-value-weight",
+        type=float,
+        default=0.25,
+        help=(
+            "FIX F3: for TRUNCATED games (max_decisions cap, no clean winner), derive a "
+            "soft value-head label from the VP margin at the point of truncation "
+            "(final_actual_vps/final_public_vps + seat are populated even for truncated "
+            "rows -- only the has_final_*_vps flag is gated on the game having actually "
+            "ended) instead of excluding these rows from value supervision entirely. "
+            "Applied at this weight (relative to a clean win/loss row's weight of 1.0). "
+            "AUDIT FIX (default was 0.0, silently starving the value head of signal "
+            "from the majority of rows on corpora with high truncation fractions --"
+            "e.g. gen-1's 87.5%%): default is now 0.25, matching the value-repair-v2/v3 "
+            "recipe's already-validated weight. Pass 0.0 to restore the pre-fix, "
+            "truncated-rows-excluded-from-value-loss behavior. Scoped to the value "
+            "head only -- never affects policy advantage weighting."
+        ),
+    )
+    parser.add_argument(
+        "--policy-loss-weight",
+        type=float,
+        default=1.0,
+        help=(
+            "Scalar weight on the policy (action) loss term, alongside the existing "
+            "value/final-vp/q loss weights. Previously implicit at a fixed 1.0 -- set to 0 "
+            "for a pure value-head-repair pass (combine with --train-value-only / "
+            "--freeze-modules to also stop the policy backbone from moving)."
+        ),
+    )
+    # EXP3 (value-reuse-discipline ablation, task #40): at a fixed policy recipe,
+    # value-loss-weight 0.10 was strictly better than 0.25 under multi-epoch reuse
+    # (same policy loss, lower value overfit). RUN-6 adopts 0.10 as the default.
+    parser.add_argument("--value-loss-weight", type=float, default=0.10)
+    parser.add_argument("--final-vp-loss-weight", type=float, default=0.05)
+    parser.add_argument(
+        "--q-loss-weight",
+        type=float,
+        default=0.0,
+        help="Auxiliary Q-head regression weight from finite target_scores rows.",
+    )
+    parser.add_argument(
+        "--policy-kl-anchor-weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Weight on a policy-KL anchor loss KL(pi_theta || prior_policy), pulling "
+            "the trained policy toward the frozen seed checkpoint's recorded per-state "
+            "prior distribution (the `prior_policy` shard column). 0.0 (default) disables "
+            "it -- a pure no-op, bit-identical to prior runs. Its purpose is the "
+            "unfreeze-with-KL value-repair recipe: train the FULL trunk on true outcomes "
+            "(value loss) while this anchor keeps the policy from drifting off the seed, "
+            "so a linear value head is no longer the only free parameter. Scoped to rows "
+            "with a recorded prior (raw/gumbel self-play rows -- teacher rows contribute "
+            "nothing, same has_prior filter as the KL telemetry). Anchors to the SAME "
+            "quantity the prior_kl telemetry already tracks, so prior_kl_ratio reports "
+            "whether the anchor is binding."
+        ),
+    )
+    parser.add_argument(
+        "--value-uncertainty-loss-weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Weight on the optional value-uncertainty auxiliary head's regression loss "
+            "(predicting the value head's own squared error (z - v)^2 against the true "
+            "outcome, KataGo short-term-error style with a stop-gradient on the value "
+            "prediction feeding the target). 0.0 (default) disables the loss; requires an "
+            "--arch entity_graph model built with the head present (see "
+            "EntityGraphNetConfig.value_uncertainty_head). Pure no-op when 0.0 or when the "
+            "head is absent from outputs. Trains the head only -- search-side consumption "
+            "of the prediction is a separate, not-yet-wired design (see docs)."
+        ),
+    )
+    parser.add_argument(
+        "--value-uncertainty-head",
+        action="store_true",
+        help=(
+            "Build a fresh --arch entity_graph model (no --init-checkpoint) with the "
+            "optional value-uncertainty auxiliary head present (EntityGraphNetConfig."
+            "value_uncertainty_head=True), so --value-uncertainty-loss-weight has a "
+            "head to train against. False (default) is a pure no-op -- matches every "
+            "checkpoint built before this flag existed. Has no effect with "
+            "--init-checkpoint: an existing checkpoint's own saved config already "
+            "decides whether the head is present."
+        ),
+    )
+    parser.add_argument(
+        "--value-head-type",
+        choices=("mse", "hlgauss"),
+        default="mse",
+        help=(
+            "Which value head is the PRIMARY value target (CAT-39). 'mse' (default) is the "
+            "current behaviour exactly: only the scalar-MSE value head is trained, no "
+            "categorical CE. 'hlgauss' additionally trains the distributional HL-Gauss "
+            "categorical head (requires an --arch entity_graph model built with "
+            "value_categorical_bins >= 2; see f69_upgrade_checkpoint_config catbins:N) with a "
+            "Gaussian-smeared cross-entropy target, and keeps the scalar-MSE head fully "
+            "trained IN PARALLEL as the control arm. When 'hlgauss' and "
+            "--value-categorical-loss-weight is 0, the CE weight defaults to --value-loss-weight "
+            "so the primary head actually trains. The scalar `value` output stays the value "
+            "consumed by search/eval either way -- switching search to the categorical "
+            "win-value readout is a separate, flag-gated downstream step."
+        ),
+    )
+    parser.add_argument(
+        "--value-categorical-loss-weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Explicit weight on the HL-Gauss categorical value head's cross-entropy loss "
+            "(CAT-39). 0.0 (default) means: in --value-head-type mse it is a pure no-op; in "
+            "hlgauss it falls back to --value-loss-weight. Set > 0 to weight the CE "
+            "independently of the scalar MSE control arm. Pure no-op when the categorical "
+            "head is absent from the model outputs."
+        ),
+    )
+    parser.add_argument(
+        "--value-hlgauss-sigma-ratio",
+        type=float,
+        default=0.75,
+        help=(
+            "HL-Gauss smoothing sigma as a multiple of the win-loss bin width (CAT-39). The "
+            "scalar value target is projected onto the categorical bins as a Gaussian with "
+            "this sigma (Farebrother et al. 2024 report ~0.75 x bin-width optimal; the CAT-39 "
+            "spec says sigma ~ bin width, so 0.75 sits inside that band). Larger = smoother "
+            "targets, smaller -> two-hot in the limit."
+        ),
+    )
+    parser.add_argument(
+        "--value-target-lambda",
+        type=float,
+        default=1.0,
+        help=(
+            "MuZero/ReZero-style value-target blend (CAT-39, arXiv:2404.16364): value target "
+            "= lambda*z + (1-lambda)*V_search on rows carrying a stored search root value "
+            "(the `root_value` / `root_value_mask` shard columns). 1.0 (default) is a pure "
+            "no-op (pure realised-outcome z); inert on shards with no root_value column. The "
+            "blend is applied in DISTRIBUTION space for the HL-Gauss head (project z and "
+            "V_search each to a categorical distribution, then mix) and in scalar space for "
+            "the MSE control arm -- the two are consistent because HL-Gauss preserves the "
+            "expectation and blending is linear."
+        ),
+    )
+    parser.add_argument(
+        "--aux-subgoal-loss-weight",
+        type=float,
+        default=0.0,
+        help=(
+            "CAT-100: weight on the combined Catan-native auxiliary-subgoal loss "
+            "(longest-road / largest-army / VP-in-N / next-settlement / robber-target "
+            "heads; UNREAL-style, arXiv 1611.05397). A small value (0.02-0.1) is "
+            "typical. 0.0 (default) disables it. Pure no-op unless the --arch "
+            "entity_graph model was built with --aux-subgoal-heads (so the outputs are "
+            "present) AND the corpus carries the matching aux target fields "
+            "(aux_longest_road/aux_largest_army/aux_vp_in_n/aux_next_settlement/"
+            "aux_robber_target); rows lacking a target are ignored per head. Targets "
+            "are engine-free labels -- see catan_zero.rl.aux_subgoal_targets."
+        ),
+    )
+    parser.add_argument(
+        "--edge-policy-head",
+        action="store_true",
+        help=(
+            "CAT-97: build the --arch entity_graph model with the GATEAU-style "
+            "edge/node-feature policy head (EntityGraphConfig.edge_policy_head): a "
+            "direct per-action logit read from each move's target entity token, added "
+            "to the CLIP logits (zero-init, so identical at init). For warm-starting "
+            "an existing checkpoint instead, use tools/f69_upgrade_checkpoint_config.py "
+            "--flags edge. Ignored for non-entity architectures."
+        ),
+    )
+    parser.add_argument(
+        "--aux-subgoal-heads",
+        action="store_true",
+        help=(
+            "CAT-100: build the --arch entity_graph model with the auxiliary subgoal "
+            "heads (EntityGraphConfig.aux_subgoal_heads). Emits aux predictions only; "
+            "value/policy outputs are unchanged. Pair with --aux-subgoal-loss-weight "
+            "to train them. For warm-starting an existing checkpoint, use "
+            "tools/f69_upgrade_checkpoint_config.py --flags aux."
+        ),
+    )
+    parser.add_argument(
+        "--freeze-modules",
+        default="",
+        help=(
+            "Comma-separated --arch entity_graph module groups to freeze "
+            "(requires_grad=False): trunk,action_encoder,policy_head. value_head and "
+            "final_vp_head can never be frozen this way. See --train-value-only for a "
+            "shortcut covering all three groups."
+        ),
+    )
+    parser.add_argument(
+        "--train-value-only",
+        action="store_true",
+        help=(
+            "Shortcut for --freeze-modules trunk,action_encoder,policy_head (--arch "
+            "entity_graph only): freezes everything except value_head/final_vp_head. "
+            "Combine with --policy-loss-weight 0 so the frozen policy backbone also stops "
+            "contributing gradient via the policy loss."
+        ),
+    )
+    parser.add_argument(
+        "--allow-teacher-score-q-loss",
+        action="store_true",
+        help=(
+            "Allow target_scores to train the q_values head. Off by default because "
+            "target_scores are teacher preference scores, while PPO expects q_values "
+            "to be return-scale action values."
+        ),
+    )
+    parser.add_argument(
+        "--q-skip-teacher-prefixes",
+        default="catanatron_ab",
+        help=(
+            "Comma-separated teacher-name prefixes excluded from target_scores Q loss. "
+            "Rows marked target_score_source=ab_root are not skipped; older/fallback "
+            "AB rows without that provenance stay excluded."
+        ),
+    )
+    parser.add_argument(
+        "--allow-legacy-action-mask-upgrade",
+        action="store_true",
+        help=(
+            "Allow an old XDim checkpoint with missing action_mask_version to be "
+            "stamped with the current environment version. Keep this off for "
+            "production unless an action-ID replay smoke has passed."
+        ),
+    )
+    parser.add_argument("--winner-sample-weight", type=float, default=1.0)
+    parser.add_argument("--loser-sample-weight", type=float, default=0.3)
+    parser.add_argument(
+        "--vp-margin-weight",
+        type=float,
+        default=0.0,
+        help="Optional sample multiplier by final VP margin / vps_to_win.",
+    )
+    parser.add_argument(
+        "--advantage-policy-weighting",
+        choices=("none", "outcome_value"),
+        default="none",
+        help=(
+            "Optional AWR-lite policy reweighting. outcome_value multiplies the "
+            "policy loss by exp((final_outcome - V(s)) / temperature), clamped "
+            "and normalized per batch. Value/final-VP losses remain unbiased."
+        ),
+    )
+    parser.add_argument(
+        "--advantage-temperature",
+        type=float,
+        default=1.0,
+        help="Temperature for --advantage-policy-weighting outcome_value.",
+    )
+    parser.add_argument(
+        "--advantage-weight-cap",
+        type=float,
+        default=5.0,
+        help="Maximum per-sample AWR multiplier before per-batch normalization.",
+    )
+    parser.add_argument(
+        "--advantage-weight-floor",
+        type=float,
+        default=0.05,
+        help="Minimum per-sample AWR multiplier before per-batch normalization.",
+    )
+    parser.add_argument(
+        "--teacher-weights",
+        default="",
+        help="Comma-separated teacher weights, e.g. value_rollout_search=1.5,catanatron_value=1.2",
+    )
+    parser.add_argument(
+        "--phase-weights",
+        default="",
+        help="Comma-separated phase weights, e.g. robber=3.0,initial_build=2.0",
+    )
+    parser.add_argument(
+        "--value-phase-weights",
+        default="",
+        help=(
+            "Comma-separated phase weights for the VALUE head, e.g. "
+            "robber=8.0,initial_build=5.0 (FIX A5). Falls back to --phase-weights when empty, "
+            "so the value head is phase-repaired the same way as the policy by default."
+        ),
+    )
+    parser.add_argument(
+        "--forced-action-weight",
+        type=float,
+        default=0.1,
+        help="Multiplier for samples with exactly one legal action.",
+    )
+    parser.add_argument(
+        "--policy-surprise-weight",
+        type=float,
+        default=0.0,
+        help=(
+            "CAT-45 diversity-strangulation countermeasure (roadmap R8): oversample "
+            "rows where search disagreed most with the prior policy. Reweights the "
+            "per-EPOCH SAMPLING order (not the loss) to draw rows with replacement, "
+            "probability proportional to 1.0 + weight_scale * min(KL(target_policy || "
+            "prior_policy), --policy-surprise-cap). 0.0 (default) disables this and "
+            "keeps today's uniform rng.permutation epoch order exactly as-is. Rows "
+            "with no recorded prior_policy (non-Gumbel-self-play teacher rows, or "
+            "shards predating this column) always get the uniform baseline weight."
+        ),
+    )
+    parser.add_argument(
+        "--policy-surprise-cap",
+        type=float,
+        default=4.0,
+        help="KL cap for --policy-surprise-weight; prevents a handful of extreme-"
+        "surprise rows (e.g. wide/contested roots) from dominating the sampler.",
+    )
+    parser.add_argument(
+        "--forced-row-value-weight",
+        type=float,
+        default=1.0,
+        help=(
+            "CAT-60: multiplier for VALUE-loss weight on rows with exactly one legal "
+            "action. Default 1.0 is a no-op (byte-identical to pre-CAT-60 behavior). "
+            "Distinct from --forced-action-weight, which only affects the POLICY loss."
+        ),
+    )
+    parser.add_argument(
+        "--per-game-value-weight",
+        action="store_true",
+        help=(
+            "CAT-60: normalize VALUE-loss weights so every game (grouped by game_seed) "
+            "contributes equal total loss mass regardless of its row count, addressing "
+            "'16k games = 16k independent outcomes, not 3.6M labels'. Applied after "
+            "phase weights, the CAT-45 value_weight_multiplier field, and "
+            "--forced-row-value-weight -- see build_value_sample_weights' docstring for "
+            "the exact combination rule. Default OFF: byte-identical to prior behavior."
+        ),
+    )
+    parser.add_argument(
+        "--per-game-value-weight-mode",
+        choices=("equal", "sqrt"),
+        default="equal",
+        help=(
+            "EXP3: how --per-game-value-weight distributes per-game mass. 'equal' (default, "
+            "CAT-60 behavior): every game contributes EQUAL total value-loss mass (row weight "
+            "divided by the game's summed weight -> long games heavily downweighted per row). "
+            "'sqrt': row weight divided by SQRT of the game's summed weight, so a game of n "
+            "value rows contributes ~sqrt(n) mass -- the effective-sample-size middle ground "
+            "between row-level (mass n) and equal (mass 1), treating n correlated in-game rows "
+            "as ~sqrt(n) independent value samples. No-op unless --per-game-value-weight is set."
+        ),
+    )
+    parser.add_argument(
+        "--init-checkpoint",
+        default="",
+        help="Optional checkpoint to continue XDim-lite BC training from.",
+    )
+    parser.add_argument("--checkpoint", required=True)
+    parser.add_argument("--report", required=True)
+    parser.add_argument("--save-each-epoch", action="store_true")
+    parser.add_argument(
+        "--progress-every-batches",
+        type=int,
+        default=50,
+        help="Rank-0 JSON heartbeat interval during each epoch; 0 disables.",
+    )
+    parser.add_argument(
+        "--train-diagnostics-every-batches",
+        type=int,
+        default=0,
+        help=(
+            "Collect expensive per-phase/per-teacher train-batch diagnostics every N "
+            "batches. 0 disables train diagnostics; validation diagnostics still run."
+        ),
+    )
+    parser.add_argument(
+        "--ddp-find-unused-parameters",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Enable DDP unused-parameter discovery. The 35M xdim_graph BC path "
+            "turns this on automatically when optional auxiliary heads are not "
+            "part of the current loss."
+        ),
+    )
+    parser.add_argument(
+        "--amp",
+        choices=("none", "bf16"),
+        default="none",
+        help=(
+            "Mixed precision mode for XDim BC forward/loss. Use bf16 on B200/A100 "
+            "to reduce activation memory and use tensor cores; reductions and "
+            "reported metrics stay in float32."
+        ),
+    )
+    parser.add_argument(
+        "--allow-concurrent-bc",
+        action="store_true",
+        help=(
+            "Allow multiple behavior-cloning jobs on the same host. Keep unset "
+            "on the B200 training box so accidental launchers cannot stack two "
+            "2-GPU DDP jobs on the same devices."
+        ),
+    )
+    parser.add_argument(
+        "--host-lock-file",
+        default="/tmp/catan_zero_train_bc.lock",
+        help="Host-local lock used to prevent accidental concurrent BC jobs.",
+    )
+    parser.add_argument("--device", default="auto")
+    parser.add_argument(
+        "--require-strict-35m-teacher",
+        action="store_true",
+        help=(
+            "Run tools/report_teacher_data_quality.py --strict-35m-teacher before "
+            "loading data. This is a fail-closed preflight for serious 35M BC runs."
+        ),
+    )
+    parser.add_argument(
+        "--require-production-35m-teacher",
+        action="store_true",
+        help=(
+            "Run the full production 35M teacher-data gate before training. Use this "
+            "for B200 production BC runs; it implies --require-strict-35m-teacher."
+        ),
+    )
+    parser.add_argument(
+        "--require-35m-model",
+        action="store_true",
+        help=(
+            "Fail unless --arch xdim_graph builds a model in the expected 35M "
+            "parameter range. Implied by --require-production-35m-teacher."
+        ),
+    )
+    parser.add_argument(
+        "--skip-teacher-quality-gate",
+        action="store_true",
+        help=(
+            "Skip the external teacher-data quality preflight. Use only for a "
+            "curated dataset that was already gated in a previous run; in-process "
+            "schema and quality checks still run after loading."
+        ),
+    )
+    parser.add_argument(
+        "--trust-curated-data-quality",
+        action="store_true",
+        help=(
+            "Skip the expensive in-process teacher_data_quality diagnostic table and "
+            "use a minimal trusted record with invalid_teacher_actions=0. Use only "
+            "for a curated dataset that already passed the external quality gate."
+        ),
+    )
+    parser.add_argument(
+        "--ddp-shard-data",
+        action="store_true",
+        help=(
+            "In DDP, load only the manifest shard files assigned to each rank. "
+            "Use this for very large curated teacher sets so host RAM scales by "
+            "rank instead of duplicating the full dataset on every GPU process."
+        ),
+    )
+    parser.add_argument(
+        "--fsdp",
+        action="store_true",
+        help=(
+            "C1: shard model params/grads/optimizer state across ranks with "
+            "FullyShardedDataParallel instead of replicating them with DDP. Use "
+            "only when a net is too big to fit a DDP replica + optimizer state on "
+            "one GPU; DDP is the workhorse for the 70-150M entity_graph configs on "
+            "80GB H100s (they fit a replica with room to spare). Transformer blocks "
+            "are auto-wrapped by module type; the final checkpoint is gathered to a "
+            "full (unsharded) state_dict on rank 0 so it loads exactly like a "
+            "DDP/single-GPU checkpoint. Requires torchrun (WORLD_SIZE>1) and "
+            "--arch entity_graph/xdim_graph."
+        ),
+    )
+    parser.add_argument(
+        "--grow-from-checkpoint",
+        default="",
+        help=(
+            "C1 warm-start-GROW: build a FRESH model at the requested "
+            "--hidden-size/--graph-layers/--attention-heads (typically bigger than "
+            "the checkpoint's) and copy every parameter/buffer whose NAME and SHAPE "
+            "match from this checkpoint, leaving the rest at fresh init. Logs the "
+            "fraction of the new model's parameters that were warm-started. Unlike "
+            "--init-checkpoint (which rebuilds the model at the CHECKPOINT's config "
+            "and enforces an exact architecture match), this deliberately allows a "
+            "shape change: same-width/deeper configs warm-start the shared trunk "
+            "blocks + encoders + heads cleanly; a width change matches little and "
+            "falls back toward from-scratch. Mutually exclusive with "
+            "--init-checkpoint."
+        ),
+    )
+    parser.add_argument("--min-35m-params", type=int, default=30_000_000)
+    parser.add_argument("--max-35m-params", type=int, default=40_000_000)
+    parser.add_argument(
+        "--skip-guards",
+        action="store_true",
+        help=(
+            "Skip tools/prelaunch_guard.py's pre-launch checks (CLI-default-override "
+            "trap, VAL-ONLY seed range, masked-regime mismatch on --init-checkpoint, "
+            "fd-limit; CAT-69/CAT-75). Logs a loud WARNING and proceeds anyway -- use "
+            "only for a known false positive or an intentional smoke test."
+        ),
+    )
+    add_config_flags(parser, default_purpose="train_bc")
+    return parser
+
+
+def _build_guard_specs(
+    args: argparse.Namespace, argv: Sequence[str], parser: argparse.ArgumentParser
+) -> list[dict]:
+    static_specs = launcher_guards.load_static_guard_specs("train_bc")
+    specs = launcher_guards.merge_dynamic_args(
+        static_specs, {"cli_flag_lint": {"argv": list(argv), "parser": parser}}
+    )
+    # VAL-ONLY-never-trains (b): best-effort discovery of the seed range(s) this
+    # corpus was generated from, from any reachable generation manifest.json --
+    # refuses a training launch whose corpus overlaps the reserved VAL-ONLY band.
+    for seed_range in launcher_guards.discover_generation_seed_ranges(args.data):
+        specs.append(
+            {
+                "name": "val_only_never_trains",
+                "args": {"seed_range": seed_range, "purpose": "train"},
+            }
+        )
+    # masked-regime (c): only meaningful when continuing from a checkpoint --
+    # a fresh --arch entity_graph run has no prior regime to contradict.
+    if args.init_checkpoint:
+        specs.append(
+            {
+                "name": "masked_regime",
+                "args": {
+                    "checkpoint_path": args.init_checkpoint,
+                    "expected_masked": bool(args.mask_hidden_info),
+                },
+            }
+        )
+    return specs
+
+
+def _assert_value_heads_present_for_losses(model, args) -> None:
+    """Fail LOUD (SystemExit) when a value-head objective was requested on the
+    CLI but the constructed/loaded model lacks the head that objective needs --
+    instead of silently training with that loss term stuck at 0.0 for the whole
+    (multi-hundred-GPU-hour) run. Mirrors the --value-lr-mult SystemExit guard:
+    a requested-but-inert head is a misconfiguration, not a no-op.
+
+    (1) --value-head-type hlgauss needs a categorical value head
+        (value_categorical_bins >= 2). CAT-39's weight resolution makes the CE
+        weight nonzero in hlgauss mode, but the loss term is still gated on
+        "value_categorical_logits" in the model outputs; a scalar model never
+        emits them, so the HL-Gauss objective is silently inert.
+    (2) --value-uncertainty-loss-weight != 0 needs the value_uncertainty_head
+        submodule; without it "value_uncertainty" is never in outputs and the
+        loss stays 0.0.
+    """
+    if str(getattr(args, "value_head_type", "scalar")) == "hlgauss":
+        bins = int(getattr(model, "value_categorical_bins", 0) or 0)
+        if bins < 2:
+            raise SystemExit(
+                "--value-head-type hlgauss requires a categorical value head "
+                "(EntityGraphNetConfig.value_categorical_bins >= 2; see "
+                "f69_upgrade_checkpoint_config catbins:N), but the constructed/"
+                f"loaded model has value_categorical_bins={bins}. Without it the "
+                "HL-Gauss objective is silently inert and the run trains scalar-MSE "
+                "only. Upgrade the checkpoint to a catbins head or pass "
+                "--value-head-type scalar."
+            )
+    if float(getattr(args, "value_uncertainty_loss_weight", 0.0) or 0.0) != 0.0:
+        if getattr(model, "value_uncertainty_head", None) is None:
+            raise SystemExit(
+                "--value-uncertainty-loss-weight != 0 requires the model to carry a "
+                "value_uncertainty_head (build a fresh model with "
+                "--value-uncertainty-head, or resume a checkpoint that already has "
+                "it), but the constructed/loaded model has none. Without it the "
+                "uncertainty loss is silently inert; pass "
+                "--value-uncertainty-loss-weight 0 or add the head."
+            )
+
+
+def main(argv: Sequence[str] | None = None) -> None:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    launcher_guards.run_or_refuse(
+        _build_guard_specs(args, argv if argv is not None else sys.argv[1:], parser),
+        launcher="train_bc",
+        skip=bool(args.skip_guards),
+    )
+
+    if args.hidden_size is None:
+        args.hidden_size = 640 if args.arch == "entity_graph" else 768 if args.arch == "xdim_graph" else 512
+    if args.require_production_35m_teacher:
+        args.require_35m_model = True
+    if args.require_35m_model and not args.skip_teacher_quality_gate:
+        args.require_strict_35m_teacher = True
+    if args.skip_teacher_quality_gate and (
+        args.require_strict_35m_teacher or args.require_production_35m_teacher
+    ):
+        raise SystemExit(
+            "--skip-teacher-quality-gate cannot be combined with strict/production "
+            "teacher quality gates"
+        )
+    # CAT-128 item 5: the strict/production teacher-quality gate runs
+    # report_teacher_data_quality.py, which discovers NPZ teacher shards -- it cannot
+    # read a --data-format memmap corpus (it globs *.npz, finds none -> "no teacher
+    # shards found" and aborts deep in a subprocess; this was a CAT-109 failure mode).
+    # For a curated memmap corpus the correct guard is --skip-teacher-quality-gate
+    # --trust-curated-data-quality (the corpus was gated when it was built). Fail fast
+    # with that guidance rather than let the subprocess abort confusingly.
+    if args.data_format == "memmap" and (
+        args.require_strict_35m_teacher or args.require_production_35m_teacher
+    ):
+        raise SystemExit(
+            "--require-strict-35m-teacher/--require-production-35m-teacher are "
+            "incompatible with --data-format memmap: the external teacher-quality "
+            "report globs NPZ shards, which a memmap corpus does not have. For a "
+            "curated memmap corpus use --skip-teacher-quality-gate "
+            "--trust-curated-data-quality instead."
+        )
+    # C1 grad-accum / grow / FSDP validation (kept next to the other early
+    # argument-consistency checks so a misconfigured launch fails before any
+    # data load or GPU allocation).
+    if int(args.grad_accum_steps) < 1:
+        raise SystemExit("--grad-accum-steps must be >= 1")
+    if int(args.grad_accum_steps) > 1 and args.arch not in {"xdim_graph", "entity_graph"}:
+        raise SystemExit(
+            "--grad-accum-steps > 1 is only supported for --arch entity_graph/"
+            "xdim_graph (the _train_xdim_batch trainer); other archs must use "
+            "--grad-accum-steps 1"
+        )
+    if args.grow_from_checkpoint and args.init_checkpoint:
+        raise SystemExit(
+            "--grow-from-checkpoint and --init-checkpoint are mutually exclusive: "
+            "--init-checkpoint resumes at the checkpoint's exact architecture, "
+            "--grow-from-checkpoint warm-starts a fresh (bigger) architecture"
+        )
+    if args.grow_from_checkpoint and args.arch != "entity_graph":
+        raise SystemExit("--grow-from-checkpoint currently supports --arch entity_graph only")
+    ddp = _distributed_state()
+    # CAT-66 typed config + config-hash. Built after --hidden-size resolution so
+    # the recorded width is the effective one; registered only on rank 0 to avoid
+    # duplicate JSONL writes under DDP. A pure no-op to the run when no --config*
+    # flag is passed (see catan_zero.rl.config_cli).
+    train_config = resolve_config(
+        args, TrainConfig.from_namespace, parser=parser, register=(ddp["rank"] == 0)
+    )
+    train_config_hash = train_config.config_hash()
+    train_lock = None
+    if not args.allow_concurrent_bc:
+        train_lock = _acquire_host_train_lock(args.host_lock_file, ddp)
+
+    import torch
+
+    if ddp["enabled"] and args.arch not in {"xdim_lite", "xdim_graph", "entity_graph"}:
+        raise SystemExit("DDP behavior cloning currently supports XDim/entity architectures")
+    if bool(args.fsdp):
+        if not ddp["enabled"]:
+            raise SystemExit(
+                "--fsdp requires a multi-rank launch (torchrun --nproc_per_node>1); "
+                "WORLD_SIZE==1 has nothing to shard"
+            )
+        if args.arch not in {"xdim_graph", "entity_graph"}:
+            raise SystemExit("--fsdp currently supports --arch entity_graph/xdim_graph only")
+    if ddp["enabled"]:
+        import torch.distributed as dist
+
+        torch.cuda.set_device(ddp["local_rank"])
+        dist.init_process_group(backend="nccl")
+        args.device = f"cuda:{ddp['local_rank']}"
+    if args.amp == "bf16":
+        torch.set_float32_matmul_precision("high")
+        if str(args.device).startswith("cuda") and not torch.cuda.is_bf16_supported():
+            raise SystemExit("--amp bf16 requested but CUDA device lacks BF16 support")
+
+    _preflight_init_checkpoint_architecture(args, ddp)
+
+    if args.init_checkpoint and int(args.lr_warmup_steps) == 0:
+        _rank0_print(
+            "WARNING: --init-checkpoint is set but --lr-warmup-steps is 0. "
+            "Checkpoints do not persist optimizer state, so this resume restarts "
+            "Adam's moment estimates from zero -- training without a warmup ramp "
+            "risks catastrophic forgetting. Consider --lr-warmup-steps 500-1000.",
+            ddp,
+        )
+
+    if args.skip_teacher_quality_gate:
+        _rank0_print(
+            json.dumps(
+                {
+                    "progress": "teacher_quality_gate",
+                    "skipped": True,
+                    "reason": "caller asserted this curated dataset was already gated",
+                },
+                sort_keys=True,
+            ),
+            ddp,
+        )
+    else:
+        _run_teacher_quality_gate(
+            Path(args.data),
+            track=args.track,
+            vps_to_win=args.vps_to_win,
+            strict=bool(args.require_strict_35m_teacher),
+            production=bool(args.require_production_35m_teacher),
+            soft_target_min_legal_coverage=float(args.soft_target_min_legal_coverage),
+            out_path=Path(args.report).with_suffix(".teacher_quality.json"),
+            ddp=ddp,
+        )
+
+    global _MASK_HIDDEN_INFO_PLAYER_TOKENS
+    if bool(args.mask_hidden_info) and args.arch != "entity_graph":
+        raise SystemExit("--mask-hidden-info requires --arch entity_graph (masks player_tokens)")
+    _MASK_HIDDEN_INFO_PLAYER_TOKENS = bool(args.mask_hidden_info)
+
+    rng = np.random.default_rng(args.seed)
+    if args.data_format == "memmap":
+        if bool(args.ddp_shard_data):
+            raise SystemExit(
+                "--ddp-shard-data is not supported with --data-format memmap; the "
+                "memmap corpus is streamed per batch, so per-rank RAM is already "
+                "bounded and DDP batch sharding is handled at the index level."
+            )
+        data = load_teacher_data_memmap(Path(args.data))
+    else:
+        data = load_teacher_data(Path(args.data), ddp=ddp, shard_data=bool(args.ddp_shard_data), mask_hidden_info=bool(getattr(args, "mask_hidden_info", False)))
+    env_config = _env_config_for_teacher_data(args, data, ddp)
+    if args.trust_curated_data_quality:
+        data_quality = {
+            "samples": int(len(data["action_taken"])),
+            "invalid_teacher_actions": 0,
+            "trusted_curated_data_quality": True,
+            "quality_report_skipped": True,
+            "reason": "caller asserted corpus already passed external quality gate",
+        }
+    else:
+        data_quality = teacher_data_quality(
+            data,
+            q_skip_teacher_prefixes=_parse_prefixes(args.q_skip_teacher_prefixes),
+            soft_target_temperature=args.soft_target_temperature,
+            soft_target_source=args.soft_target_source,
+            soft_target_min_legal_coverage=args.soft_target_min_legal_coverage,
+        )
+    if float(args.q_loss_weight) != 0.0 and not args.allow_teacher_score_q_loss:
+        raise SystemExit(
+            "--q-loss-weight trains q_values on normalized teacher preference scores, "
+            "but PPO treats q_values as return-scale action values. Use "
+            "--q-loss-weight 0 for the PPO warm-start checkpoint, or pass "
+            "--allow-teacher-score-q-loss only for an explicitly non-PPO teacher-score "
+            "experiment."
+        )
+    if ddp["enabled"]:
+        from torch.nn.parallel import DistributedDataParallel
+    _rank0_print(
+        json.dumps({"progress": "bc_data_quality", **data_quality}, sort_keys=True),
+        ddp,
+    )
+    # AUDIT FIX (truncated-value default): surface truncation fraction + the
+    # effective F3 handling in train.log up front, since the CLI default now
+    # feeds truncated rows into the value loss (see --truncated-vp-margin-value-
+    # weight help) and this is easy to miss without an explicit startup line.
+    truncated_vp_margin_value_weight = float(args.truncated_vp_margin_value_weight)
+    _rank0_print(
+        json.dumps(
+            {
+                "progress": "bc_truncated_value_handling",
+                "truncated_fraction": data_quality.get("truncated_fraction"),
+                "truncated_vp_margin_value_weight": truncated_vp_margin_value_weight,
+                "truncated_rows_contribute_value_signal": truncated_vp_margin_value_weight > 0.0,
+            },
+            sort_keys=True,
+        ),
+        ddp,
+    )
+    if args.arch == "candidate":
+        policy = create_ppo_policy(
+            config=env_config,
+            seed=args.seed,
+            hidden_size=args.hidden_size,
+            architecture="candidate",
+            device=args.device,
+        )
+        if float(args.value_lr_mult) != 1.0:
+            raise SystemExit(
+                "--value-lr-mult is only supported for --arch entity_graph/xdim_lite/"
+                "xdim_graph (it needs a named value_head/final_vp_head/"
+                "value_uncertainty_head submodule to split into its own param group), "
+                "not --arch candidate"
+            )
+        params = []
+        for name in ("model", "actor", "action_encoder", "action_id_embedding", "action_bias"):
+            module = getattr(policy, name, None)
+            if module is not None:
+                params.extend(module.parameters())
+        optimizer = _make_optimizer(params, args, getattr(policy, "device", args.device))
+        train_fn = _train_candidate_batch
+    else:
+        if args.init_checkpoint:
+            if args.arch == "entity_graph":
+                policy = EntityGraphPolicy.load(
+                    args.init_checkpoint,
+                    device=args.device,
+                    strict_metadata=not bool(args.allow_legacy_action_mask_upgrade),
+                )
+            else:
+                policy = XDimLitePolicy.load(
+                    args.init_checkpoint,
+                    device=args.device,
+                    strict_metadata=not bool(args.allow_legacy_action_mask_upgrade),
+                )
+            if getattr(policy, "policy_type", None) != args.arch:
+                raise SystemExit(
+                    f"--arch {args.arch} does not match init checkpoint policy_type "
+                    f"{getattr(policy, 'policy_type', None)}"
+                )
+            _assert_init_config_matches(policy, args)
+        else:
+            if args.arch == "entity_graph":
+                policy = EntityGraphPolicy.create(
+                    env_config=env_config,
+                    hidden_size=args.hidden_size,
+                    state_layers=args.graph_layers,
+                    attention_heads=args.attention_heads,
+                    dropout=args.graph_dropout,
+                    seed=args.seed,
+                    device=args.device,
+                    value_uncertainty_head=bool(args.value_uncertainty_head),
+                    edge_policy_head=bool(getattr(args, "edge_policy_head", False)),
+                    aux_subgoal_heads=bool(getattr(args, "aux_subgoal_heads", False)),
+                )
+            elif args.arch == "xdim_graph":
+                policy = XDimGraphPolicy.create(
+                    env_config=env_config,
+                    hidden_size=args.hidden_size,
+                    seed=args.seed,
+                    device=args.device,
+                    token_count=args.graph_tokens,
+                    board_layers=args.graph_layers,
+                    attention_heads=args.attention_heads,
+                    dropout=args.graph_dropout,
+                )
+            else:
+                policy = XDimLitePolicy.create(
+                    env_config=env_config,
+                    hidden_size=args.hidden_size,
+                    seed=args.seed,
+                    device=args.device,
+                )
+        _ensure_policy_action_mask_version(
+            policy,
+            env_config,
+            allow_legacy_upgrade=bool(args.allow_legacy_action_mask_upgrade),
+            checkpoint_path=args.init_checkpoint or "",
+        )
+        if args.grow_from_checkpoint:
+            grow_report = _warm_start_grow(
+                policy, args.grow_from_checkpoint, device=args.device
+            )
+            _rank0_print(
+                json.dumps({"progress": "warm_start_grow", **grow_report}, sort_keys=True),
+                ddp,
+            )
+        _enforce_35m_model_size(policy, args)
+        _assert_value_heads_present_for_losses(policy.model, args)
+        if float(args.q_loss_weight) == 0.0:
+            _set_xdim_q_branch_trainable(policy.model, False)
+            _rank0_print(
+                json.dumps(
+                    {
+                        "progress": "q_branch",
+                        "trainable": False,
+                        "reason": "q_loss_weight=0",
+                    },
+                    sort_keys=True,
+                ),
+                ddp,
+            )
+        freeze_module_groups = set(_parse_prefixes(args.freeze_modules))
+        if bool(args.train_value_only):
+            freeze_module_groups |= {"trunk", "action_encoder", "policy_head"}
+        if freeze_module_groups:
+            if args.arch != "entity_graph":
+                raise SystemExit(
+                    "--freeze-modules/--train-value-only currently only supports "
+                    "--arch entity_graph"
+                )
+            touched = _set_entity_graph_modules_trainable(
+                policy.model, freeze_module_groups, trainable=False
+            )
+            _rank0_print(
+                json.dumps(
+                    {
+                        "progress": "freeze_modules",
+                        "frozen_groups": sorted(freeze_module_groups),
+                        "frozen_submodules": touched,
+                    },
+                    sort_keys=True,
+                ),
+                ddp,
+            )
+        if bool(args.fsdp):
+            # C1 minimal FSDP: FULL_SHARD across ranks, transformer blocks
+            # auto-wrapped by module type. use_orig_params=True so
+            # named_parameters()/named_modules() keep their original names -- the
+            # value/final-vp/uncertainty param-group split in
+            # _build_optimizer_param_groups and the module-freeze helpers keep
+            # working unchanged. Mixed precision is left to the existing
+            # _amp_context autocast (same as the DDP path): FSDP shards params in
+            # fp32 and compute autocasts to bf16, so we do NOT also pass an FSDP
+            # MixedPrecision policy (that would double-cast). Grad clipping under
+            # FSDP must go through FSDP.clip_grad_norm_ (a collective) -- handled
+            # in _train_xdim_batch -- and the checkpoint is gathered to a full
+            # rank-0 state_dict in _save_policy.
+            from torch.distributed.fsdp import (
+                FullyShardedDataParallel as FSDP,
+                ShardingStrategy,
+            )
+            from torch.distributed.fsdp.wrap import ModuleWrapPolicy
+
+            block_types: set = set()
+            if hasattr(policy.model, "blocks"):
+                for _block in policy.model.blocks:
+                    block_types.add(type(_block))
+            if getattr(policy.model, "action_cross_attention_layers", 0) and hasattr(
+                policy.model, "action_cross_blocks"
+            ):
+                for _block in policy.model.action_cross_blocks:
+                    block_types.add(type(_block))
+            wrap_policy = ModuleWrapPolicy(block_types) if block_types else None
+            # FSDP cannot flatten 0-dim (scalar) parameters (e.g. the entity_graph
+            # net's logit_scale). Keep any scalar params OUT of FSDP via
+            # ignored_states -- they stay replicated (unsharded) on every rank, a
+            # negligible cost. FSDP will not all-reduce their gradients, so
+            # _clip_grad_norm averages them across ranks before the step to keep
+            # ranks in lockstep (see policy._fsdp_ignored_params).
+            ignored_scalar_params = [
+                p for p in policy.model.parameters() if p.dim() == 0
+            ]
+            _rank0_print(
+                json.dumps(
+                    {
+                        "progress": "fsdp_wrap",
+                        "sharding": "FULL_SHARD",
+                        "wrapped_block_types": sorted(t.__name__ for t in block_types),
+                        "ignored_scalar_params": int(len(ignored_scalar_params)),
+                        "amp": str(args.amp),
+                    },
+                    sort_keys=True,
+                ),
+                ddp,
+            )
+            policy.model = FSDP(
+                policy.model,
+                auto_wrap_policy=wrap_policy,
+                sharding_strategy=ShardingStrategy.FULL_SHARD,
+                device_id=ddp["local_rank"],
+                use_orig_params=True,
+                ignored_states=ignored_scalar_params or None,
+            )
+            # Same Parameter objects survive the wrap (ignored -> unsharded), so
+            # keep references for the manual gradient all-reduce at step time.
+            policy._fsdp_ignored_params = ignored_scalar_params
+        elif ddp["enabled"]:
+            _rank0_print(
+                json.dumps(
+                    {
+                        "progress": "ddp_wrap",
+                        "find_unused_parameters": bool(args.ddp_find_unused_parameters),
+                    },
+                    sort_keys=True,
+                ),
+                ddp,
+            )
+            policy.model = DistributedDataParallel(
+                policy.model,
+                device_ids=[ddp["local_rank"]],
+                output_device=ddp["local_rank"],
+                find_unused_parameters=bool(args.ddp_find_unused_parameters),
+            )
+        policy.model.train()
+        optimizer = _make_optimizer(
+            _build_optimizer_param_groups(
+                policy.model, base_lr=float(args.lr), value_lr_mult=float(args.value_lr_mult)
+            ),
+            args,
+            getattr(policy, "device", args.device),
+        )
+        train_fn = _train_xdim_batch
+
+    validate_teacher_data_schema(policy, data, data_quality, env_config)
+
+    # CAT-128 patch #8: resume optimizer (Adam) moment state from the --init-checkpoint's
+    # sidecar so a stop/crash continues with warm moments + correct LR position rather
+    # than restarting Adam from zero (the fresh-Adam catastrophic-forgetting risk called
+    # out by the --lr-warmup-steps guard). Called on ALL ranks (FSDP restore is a
+    # collective) BEFORE the training loop, after the optimizer is built. Fail-safe: the
+    # champion and any --grow-from-checkpoint arm have no matching sidecar, so this
+    # returns False and training proceeds with a fresh optimizer -- the expected first
+    # fine-tune behaviour; the win is on resuming a run this code started.
+    if args.init_checkpoint:
+        from catan_zero.rl.optim_state import load_optimizer_state
+
+        restored = load_optimizer_state(args.init_checkpoint, policy.model, optimizer, ddp)
+        _rank0_print(
+            json.dumps({"progress": "optimizer_resume", "restored": bool(restored)}, sort_keys=True),
+            ddp,
+        )
+
+    symmetry = None
+    symmetry_rng = None
+    if getattr(args, "symmetry_augment", False):
+        if args.arch != "entity_graph":
+            raise SystemExit("--symmetry-augment requires --arch entity_graph")
+        from catan_zero.rl.hex_symmetry import build_hex_symmetry
+
+        symmetry = build_hex_symmetry()
+        symmetry_rng = np.random.default_rng(int(args.seed) + 20260705)
+        _rank0_print(
+            json.dumps(
+                {
+                    "progress": "symmetry_augment",
+                    "n_symmetries": int(symmetry.fwd_hex.shape[0]),
+                    "relabel_events": bool(args.symmetry_augment_events),
+                },
+                sort_keys=True,
+            ),
+            ddp,
+        )
+
+    start = time.perf_counter()
+    metrics = []
+    n = len(data["action_taken"])
+    policy_sample_weights = build_sample_weights(
+        data,
+        teacher_weights=_parse_weight_map(args.teacher_weights),
+        phase_weights=_parse_weight_map(args.phase_weights),
+        forced_action_weight=args.forced_action_weight,
+        winner_sample_weight=args.winner_sample_weight,
+        loser_sample_weight=args.loser_sample_weight,
+        vp_margin_weight=args.vp_margin_weight,
+        vps_to_win=args.vps_to_win,
+    )
+    value_phase_weights_raw = args.value_phase_weights or args.phase_weights
+    value_sample_weights = build_value_sample_weights(
+        data,
+        phase_weights=_parse_weight_map(value_phase_weights_raw),
+        forced_row_value_weight=args.forced_row_value_weight,
+        per_game_value_weight=args.per_game_value_weight,
+        per_game_value_weight_mode=args.per_game_value_weight_mode,
+    )
+    # CAT-45: policy-surprise sample-frequency weighting. Independent axis from
+    # policy_sample_weights/value_sample_weights above (those scale LOSS
+    # magnitude; this scales how often a row is DRAWN per epoch -- see
+    # _epoch_order's docstring for the explicit non-combination rule). Computed
+    # unconditionally (cheap: target_policy/prior_policy are already eagerly
+    # materialized) so its quality report is always available for audit, but
+    # only ever passed into _epoch_order when the flag is on (see below) --
+    # flag-off must reuse rng.permutation exactly, not a uniform-weighted choice.
+    policy_surprise_kl, policy_surprise_has_prior = compute_policy_surprise_kl(data)
+    policy_surprise_weights_full = policy_surprise_sampling_weights(
+        policy_surprise_kl,
+        policy_surprise_has_prior,
+        weight_scale=args.policy_surprise_weight,
+        cap=args.policy_surprise_cap,
+    )
+    validation_game_seed_ranges = _parse_game_seed_ranges(args.validation_game_seed_ranges)
+    split = split_train_validation_indices(
+        data,
+        validation_fraction=args.validation_fraction,
+        validation_seed=args.validation_seed,
+        validation_max_samples=args.validation_max_samples,
+        validation_game_seed_ranges=validation_game_seed_ranges,
+        allow_missing_game_seed=bool(args.allow_missing_game_seed_validation_split),
+    )
+    train_indices = split["train"]
+    validation_indices = split["validation"]
+    epoch_sample_weights = (
+        policy_surprise_weights_full[train_indices]
+        if float(args.policy_surprise_weight) > 0.0
+        else None
+    )
+    policy_sample_weight_report = sample_weight_quality(data, policy_sample_weights)
+    value_sample_weight_report = sample_weight_quality(data, value_sample_weights)
+    policy_surprise_weight_report = sample_weight_quality(data, policy_surprise_weights_full)
+    value_sample_weight_report["by_game"] = per_game_weight_quality(data, value_sample_weights)
+    _rank0_print(
+        json.dumps(
+            {
+                "progress": "bc_split",
+                "train_samples": int(len(train_indices)),
+                "validation_samples": int(len(validation_indices)),
+                "validation_fraction": float(args.validation_fraction),
+                "validation_seed": int(args.validation_seed),
+                "validation_game_seed_ranges": validation_game_seed_ranges,
+                "sample_weights": policy_sample_weight_report,
+                "policy_sample_weights": policy_sample_weight_report,
+                "value_sample_weights": value_sample_weight_report,
+                "policy_surprise_weight": float(args.policy_surprise_weight),
+                "policy_surprise_cap": float(args.policy_surprise_cap),
+                "policy_surprise_weight_quality": policy_surprise_weight_report,
+            },
+            sort_keys=True,
+        ),
+        ddp,
+    )
+    first_batch_profile = None
+    global_step = 0
+    total_training_steps = int(args.max_steps) if int(args.max_steps) > 0 else 0
+    # C1 gradient accumulation. accum==1 (default) preserves the pre-C1 path
+    # exactly: every micro-batch zero-grads, backwards the undivided loss, clips,
+    # and steps, and global_step (== optimizer steps) advances once per batch.
+    accum = max(1, int(args.grad_accum_steps))
+    for epoch in range(args.epochs):
+        order = _epoch_order(
+            rng,
+            len(train_indices),
+            args.batch_size,
+            ddp,
+            data_sharded=bool(args.ddp_shard_data),
+            sample_weights=epoch_sample_weights,
+        )
+        epoch_losses = []
+        epoch_extra_sums: dict[str, float] = {
+            "policy_loss": 0.0,
+            "value_loss": 0.0,
+            "final_vp_loss": 0.0,
+            "q_loss": 0.0,
+            "q_score_rows_ge2": 0.0,
+            "soft_distillation_rows": 0.0,
+            "advantage_weight_rows": 0.0,
+            "advantage_mean_sum": 0.0,
+            "advantage_weight_mean_sum": 0.0,
+        }
+        epoch_extra_denominators: dict[str, float] = {
+            "policy_loss": 0.0,
+            "value_loss": 0.0,
+            "final_vp_loss": 0.0,
+            "q_loss": 0.0,
+        }
+        epoch_acc = []
+        epoch_top3 = []
+        epoch_count = 0
+        epoch_active_count = 0.0
+        phase_stats = _empty_phase_stats()
+        phase_stats_unforced = _empty_phase_stats()
+        teacher_stats = _empty_phase_stats()
+        total_batches = int(np.ceil(len(order) / max(1, args.batch_size)))
+        # AUDIT FIX (LR schedule): the post-warmup decay curve needs an end point.
+        # --max-steps (if set) is the true hard stop; otherwise fall back to the
+        # epochs x batches-per-epoch estimate (recomputed identically every epoch
+        # since train_indices/order length is stable, so this is a cheap no-op for
+        # every epoch after the first).
+        # Optimizer steps per epoch = ceil(batches / accum) (the trailing partial
+        # accumulation group is flushed as one step at epoch end), so the LR-decay
+        # endpoint is counted in OPTIMIZER steps. At accum==1 this is exactly
+        # total_batches, i.e. the pre-C1 value.
+        optimizer_steps_per_epoch = int(np.ceil(total_batches / accum))
+        total_training_steps = (
+            int(args.max_steps)
+            if int(args.max_steps) > 0
+            else int(args.epochs) * optimizer_steps_per_epoch
+        )
+        # Micro-batch position within the current accumulation group; reset after
+        # every optimizer step and flushed at epoch end so gradients never carry
+        # across the epoch boundary.
+        micro_in_group = 0
+        # The policy-KL anchor and value-uncertainty auxiliary loss are entity_graph
+        # (_train_xdim_batch) features -- the legacy dense _train_candidate_batch path
+        # does not accept them, so only forward them when the xdim trainer is active.
+        train_fn_extra_kwargs: dict[str, float] = {}
+        if train_fn is _train_xdim_batch:
+            # CAT-39: resolve the categorical CE weight. In hlgauss mode a 0 weight
+            # falls back to the scalar value-loss weight so the primary head trains;
+            # in mse mode it stays 0 (pure no-op, current behaviour untouched).
+            resolved_categorical_weight = float(args.value_categorical_loss_weight)
+            if str(args.value_head_type) == "hlgauss" and resolved_categorical_weight == 0.0:
+                resolved_categorical_weight = float(args.value_loss_weight)
+            train_fn_extra_kwargs = {
+                "policy_kl_anchor_weight": float(args.policy_kl_anchor_weight),
+                "value_uncertainty_loss_weight": float(args.value_uncertainty_loss_weight),
+                "aux_subgoal_loss_weight": float(args.aux_subgoal_loss_weight),
+                "value_categorical_loss_weight": resolved_categorical_weight,
+                "value_hlgauss_sigma_ratio": float(args.value_hlgauss_sigma_ratio),
+                "value_target_lambda": float(args.value_target_lambda),
+            }
+        batch_iterator = _iterate_training_batches(
+            data,
+            order,
+            train_indices,
+            int(args.batch_size),
+            policy_sample_weights,
+            value_sample_weights,
+            num_workers=int(args.data_loader_workers),
+            prefetch=int(args.data_loader_prefetch),
+        )
+        for batch_number, (_batch_tuple, _is_last_batch) in enumerate(
+            _iter_with_last(batch_iterator), start=1
+        ):
+            batch_data, batch, batch_policy_weights, batch_value_weights = _batch_tuple
+            if len(batch) == 0:
+                continue
+            # C1 grad-accum bookkeeping. At accum==1 do_zero_grad and do_step are
+            # both True every batch (identical to pre-C1). The LR schedule uses
+            # global_step (optimizer steps), so within an accumulation group every
+            # micro-batch sees the same LR. The final batch of the epoch always
+            # closes its group with a synced optimizer step -- this both flushes
+            # the trailing partial group and, crucially, guarantees that last
+            # backward runs WITH DDP/FSDP gradient sync (non-stepping micro-batches
+            # run under no_sync, so a step on unsynced grads would diverge ranks).
+            # The last epoch batch is never empty (the final order slice has >=1
+            # row), so no pending gradient can survive the loop.
+            micro_in_group += 1
+            accum_do_zero_grad = micro_in_group == 1
+            accum_do_step = (micro_in_group >= accum) or bool(_is_last_batch)
+            accum_kwargs: dict = {}
+            if train_fn is _train_xdim_batch:
+                accum_kwargs = {
+                    "grad_accum_steps": accum,
+                    "accum_do_zero_grad": accum_do_zero_grad,
+                    "accum_do_step": accum_do_step,
+                }
+            _apply_lr_schedule(
+                optimizer,
+                base_lr=float(args.lr),
+                step=global_step,
+                warmup_steps=int(args.lr_warmup_steps),
+                total_steps=total_training_steps,
+                schedule=str(args.lr_schedule),
+            )
+            batch_metrics = train_fn(
+                policy,
+                optimizer,
+                batch_data,
+                batch,
+                batch_policy_weights,
+                batch_value_weights,
+                args.soft_target_temperature,
+                args.soft_target_weight,
+                args.soft_target_source,
+                args.soft_target_min_legal_coverage,
+                args.policy_loss_weight,
+                args.value_loss_weight,
+                args.final_vp_loss_weight,
+                args.q_loss_weight,
+                _parse_prefixes(args.q_skip_teacher_prefixes),
+                args.vps_to_win,
+                args.advantage_policy_weighting,
+                args.advantage_temperature,
+                args.advantage_weight_cap,
+                args.advantage_weight_floor,
+                args.amp,
+                diagnostics=(
+                    int(args.train_diagnostics_every_batches) > 0
+                    and batch_number % int(args.train_diagnostics_every_batches) == 0
+                ),
+                truncated_vp_margin_value_weight=args.truncated_vp_margin_value_weight,
+                symmetry=symmetry,
+                symmetry_rng=symmetry_rng,
+                symmetry_relabel_events=bool(
+                    getattr(args, "symmetry_augment_events", True)
+                ),
+                **train_fn_extra_kwargs,
+                **accum_kwargs,
+            )
+            loss = float(batch_metrics["loss"])
+            accuracy = float(batch_metrics["accuracy"])
+            if first_batch_profile is None:
+                first_batch_profile = _batch_profile(policy, batch_data, batch)
+                _rank0_print(
+                    json.dumps(
+                        {
+                            "progress": "bc_batch_profile",
+                            "arch": args.arch,
+                            "world_size": ddp["world_size"],
+                            "rank": ddp["rank"],
+                            **first_batch_profile,
+                        },
+                        sort_keys=True,
+                    ),
+                    ddp,
+            )
+            epoch_losses.append(loss * len(batch))
+            active_count = float(batch_metrics.get("active_count", len(batch)))
+            epoch_acc.append(accuracy * active_count)
+            epoch_top3.append(float(batch_metrics["top3_accuracy"]) * active_count)
+            epoch_active_count += active_count
+            for key in ("policy_loss", "value_loss", "final_vp_loss", "q_loss"):
+                weighted_sum_key = f"{key}_weighted_sum"
+                weight_sum_key = f"{key}_weight_sum"
+                if weighted_sum_key in batch_metrics and weight_sum_key in batch_metrics:
+                    epoch_extra_sums[key] += float(batch_metrics[weighted_sum_key])
+                    epoch_extra_denominators[key] += float(batch_metrics[weight_sum_key])
+                else:
+                    epoch_extra_sums[key] += float(batch_metrics.get(key, 0.0)) * len(batch)
+                    epoch_extra_denominators[key] += float(len(batch))
+            epoch_extra_sums["q_score_rows_ge2"] += float(batch_metrics.get("q_score_rows_ge2", 0.0))
+            epoch_extra_sums["soft_distillation_rows"] += float(
+                batch_metrics.get("soft_distillation_rows", 0.0)
+            )
+            advantage_rows = float(batch_metrics.get("advantage_weight_rows", 0.0))
+            epoch_extra_sums["advantage_weight_rows"] += advantage_rows
+            epoch_extra_sums["advantage_mean_sum"] += (
+                float(batch_metrics.get("advantage_mean", 0.0)) * advantage_rows
+            )
+            epoch_extra_sums["advantage_weight_mean_sum"] += (
+                float(batch_metrics.get("advantage_weight_mean", 1.0)) * advantage_rows
+            )
+            _merge_phase_stats(phase_stats, batch_metrics["phase_stats"])
+            _merge_phase_stats(
+                phase_stats_unforced,
+                batch_metrics.get("phase_stats_unforced", {}),
+            )
+            _merge_phase_stats(teacher_stats, batch_metrics["teacher_stats"])
+            epoch_count += len(batch)
+            # An optimizer step (and its LR-schedule tick) happens once per
+            # accumulation group; at accum==1 that is every batch. train_fn did
+            # the clip+step when accum_do_step was True.
+            if accum_do_step:
+                micro_in_group = 0
+                global_step += 1
+            if args.progress_every_batches and batch_number % int(args.progress_every_batches) == 0:
+                _rank0_print(
+                    json.dumps(
+                        {
+                            "progress": "bc_batch",
+                            "arch": args.arch,
+                            "epoch": epoch + 1,
+                            "batch": batch_number,
+                            "batches": total_batches,
+                            "samples": int(epoch_count),
+                            "loss": loss,
+                            "accuracy": accuracy,
+                            "cuda": _cuda_memory(policy),
+                        },
+                        sort_keys=True,
+                    ),
+                    ddp,
+                )
+            if args.max_steps > 0 and global_step >= args.max_steps:
+                break
+        phase_stats = _reduce_nested_count_stats(phase_stats, ddp)
+        phase_stats_unforced = _reduce_nested_count_stats(phase_stats_unforced, ddp)
+        teacher_stats = _reduce_nested_count_stats(teacher_stats, ddp)
+        loss_sum = float(np.sum(epoch_losses)) if epoch_losses else 0.0
+        acc_sum = float(np.sum(epoch_acc)) if epoch_acc else 0.0
+        top3_sum = float(np.sum(epoch_top3)) if epoch_top3 else 0.0
+        epoch_extra_sums = _reduce_named_sums(epoch_extra_sums, ddp)
+        epoch_extra_denominators = _reduce_named_sums(epoch_extra_denominators, ddp)
+        loss_sum, acc_sum, top3_sum, total_count = _reduce_epoch_metrics(
+            loss_sum,
+            acc_sum,
+            top3_sum,
+            float(epoch_count),
+            ddp,
+        )
+        active_count_total = _reduce_scalar_sum(float(epoch_active_count), ddp)
+        policy_loss_epoch = _metric_from_sum_denominator(
+            epoch_extra_sums["policy_loss"], epoch_extra_denominators["policy_loss"]
+        )
+        value_loss_epoch = _metric_from_sum_denominator(
+            epoch_extra_sums["value_loss"], epoch_extra_denominators["value_loss"]
+        )
+        final_vp_loss_epoch = _metric_from_sum_denominator(
+            epoch_extra_sums["final_vp_loss"], epoch_extra_denominators["final_vp_loss"]
+        )
+        q_loss_epoch = _metric_from_sum_denominator(
+            epoch_extra_sums["q_loss"], epoch_extra_denominators["q_loss"]
+        )
+        loss_epoch = (
+            policy_loss_epoch
+            + float(args.value_loss_weight) * value_loss_epoch
+            + float(args.final_vp_loss_weight) * final_vp_loss_epoch
+            + float(args.q_loss_weight) * q_loss_epoch
+        )
+        metrics.append(
+            {
+                "epoch": epoch + 1,
+                "loss": loss_epoch,
+                "raw_batch_mean_loss": loss_sum / max(total_count, 1.0),
+                "policy_loss": policy_loss_epoch,
+                "value_loss": value_loss_epoch,
+                "final_vp_loss": final_vp_loss_epoch,
+                "q_loss": q_loss_epoch,
+                "loss_denominators": dict(epoch_extra_denominators),
+                "q_score_rows_ge2": int(round(epoch_extra_sums["q_score_rows_ge2"])),
+                "q_score_rows_ge2_fraction": epoch_extra_sums["q_score_rows_ge2"] / max(total_count, 1.0),
+                "soft_distillation_rows": int(round(epoch_extra_sums["soft_distillation_rows"])),
+                "soft_distillation_fraction": epoch_extra_sums["soft_distillation_rows"] / max(total_count, 1.0),
+                "advantage_weight_rows": int(round(epoch_extra_sums["advantage_weight_rows"])),
+                "advantage_mean": (
+                    epoch_extra_sums["advantage_mean_sum"]
+                    / max(epoch_extra_sums["advantage_weight_rows"], 1.0)
+                ),
+                "advantage_weight_mean": (
+                    epoch_extra_sums["advantage_weight_mean_sum"]
+                    / max(epoch_extra_sums["advantage_weight_rows"], 1.0)
+                ),
+                "accuracy_active_count": int(round(active_count_total)),
+                "accuracy": acc_sum / max(active_count_total, 1.0),
+                "top3_accuracy": top3_sum / max(active_count_total, 1.0),
+                "phase_accuracy": _finalize_phase_stats(phase_stats),
+                "phase_accuracy_excluding_forced": _finalize_phase_stats(phase_stats_unforced),
+                "teacher_accuracy": _finalize_phase_stats(teacher_stats),
+            }
+        )
+        validation_metrics = evaluate_bc_batches(
+            policy,
+            data,
+            validation_indices,
+            policy_sample_weights,
+            value_sample_weights,
+            args.batch_size,
+            args.soft_target_temperature,
+            args.soft_target_weight,
+            args.soft_target_source,
+            args.soft_target_min_legal_coverage,
+            args.policy_loss_weight,
+            args.value_loss_weight,
+            args.final_vp_loss_weight,
+            args.q_loss_weight,
+            _parse_prefixes(args.q_skip_teacher_prefixes),
+            args.vps_to_win,
+            args.advantage_policy_weighting,
+            args.advantage_temperature,
+            args.advantage_weight_cap,
+            args.advantage_weight_floor,
+            ddp,
+            args.amp,
+            data_sharded=bool(args.ddp_shard_data),
+            truncated_vp_margin_value_weight=args.truncated_vp_margin_value_weight,
+        )
+        metrics[-1]["validation"] = validation_metrics
+        _rank0_print(
+            json.dumps(
+                {
+                    "progress": "bc",
+                    "arch": args.arch,
+                    "world_size": ddp["world_size"],
+                    **metrics[-1],
+                    "cuda": _cuda_memory(policy),
+                },
+                sort_keys=True,
+            ),
+            ddp,
+        )
+        if args.save_each_epoch:
+            # Called on every rank: _save_policy writes on rank 0 for DDP/single
+            # and runs the collective full-state-dict gather (all ranks) for FSDP.
+            epoch_path = _epoch_checkpoint_path(args.checkpoint, epoch + 1)
+            _save_policy(
+                policy,
+                str(epoch_path),
+                ddp,
+                mask_hidden_info=bool(args.mask_hidden_info),
+                soft_target_source=args.soft_target_source,
+            )
+            # CAT-128 patch #8: persist optimizer (Adam) state as <ckpt>.optimizer.pt.
+            # Called on ALL ranks (the FSDP gather is a collective); rank-0 writes.
+            _save_optimizer_sidecar(str(epoch_path), policy, optimizer, ddp)
+        if args.max_steps > 0 and global_step >= args.max_steps:
+            break
+    # Called on every rank (see _save_policy): rank-0 write for DDP/single, and a
+    # collective full-state-dict gather for FSDP (C1). MUST stay unconditional --
+    # the FSDP gather is collective, so wrapping in `if rank==0` would deadlock/skip
+    # it. OPT-8 soft_target_source provenance kwarg threaded in (recorded in metadata).
+    _save_policy(
+        policy,
+        args.checkpoint,
+        ddp,
+        mask_hidden_info=bool(args.mask_hidden_info),
+        soft_target_source=args.soft_target_source,
+    )
+    # CAT-128 patch #8: persist final optimizer (Adam) state alongside the checkpoint.
+    _save_optimizer_sidecar(args.checkpoint, policy, optimizer, ddp)
+    report = {
+        "arch": args.arch,
+        "config_hash": train_config_hash,
+        "samples": int(n),
+        "global_samples": int(_reduce_scalar_sum(float(n), ddp))
+        if bool(args.ddp_shard_data)
+        else int(n),
+        "train_samples": int(len(train_indices)),
+        "validation_samples": int(len(validation_indices)),
+        "epochs": args.epochs,
+        "max_steps": int(args.max_steps),
+        "steps_completed": int(global_step),
+        "batch_size": args.batch_size,
+        "amp": args.amp,
+        "optimizer": args.optimizer,
+        "lr": float(args.lr),
+        "weight_decay": float(args.weight_decay),
+        "fused_optimizer": bool(args.fused_optimizer),
+        "hidden_size": int(args.hidden_size),
+        "mask_hidden_info": bool(args.mask_hidden_info),
+        "seed": int(args.seed),
+        "symmetry_augment": bool(args.symmetry_augment),
+        "data": str(args.data),
+        "data_format": args.data_format,
+        "track": args.track,
+        "vps_to_win": int(args.vps_to_win),
+        "validation_game_seed_ranges": validation_game_seed_ranges or None,
+        "allow_missing_game_seed_validation_split": bool(
+            args.allow_missing_game_seed_validation_split
+        ),
+        "graph_history_features": bool(
+            getattr(env_config, "use_graph_history_features", False)
+        ),
+        "checkpoint": args.checkpoint,
+        "init_checkpoint": args.init_checkpoint or None,
+        "metrics": metrics,
+        "data_quality": data_quality,
+        "sample_weight_quality": policy_sample_weight_report,
+        "policy_sample_weight_quality": policy_sample_weight_report,
+        "value_sample_weight_quality": value_sample_weight_report,
+        "policy_surprise_weight": float(args.policy_surprise_weight),
+        "policy_surprise_cap": float(args.policy_surprise_cap),
+        "policy_surprise_weight_quality": policy_surprise_weight_report,
+        "first_batch_profile": first_batch_profile,
+        "parameter_count": int(_parameter_count(policy)),
+        "world_size": ddp["world_size"],
+        "ddp_shard_data": bool(args.ddp_shard_data),
+        "teacher_weights": _parse_weight_map(args.teacher_weights),
+        "phase_weights": _parse_weight_map(args.phase_weights),
+        "value_phase_weights": _parse_weight_map(value_phase_weights_raw),
+        "forced_action_weight": args.forced_action_weight,
+        "forced_row_value_weight": args.forced_row_value_weight,
+        "per_game_value_weight": bool(args.per_game_value_weight),
+        "per_game_value_weight_mode": str(args.per_game_value_weight_mode),
+        "winner_sample_weight": args.winner_sample_weight,
+        "loser_sample_weight": args.loser_sample_weight,
+        "vp_margin_weight": args.vp_margin_weight,
+        "advantage_policy_weighting": args.advantage_policy_weighting,
+        "advantage_temperature": args.advantage_temperature,
+        "advantage_weight_cap": args.advantage_weight_cap,
+        "advantage_weight_floor": args.advantage_weight_floor,
+        "soft_target_temperature": args.soft_target_temperature,
+        "soft_target_weight": args.soft_target_weight,
+        "soft_target_source": args.soft_target_source,
+        "soft_target_min_legal_coverage": args.soft_target_min_legal_coverage,
+        "policy_loss_weight": args.policy_loss_weight,
+        "value_loss_weight": args.value_loss_weight,
+        "truncated_vp_margin_value_weight": float(args.truncated_vp_margin_value_weight),
+        "final_vp_loss_weight": args.final_vp_loss_weight,
+        "q_loss_weight": args.q_loss_weight,
+        "policy_kl_anchor_weight": args.policy_kl_anchor_weight,
+        "value_uncertainty_loss_weight": args.value_uncertainty_loss_weight,
+        "aux_subgoal_loss_weight": args.aux_subgoal_loss_weight,
+        "value_head_type": args.value_head_type,
+        "value_categorical_loss_weight": args.value_categorical_loss_weight,
+        "value_hlgauss_sigma_ratio": args.value_hlgauss_sigma_ratio,
+        "value_target_lambda": args.value_target_lambda,
+        "edge_policy_head": bool(getattr(args, "edge_policy_head", False)),
+        "aux_subgoal_heads": bool(getattr(args, "aux_subgoal_heads", False)),
+        "freeze_modules": args.freeze_modules,
+        "train_value_only": bool(args.train_value_only),
+        "lr_warmup_steps": args.lr_warmup_steps,
+        "lr_schedule": args.lr_schedule,
+        "total_training_steps": int(total_training_steps),
+        "allow_teacher_score_q_loss": bool(args.allow_teacher_score_q_loss),
+        "allow_legacy_action_mask_upgrade": bool(args.allow_legacy_action_mask_upgrade),
+        "trust_curated_data_quality": bool(args.trust_curated_data_quality),
+        "require_strict_35m_teacher": bool(args.require_strict_35m_teacher),
+        "require_production_35m_teacher": bool(args.require_production_35m_teacher),
+        "require_35m_model": bool(args.require_35m_model),
+        "min_35m_params": int(args.min_35m_params),
+        "max_35m_params": int(args.max_35m_params),
+        "teacher_quality_gate_report": str(Path(args.report).with_suffix(".teacher_quality.json"))
+        if (args.require_strict_35m_teacher or args.require_production_35m_teacher)
+        else None,
+        "q_skip_teacher_prefixes": _parse_prefixes(args.q_skip_teacher_prefixes),
+        "validation_fraction": args.validation_fraction,
+        "validation_max_samples": args.validation_max_samples,
+        "validation_seed": args.validation_seed,
+        "graph_tokens": args.graph_tokens if args.arch == "xdim_graph" else None,
+        "graph_layers": args.graph_layers if args.arch in ("xdim_graph", "entity_graph") else None,
+        "attention_heads": args.attention_heads if args.arch in ("xdim_graph", "entity_graph") else None,
+        "graph_dropout": args.graph_dropout if args.arch in ("xdim_graph", "entity_graph") else None,
+        "progress_every_batches": args.progress_every_batches,
+        "train_diagnostics_every_batches": args.train_diagnostics_every_batches,
+        "elapsed_sec": time.perf_counter() - start,
+    }
+    if ddp["rank"] == 0:
+        write_json(args.report, report)
+        print(json.dumps(report, indent=2, sort_keys=True))
+    if ddp["enabled"]:
+        import torch.distributed as dist
+
+        dist.destroy_process_group()
+
+
+def _train_candidate_batch(
+    policy,
+    optimizer,
+    data: dict,
+    batch: np.ndarray,
+    policy_sample_weights: np.ndarray,
+    value_sample_weights: np.ndarray,
+    soft_target_temperature: float,
+    soft_target_weight: float,
+    soft_target_source: str,
+    soft_target_min_legal_coverage: float,
+    policy_loss_weight: float,
+    value_loss_weight: float,
+    final_vp_loss_weight: float,
+    q_loss_weight: float,
+    q_skip_teacher_prefixes: tuple[str, ...],
+    vps_to_win: int,
+    advantage_policy_weighting: str,
+    advantage_temperature: float,
+    advantage_weight_cap: float,
+    advantage_weight_floor: float,
+    amp: str = "none",
+    *,
+    diagnostics: bool = True,
+    truncated_vp_margin_value_weight: float = 0.0,
+) -> dict:
+    del q_skip_teacher_prefixes, amp
+    del advantage_policy_weighting, advantage_temperature, advantage_weight_cap, advantage_weight_floor
+    import torch
+    from torch import nn
+
+    obs = torch.as_tensor(
+        normalize_observations(data["obs"][batch]),
+        dtype=torch.float32,
+        device=policy.device,
+    )
+    context = _dense_context(data, batch, policy.action_size, policy.context_action_feature_size)
+    context_t = torch.as_tensor(context, dtype=torch.float32, device=policy.device)
+    actions = torch.as_tensor(data["action_taken"][batch].astype(np.int64), device=policy.device)
+    valid = _valid_lists(data["legal_action_ids"][batch])
+    logits, values = policy.forward(obs, context_t)
+    masked = _torch_ppo_masked_logits(logits, valid, policy.action_size)
+    policy_weights = torch.as_tensor(
+        policy_sample_weights[batch],
+        dtype=torch.float32,
+        device=policy.device,
+    )
+    value_weights = torch.as_tensor(
+        value_sample_weights[batch],
+        dtype=torch.float32,
+        device=policy.device,
+    )
+    hard_loss = nn.functional.cross_entropy(masked, actions, reduction="none")
+    soft_targets, has_soft, soft_support = _soft_targets_full(
+        data,
+        batch,
+        policy.action_size,
+        policy.device,
+        soft_target_temperature,
+        soft_target_source,
+        soft_target_min_legal_coverage,
+    )
+    if soft_targets is not None:
+        log_probs = _support_log_softmax(masked, soft_support)
+        soft_loss = -(soft_targets * log_probs).sum(dim=-1)
+        alpha = float(np.clip(soft_target_weight, 0.0, 1.0))
+        per_sample_loss = torch.where(
+            has_soft,
+            alpha * soft_loss + (1.0 - alpha) * hard_loss,
+            hard_loss,
+        )
+    else:
+        per_sample_loss = hard_loss
+    policy_loss = _weighted_mean_loss(per_sample_loss, policy_weights)
+    policy_loss_sum, policy_loss_denominator = _weighted_loss_parts(per_sample_loss, policy_weights)
+    _, _, _, _, outcome_targets, has_outcome, outcome_confidence = _value_targets(
+        data,
+        batch,
+        policy.device,
+        vps_to_win,
+        truncated_vp_margin_value_weight=truncated_vp_margin_value_weight,
+    )
+    value_loss = torch.tensor(0.0, dtype=torch.float32, device=policy.device)
+    if outcome_targets is not None:
+        value_error = nn.functional.mse_loss(values, outcome_targets, reduction="none")
+        value_loss = _weighted_mean_loss(
+            value_error,
+            value_weights * outcome_confidence,
+            mask=has_outcome,
+        )
+        value_loss_sum, value_loss_denominator = _weighted_loss_parts(
+            value_error,
+            value_weights * outcome_confidence,
+            mask=has_outcome,
+        )
+    else:
+        value_loss_sum, value_loss_denominator = _zero_loss_parts(policy.device)
+    loss = float(policy_loss_weight) * policy_loss + float(value_loss_weight) * value_loss
+    if not torch.isfinite(loss):
+        raise FloatingPointError(f"non-finite BC loss: {float(loss.detach().cpu())}")
+    optimizer.zero_grad(set_to_none=True)
+    loss.backward()
+    torch.nn.utils.clip_grad_norm_(list(_params(policy)), 1.0)
+    optimizer.step()
+    predictions = torch.argmax(masked, dim=-1)
+    active = policy_weights > 0.0
+    active_count = int(active.sum().item())
+    accuracy = _masked_metric_mean((predictions == actions).float(), active)
+    top3_accuracy = _topk_full_accuracy(masked, actions, k=3, mask=active)
+    active_np = active.detach().cpu().numpy().astype(bool)
+    if diagnostics:
+        predictions_np = predictions.detach().cpu().numpy()
+        actions_np = actions.detach().cpu().numpy()
+        logits_np = masked.detach().cpu().numpy()
+        phase_stats = _field_stats(
+            data,
+            batch[active_np],
+            predictions_np[active_np],
+            actions_np[active_np],
+            logits_np[active_np],
+            field="phase",
+        )
+        teacher_stats = _field_stats(
+            data,
+            batch[active_np],
+            predictions_np[active_np],
+            actions_np[active_np],
+            logits_np[active_np],
+            field="teacher_name",
+        )
+        phase_stats_unforced = _field_stats_unforced(
+            data,
+            batch[active_np],
+            predictions_np[active_np],
+            actions_np[active_np],
+            logits_np[active_np],
+            field="phase",
+        )
+    else:
+        phase_stats = {}
+        teacher_stats = {}
+        phase_stats_unforced = {}
+    return {
+        "loss": float(loss.item()),
+        "policy_loss": float(policy_loss.item()),
+        "value_loss": float(value_loss.item()),
+        "final_vp_loss": 0.0,
+        "q_loss": 0.0,
+        "policy_loss_weighted_sum": float(policy_loss_sum.item()),
+        "policy_loss_weight_sum": float(policy_loss_denominator.item()),
+        "value_loss_weighted_sum": float(value_loss_sum.item()),
+        "value_loss_weight_sum": float(value_loss_denominator.item()),
+        "final_vp_loss_weighted_sum": 0.0,
+        "final_vp_loss_weight_sum": 0.0,
+        "q_loss_weighted_sum": 0.0,
+        "q_loss_weight_sum": 0.0,
+        "q_score_rows_ge2": 0,
+        "soft_distillation_rows": int(has_soft.sum().item()) if soft_targets is not None else 0,
+        "soft_distillation_active_rows": int((has_soft & active).sum().item())
+        if soft_targets is not None
+        else 0,
+        "soft_distillation_active_rows": (
+            int((has_soft & active).sum().item()) if soft_targets is not None else 0
+        ),
+        "active_count": active_count,
+        "accuracy": float(accuracy.item()),
+        "top3_accuracy": float(top3_accuracy.item()),
+        "phase_stats": phase_stats,
+        "teacher_stats": teacher_stats,
+        "phase_stats_unforced": phase_stats_unforced,
+    }
+
+
+def _entity_batch(data: dict, batch: np.ndarray) -> dict[str, np.ndarray]:
+    missing = [key for key in ENTITY_BATCH_KEYS if key not in data]
+    if missing:
+        raise SystemExit(
+            "entity_graph training requires converted entity-token fields; "
+            f"missing {missing[:8]}{'...' if len(missing) > 8 else ''}. "
+            "Run tools/convert_teacher_to_entity_tokens.py first."
+        )
+    result = {key: data[key][batch] for key in ENTITY_BATCH_KEYS}
+    if _MASK_HIDDEN_INFO_PLAYER_TOKENS:
+        # Load-time public-observation masking: zero non-actor hidden slots so a
+        # model trained here matches the public-observation evaluator (task #72).
+        result["player_tokens"] = _mask_player_tokens_public(result["player_tokens"])
+    return result
+
+
+def _forward_legal_np_for_batch(
+    policy,
+    data: dict,
+    batch: np.ndarray,
+    legal_action_ids: np.ndarray,
+    *,
+    return_q: bool,
+    symmetry=None,
+    symmetry_rng=None,
+    symmetry_relabel_events: bool = True,
+) -> dict:
+    if getattr(policy, "policy_type", "") == "entity_graph":
+        entity = _entity_batch(data, batch)
+        if symmetry is not None:
+            # f74: draw one D6 orientation per row and relabel the board tokens.
+            # Legal-action rows keep their order (only their target ids move), so
+            # the per-legal-row policy/soft targets computed by the caller stay
+            # aligned and the value target is invariant -- nothing else to change.
+            n_sym = int(symmetry.fwd_hex.shape[0])
+            b = int(np.asarray(entity["hex_tokens"]).shape[0])
+            gen = symmetry_rng if symmetry_rng is not None else np.random.default_rng()
+            g = gen.integers(n_sym, size=b)
+            entity = symmetry.permute_entity_batch(
+                entity, g, relabel_events=symmetry_relabel_events
+            )
+        return policy.forward_legal_np(
+            entity,
+            legal_action_ids,
+            data["legal_action_context"][batch],
+            return_q=return_q,
+        )
+    return policy.forward_legal_np(
+        data["obs"][batch],
+        legal_action_ids,
+        data["legal_action_context"][batch],
+        return_q=return_q,
+    )
+
+
+def _advantage_reweighted_policy_weights(
+    policy_weights,
+    outputs: dict,
+    outcome_targets,
+    has_outcome,
+    mode: str,
+    temperature: float,
+    weight_cap: float,
+    weight_floor: float,
+):
+    import torch
+
+    stats = {
+        "advantage_weight_rows": 0,
+        "advantage_mean": 0.0,
+        "advantage_weight_mean": 1.0,
+        "advantage_weight_min": 1.0,
+        "advantage_weight_max": 1.0,
+    }
+    if mode == "none" or outcome_targets is None or "value" not in outputs:
+        return policy_weights, stats
+    if mode != "outcome_value":
+        raise ValueError(f"unknown advantage policy weighting mode: {mode}")
+    temperature = max(float(temperature), 1.0e-6)
+    cap = max(float(weight_cap), 1.0e-6)
+    floor = max(float(weight_floor), 0.0)
+    if floor > cap:
+        floor = cap
+    with torch.no_grad():
+        values = outputs["value"].detach().float()
+        targets = outcome_targets.detach().float()
+        has = has_outcome.bool() if has_outcome is not None else torch.ones_like(targets, dtype=torch.bool)
+        active = (policy_weights > 0.0) & has & torch.isfinite(targets) & torch.isfinite(values)
+        if not bool(active.any().item()):
+            return policy_weights, stats
+        advantages = targets - values
+        raw = torch.exp(torch.clamp(advantages / temperature, min=-20.0, max=20.0))
+        raw = raw.clamp(min=floor, max=cap)
+        active_weights = policy_weights[active]
+        raw_active = raw[active]
+        mean_multiplier = (active_weights * raw_active).sum() / active_weights.sum().clamp_min(1.0e-6)
+        multiplier = torch.ones_like(policy_weights)
+        multiplier[active] = raw[active] / mean_multiplier.clamp_min(1.0e-6)
+        updated = policy_weights * multiplier
+        stats = {
+            "advantage_weight_rows": int(active.sum().item()),
+            "advantage_mean": float(advantages[active].mean().item()),
+            "advantage_weight_mean": float(multiplier[active].mean().item()),
+            "advantage_weight_min": float(multiplier[active].min().item()),
+            "advantage_weight_max": float(multiplier[active].max().item()),
+        }
+        return updated, stats
+
+
+# CAT-100 auxiliary subgoal heads: (data field == model output key, loss kind).
+# binary -> BCE-with-logits, scalar -> MSE, categorical -> cross-entropy with a
+# -1 ignore. Unlabeled rows are masked (non-finite for binary/scalar, <0 for
+# categorical), so a partially-labeled corpus never poisons a head.
+_AUX_SUBGOAL_SPECS = (
+    ("aux_longest_road", "binary"),
+    ("aux_largest_army", "binary"),
+    ("aux_vp_in_n", "scalar"),
+    ("aux_next_settlement", "categorical"),
+    ("aux_robber_target", "categorical"),
+)
+
+
+def _aux_subgoal_loss(outputs: dict, data: dict, batch: np.ndarray, device) -> tuple:
+    """Combined CAT-100 auxiliary-subgoal loss over head/target pairs present in
+    BOTH the model outputs and the corpus. Returns (loss_tensor, active_heads).
+
+    A no-op (returns 0.0, 0) only when no aux head is built (a heads-off model is
+    unaffected). Each head contributes its own masked mean; the shared
+    --aux-subgoal-loss-weight scales their sum (UNREAL uniform small-weight
+    scheme, arXiv 1611.05397).
+
+    CAT-105 (loud fail on requested-but-inert aux): this function is only called
+    when --aux-subgoal-loss-weight > 0. If the model WAS built with the aux heads
+    (their outputs are present) but the corpus carries NONE of the aux target
+    columns, the objective would silently train as a no-op (active_heads stays 0,
+    loss stays 0.0) -- the exact silent-inert class 1b99c56 fixed for the value
+    head. Raise instead, so a mis-provisioned aux run fails loud at the first
+    batch rather than wasting a whole run. (A corpus that HAS the columns but a
+    given batch happens to hold no valid targets is fine -- that is transient and
+    does not raise.)"""
+    import torch
+    from torch import nn
+
+    heads_present = any(field in outputs for field, _ in _AUX_SUBGOAL_SPECS)
+    labels_present = any(field in data for field, _ in _AUX_SUBGOAL_SPECS)
+    if heads_present and not labels_present:
+        wanted = ", ".join(field for field, _ in _AUX_SUBGOAL_SPECS)
+        raise ValueError(
+            "CAT-105: --aux-subgoal-loss-weight > 0 with the aux-subgoal heads built "
+            "(--aux-subgoal-heads), but the training corpus carries NONE of the aux "
+            f"target columns ({wanted}). The aux objective would train as a silent "
+            "no-op. Build/select a corpus that includes the aux target fields (see "
+            "catan_zero.rl.aux_subgoal_targets), or drop --aux-subgoal-heads / set "
+            "--aux-subgoal-loss-weight 0."
+        )
+
+    total = torch.zeros((), dtype=torch.float32, device=device)
+    active_heads = 0
+    for field, kind in _AUX_SUBGOAL_SPECS:
+        if field not in outputs or field not in data:
+            continue
+        raw = np.asarray(data[field][batch])
+        pred = outputs[field]
+        if kind == "categorical":
+            target = torch.as_tensor(raw.astype(np.int64), device=device)
+            valid = target >= 0
+            if not bool(valid.any().item()):
+                continue
+            per = nn.functional.cross_entropy(
+                pred, target.clamp_min(0), reduction="none"
+            )
+        elif kind == "binary":
+            target = torch.as_tensor(raw.astype(np.float32), device=device)
+            valid = torch.isfinite(target)
+            if not bool(valid.any().item()):
+                continue
+            per = nn.functional.binary_cross_entropy_with_logits(
+                pred, torch.nan_to_num(target), reduction="none"
+            )
+        else:  # scalar (vp_in_n): plain regression.
+            target = torch.as_tensor(raw.astype(np.float32), device=device)
+            valid = torch.isfinite(target)
+            if not bool(valid.any().item()):
+                continue
+            per = nn.functional.mse_loss(
+                pred, torch.nan_to_num(target), reduction="none"
+            )
+        weight = valid.to(per.dtype)
+        total = total + (per * weight).sum() / weight.sum().clamp_min(1.0)
+        active_heads += 1
+    return total, active_heads
+
+
+def _train_xdim_batch(
+    policy,
+    optimizer,
+    data: dict,
+    batch: np.ndarray,
+    policy_sample_weights: np.ndarray,
+    value_sample_weights: np.ndarray,
+    soft_target_temperature: float,
+    soft_target_weight: float,
+    soft_target_source: str,
+    soft_target_min_legal_coverage: float,
+    policy_loss_weight: float,
+    value_loss_weight: float,
+    final_vp_loss_weight: float,
+    q_loss_weight: float,
+    q_skip_teacher_prefixes: tuple[str, ...],
+    vps_to_win: int,
+    advantage_policy_weighting: str,
+    advantage_temperature: float,
+    advantage_weight_cap: float,
+    advantage_weight_floor: float,
+    amp: str = "none",
+    *,
+    diagnostics: bool = True,
+    truncated_vp_margin_value_weight: float = 0.0,
+    policy_kl_anchor_weight: float = 0.0,
+    value_uncertainty_loss_weight: float = 0.0,
+    aux_subgoal_loss_weight: float = 0.0,
+    value_categorical_loss_weight: float = 0.0,
+    value_hlgauss_sigma_ratio: float = 0.75,
+    value_target_lambda: float = 1.0,
+    symmetry=None,
+    symmetry_rng=None,
+    symmetry_relabel_events: bool = True,
+    grad_accum_steps: int = 1,
+    accum_do_zero_grad: bool = True,
+    accum_do_step: bool = True,
+) -> dict:
+    import torch
+    from torch import nn
+
+    legal_action_ids = data["legal_action_ids"][batch]
+    actions_np = data["action_taken"][batch].astype(np.int64)
+    target_columns = _target_columns(legal_action_ids, actions_np)
+    target = torch.as_tensor(target_columns, dtype=torch.long, device=policy.device)
+    policy_weights = torch.as_tensor(
+        policy_sample_weights[batch],
+        dtype=torch.float32,
+        device=policy.device,
+    )
+    value_weights = torch.as_tensor(
+        value_sample_weights[batch],
+        dtype=torch.float32,
+        device=policy.device,
+    )
+    with _amp_context(policy.device, amp):
+        outputs = _forward_legal_np_for_batch(
+            policy,
+            data,
+            batch,
+            legal_action_ids,
+            return_q=float(q_loss_weight) != 0.0,
+            symmetry=symmetry,
+            symmetry_rng=symmetry_rng,
+            symmetry_relabel_events=symmetry_relabel_events,
+        )
+        hard_loss = nn.functional.cross_entropy(outputs["logits"], target, reduction="none")
+        soft_targets, has_soft, soft_support = _soft_targets_legal(
+            data,
+            batch,
+            policy.device,
+            soft_target_temperature,
+            soft_target_source,
+            soft_target_min_legal_coverage,
+        )
+        if soft_targets is not None:
+            log_probs = _support_log_softmax(outputs["logits"], soft_support)
+            soft_loss = -(soft_targets * log_probs).sum(dim=-1)
+            alpha = float(np.clip(soft_target_weight, 0.0, 1.0))
+            per_sample_loss = torch.where(
+                has_soft,
+                alpha * soft_loss + (1.0 - alpha) * hard_loss,
+                hard_loss,
+            )
+        else:
+            per_sample_loss = hard_loss
+        (
+            outcome_targets,
+            vp_targets,
+            has_outcome,
+            has_vp_target,
+            value_outcome_targets,
+            value_has_outcome,
+            outcome_confidence,
+        ) = _value_targets(
+            data,
+            batch,
+            policy.device,
+            vps_to_win,
+            truncated_vp_margin_value_weight=truncated_vp_margin_value_weight,
+        )
+        # CAT-39: truncated mask + stored search root value for the value-target
+        # lambda blend. Both are read best-effort so shards without the columns
+        # (every current shard) leave the targets untouched -- root_value blending
+        # is a gen-1-onward lever, lambda=1.0 (default) is a pure no-op.
+        truncated_mask = torch.as_tensor(
+            np.asarray(
+                data.get(
+                    "truncated", np.zeros(len(data["action_taken"]), dtype=np.bool_)
+                )[batch],
+                dtype=np.bool_,
+            ),
+            dtype=torch.bool,
+            device=policy.device,
+        )
+        root_value, root_value_mask = _root_value_targets(data, batch, policy.device)
+        # Scalar-space blend for the MSE control arm: value target = lambda*z +
+        # (1-lambda)*V_search on rows carrying a stored root value. Distribution-
+        # space blend for the HL-Gauss head happens below; the two are consistent
+        # because HL-Gauss preserves the expectation and blending is linear.
+        if (
+            float(value_target_lambda) != 1.0
+            and value_outcome_targets is not None
+            and root_value is not None
+        ):
+            lam = float(value_target_lambda)
+            blend_rows = root_value_mask & value_has_outcome
+            value_outcome_targets = torch.where(
+                blend_rows,
+                lam * value_outcome_targets + (1.0 - lam) * root_value,
+                value_outcome_targets,
+            )
+        # Advantage reweighting stays on the policy-safe (unfilled) outcome/has_outcome --
+        # FIX F3 is scoped to the value head only, must not leak into POLICY weighting.
+        policy_weights, advantage_stats = _advantage_reweighted_policy_weights(
+            policy_weights,
+            outputs,
+            outcome_targets,
+            has_outcome,
+            advantage_policy_weighting,
+            advantage_temperature,
+            advantage_weight_cap,
+            advantage_weight_floor,
+        )
+        policy_loss = _weighted_mean_loss(per_sample_loss, policy_weights)
+        policy_loss_sum, policy_loss_denominator = _weighted_loss_parts(per_sample_loss, policy_weights)
+        value_loss = torch.tensor(0.0, dtype=torch.float32, device=policy.device)
+        final_vp_loss = torch.tensor(0.0, dtype=torch.float32, device=policy.device)
+        q_loss = torch.tensor(0.0, dtype=torch.float32, device=policy.device)
+        if value_outcome_targets is not None and "value" in outputs:
+            value_error = nn.functional.mse_loss(
+                outputs["value"], value_outcome_targets, reduction="none"
+            )
+            value_loss = _weighted_mean_loss(
+                value_error,
+                value_weights * outcome_confidence,
+                mask=value_has_outcome,
+            )
+            value_loss_sum, value_loss_denominator = _weighted_loss_parts(
+                value_error,
+                value_weights * outcome_confidence,
+                mask=value_has_outcome,
+            )
+        else:
+            value_loss_sum, value_loss_denominator = _zero_loss_parts(policy.device)
+        if vp_targets is not None and "final_vp" in outputs:
+            vp_error = nn.functional.mse_loss(outputs["final_vp"], vp_targets, reduction="none")
+            final_vp_loss = _weighted_mean_loss(
+                vp_error,
+                value_weights,
+                mask=has_vp_target,
+            )
+            final_vp_loss_sum, final_vp_loss_denominator = _weighted_loss_parts(
+                vp_error,
+                value_weights,
+                mask=has_vp_target,
+            )
+        else:
+            final_vp_loss_sum, final_vp_loss_denominator = _zero_loss_parts(policy.device)
+        q_loss_sum, q_loss_denominator = _zero_loss_parts(policy.device)
+        if float(q_loss_weight) != 0.0 and "q_values" in outputs:
+            q_loss, q_loss_sum, q_loss_denominator = _q_score_loss_parts(
+                outputs["q_values"],
+                data,
+                batch,
+                policy_weights,
+                policy.device,
+                q_skip_teacher_prefixes=q_skip_teacher_prefixes,
+            )
+        # Policy-KL anchor (unfreeze-with-KL value-repair recipe): pull the trained
+        # policy toward the seed's recorded prior_policy. Only computed when enabled,
+        # so a 0-weight run is bit-identical to pre-anchor behavior.
+        kl_anchor_loss = torch.tensor(0.0, dtype=torch.float32, device=policy.device)
+        if float(policy_kl_anchor_weight) != 0.0:
+            _anchor = _policy_kl_anchor_loss(data, batch, outputs["logits"], policy.device)
+            if _anchor is not None:
+                kl_anchor_loss = _anchor
+        # Value-uncertainty auxiliary head: regress the value head's own squared
+        # error (z - v)^2 with a stop-gradient on v (KataGo short-term-error style;
+        # Huber loss because the target is already a squared quantity). No-op unless
+        # the head is present in outputs and the weight is nonzero.
+        value_uncertainty_loss = torch.tensor(0.0, dtype=torch.float32, device=policy.device)
+        if (
+            float(value_uncertainty_loss_weight) != 0.0
+            and "value_uncertainty" in outputs
+            and value_outcome_targets is not None
+            and "value" in outputs
+        ):
+            uncertainty_target = (value_outcome_targets - outputs["value"].detach()) ** 2
+            uncertainty_error = nn.functional.smooth_l1_loss(
+                outputs["value_uncertainty"], uncertainty_target, reduction="none"
+            )
+            value_uncertainty_loss = _weighted_mean_loss(
+                uncertainty_error,
+                value_weights * outcome_confidence,
+                mask=value_has_outcome,
+            )
+        # HL-Gauss categorical value head (CAT-39): cross-entropy against a
+        # Gaussian-smeared win-loss target, with truncated rows routed to the
+        # dedicated truncation class (R9 support = win/loss + truncation ONLY;
+        # VP-margin lives on the separate aux head). The scalar-MSE head above is
+        # trained IN PARALLEL as the control arm and is untouched by this term.
+        value_categorical_loss = torch.tensor(0.0, dtype=torch.float32, device=policy.device)
+        if (
+            float(value_categorical_loss_weight) != 0.0
+            and "value_categorical_logits" in outputs
+            and outcome_targets is not None
+        ):
+            cat_logits = outputs["value_categorical_logits"].float()
+            n_out = int(cat_logits.shape[-1])
+            has_trunc_class = n_out > int(policy.model.value_categorical_bins)
+            bins = int(policy.model.value_categorical_bins)
+            # Real win/loss target on the continuous axis; truncated rows one-hot
+            # on the truncation class (uses the policy-safe raw outcome, NOT the
+            # F3 VP-margin-filled value_outcome_targets, per R9).
+            cat_targets = _hl_gauss_value_targets(
+                outcome_targets,
+                bins,
+                sigma_ratio=value_hlgauss_sigma_ratio,
+                truncated=truncated_mask if has_trunc_class else None,
+                add_truncation_class=has_trunc_class,
+            )
+            # Distribution-space value-target lambda blend: mix the realised-
+            # outcome distribution with the fresh search-root-value distribution
+            # BEFORE collapsing to a scalar (never blend scalars then discretize).
+            if (
+                float(value_target_lambda) != 1.0
+                and root_value is not None
+            ):
+                lam = float(value_target_lambda)
+                rv_targets = _hl_gauss_value_targets(
+                    root_value,
+                    bins,
+                    sigma_ratio=value_hlgauss_sigma_ratio,
+                    truncated=None,
+                    add_truncation_class=has_trunc_class,
+                )
+                blend_rows = (root_value_mask & has_outcome & ~truncated_mask).unsqueeze(-1)
+                cat_targets = torch.where(
+                    blend_rows,
+                    lam * cat_targets + (1.0 - lam) * rv_targets,
+                    cat_targets,
+                )
+            cat_log_probs = torch.nn.functional.log_softmax(cat_logits, dim=-1)
+            cat_ce = -(cat_targets * cat_log_probs).sum(dim=-1)
+            # Trainable rows: a real outcome OR a truncation label (both are
+            # certain, confidence 1.0). Rows with neither are masked out.
+            cat_mask = has_outcome | truncated_mask if has_trunc_class else has_outcome
+            value_categorical_loss = _weighted_mean_loss(
+                cat_ce,
+                value_weights,
+                mask=cat_mask,
+            )
+        # CAT-100 auxiliary subgoal heads (longest-road/largest-army/VP-in-N/
+        # next-settlement/robber-target). No-op unless the weight is nonzero AND
+        # the model has the heads AND the corpus has the target fields.
+        aux_subgoal_loss = torch.tensor(0.0, dtype=torch.float32, device=policy.device)
+        aux_subgoal_active_heads = 0
+        if float(aux_subgoal_loss_weight) != 0.0:
+            aux_subgoal_loss, aux_subgoal_active_heads = _aux_subgoal_loss(
+                outputs, data, batch, policy.device
+            )
+        loss = (
+            float(policy_loss_weight) * policy_loss
+            + float(value_loss_weight) * value_loss
+            + float(final_vp_loss_weight) * final_vp_loss
+            + float(q_loss_weight) * q_loss
+            + float(policy_kl_anchor_weight) * kl_anchor_loss
+            + float(value_uncertainty_loss_weight) * value_uncertainty_loss
+            + float(value_categorical_loss_weight) * value_categorical_loss
+            + float(aux_subgoal_loss_weight) * aux_subgoal_loss
+        )
+    # C1 gradient accumulation. At grad_accum_steps==1 (accum_do_zero_grad and
+    # accum_do_step both True) this is byte-identical to the pre-C1 path:
+    # zero_grad, backward on the undivided loss, clip, step. For N>1 the loss is
+    # divided by N and grads accumulate across N micro-batches; only the stepping
+    # micro-batch zero-grads (at group start), all-reduces (the rest run under
+    # no_sync), clips, and steps.
+    import contextlib
+
+    if accum_do_zero_grad:
+        optimizer.zero_grad(set_to_none=True)
+    if not torch.isfinite(loss):
+        raise FloatingPointError(f"non-finite BC loss: {float(loss.detach().cpu())}")
+    backward_loss = loss / float(grad_accum_steps) if int(grad_accum_steps) > 1 else loss
+    if (not accum_do_step) and hasattr(policy.model, "no_sync"):
+        _sync_ctx = policy.model.no_sync()
+    else:
+        _sync_ctx = contextlib.nullcontext()
+    with _sync_ctx:
+        backward_loss.backward()
+    if accum_do_step:
+        _clip_grad_norm(policy, 1.0)
+        optimizer.step()
+    predictions = torch.argmax(outputs["logits"], dim=-1)
+    active = policy_weights > 0.0
+    active_count = int(active.sum().item())
+    accuracy = _masked_metric_mean((predictions == target).float(), active)
+    top3_accuracy = _topk_legal_accuracy(outputs["logits"], target, k=3, mask=active)
+    active_np = active.detach().cpu().numpy().astype(bool)
+    if diagnostics:
+        predictions_np = predictions.detach().cpu().numpy()
+        target_np = target.detach().cpu().numpy()
+        logits_np = outputs["logits"].float().detach().cpu().numpy()
+        phase_stats = _field_stats(
+            data,
+            batch[active_np],
+            predictions_np[active_np],
+            target_np[active_np],
+            logits_np[active_np],
+            field="phase",
+        )
+        teacher_stats = _field_stats(
+            data,
+            batch[active_np],
+            predictions_np[active_np],
+            target_np[active_np],
+            logits_np[active_np],
+            field="teacher_name",
+        )
+        phase_stats_unforced = _field_stats_unforced(
+            data,
+            batch[active_np],
+            predictions_np[active_np],
+            target_np[active_np],
+            logits_np[active_np],
+            field="phase",
+        )
+    else:
+        phase_stats = {}
+        teacher_stats = {}
+        phase_stats_unforced = {}
+    q_score_rows_ge2 = (
+        _q_score_rows_ge2(
+            data,
+            batch,
+            q_skip_teacher_prefixes=q_skip_teacher_prefixes,
+        )
+        if float(q_loss_weight) != 0.0 or diagnostics
+        else 0
+    )
+    return {
+        "loss": float(loss.item()),
+        "policy_loss": float(policy_loss.item()),
+        "value_loss": float(value_loss.item()),
+        "final_vp_loss": float(final_vp_loss.item()),
+        "q_loss": float(q_loss.item()),
+        "policy_kl_anchor_loss": float(kl_anchor_loss.item()),
+        "value_uncertainty_loss": float(value_uncertainty_loss.item()),
+        "aux_subgoal_loss": float(aux_subgoal_loss.item()),
+        "aux_subgoal_active_heads": int(aux_subgoal_active_heads),
+        "value_categorical_loss": float(value_categorical_loss.item()),
+        "policy_loss_weighted_sum": float(policy_loss_sum.item()),
+        "policy_loss_weight_sum": float(policy_loss_denominator.item()),
+        "value_loss_weighted_sum": float(value_loss_sum.item()),
+        "value_loss_weight_sum": float(value_loss_denominator.item()),
+        "final_vp_loss_weighted_sum": float(final_vp_loss_sum.item()),
+        "final_vp_loss_weight_sum": float(final_vp_loss_denominator.item()),
+        "q_loss_weighted_sum": float(q_loss_sum.item()),
+        "q_loss_weight_sum": float(q_loss_denominator.item()),
+        "q_score_rows_ge2": q_score_rows_ge2,
+        **advantage_stats,
+        "soft_distillation_rows": int(has_soft.sum().item()) if soft_targets is not None else 0,
+        "active_count": active_count,
+        "accuracy": float(accuracy.item()),
+        "top3_accuracy": float(top3_accuracy.item()),
+        "phase_stats": phase_stats,
+        "teacher_stats": teacher_stats,
+        "phase_stats_unforced": phase_stats_unforced,
+    }
+
+
+def evaluate_bc_batches(
+    policy,
+    data: dict,
+    indices: np.ndarray,
+    policy_sample_weights: np.ndarray,
+    value_sample_weights: np.ndarray,
+    batch_size: int,
+    soft_target_temperature: float,
+    soft_target_weight: float,
+    soft_target_source: str,
+    soft_target_min_legal_coverage: float,
+    policy_loss_weight: float,
+    value_loss_weight: float,
+    final_vp_loss_weight: float,
+    q_loss_weight: float,
+    q_skip_teacher_prefixes: tuple[str, ...],
+    vps_to_win: int,
+    advantage_policy_weighting: str,
+    advantage_temperature: float,
+    advantage_weight_cap: float,
+    advantage_weight_floor: float,
+    ddp: dict[str, int | bool],
+    amp: str = "none",
+    *,
+    data_sharded: bool = False,
+    truncated_vp_margin_value_weight: float = 0.0,
+) -> dict:
+    if len(indices) == 0:
+        return {}
+    eval_indices = np.asarray(indices, dtype=np.int64)
+    if not data_sharded:
+        eval_indices = _distributed_index_slice(eval_indices, ddp)
+    previous_modes = _set_policy_training(policy, False)
+    try:
+        loss_sum = 0.0
+        extra_sums: dict[str, float] = {
+            "policy_loss": 0.0,
+            "value_loss": 0.0,
+            "final_vp_loss": 0.0,
+            "q_loss": 0.0,
+            "q_score_rows_ge2": 0.0,
+            "soft_distillation_rows": 0.0,
+            "soft_distillation_active_rows": 0.0,
+            "advantage_weight_rows": 0.0,
+            "advantage_mean_sum": 0.0,
+            "advantage_weight_mean_sum": 0.0,
+            "prior_kl_rows": 0.0,
+            "prior_kl_model_prior_sum": 0.0,
+            "prior_kl_target_prior_sum": 0.0,
+        }
+        extra_denominators: dict[str, float] = {
+            "policy_loss": 0.0,
+            "value_loss": 0.0,
+            "final_vp_loss": 0.0,
+            "q_loss": 0.0,
+        }
+        acc_sum = 0.0
+        top3_sum = 0.0
+        count = 0.0
+        active_count = 0.0
+        phase_stats = _empty_phase_stats()
+        phase_stats_unforced = _empty_phase_stats()
+        teacher_stats = _empty_phase_stats()
+        eval_fn = _eval_xdim_batch if hasattr(policy, "forward_legal_np") else _eval_candidate_batch
+        for start_idx in range(0, len(eval_indices), batch_size):
+            batch = eval_indices[start_idx : start_idx + batch_size]
+            if len(batch) == 0:
+                continue
+            batch_metrics = eval_fn(
+                policy,
+                data,
+                batch,
+                policy_sample_weights,
+                value_sample_weights,
+                soft_target_temperature,
+                soft_target_weight,
+                soft_target_source,
+                soft_target_min_legal_coverage,
+                policy_loss_weight,
+                value_loss_weight,
+                final_vp_loss_weight,
+                q_loss_weight,
+                q_skip_teacher_prefixes,
+                vps_to_win,
+                advantage_policy_weighting,
+                advantage_temperature,
+                advantage_weight_cap,
+                advantage_weight_floor,
+                amp,
+                truncated_vp_margin_value_weight=truncated_vp_margin_value_weight,
+            )
+            loss_sum += float(batch_metrics["loss"]) * len(batch)
+            for key in ("policy_loss", "value_loss", "final_vp_loss", "q_loss"):
+                weighted_sum_key = f"{key}_weighted_sum"
+                weight_sum_key = f"{key}_weight_sum"
+                if weighted_sum_key in batch_metrics and weight_sum_key in batch_metrics:
+                    extra_sums[key] += float(batch_metrics[weighted_sum_key])
+                    extra_denominators[key] += float(batch_metrics[weight_sum_key])
+                else:
+                    extra_sums[key] += float(batch_metrics.get(key, 0.0)) * len(batch)
+                    extra_denominators[key] += float(len(batch))
+            extra_sums["q_score_rows_ge2"] += float(batch_metrics.get("q_score_rows_ge2", 0.0))
+            extra_sums["soft_distillation_rows"] += float(
+                batch_metrics.get("soft_distillation_rows", 0.0)
+            )
+            extra_sums["soft_distillation_active_rows"] += float(
+                batch_metrics.get("soft_distillation_active_rows", 0.0)
+            )
+            advantage_rows = float(batch_metrics.get("advantage_weight_rows", 0.0))
+            extra_sums["advantage_weight_rows"] += advantage_rows
+            extra_sums["advantage_mean_sum"] += (
+                float(batch_metrics.get("advantage_mean", 0.0)) * advantage_rows
+            )
+            extra_sums["advantage_weight_mean_sum"] += (
+                float(batch_metrics.get("advantage_weight_mean", 1.0)) * advantage_rows
+            )
+            extra_sums["prior_kl_rows"] += float(batch_metrics.get("prior_kl_rows", 0.0))
+            extra_sums["prior_kl_model_prior_sum"] += float(
+                batch_metrics.get("prior_kl_model_prior_sum", 0.0)
+            )
+            extra_sums["prior_kl_target_prior_sum"] += float(
+                batch_metrics.get("prior_kl_target_prior_sum", 0.0)
+            )
+            batch_active_count = float(batch_metrics.get("active_count", len(batch)))
+            acc_sum += float(batch_metrics["accuracy"]) * batch_active_count
+            top3_sum += float(batch_metrics["top3_accuracy"]) * batch_active_count
+            count += float(len(batch))
+            active_count += batch_active_count
+            _merge_phase_stats(phase_stats, batch_metrics["phase_stats"])
+            _merge_phase_stats(
+                phase_stats_unforced,
+                batch_metrics.get("phase_stats_unforced", {}),
+            )
+            _merge_phase_stats(teacher_stats, batch_metrics["teacher_stats"])
+        extra_sums = _reduce_named_sums(extra_sums, ddp)
+        extra_denominators = _reduce_named_sums(extra_denominators, ddp)
+        loss_sum, acc_sum, top3_sum, total_count = _reduce_epoch_metrics(
+            loss_sum,
+            acc_sum,
+            top3_sum,
+            count,
+            ddp,
+        )
+        active_count_total = _reduce_scalar_sum(active_count, ddp)
+        phase_stats = _reduce_nested_count_stats(phase_stats, ddp)
+        phase_stats_unforced = _reduce_nested_count_stats(phase_stats_unforced, ddp)
+        teacher_stats = _reduce_nested_count_stats(teacher_stats, ddp)
+        policy_loss_eval = _metric_from_sum_denominator(
+            extra_sums["policy_loss"], extra_denominators["policy_loss"]
+        )
+        value_loss_eval = _metric_from_sum_denominator(
+            extra_sums["value_loss"], extra_denominators["value_loss"]
+        )
+        final_vp_loss_eval = _metric_from_sum_denominator(
+            extra_sums["final_vp_loss"], extra_denominators["final_vp_loss"]
+        )
+        q_loss_eval = _metric_from_sum_denominator(
+            extra_sums["q_loss"], extra_denominators["q_loss"]
+        )
+        loss_eval = (
+            policy_loss_eval
+            + float(value_loss_weight) * value_loss_eval
+            + float(final_vp_loss_weight) * final_vp_loss_eval
+            + float(q_loss_weight) * q_loss_eval
+        )
+        return {
+            "samples": int(total_count),
+            "loss": loss_eval,
+            "raw_batch_mean_loss": loss_sum / max(total_count, 1.0),
+            "policy_loss": policy_loss_eval,
+            "value_loss": value_loss_eval,
+            "final_vp_loss": final_vp_loss_eval,
+            "q_loss": q_loss_eval,
+            "loss_denominators": dict(extra_denominators),
+            "q_score_rows_ge2": int(round(extra_sums["q_score_rows_ge2"])),
+            "q_score_rows_ge2_fraction": extra_sums["q_score_rows_ge2"] / max(total_count, 1.0),
+            "soft_distillation_rows": int(round(extra_sums["soft_distillation_rows"])),
+            "soft_distillation_fraction": extra_sums["soft_distillation_rows"] / max(total_count, 1.0),
+            "soft_distillation_active_rows": int(
+                round(extra_sums["soft_distillation_active_rows"])
+            ),
+            "soft_distillation_active_fraction": (
+                extra_sums["soft_distillation_active_rows"] / max(active_count_total, 1.0)
+            ),
+            "advantage_weight_rows": int(round(extra_sums["advantage_weight_rows"])),
+            "advantage_mean": (
+                extra_sums["advantage_mean_sum"]
+                / max(extra_sums["advantage_weight_rows"], 1.0)
+            ),
+            "advantage_weight_mean": (
+                extra_sums["advantage_weight_mean_sum"]
+                / max(extra_sums["advantage_weight_rows"], 1.0)
+            ),
+            "accuracy_active_count": int(round(active_count_total)),
+            "accuracy": acc_sum / max(active_count_total, 1.0),
+            "top3_accuracy": top3_sum / max(active_count_total, 1.0),
+            "phase_accuracy": _finalize_phase_stats(phase_stats),
+            "phase_accuracy_excluding_forced": _finalize_phase_stats(phase_stats_unforced),
+            "teacher_accuracy": _finalize_phase_stats(teacher_stats),
+            # SUCCESS TELEMETRY (gen-1 recipe): "worked" once prior_kl_ratio
+            # reaches 0.6-0.8; <0.3 by the end of training signals underfit
+            # (retrain at a higher LR before spending gate games on it).
+            "prior_kl_rows": int(round(extra_sums["prior_kl_rows"])),
+            "prior_kl_model_prior_mean": (
+                extra_sums["prior_kl_model_prior_sum"] / max(extra_sums["prior_kl_rows"], 1.0)
+            ),
+            "prior_kl_target_prior_mean": (
+                extra_sums["prior_kl_target_prior_sum"] / max(extra_sums["prior_kl_rows"], 1.0)
+            ),
+            "prior_kl_ratio": (
+                extra_sums["prior_kl_model_prior_sum"]
+                / max(extra_sums["prior_kl_target_prior_sum"], 1.0e-6)
+                if extra_sums["prior_kl_rows"] > 0
+                else 0.0
+            ),
+        }
+    finally:
+        _restore_policy_training(policy, previous_modes)
+
+
+def _run_teacher_quality_gate(
+    data_path: Path,
+    *,
+    track: str,
+    vps_to_win: int,
+    strict: bool,
+    production: bool,
+    soft_target_min_legal_coverage: float,
+    out_path: Path,
+    ddp: dict[str, int | bool],
+) -> None:
+    if production:
+        strict = True
+    if not strict:
+        return
+
+    command = [
+        sys.executable,
+        "tools/report_teacher_data_quality.py",
+        "--data",
+        str(data_path),
+        "--track",
+        str(track),
+        "--vps-to-win",
+        str(int(vps_to_win)),
+        "--out",
+        str(out_path),
+        "--soft-target-min-legal-coverage",
+        str(float(soft_target_min_legal_coverage)),
+    ]
+    if production:
+        command.append("--production-35m-teacher")
+    else:
+        command.append("--strict-35m-teacher")
+
+    status = 0
+    if int(ddp.get("rank", 0)) == 0:
+        print(
+            json.dumps(
+                {
+                    "progress": "teacher_quality_gate",
+                    "command": command,
+                    "production": bool(production),
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+        result = subprocess.run(command, text=True, capture_output=True)
+        if result.stdout:
+            print(result.stdout, end="", flush=True)
+        if result.stderr:
+            print(result.stderr, end="", file=sys.stderr, flush=True)
+        status = int(result.returncode)
+
+    if ddp.get("enabled", False):
+        import torch
+        import torch.distributed as dist
+
+        device = f"cuda:{int(ddp.get('local_rank', 0))}"
+        status_tensor = torch.tensor([status], dtype=torch.int32, device=device)
+        dist.broadcast(status_tensor, src=0)
+        status = int(status_tensor.item())
+
+    if status != 0:
+        raise SystemExit(
+            "teacher data quality gate failed; refusing to start BC training "
+            f"on {data_path}"
+        )
+
+
+def _eval_candidate_batch(
+    policy,
+    data: dict,
+    batch: np.ndarray,
+    policy_sample_weights: np.ndarray,
+    value_sample_weights: np.ndarray,
+    soft_target_temperature: float,
+    soft_target_weight: float,
+    soft_target_source: str,
+    soft_target_min_legal_coverage: float,
+    policy_loss_weight: float,
+    value_loss_weight: float,
+    final_vp_loss_weight: float,
+    q_loss_weight: float,
+    q_skip_teacher_prefixes: tuple[str, ...],
+    vps_to_win: int,
+    advantage_policy_weighting: str,
+    advantage_temperature: float,
+    advantage_weight_cap: float,
+    advantage_weight_floor: float,
+    amp: str = "none",
+    *,
+    truncated_vp_margin_value_weight: float = 0.0,
+) -> dict:
+    del final_vp_loss_weight, q_loss_weight, amp
+    del q_skip_teacher_prefixes
+    del advantage_policy_weighting, advantage_temperature, advantage_weight_cap, advantage_weight_floor
+    import torch
+    from torch import nn
+
+    with torch.no_grad():
+        obs = torch.as_tensor(
+            normalize_observations(data["obs"][batch]),
+            dtype=torch.float32,
+            device=policy.device,
+        )
+        context = _dense_context(data, batch, policy.action_size, policy.context_action_feature_size)
+        context_t = torch.as_tensor(context, dtype=torch.float32, device=policy.device)
+        actions = torch.as_tensor(data["action_taken"][batch].astype(np.int64), device=policy.device)
+        valid = _valid_lists(data["legal_action_ids"][batch])
+        logits, values = policy.forward(obs, context_t)
+        masked = _torch_ppo_masked_logits(logits, valid, policy.action_size)
+        policy_weights = torch.as_tensor(
+            policy_sample_weights[batch],
+            dtype=torch.float32,
+            device=policy.device,
+        )
+        value_weights = torch.as_tensor(
+            value_sample_weights[batch],
+            dtype=torch.float32,
+            device=policy.device,
+        )
+        hard_loss = nn.functional.cross_entropy(masked, actions, reduction="none")
+        soft_targets, has_soft, soft_support = _soft_targets_full(
+            data,
+            batch,
+            policy.action_size,
+            policy.device,
+            soft_target_temperature,
+            soft_target_source,
+            soft_target_min_legal_coverage,
+        )
+        if soft_targets is not None:
+            log_probs = _support_log_softmax(masked, soft_support)
+            soft_loss = -(soft_targets * log_probs).sum(dim=-1)
+            alpha = float(np.clip(soft_target_weight, 0.0, 1.0))
+            per_sample_loss = torch.where(
+                has_soft,
+                alpha * soft_loss + (1.0 - alpha) * hard_loss,
+                hard_loss,
+            )
+        else:
+            per_sample_loss = hard_loss
+        policy_loss_sum, policy_loss_denominator = _weighted_loss_parts(per_sample_loss, policy_weights)
+        policy_loss = policy_loss_sum / torch.clamp(policy_loss_denominator, min=1e-6)
+        _, _, _, _, outcome_targets, has_outcome, outcome_confidence = _value_targets(
+            data,
+            batch,
+            policy.device,
+            vps_to_win,
+            truncated_vp_margin_value_weight=truncated_vp_margin_value_weight,
+        )
+        value_loss = torch.tensor(0.0, dtype=torch.float32, device=policy.device)
+        if outcome_targets is not None:
+            value_error = nn.functional.mse_loss(values, outcome_targets, reduction="none")
+            value_loss_sum, value_loss_denominator = _weighted_loss_parts(
+                value_error,
+                value_weights * outcome_confidence,
+                mask=has_outcome,
+            )
+            value_loss = value_loss_sum / torch.clamp(value_loss_denominator, min=1e-6)
+        else:
+            value_loss_sum, value_loss_denominator = _zero_loss_parts(policy.device)
+        loss = float(policy_loss_weight) * policy_loss + float(value_loss_weight) * value_loss
+        predictions = torch.argmax(masked, dim=-1)
+        active = policy_weights > 0.0
+        active_count = int(active.sum().item())
+        accuracy = _masked_metric_mean((predictions == actions).float(), active)
+        top3_accuracy = _topk_full_accuracy(masked, actions, k=3, mask=active)
+        predictions_np = predictions.detach().cpu().numpy()
+        targets_np = actions.detach().cpu().numpy()
+        logits_np = masked.detach().cpu().numpy()
+        active_np = active.detach().cpu().numpy().astype(bool)
+        return {
+            "loss": float(loss.item()),
+            "policy_loss": float(policy_loss.item()),
+            "value_loss": float(value_loss.item()),
+            "final_vp_loss": 0.0,
+            "q_loss": 0.0,
+            "policy_loss_weighted_sum": float(policy_loss_sum.item()),
+            "policy_loss_weight_sum": float(policy_loss_denominator.item()),
+            "value_loss_weighted_sum": float(value_loss_sum.item()),
+            "value_loss_weight_sum": float(value_loss_denominator.item()),
+            "final_vp_loss_weighted_sum": 0.0,
+            "final_vp_loss_weight_sum": 0.0,
+            "q_loss_weighted_sum": 0.0,
+            "q_loss_weight_sum": 0.0,
+            "q_score_rows_ge2": 0,
+            "soft_distillation_rows": int(has_soft.sum().item()) if soft_targets is not None else 0,
+            "soft_distillation_active_rows": int((has_soft & active).sum().item())
+            if soft_targets is not None
+            else 0,
+            "soft_distillation_active_rows": (
+                int((has_soft & active).sum().item()) if soft_targets is not None else 0
+            ),
+            "active_count": active_count,
+            "accuracy": float(accuracy.item()),
+            "top3_accuracy": float(top3_accuracy.item()),
+            "phase_stats": _field_stats(
+                data,
+                batch[active_np],
+                predictions_np[active_np],
+                targets_np[active_np],
+                logits_np[active_np],
+                field="phase",
+            ),
+            "phase_stats_unforced": _field_stats_unforced(
+                data,
+                batch[active_np],
+                predictions_np[active_np],
+                targets_np[active_np],
+                logits_np[active_np],
+                field="phase",
+            ),
+            "teacher_stats": _field_stats(
+                data,
+                batch[active_np],
+                predictions_np[active_np],
+                targets_np[active_np],
+                logits_np[active_np],
+                field="teacher_name",
+            ),
+        }
+
+
+def _eval_xdim_batch(
+    policy,
+    data: dict,
+    batch: np.ndarray,
+    policy_sample_weights: np.ndarray,
+    value_sample_weights: np.ndarray,
+    soft_target_temperature: float,
+    soft_target_weight: float,
+    soft_target_source: str,
+    soft_target_min_legal_coverage: float,
+    policy_loss_weight: float,
+    value_loss_weight: float,
+    final_vp_loss_weight: float,
+    q_loss_weight: float,
+    q_skip_teacher_prefixes: tuple[str, ...],
+    vps_to_win: int,
+    advantage_policy_weighting: str,
+    advantage_temperature: float,
+    advantage_weight_cap: float,
+    advantage_weight_floor: float,
+    amp: str = "none",
+    *,
+    truncated_vp_margin_value_weight: float = 0.0,
+) -> dict:
+    import torch
+    from torch import nn
+
+    with torch.no_grad():
+        legal_action_ids = data["legal_action_ids"][batch]
+        actions_np = data["action_taken"][batch].astype(np.int64)
+        target_columns = _target_columns(legal_action_ids, actions_np)
+        target = torch.as_tensor(target_columns, dtype=torch.long, device=policy.device)
+        policy_weights = torch.as_tensor(
+            policy_sample_weights[batch],
+            dtype=torch.float32,
+            device=policy.device,
+        )
+        value_weights = torch.as_tensor(
+            value_sample_weights[batch],
+            dtype=torch.float32,
+            device=policy.device,
+        )
+        with _amp_context(policy.device, amp):
+            outputs = _forward_legal_np_for_batch(
+                policy,
+                data,
+                batch,
+                legal_action_ids,
+                return_q=float(q_loss_weight) != 0.0,
+            )
+            hard_loss = nn.functional.cross_entropy(outputs["logits"], target, reduction="none")
+            soft_targets, has_soft, soft_support = _soft_targets_legal(
+                data,
+                batch,
+                policy.device,
+                soft_target_temperature,
+                soft_target_source,
+                soft_target_min_legal_coverage,
+            )
+            if soft_targets is not None:
+                log_probs = _support_log_softmax(outputs["logits"], soft_support)
+                soft_loss = -(soft_targets * log_probs).sum(dim=-1)
+                alpha = float(np.clip(soft_target_weight, 0.0, 1.0))
+                per_sample_loss = torch.where(
+                    has_soft,
+                    alpha * soft_loss + (1.0 - alpha) * hard_loss,
+                    hard_loss,
+                )
+            else:
+                per_sample_loss = hard_loss
+            (
+                outcome_targets,
+                vp_targets,
+                has_outcome,
+                has_vp_target,
+                value_outcome_targets,
+                value_has_outcome,
+                outcome_confidence,
+            ) = _value_targets(
+                data,
+                batch,
+                policy.device,
+                vps_to_win,
+                truncated_vp_margin_value_weight=truncated_vp_margin_value_weight,
+            )
+            # Advantage reweighting stays on the policy-safe (unfilled) outcome/has_outcome --
+            # FIX F3 is scoped to the value head only, must not leak into POLICY weighting.
+            policy_weights, advantage_stats = _advantage_reweighted_policy_weights(
+                policy_weights,
+                outputs,
+                outcome_targets,
+                has_outcome,
+                advantage_policy_weighting,
+                advantage_temperature,
+                advantage_weight_cap,
+                advantage_weight_floor,
+            )
+            policy_loss_sum, policy_loss_denominator = _weighted_loss_parts(per_sample_loss, policy_weights)
+            policy_loss = policy_loss_sum / torch.clamp(policy_loss_denominator, min=1e-6)
+            value_loss = torch.tensor(0.0, dtype=torch.float32, device=policy.device)
+            final_vp_loss = torch.tensor(0.0, dtype=torch.float32, device=policy.device)
+            q_loss = torch.tensor(0.0, dtype=torch.float32, device=policy.device)
+            if value_outcome_targets is not None and "value" in outputs:
+                value_error = nn.functional.mse_loss(
+                    outputs["value"], value_outcome_targets, reduction="none"
+                )
+                value_loss_sum, value_loss_denominator = _weighted_loss_parts(
+                    value_error,
+                    value_weights * outcome_confidence,
+                    mask=value_has_outcome,
+                )
+                value_loss = value_loss_sum / torch.clamp(value_loss_denominator, min=1e-6)
+            else:
+                value_loss_sum, value_loss_denominator = _zero_loss_parts(policy.device)
+            if vp_targets is not None and "final_vp" in outputs:
+                vp_error = nn.functional.mse_loss(outputs["final_vp"], vp_targets, reduction="none")
+                final_vp_loss_sum, final_vp_loss_denominator = _weighted_loss_parts(
+                    vp_error,
+                    value_weights,
+                    mask=has_vp_target,
+                )
+                final_vp_loss = final_vp_loss_sum / torch.clamp(final_vp_loss_denominator, min=1e-6)
+            else:
+                final_vp_loss_sum, final_vp_loss_denominator = _zero_loss_parts(policy.device)
+            q_loss_sum, q_loss_denominator = _zero_loss_parts(policy.device)
+            if float(q_loss_weight) != 0.0 and "q_values" in outputs:
+                q_loss, q_loss_sum, q_loss_denominator = _q_score_loss_parts(
+                    outputs["q_values"],
+                    data,
+                    batch,
+                    policy_weights,
+                    policy.device,
+                    q_skip_teacher_prefixes=q_skip_teacher_prefixes,
+                )
+            loss = (
+                float(policy_loss_weight) * policy_loss
+                + float(value_loss_weight) * value_loss
+                + float(final_vp_loss_weight) * final_vp_loss
+                + float(q_loss_weight) * q_loss
+            )
+        predictions = torch.argmax(outputs["logits"], dim=-1)
+        active = policy_weights > 0.0
+        active_count = int(active.sum().item())
+        accuracy = _masked_metric_mean((predictions == target).float(), active)
+        top3_accuracy = _topk_legal_accuracy(outputs["logits"], target, k=3, mask=active)
+        predictions_np = predictions.detach().cpu().numpy()
+        targets_np = target.detach().cpu().numpy()
+        logits_np = outputs["logits"].float().detach().cpu().numpy()
+        q_score_rows_ge2 = _q_score_rows_ge2(
+            data,
+            batch,
+            q_skip_teacher_prefixes=q_skip_teacher_prefixes,
+        )
+        active_np = active.detach().cpu().numpy().astype(bool)
+        # Success telemetry (gen-1 recipe): KL(model||prior_policy) vs the
+        # reference KL(target_policy||prior_policy) on a held-out gen slice.
+        prior_kl = _prior_kl_telemetry(data, batch, outputs["logits"], policy.device)
+        if prior_kl is not None:
+            has_prior = prior_kl["has_prior"]
+            prior_kl_rows = int(has_prior.sum().item())
+            kl_model_prior_sum = float(prior_kl["kl_model_prior"][has_prior].sum().item())
+            kl_target_prior_sum = float(prior_kl["kl_target_prior"][has_prior].sum().item())
+        else:
+            prior_kl_rows = 0
+            kl_model_prior_sum = 0.0
+            kl_target_prior_sum = 0.0
+        return {
+            "loss": float(loss.item()),
+            "policy_loss": float(policy_loss.item()),
+            "value_loss": float(value_loss.item()),
+            "final_vp_loss": float(final_vp_loss.item()),
+            "q_loss": float(q_loss.item()),
+            "policy_loss_weighted_sum": float(policy_loss_sum.item()),
+            "policy_loss_weight_sum": float(policy_loss_denominator.item()),
+            "value_loss_weighted_sum": float(value_loss_sum.item()),
+            "value_loss_weight_sum": float(value_loss_denominator.item()),
+            "final_vp_loss_weighted_sum": float(final_vp_loss_sum.item()),
+            "final_vp_loss_weight_sum": float(final_vp_loss_denominator.item()),
+            "q_loss_weighted_sum": float(q_loss_sum.item()),
+            "q_loss_weight_sum": float(q_loss_denominator.item()),
+            "q_score_rows_ge2": q_score_rows_ge2,
+            **advantage_stats,
+            "soft_distillation_rows": int(has_soft.sum().item()) if soft_targets is not None else 0,
+            "soft_distillation_active_rows": (
+                int((has_soft & active).sum().item()) if soft_targets is not None else 0
+            ),
+            "active_count": active_count,
+            "accuracy": float(accuracy.item()),
+            "top3_accuracy": float(top3_accuracy.item()),
+            "phase_stats": _field_stats(
+                data,
+                batch[active_np],
+                predictions_np[active_np],
+                targets_np[active_np],
+                logits_np[active_np],
+                field="phase",
+            ),
+            "phase_stats_unforced": _field_stats_unforced(
+                data,
+                batch[active_np],
+                predictions_np[active_np],
+                targets_np[active_np],
+                logits_np[active_np],
+                field="phase",
+            ),
+            "teacher_stats": _field_stats(
+                data,
+                batch[active_np],
+                predictions_np[active_np],
+                targets_np[active_np],
+                logits_np[active_np],
+                field="teacher_name",
+            ),
+            "prior_kl_rows": prior_kl_rows,
+            "prior_kl_model_prior_sum": kl_model_prior_sum,
+            "prior_kl_target_prior_sum": kl_target_prior_sum,
+        }
+
+
+# Large per-decision columns streamed per batch by MemmapCorpus rather than held
+# resident. Everything else (scalars, strings, VP arrays, and the comparatively
+# small legal_action_ids/target_policy/target_scores/masks needed by the
+# full-corpus weight/split/quality passes) is materialised eagerly at load time.
+MEMMAP_LAZY_COLUMNS = frozenset(
+    {
+        "obs",
+        "legal_action_context",
+        "legal_action_tokens",
+        "legal_action_target_ids",
+        "legal_action_mask",
+        "hex_tokens",
+        "hex_vertex_ids",
+        "hex_edge_ids",
+        "hex_mask",
+        "vertex_tokens",
+        "vertex_mask",
+        "edge_tokens",
+        "edge_vertex_ids",
+        "edge_mask",
+        "player_tokens",
+        "player_mask",
+        "global_tokens",
+        "event_tokens",
+        "event_target_ids",
+        "event_mask",
+    }
+)
+
+
+def _normalize_index(idx, n: int) -> np.ndarray:
+    """Coerce a __getitem__ key (int array, slice, or list) into an int64 index array."""
+    if isinstance(idx, slice):
+        return np.arange(*idx.indices(n), dtype=np.int64)
+    arr = np.asarray(idx)
+    if arr.dtype == np.bool_:
+        return np.flatnonzero(arr).astype(np.int64, copy=False)
+    return arr.astype(np.int64, copy=False)
+
+
+class _MemmapFixedColumn:
+    """Fixed-width column backed by a flat memmap; materialises only indexed rows."""
+
+    def __init__(self, mm: np.memmap, n: int):
+        self._mm = mm
+        self.shape = tuple(mm.shape)
+        self.ndim = mm.ndim
+        self.dtype = mm.dtype
+        self._n = n
+
+    def __len__(self) -> int:
+        return self._n
+
+    def __getitem__(self, idx):
+        return np.asarray(self._mm[idx])
+
+    def __array__(self, dtype=None):
+        arr = np.asarray(self._mm)
+        return arr.astype(dtype) if dtype is not None else arr
+
+
+class _MemmapRaggedColumn:
+    """Legal-action-ragged column stored trimmed on disk.
+
+    Reconstructs an ``(len(batch), legal_width[, feat])`` array padded with the
+    loader's fill value, byte-identical to load_teacher_data's padded column for
+    the same rows.
+    """
+
+    def __init__(self, flat: np.memmap, offsets: np.ndarray, legal_width: int, fill, dtype, feat):
+        self._flat = flat
+        self._offsets = offsets
+        self._width = int(legal_width)
+        self._fill = fill
+        self.dtype = np.dtype(dtype)
+        self._feat = feat
+        self._n = int(offsets.shape[0] - 1)
+        self.ndim = 3 if feat is not None else 2
+        self.shape = (self._n, self._width, feat) if feat is not None else (self._n, self._width)
+
+    def __len__(self) -> int:
+        return self._n
+
+    def _reconstruct(self, indices: np.ndarray | None) -> np.ndarray:
+        width = self._width
+        feat = self._feat
+        if indices is None:
+            # Whole corpus: the flat file is already the row-major prefix concat,
+            # so scatter it straight into the padded output without gathering.
+            counts = (self._offsets[1:] - self._offsets[:-1]).astype(np.int64)
+            m = self._n
+            prefix = np.arange(width)[None, :] < counts[:, None]
+            out = self._new_full(m)
+            out[prefix] = np.asarray(self._flat)
+            return out
+        starts = self._offsets[indices]
+        counts = (self._offsets[indices + 1] - starts).astype(np.int64)
+        m = int(indices.shape[0])
+        out = self._new_full(m)
+        total = int(counts.sum())
+        if total:
+            prefix = np.arange(width)[None, :] < counts[:, None]
+            within = np.arange(total, dtype=np.int64) - np.repeat(np.cumsum(counts) - counts, counts)
+            src = np.repeat(starts, counts) + within
+            out[prefix] = np.asarray(self._flat[src])
+        return out
+
+    def _new_full(self, m: int) -> np.ndarray:
+        if self._feat is not None:
+            return np.full((m, self._width, self._feat), self._fill, dtype=self.dtype)
+        return np.full((m, self._width), self._fill, dtype=self.dtype)
+
+    def __getitem__(self, idx):
+        return self._reconstruct(_normalize_index(idx, self._n))
+
+    def __array__(self, dtype=None):
+        arr = self._reconstruct(None)
+        return arr.astype(dtype) if dtype is not None else arr
+
+
+class MemmapCorpus:
+    """Dict-of-arrays view over a corpus built by tools/build_memmap_corpus.py.
+
+    Exposes the same ``data[key][batch]`` interface load_teacher_data returns.
+    Small/full-corpus columns are materialised eagerly; large per-decision
+    columns are lazy (streamed per batch), so host RAM stays bounded regardless
+    of corpus size.
+    """
+
+    def __init__(self, corpus_dir: Path):
+        corpus_dir = Path(corpus_dir)
+        meta_path = corpus_dir / "corpus_meta.json"
+        if not meta_path.exists():
+            raise SystemExit(
+                f"{corpus_dir} is not a memmap corpus (no corpus_meta.json). "
+                "Build it with tools/build_memmap_corpus.py or use --data-format npz."
+            )
+        self.meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        if self.meta.get("schema") != "memmap_corpus_v1":
+            raise SystemExit(f"{meta_path}: unsupported corpus schema {self.meta.get('schema')!r}")
+        self.row_count = int(self.meta["row_count"])
+        self.legal_width = int(self.meta["legal_width"])
+        self.stats = self.meta.get("stats", {})
+        self._columns = self.meta["columns"]
+        self._offsets = np.fromfile(corpus_dir / "row_offsets.dat", dtype=np.int64)
+        if self._offsets.shape[0] != self.row_count + 1:
+            raise SystemExit(
+                f"{corpus_dir}: row_offsets length {self._offsets.shape[0]} != row_count+1 "
+                f"{self.row_count + 1}"
+            )
+        self._eager: dict[str, np.ndarray] = {}
+        self._lazy: dict[str, object] = {}
+        for name, schema in self._columns.items():
+            kind = schema["kind"]
+            if kind == "string":
+                codes = np.fromfile(corpus_dir / f"{name}.codes.dat", dtype=np.int32)
+                categories = np.asarray(schema["categories"], dtype=str)
+                if categories.size == 0:
+                    categories = np.asarray([""], dtype=str)
+                self._eager[name] = categories[codes]
+                continue
+            if kind == "fixed":
+                inner = tuple(int(d) for d in schema["inner_shape"])
+                mm = np.memmap(
+                    corpus_dir / f"{name}.dat",
+                    dtype=np.dtype(schema["dtype"]),
+                    mode="r",
+                    shape=(self.row_count, *inner),
+                )
+                if name in MEMMAP_LAZY_COLUMNS:
+                    self._lazy[name] = _MemmapFixedColumn(mm, self.row_count)
+                else:
+                    self._eager[name] = np.asarray(mm)
+                continue
+            # ragged2d / ragged3d
+            feat = int(schema["feat"]) if kind == "ragged3d" else None
+            flat_shape = (int(self.meta["flat_count"]), feat) if feat is not None else (int(self.meta["flat_count"]),)
+            flat = np.memmap(
+                corpus_dir / f"{name}.dat",
+                dtype=np.dtype(schema["dtype"]),
+                mode="r",
+                shape=flat_shape,
+            )
+            column = _MemmapRaggedColumn(
+                flat, self._offsets, self.legal_width, schema["fill"], schema["dtype"], feat
+            )
+            if name in MEMMAP_LAZY_COLUMNS:
+                self._lazy[name] = column
+            else:
+                self._eager[name] = column._reconstruct(None)
+
+    def __contains__(self, key: str) -> bool:
+        return key in self._eager or key in self._lazy
+
+    def __getitem__(self, key: str):
+        if key in self._eager:
+            return self._eager[key]
+        if key in self._lazy:
+            return self._lazy[key]
+        raise KeyError(key)
+
+    def get(self, key: str, default=None):
+        if key in self:
+            return self[key]
+        return default
+
+    def keys(self):
+        return list(self._eager.keys()) + list(self._lazy.keys())
+
+    def __len__(self) -> int:
+        return self.row_count
+
+
+def load_teacher_data_memmap(path: Path) -> MemmapCorpus:
+    corpus = MemmapCorpus(path)
+    print(
+        json.dumps(
+            {
+                "progress": "bc_memmap_load",
+                "corpus_dir": str(path),
+                "rows": corpus.row_count,
+                "legal_width": corpus.legal_width,
+                "shard_count": int(corpus.meta.get("shard_count", 0)),
+            },
+            sort_keys=True,
+        ),
+        flush=True,
+    )
+    return corpus
+
+
+def _iterate_training_batches(
+    data,
+    order: np.ndarray,
+    train_indices: np.ndarray,
+    batch_size: int,
+    policy_sample_weights: np.ndarray,
+    value_sample_weights: np.ndarray,
+    *,
+    num_workers: int,
+    prefetch: int,
+):
+    """Yield ``(data, batch, policy_weights, value_weights)`` tuples for one epoch.
+
+    Default path (npz dict, or num_workers<=0): yields the corpus and the GLOBAL
+    batch indices unchanged, so train_fn indexes exactly as before -- zero
+    behaviour change and identical batch order.
+
+    Prefetch path (MemmapCorpus + num_workers>0): background threads materialise
+    each batch's columns into a plain dict while the GPU trains the previous
+    batch, overlapping the per-batch ragged reconstruction. train_fn then sees a
+    materialised dict indexed by a local ``arange``, which is element-for-element
+    identical to indexing the corpus with the global batch. Threads (not
+    processes) share the read-only memmaps safely and avoid the fork-duplication
+    pitfall of DataLoader workers.
+    """
+    batches = [
+        train_indices[order[start : start + batch_size]]
+        for start in range(0, len(order), batch_size)
+    ]
+    batches = [b for b in batches if len(b) > 0]
+
+    if num_workers <= 0 or not isinstance(data, MemmapCorpus):
+        for batch in batches:
+            yield data, batch, policy_sample_weights, value_sample_weights
+        return
+
+    keys = list(data.keys())
+
+    def _materialize(batch: np.ndarray):
+        materialized = {key: data[key][batch] for key in keys}
+        local = np.arange(len(batch), dtype=np.int64)
+        return materialized, local, policy_sample_weights[batch], value_sample_weights[batch]
+
+    prefetch = max(1, int(prefetch))
+    with ThreadPoolExecutor(max_workers=int(num_workers)) as executor:
+        pending: deque = deque()
+        next_index = 0
+        while next_index < len(batches) and len(pending) < prefetch:
+            pending.append(executor.submit(_materialize, batches[next_index]))
+            next_index += 1
+        while pending:
+            future = pending.popleft()
+            if next_index < len(batches):
+                pending.append(executor.submit(_materialize, batches[next_index]))
+                next_index += 1
+            yield future.result()
+
+
+def load_teacher_data(
+    path: Path,
+    *,
+    ddp: dict[str, int | bool] | None = None,
+    shard_data: bool = False,
+    mask_hidden_info: bool = False,
+) -> dict:
+    files = _teacher_shard_files(path)
+    if not files:
+        raise SystemExit(f"no teacher shards found in {path}")
+    total_files = len(files)
+    if shard_data:
+        if ddp is None or not bool(ddp.get("enabled", False)):
+            raise SystemExit("--ddp-shard-data requires torchrun/DDP")
+        world_size = int(ddp["world_size"])
+        rank = int(ddp["rank"])
+        files = files[rank::world_size]
+        if not files:
+            raise SystemExit(
+                f"rank {rank} received no teacher shards from {path}; "
+                f"total_shards={total_files}, world_size={world_size}"
+            )
+        print(
+            json.dumps(
+                {
+                    "progress": "bc_data_shard_load",
+                    "rank": rank,
+                    "world_size": world_size,
+                    "loaded_shards": len(files),
+                    "total_shards": total_files,
+                    "first_shard": str(files[0]),
+                    "last_shard": str(files[-1]),
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+    arrays: dict[str, list[np.ndarray]] = {}
+    keys = (
+        "obs",
+        "legal_action_ids",
+        "legal_action_context",
+        "action_taken",
+        "target_policy",
+        "prior_policy",
+        "target_scores",
+        "target_policy_mask",
+        "target_scores_mask",
+        "target_score_source",
+        "game_seed",
+        "teacher_name",
+        "player",
+        "seat",
+        "phase",
+        "decision_index",
+        "action_mask_version",
+        "winner",
+        "terminated",
+        "truncated",
+        "final_public_vps",
+        "has_final_public_vps",
+        "final_actual_vps",
+        "has_final_actual_vps",
+        "policy_weight_multiplier",
+        "value_weight_multiplier",
+        "hex_tokens",
+        "hex_vertex_ids",
+        "hex_edge_ids",
+        "vertex_tokens",
+        "edge_tokens",
+        "edge_vertex_ids",
+        "player_tokens",
+        "global_tokens",
+        "legal_action_tokens",
+        "legal_action_target_ids",
+        "event_tokens",
+        "event_target_ids",
+        "hex_mask",
+        "vertex_mask",
+        "edge_mask",
+        "player_mask",
+        "legal_action_mask",
+        "event_mask",
+    )
+    if mask_hidden_info:
+        from catan_zero.rl.entity_token_features import mask_player_tokens_public
+    for file in files:
+        shard = _normalize_teacher_shard(_load_npz(file), file)
+        if mask_hidden_info and "player_tokens" in shard:
+            # f72 public-observation training: strip opponent hidden slots from the
+            # banked (omniscient) tokens so this corpus trains a public-only model.
+            shard["player_tokens"] = mask_player_tokens_public(shard["player_tokens"])
+        for key in keys:
+            if key in shard:
+                arrays.setdefault(key, []).append(shard[key])
+    return {key: _concat_padded(key, values) for key, values in arrays.items()}
+
+
+def _env_config_for_teacher_data(args, data: dict, ddp: dict[str, int | bool]):
+    from catan_zero.rl.multiagent_env import ColonistMultiAgentEnv
+
+    observed_width = int(data["obs"].shape[1])
+    base_config = parse_track(
+        args.track,
+        vps_to_win=args.vps_to_win,
+        use_graph_history_features=False,
+    )
+    graph_config = parse_track(
+        args.track,
+        vps_to_win=args.vps_to_win,
+        use_graph_history_features=True,
+    )
+
+    def _obs_width(config) -> int:
+        env = ColonistMultiAgentEnv(config)
+        try:
+            return int(env.observation_space.shape[0])
+        finally:
+            env.close()
+
+    base_width = _obs_width(base_config)
+    graph_width = _obs_width(graph_config)
+    if bool(args.graph_history_features):
+        selected = graph_config
+        reason = "explicit"
+    elif observed_width == graph_width and observed_width != base_width:
+        selected = graph_config
+        reason = "auto_detected_from_obs_width"
+    elif observed_width == base_width:
+        selected = base_config
+        reason = "base_obs_width"
+    else:
+        raise SystemExit(
+            "teacher observation width does not match a known train schema: "
+            f"observed={observed_width}, base={base_width}, graph_history={graph_width}. "
+            "Regenerate/curate the shards with the current env or pass the correct "
+            "--graph-history-features setting if the schema changed intentionally."
+        )
+    _rank0_print(
+        json.dumps(
+            {
+                "progress": "bc_env_schema",
+                "track": args.track,
+                "vps_to_win": int(args.vps_to_win),
+                "observed_obs_width": observed_width,
+                "base_obs_width": base_width,
+                "graph_history_obs_width": graph_width,
+                "graph_history_features": bool(
+                    getattr(selected, "use_graph_history_features", False)
+                ),
+                "reason": reason,
+            },
+            sort_keys=True,
+        ),
+        ddp,
+    )
+    return selected
+
+
+def _teacher_shard_files(path: Path) -> list[Path]:
+    manifest_path = path / "manifest.json"
+    if manifest_path.exists():
+        files = _manifest_shard_files(manifest_path)
+        if files:
+            return files
+
+    if (path / "manifest.partial.json").exists() or (path / "parts").exists():
+        raise SystemExit(
+            f"{path} looks like a partial Modal/raw teacher root without a completed "
+            "top-level manifest.json; refusing recursive shard glob. Curate or "
+            "summarize the run first, or pass a completed leaf teacher_data directory."
+        )
+
+    files = sorted(path.glob("*.npz")) + sorted(path.glob("*.npz.zst"))
+    if files:
+        return files
+
+    child_manifests = sorted(
+        candidate
+        for candidate in path.glob("**/manifest.json")
+        if candidate.parent != path
+    )
+    if len(child_manifests) == 1:
+        files = _manifest_shard_files(child_manifests[0])
+        if files:
+            return files
+    if len(child_manifests) > 1:
+        files = _modal_part_manifest_shards(path, child_manifests)
+        if files:
+            return files
+        files = _entity_partition_manifest_shards(child_manifests)
+        if files:
+            return files
+        previews = ", ".join(str(candidate.parent) for candidate in child_manifests[:5])
+        raise SystemExit(
+            f"{path} contains multiple nested teacher manifests; pass a single leaf "
+            f"curated data directory instead of recursively mixing runs. Examples: {previews}"
+        )
+
+    return sorted(path.glob("**/*.npz")) + sorted(path.glob("**/*.npz.zst"))
+
+
+def _modal_part_manifest_shards(path: Path, manifests: list[Path]) -> list[Path]:
+    files: list[Path] = []
+    for manifest in manifests:
+        try:
+            relative = manifest.relative_to(path)
+        except ValueError:
+            return []
+        parts = relative.parts
+        if len(parts) != 3 or parts[0] != "parts" or not parts[1].startswith("part_"):
+            return []
+        files.extend(_manifest_shard_files(manifest))
+    return sorted(files)
+
+
+def _entity_partition_manifest_shards(manifests: list[Path]) -> list[Path]:
+    files: list[Path] = []
+    signatures: set[tuple[str, int, bool]] = set()
+    partition_pairs: set[tuple[int, int]] = set()
+    partition_counts: set[int] = set()
+    for manifest_path in manifests:
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception:
+            return []
+        if manifest.get("schema") != "entity_tokens_v1":
+            return []
+        signatures.add(
+            (
+                str(manifest.get("track", "")),
+                int(manifest.get("vps_to_win", -1)),
+                bool(manifest.get("graph_history_features", False)),
+            )
+        )
+        partition_count = int(manifest.get("partition_count", 1))
+        partition_index = int(manifest.get("partition_index", 0))
+        partition_counts.add(partition_count)
+        partition_pairs.add((partition_count, partition_index))
+        if manifest.get("mismatches"):
+            raise SystemExit(f"{manifest_path} contains entity conversion mismatches")
+        files.extend(_manifest_shard_files(manifest_path))
+    if len(signatures) != 1:
+        return []
+    if len(partition_pairs) != len(manifests):
+        raise SystemExit("duplicate entity conversion partition manifests detected")
+    if len(partition_counts) != 1:
+        raise SystemExit("inconsistent entity conversion partition counts detected")
+    partition_count = next(iter(partition_counts))
+    expected = {(partition_count, index) for index in range(partition_count)}
+    missing = sorted(index for _, index in (expected - partition_pairs))
+    extra = sorted(index for _, index in (partition_pairs - expected))
+    if missing or extra:
+        details = []
+        if missing:
+            details.append(f"missing partition indices {missing[:10]}")
+        if extra:
+            details.append(f"unexpected partition indices {extra[:10]}")
+        raise SystemExit("incomplete entity conversion partition manifests: " + "; ".join(details))
+    return sorted(files)
+
+
+def _manifest_shard_files(manifest_path: Path) -> list[Path]:
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    files = []
+    missing = []
+    for value in manifest.get("shards", ()):
+        raw = Path(value)
+        candidates = [raw] if raw.is_absolute() else [raw, manifest_path.parent / raw]
+        if raw.is_absolute():
+            candidates.append(manifest_path.parent / raw.name)
+        chosen = next((candidate for candidate in candidates if candidate.exists()), candidates[0])
+        files.append(chosen)
+        if not chosen.exists():
+            missing.append(str(chosen))
+    if missing:
+        preview = ", ".join(missing[:5])
+        raise SystemExit(
+            f"{manifest_path} points to missing teacher shards. "
+            f"First missing paths: {preview}"
+        )
+    return files
+
+
+def _normalize_teacher_shard(shard, path: Path) -> dict[str, np.ndarray]:
+    required = ("obs", "legal_action_ids", "legal_action_context", "action_taken")
+    missing = [key for key in required if key not in shard]
+    if missing:
+        raise SystemExit(f"{path} is missing required teacher fields: {missing}")
+
+    action_taken = np.asarray(shard["action_taken"], dtype=np.int16)
+    n = int(len(action_taken))
+    legal = np.asarray(shard["legal_action_ids"], dtype=np.int16)
+    context = np.asarray(shard["legal_action_context"], dtype=np.float16)
+    obs = np.asarray(shard["obs"], dtype=np.float16)
+    if obs.shape[0] != n or legal.shape[0] != n or context.shape[0] != n:
+        raise SystemExit(
+            f"{path} has inconsistent row counts: "
+            f"obs={obs.shape[0]} legal={legal.shape[0]} "
+            f"context={context.shape[0]} action_taken={n}"
+        )
+    if legal.ndim != 2 or context.ndim != 3 or context.shape[1] != legal.shape[1]:
+        raise SystemExit(
+            f"{path} has invalid legal/context shapes: "
+            f"legal={legal.shape} context={context.shape}"
+        )
+
+    legal_width = int(legal.shape[1])
+    shard_has_final_public_vps = False
+    shard_has_final_actual_vps = False
+    target_policy = _field_or_default(
+        shard,
+        "target_policy",
+        np.zeros((n, legal_width), dtype=np.float32),
+        path,
+        leading=n,
+        width=legal_width,
+    ).astype(np.float32, copy=False)  # F4: fp32, not fp16 (see gumbel_self_play.py._build_decision_row)
+    # Success telemetry: root prior (pre-search network policy), same legal_rust
+    # ordering as target_policy -- only populated by Gumbel self-play rows
+    # (gumbel_self_play.py._build_decision_row), defaults to all-zero for any
+    # other teacher source. That default is exactly what scopes
+    # _prior_kl_telemetry to a held-out GEN slice with no extra bookkeeping.
+    prior_policy = _field_or_default(
+        shard,
+        "prior_policy",
+        np.zeros((n, legal_width), dtype=np.float32),
+        path,
+        leading=n,
+        width=legal_width,
+    ).astype(np.float32, copy=False)
+    target_scores = _field_or_default(
+        shard,
+        "target_scores",
+        np.full((n, legal_width), np.nan, dtype=np.float32),
+        path,
+        leading=n,
+        width=legal_width,
+    ).astype(np.float32, copy=False)
+    target_policy_mask = _field_or_default(
+        shard,
+        "target_policy_mask",
+        (np.asarray(target_policy, dtype=np.float32) > 0.0),
+        path,
+        leading=n,
+        width=legal_width,
+    ).astype(np.bool_, copy=False)
+    target_scores_mask = _field_or_default(
+        shard,
+        "target_scores_mask",
+        np.isfinite(target_scores),
+        path,
+        leading=n,
+        width=legal_width,
+    ).astype(np.bool_, copy=False)
+
+    result: dict[str, np.ndarray] = {
+        "obs": obs,
+        "legal_action_ids": legal,
+        "legal_action_context": context,
+        "action_taken": action_taken,
+        "target_policy": target_policy,
+        "prior_policy": prior_policy,
+        "target_scores": target_scores,
+        "target_policy_mask": target_policy_mask,
+        "target_scores_mask": target_scores_mask,
+        "target_score_source": _field_or_default(
+            shard,
+            "target_score_source",
+            np.full(n, "", dtype="<U1"),
+            path,
+            leading=n,
+        ).astype(str),
+        "game_seed": _field_or_default(
+            shard,
+            "game_seed",
+            np.zeros(n, dtype=np.int64),
+            path,
+            leading=n,
+        ).astype(np.int64, copy=False),
+        "teacher_name": _field_or_default(
+            shard,
+            "teacher_name",
+            np.full(n, "", dtype="<U1"),
+            path,
+            leading=n,
+        ).astype(str),
+        "player": _field_or_default(
+            shard,
+            "player",
+            np.full(n, "", dtype="<U1"),
+            path,
+            leading=n,
+        ).astype(str),
+        "seat": _field_or_default(
+            shard,
+            "seat",
+            np.full(n, -1, dtype=np.int8),
+            path,
+            leading=n,
+        ).astype(np.int8, copy=False),
+        "phase": _field_or_default(
+            shard,
+            "phase",
+            np.full(n, "", dtype="<U1"),
+            path,
+            leading=n,
+        ).astype(str),
+        "decision_index": _field_or_default(
+            shard,
+            "decision_index",
+            np.full(n, -1, dtype=np.int32),
+            path,
+            leading=n,
+        ).astype(np.int32, copy=False),
+        "action_mask_version": _field_or_default(
+            shard,
+            "action_mask_version",
+            np.full(n, "", dtype="<U1"),
+            path,
+            leading=n,
+        ).astype(str),
+        "winner": _field_or_default(
+            shard,
+            "winner",
+            np.full(n, "", dtype="<U1"),
+            path,
+            leading=n,
+        ).astype(str),
+        "terminated": _field_or_default(
+            shard,
+            "terminated",
+            np.full(n, True, dtype=np.bool_),
+            path,
+            leading=n,
+        ).astype(np.bool_, copy=False),
+        "truncated": _field_or_default(
+            shard,
+            "truncated",
+            np.full(n, False, dtype=np.bool_),
+            path,
+            leading=n,
+        ).astype(np.bool_, copy=False),
+        "final_public_vps": _field_or_default(
+            shard,
+            "final_public_vps",
+            np.zeros((n, 4), dtype=np.int16),
+            path,
+            leading=n,
+        ).astype(np.int16, copy=False),
+        "has_final_public_vps": _field_or_default(
+            shard,
+            "has_final_public_vps",
+            np.full(n, shard_has_final_public_vps, dtype=np.bool_),
+            path,
+            leading=n,
+        ).astype(np.bool_, copy=False),
+        "final_actual_vps": _field_or_default(
+            shard,
+            "final_actual_vps",
+            np.zeros((n, 4), dtype=np.int16),
+            path,
+            leading=n,
+        ).astype(np.int16, copy=False),
+        "has_final_actual_vps": _field_or_default(
+            shard,
+            "has_final_actual_vps",
+            np.full(n, shard_has_final_actual_vps, dtype=np.bool_),
+            path,
+            leading=n,
+        ).astype(np.bool_, copy=False),
+        "policy_weight_multiplier": _field_or_default(
+            shard,
+            "policy_weight_multiplier",
+            np.ones(n, dtype=np.float32),
+            path,
+            leading=n,
+        ).astype(np.float32, copy=False),
+        "value_weight_multiplier": _field_or_default(
+            shard,
+            "value_weight_multiplier",
+            np.ones(n, dtype=np.float32),
+            path,
+            leading=n,
+        ).astype(np.float32, copy=False),
+    }
+    for key, dtype in ENTITY_FIELD_DTYPES.items():
+        if key not in shard:
+            continue
+        value = np.asarray(shard[key])
+        if value.shape[0] != n:
+            raise SystemExit(
+                f"{path} field {key} has {value.shape[0]} rows, expected {n}"
+            )
+        result[key] = value.astype(dtype, copy=False)
+    return result
+
+
+def _field_or_default(
+    shard,
+    key: str,
+    default: np.ndarray,
+    path: Path,
+    *,
+    leading: int,
+    width: int | None = None,
+) -> np.ndarray:
+    if key not in shard:
+        return default
+    value = np.asarray(shard[key])
+    if value.shape[0] != leading:
+        raise SystemExit(
+            f"{path} field {key} has {value.shape[0]} rows, expected {leading}"
+        )
+    if width is not None and (value.ndim < 2 or value.shape[1] != width):
+        raise SystemExit(
+            f"{path} field {key} has shape {value.shape}, expected width {width}"
+        )
+    return value
+
+
+def teacher_data_quality(
+    data: dict,
+    *,
+    q_skip_teacher_prefixes: tuple[str, ...] = ("catanatron_ab",),
+    soft_target_temperature: float = 0.7,
+    soft_target_source: str = "policy",
+    soft_target_min_legal_coverage: float = 0.5,
+) -> dict:
+    n = int(len(data["action_taken"]))
+    legal_counts = np.sum(data["legal_action_ids"] >= 0, axis=1)
+    target_policy = np.asarray(data.get("target_policy", np.zeros((n, 0))), dtype=np.float32)
+    target_scores = np.asarray(data.get("target_scores", np.full((n, 0), np.nan)), dtype=np.float32)
+    legal_mask = data["legal_action_ids"] >= 0
+    target_policy_mask = np.asarray(
+        data.get("target_policy_mask", np.where(np.isfinite(target_policy), target_policy, 0.0) > 0.0),
+        dtype=np.bool_,
+    )
+    target_scores_mask = np.asarray(
+        data.get("target_scores_mask", np.isfinite(target_scores)),
+        dtype=np.bool_,
+    )
+    finite_scores = legal_mask & target_scores_mask & np.isfinite(target_scores)
+    positive_policy = legal_mask & target_policy_mask & (
+        np.where(np.isfinite(target_policy), target_policy, 0.0) > 0.0
+    )
+    policy_rows = np.sum(positive_policy.any(axis=1))
+    score_rows = np.sum(finite_scores.any(axis=1))
+    legal_denominator = np.maximum(legal_counts, 1)
+    score_coverage = np.sum(finite_scores, axis=1) / legal_denominator
+    policy_coverage = np.sum(positive_policy, axis=1) / legal_denominator
+    q_score_rows_ge2 = _q_score_rows_ge2(data, np.arange(n, dtype=np.int64))
+    usable_q_score_rows_ge2 = _q_score_rows_ge2(
+        data,
+        np.arange(n, dtype=np.int64),
+        q_skip_teacher_prefixes=q_skip_teacher_prefixes,
+    )
+    winners = np.asarray(data.get("winner", np.full(n, ""))).astype(str)
+    truncated = np.asarray(data.get("truncated", np.zeros(n, dtype=np.bool_)), dtype=np.bool_)
+    has_final_vps = np.asarray(
+        data.get("has_final_public_vps", np.zeros(n, dtype=np.bool_)),
+        dtype=np.bool_,
+    )
+    has_actual_vps = np.asarray(
+        data.get("has_final_actual_vps", np.zeros(n, dtype=np.bool_)),
+        dtype=np.bool_,
+    )
+    teachers = np.asarray(data.get("teacher_name", np.full(n, ""))).astype(str)
+    phases = np.asarray(data.get("phase", np.full(n, ""))).astype(str)
+    score_sources = np.asarray(data.get("target_score_source", np.full(n, ""))).astype(str)
+    action_mask_versions = np.asarray(data.get("action_mask_version", np.full(n, ""))).astype(str)
+    policy_multiplier = np.asarray(
+        data.get("policy_weight_multiplier", np.ones(n, dtype=np.float32)),
+        dtype=np.float32,
+    )
+    value_multiplier = np.asarray(
+        data.get("value_weight_multiplier", np.ones(n, dtype=np.float32)),
+        dtype=np.float32,
+    )
+    policy_active = policy_multiplier > 0.0
+    value_active = value_multiplier > 0.0
+    soft_payload = _soft_target_array(
+        data,
+        np.arange(n, dtype=np.int64),
+        soft_target_temperature,
+        soft_target_source,
+    )
+    if soft_payload is None:
+        effective_soft_distillation = np.zeros(n, dtype=bool)
+    else:
+        effective_soft_distillation = _has_distillation_distribution(
+            soft_payload[0],
+            soft_payload[1],
+            legal_action_ids=data["legal_action_ids"],
+            min_legal_coverage=soft_target_min_legal_coverage,
+        )
+    unflagged_actual_vp_rows = _unflagged_vp_rows(data, "final_actual_vps", "has_final_actual_vps")
+    unflagged_public_vp_rows = _unflagged_vp_rows(data, "final_public_vps", "has_final_public_vps")
+    matches = data["legal_action_ids"] == data["action_taken"][:, None]
+    selected_action_has_score = np.any(matches & finite_scores, axis=1)
+    soft_scores = np.any(finite_scores, axis=1)
+    soft_policy = np.any(positive_policy, axis=1)
+    ab_root_scores = (score_sources == "ab_root") & soft_scores
+    invalid = int(np.sum(~np.any(matches, axis=1)))
+    policy_active_count = int(np.sum(policy_active))
+    value_active_count = int(np.sum(value_active))
+    q_rows_ge2 = np.sum(finite_scores, axis=1) >= 2
+    usable_finite_scores = finite_scores.copy()
+    skip_rows = _q_skip_rows_for_arrays(
+        teachers,
+        score_sources,
+        q_skip_teacher_prefixes,
+    )
+    if np.any(skip_rows):
+        usable_finite_scores[skip_rows] = False
+    usable_q_rows_ge2 = np.sum(usable_finite_scores, axis=1) >= 2
+    q_score_rows_ge2 = int(np.sum(q_rows_ge2))
+    usable_q_score_rows_ge2 = int(np.sum(usable_q_rows_ge2))
+    return {
+        "samples": n,
+        "soft_policy_rows": int(policy_rows),
+        "soft_policy_fraction": float(policy_rows / max(n, 1)),
+        "soft_score_rows": int(score_rows),
+        "soft_score_fraction": float(score_rows / max(n, 1)),
+        "policy_active_soft_policy_fraction": (
+            float(np.sum(policy_active & soft_policy) / max(policy_active_count, 1))
+        ),
+        "policy_active_soft_score_fraction": (
+            float(np.sum(policy_active & soft_scores) / max(policy_active_count, 1))
+        ),
+        "soft_score_legal_coverage_mean": float(np.mean(score_coverage)) if n else 0.0,
+        "soft_score_legal_coverage_p50": float(np.percentile(score_coverage, 50)) if n else 0.0,
+        "soft_policy_legal_coverage_mean": float(np.mean(policy_coverage)) if n else 0.0,
+        "soft_policy_legal_coverage_p50": float(np.percentile(policy_coverage, 50)) if n else 0.0,
+        "effective_soft_distillation_rows": int(np.sum(effective_soft_distillation)),
+        "effective_soft_distillation_fraction": (
+            float(np.mean(effective_soft_distillation)) if n else 0.0
+        ),
+        "policy_active_effective_soft_distillation_rows": int(
+            np.sum(policy_active & effective_soft_distillation)
+        ),
+        "policy_active_effective_soft_distillation_fraction": (
+            float(np.sum(policy_active & effective_soft_distillation) / max(policy_active_count, 1))
+        ),
+        "soft_target_min_legal_coverage": float(soft_target_min_legal_coverage),
+        "selected_action_score_fraction": (
+            float(np.mean(selected_action_has_score)) if n else 0.0
+        ),
+        "q_score_rows_ge2": int(q_score_rows_ge2),
+        "q_score_rows_ge2_fraction": float(q_score_rows_ge2 / max(n, 1)),
+        "usable_q_score_rows_ge2": int(usable_q_score_rows_ge2),
+        "usable_q_score_rows_ge2_fraction": float(usable_q_score_rows_ge2 / max(n, 1)),
+        "q_score_rows_ge2_policy_active_fraction": (
+            float(np.sum(policy_active & q_rows_ge2) / max(policy_active_count, 1))
+        ),
+        "usable_q_score_rows_ge2_policy_active_fraction": (
+            float(np.sum(policy_active & usable_q_rows_ge2) / max(policy_active_count, 1))
+        ),
+        "q_skip_teacher_prefixes": list(q_skip_teacher_prefixes),
+        "outcome_rows": int(np.sum(winners != "")),
+        "outcome_fraction": float(np.mean(winners != "")) if n else 0.0,
+        "clean_terminal_outcome_rows": int(np.sum((winners != "") & ~truncated)),
+        "clean_terminal_outcome_fraction": (
+            float(np.mean((winners != "") & ~truncated)) if n else 0.0
+        ),
+        "final_public_vp_rows": int(np.sum(has_final_vps)),
+        "final_public_vp_fraction": float(np.mean(has_final_vps)) if n else 0.0,
+        "final_actual_vp_rows": int(np.sum(has_actual_vps)),
+        "final_actual_vp_fraction": float(np.mean(has_actual_vps)) if n else 0.0,
+        "unflagged_final_actual_vp_rows": int(np.sum(unflagged_actual_vp_rows)),
+        "unflagged_final_public_vp_rows": int(np.sum(unflagged_public_vp_rows)),
+        "truncated_rows": int(np.sum(truncated)),
+        "truncated_fraction": float(np.mean(truncated)) if n else 0.0,
+        "forced_action_rows": int(np.sum(legal_counts == 1)),
+        "forced_action_fraction": float(np.mean(legal_counts == 1)) if n else 0.0,
+        "policy_weight_zero_rows": int(np.sum(policy_multiplier <= 0.0)),
+        "policy_weight_zero_fraction": float(np.mean(policy_multiplier <= 0.0)) if n else 0.0,
+        "value_weight_zero_rows": int(np.sum(value_multiplier <= 0.0)),
+        "value_weight_zero_fraction": float(np.mean(value_multiplier <= 0.0)) if n else 0.0,
+        "policy_active_rows": policy_active_count,
+        "policy_active_fraction": float(policy_active_count / max(n, 1)),
+        "value_active_rows": value_active_count,
+        "value_active_fraction": float(value_active_count / max(n, 1)),
+        "policy_effective_forced_action_fraction": (
+            float(np.sum(policy_active & (legal_counts == 1))) / float(max(policy_active_count, 1))
+        ),
+        "policy_effective_roll_fraction": (
+            float(np.sum(policy_active & (phases == "roll"))) / float(max(policy_active_count, 1))
+        ),
+        "invalid_teacher_actions": invalid,
+        "legal_actions_mean": float(np.mean(legal_counts)) if n else 0.0,
+        "legal_actions_p90": int(np.percentile(legal_counts, 90)) if n else 0,
+        "legal_actions_max": int(np.max(legal_counts)) if n else 0,
+        "teacher_counts": _string_counts(teachers),
+        "phase_counts": _string_counts(phases),
+        "target_score_source_counts": _string_counts(
+            np.where(score_sources == "", "none", score_sources)
+        ),
+        "ab_root_score_rows": int(np.sum((score_sources == "ab_root") & np.isfinite(target_scores).any(axis=1))),
+        "ab_root_score_fraction": float(
+            np.mean((score_sources == "ab_root") & np.isfinite(target_scores).any(axis=1))
+        )
+        if n
+        else 0.0,
+        "policy_active_ab_root_score_fraction": (
+            float(np.sum(policy_active & ab_root_scores) / max(policy_active_count, 1))
+        ),
+        "action_mask_version_counts": _string_counts(action_mask_versions),
+        "by_teacher": _quality_by_field(
+            data,
+            "teacher_name",
+            q_skip_teacher_prefixes=q_skip_teacher_prefixes,
+            soft_target_temperature=soft_target_temperature,
+            soft_target_source=soft_target_source,
+            soft_target_min_legal_coverage=soft_target_min_legal_coverage,
+            effective_soft_distillation=effective_soft_distillation,
+        ),
+        "by_phase": _quality_by_field(
+            data,
+            "phase",
+            q_skip_teacher_prefixes=q_skip_teacher_prefixes,
+            soft_target_temperature=soft_target_temperature,
+            soft_target_source=soft_target_source,
+            soft_target_min_legal_coverage=soft_target_min_legal_coverage,
+            effective_soft_distillation=effective_soft_distillation,
+        ),
+        "by_teacher_phase": _quality_by_fields(
+            data,
+            ("teacher_name", "phase"),
+            q_skip_teacher_prefixes=q_skip_teacher_prefixes,
+            soft_target_temperature=soft_target_temperature,
+            soft_target_source=soft_target_source,
+            soft_target_min_legal_coverage=soft_target_min_legal_coverage,
+            effective_soft_distillation=effective_soft_distillation,
+        ),
+    }
+
+
+def sample_weight_quality(data: dict, weights: np.ndarray) -> dict:
+    weights = np.asarray(weights, dtype=np.float64)
+    if weights.size == 0:
+        return {
+            "mean": 0.0,
+            "min": 0.0,
+            "max": 0.0,
+            "effective_sample_size": 0.0,
+            "effective_sample_fraction": 0.0,
+            "by_teacher": {},
+            "by_phase": {},
+        }
+    denom = float(np.sum(weights * weights))
+    effective = float(np.sum(weights) ** 2 / denom) if denom > 0.0 else 0.0
+    return {
+        "mean": float(np.mean(weights)),
+        "min": float(np.min(weights)),
+        "max": float(np.max(weights)),
+        "effective_sample_size": effective,
+        "effective_sample_fraction": effective / float(len(weights)),
+        "by_teacher": _weight_by_field(data, weights, "teacher_name"),
+        "by_phase": _weight_by_field(data, weights, "phase"),
+    }
+
+
+def per_game_weight_quality(data: dict, weights: np.ndarray) -> dict:
+    """CAT-60 verification: log the actual per-game total weight mass directly (not just
+    trust the per-game normalization formula) so a smoke train can confirm games of very
+    different lengths end up with roughly equal total value-loss mass when
+    --per-game-value-weight is on -- and, for comparison, how unequal it is when off."""
+
+    n = len(weights)
+    if n == 0:
+        return {"n_games": 0, "rows_per_game": {}, "total_weight_per_game": {}}
+    seeds = np.asarray(data.get("game_seed", np.arange(n, dtype=np.int64)), dtype=np.int64)
+    weights64 = np.asarray(weights, dtype=np.float64)
+    unique_seeds, inverse, counts = np.unique(seeds, return_inverse=True, return_counts=True)
+    totals = np.zeros(len(unique_seeds), dtype=np.float64)
+    np.add.at(totals, inverse, weights64)
+    return {
+        "n_games": int(len(unique_seeds)),
+        "rows_per_game": {
+            "min": int(counts.min()),
+            "max": int(counts.max()),
+            "mean": float(counts.mean()),
+        },
+        "total_weight_per_game": {
+            "min": float(totals.min()),
+            "max": float(totals.max()),
+            "mean": float(totals.mean()),
+            "std": float(totals.std()),
+        },
+    }
+
+
+def validate_teacher_data_schema(policy, data: dict, data_quality: dict, env_config) -> None:
+    config = getattr(policy, "config", None)
+    action_size = int(getattr(policy, "action_size", getattr(config, "action_size", 0)))
+    observation_size = int(getattr(config, "observation_size", 0))
+    context_size = int(
+        getattr(
+            policy,
+            "context_action_feature_size",
+            getattr(config, "context_action_feature_size", 0),
+        )
+    )
+    # obs / context / entity-token columns are checked for shape only, so read
+    # them without np.asarray -- a MemmapCorpus streams these lazily and
+    # materialising the full column here would defeat the streaming loader.
+    obs = data["obs"]
+    legal = np.asarray(data["legal_action_ids"])
+    context = data["legal_action_context"]
+    actions = np.asarray(data["action_taken"])
+    problems: list[str] = []
+    if observation_size and obs.ndim == 2 and int(obs.shape[1]) != observation_size:
+        problems.append(
+            f"obs width {obs.shape[1]} != checkpoint observation_size {observation_size}"
+        )
+    if legal.ndim != 2:
+        problems.append(f"legal_action_ids must be rank 2, got {legal.shape}")
+    else:
+        duplicate_rows = _duplicate_legal_action_rows(legal)
+        if duplicate_rows.size:
+            preview = ", ".join(str(int(row)) for row in duplicate_rows[:5])
+            problems.append(
+                "duplicate legal action ids in rows "
+                f"{preview}; each legal_action_ids row must be unique"
+            )
+    if context.ndim != 3:
+        problems.append(f"legal_action_context must be rank 3, got {context.shape}")
+    elif context_size and int(context.shape[2]) != context_size:
+        problems.append(
+            f"legal_action_context width {context.shape[2]} != checkpoint context size {context_size}"
+        )
+    if getattr(policy, "policy_type", "") == "entity_graph":
+        missing_entity = [key for key in ENTITY_BATCH_KEYS if key not in data]
+        if missing_entity:
+            problems.append(
+                "entity_graph requires converted entity-token fields; "
+                f"missing {missing_entity[:8]}{'...' if len(missing_entity) > 8 else ''}"
+            )
+        else:
+            entity_shapes = {
+                "hex_tokens": (3, 19, HEX_FEATURE_SIZE),
+                "vertex_tokens": (3, 54, VERTEX_FEATURE_SIZE),
+                "edge_tokens": (3, 72, EDGE_FEATURE_SIZE),
+                "player_tokens": (3, None, PLAYER_FEATURE_SIZE),
+                "global_tokens": (3, 1, GLOBAL_FEATURE_SIZE),
+                "legal_action_tokens": (3, legal.shape[1] if legal.ndim == 2 else None, None),
+                "event_tokens": (3, None, EVENT_FEATURE_SIZE),
+            }
+            feature_sizes = {
+                "legal_action_tokens": int(getattr(config, "legal_action_feature_size", 0) or 0),
+            }
+            for key, expected in entity_shapes.items():
+                value = data[key]  # shape-only checks; keep lazy columns unmaterialised
+                if value.ndim != expected[0]:
+                    problems.append(f"{key} must be rank {expected[0]}, got {value.shape}")
+                    continue
+                if expected[1] is not None and int(value.shape[1]) != int(expected[1]):
+                    problems.append(
+                        f"{key} dim1 {value.shape[1]} != expected {expected[1]}"
+                    )
+                expected_width = feature_sizes.get(key)
+                if expected_width is None:
+                    expected_width = expected[2]
+                if expected_width and int(value.shape[2]) != int(expected_width):
+                    problems.append(
+                        f"{key} width {value.shape[2]} != checkpoint width {expected_width}"
+                    )
+            for key in (
+                "hex_mask",
+                "vertex_mask",
+                "edge_mask",
+                "player_mask",
+                "legal_action_mask",
+                "event_mask",
+            ):
+                value = data[key]  # shape-only checks; keep lazy columns unmaterialised
+                if value.ndim != 2 or value.shape[0] != len(actions):
+                    problems.append(f"{key} must be rank 2 with {len(actions)} rows, got {value.shape}")
+            if (
+                legal.ndim == 2
+                and "legal_action_tokens" in data
+                and "legal_action_mask" in data
+                and data["legal_action_tokens"].shape[1] != legal.shape[1]
+            ):
+                problems.append(
+                    "legal_action_tokens candidate width must match legal_action_ids width"
+                )
+    if action_size:
+        valid_legal = legal[legal >= 0]
+        if valid_legal.size and int(np.max(valid_legal)) >= action_size:
+            problems.append(
+                f"legal action id max {int(np.max(valid_legal))} >= checkpoint action_size {action_size}"
+            )
+        if actions.size and (int(np.min(actions)) < 0 or int(np.max(actions)) >= action_size):
+            problems.append(
+                f"action_taken range [{int(np.min(actions))}, {int(np.max(actions))}] "
+                f"is outside checkpoint action_size {action_size}"
+            )
+    if int(data_quality.get("invalid_teacher_actions", 0)) != 0:
+        problems.append(
+            f"invalid_teacher_actions={int(data_quality['invalid_teacher_actions'])}; "
+            "teacher action must be present in legal_action_ids"
+        )
+    versions = np.asarray(data.get("action_mask_version", np.full(len(actions), ""))).astype(str)
+    nonempty_versions = sorted({version for version in versions if version})
+    if nonempty_versions and np.any(versions == ""):
+        problems.append(
+            "mixed known and unknown action_mask_version values; regenerate or curate "
+            "old shards instead of mixing empty-version rows with versioned rows"
+        )
+    if not nonempty_versions and len(actions) >= 1000:
+        problems.append(
+            "missing action_mask_version for a production-sized teacher dataset; "
+            "regenerate or curate shards with current action catalog provenance"
+        )
+    if len(nonempty_versions) > 1:
+        problems.append(f"mixed action_mask_version values: {nonempty_versions}")
+    expected_version = _expected_action_mask_version(env_config)
+    checkpoint_version = str(getattr(config, "action_mask_version", "") or "")
+    if expected_version and checkpoint_version and checkpoint_version != expected_version:
+        problems.append(
+            f"checkpoint action_mask_version {checkpoint_version!r} does not match "
+            f"current env action_mask_version {expected_version!r}"
+        )
+    if expected_version and nonempty_versions and nonempty_versions != [expected_version]:
+        problems.append(
+            f"teacher action_mask_version {nonempty_versions} does not match current "
+            f"env action_mask_version {expected_version!r}"
+        )
+    expected_static_hash = _expected_static_action_features_sha256(env_config)
+    checkpoint_static_hash = _policy_static_action_features_sha256(policy)
+    if (
+        expected_static_hash
+        and checkpoint_static_hash
+        and checkpoint_static_hash != expected_static_hash
+    ):
+        problems.append(
+            "checkpoint static_action_features_sha256 does not match current "
+            f"env action features: checkpoint={checkpoint_static_hash} "
+            f"current={expected_static_hash}"
+        )
+    if problems:
+        raise SystemExit("teacher data schema validation failed: " + "; ".join(problems))
+
+
+def _expected_action_mask_version(env_config) -> str:
+    from catan_zero.rl.multiagent_env import ColonistMultiAgentEnv
+
+    env = ColonistMultiAgentEnv(env_config)
+    try:
+        _, info = env.reset(seed=0)
+        return str(info.get("action_mask_version", ""))
+    finally:
+        env.close()
+
+
+def _expected_static_action_features_sha256(env_config) -> str:
+    from catan_zero.rl.multiagent_env import ColonistMultiAgentEnv
+
+    env = ColonistMultiAgentEnv(env_config)
+    try:
+        env.reset(seed=0)
+        return _array_sha256(build_action_feature_table(env))
+    finally:
+        env.close()
+
+
+def _policy_static_action_features_sha256(policy) -> str:
+    static = getattr(policy, "static_action_features", None)
+    if static is None:
+        static = getattr(policy, "action_features", None)
+    if static is None:
+        return ""
+    if hasattr(static, "detach"):
+        static = static.detach().cpu().numpy()
+    return _array_sha256(np.asarray(static, dtype=np.float32))
+
+
+def _quality_by_field(
+    data: dict,
+    field: str,
+    *,
+    limit: int = 40,
+    q_skip_teacher_prefixes: tuple[str, ...] = (),
+    soft_target_temperature: float = 0.7,
+    soft_target_source: str = "policy",
+    soft_target_min_legal_coverage: float = 0.5,
+    effective_soft_distillation: np.ndarray | None = None,
+) -> dict[str, dict]:
+    n = int(len(data["action_taken"]))
+    values = np.asarray(data.get(field, np.full(n, ""))).astype(str)
+    result = {}
+    for key in _top_group_keys(values, limit=limit):
+        mask = values == key
+        result[str(key)] = _quality_for_mask(
+            data,
+            mask,
+            q_skip_teacher_prefixes=q_skip_teacher_prefixes,
+            soft_target_temperature=soft_target_temperature,
+            soft_target_source=soft_target_source,
+            soft_target_min_legal_coverage=soft_target_min_legal_coverage,
+            effective_soft_distillation=effective_soft_distillation,
+        )
+    return result
+
+
+def _quality_by_fields(
+    data: dict,
+    fields: tuple[str, ...],
+    *,
+    limit: int = 80,
+    q_skip_teacher_prefixes: tuple[str, ...] = (),
+    soft_target_temperature: float = 0.7,
+    soft_target_source: str = "policy",
+    soft_target_min_legal_coverage: float = 0.5,
+    effective_soft_distillation: np.ndarray | None = None,
+) -> dict[str, dict]:
+    n = int(len(data["action_taken"]))
+    columns = [
+        np.asarray(data.get(field, np.full(n, ""))).astype(str)
+        for field in fields
+    ]
+    keys = np.asarray(["|".join(parts) for parts in zip(*columns, strict=False)])
+    result = {}
+    for key in _top_group_keys(keys, limit=limit):
+        mask = keys == key
+        result[str(key)] = _quality_for_mask(
+            data,
+            mask,
+            q_skip_teacher_prefixes=q_skip_teacher_prefixes,
+            soft_target_temperature=soft_target_temperature,
+            soft_target_source=soft_target_source,
+            soft_target_min_legal_coverage=soft_target_min_legal_coverage,
+            effective_soft_distillation=effective_soft_distillation,
+        )
+    return result
+
+
+def _quality_for_mask(
+    data: dict,
+    mask: np.ndarray,
+    *,
+    q_skip_teacher_prefixes: tuple[str, ...] = (),
+    soft_target_temperature: float = 0.7,
+    soft_target_source: str = "policy",
+    soft_target_min_legal_coverage: float = 0.5,
+    effective_soft_distillation: np.ndarray | None = None,
+) -> dict:
+    mask = np.asarray(mask, dtype=bool)
+    n = int(np.sum(mask))
+    if n == 0:
+        return {}
+    legal = data["legal_action_ids"][mask]
+    actions = data["action_taken"][mask]
+    legal_counts = np.sum(legal >= 0, axis=1)
+    target_policy = np.asarray(data.get("target_policy", np.zeros((len(data["action_taken"]), 0)))[mask], dtype=np.float32)
+    target_scores = np.asarray(data.get("target_scores", np.full((len(data["action_taken"]), 0), np.nan))[mask], dtype=np.float32)
+    teachers = np.asarray(data.get("teacher_name", np.full(len(data["action_taken"]), "")))[mask].astype(str)
+    score_sources = np.asarray(
+        data.get("target_score_source", np.full(len(data["action_taken"]), ""))
+    )[mask].astype(str)
+    winners = np.asarray(data.get("winner", np.full(len(data["action_taken"]), "")))[mask].astype(str)
+    players = np.asarray(data.get("player", np.full(len(data["action_taken"]), "")))[mask].astype(str)
+    truncated = np.asarray(data.get("truncated", np.zeros(len(data["action_taken"]), dtype=np.bool_)))[mask].astype(bool)
+    phases = np.asarray(data.get("phase", np.full(len(data["action_taken"]), "")))[mask].astype(str)
+    policy_multiplier = np.asarray(
+        data.get("policy_weight_multiplier", np.ones(len(data["action_taken"]), dtype=np.float32))
+    )[mask].astype(np.float32)
+    value_multiplier = np.asarray(
+        data.get("value_weight_multiplier", np.ones(len(data["action_taken"]), dtype=np.float32))
+    )[mask].astype(np.float32)
+    policy_active = policy_multiplier > 0.0
+    value_active = value_multiplier > 0.0
+    if effective_soft_distillation is not None:
+        effective_soft_distillation_masked = np.asarray(
+            effective_soft_distillation,
+            dtype=bool,
+        )[mask]
+    else:
+        batch = np.flatnonzero(mask).astype(np.int64)
+        soft_payload = _soft_target_array(
+            data,
+            batch,
+            soft_target_temperature,
+            soft_target_source,
+        )
+        if soft_payload is None:
+            effective_soft_distillation_masked = np.zeros(n, dtype=bool)
+        else:
+            effective_soft_distillation_masked = _has_distillation_distribution(
+                soft_payload[0],
+                soft_payload[1],
+                legal_action_ids=legal,
+                min_legal_coverage=soft_target_min_legal_coverage,
+            )
+    has_final_vps = np.asarray(
+        data.get("has_final_public_vps", np.zeros(len(data["action_taken"]), dtype=np.bool_))
+    )[mask].astype(bool)
+    has_actual_vps = np.asarray(
+        data.get("has_final_actual_vps", np.zeros(len(data["action_taken"]), dtype=np.bool_))
+    )[mask].astype(bool)
+    matches = legal == actions[:, None]
+    target_policy_mask_all = np.asarray(
+        data.get(
+            "target_policy_mask",
+            np.where(
+                np.isfinite(data.get("target_policy", np.zeros((len(data["action_taken"]), 0)))),
+                data.get("target_policy", np.zeros((len(data["action_taken"]), 0))),
+                0.0,
+            )
+            > 0.0,
+        ),
+        dtype=np.bool_,
+    )
+    target_scores_all = data.get(
+        "target_scores",
+        np.full((len(data["action_taken"]), 0), np.nan),
+    )
+    target_scores_mask_all = np.asarray(
+        data.get("target_scores_mask", np.isfinite(target_scores_all)),
+        dtype=np.bool_,
+    )
+    target_policy_mask = np.asarray(
+        target_policy_mask_all,
+        dtype=np.bool_,
+    )[mask]
+    target_scores_mask = np.asarray(
+        target_scores_mask_all,
+        dtype=np.bool_,
+    )[mask]
+    finite_scores = (legal >= 0) & target_scores_mask & np.isfinite(target_scores)
+    positive_policy = (legal >= 0) & target_policy_mask & (
+        np.where(np.isfinite(target_policy), target_policy, 0.0) > 0.0
+    )
+    soft_policy = np.any(positive_policy, axis=1)
+    soft_scores = np.any(finite_scores, axis=1)
+    ab_root_scores = (score_sources == "ab_root") & soft_scores
+    selected_action_has_score = np.any(matches & finite_scores, axis=1)
+    legal_denominator = np.maximum(legal_counts, 1)
+    score_coverage = np.sum(finite_scores, axis=1) / legal_denominator
+    policy_coverage = np.sum(positive_policy, axis=1) / legal_denominator
+    q_rows_ge2 = np.sum(finite_scores, axis=1) >= 2
+    usable_finite_scores = finite_scores.copy()
+    skip_rows = _q_skip_rows_for_arrays(
+        teachers,
+        score_sources,
+        q_skip_teacher_prefixes,
+    )
+    if np.any(skip_rows):
+        usable_finite_scores[skip_rows] = False
+    usable_q_rows_ge2 = np.sum(usable_finite_scores, axis=1) >= 2
+    clean_outcome = (winners != "") & ~truncated
+    winner_rows = clean_outcome & (winners == players)
+    policy_active_count = int(np.sum(policy_active))
+    value_active_count = int(np.sum(value_active))
+    return {
+        "samples": n,
+        "target_score_source_counts": _string_counts(
+            np.where(score_sources == "", "none", score_sources)
+        ),
+        "ab_root_score_fraction": float(
+            np.mean((score_sources == "ab_root") & soft_scores)
+        ),
+        "soft_policy_fraction": float(np.mean(soft_policy)),
+        "soft_score_fraction": float(np.mean(soft_scores)),
+        "policy_active_soft_policy_fraction": (
+            float(np.sum(policy_active & soft_policy) / max(policy_active_count, 1))
+        ),
+        "policy_active_soft_score_fraction": (
+            float(np.sum(policy_active & soft_scores) / max(policy_active_count, 1))
+        ),
+        "policy_active_ab_root_score_fraction": (
+            float(np.sum(policy_active & ab_root_scores) / max(policy_active_count, 1))
+        ),
+        "soft_score_legal_coverage_mean": float(np.mean(score_coverage)),
+        "soft_score_legal_coverage_p50": float(np.percentile(score_coverage, 50)),
+        "soft_policy_legal_coverage_mean": float(np.mean(policy_coverage)),
+        "soft_policy_legal_coverage_p50": float(np.percentile(policy_coverage, 50)),
+        "effective_soft_distillation_fraction": float(np.mean(effective_soft_distillation_masked)),
+        "policy_active_effective_soft_distillation_fraction": (
+            float(np.sum(policy_active & effective_soft_distillation_masked) / max(policy_active_count, 1))
+        ),
+        "effective_soft_distillation_rows": int(np.sum(effective_soft_distillation_masked)),
+        "policy_active_effective_soft_distillation_rows": int(
+            np.sum(policy_active & effective_soft_distillation_masked)
+        ),
+        "selected_action_score_fraction": float(np.mean(selected_action_has_score)),
+        "q_score_rows_ge2": int(np.sum(q_rows_ge2)),
+        "q_score_rows_ge2_fraction": float(np.mean(q_rows_ge2)),
+        "q_score_rows_ge2_policy_active_fraction": (
+            float(np.sum(policy_active & q_rows_ge2) / max(policy_active_count, 1))
+        ),
+        "usable_q_score_rows_ge2": int(np.sum(usable_q_rows_ge2)),
+        "usable_q_score_rows_ge2_fraction": float(np.mean(usable_q_rows_ge2)),
+        "usable_q_score_rows_ge2_policy_active_fraction": (
+            float(np.sum(policy_active & usable_q_rows_ge2) / max(policy_active_count, 1))
+        ),
+        "forced_action_fraction": float(np.mean(legal_counts == 1)),
+        "policy_weight_zero_fraction": float(np.mean(policy_multiplier <= 0.0)),
+        "value_weight_zero_fraction": float(np.mean(value_multiplier <= 0.0)),
+        "policy_active_rows": policy_active_count,
+        "policy_active_fraction": float(policy_active_count / max(n, 1)),
+        "value_active_rows": value_active_count,
+        "value_active_fraction": float(value_active_count / max(n, 1)),
+        "policy_effective_forced_action_fraction": (
+            float(np.sum(policy_active & (legal_counts == 1))) / float(max(policy_active_count, 1))
+        ),
+        "policy_effective_roll_fraction": (
+            float(np.sum(policy_active & (phases == "roll"))) / float(max(policy_active_count, 1))
+        ),
+        "invalid_teacher_actions": int(np.sum(~np.any(matches, axis=1))),
+        "truncated_fraction": float(np.mean(truncated)),
+        "outcome_fraction": float(np.mean(winners != "")),
+        "clean_terminal_outcome_fraction": float(np.mean(clean_outcome)),
+        "final_public_vp_fraction": float(np.mean(has_final_vps)),
+        "final_actual_vp_fraction": float(np.mean(has_actual_vps)),
+        "winner_row_fraction": float(np.mean(winner_rows)) if np.any(clean_outcome) else 0.0,
+        "legal_actions_mean": float(np.mean(legal_counts)),
+        "legal_actions_p90": int(np.percentile(legal_counts, 90)),
+    }
+
+
+def _weight_by_field(
+    data: dict,
+    weights: np.ndarray,
+    field: str,
+    *,
+    limit: int = 40,
+) -> dict[str, dict]:
+    n = int(len(data["action_taken"]))
+    values = np.asarray(data.get(field, np.full(n, ""))).astype(str)
+    result = {}
+    for key in _top_group_keys(values, limit=limit):
+        mask = values == key
+        raw_count = int(np.sum(mask))
+        total = float(np.sum(weights[mask]))
+        result[str(key)] = {
+            "raw_samples": raw_count,
+            "weight_sum": total,
+            "mean_weight": total / max(raw_count, 1),
+        }
+    return result
+
+
+def _top_group_keys(values: np.ndarray, *, limit: int) -> list[str]:
+    if values.size == 0:
+        return []
+    unique, counts = np.unique(values.astype(str), return_counts=True)
+    order = np.argsort(-counts)
+    return [str(unique[index]) for index in order[:limit]]
+
+
+def _string_counts(values: np.ndarray, *, limit: int = 20) -> dict[str, int]:
+    if values.size == 0:
+        return {}
+    unique, counts = np.unique(values.astype(str), return_counts=True)
+    order = np.argsort(-counts)
+    return {
+        str(unique[index]): int(counts[index])
+        for index in order[:limit]
+    }
+
+
+def _load_npz(path: Path):
+    if path.suffix == ".zst":
+        try:
+            import zstandard as zstd
+        except ImportError as error:
+            raise SystemExit("zstandard is required to read .npz.zst shards") from error
+        data = zstd.ZstdDecompressor().decompress(path.read_bytes())
+        return np.load(io.BytesIO(data), allow_pickle=False)
+    return np.load(path, allow_pickle=False)
+
+
+def _dense_context(data: dict, batch: np.ndarray, action_size: int, context_size: int) -> np.ndarray:
+    dense = np.zeros((len(batch), action_size, context_size), dtype=np.float32)
+    valid = data["legal_action_ids"][batch]
+    context = data["legal_action_context"][batch]
+    for row in range(len(batch)):
+        actions = valid[row]
+        keep = actions >= 0
+        dense[row, actions[keep].astype(np.int64), :] = context[row, keep, :context_size]
+    return dense
+
+
+def _valid_lists(values: np.ndarray) -> list[tuple[int, ...]]:
+    # OPT-4: numpy boolean mask + tolist avoids the per-element double int()
+    # cast and the Python filter loop. Output is identical -- non-negative
+    # action ids in original order as a tuple of Python ints, per row.
+    return [tuple(row[row >= 0].tolist()) for row in np.asarray(values)]
+
+
+def _target_columns(legal_action_ids: np.ndarray, actions: np.ndarray) -> np.ndarray:
+    duplicate_rows = _duplicate_legal_action_rows(legal_action_ids)
+    if duplicate_rows.size:
+        first = int(duplicate_rows[0])
+        valid = legal_action_ids[first][legal_action_ids[first] >= 0]
+        raise ValueError(
+            "duplicate legal action ids in teacher row "
+            f"{first}: {valid.astype(np.int64).tolist()}"
+        )
+    matches = legal_action_ids == actions[:, None]
+    missing = ~np.any(matches, axis=1)
+    if np.any(missing):
+        first = int(np.flatnonzero(missing)[0])
+        raise ValueError(
+            f"teacher action {int(actions[first])} is not present in legal candidates"
+        )
+    return np.argmax(matches, axis=1).astype(np.int64, copy=False)
+
+
+def _duplicate_legal_action_rows(legal_action_ids: np.ndarray) -> np.ndarray:
+    """Vectorized (task #76 side-finding): the original per-row Python loop
+    with a np.unique() call inside was O(n) Python-level overhead that got
+    dramatically slower under real memory pressure on very large corpora
+    (discovered as a multi-hour pre-training stall on a 14.4M-row corpus,
+    task #65). Sort each row (padding sentinel -1 sorts first), then a
+    duplicate is any adjacent-equal pair among the non-negative (real action
+    id) entries -- two adjacent -1 padding slots are explicitly excluded, not
+    real duplicates.
+    """
+    legal = np.asarray(legal_action_ids)
+    if legal.ndim != 2 or legal.shape[1] < 2:
+        return np.asarray([], dtype=np.int64)
+    sorted_rows = np.sort(legal, axis=1)
+    adjacent_equal = np.diff(sorted_rows, axis=1) == 0
+    later_is_valid = sorted_rows[:, 1:] >= 0
+    has_duplicate = np.any(adjacent_equal & later_is_valid, axis=1)
+    return np.nonzero(has_duplicate)[0].astype(np.int64)
+
+
+def _concat_padded(key: str, values: list[np.ndarray]) -> np.ndarray:
+    if len(values) == 1:
+        return values[0]
+    if key in {
+        "legal_action_ids",
+        "target_policy",
+        "prior_policy",
+        "target_scores",
+        "target_policy_mask",
+        "target_scores_mask",
+        "legal_action_mask",
+    }:
+        if key == "legal_action_ids":
+            fill = -1
+        elif key == "target_scores":
+            fill = np.nan
+        elif key in {"target_policy_mask", "target_scores_mask", "legal_action_mask"}:
+            fill = False
+        else:
+            fill = 0.0
+        width = max(value.shape[1] for value in values)
+        padded = []
+        for value in values:
+            if value.shape[1] == width:
+                padded.append(value)
+                continue
+            out = np.full((value.shape[0], width), fill, dtype=value.dtype)
+            out[:, : value.shape[1]] = value
+            padded.append(out)
+        return np.concatenate(padded, axis=0)
+    if key == "legal_action_context":
+        width = max(value.shape[1] for value in values)
+        feature_size = max(value.shape[2] for value in values)
+        padded = []
+        for value in values:
+            if value.shape[1] == width and value.shape[2] == feature_size:
+                padded.append(value)
+                continue
+            out = np.zeros((value.shape[0], width, feature_size), dtype=value.dtype)
+            out[:, : value.shape[1], : value.shape[2]] = value
+            padded.append(out)
+        return np.concatenate(padded, axis=0)
+    if key in {"legal_action_tokens", "legal_action_target_ids"}:
+        width = max(value.shape[1] for value in values)
+        feature_size = max(value.shape[2] for value in values)
+        fill = -1 if key == "legal_action_target_ids" else 0.0
+        padded = []
+        for value in values:
+            if value.shape[1] == width and value.shape[2] == feature_size:
+                padded.append(value)
+                continue
+            out = np.full((value.shape[0], width, feature_size), fill, dtype=value.dtype)
+            out[:, : value.shape[1], : value.shape[2]] = value
+            padded.append(out)
+        return np.concatenate(padded, axis=0)
+    return np.concatenate(values, axis=0)
+
+
+def _soft_targets_legal(
+    data: dict,
+    batch: np.ndarray,
+    device,
+    temperature: float,
+    source: str,
+    min_legal_coverage: float = 0.0,
+):
+    import torch
+
+    payload = _soft_target_array(data, batch, temperature, source)
+    if payload is None:
+        return None, None, None
+    target, support = payload
+    soft = torch.as_tensor(target, dtype=torch.float32, device=device)
+    support_t = torch.as_tensor(support, dtype=torch.bool, device=device)
+    has_soft = torch.as_tensor(
+        _has_distillation_distribution(
+            target,
+            support,
+            legal_action_ids=data["legal_action_ids"][batch],
+            min_legal_coverage=min_legal_coverage,
+        ),
+        dtype=torch.bool,
+        device=device,
+    )
+    return soft, has_soft, support_t
+
+
+def _soft_targets_full(
+    data: dict,
+    batch: np.ndarray,
+    action_size: int,
+    device,
+    temperature: float,
+    source: str,
+    min_legal_coverage: float = 0.0,
+):
+    import torch
+
+    payload = _soft_target_array(data, batch, temperature, source)
+    if payload is None:
+        return None, None, None
+    target, support = payload
+    legal = data["legal_action_ids"][batch]
+    has_soft_np = _has_distillation_distribution(
+        target,
+        support,
+        legal_action_ids=legal,
+        min_legal_coverage=min_legal_coverage,
+    )
+    dense = np.zeros((len(batch), action_size), dtype=np.float32)
+    dense_support = np.zeros((len(batch), action_size), dtype=np.bool_)
+    for row in range(len(batch)):
+        keep = legal[row] >= 0
+        dense[row, legal[row, keep].astype(np.int64)] = target[row, keep]
+        dense_support[row, legal[row, keep].astype(np.int64)] = support[row, keep]
+    soft = torch.as_tensor(dense, dtype=torch.float32, device=device)
+    support_t = torch.as_tensor(dense_support, dtype=torch.bool, device=device)
+    has_soft = torch.as_tensor(
+        has_soft_np,
+        dtype=torch.bool,
+        device=device,
+    )
+    return soft, has_soft, support_t
+
+
+def _soft_target_array(
+    data: dict,
+    batch: np.ndarray,
+    temperature: float,
+    source: str,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    policy = np.zeros_like(data["legal_action_ids"][batch], dtype=np.float32)
+    policy_support = np.zeros_like(policy, dtype=np.bool_)
+    has_policy = np.zeros(policy.shape[0], dtype=bool)
+    if "target_policy" in data and source in {"prefer_policy", "policy", "prefer_scores"}:
+        policy = np.asarray(data["target_policy"][batch], dtype=np.float32)
+        if "target_policy_mask" in data:
+            policy_support = np.asarray(data["target_policy_mask"][batch], dtype=np.bool_)
+        else:
+            policy_support = np.where(np.isfinite(policy), policy, 0.0) > 0.0
+        policy = np.where(np.isfinite(policy), np.maximum(policy, 0.0), 0.0)
+        policy = np.where(policy_support, policy, 0.0)
+        sums = np.sum(policy, axis=1, keepdims=True)
+        has_policy = sums[:, 0] > 0.0
+        if np.any(has_policy):
+            policy[has_policy] = policy[has_policy] / sums[has_policy]
+    score_target = np.zeros_like(policy, dtype=np.float32)
+    score_support = np.zeros_like(policy, dtype=np.bool_)
+    has_scores = np.zeros(policy.shape[0], dtype=bool)
+    if "target_scores" in data and source in {"prefer_scores", "scores", "prefer_policy"}:
+        scores = np.asarray(data["target_scores"][batch], dtype=np.float32)
+        if "target_scores_mask" in data:
+            score_support = np.asarray(data["target_scores_mask"][batch], dtype=np.bool_)
+        else:
+            score_support = np.isfinite(scores)
+        score_target = _scores_to_policy(
+            scores,
+            data["legal_action_ids"][batch],
+            temperature,
+            score_support=score_support,
+        )
+        has_scores = np.sum(score_target, axis=1) > 0.0
+
+    teacher_names = np.asarray(
+        data.get("teacher_name", np.full(len(data["action_taken"]), ""))[batch]
+    ).astype(str)
+    score_sources = np.asarray(
+        data.get("target_score_source", np.full(len(data["action_taken"]), ""))[batch]
+    ).astype(str)
+    prefer_policy_rows = _prefer_policy_over_scores_for_teachers(
+        teacher_names,
+        score_sources,
+    )
+    ab_root_blend_rows = (
+        _ab_root_score_rows(teacher_names, score_sources) & has_policy & has_scores
+    )
+
+    if source == "policy":
+        target = policy
+        support = policy_support
+    elif source == "scores":
+        target = score_target
+        support = score_support
+    elif source == "prefer_scores":
+        target = policy.copy()
+        support = policy_support.copy()
+        target[has_scores] = score_target[has_scores]
+        support[has_scores] = score_support[has_scores]
+        target[prefer_policy_rows & has_policy] = policy[prefer_policy_rows & has_policy]
+        support[prefer_policy_rows & has_policy] = policy_support[prefer_policy_rows & has_policy]
+        if np.any(ab_root_blend_rows):
+            blended = _blend_soft_target_rows(
+                policy,
+                score_target,
+                ab_root_blend_rows,
+                policy_weight=0.30,
+            )
+            target[ab_root_blend_rows] = blended
+            support[ab_root_blend_rows] = blended > 0.0
+    else:
+        target = policy.copy()
+        support = policy_support.copy()
+        target[~has_policy & has_scores] = score_target[~has_policy & has_scores]
+        support[~has_policy & has_scores] = score_support[~has_policy & has_scores]
+    if not np.any(np.sum(target, axis=1) > 0.0):
+        return None
+    support &= target > 0.0
+    return target.astype(np.float32, copy=False), support.astype(np.bool_, copy=False)
+
+
+def _has_distillation_distribution(
+    target: np.ndarray,
+    support: np.ndarray,
+    *,
+    legal_action_ids: np.ndarray | None = None,
+    min_legal_coverage: float = 0.0,
+) -> np.ndarray:
+    """Rows with only one supported target should train as hard labels.
+
+    A one-hot "soft" target makes KL over the supported set equal zero because
+    the supported softmax contains only the chosen action. Treating those rows
+    as hard labels preserves the full cross-entropy gradient.
+    """
+
+    target = np.asarray(target, dtype=np.float32)
+    support = np.asarray(support, dtype=np.bool_)
+    positive = support & (target > 0.0)
+    has_distribution = np.sum(positive, axis=1) > 1
+    min_coverage = float(np.clip(min_legal_coverage, 0.0, 1.0))
+    if min_coverage <= 0.0 or legal_action_ids is None:
+        return has_distribution
+    legal = np.asarray(legal_action_ids)
+    legal_counts = np.maximum(np.sum(legal >= 0, axis=1), 1)
+    coverage = np.sum(positive, axis=1) / legal_counts
+    return has_distribution & (coverage >= min_coverage)
+
+
+def _scores_to_policy(
+    scores: np.ndarray,
+    legal_action_ids: np.ndarray,
+    temperature: float,
+    *,
+    score_support: np.ndarray | None = None,
+) -> np.ndarray:
+    target = np.zeros(scores.shape, dtype=np.float32)
+    temp = max(float(temperature), 1.0e-6)
+    if score_support is None:
+        score_support = np.isfinite(scores)
+    valid = (legal_action_ids >= 0) & np.asarray(score_support, dtype=np.bool_) & np.isfinite(scores)
+    for row in range(scores.shape[0]):
+        keep = valid[row]
+        if not np.any(keep):
+            continue
+        logits = scores[row, keep].astype(np.float32)
+        logits = logits / temp
+        logits = logits - float(np.max(logits))
+        logits = np.clip(logits, -60.0, 0.0)
+        probs = np.exp(logits)
+        total = float(np.sum(probs))
+        if total > 0.0:
+            target[row, keep] = probs / total
+    return target
+
+
+def _support_log_softmax(logits, support):
+    import torch
+
+    if support is None:
+        return torch.nn.functional.log_softmax(logits, dim=-1)
+    support = support.to(device=logits.device, dtype=torch.bool)
+    if support.shape != logits.shape:
+        raise ValueError(
+            f"soft target support shape {tuple(support.shape)} does not match "
+            f"logits shape {tuple(logits.shape)}"
+        )
+    # The support mask is only a shape/provenance guard here. Candidate logits are
+    # already masked to legal actions upstream, so the soft-label denominator must
+    # include every legal candidate. Otherwise a high logit on an unscored legal
+    # action gets no distillation penalty and can silently dominate evaluation.
+    return torch.nn.functional.log_softmax(logits, dim=-1)
+
+
+def _prior_kl_telemetry(
+    data: dict,
+    batch: np.ndarray,
+    logits,
+    device,
+):
+    """SUCCESS TELEMETRY (gen-1 recipe): KL(model_policy || prior_policy) on a
+    held-out GEN slice, alongside the reference KL(target_policy || prior_policy)
+    -- training "worked" once the former reaches 60-80% of the latter; if it's
+    still under ~30% of it by the end of training, the run underfit (a retrain
+    at a higher LR is cheaper than spending gate games finding that out).
+
+    Scoped to rows with a recorded prior, with no extra bookkeeping: prior_policy
+    is populated by the self-play data generators -- gumbel_self_play.py's
+    _build_decision_row and raw_selfplay.py's _build_raw_decision_row (the latter
+    stores the seed model's raw prior distribution, since there is no search to
+    improve it) -- while any other teacher source defaults it to all-zero (see
+    _normalize_teacher_shard), which this function's `has_prior` filter excludes
+    automatically.
+
+    The returned per-row `kl_model_prior`/`kl_target_prior` tensors are
+    differentiable through `logits` (the caller detaches at `.item()` for
+    telemetry); _policy_kl_anchor_loss reuses this same computation, un-detached,
+    as the training-time policy-KL anchor so the anchor and the telemetry measure
+    the identical quantity.
+
+    `logits` must already be in the SAME per-row legal-action ordering as
+    data["target_policy"]/data["prior_policy"] (true for _eval_xdim_batch's
+    outputs["logits"], which _soft_targets_legal already relies on for the
+    same reason -- see _support_log_softmax above).
+    """
+    import torch
+
+    if "prior_policy" not in data or "target_policy" not in data:
+        return None
+    prior_np = np.asarray(data["prior_policy"][batch], dtype=np.float32)
+    target_np = np.asarray(data["target_policy"][batch], dtype=np.float32)
+    legal_ids = np.asarray(data["legal_action_ids"][batch])
+    valid_np = legal_ids >= 0
+    has_prior_np = (prior_np * valid_np).sum(axis=1) > 1.0e-6
+    if not has_prior_np.any():
+        return None
+
+    valid = torch.as_tensor(valid_np, dtype=torch.bool, device=device)
+    has_prior = torch.as_tensor(has_prior_np, dtype=torch.bool, device=device)
+    prior = torch.as_tensor(prior_np, dtype=torch.float32, device=device)
+    target = torch.as_tensor(target_np, dtype=torch.float32, device=device)
+    zeros = torch.zeros_like(prior)
+
+    eps = 1.0e-8
+    prior = torch.where(valid, prior, zeros)
+    prior_norm = prior / torch.clamp(prior.sum(dim=-1, keepdim=True), min=eps)
+    target = torch.where(valid, target, zeros)
+    target_norm = target / torch.clamp(target.sum(dim=-1, keepdim=True), min=eps)
+
+    model_log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
+    model_probs = torch.where(valid, model_log_probs.exp(), zeros)
+
+    log_prior = torch.log(torch.clamp(prior_norm, min=eps))
+    log_target = torch.log(torch.clamp(target_norm, min=eps))
+
+    kl_model_prior = torch.where(valid, model_probs * (model_log_probs - log_prior), zeros).sum(
+        dim=-1
+    )
+    kl_target_prior = torch.where(valid, target_norm * (log_target - log_prior), zeros).sum(
+        dim=-1
+    )
+    return {
+        "has_prior": has_prior,
+        "kl_model_prior": kl_model_prior,
+        "kl_target_prior": kl_target_prior,
+    }
+
+
+def compute_policy_surprise_kl(
+    data: dict, batch: np.ndarray | None = None
+) -> tuple[np.ndarray, np.ndarray]:
+    """Per-row "policy surprise" KL(target_policy || prior_policy) -- a pure,
+    data-derived (no model/torch) NumPy port of ``_prior_kl_telemetry``'s
+    ``kl_target_prior`` term, for use as a CAT-45 sample-frequency weighting
+    signal rather than a training-time loss/telemetry term. Kept as a separate
+    function (not a refactor of ``_prior_kl_telemetry``) so that function's
+    existing tests/behaviour are untouched; the masking/eps/normalization
+    conventions are intentionally identical so the two never silently drift
+    apart.
+
+    Returns ``(kl_target_prior, has_prior)`` over ``batch`` (or the whole
+    corpus when ``batch`` is None), matching ``_prior_kl_telemetry``'s
+    ``has_prior`` scoping: rows with no recorded ``prior_policy`` (any non-
+    Gumbel-self-play teacher row, or any shard predating this column) get
+    ``has_prior=False`` and ``kl_target_prior=0.0`` -- exactly the "old shards
+    default to uniform weight" behaviour CAT-45 requires.
+    """
+    n = len(data["action_taken"]) if batch is None else len(batch)
+    if "prior_policy" not in data or "target_policy" not in data:
+        return np.zeros(n, dtype=np.float32), np.zeros(n, dtype=np.bool_)
+
+    index = slice(None) if batch is None else batch
+    prior = np.asarray(data["prior_policy"][index], dtype=np.float32)
+    target = np.asarray(data["target_policy"][index], dtype=np.float32)
+    legal_ids = np.asarray(data["legal_action_ids"][index])
+    valid = legal_ids >= 0
+
+    has_prior = (prior * valid).sum(axis=1) > 1.0e-6
+    if not has_prior.any():
+        return np.zeros(n, dtype=np.float32), has_prior
+
+    eps = 1.0e-8
+    prior = np.where(valid, prior, 0.0)
+    prior_norm = prior / np.clip(prior.sum(axis=-1, keepdims=True), eps, None)
+    target = np.where(valid, target, 0.0)
+    target_norm = target / np.clip(target.sum(axis=-1, keepdims=True), eps, None)
+
+    log_prior = np.log(np.clip(prior_norm, eps, None))
+    log_target = np.log(np.clip(target_norm, eps, None))
+    kl_target_prior = np.where(valid, target_norm * (log_target - log_prior), 0.0).sum(axis=-1)
+    # Rows without a recorded prior have an undefined KL -- zero them explicitly
+    # rather than trust the eps-clamped math above to land near zero.
+    kl_target_prior = np.where(has_prior, kl_target_prior, 0.0)
+    return kl_target_prior.astype(np.float32, copy=False), has_prior
+
+
+def policy_surprise_sampling_weights(
+    kl_target_prior: np.ndarray,
+    has_prior: np.ndarray,
+    *,
+    weight_scale: float,
+    cap: float,
+) -> np.ndarray:
+    """CAT-45 sample-frequency weight from per-row policy surprise.
+
+    ``weight = 1.0 + weight_scale * min(kl_target_prior, cap)`` for rows with a
+    recorded prior, ``weight = 1.0`` (uniform baseline) for everything else --
+    rows with no recorded prior (pre-CAT-45 shards, non-Gumbel teacher rows) and
+    ANY row whenever ``weight_scale <= 0.0`` (the default-off case). This is a
+    strict *upweighting* of surprising states relative to a uniform floor of
+    1.0, never a downweighting of agreeing ones -- consistent with "oversample
+    high-KL states" (R8 / master plan Sec 4.5), not "starve low-KL states".
+
+    This is deliberately NOT a literal reproduction of KataGo's own (unpublished
+    here) sample-frequency constants -- it is "roughly KataGo-style" per the
+    ticket's own framing ("half of KataGo's sample-frequency weighting scheme"),
+    with an explicit, capped, documented formula of our own so the behaviour is
+    auditable and testable independent of that precedent.
+    """
+    weight_scale = float(weight_scale)
+    cap = float(cap)
+    weights = np.ones_like(kl_target_prior, dtype=np.float64)
+    if weight_scale > 0.0:
+        weights[has_prior] = 1.0 + weight_scale * np.minimum(kl_target_prior[has_prior], cap)
+    return weights.astype(np.float32, copy=False)
+
+
+def _policy_kl_anchor_loss(data: dict, batch: np.ndarray, logits, device):
+    """Differentiable policy-KL anchor loss: the mean over rows-with-a-recorded-
+    prior of KL(pi_theta || prior_policy), pulling the trained policy toward the
+    frozen seed checkpoint's recorded per-state prior (the `prior_policy` column).
+
+    Reuses _prior_kl_telemetry's exact per-row computation (un-detached here),
+    so a run's prior_kl_ratio telemetry directly reflects how hard this anchor is
+    binding. The masked mean goes through _weighted_mean_loss so it inherits the
+    same DDP-correct global-denominator reduction the value/policy losses use.
+
+    Returns None when the batch has no prior rows (caller then adds nothing to
+    the loss). MUST be called with grad enabled -- i.e. from the training path,
+    not the no_grad eval path where the telemetry variant lives.
+    """
+    import torch
+
+    terms = _prior_kl_telemetry(data, batch, logits, device)
+    if terms is None:
+        return None
+    weights = terms["has_prior"].to(torch.float32)
+    if float(weights.sum().item()) <= 0.0:
+        return None
+    return _weighted_mean_loss(terms["kl_model_prior"], weights)
+
+
+def _weighted_mean_loss(values, weights, *, mask=None):
+    import torch
+
+    numerator, denominator = _weighted_loss_parts(values, weights, mask=mask)
+    if torch.is_grad_enabled():
+        try:
+            import torch.distributed as dist
+
+            if dist.is_available() and dist.is_initialized():
+                global_denominator = denominator.detach().clone()
+                dist.all_reduce(global_denominator, op=dist.ReduceOp.SUM)
+                return (
+                    numerator
+                    * float(dist.get_world_size())
+                    / torch.clamp(global_denominator, min=1.0e-6)
+                )
+        except Exception:
+            pass
+    return numerator / torch.clamp(denominator, min=1.0e-6)
+
+
+def _weighted_loss_parts(values, weights, *, mask=None):
+    effective_weights = weights
+    if mask is not None:
+        effective_weights = effective_weights * mask.to(
+            device=weights.device,
+            dtype=weights.dtype,
+        )
+    return (values * effective_weights).sum(), effective_weights.sum()
+
+
+def _zero_loss_parts(device):
+    import torch
+
+    zero = torch.tensor(0.0, dtype=torch.float32, device=device)
+    return zero, zero
+
+
+def _metric_from_sum_denominator(weighted_sum: float, denominator: float) -> float:
+    if float(denominator) <= 0.0:
+        return 0.0
+    return float(weighted_sum) / float(denominator)
+
+
+def _q_score_loss_parts(
+    q_values,
+    data: dict,
+    batch: np.ndarray,
+    weights,
+    device,
+    *,
+    q_skip_teacher_prefixes: tuple[str, ...],
+):
+    import torch
+
+    scores = np.asarray(data.get("target_scores", np.empty((len(data["action_taken"]), 0)))[batch], dtype=np.float32)
+    legal = np.asarray(data["legal_action_ids"][batch], dtype=np.int64)
+    if scores.size == 0:
+        zero = torch.tensor(0.0, dtype=torch.float32, device=device)
+        return zero, zero, zero
+    if "target_scores_mask" in data:
+        score_mask = np.asarray(data["target_scores_mask"][batch], dtype=np.bool_)
+    else:
+        score_mask = np.isfinite(scores)
+    finite_np = (legal >= 0) & score_mask & np.isfinite(scores)
+    skip_rows = _q_skip_rows(data, batch, q_skip_teacher_prefixes)
+    if np.any(skip_rows):
+        finite_np[skip_rows] = False
+    row_has_scores_np = np.sum(finite_np, axis=1) >= 2
+    if not np.any(row_has_scores_np):
+        zero = torch.tensor(0.0, dtype=torch.float32, device=device)
+        return zero, zero, zero
+
+    mask = torch.as_tensor(finite_np, dtype=torch.bool, device=device)
+    row_has_scores = torch.as_tensor(row_has_scores_np, dtype=torch.float32, device=device)
+    targets = torch.as_tensor(
+        np.where(finite_np, scores, 0.0),
+        dtype=torch.float32,
+        device=device,
+    )
+    counts = mask.sum(dim=1, keepdim=True).clamp_min(1)
+    target_mean = (targets * mask.float()).sum(dim=1, keepdim=True) / counts
+    centered_targets = torch.where(mask, targets - target_mean, torch.zeros_like(targets))
+    target_var = (centered_targets.pow(2) * mask.float()).sum(dim=1, keepdim=True) / counts
+    target_std = target_var.sqrt().clamp_min(1.0e-4)
+    normalized_targets = centered_targets / target_std
+
+    q_safe = torch.where(mask, q_values, torch.zeros_like(q_values))
+    per_row = ((q_safe - normalized_targets).pow(2) * mask.float()).sum(dim=1) / counts.squeeze(1)
+    effective_weights = weights * row_has_scores
+    loss = _weighted_mean_loss(per_row, effective_weights)
+    weighted_sum, denominator = _weighted_loss_parts(per_row, effective_weights)
+    return loss, weighted_sum, denominator
+
+
+def _unflagged_vp_rows(data: dict, values_key: str, flags_key: str) -> np.ndarray:
+    values = np.asarray(data.get(values_key, np.zeros((len(data["action_taken"]), 0))), dtype=np.float32)
+    flags = np.asarray(
+        data.get(flags_key, np.zeros(len(data["action_taken"]), dtype=np.bool_)),
+        dtype=np.bool_,
+    )
+    if values.ndim != 2 or values.shape[0] != len(flags):
+        return np.zeros(len(data["action_taken"]), dtype=bool)
+    return (np.sum(np.abs(values), axis=1) > 0.0) & ~flags
+
+
+def _q_score_rows_ge2(
+    data: dict,
+    batch: np.ndarray,
+    *,
+    q_skip_teacher_prefixes: tuple[str, ...] = (),
+) -> int:
+    scores_all = data.get("target_scores")
+    if scores_all is None:
+        return 0
+    scores = np.asarray(scores_all[batch], dtype=np.float32)
+    legal = np.asarray(data["legal_action_ids"][batch], dtype=np.int64)
+    if scores.shape != legal.shape:
+        return 0
+    if "target_scores_mask" in data:
+        score_mask = np.asarray(data["target_scores_mask"][batch], dtype=np.bool_)
+    else:
+        score_mask = np.isfinite(scores)
+    finite = (legal >= 0) & score_mask & np.isfinite(scores)
+    skip_rows = _q_skip_rows(data, batch, q_skip_teacher_prefixes)
+    if np.any(skip_rows):
+        finite[skip_rows] = False
+    return int(np.sum(np.sum(finite, axis=1) >= 2))
+
+
+def _truncated_vp_margin_outcome(
+    data: dict, batch: np.ndarray, truncated: np.ndarray, vps_to_win: int
+) -> tuple[np.ndarray, np.ndarray]:
+    """FIX F3: derive a soft value label for TRUNCATED rows from the VP margin at the
+    point of truncation. final_actual_vps/final_public_vps + seat are populated in every
+    row regardless of whether the game actually ended -- only the has_final_*_vps flag is
+    gated on termination (see gumbel_self_play.py's _game_outcome_fields, which always
+    snapshots the live state). Without this, the value head only ever learns from the
+    9-19% of games that finish naturally, starving it of signal from the majority.
+
+    margin = clip((my_vp - opponent_vp) / vps_to_win, -1, 1). Since this is always a
+    2-seated game, opponent_vp = sum(all 4 PLAYER_NAMES slots) - my_vp (the other two
+    slots are unseated and always 0), avoiding any need to know which color is "the
+    opponent" explicitly.
+    """
+    n = len(batch)
+    mask = np.zeros(n, dtype=bool)
+    outcome = np.zeros(n, dtype=np.float32)
+    if "seat" not in data:
+        return mask, outcome
+    seats = np.asarray(data["seat"][batch], dtype=np.int64)
+    rows = np.arange(n)
+    for vp_key in ("final_actual_vps", "final_public_vps"):
+        if vp_key not in data:
+            continue
+        remaining = truncated & ~mask & (seats >= 0)
+        if not remaining.any():
+            continue
+        vps = np.asarray(data[vp_key][batch], dtype=np.float32)
+        valid = remaining & (seats < vps.shape[1])
+        if not valid.any():
+            continue
+        my_vp = vps[rows[valid], seats[valid]]
+        opponent_vp = vps[valid].sum(axis=1) - my_vp
+        margin = (my_vp - opponent_vp) / max(float(vps_to_win), 1.0)
+        outcome[valid] = np.clip(margin, -1.0, 1.0)
+        mask[valid] = True
+    return mask, outcome
+
+
+def _root_value_targets(data: dict, batch: np.ndarray, device):
+    """Read the stored search root value (`root_value` + `root_value_mask`) for
+    the CAT-39 value-target lambda blend (MuZero/ReZero, arXiv:2404.16364).
+
+    Returns (root_value[B], root_value_mask[B]) as torch tensors, or (None, None)
+    when the shard has no root_value column (every current shard) so the blend is
+    a pure no-op and inert -- a gen-1-onward lever. root_value is expected in the
+    same [-1, 1] value scale as the outcome target; rows without a stored value
+    are masked (NaNs treated as unset).
+    """
+    import torch
+
+    if "root_value" not in data:
+        return None, None
+    n = len(batch)
+    raw = np.asarray(data["root_value"][batch], dtype=np.float32).reshape(n)
+    if "root_value_mask" in data:
+        mask = np.asarray(data["root_value_mask"][batch], dtype=np.bool_).reshape(n)
+    else:
+        mask = np.isfinite(raw)
+    mask = mask & np.isfinite(raw)
+    values = np.where(mask, raw, 0.0).astype(np.float32)
+    return (
+        torch.as_tensor(values, dtype=torch.float32, device=device),
+        torch.as_tensor(mask, dtype=torch.bool, device=device),
+    )
+
+
+def _hl_gauss_value_targets(
+    targets,
+    bins: int,
+    *,
+    sigma_ratio: float = 0.75,
+    truncated=None,
+    add_truncation_class: bool = True,
+):
+    """HL-Gauss projection (Farebrother et al. 2024, arXiv:2403.03950 "Stop
+    Regressing") of scalar win-loss targets in [-1, 1] onto a uniform categorical
+    support of `bins` atoms.
+
+    Each scalar target y is smeared as a Gaussian of std ``sigma = sigma_ratio *
+    bin_width`` and integrated over atom-centred cells via the Gaussian CDF
+    (erf); the outer cells extend to +/-inf so tail mass beyond the support is
+    captured rather than clipped. This is the regression-as-classification target
+    that beats both plain two-hot (which underperforms MSE) and scalar MSE,
+    especially under stochastic dynamics.
+
+    Returns a row-stochastic ``[B, bins (+1 when add_truncation_class)]`` tensor.
+    When ``truncated`` is given, those rows are routed ENTIRELY to the extra
+    truncation class (one-hot) with zero mass on the win-loss bins -- the CAT-39
+    R9 support (win/loss + truncation ONLY; VP-margin routes to a separate aux
+    head), never a margin bump on the continuous axis. The support expectation
+    over the win-loss atoms recovers the (clamped) scalar target to within the
+    bin resolution, which is what the scalar readout consumes downstream.
+    """
+    import torch
+
+    n = int(targets.shape[0])
+    device = targets.device
+    n_out = int(bins) + (1 if add_truncation_class else 0)
+    out = torch.zeros((n, n_out), dtype=torch.float32, device=device)
+    centers = torch.linspace(-1.0, 1.0, int(bins), device=device)
+    bin_width = 2.0 / float(int(bins) - 1)
+    sigma = max(float(sigma_ratio), 1.0e-6) * bin_width
+    lower = centers - bin_width / 2.0
+    upper = centers + bin_width / 2.0
+    lower = lower.clone()
+    upper = upper.clone()
+    lower[0] = float("-inf")
+    upper[-1] = float("inf")
+    y = targets.detach().float().clamp(-1.0, 1.0).unsqueeze(-1)
+    inv = 1.0 / (sigma * math.sqrt(2.0))
+    cdf_hi = 0.5 * (1.0 + torch.erf((upper.unsqueeze(0) - y) * inv))
+    cdf_lo = 0.5 * (1.0 + torch.erf((lower.unsqueeze(0) - y) * inv))
+    probs = (cdf_hi - cdf_lo).clamp_min(0.0)
+    probs = probs / probs.sum(dim=-1, keepdim=True).clamp_min(1.0e-8)
+    out[:, : int(bins)] = probs
+    if truncated is not None and add_truncation_class:
+        tmask = truncated.to(device=device, dtype=torch.bool)
+        if bool(tmask.any().item()):
+            out[tmask] = 0.0
+            out[tmask, int(bins)] = 1.0
+    return out
+
+
+def _value_targets(
+    data: dict,
+    batch: np.ndarray,
+    device,
+    vps_to_win: int,
+    *,
+    truncated_vp_margin_value_weight: float = 0.0,
+):
+    import torch
+
+    if "winner" not in data or "player" not in data:
+        return None, None, None, None, None, None, None
+    winners = np.asarray(data["winner"][batch]).astype(str)
+    players = np.asarray(data["player"][batch]).astype(str)
+    truncated = np.asarray(
+        data.get("truncated", np.zeros(len(data["action_taken"]), dtype=np.bool_))[batch],
+        dtype=np.bool_,
+    )
+    has_outcome_np = (winners != "") & ~truncated
+    outcome = np.zeros(len(batch), dtype=np.float32)
+    outcome[has_outcome_np & (winners == players)] = 1.0
+    outcome[has_outcome_np & (winners != players)] = -1.0
+    # FIX F3: value_outcome/value_has_outcome_np/outcome_confidence are a SEPARATE,
+    # value-loss-only view -- outcome/has_outcome_np above stay exactly as they were
+    # (some callers, e.g. _train_xdim_batch, also feed them into
+    # _advantage_reweighted_policy_weights for POLICY advantage weighting, which this
+    # fix must not touch; team-lead scoped F3 to the value head only).
+    value_outcome = outcome.copy()
+    value_has_outcome_np = has_outcome_np.copy()
+    outcome_confidence = np.where(has_outcome_np, 1.0, 0.0).astype(np.float32)
+    if float(truncated_vp_margin_value_weight) > 0.0 and truncated.any():
+        soft_mask, soft_outcome = _truncated_vp_margin_outcome(data, batch, truncated, vps_to_win)
+        fill = soft_mask & ~has_outcome_np
+        value_outcome[fill] = soft_outcome[fill]
+        value_has_outcome_np = value_has_outcome_np | fill
+        outcome_confidence[fill] = float(truncated_vp_margin_value_weight)
+    vp_target = np.zeros(len(batch), dtype=np.float32)
+    has_vp_np = np.zeros(len(batch), dtype=bool)
+    if "seat" in data and "final_actual_vps" in data:
+        seats = np.asarray(data["seat"][batch], dtype=np.int64)
+        rows = np.arange(len(batch))
+        actual_vps = np.asarray(data["final_actual_vps"][batch], dtype=np.float32)
+        has_actual = np.asarray(
+            data.get("has_final_actual_vps", np.zeros(len(data["action_taken"]), dtype=np.bool_))[
+                batch
+            ],
+            dtype=np.bool_,
+        )
+        valid_actual = (
+            (seats >= 0)
+            & (seats < actual_vps.shape[1])
+            & ~truncated
+            & has_actual
+        )
+        vp_target[valid_actual] = actual_vps[rows[valid_actual], seats[valid_actual]]
+        has_vp_np[valid_actual] = True
+    if "seat" in data and "final_public_vps" in data:
+        seats = np.asarray(data["seat"][batch], dtype=np.int64)
+        rows = np.arange(len(batch))
+        public_vps = np.asarray(data["final_public_vps"][batch], dtype=np.float32)
+        has_public = np.asarray(
+            data.get("has_final_public_vps", np.zeros(len(data["action_taken"]), dtype=np.bool_))[
+                batch
+            ],
+            dtype=np.bool_,
+        )
+        valid_public = (
+            ~has_vp_np
+            & (seats >= 0)
+            & (seats < public_vps.shape[1])
+            & ~truncated
+            & has_public
+        )
+        vp_target[valid_public] = public_vps[rows[valid_public], seats[valid_public]]
+        has_vp_np[valid_public] = True
+    vp_target[has_vp_np] /= max(float(vps_to_win), 1.0)
+    return (
+        torch.as_tensor(outcome, dtype=torch.float32, device=device),
+        torch.as_tensor(vp_target, dtype=torch.float32, device=device),
+        torch.as_tensor(has_outcome_np, dtype=torch.bool, device=device),
+        torch.as_tensor(has_vp_np, dtype=torch.bool, device=device),
+        torch.as_tensor(value_outcome, dtype=torch.float32, device=device),
+        torch.as_tensor(value_has_outcome_np, dtype=torch.bool, device=device),
+        torch.as_tensor(outcome_confidence, dtype=torch.float32, device=device),
+    )
+
+
+def _masked_metric_mean(values, mask):
+    import torch
+
+    mask = mask.to(device=values.device, dtype=torch.bool)
+    if not torch.any(mask):
+        return torch.tensor(0.0, dtype=values.dtype, device=values.device)
+    return values[mask].mean()
+
+
+def _topk_legal_accuracy(logits, target, *, k: int, mask=None):
+    import torch
+
+    k = min(int(k), int(logits.shape[-1]))
+    topk = torch.topk(logits, k=k, dim=-1).indices
+    hits = (topk == target.unsqueeze(-1)).any(dim=-1).float()
+    if mask is not None:
+        return _masked_metric_mean(hits, mask)
+    return hits.mean()
+
+
+def _topk_full_accuracy(masked_logits, actions, *, k: int, mask=None):
+    import torch
+
+    k = min(int(k), int(masked_logits.shape[-1]))
+    topk = torch.topk(masked_logits, k=k, dim=-1).indices
+    hits = (topk == actions.unsqueeze(-1)).any(dim=-1).float()
+    if mask is not None:
+        return _masked_metric_mean(hits, mask)
+    return hits.mean()
+
+
+def _field_stats(
+    data: dict,
+    batch: np.ndarray,
+    predictions: np.ndarray,
+    targets: np.ndarray,
+    logits: np.ndarray,
+    *,
+    field: str,
+) -> dict[str, dict[str, int]]:
+    values = np.asarray(data.get(field, np.asarray(["unknown"] * len(data["action_taken"]))))[
+        batch
+    ].astype(str)
+    top3 = _numpy_topk_contains(logits, targets, k=3)
+    stats = _empty_phase_stats()
+    for value, pred, target, in_top3 in zip(values, predictions, targets, top3, strict=False):
+        key = str(value or "unknown")
+        row = stats.setdefault(key, {"count": 0, "top1": 0, "top3": 0})
+        row["count"] += 1
+        row["top1"] += int(int(pred) == int(target))
+        row["top3"] += int(bool(in_top3))
+    return stats
+
+
+def _field_stats_unforced(
+    data: dict,
+    batch: np.ndarray,
+    predictions: np.ndarray,
+    targets: np.ndarray,
+    logits: np.ndarray,
+    *,
+    field: str,
+) -> dict[str, dict[str, int]]:
+    legal_counts = np.sum(data["legal_action_ids"][batch] >= 0, axis=1)
+    keep = legal_counts > 1
+    if not np.any(keep):
+        return {}
+    return _field_stats(
+        data,
+        batch[keep],
+        predictions[keep],
+        targets[keep],
+        logits[keep],
+        field=field,
+    )
+
+
+def _numpy_topk_contains(logits: np.ndarray, targets: np.ndarray, *, k: int) -> np.ndarray:
+    if logits.shape[1] == 0:
+        return np.zeros(len(targets), dtype=bool)
+    k = min(int(k), int(logits.shape[1]))
+    topk = np.argpartition(-logits, kth=k - 1, axis=1)[:, :k]
+    return np.any(topk == targets[:, None], axis=1)
+
+
+def _empty_phase_stats() -> dict[str, dict[str, int]]:
+    return {}
+
+
+def _merge_phase_stats(
+    total: dict[str, dict[str, int]],
+    update: dict[str, dict[str, int]],
+) -> None:
+    for phase, row in update.items():
+        target = total.setdefault(str(phase), {"count": 0, "top1": 0, "top3": 0})
+        target["count"] += int(row.get("count", 0))
+        target["top1"] += int(row.get("top1", 0))
+        target["top3"] += int(row.get("top3", 0))
+
+
+def _reduce_nested_count_stats(
+    stats: dict[str, dict[str, int]],
+    ddp: dict[str, int | bool],
+) -> dict[str, dict[str, int]]:
+    if not ddp["enabled"]:
+        return stats
+    import torch.distributed as dist
+
+    gathered: list[dict[str, dict[str, int]] | None] = [None] * int(ddp["world_size"])
+    dist.all_gather_object(gathered, stats)
+    merged: dict[str, dict[str, int]] = {}
+    for item in gathered:
+        if item:
+            _merge_phase_stats(merged, item)
+    return merged
+
+
+def _finalize_phase_stats(stats: dict[str, dict[str, int]]) -> dict[str, dict[str, float]]:
+    result = {}
+    for phase, row in sorted(stats.items()):
+        count = int(row.get("count", 0))
+        result[phase] = {
+            "count": count,
+            "top1_accuracy": float(row.get("top1", 0)) / max(count, 1),
+            "top3_accuracy": float(row.get("top3", 0)) / max(count, 1),
+        }
+    return result
+
+
+def _params(policy):
+    for name in ("model", "actor", "action_encoder", "action_id_embedding", "action_bias"):
+        module = getattr(policy, name, None)
+        if module is not None:
+            yield from module.parameters()
+
+
+def _clip_grad_norm(policy, max_norm: float = 1.0):
+    """Clip the gradient norm of ``policy.model``, correct under DDP, FSDP, and
+    single-GPU. FSDP shards parameters, so ``torch.nn.utils.clip_grad_norm_`` over
+    local shards would compute the wrong global norm -- FSDP exposes its own
+    collective ``clip_grad_norm_`` for this. Plain modules and DDP-wrapped modules
+    have no such method, so they take the standard path (byte-identical to the
+    pre-C1 ``torch.nn.utils.clip_grad_norm_(policy.model.parameters(), 1.0)``)."""
+    import torch
+
+    model = policy.model
+    fsdp_clip = getattr(model, "clip_grad_norm_", None)
+    if callable(fsdp_clip) and not isinstance(
+        model, torch.nn.parallel.DistributedDataParallel
+    ):
+        # FSDP ignores 0-dim params (e.g. logit_scale); FSDP's collective clip
+        # never sees them and never all-reduced their grads. Average those grads
+        # across ranks here so the replicated scalar stays identical everywhere.
+        import torch.distributed as dist
+
+        for param in getattr(policy, "_fsdp_ignored_params", []) or []:
+            if param.grad is not None:
+                dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
+        return fsdp_clip(max_norm)
+    return torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
+
+
+def _torch_ppo_masked_logits(logits, valid_actions, action_size):
+    from catan_zero.rl.torch_ppo import _masked_logits
+
+    return _masked_logits(logits, valid_actions, action_size)
+
+
+def build_sample_weights(
+    data: dict,
+    *,
+    teacher_weights: dict[str, float],
+    phase_weights: dict[str, float],
+    forced_action_weight: float,
+    winner_sample_weight: float,
+    loser_sample_weight: float,
+    vp_margin_weight: float,
+    vps_to_win: int,
+) -> np.ndarray:
+    n = len(data["action_taken"])
+    weights = np.ones(n, dtype=np.float32)
+    if teacher_weights and "teacher_name" in data:
+        teachers = np.asarray(data["teacher_name"]).astype(str)
+        for teacher, weight in teacher_weights.items():
+            weights[teachers == teacher] *= float(weight)
+    if phase_weights and "phase" in data:
+        phases = np.asarray(data["phase"]).astype(str)
+        for phase, weight in phase_weights.items():
+            weights[phases == phase] *= float(weight)
+    if forced_action_weight != 1.0:
+        legal_counts = np.sum(data["legal_action_ids"] >= 0, axis=1)
+        weights[legal_counts == 1] *= float(forced_action_weight)
+    if "winner" in data and "player" in data:
+        winners = np.asarray(data["winner"]).astype(str)
+        players = np.asarray(data["player"]).astype(str)
+        truncated = np.asarray(
+            data.get("truncated", np.zeros(n, dtype=np.bool_)),
+            dtype=np.bool_,
+        )
+        has_winner = (winners != "") & ~truncated
+        weights[has_winner & (winners == players)] *= float(winner_sample_weight)
+        weights[has_winner & (winners != players)] *= float(loser_sample_weight)
+    if float(vp_margin_weight) != 0.0 and "seat" in data and "final_actual_vps" in data:
+        rows = np.arange(n)
+        seats = np.asarray(data["seat"], dtype=np.int64)
+        truncated = np.asarray(
+            data.get("truncated", np.zeros(n, dtype=np.bool_)),
+            dtype=np.bool_,
+        )
+        vps = np.zeros((n, 4), dtype=np.float32)
+        has_final_vps = np.zeros(n, dtype=np.bool_)
+        actual = np.asarray(data["final_actual_vps"], dtype=np.float32)
+        if actual.ndim == 2 and actual.shape[0] == n:
+            vps[:, : actual.shape[1]] = actual[:, : vps.shape[1]]
+            has_actual = np.asarray(
+                data.get("has_final_actual_vps", np.zeros(n, dtype=np.bool_)),
+                dtype=np.bool_,
+            )
+            has_final_vps |= has_actual
+        valid = (seats >= 0) & (seats < vps.shape[1]) & ~truncated & has_final_vps
+        own = np.zeros(n, dtype=np.float32)
+        own[valid] = vps[rows[valid], seats[valid]]
+        masked = vps.copy()
+        for idx, seat in enumerate(seats):
+            if 0 <= int(seat) < masked.shape[1]:
+                masked[idx, int(seat)] = -1.0
+        best_opp = np.max(masked, axis=1)
+        margin = (own - best_opp) / max(float(vps_to_win), 1.0)
+        multiplier = np.ones(n, dtype=np.float32)
+        multiplier[valid] = np.maximum(
+            0.1,
+            1.0 + float(vp_margin_weight) * margin[valid],
+        )
+        weights *= multiplier
+    mean = float(np.mean(weights)) if len(weights) else 1.0
+    if "policy_weight_multiplier" in data:
+        weights *= np.asarray(data["policy_weight_multiplier"], dtype=np.float32)
+        mean = float(np.mean(weights)) if len(weights) else 1.0
+    if mean > 0:
+        weights = weights / mean
+    return weights.astype(np.float32, copy=False)
+
+
+def build_value_sample_weights(
+    data: dict,
+    *,
+    phase_weights: dict[str, float] | None = None,
+    forced_row_value_weight: float = 1.0,
+    per_game_value_weight: bool = False,
+    per_game_value_weight_mode: str = "equal",
+) -> np.ndarray:
+    """Keep value targets unbiased by filtered-BC policy weighting.
+
+    Winner/loser filtering is useful for action imitation because we prefer to
+    copy decisions from stronger trajectories. The value head needs both sides
+    of a completed game at full weight, otherwise PPO starts from an optimistic
+    baseline and advantages become high-variance.
+
+    FIX A5: ``phase_weights`` (e.g. ``robber=8.0,initial_build=5.0``) previously only reached
+    the POLICY loss via ``build_sample_weights`` -- the value head had no way to be
+    phase-weighted at all, so any "phase-repair" pass could never touch the value head by
+    construction. This mirrors ``build_sample_weights``'s phase-weight application (per-phase
+    multiplier, then renormalize to mean 1) so the value head can be repaired the same way.
+
+    CAT-60: ``forced_row_value_weight`` and ``per_game_value_weight`` address "16k games = 16k
+    independent outcomes, not 3.6M labels" -- naive per-row value MSE overweights games with
+    many recorded decisions relative to short games, and wastes weight on near-zero-information
+    forced-decision rows (states with exactly one legal action). Combination rule, applied in
+    this exact order, since every factor here is multiplicative and the final mean-renormalize
+    makes the order of scalar factors irrelevant except for ``per_game_value_weight``, which
+    must go LAST:
+
+      1. ``phase_weights`` multiplier (this function, existing).
+      2. ``value_weight_multiplier`` (CAT-45's per-row sampling-weight field, already stored on
+         the corpus -- existing).
+      3. ``forced_row_value_weight`` multiplier on rows with exactly one legal action (new).
+      4. ``per_game_value_weight`` normalization (new): divides every row's weight (as
+         accumulated by steps 1-3) by the total weight its game already accumulated, so every
+         game contributes EXACTLY the same total value-loss mass regardless of (a) its row
+         count and (b) how steps 1-3 happen to be distributed within it. This equalizes GAMES
+         against each other; it does not undo forced-row downweighting *within* a game -- a
+         game that is mostly forced moves still has its low-information rows suppressed by
+         step 3, it just doesn't lose overall game-level mass for being long.
+
+    Finally the whole array is renormalized to global mean 1, as with every other weight
+    builder in this module (a uniform scalar rescale, so it preserves the equal-per-game-mass
+    property from step 4).
+    """
+
+    weights = np.ones(len(data["action_taken"]), dtype=np.float32)
+    if phase_weights and "phase" in data:
+        phases = np.asarray(data["phase"]).astype(str)
+        for phase, weight in phase_weights.items():
+            weights[phases == phase] *= float(weight)
+    if "value_weight_multiplier" in data:
+        weights *= np.asarray(data["value_weight_multiplier"], dtype=np.float32)
+    if float(forced_row_value_weight) != 1.0 and "legal_action_ids" in data:
+        legal_counts = np.sum(np.asarray(data["legal_action_ids"]) >= 0, axis=1)
+        weights[legal_counts == 1] *= float(forced_row_value_weight)
+    if per_game_value_weight and len(weights):
+        weights = _normalize_weights_per_game(data, weights, mode=per_game_value_weight_mode)
+    mean = float(np.mean(weights)) if len(weights) else 1.0
+    if mean > 0.0:
+        weights = weights / mean
+    return weights.astype(np.float32, copy=False)
+
+
+def _normalize_weights_per_game(data: dict, weights: np.ndarray, *, mode: str = "equal") -> np.ndarray:
+    """Rescale ``weights`` so every game (grouped by ``game_seed``) contributes an equal total.
+
+    Unlike ``split_train_validation_indices`` (which falls back to ``np.arange(n)`` -- one row
+    per "game" -- when ``game_seed`` is absent, which is safe there because it only affects
+    the train/validation split), a one-row-per-game fallback here would silently collapse
+    every row's weight to exactly 1.0 (a one-row group trivially holds 100% of its own mass),
+    erasing phase weights, --forced-row-value-weight, and the CAT-45 value_weight_multiplier
+    in the process. So a missing ``game_seed`` column is instead a hard no-op: this ticket's
+    step 1 requires spot-checking that the column is populated before enabling the flag.
+    """
+
+    if "game_seed" not in data:
+        return weights
+    seeds = np.asarray(data["game_seed"], dtype=np.int64)
+    weights64 = weights.astype(np.float64, copy=False)
+    unique_seeds, inverse = np.unique(seeds, return_inverse=True)
+    game_totals = np.zeros(len(unique_seeds), dtype=np.float64)
+    np.add.at(game_totals, inverse, weights64)
+    safe_totals = np.where(game_totals > 0.0, game_totals, 1.0)
+    if mode == "sqrt":
+        # EXP3: divide by sqrt(game_total) -> a game of summed-weight W contributes
+        # sqrt(W) total mass (with unit base weights, W == n_value_rows, so ~sqrt(n)),
+        # the effective-sample-size correction for n correlated in-game value labels.
+        denom = np.sqrt(safe_totals)
+    elif mode == "equal":
+        denom = safe_totals
+    else:
+        raise ValueError(f"unknown per_game_value_weight_mode {mode!r}")
+    normalized = weights64 / denom[inverse]
+    return normalized.astype(np.float32, copy=False)
+
+
+def _parse_game_seed_ranges(raw: str) -> list[tuple[int, int]]:
+    """Parse "start1:end1,start2:end2" (inclusive bounds) for
+    --validation-game-seed-ranges. Matches a holdout.json's documented ranges
+    (task #65 value-head-repair-v2 protocol)."""
+    ranges: list[tuple[int, int]] = []
+    for chunk in raw.split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        if ":" not in chunk:
+            raise SystemExit(f"invalid --validation-game-seed-ranges entry {chunk!r}: expected start:end")
+        start_str, end_str = chunk.split(":", 1)
+        start, end = int(start_str), int(end_str)
+        if end < start:
+            raise SystemExit(f"invalid --validation-game-seed-ranges entry {chunk!r}: end < start")
+        ranges.append((start, end))
+    return ranges
+
+
+def split_train_validation_indices(
+    data: dict,
+    *,
+    validation_fraction: float,
+    validation_seed: int,
+    validation_max_samples: int,
+    validation_game_seed_ranges: list[tuple[int, int]] | None = None,
+    allow_missing_game_seed: bool = False,
+) -> dict[str, np.ndarray]:
+    """Split into train/validation indices.
+
+    CAT-52 AUDIT (2026-07-08, see AUDIT.md): every path below is REQUIRED to be
+    game-level (grouping/filtering by ``data["game_seed"]``, one value per GAME,
+    repeated across every decision row of that game), never row-level -- a
+    row-level split is the exact mechanism that caused the round-11 val-leak
+    incident (per-round random re-splits leaked ~95% of validation rows,
+    because the "split" secretly operated per-ROW instead of per-GAME).
+
+    Both branches below used to silently default a MISSING ``"game_seed"``
+    column to ``np.arange(n)`` -- i.e. treat every row as its own distinct
+    "game". That default defeats game-level grouping by construction (each
+    row becomes a singleton group) and reproduces the round-11 mechanism
+    exactly, with no warning. Refuse it by default; ``allow_missing_game_seed``
+    is an explicit, loud opt-out for callers that genuinely have no game_seed
+    column (documented as a row-level split when used).
+    """
+    n = int(len(data["action_taken"]))
+    all_indices = np.arange(n, dtype=np.int64)
+    if "game_seed" not in data and not allow_missing_game_seed:
+        raise SystemExit(
+            "split_train_validation_indices: data has no 'game_seed' column. "
+            "Defaulting to a row-index-as-seed split would silently degrade to a "
+            "ROW-LEVEL split (the exact round-11 val-leak mechanism -- see "
+            "AUDIT.md), so this is refused by default. Pass "
+            "allow_missing_game_seed=True (train_bc.py: "
+            "--allow-missing-game-seed-validation-split) only if you have "
+            "verified this corpus has no meaningful game grouping and a "
+            "row-level split is acceptable for your use case."
+        )
+    if validation_game_seed_ranges:
+        # Explicit, deterministic held-out set (task #65): overrides the random
+        # game_seed permutation below entirely -- these EXACT games are what a
+        # holdout.json documents for coordination with the separate calibration
+        # probe (docs/catan_postrepair_revalidation_protocol_20260704.md Step 1).
+        seeds = np.asarray(data.get("game_seed", np.arange(n, dtype=np.int64)), dtype=np.int64)
+        validation_mask = np.zeros(n, dtype=bool)
+        for start, end in validation_game_seed_ranges:
+            validation_mask |= (seeds >= start) & (seeds <= end)
+        validation = all_indices[validation_mask]
+        train = all_indices[~validation_mask]
+        if validation_max_samples > 0 and len(validation) > validation_max_samples:
+            rng = np.random.default_rng(validation_seed + 1)
+            validation = np.sort(rng.choice(validation, size=validation_max_samples, replace=False))
+        return {
+            "train": train.astype(np.int64, copy=False),
+            "validation": validation.astype(np.int64, copy=False),
+        }
+    fraction = float(np.clip(validation_fraction, 0.0, 0.9))
+    if n == 0 or fraction <= 0.0:
+        return {
+            "train": all_indices,
+            "validation": np.asarray([], dtype=np.int64),
+        }
+    seeds = np.asarray(data.get("game_seed", np.arange(n, dtype=np.int64)), dtype=np.int64)
+    unique_seeds = np.unique(seeds)
+    if unique_seeds.size <= 1:
+        if n >= 1000:
+            raise SystemExit(
+                "validation_fraction requires non-degenerate game_seed values for "
+                "large teacher datasets; refusing row-level validation split because "
+                "it can leak decisions from the same game into train and validation."
+            )
+        print(
+            "WARNING: split_train_validation_indices is falling back to a ROW-LEVEL "
+            f"random split ({n} rows, {unique_seeds.size} unique game_seed value(s)) -- "
+            "this is the round-11 val-leak mechanism (see AUDIT.md). Only acceptable "
+            "for tiny synthetic/smoke corpora where within-game correlation across "
+            "train/validation is a non-issue; never for a real training corpus.",
+            file=sys.stderr,
+        )
+        rng = np.random.default_rng(validation_seed)
+        shuffled = rng.permutation(all_indices)
+        validation_count = max(1, int(round(n * fraction)))
+        validation = np.sort(shuffled[:validation_count])
+        train = np.sort(shuffled[validation_count:])
+    else:
+        rng = np.random.default_rng(validation_seed)
+        shuffled_seeds = rng.permutation(unique_seeds)
+        target_rows = max(1, int(round(n * fraction)))
+        selected: list[int] = []
+        selected_rows = 0
+        seed_counts = {
+            int(seed): int(np.sum(seeds == seed))
+            for seed in shuffled_seeds
+        }
+        for seed in shuffled_seeds:
+            selected.append(int(seed))
+            selected_rows += seed_counts[int(seed)]
+            if selected_rows >= target_rows:
+                break
+        validation_mask = np.isin(seeds, np.asarray(selected, dtype=np.int64))
+        validation = all_indices[validation_mask]
+        train = all_indices[~validation_mask]
+    if validation_max_samples > 0 and len(validation) > validation_max_samples:
+        rng = np.random.default_rng(validation_seed + 1)
+        validation = np.sort(rng.choice(validation, size=validation_max_samples, replace=False))
+    if len(train) == 0:
+        train = np.setdiff1d(all_indices, validation[: max(0, len(validation) - 1)], assume_unique=False)
+        validation = np.setdiff1d(all_indices, train, assume_unique=False)
+    return {
+        "train": train.astype(np.int64, copy=False),
+        "validation": validation.astype(np.int64, copy=False),
+    }
+
+
+def _distributed_index_slice(indices: np.ndarray, ddp: dict[str, int | bool]) -> np.ndarray:
+    if not ddp["enabled"]:
+        return indices
+    world_size = int(ddp["world_size"])
+    rank = int(ddp["rank"])
+    return np.asarray(indices, dtype=np.int64)[rank::world_size]
+
+
+def _set_policy_training(policy, training: bool) -> list[tuple[object, bool]]:
+    seen: set[int] = set()
+    modes: list[tuple[object, bool]] = []
+    for name in ("model", "actor", "action_encoder", "action_id_embedding", "action_bias"):
+        module = getattr(policy, name, None)
+        if module is None or not hasattr(module, "train") or id(module) in seen:
+            continue
+        seen.add(id(module))
+        modes.append((module, bool(getattr(module, "training", False))))
+        module.train(bool(training))
+    return modes
+
+
+def _restore_policy_training(policy, modes: list[tuple[object, bool]]) -> None:
+    del policy
+    for module, was_training in modes:
+        if hasattr(module, "train"):
+            module.train(was_training)
+
+
+def _parse_weight_map(raw: str) -> dict[str, float]:
+    weights: dict[str, float] = {}
+    for part in raw.split(","):
+        item = part.strip()
+        if not item:
+            continue
+        if "=" not in item:
+            raise SystemExit(f"invalid --teacher-weights entry: {item}")
+        name, value = item.split("=", 1)
+        weights[name.strip()] = float(value)
+    return weights
+
+
+def _parse_prefixes(raw: str) -> tuple[str, ...]:
+    return tuple(part.strip() for part in raw.split(",") if part.strip())
+
+
+def _teacher_name_has_prefix(values: np.ndarray, prefixes: tuple[str, ...]) -> np.ndarray:
+    if not prefixes:
+        return np.zeros(values.shape, dtype=bool)
+    result = np.zeros(values.shape, dtype=bool)
+    for prefix in prefixes:
+        result |= np.char.startswith(values.astype(str), prefix)
+    return result
+
+
+def _q_skip_rows(data: dict, batch: np.ndarray, prefixes: tuple[str, ...]) -> np.ndarray:
+    teacher_names = np.asarray(
+        data.get("teacher_name", np.full(len(data["action_taken"]), ""))[batch]
+    ).astype(str)
+    score_sources = np.asarray(
+        data.get("target_score_source", np.full(len(data["action_taken"]), ""))[batch]
+    ).astype(str)
+    return _q_skip_rows_for_arrays(teacher_names, score_sources, prefixes)
+
+
+def _q_skip_rows_for_arrays(
+    teacher_names: np.ndarray,
+    score_sources: np.ndarray,
+    prefixes: tuple[str, ...],
+) -> np.ndarray:
+    if not prefixes:
+        return np.zeros(teacher_names.shape, dtype=bool)
+    prefix_match = _teacher_name_has_prefix(teacher_names.astype(str), prefixes)
+    # AB rows generated by the fixed teacher expose true root alpha-beta scores.
+    # Older AB rows have no source or fallback value scores and stay excluded.
+    return prefix_match & (score_sources.astype(str) != "ab_root")
+
+
+def _prefer_policy_over_scores_for_teachers(
+    teacher_names: np.ndarray,
+    score_sources: np.ndarray | None = None,
+) -> np.ndarray:
+    """Keep AB rows anchored to the action actually chosen by alpha-beta.
+
+    New AB shards expose root search scores, but the anchored policy target is
+    still safer for older/fallback rows where scores may be missing or generated
+    by a fallback teacher. Rows marked target_score_source=ab_root are handled
+    by the prefer_scores path with an explicit score/policy blend.
+    """
+
+    ab_rows = _teacher_name_has_prefix(teacher_names, ("catanatron_ab",))
+    if score_sources is None:
+        return ab_rows
+    return ab_rows & (np.asarray(score_sources).astype(str) != "ab_root")
+
+
+def _ab_root_score_rows(teacher_names: np.ndarray, score_sources: np.ndarray) -> np.ndarray:
+    return _teacher_name_has_prefix(teacher_names, ("catanatron_ab",)) & (
+        np.asarray(score_sources).astype(str) == "ab_root"
+    )
+
+
+def _blend_soft_target_rows(
+    policy: np.ndarray,
+    score_target: np.ndarray,
+    rows: np.ndarray,
+    *,
+    policy_weight: float,
+) -> np.ndarray:
+    alpha = float(np.clip(policy_weight, 0.0, 1.0))
+    mixed = alpha * policy[rows] + (1.0 - alpha) * score_target[rows]
+    sums = np.sum(mixed, axis=1, keepdims=True)
+    valid = sums[:, 0] > 0.0
+    if np.any(valid):
+        mixed[valid] = mixed[valid] / sums[valid]
+    return mixed.astype(np.float32, copy=False)
+
+
+def _checkpoint_config_mismatches(
+    *,
+    policy_type: str | None,
+    config,
+    args: argparse.Namespace,
+) -> list[str]:
+    mismatches: list[str] = []
+    if policy_type is not None and str(policy_type) != str(args.arch):
+        mismatches.append(f"policy_type checkpoint={policy_type} cli={args.arch}")
+    if config is None:
+        return mismatches
+    # Task #74: checkpoints may store the config as a name-keyed dict; the
+    # getattr probes below need an attribute view over that form.
+    from catan_zero.rl.config_serialization import config_attr_view
+
+    config = config_attr_view(config)
+    hidden_size = getattr(config, "hidden_size", None)
+    if hidden_size is not None and int(hidden_size) != int(args.hidden_size):
+        mismatches.append(f"hidden_size checkpoint={hidden_size} cli={args.hidden_size}")
+    if args.arch == "xdim_graph":
+        token_count = getattr(config, "token_count", None)
+        if token_count is not None and int(token_count) != int(args.graph_tokens):
+            mismatches.append(f"graph_tokens checkpoint={token_count} cli={args.graph_tokens}")
+        board_layers = getattr(config, "board_layers", None)
+        if board_layers is not None and int(board_layers) != int(args.graph_layers):
+            mismatches.append(f"graph_layers checkpoint={board_layers} cli={args.graph_layers}")
+        attention_heads = getattr(config, "attention_heads", None)
+        if attention_heads is not None and int(attention_heads) != int(args.attention_heads):
+            mismatches.append(
+                f"attention_heads checkpoint={attention_heads} cli={args.attention_heads}"
+            )
+        dropout = getattr(config, "dropout", None)
+        if dropout is not None and abs(float(dropout) - float(args.graph_dropout)) > 1.0e-9:
+            mismatches.append(f"graph_dropout checkpoint={dropout} cli={args.graph_dropout}")
+    if args.arch == "entity_graph":
+        state_layers = getattr(config, "state_layers", None)
+        if state_layers is not None and int(state_layers) != int(args.graph_layers):
+            mismatches.append(f"graph_layers checkpoint={state_layers} cli={args.graph_layers}")
+        attention_heads = getattr(config, "attention_heads", None)
+        if attention_heads is not None and int(attention_heads) != int(args.attention_heads):
+            mismatches.append(
+                f"attention_heads checkpoint={attention_heads} cli={args.attention_heads}"
+            )
+        dropout = getattr(config, "dropout", None)
+        if dropout is not None and abs(float(dropout) - float(args.graph_dropout)) > 1.0e-9:
+            mismatches.append(f"graph_dropout checkpoint={dropout} cli={args.graph_dropout}")
+    return mismatches
+
+
+def _preflight_init_checkpoint_architecture(args: argparse.Namespace, ddp: dict) -> None:
+    if not args.init_checkpoint or args.arch not in {"xdim_graph", "entity_graph"}:
+        return
+    import torch
+
+    checkpoint = torch.load(args.init_checkpoint, map_location="cpu", weights_only=False)
+    if not isinstance(checkpoint, dict):
+        return
+    mismatches = _checkpoint_config_mismatches(
+        policy_type=checkpoint.get("policy_type"),
+        config=checkpoint.get("config"),
+        args=args,
+    )
+    if mismatches:
+        raise SystemExit(
+            "init checkpoint architecture does not match requested run: "
+            + "; ".join(mismatches)
+        )
+    _rank0_print(
+        json.dumps(
+            {
+                "progress": "init_checkpoint_architecture_preflight",
+                "checkpoint": args.init_checkpoint,
+                "policy_type": checkpoint.get("policy_type"),
+                "ok": True,
+            },
+            sort_keys=True,
+        ),
+        ddp,
+    )
+
+
+def _assert_init_config_matches(policy, args: argparse.Namespace) -> None:
+    mismatches = _checkpoint_config_mismatches(
+        policy_type=getattr(policy, "policy_type", None),
+        config=getattr(policy, "config", None),
+        args=args,
+    )
+    if mismatches:
+        raise SystemExit(
+            "init checkpoint architecture does not match requested run: "
+            + "; ".join(mismatches)
+        )
+
+
+def _enforce_35m_model_size(policy, args: argparse.Namespace) -> None:
+    if not bool(getattr(args, "require_35m_model", False)):
+        return
+    if str(args.arch) not in {"xdim_graph", "entity_graph"}:
+        raise SystemExit("--require-35m-model requires --arch xdim_graph or --arch entity_graph")
+    count = int(_parameter_count(policy))
+    lower = int(args.min_35m_params)
+    upper = int(args.max_35m_params)
+    if count < lower or count > upper:
+        raise SystemExit(
+            f"{args.arch} parameter count is outside the required 35M range: "
+            f"count={count} expected=[{lower}, {upper}]. Check --hidden-size, "
+            "--graph-tokens, and --graph-layers before launching a production BC run."
+        )
+
+
+def _set_xdim_q_branch_trainable(model, trainable: bool) -> None:
+    module = getattr(model, "module", model)
+    for name in ("q_state", "q_action", "q_bias", "q_head"):
+        layer = getattr(module, name, None)
+        if layer is None:
+            continue
+        for param in layer.parameters():
+            param.requires_grad = bool(trainable)
+
+
+# Named groups of EntityGraphNet submodules that --freeze-modules / --train-value-only can
+# freeze. value_head and final_vp_head are intentionally NOT included here -- they must stay
+# trainable for a value-head-repair pass by construction.
+ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS: dict[str, tuple[str, ...]] = {
+    "trunk": (
+        "hex_encoder",
+        "vertex_encoder",
+        "edge_encoder",
+        "player_encoder",
+        "global_encoder",
+        "event_encoder",
+        "type_embedding",
+        "cls_token",
+        "blocks",
+        "state_norm",
+    ),
+    "action_encoder": ("action_encoder",),
+    "policy_head": ("action_bias", "logit_scale"),
+}
+
+
+def _set_entity_graph_modules_trainable(
+    model, group_names, *, trainable: bool
+) -> list[str]:
+    """Freeze/unfreeze named EntityGraphNet module groups (mirrors
+    ``_set_xdim_q_branch_trainable``'s pattern for the XDim architecture).
+
+    Recognized group names: trunk, action_encoder, policy_head. Raises SystemExit on an
+    unrecognized name. Returns the list of attribute names actually touched, for logging.
+    """
+    module = getattr(model, "module", model)
+    group_names = list(group_names)
+    unknown = sorted(set(group_names) - set(ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS))
+    if unknown:
+        raise SystemExit(
+            "unknown --freeze-modules group(s): "
+            f"{unknown}; valid groups are {sorted(ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS)}"
+        )
+    touched: list[str] = []
+    for group_name in group_names:
+        for attr_name in ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS[group_name]:
+            attr = getattr(module, attr_name, None)
+            if attr is None:
+                continue
+            touched.append(attr_name)
+            parameters = attr.parameters() if hasattr(attr, "parameters") else (attr,)
+            for param in parameters:
+                param.requires_grad = bool(trainable)
+    return touched
+
+
+def _lr_warmup_multiplier(step: int, warmup_steps: int) -> float:
+    """Linear ramp from 0 at step 0 to 1.0 at (and past) ``warmup_steps``. ``step`` is
+    0-indexed (the step about to run); a ``warmup_steps <= 0`` disables the ramp (always 1.0).
+    """
+    if warmup_steps <= 0:
+        return 1.0
+    return min(1.0, float(step + 1) / float(warmup_steps))
+
+
+def _apply_lr_warmup(optimizer, *, base_lr: float, step: int, warmup_steps: int) -> float:
+    """Set every optimizer param group's lr to ``group_base_lr * warmup multiplier`` for
+    this step, where ``group_base_lr`` is the group's own ``"base_lr"`` key when present
+    (see ``_build_optimizer_param_groups``'s --value-lr-mult split) and ``base_lr``
+    otherwise -- so a single-group optimizer (no "base_lr" key, e.g. every call site
+    before --value-lr-mult existed) is unaffected. Returns the multiplier actually
+    applied, for logging."""
+    multiplier = _lr_warmup_multiplier(step, warmup_steps)
+    for group in optimizer.param_groups:
+        group["lr"] = float(group.get("base_lr", base_lr)) * multiplier
+    return multiplier
+
+
+def _lr_schedule_multiplier(
+    step: int, *, warmup_steps: int, total_steps: int, schedule: str
+) -> float:
+    """AUDIT FIX (LR decay): combine the existing linear warmup ramp with an optional
+    post-warmup decay curve. ``step`` is 0-indexed (the step about to run).
+
+    ``schedule="flat"`` returns exactly ``_lr_warmup_multiplier(step, warmup_steps)`` --
+    i.e. warmup-then-hold, bit-identical to every training recipe run before this flag
+    existed. ``"cosine"``/``"linear"`` only change behavior once the caller opts in via
+    --lr-schedule.
+    """
+    warmup_multiplier = _lr_warmup_multiplier(step, warmup_steps)
+    if schedule == "flat":
+        return warmup_multiplier
+    if step < warmup_steps:
+        return warmup_multiplier
+    decay_span = max(1, int(total_steps) - int(warmup_steps))
+    progress = min(1.0, max(0.0, float(step - warmup_steps) / float(decay_span)))
+    if schedule == "cosine":
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
+    if schedule == "linear":
+        return max(0.0, 1.0 - progress)
+    raise SystemExit(f"unknown --lr-schedule {schedule!r}; expected flat, cosine, or linear")
+
+
+def _apply_lr_schedule(
+    optimizer,
+    *,
+    base_lr: float,
+    step: int,
+    warmup_steps: int,
+    total_steps: int,
+    schedule: str,
+) -> float:
+    """Set every optimizer param group's lr to ``group_base_lr * schedule multiplier``
+    for this step, where ``group_base_lr`` is the group's own ``"base_lr"`` key when
+    present (see ``_build_optimizer_param_groups``'s --value-lr-mult split) and
+    ``base_lr`` otherwise -- so a single-group optimizer (no "base_lr" key, e.g. every
+    call site before --value-lr-mult existed) is unaffected. Returns the multiplier
+    actually applied, for logging."""
+    multiplier = _lr_schedule_multiplier(
+        step, warmup_steps=warmup_steps, total_steps=total_steps, schedule=schedule
+    )
+    for group in optimizer.param_groups:
+        group["lr"] = float(group.get("base_lr", base_lr)) * multiplier
+    return multiplier
+
+
+# Submodule attribute names treated as "value head" parameters for --value-lr-mult.
+# Mirrors ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS's own comment that value_head/
+# final_vp_head are intentionally excluded from the freeze groups because they must
+# always train; value_uncertainty_head is the third, optional value-adjacent head
+# (see --value-uncertainty-head). Present on both EntityGraphNet and XDimLite/
+# XDimGraph's underlying model as plain named submodules.
+VALUE_HEAD_MODULE_ATTRS: tuple[str, ...] = (
+    "value_head",
+    "final_vp_head",
+    "value_uncertainty_head",
+)
+
+
+def _build_optimizer_param_groups(model, *, base_lr: float, value_lr_mult: float):
+    """Return the optimizer's ``params`` argument for ``model``'s trainable parameters.
+
+    ``value_lr_mult == 1.0`` (default) returns a FLAT list of parameters -- exactly the
+    single-implicit-group optimizer this trainer built before --value-lr-mult existed,
+    bit-identical training dynamics. Any other multiplier splits VALUE_HEAD_MODULE_ATTRS
+    submodules (value_head/final_vp_head/value_uncertainty_head, whichever are present
+    and have trainable parameters) into their own param-group dict at
+    ``base_lr * value_lr_mult``; every other trainable parameter stays in a base group
+    at ``base_lr``. Each group dict carries its own ``"base_lr"`` key so
+    ``_apply_lr_schedule``/``_apply_lr_warmup`` scale the right rate per group instead
+    of overwriting every group with the same absolute rate.
+    """
+    module = getattr(model, "module", model)
+    trainable = [p for p in module.parameters() if p.requires_grad]
+    if float(value_lr_mult) == 1.0:
+        return trainable
+    value_params: list = []
+    for attr_name in VALUE_HEAD_MODULE_ATTRS:
+        submodule = getattr(module, attr_name, None)
+        if submodule is None:
+            continue
+        value_params.extend(p for p in submodule.parameters() if p.requires_grad)
+    if not value_params:
+        raise SystemExit(
+            "--value-lr-mult != 1.0 but the model has no trainable parameters under "
+            f"any of {VALUE_HEAD_MODULE_ATTRS} -- nothing to apply the multiplier to."
+        )
+    value_param_ids = {id(p) for p in value_params}
+    base_params = [p for p in trainable if id(p) not in value_param_ids]
+    value_lr = float(base_lr) * float(value_lr_mult)
+    groups = [{"params": base_params, "lr": float(base_lr), "base_lr": float(base_lr)}]
+    groups.append({"params": value_params, "lr": value_lr, "base_lr": value_lr})
+    return groups
+
+
+def _make_optimizer(params, args, device):
+    import torch
+
+    param_groups = list(params)
+    if param_groups and isinstance(param_groups[0], dict):
+        # --value-lr-mult path: `params` is already a list of param-group dicts (see
+        # `_build_optimizer_param_groups`), each carrying its own "lr". Drop any
+        # non-trainable stragglers per group (mirrors the flat-list branch below).
+        trainable_params = [
+            {**group, "params": [p for p in group["params"] if p.requires_grad]}
+            for group in param_groups
+        ]
+        if not any(group["params"] for group in trainable_params):
+            raise SystemExit("no trainable parameters found for BC optimizer")
+    else:
+        trainable_params = [parameter for parameter in param_groups if parameter.requires_grad]
+        if not trainable_params:
+            raise SystemExit("no trainable parameters found for BC optimizer")
+    optimizer_name = str(args.optimizer).lower()
+    weight_decay = float(args.weight_decay)
+    # AUDIT FIX (weight-decay silent no-op): plain torch.optim.Adam's weight_decay
+    # is L2-regularization added to the gradient BEFORE the Adam moment estimates,
+    # not AdamW's decoupled decay -- they are not interchangeable, and this
+    # function used to only ever forward --weight-decay when --optimizer adamw was
+    # also passed, silently dropping it under the default "adam" optimizer. Fail
+    # loud instead: a nonzero --weight-decay with --optimizer adam is always a
+    # config mistake here (this repo's only two choices are "adam"/"adamw"), so
+    # refuse rather than guess which regularization the caller meant.
+    if weight_decay != 0.0 and optimizer_name != "adamw":
+        raise SystemExit(
+            f"--weight-decay {weight_decay} has no effect with --optimizer "
+            f"{optimizer_name!r}: this trainer only forwards weight_decay to "
+            "torch.optim.AdamW's decoupled decay. Pass --optimizer adamw to "
+            "apply it, or --weight-decay 0.0 to train without decay."
+        )
+    cls = torch.optim.AdamW if optimizer_name == "adamw" else torch.optim.Adam
+    kwargs = {"lr": float(args.lr)}
+    if optimizer_name == "adamw":
+        kwargs["weight_decay"] = weight_decay
+    if bool(args.fused_optimizer) and str(device).startswith("cuda"):
+        kwargs["fused"] = True
+    try:
+        return cls(trainable_params, **kwargs)
+    except TypeError:
+        if "fused" not in kwargs:
+            raise
+        kwargs.pop("fused", None)
+        return cls(trainable_params, **kwargs)
+
+
+def _amp_context(device, amp: str):
+    from contextlib import nullcontext
+
+    if str(amp).lower() != "bf16":
+        return nullcontext()
+    if not str(device).startswith("cuda"):
+        return nullcontext()
+    import torch
+
+    if not torch.cuda.is_available():
+        return nullcontext()
+    return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+
+
+def _ensure_policy_action_mask_version(
+    policy,
+    env_config,
+    *,
+    allow_legacy_upgrade: bool,
+    checkpoint_path: str,
+) -> None:
+    config = getattr(policy, "config", None)
+    if config is None:
+        return
+    current = str(getattr(config, "action_mask_version", "") or "")
+    if current:
+        return
+    expected = _expected_action_mask_version(env_config)
+    if not expected:
+        return
+    if not allow_legacy_upgrade:
+        source = f" {checkpoint_path}" if checkpoint_path else ""
+        raise SystemExit(
+            f"init checkpoint{source} is missing action_mask_version; refusing "
+            "to stamp it with the current action catalog automatically. Regenerate "
+            "from a versioned checkpoint or pass --allow-legacy-action-mask-upgrade "
+            "only after an action-ID replay smoke test passes."
+        )
+    object.__setattr__(config, "action_mask_version", expected)
+
+
+def _batch_profile(policy, data: dict, batch: np.ndarray) -> dict:
+    config = getattr(policy, "config", None)
+    action_size = int(getattr(policy, "action_size", getattr(config, "action_size", 0)))
+    context_size = int(
+        getattr(
+            policy,
+            "context_action_feature_size",
+            getattr(config, "context_action_feature_size", 0),
+        )
+    )
+    valid = data["legal_action_ids"][batch]
+    legal_counts = np.sum(valid >= 0, axis=1)
+    profile = {
+        "batch_size": int(len(batch)),
+        "obs_shape": list(data["obs"][batch].shape),
+        "legal_action_ids_shape": list(valid.shape),
+        "legal_action_context_shape": list(data["legal_action_context"][batch].shape),
+        "dense_action_context_shape": [int(len(batch)), action_size, context_size],
+        "legal_actions_mean": float(np.mean(legal_counts)) if len(legal_counts) else 0.0,
+        "legal_actions_p90": int(np.percentile(legal_counts, 90)) if len(legal_counts) else 0,
+        "legal_actions_max": int(np.max(legal_counts)) if len(legal_counts) else 0,
+        "parameter_count": int(_parameter_count(policy)),
+        "cuda": _cuda_memory(policy),
+    }
+    if getattr(policy, "policy_type", "") == "entity_graph":
+        for key in (
+            "hex_tokens",
+            "vertex_tokens",
+            "edge_tokens",
+            "player_tokens",
+            "global_tokens",
+            "legal_action_tokens",
+            "event_tokens",
+        ):
+            if key in data:
+                profile[f"{key}_shape"] = list(data[key][batch].shape)
+    return profile
+
+
+def _parameter_count(policy) -> int:
+    return int(sum(parameter.numel() for parameter in _params(policy)))
+
+
+def _cuda_memory(policy) -> dict:
+    try:
+        import torch
+    except ImportError:
+        return {}
+    device = getattr(policy, "device", None)
+    if not torch.cuda.is_available() or device is None or str(device).startswith("cpu"):
+        return {}
+    return {
+        "allocated_mib": float(torch.cuda.memory_allocated(device) / 1024 / 1024),
+        "reserved_mib": float(torch.cuda.memory_reserved(device) / 1024 / 1024),
+        "max_allocated_mib": float(torch.cuda.max_memory_allocated(device) / 1024 / 1024),
+        "max_reserved_mib": float(torch.cuda.max_memory_reserved(device) / 1024 / 1024),
+    }
+
+
+def _epoch_checkpoint_path(checkpoint: str, epoch: int) -> Path:
+    path = Path(checkpoint)
+    suffix = "".join(path.suffixes) or ".pt"
+    stem = path.name[: -len(suffix)] if path.name.endswith(suffix) else path.stem
+    return path.with_name(f"{stem}_epoch{epoch:04d}{suffix}")
+
+
+def _acquire_host_train_lock(lock_file: str, ddp: dict[str, int | bool]):
+    """Prevent accidental same-host BC job stacking.
+
+    Only local rank 0 owns the lock for DDP jobs. If a second DDP launcher starts,
+    its rank 0 exits quickly and torchrun tears down the sibling ranks.
+    """
+
+    if bool(ddp["enabled"]) and int(ddp["local_rank"]) != 0:
+        return None
+    path = Path(lock_file)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = path.open("w", encoding="utf-8")
+    try:
+        import fcntl
+
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as error:
+        raise SystemExit(
+            f"another train_bc.py job is already running on this host; "
+            f"lock_file={path}. Pass --allow-concurrent-bc only if the GPUs "
+            "are intentionally partitioned."
+        ) from error
+    handle.seek(0)
+    handle.truncate()
+    handle.write(
+        json.dumps(
+            {
+                "pid": os.getpid(),
+                "rank": int(ddp["rank"]),
+                "local_rank": int(ddp["local_rank"]),
+                "started_unix": time.time(),
+            },
+            sort_keys=True,
+        )
+        + "\n"
+    )
+    handle.flush()
+    return handle
+
+
+def _iter_with_last(iterable):
+    """Yield ``(item, is_last)`` for every item, with ``is_last=True`` only on the
+    final item. Uses one-step lookahead so it works on single-pass generators
+    (the streaming memmap/prefetch batch iterator) without materialising them.
+    An empty iterable yields nothing.
+    """
+    iterator = iter(iterable)
+    try:
+        previous = next(iterator)
+    except StopIteration:
+        return
+    for current in iterator:
+        yield previous, False
+        previous = current
+    yield previous, True
+
+
+def _warm_start_grow(policy, checkpoint_path: str, *, device: str) -> dict:
+    """C1 warm-start-GROW: copy every parameter/buffer whose NAME and SHAPE
+    match from ``checkpoint_path`` into the already-constructed (fresh, typically
+    bigger) ``policy.model``; leave every other tensor at its fresh init.
+
+    This is the "load matching keys, init the rest, log the fraction loaded"
+    contract from the C1 spec. It deliberately does NOT require an architecture
+    match (that is what --init-checkpoint is for): a same-width/deeper config
+    warm-starts the shared trunk blocks + token encoders + heads cleanly (only
+    the extra blocks.<i> stay fresh), while a width change matches little and the
+    run is effectively from-scratch -- either way the fraction loaded is logged
+    so the caller sees exactly how much signal was transferred.
+
+    Returns a JSON-safe report: parameter/tensor counts, the loaded fraction (by
+    parameter element count -- the number that matters for "how warm is this
+    start"), and the sizes of the mismatched/missing/unexpected buckets.
+    """
+    import torch
+
+    ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    if not isinstance(ckpt, dict) or "model" not in ckpt:
+        raise SystemExit(
+            f"--grow-from-checkpoint {checkpoint_path} is not a policy checkpoint "
+            "(no 'model' state_dict)"
+        )
+    source = ckpt["model"]
+    target_model = policy.model
+    target_sd = target_model.state_dict()
+
+    to_copy: dict = {}
+    shape_mismatch: list[str] = []
+    unexpected: list[str] = []
+    for name, src_tensor in source.items():
+        if name not in target_sd:
+            unexpected.append(name)
+            continue
+        if tuple(src_tensor.shape) == tuple(target_sd[name].shape):
+            to_copy[name] = src_tensor
+        else:
+            shape_mismatch.append(name)
+    missing = [name for name in target_sd if name not in source]
+
+    # strict=False so the fresh-init tensors for missing/mismatched keys are
+    # left untouched; assign=False keeps the target's dtype/device.
+    target_model.load_state_dict(to_copy, strict=False)
+
+    def _param_elems(names) -> int:
+        return int(sum(int(target_sd[n].numel()) for n in names if n in target_sd))
+
+    total_target_params = int(sum(p.numel() for p in target_model.parameters()))
+    # Restrict the "loaded" accounting to trainable parameters (buffers such as
+    # the non-persistent value_categorical_support never appear in state_dict
+    # persistently, but any registered buffers that do should not inflate the
+    # "fraction of the MODEL warm-started" number the operator reads).
+    param_names = {name for name, _ in target_model.named_parameters()}
+    loaded_param_elems = _param_elems(n for n in to_copy if n in param_names)
+    loaded_fraction = (
+        float(loaded_param_elems) / float(total_target_params)
+        if total_target_params > 0
+        else 0.0
+    )
+    return {
+        "checkpoint": checkpoint_path,
+        "source_tensors": int(len(source)),
+        "target_tensors": int(len(target_sd)),
+        "copied_tensors": int(len(to_copy)),
+        "shape_mismatch_tensors": int(len(shape_mismatch)),
+        "missing_in_source_tensors": int(len(missing)),
+        "unexpected_in_source_tensors": int(len(unexpected)),
+        "target_total_params": total_target_params,
+        "loaded_params": loaded_param_elems,
+        "loaded_fraction": round(loaded_fraction, 6),
+        "shape_mismatch_examples": sorted(shape_mismatch)[:8],
+        "missing_examples": sorted(missing)[:8],
+    }
+
+
+def _distributed_state() -> dict[str, int | bool]:
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    return {
+        "enabled": world_size > 1,
+        "world_size": world_size,
+        "rank": int(os.environ.get("RANK", "0")),
+        "local_rank": int(os.environ.get("LOCAL_RANK", "0")),
+    }
+
+
+def _epoch_order(
+    rng: np.random.Generator,
+    n: int,
+    batch_size: int,
+    ddp: dict[str, int | bool],
+    *,
+    data_sharded: bool = False,
+    sample_weights: np.ndarray | None = None,
+) -> np.ndarray:
+    """Per-epoch traversal order over ``train_indices`` positions ``0..n-1``.
+
+    Default (``sample_weights=None``): a uniform ``rng.permutation`` -- every
+    row visited exactly once per epoch, byte-identical to pre-CAT-45 behaviour.
+    This is NOT merely "uniform weights passed through the weighted path" --
+    ``rng.choice`` and ``rng.permutation`` consume a NumPy bit generator's
+    stream differently even when the distribution is uniform, so taking that
+    shortcut would silently change existing seeded runs' reproducibility.
+    Callers MUST pass ``sample_weights=None`` (not an all-ones array) to get
+    today's exact behaviour.
+
+    CAT-45 weighted path (``sample_weights`` given, length ``n``, aligned to
+    ``train_indices`` positions): draws ``n`` positions WITH replacement,
+    probability proportional to ``sample_weights`` -- a KataGo-style weighted
+    sampler (oversampling), matching torch's ``WeightedRandomSampler``
+    convention. This changes SAMPLING FREQUENCY (how often a row is drawn per
+    epoch), which is orthogonal to -- and composes multiplicatively in effect
+    with -- ``policy_sample_weights``/``value_sample_weights`` (which scale the
+    LOSS magnitude of whichever row was drawn); see the CAT-45 call site for the
+    explicit non-combination-rule with those. If a future ticket also wants to
+    change epoch sampling frequency (not loss weight), it must combine its
+    weights with these explicitly (e.g. multiply then renormalize) rather than
+    overwriting this argument.
+    """
+    if sample_weights is None:
+        order = rng.permutation(n)
+    else:
+        weights = np.asarray(sample_weights, dtype=np.float64)
+        if weights.shape[0] != n:
+            raise ValueError(
+                f"sample_weights length {weights.shape[0]} != train_indices length {n}"
+            )
+        total = float(weights.sum())
+        if total <= 0.0:
+            raise ValueError("sample_weights must sum to a positive value")
+        order = rng.choice(n, size=n, replace=True, p=weights / total)
+    if not ddp["enabled"]:
+        return order
+    if data_sharded:
+        total_size = int(
+            np.ceil(_distributed_scalar_max(float(n), ddp) / max(1, int(batch_size)))
+            * max(1, int(batch_size))
+        )
+        if total_size > len(order):
+            pad = np.resize(order, total_size - len(order))
+            order = np.concatenate((order, pad), axis=0)
+        return order
+    world_size = int(ddp["world_size"])
+    rank = int(ddp["rank"])
+    global_batch = max(1, int(batch_size)) * world_size
+    total_size = int(np.ceil(n / global_batch) * global_batch)
+    if total_size > len(order):
+        pad = np.resize(order, total_size - len(order))
+        order = np.concatenate((order, pad), axis=0)
+    return order[rank:total_size:world_size]
+
+
+def _reduce_epoch_metrics(
+    loss_sum: float,
+    acc_sum: float,
+    top3_sum: float,
+    count: float,
+    ddp: dict[str, int | bool],
+) -> tuple[float, float, float, float]:
+    if not ddp["enabled"]:
+        return loss_sum, acc_sum, top3_sum, count
+    import torch
+    import torch.distributed as dist
+
+    values = torch.tensor(
+        [loss_sum, acc_sum, top3_sum, count],
+        dtype=torch.float64,
+        device=f"cuda:{int(ddp['local_rank'])}",
+    )
+    dist.all_reduce(values, op=dist.ReduceOp.SUM)
+    return (
+        float(values[0].item()),
+        float(values[1].item()),
+        float(values[2].item()),
+        float(values[3].item()),
+    )
+
+
+def _reduce_named_sums(
+    values_by_name: dict[str, float],
+    ddp: dict[str, int | bool],
+) -> dict[str, float]:
+    if not ddp["enabled"] or not values_by_name:
+        return dict(values_by_name)
+    import torch
+    import torch.distributed as dist
+
+    names = sorted(values_by_name)
+    values = torch.tensor(
+        [float(values_by_name[name]) for name in names],
+        dtype=torch.float64,
+        device=f"cuda:{int(ddp['local_rank'])}",
+    )
+    dist.all_reduce(values, op=dist.ReduceOp.SUM)
+    return {name: float(values[index].item()) for index, name in enumerate(names)}
+
+
+def _reduce_scalar_sum(value: float, ddp: dict[str, int | bool]) -> float:
+    if not ddp["enabled"]:
+        return float(value)
+    import torch
+    import torch.distributed as dist
+
+    values = torch.tensor(
+        [float(value)],
+        dtype=torch.float64,
+        device=f"cuda:{int(ddp['local_rank'])}",
+    )
+    dist.all_reduce(values, op=dist.ReduceOp.SUM)
+    return float(values[0].item())
+
+
+def _distributed_scalar_max(value: float, ddp: dict[str, int | bool]) -> float:
+    if not ddp["enabled"]:
+        return float(value)
+    import torch
+    import torch.distributed as dist
+
+    values = torch.tensor(
+        [float(value)],
+        dtype=torch.float64,
+        device=f"cuda:{int(ddp['local_rank'])}",
+    )
+    dist.all_reduce(values, op=dist.ReduceOp.MAX)
+    return float(values[0].item())
+
+
+def _rank0_print(message: str, ddp: dict[str, int | bool]) -> None:
+    if int(ddp["rank"]) == 0:
+        print(message, flush=True)
+
+
+def _is_fsdp(model) -> bool:
+    # Single FSDP-detection path: delegate to the shared util so model-weight gather
+    # (_save_policy) and optimizer-state gather (optim_state.save_optimizer_state) can
+    # never disagree on what "is FSDP" means (CAT-128).
+    from catan_zero.rl.optim_state import is_fsdp
+
+    return is_fsdp(model)
+
+
+def _save_optimizer_sidecar(checkpoint_path: str, policy, optimizer, ddp: dict) -> None:
+    """CAT-128 patch #8 wrapper: persist optimizer (Adam) state as
+    ``<checkpoint_path>.optimizer.pt`` via the shared FSDP-safe util. MUST be called on
+    every rank (the FSDP gather is collective); the util rank-guards the write and is
+    fail-soft (a save error logs and does not crash the run)."""
+    from catan_zero.rl.optim_state import save_optimizer_state
+
+    save_optimizer_state(checkpoint_path, policy.model, optimizer, ddp)
+
+
+def _save_policy(
+    policy,
+    path: str,
+    ddp: dict[str, int | bool],
+    *,
+    mask_hidden_info: bool = False,
+    soft_target_source: str | None = None,
+) -> None:
+    """Write a policy checkpoint. Safe to call from EVERY rank: single-GPU and
+    DDP write on rank 0 only, while FSDP gathers a full (unsharded) state_dict --
+    a collective every rank must enter -- and writes it on rank 0. The on-disk
+    format is identical across all three paths so a checkpoint loads the same way
+    regardless of how it was trained."""
+    import torch
+
+    is_rank0 = int(ddp["rank"]) == 0
+
+    # FSDP: gather the full state_dict on all ranks (offloaded to CPU, populated
+    # only on rank 0), then write on rank 0. Keys come back with their original
+    # (unwrapped) names because the model was wrapped with use_orig_params=True,
+    # so the checkpoint is interchangeable with the DDP/single-GPU form.
+    if _is_fsdp(policy.model):
+        from torch.distributed.fsdp import (
+            FullStateDictConfig,
+            FullyShardedDataParallel as FSDP,
+            StateDictType,
+        )
+
+        gather_cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+        with FSDP.state_dict_type(policy.model, StateDictType.FULL_STATE_DICT, gather_cfg):
+            model_state = policy.model.state_dict()
+        if not is_rank0:
+            return
+        _write_entity_checkpoint(policy, path, model_state, mask_hidden_info)
+        return
+
+    output = Path(path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    tmp = output.with_name(f".{output.name}.tmp.{os.getpid()}")
+    if not ddp["enabled"]:
+        try:
+            policy.save(
+                tmp,
+                mask_hidden_info=bool(mask_hidden_info),
+                soft_target_source=soft_target_source,
+            )
+            if not tmp.exists() or tmp.stat().st_size <= 0:
+                raise RuntimeError(f"checkpoint temp file was not written: {tmp}")
+            os.replace(tmp, output)
+        finally:
+            if tmp.exists():
+                tmp.unlink()
+        return
+
+    # DDP: only rank 0 writes; other ranks return (state_dict() here is a local
+    # non-collective call, so this guard is safe even when every rank calls in).
+    if not is_rank0:
+        return
+    _write_entity_checkpoint(policy, path, policy.model.module.state_dict(), mask_hidden_info)
+
+
+def _write_entity_checkpoint(policy, path: str, model_state: dict, mask_hidden_info: bool) -> None:
+    """Atomically write the durable name-keyed checkpoint dict shared by the DDP
+    and FSDP save paths (mirrors EntityGraphPolicy.save's fields)."""
+    import torch
+
+    from catan_zero.rl.config_serialization import config_to_dict
+
+    output = Path(path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    tmp = output.with_name(f".{output.name}.tmp.{os.getpid()}")
+    try:
+        torch.save(
+            {
+                "policy_type": getattr(policy, "policy_type", "xdim_lite"),
+                "config": config_to_dict(policy.config),
+                "action_mask_version": str(getattr(policy.config, "action_mask_version", "")),
+                "mask_hidden_info": bool(mask_hidden_info),
+                # OPT-8 provenance (mirrors EntityGraphPolicy.save).
+                "soft_target_source": str(soft_target_source) if soft_target_source is not None else "",
+                "static_action_features_sha256": _array_sha256(
+                    policy.static_action_features.detach().cpu().numpy()
+                ),
+                "static_action_features": policy.static_action_features.detach().cpu(),
+                "model": model_state,
+            },
+            tmp,
+        )
+        if not tmp.exists() or tmp.stat().st_size <= 0:
+            raise RuntimeError(f"checkpoint temp file was not written: {tmp}")
+        os.replace(tmp, output)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+
+
+if __name__ == "__main__":
+    main()

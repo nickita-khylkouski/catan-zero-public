@@ -1,0 +1,21 @@
+{
+  "guards": [
+    {
+      "name": "cli_flag_lint",
+      "args": {
+        "critical_flags": [
+          "--optimizer",
+          "--weight-decay",
+          "--truncated-vp-margin-value-weight",
+          "--lr-schedule"
+        ]
+      }
+    },
+    {
+      "name": "fd_limit",
+      "args": {
+        "minimum": 65536
+      }
+    }
+  ]
+}

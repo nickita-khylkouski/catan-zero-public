@@ -1,0 +1,299 @@
+from __future__ import annotations
+
+import dataclasses
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+from catan_zero.rl._catanatron import import_catanatron_module
+from tools.train_bc import (
+    ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS,
+    _apply_lr_warmup,
+    _lr_warmup_multiplier,
+    _set_entity_graph_modules_trainable,
+    _train_xdim_batch,
+    load_teacher_data,
+)
+
+
+# --------------------------------------------------------------------------- lr warmup
+
+
+def test_lr_warmup_multiplier_ramps_linearly_then_holds() -> None:
+    assert _lr_warmup_multiplier(0, 10) == pytest.approx(0.1)
+    assert _lr_warmup_multiplier(4, 10) == pytest.approx(0.5)
+    assert _lr_warmup_multiplier(9, 10) == pytest.approx(1.0)
+    assert _lr_warmup_multiplier(20, 10) == pytest.approx(1.0)
+
+
+def test_lr_warmup_multiplier_disabled_when_warmup_steps_not_positive() -> None:
+    assert _lr_warmup_multiplier(0, 0) == 1.0
+    assert _lr_warmup_multiplier(0, -5) == 1.0
+
+
+def test_apply_lr_warmup_sets_every_param_group() -> None:
+    import torch
+
+    model = torch.nn.Linear(2, 2)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1.0)
+
+    multiplier = _apply_lr_warmup(optimizer, base_lr=2e-4, step=0, warmup_steps=4)
+
+    assert multiplier == pytest.approx(0.25)
+    for group in optimizer.param_groups:
+        assert group["lr"] == pytest.approx(2e-4 * 0.25)
+
+    multiplier = _apply_lr_warmup(optimizer, base_lr=2e-4, step=10, warmup_steps=4)
+    assert multiplier == pytest.approx(1.0)
+    for group in optimizer.param_groups:
+        assert group["lr"] == pytest.approx(2e-4)
+
+
+# --------------------------------------------------------------------------- freeze utility
+
+
+def _make_entity_policy():
+    from catan_zero.rl.entity_token_policy import EntityGraphPolicy
+    from catan_zero.rl.self_play import make_env_config
+
+    return EntityGraphPolicy.create(
+        env_config=make_env_config(vps_to_win=3),
+        hidden_size=16,
+        state_layers=1,
+        attention_heads=2,
+        seed=0,
+    )
+
+
+def test_freeze_module_groups_cover_expected_submodules() -> None:
+    assert set(ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS) == {"trunk", "action_encoder", "policy_head"}
+    assert "value_head" not in sum(ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS.values(), ())
+    assert "final_vp_head" not in sum(ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS.values(), ())
+
+
+def test_set_entity_graph_modules_trainable_freezes_and_restores() -> None:
+    policy = _make_entity_policy()
+
+    touched = _set_entity_graph_modules_trainable(
+        policy.model, ["trunk", "action_encoder", "policy_head"], trainable=False
+    )
+    assert set(touched) == {
+        "hex_encoder",
+        "vertex_encoder",
+        "edge_encoder",
+        "player_encoder",
+        "global_encoder",
+        "event_encoder",
+        "type_embedding",
+        "cls_token",
+        "blocks",
+        "state_norm",
+        "action_encoder",
+        "action_bias",
+        "logit_scale",
+    }
+    for name in touched:
+        attr = getattr(policy.model, name)
+        params = attr.parameters() if hasattr(attr, "parameters") else (attr,)
+        assert all(not p.requires_grad for p in params)
+    # value_head / final_vp_head must remain trainable -- never in the freezable groups.
+    assert all(p.requires_grad for p in policy.model.value_head.parameters())
+    assert all(p.requires_grad for p in policy.model.final_vp_head.parameters())
+
+    _set_entity_graph_modules_trainable(policy.model, ["trunk"], trainable=True)
+    assert all(p.requires_grad for p in policy.model.hex_encoder.parameters())
+    # action_encoder/policy_head were not re-enabled -- still frozen.
+    assert all(not p.requires_grad for p in policy.model.action_encoder.parameters())
+
+
+def test_set_entity_graph_modules_trainable_rejects_unknown_group() -> None:
+    policy = _make_entity_policy()
+    with pytest.raises(SystemExit):
+        _set_entity_graph_modules_trainable(policy.model, ["not_a_real_group"], trainable=False)
+
+
+def test_value_only_smoke_frozen_params_stay_put_value_params_move() -> None:
+    """10-step smoke (per spec): after freezing trunk/action_encoder/policy_head, those
+    params' gradients must be None (never touched) and their values must not move across
+    optimizer steps, while value_head/final_vp_head gradients are non-zero and their values
+    DO move."""
+    import torch
+
+    policy = _make_entity_policy()
+    _set_entity_graph_modules_trainable(
+        policy.model, ["trunk", "action_encoder", "policy_head"], trainable=False
+    )
+
+    samples = _collect_real_samples(6)
+    entity_batch = _pad_entity_batch(policy, samples)
+    legal_action_ids, legal_action_context = _pad_legal_action_arrays(policy, samples)
+
+    optimizer = torch.optim.Adam(
+        [p for p in policy.model.parameters() if p.requires_grad], lr=1e-2
+    )
+
+    frozen_param = next(policy.model.hex_encoder.parameters())
+    frozen_before = frozen_param.detach().clone()
+    value_param = next(policy.model.value_head.parameters())
+    value_before = value_param.detach().clone()
+
+    value_targets = torch.as_tensor(
+        np.random.default_rng(0).normal(size=len(samples)).astype(np.float32),
+        device=policy.device,
+    )
+
+    for _ in range(10):
+        outputs = policy.forward_legal_np(
+            entity_batch, legal_action_ids, legal_action_context, return_q=False
+        )
+        value_loss = torch.nn.functional.mse_loss(outputs["value"], value_targets)
+        optimizer.zero_grad(set_to_none=True)
+        value_loss.backward()
+        assert frozen_param.grad is None
+        assert value_param.grad is not None
+        assert bool((value_param.grad.abs().sum() > 0).item())
+        optimizer.step()
+
+    torch.testing.assert_close(frozen_param.detach(), frozen_before)
+    assert not torch.allclose(value_param.detach(), value_before)
+
+
+# --------------------------------------------------------------------------- policy-loss-weight
+# end-to-end (via a real, on-disk DAgger-format shard, matching the production data path).
+
+
+def _collect_real_samples(n: int):
+    import_catanatron_module("catanatron")
+    from catan_zero.rl.action_features import build_action_context_feature_table
+    from catan_zero.rl.entity_token_features import build_entity_token_features
+    from catan_zero.rl.multiagent_env import ColonistMultiAgentEnv
+    from catan_zero.rl.self_play import StepSample, _phase_from_info, make_env_config
+
+    config = make_env_config(vps_to_win=3)
+    env = ColonistMultiAgentEnv(config)
+    samples = []
+    try:
+        observations, info = env.reset(seed=9)
+        for decision_index in range(n):
+            player = str(info["current_player"])
+            observation = np.asarray(observations[player], dtype=np.float64)
+            valid_actions = tuple(int(a) for a in info["valid_actions"])
+            entity_features = {
+                key: value
+                for key, value in build_entity_token_features(env, player).items()
+                if key != "schema"
+            }
+            samples.append(
+                StepSample(
+                    observation=observation.copy(),
+                    valid_actions=valid_actions,
+                    action=int(valid_actions[0]),
+                    player=player,
+                    action_context_features=build_action_context_feature_table(env, info),
+                    entity_features=entity_features,
+                    phase=_phase_from_info(info),
+                    decision_index=decision_index,
+                )
+            )
+            observations, _rewards, terminated, truncated, info = env.step(int(valid_actions[0]))
+            if terminated or truncated:
+                observations, info = env.reset(seed=9 + decision_index + 1)
+    finally:
+        env.close()
+    return samples
+
+
+def _pad_entity_batch(policy, samples):
+    from catan_zero.rl.torch_ppo import _entity_graph_batch
+
+    batch, _legal_ids, _legal_ctx = _entity_graph_batch(samples, policy)
+    return batch
+
+
+def _pad_legal_action_arrays(policy, samples):
+    max_legal = max(len(s.valid_actions) for s in samples)
+    context_size = int(policy.context_action_feature_size)
+    legal_action_ids = np.full((len(samples), max_legal), -1, dtype=np.int64)
+    legal_action_context = np.zeros((len(samples), max_legal, context_size), dtype=np.float32)
+    for row, sample in enumerate(samples):
+        n = len(sample.valid_actions)
+        legal_action_ids[row, :n] = np.asarray(sample.valid_actions, dtype=np.int64)
+        ctx = np.asarray(sample.action_context_features, dtype=np.float32)[list(sample.valid_actions), :]
+        legal_action_context[row, :n, : ctx.shape[1]] = ctx[:, :context_size]
+    return legal_action_ids, legal_action_context
+
+
+def _write_and_load_shard(tmp_path: Path, samples):
+    from tools.generate_dagger_data import DaggerEntityShardWriter, _row_from_sample
+
+    out = tmp_path / "shard"
+    out.mkdir()
+    writer = DaggerEntityShardWriter(out, 1000, "npz")
+    for sample in samples:
+        row = _row_from_sample(
+            sample,
+            teacher="test_teacher",
+            entity_features=sample.entity_features,
+            game_seed=0,
+            winner="BLUE",
+            terminated=True,
+            truncated=False,
+            final_public_vps={"BLUE": 10, "RED": 4, "WHITE": 0, "ORANGE": 0},
+            final_actual_vps={"BLUE": 10, "RED": 4, "WHITE": 0, "ORANGE": 0},
+            policy_weight_multiplier=1.0,
+            value_weight_multiplier=1.0,
+        )
+        row["has_final_public_vps"] = True
+        row["has_final_actual_vps"] = True
+        writer.add_row(row)
+    writer.close()
+    return load_teacher_data(out)
+
+
+def test_policy_loss_weight_scales_the_policy_term_in_train_xdim_batch(tmp_path) -> None:
+    import torch
+
+    samples = _collect_real_samples(6)
+    data = _write_and_load_shard(tmp_path, samples)
+    n = len(data["action_taken"])
+    batch = np.arange(n)
+    policy_weights = np.ones(n, dtype=np.float32)
+    value_weights = np.ones(n, dtype=np.float32)
+
+    def run(policy_loss_weight: float, value_loss_weight: float):
+        policy = _make_entity_policy()
+        optimizer = torch.optim.Adam(policy.model.parameters(), lr=1e-3)
+        return _train_xdim_batch(
+            policy,
+            optimizer,
+            data,
+            batch,
+            policy_weights,
+            value_weights,
+            soft_target_temperature=1.0,
+            soft_target_weight=0.0,
+            soft_target_source="scores",
+            soft_target_min_legal_coverage=0.0,
+            policy_loss_weight=policy_loss_weight,
+            value_loss_weight=value_loss_weight,
+            final_vp_loss_weight=0.0,
+            q_loss_weight=0.0,
+            q_skip_teacher_prefixes=(),
+            vps_to_win=10,
+            advantage_policy_weighting="none",
+            advantage_temperature=1.0,
+            advantage_weight_cap=5.0,
+            advantage_weight_floor=0.05,
+            amp="none",
+            diagnostics=False,
+        )
+
+    value_only_metrics = run(policy_loss_weight=0.0, value_loss_weight=1.0)
+    policy_only_metrics = run(policy_loss_weight=1.0, value_loss_weight=0.0)
+
+    # policy_loss/value_loss (the raw, UNweighted components) are always reported regardless
+    # of the scalar weights -- only the combined "loss" used for backprop changes.
+    assert value_only_metrics["policy_loss"] > 0.0
+    assert value_only_metrics["loss"] == pytest.approx(value_only_metrics["value_loss"], rel=1e-4)
+    assert policy_only_metrics["loss"] == pytest.approx(policy_only_metrics["policy_loss"], rel=1e-4)

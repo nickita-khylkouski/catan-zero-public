@@ -1,0 +1,50 @@
+
+*****************************************
+Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+*****************************************
+{"progress": "teacher_quality_gate", "reason": "caller asserted this curated dataset was already gated", "skipped": true}
+{"first_shard": "runs/teacher/curated_prod_ab3_ab5_ab4_a100fresh_clean2_20260628_210418/teacher_data/teacher_shard_00001.npz.zst", "last_shard": "runs/teacher/curated_prod_ab3_ab5_ab4_a100fresh_clean2_20260628_210418/teacher_data/teacher_shard_00065.npz.zst", "loaded_shards": 33, "progress": "bc_data_shard_load", "rank": 1, "total_shards": 66, "world_size": 2}{"first_shard": "runs/teacher/curated_prod_ab3_ab5_ab4_a100fresh_clean2_20260628_210418/teacher_data/teacher_shard_00000.npz.zst", "last_shard": "runs/teacher/curated_prod_ab3_ab5_ab4_a100fresh_clean2_20260628_210418/teacher_data/teacher_shard_00064.npz.zst", "loaded_shards": 33, "progress": "bc_data_shard_load", "rank": 0, "total_shards": 66, "world_size": 2}
+
+{"base_obs_width": 614, "graph_history_features": false, "graph_history_obs_width": 806, "observed_obs_width": 614, "progress": "bc_env_schema", "reason": "base_obs_width", "track": "2p_no_trade", "vps_to_win": 10}
+init checkpoint architecture does not match requested run: graph_layers checkpoint=6 cli=4
+W0630 16:50:34.094000 247891 .venv/lib/python3.11/site-packages/torch/distributed/elastic/multiprocessing/api.py:1014] Sending process 247954 closing signal SIGTERM
+E0630 16:50:34.359000 247891 .venv/lib/python3.11/site-packages/torch/distributed/elastic/multiprocessing/api.py:988] failed (exitcode: 1) local_rank: 1 (pid: 247955) of binary: /home/ubuntu/catan-zero/.venv/bin/python
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/home/ubuntu/catan-zero/.venv/lib/python3.11/site-packages/torch/distributed/run.py", line 1020, in <module>
+    main()
+  File "/home/ubuntu/catan-zero/.venv/lib/python3.11/site-packages/torch/distributed/elastic/multiprocessing/errors/__init__.py", line 367, in wrapper
+    return f(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^
+  File "/home/ubuntu/catan-zero/.venv/lib/python3.11/site-packages/torch/distributed/run.py", line 1016, in main
+    run(args)
+  File "/home/ubuntu/catan-zero/.venv/lib/python3.11/site-packages/torch/distributed/run.py", line 1007, in run
+    elastic_launch(
+  File "/home/ubuntu/catan-zero/.venv/lib/python3.11/site-packages/torch/distributed/launcher/api.py", line 191, in __call__
+    return launch_agent(self._config, self._entrypoint, list(args))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ubuntu/catan-zero/.venv/lib/python3.11/site-packages/torch/distributed/launcher/api.py", line 371, in launch_agent
+    raise ChildFailedError(
+torch.distributed.elastic.multiprocessing.errors.ChildFailedError: 
+============================================================
+tools/train_bc.py FAILED
+------------------------------------------------------------
+Failures:
+[1]:
+  time      : 2026-06-30_16:50:34
+  host      : 132-145-197-81
+  rank      : 0 (local_rank: 0)
+  exitcode  : -15 (pid: 247954)  (SIGTERM)
+  error_file: <N/A>
+  traceback : Signal 15 (SIGTERM) received by PID 247954
+------------------------------------------------------------
+Root Cause (first observed failure):
+[0]:
+  time      : 2026-06-30_16:50:34
+  host      : 132-145-197-81
+  rank      : 1 (local_rank: 1)
+  exitcode  : 1 (pid: 247955) 
+  error_file: <N/A>
+  traceback : To enable traceback see: https://pytorch.org/docs/stable/elastic/errors.html
+============================================================

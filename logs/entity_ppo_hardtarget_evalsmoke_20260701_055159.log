@@ -1,0 +1,54 @@
+run=]entity_ppo_hardtarget_evalsmoke_20260701_055159 start=]2026-07-01T05:51:59Z
+{"checkpoint": "runs/distributed/entity_ppo_hardtarget_evalsmoke_20260701_055159/policy/weights_v1.pt", "devices": ["cuda:0", "cuda:1"], "event": "local_ppo_shards_start", "games": 64, "policy_version": 1, "run_root": "runs/distributed/entity_ppo_hardtarget_evalsmoke_20260701_055159", "workers": 16}
+{"device": "cuda:0", "elapsed_sec": 20.718935402983334, "event": "local_ppo_worker_done", "games": 4, "samples": 480, "shards": 2, "worker_id": "local_000"}
+{"device": "cuda:1", "elapsed_sec": 22.90570410498185, "event": "local_ppo_worker_done", "games": 4, "samples": 459, "shards": 2, "worker_id": "local_005"}
+{"device": "cuda:1", "elapsed_sec": 24.7664274359704, "event": "local_ppo_worker_done", "games": 4, "samples": 562, "shards": 2, "worker_id": "local_015"}
+{"device": "cuda:0", "elapsed_sec": 25.79924599302467, "event": "local_ppo_worker_done", "games": 4, "samples": 599, "shards": 2, "worker_id": "local_010"}
+{"device": "cuda:1", "elapsed_sec": 26.351482609985396, "event": "local_ppo_worker_done", "games": 4, "samples": 338, "shards": 2, "worker_id": "local_013"}
+{"device": "cuda:0", "elapsed_sec": 28.5299957980169, "event": "local_ppo_worker_done", "games": 4, "samples": 551, "shards": 2, "worker_id": "local_002"}
+{"device": "cuda:0", "elapsed_sec": 28.490913757006638, "event": "local_ppo_worker_done", "games": 4, "samples": 443, "shards": 2, "worker_id": "local_004"}
+{"device": "cuda:0", "elapsed_sec": 31.189598880009726, "event": "local_ppo_worker_done", "games": 4, "samples": 434, "shards": 2, "worker_id": "local_014"}
+{"device": "cuda:0", "elapsed_sec": 32.02463565400103, "event": "local_ppo_worker_done", "games": 4, "samples": 403, "shards": 2, "worker_id": "local_006"}
+{"device": "cuda:0", "elapsed_sec": 35.95548565097852, "event": "local_ppo_worker_done", "games": 4, "samples": 626, "shards": 2, "worker_id": "local_012"}
+{"device": "cuda:0", "elapsed_sec": 37.7600105869933, "event": "local_ppo_worker_done", "games": 4, "samples": 697, "shards": 2, "worker_id": "local_008"}
+{"device": "cuda:1", "elapsed_sec": 40.259118831017986, "event": "local_ppo_worker_done", "games": 4, "samples": 634, "shards": 2, "worker_id": "local_003"}
+{"device": "cuda:1", "elapsed_sec": 40.512850527011324, "event": "local_ppo_worker_done", "games": 4, "samples": 590, "shards": 2, "worker_id": "local_009"}
+{"device": "cuda:1", "elapsed_sec": 42.80166072101565, "event": "local_ppo_worker_done", "games": 4, "samples": 862, "shards": 2, "worker_id": "local_007"}
+{"device": "cuda:1", "elapsed_sec": 44.15196563000791, "event": "local_ppo_worker_done", "games": 4, "samples": 547, "shards": 2, "worker_id": "local_011"}
+{"device": "cuda:1", "elapsed_sec": 51.01988368702587, "event": "local_ppo_worker_done", "games": 4, "samples": 598, "shards": 2, "worker_id": "local_001"}
+{"elapsed_sec": 60.23552192200441, "event": "local_ppo_shards_done", "games": 64, "run_root": "runs/distributed/entity_ppo_hardtarget_evalsmoke_20260701_055159", "samples": 8823, "shards": 32}
+{'event': 'learner_start', 'device': 'cuda:0', 'config': {'run_base': 'runs/distributed', 'run_name': 'entity_ppo_hardtarget_evalsmoke_20260701_055159', 'init_checkpoint': 'runs/bc/entity_graph_35m_oldbase_hardtarget_ab45_robber_opening_20260630_220320/checkpoint.pt', 'architecture': 'entity_graph', 'device': 'cuda:0', 'shards_per_step': 32, 'max_staleness': 10, 'poll_secs': 5.0, 'stable_secs': 0.0, 'max_steps': 1, 'resume': False, 'lr': 5e-06, 'clip_ratio': 0.05, 'value_coef': 0.5, 'entropy_coef': 0.01, 'ppo_epochs': 1, 'minibatch_size': 1024, 'target_kl': 0.02, 'kl_to_bc_init': 1.0, 'kl_to_bc_final': 1.0, 'kl_to_bc_anneal_steps': 1, 'use_vtrace': False, 'vtrace_clip_rho': 1.0, 'vtrace_clip_pg_rho': 1.0, 'gamma': 0.997, 'vtrace_use_current_values': True, 'vtrace_forward_chunk': 8192, 'checkpoint_every': 1, 'keep_last_checkpoints': 5, 'checkpoint_milestone_every': 500, 'eval_games': 40, 'eval_tracks': '2p_no_trade', 'eval_opponents': 'catanatron_value,catanatron_ab3', 'eval_workers': 16, 'eval_max_decisions': 1000, 'eval_device': 'cpu', 'eval_timeout_secs': 900.0, 'league_snapshot_interval': 200, 'league_promote_winrate': 0.7}}
+{'event': 'published', 'version': 2, 'step': 0}
+{'event': 'step', 'step': 0, 'version': 3, 'n_shards': 32, 'n_trajectories': 64, 'samples': 8823.0, 'policy_loss': 0.07775139063596725, 'value_loss': 0.056243233382701874, 'entropy': 0.32179319858551025, 'approx_kl': -0.0004864427901338786, 'ema_policy_kl': 0.00013582990504801273, 'beta': 1.0, 'mean_return': -0.20360176338640953, 'use_vtrace': False}
+{'event': 'checkpoint', 'step': 1, 'path': 'runs/distributed/entity_ppo_hardtarget_evalsmoke_20260701_055159/checkpoints/step_1.pt'}
+{'progress': 'scoreboard_chunk', 'track': '2p_no_trade', 'opponent': 'catanatron_value', 'chunk_index': 13, 'chunk_count': 14, 'games': 1, 'wins': 0}
+{'progress': 'scoreboard_chunk', 'track': '2p_no_trade', 'opponent': 'catanatron_value', 'chunk_index': 3, 'chunk_count': 14, 'games': 3, 'wins': 1}
+{'progress': 'scoreboard_chunk', 'track': '2p_no_trade', 'opponent': 'catanatron_value', 'chunk_index': 4, 'chunk_count': 14, 'games': 3, 'wins': 1}
+{'progress': 'scoreboard_chunk', 'track': '2p_no_trade', 'opponent': 'catanatron_value', 'chunk_index': 11, 'chunk_count': 14, 'games': 3, 'wins': 0}
+{'progress': 'scoreboard_chunk', 'track': '2p_no_trade', 'opponent': 'catanatron_value', 'chunk_index': 12, 'chunk_count': 14, 'games': 3, 'wins': 1}
+{'progress': 'scoreboard_chunk', 'track': '2p_no_trade', 'opponent': 'catanatron_value', 'chunk_index': 0, 'chunk_count': 14, 'games': 3, 'wins': 0}
+{'progress': 'scoreboard_chunk', 'track': '2p_no_trade', 'opponent': 'catanatron_value', 'chunk_index': 7, 'chunk_count': 14, 'games': 3, 'wins': 0}
+{'progress': 'scoreboard_chunk', 'track': '2p_no_trade', 'opponent': 'catanatron_value', 'chunk_index': 9, 'chunk_count': 14, 'games': 3, 'wins': 1}
+{'progress': 'scoreboard_chunk', 'track': '2p_no_trade', 'opponent': 'catanatron_ab3', 'chunk_index': 0, 'chunk_count': 14, 'games': 3, 'wins': 2}
+{'progress': 'scoreboard_chunk', 'track': '2p_no_trade', 'opponent': 'catanatron_value', 'chunk_index': 6, 'chunk_count': 14, 'games': 3, 'wins': 3}
+{'progress': 'scoreboard_chunk', 'track': '2p_no_trade', 'opponent': 'catanatron_value', 'chunk_index': 5, 'chunk_count': 14, 'games': 3, 'wins': 2}
+{'progress': 'scoreboard_chunk', 'track': '2p_no_trade', 'opponent': 'catanatron_value', 'chunk_index': 2, 'chunk_count': 14, 'games': 3, 'wins': 2}
+{'progress': 'scoreboard_chunk', 'track': '2p_no_trade', 'opponent': 'catanatron_value', 'chunk_index': 1, 'chunk_count': 14, 'games': 3, 'wins': 1}
+{'progress': 'scoreboard_chunk', 'track': '2p_no_trade', 'opponent': 'catanatron_value', 'chunk_index': 8, 'chunk_count': 14, 'games': 3, 'wins': 1}
+{'progress': 'scoreboard_chunk', 'track': '2p_no_trade', 'opponent': 'catanatron_value', 'chunk_index': 10, 'chunk_count': 14, 'games': 3, 'wins': 2}
+{'progress': 'scoreboard_chunk', 'track': '2p_no_trade', 'opponent': 'catanatron_ab3', 'chunk_index': 2, 'chunk_count': 14, 'games': 3, 'wins': 0}
+{'progress': 'scoreboard_chunk', 'track': '2p_no_trade', 'opponent': 'catanatron_ab3', 'chunk_index': 1, 'chunk_count': 14, 'games': 3, 'wins': 2}
+{'progress': 'scoreboard_chunk', 'track': '2p_no_trade', 'opponent': 'catanatron_ab3', 'chunk_index': 13, 'chunk_count': 14, 'games': 1, 'wins': 1}
+{'progress': 'scoreboard_chunk', 'track': '2p_no_trade', 'opponent': 'catanatron_ab3', 'chunk_index': 3, 'chunk_count': 14, 'games': 3, 'wins': 2}
+{'progress': 'scoreboard_chunk', 'track': '2p_no_trade', 'opponent': 'catanatron_ab3', 'chunk_index': 4, 'chunk_count': 14, 'games': 3, 'wins': 2}
+{'progress': 'scoreboard_chunk', 'track': '2p_no_trade', 'opponent': 'catanatron_ab3', 'chunk_index': 9, 'chunk_count': 14, 'games': 3, 'wins': 2}
+{'progress': 'scoreboard_chunk', 'track': '2p_no_trade', 'opponent': 'catanatron_ab3', 'chunk_index': 5, 'chunk_count': 14, 'games': 3, 'wins': 0}
+{'progress': 'scoreboard_chunk', 'track': '2p_no_trade', 'opponent': 'catanatron_ab3', 'chunk_index': 6, 'chunk_count': 14, 'games': 3, 'wins': 3}
+{'progress': 'scoreboard_chunk', 'track': '2p_no_trade', 'opponent': 'catanatron_ab3', 'chunk_index': 8, 'chunk_count': 14, 'games': 3, 'wins': 0}
+{'progress': 'scoreboard_chunk', 'track': '2p_no_trade', 'opponent': 'catanatron_ab3', 'chunk_index': 11, 'chunk_count': 14, 'games': 3, 'wins': 1}
+{'progress': 'scoreboard_chunk', 'track': '2p_no_trade', 'opponent': 'catanatron_ab3', 'chunk_index': 7, 'chunk_count': 14, 'games': 3, 'wins': 3}
+{'progress': 'scoreboard_chunk', 'track': '2p_no_trade', 'opponent': 'catanatron_ab3', 'chunk_index': 10, 'chunk_count': 14, 'games': 3, 'wins': 1}
+{'progress': 'scoreboard_chunk', 'track': '2p_no_trade', 'opponent': 'catanatron_ab3', 'chunk_index': 12, 'chunk_count': 14, 'games': 3, 'wins': 2}
+{'candidate': 'runs/distributed/entity_ppo_hardtarget_evalsmoke_20260701_055159/checkpoints/step_1.pt', 'candidate_kind': 'checkpoint', 'games_per_matchup': 40, 'chunk_games': 3, 'chunks': 28, 'elapsed_sec': 131.67848488100572, 'device': 'cpu', 'workers': 16, 'paired_seeds': False, 'results': [{'games': 40, 'candidate': 'entity_graph', 'opponent': 'catanatron_ab3', 'wins': 21, 'win_rate': 0.525, 'elo_vs_opponent': 17.386277512436145, 'seat_wins': {'BLUE': 10, 'RED': 11}, 'avg_decisions': 227.75, 'moves_to_win': 222.76190476190476, 'avg_candidate_win_decisions': 222.76190476190476, 'avg_candidate_vp': 7.575, 'avg_best_opponent_vp': 7.9, 'avg_vp_margin': -0.325, 'track': '2p_no_trade', 'confidence_interval_95': [0.3702422053659332, 0.6797577946340668], 'illegal_action_count': 0, 'timeouts_or_stuck_games': 0, 'chunks': 14}, {'games': 40, 'candidate': 'entity_graph', 'opponent': 'catanatron_value', 'wins': 15, 'win_rate': 0.375, 'elo_vs_opponent': -88.73949984654253, 'seat_wins': {'BLUE': 8, 'RED': 7}, 'avg_decisions': 234.85, 'moves_to_win': 257.73333333333335, 'avg_candidate_win_decisions': 257.73333333333335, 'avg_candidate_vp': 6.95, 'avg_best_opponent_vp': 8.85, 'avg_vp_margin': -1.9, 'track': '2p_no_trade', 'confidence_interval_95': [0.22496875325453036, 0.5250312467454696], 'illegal_action_count': 0, 'timeouts_or_stuck_games': 0, 'chunks': 14}]}
+{'event': 'eval', 'step': 1, 'payoff_ids': ['main-0001', 'frozen-0002', 'frozen-0003'], 'payoff_matrix': [[nan, 0.525, 0.375], [0.475, nan, nan], [0.625, nan, nan]], 'cycling': {'dominant': True, 'min_baseline_winrate': 0.375, 'worst_baseline': 'catanatron_value'}}
+{'event': 'learner_done', 'steps': 1}

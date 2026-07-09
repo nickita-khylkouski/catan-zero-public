@@ -1,0 +1,34 @@
+{
+  "_comment": "CAT-54 verification smoke-test manifest: a self-contained (no CAT-9 registry dependency) 4-category mix covering every checkpoint-backed category the R9 mix defines (catanatron_value excluded -- no engine is wired for it in this ticket, that is CAT-56). Replace the placeholder checkpoint paths below with real archived champion checkpoints before running. Intended usage: tools/generate_gumbel_selfplay_data.py --checkpoint <producer_checkpoint> --opponent-mix-manifest configs/opponent_mix/opponent_mix_smoke_test.json --games 40 --workers 1 (a few dozen games across the mix categories, per the ticket's verification step -- run on a host with the compiled catanatron_rs engine).",
+  "categories": [
+    {
+      "name": "producer_self_play",
+      "weight": 75,
+      "source": "self"
+    },
+    {
+      "name": "previous_public_champion",
+      "weight": 10,
+      "source": "checkpoint_list",
+      "checkpoints": [
+        {"path": "REPLACE_WITH_PREVIOUS_PUBLIC_CHAMPION_CHECKPOINT.pt", "version": 0, "md5": ""}
+      ]
+    },
+    {
+      "name": "older_champion",
+      "weight": 5,
+      "source": "checkpoint_list",
+      "checkpoints": [
+        {"path": "REPLACE_WITH_AN_OLDER_ARCHIVED_CHECKPOINT.pt", "version": -1, "md5": ""}
+      ]
+    },
+    {
+      "name": "hard_experimental",
+      "weight": 5,
+      "source": "checkpoint_list",
+      "checkpoints": [
+        {"path": "REPLACE_WITH_A_HARD_NEGATIVE_OR_EXPLOITER_CHECKPOINT.pt", "version": -1, "md5": ""}
+      ]
+    }
+  ]
+}

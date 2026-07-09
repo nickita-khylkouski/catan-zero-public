@@ -1,0 +1,151 @@
+from __future__ import annotations
+
+import numpy as np
+import pytest
+
+from tools.train_bc import build_value_sample_weights, per_game_weight_quality
+
+
+def _legal_action_ids(counts: list[int], width: int = 4) -> np.ndarray:
+    """Build a legal_action_ids array where row i has exactly counts[i] legal actions
+    (remaining columns padded with -1, matching the corpus schema's padding convention)."""
+    rows = []
+    for count in counts:
+        row = list(range(count)) + [-1] * (width - count)
+        rows.append(row)
+    return np.asarray(rows, dtype=np.int32)
+
+
+def test_per_game_value_weight_equalizes_total_mass_across_game_lengths() -> None:
+    """CAT-60 core property: a 5-row game and a 1-row game must contribute the SAME total
+    value-loss mass once --per-game-value-weight is on, addressing '16k games = 16k
+    independent outcomes, not 3.6M labels'."""
+    game_seed = np.asarray([1, 1, 1, 1, 1, 2], dtype=np.int64)
+    data = {
+        "action_taken": np.zeros(6, dtype=np.int16),
+        "game_seed": game_seed,
+    }
+
+    weights = build_value_sample_weights(data, per_game_value_weight=True)
+
+    game1_total = float(np.sum(weights[game_seed == 1]))
+    game2_total = float(np.sum(weights[game_seed == 2]))
+    assert game1_total == pytest.approx(game2_total, rel=1e-5)
+
+
+def test_per_game_value_weight_off_is_byte_identical_to_prior_behavior() -> None:
+    """Flag-off regression: default arguments must reproduce the exact pre-CAT-60 formula
+    (phase weights + value_weight_multiplier, mean-normalized), since per_game_value_weight
+    defaults to False and forced_row_value_weight defaults to 1.0 (no-op)."""
+    data = {
+        "action_taken": np.asarray([1, 2, 3, 4], dtype=np.int16),
+        "phase": np.asarray(["robber", "initial_build", "robber", "initial_build"]),
+        "value_weight_multiplier": np.asarray([1.0, 2.0, 0.5, 1.0], dtype=np.float32),
+        "game_seed": np.asarray([10, 10, 20, 20], dtype=np.int64),
+        "legal_action_ids": _legal_action_ids([1, 3, 1, 2]),
+    }
+
+    default_weights = build_value_sample_weights(data, phase_weights={"robber": 4.0})
+    explicit_off_weights = build_value_sample_weights(
+        data,
+        phase_weights={"robber": 4.0},
+        forced_row_value_weight=1.0,
+        per_game_value_weight=False,
+    )
+
+    assert default_weights.tolist() == explicit_off_weights.tolist()
+
+    # Cross-check against the hand-computed pre-CAT-60 formula.
+    expected = np.asarray([4.0, 2.0, 2.0, 1.0], dtype=np.float32)
+    expected = expected / float(np.mean(expected))
+    assert default_weights.tolist() == pytest.approx(expected.tolist())
+
+
+def test_forced_row_value_weight_downweights_single_legal_action_rows() -> None:
+    """Rows with exactly one legal action (forced moves) carry near-zero information for the
+    value head; --forced-row-value-weight must suppress them specifically in the VALUE loss."""
+    data = {
+        "action_taken": np.asarray([1, 2, 3], dtype=np.int16),
+        "legal_action_ids": _legal_action_ids([1, 3, 1]),
+    }
+
+    weights = build_value_sample_weights(data, forced_row_value_weight=0.1)
+
+    # Forced rows (0 and 2) are downweighted relative to the free-choice row (1).
+    assert weights[0] < weights[1]
+    assert weights[2] < weights[1]
+    assert weights[0] == pytest.approx(weights[2])
+
+
+def test_forced_row_value_weight_default_is_noop() -> None:
+    data = {
+        "action_taken": np.asarray([1, 2], dtype=np.int16),
+        "legal_action_ids": _legal_action_ids([1, 3]),
+    }
+
+    weights = build_value_sample_weights(data)
+
+    assert weights[0] == pytest.approx(weights[1])
+
+
+def test_per_game_value_weight_composes_with_forced_row_and_multiplier() -> None:
+    """CAT-60 combination rule: per-game normalization is applied LAST, so it equalizes total
+    game mass even when forced-row downweighting and the CAT-45 value_weight_multiplier are
+    unevenly distributed within a game -- it does not undo the within-game suppression of
+    low-information forced rows, it only equalizes across games."""
+    game_seed = np.asarray([1, 1, 1, 2, 2], dtype=np.int64)
+    data = {
+        "action_taken": np.zeros(5, dtype=np.int16),
+        "game_seed": game_seed,
+        "value_weight_multiplier": np.asarray([1.0, 0.5, 2.0, 1.0, 1.0], dtype=np.float32),
+        "legal_action_ids": _legal_action_ids([1, 3, 2, 3, 1]),
+    }
+
+    weights = build_value_sample_weights(
+        data,
+        forced_row_value_weight=0.1,
+        per_game_value_weight=True,
+    )
+
+    game1_total = float(np.sum(weights[game_seed == 1]))
+    game2_total = float(np.sum(weights[game_seed == 2]))
+    assert game1_total == pytest.approx(game2_total, rel=1e-5)
+    # Within game 1, the forced row (index 0) still ends up cheaper than the free rows.
+    assert weights[0] < weights[1]
+    assert weights[0] < weights[2]
+
+
+def test_per_game_value_weight_missing_game_seed_is_noop() -> None:
+    """No game_seed column is a hard no-op (skips normalization entirely), NOT a fallback to
+    one-row-per-game -- the latter would silently collapse every weight to 1.0 and erase
+    phase weights / forced-row weighting / the CAT-45 multiplier in the process."""
+    data = {
+        "action_taken": np.asarray([1, 2, 3], dtype=np.int16),
+        "phase": np.asarray(["robber", "initial_build", "robber"]),
+    }
+
+    with_flag = build_value_sample_weights(
+        data, phase_weights={"robber": 4.0}, per_game_value_weight=True
+    )
+    without_flag = build_value_sample_weights(data, phase_weights={"robber": 4.0})
+
+    assert with_flag.tolist() == pytest.approx(without_flag.tolist())
+
+
+def test_per_game_weight_quality_reports_equalization() -> None:
+    game_seed = np.asarray([1, 1, 1, 1, 1, 2], dtype=np.int64)
+    data = {"action_taken": np.zeros(6, dtype=np.int16), "game_seed": game_seed}
+
+    unnormalized = build_value_sample_weights(data)
+    normalized = build_value_sample_weights(data, per_game_value_weight=True)
+
+    report_off = per_game_weight_quality(data, unnormalized)
+    report_on = per_game_weight_quality(data, normalized)
+
+    assert report_off["n_games"] == 2
+    assert report_off["rows_per_game"]["min"] == 1
+    assert report_off["rows_per_game"]["max"] == 5
+    # Off: the 5-row game carries far more total mass than the 1-row game.
+    assert report_off["total_weight_per_game"]["std"] > 0.0
+    # On: per-game normalization drives the spread to ~0.
+    assert report_on["total_weight_per_game"]["std"] == pytest.approx(0.0, abs=1e-6)

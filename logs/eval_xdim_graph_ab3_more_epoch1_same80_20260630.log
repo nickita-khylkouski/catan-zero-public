@@ -1,0 +1,36 @@
+concurrent.futures.process._RemoteTraceback: 
+"""
+Traceback (most recent call last):
+  File "/usr/lib/python3.11/concurrent/futures/process.py", line 261, in _process_worker
+    r = call_item.fn(*call_item.args, **call_item.kwargs)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ubuntu/catan-zero/tools/evaluate_scoreboard.py", line 202, in _run_job
+    else make_named_policy("checkpoint", payload["candidate"], device=payload["device"])
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ubuntu/catan-zero/tools/factory_common.py", line 52, in make_named_policy
+    return load_checkpoint_policy(checkpoint, device=device)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ubuntu/catan-zero/src/catan_zero/rl/policy_pool.py", line 105, in load_checkpoint_policy
+    return XDimLitePolicy.load(checkpoint, device=device)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ubuntu/catan-zero/src/catan_zero/rl/xdim_lite_policy.py", line 613, in load
+    _validate_checkpoint_metadata(data, static, checkpoint, strict=strict_metadata)
+  File "/home/ubuntu/catan-zero/src/catan_zero/rl/xdim_lite_policy.py", line 774, in _validate_checkpoint_metadata
+    raise ValueError(
+ValueError: runs/teacher/xdim_graph_ab3_more_ft_gpu1_20260628_0642/xdim_graph_ab3_more_ft_gpu1_epoch0001.pt is missing XDim action_mask_version metadata; refuse to load it for production evaluation/training
+"""
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/home/ubuntu/catan-zero/tools/evaluate_scoreboard.py", line 328, in <module>
+    main()
+  File "/home/ubuntu/catan-zero/tools/evaluate_scoreboard.py", line 100, in main
+    result = future.result()
+             ^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.11/concurrent/futures/_base.py", line 449, in result
+    return self.__get_result()
+           ^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.11/concurrent/futures/_base.py", line 401, in __get_result
+    raise self._exception
+ValueError: runs/teacher/xdim_graph_ab3_more_ft_gpu1_20260628_0642/xdim_graph_ab3_more_ft_gpu1_epoch0001.pt is missing XDim action_mask_version metadata; refuse to load it for production evaluation/training

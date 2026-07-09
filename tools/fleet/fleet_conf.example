@@ -1,0 +1,27 @@
+# FLEET_CONF example — copy to $FLEET_CONF (default ~/.catan_fleet.conf) and fill REAL IPs.
+# DO NOT commit the filled file (it is gitignored: /.catan_fleet.conf, *.fleet.conf).
+# Sourced as bash. Keyed by ALIAS only — never put IPs in the repo.
+
+declare -A HOST=(
+  [c1]=REPLACE_ME_c1_ip
+  [c2]=REPLACE_ME_c2_ip
+  [c3]=REPLACE_ME_c3_ip
+  [c4]=REPLACE_ME_c4_ip
+  [c5]=REPLACE_ME_c5_ip
+  [c6]=REPLACE_ME_c6_ip
+  [a100a]=REPLACE_ME_a100a_ip
+  [a100b]=REPLACE_ME_a100b_ip
+  [b200]=REPLACE_ME_b200_ip
+)
+
+# Optional; defaults to ~/.ssh/gpu_access_ed25519 if unset.
+GPU_SSH_KEY="$HOME/.ssh/gpu_access_ed25519"
+
+# Harvest-only (read by tools/wave1_harvest.sh); fleet_stop/status/launch ignore this.
+declare -A DIRS=(
+  [c1]="gen_out/mps_wave2"
+  [c2]="gen_run/mps_wave1"
+  [c3]="gen_run/mps_wave1"
+  [c5]="gen_out/mps_gpu0"
+  [c6]="gen_out/mps_wave1_n128"
+)

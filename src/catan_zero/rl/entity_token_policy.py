@@ -1,0 +1,1114 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+import math
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+
+from catan_zero.rl.action_features import (
+    CONTEXT_ACTION_FEATURE_SIZE,
+    build_action_context_feature_table,
+)
+from catan_zero.rl.entity_token_features import (
+    EDGE_FEATURE_SIZE,
+    EVENT_FEATURE_SIZE,
+    GLOBAL_FEATURE_SIZE,
+    HEX_FEATURE_SIZE,
+    LEGAL_ACTION_FEATURE_SIZE,
+    PLAYER_FEATURE_SIZE,
+    VERTEX_FEATURE_SIZE,
+    build_entity_token_features,
+)
+from catan_zero.rl.multiagent_env import ColonistMultiAgentConfig, ColonistMultiAgentEnv
+from catan_zero.rl.torch_ppo import build_action_feature_table
+from catan_zero.rl.xdim_lite_policy import (
+    _array_sha256,
+    _install_numpy_pickle_aliases,
+    _resolve_device,
+)
+
+
+ENTITY_POLICY_SCHEMA_VERSION = "entity_graph_policy_v1"
+
+# Fixed board sizes on the standard Catan map: 54 intersections (settlement/city
+# nodes, catanatron node_id 0-53) and 19 hexes (robber targets, hex id 0-18).
+# These match the per-type target-id space in EntityGraphNet._gather_target_tokens
+# and the shape asserts in _assert_entity_batch_shapes; the CAT-100 categorical
+# aux heads emit over exactly these index spaces.
+AUX_NUM_INTERSECTIONS = 54
+AUX_NUM_HEXES = 19
+
+
+@dataclass(frozen=True, slots=True)
+class EntityGraphConfig:
+    action_size: int
+    static_action_feature_size: int
+    context_action_feature_size: int = CONTEXT_ACTION_FEATURE_SIZE
+    legal_action_feature_size: int = LEGAL_ACTION_FEATURE_SIZE
+    hidden_size: int = 640
+    state_layers: int = 6
+    attention_heads: int = 8
+    dropout: float = 0.05
+    action_mask_version: str = ""
+    schema_version: str = ENTITY_POLICY_SCHEMA_VERSION
+    # Optional value-uncertainty auxiliary head (KataGo short-term-error style):
+    # a scalar per state predicting the value head's own squared error. Default
+    # False keeps the parameter count and forward outputs bit-identical to models
+    # built before this field existed (older checkpoints deserialize with the
+    # default, so they load unchanged; see EntityGraphNet.load allowed-missing
+    # prefixes for the reverse direction). The prediction is trained by
+    # train_bc.py --value-uncertainty-loss-weight. The head reads a stop-gradient
+    # (detached) copy of the trunk state so its loss never distorts value/trunk
+    # learning (see forward()). Consuming it inside search is opt-in and
+    # flag-gated: EntityGraphRustEvaluatorConfig.emit_uncertainty surfaces this
+    # scalar to the searcher, and GumbelChanceMCTSConfig.uncertainty_backup_weighting
+    # turns it into KataGo-style capped backup weights (both default OFF, CAT-61).
+    value_uncertainty_head: bool = False
+    # --- Action-attention architecture upgrade (f69), all default OFF ---
+    # When every flag below is off, the module is structurally and
+    # behaviorally bit-identical to the pre-upgrade net: no new parameters are
+    # created, so existing checkpoints load with strict=True. Old pickled
+    # configs predate these slots; the module reads them via getattr(...,
+    # default) so those checkpoints still construct.
+    #
+    # (1) Gather post-trunk board tokens for each action's target entities
+    #     (legal_action_target_ids) and add a zero-initialised projection of
+    #     the pooled result into encoded_actions.
+    action_target_gather: bool = False
+    # (2) N post-trunk cross-attention blocks: encoded_actions query the final
+    #     board tokens. Output projection + FFN are zero-initialised so the
+    #     block is an exact identity at init (warm-start safety).
+    action_cross_attention_layers: int = 0
+    # (3) A learned probe token cross-attends over all output tokens; a
+    #     zero-initialised head consuming [CLS ++ probe_output] (2h) is ADDED
+    #     to the value, so value is unchanged at init.
+    value_attention_pool: bool = False
+    # --- Distributional (HL-Gauss categorical) value head (CAT-39), default OFF ---
+    # A MuZero/C51-shaped categorical value head over a uniform support on the
+    # win-loss axis [-1, 1], trained with HL-Gauss cross-entropy (Farebrother et
+    # al. 2024, arXiv:2403.03950 "Stop Regressing"): scalar targets are projected
+    # to a Gaussian-smeared histogram (sigma ~ bin width) rather than the two-hot
+    # encoding a plain C51 head uses -- two-hot underperforms MSE, HL-Gauss beats
+    # it, and the gap is largest under stochastic dynamics (the whole reason this
+    # head exists for Catan). Per the CAT-39 R9 ruling the PRIMARY support is
+    # win/loss ONLY plus one distinct TRUNCATION class (VP-margin is removed from
+    # the joint support and lives on a separate auxiliary head): the head emits
+    # ``value_categorical_bins`` win-loss logits followed by, when
+    # ``value_categorical_truncation_class`` is set, one extra truncation logit.
+    # New output keys ("value_categorical_logits", "value_categorical" = the
+    # calibrated win-value expectation over the win-loss bins renormalised to
+    # exclude truncation mass, "value_categorical_truncation_prob"); new params
+    # under value_categorical_head.*. The scalar MSE value head stays the value
+    # consumed by search/eval (bit-identical), so warm-starting an old checkpoint
+    # with these flags ON leaves every existing output unchanged. 0 disables (no
+    # new params). NOTE: appended LAST on purpose -- this frozen+slots dataclass
+    # pickles positionally, so new fields must only ever be appended.
+    value_categorical_bins: int = 0
+    value_categorical_truncation_class: bool = True
+    # --- CAT-97 GATEAU edge/node-feature policy head (default OFF) ---
+    # AlphaGateau (arXiv 2410.23753) reads each move's POLICY LOGIT directly
+    # from that move's edge/node feature: policy_logit(move) = MLP(edge_feat).
+    # Here every legal action already carries its TARGET entity tokens (edge
+    # token for a road, intersection/vertex token for a settlement/city, hex
+    # for the robber -- the same fixed [B,A,4] `legal_action_target_ids`
+    # mapping used by action_target_gather). When on, we mean-pool those
+    # post-trunk target tokens per action and add a DIRECT per-action logit
+    # MLP(pooled_target) to the CLIP-style logits. The final Linear is
+    # zero-initialised, so the logit (and every other output) is bit-identical
+    # to the pre-flag net at init -- warm-start safe. This is the topology-
+    # aligned, size-agnostic policy format from the paper; it differs from
+    # action_target_gather (which instead modulates the CLIP action embedding)
+    # by emitting a stand-alone logit term and can be used with or without it.
+    # NOTE: appended LAST -- this frozen+slots dataclass pickles positionally.
+    edge_policy_head: bool = False
+    # --- CAT-100 Catan-native auxiliary subgoal heads (default OFF) ---
+    # UNREAL-style auxiliary prediction heads (Jaderberg et al. 2016,
+    # arXiv 1611.05397) off the SHARED pooled state (CLS) token, trained with a
+    # small loss weight alongside value/policy. They emit into the outputs dict
+    # ONLY and never touch logits/value/final_vp/q_values, so a model built
+    # with them enabled is bit-identical in its value/policy outputs to one
+    # built without -- warm-start safe by construction (the aux heads simply
+    # start random and train from the auxiliary loss). Targets are free labels
+    # from the catanatron engine (see rl/aux_subgoal_targets.py):
+    #   aux_longest_road / aux_largest_army : binary "actor holds it at
+    #       horizon" (BCE-with-logits),
+    #   aux_vp_in_n     : scalar actor VP gain over `aux_vp_horizon` plies (MSE),
+    #   aux_next_settlement : categorical over 54 intersections (cross-entropy),
+    #   aux_robber_target   : categorical over 19 hexes (cross-entropy).
+    aux_subgoal_heads: bool = False
+    # Horizon (plies) for the aux_vp_in_n target. Metadata only -- the head is a
+    # plain scalar regressor; the horizon lives here so a checkpoint records the
+    # target definition it was trained against.
+    aux_vp_horizon: int = 8
+
+
+class EntityGraphNet:
+    """Typed Catan entity-token encoder with sparse legal-action scoring."""
+
+    def __new__(cls, config: EntityGraphConfig):
+        import torch
+        from torch import nn
+
+        class _Block(nn.Module):
+            def __init__(self, width: int, heads: int, dropout: float) -> None:
+                super().__init__()
+                self.norm_attn = nn.LayerNorm(width)
+                self.attn = nn.MultiheadAttention(
+                    width,
+                    max(1, int(heads)),
+                    dropout=float(dropout),
+                    batch_first=True,
+                )
+                self.norm_ff = nn.LayerNorm(width)
+                self.ff = nn.Sequential(
+                    nn.Linear(width, 4 * width),
+                    nn.GELU(),
+                    nn.Dropout(float(dropout)),
+                    nn.Linear(4 * width, width),
+                    nn.Dropout(float(dropout)),
+                )
+
+            def forward(self, tokens, key_padding_mask=None):
+                attn_in = self.norm_attn(tokens)
+                attn_out, _ = self.attn(
+                    attn_in,
+                    attn_in,
+                    attn_in,
+                    key_padding_mask=key_padding_mask,
+                    need_weights=False,
+                )
+                tokens = tokens + attn_out
+                tokens = tokens + self.ff(self.norm_ff(tokens))
+                return tokens
+
+        class _CrossBlock(nn.Module):
+            """Pre-LN cross-attention block: `query` attends over `memory`.
+
+            Zero-initialising both the attention output projection and the
+            final feed-forward linear makes the block an exact identity at
+            init (query is returned unchanged, since both residual branches
+            add exactly 0.0). That is the warm-start guarantee: stacking any
+            number of these on a checkpoint trained without them reproduces
+            the original function bit-for-bit until the new weights train.
+            """
+
+            def __init__(self, width: int, heads: int, dropout: float) -> None:
+                super().__init__()
+                self.norm_q = nn.LayerNorm(width)
+                self.norm_kv = nn.LayerNorm(width)
+                self.attn = nn.MultiheadAttention(
+                    width,
+                    max(1, int(heads)),
+                    dropout=float(dropout),
+                    batch_first=True,
+                )
+                self.norm_ff = nn.LayerNorm(width)
+                self.ff = nn.Sequential(
+                    nn.Linear(width, 4 * width),
+                    nn.GELU(),
+                    nn.Dropout(float(dropout)),
+                    nn.Linear(4 * width, width),
+                    nn.Dropout(float(dropout)),
+                )
+                nn.init.zeros_(self.attn.out_proj.weight)
+                if self.attn.out_proj.bias is not None:
+                    nn.init.zeros_(self.attn.out_proj.bias)
+                nn.init.zeros_(self.ff[3].weight)
+                nn.init.zeros_(self.ff[3].bias)
+
+            def forward(self, query, memory, key_padding_mask=None):
+                attn_out, _ = self.attn(
+                    self.norm_q(query),
+                    self.norm_kv(memory),
+                    self.norm_kv(memory),
+                    key_padding_mask=key_padding_mask,
+                    need_weights=False,
+                )
+                query = query + attn_out
+                query = query + self.ff(self.norm_ff(query))
+                return query
+
+        class _Module(nn.Module):
+            def __init__(self, cfg: EntityGraphConfig) -> None:
+                super().__init__()
+                self.config = cfg
+                h = int(cfg.hidden_size)
+                dropout = float(cfg.dropout)
+                self.hex_encoder = _token_encoder(HEX_FEATURE_SIZE, h, dropout)
+                self.vertex_encoder = _token_encoder(VERTEX_FEATURE_SIZE, h, dropout)
+                self.edge_encoder = _token_encoder(EDGE_FEATURE_SIZE, h, dropout)
+                self.player_encoder = _token_encoder(PLAYER_FEATURE_SIZE, h, dropout)
+                self.global_encoder = _token_encoder(GLOBAL_FEATURE_SIZE, h, dropout)
+                self.event_encoder = _token_encoder(EVENT_FEATURE_SIZE, h, dropout)
+                self.type_embedding = nn.Parameter(torch.zeros(7, h))
+                self.cls_token = nn.Parameter(torch.zeros(1, 1, h))
+                self.blocks = nn.ModuleList(
+                    _Block(h, cfg.attention_heads, dropout)
+                    for _ in range(max(1, int(cfg.state_layers)))
+                )
+                self.state_norm = nn.LayerNorm(h)
+                action_in = int(cfg.legal_action_feature_size) + int(
+                    cfg.context_action_feature_size
+                )
+                self.action_encoder = nn.Sequential(
+                    nn.Linear(action_in, h),
+                    nn.LayerNorm(h),
+                    nn.GELU(),
+                    nn.Dropout(dropout),
+                    nn.Linear(h, h),
+                    nn.GELU(),
+                    nn.Linear(h, h),
+                )
+                self.action_bias = nn.Linear(action_in, 1)
+                self.logit_scale = nn.Parameter(torch.tensor(math.log(1.0)))
+                self.value_head = nn.Sequential(
+                    nn.Linear(h, h),
+                    nn.GELU(),
+                    nn.Dropout(dropout),
+                    nn.Linear(h, 1),
+                )
+                self.final_vp_head = nn.Sequential(
+                    nn.Linear(h, h // 2),
+                    nn.GELU(),
+                    nn.Dropout(dropout),
+                    nn.Linear(h // 2, 1),
+                )
+                # Optional value-uncertainty head: same shape as value_head, one
+                # scalar per state. softplus at the emit site forces the predicted
+                # squared-error to be non-negative. Only built when enabled so the
+                # default model is unchanged.
+                if bool(getattr(cfg, "value_uncertainty_head", False)):
+                    self.value_uncertainty_head = nn.Sequential(
+                        nn.Linear(h, h),
+                        nn.GELU(),
+                        nn.Dropout(dropout),
+                        nn.Linear(h, 1),
+                    )
+                else:
+                    self.value_uncertainty_head = None
+                # Optional HL-Gauss categorical value head (CAT-39): purely
+                # additive -- see EntityGraphConfig.value_categorical_bins. The
+                # linear head emits `bins` win-loss logits plus, when the
+                # truncation class is enabled, one extra logit; the support
+                # buffer holds ONLY the win-loss bin centres (the truncation
+                # class carries no support value and is excluded from the
+                # expectation readout, per the R9 win/loss-only support).
+                self.value_categorical_bins = int(
+                    getattr(cfg, "value_categorical_bins", 0)
+                )
+                self.value_categorical_truncation_class = bool(
+                    getattr(cfg, "value_categorical_truncation_class", True)
+                )
+                if self.value_categorical_bins >= 2:
+                    n_out = self.value_categorical_bins + (
+                        1 if self.value_categorical_truncation_class else 0
+                    )
+                    self.value_categorical_head = nn.Sequential(
+                        nn.Linear(h, h),
+                        nn.GELU(),
+                        nn.Dropout(dropout),
+                        nn.Linear(h, n_out),
+                    )
+                    # Non-persistent: keeps state_dict identical to a model
+                    # without the buffer, so strict load round-trips are clean.
+                    self.register_buffer(
+                        "value_categorical_support",
+                        torch.linspace(-1.0, 1.0, self.value_categorical_bins),
+                        persistent=False,
+                    )
+                else:
+                    self.value_categorical_head = None
+                self.q_head = nn.Sequential(
+                    nn.Linear(3 * h, h),
+                    nn.LayerNorm(h),
+                    nn.GELU(),
+                    nn.Dropout(dropout),
+                    nn.Linear(h, h // 2),
+                    nn.GELU(),
+                    nn.Linear(h // 2, 1),
+                )
+                nn.init.normal_(self.type_embedding, std=0.02)
+                nn.init.normal_(self.cls_token, std=0.02)
+                nn.init.zeros_(self.action_bias.weight)
+                nn.init.zeros_(self.action_bias.bias)
+
+                # --- f69 action-attention upgrade (all gated, default OFF) ---
+                # Read via getattr so configs pickled before these slots
+                # existed still construct (they resolve to the OFF defaults).
+                self.action_target_gather = bool(
+                    getattr(cfg, "action_target_gather", False)
+                )
+                self.action_cross_attention_layers = int(
+                    getattr(cfg, "action_cross_attention_layers", 0)
+                )
+                self.value_attention_pool = bool(
+                    getattr(cfg, "value_attention_pool", False)
+                )
+
+                if self.action_target_gather:
+                    # Pooled target token (dim h) -> zero-init projection added
+                    # to encoded_actions. LayerNorm tames the raw residual-
+                    # stream magnitude; the trailing Linear is zero so the
+                    # branch contributes exactly 0 at init.
+                    self.target_gather_proj = nn.Sequential(
+                        nn.LayerNorm(h),
+                        nn.Linear(h, h),
+                    )
+                    nn.init.zeros_(self.target_gather_proj[1].weight)
+                    nn.init.zeros_(self.target_gather_proj[1].bias)
+
+                if self.action_cross_attention_layers > 0:
+                    self.action_cross_blocks = nn.ModuleList(
+                        _CrossBlock(h, cfg.attention_heads, dropout)
+                        for _ in range(self.action_cross_attention_layers)
+                    )
+
+                if self.value_attention_pool:
+                    self.value_probe = nn.Parameter(torch.zeros(1, 1, h))
+                    nn.init.normal_(self.value_probe, std=0.02)
+                    self.value_probe_norm_q = nn.LayerNorm(h)
+                    self.value_probe_norm_kv = nn.LayerNorm(h)
+                    self.value_probe_attn = nn.MultiheadAttention(
+                        h,
+                        max(1, int(cfg.attention_heads)),
+                        dropout=dropout,
+                        batch_first=True,
+                    )
+                    # Consumes [CLS ++ probe_output] (2h). Final Linear is
+                    # zero-init so this ADD-on head contributes 0 at init and
+                    # the value equals today's value_head(CLS) exactly.
+                    self.value_pool_head = nn.Sequential(
+                        nn.LayerNorm(2 * h),
+                        nn.Linear(2 * h, h),
+                        nn.GELU(),
+                        nn.Dropout(dropout),
+                        nn.Linear(h, 1),
+                    )
+                    nn.init.zeros_(self.value_pool_head[4].weight)
+                    nn.init.zeros_(self.value_pool_head[4].bias)
+
+                # --- CAT-97 GATEAU edge/node-feature policy head (default OFF) ---
+                self.edge_policy_head = bool(getattr(cfg, "edge_policy_head", False))
+                if self.edge_policy_head:
+                    # MLP(pooled target entity token) -> per-action scalar logit,
+                    # ADDED to the CLIP logits. Zero-init final Linear so the
+                    # logit is unchanged at init (warm-start guarantee).
+                    self.edge_policy_mlp = nn.Sequential(
+                        nn.LayerNorm(h),
+                        nn.Linear(h, h),
+                        nn.GELU(),
+                        nn.Dropout(dropout),
+                        nn.Linear(h, 1),
+                    )
+                    nn.init.zeros_(self.edge_policy_mlp[4].weight)
+                    nn.init.zeros_(self.edge_policy_mlp[4].bias)
+
+                # --- CAT-100 auxiliary Catan-subgoal heads (default OFF) ---
+                # Read the pooled state (CLS) token only; emit new outputs that
+                # never feed value/policy, so main outputs stay bit-identical.
+                self.aux_subgoal_heads = bool(getattr(cfg, "aux_subgoal_heads", False))
+                if self.aux_subgoal_heads:
+                    def _scalar_head() -> nn.Module:
+                        return nn.Sequential(
+                            nn.Linear(h, h),
+                            nn.GELU(),
+                            nn.Dropout(dropout),
+                            nn.Linear(h, 1),
+                        )
+
+                    def _categorical_head(num_classes: int) -> nn.Module:
+                        return nn.Sequential(
+                            nn.Linear(h, h),
+                            nn.GELU(),
+                            nn.Dropout(dropout),
+                            nn.Linear(h, int(num_classes)),
+                        )
+
+                    self.aux_longest_road_head = _scalar_head()
+                    self.aux_largest_army_head = _scalar_head()
+                    self.aux_vp_in_n_head = _scalar_head()
+                    # 54 intersections / 19 hexes: fixed board sizes, matching the
+                    # per-type target-id space verified in _gather_target_tokens and
+                    # the shape asserts in _assert_entity_batch_shapes.
+                    self.aux_next_settlement_head = _categorical_head(AUX_NUM_INTERSECTIONS)
+                    self.aux_robber_target_head = _categorical_head(AUX_NUM_HEXES)
+
+            def forward(self, batch: dict[str, Any], *, return_q: bool = False):
+                tokens, padding_mask = self._state_tokens(batch)
+                for block in self.blocks:
+                    tokens = block(tokens, key_padding_mask=padding_mask)
+                state = self.state_norm(tokens[:, 0])
+                action_features = torch.cat(
+                    (
+                        batch["legal_action_tokens"].float(),
+                        batch["legal_action_context"].float(),
+                    ),
+                    dim=-1,
+                )
+                encoded_actions = self.action_encoder(action_features)
+                # Post-trunk target-entity tokens per action, mean-pooled ([B,A,h]).
+                # Shared by action_target_gather (modulates the CLIP embedding) and
+                # the CAT-97 edge_policy_head (emits a direct logit); computed once.
+                pooled_targets = None
+                if self.action_target_gather or self.edge_policy_head:
+                    pooled_targets = self._gather_target_tokens(tokens, batch)
+                if self.action_target_gather:
+                    encoded_actions = encoded_actions + self.target_gather_proj(
+                        pooled_targets
+                    )
+                if self.action_cross_attention_layers > 0:
+                    for cross_block in self.action_cross_blocks:
+                        encoded_actions = cross_block(
+                            encoded_actions,
+                            tokens,
+                            key_padding_mask=padding_mask,
+                        )
+                policy_state = torch.nn.functional.normalize(state, dim=-1)
+                policy_actions = torch.nn.functional.normalize(encoded_actions, dim=-1)
+                logit_scale = torch.clamp(self.logit_scale.exp(), max=50.0)
+                logits = logit_scale * (policy_state.unsqueeze(1) * policy_actions).sum(dim=-1)
+                logits = logits + self.action_bias(action_features).squeeze(-1)
+                if self.edge_policy_head:
+                    # AlphaGateau per-move readout: a direct logit from each
+                    # action's pooled target-entity token. Zero-init -> +0 at init.
+                    logits = logits + self.edge_policy_mlp(pooled_targets).squeeze(-1)
+                value = self.value_head(state).squeeze(-1)
+                if self.value_attention_pool:
+                    value = value + self._value_pool(state, tokens, padding_mask)
+                outputs = {
+                    "logits": logits,
+                    "value": value,
+                    "final_vp": self.final_vp_head(state).squeeze(-1),
+                }
+                if self.value_uncertainty_head is not None:
+                    # Stop-gradient (CAT-61): the uncertainty head reads a
+                    # DETACHED copy of the trunk state, so its regression loss
+                    # trains only the head's own parameters and never flows
+                    # gradients back into the shared trunk or the value head.
+                    # This is the KataGo short-term-error design -- the error
+                    # predictor must not distort value learning. (The training
+                    # target in train_bc.py separately detaches `value`, so
+                    # both the target and the head input are stop-gradiented.)
+                    outputs["value_uncertainty"] = torch.nn.functional.softplus(
+                        self.value_uncertainty_head(state.detach()).squeeze(-1)
+                    )
+                if self.value_categorical_head is not None:
+                    cat_logits = self.value_categorical_head(state)
+                    outputs["value_categorical_logits"] = cat_logits
+                    n_bins = self.value_categorical_bins
+                    probs = torch.softmax(cat_logits.float(), dim=-1)
+                    win_probs = probs[..., :n_bins]
+                    # Calibrated win-value: expectation over the win-loss bins,
+                    # renormalised to exclude any truncation-class mass so the
+                    # scalar readout is P(win)-calibrated (R9: the search backup
+                    # reads this win-value, never a win+margin blend).
+                    win_mass = win_probs.sum(dim=-1, keepdim=True).clamp_min(1.0e-8)
+                    outputs["value_categorical"] = (
+                        (win_probs / win_mass) * self.value_categorical_support
+                    ).sum(dim=-1)
+                    if self.value_categorical_truncation_class:
+                        outputs["value_categorical_truncation_prob"] = probs[..., -1]
+                if self.aux_subgoal_heads:
+                    # CAT-100 auxiliary subgoal predictions. Raw logits/scalars
+                    # (loss applies BCE-with-logits / CE / MSE at the train site).
+                    # These never feed value/policy, so main outputs are unchanged.
+                    outputs["aux_longest_road"] = self.aux_longest_road_head(state).squeeze(-1)
+                    outputs["aux_largest_army"] = self.aux_largest_army_head(state).squeeze(-1)
+                    outputs["aux_vp_in_n"] = self.aux_vp_in_n_head(state).squeeze(-1)
+                    outputs["aux_next_settlement"] = self.aux_next_settlement_head(state)
+                    outputs["aux_robber_target"] = self.aux_robber_target_head(state)
+                if return_q:
+                    state_expanded = state.unsqueeze(1).expand_as(encoded_actions)
+                    q_features = torch.cat(
+                        (
+                            state_expanded,
+                            encoded_actions,
+                            state_expanded * encoded_actions,
+                        ),
+                        dim=-1,
+                    )
+                    outputs["q_values"] = self.q_head(q_features).squeeze(-1)
+                return outputs
+
+            def _state_tokens(self, batch: dict[str, Any]):
+                import torch
+
+                pieces = [
+                    self.cls_token.expand(batch["hex_tokens"].shape[0], -1, -1)
+                    + self.type_embedding[0].view(1, 1, -1),
+                    self.hex_encoder(batch["hex_tokens"].float())
+                    + self.type_embedding[1].view(1, 1, -1),
+                    self.vertex_encoder(batch["vertex_tokens"].float())
+                    + self.type_embedding[2].view(1, 1, -1),
+                    self.edge_encoder(batch["edge_tokens"].float())
+                    + self.type_embedding[3].view(1, 1, -1),
+                    self.player_encoder(batch["player_tokens"].float())
+                    + self.type_embedding[4].view(1, 1, -1),
+                    self.global_encoder(batch["global_tokens"].float())
+                    + self.type_embedding[5].view(1, 1, -1),
+                    self.event_encoder(batch["event_tokens"].float())
+                    + self.type_embedding[6].view(1, 1, -1),
+                ]
+                tokens = torch.cat(pieces, dim=1)
+                # Keep the symbolic batch dim (do NOT coerce to a Python int): under
+                # torch.onnx tracing int() bakes the current batch size into the mask
+                # `zeros(...)` as a constant, forcing a fixed-batch ONNX graph. The
+                # gen-2 CPU evaluator needs a variable batch axis (ragged chance
+                # fan-outs / action counts); in eager mode this is an int anyway.
+                batch_size = tokens.shape[0]
+                masks = [
+                    torch.zeros((batch_size, 1), dtype=torch.bool, device=tokens.device),
+                    ~batch["hex_mask"].bool(),
+                    ~batch["vertex_mask"].bool(),
+                    ~batch["edge_mask"].bool(),
+                    ~batch["player_mask"].bool(),
+                    torch.zeros((batch_size, 1), dtype=torch.bool, device=tokens.device),
+                    ~batch["event_mask"].bool(),
+                ]
+                return tokens, torch.cat(masks, dim=1)
+
+            def _gather_target_tokens(self, tokens, batch: dict[str, Any]):
+                """Pool post-trunk board tokens for each action's targets.
+
+                `legal_action_target_ids` is [B, A, 4] with a FIXED column ->
+                entity-type mapping (verified against the featurizer,
+                `_legal_action_target_ids`): col0=hex id (0-18), col1=vertex/
+                node id (0-53), col2=edge id (0-71), col3=player id (0-3), each
+                -1 when that target type is absent for the action. These are
+                per-entity-type indices, NOT indices into the concatenated
+                token sequence, so we add the constant per-type start offsets
+                of the CLS-prefixed [CLS | hex | vertex | edge | player |
+                global | event] layout built in `_state_tokens`. hex/vertex/
+                edge counts are fixed (19/54/72) and player tokens are always
+                4 rows, so the offsets are constants; we still derive them from
+                the live shapes so the mapping stays correct if the layout ever
+                changes. Valid targets are mean-pooled; an action with no board
+                target (e.g. ROLL, END_TURN) pools to the zero vector.
+                """
+                import torch
+
+                target_ids = batch["legal_action_target_ids"].long()  # [B, A, 4]
+                n_hex = int(batch["hex_tokens"].shape[1])
+                n_vertex = int(batch["vertex_tokens"].shape[1])
+                n_edge = int(batch["edge_tokens"].shape[1])
+                # Start index of each targeted type in the concatenated
+                # sequence (CLS occupies index 0).
+                offsets = torch.tensor(
+                    [
+                        1,  # hex
+                        1 + n_hex,  # vertex
+                        1 + n_hex + n_vertex,  # edge
+                        1 + n_hex + n_vertex + n_edge,  # player
+                    ],
+                    dtype=torch.long,
+                    device=target_ids.device,
+                )
+                seq_len = int(tokens.shape[1])
+                width = int(tokens.shape[2])
+                valid = target_ids >= 0  # [B, A, 4]
+                gather_index = torch.where(
+                    valid,
+                    target_ids + offsets.view(1, 1, -1),
+                    torch.zeros_like(target_ids),
+                ).clamp_(0, seq_len - 1)
+                batch_size = int(target_ids.shape[0])
+                num_actions = int(target_ids.shape[1])
+                flat_index = gather_index.reshape(batch_size, num_actions * 4)
+                gathered = torch.gather(
+                    tokens,
+                    1,
+                    flat_index.unsqueeze(-1).expand(-1, -1, width),
+                ).reshape(batch_size, num_actions, 4, width)
+                weight = valid.to(gathered.dtype).unsqueeze(-1)  # [B, A, 4, 1]
+                pooled = (gathered * weight).sum(dim=2) / weight.sum(dim=2).clamp_(min=1.0)
+                return pooled  # [B, A, h]
+
+            def _value_pool(self, state, tokens, padding_mask):
+                """Learned probe token cross-attends over all output tokens.
+
+                Returns the scalar (per batch row) contribution of the
+                zero-initialised head consuming [CLS ++ probe_output] (2h). The
+                final linear of that head is zero at init, so this returns
+                exactly 0 until trained -- value equals today's value_head(CLS).
+                """
+                import torch
+
+                batch_size = int(tokens.shape[0])
+                probe = self.value_probe.expand(batch_size, -1, -1)
+                probe_out, _ = self.value_probe_attn(
+                    self.value_probe_norm_q(probe),
+                    self.value_probe_norm_kv(tokens),
+                    self.value_probe_norm_kv(tokens),
+                    key_padding_mask=padding_mask,
+                    need_weights=False,
+                )
+                probe_out = probe_out.squeeze(1)  # [B, h]
+                pooled = torch.cat((state, probe_out), dim=-1)  # [B, 2h]
+                return self.value_pool_head(pooled).squeeze(-1)
+
+        return _Module(config)
+
+
+def _token_encoder(input_size: int, hidden_size: int, dropout: float):
+    from torch import nn
+
+    return nn.Sequential(
+        nn.Linear(int(input_size), int(hidden_size)),
+        nn.LayerNorm(int(hidden_size)),
+        nn.GELU(),
+        nn.Dropout(float(dropout)),
+        nn.Linear(int(hidden_size), int(hidden_size)),
+    )
+
+
+class EntityGraphPolicy:
+    name = "entity_graph"
+    policy_type = "entity_graph"
+
+    def __init__(
+        self,
+        config: EntityGraphConfig,
+        static_action_features: np.ndarray,
+        *,
+        seed: int = 0,
+        device: str | None = None,
+    ) -> None:
+        import torch
+
+        torch.manual_seed(seed)
+        self.config = config
+        self.architecture = self.policy_type
+        # f72 safety net (task #76): whether this policy's weights were trained
+        # with train_bc.py --mask-hidden-info. Overwritten by .load() from the
+        # checkpoint's own recorded metadata; freshly constructed policies
+        # (train_bc.py's own training loop, before its first save) default False.
+        self.trained_with_masked_hidden_info: bool = False
+        self.action_size = int(config.action_size)
+        self.context_action_feature_size = int(config.context_action_feature_size)
+        self.device = _resolve_device(device)
+        self.static_action_features = torch.as_tensor(
+            static_action_features,
+            dtype=torch.float32,
+            device=self.device,
+        )
+        self.model = EntityGraphNet(config).to(self.device)
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        env_config: ColonistMultiAgentConfig | None = None,
+        hidden_size: int = 640,
+        state_layers: int = 6,
+        attention_heads: int = 8,
+        dropout: float = 0.05,
+        seed: int = 0,
+        device: str | None = None,
+        value_uncertainty_head: bool = False,
+        edge_policy_head: bool = False,
+        aux_subgoal_heads: bool = False,
+        aux_vp_horizon: int = 8,
+    ) -> EntityGraphPolicy:
+        env = ColonistMultiAgentEnv(env_config or ColonistMultiAgentConfig())
+        try:
+            _observations, info = env.reset(seed=seed)
+            static = build_action_feature_table(env)
+            config = EntityGraphConfig(
+                action_size=env.action_space.n,
+                static_action_feature_size=int(static.shape[1]),
+                hidden_size=hidden_size,
+                state_layers=state_layers,
+                attention_heads=attention_heads,
+                dropout=dropout,
+                action_mask_version=str(info.get("action_mask_version", "")),
+                value_uncertainty_head=bool(value_uncertainty_head),
+                edge_policy_head=bool(edge_policy_head),
+                aux_subgoal_heads=bool(aux_subgoal_heads),
+                aux_vp_horizon=int(aux_vp_horizon),
+            )
+            return cls(config, static, seed=seed, device=device)
+        finally:
+            env.close()
+
+    def forward_legal_np(
+        self,
+        entity_batch: dict[str, np.ndarray],
+        legal_action_ids: np.ndarray,
+        legal_action_context: np.ndarray,
+        *,
+        return_q: bool = False,
+    ):
+        import torch
+
+        _assert_entity_batch_shapes(
+            entity_batch,
+            legal_action_ids,
+            legal_action_context,
+            self.config,
+        )
+        batch = {
+            key: torch.as_tensor(value, device=self.device)
+            for key, value in entity_batch.items()
+        }
+        batch["legal_action_context"] = torch.as_tensor(
+            legal_action_context,
+            dtype=torch.float32,
+            device=self.device,
+        )
+        action_ids = torch.as_tensor(legal_action_ids, dtype=torch.long, device=self.device)
+        outputs = self.model(batch, return_q=return_q)
+        valid = action_ids >= 0
+        outputs["logits"] = outputs["logits"].masked_fill(~valid, -1.0e9)
+        return outputs
+
+    def select_action(
+        self,
+        env: ColonistMultiAgentEnv,
+        observation: np.ndarray,
+        info: dict[str, Any],
+        rng: np.random.Generator,
+        *,
+        training: bool = False,
+    ) -> int:
+        import torch
+
+        del observation
+        valid_actions = tuple(int(action) for action in info["valid_actions"])
+        if not valid_actions:
+            raise ValueError("entity_graph policy received no valid actions")
+        with torch.no_grad():
+            outputs, _entity, _legal_context = self._legal_outputs_from_env(
+                env,
+                info,
+                valid_actions,
+                return_q=False,
+            )
+            logits = outputs["logits"].squeeze(0)
+            if training:
+                column = int(torch.distributions.Categorical(logits=logits).sample().item())
+            else:
+                column = int(torch.argmax(logits, dim=-1).item())
+        return int(valid_actions[column])
+
+    def sample_action_value_q_from_env(
+        self,
+        env: ColonistMultiAgentEnv,
+        info: dict[str, Any],
+        rng: np.random.Generator,
+        *,
+        training: bool = True,
+        action_temperature: float = 1.0,
+    ) -> tuple[int, float, float, float, np.ndarray, np.ndarray, dict[str, np.ndarray]]:
+        import torch
+
+        del rng
+        valid_actions = tuple(int(action) for action in info["valid_actions"])
+        if not valid_actions:
+            raise ValueError("entity_graph policy received no valid actions")
+        with torch.no_grad():
+            outputs, entity, _legal_context = self._legal_outputs_from_env(
+                env,
+                info,
+                valid_actions,
+                return_q=True,
+            )
+            logits = outputs["logits"].squeeze(0)
+            q_values = outputs.get("q_values")
+            if q_values is None:
+                q_values = outputs["value"].reshape(1, 1).expand(1, len(valid_actions))
+            legal_q_values = q_values.squeeze(0)
+            behavior_logits = logits / max(float(action_temperature), 1.0e-6)
+            behavior_logits = torch.clamp(behavior_logits, min=-50.0, max=50.0)
+            dist = torch.distributions.Categorical(logits=behavior_logits)
+            column_t = dist.sample() if training else torch.argmax(logits, dim=-1)
+            column = int(column_t.item())
+            probs = torch.softmax(behavior_logits, dim=-1)
+        entity_copy = {
+            key: np.asarray(value).copy()
+            for key, value in entity.items()
+            if key != "schema"
+        }
+        return (
+            int(valid_actions[column]),
+            float(dist.log_prob(column_t).item()),
+            float(outputs["value"].reshape(-1)[0].item()),
+            float(legal_q_values[column].item()),
+            probs.detach().cpu().numpy().astype(np.float32),
+            legal_q_values.detach().cpu().numpy().astype(np.float32),
+            entity_copy,
+        )
+
+    def action_probs(
+        self,
+        env: ColonistMultiAgentEnv,
+        info: dict[str, Any],
+        valid_actions: tuple[int, ...] | None = None,
+    ) -> np.ndarray:
+        import torch
+
+        actions = tuple(int(action) for action in (valid_actions or info["valid_actions"]))
+        if not actions:
+            return np.zeros(0, dtype=np.float32)
+        with torch.no_grad():
+            outputs, _entity, _legal_context = self._legal_outputs_from_env(
+                env,
+                info,
+                actions,
+                return_q=False,
+            )
+            logits = outputs["logits"].squeeze(0)
+            probs = torch.softmax(logits, dim=-1)
+        return probs.detach().cpu().numpy().astype(np.float32)
+
+    def _legal_outputs_from_env(
+        self,
+        env: ColonistMultiAgentEnv,
+        info: dict[str, Any],
+        valid_actions: tuple[int, ...],
+        *,
+        return_q: bool = False,
+    ):
+        entity = build_entity_token_features(
+            env,
+            actor=str(info.get("current_player") or env.current_player_name()),
+            include_event_log=True,
+        )
+        if int(entity["legal_action_tokens"].shape[0]) != len(valid_actions):
+            raise ValueError(
+                "entity legal-action token count does not match valid actions: "
+                f"{entity['legal_action_tokens'].shape[0]} != {len(valid_actions)}"
+            )
+        context_table = build_action_context_feature_table(env, info)
+        legal_context = np.asarray(context_table, dtype=np.float32)[list(valid_actions), :]
+        entity_batch = {
+            key: np.asarray(value)[None, ...]
+            for key, value in entity.items()
+            if key != "schema"
+        }
+        outputs = self.forward_legal_np(
+            entity_batch,
+            np.asarray(valid_actions, dtype=np.int64)[None, :],
+            legal_context[None, :, :],
+            return_q=return_q,
+        )
+        return outputs, entity, legal_context
+
+    def save(
+        self,
+        path: str | Path,
+        *,
+        mask_hidden_info: bool = False,
+        soft_target_source: str | None = None,
+    ) -> None:
+        import torch
+
+        output = Path(path)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        from catan_zero.rl.config_serialization import config_to_dict
+
+        torch.save(
+            {
+                "policy_type": self.policy_type,
+                # Durable name-keyed form (task #74): never pickle the frozen+slots
+                # dataclass itself -- positional state is crash/shift-prone across
+                # field-list changes. Loaders accept both this and legacy pickles.
+                "config": config_to_dict(self.config),
+                "action_mask_version": str(getattr(self.config, "action_mask_version", "")),
+                # f72 safety net (task #76): whether train_bc.py --mask-hidden-info
+                # was used for this training run. Absent/False on any checkpoint
+                # predating this field (legacy checkpoints deserialize as
+                # untrained-with-masking, the safe default -- see
+                # EntityGraphRustEvaluator.__init__'s public_observation guard).
+                "mask_hidden_info": bool(mask_hidden_info),
+                # OPT-8 provenance: which soft policy target this run trained
+                # against ("policy" = Gumbel visit counts; "prefer_scores" was the
+                # degenerate-target footgun). Empty string on checkpoints predating
+                # this field. report.json also carries it; this makes the
+                # checkpoint self-describing without the sidecar.
+                "soft_target_source": str(soft_target_source) if soft_target_source is not None else "",
+                "static_action_features_sha256": _array_sha256(
+                    self.static_action_features.detach().cpu().numpy()
+                ),
+                "static_action_features": self.static_action_features.detach().cpu(),
+                "model": self.model.state_dict(),
+            },
+            output,
+        )
+
+    @classmethod
+    def load(
+        cls,
+        path: str | Path,
+        *,
+        device: str | None = None,
+        strict_metadata: bool = True,
+    ) -> EntityGraphPolicy:
+        import torch
+
+        from catan_zero.rl.config_serialization import (
+            config_from_dict as _config_from_dict,
+            is_config_dict as _is_config_dict,
+        )
+
+        resolved = _resolve_device(device)
+        _install_numpy_pickle_aliases()
+        checkpoint = Path(path)
+        try:
+            data = torch.load(checkpoint, map_location=resolved, weights_only=False)
+        except TypeError:
+            data = torch.load(checkpoint, map_location=resolved)
+        static = data["static_action_features"]
+        if hasattr(static, "detach"):
+            static = static.detach().cpu().numpy()
+        config = data["config"]
+        # Task #74: reconstruct the config by field NAME from either serialized
+        # form -- the durable name-keyed dict (new checkpoints) or the legacy
+        # pickled dataclass (old checkpoints; possibly stale with unset slots,
+        # the a413df8 case, which this subsumes). Order-independent, fills
+        # missing fields from current defaults, warns+drops unknown fields.
+        if isinstance(config, EntityGraphConfig) or _is_config_dict(config):
+            config = _config_from_dict(EntityGraphConfig, config)
+        if strict_metadata:
+            if str(data.get("policy_type", "") or "") != cls.policy_type:
+                raise ValueError(
+                    f"{checkpoint} is not an entity_graph checkpoint: "
+                    f"policy_type={data.get('policy_type')!r}"
+                )
+            if not isinstance(config, EntityGraphConfig):
+                raise ValueError(
+                    f"{checkpoint} config is {type(config).__name__}, expected EntityGraphConfig"
+                )
+            if str(getattr(config, "schema_version", "") or "") != ENTITY_POLICY_SCHEMA_VERSION:
+                raise ValueError(
+                    f"{checkpoint} entity policy schema mismatch: "
+                    f"{getattr(config, 'schema_version', '')!r} != {ENTITY_POLICY_SCHEMA_VERSION!r}"
+                )
+            if int(getattr(config, "legal_action_feature_size", 0)) != LEGAL_ACTION_FEATURE_SIZE:
+                raise ValueError(
+                    f"{checkpoint} legal_action_feature_size mismatch: "
+                    f"{getattr(config, 'legal_action_feature_size', None)} != {LEGAL_ACTION_FEATURE_SIZE}"
+                )
+            if int(getattr(config, "context_action_feature_size", 0)) != CONTEXT_ACTION_FEATURE_SIZE:
+                raise ValueError(
+                    f"{checkpoint} context_action_feature_size mismatch: "
+                    f"{getattr(config, 'context_action_feature_size', None)} != {CONTEXT_ACTION_FEATURE_SIZE}"
+                )
+            expected_static_hash = str(data.get("static_action_features_sha256", "") or "")
+            if expected_static_hash:
+                actual_static_hash = _array_sha256(np.asarray(static, dtype=np.float32))
+                if actual_static_hash != expected_static_hash:
+                    raise ValueError(
+                        f"{checkpoint} static_action_features_sha256 mismatch: "
+                        f"checkpoint={expected_static_hash} actual={actual_static_hash}"
+                    )
+        policy = cls(config, static, device=str(resolved))
+        # f72 safety net (task #76): record whether this checkpoint's training run
+        # used --mask-hidden-info. Missing on any checkpoint saved before this field
+        # existed -- defaults to False (untrained-with-masking), the safe default:
+        # EntityGraphRustEvaluator.__init__ aborts if public_observation=True is
+        # requested against a checkpoint that doesn't report having been trained
+        # for it, so an old/legacy checkpoint correctly fails closed rather than
+        # silently running mismatched.
+        policy.trained_with_masked_hidden_info = bool(data.get("mask_hidden_info", False))
+        missing, unexpected = policy.model.load_state_dict(data["model"], strict=False)
+        # Optional aux heads and the f69 action-attention upgrade params are all
+        # absent from checkpoints that predate them, so their freshly-initialised
+        # weights are permitted to be "missing" when warm-starting an upgraded
+        # config. When every optional flag is off none of these modules exist, so
+        # this list is inert and the load is equivalent to strict.
+        allowed_missing_prefixes = (
+            "q_head.",
+            "value_uncertainty_head.",
+            "value_categorical_head.",
+            "target_gather_proj.",
+            "action_cross_blocks.",
+            "value_probe",
+            "value_pool_head.",
+            # CAT-97 edge-feature policy head + CAT-100 aux subgoal heads: all
+            # absent from checkpoints that predate them, so warm-starting an
+            # upgraded config (heads ON) from an older checkpoint permits their
+            # freshly-initialised weights to be "missing". Inert when off.
+            "edge_policy_mlp.",
+            "aux_longest_road_head.",
+            "aux_largest_army_head.",
+            "aux_vp_in_n_head.",
+            "aux_next_settlement_head.",
+            "aux_robber_target_head.",
+        )
+        disallowed_missing = [
+            key for key in missing if not key.startswith(allowed_missing_prefixes)
+        ]
+        if disallowed_missing or unexpected:
+            raise RuntimeError(
+                "entity_graph checkpoint state mismatch: "
+                f"missing={disallowed_missing[:8]} unexpected={unexpected[:8]}"
+            )
+        policy.model.eval()
+        return policy
+
+
+def _assert_entity_batch_shapes(
+    entity_batch: dict[str, np.ndarray],
+    legal_action_ids: np.ndarray,
+    legal_action_context: np.ndarray,
+    config: EntityGraphConfig,
+) -> None:
+    required = {
+        "hex_tokens": (3, 19, HEX_FEATURE_SIZE),
+        "vertex_tokens": (3, 54, VERTEX_FEATURE_SIZE),
+        "edge_tokens": (3, 72, EDGE_FEATURE_SIZE),
+        "player_tokens": (3, None, PLAYER_FEATURE_SIZE),
+        "global_tokens": (3, 1, GLOBAL_FEATURE_SIZE),
+        "legal_action_tokens": (3, None, int(config.legal_action_feature_size)),
+        "event_tokens": (3, None, EVENT_FEATURE_SIZE),
+    }
+    legal = np.asarray(legal_action_ids)
+    context = np.asarray(legal_action_context)
+    if legal.ndim != 2:
+        raise ValueError(f"legal_action_ids must be rank 2, got {legal.shape}")
+    if context.ndim != 3:
+        raise ValueError(f"legal_action_context must be rank 3, got {context.shape}")
+    batch_size, legal_width = int(legal.shape[0]), int(legal.shape[1])
+    if context.shape[:2] != legal.shape:
+        raise ValueError(
+            "legal_action_context shape must align with legal_action_ids: "
+            f"context={context.shape} legal={legal.shape}"
+        )
+    if int(context.shape[2]) != int(config.context_action_feature_size):
+        raise ValueError(
+            "legal_action_context width mismatch: "
+            f"{context.shape[2]} != {config.context_action_feature_size}"
+        )
+    for key, expected in required.items():
+        if key not in entity_batch:
+            raise ValueError(f"missing entity batch field {key}")
+        value = np.asarray(entity_batch[key])
+        if value.ndim != expected[0]:
+            raise ValueError(f"{key} must be rank {expected[0]}, got {value.shape}")
+        if int(value.shape[0]) != batch_size:
+            raise ValueError(f"{key} batch size {value.shape[0]} != {batch_size}")
+        if expected[1] is not None and int(value.shape[1]) != int(expected[1]):
+            raise ValueError(f"{key} dim1 {value.shape[1]} != {expected[1]}")
+        if int(value.shape[2]) != int(expected[2]):
+            raise ValueError(f"{key} width {value.shape[2]} != {expected[2]}")
+    if np.asarray(entity_batch["legal_action_tokens"]).shape[1] != legal_width:
+        raise ValueError(
+            "legal_action_tokens candidate width must match legal_action_ids: "
+            f"{np.asarray(entity_batch['legal_action_tokens']).shape[1]} != {legal_width}"
+        )
+    mask_shapes = {
+        "hex_mask": 19,
+        "vertex_mask": 54,
+        "edge_mask": 72,
+        "player_mask": np.asarray(entity_batch["player_tokens"]).shape[1],
+        "legal_action_mask": legal_width,
+        "event_mask": np.asarray(entity_batch["event_tokens"]).shape[1],
+    }
+    for key, width in mask_shapes.items():
+        if key not in entity_batch:
+            raise ValueError(f"missing entity batch field {key}")
+        value = np.asarray(entity_batch[key])
+        if value.shape != (batch_size, int(width)):
+            raise ValueError(f"{key} shape {value.shape} != {(batch_size, int(width))}")

@@ -1,0 +1,40 @@
+{
+  "track": "2p_no_trade",
+  "algorithm": "ppo",
+  "arch": "candidate",
+  "seed": 1,
+  "run_dir": "runs/self_play/gpu_ppo_2p_v1",
+  "hidden_size": 512,
+  "vps_to_win": 10,
+  "iterations": 1,
+  "rollout": {
+    "decisions_per_rank": 262144,
+    "max_decisions_per_game": 1000,
+    "gamma": 0.997,
+    "gae_lambda": 0.95
+  },
+  "ppo": {
+    "epochs": 2,
+    "minibatch_size": 65536,
+    "clip_ratio": 0.15,
+    "entropy_coef": 0.01,
+    "value_coef": 0.5,
+    "max_grad_norm": 1.0,
+    "lr": 0.0002,
+    "value_clip_range": 0.2
+  },
+  "opponents": {
+    "latest_self": 0.70,
+    "past_checkpoints": 0.20,
+    "baseline_bots": 0.10,
+    "baseline": "random"
+  },
+  "checkpoint": {
+    "every_iterations": 1,
+    "keep_last": 20
+  },
+  "eval": {
+    "dev_games": 2000,
+    "promotion_games": 20000
+  }
+}

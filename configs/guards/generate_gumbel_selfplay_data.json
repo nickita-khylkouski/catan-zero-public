@@ -1,0 +1,35 @@
+{
+  "guards": [
+    {
+      "name": "cli_flag_lint",
+      "args": {
+        "critical_flags": [
+          "--c-scale",
+          "--c-visit",
+          "--n-full",
+          "--n-fast",
+          "--base-seed",
+          "--games"
+        ]
+      }
+    },
+    {
+      "name": "seed_ledger",
+      "args": {
+        "purpose": "generate"
+      }
+    },
+    {
+      "name": "ledger_overlap",
+      "args": {
+        "purpose": "generate"
+      }
+    },
+    {
+      "name": "fd_limit",
+      "args": {
+        "minimum": 65536
+      }
+    }
+  ]
+}

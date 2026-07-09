@@ -1,0 +1,7 @@
+2026-06-30T08:37:20+00:00 b200_queue rows=490496 min_rows=100000 import_root=runs/data/a100_imports
+{'dataset': 'runs/data/curated/mcts_auto_20260630_fix4_dataset', 'shards': 438, 'rows': 490496}
+2026-06-30T08:37:34+00:00 b200_queue train_start name=entity_graph_35m_mcts_auto_20260630_fix4_mcts_policy data=runs/data/curated/mcts_auto_20260630_fix4_dataset init=runs/bc/entity_graph_35m_2p10_hq_1000parts_cumulative_shardddp_bs4k_20260629_200420/checkpoint_epoch0002.pt
+2026-06-30T08:39:30+00:00 b200_queue train_done name=entity_graph_35m_mcts_auto_20260630_fix4_mcts_policy status=0
+2026-06-30T08:39:30+00:00 b200_queue train_start name=entity_graph_35m_mcts_auto_20260630_fix4_mcts_qaux data=runs/data/curated/mcts_auto_20260630_fix4_dataset init=runs/bc/entity_graph_35m_mcts_auto_20260630_fix4_mcts_policy/checkpoint.pt
+2026-06-30T08:40:40+00:00 b200_queue train_done name=entity_graph_35m_mcts_auto_20260630_fix4_mcts_qaux status=0
+2026-06-30T08:40:40+00:00 b200_queue complete dataset=runs/data/curated/mcts_auto_20260630_fix4_dataset exp1=entity_graph_35m_mcts_auto_20260630_fix4_mcts_policy exp2=entity_graph_35m_mcts_auto_20260630_fix4_mcts_qaux

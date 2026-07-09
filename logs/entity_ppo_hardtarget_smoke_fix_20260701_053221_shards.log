@@ -1,0 +1,4 @@
+{"checkpoint": "runs/distributed/entity_ppo_hardtarget_smoke_fix_20260701_053221/policy/weights_v1.pt", "devices": ["cuda:0", "cuda:1"], "event": "local_ppo_shards_start", "games": 4, "policy_version": 1, "run_root": "runs/distributed/entity_ppo_hardtarget_smoke_fix_20260701_053221", "workers": 2}
+{"device": "cuda:0", "elapsed_sec": 10.224130048998632, "event": "local_ppo_worker_done", "games": 2, "samples": 224, "shards": 2, "worker_id": "local_000"}
+{"device": "cuda:1", "elapsed_sec": 26.907137345988303, "event": "local_ppo_worker_done", "games": 2, "samples": 233, "shards": 2, "worker_id": "local_001"}
+{"elapsed_sec": 29.894419817981543, "event": "local_ppo_shards_done", "games": 4, "run_root": "runs/distributed/entity_ppo_hardtarget_smoke_fix_20260701_053221", "samples": 457, "shards": 4}

@@ -1,0 +1,1025 @@
+2026-06-30T07:59:12+00:00
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+2026-06-30T08:04:15+00:00
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+2026-06-30T08:09:17+00:00
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+2026-06-30T08:14:20+00:00
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+2026-06-30T08:19:23+00:00
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+2026-06-30T08:24:25+00:00
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+2026-06-30T08:29:28+00:00
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+2026-06-30T08:34:31+00:00
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+2026-06-30T08:39:33+00:00
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+2026-06-30T08:44:36+00:00
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+2026-06-30T08:49:39+00:00
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+2026-06-30T08:54:41+00:00
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+2026-06-30T08:59:44+00:00
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+2026-06-30T09:04:47+00:00
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+2026-06-30T09:09:49+00:00
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+2026-06-30T09:14:52+00:00
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+2026-06-30T09:19:55+00:00
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+2026-06-30T09:24:57+00:00
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+2026-06-30T09:30:00+00:00
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+2026-06-30T09:35:03+00:00
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+2026-06-30T09:40:05+00:00
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+2026-06-30T09:45:08+00:00
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+2026-06-30T09:50:11+00:00
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+2026-06-30T09:55:13+00:00
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+2026-06-30T10:00:16+00:00
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+2026-06-30T10:05:19+00:00
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+2026-06-30T10:10:21+00:00
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+2026-06-30T10:15:24+00:00
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+2026-06-30T10:20:26+00:00
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+2026-06-30T10:25:29+00:00
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+2026-06-30T10:30:31+00:00
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+2026-06-30T10:35:34+00:00
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+2026-06-30T10:40:36+00:00
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+2026-06-30T10:45:39+00:00
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+2026-06-30T10:50:41+00:00
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+2026-06-30T10:55:44+00:00
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+2026-06-30T11:00:46+00:00
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+2026-06-30T11:05:49+00:00
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+2026-06-30T11:10:51+00:00
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+2026-06-30T11:15:54+00:00
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+2026-06-30T11:20:56+00:00
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+2026-06-30T11:25:59+00:00
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+2026-06-30T11:31:02+00:00
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+2026-06-30T11:36:04+00:00
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+2026-06-30T11:41:07+00:00
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+2026-06-30T11:46:09+00:00
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+2026-06-30T11:51:11+00:00
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+2026-06-30T11:56:14+00:00
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+2026-06-30T12:01:16+00:00
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+2026-06-30T12:06:19+00:00
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+2026-06-30T12:11:22+00:00
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+2026-06-30T12:16:24+00:00
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+2026-06-30T12:21:27+00:00
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+2026-06-30T12:26:29+00:00
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+2026-06-30T12:31:32+00:00
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+2026-06-30T12:36:34+00:00
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+2026-06-30T12:41:37+00:00
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_quality_s32_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+2026-06-30T12:46:39+00:00
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+2026-06-30T12:51:42+00:00
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+2026-06-30T12:56:44+00:00
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+2026-06-30T13:01:47+00:00
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+2026-06-30T13:06:49+00:00
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+2026-06-30T13:11:52+00:00
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+2026-06-30T13:16:54+00:00
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+2026-06-30T13:21:57+00:00
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+2026-06-30T13:26:59+00:00
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+2026-06-30T13:32:02+00:00
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+2026-06-30T13:37:04+00:00
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+2026-06-30T13:42:07+00:00
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+2026-06-30T13:47:10+00:00
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+2026-06-30T13:52:13+00:00
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+2026-06-30T13:57:16+00:00
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+2026-06-30T14:02:19+00:00
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+2026-06-30T14:07:21+00:00
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+2026-06-30T14:12:24+00:00
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+2026-06-30T14:17:26+00:00
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+2026-06-30T14:22:29+00:00
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+2026-06-30T14:27:32+00:00
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+2026-06-30T14:32:34+00:00
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+2026-06-30T14:37:37+00:00
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+2026-06-30T14:42:40+00:00
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+2026-06-30T14:47:43+00:00
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+2026-06-30T14:52:45+00:00
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+2026-06-30T14:57:48+00:00
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+2026-06-30T15:02:51+00:00
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+2026-06-30T15:07:54+00:00
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+2026-06-30T15:12:56+00:00
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+2026-06-30T15:17:59+00:00
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+2026-06-30T15:23:02+00:00
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+2026-06-30T15:28:04+00:00
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+2026-06-30T15:33:07+00:00
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+2026-06-30T15:38:10+00:00
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100b_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+2026-06-30T15:43:13+00:00
+rsync: [sender] link_stat "/home/ubuntu/catan-zero/runs/data/mcts_terminal_s16_64proc_a100a_20260630_queued" failed: No such file or directory (2)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1887) [Receiver=3.2.7]
+rsync: [Receiver] write error: Broken pipe (32)
+2026-06-30T15:48:15+00:00
+2026-06-30T15:53:18+00:00
+2026-06-30T15:58:21+00:00
+2026-06-30T16:03:24+00:00
+2026-06-30T16:08:26+00:00
+2026-06-30T16:13:29+00:00
+2026-06-30T16:18:32+00:00
+2026-06-30T16:23:35+00:00
+2026-06-30T16:28:38+00:00
+2026-06-30T16:33:41+00:00
+2026-06-30T16:38:44+00:00
+2026-06-30T16:43:47+00:00
+2026-06-30T16:48:50+00:00
+2026-06-30T16:53:53+00:00
+2026-06-30T16:58:56+00:00
+2026-06-30T17:03:59+00:00
+2026-06-30T17:09:02+00:00
+2026-06-30T17:14:05+00:00
+2026-06-30T17:19:08+00:00
+2026-06-30T17:24:10+00:00
+2026-06-30T17:29:13+00:00
+2026-06-30T17:34:16+00:00
+2026-06-30T17:39:19+00:00
+2026-06-30T17:44:21+00:00
+2026-06-30T17:49:24+00:00
+2026-06-30T17:54:27+00:00
+2026-06-30T17:59:30+00:00
+2026-06-30T18:04:33+00:00
+2026-06-30T18:09:35+00:00
+2026-06-30T18:14:38+00:00
+2026-06-30T18:19:41+00:00
+2026-06-30T18:24:44+00:00
+2026-06-30T18:29:47+00:00
+2026-06-30T18:34:49+00:00
+2026-06-30T18:39:52+00:00
+2026-06-30T18:44:55+00:00
+2026-06-30T18:49:57+00:00
+2026-06-30T18:55:00+00:00

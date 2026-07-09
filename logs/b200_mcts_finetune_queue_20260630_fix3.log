@@ -1,0 +1,3 @@
+2026-06-30T08:35:46+00:00 b200_queue rows=431104 min_rows=100000 import_root=runs/data/a100_imports
+{'dataset': 'runs/data/curated/mcts_auto_20260630_fix3_dataset', 'shards': 438, 'rows': 490496}
+2026-06-30T08:36:01+00:00 b200_queue train_start name=entity_graph_35m_mcts_auto_20260630_fix3_mcts_policy data=runs/data/curated/mcts_auto_20260630_fix3_dataset init=runs/bc/entity_graph_35m_2p10_hq_1000parts_cumulative_shardddp_bs4k_20260629_200420/checkpoint_epoch0002.pt

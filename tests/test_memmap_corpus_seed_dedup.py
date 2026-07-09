@@ -1,0 +1,164 @@
+"""Unit tests for build_memmap_corpus.py's game_seed duplicate-run detector
+(FIX 1, task #85): a shard-boundary false-negative in the earlier
+pending/closed-set logic, and the new --abort-on-duplicate-seeds behavior.
+
+These use tiny synthetic seed columns / npz shards -- no real teacher data
+required.
+"""
+from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+_REPO = Path(__file__).resolve().parents[1]
+_TOOLS_DIR = _REPO / "tools"
+if str(_TOOLS_DIR) not in sys.path:
+    sys.path.insert(0, str(_TOOLS_DIR))
+
+from build_memmap_corpus import _GameSeedRunTracker, build_memmap_corpus  # type: ignore  # noqa: E402
+
+
+# ---------------------------------------------------------------------------
+# FIX 1a: confirm the shard-boundary false-negative in the tracker.
+# ---------------------------------------------------------------------------
+
+
+def test_tracker_detects_duplicate_that_reappears_after_boundary_continuation():
+    """Shard 1 ends with seed 3 (run stays open). Shard 2 OPENS with a
+    continuation of seed 3 (merged, not a new run), then seed 4, then seed 3
+    AGAIN as a genuinely separate, non-contiguous run within the SAME shard.
+    That second occurrence of 3 is a real duplicate (collision) and must be
+    flagged -- this is exactly the case the earlier pending/closed-set logic
+    missed, because the continuation-merged run of 3 was never registered in
+    the closed-set while open, so its later reappearance was mistaken for a
+    first-time occurrence.
+    """
+    tracker = _GameSeedRunTracker()
+    tracker.observe_shard(np.array([1, 1, 2, 2, 3, 3], dtype=np.int64))
+    assert not tracker.has_duplicates
+
+    tracker.observe_shard(np.array([3, 3, 4, 4, 3, 3], dtype=np.int64))
+    assert tracker.has_duplicates, "seed 3's second, non-contiguous run must be flagged"
+    assert tracker.duplicate_count == 1
+
+
+def test_tracker_no_false_positive_for_simple_boundary_continuation():
+    """A game_seed that merely spans a shard boundary once (no reappearance)
+    must NOT be flagged."""
+    tracker = _GameSeedRunTracker()
+    tracker.observe_shard(np.array([1, 1, 2, 2], dtype=np.int64))
+    tracker.observe_shard(np.array([2, 2, 3, 3], dtype=np.int64))
+    assert not tracker.has_duplicates
+
+
+def test_tracker_detects_duplicate_within_single_shard_no_boundary():
+    """Duplicate run entirely inside one shard call (no cross-shard merge
+    involved) is also caught."""
+    tracker = _GameSeedRunTracker()
+    tracker.observe_shard(np.array([5, 5, 6, 6, 5, 5], dtype=np.int64))
+    assert tracker.has_duplicates
+    assert tracker.duplicate_count == 1
+
+
+def test_tracker_detects_duplicate_separated_by_a_later_shard():
+    """The duplicate run doesn't have to be in the immediately-next shard --
+    it can reappear several shards later, as long as the boundary-continuation
+    merge doesn't hide it."""
+    tracker = _GameSeedRunTracker()
+    tracker.observe_shard(np.array([1, 1, 2, 2], dtype=np.int64))  # 2 stays open
+    tracker.observe_shard(np.array([2, 2, 3, 3], dtype=np.int64))  # continues 2, then 3
+    tracker.observe_shard(np.array([4, 4, 2, 2], dtype=np.int64))  # 2 reappears: dup
+    assert tracker.has_duplicates
+    assert tracker.duplicate_count == 1
+
+
+def test_tracker_empty_shard_is_noop():
+    tracker = _GameSeedRunTracker()
+    tracker.observe_shard(np.array([], dtype=np.int64))
+    tracker.observe_shard(np.array([7, 7], dtype=np.int64))
+    assert not tracker.has_duplicates
+
+
+# ---------------------------------------------------------------------------
+# FIX 1b: --abort-on-duplicate-seeds (default on) hard-exits; the escape
+# hatch only warns. Uses tiny synthetic npz shards (minimal required columns).
+# ---------------------------------------------------------------------------
+
+
+def _write_synthetic_shard(path: Path, *, game_seed: np.ndarray) -> None:
+    n = int(game_seed.shape[0])
+    legal_width = 2
+    np.savez(
+        path,
+        obs=np.zeros((n, 4), dtype=np.float16),
+        legal_action_ids=np.zeros((n, legal_width), dtype=np.int16),
+        legal_action_context=np.zeros((n, legal_width, 1), dtype=np.float16),
+        action_taken=np.zeros(n, dtype=np.int16),
+        game_seed=game_seed.astype(np.int64),
+    )
+
+
+def _make_duplicate_seed_shards(tmp_path: Path) -> Path:
+    """Two shards whose game_seed columns reproduce the shard-boundary
+    reappearance case above."""
+    teacher_dir = tmp_path / "teacher"
+    teacher_dir.mkdir()
+    _write_synthetic_shard(teacher_dir / "shard0.npz", game_seed=np.array([1, 1, 2, 2, 3, 3]))
+    _write_synthetic_shard(teacher_dir / "shard1.npz", game_seed=np.array([3, 3, 4, 4, 3, 3]))
+    return teacher_dir
+
+
+def _make_clean_shards(tmp_path: Path) -> Path:
+    teacher_dir = tmp_path / "teacher"
+    teacher_dir.mkdir()
+    _write_synthetic_shard(teacher_dir / "shard0.npz", game_seed=np.array([1, 1, 2, 2]))
+    _write_synthetic_shard(teacher_dir / "shard1.npz", game_seed=np.array([2, 2, 3, 3]))
+    return teacher_dir
+
+
+def test_build_memmap_corpus_aborts_by_default_on_duplicate_seeds(tmp_path):
+    teacher_dir = _make_duplicate_seed_shards(tmp_path)
+    with pytest.raises(SystemExit, match="ABORTING"):
+        build_memmap_corpus(
+            teacher_dir,
+            tmp_path / "corpus",
+            progress_every=0,
+            abort_on_duplicate_seeds=True,
+        )
+
+
+def test_build_memmap_corpus_warns_only_with_escape_hatch(tmp_path, capsys):
+    teacher_dir = _make_duplicate_seed_shards(tmp_path)
+    meta = build_memmap_corpus(
+        teacher_dir,
+        tmp_path / "corpus",
+        progress_every=0,
+        abort_on_duplicate_seeds=False,
+    )
+    assert meta["stats"]["has_duplicate_game_seeds"] is True
+    assert meta["stats"]["duplicate_game_seed_count"] == 1
+    captured = capsys.readouterr()
+    assert "WARNING" in captured.err
+
+
+def test_build_memmap_corpus_default_kwarg_is_abort_on():
+    import inspect
+
+    sig = inspect.signature(build_memmap_corpus)
+    assert sig.parameters["abort_on_duplicate_seeds"].default is True
+
+
+def test_build_memmap_corpus_no_duplicates_does_not_abort(tmp_path):
+    teacher_dir = _make_clean_shards(tmp_path)
+    meta = build_memmap_corpus(
+        teacher_dir,
+        tmp_path / "corpus",
+        progress_every=0,
+        abort_on_duplicate_seeds=True,
+    )
+    assert meta["stats"]["has_duplicate_game_seeds"] is False
+    assert meta["stats"]["duplicate_game_seed_count"] == 0

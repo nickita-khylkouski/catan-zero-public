@@ -1,0 +1,1 @@
+{"progress": "rust_mcts_game", "game": 0, "seed": 6900, "candidate_color": "BLUE", "opponent_color": "RED", "winner": "RED", "candidate_won": false, "candidate_vp": 2, "opponent_vp": 10, "decisions": 370, "candidate_decisions": 174, "timed_out": false}

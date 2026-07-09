@@ -1,0 +1,38 @@
+{
+  "interval_seconds": 300,
+  "ssh_key": "~/.ssh/catan_a100_sync_ed25519",
+  "min_shard_age_seconds": 180,
+  "min_batch_shards": 2,
+  "max_batch_shards": 64,
+  "sources": [
+    {
+      "name": "a100a",
+      "host": "ubuntu@a100a",
+      "repo": "/home/ubuntu/catan-zero",
+      "shard_globs": [
+        "./runs/selfplay/gen3_mps_20260707/*/worker_*/gumbel_self_play_shard_*.npz",
+        "./runs/selfplay/gen3_mps_20260707_r5/*/worker_*/gumbel_self_play_shard_*.npz",
+        "./runs/selfplay/gen3_mps_20260707_r6/*/worker_*/gumbel_self_play_shard_*.npz",
+        "./runs/selfplay/gen3_mps_20260707_r9/*/worker_*/gumbel_self_play_shard_*.npz",
+        "./runs/selfplay/gen3_auto/*/worker_*/gumbel_self_play_shard_*.npz"
+      ],
+      "checkpoint_path": "runs/bc/gen3_20260706/checkpoint.pt",
+      "ckpt_version": 0
+    },
+    {
+      "name": "a100b",
+      "host": "ubuntu@a100b",
+      "repo": "/home/ubuntu/catan-zero",
+      "shard_globs": [
+        "./runs/selfplay/gen3_mps_20260707/*/worker_*/gumbel_self_play_shard_*.npz",
+        "./runs/selfplay/gen3_mps_20260707_r5/*/worker_*/gumbel_self_play_shard_*.npz",
+        "./runs/selfplay/gen3_mps_20260707_r7/*/worker_*/gumbel_self_play_shard_*.npz",
+        "./runs/selfplay/gen3_mps_20260707_r8/*/worker_*/gumbel_self_play_shard_*.npz",
+        "./runs/selfplay/gen3_mps_20260707_r9/*/worker_*/gumbel_self_play_shard_*.npz",
+        "./runs/selfplay/gen3_auto/*/worker_*/gumbel_self_play_shard_*.npz"
+      ],
+      "checkpoint_path": "runs/bc/gen3_20260706/checkpoint.pt",
+      "ckpt_version": 0
+    }
+  ]
+}

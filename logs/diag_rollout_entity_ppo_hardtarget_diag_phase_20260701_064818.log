@@ -1,0 +1,18 @@
+{"checkpoint": "runs/distributed/entity_ppo_hardtarget_diag_phase_20260701_064818/policy/weights_v1.pt", "devices": ["cuda:0", "cuda:1"], "event": "local_ppo_shards_start", "games": 64, "policy_version": 1, "run_root": "runs/distributed/entity_ppo_hardtarget_diag_phase_20260701_064818", "workers": 16}
+{"device": "cuda:1", "elapsed_sec": 21.236703731003217, "event": "local_ppo_worker_done", "games": 4, "samples": 461, "shards": 2, "worker_id": "local_009"}
+{"device": "cuda:0", "elapsed_sec": 22.218334996025078, "event": "local_ppo_worker_done", "games": 4, "samples": 540, "shards": 2, "worker_id": "local_000"}
+{"device": "cuda:1", "elapsed_sec": 23.701741385972127, "event": "local_ppo_worker_done", "games": 4, "samples": 457, "shards": 2, "worker_id": "local_013"}
+{"device": "cuda:0", "elapsed_sec": 23.92107812600443, "event": "local_ppo_worker_done", "games": 4, "samples": 304, "shards": 2, "worker_id": "local_002"}
+{"device": "cuda:1", "elapsed_sec": 28.230434776982293, "event": "local_ppo_worker_done", "games": 4, "samples": 681, "shards": 2, "worker_id": "local_007"}
+{"device": "cuda:0", "elapsed_sec": 29.711211546964478, "event": "local_ppo_worker_done", "games": 4, "samples": 536, "shards": 2, "worker_id": "local_004"}
+{"device": "cuda:0", "elapsed_sec": 29.693387467006687, "event": "local_ppo_worker_done", "games": 4, "samples": 446, "shards": 2, "worker_id": "local_012"}
+{"device": "cuda:1", "elapsed_sec": 29.82738704798976, "event": "local_ppo_worker_done", "games": 4, "samples": 610, "shards": 2, "worker_id": "local_003"}
+{"device": "cuda:1", "elapsed_sec": 30.286075171025004, "event": "local_ppo_worker_done", "games": 4, "samples": 390, "shards": 2, "worker_id": "local_001"}
+{"device": "cuda:0", "elapsed_sec": 32.344756176986266, "event": "local_ppo_worker_done", "games": 4, "samples": 601, "shards": 2, "worker_id": "local_010"}
+{"device": "cuda:0", "elapsed_sec": 32.46259558998281, "event": "local_ppo_worker_done", "games": 4, "samples": 664, "shards": 2, "worker_id": "local_014"}
+{"device": "cuda:0", "elapsed_sec": 34.6586009489838, "event": "local_ppo_worker_done", "games": 4, "samples": 629, "shards": 2, "worker_id": "local_006"}
+{"device": "cuda:1", "elapsed_sec": 35.95626348699443, "event": "local_ppo_worker_done", "games": 4, "samples": 627, "shards": 2, "worker_id": "local_015"}
+{"device": "cuda:1", "elapsed_sec": 36.44036220398266, "event": "local_ppo_worker_done", "games": 4, "samples": 729, "shards": 2, "worker_id": "local_011"}
+{"device": "cuda:1", "elapsed_sec": 36.61685215198668, "event": "local_ppo_worker_done", "games": 4, "samples": 634, "shards": 2, "worker_id": "local_005"}
+{"device": "cuda:0", "elapsed_sec": 38.990713240986224, "event": "local_ppo_worker_done", "games": 4, "samples": 551, "shards": 2, "worker_id": "local_008"}
+{"elapsed_sec": 48.08569164801156, "event": "local_ppo_shards_done", "games": 64, "run_root": "runs/distributed/entity_ppo_hardtarget_diag_phase_20260701_064818", "samples": 8860, "shards": 32}

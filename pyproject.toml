@@ -1,0 +1,45 @@
+[project]
+name = "catan-zero"
+version = "0.1.0"
+description = "CatanZero benchmark and training contracts"
+requires-python = ">=3.11"
+dependencies = [
+    "gymnasium>=1.0",
+    "networkx>=3.0",
+    "numpy>=1.26",
+    "zstandard>=0.22",
+    # RUN-6: scipy promoted from the `dev`/`population_arena` extras to a BASE
+    # dependency. tools/population_arena.py (Nash-averaging solver, CAT-58) is a
+    # shipped, test-gated feature; keeping scipy extra-only let ad-hoc venvs
+    # (`pip install -e .`) drift scipy-less and phantom-fail the 7 population_arena
+    # tests. Base makes `which venv` stop mattering (RUN-6 plan section 3b).
+    "scipy>=1.11",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "whr>=2.2", "scipy>=1.11"]
+rl = ["torch>=2.0"]
+# RUN-6: modal is pinned in its own extra ONLY for the legacy CPU-factory guard
+# test (tools/modal_gumbel_factory.py). It is NOT needed for training, generation,
+# gates, or the GPU factory (modal_gumbel_factory_gpu.py). The guard test uses
+# pytest.importorskip("modal"), so it skips cleanly when this extra is absent;
+# install `.[modal]` only to exercise that one test.
+modal = ["modal>=0.62"]
+# Optional: filesystem-mode MLflow gate-run logging (tools/mlflow_gate_logging.py).
+# The logger is fail-open, so this is not required to run gates.
+eval = ["mlflow>=2.0"]
+# Optional: Whole-History Rating ladder (tools/whr_ladder.py, Linear CAT-21).
+# whr_ladder.py lazily imports `whr` inside fit_whr_stratum with a clear
+# "pip install whr" error, so this is not required to run --help or any
+# ingest-only path -- only a real stratum fit needs it.
+whr = ["whr>=2.2"]
+# Optional: Nash-averaging solver (tools/population_arena.py, Linear CAT-58).
+# solve_nash_equilibrium lazily imports scipy.optimize with a clear
+# "pip install scipy" error, so this is not required for schedule building
+# or payoff-matrix assembly -- only the LP solve step needs it. Also listed
+# under `dev` so the module's own test suite runs unmodified.
+population_arena = ["scipy>=1.11"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
