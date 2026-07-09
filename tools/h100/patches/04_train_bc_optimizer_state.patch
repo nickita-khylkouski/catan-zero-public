@@ -1,0 +1,40 @@
+--- a/tools/train_bc.py
++++ b/tools/train_bc.py
+@@ -1105,6 +1105,18 @@
+                params.extend(module.parameters())
+        optimizer = _make_optimizer(params, args, getattr(policy, "device", args.device))
++       # SYSTEM_DESIGN_FINDINGS #8: Persist optimizer state across resumes.
++       # Previously: checkpoints do not persist optimizer state, so every resume
++       # restarts Adam's moment estimates from zero (the code even warns about
++       # this at line 990). This sidecar file saves/loads optimizer.state_dict()
++       # alongside the model checkpoint so resumes keep Adam momentum + variance.
++       if args.init_checkpoint:
++           _opt_sidecar = Path(str(args.init_checkpoint) + ".optimizer.pt")
++           if _opt_sidecar.exists():
++               import torch as _torch
++               try:
++                   optimizer.load_state_dict(_torch.load(_opt_sidecar, map_location=str(getattr(policy, "device", args.device))))
++                   _rank0_print(json.dumps({"progress": "optimizer_state_loaded", "sidecar": str(_opt_sidecar)}), ddp)
++               except Exception as _e:
++                   _rank0_print(json.dumps({"progress": "optimizer_state_load_failed", "error": str(_e)[:200]}), ddp)
+        train_fn = _train_candidate_batch
+    else:
+        if args.init_checkpoint:
+            if args.arch == "entity_graph":
+@@ -1739,6 +1751,14 @@
+            _save_policy(
+                policy, str(epoch_path), ddp, mask_hidden_info=bool(args.mask_hidden_info)
+            )
++           # SYSTEM_DESIGN_FINDINGS #8: Save optimizer state sidecar per epoch.
++           if int(ddp["rank"]) == 0:
++               import torch as _torch
++               _torch.save(optimizer.state_dict(), str(epoch_path) + ".optimizer.pt")
+        if args.max_steps > 0 and global_step >= args.max_steps:
+            break
+    # Called on every rank (see _save_policy): rank-0 write for DDP/single, and a
+    # collective full-state-dict gather for FSDP.
+    _save_policy(policy, args.checkpoint, ddp, mask_hidden_info=bool(args.mask_hidden_info))
++   # SYSTEM_DESIGN_FINDINGS #8: Save optimizer state sidecar at final checkpoint.
++   if int(ddp["rank"]) == 0:
++       import torch as _torch
++       _torch.save(optimizer.state_dict(), str(args.checkpoint) + ".optimizer.pt")

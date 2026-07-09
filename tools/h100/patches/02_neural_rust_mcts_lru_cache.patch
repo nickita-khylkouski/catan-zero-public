@@ -1,0 +1,72 @@
+--- a/src/catan_zero/search/neural_rust_mcts.py
++++ b/src/catan_zero/search/neural_rust_mcts.py
+@@ -1,6 +1,7 @@
+ from __future__ import annotations
+
++from collections import OrderedDict
+ import hashlib
+ import json
+ import queue
+ import threading
+@@ -167,7 +168,8 @@
+         self.policy = policy
+         self.config = config or EntityGraphRustEvaluatorConfig()
+         _assert_public_observation_matches_checkpoint_training(policy, self.config)
+-        self._cache: dict[tuple[str, str, tuple[str, ...], tuple[int, ...]], tuple[dict[int, float], float]] = {}
++        # SYSTEM_DESIGN_FINDINGS #15: OrderedDict for LRU eviction (was FIFO via next(iter))
++        self._cache: OrderedDict[tuple[str, str, tuple[str, ...], tuple[int, ...]], tuple[dict[int, float], float]] = OrderedDict()
+         # Task #81 phase 2 (config.rust_featurize): board topology, computed
+         # lazily ONCE per evaluator lifetime on the first Rust-featurized leaf
+         # and reused for every subsequent one (see the config field's comment
+@@ -325,6 +327,9 @@
+             cached = self._cache.get(cache_key)
+             if cached is not None:
+                 # CAT-61: cache entries are (priors, value) or (priors, value,
+                 # uncertainty); tolerate both so a mixed-format cache is safe.
++                # SYSTEM_DESIGN_FINDINGS #15: LRU — move hit to end so FIFO
++                # eviction via popitem(last=False) evicts least-recently-used.
++                self._cache.move_to_end(cache_key)
+                 uncertainty = cached[2] if len(cached) > 2 else 0.0
+                 return self._eval_result(dict(cached[0]), float(cached[1]), uncertainty)
+
+@@ -423,8 +428,9 @@
+         uncertainty = _uncertainty_from_outputs(outputs, 0)
+         if cache_enabled:
+             if len(self._cache) >= int(self.config.cache_size):
+-                self._cache.pop(next(iter(self._cache)))
++                self._cache.popitem(last=False)
+             self._cache[cache_key] = self._cache_entry(priors, value, uncertainty)
+@@ -597,6 +603,9 @@
+                 cached = self._cache.get(cache_key)
+                 if cached is not None:
+                     # CAT-61: tolerate (priors, value) and (priors, value, unc).
++                    # SYSTEM_DESIGN_FINDINGS #15: LRU move_to_end on hit.
++                    self._cache.move_to_end(cache_key)
+                     uncertainty = cached[2] if len(cached) > 2 else 0.0
+                     results[request_index] = self._eval_result(
+                         dict(cached[0]), float(cached[1]), uncertainty
+                     )
+@@ -692,8 +701,9 @@
+                 uncertainty = _uncertainty_from_outputs(outputs, batch_row)
+                 if int(self.config.cache_size) > 0:
+                     if len(self._cache) >= int(self.config.cache_size):
+-                        self._cache.pop(next(iter(self._cache)))
++                        self._cache.popitem(last=False)
+                     self._cache[batch_request.cache_key] = self._cache_entry(
+@@ -880,6 +890,9 @@
+             with self._cache_lock:
+                 cached = self._cache.get(cache_key)
+             if cached is not None:
+                 # CAT-61: tolerate (priors, value) and (priors, value, unc).
++                # SYSTEM_DESIGN_FINDINGS #15: LRU move_to_end on hit (thread-safe under lock).
++                with self._cache_lock:
++                    self._cache.move_to_end(cache_key)
+                 uncertainty = cached[2] if len(cached) > 2 else 0.0
+                 return self._eval_result(dict(cached[0]), float(cached[1]), uncertainty)
+@@ -968,8 +981,9 @@
+                 if int(self.config.cache_size) > 0:
+                     with self._cache_lock:
+                         if len(self._cache) >= int(self.config.cache_size):
+-                            self._cache.pop(next(iter(self._cache)))
++                            self._cache.popitem(last=False)
+                         self._cache[request.cache_key] = self._cache_entry(

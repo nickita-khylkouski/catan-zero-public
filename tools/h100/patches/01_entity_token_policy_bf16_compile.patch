@@ -1,0 +1,55 @@
+--- a/src/catan_zero/rl/entity_token_policy.py
++++ b/src/catan_zero/rl/entity_token_policy.py
+@@ -590,6 +590,12 @@
+             static_action_features,
+             dtype=torch.float32,
+             device=self.device,
+         )
+         self.model = EntityGraphNet(config).to(self.device)
++        # Inference optimizations (SYSTEM_DESIGN_FINDINGS #2, #3):
++        # torch.compile fuses Python-heavy transformer forward into fewer CUDA
++        # kernels (~1.2-1.5x). mode="reduce-overhead" minimizes launch overhead.
++        # Guarded by try/except so CPU-only / older-torch environments still work.
++        try:
++            self.model = torch.compile(self.model, mode="reduce-overhead")
++        except Exception:
++            pass  # fall back to eager if compile fails (dynamic shapes, old torch)
+
+     @classmethod
+@@ -622,16 +628,22 @@
+         import torch
+
+         _assert_entity_batch_shapes(
+             entity_batch,
+             legal_action_ids,
+             legal_action_context,
+             self.config,
+         )
++        # SYSTEM_DESIGN_FINDINGS #2: bf16 autocast for inference. Training
++        # already uses bf16 (train_bc.py line 4829); inference was fp32 only.
++        # H100 bf16 tensor cores give ~1.5-2x throughput vs fp32. The model
++        # outputs (logits, value) are cast back to fp32 by the caller's
++        # .float().cpu().numpy() so downstream behaviour is unchanged.
++        is_cuda = str(self.device).startswith("cuda")
++        autocast_ctx = (
++            torch.autocast(device_type="cuda", dtype=torch.bfloat16)
++            if is_cuda
++            else torch.no_grad()
++        )
+         batch = {
+-            key: torch.as_tensor(value, device=self.device)
++            key: torch.as_tensor(value, device=self.device, non_blocking=True)
+             for key, value in entity_batch.items()
+         }
+         batch["legal_action_context"] = torch.as_tensor(
+             legal_action_context,
+             dtype=torch.float32,
+             device=self.device,
+         )
+         action_ids = torch.as_tensor(legal_action_ids, dtype=torch.long, device=self.device)
+-        outputs = self.model(batch, return_q=return_q)
++        with autocast_ctx:
++            outputs = self.model(batch, return_q=return_q)
+         valid = action_ids >= 0
+         outputs["logits"] = outputs["logits"].masked_fill(~valid, -1.0e9)
+         return outputs
