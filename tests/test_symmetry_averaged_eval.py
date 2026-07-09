@@ -15,6 +15,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+pytest.importorskip("catanatron_rs")
+
 _REPO = Path(__file__).resolve().parents[1]
 if str(_REPO / "src") not in sys.path:
     sys.path.insert(0, str(_REPO / "src"))

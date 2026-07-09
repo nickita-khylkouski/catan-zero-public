@@ -4,6 +4,8 @@ import json
 
 import pytest
 
+pytest.importorskip("catanatron_rs")
+
 from catan_zero.search.gumbel_chance_mcts import (
     DEVELOPMENT_CARDS,
     RESOURCES,

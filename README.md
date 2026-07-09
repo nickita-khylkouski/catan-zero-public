@@ -26,7 +26,7 @@ downstream of it. Land the fix, land the test, then generate.
 - `docs/reviews/` — eight external expert reviews (R1-R8) plus the internal
   2026-07-06 critique report; see `docs/reviews/README.md` for an index
   mapping each file back to its original filename and what it added.
-- `tools/modal/modal_gumbel_factory_gpu.py` — the GPU self-play generation
+- `tools/modal_gumbel_factory_gpu.py` — the GPU self-play generation
   factory (Modal/L4 fleet), recovered from a local-only mirror that was
   never committed anywhere.
 - `rescue/` — untracked working-tree files rescued from each GPU host before

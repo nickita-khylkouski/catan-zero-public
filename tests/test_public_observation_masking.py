@@ -21,6 +21,8 @@ import random
 import numpy as np
 import pytest
 
+pytest.importorskip("catanatron_rs")
+
 from catan_zero.rl.entity_token_features import (
     PLAYERS,
     PUBLIC_MASK_PLAYER_SLOTS,

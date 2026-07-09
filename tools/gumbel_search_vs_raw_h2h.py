@@ -496,6 +496,7 @@ def _build_summary(
         "pair_sprt": pair_sprt,
         # Recommended verdict: trinomial GSPRT over all complete pairs (task #1).
         "pentanomial_sprt": pentanomial_sprt,
+        "verdict": pentanomial_sprt["decision"],
         "pair_diagnostics": pair_diagnostics,
         # Same counts as pair_diagnostics, under the exact names requested
         # for cross-team reporting consistency.

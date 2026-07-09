@@ -40,6 +40,9 @@ whr = ["whr>=2.2"]
 # under `dev` so the module's own test suite runs unmodified.
 population_arena = ["scipy>=1.11"]
 
+[tool.setuptools.packages.find]
+where = ["src"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]

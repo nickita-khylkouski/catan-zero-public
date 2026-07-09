@@ -101,6 +101,44 @@ def test_cli_flag_lint_without_parser_trusts_critical_flags_as_given():
     assert result.passed
 
 
+def test_cli_flag_lint_rejects_wrong_value_when_expected_values_given():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--c-scale", type=float, default=1.0)
+    parser.add_argument("--games", type=int, default=100)
+
+    result = guard.guard_cli_flag_lint(
+        argv=["--c-scale", "1.0", "--games", "100"],
+        critical_flags=["--c-scale", "--games"],
+        parser=parser,
+        expected_values={"--c-scale": 0.03},
+    )
+    assert not result.passed
+    assert "unsafe value" in result.reason
+    assert "0.03" in result.reason
+
+
+def test_cli_flag_lint_accepts_expected_value_and_rejects_inverted_boolean():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--public-observation", action=argparse.BooleanOptionalAction, default=False)
+
+    pass_result = guard.guard_cli_flag_lint(
+        argv=["--public-observation"],
+        critical_flags=["--public-observation"],
+        parser=parser,
+        expected_values={"--public-observation": True},
+    )
+    assert pass_result.passed
+
+    fail_result = guard.guard_cli_flag_lint(
+        argv=["--no-public-observation"],
+        critical_flags=["--public-observation"],
+        parser=parser,
+        expected_values={"--public-observation": True},
+    )
+    assert not fail_result.passed
+    assert "unsafe value" in fail_result.reason
+
+
 # ---------------------------------------------------------------------------
 # (b) seed-ledger enforcement + VAL-ONLY range
 # ---------------------------------------------------------------------------
