@@ -81,7 +81,21 @@ def _log(feed_dir: Path, msg: str) -> None:
 def _atomic_json(p: Path, obj) -> None:
     tmp = p.with_suffix(p.suffix + ".tmp")
     tmp.parent.mkdir(parents=True, exist_ok=True)
-    tmp.write_text(json.dumps(obj, indent=2, sort_keys=True))
+    with open(tmp, "w") as f:
+        f.write(json.dumps(obj, indent=2, sort_keys=True))
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, p)
+
+
+def _atomic_write_text(p: Path, text: str) -> None:
+    """Atomic text write: temp + fsync + os.replace. Prevents truncation on crash."""
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    tmp.parent.mkdir(parents=True, exist_ok=True)
+    with open(tmp, "w") as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
     os.replace(tmp, p)
 
 
@@ -241,7 +255,7 @@ def process_source(loop_dir: Path, feed_dir: Path, src: dict, cfg: dict, state: 
     staging = feed_dir / "incoming" / batch_id
     staging.mkdir(parents=True, exist_ok=True)
     listfile = staging / ".files"
-    listfile.write_text("".join(s["rel"] + "\n" for s in new))
+    _atomic_write_text(listfile, "".join(s["rel"] + "\n" for s in new))
     rsync = subprocess.run(
         ["rsync", "-a", "--files-from", str(listfile), "-e",
          f"ssh -i {key} -o BatchMode=yes -o ConnectTimeout=15",
@@ -324,18 +338,18 @@ def process_source(loop_dir: Path, feed_dir: Path, src: dict, cfg: dict, state: 
                 overlap = prev
                 break
     if reserved_hit is not None:
-        (corpus_dir / ".valonly").write_text(json.dumps(
+        _atomic_write_text(corpus_dir / ".valonly", json.dumps(
             {"reason": "reserved val-only game_seed range", "range": list(seed_range),
              "reserved": reserved_hit}))
         _log(feed_dir, f"{name}: {batch_id} VAL-ONLY — seed range {seed_range} intersects "
                        f"reserved validation range {reserved_hit}; never fed to training")
     elif overlap is not None:
-        (corpus_dir / ".quarantined").write_text(json.dumps(
+        _atomic_write_text(corpus_dir / ".quarantined", json.dumps(
             {"reason": "game_seed overlap", "range": list(seed_range), "conflicts_with": overlap}))
         _log(feed_dir, f"{name}: {batch_id} QUARANTINED — game_seed range {seed_range} overlaps "
                        f"previously ingested {overlap} (duplicate training data)")
     else:
-        (corpus_dir / ".ready").write_text("")
+        _atomic_write_text(corpus_dir / ".ready", "")
         _log(feed_dir, f"{name}: {batch_id} READY — {row_count:,} rows from {len(verified)} shards "
                        f"(v{src['ckpt_version']}, seeds {seed_range})")
         if seed_range is not None:

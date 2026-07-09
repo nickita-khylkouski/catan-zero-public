@@ -186,7 +186,7 @@ if ! kill -0 "$PID" 2>/dev/null; then echo "WARNING: pid $PID already exited —
 REMOTE_EOF
 
 # Forward TREE/CKPT/LEDGER/PY/GEN_PY/GROW_FROM overrides + all positionals to the box.
-timeout 90 ssh -o ConnectTimeout=10 -o BatchMode=yes -i "$KEY" ubuntu@"$IP" \
+timeout 90 ssh -o ConnectTimeout=10 -o BatchMode=yes -o StrictHostKeyChecking=accept-new -i "$KEY" ubuntu@"$IP" \
   "TREE='${TREE:-}' CKPT='${CKPT:-}' LEDGER='${LEDGER:-}' PY='${PY:-}' GEN_PY='${GEN_PY:-}' bash -s -- \
    $GO $ROLE $ALIAS $GPU_CSV $NGPU ${NFULL:-0} ${PFULL:-0} $GAMES $WORKERS ${BASE_SEED:-0} $CLAIM_ID $DATE_UTC '${DATA:-}' '${GROW_FROM:-}'" \
   <<< "$REMOTE" 2>&1 | sed 's/^/  /'

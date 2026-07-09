@@ -13,7 +13,8 @@ def _require_rust_module():
     except ImportError as error:  # pragma: no cover - exercised only without local binding.
         raise RuntimeError(
             "catanatron_rs is required for RustMCTS. Install the optimized Rust "
-            "binding from /Users/nickita/Downloads/Telegram Desktop/catanatron-rs."
+            "binding via tools/install_v1_freeze.sh or pip install the wheel "
+            "from the release assets."
         ) from error
 
     required = (

@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 import shlex
 import subprocess
 
 
 DEFAULT_HOSTS_CONFIG = Path("configs/gpu_cluster_hosts.json")
-DEFAULT_SSH_KEY = "/Users/nickita/.ssh/gpu_access_ed25519"
+DEFAULT_SSH_KEY = os.path.expanduser("~/.ssh/gpu_access_ed25519")
 
 
 REMOTE_COMMANDS = {
