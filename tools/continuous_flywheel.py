@@ -151,9 +151,10 @@ def record_anchor_telemetry(
 def _atomic_json(p: Path, obj) -> None:
     tmp = p.with_suffix(p.suffix + ".tmp")
     tmp.parent.mkdir(parents=True, exist_ok=True)
-    tmp.write_text(json.dumps(obj, indent=2, sort_keys=True))
-    tmp.flush()
-    os.fsync(tmp.fileno())
+    with open(tmp, "w") as f:
+        f.write(json.dumps(obj, indent=2, sort_keys=True))
+        f.flush()
+        os.fsync(f.fileno())
     os.replace(tmp, p)
 
 
@@ -161,9 +162,10 @@ def _atomic_write_text(p: Path, text: str) -> None:
     """Atomic text write: temp + fsync + os.replace. Prevents truncation on crash."""
     tmp = p.with_suffix(p.suffix + ".tmp")
     tmp.parent.mkdir(parents=True, exist_ok=True)
-    tmp.write_text(text)
-    tmp.flush()
-    os.fsync(tmp.fileno())
+    with open(tmp, "w") as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
     os.replace(tmp, p)
 
 
