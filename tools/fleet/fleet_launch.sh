@@ -138,25 +138,32 @@ tools/train_bc.py --data $DATA --checkpoint $OUT/model.pt --report $OUT/report.j
   CADENCE=120
   PROG="grep -oE 'step=[0-9]+/[0-9]+|epoch [0-9]+' $OUT/run.log 2>/dev/null | tail -1"
 else
-  # generation: guards ON (no --skip-guards); the tool re-runs prelaunch_guard, and
+  # generation: ONE generator PER PHYSICAL GPU. The generator is single-device
+  # (all workers use --device cuda = the one visible GPU), so we pin each process
+  # with CUDA_VISIBLE_DEVICES=$g and give each a DISJOINT GAMES-wide seed sub-block
+  # [BASE+i*GAMES, BASE+(i+1)*GAMES). Exposing all GPUs to one process (the old
+  # bug) ran everything on gpu0 while claiming NGPU*WORKERS*GAMES seeds. guards ON;
   # ledger_overlap excludes our own claim via --ledger-claim-label=$CLAIM_ID.
-  CMD="cd $TREE && CUDA_VISIBLE_DEVICES=$GPU_CSV CUDA_MPS_PIPE_DIRECTORY=/tmp/mps_pipe_host \
-$GEN_PY tools/generate_gumbel_selfplay_data.py --out-dir $OUT --checkpoint $CKPT --device cuda \
---games $GAMES --workers $WORKERS --base-seed $BASE_SEED --shard-size 2048 \
+  CMD="cd $TREE && i=0; for g in \$(echo '$GPU_CSV' | tr ',' ' '); do \
+CUDA_VISIBLE_DEVICES=\$g CUDA_MPS_PIPE_DIRECTORY=/tmp/mps_pipe_host \
+$GEN_PY tools/generate_gumbel_selfplay_data.py --out-dir $OUT/gpu\$g --checkpoint $CKPT --device cuda \
+--games $GAMES --workers $WORKERS --base-seed \$(( $BASE_SEED + i * $GAMES )) --shard-size 2048 \
 --n-full $NFULL --n-fast 16 --p-full $PFULL --c-visit 50.0 --c-scale 0.03 \
 --max-decisions 600 --max-depth 80 --temperature-decisions 90 \
 --correct-rust-chance-spectra --lazy-interior-chance --public-observation \
 --track 2p_no_trade --vps-to-win 10 --format npz --score-actions \
---ledger-claim-label $CLAIM_ID"
+--ledger-claim-label $CLAIM_ID > $OUT/gpu\$g.log 2>&1 & \
+i=\$(( i + 1 )); done; echo \"launched \$i per-GPU generators on GPUs $GPU_CSV\"; wait"
   CADENCE=60
-  PROG="ls $OUT/*.npz 2>/dev/null | wc -l"
+  PROG="ls $OUT/gpu*/*.npz 2>/dev/null | wc -l"
 fi
 
 # --- CLAIM row (append BEFORE guard so ledger_overlap sees + excludes our own) ---
 if [ "$ROLE" = "train" ]; then
   CLAIM_ROW="# (train role claims no seed range) claim=$CLAIM_ID $ALIAS train $DATE_UTC"
 else
-  END=$(( BASE_SEED + GAMES * WORKERS * NGPU ))
+  # one generator per GPU, each consuming a disjoint GAMES-wide sub-block → NGPU*GAMES total.
+  END=$(( BASE_SEED + GAMES * NGPU ))
   CLAIM_ROW="[$BASE_SEED – $END) | fleet/$ALIAS | $ROLE n$NFULL p$PFULL gpus=$GPU_CSV claim=$CLAIM_ID | $DATE_UTC"
 fi
 
