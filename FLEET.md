@@ -36,7 +36,7 @@ launch new work there, and drop any lingering A100 entries from your local
   ```
   curl -fsSL https://raw.githubusercontent.com/nickita-khylkouski/catan-zero-public/v1.0-deploy/tools/install_v1_freeze.sh | bash
   ```
-  `tools/install_v1_freeze.sh` — clone+checkout tag → py3.11 venv → torch cu128 → `pip install -e .[dev,rl]` → `catanatron_rs` 0.1.3 cp311 wheel (from `$CATAN_RS_WHEEL` if set, else auto-fetched from the release) → env-doctor → rust-featurize parity smoke. `CATAN_REPO` also accepts a local git-bundle path as an offline fallback.
+  `tools/install_v1_freeze.sh` — clone+checkout tag → py3.11 venv → torch cu128 → `pip install -e vendor/catanatron` → `pip install -e .[dev,rl]` → `catanatron_rs` 0.1.3 cp311 wheel (from `$CATAN_RS_WHEEL` if set, else auto-fetched from the release) → env-doctor → rust-featurize parity smoke. `CATAN_REPO` also accepts a local git-bundle path as an offline fallback.
 - Fleet acceptance (after install, before the box joins rotation):
   ```
   NOOP_ATOL=1e-4 PY=<venv>/bin/python bash scripts/gate.sh --only noop

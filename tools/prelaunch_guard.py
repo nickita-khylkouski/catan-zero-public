@@ -87,12 +87,16 @@ def _fail(guard: str, reason: str, *, host_only: bool = False, **details: Any) -
 
 
 def discover_configurable_flags(parser: argparse.ArgumentParser) -> list[str]:
-    """Return every optional (non-required) flag's preferred spelling.
+    """Return every optional (non-required) flag's recognized spellings.
 
     These are exactly the flags a caller CAN silently omit and fall back to
     whatever default the script's author picked -- the class of bug behind
     the c_scale 1.0-vs-0.1 near-miss and 6+ prior incidents. Required flags
     are excluded: argparse already forces those to be explicit.
+
+    All option strings for each action are returned (not just the longest),
+    so ``BooleanOptionalAction`` pairs like ``--public-observation`` and
+    ``--no-public-observation`` are both recognized by the stale-flag check.
     """
     flags: list[str] = []
     for action in parser._actions:  # noqa: SLF001 -- argparse has no public introspection API
@@ -102,7 +106,7 @@ def discover_configurable_flags(parser: argparse.ArgumentParser) -> list[str]:
             continue
         if action.required:
             continue
-        flags.append(max(action.option_strings, key=len))
+        flags.extend(action.option_strings)
     return flags
 
 
@@ -111,10 +115,19 @@ def guard_cli_flag_lint(
     critical_flags: Sequence[str],
     *,
     parser: argparse.ArgumentParser | None = None,
+    expected_values: Mapping[str, Any] | None = None,
 ) -> GuardResult:
     """FAIL if any `critical_flags` entry is absent from `argv` (as a bare
     token `--flag` or `--flag=value`), meaning the launch would silently
     rely on that flag's parser default rather than an explicit value.
+
+    `expected_values` (optional) maps a subset of the critical flags to the
+    exact resolved value they must have. When a parser is provided, this
+    guard parses ``argv`` and compares the resolved value to the expected
+    value, so passing ``--c-scale 0.1`` or ``--no-public-observation`` is
+    caught as a FAIL even though the token itself is present. This closes
+    the "token-only" gap where unsafe values could masquerade as explicit
+    flags (CAT-69 follow-up / CAT-88 silent-default class).
 
     `critical_flags` is normally a hand-maintained list, which can itself
     drift out of sync with the target script (a flag gets renamed or
@@ -127,9 +140,15 @@ def guard_cli_flag_lint(
     reported as stale config rather than silently treated as present-or-
     absent. Without a `parser`, `critical_flags` is trusted as given.
     """
+    expected_values = dict(expected_values or {})
+    all_critical = list(critical_flags)
+    for flag in expected_values:
+        if flag not in all_critical:
+            all_critical.append(flag)
+
     if parser is not None:
         real_flags = set(discover_configurable_flags(parser))
-        stale = [flag for flag in critical_flags if flag not in real_flags]
+        stale = [flag for flag in all_critical if flag not in real_flags]
         if stale:
             return _fail(
                 "cli_flag_lint",
@@ -141,22 +160,62 @@ def guard_cli_flag_lint(
                 stale_flags=stale,
             )
 
+    def _is_present(flag: str) -> bool:
+        if flag in argv_set:
+            return True
+        if any(tok.startswith(flag + "=") for tok in argv_tokens):
+            return True
+        if parser is not None:
+            action = parser._option_string_actions.get(flag)
+            if action is not None:
+                for option in action.option_strings:
+                    if option in argv_set:
+                        return True
+                    if any(tok.startswith(option + "=") for tok in argv_tokens):
+                        return True
+        return False
+
     argv_tokens = list(argv)
     argv_set = set(argv_tokens)
-    missing = [
-        flag
-        for flag in critical_flags
-        if flag not in argv_set and not any(tok.startswith(flag + "=") for tok in argv_tokens)
-    ]
+    missing = [flag for flag in all_critical if not _is_present(flag)]
     if missing:
         return _fail(
             "cli_flag_lint",
             f"launch omits explicit value(s) for critical flag(s), silently relying on "
-            f"the parser default: {missing}. Pass every flag in {list(critical_flags)!r} "
+            f"the parser default: {missing}. Pass every flag in {all_critical!r} "
             "explicitly (CLI-default-override trap, 7+ prior incidents).",
             missing_flags=missing,
         )
-    return _ok("cli_flag_lint", f"all {len(critical_flags)} critical flag(s) explicit in argv")
+
+    if expected_values and parser is not None:
+        try:
+            parsed = parser.parse_args(argv_tokens)
+        except SystemExit as exc:
+            # argparse exits on malformed argv; treat as a guard failure so the
+            # caller gets a reason instead of the whole process terminating.
+            return _fail(
+                "cli_flag_lint",
+                f"could not parse argv for value-checking: {exc}",
+            )
+        value_errors: list[str] = []
+        for flag, expected in expected_values.items():
+            action = parser._option_string_actions.get(flag)
+            if action is None:
+                # Should have been caught by stale-flag check above; defensive.
+                value_errors.append(f"{flag}: not a real flag")
+                continue
+            actual = getattr(parsed, action.dest, None)
+            if actual != expected:
+                value_errors.append(f"{flag}={actual!r} (expected {expected!r})")
+        if value_errors:
+            return _fail(
+                "cli_flag_lint",
+                f"critical flag(s) resolved to an unsafe value: {value_errors}. "
+                "Pass the production value explicitly, or update the guard config.",
+                value_errors=value_errors,
+            )
+
+    return _ok("cli_flag_lint", f"all {len(all_critical)} critical flag(s) explicit in argv")
 
 
 # ---------------------------------------------------------------------------
@@ -595,7 +654,9 @@ def guard_ledger_overlap(
 ) -> GuardResult:
     """Refuse any launch whose [base_seed, base_seed+games) range overlaps a
     range already claimed in the cross-host SEED_LEDGER.md. Fails CLOSED when
-    the ledger is missing (a launch that cannot be verified is refused).
+    the ledger is missing (a launch that cannot be verified is refused), EXCEPT
+    for seed ranges that live entirely inside the VAL-ONLY band [6.19B, 6.2B),
+    which are validation-local and do not need cross-host ledger coverage.
 
     CAT-124: the canonical launch order is claim-then-verify (append the claim
     row to the ledger, then run guards), so by guard time this launch's OWN
@@ -610,6 +671,12 @@ def guard_ledger_overlap(
         return _ok("ledger_overlap", f"empty seed range [{requested[0]}, {requested[1]}); nothing to claim")
     resolved = _resolve_seed_ledger_path(ledger_path)
     if not resolved.exists():
+        if VAL_ONLY_SEED_RANGE[0] <= requested[0] and requested[1] <= VAL_ONLY_SEED_RANGE[1]:
+            return _ok(
+                "ledger_overlap",
+                f"[{requested[0]}, {requested[1]}) is inside the VAL-ONLY band; cross-host "
+                "ledger check is not required and the canonical ledger is missing.",
+            )
         return _fail(
             "ledger_overlap",
             f"canonical seed ledger not found at {resolved} (tried explicit arg, "

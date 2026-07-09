@@ -10,7 +10,13 @@
           "--n-fast",
           "--base-seed",
           "--games"
-        ]
+        ],
+        "expected_values": {
+          "--c-scale": 0.03,
+          "--temperature-decisions": 90,
+          "--public-observation": true,
+          "--lazy-interior-chance": true
+        }
       }
     },
     {

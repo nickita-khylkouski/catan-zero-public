@@ -583,6 +583,7 @@ def _build_summary(
         "sprt": sprt,
         "pair_sprt": pair_sprt,
         "pentanomial_sprt": pentanomial_sprt,
+        "verdict": pentanomial_sprt["decision"],
         "pair_diagnostics": pair_diagnostics,
         "pairs_decisive": decisive_pairs,
         "pairs_split_excluded": pair_diagnostics["split_pairs"],

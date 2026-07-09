@@ -35,6 +35,9 @@
 set -uo pipefail
 cd "$(dirname "$0")/.." || exit 1
 
+# CAT-126: generation opens many zstd/npz shards; 1024 is not enough.
+ulimit -n 65536
+
 CKPT="${CKPT:-runs/bc/gen2A_20260706/checkpoint.pt}"
 WORKERS="${WORKERS:-16}"
 GAMES="${GAMES:-1500}"
@@ -51,6 +54,34 @@ GEN_ARGS=(
 # GEN_EXTRA_ARGS: space-separated extra CLI flags appended at launch (the
 # gen-3 runbook's gate-dependent flag flips, e.g. "--exact-budget-sh").
 read -r -a EXTRA_ARGS <<< "${GEN_EXTRA_ARGS:-}"
+
+# Validate GEN_EXTRA_ARGS: only the runbook allowlist is permitted, and
+# --skip-guards is categorically forbidden (it would bypass the prelaunch guard
+# that the rest of this script relies on to prevent silent default overrides).
+validate_extra_args() {
+  local i=0
+  while [ "$i" -lt "${#EXTRA_ARGS[@]}" ]; do
+    local tok="${EXTRA_ARGS[$i]}"
+    case "$tok" in
+      --exact-budget-sh|--rust-featurize)
+        i=$((i+1));;
+      --exact-budget-sh-min-n)
+        # skip the required numeric argument
+        if [ "$((i+1))" -ge "${#EXTRA_ARGS[@]}" ]; then
+          echo "mps_rollout: $tok requires a value" >&2; exit 1
+        fi
+        i=$((i+2));;
+      --skip-guards|--no-public-observation|--no-lazy-interior-chance|--c-scale|--c-visit|--p-full|--n-full|--n-fast|--temperature-decisions|--public-observation|--lazy-interior-chance)
+        echo "mps_rollout: GEN_EXTRA_ARGS token '$tok' is forbidden; it can override the production recipe or disable guards" >&2; exit 1;;
+      --*)
+        echo "mps_rollout: GEN_EXTRA_ARGS token '$tok' is not in the allowlist" >&2; exit 1;;
+      *)
+        # bare value (e.g. the number after --exact-budget-sh-min-n) is fine
+        i=$((i+1));;
+    esac
+  done
+}
+validate_extra_args
 
 export CUDA_MPS_PIPE_DIRECTORY=/tmp/mps_pipe_host
 export CUDA_MPS_LOG_DIRECTORY=/tmp/mps_log_host
@@ -90,10 +121,13 @@ launch_gpu() {
   local gpu="$1" seed="$2"
   local out="${OUT_PREFIX}/gpu${gpu}"
   mkdir -p "$out"
+  # CAT-132: append logs across restarts so prior stdout is not silently lost;
+  # disown so a closing ssh session cannot SIGHUP the nohup'd job.
   CUDA_VISIBLE_DEVICES=$gpu nohup "${GEN_PY:-.venv/bin/python}" tools/generate_gumbel_selfplay_data.py \
     --out-dir "$out" --games "$GAMES" --workers "$WORKERS" \
     --base-seed "$seed" "${GEN_ARGS[@]}" ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} \
-    > "$out/launch.log" 2>&1 &
+    >> "$out/launch.log" 2>&1 &
+  disown
   echo "gpu$gpu: launched pid $! seed=$seed workers=$WORKERS (MPS) -> $out"
 }
 
@@ -106,7 +140,8 @@ launch_gpu_no_mps() {
   env -u CUDA_MPS_PIPE_DIRECTORY -u CUDA_MPS_LOG_DIRECTORY \
     CUDA_VISIBLE_DEVICES=$gpu nohup "${GEN_PY:-.venv/bin/python}" tools/generate_gumbel_selfplay_data.py \
     --out-dir "$out" --games "$GAMES" --workers 8 \
-    --base-seed "$seed" "${GEN_ARGS[@]}" > "$out/launch.log" 2>&1 &
+    --base-seed "$seed" "${GEN_ARGS[@]}" >> "$out/launch.log" 2>&1 &
+  disown
   echo "gpu$gpu: ROLLED BACK to 8 workers no-MPS, pid $! seed=$seed -> $out"
 }
 

@@ -336,15 +336,19 @@ def test_continuous_flywheel_sample_argv_produces_expected_namespace(tmp_path):
     ],
 )
 def test_static_guard_config_critical_flags_are_not_stale(module, launcher):
-    """The committed configs/guards/<launcher>.json critical_flags must all be
-    real optional flags on the CURRENT parser -- this is exactly the "stale
-    hardcoded flag list" failure mode guard_cli_flag_lint's parser cross-check
-    exists to catch (CAT-69 review comment bd5b777)."""
+    """The committed configs/guards/<launcher>.json critical_flags and any
+    expected_values keys must all be real optional flags on the CURRENT parser
+    -- this is exactly the "stale hardcoded flag list" failure mode
+    guard_cli_flag_lint's parser cross-check exists to catch (CAT-69 review
+    comment bd5b777)."""
     parser = module.build_parser()
     for spec in launcher_guards.load_static_guard_specs(launcher):
         if spec["name"] != "cli_flag_lint":
             continue
-        critical_flags = spec["args"]["critical_flags"]
+        critical_flags = list(spec["args"]["critical_flags"])
+        for flag in spec["args"].get("expected_values", {}):
+            if flag not in critical_flags:
+                critical_flags.append(flag)
         result = prelaunch_guard.guard_cli_flag_lint(
             argv=critical_flags,  # every critical flag present -> nothing "missing"
             critical_flags=critical_flags,
@@ -375,6 +379,19 @@ def _write_generation_manifest(data_dir: Path, *, base_seed: int, games: int) ->
 
 
 class TestGenerateGumbelSelfplayGuardWiring:
+    # Production recipe flags that the generate guard config now value-checks.
+    # Each test that should pass cli_flag_lint must include these (or skip them
+    # intentionally to test a guard failure).
+    _GEN_RECIPE_FLAGS = [
+        "--c-scale", "0.03",
+        "--c-visit", "50.0",
+        "--n-full", "64",
+        "--n-fast", "16",
+        "--temperature-decisions", "90",
+        "--public-observation",
+        "--lazy-interior-chance",
+    ]
+
     def test_seed_ledger_collision_refuses_launch(self, tmp_path):
         claims_dir = tmp_path / ".seed_claims"
         claims_dir.mkdir()
@@ -387,8 +404,7 @@ class TestGenerateGumbelSelfplayGuardWiring:
         parser = gen_cli.build_parser()
         argv = [
             "--out-dir", str(out_dir_b), "--base-seed", "1032", "--games", "64",
-            "--c-scale", "0.1", "--c-visit", "50", "--n-full", "64", "--n-fast", "16",
-        ]
+        ] + self._GEN_RECIPE_FLAGS
         args = parser.parse_args(argv)
         specs = gen_cli._build_guard_specs(args, argv, parser)
         # Point seed_ledger at the fixture claims dir, not the real default location.
@@ -402,8 +418,7 @@ class TestGenerateGumbelSelfplayGuardWiring:
         parser = gen_cli.build_parser()
         argv = [
             "--out-dir", str(tmp_path / "run"), "--base-seed", str(VAL_ONLY_SEED), "--games", "8",
-            "--c-scale", "0.1", "--c-visit", "50", "--n-full", "64", "--n-fast", "16",
-        ]
+        ] + self._GEN_RECIPE_FLAGS
         args = parser.parse_args(argv)
         specs = gen_cli._build_guard_specs(args, argv, parser)
         launcher_guards.run_or_refuse(specs, launcher="generate_gumbel_selfplay_data", skip=False)
@@ -434,8 +449,7 @@ class TestGenerateGumbelSelfplayGuardWiring:
         parser = gen_cli.build_parser()
         argv = [
             "--out-dir", str(tmp_path / "run"), "--base-seed", "1", "--games", "8",
-            "--c-scale", "0.1", "--c-visit", "50", "--n-full", "64", "--n-fast", "16",
-        ] + argv_extra
+        ] + self._GEN_RECIPE_FLAGS + argv_extra
         args = parser.parse_args(argv)
         specs = gen_cli._build_guard_specs(args, argv, parser)
         overlap = next(s for s in specs if s["name"] == "ledger_overlap")
@@ -481,6 +495,7 @@ class TestTrainBcGuardWiring:
             "--data", str(data_dir),
             "--checkpoint", str(tmp_path / "ckpt.pt"),
             "--report", str(tmp_path / "report.json"),
+            "--mask-hidden-info",
             "--optimizer", "adam", "--weight-decay", "0.0",
             "--truncated-vp-margin-value-weight", "0.25", "--lr-schedule", "flat",
         ]
@@ -498,6 +513,7 @@ class TestTrainBcGuardWiring:
             "--data", str(data_dir),
             "--checkpoint", str(tmp_path / "ckpt.pt"),
             "--report", str(tmp_path / "report.json"),
+            "--mask-hidden-info",
             "--optimizer", "adam", "--weight-decay", "0.0",
             "--truncated-vp-margin-value-weight", "0.25", "--lr-schedule", "flat",
         ]

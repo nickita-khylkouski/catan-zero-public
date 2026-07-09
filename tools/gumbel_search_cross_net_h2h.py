@@ -579,6 +579,8 @@ def _build_summary(
         "sprt": sprt,
         "pair_sprt": pair_sprt,
         "pentanomial_sprt": pentanomial_sprt,
+        # Recommended gate verdict: trinomial GSPRT over all complete pairs.
+        "verdict": pentanomial_sprt["decision"],
         "pair_diagnostics": pair_diagnostics,
         "pairs_decisive": pair_diagnostics["ww_pairs"] + pair_diagnostics["ll_pairs"],
         "pairs_split_excluded": pair_diagnostics["split_pairs"],

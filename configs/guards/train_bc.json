@@ -7,8 +7,12 @@
           "--optimizer",
           "--weight-decay",
           "--truncated-vp-margin-value-weight",
-          "--lr-schedule"
-        ]
+          "--lr-schedule",
+          "--mask-hidden-info"
+        ],
+        "expected_values": {
+          "--mask-hidden-info": true
+        }
       }
     },
     {

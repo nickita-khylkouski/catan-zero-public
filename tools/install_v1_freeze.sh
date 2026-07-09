@@ -76,6 +76,10 @@ python -m pip install --quiet --upgrade pip
 #    then the local rust wheel (the one dep pip cannot resolve from PyPI); + modal.
 python -m pip install "torch>=2.11" --index-url "$TORCH_INDEX" \
   || { echo "[install] cu128 index failed; falling back to default torch index"; python -m pip install "torch>=2.11"; }
+# catanatron is vendored under vendor/catanatron and is NOT on PyPI in the
+# exact version this repo uses; install it from the local copy before the
+# main package so the editable dependency is available for catan-zero tests.
+python -m pip install -e vendor/catanatron
 python -m pip install -e '.[dev,rl]'
 if [ ! -f "$CATAN_RS_WHEEL" ]; then
   RS_WHEEL_NAME="catanatron_rs-0.1.3-cp311-cp311-manylinux_2_34_x86_64.whl"
