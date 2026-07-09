@@ -152,6 +152,18 @@ def _atomic_json(p: Path, obj) -> None:
     tmp = p.with_suffix(p.suffix + ".tmp")
     tmp.parent.mkdir(parents=True, exist_ok=True)
     tmp.write_text(json.dumps(obj, indent=2, sort_keys=True))
+    tmp.flush()
+    os.fsync(tmp.fileno())
+    os.replace(tmp, p)
+
+
+def _atomic_write_text(p: Path, text: str) -> None:
+    """Atomic text write: temp + fsync + os.replace. Prevents truncation on crash."""
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    tmp.parent.mkdir(parents=True, exist_ok=True)
+    tmp.write_text(text)
+    tmp.flush()
+    os.fsync(tmp.fileno())
     os.replace(tmp, p)
 
 
@@ -204,7 +216,7 @@ def _npz_rows_cached(npz: Path) -> int | None:
     rows = _npz_rows(npz)
     if rows is not None:
         try:
-            sidecar.write_text(str(rows))
+            _atomic_write_text(sidecar, str(rows))
         except OSError:
             pass
     return rows
@@ -246,7 +258,7 @@ class Runner:
                 sp = out_dir / f"stub_shard_{round_idx:03d}_{k}.npz"
                 sp.write_bytes(b"")
                 shards.append({"path": str(sp), "rows": 1024})
-            (out_dir / "manifest.json").write_text(json.dumps({"shards": shards, "rows": 2048}))
+            _atomic_json(out_dir / "manifest.json", {"shards": shards, "rows": 2048})
             return {"ok": True, "out_dir": str(out_dir), "note": "dry-run stub", "rows": 2048}
         archive = list_archive(self.loop_dir)
         pool_manifest_path = out_dir.parent / f"opponent_pool_r{round_idx:03d}.json"
@@ -562,7 +574,7 @@ def reconcile_pending_promotion(loop_dir: Path, journal: dict, gen_root: Path) -
         out_dir = gen_root / f"round_{int(round_idx):03d}"
         if out_dir.exists():
             try:
-                (out_dir / ".round_done").write_text(last["decision"])
+                _atomic_write_text(out_dir / ".round_done", last["decision"])
             except OSError:
                 pass
 
@@ -794,7 +806,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             journal["rounds"].append(rec)
             save_journal(loop_dir, journal)
             try:
-                (out_dir / ".round_done").write_text(rec["decision"])
+                _atomic_write_text(out_dir / ".round_done", rec["decision"])
             except OSError:
                 pass
             if streak >= 3:
@@ -892,7 +904,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             journal["rounds"].append(rec)
         save_journal(loop_dir, journal)
         try:
-            (out_dir / ".round_done").write_text(rec["decision"])
+            _atomic_write_text(out_dir / ".round_done", rec["decision"])
         except OSError:
             pass
 

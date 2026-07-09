@@ -61,6 +61,8 @@ def save_state(loop_dir: Path, state: dict) -> None:
     path = loop_dir / "loop_state.json"
     tmp = path.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(state, indent=2, sort_keys=True))
+    tmp.flush()
+    os.fsync(tmp.fileno())
     os.replace(tmp, path)
 
 

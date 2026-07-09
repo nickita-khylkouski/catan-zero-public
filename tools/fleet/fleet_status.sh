@@ -41,7 +41,7 @@ for alias in $(fleet_aliases); do
   [ "$TARGET" = "all" ] || [ "$TARGET" = "$alias" ] || continue
   ip="$(fleet_host "$alias")" || continue
   (
-    out=$(timeout 25 ssh -o ConnectTimeout=8 -o BatchMode=yes -i "$KEY" ubuntu@"$ip" "bash -s" <<< "$REMOTE" 2>/dev/null)
+    out=$(timeout 25 ssh -o ConnectTimeout=8 -o BatchMode=yes -o StrictHostKeyChecking=accept-new -i "$KEY" ubuntu@"$ip" "bash -s" <<< "$REMOTE" 2>/dev/null)
     [ -z "$out" ] && out="UNREACHABLE"
     printf "%-6s %-16s %s\n" "$alias" "$ip" "$out" > "$TMP/$alias"
   ) &

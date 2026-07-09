@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
+import os
 from pathlib import Path
 import subprocess
 import time
@@ -127,7 +128,7 @@ find runs/teacher runs/scoreboards -maxdepth 2 -type f -name '*.log' -mmin +10 -
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="One-shot teacher-phase cluster status.")
-    parser.add_argument("--ssh-key", default="/Users/nickita/.ssh/gpu_access_ed25519")
+    parser.add_argument("--ssh-key", default=os.path.expanduser("~/.ssh/gpu_access_ed25519"))
     parser.add_argument("--hosts-config", default=str(DEFAULT_HOSTS_CONFIG))
     parser.add_argument("--timeout", type=int, default=20)
     parser.add_argument(

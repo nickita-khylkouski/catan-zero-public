@@ -96,7 +96,7 @@ REMOTE_EOF
 run_box() { # $1=ip $2=alias
   local ip="$1" alias="$2"
   local out
-  out=$(timeout 60 ssh -o ConnectTimeout=10 -o BatchMode=yes -i "$KEY" ubuntu@"$ip" \
+  out=$(timeout 60 ssh -o ConnectTimeout=10 -o BatchMode=yes -o StrictHostKeyChecking=accept-new -i "$KEY" ubuntu@"$ip" \
         "bash -s -- $((1-DRY))" <<< "$REMOTE" 2>/dev/null)
   if [ -z "$out" ]; then echo "[$alias $ip] UNREACHABLE"; else echo "[$alias $ip]"; echo "$out" | sed 's/^/  /'; fi
 }
