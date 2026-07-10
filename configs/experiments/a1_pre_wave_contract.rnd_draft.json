@@ -7,7 +7,7 @@
       "c_visit": 50.0,
       "c_scale": "__UNRESOLVED__",
       "prior_temperature": 1.0,
-      "n_full": "__UNRESOLVED__",
+      "n_full": 128,
       "n_fast": 16,
       "p_full": 0.25,
       "n_full_wide": "__UNRESOLVED__",

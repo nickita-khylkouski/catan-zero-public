@@ -3,8 +3,8 @@
 Status: **near-final and deliberately unsealable**. This file materializes only
 choices already supported by the local plans and immutable evidence. It does
 not seal or render a contract, create output directories, allocate production
-seeds, or launch generation. The checked-in JSON currently has 14 unresolved
-fields: the binding S1/S2/S3 search decisions and the synchronized fleet seed
+seeds, or launch generation. The checked-in JSON currently has 13 unresolved
+fields: the remaining binding S1/S3 search decisions and the synchronized fleet seed
 base/ledger. There is also one **conditional pre-seal action** outside that
 placeholder count: if typed S1 selects `c_scale=0.1` or `0.3`, the static
 generation guard must be synchronized and provenance-stamped before runtime
@@ -23,7 +23,8 @@ hashes are frozen. A `c_scale=0.03` selection requires no guard mutation.
   209-191 result versus gen3 is evidence that it is challenging, not evidence
   that it was promoted.
 - The production regime is two-player/no-trade at 10 VP with public-observation
-  masking. `p_full=0.25`, `n_fast=16`, lazy interior chance, corrected Rust
+  masking. The operator fixed global `n_full=128` for A1 on 2026-07-09; no n64
+  arm and no global n196 arm are authorized. `p_full=0.25`, `n_fast=16`, lazy interior chance, corrected Rust
   chance spectra, and `max_decisions=600` are fixed. Exact-budget sequential
   halving, late temperature, belief spectra, uncertainty, raw-policy fallback,
   Rust featurization, and eval-server generation are off.
@@ -108,7 +109,7 @@ time of inspection:
 
 | local file/value | SHA-256 |
 |---|---|
-| `a1_pre_wave_contract.rnd_draft.json` | `563769f6858952a0ba539c6455ee7196780b59b4bc31878e5594b07287b2b187` |
+| `a1_pre_wave_contract.rnd_draft.json` | `38454992b08bf1be4f7c93713f0fa4e275d318ca82337127fc0aa498ae84750a` |
 | `a1_pre_wave_contract.template.json` | `b6e7ba32155d6e3521132fc453e74a505dc36eaf057ea020630a5c574865a260` |
 | `tools/a1_pre_wave_contract.py` | `e1dbb91413616a4d323b45967068f39695a334ad229628b684509d1cdb7a78af` |
 | `tools/build_memmap_corpus.py` | `c21f4a304aee19944f3882af1bd72ada7c6d8822f31a09b0d3950317987ffbec` |
@@ -122,7 +123,6 @@ time of inspection:
   "schema_version": "a1-pre-wave-contract-draft-v2",
   "unresolved": [
     "$.science.search.c_scale",
-    "$.science.search.n_full",
     "$.science.search.n_full_wide",
     "$.science.search.n_full_wide_threshold",
     "$.science.search.wide_roots_always_full",
@@ -139,7 +139,7 @@ time of inspection:
 }
 ```
 
-Before sealing, replace only those placeholders from replayable typed S1/S2/S3
+Before sealing, replace only those placeholders from replayable typed S1/S3
 adjudicator envelopes and a synchronized production seed ledger. Do not infer a
 search choice from defaults or informal probe output, and do not fabricate a
 seed allocation from the stale R&D-host ledger.
