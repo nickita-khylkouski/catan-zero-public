@@ -26,6 +26,7 @@ from tools.rnd_topology_holdout_export import (
     RUN_SCHEMA,
     _DYNAMIC_TRAIN_CONFIG_FIELDS,
     _EXECUTING_LEARNER_SOURCE_FILES,
+    _a1_legacy_canonical_sha,
     _resolve_report_repo_path,
     _validate_experiment_self_hash,
     export_holdout_evidence,
@@ -211,8 +212,11 @@ def _fixtures(tmp_path: Path) -> dict[str, Path | dict]:
             "records_sha256": "sha256:" + _canonical_sha(records),
         },
     )
-    contract_semantic = {"schema_version": "fixture-a1-contract/v1"}
-    contract_sha = "sha256:" + _canonical_sha(contract_semantic)
+    contract_semantic = {
+        "schema_version": "fixture-a1-contract/v1",
+        "non_ascii_note": "Café",
+    }
+    contract_sha = "sha256:" + _a1_legacy_canonical_sha(contract_semantic)
     holdout_payload = json.loads(holdout.read_text())
     holdout_payload["a1_contract_sha256"] = contract_sha
     _write(holdout, holdout_payload)
@@ -544,6 +548,20 @@ def test_report_relative_artifact_path_rejects_parent_traversal(
     monkeypatch.setattr(holdout_exporter, "_ROOT", repo)
     with pytest.raises(ExportError, match="contains traversal"):
         _resolve_report_repo_path("../outside/checkpoint.pt", label="checkpoint")
+
+
+def test_a1_contract_digest_uses_legacy_ascii_escaping() -> None:
+    payload = {"label": "Café", "nested": {"snowman": "☃"}}
+    expected = hashlib.sha256(
+        json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode()
+    ).hexdigest()
+    assert _a1_legacy_canonical_sha(payload) == expected
+    assert _a1_legacy_canonical_sha(payload) != holdout_exporter._canonical_sha(payload)
 
 
 def test_real_preregistration_self_hash_and_recipe_fields_are_valid() -> None:

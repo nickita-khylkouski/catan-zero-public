@@ -102,6 +102,20 @@ def _canonical_sha(value: Any) -> str:
     ).hexdigest()
 
 
+def _a1_legacy_canonical_sha(value: Any) -> str:
+    """Match the immutable A1 contract's historical ASCII-escaped digest."""
+
+    return hashlib.sha256(
+        json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
 def _validate_corpus_payloads(corpus_dir: Path) -> str:
     meta = _load_object(corpus_dir / "corpus_meta.json", name="corpus metadata")
     try:
@@ -563,7 +577,7 @@ def _validate_a1_artifact_relocation(
     semantic.pop("contract_sha256", None)
     if (
         contract.get("contract_sha256") != contract_sha
-        or contract_sha != "sha256:" + _canonical_sha(semantic)
+        or contract_sha != "sha256:" + _a1_legacy_canonical_sha(semantic)
     ):
         raise ExportError("relocated contract semantic hash differs from audit binding")
 
