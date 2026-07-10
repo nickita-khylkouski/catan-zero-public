@@ -8,6 +8,7 @@ import subprocess
 
 ROOT = Path(__file__).resolve().parents[1]
 INSTALLER = ROOT / "tools" / "install_v1_freeze.sh"
+MPS_UNIT = ROOT / "tools" / "fleet" / "systemd" / "nvidia-mps.service"
 WHEEL_NAME = "catanatron_rs-0.1.4-cp311-cp311-manylinux_2_34_x86_64.whl"
 
 
@@ -242,11 +243,29 @@ def test_receipt_is_outside_checkout_and_binds_release_evidence() -> None:
         '"fleet_exporter_fragment_path"',
         '"fleet_exporter_dropin_paths"',
         '"fleet_exporter_effective"',
+        '"nvidia_mps_limit_nofile_soft"',
     ):
         assert field in text
     assert "handle.flush()" in text
     assert "os.fsync(handle.fileno())" in text
     assert "os.replace(temporary, receipt)" in text
+
+
+def test_mps_unit_and_installer_bind_effective_nofile_limit() -> None:
+    unit = MPS_UNIT.read_text(encoding="utf-8")
+    assert unit.splitlines().count("LimitNOFILE=65536") == 1
+
+    text = INSTALLER.read_text(encoding="utf-8")
+    restart = text.index("sudo systemctl restart nvidia-mps.service")
+    inspect = text.index(
+        "systemctl show nvidia-mps.service --property=LimitNOFILESoft --value"
+    )
+    receipt = text.index('"nvidia_mps_limit_nofile_soft"')
+    assert restart < inspect < receipt
+    assert "MPS_REQUIRED_LIMIT_NOFILE_SOFT=65536" in text
+    assert '[[ ! "$CATAN_MPS_LIMIT_NOFILE_SOFT" =~ ^[0-9]+$ ]]' in text
+    assert '"$CATAN_MPS_LIMIT_NOFILE_SOFT" -lt "$MPS_REQUIRED_LIMIT_NOFILE_SOFT"' in text
+    assert "export CATAN_MPS_LIMIT_NOFILE_SOFT" in text
 
 
 def test_exporter_install_removes_legacy_dropins_and_attests_effective_process() -> None:

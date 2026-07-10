@@ -44,6 +44,32 @@ while True:
         ]
         if ignore_generator_term and category == "current_producer":
             argv.append("--dummy-ignore-term")
+        out_dir = Path(argv[argv.index("--out-dir") + 1])
+        environment = {
+            **supervisor.SEALED_RUNTIME_ENVIRONMENT,
+            "PYTHONPATH": f"{repo}/src:{repo}",
+            "CUDA_VISIBLE_DEVICES": "0",
+            **supervisor.CLIENT_ENVIRONMENT,
+            "CATAN_SEED_LEDGER": str(tmp_path / "ledger.md"),
+            "CATAN_A1_CONTRACT_SHA256": "sha256:test-contract",
+            supervisor.CONFIG_REGISTRY_ENVIRONMENT_VARIABLE: str(
+                out_dir / supervisor.CONFIG_REGISTRY_FILENAME
+            ),
+        }
+        source_environment = {
+            **environment,
+            "PYTHONPATH": (
+                f"{supervisor.RUNTIME_REPO_TOKEN}/src:"
+                f"{supervisor.RUNTIME_REPO_TOKEN}"
+            ),
+        }
+        provenance = {
+            "pipeline": "generate",
+            "config_hash": f"generate-{category}",
+            "full_config_hash": f"generate-full-{category}",
+            "config": {},
+        }
+        provenance["provenance_sha256"] = supervisor._digest(provenance)
         command = {
             "job_id": job_id,
             "worker_id": "c1_gpu0",
@@ -52,10 +78,10 @@ while True:
             "category": category,
             "argv": argv,
             "argv_sha256": supervisor._digest(argv),
-            "environment": {
-                "CUDA_VISIBLE_DEVICES": "0",
-                **supervisor.CLIENT_ENVIRONMENT,
-            },
+            "environment": environment,
+            "environment_sha256": supervisor._digest(environment),
+            "render_environment_sha256": supervisor._digest(source_environment),
+            "config_provenance": provenance,
             "must_run_after": [] if previous is None else [previous],
         }
         commands.append(command)
@@ -236,6 +262,7 @@ def test_executor_stop_is_dry_by_default_and_writes_resumable_stopped_receipt(
                 "plan_sha256": plan["plan_sha256"],
                 "status": "launched",
                 "lane_pids": {"c1_gpu0": 123},
+                "launch_pending_worker_id": "c1_gpu0",
             }
         ),
         encoding="utf-8",
@@ -263,6 +290,7 @@ def test_executor_stop_is_dry_by_default_and_writes_resumable_stopped_receipt(
     assert stopped["mps_preserved"] is True
     persisted = json.loads(receipt_path.read_text())
     assert persisted["status"] == "stopped"
+    assert "launch_pending_worker_id" not in persisted
     # The existing exact receipt is deliberately accepted only with --resume;
     # the lane supervisor will quarantine incomplete output before replay.
     assert executor._resume_receipt(receipt_path, plan, resume=True)["status"] == "stopped"

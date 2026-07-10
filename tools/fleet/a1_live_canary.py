@@ -22,7 +22,9 @@ import os
 import re
 import shlex
 import stat
+import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -55,23 +57,89 @@ MUTABLE_VALUE_FLAGS = {
     "--base-seed",
     "--ledger-claim-label",
 }
-REMOTE_AUDIT_SCRIPT = r"""import hashlib,json,pathlib,sys
+REMOTE_AUDIT_SCRIPT = r"""import hashlib,json,pathlib,stat,sys
 items=json.loads(sys.argv[1]);result=[]
-sha=lambda p:'sha256:'+hashlib.sha256(p.read_bytes()).hexdigest()
+digest=lambda b:'sha256:'+hashlib.sha256(b).hexdigest()
+sha=lambda p:digest(p.read_bytes())
 for item in items:
- mpath=pathlib.Path(item['manifest']);apath=pathlib.Path(item['attestation'])
- if not mpath.is_file() or not apath.is_file(): raise SystemExit('missing canary manifest/attestation: '+item['job_id'])
+ mpath=pathlib.Path(item['manifest']);apath=pathlib.Path(item['attestation']);rpath=pathlib.Path(item['config_registry'])
+ if not mpath.is_file() or not apath.is_file() or not rpath.is_file() or rpath.is_symlink(): raise SystemExit('missing canary manifest/attestation/registry: '+item['job_id'])
  m=json.loads(mpath.read_text())
  if int(m.get('games_requested',-1))!=item['games'] or int(m.get('games_completed',-1))!=item['games'] or int(m.get('games_failed',-1))!=0 or m.get('errors') not in ([],None): raise SystemExit('unclean canary manifest: '+item['job_id'])
  if int(m.get('base_seed',-1))!=item['base_seed'] or int(m.get('rows',0))<=0 or int(m.get('simulations_used_total',0))<=0: raise SystemExit('empty/drifted canary manifest: '+item['job_id'])
  if m.get('target_information_regime')!='public_conservation_pimc_v1': raise SystemExit('unsafe target regime: '+item['job_id'])
  if sha(apath)!=item['attestation_sha256']: raise SystemExit('canary attestation drift: '+item['job_id'])
- result.append({'job_id':item['job_id'],'rows':int(m['rows']),'simulations':int(m['simulations_used_total']),'manifest_sha256':sha(mpath),'attestation_sha256':sha(apath)})
+ before=rpath.stat();mode=before.st_mode
+ if not stat.S_ISREG(mode) or mode&0o222: raise SystemExit('canary config registry is not sealed: '+item['job_id'])
+ rbytes=rpath.read_bytes();after=rpath.stat()
+ if (before.st_dev,before.st_ino,before.st_size,before.st_mtime_ns,before.st_ctime_ns)!=(after.st_dev,after.st_ino,after.st_size,after.st_mtime_ns,after.st_ctime_ns) or len(rbytes)!=after.st_size: raise SystemExit('canary config registry mutated during read: '+item['job_id'])
+ records=[json.loads(line) for line in rbytes.decode().splitlines() if line.strip()]
+ if len(records)!=1 or not isinstance(records[0],dict): raise SystemExit('canary config registry count mismatch: '+item['job_id'])
+ record=records[0];expected=item['config_provenance'];config=record.get('config')
+ if set(record)!={'config_hash','full_config_hash','pipeline','timestamp','purpose','config'} or not isinstance(config,dict) or not isinstance(record.get('timestamp'),str) or not isinstance(record.get('purpose'),str): raise SystemExit('canary config registry fields mismatch: '+item['job_id'])
+ full=digest(json.dumps(config,sort_keys=True,separators=(',',':')).encode());short='sha256:'+full.removeprefix('sha256:')[:16]
+ if record.get('pipeline')!='generate' or config.get('pipeline')!='generate' or record.get('full_config_hash')!=full or record.get('config_hash')!=short or m.get('config_hash')!=short or any(record.get(k)!=expected.get(k) for k in ('pipeline','config_hash','full_config_hash','config')): raise SystemExit('canary config registry mismatch: '+item['job_id'])
+ result.append({'job_id':item['job_id'],'rows':int(m['rows']),'simulations':int(m['simulations_used_total']),'manifest_sha256':sha(mpath),'attestation_sha256':sha(apath),'config_hash':short,'full_config_hash':full,'config_registry_sha256':digest(rbytes)})
 print(json.dumps(result,sort_keys=True))"""
+MPS_RUNTIME_ATTESTATION_SCRIPT = r"""import json,pathlib,subprocess,sys,time
+required=int(sys.argv[1]);timeout=float(sys.argv[2]);not_before_ns=int(sys.argv[3]);expected=json.loads(sys.argv[4]);deadline=time.monotonic()+timeout
+def nofile_soft(pid):
+ for line in pathlib.Path(f'/proc/{pid}/limits').read_text().splitlines():
+  if line.startswith('Max open files'):
+   value=line.split()[3]
+   return -1 if value=='unlimited' else int(value)
+ raise RuntimeError(f'Max open files is absent for MPS server {pid}')
+def positive_progress(item):
+ for job in item['jobs']:
+  root=pathlib.Path(job['output']);workers={};valid=True
+  for index in range(job['workers']):
+   worker_id=f'worker_{index:03d}';path=root/worker_id/'progress.json'
+   try:
+    if not path.is_file() or path.is_symlink(): valid=False;break
+    stat=path.stat();payload=json.loads(path.read_text())
+   except (OSError,UnicodeError,json.JSONDecodeError): valid=False;break
+   rows=payload.get('rows');simulations=payload.get('simulations_used_total');failed=payload.get('games_failed')
+   if stat.st_mtime_ns<not_before_ns or type(rows) is not int or rows<=0 or type(simulations) is not int or simulations<=0 or type(failed) is not int or failed!=0:
+    valid=False;break
+   workers[worker_id]={'progress':str(path),'rows':rows,'simulations':simulations,'games_failed':failed,'mtime_ns':stat.st_mtime_ns}
+  if valid and len(workers)==job['workers']:
+   return {'worker_id':item['worker_id'],'gpu':item['gpu'],'job_id':job['job_id'],'output':job['output'],'expected_workers':job['workers'],'workers':workers}
+ return None
+last='no MPS server reported by nvidia-smi'
+while time.monotonic()<deadline:
+ remaining=max(0.0,deadline-time.monotonic())
+ try: response=subprocess.run(['nvidia-smi','--query-compute-apps=pid,process_name','--format=csv,noheader,nounits'],text=True,capture_output=True,check=False,timeout=max(0.1,min(2.0,remaining)))
+ except subprocess.TimeoutExpired:
+  last='nvidia-smi compute query timed out';continue
+ if response.returncode:
+  last='nvidia-smi compute query failed: '+response.stderr;time.sleep(min(0.25,max(0.0,deadline-time.monotonic())));continue
+ pids=sorted({int(line.split(',',1)[0].strip()) for line in response.stdout.splitlines() if 'nvidia-cuda-mps-server' in line})
+ observed={}
+ try:
+  for pid in pids: observed[str(pid)]=nofile_soft(pid)
+ except (FileNotFoundError,ProcessLookupError) as error:
+  last='MPS server changed during inspection: '+repr(error);time.sleep(0.25);continue
+ if observed:
+  low={pid:value for pid,value in observed.items() if value!=-1 and value<required}
+  if low: raise SystemExit(f'MPS server RLIMIT_NOFILE below {required}: {low}')
+  progress={}
+  for item in expected:
+   evidence=positive_progress(item)
+   if evidence is not None: progress[item['worker_id']]=evidence
+  missing=sorted(item['worker_id'] for item in expected if item['worker_id'] not in progress)
+  if not missing:
+   print(json.dumps({'required_nofile_soft':required,'server_nofile_soft':observed,'canary_lane_progress':progress},sort_keys=True));raise SystemExit(0)
+  last='canary lanes without positive progress: '+repr(missing)
+ time.sleep(0.25)
+raise SystemExit(f'MPS/canary runtime proof incomplete within {timeout}s: {last}')"""
 
 
 class CanaryError(RuntimeError):
     """A selective canary cannot be proven isolated and recipe-identical."""
+
+
+class CanaryCleanupError(CanaryError):
+    """A post-launch failure occurred and its exact-stop also failed."""
 
 
 def _canonical(value: Any) -> bytes:
@@ -224,6 +292,33 @@ def _canary_ledger_row(start: int, end: int, job_id: str, claim: str) -> str:
     return f"[{start} – {end}) | VAL-ONLY a1-live-canary/{job_id} claim={claim}"
 
 
+def _canary_config_provenance(
+    source: Mapping[str, Any], *, games: int, base_seed: int
+) -> dict[str, Any]:
+    """Derive the validation-only typed config from its verified source command."""
+
+    provenance = source.get("config_provenance")
+    if not isinstance(provenance, Mapping) or not isinstance(
+        provenance.get("config"), Mapping
+    ):
+        raise CanaryError("source command lacks typed config provenance")
+    config = json.loads(json.dumps(provenance["config"]))
+    fields = config.get("fields")
+    if not isinstance(fields, dict):
+        raise CanaryError("source typed config fields are malformed")
+    fields["games"] = int(games)
+    fields["base_seed"] = int(base_seed)
+    full_hash = _digest(config)
+    result = {
+        "pipeline": "generate",
+        "config_hash": "sha256:" + full_hash.removeprefix("sha256:")[:16],
+        "full_config_hash": full_hash,
+        "config": config,
+    }
+    result["provenance_sha256"] = _digest(result)
+    return result
+
+
 def derive_canary_plan(
     *,
     lock: dict[str, Any],
@@ -299,6 +394,14 @@ def derive_canary_plan(
                 },
             )
             _assert_exact_recipe(source_command["argv"], argv)
+            environment = {
+                **source_command["environment"],
+                "CATAN_SEED_LEDGER": str(canary_ledger),
+                "CATAN_A1_CANARY_ID": canary_id,
+                contract.CONFIG_REGISTRY_ENVIRONMENT_VARIABLE: str(
+                    out_dir / contract.CONFIG_REGISTRY_FILENAME
+                ),
+            }
             source_attestation = source_command["output_attestation"]
             source_path = Path(str(source_attestation["source"]))
             if (
@@ -341,11 +444,13 @@ def derive_canary_plan(
                 "worker_id": worker_id,
                 "argv": argv,
                 "argv_sha256": _digest(argv),
-                "environment": {
-                    **source_command["environment"],
-                    "CATAN_SEED_LEDGER": str(canary_ledger),
-                    "CATAN_A1_CANARY_ID": canary_id,
-                },
+                "environment": environment,
+                "environment_sha256": _digest(environment),
+                "config_provenance": _canary_config_provenance(
+                    source_command,
+                    games=GAMES_PER_JOB,
+                    base_seed=seed_start,
+                ),
                 "ledger_claim": {
                     "validation_only": True,
                     "path": str(canary_ledger),
@@ -515,11 +620,46 @@ def validate_canary_plan(plan: Mapping[str, Any]) -> None:
         raise CanaryError("canary ledger aliases the production ledger")
     for lane in lanes.values():
         for command in lane:
-            if command["environment"].get("CATAN_SEED_LEDGER") != canary_ledger:
-                raise CanaryError("canary command references a non-canary ledger")
             out_dir = Path(_flag_value(command["argv"], "--out-dir"))
             if Path(str(plan["output_root"])) not in out_dir.parents:
                 raise CanaryError("canary output escapes its validation root")
+            expected_environment = {
+                **contract.SEALED_RUNTIME_ENVIRONMENT,
+                "CUDA_VISIBLE_DEVICES": str(command["gpu"]),
+                **executor.CLIENT_ENVIRONMENT,
+                "CATAN_SEED_LEDGER": canary_ledger,
+                "CATAN_A1_CONTRACT_SHA256": str(plan["contract_sha256"]),
+                contract.CONFIG_REGISTRY_ENVIRONMENT_VARIABLE: str(
+                    out_dir / contract.CONFIG_REGISTRY_FILENAME
+                ),
+                "CATAN_A1_CANARY_ID": str(plan["canary_id"]),
+            }
+            if command.get("environment") != expected_environment:
+                raise CanaryError("canary command exact environment drift")
+            if command.get("environment_sha256") != _digest(expected_environment):
+                raise CanaryError("canary command environment digest drift")
+            registry = Path(
+                expected_environment[contract.CONFIG_REGISTRY_ENVIRONMENT_VARIABLE]
+            )
+            if registry.parent != out_dir or not registry.is_relative_to(
+                Path(str(plan["output_root"]))
+            ):
+                raise CanaryError("canary config registry leaked outside validation output")
+            provenance = command.get("config_provenance")
+            if not isinstance(provenance, Mapping):
+                raise CanaryError("canary command lacks typed config provenance")
+            unhashed = dict(provenance)
+            declared = unhashed.pop("provenance_sha256", None)
+            config = unhashed.get("config")
+            fields = config.get("fields") if isinstance(config, Mapping) else None
+            if (
+                declared != _digest(unhashed)
+                or not isinstance(fields, Mapping)
+                or fields.get("games") != GAMES_PER_JOB
+                or fields.get("base_seed")
+                != int(_flag_value(command["argv"], "--base-seed"))
+            ):
+                raise CanaryError("canary typed config provenance drift")
             start = int(_flag_value(command["argv"], "--base-seed"))
             games = int(_flag_value(command["argv"], "--games"))
             lo, hi = contract.VAL_ONLY_SEED_RANGE
@@ -587,6 +727,10 @@ def audit_canary(plan: dict[str, Any]) -> dict[str, Any]:
                 "attestation_sha256": command["output_attestation"][
                     "source_file_sha256"
                 ],
+                "config_registry": command["environment"][
+                    contract.CONFIG_REGISTRY_ENVIRONMENT_VARIABLE
+                ],
+                "config_provenance": command["config_provenance"],
                 "games": int(_flag_value(command["argv"], "--games")),
                 "base_seed": int(_flag_value(command["argv"], "--base-seed")),
             }
@@ -614,6 +758,32 @@ def audit_canary(plan: dict[str, Any]) -> dict[str, Any]:
             ) from error
         if not isinstance(host_results, list) or len(host_results) != len(commands):
             raise CanaryError(f"canary audit result count drift on {alias}")
+        expected_by_id = {str(item["job_id"]): item for item in commands}
+        if {
+            str(item.get("job_id"))
+            for item in host_results
+            if isinstance(item, Mapping)
+        } != set(expected_by_id):
+            raise CanaryError(f"canary audit job identity drift on {alias}")
+        for item in host_results:
+            if not isinstance(item, Mapping):
+                raise CanaryError(f"canary audit result shape drift on {alias}")
+            source = expected_by_id[str(item["job_id"])]
+            provenance = source["config_provenance"]
+            if (
+                item.get("config_hash") != provenance["config_hash"]
+                or item.get("full_config_hash") != provenance["full_config_hash"]
+                or item.get("attestation_sha256")
+                != source["output_attestation"]["source_file_sha256"]
+                or not str(item.get("config_registry_sha256", "")).startswith(
+                    "sha256:"
+                )
+                or type(item.get("rows")) is not int
+                or int(item["rows"]) <= 0
+                or type(item.get("simulations")) is not int
+                or int(item["simulations"]) <= 0
+            ):
+                raise CanaryError(f"canary audit provenance drift on {alias}")
         results.extend(host_results)
     report = {
         "schema_version": "a1-live-canary-audit-v1",
@@ -630,8 +800,179 @@ def audit_canary(plan: dict[str, Any]) -> dict[str, Any]:
     return report
 
 
+def _runtime_lane_expectations(
+    plan: Mapping[str, Any], alias: str
+) -> list[dict[str, Any]]:
+    expectations: list[dict[str, Any]] = []
+    for worker_id, lane in sorted(plan["_private"]["lanes"].items()):
+        if lane[0]["host_alias"] != alias:
+            continue
+        expectations.append(
+            {
+                "worker_id": worker_id,
+                "gpu": int(lane[0]["gpu"]),
+                "jobs": [
+                    {
+                        "job_id": command["job_id"],
+                        "output": _flag_value(command["argv"], "--out-dir"),
+                        "workers": min(
+                            int(_flag_value(command["argv"], "--workers")),
+                            int(_flag_value(command["argv"], "--games")),
+                        ),
+                    }
+                    for command in lane
+                ],
+            }
+        )
+    expected_gpus = list(range(CANARY_ALIASES[alias]))
+    if sorted(item["gpu"] for item in expectations) != expected_gpus:
+        raise CanaryError(f"runtime lane topology drift on {alias}")
+    return expectations
+
+
+def attest_mps_runtime(
+    plan: dict[str, Any],
+    *,
+    not_before_epoch: float,
+    timeout_seconds: float = 600.0,
+) -> dict[str, Any]:
+    """Prove every canary GPU produced rows through a safely-limited MPS server."""
+
+    validate_canary_plan(plan)
+    if (
+        isinstance(not_before_epoch, bool)
+        or not isinstance(not_before_epoch, (int, float))
+        or not_before_epoch <= 0
+    ):
+        raise CanaryError("MPS runtime attestation requires a positive not-before time")
+    not_before_ns = int(float(not_before_epoch) * 1_000_000_000)
+    hosts = plan["_private"]["hosts"]
+    reports: dict[str, Any] = {}
+    for alias in sorted(CANARY_ALIASES):
+        expected_lanes = _runtime_lane_expectations(plan, alias)
+        command = " ".join(
+            shlex.quote(value)
+            for value in (
+                hosts["python"],
+                "-c",
+                MPS_RUNTIME_ATTESTATION_SCRIPT,
+                str(executor.REQUIRED_NOFILE_SOFT),
+                str(timeout_seconds),
+                str(not_before_ns),
+                json.dumps(expected_lanes, sort_keys=True, separators=(",", ":")),
+            )
+        )
+        try:
+            response = executor._ssh(
+                hosts,
+                alias,
+                command,
+                timeout_seconds=max(1.0, timeout_seconds + 15.0),
+            )
+        except subprocess.TimeoutExpired as error:
+            raise CanaryError(
+                f"MPS runtime attestation transport timed out on {alias}"
+            ) from error
+        if response.returncode != 0:
+            raise CanaryError(
+                f"MPS runtime attestation failed on {alias}: "
+                f"{(response.stderr or response.stdout).strip()}"
+            )
+        try:
+            report = json.loads(response.stdout)
+        except json.JSONDecodeError as error:
+            raise CanaryError(
+                f"MPS runtime attestation returned invalid JSON on {alias}"
+            ) from error
+        limits = report.get("server_nofile_soft")
+        progress = report.get("canary_lane_progress")
+        expected_by_worker = {item["worker_id"]: item for item in expected_lanes}
+        if (
+            report.get("required_nofile_soft") != executor.REQUIRED_NOFILE_SOFT
+            or not isinstance(limits, dict)
+            or not limits
+            or any(
+                type(value) is not int
+                or (value != -1 and value < executor.REQUIRED_NOFILE_SOFT)
+                for value in limits.values()
+            )
+        ):
+            raise CanaryError(f"unsafe MPS runtime limit report on {alias}")
+        if not isinstance(progress, dict) or set(progress) != set(expected_by_worker):
+            raise CanaryError(f"incomplete canary lane progress report on {alias}")
+        for worker_id, evidence in progress.items():
+            expected = expected_by_worker[worker_id]
+            expected_jobs = {item["job_id"]: item for item in expected["jobs"]}
+            job = expected_jobs.get(evidence.get("job_id")) if isinstance(evidence, dict) else None
+            if (
+                not isinstance(evidence, dict)
+                or evidence.get("worker_id") != worker_id
+                or evidence.get("gpu") != expected["gpu"]
+                or not isinstance(job, dict)
+                or evidence.get("output") != job["output"]
+                or evidence.get("expected_workers") != job["workers"]
+                or not isinstance(evidence.get("workers"), dict)
+                or set(evidence["workers"])
+                != {f"worker_{index:03d}" for index in range(job["workers"])}
+            ):
+                raise CanaryError(
+                    f"unsafe canary lane progress evidence for {worker_id} on {alias}"
+                )
+            for progress_worker_id, worker_evidence in evidence["workers"].items():
+                expected_progress = str(
+                    Path(job["output"]) / progress_worker_id / "progress.json"
+                )
+                if (
+                    not isinstance(worker_evidence, dict)
+                    or worker_evidence.get("progress") != expected_progress
+                    or type(worker_evidence.get("rows")) is not int
+                    or worker_evidence["rows"] <= 0
+                    or type(worker_evidence.get("simulations")) is not int
+                    or worker_evidence["simulations"] <= 0
+                    or worker_evidence.get("games_failed") != 0
+                    or type(worker_evidence.get("mtime_ns")) is not int
+                    or worker_evidence["mtime_ns"] < not_before_ns
+                ):
+                    raise CanaryError(
+                        f"stale/unsafe canary worker progress for {worker_id} on {alias}"
+                    )
+        reports[alias] = report
+    return {
+        "required_nofile_soft": executor.REQUIRED_NOFILE_SOFT,
+        "not_before_epoch": float(not_before_epoch),
+        "hosts": reports,
+    }
+
+
 def _public(plan: Mapping[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in plan.items() if key != "_private"}
+
+
+def _receipt_has_launch_state(plan: Mapping[str, Any], receipt_path: Path) -> bool:
+    """Return whether an interrupted execute durably recorded a live lane prefix."""
+
+    if not receipt_path.is_file():
+        return False
+    try:
+        receipt = _load(receipt_path)
+    except CanaryError:
+        return False
+    lane_pids = receipt.get("lane_pids")
+    pending_worker = receipt.get("launch_pending_worker_id")
+    lanes = plan.get("_private", {}).get("lanes", {})
+    return (
+        receipt.get("plan_sha256") == plan.get("plan_sha256")
+        and receipt.get("status") in {"launching", "launched", "launch_failed"}
+        and isinstance(lane_pids, dict)
+        and (
+            bool(lane_pids)
+            or (
+                isinstance(pending_worker, str)
+                and isinstance(lanes, Mapping)
+                and pending_worker in lanes
+            )
+        )
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -678,9 +1019,44 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.command == "audit":
             result = audit_canary(plan)
         elif args.go:
-            result = executor.execute(
-                plan, receipt_path=args.receipt, resume=bool(args.resume)
-            )
+            runtime_not_before = time.time()
+            execute_returned = False
+            try:
+                result = executor.execute(
+                    plan, receipt_path=args.receipt, resume=bool(args.resume)
+                )
+                execute_returned = True
+                result["mps_runtime"] = attest_mps_runtime(
+                    plan, not_before_epoch=runtime_not_before
+                )
+                executor._atomic_json(args.receipt, result)
+            except BaseException as primary_error:
+                if not execute_returned and not _receipt_has_launch_state(
+                    plan, args.receipt
+                ):
+                    raise
+                try:
+                    executor.stop_execution(plan, receipt_path=args.receipt, go=True)
+                except BaseException as cleanup_error:
+                    if isinstance(primary_error, (KeyboardInterrupt, SystemExit)):
+                        primary_error.add_note(
+                            "exact-stop also failed: "
+                            f"{type(cleanup_error).__name__}: {cleanup_error}"
+                        )
+                        raise primary_error from cleanup_error
+                    if isinstance(cleanup_error, (KeyboardInterrupt, SystemExit)):
+                        cleanup_error.add_note(
+                            "post-launch validation/persistence had already failed: "
+                            f"{type(primary_error).__name__}: {primary_error}"
+                        )
+                        raise cleanup_error from primary_error
+                    raise CanaryCleanupError(
+                        "post-launch validation/persistence failed: "
+                        f"{type(primary_error).__name__}: {primary_error}; "
+                        "exact-stop also failed: "
+                        f"{type(cleanup_error).__name__}: {cleanup_error}"
+                    ) from primary_error
+                raise
         else:
             result = _public(plan)
     except (CanaryError, executor.ExecutorError, OSError) as error:

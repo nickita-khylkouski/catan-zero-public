@@ -38,6 +38,7 @@ CLIENT_ENVIRONMENT = {
 }
 SUPERVISOR_ENVIRONMENT = {"PYTHONDONTWRITEBYTECODE": "1"}
 REQUIRED_NOFILE_SOFT = 65_536
+STOP_SSH_TIMEOUT_SECONDS = 45.0
 MPS_UNIT_PATH = _REPO_ROOT / "tools/fleet/systemd/nvidia-mps.service"
 FORBIDDEN_ADAPTIVE_ARGV = (
     "--n-full-wide",
@@ -48,6 +49,30 @@ FORBIDDEN_ADAPTIVE_ARGV = (
 
 class ExecutorError(RuntimeError):
     pass
+
+
+def _materialize_job_environment(
+    command: Mapping[str, Any], *, repo_dir: str
+) -> dict[str, Any]:
+    """Resolve the one sealed repo token without inheriting host environment."""
+
+    environment = command.get("environment")
+    if not isinstance(environment, dict):
+        raise ExecutorError("job environment is not a mapping")
+    expected_pythonpath = (
+        f"{contract.RUNTIME_REPO_TOKEN}/src:{contract.RUNTIME_REPO_TOKEN}"
+    )
+    if environment.get("PYTHONPATH") != expected_pythonpath:
+        raise ExecutorError("rendered PYTHONPATH token drift")
+    if command.get("environment_sha256") != _digest(environment):
+        raise ExecutorError("rendered environment digest drift before materialization")
+    runtime = {str(key): str(value) for key, value in environment.items()}
+    runtime["PYTHONPATH"] = f"{repo_dir}/src:{repo_dir}"
+    materialized = dict(command)
+    materialized["render_environment_sha256"] = command["environment_sha256"]
+    materialized["environment"] = runtime
+    materialized["environment_sha256"] = _digest(runtime)
+    return materialized
 
 
 def _canonical(value: Any) -> bytes:
@@ -192,14 +217,24 @@ def verify_render(
             raise ExecutorError(f"{job_id} lacks an exact --n-full value") from error
         if rendered_n_full != 128 or any(flag in expected_argv for flag in FORBIDDEN_ADAPTIVE_ARGV):
             raise ExecutorError(f"{job_id} is not the sealed n128/no-adaptive recipe")
-        expected_environment = {
-            "CUDA_VISIBLE_DEVICES": str(job["gpu"]),
-            **CLIENT_ENVIRONMENT,
-            "CATAN_SEED_LEDGER": lock["fleet"]["seed_ledger"]["path"],
-            "CATAN_A1_CONTRACT_SHA256": lock["contract_sha256"],
-        }
+        expected_environment = contract._job_environment(lock, job)
         if command.get("environment") != expected_environment:
             raise ExecutorError(f"exact client environment drift for {job_id}")
+        if command.get("environment_sha256") != contract._digest_value(
+            expected_environment
+        ):
+            raise ExecutorError(f"client environment digest mismatch for {job_id}")
+        expected_config_provenance = contract._expected_generate_config_provenance(
+            lock,
+            job,
+            opponent_mix_manifest=(
+                None
+                if job["category"] == "current_producer"
+                else str(mix_paths[job["category"]])
+            ),
+        )
+        if command.get("config_provenance") != expected_config_provenance:
+            raise ExecutorError(f"typed config provenance drift for {job_id}")
         claim = command.get("ledger_claim", {})
         expected_row = contract._ledger_claim_row(lock, job)
         if claim.get("row") != expected_row or claim.get("row_sha256") != contract._digest_value(expected_row):
@@ -408,7 +443,13 @@ def _verify_plan_digest(plan: Mapping[str, Any]) -> None:
         raise ExecutorError("execution plan semantic digest mismatch")
 
 
-def _ssh(hosts: dict[str, Any], alias: str, remote_command: str) -> subprocess.CompletedProcess[str]:
+def _ssh(
+    hosts: dict[str, Any],
+    alias: str,
+    remote_command: str,
+    *,
+    timeout_seconds: float | None = None,
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [
             "ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new",
@@ -418,6 +459,7 @@ def _ssh(hosts: dict[str, Any], alias: str, remote_command: str) -> subprocess.C
         text=True,
         capture_output=True,
         check=False,
+        timeout=timeout_seconds,
     )
 
 
@@ -538,16 +580,19 @@ for line in apps.stdout.splitlines():
     fields=[part.strip() for part in line.split(',',1)]
     if len(fields)!=2 or 'nvidia-cuda-mps-server' not in fields[1]: foreign.append(line.strip())
 if foreign: raise SystemExit('non-MPS compute applications present: '+repr(foreign))
-show=run('systemctl','show','nvidia-mps.service','--property=ActiveState,UnitFileState,MainPID,Environment,FragmentPath')
+show=run('systemctl','show','nvidia-mps.service','--property=ActiveState,UnitFileState,MainPID,Environment,FragmentPath,LimitNOFILESoft')
 if show.returncode: raise SystemExit('cannot inspect nvidia-mps.service: '+show.stderr)
 properties={}
 for line in show.stdout.splitlines():
     if '=' in line:
         key,value=line.split('=',1);properties[key]=value
-required_properties={'ActiveState','UnitFileState','MainPID','Environment','FragmentPath'}
+required_properties={'ActiveState','UnitFileState','MainPID','Environment','FragmentPath','LimitNOFILESoft'}
 if not required_properties.issubset(properties): raise SystemExit('incomplete nvidia-mps.service properties: '+repr(properties))
 active=properties['ActiveState'];enabled=properties['UnitFileState'];main_pid_raw=properties['MainPID'];environment=properties['Environment']
 if active!='active' or enabled!='enabled': raise SystemExit(f'MPS service not active+enabled: {active}/{enabled}')
+try: mps_limit_nofile_soft=int(properties['LimitNOFILESoft'])
+except ValueError: raise SystemExit('invalid MPS LimitNOFILESoft: '+properties['LimitNOFILESoft'])
+if mps_limit_nofile_soft<required_nofile: raise SystemExit(f'MPS LimitNOFILESoft {mps_limit_nofile_soft} is below required {required_nofile}')
 try: main_pid=int(main_pid_raw)
 except ValueError: raise SystemExit('invalid MPS MainPID: '+main_pid_raw)
 if main_pid<=0 or not pathlib.Path(f'/proc/{main_pid}').exists(): raise SystemExit('MPS MainPID is not live')
@@ -562,7 +607,7 @@ mps_unit_sha256='sha256:'+hashlib.sha256(fragment.read_bytes()).hexdigest()
 if mps_unit_sha256!=expected_mps_unit_sha256: raise SystemExit(f'MPS service unit digest drift: expected {expected_mps_unit_sha256}, got {mps_unit_sha256}')
 try: rust_version=importlib.metadata.version('catanatron-rs')
 except importlib.metadata.PackageNotFoundError: rust_version='unknown'
-print(json.dumps({'gpu_indices':indices,'compute_apps':'mps_only_or_empty','mps_active':active,'mps_enabled':enabled,'mps_main_pid':main_pid,'mps_unit_sha256':mps_unit_sha256,'client_environment':required,'python':sys.executable,'torch_version':str(torch.__version__),'torch_cuda_version':str(torch.version.cuda),'catanatron_rs_version':rust_version,'required_nofile_soft':required_nofile,'nofile_soft_before':nofile_soft_before,'nofile_soft':nofile_soft,'nofile_hard':nofile_hard},sort_keys=True))'''
+print(json.dumps({'gpu_indices':indices,'compute_apps':'mps_only_or_empty','mps_active':active,'mps_enabled':enabled,'mps_main_pid':main_pid,'mps_unit_sha256':mps_unit_sha256,'mps_limit_nofile_soft':mps_limit_nofile_soft,'client_environment':required,'python':sys.executable,'torch_version':str(torch.__version__),'torch_cuda_version':str(torch.version.cuda),'catanatron_rs_version':rust_version,'required_nofile_soft':required_nofile,'nofile_soft_before':nofile_soft_before,'nofile_soft':nofile_soft,'nofile_hard':nofile_hard},sort_keys=True))'''
     command = " ".join(
         shlex.quote(value)
         for value in (
@@ -582,6 +627,14 @@ print(json.dumps({'gpu_indices':indices,'compute_apps':'mps_only_or_empty','mps_
         raise ExecutorError(f"host MPS client environment drift on {alias}")
     if report.get("mps_unit_sha256") != expected_mps_unit_sha256:
         raise ExecutorError(f"host MPS service unit digest drift on {alias}")
+    mps_limit_nofile_soft = report.get("mps_limit_nofile_soft")
+    if type(mps_limit_nofile_soft) is not int:
+        raise ExecutorError(f"invalid MPS LimitNOFILESoft report on {alias}")
+    if mps_limit_nofile_soft < REQUIRED_NOFILE_SOFT:
+        raise ExecutorError(
+            f"host MPS LimitNOFILESoft {mps_limit_nofile_soft} is below required "
+            f"{REQUIRED_NOFILE_SOFT} on {alias}"
+        )
     limit_fields = (
         "required_nofile_soft", "nofile_soft_before", "nofile_soft", "nofile_hard",
     )
@@ -622,10 +675,15 @@ def _supervisor_launch_command(
 ) -> str:
     """Build a narrow launcher which raises nofile before creating the session."""
     extra = dict(extra_environment or {})
-    protected = {*CLIENT_ENVIRONMENT, *SUPERVISOR_ENVIRONMENT, "PYTHONPATH"}
+    protected = {
+        *CLIENT_ENVIRONMENT,
+        *SUPERVISOR_ENVIRONMENT,
+        *contract.SEALED_RUNTIME_ENVIRONMENT,
+    }
     if protected & set(extra):
         raise ExecutorError("supervisor launch environment cannot override invariants")
     environment = {
+        **contract.SEALED_RUNTIME_ENVIRONMENT,
         **CLIENT_ENVIRONMENT,
         **SUPERVISOR_ENVIRONMENT,
         "PYTHONPATH": f"{repo_dir}/src:{repo_dir}",
@@ -638,7 +696,7 @@ def _supervisor_launch_command(
     ):
         raise ExecutorError("invalid supervisor launch environment")
     argv = [python, supervisor, "run", "--lane", remote_lane]
-    script = r'''import json,os,pathlib,resource,subprocess,sys
+    script = r'''import json,pathlib,resource,subprocess,sys
 required=int(sys.argv[1]);log=pathlib.Path(sys.argv[2]);environment=json.loads(sys.argv[3]);argv=json.loads(sys.argv[4])
 soft,hard=resource.getrlimit(resource.RLIMIT_NOFILE);unlimited=resource.RLIM_INFINITY
 if hard!=unlimited and hard<required: raise SystemExit(f'hard RLIMIT_NOFILE {hard} is below required {required}')
@@ -647,18 +705,23 @@ if soft!=unlimited and soft<required:
     except (OSError,ValueError) as error: raise SystemExit(f'cannot raise soft RLIMIT_NOFILE {soft} to {required}: {error!r}')
 raised,_=resource.getrlimit(resource.RLIMIT_NOFILE)
 if raised!=unlimited and raised<required: raise SystemExit(f'soft RLIMIT_NOFILE {raised} is below required {required} after raise')
-log.parent.mkdir(parents=True,exist_ok=True);child_environment=os.environ.copy();child_environment.update(environment)
+log.parent.mkdir(parents=True,exist_ok=True)
 with log.open('ab',buffering=0) as output:
-    process=subprocess.Popen(argv,stdin=subprocess.DEVNULL,stdout=output,stderr=subprocess.STDOUT,env=child_environment,start_new_session=True,close_fds=True)
+    process=subprocess.Popen(argv,stdin=subprocess.DEVNULL,stdout=output,stderr=subprocess.STDOUT,env=environment,start_new_session=True,close_fds=True)
 print(process.pid,flush=True)'''
-    return " ".join(
-        shlex.quote(value)
-        for value in (
-            python, "-c", script, str(REQUIRED_NOFILE_SOFT), log,
-            json.dumps(environment, sort_keys=True, separators=(",", ":")),
-            json.dumps(argv, separators=(",", ":")),
-        )
-    )
+    invocation = [
+        "/usr/bin/env",
+        "-i",
+        *(f"{key}={value}" for key, value in sorted(environment.items())),
+        python,
+        "-c",
+        script,
+        str(REQUIRED_NOFILE_SOFT),
+        log,
+        json.dumps(environment, sort_keys=True, separators=(",", ":")),
+        json.dumps(argv, separators=(",", ":")),
+    ]
+    return " ".join(shlex.quote(value) for value in invocation)
 
 
 _STAGE_REPO_SCRIPT = r'''import hashlib,json,os,pathlib,shutil,stat,sys,tarfile,time,uuid
@@ -801,6 +864,9 @@ def _lane_payload(
     repo_dir: str,
 ) -> dict[str, Any]:
     remote = hosts["remote_root"]
+    materialized_lane = [
+        _materialize_job_environment(command, repo_dir=repo_dir) for command in lane
+    ]
     payload = {
         "schema_version": LANE_SCHEMA,
         "worker_id": worker_id,
@@ -814,7 +880,7 @@ def _lane_payload(
         "lane_lock": f"{remote}/locks/{worker_id}.lock",
         "client_environment": dict(CLIENT_ENVIRONMENT),
         "operator_manifests": dict(operator_manifests),
-        "commands": lane,
+        "commands": materialized_lane,
     }
     payload["lane_sha256"] = _digest(payload)
     return payload
@@ -833,6 +899,12 @@ def _resume_receipt(
         raise ExecutorError("executor receipt schema drift")
     if receipt.get("plan_sha256") != public["plan_sha256"]:
         raise ExecutorError("resume receipt binds a different execution plan")
+    pending_worker = receipt.get("launch_pending_worker_id")
+    if pending_worker is not None:
+        raise ExecutorError(
+            f"receipt has unresolved pending supervisor launch for {pending_worker}; "
+            "exact-stop is required before resume"
+        )
     return receipt
 
 
@@ -952,11 +1024,23 @@ def execute(plan: dict[str, Any], *, receipt_path: Path, resume: bool) -> dict[s
                 log=log,
                 repo_dir=repo_dir,
             )
+            # Persist intent after the immutable lane exists but before the
+            # detached spawn. If SSH returns a PID and the subsequent receipt
+            # write fails, the caller can still exact-scan this lane by argv.
+            receipt.update(
+                {
+                    "status": "launching",
+                    "lane_pids": lane_pids,
+                    "launch_pending_worker_id": worker_id,
+                }
+            )
+            _atomic_json(receipt_path, receipt)
             result = _ssh(hosts, alias, launch)
             if result.returncode != 0 or not result.stdout.strip().splitlines()[-1].isdigit():
                 raise ExecutorError(f"detached supervisor launch failed for {worker_id}")
             lane_pids[worker_id] = int(result.stdout.strip().splitlines()[-1])
             receipt.update({"status": "launching", "lane_pids": lane_pids})
+            receipt.pop("launch_pending_worker_id", None)
             _atomic_json(receipt_path, receipt)
         acknowledgements: dict[str, Any] = {}
         for worker_id, lane in sorted(lanes.items()):
@@ -994,6 +1078,7 @@ def execute(plan: dict[str, Any], *, receipt_path: Path, resume: bool) -> dict[s
             "lane_acknowledgements": acknowledgements,
         }
     )
+    receipt.pop("launch_pending_worker_id", None)
     _atomic_json(receipt_path, receipt)
     return receipt
 
@@ -1045,7 +1130,15 @@ def _stop_helper_call(
         + " ".join(shlex.quote(value) for value in argv)
         + "; fi"
     )
-    response = _ssh(hosts, alias, command)
+    try:
+        response = _ssh(
+            hosts, alias, command, timeout_seconds=STOP_SSH_TIMEOUT_SECONDS
+        )
+    except subprocess.TimeoutExpired as error:
+        raise ExecutorError(
+            f"A1 {action} timed out for {worker_id} after "
+            f"{STOP_SSH_TIMEOUT_SECONDS:g}s"
+        ) from error
     if response.returncode != 0:
         detail = (response.stderr or response.stdout).strip()
         raise ExecutorError(f"A1 {action} refused for {worker_id}: {detail}")
@@ -1121,6 +1214,7 @@ def stop_execution(
             "mps_preserved": True,
         }
     )
+    receipt.pop("launch_pending_worker_id", None)
     _atomic_json(receipt_path, receipt)
     return receipt
 

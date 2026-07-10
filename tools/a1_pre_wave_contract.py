@@ -30,7 +30,7 @@ import sys
 import uuid
 from collections import Counter
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 import numpy as np
 
@@ -63,6 +63,21 @@ LOCK_SCHEMA = "a1-pre-wave-contract-lock-v2"
 RENDER_SCHEMA = "a1-pre-wave-render-v2"
 MPS_PIPE_DIRECTORY = "/tmp/mps_pipe_host"
 MPS_LOG_DIRECTORY = "/tmp/mps_log_host"
+CONFIG_REGISTRY_ENVIRONMENT_VARIABLE = "CATAN_ZERO_CONFIG_REGISTRY"
+CONFIG_REGISTRY_FILENAME = "config_registry.jsonl"
+RUNTIME_REPO_TOKEN = "__A1_RUNTIME_REPO__"
+SEALED_RUNTIME_ENVIRONMENT = {
+    "HOME": "/home/ubuntu",
+    "LANG": "C.UTF-8",
+    "LC_ALL": "C.UTF-8",
+    "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    "PYTHONHASHSEED": "0",
+    "PYTHONDONTWRITEBYTECODE": "1",
+    "PYTHONNOUSERSITE": "1",
+    "PYTHONPATH": f"{RUNTIME_REPO_TOKEN}/src:{RUNTIME_REPO_TOKEN}",
+    "TMPDIR": "/tmp",
+    "TZ": "UTC",
+}
 AUDIT_SCHEMA = "a1-post-wave-audit-v2"
 GUARD_SYNC_SCHEMA = "a1-pre-wave-generation-guard-sync-v1"
 CLAIM_RECEIPT_SCHEMA = "a1-seed-claim-transaction-v1"
@@ -296,6 +311,102 @@ def _sha256(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1 << 20), b""):
             digest.update(chunk)
     return "sha256:" + digest.hexdigest()
+
+
+def _sha256_bytes(payload: bytes) -> str:
+    return "sha256:" + hashlib.sha256(payload).hexdigest()
+
+
+def _strict_config_registry_record(
+    payload: bytes, *, expected: Mapping[str, Any], where: str
+) -> dict[str, Any]:
+    """Validate one job-private registry record against exact typed provenance."""
+
+    try:
+        text = payload.decode("utf-8")
+        records = [json.loads(line) for line in text.splitlines() if line.strip()]
+    except (UnicodeError, json.JSONDecodeError) as error:
+        raise ContractError(f"{where}: invalid config registry: {error}") from error
+    if len(records) != 1 or not isinstance(records[0], dict):
+        raise ContractError(f"{where}: config registry must contain exactly one object")
+    record = records[0]
+    required = {
+        "config_hash",
+        "full_config_hash",
+        "pipeline",
+        "timestamp",
+        "purpose",
+        "config",
+    }
+    if set(record) != required:
+        raise ContractError(f"{where}: config registry record fields drift")
+    if not isinstance(record.get("timestamp"), str) or not isinstance(
+        record.get("purpose"), str
+    ):
+        raise ContractError(f"{where}: config registry metadata types drift")
+    config = record.get("config")
+    if not isinstance(config, dict):
+        raise ContractError(f"{where}: config registry canonical payload is absent")
+    full_hash = _digest_value(config)
+    short_hash = "sha256:" + full_hash.removeprefix("sha256:")[:16]
+    if (
+        record.get("pipeline") != "generate"
+        or config.get("pipeline") != "generate"
+        or record.get("full_config_hash") != full_hash
+        or record.get("config_hash") != short_hash
+    ):
+        raise ContractError(f"{where}: config registry record is not self-consistent")
+    for key in ("pipeline", "config_hash", "full_config_hash", "config"):
+        if record.get(key) != expected.get(key):
+            raise ContractError(f"{where}: config registry {key} differs from sealed config")
+    return record
+
+
+def _read_sealed_regular(path: Path, *, where: str) -> bytes:
+    """Read one immutable regular file once, rejecting symlinks and write bits."""
+
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise ContractError(f"{where}: cannot open sealed file {path}: {error}") from error
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_mode & 0o222:
+            raise ContractError(f"{where}: file is not a read-only regular file: {path}")
+        chunks: list[bytes] = []
+        while chunk := os.read(descriptor, 1 << 20):
+            chunks.append(chunk)
+        payload = b"".join(chunks)
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        verification_chunks: list[bytes] = []
+        while chunk := os.read(descriptor, 1 << 20):
+            verification_chunks.append(chunk)
+        if b"".join(verification_chunks) != payload:
+            raise ContractError(f"{where}: sealed file mutated during read: {path}")
+        after = os.fstat(descriptor)
+        before_identity = (
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_size,
+            metadata.st_mtime_ns,
+            metadata.st_ctime_ns,
+        )
+        after_identity = (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        )
+        if before_identity != after_identity or len(payload) != after.st_size:
+            raise ContractError(f"{where}: sealed file mutated during read: {path}")
+        current = os.stat(path, follow_symlinks=False)
+        if (current.st_dev, current.st_ino) != (metadata.st_dev, metadata.st_ino):
+            raise ContractError(f"{where}: sealed file changed during inspection: {path}")
+        return payload
+    finally:
+        os.close(descriptor)
 
 
 def _md5(path: Path) -> str:
@@ -2871,6 +2982,23 @@ def _generator_argv(
     return argv
 
 
+def _job_environment(lock: dict[str, Any], job: dict[str, Any]) -> dict[str, str]:
+    """Return the complete sealed environment for one writable job sandbox."""
+
+    output_dir = Path(str(job["output_dir"]))
+    return {
+        **SEALED_RUNTIME_ENVIRONMENT,
+        "CUDA_VISIBLE_DEVICES": str(job["gpu"]),
+        "CUDA_MPS_PIPE_DIRECTORY": MPS_PIPE_DIRECTORY,
+        "CUDA_MPS_LOG_DIRECTORY": MPS_LOG_DIRECTORY,
+        "CATAN_SEED_LEDGER": str(lock["fleet"]["seed_ledger"]["path"]),
+        "CATAN_A1_CONTRACT_SHA256": str(lock["contract_sha256"]),
+        CONFIG_REGISTRY_ENVIRONMENT_VARIABLE: str(
+            output_dir / CONFIG_REGISTRY_FILENAME
+        ),
+    }
+
+
 def _job_attestation(lock: dict[str, Any], job: dict[str, Any]) -> dict[str, Any]:
     return {
         "schema_version": "a1-generation-job-attestation-v2",
@@ -3164,6 +3292,16 @@ def render(lock_path: Path, out_dir: Path) -> dict[str, Any]:
     commands = []
     for job in lock["fleet"]["jobs"]:
         argv = _generator_argv(lock, job, mix_paths=mix_paths)
+        environment = _job_environment(lock, job)
+        config_provenance = _expected_generate_config_provenance(
+            lock,
+            job,
+            opponent_mix_manifest=(
+                None
+                if job["category"] == "current_producer"
+                else str(mix_paths[job["category"]])
+            ),
+        )
         attestation = _job_attestation(lock, job)
         attestation_source = out_dir / "job_attestations" / f"{job['job_id']}.json"
         _create_readonly(attestation_source, attestation)
@@ -3174,13 +3312,9 @@ def render(lock_path: Path, out_dir: Path) -> dict[str, Any]:
                 "host_alias": job["host_alias"],
                 "gpu": job["gpu"],
                 "category": job["category"],
-                "environment": {
-                    "CUDA_VISIBLE_DEVICES": str(job["gpu"]),
-                    "CUDA_MPS_PIPE_DIRECTORY": MPS_PIPE_DIRECTORY,
-                    "CUDA_MPS_LOG_DIRECTORY": MPS_LOG_DIRECTORY,
-                    "CATAN_SEED_LEDGER": lock["fleet"]["seed_ledger"]["path"],
-                    "CATAN_A1_CONTRACT_SHA256": lock["contract_sha256"],
-                },
+                "environment": environment,
+                "environment_sha256": _digest_value(environment),
+                "config_provenance": config_provenance,
                 "python": "python",
                 "argv": argv,
                 "argv_sha256": _digest_value(argv),
@@ -3435,6 +3569,28 @@ def _expected_cli_fields(lock: dict[str, Any], job: dict[str, Any]) -> dict[str,
     }
 
 
+def _expected_generate_config_provenance(
+    lock: dict[str, Any],
+    job: dict[str, Any],
+    *,
+    opponent_mix_manifest: str | None,
+) -> dict[str, Any]:
+    """Reconstruct the exact typed GenerateConfig the sealed argv must produce."""
+
+    values = _expected_cli_fields(lock, job)
+    values["opponent_mix_manifest"] = opponent_mix_manifest
+    values["producer_checkpoint_sha256"] = _producer(lock)["sha256"]
+    config = GenerateConfig.from_namespace(argparse.Namespace(**values))
+    provenance = {
+        "pipeline": "generate",
+        "config_hash": config.config_hash(),
+        "full_config_hash": config.full_config_hash(),
+        "config": config.canonical_payload(),
+    }
+    provenance["provenance_sha256"] = _digest_value(provenance)
+    return provenance
+
+
 def _expected_selfplay_config(lock: dict[str, Any]) -> dict[str, Any]:
     generation = lock["generation"]
     search = lock["science"]["search_operator"]
@@ -3559,10 +3715,16 @@ def audit_outputs(lock_path: Path, out_path: Path) -> dict[str, Any]:
                 errors.append(
                     f"{job['job_id']}: cli_args.{key}={cli.get(key)!r}, expected {expected!r}"
                 )
+        actual_config_provenance: dict[str, Any] | None = None
         try:
-            actual_config_hash = GenerateConfig.from_namespace(
-                argparse.Namespace(**cli)
-            ).config_hash()
+            actual_config = GenerateConfig.from_namespace(argparse.Namespace(**cli))
+            actual_config_hash = actual_config.config_hash()
+            actual_config_provenance = {
+                "pipeline": "generate",
+                "config_hash": actual_config_hash,
+                "full_config_hash": actual_config.full_config_hash(),
+                "config": actual_config.canonical_payload(),
+            }
         except Exception as error:  # noqa: BLE001 - malformed config provenance blocks ingest.
             errors.append(f"{job['job_id']}: cannot reconstruct config_hash: {error}")
         else:
@@ -3571,6 +3733,44 @@ def audit_outputs(lock_path: Path, out_path: Path) -> dict[str, Any]:
                     f"{job['job_id']}: config_hash={manifest.get('config_hash')!r}, "
                     f"reconstructed={actual_config_hash!r}"
                 )
+            expected_config_provenance = _expected_generate_config_provenance(
+                lock,
+                job,
+                opponent_mix_manifest=cli.get("opponent_mix_manifest"),
+            )
+            expected_config_provenance.pop("provenance_sha256")
+            if actual_config_provenance != expected_config_provenance:
+                errors.append(f"{job['job_id']}: full typed GenerateConfig drift")
+        registry_path = Path(job["output_dir"]) / CONFIG_REGISTRY_FILENAME
+        try:
+            registry_payload = _read_sealed_regular(
+                registry_path, where=str(job["job_id"])
+            )
+            if actual_config_provenance is None:
+                raise ContractError(
+                    f"{job['job_id']}: cannot validate registry without typed config"
+                )
+            _strict_config_registry_record(
+                registry_payload,
+                expected=actual_config_provenance,
+                where=str(job["job_id"]),
+            )
+        except ContractError as error:
+            errors.append(str(error))
+        else:
+            shard_records.append(
+                {
+                    "kind": "config_registry",
+                    "path": str(registry_path),
+                    "sha256": _sha256_bytes(registry_payload),
+                    "job_id": job["job_id"],
+                    "category": job["category"],
+                    "config_hash": manifest.get("config_hash"),
+                    "full_config_hash": actual_config_provenance[
+                        "full_config_hash"
+                    ],
+                }
+            )
         worker_summaries = list(manifest.get("worker_summaries", []))
         expected_workers = min(
             int(lock["generation"]["workers_per_gpu"]), int(job["attempts"])

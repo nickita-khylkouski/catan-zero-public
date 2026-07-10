@@ -126,15 +126,20 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, dict, dict]:
             attestation.parent.mkdir(parents=True, exist_ok=True)
             attestation.write_text(json.dumps({"job_id": job_id}) + "\n", encoding="utf-8")
             claim_row = contract._ledger_claim_row(lock, job)
+            environment = contract._job_environment(lock, job)
+            config_provenance = contract._expected_generate_config_provenance(
+                lock,
+                job,
+                opponent_mix_manifest=(
+                    None if category == "current_producer" else str(mix_paths[category])
+                ),
+            )
             commands.append(
                 {
                     **{key: job[key] for key in ("job_id", "worker_id", "host_alias", "gpu", "category")},
-                    "environment": {
-                        "CUDA_VISIBLE_DEVICES": str(gpu),
-                        **executor.CLIENT_ENVIRONMENT,
-                        "CATAN_SEED_LEDGER": str(ledger),
-                        "CATAN_A1_CONTRACT_SHA256": lock["contract_sha256"],
-                    },
+                    "environment": environment,
+                    "environment_sha256": contract._digest_value(environment),
+                    "config_provenance": config_provenance,
                     "python": "python",
                     "argv": argv,
                     "argv_sha256": contract._digest_value(argv),
@@ -215,6 +220,11 @@ def test_dry_plan_is_exact_40_lane_120_job_n128_mps_contract(
     assert plan["client_environment"] == executor.CLIENT_ENVIRONMENT
     assert plan["category_order"] == list(executor.CATEGORY_ORDER)
     assert all("--resume" in command["argv"] for command in rendered["commands"])
+    assert all(
+        command["environment"]["CATAN_ZERO_CONFIG_REGISTRY"]
+        == str(Path(command["argv"][command["argv"].index("--out-dir") + 1]) / "config_registry.jsonl")
+        for command in rendered["commands"]
+    )
     assert all(command["argv"][command["argv"].index("--n-full") + 1] == "128" for command in rendered["commands"])
     assert not any(flag in command["argv"] for command in rendered["commands"] for flag in executor.FORBIDDEN_ADAPTIVE_ARGV)
 
@@ -234,12 +244,42 @@ def test_private_host_config_and_render_environment_fail_closed(tmp_path: Path) 
         executor.verify_render(lock_path, render_path, verify_lock_fn=_verifier(lock))
 
 
+def test_render_environment_digest_and_per_job_registry_fail_closed(
+    tmp_path: Path,
+) -> None:
+    lock_path, render_path, lock, rendered = _fixture(tmp_path)
+    command = rendered["commands"][0]
+    command["environment"]["CATAN_ZERO_CONFIG_REGISTRY"] = str(
+        tmp_path / "shared-or-production-registry.jsonl"
+    )
+    command["environment_sha256"] = contract._digest_value(command["environment"])
+    rendered.pop("render_sha256")
+    rendered["render_sha256"] = contract._digest_value(rendered)
+    render_path.write_text(json.dumps(rendered), encoding="utf-8")
+    with pytest.raises(executor.ExecutorError, match="client environment drift"):
+        executor.verify_render(lock_path, render_path, verify_lock_fn=_verifier(lock))
+
+    command["environment"] = contract._job_environment(
+        lock, lock["fleet"]["jobs"][0]
+    )
+    command["environment_sha256"] = "sha256:" + "0" * 64
+    rendered.pop("render_sha256")
+    rendered["render_sha256"] = contract._digest_value(rendered)
+    render_path.write_text(json.dumps(rendered), encoding="utf-8")
+    with pytest.raises(executor.ExecutorError, match="environment digest mismatch"):
+        executor.verify_render(lock_path, render_path, verify_lock_fn=_verifier(lock))
+
+
 def _lane(tmp_path: Path, commands: list[dict]) -> tuple[Path, dict]:
     lock_copy = tmp_path / "remote" / "contract.lock.json"
     render_copy = tmp_path / "remote" / "commands.json"
     lock_copy.parent.mkdir(parents=True, exist_ok=True)
     lock_copy.write_text("lock\n", encoding="utf-8")
     render_copy.write_text("render\n", encoding="utf-8")
+    materialized = [
+        executor._materialize_job_environment(command, repo_dir=str(tmp_path))
+        for command in commands
+    ]
     lane = {
         "schema_version": supervisor.SCHEMA,
         "worker_id": commands[0]["worker_id"],
@@ -256,7 +296,7 @@ def _lane(tmp_path: Path, commands: list[dict]) -> tuple[Path, dict]:
             "lock": {"path": str(lock_copy), "sha256": _sha(lock_copy)},
             "render": {"path": str(render_copy), "sha256": _sha(render_copy)},
         },
-        "commands": commands,
+        "commands": materialized,
     }
     lane["lane_sha256"] = supervisor._digest(lane)
     path = tmp_path / "lane.json"
@@ -270,8 +310,24 @@ def _complete_output(command: dict) -> None:
     out.mkdir(parents=True, exist_ok=True)
     attempts = int(argv[argv.index("--games") + 1])
     base_seed = int(argv[argv.index("--base-seed") + 1])
+    provenance = command["config_provenance"]
     (out / "manifest.json").write_text(
-        json.dumps({"games_requested": attempts, "games_completed": attempts, "games_failed": 0, "errors": [], "base_seed": base_seed}),
+        json.dumps({"games_requested": attempts, "games_completed": attempts, "games_failed": 0, "errors": [], "base_seed": base_seed, "config_hash": provenance["config_hash"]}),
+        encoding="utf-8",
+    )
+    registry = Path(command["environment"]["CATAN_ZERO_CONFIG_REGISTRY"])
+    registry.write_text(
+        json.dumps(
+            {
+                "config_hash": provenance["config_hash"],
+                "full_config_hash": provenance["full_config_hash"],
+                "pipeline": "generate",
+                "timestamp": "2026-07-10T00:00:00+00:00",
+                "purpose": "test",
+                "config": provenance["config"],
+            }
+        )
+        + "\n",
         encoding="utf-8",
     )
     source = Path(command["output_attestation"]["source"])
@@ -289,14 +345,16 @@ def test_completed_receipts_are_validated_and_never_rerun(
     commands = rendered["commands"][:3]
     lane_path, lane = _lane(tmp_path, commands)
     Path(lane["receipt_dir"]).mkdir(parents=True)
-    for command in commands:
+    for command in lane["commands"]:
         _complete_output(command)
+        completed = supervisor._validate_completed(command)
         receipt = {
             "schema_version": supervisor.RECEIPT_SCHEMA,
             "job_id": command["job_id"],
             "lane_sha256": lane["lane_sha256"],
             "argv_sha256": command["argv_sha256"],
             "status": "complete",
+            **completed,
         }
         Path(lane["receipt_dir"], f"{command['job_id']}.json").write_text(json.dumps(receipt), encoding="utf-8")
     monkeypatch.setattr(supervisor.subprocess, "Popen", lambda *_a, **_k: pytest.fail("completed job reran"))
@@ -306,6 +364,8 @@ def test_completed_receipts_are_validated_and_never_rerun(
 def test_incomplete_lane_runs_exact_resume_sequentially(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setenv("NVIDIA_TF32_OVERRIDE", "1")
+    monkeypatch.setenv("PYTHONHOME", "/unsealed/ambient-python")
     _lock_path, _render_path, _lock, rendered = _fixture(tmp_path)
     lane_path, lane = _lane(tmp_path, rendered["commands"][:3])
     calls = []
@@ -326,8 +386,84 @@ def test_incomplete_lane_runs_exact_resume_sequentially(
     assert len(calls) == 3
     assert all("--resume" in argv for argv, _environment, _kwargs in calls)
     assert all(environment["CUDA_MPS_PIPE_DIRECTORY"] == "/tmp/mps_pipe_host" for _argv, environment, _kwargs in calls)
+    assert all(
+        environment["CATAN_ZERO_CONFIG_REGISTRY"].endswith("/config_registry.jsonl")
+        for _argv, environment, _kwargs in calls
+    )
     assert all(kwargs.get("pass_fds") for _argv, _environment, kwargs in calls)
+    assert all(environment == command["environment"] for (_argv, environment, _kwargs), command in zip(calls, lane["commands"], strict=True))
+    assert all("NVIDIA_TF32_OVERRIDE" not in environment for _argv, environment, _kwargs in calls)
+    assert all("PYTHONHOME" not in environment for _argv, environment, _kwargs in calls)
     assert [command["category"] for command in lane["commands"]] == list(supervisor.CATEGORY_ORDER)
+
+
+def test_completed_job_rejects_forged_minimal_registry_record(tmp_path: Path) -> None:
+    _lock_path, _render_path, _lock, rendered = _fixture(tmp_path)
+    _lane_path, lane = _lane(tmp_path, rendered["commands"][:3])
+    command = lane["commands"][0]
+    _complete_output(command)
+    registry = Path(command["environment"]["CATAN_ZERO_CONFIG_REGISTRY"])
+    registry.write_text(
+        json.dumps(
+            {
+                "pipeline": "generate",
+                "config_hash": command["config_provenance"]["config_hash"],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(supervisor.SupervisorError, match="registry fields drifted"):
+        supervisor._validate_completed(command)
+    assert stat.S_IMODE(registry.stat().st_mode) == 0o444
+
+
+def test_completed_receipt_rejects_post_completion_registry_mutation(
+    tmp_path: Path,
+) -> None:
+    _lock_path, _render_path, _lock, rendered = _fixture(tmp_path)
+    _lane_path, lane = _lane(tmp_path, rendered["commands"][:3])
+    command = lane["commands"][0]
+    _complete_output(command)
+    completed = supervisor._validate_completed(command)
+    receipt_path = Path(lane["receipt_dir"]) / f"{command['job_id']}.json"
+    receipt_path.parent.mkdir(parents=True)
+    receipt_path.write_text(
+        json.dumps(
+            {
+                "schema_version": supervisor.RECEIPT_SCHEMA,
+                "job_id": command["job_id"],
+                "lane_sha256": lane["lane_sha256"],
+                "argv_sha256": command["argv_sha256"],
+                "status": "complete",
+                **completed,
+            }
+        ),
+        encoding="utf-8",
+    )
+    registry = Path(command["environment"]["CATAN_ZERO_CONFIG_REGISTRY"])
+    registry.chmod(0o644)
+    record = json.loads(registry.read_text(encoding="utf-8"))
+    record["purpose"] = "mutated-after-completion"
+    registry.write_text(json.dumps(record) + "\n", encoding="utf-8")
+    with pytest.raises(supervisor.SupervisorError, match="config_registry_sha256 drift"):
+        supervisor._run_job(lane, command)
+
+
+def test_lane_rejects_registry_escape_even_with_rehashed_environment(
+    tmp_path: Path,
+) -> None:
+    _lock_path, _render_path, _lock, rendered = _fixture(tmp_path)
+    commands = rendered["commands"][:3]
+    commands[0]["environment"]["CATAN_ZERO_CONFIG_REGISTRY"] = str(
+        tmp_path / "shared.jsonl"
+    )
+    commands[0]["environment_sha256"] = supervisor._digest(
+        commands[0]["environment"]
+    )
+    lane_path, _lane_payload = _lane(tmp_path, commands)
+    with pytest.raises(supervisor.SupervisorError, match="sealed inside its output"):
+        supervisor.load_lane(lane_path)
 
 
 def test_completed_output_without_receipt_refuses(tmp_path: Path) -> None:
@@ -427,6 +563,86 @@ def test_append_only_ledger_update_contract() -> None:
         executor._append_only_bytes(b"diverged\n", b"prefix\nclaim\n")
 
 
+def test_ssh_propagates_hard_command_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: dict[str, object] = {}
+
+    def fake_run(argv, **kwargs):
+        observed.update({"argv": argv, **kwargs})
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(executor.subprocess, "run", fake_run)
+    result = executor._ssh(
+        {
+            "ssh_key": "/tmp/key",
+            "ssh_user": "ubuntu",
+            "hosts": {"c1": "192.0.2.1"},
+        },
+        "c1",
+        "true",
+        timeout_seconds=17.5,
+    )
+    assert result.returncode == 0
+    assert observed["timeout"] == 17.5
+
+
+def test_supervisor_launch_intent_is_durable_before_detached_spawn() -> None:
+    source = Path(executor.__file__).read_text(encoding="utf-8")
+    execute_start = source.index("def execute(")
+    pending = source.index('"launch_pending_worker_id": worker_id', execute_start)
+    spawn = source.index("result = _ssh(hosts, alias, launch)", pending)
+    pid = source.index("lane_pids[worker_id] = int", spawn)
+    clear = source.index('receipt.pop("launch_pending_worker_id", None)', pid)
+    assert pending < spawn < pid < clear
+
+
+def test_resume_refuses_unresolved_pending_supervisor_launch(tmp_path: Path) -> None:
+    public = {"plan_sha256": "sha256:pending"}
+    receipt = tmp_path / "receipt.json"
+    receipt.write_text(
+        json.dumps(
+            {
+                "schema_version": executor.RECEIPT_SCHEMA,
+                "plan_sha256": public["plan_sha256"],
+                "status": "launching",
+                "lane_pids": {},
+                "launch_pending_worker_id": "c1_gpu0",
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(executor.ExecutorError, match="unresolved pending"):
+        executor._resume_receipt(receipt, public, resume=True)
+
+
+def test_exact_stop_ssh_is_hard_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        executor,
+        "_ssh",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            subprocess.TimeoutExpired("ssh", executor.STOP_SSH_TIMEOUT_SECONDS)
+        ),
+    )
+    plan = {
+        "repo_artifacts_sha256": "sha256:repo",
+        "_private": {
+            "hosts": {
+                "remote_root": "/remote",
+                "python": "/venv/bin/python",
+            }
+        },
+    }
+    with pytest.raises(executor.ExecutorError, match="stop timed out"):
+        executor._stop_helper_call(
+            plan,
+            "c1_gpu0",
+            [{"host_alias": "c1"}],
+            action="stop",
+            supervisor_pid=0,
+        )
+
+
 def test_preflight_accepts_only_exact_report(monkeypatch: pytest.MonkeyPatch) -> None:
     report = {
         "gpu_indices": [0, 1, 2, 3],
@@ -435,6 +651,7 @@ def test_preflight_accepts_only_exact_report(monkeypatch: pytest.MonkeyPatch) ->
         "mps_enabled": "enabled",
         "mps_main_pid": 123,
         "mps_unit_sha256": executor._sha256(executor.MPS_UNIT_PATH),
+        "mps_limit_nofile_soft": executor.REQUIRED_NOFILE_SOFT,
         "client_environment": dict(executor.CLIENT_ENVIRONMENT),
         "python": "/venv/bin/python",
         "torch_version": "x",
@@ -467,6 +684,8 @@ def test_preflight_accepts_only_exact_report(monkeypatch: pytest.MonkeyPatch) ->
         ("nofile_soft", 1024, "soft RLIMIT_NOFILE"),
         ("nofile_hard", 1024, "hard RLIMIT_NOFILE"),
         ("nofile_soft", "65536", "invalid RLIMIT_NOFILE report"),
+        ("mps_limit_nofile_soft", 1024, "MPS LimitNOFILESoft"),
+        ("mps_limit_nofile_soft", "65536", "invalid MPS LimitNOFILESoft report"),
     ],
 )
 def test_preflight_fails_closed_on_nofile_report(
@@ -479,6 +698,7 @@ def test_preflight_fails_closed_on_nofile_report(
         "mps_enabled": "enabled",
         "mps_main_pid": 123,
         "mps_unit_sha256": executor._sha256(executor.MPS_UNIT_PATH),
+        "mps_limit_nofile_soft": executor.REQUIRED_NOFILE_SOFT,
         "client_environment": dict(executor.CLIENT_ENVIRONMENT),
         "python": "/venv/bin/python",
         "torch_version": "x",
@@ -516,7 +736,7 @@ def test_supervisor_launch_raises_nofile_before_new_session_and_env(
 import json,os,pathlib,resource,sys,time
 path=pathlib.Path(os.environ['A1_TEST_OBSERVATION'])
 soft,hard=resource.getrlimit(resource.RLIMIT_NOFILE)
-path.write_text(json.dumps({'argv':sys.argv[1:],'soft':soft,'hard':hard,'pid':os.getpid(),'sid':os.getsid(0),'pgid':os.getpgrp(),'pipe':os.environ.get('CUDA_MPS_PIPE_DIRECTORY'),'pythonpath':os.environ.get('PYTHONPATH'),'dont_write_bytecode':os.environ.get('PYTHONDONTWRITEBYTECODE')}))
+path.write_text(json.dumps({'argv':sys.argv[1:],'soft':soft,'hard':hard,'pid':os.getpid(),'sid':os.getsid(0),'pgid':os.getpgrp(),'pipe':os.environ.get('CUDA_MPS_PIPE_DIRECTORY'),'pythonpath':os.environ.get('PYTHONPATH'),'dont_write_bytecode':os.environ.get('PYTHONDONTWRITEBYTECODE'),'tf32_override':os.environ.get('NVIDIA_TF32_OVERRIDE'),'pythonhome':os.environ.get('PYTHONHOME')}))
 time.sleep(30)
 """,
         encoding="utf-8",
@@ -534,9 +754,13 @@ time.sleep(30)
         _current_soft, current_hard = resource.getrlimit(resource.RLIMIT_NOFILE)
         resource.setrlimit(resource.RLIMIT_NOFILE, (1024, current_hard))
 
+    hostile_environment = os.environ.copy()
+    hostile_environment["NVIDIA_TF32_OVERRIDE"] = "1"
+    hostile_environment["PYTHONHOME"] = "/unsealed/ambient-python"
     result = subprocess.run(
         shlex.split(command), text=True, capture_output=True, check=False,
         preexec_fn=low_soft_nofile,
+        env=hostile_environment,
     )
     assert result.returncode == 0, result.stderr
     pid = int(result.stdout.strip())
@@ -551,6 +775,8 @@ time.sleep(30)
         assert observed["pipe"] == executor.CLIENT_ENVIRONMENT["CUDA_MPS_PIPE_DIRECTORY"]
         assert observed["pythonpath"] == "/sealed/repo/src:/sealed/repo"
         assert observed["dont_write_bytecode"] == "1"
+        assert observed["tf32_override"] is None
+        assert observed["pythonhome"] is None
     finally:
         try:
             os.killpg(pid, signal.SIGKILL)

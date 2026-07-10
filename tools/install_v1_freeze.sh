@@ -37,6 +37,7 @@ RS_WHEEL_NAME="catanatron_rs-0.1.4-cp311-cp311-manylinux_2_34_x86_64.whl"
 RS_WHEEL_SHA256_FILE_REL="native/catanatron-rs/WHEEL_SHA256SUMS"
 TORCH_INDEX="${TORCH_INDEX:-https://download.pytorch.org/whl/cu128}"
 PY="${PY:-python3.11}"
+MPS_REQUIRED_LIMIT_NOFILE_SOFT=65536
 
 INSTALL_TMP=""
 EXPORTER_TRANSACTION_ARMED=0
@@ -250,7 +251,21 @@ if [ "$(systemctl is-active nvidia-mps.service)" != "active" ] \
   sudo systemctl status nvidia-mps.service --no-pager >&2 || true
   exit 3
 fi
-echo "[install] nvidia-mps.service active+enabled"
+if ! CATAN_MPS_LIMIT_NOFILE_SOFT="$(
+  systemctl show nvidia-mps.service --property=LimitNOFILESoft --value
+)"; then
+  echo "[install] ERROR: cannot inspect nvidia-mps.service LimitNOFILESoft" >&2
+  sudo systemctl status nvidia-mps.service --no-pager >&2 || true
+  exit 3
+fi
+if [[ ! "$CATAN_MPS_LIMIT_NOFILE_SOFT" =~ ^[0-9]+$ ]] \
+  || [ "$CATAN_MPS_LIMIT_NOFILE_SOFT" -lt "$MPS_REQUIRED_LIMIT_NOFILE_SOFT" ]; then
+  echo "[install] ERROR: nvidia-mps.service effective LimitNOFILESoft is " \
+    "$CATAN_MPS_LIMIT_NOFILE_SOFT; required >=$MPS_REQUIRED_LIMIT_NOFILE_SOFT" >&2
+  sudo systemctl status nvidia-mps.service --no-pager >&2 || true
+  exit 3
+fi
+echo "[install] nvidia-mps.service active+enabled LimitNOFILESoft=$CATAN_MPS_LIMIT_NOFILE_SOFT"
 
 # 3. venv — Python 3.11 is REQUIRED (cp311 rust wheel; matches B200/H100 ~/venv).
 #    Bootstrap 3.11 via `uv` when $PY is absent (H100 canaries ship python3.10
@@ -479,6 +494,7 @@ export RS_WHEEL_NAME RS_WHEEL_ACTUAL_SHA256 RS_WHEEL_EXPECTED_SHA256
 export RS_WHEEL_SHA256_FILE_REL RS_WHEEL_INVENTORY_SHA256
 export CATAN_MPS_ACTIVE="$(systemctl is-active nvidia-mps.service)"
 export CATAN_MPS_ENABLED="$(systemctl is-enabled nvidia-mps.service)"
+export CATAN_MPS_LIMIT_NOFILE_SOFT
 export CATAN_EXPORTER_ACTIVE="$(systemctl is-active catan-fleet-exporter.service)"
 export CATAN_EXPORTER_ENABLED="$(systemctl is-enabled catan-fleet-exporter.service)"
 export CATAN_EXPORTER_FRAGMENT_PATH CATAN_EXPORTER_DROPIN_PATHS CATAN_EXPORTER_ATTESTATION_JSON
@@ -531,6 +547,9 @@ payload = {
     "services": {
         "nvidia_mps_active": os.environ["CATAN_MPS_ACTIVE"],
         "nvidia_mps_enabled": os.environ["CATAN_MPS_ENABLED"],
+        "nvidia_mps_limit_nofile_soft": int(
+            os.environ["CATAN_MPS_LIMIT_NOFILE_SOFT"]
+        ),
         "fleet_exporter_active": os.environ["CATAN_EXPORTER_ACTIVE"],
         "fleet_exporter_enabled": os.environ["CATAN_EXPORTER_ENABLED"],
         "fleet_exporter_fragment_path": os.environ["CATAN_EXPORTER_FRAGMENT_PATH"],

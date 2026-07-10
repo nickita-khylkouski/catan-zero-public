@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -23,6 +24,20 @@ CATEGORY_ORDER = ("current_producer", "recent_history", "hard_negative")
 CLIENT_ENVIRONMENT = {
     "CUDA_MPS_PIPE_DIRECTORY": "/tmp/mps_pipe_host",
     "CUDA_MPS_LOG_DIRECTORY": "/tmp/mps_log_host",
+}
+CONFIG_REGISTRY_ENVIRONMENT_VARIABLE = "CATAN_ZERO_CONFIG_REGISTRY"
+CONFIG_REGISTRY_FILENAME = "config_registry.jsonl"
+RUNTIME_REPO_TOKEN = "__A1_RUNTIME_REPO__"
+SEALED_RUNTIME_ENVIRONMENT = {
+    "HOME": "/home/ubuntu",
+    "LANG": "C.UTF-8",
+    "LC_ALL": "C.UTF-8",
+    "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    "PYTHONHASHSEED": "0",
+    "PYTHONDONTWRITEBYTECODE": "1",
+    "PYTHONNOUSERSITE": "1",
+    "TMPDIR": "/tmp",
+    "TZ": "UTC",
 }
 FORBIDDEN_ADAPTIVE_ARGV = (
     "--n-full-wide",
@@ -49,6 +64,126 @@ def _sha256(path: Path) -> str:
         for block in iter(lambda: handle.read(1 << 20), b""):
             digest.update(block)
     return "sha256:" + digest.hexdigest()
+
+
+def _sha256_bytes(payload: bytes) -> str:
+    return "sha256:" + hashlib.sha256(payload).hexdigest()
+
+
+def _validate_registry_payload(
+    payload: bytes, *, expected: dict[str, Any], manifest_hash: Any, job_id: str
+) -> None:
+    try:
+        records = [
+            json.loads(line)
+            for line in payload.decode("utf-8").splitlines()
+            if line.strip()
+        ]
+    except (UnicodeError, json.JSONDecodeError) as error:
+        raise SupervisorError(f"completed job {job_id} has an invalid config registry") from error
+    if len(records) != 1 or not isinstance(records[0], dict):
+        raise SupervisorError(
+            f"completed job {job_id} registry must contain exactly one object"
+        )
+    record = records[0]
+    if set(record) != {
+        "config_hash",
+        "full_config_hash",
+        "pipeline",
+        "timestamp",
+        "purpose",
+        "config",
+    }:
+        raise SupervisorError(f"completed job {job_id} registry fields drifted")
+    if not isinstance(record.get("timestamp"), str) or not isinstance(
+        record.get("purpose"), str
+    ):
+        raise SupervisorError(f"completed job {job_id} registry metadata types drifted")
+    config = record.get("config")
+    if not isinstance(config, dict):
+        raise SupervisorError(f"completed job {job_id} registry config is absent")
+    full_hash = _digest(config)
+    short_hash = "sha256:" + full_hash.removeprefix("sha256:")[:16]
+    expected_unhashed = dict(expected)
+    declared = expected_unhashed.pop("provenance_sha256", None)
+    if declared != _digest(expected_unhashed):
+        raise SupervisorError(f"completed job {job_id} typed config provenance drifted")
+    if (
+        record.get("pipeline") != "generate"
+        or config.get("pipeline") != "generate"
+        or record.get("full_config_hash") != full_hash
+        or record.get("config_hash") != short_hash
+        or manifest_hash != short_hash
+        or any(record.get(key) != expected_unhashed.get(key) for key in expected_unhashed)
+    ):
+        raise SupervisorError(
+            f"completed job {job_id} registry differs from its exact typed config"
+        )
+
+
+def _read_fsync_seal_registry(path: Path, *, job_id: str) -> tuple[bytes, str]:
+    """Durably seal and single-read a registry after its generator has exited."""
+
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise SupervisorError(
+            f"completed job {job_id} cannot open its config registry: {error}"
+        ) from error
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode):
+            raise SupervisorError(f"completed job {job_id} registry is not regular")
+        os.fsync(descriptor)
+        os.fchmod(descriptor, 0o444)
+        os.fsync(descriptor)
+        before = os.fstat(descriptor)
+        chunks: list[bytes] = []
+        while chunk := os.read(descriptor, 1 << 20):
+            chunks.append(chunk)
+        payload = b"".join(chunks)
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        verification_chunks: list[bytes] = []
+        while chunk := os.read(descriptor, 1 << 20):
+            verification_chunks.append(chunk)
+        if b"".join(verification_chunks) != payload:
+            raise SupervisorError(
+                f"completed job {job_id} registry mutated during sealing"
+            )
+        after_read = os.fstat(descriptor)
+        before_identity = (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        )
+        after_identity = (
+            after_read.st_dev,
+            after_read.st_ino,
+            after_read.st_size,
+            after_read.st_mtime_ns,
+            after_read.st_ctime_ns,
+        )
+        if before_identity != after_identity or len(payload) != after_read.st_size:
+            raise SupervisorError(
+                f"completed job {job_id} registry mutated during sealing"
+            )
+        current = os.stat(path, follow_symlinks=False)
+        if (
+            (current.st_dev, current.st_ino) != (before.st_dev, before.st_ino)
+            or stat.S_IMODE(current.st_mode) != 0o444
+        ):
+            raise SupervisorError(f"completed job {job_id} registry changed while sealing")
+    finally:
+        os.close(descriptor)
+    directory = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+    return payload, _sha256_bytes(payload)
 
 
 def _load(path: Path) -> dict[str, Any]:
@@ -156,11 +291,61 @@ def load_lane(path: Path) -> dict[str, Any]:
         if command.get("must_run_after") != expected_dependencies:
             raise SupervisorError("job dependency order drift")
         environment = command.get("environment", {})
-        if environment.get("CUDA_VISIBLE_DEVICES") != gpu:
+        if not isinstance(environment, dict) or not all(
+            isinstance(key, str) and isinstance(value, str)
+            for key, value in environment.items()
+        ):
+            raise SupervisorError("job environment must be an exact string mapping")
+        expected_keys = {
+            *SEALED_RUNTIME_ENVIRONMENT,
+            "PYTHONPATH",
+            "CUDA_VISIBLE_DEVICES",
+            *CLIENT_ENVIRONMENT,
+            "CATAN_SEED_LEDGER",
+            "CATAN_A1_CONTRACT_SHA256",
+            CONFIG_REGISTRY_ENVIRONMENT_VARIABLE,
+        }
+        if "CATAN_A1_CANARY_ID" in environment:
+            expected_keys.add("CATAN_A1_CANARY_ID")
+        if set(environment) != expected_keys:
+            raise SupervisorError("job exact environment fields drift")
+        if command.get("environment_sha256") != _digest(environment):
+            raise SupervisorError("job environment semantic digest mismatch")
+        expected_runtime = {
+            **SEALED_RUNTIME_ENVIRONMENT,
+            "PYTHONPATH": f"{lane['repo_dir']}/src:{lane['repo_dir']}",
+        }
+        for key, value in expected_runtime.items():
+            if environment[key] != value:
+                raise SupervisorError(f"job sealed runtime environment drift: {key}")
+        source_environment = {
+            **environment,
+            "PYTHONPATH": f"{RUNTIME_REPO_TOKEN}/src:{RUNTIME_REPO_TOKEN}",
+        }
+        if command.get("render_environment_sha256") != _digest(source_environment):
+            raise SupervisorError("job render-to-runtime environment binding drift")
+        if environment["CUDA_VISIBLE_DEVICES"] != gpu:
             raise SupervisorError("job CUDA_VISIBLE_DEVICES differs from lane GPU")
         for key, value in CLIENT_ENVIRONMENT.items():
-            if environment.get(key) != value:
+            if environment[key] != value:
                 raise SupervisorError(f"job {key} differs from the systemd MPS service")
+        out_dir = Path(argv[argv.index("--out-dir") + 1])
+        registry = Path(environment[CONFIG_REGISTRY_ENVIRONMENT_VARIABLE])
+        if not out_dir.is_absolute() or registry != out_dir / CONFIG_REGISTRY_FILENAME:
+            raise SupervisorError("job config registry is not sealed inside its output")
+        if not Path(environment["CATAN_SEED_LEDGER"]).is_absolute():
+            raise SupervisorError("job seed ledger must be an absolute path")
+        provenance = command.get("config_provenance")
+        if not isinstance(provenance, dict):
+            raise SupervisorError("job lacks exact typed config provenance")
+        unhashed_provenance = dict(provenance)
+        provenance_sha256 = unhashed_provenance.pop("provenance_sha256", None)
+        if (
+            set(unhashed_provenance)
+            != {"pipeline", "config_hash", "full_config_hash", "config"}
+            or provenance_sha256 != _digest(unhashed_provenance)
+        ):
+            raise SupervisorError("job typed config provenance digest drift")
         previous = str(command["job_id"])
     return lane
 
@@ -322,13 +507,73 @@ def _validate_completed(command: dict[str, Any]) -> dict[str, Any]:
         != int(argv[argv.index("--base-seed") + 1])
     ):
         raise SupervisorError(f"completed job {command['job_id']} manifest is not exact/clean")
+    registry_path = Path(
+        command["environment"][CONFIG_REGISTRY_ENVIRONMENT_VARIABLE]
+    )
+    if registry_path.parent != out_dir:
+        raise SupervisorError(
+            f"completed job {command['job_id']} lacks its sealed config registry"
+        )
+    config_hash = manifest.get("config_hash")
+    registry_payload, registry_sha256 = _read_fsync_seal_registry(
+        registry_path, job_id=str(command["job_id"])
+    )
+    _validate_registry_payload(
+        registry_payload,
+        expected=command["config_provenance"],
+        manifest_hash=config_hash,
+        job_id=str(command["job_id"]),
+    )
     if _sha256(attestation_path) != command["output_attestation"]["source_file_sha256"]:
         raise SupervisorError(f"job {command['job_id']} attestation bytes drifted")
     return {
         "manifest": str(manifest_path),
         "manifest_sha256": _sha256(manifest_path),
         "attestation_sha256": _sha256(attestation_path),
+        "config_registry": str(registry_path),
+        "config_registry_sha256": registry_sha256,
     }
+
+
+def _ensure_config_registry(command: dict[str, Any]) -> Path:
+    """Create and prove the job-private registry is a writable regular file."""
+
+    argv = command["argv"]
+    out_dir = Path(argv[argv.index("--out-dir") + 1])
+    registry = Path(
+        command["environment"][CONFIG_REGISTRY_ENVIRONMENT_VARIABLE]
+    )
+    if registry != out_dir / CONFIG_REGISTRY_FILENAME:
+        raise SupervisorError(f"config registry path drift for {command['job_id']}")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    if out_dir.is_symlink() or not out_dir.is_dir():
+        raise SupervisorError(f"unsafe output directory for {command['job_id']}")
+    if registry.exists():
+        if registry.is_symlink() or not registry.is_file():
+            raise SupervisorError(f"unsafe config registry for {command['job_id']}")
+    else:
+        try:
+            descriptor = os.open(
+                registry, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
+            )
+        except FileExistsError:
+            if registry.is_symlink() or not registry.is_file():
+                raise SupervisorError(
+                    f"unsafe config registry race for {command['job_id']}"
+                )
+        else:
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.flush()
+                os.fsync(handle.fileno())
+    try:
+        with registry.open("ab") as handle:
+            handle.flush()
+            os.fsync(handle.fileno())
+    except OSError as error:
+        raise SupervisorError(
+            f"config registry is not writable for {command['job_id']}: {error}"
+        ) from error
+    return registry
 
 
 def _ensure_attestation(command: dict[str, Any]) -> None:
@@ -365,7 +610,12 @@ def _run_job(lane: dict[str, Any], command: dict[str, Any]) -> dict[str, Any]:
         if receipt.get("argv_sha256") != command["argv_sha256"]:
             raise SupervisorError(f"job receipt argv drift: {receipt_path}")
         if receipt.get("status") == "complete":
-            _validate_completed(command)
+            current = _validate_completed(command)
+            for key, value in current.items():
+                if receipt.get(key) != value:
+                    raise SupervisorError(
+                        f"completed job receipt {key} drift: {receipt_path}"
+                    )
             return receipt
     else:
         out_dir = Path(command["argv"][command["argv"].index("--out-dir") + 1])
@@ -412,9 +662,12 @@ def _run_job(lane: dict[str, Any], command: dict[str, Any]) -> dict[str, Any]:
                 receipt,
                 reason="incomplete_attempt",
             )
+        _ensure_config_registry(command)
         _ensure_attestation(command)
-        environment = os.environ.copy()
-        environment.update({str(k): str(v) for k, v in command["environment"].items()})
+        # The child receives only the materialized, digest-bound environment.
+        # Inheriting the supervisor/SSH shell could silently inject Python/CUDA
+        # controls (PYTHONHOME, LD_PRELOAD, NVIDIA_TF32_OVERRIDE, etc.).
+        environment = {str(k): str(v) for k, v in command["environment"].items()}
         log_path = Path(lane["log_dir"]) / f"{command['job_id']}.log"
         log_path.parent.mkdir(parents=True, exist_ok=True)
         receipt.update(

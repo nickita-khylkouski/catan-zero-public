@@ -8,6 +8,9 @@ ConditionPathExists=/usr/bin/nvidia-cuda-mps-control
 Type=simple
 User=ubuntu
 Group=ubuntu
+# MPS servers inherit this limit from the control daemon. The system default
+# of 1,024 descriptors is too low for 16 concurrent self-play clients.
+LimitNOFILE=65536
 Environment=CUDA_MPS_PIPE_DIRECTORY=/tmp/mps_pipe_host
 Environment=CUDA_MPS_LOG_DIRECTORY=/tmp/mps_log_host
 ExecStartPre=/usr/bin/rm -rf /tmp/mps_pipe_host /tmp/mps_log_host

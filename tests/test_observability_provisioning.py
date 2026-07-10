@@ -150,6 +150,41 @@ def test_committed_dashboard_covers_required_gpu_and_generator_metrics() -> None
         assert metric in expressions
 
 
+def test_dashboard_box_filter_uses_prometheus_fleet_alias_consistently() -> None:
+    dashboard_path = OBS / "grafana/dashboards/catan_fleet_production.json"
+    dashboard = json.loads(dashboard_path.read_text(encoding="utf-8"))
+    variables = dashboard["templating"]["list"]
+    assert len(variables) == 1
+    box = variables[0]
+    assert box["name"] == "box"
+    assert box["query"]["query"] == "label_values(catan_fleet_exporter_up, box)"
+    assert box["includeAll"] is True
+    assert box["current"] == {"text": "All", "value": "$__all"}
+
+    catan_targets = [
+        target
+        for panel in dashboard["panels"]
+        for target in panel.get("targets", [])
+        if "catan_fleet_" in target.get("expr", "")
+    ]
+    assert catan_targets
+    for target in catan_targets:
+        expression = target["expr"]
+        assert 'box=~"$box"' in expression
+        assert 'host=~"$box"' not in expression
+
+    rate_panel = next(
+        panel
+        for panel in dashboard["panels"]
+        if panel["title"] == "Rows and simulations rate"
+    )
+    assert all("sum by(box)" in target["expr"] for target in rate_panel["targets"])
+    assert {target["legendFormat"] for target in rate_panel["targets"]} == {
+        "{{box}} rows/s",
+        "{{box}} sims/s",
+    }
+
+
 def test_prometheus_and_grafana_provisioning_are_committed() -> None:
     prometheus = (OBS / "prometheus/prometheus.yml").read_text(encoding="utf-8")
     assert "job_name: dcgm" in prometheus

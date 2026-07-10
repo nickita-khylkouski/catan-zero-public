@@ -19,7 +19,7 @@
         "name": "box",
         "type": "query",
         "datasource": {"type": "prometheus", "uid": "prometheus"},
-        "query": {"query": "label_values(catan_fleet_exporter_up, host)", "refId": "A"},
+        "query": {"query": "label_values(catan_fleet_exporter_up, box)", "refId": "A"},
         "refresh": 2,
         "includeAll": true,
         "multi": true,
@@ -44,7 +44,7 @@
       "title": "Healthy generators",
       "gridPos": {"h": 4, "w": 4, "x": 4, "y": 0},
       "datasource": {"type": "prometheus", "uid": "prometheus"},
-      "targets": [{"refId": "A", "expr": "sum(catan_fleet_generator_healthy{host=~\"$box\"}) or vector(0)"}],
+      "targets": [{"refId": "A", "expr": "sum(catan_fleet_generator_healthy{box=~\"$box\"}) or vector(0)"}],
       "fieldConfig": {"defaults": {"unit": "none", "color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "green", "value": 1}]}}, "overrides": []},
       "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "colorMode": "background", "graphMode": "none", "textMode": "value"}
     },
@@ -54,7 +54,7 @@
       "title": "Stale active generators",
       "gridPos": {"h": 4, "w": 4, "x": 8, "y": 0},
       "datasource": {"type": "prometheus", "uid": "prometheus"},
-      "targets": [{"refId": "A", "expr": "count((catan_fleet_generator_progress_age_seconds{host=~\"$box\"} > 300) and (catan_fleet_generator_processes{host=~\"$box\"} > 0)) or vector(0)"}],
+      "targets": [{"refId": "A", "expr": "count((catan_fleet_generator_progress_age_seconds{box=~\"$box\"} > 300) and (catan_fleet_generator_processes{box=~\"$box\"} > 0)) or vector(0)"}],
       "fieldConfig": {"defaults": {"unit": "none", "color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "red", "value": 1}]}}, "overrides": []},
       "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "colorMode": "background", "graphMode": "none", "textMode": "value"}
     },
@@ -65,8 +65,8 @@
       "gridPos": {"h": 4, "w": 6, "x": 12, "y": 0},
       "datasource": {"type": "prometheus", "uid": "prometheus"},
       "targets": [
-        {"refId": "A", "expr": "sum(catan_fleet_generator_failures{host=~\"$box\"}) or vector(0)", "legendFormat": "failures"},
-        {"refId": "B", "expr": "sum(catan_fleet_generator_truncations{host=~\"$box\"}) or vector(0)", "legendFormat": "truncations"}
+        {"refId": "A", "expr": "sum(catan_fleet_generator_failures{box=~\"$box\"}) or vector(0)", "legendFormat": "failures"},
+        {"refId": "B", "expr": "sum(catan_fleet_generator_truncations{box=~\"$box\"}) or vector(0)", "legendFormat": "truncations"}
       ],
       "fieldConfig": {"defaults": {"unit": "none", "color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "red", "value": 1}]}}, "overrides": []},
       "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "colorMode": "value", "graphMode": "none", "textMode": "value_and_name"}
@@ -77,7 +77,7 @@
       "title": "Output disk free",
       "gridPos": {"h": 4, "w": 6, "x": 18, "y": 0},
       "datasource": {"type": "prometheus", "uid": "prometheus"},
-      "targets": [{"refId": "A", "expr": "min(catan_fleet_output_disk_free_bytes{host=~\"$box\"})"}],
+      "targets": [{"refId": "A", "expr": "min(catan_fleet_output_disk_free_bytes{box=~\"$box\"})"}],
       "fieldConfig": {"defaults": {"unit": "bytes", "color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "orange", "value": 107374182400}, {"color": "green", "value": 536870912000}]}}, "overrides": []},
       "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "colorMode": "value", "graphMode": "area", "textMode": "value"}
     },
@@ -128,13 +128,13 @@
       "gridPos": {"h": 10, "w": 16, "x": 0, "y": 20},
       "datasource": {"type": "prometheus", "uid": "prometheus"},
       "targets": [
-        {"refId": "A", "expr": "catan_fleet_generator_games_completed{host=~\"$box\"}", "format": "table", "instant": true, "legendFormat": "games"},
-        {"refId": "B", "expr": "catan_fleet_generator_rows{host=~\"$box\"}", "format": "table", "instant": true, "legendFormat": "rows"},
-        {"refId": "C", "expr": "catan_fleet_generator_simulations{host=~\"$box\"}", "format": "table", "instant": true, "legendFormat": "sims"},
-        {"refId": "D", "expr": "catan_fleet_generator_shards{host=~\"$box\"}", "format": "table", "instant": true, "legendFormat": "shards"},
-        {"refId": "E", "expr": "catan_fleet_generator_progress_age_seconds{host=~\"$box\"}", "format": "table", "instant": true, "legendFormat": "age"},
-        {"refId": "F", "expr": "catan_fleet_generator_processes{host=~\"$box\"}", "format": "table", "instant": true, "legendFormat": "processes"},
-        {"refId": "G", "expr": "catan_fleet_generator_healthy{host=~\"$box\"}", "format": "table", "instant": true, "legendFormat": "healthy"}
+        {"refId": "A", "expr": "catan_fleet_generator_games_completed{box=~\"$box\"}", "format": "table", "instant": true, "legendFormat": "games"},
+        {"refId": "B", "expr": "catan_fleet_generator_rows{box=~\"$box\"}", "format": "table", "instant": true, "legendFormat": "rows"},
+        {"refId": "C", "expr": "catan_fleet_generator_simulations{box=~\"$box\"}", "format": "table", "instant": true, "legendFormat": "sims"},
+        {"refId": "D", "expr": "catan_fleet_generator_shards{box=~\"$box\"}", "format": "table", "instant": true, "legendFormat": "shards"},
+        {"refId": "E", "expr": "catan_fleet_generator_progress_age_seconds{box=~\"$box\"}", "format": "table", "instant": true, "legendFormat": "age"},
+        {"refId": "F", "expr": "catan_fleet_generator_processes{box=~\"$box\"}", "format": "table", "instant": true, "legendFormat": "processes"},
+        {"refId": "G", "expr": "catan_fleet_generator_healthy{box=~\"$box\"}", "format": "table", "instant": true, "legendFormat": "healthy"}
       ],
       "transformations": [{"id": "merge", "options": {}}],
       "fieldConfig": {"defaults": {"custom": {"align": "auto"}}, "overrides": []},
@@ -146,7 +146,7 @@
       "title": "Config hash and seed range",
       "gridPos": {"h": 10, "w": 8, "x": 16, "y": 20},
       "datasource": {"type": "prometheus", "uid": "prometheus"},
-      "targets": [{"refId": "A", "expr": "catan_fleet_generator_info{host=~\"$box\"}", "format": "table", "instant": true}],
+      "targets": [{"refId": "A", "expr": "catan_fleet_generator_info{box=~\"$box\"}", "format": "table", "instant": true}],
       "fieldConfig": {"defaults": {"custom": {"align": "auto"}}, "overrides": []},
       "options": {"showHeader": true}
     },
@@ -157,8 +157,8 @@
       "gridPos": {"h": 8, "w": 24, "x": 0, "y": 30},
       "datasource": {"type": "prometheus", "uid": "prometheus"},
       "targets": [
-        {"refId": "A", "expr": "sum by(host)(rate(catan_fleet_generator_rows{host=~\"$box\"}[5m]))", "legendFormat": "{{host}} rows/s"},
-        {"refId": "B", "expr": "sum by(host)(rate(catan_fleet_generator_simulations{host=~\"$box\"}[5m]))", "legendFormat": "{{host}} sims/s"}
+        {"refId": "A", "expr": "sum by(box)(rate(catan_fleet_generator_rows{box=~\"$box\"}[5m]))", "legendFormat": "{{box}} rows/s"},
+        {"refId": "B", "expr": "sum by(box)(rate(catan_fleet_generator_simulations{box=~\"$box\"}[5m]))", "legendFormat": "{{box}} sims/s"}
       ],
       "fieldConfig": {"defaults": {"unit": "ops", "custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 8, "showPoints": "never"}}, "overrides": []},
       "options": {"legend": {"displayMode": "table", "placement": "right", "calcs": ["mean", "max"]}, "tooltip": {"mode": "multi", "sort": "desc"}}
@@ -170,7 +170,7 @@
       "description": "The sealed wave has exactly 40 physical H100 lanes.",
       "gridPos": {"h": 5, "w": 6, "x": 0, "y": 38},
       "datasource": {"type": "prometheus", "uid": "prometheus"},
-      "targets": [{"refId": "A", "expr": "sum(catan_fleet_generator_lanes_active_total{host=~\"$box\"}) or vector(0)"}],
+      "targets": [{"refId": "A", "expr": "sum(catan_fleet_generator_lanes_active_total{box=~\"$box\"}) or vector(0)"}],
       "fieldConfig": {"defaults": {"unit": "none", "max": 40, "color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "green", "value": 40}]}}, "overrides": []},
       "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "colorMode": "background", "graphMode": "none", "textMode": "value"}
     },
@@ -181,7 +181,7 @@
       "description": "Active lanes matching every exact n128 information-set recipe field and the public target regime.",
       "gridPos": {"h": 5, "w": 6, "x": 6, "y": 38},
       "datasource": {"type": "prometheus", "uid": "prometheus"},
-      "targets": [{"refId": "A", "expr": "sum(catan_fleet_generator_lanes_recipe_safe_total{host=~\"$box\"}) or vector(0)"}],
+      "targets": [{"refId": "A", "expr": "sum(catan_fleet_generator_lanes_recipe_safe_total{box=~\"$box\"}) or vector(0)"}],
       "fieldConfig": {"defaults": {"unit": "none", "max": 40, "color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "green", "value": 40}]}}, "overrides": []},
       "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "colorMode": "background", "graphMode": "none", "textMode": "value"}
     },
@@ -191,7 +191,7 @@
       "title": "Exact recipe safety by active lane",
       "gridPos": {"h": 5, "w": 12, "x": 12, "y": 38},
       "datasource": {"type": "prometheus", "uid": "prometheus"},
-      "targets": [{"refId": "A", "expr": "catan_fleet_generator_recipe_safe{host=~\"$box\"} and catan_fleet_generator_active{host=~\"$box\"} == 1", "legendFormat": "{{alias}}/gpu{{gpu}}/pipeline{{pipeline}}"}],
+      "targets": [{"refId": "A", "expr": "catan_fleet_generator_recipe_safe{box=~\"$box\"} and catan_fleet_generator_active{box=~\"$box\"} == 1", "legendFormat": "{{alias}}/gpu{{gpu}}/pipeline{{pipeline}}"}],
       "fieldConfig": {"defaults": {"unit": "none", "min": 0, "max": 1, "mappings": [{"type": "value", "options": {"0": {"text": "MISMATCH", "color": "red"}, "1": {"text": "SAFE", "color": "green"}}}]}, "overrides": []},
       "options": {"showValue": "always", "legend": {"displayMode": "hidden", "placement": "bottom"}, "tooltip": {"mode": "single"}}
     },
@@ -203,9 +203,9 @@
       "gridPos": {"h": 10, "w": 24, "x": 0, "y": 43},
       "datasource": {"type": "prometheus", "uid": "prometheus"},
       "targets": [
-        {"refId": "A", "expr": "catan_fleet_generator_info{host=~\"$box\"}", "format": "table", "instant": true},
-        {"refId": "B", "expr": "catan_fleet_generator_recipe_safe{host=~\"$box\"}", "format": "table", "instant": true, "legendFormat": "recipe_safe"},
-        {"refId": "C", "expr": "catan_fleet_generator_target_information_regime_attested{host=~\"$box\"}", "format": "table", "instant": true, "legendFormat": "regime_attested"}
+        {"refId": "A", "expr": "catan_fleet_generator_info{box=~\"$box\"}", "format": "table", "instant": true},
+        {"refId": "B", "expr": "catan_fleet_generator_recipe_safe{box=~\"$box\"}", "format": "table", "instant": true, "legendFormat": "recipe_safe"},
+        {"refId": "C", "expr": "catan_fleet_generator_target_information_regime_attested{box=~\"$box\"}", "format": "table", "instant": true, "legendFormat": "regime_attested"}
       ],
       "transformations": [{"id": "merge", "options": {}}],
       "fieldConfig": {"defaults": {"custom": {"align": "auto"}}, "overrides": []},

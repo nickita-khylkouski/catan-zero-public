@@ -1274,6 +1274,12 @@ def test_render_writes_commands_only_and_never_overwrites(tmp_path: Path) -> Non
     )
     current = payload["commands"][0]
     assert current["environment"]["CATAN_A1_CONTRACT_SHA256"] == lock["contract_sha256"]
+    assert current["environment"]["CATAN_ZERO_CONFIG_REGISTRY"] == str(
+        Path(lock["fleet"]["jobs"][0]["output_dir"]) / "config_registry.jsonl"
+    )
+    assert current["environment_sha256"] == contract._digest_value(
+        current["environment"]
+    )
     assert current["output_attestation"]["destination"].endswith("/a1_contract.json")
     assert current["ledger_claim"] == {
         "path": lock["fleet"]["seed_ledger"]["path"],
@@ -1595,6 +1601,29 @@ def test_post_wave_audit_canonicalizes_symlinked_contract_path(
     assert payload["contract_path"] == str(lock_path.resolve(strict=True))
 
 
+def test_single_read_registry_evidence_rejects_in_place_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registry = tmp_path / "config_registry.jsonl"
+    registry.write_bytes(b"x" * 128)
+    registry.chmod(0o444)
+    original_read = contract.os.read
+    changed = False
+
+    def racing_read(descriptor: int, size: int) -> bytes:
+        nonlocal changed
+        payload = original_read(descriptor, size)
+        if payload and not changed:
+            changed = True
+            registry.chmod(0o644)
+            registry.write_bytes(b"y" * 128)
+        return payload
+
+    monkeypatch.setattr(contract.os, "read", racing_read)
+    with pytest.raises(contract.ContractError, match="mutated during read"):
+        contract._read_sealed_regular(registry, where="race-test")
+
+
 def test_post_wave_audit_accepts_exact_complete_category_corpus(tmp_path: Path) -> None:
     lock_path, lock = _lock(tmp_path)
     _append_job_claims(lock)
@@ -1653,6 +1682,7 @@ def test_post_wave_audit_accepts_exact_complete_category_corpus(tmp_path: Path) 
                 encoding="utf-8",
             )
             cli["opponent_mix_manifest"] = str(mix)
+        cli["producer_checkpoint_sha256"] = contract._producer(lock)["sha256"]
         worker = out_dir / "worker_000" / "manifest.json"
         worker.parent.mkdir()
         worker.write_text(
@@ -1668,9 +1698,24 @@ def test_post_wave_audit_accepts_exact_complete_category_corpus(tmp_path: Path) 
             ),
             encoding="utf-8",
         )
-        config_hash = contract.GenerateConfig.from_namespace(
-            Namespace(**cli)
-        ).config_hash()
+        typed_config = contract.GenerateConfig.from_namespace(Namespace(**cli))
+        config_hash = typed_config.config_hash()
+        registry_path = out_dir / "config_registry.jsonl"
+        registry_path.write_text(
+            json.dumps(
+                {
+                    "config_hash": config_hash,
+                    "full_config_hash": typed_config.full_config_hash(),
+                    "pipeline": "generate",
+                    "timestamp": "2026-07-10T00:00:00+00:00",
+                    "purpose": "test",
+                    "config": typed_config.canonical_payload(),
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        registry_path.chmod(0o444)
         (out_dir / "manifest.json").write_text(
             json.dumps(
                 {
@@ -1730,6 +1775,47 @@ def test_post_wave_audit_accepts_exact_complete_category_corpus(tmp_path: Path) 
     )
     assert {item["category"] for item in report["shards"]} == set(
         contract.EXPECTED_GAMES
+    )
+    registry_evidence = [
+        item for item in report["shards"] if item["kind"] == "config_registry"
+    ]
+    assert len(registry_evidence) == 120
+    assert all(item["config_hash"] for item in registry_evidence)
+    first_registry = (
+        Path(lock["fleet"]["jobs"][0]["output_dir"]) / "config_registry.jsonl"
+    )
+    original_registry = first_registry.read_text(encoding="utf-8")
+    first_registry.chmod(0o644)
+    first_registry.write_text(
+        '{"config_hash":"sha256:wrong","pipeline":"generate"}\n',
+        encoding="utf-8",
+    )
+    first_registry.chmod(0o444)
+    bad_registry_report = tmp_path / "audit.bad-registry.json"
+    with pytest.raises(contract.ContractError, match="post-wave audit failed"):
+        contract.audit_outputs(lock_path, bad_registry_report)
+    assert any(
+        "config registry record fields drift" in error
+        for error in json.loads(bad_registry_report.read_text())["errors"]
+    )
+    first_registry.chmod(0o644)
+    first_registry.write_text(original_registry, encoding="utf-8")
+    first_registry.chmod(0o444)
+    first_manifest = json.loads(
+        (Path(lock["fleet"]["jobs"][0]["output_dir"]) / "manifest.json").read_text()
+    )
+    first_worker = Path(first_manifest["worker_summaries"][0])
+    worker_payload = json.loads(first_worker.read_text(encoding="utf-8"))
+    worker_payload["target_information_regime"] = (
+        "authoritative_hidden_state_search_v1"
+    )
+    first_worker.write_text(json.dumps(worker_payload), encoding="utf-8")
+    bad_worker_report = tmp_path / "audit.bad-worker-regime.json"
+    with pytest.raises(contract.ContractError, match="post-wave audit failed"):
+        contract.audit_outputs(lock_path, bad_worker_report)
+    assert any(
+        "worker manifest target_information_regime" in error
+        for error in json.loads(bad_worker_report.read_text())["errors"]
     )
     assert report["source_provenance"]["hard_negative"]["opponent_checkpoint_sha256"]
     validation_path = Path(report["validation_holdout"]["manifest"])
