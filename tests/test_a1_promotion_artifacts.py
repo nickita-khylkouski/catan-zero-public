@@ -510,6 +510,9 @@ def test_evidence_prewrite_replays_transaction_validator(
         assert json.loads(path.read_text()) == value
 
     monkeypatch.setattr(promotion, "_verify_promotion_evidence", verify)
+    monkeypatch.setattr(
+        promotion, "_sealed_evaluation_semantics", lambda _contract: {"c_scale": 0.03}
+    )
     artifacts._validate_envelope_before_write(
         tmp_path / "final.json",
         value=value,
@@ -522,7 +525,12 @@ def test_evidence_prewrite_replays_transaction_validator(
     assert not called[0].exists()
 
 
-def test_adjudication_builder_derives_every_third_requirement(tmp_path: Path) -> None:
+def test_adjudication_builder_derives_every_third_requirement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        promotion, "_sealed_evaluation_semantics", lambda _contract: {"c_scale": 0.03}
+    )
     candidate, champion = _checkpoints(tmp_path)
     report = tmp_path / "training.json"
     _json(report, {"training": "report"})
@@ -556,6 +564,8 @@ def test_adjudication_builder_derives_every_third_requirement(tmp_path: Path) ->
 
     assert value["nth_confirmation_required"] is True
     assert value["nth_confirmation_passed"] is True
+    assert value["candidate"]["agent_identity"]["search_config"]["c_scale"] == 0.10
+    assert value["champion"]["agent_identity"]["search_config"]["c_scale"] == 0.03
     digest = value.pop("adjudication_sha256")
     assert digest == promotion._digest_value(value)
 

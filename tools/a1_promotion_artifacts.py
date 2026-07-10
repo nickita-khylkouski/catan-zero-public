@@ -706,6 +706,7 @@ def _validate_envelope_before_write(
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
             json.dump(value, handle, indent=2, sort_keys=True)
             handle.write("\n")
+        sealed_semantics = promotion._sealed_evaluation_semantics(contract)  # noqa: SLF001
         promotion._verify_promotion_evidence(  # noqa: SLF001
             temporary,
             kind=kind,
@@ -713,8 +714,20 @@ def _validate_envelope_before_write(
             expected_readout=str(
                 contract["science"]["learner_value_objective"]["value_readout"]
             ),
-            candidate={**_checkpoint_ref(candidate), "md5": promotion._md5(candidate)},  # noqa: SLF001
-            champion={**_checkpoint_ref(champion), "md5": promotion._md5(champion)},  # noqa: SLF001
+            candidate={
+                **_checkpoint_ref(candidate),
+                "md5": promotion._md5(candidate),  # noqa: SLF001
+                "search_config": promotion._role_search_config(  # noqa: SLF001
+                    sealed_semantics, role="candidate"
+                ),
+            },
+            champion={
+                **_checkpoint_ref(champion),
+                "md5": promotion._md5(champion),  # noqa: SLF001
+                "search_config": promotion._role_search_config(  # noqa: SLF001
+                    sealed_semantics, role="champion"
+                ),
+            },
         )
     except promotion.PromotionError as error:
         raise ArtifactBuildError(
@@ -755,20 +768,38 @@ def build_adjudication(
         raise ArtifactBuildError(
             "n64 confirmation was asserted for a non-third promotion"
         )
+    sealed_semantics = promotion._sealed_evaluation_semantics(contract)  # noqa: SLF001
+    candidate_ref = _checkpoint_ref(candidate)
+    champion_ref = _checkpoint_ref(champion)
     value = {
         "schema_version": promotion.ADJUDICATION_SCHEMA,
         "passed": True,
         "decision": "promote",
         "contract_sha256": contract["contract_sha256"],
         "candidate": {
-            **_checkpoint_ref(candidate),
+            **candidate_ref,
             "version": candidate_version,
+            "agent_identity": promotion._agent_identity(  # noqa: SLF001
+                candidate_ref,
+                promotion._role_search_config(  # noqa: SLF001
+                    sealed_semantics, role="candidate"
+                ),
+            ),
             "training_report": {
                 "path": str(training_report.expanduser().resolve()),
                 "sha256": promotion._sha256(training_report),  # noqa: SLF001
             },
         },
-        "champion": {**_checkpoint_ref(champion), "version": champion_version},
+        "champion": {
+            **champion_ref,
+            "version": champion_version,
+            "agent_identity": promotion._agent_identity(  # noqa: SLF001
+                champion_ref,
+                promotion._role_search_config(  # noqa: SLF001
+                    sealed_semantics, role="champion"
+                ),
+            ),
+        },
         "checks": {name: True for name in promotion.REQUIRED_CHECKS},
         "nth_confirmation_required": nth_required,
         "nth_confirmation_passed": nth_confirmation_passed,

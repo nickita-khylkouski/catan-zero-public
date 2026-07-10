@@ -50,6 +50,9 @@ FLEET_EVALUATION_POOL_SCHEMA = "a1-fleet-evaluation-pool-v1"
 LEGACY_INCUMBENT_PROVENANCE_SCHEMA = "a1-legacy-incumbent-provenance-v1"
 MAX_CALIBRATION_RMSE_REGRESSION = 0.02
 MAX_EXTERNAL_WIN_RATE_REGRESSION = 0.02
+CANDIDATE_DEPLOYED_C_SCALE = 0.10
+CHAMPION_DEPLOYED_C_SCALE = 0.03
+ROLE_SEARCH_CONFIG_SCHEMA = "a1-deployed-agent-search-config-v1"
 MIN_BUCKET_WIN_RATE = 0.45
 MIN_BUCKET_GAMES = 8
 REQUIRED_PROMOTION_BUCKETS = {
@@ -1026,6 +1029,131 @@ def _require_sealed_semantics(
             )
 
 
+def _role_search_config(
+    sealed_semantics: dict[str, Any], *, role: str
+) -> dict[str, Any]:
+    """Return the exact search operator bound to one deployed agent role."""
+
+    if role not in {"candidate", "champion"}:
+        raise PromotionError(f"unknown deployed-agent role {role!r}")
+    config = dict(sealed_semantics)
+    config["c_scale"] = (
+        CANDIDATE_DEPLOYED_C_SCALE if role == "candidate" else CHAMPION_DEPLOYED_C_SCALE
+    )
+    return config
+
+
+def _verify_role_search_config(
+    raw: Any,
+    *,
+    role: str,
+    sealed_semantics: dict[str, Any],
+    where: str,
+) -> dict[str, Any]:
+    """Validate a complete, typed, role-specific deployed search operator.
+
+    This is intentionally an exact-key comparator.  A report may carry
+    scheduling metadata beside this object, but no unknown or omitted search
+    field can become part of the promoted agent identity.
+    """
+
+    expected = _role_search_config(sealed_semantics, role=role)
+    actual = _require_exact_keys(raw, set(expected), where=where)
+    _require_sealed_semantics(actual, expected, where=where)
+    return actual
+
+
+def _verify_role_search_pair(
+    candidate_raw: Any,
+    champion_raw: Any,
+    *,
+    sealed_semantics: dict[str, Any],
+    where: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Prove two reports differ only by the approved role c_scale."""
+
+    candidate = _verify_role_search_config(
+        candidate_raw,
+        role="candidate",
+        sealed_semantics=sealed_semantics,
+        where=f"{where}.candidate",
+    )
+    champion = _verify_role_search_config(
+        champion_raw,
+        role="champion",
+        sealed_semantics=sealed_semantics,
+        where=f"{where}.champion",
+    )
+    for key in sorted(set(candidate) | set(champion)):
+        if key == "c_scale":
+            continue
+        if _canonical_bytes(candidate[key]) != _canonical_bytes(champion[key]):
+            raise PromotionError(f"{where} role search drift outside c_scale: {key}")
+    return candidate, champion
+
+
+def _agent_identity(
+    checkpoint: dict[str, Any], search_config: dict[str, Any]
+) -> dict[str, Any]:
+    identity = {
+        "schema_version": ROLE_SEARCH_CONFIG_SCHEMA,
+        "checkpoint": {
+            "path": checkpoint["path"],
+            "sha256": checkpoint["sha256"],
+        },
+        "search_config": search_config,
+    }
+    identity["agent_identity_sha256"] = _digest_value(identity)
+    return identity
+
+
+def _verify_agent_identity(
+    raw: Any,
+    *,
+    role: str,
+    checkpoint_path: Path,
+    checkpoint_sha256: str,
+    sealed_semantics: dict[str, Any],
+    base: Path,
+    where: str,
+) -> dict[str, Any]:
+    value = _require_exact_keys(
+        raw,
+        {
+            "schema_version",
+            "checkpoint",
+            "search_config",
+            "agent_identity_sha256",
+        },
+        where=where,
+    )
+    if value["schema_version"] != ROLE_SEARCH_CONFIG_SCHEMA:
+        raise PromotionError(f"{where} schema is not supported")
+    declared = _validate_sha256(
+        value["agent_identity_sha256"], where=f"{where}.agent_identity_sha256"
+    )
+    unhashed = dict(value)
+    unhashed.pop("agent_identity_sha256")
+    if declared != _digest_value(unhashed):
+        raise PromotionError(f"{where} semantic digest mismatch")
+    _verify_bound_checkpoint(
+        value["checkpoint"],
+        expected_path=checkpoint_path,
+        expected_sha256=checkpoint_sha256,
+        where=f"{where}.checkpoint",
+        base=base,
+    )
+    if value["checkpoint"]["path"] != str(checkpoint_path):
+        raise PromotionError(f"{where}.checkpoint.path must be canonical and absolute")
+    _verify_role_search_config(
+        value["search_config"],
+        role=role,
+        sealed_semantics=sealed_semantics,
+        where=f"{where}.search_config",
+    )
+    return value
+
+
 def _sealed_evaluation_semantics(contract: dict[str, Any]) -> dict[str, Any]:
     """Project the immutable A1 lock into deterministic evaluation semantics.
 
@@ -1128,6 +1256,8 @@ def _verify_internal_h2h_source(
     champion: Path,
     where: str,
     sealed_semantics: dict[str, Any],
+    candidate_search_config: dict[str, Any],
+    champion_search_config: dict[str, Any],
 ) -> None:
     if (
         _absolute(payload.get("candidate_checkpoint"), base=candidate.parent)
@@ -1178,6 +1308,8 @@ def _verify_internal_h2h_source(
     expected_fields = dict(sealed_semantics)
     expected_fields.update(
         {
+            "candidate_c_scale": candidate_search_config["c_scale"],
+            "baseline_c_scale": champion_search_config["c_scale"],
             "candidate_n_full": sealed_semantics["n_full"],
             "baseline_n_full": sealed_semantics["n_full"],
             "candidate_n_full_wide": sealed_semantics["n_full_wide"],
@@ -1192,6 +1324,18 @@ def _verify_internal_h2h_source(
     )
     config_where = "pooled effective config" if pooled else "typed config"
     _require_sealed_semantics(fields, expected_fields, where=f"{where} {config_where}")
+    _verify_role_search_pair(
+        {
+            **{key: fields[key] for key in candidate_search_config},
+            "c_scale": fields["candidate_c_scale"],
+        },
+        {
+            **{key: fields[key] for key in champion_search_config},
+            "c_scale": fields["baseline_c_scale"],
+        },
+        sealed_semantics=sealed_semantics,
+        where=f"{where} deployed search",
+    )
     if fields.get("public_observation") is not True:
         raise PromotionError(f"{where} typed config is not public-observation")
     expected_information_recipe = {
@@ -1282,6 +1426,8 @@ def _verify_external_panel_source(
     checkpoint_md5: str,
     where: str,
     sealed_semantics: dict[str, Any],
+    role: str,
+    deployed_search_config: dict[str, Any],
 ) -> tuple[float, dict[str, Any]]:
     if payload.get("stratum") != "neutral-harness":
         raise PromotionError(f"{where} is not a neutral-harness panel")
@@ -1339,9 +1485,14 @@ def _verify_external_panel_source(
     search_config = payload.get("search_config")
     if not isinstance(search_config, dict) or not search_config:
         raise PromotionError(f"{where} has no resolved search_config")
-    _require_sealed_semantics(
-        search_config, sealed_semantics, where=f"{where}.search_config"
+    verified_search_config = _verify_role_search_config(
+        search_config,
+        role=role,
+        sealed_semantics=sealed_semantics,
+        where=f"{where}.search_config",
     )
+    if verified_search_config != deployed_search_config:
+        raise PromotionError(f"{where} search config differs from agent identity")
     if pooled:
         effective = payload.get("effective_search_config")
         if effective != search_config:
@@ -1427,14 +1578,34 @@ def _verify_external_panel_source(
         raise PromotionError(f"{where} has malformed external-panel SPRT") from error
     if replayed_sprt != sprt or payload.get("verdict") != sprt.get("decision"):
         raise PromotionError(f"{where} external-panel SPRT does not replay")
+    cohort_fields = (
+        "stratum",
+        "harness",
+        "baseline_bot",
+        "mode",
+        "public_observation",
+        "information_set_search",
+        "determinization_particles",
+        "determinization_min_simulations",
+        "candidate_value_readout",
+        "trained_value_readouts",
+        "n_full",
+        "n_full_wide",
+        "map_kind",
+        "gate_config",
+        "pairs_requested",
+        "games_requested",
+    )
     cohort = {
-        "baseline_bot": payload["baseline_bot"],
-        "map_kind": payload.get("map_kind"),
-        "search_config": search_config,
-        "pairs_requested": payload.get("pairs_requested"),
-        "games_requested": payload.get("games_requested"),
+        "cohort_config": {key: payload.get(key) for key in cohort_fields},
         "cohort_rows": sorted(cohort_rows),
+        "pooled": pooled,
     }
+    if pooled:
+        cohort["fleet_seed_intervals"] = [
+            (interval["base_seed"], interval["end_seed"])
+            for interval in payload["fleet_merge"]["seed_intervals"]
+        ]
     return rate, cohort
 
 
@@ -1987,6 +2158,8 @@ def _verify_promotion_evidence(
             champion=champion_path,
             where="internal H2H",
             sealed_semantics=sealed_semantics,
+            candidate_search_config=candidate["search_config"],
+            champion_search_config=champion["search_config"],
         )
         if value["verdict"] != "H1" or result:
             raise PromotionError("internal H2H envelope verdict/result drift")
@@ -2006,6 +2179,8 @@ def _verify_promotion_evidence(
             checkpoint_md5=candidate["md5"],
             where="candidate external panel",
             sealed_semantics=sealed_semantics,
+            role="candidate",
+            deployed_search_config=candidate["search_config"],
         )
         champion_rate, champion_cohort = _verify_external_panel_source(
             champion_panel,
@@ -2013,6 +2188,14 @@ def _verify_promotion_evidence(
             checkpoint_md5=champion["md5"],
             where="champion external panel",
             sealed_semantics=sealed_semantics,
+            role="champion",
+            deployed_search_config=champion["search_config"],
+        )
+        _verify_role_search_pair(
+            candidate_panel["search_config"],
+            champion_panel["search_config"],
+            sealed_semantics=sealed_semantics,
+            where="external panel deployed agents",
         )
         if candidate_cohort != champion_cohort:
             raise PromotionError(
@@ -2112,7 +2295,7 @@ def _verify_adjudication(
     base = path.parent
     candidate_raw = _require_exact_keys(
         value["candidate"],
-        {"path", "sha256", "version", "training_report"},
+        {"path", "sha256", "version", "training_report", "agent_identity"},
         where="candidate",
     )
     candidate_path, candidate_ref = _validate_file_ref(
@@ -2140,7 +2323,9 @@ def _verify_adjudication(
         training_report_sha256=training_ref["sha256"],
     )
     champion_raw = _require_exact_keys(
-        value["champion"], {"path", "sha256", "version"}, where="champion"
+        value["champion"],
+        {"path", "sha256", "version", "agent_identity"},
+        where="champion",
     )
     champion_path, champion_ref = _validate_file_ref(
         {"path": champion_raw["path"], "sha256": champion_raw["sha256"]},
@@ -2189,6 +2374,35 @@ def _verify_adjudication(
 
     candidate_binding = {**candidate_ref, "md5": _md5(candidate_path)}
     champion_binding = {**champion_ref, "md5": _md5(champion_path)}
+    sealed_semantics = _sealed_evaluation_semantics(contract)
+    candidate_identity = _verify_agent_identity(
+        candidate_raw["agent_identity"],
+        role="candidate",
+        checkpoint_path=candidate_path,
+        checkpoint_sha256=candidate_ref["sha256"],
+        sealed_semantics=sealed_semantics,
+        base=base,
+        where="candidate.agent_identity",
+    )
+    champion_identity = _verify_agent_identity(
+        champion_raw["agent_identity"],
+        role="champion",
+        checkpoint_path=champion_path,
+        checkpoint_sha256=champion_ref["sha256"],
+        sealed_semantics=sealed_semantics,
+        base=base,
+        where="champion.agent_identity",
+    )
+    _verify_role_search_pair(
+        candidate_identity["search_config"],
+        champion_identity["search_config"],
+        sealed_semantics=sealed_semantics,
+        where="adjudication deployed agents",
+    )
+    candidate_binding["agent_identity"] = candidate_identity
+    candidate_binding["search_config"] = candidate_identity["search_config"]
+    champion_binding["agent_identity"] = champion_identity
+    champion_binding["search_config"] = champion_identity["search_config"]
 
     checks = _require_exact_keys(value["checks"], REQUIRED_CHECKS, where="checks")
     failed_checks = sorted(
@@ -2248,12 +2462,14 @@ def _verify_adjudication(
             "version": candidate_raw["version"],
             "md5": candidate_binding["md5"],
             "training_report": training_ref,
+            "agent_identity": candidate_identity,
         },
         "training_receipt": training_receipt_ref,
         "champion": {
             **champion_ref,
             "version": champion_raw["version"],
             "md5": champion_binding["md5"],
+            "agent_identity": champion_identity,
         },
         "evidence": [evidence_by_kind[kind] for kind in sorted(evidence_by_kind)],
         "adjudication_sha256": declared_digest,
@@ -2289,6 +2505,14 @@ def _stage_registry(
                 "execution_binding_sha256"
             ],
             "a1_promotion_receipt": str(receipt_path),
+            "a1_candidate_agent_identity_sha256": candidate["agent_identity"][
+                "agent_identity_sha256"
+            ],
+            "a1_candidate_search_config": candidate["agent_identity"]["search_config"],
+            "a1_champion_agent_identity_sha256": champion["agent_identity"][
+                "agent_identity_sha256"
+            ],
+            "a1_champion_search_config": champion["agent_identity"]["search_config"],
             "fleet_ckpt_updated": False,
         }
         registry.append_pool(

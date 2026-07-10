@@ -239,6 +239,12 @@ def _fixture(tmp_path: Path, *, promotion_count: int = 0, n_full: int = 128) -> 
     evidence_semantics = promotion._sealed_evaluation_semantics(
         contract if n_full == 128 else _contract(n_full=128, producer=champion)
     )
+    candidate_search_config = promotion._role_search_config(
+        evidence_semantics, role="candidate"
+    )
+    champion_search_config = promotion._role_search_config(
+        evidence_semantics, role="champion"
+    )
     report_path = tmp_path / "report.json"
     command = ["/usr/bin/python3", "tools/train_bc.py", "--sealed-a1"]
     execution_binding = one_dose._execution_binding(
@@ -333,6 +339,8 @@ def _fixture(tmp_path: Path, *, promotion_count: int = 0, n_full: int = 128) -> 
             "determinization_min_simulations": 32,
             "candidate_n_full": 128,
             "baseline_n_full": 128,
+            "candidate_c_scale": candidate_search_config["c_scale"],
+            "baseline_c_scale": champion_search_config["c_scale"],
             "candidate_n_full_wide": None,
             "baseline_n_full_wide": None,
             "candidate_n_full_wide_threshold": None,
@@ -378,10 +386,9 @@ def _fixture(tmp_path: Path, *, promotion_count: int = 0, n_full: int = 128) -> 
     )
 
     external_sources = []
-    external_search_config = evidence_semantics
-    for role, checkpoint, win_rate in (
-        ("candidate_panel", candidate, 0.55),
-        ("champion_panel", champion, 0.54),
+    for role, checkpoint, win_rate, external_search_config in (
+        ("candidate_panel", candidate, 0.55, candidate_search_config),
+        ("champion_panel", champion, 0.54, champion_search_config),
     ):
         external_games = [
             {
@@ -665,6 +672,9 @@ def _fixture(tmp_path: Path, *, promotion_count: int = 0, n_full: int = 128) -> 
             "path": str(candidate),
             "sha256": promotion._sha256(candidate),
             "version": 5,
+            "agent_identity": promotion._agent_identity(
+                _checkpoint_ref(candidate), candidate_search_config
+            ),
             "training_report": {
                 "path": str(report_path),
                 "sha256": promotion._sha256(report_path),
@@ -674,6 +684,9 @@ def _fixture(tmp_path: Path, *, promotion_count: int = 0, n_full: int = 128) -> 
             "path": str(champion),
             "sha256": promotion._sha256(champion),
             "version": 4,
+            "agent_identity": promotion._agent_identity(
+                _checkpoint_ref(champion), champion_search_config
+            ),
         },
         "checks": {name: True for name in promotion.REQUIRED_CHECKS},
         "nth_confirmation_required": nth_required,
@@ -815,6 +828,47 @@ def test_dry_run_binds_v3_one_dose_receipt(tmp_path: Path) -> None:
             fixture["training_receipt"].read_text(encoding="utf-8")
         )["outputs"]["execution_binding_sha256"],
     }
+
+
+def test_promotion_receipt_binds_deployed_agent_identities(tmp_path: Path) -> None:
+    fixture = _fixture(tmp_path)
+
+    plan = _execute(fixture, go=False)
+
+    candidate = plan["candidate"]["agent_identity"]
+    champion = plan["champion"]["agent_identity"]
+    assert candidate["search_config"]["c_scale"] == 0.10
+    assert champion["search_config"]["c_scale"] == 0.03
+    assert {
+        key: value
+        for key, value in candidate["search_config"].items()
+        if key != "c_scale"
+    } == {
+        key: value
+        for key, value in champion["search_config"].items()
+        if key != "c_scale"
+    }
+    for identity in (candidate, champion):
+        unhashed = dict(identity)
+        declared = unhashed.pop("agent_identity_sha256")
+        assert declared == promotion._digest_value(unhashed)
+
+
+def test_adjudication_cannot_rebind_candidate_to_champion_search(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path)
+    adjudication = json.loads(fixture["adjudication"].read_text())
+    identity = adjudication["candidate"]["agent_identity"]
+    identity["search_config"]["c_scale"] = 0.03
+    identity.pop("agent_identity_sha256")
+    identity["agent_identity_sha256"] = promotion._digest_value(identity)
+    adjudication.pop("adjudication_sha256")
+    adjudication["adjudication_sha256"] = promotion._digest_value(adjudication)
+    _write_json(fixture["adjudication"], adjudication)
+
+    with pytest.raises(promotion.PromotionError, match="sealed A1 semantic drift"):
+        _execute(fixture, go=False)
 
 
 def test_dry_run_accepts_schema_separated_sealed_retry_receipt(
@@ -1129,6 +1183,8 @@ def test_external_panel_without_information_set_attestation_is_rejected(
             sealed_semantics=promotion._sealed_evaluation_semantics(
                 fixture["contract"]
             ),
+            role="candidate",
+            deployed_search_config=payload["search_config"],
         )
 
 
@@ -1383,6 +1439,40 @@ def test_external_comparison_rejects_different_search_configs(tmp_path: Path) ->
     )
 
     with pytest.raises(promotion.PromotionError, match="sealed A1 semantic drift"):
+        _execute(fixture, go=False)
+
+
+def test_external_comparison_rejects_other_cohort_metadata_drift(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path)
+
+    _mutate_evidence_source(
+        fixture,
+        kind="external_panel",
+        role="candidate_panel",
+        mutate=lambda source: source.__setitem__("gate_config", "drifted-gate"),
+    )
+
+    with pytest.raises(promotion.PromotionError, match="different cohorts/configs"):
+        _execute(fixture, go=False)
+
+
+def test_external_reports_cannot_omit_d6_threshold_attestation(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path)
+    for role in ("candidate_panel", "champion_panel"):
+        _mutate_evidence_source(
+            fixture,
+            kind="external_panel",
+            role=role,
+            mutate=lambda source: source["search_config"].pop(
+                "symmetry_averaged_eval_threshold"
+            ),
+        )
+
+    with pytest.raises(promotion.PromotionError, match="keys differ"):
         _execute(fixture, go=False)
 
 
