@@ -287,6 +287,7 @@ def score_learning_gate(
     *,
     bootstrap_samples: int = 10_000,
     bootstrap_seed: int = 20260710,
+    experiment_config_sha256: str | None = None,
 ) -> dict[str, Any]:
     """Validate config-bound evidence and return a deterministic pass/fail report."""
 
@@ -295,6 +296,11 @@ def score_learning_gate(
     if type(bootstrap_seed) is not int:
         raise GateInputError("bootstrap_seed must be an integer")
     roles, arms_by_id, gate = _experiment_contract(config)
+    expected_experiment_sha = (
+        _sha256(experiment_config_sha256, field="experiment_config_sha256")
+        if experiment_config_sha256 is not None
+        else _canonical_sha256(config)
+    )
     raw_seeds = gate.get("seeds")
     if (
         not isinstance(raw_seeds, list)
@@ -368,6 +374,7 @@ def score_learning_gate(
         "topology_mask_registration_artifact_sha256",
         "training_manifest_sha256",
         "holdout_manifest_sha256",
+        "experiment_config_sha256",
         "run_provenance",
     )
     for row_number, raw in enumerate(records, 1):
@@ -417,6 +424,15 @@ def score_learning_gate(
                 raise GateInputError(
                     f"row {row_number}: {field} does not match experiment config"
                 )
+        actual_experiment_sha = _sha256(
+            raw["experiment_config_sha256"],
+            field="experiment_config_sha256",
+            row=row_number,
+        )
+        if actual_experiment_sha != expected_experiment_sha:
+            raise GateInputError(
+                f"row {row_number}: experiment_config_sha256 does not match scorer config"
+            )
         key = (arm, seed, game, decision)
         if key in seen:
             raise GateInputError(
@@ -443,6 +459,10 @@ def score_learning_gate(
             "optimizer_steps",
             "global_batch_size",
             "sample_presentations",
+            "training_report_sha256",
+            "experiment_config_sha256",
+            "optimizer_sidecar_sha256",
+            "train_config_hash",
         )
         missing_provenance = [
             field for field in provenance_required if field not in provenance
@@ -456,6 +476,24 @@ def score_learning_gate(
             field="run_provenance.checkpoint_sha256",
             row=row_number,
         )
+        for field in (
+            "training_report_sha256",
+            "experiment_config_sha256",
+            "optimizer_sidecar_sha256",
+        ):
+            value = _sha256(
+                provenance[field], field=f"run_provenance.{field}", row=row_number
+            )
+            if field == "experiment_config_sha256" and value != expected_experiment_sha:
+                raise GateInputError(
+                    f"row {row_number}: run_provenance experiment config SHA mismatch"
+                )
+        if not isinstance(provenance["train_config_hash"], str) or not re.fullmatch(
+            r"sha256:[0-9a-f]{16}", provenance["train_config_hash"]
+        ):
+            raise GateInputError(
+                f"row {row_number}: run_provenance.train_config_hash is invalid"
+            )
         resolved = provenance["resolved_config"]
         if not isinstance(resolved, Mapping):
             raise GateInputError(
@@ -655,6 +693,10 @@ def score_learning_gate(
                 "optimizer_steps": value["optimizer_steps"],
                 "global_batch_size": value["global_batch_size"],
                 "sample_presentations": value["sample_presentations"],
+                "training_report_sha256": value["training_report_sha256"],
+                "experiment_config_sha256": value["experiment_config_sha256"],
+                "optimizer_sidecar_sha256": value["optimizer_sidecar_sha256"],
+                "train_config_hash": value["train_config_hash"],
             }
             for (arm, seed), value in sorted(provenance_by_run.items())
         },
@@ -717,6 +759,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             config,
             bootstrap_samples=args.bootstrap_samples,
             bootstrap_seed=args.bootstrap_seed,
+            experiment_config_sha256=hashlib.sha256(config_raw).hexdigest(),
         )
         report["input_sha256"] = hashlib.sha256(raw).hexdigest()
         report["experiment_config_sha256"] = hashlib.sha256(config_raw).hexdigest()

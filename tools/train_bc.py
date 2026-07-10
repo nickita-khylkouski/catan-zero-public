@@ -4,6 +4,7 @@ import argparse
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
+import importlib
 import io
 import json
 import math
@@ -13,7 +14,7 @@ from pathlib import Path
 import subprocess
 import sys
 import time
-from typing import Sequence
+from typing import Mapping, Sequence
 
 import numpy as np
 
@@ -99,6 +100,16 @@ A1_REQUIRED_RUNTIME_CODE_SUFFIXES = (
         "src/catan_zero/search/neural_rust_mcts.py",
         "src/catan_zero/search/rust_mcts.py",
     }
+)
+
+RND_EXECUTING_LEARNER_SOURCE_MODULES = (
+    ("tools/train_bc.py", None),
+    ("src/catan_zero/rl/pipeline_configs.py", "catan_zero.rl.pipeline_configs"),
+    ("src/catan_zero/rl/entity_token_policy.py", "catan_zero.rl.entity_token_policy"),
+    (
+        "src/catan_zero/rl/sparse_topology_adapter.py",
+        "catan_zero.rl.sparse_topology_adapter",
+    ),
 )
 
 
@@ -1109,6 +1120,26 @@ def build_parser() -> argparse.ArgumentParser:
             "only for a known false positive or an intentional smoke test."
         ),
     )
+    parser.add_argument(
+        "--rnd-allow-a1-learner-override",
+        action="store_true",
+        help=(
+            "R&D-only: retain the authenticated A1 corpus, selected-game chain, and "
+            "exact validation-manifest exclusion, but allow a different warm start or "
+            "learner recipe than the frozen A1 production contract. The old A1 lock is "
+            "then data-generation provenance only; executing learner sources are hashed "
+            "into the report. Default off."
+        ),
+    )
+    parser.add_argument(
+        "--rnd-a1-artifact-dir",
+        default="",
+        help=(
+            "R&D override only: directory containing relocated byte-identical A1 "
+            "selected-game, post-wave audit, validation, and contract-lock JSON files. "
+            "Frozen logical paths remain authoritative; this changes physical lookup only."
+        ),
+    )
     add_config_flags(parser, default_purpose="train_bc")
     return parser
 
@@ -1376,6 +1407,48 @@ def _sha256_existing_file(path: str | Path) -> str:
     return f"sha256:{digest.hexdigest()}"
 
 
+def _rnd_executing_learner_source_sha256(*, enabled: bool) -> dict[str, str] | None:
+    """Bind an R&D learner report to the exact imported implementation files.
+
+    Relative names are stable across checkouts; module ``__file__`` checks prove
+    the hashes came from the modules Python actually imported in this process.
+    No git identity or repository-tree hash is used.
+    """
+
+    if not enabled:
+        return None
+    root = Path(__file__).resolve().parents[1]
+    result: dict[str, str] = {}
+    for relative, module_name in RND_EXECUTING_LEARNER_SOURCE_MODULES:
+        module = (
+            sys.modules[__name__]
+            if module_name is None
+            else importlib.import_module(module_name)
+        )
+        raw_module_path = getattr(module, "__file__", None)
+        if not raw_module_path:
+            raise SystemExit(
+                f"R&D executing learner module {module.__name__} has no __file__"
+            )
+        try:
+            module_path = Path(raw_module_path).resolve(strict=True)
+            expected_path = (root / relative).resolve(strict=True)
+        except OSError as error:
+            raise SystemExit(
+                f"cannot resolve R&D executing learner source {relative}: {error}"
+            ) from error
+        if module_path != expected_path:
+            raise SystemExit(
+                "R&D executing learner source resolved outside the active checkout: "
+                f"module={module.__name__} actual={module_path} expected={expected_path}"
+            )
+        digest = _sha256_existing_file(module_path)
+        if not _is_sha256(digest):
+            raise SystemExit(f"cannot hash R&D executing learner source {module_path}")
+        result[relative] = str(digest)[7:]
+    return result
+
+
 def _canonical_json_sha256(value: object) -> str:
     payload = json.dumps(
         value, sort_keys=True, separators=(",", ":"), ensure_ascii=True
@@ -1605,6 +1678,126 @@ def _is_sha256(value: object) -> bool:
     )
 
 
+def _logical_absolute_path(value: object, *, label: str) -> Path:
+    raw = str(value)
+    path = Path(raw).expanduser()
+    if not path.is_absolute() or str(path) != raw:
+        raise SystemExit(f"bound {label} path is not canonical absolute: {raw!r}")
+    return path
+
+
+def _prepare_rnd_a1_artifact_relocation(
+    corpus_meta: dict[str, object],
+    *,
+    artifact_dir: str | Path,
+    validation_manifest_path: str | Path,
+) -> tuple[dict[str, Path], dict[str, object]]:
+    """Authenticate an isolated copy of the four frozen A1 JSON artifacts."""
+
+    try:
+        root = Path(artifact_dir).expanduser().resolve(strict=True)
+    except OSError as error:
+        raise SystemExit(f"cannot resolve --rnd-a1-artifact-dir: {error}") from error
+    if not root.is_dir():
+        raise SystemExit("--rnd-a1-artifact-dir must be a directory")
+    selected_meta = corpus_meta.get("selected_game_seed_manifest")
+    audit_meta = corpus_meta.get("a1_post_wave_audit")
+    if not isinstance(selected_meta, dict) or not isinstance(audit_meta, dict):
+        raise SystemExit("R&D A1 relocation requires fully bound A1 corpus metadata")
+    validation_meta = audit_meta.get("validation_holdout")
+    if not isinstance(validation_meta, dict):
+        raise SystemExit("A1 corpus metadata has no bound validation artifact")
+
+    logical = {
+        "selected_game_manifest": _logical_absolute_path(
+            selected_meta.get("path"), label="A1 selected-game manifest"
+        ),
+        "post_wave_audit": _logical_absolute_path(
+            audit_meta.get("path"), label="A1 post-wave audit"
+        ),
+        "validation_manifest": _logical_absolute_path(
+            validation_meta.get("path"), label="A1 validation manifest"
+        ),
+    }
+    expected_validation_physical = root / logical["validation_manifest"].name
+    try:
+        requested_validation = Path(validation_manifest_path).expanduser().resolve(
+            strict=True
+        )
+    except OSError as error:
+        raise SystemExit(
+            f"cannot resolve relocated --validation-game-seed-manifest: {error}"
+        ) from error
+    if requested_validation != expected_validation_physical.resolve(strict=False):
+        raise SystemExit(
+            "--validation-game-seed-manifest must be the direct relocated copy "
+            f"{expected_validation_physical}"
+        )
+    initial_expected = {
+        "selected_game_manifest": selected_meta.get("file_sha256"),
+        "post_wave_audit": audit_meta.get("file_sha256"),
+        "validation_manifest": validation_meta.get("file_sha256"),
+    }
+    physical: dict[str, Path] = {}
+    report_files: dict[str, dict[str, str]] = {}
+    for role, logical_path in logical.items():
+        path = root / logical_path.name
+        if not path.is_file():
+            raise SystemExit(f"R&D A1 relocation is missing {role}: {path.name}")
+        resolved_path = path.resolve(strict=True)
+        if resolved_path.parent != root:
+            raise SystemExit(f"R&D A1 relocated {role} must be a direct regular file")
+        actual = _sha256_existing_file(path)
+        if not _is_sha256(initial_expected[role]) or actual != initial_expected[role]:
+            raise SystemExit(
+                f"R&D A1 relocated {role} file hash mismatch: "
+                f"expected={initial_expected[role]!r} actual={actual!r}"
+            )
+        physical[role] = resolved_path
+        report_files[role] = {
+            "logical_path": str(logical_path),
+            "filename": path.name,
+            "sha256": actual,
+        }
+
+    try:
+        audit_payload = json.loads(physical["post_wave_audit"].read_bytes())
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise SystemExit(f"cannot parse relocated A1 post-wave audit: {error}") from error
+    if not isinstance(audit_payload, dict):
+        raise SystemExit("relocated A1 post-wave audit must be a JSON object")
+    lock_logical = _logical_absolute_path(
+        audit_payload.get("contract_path"), label="A1 contract lock"
+    )
+    lock_path = root / lock_logical.name
+    if not lock_path.is_file():
+        raise SystemExit(f"R&D A1 relocation is missing contract_lock: {lock_path.name}")
+    resolved_lock = lock_path.resolve(strict=True)
+    if resolved_lock.parent != root:
+        raise SystemExit("R&D A1 relocated contract_lock must be a direct regular file")
+    lock_sha = _sha256_existing_file(lock_path)
+    physical["contract_lock"] = resolved_lock
+    report_files["contract_lock"] = {
+        "logical_path": str(lock_logical),
+        "filename": lock_path.name,
+        "sha256": lock_sha,
+    }
+    expected_names = {record["filename"] for record in report_files.values()}
+    if len(expected_names) != 4:
+        raise SystemExit("R&D A1 relocated artifact basenames must be distinct")
+    actual_names = {path.name for path in root.iterdir() if path.is_file()}
+    if actual_names != expected_names:
+        raise SystemExit(
+            "R&D A1 artifact directory must contain exactly the four bound files: "
+            f"missing={sorted(expected_names - actual_names)} "
+            f"unexpected={sorted(actual_names - expected_names)}"
+        )
+    return physical, {
+        "schema_version": "catan-zero-rnd-a1-artifact-relocation/v1",
+        "files": report_files,
+    }
+
+
 def _load_validation_game_seed_manifest_for_training(
     path: str | Path,
     *,
@@ -1612,6 +1805,7 @@ def _load_validation_game_seed_manifest_for_training(
     validation_seed: int,
     validation_max_samples: int,
     validation_game_seed_ranges: list[tuple[int, int]],
+    logical_path: str | Path | None = None,
 ) -> dict[str, object]:
     """Validate the exact A1 holdout before any optimizer step can run.
 
@@ -1737,8 +1931,14 @@ def _load_validation_game_seed_manifest_for_training(
             f"declared={payload['validation_game_seed_set_sha256']!r} "
             f"actual={actual_digest!r}"
         )
+    bound_path = (
+        manifest_path
+        if logical_path is None
+        else _logical_absolute_path(logical_path, label="A1 validation manifest")
+    )
     return {
-        "path": manifest_path,
+        "path": bound_path,
+        "physical_path": manifest_path,
         "file_sha256": f"sha256:{hashlib.sha256(raw).hexdigest()}",
         "manifest_sha256": _canonical_json_sha256(payload),
         "a1_contract_sha256": payload["a1_contract_sha256"],
@@ -1828,31 +2028,51 @@ def _validate_a1_validation_manifest_corpus_binding(
 
 
 def _read_sha256_bound_json(
-    path_value: object, expected_file_sha256: object, *, label: str
+    path_value: object,
+    expected_file_sha256: object | None,
+    *,
+    label: str,
+    physical_path: Path | None = None,
 ) -> tuple[Path, dict[str, object], str]:
+    logical_path = _logical_absolute_path(path_value, label=label)
     try:
-        path = Path(str(path_value)).expanduser().resolve(strict=True)
-        raw = path.read_bytes()
+        read_path = (
+            logical_path.resolve(strict=True)
+            if physical_path is None
+            else Path(physical_path).resolve(strict=True)
+        )
+        raw = read_path.read_bytes()
         payload = json.loads(raw)
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
-        raise SystemExit(f"cannot read bound {label} {path_value}: {error}") from error
+        raise SystemExit(f"cannot read bound {label} {read_path}: {error}") from error
     actual_file_sha256 = f"sha256:{hashlib.sha256(raw).hexdigest()}"
-    if actual_file_sha256 != expected_file_sha256:
+    if (
+        expected_file_sha256 is not None
+        and actual_file_sha256 != expected_file_sha256
+    ):
         raise SystemExit(
             f"bound {label} file SHA-256 drift: "
             f"expected={expected_file_sha256!r} actual={actual_file_sha256!r}"
         )
     if not isinstance(payload, dict):
         raise SystemExit(f"bound {label} must be a JSON object")
-    return path, payload, actual_file_sha256
+    return logical_path, payload, actual_file_sha256
 
 
 def _validate_a1_corpus_artifacts_and_seeds(
     corpus_meta: dict[str, object],
     validation_seed_contract: dict[str, object],
     game_seed_column: np.ndarray,
+    *,
+    validate_live_learner_code: bool = True,
+    relocated_artifacts: Mapping[str, Path] | None = None,
 ) -> dict[str, object]:
-    """Replay the selected/audit/lock chain against the actual memmap seeds."""
+    """Replay the selected/audit/lock chain against the actual memmap seeds.
+
+    R&D learner overrides retain every corpus/selection/audit/lock proof but use
+    the historical lock strictly as data-generation provenance. Their live
+    learner identity is bound separately by executing-source hashes.
+    """
 
     selected_meta = corpus_meta["selected_game_seed_manifest"]
     audit_meta = corpus_meta["a1_post_wave_audit"]
@@ -1863,6 +2083,11 @@ def _validate_a1_corpus_artifacts_and_seeds(
         selected_meta.get("path"),
         selected_meta.get("file_sha256"),
         label="A1 selected-game manifest",
+        physical_path=(
+            None
+            if relocated_artifacts is None
+            else relocated_artifacts["selected_game_manifest"]
+        ),
     )
     if str(selected_path) != str(selected_meta.get("path")):
         raise SystemExit("A1 selected-game manifest path is not canonical")
@@ -1951,6 +2176,11 @@ def _validate_a1_corpus_artifacts_and_seeds(
         audit_meta.get("path"),
         audit_meta.get("file_sha256"),
         label="A1 post-wave audit",
+        physical_path=(
+            None
+            if relocated_artifacts is None
+            else relocated_artifacts["post_wave_audit"]
+        ),
     )
     if str(audit_path) != str(audit_meta.get("path")):
         raise SystemExit("A1 post-wave audit path is not canonical")
@@ -2019,8 +2249,17 @@ def _validate_a1_corpus_artifacts_and_seeds(
     contract_path_value = audit_payload.get("contract_path")
     lock_path, lock_payload, _ = _read_sha256_bound_json(
         contract_path_value,
-        _sha256_existing_file(str(contract_path_value)),
+        (
+            _sha256_existing_file(str(contract_path_value))
+            if relocated_artifacts is None
+            else None
+        ),
         label="A1 contract lock",
+        physical_path=(
+            None
+            if relocated_artifacts is None
+            else relocated_artifacts["contract_lock"]
+        ),
     )
     if str(lock_path) != str(contract_path_value):
         raise SystemExit("A1 contract lock path is not canonical")
@@ -2050,6 +2289,9 @@ def _validate_a1_corpus_artifacts_and_seeds(
             record.get("sha256")
         ):
             raise SystemExit(f"A1 learner-code record {index} is malformed")
+        if not validate_live_learner_code:
+            learner_paths.append(str(record["path"]))
+            continue
         try:
             code_path = Path(str(record["path"])).expanduser().resolve(strict=True)
         except OSError as error:
@@ -2093,6 +2335,9 @@ def _validate_a1_corpus_artifacts_and_seeds(
             record.get("sha256")
         ):
             raise SystemExit(f"A1 runtime-code-tree record {index} is malformed")
+        if not validate_live_learner_code:
+            runtime_paths.append(str(record["path"]))
+            continue
         try:
             runtime_path = Path(str(record["path"])).expanduser().resolve(strict=True)
         except OSError as error:
@@ -2163,7 +2408,10 @@ def _validate_a1_corpus_artifacts_and_seeds(
 
 
 def _validate_a1_learner_objective(
-    args: argparse.Namespace, bound: dict[str, object]
+    args: argparse.Namespace,
+    bound: dict[str, object],
+    *,
+    allow_checkpoint_override: bool = False,
 ) -> None:
     objective = bound["learner_value_objective"]
     assert isinstance(objective, dict)
@@ -2195,7 +2443,7 @@ def _validate_a1_learner_objective(
             abs_tol=1e-12,
         ):
             raise SystemExit("A1 HL-Gauss sigma differs from the contract")
-    if getattr(args, "init_checkpoint_sha256", None) != bound[
+    if not allow_checkpoint_override and getattr(args, "init_checkpoint_sha256", None) != bound[
         "producer_checkpoint_sha256"
     ]:
         raise SystemExit(
@@ -2356,6 +2604,30 @@ def main(argv: Sequence[str] | None = None) -> None:
             validation_manifest_path=args.validation_game_seed_manifest or None,
         )
 
+    relocated_a1_artifacts: dict[str, Path] | None = None
+    rnd_a1_artifact_relocation: dict[str, object] | None = None
+    effective_validation_manifest = args.validation_game_seed_manifest
+    if args.rnd_a1_artifact_dir:
+        if not bool(args.rnd_allow_a1_learner_override):
+            raise SystemExit(
+                "--rnd-a1-artifact-dir requires --rnd-allow-a1-learner-override"
+            )
+        if not args.validation_game_seed_manifest or a1_preflight_meta is None:
+            raise SystemExit(
+                "--rnd-a1-artifact-dir requires an authenticated A1 memmap corpus "
+                "and --validation-game-seed-manifest"
+            )
+        relocated_a1_artifacts, rnd_a1_artifact_relocation = (
+            _prepare_rnd_a1_artifact_relocation(
+                a1_preflight_meta,
+                artifact_dir=args.rnd_a1_artifact_dir,
+                validation_manifest_path=args.validation_game_seed_manifest,
+            )
+        )
+        effective_validation_manifest = str(
+            relocated_a1_artifacts["validation_manifest"]
+        )
+
     validation_game_seed_ranges = _parse_game_seed_ranges(
         args.validation_game_seed_ranges
     )
@@ -2367,11 +2639,16 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "build the selected corpus first and pass --data-format memmap"
             )
         validation_seed_contract = _load_validation_game_seed_manifest_for_training(
-            args.validation_game_seed_manifest,
+            effective_validation_manifest,
             validation_fraction=float(args.validation_fraction),
             validation_seed=int(args.validation_seed),
             validation_max_samples=int(args.validation_max_samples),
             validation_game_seed_ranges=validation_game_seed_ranges,
+            logical_path=(
+                a1_preflight_meta["a1_post_wave_audit"]["validation_holdout"]["path"]
+                if relocated_a1_artifacts is not None
+                else None
+            ),
         )
 
     launcher_guards.run_or_refuse(
@@ -2548,6 +2825,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         ddp,
     )
     a1_training_binding: dict[str, object] | None = None
+    rnd_executing_learner_source_sha256: dict[str, str] | None = None
     if validation_seed_contract is not None:
         _validate_a1_validation_manifest_corpus_binding(
             getattr(data, "meta", None), validation_seed_contract
@@ -2556,11 +2834,40 @@ def main(argv: Sequence[str] | None = None) -> None:
             getattr(data, "meta"),
             validation_seed_contract,
             np.asarray(data["game_seed"], dtype=np.int64),
+            validate_live_learner_code=not bool(args.rnd_allow_a1_learner_override),
+            relocated_artifacts=relocated_a1_artifacts,
         )
-        _validate_a1_learner_objective(args, a1_training_binding)
-        a1_training_binding["effective_learner_training_recipe"] = (
-            _validate_a1_learner_training_recipe(args, ddp, a1_training_binding)
-        )
+        if bool(args.rnd_allow_a1_learner_override):
+            _validate_a1_learner_objective(
+                args, a1_training_binding, allow_checkpoint_override=True
+            )
+            a1_training_binding["effective_learner_training_recipe"] = (
+                _effective_a1_learner_training_recipe(args, ddp)
+            )
+            # This remains after all corpus/selection/audit/holdout proofs. The
+            # historical A1 code lock no longer claims the overridden learner;
+            # bind the modules this Python process actually imported instead.
+            rnd_executing_learner_source_sha256 = (
+                _rnd_executing_learner_source_sha256(enabled=True)
+            )
+            _rank0_print(
+                json.dumps(
+                    {
+                        "progress": "rnd_a1_learner_override",
+                        "production_contract_override": True,
+                        "corpus_and_validation_bindings_retained": True,
+                        "a1_lock_scope": "data_generation_provenance_only",
+                        "executing_learner_sources_bound": True,
+                    },
+                    sort_keys=True,
+                ),
+                ddp,
+            )
+        else:
+            _validate_a1_learner_objective(args, a1_training_binding)
+            a1_training_binding["effective_learner_training_recipe"] = (
+                _validate_a1_learner_training_recipe(args, ddp, a1_training_binding)
+            )
         args.a1_contract_sha256 = validation_seed_contract["a1_contract_sha256"]
         args.a1_selected_game_seed_set_sha256 = a1_training_binding[
             "selected_game_seed_set_sha256"
@@ -2577,6 +2884,11 @@ def main(argv: Sequence[str] | None = None) -> None:
         args.a1_runtime_code_tree_sha256 = a1_training_binding[
             "runtime_code_tree_sha256"
         ]
+    elif bool(args.rnd_allow_a1_learner_override):
+        raise SystemExit(
+            "--rnd-allow-a1-learner-override requires the authenticated A1 memmap "
+            "corpus and --validation-game-seed-manifest"
+        )
     env_config = _env_config_for_teacher_data(args, data, ddp)
     if args.trust_curated_data_quality:
         data_quality = {
@@ -3621,9 +3933,17 @@ def main(argv: Sequence[str] | None = None) -> None:
     )
     # CAT-128 patch #8: persist final optimizer (Adam) state alongside the checkpoint.
     _save_optimizer_sidecar(args.checkpoint, policy, optimizer, ddp)
+    from catan_zero.rl.optim_state import optimizer_sidecar_path
+
+    optimizer_sidecar = optimizer_sidecar_path(args.checkpoint)
+    global_batch_size = (
+        int(args.batch_size) * int(args.grad_accum_steps) * int(ddp["world_size"])
+    )
     report = {
         "arch": args.arch,
         "config_hash": train_config_hash,
+        "full_config_hash": train_config.full_config_hash(),
+        "resolved_train_config": train_config.canonical_payload(),
         "samples": int(n),
         "global_samples": int(_reduce_scalar_sum(float(n), ddp))
         if bool(args.ddp_shard_data)
@@ -3634,6 +3954,9 @@ def main(argv: Sequence[str] | None = None) -> None:
         "max_steps": int(args.max_steps),
         "steps_completed": int(global_step),
         "batch_size": args.batch_size,
+        "grad_accum_steps": int(args.grad_accum_steps),
+        "global_batch_size": global_batch_size,
+        "sample_presentations": int(global_step) * global_batch_size,
         "amp": args.amp,
         "optimizer": args.optimizer,
         "lr": float(args.lr),
@@ -3728,6 +4051,22 @@ def main(argv: Sequence[str] | None = None) -> None:
             getattr(env_config, "use_graph_history_features", False)
         ),
         "checkpoint": args.checkpoint,
+        "checkpoint_sha256": _sha256_existing_file(args.checkpoint),
+        "optimizer_sidecar": str(optimizer_sidecar),
+        "optimizer_sidecar_sha256": _sha256_existing_file(optimizer_sidecar),
+        "rnd_allow_a1_learner_override": bool(args.rnd_allow_a1_learner_override),
+        "rnd_a1_artifact_dir": str(args.rnd_a1_artifact_dir),
+        "rnd_a1_artifact_relocation": rnd_a1_artifact_relocation,
+        "rnd_executing_learner_source_sha256": (
+            rnd_executing_learner_source_sha256
+        ),
+        "a1_contract_provenance_scope": (
+            "data_generation_only"
+            if bool(args.rnd_allow_a1_learner_override)
+            else "data_generation_and_learner"
+            if a1_training_binding is not None
+            else None
+        ),
         "init_checkpoint": args.init_checkpoint or None,
         "init_checkpoint_sha256": str(args.init_checkpoint_sha256) or None,
         "grow_from_checkpoint_sha256": (

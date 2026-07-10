@@ -89,6 +89,16 @@ def _run_provenance(config: dict, arm: str, seed: int) -> dict:
         "optimizer_steps": 250,
         "global_batch_size": 4096,
         "sample_presentations": 1_024_000,
+        "training_report_sha256": hashlib.sha256(
+            f"report/{arm}/{seed}".encode()
+        ).hexdigest(),
+        "experiment_config_sha256": _canonical_sha(config),
+        "optimizer_sidecar_sha256": hashlib.sha256(
+            f"optimizer/{arm}/{seed}".encode()
+        ).hexdigest(),
+        "train_config_hash": "sha256:" + hashlib.sha256(
+            f"config/{arm}/{seed}".encode()
+        ).hexdigest()[:16],
     }
 
 
@@ -121,6 +131,7 @@ def _records(*, candidate_ce: float = 0.7, config: dict | None = None) -> list[d
                             "holdout_manifest_sha256": HASHES[
                                 "holdout_manifest_sha256"
                             ],
+                            "experiment_config_sha256": _canonical_sha(config),
                             "run_provenance": copy.deepcopy(provenance),
                         }
                     )
@@ -348,6 +359,12 @@ def test_cli_emits_json_and_nonzero_for_failed_valid_evidence(
     config = tmp_path / "config.json"
     records.write_text(json.dumps(_records(candidate_ce=1.01)), encoding="utf-8")
     config.write_text(json.dumps(_config()), encoding="utf-8")
+    config_file_sha = hashlib.sha256(config.read_bytes()).hexdigest()
+    rows = json.loads(records.read_text())
+    for row in rows:
+        row["experiment_config_sha256"] = config_file_sha
+        row["run_provenance"]["experiment_config_sha256"] = config_file_sha
+    records.write_text(json.dumps(rows), encoding="utf-8")
 
     code = main(
         [

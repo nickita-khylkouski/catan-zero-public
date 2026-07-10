@@ -290,6 +290,24 @@ class TrainConfig(PipelineConfig):
     advantage_temperature: float = 1.0
     advantage_weight_cap: float = 5.0
     advantage_weight_floor: float = 0.05
+    # Sparse-topology execution contract. Appended for compatibility with any
+    # legacy positional dataclass payloads. Together these fields select both
+    # the adapter architecture and the graph/control executed during training.
+    topology_adapter_layers: str = ""
+    topology_adapter_width: int = 448
+    topology_adapter_bases: int = 4
+    topology_adapter_kind: str = "basis_mean_v1"
+    topology_adapter_heads: int = 4
+    topology_adapter_share_weights: bool = False
+    topology_adapter_edge_control: str = "true_topology"
+    # Execution choices that alter the effective update or numerical path.
+    grad_accum_steps: int = 1
+    amp: str = "none"
+    fused_optimizer: bool = False
+    validation_game_seed_manifest: str = ""
+    a1_memmap_payload_inventory_sha256: str | None = None
+    rnd_allow_a1_learner_override: bool = False
+    rnd_a1_artifact_dir: str = ""
 
     @classmethod
     def from_namespace(cls, args: Any) -> "TrainConfig":

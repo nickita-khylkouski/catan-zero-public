@@ -20,6 +20,7 @@ from train_bc import (  # type: ignore  # noqa: E402
     _canonical_json_sha256,
     _game_seed_set_sha256,
     _load_validation_game_seed_manifest_for_training,
+    _prepare_rnd_a1_artifact_relocation,
     _preflight_a1_memmap_metadata,
     _training_data_fingerprint,
     _value_training_metadata,
@@ -277,6 +278,28 @@ def _write_a1_chain(tmp_path: Path) -> tuple[dict, dict[str, object], np.ndarray
         },
     }
     return meta, validation_contract, seeds
+
+
+def _copy_relocated_a1_chain(tmp_path: Path, meta: dict) -> tuple[Path, dict[str, Path]]:
+    selected = Path(meta["selected_game_seed_manifest"]["path"])
+    audit = Path(meta["a1_post_wave_audit"]["path"])
+    validation = Path(meta["a1_post_wave_audit"]["validation_holdout"]["path"])
+    audit_payload = json.loads(audit.read_text(encoding="utf-8"))
+    lock = Path(audit_payload["contract_path"])
+    sources = {
+        "selected_game_manifest": selected,
+        "post_wave_audit": audit,
+        "validation_manifest": validation,
+        "contract_lock": lock,
+    }
+    relocated = tmp_path / "relocated_a1"
+    relocated.mkdir()
+    physical: dict[str, Path] = {}
+    for role, source in sources.items():
+        destination = relocated / source.name
+        destination.write_bytes(source.read_bytes())
+        physical[role] = destination
+    return relocated, physical
 
 
 def test_loads_exact_a1_validation_manifest_and_binds_file_bytes(tmp_path: Path) -> None:
@@ -569,6 +592,151 @@ def test_a1_artifact_chain_rejects_learner_code_drift_before_training(
     with pytest.raises(SystemExit, match="learner implementation drift"):
         _validate_a1_corpus_artifacts_and_seeds(
             meta, validation_contract, seeds
+        )
+
+
+def test_rnd_override_treats_old_code_lock_as_data_generation_provenance(
+    tmp_path: Path,
+) -> None:
+    meta, validation_contract, seeds = _write_a1_chain(tmp_path)
+    train_code = tmp_path / "learner" / "tools" / "train_bc.py"
+    original = train_code.read_bytes()
+    train_code.write_bytes(b"#" + original[1:])
+
+    bound = _validate_a1_corpus_artifacts_and_seeds(
+        meta,
+        validation_contract,
+        seeds,
+        validate_live_learner_code=False,
+    )
+    assert bound["selected_game_seed_set_sha256"].startswith("sha256:")
+
+    tampered_seeds = seeds.copy()
+    tampered_seeds[0] = 999_999
+    with pytest.raises(SystemExit, match="unexpected=1"):
+        _validate_a1_corpus_artifacts_and_seeds(
+            meta,
+            validation_contract,
+            tampered_seeds,
+            validate_live_learner_code=False,
+        )
+
+
+def test_rnd_a1_relocation_works_with_all_original_artifact_paths_absent(
+    tmp_path: Path,
+) -> None:
+    meta, original_contract, seeds = _write_a1_chain(tmp_path)
+    relocated, physical = _copy_relocated_a1_chain(tmp_path, meta)
+    original_paths = [
+        Path(meta["selected_game_seed_manifest"]["path"]),
+        Path(meta["a1_post_wave_audit"]["path"]),
+        Path(meta["a1_post_wave_audit"]["validation_holdout"]["path"]),
+        Path(
+            json.loads(physical["post_wave_audit"].read_text(encoding="utf-8"))[
+                "contract_path"
+            ]
+        ),
+    ]
+    relocated_paths, report = _prepare_rnd_a1_artifact_relocation(
+        meta,
+        artifact_dir=relocated,
+        validation_manifest_path=physical["validation_manifest"],
+    )
+    for path in original_paths:
+        path.unlink()
+    assert all(not path.exists() for path in original_paths)
+
+    logical_validation = meta["a1_post_wave_audit"]["validation_holdout"]["path"]
+    validation_contract = _load_validation_game_seed_manifest_for_training(
+        relocated_paths["validation_manifest"],
+        validation_fraction=0.05,
+        validation_seed=17,
+        validation_max_samples=0,
+        validation_game_seed_ranges=[],
+        logical_path=logical_validation,
+    )
+    assert validation_contract["path"] == Path(logical_validation)
+    assert validation_contract["file_sha256"] == original_contract["file_sha256"]
+    _validate_a1_validation_manifest_corpus_binding(meta, validation_contract)
+    bound = _validate_a1_corpus_artifacts_and_seeds(
+        meta,
+        validation_contract,
+        seeds,
+        validate_live_learner_code=False,
+        relocated_artifacts=relocated_paths,
+    )
+    assert bound["selected_game_seed_set_sha256"].startswith("sha256:")
+    assert report["schema_version"] == "catan-zero-rnd-a1-artifact-relocation/v1"
+    assert set(report["files"]) == {
+        "selected_game_manifest",
+        "post_wave_audit",
+        "validation_manifest",
+        "contract_lock",
+    }
+    assert all(
+        record["sha256"].startswith("sha256:")
+        for record in report["files"].values()
+    )
+
+
+@pytest.mark.parametrize(
+    "role",
+    ["selected_game_manifest", "post_wave_audit", "validation_manifest"],
+)
+def test_rnd_a1_relocation_rejects_bound_file_tamper(
+    tmp_path: Path, role: str
+) -> None:
+    meta, _validation_contract, _seeds = _write_a1_chain(tmp_path)
+    relocated, physical = _copy_relocated_a1_chain(tmp_path, meta)
+    physical[role].write_bytes(physical[role].read_bytes() + b"\n")
+    with pytest.raises(SystemExit, match="file hash mismatch"):
+        _prepare_rnd_a1_artifact_relocation(
+            meta,
+            artifact_dir=relocated,
+            validation_manifest_path=physical["validation_manifest"],
+        )
+
+
+def test_rnd_a1_relocation_rejects_contract_lock_tamper(
+    tmp_path: Path,
+) -> None:
+    meta, validation_contract, seeds = _write_a1_chain(tmp_path)
+    relocated, physical = _copy_relocated_a1_chain(tmp_path, meta)
+    lock = json.loads(physical["contract_lock"].read_text(encoding="utf-8"))
+    lock["science"]["learner_training_recipe"]["epochs"] = 999
+    physical["contract_lock"].write_text(json.dumps(lock), encoding="utf-8")
+    relocated_paths, _report = _prepare_rnd_a1_artifact_relocation(
+        meta,
+        artifact_dir=relocated,
+        validation_manifest_path=physical["validation_manifest"],
+    )
+    with pytest.raises(SystemExit, match="contract lock semantic digest drift"):
+        _validate_a1_corpus_artifacts_and_seeds(
+            meta,
+            validation_contract,
+            seeds,
+            validate_live_learner_code=False,
+            relocated_artifacts=relocated_paths,
+        )
+
+
+def test_rnd_a1_relocation_rejects_missing_artifact_and_wrong_validation(
+    tmp_path: Path,
+) -> None:
+    meta, _validation_contract, _seeds = _write_a1_chain(tmp_path)
+    relocated, physical = _copy_relocated_a1_chain(tmp_path, meta)
+    with pytest.raises(SystemExit, match="must be the direct relocated copy"):
+        _prepare_rnd_a1_artifact_relocation(
+            meta,
+            artifact_dir=relocated,
+            validation_manifest_path=physical["selected_game_manifest"],
+        )
+    physical["post_wave_audit"].unlink()
+    with pytest.raises(SystemExit, match="missing post_wave_audit"):
+        _prepare_rnd_a1_artifact_relocation(
+            meta,
+            artifact_dir=relocated,
+            validation_manifest_path=physical["validation_manifest"],
         )
 
 
