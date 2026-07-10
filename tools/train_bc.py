@@ -6223,6 +6223,8 @@ def load_teacher_data(
         "target_information_regime",
         "root_value",
         "root_value_mask",
+        "is_forced",
+        "used_full_search",
         "game_seed",
         "teacher_name",
         "player",
@@ -6781,6 +6783,18 @@ def _normalize_teacher_shard(
             path,
             leading=n,
         ).astype(np.bool_, copy=False)
+    # Preserve optional self-play search provenance when present.  Besides
+    # supporting shard audits, these columns make the root-value admission
+    # mask independently checkable after normalization.
+    for key in ("is_forced", "used_full_search"):
+        if key in shard:
+            result[key] = _field_or_default(
+                shard,
+                key,
+                np.zeros(n, dtype=np.bool_),
+                path,
+                leading=n,
+            ).astype(np.bool_, copy=False)
     # CAT-100 columns are optional for legacy/non-self-play corpora, but when
     # present they must survive normalization into the training dict. Numeric
     # heads use NaN as their per-row ignore mask; categorical heads use -1.
