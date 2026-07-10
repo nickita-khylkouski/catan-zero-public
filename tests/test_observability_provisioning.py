@@ -92,6 +92,35 @@ def test_target_renderer_rejects_systemd_injection(tmp_path: Path) -> None:
         )
 
 
+def test_target_renderer_prunes_removed_box_units(tmp_path: Path) -> None:
+    generator = _load_generator()
+    config = {
+        "hub": {
+            "name": "b200",
+            "cluster": "b200",
+            "role": "rnd",
+            "gpumodel": "B200",
+        },
+        "boxes": [
+            {
+                "name": name,
+                "host": f"192.0.2.{index}",
+                "cluster": name,
+                "role": "generation",
+                "gpumodel": "H100",
+            }
+            for index, name in enumerate(("c1", "c2"), start=1)
+        ],
+    }
+    out = tmp_path / "generated"
+    generator.render(config, out_dir=out, ssh_key=Path("/private/key"))
+    assert (out / "tunnels/fleet-tunnel-c2.service").exists()
+
+    config["boxes"] = config["boxes"][:1]
+    generator.render(config, out_dir=out, ssh_key=Path("/private/key"))
+    assert not (out / "tunnels/fleet-tunnel-c2.service").exists()
+
+
 def test_committed_dashboard_covers_required_gpu_and_generator_metrics() -> None:
     dashboard_path = OBS / "grafana/dashboards/catan_fleet_production.json"
     dashboard = json.loads(dashboard_path.read_text(encoding="utf-8"))
@@ -137,4 +166,11 @@ def test_prometheus_and_grafana_provisioning_are_committed() -> None:
     assert "/var/lib/grafana/dashboards" in dashboards
     service = (OBS / "systemd/catan-fleet-exporter.service").read_text()
     assert "--listen 127.0.0.1 --port 9500" in service
+    assert "/home/ubuntu/catan-zero-v1/.venv/bin/python" in service
+    assert "--run-root /home/ubuntu/gen_out" in service
     assert "NoNewPrivileges=true" in service
+    compose = (OBS / "docker-compose.yml").read_text()
+    assert "GF_SERVER_HTTP_ADDR=127.0.0.1" in compose
+    rules = (OBS / "prometheus/rules/catan_fleet.yml").read_text()
+    assert "CatanGeneratorExitedIncomplete" in rules
+    assert "catan_fleet_generator_processes == 0" in rules

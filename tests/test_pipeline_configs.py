@@ -45,6 +45,7 @@ ALL_CONFIGS = (TrainConfig, GenerateConfig, EvalConfig, GateConfig)
 # Round-trip.
 # --------------------------------------------------------------------------- #
 
+
 @pytest.mark.parametrize("cls", ALL_CONFIGS)
 def test_payload_round_trip_is_identity(cls: type[PipelineConfig]) -> None:
     cfg = cls()
@@ -56,7 +57,9 @@ def test_payload_round_trip_is_identity(cls: type[PipelineConfig]) -> None:
 
 
 def test_round_trip_preserves_non_default_values() -> None:
-    cfg = TrainConfig(mask_hidden_info=True, value_loss_weight=1.0, seed=99, optimizer="adamw")
+    cfg = TrainConfig(
+        mask_hidden_info=True, value_loss_weight=1.0, seed=99, optimizer="adamw"
+    )
     rebuilt = config_from_payload(json.loads(cfg.canonical_json()))
     assert rebuilt == cfg
     assert rebuilt.mask_hidden_info is True
@@ -69,7 +72,11 @@ def test_config_from_payload_rejects_unknown_pipeline() -> None:
 
 
 def test_config_from_payload_drops_unknown_fields_and_fills_missing() -> None:
-    payload = {"pipeline": "gate", "schema_version": 1, "fields": {"elo1": 30.0, "bogus_field": 7}}
+    payload = {
+        "pipeline": "gate",
+        "schema_version": 1,
+        "fields": {"elo1": 30.0, "bogus_field": 7},
+    }
     cfg = config_from_payload(payload)
     assert isinstance(cfg, GateConfig)
     assert cfg.elo1 == 30.0
@@ -80,11 +87,15 @@ def test_config_from_payload_drops_unknown_fields_and_fills_missing() -> None:
 # Hash stability + drift detection.
 # --------------------------------------------------------------------------- #
 
+
 @pytest.mark.parametrize("cls", ALL_CONFIGS)
 def test_identical_configs_hash_identically(cls: type[PipelineConfig]) -> None:
     assert cls().config_hash() == cls().config_hash()
     assert cls().full_config_hash().startswith("sha256:")
-    assert cls().config_hash() == "sha256:" + cls().full_config_hash().split(":", 1)[1][:16]
+    assert (
+        cls().config_hash()
+        == "sha256:" + cls().full_config_hash().split(":", 1)[1][:16]
+    )
 
 
 @pytest.mark.parametrize("cls", ALL_CONFIGS)
@@ -108,13 +119,18 @@ def test_different_pipelines_with_same_field_names_do_not_collide() -> None:
 def test_hash_is_field_order_independent() -> None:
     # sort_keys in canonical_json means declaration order never affects the hash.
     payload = TrainConfig(seed=5).canonical_payload()
-    reordered = {"fields": payload["fields"], "schema_version": payload["schema_version"], "pipeline": payload["pipeline"]}
+    reordered = {
+        "fields": payload["fields"],
+        "schema_version": payload["schema_version"],
+        "pipeline": payload["pipeline"],
+    }
     assert json.dumps(payload, sort_keys=True) == json.dumps(reordered, sort_keys=True)
 
 
 # --------------------------------------------------------------------------- #
 # argv-equivalence: typed-config defaults == CLI argparse defaults.
 # --------------------------------------------------------------------------- #
+
 
 def _parse_argparse_defaults(path: Path) -> dict[str, object]:
     """dest (de-dashed long flag) -> literal default, for every add_argument."""
@@ -127,7 +143,11 @@ def _parse_argparse_defaults(path: Path) -> dict[str, object]:
             continue
         dest = None
         for arg in node.args:
-            if isinstance(arg, ast.Constant) and isinstance(arg.value, str) and arg.value.startswith("--"):
+            if (
+                isinstance(arg, ast.Constant)
+                and isinstance(arg.value, str)
+                and arg.value.startswith("--")
+            ):
                 dest = arg.value[2:].replace("-", "_")
                 break
         if dest is None:
@@ -158,7 +178,9 @@ def _parse_argparse_defaults(path: Path) -> dict[str, object]:
 _NONLITERAL = object()
 
 
-def _assert_typed_defaults_match_cli(cls: type[PipelineConfig], tool: str, *, skip: set[str] = frozenset()) -> None:
+def _assert_typed_defaults_match_cli(
+    cls: type[PipelineConfig], tool: str, *, skip: set[str] = frozenset()
+) -> None:
     cli = _parse_argparse_defaults(TOOLS_DIR / tool)
     typed = cls()
     mismatches: list[str] = []
@@ -171,8 +193,12 @@ def _assert_typed_defaults_match_cli(cls: type[PipelineConfig], tool: str, *, sk
             continue
         typed_default = getattr(typed, field.name)
         if not _same(cli_default, typed_default):
-            mismatches.append(f"{cls.__name__}.{field.name}={typed_default!r} != {tool} --{dest} default={cli_default!r}")
-    assert not mismatches, "typed-config default diverges from CLI default:\n" + "\n".join(mismatches)
+            mismatches.append(
+                f"{cls.__name__}.{field.name}={typed_default!r} != {tool} --{dest} default={cli_default!r}"
+            )
+    assert not mismatches, (
+        "typed-config default diverges from CLI default:\n" + "\n".join(mismatches)
+    )
 
 
 def _same(a: object, b: object) -> bool:
@@ -201,7 +227,15 @@ def test_eval_config_defaults_match_h2h_cli() -> None:
     _assert_typed_defaults_match_cli(
         EvalConfig,
         "gumbel_search_vs_raw_h2h.py",
-        skip={"mode", "candidate", "baseline", "baseline_bot", "map_kind", "elo0", "elo1"},
+        skip={
+            "mode",
+            "candidate",
+            "baseline",
+            "baseline_bot",
+            "map_kind",
+            "elo0",
+            "elo1",
+        },
     )
 
 
@@ -214,17 +248,34 @@ def test_gate_config_defaults_match_sprt_gate_cli() -> None:
         # own defaults (elo0=0/elo1=5/alpha=beta=0.05) -- in the gate-config
         # resolution block, so the RAW argparse default intentionally no longer
         # equals the dataclass default. The effective defaults still match.
-        skip={"test_kind", "generation_public_observation", "elo0", "elo1", "alpha", "beta"},
+        skip={
+            "test_kind",
+            "generation_public_observation",
+            "elo0",
+            "elo1",
+            "alpha",
+            "beta",
+        },
     )
 
 
 def test_from_namespace_reproduces_direct_construction() -> None:
     ns = argparse.Namespace(
-        arch="entity_graph", mask_hidden_info=True, seed=7, value_loss_weight=1.0, optimizer="adamw"
+        arch="entity_graph",
+        mask_hidden_info=True,
+        seed=7,
+        value_loss_weight=1.0,
+        optimizer="adamw",
     )
     got = TrainConfig.from_namespace(ns)
     # Only the attrs present on the namespace override defaults.
-    assert got == TrainConfig(arch="entity_graph", mask_hidden_info=True, seed=7, value_loss_weight=1.0, optimizer="adamw")
+    assert got == TrainConfig(
+        arch="entity_graph",
+        mask_hidden_info=True,
+        seed=7,
+        value_loss_weight=1.0,
+        optimizer="adamw",
+    )
 
 
 def test_generate_from_namespace_maps_format_to_fmt() -> None:
@@ -257,6 +308,7 @@ def test_generate_from_namespace_maps_format_to_fmt() -> None:
 # Cross-pipeline masking consistency.
 # --------------------------------------------------------------------------- #
 
+
 def test_masking_consistency_flags_mismatch() -> None:
     gen = GenerateConfig(public_observation=True)
     gate = GateConfig(generation_public_observation=False)
@@ -282,6 +334,7 @@ def test_masking_consistency_ignores_unknown_echo() -> None:
 # --------------------------------------------------------------------------- #
 # Registry.
 # --------------------------------------------------------------------------- #
+
 
 def test_registry_register_and_lookup(tmp_path: Path) -> None:
     reg = tmp_path / "reg.jsonl"
@@ -312,7 +365,9 @@ def test_registry_distinct_configs_append(tmp_path: Path) -> None:
     assert len(reg.read_text().strip().splitlines()) == 2
 
 
-def test_registry_env_var_override(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_registry_env_var_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     reg = tmp_path / "env_reg.jsonl"
     monkeypatch.setenv(config_registry.REGISTRY_ENV_VAR, str(reg))
     assert config_registry.default_registry_path() == reg
@@ -335,6 +390,7 @@ def test_registry_tolerates_partial_trailing_line(tmp_path: Path) -> None:
 # Additive CLI helper.
 # --------------------------------------------------------------------------- #
 
+
 def _mini_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--seed", type=int, default=1)
@@ -356,7 +412,9 @@ def test_add_config_flags_is_noop_when_unused() -> None:
     assert args.print_config_hash is False
 
 
-def test_resolve_config_noop_run_registers_but_changes_nothing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_resolve_config_noop_run_registers_but_changes_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     monkeypatch.setenv(config_registry.REGISTRY_ENV_VAR, str(tmp_path / "reg.jsonl"))
     parser = _mini_parser()
     args = parser.parse_args(["--seed", "3"])
@@ -368,12 +426,16 @@ def test_resolve_config_noop_run_registers_but_changes_nothing(tmp_path: Path, m
     assert dict(vars(args)) == before
 
 
-def test_dump_config_writes_and_registers(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_dump_config_writes_and_registers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     reg = tmp_path / "reg.jsonl"
     monkeypatch.setenv(config_registry.REGISTRY_ENV_VAR, str(reg))
     dump = tmp_path / "cfg.json"
     parser = _mini_parser()
-    args = parser.parse_args(["--seed", "11", "--mask-hidden-info", "--dump-config", str(dump)])
+    args = parser.parse_args(
+        ["--seed", "11", "--mask-hidden-info", "--dump-config", str(dump)]
+    )
     cfg = config_cli.resolve_config(args, TrainConfig.from_namespace, parser=parser)
     assert dump.exists()
     loaded = config_cli.load_config(dump)
@@ -382,7 +444,9 @@ def test_dump_config_writes_and_registers(tmp_path: Path, monkeypatch: pytest.Mo
     assert config_registry.lookup(cfg.config_hash(), path=reg) is not None
 
 
-def test_config_file_fills_only_defaults(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_config_file_fills_only_defaults(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     monkeypatch.setenv(config_registry.REGISTRY_ENV_VAR, str(tmp_path / "reg.jsonl"))
     # Write a config file that sets seed=77 and value_loss_weight=1.0.
     src = TrainConfig(seed=77, value_loss_weight=1.0)
@@ -392,14 +456,104 @@ def test_config_file_fills_only_defaults(tmp_path: Path, monkeypatch: pytest.Mon
     parser = _mini_parser()
     # Caller explicitly passes --seed 5 (must win) but leaves value-loss-weight default.
     args = parser.parse_args(["--seed", "5", "--config", str(cfg_file)])
-    resolved = config_cli.resolve_config(args, TrainConfig.from_namespace, parser=parser)
+    resolved = config_cli.resolve_config(
+        args, TrainConfig.from_namespace, parser=parser
+    )
     assert resolved.seed == 5  # explicit argv wins over file
     assert resolved.value_loss_weight == 1.0  # default -> filled from file
+
+
+def test_explicit_cli_value_equal_to_default_still_wins_over_config(
+    tmp_path: Path,
+) -> None:
+    """Presence in argv, not inequality from the default, defines explicit."""
+    src = TrainConfig(seed=77)
+    cfg_file = tmp_path / "in.json"
+    cfg_file.write_text(json.dumps(src.canonical_payload()))
+
+    parser = _mini_parser()
+    argv = ["--seed", "1", "--config", str(cfg_file)]
+    args = parser.parse_args(argv)
+    resolved = config_cli.resolve_config(
+        args, TrainConfig.from_namespace, parser=parser, argv=argv
+    )
+
+    assert resolved.seed == 1
+
+
+def test_config_file_rejects_wrong_pipeline_before_applying_fields(tmp_path: Path) -> None:
+    cfg_file = tmp_path / "eval.json"
+    cfg_file.write_text(json.dumps(EvalConfig(mode="cross_net").canonical_payload()))
+    parser = _mini_parser()
+    argv = ["--config", str(cfg_file)]
+    args = parser.parse_args(argv)
+
+    with pytest.raises(SystemExit):
+        config_cli.apply_config_file(
+            args,
+            parser,
+            argv=argv,
+            expected_pipeline=TrainConfig.PIPELINE,
+        )
+    assert args.seed == parser.get_default("seed")
+
+
+def test_config_file_rejects_stale_schema_before_applying_fields(tmp_path: Path) -> None:
+    payload = TrainConfig(seed=77).canonical_payload()
+    payload["schema_version"] -= 1
+    cfg_file = tmp_path / "stale.json"
+    cfg_file.write_text(json.dumps(payload))
+    parser = _mini_parser()
+    argv = ["--config", str(cfg_file)]
+    args = parser.parse_args(argv)
+
+    with pytest.raises(SystemExit):
+        config_cli.apply_config_file(
+            args,
+            parser,
+            argv=argv,
+            expected_pipeline=TrainConfig.PIPELINE,
+        )
+    assert args.seed == parser.get_default("seed")
+
+
+def test_config_file_rejects_invalid_argparse_type(tmp_path: Path) -> None:
+    payload = TrainConfig(seed=77).canonical_payload()
+    payload["fields"]["seed"] = "not-an-integer"
+    cfg_file = tmp_path / "invalid.json"
+    cfg_file.write_text(json.dumps(payload))
+    parser = _mini_parser()
+    argv = ["--config", str(cfg_file)]
+    args = parser.parse_args(argv)
+
+    with pytest.raises(SystemExit):
+        config_cli.apply_config_file(
+            args,
+            parser,
+            argv=argv,
+            expected_pipeline=TrainConfig.PIPELINE,
+        )
+    assert args.seed == parser.get_default("seed")
+
+
+def test_generate_hash_binds_producer_checkpoint_bytes() -> None:
+    first = GenerateConfig(
+        checkpoint="champion.pt", producer_checkpoint_sha256="sha256:" + "a" * 64
+    )
+    second = dataclasses.replace(first, producer_checkpoint_sha256="sha256:" + "b" * 64)
+    assert first.config_hash() != second.config_hash()
+
+
+def test_generate_hash_binds_gpu_pipeline_sharing_topology() -> None:
+    assert GenerateConfig(fleet_pipelines_per_gpu=1).config_hash() != GenerateConfig(
+        fleet_pipelines_per_gpu=2
+    ).config_hash()
 
 
 # --------------------------------------------------------------------------- #
 # Ticket smoke test: a CLI-vs-dataclass mismatch is reflected in the hash.
 # --------------------------------------------------------------------------- #
+
 
 def test_smoke_cli_default_override_trap_is_caught_by_hash() -> None:
     """Simulate the c_scale 1.0-vs-0.1 incident: a launcher that silently used
@@ -410,7 +564,9 @@ def test_smoke_cli_default_override_trap_is_caught_by_hash() -> None:
     stale_launcher = GenerateConfig(c_scale=1.0)  # the pre-F1 default that leaked
     assert correct.config_hash() != stale_launcher.config_hash()
     # And the hash reflects the value actually used, not the dataclass default.
-    assert config_from_payload(json.loads(stale_launcher.canonical_json())).c_scale == 1.0
+    assert (
+        config_from_payload(json.loads(stale_launcher.canonical_json())).c_scale == 1.0
+    )
 
 
 def test_all_pipelines_registered_in_class_map() -> None:
@@ -420,6 +576,7 @@ def test_all_pipelines_registered_in_class_map() -> None:
 # --------------------------------------------------------------------------- #
 # Helpers.
 # --------------------------------------------------------------------------- #
+
 
 def _mutate_one_field(cfg: PipelineConfig, field: dataclasses.Field) -> PipelineConfig:
     """Return a copy of ``cfg`` with ``field`` changed to a guaranteed-different value."""

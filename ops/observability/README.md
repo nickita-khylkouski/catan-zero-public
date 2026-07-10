@@ -15,23 +15,22 @@ fleet target file, SSH key, and one-host canary have been reviewed.
 
 ## Per-box canary
 
-The exporter is read-only. It scans `/proc`,
-`~/catan-zero-production/runs/selfplay/*/config.json`,
+The exporter is read-only. It scans `/proc`, `~/gen_out/*/gpu*/config.json`,
 worker `progress.json` files, final `manifest.json` files, and filesystem free
 space. The fleet launcher writes the existing typed config format to
 `$GPU_OUT/config.json` before workers start, making the canonical config hash
 available while a run is live.
 
 ```bash
-python tools/fleet/fleet_metrics_exporter.py --once \
-  --run-root ~/catan-zero-production/runs/selfplay
+python tools/fleet/fleet_metrics_exporter.py --once --run-root ~/gen_out
 python tools/fleet/fleet_metrics_exporter.py --listen 127.0.0.1 --port 9500
 curl -fsS http://127.0.0.1:9500/metrics | grep '^catan_fleet_'
 ```
 
 After the one-shot output is correct, install the pinned unit from
-`systemd/catan-fleet-exporter.service`, adjusting only immutable tree paths if
-the release is not at `/home/ubuntu/catan-zero-production/repo`. The unit binds loopback,
+`systemd/catan-fleet-exporter.service`. It follows the canonical fleet launcher
+defaults (`/home/ubuntu/catan-zero-v1` and `/home/ubuntu/gen_out`); change those
+paths only in the same reviewed change as the launcher. The unit binds loopback,
 runs unprivileged, and has a read-only home/system view.
 
 ## Hub provisioning
@@ -65,7 +64,7 @@ SSH tunnel for Grafana access; if port 3000 is public, firewall it and add TLS.
 ## Metric contract
 
 DCGM supplies per-host/per-GPU utilization, memory, power, and temperature.
-The Catan exporter supplies, per current host/GPU/run/config:
+The Catan exporter supplies, per current host/GPU/pipeline/run/config:
 
 - `generator_processes`, `generator_healthy`, `generator_complete`;
 - `generator_games_requested/completed`, `generator_rows`,
@@ -76,22 +75,24 @@ The Catan exporter supplies, per current host/GPU/run/config:
   range, plus numeric `generator_seed_start/end`;
 - output filesystem free/total bytes.
 
-Only the newest run per GPU is exported, preferring an active process, which
-bounds Prometheus label cardinality. Completed runs remain healthy; an active
+Only the newest run per GPU/pipeline slot is exported, preferring an active
+process, which bounds Prometheus label cardinality to the launcher's maximum of
+two pipelines per GPU. Completed runs remain healthy; an active
 run is unhealthy after five minutes without an atomic progress update or after
 any worker failure. The dashboard displays truncations separately because a
 bounded, declared truncation is not the same as a worker crash.
 
 ## Alerts and rollout checks
 
-Committed rules cover exporter/tunnel loss, stale active generation, worker
-failures, low output disk, and DCGM loss. Before expanding beyond one host:
+Committed rules cover exporter/tunnel loss, stale or exited-incomplete
+generation, worker failures, low output disk, and DCGM loss. Before expanding
+beyond one host:
 
 1. confirm all three targets are `UP`;
 2. compare exporter games/rows/sims/shards against the underlying JSON;
 3. confirm DCGM GPU labels stay device indices (`gpumodel` is the target label);
 4. stop a canary exporter and verify `CatanExporterDown` becomes pending;
-5. use a stale fixture/canary and verify `CatanGeneratorStale` becomes pending;
+5. use stale and exited-incomplete fixtures and verify both generator alerts;
 6. verify no exporter port listens on a public interface.
 
 The dashboard is observability only. It never authorizes harvest, training,

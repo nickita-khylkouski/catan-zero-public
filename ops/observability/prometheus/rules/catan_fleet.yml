@@ -13,6 +13,12 @@ groups:
         labels: {severity: critical}
         annotations:
           summary: "Generator stalled on {{ $labels.host }}/gpu{{ $labels.gpu }}"
+      - alert: CatanGeneratorExitedIncomplete
+        expr: catan_fleet_generator_processes == 0 and catan_fleet_generator_complete == 0 and catan_fleet_generator_games_requested > 0
+        for: 3m
+        labels: {severity: critical}
+        annotations:
+          summary: "Generator exited incomplete on {{ $labels.host }}/gpu{{ $labels.gpu }}/pipeline{{ $labels.pipeline }}"
       - alert: CatanGeneratorFailure
         expr: catan_fleet_generator_failures > 0
         for: 1m

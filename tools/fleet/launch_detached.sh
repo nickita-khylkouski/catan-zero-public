@@ -22,18 +22,70 @@ launch_detached() {
   local rundir="$1" logfile="$2" cadence="$3"; shift 3
   [ "${1:-}" = "--" ] && shift
   [ "$#" -ge 1 ] || { echo "launch_detached: no command given" >&2; return 2; }
-  mkdir -p "$rundir"
+  mkdir -p "$rundir" || { echo "launch_detached: cannot create $rundir" >&2; return 3; }
 
-  # Real job: detached, log-captured, stdin closed.
-  setsid nohup "$@" >"$logfile" 2>&1 </dev/null &
-  local job_pid=$!
-  echo "$job_pid" > "$rundir/.pid"
+  # Real job: detached, log-captured, stdin closed.  The small wrapper writes
+  # its actual PID from inside the new session before exec.  This remains
+  # correct even on a setsid implementation that forks internally; `$!` alone
+  # is not a reliable identity in that case.
+  local starting_pid="$rundir/.pid.starting.$$.$RANDOM"
+  rm -f "$starting_pid"
+  setsid nohup bash -c '
+    starting_pid="$1"; shift
+    printf "%s\n" "$$" > "$starting_pid" || exit 125
+    exec "$@"
+  ' _ "$starting_pid" "$@" >"$logfile" 2>&1 </dev/null &
+  local setsid_pid=$! job_pid="" sid="" state="" attempt
+
+  for attempt in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    if [ -s "$starting_pid" ]; then
+      job_pid=$(tr -d '[:space:]' < "$starting_pid" 2>/dev/null || true)
+      break
+    fi
+    sleep 0.01
+  done
+  rm -f "$starting_pid"
+  case "$job_pid" in
+    ''|*[!0-9]*)
+      kill "$setsid_pid" 2>/dev/null || true
+      echo "launch_detached: child did not publish a valid PID" >&2
+      return 3
+      ;;
+  esac
+
+  # A detached fleet PID is also its SID/PGID.  Both liveness and identity are
+  # contractual because fleet_stop later uses an exact negative-PGID signal.
+  sid=$(ps -o sid= -p "$job_pid" 2>/dev/null | tr -d ' ')
+  state=$(ps -o stat= -p "$job_pid" 2>/dev/null | tr -d ' ')
+  if ! kill -0 "$job_pid" 2>/dev/null || [ "$sid" != "$job_pid" ] || [[ "$state" == Z* ]]; then
+    [ "$sid" = "$job_pid" ] && kill -KILL -- "-$job_pid" 2>/dev/null || true
+    echo "launch_detached: invalid detached child pid=$job_pid sid=${sid:-missing}" >&2
+    return 3
+  fi
+  sleep "${LAUNCH_DETACHED_STARTUP_GRACE_SECONDS:-0.2}"
+  sid=$(ps -o sid= -p "$job_pid" 2>/dev/null | tr -d ' ')
+  state=$(ps -o stat= -p "$job_pid" 2>/dev/null | tr -d ' ')
+  if ! kill -0 "$job_pid" 2>/dev/null || [ "$sid" != "$job_pid" ] || [[ "$state" == Z* ]]; then
+    # The first identity check above already proved this PID was the dedicated
+    # SID/PGID. The session leader may now have exited while descendants remain,
+    # in which case querying the leader returns no SID; still reap the owned
+    # group so a failed launch cannot leave orphan GPU workers behind.
+    kill -KILL -- "-$job_pid" 2>/dev/null || true
+    echo "launch_detached: child exited during startup pid=$job_pid" >&2
+    return 3
+  fi
+  if ! printf '%s\n' "$job_pid" > "$rundir/.pid.tmp" || ! mv -f "$rundir/.pid.tmp" "$rundir/.pid"; then
+    kill -KILL -- "-$job_pid" 2>/dev/null || true
+    echo "launch_detached: cannot publish $rundir/.pid" >&2
+    return 3
+  fi
 
   # Heartbeat writer: also detached, lives exactly as long as the job. Writes the
   # beat ATOMICALLY (tmp + mv) so fleet_status never reads a half-written file.
   setsid nohup bash -c '
     rundir="$1"; job_pid="$2"; cadence="$3"; progress_cmd="$4"
-    while kill -0 "$job_pid" 2>/dev/null; do
+    while kill -0 "$job_pid" 2>/dev/null \
+        && ! ps -o stat= -p "$job_pid" 2>/dev/null | grep -q "^[[:space:]]*Z"; do
       # Optional opt-in progress field (empty PROGRESS_CMD -> prior behavior). eval is
       # 2>/dev/null | tail -1 so a missing/expensive/failing progress cmd never stalls or
       # corrupts the beat; the beat still writes atomically even if prog is empty.
@@ -46,8 +98,8 @@ launch_detached() {
   ' _ "$rundir" "$job_pid" "$cadence" "${PROGRESS_CMD:-}" >/dev/null 2>&1 </dev/null &
 
   # Sanity: confirm the job is in its OWN session (detached), not the shell's.
-  local sid; sid=$(ps -o sid= -p "$job_pid" 2>/dev/null | tr -d ' ')
-  echo "launched pid=$job_pid sid=${sid:-?} (own session = teardown-safe) log=$logfile" >&2
+  sid=$(ps -o sid= -p "$job_pid" 2>/dev/null | tr -d ' ')
+  echo "launched pid=$job_pid sid=$sid (verified own session) log=$logfile" >&2
   echo "$job_pid"
 }
 

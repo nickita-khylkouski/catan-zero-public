@@ -41,9 +41,10 @@ MPS="no-mps"
 ps -eo comm=,args= 2>/dev/null \
   | awk '$1 ~ /^nvidia-cuda-mps/ && ($0 ~ /mps-control -d/ || $0 ~ /mps-server/) {found=1} END {exit !found}' \
   && MPS="MPS"
-WORKERS=$(grep -cE "generate_gumbel_selfplay_data|train_bc.py" <<< "$CMDS")
-printf "gpus=%s busy=%s util_avg=%s%% mem_max=%sMiB | role=%s %s | %s | job_procs=%s\n" \
-  "$NG" "$BUSY" "$UTILAVG" "$MEMMAX" "$ROLE" "$DETAIL" "$MPS" "$WORKERS"
+JOB_PROCS=$(grep -cE "generate_gumbel_selfplay_data|train_bc.py" <<< "$CMDS")
+GEN_PIPELINES=$(grep -c "generate_gumbel_selfplay_data" <<< "$CMDS")
+printf "gpus=%s busy=%s util_avg=%s%% mem_max=%sMiB | role=%s %s | %s | job_procs=%s gen_pipelines=%s\n" \
+  "$NG" "$BUSY" "$UTILAVG" "$MEMMAX" "$ROLE" "$DETAIL" "$MPS" "$JOB_PROCS" "$GEN_PIPELINES"
 REMOTE_EOF
 
 TMP=$(mktemp -d)

@@ -54,6 +54,14 @@ def render(config: dict[str, Any], *, out_dir: Path, ssh_key: Path) -> dict[str,
     tunnel_dir = out_dir / "tunnels"
     target_dir.mkdir(parents=True, exist_ok=True)
     tunnel_dir.mkdir(parents=True, exist_ok=True)
+    # This directory is generated state. Prune files owned by this tool so a
+    # removed box cannot remain deployable through a stale tunnel unit.
+    for stale in (
+        *target_dir.glob("*.json"),
+        *tunnel_dir.glob("fleet-tunnel-*.service"),
+        tunnel_dir / "units.list",
+    ):
+        stale.unlink(missing_ok=True)
     targets = {
         "node": [_target(hub, "localhost:9100")],
         "dcgm": [_target(hub, "localhost:9400")],

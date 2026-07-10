@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import resource
@@ -34,7 +35,9 @@ from tools import a1_pre_wave_contract as a1_contract  # noqa: E402
 from tools import train_bc  # noqa: E402
 
 
-RECEIPT_SCHEMA = "a1-one-dose-training-receipt-v1"
+RECEIPT_SCHEMA = "a1-one-dose-training-receipt-v2"
+CLAIM_SCHEMA = "a1-one-dose-training-claim-v2"
+CLAIM_DIRECTORY = ".a1-one-dose-training-claims"
 MIN_NOFILE = 65_536
 
 
@@ -58,6 +61,50 @@ def _file_sha256(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1 << 20), b""):
             digest.update(chunk)
     return "sha256:" + digest.hexdigest()
+
+
+def _fsync_directory(path: Path) -> None:
+    """Durably publish directory-entry changes or fail closed."""
+
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    fd = os.open(path, flags)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _mkdir_durable(path: Path) -> None:
+    """Create ``path`` and sync every newly-created directory entry."""
+
+    path = Path(path)
+    missing: list[Path] = []
+    cursor = path
+    while not cursor.exists():
+        missing.append(cursor)
+        if cursor.parent == cursor:
+            break
+        cursor = cursor.parent
+    path.mkdir(parents=True, exist_ok=True)
+    if not path.is_dir():
+        raise ExecutorError(f"expected directory, found non-directory: {path}")
+    for created in reversed(missing):
+        _fsync_directory(created)
+        _fsync_directory(created.parent)
+
+
+def _fsync_file(path: Path) -> None:
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _with_digest(payload: dict[str, Any], field: str) -> dict[str, Any]:
+    result = dict(payload)
+    result[field] = _value_sha256(result)
+    return result
 
 
 def _producer(lock: dict[str, Any]) -> dict[str, Any]:
@@ -157,6 +204,11 @@ def verify_training_inputs(
         raise ExecutorError("memmap audit producer differs from the sealed producer")
 
     meta_path = data_path / "corpus_meta.json"
+    corpus_row_count = int(meta["row_count"])
+    validation_row_count = int(validation["validation_row_count"])
+    training_row_count = corpus_row_count - validation_row_count
+    if training_row_count <= 0:
+        raise ExecutorError("audited A1 corpus has no training rows")
     return {
         "lock": lock,
         "lock_path": lock_path,
@@ -168,6 +220,12 @@ def verify_training_inputs(
         "data_path": data_path,
         "corpus_meta_file_sha256": _file_sha256(meta_path),
         "payload_inventory_sha256": meta["payload_inventory_sha256"],
+        "data_fingerprint": train_bc._training_data_fingerprint(  # noqa: SLF001
+            str(data_path), "memmap"
+        ),
+        "corpus_row_count": corpus_row_count,
+        "training_row_count": training_row_count,
+        "validation_row_count": validation_row_count,
         "selected_game_seed_set_sha256": bound["selected_game_seed_set_sha256"],
         "training_game_seed_set_sha256": bound["training_game_seed_set_sha256"],
         "validation_path": validation_path,
@@ -344,29 +402,107 @@ def _raise_nofile_limit() -> None:
     resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
 
 
-def _claim_path(receipt: Path) -> Path:
-    return receipt.with_name(receipt.name + ".claim")
+def _claim_path(verified: dict[str, Any]) -> Path:
+    """Return the one stable claim path for the sealed contract identity.
+
+    The sealed seed-ledger path is the shared, contract-bound anchor. A caller
+    cannot obtain a second dose by choosing another receipt or copying the lock.
+    """
+
+    contract_sha = str(verified.get("contract_sha256", ""))
+    prefix = "sha256:"
+    digest = contract_sha.removeprefix(prefix)
+    if not contract_sha.startswith(prefix) or len(digest) != 64 or any(
+        character not in "0123456789abcdef" for character in digest
+    ):
+        raise ExecutorError(f"invalid sealed contract identity: {contract_sha!r}")
+    try:
+        ledger_value = verified["lock"]["fleet"]["seed_ledger"]["path"]
+        ledger = Path(str(ledger_value)).expanduser().resolve(strict=True)
+    except (KeyError, TypeError, OSError) as error:
+        raise ExecutorError(
+            "sealed contract has no resolvable seed-ledger claim anchor"
+        ) from error
+    if not ledger.is_file():
+        raise ExecutorError(f"sealed seed-ledger anchor is not a file: {ledger}")
+    return ledger.parent / CLAIM_DIRECTORY / f"{digest}.json"
 
 
-def _claim_attempt(receipt: Path, payload: dict[str, Any]) -> Path:
-    receipt.parent.mkdir(parents=True, exist_ok=True)
-    if receipt.exists():
-        raise ExecutorError(f"receipt already exists; A1 dose is already consumed: {receipt}")
-    claim = _claim_path(receipt)
+def _load_claim_state(claim: Path, *, contract_sha256: str) -> dict[str, Any]:
+    try:
+        payload = json.loads(claim.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ExecutorError(f"A1 contract claim is unreadable/corrupt: {claim}") from error
+    if not isinstance(payload, dict):
+        raise ExecutorError(f"A1 contract claim is not an object: {claim}")
+    stated_digest = payload.get("state_sha256")
+    unhashed = dict(payload)
+    unhashed.pop("state_sha256", None)
+    if stated_digest != _value_sha256(unhashed):
+        raise ExecutorError(f"A1 contract claim digest is invalid: {claim}")
+    if payload.get("schema_version") != CLAIM_SCHEMA:
+        raise ExecutorError(f"A1 contract claim schema is invalid: {claim}")
+    if payload.get("contract_sha256") != contract_sha256:
+        raise ExecutorError(f"A1 contract claim identity mismatch: {claim}")
+    return payload
+
+
+def _require_unconsumed_contract(verified: dict[str, Any]) -> None:
+    claim = _claim_path(verified)
+    if claim.exists():
+        state = _load_claim_state(
+            claim, contract_sha256=str(verified["contract_sha256"])
+        )
+        raise ExecutorError(
+            "sealed A1 dose already has a durable claim: "
+            f"status={state.get('status')!r} path={claim}"
+        )
+
+
+def _claim_attempt(verified: dict[str, Any], payload: dict[str, Any]) -> Path:
+    claim = _claim_path(verified)
+    _mkdir_durable(claim.parent)
     try:
         fd = os.open(claim, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o444)
     except FileExistsError as error:
         raise ExecutorError(f"A1 training claim already exists: {claim}") from error
+    durable_payload = _with_digest(payload, "state_sha256")
     with os.fdopen(fd, "wb") as handle:
-        handle.write(_canonical_bytes(payload) + b"\n")
+        handle.write(_canonical_bytes(durable_payload) + b"\n")
         handle.flush()
         os.fsync(handle.fileno())
+    _fsync_directory(claim.parent)
     return claim
 
 
-def _write_receipt_no_clobber(path: Path, payload: dict[str, Any]) -> None:
-    payload = dict(payload)
-    payload["receipt_sha256"] = _value_sha256(payload)
+def _write_terminal_claim(
+    claim: Path, payload: dict[str, Any], *, contract_sha256: str
+) -> dict[str, Any]:
+    current = _load_claim_state(claim, contract_sha256=contract_sha256)
+    if current.get("status") != "claimed":
+        raise ExecutorError(
+            f"A1 claim is already terminal: status={current.get('status')!r} path={claim}"
+        )
+    terminal = _with_digest(payload, "state_sha256")
+    tmp = claim.with_name(f".{claim.name}.tmp.{os.getpid()}.{time.time_ns()}")
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o444)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(_canonical_bytes(terminal) + b"\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, claim)
+        _fsync_directory(claim.parent)
+    finally:
+        tmp.unlink(missing_ok=True)
+    return terminal
+
+
+def _write_receipt_no_clobber(
+    path: Path, payload: dict[str, Any]
+) -> dict[str, Any]:
+    _mkdir_durable(path.parent)
+    payload = _with_digest(payload, "receipt_sha256")
     tmp = path.with_name(f".{path.name}.tmp.{os.getpid()}.{time.time_ns()}")
     try:
         with tmp.open("xb") as handle:
@@ -375,10 +511,13 @@ def _write_receipt_no_clobber(path: Path, payload: dict[str, Any]) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.link(tmp, path)
+        _fsync_directory(path.parent)
     except FileExistsError as error:
         raise ExecutorError(f"refusing to overwrite A1 receipt: {path}") from error
     finally:
         tmp.unlink(missing_ok=True)
+        _fsync_directory(path.parent)
+    return payload
 
 
 def _verify_training_outputs(
@@ -392,7 +531,17 @@ def _verify_training_outputs(
         report_payload = json.loads(report.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
         raise ExecutorError(f"cannot parse A1 training report: {error}") from error
+    recipe = verified["recipe"]
+    expected_steps = int(
+        math.ceil(
+            int(verified["training_row_count"])
+            / (int(recipe["batch_size"]) * int(recipe["grad_accum_steps"]))
+        )
+    )
+    if int(recipe["max_steps"]) > 0:
+        expected_steps = min(expected_steps, int(recipe["max_steps"]))
     expected = {
+        "arch": "entity_graph",
         "a1_contract_sha256": verified["contract_sha256"],
         "world_size": 1,
         "optimizer": "adam",
@@ -400,6 +549,46 @@ def _verify_training_outputs(
         "optimizer_restored": False,
         "fused_optimizer": False,
         "epochs": 1,
+        "max_steps": 0,
+        "batch_size": int(recipe["batch_size"]),
+        "amp": recipe["amp"],
+        "lr": float(recipe["lr"]),
+        "weight_decay": float(recipe["weight_decay"]),
+        "seed": int(recipe["seed"]),
+        "mask_hidden_info": True,
+        "symmetry_augment": False,
+        "data": str(verified["data_path"]),
+        "data_format": "memmap",
+        "data_fingerprint": verified["data_fingerprint"],
+        "samples": int(verified["corpus_row_count"]),
+        "global_samples": int(verified["corpus_row_count"]),
+        "train_samples": int(verified["training_row_count"]),
+        "validation_samples": int(verified["validation_row_count"]),
+        "track": recipe["track"],
+        "vps_to_win": int(recipe["vps_to_win"]),
+        "checkpoint": str(checkpoint),
+        "init_checkpoint": str(verified["producer"]["path"]),
+        "init_checkpoint_sha256": verified["producer"]["sha256"],
+        "input_validation_game_seed_manifest": str(verified["validation_path"]),
+        "input_validation_game_seed_manifest_sha256": verified[
+            "validation_file_sha256"
+        ],
+        "validation_game_seed_set_sha256": verified[
+            "validation_game_seed_set_sha256"
+        ],
+        "a1_selected_game_seed_set_sha256": verified[
+            "selected_game_seed_set_sha256"
+        ],
+        "a1_training_game_seed_set_sha256": verified[
+            "training_game_seed_set_sha256"
+        ],
+        "a1_memmap_payload_inventory_sha256": verified[
+            "payload_inventory_sha256"
+        ],
+        "a1_learner_training_recipe_sha256": _value_sha256(recipe),
+        "require_35m_model": True,
+        "steps_completed": expected_steps,
+        "total_training_steps": expected_steps,
     }
     drift = {
         key: {"expected": value, "actual": report_payload.get(key)}
@@ -410,8 +599,70 @@ def _verify_training_outputs(
         raise ExecutorError(f"A1 training report invariant drift: {drift}")
     if report_payload.get("a1_bound_learner_training_recipe") != verified["recipe"]:
         raise ExecutorError("A1 training report does not echo the exact sealed recipe")
-    if int(report_payload.get("steps_completed", 0)) <= 0:
-        raise ExecutorError("A1 training report records no optimizer steps")
+    if report_payload.get("a1_bound_learner_value_objective") != verified["objective"]:
+        raise ExecutorError("A1 training report does not echo the sealed value objective")
+    metrics = report_payload.get("metrics")
+    if (
+        not isinstance(metrics, list)
+        or len(metrics) != 1
+        or not isinstance(metrics[0], dict)
+        or metrics[0].get("epoch") != 1
+    ):
+        raise ExecutorError("A1 training report does not prove exactly one completed epoch")
+    for key in ("loss", "policy_loss", "value_loss"):
+        value = metrics[0].get(key)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+        ):
+            raise ExecutorError(f"A1 training report has invalid epoch metric {key!r}")
+    validation_metrics = metrics[0].get("validation")
+    if not isinstance(validation_metrics, dict):
+        raise ExecutorError("A1 training report has no one-epoch validation metrics")
+    validation_loss = validation_metrics.get("loss")
+    if (
+        validation_metrics.get("samples") != int(verified["validation_row_count"])
+        or isinstance(validation_loss, bool)
+        or not isinstance(validation_loss, (int, float))
+        or not math.isfinite(float(validation_loss))
+    ):
+        raise ExecutorError("A1 training report has invalid validation coverage/metrics")
+    parameter_count = report_payload.get("parameter_count")
+    if (
+        isinstance(parameter_count, bool)
+        or not isinstance(parameter_count, int)
+        or not 30_000_000 <= parameter_count <= 40_000_000
+    ):
+        raise ExecutorError("A1 training report does not prove the required 35M model")
+    value_training = report_payload.get("value_training")
+    expected_value_training = {
+        "primary_readout": "scalar",
+        "optimizer_steps": expected_steps,
+        "completed_epochs": 1,
+        "a1_contract_sha256": verified["contract_sha256"],
+        "a1_selected_game_seed_set_sha256": verified[
+            "selected_game_seed_set_sha256"
+        ],
+        "a1_training_game_seed_set_sha256": verified[
+            "training_game_seed_set_sha256"
+        ],
+        "a1_learner_training_recipe_sha256": _value_sha256(recipe),
+        "a1_memmap_payload_inventory_sha256": verified[
+            "payload_inventory_sha256"
+        ],
+    }
+    if not isinstance(value_training, dict) or any(
+        value_training.get(key) != value
+        for key, value in expected_value_training.items()
+    ):
+        raise ExecutorError("A1 training report value-training provenance drift")
+    if "scalar" not in value_training.get("trained_value_readouts", []):
+        raise ExecutorError("A1 candidate does not attest a trained scalar value readout")
+    for path in (checkpoint, optimizer, report):
+        _fsync_file(path)
+    for parent in {checkpoint.parent, optimizer.parent, report.parent}:
+        _fsync_directory(parent)
     return {
         "checkpoint": str(checkpoint),
         "checkpoint_sha256": _file_sha256(checkpoint),
@@ -419,15 +670,29 @@ def _verify_training_outputs(
         "optimizer_sidecar_sha256": _file_sha256(optimizer),
         "report": str(report),
         "report_sha256": _file_sha256(report),
-        "steps_completed": int(report_payload["steps_completed"]),
+        "steps_completed": expected_steps,
+        "corpus_row_count": int(verified["corpus_row_count"]),
+        "training_row_count": int(verified["training_row_count"]),
+        "validation_row_count": int(verified["validation_row_count"]),
     }
 
 
-def _require_fresh_outputs(checkpoint: Path, report: Path, receipt: Path) -> None:
+def _require_fresh_outputs(
+    checkpoint: Path,
+    report: Path,
+    receipt: Path,
+    *,
+    claim: Path | None = None,
+) -> None:
     paths = (checkpoint, Path(str(checkpoint) + ".optimizer.pt"), report, receipt)
     if len(set(paths)) != len(paths):
         raise ExecutorError(
             "checkpoint, optimizer sidecar, report, and receipt paths must be distinct"
+        )
+    if claim is not None and claim in paths:
+        raise ExecutorError(
+            "checkpoint, optimizer sidecar, report, and receipt must be distinct "
+            f"from the sealed-contract claim path: {claim}"
         )
     for path in paths:
         if path.exists():
@@ -447,15 +712,17 @@ def execute(
 ) -> dict[str, Any]:
     """Claim, execute, verify, and atomically receipt exactly one A1 dose."""
 
-    _require_fresh_outputs(checkpoint, report, receipt)
+    claim = _claim_path(verified)
+    _require_fresh_outputs(checkpoint, report, receipt, claim=claim)
     started_ns = time.time_ns()
     claim_payload = {
-        "schema_version": "a1-one-dose-training-claim-v1",
+        "schema_version": CLAIM_SCHEMA,
+        "status": "claimed",
         "contract_sha256": verified["contract_sha256"],
         "command_sha256": _value_sha256(command),
         "started_unix_ns": started_ns,
     }
-    claim = _claim_attempt(receipt, claim_payload)
+    claim = _claim_attempt(verified, claim_payload)
     status = "failed"
     returncode: int | None = None
     output_artifacts: dict[str, Any] | None = None
@@ -463,8 +730,9 @@ def execute(
     gpu_name = ""
     try:
         gpu_name = probe(gpu)
-        checkpoint.parent.mkdir(parents=True, exist_ok=True)
-        report.parent.mkdir(parents=True, exist_ok=True)
+        _mkdir_durable(checkpoint.parent)
+        _mkdir_durable(report.parent)
+        _mkdir_durable(receipt.parent)
         env = os.environ.copy()
         if env.get("WORLD_SIZE", "") not in {"", "1"}:
             raise ExecutorError(
@@ -496,7 +764,7 @@ def execute(
     except Exception as error:  # receipt every claimed attempt, then re-raise.
         failure = f"{type(error).__name__}: {error}"
     finished_ns = time.time_ns()
-    receipt_payload = {
+    evidence_payload = {
         "schema_version": RECEIPT_SCHEMA,
         "status": status,
         "contract_sha256": verified["contract_sha256"],
@@ -520,10 +788,17 @@ def execute(
         "outputs": output_artifacts,
         "failure": failure,
     }
-    try:
-        _write_receipt_no_clobber(receipt, receipt_payload)
-    finally:
-        claim.unlink(missing_ok=True)
+    terminal_claim_payload = dict(evidence_payload)
+    terminal_claim_payload["schema_version"] = CLAIM_SCHEMA
+    terminal_claim_payload["receipt_target"] = str(receipt)
+    terminal_claim = _write_terminal_claim(
+        claim,
+        terminal_claim_payload,
+        contract_sha256=str(verified["contract_sha256"]),
+    )
+    evidence_payload["claim"] = str(claim)
+    evidence_payload["claim_state_sha256"] = terminal_claim["state_sha256"]
+    receipt_payload = _write_receipt_no_clobber(receipt, evidence_payload)
     if status != "complete":
         raise ExecutorError(failure or "A1 training failed")
     return receipt_payload
@@ -562,7 +837,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         checkpoint = args.checkpoint.expanduser().resolve(strict=False)
         report = args.report.expanduser().resolve(strict=False)
         receipt = args.receipt.expanduser().resolve(strict=False)
-        _require_fresh_outputs(checkpoint, report, receipt)
+        claim = _claim_path(verified)
+        _require_fresh_outputs(checkpoint, report, receipt, claim=claim)
+        _require_unconsumed_contract(verified)
         command = build_train_command(
             verified,
             python=python,

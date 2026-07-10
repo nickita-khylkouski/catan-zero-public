@@ -34,10 +34,21 @@ Inspect the printed command and hashes. Add `--go` only on the chosen B200.
 `CUDA_VISIBLE_DEVICES`, raises the child file-descriptor limit, and executes
 without `torchrun`. Output paths must be fresh.
 
-Every claimed attempt produces one no-clobber atomic receipt. A successful
-receipt binds the contract, corpus payload inventory, validation manifest,
-producer, exact command, candidate checkpoint, fresh optimizer sidecar, report,
-GPU, and optimizer-step count. A nonzero or malformed run produces a failure
-receipt and cannot be mistaken for a candidate. A stale `.claim` file means an
-attempt was interrupted before receipting; investigate it rather than deleting
-or rerunning blindly.
+The dose claim is keyed by the sealed contract SHA-256 at
+`<seed-ledger-dir>/.a1-one-dose-training-claims/<contract-hex>.json`—not by
+`--receipt`. Choosing different output or receipt paths therefore cannot create
+a second dose. The claim is permanent:
+it begins as `claimed` and is durably replaced with `complete` or `failed`
+terminal evidence before the optional human-facing receipt is published. If
+receipt publication fails after training, the terminal `complete` claim still
+binds the candidate/report hashes and prevents a repeat.
+
+Every claimed attempt also produces one no-clobber atomic receipt when its
+receipt directory remains writable. A successful receipt binds the contract,
+corpus payload inventory and row counts, validation manifest, producer, exact
+command, candidate checkpoint, fresh optimizer sidecar, report, GPU, and exact
+optimizer-step count. The executor rejects reports that do not semantically
+prove the sealed corpus/init/checkpoint and exactly one complete epoch. A
+nonzero or malformed run produces durable `failed` claim evidence and cannot be
+mistaken for a candidate. Never delete or edit a contract claim to retry;
+investigate it and issue a new sealed contract if another dose is authorized.

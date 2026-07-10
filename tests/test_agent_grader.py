@@ -2697,7 +2697,7 @@ def test_plan_remote_gates_skips_active_decided_and_older_snapshots() -> None:
     assert plan["planned_count"] == 1
     planned = plan["planned"][0]
     assert planned["checkpoint"] == "s9760_reanalysis_noq.iter0003.pt"
-    assert planned["command"][0].endswith("python")
+    assert Path(planned["command"][0]).name.startswith("python")
     assert planned["command"][planned["command"].index("--worker") + 1] == "catan-zero-w4d:us-west4-b"
     assert planned["command"][planned["command"].index("--profile") + 1] == "strict"
     assert "--checkpoint runs/self_play/s9760_reanalysis_noq.iter0003.pt" in planned["shell"]

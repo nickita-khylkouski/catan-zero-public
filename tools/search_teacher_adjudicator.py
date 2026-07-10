@@ -36,11 +36,22 @@ import sys
 from pathlib import Path
 from typing import Any, Iterable
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+SRC = REPO_ROOT / "src"
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
+
+from catan_zero.rl.pipeline_configs import CONFIG_SCHEMA_VERSION  # noqa: E402
+
 
 MANIFEST_SCHEMA = "rl-rnd-search-stage-adjudication-v1"
 DECISION_SCHEMA = "rl-rnd-stage-decision-v1"
 FIXED_ROOT_SCHEMA = "fixed-root-search-stability-v2"
 CALIBRATION_SCHEMA = "phase-sliced-value-calibration-v2"
+# Schema 4 evidence was sealed before GenerateConfig gained checkpoint-byte
+# provenance. Its typed payload is still self-hashed and semantically checked,
+# so adjudication remains able to replay that immutable historical evidence.
+SUPPORTED_PIPELINE_CONFIG_SCHEMAS = {4, CONFIG_SCHEMA_VERSION}
 
 S1_ARMS = {
     "D1": (0.03, True),
@@ -551,7 +562,7 @@ def _validate_complete_h2h(
     )
     if (
         typed["pipeline"] != "eval"
-        or typed["schema_version"] != 4
+        or typed["schema_version"] not in SUPPORTED_PIPELINE_CONFIG_SCHEMAS
         or not isinstance(typed["fields"], dict)
     ):
         raise AdjudicationError(f"{where} typed config is not an eval config")

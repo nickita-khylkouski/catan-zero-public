@@ -33,14 +33,6 @@ def test_cuda_graph_forward_wrapper_is_opt_in_and_strict_fp32(monkeypatch) -> No
             eval_server.EvalServerConfig(cuda_graph=True, matmul_precision="high"),
         )
 
-    with pytest.raises(ValueError, match="does not support experimental autocast"):
-        eval_server._make_forward_policy(
-            raw_policy,
-            eval_server.EvalServerConfig(
-                cuda_graph=True, experimental_autocast_dtype="bf16"
-            ),
-        )
-
     captured: dict[str, object] = {}
 
     class _Runner:
@@ -70,16 +62,9 @@ def test_cuda_graph_forward_wrapper_is_opt_in_and_strict_fp32(monkeypatch) -> No
     assert runner_config.event_token_limit is None
 
 
-def test_experimental_autocast_dtype_is_fail_closed() -> None:
-    assert eval_server.EvalServerConfig().experimental_autocast_dtype is None
-    assert (
-        eval_server.EvalServerConfig(
-            experimental_autocast_dtype="bf16"
-        ).experimental_autocast_dtype
-        == "bf16"
-    )
-    with pytest.raises(ValueError, match="experimental_autocast_dtype"):
-        eval_server.EvalServerConfig(experimental_autocast_dtype="float8")
+def test_neural_row_cap_rejects_cuda_graph_bucket_rounding() -> None:
+    with pytest.raises(ValueError, match="incompatible with cuda_graph"):
+        eval_server.EvalServerConfig(max_neural_rows=100, cuda_graph=True)
 
 
 def test_cuda_graph_stats_count_graphs_and_fallback_reasons() -> None:

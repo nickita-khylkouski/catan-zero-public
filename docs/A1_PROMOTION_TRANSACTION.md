@@ -12,13 +12,17 @@ gate, alter `public_champion`, or deploy checkpoint bytes to the fleet.
 - A typed `a1-promotion-adjudication-v1` has `passed=true`,
   `decision="promote"`, a reproducible `adjudication_sha256`, and binds the
   exact contract, candidate, incumbent, training report, and five evidence
-  artifacts by SHA-256.
+  artifacts by SHA-256. Each referenced artifact is itself a sealed
+  `a1-promotion-evidence-v1` envelope binding the contract, candidate, incumbent,
+  pass verdict, and role-labelled source artifacts. A digest alone is not a
+  verdict: the transaction parses and replays the source report semantics.
 - Its six checks (`provenance`, `mechanism_calibration`, `internal_h2h`,
   `external_panel`, `high_regret`, `bucket_veto`) all pass. Every-third n64
   confirmation is derived from the authoritative registry promotion count and
   cannot be waived by the adjudication.
 - The candidate training report reproduces the sealed A1 learner recipe and
-  contract digests, records masking, and has positive optimizer steps/epochs.
+  contract digests, records masking, names the exact candidate checkpoint,
+  binds the sealed producer hash, and has positive optimizer steps/epochs.
 - The registry is nonempty, its `generator_champion` path/version/MD5 matches
   the adjudicated incumbent, and `CURRENT_CHAMPION` contains that same single
   path.
@@ -59,6 +63,43 @@ The adjudication has this exact top-level shape (extra keys fail closed):
 }
 ```
 
+Each evidence path above contains an envelope with this exact outer contract:
+
+```json
+{
+  "schema_version": "a1-promotion-evidence-v1",
+  "kind": "internal_h2h",
+  "passed": true,
+  "verdict": "H1",
+  "contract_sha256": "sha256:...",
+  "candidate": {"path": "/immutable/candidate.pt", "sha256": "sha256:..."},
+  "champion": {"path": "/immutable/champion.pt", "sha256": "sha256:..."},
+  "sources": [
+    {"role": "internal_h2h", "path": "/immutable/h2h.raw.json", "sha256": "sha256:..."}
+  ],
+  "result": {},
+  "evidence_sha256": "sha256 of canonical JSON excluding this field"
+}
+```
+
+The mechanism envelope references candidate and incumbent
+`phase-sliced-value-calibration-v2` reports and replays held-out/readout/RMSE
+semantics. Both reports must bind the identical shard directory, validation
+manifest SHA-256, selection mode/fraction/seed/ranges, observed seed count, and
+observed row count; comparing metrics from different cohorts is refused.
+Internal H2H retains and replays all paired games and the flywheel
+pentanomial GSPRT, requiring global n128, at least 200 complete pairs, and H1.
+External evidence references candidate and incumbent neutral-harness reports,
+rejects H0/errors/divergence, and applies the fixed `0.02` maximum win-rate
+regression. The two panels must have identical opponent, map/search/gate config,
+requested pair counts, and exact `(pair_id, game_seed, orientation)` cohort.
+Calibration likewise uses an exact fixed `0.02` maximum global-RMSE
+regression; envelopes cannot select either tolerance. High-regret evidence must use
+`a1-high-regret-comparison-v1` and prove a passing held-out paired result.
+Bucket evidence must use `a1-bucket-veto-v1`; every included bucket must be a
+real pass with at least eight games. `insufficient_data` is a promotion refusal,
+not a silent non-veto.
+
 ## Dry-run, commit, and recovery
 
 Dry-run is the default and writes nothing:
@@ -80,6 +121,12 @@ the plain-text current pointer changes to the candidate path. Receipt
 provenance explicitly records `fleet_ckpt_updated=false`; remote fleet paths
 remain a separate hash-verified deployment action.
 
+The lock is always derived from the canonical registry path as
+`<registry>.a1.lock`. `--lock-file` remains accepted for command compatibility
+only when it names that exact canonical path; alternate locks are refused.
+Registry, current-pointer, receipt, backup, and lock paths may not traverse
+symlinks.
+
 POSIX has no atomic two-path replace. Before either mutation, `--go` durably
 writes the receipt with status `prepared` plus exact registry/pointer backups.
 Each destination is atomically replaced under the same lock. An ordinary error
@@ -92,4 +139,7 @@ python tools/a1_promotion_transaction.py recover --receipt /private/receipts/a1-
 ```
 
 Recovery accepts only known before/after bytes. Unknown mutations, backup hash
-drift, an already-held lock, or a nonrecoverable receipt status are refused.
+drift, receipt semantic-digest drift, noncanonical paths, an already-held lock,
+or a nonrecoverable receipt status are refused. If the second recovery write or
+either post-write verification fails, the transaction restores the exact
+pre-recovery registry and pointer bytes before returning an error.

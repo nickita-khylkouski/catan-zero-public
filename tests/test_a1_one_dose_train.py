@@ -24,7 +24,12 @@ def _objective() -> dict[str, object]:
     }
 
 
-def _lock(*, n_full: int = 128, producer: Path = Path("/producer.pt")) -> dict:
+def _lock(
+    *,
+    n_full: int = 128,
+    producer: Path = Path("/producer.pt"),
+    ledger: Path = Path("/seed-ledger.tsv"),
+) -> dict:
     return {
         "contract_sha256": _SHA,
         "science": {
@@ -41,6 +46,7 @@ def _lock(*, n_full: int = 128, producer: Path = Path("/producer.pt")) -> dict:
                 "sha256": "sha256:" + "b" * 64,
             }
         ],
+        "fleet": {"seed_ledger": {"path": str(ledger)}},
     }
 
 
@@ -54,24 +60,119 @@ def _verified(tmp_path: Path) -> dict:
     data = tmp_path / "corpus"
     data.mkdir()
     (data / "corpus_meta.json").write_text("{}")
+    ledger = tmp_path / "seed-ledger.tsv"
+    ledger.write_text("sealed ledger\n")
+    lock = _lock(producer=producer, ledger=ledger)
     return {
-        "lock": _lock(producer=producer),
+        "lock": lock,
         "lock_path": lock_path,
         "lock_file_sha256": executor._file_sha256(lock_path),
         "contract_sha256": _SHA,
         "recipe": dict(contract.EXPECTED_LEARNER_TRAINING_RECIPE),
         "objective": _objective(),
-        "producer": _lock(producer=producer)["checkpoints"][0],
+        "producer": lock["checkpoints"][0],
         "data_path": data,
         "corpus_meta_file_sha256": executor._file_sha256(
             data / "corpus_meta.json"
         ),
         "payload_inventory_sha256": "sha256:" + "c" * 64,
+        "data_fingerprint": "sha256:" + "1" * 64,
+        "corpus_row_count": 5000,
+        "training_row_count": 4097,
+        "validation_row_count": 903,
         "selected_game_seed_set_sha256": "sha256:" + "d" * 64,
         "training_game_seed_set_sha256": "sha256:" + "e" * 64,
         "validation_path": validation,
         "validation_file_sha256": executor._file_sha256(validation),
         "validation_game_seed_set_sha256": "sha256:" + "f" * 64,
+    }
+
+
+def _training_report(
+    verified: dict, checkpoint: Path, *, steps_completed: int = 2
+) -> dict:
+    recipe = verified["recipe"]
+    return {
+        "arch": "entity_graph",
+        "a1_contract_sha256": verified["contract_sha256"],
+        "a1_bound_learner_training_recipe": recipe,
+        "a1_bound_learner_value_objective": verified["objective"],
+        "a1_learner_training_recipe_sha256": executor._value_sha256(recipe),
+        "a1_memmap_payload_inventory_sha256": verified[
+            "payload_inventory_sha256"
+        ],
+        "a1_selected_game_seed_set_sha256": verified[
+            "selected_game_seed_set_sha256"
+        ],
+        "a1_training_game_seed_set_sha256": verified[
+            "training_game_seed_set_sha256"
+        ],
+        "world_size": 1,
+        "optimizer": "adam",
+        "resume_optimizer": False,
+        "optimizer_restored": False,
+        "fused_optimizer": False,
+        "epochs": 1,
+        "max_steps": 0,
+        "batch_size": recipe["batch_size"],
+        "amp": recipe["amp"],
+        "lr": recipe["lr"],
+        "weight_decay": recipe["weight_decay"],
+        "seed": recipe["seed"],
+        "mask_hidden_info": True,
+        "symmetry_augment": False,
+        "data": str(verified["data_path"]),
+        "data_format": "memmap",
+        "data_fingerprint": verified["data_fingerprint"],
+        "samples": verified["corpus_row_count"],
+        "global_samples": verified["corpus_row_count"],
+        "train_samples": verified["training_row_count"],
+        "validation_samples": verified["validation_row_count"],
+        "track": recipe["track"],
+        "vps_to_win": recipe["vps_to_win"],
+        "checkpoint": str(checkpoint),
+        "init_checkpoint": str(verified["producer"]["path"]),
+        "init_checkpoint_sha256": verified["producer"]["sha256"],
+        "input_validation_game_seed_manifest": str(verified["validation_path"]),
+        "input_validation_game_seed_manifest_sha256": verified[
+            "validation_file_sha256"
+        ],
+        "validation_game_seed_set_sha256": verified[
+            "validation_game_seed_set_sha256"
+        ],
+        "steps_completed": steps_completed,
+        "total_training_steps": steps_completed,
+        "require_35m_model": True,
+        "parameter_count": 35_000_000,
+        "value_training": {
+            "primary_readout": "scalar",
+            "trained_value_readouts": ["scalar"],
+            "optimizer_steps": steps_completed,
+            "completed_epochs": 1,
+            "a1_contract_sha256": verified["contract_sha256"],
+            "a1_selected_game_seed_set_sha256": verified[
+                "selected_game_seed_set_sha256"
+            ],
+            "a1_training_game_seed_set_sha256": verified[
+                "training_game_seed_set_sha256"
+            ],
+            "a1_learner_training_recipe_sha256": executor._value_sha256(recipe),
+            "a1_memmap_payload_inventory_sha256": verified[
+                "payload_inventory_sha256"
+            ],
+        },
+        "metrics": [
+            {
+                "epoch": 1,
+                "loss": 1.0,
+                "policy_loss": 0.8,
+                "value_loss": 0.2,
+                "validation": {
+                    "samples": verified["validation_row_count"],
+                    "loss": 1.1,
+                },
+            }
+        ],
     }
 
 
@@ -135,11 +236,15 @@ def test_verification_replays_lock_payload_and_validation_chain(
         calls["require_all_job_claims"] = require_all_job_claims
         return lock
 
-    meta = {"payload_inventory_sha256": "sha256:" + "c" * 64}
+    meta = {
+        "payload_inventory_sha256": "sha256:" + "c" * 64,
+        "row_count": 5000,
+    }
     validation = {
         "a1_contract_sha256": _SHA,
         "file_sha256": executor._file_sha256(validation_path),
         "validation_game_seed_set_sha256": "sha256:" + "f" * 64,
+        "validation_row_count": 903,
     }
     bound = {
         "learner_training_recipe": dict(contract.EXPECTED_LEARNER_TRAINING_RECIPE),
@@ -202,21 +307,7 @@ def test_execute_writes_atomic_success_receipt_and_never_resumes(
         checkpoint.parent.mkdir(parents=True, exist_ok=True)
         checkpoint.write_bytes(b"candidate")
         Path(str(checkpoint) + ".optimizer.pt").write_bytes(b"fresh adam state")
-        report.write_text(
-            json.dumps(
-                {
-                    "a1_contract_sha256": _SHA,
-                    "a1_bound_learner_training_recipe": verified["recipe"],
-                    "world_size": 1,
-                    "optimizer": "adam",
-                    "resume_optimizer": False,
-                    "optimizer_restored": False,
-                    "fused_optimizer": False,
-                    "epochs": 1,
-                    "steps_completed": 743,
-                }
-            )
-        )
+        report.write_text(json.dumps(_training_report(verified, checkpoint)))
         return subprocess.CompletedProcess(command_arg, 0)
 
     result = executor.execute(
@@ -232,9 +323,14 @@ def test_execute_writes_atomic_success_receipt_and_never_resumes(
     payload = json.loads(receipt.read_text())
     assert result["status"] == payload["status"] == "complete"
     assert payload["world_size"] == 1
-    assert payload["outputs"]["steps_completed"] == 743
+    assert payload["outputs"]["steps_completed"] == 2
     assert payload["receipt_sha256"].startswith("sha256:")
-    assert not Path(str(receipt) + ".claim").exists()
+    claim = executor._claim_path(verified)
+    assert claim.exists()
+    claim_payload = json.loads(claim.read_text())
+    assert claim_payload["status"] == "complete"
+    assert payload["claim"] == str(claim)
+    assert payload["claim_state_sha256"] == claim_payload["state_sha256"]
     assert captured["env"]["CUDA_VISIBLE_DEVICES"] == "1"
     assert "WORLD_SIZE" not in captured["env"]
     with pytest.raises(executor.ExecutorError, match="non-fresh|already"):
@@ -250,7 +346,7 @@ def test_execute_writes_atomic_success_receipt_and_never_resumes(
         )
 
 
-def test_failure_is_receipted_and_claim_is_released(tmp_path: Path) -> None:
+def test_failure_is_receipted_and_claim_remains_terminal(tmp_path: Path) -> None:
     verified = _verified(tmp_path)
     checkpoint = tmp_path / "failed" / "candidate.pt"
     report = tmp_path / "failed" / "report.json"
@@ -272,7 +368,171 @@ def test_failure_is_receipted_and_claim_is_released(tmp_path: Path) -> None:
     assert payload["status"] == "failed"
     assert payload["returncode"] == 7
     assert "train_bc exited nonzero" in payload["failure"]
-    assert not Path(str(receipt) + ".claim").exists()
+    claim = executor._claim_path(verified)
+    claim_payload = json.loads(claim.read_text())
+    assert claim_payload["status"] == "failed"
+    assert payload["claim"] == str(claim)
+
+
+def test_contract_claim_blocks_a_second_receipt_and_output_set(tmp_path: Path) -> None:
+    verified = _verified(tmp_path)
+
+    def run_once(suffix: str) -> None:
+        checkpoint = tmp_path / suffix / "candidate.pt"
+        report = tmp_path / suffix / "report.json"
+        receipt = tmp_path / suffix / "receipt.json"
+        command = executor.build_train_command(
+            verified,
+            python=Path(sys.executable),
+            checkpoint=checkpoint,
+            report=report,
+        )
+
+        def runner(command_arg, **_kwargs):
+            checkpoint.parent.mkdir(parents=True, exist_ok=True)
+            checkpoint.write_bytes(b"candidate")
+            Path(str(checkpoint) + ".optimizer.pt").write_bytes(b"optimizer")
+            report.write_text(json.dumps(_training_report(verified, checkpoint)))
+            return subprocess.CompletedProcess(command_arg, 0)
+
+        executor.execute(
+            verified=verified,
+            command=command,
+            checkpoint=checkpoint,
+            report=report,
+            receipt=receipt,
+            gpu=0,
+            runner=runner,
+            probe=lambda _gpu: "NVIDIA B200",
+        )
+
+    run_once("first")
+    with pytest.raises(executor.ExecutorError, match="claim already exists"):
+        run_once("second")
+
+
+def test_receipt_publication_failure_leaves_terminal_complete_claim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    verified = _verified(tmp_path)
+    checkpoint = tmp_path / "out" / "candidate.pt"
+    report = tmp_path / "out" / "report.json"
+    receipt = tmp_path / "out" / "receipt.json"
+    command = executor.build_train_command(
+        verified,
+        python=Path(sys.executable),
+        checkpoint=checkpoint,
+        report=report,
+    )
+
+    def runner(command_arg, **_kwargs):
+        checkpoint.parent.mkdir(parents=True, exist_ok=True)
+        checkpoint.write_bytes(b"candidate")
+        Path(str(checkpoint) + ".optimizer.pt").write_bytes(b"optimizer")
+        report.write_text(json.dumps(_training_report(verified, checkpoint)))
+        return subprocess.CompletedProcess(command_arg, 0)
+
+    monkeypatch.setattr(
+        executor,
+        "_write_receipt_no_clobber",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("receipt disk error")),
+    )
+    with pytest.raises(OSError, match="receipt disk error"):
+        executor.execute(
+            verified=verified,
+            command=command,
+            checkpoint=checkpoint,
+            report=report,
+            receipt=receipt,
+            gpu=0,
+            runner=runner,
+            probe=lambda _gpu: "NVIDIA B200",
+        )
+
+    claim = executor._claim_path(verified)
+    state = executor._load_claim_state(
+        claim, contract_sha256=verified["contract_sha256"]
+    )
+    assert state["status"] == "complete"
+    assert state["outputs"]["checkpoint_sha256"] == executor._file_sha256(
+        checkpoint
+    )
+    with pytest.raises(executor.ExecutorError, match="claim already exists"):
+        executor._claim_attempt(
+            verified,
+            {
+                "schema_version": executor.CLAIM_SCHEMA,
+                "status": "claimed",
+                "contract_sha256": verified["contract_sha256"],
+            },
+        )
+
+
+@pytest.mark.parametrize("alias", ["checkpoint", "report", "receipt"])
+def test_output_paths_cannot_alias_the_contract_claim(
+    tmp_path: Path, alias: str
+) -> None:
+    verified = _verified(tmp_path)
+    claim = executor._claim_path(verified)
+    checkpoint = tmp_path / "out" / "candidate.pt"
+    report = tmp_path / "out" / "report.json"
+    receipt = tmp_path / "out" / "receipt.json"
+    if alias == "checkpoint":
+        checkpoint = claim
+    elif alias == "report":
+        report = claim
+    else:
+        receipt = claim
+
+    runner_called = False
+
+    def runner(*_args, **_kwargs):
+        nonlocal runner_called
+        runner_called = True
+        return subprocess.CompletedProcess([], 0)
+
+    with pytest.raises(executor.ExecutorError, match="claim path"):
+        executor.execute(
+            verified=verified,
+            command=[sys.executable, "train_bc.py"],
+            checkpoint=checkpoint,
+            report=report,
+            receipt=receipt,
+            gpu=0,
+            runner=runner,
+            probe=lambda _gpu: "NVIDIA B200",
+        )
+    assert runner_called is False
+    assert not claim.exists()
+
+
+@pytest.mark.parametrize(
+    ("field", "bad_value"),
+    [
+        ("checkpoint", "/wrong/candidate.pt"),
+        ("init_checkpoint_sha256", "sha256:" + "0" * 64),
+        ("data_fingerprint", "sha256:" + "0" * 64),
+        ("steps_completed", 1),
+        ("a1_training_game_seed_set_sha256", "sha256:" + "0" * 64),
+    ],
+)
+def test_output_report_must_semantically_prove_the_sealed_dose(
+    tmp_path: Path, field: str, bad_value: object
+) -> None:
+    verified = _verified(tmp_path)
+    checkpoint = tmp_path / "candidate.pt"
+    optimizer = Path(str(checkpoint) + ".optimizer.pt")
+    report = tmp_path / "report.json"
+    checkpoint.write_bytes(b"candidate")
+    optimizer.write_bytes(b"optimizer")
+    payload = _training_report(verified, checkpoint)
+    payload[field] = bad_value
+    report.write_text(json.dumps(payload))
+
+    with pytest.raises(executor.ExecutorError, match="report invariant drift"):
+        executor._verify_training_outputs(
+            checkpoint=checkpoint, report=report, verified=verified
+        )
 
 
 def test_cli_is_dry_run_by_default() -> None:
