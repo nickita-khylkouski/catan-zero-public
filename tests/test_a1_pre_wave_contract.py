@@ -1278,6 +1278,179 @@ def test_render_writes_commands_only_and_never_overwrites(tmp_path: Path) -> Non
         contract.render(lock_path, rendered)
 
 
+def test_claim_transaction_atomically_installs_all_rows_and_is_idempotent(
+    tmp_path: Path,
+) -> None:
+    lock_path, lock = _lock(tmp_path)
+    rendered_dir = tmp_path / "rendered"
+    rendered = contract.render(lock_path, rendered_dir)
+    ledger = Path(lock["fleet"]["seed_ledger"]["path"])
+    before = ledger.read_bytes()
+    receipt_path = tmp_path / "claims.receipt.json"
+
+    receipt = contract.claim_seed_ledger(
+        lock_path, rendered_dir / "commands.json", receipt_path
+    )
+    after = ledger.read_bytes()
+    assert receipt["status"] == "claimed"
+    assert receipt["claim_count"] == 120
+    assert receipt["render_sha256"] == rendered["render_sha256"]
+    assert after.startswith(before) and after != before
+    assert contract.verify_lock(
+        lock_path, require_all_job_claims=True
+    )["contract_sha256"] == lock["contract_sha256"]
+    assert receipt_path.stat().st_mode & stat.S_IWUSR == 0
+
+    # Re-entry validates the immutable receipt and exact ledger prefix. It
+    # neither appends duplicates nor rewrites the receipt.
+    receipt_bytes = receipt_path.read_bytes()
+    assert (
+        contract.claim_seed_ledger(
+            lock_path, rendered_dir / "commands.json", receipt_path
+        )
+        == receipt
+    )
+    assert ledger.read_bytes() == after
+    assert receipt_path.read_bytes() == receipt_bytes
+
+    # A later disjoint append is allowed; the receipt binds and rechecks the
+    # exact post-transaction prefix rather than incorrectly freezing the
+    # shared ledger forever.
+    with ledger.open("a", encoding="utf-8") as handle:
+        handle.write("[900000000000 – 900000000001) | later-disjoint |\n")
+    later = ledger.read_bytes()
+    assert contract.claim_seed_ledger(
+        lock_path, rendered_dir / "commands.json", receipt_path
+    ) == receipt
+    assert ledger.read_bytes() == later
+
+
+def test_claim_transaction_recovers_all_exact_rows_without_a_receipt(
+    tmp_path: Path,
+) -> None:
+    lock_path, lock = _lock(tmp_path)
+    rendered_dir = tmp_path / "rendered"
+    contract.render(lock_path, rendered_dir)
+    _append_job_claims(lock)
+    ledger = Path(lock["fleet"]["seed_ledger"]["path"])
+    before = ledger.read_bytes()
+    receipt_path = tmp_path / "recovered.receipt.json"
+
+    receipt = contract.claim_seed_ledger(
+        lock_path, rendered_dir / "commands.json", receipt_path
+    )
+    assert receipt["status"] == "already_claimed"
+    assert receipt["claim_count"] == 120
+    assert ledger.read_bytes() == before
+    assert receipt_path.is_file()
+
+
+def test_claim_transaction_refuses_partial_own_set_without_mutation(
+    tmp_path: Path,
+) -> None:
+    lock_path, lock = _lock(tmp_path)
+    rendered_dir = tmp_path / "rendered"
+    contract.render(lock_path, rendered_dir)
+    _append_job_claims(lock, [lock["fleet"]["jobs"][0]])
+    ledger = Path(lock["fleet"]["seed_ledger"]["path"])
+    before = ledger.read_bytes()
+    receipt = tmp_path / "claims.receipt.json"
+
+    with pytest.raises(contract.ContractError, match="partial own claim set"):
+        contract.claim_seed_ledger(
+            lock_path, rendered_dir / "commands.json", receipt
+        )
+    assert ledger.read_bytes() == before
+    assert not receipt.exists()
+
+
+def test_claim_transaction_rejects_render_drift_and_spoofed_live_claim(
+    tmp_path: Path,
+) -> None:
+    lock_path, lock = _lock(tmp_path)
+    rendered_dir = tmp_path / "rendered"
+    contract.render(lock_path, rendered_dir)
+    commands_path = rendered_dir / "commands.json"
+    os.chmod(commands_path, 0o644)
+    payload = json.loads(commands_path.read_text(encoding="utf-8"))
+    payload["commands"][0]["ledger_claim"]["row"] += " drift"
+    commands_path.write_text(json.dumps(payload), encoding="utf-8")
+    ledger = Path(lock["fleet"]["seed_ledger"]["path"])
+    before = ledger.read_bytes()
+    with pytest.raises(contract.ContractError, match="render semantic digest"):
+        contract.claim_seed_ledger(
+            lock_path, commands_path, tmp_path / "drift.receipt.json"
+        )
+    assert ledger.read_bytes() == before
+
+    # Restore a valid render, then show that a claim naming this contract with
+    # the wrong row is rejected by ordinary live-ledger verification first.
+    commands_path.unlink()
+    for child in rendered_dir.rglob("*"):
+        if child.is_file():
+            os.chmod(child, 0o644)
+    import shutil
+
+    shutil.rmtree(rendered_dir)
+    contract.render(lock_path, rendered_dir)
+    first = lock["fleet"]["jobs"][0]
+    with ledger.open("a", encoding="utf-8") as handle:
+        handle.write(
+            f"[{first['base_seed']} – {first['seed_end']}) | "
+            f"claim={first['claim_label']} contract={'sha256:' + '0' * 64} "
+            "job=WRONG |\n"
+        )
+    spoofed = ledger.read_bytes()
+    with pytest.raises(contract.ContractError, match="does not exactly match"):
+        contract.claim_seed_ledger(
+            lock_path,
+            rendered_dir / "commands.json",
+            tmp_path / "spoof.receipt.json",
+        )
+    assert ledger.read_bytes() == spoofed
+
+
+def test_claim_transaction_replace_failure_leaves_original_ledger(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lock_path, lock = _lock(tmp_path)
+    rendered_dir = tmp_path / "rendered"
+    contract.render(lock_path, rendered_dir)
+    ledger = Path(lock["fleet"]["seed_ledger"]["path"])
+    before = ledger.read_bytes()
+    receipt = tmp_path / "claims.receipt.json"
+
+    def fail_replace(_source: Path, _destination: Path) -> None:
+        raise OSError("injected replace failure")
+
+    monkeypatch.setattr(contract.os, "replace", fail_replace)
+    with pytest.raises(OSError, match="injected replace failure"):
+        contract.claim_seed_ledger(
+            lock_path, rendered_dir / "commands.json", receipt
+        )
+    assert ledger.read_bytes() == before
+    assert not receipt.exists()
+    assert not list(ledger.parent.glob(f".{ledger.name}.claim-*.tmp"))
+
+
+def test_claim_transaction_rejects_mutated_existing_receipt(tmp_path: Path) -> None:
+    lock_path, _lock_payload = _lock(tmp_path)
+    rendered_dir = tmp_path / "rendered"
+    contract.render(lock_path, rendered_dir)
+    receipt_path = tmp_path / "claims.receipt.json"
+    contract.claim_seed_ledger(
+        lock_path, rendered_dir / "commands.json", receipt_path
+    )
+    os.chmod(receipt_path, 0o644)
+    payload = json.loads(receipt_path.read_text(encoding="utf-8"))
+    payload["status"] = "forged"
+    receipt_path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(contract.ContractError, match="semantic digest"):
+        contract.claim_seed_ledger(
+            lock_path, rendered_dir / "commands.json", receipt_path
+        )
+
+
 def test_shard_resolution_rejects_stale_absolute_basename_alias(tmp_path: Path) -> None:
     manifest = tmp_path / "job" / "manifest.json"
     manifest.parent.mkdir()

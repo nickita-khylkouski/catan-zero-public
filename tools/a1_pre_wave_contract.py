@@ -20,12 +20,14 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import datetime as dt
+import fcntl
 import hashlib
 import json
 import os
 import re
 import stat
 import sys
+import uuid
 from collections import Counter
 from pathlib import Path
 from typing import Any, Iterable, Sequence
@@ -60,6 +62,7 @@ MPS_PIPE_DIRECTORY = "/tmp/mps_pipe_host"
 MPS_LOG_DIRECTORY = "/tmp/mps_log_host"
 AUDIT_SCHEMA = "a1-post-wave-audit-v2"
 GUARD_SYNC_SCHEMA = "a1-pre-wave-generation-guard-sync-v1"
+CLAIM_RECEIPT_SCHEMA = "a1-seed-claim-transaction-v1"
 GUARD_SYNC_KEY = "a1_pre_wave_guard_sync"
 GUARD_SYNC_TOOL = "tools/a1_pre_wave_contract.py"
 DEFAULT_GENERATION_C_SCALE = 0.03
@@ -2815,6 +2818,231 @@ def _ledger_claim_row(lock: dict[str, Any], job: dict[str, Any]) -> str:
     )
 
 
+def _validate_claim_render(
+    lock: dict[str, Any], render_path: Path
+) -> tuple[dict[str, Any], list[str]]:
+    """Reconstruct every rendered claim from the sealed lock."""
+
+    rendered = _load_json(render_path)
+    if rendered.get("schema_version") != RENDER_SCHEMA:
+        raise ContractError(f"render schema must be {RENDER_SCHEMA!r}")
+    unhashed = dict(rendered)
+    declared_digest = unhashed.pop("render_sha256", None)
+    if declared_digest != _digest_value(unhashed):
+        raise ContractError("render semantic digest mismatch")
+    if rendered.get("contract_sha256") != lock["contract_sha256"]:
+        raise ContractError("render binds a different sealed contract")
+    commands = rendered.get("commands")
+    jobs = {str(job["job_id"]): job for job in lock["fleet"]["jobs"]}
+    if not isinstance(commands, list) or len(commands) != len(jobs) or len(jobs) != 120:
+        raise ContractError("claim transaction requires exactly 120 rendered jobs")
+    expected_path = str(lock["fleet"]["seed_ledger"]["path"])
+    rows_by_job: dict[str, str] = {}
+    for command in commands:
+        if not isinstance(command, dict):
+            raise ContractError("rendered claim command is not an object")
+        job_id = str(command.get("job_id", ""))
+        if job_id not in jobs or job_id in rows_by_job:
+            raise ContractError(f"unknown or duplicate rendered claim job {job_id!r}")
+        expected_row = _ledger_claim_row(lock, jobs[job_id])
+        claim = command.get("ledger_claim")
+        if not isinstance(claim, dict) or set(claim) != {
+            "path",
+            "row",
+            "row_sha256",
+        }:
+            raise ContractError(f"rendered ledger claim fields drift for {job_id}")
+        if (
+            claim["path"] != expected_path
+            or claim["row"] != expected_row
+            or claim["row_sha256"] != _digest_value(expected_row)
+        ):
+            raise ContractError(f"rendered ledger claim differs from lock for {job_id}")
+        rows_by_job[job_id] = expected_row
+    if set(rows_by_job) != set(jobs):
+        raise ContractError("rendered claims do not cover the exact sealed job set")
+    rows = [rows_by_job[str(job["job_id"])] for job in lock["fleet"]["jobs"]]
+    if len(set(rows)) != len(rows):
+        raise ContractError("sealed jobs render duplicate ledger rows")
+    return rendered, rows
+
+
+def _durable_replace(path: Path, data: bytes) -> None:
+    """O_EXCL temp + fsync + replace + parent fsync."""
+
+    path = path.resolve(strict=True)
+    mode = stat.S_IMODE(path.stat().st_mode)
+    temporary = path.with_name(f".{path.name}.claim-{uuid.uuid4().hex}.tmp")
+    try:
+        descriptor = os.open(
+            temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode
+        )
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def _create_durable_readonly(path: Path, payload: dict[str, Any]) -> None:
+    """Create one immutable transaction receipt and durably link its name."""
+
+    path = path.absolute()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    serialized = json.dumps(payload, indent=2, sort_keys=True).encode() + b"\n"
+    try:
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o444)
+    except FileExistsError as error:
+        raise ContractError(f"refusing to overwrite claim receipt {path}") from error
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(serialized)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(path, stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except BaseException:
+        path.unlink(missing_ok=True)
+        raise
+
+
+def _verify_claim_receipt(
+    receipt_path: Path,
+    *,
+    lock: dict[str, Any],
+    rendered: dict[str, Any],
+    rows: list[str],
+    ledger_bytes: bytes,
+) -> dict[str, Any]:
+    receipt = _load_json(receipt_path)
+    expected_fields = {
+        "schema_version",
+        "status",
+        "contract_sha256",
+        "render_sha256",
+        "ledger_path",
+        "ledger_before_sha256",
+        "ledger_after_sha256",
+        "ledger_after_size_bytes",
+        "claim_count",
+        "claims_sha256",
+        "receipt_sha256",
+    }
+    if set(receipt) != expected_fields:
+        raise ContractError("claim receipt fields drift")
+    unhashed = dict(receipt)
+    declared = unhashed.pop("receipt_sha256", None)
+    if declared != _digest_value(unhashed):
+        raise ContractError("claim receipt semantic digest mismatch")
+    if (
+        receipt["schema_version"] != CLAIM_RECEIPT_SCHEMA
+        or receipt["status"] not in {"claimed", "already_claimed"}
+        or receipt["contract_sha256"] != lock["contract_sha256"]
+        or receipt["render_sha256"] != rendered["render_sha256"]
+        or receipt["ledger_path"] != str(lock["fleet"]["seed_ledger"]["path"])
+        or receipt["claim_count"] != len(rows)
+        or receipt["claims_sha256"] != _digest_value(rows)
+    ):
+        raise ContractError("claim receipt binds different contract/render/rows")
+    size = int(receipt["ledger_after_size_bytes"])
+    if size < 0 or len(ledger_bytes) < size:
+        raise ContractError("live ledger is shorter than claim receipt prefix")
+    if "sha256:" + hashlib.sha256(ledger_bytes[:size]).hexdigest() != receipt[
+        "ledger_after_sha256"
+    ]:
+        raise ContractError("live ledger claim-receipt prefix drift")
+    return receipt
+
+
+def claim_seed_ledger(
+    lock_path: Path, render_path: Path, receipt_path: Path
+) -> dict[str, Any]:
+    """Atomically install all 120 exact claims, or validate the prior transaction."""
+
+    lock_path = lock_path.absolute()
+    render_path = render_path.absolute()
+    receipt_path = receipt_path.absolute()
+    # The first verification rejects spoofed, duplicated, overlapping, or
+    # non-append-only live rows before any mutation. It is repeated under the
+    # advisory lock so cooperating operators cannot race the transaction.
+    lock = verify_lock(lock_path)
+    rendered, rows = _validate_claim_render(lock, render_path)
+    ledger = Path(str(lock["fleet"]["seed_ledger"]["path"])).absolute()
+    sidecar = ledger.with_name(ledger.name + ".a1-claim.lock")
+    sidecar.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(sidecar, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        lock = verify_lock(lock_path)
+        rendered, rows = _validate_claim_render(lock, render_path)
+        before = ledger.read_bytes()
+        if receipt_path.exists():
+            receipt = _verify_claim_receipt(
+                receipt_path,
+                lock=lock,
+                rendered=rendered,
+                rows=rows,
+                ledger_bytes=before,
+            )
+            verify_lock(lock_path, require_all_job_claims=True)
+            return receipt
+
+        _text, live_claims = _read_strict_ledger(ledger)
+        counts: list[int] = []
+        for job in lock["fleet"]["jobs"]:
+            expected = (
+                int(job["base_seed"]),
+                int(job["seed_end"]),
+                _ledger_claim_label(str(lock["contract_sha256"]), job),
+            )
+            counts.append(sum(claim == expected for claim in live_claims))
+        if any(count not in (0, 1) for count in counts):
+            raise ContractError("live ledger repeats an exact own claim")
+        present = sum(counts)
+        if present not in (0, len(rows)):
+            raise ContractError(
+                f"refusing partial own claim set: found {present}/{len(rows)} exact rows"
+            )
+        status = "already_claimed" if present == len(rows) else "claimed"
+        after = before
+        if present == 0:
+            if not before.endswith(b"\n"):
+                raise ContractError("live seed ledger must end with a newline")
+            after = before + b"".join(row.encode("utf-8") + b"\n" for row in rows)
+            _durable_replace(ledger, after)
+        verify_lock(lock_path, require_all_job_claims=True)
+        receipt = {
+            "schema_version": CLAIM_RECEIPT_SCHEMA,
+            "status": status,
+            "contract_sha256": lock["contract_sha256"],
+            "render_sha256": rendered["render_sha256"],
+            "ledger_path": str(ledger),
+            "ledger_before_sha256": "sha256:" + hashlib.sha256(before).hexdigest(),
+            "ledger_after_sha256": "sha256:" + hashlib.sha256(after).hexdigest(),
+            "ledger_after_size_bytes": len(after),
+            "claim_count": len(rows),
+            "claims_sha256": _digest_value(rows),
+        }
+        receipt["receipt_sha256"] = _digest_value(receipt)
+        _create_durable_readonly(receipt_path, receipt)
+        return receipt
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+
+
 def _create_readonly(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     serialized = json.dumps(payload, indent=2, sort_keys=True) + "\n"
@@ -3743,6 +3971,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     render_parser.add_argument("--lock", required=True)
     render_parser.add_argument("--out-dir", required=True)
+    claim_parser = sub.add_parser(
+        "claim", help="atomically append all 120 exact rendered seed claims"
+    )
+    claim_parser.add_argument("--lock", required=True)
+    claim_parser.add_argument("--render", required=True)
+    claim_parser.add_argument("--receipt", required=True)
     audit_parser = sub.add_parser(
         "audit", help="deep post-wave audit before corpus ingest"
     )
@@ -3798,6 +4032,22 @@ def main(argv: Sequence[str] | None = None) -> int:
                         "out": str(Path(args.out_dir).absolute()),
                         "jobs": len(payload["commands"]),
                     }
+                )
+            )
+            return 0
+        if args.command == "claim":
+            payload = claim_seed_ledger(
+                Path(args.lock), Path(args.render), Path(args.receipt)
+            )
+            print(
+                json.dumps(
+                    {
+                        "status": "PASS",
+                        "receipt": str(Path(args.receipt).absolute()),
+                        "receipt_sha256": payload["receipt_sha256"],
+                        "claim_count": payload["claim_count"],
+                    },
+                    sort_keys=True,
                 )
             )
             return 0

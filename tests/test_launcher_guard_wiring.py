@@ -97,6 +97,7 @@ GOLDEN_OPTION_STRINGS = {
         ("--no-public-observation", "--public-observation"),
         ("--no-rust-featurize", "--rust-featurize"),
         ("--no-score-actions", "--score-actions"),
+        ("--no-resume", "--resume"),
         ("--no-seed-claim", "--seed-claim"),
         ("--obs-width",),
         ("--opponent-mix-manifest",),
