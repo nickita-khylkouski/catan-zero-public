@@ -74,3 +74,35 @@ rejects opponent-mix generation (not compatible with its mandatory shared EvalSe
 Three two-operator collisions on 2026-07-09 (crossed c6 conversion, shared-pgid c1 kill, duplicate
 c6 relaunch). Route all fleet changes through the single box owner; always post-verify a single clean
 gen set after any conversion (`fleet_status.sh <box>` + `fleet_stop.sh <box>` dry-run).
+
+## Generic 40-GPU scheduler
+
+`gpu_fleet.py` is the daemonless scheduler for the canonical six 4×H100 plus
+two 8×H100 fleet. The committed `configs/gpu_fleet_40.json` is deliberately
+exact: extra hosts or topology drift fail closed. It allocates physical GPU IDs
+deterministically in manifest order, filters by the declared deployed Git
+commit, and refuses a selected GPU with an existing non-MPS CUDA client.
+
+Jobs are argv arrays, not shell fragments. Plans and per-host receipts are
+hash-bound, launches use the canonical detached heartbeat helper, repeat
+submission is idempotent, and mutation requires `--go`. SSH ControlMaster
+multiplexing amortizes connection setup without requiring Slurm/Ray ports or
+east-west credentials.
+
+```bash
+python tools/fleet/gpu_fleet.py --manifest configs/gpu_fleet_40.json inventory
+python tools/fleet/gpu_fleet.py --manifest configs/gpu_fleet_40.json plan \
+  --jobset jobs.json --repo-commit "$(git rev-parse HEAD)" --out plan.json
+python tools/fleet/gpu_fleet.py --manifest configs/gpu_fleet_40.json submit --plan plan.json
+python tools/fleet/gpu_fleet.py --manifest configs/gpu_fleet_40.json submit --plan plan.json --go
+python tools/fleet/gpu_fleet.py --manifest configs/gpu_fleet_40.json status --plan plan.json
+```
+
+Jobset schema:
+
+```json
+{"schema_version":"catan-gpu-jobset-v1","run_id":"probe-001","jobs":[
+  {"job_id":"train-4gpu","gpus":4,"argv":[".venv/bin/python","tools/train_bc.py","--help"]},
+  {"job_id":"eval-8gpu","gpus":8,"host":"h100-8b","argv":["bash","tools/run_eval.sh"]}
+]}
+```

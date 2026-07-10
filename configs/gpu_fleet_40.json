@@ -1,0 +1,18 @@
+{
+  "schema_version": "catan-gpu-fleet-v1",
+  "ssh_user": "ubuntu",
+  "ssh_key": null,
+  "strict_host_key_checking": "accept-new",
+  "remote_repo": "/home/ubuntu/catan-zero-v1",
+  "remote_root": "/home/ubuntu/catan-fleet-jobs",
+  "hosts": [
+    {"alias": "c1", "address": "192.222.54.251", "gpu_count": 4, "accelerator": "H100", "repo_commit": "cfb21588db12ce1d3af9b838c43e912de913afcf"},
+    {"alias": "c2", "address": "68.209.75.117", "gpu_count": 4, "accelerator": "H100", "repo_commit": "cfb21588db12ce1d3af9b838c43e912de913afcf"},
+    {"alias": "c3", "address": "192.222.53.18", "gpu_count": 4, "accelerator": "H100", "repo_commit": "cfb21588db12ce1d3af9b838c43e912de913afcf"},
+    {"alias": "c4", "address": "68.209.73.252", "gpu_count": 4, "accelerator": "H100", "repo_commit": "cfb21588db12ce1d3af9b838c43e912de913afcf"},
+    {"alias": "c5", "address": "68.209.74.145", "gpu_count": 4, "accelerator": "H100", "repo_commit": "cfb21588db12ce1d3af9b838c43e912de913afcf"},
+    {"alias": "c6", "address": "68.209.74.2", "gpu_count": 4, "accelerator": "H100", "repo_commit": "cfb21588db12ce1d3af9b838c43e912de913afcf"},
+    {"alias": "h100-8a", "address": "192.222.53.119", "gpu_count": 8, "accelerator": "H100", "repo_commit": "cfb21588db12ce1d3af9b838c43e912de913afcf"},
+    {"alias": "h100-8b", "address": "192.222.55.216", "gpu_count": 8, "accelerator": "H100", "repo_commit": "cfb21588db12ce1d3af9b838c43e912de913afcf"}
+  ]
+}
