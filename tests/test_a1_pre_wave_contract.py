@@ -16,6 +16,7 @@ from catan_zero.rl.entity_token_policy import EntityGraphConfig
 from tools import a1_pre_wave_contract as contract
 from tools import generate_gumbel_selfplay_data as generator
 from tools import legacy_scalar_readout_attestation as legacy_scalar
+from tools import search_operator_binding as operator_binding
 
 
 TEMPLATE = (
@@ -660,6 +661,46 @@ def _evidence_path(payload: dict, kind: str) -> Path:
     )
 
 
+def _replace_s2_s3_with_operator_bindings(draft: Path) -> tuple[Path, Path]:
+    payload = json.loads(draft.read_text(encoding="utf-8"))
+    search = payload["science"]["search"]
+    search.update(
+        {
+            "n_full": 128,
+            "n_fast": 16,
+            "p_full": 0.25,
+            "n_full_wide": None,
+            "n_full_wide_threshold": None,
+            "wide_roots_always_full": False,
+        }
+    )
+    s1_path = _evidence_path(payload, "s1")
+    s2_path = draft.parent / "s2.operator-binding.json"
+    s3_path = draft.parent / "s3.operator-binding.json"
+    operator_binding.write_bindings(
+        s1_path,
+        s2_path,
+        s3_path,
+        binding_time_utc="2026-07-10T04:10:00Z",
+    )
+    for item in payload["science"]["evidence"]:
+        if item["kind"] == "s2":
+            item["path"] = str(s2_path)
+        elif item["kind"] == "s3":
+            item["path"] = str(s3_path)
+    draft.write_text(json.dumps(payload), encoding="utf-8")
+    return s2_path, s3_path
+
+
+def _rewrite_operator_binding(path: Path, mutate) -> None:
+    path.chmod(0o600)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    mutate(payload)
+    unhashed = dict(payload)
+    unhashed.pop("artifact_content_sha256", None)
+    payload["artifact_content_sha256"] = operator_binding._digest_value(unhashed)
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    path.chmod(0o444)
 def _rebind_search_evidence_checkpoint(payload: dict, checkpoint: Path) -> None:
     decisions: dict[str, Path] = {}
     for stage in ("s1", "s2", "s3"):
@@ -848,6 +889,152 @@ def test_seal_rejects_fabricated_search_envelope_and_swapped_lineage(
         contract.build_lock(draft)
 
 
+def test_seal_accepts_exact_n128_no_adaptive_operator_bindings(tmp_path: Path) -> None:
+    draft = _resolved_draft(tmp_path)
+    s2_path, s3_path = _replace_s2_s3_with_operator_bindings(draft)
+
+    lock = contract.build_lock(draft)
+
+    by_kind = {item["kind"]: item for item in lock["science"]["evidence"]}
+    assert by_kind["s2"]["document_schema"] == operator_binding.SCHEMA
+    assert by_kind["s3"]["document_schema"] == operator_binding.SCHEMA
+    assert by_kind["s2"]["semantic_decision"]["evidence_class"] == (
+        operator_binding.ARTIFACT_KIND
+    )
+    assert by_kind["s2"]["semantic_decision"]["selected_fields"] == {
+        "n_full": 128,
+        "n_fast": 16,
+        "p_full": 0.25,
+    }
+    assert by_kind["s3"]["semantic_decision"]["selected_fields"] == {
+        "n_full_wide": None,
+        "n_full_wide_threshold": None,
+        "wide_roots_always_full": False,
+    }
+    assert stat.S_IMODE(s2_path.stat().st_mode) == 0o444
+    assert stat.S_IMODE(s3_path.stat().st_mode) == 0o444
+
+
+@pytest.mark.parametrize(
+    ("stage", "mutation", "message"),
+    [
+        (
+            "s2",
+            lambda payload: payload.update(statement="pretend this proves strength"),
+            "not strength evidence",
+        ),
+        (
+            "s2",
+            lambda payload: payload["selected_fields"].update(n_full=64),
+            "must select exactly",
+        ),
+        (
+            "s3",
+            lambda payload: payload["selected_fields"].update(
+                n_full_wide=256,
+                n_full_wide_threshold=40,
+                wide_roots_always_full=True,
+            ),
+            "must select exactly",
+        ),
+        (
+            "s3",
+            lambda payload: payload.update(reason="operator-authored free text"),
+            "reason mismatch",
+        ),
+        (
+            "s2",
+            lambda payload: payload.update(binding_time_utc="2026-07-10T04:10:00-07:00"),
+            "explicit UTC offset",
+        ),
+        (
+            "s2",
+            lambda payload: payload.update(operator="global_n64"),
+            "operator mismatch",
+        ),
+        (
+            "s2",
+            lambda payload: payload.update(
+                emitter={
+                    "path": str(
+                        contract.REPO_ROOT / "tools" / "search_teacher_adjudicator.py"
+                    ),
+                    "sha256": contract._sha256(
+                        contract.REPO_ROOT / "tools" / "search_teacher_adjudicator.py"
+                    ),
+                }
+            ),
+            "untrusted emitter",
+        ),
+    ],
+)
+def test_seal_rejects_mutated_operator_binding_semantics(
+    tmp_path: Path, stage: str, mutation, message: str
+) -> None:
+    draft = _resolved_draft(tmp_path)
+    s2_path, s3_path = _replace_s2_s3_with_operator_bindings(draft)
+    target = s2_path if stage == "s2" else s3_path
+    _rewrite_operator_binding(target, mutation)
+
+    with pytest.raises(contract.ContractError, match=message):
+        contract.build_lock(draft)
+
+
+def test_seal_rejects_operator_binding_self_digest(
+    tmp_path: Path,
+) -> None:
+    draft = _resolved_draft(tmp_path)
+    s2_path, _ = _replace_s2_s3_with_operator_bindings(draft)
+    s2_path.chmod(0o600)
+    s2 = json.loads(s2_path.read_text(encoding="utf-8"))
+    s2["artifact_content_sha256"] = "sha256:" + "0" * 64
+    s2_path.write_text(json.dumps(s2), encoding="utf-8")
+    s2_path.chmod(0o444)
+    with pytest.raises(contract.ContractError, match="self digest mismatch"):
+        contract.build_lock(draft)
+
+
+def test_s1_cannot_use_operator_binding_schema(tmp_path: Path) -> None:
+    draft = _resolved_draft(tmp_path)
+    payload = json.loads(draft.read_text(encoding="utf-8"))
+    s2_path, _ = _replace_s2_s3_with_operator_bindings(draft)
+    payload = json.loads(draft.read_text(encoding="utf-8"))
+    for item in payload["science"]["evidence"]:
+        if item["kind"] == "s1":
+            item["path"] = str(s2_path)
+    draft.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(contract.ContractError, match="S1 cannot use"):
+        contract.build_lock(draft)
+
+
+def test_seal_rejects_operator_binding_swapped_s1(tmp_path: Path) -> None:
+    # Rebuild in a clean directory and point S2 at a byte-identical but
+    # different S1 path. It still replays, but must not inherit the exact S1
+    # decision named by the A1 contract.
+    draft = _resolved_draft(tmp_path)
+    payload = json.loads(draft.read_text(encoding="utf-8"))
+    s2_path, s3_path = _replace_s2_s3_with_operator_bindings(draft)
+    real_s1 = _evidence_path(payload, "s1")
+    fake_s1 = tmp_path / "copied-s1.decision.json"
+    fake_s1.write_bytes(real_s1.read_bytes())
+    _rewrite_operator_binding(
+        s2_path,
+        lambda binding: binding.update(
+            source_s1={"path": str(fake_s1), "sha256": contract._sha256(fake_s1)}
+        ),
+    )
+    _rewrite_operator_binding(
+        s3_path,
+        lambda binding: binding.update(
+            source_s2_binding={
+                "path": str(s2_path),
+                "sha256": contract._sha256(s2_path),
+            }
+        ),
+    )
+    with pytest.raises(contract.ContractError, match="exact S1 lineage"):
+        contract.build_lock(draft)
 def test_seal_rejects_stringly_typed_science_booleans(tmp_path: Path) -> None:
     draft = _resolved_draft(tmp_path)
     payload = json.loads(draft.read_text())

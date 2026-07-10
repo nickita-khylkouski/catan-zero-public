@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import datetime as dt
 import hashlib
 import json
 import os
@@ -48,6 +49,7 @@ from catan_zero.rl.pipeline_configs import GenerateConfig  # noqa: E402
 from tools import legacy_scalar_readout_attestation as legacy_scalar  # noqa: E402
 from tools import a0_binding_verdict as a0_binding  # noqa: E402
 from tools import search_teacher_adjudicator as search_adjudicator  # noqa: E402
+from tools import search_operator_binding as operator_binding  # noqa: E402
 from tools.prelaunch_guard import VAL_ONLY_SEED_RANGE, parse_seed_ledger  # noqa: E402
 from tools.seed_fleet_planner import assert_disjoint_seed_blocks  # noqa: E402
 
@@ -1633,6 +1635,229 @@ def _validate_a0_evidence(
     return {"decision": decision, "source_artifacts": records}
 
 
+def _validate_operator_binding_reference(
+    raw: Any, *, owner_path: Path, where: str
+) -> tuple[Path, dict[str, str]]:
+    _require_exact_keys(raw, {"path", "sha256"}, where=where)
+    path = _absolute_ref(str(raw["path"]), base=owner_path.parent)
+    actual = _sha256(path) if path.is_file() else "<missing>"
+    if actual != raw["sha256"]:
+        raise ContractError(
+            f"{where} hash drift at {path}: declared {raw['sha256']}, actual {actual}"
+        )
+    return path, {"path": str(path), "sha256": actual}
+
+
+def _validate_operator_binding_evidence(
+    payload: dict[str, Any],
+    *,
+    path: Path,
+    expected_stage: str,
+    final_search: dict[str, Any],
+    final_evaluator: dict[str, Any],
+) -> dict[str, Any]:
+    """Validate the narrow no-S2/no-S3 operator-choice bridge.
+
+    This path cannot accept experimental verdicts and the ordinary
+    search-adjudication path cannot accept these bindings.  The exact constants
+    below make the exception specific to the current n128/no-adaptive operator
+    directive rather than a general mechanism for bypassing evidence.
+    """
+
+    if expected_stage not in {"s2", "s3"}:
+        raise ContractError(
+            f"{expected_stage.upper()} cannot use the operator-binding schema"
+        )
+    common_keys = {
+        "schema_version",
+        "artifact_kind",
+        "stage",
+        "operator",
+        "passed",
+        "decision",
+        "reason",
+        "binding_time_utc",
+        "statement",
+        "selected_fields",
+        "selected_fields_sha256",
+        "source_s1",
+        "source_s1_selected_fields_sha256",
+        "emitter",
+        "artifact_content_sha256",
+    }
+    expected_keys = set(common_keys)
+    if expected_stage == "s3":
+        expected_keys.add("source_s2_binding")
+    _require_exact_keys(
+        payload,
+        expected_keys,
+        where=f"{expected_stage.upper()} operator binding {path}",
+    )
+    if payload["schema_version"] != operator_binding.SCHEMA:
+        raise ContractError(
+            f"{expected_stage.upper()} operator-binding schema mismatch"
+        )
+    if payload["artifact_kind"] != operator_binding.ARTIFACT_KIND:
+        raise ContractError(
+            f"{expected_stage.upper()} artifact_kind must explicitly deny strength evidence"
+        )
+    if payload["stage"] != expected_stage or payload["passed"] is not True:
+        raise ContractError(
+            f"{expected_stage.upper()} operator binding has wrong stage/passed state"
+        )
+    expected_decision = "operator_bind" if expected_stage == "s2" else "operator_hold"
+    expected_operator = (
+        operator_binding.S2_OPERATOR
+        if expected_stage == "s2"
+        else operator_binding.S3_OPERATOR
+    )
+    expected_reason = (
+        operator_binding.S2_REASON
+        if expected_stage == "s2"
+        else operator_binding.S3_REASON
+    )
+    expected_selected = (
+        operator_binding.S2_SELECTED
+        if expected_stage == "s2"
+        else operator_binding.S3_SELECTED
+    )
+    if payload["decision"] != expected_decision:
+        raise ContractError(
+            f"{expected_stage.upper()} operator-binding decision mismatch"
+        )
+    if payload["operator"] != expected_operator:
+        raise ContractError(
+            f"{expected_stage.upper()} operator-binding operator mismatch"
+        )
+    if payload["reason"] != expected_reason:
+        raise ContractError(f"{expected_stage.upper()} operator-binding reason mismatch")
+    if payload["statement"] != operator_binding.STATEMENT:
+        raise ContractError(
+            f"{expected_stage.upper()} must state that the binding is not strength evidence"
+        )
+    timestamp = payload["binding_time_utc"]
+    if not isinstance(timestamp, str):
+        raise ContractError(f"{expected_stage.upper()} binding_time_utc must be a string")
+    try:
+        parsed_time = dt.datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise ContractError(
+            f"{expected_stage.upper()} binding_time_utc is not ISO-8601"
+        ) from error
+    if parsed_time.tzinfo is None or parsed_time.utcoffset() != dt.timedelta(0):
+        raise ContractError(
+            f"{expected_stage.upper()} binding_time_utc must carry an explicit UTC offset"
+        )
+    selected = payload["selected_fields"]
+    if selected != expected_selected:
+        raise ContractError(
+            f"{expected_stage.upper()} operator binding must select exactly {expected_selected}"
+        )
+    if payload["selected_fields_sha256"] != _digest_value(selected):
+        raise ContractError(
+            f"{expected_stage.upper()} operator-binding selected_fields_sha256 mismatch"
+        )
+    mismatches = {
+        key: (selected[key], final_search[key])
+        for key in selected
+        if selected[key] != final_search[key]
+    }
+    if mismatches:
+        raise ContractError(
+            f"{expected_stage.upper()} selected search fields mismatch final contract: {mismatches}"
+        )
+    unhashed = dict(payload)
+    declared_content_digest = unhashed.pop("artifact_content_sha256")
+    if declared_content_digest != _digest_value(unhashed):
+        raise ContractError(
+            f"{expected_stage.upper()} operator-binding self digest mismatch"
+        )
+
+    emitter_path, emitter_record = _validate_operator_binding_reference(
+        payload["emitter"],
+        owner_path=path,
+        where=f"{expected_stage.upper()} operator-binding emitter",
+    )
+    if not emitter_path.as_posix().endswith("tools/search_operator_binding.py"):
+        raise ContractError(
+            f"{expected_stage.upper()} operator binding has an untrusted emitter"
+        )
+    s1_path, s1_record = _validate_operator_binding_reference(
+        payload["source_s1"],
+        owner_path=path,
+        where=f"{expected_stage.upper()} source S1",
+    )
+    s1_payload = _load_json(s1_path)
+    s1_semantic = _validate_search_stage_evidence(
+        s1_payload,
+        path=s1_path,
+        expected_stage="s1",
+        final_search=final_search,
+        final_evaluator=final_evaluator,
+    )
+    if (
+        payload["source_s1_selected_fields_sha256"]
+        != s1_semantic["selected_fields_sha256"]
+    ):
+        raise ContractError(
+            f"{expected_stage.upper()} source S1 selected-fields digest mismatch"
+        )
+
+    if expected_stage == "s2":
+        try:
+            replayed_s2, _ = operator_binding.build_bindings(
+                s1_path,
+                s2_output_path=path,
+                binding_time_utc=timestamp,
+            )
+        except operator_binding.BindingError as error:
+            raise ContractError(f"S2 operator-binding replay failed: {error}") from error
+        if payload != replayed_s2:
+            raise ContractError("S2 operator binding does not equal semantic replay")
+
+    records = [s1_record, emitter_record]
+    semantic: dict[str, Any] = {
+        "decision": payload["decision"],
+        "evidence_class": operator_binding.ARTIFACT_KIND,
+        "selected_fields": dict(selected),
+        "selected_fields_sha256": payload["selected_fields_sha256"],
+        "checkpoint": dict(s1_semantic["checkpoint"]),
+        "source_artifacts": records,
+        "artifact_content_sha256": declared_content_digest,
+        "binding_time_utc": timestamp,
+    }
+    if expected_stage == "s3":
+        s2_path, s2_record = _validate_operator_binding_reference(
+            payload["source_s2_binding"],
+            owner_path=path,
+            where="S3 source S2 operator binding",
+        )
+        s2_payload = _load_json(s2_path)
+        s2_semantic = _validate_operator_binding_evidence(
+            s2_payload,
+            path=s2_path,
+            expected_stage="s2",
+            final_search=final_search,
+            final_evaluator=final_evaluator,
+        )
+        if s2_payload["source_s1"] != payload["source_s1"]:
+            raise ContractError("S3 and S2 operator bindings do not share exact S1 lineage")
+        if s2_payload["binding_time_utc"] != timestamp:
+            raise ContractError("S3 and S2 operator bindings must share one binding time")
+        if s2_semantic["evidence_class"] != operator_binding.ARTIFACT_KIND:
+            raise ContractError("S3 predecessor is not an operator binding")
+        try:
+            replayed_s2, replayed_s3 = operator_binding.build_bindings(
+                s1_path,
+                s2_output_path=s2_path,
+                binding_time_utc=timestamp,
+            )
+        except operator_binding.BindingError as error:
+            raise ContractError(f"S3 operator-binding replay failed: {error}") from error
+        if s2_payload != replayed_s2 or payload != replayed_s3:
+            raise ContractError("S3 operator binding does not equal semantic replay")
+        records.append(s2_record)
+    return semantic
 def _validate_search_stage_evidence(
     payload: dict[str, Any],
     *,
@@ -1641,6 +1866,14 @@ def _validate_search_stage_evidence(
     final_search: dict[str, Any],
     final_evaluator: dict[str, Any],
 ) -> dict[str, Any]:
+    if payload.get("schema_version") == operator_binding.SCHEMA:
+        return _validate_operator_binding_evidence(
+            payload,
+            path=path,
+            expected_stage=expected_stage,
+            final_search=final_search,
+            final_evaluator=final_evaluator,
+        )
     if payload.get("schema_version") != SEARCH_STAGE_EVIDENCE_SCHEMA:
         raise ContractError(
             f"{expected_stage.upper()} evidence {path} schema must be "
