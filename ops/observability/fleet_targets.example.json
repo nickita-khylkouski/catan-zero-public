@@ -1,0 +1,17 @@
+{
+  "hub": {
+    "name": "b200",
+    "cluster": "b200",
+    "role": "rnd",
+    "gpumodel": "B200"
+  },
+  "boxes": [
+    {
+      "name": "c1",
+      "host": "REPLACE_ME",
+      "cluster": "c1",
+      "role": "generation",
+      "gpumodel": "H100"
+    }
+  ]
+}

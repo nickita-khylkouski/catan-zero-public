@@ -1,0 +1,12 @@
+apiVersion: 1
+providers:
+  - name: catan-zero-production
+    orgId: 1
+    folder: Catan-Zero
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: false
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

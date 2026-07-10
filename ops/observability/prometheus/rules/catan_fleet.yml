@@ -1,0 +1,33 @@
+groups:
+  - name: catan-fleet
+    rules:
+      - alert: CatanExporterDown
+        expr: up{job="catan-generator"} == 0
+        for: 3m
+        labels: {severity: critical}
+        annotations:
+          summary: "Catan exporter down on {{ $labels.box }}"
+      - alert: CatanGeneratorStale
+        expr: catan_fleet_generator_processes > 0 and catan_fleet_generator_progress_age_seconds > 300
+        for: 5m
+        labels: {severity: critical}
+        annotations:
+          summary: "Generator stalled on {{ $labels.host }}/gpu{{ $labels.gpu }}"
+      - alert: CatanGeneratorFailure
+        expr: catan_fleet_generator_failures > 0
+        for: 1m
+        labels: {severity: critical}
+        annotations:
+          summary: "Self-play failure on {{ $labels.host }}/gpu{{ $labels.gpu }}"
+      - alert: CatanOutputDiskLow
+        expr: catan_fleet_output_disk_free_bytes < 100 * 1024 * 1024 * 1024
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "Less than 100 GiB free on {{ $labels.host }}"
+      - alert: GPUExporterDown
+        expr: up{job="dcgm"} == 0
+        for: 5m
+        labels: {severity: critical}
+        annotations:
+          summary: "DCGM exporter down on {{ $labels.box }}"

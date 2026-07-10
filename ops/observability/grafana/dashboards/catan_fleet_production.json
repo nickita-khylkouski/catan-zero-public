@@ -1,0 +1,167 @@
+{
+  "annotations": {"list": []},
+  "editable": false,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "links": [],
+  "liveNow": true,
+  "refresh": "15s",
+  "schemaVersion": 39,
+  "tags": ["catan-zero", "fleet", "production"],
+  "time": {"from": "now-3h", "to": "now"},
+  "timezone": "browser",
+  "title": "Catan-Zero Production Fleet",
+  "uid": "catan-zero-production",
+  "version": 1,
+  "templating": {
+    "list": [
+      {
+        "name": "box",
+        "type": "query",
+        "datasource": {"type": "prometheus", "uid": "prometheus"},
+        "query": {"query": "label_values(catan_fleet_exporter_up, host)", "refId": "A"},
+        "refresh": 2,
+        "includeAll": true,
+        "multi": true,
+        "current": {"text": "All", "value": "$__all"}
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "GPUs reporting",
+      "gridPos": {"h": 4, "w": 4, "x": 0, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [{"refId": "A", "expr": "count(DCGM_FI_DEV_GPU_UTIL{box=~\"$box\"})"}],
+      "fieldConfig": {"defaults": {"unit": "none"}, "overrides": []},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "colorMode": "value", "graphMode": "none", "textMode": "value"}
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Healthy generators",
+      "gridPos": {"h": 4, "w": 4, "x": 4, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [{"refId": "A", "expr": "sum(catan_fleet_generator_healthy{host=~\"$box\"}) or vector(0)"}],
+      "fieldConfig": {"defaults": {"unit": "none", "color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "green", "value": 1}]}}, "overrides": []},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "colorMode": "background", "graphMode": "none", "textMode": "value"}
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Stale active generators",
+      "gridPos": {"h": 4, "w": 4, "x": 8, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [{"refId": "A", "expr": "count((catan_fleet_generator_progress_age_seconds{host=~\"$box\"} > 300) and (catan_fleet_generator_processes{host=~\"$box\"} > 0)) or vector(0)"}],
+      "fieldConfig": {"defaults": {"unit": "none", "color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "red", "value": 1}]}}, "overrides": []},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "colorMode": "background", "graphMode": "none", "textMode": "value"}
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Failures / truncations",
+      "gridPos": {"h": 4, "w": 6, "x": 12, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"refId": "A", "expr": "sum(catan_fleet_generator_failures{host=~\"$box\"}) or vector(0)", "legendFormat": "failures"},
+        {"refId": "B", "expr": "sum(catan_fleet_generator_truncations{host=~\"$box\"}) or vector(0)", "legendFormat": "truncations"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "none", "color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "red", "value": 1}]}}, "overrides": []},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "colorMode": "value", "graphMode": "none", "textMode": "value_and_name"}
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "Output disk free",
+      "gridPos": {"h": 4, "w": 6, "x": 18, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [{"refId": "A", "expr": "min(catan_fleet_output_disk_free_bytes{host=~\"$box\"})"}],
+      "fieldConfig": {"defaults": {"unit": "bytes", "color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "orange", "value": 107374182400}, {"color": "green", "value": 536870912000}]}}, "overrides": []},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "colorMode": "value", "graphMode": "area", "textMode": "value"}
+    },
+    {
+      "id": 6,
+      "type": "status-history",
+      "title": "Per-GPU utilization",
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 4},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [{"refId": "A", "expr": "DCGM_FI_DEV_GPU_UTIL{box=~\"$box\"}", "legendFormat": "{{box}}/gpu{{gpu}}"}],
+      "fieldConfig": {"defaults": {"unit": "percent", "min": 0, "max": 100, "color": {"mode": "continuous-RdYlGr"}}, "overrides": []},
+      "options": {"showValue": "never", "legend": {"displayMode": "hidden", "placement": "bottom"}, "tooltip": {"mode": "single"}}
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "GPU memory used",
+      "gridPos": {"h": 8, "w": 8, "x": 0, "y": 12},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [{"refId": "A", "expr": "DCGM_FI_DEV_FB_USED{box=~\"$box\"}", "legendFormat": "{{box}}/gpu{{gpu}}"}],
+      "fieldConfig": {"defaults": {"unit": "decmbytes", "custom": {"drawStyle": "line", "lineWidth": 1, "fillOpacity": 8, "showPoints": "never"}}, "overrides": []},
+      "options": {"legend": {"displayMode": "table", "placement": "right", "calcs": ["lastNotNull", "max"]}, "tooltip": {"mode": "multi", "sort": "desc"}}
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "GPU power",
+      "gridPos": {"h": 8, "w": 8, "x": 8, "y": 12},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [{"refId": "A", "expr": "DCGM_FI_DEV_POWER_USAGE{box=~\"$box\"}", "legendFormat": "{{box}}/gpu{{gpu}}"}],
+      "fieldConfig": {"defaults": {"unit": "watt", "custom": {"drawStyle": "line", "lineWidth": 1, "fillOpacity": 8, "showPoints": "never"}}, "overrides": []},
+      "options": {"legend": {"displayMode": "table", "placement": "right", "calcs": ["lastNotNull", "max"]}, "tooltip": {"mode": "multi", "sort": "desc"}}
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "GPU temperature",
+      "gridPos": {"h": 8, "w": 8, "x": 16, "y": 12},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [{"refId": "A", "expr": "DCGM_FI_DEV_GPU_TEMP{box=~\"$box\"}", "legendFormat": "{{box}}/gpu{{gpu}}"}],
+      "fieldConfig": {"defaults": {"unit": "celsius", "custom": {"drawStyle": "line", "lineWidth": 1, "fillOpacity": 8, "showPoints": "never"}}, "overrides": []},
+      "options": {"legend": {"displayMode": "table", "placement": "right", "calcs": ["lastNotNull", "max"]}, "tooltip": {"mode": "multi", "sort": "desc"}}
+    },
+    {
+      "id": 10,
+      "type": "table",
+      "title": "Generator progress: games / rows / simulations / shards",
+      "gridPos": {"h": 10, "w": 16, "x": 0, "y": 20},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"refId": "A", "expr": "catan_fleet_generator_games_completed{host=~\"$box\"}", "format": "table", "instant": true, "legendFormat": "games"},
+        {"refId": "B", "expr": "catan_fleet_generator_rows{host=~\"$box\"}", "format": "table", "instant": true, "legendFormat": "rows"},
+        {"refId": "C", "expr": "catan_fleet_generator_simulations{host=~\"$box\"}", "format": "table", "instant": true, "legendFormat": "sims"},
+        {"refId": "D", "expr": "catan_fleet_generator_shards{host=~\"$box\"}", "format": "table", "instant": true, "legendFormat": "shards"},
+        {"refId": "E", "expr": "catan_fleet_generator_progress_age_seconds{host=~\"$box\"}", "format": "table", "instant": true, "legendFormat": "age"},
+        {"refId": "F", "expr": "catan_fleet_generator_processes{host=~\"$box\"}", "format": "table", "instant": true, "legendFormat": "processes"},
+        {"refId": "G", "expr": "catan_fleet_generator_healthy{host=~\"$box\"}", "format": "table", "instant": true, "legendFormat": "healthy"}
+      ],
+      "transformations": [{"id": "merge", "options": {}}],
+      "fieldConfig": {"defaults": {"custom": {"align": "auto"}}, "overrides": []},
+      "options": {"showHeader": true}
+    },
+    {
+      "id": 11,
+      "type": "table",
+      "title": "Config hash and seed range",
+      "gridPos": {"h": 10, "w": 8, "x": 16, "y": 20},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [{"refId": "A", "expr": "catan_fleet_generator_info{host=~\"$box\"}", "format": "table", "instant": true}],
+      "fieldConfig": {"defaults": {"custom": {"align": "auto"}}, "overrides": []},
+      "options": {"showHeader": true}
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "Rows and simulations rate",
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 30},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"refId": "A", "expr": "sum by(host)(rate(catan_fleet_generator_rows{host=~\"$box\"}[5m]))", "legendFormat": "{{host}} rows/s"},
+        {"refId": "B", "expr": "sum by(host)(rate(catan_fleet_generator_simulations{host=~\"$box\"}[5m]))", "legendFormat": "{{host}} sims/s"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "ops", "custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 8, "showPoints": "never"}}, "overrides": []},
+      "options": {"legend": {"displayMode": "table", "placement": "right", "calcs": ["mean", "max"]}, "tooltip": {"mode": "multi", "sort": "desc"}}
+    }
+  ]
+}

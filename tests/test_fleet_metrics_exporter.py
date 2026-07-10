@@ -1,0 +1,198 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+from tools.fleet import fleet_metrics_exporter as exporter
+
+
+def _write_json(path: Path, payload: object, *, mtime: float) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    path.touch()
+    import os
+
+    os.utime(path, (mtime, mtime))
+
+
+def _config(base_seed: int = 1000, games: int = 20, n_full: int = 128) -> dict:
+    return {
+        "pipeline": "generate",
+        "schema_version": 4,
+        "fields": {
+            "base_seed": base_seed,
+            "games": games,
+            "n_full": n_full,
+            "p_full": 0.25,
+        },
+    }
+
+
+def test_live_progress_exports_process_health_config_seed_and_counters(
+    tmp_path: Path,
+) -> None:
+    now = 10_000.0
+    root = tmp_path / "gen_out"
+    gpu = root / "claim-a" / "gpu2"
+    config = _config()
+    _write_json(gpu / "config.json", config, mtime=now - 10)
+    _write_json(
+        gpu / "worker_000" / "progress.json",
+        {
+            "games_requested": 10,
+            "games_completed_local": 4,
+            "rows": 1200,
+            "simulations_used_total": 88_000,
+            "shard_count_confirmed": 2,
+            "games_failed": 0,
+            "games_truncated": 1,
+        },
+        mtime=now - 5,
+    )
+    _write_json(
+        gpu / "worker_001" / "progress.json",
+        {
+            "games_requested": 10,
+            "games_completed_local": 3,
+            "rows": 900,
+            "simulations_used_total": 70_000,
+            "shard_count_confirmed": 1,
+            "games_failed": 0,
+            "games_truncated": 0,
+        },
+        mtime=now - 4,
+    )
+    processes = {str(gpu.resolve()): {41}}
+
+    snapshots = exporter.collect_snapshots(
+        [root],
+        host="c1",
+        processes=processes,
+        now=now,
+        stale_after_seconds=60,
+        max_run_age_seconds=3600,
+    )
+    assert len(snapshots) == 1
+    snapshot = snapshots[0]
+    assert snapshot.gpu == "2"
+    assert snapshot.config_hash == exporter._config_hash(config)
+    assert snapshot.seed_start == 1000
+    assert snapshot.seed_end == 1020
+    assert snapshot.games_completed == 7
+    assert snapshot.rows == 2100
+    assert snapshot.simulations == 158_000
+    assert snapshot.shards == 3
+    assert snapshot.truncations == 1
+    assert snapshot.process_count == 1
+    assert snapshot.healthy is True
+
+    metrics = exporter.render_metrics(
+        snapshots, host="c1", roots=[], now=now
+    )
+    assert 'config_hash="' + exporter._config_hash(config) + '"' in metrics
+    assert 'seed_range="[1000,1020)"' in metrics
+    assert "catan_fleet_generator_rows{" in metrics and "} 2100" in metrics
+    assert "catan_fleet_generator_simulations{" in metrics and "} 158000" in metrics
+    assert "catan_fleet_generator_healthy{" in metrics and "} 1" in metrics
+
+
+def test_stale_active_progress_is_unhealthy(tmp_path: Path) -> None:
+    now = 20_000.0
+    gpu = tmp_path / "runs" / "claim" / "gpu0"
+    _write_json(gpu / "config.json", _config(), mtime=now - 500)
+    _write_json(
+        gpu / "worker_000" / "progress.json",
+        {
+            "games_requested": 20,
+            "games_completed_local": 2,
+            "rows": 3,
+            "simulations_used_total": 4,
+            "shard_count_confirmed": 0,
+            "games_failed": 0,
+            "games_truncated": 0,
+        },
+        mtime=now - 400,
+    )
+    snapshot = exporter.snapshot_run(
+        gpu,
+        host="c1",
+        processes={str(gpu.resolve()): {7}},
+        now=now,
+        stale_after_seconds=300,
+    )
+    assert snapshot is not None
+    assert snapshot.stale_seconds == 400
+    assert snapshot.process_count == 1
+    assert snapshot.healthy is False
+
+
+def test_clean_completed_manifest_is_healthy_without_process(tmp_path: Path) -> None:
+    now = 30_000.0
+    gpu = tmp_path / "runs" / "claim" / "gpu3"
+    _write_json(gpu / "config.json", _config(), mtime=now - 100)
+    _write_json(
+        gpu / "manifest.json",
+        {
+            "config_hash": "sha256:0123456789abcdef",
+            "base_seed": 1000,
+            "games_requested": 20,
+            "games_completed": 20,
+            "games_failed": 0,
+            "games_truncated": 0,
+            "rows": 5000,
+            "simulations_used_total": 90000,
+            "shards": ["a", "b"],
+            "errors": [],
+            "n_full": 128,
+            "p_full": 0.25,
+        },
+        mtime=now - 80,
+    )
+    snapshot = exporter.snapshot_run(
+        gpu, host="c1", processes={}, now=now, stale_after_seconds=30
+    )
+    assert snapshot is not None
+    assert snapshot.complete is True
+    assert snapshot.healthy is True
+    assert snapshot.process_count == 0
+
+
+def test_discover_generators_reads_out_dir_from_proc_cmdline(tmp_path: Path) -> None:
+    proc = tmp_path / "proc"
+    cmdline = proc / "123" / "cmdline"
+    cmdline.parent.mkdir(parents=True)
+    out = tmp_path / "gen" / "gpu0"
+    cmdline.write_bytes(
+        b"python\0tools/generate_gumbel_selfplay_data.py\0--out-dir\0"
+        + str(out).encode()
+        + b"\0"
+    )
+    (proc / "not-a-pid").mkdir()
+
+    assert exporter.discover_generators(proc) == {str(out.resolve()): {123}}
+
+
+def test_only_latest_or_active_run_per_gpu_is_exposed(tmp_path: Path) -> None:
+    now = 40_000.0
+    root = tmp_path / "runs"
+    old = root / "old" / "gpu0"
+    active = root / "active" / "gpu0"
+    _write_json(old / "config.json", _config(base_seed=1), mtime=now - 20)
+    _write_json(active / "config.json", _config(base_seed=100), mtime=now - 100)
+    snapshots = exporter.collect_snapshots(
+        [root],
+        host="c1",
+        processes={str(active.resolve()): {9}},
+        now=now,
+        stale_after_seconds=300,
+        max_run_age_seconds=1000,
+    )
+    assert [snapshot.run for snapshot in snapshots] == ["active"]
+
+
+def test_launcher_dumps_typed_config_before_generation() -> None:
+    source = (
+        Path(__file__).resolve().parents[1] / "tools/fleet/fleet_launch.sh"
+    ).read_text(encoding="utf-8")
+    assert '--dump-config "$GPU_OUT/config.json"' in source
+    assert '--config-purpose "fleet-$CLAIM_ID"' in source

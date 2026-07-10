@@ -527,6 +527,7 @@ for GPU in "${GPU_IDS[@]}"; do
     "$EVAL_SERVER_COLLECTOR_FLAG" --no-eval-server-local-fallback \
     --eval-cache-size "${EVAL_CACHE_SIZE:-0}" \
     --track 2p_no_trade --vps-to-win 10 --format npz --score-actions \
+    --dump-config "$GPU_OUT/config.json" --config-purpose "fleet-$CLAIM_ID" \
     --ledger-claim-label "$CLAIM_ID" \
     "${SCIENCE_ARGS[@]}" \
     >"$GPU_OUT/run.log" 2>&1 &
