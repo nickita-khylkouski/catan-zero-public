@@ -463,6 +463,7 @@ def _fixtures(tmp_path: Path) -> dict[str, Path | dict]:
         "sample_presentations": 40,
         "world_size": 1,
         "parameter_count": 1,
+        "graph_tokens": None,
         "graph_layers": 2,
         "topology_adapter_layers": "2",
         "topology_adapter_width": 8,
@@ -766,6 +767,35 @@ def test_registered_recipe_rejects_forged_resolved_train_config(tmp_path: Path) 
     report["soft_target_weight"] = 0.1
     _rebind_report(paths, report)
     with pytest.raises(ExportError, match="registered recipe"):
+        _export(paths)
+
+
+def test_entity_graph_report_requires_null_graph_tokens_telemetry(tmp_path: Path) -> None:
+    paths = _fixtures(tmp_path)
+    report_path = Path(json.loads(paths["run_manifest"].read_text())["training_report"]["path"])
+    report = json.loads(report_path.read_text())
+    assert report["resolved_train_config"]["fields"]["graph_tokens"] == 32
+    assert report["graph_tokens"] is None
+    report["graph_tokens"] = 32
+    _rebind_report(paths, report)
+    with pytest.raises(ExportError, match="entity_graph.*graph_tokens.*must be null"):
+        _export(paths)
+
+
+def test_xdim_graph_report_requires_resolved_graph_token_count(tmp_path: Path) -> None:
+    paths = _fixtures(tmp_path)
+    report_path = Path(json.loads(paths["run_manifest"].read_text())["training_report"]["path"])
+    report = json.loads(report_path.read_text())
+    fields = report["resolved_train_config"]["fields"]
+    fields["arch"] = "xdim_graph"
+    forged = TrainConfig(**fields)
+    report["resolved_train_config"] = forged.canonical_payload()
+    report["config_hash"] = forged.config_hash()
+    report["full_config_hash"] = forged.full_config_hash()
+    report["arch"] = "xdim_graph"
+    report["graph_tokens"] = None
+    _rebind_report(paths, report)
+    with pytest.raises(ExportError, match="xdim_graph.*graph_tokens differs"):
         _export(paths)
 
 

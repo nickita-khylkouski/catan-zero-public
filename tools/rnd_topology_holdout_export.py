@@ -637,6 +637,18 @@ def _validate_training_report(
         raise ExportError("train_bc report full_config_hash differs from resolved TrainConfig")
     if resolved_payload != train_config.canonical_payload():
         raise ExportError("train_bc report resolved TrainConfig payload is noncanonical")
+    resolved_arch = resolved_fields.get("arch")
+    report_graph_tokens = report.get("graph_tokens")
+    if resolved_arch == "entity_graph":
+        if report_graph_tokens is not None:
+            raise ExportError(
+                "entity_graph train_bc report graph_tokens telemetry must be null"
+            )
+    elif resolved_arch == "xdim_graph":
+        if report_graph_tokens != resolved_fields["graph_tokens"]:
+            raise ExportError(
+                "xdim_graph train_bc report graph_tokens differs from resolved TrainConfig"
+            )
     _validate_a1_artifact_relocation(
         report,
         experiment_config,
@@ -646,6 +658,10 @@ def _validate_training_report(
         validation_manifest=validation_manifest,
     )
     for field, value in resolved_fields.items():
+        if field == "graph_tokens":
+            # This top-level field is conditional telemetry: entity_graph writes
+            # null while the canonical TrainConfig retains its unused default.
+            continue
         if field in report and report[field] != value:
             raise ExportError(f"train_bc report field {field} differs from resolved TrainConfig")
 
