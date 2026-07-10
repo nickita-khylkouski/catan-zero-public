@@ -10,6 +10,7 @@ WHEEL_NAME="catanatron_rs-0.1.4-cp311-cp311-manylinux_2_34_x86_64.whl"
 RECEIPT_NAME="catanatron_rs-0.1.4-build-receipt.json"
 SEALED_SOURCE_DATE_EPOCH="1783641600"
 SEALED_RUSTFLAGS="--remap-path-prefix=/tmp/catan-zero-catanatron-rs-wheel-src=/src/catan-zero-public -C link-arg=-Wl,--build-id=none"
+SEALED_COMPILE_IDENTITY="catanatron-rs-0.1.4-infoset-wheel-v1"
 
 die() {
   echo "build_catanatron_rs_wheel: $*" >&2
@@ -71,12 +72,14 @@ if [ "${CATAN_RS_BUILD_STAGED:-0}" != "1" ]; then
     PYTHONHASHSEED=0 \
     PYTHON_BIN="$PYTHON_BIN" \
     CATAN_RS_BUILD_STAGED=1 \
+    CATAN_RS_SOURCE_COMMIT="$SEALED_COMPILE_IDENTITY" \
+    CATAN_RS_SOURCE_TREE="$SEALED_COMPILE_IDENTITY" \
     OUT_DIR="$OUT_DIR" \
     "$CANONICAL_BUILD_ROOT/tools/build_catanatron_rs_wheel.sh"
-  # Source identity is release evidence, not a compiler input. Exporting these
-  # values into Cargo changes Rust's crate disambiguator even when every native
-  # source byte is identical (the checksum-only A->B proof caught this). Bind
-  # them into the already-built external receipt only after compilation.
+  # Real source identity is release evidence, not a compiler input. Cargo/LLVM
+  # nevertheless uses these environment keys in its crate disambiguator. They
+  # therefore carry a fixed, version-scoped compile salt above; bind the actual
+  # commit/tree into the already-built external receipt only after compilation.
   "$PYTHON_BIN" - "$OUT_DIR/$RECEIPT_NAME" "$SOURCE_COMMIT" "$SOURCE_TREE" <<'PY'
 import json
 import os
@@ -187,6 +190,7 @@ receipt = {
     "maturin_version": "$MATURIN_VERSION",
     "python_version": "$PYTHON_VERSION",
     "canonical_build_root": "$ROOT",
+    "compile_identity": "$SEALED_COMPILE_IDENTITY",
     "source_date_epoch": int("$SOURCE_DATE_EPOCH"),
     "rustflags": "$RUSTFLAGS",
     "cargo_build_jobs": int("$CARGO_BUILD_JOBS"),

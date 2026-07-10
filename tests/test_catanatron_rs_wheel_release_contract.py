@@ -115,8 +115,11 @@ def test_source_identity_is_bound_only_after_compilation() -> None:
             '"$CANONICAL_BUILD_ROOT/tools/build_catanatron_rs_wheel.sh"'
         )
     ]
-    assert "CATAN_RS_SOURCE_COMMIT=" not in staged_environment
-    assert "CATAN_RS_SOURCE_TREE=" not in staged_environment
+    assert 'CATAN_RS_SOURCE_COMMIT="$SEALED_COMPILE_IDENTITY"' in staged_environment
+    assert 'CATAN_RS_SOURCE_TREE="$SEALED_COMPILE_IDENTITY"' in staged_environment
+    assert 'CATAN_RS_SOURCE_COMMIT="$SOURCE_COMMIT"' not in staged_environment
+    assert 'CATAN_RS_SOURCE_TREE="$SOURCE_TREE"' not in staged_environment
+    assert 'SEALED_COMPILE_IDENTITY="catanatron-rs-0.1.4-infoset-wheel-v1"' in script
     assert 'payload["source_commit"] = sys.argv[2]' in script
     assert 'payload["source_tree"] = sys.argv[3]' in script
     assert '"source_commit": None' in script
@@ -139,6 +142,7 @@ def test_builder_emits_a_complete_machine_readable_receipt() -> None:
         "maturin_version",
         "python_version",
         "canonical_build_root",
+        "compile_identity",
         "source_date_epoch",
         "rustflags",
         "cargo_build_jobs",
