@@ -14,7 +14,6 @@ import argparse
 import hashlib
 import json
 import math
-import os
 import re
 import shutil
 import socket
@@ -25,7 +24,9 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 METRIC_PREFIX = "catan_fleet_"
-GPU_DIR_RE = re.compile(r"^gpu(?P<gpu>[0-9]+)$")
+GPU_DIR_RE = re.compile(
+    r"^gpu(?P<gpu>[0-9]+)(?:_pipeline(?P<pipeline>[01]))?$"
+)
 
 
 def _load_json(path: Path) -> dict[str, Any] | None:
@@ -88,6 +89,7 @@ def _number(value: Any, default: float = 0.0) -> float:
 class RunSnapshot:
     host: str
     gpu: str
+    pipeline: str
     run: str
     role: str
     config_hash: str
@@ -187,8 +189,10 @@ def snapshot_run(
     complete = bool(
         manifest is not None
         and games_requested > 0
-        and games_completed >= games_requested
+        and games_completed == games_requested
+        and values["failures"] == 0
         and not errors
+        and manifest.get("fatal_execution_error") in (None, {})
     )
     healthy = bool(
         (len(pids) > 0 and age <= stale_after_seconds and values["failures"] == 0)
@@ -219,6 +223,7 @@ def snapshot_run(
     return RunSnapshot(
         host=host,
         gpu=match.group("gpu"),
+        pipeline=match.group("pipeline") or "0",
         run=run,
         role=role,
         config_hash=config_hash,
@@ -265,17 +270,19 @@ def collect_snapshots(
             if snapshot.process_count == 0 and snapshot.stale_seconds > max_run_age_seconds:
                 continue
             snapshots.append(snapshot)
-    # Avoid unbounded label cardinality: expose one current run per physical GPU.
-    by_gpu: dict[str, RunSnapshot] = {}
+    # Avoid unbounded label cardinality: expose one current run per physical
+    # GPU/pipeline slot. Production supports at most two pipelines per GPU.
+    by_slot: dict[tuple[str, str], RunSnapshot] = {}
     for snapshot in snapshots:
-        prior = by_gpu.get(snapshot.gpu)
+        slot = (snapshot.gpu, snapshot.pipeline)
+        prior = by_slot.get(slot)
         score = (snapshot.process_count > 0, -snapshot.stale_seconds)
         prior_score = (
             (prior.process_count > 0, -prior.stale_seconds) if prior is not None else None
         )
         if prior_score is None or score > prior_score:
-            by_gpu[snapshot.gpu] = snapshot
-    return [by_gpu[gpu] for gpu in sorted(by_gpu, key=int)]
+            by_slot[slot] = snapshot
+    return [by_slot[slot] for slot in sorted(by_slot, key=lambda item: tuple(map(int, item)))]
 
 
 def _escape_label(value: Any) -> str:
@@ -324,6 +331,7 @@ def render_metrics(
         labels = {
             "host": snapshot.host,
             "gpu": snapshot.gpu,
+            "pipeline": snapshot.pipeline,
             "run": snapshot.run,
             "role": snapshot.role,
             "config_hash": snapshot.config_hash,

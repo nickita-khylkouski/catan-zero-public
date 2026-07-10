@@ -84,8 +84,6 @@ class EvalServerConfig:
         transport: ``"mp_queue"`` or opt-in ``"shared_memory"`` request slots.
         client_timeout_ms: Per-request client wait before raising (or falling
             back to a local evaluator if one is supplied).
-        experimental_autocast_dtype: Benchmark-only ``"bf16"``/``"fp16"``
-            CUDA autocast. ``None`` is the strict-FP32 production default.
     """
 
     max_batch_size: int = 64
@@ -112,11 +110,6 @@ class EvalServerConfig:
     # "highest" is strict FP32 matmul. "high" permits CUDA TF32 tensor-core
     # matmuls; kept explicit so throughput/strength gates can compare regimes.
     matmul_precision: str = "highest"
-    # Benchmark-only reduced-precision experiment. No fleet/generator CLI wires
-    # this option: only tools/bench_eval_server.py exposes it, and None keeps
-    # the production path in strict FP32. Any candidate still needs target and
-    # playing-strength gates because small logit changes can alter MCTS paths.
-    experimental_autocast_dtype: str | None = None
     # Opt-in CUDA Graph capture of the fixed-shape state trunk. The raw policy
     # remains authoritative for checkpoint metadata and the server performs
     # event-tail cropping before this wrapper sees a request.
@@ -138,10 +131,6 @@ class EvalServerConfig:
     cuda_graph_warmup_iterations: int = 3
 
     def __post_init__(self) -> None:
-        if self.experimental_autocast_dtype not in {None, "bf16", "fp16"}:
-            raise ValueError(
-                "experimental_autocast_dtype must be None, 'bf16', or 'fp16'"
-            )
         if self.max_neural_rows is not None:
             if isinstance(self.max_neural_rows, bool):
                 raise TypeError("max_neural_rows must be an integer, not bool")
@@ -151,6 +140,11 @@ class EvalServerConfig:
                 raise TypeError("max_neural_rows must be an integer") from error
             if value <= 0:
                 raise ValueError("max_neural_rows must be positive")
+            if self.cuda_graph:
+                raise ValueError(
+                    "max_neural_rows is incompatible with cuda_graph: graph batch "
+                    "buckets can execute more physical rows than the logical cap"
+                )
 
 
 # --- window assembly ---------------------------------------------------------
@@ -835,10 +829,6 @@ def _make_forward_policy(policy: Any, config: EvalServerConfig) -> Any:
     """
     if not config.cuda_graph:
         return policy
-    if config.experimental_autocast_dtype is not None:
-        raise ValueError(
-            "EvalServer CUDA Graph inference does not support experimental autocast"
-        )
     if str(config.matmul_precision) != "highest":
         raise ValueError(
             "EvalServer CUDA Graph inference requires matmul_precision='highest'"
@@ -895,19 +885,6 @@ def _server_main(
     if precision not in {"highest", "high", "medium"}:
         raise ValueError(f"invalid EvalServer matmul_precision={precision!r}")
     torch.set_float32_matmul_precision(precision)
-    autocast_name = config.experimental_autocast_dtype
-    autocast_dtype: Any | None = None
-    configured_device: Any | None = None
-    if autocast_name is not None:
-        configured_device = torch.device(config.device)
-        if configured_device.type != "cuda":
-            raise ValueError(
-                "EvalServer experimental autocast requires a CUDA device"
-            )
-        autocast_dtype = {
-            "bf16": torch.bfloat16,
-            "fp16": torch.float16,
-        }[autocast_name]
     policy = EntityGraphPolicy.load(checkpoint, device=config.device)
     handshake["action_size"] = int(policy.action_size)
     handshake["trained_with_masked_hidden_info"] = bool(
@@ -915,7 +892,6 @@ def _server_main(
     )
     handshake["needs_action_targets"] = _policy_needs_action_targets(policy)
     handshake["matmul_precision"] = precision
-    handshake["experimental_autocast_dtype"] = autocast_name
     handshake["transport"] = str(config.transport)
     handshake["max_neural_rows"] = config.max_neural_rows
     handshake["event_token_limit"] = config.event_token_limit
@@ -964,7 +940,6 @@ def _server_main(
         "max_window_requests": 0,
         "max_window_rows": 0,
         "max_neural_rows": config.max_neural_rows,
-        "experimental_autocast_dtype": autocast_name,
         "forward_calls": 0,
         "max_forward_rows": 0,
         "forward_row_histogram": {},
@@ -1135,20 +1110,12 @@ def _server_main(
                     )
                 forward_started = time.perf_counter()
                 with torch.inference_mode():
-                    autocast_context = (
-                        nullcontext()
-                        if autocast_dtype is None
-                        else torch.autocast(
-                            device_type="cuda", dtype=autocast_dtype
-                        )
+                    outputs = forward_policy.forward_legal_np(
+                        entity,
+                        legal_ids,
+                        context,
+                        return_q=any(group_return_q),
                     )
-                    with autocast_context:
-                        outputs = forward_policy.forward_legal_np(
-                            entity,
-                            legal_ids,
-                            context,
-                            return_q=any(group_return_q),
-                        )
                 if config.cuda_graph:
                     _record_cuda_graph_call(stats, forward_policy)
                 logits = outputs["logits"].detach().float().cpu().numpy()
@@ -1392,9 +1359,6 @@ class EvalServer:
                 self._handshake.get("needs_action_targets", True)
             ),
             "matmul_precision": str(self._handshake.get("matmul_precision", "highest")),
-            "experimental_autocast_dtype": self._handshake.get(
-                "experimental_autocast_dtype"
-            ),
             "transport": str(self._handshake.get("transport", "mp_queue")),
             "max_neural_rows": self._handshake.get("max_neural_rows"),
             "event_token_limit": self._handshake.get("event_token_limit"),

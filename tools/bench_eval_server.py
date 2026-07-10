@@ -226,9 +226,6 @@ def _run_arm(mode: str, a: dict[str, Any]) -> dict[str, Any]:
                     ),
                     event_token_limit=a.get("event_token_limit"),
                     matmul_precision=str(a["matmul_precision"]),
-                    experimental_autocast_dtype=a.get(
-                        "experimental_autocast_dtype"
-                    ),
                     request_collector=bool(a["request_collector"]),
                     cuda_graph=bool(a.get("cuda_graph", False)),
                     cuda_graph_batch_buckets=tuple(
@@ -428,7 +425,6 @@ def _parity(a: dict[str, Any]) -> dict[str, Any]:
             ),
             event_token_limit=a.get("event_token_limit"),
             matmul_precision=str(a["matmul_precision"]),
-            experimental_autocast_dtype=a.get("experimental_autocast_dtype"),
             request_collector=bool(a["request_collector"]),
             cuda_graph=bool(a.get("cuda_graph", False)),
             cuda_graph_batch_buckets=tuple(
@@ -470,7 +466,7 @@ def _parity(a: dict[str, Any]) -> dict[str, Any]:
     return _parity_metrics(
         local_res,
         srv_res,
-        candidate_dtype=a.get("experimental_autocast_dtype") or "fp32",
+        candidate_dtype="fp32",
         matmul_precision=str(a["matmul_precision"]),
     )
 
@@ -505,15 +501,6 @@ def main() -> None:
     ap.add_argument("--max-wait-ms", type=float, default=0.0)
     ap.add_argument(
         "--matmul-precision", choices=("highest", "high", "medium"), default="highest"
-    )
-    ap.add_argument(
-        "--experimental-autocast-dtype",
-        choices=("bf16", "fp16"),
-        default=None,
-        help=(
-            "Benchmark-only CUDA autocast. Production stays strict FP32; use "
-            "--parity to quantify output drift before any strength experiment."
-        ),
     )
     ap.add_argument(
         "--request-collector", action=argparse.BooleanOptionalAction, default=False

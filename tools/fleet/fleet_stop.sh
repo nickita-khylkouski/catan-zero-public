@@ -21,7 +21,7 @@
 #   - For unmanaged work, kill python SUPERVISORS first, then GPU leaf workers.
 #   - PRESERVE the MPS daemon (nvidia-cuda-mps-control/-server) and observability
 #     (dcgm-exporter, prometheus, grafana, node_exporter) — excluded by process_name.
-#   - Verify no recorded group/client/worker remains.  GPU memory must be <=50
+#   - Verify no recorded group/client/Catan-owned worker remains. GPU memory must be <=50
 #     MiB without MPS, or <=128 MiB with only the preserved idle MPS server.
 set -uo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -45,7 +45,11 @@ PRESERVE_RE='mps-server|mps-control|nvidia-cuda-mps|dcgm|nv-hostengine|prometheu
 # A .pid file is not sufficient authority by itself: PIDs are reusable.  Require
 # the current session/group to contain a command emitted by a canonical Catan
 # launcher before a negative-PGID signal is allowed.
-CATAN_RE='run_generation\.sh|run_training\.sh|generate_gumbel_selfplay_data\.py|train_bc\.py|torch\.distributed\.run|gumbel_search_[^ ]*\.py|promotion_gate_runner\.py|selfplay_loop\.py|continuous_flywheel\.py'
+# Match complete argv path/basename tokens, not arbitrary substrings.  Without
+# these boundaries an unrelated command such as
+# `pytest tests/test_generate_gumbel_selfplay_data.py` could become a stop
+# target merely because its test filename mentioned a canonical script.
+CATAN_RE='(^|[ /])(run_generation\.sh|run_training\.sh|generate_gumbel_selfplay_data\.py|train_bc\.py|gumbel_search_[^ /]*\.py|promotion_gate_runner\.py|selfplay_loop\.py|continuous_flywheel\.py)([[:space:]]|$)|(^|[ /])torch\.distributed\.run([[:space:]]|$)'
 
 group_snapshot() {
   # Zombies hold no GPU resources and cannot be signalled.  Excluding them also
@@ -99,15 +103,37 @@ mps_clients() {
   done | sort -un
 }
 
-# Legacy fallback: explicit compute PIDs actually holding GPU memory, excluding
-# preserved infrastructure.  Under older MPS/NVML combinations this may be
-# empty by design; the recorded group remains authoritative.
-visible_workers() {
+# Legacy visibility: explicit compute PIDs actually holding GPU memory,
+# excluding preserved infrastructure.  This list is observation only; a GPU PID
+# is never a stop target until its process/ancestor chain proves Catan ownership.
+visible_gpu_pids() {
   nvidia-smi --query-compute-apps=pid,process_name --format=csv,noheader,nounits 2>/dev/null \
     | awk -F',[ ]*' -v re="$PRESERVE_RE" '{pn=tolower($2); gsub(/ /,"",$1)} pn !~ re && $1!="" {print $1}' \
     | sort -un
 }
-WORKERS=$(visible_workers)
+
+has_catan_ancestry() {
+  local current="$1" parent depth=0
+  while [ -n "$current" ] && [ "$current" -gt 1 ] 2>/dev/null && [ "$depth" -lt 64 ]; do
+    args_of "$current" | grep -Eq "$CATAN_RE" && return 0
+    parent=$(ps -o ppid= -p "$current" 2>/dev/null | tr -d ' ')
+    case "$parent" in ''|*[!0-9]*) return 1;; esac
+    [ "$parent" = "$current" ] && return 1
+    current="$parent"
+    depth=$((depth + 1))
+  done
+  return 1
+}
+
+catan_visible_workers() {
+  local pid
+  for pid in $(visible_gpu_pids); do
+    has_catan_ancestry "$pid" && echo "$pid"
+  done | sort -un
+}
+
+VISIBLE_GPU_PIDS=$(visible_gpu_pids)
+WORKERS=$(catan_visible_workers)
 # SUPERVISORS = python/torchrun ancestors of each fallback worker. Climb stops at the first NON-python
 #    ancestor (bash/sshd/systemd) so the operator's shell is NEVER a kill target.
 SUPERVISORS=""
@@ -117,7 +143,17 @@ for pid in $WORKERS; do
     pp=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')
     { [ -z "$pp" ] || [ "$pp" -le 1 ]; } && break
     case "$(comm_of "$pp")" in
-      python|python3|python3.1[0-9]|torchrun) SUPERVISORS="$SUPERVISORS $pp"; p="$pp" ;;
+      python|python3|python3.1[0-9]|torchrun)
+        # Ownership flows from a process toward its ancestors, never from a
+        # Catan child upward into an unrelated Python orchestrator/test runner.
+        # Validate every supervisor candidate on its own ancestry before it can
+        # become a signal target.
+        if has_catan_ancestry "$pp"; then
+          SUPERVISORS="$SUPERVISORS $pp"; p="$pp"
+        else
+          break
+        fi
+        ;;
       *) break ;;
     esac
   done
@@ -138,6 +174,10 @@ for pgid in $OWNED_GROUPS; do
 done
 echo "-- MPS client PIDs (informational; server preserved): ${MPS_CLIENTS:-none} ($NMPS) --"
 echo "-- GPU compute PIDs / WORKERS (preserved infra excluded): ${WORKERS:-none} ($NWORK) --"
+UNOWNED_GPU_PIDS=$(comm -23 \
+  <(printf '%s\n' $VISIBLE_GPU_PIDS | sed '/^$/d' | sort -un) \
+  <(printf '%s\n' $WORKERS | sed '/^$/d' | sort -un))
+echo "-- UNRELATED GPU PIDs (preserved, never stop targets): ${UNOWNED_GPU_PIDS:-none} --"
 echo "-- SUPERVISORS (python/torchrun parents, killed FIRST): ${SUPERVISORS:-none} ($NSUP) --"
 for pid in $SUPERVISORS; do echo "     sup $pid [$(comm_of "$pid")] $(args_of "$pid" | cut -c1-110)"; done
 [ "$NGROUP" -eq 0 ] && [ "$NWORK" -eq 0 ] && [ "$NMPS" -eq 0 ] \
@@ -188,7 +228,7 @@ if [ "$GO" = "1" ]; then
     echo "FAIL: MPS client PID(s) still live: $MPS_CLIENTS" >&2
     VERIFY_RC=1
   fi
-  RESIDUAL_WORKERS=$(visible_workers)
+  RESIDUAL_WORKERS=$(catan_visible_workers)
   if [ -n "$RESIDUAL_WORKERS" ]; then
     echo "FAIL: non-infrastructure GPU PID(s) still live: $RESIDUAL_WORKERS" >&2
     VERIFY_RC=1

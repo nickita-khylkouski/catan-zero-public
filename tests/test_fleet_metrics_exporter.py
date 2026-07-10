@@ -75,6 +75,7 @@ def test_live_progress_exports_process_health_config_seed_and_counters(
     assert len(snapshots) == 1
     snapshot = snapshots[0]
     assert snapshot.gpu == "2"
+    assert snapshot.pipeline == "0"
     assert snapshot.config_hash == exporter._config_hash(config)
     assert snapshot.seed_start == 1000
     assert snapshot.seed_end == 1020
@@ -157,6 +158,33 @@ def test_clean_completed_manifest_is_healthy_without_process(tmp_path: Path) -> 
     assert snapshot.process_count == 0
 
 
+def test_failed_or_fatal_manifest_is_never_complete_or_healthy(tmp_path: Path) -> None:
+    now = 31_000.0
+    gpu = tmp_path / "runs" / "claim" / "gpu3"
+    _write_json(gpu / "config.json", _config(), mtime=now - 10)
+    _write_json(
+        gpu / "manifest.json",
+        {
+            "games_requested": 20,
+            "games_completed": 20,
+            "games_failed": 1,
+            "errors": [],
+            "fatal_execution_error": {
+                "type": "RuntimeError",
+                "message": "server died",
+            },
+            "n_full": 128,
+        },
+        mtime=now - 5,
+    )
+    snapshot = exporter.snapshot_run(
+        gpu, host="c1", processes={}, now=now, stale_after_seconds=300
+    )
+    assert snapshot is not None
+    assert snapshot.complete is False
+    assert snapshot.healthy is False
+
+
 def test_discover_generators_reads_out_dir_from_proc_cmdline(tmp_path: Path) -> None:
     proc = tmp_path / "proc"
     cmdline = proc / "123" / "cmdline"
@@ -190,9 +218,34 @@ def test_only_latest_or_active_run_per_gpu_is_exposed(tmp_path: Path) -> None:
     assert [snapshot.run for snapshot in snapshots] == ["active"]
 
 
+def test_dual_pipeline_directories_are_both_exposed(tmp_path: Path) -> None:
+    now = 45_000.0
+    root = tmp_path / "runs"
+    first = root / "dual" / "gpu2_pipeline0"
+    second = root / "dual" / "gpu2_pipeline1"
+    _write_json(first / "config.json", _config(base_seed=100), mtime=now - 2)
+    _write_json(second / "config.json", _config(base_seed=110), mtime=now - 1)
+
+    snapshots = exporter.collect_snapshots(
+        [root],
+        host="c1",
+        processes={str(first.resolve()): {10}, str(second.resolve()): {11}},
+        now=now,
+        stale_after_seconds=300,
+        max_run_age_seconds=1000,
+    )
+    assert [(item.gpu, item.pipeline) for item in snapshots] == [
+        ("2", "0"),
+        ("2", "1"),
+    ]
+    metrics = exporter.render_metrics(snapshots, host="c1", roots=[], now=now)
+    assert 'pipeline="0"' in metrics
+    assert 'pipeline="1"' in metrics
+
+
 def test_launcher_dumps_typed_config_before_generation() -> None:
     source = (
         Path(__file__).resolve().parents[1] / "tools/fleet/fleet_launch.sh"
     ).read_text(encoding="utf-8")
-    assert '--dump-config "$GPU_OUT/config.json"' in source
-    assert '--config-purpose "fleet-$CLAIM_ID"' in source
+    assert '--dump-config "$PIPELINE_OUT/config.json"' in source
+    assert '--config-purpose "fleet-$PIPELINE_ID"' in source

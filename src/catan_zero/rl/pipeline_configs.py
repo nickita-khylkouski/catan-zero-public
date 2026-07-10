@@ -90,7 +90,7 @@ _T = TypeVar("_T", bound="PipelineConfig")
 
 # Bump when the *set* of fields on any pipeline config changes so that hashes
 # from before/after the change are never mistaken for equal regimes.
-CONFIG_SCHEMA_VERSION = 4
+CONFIG_SCHEMA_VERSION = 5
 
 # Length (hex chars) of the short hash embedded in artifacts. 16 hex chars =
 # 64 bits; collision probability is negligible for the run counts here and the
@@ -302,6 +302,14 @@ class GenerateConfig(PipelineConfig):
     PIPELINE: ClassVar[str] = "generate"
 
     checkpoint: str | None = None
+    # A path is not an immutable model identity: the bytes at that path can be
+    # replaced between runs. Bind generation provenance to the actual producer.
+    producer_checkpoint_sha256: str = ""
+    # Multiple independent EvalServer/generator processes sharing a device can
+    # alter request-window composition and therefore numerical search paths.
+    # Bind that topology in the science hash; per-pipeline identity/index stays
+    # operational provenance so sibling shards remain merge-compatible.
+    fleet_pipelines_per_gpu: int = 1
     device: str = "cpu"
     track: str = "2p_no_trade"
     vps_to_win: int = 10

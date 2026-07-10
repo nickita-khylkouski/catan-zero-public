@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import sys
 from pathlib import Path
 
@@ -14,6 +15,7 @@ if str(_TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(_TOOLS_DIR))
 
 import generate_gumbel_selfplay_data as cli  # type: ignore  # noqa: E402
+from catan_zero.rl.pipeline_configs import GenerateConfig  # noqa: E402
 
 
 def _base_args(**overrides):
@@ -70,6 +72,313 @@ def test_worker_entry_catches_a_fatal_crash_and_returns_an_error_summary(monkeyp
     assert result["shards"] == []
     assert result["errors"]
     assert "synthetic fatal worker crash" in result["errors"][0]["error"]
+
+
+def test_dual_pipeline_topology_is_validated_and_recorded(tmp_path):
+    parser = cli.build_parser()
+    args = parser.parse_args(
+        [
+            "--out-dir",
+            str(tmp_path),
+            "--fleet-pipelines-per-gpu",
+            "2",
+            "--fleet-pipeline-index",
+            "1",
+            "--fleet-pipeline-id",
+            "claim-gpu0-pipeline1",
+        ]
+    )
+    summary = cli._merge_worker_summaries(
+        [], out_dir=tmp_path, elapsed_sec=1.0, args=args
+    )
+    assert summary["fleet_pipelines_per_gpu"] == 2
+    assert summary["fleet_pipeline_index"] == 1
+    assert summary["fleet_pipeline_id"] == "claim-gpu0-pipeline1"
+
+
+def test_dual_pipeline_index_must_fit_pipeline_count(tmp_path, capsys):
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main(
+            [
+                "--skip-guards",
+                "--out-dir",
+                str(tmp_path),
+                "--games",
+                "0",
+                "--fleet-pipeline-index",
+                "1",
+            ]
+        )
+    assert exc_info.value.code == 2
+    assert "fleet-pipeline-index" in capsys.readouterr().err
+
+
+def test_config_pipeline_count_is_applied_before_index_validation(tmp_path):
+    out_dir = tmp_path / "out"
+    config_path = tmp_path / "generate.json"
+    config_path.write_text(
+        json.dumps(
+            GenerateConfig(
+                games=0,
+                fleet_pipelines_per_gpu=2,
+            ).canonical_payload()
+        )
+    )
+
+    cli.main(
+        [
+            "--skip-guards",
+            "--out-dir",
+            str(out_dir),
+            "--config",
+            str(config_path),
+            "--fleet-pipeline-index",
+            "1",
+        ]
+    )
+    manifest = json.loads((out_dir / "manifest.json").read_text())
+    assert manifest["fleet_pipelines_per_gpu"] == 2
+    assert manifest["fleet_pipeline_index"] == 1
+
+
+def test_config_is_applied_before_auto_shard_and_science_validation(tmp_path):
+    out_dir = tmp_path / "out"
+    config = GenerateConfig(games=0, n_full=128, shard_size=777, p_full=0.5)
+    config_path = tmp_path / "generate.json"
+    config_path.write_text(json.dumps(config.canonical_payload()))
+
+    cli.main(
+        [
+            "--skip-guards",
+            "--out-dir",
+            str(out_dir),
+            "--config",
+            str(config_path),
+        ]
+    )
+
+    manifest = json.loads((out_dir / "manifest.json").read_text())
+    assert manifest["n_full"] == 128
+    assert manifest["p_full"] == 0.5
+    # A config-supplied shard size is pinned, not replaced by n=128 auto-size.
+    assert manifest["cli_args"]["shard_size"] == 777
+
+
+def test_config_filled_values_are_explicit_to_prelaunch_guard(tmp_path):
+    parser = cli.build_parser()
+    config = GenerateConfig(
+        games=0,
+        c_scale=0.03,
+        temperature_decisions=90,
+        public_observation=True,
+        lazy_interior_chance=True,
+    )
+    config_path = tmp_path / "generate.json"
+    config_path.write_text(json.dumps(config.canonical_payload()))
+    raw_argv = ["--out-dir", str(tmp_path / "out"), "--config", str(config_path)]
+    args = parser.parse_args(raw_argv)
+    filled = cli.apply_config_file(
+        args,
+        parser,
+        argv=raw_argv,
+        expected_pipeline=GenerateConfig.PIPELINE,
+    )
+
+    effective_argv = cli._guard_argv_with_config_values(
+        args, parser, raw_argv, filled
+    )
+    reparsed = parser.parse_args(effective_argv)
+
+    assert "--c-scale" in effective_argv
+    assert "--public-observation" in effective_argv
+    assert "--lazy-interior-chance" in effective_argv
+    assert reparsed.c_scale == 0.03
+    assert reparsed.temperature_decisions == 90
+
+
+def test_config_rejects_invalid_choice_before_guard_or_output(tmp_path, capsys):
+    out_dir = tmp_path / "out"
+    payload = GenerateConfig(games=0).canonical_payload()
+    payload["fields"]["value_readout"] = "not-a-readout"
+    config_path = tmp_path / "generate.json"
+    config_path.write_text(json.dumps(payload))
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main(
+            [
+                "--skip-guards",
+                "--out-dir",
+                str(out_dir),
+                "--config",
+                str(config_path),
+            ]
+        )
+    assert exc_info.value.code == 2
+    assert "value-readout" in capsys.readouterr().err
+    assert not out_dir.exists()
+
+
+@pytest.mark.parametrize("bad_p_full", [float("nan"), float("inf"), -0.01, 1.01])
+def test_invalid_p_full_from_config_fails_before_output(tmp_path, bad_p_full, capsys):
+    out_dir = tmp_path / "out"
+    config = GenerateConfig(games=0, p_full=bad_p_full)
+    config_path = tmp_path / "generate.json"
+    config_path.write_text(json.dumps(config.canonical_payload()))
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main(
+            [
+                "--skip-guards",
+                "--out-dir",
+                str(out_dir),
+                "--config",
+                str(config_path),
+            ]
+        )
+    assert exc_info.value.code == 2
+    assert "p-full" in capsys.readouterr().err
+    assert not out_dir.exists()
+
+
+def test_manifest_and_config_hash_bind_checkpoint_bytes(tmp_path):
+    out_dir = tmp_path / "out"
+    checkpoint = tmp_path / "champion.pt"
+    checkpoint.write_bytes(b"checkpoint bytes")
+    expected_sha = "sha256:" + hashlib.sha256(checkpoint.read_bytes()).hexdigest()
+
+    cli.main(
+        [
+            "--skip-guards",
+            "--out-dir",
+            str(out_dir),
+            "--games",
+            "0",
+            "--checkpoint",
+            str(checkpoint),
+        ]
+    )
+
+    manifest = json.loads((out_dir / "manifest.json").read_text())
+    assert manifest["producer_checkpoint_sha256"] == expected_sha
+    staged = Path(manifest["producer_checkpoint_staged_path"])
+    assert staged.read_bytes() == b"checkpoint bytes"
+    assert staged.stat().st_mode & 0o222 == 0
+    expected_config = GenerateConfig(
+        checkpoint=str(checkpoint), games=0, producer_checkpoint_sha256=expected_sha
+    )
+    assert manifest["config_hash"] == expected_config.config_hash()
+
+
+def test_staged_checkpoint_closes_source_path_toctou(tmp_path):
+    output = tmp_path / "out"
+    output.mkdir()
+    source = tmp_path / "champion.pt"
+    source.write_bytes(b"bytes workers must load")
+
+    staged_path, digest = cli._stage_producer_checkpoint(str(source), output)
+    source.write_bytes(b"replacement after staging")
+
+    assert staged_path is not None
+    assert Path(staged_path).read_bytes() == b"bytes workers must load"
+    assert digest == "sha256:" + hashlib.sha256(b"bytes workers must load").hexdigest()
+
+
+def test_precreated_fleet_run_log_does_not_make_output_stale(tmp_path):
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    (out_dir / "run.log").touch()
+
+    cli.main(
+        [
+            "--skip-guards",
+            "--out-dir",
+            str(out_dir),
+            "--games",
+            "0",
+        ]
+    )
+    assert (out_dir / "manifest.json").is_file()
+
+
+@pytest.mark.parametrize(
+    ("completed", "failed"),
+    [(1, 1), (1, 0)],
+    ids=("failed-game", "missing-game"),
+)
+def test_partial_generation_writes_manifest_then_exits_nonzero(
+    tmp_path, monkeypatch, completed, failed
+):
+    out_dir = tmp_path / "out"
+
+    def _partial(worker_args):
+        return {
+            "worker_index": worker_args["worker_index"],
+            "out_dir": worker_args["out_dir"],
+            "games_completed": completed,
+            "games_failed": failed,
+            "games_truncated": 0,
+            "rows": 0,
+            "decisions_total": 0,
+            "forced_decisions_total": 0,
+            "simulations_used_total": 0,
+            "wins_by_color": {},
+            "shards": [],
+            "errors": [],
+        }
+
+    monkeypatch.setattr(cli, "_worker_entry", _partial)
+    with pytest.raises(SystemExit, match="generation incomplete"):
+        cli.main(
+            [
+                "--skip-guards",
+                "--no-seed-claim",
+                "--out-dir",
+                str(out_dir),
+                "--games",
+                "2",
+            ]
+        )
+
+    manifest = json.loads((out_dir / "manifest.json").read_text())
+    assert manifest["games_requested"] == 2
+    assert manifest["games_completed"] == completed
+    assert manifest["games_failed"] == failed
+
+
+def test_eval_server_bootstrap_failure_preserves_top_manifest(
+    tmp_path, monkeypatch
+):
+    out_dir = tmp_path / "out"
+    checkpoint = tmp_path / "champion.pt"
+    checkpoint.write_bytes(b"synthetic checkpoint")
+
+    def _fail_bootstrap(*_args, **_kwargs):
+        raise RuntimeError("synthetic EvalServer startup failure")
+
+    monkeypatch.setattr(cli, "_run_eval_server_batch", _fail_bootstrap)
+    with pytest.raises(SystemExit, match="fatal=RuntimeError"):
+        cli.main(
+            [
+                "--skip-guards",
+                "--no-seed-claim",
+                "--out-dir",
+                str(out_dir),
+                "--games",
+                "1",
+                "--checkpoint",
+                str(checkpoint),
+                "--eval-server",
+            ]
+        )
+
+    manifest = json.loads((out_dir / "manifest.json").read_text())
+    assert manifest["games_requested"] == 1
+    assert manifest["games_completed"] == 0
+    assert manifest["games_failed"] == 1
+    assert manifest["fatal_execution_error"] == {
+        "type": "RuntimeError",
+        "message": "synthetic EvalServer startup failure",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -144,7 +453,10 @@ def test_merge_worker_summaries_excludes_manifest_path_for_a_crashed_worker(tmp_
     # The crashed worker's manifest.json was never written -- its path must
     # not appear in worker_summaries (this used to unconditionally list
     # every worker's out_dir/manifest.json regardless of whether it exists).
-    assert str(Path(crashed_result["out_dir"]) / "manifest.json") not in summary["worker_summaries"]
+    assert (
+        str(Path(crashed_result["out_dir"]) / "manifest.json")
+        not in summary["worker_summaries"]
+    )
     assert str(good_out_dir / "manifest.json") in summary["worker_summaries"]
 
 
@@ -157,7 +469,13 @@ def test_merge_worker_summaries_excludes_manifest_path_for_a_crashed_worker(tmp_
 def _minimal_self_only_manifest(tmp_path: Path) -> Path:
     manifest_path = tmp_path / "mix.json"
     manifest_path.write_text(
-        json.dumps({"categories": [{"name": "producer_self_play", "weight": 1, "source": "self"}]})
+        json.dumps(
+            {
+                "categories": [
+                    {"name": "producer_self_play", "weight": 1, "source": "self"}
+                ]
+            }
+        )
     )
     return manifest_path
 
@@ -182,10 +500,14 @@ def test_opponent_mix_manifest_requires_checkpoint(tmp_path, monkeypatch):
         cli.main()
 
 
-def test_opponent_mix_manifest_mutually_exclusive_with_pool_manifest(tmp_path, monkeypatch):
+def test_opponent_mix_manifest_mutually_exclusive_with_pool_manifest(
+    tmp_path, monkeypatch
+):
     manifest_path = _minimal_self_only_manifest(tmp_path)
     pool_manifest_path = tmp_path / "pool.json"
-    pool_manifest_path.write_text(json.dumps({"opponents": [{"checkpoint": "/fake.pt", "version": 0}]}))
+    pool_manifest_path.write_text(
+        json.dumps({"opponents": [{"checkpoint": "/fake.pt", "version": 0}]})
+    )
     fake_checkpoint = tmp_path / "champion.pt"
     fake_checkpoint.write_bytes(b"fake")
 
@@ -217,7 +539,9 @@ def test_merge_worker_summaries_default_path_leaves_mix_disabled(tmp_path):
     keep reporting opponent_mix as fully disabled/empty -- CAT-54 is purely
     additive."""
     args = _base_args(games=1)
-    summary = cli._merge_worker_summaries([], out_dir=tmp_path, elapsed_sec=1.0, args=args)
+    summary = cli._merge_worker_summaries(
+        [], out_dir=tmp_path, elapsed_sec=1.0, args=args
+    )
     assert summary["opponent_mix_enabled"] is False
     assert summary["opponent_mix_manifest"] is None
     assert summary["opponent_mix_effective_weights"] == {}
@@ -266,7 +590,10 @@ def test_merge_worker_summaries_aggregates_mix_per_tag_stats_across_workers(tmp_
     assert summary["opponent_mix_enabled"] is True
     assert summary["opponent_mix_pool_games"] == 5
     assert summary["opponent_mix_pool_fraction_realized"] == pytest.approx(5 / 20)
-    assert set(summary["opponent_mix_tags_used"]) == {"hard_experimental", "producer_self_play"}
+    assert set(summary["opponent_mix_tags_used"]) == {
+        "hard_experimental",
+        "producer_self_play",
+    }
     winrates = summary["opponent_mix_per_tag_champion_winrate"]
     # hard_experimental: (1+2) champion_wins over (3+2) games = 3/5
     assert winrates["hard_experimental"] == pytest.approx(3 / 5)
@@ -356,7 +683,9 @@ def test_exploiter_fraction_requires_mix_manifest(tmp_path, monkeypatch):
 
 def test_merge_worker_summaries_default_path_leaves_exploiter_disabled(tmp_path):
     args = _base_args(games=1)
-    summary = cli._merge_worker_summaries([], out_dir=tmp_path, elapsed_sec=1.0, args=args)
+    summary = cli._merge_worker_summaries(
+        [], out_dir=tmp_path, elapsed_sec=1.0, args=args
+    )
     assert summary["exploiter_enabled"] is False
     assert summary["exploiter_games"] == 0
     assert summary["exploiter_engines_used"] == []
@@ -404,6 +733,10 @@ def test_merge_worker_summaries_aggregates_exploiter_per_engine_stats(tmp_path):
     stats = summary["exploiter_per_engine_stats"]["catanatron_value"]
     assert stats == {"games": 5, "champion_wins": 3, "divergences": 1}
     # (2+1) champion_wins over (3+2) graded games
-    assert summary["exploiter_per_engine_champion_winrate"]["catanatron_value"] == pytest.approx(3 / 5)
-    assert summary["exploiter_divergence_topics"] == {"rules_adjudication_needed_longest_road": 3}
+    assert summary["exploiter_per_engine_champion_winrate"][
+        "catanatron_value"
+    ] == pytest.approx(3 / 5)
+    assert summary["exploiter_divergence_topics"] == {
+        "rules_adjudication_needed_longest_road": 3
+    }
     assert summary["exploiter_fraction_cap"] == pytest.approx(0.05)

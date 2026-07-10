@@ -1,4 +1,4 @@
-"""Precision-experiment telemetry regressions for bench_eval_server."""
+"""Strict-FP32/TF32 parity telemetry regressions for bench_eval_server."""
 
 from __future__ import annotations
 
@@ -18,12 +18,12 @@ def test_parity_metrics_report_policy_value_and_action_drift() -> None:
     metrics = bench_eval_server._parity_metrics(
         [({3: 0.8, 5: 0.2}, 0.25), ({7: 0.4, 9: 0.6}, -0.1)],
         [({3: 0.3, 5: 0.7}, 0.20), ({7: 0.45, 9: 0.55}, -0.1)],
-        candidate_dtype="bf16",
+        candidate_dtype="fp32",
         matmul_precision="highest",
     )
 
     assert metrics["reference_dtype"] == "fp32"
-    assert metrics["candidate_dtype"] == "bf16"
+    assert metrics["candidate_dtype"] == "fp32"
     assert metrics["max_prior_absdiff"] == pytest.approx(0.5)
     assert metrics["mean_prior_absdiff"] == pytest.approx(0.275)
     assert metrics["max_policy_l1"] == pytest.approx(1.0)
@@ -39,13 +39,13 @@ def test_parity_metrics_reject_misaligned_inputs() -> None:
         bench_eval_server._parity_metrics(
             [],
             [({1: 1.0}, 0.0)],
-            candidate_dtype="fp16",
+            candidate_dtype="fp32",
             matmul_precision="highest",
         )
     with pytest.raises(ValueError, match="legal-action keys differ"):
         bench_eval_server._parity_metrics(
             [({1: 1.0}, 0.0)],
             [({2: 1.0}, 0.0)],
-            candidate_dtype="fp16",
+            candidate_dtype="fp32",
             matmul_precision="highest",
         )

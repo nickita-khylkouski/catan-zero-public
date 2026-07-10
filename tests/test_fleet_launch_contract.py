@@ -11,14 +11,19 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import re
+import shutil
+import signal
 import subprocess
 import sys
+import time
 
 import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
 LAUNCHER = ROOT / "tools" / "fleet" / "fleet_launch.sh"
+DETACHER = ROOT / "tools" / "fleet" / "launch_detached.sh"
+STATUS = ROOT / "tools" / "fleet" / "fleet_status.sh"
 GATE = ROOT / "scripts" / "gate.sh"
 NOOP_CHECK = ROOT / "scripts" / "check_champion_noop.py"
 
@@ -63,6 +68,12 @@ def launcher_env(tmp_path: Path) -> dict[str, str]:
         "  printf '0\\n1\\n2\\n3\\n4\\n5\\n6\\n7\\n'\n"
         "  exit 0\n"
         "fi\n"
+        "if [[ \"$*\" == *\"--query-compute-apps=pid,process_name\"* ]]; then\n"
+        "  if [ \"${FAKE_BUSY_GPU:-}\" = \"${2:-}\" ]; then\n"
+        "    printf '4242, python3\\n'\n"
+        "  fi\n"
+        "  exit 0\n"
+        "fi\n"
         "exit 1\n"
     )
     fake_nvidia_smi.chmod(0o755)
@@ -78,6 +89,8 @@ def launcher_env(tmp_path: Path) -> dict[str, str]:
             "LEDGER": str(ledger),
             "PY": sys.executable,
             "GEN_PY": sys.executable,
+            "FLEET_LAUNCH_HEARTBEAT_WAIT_SECONDS": "0",
+            "FLEET_LAUNCH_EARLY_EXIT_SECONDS": "0.05",
         }
     )
     return env
@@ -98,6 +111,335 @@ def _run(
 
 def test_launcher_shell_syntax_is_valid() -> None:
     subprocess.run(["bash", "-n", str(LAUNCHER)], check=True)
+    subprocess.run(["bash", "-n", str(DETACHER)], check=True)
+
+
+def test_launch_detached_publishes_a_live_pid_equal_to_its_sid(tmp_path: Path) -> None:
+    if not sys.platform.startswith("linux") or not shutil.which("setsid"):
+        pytest.skip("detached PID/SID contract requires Linux setsid")
+    rundir = tmp_path / "run"
+    result = subprocess.run(
+        [
+            "bash",
+            str(DETACHER),
+            str(rundir),
+            str(tmp_path / "run.log"),
+            "60",
+            "--",
+            "sleep",
+            "30",
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    pid = int(result.stdout.strip())
+    try:
+        assert int((rundir / ".pid").read_text().strip()) == pid
+        assert os.getsid(pid) == pid
+        os.kill(pid, 0)
+    finally:
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
+def test_launch_detached_rejects_an_immediately_exited_child(tmp_path: Path) -> None:
+    if not sys.platform.startswith("linux") or not shutil.which("setsid"):
+        pytest.skip("detached PID/SID contract requires Linux setsid")
+    rundir = tmp_path / "run"
+    result = subprocess.run(
+        [
+            "bash",
+            str(DETACHER),
+            str(rundir),
+            str(tmp_path / "run.log"),
+            "60",
+            "--",
+            "bash",
+            "-c",
+            "exit 23",
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode != 0
+    assert not (rundir / ".pid").exists()
+
+
+def test_launch_detached_reaps_descendants_when_session_leader_exits(
+    tmp_path: Path,
+) -> None:
+    if not sys.platform.startswith("linux") or not shutil.which("setsid"):
+        pytest.skip("detached PGID cleanup contract requires Linux setsid")
+    rundir = tmp_path / "run"
+    child_pid_file = tmp_path / "child.pid"
+    program = (
+        "import os,time; "
+        "pid=os.fork(); "
+        f"open({str(child_pid_file)!r},'w').write(str(pid) if pid else str(os.getpid())); "
+        "time.sleep(30) if pid == 0 else time.sleep(0.02); "
+        "os._exit(0)"
+    )
+    result = subprocess.run(
+        [
+            "bash",
+            str(DETACHER),
+            str(rundir),
+            str(tmp_path / "run.log"),
+            "60",
+            "--",
+            sys.executable,
+            "-c",
+            program,
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode != 0
+    if child_pid_file.exists():
+        child_pid = int(child_pid_file.read_text())
+        for _ in range(50):
+            state = subprocess.run(
+                ["ps", "-o", "stat=", "-p", str(child_pid)],
+                text=True,
+                capture_output=True,
+                check=False,
+            ).stdout.strip()
+            if not state or state.startswith("Z"):
+                break
+            time.sleep(0.01)
+        assert not state or state.startswith("Z")
+
+
+def _generation_runner() -> str:
+    source = _source()
+    return source.split("<<'GEN_RUNNER_EOF'", 1)[1].split(
+        "\nGEN_RUNNER_EOF", 1
+    )[0]
+
+
+def _generation_runner_env(
+    tmp_path: Path,
+    *,
+    pipelines_per_gpu: int,
+    gpu_csv: str,
+    games: int,
+    workers: int,
+    base_seed: int,
+) -> tuple[dict[str, str], Path, Path]:
+    tree = tmp_path / "tree"
+    out = tmp_path / "out"
+    rundir = tmp_path / "run"
+    tree.mkdir()
+    out.mkdir()
+    rundir.mkdir()
+    env = os.environ | {
+        "TREE": str(tree),
+        "CKPT": str(tmp_path / "checkpoint.pt"),
+        "GEN_PY": "/bin/echo",
+        "OUT": str(out),
+        "RUNDIR": str(rundir),
+        "GPU_CSV": gpu_csv,
+        "GAMES": str(games),
+        "WORKERS": str(workers),
+        "BASE_SEED": str(base_seed),
+        "NFULL": "128",
+        "NFAST": "16",
+        "PFULL": "1.0",
+        "CSCALE": "0.03",
+        "CLAIM_ID": "pipeline-contract",
+        "USE_MPS": "0",
+        "CPU_AFFINITY": "0",
+        "PIPELINES_PER_GPU": str(pipelines_per_gpu),
+        "SHARD_SIZE": "",
+        "EVAL_SERVER_MAX_BATCH": "96",
+        "EVAL_SERVER_REQUEST_COLLECTOR": "1",
+        "EVAL_SERVER_MAX_NEURAL_ROWS": "",
+        "SYMMETRY_AVERAGED_EVAL": "0",
+        "RESCALE_NOISE_FLOOR_C": "",
+        "SIGMA_EVAL": "",
+        "LATE_TEMPERATURE_DECISIONS": "",
+        "LATE_TEMPERATURE": "",
+        "OPPONENT_MIX_MANIFEST": "",
+        "EXPLOITER_FRACTION": "",
+        "RUST_FEATURIZE": "0",
+        "EVAL_CACHE_SIZE": "",
+        "SYMMETRY_AVERAGED_EVAL_THRESHOLD": "",
+        "N_FULL_WIDE": "",
+        "N_FULL_WIDE_THRESHOLD": "",
+        "WIDE_ROOTS_ALWAYS_FULL": "0",
+        "WIDE_CANDIDATES_THRESHOLD": "",
+        "VALUE_READOUT": "",
+    }
+    return env, out, rundir
+
+
+def test_status_surfaces_live_generator_pipeline_count() -> None:
+    source = STATUS.read_text(encoding="utf-8")
+    assert 'GEN_PIPELINES=$(grep -c "generate_gumbel_selfplay_data"' in source
+    assert "gen_pipelines=%s" in source
+
+
+@pytest.mark.parametrize(
+    ("args", "message"),
+    [
+        (("--pipelines-per-gpu", "3"), "must be 1 or 2"),
+        (
+            ("--pipelines-per-gpu", "2", "--workers", "3"),
+            "must divide evenly",
+        ),
+        (
+            ("--pipelines-per-gpu", "2", "--workers", "4", "--games", "1"),
+            "must be >= --pipelines-per-gpu",
+        ),
+    ],
+)
+def test_invalid_generation_pipeline_topology_fails_before_ssh(
+    launcher_env: dict[str, str], args: tuple[str, ...], message: str
+) -> None:
+    result = _run(
+        launcher_env,
+        "teacher",
+        "--base-seed",
+        "72000000000",
+        *args,
+    )
+    assert result.returncode == 2
+    assert message in result.stderr
+    assert "===== fleet_launch" not in result.stdout
+
+
+def test_pipeline_option_is_generation_only(
+    launcher_env: dict[str, str], tmp_path: Path
+) -> None:
+    result = _run(
+        launcher_env,
+        "train",
+        "--data",
+        str(tmp_path / "corpus"),
+        "--pipelines-per-gpu",
+        "1",
+    )
+    assert result.returncode == 2
+    assert "applies only to teacher/volume generation" in result.stderr
+    assert "===== fleet_launch" not in result.stdout
+
+
+def test_dual_pipeline_runner_splits_totals_and_seed_ranges_exactly(
+    tmp_path: Path,
+) -> None:
+    env, out, rundir = _generation_runner_env(
+        tmp_path,
+        pipelines_per_gpu=2,
+        gpu_csv="0,2",
+        games=5,
+        workers=4,
+        base_seed=100,
+    )
+    subprocess.run(["bash", "-c", _generation_runner()], env=env, check=True)
+
+    expected = {
+        "gpu0_pipeline0": (3, 100, 0),
+        "gpu0_pipeline1": (2, 103, 1),
+        "gpu2_pipeline0": (3, 105, 0),
+        "gpu2_pipeline1": (2, 108, 1),
+    }
+    child_pids: set[str] = set()
+    for directory, (pipeline_games, seed, pipeline_index) in expected.items():
+        log = (out / directory / "run.log").read_text(encoding="utf-8")
+        assert f"--games {pipeline_games}" in log
+        assert "--workers 2" in log
+        assert f"--base-seed {seed}" in log
+        assert "--fleet-pipelines-per-gpu 2" in log
+        assert f"--fleet-pipeline-index {pipeline_index}" in log
+        assert (
+            f"--fleet-pipeline-id pipeline-contract-{directory.replace('_', '-')}"
+            in log
+        )
+        pid = (rundir / f"{directory}.pid").read_text(encoding="utf-8").strip()
+        assert pid.isdigit()
+        child_pids.add(pid)
+    assert len(child_pids) == 4
+
+
+def test_default_single_pipeline_preserves_layout_and_totals(tmp_path: Path) -> None:
+    env, out, rundir = _generation_runner_env(
+        tmp_path,
+        pipelines_per_gpu=1,
+        gpu_csv="4",
+        games=5,
+        workers=128,
+        base_seed=900,
+    )
+    subprocess.run(["bash", "-c", _generation_runner()], env=env, check=True)
+
+    log = (out / "gpu4" / "run.log").read_text(encoding="utf-8")
+    assert "--games 5" in log
+    assert "--workers 128" in log
+    assert "--base-seed 900" in log
+    assert "--fleet-pipelines-per-gpu 1" in log
+    assert "--fleet-pipeline-index 0" in log
+    assert not (out / "gpu4_pipeline0").exists()
+    assert (rundir / "gpu4_pipeline0.pid").read_text().strip().isdigit()
+
+
+def test_generation_runner_stops_siblings_on_first_pipeline_failure(
+    tmp_path: Path,
+) -> None:
+    if not sys.platform.startswith("linux") or not shutil.which("setsid"):
+        pytest.skip("fail-fast sibling PGID cleanup requires Linux setsid")
+    env, _out, _rundir = _generation_runner_env(
+        tmp_path,
+        pipelines_per_gpu=2,
+        gpu_csv="0",
+        games=4,
+        workers=4,
+        base_seed=1_000,
+    )
+    sibling_pid_file = tmp_path / "sibling.pid"
+    fake_python = tmp_path / "fake-generator"
+    fake_python.write_text(
+        "#!/usr/bin/env bash\n"
+        "case \" $* \" in\n"
+        "  *\" --fleet-pipeline-index 0 \"*) exit 7 ;;\n"
+        "esac\n"
+        f"printf '%s\\n' \"$$\" > {str(sibling_pid_file)!r}\n"
+        "trap 'exit 143' TERM INT\n"
+        "sleep 30\n",
+        encoding="utf-8",
+    )
+    fake_python.chmod(0o755)
+    env |= {
+        "GEN_PY": str(fake_python),
+        "FLEET_CHILD_POLL_SECONDS": "0.01",
+    }
+
+    started = time.monotonic()
+    result = subprocess.run(
+        ["setsid", "bash", "-c", _generation_runner()],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=5,
+    )
+    assert result.returncode == 7, result.stdout + result.stderr
+    assert time.monotonic() - started < 5
+    assert "stopping sibling pipelines" in result.stderr
+    if sibling_pid_file.exists():
+        sibling_pid = int(sibling_pid_file.read_text())
+        state = subprocess.run(
+            ["ps", "-o", "stat=", "-p", str(sibling_pid)],
+            text=True,
+            capture_output=True,
+            check=False,
+        ).stdout.strip()
+        assert not state or state.startswith("Z")
 
 
 def test_gpu_range_expansion_has_no_phantom_trailing_device() -> None:
@@ -128,8 +470,19 @@ def test_generation_fans_out_one_process_per_selected_gpu() -> None:
     assert 'IFS="," read -r -a GPU_IDS <<< "$GPU_CSV"' in source
     assert 'for GPU in "${GPU_IDS[@]}"' in source
     assert 'CUDA_VISIBLE_DEVICES="$GPU"' in source
-    assert '--out-dir "$GPU_OUT"' in source
-    assert '--base-seed "$GPU_BASE_SEED"' in source
+    assert '--out-dir "$PIPELINE_OUT"' in source
+    assert '--base-seed "$PIPELINE_BASE_SEED"' in source
+
+
+def test_dual_pipeline_is_explicit_opt_in_and_preserves_claim_total() -> None:
+    source = _source()
+    assert "PIPELINES_PER_GPU=1" in source
+    assert '--pipelines-per-gpu) PIPELINES_PER_GPU="$2"' in source
+    assert '[[ "$PIPELINES_PER_GPU" =~ ^[12]$ ]]' in source
+    assert "WORKERS % PIPELINES_PER_GPU" in source
+    assert "END=$(( BASE_SEED + GAMES * NGPU ))" in source
+    assert "GAMES * PIPELINES_PER_GPU" not in source
+    assert "pipelines=$PIPELINES_PER_GPU claim=$CLAIM_ID" in source
 
 
 def test_seed_claim_matches_games_per_gpu_not_worker_count() -> None:
@@ -270,9 +623,6 @@ def test_teacher_omits_shard_size_so_cat126_can_auto_scale_n128(
 def test_generation_science_options_reach_each_generator_argv(
     launcher_env: dict[str, str], tmp_path: Path
 ) -> None:
-    manifest = tmp_path / "mix fixtures" / "opponent mix.json"
-    manifest.parent.mkdir()
-    manifest.write_text('{"categories": []}\n')
     result = _run(
             launcher_env,
             "teacher",
@@ -287,10 +637,6 @@ def test_generation_science_options_reach_each_generator_argv(
             "150",
             "--late-temperature",
             "0.25",
-            "--opponent-mix-manifest",
-            str(manifest),
-            "--exploiter-fraction",
-            "0.03",
             "--rust-featurize",
             "--eval-cache-size",
             "0",
@@ -305,8 +651,6 @@ def test_generation_science_options_reach_each_generator_argv(
         'SCIENCE_ARGS+=(--sigma-eval "$SIGMA_EVAL")',
         'SCIENCE_ARGS+=(--late-temperature-decisions "$LATE_TEMPERATURE_DECISIONS")',
         'SCIENCE_ARGS+=(--late-temperature "$LATE_TEMPERATURE")',
-        'SCIENCE_ARGS+=(--opponent-mix-manifest "$OPPONENT_MIX_MANIFEST")',
-        'SCIENCE_ARGS+=(--exploiter-fraction "$EXPLOITER_FRACTION")',
         '--eval-cache-size "${EVAL_CACHE_SIZE:-0}"',
         'SCIENCE_ARGS+=(--shard-size "$SHARD_SIZE")',
     ):
@@ -329,10 +673,11 @@ def test_exploiter_fraction_without_mix_manifest_fails_closed(
     assert "--exploiter-fraction requires --opponent-mix-manifest" in result.stderr
 
 
-def test_missing_remote_mix_manifest_fails_preflight(
+def test_opponent_mix_fails_before_remote_preflight(
     launcher_env: dict[str, str], tmp_path: Path
 ) -> None:
-    missing = tmp_path / "missing-opponent-mix.json"
+    missing = tmp_path / "opponent-mix.json"
+    missing.write_text('{"categories": []}\n')
     result = _run(
         launcher_env,
         "volume",
@@ -342,8 +687,9 @@ def test_missing_remote_mix_manifest_fails_preflight(
         str(missing),
     )
 
-    assert result.returncode == 3
-    assert f"FAIL: --opponent-mix-manifest {missing} missing" in result.stdout
+    assert result.returncode == 2
+    assert "incompatible with the mandatory fleet EvalServer" in result.stderr
+    assert "===== fleet_launch" not in result.stdout
 
 
 def test_generation_science_options_are_rejected_for_train_role(
@@ -376,7 +722,7 @@ def test_typed_s1_s3_search_operator_reaches_each_generator(
         "--p-full",
         "0.25",
         "--c-scale",
-        "0.1",
+        "0.03",
         "--symmetry-averaged-eval",
         "--symmetry-averaged-eval-threshold",
         "20",
@@ -407,6 +753,125 @@ def test_typed_s1_s3_search_operator_reaches_each_generator(
         'EVAL_SERVER_ROW_CAP_ARGS=(--eval-server-max-neural-rows "$EVAL_SERVER_MAX_NEURAL_ROWS")',
     ):
         assert required in source
+
+
+def test_noncanonical_c_scale_fails_before_ssh(
+    launcher_env: dict[str, str],
+) -> None:
+    result = _run(
+        launcher_env,
+        "teacher",
+        "--base-seed",
+        "78500000000",
+        "--c-scale",
+        "0.1",
+    )
+    assert result.returncode == 2
+    assert "pinned to 0.03" in result.stderr
+    assert "===== fleet_launch" not in result.stdout
+
+
+def test_busy_requested_gpu_fails_before_seed_claim(
+    launcher_env: dict[str, str],
+) -> None:
+    ledger = Path(launcher_env["LEDGER"])
+    before = ledger.read_text()
+    env = launcher_env | {"FAKE_BUSY_GPU": "0"}
+    result = _run(
+        env,
+        "teacher",
+        "--base-seed",
+        "78600000000",
+        "--gpus",
+        "0",
+        "--go",
+    )
+    assert result.returncode == 3
+    assert "requested GPU 0 is busy" in result.stdout
+    assert ledger.read_text() == before
+
+
+def test_active_mps_client_fails_before_seed_claim(
+    launcher_env: dict[str, str], tmp_path: Path
+) -> None:
+    ledger = Path(launcher_env["LEDGER"])
+    before = ledger.read_text()
+    fake_bin = Path(launcher_env["PATH"].split(os.pathsep, 1)[0])
+    fake_ps = fake_bin / "ps"
+    fake_ps.write_text(
+        "#!/usr/bin/env bash\n"
+        "if [ \"$*\" = \"-eo comm=,args=\" ]; then\n"
+        "  printf 'nvidia-cuda-mps-server nvidia-cuda-mps-server\\n'\n"
+        "  exit 0\n"
+        "fi\n"
+        "exec /bin/ps \"$@\"\n"
+    )
+    fake_ps.chmod(0o755)
+    fake_mps = fake_bin / "nvidia-cuda-mps-control"
+    fake_mps.write_text(
+        "#!/usr/bin/env bash\n"
+        "read -r command server\n"
+        "case \"$command\" in\n"
+        "  get_server_list) printf '41001\\n' ;;\n"
+        "  get_client_list) printf '41002\\n' ;;\n"
+        "esac\n"
+    )
+    fake_mps.chmod(0o755)
+    mps_pipe = tmp_path / "mps"
+    mps_pipe.mkdir()
+    (mps_pipe / "control").touch()
+    env = launcher_env | {"CUDA_MPS_PIPE_DIRECTORY": str(mps_pipe)}
+    result = _run(
+        env,
+        "teacher",
+        "--base-seed",
+        "78650000000",
+        "--gpus",
+        "0",
+        "--go",
+    )
+    assert result.returncode == 3
+    assert "MPS has active CUDA client PID(s): 41002" in result.stdout
+    assert ledger.read_text() == before
+
+
+def test_missing_detach_library_makes_go_launch_fail_nonzero(
+    launcher_env: dict[str, str],
+) -> None:
+    result = _run(
+        launcher_env,
+        "teacher",
+        "--base-seed",
+        "78700000000",
+        "--gpus",
+        "0",
+        "--go",
+    )
+    assert result.returncode != 0
+    assert "launch_detached.sh is missing" in result.stdout
+
+
+def test_ledger_append_failure_stops_before_detach(
+    launcher_env: dict[str, str],
+) -> None:
+    status_file = Path("/proc/self/status")
+    if not status_file.is_file():
+        pytest.skip("requires a non-writable Linux procfs regular file")
+    env = launcher_env | {"LEDGER": str(status_file)}
+    result = _run(
+        env,
+        "teacher",
+        "--base-seed",
+        "78800000000",
+        "--gpus",
+        "0",
+        "--go",
+    )
+    assert result.returncode != 0
+    assert "could not append claim to ledger" in result.stdout
+    home = Path(launcher_env["HOME"])
+    assert not any((home / "fleet_runs").iterdir())
+    assert not any((home / "gen_out").iterdir())
 
 
 @pytest.mark.parametrize(

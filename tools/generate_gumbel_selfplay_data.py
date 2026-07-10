@@ -34,8 +34,11 @@ threaded shards were schema- and distribution-valid); throughput was.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import math
 import multiprocessing
+import os
 import queue as queue_mod
 import sys
 import time
@@ -61,7 +64,7 @@ from catan_zero.search.gumbel_chance_mcts import (
     GumbelChanceMCTSConfig,
     HeuristicRustEvaluator,
 )
-from catan_zero.rl.config_cli import add_config_flags, resolve_config
+from catan_zero.rl.config_cli import add_config_flags, apply_config_file, resolve_config
 from catan_zero.rl.pipeline_configs import GenerateConfig
 from catan_zero.search.neural_rust_mcts import (
     BatchedEntityGraphRustEvaluator,
@@ -178,6 +181,121 @@ def _auto_shard_size(n_full: int) -> int:
 
 def _shard_size_was_explicit(raw_argv: Sequence[str]) -> bool:
     return any(a == "--shard-size" or a.startswith("--shard-size=") for a in raw_argv)
+
+
+def _stage_producer_checkpoint(
+    checkpoint: str | None, output: Path
+) -> tuple[str | None, str]:
+    """Copy and hash the exact checkpoint bytes every worker will load.
+
+    Hashing a mutable source path and reopening it later has a TOCTOU gap. This
+    function reads the source once into a run-owned, read-only file, computes
+    the digest over that same stream, fsyncs it, and returns that immutable path
+    for EvalServer/workers. The heuristic path remains unchanged.
+    """
+    if checkpoint is None:
+        return None, ""
+    path = Path(checkpoint)
+    if not path.is_file():
+        raise SystemExit(f"--checkpoint is not a readable file: {path}")
+    digest = hashlib.sha256()
+    staging = output / f".producer_checkpoint.staging.{os.getpid()}"
+    try:
+        with path.open("rb") as source, staging.open("xb") as target:
+            for block in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(block)
+                target.write(block)
+            target.flush()
+            os.fsync(target.fileno())
+        hex_digest = digest.hexdigest()
+        staged = output / f"producer_checkpoint_{hex_digest}.pt"
+        os.replace(staging, staged)
+        staged.chmod(0o444)
+        directory_fd = os.open(output, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except BaseException:
+        staging.unlink(missing_ok=True)
+        raise
+    return str(staged), f"sha256:{hex_digest}"
+
+
+def _validate_science_args(
+    args: argparse.Namespace, parser: argparse.ArgumentParser
+) -> None:
+    """Reject NaN/Inf science settings before guards, workers, or artifacts."""
+    finite_names = (
+        "p_full",
+        "c_visit",
+        "c_scale",
+        "rescale_noise_floor_c",
+        "sigma_eval",
+        "temperature_high",
+        "temperature_low",
+        "late_temperature",
+        "prior_temperature",
+        "value_scale",
+    )
+    for name in finite_names:
+        value = float(getattr(args, name))
+        if not math.isfinite(value):
+            parser.error(f"--{name.replace('_', '-')} must be finite (got {value!r})")
+    if not 0.0 <= float(args.p_full) <= 1.0:
+        parser.error(f"--p-full must be in [0, 1] (got {args.p_full!r})")
+    if args.temperature_move_fraction is not None:
+        value = float(args.temperature_move_fraction)
+        if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+            parser.error(
+                "--temperature-move-fraction must be finite and in [0, 1] "
+                f"(got {args.temperature_move_fraction!r})"
+            )
+
+
+def _guard_argv_with_config_values(
+    args: argparse.Namespace,
+    parser: argparse.ArgumentParser,
+    raw_argv: Sequence[str],
+    config_filled: Sequence[str],
+) -> list[str]:
+    """Represent config-filled values as explicit inputs to prelaunch guards.
+
+    The CLI lint intentionally refuses critical parser defaults. A typed config
+    is also explicit input, so values it supplied must be checked exactly as if
+    their corresponding flags appeared in argv.
+    """
+    effective = list(raw_argv)
+    actions_by_dest = {action.dest: action for action in parser._actions}  # noqa: SLF001
+    for dest in config_filled:
+        action = actions_by_dest.get(dest)
+        if action is None or not action.option_strings:
+            continue
+        value = getattr(args, dest)
+        # ``None`` is represented by absence for these optional flags. It is
+        # never a critical production value and argparse generally cannot parse
+        # the string "None" back through an int/float action.
+        if value is None:
+            continue
+        if isinstance(action, argparse.BooleanOptionalAction):
+            prefix = "--no-" if not bool(value) else "--"
+            option = next(
+                (item for item in action.option_strings if item.startswith(prefix)),
+                action.option_strings[0],
+            )
+            effective.append(option)
+        elif isinstance(action, argparse._StoreTrueAction):  # noqa: SLF001
+            if bool(value):
+                effective.append(action.option_strings[0])
+        elif isinstance(action, argparse._StoreFalseAction):  # noqa: SLF001
+            if not bool(value):
+                effective.append(action.option_strings[0])
+        elif isinstance(value, (list, tuple)):
+            effective.append(action.option_strings[0])
+            effective.extend(str(item) for item in value)
+        else:
+            effective.extend((action.option_strings[0], str(value)))
+    return effective
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -651,6 +769,28 @@ def build_parser() -> argparse.ArgumentParser:
             "behavior (any overlap, including our own row, fails closed)."
         ),
     )
+    # The sharing count affects request timing/batch composition and is included
+    # in GenerateConfig. Index/id are operational provenance only so sibling
+    # pipelines retain the same science hash and can be merged.
+    parser.add_argument(
+        "--fleet-pipelines-per-gpu",
+        type=int,
+        choices=(1, 2),
+        default=1,
+        help="Independent fleet pipelines sharing one physical GPU (provenance only).",
+    )
+    parser.add_argument(
+        "--fleet-pipeline-index",
+        type=int,
+        choices=(0, 1),
+        default=0,
+        help="Zero-based pipeline index on the physical GPU (provenance only).",
+    )
+    parser.add_argument(
+        "--fleet-pipeline-id",
+        default=None,
+        help="Unique fleet pipeline identity recorded in the generation manifest.",
+    )
     parser.add_argument(
         "--skip-guards",
         action="store_true",
@@ -701,9 +841,26 @@ def _build_guard_specs(
 def main(argv: Sequence[str] | None = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
-    # CAT-126 #4: auto-scale shard size by n-full unless the caller pinned it.
     _raw_argv = list(argv) if argv is not None else sys.argv[1:]
-    if not _shard_size_was_explicit(_raw_argv):
+
+    # Typed config values are launch inputs, not post-launch metadata. Apply
+    # them before auto-derived values and guards so every downstream consumer
+    # sees one coherent resolved namespace. Passing argv also preserves an
+    # explicit CLI value even when it happens to equal the parser default.
+    config_filled = apply_config_file(
+        args,
+        parser,
+        argv=_raw_argv,
+        expected_pipeline=GenerateConfig.PIPELINE,
+    )
+    if int(args.fleet_pipeline_index) >= int(args.fleet_pipelines_per_gpu):
+        parser.error(
+            "--fleet-pipeline-index must be smaller than --fleet-pipelines-per-gpu"
+        )
+    _validate_science_args(args, parser)
+
+    # CAT-126 #4: auto-scale shard size by n-full unless the caller pinned it.
+    if not _shard_size_was_explicit(_raw_argv) and "shard_size" not in config_filled:
         _auto = _auto_shard_size(int(args.n_full))
         if _auto != int(args.shard_size):
             print(
@@ -718,8 +875,9 @@ def main(argv: Sequence[str] | None = None) -> None:
             )
         args.shard_size = _auto
 
+    guard_argv = _guard_argv_with_config_values(args, parser, _raw_argv, config_filled)
     launcher_guards.run_or_refuse(
-        _build_guard_specs(args, argv if argv is not None else sys.argv[1:], parser),
+        _build_guard_specs(args, guard_argv, parser),
         launcher="generate_gumbel_selfplay_data",
         skip=bool(args.skip_guards),
     )
@@ -754,16 +912,36 @@ def main(argv: Sequence[str] | None = None) -> None:
     else:
         args.late_temperature_move_fraction = None
 
+    output = Path(args.out_dir)
+    output.mkdir(parents=True, exist_ok=True)
+    stale_generation_state = (
+        any(output.glob("worker_*"))
+        or (output / "manifest.json").exists()
+        or any(output.glob("producer_checkpoint_*.pt"))
+        or any(output.glob(".producer_checkpoint.staging.*"))
+    )
+    if stale_generation_state:
+        raise SystemExit(
+            f"{output} already contains self-play output; use a fresh --out-dir"
+        )
+    runtime_checkpoint, args.producer_checkpoint_sha256 = (
+        _stage_producer_checkpoint(args.checkpoint, output)
+    )
+
     # CAT-66 typed config + config-hash. Built once in the main process from the
     # fully-resolved args (the same source the per-worker dicts flatten from), so
     # the recorded hash reflects the values actually used, not any dataclass
     # default. No-op to the run when no --config* flag is passed.
-    generate_config = resolve_config(args, GenerateConfig.from_namespace, parser=parser)
+    # The file has already been applied above. Do not apply it a second time
+    # after derived values have been resolved.
+    generate_config = resolve_config(args, GenerateConfig.from_namespace)
     generate_config_hash = generate_config.config_hash()
     if bool(args.wide_roots_always_full) and args.n_full_wide is None:
         parser.error("--wide-roots-always-full requires --n-full-wide")
     if str(args.value_readout) == "categorical" and not args.checkpoint:
-        parser.error("--value-readout categorical requires --checkpoint with a trained HL-Gauss head")
+        parser.error(
+            "--value-readout categorical requires --checkpoint with a trained HL-Gauss head"
+        )
 
     # Opponent-pool (H2): validate the manifest ONCE in the main process, before
     # spawning workers -- a malformed manifest would otherwise be caught only
@@ -805,7 +983,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         mix_config = _resolve_mix_with_exploiter(
             args.opponent_mix_manifest,
             args.exploiter_fraction,
-            producer_checkpoint=args.checkpoint,
+            producer_checkpoint=runtime_checkpoint,
         )
         opponent_mix_effective_weights = mix_config.effective_weights()
         opponent_mix_exploiter_fraction = external_engine_effective_fraction(mix_config)
@@ -813,13 +991,6 @@ def main(argv: Sequence[str] | None = None) -> None:
         raise SystemExit(
             "--exploiter-fraction requires --opponent-mix-manifest (the exploiter lane is an "
             "external_engine category of the opponent mix)."
-        )
-
-    output = Path(args.out_dir)
-    output.mkdir(parents=True, exist_ok=True)
-    if any(output.glob("worker_*")) or (output / "manifest.json").exists():
-        raise SystemExit(
-            f"{output} already contains self-play output; use a fresh --out-dir"
         )
 
     if args.seed_claim:
@@ -844,14 +1015,16 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "games": worker_games,
                 "game_index_start": game_index_start,
                 "out_dir": str(output / f"worker_{worker_index:03d}"),
-                "checkpoint": args.checkpoint,
+                "checkpoint": runtime_checkpoint,
                 "device": args.device,
                 "n_full": int(args.n_full),
                 "n_fast": int(args.n_fast),
                 "p_full": float(args.p_full),
                 "c_visit": float(args.c_visit),
                 "c_scale": float(args.c_scale),
-                "n_full_wide": (int(args.n_full_wide) if args.n_full_wide is not None else None),
+                "n_full_wide": (
+                    int(args.n_full_wide) if args.n_full_wide is not None else None
+                ),
                 "n_full_wide_threshold": (
                     int(args.n_full_wide_threshold)
                     if args.n_full_wide_threshold is not None
@@ -917,27 +1090,35 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     started = time.perf_counter()
     eval_server_stats: dict[str, Any] | None = None
-    if bool(getattr(args, "eval_server", False)) and worker_args:
-        # CAT-67 cross-game eval server: one shared GPU-resident policy, workers
-        # are RemoteEvalClients. Explicit Processes (not a Pool) so the raw
-        # mp.Queues can be handed to each worker by inheritance. Guarded to the
-        # neural-checkpoint, no-opponent-pool/mix case.
-        if not args.checkpoint:
-            raise SystemExit(
-                "--eval-server requires --checkpoint (no server for the heuristic evaluator)"
-            )
-        if args.opponent_pool_manifest or args.opponent_mix_manifest:
-            raise SystemExit(
-                "--eval-server is not compatible with --opponent-pool-manifest/"
-                "--opponent-mix-manifest in this prototype (CAT-67)"
-            )
-        results, eval_server_stats = _run_eval_server_batch(worker_args, args)
-    elif len(worker_args) <= 1:
-        results = [_worker_entry(worker_args[0])] if worker_args else []
-    else:
-        ctx = multiprocessing.get_context("spawn")
-        with ctx.Pool(processes=len(worker_args)) as pool:
-            results = pool.map(_worker_entry, worker_args)
+    fatal_execution_error: BaseException | None = None
+    try:
+        if bool(getattr(args, "eval_server", False)) and worker_args:
+            # CAT-67 cross-game eval server: one shared GPU-resident policy,
+            # workers are RemoteEvalClients. Explicit Processes (not a Pool) so
+            # raw mp.Queues can be handed to each worker by inheritance.
+            if not args.checkpoint:
+                raise ValueError(
+                    "--eval-server requires --checkpoint "
+                    "(no server for the heuristic evaluator)"
+                )
+            if args.opponent_pool_manifest or args.opponent_mix_manifest:
+                raise ValueError(
+                    "--eval-server is not compatible with "
+                    "--opponent-pool-manifest/--opponent-mix-manifest"
+                )
+            results, eval_server_stats = _run_eval_server_batch(worker_args, args)
+        elif len(worker_args) <= 1:
+            results = [_worker_entry(worker_args[0])] if worker_args else []
+        else:
+            ctx = multiprocessing.get_context("spawn")
+            with ctx.Pool(processes=len(worker_args)) as pool:
+                results = pool.map(_worker_entry, worker_args)
+    except Exception as error:  # noqa: BLE001 - preserve a launch-level manifest.
+        fatal_execution_error = error
+        results = [
+            _worker_level_error_summary(worker_arg, error)
+            for worker_arg in worker_args
+        ]
 
     summary = _merge_worker_summaries(
         results,
@@ -949,13 +1130,33 @@ def main(argv: Sequence[str] | None = None) -> None:
         opponent_mix_exploiter_fraction=opponent_mix_exploiter_fraction,
     )
     summary["config_hash"] = generate_config_hash
+    summary["producer_checkpoint_sha256"] = args.producer_checkpoint_sha256
+    summary["producer_checkpoint_staged_path"] = runtime_checkpoint
+    if fatal_execution_error is not None:
+        summary["fatal_execution_error"] = {
+            "type": type(fatal_execution_error).__name__,
+            "message": str(fatal_execution_error),
+        }
     if eval_server_stats is not None:
         summary["eval_server_stats"] = eval_server_stats
     write_json(output / "manifest.json", summary)
     print(json.dumps(summary, indent=2, sort_keys=True))
-    if int(args.games) > 0 and int(summary.get("games_completed", 0)) == 0:
+    games_requested = int(args.games)
+    games_completed = int(summary.get("games_completed", 0))
+    games_failed = int(summary.get("games_failed", 0))
+    if games_failed > 0 or games_completed != games_requested:
+        missing = max(0, games_requested - games_completed - games_failed)
+        fatal_suffix = (
+            ""
+            if fatal_execution_error is None
+            else f"; fatal={type(fatal_execution_error).__name__}: "
+            f"{fatal_execution_error}"
+        )
         raise SystemExit(
-            "all self-play workers failed; manifest was preserved for diagnosis"
+            "self-play generation incomplete: "
+            f"requested={games_requested}, completed={games_completed}, "
+            f"failed={games_failed}, missing={missing}; manifest and partial "
+            f"artifacts were preserved for diagnosis{fatal_suffix}"
         )
 
 
@@ -1071,8 +1272,13 @@ def _run_eval_server_batch(
     from catan_zero.search.eval_server import EvalServer, EvalServerConfig
 
     ctx = multiprocessing.get_context("spawn")
+    runtime_checkpoint = (
+        worker_args[0].get("checkpoint", getattr(args, "checkpoint", None))
+        if worker_args
+        else None
+    )
     server = EvalServer(
-        args.checkpoint,
+        runtime_checkpoint,
         num_clients=len(worker_args),
         config=EvalServerConfig(
             max_batch_size=int(args.eval_server_max_batch),
@@ -1240,7 +1446,10 @@ def _run_worker(
     champion_evaluator: Any | None = None,
 ) -> dict[str, Any]:
     checkpoint = worker_args["checkpoint"]
-    if str(worker_args.get("value_readout", "scalar")) == "categorical" and not checkpoint:
+    if (
+        str(worker_args.get("value_readout", "scalar")) == "categorical"
+        and not checkpoint
+    ):
         raise ValueError(
             "value_readout='categorical' requires a neural checkpoint with a trained "
             "HL-Gauss categorical value head; heuristic generation has no categorical head"
@@ -1564,6 +1773,11 @@ def _merge_worker_summaries(
         "value_readout": str(getattr(args, "value_readout", "scalar")),
         "checkpoint": args.checkpoint,
         "base_seed": int(args.base_seed),
+        "fleet_pipelines_per_gpu": int(
+            getattr(args, "fleet_pipelines_per_gpu", 1)
+        ),
+        "fleet_pipeline_index": int(getattr(args, "fleet_pipeline_index", 0)),
+        "fleet_pipeline_id": getattr(args, "fleet_pipeline_id", None),
         # Complete CLI-argument provenance so a shard batch is auditable after
         # the process exits (per build-equiv pilot-audit finding 2026-07-04).
         "cli_args": {key: value for key, value in vars(args).items()},

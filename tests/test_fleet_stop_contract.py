@@ -40,14 +40,24 @@ def _write_executable(path: Path, source: str) -> None:
     path.chmod(0o755)
 
 
-def _fake_host(tmp_path: Path, *, memory_mib: int = 0, mps_client: bool = False) -> dict[str, str]:
+def _fake_host(
+    tmp_path: Path,
+    *,
+    memory_mib: int = 0,
+    mps_client: bool = False,
+    compute_pid: int | None = None,
+    compute_name: str = "python3",
+) -> dict[str, str]:
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     _write_executable(
         fake_bin / "nvidia-smi",
         """#!/usr/bin/env bash
 case "$*" in
-  *--query-compute-apps=*) exit 0 ;;
+  *--query-compute-apps=*)
+    [ -z "${FAKE_COMPUTE_PID:-}" ] || printf '%s, %s\n' "$FAKE_COMPUTE_PID" "$FAKE_COMPUTE_NAME"
+    exit 0
+    ;;
   *--query-gpu=index,memory.used*) printf '0, %s\\n' "${FAKE_GPU_MEMORY:-0}" ;;
   *) exit 1 ;;
 esac
@@ -73,6 +83,8 @@ esac
             "HOME": str(tmp_path),
             "PATH": f"{fake_bin}:{env['PATH']}",
             "FAKE_GPU_MEMORY": str(memory_mib),
+            "FAKE_COMPUTE_PID": "" if compute_pid is None else str(compute_pid),
+            "FAKE_COMPUTE_NAME": compute_name,
             "CUDA_MPS_PIPE_DIRECTORY": str(mps_pipe),
             "FLEET_STOP_POLL_SECONDS": "0.02",
             "FLEET_STOP_RELEASE_SECONDS": "0.02",
@@ -82,8 +94,22 @@ esac
     return env
 
 
-def _run_remote(tmp_path: Path, *, go: bool, memory_mib: int = 0, mps_client: bool = False):
-    env = _fake_host(tmp_path, memory_mib=memory_mib, mps_client=mps_client)
+def _run_remote(
+    tmp_path: Path,
+    *,
+    go: bool,
+    memory_mib: int = 0,
+    mps_client: bool = False,
+    compute_pid: int | None = None,
+    compute_name: str = "python3",
+):
+    env = _fake_host(
+        tmp_path,
+        memory_mib=memory_mib,
+        mps_client=mps_client,
+        compute_pid=compute_pid,
+        compute_name=compute_name,
+    )
     return subprocess.run(
         ["bash", "-s", "--", "1" if go else "0"],
         input=_remote_routine(),
@@ -196,3 +222,39 @@ def test_dry_run_is_non_mutating_even_when_work_is_visible(tmp_path: Path) -> No
         assert proc.poll() is None
     finally:
         _force_cleanup(proc)
+
+
+def test_legacy_fallback_preserves_unrelated_visible_cuda_process(tmp_path: Path) -> None:
+    unrelated = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        result = _run_remote(tmp_path, go=True, compute_pid=unrelated.pid)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert f"UNRELATED GPU PIDs (preserved, never stop targets): {unrelated.pid}" in result.stdout
+        assert f"TERM worker {unrelated.pid}" not in result.stdout
+        assert unrelated.poll() is None
+    finally:
+        unrelated.kill()
+        unrelated.wait(timeout=5)
+
+
+def test_legacy_fallback_stops_visible_pid_with_catan_command(tmp_path: Path) -> None:
+    runner = tmp_path / "generate_gumbel_selfplay_data.py"
+    _write_executable(runner, "#!/usr/bin/env bash\nwhile :; do sleep 1; done\n")
+    catan = subprocess.Popen(
+        [str(runner)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        result = _run_remote(tmp_path, go=True, compute_pid=catan.pid)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert f"TERM worker {catan.pid}" in result.stdout
+        catan.wait(timeout=5)
+    finally:
+        if catan.poll() is None:
+            catan.kill()
+            catan.wait(timeout=5)

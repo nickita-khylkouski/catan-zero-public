@@ -204,9 +204,17 @@ run, and gains from different harnesses must not be multiplied as if they were
 independent.
 
 The NPZ row writer now requests public-observation masking directly for both
-entity tokens and action context. This fixes the old contract where online MCTS
-was public but persisted player tensors were omniscient. A 5,120-row audit over
-four new H100 arms found zero non-actor values in every hidden player slot.
+entity tokens and action context. This fixes the old storage contract where
+evaluator inputs were masked but persisted player tensors were omniscient. A
+5,120-row audit over four new H100 arms found zero non-actor values in every
+hidden player slot.
+
+This does **not** make the search information-set correct. MCTS still traverses
+the authoritative Rust `Game`, so future legal moves and chance materialization
+can depend on opponents' true hidden cards. Stored inputs are public, but their
+search targets can remain hidden-state-conditioned. Do not call this corpus a
+fully public-belief teacher until hidden-hand permutation invariance or a real
+determinization/belief-state search closes that separate issue.
 
 The retained event stream is currently dead data. Across 2,048 sampled live
 Rust states and 30,720 retained teacher rows, `event_mask` had zero live tokens.

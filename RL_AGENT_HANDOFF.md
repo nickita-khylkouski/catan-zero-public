@@ -1109,9 +1109,15 @@ Do not rely on terminal scrollback as the only record.
 
 The generation row writer now stores public-observation-masked entity and
 action-context tensors when public generation is requested. This closes the
-old mismatch where online MCTS was masked but NPZ `player_tokens` were
-omniscient at rest. Keep `--public-observation`; do not compensate by relying
-only on trainer-side masking.
+old at-rest leak where NPZ `player_tokens` were omniscient. Keep
+`--public-observation`; do not compensate by relying only on trainer-side
+masking.
+
+That flag masks neural inputs, not the authoritative Rust state traversed by
+MCTS. Opponent legal moves and materialized chance outcomes can still depend on
+true hidden cards, so public input rows may have hidden-state-conditioned
+targets. Treat information-set/determinization search as a separate unresolved
+data-quality requirement.
 
 Use these defaults for the real-champion capacity repeat:
 
@@ -1154,7 +1160,8 @@ The RL operator owns manual checks for these gaps until code integrates them:
 1. Seed claims have no shared cross-host lock.
 2. Dynamic generation guards run in detached children; launcher dry-run does not
    execute the complete remote overlap guard.
-3. A generation command can exit zero after partial worker failure.
+3. Public-input MCTS is not information-set search; targets can still depend on
+   the authoritative hidden state.
 4. No one Gumbel-specific QA profile backs --trust-curated-data.
 5. Masked search promotion has no safe one-command runner.
 6. Scalable full-fleet diversity QA and a post-harvest provenance binder are

@@ -25,7 +25,6 @@ from catan_zero.rl.xdim_lite_policy import (
     XDimGraphPolicy,
     XDimLitePolicy,
     _array_sha256,
-    masked_logits,
     normalize_observations,
 )
 from catan_zero.rl.entity_token_policy import EntityGraphPolicy
@@ -46,14 +45,14 @@ _TOOLS_DIR = Path(__file__).resolve().parent
 if str(_TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(_TOOLS_DIR))
 
-from factory_common import parse_track, write_json
-import launcher_guards
+from factory_common import parse_track, write_json  # noqa: E402
+import launcher_guards  # noqa: E402
 
 
 # Public-observation masking of hidden player info (task #72). Canonical
 # implementation lives in catan_zero.rl.entity_token_features (branch
 # f72-public-observation, now merged); import it as the single source of truth.
-from catan_zero.rl.entity_token_features import (
+from catan_zero.rl.entity_token_features import (  # noqa: E402
     mask_player_tokens_public as _mask_player_tokens_public,
 )
 
@@ -2221,11 +2220,17 @@ def _resolve_effective_value_categorical_bins(args: argparse.Namespace) -> int:
 def main(argv: Sequence[str] | None = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
+    raw_argv = list(argv) if argv is not None else sys.argv[1:]
     # Resolve file-supplied architecture values before derived defaults and
     # checkpoint inheritance. ``resolve_config`` calls this again later, which
     # is idempotent; doing it here prevents a config's categorical-bin/width
     # value from being mistaken for an omitted flag after we resolve sentinels.
-    apply_config_file(args, parser)
+    apply_config_file(
+        args,
+        parser,
+        argv=raw_argv,
+        expected_pipeline=TrainConfig.PIPELINE,
+    )
 
     a1_preflight_meta: dict[str, object] | None = None
     if args.data_format == "memmap":
@@ -2331,12 +2336,17 @@ def main(argv: Sequence[str] | None = None) -> None:
     # duplicate JSONL writes under DDP. A pure no-op to the run when no --config*
     # flag is passed (see catan_zero.rl.config_cli).
     train_config = resolve_config(
-        args, TrainConfig.from_namespace, parser=parser, register=(ddp["rank"] == 0)
+        args,
+        TrainConfig.from_namespace,
+        parser=parser,
+        argv=raw_argv,
+        register=(ddp["rank"] == 0),
     )
     train_config_hash = train_config.config_hash()
-    train_lock = None
+    _train_lock = None
     if not args.allow_concurrent_bc:
-        train_lock = _acquire_host_train_lock(args.host_lock_file, ddp)
+        # Retain the lock object for the entire training lifetime.
+        _train_lock = _acquire_host_train_lock(args.host_lock_file, ddp)
 
     import torch
 
@@ -3798,9 +3808,6 @@ def _train_candidate_batch(
         "q_loss_weight_sum": 0.0,
         "q_score_rows_ge2": 0,
         "soft_distillation_rows": int(has_soft.sum().item()) if soft_targets is not None else 0,
-        "soft_distillation_active_rows": int((has_soft & active).sum().item())
-        if soft_targets is not None
-        else 0,
         "soft_distillation_active_rows": (
             int((has_soft & active).sum().item()) if soft_targets is not None else 0
         ),
@@ -4968,9 +4975,6 @@ def _eval_candidate_batch(
             "q_loss_weight_sum": 0.0,
             "q_score_rows_ge2": 0,
             "soft_distillation_rows": int(has_soft.sum().item()) if soft_targets is not None else 0,
-            "soft_distillation_active_rows": int((has_soft & active).sum().item())
-            if soft_targets is not None
-            else 0,
             "soft_distillation_active_rows": (
                 int((has_soft & active).sum().item()) if soft_targets is not None else 0
             ),
@@ -5588,7 +5592,6 @@ class _MemmapRaggedColumn:
 
     def _reconstruct(self, indices: np.ndarray | None) -> np.ndarray:
         width = self._width
-        feat = self._feat
         if indices is None:
             # Whole corpus: the flat file is already the row-major prefix concat,
             # so scatter it straight into the padded output without gathering.
@@ -9523,8 +9526,6 @@ def _save_policy(
     a collective every rank must enter -- and writes it on rank 0. The on-disk
     format is identical across all three paths so a checkpoint loads the same way
     regardless of how it was trained."""
-    import torch
-
     is_rank0 = int(ddp["rank"]) == 0
 
     # FSDP: gather the full state_dict on all ranks (offloaded to CPU, populated

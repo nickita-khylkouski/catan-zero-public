@@ -309,6 +309,7 @@ def _h2h(
     candidate_wide_threshold: int | None = None,
     baseline_wide: int | None = None,
     overhead: float = 1.1,
+    config_schema_version: int = adjudicator.CONFIG_SCHEMA_VERSION,
 ) -> Path:
     pairs = sum(counts)
     fields = {
@@ -351,7 +352,11 @@ def _h2h(
         "elo0": -10.0,
         "elo1": 15.0,
     }
-    typed = {"pipeline": "eval", "schema_version": 4, "fields": fields}
+    typed = {
+        "pipeline": "eval",
+        "schema_version": config_schema_version,
+        "fields": fields,
+    }
     full_hash = adjudicator._digest_value(typed)
     games = []
     outcomes = [0] * counts[0] + [1] * counts[1] + [2] * counts[2]
@@ -553,6 +558,7 @@ def _s2_manifest(
     *,
     counts: tuple[int, int, int] = (5, 100, 95),
     cost: float = 1.5,
+    config_schema_version: int = adjudicator.CONFIG_SCHEMA_VERSION,
 ) -> tuple[Path, Path, Path]:
     checkpoint = _write(tmp_path / "champion.pt", b"checkpoint")
     base = _operator()
@@ -569,6 +575,7 @@ def _s2_manifest(
         base_n=64,
         candidate_n=128,
         counts=counts,
+        config_schema_version=config_schema_version,
     )
     fixed = _fixed_root(
         tmp_path / "s2.fixed.json",
@@ -758,6 +765,12 @@ def test_s2_adopts_confirmed_n128_below_cost_bound(tmp_path: Path) -> None:
     assert result["decision"] == "adopt"
     assert result["selected_fields"] == {"n_fast": 16, "n_full": 128, "p_full": 0.25}
     assert result["metrics"]["cost_pass"] is True
+
+
+def test_s2_replays_sealed_schema4_eval_evidence(tmp_path: Path) -> None:
+    manifest, _, _ = _s2_manifest(tmp_path, config_schema_version=4)
+    result = adjudicator.adjudicate(manifest)
+    assert result["decision"] == "adopt"
 
 
 def test_s2_holds_without_h1_or_when_cost_is_too_high(tmp_path: Path) -> None:
