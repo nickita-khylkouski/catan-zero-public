@@ -39,25 +39,72 @@ def test_e3_shared_weights_keep_parameter_count_constant_across_k():
     assert all(len(model.deliberation_block.state_dict()) > 0 for model in models)
 
 
-def test_e3_forward_backward_and_k_changes_computation():
+def _align_shared_weights(source, target):
+    """Copy all common parameters while retaining target-only E3 weights."""
+    source_state = source.state_dict()
+    target_state = target.state_dict()
+    for key, value in source_state.items():
+        if key in target_state:
+            target_state[key] = value.clone()
+    target.load_state_dict(target_state, strict=True)
+
+
+def test_e3_k1_is_exactly_k0_at_function_preserving_initialization():
+    torch.manual_seed(20260710)
+    k0 = EntityGraphNet(_config("rrt", layers=3, latent_deliberation_steps=0)).eval()
+    k1 = EntityGraphNet(_config("rrt", layers=3, latent_deliberation_steps=1)).eval()
+    _align_shared_weights(k0, k1)
+    batch = _batch()
+
+    output_k0 = k0(batch, return_q=True)
+    output_k1 = k1(batch, return_q=True)
+    assert not any(key.startswith("deliberation_") for key in output_k1)
+    for key in ("logits", "value", "final_vp", "q_values"):
+        assert torch.equal(output_k0[key], output_k1[key]), key
+
+
+def test_e3_zero_fusion_has_learning_signal_and_unlocks_deliberation():
+    torch.manual_seed(20260710)
+    model = EntityGraphNet(
+        _config("rrt", layers=3, latent_deliberation_steps=1)
+    ).eval()
+    batch = _batch()
+    optimizer = torch.optim.SGD(model.parameters(), lr=1e-2)
+
+    output = model(batch, return_q=True)
+    loss = output["logits"].square().mean() + output["value"].square().mean()
+    loss.backward()
+    fusion_gradient = model.deliberation_fusion.weight.grad
+    assert fusion_gradient is not None
+    assert torch.isfinite(fusion_gradient).all()
+    assert torch.count_nonzero(fusion_gradient) > 0
+    optimizer.step()
+
+    optimizer.zero_grad(set_to_none=True)
+    output = model(batch, return_q=True)
+    loss = output["logits"].square().mean() + output["value"].square().mean()
+    loss.backward()
+    slot_gradient = model.deliberation_slots.grad
+    block_gradient = model.deliberation_block.attn.in_proj_weight.grad
+    assert slot_gradient is not None and torch.count_nonzero(slot_gradient) > 0
+    assert block_gradient is not None and torch.count_nonzero(block_gradient) > 0
+
+
+def test_e3_k_changes_computation_after_fusion_is_perturbed():
     torch.manual_seed(20260710)
     k1 = EntityGraphNet(_config("rrt", layers=3, latent_deliberation_steps=1)).eval()
     k4 = EntityGraphNet(_config("rrt", layers=3, latent_deliberation_steps=4)).eval()
     k4.load_state_dict(k1.state_dict(), strict=True)
     batch = _batch()
 
+    # The repaired path is identical for every K while its residual is zero.
+    assert torch.equal(k1(batch)["logits"], k4(batch)["logits"])
+    with torch.no_grad():
+        k1.deliberation_fusion.weight.normal_(std=0.01)
+    k4.load_state_dict(k1.state_dict(), strict=True)
     output_k1 = k1(batch, return_q=True)
     output_k4 = k4(batch, return_q=True)
-    assert output_k1["deliberation_halt_logit"].shape == (2,)
     assert not torch.equal(output_k1["logits"], output_k4["logits"])
-
-    loss = output_k4["logits"].square().mean()
-    loss = loss + output_k4["value"].square().mean()
-    loss = loss + output_k4["deliberation_halt_logit"].square().mean()
-    loss.backward()
-    assert k4.deliberation_slots.grad is not None
-    assert torch.isfinite(k4.deliberation_slots.grad).all()
-    assert k4.deliberation_block.attn.in_proj_weight.grad is not None
 
 
 def test_e4_dispatches_only_selected_experts_and_emits_routing_metrics():
@@ -138,8 +185,8 @@ def test_moe_parameter_accounting_matches_top2_dispatch():
         think_counts
         == [
             {
-                "instantiated_trainable": 22_146_453,
-                "nominal_active_per_token": 22_146_453,
+                "instantiated_trainable": 22_146_068,
+                "nominal_active_per_token": 22_146_068,
             }
         ]
         * 4
@@ -182,6 +229,25 @@ def test_e3_e4_checkpoint_round_trip(tmp_path):
     assert loaded.model.parameter_accounting() == policy.model.parameter_accounting()
     for key, value in policy.model.state_dict().items():
         assert torch.equal(value, loaded.model.state_dict()[key]), key
+
+
+def test_legacy_e3_checkpoint_fails_with_explicit_migration_error(tmp_path):
+    config = _config("rrt", layers=3, latent_deliberation_steps=1)
+    static = np.zeros(
+        (config.action_size, config.static_action_feature_size), dtype=np.float32
+    )
+    policy = EntityGraphPolicy(config, static, device="cpu")
+    checkpoint = tmp_path / "legacy-think.pt"
+    policy.save(checkpoint)
+    payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    payload["model"]["deliberation_halt_head.weight"] = torch.zeros(
+        1, config.hidden_size
+    )
+    payload["model"]["deliberation_halt_head.bias"] = torch.zeros(1)
+    torch.save(payload, checkpoint)
+
+    with pytest.raises(RuntimeError, match="legacy E3 checkpoint is incompatible"):
+        EntityGraphPolicy.load(checkpoint, device="cpu")
 
 
 def test_e3_e4_train_cli_knobs_are_explicit_and_science_hashed():

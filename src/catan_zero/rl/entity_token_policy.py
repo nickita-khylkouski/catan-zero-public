@@ -193,8 +193,10 @@ class EntityGraphConfig:
     # --- E3 fixed-K shared latent deliberation (default OFF) ---
     # A small learned plan set repeatedly cross-attends to the encoded board
     # through one shared block. Increasing K changes compute, not parameter
-    # count. This is fixed-depth latent computation; the emitted halt logit is
-    # diagnostic and does not claim adaptive execution.
+    # count. This is fixed-depth latent computation, so it deliberately has no
+    # adaptive-halting head.  The plan contribution enters through a
+    # zero-initialised residual projection: enabling K>0 on aligned shared
+    # weights preserves the K=0 function exactly at initialisation.
     latent_deliberation_steps: int = 0
     latent_deliberation_slots: int = 8
     # --- E4 sparse conditional FFN capacity (default OFF) ---
@@ -541,8 +543,13 @@ class EntityGraphNet:
                     )
                     self.deliberation_fusion_norm = nn.LayerNorm(2 * h)
                     self.deliberation_fusion = nn.Linear(2 * h, h)
-                    self.deliberation_halt_head = nn.Linear(h, 1)
                     nn.init.normal_(self.deliberation_slots, std=0.02)
+                    # This is the function-preserving gate for the fixed-K
+                    # experiment.  The first backward pass trains this output
+                    # projection; once it moves away from zero, gradients also
+                    # reach the shared deliberation block and learned slots.
+                    nn.init.zeros_(self.deliberation_fusion.weight)
+                    nn.init.zeros_(self.deliberation_fusion.bias)
                 action_in = int(cfg.legal_action_feature_size) + int(
                     cfg.context_action_feature_size
                 )
@@ -896,7 +903,7 @@ class EntityGraphNet:
                             key_padding_mask=padding_mask,
                         )
                     fused = torch.cat((state, plan.mean(dim=1)), dim=-1)
-                    state = self.deliberation_fusion(
+                    state = state + self.deliberation_fusion(
                         torch.nn.functional.gelu(self.deliberation_fusion_norm(fused))
                     )
                 if self.moe_enabled:
@@ -963,10 +970,6 @@ class EntityGraphNet:
                     "value": value,
                     "final_vp": self.final_vp_head(state).squeeze(-1),
                 }
-                if self.latent_deliberation_steps > 0:
-                    outputs["deliberation_halt_logit"] = self.deliberation_halt_head(
-                        state
-                    ).squeeze(-1)
                 if self.moe_enabled:
                     outputs["moe_balance_metric"] = encoded_state[3]
                     outputs["moe_routing_load"] = encoded_state[4]
@@ -1791,7 +1794,25 @@ class EntityGraphPolicy:
                 )
         policy.trained_value_readouts = tuple(validated_readouts)
         policy._value_training_provenance_errors = tuple(provenance_errors)
-        missing, unexpected = policy.model.load_state_dict(data["model"], strict=False)
+        checkpoint_state = data["model"]
+        legacy_e3_keys = tuple(
+            str(key)
+            for key in checkpoint_state
+            if str(key).startswith("deliberation_halt_head.")
+        )
+        if legacy_e3_keys:
+            # The first E3 prototype replaced the base state with its fusion
+            # output and carried an untrained halt head.  Loading those fusion
+            # weights into the repaired residual architecture would silently
+            # change their meaning, so require an explicit migration/retrain.
+            raise RuntimeError(
+                "legacy E3 checkpoint is incompatible with the function-preserving "
+                "fixed-K architecture (found deliberation_halt_head); retrain or "
+                "migrate it explicitly"
+            )
+        missing, unexpected = policy.model.load_state_dict(
+            checkpoint_state, strict=False
+        )
         # Preserve load provenance for opt-in consumers that must distinguish a
         # genuinely trained optional head from a config-only warm-start upgrade.
         # The default scalar evaluator ignores this metadata entirely.
