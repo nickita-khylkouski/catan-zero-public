@@ -50,6 +50,7 @@ from catan_zero.rl.gumbel_self_play import (
     GumbelSelfPlayConfig,
     MixRuntime,
     OpponentPoolRuntime,
+    TARGET_INFORMATION_REGIME_AUTHORITATIVE,
     read_opponent_pool_manifest,
     run_worker_games,
 )
@@ -680,6 +681,32 @@ def build_parser() -> argparse.ArgumentParser:
         "change, so shipping is gated on a strength-based H2H A/B.",
     )
     parser.add_argument(
+        "--information-set-search",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Run actor-turn information-set MCTS over complete public-belief "
+        "determinizations instead of cloning authoritative hidden truth. Requires "
+        "a wheel exposing Game.determinize_for_player. This is mandatory for "
+        "training-admissible public-observation search targets.",
+    )
+    parser.add_argument(
+        "--determinization-particles",
+        type=int,
+        default=1,
+        help="Number of public-belief worlds aggregated per root when "
+        "--information-set-search is enabled. n-full/n-fast remain TOTAL budgets "
+        "and are divided across particles. Must be >=1.",
+    )
+    parser.add_argument(
+        "--determinization-min-simulations",
+        type=int,
+        default=32,
+        help="Minimum simulations assigned to each information-set particle. "
+        "The realized particle count is min(requested, total_budget // minimum), "
+        "with at least one particle; forced roots use one. Default 32 makes "
+        "n128 use four particles and n16 use one.",
+    )
+    parser.add_argument(
         "--opponent-pool-manifest",
         default=None,
         help="Archived-opponent pool (anti-forgetting, H2): JSON manifest "
@@ -868,6 +895,28 @@ def main(argv: Sequence[str] | None = None) -> None:
             "--fleet-pipeline-index must be smaller than --fleet-pipelines-per-gpu"
         )
     _validate_science_args(args, parser)
+    if int(args.determinization_particles) < 1:
+        parser.error("--determinization-particles must be >= 1")
+    if int(args.determinization_min_simulations) < 1:
+        parser.error("--determinization-min-simulations must be >= 1")
+    if bool(args.information_set_search):
+        if not bool(args.public_observation):
+            parser.error(
+                "--information-set-search requires --public-observation"
+            )
+        try:
+            import catanatron_rs  # type: ignore
+
+            has_determinization = hasattr(
+                catanatron_rs.Game, "determinize_for_player"
+            )
+        except ImportError:
+            has_determinization = False
+        if not has_determinization:
+            parser.error(
+                "--information-set-search requires a catanatron_rs wheel exposing "
+                "Game.determinize_for_player"
+            )
 
     # CAT-126 #4: auto-scale shard size by n-full unless the caller pinned it.
     if not _shard_size_was_explicit(_raw_argv) and "shard_size" not in config_filled:
@@ -1087,6 +1136,11 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "rust_featurize": bool(args.rust_featurize),
                 "eval_cache_size": int(args.eval_cache_size),
                 "belief_chance_spectra": bool(args.belief_chance_spectra),
+                "information_set_search": bool(args.information_set_search),
+                "determinization_particles": int(args.determinization_particles),
+                "determinization_min_simulations": int(
+                    args.determinization_min_simulations
+                ),
                 "opponent_pool_manifest": args.opponent_pool_manifest,
                 "opponent_mix_manifest": args.opponent_mix_manifest,
                 # Main-process resolution verifies every checkpoint's bytes and
@@ -1233,6 +1287,7 @@ def _server_worker_entry(
     action_size: int,
     trained_with_masked_hidden_info: bool,
     needs_action_targets: bool,
+    needs_relational_topology: bool,
     event_token_limit: int | None,
     value_categorical_bins: int,
     value_categorical_head_available: bool,
@@ -1255,6 +1310,7 @@ def _server_worker_entry(
             action_size=int(action_size),
             trained_with_masked_hidden_info=bool(trained_with_masked_hidden_info),
             needs_action_targets=bool(needs_action_targets),
+            needs_relational_topology=bool(needs_relational_topology),
             event_token_limit=event_token_limit,
             value_categorical_bins=int(value_categorical_bins),
             value_categorical_head_available=bool(value_categorical_head_available),
@@ -1358,6 +1414,7 @@ def _run_eval_server_batch(
                     int(meta["action_size"]),
                     bool(meta["trained_with_masked_hidden_info"]),
                     bool(meta.get("needs_action_targets", True)),
+                    bool(meta.get("needs_relational_topology", False)),
                     meta.get("event_token_limit"),
                     int(meta.get("value_categorical_bins", 0)),
                     bool(meta.get("value_categorical_head_available", False)),
@@ -1632,6 +1689,11 @@ def _run_worker(
         exact_budget_sh_min_n=int(worker_args.get("exact_budget_sh_min_n", 0)),
         root_wave_batching=bool(worker_args.get("root_wave_batching", False)),
         belief_chance_spectra=bool(worker_args["belief_chance_spectra"]),
+        information_set_search=bool(worker_args.get("information_set_search", False)),
+        determinization_particles=int(worker_args.get("determinization_particles", 1)),
+        determinization_min_simulations=int(
+            worker_args.get("determinization_min_simulations", 32)
+        ),
         rescale_noise_floor_c=float(worker_args.get("rescale_noise_floor_c", 0.0)),
         sigma_eval=float(worker_args.get("sigma_eval", 0.79)),
     )
@@ -1695,6 +1757,7 @@ def _merge_worker_summaries(
     exploiter_games = 0
     exploiter_engine_stats: dict[str, dict[str, int]] = {}
     exploiter_divergence_topics: dict[str, int] = {}
+    target_information_regimes: set[str] = set()
     for result in sorted(results, key=lambda item: int(item.get("worker_index", 0))):
         # Defensive: only list shards that actually exist on disk, even
         # though `run_worker_games` only ever reports paths it just
@@ -1708,6 +1771,15 @@ def _merge_worker_summaries(
         decisions_total += int(result.get("decisions_total", 0))
         forced_decisions_total += int(result.get("forced_decisions_total", 0))
         simulations_used_total += int(result.get("simulations_used_total", 0))
+        if int(result.get("rows", 0)) > 0 or result.get("shards"):
+            target_information_regimes.add(
+                str(
+                    result.get(
+                        "target_information_regime",
+                        TARGET_INFORMATION_REGIME_AUTHORITATIVE,
+                    )
+                )
+            )
         for color, count in dict(result.get("wins_by_color", {})).items():
             wins_by_color[color] = wins_by_color.get(color, 0) + int(count)
         for error in result.get("errors", ()):
@@ -1760,6 +1832,15 @@ def _merge_worker_summaries(
             if manifest_candidate.exists():
                 worker_summaries.append(str(manifest_candidate))
 
+    if len(target_information_regimes) > 1:
+        raise RuntimeError(
+            "workers emitted mixed target_information_regime values; refusing to "
+            f"merge semantically incompatible search targets: {sorted(target_information_regimes)}"
+        )
+    target_information_regime = next(
+        iter(target_information_regimes), TARGET_INFORMATION_REGIME_AUTHORITATIVE
+    )
+
     return {
         "out_dir": str(out_dir),
         "track": args.track,
@@ -1774,6 +1855,7 @@ def _merge_worker_summaries(
         "decisions_total": int(decisions_total),
         "forced_decisions_total": int(forced_decisions_total),
         "simulations_used_total": int(simulations_used_total),
+        "target_information_regime": target_information_regime,
         "workers": len(results),
         "n_full": int(args.n_full),
         "n_fast": int(args.n_fast),

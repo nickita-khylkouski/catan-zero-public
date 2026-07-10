@@ -625,6 +625,12 @@ def _base_search_config_kwargs(args: argparse.Namespace) -> dict[str, Any]:
             if args.symmetry_averaged_eval_threshold is None
             else int(args.symmetry_averaged_eval_threshold)
         ),
+        # Binding masked S1 arms must search public-belief worlds, not merely
+        # mask the evaluator input while cloning authoritative hidden truth.
+        # Historical unmasked diagnostics retain their original semantics.
+        information_set_search=bool(args.masked),
+        determinization_particles=4 if args.masked else 1,
+        determinization_min_simulations=32,
     )
 
 
@@ -753,6 +759,9 @@ def run_one_arm(arm: ArmSpec, args: argparse.Namespace, *, seed_block: int) -> d
         "max_depth": int(args.max_depth),
         "max_decisions": int(args.max_decisions),
         "masked": bool(args.masked),
+        "information_set_search": bool(args.masked),
+        "determinization_particles": 4 if args.masked else 1,
+        "determinization_min_simulations": 32,
         "lazy_interior_chance": bool(args.lazy),
         "correct_rust_chance_spectra": True,
         "prior_temperature": float(args.prior_temperature),

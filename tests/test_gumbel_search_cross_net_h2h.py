@@ -22,6 +22,7 @@ from gumbel_search_cross_net_h2h import (  # type: ignore  # noqa: E402
     _new_search_telemetry,
     _resolve_search_budgets,
     play_one_h2h_game,
+    _validate_information_set_recipe,
 )
 
 
@@ -33,6 +34,37 @@ def _base_worker_args(**overrides) -> dict:
     }
     args.update(overrides)
     return args
+
+
+def test_public_observation_requires_information_set_search() -> None:
+    args = SimpleNamespace(
+        public_observation=True,
+        information_set_search=False,
+        belief_chance_spectra=False,
+        determinization_particles=4,
+        determinization_min_simulations=32,
+    )
+    import pytest
+
+    with pytest.raises(ValueError, match="requires --information-set-search"):
+        _validate_information_set_recipe(args)
+
+    args.information_set_search = True
+    _validate_information_set_recipe(args)
+
+
+def test_build_search_config_threads_information_set_recipe() -> None:
+    config = _build_search_config(
+        _base_worker_args(
+            information_set_search=True,
+            determinization_particles=4,
+            determinization_min_simulations=32,
+        ),
+        seed=1,
+    )
+    assert config.information_set_search is True
+    assert config.determinization_particles == 4
+    assert config.determinization_min_simulations == 32
 
 
 def test_build_search_config_defaults_to_shared_n_full_when_no_override():
@@ -250,6 +282,9 @@ def test_h2h_summary_records_resolved_adaptive_budget_by_role():
         correct_rust_chance_spectra=True,
         public_observation=True,
         belief_chance_spectra=False,
+        information_set_search=True,
+        determinization_particles=4,
+        determinization_min_simulations=32,
         raw_policy_above_width=None,
         symmetry_averaged_eval=True,
         symmetry_averaged_eval_threshold=20,

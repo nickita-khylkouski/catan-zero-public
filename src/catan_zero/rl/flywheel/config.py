@@ -55,7 +55,8 @@ class FlywheelConfig:
     # "scoreboard": tools/promotion_gate_runner.py -> evaluate_scoreboard.py, which has NO
     # public-observation masking anywhere in its policy-loading chain -- a masked-trained candidate
     # gated on this path is evaluated with omniscient features (train/eval mismatch). Kept only as an
-    # opt-out; loudly warns when selected. Do not use for masked checkpoints.
+    # historical replay option; Runner.gate rejects it for promotion because a
+    # warning cannot make its omniscient evidence valid for masked checkpoints.
     gate_style: str = "h2h"               # "h2h" | "scoreboard"
     masked: bool = True                   # candidate/champion were trained with --mask-hidden-info;
                                            # threads to the h2h gate's --public-observation flag
@@ -71,6 +72,13 @@ class FlywheelConfig:
     # incumbent to have a categorical head.
     gate_candidate_value_readout: str = "scalar"
     gate_baseline_value_readout: str = "scalar"
+    # A masked evaluator alone does not make search public-information safe:
+    # authoritative game clones still contain opponent hands/dev cards.  The
+    # production H2H gate is therefore pinned to actor-turn information-set
+    # search and records the particle recipe in its artifact/config hash.
+    gate_information_set_search: bool = True
+    gate_determinization_particles: int = 4
+    gate_determinization_min_simulations: int = 32
 
     # --- generation search-operator config (CAT-88: pass EXPLICITLY, never inherit
     #     generate_gumbel_selfplay_data.py's own CLI defaults). The flywheel's generate()
@@ -98,6 +106,9 @@ class FlywheelConfig:
     gen_temperature_decisions: int | None = None
     gen_lazy_interior_chance: bool | None = None
     gen_correct_rust_chance_spectra: bool | None = None
+    gen_information_set_search: bool | None = None
+    gen_determinization_particles: int | None = None
+    gen_determinization_min_simulations: int | None = None
 
     # --- opponent pool (anti-forgetting; asymmetric-Catan critical) ---
     opponent_pool_fraction: float = 0.20
@@ -151,6 +162,8 @@ class FlywheelConfig:
         "gen_wide_candidates_threshold", "gen_c_visit", "gen_c_scale",
         "gen_max_decisions", "gen_max_depth", "gen_temperature_decisions",
         "gen_lazy_interior_chance", "gen_correct_rust_chance_spectra",
+        "gen_information_set_search", "gen_determinization_particles",
+        "gen_determinization_min_simulations",
     )
 
     def resolve_gen_search_argv(self) -> list[str]:
@@ -168,7 +181,10 @@ class FlywheelConfig:
                 "--no-gen-symmetry-averaged-eval --gen-wide-candidates-threshold 24 "
                 "--gen-c-visit 50 --gen-c-scale 0.03 --gen-max-decisions 600 "
                 "--gen-max-depth 80 --gen-temperature-decisions 90 --gen-lazy-interior-chance "
-                "--gen-correct-rust-chance-spectra; teacher: --gen-n-full 128 --gen-p-full 1.0."
+                "--gen-correct-rust-chance-spectra --gen-information-set-search "
+                "--gen-determinization-particles 4 "
+                "--gen-determinization-min-simulations 32; teacher: "
+                "--gen-n-full 128 --gen-p-full 1.0."
             )
         argv = [
             "--n-full", str(self.gen_n_full),
@@ -188,6 +204,11 @@ class FlywheelConfig:
              else "--no-lazy-interior-chance"),
             ("--correct-rust-chance-spectra" if self.gen_correct_rust_chance_spectra
              else "--no-correct-rust-chance-spectra"),
+            ("--information-set-search" if self.gen_information_set_search
+             else "--no-information-set-search"),
+            "--determinization-particles", str(self.gen_determinization_particles),
+            "--determinization-min-simulations",
+            str(self.gen_determinization_min_simulations),
         ]
         if self.gen_n_full_wide is not None:
             argv.extend(["--n-full-wide", str(self.gen_n_full_wide)])
@@ -231,6 +252,29 @@ class FlywheelConfig:
             raise ValueError("gate_min_winrate must be in [0,1]")
         if self.gate_style not in ("h2h", "scoreboard"):
             raise ValueError(f"gate_style must be h2h|scoreboard, got {self.gate_style!r}")
+        if self.gate_style == "h2h" and self.gate_enabled:
+            if not self.gate_information_set_search:
+                raise ValueError(
+                    "masked H2H gate requires gate_information_set_search=true"
+                )
+            if self.gate_determinization_particles < 1:
+                raise ValueError("gate_determinization_particles must be >= 1")
+            if self.gate_determinization_min_simulations < 1:
+                raise ValueError(
+                    "gate_determinization_min_simulations must be >= 1"
+                )
+        if self.gen_information_set_search is False:
+            raise ValueError(
+                "continuous flywheel generation is public-observation and requires "
+                "gen_information_set_search=true"
+            )
+        if self.gen_determinization_particles is not None and self.gen_determinization_particles < 1:
+            raise ValueError("gen_determinization_particles must be >= 1")
+        if (
+            self.gen_determinization_min_simulations is not None
+            and self.gen_determinization_min_simulations < 1
+        ):
+            raise ValueError("gen_determinization_min_simulations must be >= 1")
         for field_name in ("gate_candidate_value_readout", "gate_baseline_value_readout"):
             value = getattr(self, field_name)
             if value not in ("scalar", "categorical"):

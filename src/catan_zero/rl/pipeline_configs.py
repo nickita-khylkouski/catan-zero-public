@@ -234,6 +234,17 @@ class TrainConfig(PipelineConfig):
     graph_layers: int = 4
     attention_heads: int = 8
     graph_dropout: float = 0.05
+    entity_state_trunk: str = "transformer"
+    relational_block_pattern: str = ""
+    relational_ff_size: int = 0
+    relational_bases: int = 4
+    relational_action_cross_layers: int = 1
+    latent_deliberation_steps: int = 0
+    latent_deliberation_slots: int = 8
+    moe_routed_experts: int = 0
+    moe_top_k: int = 2
+    moe_expert_ff_size: int = 0
+    moe_balance_loss_weight: float = 0.01
     symmetry_augment: bool = False
     symmetry_augment_events: bool = True
     soft_target_temperature: float = 0.7
@@ -317,6 +328,13 @@ class GenerateConfig(PipelineConfig):
     # Masking / regime.
     public_observation: bool = False
     belief_chance_spectra: bool = False
+    # Masking neural features is not sufficient for hidden-information games:
+    # the search tree itself must be rooted in public-belief determinizations.
+    # These fields are science-bearing provenance because changing either the
+    # number of particles or their minimum budget changes the teacher target.
+    information_set_search: bool = False
+    determinization_particles: int = 1
+    determinization_min_simulations: int = 32
     # Seeds.
     base_seed: int = 1
     seed_claim: bool = True
@@ -433,6 +451,9 @@ class EvalConfig(PipelineConfig):
     # Masking / regime.
     public_observation: bool = False
     belief_chance_spectra: bool = False
+    information_set_search: bool = False
+    determinization_particles: int = 1
+    determinization_min_simulations: int = 32
     # Seeds + games.
     base_seed: int = 1
     pairs: int = 50

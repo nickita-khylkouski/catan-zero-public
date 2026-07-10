@@ -71,10 +71,18 @@ def test_arms_default_to_disabled():
 
 def test_new_width_controls_are_appended_for_positional_pickle_safety():
     names = tuple(field.name for field in dataclasses.fields(GumbelChanceMCTSConfig))
-    assert names[-3:] == (
+    width_controls = (
         "symmetry_averaged_eval_threshold",
         "n_full_wide_threshold",
         "wide_roots_always_full",
+    )
+    start = names.index(width_controls[0])
+    assert names[start : start + len(width_controls)] == width_controls
+    # New fields may only follow the established append-only boundary.
+    assert names[start + len(width_controls) :] == (
+        "information_set_search",
+        "determinization_particles",
+        "determinization_min_simulations",
     )
 
 

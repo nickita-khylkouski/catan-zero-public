@@ -90,6 +90,9 @@ SEARCH_OPERATOR_KEYS = {
     "exact_budget_sh",
     "exact_budget_sh_min_n",
     "belief_chance_spectra",
+    "information_set_search",
+    "determinization_particles",
+    "determinization_min_simulations",
     "rescale_noise_floor_c",
     "sigma_eval",
 }
@@ -250,6 +253,8 @@ def _validate_search_operator(raw: Any, *, where: str) -> dict[str, Any]:
         "symmetry_averaged_eval_threshold",
         "wide_candidates_threshold",
         "exact_budget_sh_min_n",
+        "determinization_particles",
+        "determinization_min_simulations",
     ):
         operator[key] = _integer(operator[key], where=f"{where}.{key}")
     for key in (
@@ -268,6 +273,7 @@ def _validate_search_operator(raw: Any, *, where: str) -> dict[str, Any]:
         "lazy_interior_chance",
         "exact_budget_sh",
         "belief_chance_spectra",
+        "information_set_search",
     ):
         if not isinstance(operator[key], bool):
             raise AdjudicationError(f"{where}.{key} must be boolean")
@@ -277,6 +283,21 @@ def _validate_search_operator(raw: Any, *, where: str) -> dict[str, Any]:
 
     if operator["max_depth"] <= 0 or operator["n_fast"] <= 0:
         raise AdjudicationError(f"{where} search depths/budgets must be positive")
+    if operator["information_set_search"] is not True:
+        raise AdjudicationError(
+            f"{where} must enable information_set_search; public evaluator masking "
+            "alone does not protect the MCTS tree"
+        )
+    if operator["belief_chance_spectra"] is not False:
+        raise AdjudicationError(
+            f"{where} information-set search requires belief_chance_spectra=false"
+        )
+    if operator["determinization_particles"] != 4:
+        raise AdjudicationError(f"{where} must use four determinization particles")
+    if operator["determinization_min_simulations"] != 32:
+        raise AdjudicationError(
+            f"{where} determinization_min_simulations must be 32"
+        )
     if operator["n_full"] not in {64, 128}:
         raise AdjudicationError(
             f"{where}.n_full must be 64 or 128; global n256 is forbidden"
@@ -523,6 +544,20 @@ def _validate_complete_h2h(
     )
     if report.get("public_observation") is not True:
         raise AdjudicationError(f"{where} public_observation must be true")
+    if report.get("information_set_search") is not True:
+        raise AdjudicationError(f"{where} information_set_search must be true")
+    if _integer(
+        report.get("determinization_particles"),
+        where=f"{where}.determinization_particles",
+    ) != 4:
+        raise AdjudicationError(f"{where} must attest four determinization particles")
+    if _integer(
+        report.get("determinization_min_simulations"),
+        where=f"{where}.determinization_min_simulations",
+    ) != 32:
+        raise AdjudicationError(
+            f"{where} must attest determinization_min_simulations=32"
+        )
     if report.get("symmetry_averaged_eval") is not True:
         raise AdjudicationError(f"{where} must enable D6 on both roles")
     if (
@@ -577,6 +612,11 @@ def _validate_complete_h2h(
         "mode": "cross_net",
         "public_observation": True,
         "belief_chance_spectra": base["belief_chance_spectra"],
+        "information_set_search": True,
+        "determinization_particles": base["determinization_particles"],
+        "determinization_min_simulations": base[
+            "determinization_min_simulations"
+        ],
         "pairs": requested,
         "n_full": base["n_full"],
         "candidate_n_full": candidate["n_full"],
@@ -964,6 +1004,9 @@ def _validate_s1_arm(
         "max_root_candidates_wide": 54,
         "symmetry_averaged_eval": True,
         "symmetry_averaged_eval_threshold": POLICY["d6_min_legal_actions"],
+        "information_set_search": True,
+        "determinization_particles": 4,
+        "determinization_min_simulations": 32,
     }
     expected_candidate = dict(expected_baseline)
     expected_candidate["c_scale"] = S1_ARMS[arm_name][0]

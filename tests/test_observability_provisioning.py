@@ -168,6 +168,7 @@ def test_prometheus_and_grafana_provisioning_are_committed() -> None:
     assert "--listen 127.0.0.1 --port 9500" in service
     assert "/home/ubuntu/catan-zero-v1/.venv/bin/python" in service
     assert "--run-root /home/ubuntu/gen_out" in service
+    assert "--run-root /home/ubuntu/catan-zero-production/runs/selfplay" in service
     assert "NoNewPrivileges=true" in service
     compose = (OBS / "docker-compose.yml").read_text()
     assert "GF_SERVER_HTTP_ADDR=127.0.0.1" in compose

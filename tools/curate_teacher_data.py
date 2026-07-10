@@ -16,6 +16,7 @@ from factory_common import write_json
 
 IMPORTANT_PHASES = {"initial_build", "main_turn", "robber", "discard"}
 PLAYER_NAMES = ("BLUE", "RED", "ORANGE", "WHITE")
+TARGET_INFORMATION_REGIME_UNKNOWN = "unknown"
 KEYS = (
     "obs",
     "legal_action_ids",
@@ -26,6 +27,7 @@ KEYS = (
     "target_policy_mask",
     "target_scores_mask",
     "target_score_source",
+    "target_information_regime",
     "game_seed",
     "teacher_name",
     "player",
@@ -166,6 +168,8 @@ def main() -> None:
         "kept_teachers": Counter(),
         "raw_score_sources": Counter(),
         "kept_score_sources": Counter(),
+        "raw_target_information_regimes": Counter(),
+        "kept_target_information_regimes": Counter(),
         "raw_phases": Counter(),
         "kept_phases": Counter(),
         "raw_legal_counts": [],
@@ -221,6 +225,15 @@ def main() -> None:
                 drop_truncated=bool(args.drop_truncated),
                 preserve_value_only_filtered_rows=bool(args.preserve_value_only_filtered_rows),
             )
+            target_information_regimes = np.asarray(
+                shard.get(
+                    "target_information_regime",
+                    np.full(n, TARGET_INFORMATION_REGIME_UNKNOWN),
+                )
+            ).astype(str)
+            report["raw_target_information_regimes"].update(
+                target_information_regimes.tolist()
+            )
             if args.dedupe_keys != "none":
                 dedupe_keep, dropped_duplicate = _dedupe_keep_mask(
                     shard,
@@ -243,6 +256,9 @@ def main() -> None:
                 shard_report["dropped_duplicate"] = int(dropped_duplicate)
             else:
                 shard_report["dropped_duplicate"] = 0
+            report["kept_target_information_regimes"].update(
+                target_information_regimes[keep_mask].tolist()
+            )
             shard["policy_weight_multiplier"] = policy_weight_multiplier
             shard["value_weight_multiplier"] = value_weight_multiplier
             _merge_shard_report(report, shard_report)
@@ -302,6 +318,9 @@ def main() -> None:
         "input_manifests": _input_manifests(args.data),
         "tool_provenance": _tool_provenance(),
         "score_source_counts": dict(report["kept_score_sources"].most_common()),
+        "target_information_regime_counts": dict(
+            report["kept_target_information_regimes"].most_common()
+        ),
         "raw_samples": int(report["raw_samples"]),
         "kept_fraction": (
             float(report["kept_samples"]) / float(report["raw_samples"])
@@ -320,6 +339,8 @@ def main() -> None:
                 "kept_teachers",
                 "raw_score_sources",
                 "kept_score_sources",
+                "raw_target_information_regimes",
+                "kept_target_information_regimes",
                 "raw_phases",
                 "kept_phases",
                 "raw_legal_counts",
@@ -330,6 +351,12 @@ def main() -> None:
         "kept_teachers": dict(report["kept_teachers"].most_common()),
         "raw_score_sources": dict(report["raw_score_sources"].most_common()),
         "kept_score_sources": dict(report["kept_score_sources"].most_common()),
+        "raw_target_information_regimes": dict(
+            report["raw_target_information_regimes"].most_common()
+        ),
+        "kept_target_information_regimes": dict(
+            report["kept_target_information_regimes"].most_common()
+        ),
         "raw_phases": dict(report["raw_phases"].most_common()),
         "kept_phases": dict(report["kept_phases"].most_common()),
         "raw_legal_actions": _legal_stats(np.asarray(report["raw_legal_counts"], dtype=np.int64)),
@@ -498,6 +525,17 @@ class ShardWriter:
             "target_score_source": np.asarray(
                 [str(row.get("target_score_source", "")) for row in self.rows]
             ),
+            "target_information_regime": np.asarray(
+                [
+                    str(
+                        row.get(
+                            "target_information_regime",
+                            TARGET_INFORMATION_REGIME_UNKNOWN,
+                        )
+                    )
+                    for row in self.rows
+                ]
+            ),
             "game_seed": np.asarray([row.get("game_seed", 0) for row in self.rows], dtype=np.int64),
             "teacher_name": np.asarray([str(row.get("teacher_name", "")) for row in self.rows]),
             "player": np.asarray([str(row.get("player", "")) for row in self.rows]),
@@ -638,6 +676,8 @@ def _default_array_for_missing_key(
         return np.full(shape, np.nan, dtype=dtype)
     if key in {"target_policy_mask", "target_scores_mask", "has_final_public_vps", "has_final_actual_vps"}:
         return np.zeros(shape, dtype=np.bool_)
+    if key == "target_information_regime":
+        return np.full(shape, TARGET_INFORMATION_REGIME_UNKNOWN, dtype=dtype)
     if key in {"target_score_source", "teacher_name", "player", "phase", "winner", "action_mask_version"}:
         return np.full(shape, "", dtype=dtype)
     if key in {"seat", "decision_index"}:

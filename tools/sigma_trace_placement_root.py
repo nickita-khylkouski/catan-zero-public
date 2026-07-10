@@ -65,7 +65,22 @@ def find_placement_roots(catanatron_rs, *, n_states: int, base_seed: int) -> lis
 
 
 def trace_one_root(mcts: GumbelChanceMCTS, game: Any) -> dict[str, Any]:
-    """Run a full search on this root and extract the per-candidate trace."""
+    """Run an explicitly authoritative diagnostic and extract private internals.
+
+    This tool studies one tree's completed-Q rescaling and therefore cannot
+    represent a cross-determinization information-set aggregate.  Refuse a
+    public-observation evaluator rather than letting the private ``_GNode``
+    path masquerade as public-information evidence.  ``opening_panel.py`` is
+    the information-set-safe replacement for public checkpoint diagnostics.
+    """
+    evaluator_config = getattr(mcts.evaluator, "config", None)
+    if evaluator_config is not None and bool(
+        getattr(evaluator_config, "public_observation", False)
+    ):
+        raise RuntimeError(
+            "sigma_trace_placement_root uses authoritative private-tree internals "
+            "and refuses public_observation; use opening_panel.py for public evidence"
+        )
     root_color = str(game.current_color())
     root = _GNode(game=game.copy(), root_color=root_color)
     mcts._expand(root)
@@ -97,6 +112,8 @@ def trace_one_root(mcts: GumbelChanceMCTS, game: Any) -> dict[str, Any]:
     visited = [c for c in per_candidate if c["visits"] > 0]
 
     return {
+        "information_regime": "authoritative_hidden_state_diagnostic",
+        "admissible_for_public_information_evidence": False,
         "n_candidates": len(per_candidate),
         "n_visited": len(visited),
         "sh_winner_action": int(sh_winner_action),
@@ -143,6 +160,8 @@ def run_sweep(
         avg_candidates = sum(t["n_candidates"] for t in traces) / len(traces)
         key = f"cv{c_visit}_cs{c_scale}"
         results[key] = {
+            "information_regime": "authoritative_hidden_state_diagnostic",
+            "admissible_for_public_information_evidence": False,
             "c_visit": c_visit,
             "c_scale": c_scale,
             "n_states": len(traces),

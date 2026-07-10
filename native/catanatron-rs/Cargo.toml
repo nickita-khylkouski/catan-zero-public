@@ -1,0 +1,43 @@
+[package]
+name = "catanatron-rs"
+version = "0.1.4"
+edition = "2024"
+
+[lib]
+name = "catanatron_rs"
+
+[[bin]]
+name = "catanatron"
+path = "src/bin/catanatron.rs"
+test = false
+bench = false
+
+[dependencies]
+pyo3 = { version = "0.27", optional = true, features = ["auto-initialize"] }
+rand = { version = "0.8", features = ["small_rng"] }
+rayon = "1"
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = "1"
+
+[features]
+default = []
+python = ["dep:pyo3"]
+python-extension = ["python", "pyo3/extension-module"]
+serde = ["dep:serde"]
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+
+[profile.bench]
+lto = false
+codegen-units = 16
+
+[dev-dependencies]
+criterion = "0.5"
+proptest = "1"
+
+[[bench]]
+name = "engine"
+harness = false

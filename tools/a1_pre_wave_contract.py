@@ -46,7 +46,10 @@ if str(TOOLS) not in sys.path:
 
 from catan_zero.search.gumbel_chance_mcts import GumbelChanceMCTSConfig  # noqa: E402
 from catan_zero.search.neural_rust_mcts import EntityGraphRustEvaluatorConfig  # noqa: E402
-from catan_zero.rl.gumbel_self_play import GumbelSelfPlayConfig  # noqa: E402
+from catan_zero.rl.gumbel_self_play import (  # noqa: E402
+    GumbelSelfPlayConfig,
+    TARGET_INFORMATION_REGIME_PUBLIC,
+)
 from catan_zero.rl.pipeline_configs import GenerateConfig  # noqa: E402
 from tools import legacy_scalar_readout_attestation as legacy_scalar  # noqa: E402
 from tools import a0_binding_verdict as a0_binding  # noqa: E402
@@ -171,6 +174,7 @@ REQUIRED_SELECTED_TELEMETRY_COLUMNS = {
 }
 REQUIRED_GENERATOR_CODE_SUFFIXES = {
     "tools/generate_gumbel_selfplay_data.py",
+    "tools/fleet/systemd/nvidia-mps.service",
     "tools/opponent_mix_registry.py",
     "src/catan_zero/rl/gumbel_self_play.py",
     "src/catan_zero/rl/flywheel/opponent_mix.py",
@@ -180,6 +184,13 @@ REQUIRED_GENERATOR_CODE_SUFFIXES = {
     "src/catan_zero/search/gumbel_chance_mcts.py",
     "src/catan_zero/search/neural_rust_mcts.py",
     "src/catan_zero/rl/pipeline_configs.py",
+    "native/catanatron-rs/Cargo.toml",
+    "native/catanatron-rs/WHEEL_SHA256SUMS",
+    "native/catanatron-rs/python/Cargo.toml",
+    "native/catanatron-rs/src/lib.rs",
+    "native/catanatron-rs/python/src/lib.rs",
+    "native/gumbel_mcts_rs/Cargo.toml",
+    "native/gumbel_mcts_rs/src/lib.rs",
 }
 REQUIRED_LEARNER_CODE_SUFFIXES = {
     "configs/guards/train_bc.json",
@@ -230,6 +241,9 @@ _SEARCH_INPUT_KEYS = {
     "exact_budget_sh",
     "exact_budget_sh_min_n",
     "belief_chance_spectra",
+    "information_set_search",
+    "determinization_particles",
+    "determinization_min_simulations",
     "rescale_noise_floor_c",
     "sigma_eval",
 }
@@ -376,6 +390,21 @@ def _runtime_code_tree_records() -> list[dict[str, Any]]:
         for path in REPO_ROOT.glob(pattern)
         if path.is_file()
     }
+    for relative in (
+        "native/catanatron-rs/Cargo.toml",
+        "native/catanatron-rs/Cargo.lock",
+        "native/catanatron-rs/pyproject.toml",
+        "native/catanatron-rs/WHEEL_SHA256SUMS",
+        "native/catanatron-rs/python/Cargo.toml",
+        "native/catanatron-rs/python/Cargo.lock",
+        "native/catanatron-rs/src/lib.rs",
+        "native/catanatron-rs/python/src/lib.rs",
+        "native/gumbel_mcts_rs/Cargo.toml",
+        "native/gumbel_mcts_rs/Cargo.lock",
+        "native/gumbel_mcts_rs/src/lib.rs",
+        "tools/fleet/systemd/nvidia-mps.service",
+    ):
+        paths.add((REPO_ROOT / relative).resolve(strict=True))
     paths.update(
         {
             (REPO_ROOT / "configs/guards/generate_gumbel_selfplay_data.json").resolve(
@@ -519,6 +548,7 @@ def _effective_search(raw: dict[str, Any]) -> dict[str, Any]:
         "lazy_interior_chance",
         "exact_budget_sh",
         "belief_chance_spectra",
+        "information_set_search",
     }
     int_keys = {
         "max_depth",
@@ -526,6 +556,8 @@ def _effective_search(raw: dict[str, Any]) -> dict[str, Any]:
         "n_fast",
         "wide_candidates_threshold",
         "exact_budget_sh_min_n",
+        "determinization_particles",
+        "determinization_min_simulations",
     }
     optional_int_keys = {
         "n_full_wide",
@@ -702,8 +734,16 @@ def _validate_guard_payload(
         "--c-visit",
         "--n-full",
         "--n-fast",
+        "--p-full",
         "--base-seed",
         "--games",
+        "--max-depth",
+        "--symmetry-averaged-eval",
+        "--symmetry-averaged-eval-threshold",
+        "--belief-chance-spectra",
+        "--information-set-search",
+        "--determinization-particles",
+        "--determinization-min-simulations",
     }
     if not required_critical.issubset(critical):
         raise ContractError(
@@ -711,9 +751,24 @@ def _validate_guard_payload(
         )
     comparisons = {
         "--c-scale": search["c_scale"],
+        "--c-visit": search["c_visit"],
+        "--n-full": search["n_full"],
+        "--n-fast": search["n_fast"],
+        "--p-full": search["p_full"],
+        "--max-depth": search["max_depth"],
         "--temperature-decisions": generation["temperature_decisions"],
         "--public-observation": evaluator["public_observation"],
         "--lazy-interior-chance": search["lazy_interior_chance"],
+        "--symmetry-averaged-eval": search["symmetry_averaged_eval"],
+        "--symmetry-averaged-eval-threshold": search[
+            "symmetry_averaged_eval_threshold"
+        ],
+        "--belief-chance-spectra": search["belief_chance_spectra"],
+        "--information-set-search": search["information_set_search"],
+        "--determinization-particles": search["determinization_particles"],
+        "--determinization-min-simulations": search[
+            "determinization_min_simulations"
+        ],
     }
     for flag, contract_value in comparisons.items():
         if flag not in expected or expected[flag] != contract_value:
@@ -833,10 +888,14 @@ def sync_generation_guard(draft_path: Path) -> dict[str, Any]:
         raise ContractError(f"{guard_path} has no expected --c-scale value")
     current_c_scale = expected["--c-scale"]
 
-    guard_search = {
-        "c_scale": selected_c_scale,
-        "lazy_interior_chance": raw_search.get("lazy_interior_chance"),
-    }
+    # The generation guard binds the complete winning search recipe, not only
+    # the S1-selected c_scale.  Preserve every resolved search field from the
+    # draft while substituting the typed S1 winner.  Passing the former
+    # two-field projection made exact guard validation crash as soon as the
+    # guard began binding n_full, information-set search, and the remaining
+    # production search parameters.
+    guard_search = dict(raw_search)
+    guard_search["c_scale"] = selected_c_scale
     evaluator = science.get("evaluator")
     generation = draft.get("generation")
     if not isinstance(evaluator, dict) or not isinstance(generation, dict):
@@ -1011,6 +1070,7 @@ def _validate_post_wave(value: dict[str, Any]) -> None:
         "required_reports",
         "require_shard_sha256",
         "require_contract_attestation",
+        "require_target_information_regime",
         "validation_holdout",
     }
     _require_exact_keys(value, required, where="post_wave_acceptance")
@@ -1027,6 +1087,11 @@ def _validate_post_wave(value: dict[str, Any]) -> None:
         )
     ):
         raise ContractError("all fail-closed A1 post-wave requirements must be true")
+    if value["require_target_information_regime"] != TARGET_INFORMATION_REGIME_PUBLIC:
+        raise ContractError(
+            "require_target_information_regime must be exactly "
+            f"{TARGET_INFORMATION_REGIME_PUBLIC!r}"
+        )
     if (
         int(value["selected_truncations_max"]) != 0
         or int(value["invalid_teacher_actions_max"]) != 0
@@ -2176,6 +2241,22 @@ def build_lock(
     _validate_learner_training_recipe(learner_training_recipe)
     if evaluator["public_observation"] is not True:
         raise ContractError("science.evaluator.public_observation must be true")
+    if search["information_set_search"] is not True:
+        raise ContractError(
+            "A1 public-observation policy targets require information_set_search=true"
+        )
+    if int(search["determinization_particles"]) < 1:
+        raise ContractError("determinization_particles must be >= 1")
+    if int(search["determinization_particles"]) > int(search["n_fast"]):
+        raise ContractError(
+            "determinization_particles cannot exceed the n_fast total budget"
+        )
+    if int(search["determinization_min_simulations"]) < 1:
+        raise ContractError("determinization_min_simulations must be >= 1")
+    if bool(search["belief_chance_spectra"]):
+        raise ContractError(
+            "belief_chance_spectra must be false under full-world determinization"
+        )
     if evaluator["value_readout"] not in {"scalar", "categorical"}:
         raise ContractError("value_readout must be scalar or categorical")
     if evaluator["value_squash"] != "tanh":
@@ -2761,6 +2842,11 @@ def _generator_argv(
         "--exact-budget-sh-min-n",
         str(search["exact_budget_sh_min_n"]),
         _bool_flag("--belief-chance-spectra", bool(search["belief_chance_spectra"])),
+        _bool_flag("--information-set-search", bool(search["information_set_search"])),
+        "--determinization-particles",
+        str(search["determinization_particles"]),
+        "--determinization-min-simulations",
+        str(search["determinization_min_simulations"]),
         _bool_flag("--public-observation", bool(evaluator["public_observation"])),
         _bool_flag("--rust-featurize", bool(evaluator["rust_featurize"])),
         _bool_flag("--eval-server", bool(generation["eval_server"])),
@@ -3308,6 +3394,11 @@ def _expected_cli_fields(lock: dict[str, Any], job: dict[str, Any]) -> dict[str,
         "exact_budget_sh": search["exact_budget_sh"],
         "exact_budget_sh_min_n": search["exact_budget_sh_min_n"],
         "belief_chance_spectra": search["belief_chance_spectra"],
+        "information_set_search": search["information_set_search"],
+        "determinization_particles": search["determinization_particles"],
+        "determinization_min_simulations": search[
+            "determinization_min_simulations"
+        ],
         "max_depth": search["max_depth"],
         "prior_temperature": evaluator["prior_temperature"],
         "value_scale": evaluator["value_scale"],
@@ -3397,6 +3488,10 @@ def audit_outputs(lock_path: Path, out_path: Path) -> dict[str, Any]:
     seen_shards: set[Path] = set()
     job_selections: list[dict[str, Any]] = []
     selected_game_records: list[dict[str, Any]] = []
+    target_information_regimes: Counter[str] = Counter()
+    required_target_information_regime = str(
+        lock["post_wave_acceptance"]["require_target_information_regime"]
+    )
     producer = _producer(lock)
     checkpoint_by_id = {record["id"]: record for record in lock["checkpoints"]}
     category_specs = {item["name"]: item for item in lock["source_categories"]}
@@ -3452,6 +3547,12 @@ def audit_outputs(lock_path: Path, out_path: Path) -> dict[str, Any]:
             errors.append(f"{job['job_id']}: base_seed drift")
         if str(manifest.get("checkpoint")) != producer["path"]:
             errors.append(f"{job['job_id']}: producer checkpoint path drift")
+        if manifest.get("target_information_regime") != required_target_information_regime:
+            errors.append(
+                f"{job['job_id']}: generation manifest target_information_regime="
+                f"{manifest.get('target_information_regime')!r}, expected "
+                f"{required_target_information_regime!r}"
+            )
         cli = dict(manifest.get("cli_args", {}))
         for key, expected in _expected_cli_fields(lock, job).items():
             if cli.get(key) != expected:
@@ -3487,6 +3588,15 @@ def audit_outputs(lock_path: Path, out_path: Path) -> dict[str, Any]:
                 )
                 continue
             worker_manifest = _load_json(worker_manifest_path)
+            if (
+                worker_manifest.get("target_information_regime")
+                != required_target_information_regime
+            ):
+                errors.append(
+                    f"{job['job_id']}: worker manifest target_information_regime="
+                    f"{worker_manifest.get('target_information_regime')!r}, expected "
+                    f"{required_target_information_regime!r}"
+                )
             actual_search = dict(worker_manifest.get("search_config", {}))
             actual_search.pop("seed", None)
             if actual_search != lock["science"]["effective_search_config"]:
@@ -3560,12 +3670,25 @@ def audit_outputs(lock_path: Path, out_path: Path) -> dict[str, Any]:
                 )
                 with np.load(canonical_shard, allow_pickle=False) as payload:
                     game_seeds = np.asarray(payload["game_seed"], dtype=np.int64)
+                    regimes = np.asarray(payload["target_information_regime"]).astype(str)
                     terminated = np.asarray(payload["terminated"], dtype=bool)
                     truncated = np.asarray(payload["truncated"], dtype=bool)
                     if game_seeds.ndim != 1 or not (
-                        terminated.shape == truncated.shape == game_seeds.shape
+                        regimes.shape
+                        == terminated.shape
+                        == truncated.shape
+                        == game_seeds.shape
                     ):
-                        raise ContractError("game status arrays are not row-aligned")
+                        raise ContractError(
+                            "game status/target-information arrays are not row-aligned"
+                        )
+                    target_information_regimes.update(regimes.tolist())
+                    if np.any(regimes != required_target_information_regime):
+                        actual = sorted(set(regimes.tolist()))
+                        errors.append(
+                            f"{job['job_id']}: shard target_information_regime values "
+                            f"{actual}, expected only {required_target_information_regime!r}"
+                        )
                     active_seed_run = _advance_game_seed_runs(
                         game_seeds,
                         active_seed=active_seed_run,
@@ -3858,6 +3981,10 @@ def audit_outputs(lock_path: Path, out_path: Path) -> dict[str, Any]:
         "job_selection_sha256": _digest_value(job_selections),
         "rows": rows,
         "invalid_teacher_actions": invalid_actions,
+        "target_information_regime": {
+            "required": required_target_information_regime,
+            "counts": dict(target_information_regimes),
+        },
         "reports": {
             "truncation": {
                 "selected_truncated_games": 0,

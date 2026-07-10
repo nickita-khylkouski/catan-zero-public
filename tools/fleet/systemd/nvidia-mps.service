@@ -1,0 +1,22 @@
+[Unit]
+Description=NVIDIA CUDA MPS control daemon for Catan Zero generation
+After=network.target nvidia-persistenced.service
+Wants=nvidia-persistenced.service
+ConditionPathExists=/usr/bin/nvidia-cuda-mps-control
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+Environment=CUDA_MPS_PIPE_DIRECTORY=/tmp/mps_pipe_host
+Environment=CUDA_MPS_LOG_DIRECTORY=/tmp/mps_log_host
+ExecStartPre=/usr/bin/rm -rf /tmp/mps_pipe_host /tmp/mps_log_host
+ExecStartPre=/usr/bin/install -d -m 0700 -o ubuntu -g ubuntu /tmp/mps_pipe_host /tmp/mps_log_host
+ExecStart=/usr/bin/nvidia-cuda-mps-control -f
+ExecStop=/bin/bash -c 'printf "quit\n" | /usr/bin/timeout 5 /usr/bin/nvidia-cuda-mps-control || true'
+Restart=always
+RestartSec=2
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target

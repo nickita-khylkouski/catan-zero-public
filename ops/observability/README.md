@@ -71,8 +71,13 @@ The Catan exporter supplies, per current host/GPU/pipeline/run/config:
   `generator_simulations`, `generator_shards`;
 - `generator_failures`, `generator_truncations`;
 - `generator_progress_age_seconds`;
-- `generator_info` labels with the typed config hash, n_full/p_full, and seed
-  range, plus numeric `generator_seed_start/end`;
+- `generator_info` labels with the typed config hash, seed range, target
+  information regime, and every exact A1 safety-critical recipe field
+  (public observation, information-set search, determinization particle
+  schedule, n_full/n_fast/p_full, symmetry settings, c_scale/c_visit,
+  max_depth, lazy chance, and legacy belief chance);
+- numeric per-lane recipe gauges, `generator_recipe_safe`, target-regime
+  attestation state, and per-host active/recipe-safe lane totals;
 - output filesystem free/total bytes.
 
 Only the newest run per GPU/pipeline slot is exported, preferring an active
@@ -85,15 +90,20 @@ bounded, declared truncation is not the same as a worker crash.
 ## Alerts and rollout checks
 
 Committed rules cover exporter/tunnel loss, stale or exited-incomplete
-generation, worker failures, low output disk, and DCGM loss. Before expanding
-beyond one host:
+generation, worker failures, exact-recipe mismatch, low output disk, DCGM
+loss, and an active-but-idle H100 lane. The GPU-idle rule is joined to an
+active Catan lane and explicitly scoped to `gpumodel="H100"`; B200 R&D/training
+activity cannot trigger it. Before expanding beyond one host:
 
 1. confirm all three targets are `UP`;
 2. compare exporter games/rows/sims/shards against the underlying JSON;
 3. confirm DCGM GPU labels stay device indices (`gpumodel` is the target label);
 4. stop a canary exporter and verify `CatanExporterDown` becomes pending;
 5. use stale and exited-incomplete fixtures and verify both generator alerts;
-6. verify no exporter port listens on a public interface.
+6. deliberately alter one canary recipe field and verify
+   `CatanGeneratorRecipeMismatch` fires;
+7. verify the dashboard reaches exactly 40 active and 40 recipe-safe lanes;
+8. verify no exporter port listens on a public interface.
 
 The dashboard is observability only. It never authorizes harvest, training,
 promotion, stopping, or seed reuse.

@@ -45,6 +45,21 @@ def _runner(
     )
 
 
+def test_scoreboard_gate_cannot_promote_masked_flywheel(tmp_path: Path) -> None:
+    runner = _runner(tmp_path)
+    runner.cfg.gate_style = "scoreboard"
+    result = runner.gate("candidate.pt", "champion.pt", round_idx=0)
+    assert result == {
+        "ok": False,
+        "pass": False,
+        "verdict": "unsafe_gate_style",
+        "reason": (
+            "scoreboard evaluation has no public-information search boundary; "
+            "use gate_style='h2h'"
+        ),
+    }
+
+
 def test_masked_h2h_gate_uses_named_flywheel_policy_and_extends(monkeypatch, tmp_path: Path) -> None:
     runner = _runner(
         tmp_path,
@@ -61,8 +76,11 @@ def test_masked_h2h_gate_uses_named_flywheel_policy_and_extends(monkeypatch, tmp
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(
             json.dumps(
-                {
-                    "public_observation": True,
+                    {
+                        "public_observation": True,
+                        "information_set_search": True,
+                        "determinization_particles": 4,
+                        "determinization_min_simulations": 32,
                     "candidate_value_readout": cmd[
                         cmd.index("--candidate-value-readout") + 1
                     ],
@@ -145,8 +163,11 @@ def test_flywheel_timeout_canary_is_generator_only(monkeypatch, tmp_path: Path) 
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(
             json.dumps(
-                {
-                    "public_observation": True,
+                    {
+                        "public_observation": True,
+                        "information_set_search": True,
+                        "determinization_particles": 4,
+                        "determinization_min_simulations": 32,
                     "candidate_value_readout": cmd[
                         cmd.index("--candidate-value-readout") + 1
                     ],
@@ -221,8 +242,11 @@ def test_value_readout_mismatch_fails_closed(monkeypatch, tmp_path: Path) -> Non
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(
             json.dumps(
-                {
-                    "public_observation": True,
+                    {
+                        "public_observation": True,
+                        "information_set_search": True,
+                        "determinization_particles": 4,
+                        "determinization_min_simulations": 32,
                     # Simulate an old/broken subprocess silently evaluating
                     # both sides through the scalar readout.
                     "candidate_value_readout": "scalar",

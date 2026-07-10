@@ -1,0 +1,90 @@
+{
+  "schema_version": "catan-zero-rnd-leaderboard/v1",
+  "campaign_id": "REPLACE-e2-architecture",
+  "required_information_regime": "public_only",
+  "require_same_training_manifest": true,
+  "frozen_candidate_fields": ["search_id", "search_config_sha256"],
+  "purpose": "Compare incumbent, topology-aware relational Transformer, and no-attention relational GNN under one public-search and paired-seed contract; decoder differences remain explicit arm properties.",
+  "required_arm_ids": [
+    "incumbent-gumbel",
+    "rrt384-gumbel",
+    "resrgcn384-gumbel"
+  ],
+  "budget_contracts": {
+    "equal_work": {
+      "match_metrics": [
+        "logical_leaves",
+        "orientation_rows"
+      ],
+      "absolute_tolerance": 0.0,
+      "relative_tolerance": 0.0
+    },
+    "equal_time": {
+      "match_metrics": [
+        "wall_time_sec"
+      ],
+      "absolute_tolerance": 0.01,
+      "relative_tolerance": 0.05
+    }
+  },
+  "arms": [
+    {
+      "arm_id": "incumbent-gumbel",
+      "comparison_role": "ranked",
+      "architecture_id": "entity-graph-net-35m",
+      "expected_parameter_count": 35041353,
+      "search_id": "gumbel-reference",
+      "source_status": "implemented",
+      "measurement_adapter_status": "provisional_fake_e2e",
+      "runnable": false,
+      "evidence": "The paired-bundle path exists but requires a native end-to-end public-information attestation before this arm is runnable."
+    },
+    {
+      "arm_id": "rrt384-gumbel",
+      "comparison_role": "ranked",
+      "architecture_id": "entity-graph-rrt384-l9",
+      "expected_parameter_count": 20070932,
+      "search_id": "gumbel-reference",
+      "source_status": "implemented",
+      "measurement_adapter_status": "provisional_fake_e2e",
+      "runnable": false,
+      "evidence": "RRT source/count tests and paired-bundle plumbing exist; a native searched-game bundle attestation remains required."
+    },
+    {
+      "arm_id": "resrgcn384-gumbel",
+      "comparison_role": "ranked",
+      "architecture_id": "entity-graph-resrgcn384-l14",
+      "expected_parameter_count": 20936010,
+      "search_id": "gumbel-reference",
+      "source_status": "implemented",
+      "measurement_adapter_status": "provisional_fake_e2e",
+      "runnable": false,
+      "evidence": "ResRGCN source/count tests and paired-bundle plumbing exist; a native searched-game bundle attestation remains required."
+    }
+  ],
+  "architecture_hypotheses": [
+    {
+      "architecture_id": "entity-graph-net-35m",
+      "parameter_count": 35041353,
+      "parameter_count_status": "in_repo_instantiated",
+      "depth_screen": [6]
+    },
+    {
+      "architecture_id": "entity-graph-rrt384-l9",
+      "parameter_count": 20070932,
+      "parameter_count_status": "in_repo_instantiated_scalar_value_contract",
+      "resolved_config": "state_trunk=rrt,width=384,layers=9,heads=6,ff=1024,pattern=RRTRRTRRT,cross=1,relations=16,distance_buckets=13,scalar_value",
+      "train_bc_argv": ["--arch", "entity_graph", "--hidden-size", "384", "--graph-layers", "9", "--attention-heads", "6", "--entity-state-trunk", "rrt", "--relational-block-pattern", "RRTRRTRRT", "--relational-ff-size", "1024", "--relational-action-cross-layers", "1", "--value-categorical-bins", "0"],
+      "depth_screen": [6, 9, 12]
+    },
+    {
+      "architecture_id": "entity-graph-resrgcn384-l14",
+      "parameter_count": 20936010,
+      "parameter_count_status": "in_repo_instantiated_scalar_value_contract",
+      "resolved_config": "state_trunk=resrgcn,width=384,layers=14,bases=4,ff=512,cross=0,scalar_value",
+      "train_bc_argv": ["--arch", "entity_graph", "--hidden-size", "384", "--graph-layers", "14", "--attention-heads", "6", "--entity-state-trunk", "resrgcn", "--relational-ff-size", "512", "--relational-bases", "4", "--relational-action-cross-layers", "0", "--value-categorical-bins", "0"],
+      "depth_screen": [10, 14, 18]
+    }
+  ],
+  "parameter_count_note": "Primary E2 counts hold the incumbent scalar value/readout fixed: incumbent 35,041,353; RRT 20,070,932; ResRGCN 20,936,010. The optional 51-bin future contract is also unit-attested at 20,238,792 and 21,103,870, but must be a separate value-objective experiment."
+}

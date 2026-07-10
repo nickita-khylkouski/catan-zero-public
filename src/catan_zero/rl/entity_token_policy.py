@@ -50,6 +50,9 @@ _NON_MODEL_ENTITY_KEYS = frozenset(
         "legal_action_mask",
     }
 )
+_RELATIONAL_TOPOLOGY_KEYS = frozenset(
+    {"hex_vertex_ids", "hex_edge_ids", "edge_vertex_ids", "event_target_ids"}
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -153,6 +156,40 @@ class EntityGraphConfig:
     # plain scalar regressor; the horizon lives here so a checkpoint records the
     # target definition it was trained against.
     aux_vp_horizon: int = 8
+    # --- R&D topology-aware state trunks (default incumbent preserved) ---
+    # ``transformer`` is the historical dense set Transformer. ``rrt`` uses
+    # directed Catan-incidence attention with an R/R/T-style local/global block
+    # pattern. ``resrgcn`` is the no-attention residual relational GNN control.
+    # All relational fields are inert under ``transformer`` so old checkpoint
+    # configs and the default state_dict remain exactly compatible.
+    state_trunk: str = "transformer"
+    # Empty selects the production-shaped default: RRT repeats ``RRT`` to the
+    # requested state_layers; ResRGCN uses one graph block per layer. An explicit
+    # pattern is accepted only by RRT and must contain exactly state_layers R/Ts.
+    relational_block_pattern: str = ""
+    # 0 selects 1024 for width-384 RRT and 512 for width-384 ResRGCN, scaling
+    # proportionally for width sweeps. Keeping it explicit in the checkpoint
+    # makes parameter/compute matching reproducible.
+    relational_ff_size: int = 0
+    relational_bases: int = 4
+    # Relational models bind every legal move to its board target and include a
+    # from-scratch action-to-board decoder. This count is separate from the
+    # warm-start-only action_cross_attention_layers incumbent experiment.
+    relational_action_cross_layers: int = 1
+    # --- E3 fixed-K shared latent deliberation (default OFF) ---
+    # A small learned plan set repeatedly cross-attends to the encoded board
+    # through one shared block. Increasing K changes compute, not parameter
+    # count. This is fixed-depth latent computation; the emitted halt logit is
+    # diagnostic and does not claim adaptive execution.
+    latent_deliberation_steps: int = 0
+    latent_deliberation_slots: int = 8
+    # --- E4 sparse conditional FFN capacity (default OFF) ---
+    # Replaces global RRT block FFNs with one shared expert plus N routed
+    # experts. Only top-k selected experts execute for each live token.
+    moe_routed_experts: int = 0
+    moe_top_k: int = 2
+    # 0 selects width 384 at model width 384 and scales proportionally.
+    moe_expert_ff_size: int = 0
 
 
 class EntityGraphNet:
@@ -205,7 +242,14 @@ class EntityGraphNet:
             the original function bit-for-bit until the new weights train.
             """
 
-            def __init__(self, width: int, heads: int, dropout: float) -> None:
+            def __init__(
+                self,
+                width: int,
+                heads: int,
+                dropout: float,
+                *,
+                identity_init: bool = True,
+            ) -> None:
                 super().__init__()
                 self.norm_q = nn.LayerNorm(width)
                 self.norm_kv = nn.LayerNorm(width)
@@ -223,11 +267,12 @@ class EntityGraphNet:
                     nn.Linear(4 * width, width),
                     nn.Dropout(float(dropout)),
                 )
-                nn.init.zeros_(self.attn.out_proj.weight)
-                if self.attn.out_proj.bias is not None:
-                    nn.init.zeros_(self.attn.out_proj.bias)
-                nn.init.zeros_(self.ff[3].weight)
-                nn.init.zeros_(self.ff[3].bias)
+                if identity_init:
+                    nn.init.zeros_(self.attn.out_proj.weight)
+                    if self.attn.out_proj.bias is not None:
+                        nn.init.zeros_(self.attn.out_proj.bias)
+                    nn.init.zeros_(self.ff[3].weight)
+                    nn.init.zeros_(self.ff[3].bias)
 
             def forward(self, query, memory, key_padding_mask=None):
                 attn_out, _ = self.attn(
@@ -247,6 +292,42 @@ class EntityGraphNet:
                 self.config = cfg
                 h = int(cfg.hidden_size)
                 dropout = float(cfg.dropout)
+                self.state_trunk = str(
+                    getattr(cfg, "state_trunk", "transformer") or "transformer"
+                ).strip().lower()
+                if self.state_trunk not in {"transformer", "rrt", "resrgcn"}:
+                    raise ValueError(
+                        "state_trunk must be one of transformer/rrt/resrgcn, got "
+                        f"{self.state_trunk!r}"
+                    )
+                self.uses_relational_topology = self.state_trunk != "transformer"
+                self.latent_deliberation_steps = int(
+                    getattr(cfg, "latent_deliberation_steps", 0) or 0
+                )
+                self.latent_deliberation_slots = int(
+                    getattr(cfg, "latent_deliberation_slots", 8) or 0
+                )
+                if self.latent_deliberation_steps < 0:
+                    raise ValueError("latent_deliberation_steps must be >= 0")
+                if self.latent_deliberation_steps > 0:
+                    if self.state_trunk != "rrt":
+                        raise ValueError(
+                            "latent deliberation currently requires state_trunk='rrt'"
+                        )
+                    if self.latent_deliberation_slots < 1:
+                        raise ValueError("latent_deliberation_slots must be >= 1")
+                self.moe_routed_experts = int(
+                    getattr(cfg, "moe_routed_experts", 0) or 0
+                )
+                self.moe_top_k = int(getattr(cfg, "moe_top_k", 2) or 0)
+                self.moe_enabled = self.moe_routed_experts > 0
+                if self.moe_enabled:
+                    if self.state_trunk != "rrt":
+                        raise ValueError("sparse MoE currently requires state_trunk='rrt'")
+                    if not 1 <= self.moe_top_k <= self.moe_routed_experts:
+                        raise ValueError(
+                            "moe_top_k must be in [1, moe_routed_experts]"
+                        )
                 self.hex_encoder = _token_encoder(HEX_FEATURE_SIZE, h, dropout)
                 self.vertex_encoder = _token_encoder(VERTEX_FEATURE_SIZE, h, dropout)
                 self.edge_encoder = _token_encoder(EDGE_FEATURE_SIZE, h, dropout)
@@ -255,11 +336,112 @@ class EntityGraphNet:
                 self.event_encoder = _token_encoder(EVENT_FEATURE_SIZE, h, dropout)
                 self.type_embedding = nn.Parameter(torch.zeros(7, h))
                 self.cls_token = nn.Parameter(torch.zeros(1, 1, h))
-                self.blocks = nn.ModuleList(
-                    _Block(h, cfg.attention_heads, dropout)
-                    for _ in range(max(1, int(cfg.state_layers)))
-                )
+                if self.state_trunk == "transformer":
+                    self.blocks = nn.ModuleList(
+                        _Block(h, cfg.attention_heads, dropout)
+                        for _ in range(max(1, int(cfg.state_layers)))
+                    )
+                    self.relational_block_pattern = ""
+                else:
+                    from catan_zero.rl.relational_trunks import (
+                        RelationalTransformerBlock,
+                        SparseMoERelationalTransformerBlock,
+                        VectorizedRelGraphBlock,
+                    )
+
+                    layer_count = max(1, int(cfg.state_layers))
+                    configured_ff = int(getattr(cfg, "relational_ff_size", 0) or 0)
+                    if configured_ff > 0:
+                        relational_ff = configured_ff
+                    elif self.state_trunk == "rrt":
+                        relational_ff = max(64, int(round(1024 * h / 384)))
+                    else:
+                        relational_ff = max(64, int(round(512 * h / 384)))
+                    if self.state_trunk == "rrt":
+                        raw_pattern = str(
+                            getattr(cfg, "relational_block_pattern", "") or ""
+                        ).upper()
+                        if not raw_pattern:
+                            raw_pattern = ("RRT" * ((layer_count + 2) // 3))[
+                                :layer_count
+                            ]
+                        if len(raw_pattern) != layer_count or set(raw_pattern) - {"R", "T"}:
+                            raise ValueError(
+                                "relational_block_pattern must contain exactly "
+                                f"state_layers R/T entries: pattern={raw_pattern!r} "
+                                f"state_layers={layer_count}"
+                            )
+                        if self.moe_enabled and "T" not in raw_pattern:
+                            raise ValueError(
+                                "sparse MoE requires at least one global T block"
+                            )
+                        self.relational_block_pattern = raw_pattern
+                        configured_expert_ff = int(
+                            getattr(cfg, "moe_expert_ff_size", 0) or 0
+                        )
+                        if configured_expert_ff < 0:
+                            raise ValueError("moe_expert_ff_size must be >= 0")
+                        expert_ff = configured_expert_ff or max(
+                            64, int(round(384 * h / 384))
+                        )
+                        blocks = []
+                        for kind in raw_pattern:
+                            if self.moe_enabled and kind == "T":
+                                blocks.append(
+                                    SparseMoERelationalTransformerBlock(
+                                        h,
+                                        cfg.attention_heads,
+                                        expert_ff,
+                                        self.moe_routed_experts,
+                                        self.moe_top_k,
+                                        dropout,
+                                        global_block=True,
+                                    )
+                                )
+                            else:
+                                blocks.append(
+                                    RelationalTransformerBlock(
+                                        h,
+                                        cfg.attention_heads,
+                                        relational_ff,
+                                        dropout,
+                                        global_block=kind == "T",
+                                    )
+                                )
+                        self.blocks = nn.ModuleList(blocks)
+                    else:
+                        if str(getattr(cfg, "relational_block_pattern", "") or ""):
+                            raise ValueError(
+                                "relational_block_pattern is only valid for state_trunk='rrt'"
+                            )
+                        bases = int(getattr(cfg, "relational_bases", 4))
+                        if bases < 1:
+                            raise ValueError("relational_bases must be >= 1")
+                        self.relational_block_pattern = "G" * layer_count
+                        self.blocks = nn.ModuleList(
+                            VectorizedRelGraphBlock(
+                                h,
+                                relational_ff,
+                                dropout,
+                                bases=bases,
+                            )
+                            for _ in range(layer_count)
+                        )
                 self.state_norm = nn.LayerNorm(h)
+                if self.latent_deliberation_steps > 0:
+                    self.deliberation_slots = nn.Parameter(
+                        torch.empty(1, self.latent_deliberation_slots, h)
+                    )
+                    self.deliberation_block = _CrossBlock(
+                        h,
+                        cfg.attention_heads,
+                        dropout,
+                        identity_init=False,
+                    )
+                    self.deliberation_fusion_norm = nn.LayerNorm(2 * h)
+                    self.deliberation_fusion = nn.Linear(2 * h, h)
+                    self.deliberation_halt_head = nn.Linear(h, 1)
+                    nn.init.normal_(self.deliberation_slots, std=0.02)
                 action_in = int(cfg.legal_action_feature_size) + int(
                     cfg.context_action_feature_size
                 )
@@ -348,12 +530,16 @@ class EntityGraphNet:
                 # --- f69 action-attention upgrade (all gated, default OFF) ---
                 # Read via getattr so configs pickled before these slots
                 # existed still construct (they resolve to the OFF defaults).
-                self.action_target_gather = bool(
+                self.action_target_gather = self.uses_relational_topology or bool(
                     getattr(cfg, "action_target_gather", False)
                 )
-                self.action_cross_attention_layers = int(
-                    getattr(cfg, "action_cross_attention_layers", 0)
+                self.action_cross_attention_layers = (
+                    int(getattr(cfg, "relational_action_cross_layers", 1))
+                    if self.uses_relational_topology
+                    else int(getattr(cfg, "action_cross_attention_layers", 0))
                 )
+                if self.action_cross_attention_layers < 0:
+                    raise ValueError("action cross-attention layer count must be >= 0")
                 self.value_attention_pool = bool(
                     getattr(cfg, "value_attention_pool", False)
                 )
@@ -367,12 +553,18 @@ class EntityGraphNet:
                         nn.LayerNorm(h),
                         nn.Linear(h, h),
                     )
-                    nn.init.zeros_(self.target_gather_proj[1].weight)
-                    nn.init.zeros_(self.target_gather_proj[1].bias)
+                    if not self.uses_relational_topology:
+                        nn.init.zeros_(self.target_gather_proj[1].weight)
+                        nn.init.zeros_(self.target_gather_proj[1].bias)
 
                 if self.action_cross_attention_layers > 0:
                     self.action_cross_blocks = nn.ModuleList(
-                        _CrossBlock(h, cfg.attention_heads, dropout)
+                        _CrossBlock(
+                            h,
+                            cfg.attention_heads,
+                            dropout,
+                            identity_init=not self.uses_relational_topology,
+                        )
                         for _ in range(self.action_cross_attention_layers)
                     )
 
@@ -401,7 +593,9 @@ class EntityGraphNet:
                     nn.init.zeros_(self.value_pool_head[4].bias)
 
                 # --- CAT-97 GATEAU edge/node-feature policy head (default OFF) ---
-                self.edge_policy_head = bool(getattr(cfg, "edge_policy_head", False))
+                self.edge_policy_head = self.uses_relational_topology or bool(
+                    getattr(cfg, "edge_policy_head", False)
+                )
                 if self.edge_policy_head:
                     # MLP(pooled target entity token) -> per-action scalar logit,
                     # ADDED to the CLIP logits. Zero-init final Linear so the
@@ -413,8 +607,9 @@ class EntityGraphNet:
                         nn.Dropout(dropout),
                         nn.Linear(h, 1),
                     )
-                    nn.init.zeros_(self.edge_policy_mlp[4].weight)
-                    nn.init.zeros_(self.edge_policy_mlp[4].bias)
+                    if not self.uses_relational_topology:
+                        nn.init.zeros_(self.edge_policy_mlp[4].weight)
+                        nn.init.zeros_(self.edge_policy_mlp[4].bias)
 
                 # --- CAT-100 auxiliary Catan-subgoal heads (default OFF) ---
                 # Read the pooled state (CLS) token only; emit new outputs that
@@ -477,6 +672,26 @@ class EntityGraphNet:
                     return_q=return_q,
                 )
 
+            def parameter_accounting(self) -> dict[str, int]:
+                """Exact instantiated and nominal per-token active parameters."""
+                total = sum(
+                    parameter.numel()
+                    for parameter in self.parameters()
+                    if parameter.requires_grad
+                )
+                inactive = 0
+                if self.moe_enabled:
+                    for block in self.blocks:
+                        if not bool(getattr(block, "is_sparse_moe", False)):
+                            continue
+                        inactive += (
+                            block.moe.routed_expert_count - block.moe.top_k
+                        ) * block.moe.one_routed_expert_parameters
+                return {
+                    "instantiated_trainable": int(total),
+                    "nominal_active_per_token": int(total - inactive),
+                }
+
             def encode_state(
                 self,
                 batch: dict[str, Any],
@@ -509,9 +724,62 @@ class EntityGraphNet:
                     batch,
                     event_token_limit=event_token_limit,
                 )
-                for block in self.blocks:
-                    tokens = block(tokens, key_padding_mask=padding_mask)
+                if self.uses_relational_topology:
+                    from catan_zero.rl.relational_trunks import build_relation_ids
+
+                    relation_batch = batch
+                    if event_token_limit is not None and "event_target_ids" in batch:
+                        relation_batch = dict(batch)
+                        relation_batch["event_target_ids"] = batch["event_target_ids"][
+                            :, :event_token_limit
+                        ]
+                    relation_ids = build_relation_ids(
+                        relation_batch,
+                        sequence_length=int(tokens.shape[1]),
+                    )
+                    moe_balance = []
+                    moe_load = []
+                    moe_importance = []
+                    for block in self.blocks:
+                        block_output = block(
+                            tokens,
+                            relation_ids,
+                            key_padding_mask=padding_mask,
+                        )
+                        if bool(getattr(block, "is_sparse_moe", False)):
+                            tokens, balance, load, importance = block_output
+                            moe_balance.append(balance)
+                            moe_load.append(load)
+                            moe_importance.append(importance)
+                        else:
+                            tokens = block_output
+                else:
+                    for block in self.blocks:
+                        tokens = block(tokens, key_padding_mask=padding_mask)
                 state = self.state_norm(tokens[:, 0])
+                if self.latent_deliberation_steps > 0:
+                    plan = self.deliberation_slots.expand(tokens.shape[0], -1, -1)
+                    for _ in range(self.latent_deliberation_steps):
+                        plan = self.deliberation_block(
+                            plan,
+                            tokens,
+                            key_padding_mask=padding_mask,
+                        )
+                    fused = torch.cat((state, plan.mean(dim=1)), dim=-1)
+                    state = self.deliberation_fusion(
+                        torch.nn.functional.gelu(
+                            self.deliberation_fusion_norm(fused)
+                        )
+                    )
+                if self.moe_enabled:
+                    return (
+                        tokens,
+                        padding_mask,
+                        state,
+                        torch.stack(moe_balance).mean(),
+                        torch.stack(moe_load),
+                        torch.stack(moe_importance),
+                    )
                 return tokens, padding_mask, state
 
             def score_actions(
@@ -522,7 +790,7 @@ class EntityGraphNet:
                 return_q: bool = False,
             ):
                 """Score legal actions and emit value heads from encoded state."""
-                tokens, padding_mask, state = encoded_state
+                tokens, padding_mask, state = encoded_state[:3]
                 action_features = torch.cat(
                     (
                         batch["legal_action_tokens"].float(),
@@ -567,6 +835,14 @@ class EntityGraphNet:
                     "value": value,
                     "final_vp": self.final_vp_head(state).squeeze(-1),
                 }
+                if self.latent_deliberation_steps > 0:
+                    outputs["deliberation_halt_logit"] = (
+                        self.deliberation_halt_head(state).squeeze(-1)
+                    )
+                if self.moe_enabled:
+                    outputs["moe_balance_metric"] = encoded_state[3]
+                    outputs["moe_routing_load"] = encoded_state[4]
+                    outputs["moe_routing_importance"] = encoded_state[5]
                 if self.value_uncertainty_head is not None:
                     # Stop-gradient (CAT-61): the uncertainty head reads a
                     # DETACHED copy of the trunk state, so its regression loss
@@ -903,6 +1179,16 @@ class EntityGraphPolicy:
         edge_policy_head: bool = False,
         aux_subgoal_heads: bool = False,
         aux_vp_horizon: int = 8,
+        state_trunk: str = "transformer",
+        relational_block_pattern: str = "",
+        relational_ff_size: int = 0,
+        relational_bases: int = 4,
+        relational_action_cross_layers: int = 1,
+        latent_deliberation_steps: int = 0,
+        latent_deliberation_slots: int = 8,
+        moe_routed_experts: int = 0,
+        moe_top_k: int = 2,
+        moe_expert_ff_size: int = 0,
     ) -> EntityGraphPolicy:
         env = ColonistMultiAgentEnv(env_config or ColonistMultiAgentConfig())
         try:
@@ -921,6 +1207,16 @@ class EntityGraphPolicy:
                 edge_policy_head=bool(edge_policy_head),
                 aux_subgoal_heads=bool(aux_subgoal_heads),
                 aux_vp_horizon=int(aux_vp_horizon),
+                state_trunk=str(state_trunk),
+                relational_block_pattern=str(relational_block_pattern),
+                relational_ff_size=int(relational_ff_size),
+                relational_bases=int(relational_bases),
+                relational_action_cross_layers=int(relational_action_cross_layers),
+                latent_deliberation_steps=int(latent_deliberation_steps),
+                latent_deliberation_slots=int(latent_deliberation_slots),
+                moe_routed_experts=int(moe_routed_experts),
+                moe_top_k=int(moe_top_k),
+                moe_expert_ff_size=int(moe_expert_ff_size),
             )
             return cls(config, static, seed=seed, device=device)
         finally:
@@ -949,13 +1245,22 @@ class EntityGraphPolicy:
         # inference window on CUDA; base checkpoints also skip action target
         # ids when neither target-aware policy head is enabled.
         needs_action_targets = bool(
-            getattr(self.config, "action_target_gather", False)
+            str(getattr(self.config, "state_trunk", "transformer"))
+            != "transformer"
+            or getattr(self.config, "action_target_gather", False)
             or getattr(self.config, "edge_policy_head", False)
+        )
+        needs_topology = (
+            str(getattr(self.config, "state_trunk", "transformer"))
+            != "transformer"
         )
         batch = {
             key: torch.as_tensor(value, device=self.device)
             for key, value in entity_batch.items()
-            if key not in _NON_MODEL_ENTITY_KEYS
+            if (
+                key not in _NON_MODEL_ENTITY_KEYS
+                or (needs_topology and key in _RELATIONAL_TOPOLOGY_KEYS)
+            )
             and (key != "legal_action_target_ids" or needs_action_targets)
         }
         batch["legal_action_context"] = torch.as_tensor(
@@ -1453,3 +1758,23 @@ def _assert_entity_batch_shapes(
         value = np.asarray(entity_batch[key])
         if value.shape != (batch_size, int(width)):
             raise ValueError(f"{key} shape {value.shape} != {(batch_size, int(width))}")
+    if str(getattr(config, "state_trunk", "transformer")) != "transformer":
+        topology_shapes = {
+            "hex_vertex_ids": (batch_size, 19, 6),
+            "hex_edge_ids": (batch_size, 19, 6),
+            "edge_vertex_ids": (batch_size, 72, 2),
+            "event_target_ids": (
+                batch_size,
+                int(np.asarray(entity_batch["event_tokens"]).shape[1]),
+                4,
+            ),
+            "legal_action_target_ids": (batch_size, legal_width, 4),
+        }
+        for key, expected_shape in topology_shapes.items():
+            if key not in entity_batch:
+                raise ValueError(
+                    f"relational state trunk requires entity batch field {key}"
+                )
+            value = np.asarray(entity_batch[key])
+            if value.shape != expected_shape:
+                raise ValueError(f"{key} shape {value.shape} != {expected_shape}")

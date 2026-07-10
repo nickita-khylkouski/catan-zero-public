@@ -1,0 +1,36 @@
+{
+  "schema_version": "catan-zero-rnd-experiment-catalog/v1",
+  "experiments": [
+    {
+      "experiment_id": "E1",
+      "name": "search_operator",
+      "arms": ["gumbel_legacy", "gumbel_exact_budget", "puct", "regularized_policy_mcts", "raw_policy_control"],
+      "status": "implemented_not_screen_ready"
+    },
+    {
+      "experiment_id": "E2",
+      "name": "representation",
+      "arms": ["incumbent_35m", "rrt384", "resrgcn384"],
+      "status": "implemented_not_screen_ready"
+    },
+    {
+      "experiment_id": "E3",
+      "name": "latent_deliberation",
+      "arms": ["k1", "k2", "k4", "k8", "extra_search_control", "untied_depth_control"],
+      "status": "source_implemented_measurement_pending"
+    },
+    {
+      "experiment_id": "E4",
+      "name": "conditional_capacity",
+      "arms": ["dense_matched_active", "sparse_moe", "dense_matched_total"],
+      "status": "source_implemented_measurement_pending"
+    },
+    {
+      "experiment_id": "E5",
+      "name": "self_improvement_rule",
+      "arms": ["search_distillation", "repaired_direct_rl", "distill_then_direct_rl"],
+      "status": "prototype_implemented_measurement_pending"
+    }
+  ],
+  "warning": "E1/E2 source and fake-engine bundle paths exist but remain non-runnable until native public-information bundle attestations pass. Catalog membership is never a strength result."
+}

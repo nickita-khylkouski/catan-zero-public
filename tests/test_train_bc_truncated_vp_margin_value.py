@@ -149,3 +149,31 @@ def test_truncated_vp_margin_skips_rows_with_no_seat_field():
     assert has_outcome.tolist() == [True, False, False, True]
     assert value_has_outcome.tolist() == [True, False, False, True]
     assert confidence.tolist() == pytest.approx([1.0, 0.0, 0.0, 1.0])
+
+
+def test_public_regime_truncated_margin_never_uses_opponent_hidden_actual_vp():
+    data = _base_data(
+        final_actual_vps=np.asarray(
+            [[0, 10, 0, 0], [0, 9, 0, 0], [9, 0, 0, 0], [0, 10, 0, 0]],
+            dtype=np.int16,
+        ),
+        final_public_vps=np.asarray(
+            [[0, 10, 0, 0], [4, 5, 0, 0], [5, 4, 0, 0], [0, 10, 0, 0]],
+            dtype=np.int16,
+        ),
+    )
+
+    _, _, _, _, value_outcome, value_has_outcome, _ = _value_targets(
+        data,
+        np.arange(4),
+        torch.device("cpu"),
+        vps_to_win=10,
+        truncated_vp_margin_value_weight=0.25,
+        public_information_only=True,
+    )
+
+    assert value_has_outcome.tolist() == [True, True, True, True]
+    # Public RED margin is (5-4)/10 and public BLUE margin is (5-4)/10.
+    # Hidden actual VP would have produced 0.9 for each row instead.
+    assert float(value_outcome[1]) == pytest.approx(0.1)
+    assert float(value_outcome[2]) == pytest.approx(0.1)

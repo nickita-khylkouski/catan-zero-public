@@ -62,6 +62,9 @@ from catan_zero.rl.entity_token_features import (  # noqa: E402
 # disk -- one corpus serves both masked and unmasked training regimes.
 _MASK_HIDDEN_INFO_PLAYER_TOKENS = False
 
+TARGET_INFORMATION_REGIME_PUBLIC = "public_conservation_pimc_v1"
+TARGET_INFORMATION_REGIME_UNKNOWN = "unknown"
+
 MEMMAP_PAYLOAD_INVENTORY_SCHEMA = "memmap-payload-inventory-v1"
 A1_REQUIRED_LEARNER_CODE_SUFFIXES = {
     "configs/guards/train_bc.json",
@@ -328,6 +331,77 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.05,
         help="Dropout probability for --arch xdim_graph/entity_graph blocks.",
+    )
+    parser.add_argument(
+        "--entity-state-trunk",
+        choices=("transformer", "rrt", "resrgcn"),
+        default="transformer",
+        help=(
+            "EntityGraph state trunk. transformer preserves the incumbent; rrt "
+            "and resrgcn are explicit topology-aware R&D arms."
+        ),
+    )
+    parser.add_argument(
+        "--relational-block-pattern",
+        default="",
+        help="Explicit R/T pattern for --entity-state-trunk rrt (for example RRTRRTRRT).",
+    )
+    parser.add_argument(
+        "--relational-ff-size",
+        type=int,
+        default=0,
+        help="Relational trunk FF width; 0 selects the width-scaled architecture default.",
+    )
+    parser.add_argument(
+        "--relational-bases",
+        type=int,
+        default=4,
+        help="Number of basis transforms in each ResRGCN block.",
+    )
+    parser.add_argument(
+        "--relational-action-cross-layers",
+        type=int,
+        default=1,
+        help="From-scratch action-to-board cross-attention blocks for relational arms.",
+    )
+    parser.add_argument(
+        "--latent-deliberation-steps",
+        type=int,
+        default=0,
+        help="Fixed shared-weight latent reasoning steps; 0 disables E3.",
+    )
+    parser.add_argument(
+        "--latent-deliberation-slots",
+        type=int,
+        default=8,
+        help="Learned plan-token count for fixed-K latent deliberation.",
+    )
+    parser.add_argument(
+        "--moe-routed-experts",
+        type=int,
+        default=0,
+        help="Routed experts in global RRT FFNs; 0 disables sparse MoE.",
+    )
+    parser.add_argument(
+        "--moe-top-k",
+        type=int,
+        default=2,
+        help="Experts dispatched per live token when sparse MoE is enabled.",
+    )
+    parser.add_argument(
+        "--moe-expert-ff-size",
+        type=int,
+        default=0,
+        help="SwiGLU inner width per shared/routed expert; 0 selects the scaled default.",
+    )
+    parser.add_argument(
+        "--moe-balance-loss-weight",
+        type=float,
+        default=0.01,
+        help=(
+            "Weight on the sparse-router load-balance objective. Inert when "
+            "--moe-routed-experts=0."
+        ),
     )
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument(
@@ -2413,6 +2487,23 @@ def main(argv: Sequence[str] | None = None) -> None:
         data = load_teacher_data_memmap(Path(args.data))
     else:
         data = load_teacher_data(Path(args.data), ddp=ddp, shard_data=bool(args.ddp_shard_data), mask_hidden_info=bool(getattr(args, "mask_hidden_info", False)))
+    target_information_admission = _validate_target_information_admission(
+        data,
+        mask_hidden_info=bool(args.mask_hidden_info),
+        soft_target_weight=float(args.soft_target_weight),
+        policy_loss_weight=float(args.policy_loss_weight),
+        q_loss_weight=float(args.q_loss_weight),
+        value_target_lambda=float(args.value_target_lambda),
+        policy_kl_anchor_weight=float(args.policy_kl_anchor_weight),
+        policy_surprise_weight=float(args.policy_surprise_weight),
+    )
+    _rank0_print(
+        json.dumps(
+            {"progress": "target_information_admission", **target_information_admission},
+            sort_keys=True,
+        ),
+        ddp,
+    )
     a1_training_binding: dict[str, object] | None = None
     if validation_seed_contract is not None:
         _validate_a1_validation_manifest_corpus_binding(
@@ -2567,6 +2658,18 @@ def main(argv: Sequence[str] | None = None) -> None:
                     value_categorical_bins=int(args.value_categorical_bins),
                     edge_policy_head=bool(getattr(args, "edge_policy_head", False)),
                     aux_subgoal_heads=bool(getattr(args, "aux_subgoal_heads", False)),
+                    state_trunk=str(args.entity_state_trunk),
+                    relational_block_pattern=str(args.relational_block_pattern),
+                    relational_ff_size=int(args.relational_ff_size),
+                    relational_bases=int(args.relational_bases),
+                    relational_action_cross_layers=int(
+                        args.relational_action_cross_layers
+                    ),
+                    latent_deliberation_steps=int(args.latent_deliberation_steps),
+                    latent_deliberation_slots=int(args.latent_deliberation_slots),
+                    moe_routed_experts=int(args.moe_routed_experts),
+                    moe_top_k=int(args.moe_top_k),
+                    moe_expert_ff_size=int(args.moe_expert_ff_size),
                 )
             elif args.arch == "xdim_graph":
                 policy = XDimGraphPolicy.create(
@@ -2991,6 +3094,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             "policy_kl_anchor_loss": 0.0,
             "value_uncertainty_loss": 0.0,
             "aux_subgoal_loss": 0.0,
+            "moe_balance_loss": 0.0,
             "value_categorical_loss": 0.0,
             "value_categorical_clean_loss": 0.0,
             "value_categorical_truncated_loss": 0.0,
@@ -3008,6 +3112,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             "policy_kl_anchor_loss": 0.0,
             "value_uncertainty_loss": 0.0,
             "aux_subgoal_loss": 0.0,
+            "moe_balance_loss": 0.0,
             "value_categorical_loss": 0.0,
             "value_categorical_clean_loss": 0.0,
             "value_categorical_truncated_loss": 0.0,
@@ -3051,6 +3156,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "value_categorical_loss_weight": resolved_categorical_value_weight,
                 "value_hlgauss_sigma_ratio": float(args.value_hlgauss_sigma_ratio),
                 "value_target_lambda": float(args.value_target_lambda),
+                "moe_balance_loss_weight": float(args.moe_balance_loss_weight),
             }
         batch_iterator = _iterate_training_batches(
             data,
@@ -3161,6 +3267,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "policy_kl_anchor_loss",
                 "value_uncertainty_loss",
                 "aux_subgoal_loss",
+                "moe_balance_loss",
                 "value_categorical_loss",
                 "value_categorical_clean_loss",
                 "value_categorical_truncated_loss",
@@ -3260,6 +3367,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "policy_kl_anchor_loss",
                 "value_uncertainty_loss",
                 "aux_subgoal_loss",
+                "moe_balance_loss",
                 "value_categorical_loss",
             )
         }
@@ -3288,6 +3396,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             * auxiliary_loss_epochs["value_uncertainty_loss"]
             + float(args.aux_subgoal_loss_weight)
             * auxiliary_loss_epochs["aux_subgoal_loss"]
+            + float(args.moe_balance_loss_weight)
+            * auxiliary_loss_epochs["moe_balance_loss"]
             + resolved_categorical_value_weight
             * auxiliary_loss_epochs["value_categorical_loss"]
         )
@@ -3364,6 +3474,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             policy_kl_anchor_weight=float(args.policy_kl_anchor_weight),
             value_uncertainty_loss_weight=float(args.value_uncertainty_loss_weight),
             aux_subgoal_loss_weight=float(args.aux_subgoal_loss_weight),
+            moe_balance_loss_weight=float(args.moe_balance_loss_weight),
             value_categorical_loss_weight=resolved_categorical_value_weight,
             value_hlgauss_sigma_ratio=float(args.value_hlgauss_sigma_ratio),
             value_target_lambda=float(args.value_target_lambda),
@@ -3603,6 +3714,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         "policy_kl_anchor_weight": args.policy_kl_anchor_weight,
         "value_uncertainty_loss_weight": args.value_uncertainty_loss_weight,
         "aux_subgoal_loss_weight": args.aux_subgoal_loss_weight,
+        "moe_balance_loss_weight": args.moe_balance_loss_weight,
         "value_head_type": args.value_head_type,
         "value_categorical_bins": int(args.value_categorical_bins),
         "value_categorical_loss_weight": args.value_categorical_loss_weight,
@@ -4041,6 +4153,7 @@ def _train_xdim_batch(
     policy_kl_anchor_weight: float = 0.0,
     value_uncertainty_loss_weight: float = 0.0,
     aux_subgoal_loss_weight: float = 0.0,
+    moe_balance_loss_weight: float = 0.0,
     value_categorical_loss_weight: float = 0.0,
     value_hlgauss_sigma_ratio: float = 0.75,
     value_target_lambda: float = 1.0,
@@ -4344,6 +4457,18 @@ def _train_xdim_batch(
             aux_subgoal_loss, aux_subgoal_active_heads = _aux_subgoal_loss(
                 outputs, data, batch, policy.device
             )
+        moe_balance_loss = outputs.get("moe_balance_metric")
+        if moe_balance_loss is None:
+            moe_balance_loss = torch.tensor(
+                0.0, dtype=torch.float32, device=policy.device
+            )
+            if (
+                float(moe_balance_loss_weight) != 0.0
+                and int(getattr(policy.config, "moe_routed_experts", 0)) > 0
+            ):
+                raise ValueError(
+                    "MoE balance loss requested but the model emitted no routing metric"
+                )
         loss = (
             float(policy_loss_weight) * policy_loss
             + float(value_loss_weight) * value_loss
@@ -4353,6 +4478,7 @@ def _train_xdim_batch(
             + float(value_uncertainty_loss_weight) * value_uncertainty_loss
             + float(value_categorical_loss_weight) * value_categorical_loss
             + float(aux_subgoal_loss_weight) * aux_subgoal_loss
+            + float(moe_balance_loss_weight) * moe_balance_loss
         )
     # C1 gradient accumulation. At grad_accum_steps==1 (accum_do_zero_grad and
     # accum_do_step both True) this is byte-identical to the pre-C1 path:
@@ -4432,6 +4558,7 @@ def _train_xdim_batch(
         "policy_kl_anchor_loss": float(kl_anchor_loss.item()),
         "value_uncertainty_loss": float(value_uncertainty_loss.item()),
         "aux_subgoal_loss": float(aux_subgoal_loss.item()),
+        "moe_balance_loss": float(moe_balance_loss.item()),
         "aux_subgoal_active_heads": int(aux_subgoal_active_heads),
         "value_categorical_loss": float(value_categorical_loss.item()),
         "primary_value_loss": float(
@@ -4512,6 +4639,7 @@ def evaluate_bc_batches(
     policy_kl_anchor_weight: float = 0.0,
     value_uncertainty_loss_weight: float = 0.0,
     aux_subgoal_loss_weight: float = 0.0,
+    moe_balance_loss_weight: float = 0.0,
     value_categorical_loss_weight: float = 0.0,
     value_hlgauss_sigma_ratio: float = 0.75,
     value_target_lambda: float = 1.0,
@@ -4532,6 +4660,7 @@ def evaluate_bc_batches(
             "policy_kl_anchor_loss": 0.0,
             "value_uncertainty_loss": 0.0,
             "aux_subgoal_loss": 0.0,
+            "moe_balance_loss": 0.0,
             "value_categorical_loss": 0.0,
             "value_categorical_clean_loss": 0.0,
             "value_categorical_truncated_loss": 0.0,
@@ -4553,6 +4682,7 @@ def evaluate_bc_batches(
             "policy_kl_anchor_loss": 0.0,
             "value_uncertainty_loss": 0.0,
             "aux_subgoal_loss": 0.0,
+            "moe_balance_loss": 0.0,
             "value_categorical_loss": 0.0,
             "value_categorical_clean_loss": 0.0,
             "value_categorical_truncated_loss": 0.0,
@@ -4571,6 +4701,7 @@ def evaluate_bc_batches(
                 "policy_kl_anchor_weight": float(policy_kl_anchor_weight),
                 "value_uncertainty_loss_weight": float(value_uncertainty_loss_weight),
                 "aux_subgoal_loss_weight": float(aux_subgoal_loss_weight),
+                "moe_balance_loss_weight": float(moe_balance_loss_weight),
                 "value_categorical_loss_weight": float(value_categorical_loss_weight),
                 "value_hlgauss_sigma_ratio": float(value_hlgauss_sigma_ratio),
                 "value_target_lambda": float(value_target_lambda),
@@ -4612,6 +4743,7 @@ def evaluate_bc_batches(
                 "policy_kl_anchor_loss",
                 "value_uncertainty_loss",
                 "aux_subgoal_loss",
+                "moe_balance_loss",
                 "value_categorical_loss",
                 "value_categorical_clean_loss",
                 "value_categorical_truncated_loss",
@@ -4690,6 +4822,7 @@ def evaluate_bc_batches(
                 "policy_kl_anchor_loss",
                 "value_uncertainty_loss",
                 "aux_subgoal_loss",
+                "moe_balance_loss",
                 "value_categorical_loss",
             )
         }
@@ -4713,6 +4846,8 @@ def evaluate_bc_batches(
             + float(value_uncertainty_loss_weight)
             * auxiliary_loss_eval["value_uncertainty_loss"]
             + float(aux_subgoal_loss_weight) * auxiliary_loss_eval["aux_subgoal_loss"]
+            + float(moe_balance_loss_weight)
+            * auxiliary_loss_eval["moe_balance_loss"]
             + float(value_categorical_loss_weight)
             * auxiliary_loss_eval["value_categorical_loss"]
         )
@@ -5034,6 +5169,7 @@ def _eval_xdim_batch(
     policy_kl_anchor_weight: float = 0.0,
     value_uncertainty_loss_weight: float = 0.0,
     aux_subgoal_loss_weight: float = 0.0,
+    moe_balance_loss_weight: float = 0.0,
     value_categorical_loss_weight: float = 0.0,
     value_hlgauss_sigma_ratio: float = 0.75,
     value_target_lambda: float = 1.0,
@@ -5301,6 +5437,18 @@ def _eval_xdim_batch(
                 aux_subgoal_loss, aux_subgoal_active_heads = _aux_subgoal_loss(
                     outputs, data, batch, policy.device
                 )
+            moe_balance_loss = outputs.get("moe_balance_metric")
+            if moe_balance_loss is None:
+                moe_balance_loss = torch.tensor(
+                    0.0, dtype=torch.float32, device=policy.device
+                )
+                if (
+                    float(moe_balance_loss_weight) != 0.0
+                    and int(getattr(policy.config, "moe_routed_experts", 0)) > 0
+                ):
+                    raise ValueError(
+                        "MoE balance loss requested but the model emitted no routing metric"
+                    )
             loss = (
                 float(policy_loss_weight) * policy_loss
                 + float(value_loss_weight) * value_loss
@@ -5310,6 +5458,7 @@ def _eval_xdim_batch(
                 + float(value_uncertainty_loss_weight)
                 * value_uncertainty_loss
                 + float(aux_subgoal_loss_weight) * aux_subgoal_loss
+                + float(moe_balance_loss_weight) * moe_balance_loss
                 + float(value_categorical_loss_weight)
                 * value_categorical_loss
             )
@@ -5348,6 +5497,7 @@ def _eval_xdim_batch(
             "policy_kl_anchor_loss": float(kl_anchor_loss.item()),
             "value_uncertainty_loss": float(value_uncertainty_loss.item()),
             "aux_subgoal_loss": float(aux_subgoal_loss.item()),
+            "moe_balance_loss": float(moe_balance_loss.item()),
             "aux_subgoal_active_heads": int(aux_subgoal_active_heads),
             "value_categorical_loss": float(value_categorical_loss.item()),
             "primary_value_loss": float(
@@ -5903,6 +6053,9 @@ def load_teacher_data(
         "target_policy_mask",
         "target_scores_mask",
         "target_score_source",
+        "target_information_regime",
+        "root_value",
+        "root_value_mask",
         "game_seed",
         "teacher_name",
         "player",
@@ -5968,6 +6121,80 @@ def load_teacher_data(
             if key in shard:
                 arrays.setdefault(key, []).append(shard[key])
     return {key: _concat_padded(key, values) for key, values in arrays.items()}
+
+
+def _validate_target_information_admission(
+    data,
+    *,
+    mask_hidden_info: bool,
+    soft_target_weight: float,
+    policy_loss_weight: float,
+    q_loss_weight: float,
+    value_target_lambda: float,
+    policy_kl_anchor_weight: float,
+    policy_surprise_weight: float,
+) -> dict[str, object]:
+    """Fail closed before public-information training consumes search targets.
+
+    Observation masking and search-state safety are independent contracts.  A
+    masked student may use realised outcomes and hard recorded actions from a
+    legacy corpus, but soft MCTS policy/Q/root-value targets are admitted only
+    when every row explicitly carries the public-conservation PIMC regime.
+    Missing provenance is ``unknown`` and is intentionally unsafe.
+    """
+
+    n = int(len(data["action_taken"]))
+    regimes = np.asarray(
+        data.get(
+            "target_information_regime",
+            np.full(n, TARGET_INFORMATION_REGIME_UNKNOWN),
+        )
+    ).astype(str)
+    if regimes.shape != (n,):
+        raise SystemExit(
+            "target_information_regime must be a one-dimensional per-row column: "
+            f"expected {(n,)}, got {regimes.shape}"
+        )
+    counts = {
+        str(value): int(count)
+        for value, count in zip(*np.unique(regimes, return_counts=True))
+    }
+    unsafe_count = int(np.sum(regimes != TARGET_INFORMATION_REGIME_PUBLIC))
+    objectives: list[str] = []
+    if (
+        float(policy_loss_weight) != 0.0
+        and float(soft_target_weight) > 0.0
+        and ("target_policy" in data or "target_scores" in data)
+    ):
+        objectives.append("soft_policy")
+    if float(q_loss_weight) != 0.0 and "target_scores" in data:
+        objectives.append("q_target")
+    if float(value_target_lambda) != 1.0 and "root_value" in data:
+        objectives.append("root_value")
+    if float(policy_kl_anchor_weight) > 0.0 and "prior_policy" in data:
+        objectives.append("policy_kl_anchor")
+    if float(policy_surprise_weight) > 0.0 and (
+        "target_policy" in data or "prior_policy" in data
+    ):
+        objectives.append("policy_surprise_sampling")
+
+    report: dict[str, object] = {
+        "mask_hidden_info": bool(mask_hidden_info),
+        "target_information_regime_counts": counts,
+        "unsafe_or_unknown_rows": unsafe_count,
+        "search_target_objectives": objectives,
+    }
+    if bool(mask_hidden_info) and objectives and unsafe_count:
+        raise SystemExit(
+            "public-observation training refused unsafe/unknown search targets: "
+            f"objectives={objectives}, unsafe_or_unknown_rows={unsafe_count}/{n}, "
+            f"target_information_regimes={counts}. Only "
+            f"{TARGET_INFORMATION_REGIME_PUBLIC!r} may supply soft policy, Q, or "
+            "search-root value targets to --mask-hidden-info training. Re-generate "
+            "with public-conservation PIMC search, or disable every listed search-target "
+            "objective and train only on hard actions/realised outcomes."
+        )
+    return report
 
 
 def _env_config_for_teacher_data(args, data: dict, ddp: dict[str, int | bool]):
@@ -6250,6 +6477,13 @@ def _normalize_teacher_shard(
             path,
             leading=n,
         ).astype(str),
+        "target_information_regime": _field_or_default(
+            shard,
+            "target_information_regime",
+            np.full(n, TARGET_INFORMATION_REGIME_UNKNOWN),
+            path,
+            leading=n,
+        ).astype(str),
         "game_seed": _field_or_default(
             shard,
             "game_seed",
@@ -6363,6 +6597,21 @@ def _normalize_teacher_shard(
             leading=n,
         ).astype(np.float32, copy=False),
     }
+    if "root_value" in shard:
+        result["root_value"] = _field_or_default(
+            shard,
+            "root_value",
+            np.full(n, np.nan, dtype=np.float32),
+            path,
+            leading=n,
+        ).astype(np.float32, copy=False)
+        result["root_value_mask"] = _field_or_default(
+            shard,
+            "root_value_mask",
+            np.isfinite(result["root_value"]),
+            path,
+            leading=n,
+        ).astype(np.bool_, copy=False)
     # CAT-100 columns are optional for legacy/non-self-play corpora, but when
     # present they must survive normalization into the training dict. Numeric
     # heads use NaN as their per-row ignore mask; categorical heads use -1.
@@ -7823,7 +8072,12 @@ def _q_score_rows_ge2(
 
 
 def _truncated_vp_margin_outcome(
-    data: dict, batch: np.ndarray, truncated: np.ndarray, vps_to_win: int
+    data: dict,
+    batch: np.ndarray,
+    truncated: np.ndarray,
+    vps_to_win: int,
+    *,
+    public_information_only: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
     """FIX F3: derive a soft value label for TRUNCATED rows from the VP margin at the
     point of truncation. final_actual_vps/final_public_vps + seat are populated in every
@@ -7844,7 +8098,16 @@ def _truncated_vp_margin_outcome(
         return mask, outcome
     seats = np.asarray(data["seat"][batch], dtype=np.int64)
     rows = np.arange(n)
-    for vp_key in ("final_actual_vps", "final_public_vps"):
+    # Opponents' actual VP includes hidden victory-point development cards.
+    # A public-observation learner must never derive even a low-weight target
+    # from that hidden truth.  Its own public score and every opponent's public
+    # score are sufficient for the truncation proxy.
+    vp_keys = (
+        ("final_public_vps",)
+        if public_information_only
+        else ("final_actual_vps", "final_public_vps")
+    )
+    for vp_key in vp_keys:
         if vp_key not in data:
             continue
         remaining = truncated & ~mask & (seats >= 0)
@@ -7954,6 +8217,7 @@ def _value_targets(
     vps_to_win: int,
     *,
     truncated_vp_margin_value_weight: float = 0.0,
+    public_information_only: bool | None = None,
 ):
     import torch
 
@@ -7978,7 +8242,15 @@ def _value_targets(
     value_has_outcome_np = has_outcome_np.copy()
     outcome_confidence = np.where(has_outcome_np, 1.0, 0.0).astype(np.float32)
     if float(truncated_vp_margin_value_weight) > 0.0 and truncated.any():
-        soft_mask, soft_outcome = _truncated_vp_margin_outcome(data, batch, truncated, vps_to_win)
+        if public_information_only is None:
+            public_information_only = _MASK_HIDDEN_INFO_PLAYER_TOKENS
+        soft_mask, soft_outcome = _truncated_vp_margin_outcome(
+            data,
+            batch,
+            truncated,
+            vps_to_win,
+            public_information_only=bool(public_information_only),
+        )
         fill = soft_mask & ~has_outcome_np
         value_outcome[fill] = soft_outcome[fill]
         value_has_outcome_np = value_has_outcome_np | fill
@@ -8699,6 +8971,15 @@ def _checkpoint_config_mismatches(
         if dropout is not None and abs(float(dropout) - float(args.graph_dropout)) > 1.0e-9:
             mismatches.append(f"graph_dropout checkpoint={dropout} cli={args.graph_dropout}")
     if args.arch == "entity_graph":
+        state_trunk = str(getattr(config, "state_trunk", "transformer"))
+        requested_state_trunk = str(
+            getattr(args, "entity_state_trunk", "transformer")
+        )
+        if state_trunk != requested_state_trunk:
+            mismatches.append(
+                "entity_state_trunk "
+                f"checkpoint={state_trunk} cli={requested_state_trunk}"
+            )
         state_layers = getattr(config, "state_layers", None)
         if state_layers is not None and int(state_layers) != int(args.graph_layers):
             mismatches.append(f"graph_layers checkpoint={state_layers} cli={args.graph_layers}")
@@ -8710,6 +8991,27 @@ def _checkpoint_config_mismatches(
         dropout = getattr(config, "dropout", None)
         if dropout is not None and abs(float(dropout) - float(args.graph_dropout)) > 1.0e-9:
             mismatches.append(f"graph_dropout checkpoint={dropout} cli={args.graph_dropout}")
+        for config_name, cli_name, default in (
+            ("relational_block_pattern", "relational_block_pattern", ""),
+            ("relational_ff_size", "relational_ff_size", 0),
+            ("relational_bases", "relational_bases", 4),
+            (
+                "relational_action_cross_layers",
+                "relational_action_cross_layers",
+                1,
+            ),
+            ("latent_deliberation_steps", "latent_deliberation_steps", 0),
+            ("latent_deliberation_slots", "latent_deliberation_slots", 8),
+            ("moe_routed_experts", "moe_routed_experts", 0),
+            ("moe_top_k", "moe_top_k", 2),
+            ("moe_expert_ff_size", "moe_expert_ff_size", 0),
+        ):
+            checkpoint_value = getattr(config, config_name, default)
+            cli_value = getattr(args, cli_name, default)
+            if checkpoint_value != cli_value:
+                mismatches.append(
+                    f"{cli_name} checkpoint={checkpoint_value} cli={cli_value}"
+                )
         categorical_bins = int(getattr(config, "value_categorical_bins", 0) or 0)
         requested_bins = int(getattr(args, "value_categorical_bins", 0) or 0)
         if categorical_bins != requested_bins:
@@ -8827,6 +9129,11 @@ ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS: dict[str, tuple[str, ...]] = {
         "cls_token",
         "blocks",
         "state_norm",
+        "deliberation_slots",
+        "deliberation_block",
+        "deliberation_fusion_norm",
+        "deliberation_fusion",
+        "deliberation_halt_head",
     ),
     "action_encoder": ("action_encoder",),
     "policy_head": ("action_bias", "logit_scale"),

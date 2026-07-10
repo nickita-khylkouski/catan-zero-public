@@ -8,14 +8,33 @@
           "--c-visit",
           "--n-full",
           "--n-fast",
+          "--p-full",
           "--base-seed",
-          "--games"
+          "--games",
+          "--max-depth",
+          "--symmetry-averaged-eval",
+          "--symmetry-averaged-eval-threshold",
+          "--belief-chance-spectra",
+          "--information-set-search",
+          "--determinization-particles",
+          "--determinization-min-simulations"
         ],
         "expected_values": {
           "--c-scale": 0.03,
+          "--c-visit": 50.0,
+          "--n-full": 128,
+          "--n-fast": 16,
+          "--p-full": 0.25,
+          "--max-depth": 80,
           "--temperature-decisions": 90,
           "--public-observation": true,
-          "--lazy-interior-chance": true
+          "--lazy-interior-chance": true,
+          "--symmetry-averaged-eval": true,
+          "--symmetry-averaged-eval-threshold": 20,
+          "--belief-chance-spectra": false,
+          "--information-set-search": true,
+          "--determinization-particles": 4,
+          "--determinization-min-simulations": 32
         }
       }
     },

@@ -16,7 +16,10 @@ from catan_zero.rl.gumbel_self_play import (
     COLORS,
     GumbelSelfPlayConfig,
     MixRuntime,
+    TARGET_INFORMATION_REGIME_AUTHORITATIVE,
+    TARGET_INFORMATION_REGIME_PUBLIC,
     _apply_selected_action,
+    _target_information_regime_for_search,
     action_size_for_evaluator,
     play_one_game,
     run_worker_games,
@@ -306,7 +309,9 @@ def test_play_one_game_materializes_aux_targets_from_full_rust_trajectory(monkey
         game.step += 1
         return game
 
-    monkeypatch.setattr(gsp, "_require_rust_module", lambda: FakeModule)
+    monkeypatch.setattr(
+        gsp._gumbel_chance_mcts, "_require_rust_module", lambda: FakeModule
+    )
     monkeypatch.setattr(gsp, "_build_decision_row", fake_build)
     monkeypatch.setattr(gsp, "_apply_selected_action", fake_apply)
 
@@ -585,8 +590,50 @@ def test_run_worker_games_writes_a_real_manifest_json(tmp_path):
     assert manifest["games_completed"] == summary["games_completed"]
     assert manifest["rows"] == summary["rows"]
     assert manifest["shards"] == summary["shards"]
+    assert (
+        manifest["target_information_regime"]
+        == TARGET_INFORMATION_REGIME_AUTHORITATIVE
+    )
     for shard_path in manifest["shards"]:
         assert Path(shard_path).exists()
+        with np.load(shard_path, allow_pickle=False) as shard:
+            assert "target_information_regime" in shard.files
+            assert set(shard["target_information_regime"].astype(str)) == {
+                TARGET_INFORMATION_REGIME_AUTHORITATIVE
+            }
+
+
+def test_target_information_regime_requires_explicit_search_and_native_support():
+    legacy = SimpleNamespace(
+        information_set_search=False,
+        belief_chance_spectra=True,
+        public_observation=True,
+    )
+    assert _target_information_regime_for_search(
+        legacy, engine_supports_determinization=True
+    ) == TARGET_INFORMATION_REGIME_AUTHORITATIVE
+
+    requested = SimpleNamespace(
+        information_set_search=True,
+        determinization_particles=4,
+    )
+    with pytest.raises(RuntimeError, match="determinize_for_player"):
+        _target_information_regime_for_search(
+            requested, engine_supports_determinization=False
+        )
+    assert _target_information_regime_for_search(
+        requested, engine_supports_determinization=True
+    ) == TARGET_INFORMATION_REGIME_PUBLIC
+
+    with pytest.raises(ValueError, match="belief_chance_spectra"):
+        _target_information_regime_for_search(
+            SimpleNamespace(
+                information_set_search=True,
+                determinization_particles=4,
+                belief_chance_spectra=True,
+            ),
+            engine_supports_determinization=True,
+        )
 
 
 def test_run_worker_games_isolates_one_bad_game_from_the_worker(tmp_path, monkeypatch):

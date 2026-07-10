@@ -209,12 +209,15 @@ evaluator inputs were masked but persisted player tensors were omniscient. A
 5,120-row audit over four new H100 arms found zero non-actor values in every
 hidden player slot.
 
-This does **not** make the search information-set correct. MCTS still traverses
-the authoritative Rust `Game`, so future legal moves and chance materialization
-can depend on opponents' true hidden cards. Stored inputs are public, but their
-search targets can remain hidden-state-conditioned. Do not call this corpus a
-fully public-belief teacher until hidden-hand permutation invariance or a real
-determinization/belief-state search closes that separate issue.
+The subsequent hidden-state audit proved neural masking was insufficient: the
+old MCTS teacher still traversed authoritative hidden truth.  That path is now
+quarantined as `authoritative_hidden_state_search_v1`.  The replacement uses
+wheel 0.1.4's atomic `Game.determinize_for_player`, actor-turn PIMC, and root
+aggregation.  Frozen-champion B200 tests were exactly invariant under an
+opponent hidden-dev permutation for policy, Q, afterstate value, root value, and
+selected action.  Production-admissible rows must carry
+`target_information_regime=public_conservation_pimc_v1`; the masked trainer
+fails closed on unsafe or unknown soft targets.
 
 The retained event stream is currently dead data. Across 2,048 sampled live
 Rust states and 30,720 retained teacher rows, `event_mask` had zero live tokens.

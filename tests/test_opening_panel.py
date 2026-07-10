@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import random
 import sys
+import inspect
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -13,11 +15,14 @@ if str(_TOOLS_DIR) not in sys.path:
 from opening_panel import (  # type: ignore  # noqa: E402
     _kendall_tau_b,
     _sample_from_priors,
+    _shallow_root_trace,
+    _validate_information_recipe,
     aggregate,
     build_panel,
     evaluate_root,
     reconstruct_roots,
 )
+import opening_panel as opening_panel_module  # type: ignore  # noqa: E402
 
 from catan_zero.search.gumbel_chance_mcts import (
     GumbelChanceMCTS,
@@ -68,6 +73,56 @@ def test_sample_from_priors_stays_in_support():
         assert _sample_from_priors(priors, legal, rng) == 7
     # Zero total falls back to a legal choice.
     assert _sample_from_priors({}, legal, rng) in legal
+
+
+def test_shallow_trace_uses_public_search_result_not_private_root_expansion():
+    game = SimpleNamespace(current_color=lambda: "RED")
+    result = SimpleNamespace(
+        selected_action=7,
+        improved_policy={3: 0.25, 7: 0.75},
+        visit_counts={3: 2, 7: 6},
+        q_values={3: -0.1, 7: 0.2},
+        priors={3: 0.6, 7: 0.4},
+        root_value=0.05,
+        simulations_used=8,
+    )
+
+    class SearchOnly:
+        def __init__(self):
+            self.calls = []
+
+        def search(self, received, *, force_full):
+            self.calls.append((received, force_full))
+            return result
+
+    mcts = SearchOnly()
+    trace = _shallow_root_trace(mcts, game)
+
+    assert mcts.calls == [(game, True)]
+    assert trace["selected_action"] == 7
+    assert trace["simulations_used"] == 8
+    assert trace["per_candidate"][7]["ranking_score"] == pytest.approx(0.75)
+    assert trace["per_candidate"][3]["raw_q"] == pytest.approx(-0.1)
+
+
+def test_opening_panel_contains_no_private_gnode_bypass() -> None:
+    source = inspect.getsource(opening_panel_module)
+    assert "_GNode(" not in source
+    assert "._run_root_search(" not in source
+
+
+def test_public_opening_panel_requires_information_set_search() -> None:
+    args = SimpleNamespace(
+        public_observation=True,
+        information_set_search=False,
+        determinization_particles=4,
+        determinization_min_simulations=32,
+    )
+    with pytest.raises(ValueError, match="information-set-search together"):
+        _validate_information_recipe(args)
+
+    args.information_set_search = True
+    _validate_information_recipe(args)
 
 
 def test_build_panel_reconstruct_is_deterministic():

@@ -1,0 +1,5 @@
+{
+  "schema_version": "catan-zero-rnd-training-manifest/v1",
+  "dataset": "synthetic-test-fixture",
+  "recipe": "identical-across-arms"
+}

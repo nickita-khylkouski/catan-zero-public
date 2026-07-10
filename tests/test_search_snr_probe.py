@@ -161,6 +161,11 @@ def test_cli_dry_run_records_explicit_production_regime(tmp_path):
         "search_snr_probe.py",
         "--dry-run",
         "--public-observation",
+        "--information-set-search",
+        "--determinization-particles",
+        "4",
+        "--determinization-min-simulations",
+        "32",
         "--lazy-interior-chance",
         "--rust-featurize",
         "--c-scale",
@@ -177,6 +182,9 @@ def test_cli_dry_run_records_explicit_production_regime(tmp_path):
         sys.argv = old_argv
     cfg = json.loads(out_path.read_text())["search_config"]
     assert cfg["public_observation"] is True
+    assert cfg["information_set_search"] is True
+    assert cfg["determinization_particles"] == 4
+    assert cfg["determinization_min_simulations"] == 32
     assert cfg["lazy_interior_chance"] is True
     assert cfg["rust_featurize"] is True
     assert cfg["c_scale"] == pytest.approx(0.03)

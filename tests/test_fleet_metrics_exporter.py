@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from tools.fleet import fleet_metrics_exporter as exporter
 
 
@@ -22,8 +24,20 @@ def _config(base_seed: int = 1000, games: int = 20, n_full: int = 128) -> dict:
         "fields": {
             "base_seed": base_seed,
             "games": games,
+            "public_observation": True,
+            "information_set_search": True,
+            "determinization_particles": 4,
+            "determinization_min_simulations": 32,
             "n_full": n_full,
+            "n_fast": 16,
             "p_full": 0.25,
+            "symmetry_averaged_eval": True,
+            "symmetry_averaged_eval_threshold": 20,
+            "c_scale": 0.03,
+            "c_visit": 50.0,
+            "max_depth": 80,
+            "lazy_interior_chance": True,
+            "belief_chance_spectra": False,
         },
     }
 
@@ -88,15 +102,22 @@ def test_live_progress_exports_process_health_config_seed_and_counters(
     assert snapshot.truncations == 1
     assert snapshot.process_count == 1
     assert snapshot.healthy is True
+    assert snapshot.recipe_safe is True
+    assert snapshot.target_information_regime == "public_conservation_pimc_v1"
+    assert snapshot.target_information_regime_attested is False
 
-    metrics = exporter.render_metrics(
-        snapshots, host="c1", roots=[], now=now
-    )
+    metrics = exporter.render_metrics(snapshots, host="c1", roots=[], now=now)
     assert 'config_hash="' + exporter._config_hash(config) + '"' in metrics
     assert 'seed_range="[1000,1020)"' in metrics
     assert "catan_fleet_generator_rows{" in metrics and "} 2100" in metrics
     assert "catan_fleet_generator_simulations{" in metrics and "} 158000" in metrics
     assert "catan_fleet_generator_healthy{" in metrics and "} 1" in metrics
+    assert "catan_fleet_generator_recipe_safe{" in metrics and "} 1" in metrics
+    assert 'information_set_search="true"' in metrics
+    assert 'determinization_particles="4"' in metrics
+    assert 'target_information_regime="public_conservation_pimc_v1"' in metrics
+    assert 'catan_fleet_generator_lanes_active_total{host="c1"} 1' in metrics
+    assert 'catan_fleet_generator_lanes_recipe_safe_total{host="c1"} 1' in metrics
 
 
 def test_sealed_a1_layout_discovers_every_alias_and_category_with_labels(
@@ -163,9 +184,7 @@ def test_sealed_a1_layout_discovers_every_alias_and_category_with_labels(
     assert all(item.gpu == "0" and item.pipeline == "0" for item in snapshots)
     assert all(item.role == "teacher" and item.healthy for item in snapshots)
 
-    metrics = exporter.render_metrics(
-        snapshots, host="fleet-test", roots=[], now=now
-    )
+    metrics = exporter.render_metrics(snapshots, host="fleet-test", roots=[], now=now)
     for alias in aliases:
         for category in category_rows:
             assert f'alias="{alias}",category="{category}"' in metrics
@@ -243,8 +262,27 @@ def test_a1_contract_and_live_argv_supply_typed_attestation_labels(
         resolved,
         "--n-full",
         "128",
+        "--n-fast",
+        "16",
         "--p-full",
         "0.25",
+        "--public-observation",
+        "--information-set-search",
+        "--determinization-particles",
+        "4",
+        "--determinization-min-simulations",
+        "32",
+        "--symmetry-averaged-eval",
+        "--symmetry-averaged-eval-threshold",
+        "20",
+        "--c-scale",
+        "0.03",
+        "--c-visit",
+        "50",
+        "--max-depth",
+        "80",
+        "--lazy-interior-chance",
+        "--no-belief-chance-spectra",
     )
 
     snapshot = exporter.snapshot_run(
@@ -264,6 +302,98 @@ def test_a1_contract_and_live_argv_supply_typed_attestation_labels(
     assert snapshot.seed_start == 300_000_000_000
     assert snapshot.seed_end == 300_000_000_245
     assert snapshot.games_requested == 245
+    assert snapshot.recipe_safe is True
+    assert snapshot.target_information_regime == "public_conservation_pimc_v1"
+    assert snapshot.target_information_regime_attested is False
+
+
+def test_recipe_mismatch_and_attested_unsafe_regime_are_exported(
+    tmp_path: Path,
+) -> None:
+    now = 18_000.0
+    root = tmp_path / "gen_out"
+    mismatch = root / "a1" / "gpu0"
+    config = _config()
+    config["fields"]["p_full"] = 0.4
+    _write_json(mismatch / "config.json", config, mtime=now - 2)
+    resolved = str(mismatch.resolve())
+    snapshot = exporter.snapshot_run(
+        mismatch,
+        host="c1",
+        processes={resolved: {10}},
+        now=now,
+        stale_after_seconds=60,
+    )
+    assert snapshot is not None
+    assert snapshot.p_full == 0.4
+    assert snapshot.recipe_safe is False
+
+    _write_json(
+        mismatch / "manifest.json",
+        {
+            "games_requested": 20,
+            "games_completed": 1,
+            "games_failed": 0,
+            "target_information_regime": "authoritative_hidden_state_search_v1",
+            "cli_args": config["fields"],
+        },
+        mtime=now - 1,
+    )
+    attested = exporter.snapshot_run(
+        mismatch,
+        host="c1",
+        processes={resolved: {10}},
+        now=now,
+        stale_after_seconds=60,
+    )
+    assert attested is not None
+    assert attested.target_information_regime_attested is True
+    assert attested.target_information_regime == "authoritative_hidden_state_search_v1"
+    assert attested.recipe_safe is False
+    metrics = exporter.render_metrics([attested], host="c1", roots=[], now=now)
+    assert "catan_fleet_generator_target_information_regime_attested{" in metrics
+    assert 'target_information_regime="authoritative_hidden_state_search_v1"' in metrics
+    assert 'catan_fleet_generator_lanes_recipe_safe_total{host="c1"} 0' in metrics
+
+
+@pytest.mark.parametrize(
+    ("field", "drifted"),
+    [
+        ("public_observation", False),
+        ("information_set_search", False),
+        ("determinization_particles", 2),
+        ("determinization_min_simulations", 16),
+        ("n_full", 256),
+        ("n_fast", 8),
+        ("p_full", 0.4),
+        ("symmetry_averaged_eval", False),
+        ("symmetry_averaged_eval_threshold", 16),
+        ("c_scale", 0.1),
+        ("c_visit", 25.0),
+        ("max_depth", 64),
+        ("lazy_interior_chance", False),
+        ("belief_chance_spectra", True),
+        ("target_information_regime", "authoritative_hidden_state_search_v1"),
+    ],
+)
+def test_every_exact_recipe_field_is_safety_binding(
+    tmp_path: Path, field: str, drifted: object
+) -> None:
+    now = 19_000.0
+    output = tmp_path / "gen_out" / field / "gpu0"
+    config = _config()
+    config["fields"][field] = drifted
+    _write_json(output / "config.json", config, mtime=now - 1)
+    resolved = str(output.resolve())
+    snapshot = exporter.snapshot_run(
+        output,
+        host="c1",
+        processes={resolved: {11}},
+        now=now,
+        stale_after_seconds=60,
+    )
+    assert snapshot is not None
+    assert snapshot.recipe_safe is False, field
 
 
 def test_stale_active_progress_is_unhealthy(tmp_path: Path) -> None:

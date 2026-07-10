@@ -1,0 +1,21 @@
+{
+  "schema_version": "catan-zero-rnd-leaderboard/v1",
+  "campaign_id": "REPLACE-e3-latent-deliberation",
+  "required_information_regime": "public_only",
+  "require_same_training_manifest": true,
+  "frozen_candidate_fields": ["search_id", "search_config_sha256"],
+  "purpose": "Compare shared-weight latent compute depths on one RRT architecture family; no textual chain of thought is used.",
+  "required_arm_ids": ["rrt-k0", "think-rrt-k1", "think-rrt-k2", "think-rrt-k4", "think-rrt-k8"],
+  "budget_contracts": {
+    "equal_work": {"match_metrics": ["logical_leaves", "orientation_rows"], "absolute_tolerance": 0.0, "relative_tolerance": 0.0},
+    "equal_time": {"match_metrics": ["wall_time_sec"], "absolute_tolerance": 0.01, "relative_tolerance": 0.05}
+  },
+  "arms": [
+    {"arm_id": "rrt-k0", "comparison_role": "ranked", "architecture_id": "entity-graph-rrt384-l9-k0", "expected_parameter_count": 20070932, "search_id": "gumbel-reference", "source_status": "implemented", "measurement_adapter_status": "not_implemented", "runnable": false},
+    {"arm_id": "think-rrt-k1", "comparison_role": "ranked", "architecture_id": "entity-graph-think-rrt384-l9-k1", "expected_parameter_count": 22146453, "search_id": "gumbel-reference", "source_status": "implemented", "measurement_adapter_status": "not_implemented", "runnable": false},
+    {"arm_id": "think-rrt-k2", "comparison_role": "ranked", "architecture_id": "entity-graph-think-rrt384-l9-k2", "expected_parameter_count": 22146453, "search_id": "gumbel-reference", "source_status": "implemented", "measurement_adapter_status": "not_implemented", "runnable": false},
+    {"arm_id": "think-rrt-k4", "comparison_role": "ranked", "architecture_id": "entity-graph-think-rrt384-l9-k4", "expected_parameter_count": 22146453, "search_id": "gumbel-reference", "source_status": "implemented", "measurement_adapter_status": "not_implemented", "runnable": false},
+    {"arm_id": "think-rrt-k8", "comparison_role": "ranked", "architecture_id": "entity-graph-think-rrt384-l9-k8", "expected_parameter_count": 22146453, "search_id": "gumbel-reference", "source_status": "implemented", "measurement_adapter_status": "not_implemented", "runnable": false}
+  ],
+  "resolved_contract": "scalar value; width=384; layers=9; heads=6; pattern=RRTRRTRRT; FF=1024; action-cross=1; 8 latent slots; shared deliberation weights"
+}

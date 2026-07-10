@@ -28,9 +28,14 @@ typed operator-binding artifacts that must exist and replay before sealing.
   chance spectra, and `max_decisions=600` are fixed. Exact-budget sequential
   halving, late temperature, belief spectra, uncertainty, raw-policy fallback,
   Rust featurization, and eval-server generation are off.
+  Search itself is information-set safe: full n128 roots aggregate four
+  independently determinized public-conservation worlds with a minimum of 32
+  simulations each; n16 fast roots use one world so the total per-root budget
+  remains exact. Every retained shard must attest
+  `target_information_regime=public_conservation_pimc_v1`.
 - The shared output parent is
   `/home/ubuntu/catan-zero-production/runs/selfplay`. The renderer owns the child layout
-  `/home/ubuntu/catan-zero-production/runs/selfplay/a1-fresh-mixed-12000games/<job_id>`.
+  `/home/ubuntu/catan-zero-production/runs/selfplay/a1-infoset-n128-p4-12000games-20260710-r1/<job_id>`.
   This path choice is operational only; no directory has been created.
 
 ## Exact learner dose

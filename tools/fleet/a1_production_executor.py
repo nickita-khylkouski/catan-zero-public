@@ -38,6 +38,7 @@ CLIENT_ENVIRONMENT = {
 }
 SUPERVISOR_ENVIRONMENT = {"PYTHONDONTWRITEBYTECODE": "1"}
 REQUIRED_NOFILE_SOFT = 65_536
+MPS_UNIT_PATH = _REPO_ROOT / "tools/fleet/systemd/nvidia-mps.service"
 FORBIDDEN_ADAPTIVE_ARGV = (
     "--n-full-wide",
     "--n-full-wide-threshold",
@@ -506,9 +507,11 @@ def _preflight_host(
     hosts: dict[str, Any], alias: str, expected_gpus: Sequence[int]
 ) -> dict[str, Any]:
     """Read-only launch preflight: topology, resources, idle compute plane, MPS."""
-    script = r'''import importlib.metadata,json,os,pathlib,resource,subprocess,sys
+    expected_mps_unit_sha256 = _sha256(MPS_UNIT_PATH)
+    script = r'''import hashlib,importlib.metadata,json,os,pathlib,resource,subprocess,sys
 expected=json.loads(sys.argv[1])
 required_nofile=int(sys.argv[2])
+expected_mps_unit_sha256=sys.argv[3]
 nofile_soft_before,nofile_hard=resource.getrlimit(resource.RLIMIT_NOFILE)
 unlimited=resource.RLIM_INFINITY
 if nofile_hard!=unlimited and nofile_hard<required_nofile: raise SystemExit(f'hard RLIMIT_NOFILE {nofile_hard} is below required {required_nofile}')
@@ -535,13 +538,13 @@ for line in apps.stdout.splitlines():
     fields=[part.strip() for part in line.split(',',1)]
     if len(fields)!=2 or 'nvidia-cuda-mps-server' not in fields[1]: foreign.append(line.strip())
 if foreign: raise SystemExit('non-MPS compute applications present: '+repr(foreign))
-show=run('systemctl','show','nvidia-mps.service','--property=ActiveState,UnitFileState,MainPID,Environment')
+show=run('systemctl','show','nvidia-mps.service','--property=ActiveState,UnitFileState,MainPID,Environment,FragmentPath')
 if show.returncode: raise SystemExit('cannot inspect nvidia-mps.service: '+show.stderr)
 properties={}
 for line in show.stdout.splitlines():
     if '=' in line:
         key,value=line.split('=',1);properties[key]=value
-required_properties={'ActiveState','UnitFileState','MainPID','Environment'}
+required_properties={'ActiveState','UnitFileState','MainPID','Environment','FragmentPath'}
 if not required_properties.issubset(properties): raise SystemExit('incomplete nvidia-mps.service properties: '+repr(properties))
 active=properties['ActiveState'];enabled=properties['UnitFileState'];main_pid_raw=properties['MainPID'];environment=properties['Environment']
 if active!='active' or enabled!='enabled': raise SystemExit(f'MPS service not active+enabled: {active}/{enabled}')
@@ -553,14 +556,18 @@ for key,value in required.items():
     if f'{key}={value}' not in environment: raise SystemExit(f'MPS service {key} drift')
     path=pathlib.Path(value)
     if not path.is_dir() or not os.access(path,os.R_OK|os.W_OK|os.X_OK): raise SystemExit(f'MPS directory inaccessible: {path}')
+fragment=pathlib.Path(properties['FragmentPath'])
+if not fragment.is_file(): raise SystemExit('MPS service FragmentPath is not a file: '+str(fragment))
+mps_unit_sha256='sha256:'+hashlib.sha256(fragment.read_bytes()).hexdigest()
+if mps_unit_sha256!=expected_mps_unit_sha256: raise SystemExit(f'MPS service unit digest drift: expected {expected_mps_unit_sha256}, got {mps_unit_sha256}')
 try: rust_version=importlib.metadata.version('catanatron-rs')
 except importlib.metadata.PackageNotFoundError: rust_version='unknown'
-print(json.dumps({'gpu_indices':indices,'compute_apps':'mps_only_or_empty','mps_active':active,'mps_enabled':enabled,'mps_main_pid':main_pid,'client_environment':required,'python':sys.executable,'torch_version':str(torch.__version__),'torch_cuda_version':str(torch.version.cuda),'catanatron_rs_version':rust_version,'required_nofile_soft':required_nofile,'nofile_soft_before':nofile_soft_before,'nofile_soft':nofile_soft,'nofile_hard':nofile_hard},sort_keys=True))'''
+print(json.dumps({'gpu_indices':indices,'compute_apps':'mps_only_or_empty','mps_active':active,'mps_enabled':enabled,'mps_main_pid':main_pid,'mps_unit_sha256':mps_unit_sha256,'client_environment':required,'python':sys.executable,'torch_version':str(torch.__version__),'torch_cuda_version':str(torch.version.cuda),'catanatron_rs_version':rust_version,'required_nofile_soft':required_nofile,'nofile_soft_before':nofile_soft_before,'nofile_soft':nofile_soft,'nofile_hard':nofile_hard},sort_keys=True))'''
     command = " ".join(
         shlex.quote(value)
         for value in (
             hosts["python"], "-c", script, json.dumps(sorted(expected_gpus)),
-            str(REQUIRED_NOFILE_SOFT),
+            str(REQUIRED_NOFILE_SOFT), expected_mps_unit_sha256,
         )
     )
     result = _ssh(hosts, alias, command)
@@ -573,6 +580,8 @@ print(json.dumps({'gpu_indices':indices,'compute_apps':'mps_only_or_empty','mps_
         raise ExecutorError(f"host preflight returned invalid JSON on {alias}") from error
     if report.get("client_environment") != CLIENT_ENVIRONMENT:
         raise ExecutorError(f"host MPS client environment drift on {alias}")
+    if report.get("mps_unit_sha256") != expected_mps_unit_sha256:
+        raise ExecutorError(f"host MPS service unit digest drift on {alias}")
     limit_fields = (
         "required_nofile_soft", "nofile_soft_before", "nofile_soft", "nofile_hard",
     )

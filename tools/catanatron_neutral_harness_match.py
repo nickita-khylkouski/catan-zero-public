@@ -214,6 +214,15 @@ def _search_config(
             if search_kwargs.get("symmetry_averaged_eval_threshold") is not None
             else None
         ),
+        information_set_search=bool(
+            search_kwargs.get("information_set_search", False)
+        ),
+        determinization_particles=int(
+            search_kwargs.get("determinization_particles", 1)
+        ),
+        determinization_min_simulations=int(
+            search_kwargs.get("determinization_min_simulations", 32)
+        ),
     )
 
 
@@ -367,6 +376,11 @@ def _search_recipe(args: Any) -> dict[str, Any]:
         "lazy_interior_chance": bool(args.lazy_interior_chance),
         "correct_rust_chance_spectra": bool(args.correct_rust_chance_spectra),
         "public_observation": bool(args.public_observation),
+        "information_set_search": bool(args.information_set_search),
+        "determinization_particles": int(args.determinization_particles),
+        "determinization_min_simulations": int(
+            args.determinization_min_simulations
+        ),
         "prior_temperature": float(args.prior_temperature),
         "value_scale": float(args.value_scale),
         "value_squash": str(args.value_squash),
@@ -740,6 +754,17 @@ def build_summary(
         "public_observation": (
             bool(args.public_observation) if args.mode == "search" else None
         ),
+        "information_set_search": (
+            bool(args.information_set_search) if args.mode == "search" else None
+        ),
+        "determinization_particles": (
+            int(args.determinization_particles) if args.mode == "search" else None
+        ),
+        "determinization_min_simulations": (
+            int(args.determinization_min_simulations)
+            if args.mode == "search"
+            else None
+        ),
         "candidate_value_readout": (
             str(args.value_readout) if args.mode == "search" else "scalar"
         ),
@@ -857,6 +882,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--public-observation", action=argparse.BooleanOptionalAction, default=True
     )
     parser.add_argument(
+        "--information-set-search",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Search public-belief determinizations instead of cloning authoritative "
+            "hidden truth. Required for every public-observation search panel."
+        ),
+    )
+    parser.add_argument("--determinization-particles", type=int, default=4)
+    parser.add_argument("--determinization-min-simulations", type=int, default=32)
+    parser.add_argument(
         "--correct-rust-chance-spectra",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -962,6 +998,20 @@ def main() -> None:
     ]:
         parser.error("--devices must contain at least one device")
     if args.mode == "search":
+        if bool(args.public_observation) != bool(args.information_set_search):
+            parser.error(
+                "search mode requires --public-observation and "
+                "--information-set-search together"
+            )
+        if not bool(args.information_set_search):
+            parser.error(
+                "search mode refuses authoritative hidden-state MCTS; enable "
+                "--information-set-search"
+            )
+        if int(args.determinization_particles) < 1:
+            parser.error("--determinization-particles must be >= 1")
+        if int(args.determinization_min_simulations) < 1:
+            parser.error("--determinization-min-simulations must be >= 1")
         for flag, value in (
             ("--n-full", args.n_full),
             ("--max-depth", args.max_depth),

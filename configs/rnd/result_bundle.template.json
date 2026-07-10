@@ -1,0 +1,102 @@
+{
+  "schema_version": "catan-zero-rnd-leaderboard/v1",
+  "campaign_id": "REPLACE-campaign",
+  "run_id": "REPLACE-unique-run-id",
+  "arm_id": "REPLACE-registered-runnable-arm",
+  "budget_regime": "equal_work",
+  "track": "2p_no_trade",
+  "required_information_regime": "public_only",
+  "architecture": {
+    "architecture_id": "REPLACE",
+    "parameter_count": 1,
+    "config_sha256": "REPLACE_WITH_64_LOWERCASE_HEX"
+  },
+  "search": {
+    "search_id": "REPLACE",
+    "config_sha256": "REPLACE_WITH_64_LOWERCASE_HEX"
+  },
+  "checkpoint": {
+    "path": "REPLACE/checkpoint.pt",
+    "sha256": "REPLACE_WITH_64_LOWERCASE_HEX"
+  },
+  "reference": {
+    "reference_id": "REPLACE-frozen-reference",
+    "architecture": {
+      "architecture_id": "REPLACE",
+      "parameter_count": 1,
+      "config_sha256": "REPLACE_WITH_64_LOWERCASE_HEX"
+    },
+    "search": {
+      "search_id": "REPLACE",
+      "config_sha256": "REPLACE_WITH_64_LOWERCASE_HEX"
+    },
+    "checkpoint": {
+      "path": "REPLACE/reference-checkpoint.pt",
+      "sha256": "REPLACE_WITH_64_LOWERCASE_HEX"
+    }
+  },
+  "code": {
+    "git_commit": "REPLACE_WITH_40_LOWERCASE_HEX",
+    "dirty": false
+  },
+  "seed_manifest": {
+    "path": "REPLACE/paired-seeds.json",
+    "sha256": "REPLACE_WITH_64_LOWERCASE_HEX",
+    "schema_version": "catan-zero-rnd-paired-seeds/v1",
+    "track": "2p_no_trade",
+    "seed_count": 1
+  },
+  "training_manifest": {
+    "path": "REPLACE/training-manifest.json",
+    "sha256": "REPLACE_WITH_64_LOWERCASE_HEX",
+    "schema_version": "catan-zero-rnd-training-manifest/v1"
+  },
+  "games": [
+    {
+      "game_id": "pair-000001-seat-0",
+      "pair_id": "pair-000001",
+      "seed": 1,
+      "track": "2p_no_trade",
+      "information_regime": "public_conservation_pimc",
+      "reference_information_regime": "public_conservation_pimc",
+      "seat_assignment": {
+        "candidate": 0,
+        "reference": 1
+      },
+      "completed": true,
+      "winner": "RED",
+      "candidate_score": 1.0,
+      "counters": {
+        "nominal_visits": 0,
+        "scheduled_visits": 0,
+        "logical_leaves": 0,
+        "orientation_rows": 0,
+        "evaluator_calls": 0,
+        "wall_time_sec": 0.0
+      }
+    },
+    {
+      "game_id": "pair-000001-seat-1",
+      "pair_id": "pair-000001",
+      "seed": 1,
+      "track": "2p_no_trade",
+      "information_regime": "public_conservation_pimc",
+      "reference_information_regime": "public_conservation_pimc",
+      "seat_assignment": {
+        "candidate": 1,
+        "reference": 0
+      },
+      "completed": true,
+      "winner": "RED",
+      "candidate_score": 0.0,
+      "counters": {
+        "nominal_visits": 0,
+        "scheduled_visits": 0,
+        "logical_leaves": 0,
+        "orientation_rows": 0,
+        "evaluator_calls": 0,
+        "wall_time_sec": 0.0
+      }
+    }
+  ]
+}

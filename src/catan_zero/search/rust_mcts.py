@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import math
 import random
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Protocol
 
 
@@ -46,6 +46,11 @@ class RustMCTSConfig:
     max_depth: int = 80
     seed: int = 0
     temperature: float = 1.0
+    # Opt-in root-consistent public-belief search. Simulations are a TOTAL
+    # nominal budget divided across determinizations.
+    information_set_search: bool = False
+    determinization_particles: int = 1
+    determinization_min_simulations: int = 32
 
 
 @dataclass(frozen=True, slots=True)
@@ -183,6 +188,11 @@ class RustMCTS:
         _require_rust_module()
 
     def search(self, game: Any) -> RustMCTSResult:
+        if bool(self.config.information_set_search):
+            return self._search_information_set(game)
+        return self._search_single_world(game)
+
+    def _search_single_world(self, game: Any) -> RustMCTSResult:
         root_color = str(game.current_color())
         legal_actions = _legal_action_indices(
             game,
@@ -205,6 +215,127 @@ class RustMCTS:
             self._simulate(root, depth=0)
         return self._result(root)
 
+    def _spawn_information_set_particle(
+        self, *, simulations: int, seed: int
+    ) -> "RustMCTS":
+        particle = RustMCTS(
+            replace(
+                self.config,
+                simulations=int(simulations),
+                seed=int(seed),
+                information_set_search=False,
+            ),
+            self.evaluator,
+        )
+        particle._root_actor_turn_only = True
+        return particle
+
+    def _search_information_set(self, game: Any) -> RustMCTSResult:
+        determinize = getattr(game, "determinize_for_player", None)
+        if not callable(determinize):
+            raise RuntimeError(
+                "information_set_search requires Game.determinize_for_player"
+            )
+        evaluator_config = getattr(self.evaluator, "config", None)
+        if evaluator_config is None or not bool(
+            getattr(evaluator_config, "public_observation", False)
+        ):
+            raise RuntimeError(
+                "information_set_search requires evaluator public_observation=True"
+            )
+        particles = int(self.config.determinization_particles)
+        if particles < 1:
+            raise ValueError("determinization_particles must be >= 1")
+        min_per_particle = int(self.config.determinization_min_simulations)
+        if min_per_particle < 1:
+            raise ValueError("determinization_min_simulations must be >= 1")
+        total_budget = max(int(self.config.simulations), 1)
+        particles = min(particles, max(1, total_budget // min_per_particle))
+        base, remainder = divmod(total_budget, particles)
+        budgets = [base + int(index < remainder) for index in range(particles)]
+        root_color = str(game.current_color())
+        authoritative_legal = _legal_action_indices(
+            game, colors=self.config.colors, map_kind=self.config.map_kind
+        )
+        if not authoritative_legal:
+            raise RuntimeError("information-set root has no legal actions")
+        seeds = [self.rng.getrandbits(64) for _ in range(particles)]
+        results: list[RustMCTSResult] = []
+        for budget, particle_seed in zip(budgets, seeds):
+            sampled = determinize(root_color, int(particle_seed))
+            sampled_legal = _legal_action_indices(
+                sampled, colors=self.config.colors, map_kind=self.config.map_kind
+            )
+            if tuple(sampled_legal) != tuple(authoritative_legal):
+                raise RuntimeError(
+                    "public-belief determinization changed root legal actions"
+                )
+            particle = self._spawn_information_set_particle(
+                simulations=budget, seed=particle_seed
+            )
+            particle._information_set_root_turn = int(sampled.num_turns())
+            results.append(particle._search_single_world(sampled))
+        return self._aggregate_information_set_results(
+            results, legal_actions=authoritative_legal
+        )
+
+    def _aggregate_information_set_results(
+        self,
+        results: list[RustMCTSResult],
+        *,
+        legal_actions: tuple[int, ...],
+    ) -> RustMCTSResult:
+        if not results:
+            raise RuntimeError("information-set search produced no particles")
+        count = float(len(results))
+        priors = _normalize_policy(
+            {
+                action: sum(result.priors.get(action, 0.0) for result in results)
+                / count
+                for action in legal_actions
+            }
+        )
+        policy = _normalize_policy(
+            {
+                action: sum(result.policy.get(action, 0.0) for result in results)
+                / count
+                for action in legal_actions
+            }
+        )
+        visits = {
+            action: sum(result.visits.get(action, 0) for result in results)
+            for action in legal_actions
+        }
+        q_values: dict[int, float] = {}
+        for action in legal_actions:
+            weighted = [
+                (result.q_values[action], result.visits.get(action, 0))
+                for result in results
+                if action in result.q_values and result.visits.get(action, 0) > 0
+            ]
+            denominator = sum(weight for _value, weight in weighted)
+            if denominator:
+                q_values[action] = sum(
+                    value * weight for value, weight in weighted
+                ) / float(denominator)
+        action = max(
+            legal_actions,
+            key=lambda candidate: (
+                policy.get(candidate, 0.0),
+                visits.get(candidate, 0),
+                priors.get(candidate, 0.0),
+                -int(candidate),
+            ),
+        )
+        return RustMCTSResult(
+            action=int(action),
+            policy=policy,
+            visits=visits,
+            q_values=q_values,
+            priors=priors,
+            root_value=sum(result.root_value for result in results) / count,
+        )
+
     def _simulate(self, node: _Node, *, depth: int) -> float:
         winner = node.game.winning_color()
         if winner is not None:
@@ -215,6 +346,13 @@ class RustMCTS:
                 root_color=node.root_color,
                 colors=self.config.colors,
             )
+        if self._is_information_set_turn_boundary(node, depth=depth):
+            if not node.expanded:
+                value = self._expand(node)
+                node.visits += 1
+                node.value_sum += value
+                return value
+            return node.value
         if not node.expanded:
             if self._expand_forced(node):
                 return self._simulate(node, depth=depth)
@@ -246,6 +384,14 @@ class RustMCTS:
         node.visits += 1
         node.value_sum += value
         return value
+
+    def _is_information_set_turn_boundary(self, node: _Node, *, depth: int) -> bool:
+        if not bool(getattr(self, "_root_actor_turn_only", False)) or depth <= 0:
+            return False
+        if str(node.game.current_color()) != str(node.root_color):
+            return True
+        root_turn = getattr(self, "_information_set_root_turn", None)
+        return root_turn is not None and int(node.game.num_turns()) != int(root_turn)
 
     def _expand_forced(self, node: _Node) -> bool:
         legal_actions = _legal_action_indices(

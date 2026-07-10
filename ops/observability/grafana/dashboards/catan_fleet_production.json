@@ -162,6 +162,54 @@
       ],
       "fieldConfig": {"defaults": {"unit": "ops", "custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 8, "showPoints": "never"}}, "overrides": []},
       "options": {"legend": {"displayMode": "table", "placement": "right", "calcs": ["mean", "max"]}, "tooltip": {"mode": "multi", "sort": "desc"}}
+    },
+    {
+      "id": 13,
+      "type": "stat",
+      "title": "Active A1 lanes / expected 40",
+      "description": "The sealed wave has exactly 40 physical H100 lanes.",
+      "gridPos": {"h": 5, "w": 6, "x": 0, "y": 38},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [{"refId": "A", "expr": "sum(catan_fleet_generator_lanes_active_total{host=~\"$box\"}) or vector(0)"}],
+      "fieldConfig": {"defaults": {"unit": "none", "max": 40, "color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "green", "value": 40}]}}, "overrides": []},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "colorMode": "background", "graphMode": "none", "textMode": "value"}
+    },
+    {
+      "id": 14,
+      "type": "stat",
+      "title": "Recipe-safe active lanes / expected 40",
+      "description": "Active lanes matching every exact n128 information-set recipe field and the public target regime.",
+      "gridPos": {"h": 5, "w": 6, "x": 6, "y": 38},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [{"refId": "A", "expr": "sum(catan_fleet_generator_lanes_recipe_safe_total{host=~\"$box\"}) or vector(0)"}],
+      "fieldConfig": {"defaults": {"unit": "none", "max": 40, "color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "green", "value": 40}]}}, "overrides": []},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "colorMode": "background", "graphMode": "none", "textMode": "value"}
+    },
+    {
+      "id": 15,
+      "type": "status-history",
+      "title": "Exact recipe safety by active lane",
+      "gridPos": {"h": 5, "w": 12, "x": 12, "y": 38},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [{"refId": "A", "expr": "catan_fleet_generator_recipe_safe{host=~\"$box\"} and catan_fleet_generator_active{host=~\"$box\"} == 1", "legendFormat": "{{alias}}/gpu{{gpu}}/pipeline{{pipeline}}"}],
+      "fieldConfig": {"defaults": {"unit": "none", "min": 0, "max": 1, "mappings": [{"type": "value", "options": {"0": {"text": "MISMATCH", "color": "red"}, "1": {"text": "SAFE", "color": "green"}}}]}, "overrides": []},
+      "options": {"showValue": "always", "legend": {"displayMode": "hidden", "placement": "bottom"}, "tooltip": {"mode": "single"}}
+    },
+    {
+      "id": 16,
+      "type": "table",
+      "title": "Exact A1 recipe and target provenance",
+      "description": "Every safety-critical launch field is a generator_info label; attested becomes 1 after the terminal manifest records the regime.",
+      "gridPos": {"h": 10, "w": 24, "x": 0, "y": 43},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {"refId": "A", "expr": "catan_fleet_generator_info{host=~\"$box\"}", "format": "table", "instant": true},
+        {"refId": "B", "expr": "catan_fleet_generator_recipe_safe{host=~\"$box\"}", "format": "table", "instant": true, "legendFormat": "recipe_safe"},
+        {"refId": "C", "expr": "catan_fleet_generator_target_information_regime_attested{host=~\"$box\"}", "format": "table", "instant": true, "legendFormat": "regime_attested"}
+      ],
+      "transformations": [{"id": "merge", "options": {}}],
+      "fieldConfig": {"defaults": {"custom": {"align": "auto"}}, "overrides": []},
+      "options": {"showHeader": true}
     }
   ]
 }

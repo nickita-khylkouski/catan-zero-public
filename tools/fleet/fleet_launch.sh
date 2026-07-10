@@ -655,6 +655,8 @@ for GPU in "${GPU_IDS[@]}"; do
       --n-full "$NFULL" --n-fast "$NFAST" --p-full "$PFULL" --c-visit 50.0 --c-scale "$CSCALE" \
       --max-decisions 600 --max-depth 80 --temperature-decisions 90 \
       --correct-rust-chance-spectra --lazy-interior-chance --public-observation \
+      --information-set-search --determinization-particles 4 \
+      --determinization-min-simulations 32 \
       --rust-featurize --eval-server --eval-server-max-batch "$EVAL_SERVER_MAX_BATCH" \
       --eval-server-max-wait-ms 0.0 --eval-server-matmul-precision highest \
       "${EVAL_SERVER_ROW_CAP_ARGS[@]}" \

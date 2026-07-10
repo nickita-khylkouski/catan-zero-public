@@ -55,6 +55,9 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, dict, dict]:
         "exact_budget_sh": False,
         "exact_budget_sh_min_n": 0,
         "belief_chance_spectra": False,
+        "information_set_search": True,
+        "determinization_particles": 4,
+        "determinization_min_simulations": 32,
         "n_full_wide": None,
         "n_full_wide_threshold": None,
         "raw_policy_above_width": None,
@@ -431,6 +434,7 @@ def test_preflight_accepts_only_exact_report(monkeypatch: pytest.MonkeyPatch) ->
         "mps_active": "active",
         "mps_enabled": "enabled",
         "mps_main_pid": 123,
+        "mps_unit_sha256": executor._sha256(executor.MPS_UNIT_PATH),
         "client_environment": dict(executor.CLIENT_ENVIRONMENT),
         "python": "/venv/bin/python",
         "torch_version": "x",
@@ -449,6 +453,10 @@ def test_preflight_accepts_only_exact_report(monkeypatch: pytest.MonkeyPatch) ->
     assert executor._preflight_host({"python": "/venv/bin/python"}, "h00", [0, 1, 2, 3]) == report
     report["client_environment"] = {"CUDA_MPS_PIPE_DIRECTORY": "/tmp/wrong"}
     with pytest.raises(executor.ExecutorError, match="environment drift"):
+        executor._preflight_host({"python": "/venv/bin/python"}, "h00", [0, 1, 2, 3])
+    report["client_environment"] = dict(executor.CLIENT_ENVIRONMENT)
+    report["mps_unit_sha256"] = "sha256:" + "0" * 64
+    with pytest.raises(executor.ExecutorError, match="unit digest drift"):
         executor._preflight_host({"python": "/venv/bin/python"}, "h00", [0, 1, 2, 3])
 
 
@@ -470,6 +478,7 @@ def test_preflight_fails_closed_on_nofile_report(
         "mps_active": "active",
         "mps_enabled": "enabled",
         "mps_main_pid": 123,
+        "mps_unit_sha256": executor._sha256(executor.MPS_UNIT_PATH),
         "client_environment": dict(executor.CLIENT_ENVIRONMENT),
         "python": "/venv/bin/python",
         "torch_version": "x",

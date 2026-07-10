@@ -119,8 +119,8 @@ This is the most important correctness story in the project.
 **The fix (`#71`, public-observation masking).** Three pieces, all opt-in behind flags:
 
 1. A canonical token-level transform `mask_player_tokens_public` zeros the non-actor hidden slots ({4,5,15,16–20,21,22–26}), keeping only public counts. This is wired into training via `train_bc --mask-hidden-info` (masks the banked corpus at load time — **no regeneration needed**) and into inference via `EntityGraphRustEvaluatorConfig.public_observation`.
-2. A perspective-relative masking in the Rust evaluator (`_mask_players_to_public`) so search sees only public state.
-3. A planner-only `belief_chance_spectra` flag (uniform steal; belief deck = base deck minus actor's own minus all played cards); the live environment is untouched.
+2. A perspective-relative masking in the Rust evaluator (`_mask_players_to_public`) so neural inputs expose only the acting player's observation.
+3. The original planner-only `belief_chance_spectra` flag reduced two chance-node leaks but was not a full fix: opponent legal actions and outcome support still came from authoritative truth.  The production replacement is actor-turn information-set MCTS over complete engine-level public-belief determinizations (`Game.determinize_for_player`), with root aggregation and authoritative live transitions kept separate.
 
 Model-invariance was **proven**: with `public_observation=ON`, permuting the opponent's hidden hand changes the value by <1e-5 and logits by <1e-4; with it OFF, it leaks. 9 new tests plus 90 affected tests pass.
 

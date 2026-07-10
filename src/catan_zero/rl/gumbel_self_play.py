@@ -69,13 +69,13 @@ from catan_zero.search.gumbel_chance_mcts import (
     is_move_robber_with_victim,
     move_robber_victim_outcome_weights,
 )
+from catan_zero.search import gumbel_chance_mcts as _gumbel_chance_mcts
 from catan_zero.search.neural_rust_mcts import (
     RUST_ENTITY_ADAPTER_VERSION,
     rust_action_context_batch,
     rust_game_to_entity_batch,
     rust_policy_action_ids,
 )
-from catan_zero.search.rust_mcts import _require_rust_module
 
 __all__ = [
     "COLORS",
@@ -107,6 +107,14 @@ PLAYER_NAMES = ("BLUE", "RED", "ORANGE", "WHITE")
 ACTION_MASK_VERSION = "colonist-multiagent-v1"
 TEACHER_NAME = "gumbel_self_play"
 TARGET_SCORE_SOURCE = "gumbel_mcts_visit_q"
+# Search targets need provenance that is independent from observation masking.
+# ``public_observation=True`` only constrains neural-network features; it does
+# not prove that the planner's cloned world state was information-safe.
+TARGET_INFORMATION_REGIME_AUTHORITATIVE = "authoritative_hidden_state_search_v1"
+TARGET_INFORMATION_REGIME_PUBLIC = "public_conservation_pimc_v1"
+TARGET_INFORMATION_REGIMES = frozenset(
+    {TARGET_INFORMATION_REGIME_AUTHORITATIVE, TARGET_INFORMATION_REGIME_PUBLIC}
+)
 
 # Kept in sync with `tools/convert_teacher_to_entity_tokens.py`'s BASE_KEYS /
 # ENTITY_KEYS. Do not diverge without updating both -- these are what makes
@@ -121,6 +129,7 @@ BASE_KEYS = (
     "target_policy_mask",
     "target_scores_mask",
     "target_score_source",
+    "target_information_regime",
     "game_seed",
     "teacher_name",
     "player",
@@ -586,7 +595,14 @@ def _build_decision_row(
     opponent_checkpoint_md5: str = "",
     snapshot: dict[str, Any] | None = None,
     action_by_id: dict[int, Any] | None = None,
+    target_information_regime: str = TARGET_INFORMATION_REGIME_AUTHORITATIVE,
 ) -> tuple[dict[str, Any], dict[str, np.ndarray]]:
+    if target_information_regime not in TARGET_INFORMATION_REGIMES:
+        raise ValueError(
+            "unsupported target_information_regime "
+            f"{target_information_regime!r}; expected one of "
+            f"{sorted(TARGET_INFORMATION_REGIMES)}"
+        )
     # legal_rust is exactly the key set of any of these dicts by
     # SearchResult's contract (covers ALL legal root actions).
     legal_rust = tuple(sorted(result.improved_policy.keys()))
@@ -684,6 +700,7 @@ def _build_decision_row(
         "target_policy_mask": target_policy_mask,
         "target_scores_mask": target_scores_mask,
         "target_score_source": TARGET_SCORE_SOURCE,
+        "target_information_regime": target_information_regime,
         "game_seed": np.int64(game_seed),
         "teacher_name": TEACHER_NAME,
         "adapter_version": RUST_ENTITY_ADAPTER_VERSION,
@@ -754,6 +771,40 @@ def _build_decision_row(
     return row, features
 
 
+def _target_information_regime_for_search(
+    search_config: Any, *, engine_supports_determinization: bool
+) -> str:
+    """Return the planner-state provenance explicitly asserted by search.
+
+    Fail-safe default: all historical Gumbel search configurations use an
+    authoritative game clone, even when evaluator inputs are masked or the
+    partial belief chance-spectrum flag is enabled.  Public provenance requires
+    BOTH the explicit ``information_set_search`` config and the native
+    ``determinize_for_player`` capability; no collection of loosely related
+    booleans is accepted as equivalent proof.
+    """
+
+    if bool(getattr(search_config, "information_set_search", False)):
+        if not engine_supports_determinization:
+            raise RuntimeError(
+                "information_set_search=True requires a native game engine exposing "
+                "determinize_for_player; refusing to emit falsely public search targets"
+            )
+        particles = int(getattr(search_config, "determinization_particles", 1))
+        if particles < 1:
+            raise ValueError(
+                "information_set_search requires determinization_particles >= 1, "
+                f"got {particles}"
+            )
+        if bool(getattr(search_config, "belief_chance_spectra", False)):
+            raise ValueError(
+                "information_set_search cannot be combined with belief_chance_spectra; "
+                "sampled worlds already materialize hidden chance state"
+            )
+        return TARGET_INFORMATION_REGIME_PUBLIC
+    return TARGET_INFORMATION_REGIME_AUTHORITATIVE
+
+
 def play_one_game(
     mcts: GumbelChanceMCTS,
     evaluator: RustEvaluator,
@@ -801,8 +852,12 @@ def play_one_game(
     actions.
     """
     started = time.perf_counter()
-    catanatron_rs = _require_rust_module()
+    catanatron_rs = _gumbel_chance_mcts._require_rust_module()
     game = catanatron_rs.Game.simple(list(config.colors), seed=int(game_seed))
+    target_information_regime = _target_information_regime_for_search(
+        mcts.config,
+        engine_supports_determinization=hasattr(game, "determinize_for_player"),
+    )
     chance_rng = random.Random(int(game_seed) ^ 0xA17E)
 
     decisions: list[DecisionRecord] = []
@@ -883,6 +938,7 @@ def play_one_game(
                 game_seed=game_seed,
                 decision_index=decision_index,
                 obs_width=config.obs_width,
+                target_information_regime=target_information_regime,
                 is_pool_game=(pool_assignment.is_pool if pool_assignment is not None else None),
                 opponent_version=(
                     pool_assignment.opponent_version if pool_assignment is not None else None
@@ -1323,6 +1379,16 @@ def run_worker_games(
         )
     out_dir = Path(out_dir)
     action_size = action_size_for_evaluator(evaluator, config.colors)
+    engine_supports_determinization = False
+    if bool(getattr(search_config, "information_set_search", False)):
+        catanatron_rs = _gumbel_chance_mcts._require_rust_module()
+        engine_supports_determinization = hasattr(
+            catanatron_rs.Game, "determinize_for_player"
+        )
+    target_information_regime = _target_information_regime_for_search(
+        search_config,
+        engine_supports_determinization=engine_supports_determinization,
+    )
     mcts = GumbelChanceMCTS(search_config, evaluator)
 
     resume_offset = 0
@@ -1620,6 +1686,7 @@ def run_worker_games(
         # c_scale 1.0-vs-0.1 near-miss (commit 376c146).
         "selfplay_config": dataclasses.asdict(config),
         "search_config": dataclasses.asdict(search_config),
+        "target_information_regime": target_information_regime,
         "elapsed_sec": elapsed,
         "rows_per_sec": rows / max(elapsed, 1.0e-9),
         "shards": [str(path) for path in writer.paths],

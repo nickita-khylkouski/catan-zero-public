@@ -125,6 +125,9 @@ def build_h2h_command(
     rescale_noise_floor_c: float = 0.0,
     sigma_eval: float = 0.79,
     public_observation: bool = True,
+    information_set_search: bool = True,
+    determinization_particles: int = 4,
+    determinization_min_simulations: int = 32,
     lazy_interior_chance: bool = True,
     correct_rust_chance_spectra: bool = True,
     symmetry_averaged_eval: bool = False,
@@ -173,6 +176,11 @@ def build_h2h_command(
         "--wide-candidates-threshold",
         str(int(wide_candidates_threshold)),
         ("--public-observation" if public_observation else "--no-public-observation"),
+        ("--information-set-search" if information_set_search else "--no-information-set-search"),
+        "--determinization-particles",
+        str(int(determinization_particles)),
+        "--determinization-min-simulations",
+        str(int(determinization_min_simulations)),
         ("--lazy-interior-chance" if lazy_interior_chance else "--no-lazy-interior-chance"),
         (
             "--correct-rust-chance-spectra"
@@ -232,6 +240,9 @@ def build_invocation_descriptor(
     rescale_noise_floor_c: float = 0.0,
     sigma_eval: float = 0.79,
     public_observation: bool = True,
+    information_set_search: bool = True,
+    determinization_particles: int = 4,
+    determinization_min_simulations: int = 32,
     lazy_interior_chance: bool = True,
     correct_rust_chance_spectra: bool = True,
     symmetry_averaged_eval: bool = False,
@@ -263,6 +274,9 @@ def build_invocation_descriptor(
         rescale_noise_floor_c=rescale_noise_floor_c,
         sigma_eval=sigma_eval,
         public_observation=public_observation,
+        information_set_search=information_set_search,
+        determinization_particles=determinization_particles,
+        determinization_min_simulations=determinization_min_simulations,
         lazy_interior_chance=lazy_interior_chance,
         correct_rust_chance_spectra=correct_rust_chance_spectra,
         symmetry_averaged_eval=symmetry_averaged_eval,
@@ -324,6 +338,11 @@ def build_invocation_descriptor(
             "rescale_noise_floor_c": float(rescale_noise_floor_c),
             "sigma_eval": float(sigma_eval),
             "public_observation": bool(public_observation),
+            "information_set_search": bool(information_set_search),
+            "determinization_particles": int(determinization_particles),
+            "determinization_min_simulations": int(
+                determinization_min_simulations
+            ),
             "lazy_interior_chance": bool(lazy_interior_chance),
             "correct_rust_chance_spectra": bool(correct_rust_chance_spectra),
             "symmetry_averaged_eval": bool(symmetry_averaged_eval),
@@ -450,6 +469,11 @@ def main() -> None:
         "--public-observation", action=argparse.BooleanOptionalAction, default=True
     )
     parser.add_argument(
+        "--information-set-search", action=argparse.BooleanOptionalAction, default=True
+    )
+    parser.add_argument("--determinization-particles", type=int, default=4)
+    parser.add_argument("--determinization-min-simulations", type=int, default=32)
+    parser.add_argument(
         "--lazy-interior-chance", action=argparse.BooleanOptionalAction, default=True
     )
     parser.add_argument(
@@ -479,6 +503,15 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    if bool(args.public_observation) != bool(args.information_set_search):
+        parser.error(
+            "--public-observation and --information-set-search must be enabled together"
+        )
+    if int(args.determinization_particles) < 1:
+        parser.error("--determinization-particles must be >= 1")
+    if int(args.determinization_min_simulations) < 1:
+        parser.error("--determinization-min-simulations must be >= 1")
+
     h2h_out_path = args.h2h_out or (str(Path(args.out).with_suffix("")) + ".h2h.json")
 
     descriptor = build_invocation_descriptor(
@@ -497,6 +530,11 @@ def main() -> None:
         rescale_noise_floor_c=float(args.rescale_noise_floor_c),
         sigma_eval=float(args.sigma_eval),
         public_observation=bool(args.public_observation),
+        information_set_search=bool(args.information_set_search),
+        determinization_particles=int(args.determinization_particles),
+        determinization_min_simulations=int(
+            args.determinization_min_simulations
+        ),
         lazy_interior_chance=bool(args.lazy_interior_chance),
         correct_rust_chance_spectra=bool(args.correct_rust_chance_spectra),
         symmetry_averaged_eval=bool(args.symmetry_averaged_eval),

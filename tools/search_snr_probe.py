@@ -148,6 +148,9 @@ def run_probe_on_checkpoint(
     device: str,
     correct_rust_chance_spectra: bool = True,
     public_observation: bool = False,
+    information_set_search: bool = False,
+    determinization_particles: int = 4,
+    determinization_min_simulations: int = 32,
     lazy_interior_chance: bool = False,
     c_visit: float = 50.0,
     c_scale: float = 0.1,
@@ -203,6 +206,11 @@ def run_probe_on_checkpoint(
                     c_scale=float(c_scale),
                     symmetry_averaged_eval=bool(symmetry_averaged_eval),
                     wide_candidates_threshold=int(wide_candidates_threshold),
+                    information_set_search=bool(information_set_search),
+                    determinization_particles=int(determinization_particles),
+                    determinization_min_simulations=int(
+                        determinization_min_simulations
+                    ),
                 )
                 mcts = GumbelChanceMCTS(config, evaluator)
                 result = mcts.search(state.copy(), force_full=True)
@@ -285,6 +293,11 @@ def main() -> None:
         help="Mask hidden opponent information in the evaluator. Pass this for masked champions.",
     )
     parser.add_argument(
+        "--information-set-search", action=argparse.BooleanOptionalAction, default=False
+    )
+    parser.add_argument("--determinization-particles", type=int, default=4)
+    parser.add_argument("--determinization-min-simulations", type=int, default=32)
+    parser.add_argument(
         "--lazy-interior-chance",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -310,6 +323,14 @@ def main() -> None:
     )
     parser.add_argument("--out", required=True)
     args = parser.parse_args()
+    if bool(args.public_observation) != bool(args.information_set_search):
+        parser.error(
+            "--public-observation and --information-set-search must be enabled together"
+        )
+    if int(args.determinization_particles) < 1:
+        parser.error("--determinization-particles must be >= 1")
+    if int(args.determinization_min_simulations) < 1:
+        parser.error("--determinization-min-simulations must be >= 1")
 
     checkpoints: list[str] = list(args.checkpoint or [])
     if args.checkpoints:
@@ -340,6 +361,11 @@ def main() -> None:
                 base_seed=int(args.base_seed),
                 device=args.device,
                 public_observation=bool(args.public_observation),
+                information_set_search=bool(args.information_set_search),
+                determinization_particles=int(args.determinization_particles),
+                determinization_min_simulations=int(
+                    args.determinization_min_simulations
+                ),
                 lazy_interior_chance=bool(args.lazy_interior_chance),
                 c_visit=float(args.c_visit),
                 c_scale=float(args.c_scale),
@@ -367,6 +393,11 @@ def main() -> None:
             "correct_rust_chance_spectra": True,
             "lazy_interior_chance": bool(args.lazy_interior_chance),
             "public_observation": bool(args.public_observation),
+            "information_set_search": bool(args.information_set_search),
+            "determinization_particles": int(args.determinization_particles),
+            "determinization_min_simulations": int(
+                args.determinization_min_simulations
+            ),
             "prior_temperature": float(args.prior_temperature),
             "value_scale": float(args.value_scale),
             "rust_featurize": bool(args.rust_featurize),

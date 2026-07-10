@@ -104,6 +104,8 @@ def _build_generation_cmd(
         "--temperature-decisions", "90",
         "--correct-rust-chance-spectra", "--lazy-interior-chance",
         "--public-observation",
+        "--information-set-search", "--determinization-particles", "4",
+        "--determinization-min-simulations", "32",
         "--track", "2p_no_trade", "--vps-to-win", "10",
         "--shard-size", "2048", "--format", "npz",
         "--score-actions",

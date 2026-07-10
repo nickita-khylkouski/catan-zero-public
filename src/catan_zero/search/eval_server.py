@@ -814,9 +814,18 @@ def _policy_needs_action_targets(policy: Any) -> bool:
     if policy_config is None:
         return True
     return bool(
-        getattr(policy_config, "action_target_gather", False)
+        str(getattr(policy_config, "state_trunk", "transformer")) != "transformer"
+        or getattr(policy_config, "action_target_gather", False)
         or getattr(policy_config, "edge_policy_head", False)
     )
+
+
+def _policy_needs_relational_topology(policy: Any) -> bool:
+    """Whether this policy's state trunk consumes immutable board topology."""
+    policy_config = getattr(policy, "config", None)
+    if policy_config is None:
+        return True
+    return str(getattr(policy_config, "state_trunk", "transformer")) != "transformer"
 
 
 def _make_forward_policy(policy: Any, config: EvalServerConfig) -> Any:
@@ -891,6 +900,7 @@ def _server_main(
         getattr(policy, "trained_with_masked_hidden_info", False)
     )
     handshake["needs_action_targets"] = _policy_needs_action_targets(policy)
+    handshake["needs_relational_topology"] = _policy_needs_relational_topology(policy)
     handshake["matmul_precision"] = precision
     handshake["transport"] = str(config.transport)
     handshake["max_neural_rows"] = config.max_neural_rows
@@ -1358,6 +1368,9 @@ class EvalServer:
             "needs_action_targets": bool(
                 self._handshake.get("needs_action_targets", True)
             ),
+            "needs_relational_topology": bool(
+                self._handshake.get("needs_relational_topology", False)
+            ),
             "matmul_precision": str(self._handshake.get("matmul_precision", "highest")),
             "transport": str(self._handshake.get("transport", "mp_queue")),
             "max_neural_rows": self._handshake.get("max_neural_rows"),
@@ -1501,6 +1514,7 @@ class RemoteEvalClient(EntityGraphRustEvaluator):
         action_size: int,
         trained_with_masked_hidden_info: bool,
         needs_action_targets: bool = True,
+        needs_relational_topology: bool = False,
         event_token_limit: int | None = None,
         value_categorical_bins: int = 0,
         value_categorical_head_available: bool = False,
@@ -1521,6 +1535,7 @@ class RemoteEvalClient(EntityGraphRustEvaluator):
         self._response_queue = response_queue
         self._client_id = int(client_id)
         self._needs_action_targets = bool(needs_action_targets)
+        self._needs_relational_topology = bool(needs_relational_topology)
         self._event_token_limit = event_token_limit
         self._req_counter = 0
         self._timeout_s = max(0.001, float(client_timeout_ms) / 1000.0)
@@ -1599,7 +1614,19 @@ class RemoteEvalClient(EntityGraphRustEvaluator):
             "entity": {
                 k: np.asarray(v)
                 for k, v in forward_entity_batch.items()
-                if k not in _NON_FORWARD_ENTITY_KEYS
+                if (
+                    k not in _NON_FORWARD_ENTITY_KEYS
+                    or (
+                        self._needs_relational_topology
+                        and k
+                        in {
+                            "hex_vertex_ids",
+                            "hex_edge_ids",
+                            "edge_vertex_ids",
+                            "event_target_ids",
+                        }
+                    )
+                )
                 and (k != "legal_action_target_ids" or self._needs_action_targets)
             },
             "legal_ids": np.asarray(legal_action_ids),

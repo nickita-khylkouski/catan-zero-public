@@ -93,6 +93,7 @@ def test_eval_server_worker_threads_zero_cache_size_to_remote_client(monkeypatch
         332,
         True,
         False,
+        False,
         0,
         0,
         False,

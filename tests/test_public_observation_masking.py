@@ -268,7 +268,7 @@ def _find_chance_nodes(catanatron_rs, seed: int, max_steps: int = 400):
     return robber, buy_dev
 
 
-def test_belief_robber_weights_are_uniform_over_true_steal_set():
+def test_belief_robber_weights_do_not_condition_on_hidden_held_type_set():
     catanatron_rs = _rust()
     robber = None
     for seed in range(0, 40):
@@ -281,12 +281,13 @@ def test_belief_robber_weights_are_uniform_over_true_steal_set():
     true = move_robber_victim_outcome_weights(game, action_json)
     belief = belief_move_robber_outcome_weights(game, action_json)
     assert belief, "belief robber produced no candidates for a non-empty victim"
-    # All belief weights uniform.
-    assert all(abs(w - 1.0) < 1e-9 for _i, w, _g in belief)
-    # Same outcome-index SET as the true (materialized) steal candidates, when
-    # the true path materialized (legacy-shape) rather than passing through.
+    # On the legacy fixed-five spectrum, belief keeps all five public resource
+    # identities with uniform mass, including true-hand-impossible no-op
+    # materializations.  Conditioning the candidate set on the true held types
+    # is exactly the hidden-information leak this path must avoid.
+    assert all(abs(w - 0.2) < 1e-9 for _i, w, _g in belief)
     if true:
-        assert {i for i, _w, _g in belief} == {i for i, _w, _g in true}
+        assert {i for i, _w, _g in true}.issubset({i for i, _w, _g in belief})
 
 
 def test_belief_dev_weights_follow_belief_deck():
@@ -302,9 +303,9 @@ def test_belief_dev_weights_follow_belief_deck():
     real = buy_development_card_real_outcomes(game, action_json)
     belief = belief_buy_development_card_outcomes(game, action_json)
     assert belief, "belief dev produced no candidates"
-    # Belief weights are integer belief-deck counts (>=1), not the engine's
-    # fractional native probabilities.
-    assert all(float(w).is_integer() and w >= 1.0 for _i, w, _g in belief)
+    # Belief weights are posterior predictive probabilities, not the engine's
+    # true-hidden-deck probabilities.
+    assert all(0.0 < w <= 1.0 for _i, w, _g in belief)
     # Belief keeps a subset of (or all) the real drawable outcomes.
     assert {i for i, _w, _g in belief}.issubset({i for i, _w, _g in real})
 

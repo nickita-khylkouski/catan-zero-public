@@ -146,7 +146,7 @@ runtime.
 The maintainer must publish the verified tree under a new release tag and attach:
 
 ~~~text
-catanatron_rs-0.1.3-cp311-cp311-manylinux_2_34_x86_64.whl
+catanatron_rs-0.1.4-cp311-cp311-manylinux_2_34_x86_64.whl
 ~~~
 
 Do not install v1.0-deploy.
@@ -1007,11 +1007,16 @@ old at-rest leak where NPZ `player_tokens` were omniscient. Keep
 `--public-observation`; do not compensate by relying only on trainer-side
 masking.
 
-That flag masks neural inputs, not the authoritative Rust state traversed by
-MCTS. Opponent legal moves and materialized chance outcomes can still depend on
-true hidden cards, so public input rows may have hidden-state-conditioned
-targets. Treat information-set/determinization search as a separate unresolved
-data-quality requirement.
+Neural masking alone is not sufficient: the earlier MCTS implementation cloned
+the authoritative Rust state, so opponent legal moves and materialized chance
+outcomes could condition targets on hidden truth.  The production-safe path now
+requires `--information-set-search --determinization-particles 4
+--determinization-min-simulations 32` and wheel 0.1.4.  The engine samples
+complete public-belief worlds, full n128 teacher roots aggregate four particles,
+n16 fast/forced rows use one particle, and traversal stops when control leaves
+the root actor's turn.  Live action resolution still uses authoritative truth.
+Every shard is stamped `target_information_regime`; masked soft-policy/Q/root-
+value training rejects anything except `public_conservation_pimc_v1`.
 
 Use these defaults for the real-champion capacity repeat:
 
@@ -1054,8 +1059,9 @@ The RL operator owns manual checks for these gaps until code integrates them:
 1. Seed claims have no shared cross-host lock.
 2. Dynamic generation guards run in detached children; launcher dry-run does not
    execute the complete remote overlap guard.
-3. Public-input MCTS is not information-set search; targets can still depend on
-   the authoritative hidden state.
+3. Information-set MCTS requires the sealed 0.1.4 wheel and the explicit
+   determinization flags; older/unknown target regimes are intentionally
+   quarantined from masked soft-target training.
 4. No one Gumbel-specific QA profile backs --trust-curated-data.
 5. Masked search promotion has no safe one-command runner.
 6. Scalable full-fleet diversity QA and a post-harvest provenance binder are

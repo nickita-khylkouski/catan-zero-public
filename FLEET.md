@@ -47,7 +47,7 @@ table is not a teacher/volume role split.
   only in this worktree; `v1.0-deploy` predates them. Publish an immutable new
   release tag with the `catanatron_rs` wheel asset before provisioning any fleet
   box.
-- Env: **Python 3.11.15**, **torch cu128** (all H100 + B200), **catanatron_rs 0.1.3 cp311**.
+- Env target: **Python 3.11.15**, **torch cu128** (all H100 + B200), **catanatron_rs 0.1.4 cp311**.
 - Verification snapshot (2026-07-09): local full suite **1,737 passed / 200
   skipped**; H100 full suite **1,913 passed / 24 skipped**; native
   feature/context/symmetry acceptance **19/19 passed**. The final handoff delta
@@ -64,7 +64,7 @@ table is not a teacher/volume role split.
   curl -fsSL "https://raw.githubusercontent.com/nickita-khylkouski/catan-zero-public/${CATAN_REF}/tools/install_v1_freeze.sh" \
     | CATAN_REF="$CATAN_REF" bash
   ```
-  `tools/install_v1_freeze.sh` — clone+checkout tag → py3.11 venv → torch cu128 → `pip install -e vendor/catanatron` → `pip install -e .[dev,rl]` → `catanatron_rs` 0.1.3 cp311 wheel (from `$CATAN_RS_WHEEL` if set, else auto-fetched from the tagged release) → env-doctor → rust-featurize parity smoke. A commit ref is supported only with an explicit staged `$CATAN_RS_WHEEL`; `CATAN_REPO` also accepts a local git-bundle path as an offline fallback.
+  `tools/install_v1_freeze.sh` — clone+checkout tag → install and enable the canonical foreground `nvidia-mps.service` → py3.11 venv → torch cu128 → `pip install -e vendor/catanatron` → `pip install -e .[dev,rl]` → verify and install the sealed `catanatron_rs` 0.1.4 cp311 wheel → env-doctor → rust-featurize/information-set parity smoke. A commit ref is supported only with an explicit staged `$CATAN_RS_WHEEL`; `CATAN_REPO` also accepts a local git-bundle path as an offline fallback.
 - Fleet acceptance (after install, after staging the private masked champion at
   `~/bundle/champion_v0.pt`, and before the box joins rotation):
   ```
@@ -77,7 +77,7 @@ table is not a teacher/volume role split.
   future non-Intel box.
 
 ## 4. Rust engine (CAT-133)
-- `catanatron-rs` canonical rev **`1400dec` (v0.1.3)** builds the shipped `catanatron_rs-0.1.3-cp311-…manylinux_2_34` wheel (maturin, from `python/`). Runtime is uniform 0.1.3 fleet-wide; the upstream is vendored under `vendor/catanatron/`.
+- `native/catanatron-rs` v0.1.4 is now the canonical wheel source and builds `catanatron_rs-0.1.4-cp311-…manylinux_2_34`; `native/gumbel_mcts_rs` is its linked native-search dependency. `native/catanatron-rs/WHEEL_SHA256SUMS` seals the exact release asset and the installer rejects any byte mismatch. Fleet deployment must be uniform 0.1.4 before information-set generation.
 - **Licensing posture: pending user decision — see CAT-138.**
 
 ## 5. Seed ledger (CAT-125)

@@ -306,7 +306,7 @@ sidecars and the exact audited shard inventory.  It is not valid to rebuild a
 corpus from other shards that merely reuse the selected seeds:
 
 ```bash
-A1_RAW=runs/selfplay/a1-fresh-mixed-12000games
+A1_RAW=runs/selfplay/a1-infoset-n128-p4-12000games-20260710-r1
 A1_AUDIT="$A1_RAW/a1_post_wave.audit.json"
 A1_SELECTED="${A1_AUDIT%.json}.selected_games.json"
 mapfile -t A1_SOURCES < <(find "$A1_RAW" -mindepth 1 -maxdepth 1 -type d -print | sort)
@@ -363,7 +363,7 @@ PY=.venv/bin/python
 DATA=runs/memmap_a1_fresh_mixed_12000games
 GEN3=runs/bc/gen3_20260706/checkpoint.pt
 RUNDIR=runs/rl_program_20260709/a1_fresh35
-A1_AUDIT=runs/selfplay/a1-fresh-mixed-12000games/a1_post_wave.audit.json
+A1_AUDIT=runs/selfplay/a1-infoset-n128-p4-12000games-20260710-r1/a1_post_wave.audit.json
 A1_VALIDATION="${A1_AUDIT%.json}.validation_seeds.json"
 mkdir -p "$RUNDIR"
 
@@ -409,7 +409,7 @@ sorted seed arrays byte-for-byte before accepting any metric:
 ```bash
 PY=.venv/bin/python
 RUNDIR=runs/rl_program_20260709/a1_fresh35
-RAW_FRESH_WINDOW=runs/selfplay/a1-fresh-mixed-12000games
+RAW_FRESH_WINDOW=runs/selfplay/a1-infoset-n128-p4-12000games-20260710-r1
 A1_MSE_EPOCH="$RUNDIR/mse/checkpoint_epoch0001.pt"
 
 "$PY" tools/phase_sliced_value_calibration.py \

@@ -23,7 +23,7 @@ Two subcommands:
           pair, reporting per root and in aggregate:
             * harmful-flip proxy: does the search's argmax differ from the
               prior's argmax (the Gate-A failure signature)?
-            * per-candidate raw-Q spread vs the evaluation noise floor
+            * per-candidate information-set-aggregated Q spread vs the evaluation noise floor
               (sigma_eval / sqrt(mean_visits)) -- is the spread the search is
               acting on real signal or sampling noise?
             * action-ranking quality vs a deeper-eval ORACLE over the top-K
@@ -41,6 +41,11 @@ is cheaper/lower-variance than rollouts. `rollout` instead plays
 our own seeded chance resolution) to terminal and averages the outcome -- an
 independent Monte-Carlo signal, higher variance, more expensive. Both
 evaluate each candidate independently.
+
+For public-observation checkpoints, both the shallow search and deep-search
+oracle use actor-turn information-set MCTS. Candidate ranking comes from the
+aggregated improved policy returned by the public search API; there is no
+fabricated single-world completed-Q/rescaling trace.
 """
 
 from __future__ import annotations
@@ -62,7 +67,6 @@ from catan_zero.rl.gumbel_self_play import _apply_selected_action
 from catan_zero.search.gumbel_chance_mcts import (
     GumbelChanceMCTS,
     GumbelChanceMCTSConfig,
-    _GNode,
 )
 from catan_zero.search.neural_rust_mcts import (
     BatchedEntityGraphRustEvaluator,
@@ -151,34 +155,53 @@ def _kendall_tau_b(x: list[float], y: list[float], *, eps: float = 1.0e-12) -> f
 
 
 def _shallow_root_trace(mcts: GumbelChanceMCTS, game: Any) -> dict[str, Any]:
-    """Run one shallow search and return the per-candidate selection basis
-    (mirrors tools/sigma_trace_placement_root.trace_one_root but also returns
-    the objects the panel's oracle comparison needs)."""
-    root_color = str(game.current_color())
-    root = _GNode(game=game.copy(), root_color=root_color)
-    mcts._expand(root)
-    mcts._run_root_search(root, int(mcts.config.n_full))
+    """Run one shallow search through the public search boundary.
 
-    completed_q = mcts._completed_q(root)
-    rescaled_q = mcts._rescaled_completed_q(root, completed_q)
-    scale = mcts._sigma_scale(root)
-    logits = root.action_logits
+    The old implementation manually constructed a private root from an
+    authoritative game copy and called private expansion helpers. That bypassed actor-turn information-set
+    determinization entirely, so a supposedly public panel searched hidden
+    truth.  ``SearchResult`` already exposes the public-information aggregate
+    needed by this diagnostic: priors, visits, Q, improved policy and the exact
+    selected action.  Use those values directly and never reconstruct an
+    authoritative private tree here.
+    """
+    root_color = str(game.current_color())
+    result = mcts.search(game, force_full=True)
 
     per_candidate: dict[int, dict[str, float]] = {}
-    for action_id, stats in root.actions.items():
+    for action_id, prior in result.priors.items():
+        visits = int(result.visit_counts.get(action_id, 0))
+        raw_q = float(result.q_values.get(action_id, result.root_value))
         per_candidate[action_id] = {
-            "prior": float(stats.prior),
-            "logit": float(logits.get(action_id, 0.0)),
-            "visits": int(stats.visits),
-            "raw_q": float(completed_q.get(action_id, 0.0)),
-            "rescaled_q": float(rescaled_q.get(action_id, 0.0)),
-            "ranking_score": float(logits.get(action_id, 0.0) + scale * rescaled_q.get(action_id, 0.0)),
+            "prior": float(prior),
+            "logit": math.log(max(float(prior), 1.0e-45)),
+            "visits": visits,
+            "raw_q": raw_q,
+            # The information-set aggregate has no single authoritative
+            # completed-Q rescaling.  Its improved policy is the canonical
+            # cross-particle action-ranking signal.
+            "rescaled_q": raw_q,
+            "ranking_score": float(result.improved_policy.get(action_id, 0.0)),
         }
-    return {"root_color": root_color, "per_candidate": per_candidate}
+    return {
+        "root_color": root_color,
+        "per_candidate": per_candidate,
+        "selected_action": int(result.selected_action),
+        "simulations_used": int(result.simulations_used),
+    }
 
 
 def _oracle_value_deep_search(
-    game: Any, action_id: int, root_color: str, *, evaluator: Any, oracle_sims: int, seed: int
+    game: Any,
+    action_id: int,
+    root_color: str,
+    *,
+    evaluator: Any,
+    oracle_sims: int,
+    seed: int,
+    information_set_search: bool,
+    determinization_particles: int,
+    determinization_min_simulations: int,
 ) -> float:
     """Apply `action_id`, run an n=`oracle_sims` search from the afterstate,
     and return its value from `root_color`'s perspective."""
@@ -196,6 +219,9 @@ def _oracle_value_deep_search(
         n_fast=oracle_sims,
         p_full=1.0,
         temperature=0.0,
+        information_set_search=bool(information_set_search),
+        determinization_particles=int(determinization_particles),
+        determinization_min_simulations=int(determinization_min_simulations),
     )
     oracle = GumbelChanceMCTS(config, evaluator)
     result = oracle.search(child, force_full=True)
@@ -268,7 +294,7 @@ def evaluate_root(
     per = trace["per_candidate"]
 
     prior_argmax = max(per, key=lambda a: per[a]["prior"])
-    search_argmax = max(per, key=lambda a: per[a]["ranking_score"])
+    search_argmax = int(trace["selected_action"])
 
     # Raw-Q spread vs noise floor (over VISITED candidates -- unvisited carry
     # v_mix, which would understate the true acted-on spread).
@@ -324,6 +350,11 @@ def evaluate_root(
                 evaluator=evaluator,
                 oracle_sims=oracle_sims,
                 seed=seed * 1_000_003 + i,
+                information_set_search=bool(mcts.config.information_set_search),
+                determinization_particles=int(mcts.config.determinization_particles),
+                determinization_min_simulations=int(
+                    mcts.config.determinization_min_simulations
+                ),
             )
 
     shallow_scores = [per[a]["ranking_score"] for a in top_candidates]
@@ -391,7 +422,23 @@ def _build_config(args: Any) -> GumbelChanceMCTSConfig:
         sigma_eval=float(args.sigma_eval),
         variance_aware_q=bool(args.variance_aware_q),
         variance_aware_k=float(args.variance_aware_k),
+        information_set_search=bool(args.information_set_search),
+        determinization_particles=int(args.determinization_particles),
+        determinization_min_simulations=int(
+            args.determinization_min_simulations
+        ),
     )
+
+
+def _validate_information_recipe(args: Any) -> None:
+    if bool(args.public_observation) != bool(args.information_set_search):
+        raise ValueError(
+            "eval requires --public-observation and --information-set-search together"
+        )
+    if int(args.determinization_particles) < 1:
+        raise ValueError("--determinization-particles must be >= 1")
+    if int(args.determinization_min_simulations) < 1:
+        raise ValueError("--determinization-min-simulations must be >= 1")
 
 
 def main() -> None:
@@ -418,6 +465,17 @@ def main() -> None:
         "match the checkpoint's recorded training regime; masked lineage "
         "checkpoints require --public-observation and fail closed otherwise.",
     )
+    p_eval.add_argument(
+        "--information-set-search",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Search public-belief determinizations. Required with "
+            "--public-observation; masked features alone are insufficient."
+        ),
+    )
+    p_eval.add_argument("--determinization-particles", type=int, default=4)
+    p_eval.add_argument("--determinization-min-simulations", type=int, default=32)
     p_eval.add_argument("--out", required=True)
     p_eval.add_argument("--max-roots", type=int, default=None, help="subsample the panel for a quick run")
     p_eval.add_argument("--seed", type=int, default=600001)
@@ -475,6 +533,11 @@ def main() -> None:
         )
         return
 
+    try:
+        _validate_information_recipe(args)
+    except ValueError as error:
+        parser.error(str(error))
+
     # eval
     panel = json.loads(Path(args.panel).read_text(encoding="utf-8"))
     roots = reconstruct_roots(catanatron_rs, panel)
@@ -523,6 +586,11 @@ def main() -> None:
         "oracle_sims": int(args.oracle_sims),
         "oracle_rollouts": int(args.oracle_rollouts),
         "public_observation": bool(args.public_observation),
+        "information_set_search": bool(args.information_set_search),
+        "determinization_particles": int(args.determinization_particles),
+        "determinization_min_simulations": int(
+            args.determinization_min_simulations
+        ),
         "search_config": {
             "n_full": int(args.n_full),
             "max_depth": int(args.max_depth),
@@ -535,6 +603,11 @@ def main() -> None:
             "variance_aware_k": float(args.variance_aware_k),
             "correct_rust_chance_spectra": bool(args.correct_rust_chance_spectra),
             "lazy_interior_chance": bool(args.lazy_interior_chance),
+            "information_set_search": bool(args.information_set_search),
+            "determinization_particles": int(args.determinization_particles),
+            "determinization_min_simulations": int(
+                args.determinization_min_simulations
+            ),
         },
         "elapsed_seconds": elapsed,
         "seconds_per_root": elapsed / len(root_reports) if root_reports else None,

@@ -99,6 +99,7 @@ def _worker(
             action_size,
             trained_masked,
             needs_targets,
+            needs_relational_topology,
             event_token_limit,
         ) = server_args
         evaluator: Any = RemoteEvalClient(
@@ -108,6 +109,7 @@ def _worker(
             action_size=action_size,
             trained_with_masked_hidden_info=trained_masked,
             needs_action_targets=needs_targets,
+            needs_relational_topology=bool(needs_relational_topology),
             event_token_limit=event_token_limit,
             config=eval_config,
             client_timeout_ms=float(a["client_timeout_ms"]),
@@ -255,6 +257,7 @@ def _run_arm(mode: str, a: dict[str, Any]) -> dict[str, Any]:
                     int(meta["action_size"]),
                     bool(meta["trained_with_masked_hidden_info"]),
                     bool(meta.get("needs_action_targets", True)),
+                    bool(meta.get("needs_relational_topology", False)),
                     meta.get("event_token_limit"),
                 )
 
@@ -453,6 +456,9 @@ def _parity(a: dict[str, Any]) -> dict[str, Any]:
                 meta["trained_with_masked_hidden_info"]
             ),
             needs_action_targets=bool(meta.get("needs_action_targets", True)),
+            needs_relational_topology=bool(
+                meta.get("needs_relational_topology", False)
+            ),
             event_token_limit=meta.get("event_token_limit"),
             config=cfg,
         )

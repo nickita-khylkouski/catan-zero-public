@@ -1,0 +1,19 @@
+{
+  "schema_version": "catan-zero-rnd-leaderboard/v1",
+  "campaign_id": "REPLACE-e5-self-improvement",
+  "required_information_regime": "public_only",
+  "require_same_training_manifest": false,
+  "frozen_candidate_fields": ["search_id", "search_config_sha256"],
+  "purpose": "Compare search distillation, direct two-player KLENT, and distillation followed by KLENT under one frozen evaluation operator.",
+  "required_arm_ids": ["search-distillation", "klent-direct", "distill-then-klent"],
+  "budget_contracts": {
+    "equal_work": {"match_metrics": ["logical_leaves", "orientation_rows"], "absolute_tolerance": 0.0, "relative_tolerance": 0.0},
+    "equal_time": {"match_metrics": ["wall_time_sec"], "absolute_tolerance": 0.01, "relative_tolerance": 0.05}
+  },
+  "arms": [
+    {"arm_id": "search-distillation", "comparison_role": "ranked", "architecture_id": "entity-graph-net-35m", "expected_parameter_count": 35041353, "search_id": "frozen-public-eval", "source_status": "implemented", "measurement_adapter_status": "not_implemented", "runnable": false},
+    {"arm_id": "klent-direct", "comparison_role": "ranked", "architecture_id": "entity-graph-net-35m", "expected_parameter_count": 35041353, "search_id": "frozen-public-eval", "source_status": "implemented_prototype", "measurement_adapter_status": "not_implemented", "runnable": false},
+    {"arm_id": "distill-then-klent", "comparison_role": "ranked", "architecture_id": "entity-graph-net-35m", "expected_parameter_count": 35041353, "search_id": "frozen-public-eval", "source_status": "implemented_prototype", "measurement_adapter_status": "not_implemented", "runnable": false}
+  ],
+  "klent_contract": "2-player no-player-trade only; alpha=.03; beta=.1; trace horizon=8; current-policy improved targets; chosen-action Q lambda returns; Catan same-player prompt signs"
+}

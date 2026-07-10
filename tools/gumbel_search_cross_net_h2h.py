@@ -463,6 +463,15 @@ def _build_search_config(
         correct_rust_chance_spectra=bool(worker_args["correct_rust_chance_spectra"]),
         lazy_interior_chance=bool(worker_args.get("lazy_interior_chance", False)),
         belief_chance_spectra=bool(worker_args.get("belief_chance_spectra", False)),
+        information_set_search=bool(
+            worker_args.get("information_set_search", False)
+        ),
+        determinization_particles=int(
+            worker_args.get("determinization_particles", 1)
+        ),
+        determinization_min_simulations=int(
+            worker_args.get("determinization_min_simulations", 32)
+        ),
         c_scale=float(worker_args.get("c_scale", 0.1)),
         c_visit=float(worker_args.get("c_visit", 50.0)),
         rescale_noise_floor_c=float(worker_args.get("rescale_noise_floor_c", 0.0)),
@@ -595,6 +604,27 @@ def _run_worker(worker_args: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _validate_information_set_recipe(args: Any) -> None:
+    """Reject masked search that can still expand authoritative hidden truth."""
+    public = bool(args.public_observation)
+    information_set = bool(args.information_set_search)
+    if public and not information_set:
+        raise ValueError(
+            "--public-observation requires --information-set-search; masking NN "
+            "features alone does not make the MCTS tree public-information safe"
+        )
+    if information_set and not public:
+        raise ValueError("--information-set-search requires --public-observation")
+    if information_set and bool(args.belief_chance_spectra):
+        raise ValueError(
+            "--information-set-search cannot be combined with --belief-chance-spectra"
+        )
+    if int(args.determinization_particles) < 1:
+        raise ValueError("--determinization-particles must be >= 1")
+    if int(args.determinization_min_simulations) < 1:
+        raise ValueError("--determinization-min-simulations must be >= 1")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Cross-checkpoint H2H gate: candidate checkpoint vs baseline checkpoint, "
@@ -709,6 +739,18 @@ def main() -> None:
         help="Planner-only public-belief chance spectra (hidden-info leak fix, f72) for "
         "both sides' search. Threads to GumbelChanceMCTSConfig.belief_chance_spectra.",
     )
+    parser.add_argument(
+        "--information-set-search",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Actor-turn search over public-belief determinizations. REQUIRED with "
+            "--public-observation; masked NN inputs alone leave authoritative hidden "
+            "truth available to tree expansion."
+        ),
+    )
+    parser.add_argument("--determinization-particles", type=int, default=1)
+    parser.add_argument("--determinization-min-simulations", type=int, default=32)
     parser.add_argument("--n-full-wide", type=int, default=None,
                         help="Backwards-compatible shared wide-root simulation budget for both "
                         "roles. Role-specific flags override this fallback for only that side. "
@@ -793,6 +835,10 @@ def main() -> None:
     parser.add_argument("--out", required=True)
     add_config_flags(parser, default_purpose="gumbel_search_cross_net_h2h")
     args = parser.parse_args()
+    try:
+        _validate_information_set_recipe(args)
+    except ValueError as exc:
+        parser.error(str(exc))
     _gate_cfg, _gate_params = resolve_gate_config(args.gate_config, elo0=args.elo0, elo1=args.elo1)
     args.elo0, args.elo1 = _gate_params["elo0"], _gate_params["elo1"]
 
@@ -872,6 +918,11 @@ def main() -> None:
             "lazy_interior_chance": bool(args.lazy_interior_chance),
             "public_observation": bool(args.public_observation),
             "belief_chance_spectra": bool(args.belief_chance_spectra),
+            "information_set_search": bool(args.information_set_search),
+            "determinization_particles": int(args.determinization_particles),
+            "determinization_min_simulations": int(
+                args.determinization_min_simulations
+            ),
             "value_squash": str(args.value_squash),
             "c_scale": float(args.c_scale),
             "c_visit": float(args.c_visit),
@@ -1033,6 +1084,11 @@ def _build_summary(
         "correct_rust_chance_spectra": bool(args.correct_rust_chance_spectra),
         "public_observation": bool(args.public_observation),
         "belief_chance_spectra": bool(args.belief_chance_spectra),
+        "information_set_search": bool(args.information_set_search),
+        "determinization_particles": int(args.determinization_particles),
+        "determinization_min_simulations": int(
+            args.determinization_min_simulations
+        ),
         "n_full_wide": (int(args.n_full_wide) if args.n_full_wide is not None else None),
         "n_full_wide_threshold": (
             int(args.n_full_wide_threshold)

@@ -1,0 +1,14 @@
+[package]
+name = "catanatron-rs-python"
+version = "0.1.4"
+edition = "2024"
+publish = false
+
+[lib]
+name = "catanatron_rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+catanatron-rs = { path = "..", default-features = false, features = ["python"] }
+pyo3 = { version = "0.27", features = ["extension-module"] }
+serde_json = "1"

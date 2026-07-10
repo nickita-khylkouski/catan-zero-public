@@ -35,13 +35,22 @@ EXPECTED_VALUE_FLAGS = {
     "--n-full": "128",
     "--n-fast": "16",
     "--p-full": "0.25",
+    "--c-scale": "0.03",
+    "--c-visit": "50.0",
+    "--max-depth": "80",
     "--workers": "16",
     "--device": "cuda",
     "--symmetry-averaged-eval-threshold": "20",
     "--rescale-noise-floor-c": "0.0",
+    "--determinization-particles": "4",
+    "--determinization-min-simulations": "32",
 }
 REQUIRED_SWITCHES = {
     "--symmetry-averaged-eval",
+    "--public-observation",
+    "--information-set-search",
+    "--lazy-interior-chance",
+    "--no-belief-chance-spectra",
     "--no-wide-roots-always-full",
     "--no-eval-server",
     "--seed-claim",
@@ -54,6 +63,9 @@ FORBIDDEN_FLAGS = {
     "--eval-server",
     "--skip-guards",
     "--no-seed-claim",
+    "--no-public-observation",
+    "--no-information-set-search",
+    "--belief-chance-spectra",
 }
 
 
@@ -245,6 +257,10 @@ def validate_exact_canary(
             "n_full": 128,
             "n_fast": 16,
             "p_full": 0.25,
+            "public_observation": True,
+            "information_set_search": True,
+            "determinization_particles": 4,
+            "determinization_min_simulations": 32,
             "symmetry_averaged_eval": True,
             "symmetry_averaged_eval_threshold": 20,
             "adaptive_wide_budget": False,

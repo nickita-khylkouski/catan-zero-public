@@ -31,6 +31,9 @@ def _fake_args(**overrides):
         correct_rust_chance_spectra=True,
         public_observation=True,
         belief_chance_spectra=False,
+        information_set_search=True,
+        determinization_particles=4,
+        determinization_min_simulations=32,
         n_full_wide=None,
         raw_policy_above_width=None,
         symmetry_averaged_eval=False,
@@ -79,6 +82,12 @@ class TestSummaryRecordsProvenance:
     def test_belief_chance_spectra_recorded(self):
         summary = _build(_fake_args(belief_chance_spectra=True), [_game(0, True), _game(0, True)])
         assert summary["belief_chance_spectra"] is True
+
+    def test_information_set_recipe_recorded(self):
+        summary = _build(_fake_args(), [_game(0, True), _game(0, True)])
+        assert summary["information_set_search"] is True
+        assert summary["determinization_particles"] == 4
+        assert summary["determinization_min_simulations"] == 32
 
     def test_n_full_wide_recorded_when_set(self):
         summary = _build(_fake_args(n_full_wide=512), [_game(0, True), _game(0, True)])

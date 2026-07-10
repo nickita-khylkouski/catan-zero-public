@@ -1,0 +1,59 @@
+{
+  "schema_version": "catan-zero-rnd-h100-probe-summary/v1",
+  "hardware": "NVIDIA H100 80GB HBM3",
+  "torch_version": "2.7.0",
+  "precision": "bfloat16_autocast_fp32_loss",
+  "shape": {"batch_size": 32, "legal_actions": 64, "events": 64},
+  "warmup_iterations": 3,
+  "measured_iterations": 12,
+  "results": [
+    {
+      "trunk": "transformer",
+      "parameter_count": 35041353,
+      "rows_per_sec": 2048.5516012028024,
+      "peak_allocated_bytes": 1608108032,
+      "measured_iterations": 12,
+      "finite": true
+    },
+    {
+      "trunk": "rrt",
+      "parameter_count": 20070932,
+      "rows_per_sec": 215.80727976969033,
+      "peak_allocated_bytes": 1616014848,
+      "measured_iterations": 12,
+      "finite": true
+    },
+    {
+      "trunk": "resrgcn",
+      "parameter_count": 20936010,
+      "rows_per_sec": 6.69591883608316,
+      "peak_allocated_bytes": 2195676672,
+      "measured_iterations": 12,
+      "finite": true
+    },
+    {
+      "trunk": "think_rrt_k4",
+      "parameter_count": 22146453,
+      "rows_per_sec": 208.0631270938901,
+      "peak_allocated_bytes": 1728711168,
+      "measured_iterations": 8,
+      "finite": true
+    },
+    {
+      "trunk": "moe_rrt_top2_of_8",
+      "parameter_count": 28508948,
+      "nominal_active_parameters": 20525588,
+      "rows_per_sec": 140.65785803287307,
+      "peak_allocated_bytes": 1887380480,
+      "measured_iterations": 8,
+      "finite": true
+    }
+  ],
+  "rrt_batch64_confirmation": {
+    "batch_size": 64,
+    "rows_per_sec": 186.12146334534037,
+    "peak_allocated_bytes": 2999665664,
+    "finite": true
+  },
+  "interpretation": "Feasibility and systems falsification only; no playing-strength conclusion."
+}

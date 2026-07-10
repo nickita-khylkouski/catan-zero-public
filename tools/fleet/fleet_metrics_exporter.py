@@ -24,13 +24,36 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 METRIC_PREFIX = "catan_fleet_"
-GPU_DIR_RE = re.compile(
-    r"^gpu(?P<gpu>[0-9]+)(?:_pipeline(?P<pipeline>[01]))?$"
-)
+GPU_DIR_RE = re.compile(r"^gpu(?P<gpu>[0-9]+)(?:_pipeline(?P<pipeline>[01]))?$")
 A1_GPU_DIR_RE = re.compile(
     r"^(?P<alias>[A-Za-z0-9][A-Za-z0-9-]*)_gpu(?P<gpu>[0-9]+)__"
     r"(?P<category>current_producer|recent_history|hard_negative)$"
 )
+
+# Exact sealed A1 production recipe. Monitoring deliberately duplicates these
+# scalar expectations instead of treating a config hash as sufficient: an
+# operator must be able to see which safety-critical knob drifted while the
+# wave is live. Keep this table synchronized with the sealed A1 contract and
+# generate_gumbel_selfplay_data guard.
+PUBLIC_TARGET_INFORMATION_REGIME = "public_conservation_pimc_v1"
+UNKNOWN_TARGET_INFORMATION_REGIME = "unknown"
+EXPECTED_A1_RECIPE: dict[str, Any] = {
+    "public_observation": True,
+    "information_set_search": True,
+    "determinization_particles": 4,
+    "determinization_min_simulations": 32,
+    "n_full": 128,
+    "n_fast": 16,
+    "p_full": 0.25,
+    "symmetry_averaged_eval": True,
+    "symmetry_averaged_eval_threshold": 20,
+    "c_scale": 0.03,
+    "c_visit": 50.0,
+    "max_depth": 80,
+    "lazy_interior_chance": True,
+    "belief_chance_spectra": False,
+    "target_information_regime": PUBLIC_TARGET_INFORMATION_REGIME,
+}
 
 
 def _load_json(path: Path) -> dict[str, Any] | None:
@@ -55,6 +78,17 @@ def _flag_value(argv: Sequence[str], name: str) -> str | None:
     return None
 
 
+def _flag_bool(argv: Sequence[str], positive: str, negative: str) -> bool | None:
+    """Return the last explicit argparse boolean flag, if either is present."""
+    resolved: bool | None = None
+    for value in argv:
+        if value == positive:
+            resolved = True
+        elif value == negative:
+            resolved = False
+    return resolved
+
+
 def discover_generators(proc_root: Path = Path("/proc")) -> dict[str, set[int]]:
     """Map resolved ``--out-dir`` paths to live top-level generator PIDs."""
     found: dict[str, set[int]] = {}
@@ -70,16 +104,22 @@ def discover_generators(proc_root: Path = Path("/proc")) -> dict[str, set[int]]:
         except OSError:
             continue
         argv = [part.decode("utf-8", "replace") for part in raw.split(b"\0") if part]
-        if not any(value.endswith("generate_gumbel_selfplay_data.py") for value in argv):
+        if not any(
+            value.endswith("generate_gumbel_selfplay_data.py") for value in argv
+        ):
             continue
         out_dir = _flag_value(argv, "--out-dir")
         if not out_dir:
             continue
-        found.setdefault(str(Path(out_dir).expanduser().resolve()), set()).add(int(entry.name))
+        found.setdefault(str(Path(out_dir).expanduser().resolve()), set()).add(
+            int(entry.name)
+        )
     return found
 
 
-def discover_generator_argv(proc_root: Path = Path("/proc")) -> dict[str, tuple[str, ...]]:
+def discover_generator_argv(
+    proc_root: Path = Path("/proc"),
+) -> dict[str, tuple[str, ...]]:
     """Map each live generator output to one deterministic, inspectable argv."""
     found: dict[str, tuple[int, tuple[str, ...]]] = {}
     try:
@@ -96,7 +136,9 @@ def discover_generator_argv(proc_root: Path = Path("/proc")) -> dict[str, tuple[
         argv = tuple(
             part.decode("utf-8", "replace") for part in raw.split(b"\0") if part
         )
-        if not any(value.endswith("generate_gumbel_selfplay_data.py") for value in argv):
+        if not any(
+            value.endswith("generate_gumbel_selfplay_data.py") for value in argv
+        ):
             continue
         out_dir = _flag_value(argv, "--out-dir")
         if not out_dir:
@@ -119,6 +161,67 @@ def _number(value: Any, default: float = 0.0) -> float:
     return result if math.isfinite(result) else default
 
 
+def _boolean(value: Any, default: bool = False) -> bool:
+    if type(value) is bool:
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+    return default
+
+
+def _recipe_value(
+    key: str,
+    *,
+    manifest: Mapping[str, Any] | None,
+    fields: Mapping[str, Any],
+    argv: Sequence[str],
+    flag: str,
+) -> Any:
+    """Read one effective recipe value from durable then live provenance."""
+    if manifest is not None:
+        if key in manifest and manifest[key] is not None:
+            return manifest[key]
+        cli_args = manifest.get("cli_args")
+        if (
+            isinstance(cli_args, Mapping)
+            and key in cli_args
+            and cli_args[key] is not None
+        ):
+            return cli_args[key]
+    if key in fields and fields[key] is not None:
+        return fields[key]
+    return _flag_value(argv, flag)
+
+
+def _recipe_bool_value(
+    key: str,
+    *,
+    manifest: Mapping[str, Any] | None,
+    fields: Mapping[str, Any],
+    argv: Sequence[str],
+    positive: str,
+    negative: str,
+) -> bool:
+    if manifest is not None:
+        if key in manifest and manifest[key] is not None:
+            return _boolean(manifest[key])
+        cli_args = manifest.get("cli_args")
+        if (
+            isinstance(cli_args, Mapping)
+            and key in cli_args
+            and cli_args[key] is not None
+        ):
+            return _boolean(cli_args[key])
+    if key in fields and fields[key] is not None:
+        return _boolean(fields[key])
+    explicit = _flag_bool(argv, positive, negative)
+    return bool(explicit) if explicit is not None else False
+
+
 @dataclass(frozen=True)
 class RunSnapshot:
     host: str
@@ -129,8 +232,23 @@ class RunSnapshot:
     run: str
     role: str
     config_hash: str
+    public_observation: bool
+    information_set_search: bool
+    determinization_particles: int
+    determinization_min_simulations: int
     n_full: int
+    n_fast: int
     p_full: float
+    symmetry_averaged_eval: bool
+    symmetry_averaged_eval_threshold: int
+    c_scale: float
+    c_visit: float
+    max_depth: int
+    lazy_interior_chance: bool
+    belief_chance_spectra: bool
+    target_information_regime: str
+    target_information_regime_attested: bool
+    recipe_safe: bool
     seed_start: int
     seed_end: int
     games_requested: int
@@ -197,7 +315,12 @@ def snapshot_run(
     manifest = _load_json(manifest_path)
     a1_contract = _load_json(a1_contract_path)
     progress, progress_mtime = _aggregate_progress(gpu_dir)
-    if not config and manifest is None and a1_contract is None and progress_mtime == 0.0:
+    if (
+        not config
+        and manifest is None
+        and a1_contract is None
+        and progress_mtime == 0.0
+    ):
         return None
 
     if manifest is not None:
@@ -258,7 +381,9 @@ def snapshot_run(
     )
     seed_start = int(
         _number(
-            manifest.get("base_seed") if manifest is not None else fields.get("base_seed")
+            manifest.get("base_seed")
+            if manifest is not None
+            else fields.get("base_seed")
         )
     )
     if not seed_start:
@@ -266,16 +391,117 @@ def snapshot_run(
     if not seed_start and a1_contract is not None:
         seed_start = int(_number(a1_contract.get("base_seed")))
     run = gpu_dir.parent.name
-    n_full = int(
-        _number(manifest.get("n_full") if manifest is not None else fields.get("n_full"))
+    recipe_source = {
+        key: _recipe_value(
+            key,
+            manifest=manifest,
+            fields=fields,
+            argv=argv,
+            flag="--" + key.replace("_", "-"),
+        )
+        for key in (
+            "determinization_particles",
+            "determinization_min_simulations",
+            "n_full",
+            "n_fast",
+            "p_full",
+            "symmetry_averaged_eval_threshold",
+            "c_scale",
+            "c_visit",
+            "max_depth",
+        )
+    }
+    public_observation = _recipe_bool_value(
+        "public_observation",
+        manifest=manifest,
+        fields=fields,
+        argv=argv,
+        positive="--public-observation",
+        negative="--no-public-observation",
     )
-    p_full = _number(
-        manifest.get("p_full") if manifest is not None else fields.get("p_full")
+    information_set_search = _recipe_bool_value(
+        "information_set_search",
+        manifest=manifest,
+        fields=fields,
+        argv=argv,
+        positive="--information-set-search",
+        negative="--no-information-set-search",
     )
-    if n_full <= 0:
-        n_full = int(_number(_flag_value(argv, "--n-full")))
-    if p_full <= 0:
-        p_full = _number(_flag_value(argv, "--p-full"))
+    symmetry_averaged_eval = _recipe_bool_value(
+        "symmetry_averaged_eval",
+        manifest=manifest,
+        fields=fields,
+        argv=argv,
+        positive="--symmetry-averaged-eval",
+        negative="--no-symmetry-averaged-eval",
+    )
+    lazy_interior_chance = _recipe_bool_value(
+        "lazy_interior_chance",
+        manifest=manifest,
+        fields=fields,
+        argv=argv,
+        positive="--lazy-interior-chance",
+        negative="--no-lazy-interior-chance",
+    )
+    belief_chance_spectra = _recipe_bool_value(
+        "belief_chance_spectra",
+        manifest=manifest,
+        fields=fields,
+        argv=argv,
+        positive="--belief-chance-spectra",
+        negative="--no-belief-chance-spectra",
+    )
+    determinization_particles = int(_number(recipe_source["determinization_particles"]))
+    determinization_min_simulations = int(
+        _number(recipe_source["determinization_min_simulations"])
+    )
+    n_full = int(_number(recipe_source["n_full"]))
+    n_fast = int(_number(recipe_source["n_fast"]))
+    p_full = _number(recipe_source["p_full"])
+    symmetry_averaged_eval_threshold = int(
+        _number(recipe_source["symmetry_averaged_eval_threshold"])
+    )
+    c_scale = _number(recipe_source["c_scale"])
+    c_visit = _number(recipe_source["c_visit"])
+    max_depth = int(_number(recipe_source["max_depth"]))
+    raw_target_regime = (
+        manifest.get("target_information_regime") if manifest is not None else None
+    )
+    target_information_regime_attested = isinstance(raw_target_regime, str)
+    if not target_information_regime_attested:
+        configured_regime = fields.get("target_information_regime")
+        raw_target_regime = (
+            configured_regime if isinstance(configured_regime, str) else None
+        )
+    # The generator deterministically stamps this public regime only after its
+    # native determinization capability check succeeds. While a lane is live
+    # and has not written its terminal manifest yet, expose that effective
+    # regime from the exact launch setting but keep the separate attested bit 0.
+    target_information_regime = (
+        str(raw_target_regime)
+        if raw_target_regime is not None
+        else PUBLIC_TARGET_INFORMATION_REGIME
+        if information_set_search
+        else UNKNOWN_TARGET_INFORMATION_REGIME
+    )
+    effective_recipe = {
+        "public_observation": public_observation,
+        "information_set_search": information_set_search,
+        "determinization_particles": determinization_particles,
+        "determinization_min_simulations": determinization_min_simulations,
+        "n_full": n_full,
+        "n_fast": n_fast,
+        "p_full": p_full,
+        "symmetry_averaged_eval": symmetry_averaged_eval,
+        "symmetry_averaged_eval_threshold": symmetry_averaged_eval_threshold,
+        "c_scale": c_scale,
+        "c_visit": c_visit,
+        "max_depth": max_depth,
+        "lazy_interior_chance": lazy_interior_chance,
+        "belief_chance_spectra": belief_chance_spectra,
+        "target_information_regime": target_information_regime,
+    }
+    recipe_safe = effective_recipe == EXPECTED_A1_RECIPE
     seed_end = seed_start + games_requested
     if a1_contract is not None:
         attested_seed_end = int(_number(a1_contract.get("seed_end")))
@@ -292,8 +518,23 @@ def snapshot_run(
         run=run,
         role=role,
         config_hash=config_hash,
+        public_observation=public_observation,
+        information_set_search=information_set_search,
+        determinization_particles=determinization_particles,
+        determinization_min_simulations=determinization_min_simulations,
         n_full=n_full,
+        n_fast=n_fast,
         p_full=p_full,
+        symmetry_averaged_eval=symmetry_averaged_eval,
+        symmetry_averaged_eval_threshold=symmetry_averaged_eval_threshold,
+        c_scale=c_scale,
+        c_visit=c_visit,
+        max_depth=max_depth,
+        lazy_interior_chance=lazy_interior_chance,
+        belief_chance_spectra=belief_chance_spectra,
+        target_information_regime=target_information_regime,
+        target_information_regime_attested=target_information_regime_attested,
+        recipe_safe=recipe_safe,
         seed_start=seed_start,
         seed_end=seed_end,
         games_requested=games_requested,
@@ -339,7 +580,10 @@ def collect_snapshots(
             )
             if snapshot is None:
                 continue
-            if snapshot.process_count == 0 and snapshot.stale_seconds > max_run_age_seconds:
+            if (
+                snapshot.process_count == 0
+                and snapshot.stale_seconds > max_run_age_seconds
+            ):
                 continue
             snapshots.append(snapshot)
     # Avoid unbounded label cardinality: expose one current run per physical
@@ -351,7 +595,9 @@ def collect_snapshots(
         prior = by_slot.get(slot)
         score = (snapshot.process_count > 0, -snapshot.stale_seconds)
         prior_score = (
-            (prior.process_count > 0, -prior.stale_seconds) if prior is not None else None
+            (prior.process_count > 0, -prior.stale_seconds)
+            if prior is not None
+            else None
         )
         if prior_score is None or score > prior_score:
             by_slot[slot] = snapshot
@@ -402,6 +648,22 @@ def render_metrics(
         "generator_truncations": "truncations",
         "generator_seed_start": "seed_start",
         "generator_seed_end": "seed_end",
+        "generator_public_observation": "public_observation",
+        "generator_information_set_search": "information_set_search",
+        "generator_determinization_particles": "determinization_particles",
+        "generator_determinization_min_simulations": "determinization_min_simulations",
+        "generator_n_full": "n_full",
+        "generator_n_fast": "n_fast",
+        "generator_p_full": "p_full",
+        "generator_symmetry_averaged_eval": "symmetry_averaged_eval",
+        "generator_symmetry_averaged_eval_threshold": "symmetry_averaged_eval_threshold",
+        "generator_c_scale": "c_scale",
+        "generator_c_visit": "c_visit",
+        "generator_max_depth": "max_depth",
+        "generator_lazy_interior_chance": "lazy_interior_chance",
+        "generator_belief_chance_spectra": "belief_chance_spectra",
+        "generator_target_information_regime_attested": "target_information_regime_attested",
+        "generator_recipe_safe": "recipe_safe",
     }
     for snapshot in snapshots:
         labels = {
@@ -417,7 +679,20 @@ def render_metrics(
         info_labels = {
             **labels,
             "n_full": snapshot.n_full,
+            "n_fast": snapshot.n_fast,
             "p_full": snapshot.p_full,
+            "public_observation": str(snapshot.public_observation).lower(),
+            "information_set_search": str(snapshot.information_set_search).lower(),
+            "determinization_particles": snapshot.determinization_particles,
+            "determinization_min_simulations": snapshot.determinization_min_simulations,
+            "symmetry_averaged_eval": str(snapshot.symmetry_averaged_eval).lower(),
+            "symmetry_averaged_eval_threshold": snapshot.symmetry_averaged_eval_threshold,
+            "c_scale": snapshot.c_scale,
+            "c_visit": snapshot.c_visit,
+            "max_depth": snapshot.max_depth,
+            "lazy_interior_chance": str(snapshot.lazy_interior_chance).lower(),
+            "belief_chance_spectra": str(snapshot.belief_chance_spectra).lower(),
+            "target_information_regime": snapshot.target_information_regime,
             "seed_range": f"[{snapshot.seed_start},{snapshot.seed_end})",
         }
         lines.append(_sample("generator_info", 1, info_labels))
@@ -426,10 +701,32 @@ def render_metrics(
             if isinstance(value, bool):
                 value = int(value)
             lines.append(_sample(metric, value, labels))
+        lines.append(
+            _sample("generator_active", int(snapshot.process_count > 0), labels)
+        )
+    lines.append(
+        _sample(
+            "generator_lanes_active_total",
+            sum(snapshot.process_count > 0 for snapshot in snapshots),
+            {"host": host},
+        )
+    )
+    lines.append(
+        _sample(
+            "generator_lanes_recipe_safe_total",
+            sum(
+                snapshot.process_count > 0 and snapshot.recipe_safe
+                for snapshot in snapshots
+            ),
+            {"host": host},
+        )
+    )
     for root in roots:
         resolved = root.expanduser().resolve()
         try:
-            usage = shutil.disk_usage(resolved if resolved.exists() else resolved.parent)
+            usage = shutil.disk_usage(
+                resolved if resolved.exists() else resolved.parent
+            )
         except OSError:
             continue
         labels = {"host": host, "path": str(resolved)}

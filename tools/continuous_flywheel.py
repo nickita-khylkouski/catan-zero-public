@@ -382,6 +382,12 @@ class Runner:
             "--workers", str(self.workers),
             "--base-seed", str(self._gate_seed(round_idx)),
             "--out", str(out),
+            ("--information-set-search" if self.cfg.gate_information_set_search
+             else "--no-information-set-search"),
+            "--determinization-particles",
+            str(self.cfg.gate_determinization_particles),
+            "--determinization-min-simulations",
+            str(self.cfg.gate_determinization_min_simulations),
         ]
         if self.cfg.gate_lazy_interior_chance:
             cmd.append("--lazy-interior-chance")
@@ -404,12 +410,19 @@ class Runner:
         if not self.cfg.gate_enabled:
             return {"ok": True, "pass": True, "verdict": "disabled", "note": "gate disabled"}
         if self.cfg.gate_style == "scoreboard":
-            print("[flywheel] WARNING: gate_style='scoreboard' (tools/promotion_gate_runner.py -> "
-                  "evaluate_scoreboard.py) does NOT apply hidden-info masking anywhere in its policy "
-                  "-loading chain. A masked-trained candidate gated on this path is evaluated with "
-                  "omniscient features (train/eval mismatch). Use gate_style='h2h' (default) unless "
-                  "you have a specific reason not to.", flush=True)
-            return self._gate_scoreboard(candidate_path, champion_path, round_idx)
+            # A warning is not a safety boundary: this branch used to continue
+            # into an omniscient scoreboard and could promote a masked model on
+            # invalid evidence.  Keep the legacy implementation readable for
+            # historical replay, but production promotion now fails closed.
+            return {
+                "ok": False,
+                "pass": False,
+                "verdict": "unsafe_gate_style",
+                "reason": (
+                    "scoreboard evaluation has no public-information search "
+                    "boundary; use gate_style='h2h'"
+                ),
+            }
         return self._gate_h2h(candidate_path, champion_path, round_idx)
 
     def _gate_h2h(self, candidate_path: str, champion_path: str, round_idx: int) -> dict:
@@ -427,6 +440,11 @@ class Runner:
             "gate_config_params": gate_params,
             "h2h_tiers": tiers,
             "public_observation": True,
+            "information_set_search": True,
+            "determinization_particles": self.cfg.gate_determinization_particles,
+            "determinization_min_simulations": (
+                self.cfg.gate_determinization_min_simulations
+            ),
             "candidate_value_readout": self.cfg.gate_candidate_value_readout,
             "baseline_value_readout": self.cfg.gate_baseline_value_readout,
             "promotion_scope": "generator_champion_only",
@@ -501,6 +519,33 @@ class Runner:
                     "pass": False,
                     "verdict": "masking_mismatch",
                     "reason": "H2H artifact did not attest public_observation=true",
+                    "raw_summary": str(raw_out),
+                    "tiers_run": tiers_run,
+                }
+                _atomic_json(out, result)
+                return result
+
+            expected_information_recipe = (
+                True,
+                int(self.cfg.gate_determinization_particles),
+                int(self.cfg.gate_determinization_min_simulations),
+            )
+            observed_information_recipe = (
+                summary.get("information_set_search"),
+                summary.get("determinization_particles"),
+                summary.get("determinization_min_simulations"),
+            )
+            if observed_information_recipe != expected_information_recipe:
+                result = {
+                    **common,
+                    "ok": False,
+                    "pass": False,
+                    "verdict": "information_regime_mismatch",
+                    "reason": (
+                        "H2H artifact did not attest the requested public-information "
+                        f"search recipe: expected={expected_information_recipe!r}, "
+                        f"observed={observed_information_recipe!r}"
+                    ),
                     "raw_summary": str(raw_out),
                     "tiers_run": tiers_run,
                 }
@@ -962,6 +1007,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--gen-temperature-decisions", type=int, default=None, help="CAT-88 gen search: temperature decisions (canonical 90, NOT the tool default 45)")
     p.add_argument("--gen-lazy-interior-chance", action=argparse.BooleanOptionalAction, default=None, help="CAT-88 gen search: lazy-interior-chance (canonical ON, NOT the tool default OFF)")
     p.add_argument("--gen-correct-rust-chance-spectra", action=argparse.BooleanOptionalAction, default=None, help="CAT-88 gen search: correct-rust-chance-spectra (canonical ON)")
+    p.add_argument(
+        "--gen-information-set-search",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Required public-belief MCTS regime. Must be explicitly enabled; "
+            "masked evaluator inputs alone do not protect search targets."
+        ),
+    )
+    p.add_argument("--gen-determinization-particles", type=int, default=None)
+    p.add_argument("--gen-determinization-min-simulations", type=int, default=None)
     p.add_argument("--evict-stale-shards", action="store_true",
                    help="physically delete out-of-window shards each round (recommended for long runs)")
     p.add_argument("--evict-grace-seconds", type=float, default=0.0,
@@ -1089,6 +1145,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         gen_temperature_decisions=args.gen_temperature_decisions,
         gen_lazy_interior_chance=args.gen_lazy_interior_chance,
         gen_correct_rust_chance_spectra=args.gen_correct_rust_chance_spectra,
+        gen_information_set_search=args.gen_information_set_search,
+        gen_determinization_particles=args.gen_determinization_particles,
+        gen_determinization_min_simulations=(
+            args.gen_determinization_min_simulations
+        ),
     ).validate()
     save_config(loop_dir, cfg)
 

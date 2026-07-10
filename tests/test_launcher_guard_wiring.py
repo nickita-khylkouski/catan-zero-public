@@ -50,6 +50,9 @@ GOLDEN_OPTION_STRINGS = {
     "generate_gumbel_selfplay_data": {
         ("--base-seed",),
         ("--belief-chance-spectra", "--no-belief-chance-spectra"),
+        ("--information-set-search", "--no-information-set-search"),
+        ("--determinization-particles",),
+        ("--determinization-min-simulations",),
         ("--c-scale",),
         ("--c-visit",),
         ("--checkpoint",),
@@ -154,6 +157,7 @@ GOLDEN_OPTION_STRINGS = {
         ("--device",),
         ("--dump-config",),
         ("--edge-policy-head",),
+        ("--entity-state-trunk",),
         ("--epochs",),
         ("--final-vp-loss-weight",),
         ("--forced-action-weight",),
@@ -173,6 +177,8 @@ GOLDEN_OPTION_STRINGS = {
         ("--host-lock-file",),
         ("--init-checkpoint",),
         ("--loser-sample-weight",),
+        ("--latent-deliberation-slots",),
+        ("--latent-deliberation-steps",),
         ("--lr",),
         ("--lr-schedule",),
         ("--lr-warmup-steps",),
@@ -180,6 +186,10 @@ GOLDEN_OPTION_STRINGS = {
         ("--max-35m-params",),
         ("--max-steps",),
         ("--min-35m-params",),
+        ("--moe-expert-ff-size",),
+        ("--moe-balance-loss-weight",),
+        ("--moe-routed-experts",),
+        ("--moe-top-k",),
         ("--no-symmetry-augment", "--symmetry-augment"),
         ("--no-symmetry-augment-events", "--symmetry-augment-events"),
         ("--optimizer",),
@@ -193,6 +203,10 @@ GOLDEN_OPTION_STRINGS = {
         ("--progress-every-batches",),
         ("--q-loss-weight",),
         ("--q-skip-teacher-prefixes",),
+        ("--relational-action-cross-layers",),
+        ("--relational-bases",),
+        ("--relational-block-pattern",),
+        ("--relational-ff-size",),
         ("--report",),
         ("--no-resume-optimizer", "--resume-optimizer"),
         ("--require-35m-model",),
@@ -251,6 +265,9 @@ GOLDEN_OPTION_STRINGS = {
         ("--gen-c-scale",),
         ("--gen-c-visit",),
         ("--gen-correct-rust-chance-spectra", "--no-gen-correct-rust-chance-spectra"),
+        ("--gen-determinization-min-simulations",),
+        ("--gen-determinization-particles",),
+        ("--gen-information-set-search", "--no-gen-information-set-search"),
         ("--gen-lazy-interior-chance", "--no-gen-lazy-interior-chance"),
         ("--gen-max-decisions",),
         ("--gen-max-depth",),
@@ -379,6 +396,9 @@ def test_continuous_flywheel_sample_argv_produces_expected_namespace(tmp_path):
     # Untouched defaults must be unaffected by the extraction.
     assert args.regime == "continuous"
     assert args.batch_size == 65536
+    assert args.gen_information_set_search is None
+    assert args.gen_determinization_particles is None
+    assert args.gen_determinization_min_simulations is None
     assert args.skip_guards is False
 
 
@@ -443,13 +463,26 @@ class TestGenerateGumbelSelfplayGuardWiring:
         "--c-visit",
         "50.0",
         "--n-full",
-        "64",
+        "128",
         "--n-fast",
         "16",
+        "--p-full",
+        "0.25",
+        "--max-depth",
+        "80",
         "--temperature-decisions",
         "90",
         "--public-observation",
         "--lazy-interior-chance",
+        "--symmetry-averaged-eval",
+        "--symmetry-averaged-eval-threshold",
+        "20",
+        "--no-belief-chance-spectra",
+        "--information-set-search",
+        "--determinization-particles",
+        "4",
+        "--determinization-min-simulations",
+        "32",
     ]
 
     def test_seed_ledger_collision_refuses_launch(self, tmp_path):

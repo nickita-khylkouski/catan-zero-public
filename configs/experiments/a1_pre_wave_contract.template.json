@@ -1,6 +1,6 @@
 {
   "schema_version": "a1-pre-wave-contract-draft-v2",
-  "contract_id": "a1-fresh-mixed-12000games",
+  "contract_id": "a1-infoset-n128-p4-12000games",
   "science": {
     "search": {
       "max_depth": 80,
@@ -22,6 +22,9 @@
       "exact_budget_sh": "__UNRESOLVED__",
       "exact_budget_sh_min_n": "__UNRESOLVED__",
       "belief_chance_spectra": false,
+      "information_set_search": true,
+      "determinization_particles": "__UNRESOLVED__",
+      "determinization_min_simulations": 32,
       "rescale_noise_floor_c": "__UNRESOLVED__",
       "sigma_eval": "__UNRESOLVED__"
     },
@@ -226,6 +229,7 @@
     "guard_config": "../guards/generate_gumbel_selfplay_data.json",
     "generator_code_files": [
       "../../tools/generate_gumbel_selfplay_data.py",
+      "../../tools/fleet/systemd/nvidia-mps.service",
       "../../tools/opponent_mix_registry.py",
       "../../src/catan_zero/rl/gumbel_self_play.py",
       "../../src/catan_zero/rl/flywheel/opponent_mix.py",
@@ -234,7 +238,14 @@
       "../../src/catan_zero/rl/hex_symmetry.py",
       "../../src/catan_zero/search/gumbel_chance_mcts.py",
       "../../src/catan_zero/search/neural_rust_mcts.py",
-      "../../src/catan_zero/rl/pipeline_configs.py"
+      "../../src/catan_zero/rl/pipeline_configs.py",
+      "../../native/catanatron-rs/Cargo.toml",
+      "../../native/catanatron-rs/WHEEL_SHA256SUMS",
+      "../../native/catanatron-rs/python/Cargo.toml",
+      "../../native/catanatron-rs/src/lib.rs",
+      "../../native/catanatron-rs/python/src/lib.rs",
+      "../../native/gumbel_mcts_rs/Cargo.toml",
+      "../../native/gumbel_mcts_rs/src/lib.rs"
     ],
     "learner_code_files": [
       "../guards/train_bc.json",
@@ -275,6 +286,7 @@
     ],
     "require_shard_sha256": true,
     "require_contract_attestation": true,
+    "require_target_information_regime": "public_conservation_pimc_v1",
     "validation_holdout": {
       "split_unit": "game_seed",
       "validation_fraction": 0.05,

@@ -44,6 +44,9 @@ def test_build_h2h_command_shape_default_pairs():
     assert command[command.index("--rescale-noise-floor-c") + 1] == "0.0"
     assert command[command.index("--sigma-eval") + 1] == "0.79"
     assert "--public-observation" in command
+    assert "--information-set-search" in command
+    assert command[command.index("--determinization-particles") + 1] == "4"
+    assert command[command.index("--determinization-min-simulations") + 1] == "32"
     assert "--lazy-interior-chance" in command
     assert "--correct-rust-chance-spectra" in command
     assert "--no-symmetry-averaged-eval" in command
@@ -90,6 +93,7 @@ def test_build_invocation_descriptor_reports_games_total_as_2x_pairs():
     assert descriptor["mechanism"] == "B_exit_fixed_point"
     assert descriptor["command"][0] == sys.executable
     assert descriptor["search_config"]["public_observation"] is True
+    assert descriptor["search_config"]["information_set_search"] is True
     assert descriptor["search_config"]["c_scale"] == 0.03
 
 

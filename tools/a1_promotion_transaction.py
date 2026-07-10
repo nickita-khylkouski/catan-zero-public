@@ -500,6 +500,17 @@ def _verify_internal_h2h_source(
         raise PromotionError(f"{where} typed config checkpoint identity drift")
     if fields.get("public_observation") is not True:
         raise PromotionError(f"{where} typed config is not public-observation")
+    expected_information_recipe = {
+        "information_set_search": True,
+        "determinization_particles": 4,
+        "determinization_min_simulations": 32,
+    }
+    for key, expected in expected_information_recipe.items():
+        if fields.get(key) != expected:
+            raise PromotionError(
+                f"{where} typed config has unsafe information-set recipe: "
+                f"{key}={fields.get(key)!r}, expected {expected!r}"
+            )
     if fields.get("candidate_n_full") != 128 or fields.get("baseline_n_full") != 128:
         raise PromotionError(f"{where} typed config is not global n128")
     for key in (
@@ -520,6 +531,12 @@ def _verify_internal_h2h_source(
         raise PromotionError(f"{where} must use scalar readouts for both roles")
     if payload.get("public_observation") is not True:
         raise PromotionError(f"{where} must use public observations")
+    for key, expected in expected_information_recipe.items():
+        if payload.get(key) != expected:
+            raise PromotionError(
+                f"{where} does not attest the sealed information-set recipe: "
+                f"{key}={payload.get(key)!r}"
+            )
     budgets = payload.get("search_budgets_by_role")
     expected_budget = {
         "n_full": 128,
@@ -566,6 +583,17 @@ def _verify_external_panel_source(
         raise PromotionError(f"{where} uses an unexpected referee harness")
     if payload.get("mode") != "search" or payload.get("public_observation") is not True:
         raise PromotionError(f"{where} must use public-observation search")
+    expected_information_recipe = {
+        "information_set_search": True,
+        "determinization_particles": 4,
+        "determinization_min_simulations": 32,
+    }
+    for key, expected in expected_information_recipe.items():
+        if payload.get(key) != expected:
+            raise PromotionError(
+                f"{where} does not attest the sealed information-set recipe: "
+                f"{key}={payload.get(key)!r}"
+            )
     if payload.get("candidate_value_readout") != "scalar":
         raise PromotionError(f"{where} must use the sealed scalar readout")
     trained = payload.get("trained_value_readouts")
@@ -593,6 +621,11 @@ def _verify_external_panel_source(
     search_config = payload.get("search_config")
     if not isinstance(search_config, dict) or not search_config:
         raise PromotionError(f"{where} has no resolved search_config")
+    for key, expected in expected_information_recipe.items():
+        if search_config.get(key) != expected:
+            raise PromotionError(
+                f"{where}.search_config has unsafe {key}={search_config.get(key)!r}"
+            )
     games = payload.get("games")
     if not isinstance(games, list) or not games:
         raise PromotionError(f"{where} has no retained paired-game cohort")

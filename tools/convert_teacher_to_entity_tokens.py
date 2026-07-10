@@ -48,6 +48,7 @@ BASE_KEYS = (
     "target_policy_mask",
     "target_scores_mask",
     "target_score_source",
+    "target_information_regime",
     "game_seed",
     "teacher_name",
     "player",

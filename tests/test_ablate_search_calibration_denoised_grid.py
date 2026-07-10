@@ -77,8 +77,17 @@ def test_symmetry_is_shared_by_candidate_and_baseline_base_config():
     )
     assert enabled["symmetry_averaged_eval"] is True
     assert enabled["symmetry_averaged_eval_threshold"] == 20
+    assert enabled["information_set_search"] is True
+    assert enabled["determinization_particles"] == 4
+    assert enabled["determinization_min_simulations"] == 32
     assert disabled["symmetry_averaged_eval"] is False
     assert disabled["symmetry_averaged_eval_threshold"] is None
+
+
+def test_unmasked_exploratory_arm_retains_authoritative_diagnostic_semantics():
+    config = _base_search_config_kwargs(_args(masked=False))
+    assert config["information_set_search"] is False
+    assert config["determinization_particles"] == 1
 
 
 def test_denoise_grid_refuses_implicit_legacy_d6_threshold():

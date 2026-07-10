@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -30,6 +31,14 @@ def _rust():
 def test_parse_configs():
     assert _parse_configs("50:0.1,50:0.03,1:0.1") == ((50.0, 0.1), (50.0, 0.03), (1.0, 0.1))
     assert _parse_configs("50:0.1") == ((50.0, 0.1),)
+
+
+def test_trace_refuses_public_observation_private_tree_bypass():
+    mcts = SimpleNamespace(
+        evaluator=SimpleNamespace(config=SimpleNamespace(public_observation=True))
+    )
+    with pytest.raises(RuntimeError, match="refuses public_observation"):
+        trace_one_root(mcts, object())
 
 
 def test_find_placement_roots_returns_real_wide_settlement_decisions():

@@ -8,7 +8,7 @@ Type=simple
 User=ubuntu
 Group=ubuntu
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/home/ubuntu/catan-zero-v1/.venv/bin/python /home/ubuntu/catan-zero-v1/tools/fleet/fleet_metrics_exporter.py --listen 127.0.0.1 --port 9500 --run-root /home/ubuntu/gen_out
+ExecStart=/home/ubuntu/catan-zero-v1/.venv/bin/python /home/ubuntu/catan-zero-v1/tools/fleet/fleet_metrics_exporter.py --listen 127.0.0.1 --port 9500 --run-root /home/ubuntu/gen_out --run-root /home/ubuntu/catan-zero-production/runs/selfplay
 Restart=always
 RestartSec=5
 NoNewPrivileges=true

@@ -36,6 +36,9 @@ def test_generation_cmd_contains_critical_production_flags() -> None:
 
     # Store-true flags absent at default that MUST be present:
     assert "--public-observation" in cmd    # else omniscient / hidden-info leak
+    assert "--information-set-search" in cmd
+    assert _flag_value(cmd, "--determinization-particles") == "4"
+    assert _flag_value(cmd, "--determinization-min-simulations") == "32"
     assert "--lazy-interior-chance" in cmd   # else ~65x more leaf evals
     assert "--correct-rust-chance-spectra" in cmd
     assert "--score-actions" in cmd

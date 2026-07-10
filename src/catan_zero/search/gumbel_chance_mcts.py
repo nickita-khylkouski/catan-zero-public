@@ -54,6 +54,7 @@ from catan_zero.search.rust_mcts import (
     _spectrum,
     _terminal_or_zero,
 )
+from catan_zero.search.public_belief import PublicBelief
 
 __all__ = [
     "GumbelChanceMCTSConfig",
@@ -471,17 +472,20 @@ class GumbelChanceMCTSConfig:
     # Hidden-information leak fix (f72), PLANNER-ONLY. When True, the search's
     # internal simulation resolves the two hidden-info chance nodes from a
     # public BELIEF instead of the true hidden state:
-    #   - MOVE_ROBBER steal: uniform over the victim's real single-resource-steal
-    #     outcomes (drops the count-MAGNITUDE leak of weighting by the victim's
-    #     actual composition). Residual: which resource TYPES the victim holds is
-    #     still implied by which outcomes are real steals.
-    #   - BUY_DEVELOPMENT_CARD: reweight the drawable outcomes by the belief deck
-    #     (full 25-card composition minus the actor's own cards minus ALL players'
-    #     PLAYED cards -- i.e. opponents' face-down cards are treated as still in
-    #     the deck, mirroring catanatron's tree_search_utils). Residual: a card
+    #   - MOVE_ROBBER steal: for an opponent victim, uniform over all five public
+    #     resource identities on the legacy fixed-five wheel (rather than the
+    #     victim's true held-type set/composition); for the perspective player's
+    #     own hand, use the known count-weighted distribution. Residual on newer
+    #     hand-filtered wheels: the engine may expose only materializable types.
+    #   - BUY_DEVELOPMENT_CARD: reweight drawable outcomes by the perspective's
+    #     posterior predictive deck (full 25-card composition minus their own
+    #     cards minus ALL players' PLAYED cards -- i.e. opponents' face-down cards
+    #     are exchangeable with the deck). Residual: a card
     #     type held 100% face-down by opponents has no drawable engine outcome to
     #     materialize, so it cannot appear as a simulated draw.
-    # This ONLY changes the planner's expectation backups; the live-game/env
+    # This is a CHANCE-node correction, not full information-set search:
+    # opponent legal actions still come from the authoritative hidden state.
+    # It ONLY changes the planner's expectation backups; the live-game/env
     # transitions in `gumbel_self_play._apply_selected_action` keep sampling from
     # the TRUE hidden state (correct -- the world runs on truth). Default OFF; a
     # search-semantics change, so shipping is gated on a strength-based H2H A/B
@@ -595,6 +599,16 @@ class GumbelChanceMCTSConfig:
     # When enabled, every root selected by the n_full_wide gate uses FULL
     # search independently of p_full. Explicit search(force_full=...) wins.
     wide_roots_always_full: bool = False
+
+    # Public-conservation PIMC boundary. When enabled, search NEVER expands the
+    # authoritative game. The Rust engine samples rules-valid worlds from bank/
+    # deck conservation plus public hand sizes (not a history-conditioned
+    # Bayesian posterior), search stops when control leaves the root actor's
+    # turn, and root evidence is aggregated. `n_full`/`n_fast` remain TOTAL
+    # nominal budgets divided deterministically across particles.
+    information_set_search: bool = False
+    determinization_particles: int = 1
+    determinization_min_simulations: int = 32
 
 
 @dataclass(frozen=True, slots=True)
@@ -752,6 +766,12 @@ class GumbelChanceMCTS:
         evaluator: RustEvaluator | None = None,
     ) -> None:
         self.config = config or GumbelChanceMCTSConfig()
+        if bool(self.config.information_set_search) and bool(
+            self.config.belief_chance_spectra
+        ):
+            raise ValueError(
+                "information_set_search cannot be combined with belief_chance_spectra"
+            )
         self.evaluator = evaluator or HeuristicRustEvaluator()
         self.rng = random.Random(self.config.seed)
         _require_rust_module()
@@ -764,6 +784,214 @@ class GumbelChanceMCTS:
     # Public search entry point.
     # ------------------------------------------------------------------
     def search(self, game: Any, *, force_full: bool | None = None) -> SearchResult:
+        if bool(getattr(self.config, "information_set_search", False)):
+            return self._search_information_set(game, force_full=force_full)
+        return self._search_authoritative(game, force_full=force_full)
+
+    def _search_authoritative(
+        self, game: Any, *, force_full: bool | None = None
+    ) -> SearchResult:
+        return self._search_single_world(game, force_full=force_full)
+
+    def _search_information_set(
+        self, game: Any, *, force_full: bool | None = None
+    ) -> SearchResult:
+        """Actor-turn PIMC over public-conservation determinizations.
+
+        The authoritative game is used only to read the root actor and that
+        actor's legal actions.  It is never evaluated or expanded.  Each search
+        particle comes from the engine's atomic ``determinize_for_player``
+        primitive, and traversal stops as soon as control leaves the root
+        actor's turn.  Root policies/Q/value are then averaged across particles.
+        This closes both hidden chance-support leakage and opponent legal-action
+        leakage for the sampled horizon while leaving live action resolution on
+        authoritative truth. Samples are not conditioned on full public-history
+        deductions; provenance deliberately calls this conservation PIMC.
+        """
+        if not hasattr(game, "determinize_for_player"):
+            raise RuntimeError(
+                "information_set_search requires a catanatron_rs wheel exposing "
+                "Game.determinize_for_player"
+            )
+        evaluator_config = getattr(self.evaluator, "config", None)
+        if evaluator_config is None or not bool(
+            getattr(evaluator_config, "public_observation", False)
+        ):
+            raise RuntimeError(
+                "information_set_search requires evaluator public_observation=True"
+            )
+        if bool(self.config.play_sh_winner):
+            raise RuntimeError(
+                "play_sh_winner is undefined across information-set particles; "
+                "select from the aggregated improved policy"
+            )
+
+        root_color = str(game.current_color())
+        authoritative_legal, _actions, _spectra = self._fetch_legal_actions(game)
+        if not authoritative_legal:
+            raise RuntimeError("no legal actions at information-set MCTS root")
+
+        requested_particles = int(self.config.determinization_particles)
+        if requested_particles < 1:
+            raise ValueError("determinization_particles must be >= 1")
+        min_per_particle = int(self.config.determinization_min_simulations)
+        if min_per_particle < 1:
+            raise ValueError("determinization_min_simulations must be >= 1")
+
+        # Choose PCR/full-vs-fast ONCE for the information set, then divide the
+        # exact total budget across particles.  Forced roots do not spend a
+        # Sequential-Halving budget but still aggregate their chance/value result.
+        if len(authoritative_legal) > 1:
+            wide_budget_root = _wide_budget_applies(
+                len(authoritative_legal), self.config
+            )
+            use_full = _choose_full_search(
+                self.config,
+                force_full=force_full,
+                wide_budget_root=wide_budget_root,
+                random_draw=self.rng.random,
+            )
+            n_full_effective = int(self.config.n_full)
+            if wide_budget_root:
+                n_full_effective = int(self.config.n_full_wide)
+            total_budget = max(
+                int(n_full_effective if use_full else self.config.n_fast), 1
+            )
+            # Spend belief averaging where it improves distilled policy, but do
+            # not fragment n16 fast searches into four nearly-empty trees.  With
+            # the A1 settings this realizes p4 for n128 full rows and p1 for n16
+            # fast rows.  Forced rows below are also p1 because they carry no
+            # policy target.
+            particle_count = min(
+                requested_particles,
+                max(1, total_budget // min_per_particle),
+            )
+            base, remainder = divmod(total_budget, particle_count)
+            budgets = [base + int(index < remainder) for index in range(particle_count)]
+        else:
+            use_full = bool(force_full) if force_full is not None else False
+            particle_count = 1
+            budgets = [None]
+
+        # Pre-draw every determinization seed before any particle search.  This
+        # makes the particle set independent of how many RNG draws a particular
+        # sampled tree consumes.
+        particle_seeds = [self.rng.getrandbits(64) for _ in range(particle_count)]
+        results: list[SearchResult] = []
+        for particle_index, particle_seed in enumerate(particle_seeds):
+            sampled = game.determinize_for_player(root_color, int(particle_seed))
+            sampled_legal, _sampled_actions, _sampled_spectra = self._fetch_legal_actions(
+                sampled
+            )
+            if tuple(sampled_legal) != tuple(authoritative_legal):
+                raise RuntimeError(
+                    "public-belief determinization changed root legal actions: "
+                    f"authoritative={tuple(authoritative_legal)} sampled={tuple(sampled_legal)}"
+                )
+            self._information_set_root_turn = int(sampled.num_turns())
+            results.append(
+                self._search_single_world(
+                    sampled,
+                    force_full=use_full,
+                    n_simulations_override=budgets[particle_index],
+                )
+            )
+        return self._aggregate_information_set_results(
+            results,
+            legal_actions=tuple(authoritative_legal),
+            used_full_search=use_full,
+        )
+
+    def _aggregate_information_set_results(
+        self,
+        results: list[SearchResult],
+        *,
+        legal_actions: tuple[int, ...],
+        used_full_search: bool,
+    ) -> SearchResult:
+        if not results:
+            raise RuntimeError("information-set search produced no particles")
+        count = float(len(results))
+        priors = _normalize_policy(
+            {
+                action: sum(result.priors.get(action, 0.0) for result in results)
+                / count
+                for action in legal_actions
+            }
+        )
+        improved = _normalize_policy(
+            {
+                action: sum(
+                    result.improved_policy.get(action, 0.0) for result in results
+                )
+                / count
+                for action in legal_actions
+            }
+        )
+        visit_counts = {
+            action: sum(result.visit_counts.get(action, 0) for result in results)
+            for action in legal_actions
+        }
+        q_values: dict[int, float] = {}
+        for action in legal_actions:
+            weighted = [
+                (result.q_values[action], result.visit_counts.get(action, 0))
+                for result in results
+                if action in result.q_values and result.visit_counts.get(action, 0) > 0
+            ]
+            total_visits = sum(visits for _value, visits in weighted)
+            if total_visits > 0:
+                q_values[action] = sum(
+                    value * visits for value, visits in weighted
+                ) / float(total_visits)
+        afterstate_values = {
+            action: sum(values) / len(values)
+            for action in legal_actions
+            if (
+                values := [
+                    result.afterstate_values[action]
+                    for result in results
+                    if action in result.afterstate_values
+                ]
+            )
+        }
+
+        if float(self.config.temperature) > 0.0:
+            selected = self._sample_categorical(improved)
+        else:
+            selected = max(
+                legal_actions,
+                key=lambda action: (
+                    improved.get(action, 0.0),
+                    visit_counts.get(action, 0),
+                    priors.get(action, 0.0),
+                    -int(action),
+                ),
+            )
+        training_policy = _prune_policy_target(
+            improved,
+            visit_counts,
+            min_visits=int(self.config.policy_target_min_visits),
+        )
+        return SearchResult(
+            selected_action=int(selected),
+            improved_policy=training_policy,
+            visit_counts=visit_counts,
+            q_values=q_values,
+            priors=priors,
+            root_value=sum(result.root_value for result in results) / count,
+            used_full_search=bool(used_full_search),
+            simulations_used=sum(result.simulations_used for result in results),
+            afterstate_values=afterstate_values,
+        )
+
+    def _search_single_world(
+        self,
+        game: Any,
+        *,
+        force_full: bool | None = None,
+        n_simulations_override: int | None = None,
+    ) -> SearchResult:
         root_color = str(game.current_color())
         legal_actions, action_json_by_id, spectrum_by_id = self._fetch_legal_actions(game)
         if not legal_actions:
@@ -797,15 +1025,25 @@ class GumbelChanceMCTS:
         n_full_effective = int(self.config.n_full)
         if wide_budget_root:
             n_full_effective = int(self.config.n_full_wide)
-        n_simulations = max(
-            int(n_full_effective if use_full else self.config.n_fast), 1
+        n_simulations = (
+            max(int(n_simulations_override), 1)
+            if n_simulations_override is not None
+            else max(int(n_full_effective if use_full else self.config.n_fast), 1)
         )
 
         root = _GNode(game=game.copy(), root_color=root_color)
         self._expand(root, at_root=True)
         priors = {action_id: stats.prior for action_id, stats in root.actions.items()}
 
-        sh_winner_action, used = self._run_root_search(root, n_simulations)
+        sh_winner_action, used = self._run_root_search(
+            root,
+            n_simulations,
+            # A particle budget changes the requested simulation count, not
+            # the search operator.  In particular, the E1 legacy arm must keep
+            # the legacy phase-rounding schedule (and its possible overrun),
+            # while the exact arm remains governed by exact_budget_sh.
+            exact_budget_override=False,
+        )
 
         completed_q = self._completed_q(root)
         improved_policy = self._improved_policy(root, completed_q)
@@ -961,7 +1199,13 @@ class GumbelChanceMCTS:
     # ------------------------------------------------------------------
     # Root: Gumbel-Top-k + Sequential Halving.
     # ------------------------------------------------------------------
-    def _run_root_search(self, root: _GNode, n_simulations: int) -> tuple[int, int]:
+    def _run_root_search(
+        self,
+        root: _GNode,
+        n_simulations: int,
+        *,
+        exact_budget_override: bool = False,
+    ) -> tuple[int, int]:
         legal = tuple(root.actions.keys())
         num_legal = len(legal)
         m = _root_candidate_count(num_legal, self.config)
@@ -982,8 +1226,9 @@ class GumbelChanceMCTS:
                 action_id: random.Random(self.rng.getrandbits(64)) for action_id in top_k
             }
 
-        if bool(self.config.exact_budget_sh) and n_simulations >= int(
-            self.config.exact_budget_sh_min_n
+        if exact_budget_override or (
+            bool(self.config.exact_budget_sh)
+            and n_simulations >= int(self.config.exact_budget_sh_min_n)
         ):
             # Task #61: exact-budget phases (see `exact_budget_sh_phases`).
             # Each phase visits the top-`count` of the CURRENT ranking, then
@@ -1373,6 +1618,19 @@ class GumbelChanceMCTS:
         if winner is not None:
             return 1.0 if str(winner) == node.root_color else -1.0
 
+        # Actor-turn PIMC cutoff: opponent policy/value may use that opponent's
+        # own hand in the SAMPLED world, but we never search beyond that first
+        # boundary (which would let the root actor condition later choices on a
+        # single determinization).  The leaf is safe because the sampled world
+        # was constructed independently of authoritative hidden truth.
+        if self._is_information_set_turn_boundary(node, depth=depth):
+            if not node.expanded:
+                return self._pending_expansion(node, record_leaf_visit=True)
+            value = node.prior_value
+            node.visits += 1
+            node.value_sum += value
+            return value
+
         if depth >= int(self.config.max_depth):
             if not node.expanded:
                 return self._pending_expansion(node, record_leaf_visit=False)
@@ -1493,6 +1751,14 @@ class GumbelChanceMCTS:
         winner = node.game.winning_color()
         if winner is not None:
             return 1.0 if str(winner) == node.root_color else -1.0
+        if self._is_information_set_turn_boundary(node, depth=depth):
+            if not node.expanded:
+                value = self._expand(node)
+            else:
+                value = node.prior_value
+            node.visits += 1
+            node.value_sum += value
+            return value
         if depth >= int(self.config.max_depth):
             if not node.expanded:
                 self._expand(node)
@@ -1545,6 +1811,14 @@ class GumbelChanceMCTS:
         node.visits += 1
         node.value_sum += value
         return value
+
+    def _is_information_set_turn_boundary(self, node: _GNode, *, depth: int) -> bool:
+        if not bool(self.config.information_set_search) or depth <= 0:
+            return False
+        if str(node.game.current_color()) != str(node.root_color):
+            return True
+        root_turn = getattr(self, "_information_set_root_turn", None)
+        return root_turn is not None and int(node.game.num_turns()) != int(root_turn)
 
     def _enumerate_roll_outcomes(
         self,
@@ -1767,11 +2041,17 @@ class GumbelChanceMCTS:
                 # into the native-enumeration branch below.
                 if is_move_robber_with_victim(action_json):
                     candidates = belief_move_robber_outcome_weights(
-                        node.game, action_json, cached_spectrum=cached_spectrum
+                        node.game,
+                        action_json,
+                        cached_spectrum=cached_spectrum,
+                        perspective=node.root_color,
                     )
                 else:
                     candidates = belief_buy_development_card_outcomes(
-                        node.game, action_json, cached_spectrum=cached_spectrum
+                        node.game,
+                        action_json,
+                        cached_spectrum=cached_spectrum,
+                        perspective=node.root_color,
                     )
             elif self.config.correct_rust_chance_spectra:
                 if is_move_robber_with_victim(action_json):
@@ -2175,41 +2455,60 @@ BASE_DEVELOPMENT_DECK: dict[str, int] = {
 
 
 def belief_move_robber_outcome_weights(
-    game: Any, action_json: Any, *, cached_spectrum: tuple[tuple[int, float], ...] | None = None
+    game: Any,
+    action_json: Any,
+    *,
+    cached_spectrum: tuple[tuple[int, float], ...] | None = None,
+    perspective: str | None = None,
 ) -> list[tuple[int, float, Any]]:
     """PLANNER-belief variant of `move_robber_victim_outcome_weights`.
 
-    Materializes the same real single-resource-steal outcomes (apply each native
-    outcome, diff the victim's hand, keep the ones that actually remove exactly
-    one card), but assigns every real outcome a UNIFORM weight of 1.0 instead of
-    the victim's true count. `_enumerate_materialized_outcomes` renormalizes, so
-    the planner steals a uniformly-random resource-TYPE among those the victim
-    holds -- dropping the count-magnitude leak. Always returns a list (never
-    `None`): empty only when the victim has nothing stealable. Shared by
-    `GumbelChanceMCTS`'s internal search ONLY; the live env keeps the true-hand
-    resolution in `gumbel_self_play._apply_selected_action`.
+    Weights come from :class:`PublicBelief`, so an opponent victim is uniform
+    over all five resource identities and the perspective player's own hand is
+    count-weighted exactly.  On the legacy five-entry Rust spectrum the fixed
+    resource/index mapping lets us retain all five children, including a no-op
+    child when the authoritative hidden hand lacks the sampled type.  This is
+    hidden-composition-invariant at the *belief distribution* boundary.
 
-    Residual leak (documented, accepted for v1): which resource TYPES the victim
-    holds is still implied by which native outcomes are real steals -- this is
-    uniform-over-HELD-types. catanatron's own belief model is uniform 1/5 over
-    ALL five types (using only the public hand SIZE), but the engine can only
-    materialize steals of actually-held types, so exact parity with catanatron
-    isn't reachable here without a synthetic "steal unknown" aggregation. For the
-    mandatory belief-spectra H2H A/B: any measured effect vs the true-hand
-    baseline (`move_robber_victim_outcome_weights`) reflects BOTH removing the
-    count-magnitude leak AND this residual held-type visibility -- it is NOT a
-    clean measurement of catanatron-parity belief. A fully hidden-belief robber
-    (uniform over all 5, tolerating impossible no-op steals) is the follow-up.
+    A fixed Rust wheel may expose only true-hand-filtered outcomes with no
+    stable resource/index mapping.  In that case we can only reweight the
+    materializable outcomes, so the child set still leaks held resource types.
+    Full removal needs determinizing the engine state before expansion; this
+    function deliberately does not claim to solve that or opponent legal-action
+    leakage (see ``public_belief.OPPONENT_ACTION_SCOPE``).
     """
     outcomes = cached_spectrum if cached_spectrum is not None else _spectrum(game, action_json)
-    victim_name = action_json[2][1]
+    victim_name = str(action_json[2][1])
+    actor_name = str(action_json[0])
     raw_json = json.dumps(action_json)
     snapshot = json.loads(game.json_snapshot())
     colors = [str(color) for color in snapshot["colors"]]
-    victim_index = colors.index(str(victim_name))
+    victim_index = colors.index(victim_name)
     victim_hand = snapshot["player_state"][victim_index]["resources"]
+    belief = PublicBelief.from_snapshot(
+        snapshot,
+        perspective=str(perspective) if perspective is not None else actor_name,
+    )
+    public_probabilities = belief.robber_steal_probabilities(victim_name)
 
-    candidates: list[tuple[int, float, Any]] = []
+    # Legacy wheels use an explicit RESOURCES-order five-entry chance space.
+    # Keeping every public-belief outcome avoids leaking the held-type set.
+    if _is_legacy_move_robber_spectrum(outcomes):
+        candidates: list[tuple[int, float, Any]] = []
+        for outcome_index, _probability in outcomes:
+            if not 0 <= int(outcome_index) < len(RESOURCES):
+                candidates = []
+                break
+            resource = RESOURCES[int(outcome_index)]
+            weight = float(public_probabilities.get(resource, 0.0))
+            if weight > 0.0:
+                candidates.append(
+                    (outcome_index, weight, game.apply_chance_outcome(raw_json, outcome_index))
+                )
+        if candidates:
+            return candidates
+
+    candidates = []
     for outcome_index, _probability in outcomes:
         candidate_game = game.apply_chance_outcome(raw_json, outcome_index)
         candidate_hand = json.loads(candidate_game.json_snapshot())["player_state"][victim_index][
@@ -2222,23 +2521,26 @@ def belief_move_robber_outcome_weights(
         ]
         if len(stolen) != 1:
             continue
-        candidates.append((outcome_index, 1.0, candidate_game))
+        weight = float(public_probabilities.get(stolen[0], 0.0))
+        if weight > 0.0:
+            candidates.append((outcome_index, weight, candidate_game))
     return candidates
 
 
 def belief_buy_development_card_outcomes(
-    game: Any, action_json: Any, *, cached_spectrum: tuple[tuple[int, float], ...] | None = None
+    game: Any,
+    action_json: Any,
+    *,
+    cached_spectrum: tuple[tuple[int, float], ...] | None = None,
+    perspective: str | None = None,
 ) -> list[tuple[int, float, Any]]:
     """PLANNER-belief variant of `buy_development_card_real_outcomes`.
 
-    Keeps the same real (card-drawing) outcomes, but reweights each by the BELIEF
-    deck rather than the true remaining-deck probability. The belief deck is
-    `BASE_DEVELOPMENT_DECK` minus the actor's own cards (unplayed + played, known
-    to the actor) minus ALL players' PLAYED cards (public) -- i.e. opponents'
-    face-down cards are treated as still in the deck, mirroring catanatron's
-    `tree_search_utils` reconstruction. This removes the leak of weighting draws
-    by the true remaining composition (which excludes opponents' held cards).
-    Planner-only; the live env keeps the true-deck resolution.
+    Keeps the same real (card-drawing) outcomes, but reweights each by the
+    posterior predictive distribution from :class:`PublicBelief`: base deck
+    minus the perspective's own unplayed cards and every publicly played card.
+    Opponents' face-down cards and the deck are exchangeable allocations of
+    that pool. Planner-only; the live env keeps true-deck resolution.
 
     Residual leak (documented, accepted for v1): a card type held 100% face-down
     by opponents has no drawable engine outcome to materialize, so it cannot
@@ -2253,23 +2555,11 @@ def belief_buy_development_card_outcomes(
     before_cards = snapshot["player_state"][actor_index]["dev_cards"]
     before_deck_count = int(snapshot.get("development_deck_count", 0))
 
-    # known_out[card] = actor's own (unplayed + played) + every player's played.
-    # The all-players loop already covers the actor's played cards; the actor's
-    # UNPLAYED cards are added once more below (they are hidden from opponents but
-    # known to -- and out of the deck for -- the actor). Opponents' unplayed cards
-    # are deliberately NOT subtracted: they remain in the actor's belief deck.
-    known_out = {card: 0 for card in DEVELOPMENT_CARDS}
-    for player_index, _color in enumerate(colors):
-        played = snapshot["player_state"][player_index].get("played_dev_cards", {}) or {}
-        for card in DEVELOPMENT_CARDS:
-            known_out[card] += int(played.get(card, 0))
-    actor_unplayed = snapshot["player_state"][actor_index].get("dev_cards", {}) or {}
-    for card in DEVELOPMENT_CARDS:
-        known_out[card] += int(actor_unplayed.get(card, 0))
-    belief_remaining = {
-        card: max(0, int(BASE_DEVELOPMENT_DECK.get(card, 0)) - known_out[card])
-        for card in DEVELOPMENT_CARDS
-    }
+    belief = PublicBelief.from_snapshot(
+        snapshot,
+        perspective=str(perspective) if perspective is not None else actor_color,
+    )
+    public_probabilities = belief.development_draw_probabilities()
 
     candidates: list[tuple[int, float, Any]] = []
     for outcome_index, _probability in outcomes:
@@ -2285,7 +2575,7 @@ def belief_buy_development_card_outcomes(
             int(candidate_snapshot.get("development_deck_count", 0)) == before_deck_count - 1
         )
         if len(gained) == 1 and deck_decreased:
-            weight = float(belief_remaining.get(gained[0], 0))
+            weight = float(public_probabilities.get(gained[0], 0.0))
             if weight > 0.0:
                 candidates.append((outcome_index, weight, candidate_game))
     return candidates

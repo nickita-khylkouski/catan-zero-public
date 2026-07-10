@@ -1,0 +1,19 @@
+{
+  "schema_version": "catan-zero-rnd-leaderboard/v1",
+  "campaign_id": "REPLACE-e4-sparse-moe",
+  "required_information_regime": "public_only",
+  "require_same_training_manifest": true,
+  "frozen_candidate_fields": ["search_id", "search_config_sha256"],
+  "purpose": "Screen top-2 sparse conditional capacity against its dense RRT base; matched-active and matched-total dense controls remain a required future confirmation.",
+  "required_arm_ids": ["rrt-dense-base", "rrt-top2-of-8-moe"],
+  "budget_contracts": {
+    "equal_work": {"match_metrics": ["logical_leaves", "orientation_rows"], "absolute_tolerance": 0.0, "relative_tolerance": 0.0},
+    "equal_time": {"match_metrics": ["wall_time_sec"], "absolute_tolerance": 0.01, "relative_tolerance": 0.05}
+  },
+  "arms": [
+    {"arm_id": "rrt-dense-base", "comparison_role": "ranked", "architecture_id": "entity-graph-rrt384-l9", "expected_parameter_count": 20070932, "search_id": "gumbel-reference", "source_status": "implemented", "measurement_adapter_status": "not_implemented", "runnable": false},
+    {"arm_id": "rrt-top2-of-8-moe", "comparison_role": "ranked", "architecture_id": "entity-graph-rrt384-l9-moe8-top2", "expected_parameter_count": 28508948, "search_id": "gumbel-reference", "source_status": "implemented", "measurement_adapter_status": "not_implemented", "runnable": false, "nominal_active_parameter_count": 20525588}
+  ],
+  "resolved_contract": "scalar value; width=384; layers=9; heads=6; RRTRRTRRT; 8 experts in three T blocks; top-k=2; expert FF=384; balance loss weight=.01",
+  "confirmation_blocker": "Do not promote from this two-arm screen; add trained dense controls matched to active and total parameters."
+}

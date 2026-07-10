@@ -235,6 +235,9 @@ def test_parser_preserves_raw_smoke_default_and_exposes_search_recipe() -> None:
     assert args.c_scale == 0.03
     assert args.lazy_interior_chance is True
     assert args.public_observation is True
+    assert args.information_set_search is True
+    assert args.determinization_particles == 4
+    assert args.determinization_min_simulations == 32
     assert args.value_readout == "scalar"
     assert args.n_full_wide is None
     assert args.n_full_wide_threshold is None
@@ -281,6 +284,9 @@ def test_neutral_search_runtime_and_fingerprint_share_d6_adaptive_recipe() -> No
     assert config.symmetry_averaged_eval is True
     assert config.symmetry_averaged_eval_threshold == 20
     assert config.wide_candidates_threshold == 24
+    assert config.information_set_search is True
+    assert config.determinization_particles == 4
+    assert config.determinization_min_simulations == 32
 
     semantics = _game_semantics(args, "checkpoint-md5")
     assert semantics["search"] == recipe
@@ -414,6 +420,9 @@ def test_summary_stays_gate_and_whr_compatible(tmp_path: Path) -> None:
         c_visit=50.0,
         lazy_interior_chance=True,
         public_observation=True,
+        information_set_search=True,
+        determinization_particles=4,
+        determinization_min_simulations=32,
         correct_rust_chance_spectra=True,
         max_depth=80,
         max_decisions=600,
@@ -489,7 +498,7 @@ def test_native_referee_search_shadow_cpu_smoke_when_full_rust_wheel_available()
     the deterministic heuristic evaluator when the 0.1.2+ Rust API exists.
 
     Developer laptops with the old minimal wheel skip cleanly; the deploy
-    environment's 0.1.3 wheel runs this test rather than masking the boundary
+    environment's 0.1.4 wheel runs this test rather than masking the boundary
     behind mocks.
     """
     from catan_zero.adapters.engine_equivalence import (

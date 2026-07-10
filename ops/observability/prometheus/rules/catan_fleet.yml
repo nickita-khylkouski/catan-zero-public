@@ -25,6 +25,13 @@ groups:
         labels: {severity: critical}
         annotations:
           summary: "Self-play failure on {{ $labels.host }}/gpu{{ $labels.gpu }}"
+      - alert: CatanGeneratorRecipeMismatch
+        expr: catan_fleet_generator_active == 1 and catan_fleet_generator_recipe_safe == 0
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: "Unsafe A1 recipe on {{ $labels.host }}/gpu{{ $labels.gpu }}/pipeline{{ $labels.pipeline }}"
+          description: "The active lane differs from the exact n128 public-information recipe; inspect catan_fleet_generator_info before retaining any output."
       - alert: CatanOutputDiskLow
         expr: catan_fleet_output_disk_free_bytes < 100 * 1024 * 1024 * 1024
         for: 10m
@@ -37,3 +44,12 @@ groups:
         labels: {severity: critical}
         annotations:
           summary: "DCGM exporter down on {{ $labels.box }}"
+      - alert: GPUIdle
+        expr: |
+          avg_over_time(DCGM_FI_DEV_GPU_UTIL{gpumodel="H100",role="generation"}[10m]) < 20
+          and on (box, gpu)
+          max by (box, gpu) (catan_fleet_generator_active == 1)
+        for: 10m
+        labels: {severity: critical}
+        annotations:
+          summary: "Active H100 generation lane is idle on {{ $labels.box }}/gpu{{ $labels.gpu }}"

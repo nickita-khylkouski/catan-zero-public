@@ -294,6 +294,15 @@ def _search_config_kwargs(worker_args: dict[str, Any]) -> dict[str, Any]:
         correct_rust_chance_spectra=bool(worker_args["correct_rust_chance_spectra"]),
         lazy_interior_chance=bool(worker_args.get("lazy_interior_chance", False)),
         belief_chance_spectra=bool(worker_args.get("belief_chance_spectra", False)),
+        information_set_search=bool(
+            worker_args.get("information_set_search", False)
+        ),
+        determinization_particles=int(
+            worker_args.get("determinization_particles", 1)
+        ),
+        determinization_min_simulations=int(
+            worker_args.get("determinization_min_simulations", 32)
+        ),
         c_scale=float(worker_args.get("c_scale", 0.1)),
         c_visit=float(worker_args.get("c_visit", 50.0)),
         max_root_candidates=int(worker_args.get("max_root_candidates", 16)),
@@ -412,6 +421,9 @@ def main() -> None:
     parser.add_argument("--max-root-candidates-wide", type=int, default=54)
     parser.add_argument("--public-observation", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--belief-chance-spectra", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--information-set-search", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--determinization-particles", type=int, default=1)
+    parser.add_argument("--determinization-min-simulations", type=int, default=32)
     parser.add_argument("--n-full-wide", type=int, default=None)
     parser.add_argument("--raw-policy-above-width", type=int, default=None)
     parser.add_argument("--symmetry-averaged-eval", action=argparse.BooleanOptionalAction, default=False)
@@ -428,6 +440,18 @@ def main() -> None:
     parser.add_argument("--out", required=True)
     add_config_flags(parser, default_purpose="gumbel_search_vs_bot_h2h")
     args = parser.parse_args()
+    if bool(args.public_observation) != bool(args.information_set_search):
+        parser.error(
+            "--public-observation and --information-set-search must be enabled together"
+        )
+    if bool(args.information_set_search) and bool(args.belief_chance_spectra):
+        parser.error(
+            "--information-set-search cannot be combined with --belief-chance-spectra"
+        )
+    if int(args.determinization_particles) < 1:
+        parser.error("--determinization-particles must be >= 1")
+    if int(args.determinization_min_simulations) < 1:
+        parser.error("--determinization-min-simulations must be >= 1")
     _gate_cfg, _gate_params = resolve_gate_config(args.gate_config, elo0=args.elo0, elo1=args.elo1)
     args.elo0, args.elo1 = _gate_params["elo0"], _gate_params["elo1"]
 
@@ -482,6 +506,11 @@ def main() -> None:
                 "lazy_interior_chance": bool(args.lazy_interior_chance),
                 "public_observation": bool(args.public_observation),
                 "belief_chance_spectra": bool(args.belief_chance_spectra),
+                "information_set_search": bool(args.information_set_search),
+                "determinization_particles": int(args.determinization_particles),
+                "determinization_min_simulations": int(
+                    args.determinization_min_simulations
+                ),
                 "value_squash": str(args.value_squash),
                 "c_scale": float(args.c_scale),
                 "c_visit": float(args.c_visit),
@@ -571,6 +600,15 @@ def _build_summary(
         "correct_rust_chance_spectra": bool(args.correct_rust_chance_spectra),
         "public_observation": bool(args.public_observation),
         "belief_chance_spectra": bool(args.belief_chance_spectra),
+        "information_set_search": bool(
+            getattr(args, "information_set_search", False)
+        ),
+        "determinization_particles": int(
+            getattr(args, "determinization_particles", 1)
+        ),
+        "determinization_min_simulations": int(
+            getattr(args, "determinization_min_simulations", 32)
+        ),
         "pairs_requested": len(pairs),
         "games_played": len(all_games),
         "games_with_winner": len(outcomes),

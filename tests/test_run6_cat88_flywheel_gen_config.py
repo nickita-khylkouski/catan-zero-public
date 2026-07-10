@@ -40,6 +40,8 @@ def test_gen_search_config_fully_set_returns_explicit_argv() -> None:
         gen_c_scale=0.03, gen_max_decisions=600, gen_max_depth=80,
         gen_temperature_decisions=90, gen_lazy_interior_chance=True,
         gen_correct_rust_chance_spectra=True,
+        gen_information_set_search=True, gen_determinization_particles=4,
+        gen_determinization_min_simulations=32,
     )
     argv = cfg.resolve_gen_search_argv()
     # every canonical value present and explicit (NOT the tool defaults 0.1/45/OFF)
@@ -51,6 +53,9 @@ def test_gen_search_config_fully_set_returns_explicit_argv() -> None:
     assert "--no-symmetry-averaged-eval" in argv
     assert "--no-wide-roots-always-full" in argv
     assert argv[argv.index("--wide-candidates-threshold") + 1] == "24"
+    assert "--information-set-search" in argv
+    assert argv[argv.index("--determinization-particles") + 1] == "4"
+    assert argv[argv.index("--determinization-min-simulations") + 1] == "32"
 
 
 def test_gen_search_config_threads_decoupled_d6_and_adaptive_wide_budget() -> None:
@@ -65,6 +70,8 @@ def test_gen_search_config_threads_decoupled_d6_and_adaptive_wide_budget() -> No
         gen_max_depth=80, gen_temperature_decisions=90,
         gen_lazy_interior_chance=True,
         gen_correct_rust_chance_spectra=True,
+        gen_information_set_search=True, gen_determinization_particles=4,
+        gen_determinization_min_simulations=32,
     ).validate()
     argv = cfg.resolve_gen_search_argv()
     assert argv[argv.index("--n-full-wide") + 1] == "256"
@@ -85,6 +92,8 @@ def test_gen_search_config_teacher_override_and_boolean_off_forms() -> None:
         gen_c_scale=0.03, gen_max_decisions=600, gen_max_depth=80,
         gen_temperature_decisions=90, gen_lazy_interior_chance=False,
         gen_correct_rust_chance_spectra=False,
+        gen_information_set_search=True, gen_determinization_particles=4,
+        gen_determinization_min_simulations=32,
     ).validate()
     argv = cfg.resolve_gen_search_argv()
     assert argv[argv.index("--n-full") + 1] == "128"

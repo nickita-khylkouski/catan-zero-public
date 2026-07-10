@@ -125,6 +125,8 @@ def _resolved_draft(tmp_path: Path) -> Path:
             "symmetry_averaged_eval_threshold": 20,
             "exact_budget_sh": True,
             "exact_budget_sh_min_n": 48,
+            "information_set_search": True,
+            "determinization_particles": 4,
             "rescale_noise_floor_c": 1.0,
             "sigma_eval": 0.98,
         }
@@ -289,14 +291,33 @@ def _resolved_draft(tmp_path: Path) -> Path:
                                 "--c-visit",
                                 "--n-full",
                                 "--n-fast",
+                                "--p-full",
                                 "--base-seed",
                                 "--games",
+                                "--max-depth",
+                                "--symmetry-averaged-eval",
+                                "--symmetry-averaged-eval-threshold",
+                                "--belief-chance-spectra",
+                                "--information-set-search",
+                                "--determinization-particles",
+                                "--determinization-min-simulations",
                             ],
                             "expected_values": {
                                 "--c-scale": 0.03,
+                                "--c-visit": 50.0,
+                                "--n-full": 128,
+                                "--n-fast": 16,
+                                "--p-full": 0.4,
+                                "--max-depth": 80,
                                 "--temperature-decisions": 90,
                                 "--public-observation": True,
                                 "--lazy-interior-chance": True,
+                                "--symmetry-averaged-eval": True,
+                                "--symmetry-averaged-eval-threshold": 20,
+                                "--belief-chance-spectra": False,
+                                "--information-set-search": True,
+                                "--determinization-particles": 4,
+                                "--determinization-min-simulations": 32,
                             },
                         },
                     }
@@ -674,6 +695,13 @@ def _replace_s2_s3_with_operator_bindings(draft: Path) -> tuple[Path, Path]:
             "wide_roots_always_full": False,
         }
     )
+    # This helper changes the winning production recipe, so keep the exact
+    # prelaunch guard binding in lockstep.  A stale p_full=0.4 guard must not
+    # make a valid p_full=0.25 operator-binding fixture look launchable.
+    guard_path = Path(payload["provenance"]["guard_config"])
+    guard = json.loads(guard_path.read_text(encoding="utf-8"))
+    guard["guards"][0]["args"]["expected_values"]["--p-full"] = 0.25
+    guard_path.write_text(json.dumps(guard) + "\n", encoding="utf-8")
     s1_path = _evidence_path(payload, "s1")
     s2_path = draft.parent / "s2.operator-binding.json"
     s3_path = draft.parent / "s3.operator-binding.json"
@@ -1593,6 +1621,9 @@ def test_post_wave_audit_accepts_exact_complete_category_corpus(tmp_path: Path) 
             "decision_index": np.zeros(n, dtype=np.int32),
             "target_policy": np.ones((n, 1), dtype=np.float32),
             "target_policy_mask": np.ones((n, 1), dtype=bool),
+            "target_information_regime": np.full(
+                n, "public_conservation_pimc_v1", dtype="U32"
+            ),
         }
         # The bounded reserve is real: the highest-seed attempt truncates and
         # must be excluded before selected metrics/holdout construction.
@@ -1632,6 +1663,7 @@ def test_post_wave_audit_accepts_exact_complete_category_corpus(tmp_path: Path) 
                         "seed": 123,
                     },
                     "selfplay_config": contract._expected_selfplay_config(lock),
+                    "target_information_regime": "public_conservation_pimc_v1",
                 }
             ),
             encoding="utf-8",
@@ -1651,6 +1683,7 @@ def test_post_wave_audit_accepts_exact_complete_category_corpus(tmp_path: Path) 
                     "checkpoint": contract._producer(lock)["path"],
                     "cli_args": cli,
                     "config_hash": config_hash,
+                    "target_information_regime": "public_conservation_pimc_v1",
                     "worker_summaries": [str(worker)],
                     "shards": [str(shard)],
                 }
@@ -1662,6 +1695,29 @@ def test_post_wave_audit_accepts_exact_complete_category_corpus(tmp_path: Path) 
     report = contract.audit_outputs(lock_path, report_path)
     assert report["passed"] is True
     assert report["games"] == contract.EXPECTED_GAMES
+    assert report["target_information_regime"] == {
+        "required": "public_conservation_pimc_v1",
+        "counts": {
+            "public_conservation_pimc_v1": sum(contract.EXPECTED_ATTEMPTS.values())
+        },
+    }
+
+    # The acceptance scanner binds the planner's information regime at the
+    # row boundary, not merely via a top-level manifest assertion.  Corrupt a
+    # reserve row and prove that even data excluded from training selection is
+    # rejected rather than silently carried alongside the accepted corpus.
+    first_shard = Path(lock["fleet"]["jobs"][0]["output_dir"]) / "shard_00000.npz"
+    with np.load(first_shard, allow_pickle=False) as payload:
+        corrupted = {key: np.asarray(payload[key]) for key in payload.files}
+    corrupted["target_information_regime"] = corrupted[
+        "target_information_regime"
+    ].copy()
+    corrupted["target_information_regime"][-1] = (
+        "authoritative_hidden_state_search_v1"
+    )
+    np.savez(first_shard, **corrupted)
+    with pytest.raises(contract.ContractError, match="post-wave audit failed"):
+        contract.audit_outputs(lock_path, tmp_path / "audit.unsafe.json")
     assert report["total_unique_games"] == 12_000
     assert report["rows"] == 12_000
     assert report["invalid_teacher_actions"] == 0

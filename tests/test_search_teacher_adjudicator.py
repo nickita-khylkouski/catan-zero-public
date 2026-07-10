@@ -54,6 +54,9 @@ def _operator(**overrides: Any) -> dict[str, Any]:
         "exact_budget_sh": True,
         "exact_budget_sh_min_n": 48,
         "belief_chance_spectra": False,
+        "information_set_search": True,
+        "determinization_particles": 4,
+        "determinization_min_simulations": 32,
         "rescale_noise_floor_c": 0.0,
         "sigma_eval": 0.98,
     }
@@ -73,6 +76,13 @@ def _evaluator() -> dict[str, Any]:
         "rust_featurize": False,
         "emit_uncertainty": False,
     }
+
+
+def test_search_operator_refuses_authoritative_hidden_state_search() -> None:
+    with pytest.raises(adjudicator.AdjudicationError, match="information_set_search"):
+        adjudicator._validate_search_operator(
+            _operator(information_set_search=False), where="unsafe_operator"
+        )
 
 
 def _pent(
@@ -157,6 +167,9 @@ def _s1_arm(
         "max_root_candidates_wide": 54,
         "symmetry_averaged_eval": True,
         "symmetry_averaged_eval_threshold": threshold,
+        "information_set_search": True,
+        "determinization_particles": 4,
+        "determinization_min_simulations": 32,
     }
     candidate = {
         **baseline,
@@ -318,6 +331,9 @@ def _h2h(
         "baseline": str(checkpoint),
         "public_observation": True,
         "belief_chance_spectra": False,
+        "information_set_search": True,
+        "determinization_particles": 4,
+        "determinization_min_simulations": 32,
         "pairs": pairs,
         "base_seed": 20_000,
         "n_full": base_n,
@@ -379,6 +395,9 @@ def _h2h(
             "candidate_checkpoint": str(checkpoint),
             "baseline_checkpoint": str(checkpoint),
             "public_observation": True,
+            "information_set_search": True,
+            "determinization_particles": 4,
+            "determinization_min_simulations": 32,
             "symmetry_averaged_eval": True,
             "symmetry_averaged_eval_threshold": 20,
             "c_visit": 50.0,

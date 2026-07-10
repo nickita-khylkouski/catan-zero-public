@@ -187,6 +187,9 @@ def _fixture(tmp_path: Path, *, promotion_count: int = 0, n_full: int = 128) -> 
             "candidate": str(candidate),
             "baseline": str(champion),
             "public_observation": True,
+            "information_set_search": True,
+            "determinization_particles": 4,
+            "determinization_min_simulations": 32,
             "candidate_n_full": 128,
             "baseline_n_full": 128,
             "n_full_wide": None,
@@ -210,6 +213,9 @@ def _fixture(tmp_path: Path, *, promotion_count: int = 0, n_full: int = 128) -> 
             "candidate_value_readout": "scalar",
             "baseline_value_readout": "scalar",
             "public_observation": True,
+            "information_set_search": True,
+            "determinization_particles": 4,
+            "determinization_min_simulations": 32,
             "search_budgets_by_role": {
                 role: {
                     "n_full": 128,
@@ -246,6 +252,9 @@ def _fixture(tmp_path: Path, *, promotion_count: int = 0, n_full: int = 128) -> 
         "max_depth": 80,
         "c_scale": 0.03,
         "public_observation": True,
+        "information_set_search": True,
+        "determinization_particles": 4,
+        "determinization_min_simulations": 32,
         "value_readout": "scalar",
     }
     for role, checkpoint, win_rate in (
@@ -261,6 +270,9 @@ def _fixture(tmp_path: Path, *, promotion_count: int = 0, n_full: int = 128) -> 
                 "baseline_bot": "catanatron_value",
                 "mode": "search",
                 "public_observation": True,
+                "information_set_search": True,
+                "determinization_particles": 4,
+                "determinization_min_simulations": 32,
                 "candidate_value_readout": "scalar",
                 "trained_value_readouts": ["scalar"],
                 "n_full": 128,
@@ -511,6 +523,23 @@ def test_global_n196_contract_is_rejected_before_mutation(tmp_path: Path) -> Non
 
     assert fixture["registry"].read_bytes() == before
     assert not fixture["receipt"].exists()
+
+
+def test_external_panel_without_information_set_attestation_is_rejected(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path)
+    source = tmp_path / "candidate_panel.raw.json"
+    payload = json.loads(source.read_text())
+    payload["information_set_search"] = False
+
+    with pytest.raises(promotion.PromotionError, match="information-set recipe"):
+        promotion._verify_external_panel_source(
+            payload,
+            checkpoint=fixture["candidate"],
+            checkpoint_md5=promotion._md5(fixture["candidate"]),
+            where="candidate external panel",
+        )
 
 
 def test_candidate_hash_drift_is_rejected(tmp_path: Path) -> None:
