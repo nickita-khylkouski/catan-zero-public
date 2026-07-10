@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""Freeze, verify, render, and postflight-audit the A1 24-GPU data handoff.
+"""Freeze, verify, render, and postflight-audit the A1 40-GPU data handoff.
 
 This tool is deliberately *not* a launcher.  It turns the winning bounded-R&D
 artifacts into an immutable contract and renders argv/environment records for
-the data-production lane.  There is no subprocess/exec path: the 24-GPU wave
+the data-production lane.  There is no subprocess/exec path: the 40-GPU wave
 remains an explicit operator boundary.
 
 The contract uses category-specific jobs rather than a probabilistic opponent
-mix.  Each of 24 workers attempts 408 current, 77 history, and 26 hard-negative
+mix.  Each of 40 workers attempts 245 current, 47 history, and 16 hard-negative
 games, then the postflight deterministically selects the lowest-seed complete
-400/75/25 per job.  This gives exactly 9,600/1,800/600 selected games before
+240/45/15 per job.  This gives exactly 9,600/1,800/600 selected games before
 row expansion while tolerating only the bounded, predeclared reserve.  The
 audit rejects an insufficient complete quota, duplicate or VAL-ONLY seeds,
 invalid selected actions, config drift, and missing shard provenance.
@@ -65,21 +65,22 @@ EXPECTED_GAMES = {
     "recent_history": 1_800,
     "hard_negative": 600,
 }
+EXPECTED_WORKER_COUNT = 40
 EXPECTED_PER_WORKER = {
-    "current_producer": 400,
-    "recent_history": 75,
-    "hard_negative": 25,
+    "current_producer": 240,
+    "recent_history": 45,
+    "hard_negative": 15,
 }
 # A bounded reserve makes the selected zero-truncation quota achievable when
 # otherwise healthy production has rare max-decision truncations.  Postflight
 # deterministically selects the lowest-seed complete games from each job.
 EXPECTED_ATTEMPTS_PER_WORKER = {
-    "current_producer": 408,
-    "recent_history": 77,
-    "hard_negative": 26,
+    "current_producer": 245,
+    "recent_history": 47,
+    "hard_negative": 16,
 }
 EXPECTED_ATTEMPTS = {
-    category: attempts * 24
+    category: attempts * EXPECTED_WORKER_COUNT
     for category, attempts in EXPECTED_ATTEMPTS_PER_WORKER.items()
 }
 
@@ -1052,9 +1053,10 @@ def _build_jobs(
     output_root: str,
     contract_id: str,
 ) -> list[dict[str, Any]]:
-    if len(workers) != 24:
+    if len(workers) != EXPECTED_WORKER_COUNT:
         raise ContractError(
-            f"the pre-wave handoff requires exactly 24 workers, got {len(workers)}"
+            "the pre-wave handoff requires exactly "
+            f"{EXPECTED_WORKER_COUNT} workers, got {len(workers)}"
         )
     if per_worker != EXPECTED_PER_WORKER:
         raise ContractError(

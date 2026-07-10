@@ -63,14 +63,14 @@ incomplete, and unselected attempts cannot enter metrics, holdout, or training.
 
 | category | selected/worker | attempts/worker | fleet selected | fleet attempts |
 |---|---:|---:|---:|---:|
-| current producer | 400 | 408 | 9,600 | 9,792 |
-| recent history | 75 | 77 | 1,800 | 1,848 |
-| hard negative | 25 | 26 | 600 | 624 |
-| **total** | **500** | **511** | **12,000** | **12,264** |
+| current producer | 240 | 245 | 9,600 | 9,800 |
+| recent history | 45 | 47 | 1,800 | 1,880 |
+| hard negative | 15 | 16 | 600 | 640 |
+| **total** | **300** | **308** | **12,000** | **12,320** |
 
 The audit emits the immutable selected-game and validation sidecars. Memmap
 ingest is bound to both those sidecars and the passing shard inventory, so the
-264 predeclared reserve attempts are excluded before corpus sizing and
+320 predeclared reserve attempts are excluded before corpus sizing and
 statistics rather than filtered later by the trainer. An A1 attestation at a
 source or ancestor blocks generic conversion, every resulting flat payload is
 content-addressed, and the trainer re-verifies all payload bytes before an
@@ -85,7 +85,7 @@ Training re-hashes that tree and persists its aggregate digest in both report
 and `value-training-v1` checkpoint provenance. The mutable shared seed ledger uses
 an immutable pre-claim prefix: render emits one exact contract/job claim row,
 append-only verification rejects peers/spoofs/duplicates, and post-wave audit
-requires all 72 exact claims.
+requires all 120 exact claims across the 40 physical H100s.
 
 ## Checkpoint and evidence identities
 
@@ -109,9 +109,9 @@ time of inspection:
 
 | local file/value | SHA-256 |
 |---|---|
-| `a1_pre_wave_contract.rnd_draft.json` | `38454992b08bf1be4f7c93713f0fa4e275d318ca82337127fc0aa498ae84750a` |
-| `a1_pre_wave_contract.template.json` | `b6e7ba32155d6e3521132fc453e74a505dc36eaf057ea020630a5c574865a260` |
-| `tools/a1_pre_wave_contract.py` | `e1dbb91413616a4d323b45967068f39695a334ad229628b684509d1cdb7a78af` |
+| `a1_pre_wave_contract.rnd_draft.json` | `eec43bd10cba7f2ae39dfb6c625959399061f4e42d0267a9bde2ed72acdb79a5` |
+| `a1_pre_wave_contract.template.json` | `bcaad7de4bc325ab0a404aacbd08d76c7361918f4d596291787be861ddcc8515` |
+| `tools/a1_pre_wave_contract.py` | `f7358aef3590f17bcef89595f7c0811cac058d505b28d759ad04d3247b6167ce` |
 | `tools/build_memmap_corpus.py` | `c21f4a304aee19944f3882af1bd72ada7c6d8822f31a09b0d3950317987ffbec` |
 | `tools/train_bc.py` | `9d787d516f6cab65a4e15a1f6a4557df04a92c958dfcb52dfbce10431aca12b0` |
 | canonical learner recipe | `1be1a29e44f1742e33bbff8798365a8ef2563438e2b4864160f2180308154655` |

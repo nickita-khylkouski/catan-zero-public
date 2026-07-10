@@ -194,12 +194,28 @@
       {"id": "c6_gpu0", "host_alias": "c6", "gpu": 0},
       {"id": "c6_gpu1", "host_alias": "c6", "gpu": 1},
       {"id": "c6_gpu2", "host_alias": "c6", "gpu": 2},
-      {"id": "c6_gpu3", "host_alias": "c6", "gpu": 3}
+      {"id": "c6_gpu3", "host_alias": "c6", "gpu": 3},
+      {"id": "h8a_gpu0", "host_alias": "h100-8a", "gpu": 0},
+      {"id": "h8a_gpu1", "host_alias": "h100-8a", "gpu": 1},
+      {"id": "h8a_gpu2", "host_alias": "h100-8a", "gpu": 2},
+      {"id": "h8a_gpu3", "host_alias": "h100-8a", "gpu": 3},
+      {"id": "h8a_gpu4", "host_alias": "h100-8a", "gpu": 4},
+      {"id": "h8a_gpu5", "host_alias": "h100-8a", "gpu": 5},
+      {"id": "h8a_gpu6", "host_alias": "h100-8a", "gpu": 6},
+      {"id": "h8a_gpu7", "host_alias": "h100-8a", "gpu": 7},
+      {"id": "h8b_gpu0", "host_alias": "h100-8b", "gpu": 0},
+      {"id": "h8b_gpu1", "host_alias": "h100-8b", "gpu": 1},
+      {"id": "h8b_gpu2", "host_alias": "h100-8b", "gpu": 2},
+      {"id": "h8b_gpu3", "host_alias": "h100-8b", "gpu": 3},
+      {"id": "h8b_gpu4", "host_alias": "h100-8b", "gpu": 4},
+      {"id": "h8b_gpu5", "host_alias": "h100-8b", "gpu": 5},
+      {"id": "h8b_gpu6", "host_alias": "h100-8b", "gpu": 6},
+      {"id": "h8b_gpu7", "host_alias": "h100-8b", "gpu": 7}
     ],
     "per_worker_games": {
-      "current_producer": 400,
-      "recent_history": 75,
-      "hard_negative": 25
+      "current_producer": 240,
+      "recent_history": 45,
+      "hard_negative": 15
     },
     "seed_base": "__UNRESOLVED__",
     "seed_block_size": 1000,

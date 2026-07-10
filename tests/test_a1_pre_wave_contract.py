@@ -376,7 +376,7 @@ def test_seal_expands_exact_category_jobs_and_binds_science_hashes(
     lock = contract.build_lock(draft)
 
     jobs = lock["fleet"]["jobs"]
-    assert len(jobs) == 72
+    assert len(jobs) == 120
     assert Counter(
         {
             category: sum(job["games"] for job in jobs if job["category"] == category)
@@ -1049,13 +1049,13 @@ def test_render_writes_commands_only_and_never_overwrites(tmp_path: Path) -> Non
     payload = contract.render(lock_path, rendered)
 
     assert payload["execution_policy"]["execute"] is False
-    assert len(payload["commands"]) == 72
-    assert len(list((rendered / "job_attestations").glob("*.json"))) == 72
+    assert len(payload["commands"]) == 120
+    assert len(list((rendered / "job_attestations").glob("*.json"))) == 120
     assert (
         sum(
             command["category"] == "current_producer" for command in payload["commands"]
         )
-        == 24
+        == 40
     )
     current = payload["commands"][0]
     assert current["environment"]["CATAN_A1_CONTRACT_SHA256"] == lock["contract_sha256"]
@@ -1310,7 +1310,7 @@ def test_post_wave_audit_accepts_exact_complete_category_corpus(tmp_path: Path) 
         report["reports"]["truncation"][
             "reserve_truncated_or_incomplete_attempts"
         ]
-        == 72
+        == 120
     )
     assert {item["category"] for item in report["shards"]} == set(
         contract.EXPECTED_GAMES
