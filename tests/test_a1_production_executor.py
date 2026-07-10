@@ -1,9 +1,17 @@
 from __future__ import annotations
 
+import hashlib
+import io
 import json
 import os
-import sys
+import resource
+import shlex
+import signal
+import stat
 import subprocess
+import sys
+import tarfile
+import time
 from pathlib import Path
 
 import pytest
@@ -426,6 +434,10 @@ def test_preflight_accepts_only_exact_report(monkeypatch: pytest.MonkeyPatch) ->
         "torch_version": "x",
         "torch_cuda_version": "x",
         "catanatron_rs_version": "x",
+        "required_nofile_soft": executor.REQUIRED_NOFILE_SOFT,
+        "nofile_soft_before": 1024,
+        "nofile_soft": executor.REQUIRED_NOFILE_SOFT,
+        "nofile_hard": 1_048_576,
     }
     monkeypatch.setattr(
         executor,
@@ -436,3 +448,182 @@ def test_preflight_accepts_only_exact_report(monkeypatch: pytest.MonkeyPatch) ->
     report["client_environment"] = {"CUDA_MPS_PIPE_DIRECTORY": "/tmp/wrong"}
     with pytest.raises(executor.ExecutorError, match="environment drift"):
         executor._preflight_host({"python": "/venv/bin/python"}, "h00", [0, 1, 2, 3])
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("required_nofile_soft", 1024, "required soft RLIMIT_NOFILE drift"),
+        ("nofile_soft", 1024, "soft RLIMIT_NOFILE"),
+        ("nofile_hard", 1024, "hard RLIMIT_NOFILE"),
+        ("nofile_soft", "65536", "invalid RLIMIT_NOFILE report"),
+    ],
+)
+def test_preflight_fails_closed_on_nofile_report(
+    monkeypatch: pytest.MonkeyPatch, field: str, value: object, message: str
+) -> None:
+    report = {
+        "gpu_indices": [0, 1, 2, 3],
+        "compute_apps": "mps_only_or_empty",
+        "mps_active": "active",
+        "mps_enabled": "enabled",
+        "mps_main_pid": 123,
+        "client_environment": dict(executor.CLIENT_ENVIRONMENT),
+        "python": "/venv/bin/python",
+        "torch_version": "x",
+        "torch_cuda_version": "x",
+        "catanatron_rs_version": "x",
+        "required_nofile_soft": executor.REQUIRED_NOFILE_SOFT,
+        "nofile_soft_before": 1024,
+        "nofile_soft": executor.REQUIRED_NOFILE_SOFT,
+        "nofile_hard": 1_048_576,
+    }
+    report[field] = value
+    monkeypatch.setattr(
+        executor,
+        "_ssh",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            [], 0, json.dumps(report), ""
+        ),
+    )
+    with pytest.raises(executor.ExecutorError, match=message):
+        executor._preflight_host(
+            {"python": "/venv/bin/python"}, "h00", [0, 1, 2, 3]
+        )
+
+
+def test_supervisor_launch_raises_nofile_before_new_session_and_env(
+    tmp_path: Path,
+) -> None:
+    _soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if hard != resource.RLIM_INFINITY and hard < executor.REQUIRED_NOFILE_SOFT:
+        pytest.skip("test host hard RLIMIT_NOFILE is below the production requirement")
+    observation = tmp_path / "observation.json"
+    child = tmp_path / "supervisor.py"
+    child.write_text(
+        """\
+import json,os,pathlib,resource,sys,time
+path=pathlib.Path(os.environ['A1_TEST_OBSERVATION'])
+soft,hard=resource.getrlimit(resource.RLIMIT_NOFILE)
+path.write_text(json.dumps({'argv':sys.argv[1:],'soft':soft,'hard':hard,'pid':os.getpid(),'sid':os.getsid(0),'pgid':os.getpgrp(),'pipe':os.environ.get('CUDA_MPS_PIPE_DIRECTORY'),'pythonpath':os.environ.get('PYTHONPATH'),'dont_write_bytecode':os.environ.get('PYTHONDONTWRITEBYTECODE')}))
+time.sleep(30)
+""",
+        encoding="utf-8",
+    )
+    log = tmp_path / "logs" / "lane.log"
+    command = executor._supervisor_launch_command(
+        python=sys.executable,
+        supervisor=str(child),
+        remote_lane="/sealed/lane.json",
+        log=str(log),
+        repo_dir="/sealed/repo",
+        extra_environment={"A1_TEST_OBSERVATION": str(observation)},
+    )
+    def low_soft_nofile() -> None:
+        _current_soft, current_hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        resource.setrlimit(resource.RLIMIT_NOFILE, (1024, current_hard))
+
+    result = subprocess.run(
+        shlex.split(command), text=True, capture_output=True, check=False,
+        preexec_fn=low_soft_nofile,
+    )
+    assert result.returncode == 0, result.stderr
+    pid = int(result.stdout.strip())
+    try:
+        deadline = time.monotonic() + 5
+        while not observation.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        observed = json.loads(observation.read_text(encoding="utf-8"))
+        assert observed["argv"] == ["run", "--lane", "/sealed/lane.json"]
+        assert observed["soft"] >= executor.REQUIRED_NOFILE_SOFT
+        assert observed["pid"] == observed["sid"] == observed["pgid"] == pid
+        assert observed["pipe"] == executor.CLIENT_ENVIRONMENT["CUDA_MPS_PIPE_DIRECTORY"]
+        assert observed["pythonpath"] == "/sealed/repo/src:/sealed/repo"
+        assert observed["dont_write_bytecode"] == "1"
+    finally:
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
+def test_staged_repo_is_read_only_bytecode_clean_and_resume_verifiable(
+    tmp_path: Path,
+) -> None:
+    files = {
+        "pkg/module.py": (b"VALUE = 7\n", 0o444),
+        "bin/tool.py": (b"#!/usr/bin/env python3\n", 0o555),
+    }
+    archive_path = tmp_path / "repo.tar"
+    with tarfile.open(archive_path, "w") as archive:
+        for name, (payload, mode) in files.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(payload)
+            info.mode = mode
+            archive.addfile(info, io.BytesIO(payload))
+    manifest = {
+        "schema_version": "a1-production-repo-v1",
+        "repo_tar_sha256": executor._sha256(archive_path),
+        "artifacts": [
+            {
+                "path": name,
+                "sha256": "sha256:" + hashlib.sha256(payload).hexdigest(),
+                "mode": mode,
+            }
+            for name, (payload, mode) in files.items()
+        ],
+    }
+    manifest["manifest_sha256"] = executor._digest(manifest)
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    root = tmp_path / "sealed-repo"
+    receipt = tmp_path / "receipt.json"
+    argv = [
+        sys.executable, "-c", executor._STAGE_REPO_SCRIPT,
+        str(archive_path), str(root), str(manifest_path), str(receipt),
+    ]
+
+    first = subprocess.run(argv, text=True, capture_output=True, check=False)
+    assert first.returncode == 0, first.stderr
+    assert stat.S_IMODE(root.stat().st_mode) == 0o555
+    assert stat.S_IMODE((root / "pkg").stat().st_mode) == 0o555
+    assert stat.S_IMODE((root / "pkg/module.py").stat().st_mode) == 0o444
+    assert stat.S_IMODE((root / "bin/tool.py").stat().st_mode) == 0o555
+
+    imported = subprocess.run(
+        [sys.executable, "-c", "import pkg.module; assert pkg.module.VALUE == 7"],
+        cwd=root,
+        env={**os.environ, "PYTHONPATH": str(root), "PYTHONDONTWRITEBYTECODE": "1"},
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert imported.returncode == 0, imported.stderr
+    assert not list(root.rglob("__pycache__"))
+    assert not list(root.rglob("*.pyc"))
+    if os.geteuid() != 0:
+        direct_environment = {**os.environ, "PYTHONPATH": str(root)}
+        direct_environment.pop("PYTHONDONTWRITEBYTECODE", None)
+        direct_environment.pop("PYTHONPYCACHEPREFIX", None)
+        direct_import = subprocess.run(
+            [sys.executable, "-c", "import pkg.module"],
+            cwd=root,
+            env=direct_environment,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert direct_import.returncode == 0, direct_import.stderr
+        assert not list(root.rglob("__pycache__"))
+        assert not list(root.rglob("*.pyc"))
+
+    os.chmod(root / "pkg", 0o755)
+    legacy_cache = root / "pkg/__pycache__"
+    legacy_cache.mkdir()
+    (legacy_cache / "module.cpython-311.pyc").write_bytes(b"legacy bytecode")
+    resumed = subprocess.run(argv, text=True, capture_output=True, check=False)
+    assert resumed.returncode == 0, resumed.stderr
+    assert not legacy_cache.exists()
+    assert stat.S_IMODE((root / "pkg").stat().st_mode) == 0o555
+    clean_resume = subprocess.run(argv, text=True, capture_output=True, check=False)
+    assert clean_resume.returncode == 0, clean_resume.stderr

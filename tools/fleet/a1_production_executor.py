@@ -35,6 +35,8 @@ CLIENT_ENVIRONMENT = {
     "CUDA_MPS_PIPE_DIRECTORY": "/tmp/mps_pipe_host",
     "CUDA_MPS_LOG_DIRECTORY": "/tmp/mps_log_host",
 }
+SUPERVISOR_ENVIRONMENT = {"PYTHONDONTWRITEBYTECODE": "1"}
+REQUIRED_NOFILE_SOFT = 65_536
 FORBIDDEN_ADAPTIVE_ARGV = (
     "--n-full-wide",
     "--n-full-wide-threshold",
@@ -428,9 +430,19 @@ if sha(dst.read_bytes())!=expected: raise SystemExit('installed live ledger dige
 def _preflight_host(
     hosts: dict[str, Any], alias: str, expected_gpus: Sequence[int]
 ) -> dict[str, Any]:
-    """Read-only launch preflight: topology, idle compute plane, durable MPS."""
-    script = r'''import importlib.metadata,json,os,pathlib,subprocess,sys
+    """Read-only launch preflight: topology, resources, idle compute plane, MPS."""
+    script = r'''import importlib.metadata,json,os,pathlib,resource,subprocess,sys
 expected=json.loads(sys.argv[1])
+required_nofile=int(sys.argv[2])
+nofile_soft_before,nofile_hard=resource.getrlimit(resource.RLIMIT_NOFILE)
+unlimited=resource.RLIM_INFINITY
+if nofile_hard!=unlimited and nofile_hard<required_nofile: raise SystemExit(f'hard RLIMIT_NOFILE {nofile_hard} is below required {required_nofile}')
+if nofile_soft_before!=unlimited and nofile_soft_before<required_nofile:
+    try: resource.setrlimit(resource.RLIMIT_NOFILE,(required_nofile,nofile_hard))
+    except (OSError,ValueError) as error: raise SystemExit(f'cannot raise soft RLIMIT_NOFILE {nofile_soft_before} to {required_nofile}: {error!r}')
+nofile_soft,nofile_hard_after=resource.getrlimit(resource.RLIMIT_NOFILE)
+if nofile_hard_after!=nofile_hard: raise SystemExit(f'hard RLIMIT_NOFILE changed during preflight: {nofile_hard}->{nofile_hard_after}')
+if nofile_soft!=unlimited and nofile_soft<required_nofile: raise SystemExit(f'soft RLIMIT_NOFILE {nofile_soft} is below required {required_nofile} after raise')
 try:
     import torch,catanatron_rs
 except Exception as error: raise SystemExit('configured interpreter dependency failure: '+repr(error))
@@ -468,10 +480,13 @@ for key,value in required.items():
     if not path.is_dir() or not os.access(path,os.R_OK|os.W_OK|os.X_OK): raise SystemExit(f'MPS directory inaccessible: {path}')
 try: rust_version=importlib.metadata.version('catanatron-rs')
 except importlib.metadata.PackageNotFoundError: rust_version='unknown'
-print(json.dumps({'gpu_indices':indices,'compute_apps':'mps_only_or_empty','mps_active':active,'mps_enabled':enabled,'mps_main_pid':main_pid,'client_environment':required,'python':sys.executable,'torch_version':str(torch.__version__),'torch_cuda_version':str(torch.version.cuda),'catanatron_rs_version':rust_version},sort_keys=True))'''
+print(json.dumps({'gpu_indices':indices,'compute_apps':'mps_only_or_empty','mps_active':active,'mps_enabled':enabled,'mps_main_pid':main_pid,'client_environment':required,'python':sys.executable,'torch_version':str(torch.__version__),'torch_cuda_version':str(torch.version.cuda),'catanatron_rs_version':rust_version,'required_nofile_soft':required_nofile,'nofile_soft_before':nofile_soft_before,'nofile_soft':nofile_soft,'nofile_hard':nofile_hard},sort_keys=True))'''
     command = " ".join(
         shlex.quote(value)
-        for value in (hosts["python"], "-c", script, json.dumps(sorted(expected_gpus)))
+        for value in (
+            hosts["python"], "-c", script, json.dumps(sorted(expected_gpus)),
+            str(REQUIRED_NOFILE_SOFT),
+        )
     )
     result = _ssh(hosts, alias, command)
     if result.returncode != 0:
@@ -483,7 +498,169 @@ print(json.dumps({'gpu_indices':indices,'compute_apps':'mps_only_or_empty','mps_
         raise ExecutorError(f"host preflight returned invalid JSON on {alias}") from error
     if report.get("client_environment") != CLIENT_ENVIRONMENT:
         raise ExecutorError(f"host MPS client environment drift on {alias}")
+    limit_fields = (
+        "required_nofile_soft", "nofile_soft_before", "nofile_soft", "nofile_hard",
+    )
+    if any(type(report.get(field)) is not int for field in limit_fields):
+        raise ExecutorError(f"invalid RLIMIT_NOFILE report on {alias}")
+    if report["required_nofile_soft"] != REQUIRED_NOFILE_SOFT:
+        raise ExecutorError(f"required soft RLIMIT_NOFILE drift on {alias}")
+    soft_before = report["nofile_soft_before"]
+    soft = report["nofile_soft"]
+    hard = report["nofile_hard"]
+    if soft_before < -1 or soft < -1 or hard < -1:
+        raise ExecutorError(f"invalid RLIMIT_NOFILE report on {alias}")
+    if hard != -1 and hard < REQUIRED_NOFILE_SOFT:
+        raise ExecutorError(
+            f"host hard RLIMIT_NOFILE {hard} is below required "
+            f"{REQUIRED_NOFILE_SOFT} on {alias}"
+        )
+    if soft != -1 and soft < REQUIRED_NOFILE_SOFT:
+        raise ExecutorError(
+            f"host soft RLIMIT_NOFILE {soft} is below required "
+            f"{REQUIRED_NOFILE_SOFT} after preflight raise on {alias}"
+        )
+    if hard != -1 and (
+        soft == -1 or soft > hard or soft_before == -1 or soft_before > hard
+    ):
+        raise ExecutorError(f"invalid RLIMIT_NOFILE soft/hard relationship on {alias}")
     return report
+
+
+def _supervisor_launch_command(
+    *,
+    python: str,
+    supervisor: str,
+    remote_lane: str,
+    log: str,
+    repo_dir: str,
+    extra_environment: Mapping[str, str] | None = None,
+) -> str:
+    """Build a narrow launcher which raises nofile before creating the session."""
+    extra = dict(extra_environment or {})
+    protected = {*CLIENT_ENVIRONMENT, *SUPERVISOR_ENVIRONMENT, "PYTHONPATH"}
+    if protected & set(extra):
+        raise ExecutorError("supervisor launch environment cannot override invariants")
+    environment = {
+        **CLIENT_ENVIRONMENT,
+        **SUPERVISOR_ENVIRONMENT,
+        "PYTHONPATH": f"{repo_dir}/src:{repo_dir}",
+        **extra,
+    }
+    if any(
+        not isinstance(key, str) or not isinstance(value, str) or not key
+        or "=" in key or "\x00" in key or "\x00" in value
+        for key, value in environment.items()
+    ):
+        raise ExecutorError("invalid supervisor launch environment")
+    argv = [python, supervisor, "run", "--lane", remote_lane]
+    script = r'''import json,os,pathlib,resource,subprocess,sys
+required=int(sys.argv[1]);log=pathlib.Path(sys.argv[2]);environment=json.loads(sys.argv[3]);argv=json.loads(sys.argv[4])
+soft,hard=resource.getrlimit(resource.RLIMIT_NOFILE);unlimited=resource.RLIM_INFINITY
+if hard!=unlimited and hard<required: raise SystemExit(f'hard RLIMIT_NOFILE {hard} is below required {required}')
+if soft!=unlimited and soft<required:
+    try: resource.setrlimit(resource.RLIMIT_NOFILE,(required,hard))
+    except (OSError,ValueError) as error: raise SystemExit(f'cannot raise soft RLIMIT_NOFILE {soft} to {required}: {error!r}')
+raised,_=resource.getrlimit(resource.RLIMIT_NOFILE)
+if raised!=unlimited and raised<required: raise SystemExit(f'soft RLIMIT_NOFILE {raised} is below required {required} after raise')
+log.parent.mkdir(parents=True,exist_ok=True);child_environment=os.environ.copy();child_environment.update(environment)
+with log.open('ab',buffering=0) as output:
+    process=subprocess.Popen(argv,stdin=subprocess.DEVNULL,stdout=output,stderr=subprocess.STDOUT,env=child_environment,start_new_session=True,close_fds=True)
+print(process.pid,flush=True)'''
+    return " ".join(
+        shlex.quote(value)
+        for value in (
+            python, "-c", script, str(REQUIRED_NOFILE_SOFT), log,
+            json.dumps(environment, sort_keys=True, separators=(",", ":")),
+            json.dumps(argv, separators=(",", ":")),
+        )
+    )
+
+
+_STAGE_REPO_SCRIPT = r'''import hashlib,json,os,pathlib,shutil,stat,sys,tarfile,time,uuid
+src,root,manifest_path,receipt_path=map(pathlib.Path,sys.argv[1:5])
+manifest=json.loads(manifest_path.read_text())
+sha=lambda p:'sha256:'+hashlib.sha256(p.read_bytes()).hexdigest()
+if sha(src)!=manifest['repo_tar_sha256']: raise SystemExit('repo tar digest drift')
+expected={r['path']:r for r in manifest['artifacts']}
+if len(expected)!=len(manifest['artifacts']) or not expected or any(str(pathlib.PurePosixPath(name)) in ('','.') or pathlib.PurePosixPath(name).is_absolute() or '..' in pathlib.PurePosixPath(name).parts for name in expected): raise SystemExit('unsafe repo artifact path')
+if any(int(record.get('mode',-1)) not in (0o444,0o555) for record in expected.values()): raise SystemExit('unsafe repo artifact mode')
+expected_dirs=set()
+for name in expected:
+    parent=pathlib.PurePosixPath(name).parent
+    while str(parent)!='.': expected_dirs.add(str(parent));parent=parent.parent
+def verify_tree(base):
+    if not base.is_dir() or base.is_symlink() or stat.S_IMODE(base.stat().st_mode)!=0o555: return False
+    if any(p.is_symlink() for p in base.rglob('*')): return False
+    actual_files={str(p.relative_to(base)) for p in base.rglob('*') if p.is_file()}
+    actual_dirs={str(p.relative_to(base)) for p in base.rglob('*') if p.is_dir()}
+    if actual_files!=set(expected) or actual_dirs!=expected_dirs: return False
+    return all(sha(base/name)==record['sha256'] and stat.S_IMODE((base/name).stat().st_mode)==int(record['mode']) for name,record in expected.items()) and all(stat.S_IMODE((base/name).stat().st_mode)==0o555 for name in expected_dirs)
+def remove_stage(stage):
+    if not stage.exists(): return
+    for directory in [stage,*[p for p in stage.rglob('*') if p.is_dir()]]:
+        os.chmod(directory,0o700)
+    shutil.rmtree(stage)
+def seal_legacy_bytecode_tree(base):
+    if not base.is_dir() or base.is_symlink(): return False
+    if any(p.is_symlink() for p in base.rglob('*')): return False
+    for name,record in expected.items():
+        artifact=base/name
+        if not artifact.is_file() or sha(artifact)!=record['sha256']: return False
+    cache_dirs=[]
+    for path in base.rglob('*'):
+        relative=path.relative_to(base);parts=relative.parts
+        if '__pycache__' in parts:
+            if path.is_dir() and path.name=='__pycache__': cache_dirs.append(path)
+            continue
+        if path.is_file() and str(relative) not in expected: return False
+        if path.is_dir() and str(relative) not in expected_dirs: return False
+    for cache in sorted(set(cache_dirs),key=lambda p:len(p.parts),reverse=True):
+        if cache.exists(): os.chmod(cache.parent,0o700);remove_stage(cache)
+    for name,record in expected.items(): os.chmod(base/name,int(record['mode']))
+    for directory in sorted([base/name for name in expected_dirs],key=lambda p:len(p.parts),reverse=True): os.chmod(directory,0o555)
+    os.chmod(base,0o555)
+    return verify_tree(base)
+receipt=None
+if receipt_path.exists():
+    receipt=json.loads(receipt_path.read_text())
+    if receipt.get('schema_version')!='a1-production-repo-stage-v1' or receipt.get('repo_tar_sha256')!=manifest['repo_tar_sha256'] or receipt.get('manifest_sha256')!=manifest['manifest_sha256']:
+        raise SystemExit('repo stage receipt binds different bytes')
+    if receipt.get('status')=='complete':
+        if not verify_tree(root) and not seal_legacy_bytecode_tree(root): raise SystemExit('completed repo tree drift')
+        raise SystemExit(0)
+else:
+    stage=root.parent/('.repo-stage-'+uuid.uuid4().hex)
+    receipt={'schema_version':'a1-production-repo-stage-v1','status':'prepared','repo_tar_sha256':manifest['repo_tar_sha256'],'manifest_sha256':manifest['manifest_sha256'],'stage':str(stage),'created_at':time.time()}
+    receipt_path.parent.mkdir(parents=True,exist_ok=True)
+    fd=os.open(receipt_path,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
+    with os.fdopen(fd,'w') as f: json.dump(receipt,f,sort_keys=True);f.flush();os.fsync(f.fileno())
+if root.exists():
+    if verify_tree(root) or seal_legacy_bytecode_tree(root): receipt['status']='complete'
+    else: raise SystemExit('repo exists without valid completed stage')
+else:
+    stage=pathlib.Path(receipt['stage'])
+    if stage.parent!=root.parent or not stage.name.startswith('.repo-stage-'): raise SystemExit('unsafe stage path')
+    remove_stage(stage);stage.mkdir(parents=True)
+    with tarfile.open(src) as archive:
+        members=archive.getmembers()
+        if {m.name for m in members}!=set(expected) or any(not m.isfile() for m in members): raise SystemExit('repo tar member drift')
+        for member in members:
+            destination=stage/member.name;destination.parent.mkdir(parents=True,exist_ok=True)
+            data=archive.extractfile(member).read()
+            fd=os.open(destination,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
+            with os.fdopen(fd,'wb') as f: f.write(data);f.flush();os.fsync(f.fileno())
+            os.chmod(destination,int(expected[member.name]['mode']))
+    if not all(sha(stage/name)==record['sha256'] for name,record in expected.items()): raise SystemExit('staged repo bytes drift')
+    for directory in sorted([p for p in stage.rglob('*') if p.is_dir()],key=lambda p:len(p.parts),reverse=True): os.chmod(directory,0o555)
+    os.chmod(stage,0o555)
+    if not verify_tree(stage): raise SystemExit('staged repo seal verification failed')
+    os.chmod(stage,0o755);os.rename(stage,root);os.chmod(root,0o555);receipt['status']='complete'
+receipt['completed_at']=time.time()
+tmp=receipt_path.parent/('.'+receipt_path.name+'.'+uuid.uuid4().hex+'.tmp')
+with tmp.open('x') as f: json.dump(receipt,f,sort_keys=True);f.flush();os.fsync(f.fileno())
+os.replace(tmp,receipt_path)
+if not verify_tree(root): raise SystemExit('installed repo verification failed')'''
 
 
 def _stage_repo(
@@ -510,54 +687,7 @@ def _stage_repo(
     receipt_path = f"{hosts['remote_root']}/receipts/repo-stage-{token}.json"
     _remote_install(hosts, alias, repo_tar, remote_tar, repo_sha)
     _remote_install(hosts, alias, local_manifest, remote_manifest, _sha256(local_manifest))
-    script = r'''import hashlib,json,os,pathlib,shutil,sys,tarfile,time,uuid
-src,root,manifest_path,receipt_path=map(pathlib.Path,sys.argv[1:5])
-manifest=json.loads(manifest_path.read_text())
-sha=lambda p:'sha256:'+hashlib.sha256(p.read_bytes()).hexdigest()
-if sha(src)!=manifest['repo_tar_sha256']: raise SystemExit('repo tar digest drift')
-expected={r['path']:r for r in manifest['artifacts']}
-def verify_tree():
-    if not root.is_dir(): return False
-    actual={str(p.relative_to(root)) for p in root.rglob('*') if p.is_file()}
-    if actual!=set(expected): return False
-    return all(sha(root/name)==record['sha256'] for name,record in expected.items())
-receipt=None
-if receipt_path.exists():
-    receipt=json.loads(receipt_path.read_text())
-    if receipt.get('schema_version')!='a1-production-repo-stage-v1' or receipt.get('repo_tar_sha256')!=manifest['repo_tar_sha256'] or receipt.get('manifest_sha256')!=manifest['manifest_sha256']:
-        raise SystemExit('repo stage receipt binds different bytes')
-    if receipt.get('status')=='complete':
-        if not verify_tree(): raise SystemExit('completed repo tree drift')
-        raise SystemExit(0)
-else:
-    stage=root.parent/('.repo-stage-'+uuid.uuid4().hex)
-    receipt={'schema_version':'a1-production-repo-stage-v1','status':'prepared','repo_tar_sha256':manifest['repo_tar_sha256'],'manifest_sha256':manifest['manifest_sha256'],'stage':str(stage),'created_at':time.time()}
-    receipt_path.parent.mkdir(parents=True,exist_ok=True)
-    fd=os.open(receipt_path,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
-    with os.fdopen(fd,'w') as f: json.dump(receipt,f,sort_keys=True);f.flush();os.fsync(f.fileno())
-if root.exists():
-    if verify_tree():
-        receipt['status']='complete'
-    else: raise SystemExit('repo exists without valid completed stage')
-else:
-    stage=pathlib.Path(receipt['stage'])
-    if stage.parent!=root.parent or not stage.name.startswith('.repo-stage-'): raise SystemExit('unsafe stage path')
-    shutil.rmtree(stage,ignore_errors=True);stage.mkdir(parents=True)
-    with tarfile.open(src) as archive:
-        members=archive.getmembers()
-        if {m.name for m in members}!=set(expected) or any(not m.isfile() for m in members): raise SystemExit('repo tar member drift')
-        for member in members:
-            destination=stage/member.name;destination.parent.mkdir(parents=True,exist_ok=True)
-            data=archive.extractfile(member).read()
-            fd=os.open(destination,os.O_WRONLY|os.O_CREAT|os.O_EXCL,int(expected[member.name]['mode']))
-            with os.fdopen(fd,'wb') as f: f.write(data);f.flush();os.fsync(f.fileno())
-    if not all(sha(stage/name)==record['sha256'] for name,record in expected.items()): raise SystemExit('staged repo bytes drift')
-    os.rename(stage,root);receipt['status']='complete'
-receipt['completed_at']=time.time()
-tmp=receipt_path.parent/('.'+receipt_path.name+'.'+uuid.uuid4().hex+'.tmp')
-with tmp.open('x') as f: json.dump(receipt,f,sort_keys=True);f.flush();os.fsync(f.fileno())
-os.replace(tmp,receipt_path)
-if not verify_tree(): raise SystemExit('installed repo verification failed')'''
+    script = _STAGE_REPO_SCRIPT
     result = _ssh(
         hosts,
         alias,
@@ -721,14 +851,12 @@ def execute(plan: dict[str, Any], *, receipt_path: Path, resume: bool) -> dict[s
             _remote_install(hosts, alias, local_lane, remote_lane, _sha256(local_lane))
             supervisor = f"{repo_dir}/tools/fleet/a1_lane_supervisor.py"
             log = f"{hosts['remote_root']}/logs/{worker_id}.supervisor.log"
-            launch = (
-                f"mkdir -p {shlex.quote(str(Path(log).parent))} && "
-                f"setsid env "
-                f"CUDA_MPS_PIPE_DIRECTORY={shlex.quote(CLIENT_ENVIRONMENT['CUDA_MPS_PIPE_DIRECTORY'])} "
-                f"CUDA_MPS_LOG_DIRECTORY={shlex.quote(CLIENT_ENVIRONMENT['CUDA_MPS_LOG_DIRECTORY'])} "
-                f"PYTHONPATH={shlex.quote(repo_dir + '/src:' + repo_dir)} "
-                f"{shlex.quote(hosts['python'])} {shlex.quote(supervisor)} run --lane {shlex.quote(remote_lane)} "
-                f">{shlex.quote(log)} 2>&1 </dev/null & echo $!"
+            launch = _supervisor_launch_command(
+                python=hosts["python"],
+                supervisor=supervisor,
+                remote_lane=remote_lane,
+                log=log,
+                repo_dir=repo_dir,
             )
             result = _ssh(hosts, alias, launch)
             if result.returncode != 0 or not result.stdout.strip().splitlines()[-1].isdigit():
