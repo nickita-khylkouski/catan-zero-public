@@ -27,6 +27,10 @@ METRIC_PREFIX = "catan_fleet_"
 GPU_DIR_RE = re.compile(
     r"^gpu(?P<gpu>[0-9]+)(?:_pipeline(?P<pipeline>[01]))?$"
 )
+A1_GPU_DIR_RE = re.compile(
+    r"^(?P<alias>[A-Za-z0-9][A-Za-z0-9-]*)_gpu(?P<gpu>[0-9]+)__"
+    r"(?P<category>current_producer|recent_history|hard_negative)$"
+)
 
 
 def _load_json(path: Path) -> dict[str, Any] | None:
@@ -88,8 +92,10 @@ def _number(value: Any, default: float = 0.0) -> float:
 @dataclass(frozen=True)
 class RunSnapshot:
     host: str
+    alias: str
     gpu: str
     pipeline: str
+    category: str
     run: str
     role: str
     config_hash: str
@@ -146,9 +152,12 @@ def snapshot_run(
     now: float,
     stale_after_seconds: float,
 ) -> RunSnapshot | None:
-    match = GPU_DIR_RE.match(gpu_dir.name)
-    if match is None:
+    legacy_match = GPU_DIR_RE.fullmatch(gpu_dir.name)
+    a1_match = A1_GPU_DIR_RE.fullmatch(gpu_dir.name)
+    if legacy_match is None and a1_match is None:
         return None
+    match = a1_match or legacy_match
+    assert match is not None
     config_path = gpu_dir / "config.json"
     manifest_path = gpu_dir / "manifest.json"
     config = _load_json(config_path) or {}
@@ -222,8 +231,11 @@ def snapshot_run(
     role = "teacher" if n_full >= 128 else "volume"
     return RunSnapshot(
         host=host,
+        alias=a1_match.group("alias") if a1_match is not None else host,
         gpu=match.group("gpu"),
-        pipeline=match.group("pipeline") or "0",
+        pipeline=(legacy_match.group("pipeline") if legacy_match is not None else None)
+        or "0",
+        category=a1_match.group("category") if a1_match is not None else "legacy",
         run=run,
         role=role,
         config_hash=config_hash,
@@ -257,7 +269,12 @@ def collect_snapshots(
 ) -> list[RunSnapshot]:
     snapshots: list[RunSnapshot] = []
     for root in roots:
-        for gpu_dir in sorted(root.expanduser().glob("*/gpu*")):
+        expanded = root.expanduser()
+        candidates = {
+            *expanded.glob("*/gpu*"),
+            *expanded.glob("*/*_gpu*__*"),
+        }
+        for gpu_dir in sorted(candidates):
             snapshot = snapshot_run(
                 gpu_dir,
                 host=host,
@@ -271,7 +288,8 @@ def collect_snapshots(
                 continue
             snapshots.append(snapshot)
     # Avoid unbounded label cardinality: expose one current run per physical
-    # GPU/pipeline slot. Production supports at most two pipelines per GPU.
+    # GPU/pipeline slot. Sealed A1 runs its three categories sequentially on a
+    # lane, so the active category wins the same slot arbitration as legacy.
     by_slot: dict[tuple[str, str], RunSnapshot] = {}
     for snapshot in snapshots:
         slot = (snapshot.gpu, snapshot.pipeline)
@@ -282,7 +300,10 @@ def collect_snapshots(
         )
         if prior_score is None or score > prior_score:
             by_slot[slot] = snapshot
-    return [by_slot[slot] for slot in sorted(by_slot, key=lambda item: tuple(map(int, item)))]
+    return [
+        by_slot[slot]
+        for slot in sorted(by_slot, key=lambda item: tuple(map(int, item)))
+    ]
 
 
 def _escape_label(value: Any) -> str:
@@ -330,8 +351,10 @@ def render_metrics(
     for snapshot in snapshots:
         labels = {
             "host": snapshot.host,
+            "alias": snapshot.alias,
             "gpu": snapshot.gpu,
             "pipeline": snapshot.pipeline,
+            "category": snapshot.category,
             "run": snapshot.run,
             "role": snapshot.role,
             "config_hash": snapshot.config_hash,

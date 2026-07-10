@@ -76,6 +76,8 @@ def test_live_progress_exports_process_health_config_seed_and_counters(
     snapshot = snapshots[0]
     assert snapshot.gpu == "2"
     assert snapshot.pipeline == "0"
+    assert snapshot.alias == "c1"
+    assert snapshot.category == "legacy"
     assert snapshot.config_hash == exporter._config_hash(config)
     assert snapshot.seed_start == 1000
     assert snapshot.seed_end == 1020
@@ -95,6 +97,110 @@ def test_live_progress_exports_process_health_config_seed_and_counters(
     assert "catan_fleet_generator_rows{" in metrics and "} 2100" in metrics
     assert "catan_fleet_generator_simulations{" in metrics and "} 158000" in metrics
     assert "catan_fleet_generator_healthy{" in metrics and "} 1" in metrics
+
+
+def test_sealed_a1_layout_discovers_every_alias_and_category_with_labels(
+    tmp_path: Path,
+) -> None:
+    now = 15_000.0
+    root = tmp_path / "gen_out"
+    run = root / "a1-fresh-mixed-12000games"
+    aliases = ("c1", "c2", "c3", "c4", "c5", "c6", "h100-8a", "h100-8b")
+    category_rows = {
+        "current_producer": 100,
+        "recent_history": 10,
+        "hard_negative": 1,
+    }
+    processes: dict[str, set[int]] = {}
+    for alias_index, alias in enumerate(aliases):
+        for category_index, (category, rows) in enumerate(category_rows.items()):
+            output = run / f"{alias}_gpu0__{category}"
+            _write_json(
+                output / "config.json",
+                _config(base_seed=10_000 + alias_index * 100 + category_index),
+                mtime=now - 2,
+            )
+            _write_json(
+                output / "worker_000" / "progress.json",
+                {
+                    "games_requested": 20,
+                    "games_completed_local": 1,
+                    "rows": rows,
+                    "simulations_used_total": rows * 128,
+                    "shard_count_confirmed": 1,
+                    "games_failed": 0,
+                    "games_truncated": 0,
+                },
+                mtime=now - 1,
+            )
+            processes[str(output.resolve())] = {
+                1000 + alias_index * len(category_rows) + category_index
+            }
+
+    snapshots = []
+    for alias in aliases:
+        for category in category_rows:
+            output = run / f"{alias}_gpu0__{category}"
+            snapshot = exporter.snapshot_run(
+                output,
+                host="fleet-test",
+                processes=processes,
+                now=now,
+                stale_after_seconds=60,
+            )
+            assert snapshot is not None
+            snapshots.append(snapshot)
+
+    assert len(snapshots) == len(aliases) * len(category_rows)
+    assert {(item.alias, item.category) for item in snapshots} == {
+        (alias, category) for alias in aliases for category in category_rows
+    }
+    assert {
+        category: sum(item.rows for item in snapshots if item.category == category)
+        for category in category_rows
+    } == {category: rows * len(aliases) for category, rows in category_rows.items()}
+    assert all(item.run == "a1-fresh-mixed-12000games" for item in snapshots)
+    assert all(item.gpu == "0" and item.pipeline == "0" for item in snapshots)
+    assert all(item.role == "teacher" and item.healthy for item in snapshots)
+
+    metrics = exporter.render_metrics(
+        snapshots, host="fleet-test", roots=[], now=now
+    )
+    for alias in aliases:
+        for category in category_rows:
+            assert f'alias="{alias}",category="{category}"' in metrics
+    assert 'run="a1-fresh-mixed-12000games"' in metrics
+
+
+def test_sealed_a1_categories_share_physical_gpu_slot_arbitration(
+    tmp_path: Path,
+) -> None:
+    now = 16_000.0
+    root = tmp_path / "gen_out"
+    run = root / "a1-fresh-mixed-12000games"
+    current = run / "c1_gpu2__current_producer"
+    recent = run / "c1_gpu2__recent_history"
+    hard = run / "c1_gpu2__hard_negative"
+    for index, output in enumerate((current, recent, hard)):
+        _write_json(
+            output / "config.json",
+            _config(base_seed=20_000 + index),
+            mtime=now - index,
+        )
+
+    snapshots = exporter.collect_snapshots(
+        [root],
+        host="c1",
+        processes={str(recent.resolve()): {123}},
+        now=now,
+        stale_after_seconds=60,
+        max_run_age_seconds=3600,
+    )
+
+    assert len(snapshots) == 1
+    assert snapshots[0].output_dir == recent
+    assert snapshots[0].alias == "c1"
+    assert snapshots[0].category == "recent_history"
 
 
 def test_stale_active_progress_is_unhealthy(tmp_path: Path) -> None:
