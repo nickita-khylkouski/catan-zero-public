@@ -37,31 +37,31 @@ def test_native_public_conservation_search_smoke() -> None:
     searches = (
         GumbelChanceMCTS(
             GumbelChanceMCTSConfig(
-                n_full=8,
-                n_fast=8,
+                n_full=128,
+                n_fast=128,
                 p_full=1.0,
                 max_depth=4,
                 seed=7,
                 information_set_search=True,
-                determinization_particles=2,
-                determinization_min_simulations=1,
+                determinization_particles=4,
+                determinization_min_simulations=32,
             ),
             evaluator,
         ),
         RustMCTS(
             RustMCTSConfig(
-                simulations=8,
+                simulations=128,
                 max_depth=4,
                 seed=7,
                 information_set_search=True,
-                determinization_particles=2,
-                determinization_min_simulations=1,
+                determinization_particles=4,
+                determinization_min_simulations=32,
             ),
             evaluator,
         ),
     )
     gumbel = searches[0].search(rust.Game.simple(["RED", "BLUE"], seed=11))
     puct = searches[1].search(rust.Game.simple(["RED", "BLUE"], seed=11))
-    assert gumbel.simulations_used == 8
-    assert sum(puct.visits.values()) == 8
+    assert gumbel.simulations_used == 128
+    assert sum(puct.visits.values()) == 128
     assert len(gumbel.improved_policy) == len(puct.policy) == 54

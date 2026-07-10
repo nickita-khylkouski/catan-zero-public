@@ -103,8 +103,8 @@ def test_information_set_particles_share_one_exact_total_budget() -> None:
     assert sum(result.visit_counts.values()) == 128
 
 
-def test_per_particle_override_preserves_configured_search_operator() -> None:
-    """A particle budget must not silently turn the legacy arm into exact SH."""
+def test_per_particle_override_enforces_exact_total_budget() -> None:
+    """Particle sub-budgets cannot inherit legacy SH rounding overruns."""
 
     class _StopAfterBudgetAssertion(RuntimeError):
         pass
@@ -129,7 +129,7 @@ def test_per_particle_override_preserves_configured_search_operator() -> None:
 
     def run_root(_self, _root, n_simulations, *, exact_budget_override=False):
         assert n_simulations == 32
-        assert exact_budget_override is False
+        assert exact_budget_override is True
         raise _StopAfterBudgetAssertion
 
     mcts._fetch_legal_actions = MethodType(fetch, mcts)
@@ -137,8 +137,7 @@ def test_per_particle_override_preserves_configured_search_operator() -> None:
     mcts._run_root_search = MethodType(run_root, mcts)
     with pytest.raises(_StopAfterBudgetAssertion):
         GumbelChanceMCTS._search_single_world(
-            mcts,
-            _Game(), force_full=True, n_simulations_override=32
+            mcts, _Game(), force_full=True, n_simulations_override=32
         )
 
 

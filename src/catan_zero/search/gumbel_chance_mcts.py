@@ -1038,11 +1038,13 @@ class GumbelChanceMCTS:
         sh_winner_action, used = self._run_root_search(
             root,
             n_simulations,
-            # A particle budget changes the requested simulation count, not
-            # the search operator.  In particular, the E1 legacy arm must keep
-            # the legacy phase-rounding schedule (and its possible overrun),
-            # while the exact arm remains governed by exact_budget_sh.
-            exact_budget_override=False,
+            # Information-set search divides one locked TOTAL budget across
+            # particles. Legacy phase rounding inside each small particle tree
+            # can otherwise turn n128/p4 into 4*108=432 simulations at a
+            # 54-action opening. An explicit particle override is therefore an
+            # exact sub-budget; ordinary non-PIMC searches retain the configured
+            # legacy/exact operator choice.
+            exact_budget_override=n_simulations_override is not None,
         )
 
         completed_q = self._completed_q(root)

@@ -289,6 +289,13 @@ if [ "$(systemctl is-active catan-fleet-exporter.service)" != "active" ] \
 fi
 echo "[install] catan-fleet-exporter.service active+enabled (loopback :9500)"
 
+# Editable installs may create ignored build metadata, but tracked/untracked
+# source drift after installation is never acceptable for a frozen runtime.
+if [ -n "$(git status --porcelain --untracked-files=all)" ]; then
+  git status --short >&2
+  die "deployment checkout drifted during installation"
+fi
+
 # 8. Durable, atomic install receipt.  It lives outside the immutable checkout
 # so the evidence does not make a future integrity check report a dirty tree.
 CATAN_INSTALL_RECEIPT="${CATAN_INSTALL_RECEIPT:-$HOME/.local/state/catan-zero/install-${HEAD_COMMIT}.json}"

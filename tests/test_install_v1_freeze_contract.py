@@ -224,6 +224,10 @@ def test_dirty_or_reused_destination_is_rejected_before_sudo(tmp_path: Path) -> 
 
 def test_receipt_is_outside_checkout_and_binds_release_evidence() -> None:
     text = INSTALLER.read_text(encoding="utf-8")
+    assert "deployment checkout drifted during installation" in text
+    assert text.index("deployment checkout drifted during installation") < text.index(
+        '"schema_version": "catan-zero-install-receipt-v1"'
+    )
     assert '"schema_version": "catan-zero-install-receipt-v1"' in text
     assert "$HOME/.local/state/catan-zero/install-${HEAD_COMMIT}.json" in text
     for field in (
