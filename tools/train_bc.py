@@ -10,6 +10,7 @@ import math
 import operator
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import time
@@ -902,6 +903,19 @@ def build_parser() -> argparse.ArgumentParser:
             "as ~sqrt(n) independent value samples. No-op unless --per-game-value-weight is set."
         ),
     )
+    # Internal A1 executor binding. These flags do not enable an ablation on
+    # their own: the audited memmap/lock path below independently reconstructs
+    # the effective recipe and rejects any mismatch or empty/no-op ablation.
+    parser.add_argument("--a1-learner-ablation-id", default="", help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--a1-effective-learner-recipe-json", default="", help=argparse.SUPPRESS
+    )
+    parser.add_argument(
+        "--a1-effective-learner-recipe-sha256", default="", help=argparse.SUPPRESS
+    )
+    parser.add_argument("--a1-ablation-code-binding-json", default="", help=argparse.SUPPRESS)
+    parser.add_argument("--a1-ablation-code-tree-sha256", default="", help=argparse.SUPPRESS)
+    parser.add_argument("--a1-reviewed-lock-file-sha256", default="", help=argparse.SUPPRESS)
     parser.add_argument(
         "--init-checkpoint",
         default="",
@@ -1206,7 +1220,7 @@ def _value_training_metadata(
         and float(categorical_training_weight_sum) > 0.0
     ):
         trained_readouts.append("categorical")
-    return {
+    metadata = {
         "schema_version": "value-training-v1",
         "primary_readout": primary_readout,
         "trained_value_readouts": trained_readouts,
@@ -1255,6 +1269,10 @@ def _value_training_metadata(
             else {}
         ),
     }
+    learner_ablation = getattr(args, "a1_learner_ablation", None)
+    if learner_ablation is not None:
+        metadata["learner_ablation"] = dict(learner_ablation)
+    return metadata
 
 
 def _assert_value_heads_present_for_losses(model, args) -> None:
@@ -2239,16 +2257,144 @@ def _validate_a1_learner_training_recipe(
         for key in sorted(set(expected) & set(effective))
         if expected[key] != effective[key]
     }
-    if missing or extra or drift:
+    ablation_id = str(getattr(args, "a1_learner_ablation_id", "") or "")
+    declared_json = str(
+        getattr(args, "a1_effective_learner_recipe_json", "") or ""
+    )
+    declared_sha = str(
+        getattr(args, "a1_effective_learner_recipe_sha256", "") or ""
+    )
+    code_binding_json = str(
+        getattr(args, "a1_ablation_code_binding_json", "") or ""
+    )
+    declared_code_sha = str(
+        getattr(args, "a1_ablation_code_tree_sha256", "") or ""
+    )
+    reviewed_lock_sha = str(
+        getattr(args, "a1_reviewed_lock_file_sha256", "") or ""
+    )
+    if not ablation_id:
+        if (
+            declared_json
+            or declared_sha
+            or code_binding_json
+            or declared_code_sha
+            or reviewed_lock_sha
+        ):
+            raise SystemExit(
+                "A1 effective-recipe metadata requires a nonempty "
+                "--a1-learner-ablation-id"
+            )
+        if missing or extra or drift:
+            raise SystemExit(
+                "A1 learner training recipe differs from the immutable one-dose "
+                "contract: "
+                f"missing={sorted(missing)} extra={sorted(extra)} drift={drift}"
+            )
+        if bound.get("learner_training_recipe_sha256") != _canonical_json_sha256(
+            effective
+        ):
+            raise SystemExit("A1 effective learner training recipe digest drift")
+        bound["learner_ablation"] = None
+        return effective
+
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,79}", ablation_id):
         raise SystemExit(
-            "A1 learner training recipe differs from the immutable one-dose "
-            "contract: "
-            f"missing={sorted(missing)} extra={sorted(extra)} drift={drift}"
+            "--a1-learner-ablation-id must be 1-80 safe identifier characters"
         )
+    effective["per_game_value_weight_mode"] = str(args.per_game_value_weight_mode)
+    missing = set(expected) - set(effective)
+    extra = set(effective) - (set(expected) | {"per_game_value_weight_mode"})
+    drift = {
+        key: {"contract": expected.get(key), "effective": effective.get(key)}
+        for key in sorted(set(expected) & set(effective))
+        if expected[key] != effective[key]
+    }
+    if effective["per_game_value_weight_mode"] != "equal":
+        drift["per_game_value_weight_mode"] = {
+            "contract": "equal (implicit train_bc default; weighting locked off)",
+            "effective": effective["per_game_value_weight_mode"],
+        }
+    if not declared_json or not _is_sha256(declared_sha):
+        raise SystemExit(
+            "A1 learner ablation requires canonical effective recipe JSON and sha256"
+        )
+    try:
+        declared = json.loads(declared_json)
+    except json.JSONDecodeError as error:
+        raise SystemExit(f"invalid A1 effective learner recipe JSON: {error}") from error
+    if not isinstance(declared, dict):
+        raise SystemExit("A1 effective learner recipe must be a JSON object")
+    if _canonical_json_sha256(declared) != declared_sha:
+        raise SystemExit("A1 declared effective learner recipe digest drift")
+    expected_effective_keys = set(expected) | {"per_game_value_weight_mode"}
+    if set(declared) != expected_effective_keys:
+        raise SystemExit(
+            "A1 ablation effective recipe key set differs from bound recipe: "
+            f"missing={sorted(expected_effective_keys - set(declared))} "
+            f"extra={sorted(set(declared) - expected_effective_keys)}"
+        )
+    if declared != effective:
+        raise SystemExit("A1 command does not match its declared effective ablation recipe")
+    if missing or extra:
+        raise SystemExit(
+            f"A1 effective recipe shape drift: missing={sorted(missing)} extra={sorted(extra)}"
+        )
+    if not drift:
+        raise SystemExit("A1 learner ablation must change at least one recipe field")
     if bound.get("learner_training_recipe_sha256") != _canonical_json_sha256(
-        effective
+        expected
     ):
-        raise SystemExit("A1 effective learner training recipe digest drift")
+        raise SystemExit("A1 immutable bound learner recipe digest drift")
+    try:
+        code_binding = json.loads(code_binding_json)
+    except json.JSONDecodeError as error:
+        raise SystemExit(f"invalid A1 ablation code binding JSON: {error}") from error
+    if not isinstance(code_binding, dict) or not _is_sha256(declared_code_sha):
+        raise SystemExit("A1 ablation requires a reviewed code-tree binding/digest")
+    if not _is_sha256(reviewed_lock_sha):
+        raise SystemExit("A1 ablation requires a reviewed raw lock-file digest")
+    unhashed_binding = dict(code_binding)
+    embedded_code_sha = unhashed_binding.pop("code_tree_sha256", None)
+    if (
+        embedded_code_sha != declared_code_sha
+        or _canonical_json_sha256(unhashed_binding) != declared_code_sha
+    ):
+        raise SystemExit("A1 ablation code-tree binding digest drift")
+    records = code_binding.get("records")
+    if not isinstance(records, list) or not records:
+        raise SystemExit("A1 ablation code-tree binding has no records")
+    seen_paths: set[str] = set()
+    for record in records:
+        if not isinstance(record, dict) or set(record) != {
+            "kind",
+            "relative_path",
+            "path",
+            "sha256",
+        }:
+            raise SystemExit("A1 ablation code-tree record is malformed")
+        path = Path(str(record["path"])).expanduser().resolve(strict=True)
+        if str(path) != record["path"] or str(path) in seen_paths:
+            raise SystemExit("A1 ablation code-tree path is noncanonical/duplicate")
+        seen_paths.add(str(path))
+        if _sha256_existing_file(str(path)) != record["sha256"]:
+            raise SystemExit(f"A1 ablation code file drift: {path}")
+    bound["learner_ablation"] = {
+        "schema_version": "a1-learner-ablation-v1",
+        "ablation_id": ablation_id,
+        "diagnostic_only": True,
+        "promotion_eligible": False,
+        "promotion_block_reason": "requires_normal_evidence_packaging_after_ablation",
+        "bound_recipe": dict(expected),
+        "bound_recipe_sha256": _canonical_json_sha256(expected),
+        "effective_recipe": dict(effective),
+        "effective_recipe_sha256": declared_sha,
+        "recipe_drift": drift,
+        "recipe_drift_sha256": _canonical_json_sha256(drift),
+        "code_binding": code_binding,
+        "code_tree_sha256": declared_code_sha,
+        "reviewed_lock_file_sha256": reviewed_lock_sha,
+    }
     return effective
 
 
@@ -2305,7 +2451,6 @@ def main(argv: Sequence[str] | None = None) -> None:
         argv=raw_argv,
         expected_pipeline=TrainConfig.PIPELINE,
     )
-
     a1_preflight_meta: dict[str, object] | None = None
     if args.data_format == "memmap":
         a1_preflight_meta = _preflight_a1_memmap_metadata(
@@ -2534,6 +2679,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         args.a1_runtime_code_tree_sha256 = a1_training_binding[
             "runtime_code_tree_sha256"
         ]
+        args.a1_learner_ablation = a1_training_binding.get("learner_ablation")
     env_config = _env_config_for_teacher_data(args, data, ddp)
     if args.trust_curated_data_quality:
         data_quality = {
@@ -3753,6 +3899,27 @@ def main(argv: Sequence[str] | None = None) -> None:
         "train_diagnostics_every_batches": args.train_diagnostics_every_batches,
         "elapsed_sec": time.perf_counter() - start,
     }
+    learner_ablation = (
+        None
+        if a1_training_binding is None
+        else a1_training_binding.get("learner_ablation")
+    )
+    if learner_ablation is not None:
+        report.update(
+            {
+                "a1_effective_learner_training_recipe": a1_training_binding[
+                    "effective_learner_training_recipe"
+                ],
+                "a1_effective_learner_training_recipe_sha256": (
+                    _canonical_json_sha256(
+                        a1_training_binding["effective_learner_training_recipe"]
+                    )
+                ),
+                "a1_learner_ablation": learner_ablation,
+                "diagnostic_only": True,
+                "promotion_eligible": False,
+            }
+        )
     if ddp["rank"] == 0:
         write_json(args.report, report)
         print(json.dumps(report, indent=2, sort_keys=True))

@@ -129,6 +129,12 @@ GOLDEN_OPTION_STRINGS = {
         ("--workers",),
     },
     "train_bc": {
+        ("--a1-ablation-code-binding-json",),
+        ("--a1-ablation-code-tree-sha256",),
+        ("--a1-effective-learner-recipe-json",),
+        ("--a1-effective-learner-recipe-sha256",),
+        ("--a1-learner-ablation-id",),
+        ("--a1-reviewed-lock-file-sha256",),
         ("--advantage-policy-weighting",),
         ("--advantage-temperature",),
         ("--advantage-weight-cap",),

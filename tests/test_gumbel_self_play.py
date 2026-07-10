@@ -365,6 +365,8 @@ def test_fast_search_rows_have_zero_policy_weight_but_full_value_weight():
         assert decision.row["used_full_search"] is False
         assert float(decision.row["policy_weight_multiplier"]) == pytest.approx(0.0)
         assert float(decision.row["value_weight_multiplier"]) == pytest.approx(1.0)
+        assert not bool(decision.row["root_value_mask"])
+        assert np.isnan(decision.row["root_value"])
 
 
 def test_full_search_rows_have_nonzero_policy_weight():
@@ -386,6 +388,9 @@ def test_full_search_rows_have_nonzero_policy_weight():
     for decision in record.decisions:
         assert decision.row["used_full_search"] is True
         assert float(decision.row["policy_weight_multiplier"]) == pytest.approx(1.0)
+        if not decision.row["is_forced"]:
+            assert bool(decision.row["root_value_mask"])
+            assert np.isfinite(decision.row["root_value"])
 
 
 # ---------------------------------------------------------------------------
@@ -421,6 +426,8 @@ def test_forced_decisions_are_recorded_with_zero_policy_weight_and_real_value_we
     for row in forced_rows:
         assert float(row["policy_weight_multiplier"]) == pytest.approx(0.0)
         assert float(row["value_weight_multiplier"]) == pytest.approx(1.0)
+        assert not bool(row["root_value_mask"])
+        assert np.isnan(row["root_value"])
 
 
 def test_forced_roll_rows_carry_real_afterstate_targets():
@@ -504,6 +511,24 @@ def test_run_worker_games_writes_valid_shards_that_round_trip_through_train_bc(t
         # round trip (they drive train_bc.py's loss weighting).
         assert "policy_weight_multiplier" in normalized
         assert "value_weight_multiplier" in normalized
+        # Future self-play persists the search root value needed by the
+        # already-wired value-target blend.  The column is scalar/optional so
+        # legacy shards without it continue to normalize unchanged.
+        assert "root_value" in raw.files
+        assert "root_value_mask" in raw.files
+        assert normalized["root_value"].dtype == np.float32
+        assert normalized["root_value_mask"].dtype == np.bool_
+        root_mask = normalized["root_value_mask"]
+        expected_root_mask = (
+            ~normalized["is_forced"].astype(np.bool_)
+            & normalized["used_full_search"].astype(np.bool_)
+            & np.isfinite(normalized["root_value"])
+        )
+        assert np.array_equal(root_mask, expected_root_mask)
+        assert np.any(root_mask)
+        assert np.all(np.isfinite(normalized["root_value"][root_mask]))
+        assert np.all(np.isnan(normalized["root_value"][~root_mask]))
+        assert np.all(np.abs(normalized["root_value"][root_mask]) <= 1.0)
         # CAT-100 production wiring: the raw shard AND train_bc's normalized
         # view retain every aux target. Numeric targets use NaN for an
         # unobserved horizon; categorical targets use -1 as ignore_index.

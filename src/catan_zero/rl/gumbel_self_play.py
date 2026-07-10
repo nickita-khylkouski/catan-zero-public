@@ -174,6 +174,13 @@ ENTITY_KEYS = (
 # consumed by train_bc; the remaining analysis/provenance fields stay optional
 # and forward-compatible.
 EXTRA_KEYS = (
+    # Scalar search value at the root, from the acting player's perspective.
+    # This is optional at load time so every historical shard remains valid;
+    # new searched shards persist it alongside explicit finite-value coverage.
+    # `target_information_regime` remains the authority for whether a masked
+    # learner may consume it (authoritative-hidden-state targets fail closed).
+    "root_value",
+    "root_value_mask",
     "afterstate_target",
     "afterstate_target_mask",
     "used_full_search",
@@ -739,6 +746,18 @@ def _build_decision_row(
         "used_full_search": bool(result.used_full_search),
         "is_forced": bool(is_forced),
         "simulations_used": np.int32(result.simulations_used),
+        # Search-root supervision is admitted only for real, non-forced FULL
+        # searches. Fast PCR rows and forced-action fast paths still advance
+        # trajectories/value outcomes, but their shallow/trivial root estimate
+        # is not a teacher target (REANALYZE_VALUE_TARGETS_DESIGN).
+        "root_value": np.float32(
+            result.root_value
+            if (not is_forced and result.used_full_search and np.isfinite(result.root_value))
+            else np.nan
+        ),
+        "root_value_mask": np.bool_(
+            not is_forced and result.used_full_search and np.isfinite(result.root_value)
+        ),
         "afterstate_target": afterstate_target,
         "afterstate_target_mask": afterstate_target_mask,
         "prior_policy": prior_policy,

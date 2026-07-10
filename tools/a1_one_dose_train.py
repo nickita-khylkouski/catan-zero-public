@@ -11,6 +11,9 @@ replays their byte and seed bindings, and then constructs the exact single-B200
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
+import errno
+import fcntl
 import hashlib
 import json
 import math
@@ -18,6 +21,8 @@ import os
 from pathlib import Path
 import pwd
 import resource
+import re
+import stat
 import subprocess
 import sys
 import time
@@ -46,11 +51,26 @@ REPORT_EXECUTION_BINDING_FIELD = "a1_one_dose_execution_binding"
 RETRY_CONTRACT_SCHEMA = "a1-one-dose-learner-retry-contract-v1"
 RETRY_IDENTITY_SCHEMA = "a1-one-dose-learner-retry-identity-v1"
 RETRY_REPAIR_KIND = "entity_graph_graph_layers_default_4_to_checkpoint_6"
+ABLATION_RECEIPT_SCHEMA = "a1-learner-ablation-training-receipt-v1"
+ABLATION_CLAIM_SCHEMA = "a1-learner-ablation-training-claim-v1"
 CLAIM_DIRECTORY = ".a1-one-dose-training-claims"
 MIN_NOFILE = 65_536
 MAX_IDLE_GPU_MEMORY_MIB = 64
 DATA_LOADER_WORKERS = 2
 DATA_LOADER_PREFETCH = 2
+TRUSTED_A1_LOCK_FILE_SHA256 = (
+    "sha256:8301c7547e1745812c69ca04934424755c7116eb5e221688abc58c1bcb7a3122"
+)
+TRUSTED_A1_LOCK_PATH = Path(
+    "/home/ubuntu/catan-zero/runs/rl_program_20260710/"
+    "a1_infoset_n128_v133/contract.lock.json"
+)
+TRUSTED_A1_VERIFIER_PATH = Path(
+    "/home/ubuntu/catan-zero-v1/tools/a1_pre_wave_contract.py"
+)
+TRUSTED_A1_VERIFIER_SHA256 = (
+    "sha256:45594de3835242904a7c3257c5ff644531c4a3c70a447880b20b3b1a23d8c9cc"
+)
 SEALED_A1_MODEL_CLI: dict[str, str] = {
     "--hidden-size": "640",
     "--graph-layers": "6",
@@ -92,6 +112,36 @@ CHILD_ENVIRONMENT_KEYS = frozenset(
     }
 )
 
+# Ablations may change learner optimization/loss semantics only. Corpus,
+# validation, architecture, topology, checkpoint, masking, and audit bindings
+# remain sealed by the original contract and are never accepted as overrides.
+A1_LEARNER_ABLATION_FIELDS = frozenset(
+    {
+        "lr",
+        "lr_warmup_steps",
+        "lr_schedule",
+        "value_lr_mult",
+        "policy_loss_weight",
+        "soft_target_source",
+        "soft_target_weight",
+        "soft_target_temperature",
+        "soft_target_min_legal_coverage",
+        "value_loss_weight",
+        "final_vp_loss_weight",
+        "policy_kl_anchor_weight",
+        "policy_surprise_weight",
+        "advantage_policy_weighting",
+        "per_game_value_weight",
+        "per_game_value_weight_mode",
+        "vp_margin_weight",
+        "truncated_vp_margin_value_weight",
+        "forced_action_weight",
+        "forced_row_value_weight",
+        "winner_sample_weight",
+        "loser_sample_weight",
+    }
+)
+
 
 class ExecutorError(RuntimeError):
     """A fail-closed A1 executor refusal."""
@@ -113,6 +163,71 @@ def _file_sha256(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1 << 20), b""):
             digest.update(chunk)
     return "sha256:" + digest.hexdigest()
+
+
+def _repo_relative_code_path(path: str) -> Path:
+    parts = Path(path).parts
+    for marker in ("configs", "native", "src", "tools", "vendor"):
+        if marker in parts:
+            return Path(*parts[parts.index(marker) :])
+    raise ExecutorError(f"cannot map sealed code path into current repository: {path}")
+
+
+def _current_ablation_code_binding(lock: dict[str, Any]) -> dict[str, Any]:
+    """Rebind the sealed learner/runtime inventory to this reviewed checkout."""
+
+    provenance = lock.get("provenance")
+    if not isinstance(provenance, dict):
+        raise ExecutorError("sealed A1 contract has no code provenance")
+    records_by_relative_path: dict[str, dict[str, str]] = {}
+    for section, kind in (
+        ("learner_code", "learner_code"),
+        ("runtime_code_tree", "runtime_code"),
+    ):
+        source = provenance.get(section)
+        if not isinstance(source, list) or not source:
+            raise ExecutorError(f"sealed A1 contract has no {section} inventory")
+        for old in source:
+            if not isinstance(old, dict) or not isinstance(old.get("path"), str):
+                raise ExecutorError(f"sealed A1 {section} record is malformed")
+            relative = _repo_relative_code_path(old["path"])
+            current = (_REPO_ROOT / relative).resolve(strict=True)
+            relative_key = relative.as_posix()
+            record = {
+                "kind": kind,
+                "relative_path": relative_key,
+                "path": str(current),
+                "sha256": _file_sha256(current),
+            }
+            prior = records_by_relative_path.get(relative_key)
+            # Learner-code semantics dominate when the same file also appears
+            # in the transitive runtime inventory. The bytes/path must agree;
+            # otherwise the sealed inventories are internally contradictory.
+            if prior is not None and (
+                prior["path"] != record["path"]
+                or prior["sha256"] != record["sha256"]
+            ):
+                raise ExecutorError(
+                    f"conflicting A1 code provenance for {relative_key}"
+                )
+            if prior is None or kind == "learner_code":
+                records_by_relative_path[relative_key] = record
+    executor_path = Path(__file__).resolve(strict=True)
+    records_by_relative_path["tools/a1_one_dose_train.py"] = {
+        "kind": "learner_code",
+        "relative_path": "tools/a1_one_dose_train.py",
+        "path": str(executor_path),
+        "sha256": _file_sha256(executor_path),
+    }
+    records = list(records_by_relative_path.values())
+    records.sort(key=lambda row: (row["kind"], row["relative_path"]))
+    binding = {
+        "schema_version": "a1-learner-ablation-code-binding-v1",
+        "repository_root": str(_REPO_ROOT.resolve(strict=True)),
+        "records": records,
+    }
+    binding["code_tree_sha256"] = _value_sha256(binding)
+    return binding
 
 
 def _lexical_python_executable(path: Path) -> Path:
@@ -270,6 +385,120 @@ def _producer(lock: dict[str, Any]) -> dict[str, Any]:
     return matches[0]
 
 
+def _verify_lock_with_sealed_runtime(
+    lock_path: Path, *, reviewed_lock_file_sha256: str | None = None
+) -> dict[str, Any]:
+    """Replay lock reconstruction with the exact repository path it sealed.
+
+    `build_lock` intentionally records absolute code paths, so importing its
+    verifier from a new ablation checkout makes an otherwise-identical lock
+    reconstruct with the new root and fail. Run only this immutable-input
+    verification in the original hash-bound runtime; the derived trainer is
+    separately bound by `_current_ablation_code_binding`.
+    """
+
+    if reviewed_lock_file_sha256 is None:
+        # Historical/default execution remains byte-for-byte on the original
+        # in-process verifier path. Only the explicitly reviewed ablation path
+        # may select the old absolute-root verifier from lock provenance.
+        return a1_contract.verify_lock(lock_path, require_all_job_claims=True)
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", reviewed_lock_file_sha256):
+        raise ExecutorError("reviewed A1 lock file sha256 is malformed")
+    if reviewed_lock_file_sha256 != TRUSTED_A1_LOCK_FILE_SHA256:
+        raise ExecutorError(
+            "reviewed A1 lock digest is not the pinned A1 lineage trust anchor"
+        )
+    if lock_path.resolve(strict=True) != TRUSTED_A1_LOCK_PATH.resolve(strict=True):
+        raise ExecutorError("A1 lock path is not the pinned A1 lineage trust anchor")
+    actual_lock_sha = _file_sha256(lock_path)
+    if actual_lock_sha != reviewed_lock_file_sha256:
+        raise ExecutorError(
+            "A1 lock bytes do not match the explicitly reviewed digest: "
+            f"reviewed={reviewed_lock_file_sha256} actual={actual_lock_sha}"
+        )
+    # Parsing/selecting paths happens only after the raw bytes are authenticated.
+    try:
+        raw = json.loads(lock_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ExecutorError(f"cannot read reviewed A1 lock: {error}") from error
+    provenance = raw.get("provenance")
+    if not isinstance(provenance, dict):
+        raise ExecutorError("reviewed A1 lock has no code provenance")
+    # Authenticate every dependency the sealed verifier may import before
+    # starting its interpreter. The raw lock is already pinned/authenticated,
+    # so these paths/digests are trusted declarations rather than attacker
+    # supplied selectors.
+    for section in ("learner_code", "runtime_code_tree"):
+        records = provenance.get(section)
+        if not isinstance(records, list) or not records:
+            raise ExecutorError(f"reviewed A1 lock has no {section} records")
+        for record in records:
+            if (
+                not isinstance(record, dict)
+                or not isinstance(record.get("path"), str)
+                or not isinstance(record.get("sha256"), str)
+            ):
+                raise ExecutorError(f"reviewed A1 {section} record is malformed")
+            dependency = Path(record["path"]).expanduser().resolve(strict=True)
+            actual_dependency_sha = _file_sha256(dependency)
+            if actual_dependency_sha != record["sha256"]:
+                raise ExecutorError(
+                    "sealed A1 verifier dependency drift before import: "
+                    f"{dependency} expected={record['sha256']} "
+                    f"actual={actual_dependency_sha}"
+                )
+    runtime = (raw.get("provenance") or {}).get("runtime_code_tree")
+    matches = [
+        record
+        for record in runtime or []
+        if isinstance(record, dict)
+        and str(record.get("path", "")) == str(TRUSTED_A1_VERIFIER_PATH)
+    ]
+    if (
+        len(matches) != 1
+        or matches[0].get("sha256") != TRUSTED_A1_VERIFIER_SHA256
+    ):
+        raise ExecutorError("reviewed A1 lock does not bind the pinned sealed verifier")
+    verifier = TRUSTED_A1_VERIFIER_PATH.expanduser().resolve(strict=True)
+    actual_verifier_sha = _file_sha256(verifier)
+    if actual_verifier_sha != TRUSTED_A1_VERIFIER_SHA256:
+        raise ExecutorError(
+            "pinned sealed verifier digest mismatch: "
+            f"expected={TRUSTED_A1_VERIFIER_SHA256} actual={actual_verifier_sha}"
+        )
+    sealed_root = verifier.parents[1]
+    script = (
+        "import json,sys; from pathlib import Path; "
+        "from tools.a1_pre_wave_contract import verify_lock; "
+        "print(json.dumps(verify_lock(Path(sys.argv[1]), require_all_job_claims=True),"
+        "sort_keys=True,separators=(',',':')))"
+    )
+    environment = dict(os.environ)
+    environment["PYTHONPATH"] = f"{sealed_root / 'src'}:{sealed_root}"
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", script, str(lock_path)],
+            cwd=str(sealed_root),
+            env=environment,
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+        verified = json.loads(result.stdout)
+    except (OSError, subprocess.CalledProcessError, json.JSONDecodeError) as error:
+        detail = (
+            error.stderr.strip()
+            if isinstance(error, subprocess.CalledProcessError) and error.stderr
+            else str(error)
+        )
+        raise ExecutorError(f"sealed A1 lock verifier refused: {detail}") from error
+    if not isinstance(verified, dict) or verified.get("contract_sha256") != raw.get(
+        "contract_sha256"
+    ):
+        raise ExecutorError("sealed A1 verifier returned a different lock identity")
+    return verified
+
+
 def _require_a1_science(lock: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
     science = lock.get("science")
     if not isinstance(science, dict):
@@ -308,7 +537,11 @@ def _require_a1_science(lock: dict[str, Any]) -> tuple[dict[str, Any], dict[str,
 
 
 def verify_training_inputs(
-    *, lock_path: Path, data_path: Path, validation_path: Path
+    *,
+    lock_path: Path,
+    data_path: Path,
+    validation_path: Path,
+    reviewed_lock_file_sha256: str | None = None,
 ) -> dict[str, Any]:
     """Replay the sealed lock and complete audit→memmap→holdout chain."""
 
@@ -322,7 +555,9 @@ def verify_training_inputs(
         raise ExecutorError(f"A1 data path is not a directory: {data_path}")
 
     try:
-        lock = a1_contract.verify_lock(lock_path, require_all_job_claims=True)
+        lock = _verify_lock_with_sealed_runtime(
+            lock_path, reviewed_lock_file_sha256=reviewed_lock_file_sha256
+        )
         recipe, objective = _require_a1_science(lock)
         meta = train_bc._preflight_a1_memmap_metadata(  # noqa: SLF001
             data_path, validation_manifest_path=validation_path
@@ -371,6 +606,7 @@ def verify_training_inputs(
         "lock": lock,
         "lock_path": lock_path,
         "lock_file_sha256": _file_sha256(lock_path),
+        "reviewed_lock_file_sha256": reviewed_lock_file_sha256,
         "contract_sha256": contract_sha,
         "recipe": recipe,
         "objective": objective,
@@ -394,6 +630,181 @@ def verify_training_inputs(
     }
 
 
+def bind_learner_ablation(
+    verified: dict[str, Any],
+    *,
+    ablation_id: str,
+    overrides_json: str,
+    reviewed_code_tree_sha256: str,
+) -> dict[str, Any]:
+    """Derive a diagnostic learner recipe without weakening the sealed inputs."""
+
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,79}", ablation_id):
+        raise ExecutorError(
+            "--ablation-id must be a nonempty 1-80 character safe identifier"
+        )
+    def _reject_json_constant(value: str) -> None:
+        raise ValueError(f"non-finite JSON constant {value}")
+
+    try:
+        overrides = json.loads(overrides_json, parse_constant=_reject_json_constant)
+    except (json.JSONDecodeError, ValueError) as error:
+        raise ExecutorError(f"invalid --recipe-overrides-json: {error}") from error
+    if not isinstance(overrides, dict) or not overrides:
+        raise ExecutorError("--recipe-overrides-json must be a nonempty JSON object")
+    forbidden = set(overrides) - A1_LEARNER_ABLATION_FIELDS
+    if forbidden:
+        raise ExecutorError(
+            "A1 learner ablation may not change sealed topology/input fields: "
+            f"{sorted(forbidden)}"
+        )
+    bound = dict(verified["recipe"])
+    effective = dict(bound)
+    # Historical A1 omitted this typed knob because per-game weighting was
+    # locked off. Bind the then-current train_bc default explicitly in every
+    # derived recipe so enabling the existing CAT-60 path can never silently
+    # mean equal when an operator intended sqrt (or vice versa).
+    effective["per_game_value_weight_mode"] = "equal"
+    for key, value in overrides.items():
+        if key == "per_game_value_weight_mode":
+            if value not in {"equal", "sqrt"}:
+                raise ExecutorError(
+                    "per_game_value_weight_mode must be 'equal' or 'sqrt'"
+                )
+            effective[key] = value
+            continue
+        expected_type = type(bound[key])
+        if type(value) is not expected_type:
+            raise ExecutorError(
+                f"A1 learner ablation {key!r} must preserve JSON type "
+                f"{expected_type.__name__}, got {type(value).__name__}"
+            )
+        effective[key] = value
+    numeric_domains: dict[str, tuple[float | None, float | None, bool]] = {
+        "lr": (0.0, None, False),
+        "lr_warmup_steps": (0.0, None, True),
+        "value_lr_mult": (0.0, None, False),
+        "policy_loss_weight": (0.0, None, True),
+        "soft_target_weight": (0.0, 1.0, True),
+        "soft_target_temperature": (0.0, None, False),
+        "soft_target_min_legal_coverage": (0.0, 1.0, True),
+        "value_loss_weight": (0.0, None, True),
+        "final_vp_loss_weight": (0.0, None, True),
+        "policy_kl_anchor_weight": (0.0, None, True),
+        "policy_surprise_weight": (0.0, None, True),
+        "vp_margin_weight": (0.0, None, True),
+        "truncated_vp_margin_value_weight": (0.0, None, True),
+        "forced_action_weight": (0.0, None, True),
+        "forced_row_value_weight": (0.0, None, True),
+        "winner_sample_weight": (0.0, None, True),
+        "loser_sample_weight": (0.0, None, True),
+    }
+    enum_domains = {
+        "lr_schedule": {"flat", "cosine", "linear"},
+        "soft_target_source": {"prefer_policy", "prefer_scores", "policy", "scores"},
+        "advantage_policy_weighting": {"none", "outcome_value"},
+        "per_game_value_weight_mode": {"equal", "sqrt"},
+    }
+    for key, value in overrides.items():
+        if key in numeric_domains:
+            numeric = float(value)
+            if not math.isfinite(numeric):
+                raise ExecutorError(f"A1 learner ablation {key} must be finite")
+            minimum, maximum, minimum_inclusive = numeric_domains[key]
+            if minimum is not None and (
+                numeric < minimum
+                if minimum_inclusive
+                else numeric <= minimum
+            ):
+                relation = ">=" if minimum_inclusive else ">"
+                raise ExecutorError(
+                    f"A1 learner ablation {key} must be {relation} {minimum}"
+                )
+            if maximum is not None and numeric > maximum:
+                raise ExecutorError(
+                    f"A1 learner ablation {key} must be <= {maximum}"
+                )
+        if key in enum_domains and value not in enum_domains[key]:
+            raise ExecutorError(
+                f"A1 learner ablation {key} must be one of {sorted(enum_domains[key])}"
+            )
+    if (
+        effective["per_game_value_weight_mode"] == "sqrt"
+        and not effective["per_game_value_weight"]
+    ):
+        raise ExecutorError(
+            "per_game_value_weight_mode=sqrt requires per_game_value_weight=true"
+        )
+    if (
+        "soft_target_temperature" in overrides
+        and effective["soft_target_source"] == "policy"
+    ):
+        raise ExecutorError(
+            "soft_target_temperature is inert for soft_target_source=policy; "
+            "do not encode a fake ablation drift"
+        )
+    active_objective_mass = sum(
+        float(effective[key])
+        for key in (
+            "policy_loss_weight",
+            "value_loss_weight",
+            "final_vp_loss_weight",
+            "policy_kl_anchor_weight",
+        )
+    )
+    if active_objective_mass <= 0.0:
+        raise ExecutorError("A1 learner ablation disables every active training objective")
+    drift = {
+        key: {"contract": bound[key], "effective": effective[key]}
+        for key in sorted(set(overrides) & set(bound))
+        if bound[key] != effective[key]
+    }
+    if effective["per_game_value_weight_mode"] != "equal":
+        drift["per_game_value_weight_mode"] = {
+            "contract": "equal (implicit train_bc default; weighting locked off)",
+            "effective": effective["per_game_value_weight_mode"],
+        }
+    if not drift:
+        raise ExecutorError("A1 learner ablation is a no-op")
+    code_binding = _current_ablation_code_binding(verified["lock"])
+    reviewed_lock_sha = verified.get("reviewed_lock_file_sha256")
+    if reviewed_lock_sha != verified.get("lock_file_sha256"):
+        raise ExecutorError("A1 ablation does not bind the reviewed raw lock bytes")
+    if reviewed_code_tree_sha256 != code_binding["code_tree_sha256"]:
+        raise ExecutorError(
+            "current ablation code tree does not match the explicitly reviewed digest: "
+            f"reviewed={reviewed_code_tree_sha256!r} "
+            f"current={code_binding['code_tree_sha256']!r}"
+        )
+    result = dict(verified)
+    result["bound_recipe"] = bound
+    result["recipe"] = effective
+    result["learner_ablation"] = {
+        "schema_version": "a1-learner-ablation-v1",
+        "ablation_id": ablation_id,
+        "diagnostic_only": True,
+        "promotion_eligible": False,
+        "promotion_block_reason": "requires_normal_evidence_packaging_after_ablation",
+        "bound_recipe": bound,
+        "bound_recipe_sha256": _value_sha256(bound),
+        "effective_recipe": effective,
+        "effective_recipe_sha256": _value_sha256(effective),
+        "recipe_drift": drift,
+        "recipe_drift_sha256": _value_sha256(drift),
+        "code_binding": code_binding,
+        "code_tree_sha256": code_binding["code_tree_sha256"],
+        "reviewed_lock_file_sha256": reviewed_lock_sha,
+    }
+    result["claim_identity_sha256"] = _value_sha256(
+        {
+            "schema_version": "a1-learner-ablation-claim-identity-v1",
+            "contract_sha256": verified["contract_sha256"],
+            "ablation": result["learner_ablation"],
+        }
+    )
+    return result
+
+
 def build_train_command(
     verified: dict[str, Any],
     *,
@@ -405,9 +816,21 @@ def build_train_command(
 
     recipe = verified["recipe"]
     producer = verified["producer"]
+    trainer_path = _REPO_ROOT / "tools" / "train_bc.py"
+    if verified.get("learner_ablation") is None:
+        candidates = [
+            Path(str(record.get("path")))
+            for record in (verified.get("lock", {}).get("provenance", {}).get("learner_code", []))
+            if isinstance(record, dict)
+            and str(record.get("path", "")).endswith("/tools/train_bc.py")
+        ]
+        if candidates:
+            if len(candidates) != 1:
+                raise ExecutorError("sealed A1 contract binds multiple train_bc entrypoints")
+            trainer_path = candidates[0].expanduser().resolve(strict=True)
     command = [
         str(python),
-        str(_REPO_ROOT / "tools" / "train_bc.py"),
+        str(trainer_path),
         "--arch",
         "entity_graph",
     ]
@@ -535,6 +958,34 @@ def build_train_command(
             "--trust-curated-data-quality",
         ]
     )
+    if bool(recipe["per_game_value_weight"]):
+        command.append("--per-game-value-weight")
+    learner_ablation = verified.get("learner_ablation")
+    if learner_ablation is not None:
+        command.extend(
+            [
+                # Each executor child sees exactly one physical GPU through
+                # CUDA_VISIBLE_DEVICES and owns a distinct durable ablation
+                # claim/output set.  The generic host-wide BC lock would
+                # otherwise serialize or reject independent diagnostic arms.
+                # Never add this to the historical/default one-dose command.
+                "--allow-concurrent-bc",
+                "--per-game-value-weight-mode",
+                str(recipe["per_game_value_weight_mode"]),
+                "--a1-learner-ablation-id",
+                str(learner_ablation["ablation_id"]),
+                "--a1-effective-learner-recipe-json",
+                _canonical_bytes(recipe).decode("ascii"),
+                "--a1-effective-learner-recipe-sha256",
+                _value_sha256(recipe),
+                "--a1-ablation-code-binding-json",
+                _canonical_bytes(learner_ablation["code_binding"]).decode("ascii"),
+                "--a1-ablation-code-tree-sha256",
+                str(learner_ablation["code_tree_sha256"]),
+                "--a1-reviewed-lock-file-sha256",
+                str(learner_ablation["reviewed_lock_file_sha256"]),
+            ]
+        )
     return command
 
 
@@ -671,6 +1122,59 @@ def _raise_nofile_limit() -> None:
     resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
 
 
+def _gpu_lock_path(gpu: int, *, lock_root: Path = Path("/tmp")) -> Path:
+    if int(gpu) < 0:
+        raise ExecutorError("physical GPU lock index must be non-negative")
+    return lock_root / f"catan_zero_a1_b200_gpu{int(gpu)}.lock"
+
+
+@contextmanager
+def _physical_gpu_lock(gpu: int, *, lock_root: Path = Path("/tmp")):
+    """Own one physical B200 across probe, claim, child, and receipt.
+
+    The lock is advisory but fail-closed: nonblocking `flock`, no symlinks,
+    regular file owned by the executor uid, private mode only. Different GPU
+    indices intentionally map to independent files so diagnostic arms can run
+    concurrently without weakening same-device exclusion.
+    """
+
+    path = _gpu_lock_path(gpu, lock_root=lock_root)
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags, 0o600)
+    except OSError as error:
+        raise ExecutorError(f"cannot open physical GPU lock {path}: {error}") from error
+    handle = os.fdopen(fd, "r+b", buffering=0)
+    try:
+        info = os.fstat(handle.fileno())
+        if not stat.S_ISREG(info.st_mode):
+            raise ExecutorError(f"physical GPU lock is not a regular file: {path}")
+        if info.st_uid != os.geteuid():
+            raise ExecutorError(
+                f"physical GPU lock is not owned by uid {os.geteuid()}: {path}"
+            )
+        if stat.S_IMODE(info.st_mode) & 0o077:
+            raise ExecutorError(
+                f"physical GPU lock has unsafe mode {oct(stat.S_IMODE(info.st_mode))}: {path}"
+            )
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as error:
+            if error.errno in {errno.EACCES, errno.EAGAIN}:
+                raise ExecutorError(
+                    f"physical B200 GPU {gpu} is already reserved by another A1 executor"
+                ) from error
+            raise ExecutorError(f"cannot lock physical B200 GPU {gpu}: {error}") from error
+        yield path
+    finally:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        handle.close()
+
+
 def _claim_path(verified: dict[str, Any]) -> Path:
     """Return the one stable claim path for the sealed contract identity.
 
@@ -720,13 +1224,13 @@ def _load_claim_state(
     unhashed.pop("state_sha256", None)
     if stated_digest != _value_sha256(unhashed):
         raise ExecutorError(f"A1 contract claim digest is invalid: {claim}")
-    expected_schema = (
-        RETRY_CLAIM_SCHEMA
+    expected_schemas = (
+        {RETRY_CLAIM_SCHEMA, ABLATION_CLAIM_SCHEMA}
         if claim_identity_sha256 is not None
         and claim_identity_sha256 != contract_sha256
-        else CLAIM_SCHEMA
+        else {CLAIM_SCHEMA}
     )
-    if payload.get("schema_version") != expected_schema:
+    if payload.get("schema_version") not in expected_schemas:
         raise ExecutorError(f"A1 contract claim schema is invalid: {claim}")
     if payload.get("contract_sha256") != contract_sha256:
         raise ExecutorError(f"A1 contract claim identity mismatch: {claim}")
@@ -1262,6 +1766,8 @@ def _verify_training_outputs(
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
         raise ExecutorError(f"cannot parse A1 training report: {error}") from error
     recipe = verified["recipe"]
+    bound_recipe = verified.get("bound_recipe", recipe)
+    learner_ablation = verified.get("learner_ablation")
     expected_steps = int(
         math.ceil(
             int(verified["training_row_count"])
@@ -1308,7 +1814,7 @@ def _verify_training_outputs(
         "a1_selected_game_seed_set_sha256": verified["selected_game_seed_set_sha256"],
         "a1_training_game_seed_set_sha256": verified["training_game_seed_set_sha256"],
         "a1_memmap_payload_inventory_sha256": verified["payload_inventory_sha256"],
-        "a1_learner_training_recipe_sha256": _value_sha256(recipe),
+        "a1_learner_training_recipe_sha256": _value_sha256(bound_recipe),
         "require_35m_model": True,
         "steps_completed": expected_steps,
         "total_training_steps": expected_steps,
@@ -1320,7 +1826,7 @@ def _verify_training_outputs(
     }
     if drift:
         raise ExecutorError(f"A1 training report invariant drift: {drift}")
-    if report_payload.get("a1_bound_learner_training_recipe") != verified["recipe"]:
+    if report_payload.get("a1_bound_learner_training_recipe") != bound_recipe:
         raise ExecutorError("A1 training report does not echo the exact sealed recipe")
     if report_payload.get("a1_bound_learner_value_objective") != verified["objective"]:
         raise ExecutorError(
@@ -1376,7 +1882,7 @@ def _verify_training_outputs(
         "a1_contract_sha256": verified["contract_sha256"],
         "a1_selected_game_seed_set_sha256": verified["selected_game_seed_set_sha256"],
         "a1_training_game_seed_set_sha256": verified["training_game_seed_set_sha256"],
-        "a1_learner_training_recipe_sha256": _value_sha256(recipe),
+        "a1_learner_training_recipe_sha256": _value_sha256(bound_recipe),
         "a1_memmap_payload_inventory_sha256": verified["payload_inventory_sha256"],
     }
     if not isinstance(value_training, dict) or any(
@@ -1384,6 +1890,17 @@ def _verify_training_outputs(
         for key, value in expected_value_training.items()
     ):
         raise ExecutorError("A1 training report value-training provenance drift")
+    if learner_ablation is not None:
+        if (
+            report_payload.get("a1_effective_learner_training_recipe") != recipe
+            or report_payload.get("a1_effective_learner_training_recipe_sha256")
+            != _value_sha256(recipe)
+            or report_payload.get("a1_learner_ablation") != learner_ablation
+            or report_payload.get("diagnostic_only") is not True
+            or report_payload.get("promotion_eligible") is not False
+            or value_training.get("learner_ablation") != learner_ablation
+        ):
+            raise ExecutorError("A1 learner ablation provenance/diagnostic marker drift")
     if "scalar" not in value_training.get("trained_value_readouts", []):
         raise ExecutorError(
             "A1 candidate does not attest a trained scalar value readout"
@@ -1429,7 +1946,7 @@ def _require_fresh_outputs(
             raise ExecutorError(f"refusing non-fresh A1 output path: {path}")
 
 
-def execute(
+def _execute_locked(
     *,
     verified: dict[str, Any],
     command: list[str],
@@ -1456,6 +1973,7 @@ def execute(
         verified.get("claim_identity_sha256", verified["contract_sha256"])
     )
     is_retry = "retry_contract" in verified
+    is_ablation = verified.get("learner_ablation") is not None
     retry_reference = (
         {
             "path": str(verified["retry_contract_path"]),
@@ -1468,13 +1986,21 @@ def execute(
         else None
     )
     claim_payload = {
-        "schema_version": RETRY_CLAIM_SCHEMA if is_retry else CLAIM_SCHEMA,
+        "schema_version": (
+            RETRY_CLAIM_SCHEMA
+            if is_retry
+            else ABLATION_CLAIM_SCHEMA
+            if is_ablation
+            else CLAIM_SCHEMA
+        ),
         "status": "claimed",
         "contract_sha256": verified["contract_sha256"],
         "command_sha256": _value_sha256(command),
         "execution_binding": execution_binding,
         "started_unix_ns": started_ns,
     }
+    if is_retry or is_ablation:
+        claim_payload["claim_identity_sha256"] = claim_identity
     if is_retry:
         claim_payload.update(
             {
@@ -1513,7 +2039,13 @@ def execute(
         failure = f"{type(error).__name__}: {error}"
     finished_ns = time.time_ns()
     evidence_payload = {
-        "schema_version": RETRY_RECEIPT_SCHEMA if is_retry else RECEIPT_SCHEMA,
+        "schema_version": (
+            RETRY_RECEIPT_SCHEMA
+            if is_retry
+            else ABLATION_RECEIPT_SCHEMA
+            if is_ablation
+            else RECEIPT_SCHEMA
+        ),
         "status": status,
         "contract_sha256": verified["contract_sha256"],
         "lock": str(verified["lock_path"]),
@@ -1524,7 +2056,9 @@ def execute(
         "validation_manifest": str(verified["validation_path"]),
         "validation_manifest_file_sha256": verified["validation_file_sha256"],
         "producer_checkpoint_sha256": verified["producer"]["sha256"],
-        "learner_training_recipe_sha256": _value_sha256(verified["recipe"]),
+        "learner_training_recipe_sha256": _value_sha256(
+            verified.get("bound_recipe", verified["recipe"])
+        ),
         "command": command,
         "command_sha256": _value_sha256(command),
         "execution_binding": execution_binding,
@@ -1544,9 +2078,25 @@ def execute(
                 "retry_contract": retry_reference,
             }
         )
+    if is_ablation:
+        evidence_payload.update(
+            {
+                "claim_identity_sha256": claim_identity,
+                "learner_ablation": verified["learner_ablation"],
+                "effective_learner_training_recipe_sha256": _value_sha256(
+                    verified["recipe"]
+                ),
+                "diagnostic_only": True,
+                "promotion_eligible": False,
+            }
+        )
     terminal_claim_payload = dict(evidence_payload)
     terminal_claim_payload["schema_version"] = (
-        RETRY_CLAIM_SCHEMA if is_retry else CLAIM_SCHEMA
+        RETRY_CLAIM_SCHEMA
+        if is_retry
+        else ABLATION_CLAIM_SCHEMA
+        if is_ablation
+        else CLAIM_SCHEMA
     )
     terminal_claim_payload["receipt_target"] = str(receipt)
     terminal_claim = _write_terminal_claim(
@@ -1563,6 +2113,35 @@ def execute(
     return receipt_payload
 
 
+def execute(
+    *,
+    verified: dict[str, Any],
+    command: list[str],
+    checkpoint: Path,
+    report: Path,
+    receipt: Path,
+    gpu: int,
+    runner: Callable[..., subprocess.CompletedProcess[Any]] = subprocess.run,
+    probe: Callable[[int], str] = _probe_b200,
+) -> dict[str, Any]:
+    """Execute one dose; ablations additionally own a physical-GPU flock."""
+
+    kwargs = {
+        "verified": verified,
+        "command": command,
+        "checkpoint": checkpoint,
+        "report": report,
+        "receipt": receipt,
+        "gpu": gpu,
+        "runner": runner,
+        "probe": probe,
+    }
+    if verified.get("learner_ablation") is None:
+        return _execute_locked(**kwargs)
+    with _physical_gpu_lock(gpu):
+        return _execute_locked(**kwargs)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--lock", required=True, type=Path)
@@ -1573,6 +2152,26 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--receipt", required=True, type=Path)
     parser.add_argument("--python", type=Path, default=Path(sys.executable))
     parser.add_argument("--gpu", type=int, default=0, help="one physical B200 index")
+    parser.add_argument(
+        "--ablation-id",
+        default="",
+        help="nonempty diagnostic learner-ablation identity (requires both ablation flags)",
+    )
+    parser.add_argument(
+        "--recipe-overrides-json",
+        default="",
+        help="nonempty JSON object overriding only allowlisted learner recipe fields",
+    )
+    parser.add_argument(
+        "--ablation-code-tree-sha256",
+        default="",
+        help="explicitly reviewed digest printed by a prior refused/dry-run inspection",
+    )
+    parser.add_argument(
+        "--reviewed-lock-file-sha256",
+        default="",
+        help="explicitly reviewed sha256 of the raw immutable lock bytes",
+    )
     parser.add_argument(
         "--retry-parent-claim",
         type=Path,
@@ -1598,11 +2197,33 @@ def main(argv: Sequence[str] | None = None) -> int:
         python = _lexical_python_executable(args.python)
         if args.gpu < 0:
             raise ExecutorError("--gpu must be non-negative")
+        ablation_values = (
+            args.ablation_id,
+            args.recipe_overrides_json,
+            args.ablation_code_tree_sha256,
+            args.reviewed_lock_file_sha256,
+        )
+        if any(ablation_values) and not all(ablation_values):
+            raise ExecutorError(
+                "--ablation-id, --recipe-overrides-json, "
+                "--ablation-code-tree-sha256, and --reviewed-lock-file-sha256 "
+                "must be supplied together"
+            )
         verified = verify_training_inputs(
             lock_path=args.lock,
             data_path=args.data,
             validation_path=args.validation_manifest,
+            reviewed_lock_file_sha256=(
+                args.reviewed_lock_file_sha256 if all(ablation_values) else None
+            ),
         )
+        if all(ablation_values):
+            verified = bind_learner_ablation(
+                verified,
+                ablation_id=args.ablation_id,
+                overrides_json=args.recipe_overrides_json,
+                reviewed_code_tree_sha256=args.ablation_code_tree_sha256,
+            )
         checkpoint = args.checkpoint.expanduser().resolve(strict=False)
         report = args.report.expanduser().resolve(strict=False)
         receipt = args.receipt.expanduser().resolve(strict=False)
@@ -1616,6 +2237,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise ExecutorError(
                 "--retry-parent-claim and --retry-contract must be supplied together"
             )
+        if verified.get("learner_ablation") is not None and args.retry_parent_claim is not None:
+            raise ExecutorError("learner ablations cannot use the historical retry path")
         if args.retry_parent_claim is not None:
             verified = authorize_failed_before_optimizer_retry(
                 verified=verified,
@@ -1654,6 +2277,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             "report": str(report),
             "receipt": str(receipt),
         }
+        if verified.get("learner_ablation") is not None:
+            plan.update(
+                {
+                    "learner_ablation": verified["learner_ablation"],
+                    "diagnostic_only": True,
+                    "promotion_eligible": False,
+                }
+            )
         print(json.dumps(plan, indent=2, sort_keys=True))
         if not args.go:
             return 0
