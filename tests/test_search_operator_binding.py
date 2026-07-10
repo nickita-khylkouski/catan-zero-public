@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import stat
 from pathlib import Path
 
@@ -164,6 +165,38 @@ def test_binding_replays_with_the_historically_bound_adjudicator(
         s1_path, s2_output_path=tmp_path / "s2.json"
     )
     assert s2["selected_fields"] == binding.S2_SELECTED
+
+
+def test_binding_replay_uses_payload_bound_emitter_path_even_when_bytes_match(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    s1_path, _decision = _s1_fixture(tmp_path, monkeypatch)
+    historical_emitter = tmp_path / "frozen/tools/search_operator_binding.py"
+    historical_emitter.parent.mkdir(parents=True)
+    shutil.copy2(Path(binding.__file__), historical_emitter)
+    assert _sha(historical_emitter) == _sha(Path(binding.__file__))
+
+    bound, _ = binding.build_bindings(
+        s1_path,
+        s2_output_path=tmp_path / "s2.json",
+        binding_time_utc="2026-07-10T04:10:00Z",
+        emitter_path=historical_emitter,
+    )
+    replayed, _ = binding.build_bindings(
+        s1_path,
+        s2_output_path=tmp_path / "s2.json",
+        binding_time_utc="2026-07-10T04:10:00Z",
+        emitter_path=Path(bound["emitter"]["path"]),
+    )
+    current_path, _ = binding.build_bindings(
+        s1_path,
+        s2_output_path=tmp_path / "s2.json",
+        binding_time_utc="2026-07-10T04:10:00Z",
+    )
+
+    assert replayed == bound
+    assert current_path != bound
+    assert current_path["emitter"]["sha256"] == bound["emitter"]["sha256"]
 
 
 @pytest.mark.parametrize(

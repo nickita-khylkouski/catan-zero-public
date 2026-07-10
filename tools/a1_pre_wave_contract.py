@@ -1814,6 +1814,7 @@ def _validate_operator_binding_evidence(
                 s1_path,
                 s2_output_path=path,
                 binding_time_utc=timestamp,
+                emitter_path=emitter_path,
             )
         except operator_binding.BindingError as error:
             raise ContractError(f"S2 operator-binding replay failed: {error}") from error
@@ -1856,6 +1857,7 @@ def _validate_operator_binding_evidence(
                 s1_path,
                 s2_output_path=s2_path,
                 binding_time_utc=timestamp,
+                emitter_path=emitter_path,
             )
         except operator_binding.BindingError as error:
             raise ContractError(f"S3 operator-binding replay failed: {error}") from error

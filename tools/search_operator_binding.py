@@ -223,12 +223,13 @@ def build_bindings(
     *,
     s2_output_path: Path,
     binding_time_utc: str | None = None,
+    emitter_path: Path | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Build both self-digested payloads without writing either output."""
+    """Build both payloads, optionally replaying a hash-validated emitter path."""
 
     s1_payload = _replay_s1(s1_decision_path)
     s1_ref = _reference(s1_decision_path)
-    emitter_ref = _reference(Path(__file__))
+    emitter_ref = _reference(Path(__file__) if emitter_path is None else emitter_path)
     timestamp = _parse_utc(binding_time_utc)
     common = {
         "schema_version": SCHEMA,

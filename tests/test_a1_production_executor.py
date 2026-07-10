@@ -197,7 +197,9 @@ def test_dry_plan_is_exact_40_lane_120_job_n128_mps_contract(
 ) -> None:
     lock_path, render_path, lock, rendered = _fixture(tmp_path)
     hosts = _hosts(tmp_path, rendered)
-    monkeypatch.setattr(executor, "_repo_artifacts", lambda _rendered: [])
+    monkeypatch.setattr(
+        executor, "_repo_artifacts", lambda _rendered, **_kwargs: []
+    )
     plan = executor.build_plan(
         lock_path=lock_path,
         render_path=render_path,

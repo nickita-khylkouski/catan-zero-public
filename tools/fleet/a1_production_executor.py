@@ -28,6 +28,7 @@ from tools import a1_pre_wave_contract as contract  # noqa: E402
 
 HOST_SCHEMA = "a1-production-hosts-v1"
 RECEIPT_SCHEMA = "a1-production-executor-receipt-v1"
+BRIDGE_SCHEMA = "a1-frozen-plan-hardened-executor-bridge-v1"
 LANE_SCHEMA = "a1-production-lane-v1"
 SAFE_ALIAS = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 CATEGORY_ORDER = ("current_producer", "recent_history", "hard_negative")
@@ -221,7 +222,10 @@ def verify_render(
     return lock, rendered, by_lane
 
 
-def _repo_artifacts(rendered: dict[str, Any]) -> list[dict[str, Any]]:
+def _repo_artifacts(
+    rendered: dict[str, Any], *, repo_root: Path = _REPO_ROOT
+) -> list[dict[str, Any]]:
+    root = repo_root.resolve(strict=True)
     required = rendered["required_artifacts"]
     records = [
         required["guard_config"],
@@ -234,14 +238,14 @@ def _repo_artifacts(rendered: dict[str, Any]) -> list[dict[str, Any]]:
         if _sha256(path) != record["sha256"]:
             raise ExecutorError(f"required repo artifact drift: {path}")
         try:
-            relative = path.relative_to(_REPO_ROOT)
+            relative = path.relative_to(root)
         except ValueError as error:
             raise ExecutorError(f"runtime artifact is outside canonical repo: {path}") from error
         files[str(relative)] = path
-    supervisor = (_REPO_ROOT / "tools/fleet/a1_lane_supervisor.py").resolve()
-    files[str(supervisor.relative_to(_REPO_ROOT))] = supervisor
-    stop_helper = (_REPO_ROOT / "tools/fleet/a1_stop_helper.py").resolve()
-    files[str(stop_helper.relative_to(_REPO_ROOT))] = stop_helper
+    supervisor = (root / "tools/fleet/a1_lane_supervisor.py").resolve()
+    files[str(supervisor.relative_to(root))] = supervisor
+    stop_helper = (root / "tools/fleet/a1_stop_helper.py").resolve()
+    files[str(stop_helper.relative_to(root))] = stop_helper
     return [
         {
             "path": key,
@@ -252,8 +256,68 @@ def _repo_artifacts(rendered: dict[str, Any]) -> list[dict[str, Any]]:
     ]
 
 
-def _repo_files(artifacts: Sequence[Mapping[str, Any]]) -> list[Path]:
-    return [(_REPO_ROOT / str(record["path"])).resolve() for record in artifacts]
+def _repo_files(
+    artifacts: Sequence[Mapping[str, Any]], *, repo_root: Path = _REPO_ROOT
+) -> list[Path]:
+    root = repo_root.resolve(strict=True)
+    files: list[Path] = []
+    for record in artifacts:
+        relative = PurePosixPath(str(record["path"]))
+        if relative.is_absolute() or ".." in relative.parts:
+            raise ExecutorError(f"unsafe repo artifact path: {relative}")
+        source = (root / Path(*relative.parts)).resolve(strict=True)
+        try:
+            source.relative_to(root)
+        except ValueError as error:
+            raise ExecutorError(f"repo artifact escapes source root: {relative}") from error
+        if not source.is_file() or _sha256(source) != record["sha256"]:
+            raise ExecutorError(f"repo artifact source drift: {source}")
+        files.append(source)
+    return files
+
+
+def _execution_repo_root(plan: Mapping[str, Any]) -> Path:
+    """Validate an optional frozen-plan/hardened-executor bridge."""
+    private = plan["_private"]
+    bridge = private.get("executor_bridge")
+    if bridge is None:
+        return _REPO_ROOT
+    expected_keys = {
+        "schema_version",
+        "frozen_repo_root",
+        "frozen_executor",
+        "hardened_executor",
+        "plan_sha256",
+        "repo_artifacts_sha256",
+        "bridge_sha256",
+    }
+    if not isinstance(bridge, dict) or set(bridge) != expected_keys:
+        raise ExecutorError("invalid frozen-plan executor bridge schema")
+    unhashed = dict(bridge)
+    declared = unhashed.pop("bridge_sha256")
+    if bridge["schema_version"] != BRIDGE_SCHEMA or declared != _digest(unhashed):
+        raise ExecutorError("frozen-plan executor bridge digest mismatch")
+    if (
+        bridge["plan_sha256"] != plan.get("plan_sha256")
+        or bridge["repo_artifacts_sha256"] != plan.get("repo_artifacts_sha256")
+    ):
+        raise ExecutorError("frozen-plan executor bridge plan binding drift")
+    root = Path(str(bridge["frozen_repo_root"])).resolve(strict=True)
+    frozen_path = (root / "tools/fleet/a1_production_executor.py").resolve(strict=True)
+    hardened_path = Path(__file__).resolve(strict=True)
+    expected_references = (
+        (bridge["frozen_executor"], frozen_path, "frozen"),
+        (bridge["hardened_executor"], hardened_path, "hardened"),
+    )
+    for reference, path, label in expected_references:
+        if (
+            not isinstance(reference, dict)
+            or set(reference) != {"path", "sha256"}
+            or Path(str(reference["path"])).resolve(strict=True) != path
+            or reference["sha256"] != _sha256(path)
+        ):
+            raise ExecutorError(f"{label} executor bridge code binding drift")
+    return root
 
 
 def _build_repo_tar(files: Sequence[Path], destination: Path) -> str:
@@ -278,11 +342,12 @@ def build_plan(
     hosts_path: Path,
     receipt_path: Path,
     verify_lock_fn: Callable[..., dict[str, Any]] = contract.verify_lock,
+    repo_root: Path = _REPO_ROOT,
 ) -> dict[str, Any]:
     lock, rendered, lanes = verify_render(
         lock_path, render_path, verify_lock_fn=verify_lock_fn
     )
-    repo_artifacts = _repo_artifacts(rendered)
+    repo_artifacts = _repo_artifacts(rendered, repo_root=repo_root)
     live_ledger_path = Path(rendered["required_artifacts"]["seed_ledger"]["path"])
     live_seed_ledger_sha256 = _sha256(live_ledger_path)
     aliases = {lane[0]["host_alias"] for lane in lanes.values()}
@@ -330,6 +395,13 @@ def build_plan(
 
 def _public(plan: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in plan.items() if key != "_private"}
+
+
+def _verify_plan_digest(plan: Mapping[str, Any]) -> None:
+    public = {key: value for key, value in plan.items() if key != "_private"}
+    declared = public.pop("plan_sha256", None)
+    if not isinstance(declared, str) or declared != _digest(public):
+        raise ExecutorError("execution plan semantic digest mismatch")
 
 
 def _ssh(hosts: dict[str, Any], alias: str, remote_command: str) -> subprocess.CompletedProcess[str]:
@@ -753,6 +825,8 @@ def _resume_receipt(
 
 
 def execute(plan: dict[str, Any], *, receipt_path: Path, resume: bool) -> dict[str, Any]:
+    _verify_plan_digest(plan)
+    repo_source_root = _execution_repo_root(plan)
     private = plan["_private"]
     hosts = private["hosts"]
     lanes = private["lanes"]
@@ -777,6 +851,12 @@ def execute(plan: dict[str, Any], *, receipt_path: Path, resume: bool) -> dict[s
             }
         )
         _create_json(receipt_path, receipt)
+    bridge = private.get("executor_bridge")
+    if bridge is not None:
+        existing_bridge = receipt.get("executor_bridge")
+        if existing_bridge is not None and existing_bridge != bridge:
+            raise ExecutorError("executor receipt bridge binding drift")
+        receipt["executor_bridge"] = bridge
     receipt["host_preflight"] = preflight
     _atomic_json(receipt_path, receipt)
 
@@ -786,7 +866,9 @@ def execute(plan: dict[str, Any], *, receipt_path: Path, resume: bool) -> dict[s
         artifacts = private["repo_artifacts"]
         if _digest(artifacts) != public["repo_artifacts_sha256"]:
             raise ExecutorError("repo artifact plan drift")
-        repo_sha = _build_repo_tar(_repo_files(artifacts), repo_tar)
+        repo_sha = _build_repo_tar(
+            _repo_files(artifacts, repo_root=repo_source_root), repo_tar
+        )
         repo_token = public["repo_artifacts_sha256"].removeprefix("sha256:")
         repo_dir = f"{hosts['remote_root']}/repo-{repo_token}"
         aliases = sorted({lane[0]["host_alias"] for lane in lanes.values()})
