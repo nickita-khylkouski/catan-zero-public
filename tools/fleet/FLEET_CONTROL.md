@@ -79,15 +79,26 @@ gen set after any conversion (`fleet_status.sh <box>` + `fleet_stop.sh <box>` dr
 
 `gpu_fleet.py` is the daemonless scheduler for the canonical six 4×H100 plus
 two 8×H100 fleet. The committed `configs/gpu_fleet_40.json` is deliberately
-exact: extra hosts or topology drift fail closed. It allocates physical GPU IDs
-deterministically in manifest order, filters by the declared deployed Git
-commit, and refuses a selected GPU with an existing non-MPS CUDA client.
+exact: every alias is bound to its literal IP, GPU count, and
+`NVIDIA H100 80GB HBM3` name; duplicate, extra, replacement, or explicitly
+excluded hosts fail closed. It allocates physical GPU IDs deterministically in
+manifest order, filters by the declared deployed Git commit, and refuses a
+selected GPU with an existing non-MPS CUDA client.
 
 Jobs are argv arrays, not shell fragments. Plans and per-host receipts are
 hash-bound, launches use the canonical detached heartbeat helper, repeat
 submission is idempotent, and mutation requires `--go`. SSH ControlMaster
 multiplexing amortizes connection setup without requiring Slurm/Ray ports or
 east-west credentials.
+
+Each launch is serialized by a per-host allocation lock. Before publishing an
+exclusive read-only receipt, it acquires each selected GPU's nonblocking
+`flock` lease, checks the GPU while that lease is held, and transfers the open
+lease descriptors into the detached process and heartbeat. The lease lives for
+the complete job, closing the zero-memory CUDA warmup race between two plans.
+Status trusts neither marker files nor `kill -0`: it replays the exact
+receipt and validates PID=SID=PGID, non-zombie state, `/proc/PID/cmdline` hash,
+and the PID-bound fresh heartbeat.
 
 ```bash
 python tools/fleet/gpu_fleet.py --manifest configs/gpu_fleet_40.json inventory

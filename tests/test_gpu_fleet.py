@@ -1,6 +1,9 @@
 import json
+import os
 from pathlib import Path
+import shutil
 import subprocess
+import sys
 
 import pytest
 
@@ -10,13 +13,13 @@ from tools.fleet import gpu_fleet as fleet
 def _manifest(tmp_path: Path, commits: dict[str, str] | None = None):
     commits = commits or {}
     hosts = []
-    for alias, count in fleet.EXPECTED_SHAPES.items():
+    for alias, (address, count) in fleet.EXPECTED_HOSTS.items():
         hosts.append(
             {
                 "alias": alias,
-                "address": f"{alias}.example",
+                "address": address,
                 "gpu_count": count,
-                "accelerator": "H100",
+                "accelerator": fleet.EXPECTED_ACCELERATOR,
                 "repo_commit": commits.get(alias, "a" * 40),
             }
         )
@@ -52,9 +55,9 @@ def test_manifest_is_exactly_the_canonical_40_gpu_shape(tmp_path):
     manifest["hosts"].append(
         {
             "alias": "h100-8c",
-            "address": "excluded.example",
+            "address": "192.222.54.141",
             "gpu_count": 8,
-            "accelerator": "H100",
+            "accelerator": fleet.EXPECTED_ACCELERATOR,
             "repo_commit": "a" * 40,
         }
     )
@@ -62,7 +65,29 @@ def test_manifest_is_exactly_the_canonical_40_gpu_shape(tmp_path):
     path.write_text(
         json.dumps({k: v for k, v in manifest.items() if k != "manifest_hash"})
     )
-    with pytest.raises(fleet.FleetError, match="exactly six"):
+    with pytest.raises(fleet.FleetError, match="excluded"):
+        fleet.load_manifest(path)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        (lambda hosts: hosts[0].update(address="203.0.113.9"), "mapping drift"),
+        (lambda hosts: hosts[0].update(gpu_count=8), "mapping drift"),
+        (lambda hosts: hosts[1].update(address=hosts[0]["address"]), "duplicate"),
+        (lambda hosts: hosts[0].update(address="209.20.158.82"), "excluded"),
+        (lambda hosts: hosts[0].update(accelerator="H100"), "must be exactly"),
+    ],
+)
+def test_manifest_rejects_wrong_duplicate_excluded_and_lookalike_hosts(
+    tmp_path, mutation, message
+):
+    manifest = _manifest(tmp_path)
+    raw = {key: value for key, value in manifest.items() if key != "manifest_hash"}
+    mutation(raw["hosts"])
+    path = tmp_path / f"bad-{message.replace(' ', '-')}.json"
+    path.write_text(json.dumps(raw))
+    with pytest.raises(fleet.FleetError, match=message):
         fleet.load_manifest(path)
 
 
@@ -137,6 +162,58 @@ def test_submit_is_dry_run_and_shell_quotes_argv(tmp_path):
     assert "'$(bad)'" in command
     assert command.index(":done") < command.index("memory.used")
     assert command.index(":active") < command.index("memory.used")
+    assert "allocation.lock" in command
+    assert "flock --exclusive --close" in command
+    assert 'exec {lease_fd}>"$lock_root/gpu-0.lock"' in command
+    assert command.index("gpu-0.lock") < command.index("memory.used")
+
+
+def test_gpu_lease_is_exclusive_across_concurrent_processes(tmp_path):
+    if shutil.which("flock") is None:
+        pytest.skip("util-linux flock behavioral test requires Linux")
+    lease = tmp_path / "gpu-0.lock"
+    holder = subprocess.Popen(["flock", "--exclusive", str(lease), "sleep", "0.5"])
+    try:
+        for _ in range(50):
+            probe = subprocess.run(["flock", "--nonblock", str(lease), "true"])
+            if probe.returncode != 0:
+                break
+        assert probe.returncode != 0
+    finally:
+        holder.wait(timeout=2)
+    assert subprocess.run(["flock", "--nonblock", str(lease), "true"]).returncode == 0
+
+
+def test_adversarial_argv_and_env_are_executed_as_literal_data(tmp_path):
+    manifest = _manifest(tmp_path)
+    manifest["remote_repo"] = str(tmp_path)
+    output = tmp_path / "observed.json"
+    pwned = tmp_path / "pwned"
+    strange = f"$(touch {pwned}) ; `touch {pwned}`"
+    jobs = _jobset(
+        tmp_path,
+        [
+            {
+                "job_id": "literal",
+                "argv": [
+                    sys.executable,
+                    "-c",
+                    "import json,os,sys;json.dump([sys.argv[1],os.environ['WEIRD']],open(sys.argv[2],'w'))",
+                    strange,
+                    str(output),
+                ],
+                "env": {"WEIRD": strange},
+            }
+        ],
+    )
+    plan = fleet.build_plan(manifest, jobs, repo_commit="a" * 40)
+    row = plan["assignments"][0]
+    row["job_dir"] = str(tmp_path / "job")
+    Path(row["job_dir"]).mkdir()
+    _, inner = fleet._runtime(manifest, plan, row)
+    subprocess.run(["bash", "-lc", inner], check=True)
+    assert json.loads(output.read_text()) == [strange, strange]
+    assert not pwned.exists()
 
 
 def test_inventory_validates_shape_commit_and_busy_state(tmp_path):
@@ -155,3 +232,51 @@ def test_inventory_validates_shape_commit_and_busy_state(tmp_path):
     result = fleet.inventory(manifest, runner=runner)
     assert result["valid"] is False
     assert result["gpu_capacity"] == 40
+
+
+def _local_status_runner(argv):
+    result = subprocess.run(
+        ["bash", "-lc", argv[-1]],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    return subprocess.CompletedProcess(
+        argv, result.returncode, result.stdout, result.stderr
+    )
+
+
+def _write_receipt(manifest, plan, row, *, mutate=False):
+    receipt, _ = fleet._runtime(manifest, plan, row)
+    if mutate:
+        receipt["plan_hash"] = "sha256:" + "0" * 64
+    path = Path(row["job_dir"])
+    path.mkdir(parents=True)
+    (path / "receipt.json").write_bytes(fleet._canonical(receipt))
+    os.chmod(path / "receipt.json", 0o444)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="remote status contract is Linux")
+def test_status_rejects_cross_plan_receipt(tmp_path):
+    manifest = _manifest(tmp_path)
+    jobs = _jobset(tmp_path, [{"job_id": "x", "argv": ["true"]}])
+    plan = fleet.build_plan(manifest, jobs, repo_commit="a" * 40)
+    plan["assignments"][0]["job_dir"] = str(tmp_path / "cross-plan")
+    _write_receipt(manifest, plan, plan["assignments"][0], mutate=True)
+    result = fleet.status(manifest, plan, runner=_local_status_runner)
+    assert result["jobs"][0]["status"] == "DRIFT"
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="remote status contract is Linux")
+def test_status_rejects_stale_or_reused_pid(tmp_path):
+    manifest = _manifest(tmp_path)
+    jobs = _jobset(tmp_path, [{"job_id": "x", "argv": ["true"]}])
+    plan = fleet.build_plan(manifest, jobs, repo_commit="a" * 40)
+    row = plan["assignments"][0]
+    row["job_dir"] = str(tmp_path / "stale-pid")
+    _write_receipt(manifest, plan, row)
+    path = Path(row["job_dir"])
+    (path / ".pid").write_text(str(os.getpid()))
+    (path / ".heartbeat").write_text(f"now pid={os.getpid()}\n")
+    result = fleet.status(manifest, plan, runner=_local_status_runner)
+    assert result["jobs"][0]["status"] == "STALE_IDENTITY"
