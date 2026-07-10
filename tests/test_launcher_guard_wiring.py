@@ -18,14 +18,13 @@ an intentionally-bad launch config is refused (SystemExit) and a good one is
 not, and that --skip-guards logs a warning and bypasses rather than silently
 no-oping.
 """
+
 from __future__ import annotations
 
 import argparse
 import json
 import sys
 from pathlib import Path
-from unittest import mock
-
 import pytest
 
 _TOOLS_DIR = Path(__file__).resolve().parents[1] / "tools"
@@ -48,197 +47,208 @@ VAL_ONLY_SEED = 6_195_000_000  # inside prelaunch_guard.VAL_ONLY_SEED_RANGE
 # ---------------------------------------------------------------------------
 
 GOLDEN_OPTION_STRINGS = {
-    'generate_gumbel_selfplay_data': {
-        ('--base-seed',),
-        ('--belief-chance-spectra', '--no-belief-chance-spectra'),
-        ('--c-scale',),
-        ('--c-visit',),
-        ('--checkpoint',),
-        ('--config',),
-        ('--config-hash',),
-        ('--config-purpose',),
-        ('--correct-rust-chance-spectra', '--no-correct-rust-chance-spectra'),
-        ('--device',),
-        ('--dump-config',),
-        ('--eval-cache-size',),
-        ('--eval-server', '--no-eval-server'),
-        ('--eval-server-max-batch',),
-        ('--eval-server-max-wait-ms',),
-        ('--eval-server-timeout-ms',),
-        ('--exact-budget-sh', '--no-exact-budget-sh'),
-        ('--exact-budget-sh-min-n',),
-        ('--exploiter-fraction',),
-        ('--format',),
-        ('--games',),
-        ('--help', '-h'),
-        ('--late-temperature',),
-        ('--late-temperature-decisions',),
-        ('--lazy-interior-chance', '--no-lazy-interior-chance'),
-        ('--ledger-claim-label',),
-        ('--max-decisions',),
-        ('--max-depth',),
-        ('--n-fast',),
-        ('--n-full',),
-        ('--n-full-wide',),
-        ('--no-public-observation', '--public-observation'),
-        ('--no-rust-featurize', '--rust-featurize'),
-        ('--no-score-actions', '--score-actions'),
-        ('--no-seed-claim', '--seed-claim'),
-        ('--obs-width',),
-        ('--opponent-mix-manifest',),
-        ('--opponent-pool-manifest',),
-        ('--out-dir',),
-        ('--p-full',),
-        ('--prior-temperature',),
-        ('--raw-policy-above-width',),
-        ('--rescale-noise-floor-c',),
-        ('--shard-size',),
-        ('--sigma-eval',),
-        ('--skip-guards',),
-        ('--temperature-decisions',),
-        ('--temperature-high',),
-        ('--temperature-low',),
-        ('--temperature-move-fraction',),
-        ('--track',),
-        ('--value-scale',),
-        ('--vps-to-win',),
-        ('--workers',),
+    "generate_gumbel_selfplay_data": {
+        ("--base-seed",),
+        ("--belief-chance-spectra", "--no-belief-chance-spectra"),
+        ("--c-scale",),
+        ("--c-visit",),
+        ("--checkpoint",),
+        ("--config",),
+        ("--config-hash",),
+        ("--config-purpose",),
+        ("--correct-rust-chance-spectra", "--no-correct-rust-chance-spectra"),
+        ("--device",),
+        ("--dump-config",),
+        ("--eval-cache-size",),
+        ("--eval-server", "--no-eval-server"),
+        ("--eval-server-batch-timeout-sec",),
+        ("--eval-server-cuda-graph", "--no-eval-server-cuda-graph"),
+        ("--eval-server-cuda-graph-batch-buckets",),
+        ("--eval-server-cuda-graph-warmup-iterations",),
+        ("--eval-server-event-token-limit",),
+        ("--eval-server-local-fallback", "--no-eval-server-local-fallback"),
+        ("--eval-server-max-batch",),
+        ("--eval-server-max-wait-ms",),
+        ("--eval-server-matmul-precision",),
+        ("--eval-server-request-collector", "--no-eval-server-request-collector"),
+        ("--eval-server-shared-memory-slot-bytes",),
+        ("--eval-server-timeout-ms",),
+        ("--eval-server-transport",),
+        ("--exact-budget-sh", "--no-exact-budget-sh"),
+        ("--exact-budget-sh-min-n",),
+        ("--exploiter-fraction",),
+        ("--format",),
+        ("--games",),
+        ("--help", "-h"),
+        ("--late-temperature",),
+        ("--late-temperature-decisions",),
+        ("--lazy-interior-chance", "--no-lazy-interior-chance"),
+        ("--ledger-claim-label",),
+        ("--max-decisions",),
+        ("--max-depth",),
+        ("--n-fast",),
+        ("--n-full",),
+        ("--n-full-wide",),
+        ("--no-public-observation", "--public-observation"),
+        ("--no-rust-featurize", "--rust-featurize"),
+        ("--no-score-actions", "--score-actions"),
+        ("--no-seed-claim", "--seed-claim"),
+        ("--obs-width",),
+        ("--opponent-mix-manifest",),
+        ("--opponent-pool-manifest",),
+        ("--out-dir",),
+        ("--p-full",),
+        ("--prior-temperature",),
+        ("--raw-policy-above-width",),
+        ("--rescale-noise-floor-c",),
+        ("--no-root-wave-batching", "--root-wave-batching"),
+        ("--shard-size",),
+        ("--sigma-eval",),
+        ("--skip-guards",),
+        ("--temperature-decisions",),
+        ("--temperature-high",),
+        ("--temperature-low",),
+        ("--temperature-move-fraction",),
+        ("--track",),
+        ("--value-scale",),
+        ("--vps-to-win",),
+        ("--workers",),
     },
-    'train_bc': {
-        ('--advantage-policy-weighting',),
-        ('--advantage-temperature',),
-        ('--advantage-weight-cap',),
-        ('--advantage-weight-floor',),
-        ('--allow-concurrent-bc',),
-        ('--allow-legacy-action-mask-upgrade',),
-        ('--allow-missing-game-seed-validation-split',),
-        ('--allow-teacher-score-q-loss',),
-        ('--amp',),
-        ('--arch',),
-        ('--attention-heads',),
-        ('--aux-subgoal-heads',),
-        ('--aux-subgoal-loss-weight',),
-        ('--batch-size',),
-        ('--checkpoint',),
-        ('--config',),
-        ('--config-hash',),
-        ('--config-purpose',),
-        ('--data',),
-        ('--data-format',),
-        ('--data-loader-prefetch',),
-        ('--data-loader-workers',),
-        ('--ddp-find-unused-parameters', '--no-ddp-find-unused-parameters'),
-        ('--ddp-shard-data',),
-        ('--device',),
-        ('--dump-config',),
-        ('--edge-policy-head',),
-        ('--epochs',),
-        ('--final-vp-loss-weight',),
-        ('--forced-action-weight',),
-        ('--forced-row-value-weight',),
-        ('--freeze-modules',),
-        ('--fsdp',),
-        ('--fused-optimizer', '--no-fused-optimizer'),
-        ('--grad-accum-steps',),
-        ('--graph-dropout',),
-        ('--graph-history-features',),
-        ('--graph-layers',),
-        ('--graph-tokens',),
-        ('--grow-from-checkpoint',),
-        ('--help', '-h'),
-        ('--hidden-size',),
-        ('--host-lock-file',),
-        ('--init-checkpoint',),
-        ('--loser-sample-weight',),
-        ('--lr',),
-        ('--lr-schedule',),
-        ('--lr-warmup-steps',),
-        ('--mask-hidden-info',),
-        ('--max-35m-params',),
-        ('--max-steps',),
-        ('--min-35m-params',),
-        ('--no-symmetry-augment', '--symmetry-augment'),
-        ('--no-symmetry-augment-events', '--symmetry-augment-events'),
-        ('--optimizer',),
-        ('--per-game-value-weight',),
-        ('--per-game-value-weight-mode',),
-        ('--phase-weights',),
-        ('--policy-kl-anchor-weight',),
-        ('--policy-loss-weight',),
-        ('--policy-surprise-cap',),
-        ('--policy-surprise-weight',),
-        ('--progress-every-batches',),
-        ('--q-loss-weight',),
-        ('--q-skip-teacher-prefixes',),
-        ('--report',),
-        ('--require-35m-model',),
-        ('--require-production-35m-teacher',),
-        ('--require-strict-35m-teacher',),
-        ('--save-each-epoch',),
-        ('--seed',),
-        ('--skip-guards',),
-        ('--skip-teacher-quality-gate',),
-        ('--soft-target-min-legal-coverage',),
-        ('--soft-target-source',),
-        ('--soft-target-temperature',),
-        ('--soft-target-weight',),
-        ('--teacher-weights',),
-        ('--track',),
-        ('--train-diagnostics-every-batches',),
-        ('--train-value-only',),
-        ('--truncated-vp-margin-value-weight',),
-        ('--trust-curated-data-quality',),
-        ('--validation-fraction',),
-        ('--validation-game-seed-ranges',),
-        ('--validation-max-samples',),
-        ('--validation-seed',),
-        ('--value-categorical-loss-weight',),
-        ('--value-head-type',),
-        ('--value-hlgauss-sigma-ratio',),
-        ('--value-loss-weight',),
-        ('--value-lr-mult',),
-        ('--value-phase-weights',),
-        ('--value-target-lambda',),
-        ('--value-uncertainty-head',),
-        ('--value-uncertainty-loss-weight',),
-        ('--vp-margin-weight',),
-        ('--vps-to-win',),
-        ('--weight-decay',),
-        ('--winner-sample-weight',),
+    "train_bc": {
+        ("--advantage-policy-weighting",),
+        ("--advantage-temperature",),
+        ("--advantage-weight-cap",),
+        ("--advantage-weight-floor",),
+        ("--allow-concurrent-bc",),
+        ("--allow-legacy-action-mask-upgrade",),
+        ("--allow-missing-game-seed-validation-split",),
+        ("--allow-teacher-score-q-loss",),
+        ("--amp",),
+        ("--arch",),
+        ("--attention-heads",),
+        ("--aux-subgoal-heads",),
+        ("--aux-subgoal-loss-weight",),
+        ("--batch-size",),
+        ("--checkpoint",),
+        ("--config",),
+        ("--config-hash",),
+        ("--config-purpose",),
+        ("--data",),
+        ("--data-format",),
+        ("--data-loader-prefetch",),
+        ("--data-loader-workers",),
+        ("--ddp-find-unused-parameters", "--no-ddp-find-unused-parameters"),
+        ("--ddp-shard-data",),
+        ("--device",),
+        ("--dump-config",),
+        ("--edge-policy-head",),
+        ("--epochs",),
+        ("--final-vp-loss-weight",),
+        ("--forced-action-weight",),
+        ("--forced-row-value-weight",),
+        ("--freeze-modules",),
+        ("--fsdp",),
+        ("--fused-optimizer", "--no-fused-optimizer"),
+        ("--grad-accum-steps",),
+        ("--graph-dropout",),
+        ("--graph-history-features",),
+        ("--graph-layers",),
+        ("--graph-tokens",),
+        ("--grow-from-checkpoint",),
+        ("--help", "-h"),
+        ("--hidden-size",),
+        ("--host-lock-file",),
+        ("--init-checkpoint",),
+        ("--loser-sample-weight",),
+        ("--lr",),
+        ("--lr-schedule",),
+        ("--lr-warmup-steps",),
+        ("--mask-hidden-info",),
+        ("--max-35m-params",),
+        ("--max-steps",),
+        ("--min-35m-params",),
+        ("--no-symmetry-augment", "--symmetry-augment"),
+        ("--no-symmetry-augment-events", "--symmetry-augment-events"),
+        ("--optimizer",),
+        ("--per-game-value-weight",),
+        ("--per-game-value-weight-mode",),
+        ("--phase-weights",),
+        ("--policy-kl-anchor-weight",),
+        ("--policy-loss-weight",),
+        ("--policy-surprise-cap",),
+        ("--policy-surprise-weight",),
+        ("--progress-every-batches",),
+        ("--q-loss-weight",),
+        ("--q-skip-teacher-prefixes",),
+        ("--report",),
+        ("--require-35m-model",),
+        ("--require-production-35m-teacher",),
+        ("--require-strict-35m-teacher",),
+        ("--save-each-epoch",),
+        ("--seed",),
+        ("--skip-guards",),
+        ("--skip-teacher-quality-gate",),
+        ("--soft-target-min-legal-coverage",),
+        ("--soft-target-source",),
+        ("--soft-target-temperature",),
+        ("--soft-target-weight",),
+        ("--teacher-weights",),
+        ("--track",),
+        ("--train-diagnostics-every-batches",),
+        ("--train-value-only",),
+        ("--truncated-vp-margin-value-weight",),
+        ("--trust-curated-data-quality",),
+        ("--validation-fraction",),
+        ("--validation-game-seed-ranges",),
+        ("--validation-max-samples",),
+        ("--validation-seed",),
+        ("--value-categorical-loss-weight",),
+        ("--value-head-type",),
+        ("--value-hlgauss-sigma-ratio",),
+        ("--value-loss-weight",),
+        ("--value-lr-mult",),
+        ("--value-phase-weights",),
+        ("--value-target-lambda",),
+        ("--value-uncertainty-head",),
+        ("--value-uncertainty-loss-weight",),
+        ("--vp-margin-weight",),
+        ("--vps-to-win",),
+        ("--weight-decay",),
+        ("--winner-sample-weight",),
     },
-    'continuous_flywheel': {
-        ('--anchor-corpus',),
-        ('--anchor-drift-alert-threshold',),
-        ('--anchor-eval-every-rounds',),
-        ('--anchor-holdout-ranges',),
-        ('--base-seed',),
-        ('--batch-size',),
-        ('--device',),
-        ('--dry-run',),
-        ('--evict-grace-seconds',),
-        ('--evict-stale-shards',),
-        ('--games-per-round',),
-        ('--gate-games',),
-        ('--gen-c-scale',),
-        ('--gen-c-visit',),
-        ('--gen-correct-rust-chance-spectra', '--no-gen-correct-rust-chance-spectra'),
-        ('--gen-lazy-interior-chance', '--no-gen-lazy-interior-chance'),
-        ('--gen-max-decisions',),
-        ('--gen-max-depth',),
-        ('--gen-n-fast',),
-        ('--gen-n-full',),
-        ('--gen-out-root',),
-        ('--gen-p-full',),
-        ('--gen-temperature-decisions',),
-        ('--help', '-h'),
-        ('--loop-dir',),
-        ('--max-rounds',),
-        ('--opponent-pool-fraction',),
-        ('--regime',),
-        ('--seed-checkpoint',),
-        ('--skip-guards',),
-        ('--window-c-rows',),
-        ('--workers',),
+    "continuous_flywheel": {
+        ("--anchor-corpus",),
+        ("--anchor-drift-alert-threshold",),
+        ("--anchor-eval-every-rounds",),
+        ("--anchor-holdout-ranges",),
+        ("--base-seed",),
+        ("--batch-size",),
+        ("--device",),
+        ("--dry-run",),
+        ("--evict-grace-seconds",),
+        ("--evict-stale-shards",),
+        ("--games-per-round",),
+        ("--gate-games",),
+        ("--gen-c-scale",),
+        ("--gen-c-visit",),
+        ("--gen-correct-rust-chance-spectra", "--no-gen-correct-rust-chance-spectra"),
+        ("--gen-lazy-interior-chance", "--no-gen-lazy-interior-chance"),
+        ("--gen-max-decisions",),
+        ("--gen-max-depth",),
+        ("--gen-n-fast",),
+        ("--gen-n-full",),
+        ("--gen-out-root",),
+        ("--gen-p-full",),
+        ("--gen-temperature-decisions",),
+        ("--help", "-h"),
+        ("--loop-dir",),
+        ("--max-rounds",),
+        ("--opponent-pool-fraction",),
+        ("--regime",),
+        ("--seed-checkpoint",),
+        ("--skip-guards",),
+        ("--window-c-rows",),
+        ("--workers",),
     },
 }
 
@@ -280,7 +290,16 @@ def test_build_parser_is_import_safe_and_side_effect_free(module):
 def test_generate_gumbel_sample_argv_produces_expected_namespace():
     parser = gen_cli.build_parser()
     args = parser.parse_args(
-        ["--out-dir", "/tmp/does-not-matter", "--base-seed", "1234", "--games", "8", "--c-scale", "0.1"]
+        [
+            "--out-dir",
+            "/tmp/does-not-matter",
+            "--base-seed",
+            "1234",
+            "--games",
+            "8",
+            "--c-scale",
+            "0.1",
+        ]
     )
     assert args.out_dir == "/tmp/does-not-matter"
     assert args.base_seed == 1234
@@ -297,11 +316,16 @@ def test_train_bc_sample_argv_produces_expected_namespace(tmp_path):
     parser = train_bc.build_parser()
     args = parser.parse_args(
         [
-            "--data", str(tmp_path / "data"),
-            "--checkpoint", str(tmp_path / "ckpt.pt"),
-            "--report", str(tmp_path / "report.json"),
-            "--optimizer", "adamw",
-            "--weight-decay", "0.01",
+            "--data",
+            str(tmp_path / "data"),
+            "--checkpoint",
+            str(tmp_path / "ckpt.pt"),
+            "--report",
+            str(tmp_path / "report.json"),
+            "--optimizer",
+            "adamw",
+            "--weight-decay",
+            "0.01",
         ]
     )
     assert args.data == str(tmp_path / "data")
@@ -317,7 +341,13 @@ def test_train_bc_sample_argv_produces_expected_namespace(tmp_path):
 def test_continuous_flywheel_sample_argv_produces_expected_namespace(tmp_path):
     parser = continuous_flywheel.build_parser()
     args = parser.parse_args(
-        ["--loop-dir", str(tmp_path / "loop"), "--seed-checkpoint", str(tmp_path / "seed.pt"), "--dry-run"]
+        [
+            "--loop-dir",
+            str(tmp_path / "loop"),
+            "--seed-checkpoint",
+            str(tmp_path / "seed.pt"),
+            "--dry-run",
+        ]
     )
     assert args.loop_dir == str(tmp_path / "loop")
     assert args.dry_run is True
@@ -383,11 +413,16 @@ class TestGenerateGumbelSelfplayGuardWiring:
     # Each test that should pass cli_flag_lint must include these (or skip them
     # intentionally to test a guard failure).
     _GEN_RECIPE_FLAGS = [
-        "--c-scale", "0.03",
-        "--c-visit", "50.0",
-        "--n-full", "64",
-        "--n-fast", "16",
-        "--temperature-decisions", "90",
+        "--c-scale",
+        "0.03",
+        "--c-visit",
+        "50.0",
+        "--n-full",
+        "64",
+        "--n-fast",
+        "16",
+        "--temperature-decisions",
+        "90",
         "--public-observation",
         "--lazy-interior-chance",
     ]
@@ -398,12 +433,19 @@ class TestGenerateGumbelSelfplayGuardWiring:
         out_dir_a = tmp_path / "run_a"
         out_dir_a.mkdir()
         (claims_dir / "run_a.json").write_text(
-            json.dumps({"out_dir": str(out_dir_a.resolve()), "base_seed": 1000, "games": 64})
+            json.dumps(
+                {"out_dir": str(out_dir_a.resolve()), "base_seed": 1000, "games": 64}
+            )
         )
         out_dir_b = tmp_path / "run_b"
         parser = gen_cli.build_parser()
         argv = [
-            "--out-dir", str(out_dir_b), "--base-seed", "1032", "--games", "64",
+            "--out-dir",
+            str(out_dir_b),
+            "--base-seed",
+            "1032",
+            "--games",
+            "64",
         ] + self._GEN_RECIPE_FLAGS
         args = parser.parse_args(argv)
         specs = gen_cli._build_guard_specs(args, argv, parser)
@@ -412,16 +454,25 @@ class TestGenerateGumbelSelfplayGuardWiring:
             if spec["name"] == "seed_ledger":
                 spec["args"]["claims_dir"] = claims_dir
         with pytest.raises(SystemExit, match="seed_ledger"):
-            launcher_guards.run_or_refuse(specs, launcher="generate_gumbel_selfplay_data", skip=False)
+            launcher_guards.run_or_refuse(
+                specs, launcher="generate_gumbel_selfplay_data", skip=False
+            )
 
     def test_val_only_range_is_allowed_for_generation(self, tmp_path):
         parser = gen_cli.build_parser()
         argv = [
-            "--out-dir", str(tmp_path / "run"), "--base-seed", str(VAL_ONLY_SEED), "--games", "8",
+            "--out-dir",
+            str(tmp_path / "run"),
+            "--base-seed",
+            str(VAL_ONLY_SEED),
+            "--games",
+            "8",
         ] + self._GEN_RECIPE_FLAGS
         args = parser.parse_args(argv)
         specs = gen_cli._build_guard_specs(args, argv, parser)
-        launcher_guards.run_or_refuse(specs, launcher="generate_gumbel_selfplay_data", skip=False)
+        launcher_guards.run_or_refuse(
+            specs, launcher="generate_gumbel_selfplay_data", skip=False
+        )
 
     def test_missing_critical_flag_refuses_launch(self, tmp_path):
         parser = gen_cli.build_parser()
@@ -430,14 +481,18 @@ class TestGenerateGumbelSelfplayGuardWiring:
         args = parser.parse_args(argv)
         specs = gen_cli._build_guard_specs(args, argv, parser)
         with pytest.raises(SystemExit, match="cli_flag_lint"):
-            launcher_guards.run_or_refuse(specs, launcher="generate_gumbel_selfplay_data", skip=False)
+            launcher_guards.run_or_refuse(
+                specs, launcher="generate_gumbel_selfplay_data", skip=False
+            )
 
     def test_skip_guards_bypasses_refusal_with_warning(self, tmp_path, capsys):
         parser = gen_cli.build_parser()
         argv = ["--out-dir", str(tmp_path / "run"), "--base-seed", "1", "--games", "8"]
         args = parser.parse_args(argv)
         specs = gen_cli._build_guard_specs(args, argv, parser)
-        launcher_guards.run_or_refuse(specs, launcher="generate_gumbel_selfplay_data", skip=True)
+        launcher_guards.run_or_refuse(
+            specs, launcher="generate_gumbel_selfplay_data", skip=True
+        )
         assert "WARNING" in capsys.readouterr().err
 
     def _ledger_overlap_own_claim(self, tmp_path, argv_extra, env_claim, monkeypatch):
@@ -447,15 +502,26 @@ class TestGenerateGumbelSelfplayGuardWiring:
         else:
             monkeypatch.setenv("CATAN_LEDGER_CLAIM_ID", env_claim)
         parser = gen_cli.build_parser()
-        argv = [
-            "--out-dir", str(tmp_path / "run"), "--base-seed", "1", "--games", "8",
-        ] + self._GEN_RECIPE_FLAGS + argv_extra
+        argv = (
+            [
+                "--out-dir",
+                str(tmp_path / "run"),
+                "--base-seed",
+                "1",
+                "--games",
+                "8",
+            ]
+            + self._GEN_RECIPE_FLAGS
+            + argv_extra
+        )
         args = parser.parse_args(argv)
         specs = gen_cli._build_guard_specs(args, argv, parser)
         overlap = next(s for s in specs if s["name"] == "ledger_overlap")
         return overlap["args"]["own_claim_label"]
 
-    def test_ledger_claim_label_flag_threads_into_overlap_guard(self, tmp_path, monkeypatch):
+    def test_ledger_claim_label_flag_threads_into_overlap_guard(
+        self, tmp_path, monkeypatch
+    ):
         # CAT-124: --ledger-claim-label reaches the ledger_overlap guard so it can
         # exclude this launch's own just-written claim row.
         got = self._ledger_overlap_own_claim(
@@ -492,12 +558,21 @@ class TestTrainBcGuardWiring:
 
         parser = train_bc.build_parser()
         argv = [
-            "--data", str(data_dir),
-            "--checkpoint", str(tmp_path / "ckpt.pt"),
-            "--report", str(tmp_path / "report.json"),
+            "--data",
+            str(data_dir),
+            "--checkpoint",
+            str(tmp_path / "ckpt.pt"),
+            "--report",
+            str(tmp_path / "report.json"),
             "--mask-hidden-info",
-            "--optimizer", "adam", "--weight-decay", "0.0",
-            "--truncated-vp-margin-value-weight", "0.25", "--lr-schedule", "flat",
+            "--optimizer",
+            "adam",
+            "--weight-decay",
+            "0.0",
+            "--truncated-vp-margin-value-weight",
+            "0.25",
+            "--lr-schedule",
+            "flat",
         ]
         args = parser.parse_args(argv)
         specs = train_bc._build_guard_specs(args, argv, parser)
@@ -510,12 +585,21 @@ class TestTrainBcGuardWiring:
 
         parser = train_bc.build_parser()
         argv = [
-            "--data", str(data_dir),
-            "--checkpoint", str(tmp_path / "ckpt.pt"),
-            "--report", str(tmp_path / "report.json"),
+            "--data",
+            str(data_dir),
+            "--checkpoint",
+            str(tmp_path / "ckpt.pt"),
+            "--report",
+            str(tmp_path / "report.json"),
             "--mask-hidden-info",
-            "--optimizer", "adam", "--weight-decay", "0.0",
-            "--truncated-vp-margin-value-weight", "0.25", "--lr-schedule", "flat",
+            "--optimizer",
+            "adam",
+            "--weight-decay",
+            "0.0",
+            "--truncated-vp-margin-value-weight",
+            "0.25",
+            "--lr-schedule",
+            "flat",
         ]
         args = parser.parse_args(argv)
         specs = train_bc._build_guard_specs(args, argv, parser)
@@ -529,13 +613,23 @@ class TestTrainBcGuardWiring:
 
         parser = train_bc.build_parser()
         argv = [
-            "--data", str(data_dir),
-            "--checkpoint", str(tmp_path / "ckpt.pt"),
-            "--report", str(tmp_path / "report.json"),
-            "--init-checkpoint", str(init_checkpoint),
+            "--data",
+            str(data_dir),
+            "--checkpoint",
+            str(tmp_path / "ckpt.pt"),
+            "--report",
+            str(tmp_path / "report.json"),
+            "--init-checkpoint",
+            str(init_checkpoint),
             "--mask-hidden-info",
-            "--optimizer", "adam", "--weight-decay", "0.0",
-            "--truncated-vp-margin-value-weight", "0.25", "--lr-schedule", "flat",
+            "--optimizer",
+            "adam",
+            "--weight-decay",
+            "0.0",
+            "--truncated-vp-margin-value-weight",
+            "0.25",
+            "--lr-schedule",
+            "flat",
         ]
         args = parser.parse_args(argv)
         specs = train_bc._build_guard_specs(args, argv, parser)
@@ -548,9 +642,12 @@ class TestTrainBcGuardWiring:
         parser = train_bc.build_parser()
         # --weight-decay/--optimizer/etc all omitted (silently defaulted).
         argv = [
-            "--data", str(data_dir),
-            "--checkpoint", str(tmp_path / "ckpt.pt"),
-            "--report", str(tmp_path / "report.json"),
+            "--data",
+            str(data_dir),
+            "--checkpoint",
+            str(tmp_path / "ckpt.pt"),
+            "--report",
+            str(tmp_path / "report.json"),
         ]
         args = parser.parse_args(argv)
         specs = train_bc._build_guard_specs(args, argv, parser)
@@ -562,9 +659,12 @@ class TestTrainBcGuardWiring:
         _write_generation_manifest(data_dir, base_seed=VAL_ONLY_SEED, games=1000)
         parser = train_bc.build_parser()
         argv = [
-            "--data", str(data_dir),
-            "--checkpoint", str(tmp_path / "ckpt.pt"),
-            "--report", str(tmp_path / "report.json"),
+            "--data",
+            str(data_dir),
+            "--checkpoint",
+            str(tmp_path / "ckpt.pt"),
+            "--report",
+            str(tmp_path / "report.json"),
         ]
         args = parser.parse_args(argv)
         specs = train_bc._build_guard_specs(args, argv, parser)
@@ -580,14 +680,24 @@ class TestContinuousFlywheelGuardWiring:
 
         parser = continuous_flywheel.build_parser()
         argv = [
-            "--loop-dir", str(loop_dir), "--seed-checkpoint", str(seed_checkpoint),
-            "--batch-size", "65536", "--games-per-round", "2000", "--gate-games", "150",
+            "--loop-dir",
+            str(loop_dir),
+            "--seed-checkpoint",
+            str(seed_checkpoint),
+            "--batch-size",
+            "65536",
+            "--games-per-round",
+            "2000",
+            "--gate-games",
+            "150",
         ]
         args = parser.parse_args(argv)
         loop_dir.mkdir(parents=True, exist_ok=True)
         specs = continuous_flywheel._build_guard_specs(args, argv, parser, loop_dir)
         with pytest.raises(SystemExit, match="masked_regime"):
-            launcher_guards.run_or_refuse(specs, launcher="continuous_flywheel", skip=False)
+            launcher_guards.run_or_refuse(
+                specs, launcher="continuous_flywheel", skip=False
+            )
 
     def test_matching_masked_regime_is_not_refused(self, tmp_path):
         seed_checkpoint = tmp_path / "seed.pt"
@@ -596,8 +706,16 @@ class TestContinuousFlywheelGuardWiring:
 
         parser = continuous_flywheel.build_parser()
         argv = [
-            "--loop-dir", str(loop_dir), "--seed-checkpoint", str(seed_checkpoint),
-            "--batch-size", "65536", "--games-per-round", "2000", "--gate-games", "150",
+            "--loop-dir",
+            str(loop_dir),
+            "--seed-checkpoint",
+            str(seed_checkpoint),
+            "--batch-size",
+            "65536",
+            "--games-per-round",
+            "2000",
+            "--gate-games",
+            "150",
         ]
         args = parser.parse_args(argv)
         loop_dir.mkdir(parents=True, exist_ok=True)
@@ -610,18 +728,31 @@ class TestContinuousFlywheelGuardWiring:
         loop_dir = tmp_path / "loop"
         loop_dir.mkdir(parents=True, exist_ok=True)
         # Simulate a prior run that recorded regime="continuous".
-        (loop_dir / "flywheel_config.json").write_text(json.dumps({"regime": "continuous"}))
+        (loop_dir / "flywheel_config.json").write_text(
+            json.dumps({"regime": "continuous"})
+        )
 
         parser = continuous_flywheel.build_parser()
         argv = [
-            "--loop-dir", str(loop_dir), "--seed-checkpoint", str(seed_checkpoint),
-            "--regime", "discrete",  # drifts from the recorded "continuous"
-            "--batch-size", "65536", "--games-per-round", "2000", "--gate-games", "150",
+            "--loop-dir",
+            str(loop_dir),
+            "--seed-checkpoint",
+            str(seed_checkpoint),
+            "--regime",
+            "discrete",  # drifts from the recorded "continuous"
+            "--batch-size",
+            "65536",
+            "--games-per-round",
+            "2000",
+            "--gate-games",
+            "150",
         ]
         args = parser.parse_args(argv)
         specs = continuous_flywheel._build_guard_specs(args, argv, parser, loop_dir)
         with pytest.raises(SystemExit, match="provenance"):
-            launcher_guards.run_or_refuse(specs, launcher="continuous_flywheel", skip=False)
+            launcher_guards.run_or_refuse(
+                specs, launcher="continuous_flywheel", skip=False
+            )
 
     def test_fresh_loop_has_no_provenance_guard(self, tmp_path):
         """A brand-new --loop-dir has no flywheel_config.json yet -- the
@@ -647,9 +778,13 @@ class TestContinuousFlywheelGuardWiring:
         fake_checkpoint = tmp_path / "not_a_real_checkpoint.pt"
         fake_checkpoint.write_bytes(b"not a real torch checkpoint")
         argv = [
-            "--loop-dir", str(loop_dir),
-            "--seed-checkpoint", str(fake_checkpoint),
-            "--dry-run", "--max-rounds", "0",
+            "--loop-dir",
+            str(loop_dir),
+            "--seed-checkpoint",
+            str(fake_checkpoint),
+            "--dry-run",
+            "--max-rounds",
+            "0",
         ]
         exit_code = continuous_flywheel.main(argv)
         assert exit_code == 0
@@ -678,8 +813,21 @@ class TestContinuousFlywheelGuardWiring:
     "module, extra_argv",
     [
         (gen_cli, ["--out-dir", "/tmp/x"]),
-        (train_bc, ["--data", "/tmp/x", "--checkpoint", "/tmp/y.pt", "--report", "/tmp/z.json"]),
-        (continuous_flywheel, ["--loop-dir", "/tmp/x", "--seed-checkpoint", "/tmp/y.pt"]),
+        (
+            train_bc,
+            [
+                "--data",
+                "/tmp/x",
+                "--checkpoint",
+                "/tmp/y.pt",
+                "--report",
+                "/tmp/z.json",
+            ],
+        ),
+        (
+            continuous_flywheel,
+            ["--loop-dir", "/tmp/x", "--seed-checkpoint", "/tmp/y.pt"],
+        ),
     ],
 )
 def test_help_exits_before_any_guard_runs(module, extra_argv, monkeypatch):

@@ -23,16 +23,26 @@ MEMMAX=$(echo "$GPU" | awk -F',[ ]*' '{if($3+0>m)m=$3}END{print m+0}')
 # role inference from live cmdlines (first match wins), + MPS presence
 ROLE="idle"; DETAIL=""
 CMDS=$(ps -eo args= 2>/dev/null)
-NF=$(echo "$CMDS" | grep -oE 'n-full [0-9]+' | head -1 | awk '{print $2}')
-if echo "$CMDS" | grep -q "torchrun\|train_bc.py"; then ROLE="TRAINING"; DETAIL="train_bc$( echo "$CMDS"|grep -q grow-from && echo '/grow')"
-elif echo "$CMDS" | grep -q "gumbel_search_cross_net_h2h"; then ROLE="GATE(cross-net)"
-elif echo "$CMDS" | grep -q "gumbel_search_vs_bot_h2h\|gumbel_search_vs_raw"; then ROLE="EVAL(vs-bot)"
-elif echo "$CMDS" | grep -q "generate_gumbel_selfplay_data"; then
+NF=$(grep -m1 -oE 'n-full [0-9]+' <<< "$CMDS" | awk '{print $2}')
+# Avoid `echo | grep -q` under pipefail: grep's early exit SIGPIPEs echo and
+# turns a true match into a false pipeline status on busy process tables.
+if grep -qE "torchrun|train_bc.py" <<< "$CMDS"; then
+    ROLE="TRAINING"; DETAIL="train_bc$(grep -q grow-from <<< "$CMDS" && echo '/grow')"
+elif grep -q "gumbel_search_cross_net_h2h" <<< "$CMDS"; then ROLE="GATE(cross-net)"
+elif grep -q "gumbel_search_vs_bot_h2h" <<< "$CMDS"; then ROLE="EVAL(vs-bot)"
+elif grep -q "gumbel_search_vs_raw_h2h" <<< "$CMDS"; then ROLE="EVAL(vs-raw)"
+elif grep -qE "(^|[ /])pytest([ ]|$)|python[^ ]* -m pytest" <<< "$CMDS"; then ROLE="TEST(pytest)"
+elif grep -q "generate_gumbel_selfplay_data" <<< "$CMDS"; then
     if [ "${NF:-0}" -ge 128 ]; then ROLE="GEN-TEACHER(n${NF})"; elif [ -n "${NF:-}" ]; then ROLE="GEN-VOLUME(n${NF})"; else ROLE="GEN"; fi
 fi
-MPS="no-mps"; { [ -e /tmp/mps_pipe_host/control ] || pgrep -x nvidia-cuda-mps-control >/dev/null 2>&1; } && MPS="MPS"
-WORKERS=$(echo "$CMDS" | grep -c "generate_gumbel_selfplay_data\|train_bc.py")
-printf "gpus=%s busy=%s util_avg=%s%% mem_max=%sMiB | role=%s %s | %s | launcher_procs=%s\n" \
+# A stale pipe socket survives `echo quit | nvidia-cuda-mps-control`; process
+# state, not filesystem residue, is the source of truth.
+MPS="no-mps"
+ps -eo comm=,args= 2>/dev/null \
+  | awk '$1 ~ /^nvidia-cuda-mps/ && ($0 ~ /mps-control -d/ || $0 ~ /mps-server/) {found=1} END {exit !found}' \
+  && MPS="MPS"
+WORKERS=$(grep -cE "generate_gumbel_selfplay_data|train_bc.py" <<< "$CMDS")
+printf "gpus=%s busy=%s util_avg=%s%% mem_max=%sMiB | role=%s %s | %s | job_procs=%s\n" \
   "$NG" "$BUSY" "$UTILAVG" "$MEMMAX" "$ROLE" "$DETAIL" "$MPS" "$WORKERS"
 REMOTE_EOF
 

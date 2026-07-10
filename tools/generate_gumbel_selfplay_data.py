@@ -36,6 +36,7 @@ from __future__ import annotations
 import argparse
 import json
 import multiprocessing
+import queue as queue_mod
 import sys
 import time
 from pathlib import Path
@@ -56,7 +57,10 @@ from catan_zero.rl.flywheel.opponent_mix import (
     scale_external_engine_fraction,
     validate_external_engine_fraction,
 )
-from catan_zero.search.gumbel_chance_mcts import GumbelChanceMCTSConfig, HeuristicRustEvaluator
+from catan_zero.search.gumbel_chance_mcts import (
+    GumbelChanceMCTSConfig,
+    HeuristicRustEvaluator,
+)
 from catan_zero.rl.config_cli import add_config_flags, resolve_config
 from catan_zero.rl.pipeline_configs import GenerateConfig
 from catan_zero.search.neural_rust_mcts import (
@@ -134,9 +138,7 @@ def _claim_seed_range(out_dir: Path, *, base_seed: int, games: int) -> None:
         others.append((other_out_dir, other_base_seed, other_games))
 
     try:
-        assert_disjoint_seed_blocks(
-            [(resolved_out_dir, base_seed, games)] + others
-        )
+        assert_disjoint_seed_blocks([(resolved_out_dir, base_seed, games)] + others)
     except ValueError as error:
         raise SystemExit(
             f"seed-claim conflict: {error} Pass a disjoint --base-seed, use "
@@ -326,6 +328,14 @@ def build_parser() -> argparse.ArgumentParser:
         "full-64 half while fast-16 stays legacy.",
     )
     parser.add_argument(
+        "--root-wave-batching",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Batch one ready neural leaf from each independent Gumbel root "
+        "candidate per visit wave. Exact chance enumeration is unchanged. "
+        "Default off until H100 throughput and target-quality canaries pass.",
+    )
+    parser.add_argument(
         "--public-observation",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -360,10 +370,10 @@ def build_parser() -> argparse.ArgumentParser:
         "that caps per-GPU throughput at ~8 workers (measured 1.87x rows/hr at 8 "
         "workers, up to 3.6x at 32; see CAT-67). Featurization + all postprocess "
         "stay per-worker; only forward_legal_np is centralized, so outputs match "
-        "the local path within batched-matmul tolerance. Each worker keeps a "
-        "lazy LOCAL fallback: if the server times out/crashes the worker degrades "
-        "to an in-process evaluator rather than hanging. Default OFF (behavior "
-        "byte-unchanged). Not compatible with --opponent-pool-manifest/"
+        "the local path within batched-matmul tolerance. Local fallback is an "
+        "explicit opt-in because one emergency CUDA context per worker can OOM "
+        "or collapse throughput. Default OFF (behavior byte-unchanged). Not "
+        "compatible with --opponent-pool-manifest/"
         "--opponent-mix-manifest in this prototype.",
     )
     parser.add_argument(
@@ -375,15 +385,94 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--eval-server-max-wait-ms",
         type=float,
-        default=3.0,
-        help="EvalServer window straggler timeout in ms (CAT-67). Only used with --eval-server.",
+        default=0.0,
+        help="EvalServer window straggler timeout in ms (CAT-67). The server always "
+        "drains already-queued requests; 0 avoids delaying single-outstanding clients "
+        "and is the measured H100 default. Only used with --eval-server.",
+    )
+    parser.add_argument(
+        "--eval-server-request-collector",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Overlap multiprocessing Queue deserialization with the current GPU "
+        "forward using one collector thread. Experimental and default false: enable "
+        "only when the target worker/payload A/B beats direct draining.",
+    )
+    parser.add_argument(
+        "--eval-server-transport",
+        choices=("mp_queue", "shared_memory"),
+        default="mp_queue",
+        help="Request payload transport. shared_memory keeps tensor bytes in one "
+        "single-outstanding slot per worker and sends only metadata through the "
+        "Queue; default mp_queue preserves the certified production path.",
+    )
+    parser.add_argument(
+        "--eval-server-shared-memory-slot-bytes",
+        type=int,
+        default=4 * 1024 * 1024,
+        help="Per-worker request-slot capacity for --eval-server-transport "
+        "shared_memory. Oversize requests safely fall back to mp.Queue.",
+    )
+    parser.add_argument(
+        "--eval-server-event-token-limit",
+        type=int,
+        default=None,
+        help="Optional retained event-token prefix before EvalServer inference. "
+        "The server fails if any omitted token is live. Default None keeps all "
+        "64 checkpoint positions; use 0 only after corpus/live-state auditing.",
+    )
+    parser.add_argument(
+        "--eval-server-cuda-graph",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Opt into CUDA Graph capture for the fixed-shape state trunk. "
+        "Strict FP32 ('highest') is required; default false until H100 parity "
+        "and throughput canaries pass.",
+    )
+    parser.add_argument(
+        "--eval-server-cuda-graph-batch-buckets",
+        type=int,
+        nargs="+",
+        default=(8, 16, 24, 32, 40, 48, 64, 80, 96, 128, 160, 192),
+        help="Ascending neural-row batch buckets captured by the CUDA Graph runner.",
+    )
+    parser.add_argument(
+        "--eval-server-cuda-graph-warmup-iterations",
+        type=int,
+        default=3,
+        help="Eager state-trunk warmups before each new CUDA Graph capture.",
     )
     parser.add_argument(
         "--eval-server-timeout-ms",
         type=float,
         default=20000.0,
-        help="Per-request client wait before a worker degrades to its local "
-        "fallback evaluator (CAT-67). Only used with --eval-server.",
+        help="Per-request client wait before failing, or degrading to a local "
+        "evaluator when --eval-server-local-fallback is explicitly enabled. "
+        "Only used with --eval-server.",
+    )
+    parser.add_argument(
+        "--eval-server-batch-timeout-sec",
+        type=float,
+        default=0.0,
+        help="Hard supervision deadline for the whole EvalServer worker batch. "
+        "0 derives a conservative finite deadline from max games/worker and "
+        "max decisions (10 seconds per possible decision plus 10 minutes).",
+    )
+    parser.add_argument(
+        "--eval-server-local-fallback",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Allow a failed EvalServer client to load a private GPU evaluator. "
+        "Default false (fail fast): silently creating one CUDA context per worker "
+        "can collapse throughput or OOM a non-MPS production launch.",
+    )
+    parser.add_argument(
+        "--eval-server-matmul-precision",
+        choices=("highest", "high", "medium"),
+        default="highest",
+        help="Torch float32 matmul precision inside EvalServer. 'highest' is the "
+        "strict production baseline; 'high' enables TF32 on H100 and must pass "
+        "numeric + playing-strength gates before promotion.",
     )
     parser.add_argument(
         "--eval-cache-size",
@@ -427,7 +516,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--opponent-mix-manifest",
         default=None,
         help="Arbitrary-category opponent mix (CAT-54, generalizes --opponent-pool-manifest's "
-        "binary fraction): JSON manifest with a \"categories\" list, each "
+        'binary fraction): JSON manifest with a "categories" list, each '
         '{"name": <tag>, "weight": <float>, "source": "self"|"checkpoint_list"|'
         '"external_engine"|"registry_role"|"registry_pool", ...} -- see '
         "tools/opponent_mix_registry.py's docstring for the full schema (registry_role/"
@@ -460,7 +549,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--obs-width", type=int, default=806)
     parser.add_argument("--base-seed", type=int, default=1)
     parser.add_argument(
-        "--shard-size", type=int, default=2048,
+        "--shard-size",
+        type=int,
+        default=2048,
         help="Rows per shard. CAT-126 #4: if NOT passed explicitly, main() auto-scales by --n-full (n>=256->256, n>=128->512, else 2048) so slow teacher/probe runs flush first shards sooner. Passing --shard-size overrides the auto default.",
     )
     parser.add_argument("--format", choices=("npz", "npz_zst"), default="npz")
@@ -514,7 +605,9 @@ def _build_guard_specs(
 ) -> list[dict]:
     import os  # local: only used here to read the launcher-set claim id (CAT-124)
 
-    static_specs = launcher_guards.load_static_guard_specs("generate_gumbel_selfplay_data")
+    static_specs = launcher_guards.load_static_guard_specs(
+        "generate_gumbel_selfplay_data"
+    )
     # CAT-124: the canonical launcher claims the seed range in the ledger BEFORE this tool
     # runs its guards (claim-then-verify), so by guard time our OWN row is already present.
     # own_claim_label is the unique id the launcher wrote into that row; passing it lets
@@ -548,7 +641,16 @@ def main(argv: Sequence[str] | None = None) -> None:
     if not _shard_size_was_explicit(_raw_argv):
         _auto = _auto_shard_size(int(args.n_full))
         if _auto != int(args.shard_size):
-            print(json.dumps({"progress": "auto_shard_size", "n_full": int(args.n_full), "shard_size": _auto}), flush=True)
+            print(
+                json.dumps(
+                    {
+                        "progress": "auto_shard_size",
+                        "n_full": int(args.n_full),
+                        "shard_size": _auto,
+                    }
+                ),
+                flush=True,
+            )
         args.shard_size = _auto
 
     launcher_guards.run_or_refuse(
@@ -581,9 +683,9 @@ def main(argv: Sequence[str] | None = None) -> None:
     # CAT-12: same absolute-count -> fraction-of-cap conversion as above, for the
     # optional late-temperature window. None stays None (disabled, no-op).
     if args.late_temperature_decisions is not None:
-        args.late_temperature_move_fraction = float(args.late_temperature_decisions) / float(
-            max(1, args.max_decisions)
-        )
+        args.late_temperature_move_fraction = float(
+            args.late_temperature_decisions
+        ) / float(max(1, args.max_decisions))
     else:
         args.late_temperature_move_fraction = None
 
@@ -607,7 +709,9 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "--opponent-pool-manifest requires --checkpoint (a neural champion "
                 "net to play one seat); omit both for heuristic-evaluator smoke runs."
             )
-        policy, _champion, _archive = read_opponent_pool_manifest(args.opponent_pool_manifest)
+        policy, _champion, _archive = read_opponent_pool_manifest(
+            args.opponent_pool_manifest
+        )
         opponent_pool_fraction_configured = float(policy.pool_fraction)
 
     # Opponent-MIX (CAT-54): same fail-fast-in-main-process validation as the
@@ -628,7 +732,9 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "--opponent-mix-manifest and --opponent-pool-manifest are mutually exclusive "
                 "(both resolve the same per-game opponent assignment) -- pass at most one."
             )
-        mix_config = _resolve_mix_with_exploiter(args.opponent_mix_manifest, args.exploiter_fraction)
+        mix_config = _resolve_mix_with_exploiter(
+            args.opponent_mix_manifest, args.exploiter_fraction
+        )
         opponent_mix_effective_weights = mix_config.effective_weights()
         opponent_mix_exploiter_fraction = external_engine_effective_fraction(mix_config)
     elif args.exploiter_fraction is not None:
@@ -640,14 +746,20 @@ def main(argv: Sequence[str] | None = None) -> None:
     output = Path(args.out_dir)
     output.mkdir(parents=True, exist_ok=True)
     if any(output.glob("worker_*")) or (output / "manifest.json").exists():
-        raise SystemExit(f"{output} already contains self-play output; use a fresh --out-dir")
+        raise SystemExit(
+            f"{output} already contains self-play output; use a fresh --out-dir"
+        )
 
     if args.seed_claim:
-        _claim_seed_range(output, base_seed=int(args.base_seed), games=max(0, int(args.games)))
+        _claim_seed_range(
+            output, base_seed=int(args.base_seed), games=max(0, int(args.games))
+        )
 
     workers = max(1, int(args.workers))
     games = max(0, int(args.games))
-    games_per_worker = [games // workers + (1 if i < games % workers else 0) for i in range(workers)]
+    games_per_worker = [
+        games // workers + (1 if i < games % workers else 0) for i in range(workers)
+    ]
 
     worker_args = []
     game_index_start = 0
@@ -667,7 +779,9 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "p_full": float(args.p_full),
                 "c_visit": float(args.c_visit),
                 "c_scale": float(args.c_scale),
-                "n_full_wide": (int(args.n_full_wide) if args.n_full_wide is not None else None),
+                "n_full_wide": (
+                    int(args.n_full_wide) if args.n_full_wide is not None else None
+                ),
                 "raw_policy_above_width": (
                     int(args.raw_policy_above_width)
                     if args.raw_policy_above_width is not None
@@ -696,6 +810,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "lazy_interior_chance": bool(args.lazy_interior_chance),
                 "exact_budget_sh": bool(args.exact_budget_sh),
                 "exact_budget_sh_min_n": int(args.exact_budget_sh_min_n),
+                "root_wave_batching": bool(args.root_wave_batching),
                 "public_observation": bool(args.public_observation),
                 "rust_featurize": bool(args.rust_featurize),
                 "eval_cache_size": int(args.eval_cache_size),
@@ -703,26 +818,31 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "opponent_pool_manifest": args.opponent_pool_manifest,
                 "opponent_mix_manifest": args.opponent_mix_manifest,
                 "exploiter_fraction": (
-                    float(args.exploiter_fraction) if args.exploiter_fraction is not None else None
+                    float(args.exploiter_fraction)
+                    if args.exploiter_fraction is not None
+                    else None
                 ),
             }
         )
         game_index_start += worker_games
 
     started = time.perf_counter()
+    eval_server_stats: dict[str, Any] | None = None
     if bool(getattr(args, "eval_server", False)) and worker_args:
         # CAT-67 cross-game eval server: one shared GPU-resident policy, workers
         # are RemoteEvalClients. Explicit Processes (not a Pool) so the raw
         # mp.Queues can be handed to each worker by inheritance. Guarded to the
         # neural-checkpoint, no-opponent-pool/mix case.
         if not args.checkpoint:
-            raise SystemExit("--eval-server requires --checkpoint (no server for the heuristic evaluator)")
+            raise SystemExit(
+                "--eval-server requires --checkpoint (no server for the heuristic evaluator)"
+            )
         if args.opponent_pool_manifest or args.opponent_mix_manifest:
             raise SystemExit(
                 "--eval-server is not compatible with --opponent-pool-manifest/"
                 "--opponent-mix-manifest in this prototype (CAT-67)"
             )
-        results = _run_eval_server_batch(worker_args, args)
+        results, eval_server_stats = _run_eval_server_batch(worker_args, args)
     elif len(worker_args) <= 1:
         results = [_worker_entry(worker_args[0])] if worker_args else []
     else:
@@ -740,8 +860,14 @@ def main(argv: Sequence[str] | None = None) -> None:
         opponent_mix_exploiter_fraction=opponent_mix_exploiter_fraction,
     )
     summary["config_hash"] = generate_config_hash
+    if eval_server_stats is not None:
+        summary["eval_server_stats"] = eval_server_stats
     write_json(output / "manifest.json", summary)
     print(json.dumps(summary, indent=2, sort_keys=True))
+    if int(args.games) > 0 and int(summary.get("games_completed", 0)) == 0:
+        raise SystemExit(
+            "all self-play workers failed; manifest was preserved for diagnosis"
+        )
 
 
 def _worker_entry(worker_args: dict[str, Any]) -> dict[str, Any]:
@@ -761,7 +887,9 @@ def _worker_entry(worker_args: dict[str, Any]) -> dict[str, Any]:
         return _worker_level_error_summary(worker_args, error)
 
 
-def _worker_level_error_summary(worker_args: dict[str, Any], error: BaseException) -> dict[str, Any]:
+def _worker_level_error_summary(
+    worker_args: dict[str, Any], error: BaseException
+) -> dict[str, Any]:
     """The error-flagged summary a failed worker returns so surviving workers
     still merge (mirrors `_worker_entry`'s catch-all, shared with the
     eval-server path)."""
@@ -799,7 +927,10 @@ def _server_worker_entry(
     client_id: int,
     action_size: int,
     trained_with_masked_hidden_info: bool,
+    needs_action_targets: bool,
+    event_token_limit: int | None,
     client_timeout_ms: float,
+    allow_local_fallback: bool,
     result_queue: Any,
 ) -> None:
     """CAT-67 eval-server per-worker entry (explicit-Process, not Pool). Builds a
@@ -816,14 +947,19 @@ def _server_worker_entry(
             int(client_id),
             action_size=int(action_size),
             trained_with_masked_hidden_info=bool(trained_with_masked_hidden_info),
+            needs_action_targets=bool(needs_action_targets),
+            event_token_limit=event_token_limit,
             config=EntityGraphRustEvaluatorConfig(
                 value_scale=float(worker_args["value_scale"]),
                 prior_temperature=float(worker_args["prior_temperature"]),
                 public_observation=bool(worker_args["public_observation"]),
                 rust_featurize=bool(worker_args["rust_featurize"]),
+                cache_size=int(worker_args.get("eval_cache_size", 100_000)),
             ),
             client_timeout_ms=float(client_timeout_ms),
-            fallback_checkpoint=worker_args["checkpoint"],
+            fallback_checkpoint=(
+                worker_args["checkpoint"] if allow_local_fallback else None
+            ),
             fallback_device=worker_args["device"],
         )
         result_queue.put(_run_worker(worker_args, champion_evaluator=client))
@@ -833,10 +969,11 @@ def _server_worker_entry(
 
 def _run_eval_server_batch(
     worker_args: list[dict[str, Any]], args: argparse.Namespace
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Launch one shared EvalServer + N RemoteEvalClient worker processes (CAT-67),
     collect their summaries, and stop the server. Results are returned ordered by
-    worker_index to match the Pool path."""
+    worker_index to match the Pool path, together with server timing/batch stats
+    persisted into the top-level generation manifest."""
     from catan_zero.search.eval_server import EvalServer, EvalServerConfig
 
     ctx = multiprocessing.get_context("spawn")
@@ -847,46 +984,157 @@ def _run_eval_server_batch(
             max_batch_size=int(args.eval_server_max_batch),
             max_wait_ms=float(args.eval_server_max_wait_ms),
             device=str(args.device),
+            transport=str(getattr(args, "eval_server_transport", "mp_queue")),
+            shared_memory_slot_bytes=int(
+                getattr(args, "eval_server_shared_memory_slot_bytes", 4 * 1024 * 1024)
+            ),
+            event_token_limit=getattr(args, "eval_server_event_token_limit", None),
+            matmul_precision=str(args.eval_server_matmul_precision),
+            request_collector=bool(args.eval_server_request_collector),
+            cuda_graph=bool(getattr(args, "eval_server_cuda_graph", False)),
+            cuda_graph_batch_buckets=tuple(
+                getattr(
+                    args,
+                    "eval_server_cuda_graph_batch_buckets",
+                    (8, 16, 24, 32, 40, 48, 64, 80, 96, 128, 160, 192),
+                )
+            ),
+            cuda_graph_warmup_iterations=int(
+                getattr(args, "eval_server_cuda_graph_warmup_iterations", 3)
+            ),
         ),
         public_observation=bool(args.public_observation),
         mp_context=ctx,
     )
-    server.start()
-    meta = server.wait_ready(timeout=300.0)
+    procs: list[Any] = []
+    results: list[dict[str, Any]] = []
+    stats: dict[str, Any] = {}
+    abort_workers = False
+    server_exit_error: RuntimeError | None = None
+    try:
+        server.start()
+        meta = server.wait_ready(timeout=300.0)
+        print(
+            json.dumps(
+                {
+                    "progress": "eval_server_ready",
+                    "num_clients": len(worker_args),
+                    **meta,
+                }
+            ),
+            flush=True,
+        )
+        result_queue: Any = ctx.Queue()
+        for client_id, wargs in enumerate(worker_args):
+            request_queue_for_client = getattr(server, "request_queue_for_client", None)
+            client_request_queue = (
+                request_queue_for_client(client_id)
+                if request_queue_for_client is not None
+                else server.request_queue
+            )
+            proc = ctx.Process(
+                target=_server_worker_entry,
+                args=(
+                    wargs,
+                    client_request_queue,
+                    server.response_queues[client_id],
+                    client_id,
+                    int(meta["action_size"]),
+                    bool(meta["trained_with_masked_hidden_info"]),
+                    bool(meta.get("needs_action_targets", True)),
+                    meta.get("event_token_limit"),
+                    float(args.eval_server_timeout_ms),
+                    bool(args.eval_server_local_fallback),
+                    result_queue,
+                ),
+                daemon=False,
+                name=f"cat67-gen-worker-{client_id}",
+            )
+            proc.start()
+            procs.append(proc)
+
+        configured_timeout = float(args.eval_server_batch_timeout_sec)
+        if configured_timeout > 0.0:
+            batch_timeout_sec = configured_timeout
+        else:
+            max_worker_games = max(int(wargs["games"]) for wargs in worker_args)
+            max_decisions = max(int(wargs["max_decisions"]) for wargs in worker_args)
+            batch_timeout_sec = max(
+                600.0, max_worker_games * max_decisions * 10.0 + 600.0
+            )
+        deadline = time.monotonic() + batch_timeout_sec
+        batch_timed_out = False
+        allow_local_fallback = bool(args.eval_server_local_fallback)
+        result_poll_sec = 5.0 if allow_local_fallback else 0.25
+        while len(results) < len(worker_args):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                batch_timed_out = True
+                break
+            try:
+                results.append(
+                    result_queue.get(timeout=min(result_poll_sec, remaining))
+                )
+            except queue_mod.Empty:
+                # Readiness only proves startup. In fail-fast/no-fallback mode,
+                # supervise the shared process for the full worker batch: once
+                # it exits, every remaining worker is waiting on a transport
+                # that can never answer. Abort them now instead of paying one
+                # client timeout for every remaining game.
+                if not allow_local_fallback and server.exitcode is not None:
+                    server_exit_error = RuntimeError(
+                        "EvalServer exited after ready "
+                        f"(exitcode={server.exitcode}); aborting worker batch"
+                    )
+                    abort_workers = True
+                    break
+                # A hard-killed/segfaulted worker cannot publish its catch-all
+                # summary.  Once every process is gone, synthesize those missing
+                # records instead of blocking on result_queue forever.
+                if not any(proc.is_alive() for proc in procs):
+                    break
+        returned = {int(result.get("worker_index", -1)) for result in results}
+        for wargs in worker_args:
+            if int(wargs["worker_index"]) not in returned:
+                if server_exit_error is not None:
+                    error: BaseException = server_exit_error
+                elif batch_timed_out:
+                    error = TimeoutError(
+                        f"EvalServer worker batch exceeded {batch_timeout_sec:.1f}s deadline"
+                    )
+                else:
+                    error = RuntimeError("worker exited without publishing a result")
+                results.append(
+                    _worker_level_error_summary(
+                        wargs,
+                        error,
+                    )
+                )
+    finally:
+        # One shared grace window per phase; N workers must not turn a five
+        # second cleanup into N*5 seconds of serial joins.
+        if not abort_workers:
+            join_deadline = time.monotonic() + 5.0
+            for proc in procs:
+                proc.join(timeout=max(0.0, join_deadline - time.monotonic()))
+        for proc in procs:
+            if proc.is_alive():
+                proc.terminate()
+        join_deadline = time.monotonic() + 5.0
+        for proc in procs:
+            proc.join(timeout=max(0.0, join_deadline - time.monotonic()))
+            if proc.is_alive() and hasattr(proc, "kill"):
+                proc.kill()
+        join_deadline = time.monotonic() + 5.0
+        for proc in procs:
+            proc.join(timeout=max(0.0, join_deadline - time.monotonic()))
+        stats = server.stop()
     print(
-        json.dumps({"progress": "eval_server_ready", "num_clients": len(worker_args), **meta}),
+        json.dumps({"progress": "eval_server_stopped", "server_stats": stats}),
         flush=True,
     )
-    result_queue: Any = ctx.Queue()
-    procs = []
-    for client_id, wargs in enumerate(worker_args):
-        proc = ctx.Process(
-            target=_server_worker_entry,
-            args=(
-                wargs,
-                server.request_queue,
-                server.response_queues[client_id],
-                client_id,
-                int(meta["action_size"]),
-                bool(meta["trained_with_masked_hidden_info"]),
-                float(args.eval_server_timeout_ms),
-                result_queue,
-            ),
-            daemon=False,
-            name=f"cat67-gen-worker-{client_id}",
-        )
-        proc.start()
-        procs.append(proc)
-
-    results: list[dict[str, Any]] = []
-    for _ in range(len(worker_args)):
-        results.append(result_queue.get())
-    for proc in procs:
-        proc.join(timeout=120.0)
-    stats = server.stop()
-    print(json.dumps({"progress": "eval_server_stopped", "server_stats": stats}), flush=True)
     results.sort(key=lambda summary: int(summary.get("worker_index", 0)))
-    return results
+    return results, stats
 
 
 def _run_worker(
@@ -916,7 +1164,9 @@ def _run_worker(
             ),
         )
     else:
-        evaluator = HeuristicRustEvaluator(score_actions=bool(worker_args["score_actions"]))
+        evaluator = HeuristicRustEvaluator(
+            score_actions=bool(worker_args["score_actions"])
+        )
 
     # Opponent pool (H2): re-parse the manifest in-process (each worker is a
     # separate spawned process; cheap pure-JSON re-parse rather than trying to
@@ -930,7 +1180,9 @@ def _run_worker(
     opponent_pool_manifest = worker_args.get("opponent_pool_manifest")
     opponent_pool: OpponentPoolRuntime | None = None
     if opponent_pool_manifest:
-        pool_policy, pool_champion, pool_archive = read_opponent_pool_manifest(opponent_pool_manifest)
+        pool_policy, pool_champion, pool_archive = read_opponent_pool_manifest(
+            opponent_pool_manifest
+        )
         opponent_eval_config = EntityGraphRustEvaluatorConfig(
             value_scale=float(worker_args["value_scale"]),
             prior_temperature=float(worker_args["prior_temperature"]),
@@ -984,7 +1236,9 @@ def _run_worker(
                 opponent_checkpoint, device=_device, config=_config
             )
 
-        opponent_mix = MixRuntime(config=mix_config, evaluator_factory=_load_mix_evaluator)
+        opponent_mix = MixRuntime(
+            config=mix_config, evaluator_factory=_load_mix_evaluator
+        )
 
     config = GumbelSelfPlayConfig(
         colors=colors,
@@ -1014,7 +1268,9 @@ def _run_worker(
         n_fast=int(worker_args["n_fast"]),
         p_full=float(worker_args["p_full"]),
         n_full_wide=(
-            int(worker_args["n_full_wide"]) if worker_args.get("n_full_wide") is not None else None
+            int(worker_args["n_full_wide"])
+            if worker_args.get("n_full_wide") is not None
+            else None
         ),
         raw_policy_above_width=(
             int(worker_args["raw_policy_above_width"])
@@ -1025,6 +1281,7 @@ def _run_worker(
         lazy_interior_chance=bool(worker_args["lazy_interior_chance"]),
         exact_budget_sh=bool(worker_args.get("exact_budget_sh", False)),
         exact_budget_sh_min_n=int(worker_args.get("exact_budget_sh_min_n", 0)),
+        root_wave_batching=bool(worker_args.get("root_wave_batching", False)),
         belief_chance_spectra=bool(worker_args["belief_chance_spectra"]),
         rescale_noise_floor_c=float(worker_args.get("rescale_noise_floor_c", 0.0)),
         sigma_eval=float(worker_args.get("sigma_eval", 0.79)),
@@ -1108,7 +1365,9 @@ def _merge_worker_summaries(
             errors.append(error)
         if opponent_pool_enabled:
             opponent_pool_games += int(result.get("opponent_pool_games", 0))
-            for version_str, stats in dict(result.get("opponent_pool_per_version_stats", {})).items():
+            for version_str, stats in dict(
+                result.get("opponent_pool_per_version_stats", {})
+            ).items():
                 agg = opponent_pool_version_stats.setdefault(
                     version_str, {"games": 0, "champion_wins": 0}
                 )
@@ -1116,20 +1375,30 @@ def _merge_worker_summaries(
                 agg["champion_wins"] += int(stats.get("champion_wins", 0))
         if opponent_mix_enabled:
             opponent_mix_pool_games += int(result.get("opponent_mix_pool_games", 0))
-            for tag, stats in dict(result.get("opponent_mix_per_tag_stats", {})).items():
-                agg = opponent_mix_tag_stats.setdefault(tag, {"games": 0, "champion_wins": 0})
+            for tag, stats in dict(
+                result.get("opponent_mix_per_tag_stats", {})
+            ).items():
+                agg = opponent_mix_tag_stats.setdefault(
+                    tag, {"games": 0, "champion_wins": 0}
+                )
                 agg["games"] += int(stats.get("games", 0))
                 agg["champion_wins"] += int(stats.get("champion_wins", 0))
             exploiter_games += int(result.get("exploiter_games", 0))
-            for engine, stats in dict(result.get("exploiter_per_engine_stats", {})).items():
+            for engine, stats in dict(
+                result.get("exploiter_per_engine_stats", {})
+            ).items():
                 agg = exploiter_engine_stats.setdefault(
                     engine, {"games": 0, "champion_wins": 0, "divergences": 0}
                 )
                 agg["games"] += int(stats.get("games", 0))
                 agg["champion_wins"] += int(stats.get("champion_wins", 0))
                 agg["divergences"] += int(stats.get("divergences", 0))
-            for topic, count in dict(result.get("exploiter_divergence_topics", {})).items():
-                exploiter_divergence_topics[topic] = exploiter_divergence_topics.get(topic, 0) + int(count)
+            for topic, count in dict(
+                result.get("exploiter_divergence_topics", {})
+            ).items():
+                exploiter_divergence_topics[topic] = exploiter_divergence_topics.get(
+                    topic, 0
+                ) + int(count)
         # A worker that crashed in _worker_entry's except-block (before, or
         # without, reaching run_worker_games's atomic manifest write) never
         # wrote a manifest.json -- referencing that nonexistent path here
@@ -1165,6 +1434,7 @@ def _merge_worker_summaries(
         # the field rather than AttributeError-ing.
         "exact_budget_sh": bool(getattr(args, "exact_budget_sh", False)),
         "exact_budget_sh_min_n": int(getattr(args, "exact_budget_sh_min_n", 0)),
+        "root_wave_batching": bool(getattr(args, "root_wave_batching", False)),
         "rust_featurize": bool(args.rust_featurize),
         "checkpoint": args.checkpoint,
         "base_seed": int(args.base_seed),
@@ -1181,14 +1451,20 @@ def _merge_worker_summaries(
         "opponent_pool_fraction_configured": opponent_pool_fraction_configured,
         "opponent_pool_games": int(opponent_pool_games) if opponent_pool_enabled else 0,
         "opponent_pool_fraction_realized": (
-            (opponent_pool_games / games_completed) if opponent_pool_enabled and games_completed else 0.0
+            (opponent_pool_games / games_completed)
+            if opponent_pool_enabled and games_completed
+            else 0.0
         ),
         "opponent_pool_versions_used": (
-            sorted(int(v) for v in opponent_pool_version_stats) if opponent_pool_enabled else []
+            sorted(int(v) for v in opponent_pool_version_stats)
+            if opponent_pool_enabled
+            else []
         ),
         "opponent_pool_per_version_champion_winrate": (
             {
-                version_str: (stats["champion_wins"] / stats["games"] if stats["games"] else 0.0)
+                version_str: (
+                    stats["champion_wins"] / stats["games"] if stats["games"] else 0.0
+                )
                 for version_str, stats in sorted(
                     opponent_pool_version_stats.items(), key=lambda item: int(item[0])
                 )
@@ -1198,17 +1474,25 @@ def _merge_worker_summaries(
         ),
         "opponent_mix_enabled": opponent_mix_enabled,
         "opponent_mix_manifest": getattr(args, "opponent_mix_manifest", None),
-        "opponent_mix_effective_weights": (opponent_mix_effective_weights or {}) if opponent_mix_enabled else {},
-        "opponent_mix_pool_games": int(opponent_mix_pool_games) if opponent_mix_enabled else 0,
+        "opponent_mix_effective_weights": (opponent_mix_effective_weights or {})
+        if opponent_mix_enabled
+        else {},
+        "opponent_mix_pool_games": int(opponent_mix_pool_games)
+        if opponent_mix_enabled
+        else 0,
         "opponent_mix_pool_fraction_realized": (
-            (opponent_mix_pool_games / games_completed) if opponent_mix_enabled and games_completed else 0.0
+            (opponent_mix_pool_games / games_completed)
+            if opponent_mix_enabled and games_completed
+            else 0.0
         ),
         "opponent_mix_tags_used": (
             sorted(opponent_mix_tag_stats) if opponent_mix_enabled else []
         ),
         "opponent_mix_per_tag_champion_winrate": (
             {
-                tag: (stats["champion_wins"] / stats["games"] if stats["games"] else 0.0)
+                tag: (
+                    stats["champion_wins"] / stats["games"] if stats["games"] else 0.0
+                )
                 for tag, stats in sorted(opponent_mix_tag_stats.items())
             }
             if opponent_mix_enabled
@@ -1227,13 +1511,16 @@ def _merge_worker_summaries(
         ),
         "exploiter_engines_used": sorted(exploiter_engine_stats),
         "exploiter_per_engine_stats": {
-            engine: dict(stats) for engine, stats in sorted(exploiter_engine_stats.items())
+            engine: dict(stats)
+            for engine, stats in sorted(exploiter_engine_stats.items())
         },
         "exploiter_per_engine_champion_winrate": {
             engine: (stats["champion_wins"] / stats["games"] if stats["games"] else 0.0)
             for engine, stats in sorted(exploiter_engine_stats.items())
         },
-        "exploiter_divergence_topics": dict(sorted(exploiter_divergence_topics.items())),
+        "exploiter_divergence_topics": dict(
+            sorted(exploiter_divergence_topics.items())
+        ),
         # Raw summed (games, champion_wins) per opponent version -- the un-divided
         # counts behind the winrate dict above. Exposed so downstream tools
         # (e.g. tools/run_exploit_probe.py's exploit-rate report) get exact

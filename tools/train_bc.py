@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 import io
 import json
 import math
+import operator
 import os
 from pathlib import Path
 import subprocess
@@ -3454,6 +3455,87 @@ class _MemmapFixedColumn:
         return arr.astype(dtype) if dtype is not None else arr
 
 
+class _ImplicitConstantColumn:
+    """File-free fixed-width column materialised only for requested rows."""
+
+    def __init__(self, n: int, inner_shape: tuple[int, ...], dtype, fill):
+        self._n = int(n)
+        self._inner_shape = tuple(int(d) for d in inner_shape)
+        self.dtype = np.dtype(dtype)
+        self._fill = fill
+        self.shape = (self._n, *self._inner_shape)
+        self.ndim = len(self.shape)
+
+    def __len__(self) -> int:
+        return self._n
+
+    def __getitem__(self, idx):
+        output_prefix = self._indexed_prefix_shape(idx)
+        if not output_prefix:
+            return np.full(self._inner_shape, self._fill, dtype=self.dtype)
+        return np.full(
+            (*output_prefix, *self._inner_shape), self._fill, dtype=self.dtype
+        )
+
+    def _indexed_prefix_shape(self, idx) -> tuple[int, ...]:
+        """Validate a row index and return NumPy's output prefix shape.
+
+        The column is constant, so reading the actual index values would be
+        wasted work, but accepting invalid indices would hide sampler bugs.
+        Validate bounds/boolean-mask length and preserve advanced-index shapes
+        without allocating an ``arange(row_count)`` for a large corpus.
+        """
+        if isinstance(idx, slice):
+            return (len(range(*idx.indices(self._n))),)
+
+        array = np.asarray(idx)
+        if array.ndim == 0:
+            if array.dtype.kind == "b":
+                # NumPy treats a scalar bool as an advanced index that inserts
+                # a leading 0/1 dimension while retaining the whole row axis.
+                return (int(bool(array)), self._n)
+            try:
+                value = operator.index(idx)
+            except TypeError:
+                try:
+                    value = operator.index(array.item())
+                except (TypeError, ValueError) as error:
+                    raise IndexError(
+                        "implicit column indices must be integers, slices, or "
+                        "integer/boolean arrays"
+                    ) from error
+            if not -self._n <= value < self._n:
+                raise IndexError(
+                    f"index {value} is out of bounds for axis 0 with size {self._n}"
+                )
+            return ()
+
+        if array.dtype.kind == "b":
+            if array.ndim != 1 or array.shape[0] != self._n:
+                raise IndexError(
+                    "boolean index did not match implicit column row axis; "
+                    f"axis has size {self._n} but mask shape is {array.shape}"
+                )
+            return (int(np.count_nonzero(array)),)
+
+        # NumPy accepts a literal empty list as an integer advanced index even
+        # though np.asarray([]) defaults to float64. Explicit floating arrays,
+        # including empty ones, remain invalid.
+        literal_empty_list = isinstance(idx, list) and array.size == 0
+        if array.dtype.kind not in {"i", "u"} and not literal_empty_list:
+            raise IndexError("arrays used as indices must be of integer or boolean type")
+        if array.size and bool(np.any((array < -self._n) | (array >= self._n))):
+            bad = int(array[(array < -self._n) | (array >= self._n)].flat[0])
+            raise IndexError(
+                f"index {bad} is out of bounds for axis 0 with size {self._n}"
+            )
+        return tuple(int(d) for d in array.shape)
+
+    def __array__(self, dtype=None):
+        arr = np.full(self.shape, self._fill, dtype=self.dtype)
+        return arr.astype(dtype) if dtype is not None else arr
+
+
 class _MemmapRaggedColumn:
     """Legal-action-ragged column stored trimmed on disk.
 
@@ -3531,12 +3613,56 @@ class MemmapCorpus:
                 "Build it with tools/build_memmap_corpus.py or use --data-format npz."
             )
         self.meta = json.loads(meta_path.read_text(encoding="utf-8"))
-        if self.meta.get("schema") != "memmap_corpus_v1":
+        if self.meta.get("schema") not in {"memmap_corpus_v1", "memmap_corpus_v2"}:
             raise SystemExit(f"{meta_path}: unsupported corpus schema {self.meta.get('schema')!r}")
         self.row_count = int(self.meta["row_count"])
         self.legal_width = int(self.meta["legal_width"])
         self.stats = self.meta.get("stats", {})
         self._columns = self.meta["columns"]
+        implicit_columns = {
+            name for name, schema in self._columns.items()
+            if schema.get("kind") == "implicit_constant"
+        }
+        declared_implicit_raw = self.meta.get("implicit_zero_columns", ())
+        try:
+            declared_implicit_columns = set(declared_implicit_raw)
+        except TypeError as error:
+            raise SystemExit(
+                f"{meta_path}: implicit_zero_columns must be a sequence of names"
+            ) from error
+        if implicit_columns != declared_implicit_columns:
+            raise SystemExit(
+                f"{meta_path}: implicit column metadata mismatch: "
+                f"columns={sorted(implicit_columns)} "
+                f"declared={sorted(declared_implicit_columns)}"
+            )
+        unsupported_implicit = implicit_columns - {"event_tokens", "event_mask"}
+        if unsupported_implicit:
+            raise SystemExit(
+                f"{meta_path}: unsupported implicit columns "
+                f"{sorted(unsupported_implicit)}"
+            )
+        if self.meta.get("schema") == "memmap_corpus_v2":
+            required_implicit = {"event_tokens", "event_mask"}
+            if (
+                implicit_columns != required_implicit
+                or len(declared_implicit_raw) != len(required_implicit)
+            ):
+                raise SystemExit(
+                    f"{meta_path}: memmap_corpus_v2 requires exactly implicit-zero "
+                    f"columns {sorted(required_implicit)}; got "
+                    f"{sorted(implicit_columns)}"
+                )
+            nonzero_fill = [
+                name
+                for name in sorted(required_implicit)
+                if self._columns[name].get("fill") != 0
+            ]
+            if nonzero_fill:
+                raise SystemExit(
+                    f"{meta_path}: implicit-zero columns must declare fill=0; "
+                    f"nonzero/missing fill for {nonzero_fill}"
+                )
         self._offsets = np.fromfile(corpus_dir / "row_offsets.dat", dtype=np.int64)
         if self._offsets.shape[0] != self.row_count + 1:
             raise SystemExit(
@@ -3567,6 +3693,19 @@ class MemmapCorpus:
                 else:
                     self._eager[name] = np.asarray(mm)
                 continue
+            if kind == "implicit_constant":
+                if self.meta.get("schema") != "memmap_corpus_v2":
+                    raise SystemExit(
+                        f"{meta_path}: implicit_constant column {name!r} requires "
+                        "memmap_corpus_v2"
+                    )
+                inner = tuple(int(d) for d in schema["inner_shape"])
+                self._lazy[name] = _ImplicitConstantColumn(
+                    self.row_count, inner, schema["dtype"], schema["fill"]
+                )
+                continue
+            if kind not in {"ragged2d", "ragged3d"}:
+                raise SystemExit(f"{meta_path}: unsupported storage kind {kind!r} for {name!r}")
             # ragged2d / ragged3d
             feat = int(schema["feat"]) if kind == "ragged3d" else None
             flat_shape = (int(self.meta["flat_count"]), feat) if feat is not None else (int(self.meta["flat_count"]),)
@@ -7196,7 +7335,13 @@ def _save_policy(
             model_state = policy.model.state_dict()
         if not is_rank0:
             return
-        _write_entity_checkpoint(policy, path, model_state, mask_hidden_info)
+        _write_entity_checkpoint(
+            policy,
+            path,
+            model_state,
+            mask_hidden_info,
+            soft_target_source=soft_target_source,
+        )
         return
 
     output = Path(path)
@@ -7221,10 +7366,23 @@ def _save_policy(
     # non-collective call, so this guard is safe even when every rank calls in).
     if not is_rank0:
         return
-    _write_entity_checkpoint(policy, path, policy.model.module.state_dict(), mask_hidden_info)
+    _write_entity_checkpoint(
+        policy,
+        path,
+        policy.model.module.state_dict(),
+        mask_hidden_info,
+        soft_target_source=soft_target_source,
+    )
 
 
-def _write_entity_checkpoint(policy, path: str, model_state: dict, mask_hidden_info: bool) -> None:
+def _write_entity_checkpoint(
+    policy,
+    path: str,
+    model_state: dict,
+    mask_hidden_info: bool,
+    *,
+    soft_target_source: str | None = None,
+) -> None:
     """Atomically write the durable name-keyed checkpoint dict shared by the DDP
     and FSDP save paths (mirrors EntityGraphPolicy.save's fields)."""
     import torch

@@ -16,7 +16,12 @@ _TOOLS_DIR = Path(__file__).resolve().parents[1] / "tools"
 if str(_TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(_TOOLS_DIR))
 
-from catan_zero.rl.entity_token_policy import EntityGraphConfig, EntityGraphPolicy
+import train_bc  # type: ignore  # noqa: E402
+
+from catan_zero.rl.entity_token_policy import (  # noqa: E402
+    EntityGraphConfig,
+    EntityGraphPolicy,
+)
 
 ACTION_SIZE = 8
 STATIC_FEATURE_SIZE = 4
@@ -60,3 +65,18 @@ def test_soft_target_source_defaults_to_empty_when_omitted(tmp_path):
     assert data["soft_target_source"] == ""
     # OPT-8 must not disturb the existing provenance field.
     assert data["mask_hidden_info"] is False
+
+
+def test_distributed_checkpoint_writer_records_soft_target_source(tmp_path):
+    path = tmp_path / "ddp_ckpt.pt"
+    policy = _tiny_policy()
+    train_bc._write_entity_checkpoint(
+        policy,
+        str(path),
+        policy.model.state_dict(),
+        True,
+        soft_target_source="policy",
+    )
+    data = _load_raw(path)
+    assert data["soft_target_source"] == "policy"
+    assert data["mask_hidden_info"] is True

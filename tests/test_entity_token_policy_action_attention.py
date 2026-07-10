@@ -245,3 +245,72 @@ def test_each_flag_alone_warm_starts_exactly(flags):
         ou = up(batch, return_q=True)
     for key in ("logits", "value", "final_vp", "q_values"):
         assert (ob[key] - ou[key]).abs().max().item() == 0.0, key
+
+
+def test_transport_filtered_entity_fields_are_exact_noop_with_all_optional_heads():
+    """EvalServer may omit only fields no current model variant consumes.
+
+    Exercise every optional forward branch together (including the target-id
+    consumers and Q head) so a future field dependency cannot silently make
+    the transport/device deny-lists unsafe.
+    """
+    import torch
+
+    from catan_zero.rl.entity_token_policy import (
+        EntityGraphPolicy,
+        _NON_MODEL_ENTITY_KEYS,
+    )
+    from catan_zero.search.eval_server import _NON_FORWARD_ENTITY_KEYS
+
+    assert _NON_FORWARD_ENTITY_KEYS == _NON_MODEL_ENTITY_KEYS - {
+        "legal_action_mask"
+    }
+
+    full_entity = _real_entity_batch(n_states=3)
+    context = full_entity.pop("legal_action_context")
+    assert _NON_FORWARD_ENTITY_KEYS <= full_entity.keys()
+    transport_entity = {
+        key: value
+        for key, value in full_entity.items()
+        if key not in _NON_FORWARD_ENTITY_KEYS
+    }
+
+    legal_mask = np.asarray(full_entity["legal_action_mask"], dtype=np.bool_)
+    legal_ids = np.full(legal_mask.shape, -1, dtype=np.int64)
+    for row in range(int(legal_mask.shape[0])):
+        width = int(legal_mask[row].sum())
+        legal_ids[row, :width] = np.arange(width, dtype=np.int64)
+
+    config = dataclasses.replace(
+        _base_config(),
+        value_uncertainty_head=True,
+        action_target_gather=True,
+        action_cross_attention_layers=2,
+        value_attention_pool=True,
+        value_categorical_bins=17,
+        value_categorical_truncation_class=True,
+        edge_policy_head=True,
+        aux_subgoal_heads=True,
+    )
+    policy = EntityGraphPolicy(
+        config,
+        np.zeros(
+            (int(config.action_size), int(config.static_action_feature_size)),
+            dtype=np.float32,
+        ),
+        seed=123,
+        device="cpu",
+    )
+    policy.model.eval()
+
+    with torch.inference_mode():
+        full_outputs = policy.forward_legal_np(
+            full_entity, legal_ids, context, return_q=True
+        )
+        filtered_outputs = policy.forward_legal_np(
+            transport_entity, legal_ids, context, return_q=True
+        )
+
+    assert full_outputs.keys() == filtered_outputs.keys()
+    for key in full_outputs:
+        assert torch.equal(full_outputs[key], filtered_outputs[key]), key

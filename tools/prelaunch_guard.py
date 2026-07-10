@@ -662,8 +662,10 @@ def guard_ledger_overlap(
     row to the ledger, then run guards), so by guard time this launch's OWN
     range is already in the ledger and would otherwise self-collide (the trap
     that forced --skip-guards on generation). Pass ``own_claim_label`` (a unique
-    substring of this launch's claim row, e.g. a claim id) and ledger rows whose
-    label contains it are treated as US, not a peer, and excluded from collision.
+    claim id) and only a ledger row carrying the exact whitespace-delimited
+    ``claim=<id>`` token is treated as US, not a peer, and excluded from
+    collision.  Substring matching is deliberately forbidden: claim ``abc``
+    must not exempt a peer carrying ``claim=abc-extra``.
     Peers still collide; the guard stays fail-closed on a genuinely overlapping
     OTHER claim."""
     requested = (int(base_seed), int(base_seed) + int(games))
@@ -688,11 +690,12 @@ def guard_ledger_overlap(
         rows = parse_seed_ledger(resolved)
     except OSError as error:
         return _fail("ledger_overlap", f"could not read seed ledger {resolved}: {error}")
+    own_claim_token = f"claim={own_claim_label}" if own_claim_label is not None else None
     collisions = [
         (start, end, label)
         for (start, end, label) in rows
         if _ranges_overlap(requested, (start, end))
-        and not (own_claim_label is not None and own_claim_label in label)
+        and not (own_claim_token is not None and own_claim_token in label.split())
     ]
     if collisions:
         rendered = "; ".join(

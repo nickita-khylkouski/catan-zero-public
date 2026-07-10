@@ -22,6 +22,7 @@ from audit_gumbel_pilot_shards import (  # noqa: E402
     PLAYER_NAMES,
     check_afterstate_targets_on_forced_roll,
     check_config_provenance,
+    check_game_seed_range,
     check_kl_improved_vs_prior,
     check_label_perspective,
     check_mix,
@@ -506,6 +507,22 @@ def test_truncation_rate_fails_above_threshold():
     assert result["truncated_fraction"] == pytest.approx(0.5)
 
 
+def test_game_seed_range_requires_exact_half_open_allocation():
+    rows = _make_game_rows(game_seed=100, num_decisions=2, winner="RED", terminated=True)
+    rows += _make_game_rows(game_seed=101, num_decisions=2, winner="BLUE", terminated=True)
+    arrays = _rows_list_to_arrays(rows)
+
+    assert check_game_seed_range(arrays, expected_range=(100, 102))["pass"]
+
+    missing = check_game_seed_range(arrays, expected_range=(100, 103))
+    assert not missing["pass"]
+    assert missing["missing_examples"] == [102]
+
+    unexpected = check_game_seed_range(arrays, expected_range=(101, 102))
+    assert not unexpected["pass"]
+    assert unexpected["unexpected_examples"] == [100]
+
+
 def test_weight_multipliers_accepts_correct_defaults():
     rows = _make_game_rows(
         game_seed=1,
@@ -647,3 +664,20 @@ def test_config_provenance_fails_when_workers_disagree(tmp_path: Path):
     result = check_config_provenance(shards_dir, expected={"c_scale": 0.1})
     assert not result["pass"]
     assert any("disagree" in failure for failure in result["failures"])
+
+
+def test_config_provenance_fails_when_expected_key_is_unrecorded(tmp_path: Path):
+    shards_dir = tmp_path / "shards"
+    _write_manifest_tree(shards_dir, num_workers=2)
+
+    result = check_config_provenance(
+        shards_dir,
+        expected={"c_scale": 0.1, "public_observation": True},
+    )
+
+    assert not result["pass"]
+    assert "public_observation" not in result["observed"]
+    assert any(
+        "public_observation" in failure and "no manifest recorded" in failure
+        for failure in result["failures"]
+    )

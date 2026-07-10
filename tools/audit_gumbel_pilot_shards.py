@@ -123,6 +123,9 @@ def check_config_provenance(
         if not values_seen and cli_args is not None and key in cli_args:
             values_seen = {cli_args[key]}
         if not values_seen:
+            failures.append(
+                f"{key}: expected {expected_value!r}, but no manifest recorded this key"
+            )
             continue
         observed[key] = sorted(values_seen) if len(values_seen) > 1 else next(iter(values_seen))
         if len(values_seen) > 1:
@@ -530,6 +533,54 @@ def check_truncation_rate(rows: dict[str, np.ndarray], *, threshold: float = 0.4
     }
 
 
+def check_game_seed_range(
+    rows: dict[str, np.ndarray], *, expected_range: tuple[int, int]
+) -> dict[str, Any]:
+    """Require distinct stored seeds to exactly cover one half-open allocation.
+
+    Decision rows legitimately repeat a game seed, so this compares unique
+    game IDs rather than treating row-level repetition as duplication.
+    """
+    start, end = expected_range
+    if start < 0 or end <= start:
+        raise ValueError(f"invalid expected seed range [{start}, {end})")
+    if "game_seed" not in rows:
+        return {
+            "check": "game_seed_range",
+            "pass": False,
+            "expected_range": [start, end],
+            "reason": "game_seed column is missing",
+        }
+
+    observed = sorted(int(seed) for seed in np.unique(rows["game_seed"]))
+    in_range = [seed for seed in observed if start <= seed < end]
+    unexpected = [seed for seed in observed if seed < start or seed >= end]
+    missing_count = (end - start) - len(in_range)
+    missing_examples: list[int] = []
+    cursor = start
+    for seed in in_range:
+        while cursor < seed and len(missing_examples) < 20:
+            missing_examples.append(cursor)
+            cursor += 1
+        cursor = seed + 1
+    while cursor < end and len(missing_examples) < 20:
+        missing_examples.append(cursor)
+        cursor += 1
+    return {
+        "check": "game_seed_range",
+        "pass": missing_count == 0 and not unexpected,
+        "expected_range": [start, end],
+        "expected_games": end - start,
+        "observed_unique_games": len(observed),
+        "observed_min": min(observed) if observed else None,
+        "observed_max": max(observed) if observed else None,
+        "missing_count": missing_count,
+        "unexpected_count": len(unexpected),
+        "missing_examples": missing_examples,
+        "unexpected_examples": unexpected[:20],
+    }
+
+
 def check_weight_multipliers(rows: dict[str, np.ndarray]) -> dict[str, Any]:
     """policy_weight_multiplier must be exactly 0 on every forced row (no
     search signal to imitate when there's no choice); value_weight_multiplier
@@ -649,6 +700,7 @@ def run_audit(
     reference_phase_counts: dict[str, int] | None,
     truncation_threshold: float = 0.40,
     expected_config: dict[str, Any] | None = None,
+    expected_seed_range: tuple[int, int] | None = None,
     is_forced_expected_range: tuple[float, float] = (0.40, 0.70),
 ) -> dict[str, Any]:
     shard_files = find_shard_files(shards_dir)
@@ -674,6 +726,8 @@ def run_audit(
         check_prior_policy_nondegenerate(rows),
         check_config_provenance(shards_dir, expected=expected_config),
     ]
+    if expected_seed_range is not None:
+        checks.append(check_game_seed_range(rows, expected_range=expected_seed_range))
     overall_pass = all(c["pass"] for c in checks if c["pass"] is not None)
     return {
         "shards_dir": str(shards_dir),
@@ -722,6 +776,14 @@ def main() -> None:
             "correctness check remains weight_multipliers, not this coarse band."
         ),
     )
+    parser.add_argument(
+        "--expected-seed-range",
+        default=None,
+        help=(
+            "Optional half-open START,END allocation. The audit fails unless the "
+            "distinct game_seed values exactly cover every seed in that range."
+        ),
+    )
     parser.add_argument("--out", default=None)
     args = parser.parse_args()
 
@@ -730,6 +792,10 @@ def main() -> None:
         reference_phase_counts = json.loads(Path(args.reference_phase_counts).read_text())
 
     expected_config = json.loads(args.expected_config) if args.expected_config else None
+    expected_seed_range = None
+    if args.expected_seed_range:
+        seed_start, seed_end = args.expected_seed_range.split(",")
+        expected_seed_range = (int(seed_start), int(seed_end))
     low_str, high_str = args.is_forced_expected_range.split(",")
     is_forced_expected_range = (float(low_str), float(high_str))
 
@@ -741,6 +807,7 @@ def main() -> None:
         reference_phase_counts=reference_phase_counts,
         truncation_threshold=args.truncation_threshold,
         expected_config=expected_config,
+        expected_seed_range=expected_seed_range,
         is_forced_expected_range=is_forced_expected_range,
     )
     print(json.dumps(report, indent=2, sort_keys=True, default=str))

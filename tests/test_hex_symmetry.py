@@ -35,13 +35,17 @@ def sym():
 @pytest.fixture(scope="module")
 def real_entity():
     """A real full-width opening placement root, rust-featurized (B=1)."""
+    pytest.importorskip("catanatron_rs")
     from catan_zero.search.rust_mcts import _require_rust_module
     from catan_zero.search.neural_rust_mcts import (
         rust_game_to_entity_batch,
         rust_policy_action_ids,
     )
 
-    rs = _require_rust_module()
+    try:
+        rs = _require_rust_module()
+    except RuntimeError as error:
+        pytest.skip(str(error))
     colors = ("RED", "BLUE")
     game = rs.Game.simple(list(colors), seed=1)
     legal = tuple(int(a) for a in game.playable_action_indices(list(colors), None))

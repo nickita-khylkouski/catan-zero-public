@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+import operator
 from pathlib import Path
 from typing import Any
 
@@ -39,6 +40,16 @@ ENTITY_POLICY_SCHEMA_VERSION = "entity_graph_policy_v1"
 # aux heads emit over exactly these index spaces.
 AUX_NUM_INTERSECTIONS = 54
 AUX_NUM_HEXES = 19
+
+_NON_MODEL_ENTITY_KEYS = frozenset(
+    {
+        "hex_vertex_ids",
+        "hex_edge_ids",
+        "edge_vertex_ids",
+        "event_target_ids",
+        "legal_action_mask",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -410,6 +421,7 @@ class EntityGraphNet:
                 # never feed value/policy, so main outputs stay bit-identical.
                 self.aux_subgoal_heads = bool(getattr(cfg, "aux_subgoal_heads", False))
                 if self.aux_subgoal_heads:
+
                     def _scalar_head() -> nn.Module:
                         return nn.Sequential(
                             nn.Linear(h, h),
@@ -432,14 +444,85 @@ class EntityGraphNet:
                     # 54 intersections / 19 hexes: fixed board sizes, matching the
                     # per-type target-id space verified in _gather_target_tokens and
                     # the shape asserts in _assert_entity_batch_shapes.
-                    self.aux_next_settlement_head = _categorical_head(AUX_NUM_INTERSECTIONS)
+                    self.aux_next_settlement_head = _categorical_head(
+                        AUX_NUM_INTERSECTIONS
+                    )
                     self.aux_robber_target_head = _categorical_head(AUX_NUM_HEXES)
 
-            def forward(self, batch: dict[str, Any], *, return_q: bool = False):
-                tokens, padding_mask = self._state_tokens(batch)
+            def forward(
+                self,
+                batch: dict[str, Any],
+                *,
+                return_q: bool = False,
+                event_token_limit: int | None = None,
+            ):
+                """Encode a state and score its legal actions.
+
+                ``event_token_limit`` is an opt-in static-shape control for
+                inference schedulers.  It may remove only a trailing suffix of
+                event positions that is masked for every row in the batch.  The
+                default keeps the historical full-width path unchanged.
+
+                Keeping state encoding and action scoring as two explicit calls
+                lets inference runtimes capture/compile the expensive fixed
+                state trunk independently of the variable legal-action head.
+                """
+                encoded_state = self.encode_state(
+                    batch,
+                    event_token_limit=event_token_limit,
+                )
+                return self.score_actions(
+                    encoded_state,
+                    batch,
+                    return_q=return_q,
+                )
+
+            def encode_state(
+                self,
+                batch: dict[str, Any],
+                *,
+                event_token_limit: int | None = None,
+            ):
+                """Run the typed-token transformer trunk.
+
+                The returned tuple is intentionally tensor-only and stable:
+                ``(tokens, padding_mask, state)``.  That makes this boundary
+                suitable for a future static-shape CUDA graph without adding
+                wrapper objects or changing the checkpoint parameter set.
+                """
+                if event_token_limit is not None:
+                    if isinstance(event_token_limit, bool):
+                        raise TypeError(
+                            "event_token_limit must be an integer, not bool"
+                        )
+                    try:
+                        event_token_limit = operator.index(event_token_limit)
+                    except TypeError as error:
+                        raise TypeError(
+                            "event_token_limit must be an integer"
+                        ) from error
+                    self._validate_event_token_limit(
+                        batch,
+                        event_token_limit=event_token_limit,
+                    )
+                tokens, padding_mask = self._state_tokens(
+                    batch,
+                    event_token_limit=event_token_limit,
+                )
                 for block in self.blocks:
                     tokens = block(tokens, key_padding_mask=padding_mask)
                 state = self.state_norm(tokens[:, 0])
+                return tokens, padding_mask, state
+
+            def score_actions(
+                self,
+                encoded_state,
+                batch: dict[str, Any],
+                *,
+                return_q: bool = False,
+            ):
+                """Score legal actions and emit value heads from encoded state."""
+                tokens, padding_mask, state = encoded_state
                 action_features = torch.cat(
                     (
                         batch["legal_action_tokens"].float(),
@@ -468,7 +551,9 @@ class EntityGraphNet:
                 policy_state = torch.nn.functional.normalize(state, dim=-1)
                 policy_actions = torch.nn.functional.normalize(encoded_actions, dim=-1)
                 logit_scale = torch.clamp(self.logit_scale.exp(), max=50.0)
-                logits = logit_scale * (policy_state.unsqueeze(1) * policy_actions).sum(dim=-1)
+                logits = logit_scale * (policy_state.unsqueeze(1) * policy_actions).sum(
+                    dim=-1
+                )
                 logits = logits + self.action_bias(action_features).squeeze(-1)
                 if self.edge_policy_head:
                     # AlphaGateau per-move readout: a direct logit from each
@@ -514,10 +599,16 @@ class EntityGraphNet:
                     # CAT-100 auxiliary subgoal predictions. Raw logits/scalars
                     # (loss applies BCE-with-logits / CE / MSE at the train site).
                     # These never feed value/policy, so main outputs are unchanged.
-                    outputs["aux_longest_road"] = self.aux_longest_road_head(state).squeeze(-1)
-                    outputs["aux_largest_army"] = self.aux_largest_army_head(state).squeeze(-1)
+                    outputs["aux_longest_road"] = self.aux_longest_road_head(
+                        state
+                    ).squeeze(-1)
+                    outputs["aux_largest_army"] = self.aux_largest_army_head(
+                        state
+                    ).squeeze(-1)
                     outputs["aux_vp_in_n"] = self.aux_vp_in_n_head(state).squeeze(-1)
-                    outputs["aux_next_settlement"] = self.aux_next_settlement_head(state)
+                    outputs["aux_next_settlement"] = self.aux_next_settlement_head(
+                        state
+                    )
                     outputs["aux_robber_target"] = self.aux_robber_target_head(state)
                 if return_q:
                     state_expanded = state.unsqueeze(1).expand_as(encoded_actions)
@@ -532,9 +623,67 @@ class EntityGraphNet:
                     outputs["q_values"] = self.q_head(q_features).squeeze(-1)
                 return outputs
 
-            def _state_tokens(self, batch: dict[str, Any]):
+            def _validate_event_token_limit(
+                self,
+                batch: dict[str, Any],
+                *,
+                event_token_limit: int,
+            ):
+                """Ensure a requested event prefix retains every valid event.
+
+                This validates the scheduler-provided bucket boundary before
+                changing the sequence shape. Validation may synchronize when
+                the mask lives on CUDA; a captured production path should crop
+                the host batch first and call ``encode_state`` without this
+                option, leaving only static tensor shapes inside the graph.
+                """
+                event_mask = batch["event_mask"].bool()
+                padded_width = int(event_mask.shape[1])
+                if not 0 <= event_token_limit <= padded_width:
+                    raise ValueError(
+                        "event_token_limit must be within the padded event width: "
+                        f"{event_token_limit} not in [0, {padded_width}]"
+                    )
+                if event_token_limit == padded_width:
+                    return
+                omitted_mask = event_mask[:, event_token_limit:]
+                if bool(omitted_mask.any().item()):
+                    raise ValueError(
+                        "event_token_limit would remove at least one unmasked "
+                        f"event token: limit={event_token_limit} width={padded_width}"
+                    )
+
+            def _state_tokens(
+                self,
+                batch: dict[str, Any],
+                *,
+                event_token_limit: int | None = None,
+            ):
                 import torch
 
+                event_tokens = batch["event_tokens"]
+                event_mask = batch["event_mask"]
+                if event_token_limit is not None:
+                    event_tokens = event_tokens[:, :event_token_limit]
+                    event_mask = event_mask[:, :event_token_limit]
+                # The event0 inference path has no event elements to encode.
+                # Calling the MLP on [B, 0, F] is mathematically empty but still
+                # launches its Linear/LayerNorm/GELU kernels.  Construct the
+                # identical empty output directly, preserving dtype/device and
+                # the final hidden width without changing any non-empty path.
+                if event_tokens.shape[1] == 0:
+                    event_piece = self.type_embedding.new_empty(
+                        (
+                            event_tokens.shape[0],
+                            0,
+                            self.type_embedding.shape[1],
+                        )
+                    )
+                else:
+                    event_piece = (
+                        self.event_encoder(event_tokens.float())
+                        + self.type_embedding[6].view(1, 1, -1)
+                    )
                 pieces = [
                     self.cls_token.expand(batch["hex_tokens"].shape[0], -1, -1)
                     + self.type_embedding[0].view(1, 1, -1),
@@ -548,8 +697,7 @@ class EntityGraphNet:
                     + self.type_embedding[4].view(1, 1, -1),
                     self.global_encoder(batch["global_tokens"].float())
                     + self.type_embedding[5].view(1, 1, -1),
-                    self.event_encoder(batch["event_tokens"].float())
-                    + self.type_embedding[6].view(1, 1, -1),
+                    event_piece,
                 ]
                 tokens = torch.cat(pieces, dim=1)
                 # Keep the symbolic batch dim (do NOT coerce to a Python int): under
@@ -559,13 +707,17 @@ class EntityGraphNet:
                 # fan-outs / action counts); in eager mode this is an int anyway.
                 batch_size = tokens.shape[0]
                 masks = [
-                    torch.zeros((batch_size, 1), dtype=torch.bool, device=tokens.device),
+                    torch.zeros(
+                        (batch_size, 1), dtype=torch.bool, device=tokens.device
+                    ),
                     ~batch["hex_mask"].bool(),
                     ~batch["vertex_mask"].bool(),
                     ~batch["edge_mask"].bool(),
                     ~batch["player_mask"].bool(),
-                    torch.zeros((batch_size, 1), dtype=torch.bool, device=tokens.device),
-                    ~batch["event_mask"].bool(),
+                    torch.zeros(
+                        (batch_size, 1), dtype=torch.bool, device=tokens.device
+                    ),
+                    ~event_mask.bool(),
                 ]
                 return tokens, torch.cat(masks, dim=1)
 
@@ -622,7 +774,9 @@ class EntityGraphNet:
                     flat_index.unsqueeze(-1).expand(-1, -1, width),
                 ).reshape(batch_size, num_actions, 4, width)
                 weight = valid.to(gathered.dtype).unsqueeze(-1)  # [B, A, 4, 1]
-                pooled = (gathered * weight).sum(dim=2) / weight.sum(dim=2).clamp_(min=1.0)
+                pooled = (gathered * weight).sum(dim=2) / weight.sum(dim=2).clamp_(
+                    min=1.0
+                )
                 return pooled  # [B, A, h]
 
             def _value_pool(self, state, tokens, padding_mask):
@@ -661,6 +815,44 @@ def _token_encoder(input_size: int, hidden_size: int, dropout: float):
         nn.Dropout(float(dropout)),
         nn.Linear(int(hidden_size), int(hidden_size)),
     )
+
+
+def event_batch_shape_telemetry(event_mask: Any) -> dict[str, int | float]:
+    """Summarize host-side event occupancy for static bucket selection.
+
+    ``required_event_width`` is the smallest prefix that retains every valid
+    event in the batch and can be passed to ``EntityGraphNet.forward`` or
+    ``encode_state`` as ``event_token_limit``.  This helper is intentionally
+    outside the model forward so telemetry never introduces a device sync into
+    the default inference path.
+    """
+    if hasattr(event_mask, "detach"):
+        event_mask = event_mask.detach().cpu().numpy()
+    mask = np.asarray(event_mask, dtype=np.bool_)
+    if mask.ndim != 2:
+        raise ValueError(f"event_mask must be rank 2, got {mask.shape}")
+
+    batch_size, padded_width = (int(mask.shape[0]), int(mask.shape[1]))
+    if padded_width == 0:
+        row_widths = np.zeros((batch_size,), dtype=np.int64)
+    else:
+        column_ids = np.arange(1, padded_width + 1, dtype=np.int64)
+        row_widths = np.where(mask, column_ids[None, :], 0).max(axis=1, initial=0)
+    required_width = int(row_widths.max()) if batch_size else 0
+    min_row_width = int(row_widths.min()) if batch_size else 0
+    active_tokens = int(mask.sum())
+    total_tokens = batch_size * padded_width
+    return {
+        "batch_size": batch_size,
+        "padded_event_width": padded_width,
+        "required_event_width": required_width,
+        "min_row_event_width": min_row_width,
+        "max_row_event_width": required_width,
+        "active_event_tokens": active_tokens,
+        "event_token_utilization": (
+            float(active_tokens / total_tokens) if total_tokens else 0.0
+        ),
+    }
 
 
 class EntityGraphPolicy:
@@ -748,16 +940,30 @@ class EntityGraphPolicy:
             legal_action_context,
             self.config,
         )
+        # Topology/annotation fields are carried by the feature batch for
+        # symmetry and shard-writing code but are not model inputs.  Shape
+        # validation above still checks legal_action_mask; omitting these known
+        # unused fields here avoids five small synchronous H2D launches per
+        # inference window on CUDA; base checkpoints also skip action target
+        # ids when neither target-aware policy head is enabled.
+        needs_action_targets = bool(
+            getattr(self.config, "action_target_gather", False)
+            or getattr(self.config, "edge_policy_head", False)
+        )
         batch = {
             key: torch.as_tensor(value, device=self.device)
             for key, value in entity_batch.items()
+            if key not in _NON_MODEL_ENTITY_KEYS
+            and (key != "legal_action_target_ids" or needs_action_targets)
         }
         batch["legal_action_context"] = torch.as_tensor(
             legal_action_context,
             dtype=torch.float32,
             device=self.device,
         )
-        action_ids = torch.as_tensor(legal_action_ids, dtype=torch.long, device=self.device)
+        action_ids = torch.as_tensor(
+            legal_action_ids, dtype=torch.long, device=self.device
+        )
         outputs = self.model(batch, return_q=return_q)
         valid = action_ids >= 0
         outputs["logits"] = outputs["logits"].masked_fill(~valid, -1.0e9)
@@ -787,7 +993,9 @@ class EntityGraphPolicy:
             )
             logits = outputs["logits"].squeeze(0)
             if training:
-                column = int(torch.distributions.Categorical(logits=logits).sample().item())
+                column = int(
+                    torch.distributions.Categorical(logits=logits).sample().item()
+                )
             else:
                 column = int(torch.argmax(logits, dim=-1).item())
         return int(valid_actions[column])
@@ -848,7 +1056,9 @@ class EntityGraphPolicy:
     ) -> np.ndarray:
         import torch
 
-        actions = tuple(int(action) for action in (valid_actions or info["valid_actions"]))
+        actions = tuple(
+            int(action) for action in (valid_actions or info["valid_actions"])
+        )
         if not actions:
             return np.zeros(0, dtype=np.float32)
         with torch.no_grad():
@@ -881,7 +1091,9 @@ class EntityGraphPolicy:
                 f"{entity['legal_action_tokens'].shape[0]} != {len(valid_actions)}"
             )
         context_table = build_action_context_feature_table(env, info)
-        legal_context = np.asarray(context_table, dtype=np.float32)[list(valid_actions), :]
+        legal_context = np.asarray(context_table, dtype=np.float32)[
+            list(valid_actions), :
+        ]
         entity_batch = {
             key: np.asarray(value)[None, ...]
             for key, value in entity.items()
@@ -915,7 +1127,9 @@ class EntityGraphPolicy:
                 # dataclass itself -- positional state is crash/shift-prone across
                 # field-list changes. Loaders accept both this and legacy pickles.
                 "config": config_to_dict(self.config),
-                "action_mask_version": str(getattr(self.config, "action_mask_version", "")),
+                "action_mask_version": str(
+                    getattr(self.config, "action_mask_version", "")
+                ),
                 # f72 safety net (task #76): whether train_bc.py --mask-hidden-info
                 # was used for this training run. Absent/False on any checkpoint
                 # predating this field (legacy checkpoints deserialize as
@@ -927,7 +1141,9 @@ class EntityGraphPolicy:
                 # degenerate-target footgun). Empty string on checkpoints predating
                 # this field. report.json also carries it; this makes the
                 # checkpoint self-describing without the sidecar.
-                "soft_target_source": str(soft_target_source) if soft_target_source is not None else "",
+                "soft_target_source": str(soft_target_source)
+                if soft_target_source is not None
+                else "",
                 "static_action_features_sha256": _array_sha256(
                     self.static_action_features.detach().cpu().numpy()
                 ),
@@ -980,22 +1196,33 @@ class EntityGraphPolicy:
                 raise ValueError(
                     f"{checkpoint} config is {type(config).__name__}, expected EntityGraphConfig"
                 )
-            if str(getattr(config, "schema_version", "") or "") != ENTITY_POLICY_SCHEMA_VERSION:
+            if (
+                str(getattr(config, "schema_version", "") or "")
+                != ENTITY_POLICY_SCHEMA_VERSION
+            ):
                 raise ValueError(
                     f"{checkpoint} entity policy schema mismatch: "
                     f"{getattr(config, 'schema_version', '')!r} != {ENTITY_POLICY_SCHEMA_VERSION!r}"
                 )
-            if int(getattr(config, "legal_action_feature_size", 0)) != LEGAL_ACTION_FEATURE_SIZE:
+            if (
+                int(getattr(config, "legal_action_feature_size", 0))
+                != LEGAL_ACTION_FEATURE_SIZE
+            ):
                 raise ValueError(
                     f"{checkpoint} legal_action_feature_size mismatch: "
                     f"{getattr(config, 'legal_action_feature_size', None)} != {LEGAL_ACTION_FEATURE_SIZE}"
                 )
-            if int(getattr(config, "context_action_feature_size", 0)) != CONTEXT_ACTION_FEATURE_SIZE:
+            if (
+                int(getattr(config, "context_action_feature_size", 0))
+                != CONTEXT_ACTION_FEATURE_SIZE
+            ):
                 raise ValueError(
                     f"{checkpoint} context_action_feature_size mismatch: "
                     f"{getattr(config, 'context_action_feature_size', None)} != {CONTEXT_ACTION_FEATURE_SIZE}"
                 )
-            expected_static_hash = str(data.get("static_action_features_sha256", "") or "")
+            expected_static_hash = str(
+                data.get("static_action_features_sha256", "") or ""
+            )
             if expected_static_hash:
                 actual_static_hash = _array_sha256(np.asarray(static, dtype=np.float32))
                 if actual_static_hash != expected_static_hash:
@@ -1011,7 +1238,9 @@ class EntityGraphPolicy:
         # requested against a checkpoint that doesn't report having been trained
         # for it, so an old/legacy checkpoint correctly fails closed rather than
         # silently running mismatched.
-        policy.trained_with_masked_hidden_info = bool(data.get("mask_hidden_info", False))
+        policy.trained_with_masked_hidden_info = bool(
+            data.get("mask_hidden_info", False)
+        )
         missing, unexpected = policy.model.load_state_dict(data["model"], strict=False)
         # Optional aux heads and the f69 action-attention upgrade params are all
         # absent from checkpoints that predate them, so their freshly-initialised

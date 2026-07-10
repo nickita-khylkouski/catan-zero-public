@@ -41,6 +41,7 @@ from __future__ import annotations
 import json
 import math
 import random
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -282,6 +283,16 @@ class GumbelChanceMCTSConfig:
     # at or above the threshold (0 = always apply when exact_budget_sh=True).
     exact_budget_sh: bool = False
     exact_budget_sh_min_n: int = 0
+    # Batch one ready neural leaf from each independent forced root candidate
+    # during a Sequential-Halving visit wave. Every candidate keeps its own
+    # deterministic RNG stream and receives exactly the schedule's visit budget.
+    # The independent streams intentionally change which random chance samples
+    # are assigned to each candidate (and the later high-temperature action draw),
+    # so this is a statistically equivalent scheduling candidate rather than a
+    # bit-identical rewrite. Default OFF retains the legacy action-major traversal
+    # and RNG ordering while the batched path is strength-gated on production
+    # checkpoints.
+    root_wave_batching: bool = False
     # Completed-Q sigma transform (ported verbatim from mctx's
     # qtransform_completed_by_mix_value, see `_rescale_completed_q` +
     # `_improved_policy`): sigma(q) = (c_visit + max_visits) * c_scale *
@@ -623,6 +634,20 @@ class _GNode:
         return self.value_sum / float(self.visits)
 
 
+@dataclass(slots=True)
+class _PendingSimulation:
+    """A selected leaf whose neural evaluation has not run yet.
+
+    ``finish`` expands the leaf and performs every deferred backup on its path.
+    Selection and game mutation stay serial and deterministic; only evaluator
+    calls from independent root candidates are coalesced.
+    """
+
+    node: _GNode
+    legal_actions: tuple[int, ...]
+    finish: Callable[[Any], float]
+
+
 def _split_evaluation(result: Any) -> tuple[Any, float, float]:
     """Unpack an evaluator result into (priors, value, uncertainty).
 
@@ -637,6 +662,34 @@ def _split_evaluation(result: Any) -> tuple[Any, float, float]:
     value = result[1]
     uncertainty = float(result[2]) if len(result) > 2 else 0.0
     return priors, value, uncertainty
+
+
+def _evaluate_many_checked(
+    evaluator: Any,
+    requests: list[tuple[Any, tuple[int, ...]]],
+    *,
+    root_color: str,
+    colors: tuple[str, ...],
+) -> list[Any]:
+    """Materialize and cardinality-check one evaluator batch atomically.
+
+    Callers must validate the complete response before expanding any child or
+    applying any backup. Otherwise a short iterator silently leaves children
+    at fabricated default values while a long iterator silently drops results.
+    """
+    results = list(
+        evaluator.evaluate_many(
+            requests,
+            root_color=root_color,
+            colors=colors,
+        )
+    )
+    if len(results) != len(requests):
+        raise RuntimeError(
+            "evaluate_many returned "
+            f"{len(results)} results for {len(requests)} requests"
+        )
+    return results
 
 
 class GumbelChanceMCTS:
@@ -867,6 +920,15 @@ class GumbelChanceMCTS:
             legal, key=lambda action_id: gumbel[action_id] + logits.get(action_id, 0.0), reverse=True
         )[:m]
         remaining = list(top_k)
+        candidate_rngs: dict[int, random.Random] | None = None
+        if bool(self.config.root_wave_batching):
+            # Draw the per-candidate seeds in the stable top-k order. Separate
+            # streams make the result reproducible even though root-wave
+            # scheduling interleaves candidates instead of exhausting one
+            # candidate before starting the next.
+            candidate_rngs = {
+                action_id: random.Random(self.rng.getrandbits(64)) for action_id in top_k
+            }
 
         if bool(self.config.exact_budget_sh) and n_simulations >= int(
             self.config.exact_budget_sh_min_n
@@ -880,10 +942,14 @@ class GumbelChanceMCTS:
             used = 0
             for count, budget in exact_budget_sh_phases(m, n_simulations):
                 visit = remaining[:count]
-                for action_id in visit:
+                if candidate_rngs is None:
+                    for action_id in visit:
+                        for _ in range(budget):
+                            self._simulate(root, depth=0, forced_action=action_id)
+                            used += 1
+                else:
                     for _ in range(budget):
-                        self._simulate(root, depth=0, forced_action=action_id)
-                        used += 1
+                        used += self._run_root_wave(root, visit, candidate_rngs)
                 completed_q = self._completed_q(root)
                 rescaled_q = self._rescaled_completed_q(root, completed_q)
                 scale = self._sigma_scale(root)
@@ -903,10 +969,14 @@ class GumbelChanceMCTS:
 
         used = 0
         for count, budget in schedule:
-            for action_id in remaining:
+            if candidate_rngs is None:
+                for action_id in remaining:
+                    for _ in range(budget):
+                        self._simulate(root, depth=0, forced_action=action_id)
+                        used += 1
+            else:
                 for _ in range(budget):
-                    self._simulate(root, depth=0, forced_action=action_id)
-                    used += 1
+                    used += self._run_root_wave(root, remaining, candidate_rngs)
             completed_q = self._completed_q(root)
             rescaled_q = self._rescaled_completed_q(root, completed_q)
             scale = self._sigma_scale(root)
@@ -924,6 +994,56 @@ class GumbelChanceMCTS:
 
         final_action = remaining[0] if remaining else top_k[0]
         return int(final_action), used
+
+    def _run_root_wave(
+        self,
+        root: _GNode,
+        action_ids: list[int],
+        candidate_rngs: dict[int, random.Random],
+    ) -> int:
+        """Run one visit for every independent root candidate.
+
+        Selection is performed in candidate order with one persistent RNG per
+        candidate. Ready leaves are evaluated together, then completed in the
+        same order. Exact chance nodes retain their existing enumeration and
+        expectation-backup behavior; if encountered during selection, that
+        candidate completes synchronously while other ready leaves still batch.
+        """
+        pending: list[_PendingSimulation] = []
+        outer_rng = self.rng
+        try:
+            for action_id in action_ids:
+                self.rng = candidate_rngs[action_id]
+                selected = self._prepare_simulation(
+                    root, depth=0, forced_action=action_id
+                )
+                if isinstance(selected, _PendingSimulation):
+                    pending.append(selected)
+        finally:
+            self.rng = outer_rng
+
+        if pending:
+            requests = [(item.node.game, item.legal_actions) for item in pending]
+            if len(pending) > 1 and hasattr(self.evaluator, "evaluate_many"):
+                results = _evaluate_many_checked(
+                    self.evaluator,
+                    requests,
+                    root_color=root.root_color,
+                    colors=self.config.colors,
+                )
+            else:
+                results = [
+                    self.evaluator.evaluate(
+                        game,
+                        legal_actions,
+                        root_color=root.root_color,
+                        colors=self.config.colors,
+                    )
+                    for game, legal_actions in requests
+                ]
+            for item, result in zip(pending, results):
+                item.finish(result)
+        return len(action_ids)
 
     def _sample_gumbel(self) -> float:
         uniform = min(max(self.rng.random(), 1.0e-12), 1.0 - 1.0e-12)
@@ -1186,6 +1306,137 @@ class GumbelChanceMCTS:
             for index, child in stats.children.items()
         )
 
+    def _prepare_simulation(
+        self, node: _GNode, *, depth: int, forced_action: int | None = None
+    ) -> float | _PendingSimulation:
+        """Select one simulation and stop at the next neural leaf.
+
+        This is the split-phase counterpart of ``_simulate`` used only by the
+        flag-gated root-wave scheduler. Full-enumeration chance actions keep the
+        established synchronous traversal because one logical chance expansion
+        may itself require several neural rows and its expectation backup must
+        observe all children together.
+        """
+        winner = node.game.winning_color()
+        if winner is not None:
+            return 1.0 if str(winner) == node.root_color else -1.0
+
+        if depth >= int(self.config.max_depth):
+            if not node.expanded:
+                return self._pending_expansion(node, record_leaf_visit=False)
+            return node.prior_value
+
+        if not node.expanded:
+            if self._expand_forced(node):
+                return self._prepare_simulation(
+                    node, depth=depth, forced_action=forced_action
+                )
+            return self._pending_expansion(node, record_leaf_visit=True)
+
+        if not node.actions:
+            value = node.prior_value
+            node.visits += 1
+            node.value_sum += value
+            return value
+
+        if forced_action is not None:
+            action_id = forced_action
+            stats = node.actions[action_id]
+        else:
+            action_id, stats = self._select_nonroot_action(node)
+
+        action_json = node.action_json[action_id]
+        if _action_type(action_json) == "ROLL" and not (
+            bool(self.config.lazy_interior_chance) and depth > 0
+        ):
+            value = self._traverse_roll(node, action_id, stats, depth)
+        elif is_move_robber_with_victim(action_json) or _action_type(
+            action_json
+        ) == "BUY_DEVELOPMENT_CARD":
+            value = self._traverse_robber_or_dev(node, action_id, stats, depth)
+        else:
+            return self._prepare_single_sample(node, action_id, stats, depth)
+
+        node.visits += 1
+        node.value_sum += value
+        return value
+
+    def _pending_expansion(
+        self, node: _GNode, *, record_leaf_visit: bool
+    ) -> _PendingSimulation:
+        legal_actions, action_json_by_id, spectrum_by_id = self._fetch_legal_actions(
+            node.game
+        )
+
+        def finish(result: Any) -> float:
+            priors, value, uncertainty = _split_evaluation(result)
+            value = self._finish_expand(
+                node,
+                legal_actions,
+                action_json_by_id,
+                spectrum_by_id,
+                priors,
+                value,
+                uncertainty,
+            )
+            if record_leaf_visit:
+                node.visits += 1
+                node.value_sum += value
+            return value
+
+        return _PendingSimulation(
+            node=node,
+            legal_actions=legal_actions,
+            finish=finish,
+        )
+
+    def _prepare_single_sample(
+        self, node: _GNode, action_id: int, stats: _GAction, depth: int
+    ) -> float | _PendingSimulation:
+        action_json = node.action_json[action_id]
+        if not stats.probabilities:
+            cached_spectrum = node.action_spectrum.get(action_id)
+            outcomes = (
+                cached_spectrum
+                if cached_spectrum is not None
+                else _spectrum(node.game, action_json)
+            )
+            node.action_spectrum.setdefault(action_id, outcomes)
+            stats.probabilities = dict(outcomes)
+
+        outcome_index = self._sample_outcome(tuple(stats.probabilities.items()))
+        child = stats.children.get(outcome_index)
+        if child is None:
+            child_game = node.game.apply_chance_outcome(
+                json.dumps(action_json), outcome_index
+            )
+            child = _GNode(game=child_game, root_color=node.root_color)
+            stats.children[outcome_index] = child
+
+        selected = self._prepare_simulation(child, depth=depth + 1)
+
+        def backup(value: float) -> float:
+            stats.visits += 1
+            stats.value_sum += value
+            stats.value_sq_sum += value * value
+            if self.config.uncertainty_backup_weighting:
+                self._accumulate_backup_weight(
+                    stats, value, child.prior_uncertainty
+                )
+            node.visits += 1
+            node.value_sum += value
+            return value
+
+        if isinstance(selected, _PendingSimulation):
+            finish_child = selected.finish
+
+            def finish(result: Any) -> float:
+                return backup(finish_child(result))
+
+            selected.finish = finish
+            return selected
+        return backup(selected)
+
     def _simulate(self, node: _GNode, *, depth: int, forced_action: int | None = None) -> float:
         winner = node.game.winning_color()
         if winner is not None:
@@ -1299,8 +1550,11 @@ class GumbelChanceMCTS:
         if can_batch_evaluate:
             contexts = {index: self._fetch_legal_actions(child.game) for index, child in children.items()}
             requests = [(child.game, contexts[index][0]) for index, child in children.items()]
-            batch_results = self.evaluator.evaluate_many(
-                requests, root_color=root_color, colors=self.config.colors
+            batch_results = _evaluate_many_checked(
+                self.evaluator,
+                requests,
+                root_color=root_color,
+                colors=self.config.colors,
             )
             for (index, child), result in zip(children.items(), batch_results):
                 priors, value, uncertainty = _split_evaluation(result)
@@ -1418,8 +1672,11 @@ class GumbelChanceMCTS:
         if can_batch_evaluate:
             contexts = {index: self._fetch_legal_actions(child.game) for index, child in children.items()}
             requests = [(child.game, contexts[index][0]) for index, child in children.items()]
-            batch_results = self.evaluator.evaluate_many(
-                requests, root_color=root_color, colors=self.config.colors
+            batch_results = _evaluate_many_checked(
+                self.evaluator,
+                requests,
+                root_color=root_color,
+                colors=self.config.colors,
             )
             for (index, child), result in zip(children.items(), batch_results):
                 priors, value, uncertainty = _split_evaluation(result)

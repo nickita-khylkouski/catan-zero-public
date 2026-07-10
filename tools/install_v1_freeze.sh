@@ -1,18 +1,20 @@
 #!/usr/bin/env bash
 # ============================================================================
-# catan-zero v1.0-deploy — one-command install (CAT-117)
+# catan-zero frozen-release installer (CAT-117)
 # Single deploy path for BOTH arches (H100 cu128 / A100 cu128). Replaces the
 # non-git tarball snapshot layout with: git clone + checkout the frozen tag +
 # a reproducible venv. Idempotent; safe to re-run.
 #
-#   curl -fsSL https://raw.githubusercontent.com/nickita-khylkouski/catan-zero-public/v1.0-deploy/tools/install_v1_freeze.sh | bash
-#   # or: bash tools/install_v1_freeze.sh
+#   CATAN_REF=<published-h100-release> bash tools/install_v1_freeze.sh
 #
 # Overridable via env:
 #   CATAN_REPO   git URL, OR a local git-bundle path (default GitHub PUBLIC repo
 #                nickita-khylkouski/catan-zero-public; a bundle file works as-is
 #                with `git clone` for an offline/air-gapped fallback)
-#   CATAN_REF    tag/branch to deploy (default v1.0-deploy)
+#   CATAN_REF    REQUIRED immutable release tag to deploy. A commit SHA is also
+#                accepted only when CATAN_RS_WHEEL names an already-staged wheel;
+#                GitHub's automatic wheel fetch is release-tag based. There is no
+#                stale fallback: v1.0-deploy predates the H100 hardening.
 #   CATAN_DEST   checkout dir (default ~/catan-zero-v1)
 #   CATAN_RS_WHEEL  catanatron_rs 0.1.3 cp311 manylinux wheel (pip can't fetch it;
 #                if unset/absent, auto-downloaded from the CATAN_REF release assets)
@@ -26,11 +28,17 @@
 set -euo pipefail
 
 CATAN_REPO="${CATAN_REPO:-https://github.com/nickita-khylkouski/catan-zero-public}"
-CATAN_REF="${CATAN_REF:-v1.0-deploy}"
+CATAN_REF="${CATAN_REF:-}"
 CATAN_DEST="${CATAN_DEST:-$HOME/catan-zero-v1}"
 CATAN_RS_WHEEL="${CATAN_RS_WHEEL:-$HOME/bundle/catanatron_rs-0.1.3-cp311-cp311-manylinux_2_34_x86_64.whl}"
 TORCH_INDEX="${TORCH_INDEX:-https://download.pytorch.org/whl/cu128}"
 PY="${PY:-python3.11}"
+
+if [ -z "$CATAN_REF" ]; then
+  echo "[install] ERROR: CATAN_REF is required; v1.0-deploy predates the current H100 launcher/lifecycle fixes." >&2
+  echo "          Publish this verified tree as an immutable release tag, then rerun with CATAN_REF=<that-tag>." >&2
+  exit 2
+fi
 
 echo "[install] repo=$CATAN_REPO ref=$CATAN_REF dest=$CATAN_DEST py=$PY"
 
@@ -44,6 +52,17 @@ git -C "$CATAN_DEST" fetch --tags --force origin
 git -C "$CATAN_DEST" checkout --force "$CATAN_REF"
 cd "$CATAN_DEST"
 echo "[install] checked out $(git describe --tags --always) @ $(git rev-parse --short HEAD)"
+
+# The fallback URL below is keyed by the literal GitHub release tag. Fail before
+# building a venv when a raw commit/branch was requested without a staged wheel;
+# otherwise provisioning would spend minutes installing dependencies before a
+# failure that cannot be repaired by retrying the same command.
+if [ ! -f "$CATAN_RS_WHEEL" ] \
+  && ! git show-ref --verify --quiet "refs/tags/$CATAN_REF"; then
+  echo "[install] ERROR: CATAN_REF '$CATAN_REF' is not a local release tag and CATAN_RS_WHEEL is absent." >&2
+  echo "          Use the published release tag (automatic wheel download), or set CATAN_RS_WHEEL for a commit ref." >&2
+  exit 3
+fi
 
 # 2. venv — Python 3.11 is REQUIRED (cp311 rust wheel; matches B200/H100 ~/venv).
 #    Bootstrap 3.11 via `uv` when $PY is absent (H100 canaries ship python3.10
@@ -115,6 +134,8 @@ except PackageNotFoundError:
     rs = version("catanatron_rs")
 assert rs == "0.1.3", f"catanatron_rs must be 0.1.3, got {rs}"
 import torch
+assert torch.cuda.is_available(), "canonical fleet install requires a CUDA-enabled torch build"
+assert torch.version.cuda == "12.8", f"canonical fleet install requires torch cu128, got CUDA {torch.version.cuda}"
 print(f"env-doctor OK: py={sys.version.split()[0]} torch={torch.__version__} "
       f"cuda={torch.cuda.is_available()} catanatron_rs={rs}")
 PY

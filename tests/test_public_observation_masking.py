@@ -38,6 +38,7 @@ from catan_zero.search.gumbel_chance_mcts import (
     is_move_robber_with_victim,
     move_robber_victim_outcome_weights,
 )
+from catan_zero.search.rust_mcts import _require_rust_module
 
 ACTOR = "BLUE"
 OPP = "RED"
@@ -50,6 +51,15 @@ SLOT_RESOURCE_COUNT = 6
 SLOT_DEV_COUNT = 7
 SLOT_BRICK = 17  # resources base slot 16 + brick offset 1
 SLOT_DEV_VP = 26  # dev base slot 22 + VICTORY_POINT offset 4
+
+
+def _rust():
+    """Skip only live-engine tests when the optional Rust wheel is absent."""
+    pytest.importorskip("catanatron_rs")
+    try:
+        return _require_rust_module()
+    except RuntimeError as error:
+        pytest.skip(str(error))
 
 
 def _players_fixture():
@@ -149,12 +159,71 @@ def test_none_perspective_masks_everyone():
     assert masked[OPP]["resources"] is None
 
 
+def test_gumbel_row_writer_persists_public_observation(monkeypatch):
+    """The shard writer must request masking itself, independent of training.
+
+    This is a contract test at the call boundary: the feature implementation's
+    slot-level masking is covered above, while this catches the production bug
+    where online search was masked but `_build_decision_row` silently called
+    both feature builders with their unsafe default.
+    """
+    from catan_zero.rl import gumbel_self_play as self_play
+    from catan_zero.search.gumbel_chance_mcts import SearchResult
+
+    calls: list[tuple[str, bool]] = []
+
+    class _Game:
+        def current_color(self):
+            return ACTOR
+
+        def json_snapshot(self):
+            return json.dumps({"current_prompt": "MAIN"})
+
+        def playable_action_indices(self, _colors, _filter):
+            return [10, 11]
+
+        def playable_actions_json(self):
+            return json.dumps([[ACTOR, "END_TURN"], [ACTOR, "ROLL"]])
+
+    def _entity(*_args, public_observation=False, **_kwargs):
+        calls.append(("entity", bool(public_observation)))
+        return {"player_tokens": np.zeros((1, 4, 31), dtype=np.float16)}
+
+    def _context(*_args, public_observation=False, **_kwargs):
+        calls.append(("context", bool(public_observation)))
+        return np.zeros((1, 2, 18), dtype=np.float32)
+
+    monkeypatch.setattr(self_play, "rust_policy_action_ids", lambda *_a, **_k: (3, 4))
+    monkeypatch.setattr(self_play, "rust_game_to_entity_batch", _entity)
+    monkeypatch.setattr(self_play, "rust_action_context_batch", _context)
+
+    self_play._build_decision_row(
+        _Game(),
+        result=SearchResult(
+            selected_action=10,
+            improved_policy={10: 0.75, 11: 0.25},
+            visit_counts={10: 3, 11: 1},
+            q_values={10: 0.2, 11: -0.1},
+            priors={10: 0.6, 11: 0.4},
+            root_value=0.1,
+            used_full_search=True,
+            simulations_used=4,
+        ),
+        action_size=8,
+        colors=(ACTOR, OPP),
+        game_seed=7,
+        decision_index=0,
+        obs_width=1,
+    )
+
+    assert calls == [("entity", True), ("context", True)]
+
+
 # --------------------------------------------------------------------------
 # Layer 2: planner belief chance spectra
 # --------------------------------------------------------------------------
 def test_base_dev_deck_matches_engine_initial_count():
-    import catanatron_rs
-
+    catanatron_rs = _rust()
     game = catanatron_rs.Game.simple(["RED", "BLUE"], seed=0)
     snap = json.loads(game.json_snapshot())
     assert sum(BASE_DEVELOPMENT_DECK.values()) == int(snap["development_deck_count"]), (
@@ -162,11 +231,9 @@ def test_base_dev_deck_matches_engine_initial_count():
     )
 
 
-def _find_chance_nodes(seed: int, max_steps: int = 400):
+def _find_chance_nodes(catanatron_rs, seed: int, max_steps: int = 400):
     """Seeded random rollout; return the first (game, action_json) that is a
     MOVE_ROBBER-with-victim and the first that is a BUY_DEVELOPMENT_CARD."""
-    import catanatron_rs
-
     colors = ["RED", "BLUE"]
     game = catanatron_rs.Game.simple(colors, seed=seed)
     rng = random.Random(seed)
@@ -202,9 +269,10 @@ def _find_chance_nodes(seed: int, max_steps: int = 400):
 
 
 def test_belief_robber_weights_are_uniform_over_true_steal_set():
+    catanatron_rs = _rust()
     robber = None
     for seed in range(0, 40):
-        robber, _ = _find_chance_nodes(seed)
+        robber, _ = _find_chance_nodes(catanatron_rs, seed)
         if robber is not None:
             break
     if robber is None:
@@ -222,9 +290,10 @@ def test_belief_robber_weights_are_uniform_over_true_steal_set():
 
 
 def test_belief_dev_weights_follow_belief_deck():
+    catanatron_rs = _rust()
     buy_dev = None
     for seed in range(0, 40):
-        _, buy_dev = _find_chance_nodes(seed)
+        _, buy_dev = _find_chance_nodes(catanatron_rs, seed)
         if buy_dev is not None:
             break
     if buy_dev is None:
@@ -254,7 +323,7 @@ def test_model_invariant_to_hidden_hand_when_public_observation_on():
 
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
-    import catanatron_rs
+    catanatron_rs = _rust()
     from catan_zero.search.neural_rust_mcts import (
         EntityGraphRustEvaluator,
         EntityGraphRustEvaluatorConfig,

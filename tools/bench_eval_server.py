@@ -25,6 +25,7 @@ local arm's per-worker model load) is excluded and the GPU contention is real.
   tools/bench_eval_server.py --parity --checkpoint ckpt.pt --device cuda:0 \
       --public-observation --num-evals 128
 """
+
 from __future__ import annotations
 
 import argparse
@@ -61,6 +62,7 @@ def _build_configs(a: dict[str, Any], worker_seed: int):
         p_full=float(a["p_full"]),
         correct_rust_chance_spectra=bool(a["correct_rust_chance_spectra"]),
         lazy_interior_chance=bool(a["lazy_interior_chance"]),
+        root_wave_batching=bool(a["root_wave_batching"]),
     )
     return config, search_config
 
@@ -91,13 +93,22 @@ def _worker(
     if mode == "server":
         from catan_zero.search.eval_server import RemoteEvalClient
 
-        request_queue, response_queue, action_size, trained_masked = server_args
+        (
+            request_queue,
+            response_queue,
+            action_size,
+            trained_masked,
+            needs_targets,
+            event_token_limit,
+        ) = server_args
         evaluator: Any = RemoteEvalClient(
             request_queue,
             response_queue,
             wid,
             action_size=action_size,
             trained_with_masked_hidden_info=trained_masked,
+            needs_action_targets=needs_targets,
+            event_token_limit=event_token_limit,
             config=eval_config,
             client_timeout_ms=float(a["client_timeout_ms"]),
         )
@@ -121,7 +132,9 @@ def _worker(
         g = catanatron_rs.Game.simple(list(COLORS), seed=worker_seed)
         legal = tuple(int(x) for x in g.playable_action_indices(list(COLORS), None))
         if legal:
-            evaluator.evaluate(g, legal, root_color=str(g.current_color()), colors=COLORS)
+            evaluator.evaluate(
+                g, legal, root_color=str(g.current_color()), colors=COLORS
+            )
     except Exception as exc:  # pragma: no cover
         result_q.put({"wid": wid, "error": f"warmup: {exc!r}"})
         ready_q.put(wid)
@@ -161,6 +174,30 @@ def _worker(
     )
 
 
+def _cleanup_workers(procs: list[Any], *, graceful: bool) -> None:
+    """Reap benchmark workers, escalating when they do not exit promptly."""
+    if graceful:
+        join_deadline = time.monotonic() + 30.0
+        for proc in procs:
+            proc.join(timeout=max(0.0, join_deadline - time.monotonic()))
+
+    for proc in procs:
+        if proc.is_alive():
+            proc.terminate()
+    join_deadline = time.monotonic() + 5.0
+    for proc in procs:
+        proc.join(timeout=max(0.0, join_deadline - time.monotonic()))
+
+    for proc in procs:
+        if proc.is_alive() and hasattr(proc, "kill"):
+            proc.kill()
+    # Always perform a final join, including for processes that exited after
+    # terminate(), so no child is left as a zombie on any benchmark path.
+    join_deadline = time.monotonic() + 5.0
+    for proc in procs:
+        proc.join(timeout=max(0.0, join_deadline - time.monotonic()))
+
+
 def _run_arm(mode: str, a: dict[str, Any]) -> dict[str, Any]:
     ctx = mp.get_context("spawn")
     workers = int(a["workers"])
@@ -170,70 +207,111 @@ def _run_arm(mode: str, a: dict[str, Any]) -> dict[str, Any]:
 
     server = None
     server_args_per_worker: list[tuple | None] = [None] * workers
-    if mode == "server":
-        from catan_zero.search.eval_server import EvalServer, EvalServerConfig
-
-        server = EvalServer(
-            a["checkpoint"],
-            num_clients=workers,
-            config=EvalServerConfig(
-                max_batch_size=int(a["max_batch_size"]),
-                max_wait_ms=float(a["max_wait_ms"]),
-                device=a["device"],
-            ),
-            public_observation=bool(a["public_observation"]),
-            mp_context=ctx,
-        )
-        server.start()
-        meta = server.wait_ready(timeout=180.0)
-        for wid in range(workers):
-            server_args_per_worker[wid] = (
-                server.request_queue,
-                server.response_queues[wid],
-                int(meta["action_size"]),
-                bool(meta["trained_with_masked_hidden_info"]),
-            )
-
-    procs = []
-    for wid in range(workers):
-        p = ctx.Process(
-            target=_worker,
-            args=(mode, wid, a, server_args_per_worker[wid], ready_q, start_event, result_q),
-            daemon=False,
-        )
-        p.start()
-        procs.append(p)
-
-    # Barrier: wait for all workers to finish setup + warmup.
-    ready = 0
-    ready_deadline = time.perf_counter() + 300.0
-    while ready < workers and time.perf_counter() < ready_deadline:
-        try:
-            ready_q.get(timeout=5.0)
-            ready += 1
-        except queue_mod.Empty:
-            pass
-    if ready < workers:
-        for p in procs:
-            p.terminate()
-        raise TimeoutError(f"only {ready}/{workers} workers reached the barrier")
-
-    wall0 = time.perf_counter()
-    start_event.set()
-
-    results = []
-    for _ in range(workers):
-        try:
-            results.append(result_q.get(timeout=1800.0))
-        except queue_mod.Empty:
-            break
-    for p in procs:
-        p.join(timeout=30.0)
-    wall = time.perf_counter() - wall0
-
     server_stats = {}
-    if server is not None:
-        server_stats = server.stop()
+    try:
+        if mode == "server":
+            from catan_zero.search.eval_server import EvalServer, EvalServerConfig
+
+            server = EvalServer(
+                a["checkpoint"],
+                num_clients=workers,
+                config=EvalServerConfig(
+                    max_batch_size=int(a["max_batch_size"]),
+                    max_wait_ms=float(a["max_wait_ms"]),
+                    device=a["device"],
+                    transport=str(a.get("transport", "mp_queue")),
+                    shared_memory_slot_bytes=int(
+                        a.get("shared_memory_slot_bytes", 4 * 1024 * 1024)
+                    ),
+                    event_token_limit=a.get("event_token_limit"),
+                    matmul_precision=str(a["matmul_precision"]),
+                    request_collector=bool(a["request_collector"]),
+                    cuda_graph=bool(a.get("cuda_graph", False)),
+                    cuda_graph_batch_buckets=tuple(
+                        a.get(
+                            "cuda_graph_batch_buckets",
+                            (8, 16, 24, 32, 40, 48, 64, 80, 96, 128, 160, 192),
+                        )
+                    ),
+                    cuda_graph_warmup_iterations=int(
+                        a.get("cuda_graph_warmup_iterations", 3)
+                    ),
+                    benchmark_legacy_merge=bool(a.get("benchmark_legacy_merge", False)),
+                ),
+                public_observation=bool(a["public_observation"]),
+                mp_context=ctx,
+            )
+            server.start()
+            meta = server.wait_ready(timeout=180.0)
+            for wid in range(workers):
+                request_queue_for_client = getattr(
+                    server, "request_queue_for_client", None
+                )
+                server_args_per_worker[wid] = (
+                    request_queue_for_client(wid)
+                    if request_queue_for_client is not None
+                    else server.request_queue,
+                    server.response_queues[wid],
+                    int(meta["action_size"]),
+                    bool(meta["trained_with_masked_hidden_info"]),
+                    bool(meta.get("needs_action_targets", True)),
+                    meta.get("client_event_token_limit"),
+                )
+
+        procs = []
+        workers_completed = False
+        try:
+            for wid in range(workers):
+                proc = ctx.Process(
+                    target=_worker,
+                    args=(
+                        mode,
+                        wid,
+                        a,
+                        server_args_per_worker[wid],
+                        ready_q,
+                        start_event,
+                        result_q,
+                    ),
+                    daemon=False,
+                )
+                proc.start()
+                procs.append(proc)
+
+            # Barrier: wait for all workers to finish setup + warmup.
+            ready = 0
+            ready_deadline = time.perf_counter() + 300.0
+            while ready < workers and time.perf_counter() < ready_deadline:
+                try:
+                    ready_q.get(timeout=5.0)
+                    ready += 1
+                except queue_mod.Empty:
+                    pass
+            if ready < workers:
+                raise TimeoutError(
+                    f"only {ready}/{workers} workers reached the barrier"
+                )
+
+            wall0 = time.perf_counter()
+            start_event.set()
+
+            results = []
+            for _ in range(workers):
+                try:
+                    results.append(result_q.get(timeout=1800.0))
+                except queue_mod.Empty:
+                    break
+            workers_completed = len(results) == workers
+        finally:
+            _cleanup_workers(procs, graceful=workers_completed)
+        if not workers_completed:
+            raise TimeoutError(
+                f"only {len(results)}/{workers} benchmark workers returned results"
+            )
+        wall = time.perf_counter() - wall0
+    finally:
+        if server is not None:
+            server_stats = server.stop()
 
     errors = [r for r in results if "error" in r]
     ok = [r for r in results if "error" not in r]
@@ -254,13 +332,16 @@ def _run_arm(mode: str, a: dict[str, Any]) -> dict[str, Any]:
 
 
 def _parity(a: dict[str, Any]) -> dict[str, Any]:
-    import numpy as np
     import torch
 
     torch.set_num_threads(1)
     from bench_leaf_eval_batching import _collect_leaf_states
     from catan_zero.rl.gumbel_self_play import COLORS
-    from catan_zero.search.eval_server import EvalServer, EvalServerConfig, RemoteEvalClient
+    from catan_zero.search.eval_server import (
+        EvalServer,
+        EvalServerConfig,
+        RemoteEvalClient,
+    )
     from catan_zero.search.neural_rust_mcts import (
         EntityGraphRustEvaluator,
         EntityGraphRustEvaluatorConfig,
@@ -271,27 +352,68 @@ def _parity(a: dict[str, Any]) -> dict[str, Any]:
     )
     states = _collect_leaf_states(num_states=int(a["num_evals"]), seed=int(a["seed"]))
 
-    local = EntityGraphRustEvaluator.from_checkpoint(a["checkpoint"], device=a["device"], config=cfg)
+    local = EntityGraphRustEvaluator.from_checkpoint(
+        a["checkpoint"], device=a["device"], config=cfg
+    )
     local_res = [
-        local.evaluate(g, l, root_color=r, colors=COLORS) for (g, l, r) in states
+        local.evaluate(game, legal, root_color=root, colors=COLORS)
+        for (game, legal, root) in states
     ]
 
     ctx = mp.get_context("spawn")
     server = EvalServer(
-        a["checkpoint"], num_clients=1,
-        config=EvalServerConfig(max_batch_size=int(a["max_batch_size"]), max_wait_ms=0.0, device=a["device"]),
-        public_observation=bool(a["public_observation"]), mp_context=ctx,
+        a["checkpoint"],
+        num_clients=1,
+        config=EvalServerConfig(
+            max_batch_size=int(a["max_batch_size"]),
+            max_wait_ms=0.0,
+            device=a["device"],
+            transport=str(a.get("transport", "mp_queue")),
+            shared_memory_slot_bytes=int(
+                a.get("shared_memory_slot_bytes", 4 * 1024 * 1024)
+            ),
+            event_token_limit=a.get("event_token_limit"),
+            matmul_precision=str(a["matmul_precision"]),
+            request_collector=bool(a["request_collector"]),
+            cuda_graph=bool(a.get("cuda_graph", False)),
+            cuda_graph_batch_buckets=tuple(
+                a.get(
+                    "cuda_graph_batch_buckets",
+                    (8, 16, 24, 32, 40, 48, 64, 80, 96, 128, 160, 192),
+                )
+            ),
+            cuda_graph_warmup_iterations=int(
+                a.get("cuda_graph_warmup_iterations", 3)
+            ),
+            benchmark_legacy_merge=bool(a.get("benchmark_legacy_merge", False)),
+        ),
+        public_observation=bool(a["public_observation"]),
+        mp_context=ctx,
     )
-    server.start()
-    meta = server.wait_ready(timeout=180.0)
-    client = RemoteEvalClient(
-        server.request_queue, server.response_queues[0], 0,
-        action_size=int(meta["action_size"]),
-        trained_with_masked_hidden_info=bool(meta["trained_with_masked_hidden_info"]),
-        config=cfg,
-    )
-    srv_res = [client.evaluate(g, l, root_color=r, colors=COLORS) for (g, l, r) in states]
-    server.stop()
+    try:
+        server.start()
+        meta = server.wait_ready(timeout=180.0)
+        request_queue_for_client = getattr(server, "request_queue_for_client", None)
+        client = RemoteEvalClient(
+            request_queue_for_client(0)
+            if request_queue_for_client is not None
+            else server.request_queue,
+            server.response_queues[0],
+            0,
+            action_size=int(meta["action_size"]),
+            trained_with_masked_hidden_info=bool(
+                meta["trained_with_masked_hidden_info"]
+            ),
+            needs_action_targets=bool(meta.get("needs_action_targets", True)),
+            event_token_limit=meta.get("client_event_token_limit"),
+            config=cfg,
+        )
+        srv_res = [
+            client.evaluate(game, legal, root_color=root, colors=COLORS)
+            for (game, legal, root) in states
+        ]
+    finally:
+        server.stop()
 
     max_prior = 0.0
     max_value = 0.0
@@ -326,20 +448,51 @@ def main() -> None:
     ap.add_argument("--max-depth", type=int, default=80)
     ap.add_argument("--temperature-move-fraction", type=float, default=0.15)
     ap.add_argument("--lazy-interior-chance", action="store_true")
+    ap.add_argument("--root-wave-batching", action="store_true")
     ap.add_argument("--correct-rust-chance-spectra", action="store_true")
     ap.add_argument("--max-batch-size", type=int, default=64)
-    ap.add_argument("--max-wait-ms", type=float, default=3.0)
+    ap.add_argument("--max-wait-ms", type=float, default=0.0)
+    ap.add_argument(
+        "--matmul-precision", choices=("highest", "high", "medium"), default="highest"
+    )
+    ap.add_argument(
+        "--request-collector", action=argparse.BooleanOptionalAction, default=False
+    )
+    ap.add_argument(
+        "--transport", choices=("mp_queue", "shared_memory"), default="mp_queue"
+    )
+    ap.add_argument("--shared-memory-slot-bytes", type=int, default=4 * 1024 * 1024)
+    ap.add_argument("--event-token-limit", type=int, default=None)
+    ap.add_argument(
+        "--cuda-graph", action=argparse.BooleanOptionalAction, default=False
+    )
+    ap.add_argument(
+        "--cuda-graph-batch-buckets",
+        type=int,
+        nargs="+",
+        default=(8, 16, 24, 32, 40, 48, 64, 80, 96, 128, 160, 192),
+    )
+    ap.add_argument("--cuda-graph-warmup-iterations", type=int, default=3)
     ap.add_argument("--client-timeout-ms", type=float, default=20000.0)
+    ap.add_argument("--benchmark-legacy-merge", action="store_true")
     ap.add_argument("--parity", action="store_true")
     ap.add_argument("--num-evals", type=int, default=128)
     ap.add_argument("--seed", type=int, default=7)
+    ap.add_argument(
+        "--summary-only",
+        action="store_true",
+        help="Omit the per-worker timing list from the final benchmark JSON.",
+    )
     args = ap.parse_args()
     a = vars(args)
 
     if args.parity:
         print(json.dumps(_parity(a), indent=2))
         return
-    print(json.dumps(_run_arm(args.mode, a), indent=2, default=str))
+    result = _run_arm(args.mode, a)
+    if args.summary_only:
+        result.pop("per_worker", None)
+    print(json.dumps(result, indent=2, default=str))
 
 
 if __name__ == "__main__":

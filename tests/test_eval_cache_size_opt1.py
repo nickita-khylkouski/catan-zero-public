@@ -44,3 +44,62 @@ def test_cache_size_zero_disables_store_and_key_work():
     # The evaluate() paths gate ALL key/hash/store work on `cache_size > 0`
     # (neural_rust_mcts.py: cache_enabled = int(self.config.cache_size) > 0),
     # so 0 cannot change eval outputs -- it only removes the never-hit lookup.
+
+
+def test_eval_server_worker_threads_zero_cache_size_to_remote_client(monkeypatch):
+    """The eval-server path must not silently restore the 100k config default."""
+    from catan_zero.search import eval_server
+
+    captured: dict[str, object] = {}
+
+    class _FakeRemoteEvalClient:
+        def __init__(self, *args, **kwargs):
+            captured["client"] = self
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+
+    def _fake_run_worker(worker_args, *, champion_evaluator=None):
+        captured["worker_args"] = worker_args
+        captured["champion_evaluator"] = champion_evaluator
+        return {"worker_index": worker_args["worker_index"], "ok": True}
+
+    class _ResultQueue:
+        def __init__(self):
+            self.items = []
+
+        def put(self, item):
+            self.items.append(item)
+
+    monkeypatch.setattr(eval_server, "RemoteEvalClient", _FakeRemoteEvalClient)
+    monkeypatch.setattr(cli, "_run_worker", _fake_run_worker)
+
+    worker_args = {
+        "worker_index": 7,
+        "checkpoint": "/checkpoint.pt",
+        "device": "cuda",
+        "value_scale": 1.0,
+        "prior_temperature": 1.0,
+        "public_observation": True,
+        "rust_featurize": True,
+        "eval_cache_size": 0,
+    }
+    result_queue = _ResultQueue()
+
+    cli._server_worker_entry(
+        worker_args,
+        object(),
+        object(),
+        3,
+        332,
+        True,
+        False,
+        20_000.0,
+        False,
+        result_queue,
+    )
+
+    kwargs = captured["kwargs"]
+    assert kwargs["config"].cache_size == 0
+    assert kwargs["needs_action_targets"] is False
+    assert captured["champion_evaluator"] is captured["client"]
+    assert result_queue.items == [{"worker_index": 7, "ok": True}]

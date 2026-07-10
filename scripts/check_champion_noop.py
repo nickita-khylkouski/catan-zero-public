@@ -38,7 +38,10 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[1]
 FIX = ROOT / "tests/fixtures/noop_input_64.npz"
 REF = ROOT / "tests/fixtures/noop_ref.npz"
-DEFAULT_CKPT = "/home/ubuntu/catan-zero/runs/bc/gen3_20260706/checkpoint.pt"  # md5 8fadfb36
+# Match the canonical fleet/install contract. The old absolute
+# /home/ubuntu/catan-zero/... path points at a retired checkout and makes a
+# fresh v1 deployment fail before it can inspect the actual bundled champion.
+DEFAULT_CKPT = str(Path.home() / "bundle" / "champion_v0.pt")  # md5 8fadfb36
 N_ROWS = 64
 
 ENTITY_KEYS = (

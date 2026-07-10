@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+echo "fleet_launch_safe.sh is retired: use tools/fleet/fleet_launch.sh (see RL_AGENT_HANDOFF.md)." >&2
+exit 2
+
 # fleet_launch_safe.sh — SAFE launch-path stub for fleet generation (CAT-123 → CAT-122 builds on this).
 #
 # Encodes the three preconditions that today's incidents proved non-negotiable. It VALIDATES and

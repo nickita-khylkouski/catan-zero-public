@@ -116,7 +116,10 @@ def test_default_config_bit_identical_to_explicit_tanh(tiny_policy):
         _priors, value_again = _evaluate(tiny_policy, game, squash="tanh")
     finally:
         tiny_policy.forward_legal_np = original_forward
-    expected = float(np.clip(math.tanh(captured["raw"] * 1.0), -1.0, 1.0))
+    # The production path intentionally uses NumPy's tanh.  libm's
+    # ``math.tanh`` can differ from NumPy by one last-place bit on Linux, so an
+    # exact historical-contract assertion must recompute with the same ufunc.
+    expected = float(np.clip(np.tanh(captured["raw"] * 1.0), -1.0, 1.0))
     assert value_again == pytest.approx(expected, abs=0.0)
 
 

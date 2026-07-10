@@ -9,8 +9,7 @@ declare -A HOST=(
   [c4]=REPLACE_ME_c4_ip
   [c5]=REPLACE_ME_c5_ip
   [c6]=REPLACE_ME_c6_ip
-  [a100a]=REPLACE_ME_a100a_ip
-  [a100b]=REPLACE_ME_a100b_ip
+  [h100-canary]=REPLACE_ME_h100_canary_ip
   [b200]=REPLACE_ME_b200_ip
 )
 
@@ -19,9 +18,9 @@ GPU_SSH_KEY="$HOME/.ssh/gpu_access_ed25519"
 
 # Harvest-only (read by tools/wave1_harvest.sh); fleet_stop/status/launch ignore this.
 declare -A DIRS=(
-  [c1]="gen_out/mps_wave2"
-  [c2]="gen_run/mps_wave1"
-  [c3]="gen_run/mps_wave1"
-  [c5]="gen_out/mps_gpu0"
-  [c6]="gen_out/mps_wave1_n128"
+  [c1]="/home/ubuntu/gen_out/REPLACE_ME_c1_claim"
+  [c2]="/home/ubuntu/gen_out/REPLACE_ME_c2_claim"
+  [c3]="/home/ubuntu/gen_out/REPLACE_ME_c3_claim"
+  [c5]="/home/ubuntu/gen_out/REPLACE_ME_c5_claim"
+  [c6]="/home/ubuntu/gen_out/REPLACE_ME_c6_claim"
 )

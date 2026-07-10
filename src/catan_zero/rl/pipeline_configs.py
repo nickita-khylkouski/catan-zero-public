@@ -90,7 +90,7 @@ _T = TypeVar("_T", bound="PipelineConfig")
 
 # Bump when the *set* of fields on any pipeline config changes so that hashes
 # from before/after the change are never mistaken for equal regimes.
-CONFIG_SCHEMA_VERSION = 1
+CONFIG_SCHEMA_VERSION = 2
 
 # Length (hex chars) of the short hash embedded in artifacts. 16 hex chars =
 # 64 bits; collision probability is negligible for the run counts here and the
@@ -107,7 +107,9 @@ def _jsonable(value: Any) -> Any:
     genuinely unserializable value rather than hashing an opaque ``repr``.
     """
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
-        return {f.name: _jsonable(getattr(value, f.name)) for f in dataclasses.fields(value)}
+        return {
+            f.name: _jsonable(getattr(value, f.name)) for f in dataclasses.fields(value)
+        }
     if isinstance(value, (list, tuple)):
         return [_jsonable(v) for v in value]
     if isinstance(value, set):
@@ -130,7 +132,9 @@ class PipelineConfig:
 
     def field_values(self) -> dict[str, Any]:
         """Field name -> JSON-normalized value, in declaration order."""
-        return {f.name: _jsonable(getattr(self, f.name)) for f in dataclasses.fields(self)}
+        return {
+            f.name: _jsonable(getattr(self, f.name)) for f in dataclasses.fields(self)
+        }
 
     def canonical_payload(self) -> dict[str, Any]:
         """The full, self-describing record that gets hashed and registered."""
@@ -146,7 +150,9 @@ class PipelineConfig:
         ``sort_keys`` makes field/declaration order irrelevant; the compact
         separators make the string stable across Python versions.
         """
-        return json.dumps(self.canonical_payload(), sort_keys=True, separators=(",", ":"))
+        return json.dumps(
+            self.canonical_payload(), sort_keys=True, separators=(",", ":")
+        )
 
     def config_hash(self) -> str:
         """Short, stable content hash of the fully-resolved config.
@@ -262,6 +268,7 @@ class GenerateConfig(PipelineConfig):
     PIPELINE: ClassVar[str] = "generate"
 
     checkpoint: str | None = None
+    device: str = "cpu"
     track: str = "2p_no_trade"
     vps_to_win: int = 10
     obs_width: int = 806
@@ -288,6 +295,48 @@ class GenerateConfig(PipelineConfig):
     value_scale: float = 1.0
     correct_rust_chance_spectra: bool = True
     lazy_interior_chance: bool = False
+    exact_budget_sh: bool = False
+    exact_budget_sh_min_n: int = 0
+    root_wave_batching: bool = False
+    rescale_noise_floor_c: float = 0.0
+    sigma_eval: float = 0.79
+    late_temperature_decisions: int | None = None
+    late_temperature: float = 0.0
+    # Evaluator/transport choices can change batching composition and numeric
+    # results, so they are part of provenance rather than "mere performance"
+    # flags. In particular TF32 was measured to diverge self-play trajectories.
+    rust_featurize: bool = False
+    eval_server: bool = False
+    eval_server_max_batch: int = 64
+    eval_server_max_wait_ms: float = 0.0
+    eval_server_timeout_ms: float = 20_000.0
+    eval_server_batch_timeout_sec: float = 0.0
+    eval_server_local_fallback: bool = False
+    eval_server_matmul_precision: str = "highest"
+    eval_server_request_collector: bool = False
+    # Request payload transport remains provenance-bearing until its parity and
+    # H100 throughput arms are certified.  Shared memory changes only IPC, but
+    # can change cross-game batch composition and therefore floating ordering.
+    eval_server_transport: str = "mp_queue"
+    eval_server_shared_memory_slot_bytes: int = 4 * 1024 * 1024
+    eval_server_event_token_limit: int | None = None
+    eval_server_cuda_graph: bool = False
+    eval_server_cuda_graph_batch_buckets: tuple[int, ...] = (
+        8,
+        16,
+        24,
+        32,
+        40,
+        48,
+        64,
+        80,
+        96,
+        128,
+        160,
+        192,
+    )
+    eval_server_cuda_graph_warmup_iterations: int = 3
+    eval_cache_size: int = 100_000
     # Run topology (part of the regime: changes shard layout / seed mapping).
     games: int = 8
     workers: int = 1
@@ -295,6 +344,8 @@ class GenerateConfig(PipelineConfig):
     fmt: str = "npz"
     score_actions: bool = True
     opponent_pool_manifest: str | None = None
+    opponent_mix_manifest: str | None = None
+    exploiter_fraction: float | None = None
 
     @classmethod
     def from_namespace(cls, args: Any) -> "GenerateConfig":
@@ -385,7 +436,13 @@ class GateConfig(PipelineConfig):
     generation_public_observation: bool | None = None
 
     @classmethod
-    def from_namespace(cls, args: Any, *, test_kind: str, generation_public_observation: bool | None = None) -> "GateConfig":
+    def from_namespace(
+        cls,
+        args: Any,
+        *,
+        test_kind: str,
+        generation_public_observation: bool | None = None,
+    ) -> "GateConfig":
         return cls._from_args(
             args,
             test_kind=test_kind,
@@ -396,6 +453,7 @@ class GateConfig(PipelineConfig):
 # --------------------------------------------------------------------------- #
 # Cross-pipeline consistency checks.
 # --------------------------------------------------------------------------- #
+
 
 def check_masking_consistency(*configs: PipelineConfig) -> list[str]:
     """Return human-readable discrepancies in the public-observation regime.
@@ -420,7 +478,9 @@ def check_masking_consistency(*configs: PipelineConfig) -> list[str]:
     if observed:
         regimes = {v for _, v in observed}
         if len(regimes) > 1:
-            detail = ", ".join(f"{name}.public_observation={val}" for name, val in observed)
+            detail = ", ".join(
+                f"{name}.public_observation={val}" for name, val in observed
+            )
             problems.append(
                 "masking regime mismatch across pipelines "
                 f"(all compared configs must share public_observation): {detail}"
@@ -446,12 +506,16 @@ def config_from_payload(payload: dict[str, Any]) -> PipelineConfig:
     pipeline = str(payload.get("pipeline", ""))
     cls = CONFIG_CLASSES.get(pipeline)
     if cls is None:
-        raise ValueError(f"unknown pipeline {pipeline!r}; expected one of {sorted(CONFIG_CLASSES)}")
+        raise ValueError(
+            f"unknown pipeline {pipeline!r}; expected one of {sorted(CONFIG_CLASSES)}"
+        )
     stored = dict(payload.get("fields", {}))
     known = {f.name for f in dataclasses.fields(cls)}
     kept = {name: value for name, value in stored.items() if name in known}
-    # Normalize the identity/collection fields JSON turned into lists back to
-    # the dataclass's declared types where it matters (none currently need it;
-    # all list-valued fields are absent from these configs), so a plain splat
-    # is correct.
+    # Canonical JSON normalizes tuples to lists. Restore tuple-valued defaults
+    # so payload round trips retain dataclass identity, not only hash parity.
+    defaults = cls()
+    for name, value in tuple(kept.items()):
+        if isinstance(getattr(defaults, name), tuple) and isinstance(value, list):
+            kept[name] = tuple(value)
     return cls(**kept)  # type: ignore[arg-type]

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # tools/fleet/launch_detached.sh — ONE detach + heartbeat implementation for the
 # fleet (CAT-122 launcher + CAT-132 gate both source this). Survives SSH teardown
-# and exposes mtime-based liveness for fleet_status.
+# and exposes mtime-based liveness for direct operator inspection.
 #
 # Usage (source, then call):
 #   source tools/fleet/launch_detached.sh

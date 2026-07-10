@@ -34,6 +34,19 @@ def _rust():
         pytest.skip(str(error))
 
 
+def _pure_mcts(config: GumbelChanceMCTSConfig) -> GumbelChanceMCTS:
+    """Build the algorithm shell without invoking the optional engine guard.
+
+    Node-level completed-Q and policy math only reads ``config``. Constructing
+    that shell directly keeps those pure-Python tests runnable when the Rust
+    extension is not installed, while live search tests continue through
+    ``_rust()`` and the real constructor.
+    """
+    mcts = object.__new__(GumbelChanceMCTS)
+    mcts.config = config
+    return mcts
+
+
 def _catanatron_rs_version() -> tuple[int, ...]:
     try:
         from importlib.metadata import version
@@ -645,7 +658,7 @@ def test_improved_policy_from_search_sums_to_one():
 
 
 def test_improved_policy_puts_more_mass_on_higher_completed_q_actions():
-    mcts = GumbelChanceMCTS(GumbelChanceMCTSConfig(seed=0))
+    mcts = _pure_mcts(GumbelChanceMCTSConfig(seed=0))
     node = _GNode(game=None, root_color="RED")
     node.actions = {0: _GAction(prior=0.5), 1: _GAction(prior=0.5)}
     node.action_logits = {0: 0.0, 1: 0.0}
@@ -708,7 +721,9 @@ def test_prior_temperature_scales_action_logits_and_sharpens_policy():
 
 
 def test_improved_policy_uses_mixed_value_for_unvisited_actions_not_zero():
-    mcts = GumbelChanceMCTS(GumbelChanceMCTSConfig(seed=0, c_visit=50.0, c_scale=1.0))
+    mcts = _pure_mcts(
+        GumbelChanceMCTSConfig(seed=0, c_visit=50.0, c_scale=1.0)
+    )
 
     class _FakeGame:
         def current_color(self):
@@ -738,7 +753,7 @@ def test_v_mix_weights_visited_actions_by_prior_not_by_visit_count():
     the SAME prior must contribute EQUALLY to v_mix (prior-weighted), not in
     proportion to how many times Gumbel-Top-k/Sequential Halving happened to
     visit them (the old, buggy visit-weighted behavior)."""
-    mcts = GumbelChanceMCTS(GumbelChanceMCTSConfig(seed=0))
+    mcts = _pure_mcts(GumbelChanceMCTSConfig(seed=0))
 
     class _FakeGame:
         def current_color(self):
@@ -782,7 +797,9 @@ def test_improved_policy_rescales_completed_q_before_sigma_bounding_sharpening()
     translate into proportionally unbounded sharpening -- it must first be
     rescaled to [0, 1], so sigma's effect is bounded by
     (c_visit + max_visits) * c_scale regardless of Q's raw magnitude."""
-    mcts = GumbelChanceMCTS(GumbelChanceMCTSConfig(seed=0, c_visit=50.0, c_scale=0.1))
+    mcts = _pure_mcts(
+        GumbelChanceMCTSConfig(seed=0, c_visit=50.0, c_scale=0.1)
+    )
     node = _GNode(game=None, root_color="RED")
     node.actions = {0: _GAction(prior=0.5), 1: _GAction(prior=0.5)}
     node.action_logits = {0: 0.0, 1: 0.0}
@@ -1039,7 +1056,9 @@ def _node_with(actions: dict[int, _GAction], *, prior_value: float = 0.0) -> _GN
 def test_noise_floor_disabled_is_exact_rescale_noop():
     """rescale_noise_floor_c == 0 -> `_rescaled_completed_q` is bit-identical
     to the raw min-max `_rescale_completed_q` (pure no-op default)."""
-    mcts = GumbelChanceMCTS(GumbelChanceMCTSConfig(seed=0, rescale_noise_floor_c=0.0))
+    mcts = _pure_mcts(
+        GumbelChanceMCTSConfig(seed=0, rescale_noise_floor_c=0.0)
+    )
     node = _node_with(
         {
             0: _GAction(prior=0.4, visits=3, value_sum=0.9),
@@ -1054,7 +1073,9 @@ def test_noise_floor_disabled_is_exact_rescale_noop():
 def test_noise_floor_exact_tie_maps_all_to_half():
     """An exact tie (raw_spread == 0) -> alpha == 0 -> every rescaled value
     is 0.5 (a constant, so the prior's order is what survives)."""
-    mcts = GumbelChanceMCTS(GumbelChanceMCTSConfig(seed=0, rescale_noise_floor_c=1.0))
+    mcts = _pure_mcts(
+        GumbelChanceMCTSConfig(seed=0, rescale_noise_floor_c=1.0)
+    )
     node = _node_with(
         {
             0: _GAction(prior=0.5, visits=4, value_sum=1.2),  # q = 0.3
@@ -1070,7 +1091,11 @@ def test_noise_floor_exact_tie_maps_all_to_half():
 def test_noise_floor_converges_to_plain_rescale_at_high_visits():
     """mean_visits -> large drives the noise floor -> 0 and alpha -> 1, so
     the attenuated rescale converges to the plain rescale."""
-    mcts = GumbelChanceMCTS(GumbelChanceMCTSConfig(seed=0, rescale_noise_floor_c=1.0, sigma_eval=0.79))
+    mcts = _pure_mcts(
+        GumbelChanceMCTSConfig(
+            seed=0, rescale_noise_floor_c=1.0, sigma_eval=0.79
+        )
+    )
     v = 10**10
     node = _node_with(
         {
@@ -1090,7 +1115,11 @@ def test_noise_floor_pulls_low_visit_spread_toward_half():
     """A modest raw spread observed over very few visits (spread near the
     noise floor) gets pulled toward the neutral 0.5, shrinking the rescaled
     range that would otherwise fill [0, 1]."""
-    mcts = GumbelChanceMCTS(GumbelChanceMCTSConfig(seed=0, rescale_noise_floor_c=1.0, sigma_eval=0.79))
+    mcts = _pure_mcts(
+        GumbelChanceMCTSConfig(
+            seed=0, rescale_noise_floor_c=1.0, sigma_eval=0.79
+        )
+    )
     node = _node_with(
         {
             0: _GAction(prior=0.4, visits=1, value_sum=0.03),  # q = 0.03
@@ -1139,7 +1168,7 @@ def test_noise_floor_does_not_change_selection_when_disabled():
 def test_variance_aware_q_disabled_is_noop():
     """variance_aware_q == False -> `_completed_q` is unchanged from the
     plain completed-Q (default OFF)."""
-    plain = GumbelChanceMCTS(GumbelChanceMCTSConfig(seed=0, variance_aware_q=False))
+    plain = _pure_mcts(GumbelChanceMCTSConfig(seed=0, variance_aware_q=False))
     node = _node_with(
         {
             0: _GAction(prior=0.5, visits=10, value_sum=8.0, value_sq_sum=7.0),
@@ -1156,7 +1185,7 @@ def test_variance_aware_zero_per_action_variance_keeps_q():
     """A candidate whose per-visit backups were all identical (zero
     per-action variance -> SE == 0) keeps its exact completed-Q even with
     the flag on: shrink == 1."""
-    aware = GumbelChanceMCTS(GumbelChanceMCTSConfig(seed=0, variance_aware_q=True))
+    aware = _pure_mcts(GumbelChanceMCTSConfig(seed=0, variance_aware_q=True))
     # value_sq_sum = visits * q^2 -> variance exactly 0 for both.
     node = _node_with(
         {
@@ -1177,8 +1206,10 @@ def test_variance_aware_high_variance_candidate_shrinks_toward_v_mix():
     noisy = _GAction(prior=0.5, visits=2, value_sum=1.0, value_sq_sum=1.0)  # q=0.5, var=0.25
     node = _node_with({0: precise, 1: noisy}, prior_value=prior_value)
 
-    plain = GumbelChanceMCTS(GumbelChanceMCTSConfig(seed=0, variance_aware_q=False))._completed_q(node)
-    aware = GumbelChanceMCTS(
+    plain = _pure_mcts(
+        GumbelChanceMCTSConfig(seed=0, variance_aware_q=False)
+    )._completed_q(node)
+    aware = _pure_mcts(
         GumbelChanceMCTSConfig(seed=0, variance_aware_q=True, variance_aware_k=1.0)
     )._completed_q(node)
 
@@ -1196,7 +1227,7 @@ def test_variance_aware_high_variance_candidate_shrinks_toward_v_mix():
 def test_variance_aware_single_visited_candidate_is_untouched():
     """With fewer than 2 visited candidates there is no between-candidate
     signal to preserve, so shrinkage is skipped entirely."""
-    aware = GumbelChanceMCTS(GumbelChanceMCTSConfig(seed=0, variance_aware_q=True))
+    aware = _pure_mcts(GumbelChanceMCTSConfig(seed=0, variance_aware_q=True))
     node = _node_with(
         {
             0: _GAction(prior=0.5, visits=3, value_sum=1.5, value_sq_sum=2.0),  # q=0.5, var>0

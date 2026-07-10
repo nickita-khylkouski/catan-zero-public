@@ -5,49 +5,45 @@ because of fragile `pkill -f` patterns. All read the box registry from `$FLEET_C
 (default `~/.catan_fleet.conf`, an alias→ip bash file; copy `fleet_conf.example` and fill it —
 the filled file is gitignored so no IPs land in the repo), use `ssh -i $GPU_SSH_KEY`
 (default `~/.ssh/gpu_access_ed25519`, BatchMode), and are safe to run while the fleet is frozen.
+Use `fleet_launch.sh` for every generation/training start. The full operator
+transaction is documented in `RL_AGENT_HANDOFF.md`.
+
+Generation pins the validated H100 inference path explicitly: `mp_queue`
+transport, zero event tokens (the live/public event tail is empty), and the
+root-wave and CUDA-graph experiments disabled. Training defaults are unchanged.
 
 ## fleet_stop.sh — robust GPU-work stop
 `fleet_stop.sh <alias|all> [--go]`   (default DRY-RUN; prints the plan, kills nothing)
 
 Design (each rule fixes a real failure seen on 2026-07-09):
-- **Kill by nvidia-smi compute-PID**, never `pkill -f <pattern>` — a pattern matches the operator's
-  own ssh/bash shell and the pgrep command itself, dropping the connection mid-kill.
-- **Climb to python/torchrun SUPERVISORS and SIGTERM them FIRST** so launchers reap their workers
-  and don't respawn; the climb **stops at the first non-python ancestor** (bash/sshd/systemd) so the
-  operator's shell is never a target. Only `comm=python|python3*|torchrun` are ever supervisors.
+- **Kill validated recorded launch sessions first**, never `pkill -f <pattern>` — each
+  `launch_detached` PID is also its SID/PGID, so one exact negative-PGID signal reaches the generator,
+  EvalServer, manager, and grandchildren even when MPS hides clients from NVML. PID reuse is rejected
+  unless the current SID/PGID and canonical Catan command signature both validate.
+- **Keep nvidia-smi compute-PID fallback** for legacy/unmanaged jobs. Climb to python/torchrun
+  supervisors but stop at the first non-python ancestor, so the operator shell is never a target.
 - **Orphan workers** (parent already gone) are killed directly from the compute-PID list.
 - **PRESERVE** the MPS daemon (`nvidia-cuda-mps-control/-server`) and observability
   (`dcgm`, `nv-hostengine`, `prometheus`, `grafana`, `node_exporter`, `*exporter`) — excluded by process_name.
-- SIGTERM supervisors → 5s → SIGKILL survivors (explicit PIDs only) → **verify 0 MiB per GPU** (retried).
+- SIGTERM groups/supervisors → bounded wait → SIGKILL exact survivors → verify zero owned groups,
+  zero MPS clients, and zero non-infrastructure GPU PIDs. The preserved MPS server's measured idle
+  footprint on H100/driver 580.105.08 is 78 MiB/GPU, so idle memory is capped at 128 MiB with MPS
+  (50 MiB otherwise); a 35M evaluator context is ~1.0 GiB and still fails closed.
 - Per-box (`fleet_stop.sh c6 --go`) or fleet-wide (`fleet_stop.sh all --go`).
 
-Validated: dry-run against a live `train_bc` (b200) selects the worker + preserves infra; mock
-unit-test (two python workers under torchrun/python parents under bash, plus an mps-server) selects
-both workers + both supervisors, **excludes the mps-server, and never climbs into bash**.
+Validated on the 8×H100 canary: a real MPS generation tree (runner + generator + resource tracker +
+EvalServer + worker) was selected as one detached group; `--go` removed the full group and the live
+MPS client while preserving the server. Post-stop memory was exactly 78 MiB on all eight GPUs.
 
 ## fleet_status.sh — one-read fleet view
 `fleet_status.sh [alias|all]`   (read-only, parallel)
 
 Per box: `gpus`, `busy` (>50%), `util_avg`, `mem_max`, inferred **role** (TRAINING / GATE(cross-net)
-/ EVAL(vs-bot) / GEN-TEACHER(nNN) / GEN-VOLUME(nNN) / idle from live cmdlines), MPS on/off, and
-launcher-process count.
+/ EVAL(vs-bot) / EVAL(vs-raw) / TEST(pytest) / GEN-TEACHER(nNN) / GEN-VOLUME(nNN) / idle from live cmdlines), MPS on/off, and
+matching generation/training process count.
 
-## fleet_launch_safe.sh — safe launch-path stub (CAT-122 builds on this)
-`fleet_launch_safe.sh <alias> <gpu> <teacher|volume> <base_seed> [--go]`   (default DRY-RUN)
-
-Enforces the three preconditions that incidents proved non-negotiable, then prints the exact command
-and refuses on any guard failure:
-1. **Fresh out-dir** (timestamped ⇒ fresh by construction; refuses a populated dir).
-2. **Seed claim** — base seed must fall inside a CLAIMED ledger range (range-membership parse,
-   tolerates commas + en-dash + open-ended rows). Wave restarts that REUSE a base produce duplicate
-   game_seeds and the pooled-build dedup guard drops the whole partial wave — so never reuse; claim a
-   fresh block first. (Authoritative overlap check remains the tool's own `prelaunch_guard`; this is a
-   fast fail-before-ssh heuristic on the box-local ledger.)
-3. **Guards ON** — the safe path runs WITH the tool's prelaunch guards. `--skip-guards` is the
-   deliberate exception for in-block wave-restart self-collision only, and must be explicit.
-- **`$GEN_PY` resolution**: prefer `$GEN_PY`, else `~/venv/bin/python`, else `<tree>/.venv/bin/python`.
-  Never hardcode `.venv/bin/python` — on the H100 boxes it doesn't exist (they run under `~/venv`) and
-  a hardcode stranded a GPU (stopped gen, failed to relaunch).
+`fleet_launch_safe.sh` is retired. It points at the old runsix tree and old MPS
+recipe. Do not use it.
 
 ## Ops lesson baked in: one operator per box
 Three two-operator collisions on 2026-07-09 (crossed c6 conversion, shared-pgid c1 kill, duplicate

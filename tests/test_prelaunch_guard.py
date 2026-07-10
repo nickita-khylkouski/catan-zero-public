@@ -600,7 +600,7 @@ def test_ledger_overlap_excludes_own_claim(tmp_path):
     ledger = tmp_path / "SEED_LEDGER.md"
     ledger.write_text(
         "# CANONICAL SEED LEDGER -- header\n"
-        "[90000000000 - 91000000000) | fleet/H100 | c6 TEACHER claimid=cat122-c6-w2 | 2026-07-09\n"
+        "[90000000000 - 91000000000) | fleet/H100 | c6 TEACHER claim=cat122-c6-w2 | 2026-07-09\n"
     )
     # WITHOUT the label: self-collision -> FAIL (the exact trap that forced --skip-guards)
     self_collide = guard.guard_ledger_overlap(90_000_000_000, 1500, ledger_path=ledger)
@@ -617,11 +617,24 @@ def test_ledger_overlap_still_collides_with_peer_despite_own_label(tmp_path):
     ledger = tmp_path / "SEED_LEDGER.md"
     ledger.write_text(
         "# CANONICAL SEED LEDGER -- header\n"
-        "[90000000000 - 91000000000) | fleet/H100 | c6 TEACHER claimid=cat122-c6-w2 | 2026-07-09\n"
+        "[90000000000 - 91000000000) | fleet/H100 | c6 TEACHER claim=cat122-c6-w2 | 2026-07-09\n"
         "[90000001000 - 90000002000) | peer | some-other-host job | 2026-07-09\n"
     )
     result = guard.guard_ledger_overlap(
         90_000_000_000, 1500, ledger_path=ledger, own_claim_label="cat122-c6-w2"
     )
     assert not result.passed  # peer [90000001000,90000002000) overlaps [90000000000,90000001500)
+    assert "overlaps" in result.reason
+
+
+def test_ledger_overlap_own_claim_requires_exact_claim_token(tmp_path):
+    ledger = tmp_path / "SEED_LEDGER.md"
+    ledger.write_text(
+        "[1000 - 1100) | peer | claim=launch-123-extra | 2026-07-09\n",
+        encoding="utf-8",
+    )
+    result = guard.guard_ledger_overlap(
+        1000, 10, ledger_path=ledger, own_claim_label="launch-123"
+    )
+    assert not result.passed
     assert "overlaps" in result.reason

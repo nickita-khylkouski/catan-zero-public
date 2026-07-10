@@ -57,7 +57,11 @@ class _MockEvaluator:
 
 
 def _opening_game(seed=1):
-    rs = _require_rust_module()
+    pytest.importorskip("catanatron_rs")
+    try:
+        rs = _require_rust_module()
+    except RuntimeError as error:
+        pytest.skip(str(error))
     return rs.Game.simple(list(COLORS), seed=seed)
 
 

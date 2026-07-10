@@ -1,10 +1,11 @@
 # CatanZero
 
-This repository consolidates the full Catan-Zero project — source, every
-development branch, planning documents, and every external expert review —
-pulled from the three GPU hosts (one B200, two A100s) that ran development
-and self-play generation. Project #1 goal: build the strongest Catan agent
-under the benchmark below.
+This repository consolidates the Catan-Zero source, development history,
+planning documents, and external reviews. The original import came from one
+B200 and two now-retired A100 hosts. The current fleet is 24 H100s across six
+four-GPU nodes, an eight-H100 canary, and a two-B200 evaluation hub; FLEET.md is
+the live inventory. Project #1 goal: build the strongest Catan agent under the
+benchmark below.
 
 ## Hard rule
 
@@ -15,10 +16,13 @@ downstream of it. Land the fix, land the test, then generate.
 
 ## Pointer map
 
+- `RL_AGENT_HANDOFF.md` — production RL operator runbook: release and artifact
+  acceptance, fleet launch, seed allocation, corpus QA, DDP training, searched
+  gates, promotion, rollback, and current integration gaps.
 - `src/`, `tools/`, `tests/` — the Python package described below (search,
-  training, self-play generation, promotion gate, H2H evaluation). This is
-  the B200 host's `master` (`ea6ce93`, 2026-07-06), used as canonical here
-  because B200 is where the bulk of feature-branch development happened.
+  training, self-play generation, promotion gate, H2H evaluation). Use the
+  verified current worktree and its next immutable H100 release, not an old
+  host branch or the obsolete `v1.0-deploy` tag.
 - `docs/plans/` — the live planning documents: `CATAN_ZERO_MASTER_PLAN.md`
   (plan of record with a status table and per-recommendation verdicts),
   `CATAN_ZERO_ROADMAP.md`, and `CATAN_ZERO_RESEARCH_CHRONICLE.md` (the
@@ -33,17 +37,14 @@ downstream of it. Land the fix, land the test, then generate.
   they could be lost to reprovisioning, kept on separate `rescue/untracked-*`
   branches rather than merged into `master`; see `rescue/README.md`.
 - Task tracking: Linear workspace, team **Catan**.
-- Live GPU hosts (code lives here, but generation/training runs live there):
-  B200, a100a, a100b (host IPs live only in your local `$FLEET_CONF` — never
-  committed; see FLEET.md), reached via `ssh -i ~/.ssh/gpu_access_ed25519
-  ubuntu@<host>`. These are ephemeral cloud-box IPs and rotate on
-  reprovision.
+- Live GPU aliases are `c1` through `c6`, `h100-canary`, and `b200`. Host IPs
+  live only in the uncommitted `$FLEET_CONF`; see FLEET.md. The retired A100
+  names below describe repository history, not active compute.
 
 ## Branches
 
-Development happened simultaneously across three hosts with independent
-local commits, so this repository does not silently collapse everything
-onto one line of history — every branch found on every host is preserved:
+The historical import happened simultaneously across three hosts with
+independent local commits, so the repository preserves those branches:
 `f60-value-squash` through `f80b-hygiene-harden`, `gen3-wheel-sync`,
 `savefix`, `v3-combined-staging`, `integ-v3`, `opt-arch`, `opt-inference`,
 `opt-rust-work` (B200 feature branches, each a `git worktree` sibling of
@@ -55,9 +56,8 @@ B200's with a host-local sync commit, plus its `integrated_master` branch);
 standalone Rust engine — native featurizer + MCTS — pulled from its own
 separate repo on B200, not a worktree of the main repo).
 
-If you're not sure which `master` is authoritative for a given file, check
-which host last touched it — that adjudication was deliberately left open
-during this import rather than silently resolved.
+Those branches are provenance, not current deployment inputs. For operations,
+follow RL_AGENT_HANDOFF.md and FLEET.md and require one immutable release.
 
 ## Not imported (and why)
 

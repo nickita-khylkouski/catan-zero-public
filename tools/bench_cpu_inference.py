@@ -1,4 +1,4 @@
-"""CPU inference benchmark for the 35M EntityGraphPolicy checkpoint.
+"""CPU/GPU inference benchmark for the 35M EntityGraphPolicy checkpoint.
 
 Standalone measurement script (task #45, Modal feasibility). Does NOT touch
 src/. Loads the real checkpoint on device=cpu, featurizes real Rust game
@@ -91,12 +91,16 @@ def make_batch(entity, ids, ctx, batch_size):
 def bench_forward(policy, batches, iters, warmup=3):
     import torch
 
-    with torch.no_grad():
+    with torch.inference_mode():
         for _ in range(warmup):
             policy.forward_legal_np(*batches[0])
+        if policy.device.type == "cuda":
+            torch.cuda.synchronize(policy.device)
         t0 = time.perf_counter()
         for i in range(iters):
             policy.forward_legal_np(*batches[i % len(batches)])
+        if policy.device.type == "cuda":
+            torch.cuda.synchronize(policy.device)
         dt = time.perf_counter() - t0
     return dt / iters
 
@@ -105,6 +109,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--compile", action="store_true")
+    parser.add_argument("--device", default="cpu")
     parser.add_argument("--threads", default="1,2,4,8")
     parser.add_argument("--batches", default="1,8,16,32")
     parser.add_argument("--iters", type=int, default=30)
@@ -117,7 +122,7 @@ def main() -> None:
 
     print(f"rss_before_load_gb={rss_gb():.2f}")
     t0 = time.perf_counter()
-    policy = EntityGraphPolicy.load(args.checkpoint, device="cpu")
+    policy = EntityGraphPolicy.load(args.checkpoint, device=args.device)
     load_s = time.perf_counter() - t0
     n_params = sum(p.numel() for p in policy.model.parameters())
     print(f"model_load_s={load_s:.2f} params={n_params/1e6:.1f}M rss_gb={rss_gb():.2f}")
@@ -152,13 +157,15 @@ def main() -> None:
                   f"{per_call*1000/bs:.2f} ms/sample")
 
     # reference outputs for drift check
-    with torch.no_grad():
+    with torch.inference_mode():
         ref = policy.forward_legal_np(*probe)
-        ref_logits = ref["logits"].numpy().copy()
-        ref_value = float(ref["value"].numpy()[0])
+        ref_logits = ref["logits"].detach().float().cpu().numpy().copy()
+        ref_value = float(ref["value"].detach().float().cpu().numpy()[0])
 
     # dynamic int8 quantization of Linear layers
     try:
+        if policy.device.type != "cpu":
+            raise RuntimeError("dynamic int8 benchmark is CPU-only")
         qmodel = torch.ao.quantization.quantize_dynamic(
             policy.model, {torch.nn.Linear}, dtype=torch.qint8
         )
@@ -166,8 +173,8 @@ def main() -> None:
         policy.model = qmodel
         with torch.no_grad():
             qout = policy.forward_legal_np(*probe)
-            q_logits = qout["logits"].numpy()
-            q_value = float(qout["value"].numpy()[0])
+            q_logits = qout["logits"].detach().cpu().numpy()
+            q_value = float(qout["value"].detach().cpu().numpy()[0])
         finite = ref_logits > -1e8
         max_logit_delta = float(np.abs(q_logits[finite] - ref_logits[finite]).max())
         ref_p = np.exp(ref_logits[finite]) / np.exp(ref_logits[finite]).sum()
@@ -195,8 +202,10 @@ def main() -> None:
             torch.set_num_threads(4)
             policy.model = torch.compile(policy.model, dynamic=True)
             t0 = time.perf_counter()
-            with torch.no_grad():
+            with torch.inference_mode():
                 policy.forward_legal_np(*probe)
+                if policy.device.type == "cuda":
+                    torch.cuda.synchronize(policy.device)
             print(f"compile_first_call_s={time.perf_counter()-t0:.1f}")
             for bs in (1, 16):
                 batches = [make_batch(*f, bs) for f in feats[:4]]

@@ -50,6 +50,14 @@ from train_bc import (  # noqa: E402  (sibling module bootstrap above)
 )
 
 MEMMAP_CORPUS_SCHEMA = "memmap_corpus_v1"
+MEMMAP_CORPUS_IMPLICIT_SCHEMA = "memmap_corpus_v2"
+
+# Event history is currently disabled in the retained teacher data, but the
+# normal entity schema still carries a dense (64, 41) fp16 tensor and a (64,)
+# bool mask for every row.  The v2 format can represent those *proven-zero*
+# columns without a data file.  Keep this list deliberately narrow: other
+# constant-looking columns may have different fill semantics.
+IMPLICIT_ZERO_EVENT_COLUMNS = frozenset({"event_tokens", "event_mask"})
 
 # The exact column set (and order) load_teacher_data keeps in its local ``keys``
 # tuple. Anything not present in a normalised shard is simply skipped, matching
@@ -226,6 +234,7 @@ def build_memmap_corpus(
     progress_every: int = 500,
     abort_on_duplicate_seeds: bool = True,
     full_rows_only: bool = False,
+    omit_zero_events: bool = False,
 ) -> dict:
     """Stream one or more sources' npz shards into a flat memmap corpus.
 
@@ -250,9 +259,30 @@ def build_memmap_corpus(
     first = _normalize_teacher_shard(_load_npz(files[0]), files[0])
     columns = [key for key in LOADER_KEYS if key in first]
     schemas = {name: _classify(name, first[name]) for name in columns}
+    implicit_zero_columns: list[str] = []
+    if omit_zero_events:
+        missing_event_columns = IMPLICIT_ZERO_EVENT_COLUMNS - set(columns)
+        if missing_event_columns:
+            raise SystemExit(
+                "--omit-zero-events requires both event_tokens and event_mask in "
+                f"the normalized source schema; missing={sorted(missing_event_columns)}"
+            )
+        for name in sorted(IMPLICIT_ZERO_EVENT_COLUMNS & set(columns)):
+            array = np.asarray(first[name])
+            schemas[name] = {
+                "kind": "implicit_constant",
+                "dtype": array.dtype.str,
+                "inner_shape": [int(d) for d in array.shape[1:]],
+                "fill": 0,
+            }
+            implicit_zero_columns.append(name)
     column_set = set(columns)
 
-    handles = {name: open(out_dir / f"{name}.dat", "wb") for name in columns if schemas[name]["kind"] != "string"}
+    handles = {
+        name: open(out_dir / f"{name}.dat", "wb")
+        for name in columns
+        if schemas[name]["kind"] not in {"string", "implicit_constant"}
+    }
     code_handles = {name: open(out_dir / f"{name}.codes.dat", "wb") for name in columns if schemas[name]["kind"] == "string"}
     # Global string factorisation: category -> code, stable in first-seen order.
     categories: dict[str, dict[str, int]] = {name: {} for name in code_handles}
@@ -277,6 +307,19 @@ def build_memmap_corpus(
     for shard_index, file in enumerate(files):
         raw = _load_npz(file)
         norm = _normalize_teacher_shard(raw, file)
+        # This check intentionally precedes --full-rows-only filtering.  The
+        # opt-in contract is corpus-source-wide: a live event in even a row
+        # that a later filter would drop must fail closed rather than allowing
+        # an accidental mixed-history source to masquerade as event-free.
+        for name in implicit_zero_columns:
+            if bool(np.any(norm[name])):
+                for handle in (*handles.values(), *code_handles.values()):
+                    handle.close()
+                raise SystemExit(
+                    f"{file}: --omit-zero-events requires every source row's {name} "
+                    "to be exactly zero; found live/non-zero event data. Refusing "
+                    "lossy conversion. Re-run without --omit-zero-events."
+                )
         if full_rows_only:
             # Keep only FULL-search rows (drop fast rows). used_full_search is the
             # ground-truth per-row full/fast marker written by the generator; it is
@@ -324,7 +367,7 @@ def build_memmap_corpus(
                     f"{file}: column {name!r} dtype {array.dtype.str} != first shard's "
                     f"{schema['dtype']}; mixed dtypes would corrupt the flat memmap."
                 )
-            if kind == "fixed":
+            if kind in {"fixed", "implicit_constant"}:
                 inner = [int(d) for d in array.shape[1:]]
                 if inner != list(schema["inner_shape"]):
                     raise SystemExit(
@@ -407,6 +450,8 @@ def build_memmap_corpus(
                 code_handles[name].write(np.ascontiguousarray(codes).tobytes())
             elif kind == "fixed":
                 np.ascontiguousarray(array).tofile(handles[name])
+            elif kind == "implicit_constant":
+                continue
             else:  # ragged2d / ragged3d
                 flat = array[prefix_mask]  # row-major prefix concat -> (sum counts, [feat])
                 np.ascontiguousarray(flat).tofile(handles[name])
@@ -469,7 +514,7 @@ def build_memmap_corpus(
         schemas[name] = {"kind": "string", "categories": category_lists[name]}
 
     meta = {
-        "schema": MEMMAP_CORPUS_SCHEMA,
+        "schema": MEMMAP_CORPUS_IMPLICIT_SCHEMA if implicit_zero_columns else MEMMAP_CORPUS_SCHEMA,
         "row_count": int(row_count),
         "flat_count": int(flat_count),
         "legal_width": int(legal_width),
@@ -486,6 +531,14 @@ def build_memmap_corpus(
         # fill) was actually VERIFIED for this corpus. A corpus built with
         # --no-verify-fill is otherwise indistinguishable from a verified one.
         "verify_fill": bool(verify_fill),
+        "implicit_zero_columns": implicit_zero_columns,
+        "implicit_zero_bytes_saved_per_row": int(
+            sum(
+                np.prod(schemas[name]["inner_shape"], dtype=np.int64)
+                * np.dtype(schemas[name]["dtype"]).itemsize
+                for name in implicit_zero_columns
+            )
+        ),
         "stats": stats,
         "conversion_seconds": round(time.perf_counter() - started, 2),
     }
@@ -496,15 +549,23 @@ def build_memmap_corpus(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
+    source_group = parser.add_mutually_exclusive_group(required=True)
+    source_group.add_argument(
         "--source",
-        required=True,
         type=Path,
         nargs="+",
         help=(
             "One or more teacher shard roots (each a dir with manifest.json); "
             "shards are concatenated in the given order, e.g. "
             "--source runs/raw_selfplay_gen1_combined runs/raw_selfplay_gen2_combined"
+        ),
+    )
+    source_group.add_argument(
+        "--source-list",
+        type=Path,
+        help=(
+            "UTF-8 file containing one teacher shard root per line. This avoids "
+            "argv limits for harvested corpora with thousands of worker leaves."
         ),
     )
     parser.add_argument("--out", required=True, type=Path, help="output corpus directory")
@@ -522,6 +583,16 @@ def main() -> None:
         ),
     )
     parser.add_argument("--no-verify-fill", action="store_true", help="skip the per-shard lossless-trim assertion (faster)")
+    parser.add_argument(
+        "--omit-zero-events",
+        action="store_true",
+        help=(
+            "Write a memmap_corpus_v2 corpus that omits event_tokens.dat and "
+            "event_mask.dat only after proving both columns are exactly zero in "
+            "every source row. Training reconstructs exact zero arrays per batch. "
+            "Conversion aborts on any live event. Off by default."
+        ),
+    )
     parser.add_argument("--progress-every", type=int, default=500)
     parser.add_argument(
         "--abort-on-duplicate-seeds",
@@ -533,14 +604,24 @@ def main() -> None:
         "duplicate_game_seed_count in corpus_meta.json) and proceed at your own risk.",
     )
     args = parser.parse_args()
+    sources = args.source
+    if args.source_list is not None:
+        sources = [
+            Path(line.strip())
+            for line in args.source_list.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        if not sources:
+            parser.error(f"--source-list is empty: {args.source_list}")
     build_memmap_corpus(
-        args.source,
+        sources,
         args.out,
         max_shards=args.max_shards,
         verify_fill=not args.no_verify_fill,
         progress_every=args.progress_every,
         abort_on_duplicate_seeds=args.abort_on_duplicate_seeds,
         full_rows_only=args.full_rows_only,
+        omit_zero_events=args.omit_zero_events,
     )
 
 

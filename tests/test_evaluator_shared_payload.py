@@ -14,15 +14,16 @@ Two guarantees, enforced together:
      function resolving independently -- in BOTH masking regimes (this is
      the correctness bar: the shared tuple must be regime-correct for both
      consumers, not just the entity-token path).
-  2. Each of the four evaluate() call sites (`EntityGraphRustEvaluator.evaluate`,
-     `.evaluate_many`, `.evaluate_symmetry_averaged`,
-     `BatchedEntityGraphRustEvaluator.evaluate`) must call
-     `_resolve_entity_adapter` exactly once per non-cached, non-terminal
-     request -- not twice.
+  2. Each evaluate() call site must call `_resolve_entity_adapter` at most once
+     per non-cached, non-terminal request. On the native Rust feature path it
+     must skip that Python adapter entirely after topology has been bootstrapped.
 """
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import json
+import threading
+import time
 
 import numpy as np
 import pytest
@@ -51,6 +52,28 @@ def _rust():
         pytest.skip(str(error))
 
 
+def _rust_with_native_features():
+    """Require the task-#81 entity *and* context APIs.
+
+    Older catanatron_rs wheels provide the MCTS game bindings (so `_rust()`
+    succeeds) but not the native feature builders exercised by the warm-path
+    tests below.  Skip those tests cleanly instead of failing with AttributeError.
+    """
+    catanatron_rs = _rust()
+    required = (
+        "EntityTopology",
+        "build_entity_features_flat",
+        "build_action_context_flat",
+    )
+    missing = [name for name in required if not hasattr(catanatron_rs, name)]
+    if missing:
+        pytest.skip(
+            "catanatron_rs wheel lacks native entity/context features: "
+            + ", ".join(missing)
+        )
+    return catanatron_rs
+
+
 def _advance_to_multi_action_state(catanatron_rs, *, seed: int, min_legal: int = 2):
     game = catanatron_rs.Game.simple(list(COLORS), seed=seed)
     for _ in range(300):
@@ -67,7 +90,7 @@ def _legal_rust_actions(game) -> tuple[int, ...]:
     return tuple(int(action) for action in game.playable_action_indices(list(COLORS), None))
 
 
-def _tiny_real_policy():
+def _tiny_real_policy(*, public_observation: bool = False):
     """Real (not mocked) but tiny policy with the actual action-catalog size,
     so `rust_policy_action_ids`/forward passes are valid -- same fixture
     pattern as tests/test_regime_fail_closed.py's
@@ -83,7 +106,30 @@ def _tiny_real_policy():
         seed=0,
     )
     policy.model.eval()  # create() leaves train mode; active Dropout would break equality/counting.
+    # This is checkpoint metadata rather than an architectural choice.  Set it
+    # to the requested regime so the evaluator's fail-closed guard is exercised
+    # (and passes) in both parametrizations.
+    policy.trained_with_masked_hidden_info = bool(public_observation)
     return policy
+
+
+def _assert_eval_close(actual, expected, *, context: str = "") -> None:
+    actual_priors, actual_value = actual
+    expected_priors, expected_value = expected
+    assert set(actual_priors) == set(expected_priors), (
+        f"{context}: prior key mismatch "
+        f"{set(actual_priors) ^ set(expected_priors)}"
+    )
+    for action in expected_priors:
+        assert np.isclose(
+            actual_priors[action], expected_priors[action], atol=1.0e-6, rtol=1.0e-5
+        ), (
+            f"{context}: action={action} prior {actual_priors[action]!r} != "
+            f"{expected_priors[action]!r}"
+        )
+    assert np.isclose(actual_value, expected_value, atol=1.0e-6, rtol=1.0e-5), (
+        f"{context}: value {actual_value!r} != {expected_value!r}"
+    )
 
 
 class _ResolveCallCounter:
@@ -242,3 +288,270 @@ def test_batched_evaluator_evaluate_builds_resolved_once():
         )
     finally:
         evaluator.close()
+
+
+def test_evaluate_many_skips_adapter_after_rust_topology_is_warm():
+    catanatron_rs = _rust_with_native_features()
+    game_a = _advance_to_multi_action_state(catanatron_rs, seed=21)
+    game_b = _advance_to_multi_action_state(catanatron_rs, seed=23)
+    legal_a = _legal_rust_actions(game_a)
+    legal_b = _legal_rust_actions(game_b)
+    actor = str(game_a.current_color())
+
+    evaluator = EntityGraphRustEvaluator(
+        _tiny_real_policy(),
+        config=EntityGraphRustEvaluatorConfig(cache_size=0, rust_featurize=True),
+    )
+    # The first native evaluation resolves the Python adapter only to compute
+    # fixed BASE-map topology. Subsequent native feature calls consume the
+    # cached topology and must not parse/rebuild the adapter payload again.
+    evaluator.evaluate(game_a, legal_a, root_color=actor, colors=COLORS)
+    assert evaluator._rust_topology is not None
+
+    with _ResolveCallCounter() as counter:
+        evaluator.evaluate_many(
+            [(game_a, legal_a), (game_b, legal_b)], root_color=actor, colors=COLORS
+        )
+    assert counter.calls == 0, (
+        "evaluate_many() rebuilt the Python entity adapter after native topology "
+        f"was warm: {counter.calls} call(s)"
+    )
+
+
+def test_batched_evaluator_skips_adapter_after_rust_topology_is_warm():
+    catanatron_rs = _rust_with_native_features()
+    game_a = _advance_to_multi_action_state(catanatron_rs, seed=31)
+    game_b = _advance_to_multi_action_state(catanatron_rs, seed=33)
+    legal_a = _legal_rust_actions(game_a)
+    legal_b = _legal_rust_actions(game_b)
+    actor = str(game_a.current_color())
+
+    evaluator = BatchedEntityGraphRustEvaluator(
+        _tiny_real_policy(),
+        config=EntityGraphRustEvaluatorConfig(cache_size=0, rust_featurize=True),
+        max_batch_size=64,
+        max_wait_ms=0.0,
+    )
+    try:
+        evaluator.evaluate(game_a, legal_a, root_color=actor, colors=COLORS)
+        assert evaluator._rust_topology is not None
+        with _ResolveCallCounter() as counter:
+            evaluator.evaluate(game_b, legal_b, root_color=actor, colors=COLORS)
+        assert counter.calls == 0, (
+            "BatchedEntityGraphRustEvaluator rebuilt the Python entity adapter "
+            f"after native topology was warm: {counter.calls} call(s)"
+        )
+    finally:
+        evaluator.close()
+
+
+@pytest.mark.parametrize("public_observation", [False, True])
+def test_warm_rust_evaluate_many_matches_individual_evaluations(public_observation):
+    """The adapter-free warm path preserves outputs in both input regimes."""
+    catanatron_rs = _rust_with_native_features()
+    policy = _tiny_real_policy(public_observation=public_observation)
+    config = EntityGraphRustEvaluatorConfig(
+        cache_size=0,
+        public_observation=public_observation,
+        rust_featurize=True,
+    )
+    singles = EntityGraphRustEvaluator(policy, config=config)
+    many = EntityGraphRustEvaluator(policy, config=config)
+
+    warm_game = _advance_to_multi_action_state(catanatron_rs, seed=40)
+    warm_legal = _legal_rust_actions(warm_game)
+    warm_actor = str(warm_game.current_color())
+    singles.evaluate(warm_game.copy(), warm_legal, root_color=warm_actor, colors=COLORS)
+    many.evaluate(warm_game.copy(), warm_legal, root_color=warm_actor, colors=COLORS)
+    assert singles._rust_topology is not None
+    assert many._rust_topology is not None
+
+    games = [
+        _advance_to_multi_action_state(catanatron_rs, seed=seed)
+        for seed in (41, 42, 43, 44)
+    ]
+    legal = [_legal_rust_actions(game) for game in games]
+    root_color = COLORS[0]
+    expected = [
+        singles.evaluate(game.copy(), actions, root_color=root_color, colors=COLORS)
+        for game, actions in zip(games, legal)
+    ]
+    with _ResolveCallCounter() as counter:
+        actual = many.evaluate_many(
+            [(game.copy(), actions) for game, actions in zip(games, legal)],
+            root_color=root_color,
+            colors=COLORS,
+        )
+    assert counter.calls == 0
+    for index, (actual_item, expected_item) in enumerate(zip(actual, expected)):
+        _assert_eval_close(
+            actual_item,
+            expected_item,
+            context=f"public_observation={public_observation} request={index}",
+        )
+
+
+@pytest.mark.parametrize("public_observation", [False, True])
+def test_warm_concurrent_batched_evaluation_matches_singles(
+    public_observation, monkeypatch
+):
+    """Concurrent EvalServer-style batching matches one-at-a-time inference."""
+    catanatron_rs = _rust_with_native_features()
+    policy = _tiny_real_policy(public_observation=public_observation)
+    config = EntityGraphRustEvaluatorConfig(
+        cache_size=0,
+        public_observation=public_observation,
+        rust_featurize=True,
+    )
+    singles = EntityGraphRustEvaluator(policy, config=config)
+    batched = BatchedEntityGraphRustEvaluator(
+        policy,
+        config=config,
+        max_batch_size=8,
+        max_wait_ms=250.0,
+    )
+    try:
+        warm_game = _advance_to_multi_action_state(catanatron_rs, seed=50)
+        warm_legal = _legal_rust_actions(warm_game)
+        warm_actor = str(warm_game.current_color())
+        singles.evaluate(warm_game.copy(), warm_legal, root_color=warm_actor, colors=COLORS)
+        batched.evaluate(warm_game.copy(), warm_legal, root_color=warm_actor, colors=COLORS)
+        assert singles._rust_topology is not None
+        assert batched._rust_topology is not None
+
+        games = [
+            _advance_to_multi_action_state(catanatron_rs, seed=seed)
+            for seed in (51, 52, 53, 54)
+        ]
+        legal = [_legal_rust_actions(game) for game in games]
+        root_color = COLORS[0]
+        expected = [
+            singles.evaluate(game.copy(), actions, root_color=root_color, colors=COLORS)
+            for game, actions in zip(games, legal)
+        ]
+
+        observed_batch_sizes: list[int] = []
+        real_forward = policy.forward_legal_np
+
+        def tracked_forward(entity_batch, legal_ids, context, *, return_q=False):
+            observed_batch_sizes.append(int(legal_ids.shape[0]))
+            return real_forward(
+                entity_batch, legal_ids, context, return_q=return_q
+            )
+
+        monkeypatch.setattr(policy, "forward_legal_np", tracked_forward)
+        # Make the collector wait for this deliberately concurrent burst.  The
+        # production flag becomes true after the first observed multi-request
+        # batch; setting it here removes scheduler luck from this regression.
+        batched._observed_concurrency = True
+        start = threading.Barrier(len(games))
+
+        def evaluate_one(index: int):
+            start.wait(timeout=10.0)
+            return batched.evaluate(
+                games[index].copy(),
+                legal[index],
+                root_color=root_color,
+                colors=COLORS,
+            )
+
+        with _ResolveCallCounter() as counter:
+            with ThreadPoolExecutor(max_workers=len(games)) as executor:
+                futures = [executor.submit(evaluate_one, index) for index in range(len(games))]
+                actual = [future.result(timeout=30.0) for future in futures]
+        assert counter.calls == 0
+        assert any(size > 1 for size in observed_batch_sizes), observed_batch_sizes
+        for index, (actual_item, expected_item) in enumerate(zip(actual, expected)):
+            _assert_eval_close(
+                actual_item,
+                expected_item,
+                context=f"public_observation={public_observation} request={index}",
+            )
+    finally:
+        batched.close()
+
+
+def test_concurrent_cold_start_computes_rust_topology_once(monkeypatch):
+    """Two producer threads cannot both initialize evaluator topology."""
+    catanatron_rs = _rust_with_native_features()
+    import catan_zero.rl.entity_token_features_rust as rust_features
+
+    policy = _tiny_real_policy()
+    evaluator = BatchedEntityGraphRustEvaluator(
+        policy,
+        config=EntityGraphRustEvaluatorConfig(cache_size=0, rust_featurize=True),
+        max_batch_size=2,
+        max_wait_ms=250.0,
+    )
+    real_compute = rust_features.compute_rust_topology
+    count_lock = threading.Lock()
+    compute_calls = 0
+
+    def slow_compute(adapter, acting_color):
+        nonlocal compute_calls
+        with count_lock:
+            compute_calls += 1
+        # Keep the first computation open long enough for the second producer
+        # to reach the cold check.  Without the evaluator lock this reliably
+        # produces two calls (the reviewer-reported race).
+        time.sleep(0.1)
+        return real_compute(adapter, acting_color)
+
+    monkeypatch.setattr(rust_features, "compute_rust_topology", slow_compute)
+    games = [
+        _advance_to_multi_action_state(catanatron_rs, seed=seed)
+        for seed in (61, 62)
+    ]
+    legal = [_legal_rust_actions(game) for game in games]
+    start = threading.Barrier(2)
+    evaluator._observed_concurrency = True
+
+    def evaluate_one(index: int):
+        start.wait(timeout=10.0)
+        return evaluator.evaluate(
+            games[index], legal[index], root_color=COLORS[0], colors=COLORS
+        )
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [executor.submit(evaluate_one, index) for index in range(2)]
+            for future in futures:
+                future.result(timeout=30.0)
+        assert compute_calls == 1
+        assert evaluator._rust_topology is not None
+    finally:
+        evaluator.close()
+
+
+@pytest.mark.parametrize("public_observation", [False, True])
+def test_warm_rust_symmetry_evaluation_skips_adapter_without_output_change(
+    public_observation,
+):
+    catanatron_rs = _rust_with_native_features()
+    policy = _tiny_real_policy(public_observation=public_observation)
+    config = EntityGraphRustEvaluatorConfig(
+        cache_size=0,
+        public_observation=public_observation,
+        rust_featurize=True,
+    )
+    cold = EntityGraphRustEvaluator(policy, config=config)
+    warm = EntityGraphRustEvaluator(policy, config=config)
+    game = _advance_to_multi_action_state(catanatron_rs, seed=71, min_legal=3)
+    legal = _legal_rust_actions(game)
+    actor = str(game.current_color())
+
+    expected = cold.evaluate_symmetry_averaged(
+        game.copy(), legal, root_color=actor, colors=COLORS
+    )
+    warm.evaluate(game.copy(), legal, root_color=actor, colors=COLORS)
+    assert warm._rust_topology is not None
+    with _ResolveCallCounter() as counter:
+        actual = warm.evaluate_symmetry_averaged(
+            game.copy(), legal, root_color=actor, colors=COLORS
+        )
+    assert counter.calls == 0
+    _assert_eval_close(
+        actual,
+        expected,
+        context=f"public_observation={public_observation} warm symmetry",
+    )

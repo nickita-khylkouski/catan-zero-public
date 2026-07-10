@@ -102,11 +102,15 @@ def _uncertainty_from_outputs(outputs: dict[str, Any], row: int) -> float:
 
 
 def _fetch_leaf_decision_inputs(
-    game: Any, colors: tuple[str, ...]
-) -> tuple[str, dict[int, Any]]:
+    game: Any,
+    colors: tuple[str, ...],
+    *,
+    include_snapshot: bool = True,
+) -> tuple[str | None, dict[int, Any]]:
     """ONE Rust round-trip for everything the leaf-eval preamble needs.
 
-    Returns (snapshot_text, action_by_id). Previously each leaf evaluation
+    Returns (snapshot_text, action_by_id). ``snapshot_text`` is ``None`` when
+    ``include_snapshot`` is false; the action map is always fetched. Previously each leaf evaluation
     re-fetched `playable_action_indices`/`playable_actions_json` up to 3x
     (rust_policy_action_ids + both featurizers via `_resolve_entity_adapter`)
     and `json_snapshot` up to 3x (_state_key + both featurizers) on the same,
@@ -116,7 +120,7 @@ def _fetch_leaf_decision_inputs(
     for exactly this reuse; this helper is the caller-side plumbing that was
     never wired up.
     """
-    snapshot_text = game.json_snapshot()
+    snapshot_text = game.json_snapshot() if include_snapshot else None
     action_ids = [
         int(action)
         for action in game.playable_action_indices(list(colors), None)
@@ -178,6 +182,11 @@ class EntityGraphRustEvaluator:
         # and reused for every subsequent one (see the config field's comment
         # for why once-per-lifetime is sound on the BASE map).
         self._rust_topology: Any = None
+        # BatchedEntityGraphRustEvaluator prepares features in producer
+        # threads.  Two cold producers can therefore observe ``None`` at the
+        # same time.  Keep initialization once-per-evaluator as promised while
+        # leaving the hot path as one unlocked attribute read.
+        self._rust_topology_lock = threading.Lock()
 
     @classmethod
     def from_checkpoint(
@@ -211,20 +220,42 @@ class EntityGraphRustEvaluator:
         again after that."""
         from catan_zero.rl.entity_token_features_rust import (
             build_entity_features_rust,
-            compute_rust_topology,
         )
 
-        if self._rust_topology is None:
-            self._rust_topology = compute_rust_topology(adapter, str(acting_color))
+        topology = self._get_or_init_rust_topology(adapter, acting_color=acting_color)
         entity = build_entity_features_rust(
             game,
             colors=tuple(str(color) for color in colors),
             policy_action_ids=tuple(int(a) for a in policy_action_ids),
             action_size=int(self.policy.action_size),
-            topology=self._rust_topology,
+            topology=topology,
             public_observation=bool(self.config.public_observation),
         )
         return {key: np.asarray(value)[None, ...] for key, value in entity.items()}
+
+    def _get_or_init_rust_topology(self, adapter: Any, *, acting_color: str) -> Any:
+        """Return the immutable native topology, initializing it exactly once.
+
+        The async evaluator's callers featurize before enqueueing, so topology
+        bootstrap can be reached concurrently.  A double-checked lock keeps
+        the common warm path lock-free and prevents duplicate cold builds.
+        """
+        topology = self._rust_topology
+        if topology is not None:
+            return topology
+
+        from catan_zero.rl.entity_token_features_rust import compute_rust_topology
+
+        with self._rust_topology_lock:
+            topology = self._rust_topology
+            if topology is None:
+                if adapter is None:
+                    raise RuntimeError(
+                        "Rust topology is cold but no entity adapter was provided"
+                    )
+                topology = compute_rust_topology(adapter, str(acting_color))
+                self._rust_topology = topology
+        return topology
 
     def _context_batch_via_rust(
         self,
@@ -244,11 +275,9 @@ class EntityGraphRustEvaluator:
         float32. CAT-72: `adapter` may be `None` once `self._rust_topology`
         is already warm (see `_entity_batch_via_rust`'s docstring)."""
         from catan_zero.rl.action_context_features_rust import build_action_context_rust
-        from catan_zero.rl.entity_token_features_rust import compute_rust_topology
 
-        if self._rust_topology is None:
-            self._rust_topology = compute_rust_topology(adapter, str(acting_color))
-        context = build_action_context_rust(game, topology=self._rust_topology)
+        topology = self._get_or_init_rust_topology(adapter, acting_color=acting_color)
+        context = build_action_context_rust(game, topology=topology)
         return context[None, ...]
 
     def _apply_value_squash(self, raw_value: float) -> float:
@@ -303,9 +332,19 @@ class EntityGraphRustEvaluator:
             return self._eval_result({}, _terminal_or_zero(game, root_color), 0.0)
 
         acting_color = str(game.current_color())
+        cache_enabled = int(self.config.cache_size) > 0
+        need_adapter_resolve = (
+            (not bool(self.config.rust_featurize)) or self._rust_topology is None
+        )
         # B1 dedup: fetch once, share across the policy-id translation, the
-        # cache key, and (on a miss) both featurizer calls below.
-        snapshot_text, action_by_id = _fetch_leaf_decision_inputs(game, colors)
+        # cache key, and (on a miss) both featurizer calls below. A warm native
+        # evaluator with caching disabled needs only the action map: avoid
+        # serializing a full JSON snapshot that no downstream consumer reads.
+        snapshot_text, action_by_id = _fetch_leaf_decision_inputs(
+            game,
+            colors,
+            include_snapshot=cache_enabled or need_adapter_resolve,
+        )
         policy_action_ids = rust_policy_action_ids(
             game,
             legal_actions,
@@ -318,9 +357,9 @@ class EntityGraphRustEvaluator:
         # key-tuple build -- previously only the STORE was gated, so a
         # cache_size=0 evaluator still hashed every leaf for a cache it
         # never wrote (speed-czar cache audit, 2026-07-06).
-        cache_enabled = int(self.config.cache_size) > 0
         cache_key = None
         if cache_enabled:
+            assert snapshot_text is not None
             cache_key = (
                 _state_key(game, snapshot_text=snapshot_text),
                 str(root_color),
@@ -347,9 +386,9 @@ class EntityGraphRustEvaluator:
         # dead weight on every non-bootstrap Rust-path leaf. Skip it once
         # topology is warm; the legacy (non-rust_featurize) path still needs
         # `resolved` every leaf, unchanged.
-        need_adapter_resolve = (not bool(self.config.rust_featurize)) or self._rust_topology is None
         resolved: tuple[dict[str, Any], "_RustEntityFeatureEnv", list[dict[str, Any]]] | None = None
         if need_adapter_resolve:
+            assert snapshot_text is not None
             snapshot = json.loads(snapshot_text)
             # B2 dedup: resolve the (payload, adapter, structured) tuple ONCE and
             # share it with both featurizers below -- see `_resolve_entity_adapter`
@@ -456,21 +495,45 @@ class EntityGraphRustEvaluator:
         from catan_zero.rl.hex_symmetry import build_hex_symmetry
 
         acting_color = str(game.current_color())
-        policy_action_ids = rust_policy_action_ids(
-            game, legal_actions, colors=colors, action_size=int(self.policy.action_size)
+        # The native feature builders consume the Python adapter only to
+        # bootstrap fixed BASE-map topology.  Once warm, symmetry averaging is
+        # just another native entity/context call and must not rebuild or parse
+        # that adapter.  On the cold/native and Python paths, fetch the snapshot
+        # and action mapping once and share them with both translation and
+        # resolution, matching evaluate().
+        need_adapter_resolve = (
+            (not bool(self.config.rust_featurize)) or self._rust_topology is None
         )
-        # B2 dedup: see evaluate() -- one shared resolve for both featurizers.
-        resolved = _resolve_entity_adapter(
-            game,
-            legal_actions,
-            colors=colors,
-            action_size=int(self.policy.action_size),
-            policy_action_ids=policy_action_ids,
-            snapshot=None,
-            action_by_id=None,
-            public_observation=bool(self.config.public_observation),
-            perspective=acting_color,
-        )
+        resolved: tuple[
+            dict[str, Any], "_RustEntityFeatureEnv", list[dict[str, Any]]
+        ] | None = None
+        if need_adapter_resolve:
+            snapshot_text, action_by_id = _fetch_leaf_decision_inputs(game, colors)
+            policy_action_ids = rust_policy_action_ids(
+                game,
+                legal_actions,
+                colors=colors,
+                action_size=int(self.policy.action_size),
+                action_by_id=action_by_id,
+            )
+            resolved = _resolve_entity_adapter(
+                game,
+                legal_actions,
+                colors=colors,
+                action_size=int(self.policy.action_size),
+                policy_action_ids=policy_action_ids,
+                snapshot=json.loads(snapshot_text),
+                action_by_id=action_by_id,
+                public_observation=bool(self.config.public_observation),
+                perspective=acting_color,
+            )
+        else:
+            policy_action_ids = rust_policy_action_ids(
+                game,
+                legal_actions,
+                colors=colors,
+                action_size=int(self.policy.action_size),
+            )
         # Task #81 gap #1 fix: this method previously never checked
         # `rust_featurize` at all, so a wide root with BOTH
         # `symmetry_averaged_eval=True` and `rust_featurize=True` set would
@@ -485,12 +548,12 @@ class EntityGraphRustEvaluator:
                 colors=colors,
                 policy_action_ids=policy_action_ids,
                 acting_color=acting_color,
-                adapter=resolved[1],
+                adapter=resolved[1] if resolved is not None else None,
             )
             context = self._context_batch_via_rust(
                 game,
                 acting_color=acting_color,
-                adapter=resolved[1],
+                adapter=resolved[1] if resolved is not None else None,
             )
         else:
             entity = rust_game_to_entity_batch(
@@ -578,8 +641,16 @@ class EntityGraphRustEvaluator:
                 continue
 
             acting_color = str(game.current_color())
+            cache_enabled = int(self.config.cache_size) > 0
+            need_adapter_resolve = (
+                (not bool(self.config.rust_featurize)) or self._rust_topology is None
+            )
             # B1 dedup: see evaluate() -- one fetch shared by everything below.
-            snapshot_text, action_by_id = _fetch_leaf_decision_inputs(game, colors)
+            snapshot_text, action_by_id = _fetch_leaf_decision_inputs(
+                game,
+                colors,
+                include_snapshot=cache_enabled or need_adapter_resolve,
+            )
             policy_action_ids = rust_policy_action_ids(
                 game,
                 legal_actions,
@@ -588,9 +659,9 @@ class EntityGraphRustEvaluator:
                 action_by_id=action_by_id,
             )
             # See evaluate(): cache_size <= 0 skips key/hash work entirely.
-            cache_enabled = int(self.config.cache_size) > 0
             cache_key = None
             if cache_enabled:
+                assert snapshot_text is not None
                 cache_key = (
                     _state_key(game, snapshot_text=snapshot_text),
                     str(root_color),
@@ -607,26 +678,36 @@ class EntityGraphRustEvaluator:
                     )
                     continue
 
-            snapshot = json.loads(snapshot_text)
-            # B2 dedup: see evaluate() -- one shared resolve for both featurizers.
-            resolved = _resolve_entity_adapter(
-                game,
-                legal_actions,
-                colors=colors,
-                action_size=int(self.policy.action_size),
-                policy_action_ids=policy_action_ids,
-                snapshot=snapshot,
-                action_by_id=action_by_id,
-                public_observation=bool(self.config.public_observation),
-                perspective=acting_color,
-            )
+            # Mirror evaluate()'s warm-topology fast path. Native entity/context
+            # featurization consumes the Python adapter only on the first leaf,
+            # where it bootstraps the immutable BASE-map topology. Rebuilding the
+            # adapter after that point performs json.loads + per-player state JSON
+            # + payload construction for data neither native call reads.
+            resolved: tuple[
+                dict[str, Any], "_RustEntityFeatureEnv", list[dict[str, Any]]
+            ] | None = None
+            if need_adapter_resolve:
+                assert snapshot_text is not None
+                snapshot = json.loads(snapshot_text)
+                # B2 dedup: see evaluate() -- one shared resolve for both featurizers.
+                resolved = _resolve_entity_adapter(
+                    game,
+                    legal_actions,
+                    colors=colors,
+                    action_size=int(self.policy.action_size),
+                    policy_action_ids=policy_action_ids,
+                    snapshot=snapshot,
+                    action_by_id=action_by_id,
+                    public_observation=bool(self.config.public_observation),
+                    perspective=acting_color,
+                )
             if bool(self.config.rust_featurize):
                 entity = self._entity_batch_via_rust(
                     game,
                     colors=colors,
                     policy_action_ids=policy_action_ids,
                     acting_color=acting_color,
-                    adapter=resolved[1],
+                    adapter=resolved[1] if resolved is not None else None,
                 )
             else:
                 entity = rust_game_to_entity_batch(
@@ -643,7 +724,7 @@ class EntityGraphRustEvaluator:
                 context = self._context_batch_via_rust(
                     game,
                     acting_color=acting_color,
-                    adapter=resolved[1],
+                    adapter=resolved[1] if resolved is not None else None,
                 )
             else:
                 context = rust_action_context_batch(
@@ -781,9 +862,17 @@ class BatchedEntityGraphRustEvaluator(EntityGraphRustEvaluator):
             return super().evaluate(game, legal_actions, root_color=root_color, colors=colors)
 
         acting_color = str(game.current_color())
+        cache_enabled = int(self.config.cache_size) > 0
+        need_adapter_resolve = (
+            (not bool(self.config.rust_featurize)) or self._rust_topology is None
+        )
         # B1 dedup: fetch once, share across the policy-id translation, the
         # cache key, and (on a miss) both featurizer calls below.
-        snapshot_text, action_by_id = _fetch_leaf_decision_inputs(game, colors)
+        snapshot_text, action_by_id = _fetch_leaf_decision_inputs(
+            game,
+            colors,
+            include_snapshot=cache_enabled or need_adapter_resolve,
+        )
         policy_action_ids = rust_policy_action_ids(
             game,
             legal_actions,
@@ -793,9 +882,9 @@ class BatchedEntityGraphRustEvaluator(EntityGraphRustEvaluator):
         )
         # See EntityGraphRustEvaluator.evaluate(): cache_size <= 0 skips the
         # per-leaf blake2b/key-tuple work entirely, not just the store.
-        cache_enabled = int(self.config.cache_size) > 0
         cache_key = None
         if cache_enabled:
+            assert snapshot_text is not None
             cache_key = (
                 _state_key(game, snapshot_text=snapshot_text),
                 str(root_color),
@@ -811,27 +900,37 @@ class BatchedEntityGraphRustEvaluator(EntityGraphRustEvaluator):
                 uncertainty = cached[2] if len(cached) > 2 else 0.0
                 return self._eval_result(dict(cached[0]), float(cached[1]), uncertainty)
 
-        snapshot = json.loads(snapshot_text)
-        # B2 dedup: see EntityGraphRustEvaluator.evaluate() -- one shared
-        # resolve for both featurizers.
-        resolved = _resolve_entity_adapter(
-            game,
-            legal_actions,
-            colors=colors,
-            action_size=int(self.policy.action_size),
-            policy_action_ids=policy_action_ids,
-            snapshot=snapshot,
-            action_by_id=action_by_id,
-            public_observation=bool(self.config.public_observation),
-            perspective=acting_color,
-        )
+        # Same warm-topology fast path as EntityGraphRustEvaluator.evaluate()
+        # and evaluate_many(): after the first native leaf, adapter construction
+        # is dead work. This preamble runs in every caller thread before the
+        # request reaches the batching queue, so skipping it also improves the
+        # cross-game EvalServer client path inherited from this evaluator.
+        resolved: tuple[
+            dict[str, Any], "_RustEntityFeatureEnv", list[dict[str, Any]]
+        ] | None = None
+        if need_adapter_resolve:
+            assert snapshot_text is not None
+            snapshot = json.loads(snapshot_text)
+            # B2 dedup: see EntityGraphRustEvaluator.evaluate() -- one shared
+            # resolve for both featurizers.
+            resolved = _resolve_entity_adapter(
+                game,
+                legal_actions,
+                colors=colors,
+                action_size=int(self.policy.action_size),
+                policy_action_ids=policy_action_ids,
+                snapshot=snapshot,
+                action_by_id=action_by_id,
+                public_observation=bool(self.config.public_observation),
+                perspective=acting_color,
+            )
         if bool(self.config.rust_featurize):
             entity = self._entity_batch_via_rust(
                 game,
                 colors=colors,
                 policy_action_ids=policy_action_ids,
                 acting_color=acting_color,
-                adapter=resolved[1],
+                adapter=resolved[1] if resolved is not None else None,
             )
         else:
             entity = rust_game_to_entity_batch(
@@ -848,7 +947,7 @@ class BatchedEntityGraphRustEvaluator(EntityGraphRustEvaluator):
             context = self._context_batch_via_rust(
                 game,
                 acting_color=acting_color,
-                adapter=resolved[1],
+                adapter=resolved[1] if resolved is not None else None,
             )
         else:
             context = rust_action_context_batch(

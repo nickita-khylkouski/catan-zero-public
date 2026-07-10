@@ -13,10 +13,12 @@
 #            differs Intel vs AMD etc); cross-vendor fleet-box acceptance
 #            sets NOOP_ATOL=1e-4 to accept a benign ~1e-6 delta instead.
 #
-# CPU-first: runs green off-GPU (validated 1798 pass / 8 skip / 0 fail, CPU-only).
+# CPU-first: runs green off-GPU; use the current command output as evidence
+# instead of preserving a stale test-count snapshot in this launcher.
 # Usage:  bash scripts/gate.sh            # full gate
 #         bash scripts/gate.sh --only suite|parity|goldens|noop
 # Env:    PY=<python>  (default: .venv/bin/python)   REPO=<repo root>
+#         NOOP_CHAMPION=<checkpoint> (default: ~/bundle/champion_v0.pt)
 #         NOOP_ATOL=<float>  (default: unset = strict --atol 0.0 byte-exact;
 #                    fleet-box acceptance across CPU vendors uses 1e-4)
 set -uo pipefail
@@ -50,8 +52,11 @@ stage_parity() { run "parity 19/19" "$PY" -m pytest "${PARITY[@]}" -q -p no:cach
 stage_goldens(){ run "CAT-75 CLI goldens" "$PY" -m pytest "${GOLDENS[@]}" -q -p no:cacheprovider; }
 stage_noop()   {
   local atol_args=()
+  local champion_args=()
   [ -n "${NOOP_ATOL:-}" ] && atol_args=(--atol "$NOOP_ATOL")
-  run "champion no-op BIT-IDENTICAL" "$PY" scripts/check_champion_noop.py "${atol_args[@]}"
+  [ -n "${NOOP_CHAMPION:-}" ] && champion_args=(--champion "$NOOP_CHAMPION")
+  run "champion no-op BIT-IDENTICAL" "$PY" scripts/check_champion_noop.py \
+    "${champion_args[@]}" "${atol_args[@]}"
 }
 
 case "$ONLY" in

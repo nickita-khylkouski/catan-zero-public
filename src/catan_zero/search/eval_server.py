@@ -7,9 +7,10 @@ in the one-process-per-worker deployment, and the SM-96%/mem-1% context-thrash
 signature is present. See docs/designs/CAT67_eval_server.md sections 4/6 and the
 BUILD TRIGGER block.
 
-This is a THROUGHPUT prototype (mp_queue v0 transport), not a production
-deployment. It is a THIRD batching layer on top of the within-tree chance
-fan-out (evaluate_many) and the within-process micro-batcher
+This is a THROUGHPUT prototype with a stable Queue transport and an opt-in
+single-slot shared-memory request transport. Responses remain Queue-based. It
+is a THIRD batching layer on top of the within-tree chance fan-out
+(`evaluate_many`) and the within-process micro-batcher
 (BatchedEntityGraphRustEvaluator) -- it replaces neither.
 
 Design invariants honored here:
@@ -33,9 +34,16 @@ Reference: docs/designs/CAT67_eval_server.md
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager, nullcontext
+import ctypes
 import json
 import multiprocessing as mp
+from multiprocessing.connection import wait as _wait_for_connections
+import operator
 import queue as queue_mod
+import socket
+import threading
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -49,6 +57,16 @@ from catan_zero.search.neural_rust_mcts import (
 
 _DESIGN_DOC = "docs/designs/CAT67_eval_server.md"
 
+# These topology/annotation arrays are useful to symmetry transforms and shard
+# writers, but the policy forward neither validates nor consumes them.  Keep
+# them client-side instead of pickling four immutable arrays on every request.
+_NON_FORWARD_ENTITY_KEYS = frozenset(
+    {"hex_vertex_ids", "hex_edge_ids", "edge_vertex_ids", "event_target_ids"}
+)
+_LEGAL_PADDED_ENTITY_KEYS = frozenset(
+    {"legal_action_tokens", "legal_action_target_ids", "legal_action_mask"}
+)
+
 
 @dataclass(frozen=True, slots=True)
 class EvalServerConfig:
@@ -59,43 +77,64 @@ class EvalServerConfig:
         max_batch_size: Max requests packed into one ``forward_legal_np`` window.
         max_wait_ms: Straggler timeout; window flushes at size OR timeout.
         device: Torch device the single server-resident policy runs on.
-        transport: "mp_queue" (prototype v0). shared_memory (v1) is not built.
+        transport: ``"mp_queue"`` or opt-in ``"shared_memory"`` request slots.
         client_timeout_ms: Per-request client wait before raising (or falling
             back to a local evaluator if one is supplied).
     """
 
     max_batch_size: int = 64
-    max_wait_ms: float = 3.0
+    # Immediate queue draining won the H100 sweep at every tested workload;
+    # callers may opt into a non-zero aggregation window, but latency is the
+    # safer and faster default for the single-outstanding-request clients.
+    max_wait_ms: float = 0.0
     device: str = "cpu"
     transport: str = "mp_queue"
     client_timeout_ms: float = 5000.0
+    # One request slot per client. Four MiB covers current feature tensors and
+    # 11-row dice fan-out with substantial headroom; oversize requests safely
+    # fall back to the ordinary Queue payload protocol.
+    shared_memory_slot_bytes: int = 4 * 1024 * 1024
+    # Optional fail-closed event prefix retained before H2D/model forward.
+    # None preserves the checkpoint's historical 64-slot path. A configured
+    # limit is accepted only when every omitted event position is masked.
+    event_token_limit: int | None = None
+    # Optional IPC collector thread. It can overlap Queue deserialization with
+    # CUDA work, but remains opt-in because host-memory contention varies by
+    # payload/worker count and must be established by an on-box A/B.
+    request_collector: bool = False
+    # "highest" is strict FP32 matmul. "high" permits CUDA TF32 tensor-core
+    # matmuls; kept explicit so throughput/strength gates can compare regimes.
+    matmul_precision: str = "highest"
+    # Opt-in CUDA Graph capture of the fixed-shape state trunk. The raw policy
+    # remains authoritative for checkpoint metadata and the server performs
+    # event-tail cropping before this wrapper sees a request.
+    cuda_graph: bool = False
+    cuda_graph_batch_buckets: tuple[int, ...] = (
+        8,
+        16,
+        24,
+        32,
+        40,
+        48,
+        64,
+        80,
+        96,
+        128,
+        160,
+        192,
+    )
+    cuda_graph_warmup_iterations: int = 3
+    # Temporary exact-A/B harness; removed after the paired H100 measurement.
+    benchmark_legacy_merge: bool = False
 
 
 # --- window assembly ---------------------------------------------------------
 
 
-def _pad_legal_2d(arr: np.ndarray, max_legal: int, fill: Any) -> np.ndarray:
-    """(B, L) -> (B, max_legal), padding the legal dim at the tail."""
-    rows, width = int(arr.shape[0]), int(arr.shape[1])
-    if width == max_legal:
-        return arr
-    out = np.full((rows, max_legal), fill, dtype=arr.dtype)
-    out[:, :width] = arr
-    return out
-
-
-def _pad_legal_3d(arr: np.ndarray, max_legal: int, fill: Any) -> np.ndarray:
-    """(B, L, F) -> (B, max_legal, F), padding the legal dim at the tail."""
-    rows, width, feat = int(arr.shape[0]), int(arr.shape[1]), int(arr.shape[2])
-    if width == max_legal:
-        return arr
-    out = np.full((rows, max_legal, feat), fill, dtype=arr.dtype)
-    out[:, :width, :] = arr
-    return out
-
-
 def _merge_forward_payloads(
     payloads: list[dict[str, Any]],
+    *,
+    fixed_field_concatenate: bool = True,
 ) -> tuple[dict[str, np.ndarray], np.ndarray, np.ndarray, list[int]]:
     """Pad every request's legal dim to the window max and concatenate along the
     batch axis. Generalizes `_merge_batched_eval_requests` to variable-B requests
@@ -104,40 +143,643 @@ def _merge_forward_payloads(
     legal_action_target_ids -1, legal_action_mask False; all other (fixed-size,
     non-legal) entity arrays just concatenate.
     """
-    max_legal = max(int(p["legal_ids"].shape[1]) for p in payloads)
     row_counts = [int(p["legal_ids"].shape[0]) for p in payloads]
+    total_rows = sum(row_counts)
+    max_legal = max(int(p["legal_ids"].shape[1]) for p in payloads)
+    context_width = int(payloads[0]["context"].shape[2])
 
-    legal_ids = np.concatenate(
-        [_pad_legal_2d(p["legal_ids"], max_legal, -1) for p in payloads], axis=0
-    ).astype(np.int64, copy=False)
-    context = np.concatenate(
-        [_pad_legal_3d(p["context"], max_legal, 0.0) for p in payloads], axis=0
-    ).astype(np.float32, copy=False)
-
+    # Allocate each final array once, then copy every request directly into its
+    # slice.  The old pad-then-concatenate path allocated one padded temporary
+    # per request and copied it again into np.concatenate's output.
+    legal_ids = np.full((total_rows, max_legal), -1, dtype=np.int64)
+    context = np.zeros((total_rows, max_legal, context_width), dtype=np.float32)
     entity: dict[str, np.ndarray] = {}
-    for key in payloads[0]["entity"]:
-        vals = [p["entity"][key] for p in payloads]
+    for key, value in payloads[0]["entity"].items():
+        value = np.asarray(value)
         if key == "legal_action_tokens":
-            entity[key] = np.concatenate(
-                [_pad_legal_3d(v, max_legal, 0.0) for v in vals], axis=0
-            ).astype(vals[0].dtype, copy=False)
+            entity[key] = np.zeros(
+                (total_rows, max_legal, int(value.shape[2])), dtype=value.dtype
+            )
         elif key == "legal_action_target_ids":
-            entity[key] = np.concatenate(
-                [_pad_legal_3d(v, max_legal, -1) for v in vals], axis=0
-            ).astype(vals[0].dtype, copy=False)
+            entity[key] = np.full(
+                (total_rows, max_legal, int(value.shape[2])), -1, dtype=value.dtype
+            )
         elif key == "legal_action_mask":
-            entity[key] = np.concatenate(
-                [_pad_legal_2d(v, max_legal, False) for v in vals], axis=0
-            ).astype(np.bool_, copy=False)
+            entity[key] = np.zeros((total_rows, max_legal), dtype=np.bool_)
         else:
-            entity[key] = np.concatenate(vals, axis=0)
+            # Fixed-shape fields need no padding. Let NumPy perform their whole
+            # window copy in C rather than issuing requests*fields small Python
+            # slice assignments. np.concatenate also preserves the historical
+            # mixed-dtype promotion contract.
+            if fixed_field_concatenate:
+                entity[key] = np.concatenate(
+                    [payload["entity"][key] for payload in payloads], axis=0
+                )
+            else:
+                dtype = np.result_type(
+                    *(np.asarray(payload["entity"][key]).dtype for payload in payloads)
+                )
+                entity[key] = np.empty(
+                    (total_rows, *value.shape[1:]), dtype=dtype
+                )
+
+    offset = 0
+    for payload, n_rows in zip(payloads, row_counts):
+        end = offset + n_rows
+        legal_width = int(payload["legal_ids"].shape[1])
+        legal_ids[offset:end, :legal_width] = payload["legal_ids"]
+        context[offset:end, :legal_width] = payload["context"]
+        for key, destination in entity.items():
+            value = payload["entity"][key]
+            if key in _LEGAL_PADDED_ENTITY_KEYS:
+                destination[offset:end, :legal_width] = value
+            elif not fixed_field_concatenate:
+                destination[offset:end] = value
+        offset = end
     return entity, legal_ids, context, row_counts
+
+
+def _legal_cell_counts(payloads: list[dict[str, Any]]) -> tuple[int, int]:
+    """Return true legal cells and request-rectangular cells.
+
+    A request may itself contain multiple rows (for example a batched chance
+    fan-out), so ``rows * request_width`` is only an upper bound on useful
+    actions.  ``legal_action_mask`` is the forward contract's authoritative
+    per-row occupancy signal and excludes both that intra-request padding and
+    the additional padding introduced while merging a server window.
+    """
+    real_cells = sum(
+        int(np.count_nonzero(payload["entity"]["legal_action_mask"]))
+        for payload in payloads
+    )
+    request_cells = sum(
+        int(payload["legal_ids"].shape[0]) * int(payload["legal_ids"].shape[1])
+        for payload in payloads
+    )
+    return real_cells, request_cells
+
+
+def _event_tail_info(
+    entity: dict[str, np.ndarray], event_token_limit: int | None
+) -> tuple[np.ndarray, np.ndarray, int, int | None]:
+    """Validate event arrays and return normalized crop information."""
+    event_mask = np.asarray(entity["event_mask"], dtype=np.bool_)
+    event_tokens = np.asarray(entity["event_tokens"])
+    if event_mask.ndim != 2:
+        raise ValueError(f"event_mask must be rank 2, got {event_mask.shape}")
+    if event_tokens.ndim != 3:
+        raise ValueError(f"event_tokens must be rank 3, got {event_tokens.shape}")
+    if event_tokens.shape[:2] != event_mask.shape:
+        raise ValueError(
+            "event token/mask shape mismatch: "
+            f"tokens={event_tokens.shape} mask={event_mask.shape}"
+        )
+    padded_width = int(event_mask.shape[1])
+    active_columns = np.flatnonzero(np.any(event_mask, axis=0))
+    required_width = int(active_columns[-1] + 1) if active_columns.size else 0
+    if event_token_limit is None:
+        return event_mask, event_tokens, required_width, None
+    if isinstance(event_token_limit, bool):
+        raise TypeError("event_token_limit must be an integer, not bool")
+    try:
+        limit = operator.index(event_token_limit)
+    except TypeError as error:
+        raise TypeError("event_token_limit must be an integer") from error
+    if not 0 <= limit <= padded_width:
+        raise ValueError(
+            f"event_token_limit {event_token_limit!r} is outside [0, {padded_width}]"
+        )
+    if required_width > limit:
+        raise ValueError(
+            "event_token_limit would remove an unmasked event token: "
+            f"required={required_width} limit={limit}"
+        )
+    return event_mask, event_tokens, required_width, limit
+
+
+def _crop_masked_event_tail(
+    entity: dict[str, np.ndarray], event_token_limit: int | None
+) -> int:
+    """Crop only a batch-wide all-masked event suffix, returning required width."""
+    event_mask, event_tokens, required_width, limit = _event_tail_info(
+        entity, event_token_limit
+    )
+    if limit is None:
+        return required_width
+    entity["event_mask"] = event_mask[:, :limit]
+    entity["event_tokens"] = event_tokens[:, :limit]
+    return required_width
+
+
+def _crop_payload_event_tails_before_merge(
+    payloads: list[dict[str, Any]], event_token_limit: int | None
+) -> int | None:
+    """Validate then view-crop request event arrays before window allocation.
+
+    The historical path allocated and copied every request's 64x41 event tail,
+    then discarded it after merging.  For an explicit limit, validate *all*
+    requests first and only then replace each server-local payload entry with a
+    zero-copy prefix view.  This preserves fail-closed behavior without leaving
+    a partially mutated window when a later request is invalid. ``None`` keeps
+    the original full-width path and has no per-request overhead.
+    """
+    if event_token_limit is None:
+        return None
+    if isinstance(event_token_limit, bool):
+        raise TypeError("event_token_limit must be an integer, not bool")
+    try:
+        limit = operator.index(event_token_limit)
+    except TypeError as error:
+        raise TypeError("event_token_limit must be an integer") from error
+    event_arrays: list[tuple[np.ndarray, np.ndarray]] = []
+    for payload in payloads:
+        event_mask = np.asarray(payload["entity"]["event_mask"], dtype=np.bool_)
+        event_tokens = np.asarray(payload["entity"]["event_tokens"])
+        if event_mask.ndim != 2:
+            raise ValueError(f"event_mask must be rank 2, got {event_mask.shape}")
+        if event_tokens.ndim != 3:
+            raise ValueError(f"event_tokens must be rank 3, got {event_tokens.shape}")
+        if event_tokens.shape[:2] != event_mask.shape:
+            raise ValueError(
+                "event token/mask shape mismatch: "
+                f"tokens={event_tokens.shape} mask={event_mask.shape}"
+            )
+        padded_width = int(event_mask.shape[1])
+        if not 0 <= limit <= padded_width:
+            raise ValueError(
+                f"event_token_limit {event_token_limit!r} is outside "
+                f"[0, {padded_width}]"
+            )
+        event_arrays.append((event_mask, event_tokens))
+    # One C-level concatenate + reduction is materially cheaper than one NumPy
+    # reduction per request at 36-128 requests/window. Widths are normally
+    # identical; retain a correct fallback for mixed-width diagnostic clients.
+    widths = {int(event_mask.shape[1]) for event_mask, _tokens in event_arrays}
+    if len(widths) <= 1:
+        merged_mask = np.concatenate(
+            [event_mask for event_mask, _tokens in event_arrays], axis=0
+        )
+        active_columns = np.flatnonzero(np.any(merged_mask, axis=0))
+        required_width = int(active_columns[-1] + 1) if active_columns.size else 0
+    else:
+        required_width = 0
+        for event_mask, _tokens in event_arrays:
+            active_columns = np.flatnonzero(np.any(event_mask, axis=0))
+            if active_columns.size:
+                required_width = max(required_width, int(active_columns[-1] + 1))
+    if required_width > limit:
+        raise ValueError(
+            "event_token_limit would remove an unmasked event token: "
+            f"required={required_width} limit={limit}"
+        )
+    for payload, (event_mask, event_tokens) in zip(payloads, event_arrays):
+        payload["entity"]["event_mask"] = event_mask[:, :limit]
+        payload["entity"]["event_tokens"] = event_tokens[:, :limit]
+    return required_width
+
+
+def _payload_event_source_counts(payload: dict[str, Any]) -> tuple[int, int]:
+    """Recover pre-client-crop event occupancy for server telemetry."""
+    if (
+        "_event_source_active_tokens" in payload
+        and "_event_source_padded_tokens" in payload
+    ):
+        return (
+            int(payload["_event_source_active_tokens"]),
+            int(payload["_event_source_padded_tokens"]),
+        )
+    event_mask = np.asarray(payload["entity"]["event_mask"], dtype=np.bool_)
+    return int(np.count_nonzero(event_mask)), int(event_mask.size)
 
 
 # --- server ------------------------------------------------------------------
 
 
 _STOP = "__STOP__"
+_SHARED_REQUEST = "__SHARED_REQUEST_V1__"
+
+
+def _aligned_offset(offset: int, alignment: int = 64) -> int:
+    """Round a shared-slot byte offset up for cache-line-friendly arrays."""
+    return (int(offset) + alignment - 1) // alignment * alignment
+
+
+def _write_shared_array(
+    slot: Any,
+    capacity: int,
+    value: Any,
+    offset: int,
+) -> tuple[tuple[str, tuple[int, ...], int, int], int]:
+    """Copy one ndarray into a shared request slot and return compact metadata."""
+    array = np.ascontiguousarray(value)
+    if array.dtype.hasobject:
+        raise TypeError("object arrays cannot use EvalServer shared-memory transport")
+    offset = _aligned_offset(offset)
+    end = offset + int(array.nbytes)
+    if end > int(capacity):
+        raise BufferError(
+            f"EvalServer shared request needs {end} bytes, slot has {capacity}"
+        )
+    destination = np.frombuffer(slot, dtype=np.uint8, count=array.nbytes, offset=offset)
+    destination[:] = array.view(np.uint8).reshape(-1)
+    return (
+        array.dtype.str,
+        tuple(int(v) for v in array.shape),
+        offset,
+        array.nbytes,
+    ), end
+
+
+def _read_shared_array(
+    slot: Any, descriptor: tuple[str, tuple[int, ...], int, int]
+) -> np.ndarray:
+    """Return a zero-copy ndarray view described by shared-slot metadata."""
+    dtype_string, shape, offset, nbytes = descriptor
+    dtype = np.dtype(dtype_string)
+    expected = int(np.prod(shape, dtype=np.int64)) * int(dtype.itemsize)
+    if expected != int(nbytes):
+        raise ValueError(
+            f"invalid shared request descriptor: shape/dtype need {expected} bytes, "
+            f"metadata says {nbytes}"
+        )
+    return np.ndarray(shape=shape, dtype=dtype, buffer=slot, offset=int(offset))
+
+
+def _pack_shared_request(
+    slot: Any, capacity: int, payload: dict[str, Any]
+) -> dict[str, Any]:
+    """Pack the forward payload into one single-outstanding client slot."""
+    offset = 0
+    entity_metadata: dict[str, Any] = {}
+    for key, value in payload["entity"].items():
+        entity_metadata[key], offset = _write_shared_array(
+            slot, capacity, value, offset
+        )
+    legal_metadata, offset = _write_shared_array(
+        slot, capacity, payload["legal_ids"], offset
+    )
+    context_metadata, offset = _write_shared_array(
+        slot, capacity, payload["context"], offset
+    )
+    metadata = {
+        "entity": entity_metadata,
+        "legal_ids": legal_metadata,
+        "context": context_metadata,
+        "return_q": bool(payload.get("return_q", False)),
+        "used_bytes": int(offset),
+    }
+    for key in ("_event_source_active_tokens", "_event_source_padded_tokens"):
+        if key in payload:
+            metadata[key] = int(payload[key])
+    return metadata
+
+
+def _unpack_shared_request(slot: Any, metadata: dict[str, Any]) -> dict[str, Any]:
+    """Recreate forward arrays as views; no request tensor is copied here."""
+    payload = {
+        "entity": {
+            key: _read_shared_array(slot, descriptor)
+            for key, descriptor in metadata["entity"].items()
+        },
+        "legal_ids": _read_shared_array(slot, metadata["legal_ids"]),
+        "context": _read_shared_array(slot, metadata["context"]),
+        "return_q": bool(metadata.get("return_q", False)),
+        "_transport": "shared_memory",
+        "_transport_bytes": int(metadata.get("used_bytes", 0)),
+    }
+    for key in ("_event_source_active_tokens", "_event_source_padded_tokens"):
+        if key in metadata:
+            payload[key] = int(metadata[key])
+    return payload
+
+
+class _SharedMemoryRequestEndpoint:
+    """Client-side single-slot request sender.
+
+    Only the compact descriptor is pickled into the notification queue. The
+    tensor bytes live in a spawn-inherited ``RawArray``. A client may issue one
+    request at a time, matching ``RemoteEvalClient``'s existing invariant.
+    """
+
+    def __init__(
+        self,
+        notification_queue: Any,
+        slot: Any,
+        in_flight_request_id: Any,
+        slot_bytes: int,
+        client_id: int,
+    ) -> None:
+        self._notification_queue = notification_queue
+        self._slot = slot
+        self._in_flight_request_id = in_flight_request_id
+        self._slot_bytes = int(slot_bytes)
+        self._client_id = int(client_id)
+
+    def put(self, item: Any) -> None:
+        if item == _STOP:
+            self._notification_queue.put(item)
+            return
+        client_id, req_id, payload = item
+        if int(client_id) != self._client_id:
+            raise ValueError(
+                f"shared request endpoint {self._client_id} received client {client_id}"
+            )
+        # Enforce the single-outstanding invariant in the transport itself.
+        # This state is shared between every facade for a client slot, so even
+        # the backward-compatible receiver.put() API cannot overwrite an
+        # unread descriptor. A second request safely uses the ordinary Queue
+        # payload path until the matching response releases the slot.
+        with self._in_flight_request_id.get_lock():
+            if int(self._in_flight_request_id.value) >= 0:
+                self._notification_queue.put(item)
+                return
+            try:
+                metadata = _pack_shared_request(self._slot, self._slot_bytes, payload)
+            except (BufferError, TypeError, ValueError):
+                # Correctness-first overflow/unsupported-dtype fallback. The
+                # server accepts ordinary Queue payloads in the same stream.
+                self._notification_queue.put(item)
+                return
+            self._in_flight_request_id.value = int(req_id)
+        try:
+            self._notification_queue.put(
+                (_SHARED_REQUEST, self._client_id, int(req_id), metadata)
+            )
+        except BaseException:
+            # No notification means the server cannot be using this slot.
+            with self._in_flight_request_id.get_lock():
+                if int(self._in_flight_request_id.value) == int(req_id):
+                    self._in_flight_request_id.value = -1
+            raise
+
+    def request_complete(self, client_id: int, req_id: int) -> None:
+        """Release the slot only for the response matching its descriptor."""
+        if int(client_id) != self._client_id:
+            raise ValueError(
+                f"shared request endpoint {self._client_id} completed client {client_id}"
+            )
+        with self._in_flight_request_id.get_lock():
+            if int(self._in_flight_request_id.value) == int(req_id):
+                self._in_flight_request_id.value = -1
+
+
+class _SharedMemoryRequestReceiver:
+    """Server-side queue facade that expands shared-slot notifications."""
+
+    def __init__(
+        self,
+        notification_queue: Any,
+        slots: list[Any],
+        in_flight_request_ids: list[Any],
+    ) -> None:
+        self._notification_queue = notification_queue
+        self._slots = slots
+        self._in_flight_request_ids = in_flight_request_ids
+
+    @property
+    def _reader(self) -> Any:
+        # _GatedRequestCollector waits on the underlying Queue connection.
+        return self._notification_queue._reader
+
+    def _decode_item(self, item: Any) -> Any:
+        if not (
+            isinstance(item, tuple) and len(item) == 4 and item[0] == _SHARED_REQUEST
+        ):
+            return item
+        _marker, client_id, req_id, metadata = item
+        client_id = int(client_id)
+        if not 0 <= client_id < len(self._slots):
+            raise ValueError(f"invalid shared-memory client id {client_id}")
+        payload = _unpack_shared_request(self._slots[client_id], metadata)
+        return client_id, int(req_id), payload
+
+    def get(self, *args: Any, **kwargs: Any) -> Any:
+        return self._decode_item(self._notification_queue.get(*args, **kwargs))
+
+    def get_nowait(self) -> Any:
+        return self._decode_item(self._notification_queue.get_nowait())
+
+    def put(self, item: Any) -> None:
+        # This preserves the historical ``server.request_queue`` API. It does
+        # transfer all slot handles to that client under spawn, so launchers
+        # should prefer ``request_queue_for_client`` once convenient.
+        if item == _STOP:
+            self._notification_queue.put(item)
+            return
+        client_id, _req_id, _payload = item
+        client_id = int(client_id)
+        if not 0 <= client_id < len(self._slots):
+            raise ValueError(f"invalid shared-memory client id {client_id}")
+        endpoint = _SharedMemoryRequestEndpoint(
+            self._notification_queue,
+            self._slots[client_id],
+            self._in_flight_request_ids[client_id],
+            len(self._slots[client_id]),
+            client_id,
+        )
+        endpoint.put(item)
+
+    def request_complete(self, client_id: int, req_id: int) -> None:
+        client_id = int(client_id)
+        if not 0 <= client_id < len(self._slots):
+            raise ValueError(f"invalid shared-memory client id {client_id}")
+        with self._in_flight_request_ids[client_id].get_lock():
+            if int(self._in_flight_request_ids[client_id].value) == int(req_id):
+                self._in_flight_request_ids[client_id].value = -1
+
+    def close(self) -> None:
+        self._notification_queue.close()
+
+    def join_thread(self) -> None:
+        self._notification_queue.join_thread()
+
+
+def _make_shared_request_transport(
+    ctx: Any, num_clients: int, slot_bytes: int
+) -> tuple[_SharedMemoryRequestReceiver, list[_SharedMemoryRequestEndpoint]]:
+    if int(slot_bytes) <= 0:
+        raise ValueError("shared_memory_slot_bytes must be positive")
+    notification_queue = ctx.Queue()
+    slots = [ctx.RawArray(ctypes.c_ubyte, int(slot_bytes)) for _ in range(num_clients)]
+    in_flight_request_ids = [
+        ctx.Value(ctypes.c_longlong, -1, lock=True) for _ in range(num_clients)
+    ]
+    receiver = _SharedMemoryRequestReceiver(
+        notification_queue, slots, in_flight_request_ids
+    )
+    endpoints = [
+        _SharedMemoryRequestEndpoint(
+            notification_queue,
+            slot,
+            in_flight_request_ids[client_id],
+            slot_bytes,
+            client_id,
+        )
+        for client_id, slot in enumerate(slots)
+    ]
+    return receiver, endpoints
+
+
+class _GatedRequestCollector:
+    """Deserialize mp.Queue requests only while the inference loop permits it.
+
+    ``threading.Event`` alone cannot pause a collector already blocked inside
+    ``Queue.get()``. This collector instead waits on both the queue's pipe and a
+    wakeup socket. The activity lock covers the complete ``get`` (including
+    unpickling), so ``paused()`` first wakes an idle collector and then waits out
+    any in-flight deserialize before entering the protected merge/scatter phase.
+    Both idle waits are kernel-blocking; there is no timeout polling loop.
+    """
+
+    def __init__(self, request_queue: "mp.Queue") -> None:
+        self._request_queue = request_queue
+        self._queue_reader = request_queue._reader
+        self.ready_requests: queue_mod.Queue[Any] = queue_mod.Queue()
+        self._gate = threading.Event()
+        self._gate.set()
+        self._shutdown = threading.Event()
+        self._activity_lock = threading.Lock()
+        self._wake_reader, self._wake_writer = socket.socketpair()
+        self._wake_reader.setblocking(False)
+        self._wake_writer.setblocking(False)
+        self._thread = threading.Thread(
+            target=self._run,
+            daemon=True,
+            name="cat67-request-collector",
+        )
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def _wake(self) -> None:
+        try:
+            self._wake_writer.send(b"\0")
+        except (BlockingIOError, OSError):
+            # A full socket already contains a wakeup byte. OSError is only
+            # possible during process teardown, when another wake is moot.
+            pass
+
+    def _drain_wakeup(self) -> None:
+        while True:
+            try:
+                if not self._wake_reader.recv(4096):
+                    return
+            except BlockingIOError:
+                return
+
+    def _run(self) -> None:
+        try:
+            while True:
+                self._gate.wait()
+                if self._shutdown.is_set():
+                    return
+                ready = _wait_for_connections((self._queue_reader, self._wake_reader))
+                if self._wake_reader in ready:
+                    self._drain_wakeup()
+                if (
+                    self._shutdown.is_set()
+                    or not self._gate.is_set()
+                    or self._queue_reader not in ready
+                ):
+                    continue
+                with self._activity_lock:
+                    # paused() may have cleared the gate while this thread was
+                    # waiting for a merge/scatter phase to release the lock.
+                    if self._shutdown.is_set() or not self._gate.is_set():
+                        continue
+                    item = self._request_queue.get()
+                self.ready_requests.put(item)
+                if item == _STOP:
+                    return
+        except BaseException as error:  # pragma: no cover - process/pipe failure
+            if not self._shutdown.is_set():
+                self.ready_requests.put(error)
+
+    @contextmanager
+    def paused(self) -> Iterator[None]:
+        self._gate.clear()
+        self._wake()
+        try:
+            # Acquisition is the acknowledgement: no get/unpickle is active,
+            # and the cleared gate prevents a new one from starting.
+            with self._activity_lock:
+                yield
+        finally:
+            self._gate.set()
+
+    def close(self, timeout: float = 1.0) -> None:
+        self._shutdown.set()
+        # The collector can be blocked either on the pause gate or in the OS
+        # connection wait. Release both before joining it.
+        self._gate.set()
+        self._wake()
+        self._thread.join(timeout=timeout)
+        if self._thread.is_alive():
+            raise TimeoutError("request collector did not stop")
+        self._wake_reader.close()
+        self._wake_writer.close()
+
+
+def _policy_needs_action_targets(policy: Any) -> bool:
+    """Whether this loaded policy consumes ``legal_action_target_ids``.
+
+    Unknown/custom policy objects fail closed to transporting the field. The
+    concrete EntityGraphPolicy always exposes its config, whose two target-aware
+    heads are the only forward branches that read these IDs.
+    """
+    policy_config = getattr(policy, "config", None)
+    if policy_config is None:
+        return True
+    return bool(
+        getattr(policy_config, "action_target_gather", False)
+        or getattr(policy_config, "edge_policy_head", False)
+    )
+
+
+def _make_forward_policy(policy: Any, config: EvalServerConfig) -> Any:
+    """Return the narrow inference wrapper while retaining ``policy`` itself.
+
+    CUDA Graphs are deliberately restricted to the strict-FP32 production
+    regime. Event cropping belongs to EvalServer, so the runner receives
+    ``event_token_limit=None`` and cannot crop the already-validated batch a
+    second time.
+    """
+    if not config.cuda_graph:
+        return policy
+    if str(config.matmul_precision) != "highest":
+        raise ValueError(
+            "EvalServer CUDA Graph inference requires "
+            "matmul_precision='highest'"
+        )
+    from catan_zero.search.cuda_graph_inference import (
+        CudaGraphInferenceConfig,
+        CudaGraphInferenceRunner,
+    )
+
+    return CudaGraphInferenceRunner(
+        policy,
+        CudaGraphInferenceConfig(
+            enabled=True,
+            batch_buckets=tuple(config.cuda_graph_batch_buckets),
+            event_token_limit=None,
+            warmup_iterations=int(config.cuda_graph_warmup_iterations),
+        ),
+    )
+
+
+def _record_cuda_graph_call(stats: dict[str, Any], forward_policy: Any) -> None:
+    """Accumulate runner-path telemetry after one successful forward call."""
+    stats["cuda_graph_calls"] += 1
+    stats["cuda_graph_graph_count"] = int(
+        getattr(forward_policy, "graph_count", 0)
+    )
+    if getattr(forward_policy, "last_path", None) == "cuda_graph":
+        return
+    stats["cuda_graph_fallbacks"] += 1
+    reason = str(getattr(forward_policy, "last_fallback_reason", None) or "unknown")
+    stats["cuda_graph_last_fallback_reason"] = reason
+    reasons = stats["cuda_graph_fallback_reason_histogram"]
+    reasons[reason] = int(reasons.get(reason, 0)) + 1
 
 
 def _server_main(
@@ -155,92 +797,282 @@ def _server_main(
     from catan_zero.rl.entity_token_policy import EntityGraphPolicy
 
     torch.set_num_threads(1)
+    try:
+        torch.set_num_interop_threads(1)
+    except RuntimeError:
+        pass
+    precision = str(config.matmul_precision)
+    if precision not in {"highest", "high", "medium"}:
+        raise ValueError(f"invalid EvalServer matmul_precision={precision!r}")
+    torch.set_float32_matmul_precision(precision)
     policy = EntityGraphPolicy.load(checkpoint, device=config.device)
     handshake["action_size"] = int(policy.action_size)
     handshake["trained_with_masked_hidden_info"] = bool(
         getattr(policy, "trained_with_masked_hidden_info", False)
     )
+    handshake["needs_action_targets"] = _policy_needs_action_targets(policy)
+    handshake["matmul_precision"] = precision
+    handshake["transport"] = str(config.transport)
+    handshake["event_token_limit"] = config.event_token_limit
+    handshake["client_event_token_limit"] = (
+        None if config.benchmark_legacy_merge else config.event_token_limit
+    )
+    handshake["cuda_graph"] = bool(config.cuda_graph)
+    handshake["cuda_graph_batch_buckets"] = tuple(config.cuda_graph_batch_buckets)
+    handshake["cuda_graph_warmup_iterations"] = int(
+        config.cuda_graph_warmup_iterations
+    )
+    forward_policy = _make_forward_policy(policy, config)
     # Warm the CUDA context / kernels once so the first real window isn't slow.
     handshake["ready"] = True
     ready_event.set()
 
     max_b = max(1, int(config.max_batch_size))
     wait_s = max(0.0, float(config.max_wait_ms) / 1000.0)
-    stats = {"windows": 0, "requests": 0, "rows": 0, "sum_batch": 0}
+    stats = {
+        "windows": 0,
+        "requests": 0,
+        "rows": 0,
+        "max_window_requests": 0,
+        "max_window_rows": 0,
+        "real_legal_cells": 0,
+        "request_legal_cells": 0,
+        "padded_legal_cells": 0,
+        "first_request_get_sec": 0.0,
+        "queued_request_drain_sec": 0.0,
+        "straggler_wait_sec": 0.0,
+        "merge_sec": 0.0,
+        "forward_and_d2h_sec": 0.0,
+        "response_enqueue_sec": 0.0,
+        "window_request_histogram": {},
+        "window_row_histogram": {},
+        "window_legal_width_histogram": {},
+        "collector_enabled": bool(config.request_collector),
+        "transport": str(config.transport),
+        "shared_memory_requests": 0,
+        "shared_memory_request_bytes": 0,
+        "queue_payload_requests": 0,
+        "event_token_limit": config.event_token_limit,
+        "event_active_tokens": 0,
+        "event_padded_tokens": 0,
+        "event_required_width_histogram": {},
+        "cuda_graph_enabled": bool(config.cuda_graph),
+        "cuda_graph_calls": 0,
+        "cuda_graph_fallbacks": 0,
+        "cuda_graph_graph_count": 0,
+        "cuda_graph_last_fallback_reason": None,
+        "cuda_graph_fallback_reason_histogram": {},
+    }
     stopping = False
 
+    collector: _GatedRequestCollector | None = None
+    request_source: Any = request_queue
+    if config.request_collector:
+        # Multiprocessing Queue.get() performs pipe reads and NumPy unpickling
+        # in the calling thread. A single collector remains the only mp.Queue
+        # consumer while the inference loop drains a cheap in-process FIFO.
+        # The gated collector overlaps deserialize with CUDA, but acknowledges
+        # every pause before merge/scatter so host-memory contention cannot leak
+        # through an already-blocked Queue.get().
+        collector = _GatedRequestCollector(request_queue)
+        collector.start()
+        request_source = collector.ready_requests
+
     while not stopping:
+        first_get_started = time.perf_counter()
         try:
-            first = request_queue.get(timeout=0.25)
+            first = request_source.get(timeout=0.25)
         except queue_mod.Empty:
+            stats["first_request_get_sec"] += time.perf_counter() - first_get_started
             continue
+        stats["first_request_get_sec"] += time.perf_counter() - first_get_started
+        if isinstance(first, BaseException):
+            raise RuntimeError("eval-server request collector failed") from first
         if first == _STOP:
             break
         window = [first]
+        collector_error: BaseException | None = None
         # Drain whatever is already queued (non-blocking) up to max_b.
+        drain_started = time.perf_counter()
         while len(window) < max_b:
             try:
-                item = request_queue.get_nowait()
+                item = request_source.get_nowait()
             except queue_mod.Empty:
+                break
+            if isinstance(item, BaseException):
+                collector_error = item
+                stopping = True
                 break
             if item == _STOP:
                 stopping = True
                 break
             window.append(item)
+        stats["queued_request_drain_sec"] += time.perf_counter() - drain_started
         # Straggler wait: give slow producers up to wait_s to fill the window.
         if len(window) < max_b and wait_s > 0.0 and not stopping:
+            straggler_started = time.perf_counter()
             deadline = time.perf_counter() + wait_s
             while len(window) < max_b:
                 remaining = deadline - time.perf_counter()
                 if remaining <= 0.0:
                     break
                 try:
-                    item = request_queue.get(timeout=remaining)
+                    item = request_source.get(timeout=remaining)
                 except queue_mod.Empty:
+                    break
+                if isinstance(item, BaseException):
+                    collector_error = item
+                    stopping = True
                     break
                 if item == _STOP:
                     stopping = True
                     break
                 window.append(item)
+            stats["straggler_wait_sec"] += time.perf_counter() - straggler_started
 
         if not window:
             continue
 
         ids = [(client_id, req_id) for (client_id, req_id, _payload) in window]
         payloads = [payload for (_c, _r, payload) in window]
+        return_q_flags = [bool(payload.get("return_q", False)) for payload in payloads]
         try:
-            entity, legal_ids, context, row_counts = _merge_forward_payloads(payloads)
-            with torch.no_grad():
-                outputs = policy.forward_legal_np(entity, legal_ids, context, return_q=False)
+            with collector.paused() if collector is not None else nullcontext():
+                if collector_error is not None:
+                    raise RuntimeError(
+                        "eval-server request collector failed"
+                    ) from collector_error
+                merge_started = time.perf_counter()
+                event_active_tokens: int | None = None
+                event_padded_tokens: int | None = None
+                required_event_width: int | None = None
+                if (
+                    config.event_token_limit is not None
+                    and not config.benchmark_legacy_merge
+                ):
+                    event_source_counts = [
+                        _payload_event_source_counts(payload) for payload in payloads
+                    ]
+                    event_active_tokens = sum(
+                        counts[0] for counts in event_source_counts
+                    )
+                    event_padded_tokens = sum(
+                        counts[1] for counts in event_source_counts
+                    )
+                    client_cropped_events = all(
+                        "_event_source_padded_tokens" in payload
+                        for payload in payloads
+                    )
+                    if not client_cropped_events:
+                        required_event_width = _crop_payload_event_tails_before_merge(
+                            payloads, config.event_token_limit
+                        )
+                entity, legal_ids, context, row_counts = _merge_forward_payloads(
+                    payloads,
+                    fixed_field_concatenate=not config.benchmark_legacy_merge,
+                )
+                if event_active_tokens is None or event_padded_tokens is None:
+                    merged_event_mask = np.asarray(
+                        entity["event_mask"], dtype=np.bool_
+                    )
+                    event_active_tokens = int(np.count_nonzero(merged_event_mask))
+                    event_padded_tokens = int(merged_event_mask.size)
+                stats["event_active_tokens"] += int(event_active_tokens)
+                stats["event_padded_tokens"] += int(event_padded_tokens)
+                if required_event_width is None:
+                    required_event_width = _crop_masked_event_tail(
+                        entity, config.event_token_limit
+                    )
+                event_histogram = stats["event_required_width_histogram"]
+                event_histogram[required_event_width] = (
+                    int(event_histogram.get(required_event_width, 0)) + 1
+                )
+                stats["merge_sec"] += time.perf_counter() - merge_started
+            forward_started = time.perf_counter()
+            with torch.inference_mode():
+                outputs = forward_policy.forward_legal_np(
+                    entity, legal_ids, context, return_q=any(return_q_flags)
+                )
+            if config.cuda_graph:
+                _record_cuda_graph_call(stats, forward_policy)
             logits = outputs["logits"].detach().float().cpu().numpy()
             value = outputs["value"].detach().float().cpu().numpy()
             vu = outputs.get("value_uncertainty")
             vu = None if vu is None else vu.detach().float().cpu().numpy()
-
-            offset = 0
-            for (client_id, req_id), n_rows in zip(ids, row_counts):
-                sl = slice(offset, offset + n_rows)
-                offset += n_rows
-                result = {"logits": logits[sl].copy(), "value": value[sl].copy()}
-                if vu is not None:
-                    result["value_uncertainty"] = vu[sl].copy()
-                response_queues[client_id].put((req_id, result, None))
-            stats["windows"] += 1
-            stats["requests"] += len(window)
-            stats["rows"] += int(offset)
-            stats["sum_batch"] += int(offset)
+            q_values = outputs.get("q_values")
+            q_values = (
+                None if q_values is None else q_values.detach().float().cpu().numpy()
+            )
+            stats["forward_and_d2h_sec"] += time.perf_counter() - forward_started
+            with collector.paused() if collector is not None else nullcontext():
+                response_started = time.perf_counter()
+                offset = 0
+                for (client_id, req_id), n_rows, wants_q, payload in zip(
+                    ids, row_counts, return_q_flags, payloads
+                ):
+                    sl = slice(offset, offset + n_rows)
+                    offset += n_rows
+                    legal_width = int(payload["legal_ids"].shape[1])
+                    result = {
+                        "logits": logits[sl, :legal_width].copy(),
+                        "value": value[sl].copy(),
+                    }
+                    if vu is not None:
+                        result["value_uncertainty"] = vu[sl].copy()
+                    if wants_q:
+                        if q_values is None:
+                            raise RuntimeError(
+                                "EvalServer policy omitted q_values for return_q request"
+                            )
+                        result["q_values"] = q_values[sl, :legal_width].copy()
+                    response_queues[client_id].put((req_id, result, None))
+                stats["response_enqueue_sec"] += time.perf_counter() - response_started
+                stats["windows"] += 1
+                stats["requests"] += len(window)
+                stats["rows"] += int(offset)
+                shared_requests = sum(
+                    payload.get("_transport") == "shared_memory" for payload in payloads
+                )
+                stats["shared_memory_requests"] += int(shared_requests)
+                stats["shared_memory_request_bytes"] += sum(
+                    int(payload.get("_transport_bytes", 0)) for payload in payloads
+                )
+                stats["queue_payload_requests"] += len(window) - int(shared_requests)
+                stats["max_window_requests"] = max(
+                    stats["max_window_requests"], len(window)
+                )
+                stats["max_window_rows"] = max(stats["max_window_rows"], int(offset))
+                max_legal = max(
+                    int(payload["legal_ids"].shape[1]) for payload in payloads
+                )
+                real_legal_cells, request_legal_cells = _legal_cell_counts(payloads)
+                stats["real_legal_cells"] += real_legal_cells
+                stats["request_legal_cells"] += request_legal_cells
+                stats["padded_legal_cells"] += int(offset) * max_legal
+                for histogram_name, key in (
+                    ("window_request_histogram", len(window)),
+                    ("window_row_histogram", int(offset)),
+                    ("window_legal_width_histogram", max_legal),
+                ):
+                    histogram = stats[histogram_name]
+                    histogram[key] = int(histogram.get(key, 0)) + 1
         except BaseException as error:  # pragma: no cover - surfaced to clients
-            for client_id, req_id in ids:
-                response_queues[client_id].put((req_id, None, repr(error)))
+            with collector.paused() if collector is not None else nullcontext():
+                for client_id, req_id in ids:
+                    response_queues[client_id].put((req_id, None, repr(error)))
 
+    if collector is not None:
+        collector.close(timeout=1.0)
+    # Compatibility alias retained for older telemetry consumers.
+    stats["sum_batch"] = int(stats["rows"])
     handshake["stats"] = dict(stats)
 
 
 class EvalServer:
     """Single-process inference service holding one GPU/CPU-resident policy and
-    servicing packed leaf requests from many game-worker processes over an mp
-    Queue. Start it, wait for `ready()`, hand `request_queue` + the per-client
-    `response_queues` to `RemoteEvalClient`s, then `stop()` when done.
+    servicing packed leaf requests from many game-worker processes. Start it,
+    wait for `ready()`, hand `request_queue_for_client(i)` + the corresponding
+    `response_queues[i]` to each `RemoteEvalClient`, then `stop()` when done.
     """
 
     def __init__(
@@ -256,8 +1088,24 @@ class EvalServer:
         self.config = config or EvalServerConfig()
         self.num_clients = int(num_clients)
         self._ctx = mp_context or mp.get_context("spawn")
-        self.request_queue: mp.Queue = self._ctx.Queue()
-        self.response_queues: list[mp.Queue] = [self._ctx.Queue() for _ in range(self.num_clients)]
+        transport = str(self.config.transport)
+        if transport == "mp_queue":
+            self.request_queue: Any = self._ctx.Queue()
+            self.request_queues: list[Any] = [self.request_queue] * self.num_clients
+        elif transport == "shared_memory":
+            self.request_queue, self.request_queues = _make_shared_request_transport(
+                self._ctx,
+                self.num_clients,
+                int(self.config.shared_memory_slot_bytes),
+            )
+        else:
+            raise ValueError(
+                f"unsupported EvalServer transport {transport!r}; "
+                "expected 'mp_queue' or 'shared_memory'"
+            )
+        self.response_queues: list[mp.Queue] = [
+            self._ctx.Queue() for _ in range(self.num_clients)
+        ]
         self._ready = self._ctx.Event()
         self._manager = self._ctx.Manager()
         self._handshake = self._manager.dict()
@@ -275,30 +1123,113 @@ class EvalServer:
             daemon=True,
             name="cat67-eval-server",
         )
+        self._stopped = False
+        self._last_stats: dict[str, Any] = {}
 
     def start(self) -> None:
         self._proc.start()
 
+    def request_queue_for_client(self, client_id: int) -> Any:
+        """Return the smallest spawn payload for one RemoteEvalClient.
+
+        Callers should prefer this over passing ``request_queue`` directly. For
+        ``mp_queue`` both are the same object; shared-memory mode returns only
+        that client's slot instead of all client slots.
+        """
+        client_id = int(client_id)
+        if not 0 <= client_id < self.num_clients:
+            raise IndexError(f"client id {client_id} outside [0, {self.num_clients})")
+        return self.request_queues[client_id]
+
     def wait_ready(self, timeout: float = 120.0) -> dict[str, Any]:
-        if not self._ready.wait(timeout=timeout):
-            raise TimeoutError("eval server did not become ready")
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        while not self._ready.wait(
+            timeout=min(0.1, max(0.0, deadline - time.monotonic()))
+        ):
+            if self._proc.exitcode is not None:
+                raise RuntimeError(
+                    f"eval server exited before ready (exitcode={self._proc.exitcode})"
+                )
+            if time.monotonic() >= deadline:
+                raise TimeoutError("eval server did not become ready")
         return {
             "action_size": int(self._handshake["action_size"]),
             "trained_with_masked_hidden_info": bool(
                 self._handshake["trained_with_masked_hidden_info"]
             ),
+            "needs_action_targets": bool(
+                self._handshake.get("needs_action_targets", True)
+            ),
+            "matmul_precision": str(self._handshake.get("matmul_precision", "highest")),
+            "transport": str(self._handshake.get("transport", "mp_queue")),
+            "event_token_limit": self._handshake.get("event_token_limit"),
+            "client_event_token_limit": self._handshake.get(
+                "client_event_token_limit"
+            ),
+            "cuda_graph": bool(self._handshake.get("cuda_graph", False)),
+            "cuda_graph_batch_buckets": tuple(
+                self._handshake.get("cuda_graph_batch_buckets", ())
+            ),
+            "cuda_graph_warmup_iterations": int(
+                self._handshake.get("cuda_graph_warmup_iterations", 0)
+            ),
         }
 
+    @property
+    def exitcode(self) -> int | None:
+        """Current server-process exit code, or ``None`` while it is running."""
+        return self._proc.exitcode
+
     def stop(self) -> dict[str, Any]:
+        if self._stopped:
+            return dict(self._last_stats)
+        self._stopped = True
         try:
-            self.request_queue.put(_STOP)
-        except Exception:
-            pass
-        self._proc.join(timeout=10.0)
-        stats = dict(self._handshake.get("stats", {})) if self._handshake else {}
-        if self._proc.is_alive():
-            self._proc.terminate()
-        return stats
+            proc_started = self._proc.pid is not None
+            if proc_started and self._proc.is_alive():
+                try:
+                    self.request_queue.put(_STOP)
+                except Exception:
+                    pass
+                self._proc.join(timeout=10.0)
+            try:
+                self._last_stats = (
+                    dict(self._handshake.get("stats", {})) if self._handshake else {}
+                )
+            except (EOFError, BrokenPipeError, OSError):
+                self._last_stats = {}
+            if proc_started and self._proc.is_alive():
+                self._proc.terminate()
+                self._proc.join(timeout=5.0)
+            if proc_started and self._proc.is_alive() and hasattr(self._proc, "kill"):
+                self._proc.kill()
+                self._proc.join(timeout=5.0)
+            return dict(self._last_stats)
+        finally:
+            # The server and every worker are joined before this point in the
+            # production launcher, so no process can still legitimately use
+            # these handles. Closing them prevents repeated canary arms from
+            # retaining Queue pipes/feeder threads for the life of the parent.
+            for ipc_queue in (
+                self.request_queue,
+                *getattr(self, "response_queues", ()),
+            ):
+                close = getattr(ipc_queue, "close", None)
+                if close is not None:
+                    try:
+                        close()
+                    except (EOFError, OSError, ValueError):
+                        pass
+                join_thread = getattr(ipc_queue, "join_thread", None)
+                if join_thread is not None:
+                    try:
+                        join_thread()
+                    except (AssertionError, EOFError, OSError, ValueError):
+                        pass
+            try:
+                self._manager.shutdown()
+            except (EOFError, BrokenPipeError, OSError):
+                pass
 
 
 # --- client ------------------------------------------------------------------
@@ -312,7 +1243,9 @@ class _RemoteForwardProxy:
     evaluator needs (featurize, softmax, squash, clip) never touches the policy.
     """
 
-    def __init__(self, client: "RemoteEvalClient", action_size: int, trained_masked: bool) -> None:
+    def __init__(
+        self, client: "RemoteEvalClient", action_size: int, trained_masked: bool
+    ) -> None:
         self._client = client
         self.action_size = int(action_size)
         self.trained_with_masked_hidden_info = bool(trained_masked)
@@ -346,6 +1279,8 @@ class RemoteEvalClient(EntityGraphRustEvaluator):
         *,
         action_size: int,
         trained_with_masked_hidden_info: bool,
+        needs_action_targets: bool = True,
+        event_token_limit: int | None = None,
         config: EntityGraphRustEvaluatorConfig | None = None,
         client_timeout_ms: float = 5000.0,
         fallback_checkpoint: str | None = None,
@@ -356,6 +1291,8 @@ class RemoteEvalClient(EntityGraphRustEvaluator):
         self._request_queue = request_queue
         self._response_queue = response_queue
         self._client_id = int(client_id)
+        self._needs_action_targets = bool(needs_action_targets)
+        self._event_token_limit = event_token_limit
         self._req_counter = 0
         self._timeout_s = max(0.001, float(client_timeout_ms) / 1000.0)
         # Failure isolation (design doc risk 5): on server timeout/error, if a
@@ -368,6 +1305,11 @@ class RemoteEvalClient(EntityGraphRustEvaluator):
         self._fallback_device = str(fallback_device)
         self._degraded = False
         self._local_policy: Any = None
+        # With no local fallback, a timed-out/failed single-outstanding request
+        # leaves this transport unusable (and may leave a stale response queued).
+        # Latch the first terminal failure so per-game exception isolation cannot
+        # turn one hung server into one full client timeout per remaining game.
+        self._terminal_failure: str | None = None
 
     def _ensure_local_policy(self) -> Any:
         if self._local_policy is None:
@@ -398,33 +1340,66 @@ class RemoteEvalClient(EntityGraphRustEvaluator):
     ) -> dict[str, Any]:
         import torch
 
+        forward_entity_batch = entity_batch
+        event_source_stats: dict[str, int] = {}
+        if self._event_token_limit is not None:
+            # Keep the evaluator-owned feature batch untouched: local post-
+            # processing and callers may retain it. Only the shallow mapping is
+            # changed; event array prefixes are zero-copy NumPy views.
+            forward_entity_batch = dict(entity_batch)
+            event_mask = np.asarray(entity_batch["event_mask"], dtype=np.bool_)
+            event_source_stats = {
+                "_event_source_active_tokens": int(np.count_nonzero(event_mask)),
+                "_event_source_padded_tokens": int(event_mask.size),
+            }
+            _crop_masked_event_tail(
+                forward_entity_batch, self._event_token_limit
+            )
+
         if self._degraded:
             return self._forward_local(
-                entity_batch, legal_action_ids, legal_action_context, return_q
+                forward_entity_batch,
+                legal_action_ids,
+                legal_action_context,
+                return_q,
             )
+        if self._terminal_failure is not None:
+            raise TimeoutError(self._terminal_failure)
 
         self._req_counter += 1
         req_id = self._req_counter
         payload = {
-            "entity": {k: np.asarray(v) for k, v in entity_batch.items()},
+            "entity": {
+                k: np.asarray(v)
+                for k, v in forward_entity_batch.items()
+                if k not in _NON_FORWARD_ENTITY_KEYS
+                and (k != "legal_action_target_ids" or self._needs_action_targets)
+            },
             "legal_ids": np.asarray(legal_action_ids),
             "context": np.asarray(legal_action_context),
             "return_q": bool(return_q),
+            **event_source_stats,
         }
         try:
             self._request_queue.put((self._client_id, req_id, payload))
             got_id, result, error = self._response_queue.get(timeout=self._timeout_s)
             if got_id != req_id:  # pragma: no cover - single-outstanding invariant
                 raise RuntimeError(f"response id mismatch: got {got_id} want {req_id}")
+            request_complete = getattr(self._request_queue, "request_complete", None)
+            if request_complete is not None:
+                request_complete(self._client_id, req_id)
             if error is not None:
                 raise RuntimeError(f"eval-server forward failed: {error}")
-            return {k: torch.from_numpy(np.ascontiguousarray(v)) for k, v in result.items()}
+            return {
+                k: torch.from_numpy(np.ascontiguousarray(v)) for k, v in result.items()
+            }
         except (queue_mod.Empty, RuntimeError, OSError, EOFError, ValueError) as exc:
             if self._fallback_checkpoint is None:
-                raise TimeoutError(
+                self._terminal_failure = (
                     f"eval-server request failed (client {self._client_id}, req {req_id}); "
-                    "no fallback checkpoint configured"
-                ) from exc
+                    "no fallback checkpoint configured; client permanently failed"
+                )
+                raise TimeoutError(self._terminal_failure) from exc
             print(
                 json.dumps(
                     {
@@ -437,5 +1412,8 @@ class RemoteEvalClient(EntityGraphRustEvaluator):
             )
             self._degraded = True
             return self._forward_local(
-                entity_batch, legal_action_ids, legal_action_context, return_q
+                forward_entity_batch,
+                legal_action_ids,
+                legal_action_context,
+                return_q,
             )

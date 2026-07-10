@@ -42,7 +42,7 @@ import json
 import os
 import random
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
@@ -54,7 +54,6 @@ from catan_zero.rl.flywheel.opponent_mix import OpponentMixConfig, choose_mix_op
 from catan_zero.search.gumbel_chance_mcts import (
     GumbelChanceMCTS,
     GumbelChanceMCTSConfig,
-    HeuristicRustEvaluator,
     RustEvaluator,
     SearchResult,
     buy_development_card_real_outcomes,
@@ -602,6 +601,12 @@ def _build_decision_row(
         policy_action_ids=mapped,
         snapshot=snapshot,
         action_by_id=action_by_id,
+        # Persist the same public-information view used by online MCTS.  The
+        # training loader may mask again as a defence in depth, but shards
+        # must be safe and self-describing on their own: a consumer that does
+        # not happen to pass ``--mask-hidden-info`` must never see opponents'
+        # resource composition, hidden development cards, or actual VP.
+        public_observation=True,
     )
     features = {key: value[0] for key, value in entity.items()}
     context = rust_action_context_batch(
@@ -613,6 +618,7 @@ def _build_decision_row(
         policy_action_ids=mapped,
         snapshot=snapshot,
         action_by_id=action_by_id,
+        public_observation=True,
     )[0]
 
     # F4: fp32, not fp16. improved_policy assigns real (non-zero, non-one-hot)
