@@ -483,7 +483,12 @@ class TestGenerateGumbelSelfplayGuardWiring:
                 specs, launcher="generate_gumbel_selfplay_data", skip=False
             )
 
-    def test_val_only_range_is_allowed_for_generation(self, tmp_path):
+    def test_val_only_range_is_allowed_for_generation(self, tmp_path, monkeypatch):
+        # This test exercises the documented VAL-ONLY exception when no canonical
+        # cross-host ledger is available.  Isolate it from any operator ledger in
+        # the runner's home directory; a real, overlapping ledger must still win
+        # and refuse the launch.
+        monkeypatch.setenv("CATAN_SEED_LEDGER", str(tmp_path / "missing-ledger.md"))
         parser = gen_cli.build_parser()
         argv = [
             "--out-dir",

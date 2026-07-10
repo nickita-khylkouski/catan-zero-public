@@ -58,7 +58,12 @@ launch_detached() {
   sid=$(ps -o sid= -p "$job_pid" 2>/dev/null | tr -d ' ')
   state=$(ps -o stat= -p "$job_pid" 2>/dev/null | tr -d ' ')
   if ! kill -0 "$job_pid" 2>/dev/null || [ "$sid" != "$job_pid" ] || [[ "$state" == Z* ]]; then
-    [ "$sid" = "$job_pid" ] && kill -KILL -- "-$job_pid" 2>/dev/null || true
+    # The PID was published by the wrapper *after* setsid created this exact
+    # SID/PGID.  A very short-lived leader can exit between publishing and the
+    # first ps query, leaving sid empty while its forked workers keep running in
+    # the owned process group.  Reap that group unconditionally; requiring the
+    # leader to remain queryable here leaks those descendants on fast hosts.
+    kill -KILL -- "-$job_pid" 2>/dev/null || true
     echo "launch_detached: invalid detached child pid=$job_pid sid=${sid:-missing}" >&2
     return 3
   fi
