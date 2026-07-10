@@ -118,6 +118,7 @@ def bind_plan(
     frozen_repo: Path,
     expected_frozen_executor_sha256: str,
     expected_hardened_executor_sha256: str,
+    expected_bridge_sha256: str,
 ) -> dict[str, Any]:
     """Privately bind two executors without changing the public plan digest."""
     hardened._verify_plan_digest(plan)
@@ -125,12 +126,16 @@ def bind_plan(
     root = frozen_repo.resolve(strict=True)
     frozen_path = (root / "tools/fleet/a1_production_executor.py").resolve(strict=True)
     hardened_path = Path(hardened.__file__).resolve(strict=True)
+    bridge_path = Path(__file__).resolve(strict=True)
     frozen_digest = hardened._sha256(frozen_path)
     hardened_digest = hardened._sha256(hardened_path)
+    bridge_digest = hardened._sha256(bridge_path)
     if frozen_digest != expected_frozen_executor_sha256:
         raise BridgeError("frozen executor digest does not equal explicit binding")
     if hardened_digest != expected_hardened_executor_sha256:
         raise BridgeError("hardened executor digest does not equal explicit binding")
+    if bridge_digest != expected_bridge_sha256:
+        raise BridgeError("bridge tool digest does not equal explicit binding")
     bridge = {
         "schema_version": hardened.BRIDGE_SCHEMA,
         "frozen_repo_root": str(root),
@@ -139,6 +144,7 @@ def bind_plan(
             "path": str(hardened_path),
             "sha256": hardened_digest,
         },
+        "bridge_tool": {"path": str(bridge_path), "sha256": bridge_digest},
         "plan_sha256": plan["plan_sha256"],
         "repo_artifacts_sha256": plan["repo_artifacts_sha256"],
     }
@@ -157,6 +163,7 @@ def build_bridged_plan(
     frozen_repo: Path,
     frozen_executor_sha256: str,
     hardened_executor_sha256: str,
+    bridge_sha256: str,
     lock_path: Path,
     render_path: Path,
     hosts_path: Path,
@@ -185,6 +192,7 @@ def build_bridged_plan(
         frozen_repo=frozen_repo,
         expected_frozen_executor_sha256=frozen_executor_sha256,
         expected_hardened_executor_sha256=hardened_executor_sha256,
+        expected_bridge_sha256=bridge_sha256,
     )
 
 
@@ -196,6 +204,7 @@ def build_parser() -> argparse.ArgumentParser:
         item.add_argument("--frozen-repo", required=True, type=Path)
         item.add_argument("--frozen-executor-sha256", required=True)
         item.add_argument("--hardened-executor-sha256", required=True)
+        item.add_argument("--bridge-sha256", required=True)
         item.add_argument("--lock", required=True, type=Path)
         item.add_argument("--render", required=True, type=Path)
         item.add_argument("--hosts", required=True, type=Path)
@@ -214,6 +223,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             frozen_repo=args.frozen_repo,
             frozen_executor_sha256=args.frozen_executor_sha256,
             hardened_executor_sha256=args.hardened_executor_sha256,
+            bridge_sha256=args.bridge_sha256,
             lock_path=args.lock,
             render_path=args.render,
             hosts_path=args.hosts,

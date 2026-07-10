@@ -287,6 +287,7 @@ def _execution_repo_root(plan: Mapping[str, Any]) -> Path:
         "frozen_repo_root",
         "frozen_executor",
         "hardened_executor",
+        "bridge_tool",
         "plan_sha256",
         "repo_artifacts_sha256",
         "bridge_sha256",
@@ -305,9 +306,11 @@ def _execution_repo_root(plan: Mapping[str, Any]) -> Path:
     root = Path(str(bridge["frozen_repo_root"])).resolve(strict=True)
     frozen_path = (root / "tools/fleet/a1_production_executor.py").resolve(strict=True)
     hardened_path = Path(__file__).resolve(strict=True)
+    bridge_path = (_REPO_ROOT / "tools/fleet/a1_executor_bridge.py").resolve(strict=True)
     expected_references = (
         (bridge["frozen_executor"], frozen_path, "frozen"),
         (bridge["hardened_executor"], hardened_path, "hardened"),
+        (bridge["bridge_tool"], bridge_path, "bridge tool"),
     )
     for reference, path, label in expected_references:
         if (

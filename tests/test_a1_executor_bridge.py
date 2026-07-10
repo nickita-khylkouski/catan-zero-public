@@ -49,6 +49,7 @@ def test_frozen_plan_bridge_preserves_public_plan_and_binds_both_executors(
         frozen_repo=root,
         frozen_executor_sha256=executor._sha256(frozen_executor),
         hardened_executor_sha256=executor._sha256(Path(executor.__file__)),
+        bridge_sha256=executor._sha256(Path(bridge.__file__)),
         lock_path=tmp_path / "lock.json",
         render_path=tmp_path / "render.json",
         hosts_path=tmp_path / "hosts.json",
@@ -65,6 +66,10 @@ def test_frozen_plan_bridge_preserves_public_plan_and_binds_both_executors(
     assert typed["hardened_executor"]["sha256"] == executor._sha256(
         Path(executor.__file__)
     )
+    assert typed["bridge_tool"] == {
+        "path": str(Path(bridge.__file__).resolve()),
+        "sha256": executor._sha256(Path(bridge.__file__)),
+    }
     assert executor._execution_repo_root(result) == root
 
 
@@ -75,12 +80,14 @@ def test_bridge_rejects_either_code_digest_drift(tmp_path: Path) -> None:
         root / "tools/fleet/a1_production_executor.py"
     )
     hardened_digest = executor._sha256(Path(executor.__file__))
+    bridge_digest = executor._sha256(Path(bridge.__file__))
     with pytest.raises(bridge.BridgeError, match="frozen executor digest"):
         bridge.bind_plan(
             original,
             frozen_repo=root,
             expected_frozen_executor_sha256="sha256:" + "0" * 64,
             expected_hardened_executor_sha256=hardened_digest,
+            expected_bridge_sha256=bridge_digest,
         )
     with pytest.raises(bridge.BridgeError, match="hardened executor digest"):
         bridge.bind_plan(
@@ -88,6 +95,15 @@ def test_bridge_rejects_either_code_digest_drift(tmp_path: Path) -> None:
             frozen_repo=root,
             expected_frozen_executor_sha256=frozen_digest,
             expected_hardened_executor_sha256="sha256:" + "0" * 64,
+            expected_bridge_sha256=bridge_digest,
+        )
+    with pytest.raises(bridge.BridgeError, match="bridge tool digest"):
+        bridge.bind_plan(
+            original,
+            frozen_repo=root,
+            expected_frozen_executor_sha256=frozen_digest,
+            expected_hardened_executor_sha256=hardened_digest,
+            expected_bridge_sha256="sha256:" + "0" * 64,
         )
 
 
@@ -101,6 +117,7 @@ def test_bridge_receipt_is_immutable_and_exactly_replayable(tmp_path: Path) -> N
             root / "tools/fleet/a1_production_executor.py"
         ),
         expected_hardened_executor_sha256=executor._sha256(Path(executor.__file__)),
+        expected_bridge_sha256=executor._sha256(Path(bridge.__file__)),
     )
     path = tmp_path / "bridge.receipt.json"
     first = bridge.seal_bridge_receipt(path, plan)
