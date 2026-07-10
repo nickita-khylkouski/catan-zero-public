@@ -22,6 +22,7 @@ from gumbel_search_cross_net_h2h import (  # type: ignore  # noqa: E402
     _build_summary,
     _load_held_out_high_regret_suite,
     _new_search_telemetry,
+    _resolve_c_scales,
     _resolve_search_budgets,
     play_one_h2h_game,
     _validate_information_set_recipe,
@@ -226,6 +227,65 @@ def test_build_search_config_preserves_other_fields_regardless_of_n_full_overrid
     assert config.seed == 7
 
 
+def test_role_specific_c_scales_override_shared_fallback_independently():
+    worker_args = _base_worker_args(
+        c_scale=0.2,
+        candidate_c_scale=0.1,
+        baseline_c_scale=0.03,
+    )
+    resolved = _resolve_c_scales(worker_args)
+
+    candidate = _build_search_config(
+        worker_args, seed=1, c_scale=resolved["candidate_c_scale"]
+    )
+    baseline = _build_search_config(
+        worker_args, seed=1, c_scale=resolved["baseline_c_scale"]
+    )
+
+    assert candidate.c_scale == 0.1
+    assert baseline.c_scale == 0.03
+
+
+def test_shared_c_scale_is_backward_compatible_role_fallback():
+    assert _resolve_c_scales(_base_worker_args(c_scale=0.03)) == {
+        "candidate_c_scale": 0.03,
+        "baseline_c_scale": 0.03,
+    }
+
+
+def test_worker_constructs_each_role_with_its_effective_c_scale(monkeypatch):
+    built_configs = []
+
+    class FakeEvaluator:
+        def close(self):
+            pass
+
+    class FakeMCTS:
+        def __init__(self, config, evaluator):
+            built_configs.append(config)
+
+    monkeypatch.setattr(h2h, "_build_evaluator", lambda *args, **kwargs: FakeEvaluator())
+    monkeypatch.setattr(h2h, "GumbelChanceMCTS", FakeMCTS)
+
+    result = h2h._run_worker(
+        {
+            **_base_worker_args(
+                c_scale=0.2,
+                candidate_c_scale=0.1,
+                baseline_c_scale=0.03,
+            ),
+            "worker_index": 0,
+            "worker_seed": 7,
+            "candidate_checkpoint": "candidate.pt",
+            "baseline_checkpoint": "baseline.pt",
+            "pairs": [],
+        }
+    )
+
+    assert result["error"] is None
+    assert [config.c_scale for config in built_configs] == [0.1, 0.03]
+
+
 def test_build_search_config_threads_d1_noise_floor_calibration():
     config = _build_search_config(
         _base_worker_args(rescale_noise_floor_c=0.25, sigma_eval=0.5),
@@ -347,6 +407,16 @@ def test_eval_config_hash_distinguishes_d1_calibration():
     assert legacy.config_hash() != calibrated.config_hash()
 
 
+def test_eval_config_hash_distinguishes_role_specific_c_scales():
+    shared = EvalConfig(
+        mode="cross_net", candidate_c_scale=0.03, baseline_c_scale=0.03
+    )
+    tuned = EvalConfig(
+        mode="cross_net", candidate_c_scale=0.1, baseline_c_scale=0.03
+    )
+    assert shared.config_hash() != tuned.config_hash()
+
+
 def test_h2h_summary_records_resolved_adaptive_budget_by_role():
     args = SimpleNamespace(
         candidate="same.pt",
@@ -367,6 +437,8 @@ def test_h2h_summary_records_resolved_adaptive_budget_by_role():
         candidate_value_readout=None,
         baseline_value_readout=None,
         c_scale=0.1,
+        candidate_c_scale=0.1,
+        baseline_c_scale=0.03,
         c_visit=50.0,
         rescale_noise_floor_c=0.25,
         sigma_eval=0.5,
@@ -430,6 +502,16 @@ def test_h2h_summary_records_resolved_adaptive_budget_by_role():
     assert summary["symmetry_averaged_eval_threshold"] == 20
     assert summary["rescale_noise_floor_c"] == 0.25
     assert summary["sigma_eval"] == 0.5
+    assert summary["candidate_c_scale"] == 0.1
+    assert summary["baseline_c_scale"] == 0.03
+    assert summary["search_parameters_by_role"] == {
+        "candidate": {"c_scale": 0.1, "c_visit": 50.0},
+        "baseline": {"c_scale": 0.03, "c_visit": 50.0},
+    }
+    assert (
+        summary["comparison_contract"]
+        == "paired_same_seed_color_swap_role_specific_search_operators"
+    )
     assert summary["search_budgets_by_role"] == {
         "candidate": {
             "n_full": 128,

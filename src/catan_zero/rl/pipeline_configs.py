@@ -478,6 +478,12 @@ class EvalConfig(PipelineConfig):
     max_decisions: int = 300
     c_visit: float = 50.0
     c_scale: float = 0.1
+    # Cross-net H2H resolves these from role-specific flags or the shared
+    # c_scale fallback.  Persisting the effective values keeps an
+    # independently tuned search-operator comparison distinct from a
+    # checkpoint-only gate in both config hashes and report provenance.
+    candidate_c_scale: float | None = None
+    baseline_c_scale: float | None = None
     rescale_noise_floor_c: float = 0.0
     sigma_eval: float = 0.79
     max_root_candidates: int = 16

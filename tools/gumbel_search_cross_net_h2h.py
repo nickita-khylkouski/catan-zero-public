@@ -10,7 +10,9 @@ distilled/trained net beat its teacher under search). CAT-25 diagnostic flags
 can deliberately override ``n_full`` / ``n_full_wide`` by role to measure
 search-budget headroom; those effective per-role budgets are recorded and
 hashed in the output so such a run cannot masquerade as a checkpoint-only
-gate.
+gate.  Role-specific ``c_scale`` flags likewise support a fair paired-seed
+comparison of each checkpoint under its independently tuned search operator;
+the effective values are recorded and hashed for the same reason.
 
 Games are paired by seed AND color-swapped (each seed is played twice, once
 with candidate=RED/baseline=BLUE and once swapped) to cancel positional/color
@@ -587,6 +589,31 @@ def _resolve_search_budgets(args: Any) -> dict[str, int | None]:
     }
 
 
+def _resolve_c_scales(args: Any) -> dict[str, float]:
+    """Resolve effective candidate/baseline sigma scales.
+
+    ``--c-scale`` remains the backwards-compatible shared fallback.  Explicit
+    role values override only their own side.  This helper is used by worker
+    construction, typed-config hashing, and report generation so all three
+    surfaces describe the exact same search operators.
+    """
+
+    def _get(name: str, default: Any = None) -> Any:
+        if isinstance(args, dict):
+            return args.get(name, default)
+        return getattr(args, name, default)
+
+    shared = float(_get("c_scale", 0.1))
+    candidate = _get("candidate_c_scale")
+    baseline = _get("baseline_c_scale")
+    return {
+        "candidate_c_scale": (
+            float(candidate) if candidate is not None else shared
+        ),
+        "baseline_c_scale": float(baseline) if baseline is not None else shared,
+    }
+
+
 def _build_evaluator(
     checkpoint: str,
     worker_args: dict[str, Any],
@@ -630,6 +657,7 @@ def _build_search_config(
     n_full: int | None = None,
     n_full_wide: int | None = None,
     n_full_wide_threshold: int | None = None,
+    c_scale: float | None = None,
 ) -> GumbelChanceMCTSConfig:
     """`n_full` defaults to `worker_args["n_full"]` when not given explicitly.
 
@@ -676,7 +704,11 @@ def _build_search_config(
         determinization_min_simulations=int(
             worker_args.get("determinization_min_simulations", 32)
         ),
-        c_scale=float(worker_args.get("c_scale", 0.1)),
+        c_scale=(
+            float(c_scale)
+            if c_scale is not None
+            else float(worker_args.get("c_scale", 0.1))
+        ),
         c_visit=float(worker_args.get("c_visit", 50.0)),
         rescale_noise_floor_c=float(worker_args.get("rescale_noise_floor_c", 0.0)),
         sigma_eval=float(worker_args.get("sigma_eval", 0.79)),
@@ -760,6 +792,7 @@ def _run_worker(worker_args: dict[str, Any]) -> dict[str, Any]:
 
     worker_seed = int(worker_args["worker_seed"])
     budgets = _resolve_search_budgets(worker_args)
+    c_scales = _resolve_c_scales(worker_args)
     candidate_n_full = int(budgets["candidate_n_full"])
     baseline_n_full = int(budgets["baseline_n_full"])
     candidate_mcts = GumbelChanceMCTS(
@@ -769,6 +802,7 @@ def _run_worker(worker_args: dict[str, Any]) -> dict[str, Any]:
             n_full=candidate_n_full,
             n_full_wide=budgets["candidate_n_full_wide"],
             n_full_wide_threshold=budgets["candidate_n_full_wide_threshold"],
+            c_scale=c_scales["candidate_c_scale"],
         ),
         candidate_evaluator,
     )
@@ -779,6 +813,7 @@ def _run_worker(worker_args: dict[str, Any]) -> dict[str, Any]:
             n_full=baseline_n_full,
             n_full_wide=budgets["baseline_n_full_wide"],
             n_full_wide_threshold=budgets["baseline_n_full_wide_threshold"],
+            c_scale=c_scales["baseline_c_scale"],
         ),
         baseline_evaluator,
     )
@@ -905,7 +940,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Cross-checkpoint H2H gate: candidate checkpoint vs baseline checkpoint, "
         "both using GumbelChanceMCTS search with identical config by default; "
-        "role-specific budget flags are explicit CAT-25 diagnostic overrides."
+        "role-specific budget/c_scale flags are explicit search-operator overrides."
     )
     parser.add_argument("--candidate", required=True, help="Candidate checkpoint path.")
     parser.add_argument("--baseline", required=True, help="Baseline checkpoint path.")
@@ -991,6 +1026,18 @@ def main() -> None:
         type=float,
         default=0.1,
         help="Sigma scale multiplier (matches GumbelChanceMCTSConfig default).",
+    )
+    parser.add_argument(
+        "--candidate-c-scale",
+        type=float,
+        default=None,
+        help="Candidate-only sigma scale (default: inherit --c-scale).",
+    )
+    parser.add_argument(
+        "--baseline-c-scale",
+        type=float,
+        default=None,
+        help="Baseline-only sigma scale (default: inherit --c-scale).",
     )
     parser.add_argument(
         "--rescale-noise-floor-c",
@@ -1170,6 +1217,7 @@ def main() -> None:
     def _build_eval_config(resolved_args: Any) -> EvalConfig:
         candidate_readout, baseline_readout = _resolve_value_readouts(resolved_args)
         budgets = _resolve_search_budgets(resolved_args)
+        c_scales = _resolve_c_scales(resolved_args)
         return EvalConfig.from_namespace(
             resolved_args,
             mode="cross_net",
@@ -1184,6 +1232,8 @@ def main() -> None:
             baseline_n_full_wide=budgets["baseline_n_full_wide"],
             candidate_n_full_wide_threshold=budgets["candidate_n_full_wide_threshold"],
             baseline_n_full_wide_threshold=budgets["baseline_n_full_wide_threshold"],
+            candidate_c_scale=c_scales["candidate_c_scale"],
+            baseline_c_scale=c_scales["baseline_c_scale"],
         )
 
     eval_config = resolve_config(
@@ -1196,6 +1246,7 @@ def main() -> None:
     candidate_checkpoint_sha256 = _checkpoint_sha256(args.candidate)
     baseline_checkpoint_sha256 = _checkpoint_sha256(args.baseline)
     candidate_value_readout, baseline_value_readout = _resolve_value_readouts(args)
+    c_scales = _resolve_c_scales(args)
 
     high_regret_suite_path: Path | None = None
     if args.held_out_high_regret_suite:
@@ -1270,6 +1321,8 @@ def main() -> None:
             ),
             "value_squash": str(args.value_squash),
             "c_scale": float(args.c_scale),
+            "candidate_c_scale": c_scales["candidate_c_scale"],
+            "baseline_c_scale": c_scales["baseline_c_scale"],
             "c_visit": float(args.c_visit),
             "rescale_noise_floor_c": float(args.rescale_noise_floor_c),
             "sigma_eval": float(args.sigma_eval),
@@ -1469,6 +1522,7 @@ def _build_summary(
     resolved_candidate_n_full = int(budgets["candidate_n_full"])
     resolved_baseline_n_full = int(budgets["baseline_n_full"])
     candidate_value_readout, baseline_value_readout = _resolve_value_readouts(args)
+    c_scales = _resolve_c_scales(args)
 
     return {
         "candidate_checkpoint": args.candidate,
@@ -1485,6 +1539,23 @@ def _build_summary(
         "candidate_value_readout": candidate_value_readout,
         "baseline_value_readout": baseline_value_readout,
         "c_scale": float(args.c_scale),
+        "candidate_c_scale": c_scales["candidate_c_scale"],
+        "baseline_c_scale": c_scales["baseline_c_scale"],
+        "search_parameters_by_role": {
+            "candidate": {
+                "c_scale": c_scales["candidate_c_scale"],
+                "c_visit": float(args.c_visit),
+            },
+            "baseline": {
+                "c_scale": c_scales["baseline_c_scale"],
+                "c_visit": float(args.c_visit),
+            },
+        },
+        "comparison_contract": (
+            "paired_same_seed_color_swap_role_specific_search_operators"
+            if c_scales["candidate_c_scale"] != c_scales["baseline_c_scale"]
+            else "paired_same_seed_color_swap_shared_search_operator"
+        ),
         "c_visit": float(args.c_visit),
         "rescale_noise_floor_c": float(getattr(args, "rescale_noise_floor_c", 0.0)),
         "sigma_eval": float(getattr(args, "sigma_eval", 0.79)),
