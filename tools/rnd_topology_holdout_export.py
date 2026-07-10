@@ -649,6 +649,37 @@ def _validate_training_report(
             raise ExportError(
                 "xdim_graph train_bc report graph_tokens differs from resolved TrainConfig"
             )
+    for field in ("grow_from_checkpoint", "grow_from_checkpoint_sha256"):
+        if resolved_fields.get(field) != "" or report.get(field) is not None:
+            raise ExportError(
+                f"train_bc report {field} telemetry must be null for the registered empty setting"
+            )
+    if (
+        resolved_fields.get("validation_game_seed_ranges") != ""
+        or report.get("validation_game_seed_ranges") is not None
+    ):
+        raise ExportError(
+            "train_bc report validation_game_seed_ranges telemetry must be null "
+            "for the registered empty setting"
+        )
+    output_validation_path = _resolve_report_repo_path(
+        report.get("validation_game_seed_manifest"),
+        label="validation_game_seed_manifest output sidecar",
+    )
+    if output_validation_path == validation_manifest.expanduser().resolve():
+        raise ExportError(
+            "train_bc report validation_game_seed_manifest must identify its output sidecar"
+        )
+    output_validation = _load_object(
+        output_validation_path, name="train_bc validation output sidecar"
+    )
+    input_validation = _load_object(validation_manifest, name="validation manifest")
+    if not np.array_equal(
+        _validation_seeds(output_validation), _validation_seeds(input_validation)
+    ):
+        raise ExportError(
+            "train_bc validation output sidecar seed support differs from authenticated input"
+        )
     _validate_a1_artifact_relocation(
         report,
         experiment_config,
@@ -657,10 +688,17 @@ def _validate_training_report(
         training_manifest=training_manifest,
         validation_manifest=validation_manifest,
     )
+    conditional_telemetry_fields = {
+        "graph_tokens",
+        "grow_from_checkpoint",
+        "grow_from_checkpoint_sha256",
+        "validation_game_seed_ranges",
+        "validation_game_seed_manifest",
+    }
     for field, value in resolved_fields.items():
-        if field == "graph_tokens":
-            # This top-level field is conditional telemetry: entity_graph writes
-            # null while the canonical TrainConfig retains its unused default.
+        if field in conditional_telemetry_fields:
+            # These top-level fields are conditional/output telemetry rather
+            # than echoes of the canonical resolved input config.
             continue
         if field in report and report[field] != value:
             raise ExportError(f"train_bc report field {field} differs from resolved TrainConfig")

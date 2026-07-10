@@ -448,6 +448,8 @@ def _fixtures(tmp_path: Path) -> dict[str, Path | dict]:
     )
     sidecar = Path(str(checkpoint) + ".optimizer.pt")
     sidecar.write_bytes(b"optimizer fixture")
+    validation_output_sidecar = tmp_path / "report.validation_seeds.json"
+    validation_output_sidecar.write_bytes(holdout.read_bytes())
     report_payload = {
         **train_config.field_values(),
         "arch": "entity_graph",
@@ -476,6 +478,10 @@ def _fixtures(tmp_path: Path) -> dict[str, Path | dict]:
         "validation_game_seed_set_sha256": validation_seed_sha,
         "a1_memmap_payload_inventory_sha256": inventory_sha,
         "optimizer_restored": False,
+        "grow_from_checkpoint": None,
+        "grow_from_checkpoint_sha256": None,
+        "validation_game_seed_ranges": None,
+        "validation_game_seed_manifest": str(validation_output_sidecar.resolve()),
         "rnd_executing_learner_source_sha256": source_hashes,
         "rnd_a1_artifact_relocation": relocation,
     }
@@ -616,6 +622,25 @@ def _rebind_report(paths: dict, payload: dict) -> None:
 
 def test_exports_exact_gate_rows_with_public_mask_and_frozen_labels(tmp_path: Path) -> None:
     paths = _fixtures(tmp_path)
+    report_path = Path(json.loads(paths["run_manifest"].read_text())["training_report"]["path"])
+    report = json.loads(report_path.read_text())
+    resolved = report["resolved_train_config"]["fields"]
+    assert (resolved["graph_tokens"], report["graph_tokens"]) == (32, None)
+    assert (resolved["grow_from_checkpoint"], report["grow_from_checkpoint"]) == (
+        "",
+        None,
+    )
+    assert (
+        resolved["grow_from_checkpoint_sha256"],
+        report["grow_from_checkpoint_sha256"],
+    ) == ("", None)
+    assert (
+        resolved["validation_game_seed_ranges"],
+        report["validation_game_seed_ranges"],
+    ) == ("", None)
+    assert resolved["validation_game_seed_manifest"] != report[
+        "validation_game_seed_manifest"
+    ]
     assert _export(paths) == 2
 
     records = [json.loads(line) for line in paths["output"].read_text().splitlines()]
@@ -796,6 +821,44 @@ def test_xdim_graph_report_requires_resolved_graph_token_count(tmp_path: Path) -
     report["graph_tokens"] = None
     _rebind_report(paths, report)
     with pytest.raises(ExportError, match="xdim_graph.*graph_tokens differs"):
+        _export(paths)
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "grow_from_checkpoint",
+        "grow_from_checkpoint_sha256",
+        "validation_game_seed_ranges",
+    ],
+)
+def test_registered_empty_input_requires_null_conditional_telemetry(
+    tmp_path: Path, field: str
+) -> None:
+    paths = _fixtures(tmp_path)
+    report_path = Path(json.loads(paths["run_manifest"].read_text())["training_report"]["path"])
+    report = json.loads(report_path.read_text())
+    report[field] = "unexpected"
+    _rebind_report(paths, report)
+    with pytest.raises(ExportError, match=f"{field} telemetry must be null"):
+        _export(paths)
+
+
+def test_validation_output_sidecar_must_match_authenticated_input_seeds(
+    tmp_path: Path,
+) -> None:
+    paths = _fixtures(tmp_path)
+    report_path = Path(json.loads(paths["run_manifest"].read_text())["training_report"]["path"])
+    report = json.loads(report_path.read_text())
+    output = Path(report["validation_game_seed_manifest"])
+    payload = json.loads(output.read_text())
+    payload["game_seeds"] = [10, 12]
+    seeds = np.asarray(payload["game_seeds"], dtype="<i8")
+    payload["validation_game_seed_set_sha256"] = "sha256:" + hashlib.sha256(
+        seeds.tobytes()
+    ).hexdigest()
+    _write(output, payload)
+    with pytest.raises(ExportError, match="output sidecar seed support differs"):
         _export(paths)
 
 
