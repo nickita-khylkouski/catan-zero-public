@@ -431,7 +431,9 @@ def test_belief_chance_spectra_dispatches_to_belief_robber_not_true_hand(monkeyp
     monkeypatch.setattr(gcm, "belief_move_robber_outcome_weights", _belief_spy)
     monkeypatch.setattr(gcm, "move_robber_victim_outcome_weights", _true_spy)
 
-    node = _GNode(game=game.copy(), root_color=str(game.current_color()))
+    colors = [str(color) for color in json.loads(game.json_snapshot())["colors"]]
+    root_color = next(color for color in colors if color != str(game.current_color()))
+    node = _GNode(game=game.copy(), root_color=root_color)
     mcts = GumbelChanceMCTS(
         GumbelChanceMCTSConfig(seed=1, belief_chance_spectra=True),
         HeuristicRustEvaluator(score_actions=False),
@@ -473,7 +475,9 @@ def test_belief_chance_spectra_off_never_calls_belief_robber(monkeypatch):
 
     monkeypatch.setattr(gcm, "belief_move_robber_outcome_weights", _belief_spy)
 
-    node = _GNode(game=game.copy(), root_color=str(game.current_color()))
+    colors = [str(color) for color in json.loads(game.json_snapshot())["colors"]]
+    root_color = next(color for color in colors if color != str(game.current_color()))
+    node = _GNode(game=game.copy(), root_color=root_color)
     mcts = GumbelChanceMCTS(
         GumbelChanceMCTSConfig(seed=1, belief_chance_spectra=False, correct_rust_chance_spectra=True),
         HeuristicRustEvaluator(score_actions=False),
@@ -520,7 +524,9 @@ def test_belief_chance_spectra_dispatches_to_belief_dev_deck_not_true_deck(monke
     monkeypatch.setattr(gcm, "belief_buy_development_card_outcomes", _belief_spy)
     monkeypatch.setattr(gcm, "buy_development_card_real_outcomes", _true_spy)
 
-    node = _GNode(game=game.copy(), root_color=str(game.current_color()))
+    colors = [str(color) for color in json.loads(game.json_snapshot())["colors"]]
+    root_color = next(color for color in colors if color != str(game.current_color()))
+    node = _GNode(game=game.copy(), root_color=root_color)
     mcts = GumbelChanceMCTS(
         GumbelChanceMCTSConfig(seed=1, belief_chance_spectra=True),
         HeuristicRustEvaluator(score_actions=False),
