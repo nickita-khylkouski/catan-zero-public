@@ -238,6 +238,8 @@ def _repo_artifacts(rendered: dict[str, Any]) -> list[dict[str, Any]]:
         files[str(relative)] = path
     supervisor = (_REPO_ROOT / "tools/fleet/a1_lane_supervisor.py").resolve()
     files[str(supervisor.relative_to(_REPO_ROOT))] = supervisor
+    stop_helper = (_REPO_ROOT / "tools/fleet/a1_stop_helper.py").resolve()
+    files[str(stop_helper.relative_to(_REPO_ROOT))] = stop_helper
     return [
         {
             "path": key,
@@ -604,6 +606,22 @@ def _lane_payload(
     return payload
 
 
+def _resume_receipt(
+    receipt_path: Path, public: Mapping[str, Any], *, resume: bool
+) -> dict[str, Any] | None:
+    """Load only a receipt for this exact plan; stopped waves remain resumable."""
+    if not receipt_path.exists():
+        return None
+    if not resume:
+        raise ExecutorError("executor receipt exists; pass --resume for exact incomplete jobs")
+    receipt = _load(receipt_path)
+    if receipt.get("schema_version") != RECEIPT_SCHEMA:
+        raise ExecutorError("executor receipt schema drift")
+    if receipt.get("plan_sha256") != public["plan_sha256"]:
+        raise ExecutorError("resume receipt binds a different execution plan")
+    return receipt
+
+
 def execute(plan: dict[str, Any], *, receipt_path: Path, resume: bool) -> dict[str, Any]:
     private = plan["_private"]
     hosts = private["hosts"]
@@ -617,13 +635,8 @@ def execute(plan: dict[str, Any], *, receipt_path: Path, resume: bool) -> dict[s
         alias: _preflight_host(hosts, alias, sorted(set(gpus)))
         for alias, gpus in sorted(expected_by_alias.items())
     }
-    if receipt_path.exists():
-        if not resume:
-            raise ExecutorError("executor receipt exists; pass --resume for exact incomplete jobs")
-        receipt = _load(receipt_path)
-        if receipt.get("plan_sha256") != public["plan_sha256"]:
-            raise ExecutorError("resume receipt binds a different execution plan")
-    else:
+    receipt = _resume_receipt(receipt_path, public, resume=resume)
+    if receipt is None:
         receipt = dict(public)
         receipt.update(
             {
@@ -763,6 +776,133 @@ def execute(plan: dict[str, Any], *, receipt_path: Path, resume: bool) -> dict[s
     return receipt
 
 
+def _stop_helper_call(
+    plan: dict[str, Any],
+    worker_id: str,
+    lane: list[dict[str, Any]],
+    *,
+    action: str,
+    supervisor_pid: int,
+) -> dict[str, Any]:
+    private = plan["_private"]
+    hosts = private["hosts"]
+    alias = lane[0]["host_alias"]
+    repo_token = plan["repo_artifacts_sha256"].removeprefix("sha256:")
+    repo_dir = f"{hosts['remote_root']}/repo-{repo_token}"
+    helper = f"{repo_dir}/tools/fleet/a1_stop_helper.py"
+    remote_lane = f"{hosts['remote_root']}/lanes/{worker_id}.json"
+    argv = (
+        hosts["python"],
+        helper,
+        action,
+        "--lane",
+        remote_lane,
+        "--supervisor-pid",
+        str(supervisor_pid),
+    )
+    command = (
+        f"if [ ! -f {shlex.quote(remote_lane)} ]; then "
+        + (
+            "echo 'recorded supervisor exists but immutable lane is missing' >&2; exit 9; "
+            if supervisor_pid > 0
+            else "printf '%s\\n' "
+            + shlex.quote(
+                json.dumps(
+                    {
+                        "worker_id": worker_id,
+                        "status": "not_staged",
+                        "supervisor_pid": None,
+                        "generator_pids": {},
+                    },
+                    sort_keys=True,
+                )
+            )
+            + "; "
+        )
+        + f"else env PYTHONPATH={shlex.quote(repo_dir + '/src:' + repo_dir)} "
+        + " ".join(shlex.quote(value) for value in argv)
+        + "; fi"
+    )
+    response = _ssh(hosts, alias, command)
+    if response.returncode != 0:
+        detail = (response.stderr or response.stdout).strip()
+        raise ExecutorError(f"A1 {action} refused for {worker_id}: {detail}")
+    try:
+        result = json.loads(response.stdout)
+    except json.JSONDecodeError as error:
+        raise ExecutorError(f"A1 {action} returned invalid JSON for {worker_id}") from error
+    if not isinstance(result, dict) or result.get("worker_id") != worker_id:
+        raise ExecutorError(f"A1 {action} identity drift for {worker_id}")
+    return result
+
+
+def stop_execution(
+    plan: dict[str, Any], *, receipt_path: Path, go: bool
+) -> dict[str, Any]:
+    """Inspect, then stop only exact receipt-bound lane/generator process groups."""
+    if not receipt_path.exists():
+        raise ExecutorError("cannot stop A1: executor receipt is missing")
+    receipt = _load(receipt_path)
+    if receipt.get("schema_version") != RECEIPT_SCHEMA:
+        raise ExecutorError("executor receipt schema drift")
+    if receipt.get("plan_sha256") != plan["plan_sha256"]:
+        raise ExecutorError("stop receipt binds a different execution plan")
+    lane_pids = receipt.get("lane_pids")
+    if not isinstance(lane_pids, dict):
+        raise ExecutorError("executor receipt has no lane PID map")
+
+    # All identities are checked fleet-wide before the first signal.  Each
+    # remote stop revalidates immediately before signalling to close PID reuse.
+    inspection: dict[str, Any] = {}
+    for worker_id, lane in sorted(plan["_private"]["lanes"].items()):
+        pid = lane_pids.get(worker_id, 0)
+        if isinstance(pid, bool) or not isinstance(pid, int) or pid < 0:
+            raise ExecutorError(f"invalid supervisor PID for {worker_id}")
+        inspection[worker_id] = _stop_helper_call(
+            plan, worker_id, lane, action="inspect", supervisor_pid=pid
+        )
+    if not go:
+        return {
+            "contract_sha256": plan["contract_sha256"],
+            "status": "stop_dry_run",
+            "lanes": inspection,
+            "mps_preserved": True,
+        }
+
+    receipt.update({"status": "stopping", "stop_started_at": time.time()})
+    _atomic_json(receipt_path, receipt)
+    stopped: dict[str, Any] = {}
+    try:
+        for worker_id, lane in sorted(plan["_private"]["lanes"].items()):
+            stopped[worker_id] = _stop_helper_call(
+                plan,
+                worker_id,
+                lane,
+                action="stop",
+                supervisor_pid=int(lane_pids.get(worker_id, 0)),
+            )
+    except ExecutorError as error:
+        receipt.update(
+            {
+                "status": "stop_failed",
+                "stop_error": str(error),
+                "stopped_lanes": stopped,
+            }
+        )
+        _atomic_json(receipt_path, receipt)
+        raise
+    receipt.update(
+        {
+            "status": "stopped",
+            "stopped_at": time.time(),
+            "stopped_lanes": stopped,
+            "mps_preserved": True,
+        }
+    )
+    _atomic_json(receipt_path, receipt)
+    return receipt
+
+
 def status(plan: dict[str, Any], *, receipt_path: Path) -> dict[str, Any]:
     private = plan["_private"]
     hosts = private["hosts"]
@@ -807,7 +947,7 @@ def status(plan: dict[str, Any], *, receipt_path: Path) -> dict[str, Any]:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
-    for name in ("run", "status"):
+    for name in ("run", "status", "stop"):
         item = sub.add_parser(name)
         item.add_argument("--lock", required=True, type=Path)
         item.add_argument("--render", required=True, type=Path)
@@ -816,6 +956,9 @@ def build_parser() -> argparse.ArgumentParser:
     run = sub.choices["run"]
     run.add_argument("--resume", action="store_true")
     run.add_argument("--go", action="store_true", help="stage and launch; default dry-run")
+    sub.choices["stop"].add_argument(
+        "--go", action="store_true", help="stop exact A1 process groups; default dry-run"
+    )
     return parser
 
 
@@ -825,6 +968,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         plan = build_plan(lock_path=args.lock, render_path=args.render, hosts_path=args.hosts, receipt_path=args.receipt)
         if args.command == "status":
             result = status(plan, receipt_path=args.receipt)
+        elif args.command == "stop":
+            result = stop_execution(plan, receipt_path=args.receipt, go=bool(args.go))
         elif not args.go:
             result = _public(plan)
         else:
