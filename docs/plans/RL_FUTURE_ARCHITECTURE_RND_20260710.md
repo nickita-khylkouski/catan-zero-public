@@ -1,7 +1,8 @@
 # Future RL architecture R&D — executable hypotheses, not conclusions
 
-Date: 2026-07-10. Hardware boundary: the two H100 80GB hosts supplied for this
-work; no B200 use. Production defaults remain unchanged.
+Date: 2026-07-10. Hardware boundary: eight H100 80GB GPUs on the permitted
+host; the separately supplied B200 host was not used. Production defaults
+remain unchanged.
 
 ## What the current system is actually doing
 
@@ -78,6 +79,87 @@ The next E2 implementation should therefore be a cheap hybrid: retain the
 incumbent six global Transformer blocks and add at most two topology message
 passing adapters, then require at least 0.5x incumbent H100 throughput before
 any learning screen. Do not spend a 40-GPU run to discover a 10–300x kernel tax.
+
+## Executed scaled ladder and exploratory learning smoke
+
+The cheap hybrid was implemented as sparse typed incidence adapters after
+Transformer blocks 2 and 4. It never materializes a dense `[B,S,S]` relation
+tensor, and its output projection is zero initialized so growing from the 35M
+checkpoint initially preserves the incumbent function exactly. The matched
+scaled ladder is:
+
+| arm | exact scalar parameters | H100 rows/s | relative systems rate | peak probe allocation |
+|---|---:|---:|---:|---:|
+| incumbent, h640/L6 | 35,041,353 | 1,222.99 | 1.000x | 1.498 GiB |
+| sparse hybrid, h640/L6, adapters 2/4, b448 | 38,602,057 | 657.50 | 0.538x | 1.947 GiB |
+| dense h832/L6 | 59,131,977 | 1,090.68 | 0.892x | 1.972 GiB |
+| dense h832/L10 | 92,401,993 | 660.68 | 0.540x | 3.083 GiB |
+
+All four passed finite forward/backward and the predeclared 0.5x throughput
+gate. These concurrent synthetic probes are a relative systems screen, not an
+isolated absolute benchmark. Raw results are in
+`configs/rnd/scaled_probe_raw_20260710/`.
+
+The 59M and 92M models then received the same 200-step, 204,800-presentation
+hard-teacher/outcome bootstrap as the incumbent. The held-out results were
+nearly identical: policy CE was 1.47262 / 1.47031 / 1.47348 for 35M / 59M /
+92M, while top-1 accuracy was 70.44% / 70.17% / 70.43%. More parameters did not
+buy measurable bootstrap sample efficiency at this budget.
+
+A fresh public-information Gumbel/PIMC corpus used 64 unique games and 37,504
+rows. All eight independent shard audits passed: zero invalid actions, exactly
+one information regime (`public_conservation_pimc_v1`), 100% soft-label legal
+coverage, and a mean non-forced KL from prior of roughly 0.18. Search therefore
+changed the policy on real decisions. However, 58/64 games truncated at the
+600-decision cap. Terminal/value/Q/VP objectives were consequently disabled;
+the architecture comparison trained only on full-coverage soft policy targets,
+with forced rows carrying zero policy weight.
+
+The equal-exposure exploratory smoke presented 25,600 raw rows to every arm. The hybrid
+was warm-grown from the incumbent with 90.7759% of its parameters copied; the
+wide arms used their matched teacher bootstraps.
+
+| arm | validation policy CE | change versus incumbent | top-1 | top-3 | train time |
+|---|---:|---:|---:|---:|---:|
+| incumbent 35M | 1.384050 | reference | 67.20% | 93.58% | 11.25 s |
+| sparse hybrid 38.6M | 1.384022 | 0.0020% lower | 66.49% | 93.76% | 19.96 s |
+| dense 59.1M | 1.384003 | 0.0034% lower | 66.67% | 93.23% | 14.25 s |
+| dense 92.4M | 1.383902 | 0.0107% lower | 66.49% | 93.67% | 20.47 s |
+
+Every difference is below 0.011%, so this smoke found no resolvable separation.
+It did **not** execute or clear the ladder's predeclared fixed-corpus gate of
+250 steps, global batch 4,096, and 1,024,000 presentations. It only rules out a
+dramatic immediate sample-efficiency gain at this tiny budget; it does not rank
+playing strength or rule out a gain after substantially more fresh data.
+Machine-readable reports are in
+`configs/rnd/architecture_screen_raw_20260710/`, with bootstraps and corpus
+audits in the adjacent `bootstrap_raw_20260710/` and
+`public_pimc_raw_20260710/` directories.
+
+The direct KLENT signal gate was also executed from the masked 35M checkpoint.
+Both games truncated (1,200 decisions total), so the new fail-closed runner
+refused the update before publishing a checkpoint. With a zero-initialized Q
+head and no terminal reward, proceeding would mostly optimize self-generated
+regularization targets rather than intelligence. The refusal artifact is in
+`configs/rnd/klent_raw_20260710/report.json`.
+
+### Current architecture decision
+
+Keep the 35,041,353-parameter Transformer as the production reference. The
+38,602,057-parameter sparse hybrid is the only new trunk that merits a larger
+replicated learning test because it preserves the incumbent at initialization
+and passed the systems gate. Do not allocate a 40-GPU campaign to the 92M model:
+depth scaling produced no meaningful small-data gain. If the hybrid clears the
+2% replicated learning gate and paired-search strength gate, the next scale
+candidate is h832/L6 at exactly 59,131,977 parameters; h832/L10 is a later
+capacity control, not the default future architecture.
+
+The next intelligence bottleneck is the loop, not another attention variant:
+first drive complete public-information self-play above 90%, then compare
+search-distillation plus complete outcome learning against the incumbent over
+at least 1,024 games and three training seeds. Keep Gumbel search until an
+equal-work/equal-time search tournament beats it. KLENT remains blocked until
+direct rollouts reliably terminate and supply external outcome signal.
 
 ## Why DeepSeek and AlphaGo do not imply the same change
 

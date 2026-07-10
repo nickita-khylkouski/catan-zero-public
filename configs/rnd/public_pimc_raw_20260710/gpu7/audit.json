@@ -1,0 +1,169 @@
+{
+  "checks": [
+    {
+      "check": "label_perspective_correctness",
+      "failures": [],
+      "games_checked": 8,
+      "games_terminated": 0,
+      "games_truncated": 8,
+      "num_failures": 0,
+      "pass": true
+    },
+    {
+      "check": "target_policy_sums_to_one",
+      "example_bad_rows": [],
+      "num_failures": 0,
+      "pass": true,
+      "rows_checked": 4800,
+      "sum_distribution": {
+        "max": 1.0000000447034836,
+        "mean": 1.0000000002724847,
+        "min": 0.9999999552965164
+      }
+    },
+    {
+      "check": "kl_improved_policy_vs_prior",
+      "kl_distribution": {
+        "max": 0.4320464058641591,
+        "mean": 0.11152991410109557,
+        "median": 0.08949741305944572,
+        "min": -2.5839937148573744e-06,
+        "near_zero_fraction": 0.3885416666666667,
+        "rows": 4800
+      },
+      "kl_distribution_forced": {
+        "max": 0.0,
+        "mean": 0.0,
+        "median": 0.0,
+        "min": 0.0,
+        "near_zero_fraction": 1.0,
+        "rows": 1863
+      },
+      "kl_distribution_non_forced": {
+        "max": 0.4320464058641591,
+        "mean": 0.18227565123774558,
+        "median": 0.180606953789422,
+        "min": -2.5839937148573744e-06,
+        "near_zero_fraction": 0.0006809669731018045,
+        "rows": 2937
+      },
+      "note": "If near_zero_fraction is high, the search isn't adding information over the prior -- consider raising n_full before the full run. IMPORTANT: forced (single-legal-action) rows have exactly one choice, so KL(improved||prior) is trivially 0 for them regardless of search quality -- they dilute the overall distribution. The 'non_forced' breakdown below is the actually meaningful signal for whether the search is adding information when there's a real choice.",
+      "pass": null,
+      "skipped": false
+    },
+    {
+      "check": "mix",
+      "full_search_fraction_among_non_forced": 0.25025536261491316,
+      "full_search_matches_p_full": true,
+      "is_forced_expected_range": [
+        0.35,
+        0.7
+      ],
+      "is_forced_fraction": 0.388125,
+      "is_forced_in_range": true,
+      "p_full_configured": 0.25,
+      "pass": true,
+      "phase_counts": {
+        "BUILD_INITIAL_ROAD": 32,
+        "BUILD_INITIAL_SETTLEMENT": 32,
+        "DISCARD": 1257,
+        "MOVE_ROBBER": 265,
+        "PLAY_TURN": 3214
+      },
+      "phase_distribution": {
+        "BUILD_INITIAL_ROAD": 0.006666666666666667,
+        "BUILD_INITIAL_SETTLEMENT": 0.006666666666666667,
+        "DISCARD": 0.261875,
+        "MOVE_ROBBER": 0.05520833333333333,
+        "PLAY_TURN": 0.6695833333333333
+      }
+    },
+    {
+      "check": "afterstate_targets_on_forced_roll",
+      "failures": [],
+      "forced_roll_rows_found": 1327,
+      "num_failures": 0,
+      "pass": true
+    },
+    {
+      "check": "truncation_rate",
+      "games_total": 8,
+      "games_truncated": 8,
+      "pass": true,
+      "rows_from_truncated_games_fraction": 1.0,
+      "threshold": 1.0,
+      "truncated_fraction": 1.0
+    },
+    {
+      "check": "weight_multipliers",
+      "failures": [],
+      "forced_rows_checked": 1863,
+      "num_failures": 0,
+      "pass": true,
+      "rows_checked": 4800,
+      "skipped": false
+    },
+    {
+      "check": "prior_policy_nondegenerate",
+      "near_one_hot_fraction": 0.0,
+      "non_forced_rows_checked": 2937,
+      "normalized_entropy_distribution": {
+        "max": 1.0000210189808016,
+        "mean": 0.9412834838738919,
+        "median": 0.9860793767685677,
+        "min": 0.5820351036292778
+      },
+      "note": "normalized_entropy is entropy / log(num_legal_actions), so 1.0 = uniform, 0.0 = one-hot. fp16 storage flushing small probabilities to 0 is expected and not itself a problem; this only flags if collapse-to-one-hot is the norm across real (non-forced) multi-way decisions, which would suggest a broken evaluator.",
+      "pass": true,
+      "skipped": false
+    },
+    {
+      "check": "config_provenance",
+      "expected": {
+        "c_scale": 0.03,
+        "c_visit": 50.0,
+        "determinization_particles": 4,
+        "information_set_search": true,
+        "n_fast": 16,
+        "n_full": 128,
+        "p_full": 0.25,
+        "public_observation": true
+      },
+      "failures": [],
+      "observed": {
+        "c_scale": 0.03,
+        "c_visit": 50.0,
+        "determinization_particles": 4,
+        "information_set_search": true,
+        "n_fast": 16,
+        "n_full": 128,
+        "p_full": 0.25,
+        "public_observation": true
+      },
+      "pass": true,
+      "skipped": false,
+      "workers_checked": 8
+    },
+    {
+      "check": "game_seed_range",
+      "expected_games": 8,
+      "expected_range": [
+        6200170000,
+        6200170008
+      ],
+      "missing_count": 0,
+      "missing_examples": [],
+      "observed_max": 6200170007,
+      "observed_min": 6200170000,
+      "observed_unique_games": 8,
+      "pass": true,
+      "unexpected_count": 0,
+      "unexpected_examples": []
+    }
+  ],
+  "games_total": 8,
+  "overall_pass": true,
+  "rows_total": 4800,
+  "shard_files_count": 16,
+  "shards_dir": "runs/rnd_public_pimc_64/gpu7"
+}

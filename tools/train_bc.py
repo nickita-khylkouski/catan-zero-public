@@ -403,6 +403,26 @@ def build_parser() -> argparse.ArgumentParser:
             "--moe-routed-experts=0."
         ),
     )
+    parser.add_argument(
+        "--topology-adapter-layers",
+        default="",
+        help=(
+            "Comma-separated one-based incumbent Transformer block positions for "
+            "sparse topology adapters (for example 2,4); empty disables."
+        ),
+    )
+    parser.add_argument(
+        "--topology-adapter-width",
+        type=int,
+        default=448,
+        help="Sparse topology-adapter bottleneck width.",
+    )
+    parser.add_argument(
+        "--topology-adapter-bases",
+        type=int,
+        default=4,
+        help="Basis-transform count in each sparse topology adapter.",
+    )
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument(
         "--lr-warmup-steps",
@@ -2670,6 +2690,9 @@ def main(argv: Sequence[str] | None = None) -> None:
                     moe_routed_experts=int(args.moe_routed_experts),
                     moe_top_k=int(args.moe_top_k),
                     moe_expert_ff_size=int(args.moe_expert_ff_size),
+                    topology_adapter_layers=str(args.topology_adapter_layers),
+                    topology_adapter_width=int(args.topology_adapter_width),
+                    topology_adapter_bases=int(args.topology_adapter_bases),
                 )
             elif args.arch == "xdim_graph":
                 policy = XDimGraphPolicy.create(
@@ -3588,6 +3611,12 @@ def main(argv: Sequence[str] | None = None) -> None:
         "weight_decay": float(args.weight_decay),
         "fused_optimizer": bool(args.fused_optimizer),
         "hidden_size": int(args.hidden_size),
+        "graph_layers": int(args.graph_layers),
+        "attention_heads": int(args.attention_heads),
+        "entity_state_trunk": str(args.entity_state_trunk),
+        "topology_adapter_layers": str(args.topology_adapter_layers),
+        "topology_adapter_width": int(args.topology_adapter_width),
+        "topology_adapter_bases": int(args.topology_adapter_bases),
         "mask_hidden_info": bool(args.mask_hidden_info),
         "seed": int(args.seed),
         "symmetry_augment": bool(args.symmetry_augment),
@@ -9007,6 +9036,9 @@ def _checkpoint_config_mismatches(
             ("moe_routed_experts", "moe_routed_experts", 0),
             ("moe_top_k", "moe_top_k", 2),
             ("moe_expert_ff_size", "moe_expert_ff_size", 0),
+            ("topology_adapter_layers", "topology_adapter_layers", ""),
+            ("topology_adapter_width", "topology_adapter_width", 448),
+            ("topology_adapter_bases", "topology_adapter_bases", 4),
         ):
             checkpoint_value = getattr(config, config_name, default)
             cli_value = getattr(args, cli_name, default)

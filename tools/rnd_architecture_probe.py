@@ -21,7 +21,9 @@ from typing import Any
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--trunk", choices=("transformer", "rrt", "resrgcn"), required=True)
+    parser.add_argument(
+        "--trunk", choices=("transformer", "rrt", "resrgcn"), required=True
+    )
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument(
         "--require-gpu-name",
@@ -34,6 +36,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--iterations", type=int, default=10)
     parser.add_argument("--value-categorical-bins", type=int, default=0)
+    parser.add_argument("--hidden-size", type=int, default=0)
+    parser.add_argument("--state-layers", type=int, default=0)
+    parser.add_argument("--attention-heads", type=int, default=0)
+    parser.add_argument("--topology-adapter-layers", default="")
+    parser.add_argument("--topology-adapter-width", type=int, default=448)
+    parser.add_argument("--topology-adapter-bases", type=int, default=4)
     parser.add_argument("--latent-deliberation-steps", type=int, default=0)
     parser.add_argument("--latent-deliberation-slots", type=int, default=8)
     parser.add_argument("--moe-routed-experts", type=int, default=0)
@@ -71,6 +79,7 @@ def _source_provenance() -> dict[str, Any]:
         "tools/rnd_architecture_probe.py",
         "src/catan_zero/rl/entity_token_policy.py",
         "src/catan_zero/rl/relational_trunks.py",
+        "src/catan_zero/rl/sparse_topology_adapter.py",
     )
     file_hashes: dict[str, str] = {}
     aggregate = hashlib.sha256()
@@ -195,6 +204,13 @@ def main() -> None:
             f"measured {gpu_name!r}"
         )
     architecture = _resolved_architecture(args.trunk)
+    for key, value in (
+        ("hidden_size", args.hidden_size),
+        ("state_layers", args.state_layers),
+        ("attention_heads", args.attention_heads),
+    ):
+        if int(value) > 0:
+            architecture[key] = int(value)
     config = EntityGraphConfig(
         action_size=607,
         static_action_feature_size=LEGAL_ACTION_FEATURE_SIZE,
@@ -209,6 +225,9 @@ def main() -> None:
         moe_routed_experts=int(args.moe_routed_experts),
         moe_top_k=int(args.moe_top_k),
         moe_expert_ff_size=int(args.moe_expert_ff_size),
+        topology_adapter_layers=str(args.topology_adapter_layers),
+        topology_adapter_width=int(args.topology_adapter_width),
+        topology_adapter_bases=int(args.topology_adapter_bases),
         **architecture,
     )
     torch.manual_seed(20260710)
@@ -270,6 +289,9 @@ def main() -> None:
         "moe_routed_experts": int(args.moe_routed_experts),
         "moe_top_k": int(args.moe_top_k),
         "moe_expert_ff_size": int(args.moe_expert_ff_size),
+        "topology_adapter_layers": str(args.topology_adapter_layers),
+        "topology_adapter_width": int(args.topology_adapter_width),
+        "topology_adapter_bases": int(args.topology_adapter_bases),
         "device": str(device),
         "gpu_name": gpu_name,
         "required_gpu_name": required_gpu_name,

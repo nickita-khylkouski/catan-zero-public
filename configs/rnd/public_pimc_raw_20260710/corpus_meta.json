@@ -1,0 +1,607 @@
+{
+  "columns": {
+    "action_mask_version": {
+      "categories": [
+        "colonist-multiagent-v1"
+      ],
+      "kind": "string"
+    },
+    "action_taken": {
+      "dtype": "<i2",
+      "inner_shape": [],
+      "kind": "fixed"
+    },
+    "aux_largest_army": {
+      "dtype": "<f4",
+      "inner_shape": [],
+      "kind": "fixed"
+    },
+    "aux_longest_road": {
+      "dtype": "<f4",
+      "inner_shape": [],
+      "kind": "fixed"
+    },
+    "aux_next_settlement": {
+      "dtype": "<i2",
+      "inner_shape": [],
+      "kind": "fixed"
+    },
+    "aux_robber_target": {
+      "dtype": "<i2",
+      "inner_shape": [],
+      "kind": "fixed"
+    },
+    "aux_vp_in_n": {
+      "dtype": "<f4",
+      "inner_shape": [],
+      "kind": "fixed"
+    },
+    "decision_index": {
+      "dtype": "<i4",
+      "inner_shape": [],
+      "kind": "fixed"
+    },
+    "edge_mask": {
+      "dtype": "|b1",
+      "inner_shape": [
+        72
+      ],
+      "kind": "fixed"
+    },
+    "edge_tokens": {
+      "dtype": "<f2",
+      "inner_shape": [
+        72,
+        8
+      ],
+      "kind": "fixed"
+    },
+    "edge_vertex_ids": {
+      "dtype": "<i2",
+      "inner_shape": [
+        72,
+        2
+      ],
+      "kind": "fixed"
+    },
+    "event_mask": {
+      "dtype": "|b1",
+      "inner_shape": [
+        64
+      ],
+      "kind": "fixed"
+    },
+    "event_target_ids": {
+      "dtype": "<i2",
+      "inner_shape": [
+        64,
+        4
+      ],
+      "kind": "fixed"
+    },
+    "event_tokens": {
+      "dtype": "<f2",
+      "inner_shape": [
+        64,
+        41
+      ],
+      "kind": "fixed"
+    },
+    "final_actual_vps": {
+      "dtype": "<i2",
+      "inner_shape": [
+        4
+      ],
+      "kind": "fixed"
+    },
+    "final_public_vps": {
+      "dtype": "<i2",
+      "inner_shape": [
+        4
+      ],
+      "kind": "fixed"
+    },
+    "game_seed": {
+      "dtype": "<i8",
+      "inner_shape": [],
+      "kind": "fixed"
+    },
+    "global_tokens": {
+      "dtype": "<f2",
+      "inner_shape": [
+        1,
+        43
+      ],
+      "kind": "fixed"
+    },
+    "has_final_actual_vps": {
+      "dtype": "|b1",
+      "inner_shape": [],
+      "kind": "fixed"
+    },
+    "has_final_public_vps": {
+      "dtype": "|b1",
+      "inner_shape": [],
+      "kind": "fixed"
+    },
+    "hex_edge_ids": {
+      "dtype": "<i2",
+      "inner_shape": [
+        19,
+        6
+      ],
+      "kind": "fixed"
+    },
+    "hex_mask": {
+      "dtype": "|b1",
+      "inner_shape": [
+        19
+      ],
+      "kind": "fixed"
+    },
+    "hex_tokens": {
+      "dtype": "<f2",
+      "inner_shape": [
+        19,
+        13
+      ],
+      "kind": "fixed"
+    },
+    "hex_vertex_ids": {
+      "dtype": "<i2",
+      "inner_shape": [
+        19,
+        6
+      ],
+      "kind": "fixed"
+    },
+    "legal_action_context": {
+      "dtype": "<f2",
+      "feat": 18,
+      "fill": 0.0,
+      "kind": "ragged3d"
+    },
+    "legal_action_ids": {
+      "dtype": "<i2",
+      "fill": -1.0,
+      "kind": "ragged2d"
+    },
+    "legal_action_mask": {
+      "dtype": "|b1",
+      "fill": 0.0,
+      "kind": "ragged2d"
+    },
+    "legal_action_target_ids": {
+      "dtype": "<i2",
+      "feat": 4,
+      "fill": -1.0,
+      "kind": "ragged3d"
+    },
+    "legal_action_tokens": {
+      "dtype": "<f2",
+      "feat": 50,
+      "fill": 0.0,
+      "kind": "ragged3d"
+    },
+    "obs": {
+      "dtype": "<f2",
+      "inner_shape": [
+        806
+      ],
+      "kind": "fixed"
+    },
+    "phase": {
+      "categories": [
+        "BUILD_INITIAL_ROAD",
+        "BUILD_INITIAL_SETTLEMENT",
+        "DISCARD",
+        "MOVE_ROBBER",
+        "PLAY_TURN"
+      ],
+      "kind": "string"
+    },
+    "player": {
+      "categories": [
+        "BLUE",
+        "RED"
+      ],
+      "kind": "string"
+    },
+    "player_mask": {
+      "dtype": "|b1",
+      "inner_shape": [
+        4
+      ],
+      "kind": "fixed"
+    },
+    "player_tokens": {
+      "dtype": "<f2",
+      "inner_shape": [
+        4,
+        31
+      ],
+      "kind": "fixed"
+    },
+    "policy_weight_multiplier": {
+      "dtype": "<f4",
+      "inner_shape": [],
+      "kind": "fixed"
+    },
+    "prior_policy": {
+      "dtype": "<f4",
+      "fill": 0.0,
+      "kind": "ragged2d"
+    },
+    "seat": {
+      "dtype": "|i1",
+      "inner_shape": [],
+      "kind": "fixed"
+    },
+    "target_information_regime": {
+      "categories": [
+        "public_conservation_pimc_v1"
+      ],
+      "kind": "string"
+    },
+    "target_policy": {
+      "dtype": "<f4",
+      "fill": 0.0,
+      "kind": "ragged2d"
+    },
+    "target_policy_mask": {
+      "dtype": "|b1",
+      "fill": 0.0,
+      "kind": "ragged2d"
+    },
+    "target_score_source": {
+      "categories": [
+        "gumbel_mcts_visit_q"
+      ],
+      "kind": "string"
+    },
+    "target_scores": {
+      "dtype": "<f4",
+      "fill": NaN,
+      "kind": "ragged2d"
+    },
+    "target_scores_mask": {
+      "dtype": "|b1",
+      "fill": 0.0,
+      "kind": "ragged2d"
+    },
+    "teacher_name": {
+      "categories": [
+        "gumbel_self_play"
+      ],
+      "kind": "string"
+    },
+    "terminated": {
+      "dtype": "|b1",
+      "inner_shape": [],
+      "kind": "fixed"
+    },
+    "truncated": {
+      "dtype": "|b1",
+      "inner_shape": [],
+      "kind": "fixed"
+    },
+    "value_weight_multiplier": {
+      "dtype": "<f4",
+      "inner_shape": [],
+      "kind": "fixed"
+    },
+    "vertex_mask": {
+      "dtype": "|b1",
+      "inner_shape": [
+        54
+      ],
+      "kind": "fixed"
+    },
+    "vertex_tokens": {
+      "dtype": "<f2",
+      "inner_shape": [
+        54,
+        24
+      ],
+      "kind": "fixed"
+    },
+    "winner": {
+      "categories": [
+        "",
+        "BLUE",
+        "RED"
+      ],
+      "kind": "string"
+    }
+  },
+  "conversion_seconds": 2.21,
+  "dropped_fast_rows": 0,
+  "flat_count": 168026,
+  "full_rows_only": false,
+  "game_seed_present": true,
+  "implicit_zero_bytes_saved_per_row": 0,
+  "implicit_zero_columns": [],
+  "legal_width": 54,
+  "payload_inventory": [
+    {
+      "filename": "action_mask_version.codes.dat",
+      "sha256": "sha256:ace5084775b5d6b1243e661947d90948a1bfa3f0ffdd7dee45a77d922bb1e163",
+      "size_bytes": 150016
+    },
+    {
+      "filename": "action_taken.dat",
+      "sha256": "sha256:525ca54802dee606de0b81f76de3d13ba6ad60b6f4e53a4a9e16a18349afb461",
+      "size_bytes": 75008
+    },
+    {
+      "filename": "aux_largest_army.dat",
+      "sha256": "sha256:6d5271f4d6bc72a76e39f168729663cfc2f69a7bc26a7544ec205e966863eccf",
+      "size_bytes": 150016
+    },
+    {
+      "filename": "aux_longest_road.dat",
+      "sha256": "sha256:5d67072fa3330b3c71156d5ff357baf53d7841fcebe23a86f906511acb963c87",
+      "size_bytes": 150016
+    },
+    {
+      "filename": "aux_next_settlement.dat",
+      "sha256": "sha256:301d64ced0b588bb2bb12a04fe123edccc11b214a3cc5317baad9080fa4b97a9",
+      "size_bytes": 75008
+    },
+    {
+      "filename": "aux_robber_target.dat",
+      "sha256": "sha256:dbd8d029bb1d693831f98b40eb65ab8a017f50359a6f80d7654a1c928261d1e7",
+      "size_bytes": 75008
+    },
+    {
+      "filename": "aux_vp_in_n.dat",
+      "sha256": "sha256:927cb5fdca8ceef1929c299eebf00f31e5496b1af87295bdf20e39c9958119ce",
+      "size_bytes": 150016
+    },
+    {
+      "filename": "decision_index.dat",
+      "sha256": "sha256:7007f8cdcbccc77d75dff666e87af90200c323a4c6e3c9dc60def462ef01dd5e",
+      "size_bytes": 150016
+    },
+    {
+      "filename": "edge_mask.dat",
+      "sha256": "sha256:d965dc292a513a44838a2991951f79c914e2d83c05845d109c04f865cd50079c",
+      "size_bytes": 2700288
+    },
+    {
+      "filename": "edge_tokens.dat",
+      "sha256": "sha256:00448b2f319f2f25944848c7bca7cfa0ebf1bab743f6e04fb4aa526263352f40",
+      "size_bytes": 43204608
+    },
+    {
+      "filename": "edge_vertex_ids.dat",
+      "sha256": "sha256:b8677561bd3e33c9b2fb43ac5784fa3333a9cf8fc494608adf1cf059554cb233",
+      "size_bytes": 10801152
+    },
+    {
+      "filename": "event_mask.dat",
+      "sha256": "sha256:0d155e9acde4e44ea22856c4f330ec14baf3c5b550936e71eb1a0b48be82df0a",
+      "size_bytes": 2400256
+    },
+    {
+      "filename": "event_target_ids.dat",
+      "sha256": "sha256:dd72dd4a132bd5190c971d00070f5933cdb1513300a535f41e2b89f92bd116fe",
+      "size_bytes": 19202048
+    },
+    {
+      "filename": "event_tokens.dat",
+      "sha256": "sha256:59dbcda12305728ef083f87c3a1ba9e6fd67ce2637442b7f8fc264c90f844226",
+      "size_bytes": 196820992
+    },
+    {
+      "filename": "final_actual_vps.dat",
+      "sha256": "sha256:ee6847b11bf65d4eaff1eb1ee071df7a8bb7f7524c3048afb11f3ffb12f89850",
+      "size_bytes": 300032
+    },
+    {
+      "filename": "final_public_vps.dat",
+      "sha256": "sha256:3d66442e792b074a82a9e83fad159b52f10881e7f10a7acf6334591eaaee14c5",
+      "size_bytes": 300032
+    },
+    {
+      "filename": "game_seed.dat",
+      "sha256": "sha256:83829e271cb15ec541cfe49d1285b4c2cc8e38bc55291b39d1e15763eea929ea",
+      "size_bytes": 300032
+    },
+    {
+      "filename": "global_tokens.dat",
+      "sha256": "sha256:08613351809294c1105ccca5993d84fa4a2fb65ba833c2419d70203effbc979a",
+      "size_bytes": 3225344
+    },
+    {
+      "filename": "has_final_actual_vps.dat",
+      "sha256": "sha256:32af624648a9165a79f0bc2d44e4dc5c84fc99ea509e516248987fa0ce982ba5",
+      "size_bytes": 37504
+    },
+    {
+      "filename": "has_final_public_vps.dat",
+      "sha256": "sha256:32af624648a9165a79f0bc2d44e4dc5c84fc99ea509e516248987fa0ce982ba5",
+      "size_bytes": 37504
+    },
+    {
+      "filename": "hex_edge_ids.dat",
+      "sha256": "sha256:2485b2124a546f83001714baca9e96a7ee595872288db4fe7095418d1157237e",
+      "size_bytes": 8550912
+    },
+    {
+      "filename": "hex_mask.dat",
+      "sha256": "sha256:0089089ebde98813ee122cff5270f31dbca4e0a8c18b0c28c260f7f3d888f7f4",
+      "size_bytes": 712576
+    },
+    {
+      "filename": "hex_tokens.dat",
+      "sha256": "sha256:b364555649f7504f018eac3d7f96c8389ca6a7fb0b190937243322b593c50353",
+      "size_bytes": 18526976
+    },
+    {
+      "filename": "hex_vertex_ids.dat",
+      "sha256": "sha256:a492fc06f9821769fd64a32431dfde3ca07739511ea1ee70d912b1fd0b113671",
+      "size_bytes": 8550912
+    },
+    {
+      "filename": "legal_action_context.dat",
+      "sha256": "sha256:69ab1769b58e0879aa1651518c542f7744c0f83dd6fe2129bdec709dc777fa5a",
+      "size_bytes": 6048936
+    },
+    {
+      "filename": "legal_action_ids.dat",
+      "sha256": "sha256:c535dff02cf93f21aac71187ef39e5035f8994ff649bf4ce63a7e6d89ced4ef5",
+      "size_bytes": 336052
+    },
+    {
+      "filename": "legal_action_mask.dat",
+      "sha256": "sha256:54ac22dfcbab9c6a3283ed203596dc4e747899617c3711be135162ff750a315a",
+      "size_bytes": 168026
+    },
+    {
+      "filename": "legal_action_target_ids.dat",
+      "sha256": "sha256:6708776bb142533f1aa460b0ee86cec3874ac31c21b44ae02a5354d0470d2e6a",
+      "size_bytes": 1344208
+    },
+    {
+      "filename": "legal_action_tokens.dat",
+      "sha256": "sha256:108d5c5715fbb018091a7c9b741db4690a7a18369a5a7a1857f82b4237e79514",
+      "size_bytes": 16802600
+    },
+    {
+      "filename": "obs.dat",
+      "sha256": "sha256:96dbf26acb6ee4e44bb38694ccf3fbff1d95b796289c5d7b87c33d22dce4e014",
+      "size_bytes": 60456448
+    },
+    {
+      "filename": "phase.codes.dat",
+      "sha256": "sha256:49922c424bab4ed1d2166b29650317a083b423fba0fed8c42282c731ce401a4e",
+      "size_bytes": 150016
+    },
+    {
+      "filename": "player.codes.dat",
+      "sha256": "sha256:5060f96dcab6066235a32e45320e5d249d7e2a986490a8acfb4eaac3c00cde58",
+      "size_bytes": 150016
+    },
+    {
+      "filename": "player_mask.dat",
+      "sha256": "sha256:4a9aaaa34eff21209e820821e11c370e7518bcd6ffa9d762352be55c0c95e3b6",
+      "size_bytes": 150016
+    },
+    {
+      "filename": "player_tokens.dat",
+      "sha256": "sha256:9cbd0e8bfd4c56adffc71c1e5f719624ab2d3f21326a6d120d7c56ef9bd879d5",
+      "size_bytes": 9300992
+    },
+    {
+      "filename": "policy_weight_multiplier.dat",
+      "sha256": "sha256:f12a622d5b322a317f9315b6feaddab803cdcdbecf8e2f66b0350dd10ce95b4a",
+      "size_bytes": 150016
+    },
+    {
+      "filename": "prior_policy.dat",
+      "sha256": "sha256:a4c607d095f204dea8647c96724841dcc8a4b437f96971a62c451a1861b2c120",
+      "size_bytes": 672104
+    },
+    {
+      "filename": "row_offsets.dat",
+      "sha256": "sha256:237bebe814b398efc15d138970dcb82fe6bdeb226b8ca77f22eb66e196201795",
+      "size_bytes": 300040
+    },
+    {
+      "filename": "seat.dat",
+      "sha256": "sha256:ec3ca101cda5a8393dc4d6ff3e6bc89c9a49a6107008b67fd7d5e14226ce3420",
+      "size_bytes": 37504
+    },
+    {
+      "filename": "target_information_regime.codes.dat",
+      "sha256": "sha256:ace5084775b5d6b1243e661947d90948a1bfa3f0ffdd7dee45a77d922bb1e163",
+      "size_bytes": 150016
+    },
+    {
+      "filename": "target_policy.dat",
+      "sha256": "sha256:d7a4f95ca3d75ec8cac30e959ec74a912c6e648c4565a476dd8358f9cd35d65a",
+      "size_bytes": 672104
+    },
+    {
+      "filename": "target_policy_mask.dat",
+      "sha256": "sha256:54ac22dfcbab9c6a3283ed203596dc4e747899617c3711be135162ff750a315a",
+      "size_bytes": 168026
+    },
+    {
+      "filename": "target_score_source.codes.dat",
+      "sha256": "sha256:ace5084775b5d6b1243e661947d90948a1bfa3f0ffdd7dee45a77d922bb1e163",
+      "size_bytes": 150016
+    },
+    {
+      "filename": "target_scores.dat",
+      "sha256": "sha256:0707a15b171049972ca9ea1c53fa9181013d9b8983906e35a4adcd549d0b1dc9",
+      "size_bytes": 672104
+    },
+    {
+      "filename": "target_scores_mask.dat",
+      "sha256": "sha256:14b84e59ad4abac01de5d4aecb2f4a28f7a22e11a52949b3605a45084e6f9b4d",
+      "size_bytes": 168026
+    },
+    {
+      "filename": "teacher_name.codes.dat",
+      "sha256": "sha256:ace5084775b5d6b1243e661947d90948a1bfa3f0ffdd7dee45a77d922bb1e163",
+      "size_bytes": 150016
+    },
+    {
+      "filename": "terminated.dat",
+      "sha256": "sha256:32af624648a9165a79f0bc2d44e4dc5c84fc99ea509e516248987fa0ce982ba5",
+      "size_bytes": 37504
+    },
+    {
+      "filename": "truncated.dat",
+      "sha256": "sha256:d1b010974c5e476ae604866e892ab31239a61959b497afbb5c38334bdf4f1391",
+      "size_bytes": 37504
+    },
+    {
+      "filename": "value_weight_multiplier.dat",
+      "sha256": "sha256:9c5ca6396d151a16892a0cbeecd5c4d18ec14ee5f190f0ad4bb376eb1a1b5194",
+      "size_bytes": 150016
+    },
+    {
+      "filename": "vertex_mask.dat",
+      "sha256": "sha256:1ec63b4abea1d4e7a95e9745170aca32ad59ab28f803f9370bbb88d52c2d6e3f",
+      "size_bytes": 2025216
+    },
+    {
+      "filename": "vertex_tokens.dat",
+      "sha256": "sha256:313a54283c38fe6fa004aea571fbbc46fa99a1401d51cbd3a92d4e5824646339",
+      "size_bytes": 97210368
+    },
+    {
+      "filename": "winner.codes.dat",
+      "sha256": "sha256:ca4175471ca0528124a8ab69c0c2651fb81529d58427c3b7997a7098139bd082",
+      "size_bytes": 150016
+    }
+  ],
+  "payload_inventory_schema": "memmap-payload-inventory-v1",
+  "payload_inventory_sha256": "sha256:30a9909a9c0ebe43671707bc516e2789d7f2a1ea39b95177e57600f135cec103",
+  "row_count": 37504,
+  "schema": "memmap_corpus_v1",
+  "shard_count": 123,
+  "source": "runs/rnd_public_pimc_64/gpu0",
+  "sources": [
+    "runs/rnd_public_pimc_64/gpu0",
+    "runs/rnd_public_pimc_64/gpu1",
+    "runs/rnd_public_pimc_64/gpu2",
+    "runs/rnd_public_pimc_64/gpu3",
+    "runs/rnd_public_pimc_64/gpu4",
+    "runs/rnd_public_pimc_64/gpu5",
+    "runs/rnd_public_pimc_64/gpu6",
+    "runs/rnd_public_pimc_64/gpu7"
+  ],
+  "stats": {
+    "action_taken_max": 331,
+    "action_taken_min": 0,
+    "duplicate_game_seed_count": 0,
+    "has_duplicate_game_seeds": false,
+    "has_duplicate_legal_rows": false,
+    "max_legal_action_id": 331
+  },
+  "verify_fill": true
+}

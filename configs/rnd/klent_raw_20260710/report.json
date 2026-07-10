@@ -1,0 +1,51 @@
+{
+  "arm": "klent-direct",
+  "git": {
+    "commit": null,
+    "dirty": null
+  },
+  "hardware": {
+    "accelerator_model": "NVIDIA H100 80GB HBM3",
+    "compute_capability": [
+      9,
+      0
+    ],
+    "cuda": true,
+    "device": "cuda",
+    "total_memory_bytes": 85017624576
+  },
+  "information_regime": "public_observation_policy",
+  "initial_checkpoint": {
+    "path": "/home/ubuntu/catan-zero-rnd/runs/rnd_bootstrap_35m/checkpoint.pt",
+    "sha256": "e2070ce27bfa30337df0669042fe8e2122e0f027e47d5483c16034ab388a3103"
+  },
+  "iterations": [],
+  "q_initialization": "zero-output",
+  "refusal": {
+    "decisions": 1200,
+    "games": 2,
+    "iteration": 1,
+    "iteration_rng_seed": 1961478880684075101,
+    "max_truncation_fraction": 0.5,
+    "reason": "insufficient_terminal_outcome_signal",
+    "seeds": [
+      6201000000,
+      6201000001
+    ],
+    "terminal_games": 0,
+    "truncated_games": 2,
+    "truncation_fraction": 1.0,
+    "wall_time_sec": 33.76090837999982
+  },
+  "schema_version": "catan-zero-e5-klent-run/v1",
+  "seed_manifest": {
+    "path": "/home/ubuntu/catan-zero-rnd/configs/rnd/e5_klent_smoke_seeds_20260710.json",
+    "schema_version": "catan-zero-e5-seeds/v1",
+    "seeds": [
+      6201000000,
+      6201000001
+    ],
+    "sha256": "47a63db36221fc24558c8b081dc62006dd68a3918d4bbbf9130d8c5f1b347796"
+  },
+  "status": "refused"
+}

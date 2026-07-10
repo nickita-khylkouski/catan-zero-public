@@ -1,0 +1,26 @@
+{
+  "data": "runs/rnd_public_pimc_64_memmap",
+  "data_fingerprint": "sha256:1efee22267481ce27c20fd6d3b78b2469a7bd0f31ff84db38a322ad2ea62286e",
+  "game_seeds": [
+    6200110001,
+    6200110002,
+    6200110004,
+    6200110005,
+    6200120000,
+    6200120004,
+    6200140005,
+    6200150000,
+    6200150005,
+    6200160005,
+    6200170003,
+    6200170005,
+    6200170006
+  ],
+  "schema_version": "train-validation-game-seeds-v1",
+  "validation_fraction": 0.2,
+  "validation_game_seed_count": 13,
+  "validation_game_seed_ranges": [],
+  "validation_game_seed_set_sha256": "sha256:fcf4ba9b3272df84a5b9904b1730d00bd5f8f4912156402d3b3d3c566e13eb08",
+  "validation_max_samples": 0,
+  "validation_seed": 20260710
+}

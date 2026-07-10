@@ -190,6 +190,14 @@ class EntityGraphConfig:
     moe_top_k: int = 2
     # 0 selects width 384 at model width 384 and scales proportionally.
     moe_expert_ff_size: int = 0
+    # --- Sparse topology adapters inside the incumbent Transformer ---
+    # Comma-separated, one-based block positions (for example ``"2,4"``).
+    # Empty preserves the historical Transformer and state_dict exactly.  These
+    # adapters consume sparse Catan incidence lists without selecting the RRT
+    # action decoder, target gather, or edge-policy head.
+    topology_adapter_layers: str = ""
+    topology_adapter_width: int = 448
+    topology_adapter_bases: int = 4
 
 
 class EntityGraphNet:
@@ -292,15 +300,46 @@ class EntityGraphNet:
                 self.config = cfg
                 h = int(cfg.hidden_size)
                 dropout = float(cfg.dropout)
-                self.state_trunk = str(
-                    getattr(cfg, "state_trunk", "transformer") or "transformer"
-                ).strip().lower()
+                self.state_trunk = (
+                    str(getattr(cfg, "state_trunk", "transformer") or "transformer")
+                    .strip()
+                    .lower()
+                )
                 if self.state_trunk not in {"transformer", "rrt", "resrgcn"}:
                     raise ValueError(
                         "state_trunk must be one of transformer/rrt/resrgcn, got "
                         f"{self.state_trunk!r}"
                     )
                 self.uses_relational_topology = self.state_trunk != "transformer"
+                raw_adapter_layers = str(
+                    getattr(cfg, "topology_adapter_layers", "") or ""
+                ).strip()
+                try:
+                    adapter_layers = tuple(
+                        int(value.strip())
+                        for value in raw_adapter_layers.split(",")
+                        if value.strip()
+                    )
+                except ValueError as error:
+                    raise ValueError(
+                        "topology_adapter_layers must be comma-separated integers"
+                    ) from error
+                if len(set(adapter_layers)) != len(adapter_layers):
+                    raise ValueError(
+                        "topology_adapter_layers must not contain duplicates"
+                    )
+                layer_count = max(1, int(cfg.state_layers))
+                if any(layer < 1 or layer > layer_count for layer in adapter_layers):
+                    raise ValueError(
+                        "topology_adapter_layers entries must be between 1 and "
+                        f"state_layers={layer_count}"
+                    )
+                if adapter_layers and self.state_trunk != "transformer":
+                    raise ValueError(
+                        "topology adapters are only valid with state_trunk='transformer'"
+                    )
+                self.topology_adapter_layers = tuple(sorted(adapter_layers))
+                self.uses_topology_adapters = bool(self.topology_adapter_layers)
                 self.latent_deliberation_steps = int(
                     getattr(cfg, "latent_deliberation_steps", 0) or 0
                 )
@@ -323,11 +362,11 @@ class EntityGraphNet:
                 self.moe_enabled = self.moe_routed_experts > 0
                 if self.moe_enabled:
                     if self.state_trunk != "rrt":
-                        raise ValueError("sparse MoE currently requires state_trunk='rrt'")
-                    if not 1 <= self.moe_top_k <= self.moe_routed_experts:
                         raise ValueError(
-                            "moe_top_k must be in [1, moe_routed_experts]"
+                            "sparse MoE currently requires state_trunk='rrt'"
                         )
+                    if not 1 <= self.moe_top_k <= self.moe_routed_experts:
+                        raise ValueError("moe_top_k must be in [1, moe_routed_experts]")
                 self.hex_encoder = _token_encoder(HEX_FEATURE_SIZE, h, dropout)
                 self.vertex_encoder = _token_encoder(VERTEX_FEATURE_SIZE, h, dropout)
                 self.edge_encoder = _token_encoder(EDGE_FEATURE_SIZE, h, dropout)
@@ -342,6 +381,24 @@ class EntityGraphNet:
                         for _ in range(max(1, int(cfg.state_layers)))
                     )
                     self.relational_block_pattern = ""
+                    if self.uses_topology_adapters:
+                        from catan_zero.rl.sparse_topology_adapter import (
+                            SparseTopologyAdapter,
+                        )
+
+                        adapter_width = int(getattr(cfg, "topology_adapter_width", 448))
+                        adapter_bases = int(getattr(cfg, "topology_adapter_bases", 4))
+                        self.topology_adapters = nn.ModuleDict(
+                            {
+                                str(layer): SparseTopologyAdapter(
+                                    h,
+                                    adapter_width,
+                                    adapter_bases,
+                                    dropout,
+                                )
+                                for layer in self.topology_adapter_layers
+                            }
+                        )
                 else:
                     from catan_zero.rl.relational_trunks import (
                         RelationalTransformerBlock,
@@ -365,7 +422,10 @@ class EntityGraphNet:
                             raw_pattern = ("RRT" * ((layer_count + 2) // 3))[
                                 :layer_count
                             ]
-                        if len(raw_pattern) != layer_count or set(raw_pattern) - {"R", "T"}:
+                        if len(raw_pattern) != layer_count or set(raw_pattern) - {
+                            "R",
+                            "T",
+                        }:
                             raise ValueError(
                                 "relational_block_pattern must contain exactly "
                                 f"state_layers R/T entries: pattern={raw_pattern!r} "
@@ -754,8 +814,26 @@ class EntityGraphNet:
                         else:
                             tokens = block_output
                 else:
-                    for block in self.blocks:
+                    topology_edges = None
+                    if self.uses_topology_adapters:
+                        from catan_zero.rl.sparse_topology_adapter import (
+                            build_sparse_incidence_edges,
+                        )
+
+                        topology_edges = build_sparse_incidence_edges(
+                            batch, sequence_length=int(tokens.shape[1])
+                        )
+                    for layer, block in enumerate(self.blocks, start=1):
                         tokens = block(tokens, key_padding_mask=padding_mask)
+                        if (
+                            self.uses_topology_adapters
+                            and str(layer) in self.topology_adapters
+                        ):
+                            tokens = self.topology_adapters[str(layer)](
+                                tokens,
+                                key_padding_mask=padding_mask,
+                                edges=topology_edges,
+                            )
                 state = self.state_norm(tokens[:, 0])
                 if self.latent_deliberation_steps > 0:
                     plan = self.deliberation_slots.expand(tokens.shape[0], -1, -1)
@@ -767,9 +845,7 @@ class EntityGraphNet:
                         )
                     fused = torch.cat((state, plan.mean(dim=1)), dim=-1)
                     state = self.deliberation_fusion(
-                        torch.nn.functional.gelu(
-                            self.deliberation_fusion_norm(fused)
-                        )
+                        torch.nn.functional.gelu(self.deliberation_fusion_norm(fused))
                     )
                 if self.moe_enabled:
                     return (
@@ -836,9 +912,9 @@ class EntityGraphNet:
                     "final_vp": self.final_vp_head(state).squeeze(-1),
                 }
                 if self.latent_deliberation_steps > 0:
-                    outputs["deliberation_halt_logit"] = (
-                        self.deliberation_halt_head(state).squeeze(-1)
-                    )
+                    outputs["deliberation_halt_logit"] = self.deliberation_halt_head(
+                        state
+                    ).squeeze(-1)
                 if self.moe_enabled:
                     outputs["moe_balance_metric"] = encoded_state[3]
                     outputs["moe_routing_load"] = encoded_state[4]
@@ -956,10 +1032,9 @@ class EntityGraphNet:
                         )
                     )
                 else:
-                    event_piece = (
-                        self.event_encoder(event_tokens.float())
-                        + self.type_embedding[6].view(1, 1, -1)
-                    )
+                    event_piece = self.event_encoder(
+                        event_tokens.float()
+                    ) + self.type_embedding[6].view(1, 1, -1)
                 pieces = [
                     self.cls_token.expand(batch["hex_tokens"].shape[0], -1, -1)
                     + self.type_embedding[0].view(1, 1, -1),
@@ -1189,6 +1264,9 @@ class EntityGraphPolicy:
         moe_routed_experts: int = 0,
         moe_top_k: int = 2,
         moe_expert_ff_size: int = 0,
+        topology_adapter_layers: str = "",
+        topology_adapter_width: int = 448,
+        topology_adapter_bases: int = 4,
     ) -> EntityGraphPolicy:
         env = ColonistMultiAgentEnv(env_config or ColonistMultiAgentConfig())
         try:
@@ -1217,6 +1295,9 @@ class EntityGraphPolicy:
                 moe_routed_experts=int(moe_routed_experts),
                 moe_top_k=int(moe_top_k),
                 moe_expert_ff_size=int(moe_expert_ff_size),
+                topology_adapter_layers=str(topology_adapter_layers),
+                topology_adapter_width=int(topology_adapter_width),
+                topology_adapter_bases=int(topology_adapter_bases),
             )
             return cls(config, static, seed=seed, device=device)
         finally:
@@ -1245,14 +1326,14 @@ class EntityGraphPolicy:
         # inference window on CUDA; base checkpoints also skip action target
         # ids when neither target-aware policy head is enabled.
         needs_action_targets = bool(
-            str(getattr(self.config, "state_trunk", "transformer"))
-            != "transformer"
+            str(getattr(self.config, "state_trunk", "transformer")) != "transformer"
             or getattr(self.config, "action_target_gather", False)
             or getattr(self.config, "edge_policy_head", False)
         )
-        needs_topology = (
-            str(getattr(self.config, "state_trunk", "transformer"))
-            != "transformer"
+        needs_topology = str(
+            getattr(self.config, "state_trunk", "transformer")
+        ) != "transformer" or bool(
+            str(getattr(self.config, "topology_adapter_layers", "") or "").strip()
         )
         batch = {
             key: torch.as_tensor(value, device=self.device)
@@ -1431,15 +1512,13 @@ class EntityGraphPolicy:
         payload = {
                 "policy_type": self.policy_type,
                 # Durable name-keyed form (task #74): never pickle the frozen+slots
-                # dataclass itself -- positional state is crash/shift-prone across
-                # field-list changes. Loaders accept both this and legacy pickles.
-                "config": config_to_dict(self.config),
-                "action_mask_version": str(
-                    getattr(self.config, "action_mask_version", "")
-                ),
-                # f72 safety net (task #76): whether train_bc.py --mask-hidden-info
-                # was used for this training run. Absent/False on any checkpoint
-                # predating this field (legacy checkpoints deserialize as
+            # dataclass itself -- positional state is crash/shift-prone across
+            # field-list changes. Loaders accept both this and legacy pickles.
+            "config": config_to_dict(self.config),
+            "action_mask_version": str(getattr(self.config, "action_mask_version", "")),
+            # f72 safety net (task #76): whether train_bc.py --mask-hidden-info
+            # was used for this training run. Absent/False on any checkpoint
+            # predating this field (legacy checkpoints deserialize as
                 # untrained-with-masking, the safe default -- see
                 # EntityGraphRustEvaluator.__init__'s public_observation guard).
                 "mask_hidden_info": bool(mask_hidden_info),
@@ -1461,9 +1540,7 @@ class EntityGraphPolicy:
             durable_value_training = dict(value_training)
             trained_readouts = tuple(
                 str(readout)
-                for readout in durable_value_training.get(
-                    "trained_value_readouts", ()
-                )
+                for readout in durable_value_training.get("trained_value_readouts", ())
                 if str(readout) in {"scalar", "categorical"}
             )
             payload["value_training"] = durable_value_training
@@ -1555,7 +1632,9 @@ class EntityGraphPolicy:
         # requested against a checkpoint that doesn't report having been trained
         # for it, so an old/legacy checkpoint correctly fails closed rather than
         # silently running mismatched.
-        policy.trained_with_masked_hidden_info = bool(data.get("mask_hidden_info", False))
+        policy.trained_with_masked_hidden_info = bool(
+            data.get("mask_hidden_info", False)
+        )
         value_training = data.get("value_training")
         policy.value_training = (
             dict(value_training) if isinstance(value_training, dict) else None
@@ -1614,7 +1693,9 @@ class EntityGraphPolicy:
                     f"non-numeric value-training metadata: {error}"
                 )
                 optimizer_steps = completed_epochs = metadata_bins = 0
-                scalar_weight = categorical_weight = scalar_mass = categorical_mass = 0.0
+                scalar_weight = categorical_weight = scalar_mass = categorical_mass = (
+                    0.0
+                )
             base_valid = (
                 schema == "value-training-v1"
                 and not provenance_errors

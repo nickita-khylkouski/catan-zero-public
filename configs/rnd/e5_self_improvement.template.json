@@ -12,7 +12,7 @@
   },
   "arms": [
     {"arm_id": "search-distillation", "comparison_role": "ranked", "architecture_id": "entity-graph-net-35m", "expected_parameter_count": 35041353, "search_id": "frozen-public-eval", "source_status": "implemented", "measurement_adapter_status": "not_implemented", "runnable": false},
-    {"arm_id": "klent-direct", "comparison_role": "ranked", "architecture_id": "entity-graph-net-35m", "expected_parameter_count": 35041353, "search_id": "frozen-public-eval", "source_status": "implemented_prototype", "measurement_adapter_status": "not_implemented", "runnable": false},
+    {"arm_id": "klent-direct", "comparison_role": "ranked", "architecture_id": "entity-graph-net-35m", "expected_parameter_count": 35041353, "search_id": "frozen-public-eval", "source_status": "implemented_single_node", "training_adapter_status": "implemented", "measurement_adapter_status": "not_implemented", "runnable": false},
     {"arm_id": "distill-then-klent", "comparison_role": "ranked", "architecture_id": "entity-graph-net-35m", "expected_parameter_count": 35041353, "search_id": "frozen-public-eval", "source_status": "implemented_prototype", "measurement_adapter_status": "not_implemented", "runnable": false}
   ],
   "klent_contract": "2-player no-player-trade only; alpha=.03; beta=.1; trace horizon=8; current-policy improved targets; chosen-action Q lambda returns; Catan same-player prompt signs"

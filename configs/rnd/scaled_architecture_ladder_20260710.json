@@ -1,0 +1,92 @@
+{
+  "schema_version": "catan-zero-rnd-scaled-architecture-ladder/v1",
+  "status": "hypotheses_require_systems_and_learning_gates",
+  "information_regime": "public_only",
+  "common": {
+    "architecture": "entity_graph",
+    "state_trunk": "transformer",
+    "attention_heads": 8,
+    "dropout": 0.05,
+    "action_size": 607,
+    "value_objectives": ["scalar", "hl_gauss_51_bin"],
+    "warning": "Parameter count and systems feasibility are not playing-strength evidence."
+  },
+  "arms": [
+    {
+      "arm_id": "incumbent-h640-l6",
+      "hidden_size": 640,
+      "state_layers": 6,
+      "topology_adapter_layers": "",
+      "scalar_parameter_count": 35041353,
+      "hl_gauss_51_bin_parameter_count": 35484925,
+      "initialization": "existing_checkpoint"
+    },
+    {
+      "arm_id": "hybrid-h640-l6-a2-a4-b448",
+      "hidden_size": 640,
+      "state_layers": 6,
+      "topology_adapter_layers": "2,4",
+      "topology_adapter_width": 448,
+      "topology_adapter_bases": 4,
+      "scalar_parameter_count": 38602057,
+      "hl_gauss_51_bin_parameter_count": 39045629,
+      "initialization": "incumbent_checkpoint_plus_zero_init_adapters"
+    },
+    {
+      "arm_id": "dense-h832-l6-59m",
+      "hidden_size": 832,
+      "state_layers": 6,
+      "topology_adapter_layers": "",
+      "scalar_parameter_count": 59131977,
+      "hl_gauss_51_bin_parameter_count": 59868349,
+      "initialization": "from_scratch"
+    },
+    {
+      "arm_id": "dense-h832-l10-92m",
+      "hidden_size": 832,
+      "state_layers": 10,
+      "topology_adapter_layers": "",
+      "scalar_parameter_count": 92401993,
+      "hl_gauss_51_bin_parameter_count": 93138365,
+      "initialization": "from_scratch",
+      "rationale": "Uses the same width as the 59m arm and adds depth; avoids an arbitrary h824 model with 103-dimensional heads merely to print 91m."
+    }
+  ],
+  "gates": [
+    {
+      "stage": "systems",
+      "all_arms": true,
+      "requirements": [
+        "finite_forward_backward",
+        "peak_allocated_memory_lte_70_gib",
+        "rows_per_second_gte_0.5x_incumbent"
+      ]
+    },
+    {
+      "stage": "fixed_corpus_screen",
+      "budget": {
+        "optimizer_steps": 250,
+        "global_batch_size": 4096,
+        "sample_presentations": 1024000,
+        "seed": 1
+      },
+      "requirements": [
+        "same_corpus_manifest",
+        "same_sample_order",
+        "same_validation_split",
+        "same_primary_objective"
+      ]
+    },
+    {
+      "stage": "replicated_learning",
+      "survivors": 2,
+      "budget": {
+        "corpus_rows": 3648516,
+        "epochs": 3,
+        "sample_presentations": 10945548,
+        "seeds": [1, 2, 3]
+      },
+      "then": "fixed paired terminal games with exact seat swaps"
+    }
+  ]
+}
