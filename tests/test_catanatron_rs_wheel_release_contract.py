@@ -36,7 +36,8 @@ def test_builder_is_valid_bash_and_stages_the_committed_tree_at_one_root() -> No
     assert "/tmp/catan-zero-catanatron-rs-wheel-src" in script
     assert re.search(r"git\s+-C\s+.*\sarchive\s+", _flat_script())
     assert "CATAN_RS_BUILD_STAGED" in script
-    assert "CATAN_RS_SOURCE_COMMIT" in script
+    assert 'SOURCE_COMMIT="$(git -C "$SOURCE_ROOT" rev-parse --verify HEAD)"' in script
+    assert "build_receipt_final" in script
     assert "canonical_build_root" in script
 
 
@@ -105,6 +106,21 @@ def test_release_environment_and_toolchain_are_sealed() -> None:
         "Python 3.11.15",
     ):
         assert version in script
+
+
+def test_source_identity_is_bound_only_after_compilation() -> None:
+    script = _script()
+    staged_environment = script[
+        script.index("env -i") : script.index(
+            '"$CANONICAL_BUILD_ROOT/tools/build_catanatron_rs_wheel.sh"'
+        )
+    ]
+    assert "CATAN_RS_SOURCE_COMMIT=" not in staged_environment
+    assert "CATAN_RS_SOURCE_TREE=" not in staged_environment
+    assert 'payload["source_commit"] = sys.argv[2]' in script
+    assert 'payload["source_tree"] = sys.argv[3]' in script
+    assert '"source_commit": None' in script
+    assert '"source_tree": None' in script
 
 
 def test_builder_emits_a_complete_machine_readable_receipt() -> None:

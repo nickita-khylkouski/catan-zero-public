@@ -71,10 +71,33 @@ if [ "${CATAN_RS_BUILD_STAGED:-0}" != "1" ]; then
     PYTHONHASHSEED=0 \
     PYTHON_BIN="$PYTHON_BIN" \
     CATAN_RS_BUILD_STAGED=1 \
-    CATAN_RS_SOURCE_COMMIT="$SOURCE_COMMIT" \
-    CATAN_RS_SOURCE_TREE="$SOURCE_TREE" \
     OUT_DIR="$OUT_DIR" \
     "$CANONICAL_BUILD_ROOT/tools/build_catanatron_rs_wheel.sh"
+  # Source identity is release evidence, not a compiler input. Exporting these
+  # values into Cargo changes Rust's crate disambiguator even when every native
+  # source byte is identical (the checksum-only A->B proof caught this). Bind
+  # them into the already-built external receipt only after compilation.
+  "$PYTHON_BIN" - "$OUT_DIR/$RECEIPT_NAME" "$SOURCE_COMMIT" "$SOURCE_TREE" <<'PY'
+import json
+import os
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+payload = json.loads(path.read_text())
+if payload.get("source_commit") is not None or payload.get("source_tree") is not None:
+    raise SystemExit("inner build receipt unexpectedly contains source identity")
+payload["source_commit"] = sys.argv[2]
+payload["source_tree"] = sys.argv[3]
+temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+with temporary.open("x", encoding="utf-8") as handle:
+    json.dump(payload, handle, indent=2, sort_keys=True)
+    handle.write("\n")
+    handle.flush()
+    os.fsync(handle.fileno())
+os.replace(temporary, path)
+PY
+  echo "build_receipt_final=$OUT_DIR/$RECEIPT_NAME"
   exit $?
 fi
 
@@ -117,8 +140,8 @@ PYTHON_VERSION="$("$PYTHON_BIN" --version 2>&1)"
 [ "$PYTHON_VERSION" = "Python 3.11.15" ] \
   || die "unexpected Python: $PYTHON_VERSION"
 
-echo "source_commit=${CATAN_RS_SOURCE_COMMIT:-unknown}"
-echo "source_tree=${CATAN_RS_SOURCE_TREE:-unknown}"
+echo "source_commit=<bound-after-build>"
+echo "source_tree=<bound-after-build>"
 echo "canonical_build_root=$ROOT"
 echo "$RUSTC_VERSION"
 echo "$CARGO_VERSION"
@@ -154,8 +177,8 @@ import sys
 
 receipt = {
     "schema_version": "catanatron-rs-wheel-build-receipt-v1",
-    "source_commit": "${CATAN_RS_SOURCE_COMMIT:-unknown}",
-    "source_tree": "${CATAN_RS_SOURCE_TREE:-unknown}",
+    "source_commit": None,
+    "source_tree": None,
     "builder_sha256": "$BUILDER_SHA256",
     "cargo_lock_sha256": "$CARGO_LOCK_SHA256",
     "python_cargo_lock_sha256": "$PYTHON_CARGO_LOCK_SHA256",
