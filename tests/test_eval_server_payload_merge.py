@@ -22,12 +22,12 @@ from catan_zero.search.eval_server import (
 def _payload(*, marker: int, rows: int, legal_width: int) -> dict:
     """Build one request with distinct, exactly representable values."""
     base = marker * 100
-    legal_ids = (
-        base + np.arange(rows * legal_width, dtype=np.int64)
-    ).reshape(rows, legal_width)
-    context = (
-        base + 10 + np.arange(rows * legal_width * 3, dtype=np.float32)
-    ).reshape(rows, legal_width, 3)
+    legal_ids = (base + np.arange(rows * legal_width, dtype=np.int64)).reshape(
+        rows, legal_width
+    )
+    context = (base + 10 + np.arange(rows * legal_width * 3, dtype=np.float32)).reshape(
+        rows, legal_width, 3
+    )
     legal_action_tokens = (
         (base + 30 + np.arange(rows * legal_width * 2, dtype=np.float32))
         .astype(np.float16)
@@ -160,6 +160,9 @@ def test_premerge_event_crop_matches_postmerge_crop() -> None:
         ).reshape(rows, 5, 4)
         payload["entity"]["event_mask"] = np.zeros((rows, 5), dtype=np.bool_)
         payload["entity"]["event_mask"][:, : index + 1] = True
+        payload["entity"]["event_target_ids"] = np.full(
+            (rows, 5, 4), index, dtype=np.int16
+        )
 
     post_payloads = [
         {
@@ -199,16 +202,27 @@ def test_premerge_event_crop_validates_entire_window_before_mutating() -> None:
     with pytest.raises(ValueError, match="would remove an unmasked event token"):
         _crop_payload_event_tails_before_merge(payloads, 2)
 
-    assert [payload["entity"]["event_tokens"].shape for payload in payloads] == original_shapes
+    assert [
+        payload["entity"]["event_tokens"].shape for payload in payloads
+    ] == original_shapes
 
 
 @pytest.mark.parametrize(
     ("config", "expected"),
     [
         (None, True),
-        (types.SimpleNamespace(action_target_gather=False, edge_policy_head=False), False),
-        (types.SimpleNamespace(action_target_gather=True, edge_policy_head=False), True),
-        (types.SimpleNamespace(action_target_gather=False, edge_policy_head=True), True),
+        (
+            types.SimpleNamespace(action_target_gather=False, edge_policy_head=False),
+            False,
+        ),
+        (
+            types.SimpleNamespace(action_target_gather=True, edge_policy_head=False),
+            True,
+        ),
+        (
+            types.SimpleNamespace(action_target_gather=False, edge_policy_head=True),
+            True,
+        ),
         (
             types.SimpleNamespace(
                 state_trunk="rrt",
@@ -229,6 +243,12 @@ def test_policy_target_requirement_handshake_is_safe(config, expected: bool) -> 
     [
         (None, True),
         (types.SimpleNamespace(state_trunk="transformer"), False),
+        (
+            types.SimpleNamespace(
+                state_trunk="transformer", topology_adapter_layers="2,4"
+            ),
+            True,
+        ),
         (types.SimpleNamespace(state_trunk="rrt"), True),
         (types.SimpleNamespace(state_trunk="resrgcn"), True),
     ],
@@ -290,7 +310,9 @@ def test_remote_client_transports_target_ids_only_when_policy_needs_them(
     assert ("legal_action_target_ids" in payload["entity"]) is needs_action_targets
     assert "hex_vertex_ids" not in payload["entity"]
     if needs_action_targets:
-        np.testing.assert_array_equal(payload["entity"]["legal_action_target_ids"], target_ids)
+        np.testing.assert_array_equal(
+            payload["entity"]["legal_action_target_ids"], target_ids
+        )
 
 
 def test_remote_client_transports_topology_for_relational_trunks() -> None:
@@ -365,10 +387,12 @@ def test_remote_client_event_limit_validates_and_crops_before_queue_put() -> Non
     request_queue = _RequestQueue()
     event_tokens = np.zeros((2, 64, 41), dtype=np.float16)
     event_mask = np.zeros((2, 64), dtype=np.bool_)
+    event_target_ids = np.full((2, 64, 4), -1, dtype=np.int16)
     entity = {
         "global_tokens": np.zeros((2, 1, 3), dtype=np.float16),
         "event_tokens": event_tokens,
         "event_mask": event_mask,
+        "event_target_ids": event_target_ids,
     }
     client = RemoteEvalClient(
         request_queue,
@@ -377,6 +401,7 @@ def test_remote_client_event_limit_validates_and_crops_before_queue_put() -> Non
         action_size=332,
         trained_with_masked_hidden_info=False,
         event_token_limit=0,
+        needs_relational_topology=True,
         config=EntityGraphRustEvaluatorConfig(),
     )
 
@@ -390,11 +415,13 @@ def test_remote_client_event_limit_validates_and_crops_before_queue_put() -> Non
     payload = request_queue.items[0][2]
     assert payload["entity"]["event_tokens"].shape == (2, 0, 41)
     assert payload["entity"]["event_mask"].shape == (2, 0)
+    assert payload["entity"]["event_target_ids"].shape == (2, 0, 4)
     assert payload["_event_source_active_tokens"] == 0
     assert payload["_event_source_padded_tokens"] == 128
     # The evaluator-owned feature mapping and arrays are not mutated.
     assert entity["event_tokens"] is event_tokens
     assert entity["event_mask"] is event_mask
+    assert entity["event_target_ids"] is event_target_ids
     assert entity["event_tokens"].shape == (2, 64, 41)
 
 

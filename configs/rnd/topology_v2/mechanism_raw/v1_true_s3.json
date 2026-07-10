@@ -1,0 +1,24 @@
+{
+  "batch_size": 64,
+  "bottleneck": 16,
+  "device": "cuda",
+  "edge_control": "true_topology",
+  "elapsed_sec": 2.6332120570004918,
+  "final_loss": 0.03213071823120117,
+  "finite": true,
+  "gpu_name": "NVIDIA H100 80GB HBM3",
+  "heads": 4,
+  "initial_loss": 0.9337820410728455,
+  "kind": "basis_mean_v1",
+  "parameter_count": 2769,
+  "schema_version": "catan-zero-topology-mechanism-probe/v1",
+  "seed": 3,
+  "source_sha256": {
+    "src/catan_zero/rl/sparse_topology_adapter.py": "9b2b83679dc600cd6624a4ff87b0604ec5bd45d4afb6ff8cbff8b4706a375165",
+    "tools/rnd_topology_mechanism_probe.py": "8c1d2d077ca8d3de9f262eb832aa43988317e5a4fcd3df0aee41aad5ba44f7c7"
+  },
+  "steps": 200,
+  "tail_mean_loss": 0.033915341924875976,
+  "torch_version": "2.7.0",
+  "width": 32
+}

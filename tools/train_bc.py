@@ -423,6 +423,29 @@ def build_parser() -> argparse.ArgumentParser:
         default=4,
         help="Basis-transform count in each sparse topology adapter.",
     )
+    parser.add_argument(
+        "--topology-adapter-kind",
+        choices=("basis_mean_v1", "local_attention_v2"),
+        default="basis_mean_v1",
+        help="Drop-in sparse topology mechanism; the historical mean adapter remains default.",
+    )
+    parser.add_argument(
+        "--topology-adapter-heads",
+        type=int,
+        default=4,
+        help="Sparse local-attention heads; inert for basis_mean_v1.",
+    )
+    parser.add_argument(
+        "--topology-adapter-share-weights",
+        action="store_true",
+        help="Reuse one adapter module at every configured layer for a capacity control.",
+    )
+    parser.add_argument(
+        "--topology-adapter-edge-control",
+        choices=("true_topology", "self_message", "type_degree_preserving_rewire"),
+        default="true_topology",
+        help="R&D topology ablation; true_topology is the only normal training mode.",
+    )
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument(
         "--lr-warmup-steps",
@@ -2693,6 +2716,12 @@ def main(argv: Sequence[str] | None = None) -> None:
                     topology_adapter_layers=str(args.topology_adapter_layers),
                     topology_adapter_width=int(args.topology_adapter_width),
                     topology_adapter_bases=int(args.topology_adapter_bases),
+                    topology_adapter_kind=str(args.topology_adapter_kind),
+                    topology_adapter_heads=int(args.topology_adapter_heads),
+                    topology_adapter_share_weights=bool(
+                        args.topology_adapter_share_weights
+                    ),
+                    topology_adapter_edge_control=str(args.topology_adapter_edge_control),
                 )
             elif args.arch == "xdim_graph":
                 policy = XDimGraphPolicy.create(
@@ -3617,6 +3646,10 @@ def main(argv: Sequence[str] | None = None) -> None:
         "topology_adapter_layers": str(args.topology_adapter_layers),
         "topology_adapter_width": int(args.topology_adapter_width),
         "topology_adapter_bases": int(args.topology_adapter_bases),
+        "topology_adapter_kind": str(args.topology_adapter_kind),
+        "topology_adapter_heads": int(args.topology_adapter_heads),
+        "topology_adapter_share_weights": bool(args.topology_adapter_share_weights),
+        "topology_adapter_edge_control": str(args.topology_adapter_edge_control),
         "mask_hidden_info": bool(args.mask_hidden_info),
         "seed": int(args.seed),
         "symmetry_augment": bool(args.symmetry_augment),
@@ -3775,8 +3808,6 @@ def main(argv: Sequence[str] | None = None) -> None:
         "validation_max_samples": args.validation_max_samples,
         "validation_seed": args.validation_seed,
         "graph_tokens": args.graph_tokens if args.arch == "xdim_graph" else None,
-        "graph_layers": args.graph_layers if args.arch in ("xdim_graph", "entity_graph") else None,
-        "attention_heads": args.attention_heads if args.arch in ("xdim_graph", "entity_graph") else None,
         "graph_dropout": args.graph_dropout if args.arch in ("xdim_graph", "entity_graph") else None,
         "progress_every_batches": args.progress_every_batches,
         "train_diagnostics_every_batches": args.train_diagnostics_every_batches,
@@ -9039,6 +9070,18 @@ def _checkpoint_config_mismatches(
             ("topology_adapter_layers", "topology_adapter_layers", ""),
             ("topology_adapter_width", "topology_adapter_width", 448),
             ("topology_adapter_bases", "topology_adapter_bases", 4),
+            ("topology_adapter_kind", "topology_adapter_kind", "basis_mean_v1"),
+            ("topology_adapter_heads", "topology_adapter_heads", 4),
+            (
+                "topology_adapter_share_weights",
+                "topology_adapter_share_weights",
+                False,
+            ),
+            (
+                "topology_adapter_edge_control",
+                "topology_adapter_edge_control",
+                "true_topology",
+            ),
         ):
             checkpoint_value = getattr(config, config_name, default)
             cli_value = getattr(args, cli_name, default)

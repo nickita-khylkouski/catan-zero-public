@@ -1,0 +1,258 @@
+{
+  "schema_version": "catan-zero-topology-adapter-v2-experiment/v1",
+  "status": "real_collated_width_screen_complete_learning_not_run",
+  "production_defaults_changed": false,
+  "common": {
+    "hidden_size": 640,
+    "state_layers": 6,
+    "attention_heads": 8,
+    "adapter_layers": "2,4",
+    "warm_start_identity_required": true,
+    "information_regime": "public_only"
+  },
+  "arms": [
+    {
+      "arm_id": "c0-incumbent",
+      "adapter_kind": "none",
+      "expected_parameters": 35041353,
+      "role": "reference"
+    },
+    {
+      "arm_id": "c1-basis-mean-b192",
+      "adapter_kind": "basis_mean_v1",
+      "adapter_width": 192,
+      "edge_control": "true_topology",
+      "expected_parameters": 35979081,
+      "role": "small_v1"
+    },
+    {
+      "arm_id": "c2-basis-mean-b192-self-message",
+      "adapter_kind": "basis_mean_v1",
+      "adapter_width": 192,
+      "edge_control": "self_message",
+      "expected_parameters": 35979081,
+      "role": "v1_capacity_compute_control"
+    },
+    {
+      "arm_id": "c3-basis-mean-b192-rewired",
+      "adapter_kind": "basis_mean_v1",
+      "adapter_width": 192,
+      "edge_control": "type_degree_preserving_rewire",
+      "expected_parameters": 35979081,
+      "role": "v1_geometry_control"
+    },
+    {
+      "arm_id": "v2-local-attention-b192",
+      "adapter_kind": "local_attention_v2",
+      "adapter_width": 192,
+      "adapter_heads": 4,
+      "edge_control": "true_topology",
+      "expected_parameters": 36065481,
+      "role": "b192_architecture_upper_bound",
+      "note": "Two 512,064-parameter adapters over the 35,041,353-parameter incumbent."
+    },
+    {
+      "arm_id": "v2-local-attention-b192-self-message",
+      "adapter_kind": "local_attention_v2",
+      "adapter_width": 192,
+      "adapter_heads": 4,
+      "edge_control": "self_message",
+      "expected_parameters": 36065481,
+      "role": "b192_capacity_compute_control"
+    },
+    {
+      "arm_id": "v2-local-attention-b192-rewired",
+      "adapter_kind": "local_attention_v2",
+      "adapter_width": 192,
+      "adapter_heads": 4,
+      "edge_control": "type_degree_preserving_rewire",
+      "expected_parameters": 36065481,
+      "role": "b192_geometry_control",
+      "note": "Fixed type-cyclic endpoint rotation; preserves edge work and source-type counts, not each node's degree."
+    },
+    {
+      "arm_id": "v2-local-attention-b192-shared",
+      "adapter_kind": "local_attention_v2",
+      "adapter_width": 192,
+      "adapter_heads": 4,
+      "share_weights": true,
+      "edge_control": "true_topology",
+      "expected_parameters": 35553417,
+      "role": "recurrent_capacity_control"
+    },
+    {
+      "arm_id": "v2-local-attention-b128-shared",
+      "adapter_kind": "local_attention_v2",
+      "adapter_width": 128,
+      "adapter_heads": 4,
+      "share_weights": true,
+      "edge_control": "true_topology",
+      "expected_parameters": 35325833,
+      "role": "primary_candidate",
+      "note": "One 284,480-parameter adapter reused after layers 2 and 4; selected from the real-collated width screen."
+    },
+    {
+      "arm_id": "v2-local-attention-b128-shared-self-message",
+      "adapter_kind": "local_attention_v2",
+      "adapter_width": 128,
+      "adapter_heads": 4,
+      "share_weights": true,
+      "edge_control": "self_message",
+      "expected_parameters": 35325833,
+      "role": "capacity_compute_control"
+    },
+    {
+      "arm_id": "v2-local-attention-b128-shared-rewired",
+      "adapter_kind": "local_attention_v2",
+      "adapter_width": 128,
+      "adapter_heads": 4,
+      "share_weights": true,
+      "edge_control": "type_degree_preserving_rewire",
+      "expected_parameters": 35325833,
+      "role": "geometry_control"
+    }
+  ],
+  "conditional_width_arms": [
+    {"adapter_kind": "local_attention_v2", "adapter_width": 128, "share_weights": false, "expected_parameters": 35610313},
+    {"adapter_kind": "local_attention_v2", "adapter_width": 160, "share_weights": false, "expected_parameters": 35823561},
+    {"adapter_kind": "local_attention_v2", "adapter_width": 160, "share_weights": true, "expected_parameters": 35432457},
+    {"adapter_kind": "local_attention_v2", "adapter_width": 192, "share_weights": true, "expected_parameters": 35553417}
+  ],
+  "systems_gate": {
+    "repeats": 2,
+    "minimum_incumbent_rows_per_second_ratio": 0.5,
+    "maximum_incumbent_peak_memory_ratio": 1.5,
+    "requires_real_collated_batch": true,
+    "requires_eval_server_smoke": true,
+    "requires_cuda_graph_smoke": true
+  },
+  "systems_evidence": {
+    "evidence_class": "synthetic_feature_training_step_smoke_with_real_board_incidence",
+    "real_collated_batch_run": true,
+    "eval_server_smoke_artifact_stored": false,
+    "hardware": "NVIDIA H100 80GB HBM3",
+    "batch_size": 32,
+    "legal_actions": 64,
+    "events": 64,
+    "full_incidence": true,
+    "isolated_repeats": 2,
+    "mean_rows_per_second": {
+      "c0-incumbent": 1070.459,
+      "c1-basis-mean-b192": 951.324,
+      "v2-local-attention-b192": 562.202,
+      "v2-local-attention-b192-shared": 563.236
+    },
+    "incumbent_throughput_ratio": {
+      "c1-basis-mean-b192": 0.8887,
+      "v2-local-attention-b192": 0.5252,
+      "v2-local-attention-b192-shared": 0.5262
+    },
+    "peak_allocated_gib": {
+      "c0-incumbent": 1.498,
+      "c1-basis-mean-b192": 1.741,
+      "v2-local-attention-b192": 1.798,
+      "v2-local-attention-b192-shared": 1.795
+    },
+    "cuda_graph_v2": "captured_and_replayed",
+    "raw_artifacts": "probe_raw"
+  },
+  "real_collated_systems_evidence": {
+    "hardware": "NVIDIA H100 80GB HBM3",
+    "batch_size": 32,
+    "legal_actions": 64,
+    "events": 64,
+    "isolated_repeats": 2,
+    "legal_action_mask_utilization": 0.2138671875,
+    "event_mask_utilization": 0.2578125,
+    "mean_rows_per_second": {
+      "c0-incumbent": 1135.705,
+      "c1-basis-mean-b192": 948.221,
+      "v2-local-attention-b128": 583.097,
+      "v2-local-attention-b128-shared": 591.726,
+      "v2-local-attention-b160": 580.925,
+      "v2-local-attention-b160-shared": 551.428,
+      "v2-local-attention-b192": 554.137,
+      "v2-local-attention-b192-shared": 560.645
+    },
+    "incumbent_throughput_ratio": {
+      "c1-basis-mean-b192": 0.8349,
+      "v2-local-attention-b128": 0.5134,
+      "v2-local-attention-b128-shared": 0.521,
+      "v2-local-attention-b160": 0.5115,
+      "v2-local-attention-b160-shared": 0.4855,
+      "v2-local-attention-b192": 0.4879,
+      "v2-local-attention-b192-shared": 0.4937
+    },
+    "selected_systems_candidate": "v2-local-attention-b128-shared",
+    "selection_reason": "Highest observed mean throughput among v2 arms, 0.5210x incumbent, and the smallest v2 parameter count. Two repeats are a screen, not a stable capacity estimate.",
+    "raw_artifacts": "collated_raw"
+  },
+  "mechanism_evidence": {
+    "task": "vertex_mean_of_physically_incident_hex_values",
+    "seeds": [1, 2, 3],
+    "steps": 200,
+    "tail_mean_mse": {
+      "basis-mean-probe-b16-true-topology": 0.034308,
+      "basis-mean-probe-b19-parameter-matched-true-topology": 0.033031,
+      "basis-mean-probe-b16-self-message": 0.59225,
+      "basis-mean-probe-b16-rewired": 0.572829,
+      "local-attention-v2-probe-b16-true-topology": 0.011063,
+      "local-attention-v2-probe-b16-self-message": 0.592683,
+      "local-attention-v2-probe-b16-rewired": 0.57179
+    },
+    "probe_parameter_counts": {
+      "basis-mean-b16": 2769,
+      "basis-mean-b19-parameter-matched": 3600,
+      "local-attention-v2-b16": 3553
+    },
+    "interpretation": "At the fixed 200-update budget, both v1 and v2 require correct incidence; v2 has lower error than the near-parameter-matched v1 arm on this uniform one-hop task. This validates wiring and optimization only, not state-dependent attention or playing strength.",
+    "raw_artifacts": "mechanism_raw"
+  },
+  "conditional_attention_evidence": {
+    "task": "receiver_query_conditioned_soft_selection_over_physically_incident_hexes",
+    "seeds": [0, 1, 2],
+    "steps": 400,
+    "mean_tail_mse": {
+      "basis-mean-true-topology": 1.217511,
+      "local-attention-v2-true-topology": 0.015463,
+      "local-attention-v2-self-message": 4.764995,
+      "local-attention-v2-rewired": 4.577317
+    },
+    "mean_normalized_improvement": {
+      "basis-mean-true-topology": 0.744478,
+      "local-attention-v2-true-topology": 0.996753,
+      "local-attention-v2-self-message": -0.000039,
+      "local-attention-v2-rewired": 0.03936
+    },
+    "interpretation": "Receiver-conditioned attention can learn a query-dependent neighbor selection that the receiver-blind mean adapter cannot express through the fixed scored coordinate. This is a mechanism result, not Catan playing strength.",
+    "raw_artifacts": "conditional_raw"
+  },
+  "learning_gate": {
+    "optimizer_steps": 250,
+    "global_batch_size": 4096,
+    "sample_presentations_per_arm_seed": 1024000,
+    "seeds": [1, 2, 3],
+    "primary_metric": "game_macro_policy_ce_nonforced_topology_sensitive",
+    "minimum_relative_improvement_vs_incumbent": 0.02,
+    "minimum_relative_improvement_vs_capacity_control": 0.02,
+    "maximum_overall_ce_regression": 0.005,
+    "requires_clustered_game_ci_excluding_zero": true,
+    "requires_true_topology_beats_rewired_ci_excluding_zero": true,
+    "topology_sensitive_mask_must_be_preregistered": true,
+    "requires_exact_paired_holdout_support": true,
+    "minimum_holdout_games": 256,
+    "minimum_topology_sensitive_decisions": 1024,
+    "registration_status": "pending_before_learning_run",
+    "topology_mask_registration_artifact_sha256": null,
+    "training_manifest_sha256": null,
+    "holdout_manifest_sha256": null,
+    "training_data_sha256": null,
+    "uncertainty": "paired_crossed_bootstrap_training_seed_and_common_holdout_game",
+    "scorer": "tools/rnd_topology_learning_gate.py"
+  },
+  "outcome_admission": {
+    "minimum_terminal_game_fraction": 0.9,
+    "truncated_rows_policy_only": true,
+    "truncated_rows_primary_value_or_q": false
+  }
+}

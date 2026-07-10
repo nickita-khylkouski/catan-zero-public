@@ -19,7 +19,11 @@ from catan_zero.rl.entity_token_features import (  # noqa: E402
     PLAYER_FEATURE_SIZE,
     VERTEX_FEATURE_SIZE,
 )
-from catan_zero.rl.entity_token_policy import EntityGraphConfig, EntityGraphNet  # noqa: E402
+from catan_zero.rl.entity_token_policy import (  # noqa: E402
+    EntityGraphConfig,
+    EntityGraphNet,
+    EntityGraphPolicy,
+)
 from catan_zero.search.cuda_graph_inference import (  # noqa: E402
     CudaGraphInferenceConfig,
     CudaGraphInferenceRunner,
@@ -46,7 +50,14 @@ def _policy(**overrides):
     )
 
 
-def _batch(batch_size=3, legal_width=5, event_width=8, live_events=0):
+def _batch(
+    batch_size=3,
+    legal_width=5,
+    event_width=8,
+    live_events=0,
+    *,
+    topology=False,
+):
     rng = np.random.default_rng(20260709)
     entity = {}
     for name, count, width in (
@@ -75,6 +86,13 @@ def _batch(batch_size=3, legal_width=5, event_width=8, live_events=0):
     legal_ids = np.tile(np.arange(legal_width, dtype=np.int64), (batch_size, 1))
     legal_ids[-1, -1] = -1
     entity["legal_action_mask"] = legal_ids >= 0
+    if topology:
+        entity["hex_vertex_ids"] = np.full((batch_size, 19, 6), -1, dtype=np.int16)
+        entity["hex_edge_ids"] = np.full((batch_size, 19, 6), -1, dtype=np.int16)
+        entity["edge_vertex_ids"] = np.full((batch_size, 72, 2), -1, dtype=np.int16)
+        entity["event_target_ids"] = np.full(
+            (batch_size, event_width, 4), -1, dtype=np.int16
+        )
     context = rng.normal(
         size=(batch_size, legal_width, CONTEXT_ACTION_FEATURE_SIZE)
     ).astype(np.float32)
@@ -199,6 +217,138 @@ def test_runner_preserves_policy_metadata_and_target_aware_action_head():
     assert runner.action_size == policy.action_size
     assert runner.runner_config.enabled is False
     assert outputs["logits"].shape == (2, 4)
+
+
+def test_topology_adapter_eager_path_retains_incidence_and_crops_event_targets():
+    policy = _policy(topology_adapter_layers="1", topology_adapter_width=16)
+    entity, legal_ids, context = _batch(topology=True)
+    runner = CudaGraphInferenceRunner(
+        policy,
+        CudaGraphInferenceConfig(enabled=False, event_token_limit=0),
+    )
+
+    outputs = runner.forward_legal_np(entity, legal_ids, context)
+
+    assert outputs["logits"].shape == legal_ids.shape
+    assert set(runner._state_input_keys()) >= {
+        "hex_vertex_ids",
+        "hex_edge_ids",
+        "edge_vertex_ids",
+        "event_target_ids",
+        "event_mask",
+    }
+    assert any(
+        field[0] == "event_target_ids"
+        for field in runner._graph_signature(
+            runner._crop_events(entity), runner.selected_batch_bucket(3)
+        )[1]
+    )
+
+
+def test_topology_adapter_does_not_require_action_target_ids():
+    entity, legal_ids, context = _batch(topology=True)
+    entity.pop("legal_action_target_ids")
+    runner = CudaGraphInferenceRunner(_policy(topology_adapter_layers="1"))
+
+    outputs = runner.forward_legal_np(entity, legal_ids, context)
+
+    assert outputs["logits"].shape == legal_ids.shape
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    (
+        (
+            lambda entity: entity.pop("event_target_ids"),
+            "requires entity batch field event_target_ids",
+        ),
+        (
+            lambda entity: entity.__setitem__(
+                "event_target_ids", entity["event_target_ids"][:, :-1]
+            ),
+            "event_target_ids shape",
+        ),
+        (
+            lambda entity: entity.__setitem__(
+                "edge_vertex_ids", entity["edge_vertex_ids"].astype(np.float32)
+            ),
+            "must contain integer ids",
+        ),
+    ),
+)
+def test_topology_adapter_rejects_missing_or_malformed_ids(mutation, message):
+    entity, legal_ids, context = _batch(topology=True)
+    mutation(entity)
+    runner = CudaGraphInferenceRunner(_policy(topology_adapter_layers="1"))
+
+    with pytest.raises(ValueError, match=message):
+        runner.forward_legal_np(entity, legal_ids, context)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    (
+        ("hex_vertex_ids", 54, r"outside \[-1, 54\)"),
+        ("hex_edge_ids", 72, r"outside \[-1, 72\)"),
+        ("edge_vertex_ids", -2, r"outside \[-1, 54\)"),
+        ("event_target_ids", 19, r"outside \[-1, 19\)"),
+    ),
+)
+def test_topology_adapter_rejects_out_of_range_ids(field, value, message):
+    entity, legal_ids, context = _batch(topology=True)
+    entity[field][0, 0, 0] = value
+    runner = CudaGraphInferenceRunner(_policy(topology_adapter_layers="1"))
+
+    with pytest.raises(ValueError, match=message):
+        runner.forward_legal_np(entity, legal_ids, context)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA Graph regression")
+def test_v2_topology_adapter_is_cuda_graph_capturable():
+    config = EntityGraphConfig(
+        action_size=64,
+        static_action_feature_size=LEGAL_ACTION_FEATURE_SIZE,
+        context_action_feature_size=CONTEXT_ACTION_FEATURE_SIZE,
+        legal_action_feature_size=LEGAL_ACTION_FEATURE_SIZE,
+        hidden_size=32,
+        state_layers=1,
+        attention_heads=4,
+        dropout=0.0,
+        topology_adapter_layers="1",
+        topology_adapter_width=16,
+        topology_adapter_kind="local_attention_v2",
+        topology_adapter_heads=4,
+    )
+    policy = EntityGraphPolicy(
+        config,
+        np.zeros((64, LEGAL_ACTION_FEATURE_SIZE), dtype=np.float32),
+        device="cuda",
+    )
+    policy.model.eval()
+    entity, legal_ids, context = _batch(
+        batch_size=3,
+        legal_width=5,
+        event_width=8,
+        live_events=2,
+        topology=True,
+    )
+    runner = CudaGraphInferenceRunner(
+        policy,
+        CudaGraphInferenceConfig(
+            enabled=True,
+            batch_buckets=(4,),
+            event_token_limit=4,
+            warmup_iterations=1,
+        ),
+    )
+
+    outputs = runner.forward_legal_np(entity, legal_ids, context, return_q=True)
+
+    assert outputs["logits"].shape == legal_ids.shape
+    assert outputs["q_values"].shape == legal_ids.shape
+    assert runner.graph_count == 1
+    assert runner.last_path == "cuda_graph"
+    assert runner.last_fallback_reason is None
 
 
 def test_configuration_rejects_unsafe_or_ambiguous_buckets():

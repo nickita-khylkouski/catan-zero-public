@@ -55,6 +55,20 @@ _RELATIONAL_TOPOLOGY_KEYS = frozenset(
 )
 
 
+def entity_policy_uses_topology(config: Any) -> bool:
+    """Return whether the state encoder consumes Catan incidence tensors.
+
+    Keep this small predicate shared by direct inference, the eval-server
+    handshake, and CUDA-graph input selection.  In particular, a Transformer
+    becomes topology-consuming when sparse adapters are configured even though
+    its base attention blocks retain the ordinary Transformer trunk name.
+    """
+    return bool(
+        str(getattr(config, "state_trunk", "transformer")) != "transformer"
+        or str(getattr(config, "topology_adapter_layers", "") or "").strip()
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class EntityGraphConfig:
     action_size: int
@@ -198,6 +212,10 @@ class EntityGraphConfig:
     topology_adapter_layers: str = ""
     topology_adapter_width: int = 448
     topology_adapter_bases: int = 4
+    topology_adapter_kind: str = "basis_mean_v1"
+    topology_adapter_heads: int = 4
+    topology_adapter_share_weights: bool = False
+    topology_adapter_edge_control: str = "true_topology"
 
 
 class EntityGraphNet:
@@ -383,22 +401,45 @@ class EntityGraphNet:
                     self.relational_block_pattern = ""
                     if self.uses_topology_adapters:
                         from catan_zero.rl.sparse_topology_adapter import (
-                            SparseTopologyAdapter,
+                            create_sparse_topology_adapter,
                         )
 
                         adapter_width = int(getattr(cfg, "topology_adapter_width", 448))
                         adapter_bases = int(getattr(cfg, "topology_adapter_bases", 4))
-                        self.topology_adapters = nn.ModuleDict(
-                            {
-                                str(layer): SparseTopologyAdapter(
-                                    h,
-                                    adapter_width,
-                                    adapter_bases,
-                                    dropout,
-                                )
-                                for layer in self.topology_adapter_layers
-                            }
+                        adapter_kind = str(
+                            getattr(cfg, "topology_adapter_kind", "basis_mean_v1")
                         )
+                        adapter_heads = int(getattr(cfg, "topology_adapter_heads", 4))
+                        self.topology_adapter_share_weights = bool(
+                            getattr(cfg, "topology_adapter_share_weights", False)
+                        )
+                        self.topology_adapter_edge_control = str(
+                            getattr(
+                                cfg,
+                                "topology_adapter_edge_control",
+                                "true_topology",
+                            )
+                        )
+
+                        def _new_topology_adapter():
+                            return create_sparse_topology_adapter(
+                                kind=adapter_kind,
+                                width=h,
+                                bottleneck=adapter_width,
+                                bases=adapter_bases,
+                                heads=adapter_heads,
+                                dropout=dropout,
+                            )
+
+                        if self.topology_adapter_share_weights:
+                            self.topology_adapter_shared = _new_topology_adapter()
+                        else:
+                            self.topology_adapters = nn.ModuleDict(
+                                {
+                                    str(layer): _new_topology_adapter()
+                                    for layer in self.topology_adapter_layers
+                                }
+                            )
                 else:
                     from catan_zero.rl.relational_trunks import (
                         RelationalTransformerBlock,
@@ -817,19 +858,30 @@ class EntityGraphNet:
                     topology_edges = None
                     if self.uses_topology_adapters:
                         from catan_zero.rl.sparse_topology_adapter import (
+                            apply_sparse_edge_control,
                             build_sparse_incidence_edges,
                         )
 
                         topology_edges = build_sparse_incidence_edges(
                             batch, sequence_length=int(tokens.shape[1])
                         )
+                        topology_edges = apply_sparse_edge_control(
+                            topology_edges,
+                            self.topology_adapter_edge_control,
+                            sequence_length=int(tokens.shape[1]),
+                        )
                     for layer, block in enumerate(self.blocks, start=1):
                         tokens = block(tokens, key_padding_mask=padding_mask)
                         if (
                             self.uses_topology_adapters
-                            and str(layer) in self.topology_adapters
+                            and layer in self.topology_adapter_layers
                         ):
-                            tokens = self.topology_adapters[str(layer)](
+                            adapter = (
+                                self.topology_adapter_shared
+                                if self.topology_adapter_share_weights
+                                else self.topology_adapters[str(layer)]
+                            )
+                            tokens = adapter(
                                 tokens,
                                 key_padding_mask=padding_mask,
                                 edges=topology_edges,
@@ -1267,6 +1319,10 @@ class EntityGraphPolicy:
         topology_adapter_layers: str = "",
         topology_adapter_width: int = 448,
         topology_adapter_bases: int = 4,
+        topology_adapter_kind: str = "basis_mean_v1",
+        topology_adapter_heads: int = 4,
+        topology_adapter_share_weights: bool = False,
+        topology_adapter_edge_control: str = "true_topology",
     ) -> EntityGraphPolicy:
         env = ColonistMultiAgentEnv(env_config or ColonistMultiAgentConfig())
         try:
@@ -1298,6 +1354,10 @@ class EntityGraphPolicy:
                 topology_adapter_layers=str(topology_adapter_layers),
                 topology_adapter_width=int(topology_adapter_width),
                 topology_adapter_bases=int(topology_adapter_bases),
+                topology_adapter_kind=str(topology_adapter_kind),
+                topology_adapter_heads=int(topology_adapter_heads),
+                topology_adapter_share_weights=bool(topology_adapter_share_weights),
+                topology_adapter_edge_control=str(topology_adapter_edge_control),
             )
             return cls(config, static, seed=seed, device=device)
         finally:
@@ -1330,11 +1390,7 @@ class EntityGraphPolicy:
             or getattr(self.config, "action_target_gather", False)
             or getattr(self.config, "edge_policy_head", False)
         )
-        needs_topology = str(
-            getattr(self.config, "state_trunk", "transformer")
-        ) != "transformer" or bool(
-            str(getattr(self.config, "topology_adapter_layers", "") or "").strip()
-        )
+        needs_topology = entity_policy_uses_topology(self.config)
         batch = {
             key: torch.as_tensor(value, device=self.device)
             for key, value in entity_batch.items()
@@ -1510,8 +1566,8 @@ class EntityGraphPolicy:
         from catan_zero.rl.config_serialization import config_to_dict
 
         payload = {
-                "policy_type": self.policy_type,
-                # Durable name-keyed form (task #74): never pickle the frozen+slots
+            "policy_type": self.policy_type,
+            # Durable name-keyed form (task #74): never pickle the frozen+slots
             # dataclass itself -- positional state is crash/shift-prone across
             # field-list changes. Loaders accept both this and legacy pickles.
             "config": config_to_dict(self.config),
@@ -1519,23 +1575,23 @@ class EntityGraphPolicy:
             # f72 safety net (task #76): whether train_bc.py --mask-hidden-info
             # was used for this training run. Absent/False on any checkpoint
             # predating this field (legacy checkpoints deserialize as
-                # untrained-with-masking, the safe default -- see
-                # EntityGraphRustEvaluator.__init__'s public_observation guard).
-                "mask_hidden_info": bool(mask_hidden_info),
-                # OPT-8 provenance: which soft policy target this run trained
-                # against ("policy" = Gumbel visit counts; "prefer_scores" was the
-                # degenerate-target footgun). Empty string on checkpoints predating
-                # this field. report.json also carries it; this makes the
-                # checkpoint self-describing without the sidecar.
-                "soft_target_source": str(soft_target_source)
-                if soft_target_source is not None
-                else "",
-                "static_action_features_sha256": _array_sha256(
-                    self.static_action_features.detach().cpu().numpy()
-                ),
-                "static_action_features": self.static_action_features.detach().cpu(),
-                "model": self.model.state_dict(),
-            }
+            # untrained-with-masking, the safe default -- see
+            # EntityGraphRustEvaluator.__init__'s public_observation guard).
+            "mask_hidden_info": bool(mask_hidden_info),
+            # OPT-8 provenance: which soft policy target this run trained
+            # against ("policy" = Gumbel visit counts; "prefer_scores" was the
+            # degenerate-target footgun). Empty string on checkpoints predating
+            # this field. report.json also carries it; this makes the
+            # checkpoint self-describing without the sidecar.
+            "soft_target_source": str(soft_target_source)
+            if soft_target_source is not None
+            else "",
+            "static_action_features_sha256": _array_sha256(
+                self.static_action_features.detach().cpu().numpy()
+            ),
+            "static_action_features": self.static_action_features.detach().cpu(),
+            "model": self.model.state_dict(),
+        }
         if value_training is not None:
             durable_value_training = dict(value_training)
             trained_readouts = tuple(
@@ -1839,7 +1895,8 @@ def _assert_entity_batch_shapes(
         value = np.asarray(entity_batch[key])
         if value.shape != (batch_size, int(width)):
             raise ValueError(f"{key} shape {value.shape} != {(batch_size, int(width))}")
-    if str(getattr(config, "state_trunk", "transformer")) != "transformer":
+    uses_topology = entity_policy_uses_topology(config)
+    if uses_topology:
         topology_shapes = {
             "hex_vertex_ids": (batch_size, 19, 6),
             "hex_edge_ids": (batch_size, 19, 6),
@@ -1849,13 +1906,50 @@ def _assert_entity_batch_shapes(
                 int(np.asarray(entity_batch["event_tokens"]).shape[1]),
                 4,
             ),
-            "legal_action_target_ids": (batch_size, legal_width, 4),
         }
+        if str(getattr(config, "state_trunk", "transformer")) != "transformer":
+            topology_shapes["legal_action_target_ids"] = (
+                batch_size,
+                legal_width,
+                4,
+            )
         for key, expected_shape in topology_shapes.items():
             if key not in entity_batch:
                 raise ValueError(
-                    f"relational state trunk requires entity batch field {key}"
+                    f"topology-consuming policy requires entity batch field {key}"
                 )
             value = np.asarray(entity_batch[key])
             if value.shape != expected_shape:
                 raise ValueError(f"{key} shape {value.shape} != {expected_shape}")
+
+        player_count = int(np.asarray(entity_batch["player_tokens"]).shape[1])
+        topology_ranges = {
+            "hex_vertex_ids": (54,),
+            "hex_edge_ids": (72,),
+            "edge_vertex_ids": (54,),
+            "event_target_ids": (19, 54, 72, player_count),
+        }
+        if "legal_action_target_ids" in topology_shapes:
+            topology_ranges["legal_action_target_ids"] = (
+                19,
+                54,
+                72,
+                player_count,
+            )
+        for key, upper_bounds in topology_ranges.items():
+            value = np.asarray(entity_batch[key])
+            if not np.issubdtype(value.dtype, np.integer):
+                raise ValueError(f"{key} must contain integer ids, got {value.dtype}")
+            if len(upper_bounds) == 1:
+                invalid = (value < -1) | (value >= upper_bounds[0])
+            else:
+                bounds = np.asarray(upper_bounds, dtype=np.int64).reshape(1, 1, -1)
+                invalid = (value < -1) | (value >= bounds)
+            if bool(np.any(invalid)):
+                bad_index = tuple(int(index) for index in np.argwhere(invalid)[0])
+                bad_value = int(value[bad_index])
+                column = bad_index[-1] if len(upper_bounds) > 1 else 0
+                raise ValueError(
+                    f"{key} id {bad_value} at {bad_index} is outside "
+                    f"[-1, {upper_bounds[column]})"
+                )

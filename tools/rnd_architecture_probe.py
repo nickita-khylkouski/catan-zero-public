@@ -33,6 +33,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--legal-actions", type=int, default=64)
     parser.add_argument("--events", type=int, default=64)
+    parser.add_argument(
+        "--full-incidence",
+        action="store_true",
+        help="Replace the tiny synthetic edge subset with a real Catan board incidence table.",
+    )
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--iterations", type=int, default=10)
     parser.add_argument("--value-categorical-bins", type=int, default=0)
@@ -42,6 +47,14 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--topology-adapter-layers", default="")
     parser.add_argument("--topology-adapter-width", type=int, default=448)
     parser.add_argument("--topology-adapter-bases", type=int, default=4)
+    parser.add_argument("--topology-adapter-kind", default="basis_mean_v1")
+    parser.add_argument("--topology-adapter-heads", type=int, default=4)
+    parser.add_argument("--topology-adapter-share-weights", action="store_true")
+    parser.add_argument(
+        "--topology-adapter-edge-control",
+        choices=("true_topology", "self_message", "type_degree_preserving_rewire"),
+        default="true_topology",
+    )
     parser.add_argument("--latent-deliberation-steps", type=int, default=0)
     parser.add_argument("--latent-deliberation-slots", type=int, default=8)
     parser.add_argument("--moe-routed-experts", type=int, default=0)
@@ -106,7 +119,15 @@ def _source_provenance() -> dict[str, Any]:
     }
 
 
-def _batch(config: Any, *, batch_size: int, actions: int, events: int, device: Any):
+def _batch(
+    config: Any,
+    *,
+    batch_size: int,
+    actions: int,
+    events: int,
+    device: Any,
+    full_incidence: bool = False,
+):
     import torch
 
     from catan_zero.rl.entity_token_features import (
@@ -177,6 +198,32 @@ def _batch(config: Any, *, batch_size: int, actions: int, events: int, device: A
     result["edge_vertex_ids"][:, 0, :] = torch.tensor((0, 1), device=device)
     if events:
         result["event_target_ids"][:, 0, 1] = 0
+    if full_incidence:
+        from catan_zero.rl.entity_token_features import build_entity_token_features
+        from catan_zero.rl.multiagent_env import (
+            ColonistMultiAgentConfig,
+            ColonistMultiAgentEnv,
+        )
+
+        env = ColonistMultiAgentEnv(ColonistMultiAgentConfig())
+        try:
+            _observations, info = env.reset(seed=20260710)
+            entity = build_entity_token_features(
+                env,
+                actor=str(info["current_player"]),
+                include_event_log=True,
+            )
+        finally:
+            env.close()
+        for key in ("hex_vertex_ids", "hex_edge_ids", "edge_vertex_ids"):
+            value = torch.as_tensor(entity[key], dtype=torch.long, device=device)
+            result[key] = value.unsqueeze(0).expand(batch_size, *value.shape).clone()
+        real_events = torch.as_tensor(
+            entity["event_target_ids"], dtype=torch.long, device=device
+        )
+        copied = min(events, int(real_events.shape[0]))
+        result["event_target_ids"].fill_(-1)
+        result["event_target_ids"][:, :copied] = real_events[:copied]
     return result
 
 
@@ -228,6 +275,10 @@ def main() -> None:
         topology_adapter_layers=str(args.topology_adapter_layers),
         topology_adapter_width=int(args.topology_adapter_width),
         topology_adapter_bases=int(args.topology_adapter_bases),
+        topology_adapter_kind=str(args.topology_adapter_kind),
+        topology_adapter_heads=int(args.topology_adapter_heads),
+        topology_adapter_share_weights=bool(args.topology_adapter_share_weights),
+        topology_adapter_edge_control=str(args.topology_adapter_edge_control),
         **architecture,
     )
     torch.manual_seed(20260710)
@@ -238,6 +289,7 @@ def main() -> None:
         actions=int(args.legal_actions),
         events=int(args.events),
         device=device,
+        full_incidence=bool(args.full_incidence),
     )
     parameter_count = sum(parameter.numel() for parameter in model.parameters())
     torch.cuda.reset_peak_memory_stats(device)
@@ -292,6 +344,10 @@ def main() -> None:
         "topology_adapter_layers": str(args.topology_adapter_layers),
         "topology_adapter_width": int(args.topology_adapter_width),
         "topology_adapter_bases": int(args.topology_adapter_bases),
+        "topology_adapter_kind": str(args.topology_adapter_kind),
+        "topology_adapter_heads": int(args.topology_adapter_heads),
+        "topology_adapter_share_weights": bool(args.topology_adapter_share_weights),
+        "topology_adapter_edge_control": str(args.topology_adapter_edge_control),
         "device": str(device),
         "gpu_name": gpu_name,
         "required_gpu_name": required_gpu_name,
@@ -301,6 +357,7 @@ def main() -> None:
         "batch_size": int(args.batch_size),
         "legal_actions": int(args.legal_actions),
         "events": int(args.events),
+        "full_incidence": bool(args.full_incidence),
         "warmup_iterations": int(args.warmup),
         "measured_iterations": int(args.iterations),
         "elapsed_sec": elapsed,

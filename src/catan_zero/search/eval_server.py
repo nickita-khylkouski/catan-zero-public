@@ -349,8 +349,18 @@ def _crop_masked_event_tail(
     )
     if limit is None:
         return required_width
+    event_targets = entity.get("event_target_ids")
+    if event_targets is not None:
+        event_targets = np.asarray(event_targets)
+        expected = (*event_mask.shape, 4)
+        if event_targets.shape != expected:
+            raise ValueError(
+                f"event_target_ids shape {event_targets.shape} != {expected}"
+            )
     entity["event_mask"] = event_mask[:, :limit]
     entity["event_tokens"] = event_tokens[:, :limit]
+    if event_targets is not None:
+        entity["event_target_ids"] = event_targets[:, :limit]
     return required_width
 
 
@@ -374,10 +384,12 @@ def _crop_payload_event_tails_before_merge(
         limit = operator.index(event_token_limit)
     except TypeError as error:
         raise TypeError("event_token_limit must be an integer") from error
-    event_arrays: list[tuple[np.ndarray, np.ndarray]] = []
+    event_arrays: list[tuple[np.ndarray, np.ndarray, np.ndarray | None]] = []
     for payload in payloads:
         event_mask = np.asarray(payload["entity"]["event_mask"], dtype=np.bool_)
         event_tokens = np.asarray(payload["entity"]["event_tokens"])
+        raw_targets = payload["entity"].get("event_target_ids")
+        event_targets = None if raw_targets is None else np.asarray(raw_targets)
         if event_mask.ndim != 2:
             raise ValueError(f"event_mask must be rank 2, got {event_mask.shape}")
         if event_tokens.ndim != 3:
@@ -387,26 +399,33 @@ def _crop_payload_event_tails_before_merge(
                 "event token/mask shape mismatch: "
                 f"tokens={event_tokens.shape} mask={event_mask.shape}"
             )
+        if event_targets is not None and event_targets.shape != (*event_mask.shape, 4):
+            raise ValueError(
+                "event_target_ids shape mismatch: "
+                f"targets={event_targets.shape} mask={event_mask.shape}"
+            )
         padded_width = int(event_mask.shape[1])
         if not 0 <= limit <= padded_width:
             raise ValueError(
                 f"event_token_limit {event_token_limit!r} is outside "
                 f"[0, {padded_width}]"
             )
-        event_arrays.append((event_mask, event_tokens))
+        event_arrays.append((event_mask, event_tokens, event_targets))
     # One C-level concatenate + reduction is materially cheaper than one NumPy
     # reduction per request at 36-128 requests/window. Widths are normally
     # identical; retain a correct fallback for mixed-width diagnostic clients.
-    widths = {int(event_mask.shape[1]) for event_mask, _tokens in event_arrays}
+    widths = {
+        int(event_mask.shape[1]) for event_mask, _tokens, _targets in event_arrays
+    }
     if len(widths) <= 1:
         merged_mask = np.concatenate(
-            [event_mask for event_mask, _tokens in event_arrays], axis=0
+            [event_mask for event_mask, _tokens, _targets in event_arrays], axis=0
         )
         active_columns = np.flatnonzero(np.any(merged_mask, axis=0))
         required_width = int(active_columns[-1] + 1) if active_columns.size else 0
     else:
         required_width = 0
-        for event_mask, _tokens in event_arrays:
+        for event_mask, _tokens, _targets in event_arrays:
             active_columns = np.flatnonzero(np.any(event_mask, axis=0))
             if active_columns.size:
                 required_width = max(required_width, int(active_columns[-1] + 1))
@@ -415,9 +434,13 @@ def _crop_payload_event_tails_before_merge(
             "event_token_limit would remove an unmasked event token: "
             f"required={required_width} limit={limit}"
         )
-    for payload, (event_mask, event_tokens) in zip(payloads, event_arrays):
+    for payload, (event_mask, event_tokens, event_targets) in zip(
+        payloads, event_arrays
+    ):
         payload["entity"]["event_mask"] = event_mask[:, :limit]
         payload["entity"]["event_tokens"] = event_tokens[:, :limit]
+        if event_targets is not None:
+            payload["entity"]["event_target_ids"] = event_targets[:, :limit]
     return required_width
 
 
@@ -821,11 +844,13 @@ def _policy_needs_action_targets(policy: Any) -> bool:
 
 
 def _policy_needs_relational_topology(policy: Any) -> bool:
-    """Whether this policy's state trunk consumes immutable board topology."""
+    """Whether this policy's state encoder consumes immutable board topology."""
     policy_config = getattr(policy, "config", None)
     if policy_config is None:
         return True
-    return str(getattr(policy_config, "state_trunk", "transformer")) != "transformer"
+    from catan_zero.rl.entity_token_policy import entity_policy_uses_topology
+
+    return entity_policy_uses_topology(policy_config)
 
 
 def _make_forward_policy(policy: Any, config: EvalServerConfig) -> Any:
@@ -910,9 +935,7 @@ def _server_main(
     handshake["cuda_graph_warmup_iterations"] = int(config.cuda_graph_warmup_iterations)
     forward_policy = _make_forward_policy(policy, config)
     policy_model = getattr(policy, "model", None)
-    categorical_bins = int(
-        getattr(policy_model, "value_categorical_bins", 0) or 0
-    )
+    categorical_bins = int(getattr(policy_model, "value_categorical_bins", 0) or 0)
     missing_state_keys = tuple(getattr(policy, "_checkpoint_missing_state_keys", ()))
     trained_readouts = tuple(
         str(readout)

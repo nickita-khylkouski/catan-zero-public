@@ -1,0 +1,368 @@
+{
+  "architecture": {
+    "attention_heads": 8,
+    "hidden_size": 640,
+    "parameter_count": 35041353,
+    "state_layers": 6,
+    "topology_adapter_bases": 4,
+    "topology_adapter_edge_control": "true_topology",
+    "topology_adapter_heads": 4,
+    "topology_adapter_kind": "basis_mean_v1",
+    "topology_adapter_layers": "",
+    "topology_adapter_share_weights": false,
+    "topology_adapter_width": 192
+  },
+  "batch_provenance": {
+    "action_space_size": 607,
+    "batch_size": 32,
+    "episode_resets": 0,
+    "generator": "ColonistMultiAgentEnv + build_entity_token_features",
+    "legal_action_ids_sha256": "9d738797070d6c629c1a348dcb6116314222dbc3ac6db3dd9bc961cd65419e97",
+    "mask_utilization": {
+      "events": {
+        "capacity": 2048,
+        "fraction": 0.2578125,
+        "live": 528
+      },
+      "legal_actions": {
+        "capacity": 2048,
+        "fraction": 0.2138671875,
+        "live": 438
+      },
+      "players": {
+        "capacity": 128,
+        "fraction": 1.0,
+        "live": 128
+      }
+    },
+    "requested_event_width": 64,
+    "requested_legal_width": 64,
+    "seed": 20260710,
+    "state_records": [
+      {
+        "actor": "RED",
+        "decision_index": 0,
+        "legal_action_ids_sha256": "b50708b926b418b5e4634103fe20851287ba40c4449b841846b73465491533fe",
+        "legal_count_before_width_limit": 54,
+        "legal_count_collated": 54,
+        "live_events": 1,
+        "truncated_legal_actions": 0
+      },
+      {
+        "actor": "RED",
+        "decision_index": 1,
+        "legal_action_ids_sha256": "87d2c871c5ef73102ce21f29f96bc21946fcda62e87c42a95fe8b8640f3dbf7c",
+        "legal_count_before_width_limit": 2,
+        "legal_count_collated": 2,
+        "live_events": 2,
+        "truncated_legal_actions": 0
+      },
+      {
+        "actor": "ORANGE",
+        "decision_index": 2,
+        "legal_action_ids_sha256": "84d36d24d9f4612a70e27aaf015c1e2e1e58a7ceb45d6a81abed88b32639bbd8",
+        "legal_count_before_width_limit": 51,
+        "legal_count_collated": 51,
+        "live_events": 3,
+        "truncated_legal_actions": 0
+      },
+      {
+        "actor": "ORANGE",
+        "decision_index": 3,
+        "legal_action_ids_sha256": "a3429ced345e2f9f49a0031d0b3afe7e3b3ddeb04a71a33d8a6c62570e86edff",
+        "legal_count_before_width_limit": 3,
+        "legal_count_collated": 3,
+        "live_events": 4,
+        "truncated_legal_actions": 0
+      },
+      {
+        "actor": "WHITE",
+        "decision_index": 4,
+        "legal_action_ids_sha256": "e2dbad4ddc70fdb2b09ea77427fa298ed6970a940f4cc92d6b098753d3fff7b5",
+        "legal_count_before_width_limit": 47,
+        "legal_count_collated": 47,
+        "live_events": 5,
+        "truncated_legal_actions": 0
+      },
+      {
+        "actor": "WHITE",
+        "decision_index": 5,
+        "legal_action_ids_sha256": "35a8e70161b5232ad90befef9ee0ffd55d378a5bb3341c945718688b64ceb204",
+        "legal_count_before_width_limit": 3,
+        "legal_count_collated": 3,
+        "live_events": 6,
+        "truncated_legal_actions": 0
+      },
+      {
+        "actor": "BLUE",
+        "decision_index": 6,
+        "legal_action_ids_sha256": "f3acec4afda80bc115dbb12987933a0af6d36936fc1d47bdae768c0842a71ef5",
+        "legal_count_before_width_limit": 43,
+        "legal_count_collated": 43,
+        "live_events": 7,
+        "truncated_legal_actions": 0
+      },
+      {
+        "actor": "BLUE",
+        "decision_index": 7,
+        "legal_action_ids_sha256": "e51609cc90c25479863c525d17b62a424dab7687107490e1f0ffd1bf325152bd",
+        "legal_count_before_width_limit": 2,
+        "legal_count_collated": 2,
+        "live_events": 8,
+        "truncated_legal_actions": 0
+      },
+      {
+        "actor": "BLUE",
+        "decision_index": 8,
+        "legal_action_ids_sha256": "2e2eb19b7aa7aea16a3719c8aecc5504b5d991c844b70706190ba676a1c0f077",
+        "legal_count_before_width_limit": 40,
+        "legal_count_collated": 40,
+        "live_events": 9,
+        "truncated_legal_actions": 0
+      },
+      {
+        "actor": "BLUE",
+        "decision_index": 9,
+        "legal_action_ids_sha256": "415b1d09cdfabacc47b18125f5e5ec23fcb92d1d18b57ce931e12069c2681096",
+        "legal_count_before_width_limit": 3,
+        "legal_count_collated": 3,
+        "live_events": 10,
+        "truncated_legal_actions": 0
+      },
+      {
+        "actor": "WHITE",
+        "decision_index": 10,
+        "legal_action_ids_sha256": "d51896757f8fcbb2b8cce519d7ecbc9d23c2ad8eefa8af7425dce1a4b3b18b51",
+        "legal_count_before_width_limit": 36,
+        "legal_count_collated": 36,
+        "live_events": 11,
+        "truncated_legal_actions": 0
+      },
+      {
+        "actor": "WHITE",
+        "decision_index": 11,
+        "legal_action_ids_sha256": "0a6ba3fe83c8441f9cebc3a4c96b411fcf1bf512431c39cef3cd73ba0f45544d",
+        "legal_count_before_width_limit": 3,
+        "legal_count_collated": 3,
+        "live_events": 12,
+        "truncated_legal_actions": 0
+      },
+      {
+        "actor": "ORANGE",
+        "decision_index": 12,
+        "legal_action_ids_sha256": "2da9b1c8ac3145eb4f6ba7b6efbd91dd0007e60558184270e2d063c8858503ca",
+        "legal_count_before_width_limit": 32,
+        "legal_count_collated": 32,
+        "live_events": 13,
+        "truncated_legal_actions": 0
+      },
+      {
+        "actor": "ORANGE",
+        "decision_index": 13,
+        "legal_action_ids_sha256": "7b1c28c324dd9473ff8157f163ff187915f22615174e17d879ba98ec53229307",
+        "legal_count_before_width_limit": 3,
+        "legal_count_collated": 3,
+        "live_events": 14,
+        "truncated_legal_actions": 0
+      },
+      {
+        "actor": "RED",
+        "decision_index": 14,
+        "legal_action_ids_sha256": "261e3d1b0c2ad4ddf8271cd51236bd568eadf743d01258047683b4bdcc23265e",
+        "legal_count_before_width_limit": 29,
+        "legal_count_collated": 29,
+        "live_events": 15,
+        "truncated_legal_actions": 0
+      },
+      {
+        "actor": "RED",
+        "decision_index": 15,
+        "legal_action_ids_sha256": "e48ec9d0caf3ab19b066e082d30c081f2e4ed6062024e916dada9d94648a363c",
+        "legal_count_before_width_limit": 2,
+        "legal_count_collated": 2,
+        "live_events": 16,
+        "truncated_legal_actions": 0
+      },
+      {
+        "actor": "RED",
+        "decision_index": 16,
+        "legal_action_ids_sha256": "233826a0e32fe84b01f5bbac1f54640c1329eb78050761e2827c09a0029bda65",
+        "legal_count_before_width_limit": 1,
+        "legal_count_collated": 1,
+        "live_events": 17,
+        "truncated_legal_actions": 0
+      },
+      {
+        "actor": "RED",
+        "decision_index": 17,
+        "legal_action_ids_sha256": "95b15cdc1d80bfd3b02460bde31b72731eaefd126d7c328b0f2bd48a9f8f3a90",
+        "legal_count_before_width_limit": 15,
+        "legal_count_collated": 15,
+        "live_events": 18,
+        "truncated_legal_actions": 0
+      },
+      {
+        "actor": "ORANGE",
+        "decision_index": 18,
+        "legal_action_ids_sha256": "8f5d174b55113e2288b03c08d3fb814d7b9e9d4eea64ad510013ef57433bd7ff",
+        "legal_count_before_width_limit": 1,
+        "legal_count_collated": 1,
+        "live_events": 19,
+        "truncated_legal_actions": 0
+      },
+      {
+        "actor": "WHITE",
+        "decision_index": 19,
+        "legal_action_ids_sha256": "8f5d174b55113e2288b03c08d3fb814d7b9e9d4eea64ad510013ef57433bd7ff",
+        "legal_count_before_width_limit": 1,
+        "legal_count_collated": 1,
+        "live_events": 20,
+        "truncated_legal_actions": 0
+      },
+      {
+        "actor": "BLUE",
+        "decision_index": 20,
+        "legal_action_ids_sha256": "8f5d174b55113e2288b03c08d3fb814d7b9e9d4eea64ad510013ef57433bd7ff",
+        "legal_count_before_width_limit": 1,
+        "legal_count_collated": 1,
+        "live_events": 21,
+        "truncated_legal_actions": 0
+      },
+      {
+        "actor": "RED",
+        "decision_index": 21,
+        "legal_action_ids_sha256": "95b15cdc1d80bfd3b02460bde31b72731eaefd126d7c328b0f2bd48a9f8f3a90",
+        "legal_count_before_width_limit": 15,
+        "legal_count_collated": 15,
+        "live_events": 22,
+        "truncated_legal_actions": 0
+      },
+      {
+        "actor": "ORANGE",
+        "decision_index": 22,
+        "legal_action_ids_sha256": "8f5d174b55113e2288b03c08d3fb814d7b9e9d4eea64ad510013ef57433bd7ff",
+        "legal_count_before_width_limit": 1,
+        "legal_count_collated": 1,
+        "live_events": 23,
+        "truncated_legal_actions": 0
+      },
+      {
+        "actor": "WHITE",
+        "decision_index": 23,
+        "legal_action_ids_sha256": "9622c47b26c08124b6c6f761635ed16267fcfdfe8658382ea5395ed911077250",
+        "legal_count_before_width_limit": 2,
+        "legal_count_collated": 2,
+        "live_events": 24,
+        "truncated_legal_actions": 0
+      },
+      {
+        "actor": "BLUE",
+        "decision_index": 24,
+        "legal_action_ids_sha256": "9622c47b26c08124b6c6f761635ed16267fcfdfe8658382ea5395ed911077250",
+        "legal_count_before_width_limit": 2,
+        "legal_count_collated": 2,
+        "live_events": 25,
+        "truncated_legal_actions": 0
+      },
+      {
+        "actor": "RED",
+        "decision_index": 25,
+        "legal_action_ids_sha256": "cd085276bfe11c54062c305f475b531b83b4d321a97e3c44a0c24562b3e03446",
+        "legal_count_before_width_limit": 2,
+        "legal_count_collated": 2,
+        "live_events": 26,
+        "truncated_legal_actions": 0
+      },
+      {
+        "actor": "RED",
+        "decision_index": 26,
+        "legal_action_ids_sha256": "42175ff8057be08947d87ef07b2e981e7ac3efc453a08d3acf9e23547278f263",
+        "legal_count_before_width_limit": 38,
+        "legal_count_collated": 38,
+        "live_events": 27,
+        "truncated_legal_actions": 0
+      },
+      {
+        "actor": "ORANGE",
+        "decision_index": 27,
+        "legal_action_ids_sha256": "8f5d174b55113e2288b03c08d3fb814d7b9e9d4eea64ad510013ef57433bd7ff",
+        "legal_count_before_width_limit": 1,
+        "legal_count_collated": 1,
+        "live_events": 28,
+        "truncated_legal_actions": 0
+      },
+      {
+        "actor": "WHITE",
+        "decision_index": 28,
+        "legal_action_ids_sha256": "8f5d174b55113e2288b03c08d3fb814d7b9e9d4eea64ad510013ef57433bd7ff",
+        "legal_count_before_width_limit": 1,
+        "legal_count_collated": 1,
+        "live_events": 29,
+        "truncated_legal_actions": 0
+      },
+      {
+        "actor": "BLUE",
+        "decision_index": 29,
+        "legal_action_ids_sha256": "9622c47b26c08124b6c6f761635ed16267fcfdfe8658382ea5395ed911077250",
+        "legal_count_before_width_limit": 2,
+        "legal_count_collated": 2,
+        "live_events": 30,
+        "truncated_legal_actions": 0
+      },
+      {
+        "actor": "RED",
+        "decision_index": 30,
+        "legal_action_ids_sha256": "e4fa8ef4ad09b88a5871dd5af7e9749351bbe56d184a8934badc9383088ca842",
+        "legal_count_before_width_limit": 1,
+        "legal_count_collated": 1,
+        "live_events": 31,
+        "truncated_legal_actions": 0
+      },
+      {
+        "actor": "ORANGE",
+        "decision_index": 31,
+        "legal_action_ids_sha256": "233826a0e32fe84b01f5bbac1f54640c1329eb78050761e2827c09a0029bda65",
+        "legal_count_before_width_limit": 1,
+        "legal_count_collated": 1,
+        "live_events": 32,
+        "truncated_legal_actions": 0
+      }
+    ]
+  },
+  "device_transfer": "once before warmup; no host transfer in timed loop",
+  "elapsed_sec": 1.4127701849993173,
+  "final_loss": 0.02629934996366501,
+  "finite": true,
+  "gradients_finite": true,
+  "hardware": {
+    "device": "cuda:0",
+    "gpu_compute_capability": [
+      9,
+      0
+    ],
+    "gpu_name": "NVIDIA H100 80GB HBM3",
+    "gpu_total_memory_bytes": 85017624576,
+    "platform": "Linux-6.8.0-1046-nvidia-x86_64-with-glibc2.35",
+    "torch_cuda_version": "12.8",
+    "torch_version": "2.7.0"
+  },
+  "measured_iterations": 50,
+  "peak_allocated_bytes": 1607907840,
+  "precision": "bfloat16 autocast with fp32 loss",
+  "rows_per_sec": 1132.5267315156239,
+  "schema_version": "catan-zero-rnd-topology-collated-probe/v1",
+  "scope": "systems-only; no playing-strength claim",
+  "source_provenance": {
+    "file_sha256": {
+      "src/catan_zero/rl/action_features.py": "8389a7f8232699fb512fe854821ed5329f840e079cf63ac76fe39b672a389a80",
+      "src/catan_zero/rl/entity_token_features.py": "2c7fc6a377ed0c2feb287c933a2f1af329df17b01692a73f1cbe5b9b98712297",
+      "src/catan_zero/rl/entity_token_policy.py": "8f76c1f6fd9fd5f6e76748f6068a5140c7751d15a836c0ba814153d903eb4dd6",
+      "src/catan_zero/rl/sparse_topology_adapter.py": "9b2b83679dc600cd6624a4ff87b0604ec5bd45d4afb6ff8cbff8b4706a375165",
+      "tools/rnd_topology_collated_probe.py": "bab90c4edc0c94dffa033b59a82d75bb53e45fc65598f32dafbb4f1599d38bf0"
+    },
+    "git_commit": null,
+    "source_bundle_sha256": "15c77511bfe1e43e8506d766cbb3a00f6bdcde73542a7580759fc2e30eed642f"
+  },
+  "steps_per_sec": 35.391460359863245,
+  "warmup_iterations": 5
+}

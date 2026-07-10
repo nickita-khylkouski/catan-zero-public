@@ -19,7 +19,10 @@ from typing import Any
 
 import numpy as np
 
-from catan_zero.rl.entity_token_policy import _assert_entity_batch_shapes
+from catan_zero.rl.entity_token_policy import (
+    _assert_entity_batch_shapes,
+    entity_policy_uses_topology,
+)
 
 
 _STATE_INPUT_KEYS = (
@@ -34,6 +37,12 @@ _STATE_INPUT_KEYS = (
     "global_tokens",
     "event_tokens",
     "event_mask",
+)
+_TOPOLOGY_STATE_INPUT_KEYS = (
+    "hex_vertex_ids",
+    "hex_edge_ids",
+    "edge_vertex_ids",
+    "event_target_ids",
 )
 
 
@@ -305,7 +314,7 @@ class CudaGraphInferenceRunner:
         import torch
 
         inputs = {}
-        for key in _STATE_INPUT_KEYS:
+        for key in self._state_input_keys():
             source = torch.as_tensor(entity_batch[key])
             inputs[key] = torch.zeros(
                 (bucket, *source.shape[1:]),
@@ -388,10 +397,11 @@ class CudaGraphInferenceRunner:
             torch.autocast(device_type=self.device.type, enabled=False),
             _strict_fp32(torch),
         ):
+            state_keys = self._state_input_keys()
             state_batch = {
                 key: torch.as_tensor(value, device=self.device)
                 for key, value in entity_batch.items()
-                if key in _STATE_INPUT_KEYS
+                if key in state_keys
             }
             encoded_state = self.model.encode_state(state_batch)
             action_batch, action_ids = self._action_batch(
@@ -432,6 +442,14 @@ class CudaGraphInferenceRunner:
         cropped = dict(entity_batch)
         cropped["event_mask"] = event_mask[:, :limit]
         cropped["event_tokens"] = event_tokens[:, :limit]
+        if "event_target_ids" in entity_batch:
+            event_targets = _as_numpy(entity_batch["event_target_ids"])
+            expected = (*event_mask.shape, 4)
+            if event_targets.shape != expected:
+                raise ValueError(
+                    f"event_target_ids shape {event_targets.shape} != {expected}"
+                )
+            cropped["event_target_ids"] = event_targets[:, :limit]
         return cropped
 
     def _graph_signature(
@@ -440,10 +458,15 @@ class CudaGraphInferenceRunner:
         bucket: int,
     ) -> tuple[Any, ...]:
         fields = []
-        for key in _STATE_INPUT_KEYS:
+        for key in self._state_input_keys():
             value = _as_numpy(entity_batch[key])
             fields.append((key, value.dtype.str, tuple(value.shape[1:])))
         return (bucket, tuple(fields))
+
+    def _state_input_keys(self) -> tuple[str, ...]:
+        if entity_policy_uses_topology(self.config):
+            return (*_STATE_INPUT_KEYS, *_TOPOLOGY_STATE_INPUT_KEYS)
+        return _STATE_INPUT_KEYS
 
     @staticmethod
     def _resolve_device(policy: Any):

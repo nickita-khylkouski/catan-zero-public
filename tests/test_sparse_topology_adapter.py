@@ -21,6 +21,7 @@ from catan_zero.rl.entity_token_features import (  # noqa: E402
 from catan_zero.rl.entity_token_policy import EntityGraphConfig, EntityGraphNet  # noqa: E402
 from catan_zero.rl.relational_trunks import build_relation_ids  # noqa: E402
 from catan_zero.rl.sparse_topology_adapter import (  # noqa: E402
+    apply_sparse_edge_control,
     build_sparse_incidence_edges,
 )
 
@@ -125,6 +126,28 @@ def test_adapter_does_not_enable_relational_action_heads_and_gets_gradient():
     assert torch.count_nonzero(up_gradient) > 0
 
 
+def test_basis_mean_v1_preserves_legacy_zero_degree_bias_path():
+    from catan_zero.rl.sparse_topology_adapter import SparseTopologyAdapter
+
+    adapter = SparseTopologyAdapter(width=4, bottleneck=2, bases=1, dropout=0.0)
+    with torch.no_grad():
+        adapter.ff_in.weight.zero_()
+        adapter.ff_in.bias.copy_(torch.tensor((1.0, 1.0, 1.0, 1.0)))
+        adapter.up.weight.fill_(1.0)
+        adapter.up.bias.zero_()
+    x = torch.zeros((1, 3, 4))
+    no_edges = (
+        torch.zeros((1, 1), dtype=torch.long),
+        torch.zeros((1, 1), dtype=torch.long),
+        torch.zeros((1, 1), dtype=torch.long),
+        torch.zeros((1, 1), dtype=torch.bool),
+    )
+
+    result = adapter(x, edges=no_edges)
+
+    assert torch.count_nonzero(result) == result.numel()
+
+
 def test_sparse_edges_match_dense_relation_direction_and_ids():
     batch = _batch(batch_size=2, events=2)
     sequence_length = 153
@@ -139,6 +162,29 @@ def test_sparse_edges_match_dense_relation_direction_and_ids():
         dense[batch_index[valid], destination[valid], source[valid]],
         relation[valid],
     )
+
+
+def test_edge_controls_preserve_work_and_isolate_neighbor_geometry():
+    edges = build_sparse_incidence_edges(_batch(batch_size=1), sequence_length=153)
+    source, destination, relation, valid = edges
+    self_edges = apply_sparse_edge_control(edges, "self_message", sequence_length=153)
+    rewired = apply_sparse_edge_control(
+        edges, "type_degree_preserving_rewire", sequence_length=153
+    )
+
+    assert torch.equal(self_edges[0][valid], destination[valid])
+    for controlled in (self_edges, rewired):
+        assert controlled[0].shape == source.shape
+        assert torch.equal(controlled[1], destination)
+        assert torch.equal(controlled[2], relation)
+        assert torch.equal(controlled[3], valid)
+    assert torch.any(rewired[0][valid] != source[valid])
+
+    def token_type(values):
+        boundaries = torch.tensor((1, 20, 74, 146, 150, 151, 153))
+        return torch.bucketize(values, boundaries, right=True)
+
+    assert torch.equal(token_type(rewired[0][valid]), token_type(source[valid]))
 
 
 @pytest.mark.parametrize(
@@ -158,22 +204,26 @@ def test_invalid_adapter_configs_fail_loud(overrides, match):
 
 
 @pytest.mark.parametrize(
-    ("hidden", "layers", "adapters", "categorical_bins", "expected"),
+    ("hidden", "layers", "adapters", "kind", "width", "categorical_bins", "expected"),
     [
-        (640, 6, "", 0, 35_041_353),
-        (640, 6, "2,4", 0, 38_602_057),
-        (832, 6, "", 0, 59_131_977),
-        (832, 10, "", 0, 92_401_993),
-        (640, 6, "", 51, 35_484_925),
-        (640, 6, "2,4", 51, 39_045_629),
-        (832, 6, "", 51, 59_868_349),
-        (832, 10, "", 51, 93_138_365),
+        (640, 6, "", "basis_mean_v1", 448, 0, 35_041_353),
+        (640, 6, "2,4", "basis_mean_v1", 448, 0, 38_602_057),
+        (640, 6, "2,4", "basis_mean_v1", 192, 0, 35_979_081),
+        (640, 6, "2,4", "local_attention_v2", 192, 0, 36_065_481),
+        (832, 6, "", "basis_mean_v1", 448, 0, 59_131_977),
+        (832, 10, "", "basis_mean_v1", 448, 0, 92_401_993),
+        (640, 6, "", "basis_mean_v1", 448, 51, 35_484_925),
+        (640, 6, "2,4", "basis_mean_v1", 448, 51, 39_045_629),
+        (832, 6, "", "basis_mean_v1", 448, 51, 59_868_349),
+        (832, 10, "", "basis_mean_v1", 448, 51, 93_138_365),
     ],
 )
 def test_exact_scaled_ladder_parameter_counts(
     hidden: int,
     layers: int,
     adapters: str,
+    kind: str,
+    width: int,
     categorical_bins: int,
     expected: int,
 ):
@@ -187,8 +237,37 @@ def test_exact_scaled_ladder_parameter_counts(
         attention_heads=8,
         value_categorical_bins=categorical_bins,
         topology_adapter_layers=adapters,
-        topology_adapter_width=448,
+        topology_adapter_width=width,
         topology_adapter_bases=4,
+        topology_adapter_kind=kind,
+        topology_adapter_heads=4,
     )
     model = EntityGraphNet(config)
+    assert sum(parameter.numel() for parameter in model.parameters()) == expected
+
+
+@pytest.mark.parametrize(
+    ("kind", "expected"),
+    [
+        ("basis_mean_v1", 35_510_217),
+        ("local_attention_v2", 35_553_417),
+    ],
+)
+def test_shared_adapter_parameter_counts(kind: str, expected: int):
+    model = EntityGraphNet(
+        EntityGraphConfig(
+            action_size=607,
+            static_action_feature_size=LEGAL_ACTION_FEATURE_SIZE,
+            context_action_feature_size=CONTEXT_ACTION_FEATURE_SIZE,
+            legal_action_feature_size=LEGAL_ACTION_FEATURE_SIZE,
+            hidden_size=640,
+            state_layers=6,
+            attention_heads=8,
+            topology_adapter_layers="2,4",
+            topology_adapter_width=192,
+            topology_adapter_kind=kind,
+            topology_adapter_heads=4,
+            topology_adapter_share_weights=True,
+        )
+    )
     assert sum(parameter.numel() for parameter in model.parameters()) == expected
