@@ -1,0 +1,67 @@
+{
+  "schema_version": "catan-zero-topology-real-result/v1",
+  "status": "fail",
+  "decision": "do_not_promote_true_topology_adapter",
+  "training_commit": "ffbecb999c199e89c375c51a77e274f711106253",
+  "scoring_commit": "39c25e237ab209fe3f281b2b02690275b81dadab",
+  "experiment_config_file_sha256": "363e2afa4a4821236363ec04d566cce18befee87787974dbbbb3ac40f7066154",
+  "experiment_config_semantic_sha256": "0589cb0693430a797a3d9b332a9e42c627a48d87b7f0417b92dd1b565f92c01d",
+  "combined_evidence": {
+    "files": 12,
+    "rows": 1758204,
+    "decisions_per_arm_seed": 146517,
+    "holdout_games": 596,
+    "topology_sensitive_decisions": 31442,
+    "sha256": "1b649d842e4db333f79d71de90609584fa49a59164db4d5a01d8eac6940a80fc",
+    "manifest_file_sha256": "7d90cdc2a4a64986dc22ce466da9b545bd8ad133982322857c927ecc0e66e61d"
+  },
+  "bootstrap": {
+    "samples": 10000,
+    "seed": 20260710,
+    "final_report_file_sha256": "63f76b8ff87b2b825b8ad89c69d3b5ddc3984607c8ec8d47dd23ba2367704707"
+  },
+  "primary_topology_sensitive_game_macro_policy_ce": {
+    "true_topology": 1.9396576318348648,
+    "vs_incumbent": {
+      "reference_ce": 1.9395934044289114,
+      "relative_improvement": -0.00003311385046309552,
+      "relative_improvement_ci95": [
+        -0.00016716178478396802,
+        0.00008066986053290188
+      ]
+    },
+    "vs_capacity_control": {
+      "reference_ce": 1.9396489987881917,
+      "relative_improvement": -0.0000044508293399906385,
+      "relative_improvement_ci95": [
+        -0.000024746898767502865,
+        0.000016854294347321116
+      ]
+    },
+    "vs_rewired": {
+      "reference_ce": 1.9396633804629502,
+      "relative_improvement": 0.000002963724604607192,
+      "relative_improvement_ci95": [
+        -0.0000191214598030096,
+        0.00002047763804017056
+      ]
+    }
+  },
+  "overall_nonforced_decision_micro_policy_ce": {
+    "true_topology": 1.4353803538593126,
+    "incumbent": 1.435185848296178,
+    "relative_regression": 0.0001355263942754382,
+    "relative_regression_ci95": [
+      -0.00010024230651457242,
+      0.00038847518805113944
+    ],
+    "within_registered_safety_limit": true
+  },
+  "failed_checks": [
+    "primary_vs_incumbent_point_threshold",
+    "primary_vs_incumbent_ci_excludes_zero",
+    "primary_vs_capacity_point_threshold",
+    "primary_vs_capacity_ci_excludes_zero",
+    "true_topology_beats_rewired_ci_excludes_zero"
+  ]
+}
