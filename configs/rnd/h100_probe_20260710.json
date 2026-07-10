@@ -1,5 +1,7 @@
 {
   "schema_version": "catan-zero-rnd-h100-probe-summary/v1",
+  "raw_artifact_directory": "configs/rnd/h100_probe_raw_20260710",
+  "source_bundle_sha256": "b676fcdd99f6f804b09bab4c2d9ccb3bcf28006e966474e2c362b918de8d08d6",
   "hardware": "NVIDIA H100 80GB HBM3",
   "torch_version": "2.7.0",
   "precision": "bfloat16_autocast_fp32_loss",
@@ -9,50 +11,62 @@
   "results": [
     {
       "trunk": "transformer",
+      "raw_artifact": "transformer.json",
       "parameter_count": 35041353,
-      "rows_per_sec": 2048.5516012028024,
+      "rows_per_sec": 1500.4037609677712,
       "peak_allocated_bytes": 1608108032,
       "measured_iterations": 12,
+      "gradients_finite": true,
       "finite": true
     },
     {
       "trunk": "rrt",
+      "raw_artifact": "rrt.json",
       "parameter_count": 20070932,
-      "rows_per_sec": 215.80727976969033,
+      "rows_per_sec": 203.06314729272611,
       "peak_allocated_bytes": 1616014848,
       "measured_iterations": 12,
+      "gradients_finite": true,
       "finite": true
     },
     {
       "trunk": "resrgcn",
+      "raw_artifact": "resrgcn.json",
       "parameter_count": 20936010,
-      "rows_per_sec": 6.69591883608316,
+      "rows_per_sec": 6.682163387091273,
       "peak_allocated_bytes": 2195676672,
       "measured_iterations": 12,
+      "gradients_finite": true,
       "finite": true
     },
     {
       "trunk": "think_rrt_k4",
+      "raw_artifact": "think_rrt_k4.json",
       "parameter_count": 22146453,
-      "rows_per_sec": 208.0631270938901,
+      "rows_per_sec": 197.88177378013398,
       "peak_allocated_bytes": 1728711168,
       "measured_iterations": 8,
+      "gradients_finite": true,
       "finite": true
     },
     {
       "trunk": "moe_rrt_top2_of_8",
+      "raw_artifact": "moe_rrt_top2_of_8.json",
       "parameter_count": 28508948,
       "nominal_active_parameters": 20525588,
-      "rows_per_sec": 140.65785803287307,
+      "rows_per_sec": 133.61081265062754,
       "peak_allocated_bytes": 1887380480,
       "measured_iterations": 8,
+      "gradients_finite": true,
       "finite": true
     }
   ],
   "rrt_batch64_confirmation": {
+    "raw_artifact": "rrt_batch64.json",
     "batch_size": 64,
-    "rows_per_sec": 186.12146334534037,
+    "rows_per_sec": 181.67846701218386,
     "peak_allocated_bytes": 2999665664,
+    "gradients_finite": true,
     "finite": true
   },
   "interpretation": "Feasibility and systems falsification only; no playing-strength conclusion."

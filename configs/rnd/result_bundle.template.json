@@ -39,6 +39,22 @@
     "git_commit": "REPLACE_WITH_40_LOWERCASE_HEX",
     "dirty": false
   },
+  "native_engine": {
+    "engine_id": "catanatron_rs",
+    "version": "REPLACE",
+    "path": "REPLACE/catanatron_rs.so",
+    "sha256": "REPLACE_WITH_64_LOWERCASE_HEX"
+  },
+  "hardware": {
+    "device": "cuda:0",
+    "device_type": "cuda",
+    "host_fingerprint": "REPLACE_WITH_64_LOWERCASE_HEX",
+    "machine": "x86_64",
+    "accelerator_model": "NVIDIA H100 80GB HBM3",
+    "accelerator_uuid": "REPLACE_GPU_UUID",
+    "total_memory_bytes": 85000000000,
+    "compute_capability": "9.0"
+  },
   "seed_manifest": {
     "path": "REPLACE/paired-seeds.json",
     "sha256": "REPLACE_WITH_64_LOWERCASE_HEX",

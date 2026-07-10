@@ -51,22 +51,25 @@ change.
 
 A bounded synthetic BF16 forward/backward probe used batch 32, 64 legal actions,
 64 events, three warmups, and twelve measured steps on otherwise idle H100s.
-It is a kernel/feasibility measurement, not a strength result.
+The probe now refuses non-H100 devices and checks every materialized parameter
+gradient for finiteness. Raw per-run JSON retains the measured GPU name, device,
+resolved architecture, elapsed time, and runtime versions. It remains a
+kernel/feasibility measurement, not a strength result.
 
 | trunk | rows/s | peak allocated | relative to incumbent | current ruling |
 |---|---:|---:|---:|---|
-| incumbent | 2,048.6 | 1.50 GiB | 1.00x | reference |
-| RRT | 215.8 | 1.51 GiB | 0.105x | correctness candidate; optimize before training screen |
-| ResRGCN | 6.70 | 2.04 GiB | 0.0033x | stop this dense implementation before training |
+| incumbent | 1,500.4 | 1.50 GiB | 1.00x | reference |
+| RRT | 203.1 | 1.51 GiB | 0.135x | correctness candidate; optimize before training screen |
+| ResRGCN | 6.68 | 2.04 GiB | 0.0045x | stop this dense implementation before training |
 
-RRT at batch 64 reached 186.1 rows/s and 2.79 GiB, so the batch-32 gap is not a
+RRT at batch 64 reached 181.7 rows/s and 2.79 GiB, so the batch-32 gap is not a
 small-batch artifact. The likely mechanism is full `[B,L,L]` relation materialization
 and attention-bias handling; the probe does not establish whether a faster
 implementation would be stronger. ResRGCN is ruled out only in its current dense
 implementation, not as an architectural idea.
 
 Two additional bounded H100 probes used the same shape. Think-RRT K=4 reached
-208.1 rows/s with 1.61 GiB peak; top-2-of-8 MoE RRT reached 140.7 rows/s with
+197.9 rows/s with 1.61 GiB peak; top-2-of-8 MoE RRT reached 133.6 rows/s with
 1.76 GiB peak. Both are finite and mechanically viable, but both inherit the
 RRT systems bottleneck. The K=4 result means recurrence itself is not the main
 tax; it does not show that recurrent computation improves play.

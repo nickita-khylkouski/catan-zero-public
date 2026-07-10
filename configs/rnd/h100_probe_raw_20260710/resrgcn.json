@@ -1,0 +1,45 @@
+{
+  "batch_size": 32,
+  "device": "cuda:0",
+  "elapsed_sec": 57.466418846001034,
+  "events": 64,
+  "final_loss": 0.09202984720468521,
+  "finite": true,
+  "gpu_name": "NVIDIA H100 80GB HBM3",
+  "gradients_finite": true,
+  "latent_deliberation_slots": 8,
+  "latent_deliberation_steps": 0,
+  "legal_actions": 64,
+  "measured_iterations": 12,
+  "moe_expert_ff_size": 384,
+  "moe_routed_experts": 0,
+  "moe_top_k": 2,
+  "parameter_count": 20936010,
+  "peak_allocated_bytes": 2195676672,
+  "precision": "bfloat16_autocast_fp32_loss",
+  "required_gpu_name": "NVIDIA H100",
+  "resolved_architecture": {
+    "attention_heads": 6,
+    "hidden_size": 384,
+    "relational_action_cross_layers": 0,
+    "relational_bases": 4,
+    "relational_ff_size": 512,
+    "state_layers": 14
+  },
+  "rows_per_sec": 6.682163387091273,
+  "schema_version": "catan-zero-rnd-architecture-probe/v1",
+  "source_provenance": {
+    "file_sha256": {
+      "src/catan_zero/rl/entity_token_policy.py": "20da63c8f629cff04a9dce0f87a66bb2b68f04cca5d605d68222746a724a069e",
+      "src/catan_zero/rl/relational_trunks.py": "3b2f73d06e534957b33b6c5cbd688c3008e1c57ac2b00ecef90eceddf5087c00",
+      "tools/rnd_architecture_probe.py": "f05a0514d0a32b9152e1509880ac001529ae488fe173fb934b6f3442c2c23c71"
+    },
+    "git_commit": null,
+    "source_bundle_sha256": "b676fcdd99f6f804b09bab4c2d9ccb3bcf28006e966474e2c362b918de8d08d6"
+  },
+  "steps_per_sec": 0.20881760584660228,
+  "torch_version": "2.7.0",
+  "trunk": "resrgcn",
+  "value_categorical_bins": 0,
+  "warmup_iterations": 3
+}

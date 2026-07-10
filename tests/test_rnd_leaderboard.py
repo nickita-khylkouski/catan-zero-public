@@ -126,6 +126,22 @@ def _bundle(
             "checkpoint": {"path": "/remote/reference.pt", "sha256": SHA_B},
         },
         "code": {"git_commit": COMMIT, "dirty": False},
+        "native_engine": {
+            "engine_id": "catanatron_rs",
+            "version": "0.1.4",
+            "path": str(TRAINING_MANIFEST_PATH),
+            "sha256": TRAINING_MANIFEST_SHA,
+        },
+        "hardware": {
+            "device": "cpu",
+            "device_type": "cpu",
+            "host_fingerprint": SHA_A,
+            "machine": "test-machine",
+            "accelerator_model": "cpu",
+            "accelerator_uuid": None,
+            "total_memory_bytes": None,
+            "compute_capability": None,
+        },
         "seed_manifest": {
             "path": str(SEED_MANIFEST_PATH),
             "sha256": SEED_MANIFEST_SHA,
@@ -344,6 +360,24 @@ def test_seed_manifest_file_and_game_schedule_are_verified(tmp_path: Path) -> No
     with pytest.raises(ValidationError, match="seed_manifest SHA mismatch"):
         validate_and_aggregate(_campaign(), bundles)
 
+
+def test_native_engine_and_equal_time_hardware_are_verified() -> None:
+    bundles = _bundles()
+    bundles[1]["native_engine"]["version"] = "0.1.3"
+    with pytest.raises(ValidationError, match="native_engine does not exactly match"):
+        validate_and_aggregate(_campaign(), bundles)
+
+    bundles = _bundles(regime="equal_time")
+    bundles[1]["hardware"].update(
+        device="cuda:0",
+        device_type="cuda",
+        accelerator_model="NVIDIA H100 80GB HBM3",
+        accelerator_uuid="GPU-test",
+        total_memory_bytes=80_000_000_000,
+        compute_capability="9.0",
+    )
+    with pytest.raises(ValidationError, match="hardware class does not match"):
+        validate_and_aggregate(_campaign(), bundles)
 
 def test_local_checkpoint_hash_is_verified(tmp_path: Path) -> None:
     checkpoint = tmp_path / "checkpoint.pt"

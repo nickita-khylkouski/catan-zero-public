@@ -6138,9 +6138,11 @@ def _validate_target_information_admission(
 
     Observation masking and search-state safety are independent contracts.  A
     masked student may use realised outcomes and hard recorded actions from a
-    legacy corpus, but soft MCTS policy/Q/root-value targets are admitted only
-    when every row explicitly carries the public-conservation PIMC regime.
-    Missing provenance is ``unknown`` and is intentionally unsafe.
+    legacy corpus only when every search-derived objective is disabled for the
+    run.  The current trainer configures those objectives corpus-wide, so a
+    mixed corpus is admitted to them only when every row explicitly carries
+    the public-conservation PIMC regime. Missing provenance is ``unknown`` and
+    is intentionally unsafe.
     """
 
     n = int(len(data["action_taken"]))

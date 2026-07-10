@@ -587,6 +587,58 @@ def _validate_training_manifest(bundle: Mapping[str, Any], context: str) -> dict
     return {"path": path, "sha256": digest, "schema_version": schema_version}
 
 
+def _validate_native_engine(bundle: Mapping[str, Any], context: str) -> dict[str, Any]:
+    engine = _require_mapping(bundle.get("native_engine"), f"{context}.native_engine")
+    engine_id = _require_string(engine, "engine_id", f"{context}.native_engine")
+    if engine_id != "catanatron_rs":
+        raise ValidationError(f"{context}.native_engine.engine_id must be 'catanatron_rs'")
+    version = _require_string(engine, "version", f"{context}.native_engine")
+    path = _require_string(engine, "path", f"{context}.native_engine")
+    digest = _require_sha256(engine, "sha256", f"{context}.native_engine")
+    source = Path(path)
+    if not source.is_file():
+        raise ValidationError(f"{context}.native_engine.path does not exist: {source}")
+    measured = sha256_file(source)
+    if measured != digest:
+        raise ValidationError(
+            f"{context}.native_engine SHA mismatch: recorded={digest}, measured={measured}"
+        )
+    return {"engine_id": engine_id, "version": version, "path": path, "sha256": digest}
+
+
+def _validate_hardware(bundle: Mapping[str, Any], context: str) -> dict[str, Any]:
+    hardware = _require_mapping(bundle.get("hardware"), f"{context}.hardware")
+    device = _require_string(hardware, "device", f"{context}.hardware")
+    device_type = _require_string(hardware, "device_type", f"{context}.hardware")
+    if device_type not in {"cpu", "cuda"}:
+        raise ValidationError(f"{context}.hardware.device_type must be cpu or cuda")
+    host = _require_sha256(hardware, "host_fingerprint", f"{context}.hardware")
+    machine = _require_string(hardware, "machine", f"{context}.hardware")
+    model = _require_string(hardware, "accelerator_model", f"{context}.hardware")
+    uuid = hardware.get("accelerator_uuid")
+    total_memory = hardware.get("total_memory_bytes")
+    capability = hardware.get("compute_capability")
+    if device_type == "cuda":
+        if not isinstance(uuid, str) or not uuid.strip():
+            raise ValidationError(f"{context}.hardware.accelerator_uuid is required for CUDA")
+        if isinstance(total_memory, bool) or not isinstance(total_memory, int) or total_memory <= 0:
+            raise ValidationError(f"{context}.hardware.total_memory_bytes must be positive for CUDA")
+        if not isinstance(capability, str) or not capability.strip():
+            raise ValidationError(f"{context}.hardware.compute_capability is required for CUDA")
+    elif any(value is not None for value in (uuid, total_memory, capability)):
+        raise ValidationError(f"{context}.hardware CPU accelerator details must be null")
+    return {
+        "device": device,
+        "device_type": device_type,
+        "host_fingerprint": host,
+        "machine": machine,
+        "accelerator_model": model,
+        "accelerator_uuid": uuid,
+        "total_memory_bytes": total_memory,
+        "compute_capability": capability,
+    }
+
+
 def _pair_counter_totals(pair_games: Sequence[Mapping[str, Any]]) -> dict[str, float]:
     return {
         key: sum(float(game["counters"][key]) for game in pair_games)
@@ -756,6 +808,9 @@ def validate_and_aggregate(
     expected_reference: dict[str, Any] | None = None
     expected_seed_manifest: dict[str, Any] | None = None
     expected_training_manifest: dict[str, Any] | None = None
+    expected_native_engine: dict[str, Any] | None = None
+    expected_hardware_class: tuple[Any, ...] | None = None
+    hardware_by_arm: dict[str, dict[str, Any]] = {}
 
     for bundle_index, raw_bundle in enumerate(result_bundles):
         context = f"results[{bundle_index}]"
@@ -797,6 +852,38 @@ def validate_and_aggregate(
             expected_regime = regime
         elif regime != expected_regime:
             raise ValidationError("all result bundles must use the same budget_regime")
+        native_engine = _validate_native_engine(bundle, context)
+        if expected_native_engine is None:
+            expected_native_engine = native_engine
+        elif native_engine != expected_native_engine:
+            raise ValidationError(
+                f"{context}.native_engine does not exactly match the other arms"
+            )
+        hardware = _validate_hardware(bundle, context)
+        required_model = campaign.get("required_accelerator_model")
+        if required_model is not None:
+            if not isinstance(required_model, str) or not required_model.strip():
+                raise ValidationError(
+                    "campaign.required_accelerator_model must be a non-empty string when set"
+                )
+            if required_model not in str(hardware["accelerator_model"]):
+                raise ValidationError(
+                    f"{context}.hardware.accelerator_model={hardware['accelerator_model']!r} "
+                    f"does not satisfy required {required_model!r}"
+                )
+        hardware_class = (
+            hardware["device_type"],
+            hardware["accelerator_model"],
+            hardware["total_memory_bytes"],
+            hardware["compute_capability"],
+        )
+        if regime == "equal_time":
+            if expected_hardware_class is None:
+                expected_hardware_class = hardware_class
+            elif hardware_class != expected_hardware_class:
+                raise ValidationError(
+                    f"{context}.hardware class does not match the other equal_time arms"
+                )
 
         run_id = _require_string(bundle, "run_id", context)
         if run_id in run_ids:
@@ -806,6 +893,7 @@ def validate_and_aggregate(
         if arm_id in seen_arm_ids:
             raise ValidationError(f"duplicate result bundle for arm_id {arm_id!r}")
         seen_arm_ids.add(arm_id)
+        hardware_by_arm[arm_id] = hardware
         registry_arm = registry.get(arm_id)
         if registry_arm is None:
             raise ValidationError(f"{context}.arm_id {arm_id!r} is not registered")
@@ -915,6 +1003,7 @@ def validate_and_aggregate(
     assert expected_reference is not None
     assert expected_seed_manifest is not None
     assert expected_training_manifest is not None
+    assert expected_native_engine is not None
     _validate_pair_alignment(pairs_by_arm)
     ranked_pair_sets = {
         summary.arm_id: pairs_by_arm[summary.arm_id]
@@ -963,6 +1052,8 @@ def validate_and_aggregate(
         "required_information_regime": information_requirement,
         "seed_manifest": expected_seed_manifest,
         "training_manifest": expected_training_manifest,
+        "native_engine": expected_native_engine,
+        "hardware_by_arm": {arm: hardware_by_arm[arm] for arm in sorted(hardware_by_arm)},
         "require_same_training_manifest": bool(
             campaign["require_same_training_manifest"]
         ),

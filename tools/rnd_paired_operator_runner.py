@@ -17,8 +17,10 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import hashlib
+import importlib.metadata
 import json
 import os
+import platform
 import random
 import subprocess
 import sys
@@ -251,6 +253,76 @@ def load_training_manifest(path: str | Path) -> dict[str, Any]:
     }
 
 
+def capture_native_engine_provenance() -> dict[str, Any]:
+    """Hash the loaded extension that supplies game and determinization semantics."""
+
+    rust = _require_rust_module()
+    module_path = Path(str(getattr(rust, "__file__", ""))).resolve()
+    if not module_path.is_file():
+        raise BundleRunError(f"loaded catanatron_rs module has no hashable file: {module_path}")
+    try:
+        version = importlib.metadata.version("catanatron-rs")
+    except importlib.metadata.PackageNotFoundError as exc:
+        raise BundleRunError("loaded catanatron_rs has no package version") from exc
+    return {
+        "engine_id": "catanatron_rs",
+        "version": version,
+        "path": str(module_path),
+        "sha256": sha256_file(module_path),
+    }
+
+
+def capture_hardware_provenance(device_name: str) -> dict[str, Any]:
+    """Record execution hardware while hashing, rather than publishing, the hostname."""
+
+    import torch
+
+    device = torch.device(device_name)
+    payload: dict[str, Any] = {
+        "device": str(device),
+        "device_type": device.type,
+        "host_fingerprint": hashlib.sha256(platform.node().encode("utf-8")).hexdigest(),
+        "machine": platform.machine(),
+    }
+    if device.type != "cuda":
+        payload.update(
+            accelerator_model="cpu",
+            accelerator_uuid=None,
+            total_memory_bytes=None,
+            compute_capability=None,
+        )
+        return payload
+    if not torch.cuda.is_available():
+        raise BundleRunError(f"requested unavailable CUDA device {device}")
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    properties = torch.cuda.get_device_properties(index)
+    uuid = None
+    try:
+        completed = subprocess.run(
+            [
+                "nvidia-smi",
+                f"--id={index}",
+                "--query-gpu=uuid",
+                "--format=csv,noheader,nounits",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        uuid = completed.stdout.strip() or None
+    except (OSError, subprocess.CalledProcessError):
+        pass
+    if not uuid:
+        raise BundleRunError("CUDA hardware provenance requires a measurable GPU UUID")
+    payload.update(
+        accelerator_model=str(properties.name),
+        accelerator_uuid=uuid,
+        total_memory_bytes=int(properties.total_memory),
+        compute_capability=f"{properties.major}.{properties.minor}",
+    )
+    return payload
+
+
 def _default_game_factory(seed: int) -> Any:
     rust = _require_rust_module()
     return rust.Game.simple(list(COLORS), seed=int(seed))
@@ -414,6 +486,8 @@ def build_result_bundle(
     seed_manifest: Mapping[str, Any],
     training_manifest: Mapping[str, Any],
     code_provenance: Mapping[str, Any],
+    native_engine_provenance: Mapping[str, Any],
+    hardware_provenance: Mapping[str, Any],
     max_decisions: int,
     require_public_information: bool = True,
     game_factory: GameFactory = _default_game_factory,
@@ -470,6 +544,8 @@ def build_result_bundle(
         "code": dict(code_provenance),
         "seed_manifest": dict(seed_manifest),
         "training_manifest": dict(training_manifest),
+        "native_engine": dict(native_engine_provenance),
+        "hardware": dict(hardware_provenance),
         "seed_protocol": {
             "board_and_chance": "same game_seed in both seat orientations",
             "candidate_search": "game_seed xor 0x43414E44, reset before each orientation",
@@ -724,6 +800,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             seed_manifest=seed_manifest,
             training_manifest=training_manifest,
             code_provenance=capture_git_provenance(args.repo),
+            native_engine_provenance=capture_native_engine_provenance(),
+            hardware_provenance=capture_hardware_provenance(args.device),
             max_decisions=args.max_decisions,
             require_public_information=require_public,
         )

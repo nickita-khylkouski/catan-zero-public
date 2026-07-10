@@ -11,8 +11,11 @@ runs.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import subprocess
 import time
+from pathlib import Path
 from typing import Any
 
 
@@ -59,6 +62,38 @@ def _resolved_architecture(trunk: str) -> dict[str, Any]:
         "relational_ff_size": 512,
         "relational_bases": 4,
         "relational_action_cross_layers": 0,
+    }
+
+
+def _source_provenance() -> dict[str, Any]:
+    repo = Path(__file__).resolve().parents[1]
+    relative_paths = (
+        "tools/rnd_architecture_probe.py",
+        "src/catan_zero/rl/entity_token_policy.py",
+        "src/catan_zero/rl/relational_trunks.py",
+    )
+    file_hashes: dict[str, str] = {}
+    aggregate = hashlib.sha256()
+    for relative in relative_paths:
+        content = (repo / relative).read_bytes()
+        digest = hashlib.sha256(content).hexdigest()
+        file_hashes[relative] = digest
+        aggregate.update(relative.encode("utf-8") + b"\0" + content + b"\0")
+    git_commit = None
+    try:
+        git_commit = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        pass
+    return {
+        "git_commit": git_commit,
+        "source_bundle_sha256": aggregate.hexdigest(),
+        "file_sha256": file_hashes,
     }
 
 
@@ -239,6 +274,7 @@ def main() -> None:
         "gpu_name": gpu_name,
         "required_gpu_name": required_gpu_name,
         "torch_version": str(torch.__version__),
+        "source_provenance": _source_provenance(),
         "precision": "bfloat16_autocast_fp32_loss",
         "batch_size": int(args.batch_size),
         "legal_actions": int(args.legal_actions),

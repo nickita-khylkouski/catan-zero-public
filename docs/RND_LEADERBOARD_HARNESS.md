@@ -21,9 +21,14 @@ Every arm records:
 - a frozen reference ID with its architecture, search, parameter count,
   checkpoint, and config hashes; the reference must match exactly across arms;
 - exact Git commit and, for a dirty run, a non-zero patch SHA-256;
-- immutable paired-seed manifest path, SHA-256, schema, track, and count;
-- immutable training-data/recipe manifest path, SHA-256, and schema;
-- paired seed, exact candidate/reference seats, completion and candidate score;
+- immutable paired-seed manifest path, locally remeasured SHA-256, schema,
+  track, count, and an exact match between its ordered seed array and games;
+- immutable training-data/recipe manifest path, locally remeasured SHA-256,
+  and schema;
+- the loaded native-engine version, binary path, and locally remeasured SHA-256;
+- device, accelerator model/UUID/memory/capability, and hashed host identity;
+- paired seed, exact 0/1 candidate/reference seats, terminal winner, completion,
+  and candidate score re-derived from winner plus seat;
 - candidate and frozen-reference information regimes for every game;
 - nominal visits, scheduled visits, logical neural leaves, orientation rows,
   evaluator method calls, and measured wall time for every game.
@@ -32,6 +37,9 @@ All six counters are mandatory, including for raw-policy controls. A genuine
 zero is recorded as zero. A missing counter is not inferred and invalidates the
 bundle. Truncated games are also rejected rather than silently treated as
 losses.
+Equal-time arms must also match device type, accelerator model, memory, and
+compute capability. A campaign may set `required_accelerator_model` to reject
+results from the wrong GPU class.
 
 Each pair contains exactly two games with the same seed and exact seat swaps.
 All arms must cover the same pair IDs and seeds. The campaign's

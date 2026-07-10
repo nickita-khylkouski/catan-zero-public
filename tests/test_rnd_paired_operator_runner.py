@@ -121,6 +121,28 @@ def _training_manifest() -> dict:
     }
 
 
+def _native_engine() -> dict:
+    return {
+        "engine_id": "catanatron_rs",
+        "version": "0.1.4",
+        "path": str(TRAINING_MANIFEST_PATH),
+        "sha256": hashlib.sha256(TRAINING_MANIFEST_PATH.read_bytes()).hexdigest(),
+    }
+
+
+def _hardware() -> dict:
+    return {
+        "device": "cpu",
+        "device_type": "cpu",
+        "host_fingerprint": SHA_A,
+        "machine": "test-machine",
+        "accelerator_model": "cpu",
+        "accelerator_uuid": None,
+        "total_memory_bytes": None,
+        "compute_capability": None,
+    }
+
+
 def _campaign() -> dict:
     return {
         "schema_version": "catan-zero-rnd-leaderboard/v1",
@@ -170,6 +192,8 @@ def _build(arm_id: str = "arm-a") -> tuple[dict, _FakeOperator, _FakeOperator]:
         seed_manifest=_seed_manifest(),
         training_manifest=_training_manifest(),
         code_provenance={"git_commit": COMMIT, "dirty": False},
+        native_engine_provenance=_native_engine(),
+        hardware_provenance=_hardware(),
         max_decisions=8,
         game_factory=lambda _seed: _FakeGame(),
         action_applier=_apply,
@@ -237,6 +261,8 @@ def test_public_default_rejects_authoritative_operator_before_play() -> None:
             seed_manifest=_seed_manifest(),
             training_manifest=_training_manifest(),
             code_provenance={"git_commit": COMMIT, "dirty": False},
+            native_engine_provenance=_native_engine(),
+            hardware_provenance=_hardware(),
             max_decisions=8,
             game_factory=lambda _seed: _FakeGame(),
             action_applier=_apply,
@@ -259,6 +285,8 @@ def test_incomplete_game_fails_without_returning_a_partial_bundle() -> None:
             seed_manifest=_seed_manifest(),
             training_manifest=_training_manifest(),
             code_provenance={"git_commit": COMMIT, "dirty": False},
+            native_engine_provenance=_native_engine(),
+            hardware_provenance=_hardware(),
             max_decisions=2,
             game_factory=lambda _seed: _FakeGame(),
             action_applier=_apply,
