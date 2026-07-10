@@ -57,7 +57,10 @@ def render(config: dict[str, Any], *, out_dir: Path, ssh_key: Path) -> dict[str,
     targets = {
         "node": [_target(hub, "localhost:9100")],
         "dcgm": [_target(hub, "localhost:9400")],
-        "catan": [_target(hub, "localhost:9500")],
+        # The hub is monitoring-only. Application exporter targets are the
+        # generation boxes, so a deliberately absent hub exporter never raises
+        # a false CatanExporterDown alert.
+        "catan": [],
     }
     units: list[str] = []
     for index, box in enumerate(boxes, start=1):

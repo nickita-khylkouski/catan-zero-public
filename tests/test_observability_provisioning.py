@@ -43,7 +43,7 @@ def test_target_renderer_adds_node_dcgm_and_catan_without_gpu_label(
         config, out_dir=tmp_path / "generated", ssh_key=Path("/private/key")
     )
     assert result == {"boxes": 2, "tunnels": 1}
-    for job in ("node", "dcgm", "catan"):
+    for job in ("node", "dcgm"):
         records = json.loads(
             (tmp_path / "generated/targets" / f"{job}.json").read_text()
         )
@@ -53,8 +53,10 @@ def test_target_renderer_adds_node_dcgm_and_catan_without_gpu_label(
     catan = json.loads(
         (tmp_path / "generated/targets/catan.json").read_text()
     )
-    assert catan[0]["targets"] == ["localhost:9500"]
-    assert catan[1]["targets"] == ["localhost:19501"]
+    assert len(catan) == 1
+    assert catan[0]["targets"] == ["localhost:19501"]
+    assert "gpu" not in catan[0]["labels"]
+    assert catan[0]["labels"]["gpumodel"] == "H100"
     unit = (tmp_path / "generated/tunnels/fleet-tunnel-c1.service").read_text()
     assert "127.0.0.1:19101:127.0.0.1:9100" in unit
     assert "127.0.0.1:19401:127.0.0.1:9400" in unit

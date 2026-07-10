@@ -15,21 +15,23 @@ fleet target file, SSH key, and one-host canary have been reviewed.
 
 ## Per-box canary
 
-The exporter is read-only. It scans `/proc`, `~/gen_out/*/gpu*/config.json`,
+The exporter is read-only. It scans `/proc`,
+`~/catan-zero-production/runs/selfplay/*/config.json`,
 worker `progress.json` files, final `manifest.json` files, and filesystem free
 space. The fleet launcher writes the existing typed config format to
 `$GPU_OUT/config.json` before workers start, making the canonical config hash
 available while a run is live.
 
 ```bash
-python tools/fleet/fleet_metrics_exporter.py --once --run-root ~/gen_out
+python tools/fleet/fleet_metrics_exporter.py --once \
+  --run-root ~/catan-zero-production/runs/selfplay
 python tools/fleet/fleet_metrics_exporter.py --listen 127.0.0.1 --port 9500
 curl -fsS http://127.0.0.1:9500/metrics | grep '^catan_fleet_'
 ```
 
 After the one-shot output is correct, install the pinned unit from
 `systemd/catan-fleet-exporter.service`, adjusting only immutable tree paths if
-the release is not at `/home/ubuntu/catan-zero-v1`. The unit binds loopback,
+the release is not at `/home/ubuntu/catan-zero-production/repo`. The unit binds loopback,
 runs unprivileged, and has a read-only home/system view.
 
 ## Hub provisioning
