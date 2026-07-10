@@ -5,10 +5,18 @@ import hashlib
 import json
 import math
 from pathlib import Path
+import random
 
 import pytest
 
-from tools.rnd_topology_learning_gate import GateInputError, main, score_learning_gate
+from tools.rnd_topology_learning_gate import (
+    GateInputError,
+    _aggregate_game_summaries,
+    _paired_crossed_bootstrap,
+    _summarize_games,
+    main,
+    score_learning_gate,
+)
 
 
 ARMS = {
@@ -24,6 +32,144 @@ HASHES = {
     "training_data_sha256": "4" * 64,
 }
 COMMON = {"hidden_size": 16, "state_layers": 2, "attention_heads": 2}
+
+
+def _legacy_aggregate_games(values, games, *, game_macro: bool) -> float:
+    if game_macro:
+        return math.fsum(
+            math.fsum(values[game]) / len(values[game]) for game in games
+        ) / len(games)
+    flattened = [value for game in games for value in values[game]]
+    return math.fsum(flattened) / len(flattened)
+
+
+def _legacy_paired_crossed_bootstrap(
+    candidate, reference, *, samples: int, seed: int, game_macro: bool
+):
+    rng = random.Random(seed)
+    seeds = sorted(candidate)
+    games = sorted(candidate[seeds[0]])
+    per_seed = {}
+    for model_seed in seeds:
+        cand = _legacy_aggregate_games(
+            candidate[model_seed], games, game_macro=game_macro
+        )
+        ref = _legacy_aggregate_games(
+            reference[model_seed], games, game_macro=game_macro
+        )
+        per_seed[str(model_seed)] = {
+            "candidate_ce": cand,
+            "reference_ce": ref,
+            "relative_improvement": (ref - cand) / ref,
+        }
+    point_candidate = math.fsum(
+        value["candidate_ce"] for value in per_seed.values()
+    ) / len(per_seed)
+    point_reference = math.fsum(
+        value["reference_ce"] for value in per_seed.values()
+    ) / len(per_seed)
+    differences = []
+    improvements = []
+    regressions = []
+    for _ in range(samples):
+        selected_seeds = [rng.choice(seeds) for _ in seeds]
+        selected_games = [rng.choice(games) for _ in games]
+        candidate_value = math.fsum(
+            _legacy_aggregate_games(
+                candidate[model_seed], selected_games, game_macro=game_macro
+            )
+            for model_seed in selected_seeds
+        ) / len(selected_seeds)
+        reference_value = math.fsum(
+            _legacy_aggregate_games(
+                reference[model_seed], selected_games, game_macro=game_macro
+            )
+            for model_seed in selected_seeds
+        ) / len(selected_seeds)
+        difference = candidate_value - reference_value
+        differences.append(difference)
+        improvements.append(-difference / reference_value)
+        regressions.append(difference / reference_value)
+
+    def quantile(values, probability):
+        ordered = sorted(values)
+        position = (len(ordered) - 1) * probability
+        lower = math.floor(position)
+        upper = math.ceil(position)
+        if lower == upper:
+            return ordered[lower]
+        fraction = position - lower
+        return ordered[lower] * (1 - fraction) + ordered[upper] * fraction
+
+    difference = point_candidate - point_reference
+    return {
+        "candidate_ce": point_candidate,
+        "reference_ce": point_reference,
+        "candidate_minus_reference": difference,
+        "relative_improvement": -difference / point_reference,
+        "relative_regression": difference / point_reference,
+        "difference_ci95": [quantile(differences, 0.025), quantile(differences, 0.975)],
+        "relative_improvement_ci95": [
+            quantile(improvements, 0.025),
+            quantile(improvements, 0.975),
+        ],
+        "relative_regression_ci95": [
+            quantile(regressions, 0.025),
+            quantile(regressions, 0.975),
+        ],
+        "per_seed": per_seed,
+    }
+
+
+@pytest.mark.parametrize("game_macro", [True, False])
+def test_precomputed_game_aggregation_matches_legacy(game_macro: bool) -> None:
+    values = {
+        "g1": [0.125, 0.25, 0.5],
+        "g2": [0.75, 1.0],
+        "g3": [1.25, 1.5, 1.75, 2.0],
+    }
+    games = ["g3", "g1", "g3", "g2"]
+    actual = _aggregate_game_summaries(
+        _summarize_games(values), games, game_macro=game_macro
+    )
+    assert actual == _legacy_aggregate_games(values, games, game_macro=game_macro)
+
+
+@pytest.mark.parametrize("game_macro", [True, False])
+def test_precomputed_crossed_bootstrap_matches_legacy_and_rng_draws(
+    game_macro: bool,
+) -> None:
+    candidate = {
+        seed: {
+            game: [0.125 * (seed + game_index + decision) for decision in range(1, 5)]
+            for game_index, game in enumerate(("g1", "g2", "g3", "g4"))
+        }
+        for seed in (1, 2, 3)
+    }
+    reference = {
+        seed: {
+            game: [value + 0.5 for value in observations]
+            for game, observations in games.items()
+        }
+        for seed, games in candidate.items()
+    }
+    samples = 250
+    rng_seed = 9182
+    expected = _legacy_paired_crossed_bootstrap(
+        candidate,
+        reference,
+        samples=samples,
+        seed=rng_seed,
+        game_macro=game_macro,
+    )
+    actual = _paired_crossed_bootstrap(
+        candidate,
+        reference,
+        samples=samples,
+        rng=random.Random(rng_seed),
+        game_macro=game_macro,
+    )
+    assert actual == expected
 
 
 def _canonical_sha(value: dict) -> str:

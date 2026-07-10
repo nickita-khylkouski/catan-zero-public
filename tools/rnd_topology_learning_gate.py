@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 from collections import defaultdict
+from dataclasses import dataclass
 import hashlib
 import json
 import math
@@ -166,12 +167,45 @@ def _game_values(
     return dict(grouped)
 
 
-def _aggregate_games(
-    values: Mapping[str, Sequence[float]], games: Sequence[str], *, game_macro: bool
+@dataclass(frozen=True, slots=True)
+class _GameSummary:
+    """Sufficient statistics for repeated bootstrap aggregation of one game."""
+
+    total: float
+    count: int
+    mean: float
+
+
+def _summarize_games(
+    values: Mapping[str, Sequence[float]],
+) -> dict[str, _GameSummary]:
+    summaries: dict[str, _GameSummary] = {}
+    for game, observations in values.items():
+        count = len(observations)
+        if count <= 0:
+            raise GateInputError(f"game {game!r} has no decision observations")
+        total = math.fsum(observations)
+        summaries[game] = _GameSummary(
+            total=total,
+            count=count,
+            mean=total / count,
+        )
+    return summaries
+
+
+def _aggregate_game_summaries(
+    summaries: Mapping[str, _GameSummary],
+    games: Sequence[str],
+    *,
+    game_macro: bool,
 ) -> float:
+    if not games:
+        raise GateInputError("cannot aggregate an empty game sample")
     if game_macro:
-        return _mean([_mean(values[game]) for game in games])
-    return _mean([value for game in games for value in values[game]])
+        return math.fsum(summaries[game].mean for game in games) / len(games)
+    total = math.fsum(summaries[game].total for game in games)
+    count = sum(summaries[game].count for game in games)
+    return total / count
 
 
 def _paired_crossed_bootstrap(
@@ -187,6 +221,12 @@ def _paired_crossed_bootstrap(
         raise GateInputError("candidate/reference seed support differs")
     common_games: list[str] | None = None
     per_seed: dict[str, dict[str, float]] = {}
+    candidate_summaries = {
+        seed: _summarize_games(candidate[seed]) for seed in seeds
+    }
+    reference_summaries = {
+        seed: _summarize_games(reference[seed]) for seed in seeds
+    }
     for seed in seeds:
         games = sorted(candidate[seed])
         if set(games) != set(reference[seed]):
@@ -203,8 +243,12 @@ def _paired_crossed_bootstrap(
                 raise GateInputError(
                     f"reference CE must be positive for every game cluster; seed {seed}, game {game!r}"
                 )
-        cand = _aggregate_games(candidate[seed], games, game_macro=game_macro)
-        ref = _aggregate_games(reference[seed], games, game_macro=game_macro)
+        cand = _aggregate_game_summaries(
+            candidate_summaries[seed], games, game_macro=game_macro
+        )
+        ref = _aggregate_game_summaries(
+            reference_summaries[seed], games, game_macro=game_macro
+        )
         per_seed[str(seed)] = {
             "candidate_ce": cand,
             "reference_ce": ref,
@@ -222,13 +266,21 @@ def _paired_crossed_bootstrap(
         selected_games = [rng.choice(common_games) for _ in common_games]
         cand_value = _mean(
             [
-                _aggregate_games(candidate[seed], selected_games, game_macro=game_macro)
+                _aggregate_game_summaries(
+                    candidate_summaries[seed],
+                    selected_games,
+                    game_macro=game_macro,
+                )
                 for seed in selected_seeds
             ]
         )
         ref_value = _mean(
             [
-                _aggregate_games(reference[seed], selected_games, game_macro=game_macro)
+                _aggregate_game_summaries(
+                    reference_summaries[seed],
+                    selected_games,
+                    game_macro=game_macro,
+                )
                 for seed in selected_seeds
             ]
         )
