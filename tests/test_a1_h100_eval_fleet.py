@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -187,6 +188,57 @@ def test_every_job_is_cuda_pinned_and_has_exact_n128_infoset_d6_recipe(
     assert "/home/ubuntu/catan-zero-v1/src" in all_shell
     assert "/home/ubuntu/catan-zero-v1/tools/fleet/launch_detached.sh" in all_shell
     assert "\ntools/fleet/launch_detached.sh " not in all_shell
+
+
+def test_launch_command_is_independent_of_remote_ssh_working_directory(
+    tmp_path: Path,
+) -> None:
+    remote_repo = tmp_path / "remote repo"
+    launcher = remote_repo / "tools" / "fleet" / "launch_detached.sh"
+    launcher.parent.mkdir(parents=True)
+    launcher.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        "shift 3\n"
+        "test \"$1\" = --\n"
+        "shift\n"
+        '"$@"\n',
+        encoding="utf-8",
+    )
+    launcher.chmod(0o755)
+
+    job_dir = tmp_path / "remote output" / "job-0"
+    report = job_dir / "report.json"
+    job = {
+        "job_id": "job-0",
+        "job_dir": str(job_dir),
+        "report": str(report),
+        "gpu": 0,
+        "argv": [
+            "python3",
+            "-c",
+            f"from pathlib import Path; Path({str(report)!r}).write_text('ok')",
+        ],
+    }
+    command = fleet._launch_job_command(  # noqa: SLF001
+        {"remote_repo": str(remote_repo)}, job
+    )
+    unrelated_cwd = tmp_path / "unrelated-ssh-cwd"
+    unrelated_cwd.mkdir()
+
+    completed = subprocess.run(
+        ["bash", "-lc", command],
+        cwd=unrelated_cwd,
+        check=False,
+        text=True,
+        capture_output=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert report.read_text(encoding="utf-8") == "ok"
+    assert (job_dir / ".done").is_file()
+    assert (job_dir / ".rc").read_text(encoding="utf-8") == "0\n"
+    assert not (job_dir / ".failed").exists()
 
 
 def test_plan_hash_and_checkpoint_bytes_are_replayed_on_load(tmp_path: Path) -> None:
