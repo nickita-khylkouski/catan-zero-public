@@ -107,6 +107,7 @@ def test_installer_shell_syntax_and_preflight_order() -> None:
     assert all(verified < mutation for mutation in mutations)
     assert 'git rev-parse --verify "refs/tags/${CATAN_REF}^{commit}"' in text
     assert "sha256sum -c --strict wheel.sha256" in text
+    assert "CATAN_DEST must be an absolute systemd-safe path" in text
 
 
 def test_malformed_inventory_fails_before_any_privileged_mutation(
@@ -226,9 +227,9 @@ def test_receipt_is_outside_checkout_and_binds_release_evidence() -> None:
     text = INSTALLER.read_text(encoding="utf-8")
     assert "deployment checkout drifted during installation" in text
     assert text.index("deployment checkout drifted during installation") < text.index(
-        '"schema_version": "catan-zero-install-receipt-v1"'
+        '"schema_version": "catan-zero-install-receipt-v2"'
     )
-    assert '"schema_version": "catan-zero-install-receipt-v1"' in text
+    assert '"schema_version": "catan-zero-install-receipt-v2"' in text
     assert "$HOME/.local/state/catan-zero/install-${HEAD_COMMIT}.json" in text
     for field in (
         '"source_commit"',
@@ -238,8 +239,51 @@ def test_receipt_is_outside_checkout_and_binds_release_evidence() -> None:
         '"checksum_inventory_sha256"',
         '"catanatron_rs_version"',
         '"determinize_for_player"',
+        '"fleet_exporter_fragment_path"',
+        '"fleet_exporter_dropin_paths"',
+        '"fleet_exporter_effective"',
     ):
         assert field in text
     assert "handle.flush()" in text
     assert "os.fsync(handle.fileno())" in text
     assert "os.replace(temporary, receipt)" in text
+
+
+def test_exporter_install_removes_legacy_dropins_and_attests_effective_process() -> None:
+    text = INSTALLER.read_text(encoding="utf-8")
+    assert 'EXPORTER_DROPIN_DIR="/etc/systemd/system/catan-fleet-exporter.service.d"' in text
+    assert 'sudo rm -rf -- "$EXPORTER_DROPIN_DIR"' in text
+    assert "--property=FragmentPath" in text
+    assert "--property=DropInPaths" in text
+    assert 'Path(f"/proc/{pid}/cmdline")' in text
+    assert '"--run-root", "/home/ubuntu/gen_out"' in text
+    assert '"--run-root", "/home/ubuntu/catan-zero-production/runs/selfplay"' in text
+    assert "build_opener(ProxyHandler({}))" in text
+    assert '"catan_fleet_" not in body' in text
+    assert "MainPID changed during attestation" in text
+    assert "finish_install_transaction" in text
+    assert "EXPORTER_TRANSACTION_ARMED=1" in text
+    assert "EXPORTER_TRANSACTION_ARMED=0" in text
+    assert "disable --now catan-fleet-exporter.service" in text
+    assert "exporter rollback FAILED" in text
+    assert 'rm -f -- "$CATAN_INSTALL_RECEIPT"' in text
+    assert "--property=ActiveState" in text
+    assert "--property=UnitFileState" in text
+    assert "--property=MainPID" in text
+    assert '[ "$active" != "inactive" ]' in text
+    assert '[ "$enabled" != "disabled" ]' in text
+    assert '[ "$main_pid" != "0" ]' in text
+    assert 'rm -f -- "$CATAN_INSTALL_RECEIPT"' in text
+
+    remove = text.index('sudo rm -rf -- "$EXPORTER_DROPIN_DIR"')
+    install = text.index('sudo install -m 0644 "$EXPORTER_UNIT_RENDERED"')
+    receipt = text.index('"schema_version": "catan-zero-install-receipt-v2"')
+    assert remove < install < receipt
+
+
+def test_exporter_unit_is_rendered_for_a_safe_fresh_destination() -> None:
+    text = INSTALLER.read_text(encoding="utf-8")
+    assert 'default = "/home/ubuntu/catan-zero-v1"' in text
+    assert "text.count(default) != 2" in text
+    assert "rendered = text.replace(default, str(destination))" in text
+    assert 're.fullmatch(r"/[A-Za-z0-9._/-]+", str(destination))' in text

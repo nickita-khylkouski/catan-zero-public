@@ -39,18 +39,64 @@ TORCH_INDEX="${TORCH_INDEX:-https://download.pytorch.org/whl/cu128}"
 PY="${PY:-python3.11}"
 
 INSTALL_TMP=""
+EXPORTER_TRANSACTION_ARMED=0
 cleanup_install_tmp() {
   if [ -n "$INSTALL_TMP" ] && [ -d "$INSTALL_TMP" ]; then
     rm -rf -- "$INSTALL_TMP"
   fi
 }
-trap cleanup_install_tmp EXIT
+finish_install_transaction() {
+  local original_status=$?
+  local cleanup_failed=0
+  local active="unknown"
+  local enabled="unknown"
+  local main_pid="unknown"
+  local active_rc=0
+  local enabled_rc=0
+  local pid_rc=0
+  trap - EXIT
+  set +e
+  if [ "$EXPORTER_TRANSACTION_ARMED" -eq 1 ]; then
+    if [ -n "${CATAN_INSTALL_RECEIPT:-}" ]; then
+      rm -f -- "$CATAN_INSTALL_RECEIPT"
+    fi
+    sudo -n systemctl disable --now catan-fleet-exporter.service >/dev/null 2>&1 \
+      || cleanup_failed=1
+    active="$(systemctl show --property=ActiveState --value \
+      catan-fleet-exporter.service 2>/dev/null)" || active_rc=$?
+    enabled="$(systemctl show --property=UnitFileState --value \
+      catan-fleet-exporter.service 2>/dev/null)" || enabled_rc=$?
+    main_pid="$(systemctl show --property=MainPID --value \
+      catan-fleet-exporter.service 2>/dev/null)" || pid_rc=$?
+    if [ "$active_rc" -ne 0 ] || [ "$enabled_rc" -ne 0 ] || [ "$pid_rc" -ne 0 ] \
+      || [ "$active" != "inactive" ] || [ "$enabled" != "disabled" ] \
+      || [ "$main_pid" != "0" ]; then
+      cleanup_failed=1
+    fi
+    if [ "$cleanup_failed" -eq 0 ]; then
+      echo "[install] exporter rollback verified: active=$active enabled=$enabled main_pid=$main_pid" >&2
+    else
+      echo "[install] CRITICAL: exporter rollback FAILED: active=$active enabled=$enabled main_pid=$main_pid" >&2
+    fi
+  fi
+  cleanup_install_tmp
+  if [ "$cleanup_failed" -ne 0 ]; then
+    exit 3
+  fi
+  exit "$original_status"
+}
+trap finish_install_transaction EXIT
 trap 'exit 130' INT TERM HUP
 
 die() {
   echo "[install] ERROR: $*" >&2
   exit 3
 }
+
+if [[ ! "$CATAN_DEST" =~ ^/[A-Za-z0-9._/-]+$ ]] \
+  || [[ "/$CATAN_DEST/" == *"/../"* ]]; then
+  die "CATAN_DEST must be an absolute systemd-safe path without '..': $CATAN_DEST"
+fi
 
 if [ -z "$CATAN_REF" ]; then
   echo "[install] ERROR: CATAN_REF is required; v1.0-deploy predates the current H100 launcher/lifecycle fixes." >&2
@@ -168,6 +214,16 @@ chmod 0444 "$VERIFIED_RS_WHEEL"
 CATAN_RS_WHEEL="$VERIFIED_RS_WHEEL"
 echo "[install] catanatron_rs wheel preflight verified: $RS_WHEEL_ACTUAL_SHA256"
 
+# A successful receipt is authoritative only for an uninterrupted installer
+# transaction.  Invalidate any same-commit receipt immediately before the
+# first privileged/runtime mutation so a later failure cannot leave stale
+# success evidence behind.
+CATAN_INSTALL_RECEIPT="${CATAN_INSTALL_RECEIPT:-$HOME/.local/state/catan-zero/install-${HEAD_COMMIT}.json}"
+if [ -e "$CATAN_INSTALL_RECEIPT" ] && [ ! -f "$CATAN_INSTALL_RECEIPT" ]; then
+  die "install receipt path exists and is not a regular file: $CATAN_INSTALL_RECEIPT"
+fi
+rm -f -- "$CATAN_INSTALL_RECEIPT"
+
 # The production executor requires a boot-persistent foreground MPS daemon.
 # Install the exact unit from this immutable checkout; ad-hoc `-d` daemons can
 # disappear with their SSH session and strand every attached CUDA client.
@@ -273,21 +329,141 @@ PYTHONPATH="$CATAN_DEST/src" python -m pytest \
 # hub reaches it through the committed SSH tunnel topology.
 EXPORTER_UNIT_SOURCE="$CATAN_DEST/ops/observability/systemd/catan-fleet-exporter.service"
 EXPORTER_UNIT_DEST="/etc/systemd/system/catan-fleet-exporter.service"
+EXPORTER_DROPIN_DIR="/etc/systemd/system/catan-fleet-exporter.service.d"
+EXPORTER_UNIT_RENDERED="$INSTALL_TMP/catan-fleet-exporter.service"
 if [ ! -f "$EXPORTER_UNIT_SOURCE" ]; then
   echo "[install] ERROR: canonical fleet exporter unit is missing: $EXPORTER_UNIT_SOURCE" >&2
   exit 3
 fi
-sudo install -m 0644 "$EXPORTER_UNIT_SOURCE" "$EXPORTER_UNIT_DEST"
+# The committed unit documents the fleet default.  Upgrades are allowed to use
+# another fresh absolute checkout, so render only those two exact default path
+# occurrences and reject paths that would require ambiguous systemd quoting.
+export EXPORTER_UNIT_SOURCE EXPORTER_UNIT_RENDERED CATAN_DEST
+python - <<'PY'
+from pathlib import Path
+import os
+import re
+
+source = Path(os.environ["EXPORTER_UNIT_SOURCE"])
+destination = Path(os.environ["CATAN_DEST"]).resolve()
+if not destination.is_absolute() or not re.fullmatch(r"/[A-Za-z0-9._/-]+", str(destination)):
+    raise SystemExit(f"CATAN_DEST is not safe for exact systemd rendering: {destination}")
+default = "/home/ubuntu/catan-zero-v1"
+text = source.read_text(encoding="utf-8")
+if text.count(default) != 2:
+    raise SystemExit("canonical exporter unit default-path contract drifted")
+rendered = text.replace(default, str(destination))
+target = Path(os.environ["EXPORTER_UNIT_RENDERED"])
+target.write_text(rendered, encoding="utf-8")
+target.chmod(0o444)
+PY
+
+exporter_fail() {
+  local message="$1"
+  die "$message; transaction rollback will verify exporter inactive+disabled"
+}
+# A base unit does not override an existing systemd drop-in.  Old fleet
+# deployments used an override.conf pointing at a versioned staging tree, so
+# merely installing the canonical unit could leave an active, healthy-looking
+# exporter running stale code and omitting the validation output root.  The
+# frozen installer owns the complete exporter definition: remove its legacy
+# /etc drop-in namespace and then fail closed if any drop-in remains elsewhere.
+EXPORTER_TRANSACTION_ARMED=1
+if sudo test -e "$EXPORTER_DROPIN_DIR" || sudo test -L "$EXPORTER_DROPIN_DIR"; then
+  sudo rm -rf -- "$EXPORTER_DROPIN_DIR"
+fi
+sudo install -m 0644 "$EXPORTER_UNIT_RENDERED" "$EXPORTER_UNIT_DEST"
 sudo systemctl daemon-reload
+CATAN_EXPORTER_FRAGMENT_PATH="$(systemctl show \
+  --property=FragmentPath --value catan-fleet-exporter.service)"
+CATAN_EXPORTER_DROPIN_PATHS="$(systemctl show \
+  --property=DropInPaths --value catan-fleet-exporter.service)"
+if [ "$CATAN_EXPORTER_FRAGMENT_PATH" != "$EXPORTER_UNIT_DEST" ] \
+  || [ -n "$CATAN_EXPORTER_DROPIN_PATHS" ]; then
+  echo "[install] ERROR: exporter systemd provenance drift" >&2
+  echo "[install] fragment=$CATAN_EXPORTER_FRAGMENT_PATH" >&2
+  echo "[install] dropins=$CATAN_EXPORTER_DROPIN_PATHS" >&2
+  exporter_fail "exporter systemd provenance drift"
+fi
+
 sudo systemctl enable catan-fleet-exporter.service
-sudo systemctl restart catan-fleet-exporter.service
+if ! sudo systemctl restart catan-fleet-exporter.service; then
+  exporter_fail "cannot restart canonical exporter"
+fi
 if [ "$(systemctl is-active catan-fleet-exporter.service)" != "active" ] \
   || [ "$(systemctl is-enabled catan-fleet-exporter.service)" != "enabled" ]; then
-  echo "[install] ERROR: catan-fleet-exporter.service is not active+enabled" >&2
   sudo systemctl status catan-fleet-exporter.service --no-pager >&2 || true
-  exit 3
+  exporter_fail "catan-fleet-exporter.service is not active+enabled"
 fi
-echo "[install] catan-fleet-exporter.service active+enabled (loopback :9500)"
+
+export CATAN_EXPORTER_FRAGMENT_PATH CATAN_EXPORTER_DROPIN_PATHS
+if ! CATAN_EXPORTER_ATTESTATION_JSON="$(python - <<'PY'
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+import subprocess
+import time
+from urllib.request import build_opener, ProxyHandler
+
+destination = Path(os.environ["CATAN_DEST"]).resolve()
+expected = [
+    str(destination / ".venv/bin/python"),
+    str(destination / "tools/fleet/fleet_metrics_exporter.py"),
+    "--listen", "127.0.0.1",
+    "--port", "9500",
+    "--run-root", "/home/ubuntu/gen_out",
+    "--run-root", "/home/ubuntu/catan-zero-production/runs/selfplay",
+]
+url = "http://127.0.0.1:9500/metrics"
+opener = build_opener(ProxyHandler({}))
+deadline = time.monotonic() + 15.0
+last_error = "service did not expose a MainPID"
+while time.monotonic() < deadline:
+    try:
+        raw_pid = subprocess.check_output(
+            ["systemctl", "show", "--property=MainPID", "--value", "catan-fleet-exporter.service"],
+            text=True,
+        ).strip()
+        if not raw_pid.isdigit() or int(raw_pid) <= 0:
+            raise RuntimeError(f"invalid MainPID {raw_pid!r}")
+        pid = int(raw_pid)
+        actual = [
+            item.decode("utf-8")
+            for item in Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+            if item
+        ]
+        if actual != expected:
+            raise RuntimeError(f"MainPID argv drift: {actual!r}")
+        with opener.open(url, timeout=2) as response:
+            body = response.read().decode("utf-8", errors="strict")
+            if response.status != 200 or "catan_fleet_" not in body:
+                raise RuntimeError("metrics response lacks canonical catan_fleet_* metrics")
+        stable_pid = subprocess.check_output(
+            ["systemctl", "show", "--property=MainPID", "--value", "catan-fleet-exporter.service"],
+            text=True,
+        ).strip()
+        if stable_pid != raw_pid:
+            raise RuntimeError(f"MainPID changed during attestation: {raw_pid}->{stable_pid}")
+        print(json.dumps({
+            "main_pid": pid,
+            "argv": actual,
+            "metrics_url": url,
+            "metrics_prefix": "catan_fleet_",
+        }, separators=(",", ":")))
+        break
+    except Exception as error:
+        last_error = repr(error)
+        time.sleep(0.25)
+else:
+    raise SystemExit(f"exporter failed stable exact-readiness attestation: {last_error}")
+PY
+)"; then
+  exporter_fail "canonical exporter readiness attestation failed"
+fi
+export CATAN_EXPORTER_ATTESTATION_JSON
+echo "[install] catan-fleet-exporter.service exact+active+enabled (loopback :9500)"
 
 # Editable installs may create ignored build metadata, but tracked/untracked
 # source drift after installation is never acceptable for a frozen runtime.
@@ -298,7 +474,6 @@ fi
 
 # 8. Durable, atomic install receipt.  It lives outside the immutable checkout
 # so the evidence does not make a future integrity check report a dirty tree.
-CATAN_INSTALL_RECEIPT="${CATAN_INSTALL_RECEIPT:-$HOME/.local/state/catan-zero/install-${HEAD_COMMIT}.json}"
 export CATAN_INSTALL_RECEIPT CATAN_REPO CATAN_REF CATAN_DEST REF_KIND TAG_COMMIT HEAD_COMMIT
 export RS_WHEEL_NAME RS_WHEEL_ACTUAL_SHA256 RS_WHEEL_EXPECTED_SHA256
 export RS_WHEEL_SHA256_FILE_REL RS_WHEEL_INVENTORY_SHA256
@@ -306,6 +481,7 @@ export CATAN_MPS_ACTIVE="$(systemctl is-active nvidia-mps.service)"
 export CATAN_MPS_ENABLED="$(systemctl is-enabled nvidia-mps.service)"
 export CATAN_EXPORTER_ACTIVE="$(systemctl is-active catan-fleet-exporter.service)"
 export CATAN_EXPORTER_ENABLED="$(systemctl is-enabled catan-fleet-exporter.service)"
+export CATAN_EXPORTER_FRAGMENT_PATH CATAN_EXPORTER_DROPIN_PATHS CATAN_EXPORTER_ATTESTATION_JSON
 python - <<'PY'
 from __future__ import annotations
 
@@ -329,7 +505,7 @@ if rust_version != "0.1.4" or not determinize_api:
     raise SystemExit("refusing to write receipt for an invalid catanatron_rs install")
 
 payload = {
-    "schema_version": "catan-zero-install-receipt-v1",
+    "schema_version": "catan-zero-install-receipt-v2",
     "created_at": datetime.now(timezone.utc).isoformat(),
     "repository": os.environ["CATAN_REPO"],
     "requested_ref": os.environ["CATAN_REF"],
@@ -357,6 +533,11 @@ payload = {
         "nvidia_mps_enabled": os.environ["CATAN_MPS_ENABLED"],
         "fleet_exporter_active": os.environ["CATAN_EXPORTER_ACTIVE"],
         "fleet_exporter_enabled": os.environ["CATAN_EXPORTER_ENABLED"],
+        "fleet_exporter_fragment_path": os.environ["CATAN_EXPORTER_FRAGMENT_PATH"],
+        "fleet_exporter_dropin_paths": os.environ["CATAN_EXPORTER_DROPIN_PATHS"],
+        "fleet_exporter_effective": json.loads(
+            os.environ["CATAN_EXPORTER_ATTESTATION_JSON"]
+        ),
     },
 }
 
@@ -378,6 +559,7 @@ finally:
 print(f"[install] receipt={receipt} sha256_pending_shell")
 PY
 INSTALL_RECEIPT_SHA256="$(sha256sum "$CATAN_INSTALL_RECEIPT" | awk '{print $1}')"
+EXPORTER_TRANSACTION_ARMED=0
 echo "[install] receipt sha256=$INSTALL_RECEIPT_SHA256 path=$CATAN_INSTALL_RECEIPT"
 
 echo "[install] $CATAN_REF READY at $CATAN_DEST (.venv activated-on-demand)"
