@@ -283,9 +283,9 @@ R&D lane validates the contract and trains on B200.
 The machine-readable boundary for this section is
 `configs/experiments/a1_pre_wave_contract.template.json`, sealed/rendered by
 `tools/a1_pre_wave_contract.py` only after A0/S1-S3 resolve every marked
-science field.  Its 24 × (408 current + 77 history + 26 hard-negative)
-bounded attempts deterministically select the lowest-seed complete 400/75/25
-per worker, making 9,600/1,800/600 exact rather than relying on a random
+science field.  Its 40 × (245 current + 47 history + 16 hard-negative)
+bounded attempts deterministically select the lowest-seed complete 240/45/15
+per physical GPU, making 9,600/1,800/600 exact rather than relying on a random
 realized mix or assuming truncations never occur.  A seal binds full
 search/evaluator configs and their
 hashes, readout and checkpoint bytes, A0/S1-S3 evidence,

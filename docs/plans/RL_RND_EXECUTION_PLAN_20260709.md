@@ -369,7 +369,7 @@ Data contract:
 ### Fail-closed pre-wave handoff boundary
 
 `configs/experiments/a1_pre_wave_contract.template.json` is the only supported
-starting point for the 24-GPU handoff.  It is intentionally not launchable:
+starting point for the 40-GPU handoff.  It is intentionally not launchable:
 every result selected by A0/S1-S3 is written as `__UNRESOLVED__`, and
 `tools/a1_pre_wave_contract.py seal` refuses while any such value remains.
 Sealing also refuses missing/mutated A0/S1/S2/S3 evidence, an unmasked or
@@ -378,12 +378,12 @@ drift, a changed seed-ledger snapshot prefix, seed overlap, learner-code drift,
 or any VAL-ONLY seed. The shared ledger is not incorrectly frozen forever:
 the lock preserves its exact pre-claim bytes, `render` emits one exact claim
 row per job, live verification permits only append-only disjoint growth, and
-the post-wave audit requires every one of the 72 exact own claims.
+the post-wave audit requires every one of the 120 exact own claims.
 
 The sealed plan expands deterministically to three category-specific jobs per
-GPU, not a probabilistic opponent mix: each worker attempts 408
-current-producer, 77 recent/history, and 26 hard-negative games.  Postflight
-selects the lowest-seed complete 400/75/25 per job, so rare healthy
+GPU, not a probabilistic opponent mix: each physical GPU attempts 245
+current-producer, 47 recent/history, and 16 hard-negative games.  Postflight
+selects the lowest-seed complete 240/45/15 per job, so rare healthy
 truncations consume only the bounded reserve and the selected pre-row-expansion
 quotas remain exactly 9,600/1,800/600.  Search and
 evaluator configs are stored in full and separately hashed; checkpoint,

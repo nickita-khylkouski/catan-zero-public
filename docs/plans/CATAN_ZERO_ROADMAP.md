@@ -210,7 +210,7 @@ contract is sealed/rendered for the data-lane owner, with no fleet launch.
 
 - **B200 host (2 GPUs)**: bounded A0/S1-S3 training, search, adjudication,
   and software probes only.
-- **24-GPU production data lane (six four-GPU hosts)**: owned by the separately
+- **40-GPU production data lane (six four-GPU and two eight-GPU hosts)**: owned by the separately
   sealed A1 contract and its synchronized seed ledger. This R&D lane may render
   the handoff but may not launch the wave.
 - **Historical A100/Modal topology:** retained in prior run records only; it is
@@ -279,7 +279,7 @@ The build-and-shelve audit [R7] cuts both ways: a lot of this roadmap is NOT new
 - **B200 host (2× B200)**: bounded R&D for A0/S1-S3, contract validation,
   and learner/search probes. It does not run a production wave or the closed C0
   91M re-probe.
-- **24-GPU production data lane (six four-GPU hosts)**: receives only a sealed,
+- **40-GPU production data lane (six four-GPU and two eight-GPU hosts)**: receives only a sealed,
   audited, non-executing handoff after S1-S3 and seed-ledger synchronization.
   The data-lane owner, not this R&D process, performs any eventual launch.
 - **Historical A100/Modal resources:** non-authoritative for the current

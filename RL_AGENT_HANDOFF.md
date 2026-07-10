@@ -10,20 +10,17 @@ track do not support a four-player full-trade strength claim.
 
 | Item | State |
 |---|---|
-| Local branch | codex/h100-simulation-throughput at 1610901-dirty |
-| Publishable release | Blocked. v1.0-deploy predates the H100 work |
-| Private masked champion | Missing from this checkout |
-| Authoritative production seed ledger | Missing from this checkout |
-| Authoritative ChampionRegistry and deployment pointers | Missing from this checkout |
-| Full production fleet config | Missing from the default local path |
-| 8-H100 canary | Validation lab outside the 24 production H100s |
-| Local verification | 1,737 passed, 200 skipped, 4 warnings in 49.13s |
-| H100 verification | 1,913 passed, 24 skipped in 18m18s |
-| Final H100 delta | 184 targeted tests passed in 7.89s; all 8 GPUs returned to 0 MiB |
-| Final CUDA parity | 128 states, prior diff 2.04e-8, value diff 6.54e-7 |
-| End-to-end canary smoke | 16/16 games, 0 failed, 9,506 rows, automatic cleanup |
-| Production launch | Blocked by the release, champion, ledger, fleet config, and real-champion repeat |
-| Promotion/deployment | Blocked by private registry state and an owner-approved gate/veto record |
+| Canonical repository | `nickita-khylkouski/catan-zero-public`; deploy one final immutable A1 tag |
+| Production H100 topology | 40 GPUs: `c1`-`c6` (4 each), `h100-8a` and `h100-8b` (8 each) |
+| A1 search decision | global n128; n_fast 16; p_full .25; adaptive/wide budget disabled |
+| A1 source dose | 9,600 current + 1,800 recent + 600 hard-negative complete games |
+| A1 job/claim count | 120: three category jobs per physical H100 |
+| Private artifacts | Must be staged and hash-verified on every declared consumer before seal/launch |
+| Production seed ledger | One byte-identical append-only ledger across all eight H100 hosts |
+| Fleet config | Private `$FLEET_CONF`; aliases only in repository examples |
+| Production launch | Only from a verified sealed contract through the A1 production executor |
+| Training | One sealed scalar-MSE dose on one selected B200 after corpus postflight |
+| Promotion/deployment | Atomic typed transaction only after every required gate and veto passes |
 
 The canary smoke used a synthetic same-shape checkpoint. Its rows certify
 pipeline behavior. They do not certify playing strength and must not train a
@@ -37,7 +34,7 @@ The RL operator owns this sequence:
 2. Allocate non-overlapping seeds under one global allocator.
 3. Launch and monitor generation one box at a time.
 4. Reconcile manifests, run corpus QA, and build a fresh memmap corpus.
-5. Launch the canonical 35M DDP control.
+5. Launch the sealed one-dose 35M learner on one selected B200.
 6. Run searched candidate-versus-incumbent, neutral, tripwire, and population
    evidence required by the approved promotion policy.
 7. Record a promotion transaction and deploy the selected checkpoint only
@@ -55,24 +52,26 @@ describes the mechanics; it does not grant new external permissions.
 
 ~~~text
 Operator workstation
-  -> fleet_launch.sh
-  -> one detached generator per physical GPU
+  -> sealed A1 contract + a1_production_executor.py
+  -> one detached lane supervisor per physical GPU
+  -> three deterministic source-category jobs per lane
   -> CPU game workers
-  -> one EvalServer and one CUDA context per GPU
+  -> one MPS-managed generator per GPU (EvalServer off)
   -> Rust game state, features, and Gumbel chance MCTS
   -> strict-FP32 entity-graph policy forward
   -> NPZ decision shards plus manifests
   -> manifest reconciliation and Gumbel QA
   -> duplicate-safe memmap corpus
-  -> four-rank DDP train_bc on c4
+  -> one sealed one-dose train_bc process on a B200
   -> candidate checkpoint and report
   -> searched cross-net H2H plus neutral panels
   -> manual registry and CKPT deployment transaction
 ~~~
 
-The generator and trainer have canonical launchers. Corpus attestation and
-masked-search promotion still require an operator checklist. No current command
-joins every stage into one safe transaction.
+Generation, one-dose training, and promotion each have fail-closed transaction
+boundaries. They remain deliberately separate: postflight evidence must be
+accepted before training, and gate/veto evidence must be accepted before
+promotion.
 
 ## 4. Source-of-truth order
 
@@ -101,7 +100,9 @@ Never train on:
 - Synthetic-checkpoint canary rows, including the 9,506-row smoke.
 - The 21,120-row DDP training smoke corpus.
 - Canary/evaluation outputs or seeds in [6190000000, 6200000000).
-- TF32, torch.compile, MPS, or other rejected experiment outputs.
+- TF32, torch.compile, or other rejected experiment outputs. MPS is required by
+  the sealed A1 runtime; reject only unattested diagnostic MPS outputs or runs
+  whose managed daemon/runtime contract did not verify.
 - Partial generation or harvests with unreconciled counts.
 - Any run with worker errors, reused seeds, ambiguous masking, or wrong track.
 - A memmap built with duplicate-seed or fill verification disabled.
@@ -112,30 +113,31 @@ CANARY_VAL_ONLY_LEDGER.md into the production seed ledger.
 
 ## 6. Production recipe
 
-| Role | Four-GPU production node | Eight-GPU canary |
-|---|---|---|
-| Teacher | 128 workers/GPU, n128, p-full 1.0, shard 512, batch 96, collector on | 64 workers/GPU |
-| Volume | 48 workers/GPU, n64, p-full 0.25, shard 2048, batch 64, collector off | 32 workers/GPU |
-| Train | Four DDP ranks, batch 1024/rank | Eight ranks, batch 512/rank |
+The current A1 wave has one search recipe on every physical H100. There is no
+teacher/volume box split and no H100 held out for training:
 
-All generation uses:
+| Field | Sealed A1 value |
+|---|---|
+| H100 topology | six 4-GPU hosts + two 8-GPU hosts = 40 GPUs |
+| Search budget | `n_full=128`, `n_fast=16`, `p_full=0.25` |
+| Adaptive budget | disabled (`n_full_wide=null`, threshold null, always-full false) |
+| Search calibration | c-visit 50.0, c-scale .03, D1 off, sigma_eval .98 |
+| Symmetry | D6 averaged evaluation on from legal width 20 |
+| Runtime | one generator/GPU, 16 workers/GPU, systemd-managed MPS, EvalServer off |
+| Precision/masking | strict FP32, public observations, masked checkpoints |
+| Source jobs | 240/45/15 selected games per GPU for current/recent/hard-negative |
+| Attempts | 245/47/16 per GPU; reserve attempts are excluded before training |
 
-- one generator and EvalServer per physical GPU;
-- public observations and a masked checkpoint;
-- Rust features and corrected chance spectra;
-- lazy interior chance;
-- c-visit 50.0 and c-scale 0.03;
-- immediate queue drain;
-- matmul_precision=highest;
-- cache size 0;
-- no local CUDA fallback;
-- CPU affinity;
-- MPS off.
+All generation also uses corrected Rust chance spectra, lazy interior chance,
+`max_decisions=600`, no local CUDA fallback, and the exact immutable generator
+tree bound by the seal. The source mix is implemented as three deterministic
+jobs per GPU, not probabilistic opponent selection. Global n64, global n196,
+and adaptive or global n256 are unauthorized for this wave.
 
-The measured synthetic frontier reached 91.85k rows/hour/GPU at
-w128/batch96/collector. The 2.20M rows/hour figure assumes all 24 H100s run the
-teacher recipe. The standard role layout reserves c4 for training and mixes
-teacher and volume nodes, so its aggregate rate differs.
+The historical 91.85k rows/hour/GPU and 2.20M rows/hour over 24 H100s were
+measurements/projections for a synthetic-checkpoint EvalServer recipe. Preserve
+them as evidence; do not treat them as the capacity model for this 40-H100 A1
+runtime.
 
 ## 7. Release and node acceptance
 
@@ -162,13 +164,14 @@ cd /home/ubuntu/catan-zero-v1
 test "$(git rev-parse HEAD)" = <recorded-release-commit>
 ~~~
 
-Stage the real champion on every node that consumes it: c1-c6,
-`h100-canary`, and `b200`. Stage the production ledger only on the five
-generation nodes c1, c2, c3, c5, and c6:
+Stage every source checkpoint on every production H100 that consumes it:
+`c1`-`c6`, `h100-8a`, and `h100-8b`. Stage learner/evaluation inputs on the
+selected B200 separately. The synchronized production ledger belongs on all
+eight production H100 hosts:
 
 ~~~text
 /home/ubuntu/bundle/champion_v0.pt
-/home/ubuntu/catan-zero-v1/runs/SEED_LEDGER.md
+/home/ubuntu/catan-zero-production/SEED_LEDGER.md
 ~~~
 
 Record the release commit, release tag, Rust-wheel SHA-256, checkpoint SHA-256,
@@ -209,43 +212,24 @@ PY=.venv/bin/python \
 The no-op gate needs the real masked champion. A synthetic checkpoint cannot
 replace it.
 
-### 7.4 Clear the real-champion capacity gate
+### 7.4 Clear both production-shape canaries
 
-Before the 24-H100 rollout, complete the private fleet configuration in Section
-8, then repeat the production-shaped teacher recipe on four canary GPUs with
-the real champion. Use only the validation seed band and its dedicated ledger;
-these rows remain quarantined:
+Before the 40-H100 rollout, complete the private fleet configuration in Section
+8 and exercise the sealed recipe on both host shapes: one four-GPU host and one
+eight-GPU host. Use validation-only seeds and outputs, never production claims,
+unless executing the first real jobs through the executor's exact resume
+transaction. The canary must reproduce global n128/n_fast16/p_full.25, D6 at
+width 20, no adaptive budget, 16 workers/GPU, MPS, and EvalServer off.
 
-~~~bash
-cd <verified-local-checkout>
-test -x .venv/bin/python
-test -f tools/fleet/fleet_launch.sh
+Inspect the executor's default dry run before adding `--go`. Accept only if all
+selected GPUs attach to the managed MPS service, guards pass, output rows and
+simulations advance, manifests reconcile, checkpoint/config hashes match, and
+there are zero failed games or worker errors. Retain the exact config dump and
+audit report for each host shape. Validation-only rows remain quarantined.
 
-export FLEET_CONF="$HOME/.catan_fleet.conf"
-export CKPT=/home/ubuntu/bundle/champion_v0.pt
-export LEDGER=/home/ubuntu/catan-zero-v1/runs/CANARY_VAL_ONLY_LEDGER.md
-export REMOTE_PY=/home/ubuntu/catan-zero-v1/.venv/bin/python
-
-PY="$REMOTE_PY" GEN_PY="$REMOTE_PY" \
-  tools/fleet/fleet_launch.sh h100-canary teacher \
-  --base-seed <fresh-seed-in-6190000000-to-6199998464> \
-  --gpus 0-3 --workers 128 --games 384 \
-  --wave real-champion-capacity
-~~~
-
-Inspect the dry run, repeat it with `--go`, and accept all four manifests as in
-Section 12. This is at least three complete games per worker and exercises the
-same total 512-worker CPU load as one four-GPU production node.
-
-The predeclared capacity threshold for the current plan is a median of at least
-80,000 rows/hour/GPU, no GPU below 72,000 rows/hour, zero failed games, zero
-worker errors, and no local fallback. Compute each GPU rate as
-`manifest.rows_per_sec * 3600`. Record simulations/second, EvalServer request
-and row totals, effective batch size, CPU/GPU utilization, power, truncation,
-and diversity beside the rate. If the rate gate misses, do not use the 2.20M
-rows/hour projection or start all 24 GPUs; profile or re-plan from the measured
-real-champion rate. Regardless of the result, never harvest this claim into a
-training corpus.
+The older 80k/72k per-GPU threshold and 2.20M rows/hour projection belong to
+the historical w128 EvalServer capacity experiment. They are not acceptance
+thresholds for the sealed 16-worker/MPS A1 runtime.
 
 ## 8. Private fleet configuration
 
@@ -259,7 +243,8 @@ declare -A HOST=(
   [c4]=...
   [c5]=...
   [c6]=...
-  [h100-canary]=...
+  [h100-8a]=...
+  [h100-8b]=...
   [b200]=...
 )
 
@@ -270,8 +255,11 @@ declare -A DIRS=(
   [c1]="/home/ubuntu/gen_out/<c1-claim>"
   [c2]="/home/ubuntu/gen_out/<c2-claim>"
   [c3]="/home/ubuntu/gen_out/<c3-claim>"
+  [c4]="/home/ubuntu/gen_out/<c4-claim>"
   [c5]="/home/ubuntu/gen_out/<c5-claim>"
   [c6]="/home/ubuntu/gen_out/<c6-claim>"
+  [h100-8a]="/home/ubuntu/gen_out/<h100-8a-claim>"
+  [h100-8b]="/home/ubuntu/gen_out/<h100-8b-claim>"
 )
 ~~~
 
@@ -283,14 +271,14 @@ Remote commands use the ubuntu account.
 The launcher appends to each node's local ledger. It does not hold a shared
 cross-host lock. One global operator must allocate every range.
 
-The production-ledger participant set is c1, c2, c3, c5, and c6. c4 does not
-generate or claim game seeds. Freeze all production allocation and launches
-from the first pull until every redistributed hash matches. Before a wave:
+The production-ledger participant set is all eight H100 hosts: `c1`-`c6`,
+`h100-8a`, and `h100-8b`. Freeze all production allocation and launches from
+the first pull until every redistributed hash matches. Before a wave:
 
 1. Pull the ledger from every production generation node.
 2. Merge the copies.
 3. Inspect every reported overlap.
-4. Atomically distribute one byte-identical canonical ledger to those five nodes.
+4. Atomically distribute one byte-identical canonical ledger to all eight nodes.
 5. Allocate all ranges from one next-safe value.
 
 Fail-closed pull, merge, next-safe calculation, and distribution:
@@ -302,9 +290,9 @@ export FLEET_CONF="$HOME/.catan_fleet.conf"
 export LOCAL_PY="$PWD/.venv/bin/python"
 source tools/fleet/fleet_lib.sh
 
-GEN_ALIASES=(c1 c2 c3 c5 c6)
+GEN_ALIASES=(c1 c2 c3 c4 c5 c6 h100-8a h100-8b)
 PRIVATE_STATE=<private-state>
-LEDGER_REMOTE=/home/ubuntu/catan-zero-v1/runs/SEED_LEDGER.md
+LEDGER_REMOTE=/home/ubuntu/catan-zero-production/SEED_LEDGER.md
 STAMP=$(date -u +%Y%m%dT%H%M%SZ)
 COPY_DIR="$PRIVATE_STATE/ledger-copies/$STAMP"
 CANON="$PRIVATE_STATE/SEED_LEDGER.md"
@@ -355,7 +343,7 @@ for start, end, label in rows:
         raise SystemExit(f"open-ended claim blocks allocation: {label}")
     if start < hi and end > lo:
         raise SystemExit(f"production ledger contains VAL-ONLY overlap [{start},{end}): {label}")
-wave_seeds = 30_000
+wave_seeds = 40_000
 next_safe = max(end for _, end, _ in rows)
 if next_safe < hi and next_safe + wave_seeds > lo:
     next_safe = hi
@@ -383,107 +371,55 @@ done
 sync_seed_ledger reports overlaps between different claim IDs but does not fail
 for them. Treat any new overlap as fatal. Quarantine the affected data.
 
-With 1,500 games/GPU and four GPUs, each generation box consumes 6,000 seeds.
-For next-safe seed B, the standard layout is:
-
-| Box | Role | Base | Half-open range |
-|---|---|---:|---|
-| c1 | volume | B | [B, B+6000) |
-| c2 | teacher | B+6000 | [B+6000, B+12000) |
-| c3 | teacher | B+12000 | [B+12000, B+18000) |
-| c5 | volume | B+18000 | [B+18000, B+24000) |
-| c6 | teacher | B+24000 | [B+24000, B+30000) |
-
-c4 remains the training/control node in this layout.
-
-After each --go attempt, pull, merge, inspect, and redistribute the updated
-ledger before another operator can allocate seeds. A claim remains consumed
-after a guard failure, crash, or partial wave. Never delete it or reuse its base.
+Do not hand-derive per-box ranges. The sealed contract owns 40 disjoint
+1,000-seed worker blocks and render emits the exact three category claims for
+each physical GPU. Append all 120 rendered rows to the canonical prefix, check
+the resulting ledger, and redistribute the same bytes to all eight hosts before
+any `--go` attempt. A claim remains consumed after a guard failure, crash, or
+partial wave. Never delete it or reuse its base; resume only through the exact
+executor receipt and lane state.
 
 ## 10. Launch a production wave
 
-Set local controls:
+Use the A1 executor, not `fleet_launch.sh`. Its host manifest is private and
+must map exactly `c1`-`c6`, `h100-8a`, and `h100-8b` to the production SSH
+endpoints and expected remote repository/runtime paths.
 
 ~~~bash
 cd <verified-local-checkout>
-test -x .venv/bin/python
-test -f tools/fleet/fleet_launch.sh
-
-export FLEET_CONF="$HOME/.catan_fleet.conf"
-export REMOTE_PY=/home/ubuntu/catan-zero-v1/.venv/bin/python
-export LOCAL_PY="$PWD/.venv/bin/python"
-export CKPT=/home/ubuntu/bundle/champion_v0.pt
-export LEDGER=/home/ubuntu/catan-zero-v1/runs/SEED_LEDGER.md
-
-tools/fleet/fleet_status.sh all
-tools/fleet/fleet_stop.sh <alias>
+python tools/fleet/a1_production_executor.py run \
+  --lock <immutable-a1-lock.json> \
+  --render <immutable-a1-render.json> \
+  --hosts <private-a1-hosts.json> \
+  --receipt <fresh-executor-receipt.json>
 ~~~
 
-fleet_stop.sh is a dry run without --go.
+The command above is a read-only dry run. Verify the lock, render, host set,
+120 jobs/claims, remote commit/checkpoint/ledger hashes, and both canary-shape
+evidence. Repeat exactly with `--go` to stage and start all 40 lanes. Use
+`--resume --go` only for the same lock/render/host set and receipt after an
+interruption; it resumes exact incomplete jobs and never skips guards.
 
-Run each launch once without --go. Inspect the plan. Repeat the same command
-with --go, one box at a time:
-
-~~~bash
-B=<authoritative-next-safe-seed>
-
-PY="$REMOTE_PY" GEN_PY="$REMOTE_PY" \
-  tools/fleet/fleet_launch.sh c1 volume \
-  --base-seed "$B" --gpus 0-3 --games 1500 --wave <wave>
-
-PY="$REMOTE_PY" GEN_PY="$REMOTE_PY" \
-  tools/fleet/fleet_launch.sh c2 teacher \
-  --base-seed "$((B + 6000))" --gpus 0-3 --games 1500 --wave <wave>
-
-PY="$REMOTE_PY" GEN_PY="$REMOTE_PY" \
-  tools/fleet/fleet_launch.sh c3 teacher \
-  --base-seed "$((B + 12000))" --gpus 0-3 --games 1500 --wave <wave>
-
-PY="$REMOTE_PY" GEN_PY="$REMOTE_PY" \
-  tools/fleet/fleet_launch.sh c5 volume \
-  --base-seed "$((B + 18000))" --gpus 0-3 --games 1500 --wave <wave>
-
-PY="$REMOTE_PY" GEN_PY="$REMOTE_PY" \
-  tools/fleet/fleet_launch.sh c6 teacher \
-  --base-seed "$((B + 24000))" --gpus 0-3 --games 1500 --wave <wave>
-~~~
-
-Add --go only after each dry run passes.
-
-The default GPU selection is 0-3. An eight-GPU canary requires --gpus 0-7.
-Do not pass --mps.
-
-The generator guards run inside the detached per-GPU children. A zero launcher
-exit does not prove that every child survived. Record the printed claim ID and
-OUT path, then inspect status, heartbeat, and every GPU log.
+The detached lane supervisors execute `current_producer`, `recent_history`,
+then `hard_negative` sequentially on each GPU. A zero executor exit is not
+postflight acceptance; monitor all lanes and require the immutable output audit
+before corpus construction.
 
 ## 11. Monitor and stop
 
-After each launch:
+Monitor the exact sealed lanes:
 
 ~~~bash
-tools/fleet/fleet_status.sh <alias>
-tools/fleet/fleet_stop.sh <alias>
+python tools/fleet/a1_production_executor.py status \
+  --lock <immutable-a1-lock.json> \
+  --render <immutable-a1-render.json> \
+  --hosts <private-a1-hosts.json> \
+  --receipt <executor-receipt.json>
 ~~~
 
-The second command stays in dry-run mode and should identify one intended
-detached Catan group.
-
-Inspect a claim on its node:
-
-~~~bash
-source tools/fleet/fleet_lib.sh
-ALIAS=<alias>
-CLAIM=<claim-id>
-
-ssh -i "$(fleet_key)" ubuntu@"$(fleet_host "$ALIAS")" \
-  "cd /home/ubuntu/catan-zero-v1 && \
-   source tools/fleet/launch_detached.sh && \
-   heartbeat_status /home/ubuntu/fleet_runs/$CLAIM 60 && \
-   tail -40 /home/ubuntu/gen_out/$CLAIM/gpu0/run.log"
-~~~
-
-Inspect all gpu0 through gpu3 logs, not only gpu0.
+Also inspect the Grafana fleet dashboard, exporter freshness, GPU activity,
+rows/simulations, MPS health, disk capacity, and every lane's current job. On
+four-GPU hosts inspect GPUs 0-3; on eight-GPU hosts inspect GPUs 0-7.
 
 Normal stop:
 
@@ -493,89 +429,30 @@ tools/fleet/fleet_stop.sh <alias> --go
 tools/fleet/fleet_status.sh <alias>
 ~~~
 
-Do not use pkill -f. If canonical stop fails, do not relaunch. Resolve the exact
-PGID/PIDs that it reports, rerun canonical stop, and verify idle memory.
+Do not use `pkill -f`. If canonical stop fails, do not relaunch. Resolve the
+exact PGID/PIDs that it reports, rerun canonical stop, and verify idle memory.
+Stopping does not release claims; continue only with the A1 executor's exact
+resume transaction.
 
 ## 12. Accept generation before harvest
 
-Each GPU output must contain:
+Run the sealed contract's post-wave audit over all 120 job roots. The audit,
+not a generic teacher/volume profile, is the binding acceptance boundary. It
+must reproduce the lock and runtime-tree hashes, all exact claims, source and
+checkpoint identities, and the global n128/n_fast16/p_full.25 config with
+adaptive budget disabled.
 
-~~~text
-~/gen_out/<claim>/gpuN/
-  run.log
-  manifest.json
-  worker_000/
-    manifest.json
-    progress.json
-    gumbel_self_play_shard_00000.npz
-~~~
+Accept exactly the lowest-seed complete 240/45/15 games per physical GPU for
+current/recent/hard-negative sources: 12,000 complete unique games total.
+Reserve, truncated, incomplete, and unselected attempts must be absent from
+metrics, holdout, and training. Require zero invalid teacher actions, no
+VAL-ONLY or duplicate seeds, public-observation masking, nonempty rows, all
+listed shard hashes present, and passing phase/decision/legal-width/entropy/
+full-search-mass diagnostics.
 
-For every gpuN manifest, require:
-
-- games_completed equals games_requested;
-- games_failed equals 0;
-- errors is empty;
-- rows is greater than 0;
-- every listed shard exists;
-- track is 2p_no_trade and vps_to_win is 10;
-- cli_args.ledger_claim_label equals the recorded claim ID;
-- base_seed and the distinct shard game_seed values exactly cover this GPU's
-  allocated half-open range;
-- a fresh SHA-256 of the checkpoint path still equals the champion SHA-256
-  recorded before launch;
-- role settings match Section 6;
-- public observation, Rust features, corrected chance spectra, and lazy chance
-  are enabled;
-- precision is highest, cache is 0, and local fallback is off.
-
-The generator can exit zero when some workers fail. Manifest reconciliation is
-binding.
-
-Run the independent Gumbel audit from the checkout on each generation node,
-once for every gpuN root:
-
-~~~bash
-cd /home/ubuntu/catan-zero-v1
-export REMOTE_PY=/home/ubuntu/catan-zero-v1/.venv/bin/python
-GPU_BASE=<allocated-base-for-this-gpu>
-GAMES=1500  # use 384 for the real-champion capacity canary
-GPU_END=$((GPU_BASE + GAMES))
-EXPECTED_CONFIG='{"track":"2p_no_trade","vps_to_win":10,"c_visit":50.0,"c_scale":0.03,"n_full":128,"n_fast":16,"p_full":1.0,"max_decisions":600,"max_depth":80,"shard_size":512,"format":"npz","public_observation":true,"rust_featurize":true,"correct_rust_chance_spectra":true,"lazy_interior_chance":true,"eval_server":true,"eval_server_max_batch":96,"eval_server_max_wait_ms":0.0,"eval_server_request_collector":true,"eval_server_local_fallback":false,"eval_server_matmul_precision":"highest","eval_cache_size":0}'
-
-$REMOTE_PY tools/audit_gumbel_pilot_shards.py \
-  --shards-dir /home/ubuntu/gen_out/<claim>/gpuN \
-  --vps-to-win 10 \
-  --p-full 1.0 \
-  --colors RED,BLUE \
-  --expected-config "$EXPECTED_CONFIG" \
-  --expected-seed-range "$GPU_BASE,$GPU_END" \
-  --out /home/ubuntu/gen_out/<claim>/gpuN/audit.json
-~~~
-
-For volume data, change n_full to 64, p_full to 0.25, shard_size to 2048,
-eval_server_max_batch to 64, and eval_server_request_collector to false. Keep
-the remaining expected fields binding.
-
-Set truncation and diversity acceptance thresholds before generation. The
-Gumbel audit defaults to a 0.40 truncation threshold. The synthetic smoke hit
-14/16 truncated games, so it cannot define a production threshold.
-
-The generic teacher quality report is an optional bounded diagnostic. Run it
-on one worker leaf at a time on the source node, never on a full production
-harvest:
-
-~~~bash
-$REMOTE_PY tools/report_teacher_data_quality.py \
-  --data /home/ubuntu/gen_out/<claim>/gpuN/worker_NNN \
-  --track 2p_no_trade \
-  --vps-to-win 10 \
-  --out /home/ubuntu/gen_out/<claim>/gpuN/worker_NNN/quality.json
-~~~
-
-Its strict and production 35M profiles target an older AB/JSettlers mixture.
-Do not apply those profiles to Gumbel data without defining a compatible
-Gumbel policy. It materializes NPZ rows in memory and is not a scalable
-aggregate gate.
+The audit emits immutable selected-game and validation-seed sidecars. Corpus
+construction must bind those sidecars and the passing shard inventory; merely
+finding NPZ files or observing zero process exit is not acceptance.
 
 ## 13. Harvest and reconcile
 
@@ -603,7 +480,7 @@ Before corpus build:
 3. Confirm no canary path appears.
 4. Compare every harvested worker leaf with its already accepted remote worker
    manifest; rsync preserves remote absolute paths inside JSON.
-5. Preserve teacher and volume roots as separate declared sources.
+5. Preserve current/recent/hard-negative roots as separate declared sources.
 6. Save the harvest inventory, source-list, and QA report hashes.
 
 Do not run the Gumbel audit against the relocated harvest; it was intentionally
@@ -613,7 +490,17 @@ absolute-path fallback resolves each shard basename inside that leaf.
 
 ## 14. Build and accept the memmap corpus
 
-The active H100 experiment compares role-pure n128 teacher and n64 volume data
+For A1, follow the selected-game bridge in
+`docs/plans/RL_ARCHITECTURE_SCALE_PROBE_20260709.md`: invoke
+`tools/build_memmap_corpus.py` with both the immutable
+`--selected-game-seed-manifest` and passing `--a1-post-wave-audit`. The builder
+must reproduce the exact 12,000-game selected set and validation sidecar. Do
+not use `wave1_harvest.sh build-teacher`, `build-volume`, or `build-pooled` for
+the A1 dose.
+
+### Historical role-pure corpus procedure (not A1)
+
+The prior H100 experiment compared role-pure n128 teacher and n64 volume data
 engines at equal GPU-hours. Build and train those corpora separately first:
 
 ~~~bash
@@ -680,7 +567,7 @@ $REMOTE_PY tools/corpus_diversity_scan.py \
 
 The diversity scan has no binding threshold and can encode an error in JSON
 while returning zero. Inspect the report. It materializes rows and builds Python
-sets, so do not point it at the full 24-H100 harvest. Aggregate the bounded
+sets, so do not point it at the full 40-H100 harvest. Aggregate the bounded
 report metrics in the wave record; scalable aggregate diversity QA remains a
 known gap.
 
@@ -689,6 +576,13 @@ There is no single production Gumbel QA command behind
 wave record before training.
 
 ## 15. Train the canonical 35M control
+
+For A1, use only `tools/a1_one_dose_train.py` as documented in
+`docs/A1_ONE_DOSE_TRAINING.md`. It verifies the sealed contract, selected-game
+corpus, immutable validation sidecar, and exact one-B200 scalar recipe before
+rendering or executing `train_bc`.
+
+### Historical four-H100 DDP control (not A1)
 
 Stage the accepted corpus on c4 under an immutable path:
 

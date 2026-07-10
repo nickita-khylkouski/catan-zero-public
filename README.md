@@ -2,10 +2,10 @@
 
 This repository consolidates the Catan-Zero source, development history,
 planning documents, and external reviews. The original import came from one
-B200 and two now-retired A100 hosts. The current fleet is 24 H100s across six
-four-GPU nodes, an eight-H100 canary, and a two-B200 evaluation hub; FLEET.md is
-the live inventory. Project #1 goal: build the strongest Catan agent under the
-benchmark below.
+B200 and two now-retired A100 hosts. The production data fleet is 40 H100s:
+six four-GPU nodes plus two eight-GPU nodes. A separate two-B200 host is the
+evaluation/orchestration hub; FLEET.md is the live inventory. Project #1 goal:
+build the strongest Catan agent under the benchmark below.
 
 ## Hard rule
 
@@ -37,9 +37,10 @@ downstream of it. Land the fix, land the test, then generate.
   they could be lost to reprovisioning, kept on separate `rescue/untracked-*`
   branches rather than merged into `master`; see `rescue/README.md`.
 - Task tracking: Linear workspace, team **Catan**.
-- Live GPU aliases are `c1` through `c6`, `h100-canary`, and `b200`. Host IPs
-  live only in the uncommitted `$FLEET_CONF`; see FLEET.md. The retired A100
-  names below describe repository history, not active compute.
+- Production H100 aliases are `c1` through `c6`, `h100-8a`, and `h100-8b`.
+  B200 control-plane aliases are separate. Host IPs live only in the
+  uncommitted `$FLEET_CONF`; see FLEET.md. The retired A100 names below
+  describe repository history, not active compute.
 
 ## Branches
 

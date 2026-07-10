@@ -1,14 +1,12 @@
 # A1 pre-wave R&D draft
 
-Status: **near-final and deliberately unsealable**. This file materializes only
+Status: **fully resolved and deliberately unsealed**. This file materializes only
 choices already supported by the local plans and immutable evidence. It does
 not seal or render a contract, create output directories, allocate production
-seeds, or launch generation. The checked-in JSON currently has 13 unresolved
-fields: the remaining binding S1/S3 search decisions and the synchronized fleet seed
-base/ledger. There is also one **conditional pre-seal action** outside that
-placeholder count: if typed S1 selects `c_scale=0.1` or `0.3`, the static
-generation guard must be synchronized and provenance-stamped before runtime
-hashes are frozen. A `c_scale=0.03` selection requires no guard mutation.
+seeds, or launch generation. The checked-in JSON has no unresolved fields.
+Typed S1 selected `c_scale=0.03`, so the static generation guard remains
+pristine and requires no synchronization mutation. The S2/S3 paths point to
+typed operator-binding artifacts that must exist and replay before sealing.
 
 ## Resolved bindings
 
@@ -24,13 +22,15 @@ hashes are frozen. A `c_scale=0.03` selection requires no guard mutation.
   that it was promoted.
 - The production regime is two-player/no-trade at 10 VP with public-observation
   masking. The operator fixed global `n_full=128` for A1 on 2026-07-09; no n64
-  arm and no global n196 arm are authorized. `p_full=0.25`, `n_fast=16`, lazy interior chance, corrected Rust
+  arm and no global n196 arm are authorized. Typed S1 retained `c_scale=0.03`,
+  disabled D1 rescaling, calibrated `sigma_eval=0.98`, and enabled D6 averaging
+  from legal width 20. `p_full=0.25`, `n_fast=16`, lazy interior chance, corrected Rust
   chance spectra, and `max_decisions=600` are fixed. Exact-budget sequential
   halving, late temperature, belief spectra, uncertainty, raw-policy fallback,
   Rust featurization, and eval-server generation are off.
 - The shared output parent is
-  `/home/ubuntu/catan-zero/runs/selfplay`. The renderer owns the child layout
-  `/home/ubuntu/catan-zero/runs/selfplay/a1-fresh-mixed-12000games/<job_id>`.
+  `/home/ubuntu/catan-zero-production/runs/selfplay`. The renderer owns the child layout
+  `/home/ubuntu/catan-zero-production/runs/selfplay/a1-fresh-mixed-12000games/<job_id>`.
   This path choice is operational only; no directory has been created.
 
 ## Exact learner dose
@@ -109,9 +109,9 @@ time of inspection:
 
 | local file/value | SHA-256 |
 |---|---|
-| `a1_pre_wave_contract.rnd_draft.json` | `eec43bd10cba7f2ae39dfb6c625959399061f4e42d0267a9bde2ed72acdb79a5` |
+| `a1_pre_wave_contract.rnd_draft.json` | `70ab44116b9b7533fe659ee0a35a1b69ee6273e87e7b69cc8047d5210e5c9704` |
 | `a1_pre_wave_contract.template.json` | `bcaad7de4bc325ab0a404aacbd08d76c7361918f4d596291787be861ddcc8515` |
-| `tools/a1_pre_wave_contract.py` | `f7358aef3590f17bcef89595f7c0811cac058d505b28d759ad04d3247b6167ce` |
+| `tools/a1_pre_wave_contract.py` | `14ae98f121d3dbf689595a786663d48bfa3628dde2f1a11d885b960579147e0a` |
 | `tools/build_memmap_corpus.py` | `c21f4a304aee19944f3882af1bd72ada7c6d8822f31a09b0d3950317987ffbec` |
 | `tools/train_bc.py` | `9d787d516f6cab65a4e15a1f6a4557df04a92c958dfcb52dfbce10431aca12b0` |
 | canonical learner recipe | `1be1a29e44f1742e33bbff8798365a8ef2563438e2b4864160f2180308154655` |
@@ -121,28 +121,13 @@ time of inspection:
 ```json
 {
   "schema_version": "a1-pre-wave-contract-draft-v2",
-  "unresolved": [
-    "$.science.search.c_scale",
-    "$.science.search.n_full_wide",
-    "$.science.search.n_full_wide_threshold",
-    "$.science.search.wide_roots_always_full",
-    "$.science.search.symmetry_averaged_eval",
-    "$.science.search.symmetry_averaged_eval_threshold",
-    "$.science.search.rescale_noise_floor_c",
-    "$.science.search.sigma_eval",
-    "$.science.evidence[1].path",
-    "$.science.evidence[2].path",
-    "$.science.evidence[3].path",
-    "$.fleet.seed_base",
-    "$.fleet.seed_ledger"
-  ]
+  "unresolved": []
 }
 ```
 
-Before sealing, replace only those placeholders from replayable typed S1/S3
-adjudicator envelopes and a synchronized production seed ledger. Do not infer a
-search choice from defaults or informal probe output, and do not fabricate a
-seed allocation from the stale R&D-host ledger.
+Before sealing, emit the typed operator-binding artifacts at the declared
+paths. They preserve the distinction between an operator choice and
+experimental strength evidence.
 
 After the typed S1 path and S1-selected search fields are in the draft, run:
 

@@ -56,6 +56,8 @@ from tools.seed_fleet_planner import assert_disjoint_seed_blocks  # noqa: E402
 DRAFT_SCHEMA = "a1-pre-wave-contract-draft-v2"
 LOCK_SCHEMA = "a1-pre-wave-contract-lock-v2"
 RENDER_SCHEMA = "a1-pre-wave-render-v2"
+MPS_PIPE_DIRECTORY = "/tmp/mps_pipe_host"
+MPS_LOG_DIRECTORY = "/tmp/mps_log_host"
 AUDIT_SCHEMA = "a1-post-wave-audit-v2"
 GUARD_SYNC_SCHEMA = "a1-pre-wave-generation-guard-sync-v1"
 GUARD_SYNC_KEY = "a1_pre_wave_guard_sync"
@@ -2749,6 +2751,7 @@ def _generator_argv(
         _bool_flag("--rust-featurize", bool(evaluator["rust_featurize"])),
         _bool_flag("--eval-server", bool(generation["eval_server"])),
         "--seed-claim",
+        "--resume",
     ]
     optional = (
         ("--n-full-wide", search["n_full_wide"]),
@@ -2848,6 +2851,8 @@ def render(lock_path: Path, out_dir: Path) -> dict[str, Any]:
                 "category": job["category"],
                 "environment": {
                     "CUDA_VISIBLE_DEVICES": str(job["gpu"]),
+                    "CUDA_MPS_PIPE_DIRECTORY": MPS_PIPE_DIRECTORY,
+                    "CUDA_MPS_LOG_DIRECTORY": MPS_LOG_DIRECTORY,
                     "CATAN_SEED_LEDGER": lock["fleet"]["seed_ledger"]["path"],
                     "CATAN_A1_CONTRACT_SHA256": lock["contract_sha256"],
                 },

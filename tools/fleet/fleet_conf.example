@@ -9,7 +9,8 @@ declare -A HOST=(
   [c4]=REPLACE_ME_c4_ip
   [c5]=REPLACE_ME_c5_ip
   [c6]=REPLACE_ME_c6_ip
-  [h100-canary]=REPLACE_ME_h100_canary_ip
+  [h100-8a]=REPLACE_ME_h100_8a_ip
+  [h100-8b]=REPLACE_ME_h100_8b_ip
   [b200]=REPLACE_ME_b200_ip
 )
 
@@ -21,6 +22,9 @@ declare -A DIRS=(
   [c1]="/home/ubuntu/gen_out/REPLACE_ME_c1_claim"
   [c2]="/home/ubuntu/gen_out/REPLACE_ME_c2_claim"
   [c3]="/home/ubuntu/gen_out/REPLACE_ME_c3_claim"
+  [c4]="/home/ubuntu/gen_out/REPLACE_ME_c4_claim"
   [c5]="/home/ubuntu/gen_out/REPLACE_ME_c5_claim"
   [c6]="/home/ubuntu/gen_out/REPLACE_ME_c6_claim"
+  [h100-8a]="/home/ubuntu/gen_out/REPLACE_ME_h100_8a_claim"
+  [h100-8b]="/home/ubuntu/gen_out/REPLACE_ME_h100_8b_claim"
 )

@@ -6,7 +6,7 @@ gate, alter `public_champion`, or deploy checkpoint bytes to the fleet.
 
 ## Preconditions
 
-- The sealed `a1-pre-wave-contract-lock-v2` verifies with all 72 job claims and
+- The sealed `a1-pre-wave-contract-lock-v2` verifies with all 120 job claims and
   selects global `n_full=128` with no adaptive alternate budget. Global n64,
   n196, and adaptive/global n256 are refused for this wave.
 - A typed `a1-promotion-adjudication-v1` has `passed=true`,

@@ -7,23 +7,31 @@
 > The end-to-end RL operator transaction is in `RL_AGENT_HANDOFF.md`.
 
 ## 1. Box inventory (aliases + stable roles)
-Fleet is consolidated to **H100 + B200 only** (24× H100 across 6 boxes, NVLink,
-homogeneous INTEL Xeon hosts). The prior A100 pool (`a100a`, `a100b`) and the
-older `a100-legacy` box are **RETIRED** — decommissioned from the active fleet;
-any useful data on them was salvaged separately before retirement. Do not
-launch new work there, and drop any lingering A100 entries from your local
+Fleet is consolidated to **H100 + B200 only**. The production data lane has
+**40 H100s across eight boxes**: six four-GPU nodes and two eight-GPU nodes,
+all with NVLink/NVSwitch. The prior A100 pool (`a100a`, `a100b`) and the older
+`a100-legacy` box are **RETIRED** — decommissioned from the active fleet; any
+useful data on them was salvaged separately before retirement. Do not launch
+new work there, and drop any lingering A100 entries from your local
 `$FLEET_CONF`.
 
 | Alias | Hardware | Typical role |
 |---|---|---|
-| c1 | 4× H100 (NVLink) | volume gen (n64, p0.25) |
-| c2 | 4× H100 | teacher gen (n128, p1.0) |
-| c3 | 4× H100 | teacher gen (n128, p1.0) |
-| c4 | 4× H100 | control / training (DDP/FSDP) |
-| c5 | 4× H100 | volume gen (n64, p0.25) |
-| c6 | 4× H100 | teacher gen (n128, p1.0) |
-| h100-canary | 8× H100 (NVSwitch) | validation/performance lab; outside the 24 production H100s |
+| c1 | 4× H100 (NVLink) | A1 generation |
+| c2 | 4× H100 (NVLink) | A1 generation |
+| c3 | 4× H100 (NVLink) | A1 generation |
+| c4 | 4× H100 (NVLink) | A1 generation |
+| c5 | 4× H100 (NVLink) | A1 generation |
+| c6 | 4× H100 (NVLink) | A1 generation |
+| h100-8a | 8× H100 (NVSwitch) | A1 generation; eight-GPU shape canary first |
+| h100-8b | 8× H100 (NVSwitch) | A1 generation |
 | b200 | 2× B200 | eval + orchestration hub (gates, Grafana, banking) |
+
+The current A1 search decision is uniform across all 40 H100s:
+`n_full=128`, `n_fast=16`, and `p_full=0.25`. There is no n64 production arm
+and no adaptive or blanket n196/n256 budget in this wave. Source categories are
+rendered as separate deterministic jobs from the sealed A1 contract; the box
+table is not a teacher/volume role split.
 
 ## 2. Fleet config (`$FLEET_CONF`) — the IP boundary
 - `FLEET_CONF="${FLEET_CONF:-$HOME/.catan_fleet.conf}"`, a **bash file that is sourced** (not JSON), **uncommitted / gitignored**.
@@ -83,30 +91,45 @@ launch new work there, and drop any lingering A100 entries from your local
 
 ## 7. Launch / stop / status (CAT-122 / CAT-123) — one canonical path
 Interpreter is auto-resolved (`$GEN_PY` → `~/venv/bin/python` → `<tree>/.venv/bin/python`); never a bare `torchrun`/`python3` (loads system numpy<2, crashes champion load — CAT-128) and never a hardcoded `.venv` (stranded a GPU — CAT-123). Hosts via `fleet_lib.sh` (§2).
-- **Launch** (the old `fire_*.sh` and `mps_rollout.sh` paths were removed): `tools/fleet/fleet_launch.sh <alias> <role> --base-seed N [--gpus 0-3] [--go]` — `role ∈ {teacher, volume, train}`; `--base-seed` REQUIRED for gen roles (fresh, ledgered); **default DRY-RUN** (prints plan), `--go` to fire. Generation uses one strict-FP32 EvalServer per GPU, Rust features, cache off, immediate queue drain, GPU-local CPU affinity, and fail-fast clients. The canonical n128 production shape (≤4 selected GPUs) uses **128 workers/GPU, request collector on, max batch 96, wait 0 ms, `matmul_precision=highest`, cache 0, no MPS**; an all-8 canary launch defaults to 64 workers/GPU to preserve the same total host concurrency. Volume retains its separate 48/32 worker, batch64, collector-off recipe. MPS is diagnostic only. The detached runner survives SSH teardown. A zero launcher exit does not attest every child; reconcile manifests before harvest.
+- **A1 launch:** seal and verify the pre-wave contract, render its exact 120
+  category/GPU jobs, synchronize all 120 ledger claims to every production
+  host, then use `tools/fleet/a1_production_executor.py`. It is dry-run by
+  default; `--go` is the only execution boundary. The executor runs one
+  category at a time per GPU under a detached resumable lane supervisor. Do
+  not substitute the generic role launcher for A1.
+- **A1 runtime:** one generator per physical GPU, 16 workers/GPU,
+  systemd-managed MPS, EvalServer off, strict FP32, public-observation masking,
+  `n_full=128`, `n_fast=16`, `p_full=0.25`, `c_scale=0.03`, D1 rescaling off,
+  and D6 averaging from legal width 20. `n_full_wide` and its threshold are
+  unset and `wide_roots_always_full=false`: adaptive n256 is disabled.
+- **Generic launcher:** `tools/fleet/fleet_launch.sh` remains useful for bounded
+  diagnostics and historical role-shaped experiments, but it is not the A1
+  production transaction. A zero launcher or executor exit does not attest
+  every child; verify receipts, manifests, and postflight audit before harvest.
 - **Stop**: `tools/fleet/fleet_stop.sh <alias|all> [--go]` — **default DRY-RUN**; terminates validated `launch_detached` process groups (so MPS-hidden clients and grandchildren cannot escape), retains explicit compute-PID fallback, PRESERVES MPS/observability, and fails unless owned groups, MPS clients, and non-infrastructure GPU PIDs are gone. Idle memory must be ≤50 MiB without MPS or ≤128 MiB for the measured 78 MiB/GPU preserved MPS-server baseline on driver 580.105.08.
 - **Status**: `tools/fleet/fleet_status.sh [alias|all]` — read-only, parallel; per-box util/mem, inferred role, MPS on/off, matching job-process count.
 - **Harvest → corpus**: `tools/wave1_harvest.sh {harvest-all|build-teacher|build-volume}` (parallel rsync + ControlMaster; reads `$FLEET_CONF`). Populate `DIRS` from accepted claim paths and reconcile harvested counts against remote manifests before a role-pure build. `build-pooled` is experiment-only after a predeclared mixture decision.
 - **Ops rule (CAT-123):** one operator per box; always post-verify a single clean gen set after any change (`fleet_status.sh <box>` + `fleet_stop.sh <box>` dry-run).
 
-### n128 teacher throughput lock (2026-07-09)
+### Historical n128 EvalServer throughput lock (2026-07-09)
 
 At w48, wait `0/0.05/0.1/0.25 ms` measured
 `72.26/70.54/70.04/71.07k` rows/hour/GPU, locking wait 0. Before the collector
 fix, workers `48/64/80/96` measured `68.07/74.41/74.65/75.98k`; with the fixed
 collector enabled, four w96 repetitions averaged **81.93k**.
 
-The final synthetic-checkpoint frontier measured **91.85k rows/hour/GPU** for
+The synthetic-checkpoint frontier measured **91.85k rows/hour/GPU** for
 the canonical w128/batch96/collector recipe, about **37% above** the earlier
 ~67k w48 teacher baseline. Across 24 H100s this projects to approximately
 **2.20M rows/hour**. Supporting paired results were w96 **83.42k** versus w128
 **89.57k** (+7.4%), then batch64 **90.50k** versus batch96 **91.85k** (+1.5%)
 at w128.
 
-These are throughput-only results from a synthetic same-shape masked 35M
-checkpoint. Repeat the final recipe with the real masked champion before
-treating the projection as production capacity. TF32 remains rejected after
-same-seed trajectory divergence; `matmul_precision=highest` is mandatory.
+These are preserved throughput-only results from the historical 24-H100
+EvalServer experiment with a synthetic same-shape masked 35M checkpoint. They
+are not the 40-H100 A1 runtime recipe and must not be multiplied to claim A1
+capacity. TF32 remains rejected after same-seed trajectory divergence;
+`matmul_precision=highest` is mandatory.
 
 ## 8. Bring up a new box
 1. Add its `[alias]=<ip>` to your local `$FLEET_CONF` (uncommitted).

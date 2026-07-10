@@ -621,6 +621,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--format", choices=("npz", "npz_zst"), default="npz")
     parser.add_argument(
+        "--resume",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Authorize an executor-managed retry only after the entire incomplete "
+            "job directory was atomically quarantined. Worker shards are never "
+            "incrementally reused; a completed top-level manifest is never rerun."
+        ),
+    )
+    parser.add_argument(
         "--score-actions",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -817,9 +827,14 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     output = Path(args.out_dir)
     output.mkdir(parents=True, exist_ok=True)
-    if any(output.glob("worker_*")) or (output / "manifest.json").exists():
+    if (output / "manifest.json").exists():
         raise SystemExit(
-            f"{output} already contains self-play output; use a fresh --out-dir"
+            f"{output} already has a completed manifest; completed seeds are immutable"
+        )
+    if any(output.glob("worker_*")):
+        raise SystemExit(
+            f"{output} contains partial worker output; atomically quarantine the "
+            "entire job directory before exact replay (incremental worker resume is unsafe)"
         )
 
     if args.seed_claim:
@@ -844,6 +859,11 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "games": worker_games,
                 "game_index_start": game_index_start,
                 "out_dir": str(output / f"worker_{worker_index:03d}"),
+                # A1 retries replay the exact job from a fresh directory after
+                # forensic quarantine; never preserve a shard that may contain
+                # a prefix of the next unconfirmed game.
+                "resume": False,
+                "run_id": generate_config_hash,
                 "checkpoint": args.checkpoint,
                 "device": args.device,
                 "n_full": int(args.n_full),
@@ -1422,6 +1442,8 @@ def _run_worker(
         evaluator=evaluator,
         shard_size=int(worker_args["shard_size"]),
         fmt=str(worker_args["format"]),
+        resume=bool(worker_args.get("resume", False)),
+        run_id=str(worker_args.get("run_id", "")),
         opponent_pool=opponent_pool,
         opponent_mix=opponent_mix,
     )
