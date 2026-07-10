@@ -74,19 +74,30 @@ def _load_frozen_plan(
     receipt_path: Path,
 ) -> dict[str, Any]:
     """Build the plan with no current-checkout modules in the interpreter."""
-    script = r'''import importlib.util,json,pathlib,sys
+    script = r'''import json,pathlib,sys
 root=pathlib.Path(sys.argv[1]).resolve(strict=True)
 executor_path=(root/'tools/fleet/a1_production_executor.py').resolve(strict=True)
-sys.path.insert(0,str(root))
-spec=importlib.util.spec_from_file_location('_a1_frozen_executor',executor_path)
-if spec is None or spec.loader is None: raise SystemExit('cannot load frozen executor spec')
-module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+from tools.fleet import a1_production_executor as module
+if pathlib.Path(module.__file__).resolve(strict=True)!=executor_path: raise SystemExit(f'frozen executor import leaked to {module.__file__}')
 plan=module.build_plan(lock_path=pathlib.Path(sys.argv[2]),render_path=pathlib.Path(sys.argv[3]),hosts_path=pathlib.Path(sys.argv[4]),receipt_path=pathlib.Path(sys.argv[5]))
 print(json.dumps(plan,sort_keys=True,separators=(',',':')))'''
+    environment = os.environ.copy()
+    for name in (
+        "PYTHONHOME",
+        "PYTHONSAFEPATH",
+        "PYTHONSTARTUP",
+        "PYTHONUSERBASE",
+    ):
+        environment.pop(name, None)
+    environment.update(
+        {
+            "PYTHONPATH": f"{frozen_repo / 'src'}:{frozen_repo}",
+            "PYTHONDONTWRITEBYTECODE": "1",
+        }
+    )
     result = subprocess.run(
         [
             sys.executable,
-            "-I",
             "-c",
             script,
             str(frozen_repo),
@@ -99,6 +110,7 @@ print(json.dumps(plan,sort_keys=True,separators=(',',':')))'''
         capture_output=True,
         check=False,
         cwd=frozen_repo,
+        env=environment,
     )
     if result.returncode != 0:
         detail = (result.stderr or result.stdout).strip()

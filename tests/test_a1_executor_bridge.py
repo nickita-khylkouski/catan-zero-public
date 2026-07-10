@@ -43,6 +43,9 @@ def test_frozen_plan_bridge_preserves_public_plan_and_binds_both_executors(
 ) -> None:
     original = _plan()
     root = _frozen_repo(tmp_path, original)
+    monkeypatch.setenv("PYTHONPATH", str(Path(executor.__file__).resolve().parents[2]))
+    monkeypatch.setenv("PYTHONHOME", "/invalid/hardened-python-home")
+    monkeypatch.setenv("PYTHONSAFEPATH", "1")
     monkeypatch.setattr(executor, "build_plan", lambda **_kwargs: original)
     frozen_executor = root / "tools/fleet/a1_production_executor.py"
     result = bridge.build_bridged_plan(
