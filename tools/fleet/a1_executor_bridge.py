@@ -98,6 +98,7 @@ print(json.dumps(plan,sort_keys=True,separators=(',',':')))'''
         text=True,
         capture_output=True,
         check=False,
+        cwd=frozen_repo,
     )
     if result.returncode != 0:
         detail = (result.stderr or result.stdout).strip()

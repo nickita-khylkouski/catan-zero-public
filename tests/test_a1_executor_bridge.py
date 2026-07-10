@@ -27,9 +27,12 @@ def _frozen_repo(tmp_path: Path, plan: dict) -> Path:
     source = root / "tools/fleet/a1_production_executor.py"
     source.parent.mkdir(parents=True)
     source.write_text(
-        "import json\n"
+        "import json, pathlib\n"
         f"PLAN = json.loads({json.dumps(json.dumps(plan))})\n"
-        "def build_plan(**_kwargs): return PLAN\n",
+        "ROOT = pathlib.Path(__file__).resolve().parents[2]\n"
+        "def build_plan(**_kwargs):\n"
+        "    if pathlib.Path.cwd().resolve() != ROOT: raise RuntimeError('wrong frozen cwd')\n"
+        "    return PLAN\n",
         encoding="utf-8",
     )
     return root
