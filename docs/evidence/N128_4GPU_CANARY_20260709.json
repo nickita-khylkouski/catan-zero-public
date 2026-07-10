@@ -1,0 +1,77 @@
+{
+  "schema_version": "n128-4gpu-canary-v1",
+  "purpose": "end_to_end_generation_and_independent_audit_only",
+  "train_admissible": false,
+  "train_admissibility_reason": "VAL-ONLY seeds and generic teacher p_full=1.0; this evidence proves runtime generation, not the sealed A1 corpus recipe",
+  "source_commit": "729df889f400274963eeaef290d4388aeca61527",
+  "source_tag": "v1.1-rl-pipeline",
+  "checkpoint_sha256": "89aa133d629e747021bc725f2ad63e0563f3b76e71f0dd563f056c6de8f77ebb",
+  "hardware": {
+    "node_count": 1,
+    "gpu_count": 4,
+    "gpu_model": "NVIDIA H100 80GB HBM3"
+  },
+  "recipe": {
+    "n_full": 128,
+    "n_fast": 16,
+    "p_full": 1.0,
+    "c_visit": 50.0,
+    "c_scale": 0.03,
+    "workers_per_gpu": 4,
+    "eval_server": true,
+    "eval_server_matmul_precision": "highest",
+    "public_observation": true,
+    "shard_size": 32
+  },
+  "totals": {
+    "games_completed": 16,
+    "rows": 4087,
+    "simulations_used": 242729,
+    "shards": 135,
+    "games_failed": 0,
+    "games_truncated": 0,
+    "independent_audits_passed": 4
+  },
+  "gpu_results": [
+    {
+      "gpu": 0,
+      "seed_range": [6198000000, 6198000004],
+      "rows": 900,
+      "simulations_used": 54540,
+      "elapsed_sec": 253.8781324929878,
+      "shards": 30,
+      "manifest_sha256": "bfbc89e18509b5d4ac5f4c35e66c95b0efd63880b23b02289305f969b4070e5f",
+      "audit_sha256": "6eab14313851ca6431a842593562feece6c352f6eb3d1bb5064bf3beb7add0c2"
+    },
+    {
+      "gpu": 1,
+      "seed_range": [6198000004, 6198000008],
+      "rows": 1011,
+      "simulations_used": 61320,
+      "elapsed_sec": 183.81744674401125,
+      "shards": 34,
+      "manifest_sha256": "09b3baf34367683343ed2719851dfe94995e570e61ec56b92ab128cdfa47d49a",
+      "audit_sha256": "1efea46abbddca90976632b794cca5ad851335dafe450aa9b362fd67a29a33fa"
+    },
+    {
+      "gpu": 2,
+      "seed_range": [6198000008, 6198000012],
+      "rows": 964,
+      "simulations_used": 59751,
+      "elapsed_sec": 197.2734603889985,
+      "shards": 32,
+      "manifest_sha256": "2235e5196ca75d34561a50c72f0739a148b7a9fb64ea66f43d537bff6809ab4e",
+      "audit_sha256": "d74221b52aa84440e3625fbc77e12d0537557d5b6f359513169d679b4bfb102f"
+    },
+    {
+      "gpu": 3,
+      "seed_range": [6198000012, 6198000016],
+      "rows": 1212,
+      "simulations_used": 67118,
+      "elapsed_sec": 219.91321781399893,
+      "shards": 39,
+      "manifest_sha256": "fe30b61475a12835ebc9a0ddf61c2846e94a70beeaf3b3e821146ab2dadc185b",
+      "audit_sha256": "90d57867e384668d5f961fc9236c15c7d3391f4519ee7a671b02ee09be0dff82"
+    }
+  ]
+}
