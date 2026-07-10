@@ -104,6 +104,7 @@ def test_release_environment_and_toolchain_are_sealed() -> None:
         "cargo 1.96.1 (356927216 2026-06-26)",
         "maturin 1.14.1",
         "Python 3.11.15",
+        "GNU strip (GNU Binutils for Ubuntu) 2.38",
     ):
         assert version in script
 
@@ -141,6 +142,8 @@ def test_builder_emits_a_complete_machine_readable_receipt() -> None:
         "cargo_version",
         "maturin_version",
         "python_version",
+        "strip_version",
+        "elf_normalization",
         "canonical_build_root",
         "compile_identity",
         "source_date_epoch",

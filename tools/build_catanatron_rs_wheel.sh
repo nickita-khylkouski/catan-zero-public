@@ -129,11 +129,13 @@ command -v "$PYTHON_BIN" >/dev/null 2>&1 || {
   echo "Python interpreter not found: $PYTHON_BIN" >&2
   exit 1
 }
+command -v strip >/dev/null 2>&1 || die "GNU strip is required"
 
 RUSTC_VERSION="$(rustc --version)"
 CARGO_VERSION="$(cargo --version)"
 MATURIN_VERSION="$(maturin --version)"
 PYTHON_VERSION="$("$PYTHON_BIN" --version 2>&1)"
+STRIP_VERSION="$(strip --version | head -n 1)"
 [ "$RUSTC_VERSION" = "rustc 1.96.1 (31fca3adb 2026-06-26)" ] \
   || die "unexpected rustc: $RUSTC_VERSION"
 [ "$CARGO_VERSION" = "cargo 1.96.1 (356927216 2026-06-26)" ] \
@@ -142,6 +144,8 @@ PYTHON_VERSION="$("$PYTHON_BIN" --version 2>&1)"
   || die "unexpected maturin: $MATURIN_VERSION"
 [ "$PYTHON_VERSION" = "Python 3.11.15" ] \
   || die "unexpected Python: $PYTHON_VERSION"
+[ "$STRIP_VERSION" = "GNU strip (GNU Binutils for Ubuntu) 2.38" ] \
+  || die "unexpected strip: $STRIP_VERSION"
 
 echo "source_commit=<bound-after-build>"
 echo "source_tree=<bound-after-build>"
@@ -150,6 +154,7 @@ echo "$RUSTC_VERSION"
 echo "$CARGO_VERSION"
 echo "$MATURIN_VERSION"
 echo "$PYTHON_VERSION"
+echo "$STRIP_VERSION"
 
 mkdir -p "$OUT_DIR"
 rm -f "$OUT_DIR"/catanatron_rs-0.1.4-*.whl
@@ -168,6 +173,80 @@ maturin build \
 
 WHEEL_PATH="$OUT_DIR/$WHEEL_NAME"
 [ -f "$WHEEL_PATH" ] || die "expected wheel was not produced: $WHEEL_PATH"
+
+# ThinLTO emits process/source-dependent `.llvm.<number>` names only in the
+# non-runtime ELF symbol/string tables. GNU strip removes those tables and the
+# resulting shared object is byte-identical across the observed variants. Then
+# rebuild the wheel in stable path order with a fresh standards-compliant
+# RECORD and fixed ZIP metadata. Runtime/loadable sections are unchanged.
+NORMALIZE_TMP="$(mktemp -d "${TMPDIR:-/tmp}/catan-rs-wheel-normalize.XXXXXXXX")"
+trap 'rm -rf -- "$NORMALIZE_TMP"' EXIT
+"$PYTHON_BIN" - "$WHEEL_PATH" "$NORMALIZE_TMP" <<'PY'
+import pathlib
+import sys
+import zipfile
+
+wheel = pathlib.Path(sys.argv[1])
+root = pathlib.Path(sys.argv[2])
+with zipfile.ZipFile(wheel) as archive:
+    for name in archive.namelist():
+        path = pathlib.PurePosixPath(name)
+        if path.is_absolute() or ".." in path.parts:
+            raise SystemExit(f"unsafe wheel member: {name}")
+    archive.extractall(root)
+PY
+mapfile -t SHARED_OBJECTS < <(find "$NORMALIZE_TMP" -type f -name '*.so' -print)
+[ "${#SHARED_OBJECTS[@]}" -eq 1 ] \
+  || die "expected exactly one shared object in wheel, found ${#SHARED_OBJECTS[@]}"
+strip --strip-unneeded "${SHARED_OBJECTS[0]}"
+"$PYTHON_BIN" - "$WHEEL_PATH" "$NORMALIZE_TMP" "$SOURCE_DATE_EPOCH" <<'PY'
+import base64
+import csv
+import hashlib
+import io
+import os
+import pathlib
+import sys
+import time
+import zipfile
+
+wheel = pathlib.Path(sys.argv[1])
+root = pathlib.Path(sys.argv[2])
+epoch = int(sys.argv[3])
+files = sorted(path for path in root.rglob("*") if path.is_file())
+records = [path for path in files if path.as_posix().endswith(".dist-info/RECORD")]
+if len(records) != 1:
+    raise SystemExit(f"expected one RECORD, found {len(records)}")
+record = records[0]
+rows: list[list[str]] = []
+for path in files:
+    relative = path.relative_to(root).as_posix()
+    if path == record:
+        continue
+    data = path.read_bytes()
+    digest = base64.urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(b"=").decode()
+    rows.append([relative, f"sha256={digest}", str(len(data))])
+rows.append([record.relative_to(root).as_posix(), "", ""])
+buffer = io.StringIO(newline="")
+csv.writer(buffer, lineterminator="\n").writerows(rows)
+record.write_text(buffer.getvalue(), encoding="utf-8")
+
+normalized = wheel.with_name(f".{wheel.name}.normalized-{os.getpid()}")
+timestamp = time.gmtime(epoch)[:6]
+with zipfile.ZipFile(
+    normalized, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9
+) as archive:
+    for path in sorted(path for path in root.rglob("*") if path.is_file()):
+        relative = path.relative_to(root).as_posix()
+        info = zipfile.ZipInfo(relative, date_time=timestamp)
+        info.create_system = 3
+        info.compress_type = zipfile.ZIP_DEFLATED
+        mode = 0o755 if path.suffix == ".so" else 0o644
+        info.external_attr = mode << 16
+        archive.writestr(info, path.read_bytes(), compress_type=zipfile.ZIP_DEFLATED, compresslevel=9)
+os.replace(normalized, wheel)
+PY
+
 WHEEL_SHA256="$(sha256sum "$WHEEL_PATH" | awk '{print $1}')"
 BUILDER_SHA256="$(sha256sum "$ROOT/tools/build_catanatron_rs_wheel.sh" | awk '{print $1}')"
 CARGO_LOCK_SHA256="$(sha256sum "$ROOT/native/catanatron-rs/Cargo.lock" | awk '{print $1}')"
@@ -189,6 +268,8 @@ receipt = {
     "cargo_version": "$CARGO_VERSION",
     "maturin_version": "$MATURIN_VERSION",
     "python_version": "$PYTHON_VERSION",
+    "strip_version": "$STRIP_VERSION",
+    "elf_normalization": "strip--strip-unneeded+deterministic-wheel-v1",
     "canonical_build_root": "$ROOT",
     "compile_identity": "$SEALED_COMPILE_IDENTITY",
     "source_date_epoch": int("$SOURCE_DATE_EPOCH"),
