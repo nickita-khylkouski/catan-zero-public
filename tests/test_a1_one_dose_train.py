@@ -217,6 +217,104 @@ def test_command_is_direct_one_b200_fresh_unfused_adam(tmp_path: Path) -> None:
     assert "--p-full" not in command  # generation choice remains contract-bound.
 
 
+def _gpu_query_runner(
+    *,
+    identity: str = "NVIDIA B200, Default, 0\n",
+    processes: str = "",
+):
+    def run(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess:
+        output = processes if "--query-compute-apps=" in " ".join(command) else identity
+        return subprocess.CompletedProcess(command, 0, stdout=output, stderr="")
+
+    return run
+
+
+def test_b200_preflight_accepts_idle_default_or_exclusive_process() -> None:
+    assert executor._probe_b200(
+        0, runner=_gpu_query_runner(), mps_probe=lambda: []
+    ) == "NVIDIA B200"
+    assert executor._probe_b200(
+        7,
+        runner=_gpu_query_runner(identity="NVIDIA B200, Exclusive Process, 16\n"),
+        mps_probe=lambda: [],
+    ) == "NVIDIA B200"
+
+
+@pytest.mark.parametrize(
+    ("identity", "processes", "match"),
+    [
+        ("NVIDIA H100, Default, 0\n", "", "not exactly one B200"),
+        ("NVIDIA B200, Prohibited, 0\n", "", "unsafe compute mode"),
+        ("NVIDIA B200, Default, 65\n", "", "not idle"),
+        ("NVIDIA B200, Default, N/A\n", "", "unparseable memory"),
+        ("NVIDIA B200, Default, 0\n", "123, python, 1024\n", "compute process"),
+    ],
+)
+def test_b200_preflight_rejects_unsafe_or_occupied_gpu(
+    identity: str, processes: str, match: str
+) -> None:
+    with pytest.raises(executor.ExecutorError, match=match):
+        executor._probe_b200(
+            0,
+            runner=_gpu_query_runner(identity=identity, processes=processes),
+            mps_probe=lambda: [],
+        )
+
+
+def test_b200_preflight_rejects_manual_or_service_managed_mps() -> None:
+    with pytest.raises(executor.ExecutorError, match="CUDA MPS is active"):
+        executor._probe_b200(
+            0,
+            runner=_gpu_query_runner(),
+            mps_probe=lambda: ["pid=123 executable=nvidia-cuda-mps-control"],
+        )
+
+
+def test_mps_process_scan_reads_exact_executable_names(tmp_path: Path) -> None:
+    for pid, command in {
+        "101": b"/usr/bin/nvidia-cuda-mps-control\0-f\0",
+        "102": b"/usr/bin/nvidia-cuda-mps-server\0",
+        "103": b"python3\0worker.py\0",
+    }.items():
+        process = tmp_path / pid
+        process.mkdir()
+        (process / "cmdline").write_bytes(command)
+    (tmp_path / "not-a-pid").mkdir()
+
+    assert executor._active_mps_processes(tmp_path) == [
+        "pid=101 executable=nvidia-cuda-mps-control",
+        "pid=102 executable=nvidia-cuda-mps-server",
+    ]
+
+
+def test_hardware_refusal_does_not_consume_sealed_dose(tmp_path: Path) -> None:
+    verified = _verified(tmp_path)
+    claim = executor._claim_path(verified)
+    runner_called = False
+
+    def runner(*_args, **_kwargs):
+        nonlocal runner_called
+        runner_called = True
+        return subprocess.CompletedProcess([], 0)
+
+    with pytest.raises(executor.ExecutorError, match="occupied"):
+        executor.execute(
+            verified=verified,
+            command=[sys.executable, "train_bc.py"],
+            checkpoint=tmp_path / "candidate.pt",
+            report=tmp_path / "report.json",
+            receipt=tmp_path / "receipt.json",
+            gpu=0,
+            runner=runner,
+            probe=lambda _gpu: (_ for _ in ()).throw(
+                executor.ExecutorError("occupied B200")
+            ),
+        )
+
+    assert runner_called is False
+    assert not claim.exists()
+
+
 def test_verification_replays_lock_payload_and_validation_chain(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

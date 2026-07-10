@@ -39,6 +39,11 @@ RECEIPT_SCHEMA = "a1-one-dose-training-receipt-v2"
 CLAIM_SCHEMA = "a1-one-dose-training-claim-v2"
 CLAIM_DIRECTORY = ".a1-one-dose-training-claims"
 MIN_NOFILE = 65_536
+MAX_IDLE_GPU_MEMORY_MIB = 64
+ACCEPTABLE_COMPUTE_MODES = frozenset({"DEFAULT", "EXCLUSIVE_PROCESS"})
+MPS_EXECUTABLES = frozenset(
+    {"nvidia-cuda-mps-control", "nvidia-cuda-mps-server"}
+)
 
 
 class ExecutorError(RuntimeError):
@@ -370,15 +375,56 @@ def build_train_command(
     return command
 
 
-def _probe_b200(gpu: int) -> str:
+def _active_mps_processes(proc_root: Path = Path("/proc")) -> list[str]:
+    """Return live CUDA MPS control/server processes without invoking a shell."""
+
+    found: list[str] = []
     try:
-        result = subprocess.run(
+        entries = list(proc_root.iterdir())
+    except OSError as error:
+        raise ExecutorError(f"cannot inspect process table for CUDA MPS: {error}") from error
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            raw = (entry / "cmdline").read_bytes()
+        except (FileNotFoundError, ProcessLookupError):
+            # Processes can exit while /proc is being traversed. A process whose
+            # directory disappears during the scan no longer threatens the run.
+            continue
+        except PermissionError as error:
+            raise ExecutorError(
+                f"cannot prove process {entry.name} is not CUDA MPS: {error}"
+            ) from error
+        except OSError as error:
+            raise ExecutorError(
+                f"cannot inspect process {entry.name} for CUDA MPS: {error}"
+            ) from error
+        argv = [part.decode("utf-8", errors="replace") for part in raw.split(b"\0") if part]
+        if not argv:
+            continue
+        executable = Path(argv[0]).name
+        if executable in MPS_EXECUTABLES:
+            found.append(f"pid={entry.name} executable={executable}")
+    return sorted(found)
+
+
+def _probe_b200(
+    gpu: int,
+    *,
+    runner: Callable[..., subprocess.CompletedProcess[Any]] = subprocess.run,
+    mps_probe: Callable[[], list[str]] = _active_mps_processes,
+) -> str:
+    """Fail closed unless ``gpu`` is one idle, directly-owned B200."""
+
+    try:
+        result = runner(
             [
                 "nvidia-smi",
                 "-i",
                 str(gpu),
-                "--query-gpu=name",
-                "--format=csv,noheader",
+                "--query-gpu=name,compute_mode,memory.used",
+                "--format=csv,noheader,nounits",
             ],
             check=True,
             text=True,
@@ -386,10 +432,62 @@ def _probe_b200(gpu: int) -> str:
         )
     except (OSError, subprocess.CalledProcessError) as error:
         raise ExecutorError(f"cannot verify selected B200 GPU {gpu}: {error}") from error
-    names = [line.strip() for line in result.stdout.splitlines() if line.strip()]
-    if len(names) != 1 or "B200" not in names[0].upper():
-        raise ExecutorError(f"selected GPU {gpu} is not exactly one B200: {names}")
-    return names[0]
+    rows = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if len(rows) != 1:
+        raise ExecutorError(f"selected GPU {gpu} query returned {len(rows)} rows: {rows}")
+    fields = [field.strip() for field in rows[0].split(",")]
+    if len(fields) != 3:
+        raise ExecutorError(f"selected GPU {gpu} query is malformed: {rows[0]!r}")
+    name, compute_mode_raw, memory_used_raw = fields
+    if "B200" not in name.upper():
+        raise ExecutorError(f"selected GPU {gpu} is not exactly one B200: {name!r}")
+    compute_mode = compute_mode_raw.upper().replace("-", "_").replace(" ", "_")
+    if compute_mode not in ACCEPTABLE_COMPUTE_MODES:
+        raise ExecutorError(
+            f"selected B200 GPU {gpu} has unsafe compute mode {compute_mode_raw!r}; "
+            f"expected Default or Exclusive Process"
+        )
+    try:
+        memory_used_mib = int(memory_used_raw)
+    except ValueError as error:
+        raise ExecutorError(
+            f"selected B200 GPU {gpu} has unparseable memory usage {memory_used_raw!r}"
+        ) from error
+    if memory_used_mib < 0 or memory_used_mib > MAX_IDLE_GPU_MEMORY_MIB:
+        raise ExecutorError(
+            f"selected B200 GPU {gpu} is not idle: memory.used={memory_used_mib} MiB "
+            f"(maximum idle allowance {MAX_IDLE_GPU_MEMORY_MIB} MiB)"
+        )
+
+    try:
+        processes = runner(
+            [
+                "nvidia-smi",
+                "-i",
+                str(gpu),
+                "--query-compute-apps=pid,process_name,used_gpu_memory",
+                "--format=csv,noheader,nounits",
+            ],
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+        mps_processes = mps_probe()
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise ExecutorError(f"cannot prove selected B200 GPU {gpu} is idle: {error}") from error
+    compute_processes = [
+        line.strip() for line in processes.stdout.splitlines() if line.strip()
+    ]
+    if compute_processes:
+        raise ExecutorError(
+            f"selected B200 GPU {gpu} has active compute process(es): {compute_processes}"
+        )
+    if mps_processes:
+        raise ExecutorError(
+            "CUDA MPS is active; the sealed one-B200 learner requires direct exclusive "
+            f"ownership: {mps_processes}"
+        )
+    return name
 
 
 def _raise_nofile_limit() -> None:
@@ -714,6 +812,9 @@ def execute(
 
     claim = _claim_path(verified)
     _require_fresh_outputs(checkpoint, report, receipt, claim=claim)
+    # Hardware refusal must precede the durable one-dose claim. Occupancy or an
+    # MPS daemon is an operational precondition failure, not a consumed dose.
+    gpu_name = probe(gpu)
     started_ns = time.time_ns()
     claim_payload = {
         "schema_version": CLAIM_SCHEMA,
@@ -727,9 +828,7 @@ def execute(
     returncode: int | None = None
     output_artifacts: dict[str, Any] | None = None
     failure: str | None = None
-    gpu_name = ""
     try:
-        gpu_name = probe(gpu)
         _mkdir_durable(checkpoint.parent)
         _mkdir_durable(report.parent)
         _mkdir_durable(receipt.parent)
