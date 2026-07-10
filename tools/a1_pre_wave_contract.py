@@ -1915,7 +1915,16 @@ def _validate_search_stage_evidence(
             f"adjudication manifest, found {len(manifest_candidates)}"
         )
     try:
-        replayed = search_adjudicator.adjudicate(manifest_candidates[0])
+        replayed = (
+            operator_binding._replay_s1(path)
+            if expected_stage == "s1"
+            else search_adjudicator.adjudicate(manifest_candidates[0])
+        )
+    except operator_binding.BindingError as error:
+        raise ContractError(
+            f"{expected_stage.upper()} evidence does not equal the replayed adjudication: "
+            f"{error}"
+        ) from error
     except search_adjudicator.AdjudicationError as error:
         raise ContractError(
             f"{expected_stage.upper()} evidence failed semantic replay: {error}"

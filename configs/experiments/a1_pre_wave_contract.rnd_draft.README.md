@@ -111,7 +111,7 @@ time of inspection:
 |---|---|
 | `a1_pre_wave_contract.rnd_draft.json` | `70ab44116b9b7533fe659ee0a35a1b69ee6273e87e7b69cc8047d5210e5c9704` |
 | `a1_pre_wave_contract.template.json` | `bcaad7de4bc325ab0a404aacbd08d76c7361918f4d596291787be861ddcc8515` |
-| `tools/a1_pre_wave_contract.py` | `14ae98f121d3dbf689595a786663d48bfa3628dde2f1a11d885b960579147e0a` |
+| `tools/a1_pre_wave_contract.py` | `d65da92b724199f9cc290e4fbb23d36a26e9158186f74e95567e4922ac7a5173` |
 | `tools/build_memmap_corpus.py` | `c21f4a304aee19944f3882af1bd72ada7c6d8822f31a09b0d3950317987ffbec` |
 | `tools/train_bc.py` | `9d787d516f6cab65a4e15a1f6a4557df04a92c958dfcb52dfbce10431aca12b0` |
 | canonical learner recipe | `1be1a29e44f1742e33bbff8798365a8ef2563438e2b4864160f2180308154655` |
