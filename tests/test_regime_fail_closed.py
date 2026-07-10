@@ -410,14 +410,19 @@ def test_belief_chance_spectra_dispatches_to_belief_robber_not_true_hand(monkeyp
         pytest.skip("no MOVE_ROBBER-with-nonempty-victim node found in probe rollouts")
     game, _action_json = robber
 
-    belief_calls: list[Any] = []
+    belief_calls: list[tuple[Any, str | None]] = []
     true_calls: list[Any] = []
     real_belief = gcm.belief_move_robber_outcome_weights
     real_true = gcm.move_robber_victim_outcome_weights
 
-    def _belief_spy(g, aj, *, cached_spectrum=None):
-        belief_calls.append(aj)
-        return real_belief(g, aj, cached_spectrum=cached_spectrum)
+    def _belief_spy(g, aj, *, cached_spectrum=None, perspective=None):
+        belief_calls.append((aj, perspective))
+        return real_belief(
+            g,
+            aj,
+            cached_spectrum=cached_spectrum,
+            perspective=perspective,
+        )
 
     def _true_spy(g, aj, *, cached_spectrum=None):
         true_calls.append(aj)
@@ -440,6 +445,7 @@ def test_belief_chance_spectra_dispatches_to_belief_robber_not_true_hand(monkeyp
     mcts._traverse_robber_or_dev(node, action_id, stats, depth=0)
 
     assert belief_calls, "belief_chance_spectra=True must dispatch to belief_move_robber_outcome_weights"
+    assert {perspective for _action, perspective in belief_calls} == {node.root_color}
     assert not true_calls, "belief_chance_spectra=True must NOT also consult the true-hand-weighted path"
 
 
@@ -453,12 +459,17 @@ def test_belief_chance_spectra_off_never_calls_belief_robber(monkeypatch):
         pytest.skip("no MOVE_ROBBER-with-nonempty-victim node found in probe rollouts")
     game, _action_json = robber
 
-    belief_calls: list[Any] = []
+    belief_calls: list[tuple[Any, str | None]] = []
     real_belief = gcm.belief_move_robber_outcome_weights
 
-    def _belief_spy(g, aj, *, cached_spectrum=None):
-        belief_calls.append(aj)
-        return real_belief(g, aj, cached_spectrum=cached_spectrum)
+    def _belief_spy(g, aj, *, cached_spectrum=None, perspective=None):
+        belief_calls.append((aj, perspective))
+        return real_belief(
+            g,
+            aj,
+            cached_spectrum=cached_spectrum,
+            perspective=perspective,
+        )
 
     monkeypatch.setattr(gcm, "belief_move_robber_outcome_weights", _belief_spy)
 
@@ -488,14 +499,19 @@ def test_belief_chance_spectra_dispatches_to_belief_dev_deck_not_true_deck(monke
         pytest.skip("no BUY_DEVELOPMENT_CARD node found in probe rollouts")
     game, _action_json = buy_dev
 
-    belief_calls: list[Any] = []
+    belief_calls: list[tuple[Any, str | None]] = []
     true_calls: list[Any] = []
     real_belief = gcm.belief_buy_development_card_outcomes
     real_true = gcm.buy_development_card_real_outcomes
 
-    def _belief_spy(g, aj, *, cached_spectrum=None):
-        belief_calls.append(aj)
-        return real_belief(g, aj, cached_spectrum=cached_spectrum)
+    def _belief_spy(g, aj, *, cached_spectrum=None, perspective=None):
+        belief_calls.append((aj, perspective))
+        return real_belief(
+            g,
+            aj,
+            cached_spectrum=cached_spectrum,
+            perspective=perspective,
+        )
 
     def _true_spy(g, aj, *, cached_spectrum=None):
         true_calls.append(aj)
@@ -518,4 +534,5 @@ def test_belief_chance_spectra_dispatches_to_belief_dev_deck_not_true_deck(monke
     mcts._traverse_robber_or_dev(node, action_id, stats, depth=0)
 
     assert belief_calls, "belief_chance_spectra=True must dispatch to belief_buy_development_card_outcomes"
+    assert {perspective for _action, perspective in belief_calls} == {node.root_color}
     assert not true_calls, "belief_chance_spectra=True must NOT also consult the true-remaining-deck path"
