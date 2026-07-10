@@ -115,6 +115,36 @@ def test_external_plan_uses_matched_candidate_champion_cohorts(tmp_path: Path) -
     assert by_role["candidate"][-1][1] == 6_191_000_500
 
 
+def test_canary_scope_uses_every_gpu_on_one_four_and_one_eight_gpu_host(
+    tmp_path: Path,
+) -> None:
+    manifest, full = _plan(tmp_path)
+    canary = fleet.build_plan(
+        manifest,
+        candidate=Path(full["candidate"]["source"]),
+        champion=Path(full["champion"]["source"]),
+        internal_pairs=24,
+        external_pairs=12,
+        internal_base_seed=6_192_000_000,
+        external_base_seed=6_192_001_000,
+        workers_per_gpu=2,
+        iteration_id="a1-canary",
+        scope="canary",
+        repo_commit="a" * 40,
+        tool_hashes=full["tool_hashes"],
+    )
+    assert canary["scope"] == "canary"
+    assert len(canary["jobs"]) == 24
+    for phase in ("internal", "external"):
+        jobs = [job for job in canary["jobs"] if job["phase"] == phase]
+        assert len(jobs) == 12
+        assert {job["alias"] for job in jobs} == {"c1", "h100-8a"}
+        assert {(job["alias"], job["gpu"]) for job in jobs} == {
+            *(("c1", gpu) for gpu in range(4)),
+            *(("h100-8a", gpu) for gpu in range(8)),
+        }
+
+
 def test_every_job_is_cuda_pinned_and_has_exact_n128_infoset_d6_recipe(
     tmp_path: Path,
 ) -> None:
@@ -150,6 +180,11 @@ def test_every_job_is_cuda_pinned_and_has_exact_n128_infoset_d6_recipe(
     for gpu in range(8):
         assert f"CUDA_VISIBLE_DEVICES={gpu}" in all_shell
     assert "B200" not in all_shell
+    assert "query-compute-apps=process_name" in all_shell
+    assert "nvidia-cuda-mps-server" in all_shell
+    assert "memory.used" in all_shell
+    assert "PYTHONPATH=" in all_shell
+    assert "/home/ubuntu/catan-zero-v1/src" in all_shell
 
 
 def test_plan_hash_and_checkpoint_bytes_are_replayed_on_load(tmp_path: Path) -> None:

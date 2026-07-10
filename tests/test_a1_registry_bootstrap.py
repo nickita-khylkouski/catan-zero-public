@@ -106,8 +106,9 @@ def test_commit_publishes_roles_pool_pointer_and_receipt_once(tmp_path: Path) ->
     assert len(registry.opponent_pool()) == 2
     assert pointer.read_text() == str(incumbent.resolve()) + "\n"
     assert receipt_path.stat().st_mode & 0o222 == 0
-    with pytest.raises(bootstrap.BootstrapError, match="non-fresh"):
-        bootstrap.commit(plan)
+    journal = Path(plan["destinations"]["prepared_journal"])
+    assert journal.is_file() and journal.stat().st_mode & 0o222 == 0
+    assert bootstrap.commit(plan) == receipt
 
 
 def test_refuses_nonproducer_incumbent_and_report_drift(tmp_path: Path) -> None:
@@ -146,4 +147,147 @@ def test_refuses_preexisting_destination(tmp_path: Path) -> None:
             receipt_path=tmp_path / "receipt.json",
             incumbent=incumbent,
             verify_lock_fn=_verify(lock),
+        )
+
+
+def test_commit_resumes_after_hard_kill_between_registry_and_pointer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lock, lock_path, incumbent = _fixture(tmp_path)
+    registry = tmp_path / "registry.json"
+    pointer = tmp_path / "CURRENT_CHAMPION"
+    receipt = tmp_path / "bootstrap.json"
+    plan = bootstrap.build_plan(
+        lock_path=lock_path,
+        registry_path=registry,
+        pointer_path=pointer,
+        receipt_path=receipt,
+        incumbent=incumbent,
+        verify_lock_fn=_verify(lock),
+    )
+    original = bootstrap._publish_exact
+
+    def kill_at_pointer(path: Path, payload: bytes, **kwargs) -> None:
+        if path == pointer:
+            raise KeyboardInterrupt("simulated hard kill")
+        original(path, payload, **kwargs)
+
+    monkeypatch.setattr(bootstrap, "_publish_exact", kill_at_pointer)
+    with pytest.raises(KeyboardInterrupt, match="hard kill"):
+        bootstrap.commit(plan)
+    journal = Path(plan["destinations"]["prepared_journal"])
+    assert journal.is_file()
+    assert registry.is_file()
+    assert not pointer.exists() and not receipt.exists()
+
+    monkeypatch.setattr(bootstrap, "_publish_exact", original)
+    committed = bootstrap.commit(plan)
+    assert committed["mode"] == "committed"
+    assert pointer.read_text() == str(incumbent.resolve()) + "\n"
+    assert receipt.is_file()
+
+
+def test_resume_from_prepared_journal_rejects_unknown_partial_bytes(
+    tmp_path: Path,
+) -> None:
+    lock, lock_path, incumbent = _fixture(tmp_path)
+    registry = tmp_path / "registry.json"
+    pointer = tmp_path / "CURRENT_CHAMPION"
+    receipt = tmp_path / "bootstrap.json"
+    plan = bootstrap.build_plan(
+        lock_path=lock_path,
+        registry_path=registry,
+        pointer_path=pointer,
+        receipt_path=receipt,
+        incumbent=incumbent,
+        verify_lock_fn=_verify(lock),
+    )
+    journal = bootstrap._journal_payload(plan)
+    journal_path = Path(plan["destinations"]["prepared_journal"])
+    bootstrap._write_exclusive(
+        journal_path,
+        json.dumps(journal, indent=2, sort_keys=True).encode() + b"\n",
+        mode=0o444,
+    )
+    pointer.write_text("attacker-controlled\n", encoding="utf-8")
+    pointer.chmod(0o600)
+
+    with pytest.raises(bootstrap.BootstrapError, match="differs from prepared bytes"):
+        bootstrap.commit(plan)
+    assert pointer.read_text() == "attacker-controlled\n"
+    assert not receipt.exists()
+
+
+def test_commit_resumes_after_hard_kill_before_committed_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lock, lock_path, incumbent = _fixture(tmp_path)
+    registry = tmp_path / "registry.json"
+    pointer = tmp_path / "CURRENT_CHAMPION"
+    receipt = tmp_path / "bootstrap.json"
+    plan = bootstrap.build_plan(
+        lock_path=lock_path,
+        registry_path=registry,
+        pointer_path=pointer,
+        receipt_path=receipt,
+        incumbent=incumbent,
+        verify_lock_fn=_verify(lock),
+    )
+    original = bootstrap._publish_exact
+
+    def kill_at_receipt(path: Path, payload: bytes, **kwargs) -> None:
+        if path == receipt:
+            raise KeyboardInterrupt("simulated receipt kill")
+        original(path, payload, **kwargs)
+
+    monkeypatch.setattr(bootstrap, "_publish_exact", kill_at_receipt)
+    with pytest.raises(KeyboardInterrupt, match="receipt kill"):
+        bootstrap.commit(plan)
+    assert registry.is_file() and pointer.is_file()
+    assert not receipt.exists()
+
+    monkeypatch.setattr(bootstrap, "_publish_exact", original)
+    committed = bootstrap.commit(plan)
+    assert committed["mode"] == "committed"
+    assert receipt.is_file()
+
+
+def test_resume_plan_from_journal_binds_original_arguments(tmp_path: Path) -> None:
+    lock, lock_path, incumbent = _fixture(tmp_path)
+    registry = tmp_path / "registry.json"
+    pointer = tmp_path / "CURRENT_CHAMPION"
+    receipt = tmp_path / "bootstrap.json"
+    plan = bootstrap.build_plan(
+        lock_path=lock_path,
+        registry_path=registry,
+        pointer_path=pointer,
+        receipt_path=receipt,
+        incumbent=incumbent,
+        verify_lock_fn=_verify(lock),
+    )
+    journal = bootstrap._journal_payload(plan)
+    journal_path = Path(plan["destinations"]["prepared_journal"])
+    bootstrap._write_exclusive(
+        journal_path,
+        json.dumps(journal, indent=2, sort_keys=True).encode() + b"\n",
+        mode=0o444,
+    )
+
+    resumed = bootstrap._resume_plan_from_journal(
+        journal_path,
+        lock_path=lock_path,
+        registry_path=registry,
+        pointer_path=pointer,
+        receipt_path=receipt,
+        incumbent=incumbent,
+    )
+    assert resumed == plan
+    with pytest.raises(bootstrap.BootstrapError, match="destinations"):
+        bootstrap._resume_plan_from_journal(
+            journal_path,
+            lock_path=lock_path,
+            registry_path=tmp_path / "other.json",
+            pointer_path=pointer,
+            receipt_path=receipt,
+            incumbent=incumbent,
         )

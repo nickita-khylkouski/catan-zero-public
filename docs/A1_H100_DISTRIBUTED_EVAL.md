@@ -14,6 +14,13 @@ determinizations, and D6 averaging from width 20.
 Copy `configs/a1_h100_eval_fleet.example.json` to the gitignored
 `configs/a1_h100_eval_fleet.json` on the B200 and fill private addresses. Then:
 
+Use a separate immutable evaluation clone/worktree on the B200 and every H100;
+do not edit the sealed deployment at `/home/ubuntu/catan-zero-v1`. Point
+`remote_repo` at that evaluation tree and `remote_python` at the sealed venv.
+The controller pins `PYTHONPATH` to the evaluation tree and proves the imported
+`catan_zero` package comes from it, so the venv supplies dependencies without
+silently importing the older sealed source tree.
+
 ```bash
 PY=.venv/bin/python
 CTL=tools/fleet/a1_h100_eval_fleet.py
@@ -37,6 +44,13 @@ $PY "$CTL" --manifest "$M" status --plan /immutable/a1/eval.plan.json \
 $PY "$CTL" --manifest "$M" collect --plan /immutable/a1/eval.plan.json \
   --phase internal --output-dir /immutable/a1/evaluation
 ```
+
+Before the full plan, use `--scope canary` with 24 internal pairs and 12
+external pairs. That exercises every GPU on `c1` (4 GPUs) and `h100-8a` (8
+GPUs), two pairs per internal lane and two matched pairs per external cohort.
+It is a separate immutable plan with separate VAL-only ranges. After both
+canary phases collect cleanly, create the independent `--scope full` 600/500
+plan shown above; never extend or reinterpret the canary plan as the full gate.
 
 Run the external phase the same way after internal H2H. Adjacent GPU lanes run
 candidate and incumbent against `catanatron_value` on identical seed cohorts;

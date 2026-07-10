@@ -36,6 +36,35 @@ gate, alter `public_champion`, or deploy checkpoint bytes to the fleet.
   the adjudicated incumbent, and `CURRENT_CHAMPION` contains that same single
   path.
 
+## One-time A1 registry bootstrap
+
+If no pre-A1 registry was ever persisted, create the A1 lineage only through
+the audited bootstrap. Dry-run first, then repeat with `--go`:
+
+```bash
+python tools/a1_registry_bootstrap.py \
+  --lock /immutable/a1.lock.json \
+  --incumbent /immutable/champion.pt \
+  --registry /private/champion_registry.json \
+  --current-pointer /private/CURRENT_CHAMPION \
+  --receipt /private/receipts/a1-registry-bootstrap.json
+
+python tools/a1_registry_bootstrap.py \
+  --lock /immutable/a1.lock.json \
+  --incumbent /immutable/champion.pt \
+  --registry /private/champion_registry.json \
+  --current-pointer /private/CURRENT_CHAMPION \
+  --receipt /private/receipts/a1-registry-bootstrap.json --go
+```
+
+The tool binds the exact contract producer and its typed historical scalar
+attestation, initializes promotion count zero, and imports only the contract's
+history/hard-negative checkpoints. It durably publishes a read-only prepared
+journal first, deterministic registry/current-pointer bytes second, and the
+committed receipt last. Repeating the identical `--go` command after a hard
+interruption resumes missing exact publications; unknown or drifted partial
+bytes fail closed.
+
 The adjudication has this exact top-level shape (extra keys fail closed):
 
 ```json

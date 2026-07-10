@@ -50,6 +50,7 @@ EXPECTED_SHAPES = {
     "h100-8a": 8,
     "h100-8b": 8,
 }
+CANARY_ALIASES = {"c1", "h100-8a"}
 SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 SAFE_ADDRESS = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.:-]*$")
 
@@ -353,6 +354,7 @@ def build_plan(
     external_base_seed: int,
     workers_per_gpu: int = 8,
     iteration_id: str = "a1",
+    scope: str = "full",
     repo_root: Path = _REPO_ROOT,
     repo_commit: str | None = None,
     tool_hashes: dict[str, str] | None = None,
@@ -365,7 +367,15 @@ def build_plan(
         raise FleetError("candidate and champion checkpoint bytes are identical")
     if workers_per_gpu <= 0:
         raise FleetError("workers_per_gpu must be positive")
-    if internal_pairs < 40 or external_pairs < 20:
+    if scope not in {"canary", "full"}:
+        raise FleetError("scope must be 'canary' or 'full'")
+    all_slots = gpu_slots(manifest)
+    slots = (
+        [slot for slot in all_slots if slot["alias"] in CANARY_ALIASES]
+        if scope == "canary"
+        else all_slots
+    )
+    if internal_pairs < len(slots) or external_pairs < len(slots) // 2:
         raise FleetError(
             "production fleet plan requires at least one pair per internal GPU "
             "and per matched external cohort"
@@ -378,7 +388,6 @@ def build_plan(
     # and adjudication contract; hashes still prove the paths' contents.
     remote_candidate = str(candidate)
     remote_champion = str(champion)
-    slots = gpu_slots(manifest)
     seed_intervals = [
         (internal_base_seed, internal_base_seed + internal_pairs, "internal"),
         (external_base_seed, external_base_seed + external_pairs, "external"),
@@ -405,6 +414,7 @@ def build_plan(
         "internal_base_seed": internal_base_seed,
         "external_base_seed": external_base_seed,
         "iteration_id": iteration_id,
+        "scope": scope,
     }
     run_id = "a1-eval-" + hashlib.sha256(_canonical(run_key)).hexdigest()[:16]
     run_root = f"{root}/runs/{run_id}"
@@ -486,6 +496,7 @@ def build_plan(
         "schema_version": PLAN_SCHEMA,
         "run_id": run_id,
         "iteration_id": iteration_id,
+        "scope": scope,
         "manifest_hash": manifest["manifest_hash"],
         "repo_commit": repo_commit or _git_commit(repo_root),
         "tool_hashes": tool_hashes or _tool_hashes(repo_root),
@@ -583,7 +594,15 @@ def _validate_planned_jobs(plan: dict[str, Any], manifest: dict[str, Any]) -> No
     jobs = plan.get("jobs")
     if not isinstance(jobs, list):
         raise FleetError("evaluation plan jobs must be a list")
-    slots = gpu_slots(manifest)
+    all_slots = gpu_slots(manifest)
+    scope = plan.get("scope")
+    if scope not in {"canary", "full"}:
+        raise FleetError("evaluation plan has an invalid scope")
+    slots = (
+        [slot for slot in all_slots if slot["alias"] in CANARY_ALIASES]
+        if scope == "canary"
+        else all_slots
+    )
     valid_slots = {(slot["alias"], slot["gpu"]): slot for slot in slots}
     job_ids: set[str] = set()
     by_phase: dict[str, list[dict[str, Any]]] = {"internal": [], "external": []}
@@ -603,9 +622,11 @@ def _validate_planned_jobs(plan: dict[str, Any], manifest: dict[str, Any]) -> No
         if job.get("command_hash") != _digest(job.get("argv")):
             raise FleetError(f"evaluation job command hash drift: {job_id}")
         by_phase[job["phase"]].append(job)
-    if len(by_phase["internal"]) != 40 or len(by_phase["external"]) != 40:
+    if len(by_phase["internal"]) != len(slots) or len(by_phase["external"]) != len(
+        slots
+    ):
         raise FleetError(
-            "sealed A1 plan must allocate 40 internal and 40 external jobs"
+            f"sealed A1 {scope} plan must allocate {len(slots)} jobs per phase"
         )
     if {(job["alias"], job["gpu"]) for job in by_phase["internal"]} != set(
         valid_slots
@@ -616,7 +637,7 @@ def _validate_planned_jobs(plan: dict[str, Any], manifest: dict[str, Any]) -> No
     claims = plan.get("pair_claims", {})
     expected_internal = _split_ranges(
         int(claims["internal"]["pairs"]),
-        40,
+        len(slots),
         int(claims["internal"]["base_seed"]),
     )
     internal_by_slot = {(job["alias"], job["gpu"]): job for job in by_phase["internal"]}
@@ -858,13 +879,29 @@ def _preflight_command(
     manifest: dict[str, Any], plan: dict[str, Any], host: dict[str, Any]
 ) -> str:
     repo = shlex.quote(manifest["remote_repo"])
+    pythonpath = manifest["remote_repo"] + "/src:" + manifest["remote_repo"]
+    import_probe = (
+        "from pathlib import Path; import catan_zero; "
+        "assert Path(catan_zero.__file__).resolve().is_relative_to("
+        f"Path({manifest['remote_repo']!r}) / 'src')"
+    )
     lines = [
         "set -euo pipefail",
         f"cd {repo}",
         f'test "$(git rev-parse HEAD)" = {shlex.quote(plan["repo_commit"])}',
         f'test "$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)" -eq {host["gpu_count"]}',
         "test \"$(nvidia-smi --query-gpu=name --format=csv,noheader | grep -vc 'H100')\" -eq 0",
+        # A healthy idle fleet keeps one MPS server attached to every GPU.
+        # Reject every other compute process while allowing that daemon.
+        'test "$(nvidia-smi --query-compute-apps=process_name '
+        "--format=csv,noheader,nounits 2>/dev/null "
+        "| grep -Evc '(^|/)nvidia-cuda-mps-server$' || true)\" -eq 0",
+        'test "$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits '
+        "| awk '$1 > 128 {n++} END {print n+0}')\" -eq 0",
         f"test -x {shlex.quote(manifest['remote_python'])}",
+        f"PYTHONPATH={shlex.quote(pythonpath)} "
+        f"{shlex.quote(manifest['remote_python'])} -c "
+        f"{shlex.quote(import_probe)}",
     ]
     for tool, expected in sorted(plan["tool_hashes"].items()):
         lines.append(
@@ -888,6 +925,7 @@ def _launch_job_command(manifest: dict[str, Any], job: dict[str, Any]) -> str:
         f"env CUDA_VISIBLE_DEVICES={int(job['gpu'])} "
         "CUDA_MPS_PIPE_DIRECTORY=/tmp/mps_pipe_host "
         "CUDA_MPS_LOG_DIRECTORY=/tmp/mps_log_host "
+        f"PYTHONPATH={shlex.quote(manifest['remote_repo'] + '/src:' + manifest['remote_repo'])} "
         f"PYTHONUNBUFFERED=1 {command}; rc=$?; "
         f"printf '%s\\n' \"$rc\" > {shlex.quote(job_dir + '/.rc.tmp')}; "
         f"mv -f {shlex.quote(job_dir + '/.rc.tmp')} {shlex.quote(job_dir + '/.rc')}; "
@@ -1300,6 +1338,7 @@ def _parser() -> argparse.ArgumentParser:
     plan.add_argument("--external-base-seed", type=int, required=True)
     plan.add_argument("--workers-per-gpu", type=int, default=8)
     plan.add_argument("--iteration-id", required=True)
+    plan.add_argument("--scope", choices=("canary", "full"), default="full")
     plan.add_argument("--out", type=Path, required=True)
     for name in ("launch", "resume"):
         operation = commands.add_parser(name)
@@ -1338,6 +1377,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 external_base_seed=args.external_base_seed,
                 workers_per_gpu=args.workers_per_gpu,
                 iteration_id=args.iteration_id,
+                scope=args.scope,
             )
             write_new_readonly(args.out, value)
             result = {

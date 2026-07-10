@@ -25,10 +25,10 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from tools import a1_pre_wave_contract as contract_tool  # noqa: E402
-from tools.champion_registry import ChampionRegistry  # noqa: E402
 
 
 RECEIPT_SCHEMA = "a1-champion-registry-bootstrap-v1"
+JOURNAL_SCHEMA = "a1-champion-registry-bootstrap-journal-v1"
 
 
 class BootstrapError(RuntimeError):
@@ -112,6 +112,7 @@ def build_plan(
     registry = _fresh(registry_path, where="registry")
     pointer = _fresh(pointer_path, where="current pointer")
     receipt = _fresh(receipt_path, where="bootstrap receipt")
+    journal = _fresh(_journal_path(receipt), where="bootstrap prepared journal")
     try:
         lock = verify_lock_fn(lock_path, require_all_job_claims=True)
     except (contract_tool.ContractError, OSError) as error:
@@ -157,6 +158,8 @@ def build_plan(
             "promotion_count": 0,
             "basis": "new_registry_lineage_no_persisted_pre_a1_registry",
         },
+        "bootstrap_unix_ns": int(lock_path.stat().st_mtime_ns),
+        "bootstrap_timestamp": float(lock_path.stat().st_mtime_ns / 1_000_000_000),
         "incumbent": {
             **incumbent_ref,
             "md5": _md5(Path(incumbent_ref["path"])),
@@ -169,6 +172,7 @@ def build_plan(
             "registry": str(registry),
             "current_pointer": str(pointer),
             "receipt": str(receipt),
+            "prepared_journal": str(journal),
         },
     }
     plan["plan_sha256"] = _digest(plan)
@@ -184,32 +188,95 @@ def _fsync_dir(path: Path) -> None:
 
 
 def _write_exclusive(path: Path, payload: bytes, *, mode: int) -> None:
-    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+    temporary = path.with_name(f".{path.name}.publish.{os.getpid()}.{time.time_ns()}")
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
     try:
         with os.fdopen(descriptor, "wb", closefd=True) as handle:
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
+        os.link(temporary, path)
         _fsync_dir(path.parent)
     except BaseException:
-        path.unlink(missing_ok=True)
         raise
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
-def commit(plan: dict[str, Any]) -> dict[str, Any]:
-    if plan.get("schema_version") != RECEIPT_SCHEMA or plan.get("mode") != "dry-run":
-        raise BootstrapError("invalid bootstrap plan")
-    stated = plan.get("plan_sha256")
-    unhashed = dict(plan)
-    unhashed.pop("plan_sha256", None)
-    if stated != _digest(unhashed):
-        raise BootstrapError("bootstrap plan digest mismatch")
-    destinations = plan["destinations"]
-    registry_path = _fresh(Path(destinations["registry"]), where="registry")
-    pointer_path = _fresh(
-        Path(destinations["current_pointer"]), where="current pointer"
-    )
-    receipt_path = _fresh(Path(destinations["receipt"]), where="bootstrap receipt")
+def _journal_path(receipt_path: Path) -> Path:
+    return receipt_path.with_name(receipt_path.name + ".prepared")
+
+
+def _render_registry(plan: dict[str, Any]) -> bytes:
+    """Render byte-identical registry state on the first try and every resume."""
+
+    timestamp = float(plan["bootstrap_timestamp"])
+    incumbent = plan["incumbent"]
+    provenance = {
+        "bootstrap_schema": RECEIPT_SCHEMA,
+        "bootstrap_plan_sha256": plan["plan_sha256"],
+        "contract_sha256": plan["contract"]["contract_sha256"],
+        "legacy_training_report": incumbent["legacy_training_report"],
+    }
+    roles: dict[str, Any] = {}
+    pool: list[dict[str, Any]] = []
+    transitions: list[dict[str, Any]] = []
+    for role in plan["roles"]:
+        pointer = {
+            "role": role,
+            "checkpoint_path": incumbent["path"],
+            "md5": incumbent["md5"],
+            "version": int(incumbent["version"]),
+            "updated_at": timestamp,
+            "provenance": provenance,
+        }
+        roles[role] = pointer
+        transitions.append(
+            {
+                "ts": timestamp,
+                "kind": "set_role",
+                "role": role,
+                "reason": "audited A1 registry bootstrap",
+                "from_pointer": None,
+                "to_pointer": pointer,
+            }
+        )
+    for row in plan["opponent_pool"]:
+        entry = {
+            "checkpoint_path": row["path"],
+            "md5": row["md5"],
+            "version": None,
+            "added_at": timestamp,
+            "status": "active",
+            "provenance": {
+                **provenance,
+                "contract_source_role": row["source_role"],
+            },
+        }
+        pool.append(entry)
+        transitions.append(
+            {
+                "ts": timestamp,
+                "kind": "pool_append",
+                "role": "opponent_pool",
+                "reason": "sealed A1 bootstrap opponent",
+                "from_pointer": None,
+                "to_pointer": entry,
+            }
+        )
+    state = {
+        "roles": roles,
+        "opponent_pool": pool,
+        "transitions": transitions,
+        "promotion_counts": {},
+    }
+    return json.dumps(state, indent=2, sort_keys=True).encode()
+
+
+def _verify_plan_sources(plan: dict[str, Any]) -> None:
+    contract = plan["contract"]
+    if _sha256(Path(contract["path"])) != contract["sha256"]:
+        raise BootstrapError("A1 contract lock drifted after planning")
     incumbent = plan["incumbent"]
     incumbent_path = Path(incumbent["path"]).resolve(strict=True)
     if (
@@ -217,64 +284,177 @@ def commit(plan: dict[str, Any]) -> dict[str, Any]:
         or _md5(incumbent_path) != incumbent["md5"]
     ):
         raise BootstrapError("incumbent bytes drifted after planning")
-
-    registry = ChampionRegistry(registry_path)
-    provenance = {
-        "bootstrap_schema": RECEIPT_SCHEMA,
-        "bootstrap_plan_sha256": stated,
-        "contract_sha256": plan["contract"]["contract_sha256"],
-        "legacy_training_report": incumbent["legacy_training_report"],
-    }
-    for role in plan["roles"]:
-        registry.set_role(
-            role,
-            incumbent_path,
-            expected_md5=incumbent["md5"],
-            version=int(incumbent["version"]),
-            provenance=provenance,
-            reason="audited A1 registry bootstrap",
-        )
+    report = incumbent["legacy_training_report"]
+    if _sha256(Path(report["path"])) != report["sha256"]:
+        raise BootstrapError("legacy scalar training report drifted after planning")
     for row in plan["opponent_pool"]:
         pool_path = Path(row["path"]).resolve(strict=True)
         if _sha256(pool_path) != row["sha256"] or _md5(pool_path) != row["md5"]:
             raise BootstrapError("opponent-pool checkpoint drifted after planning")
-        registry.append_pool(
-            pool_path,
-            expected_md5=row["md5"],
-            provenance={**provenance, "contract_source_role": row["source_role"]},
-            status="active",
-            reason="sealed A1 bootstrap opponent",
+
+
+def _journal_payload(plan: dict[str, Any]) -> dict[str, Any]:
+    registry_bytes = _render_registry(plan)
+    pointer_bytes = (plan["incumbent"]["path"] + "\n").encode()
+    value: dict[str, Any] = {
+        "schema_version": JOURNAL_SCHEMA,
+        "status": "prepared",
+        "plan": plan,
+        "registry_sha256": "sha256:" + hashlib.sha256(registry_bytes).hexdigest(),
+        "current_pointer_sha256": "sha256:" + hashlib.sha256(pointer_bytes).hexdigest(),
+        "prepared_unix_ns": int(plan["bootstrap_unix_ns"]),
+    }
+    value["journal_sha256"] = _digest(value)
+    return value
+
+
+def _verify_journal(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict) or value.get("schema_version") != JOURNAL_SCHEMA:
+        raise BootstrapError("bootstrap prepared journal schema is invalid")
+    declared = value.get("journal_sha256")
+    unhashed = dict(value)
+    unhashed.pop("journal_sha256", None)
+    if declared != _digest(unhashed):
+        raise BootstrapError("bootstrap prepared journal digest mismatch")
+    plan = value.get("plan")
+    if not isinstance(plan, dict):
+        raise BootstrapError("bootstrap prepared journal has no plan")
+    _verify_plan_digest(plan)
+    expected = _journal_payload(plan)
+    if value != expected:
+        raise BootstrapError(
+            "bootstrap prepared journal differs from deterministic plan"
         )
-    # ChampionRegistry.save is not the transaction boundary here.  Render its
-    # bytes to a private temporary path, then publish all destinations with
-    # exclusive creation and roll back on any failure.
-    temporary = registry_path.with_name(f".{registry_path.name}.render.{os.getpid()}")
-    registry.path = temporary
-    registry.save()
-    registry_bytes = temporary.read_bytes()
-    temporary.unlink(missing_ok=True)
-    pointer_bytes = (str(incumbent_path) + "\n").encode()
-    receipt = {**plan, "mode": "committed", "committed_unix_ns": time.time_ns()}
-    receipt["registry_sha256"] = "sha256:" + hashlib.sha256(registry_bytes).hexdigest()
-    receipt["current_pointer_sha256"] = (
-        "sha256:" + hashlib.sha256(pointer_bytes).hexdigest()
+    return value
+
+
+def _verify_plan_digest(plan: dict[str, Any]) -> None:
+    if plan.get("schema_version") != RECEIPT_SCHEMA or plan.get("mode") != "dry-run":
+        raise BootstrapError("invalid bootstrap plan")
+    stated = plan.get("plan_sha256")
+    unhashed = dict(plan)
+    unhashed.pop("plan_sha256", None)
+    if stated != _digest(unhashed):
+        raise BootstrapError("bootstrap plan digest mismatch")
+
+
+def _publish_exact(path: Path, payload: bytes, *, mode: int, where: str) -> None:
+    if path.exists() or path.is_symlink():
+        if (
+            path.is_symlink()
+            or not path.is_file()
+            or path.read_bytes() != payload
+            or path.stat().st_mode & 0o777 != mode
+        ):
+            raise BootstrapError(f"existing {where} differs from prepared bytes")
+        return
+    try:
+        _write_exclusive(path, payload, mode=mode)
+    except FileExistsError:
+        if (
+            path.is_symlink()
+            or not path.is_file()
+            or path.read_bytes() != payload
+            or path.stat().st_mode & 0o777 != mode
+        ):
+            raise BootstrapError(f"racing {where} differs from prepared bytes")
+
+
+def commit(plan: dict[str, Any]) -> dict[str, Any]:
+    _verify_plan_digest(plan)
+    _verify_plan_sources(plan)
+    destinations = plan["destinations"]
+    registry_path = Path(destinations["registry"])
+    pointer_path = Path(destinations["current_pointer"])
+    receipt_path = Path(destinations["receipt"])
+    journal_path = Path(destinations["prepared_journal"])
+    registry_bytes = _render_registry(plan)
+    pointer_bytes = (plan["incumbent"]["path"] + "\n").encode()
+    journal = _journal_payload(plan)
+    journal_bytes = json.dumps(journal, indent=2, sort_keys=True).encode() + b"\n"
+    _publish_exact(
+        journal_path,
+        journal_bytes,
+        mode=0o444,
+        where="bootstrap prepared journal",
     )
+    _verify_journal(json.loads(journal_path.read_text(encoding="utf-8")))
+
+    # The committed receipt is deliberately LAST. A hard kill before it leaves
+    # a durable journal plus zero, one, or two exact publications; rerunning
+    # commit resumes only those deterministic bytes.
+    _publish_exact(registry_path, registry_bytes, mode=0o600, where="registry")
+    _publish_exact(
+        pointer_path,
+        pointer_bytes,
+        mode=0o600,
+        where="current pointer",
+    )
+    receipt = {
+        **plan,
+        "mode": "committed",
+        "committed_unix_ns": journal["prepared_unix_ns"],
+        "prepared_journal": {
+            "path": str(journal_path),
+            "sha256": _sha256(journal_path),
+            "journal_sha256": journal["journal_sha256"],
+        },
+        "registry_sha256": journal["registry_sha256"],
+        "current_pointer_sha256": journal["current_pointer_sha256"],
+    }
     receipt["receipt_sha256"] = _digest(receipt)
     receipt_bytes = json.dumps(receipt, indent=2, sort_keys=True).encode() + b"\n"
-    created: list[Path] = []
-    try:
-        _write_exclusive(receipt_path, receipt_bytes, mode=0o444)
-        created.append(receipt_path)
-        _write_exclusive(registry_path, registry_bytes, mode=0o600)
-        created.append(registry_path)
-        _write_exclusive(pointer_path, pointer_bytes, mode=0o600)
-        created.append(pointer_path)
-    except BaseException:
-        for path in reversed(created):
-            path.unlink(missing_ok=True)
-            _fsync_dir(path.parent)
-        raise
+    _publish_exact(
+        receipt_path,
+        receipt_bytes,
+        mode=0o444,
+        where="bootstrap committed receipt",
+    )
+    if (
+        _sha256(registry_path) != receipt["registry_sha256"]
+        or _sha256(pointer_path) != receipt["current_pointer_sha256"]
+        or json.loads(receipt_path.read_text(encoding="utf-8")) != receipt
+    ):
+        raise BootstrapError("bootstrap publication verification failed")
     return receipt
+
+
+def _resume_plan_from_journal(
+    journal_path: Path,
+    *,
+    lock_path: Path,
+    registry_path: Path,
+    pointer_path: Path,
+    receipt_path: Path,
+    incumbent: Path,
+) -> dict[str, Any]:
+    try:
+        journal = _verify_journal(json.loads(journal_path.read_text(encoding="utf-8")))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise BootstrapError(
+            f"cannot resume bootstrap prepared journal: {error}"
+        ) from error
+    plan = journal["plan"]
+    expected_destinations = {
+        "registry": str(Path(os.path.abspath(os.fspath(registry_path.expanduser())))),
+        "current_pointer": str(
+            Path(os.path.abspath(os.fspath(pointer_path.expanduser())))
+        ),
+        "receipt": str(Path(os.path.abspath(os.fspath(receipt_path.expanduser())))),
+        "prepared_journal": str(journal_path),
+    }
+    if plan.get("destinations") != expected_destinations:
+        raise BootstrapError("resume arguments differ from prepared destinations")
+    if Path(plan["contract"]["path"]).resolve(strict=True) != lock_path.resolve(
+        strict=True
+    ):
+        raise BootstrapError("resume contract lock differs from prepared plan")
+    if Path(plan["incumbent"]["path"]).resolve(strict=True) != incumbent.resolve(
+        strict=True
+    ):
+        raise BootstrapError("resume incumbent differs from prepared plan")
+    _verify_plan_sources(plan)
+    return plan
 
 
 def main() -> None:
@@ -287,13 +467,25 @@ def main() -> None:
     parser.add_argument("--go", action="store_true")
     args = parser.parse_args()
     try:
-        plan = build_plan(
-            lock_path=Path(args.lock),
-            registry_path=Path(args.registry),
-            pointer_path=Path(args.current_pointer),
-            receipt_path=Path(args.receipt),
-            incumbent=Path(args.incumbent),
-        )
+        receipt_path = Path(os.path.abspath(os.fspath(Path(args.receipt).expanduser())))
+        journal_path = _journal_path(receipt_path)
+        if args.go and journal_path.is_file():
+            plan = _resume_plan_from_journal(
+                journal_path,
+                lock_path=Path(args.lock),
+                registry_path=Path(args.registry),
+                pointer_path=Path(args.current_pointer),
+                receipt_path=receipt_path,
+                incumbent=Path(args.incumbent),
+            )
+        else:
+            plan = build_plan(
+                lock_path=Path(args.lock),
+                registry_path=Path(args.registry),
+                pointer_path=Path(args.current_pointer),
+                receipt_path=receipt_path,
+                incumbent=Path(args.incumbent),
+            )
         result = commit(plan) if args.go else plan
     except (BootstrapError, OSError, ValueError) as error:
         parser.error(str(error))
