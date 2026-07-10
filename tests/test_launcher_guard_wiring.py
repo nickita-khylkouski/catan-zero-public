@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import resource
 import sys
 from pathlib import Path
 import pytest
@@ -299,6 +300,25 @@ GOLDEN_OPTION_STRINGS = {
         ("--workers",),
     },
 }
+
+
+@pytest.fixture(autouse=True)
+def _stable_host_fd_limit(monkeypatch):
+    """Keep launcher wiring tests independent of the pytest shell's ulimit.
+
+    The fd-limit guard's pass/fail behavior is covered directly in
+    test_prelaunch_guard.py.  This module verifies launcher wiring, so its
+    allowed-path cases should not fail merely because CI starts pytest with a
+    lower host-only soft limit.
+    """
+    original_getrlimit = resource.getrlimit
+
+    def getrlimit(limit: int) -> tuple[int, int]:
+        if limit == resource.RLIMIT_NOFILE:
+            return 65536, 65536
+        return original_getrlimit(limit)
+
+    monkeypatch.setattr(resource, "getrlimit", getrlimit)
 
 
 def _option_strings(parser: argparse.ArgumentParser) -> set[tuple[str, ...]]:
