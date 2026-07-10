@@ -20,5 +20,6 @@ checkpoints/
 
 # CAT-137: fleet host config carries live IPs — keep out of the repo (use the .example + $FLEET_CONF)
 /configs/gpu_cluster_hosts.json
+/configs/a1_h100_eval_fleet.json
 # CAT-137/consolidator: runtime append-log (test exhaust), never a curated baseline
 configs/config_registry.jsonl

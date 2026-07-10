@@ -1,0 +1,532 @@
+#!/usr/bin/env python3
+"""Fail-closed pooling for distributed A1 promotion evaluations.
+
+Fleet evaluators reset ``pair_id`` in every process.  Concatenating their JSON
+therefore corrupts pairing and can double-count a seed.  This tool pools either
+cross-net H2H or neutral-harness reports by globally unique ``game_seed``,
+requires identical science/config/checkpoint bytes, rejects duplicate or
+incomplete pairs, renumbers pairs deterministically, and recomputes all gate
+statistics from the retained raw games.
+"""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import hashlib
+import json
+import sys
+from pathlib import Path
+from typing import Any, Sequence
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from tools import a1_promotion_artifacts as artifacts  # noqa: E402
+from tools import a1_promotion_transaction as promotion  # noqa: E402
+from tools.sprt_gate import (  # noqa: E402
+    evaluate_pentanomial_sprt,
+    evaluate_sprt,
+    pair_scores_from_h2h_games,
+)
+
+
+POOL_SCHEMA = "a1-fleet-evaluation-pool-v1"
+ORIENTATIONS = {
+    "internal": {"candidate_red", "candidate_blue"},
+    "neutral": {"candidate_first", "candidate_second"},
+}
+
+
+class PoolError(RuntimeError):
+    """Raised when fleet reports cannot form one promotion-grade cohort."""
+
+
+def _load(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise PoolError(f"cannot load report {path}: {error}") from error
+    if not isinstance(value, dict):
+        raise PoolError(f"report {path} must contain a JSON object")
+    return value
+
+
+def _canonical(value: Any) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def _validate_checkpoint_sha256(
+    report: dict[str, Any], *, key: str, expected: Path, where: str
+) -> str:
+    actual = promotion._sha256(expected.expanduser().resolve(strict=True))  # noqa: SLF001
+    declared = report.get(key)
+    if declared != actual:
+        raise PoolError(f"{where} checkpoint SHA-256 drift: {declared!r} != {actual}")
+    return actual
+
+
+def _validate_config_hash(report: dict[str, Any], *, where: str) -> None:
+    typed = report.get("typed_config")
+    if not isinstance(typed, dict):
+        raise PoolError(f"{where} has no typed_config")
+    digest = hashlib.sha256(_canonical(typed)).hexdigest()
+    if report.get("full_config_hash") != "sha256:" + digest:
+        raise PoolError(f"{where} full_config_hash does not replay")
+    if report.get("config_hash") != "sha256:" + digest[:16]:
+        raise PoolError(f"{where} config_hash does not replay")
+
+
+def _internal_effective_search_config(
+    report: dict[str, Any], *, where: str
+) -> dict[str, Any]:
+    """Remove only per-shard identity/seed fields from a replayed typed config."""
+    _validate_config_hash(report, where=where)
+    typed = report["typed_config"]
+    if typed.get("pipeline") != "eval" or not isinstance(typed.get("fields"), dict):
+        raise PoolError(f"{where} typed_config is not an evaluation config")
+    fields = copy.deepcopy(typed["fields"])
+    for name in ("candidate", "baseline", "base_seed", "pairs"):
+        fields.pop(name, None)
+    return fields
+
+
+def _neutral_effective_search_config(
+    report: dict[str, Any], *, where: str
+) -> dict[str, Any]:
+    search = report.get("search_config")
+    if not isinstance(search, dict) or not search:
+        raise PoolError(f"{where} has no effective search_config")
+    identity = {
+        "stratum": report.get("stratum"),
+        "harness": report.get("harness"),
+        "referee_engine": report.get("referee_engine"),
+        "baseline_bot": report.get("baseline_bot"),
+        "mode": report.get("mode"),
+        "map_kind": report.get("map_kind"),
+        "gate_config": report.get("gate_config"),
+        "vps_to_win": report.get("vps_to_win"),
+        "max_player_trade_offers_per_turn": report.get(
+            "max_player_trade_offers_per_turn"
+        ),
+        "trained_value_readouts": report.get("trained_value_readouts"),
+        "search_config": search,
+    }
+    return identity
+
+
+def _seed_interval(report: dict[str, Any], *, where: str) -> tuple[int, int]:
+    try:
+        base = int(report["base_seed"])
+        pairs = int(report["pairs_requested"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise PoolError(f"{where} has no valid seed interval") from error
+    if pairs <= 0:
+        raise PoolError(f"{where} pairs_requested must be positive")
+    games = report.get("games")
+    if not isinstance(games, list):
+        raise PoolError(f"{where} has no retained games")
+    counts: dict[int, int] = {}
+    for game in games:
+        try:
+            seed = int(game["game_seed"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise PoolError(f"{where} game has no valid game_seed") from error
+        counts[seed] = counts.get(seed, 0) + 1
+    expected = set(range(base, base + pairs))
+    if set(counts) != expected or any(count != 2 for count in counts.values()):
+        raise PoolError(
+            f"{where} raw games do not exactly cover [{base}, {base + pairs}) twice"
+        )
+    return base, base + pairs
+
+
+def _contiguous_intervals(
+    reports: Sequence[tuple[Path, dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    intervals = sorted(
+        ((*_seed_interval(report, where=str(path)), path) for path, report in reports),
+        key=lambda row: (row[0], row[1], str(row[2])),
+    )
+    for previous, current in zip(intervals, intervals[1:]):
+        if previous[1] != current[0]:
+            relation = "an overlap" if previous[1] > current[0] else "a gap"
+            raise PoolError(
+                f"fleet seed intervals have {relation}: "
+                f"[{previous[0]}, {previous[1]}) then [{current[0]}, {current[1]})"
+            )
+    return [
+        {"base_seed": lo, "end_seed": hi, "path": str(path)}
+        for lo, hi, path in intervals
+    ]
+
+
+def _pair_diagnostics(
+    games: list[dict[str, Any]],
+) -> tuple[list[float], dict[str, int]]:
+    scores, diagnostics = pair_scores_from_h2h_games(games)
+    return scores, diagnostics
+
+
+def _validate_and_normalize_games(
+    reports: Sequence[tuple[Path, dict[str, Any]]], *, kind: str
+) -> list[dict[str, Any]]:
+    seen: dict[tuple[int, str], Path] = {}
+    by_seed: dict[int, list[dict[str, Any]]] = {}
+    expected_orientations = ORIENTATIONS[kind]
+    for path, report in reports:
+        games = report.get("games")
+        if not isinstance(games, list) or not games:
+            raise PoolError(f"{path} has no retained raw games")
+        if report.get("games_played") != len(games):
+            raise PoolError(f"{path} games_played differs from retained games")
+        source_sha = promotion._sha256(path)  # noqa: SLF001
+        for index, raw in enumerate(games):
+            if not isinstance(raw, dict):
+                raise PoolError(f"{path}.games[{index}] is not an object")
+            game = copy.deepcopy(raw)
+            try:
+                seed = int(game["game_seed"])
+                orientation = str(game["orientation"])
+                source_pair_id = int(game["pair_id"])
+            except (KeyError, TypeError, ValueError) as error:
+                raise PoolError(f"{path}.games[{index}] lacks pair identity") from error
+            if orientation not in expected_orientations:
+                raise PoolError(
+                    f"{path}.games[{index}] has invalid orientation {orientation!r}"
+                )
+            identity = (seed, orientation)
+            prior = seen.get(identity)
+            if prior is not None:
+                raise PoolError(
+                    f"duplicate fleet game seed/orientation {identity}: {prior} and {path}"
+                )
+            seen[identity] = path
+            if (
+                game.get("candidate_won") is None
+                or game.get("search_won") is None
+                or game.get("truncated") is True
+                or game.get("terminated") is not True
+                or game.get("error") not in {None, ""}
+                or bool(game.get("engine_divergence", False))
+            ):
+                raise PoolError(f"{path}.games[{index}] is not a complete clean game")
+            game["source_pair_id"] = source_pair_id
+            game["source_report_sha256"] = source_sha
+            by_seed.setdefault(seed, []).append(game)
+    for seed, games in by_seed.items():
+        orientations = {str(game["orientation"]) for game in games}
+        if len(games) != 2 or orientations != expected_orientations:
+            raise PoolError(
+                f"game seed {seed} is not one complete seat-swapped pair: {sorted(orientations)}"
+            )
+    normalized: list[dict[str, Any]] = []
+    for pair_id, seed in enumerate(sorted(by_seed)):
+        for game in sorted(by_seed[seed], key=lambda item: str(item["orientation"])):
+            game["pair_id"] = pair_id
+            normalized.append(game)
+    return normalized
+
+
+def _source_refs(paths: Sequence[Path]) -> list[dict[str, str]]:
+    return [
+        {"path": str(path.resolve()), "sha256": promotion._sha256(path)}  # noqa: SLF001
+        for path in paths
+    ]
+
+
+def pool_internal(
+    paths: Sequence[Path], *, candidate: Path, champion: Path
+) -> dict[str, Any]:
+    if not paths:
+        raise PoolError("at least one internal H2H report is required")
+    loaded = [(path.resolve(), _load(path.resolve())) for path in paths]
+    candidate = candidate.expanduser().resolve(strict=True)
+    champion = champion.expanduser().resolve(strict=True)
+    candidate_sha256 = promotion._sha256(candidate)  # noqa: SLF001
+    champion_sha256 = promotion._sha256(champion)  # noqa: SLF001
+    effective_config: dict[str, Any] | None = None
+    for path, report in loaded:
+        _validate_checkpoint_sha256(
+            report,
+            key="candidate_checkpoint_sha256",
+            expected=candidate,
+            where=f"{path} candidate",
+        )
+        _validate_checkpoint_sha256(
+            report,
+            key="baseline_checkpoint_sha256",
+            expected=champion,
+            where=f"{path} champion",
+        )
+        shard_effective = _internal_effective_search_config(report, where=str(path))
+        if effective_config is None:
+            effective_config = shard_effective
+        elif _canonical(shard_effective) != _canonical(effective_config):
+            raise PoolError(f"fleet report effective science/config drift in {path}")
+        if report.get("gate_config") != "flywheel":
+            raise PoolError(f"{path} is not a flywheel gate report")
+        if report.get("errors") != [] or int(report.get("games_truncated", -1)) != 0:
+            raise PoolError(f"{path} contains errors or truncations")
+        scores, diagnostics = _pair_diagnostics(report.get("games", []))
+        replay = evaluate_pentanomial_sprt(
+            scores, elo0=-10.0, elo1=15.0, alpha=0.05, beta=0.05
+        )
+        if replay != report.get("pentanomial_sprt") or diagnostics != report.get(
+            "pair_diagnostics"
+        ):
+            raise PoolError(f"{path} gate statistics do not replay")
+    intervals = _contiguous_intervals(loaded)
+    games = _validate_and_normalize_games(loaded, kind="internal")
+    outcomes = [bool(game["candidate_won"]) for game in games]
+    pair_scores, diagnostics = _pair_diagnostics(games)
+    concordant = []
+    for pair_id in range(len(games) // 2):
+        results = {
+            bool(game["candidate_won"]) for game in games if game["pair_id"] == pair_id
+        }
+        if len(results) == 1:
+            concordant.append(next(iter(results)))
+    pentanomial = evaluate_pentanomial_sprt(
+        pair_scores, elo0=-10.0, elo1=15.0, alpha=0.05, beta=0.05
+    )
+    complete_pairs = len(games) // 2
+    result = copy.deepcopy(loaded[0][1])
+    result.pop("config_hash", None)
+    result.pop("full_config_hash", None)
+    result.pop("typed_config", None)
+    result.update(
+        {
+            "candidate_checkpoint": str(candidate),
+            "candidate_checkpoint_sha256": candidate_sha256,
+            "baseline_checkpoint": str(champion),
+            "baseline_checkpoint_sha256": champion_sha256,
+            "base_seed": intervals[0]["base_seed"],
+            "effective_search_config": effective_config,
+            "pairs_requested": complete_pairs,
+            "games_played": len(games),
+            "games_with_winner": len(games),
+            "games_truncated": 0,
+            "candidate_wins": sum(outcomes),
+            "baseline_wins": len(outcomes) - sum(outcomes),
+            "candidate_win_rate": sum(outcomes) / len(outcomes),
+            "sprt": evaluate_sprt(outcomes=outcomes, elo0=-10.0, elo1=15.0),
+            "pair_sprt": evaluate_sprt(outcomes=concordant, elo0=-10.0, elo1=15.0),
+            "pentanomial_sprt": pentanomial,
+            "verdict": pentanomial["decision"],
+            "pair_diagnostics": diagnostics,
+            "pairs_decisive": diagnostics["ww_pairs"] + diagnostics["ll_pairs"],
+            "pairs_split_excluded": diagnostics["split_pairs"],
+            "pairs_truncated_excluded": diagnostics["incomplete_pairs"],
+            "complete_pairs": complete_pairs,
+            "split_rate": diagnostics["split_pairs"] / complete_pairs,
+            "decisive_pair_yield": (diagnostics["ww_pairs"] + diagnostics["ll_pairs"])
+            / complete_pairs,
+            "elapsed_sec": sum(
+                float(report.get("elapsed_sec", 0.0)) for _, report in loaded
+            ),
+            "workers": sum(int(report.get("workers", 0)) for _, report in loaded),
+            "errors": [],
+            "games": games,
+            "fleet_merge": {
+                "schema_version": POOL_SCHEMA,
+                "kind": "internal_h2h",
+                "candidate": artifacts._checkpoint_ref(candidate),  # noqa: SLF001
+                "champion": artifacts._checkpoint_ref(champion),  # noqa: SLF001
+                "sources": _source_refs([path for path, _ in loaded]),
+                "seed_intervals": intervals,
+                "shard_config_hashes": [
+                    {
+                        "path": str(path),
+                        "config_hash": report["config_hash"],
+                        "full_config_hash": report["full_config_hash"],
+                    }
+                    for path, report in loaded
+                ],
+                "effective_search_config_sha256": promotion._digest_value(  # noqa: SLF001
+                    effective_config
+                ),
+            },
+        }
+    )
+    return result
+
+
+def _wilson(wins: int, games: int, z: float = 1.96) -> list[float]:
+    p = wins / games
+    denominator = 1 + z * z / games
+    center = p + z * z / (2 * games)
+    half = z * ((p * (1 - p) / games + z * z / (4 * games * games)) ** 0.5)
+    return [
+        max(0.0, (center - half) / denominator),
+        min(1.0, (center + half) / denominator),
+    ]
+
+
+def pool_neutral(paths: Sequence[Path], *, checkpoint: Path) -> dict[str, Any]:
+    if not paths:
+        raise PoolError("at least one neutral-harness report is required")
+    loaded = [(path.resolve(), _load(path.resolve())) for path in paths]
+    checkpoint = checkpoint.expanduser().resolve(strict=True)
+    checkpoint_md5 = promotion._md5(checkpoint)  # noqa: SLF001
+    checkpoint_sha256 = promotion._sha256(checkpoint)  # noqa: SLF001
+    effective_config: dict[str, Any] | None = None
+    for path, report in loaded:
+        if report.get("candidate_checkpoint_md5") != checkpoint_md5:
+            raise PoolError(f"{path} checkpoint MD5 drift")
+        _validate_checkpoint_sha256(
+            report,
+            key="candidate_checkpoint_sha256",
+            expected=checkpoint,
+            where=f"{path} candidate",
+        )
+        shard_effective = _neutral_effective_search_config(report, where=str(path))
+        if effective_config is None:
+            effective_config = shard_effective
+        elif _canonical(shard_effective) != _canonical(effective_config):
+            raise PoolError(f"fleet report effective science/config drift in {path}")
+        if (
+            report.get("stratum") != "neutral-harness"
+            or report.get("harness") != "catanatron_native_engine"
+            or report.get("mode") != "search"
+            or report.get("gate_config") != "flywheel"
+        ):
+            raise PoolError(f"{path} is not a promotion neutral-search report")
+        if (
+            report.get("errors") != []
+            or report.get("worker_errors") != []
+            or int(report.get("games_truncated", -1)) != 0
+            or int(report.get("games_engine_divergence", -1)) != 0
+        ):
+            raise PoolError(f"{path} contains errors, truncations, or divergence")
+        scores, diagnostics = _pair_diagnostics(report.get("games", []))
+        replay = evaluate_pentanomial_sprt(
+            scores, elo0=-10.0, elo1=15.0, alpha=0.05, beta=0.05
+        )
+        if replay != report.get("pentanomial_sprt") or diagnostics != report.get(
+            "pair_diagnostics"
+        ):
+            raise PoolError(f"{path} gate statistics do not replay")
+    intervals = _contiguous_intervals(loaded)
+    games = _validate_and_normalize_games(loaded, kind="neutral")
+    outcomes = [bool(game["candidate_won"]) for game in games]
+    wins = sum(outcomes)
+    scores, diagnostics = _pair_diagnostics(games)
+    pentanomial = evaluate_pentanomial_sprt(
+        scores, elo0=-10.0, elo1=15.0, alpha=0.05, beta=0.05
+    )
+    pairs = len(games) // 2
+    result = copy.deepcopy(loaded[0][1])
+    result.update(
+        {
+            "candidate_checkpoint": str(checkpoint),
+            "candidate_checkpoint_md5": checkpoint_md5,
+            "candidate_checkpoint_sha256": checkpoint_sha256,
+            "base_seed": intervals[0]["base_seed"],
+            "effective_search_config": effective_config["search_config"],
+            "pairs_requested": pairs,
+            "complete_pairs": pairs,
+            "games_requested": len(games),
+            "games_played": len(games),
+            "games_with_winner": len(games),
+            "games_truncated": 0,
+            "games_errored": 0,
+            "games_engine_divergence": 0,
+            "candidate_wins": wins,
+            "baseline_wins": len(outcomes) - wins,
+            "candidate_win_rate": wins / len(outcomes),
+            "candidate_win_rate_wilson_95ci": _wilson(wins, len(outcomes)),
+            "total_illegal_policy_picks": sum(
+                int(game.get("illegal_policy_picks", 0)) for game in games
+            ),
+            "total_search_decisions": sum(
+                int(game.get("search_decisions", 0)) for game in games
+            ),
+            "total_simulations_used": sum(
+                int(game.get("simulations_used", 0)) for game in games
+            ),
+            "sprt": evaluate_sprt(outcomes=outcomes, elo0=-10.0, elo1=15.0),
+            "pentanomial_sprt": pentanomial,
+            "verdict": pentanomial["decision"],
+            "pair_diagnostics": diagnostics,
+            "workers": sum(int(report.get("workers", 0)) for _, report in loaded),
+            "run_fingerprint": promotion._digest_value(
+                _source_refs([path for path, _ in loaded])
+            ),  # noqa: SLF001
+            "artifact_dir": "fleet-pooled; see fleet_merge.sources",
+            "resume": {
+                "enabled": False,
+                "games_resumed": 0,
+                "games_run_this_invocation": len(games),
+            },
+            "elapsed_sec": sum(
+                float(report.get("elapsed_sec", 0.0)) for _, report in loaded
+            ),
+            "worker_errors": [],
+            "errors": [],
+            "games": games,
+            "fleet_merge": {
+                "schema_version": POOL_SCHEMA,
+                "kind": "external_panel",
+                "checkpoint": artifacts._checkpoint_ref(checkpoint),  # noqa: SLF001
+                "sources": _source_refs([path for path, _ in loaded]),
+                "seed_intervals": intervals,
+                "effective_search_config_sha256": promotion._digest_value(  # noqa: SLF001
+                    effective_config["search_config"]
+                ),
+            },
+        }
+    )
+    return result
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    internal = subparsers.add_parser("internal", help="pool cross-net H2H reports")
+    internal.add_argument("--report", action="append", type=Path, required=True)
+    internal.add_argument("--candidate", type=Path, required=True)
+    internal.add_argument("--champion", type=Path, required=True)
+    internal.add_argument("--out", type=Path, required=True)
+    neutral = subparsers.add_parser("neutral", help="pool neutral-harness reports")
+    neutral.add_argument("--report", action="append", type=Path, required=True)
+    neutral.add_argument("--checkpoint", type=Path, required=True)
+    neutral.add_argument("--out", type=Path, required=True)
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = _parser().parse_args(argv)
+    try:
+        value = (
+            pool_internal(args.report, candidate=args.candidate, champion=args.champion)
+            if args.command == "internal"
+            else pool_neutral(args.report, checkpoint=args.checkpoint)
+        )
+        artifacts._write_new_readonly(args.out, value)  # noqa: SLF001
+        print(
+            json.dumps(
+                {
+                    "path": str(args.out.expanduser().resolve()),
+                    "sha256": promotion._sha256(args.out),  # noqa: SLF001
+                    "pairs": value["complete_pairs"],
+                    "verdict": value["verdict"],
+                },
+                sort_keys=True,
+            )
+        )
+        return 0
+    except (
+        PoolError,
+        artifacts.ArtifactBuildError,
+        OSError,
+        KeyError,
+        ValueError,
+    ) as error:
+        print(f"A1 fleet evaluation pool refused: {error}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

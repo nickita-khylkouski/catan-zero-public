@@ -32,17 +32,36 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from tools import a1_pre_wave_contract as a1_contract  # noqa: E402
+from tools import a1_one_dose_train as one_dose  # noqa: E402
 from tools.champion_registry import ChampionRegistry  # noqa: E402
 from tools.sprt_gate import evaluate_pentanomial_sprt, pair_scores_from_h2h_games  # noqa: E402
 
 
 ADJUDICATION_SCHEMA = "a1-promotion-adjudication-v1"
-RECEIPT_SCHEMA = "a1-promotion-transaction-receipt-v1"
+RECEIPT_SCHEMA = "a1-promotion-transaction-receipt-v2"
+LEGACY_RECEIPT_SCHEMA = "a1-promotion-transaction-receipt-v1"
 EVIDENCE_SCHEMA = "a1-promotion-evidence-v1"
 HIGH_REGRET_SCHEMA = "a1-high-regret-comparison-v1"
 BUCKET_VETO_SCHEMA = "a1-bucket-veto-v1"
+HIGH_REGRET_REPORT_SCHEMA = "a1-held-out-high-regret-report-v1"
+HIGH_REGRET_SUITE_SCHEMA = "a1-held-out-high-regret-suite-v1"
+BUCKET_GAME_REPORT_SCHEMA = "a1-bucket-game-report-v1"
+FLEET_EVALUATION_POOL_SCHEMA = "a1-fleet-evaluation-pool-v1"
+LEGACY_INCUMBENT_PROVENANCE_SCHEMA = "a1-legacy-incumbent-provenance-v1"
 MAX_CALIBRATION_RMSE_REGRESSION = 0.02
 MAX_EXTERNAL_WIN_RATE_REGRESSION = 0.02
+MIN_BUCKET_WIN_RATE = 0.45
+MIN_BUCKET_GAMES = 8
+REQUIRED_PROMOTION_BUCKETS = {
+    "phase:opening",
+    "phase:robber_dev",
+    "phase:chance",
+    "phase:build_trade",
+    "opening",
+    "41+",
+    "blowout",
+    "close",
+}
 REQUIRED_EVIDENCE_KINDS = {
     "mechanism_calibration",
     "internal_h2h",
@@ -184,14 +203,18 @@ def _canonical_lock_path(registry_path: Path) -> Path:
 def _enforce_canonical_lock(registry_path: Path, requested: Path | None) -> Path:
     canonical = _canonical_lock_path(registry_path)
     if canonical.is_symlink():
-        raise PromotionError(f"canonical promotion lock must not be a symlink: {canonical}")
+        raise PromotionError(
+            f"canonical promotion lock must not be a symlink: {canonical}"
+        )
     if requested is None:
         return canonical
     lexical = _lexical_absolute(requested)
     try:
         resolved_parent = lexical.parent.resolve(strict=True)
     except OSError as error:
-        raise PromotionError(f"cannot resolve promotion lock parent: {error}") from error
+        raise PromotionError(
+            f"cannot resolve promotion lock parent: {error}"
+        ) from error
     normalized = resolved_parent / lexical.name
     if lexical.parent != resolved_parent or normalized != canonical:
         raise PromotionError(
@@ -334,7 +357,9 @@ def _verify_training_report(
             f"{report_checkpoint} != {candidate_path}"
         )
     if _sha256(report_checkpoint) != candidate_sha256:
-        raise PromotionError("candidate bytes drifted while validating its training report")
+        raise PromotionError(
+            "candidate bytes drifted while validating its training report"
+        )
     producers = [
         record
         for record in contract.get("checkpoints", [])
@@ -346,16 +371,309 @@ def _verify_training_report(
         producers[0].get("sha256"), where="contract producer sha256"
     )
     if report.get("init_checkpoint_sha256") != producer_sha:
-        raise PromotionError("candidate training report init checkpoint differs from producer")
+        raise PromotionError(
+            "candidate training report init checkpoint differs from producer"
+        )
     steps = report.get("steps_completed")
     epochs = report.get("epochs")
     if isinstance(steps, bool) or not isinstance(steps, int) or steps <= 0:
-        raise PromotionError("candidate training report has no completed optimizer steps")
+        raise PromotionError(
+            "candidate training report has no completed optimizer steps"
+        )
     if epochs != recipe.get("epochs"):
-        raise PromotionError("candidate training report epoch count differs from sealed recipe")
+        raise PromotionError(
+            "candidate training report epoch count differs from sealed recipe"
+        )
     if report.get("max_steps") != recipe.get("max_steps"):
-        raise PromotionError("candidate training report max_steps differs from sealed recipe")
+        raise PromotionError(
+            "candidate training report max_steps differs from sealed recipe"
+        )
     return report
+
+
+def _verify_one_dose_training_receipt(
+    path: Path,
+    *,
+    contract_lock: Path,
+    contract: dict[str, Any],
+    candidate_path: Path,
+    candidate_sha256: str,
+    training_report_path: Path,
+    training_report_sha256: str,
+) -> dict[str, Any]:
+    """Prove the candidate came from the sealed, environment-bound A1 dose.
+
+    A training report alone is reproducible text and is therefore insufficient
+    promotion authority.  The v3 one-dose receipt binds the command, exact child
+    environment, durable single-dose claim, candidate, optimizer sidecar, and
+    executor-augmented report.  Direct promotion replays those bindings so it
+    cannot bypass the resumable iteration orchestrator.
+    """
+
+    path = _canonical_existing_file(path, where="A1 one-dose training receipt")
+    value = _verify_receipt_digest(_load_json(path))
+    expected_keys = {
+        "schema_version",
+        "status",
+        "contract_sha256",
+        "lock",
+        "lock_file_sha256",
+        "corpus",
+        "corpus_meta_file_sha256",
+        "payload_inventory_sha256",
+        "validation_manifest",
+        "validation_manifest_file_sha256",
+        "producer_checkpoint_sha256",
+        "learner_training_recipe_sha256",
+        "command",
+        "command_sha256",
+        "execution_binding",
+        "world_size",
+        "gpu",
+        "gpu_name",
+        "started_unix_ns",
+        "finished_unix_ns",
+        "returncode",
+        "outputs",
+        "failure",
+        "claim",
+        "claim_state_sha256",
+        "receipt_sha256",
+    }
+    receipt_schema = value.get("schema_version")
+    is_retry = receipt_schema == one_dose.RETRY_RECEIPT_SCHEMA
+    if is_retry:
+        expected_keys |= {"claim_identity_sha256", "retry_contract"}
+    value = _require_exact_keys(value, expected_keys, where="one-dose training receipt")
+    if receipt_schema not in {
+        one_dose.RECEIPT_SCHEMA,
+        one_dose.RETRY_RECEIPT_SCHEMA,
+    }:
+        raise PromotionError(
+            "one-dose receipt schema must be a supported direct or sealed-retry schema"
+        )
+    if (
+        value["status"] != "complete"
+        or value["returncode"] != 0
+        or value["failure"] is not None
+        or value["world_size"] != 1
+    ):
+        raise PromotionError(
+            "one-dose training receipt is not a successful direct dose"
+        )
+    if value["contract_sha256"] != contract["contract_sha256"]:
+        raise PromotionError("one-dose training receipt binds a different A1 contract")
+    if _absolute(value["lock"], base=path.parent) != contract_lock:
+        raise PromotionError(
+            "one-dose training receipt binds a different contract lock"
+        )
+    if value["lock_file_sha256"] != _sha256(contract_lock):
+        raise PromotionError("one-dose training receipt contract-lock bytes drifted")
+    retry_reference: dict[str, Any] | None = None
+    if is_retry:
+        retry_reference = _require_exact_keys(
+            value["retry_contract"],
+            {"path", "file_sha256", "retry_contract_sha256"},
+            where="one-dose training receipt.retry_contract",
+        )
+        retry_contract_path = _canonical_existing_file(
+            _absolute(retry_reference["path"], base=path.parent),
+            where="one-dose learner retry contract",
+        )
+        if _sha256(retry_contract_path) != retry_reference["file_sha256"]:
+            raise PromotionError("one-dose learner retry contract bytes drifted")
+        retry_contract = _load_json(retry_contract_path)
+        if retry_contract.get("schema_version") != one_dose.RETRY_CONTRACT_SCHEMA:
+            raise PromotionError("one-dose learner retry contract schema is invalid")
+        retry_unhashed = dict(retry_contract)
+        stated_contract_sha = retry_unhashed.pop("retry_contract_sha256", None)
+        if (
+            stated_contract_sha != _digest_value(retry_unhashed)
+            or stated_contract_sha != retry_reference["retry_contract_sha256"]
+        ):
+            raise PromotionError("one-dose learner retry contract digest mismatch")
+        retry_identity = retry_contract.get("retry_identity")
+        if (
+            not isinstance(retry_identity, dict)
+            or retry_identity.get("schema_version") != one_dose.RETRY_IDENTITY_SCHEMA
+            or retry_identity.get("repair_kind") != one_dose.RETRY_REPAIR_KIND
+            or retry_identity.get("parent_contract_sha256")
+            != contract["contract_sha256"]
+            or retry_contract.get("retry_identity_sha256")
+            != _digest_value(retry_identity)
+            or value["claim_identity_sha256"]
+            != retry_contract.get("retry_identity_sha256")
+        ):
+            raise PromotionError("one-dose learner retry identity is invalid")
+    gpu = value["gpu"]
+    if (
+        isinstance(gpu, bool)
+        or not isinstance(gpu, int)
+        or gpu < 0
+        or not isinstance(value["gpu_name"], str)
+        or "B200" not in value["gpu_name"].upper()
+    ):
+        raise PromotionError("one-dose receipt does not attest one physical B200")
+    started = value["started_unix_ns"]
+    finished = value["finished_unix_ns"]
+    if (
+        isinstance(started, bool)
+        or not isinstance(started, int)
+        or isinstance(finished, bool)
+        or not isinstance(finished, int)
+        or started <= 0
+        or finished < started
+    ):
+        raise PromotionError("one-dose receipt timestamps are invalid")
+
+    command = value["command"]
+    if (
+        not isinstance(command, list)
+        or not command
+        or not all(isinstance(item, str) for item in command)
+    ):
+        raise PromotionError("one-dose training receipt command is invalid")
+    if value["command_sha256"] != _digest_value(command):
+        raise PromotionError("one-dose training receipt command digest mismatch")
+    execution_binding = value["execution_binding"]
+    try:
+        one_dose._validate_execution_binding(execution_binding)  # noqa: SLF001
+    except (one_dose.ExecutorError, AttributeError, TypeError) as error:
+        raise PromotionError(
+            f"one-dose execution binding is invalid: {error}"
+        ) from error
+    if execution_binding["command_sha256"] != value["command_sha256"]:
+        raise PromotionError("one-dose command and execution binding disagree")
+    try:
+        expected_environment = one_dose._child_environment(gpu)  # noqa: SLF001
+    except one_dose.ExecutorError as error:
+        raise PromotionError(
+            f"cannot reconstruct one-dose child environment: {error}"
+        ) from error
+    if execution_binding["environment"] != expected_environment:
+        raise PromotionError(
+            "one-dose child environment differs from the exact allowlist"
+        )
+
+    outputs = _require_exact_keys(
+        value["outputs"],
+        {
+            "checkpoint",
+            "checkpoint_sha256",
+            "optimizer_sidecar",
+            "optimizer_sidecar_sha256",
+            "report",
+            "report_sha256",
+            "execution_binding_sha256",
+            "steps_completed",
+            "corpus_row_count",
+            "training_row_count",
+            "validation_row_count",
+        },
+        where="one-dose training receipt.outputs",
+    )
+    output_checkpoint = _absolute(outputs["checkpoint"], base=path.parent)
+    if (
+        output_checkpoint != candidate_path
+        or outputs["checkpoint_sha256"] != candidate_sha256
+    ):
+        raise PromotionError("one-dose receipt candidate differs from adjudication")
+    if _sha256(output_checkpoint) != outputs["checkpoint_sha256"]:
+        raise PromotionError("one-dose receipt candidate bytes drifted")
+    output_report = _absolute(outputs["report"], base=path.parent)
+    if (
+        output_report != training_report_path
+        or outputs["report_sha256"] != training_report_sha256
+        or _sha256(output_report) != outputs["report_sha256"]
+    ):
+        raise PromotionError(
+            "one-dose receipt training report differs from adjudication"
+        )
+    optimizer = _canonical_existing_file(
+        _absolute(outputs["optimizer_sidecar"], base=path.parent),
+        where="one-dose optimizer sidecar",
+    )
+    if _sha256(optimizer) != outputs["optimizer_sidecar_sha256"]:
+        raise PromotionError("one-dose optimizer-sidecar bytes drifted")
+    if outputs["execution_binding_sha256"] != _digest_value(execution_binding):
+        raise PromotionError("one-dose output execution-binding digest mismatch")
+    counts = {
+        name: outputs[name]
+        for name in (
+            "steps_completed",
+            "corpus_row_count",
+            "training_row_count",
+            "validation_row_count",
+        )
+    }
+    if (
+        any(
+            isinstance(number, bool) or not isinstance(number, int) or number < 0
+            for number in counts.values()
+        )
+        or counts["steps_completed"] <= 0
+    ):
+        raise PromotionError("one-dose output row/step counts are invalid")
+    if (
+        counts["training_row_count"] <= 0
+        or counts["validation_row_count"] <= 0
+        or counts["training_row_count"] + counts["validation_row_count"]
+        != counts["corpus_row_count"]
+    ):
+        raise PromotionError(
+            "one-dose output train/validation coverage is inconsistent"
+        )
+
+    report = _load_json(output_report)
+    if report.get(one_dose.REPORT_EXECUTION_BINDING_FIELD) != execution_binding:
+        raise PromotionError(
+            "candidate training report does not bind the one-dose command/environment"
+        )
+    if value["learner_training_recipe_sha256"] != contract["science"].get(
+        "learner_training_recipe_sha256"
+    ):
+        raise PromotionError("one-dose receipt learner recipe differs from contract")
+    producers = [
+        record
+        for record in contract.get("checkpoints", [])
+        if isinstance(record, dict) and record.get("role") == "producer"
+    ]
+    if len(producers) != 1 or value["producer_checkpoint_sha256"] != producers[0].get(
+        "sha256"
+    ):
+        raise PromotionError("one-dose receipt producer differs from contract")
+
+    claim_path = _canonical_existing_file(
+        _absolute(value["claim"], base=path.parent), where="one-dose durable claim"
+    )
+    try:
+        claim = one_dose._load_claim_state(  # noqa: SLF001
+            claim_path,
+            contract_sha256=contract["contract_sha256"],
+            claim_identity_sha256=(
+                value["claim_identity_sha256"] if is_retry else None
+            ),
+        )
+    except one_dose.ExecutorError as error:
+        raise PromotionError(f"one-dose durable claim is invalid: {error}") from error
+    if (
+        claim.get("status") != "complete"
+        or claim.get("receipt_target") != str(path)
+        or claim.get("state_sha256") != value["claim_state_sha256"]
+        or claim.get("command_sha256") != value["command_sha256"]
+        or claim.get("execution_binding") != execution_binding
+        or claim.get("outputs") != outputs
+        or (is_retry and claim.get("retry_contract") != retry_reference)
+    ):
+        raise PromotionError("one-dose receipt and durable claim disagree")
+    return {
+        "path": str(path),
+        "sha256": _sha256(path),
+        "receipt_sha256": value["receipt_sha256"],
+        "claim": str(claim_path),
+        "claim_state_sha256": value["claim_state_sha256"],
+        "execution_binding_sha256": outputs["execution_binding_sha256"],
+    }
 
 
 def _verify_contract(
@@ -366,13 +684,18 @@ def _verify_contract(
     try:
         lock = verify_lock_fn(path, require_all_job_claims=True)
     except Exception as error:
-        raise PromotionError(f"sealed A1 contract verification failed: {error}") from error
+        raise PromotionError(
+            f"sealed A1 contract verification failed: {error}"
+        ) from error
     search = lock.get("science", {}).get("search_operator", {})
     if search.get("n_full") != 128:
         raise PromotionError(
             f"current A1 promotion requires global n_full=128, got {search.get('n_full')!r}"
         )
-    if search.get("n_full_wide") is not None or search.get("wide_roots_always_full") is not False:
+    if (
+        search.get("n_full_wide") is not None
+        or search.get("wide_roots_always_full") is not False
+    ):
         raise PromotionError(
             "current A1 promotion is global n128 only; adaptive/global alternate "
             "budgets are forbidden"
@@ -409,8 +732,128 @@ def _finite_number(value: Any, *, where: str, minimum: float | None = None) -> f
     return number
 
 
+def _verify_fleet_pool_provenance(
+    payload: dict[str, Any],
+    *,
+    kind: str,
+    checkpoint_refs: dict[str, tuple[Path, str]],
+    effective_config: dict[str, Any],
+    where: str,
+) -> None:
+    """Replay the provenance wrapper emitted by ``a1_evaluation_pool``.
+
+    A pooled fleet report is not one evaluator invocation, so it intentionally
+    has no synthetic ``typed_config``.  It instead retains every hashed shard,
+    its exact contiguous seed interval, and one science-only effective config.
+    Promotion accepts that representation only after replaying all bindings.
+    """
+
+    merge = payload.get("fleet_merge")
+    if not isinstance(merge, dict):
+        raise PromotionError(f"{where}.fleet_merge must be an object")
+    required = {
+        "schema_version",
+        "kind",
+        "sources",
+        "seed_intervals",
+        "effective_search_config_sha256",
+        *checkpoint_refs,
+    }
+    if kind == "internal_h2h":
+        required.add("shard_config_hashes")
+    value = _require_exact_keys(merge, required, where=f"{where}.fleet_merge")
+    if value["schema_version"] != FLEET_EVALUATION_POOL_SCHEMA or value["kind"] != kind:
+        raise PromotionError(f"{where} has an unexpected fleet-pool schema/kind")
+    for role, (path, sha256) in checkpoint_refs.items():
+        _verify_bound_checkpoint(
+            value[role],
+            expected_path=path,
+            expected_sha256=sha256,
+            where=f"{where}.fleet_merge.{role}",
+            base=path.parent,
+        )
+    if value["effective_search_config_sha256"] != _digest_value(effective_config):
+        raise PromotionError(f"{where} pooled effective-search config digest mismatch")
+    sources = value["sources"]
+    intervals = value["seed_intervals"]
+    if (
+        not isinstance(sources, list)
+        or not sources
+        or not isinstance(intervals, list)
+        or len(intervals) != len(sources)
+    ):
+        raise PromotionError(f"{where} has incomplete fleet shard provenance")
+    source_paths: set[str] = set()
+    for index, source in enumerate(sources):
+        path, _ref = _validate_file_ref(
+            source, base=Path.cwd(), where=f"{where}.fleet_merge.sources[{index}]"
+        )
+        if str(path) in source_paths:
+            raise PromotionError(f"{where} repeats a fleet source report")
+        source_paths.add(str(path))
+    cursor: int | None = None
+    interval_paths: set[str] = set()
+    for index, raw in enumerate(intervals):
+        interval = _require_exact_keys(
+            raw,
+            {"base_seed", "end_seed", "path"},
+            where=f"{where}.fleet_merge.seed_intervals[{index}]",
+        )
+        lo = interval["base_seed"]
+        hi = interval["end_seed"]
+        if (
+            isinstance(lo, bool)
+            or not isinstance(lo, int)
+            or isinstance(hi, bool)
+            or not isinstance(hi, int)
+            or hi <= lo
+        ):
+            raise PromotionError(f"{where} has an invalid fleet seed interval")
+        path = str(_absolute(interval["path"], base=Path.cwd()))
+        if path not in source_paths or path in interval_paths:
+            raise PromotionError(f"{where} seed interval does not bind one source")
+        if cursor is not None and lo != cursor:
+            raise PromotionError(f"{where} fleet seed intervals are not contiguous")
+        cursor = hi
+        interval_paths.add(path)
+    if interval_paths != source_paths:
+        raise PromotionError(f"{where} fleet seed intervals omit a source")
+    if kind == "internal_h2h":
+        hashes = value["shard_config_hashes"]
+        if not isinstance(hashes, list) or len(hashes) != len(sources):
+            raise PromotionError(f"{where} lacks per-shard typed-config hashes")
+        hash_paths: set[str] = set()
+        for index, raw in enumerate(hashes):
+            row = _require_exact_keys(
+                raw,
+                {"path", "config_hash", "full_config_hash"},
+                where=f"{where}.fleet_merge.shard_config_hashes[{index}]",
+            )
+            path = str(_absolute(row["path"], base=Path.cwd()))
+            if path not in source_paths or path in hash_paths:
+                raise PromotionError(f"{where} shard config hash path mismatch")
+            _validate_sha256(row["full_config_hash"], where="full_config_hash")
+            short = row["config_hash"]
+            if (
+                not isinstance(short, str)
+                or not short.startswith("sha256:")
+                or len(short) != 23
+            ):
+                raise PromotionError(f"{where} has an invalid short config hash")
+            hash_paths.add(path)
+        if hash_paths != source_paths:
+            raise PromotionError(f"{where} shard config hashes omit a source")
+
+
 def _verify_calibration_source(
-    payload: dict[str, Any], *, checkpoint: Path, expected_readout: str, where: str
+    payload: dict[str, Any],
+    *,
+    source_path: Path,
+    checkpoint: Path,
+    expected_readout: str,
+    where: str,
+    contract: dict[str, Any] | None = None,
+    allow_legacy_incumbent: bool = False,
 ) -> tuple[float, dict[str, Any]]:
     if payload.get("schema_version") != "phase-sliced-value-calibration-v2":
         raise PromotionError(f"{where} is not phase-sliced-value-calibration-v2")
@@ -426,10 +869,86 @@ def _verify_calibration_source(
     trained = provenance.get("trained_value_readouts")
     if not isinstance(trained, list) or expected_readout not in trained:
         raise PromotionError(f"{where} does not prove the selected readout was trained")
-    _positive_int(provenance.get("optimizer_steps"), where=f"{where}.optimizer_steps")
-    _positive_int(provenance.get("completed_epochs"), where=f"{where}.completed_epochs")
+    optimizer_steps = provenance.get("optimizer_steps")
+    completed_epochs = provenance.get("completed_epochs")
+    if isinstance(optimizer_steps, int) and optimizer_steps > 0:
+        _positive_int(optimizer_steps, where=f"{where}.optimizer_steps")
+        _positive_int(completed_epochs, where=f"{where}.completed_epochs")
+        if payload.get("legacy_incumbent_provenance") is not None:
+            raise PromotionError(
+                f"{where} may not attach a legacy bridge to native provenance"
+            )
+    else:
+        if not allow_legacy_incumbent or contract is None:
+            raise PromotionError(f"{where}.optimizer_steps must be a positive integer")
+        if expected_readout != "scalar":
+            raise PromotionError(f"{where} legacy provenance is scalar-only")
+        bridge = _require_exact_keys(
+            payload.get("legacy_incumbent_provenance"),
+            {
+                "schema_version",
+                "contract_sha256",
+                "checkpoint_sha256",
+                "historical_training_report",
+            },
+            where=f"{where}.legacy_incumbent_provenance",
+        )
+        if bridge["schema_version"] != LEGACY_INCUMBENT_PROVENANCE_SCHEMA:
+            raise PromotionError(f"{where} has an unexpected legacy bridge schema")
+        if bridge["contract_sha256"] != contract.get("contract_sha256"):
+            raise PromotionError(f"{where} legacy bridge binds a different contract")
+        checkpoint_sha256 = _sha256(checkpoint)
+        if bridge["checkpoint_sha256"] != checkpoint_sha256:
+            raise PromotionError(f"{where} legacy bridge checkpoint hash mismatch")
+        producers = [
+            item
+            for item in contract.get("checkpoints", [])
+            if isinstance(item, dict) and item.get("role") == "producer"
+        ]
+        if len(producers) != 1:
+            raise PromotionError(f"{where} contract has no unique producer checkpoint")
+        producer = producers[0]
+        producer_path = _absolute(producer.get("path"), base=source_path.parent)
+        if producer_path != checkpoint or producer.get("sha256") != checkpoint_sha256:
+            raise PromotionError(
+                f"{where} legacy bridge is not for the contract-bound incumbent"
+            )
+        report_path, _report_ref = _validate_file_ref(
+            bridge["historical_training_report"],
+            base=source_path.parent,
+            where=f"{where}.historical_training_report",
+        )
+        historical = _load_json(report_path)
+        historical_checkpoint = historical.get("checkpoint")
+        if (
+            not isinstance(historical_checkpoint, str)
+            or _absolute(historical_checkpoint, base=report_path.parent) != checkpoint
+        ):
+            raise PromotionError(
+                f"{where} historical report does not bind the incumbent checkpoint"
+            )
+        if (
+            historical.get("checkpoint_sha256") is not None
+            and historical["checkpoint_sha256"] != checkpoint_sha256
+        ):
+            raise PromotionError(f"{where} historical report checkpoint hash mismatch")
+        _positive_int(
+            historical.get("steps_completed"),
+            where=f"{where}.historical_training_report.steps_completed",
+        )
+        _positive_int(
+            historical.get("epochs"),
+            where=f"{where}.historical_training_report.epochs",
+        )
+        if optimizer_steps is not None or completed_epochs is not None:
+            raise PromotionError(
+                f"{where} legacy calibration must retain null native step provenance"
+            )
     selection = payload.get("row_selection")
-    if not isinstance(selection, dict) or selection.get("held_out_filter_applied") is not True:
+    if (
+        not isinstance(selection, dict)
+        or selection.get("held_out_filter_applied") is not True
+    ):
         raise PromotionError(f"{where} is not computed on a held-out row selection")
     cohort_keys = {
         "mode",
@@ -460,7 +979,9 @@ def _verify_calibration_source(
         raise PromotionError(f"{where}.global must be an object")
     _positive_int(global_metrics.get("n"), where=f"{where}.global.n")
     rmse = _finite_number(
-        global_metrics.get("value_rmse"), where=f"{where}.global.value_rmse", minimum=0.0
+        global_metrics.get("value_rmse"),
+        where=f"{where}.global.value_rmse",
+        minimum=0.0,
     )
     shard_dir = payload.get("shard_dir")
     if not isinstance(shard_dir, str) or not shard_dir:
@@ -473,31 +994,204 @@ def _verify_calibration_source(
     return rmse, cohort
 
 
-def _verify_internal_h2h_source(
-    payload: dict[str, Any], *, candidate: Path, champion: Path, where: str
+def _require_sealed_semantics(
+    actual: dict[str, Any], expected: dict[str, Any], *, where: str
 ) -> None:
-    if _absolute(payload.get("candidate_checkpoint"), base=candidate.parent) != candidate:
+    """Fail closed unless every sealed semantic is explicitly attested.
+
+    Canonical JSON comparison deliberately distinguishes booleans from integers
+    (``False`` must not satisfy a sealed ``0``) and also catches missing keys.
+    Extra scheduling/provenance fields are allowed; only science semantics bind.
+    """
+
+    for key, expected_value in expected.items():
+        if key not in actual:
+            raise PromotionError(f"{where} omits sealed A1 semantic {key!r}")
+        actual_value = actual[key]
+        both_numbers = (
+            isinstance(actual_value, (int, float))
+            and not isinstance(actual_value, bool)
+            and isinstance(expected_value, (int, float))
+            and not isinstance(expected_value, bool)
+        )
+        values_match = (
+            float(actual_value) == float(expected_value)
+            if both_numbers
+            else _canonical_bytes(actual_value) == _canonical_bytes(expected_value)
+        )
+        if not values_match:
+            raise PromotionError(
+                f"{where} sealed A1 semantic drift: {key}={actual_value!r}, "
+                f"expected {expected_value!r}"
+            )
+
+
+def _sealed_evaluation_semantics(contract: dict[str, Any]) -> dict[str, Any]:
+    """Project the immutable A1 lock into deterministic evaluation semantics.
+
+    Evaluation deliberately forces a full n128 search on every decision, while
+    all other search and evaluator knobs inherit the sealed production operator.
+    This projection is shared by internal H2H and the external neutral harness so
+    two reports cannot agree with each other while jointly drifting from A1.
+    """
+
+    try:
+        science = contract["science"]
+        search = science["effective_search_config"]
+        evaluator = science["evaluator"]
+        max_decisions = contract["generation"]["max_decisions"]
+    except (KeyError, TypeError) as error:
+        raise PromotionError(
+            "sealed A1 contract lacks complete effective search/evaluator semantics"
+        ) from error
+    if not isinstance(search, dict) or not isinstance(evaluator, dict):
+        raise PromotionError(
+            "sealed A1 contract search/evaluator semantics must be objects"
+        )
+
+    def search_value(name: str) -> Any:
+        if name not in search:
+            raise PromotionError(
+                f"sealed A1 contract omits effective_search_config.{name}"
+            )
+        return search[name]
+
+    def evaluator_value(name: str) -> Any:
+        if name not in evaluator:
+            raise PromotionError(f"sealed A1 contract omits evaluator.{name}")
+        return evaluator[name]
+
+    n_full = search_value("n_full")
+    if n_full != 128:
+        raise PromotionError("sealed A1 promotion evaluation requires n_full=128")
+    semantics = {
+        "public_observation": evaluator_value("public_observation"),
+        "belief_chance_spectra": search_value("belief_chance_spectra"),
+        "information_set_search": search_value("information_set_search"),
+        "determinization_particles": search_value("determinization_particles"),
+        "determinization_min_simulations": search_value(
+            "determinization_min_simulations"
+        ),
+        "n_full": n_full,
+        "n_fast": n_full,
+        "p_full": 1.0,
+        "force_full_every_decision": True,
+        "n_full_wide": search_value("n_full_wide"),
+        "n_full_wide_threshold": search_value("n_full_wide_threshold"),
+        "wide_roots_always_full": search_value("wide_roots_always_full"),
+        "raw_policy_above_width": search_value("raw_policy_above_width"),
+        "max_depth": search_value("max_depth"),
+        "max_decisions": max_decisions,
+        "temperature": 0.0,
+        "c_visit": search_value("c_visit"),
+        "c_scale": search_value("c_scale"),
+        "rescale_noise_floor_c": search_value("rescale_noise_floor_c"),
+        "sigma_eval": search_value("sigma_eval"),
+        "max_root_candidates": search_value("max_root_candidates"),
+        "max_root_candidates_wide": search_value("max_root_candidates_wide"),
+        "wide_candidates_threshold": search_value("wide_candidates_threshold"),
+        "symmetry_averaged_eval": search_value("symmetry_averaged_eval"),
+        "symmetry_averaged_eval_threshold": search_value(
+            "symmetry_averaged_eval_threshold"
+        ),
+        "correct_rust_chance_spectra": search_value("correct_rust_chance_spectra"),
+        "lazy_interior_chance": search_value("lazy_interior_chance"),
+        "prior_temperature": evaluator_value("prior_temperature"),
+        "value_scale": evaluator_value("value_scale"),
+        "value_squash": evaluator_value("value_squash"),
+        "value_readout": evaluator_value("value_readout"),
+        "play_sh_winner": search_value("play_sh_winner"),
+        "exact_budget_sh": search_value("exact_budget_sh"),
+        "exact_budget_sh_min_n": search_value("exact_budget_sh_min_n"),
+        "root_wave_batching": search_value("root_wave_batching"),
+        "use_batch_api": search_value("use_batch_api"),
+        "policy_target_min_visits": search_value("policy_target_min_visits"),
+        "uncertainty_backup_weighting": search_value("uncertainty_backup_weighting"),
+        "uncertainty_backup_a": search_value("uncertainty_backup_a"),
+        "uncertainty_backup_exp": search_value("uncertainty_backup_exp"),
+        "uncertainty_backup_cap": search_value("uncertainty_backup_cap"),
+        "variance_aware_q": search_value("variance_aware_q"),
+        "variance_aware_k": search_value("variance_aware_k"),
+        "variance_aware_closed_form_js": search_value("variance_aware_closed_form_js"),
+        "evaluator_context_fill": evaluator_value("context_fill"),
+        "evaluator_cache_size": evaluator_value("cache_size"),
+        "evaluator_rust_featurize": evaluator_value("rust_featurize"),
+        "evaluator_emit_uncertainty": evaluator_value("emit_uncertainty"),
+    }
+    return semantics
+
+
+def _verify_internal_h2h_source(
+    payload: dict[str, Any],
+    *,
+    candidate: Path,
+    champion: Path,
+    where: str,
+    sealed_semantics: dict[str, Any],
+) -> None:
+    if (
+        _absolute(payload.get("candidate_checkpoint"), base=candidate.parent)
+        != candidate
+    ):
         raise PromotionError(f"{where} candidate checkpoint drift")
     if _absolute(payload.get("baseline_checkpoint"), base=champion.parent) != champion:
         raise PromotionError(f"{where} incumbent checkpoint drift")
-    typed_config = payload.get("typed_config")
-    if not isinstance(typed_config, dict):
-        raise PromotionError(f"{where} has no typed evaluation config")
-    canonical_config = _canonical_bytes(typed_config)
-    config_digest = hashlib.sha256(canonical_config).hexdigest()
-    if payload.get("full_config_hash") != "sha256:" + config_digest:
-        raise PromotionError(f"{where} full config hash does not replay")
-    if payload.get("config_hash") != "sha256:" + config_digest[:16]:
-        raise PromotionError(f"{where} short config hash does not replay")
-    fields = typed_config.get("fields")
-    if typed_config.get("pipeline") != "eval" or not isinstance(fields, dict):
-        raise PromotionError(f"{where} typed config is not an eval config")
-    if fields.get("mode") != "cross_net":
-        raise PromotionError(f"{where} typed config is not cross-net")
-    if _absolute(fields.get("candidate"), base=candidate.parent) != candidate or _absolute(
-        fields.get("baseline"), base=champion.parent
-    ) != champion:
-        raise PromotionError(f"{where} typed config checkpoint identity drift")
+    pooled = isinstance(payload.get("fleet_merge"), dict)
+    if pooled:
+        if payload.get("candidate_checkpoint_sha256") != _sha256(candidate):
+            raise PromotionError(f"{where} candidate checkpoint SHA-256 drift")
+        if payload.get("baseline_checkpoint_sha256") != _sha256(champion):
+            raise PromotionError(f"{where} incumbent checkpoint SHA-256 drift")
+        fields = payload.get("effective_search_config")
+        if not isinstance(fields, dict):
+            raise PromotionError(f"{where} has no pooled effective search config")
+        _verify_fleet_pool_provenance(
+            payload,
+            kind="internal_h2h",
+            checkpoint_refs={
+                "candidate": (candidate, _sha256(candidate)),
+                "champion": (champion, _sha256(champion)),
+            },
+            effective_config=fields,
+            where=where,
+        )
+    else:
+        typed_config = payload.get("typed_config")
+        if not isinstance(typed_config, dict):
+            raise PromotionError(f"{where} has no typed evaluation config")
+        canonical_config = _canonical_bytes(typed_config)
+        config_digest = hashlib.sha256(canonical_config).hexdigest()
+        if payload.get("full_config_hash") != "sha256:" + config_digest:
+            raise PromotionError(f"{where} full config hash does not replay")
+        if payload.get("config_hash") != "sha256:" + config_digest[:16]:
+            raise PromotionError(f"{where} short config hash does not replay")
+        fields = typed_config.get("fields")
+        if typed_config.get("pipeline") != "eval" or not isinstance(fields, dict):
+            raise PromotionError(f"{where} typed config is not an eval config")
+        if fields.get("mode") != "cross_net":
+            raise PromotionError(f"{where} typed config is not cross-net")
+        if (
+            _absolute(fields.get("candidate"), base=candidate.parent) != candidate
+            or _absolute(fields.get("baseline"), base=champion.parent) != champion
+        ):
+            raise PromotionError(f"{where} typed config checkpoint identity drift")
+    expected_fields = dict(sealed_semantics)
+    expected_fields.update(
+        {
+            "candidate_n_full": sealed_semantics["n_full"],
+            "baseline_n_full": sealed_semantics["n_full"],
+            "candidate_n_full_wide": sealed_semantics["n_full_wide"],
+            "baseline_n_full_wide": sealed_semantics["n_full_wide"],
+            "candidate_n_full_wide_threshold": sealed_semantics[
+                "n_full_wide_threshold"
+            ],
+            "baseline_n_full_wide_threshold": sealed_semantics["n_full_wide_threshold"],
+            "candidate_value_readout": sealed_semantics["value_readout"],
+            "baseline_value_readout": sealed_semantics["value_readout"],
+        }
+    )
+    config_where = "pooled effective config" if pooled else "typed config"
+    _require_sealed_semantics(fields, expected_fields, where=f"{where} {config_where}")
     if fields.get("public_observation") is not True:
         raise PromotionError(f"{where} typed config is not public-observation")
     expected_information_recipe = {
@@ -522,12 +1216,15 @@ def _verify_internal_h2h_source(
         "baseline_n_full_wide_threshold",
     ):
         if fields.get(key) is not None:
-            raise PromotionError(f"{where} typed config enables forbidden wide budget {key}")
+            raise PromotionError(
+                f"{where} typed config enables forbidden wide budget {key}"
+            )
     if payload.get("verdict") != "H1":
         raise PromotionError(f"{where} verdict is not H1")
-    if payload.get("candidate_value_readout") != "scalar" or payload.get(
-        "baseline_value_readout"
-    ) != "scalar":
+    if (
+        payload.get("candidate_value_readout") != "scalar"
+        or payload.get("baseline_value_readout") != "scalar"
+    ):
         raise PromotionError(f"{where} must use scalar readouts for both roles")
     if payload.get("public_observation") is not True:
         raise PromotionError(f"{where} must use public observations")
@@ -543,9 +1240,11 @@ def _verify_internal_h2h_source(
         "n_full_wide": None,
         "n_full_wide_threshold": None,
     }
-    if not isinstance(budgets, dict) or budgets.get("candidate") != expected_budget or budgets.get(
-        "baseline"
-    ) != expected_budget:
+    if (
+        not isinstance(budgets, dict)
+        or budgets.get("candidate") != expected_budget
+        or budgets.get("baseline") != expected_budget
+    ):
         raise PromotionError(f"{where} does not use the sealed global n128 budget")
     sprt = payload.get("pentanomial_sprt")
     if not isinstance(sprt, dict) or sprt.get("decision") != "H1":
@@ -560,7 +1259,9 @@ def _verify_internal_h2h_source(
     if int(payload.get("games_truncated", -1)) != 0:
         raise PromotionError(f"{where} contains truncated games")
     games = payload.get("games")
-    if not isinstance(games, list) or len(games) != int(payload.get("games_played", -1)):
+    if not isinstance(games, list) or len(games) != int(
+        payload.get("games_played", -1)
+    ):
         raise PromotionError(f"{where} does not retain its complete game evidence")
     if len(games) != int(payload.get("games_with_winner", -1)):
         raise PromotionError(f"{where} has incomplete winner records")
@@ -575,7 +1276,12 @@ def _verify_internal_h2h_source(
 
 
 def _verify_external_panel_source(
-    payload: dict[str, Any], *, checkpoint: Path, checkpoint_md5: str, where: str
+    payload: dict[str, Any],
+    *,
+    checkpoint: Path,
+    checkpoint_md5: str,
+    where: str,
+    sealed_semantics: dict[str, Any],
 ) -> tuple[float, dict[str, Any]]:
     if payload.get("stratum") != "neutral-harness":
         raise PromotionError(f"{where} is not a neutral-harness panel")
@@ -601,26 +1307,54 @@ def _verify_external_panel_source(
         raise PromotionError(f"{where} does not prove scalar value training")
     if payload.get("n_full") != 128 or payload.get("n_full_wide") is not None:
         raise PromotionError(f"{where} does not use the sealed global n128 budget")
-    if _absolute(payload.get("candidate_checkpoint"), base=checkpoint.parent) != checkpoint:
+    if (
+        _absolute(payload.get("candidate_checkpoint"), base=checkpoint.parent)
+        != checkpoint
+    ):
         raise PromotionError(f"{where} candidate checkpoint drift")
     if payload.get("candidate_checkpoint_md5") != checkpoint_md5:
         raise PromotionError(f"{where} candidate checkpoint MD5 drift")
-    if payload.get("verdict") == "H0":
-        raise PromotionError(f"{where} records a binding external regression")
+    pooled = isinstance(payload.get("fleet_merge"), dict)
+    if pooled and payload.get("candidate_checkpoint_sha256") != _sha256(checkpoint):
+        raise PromotionError(f"{where} candidate checkpoint SHA-256 drift")
     sprt = payload.get("pentanomial_sprt")
-    if not isinstance(sprt, dict) or sprt.get("decision") not in {"H1", "continue"}:
-        raise PromotionError(f"{where} has an invalid external-panel verdict")
-    _positive_int(payload.get("complete_pairs"), where=f"{where}.complete_pairs")
+    if not isinstance(sprt, dict):
+        raise PromotionError(f"{where} has no external-panel SPRT report")
+    complete_pairs = _positive_int(
+        payload.get("complete_pairs"), where=f"{where}.complete_pairs"
+    )
+    if complete_pairs < 500:
+        raise PromotionError(f"{where} has fewer than 500 complete pairs")
     if payload.get("errors") != [] or payload.get("worker_errors") != []:
         raise PromotionError(f"{where} contains evaluation errors")
     if int(payload.get("games_engine_divergence", -1)) != 0:
         raise PromotionError(f"{where} contains engine divergence")
     rate = _finite_number(
-        payload.get("candidate_win_rate"), where=f"{where}.candidate_win_rate", minimum=0.0
+        payload.get("candidate_win_rate"),
+        where=f"{where}.candidate_win_rate",
+        minimum=0.0,
     )
+    if rate > 1.0:
+        raise PromotionError(f"{where}.candidate_win_rate must be <= 1")
     search_config = payload.get("search_config")
     if not isinstance(search_config, dict) or not search_config:
         raise PromotionError(f"{where} has no resolved search_config")
+    _require_sealed_semantics(
+        search_config, sealed_semantics, where=f"{where}.search_config"
+    )
+    if pooled:
+        effective = payload.get("effective_search_config")
+        if effective != search_config:
+            raise PromotionError(
+                f"{where} pooled effective config differs from search_config"
+            )
+        _verify_fleet_pool_provenance(
+            payload,
+            kind="external_panel",
+            checkpoint_refs={"checkpoint": (checkpoint, _sha256(checkpoint))},
+            effective_config=search_config,
+            where=where,
+        )
     for key, expected in expected_information_recipe.items():
         if search_config.get(key) != expected:
             raise PromotionError(
@@ -630,27 +1364,73 @@ def _verify_external_panel_source(
     if not isinstance(games, list) or not games:
         raise PromotionError(f"{where} has no retained paired-game cohort")
     cohort_rows: list[tuple[int, int, str]] = []
+    outcomes: list[bool] = []
+    orientations_by_pair: dict[int, set[str]] = {}
     for index, game in enumerate(games):
         if not isinstance(game, dict):
             raise PromotionError(f"{where}.games[{index}] is not an object")
-        try:
-            row = (
-                int(game["pair_id"]),
-                int(game["game_seed"]),
-                str(game["orientation"]),
+        pair_id = game.get("pair_id")
+        game_seed = game.get("game_seed")
+        orientation = game.get("orientation")
+        outcome = game.get("candidate_won")
+        if (
+            isinstance(pair_id, bool)
+            or not isinstance(pair_id, int)
+            or pair_id < 0
+            or isinstance(game_seed, bool)
+            or not isinstance(game_seed, int)
+            or game_seed < 0
+            or orientation not in {"candidate_first", "candidate_second"}
+            or not isinstance(outcome, bool)
+        ):
+            raise PromotionError(
+                f"{where}.games[{index}] lacks a complete cohort outcome"
             )
-        except (KeyError, TypeError, ValueError) as error:
-            raise PromotionError(f"{where}.games[{index}] lacks cohort identity") from error
+        row = (pair_id, game_seed, orientation)
         cohort_rows.append(row)
+        outcomes.append(outcome)
+        orientations_by_pair.setdefault(pair_id, set()).add(orientation)
     if len(set(cohort_rows)) != len(cohort_rows):
         raise PromotionError(f"{where} contains duplicate paired-game cohort rows")
+    if len(orientations_by_pair) != complete_pairs or any(
+        orientations != {"candidate_first", "candidate_second"}
+        for orientations in orientations_by_pair.values()
+    ):
+        raise PromotionError(f"{where} does not retain two orientations per pair")
     if len(games) != int(payload.get("games_played", -1)):
         raise PromotionError(f"{where} retained games differ from games_played")
+    if (
+        len(outcomes) != int(payload.get("games_with_winner", -1))
+        or int(payload.get("games_truncated", -1)) != 0
+    ):
+        raise PromotionError(f"{where} contains incomplete external-panel games")
+    wins = sum(outcomes)
+    if (
+        payload.get("candidate_wins") != wins
+        or payload.get("baseline_wins") != len(outcomes) - wins
+        or rate != wins / len(outcomes)
+    ):
+        raise PromotionError(f"{where} win-rate summary does not replay from raw games")
+    normalized_games = [{**game, "search_won": game["candidate_won"]} for game in games]
+    pair_scores, pair_diagnostics = pair_scores_from_h2h_games(normalized_games)
+    if pair_diagnostics.get("incomplete_pairs") != 0 or pair_diagnostics != payload.get(
+        "pair_diagnostics"
+    ):
+        raise PromotionError(f"{where} paired outcomes do not replay from raw games")
+    threshold_fields = ("elo0", "elo1", "alpha", "beta")
+    try:
+        replayed_sprt = evaluate_pentanomial_sprt(
+            pair_scores,
+            **{field: float(sprt[field]) for field in threshold_fields},
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise PromotionError(f"{where} has malformed external-panel SPRT") from error
+    if replayed_sprt != sprt or payload.get("verdict") != sprt.get("decision"):
+        raise PromotionError(f"{where} external-panel SPRT does not replay")
     cohort = {
         "baseline_bot": payload["baseline_bot"],
         "map_kind": payload.get("map_kind"),
         "search_config": search_config,
-        "gate_config": payload.get("gate_config"),
         "pairs_requested": payload.get("pairs_requested"),
         "games_requested": payload.get("games_requested"),
         "cohort_rows": sorted(cohort_rows),
@@ -666,6 +1446,7 @@ def _verify_high_regret_source(
     champion: Path,
     champion_sha256: str,
     where: str,
+    sealed_semantics: dict[str, Any],
 ) -> None:
     expected_keys = {
         "schema_version",
@@ -677,13 +1458,20 @@ def _verify_high_regret_source(
         "verdict",
         "complete_pairs",
         "errors",
+        "report",
+        "suite_manifest",
+        "pentanomial_sprt",
+        "pair_diagnostics",
     }
     value = _require_exact_keys(payload, expected_keys, where=where)
-    if value["schema_version"] != HIGH_REGRET_SCHEMA or value["suite"] != "held_out_high_regret":
+    if (
+        value["schema_version"] != HIGH_REGRET_SCHEMA
+        or value["suite"] != "held_out_high_regret"
+    ):
         raise PromotionError(f"{where} has an unexpected high-regret schema/suite")
     if value["held_out"] is not True or value["passed"] is not True:
         raise PromotionError(f"{where} is not a passing held-out high-regret result")
-    if value["verdict"] not in {"H1", "noninferior"}:
+    if value["verdict"] != "H1":
         raise PromotionError(f"{where} high-regret verdict is not passing")
     _verify_bound_checkpoint(
         value["candidate"],
@@ -702,6 +1490,225 @@ def _verify_high_regret_source(
     _positive_int(value["complete_pairs"], where=f"{where}.complete_pairs")
     if value["errors"] != []:
         raise PromotionError(f"{where} contains high-regret evaluation errors")
+    report_path, _report_ref = _validate_file_ref(
+        value["report"], base=candidate.parent, where=f"{where}.report"
+    )
+    suite_path, suite_ref = _validate_file_ref(
+        value["suite_manifest"], base=candidate.parent, where=f"{where}.suite_manifest"
+    )
+    report = _require_exact_keys(
+        _load_json(report_path),
+        {
+            "schema_version",
+            "suite",
+            "held_out",
+            "suite_manifest",
+            "candidate",
+            "champion",
+            "errors",
+            "games",
+            "pentanomial_sprt",
+            "pair_diagnostics",
+            "evaluation_config",
+        },
+        where=f"{where}.report payload",
+    )
+    if (
+        report["schema_version"] != HIGH_REGRET_REPORT_SCHEMA
+        or report["suite"] != "held_out_high_regret"
+        or report["held_out"] is not True
+        or report["errors"] != []
+    ):
+        raise PromotionError(f"{where}.report is not a clean held-out high-regret run")
+    _verify_bound_checkpoint(
+        report["candidate"],
+        expected_path=candidate,
+        expected_sha256=candidate_sha256,
+        where=f"{where}.report.candidate",
+        base=report_path.parent,
+    )
+    _verify_bound_checkpoint(
+        report["champion"],
+        expected_path=champion,
+        expected_sha256=champion_sha256,
+        where=f"{where}.report.champion",
+        base=report_path.parent,
+    )
+    report_suite_path, report_suite_ref = _validate_file_ref(
+        report["suite_manifest"],
+        base=report_path.parent,
+        where=f"{where}.report.suite_manifest",
+    )
+    if (
+        report_suite_path != suite_path
+        or report_suite_ref["sha256"] != suite_ref["sha256"]
+    ):
+        raise PromotionError(f"{where} and its report bind different held-out suites")
+    evaluation_config = report["evaluation_config"]
+    if not isinstance(evaluation_config, dict):
+        raise PromotionError(f"{where}.report has no evaluation_config")
+    _require_sealed_semantics(
+        evaluation_config,
+        sealed_semantics,
+        where=f"{where}.report.evaluation_config",
+    )
+    suite = _require_exact_keys(
+        _load_json(suite_path),
+        {
+            "schema_version",
+            "suite",
+            "held_out",
+            "source_manifest",
+            "selection",
+            "states",
+            "suite_sha256",
+        },
+        where=f"{where}.suite_manifest payload",
+    )
+    suite_digest = _validate_sha256(
+        suite["suite_sha256"], where=f"{where}.suite_manifest.suite_sha256"
+    )
+    unhashed_suite = dict(suite)
+    unhashed_suite.pop("suite_sha256")
+    if suite_digest != _digest_value(unhashed_suite):
+        raise PromotionError(f"{where} held-out suite semantic digest mismatch")
+    if (
+        suite["schema_version"] != HIGH_REGRET_SUITE_SCHEMA
+        or suite["suite"] != "held_out_high_regret"
+        or suite["held_out"] is not True
+    ):
+        raise PromotionError(f"{where} suite manifest is not a held-out suite")
+    _validate_file_ref(
+        suite["source_manifest"],
+        base=suite_path.parent,
+        where=f"{where}.suite_manifest.source_manifest",
+    )
+    selection = suite["selection"]
+    states = suite["states"]
+    if (
+        not isinstance(selection, dict)
+        or selection.get("algorithm") != "stable-hash-holdout-stratified-regret-v1"
+        or not isinstance(states, list)
+        or not states
+        or selection.get("selected_pairs") != len(states)
+    ):
+        raise PromotionError(f"{where} held-out suite selection is malformed")
+    expected_strata = {
+        "phase:opening",
+        "phase:robber_dev",
+        "phase:chance",
+        "phase:build_trade",
+        "41+",
+    }
+    selected_by_stratum = selection.get("selected_by_stratum")
+    stratum_min_pairs = selection.get("stratum_min_pairs")
+    if (
+        selection.get("holdout_fraction") != 0.10
+        or selection.get("holdout_seed") != 17
+        or isinstance(stratum_min_pairs, bool)
+        or not isinstance(stratum_min_pairs, int)
+        or stratum_min_pairs < 4
+        or not isinstance(selected_by_stratum, dict)
+        or set(selected_by_stratum) != expected_strata
+        or any(value != stratum_min_pairs for value in selected_by_stratum.values())
+    ):
+        raise PromotionError(
+            f"{where} held-out suite violates the fixed stratified policy"
+        )
+    state_by_pair: dict[int, tuple[int, int]] = {}
+    actual_strata = {label: 0 for label in expected_strata}
+    for index, state in enumerate(states):
+        if not isinstance(state, dict):
+            raise PromotionError(f"{where}.suite.states[{index}] is malformed")
+        pair_id = state.get("pair_id")
+        game_seed = state.get("game_seed")
+        decision_index = state.get("decision_index")
+        legal_count = state.get("legal_count")
+        if (
+            isinstance(pair_id, bool)
+            or not isinstance(pair_id, int)
+            or pair_id < 0
+            or isinstance(game_seed, bool)
+            or not isinstance(game_seed, int)
+            or isinstance(decision_index, bool)
+            or not isinstance(decision_index, int)
+            or decision_index < 0
+            or isinstance(legal_count, bool)
+            or not isinstance(legal_count, int)
+            or legal_count < 0
+            or pair_id in state_by_pair
+        ):
+            raise PromotionError(f"{where}.suite.states[{index}] has invalid identity")
+        state_by_pair[pair_id] = (game_seed, decision_index)
+        phase = str(state.get("phase", "")).upper()
+        if "BUILD_INITIAL_SETTLEMENT" in phase or "BUILD_INITIAL_ROAD" in phase:
+            phase_stratum = "opening"
+        elif "ROBBER" in phase or "KNIGHT" in phase or "DEVELOPMENT_CARD" in phase:
+            phase_stratum = "robber_dev"
+        elif "DISCARD" in phase or "ROLL" in phase:
+            phase_stratum = "chance"
+        else:
+            phase_stratum = "build_trade"
+        actual_strata[f"phase:{phase_stratum}"] += 1
+        if legal_count >= 41:
+            actual_strata["41+"] += 1
+    if any(actual_strata[label] < stratum_min_pairs for label in expected_strata):
+        raise PromotionError(f"{where} held-out suite lacks required stratum coverage")
+    games = report["games"]
+    if not isinstance(games, list) or not games:
+        raise PromotionError(f"{where}.report has no raw paired games")
+    identities: set[tuple[int, str]] = set()
+    orientations_by_pair: dict[int, set[str]] = {}
+    for index, game in enumerate(games):
+        if not isinstance(game, dict):
+            raise PromotionError(f"{where}.report.games[{index}] is malformed")
+        pair_id = game.get("pair_id")
+        orientation = game.get("orientation")
+        if (
+            isinstance(pair_id, bool)
+            or not isinstance(pair_id, int)
+            or pair_id < 0
+            or not isinstance(orientation, str)
+            or not orientation
+        ):
+            raise PromotionError(f"{where}.report.games[{index}] lacks pair identity")
+        identity = (pair_id, orientation)
+        if identity in identities or not isinstance(game.get("candidate_won"), bool):
+            raise PromotionError(
+                f"{where}.report.games[{index}] is duplicate or incomplete"
+            )
+        identities.add(identity)
+        if state_by_pair.get(pair_id) != (
+            game.get("archived_game_seed"),
+            game.get("archived_decision_index"),
+        ):
+            raise PromotionError(
+                f"{where}.report.games[{index}] is not from its held-out suite state"
+            )
+        orientations_by_pair.setdefault(pair_id, set()).add(orientation)
+    if set(orientations_by_pair) != set(state_by_pair) or any(
+        len(orientations) != 2 for orientations in orientations_by_pair.values()
+    ):
+        raise PromotionError(f"{where}.report does not cover every suite pair twice")
+    normalized_games = [{**game, "search_won": game["candidate_won"]} for game in games]
+    pair_scores, diagnostics = pair_scores_from_h2h_games(normalized_games)
+    replayed = evaluate_pentanomial_sprt(
+        pair_scores, elo0=-10.0, elo1=15.0, alpha=0.05, beta=0.05
+    )
+    complete_pairs = (
+        diagnostics["ww_pairs"] + diagnostics["split_pairs"] + diagnostics["ll_pairs"]
+    )
+    if (
+        diagnostics["incomplete_pairs"] != 0
+        or diagnostics != report["pair_diagnostics"]
+        or replayed != report["pentanomial_sprt"]
+        or diagnostics != value["pair_diagnostics"]
+        or replayed != value["pentanomial_sprt"]
+        or complete_pairs != value["complete_pairs"]
+        or replayed["decision"] != value["verdict"]
+        or replayed["decision"] != "H1"
+    ):
+        raise PromotionError(f"{where} high-regret paired statistics do not replay")
 
 
 def _verify_bucket_veto_source(
@@ -720,6 +1727,7 @@ def _verify_bucket_veto_source(
         "veto",
         "veto_buckets",
         "per_bucket",
+        "report",
     }
     value = _require_exact_keys(payload, expected_keys, where=where)
     if value["schema_version"] != BUCKET_VETO_SCHEMA:
@@ -740,6 +1748,93 @@ def _verify_bucket_veto_source(
     )
     if value["veto"] is not False or value["veto_buckets"] != []:
         raise PromotionError(f"{where} vetoes promotion")
+    report_path, _report_ref = _validate_file_ref(
+        value["report"], base=candidate.parent, where=f"{where}.report"
+    )
+    report = _require_exact_keys(
+        _load_json(report_path),
+        {"schema_version", "candidate", "champion", "errors", "games"},
+        where=f"{where}.report payload",
+    )
+    if report["schema_version"] != BUCKET_GAME_REPORT_SCHEMA or report["errors"] != []:
+        raise PromotionError(f"{where}.report is not a clean bucket-game report")
+    _verify_bound_checkpoint(
+        report["candidate"],
+        expected_path=candidate,
+        expected_sha256=candidate_sha256,
+        where=f"{where}.report.candidate",
+        base=report_path.parent,
+    )
+    _verify_bound_checkpoint(
+        report["champion"],
+        expected_path=champion,
+        expected_sha256=champion_sha256,
+        where=f"{where}.report.champion",
+        base=report_path.parent,
+    )
+    raw_games = report["games"]
+    if not isinstance(raw_games, list) or not raw_games:
+        raise PromotionError(f"{where}.report has no bucket-labelled games")
+    counts: dict[str, list[int]] = {}
+    identities: set[tuple[int, str]] = set()
+    for index, game in enumerate(raw_games):
+        if not isinstance(game, dict):
+            raise PromotionError(f"{where}.report.games[{index}] is malformed")
+        pair_id = game.get("pair_id")
+        orientation = game.get("orientation")
+        if (
+            isinstance(pair_id, bool)
+            or not isinstance(pair_id, int)
+            or pair_id < 0
+            or not isinstance(orientation, str)
+            or not orientation
+        ):
+            raise PromotionError(f"{where}.report.games[{index}] lacks pair identity")
+        identity = (pair_id, orientation)
+        outcome = game.get("candidate_won")
+        labels = game.get("buckets")
+        if identity in identities or not isinstance(outcome, bool):
+            raise PromotionError(
+                f"{where}.report.games[{index}] is duplicate or incomplete"
+            )
+        if (
+            not isinstance(labels, list)
+            or not labels
+            or not all(isinstance(label, str) and label for label in labels)
+            or len(set(labels)) != len(labels)
+        ):
+            raise PromotionError(f"{where}.report.games[{index}] has invalid buckets")
+        identities.add(identity)
+        for label in labels:
+            bucket_counts = counts.setdefault(label, [0, 0])
+            bucket_counts[0 if outcome else 1] += 1
+    replayed_buckets: dict[str, dict[str, Any]] = {}
+    replayed_veto: list[str] = []
+    for label, (wins, losses) in sorted(counts.items()):
+        count = wins + losses
+        winrate = wins / count
+        status = (
+            "insufficient_data"
+            if count < MIN_BUCKET_GAMES
+            else "pass"
+            if winrate >= MIN_BUCKET_WIN_RATE
+            else "fail"
+        )
+        replayed_buckets[label] = {"status": status, "n": count, "winrate": winrate}
+        if status == "fail":
+            replayed_veto.append(label)
+    if (
+        value["per_bucket"] != replayed_buckets
+        or value["veto_buckets"] != replayed_veto
+        or value["veto"] is not bool(replayed_veto)
+    ):
+        raise PromotionError(f"{where} bucket outcomes do not replay from raw games")
+    if set(replayed_buckets) != REQUIRED_PROMOTION_BUCKETS:
+        raise PromotionError(
+            f"{where} bucket coverage mismatch: "
+            f"missing={sorted(REQUIRED_PROMOTION_BUCKETS - set(replayed_buckets))} "
+            f"unexpected={sorted(set(replayed_buckets) - REQUIRED_PROMOTION_BUCKETS)}"
+        )
     buckets = value["per_bucket"]
     if not isinstance(buckets, dict) or not buckets:
         raise PromotionError(f"{where}.per_bucket must be a non-empty object")
@@ -748,25 +1843,31 @@ def _verify_bucket_veto_source(
             raise PromotionError(f"{where}.per_bucket is malformed")
         if result.get("status") != "pass":
             raise PromotionError(f"{where} bucket {name!r} is not a pass")
-        count = _positive_int(
-            result.get("n"), where=f"{where}.per_bucket[{name}].n"
-        )
-        if count < 8:
+        count = _positive_int(result.get("n"), where=f"{where}.per_bucket[{name}].n")
+        if count < MIN_BUCKET_GAMES:
             raise PromotionError(f"{where} bucket {name!r} has insufficient data")
-        _finite_number(
-            result.get("winrate"), where=f"{where}.per_bucket[{name}].winrate", minimum=0.0
+        winrate = _finite_number(
+            result.get("winrate"),
+            where=f"{where}.per_bucket[{name}].winrate",
+            minimum=0.0,
         )
+        if winrate < MIN_BUCKET_WIN_RATE:
+            raise PromotionError(
+                f"{where} bucket {name!r} regresses by more than the fixed 5% limit"
+            )
 
 
 def _verify_promotion_evidence(
     path: Path,
     *,
     kind: str,
-    contract_sha256: str,
+    contract: dict[str, Any],
     expected_readout: str = "scalar",
     candidate: dict[str, Any],
     champion: dict[str, Any],
 ) -> dict[str, Any]:
+    contract_sha256 = contract["contract_sha256"]
+    sealed_semantics = _sealed_evaluation_semantics(contract)
     value = _load_json(path)
     expected_keys = {
         "schema_version",
@@ -820,7 +1921,9 @@ def _verify_promotion_evidence(
         )
         role = item["role"]
         if not isinstance(role, str) or role in source_by_role:
-            raise PromotionError(f"{kind} evidence source role is invalid or duplicated")
+            raise PromotionError(
+                f"{kind} evidence source role is invalid or duplicated"
+            )
         source_path, _verified = _validate_file_ref(
             {"path": item["path"], "sha256": item["sha256"]},
             base=path.parent,
@@ -842,15 +1945,19 @@ def _verify_promotion_evidence(
             raise PromotionError("mechanism calibration value_readout drift")
         candidate_rmse, candidate_cohort = _verify_calibration_source(
             source_by_role["candidate_calibration"][1],
+            source_path=source_by_role["candidate_calibration"][0],
             checkpoint=candidate_path,
             expected_readout=expected_readout,
             where="candidate calibration",
         )
         champion_rmse, champion_cohort = _verify_calibration_source(
             source_by_role["champion_calibration"][1],
+            source_path=source_by_role["champion_calibration"][0],
             checkpoint=champion_path,
             expected_readout=expected_readout,
             where="champion calibration",
+            contract=contract,
+            allow_legacy_incumbent=True,
         )
         if candidate_cohort != champion_cohort:
             raise PromotionError(
@@ -866,7 +1973,9 @@ def _verify_promotion_evidence(
                 "mechanism calibration regression limit differs from the fixed policy"
             )
         if candidate_rmse > champion_rmse + max_regression:
-            raise PromotionError("candidate calibration exceeds the allowed RMSE regression")
+            raise PromotionError(
+                "candidate calibration exceeds the allowed RMSE regression"
+            )
         if value["verdict"] != "pass":
             raise PromotionError("mechanism calibration verdict is not pass")
     elif kind == "internal_h2h":
@@ -877,6 +1986,7 @@ def _verify_promotion_evidence(
             candidate=candidate_path,
             champion=champion_path,
             where="internal H2H",
+            sealed_semantics=sealed_semantics,
         )
         if value["verdict"] != "H1" or result:
             raise PromotionError("internal H2H envelope verdict/result drift")
@@ -895,12 +2005,14 @@ def _verify_promotion_evidence(
             checkpoint=candidate_path,
             checkpoint_md5=candidate["md5"],
             where="candidate external panel",
+            sealed_semantics=sealed_semantics,
         )
         champion_rate, champion_cohort = _verify_external_panel_source(
             champion_panel,
             checkpoint=champion_path,
             checkpoint_md5=champion["md5"],
             where="champion external panel",
+            sealed_semantics=sealed_semantics,
         )
         if candidate_cohort != champion_cohort:
             raise PromotionError(
@@ -921,7 +2033,9 @@ def _verify_promotion_evidence(
                 "external panel regression limit differs from the fixed policy"
             )
         if candidate_rate + max_regression < champion_rate:
-            raise PromotionError("candidate external panel exceeds the allowed regression")
+            raise PromotionError(
+                "candidate external panel exceeds the allowed regression"
+            )
         if value["verdict"] != "pass":
             raise PromotionError("external panel envelope verdict is not pass")
     elif kind == "high_regret":
@@ -934,6 +2048,7 @@ def _verify_promotion_evidence(
             champion=champion_path,
             champion_sha256=champion["sha256"],
             where="high-regret comparison",
+            sealed_semantics=sealed_semantics,
         )
         if value["verdict"] != "pass":
             raise PromotionError("high-regret envelope verdict is not pass")
@@ -959,6 +2074,8 @@ def _verify_adjudication(
     path: Path,
     *,
     contract: dict[str, Any],
+    contract_lock: Path,
+    training_receipt: Path,
     registry: ChampionRegistry,
     current_pointer: Path,
 ) -> dict[str, Any]:
@@ -994,7 +2111,9 @@ def _verify_adjudication(
 
     base = path.parent
     candidate_raw = _require_exact_keys(
-        value["candidate"], {"path", "sha256", "version", "training_report"}, where="candidate"
+        value["candidate"],
+        {"path", "sha256", "version", "training_report"},
+        where="candidate",
     )
     candidate_path, candidate_ref = _validate_file_ref(
         {"path": candidate_raw["path"], "sha256": candidate_raw["sha256"]},
@@ -1011,6 +2130,15 @@ def _verify_adjudication(
         candidate_path=candidate_path,
         candidate_sha256=candidate_ref["sha256"],
     )
+    training_receipt_ref = _verify_one_dose_training_receipt(
+        training_receipt,
+        contract_lock=contract_lock,
+        contract=contract,
+        candidate_path=candidate_path,
+        candidate_sha256=candidate_ref["sha256"],
+        training_report_path=training_path,
+        training_report_sha256=training_ref["sha256"],
+    )
     champion_raw = _require_exact_keys(
         value["champion"], {"path", "sha256", "version"}, where="champion"
     )
@@ -1019,13 +2147,22 @@ def _verify_adjudication(
         base=base,
         where="champion",
     )
-    if candidate_path == champion_path or candidate_ref["sha256"] == champion_ref["sha256"]:
-        raise PromotionError("candidate and incumbent champion must have distinct bytes")
+    if (
+        candidate_path == champion_path
+        or candidate_ref["sha256"] == champion_ref["sha256"]
+    ):
+        raise PromotionError(
+            "candidate and incumbent champion must have distinct bytes"
+        )
     for label, raw_version in (
         ("candidate.version", candidate_raw["version"]),
         ("champion.version", champion_raw["version"]),
     ):
-        if isinstance(raw_version, bool) or not isinstance(raw_version, int) or raw_version < 0:
+        if (
+            isinstance(raw_version, bool)
+            or not isinstance(raw_version, int)
+            or raw_version < 0
+        ):
             raise PromotionError(f"{label} must be a non-negative integer")
     if candidate_raw["version"] != champion_raw["version"] + 1:
         raise PromotionError("candidate version must be exactly incumbent version + 1")
@@ -1033,20 +2170,30 @@ def _verify_adjudication(
     incumbent = registry.get_role("generator_champion")
     if incumbent is None:
         raise PromotionError("authoritative registry has no generator_champion")
-    if str(Path(incumbent.checkpoint_path).expanduser().resolve()) != str(champion_path):
-        raise PromotionError("adjudicated champion path differs from registry generator_champion")
+    if str(Path(incumbent.checkpoint_path).expanduser().resolve()) != str(
+        champion_path
+    ):
+        raise PromotionError(
+            "adjudicated champion path differs from registry generator_champion"
+        )
     if incumbent.md5 != _md5(champion_path):
-        raise PromotionError("registry generator_champion md5 differs from incumbent bytes")
+        raise PromotionError(
+            "registry generator_champion md5 differs from incumbent bytes"
+        )
     if incumbent.version != champion_raw["version"]:
         raise PromotionError("adjudicated champion version differs from registry")
     if _read_current_pointer(current_pointer) != str(champion_path):
-        raise PromotionError("CURRENT_CHAMPION pointer differs from adjudicated incumbent")
+        raise PromotionError(
+            "CURRENT_CHAMPION pointer differs from adjudicated incumbent"
+        )
 
     candidate_binding = {**candidate_ref, "md5": _md5(candidate_path)}
     champion_binding = {**champion_ref, "md5": _md5(champion_path)}
 
     checks = _require_exact_keys(value["checks"], REQUIRED_CHECKS, where="checks")
-    failed_checks = sorted(name for name, passed in checks.items() if passed is not True)
+    failed_checks = sorted(
+        name for name, passed in checks.items() if passed is not True
+    )
     if failed_checks:
         raise PromotionError(f"adjudication has non-passing checks: {failed_checks}")
     next_count = registry.promotion_count("generator_champion") + 1
@@ -1079,7 +2226,7 @@ def _verify_adjudication(
         _verify_promotion_evidence(
             evidence_path,
             kind=kind,
-            contract_sha256=contract_sha,
+            contract=contract,
             expected_readout=str(
                 contract["science"]["learner_value_objective"]["value_readout"]
             ),
@@ -1102,6 +2249,7 @@ def _verify_adjudication(
             "md5": candidate_binding["md5"],
             "training_report": training_ref,
         },
+        "training_receipt": training_receipt_ref,
         "champion": {
             **champion_ref,
             "version": champion_raw["version"],
@@ -1133,6 +2281,13 @@ def _stage_registry(
             "a1_contract_sha256": contract_sha256,
             "a1_promotion_adjudication": str(adjudication_path),
             "a1_promotion_adjudication_sha256": verified["adjudication_sha256"],
+            "a1_one_dose_training_receipt": verified["training_receipt"]["path"],
+            "a1_one_dose_training_receipt_sha256": verified["training_receipt"][
+                "sha256"
+            ],
+            "a1_one_dose_execution_binding_sha256": verified["training_receipt"][
+                "execution_binding_sha256"
+            ],
             "a1_promotion_receipt": str(receipt_path),
             "fleet_ckpt_updated": False,
         }
@@ -1175,6 +2330,7 @@ def prepare_promotion(
     current_pointer: Path,
     contract_lock: Path,
     adjudication_path: Path,
+    training_receipt: Path,
     receipt_path: Path,
     reason: str,
     verify_lock_fn: Callable[..., dict[str, Any]] = a1_contract.verify_lock,
@@ -1189,14 +2345,21 @@ def prepare_promotion(
     adjudication_path = _canonical_existing_file(
         adjudication_path, where="promotion adjudication"
     )
+    training_receipt = _canonical_existing_file(
+        training_receipt, where="A1 one-dose training receipt"
+    )
     receipt_path = _canonical_new_file(receipt_path, where="promotion receipt")
     if registry_path.stat().st_size == 0:
-        raise PromotionError("authoritative registry must be an existing non-empty file")
+        raise PromotionError(
+            "authoritative registry must be an existing non-empty file"
+        )
     contract = _verify_contract(contract_lock, verify_lock_fn=verify_lock_fn)
     registry = ChampionRegistry.load(registry_path)
     verified = _verify_adjudication(
         adjudication_path,
         contract=contract,
+        contract_lock=contract_lock,
+        training_receipt=training_receipt,
         registry=registry,
         current_pointer=current_pointer,
     )
@@ -1237,6 +2400,7 @@ def prepare_promotion(
             "path": str(adjudication_path.resolve()),
             "adjudication_sha256": verified["adjudication_sha256"],
         },
+        "training_receipt": verified["training_receipt"],
         "candidate": verified["candidate"],
         "champion": verified["champion"],
         "evidence": verified["evidence"],
@@ -1264,6 +2428,7 @@ def execute_promotion(
     current_pointer: Path,
     contract_lock: Path,
     adjudication_path: Path,
+    training_receipt: Path,
     receipt_path: Path,
     reason: str,
     lock_path: Path | None = None,
@@ -1280,6 +2445,9 @@ def execute_promotion(
     adjudication_path = _canonical_existing_file(
         adjudication_path, where="promotion adjudication"
     )
+    training_receipt = _canonical_existing_file(
+        training_receipt, where="A1 one-dose training receipt"
+    )
     receipt_path = _canonical_new_file(receipt_path, where="promotion receipt")
     lock_path = _enforce_canonical_lock(registry_path, lock_path)
     with _exclusive_lock(lock_path):
@@ -1288,6 +2456,7 @@ def execute_promotion(
             current_pointer=current_pointer,
             contract_lock=contract_lock,
             adjudication_path=adjudication_path,
+            training_receipt=training_receipt,
             receipt_path=receipt_path,
             reason=reason,
             verify_lock_fn=verify_lock_fn,
@@ -1350,7 +2519,9 @@ def execute_promotion(
                 raise PromotionError(
                     f"promotion failed and rollback was incomplete: {rollback_errors}"
                 ) from error
-            raise PromotionError("promotion failed; original registry/pointer restored") from error
+            raise PromotionError(
+                "promotion failed; original registry/pointer restored"
+            ) from error
 
 
 def _load_recovery_receipt(
@@ -1358,13 +2529,15 @@ def _load_recovery_receipt(
 ) -> tuple[dict[str, Any], Path, Path, Path, Path, Path]:
     receipt_path = _canonical_existing_file(receipt_path, where="promotion receipt")
     receipt = _verify_receipt_digest(_load_json(receipt_path))
-    if receipt.get("schema_version") != RECEIPT_SCHEMA:
-        raise PromotionError(f"receipt schema must be {RECEIPT_SCHEMA!r}")
+    receipt_schema = receipt.get("schema_version")
+    if receipt_schema not in {RECEIPT_SCHEMA, LEGACY_RECEIPT_SCHEMA}:
+        raise PromotionError(
+            f"receipt schema must be {RECEIPT_SCHEMA!r} or legacy "
+            f"{LEGACY_RECEIPT_SCHEMA!r}"
+        )
     status = receipt.get("status")
     if status not in {"prepared", "committed", "rollback_failed"}:
-        raise PromotionError(
-            f"receipt status {status!r} is not recoverable"
-        )
+        raise PromotionError(f"receipt status {status!r} is not recoverable")
     base_keys = {
         "schema_version",
         "transaction_id",
@@ -1385,6 +2558,8 @@ def _load_recovery_receipt(
         "lock_path",
         "receipt_sha256",
     }
+    if receipt_schema == RECEIPT_SCHEMA:
+        base_keys.add("training_receipt")
     status_keys = {
         "prepared": set(),
         "committed": {"committed_at"},
@@ -1392,7 +2567,9 @@ def _load_recovery_receipt(
     }[str(status)]
     _require_exact_keys(receipt, base_keys | status_keys, where="recovery receipt")
     registry_state = _require_exact_keys(
-        receipt["registry"], {"path", "before_sha256", "after_sha256"}, where="receipt.registry"
+        receipt["registry"],
+        {"path", "before_sha256", "after_sha256"},
+        where="receipt.registry",
     )
     current_state = _require_exact_keys(
         receipt["current_pointer"],
@@ -1443,7 +2620,10 @@ def _load_recovery_receipt(
         Path(str(rollback["current_backup"])), where="current-pointer rollback backup"
     )
     expected_registry_backup, expected_current_backup = _backup_paths(receipt_path)
-    if registry_backup != expected_registry_backup or current_backup != expected_current_backup:
+    if (
+        registry_backup != expected_registry_backup
+        or current_backup != expected_current_backup
+    ):
         raise PromotionError("receipt rollback backup paths are not transaction-local")
     return (
         receipt,
@@ -1527,20 +2707,27 @@ def recover_transaction(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
-    promote = subparsers.add_parser("promote", help="preflight or commit one A1 promotion")
+    promote = subparsers.add_parser(
+        "promote", help="preflight or commit one A1 promotion"
+    )
     promote.add_argument("--registry", required=True, type=Path)
     promote.add_argument("--current-pointer", required=True, type=Path)
     promote.add_argument("--contract-lock", required=True, type=Path)
     promote.add_argument("--adjudication", required=True, type=Path)
+    promote.add_argument("--training-receipt", required=True, type=Path)
     promote.add_argument("--receipt", required=True, type=Path)
     promote.add_argument("--reason", required=True)
     promote.add_argument("--lock-file", type=Path, default=None)
     promote.add_argument("--go", action="store_true", help="commit; default is dry-run")
 
-    recover = subparsers.add_parser("recover", help="restore exact before bytes from a receipt")
+    recover = subparsers.add_parser(
+        "recover", help="restore exact before bytes from a receipt"
+    )
     recover.add_argument("--receipt", required=True, type=Path)
     recover.add_argument("--lock-file", type=Path, default=None)
-    recover.add_argument("--go", action="store_true", help="restore; default is dry-run")
+    recover.add_argument(
+        "--go", action="store_true", help="restore; default is dry-run"
+    )
     return parser
 
 
@@ -1553,6 +2740,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 current_pointer=args.current_pointer,
                 contract_lock=args.contract_lock,
                 adjudication_path=args.adjudication,
+                training_receipt=args.training_receipt,
                 receipt_path=args.receipt,
                 reason=args.reason,
                 lock_path=args.lock_file,

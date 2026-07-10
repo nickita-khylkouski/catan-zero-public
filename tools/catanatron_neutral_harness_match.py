@@ -192,7 +192,9 @@ def _search_config(
         correct_rust_chance_spectra=bool(search_kwargs["correct_rust_chance_spectra"]),
         max_root_candidates=int(search_kwargs["max_root_candidates"]),
         max_root_candidates_wide=int(search_kwargs["max_root_candidates_wide"]),
-        wide_candidates_threshold=int(search_kwargs.get("wide_candidates_threshold", 24)),
+        wide_candidates_threshold=int(
+            search_kwargs.get("wide_candidates_threshold", 24)
+        ),
         n_full_wide=(
             int(search_kwargs["n_full_wide"])
             if search_kwargs.get("n_full_wide") is not None
@@ -203,25 +205,40 @@ def _search_config(
             if search_kwargs.get("n_full_wide_threshold") is not None
             else None
         ),
-        wide_roots_always_full=bool(
-            search_kwargs.get("wide_roots_always_full", False)
-        ),
-        symmetry_averaged_eval=bool(
-            search_kwargs.get("symmetry_averaged_eval", False)
-        ),
+        wide_roots_always_full=bool(search_kwargs.get("wide_roots_always_full", False)),
+        symmetry_averaged_eval=bool(search_kwargs.get("symmetry_averaged_eval", False)),
         symmetry_averaged_eval_threshold=(
             int(search_kwargs["symmetry_averaged_eval_threshold"])
             if search_kwargs.get("symmetry_averaged_eval_threshold") is not None
             else None
         ),
-        information_set_search=bool(
-            search_kwargs.get("information_set_search", False)
-        ),
+        information_set_search=bool(search_kwargs.get("information_set_search", False)),
         determinization_particles=int(
             search_kwargs.get("determinization_particles", 1)
         ),
         determinization_min_simulations=int(
             search_kwargs.get("determinization_min_simulations", 32)
+        ),
+        belief_chance_spectra=bool(search_kwargs.get("belief_chance_spectra", False)),
+        rescale_noise_floor_c=float(search_kwargs.get("rescale_noise_floor_c", 0.0)),
+        sigma_eval=float(search_kwargs.get("sigma_eval", 0.79)),
+        raw_policy_above_width=search_kwargs.get("raw_policy_above_width"),
+        exact_budget_sh=bool(search_kwargs.get("exact_budget_sh", False)),
+        exact_budget_sh_min_n=int(search_kwargs.get("exact_budget_sh_min_n", 0)),
+        root_wave_batching=bool(search_kwargs.get("root_wave_batching", False)),
+        play_sh_winner=bool(search_kwargs.get("play_sh_winner", False)),
+        use_batch_api=bool(search_kwargs.get("use_batch_api", True)),
+        policy_target_min_visits=int(search_kwargs.get("policy_target_min_visits", 0)),
+        uncertainty_backup_weighting=bool(
+            search_kwargs.get("uncertainty_backup_weighting", False)
+        ),
+        uncertainty_backup_a=float(search_kwargs.get("uncertainty_backup_a", 0.25)),
+        uncertainty_backup_exp=float(search_kwargs.get("uncertainty_backup_exp", 1.0)),
+        uncertainty_backup_cap=float(search_kwargs.get("uncertainty_backup_cap", 1.0)),
+        variance_aware_q=bool(search_kwargs.get("variance_aware_q", False)),
+        variance_aware_k=float(search_kwargs.get("variance_aware_k", 1.0)),
+        variance_aware_closed_form_js=bool(
+            search_kwargs.get("variance_aware_closed_form_js", False)
         ),
     )
 
@@ -342,6 +359,14 @@ def _checkpoint_md5(path: str | Path) -> str:
     return digest.hexdigest()
 
 
+def _checkpoint_sha256(path: str | Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return "sha256:" + digest.hexdigest()
+
+
 def _run_fingerprint(config: dict[str, Any]) -> str:
     payload = json.dumps(config, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
@@ -378,9 +403,7 @@ def _search_recipe(args: Any) -> dict[str, Any]:
         "public_observation": bool(args.public_observation),
         "information_set_search": bool(args.information_set_search),
         "determinization_particles": int(args.determinization_particles),
-        "determinization_min_simulations": int(
-            args.determinization_min_simulations
-        ),
+        "determinization_min_simulations": int(args.determinization_min_simulations),
         "prior_temperature": float(args.prior_temperature),
         "value_scale": float(args.value_scale),
         "value_squash": str(args.value_squash),
@@ -388,6 +411,30 @@ def _search_recipe(args: Any) -> dict[str, Any]:
         "max_root_candidates": int(args.max_root_candidates),
         "max_root_candidates_wide": int(args.max_root_candidates_wide),
         "wide_candidates_threshold": int(args.wide_candidates_threshold),
+        "n_fast": int(args.n_full),
+        "p_full": 1.0,
+        "temperature": 0.0,
+        "play_sh_winner": False,
+        "belief_chance_spectra": bool(getattr(args, "belief_chance_spectra", False)),
+        "rescale_noise_floor_c": float(getattr(args, "rescale_noise_floor_c", 0.0)),
+        "sigma_eval": float(getattr(args, "sigma_eval", 0.98)),
+        "raw_policy_above_width": None,
+        "exact_budget_sh": False,
+        "exact_budget_sh_min_n": 0,
+        "root_wave_batching": False,
+        "use_batch_api": True,
+        "policy_target_min_visits": 0,
+        "uncertainty_backup_weighting": False,
+        "uncertainty_backup_a": 0.25,
+        "uncertainty_backup_exp": 1.0,
+        "uncertainty_backup_cap": 1.0,
+        "variance_aware_q": False,
+        "variance_aware_k": 1.0,
+        "variance_aware_closed_form_js": False,
+        "evaluator_context_fill": 0.0,
+        "evaluator_cache_size": 0,
+        "evaluator_rust_featurize": False,
+        "evaluator_emit_uncertainty": False,
         "symmetry_averaged_eval": bool(args.symmetry_averaged_eval),
         "symmetry_averaged_eval_threshold": (
             int(args.symmetry_averaged_eval_threshold)
@@ -397,7 +444,9 @@ def _search_recipe(args: Any) -> dict[str, Any]:
     }
 
 
-def _game_semantics(args: Any, checkpoint_md5: str) -> dict[str, Any]:
+def _game_semantics(
+    args: Any, checkpoint_md5: str, checkpoint_sha256: str
+) -> dict[str, Any]:
     inference_devices = (
         [item.strip() for item in args.devices.split(",") if item.strip()]
         if args.devices
@@ -408,8 +457,9 @@ def _game_semantics(args: Any, checkpoint_md5: str) -> dict[str, Any]:
         "mode": str(args.mode),
         "checkpoint": str(Path(args.checkpoint).expanduser().resolve()),
         "checkpoint_md5": checkpoint_md5,
+        "checkpoint_sha256": checkpoint_sha256,
         "opponent": str(args.opponent),
-        "base_seed": int(args.base_seed),
+        "base_seed": int(getattr(args, "base_seed", 1)),
         "vps_to_win": int(args.vps_to_win),
         "sample": bool(args.sample),
         "max_player_trade_offers_per_turn": int(args.max_player_trade_offers_per_turn),
@@ -503,9 +553,13 @@ def _build_evaluator(worker_args: dict[str, Any]) -> Any:
         config=EntityGraphRustEvaluatorConfig(
             value_scale=float(worker_args["value_scale"]),
             prior_temperature=float(worker_args["prior_temperature"]),
+            context_fill=float(worker_args.get("evaluator_context_fill", 0.0)),
+            cache_size=int(worker_args.get("evaluator_cache_size", 0)),
             value_squash=str(worker_args["value_squash"]),
             value_readout=str(worker_args["value_readout"]),
             public_observation=bool(worker_args["public_observation"]),
+            rust_featurize=bool(worker_args.get("evaluator_rust_featurize", False)),
+            emit_uncertainty=bool(worker_args.get("evaluator_emit_uncertainty", False)),
         ),
     )
 
@@ -650,6 +704,7 @@ def build_summary(
     *,
     games: list[dict[str, Any]],
     checkpoint_md5: str,
+    checkpoint_sha256: str,
     run_fingerprint: str,
     artifact_dir: Path,
     elapsed_sec: float,
@@ -714,6 +769,7 @@ def build_summary(
         "referee_engine": "vendored_python_catanatron",
         "candidate_checkpoint": str(args.checkpoint),
         "candidate_checkpoint_md5": checkpoint_md5,
+        "candidate_checkpoint_sha256": checkpoint_sha256,
         "baseline_bot": str(args.opponent),
         "mode": str(args.mode),
         "map_kind": "BASE" if args.mode == "raw_policy" else SEARCH_MAP_KIND,
@@ -761,9 +817,7 @@ def build_summary(
             int(args.determinization_particles) if args.mode == "search" else None
         ),
         "determinization_min_simulations": (
-            int(args.determinization_min_simulations)
-            if args.mode == "search"
-            else None
+            int(args.determinization_min_simulations) if args.mode == "search" else None
         ),
         "candidate_value_readout": (
             str(args.value_readout) if args.mode == "search" else "scalar"
@@ -788,6 +842,7 @@ def build_summary(
         "max_player_trade_offers_per_turn": int(args.max_player_trade_offers_per_turn),
         "vps_to_win": int(args.vps_to_win),
         "pairs_requested": int(args.pairs),
+        "base_seed": int(getattr(args, "base_seed", 1)),
         "complete_pairs": complete_pairs,
         "games_requested": int(args.pairs) * 2,
         "games_played": len(games),
@@ -876,6 +931,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--c-scale", type=float, default=0.03)
     parser.add_argument("--c-visit", type=float, default=50.0)
     parser.add_argument(
+        "--rescale-noise-floor-c",
+        type=float,
+        default=0.0,
+        help="Completed-Q noise-floor attenuation (sealed A1 default: disabled).",
+    )
+    parser.add_argument(
+        "--sigma-eval",
+        type=float,
+        default=0.98,
+        help="Value-noise estimate used by completed-Q attenuation.",
+    )
+    parser.add_argument(
         "--lazy-interior-chance", action=argparse.BooleanOptionalAction, default=True
     )
     parser.add_argument(
@@ -889,6 +956,12 @@ def build_parser() -> argparse.ArgumentParser:
             "Search public-belief determinizations instead of cloning authoritative "
             "hidden truth. Required for every public-observation search panel."
         ),
+    )
+    parser.add_argument(
+        "--belief-chance-spectra",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Legacy chance-spectrum belief correction (PIMC supersedes it in A1).",
     )
     parser.add_argument("--determinization-particles", type=int, default=4)
     parser.add_argument("--determinization-min-simulations", type=int, default=32)
@@ -1046,6 +1119,7 @@ def main() -> None:
     args.threads_per_worker = threads_per_worker
 
     checkpoint_md5 = _checkpoint_md5(args.checkpoint)
+    checkpoint_sha256 = _checkpoint_sha256(args.checkpoint)
     trained_value_readouts = ("scalar",)
     if args.mode == "search":
         try:
@@ -1054,7 +1128,7 @@ def main() -> None:
             )
         except (OSError, KeyError, TypeError, ValueError) as error:
             parser.error(f"checkpoint value-readout preflight failed: {error}")
-    semantics = _game_semantics(args, checkpoint_md5)
+    semantics = _game_semantics(args, checkpoint_md5, checkpoint_sha256)
     if args.mode == "search":
         semantics["trained_value_readouts"] = list(trained_value_readouts)
     fingerprint = _run_fingerprint(semantics)
@@ -1181,6 +1255,7 @@ def main() -> None:
         args,
         games=list(all_records.values()),
         checkpoint_md5=checkpoint_md5,
+        checkpoint_sha256=checkpoint_sha256,
         run_fingerprint=fingerprint,
         artifact_dir=artifact_dir,
         elapsed_sec=elapsed,

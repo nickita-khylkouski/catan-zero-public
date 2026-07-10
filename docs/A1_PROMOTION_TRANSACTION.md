@@ -23,6 +23,15 @@ gate, alter `public_champion`, or deploy checkpoint bytes to the fleet.
 - The candidate training report reproduces the sealed A1 learner recipe and
   contract digests, records masking, names the exact candidate checkpoint,
   binds the sealed producer hash, and has positive optimizer steps/epochs.
+- A successful direct `a1-one-dose-training-receipt-v3` or the single
+  authorized graph-layer-repair `a1-one-dose-training-receipt-v4` is required
+  separately from the adjudication. For v4, the orchestrator additionally
+  replays the failed v3 parent, immutable retry contract and identity, and
+  derived terminal claim through `adopt-retry`. The transaction verifies the
+  receipt semantic digest, exact command/allowlisted child environment,
+  executor-owned report binding, candidate/report/optimizer hashes, and
+  terminal durable-claim agreement. A plausible standalone training report
+  cannot authorize promotion.
 - The registry is nonempty, its `generator_champion` path/version/MD5 matches
   the adjudicated incumbent, and `CURRENT_CHAMPION` contains that same single
   path.
@@ -90,15 +99,109 @@ observed row count; comparing metrics from different cohorts is refused.
 Internal H2H retains and replays all paired games and the flywheel
 pentanomial GSPRT, requiring global n128, at least 200 complete pairs, and H1.
 External evidence references candidate and incumbent neutral-harness reports,
-rejects H0/errors/divergence, and applies the fixed `0.02` maximum win-rate
-regression. The two panels must have identical opponent, map/search/gate config,
-requested pair counts, and exact `(pair_id, game_seed, orientation)` cohort.
+replays every raw outcome, and applies the fixed `0.02` maximum win-rate
+regression. Individual absolute SPRT verdicts are diagnostic only (both honest
+panels may be H0); changing their Elo thresholds cannot change eligibility. The
+two panels must have identical opponent, map/search config, requested pair
+counts, and exact `(pair_id, game_seed, orientation)` cohort.
 Calibration likewise uses an exact fixed `0.02` maximum global-RMSE
 regression; envelopes cannot select either tolerance. High-regret evidence must use
 `a1-high-regret-comparison-v1` and prove a passing held-out paired result.
 Bucket evidence must use `a1-bucket-veto-v1`; every included bucket must be a
 real pass with at least eight games. `insufficient_data` is a promotion refusal,
 not a silent non-veto.
+
+## Build the evidence graph
+
+Do not hand-author any of the JSON above. The canonical producer is
+`tools/a1_promotion_artifacts.py`. It creates every output with `O_EXCL`, makes
+it read-only, hashes each source, and replays the transaction validator before
+publishing an evidence envelope or adjudication.
+
+Derive the high-regret comparison from the held-out evaluator report and the
+bucket veto from raw, bucket-labelled game records. Aggregate counts are not
+accepted because they cannot prove cohort identity or be independently replayed:
+
+```bash
+# One-time frozen suite: deterministic 10% hash holdout, then fixed stratified
+# regret-descending selection (opening, robber/dev, chance, build/trade, 41+).
+python tools/a1_promotion_artifacts.py held-out-suite \
+  --manifest /immutable/raw_10pct_regret.npz \
+  --holdout-fraction 0.10 --holdout-seed 17 --pairs 200 \
+  --out /immutable/a1-high-regret.suite.json
+
+# Real candidate-vs-champion continuations from every frozen archived state.
+python tools/gumbel_search_cross_net_h2h.py \
+  --candidate /immutable/candidate.pt --baseline /immutable/champion.pt \
+  --held-out-high-regret-suite /immutable/a1-high-regret.suite.json \
+  --workers 8 --devices cuda:0,cuda:1,cuda:2,cuda:3 \
+  --n-full 128 --max-decisions 600 --gate-config flywheel \
+  --public-observation --information-set-search \
+  --determinization-particles 4 --determinization-min-simulations 32 \
+  --c-scale 0.03 --c-visit 50 --sigma-eval 0.98 \
+  --lazy-interior-chance --symmetry-averaged-eval \
+  --symmetry-averaged-eval-threshold 20 \
+  --out /immutable/high-regret.report.json
+
+python tools/a1_promotion_artifacts.py high-regret \
+  --report /immutable/high-regret.report.json \
+  --candidate /immutable/candidate.pt \
+  --champion /immutable/champion.pt \
+  --out /immutable/high-regret.source.json
+
+python tools/a1_promotion_artifacts.py bucket-report \
+  --report /immutable/high-regret.report.json \
+  --candidate /immutable/candidate.pt \
+  --champion /immutable/champion.pt \
+  --out /immutable/bucket-games.report.json
+
+python tools/a1_promotion_artifacts.py bucket-veto \
+  --report /immutable/bucket-games.report.json \
+  --candidate /immutable/candidate.pt \
+  --champion /immutable/champion.pt \
+  --out /immutable/bucket-veto.source.json
+```
+
+The high-regret input is `a1-held-out-high-regret-report-v1` and must bind the
+exact checkpoint bytes, `suite=held_out_high_regret`, `held_out=true`, a
+no errors, immutable held-out-suite provenance, and raw paired games whose
+pentanomial statistics replay to `H1`. The bucket input is
+`a1-bucket-game-report-v1`; the builder computes status, sample size, win rate,
+and veto directly from unique bucket-labelled games rather than accepting
+caller-authored result fields.
+
+Wrap each verified source and then build the final adjudication. `--source` and
+`--evidence` are repeatable `ROLE=PATH` / `KIND=PATH` arguments:
+
+```bash
+python tools/a1_promotion_artifacts.py evidence \
+  --kind high_regret \
+  --contract-lock /immutable/a1.lock.json \
+  --candidate /immutable/candidate.pt \
+  --champion /immutable/champion.pt \
+  --source high_regret=/immutable/high-regret.source.json \
+  --out /immutable/high-regret.evidence.json
+
+python tools/a1_promotion_artifacts.py adjudicate \
+  --contract-lock /immutable/a1.lock.json \
+  --training-receipt /immutable/training.receipt.json \
+  --registry /private/champion_registry.json \
+  --current-pointer /private/CURRENT_CHAMPION \
+  --candidate /immutable/candidate.pt --candidate-version 5 \
+  --training-report /immutable/report.json \
+  --champion /immutable/champion.pt --champion-version 4 \
+  --evidence mechanism_calibration=/immutable/calibration.evidence.json \
+  --evidence internal_h2h=/immutable/internal.evidence.json \
+  --evidence external_panel=/immutable/external.evidence.json \
+  --evidence high_regret=/immutable/high-regret.evidence.json \
+  --evidence bucket_veto=/immutable/bucket-veto.evidence.json \
+  --out /immutable/a1.promotion.json
+```
+
+For every third generator promotion, the registry-derived policy additionally
+requires `--nth-confirmation-passed`; the flag is refused on other promotions.
+The subsequent promotion transaction still re-verifies the entire graph, so
+the builder is not a second authorization boundary.
 
 ## Dry-run, commit, and recovery
 
@@ -110,6 +213,7 @@ python tools/a1_promotion_transaction.py promote \
   --current-pointer /private/CURRENT_CHAMPION \
   --contract-lock /immutable/a1.lock.json \
   --adjudication /immutable/a1.promotion.json \
+  --training-receipt /immutable/a1.one-dose.receipt.json \
   --receipt /private/receipts/a1-p5.json \
   --reason "A1 typed promotion"
 ```
@@ -120,6 +224,10 @@ only `generator_champion` is changed, the promotion counter increments, and
 the plain-text current pointer changes to the candidate path. Receipt
 provenance explicitly records `fleet_ckpt_updated=false`; remote fleet paths
 remain a separate hash-verified deployment action.
+
+New transactions use `a1-promotion-transaction-receipt-v2` and bind the
+verified v3 direct-dose or v4 derived-retry receipt. Recovery remains compatible
+with already-prepared v1 promotion receipts.
 
 The lock is always derived from the canonical registry path as
 `<registry>.a1.lock`. `--lock-file` remains accepted for command compatibility

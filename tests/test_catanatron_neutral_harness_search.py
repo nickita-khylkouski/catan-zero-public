@@ -233,6 +233,8 @@ def test_parser_preserves_raw_smoke_default_and_exposes_search_recipe() -> None:
     assert args.mode == "raw_policy"
     assert args.n_full == 64
     assert args.c_scale == 0.03
+    assert args.rescale_noise_floor_c == 0.0
+    assert args.sigma_eval == 0.98
     assert args.lazy_interior_chance is True
     assert args.public_observation is True
     assert args.information_set_search is True
@@ -288,7 +290,8 @@ def test_neutral_search_runtime_and_fingerprint_share_d6_adaptive_recipe() -> No
     assert config.determinization_particles == 4
     assert config.determinization_min_simulations == 32
 
-    semantics = _game_semantics(args, "checkpoint-md5")
+    semantics = _game_semantics(args, "checkpoint-md5", "sha256:" + "1" * 64)
+    assert semantics["checkpoint_sha256"] == "sha256:" + "1" * 64
     assert semantics["search"] == recipe
     default_args = parser.parse_args(
         [
@@ -303,7 +306,7 @@ def test_neutral_search_runtime_and_fingerprint_share_d6_adaptive_recipe() -> No
         ]
     )
     assert _run_fingerprint(semantics) != _run_fingerprint(
-        _game_semantics(default_args, "checkpoint-md5")
+        _game_semantics(default_args, "checkpoint-md5", "sha256:" + "1" * 64)
     )
 
 
@@ -330,6 +333,10 @@ def test_search_evaluator_receives_explicit_categorical_readout(monkeypatch) -> 
         }
     )
     assert captured["config"].value_readout == "categorical"
+    assert captured["config"].cache_size == 0
+    assert captured["config"].context_fill == 0.0
+    assert captured["config"].rust_featurize is False
+    assert captured["config"].emit_uncertainty is False
 
 
 def test_neutral_harness_categorical_preflight_requires_training_provenance(
@@ -454,6 +461,7 @@ def test_summary_stays_gate_and_whr_compatible(tmp_path: Path) -> None:
         args,
         games=games,
         checkpoint_md5="abc",
+        checkpoint_sha256="sha256:" + "1" * 64,
         run_fingerprint="fingerprint",
         artifact_dir=tmp_path,
         elapsed_sec=1.5,
@@ -463,6 +471,7 @@ def test_summary_stays_gate_and_whr_compatible(tmp_path: Path) -> None:
         trained_value_readouts=("scalar", "categorical"),
     )
     assert summary["candidate_checkpoint"] == "checkpoint.pt"
+    assert summary["candidate_checkpoint_sha256"] == "sha256:" + "1" * 64
     assert summary["baseline_bot"] == "catanatron_value"
     assert len(summary["games"]) == 4
     assert summary["pentanomial_sprt"]["pairs"] == 2

@@ -90,7 +90,7 @@ _T = TypeVar("_T", bound="PipelineConfig")
 
 # Bump when the *set* of fields on any pipeline config changes so that hashes
 # from before/after the change are never mistaken for equal regimes.
-CONFIG_SCHEMA_VERSION = 5
+CONFIG_SCHEMA_VERSION = 6
 
 # Length (hex chars) of the short hash embedded in artifacts. 16 hex chars =
 # 64 bits; collision probability is negligible for the run counts here and the
@@ -500,6 +500,33 @@ class EvalConfig(PipelineConfig):
     # SPRT thresholds echoed by the eval tool (the gate re-derives its own).
     elo0: float = 0.0
     elo1: float = 30.0
+
+    # Complete search/evaluator semantics.  These fields are intentionally
+    # persisted even when the corresponding experiment is disabled: promotion
+    # evidence must prove the evaluator used the sealed no-op value rather than
+    # silently inheriting whatever default a newer binary happens to have.
+    n_fast: int = 64
+    p_full: float = 1.0
+    force_full_every_decision: bool = True
+    temperature: float = 0.0
+    play_sh_winner: bool = False
+    wide_roots_always_full: bool = False
+    exact_budget_sh: bool = False
+    exact_budget_sh_min_n: int = 0
+    root_wave_batching: bool = False
+    use_batch_api: bool = True
+    policy_target_min_visits: int = 0
+    uncertainty_backup_weighting: bool = False
+    uncertainty_backup_a: float = 0.25
+    uncertainty_backup_exp: float = 1.0
+    uncertainty_backup_cap: float = 1.0
+    variance_aware_q: bool = False
+    variance_aware_k: float = 1.0
+    variance_aware_closed_form_js: bool = False
+    evaluator_context_fill: float = 0.0
+    evaluator_cache_size: int = 0
+    evaluator_rust_featurize: bool = False
+    evaluator_emit_uncertainty: bool = False
 
     @classmethod
     def from_namespace(cls, args: Any, *, mode: str, **overrides: Any) -> "EvalConfig":

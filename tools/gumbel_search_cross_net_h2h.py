@@ -26,6 +26,7 @@ EXCLUDED from the SPRT input.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import multiprocessing
 import sys
@@ -37,23 +38,177 @@ _TOOLS_DIR = Path(__file__).resolve().parent
 if str(_TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(_TOOLS_DIR))
 
-from catan_zero.rl.config_cli import add_config_flags, resolve_config
-from catan_zero.rl.gumbel_self_play import _apply_selected_action
-from catan_zero.rl.pipeline_configs import EvalConfig
-from catan_zero.search.gumbel_chance_mcts import (
+from catan_zero.rl.config_cli import add_config_flags, resolve_config  # noqa: E402
+from catan_zero.rl.gumbel_self_play import _apply_selected_action  # noqa: E402
+from catan_zero.rl.pipeline_configs import EvalConfig  # noqa: E402
+from catan_zero.search.gumbel_chance_mcts import (  # noqa: E402
     GumbelChanceMCTS,
     GumbelChanceMCTSConfig,
     _matches_explicit_or_legacy_width_gate,
 )
-from catan_zero.search.neural_rust_mcts import (
+from catan_zero.search.neural_rust_mcts import (  # noqa: E402
     BatchedEntityGraphRustEvaluator,
     EntityGraphRustEvaluatorConfig,
 )
-from catan_zero.search.rust_mcts import _require_rust_module
-from factory_common import write_json
-from sprt_gate import GATE_CONFIGS, evaluate_pentanomial_sprt, evaluate_sprt, pair_scores_from_h2h_games, resolve_gate_config
+from catan_zero.search.rust_mcts import _require_rust_module  # noqa: E402
+from factory_common import write_json  # noqa: E402
+from sprt_gate import (  # noqa: E402
+    GATE_CONFIGS,
+    evaluate_pentanomial_sprt,
+    evaluate_sprt,
+    pair_scores_from_h2h_games,
+    resolve_gate_config,
+)
 
 COLORS: tuple[str, ...] = ("RED", "BLUE")
+
+
+def _promotion_phase_bucket(phases: set[str]) -> str:
+    upper = " ".join(phases).upper()
+    if "BUILD_INITIAL_SETTLEMENT" in upper or "BUILD_INITIAL_ROAD" in upper:
+        return "opening"
+    if "ROBBER" in upper or "KNIGHT" in upper or "DEVELOPMENT_CARD" in upper:
+        return "robber_dev"
+    if "DISCARD" in upper or "ROLL" in upper:
+        return "chance"
+    return "build_trade"
+
+
+def _checkpoint_sha256(path: str | Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return "sha256:" + digest.hexdigest()
+
+
+def _load_held_out_high_regret_suite(
+    path: str | Path,
+) -> tuple[Path, dict[str, Any], list[dict[str, Any]]]:
+    """Load and replay the immutable suite envelope before any GPU work."""
+
+    suite_path = Path(path).expanduser().resolve()
+    try:
+        suite = json.loads(suite_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"cannot load held-out suite: {error}") from error
+    expected_keys = {
+        "schema_version",
+        "suite",
+        "held_out",
+        "source_manifest",
+        "selection",
+        "states",
+        "suite_sha256",
+    }
+    if not isinstance(suite, dict) or set(suite) != expected_keys:
+        raise ValueError("held-out suite has an unexpected schema")
+    if (
+        suite["schema_version"] != "a1-held-out-high-regret-suite-v1"
+        or suite["suite"] != "held_out_high_regret"
+        or suite["held_out"] is not True
+    ):
+        raise ValueError("held-out suite identity is invalid")
+    unhashed = dict(suite)
+    declared_digest = unhashed.pop("suite_sha256")
+    actual_digest = (
+        "sha256:"
+        + hashlib.sha256(
+            json.dumps(unhashed, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+    )
+    if declared_digest != actual_digest:
+        raise ValueError("held-out suite semantic digest mismatch")
+    source_ref = suite["source_manifest"]
+    if not isinstance(source_ref, dict) or set(source_ref) != {"path", "sha256"}:
+        raise ValueError("held-out suite source manifest reference is malformed")
+    source_path = Path(str(source_ref["path"])).expanduser()
+    if not source_path.is_absolute():
+        source_path = suite_path.parent / source_path
+    source_path = source_path.resolve()
+    if (
+        not source_path.is_file()
+        or _checkpoint_sha256(source_path) != source_ref["sha256"]
+    ):
+        raise ValueError("held-out suite source manifest is missing or drifted")
+    selection = suite["selection"]
+    states = suite["states"]
+    if (
+        not isinstance(selection, dict)
+        or selection.get("algorithm") != "stable-hash-holdout-stratified-regret-v1"
+        or not isinstance(states, list)
+        or not states
+        or selection.get("selected_pairs") != len(states)
+    ):
+        raise ValueError("held-out suite selection is malformed")
+    expected_strata = {
+        "phase:opening",
+        "phase:robber_dev",
+        "phase:chance",
+        "phase:build_trade",
+        "41+",
+    }
+    selected_by_stratum = selection.get("selected_by_stratum")
+    stratum_min_pairs = selection.get("stratum_min_pairs")
+    if (
+        selection.get("holdout_fraction") != 0.10
+        or selection.get("holdout_seed") != 17
+        or isinstance(stratum_min_pairs, bool)
+        or not isinstance(stratum_min_pairs, int)
+        or stratum_min_pairs < 4
+        or not isinstance(selected_by_stratum, dict)
+        or set(selected_by_stratum) != expected_strata
+        or any(value != stratum_min_pairs for value in selected_by_stratum.values())
+    ):
+        raise ValueError("held-out suite does not satisfy the fixed stratified policy")
+    pairs: list[dict[str, Any]] = []
+    pair_ids: set[int] = set()
+    for index, raw_state in enumerate(states):
+        if not isinstance(raw_state, dict):
+            raise ValueError(f"held-out suite state {index} is malformed")
+        state = dict(raw_state)
+        shard_path = Path(str(state.get("shard_path", ""))).expanduser()
+        if not shard_path.is_absolute():
+            shard_path = suite_path.parent / shard_path
+        state["shard_path"] = str(shard_path.resolve())
+        pair_id = state.get("pair_id")
+        game_seed = state.get("game_seed")
+        decision_index = state.get("decision_index")
+        legal_count = state.get("legal_count")
+        if (
+            isinstance(pair_id, bool)
+            or not isinstance(pair_id, int)
+            or pair_id < 0
+            or pair_id in pair_ids
+            or isinstance(game_seed, bool)
+            or not isinstance(game_seed, int)
+            or isinstance(decision_index, bool)
+            or not isinstance(decision_index, int)
+            or decision_index < 0
+            or isinstance(legal_count, bool)
+            or not isinstance(legal_count, int)
+            or legal_count < 0
+        ):
+            raise ValueError(f"held-out suite state {index} lacks valid identity")
+        pair_ids.add(pair_id)
+        pairs.append(
+            {
+                "pair_id": pair_id,
+                "game_seed": game_seed,
+                "archived_state": state,
+            }
+        )
+    actual_strata = {
+        f"phase:{stratum}": sum(
+            _promotion_phase_bucket({str(state.get("phase", ""))}) == stratum
+            for state in states
+        )
+        for stratum in ("opening", "robber_dev", "chance", "build_trade")
+    }
+    actual_strata["41+"] = sum(state["legal_count"] >= 41 for state in states)
+    if any(actual_strata[label] < stratum_min_pairs for label in expected_strata):
+        raise ValueError("held-out suite retained states do not cover every stratum")
+    return suite_path, suite, pairs
 
 
 def _new_search_telemetry() -> dict[str, dict[str, float | int]]:
@@ -147,8 +302,7 @@ def _finalize_search_telemetry(
             else None
         ),
         "candidate_over_baseline_simulations_per_call_ratio": (
-            float(candidate_simulations_per_call)
-            / float(baseline_simulations_per_call)
+            float(candidate_simulations_per_call) / float(baseline_simulations_per_call)
             if candidate_simulations_per_call is not None
             and baseline_simulations_per_call is not None
             and float(baseline_simulations_per_call) > 0.0
@@ -177,15 +331,31 @@ def play_one_h2h_game(
     max_decisions: int,
     correct_rust_chance_spectra: bool,
     search_telemetry_by_role: dict[str, dict[str, float | int]] | None = None,
+    initial_game: Any | None = None,
+    initial_chance_rng: Any | None = None,
+    archived_game_seed: int | None = None,
+    archived_decision_index: int | None = None,
+    archived_phase: str | None = None,
+    archived_legal_count: int | None = None,
 ) -> dict[str, Any]:
     import random
 
-    catanatron_rs = _require_rust_module()
-    game = catanatron_rs.Game.simple(list(COLORS), seed=int(game_seed))
-    chance_rng = random.Random(int(game_seed) ^ 0xA17E)
+    if (initial_game is None) != (initial_chance_rng is None):
+        raise ValueError(
+            "initial_game and initial_chance_rng must be supplied together"
+        )
+    if initial_game is None:
+        catanatron_rs = _require_rust_module()
+        game = catanatron_rs.Game.simple(list(COLORS), seed=int(game_seed))
+        chance_rng = random.Random(int(game_seed) ^ 0xA17E)
+    else:
+        game = initial_game
+        chance_rng = initial_chance_rng
 
     decision_index = 0
     terminal = False
+    phases_seen: set[str] = set()
+    max_legal_count = int(archived_legal_count or 0)
     while decision_index < int(max_decisions):
         if game.winning_color() is not None:
             terminal = True
@@ -193,6 +363,15 @@ def play_one_h2h_game(
         legal_rust = tuple(
             int(action) for action in game.playable_action_indices(list(COLORS), None)
         )
+        max_legal_count = max(max_legal_count, len(legal_rust))
+        try:
+            current_phase = str(
+                json.loads(game.json_snapshot()).get("current_prompt", "")
+            )
+        except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+            current_phase = ""
+        if current_phase:
+            phases_seen.add(current_phase)
         if not legal_rust:
             break
 
@@ -229,9 +408,7 @@ def play_one_h2h_game(
                 if selected != int(prior_argmax):
                     role_telemetry["selected_vs_prior_disagreement_calls"] += 1
                     if wide_root:
-                        role_telemetry[
-                            "wide_selected_vs_prior_disagreement_calls"
-                        ] += 1
+                        role_telemetry["wide_selected_vs_prior_disagreement_calls"] += 1
 
         game = _apply_selected_action(
             game,
@@ -251,9 +428,29 @@ def play_one_h2h_game(
         state = json.loads(game.player_state_json(color))
         final_vps[color] = int(state.get("victory_points", 0) or 0)
 
-    candidate_color = next(color for color, role in role_by_color.items() if role == "candidate")
-    baseline_color = next(color for color, role in role_by_color.items() if role == "baseline")
+    candidate_color = next(
+        color for color, role in role_by_color.items() if role == "candidate"
+    )
+    baseline_color = next(
+        color for color, role in role_by_color.items() if role == "baseline"
+    )
     candidate_won = (winner == candidate_color) if terminal else None
+    start_phase = str(archived_phase or "")
+    if start_phase:
+        phases_seen.add(start_phase)
+    phase_bucket = _promotion_phase_bucket(
+        {start_phase} if start_phase else phases_seen
+    )
+    buckets = [f"phase:{phase_bucket}"]
+    phase_upper = " ".join(phases_seen).upper()
+    if "BUILD_INITIAL_SETTLEMENT" in phase_upper or "BUILD_INITIAL_ROAD" in phase_upper:
+        buckets.append("opening")
+    if max_legal_count >= 41:
+        buckets.append("41+")
+    vp_margin = abs(
+        final_vps.get(candidate_color, 0) - final_vps.get(baseline_color, 0)
+    )
+    buckets.append("blowout" if vp_margin >= 3 else "close")
 
     return {
         "game_seed": int(game_seed),
@@ -265,6 +462,11 @@ def play_one_h2h_game(
         "decisions": int(decision_index),
         "final_vps": final_vps,
         "candidate_won": candidate_won,
+        "buckets": sorted(set(buckets)),
+        "max_legal_count": max_legal_count,
+        "phases_seen": sorted(phases_seen),
+        "archived_game_seed": archived_game_seed,
+        "archived_decision_index": archived_decision_index,
         # Kept for reuse of sprt_gate.py's pair_scores_from_h2h_games /
         # _concordant_pair_outcomes, which key off "search_won" generically.
         "search_won": candidate_won,
@@ -401,16 +603,22 @@ def _build_evaluator(
     elif role == "baseline":
         value_readout = baseline_readout
     else:
-        raise ValueError(f"unknown evaluator role {role!r}; expected candidate|baseline")
+        raise ValueError(
+            f"unknown evaluator role {role!r}; expected candidate|baseline"
+        )
     return BatchedEntityGraphRustEvaluator.from_checkpoint(
         checkpoint,
         device=worker_args["device"],
         config=EntityGraphRustEvaluatorConfig(
             value_scale=float(worker_args["value_scale"]),
             prior_temperature=float(worker_args["prior_temperature"]),
+            context_fill=float(worker_args.get("evaluator_context_fill", 0.0)),
+            cache_size=int(worker_args.get("evaluator_cache_size", 0)),
             value_squash=str(worker_args.get("value_squash", "tanh")),
             value_readout=value_readout,
             public_observation=bool(worker_args.get("public_observation", False)),
+            rust_featurize=bool(worker_args.get("evaluator_rust_featurize", False)),
+            emit_uncertainty=bool(worker_args.get("evaluator_emit_uncertainty", False)),
         ),
     )
 
@@ -463,12 +671,8 @@ def _build_search_config(
         correct_rust_chance_spectra=bool(worker_args["correct_rust_chance_spectra"]),
         lazy_interior_chance=bool(worker_args.get("lazy_interior_chance", False)),
         belief_chance_spectra=bool(worker_args.get("belief_chance_spectra", False)),
-        information_set_search=bool(
-            worker_args.get("information_set_search", False)
-        ),
-        determinization_particles=int(
-            worker_args.get("determinization_particles", 1)
-        ),
+        information_set_search=bool(worker_args.get("information_set_search", False)),
+        determinization_particles=int(worker_args.get("determinization_particles", 1)),
         determinization_min_simulations=int(
             worker_args.get("determinization_min_simulations", 32)
         ),
@@ -492,21 +696,48 @@ def _build_search_config(
             if worker_args.get("symmetry_averaged_eval_threshold") is not None
             else None
         ),
+        wide_roots_always_full=bool(worker_args.get("wide_roots_always_full", False)),
+        exact_budget_sh=bool(worker_args.get("exact_budget_sh", False)),
+        exact_budget_sh_min_n=int(worker_args.get("exact_budget_sh_min_n", 0)),
+        root_wave_batching=bool(worker_args.get("root_wave_batching", False)),
+        play_sh_winner=bool(worker_args.get("play_sh_winner", False)),
+        use_batch_api=bool(worker_args.get("use_batch_api", True)),
+        policy_target_min_visits=int(worker_args.get("policy_target_min_visits", 0)),
+        uncertainty_backup_weighting=bool(
+            worker_args.get("uncertainty_backup_weighting", False)
+        ),
+        uncertainty_backup_a=float(worker_args.get("uncertainty_backup_a", 0.25)),
+        uncertainty_backup_exp=float(worker_args.get("uncertainty_backup_exp", 1.0)),
+        uncertainty_backup_cap=float(worker_args.get("uncertainty_backup_cap", 1.0)),
+        variance_aware_q=bool(worker_args.get("variance_aware_q", False)),
+        variance_aware_k=float(worker_args.get("variance_aware_k", 1.0)),
+        variance_aware_closed_form_js=bool(
+            worker_args.get("variance_aware_closed_form_js", False)
+        ),
     )
 
 
-def _write_worker_progress(progress_dir: str, worker_index: int, games_done: int, wins: int) -> None:
+def _write_worker_progress(
+    progress_dir: str, worker_index: int, games_done: int, wins: int
+) -> None:
     """Atomically write this worker's running tally so a poller can sum all worker_*.json for a
     live win-rate read (fixes the old 'no progress until the very end' blindness)."""
     if not progress_dir:
         return
     import os as _os
+
     p = _os.path.join(progress_dir, f"worker_{worker_index:03d}.json")
     tmp = p + ".tmp"
     try:
         with open(tmp, "w") as fh:
-            json.dump({"worker_index": worker_index, "games_done": games_done,
-                       "candidate_wins": wins}, fh)
+            json.dump(
+                {
+                    "worker_index": worker_index,
+                    "games_done": games_done,
+                    "candidate_wins": wins,
+                },
+                fh,
+            )
         _os.replace(tmp, p)
     except OSError:
         pass
@@ -556,6 +787,7 @@ def _run_worker(worker_args: dict[str, Any]) -> dict[str, Any]:
     games: list[dict[str, Any]] = []
     pair_errors: list[dict[str, Any]] = []
     search_telemetry = _new_search_telemetry()
+    archived_sequences: dict[tuple[str, int], Any] = {}
     try:
         for pair in worker_args["pairs"]:
             game_seed = int(pair["game_seed"])
@@ -568,29 +800,73 @@ def _run_worker(worker_args: dict[str, Any]) -> dict[str, Any]:
                     ("candidate_red", {"RED": "candidate", "BLUE": "baseline"}),
                     ("candidate_blue", {"RED": "baseline", "BLUE": "candidate"}),
                 ):
+                    archived = pair.get("archived_state")
+                    initial: dict[str, Any] = {}
+                    if archived is not None:
+                        from reconstruct_state import (
+                            action_size_for_colors,
+                            gather_game_action_sequence,
+                            reconstruct_state,
+                        )
+
+                        shard_path = str(archived["shard_path"])
+                        cache_key = (shard_path, game_seed)
+                        if cache_key not in archived_sequences:
+                            archived_sequences[cache_key] = gather_game_action_sequence(
+                                Path(shard_path).parent, game_seed, colors=COLORS
+                            )
+                        sequence = archived_sequences[cache_key]
+                        game, chance_rng = reconstruct_state(
+                            game_seed,
+                            sequence.actions,
+                            int(archived["decision_index"]),
+                            colors=COLORS,
+                            correct_rust_chance_spectra=bool(
+                                worker_args["correct_rust_chance_spectra"]
+                            ),
+                            action_size=action_size_for_colors(COLORS),
+                            return_rng=True,
+                        )
+                        initial = {
+                            "initial_game": game,
+                            "initial_chance_rng": chance_rng,
+                            "archived_game_seed": game_seed,
+                            "archived_decision_index": int(archived["decision_index"]),
+                            "archived_phase": str(archived.get("phase", "")),
+                            "archived_legal_count": int(archived.get("legal_count", 0)),
+                        }
                     record = play_one_h2h_game(
                         mcts_by_role,
                         role_by_color=role_by_color,
                         game_seed=game_seed,
                         max_decisions=int(worker_args["max_decisions"]),
-                        correct_rust_chance_spectra=bool(worker_args["correct_rust_chance_spectra"]),
+                        correct_rust_chance_spectra=bool(
+                            worker_args["correct_rust_chance_spectra"]
+                        ),
                         search_telemetry_by_role=search_telemetry,
+                        **initial,
                     )
                     record["orientation"] = orientation
                     record["pair_id"] = int(pair["pair_id"])
                     pair_games.append(record)
             except Exception as error:  # noqa: BLE001 - keep the worker's other pairs.
-                pair_errors.append({
-                    "pair_id": int(pair["pair_id"]),
-                    "game_seed": game_seed,
-                    "error": repr(error),
-                })
+                pair_errors.append(
+                    {
+                        "pair_id": int(pair["pair_id"]),
+                        "game_seed": game_seed,
+                        "error": repr(error),
+                    }
+                )
                 continue
             games.extend(pair_games)
             # incremental progress after each pair (2 games), so a poller sees a live win rate
             _wins = sum(1 for g in games if g.get("candidate_won"))
-            _write_worker_progress(worker_args.get("progress_dir", ""),
-                                   int(worker_args["worker_index"]), len(games), _wins)
+            _write_worker_progress(
+                worker_args.get("progress_dir", ""),
+                int(worker_args["worker_index"]),
+                len(games),
+                _wins,
+            )
     finally:
         candidate_evaluator.close()
         baseline_evaluator.close()
@@ -633,13 +909,18 @@ def main() -> None:
     )
     parser.add_argument("--candidate", required=True, help="Candidate checkpoint path.")
     parser.add_argument("--baseline", required=True, help="Baseline checkpoint path.")
-    parser.add_argument("--pairs", type=int, default=50, help="paired seeds; total games = 2x this")
+    parser.add_argument(
+        "--pairs", type=int, default=50, help="paired seeds; total games = 2x this"
+    )
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--device", default="cpu")
-    parser.add_argument("--devices", default=None,
-                        help="comma-list of devices to spread workers across, e.g. "
-                             "cuda:0,cuda:1 (round-robin per worker; overrides --device). "
-                             "Halves wall-time on a 2-GPU box.")
+    parser.add_argument(
+        "--devices",
+        default=None,
+        help="comma-list of devices to spread workers across, e.g. "
+        "cuda:0,cuda:1 (round-robin per worker; overrides --device). "
+        "Halves wall-time on a 2-GPU box.",
+    )
     parser.add_argument("--n-full", type=int, default=64)
     parser.add_argument(
         "--candidate-n-full",
@@ -693,12 +974,24 @@ def main() -> None:
         default=False,
         help="Run search with lazy interior chance evaluation (#52 lazy-vs-raw arm).",
     )
-    parser.add_argument("--value-squash", choices=("tanh", "clip"), default="tanh",
-                        help="Evaluator value squash (#60 diagnostic arm).")
-    parser.add_argument("--c-visit", type=float, default=50.0,
-                        help="Sigma c_visit floor; 1.0 = visit-scaled sigma (armV diagnostic).")
-    parser.add_argument("--c-scale", type=float, default=0.1,
-                        help="Sigma scale multiplier (matches GumbelChanceMCTSConfig default).")
+    parser.add_argument(
+        "--value-squash",
+        choices=("tanh", "clip"),
+        default="tanh",
+        help="Evaluator value squash (#60 diagnostic arm).",
+    )
+    parser.add_argument(
+        "--c-visit",
+        type=float,
+        default=50.0,
+        help="Sigma c_visit floor; 1.0 = visit-scaled sigma (armV diagnostic).",
+    )
+    parser.add_argument(
+        "--c-scale",
+        type=float,
+        default=0.1,
+        help="Sigma scale multiplier (matches GumbelChanceMCTSConfig default).",
+    )
     parser.add_argument(
         "--rescale-noise-floor-c",
         type=float,
@@ -711,10 +1004,18 @@ def main() -> None:
         default=0.79,
         help="Value-estimate noise stdev used by --rescale-noise-floor-c.",
     )
-    parser.add_argument("--max-root-candidates", type=int, default=16,
-                        help="Root Gumbel-Top-k candidate cap on normal roots (SNR arm: 8).")
-    parser.add_argument("--max-root-candidates-wide", type=int, default=54,
-                        help="Root Gumbel-Top-k cap on wide (placement) roots; 16 = narrow diagnostic arm.")
+    parser.add_argument(
+        "--max-root-candidates",
+        type=int,
+        default=16,
+        help="Root Gumbel-Top-k candidate cap on normal roots (SNR arm: 8).",
+    )
+    parser.add_argument(
+        "--max-root-candidates-wide",
+        type=int,
+        default=54,
+        help="Root Gumbel-Top-k cap on wide (placement) roots; 16 = narrow diagnostic arm.",
+    )
     parser.add_argument(
         "--wide-candidates-threshold",
         type=int,
@@ -751,10 +1052,14 @@ def main() -> None:
     )
     parser.add_argument("--determinization-particles", type=int, default=1)
     parser.add_argument("--determinization-min-simulations", type=int, default=32)
-    parser.add_argument("--n-full-wide", type=int, default=None,
-                        help="Backwards-compatible shared wide-root simulation budget for both "
-                        "roles. Role-specific flags override this fallback for only that side. "
-                        "Default None = use each role's normal n_full at wide roots.")
+    parser.add_argument(
+        "--n-full-wide",
+        type=int,
+        default=None,
+        help="Backwards-compatible shared wide-root simulation budget for both "
+        "roles. Role-specific flags override this fallback for only that side. "
+        "Default None = use each role's normal n_full at wide roots.",
+    )
     parser.add_argument(
         "--n-full-wide-threshold",
         type=int,
@@ -794,9 +1099,13 @@ def main() -> None:
         help="Baseline-only inclusive n_full_wide width gate (default: inherit "
         "--n-full-wide-threshold).",
     )
-    parser.add_argument("--raw-policy-above-width", type=int, default=None,
-                        help="Phase-gated-search arm: at roots wider than this many legal actions, "
-                        "skip search and play argmax(prior). Default None = always search (disabled).")
+    parser.add_argument(
+        "--raw-policy-above-width",
+        type=int,
+        default=None,
+        help="Phase-gated-search arm: at roots wider than this many legal actions, "
+        "skip search and play argmax(prior). Default None = always search (disabled).",
+    )
     parser.add_argument(
         "--symmetry-averaged-eval",
         action=argparse.BooleanOptionalAction,
@@ -817,13 +1126,26 @@ def main() -> None:
     )
     parser.add_argument("--base-seed", type=int, default=1)
     parser.add_argument(
+        "--held-out-high-regret-suite",
+        default=None,
+        help=(
+            "Evaluate every archived state in an immutable "
+            "a1-held-out-high-regret-suite-v1 manifest instead of fresh starts; "
+            "emits a1-held-out-high-regret-report-v1 for promotion replay."
+        ),
+    )
+    parser.add_argument(
         "--gate-config",
         choices=sorted(GATE_CONFIGS),
         default="flywheel",
         help="Named SPRT gate config (CAT-7) providing --elo0/--elo1 defaults; explicit flags override.",
     )
-    parser.add_argument("--elo0", type=float, default=None, help="Override --gate-config's elo0.")
-    parser.add_argument("--elo1", type=float, default=None, help="Override --gate-config's elo1.")
+    parser.add_argument(
+        "--elo0", type=float, default=None, help="Override --gate-config's elo0."
+    )
+    parser.add_argument(
+        "--elo1", type=float, default=None, help="Override --gate-config's elo1."
+    )
     parser.add_argument(
         "--threads-per-worker",
         type=int,
@@ -839,7 +1161,9 @@ def main() -> None:
         _validate_information_set_recipe(args)
     except ValueError as exc:
         parser.error(str(exc))
-    _gate_cfg, _gate_params = resolve_gate_config(args.gate_config, elo0=args.elo0, elo1=args.elo1)
+    _gate_cfg, _gate_params = resolve_gate_config(
+        args.gate_config, elo0=args.elo0, elo1=args.elo1
+    )
     args.elo0, args.elo1 = _gate_params["elo0"], _gate_params["elo1"]
 
     # CAT-66 typed config + config-hash (cross-checkpoint search-vs-search regime).
@@ -849,18 +1173,17 @@ def main() -> None:
         return EvalConfig.from_namespace(
             resolved_args,
             mode="cross_net",
+            n_fast=budgets["candidate_n_full"],
+            p_full=1.0,
+            force_full_every_decision=True,
             candidate_value_readout=candidate_readout,
             baseline_value_readout=baseline_readout,
             candidate_n_full=budgets["candidate_n_full"],
             baseline_n_full=budgets["baseline_n_full"],
             candidate_n_full_wide=budgets["candidate_n_full_wide"],
             baseline_n_full_wide=budgets["baseline_n_full_wide"],
-            candidate_n_full_wide_threshold=budgets[
-                "candidate_n_full_wide_threshold"
-            ],
-            baseline_n_full_wide_threshold=budgets[
-                "baseline_n_full_wide_threshold"
-            ],
+            candidate_n_full_wide_threshold=budgets["candidate_n_full_wide_threshold"],
+            baseline_n_full_wide_threshold=budgets["baseline_n_full_wide_threshold"],
         )
 
     eval_config = resolve_config(
@@ -870,16 +1193,35 @@ def main() -> None:
     )
     eval_config_hash = eval_config.config_hash()
     eval_full_config_hash = eval_config.full_config_hash()
+    candidate_checkpoint_sha256 = _checkpoint_sha256(args.candidate)
+    baseline_checkpoint_sha256 = _checkpoint_sha256(args.baseline)
     candidate_value_readout, baseline_value_readout = _resolve_value_readouts(args)
 
-    pairs = [{"pair_id": i, "game_seed": int(args.base_seed) + i} for i in range(max(1, int(args.pairs)))]
+    high_regret_suite_path: Path | None = None
+    if args.held_out_high_regret_suite:
+        try:
+            high_regret_suite_path, _high_regret_suite, pairs = (
+                _load_held_out_high_regret_suite(args.held_out_high_regret_suite)
+            )
+        except ValueError as error:
+            parser.error(str(error))
+    else:
+        pairs = [
+            {"pair_id": i, "game_seed": int(args.base_seed) + i}
+            for i in range(max(1, int(args.pairs)))
+        ]
     workers = max(1, int(args.workers))
     threads_per_worker = int(args.threads_per_worker)
     if threads_per_worker <= 0:
         import os as _os
 
         threads_per_worker = max(1, (_os.cpu_count() or workers) // workers)
-    for name in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+    for name in (
+        "OMP_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+    ):
         import os as _os
 
         _os.environ[name] = str(threads_per_worker)
@@ -888,10 +1230,13 @@ def main() -> None:
         shards[i % workers].append(pair)
 
     # Multi-GPU: spread workers round-robin across --devices (falls back to --device).
-    devices = [d.strip() for d in args.devices.split(",")] if args.devices else [args.device]
+    devices = (
+        [d.strip() for d in args.devices.split(",")] if args.devices else [args.device]
+    )
     # Live progress: workers write per-worker tallies here so a poller can peek the running win rate
     # without waiting for the whole run (the old single-write-at-end blindness).
     from pathlib import Path as _Path
+
     progress_dir = _Path(args.out).parent / "progress"
     progress_dir.mkdir(parents=True, exist_ok=True)
 
@@ -931,7 +1276,9 @@ def main() -> None:
             "max_root_candidates": int(args.max_root_candidates),
             "max_root_candidates_wide": int(args.max_root_candidates_wide),
             "wide_candidates_threshold": int(args.wide_candidates_threshold),
-            "n_full_wide": (int(args.n_full_wide) if args.n_full_wide is not None else None),
+            "n_full_wide": (
+                int(args.n_full_wide) if args.n_full_wide is not None else None
+            ),
             "n_full_wide_threshold": (
                 int(args.n_full_wide_threshold)
                 if args.n_full_wide_threshold is not None
@@ -982,14 +1329,30 @@ def main() -> None:
         with ctx.Pool(processes=len(worker_args)) as pool:
             # imap_unordered streams results as each worker finishes, so we can log incremental
             # completion (and the per-worker progress files give an even finer live read).
-            for done, result in enumerate(pool.imap_unordered(_worker_entry, worker_args), start=1):
+            for done, result in enumerate(
+                pool.imap_unordered(_worker_entry, worker_args), start=1
+            ):
                 results.append(result)
                 _g = sum(len(r.get("games", ())) for r in results)
-                _w = sum(1 for r in results for gm in r.get("games", ()) if gm.get("candidate_won"))
-                print(json.dumps({"progress": "worker_done", "workers_done": done,
-                                  "workers_total": len(worker_args), "games_so_far": _g,
-                                  "candidate_wins_so_far": _w,
-                                  "running_winrate": round(_w / _g, 4) if _g else None}), flush=True)
+                _w = sum(
+                    1
+                    for r in results
+                    for gm in r.get("games", ())
+                    if gm.get("candidate_won")
+                )
+                print(
+                    json.dumps(
+                        {
+                            "progress": "worker_done",
+                            "workers_done": done,
+                            "workers_total": len(worker_args),
+                            "games_so_far": _g,
+                            "candidate_wins_so_far": _w,
+                            "running_winrate": round(_w / _g, 4) if _g else None,
+                        }
+                    ),
+                    flush=True,
+                )
     elapsed = time.perf_counter() - started
 
     all_games: list[dict[str, Any]] = []
@@ -999,11 +1362,17 @@ def main() -> None:
         all_games.extend(result.get("games", ()))
         _add_search_telemetry(search_telemetry, result.get("search_telemetry", {}))
         if result.get("error"):
-            errors.append({"worker_index": result.get("worker_index"), "error": result["error"]})
+            errors.append(
+                {"worker_index": result.get("worker_index"), "error": result["error"]}
+            )
         for pair_error in result.get("pair_errors") or ():
             errors.append({"worker_index": result.get("worker_index"), **pair_error})
 
-    outcomes = [bool(game["candidate_won"]) for game in all_games if game["candidate_won"] is not None]
+    outcomes = [
+        bool(game["candidate_won"])
+        for game in all_games
+        if game["candidate_won"] is not None
+    ]
     truncated_count = sum(1 for game in all_games if game["truncated"])
     summary = _build_summary(
         args,
@@ -1015,13 +1384,42 @@ def main() -> None:
         workers=workers,
         threads_per_worker=threads_per_worker,
         errors=errors,
+        candidate_checkpoint_sha256=candidate_checkpoint_sha256,
+        baseline_checkpoint_sha256=baseline_checkpoint_sha256,
         search_telemetry=search_telemetry,
     )
     summary["config_hash"] = eval_config_hash
     summary["full_config_hash"] = eval_full_config_hash
     summary["typed_config"] = eval_config.canonical_payload()
+    if high_regret_suite_path is not None:
+        summary = {
+            "schema_version": "a1-held-out-high-regret-report-v1",
+            "suite": "held_out_high_regret",
+            "held_out": True,
+            "suite_manifest": {
+                "path": str(high_regret_suite_path),
+                "sha256": _checkpoint_sha256(high_regret_suite_path),
+            },
+            "candidate": {
+                "path": str(Path(args.candidate).resolve()),
+                "sha256": _checkpoint_sha256(args.candidate),
+            },
+            "champion": {
+                "path": str(Path(args.baseline).resolve()),
+                "sha256": _checkpoint_sha256(args.baseline),
+            },
+            "evaluation_config": eval_config.canonical_payload()["fields"],
+            "errors": summary["errors"],
+            "games": summary["games"],
+            "pentanomial_sprt": summary["pentanomial_sprt"],
+            "pair_diagnostics": summary["pair_diagnostics"],
+        }
     write_json(args.out, summary)
-    print(json.dumps({k: v for k, v in summary.items() if k != "games"}, indent=2, sort_keys=True))
+    print(
+        json.dumps(
+            {k: v for k, v in summary.items() if k != "games"}, indent=2, sort_keys=True
+        )
+    )
 
 
 def _build_summary(
@@ -1035,11 +1433,17 @@ def _build_summary(
     workers: int,
     threads_per_worker: int,
     errors: list[Any],
+    candidate_checkpoint_sha256: str,
+    baseline_checkpoint_sha256: str,
     search_telemetry: dict[str, dict[str, float | int]] | None = None,
 ) -> dict[str, Any]:
-    sprt = evaluate_sprt(outcomes=outcomes, elo0=float(args.elo0), elo1=float(args.elo1))
+    sprt = evaluate_sprt(
+        outcomes=outcomes, elo0=float(args.elo0), elo1=float(args.elo1)
+    )
     pair_outcomes, pair_diagnostics = _concordant_pair_outcomes(all_games)
-    pair_sprt = evaluate_sprt(outcomes=pair_outcomes, elo0=float(args.elo0), elo1=float(args.elo1))
+    pair_sprt = evaluate_sprt(
+        outcomes=pair_outcomes, elo0=float(args.elo0), elo1=float(args.elo1)
+    )
 
     pair_scores, _pent_diagnostics = pair_scores_from_h2h_games(all_games)
     pentanomial_sprt = evaluate_pentanomial_sprt(
@@ -1047,10 +1451,14 @@ def _build_summary(
     )
 
     complete_pairs = (
-        pair_diagnostics["ww_pairs"] + pair_diagnostics["ll_pairs"] + pair_diagnostics["split_pairs"]
+        pair_diagnostics["ww_pairs"]
+        + pair_diagnostics["ll_pairs"]
+        + pair_diagnostics["split_pairs"]
     )
     decisive_pairs = pair_diagnostics["ww_pairs"] + pair_diagnostics["ll_pairs"]
-    split_rate = (pair_diagnostics["split_pairs"] / complete_pairs) if complete_pairs else None
+    split_rate = (
+        (pair_diagnostics["split_pairs"] / complete_pairs) if complete_pairs else None
+    )
     decisive_pair_yield = (decisive_pairs / complete_pairs) if complete_pairs else None
 
     # Resolved (not raw-flag) provenance: mirrors the fallback _build_search_config
@@ -1064,7 +1472,9 @@ def _build_summary(
 
     return {
         "candidate_checkpoint": args.candidate,
+        "candidate_checkpoint_sha256": candidate_checkpoint_sha256,
         "baseline_checkpoint": args.baseline,
+        "baseline_checkpoint_sha256": baseline_checkpoint_sha256,
         "gate_config": getattr(args, "gate_config", None),
         "n_full": int(args.n_full),
         "candidate_n_full": resolved_candidate_n_full,
@@ -1080,16 +1490,18 @@ def _build_summary(
         "sigma_eval": float(getattr(args, "sigma_eval", 0.79)),
         "max_root_candidates": int(args.max_root_candidates),
         "max_root_candidates_wide": int(args.max_root_candidates_wide),
-        "wide_candidates_threshold": int(getattr(args, "wide_candidates_threshold", 24)),
+        "wide_candidates_threshold": int(
+            getattr(args, "wide_candidates_threshold", 24)
+        ),
         "correct_rust_chance_spectra": bool(args.correct_rust_chance_spectra),
         "public_observation": bool(args.public_observation),
         "belief_chance_spectra": bool(args.belief_chance_spectra),
         "information_set_search": bool(args.information_set_search),
         "determinization_particles": int(args.determinization_particles),
-        "determinization_min_simulations": int(
-            args.determinization_min_simulations
+        "determinization_min_simulations": int(args.determinization_min_simulations),
+        "n_full_wide": (
+            int(args.n_full_wide) if args.n_full_wide is not None else None
         ),
-        "n_full_wide": (int(args.n_full_wide) if args.n_full_wide is not None else None),
         "n_full_wide_threshold": (
             int(args.n_full_wide_threshold)
             if getattr(args, "n_full_wide_threshold", None) is not None
@@ -1097,30 +1509,24 @@ def _build_summary(
         ),
         "candidate_n_full_wide": budgets["candidate_n_full_wide"],
         "baseline_n_full_wide": budgets["baseline_n_full_wide"],
-        "candidate_n_full_wide_threshold": budgets[
-            "candidate_n_full_wide_threshold"
-        ],
-        "baseline_n_full_wide_threshold": budgets[
-            "baseline_n_full_wide_threshold"
-        ],
+        "candidate_n_full_wide_threshold": budgets["candidate_n_full_wide_threshold"],
+        "baseline_n_full_wide_threshold": budgets["baseline_n_full_wide_threshold"],
         "search_budgets_by_role": {
             "candidate": {
                 "n_full": resolved_candidate_n_full,
                 "n_full_wide": budgets["candidate_n_full_wide"],
-                "n_full_wide_threshold": budgets[
-                    "candidate_n_full_wide_threshold"
-                ],
+                "n_full_wide_threshold": budgets["candidate_n_full_wide_threshold"],
             },
             "baseline": {
                 "n_full": resolved_baseline_n_full,
                 "n_full_wide": budgets["baseline_n_full_wide"],
-                "n_full_wide_threshold": budgets[
-                    "baseline_n_full_wide_threshold"
-                ],
+                "n_full_wide_threshold": budgets["baseline_n_full_wide_threshold"],
             },
         },
         "raw_policy_above_width": (
-            int(args.raw_policy_above_width) if args.raw_policy_above_width is not None else None
+            int(args.raw_policy_above_width)
+            if args.raw_policy_above_width is not None
+            else None
         ),
         "symmetry_averaged_eval": bool(args.symmetry_averaged_eval),
         "symmetry_averaged_eval_threshold": (
@@ -1129,12 +1535,17 @@ def _build_summary(
             else None
         ),
         "pairs_requested": len(pairs),
+        "base_seed": int(getattr(args, "base_seed", 1)),
         "games_played": len(all_games),
         "games_with_winner": len(outcomes),
         "games_truncated": truncated_count,
         "candidate_wins": sum(1 for outcome in outcomes if outcome),
         "baseline_wins": sum(1 for outcome in outcomes if not outcome),
-        "candidate_win_rate": (sum(1 for outcome in outcomes if outcome) / len(outcomes)) if outcomes else None,
+        "candidate_win_rate": (
+            sum(1 for outcome in outcomes if outcome) / len(outcomes)
+        )
+        if outcomes
+        else None,
         "sprt": sprt,
         "pair_sprt": pair_sprt,
         "pentanomial_sprt": pentanomial_sprt,
@@ -1158,15 +1569,24 @@ def _build_summary(
     }
 
 
-def _concordant_pair_outcomes(games: list[dict[str, Any]]) -> tuple[list[bool], dict[str, int]]:
+def _concordant_pair_outcomes(
+    games: list[dict[str, Any]],
+) -> tuple[list[bool], dict[str, int]]:
     by_pair: dict[int, list[dict[str, Any]]] = {}
     for game in games:
         by_pair.setdefault(int(game["pair_id"]), []).append(game)
 
     outcomes: list[bool] = []
-    diagnostics = {"ww_pairs": 0, "ll_pairs": 0, "split_pairs": 0, "incomplete_pairs": 0}
+    diagnostics = {
+        "ww_pairs": 0,
+        "ll_pairs": 0,
+        "split_pairs": 0,
+        "incomplete_pairs": 0,
+    }
     for pair_games in by_pair.values():
-        if len(pair_games) != 2 or any(game["candidate_won"] is None for game in pair_games):
+        if len(pair_games) != 2 or any(
+            game["candidate_won"] is None for game in pair_games
+        ):
             diagnostics["incomplete_pairs"] += 1
             continue
         results = {bool(game["candidate_won"]) for game in pair_games}

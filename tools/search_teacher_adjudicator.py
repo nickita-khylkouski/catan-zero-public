@@ -51,7 +51,7 @@ CALIBRATION_SCHEMA = "phase-sliced-value-calibration-v2"
 # Schema 4 evidence was sealed before GenerateConfig gained checkpoint-byte
 # provenance. Its typed payload is still self-hashed and semantically checked,
 # so adjudication remains able to replay that immutable historical evidence.
-SUPPORTED_PIPELINE_CONFIG_SCHEMAS = {4, CONFIG_SCHEMA_VERSION}
+SUPPORTED_PIPELINE_CONFIG_SCHEMAS = {4, 5, CONFIG_SCHEMA_VERSION}
 
 S1_ARMS = {
     "D1": (0.03, True),
@@ -295,9 +295,7 @@ def _validate_search_operator(raw: Any, *, where: str) -> dict[str, Any]:
     if operator["determinization_particles"] != 4:
         raise AdjudicationError(f"{where} must use four determinization particles")
     if operator["determinization_min_simulations"] != 32:
-        raise AdjudicationError(
-            f"{where} determinization_min_simulations must be 32"
-        )
+        raise AdjudicationError(f"{where} determinization_min_simulations must be 32")
     if operator["n_full"] not in {64, 128}:
         raise AdjudicationError(
             f"{where}.n_full must be 64 or 128; global n256 is forbidden"
@@ -546,15 +544,21 @@ def _validate_complete_h2h(
         raise AdjudicationError(f"{where} public_observation must be true")
     if report.get("information_set_search") is not True:
         raise AdjudicationError(f"{where} information_set_search must be true")
-    if _integer(
-        report.get("determinization_particles"),
-        where=f"{where}.determinization_particles",
-    ) != 4:
+    if (
+        _integer(
+            report.get("determinization_particles"),
+            where=f"{where}.determinization_particles",
+        )
+        != 4
+    ):
         raise AdjudicationError(f"{where} must attest four determinization particles")
-    if _integer(
-        report.get("determinization_min_simulations"),
-        where=f"{where}.determinization_min_simulations",
-    ) != 32:
+    if (
+        _integer(
+            report.get("determinization_min_simulations"),
+            where=f"{where}.determinization_min_simulations",
+        )
+        != 32
+    ):
         raise AdjudicationError(
             f"{where} must attest determinization_min_simulations=32"
         )
@@ -614,9 +618,7 @@ def _validate_complete_h2h(
         "belief_chance_spectra": base["belief_chance_spectra"],
         "information_set_search": True,
         "determinization_particles": base["determinization_particles"],
-        "determinization_min_simulations": base[
-            "determinization_min_simulations"
-        ],
+        "determinization_min_simulations": base["determinization_min_simulations"],
         "pairs": requested,
         "n_full": base["n_full"],
         "candidate_n_full": candidate["n_full"],
@@ -638,9 +640,7 @@ def _validate_complete_h2h(
         "max_root_candidates_wide": 54,
         "wide_candidates_threshold": base["wide_candidates_threshold"],
         "symmetry_averaged_eval": base["symmetry_averaged_eval"],
-        "symmetry_averaged_eval_threshold": base[
-            "symmetry_averaged_eval_threshold"
-        ],
+        "symmetry_averaged_eval_threshold": base["symmetry_averaged_eval_threshold"],
         "correct_rust_chance_spectra": base["correct_rust_chance_spectra"],
         "lazy_interior_chance": base["lazy_interior_chance"],
         "prior_temperature": evaluator["prior_temperature"],
@@ -693,13 +693,21 @@ def _validate_complete_h2h(
             for game in pair_games
         }
         if len(seeds) != 1 or next(iter(seeds)) in seen_game_seeds:
-            raise AdjudicationError(f"{where} pair {pair_id} has duplicate/drifted seed")
+            raise AdjudicationError(
+                f"{where} pair {pair_id} has duplicate/drifted seed"
+            )
         if next(iter(seeds)) != base_seed + pair_id:
-            raise AdjudicationError(f"{where} pair {pair_id} seed is outside the typed plan")
+            raise AdjudicationError(
+                f"{where} pair {pair_id} seed is outside the typed plan"
+            )
         seen_game_seeds.update(seeds)
         wins = sum(bool(game["candidate_won"]) for game in pair_games)
         raw_counts[wins] += 1
-    pent_counts = [int(pent["ll_pairs"]), int(pent["split_pairs"]), int(pent["ww_pairs"])]
+    pent_counts = [
+        int(pent["ll_pairs"]),
+        int(pent["split_pairs"]),
+        int(pent["ww_pairs"]),
+    ]
     if raw_counts != pent_counts:
         raise AdjudicationError(
             f"{where} pentanomial counts do not reconstruct from raw games"
@@ -884,7 +892,10 @@ def _validate_fixed_root_report(
             if isinstance(row, list)
             for seed in row
         ]
-        if any(not isinstance(row, list) or len(row) < POLICY["fixed_root_min_repeats"] for row in rows):
+        if any(
+            not isinstance(row, list) or len(row) < POLICY["fixed_root_min_repeats"]
+            for row in rows
+        ):
             raise AdjudicationError(f"{where} {role} seed repeats are incomplete")
         if len(flat) != len(set(flat)):
             raise AdjudicationError(f"{where} {role} repeats reuse search seeds")
@@ -910,9 +921,10 @@ def _validate_fixed_root_report(
                 raise AdjudicationError(f"{where} per-root role set drift")
             for role in (baseline_role, candidate_role):
                 runs = root_roles[role].get("runs")
-                if not isinstance(runs, list) or len(runs) < POLICY[
-                    "fixed_root_min_repeats"
-                ]:
+                if (
+                    not isinstance(runs, list)
+                    or len(runs) < POLICY["fixed_root_min_repeats"]
+                ):
                     raise AdjudicationError(f"{where} {role} repeats are incomplete")
                 if [int(run.get("search_seed", -1)) for run in runs] != [
                     int(seed) for seed in seed_manifests[role]["seeds_by_root"][index]
@@ -1060,9 +1072,7 @@ def _validate_s1_arm(
             ("max_root_candidates_wide", 54),
         ):
             if config.get(field) != expected:
-                raise AdjudicationError(
-                    f"{where}.{label}.{field} must be {expected!r}"
-                )
+                raise AdjudicationError(f"{where}.{label}.{field} must be {expected!r}")
     _close(baseline.get("c_scale"), 0.03, where=f"{where}.baseline.c_scale")
     if (
         _number(

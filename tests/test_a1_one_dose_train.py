@@ -10,6 +10,7 @@ import pytest
 
 from tools import a1_one_dose_train as executor
 from tools import a1_pre_wave_contract as contract
+from catan_zero.rl.entity_token_policy import EntityGraphConfig
 
 
 _SHA = "sha256:" + "a" * 64
@@ -34,9 +35,7 @@ def _lock(
         "contract_sha256": _SHA,
         "science": {
             "search_operator": {"n_full": n_full, "p_full": 0.25},
-            "learner_training_recipe": dict(
-                contract.EXPECTED_LEARNER_TRAINING_RECIPE
-            ),
+            "learner_training_recipe": dict(contract.EXPECTED_LEARNER_TRAINING_RECIPE),
             "learner_value_objective": _objective(),
         },
         "checkpoints": [
@@ -72,9 +71,7 @@ def _verified(tmp_path: Path) -> dict:
         "objective": _objective(),
         "producer": lock["checkpoints"][0],
         "data_path": data,
-        "corpus_meta_file_sha256": executor._file_sha256(
-            data / "corpus_meta.json"
-        ),
+        "corpus_meta_file_sha256": executor._file_sha256(data / "corpus_meta.json"),
         "payload_inventory_sha256": "sha256:" + "c" * 64,
         "data_fingerprint": "sha256:" + "1" * 64,
         "corpus_row_count": 5000,
@@ -94,19 +91,14 @@ def _training_report(
     recipe = verified["recipe"]
     return {
         "arch": "entity_graph",
+        **executor.SEALED_A1_MODEL_REPORT,
         "a1_contract_sha256": verified["contract_sha256"],
         "a1_bound_learner_training_recipe": recipe,
         "a1_bound_learner_value_objective": verified["objective"],
         "a1_learner_training_recipe_sha256": executor._value_sha256(recipe),
-        "a1_memmap_payload_inventory_sha256": verified[
-            "payload_inventory_sha256"
-        ],
-        "a1_selected_game_seed_set_sha256": verified[
-            "selected_game_seed_set_sha256"
-        ],
-        "a1_training_game_seed_set_sha256": verified[
-            "training_game_seed_set_sha256"
-        ],
+        "a1_memmap_payload_inventory_sha256": verified["payload_inventory_sha256"],
+        "a1_selected_game_seed_set_sha256": verified["selected_game_seed_set_sha256"],
+        "a1_training_game_seed_set_sha256": verified["training_game_seed_set_sha256"],
         "world_size": 1,
         "optimizer": "adam",
         "resume_optimizer": False,
@@ -137,9 +129,7 @@ def _training_report(
         "input_validation_game_seed_manifest_sha256": verified[
             "validation_file_sha256"
         ],
-        "validation_game_seed_set_sha256": verified[
-            "validation_game_seed_set_sha256"
-        ],
+        "validation_game_seed_set_sha256": verified["validation_game_seed_set_sha256"],
         "steps_completed": steps_completed,
         "total_training_steps": steps_completed,
         "require_35m_model": True,
@@ -157,9 +147,7 @@ def _training_report(
                 "training_game_seed_set_sha256"
             ],
             "a1_learner_training_recipe_sha256": executor._value_sha256(recipe),
-            "a1_memmap_payload_inventory_sha256": verified[
-                "payload_inventory_sha256"
-            ],
+            "a1_memmap_payload_inventory_sha256": verified["payload_inventory_sha256"],
         },
         "metrics": [
             {
@@ -178,6 +166,83 @@ def _training_report(
 
 def _option(command: list[str], flag: str) -> str:
     return command[command.index(flag) + 1]
+
+
+def _replace_option(command: list[str], flag: str, value: str) -> list[str]:
+    changed = list(command)
+    changed[changed.index(flag) + 1] = value
+    return changed
+
+
+def _remove_option(command: list[str], flag: str) -> list[str]:
+    changed = list(command)
+    index = changed.index(flag)
+    del changed[index : index + 2]
+    return changed
+
+
+def _failed_architecture_attempt(tmp_path: Path) -> tuple[dict, Path, list[str]]:
+    torch = pytest.importorskip("torch")
+
+    verified = _verified(tmp_path)
+    producer = Path(verified["producer"]["path"])
+    torch.save(
+        {
+            "policy_type": "entity_graph",
+            "config": {
+                "__config_dataclass__": "EntityGraphConfig",
+                "__config_schema__": 1,
+                "fields": {
+                    "hidden_size": 640,
+                    "state_layers": 6,
+                    "attention_heads": 8,
+                    "dropout": 0.05,
+                    "state_trunk": "transformer",
+                    "relational_block_pattern": "",
+                    "relational_ff_size": 0,
+                    "relational_bases": 4,
+                    "relational_action_cross_layers": 1,
+                    "latent_deliberation_steps": 0,
+                    "latent_deliberation_slots": 8,
+                    "moe_routed_experts": 0,
+                    "moe_top_k": 2,
+                    "moe_expert_ff_size": 0,
+                    "value_categorical_bins": 0,
+                },
+            },
+        },
+        producer,
+    )
+    producer_sha = executor._file_sha256(producer)
+    verified["producer"]["sha256"] = producer_sha
+    parent_checkpoint = tmp_path / "attempt-r1" / "candidate.pt"
+    parent_report = tmp_path / "attempt-r1" / "training.report.json"
+    parent_receipt = tmp_path / "attempt-r1" / "training.receipt.json"
+    parent_command = executor.build_train_command(
+        verified,
+        python=Path(sys.executable),
+        checkpoint=parent_checkpoint,
+        report=parent_report,
+    )
+    # Reproduce the exact production defect: the legacy argv omitted both
+    # fields. train_bc resolved entity_graph hidden_size to 640, while its old
+    # graph_layers parser default remained 4 and mismatched the 6-layer parent.
+    parent_command = _remove_option(parent_command, "--graph-layers")
+    parent_command = _remove_option(parent_command, "--hidden-size")
+    with pytest.raises(executor.ExecutorError, match="exited nonzero"):
+        executor.execute(
+            verified=verified,
+            command=parent_command,
+            checkpoint=parent_checkpoint,
+            report=parent_report,
+            receipt=parent_receipt,
+            gpu=0,
+            runner=lambda *args, **kwargs: subprocess.CompletedProcess(
+                parent_command, 1
+            ),
+            probe=lambda _gpu: "NVIDIA B200",
+        )
+    return verified, executor._claim_path(verified), parent_command
 
 
 def test_current_a1_requires_global_n128_and_exact_scalar_dose() -> None:
@@ -208,6 +273,8 @@ def test_command_is_direct_one_b200_fresh_unfused_adam(tmp_path: Path) -> None:
     assert _option(command, "--value-lr-mult") == "0.3"
     assert _option(command, "--batch-size") == "4096"
     assert _option(command, "--grad-accum-steps") == "1"
+    assert _option(command, "--data-loader-workers") == "2"
+    assert _option(command, "--data-loader-prefetch") == "2"
     assert _option(command, "--epochs") == "1"
     assert _option(command, "--value-head-type") == "mse"
     assert _option(command, "--value-categorical-bins") == "0"
@@ -215,6 +282,281 @@ def test_command_is_direct_one_b200_fresh_unfused_adam(tmp_path: Path) -> None:
     assert "--no-symmetry-augment" in command
     assert "--validation-game-seed-manifest" in command
     assert "--p-full" not in command  # generation choice remains contract-bound.
+    for flag, value in executor.SEALED_A1_MODEL_CLI.items():
+        assert _option(command, flag) == value
+
+
+def test_real_gen3_architecture_cannot_fall_back_to_cli_defaults(
+    tmp_path: Path,
+) -> None:
+    """The real incumbent must match every checkpoint-compared CLI field."""
+
+    verified = _verified(tmp_path)
+    command = executor.build_train_command(
+        verified,
+        python=Path(sys.executable),
+        checkpoint=tmp_path / "candidate.pt",
+        report=tmp_path / "report.json",
+    )
+    parser = executor.train_bc.build_parser()
+    parsed = parser.parse_args(command[2:])
+    gen3 = EntityGraphConfig(
+        action_size=567,
+        static_action_feature_size=50,
+        hidden_size=640,
+        state_layers=6,
+        attention_heads=8,
+        dropout=0.05,
+    )
+
+    assert parser.get_default("graph_layers") == 4
+    assert parsed.hidden_size == gen3.hidden_size
+    assert parsed.graph_layers == gen3.state_layers == 6
+    assert parsed.attention_heads == gen3.attention_heads
+    assert parsed.graph_dropout == gen3.dropout
+    assert (
+        executor.train_bc._checkpoint_config_mismatches(
+            policy_type="entity_graph", config=gen3, args=parsed
+        )
+        == []
+    )
+
+    omitted = list(command)
+    graph_layers_index = omitted.index("--graph-layers")
+    del omitted[graph_layers_index : graph_layers_index + 2]
+    defaulted = parser.parse_args(omitted[2:])
+    mismatches = executor.train_bc._checkpoint_config_mismatches(
+        policy_type="entity_graph", config=gen3, args=defaulted
+    )
+    assert "graph_layers checkpoint=6 cli=4" in mismatches
+
+
+def test_all_checkpoint_compared_gen3_model_knobs_are_explicit(
+    tmp_path: Path,
+) -> None:
+    verified = _verified(tmp_path)
+    command = executor.build_train_command(
+        verified,
+        python=Path(sys.executable),
+        checkpoint=tmp_path / "candidate.pt",
+        report=tmp_path / "report.json",
+    )
+
+    expected = {
+        "--hidden-size": "640",
+        "--graph-layers": "6",
+        "--attention-heads": "8",
+        "--graph-dropout": "0.05",
+        "--entity-state-trunk": "transformer",
+        "--relational-block-pattern": "",
+        "--relational-ff-size": "0",
+        "--relational-bases": "4",
+        "--relational-action-cross-layers": "1",
+        "--latent-deliberation-steps": "0",
+        "--latent-deliberation-slots": "8",
+        "--moe-routed-experts": "0",
+        "--moe-top-k": "2",
+        "--moe-expert-ff-size": "0",
+        "--value-categorical-bins": "0",
+    }
+    assert (
+        expected.items() <= {flag: _option(command, flag) for flag in expected}.items()
+    )
+
+
+def test_loader_prefetch_is_outside_sealed_recipe_and_runtime_inventory(
+    tmp_path: Path,
+) -> None:
+    verified = _verified(tmp_path)
+    command = executor.build_train_command(
+        verified,
+        python=Path(sys.executable),
+        checkpoint=tmp_path / "candidate.pt",
+        report=tmp_path / "report.json",
+    )
+    baseline = list(command)
+    for flag in ("--data-loader-workers", "--data-loader-prefetch"):
+        index = baseline.index(flag)
+        del baseline[index : index + 2]
+
+    parser = executor.train_bc.build_parser()
+    parsed = parser.parse_args(command[2:])
+    baseline_parsed = parser.parse_args(baseline[2:])
+    effective = executor.train_bc._effective_a1_learner_training_recipe(
+        parsed,
+        {"enabled": False, "world_size": 1, "rank": 0, "local_rank": 0},
+    )
+    baseline_effective = executor.train_bc._effective_a1_learner_training_recipe(
+        baseline_parsed,
+        {"enabled": False, "world_size": 1, "rank": 0, "local_rank": 0},
+    )
+    assert effective == baseline_effective == verified["recipe"]
+    assert (
+        executor.train_bc.TrainConfig.from_namespace(parsed).canonical_payload()
+        == executor.train_bc.TrainConfig.from_namespace(
+            baseline_parsed
+        ).canonical_payload()
+    )
+    assert "tools/a1_one_dose_train.py" not in contract.REQUIRED_RUNTIME_CODE_SUFFIXES
+
+
+def test_learner_python_preserves_virtualenv_symlink(tmp_path: Path) -> None:
+    base = tmp_path / "base-python"
+    base.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    base.chmod(0o755)
+    venv_bin = tmp_path / "venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    python = venv_bin / "python"
+    python.symlink_to(base)
+
+    selected = executor._lexical_python_executable(python)
+
+    assert selected == python.absolute()
+    assert selected != python.resolve()
+
+
+def test_dry_run_plan_invokes_lexical_virtualenv_python(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    verified = _verified(tmp_path)
+    base = tmp_path / "base-python"
+    base.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    base.chmod(0o755)
+    venv_bin = tmp_path / "venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    python = venv_bin / "python"
+    python.symlink_to(base)
+    claim = tmp_path / "claim.json"
+    monkeypatch.setattr(executor, "verify_training_inputs", lambda **_kwargs: verified)
+    monkeypatch.setattr(executor, "_claim_path", lambda _verified: claim)
+    monkeypatch.setattr(
+        executor, "_require_fresh_outputs", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        executor, "_require_unconsumed_contract", lambda _verified: None
+    )
+
+    result = executor.main(
+        [
+            "--lock",
+            str(tmp_path / "lock.json"),
+            "--data",
+            str(tmp_path / "corpus"),
+            "--validation-manifest",
+            str(tmp_path / "validation.json"),
+            "--checkpoint",
+            str(tmp_path / "candidate.pt"),
+            "--report",
+            str(tmp_path / "report.json"),
+            "--receipt",
+            str(tmp_path / "receipt.json"),
+            "--python",
+            str(python),
+        ]
+    )
+
+    plan = json.loads(capsys.readouterr().out)
+    assert result == 0
+    assert plan["command"][0] == str(python.absolute())
+    assert plan["command"][0] != str(python.resolve())
+
+
+def test_loader_prefetch_materializes_byte_identical_batches() -> None:
+    row_count = 6
+    corpus = object.__new__(executor.train_bc.MemmapCorpus)
+    corpus.row_count = row_count
+    corpus._eager = {
+        "game_seed": np.asarray([10, 11, 12, 13, 14, 15], dtype=np.int64),
+    }
+    fixed = np.arange(row_count * 4, dtype=np.float16).reshape(row_count, 2, 2)
+    offsets = np.asarray([0, 2, 3, 6, 6, 7, 9], dtype=np.int64)
+    ragged = np.arange(9, dtype=np.int16)
+    corpus._lazy = {
+        "fixed": executor.train_bc._MemmapFixedColumn(fixed, row_count),
+        "ragged": executor.train_bc._MemmapRaggedColumn(
+            ragged, offsets, 3, -1, np.int16, None
+        ),
+    }
+    train_indices = np.asarray([5, 2, 0, 4, 1, 3], dtype=np.int64)
+    order = np.asarray([2, 4, 0, 5, 1, 3], dtype=np.int64)
+    policy_weights = np.linspace(0.1, 0.6, row_count, dtype=np.float32)
+    value_weights = np.linspace(1.1, 1.6, row_count, dtype=np.float32)
+
+    def collect(
+        workers: int,
+    ) -> list[tuple[dict[str, np.ndarray], np.ndarray, np.ndarray]]:
+        batches = []
+        for data, batch, policy, value in executor.train_bc._iterate_training_batches(
+            corpus,
+            order,
+            train_indices,
+            2,
+            policy_weights,
+            value_weights,
+            num_workers=workers,
+            prefetch=3,
+        ):
+            if isinstance(data, executor.train_bc.MemmapCorpus):
+                materialized = {key: data[key][batch] for key in data.keys()}
+                policy = policy[batch]
+                value = value[batch]
+            else:
+                materialized = data
+            batches.append((materialized, policy, value))
+        return batches
+
+    synchronous = collect(0)
+    prefetched = collect(2)
+    assert len(synchronous) == len(prefetched) == 3
+    for (sync_data, sync_policy, sync_value), (
+        prefetch_data,
+        prefetch_policy,
+        prefetch_value,
+    ) in zip(synchronous, prefetched, strict=True):
+        assert set(sync_data) == set(prefetch_data)
+        for key in sync_data:
+            assert sync_data[key].dtype == prefetch_data[key].dtype
+            assert sync_data[key].shape == prefetch_data[key].shape
+            assert sync_data[key].tobytes() == prefetch_data[key].tobytes()
+        assert sync_policy.tobytes() == prefetch_policy.tobytes()
+        assert sync_value.tobytes() == prefetch_value.tobytes()
+
+
+def test_child_environment_is_exact_allowlisted_and_ambient_free(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    poisoned = {
+        "AWS_SECRET_ACCESS_KEY": "secret",
+        "CUDA_VISIBLE_DEVICES": "7",
+        "LD_PRELOAD": "/tmp/inject.so",
+        "LOCAL_RANK": "5",
+        "PYTHONPATH": "/tmp/inject",
+        "RANK": "5",
+        "WORLD_SIZE": "8",
+    }
+    for key, value in poisoned.items():
+        monkeypatch.setenv(key, value)
+
+    environment = executor._child_environment(3)
+    assert set(environment) == executor.CHILD_ENVIRONMENT_KEYS
+    assert environment["CUDA_VISIBLE_DEVICES"] == "3"
+    assert environment["CUDA_DEVICE_ORDER"] == "PCI_BUS_ID"
+    assert environment["PYTHONHASHSEED"] == "0"
+    assert environment["PYTHONPATH"] == (
+        f"{executor._REPO_ROOT / 'src'}:{executor._REPO_ROOT}"
+    )
+    assert not (set(environment) & set(poisoned)) - {
+        "CUDA_VISIBLE_DEVICES",
+        "PYTHONPATH",
+    }
+    for forbidden in (
+        "AWS_SECRET_ACCESS_KEY",
+        "LD_PRELOAD",
+        "RANK",
+        "LOCAL_RANK",
+        "WORLD_SIZE",
+    ):
+        assert forbidden not in environment
 
 
 def _gpu_query_runner(
@@ -230,14 +572,18 @@ def _gpu_query_runner(
 
 
 def test_b200_preflight_accepts_idle_default_or_exclusive_process() -> None:
-    assert executor._probe_b200(
-        0, runner=_gpu_query_runner(), mps_probe=lambda: []
-    ) == "NVIDIA B200"
-    assert executor._probe_b200(
-        7,
-        runner=_gpu_query_runner(identity="NVIDIA B200, Exclusive Process, 16\n"),
-        mps_probe=lambda: [],
-    ) == "NVIDIA B200"
+    assert (
+        executor._probe_b200(0, runner=_gpu_query_runner(), mps_probe=lambda: [])
+        == "NVIDIA B200"
+    )
+    assert (
+        executor._probe_b200(
+            7,
+            runner=_gpu_query_runner(identity="NVIDIA B200, Exclusive Process, 16\n"),
+            mps_probe=lambda: [],
+        )
+        == "NVIDIA B200"
+    )
 
 
 @pytest.mark.parametrize(
@@ -399,7 +745,9 @@ def test_execute_writes_atomic_success_receipt_and_never_resumes(
     )
     captured: dict[str, object] = {}
 
-    def fake_runner(command_arg: list[str], **kwargs: object) -> subprocess.CompletedProcess:
+    def fake_runner(
+        command_arg: list[str], **kwargs: object
+    ) -> subprocess.CompletedProcess:
         captured["command"] = command_arg
         captured["env"] = kwargs["env"]
         checkpoint.parent.mkdir(parents=True, exist_ok=True)
@@ -429,8 +777,19 @@ def test_execute_writes_atomic_success_receipt_and_never_resumes(
     assert claim_payload["status"] == "complete"
     assert payload["claim"] == str(claim)
     assert payload["claim_state_sha256"] == claim_payload["state_sha256"]
-    assert captured["env"]["CUDA_VISIBLE_DEVICES"] == "1"
-    assert "WORLD_SIZE" not in captured["env"]
+    expected_environment = executor._child_environment(1)
+    expected_binding = executor._execution_binding(
+        command=command, environment=expected_environment
+    )
+    assert captured["env"] == expected_environment
+    assert payload["execution_binding"] == expected_binding
+    assert claim_payload["execution_binding"] == expected_binding
+    report_payload = json.loads(report.read_text())
+    assert report_payload[executor.REPORT_EXECUTION_BINDING_FIELD] == expected_binding
+    assert payload["outputs"]["execution_binding_sha256"] == executor._value_sha256(
+        expected_binding
+    )
+    assert payload["outputs"]["report_sha256"] == executor._file_sha256(report)
     with pytest.raises(executor.ExecutorError, match="non-fresh|already"):
         executor.execute(
             verified=verified,
@@ -470,6 +829,267 @@ def test_failure_is_receipted_and_claim_remains_terminal(tmp_path: Path) -> None
     claim_payload = json.loads(claim.read_text())
     assert claim_payload["status"] == "failed"
     assert payload["claim"] == str(claim)
+    expected_binding = executor._execution_binding(
+        command=command, environment=executor._child_environment(0)
+    )
+    assert payload["execution_binding"] == expected_binding
+    assert claim_payload["execution_binding"] == expected_binding
+
+
+def test_failed_before_optimizer_derives_new_immutable_retry_claim(
+    tmp_path: Path,
+) -> None:
+    verified, parent_claim, _parent_command = _failed_architecture_attempt(tmp_path)
+    parent_claim_before = parent_claim.read_bytes()
+    parent = executor._load_claim_state(
+        parent_claim, contract_sha256=verified["contract_sha256"]
+    )
+    parent_receipt = Path(parent["receipt_target"])
+    parent_receipt_before = parent_receipt.read_bytes()
+    checkpoint = tmp_path / "attempt-r2" / "candidate.pt"
+    report = tmp_path / "attempt-r2" / "training.report.json"
+    receipt = tmp_path / "attempt-r2" / "training.receipt.json"
+    retry_contract = tmp_path / "attempt-r2" / "learner-retry.contract.json"
+    retry_command = executor.build_train_command(
+        verified,
+        python=Path(sys.executable),
+        checkpoint=checkpoint,
+        report=report,
+    )
+
+    derived = executor.authorize_failed_before_optimizer_retry(
+        verified=verified,
+        parent_claim=parent_claim,
+        retry_command=retry_command,
+        checkpoint=checkpoint,
+        report=report,
+        receipt=receipt,
+        retry_contract_path=retry_contract,
+        publish=True,
+    )
+
+    assert derived["contract_sha256"] == verified["contract_sha256"]
+    assert derived["claim_identity_sha256"] != verified["contract_sha256"]
+    assert executor._claim_path(derived) != parent_claim
+    assert not executor._claim_path(derived).exists()
+    assert (
+        derived["retry_contract"]["preserved_bindings"]["parent_contract_sha256"]
+        == verified["contract_sha256"]
+    )
+    assert derived["retry_contract"]["parent"]["pre_optimizer_proof"] == {
+        "kind": "replayed_init_checkpoint_architecture_preflight",
+        "mismatches": ["graph_layers checkpoint=6 cli=4"],
+        "optimizer_steps": 0,
+        "outputs": None,
+    }
+    assert json.loads(retry_contract.read_text()) == derived["retry_contract"]
+    assert parent_claim.read_bytes() == parent_claim_before
+    assert parent_receipt.read_bytes() == parent_receipt_before
+
+    # The new identity can acquire exactly one independent claim; the parent
+    # remains terminal and cannot be overwritten or mistaken for the retry.
+    retry_claim = executor._claim_attempt(
+        derived,
+        {
+            "schema_version": executor.RETRY_CLAIM_SCHEMA,
+            "status": "claimed",
+            "contract_sha256": verified["contract_sha256"],
+            "claim_identity_sha256": derived["claim_identity_sha256"],
+        },
+    )
+    retry_state = executor._load_claim_state(
+        retry_claim,
+        contract_sha256=verified["contract_sha256"],
+        claim_identity_sha256=derived["claim_identity_sha256"],
+    )
+    assert retry_state["status"] == "claimed"
+    assert retry_claim != parent_claim
+
+
+def test_retry_identity_is_stable_across_output_path_changes(tmp_path: Path) -> None:
+    verified, parent_claim, _ = _failed_architecture_attempt(tmp_path)
+
+    def authorize(suffix: str) -> dict:
+        checkpoint = tmp_path / suffix / "candidate.pt"
+        report = tmp_path / suffix / "report.json"
+        command = executor.build_train_command(
+            verified,
+            python=Path(sys.executable),
+            checkpoint=checkpoint,
+            report=report,
+        )
+        return executor.authorize_failed_before_optimizer_retry(
+            verified=verified,
+            parent_claim=parent_claim,
+            retry_command=command,
+            checkpoint=checkpoint,
+            report=report,
+            receipt=tmp_path / suffix / "receipt.json",
+            retry_contract_path=tmp_path / suffix / "retry.json",
+            publish=False,
+        )
+
+    first = authorize("r2-a")
+    second = authorize("r2-b")
+    assert first["claim_identity_sha256"] == second["claim_identity_sha256"]
+    assert executor._claim_path(first) == executor._claim_path(second)
+    assert (
+        first["retry_contract"]["retry_contract_sha256"]
+        != second["retry_contract"]["retry_contract_sha256"]
+    )
+
+
+def test_retry_refuses_loader_drift(tmp_path: Path) -> None:
+    verified, parent_claim, _ = _failed_architecture_attempt(tmp_path)
+    checkpoint = tmp_path / "r2" / "candidate.pt"
+    report = tmp_path / "r2" / "report.json"
+    command = executor.build_train_command(
+        verified,
+        python=Path(sys.executable),
+        checkpoint=checkpoint,
+        report=report,
+    )
+    command = _replace_option(command, "--data-loader-workers", "3")
+    with pytest.raises(executor.ExecutorError, match="non-architecture learner"):
+        executor.authorize_failed_before_optimizer_retry(
+            verified=verified,
+            parent_claim=parent_claim,
+            retry_command=command,
+            checkpoint=checkpoint,
+            report=report,
+            receipt=tmp_path / "r2" / "receipt.json",
+            retry_contract_path=tmp_path / "r2" / "retry.json",
+            publish=False,
+        )
+
+
+def test_retry_requires_literal_parent_omission_and_corrected_six(
+    tmp_path: Path,
+) -> None:
+    verified, parent_claim, _ = _failed_architecture_attempt(tmp_path)
+    checkpoint = tmp_path / "r2" / "candidate.pt"
+    report = tmp_path / "r2" / "report.json"
+    command = executor.build_train_command(
+        verified,
+        python=Path(sys.executable),
+        checkpoint=checkpoint,
+        report=report,
+    )
+    command = _replace_option(command, "--graph-layers", "06")
+    with pytest.raises(executor.ExecutorError, match="literal --graph-layers 6"):
+        executor.authorize_failed_before_optimizer_retry(
+            verified=verified,
+            parent_claim=parent_claim,
+            retry_command=command,
+            checkpoint=checkpoint,
+            report=report,
+            receipt=tmp_path / "r2" / "receipt.json",
+            retry_contract_path=tmp_path / "r2" / "retry.json",
+            publish=False,
+        )
+
+
+def test_retry_refuses_parent_with_any_output_artifact(tmp_path: Path) -> None:
+    verified, parent_claim, _ = _failed_architecture_attempt(tmp_path)
+    parent = executor._load_claim_state(
+        parent_claim, contract_sha256=verified["contract_sha256"]
+    )
+    parent_checkpoint = Path(_option(parent["command"], "--checkpoint"))
+    parent_checkpoint.parent.mkdir(parents=True, exist_ok=True)
+    parent_checkpoint.write_bytes(b"partial output")
+    retry_checkpoint = tmp_path / "r2" / "candidate.pt"
+    retry_report = tmp_path / "r2" / "report.json"
+    retry_command = executor.build_train_command(
+        verified,
+        python=Path(sys.executable),
+        checkpoint=retry_checkpoint,
+        report=retry_report,
+    )
+
+    with pytest.raises(executor.ExecutorError, match="zero-output/zero-step"):
+        executor.authorize_failed_before_optimizer_retry(
+            verified=verified,
+            parent_claim=parent_claim,
+            retry_command=retry_command,
+            checkpoint=retry_checkpoint,
+            report=retry_report,
+            receipt=tmp_path / "r2" / "receipt.json",
+            retry_contract_path=tmp_path / "r2" / "retry.json",
+            publish=False,
+        )
+
+
+def test_retry_refuses_non_architecture_semantic_change(tmp_path: Path) -> None:
+    verified, parent_claim, _ = _failed_architecture_attempt(tmp_path)
+    checkpoint = tmp_path / "r2" / "candidate.pt"
+    report = tmp_path / "r2" / "report.json"
+    retry_command = executor.build_train_command(
+        verified,
+        python=Path(sys.executable),
+        checkpoint=checkpoint,
+        report=report,
+    )
+    retry_command = _replace_option(retry_command, "--lr", "0.123")
+
+    with pytest.raises(executor.ExecutorError, match="non-architecture learner"):
+        executor.authorize_failed_before_optimizer_retry(
+            verified=verified,
+            parent_claim=parent_claim,
+            retry_command=retry_command,
+            checkpoint=checkpoint,
+            report=report,
+            receipt=tmp_path / "r2" / "receipt.json",
+            retry_contract_path=tmp_path / "r2" / "retry.json",
+            publish=False,
+        )
+
+
+def test_retry_refuses_command_that_still_fails_architecture_preflight(
+    tmp_path: Path,
+) -> None:
+    verified, parent_claim, parent_command = _failed_architecture_attempt(tmp_path)
+    checkpoint = tmp_path / "r2" / "candidate.pt"
+    report = tmp_path / "r2" / "report.json"
+    retry_command = list(parent_command)
+    retry_command = _replace_option(retry_command, "--checkpoint", str(checkpoint))
+    retry_command = _replace_option(retry_command, "--report", str(report))
+
+    with pytest.raises(executor.ExecutorError, match="still fails architecture"):
+        executor.authorize_failed_before_optimizer_retry(
+            verified=verified,
+            parent_claim=parent_claim,
+            retry_command=retry_command,
+            checkpoint=checkpoint,
+            report=report,
+            receipt=tmp_path / "r2" / "receipt.json",
+            retry_contract_path=tmp_path / "r2" / "retry.json",
+            publish=False,
+        )
+
+
+def test_retry_refuses_parent_lock_or_data_binding_drift(tmp_path: Path) -> None:
+    verified, parent_claim, _ = _failed_architecture_attempt(tmp_path)
+    Path(verified["lock_path"]).write_text("mutated lock")
+    checkpoint = tmp_path / "r2" / "candidate.pt"
+    report = tmp_path / "r2" / "report.json"
+    retry_command = executor.build_train_command(
+        verified,
+        python=Path(sys.executable),
+        checkpoint=checkpoint,
+        report=report,
+    )
+
+    with pytest.raises(executor.ExecutorError, match="sealed retry binding drift"):
+        executor.authorize_failed_before_optimizer_retry(
+            verified=verified,
+            parent_claim=parent_claim,
+            retry_command=retry_command,
+            checkpoint=checkpoint,
+            report=report,
+            receipt=tmp_path / "r2" / "receipt.json",
+            retry_contract_path=tmp_path / "r2" / "retry.json",
+            publish=False,
+        )
 
 
 def test_contract_claim_blocks_a_second_receipt_and_output_set(tmp_path: Path) -> None:
@@ -552,9 +1172,7 @@ def test_receipt_publication_failure_leaves_terminal_complete_claim(
         claim, contract_sha256=verified["contract_sha256"]
     )
     assert state["status"] == "complete"
-    assert state["outputs"]["checkpoint_sha256"] == executor._file_sha256(
-        checkpoint
-    )
+    assert state["outputs"]["checkpoint_sha256"] == executor._file_sha256(checkpoint)
     with pytest.raises(executor.ExecutorError, match="claim already exists"):
         executor._claim_attempt(
             verified,
@@ -612,6 +1230,10 @@ def test_output_paths_cannot_alias_the_contract_claim(
         ("data_fingerprint", "sha256:" + "0" * 64),
         ("steps_completed", 1),
         ("a1_training_game_seed_set_sha256", "sha256:" + "0" * 64),
+        ("hidden_size", 512),
+        ("graph_layers", 4),
+        ("attention_heads", 4),
+        ("graph_dropout", 0.1),
     ],
 )
 def test_output_report_must_semantically_prove_the_sealed_dose(
@@ -626,10 +1248,51 @@ def test_output_report_must_semantically_prove_the_sealed_dose(
     payload = _training_report(verified, checkpoint)
     payload[field] = bad_value
     report.write_text(json.dumps(payload))
+    command = [sys.executable, "train_bc.py"]
+    execution_binding = executor._execution_binding(
+        command=command, environment=executor._child_environment(0)
+    )
+    executor._bind_training_report(report, execution_binding=execution_binding)
 
     with pytest.raises(executor.ExecutorError, match="report invariant drift"):
         executor._verify_training_outputs(
-            checkpoint=checkpoint, report=report, verified=verified
+            checkpoint=checkpoint,
+            report=report,
+            verified=verified,
+            execution_binding=execution_binding,
+        )
+
+
+def test_report_binding_rejects_child_spoof_and_verifier_rejects_drift(
+    tmp_path: Path,
+) -> None:
+    verified = _verified(tmp_path)
+    checkpoint = tmp_path / "candidate.pt"
+    optimizer = Path(str(checkpoint) + ".optimizer.pt")
+    report = tmp_path / "report.json"
+    checkpoint.write_bytes(b"candidate")
+    optimizer.write_bytes(b"optimizer")
+    command = [sys.executable, "train_bc.py"]
+    binding = executor._execution_binding(
+        command=command, environment=executor._child_environment(0)
+    )
+
+    spoofed = _training_report(verified, checkpoint)
+    spoofed[executor.REPORT_EXECUTION_BINDING_FIELD] = binding
+    report.write_text(json.dumps(spoofed))
+    with pytest.raises(executor.ExecutorError, match="pre-populated"):
+        executor._bind_training_report(report, execution_binding=binding)
+
+    report.write_text(json.dumps(_training_report(verified, checkpoint)))
+    executor._bind_training_report(report, execution_binding=binding)
+    drifted = dict(binding)
+    drifted["command_sha256"] = "sha256:" + "0" * 64
+    with pytest.raises(executor.ExecutorError, match="does not bind"):
+        executor._verify_training_outputs(
+            checkpoint=checkpoint,
+            report=report,
+            verified=verified,
+            execution_binding=drifted,
         )
 
 

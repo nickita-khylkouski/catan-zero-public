@@ -50,5 +50,36 @@ command, candidate checkpoint, fresh optimizer sidecar, report, GPU, and exact
 optimizer-step count. The executor rejects reports that do not semantically
 prove the sealed corpus/init/checkpoint and exactly one complete epoch. A
 nonzero or malformed run produces durable `failed` claim evidence and cannot be
-mistaken for a candidate. Never delete or edit a contract claim to retry;
-investigate it and issue a new sealed contract if another dose is authorized.
+mistaken for a candidate. Never delete or edit a contract claim to retry.
+
+There is one narrow, typed exception to issuing a new science contract. If the
+v3 attempt failed before optimizer construction solely because the historical
+argv omitted `--graph-layers` and therefore selected `4` against the sealed
+six-layer producer, the executor may authorize one derived v4 repair. The
+repair must add exactly `--graph-layers 6`, keep every other learner semantic
+unchanged, use fresh outputs, and preserve the failed v3 claim and receipt. Its
+stable retry identity keys a different `O_EXCL` claim, so changing r2 filenames
+cannot mint a second retry.
+
+If the v4 retry completed before an iteration state existed, adopt it without
+running the learner again:
+
+```bash
+python tools/a1_iteration_orchestrator.py adopt-retry \
+  --state /absolute/iteration.state.json \
+  --lock /absolute/a1.lock.json \
+  --data /absolute/a1-memmap \
+  --validation-manifest /absolute/a1.audit.validation_seeds.json \
+  --parent-claim /absolute/.a1-one-dose-training-claims/<v3-contract>.json \
+  --retry-contract /absolute/r2/learner-retry.contract.json \
+  --retry-receipt /absolute/r2/training.receipt.json \
+  --python /absolute/learner-venv/bin/python \
+  --gpu 0
+```
+
+`adopt-retry` is a read-only evidence replay followed by one atomic state-file
+publication. It verifies the v3 claim/receipt, zero-step architecture mismatch,
+sole command correction, retry identity and contract, v4 receipt and derived
+claim, exact child environment, output semantics, and every output hash. It
+never invokes `train_bc`; repeating the command validates and returns the same
+sealed `dose_complete` state.

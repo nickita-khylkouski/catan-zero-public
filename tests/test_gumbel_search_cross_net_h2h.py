@@ -7,6 +7,7 @@ GPU/checkpoint/rust dependency needed."""
 from __future__ import annotations
 
 import sys
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -19,11 +20,88 @@ import gumbel_search_cross_net_h2h as h2h  # type: ignore  # noqa: E402
 from gumbel_search_cross_net_h2h import (  # type: ignore  # noqa: E402
     _build_search_config,
     _build_summary,
+    _load_held_out_high_regret_suite,
     _new_search_telemetry,
     _resolve_search_budgets,
     play_one_h2h_game,
     _validate_information_set_recipe,
 )
+
+
+def test_held_out_suite_loader_replays_digest_and_source_manifest(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "regret.npz"
+    source.write_bytes(b"manifest")
+    suite = {
+        "schema_version": "a1-held-out-high-regret-suite-v1",
+        "suite": "held_out_high_regret",
+        "held_out": True,
+        "source_manifest": {
+            "path": str(source),
+            "sha256": h2h._checkpoint_sha256(source),
+        },
+        "selection": {
+            "algorithm": "stable-hash-holdout-stratified-regret-v1",
+            "holdout_fraction": 0.10,
+            "holdout_seed": 17,
+            "eligible_unique_states": 20,
+            "selected_pairs": 20,
+            "stratum_min_pairs": 4,
+            "selected_by_stratum": {
+                "phase:opening": 4,
+                "phase:robber_dev": 4,
+                "phase:chance": 4,
+                "phase:build_trade": 4,
+                "41+": 4,
+            },
+        },
+        "states": [
+            {
+                "pair_id": pair,
+                "game_seed": 123 + pair,
+                "decision_index": pair,
+                "shard_path": "relative-shard.npz",
+                "phase": (
+                    "BUILD_INITIAL_SETTLEMENT",
+                    "MOVE_ROBBER",
+                    "ROLL",
+                    "BUILD_ROAD",
+                )[pair % 4],
+                "legal_count": 54 if pair < 4 else 12,
+            }
+            for pair in range(20)
+        ],
+    }
+    suite["suite_sha256"] = (
+        "sha256:"
+        + h2h.hashlib.sha256(
+            json.dumps(suite, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+    )
+    path = tmp_path / "suite.json"
+    path.write_text(json.dumps(suite), encoding="utf-8")
+
+    resolved_path, loaded, pairs = _load_held_out_high_regret_suite(path)
+
+    assert resolved_path == path.resolve()
+    assert loaded == suite
+    assert len(pairs) == 20
+    assert pairs[0] == {
+        "pair_id": 0,
+        "game_seed": 123,
+        "archived_state": {
+            **suite["states"][0],
+            "shard_path": str((tmp_path / "relative-shard.npz").resolve()),
+        },
+    }
+
+    suite["states"][0]["decision_index"] = 8
+    path.write_text(json.dumps(suite), encoding="utf-8")
+    import pytest
+
+    with pytest.raises(ValueError, match="semantic digest mismatch"):
+        _load_held_out_high_regret_suite(path)
 
 
 def _base_worker_args(**overrides) -> dict:
@@ -67,6 +145,17 @@ def test_build_search_config_threads_information_set_recipe() -> None:
     assert config.determinization_min_simulations == 32
 
 
+def test_build_search_config_seals_disabled_experimental_semantics() -> None:
+    config = _build_search_config(_base_worker_args(n_full=128), seed=1)
+    assert config.exact_budget_sh is False
+    assert config.root_wave_batching is False
+    assert config.play_sh_winner is False
+    assert config.use_batch_api is True
+    assert config.policy_target_min_visits == 0
+    assert config.uncertainty_backup_weighting is False
+    assert config.variance_aware_q is False
+
+
 def test_build_search_config_defaults_to_shared_n_full_when_no_override():
     worker_args = _base_worker_args()
     config = _build_search_config(worker_args, seed=1)
@@ -95,7 +184,9 @@ def test_worker_args_resolution_uses_candidate_and_baseline_keys_when_present():
     candidate_n_full = int(worker_args.get("candidate_n_full", worker_args["n_full"]))
     baseline_n_full = int(worker_args.get("baseline_n_full", worker_args["n_full"]))
 
-    candidate_config = _build_search_config(worker_args, seed=1, n_full=candidate_n_full)
+    candidate_config = _build_search_config(
+        worker_args, seed=1, n_full=candidate_n_full
+    )
     baseline_config = _build_search_config(worker_args, seed=1, n_full=baseline_n_full)
 
     assert candidate_config.n_full == 128
@@ -114,7 +205,9 @@ def test_worker_args_resolution_omits_keys_falls_back_to_shared_n_full():
     assert candidate_n_full == 64
     assert baseline_n_full == 64
 
-    candidate_config = _build_search_config(worker_args, seed=1, n_full=candidate_n_full)
+    candidate_config = _build_search_config(
+        worker_args, seed=1, n_full=candidate_n_full
+    )
     baseline_config = _build_search_config(worker_args, seed=1, n_full=baseline_n_full)
     assert candidate_config.n_full == baseline_config.n_full == 64
 
@@ -302,6 +395,8 @@ def test_h2h_summary_records_resolved_adaptive_budget_by_role():
         workers=1,
         threads_per_worker=1,
         errors=[],
+        candidate_checkpoint_sha256="sha256:" + "1" * 64,
+        baseline_checkpoint_sha256="sha256:" + "2" * 64,
         search_telemetry={
             "candidate": {
                 "search_calls": 10,
@@ -325,6 +420,8 @@ def test_h2h_summary_records_resolved_adaptive_budget_by_role():
             },
         },
     )
+    assert summary["candidate_checkpoint_sha256"] == "sha256:" + "1" * 64
+    assert summary["baseline_checkpoint_sha256"] == "sha256:" + "2" * 64
 
     assert summary["candidate_n_full_wide"] == 256
     assert summary["baseline_n_full_wide"] is None
@@ -353,9 +450,9 @@ def test_h2h_summary_records_resolved_adaptive_budget_by_role():
     assert telemetry["by_role"]["candidate"]["wide_root_calls"] == 4
     assert telemetry["by_role"]["candidate"]["wide_root_simulations_used"] == 1024
     assert telemetry["by_role"]["candidate"]["wide_root_simulations_per_call"] == 256
-    assert telemetry["by_role"]["candidate"][
-        "selected_vs_prior_disagreement_rate"
-    ] == 0.3
+    assert (
+        telemetry["by_role"]["candidate"]["selected_vs_prior_disagreement_rate"] == 0.3
+    )
 
 
 def test_play_game_records_exact_role_simulations_and_decision_change(monkeypatch):
@@ -372,7 +469,9 @@ def test_play_game_records_exact_role_simulations_and_decision_change(monkeypatc
             return "RED"
 
         def player_state_json(self, color):
-            return '{"victory_points": 10}' if color == "RED" else '{"victory_points": 2}'
+            return (
+                '{"victory_points": 10}' if color == "RED" else '{"victory_points": 2}'
+            )
 
     game = FakeGame()
 
