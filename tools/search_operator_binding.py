@@ -21,6 +21,7 @@ import datetime as dt
 import hashlib
 import json
 import os
+import runpy
 import sys
 from pathlib import Path
 from typing import Any
@@ -128,8 +129,44 @@ def _parse_utc(raw: str | None) -> str:
 def _replay_s1(path: Path) -> dict[str, Any]:
     decision_path = path.expanduser().resolve(strict=True)
     payload = _load_json(decision_path)
+
+    # Replay historical decisions with the exact adjudicator bytes they bind.
+    # Replaying with today's checkout makes an otherwise immutable decision
+    # drift whenever the adjudicator later gains hardening or provenance fields.
+    adjudicator: Any = search_adjudicator
+    adjudicator_ref = payload.get("adjudicator")
+    if adjudicator_ref is not None:
+        if not isinstance(adjudicator_ref, dict) or set(adjudicator_ref) != {
+            "path",
+            "sha256",
+        }:
+            raise BindingError("S1 adjudicator reference must contain path and sha256")
+        adjudicator_path = Path(str(adjudicator_ref["path"])).expanduser()
+        if not adjudicator_path.is_absolute():
+            adjudicator_path = decision_path.parent / adjudicator_path
+        adjudicator_path = adjudicator_path.resolve(strict=True)
+        if _sha256(adjudicator_path) != adjudicator_ref["sha256"]:
+            raise BindingError(f"S1 adjudicator hash drift at {adjudicator_path}")
+        current_adjudicator_path = Path(search_adjudicator.__file__).resolve(strict=True)
+        if adjudicator_path != current_adjudicator_path:
+            try:
+                namespace = runpy.run_path(str(adjudicator_path))
+                adjudicator = type(
+                    "BoundAdjudicator",
+                    (),
+                    {
+                        "DECISION_SCHEMA": namespace["DECISION_SCHEMA"],
+                        "MANIFEST_SCHEMA": namespace["MANIFEST_SCHEMA"],
+                        "AdjudicationError": namespace["AdjudicationError"],
+                        "adjudicate": staticmethod(namespace["adjudicate"]),
+                    },
+                )
+            except (KeyError, OSError, RuntimeError) as error:
+                raise BindingError(
+                    f"cannot load bound S1 adjudicator {adjudicator_path}: {error}"
+                ) from error
     if (
-        payload.get("schema_version") != search_adjudicator.DECISION_SCHEMA
+        payload.get("schema_version") != adjudicator.DECISION_SCHEMA
         or payload.get("stage") != "s1"
         or payload.get("passed") is not True
     ):
@@ -152,7 +189,7 @@ def _replay_s1(path: Path) -> dict[str, Any]:
         candidate_payload = _load_json(candidate)
         if (
             candidate_payload.get("schema_version")
-            == search_adjudicator.MANIFEST_SCHEMA
+            == adjudicator.MANIFEST_SCHEMA
             and candidate_payload.get("stage") == "s1"
         ):
             manifests.append(candidate)
@@ -161,8 +198,8 @@ def _replay_s1(path: Path) -> dict[str, Any]:
             f"S1 decision must bind exactly one replayable manifest, found {len(manifests)}"
         )
     try:
-        replayed = search_adjudicator.adjudicate(manifests[0])
-    except search_adjudicator.AdjudicationError as error:
+        replayed = adjudicator.adjudicate(manifests[0])
+    except adjudicator.AdjudicationError as error:
         raise BindingError(f"S1 semantic replay failed: {error}") from error
     if replayed != payload:
         raise BindingError("S1 decision does not equal semantic replay")

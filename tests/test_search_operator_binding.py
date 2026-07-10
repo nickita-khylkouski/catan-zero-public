@@ -130,6 +130,42 @@ def test_binding_rejects_unreplayable_or_drifted_s1(
         binding.build_bindings(s1_path, s2_output_path=tmp_path / "s2.json")
 
 
+def test_binding_replays_with_the_historically_bound_adjudicator(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    s1_path, decision = _s1_fixture(tmp_path, monkeypatch)
+    adjudicator = tmp_path / "historical_adjudicator.py"
+    adjudicator.write_text("# immutable historical adjudicator\n", encoding="utf-8")
+    decision["adjudicator"] = {"path": str(adjudicator), "sha256": _sha(adjudicator)}
+    decision["source_artifacts"].append(
+        {"path": str(adjudicator), "sha256": _sha(adjudicator)}
+    )
+    s1_path.write_text(json.dumps(decision) + "\n", encoding="utf-8")
+
+    monkeypatch.setattr(
+        binding.runpy,
+        "run_path",
+        lambda candidate: {
+            "DECISION_SCHEMA": binding.search_adjudicator.DECISION_SCHEMA,
+            "MANIFEST_SCHEMA": binding.search_adjudicator.MANIFEST_SCHEMA,
+            "AdjudicationError": binding.search_adjudicator.AdjudicationError,
+            "adjudicate": lambda _manifest: decision,
+        }
+        if Path(candidate) == adjudicator
+        else {},
+    )
+    monkeypatch.setattr(
+        binding.search_adjudicator,
+        "adjudicate",
+        lambda _manifest: (_ for _ in ()).throw(AssertionError("used current adjudicator")),
+    )
+
+    s2, _s3 = binding.build_bindings(
+        s1_path, s2_output_path=tmp_path / "s2.json"
+    )
+    assert s2["selected_fields"] == binding.S2_SELECTED
+
+
 @pytest.mark.parametrize(
     "timestamp",
     ["2026-07-10T04:10:00", "2026-07-10T04:10:00-07:00", "not-a-time"],
