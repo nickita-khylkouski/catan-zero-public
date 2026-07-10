@@ -203,6 +203,69 @@ def test_sealed_a1_categories_share_physical_gpu_slot_arbitration(
     assert snapshots[0].category == "recent_history"
 
 
+def test_a1_contract_and_live_argv_supply_typed_attestation_labels(
+    tmp_path: Path,
+) -> None:
+    now = 17_000.0
+    root = tmp_path / "gen_out"
+    output = root / "a1-fresh-mixed-12000games" / "c1_gpu0__current_producer"
+    contract_hash = "sha256:" + "a" * 64
+    _write_json(
+        output / "a1_contract.json",
+        {
+            "schema_version": "a1-generation-job-attestation-v2",
+            "base_seed": 300_000_000_000,
+            "seed_end": 300_000_000_245,
+            "games": 240,
+            "attempts": 245,
+            "effective_search_config_sha256": contract_hash,
+        },
+        mtime=now - 2,
+    )
+    _write_json(
+        output / "worker_000" / "progress.json",
+        {
+            "games_requested": 245,
+            "games_completed_local": 2,
+            "rows": 900,
+            "simulations_used_total": 12_000,
+            "shard_count_confirmed": 1,
+            "games_failed": 0,
+            "games_truncated": 0,
+        },
+        mtime=now - 1,
+    )
+    resolved = str(output.resolve())
+    argv = (
+        "python",
+        "tools/generate_gumbel_selfplay_data.py",
+        "--out-dir",
+        resolved,
+        "--n-full",
+        "128",
+        "--p-full",
+        "0.25",
+    )
+
+    snapshot = exporter.snapshot_run(
+        output,
+        host="fleet-host",
+        processes={resolved: {123}},
+        generator_argv={resolved: argv},
+        now=now,
+        stale_after_seconds=60,
+    )
+
+    assert snapshot is not None
+    assert snapshot.config_hash == contract_hash
+    assert snapshot.n_full == 128
+    assert snapshot.p_full == 0.25
+    assert snapshot.role == "teacher"
+    assert snapshot.seed_start == 300_000_000_000
+    assert snapshot.seed_end == 300_000_000_245
+    assert snapshot.games_requested == 245
+
+
 def test_stale_active_progress_is_unhealthy(tmp_path: Path) -> None:
     now = 20_000.0
     gpu = tmp_path / "runs" / "claim" / "gpu0"
@@ -304,6 +367,14 @@ def test_discover_generators_reads_out_dir_from_proc_cmdline(tmp_path: Path) -> 
     (proc / "not-a-pid").mkdir()
 
     assert exporter.discover_generators(proc) == {str(out.resolve()): {123}}
+    assert exporter.discover_generator_argv(proc) == {
+        str(out.resolve()): (
+            "python",
+            "tools/generate_gumbel_selfplay_data.py",
+            "--out-dir",
+            str(out),
+        )
+    }
 
 
 def test_only_latest_or_active_run_per_gpu_is_exposed(tmp_path: Path) -> None:

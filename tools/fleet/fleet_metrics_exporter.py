@@ -79,6 +79,36 @@ def discover_generators(proc_root: Path = Path("/proc")) -> dict[str, set[int]]:
     return found
 
 
+def discover_generator_argv(proc_root: Path = Path("/proc")) -> dict[str, tuple[str, ...]]:
+    """Map each live generator output to one deterministic, inspectable argv."""
+    found: dict[str, tuple[int, tuple[str, ...]]] = {}
+    try:
+        entries = list(proc_root.iterdir())
+    except OSError:
+        return {}
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            raw = (entry / "cmdline").read_bytes()
+        except OSError:
+            continue
+        argv = tuple(
+            part.decode("utf-8", "replace") for part in raw.split(b"\0") if part
+        )
+        if not any(value.endswith("generate_gumbel_selfplay_data.py") for value in argv):
+            continue
+        out_dir = _flag_value(argv, "--out-dir")
+        if not out_dir:
+            continue
+        resolved = str(Path(out_dir).expanduser().resolve())
+        pid = int(entry.name)
+        prior = found.get(resolved)
+        if prior is None or pid < prior[0]:
+            found[resolved] = (pid, argv)
+    return {path: record[1] for path, record in found.items()}
+
+
 def _number(value: Any, default: float = 0.0) -> float:
     if isinstance(value, bool):
         return default
@@ -149,6 +179,7 @@ def snapshot_run(
     *,
     host: str,
     processes: Mapping[str, set[int]],
+    generator_argv: Mapping[str, Sequence[str]] | None = None,
     now: float,
     stale_after_seconds: float,
 ) -> RunSnapshot | None:
@@ -160,11 +191,13 @@ def snapshot_run(
     assert match is not None
     config_path = gpu_dir / "config.json"
     manifest_path = gpu_dir / "manifest.json"
+    a1_contract_path = gpu_dir / "a1_contract.json"
     config = _load_json(config_path) or {}
     fields = config.get("fields") if isinstance(config.get("fields"), dict) else {}
     manifest = _load_json(manifest_path)
+    a1_contract = _load_json(a1_contract_path)
     progress, progress_mtime = _aggregate_progress(gpu_dir)
-    if not config and manifest is None and progress_mtime == 0.0:
+    if not config and manifest is None and a1_contract is None and progress_mtime == 0.0:
         return None
 
     if manifest is not None:
@@ -183,7 +216,7 @@ def snapshot_run(
         values = progress
 
     mtimes = [value for value in (progress_mtime,) if value > 0]
-    for path in (config_path, manifest_path):
+    for path in (config_path, manifest_path, a1_contract_path):
         try:
             mtimes.append(path.stat().st_mtime)
         except OSError:
@@ -192,7 +225,13 @@ def snapshot_run(
     age = max(0.0, now - newest) if newest else float("inf")
     resolved = str(gpu_dir.resolve())
     pids = processes.get(resolved, set())
-    games_requested = int(values["games_requested"] or _number(fields.get("games")))
+    argv = tuple((generator_argv or {}).get(resolved, ()))
+    attested_attempts = _number(
+        a1_contract.get("attempts") if a1_contract is not None else None
+    )
+    games_requested = int(
+        values["games_requested"] or _number(fields.get("games")) or attested_attempts
+    )
     games_completed = int(values["games_completed"])
     errors = manifest.get("errors", []) if manifest is not None else []
     complete = bool(
@@ -212,6 +251,9 @@ def snapshot_run(
         if manifest is not None and manifest.get("config_hash")
         else _config_hash(config)
         if config
+        else str(a1_contract.get("effective_search_config_sha256"))
+        if a1_contract is not None
+        and isinstance(a1_contract.get("effective_search_config_sha256"), str)
         else "pending"
     )
     seed_start = int(
@@ -221,6 +263,8 @@ def snapshot_run(
     )
     if not seed_start:
         seed_start = int(_number(fields.get("base_seed")))
+    if not seed_start and a1_contract is not None:
+        seed_start = int(_number(a1_contract.get("base_seed")))
     run = gpu_dir.parent.name
     n_full = int(
         _number(manifest.get("n_full") if manifest is not None else fields.get("n_full"))
@@ -228,6 +272,15 @@ def snapshot_run(
     p_full = _number(
         manifest.get("p_full") if manifest is not None else fields.get("p_full")
     )
+    if n_full <= 0:
+        n_full = int(_number(_flag_value(argv, "--n-full")))
+    if p_full <= 0:
+        p_full = _number(_flag_value(argv, "--p-full"))
+    seed_end = seed_start + games_requested
+    if a1_contract is not None:
+        attested_seed_end = int(_number(a1_contract.get("seed_end")))
+        if attested_seed_end > seed_start:
+            seed_end = attested_seed_end
     role = "teacher" if n_full >= 128 else "volume"
     return RunSnapshot(
         host=host,
@@ -242,7 +295,7 @@ def snapshot_run(
         n_full=n_full,
         p_full=p_full,
         seed_start=seed_start,
-        seed_end=seed_start + games_requested,
+        seed_end=seed_end,
         games_requested=games_requested,
         games_completed=games_completed,
         rows=int(values["rows"]),
@@ -263,6 +316,7 @@ def collect_snapshots(
     *,
     host: str,
     processes: Mapping[str, set[int]],
+    generator_argv: Mapping[str, Sequence[str]] | None = None,
     now: float,
     stale_after_seconds: float,
     max_run_age_seconds: float,
@@ -279,6 +333,7 @@ def collect_snapshots(
                 gpu_dir,
                 host=host,
                 processes=processes,
+                generator_argv=generator_argv,
                 now=now,
                 stale_after_seconds=stale_after_seconds,
             )
@@ -386,11 +441,13 @@ def render_metrics(
 def collect_metrics(args: argparse.Namespace) -> str:
     now = time.time()
     processes = discover_generators(Path(args.proc_root))
+    generator_argv = discover_generator_argv(Path(args.proc_root))
     roots = [Path(value) for value in args.run_root]
     snapshots = collect_snapshots(
         roots,
         host=args.host_label,
         processes=processes,
+        generator_argv=generator_argv,
         now=now,
         stale_after_seconds=float(args.stale_after_seconds),
         max_run_age_seconds=float(args.max_run_age_seconds),
