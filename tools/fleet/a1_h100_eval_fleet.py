@@ -935,7 +935,7 @@ def _launch_job_command(manifest: dict[str, Any], job: dict[str, Any]) -> str:
         'exit "$rc"'
     )
     detached = [
-        "tools/fleet/launch_detached.sh",
+        manifest["remote_repo"].rstrip("/") + "/tools/fleet/launch_detached.sh",
         job_dir,
         log,
         "60",

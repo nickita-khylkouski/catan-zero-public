@@ -185,6 +185,8 @@ def test_every_job_is_cuda_pinned_and_has_exact_n128_infoset_d6_recipe(
     assert "memory.used" in all_shell
     assert "PYTHONPATH=" in all_shell
     assert "/home/ubuntu/catan-zero-v1/src" in all_shell
+    assert "/home/ubuntu/catan-zero-v1/tools/fleet/launch_detached.sh" in all_shell
+    assert "\ntools/fleet/launch_detached.sh " not in all_shell
 
 
 def test_plan_hash_and_checkpoint_bytes_are_replayed_on_load(tmp_path: Path) -> None:
