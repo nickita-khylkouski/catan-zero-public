@@ -8,12 +8,21 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 _TOOLS_DIR = Path(__file__).resolve().parents[1] / "tools"
 if str(_TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(_TOOLS_DIR))
 
-from gumbel_search_cross_net_h2h import _build_search_config  # type: ignore  # noqa: E402
+from catan_zero.rl.pipeline_configs import EvalConfig  # noqa: E402
+import gumbel_search_cross_net_h2h as h2h  # type: ignore  # noqa: E402
+from gumbel_search_cross_net_h2h import (  # type: ignore  # noqa: E402
+    _build_search_config,
+    _build_summary,
+    _new_search_telemetry,
+    _resolve_search_budgets,
+    play_one_h2h_game,
+)
 
 
 def _base_worker_args(**overrides) -> dict:
@@ -90,3 +99,298 @@ def test_build_search_config_preserves_other_fields_regardless_of_n_full_overrid
     assert config.c_visit == 10.0
     assert config.max_root_candidates == 8
     assert config.seed == 7
+
+
+def test_build_search_config_threads_d1_noise_floor_calibration():
+    config = _build_search_config(
+        _base_worker_args(rescale_noise_floor_c=0.25, sigma_eval=0.5),
+        seed=1,
+    )
+    assert config.rescale_noise_floor_c == 0.25
+    assert config.sigma_eval == 0.5
+
+    default_config = _build_search_config(_base_worker_args(), seed=1)
+    assert default_config.rescale_noise_floor_c == 0.0
+    assert default_config.sigma_eval == 0.79
+
+
+def test_role_specific_wide_budget_overrides_only_candidate():
+    worker_args = _base_worker_args(
+        n_full_wide=None,
+        candidate_n_full=128,
+        baseline_n_full=128,
+        candidate_n_full_wide=256,
+        candidate_n_full_wide_threshold=40,
+    )
+    budgets = _resolve_search_budgets(worker_args)
+
+    candidate = _build_search_config(
+        worker_args,
+        seed=1,
+        n_full=int(budgets["candidate_n_full"]),
+        n_full_wide=budgets["candidate_n_full_wide"],
+        n_full_wide_threshold=budgets["candidate_n_full_wide_threshold"],
+    )
+    baseline = _build_search_config(
+        worker_args,
+        seed=1,
+        n_full=int(budgets["baseline_n_full"]),
+        n_full_wide=budgets["baseline_n_full_wide"],
+        n_full_wide_threshold=budgets["baseline_n_full_wide_threshold"],
+    )
+
+    assert candidate.n_full == baseline.n_full == 128
+    assert candidate.n_full_wide == 256
+    assert candidate.n_full_wide_threshold == 40
+    assert baseline.n_full_wide is None
+    assert baseline.n_full_wide_threshold is None
+
+
+def test_shared_wide_budget_is_backward_compatible_fallback():
+    budgets = _resolve_search_budgets(_base_worker_args(n_full_wide=512))
+    assert budgets == {
+        "candidate_n_full": 64,
+        "baseline_n_full": 64,
+        "candidate_n_full_wide": 512,
+        "baseline_n_full_wide": 512,
+        "candidate_n_full_wide_threshold": None,
+        "baseline_n_full_wide_threshold": None,
+    }
+
+
+def test_role_specific_wide_budgets_override_shared_fallback_independently():
+    budgets = _resolve_search_budgets(
+        _base_worker_args(
+            n_full_wide=512,
+            candidate_n_full_wide=256,
+            baseline_n_full_wide=128,
+            n_full_wide_threshold=40,
+            candidate_n_full_wide_threshold=48,
+            baseline_n_full_wide_threshold=32,
+        )
+    )
+    assert budgets["candidate_n_full_wide"] == 256
+    assert budgets["baseline_n_full_wide"] == 128
+    assert budgets["candidate_n_full_wide_threshold"] == 48
+    assert budgets["baseline_n_full_wide_threshold"] == 32
+
+
+def test_eval_config_hash_distinguishes_adaptive_candidate_from_shared_arm():
+    adaptive = EvalConfig(
+        mode="cross_net",
+        n_full=64,
+        candidate_n_full=128,
+        baseline_n_full=128,
+        candidate_n_full_wide=256,
+        baseline_n_full_wide=None,
+        candidate_n_full_wide_threshold=40,
+        baseline_n_full_wide_threshold=None,
+    )
+    uniform = EvalConfig(
+        mode="cross_net",
+        n_full=64,
+        candidate_n_full=128,
+        baseline_n_full=128,
+        candidate_n_full_wide=None,
+        baseline_n_full_wide=None,
+        candidate_n_full_wide_threshold=None,
+        baseline_n_full_wide_threshold=None,
+    )
+    shared = EvalConfig(
+        mode="cross_net",
+        n_full=64,
+        n_full_wide=256,
+        candidate_n_full=128,
+        baseline_n_full=128,
+        candidate_n_full_wide=256,
+        baseline_n_full_wide=256,
+        n_full_wide_threshold=40,
+        candidate_n_full_wide_threshold=40,
+        baseline_n_full_wide_threshold=40,
+    )
+
+    assert adaptive.config_hash() != uniform.config_hash()
+    assert adaptive.config_hash() != shared.config_hash()
+    assert adaptive.full_config_hash().startswith("sha256:")
+
+
+def test_eval_config_hash_distinguishes_d1_calibration():
+    legacy = EvalConfig(mode="cross_net")
+    calibrated = EvalConfig(
+        mode="cross_net", rescale_noise_floor_c=0.25, sigma_eval=0.5
+    )
+    assert legacy.config_hash() != calibrated.config_hash()
+
+
+def test_h2h_summary_records_resolved_adaptive_budget_by_role():
+    args = SimpleNamespace(
+        candidate="same.pt",
+        baseline="same.pt",
+        gate_config="flywheel",
+        n_full=64,
+        candidate_n_full=128,
+        baseline_n_full=128,
+        n_full_wide=None,
+        candidate_n_full_wide=256,
+        baseline_n_full_wide=None,
+        n_full_wide_threshold=None,
+        candidate_n_full_wide_threshold=40,
+        baseline_n_full_wide_threshold=None,
+        lazy_interior_chance=True,
+        value_squash="tanh",
+        value_readout="scalar",
+        candidate_value_readout=None,
+        baseline_value_readout=None,
+        c_scale=0.1,
+        c_visit=50.0,
+        rescale_noise_floor_c=0.25,
+        sigma_eval=0.5,
+        max_root_candidates=16,
+        max_root_candidates_wide=54,
+        correct_rust_chance_spectra=True,
+        public_observation=True,
+        belief_chance_spectra=False,
+        raw_policy_above_width=None,
+        symmetry_averaged_eval=True,
+        symmetry_averaged_eval_threshold=20,
+        wide_candidates_threshold=24,
+        elo0=-10.0,
+        elo1=15.0,
+    )
+    summary = _build_summary(
+        args,
+        all_games=[],
+        outcomes=[],
+        truncated_count=0,
+        pairs=[],
+        elapsed=0.0,
+        workers=1,
+        threads_per_worker=1,
+        errors=[],
+        search_telemetry={
+            "candidate": {
+                "search_calls": 10,
+                "non_forced_search_calls": 10,
+                "search_elapsed_sec": 20.0,
+                "simulations_used": 1536,
+                "wide_root_calls": 4,
+                "wide_root_simulations_used": 1024,
+                "selected_vs_prior_disagreement_calls": 3,
+                "wide_selected_vs_prior_disagreement_calls": 2,
+            },
+            "baseline": {
+                "search_calls": 10,
+                "non_forced_search_calls": 10,
+                "search_elapsed_sec": 10.0,
+                "simulations_used": 1280,
+                "wide_root_calls": 4,
+                "wide_root_simulations_used": 512,
+                "selected_vs_prior_disagreement_calls": 2,
+                "wide_selected_vs_prior_disagreement_calls": 1,
+            },
+        },
+    )
+
+    assert summary["candidate_n_full_wide"] == 256
+    assert summary["baseline_n_full_wide"] is None
+    assert summary["candidate_n_full_wide_threshold"] == 40
+    assert summary["baseline_n_full_wide_threshold"] is None
+    assert summary["symmetry_averaged_eval_threshold"] == 20
+    assert summary["rescale_noise_floor_c"] == 0.25
+    assert summary["sigma_eval"] == 0.5
+    assert summary["search_budgets_by_role"] == {
+        "candidate": {
+            "n_full": 128,
+            "n_full_wide": 256,
+            "n_full_wide_threshold": 40,
+        },
+        "baseline": {
+            "n_full": 128,
+            "n_full_wide": None,
+            "n_full_wide_threshold": None,
+        },
+    }
+    telemetry = summary["search_telemetry"]
+    assert telemetry["candidate_over_baseline_elapsed_ratio"] == 2.0
+    assert telemetry["candidate_over_baseline_seconds_per_call_ratio"] == 2.0
+    assert telemetry["candidate_over_baseline_simulations_ratio"] == 1.2
+    assert telemetry["candidate_over_baseline_simulations_per_call_ratio"] == 1.2
+    assert telemetry["by_role"]["candidate"]["wide_root_calls"] == 4
+    assert telemetry["by_role"]["candidate"]["wide_root_simulations_used"] == 1024
+    assert telemetry["by_role"]["candidate"]["wide_root_simulations_per_call"] == 256
+    assert telemetry["by_role"]["candidate"][
+        "selected_vs_prior_disagreement_rate"
+    ] == 0.3
+
+
+def test_play_game_records_exact_role_simulations_and_decision_change(monkeypatch):
+    class FakeGame:
+        won = False
+
+        def winning_color(self):
+            return "RED" if self.won else None
+
+        def playable_action_indices(self, _colors, _unused):
+            return list(range(40))
+
+        def current_color(self):
+            return "RED"
+
+        def player_state_json(self, color):
+            return '{"victory_points": 10}' if color == "RED" else '{"victory_points": 2}'
+
+    game = FakeGame()
+
+    class FakeRustGameFactory:
+        @staticmethod
+        def simple(_colors, *, seed):
+            assert seed == 17
+            return game
+
+    fake_rust = SimpleNamespace(Game=FakeRustGameFactory)
+    monkeypatch.setattr(h2h, "_require_rust_module", lambda: fake_rust)
+
+    def apply_action(current_game, selected, **_kwargs):
+        assert selected == 7
+        current_game.won = True
+        return current_game
+
+    monkeypatch.setattr(h2h, "_apply_selected_action", apply_action)
+
+    class FakeMCTS:
+        config = SimpleNamespace(
+            n_full_wide_threshold=40,
+            wide_candidates_threshold=24,
+        )
+
+        def search(self, _game, *, force_full):
+            assert force_full is True
+            return SimpleNamespace(
+                selected_action=7,
+                priors={3: 0.9, 7: 0.1},
+                simulations_used=256,
+            )
+
+    telemetry = _new_search_telemetry()
+    record = play_one_h2h_game(
+        {"candidate": FakeMCTS(), "baseline": FakeMCTS()},
+        role_by_color={"RED": "candidate", "BLUE": "baseline"},
+        game_seed=17,
+        max_decisions=2,
+        correct_rust_chance_spectra=True,
+        search_telemetry_by_role=telemetry,
+    )
+
+    assert record["candidate_won"] is True
+    candidate_telemetry = dict(telemetry["candidate"])
+    elapsed = candidate_telemetry.pop("search_elapsed_sec")
+    assert candidate_telemetry == {
+        "search_calls": 1,
+        "non_forced_search_calls": 1,
+        "simulations_used": 256,
+        "wide_root_calls": 1,
+        "wide_root_simulations_used": 256,
+        "selected_vs_prior_disagreement_calls": 1,
+        "wide_selected_vs_prior_disagreement_calls": 1,
+    }
+    assert elapsed >= 0.0

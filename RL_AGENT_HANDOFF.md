@@ -1052,7 +1052,7 @@ that exact remote path for future launches. Verify all remote hashes before
 unfreezing allocation. Keep the incumbent path and registry backup for rollback.
 
 `runs/CURRENT_CHAMPION` only feeds an obsolete launcher and is not the H100
-deployment source. Do not run `auto_refill.sh`. Update and restart a legacy feed
+deployment source. The obsolete `auto_refill.sh` was removed. Update and restart a legacy feed
 daemon only if the wave record explicitly says that loop remains active.
 
 Do not change public_champion after a flywheel gate. Public promotion requires

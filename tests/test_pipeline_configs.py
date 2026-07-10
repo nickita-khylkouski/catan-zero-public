@@ -228,11 +228,29 @@ def test_from_namespace_reproduces_direct_construction() -> None:
 
 
 def test_generate_from_namespace_maps_format_to_fmt() -> None:
-    ns = argparse.Namespace(**{"format": "npz_zst", "n_full": 128, "public_observation": True})
+    ns = argparse.Namespace(
+        **{
+            "format": "npz_zst",
+            "n_full": 128,
+            "public_observation": True,
+            "symmetry_averaged_eval": True,
+            "symmetry_averaged_eval_threshold": 20,
+            "n_full_wide": 256,
+            "n_full_wide_threshold": 40,
+            "wide_roots_always_full": True,
+            "wide_candidates_threshold": 20,
+        }
+    )
     cfg = GenerateConfig.from_namespace(ns)
     assert cfg.fmt == "npz_zst"
     assert cfg.n_full == 128
     assert cfg.public_observation is True
+    assert cfg.symmetry_averaged_eval is True
+    assert cfg.symmetry_averaged_eval_threshold == 20
+    assert cfg.n_full_wide == 256
+    assert cfg.n_full_wide_threshold == 40
+    assert cfg.wide_roots_always_full is True
+    assert cfg.wide_candidates_threshold == 20
 
 
 # --------------------------------------------------------------------------- #

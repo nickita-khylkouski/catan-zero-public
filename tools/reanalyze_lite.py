@@ -23,9 +23,10 @@ for, with ZERO new games: batch-forward the CURRENT champion (or a lagged/EMA ne
 over the stored states and overwrite the value component with those fresh forward
 passes. This is a batch FORWARD pass, not a full re-search (that is the larger,
 separate "full selective reanalyze" graduation step, CAT-63) -- and it is a
-HYPOTHESIS TEST, not a guaranteed fix: a raw forward value may or may not beat the
-stale search-completed value. The retrain + gate (a separate step, run on the
-output of this tool) is what decides.
+HYPOTHESIS TEST, not a guaranteed fix: a fresh search-consistent forward value may
+or may not beat the stale search-completed value. The selected scalar/categorical
+readout is materialized with search's exact scale, squash, and final clip; the
+retrain + gate (a separate step, run on the output of this tool) is what decides.
 
 WHAT IT REUSES
 --------------
@@ -69,15 +70,22 @@ Lagged/EMA reanalyzer (R8 fallback when drift telemetry is ambiguous)::
 Then retrain ONE dose champion-init on the rewritten corpus and gate it against a
 same-data control trained on the untouched corpus (both separate steps).
 
-NOTE ON THE DEFAULT (``--v-component target_scores``): a standard memmap corpus
-carries ``target_scores`` (per-action search-completed Q) but not ``root_value``
-or ``afterstate_target`` (dropped at conversion, gumbel_self_play.EXTRA_KEYS).
-Refreshing ``target_scores`` from the q-head replaces the generation-time net's
-archived Q with the reanalyzer's fresh Q -- the literal ticket instruction. If a
-per-STATE value column is what the eventual value-target-lambda consumes, use
-``--v-component root_value`` to materialise a fresh V(s) column from the value
-head instead. Which lever the retrain+gate should test is a decision for the
-operator; see the CAT-34 completion note.
+SAFE DEFAULT
+------------
+The default is ``--v-component root_value``. It materialises a fresh per-state
+``V(s)`` column from the configured trained value readout, using the same
+``value_scale`` / scalar ``value_squash`` / final ``[-1, 1]`` clip as search. The
+full contract is persisted in the column schema and manifest. This is the column
+consumed by ``train_bc --value-target-lambda``. Normal training uses
+``q_loss_weight=0`` and freezes the q branch, so silently replacing
+``target_scores`` from that branch would turn random/untrained outputs into
+training targets.
+
+The per-action ``target_scores`` and ``afterstate_target`` modes remain available
+only for a checkpoint whose q head has explicit, validated provenance supplied by
+``--q-head-provenance``. The provenance is checkpoint-md5-bound and must attest
+that the q head was trained for root-to-move search-action values in ``[-1, 1]``
+and passed a named validation. See ``docs/REANALYZE_Q_HEAD_PROVENANCE.md``.
 """
 from __future__ import annotations
 
@@ -100,7 +108,14 @@ if str(_SRC_DIR) not in sys.path:
     sys.path.insert(0, str(_SRC_DIR))
 
 TOOL_NAME = "reanalyze_lite"
-TOOL_VERSION = "1.0"
+TOOL_VERSION = "1.2"
+DEFAULT_V_COMPONENT = "root_value"
+
+Q_HEAD_PROVENANCE_SCHEMA = "catan_zero_q_head_provenance_v1"
+Q_HEAD_TARGET_SEMANTICS = "root_to_move_search_action_value_v1"
+ROOT_VALUE_MATERIALIZATION_SCHEMA = "catan_zero_root_value_materialization_v1"
+ROOT_VALUE_TARGET_SEMANTICS = "root_to_move_search_backup_value_v1"
+ROOT_VALUE_RANGE = [-1.0, 1.0]
 
 # The three value-component columns the tool can refresh, and which forward-pass
 # output feeds each. Only ``target_scores`` is present in a standard memmap corpus
@@ -113,12 +128,261 @@ TOOL_VERSION = "1.0"
 #   (N, legal_width), stored trimmed to each row's legal count; refreshed from the
 #   q_values head, overwriting only the entries that were finite (masked) before.
 # * per_state columns (root_value) are a scalar (N,) fixed column; refreshed from
-#   the value head V(s). If absent it is MATERIALISED (a new .dat + a schema entry).
+#   the configured search value readout after its exact scale/squash/final clip.
+#   If absent it is MATERIALISED (a new .dat + a provenance-bearing schema entry).
 V_COMPONENTS: dict[str, dict[str, str]] = {
     "target_scores": {"forward_output": "q_values", "kind": "per_action"},
     "afterstate_target": {"forward_output": "q_values", "kind": "per_action"},
     "root_value": {"forward_output": "value", "kind": "per_state"},
 }
+
+
+def resolve_root_value_materialization(
+    *,
+    value_readout: str = "scalar",
+    value_squash: str = "tanh",
+    value_scale: float = 1.0,
+) -> dict:
+    """Return the canonical, search-equivalent root-value materialization spec.
+
+    This mirrors :class:`EntityGraphRustEvaluator` exactly: scalar search reads
+    ``outputs["value"]`` and applies ``tanh(raw * scale)`` (or the experimental
+    clip-only path); categorical search reads the already-calibrated
+    ``outputs["value_categorical"]``, bypasses scalar tanh, then both paths apply
+    the evaluator's final ``[-1, 1]`` clip.  Persisting this complete spec keeps a
+    corpus target tied to the readout actually used by search instead of merely
+    saying that it came from an unspecified "value head".
+    """
+    readout = str(value_readout)
+    squash = str(value_squash)
+    try:
+        scale = float(value_scale)
+    except (TypeError, ValueError) as exc:
+        raise SystemExit(f"--value-scale must be a finite positive float (got {value_scale!r})") from exc
+    if readout not in {"scalar", "categorical"}:
+        raise SystemExit(
+            f"unknown --value-readout {readout!r}; expected 'scalar' or 'categorical'"
+        )
+    if squash not in {"tanh", "clip"}:
+        raise SystemExit(
+            f"unknown --value-squash {squash!r}; expected 'tanh' or 'clip'"
+        )
+    if not np.isfinite(scale) or scale <= 0.0:
+        raise SystemExit(f"--value-scale must be finite and > 0 (got {value_scale!r})")
+    return {
+        "schema": ROOT_VALUE_MATERIALIZATION_SCHEMA,
+        "target_semantics": ROOT_VALUE_TARGET_SEMANTICS,
+        "value_readout": readout,
+        "forward_output": "value" if readout == "scalar" else "value_categorical",
+        "value_scale": scale,
+        "configured_value_squash": squash,
+        "applied_value_squash": squash if readout == "scalar" else "none",
+        "final_clip": True,
+        "value_range": list(ROOT_VALUE_RANGE),
+    }
+
+
+def validate_root_value_materialization(
+    provenance: dict | None,
+    *,
+    v_component: str,
+) -> dict | None:
+    """Validate a persisted materialization record, rejecting legacy ambiguity.
+
+    Per-action Q targets do not use this record.  ``root_value`` jobs must carry
+    the full canonical record at plan, run, and merge time; otherwise a pre-v1.2
+    banked job containing raw, unsquashed scalar outputs could be mistaken for
+    search-backup values.
+    """
+    if v_component != "root_value":
+        if provenance is not None:
+            raise SystemExit(
+                "root-value materialization provenance is only valid with "
+                "--v-component root_value"
+            )
+        return None
+    if not isinstance(provenance, dict):
+        raise SystemExit(
+            "root_value requires search-consistent value materialization provenance; "
+            "legacy/raw-forward jobs must be re-planned"
+        )
+    try:
+        canonical = resolve_root_value_materialization(
+            value_readout=provenance.get("value_readout"),
+            value_squash=provenance.get("configured_value_squash"),
+            value_scale=provenance.get("value_scale"),
+        )
+    except SystemExit as exc:
+        raise SystemExit(f"invalid root-value materialization provenance: {exc}") from exc
+    if provenance != canonical:
+        mismatched = sorted(
+            key
+            for key in set(provenance) | set(canonical)
+            if provenance.get(key) != canonical.get(key)
+        )
+        raise SystemExit(
+            "invalid root-value materialization provenance: non-canonical/mismatched "
+            f"field(s) {mismatched}"
+        )
+    return canonical
+
+
+def materialize_search_root_values(outputs: dict, provenance: dict) -> np.ndarray:
+    """Convert one forward batch into the exact bounded value search backs up."""
+    spec = validate_root_value_materialization(provenance, v_component="root_value")
+    assert spec is not None
+    key = spec["forward_output"]
+    if key not in outputs:
+        raise SystemExit(
+            f"value_readout={spec['value_readout']!r} requires forward output {key!r}; "
+            f"model emitted {sorted(outputs)} (refusing fallback to another head)"
+        )
+    tensor = outputs[key]
+    try:
+        raw = tensor.detach().float().reshape(-1).cpu().numpy().astype(np.float64)
+    except AttributeError as exc:
+        raise SystemExit(f"forward output {key!r} is not a tensor-like value") from exc
+    if not np.all(np.isfinite(raw)):
+        bad = int((~np.isfinite(raw)).sum())
+        raise SystemExit(f"forward output {key!r} contains {bad} non-finite value(s)")
+
+    scaled = raw * float(spec["value_scale"])
+    if spec["applied_value_squash"] == "tanh":
+        bounded = np.tanh(scaled)
+    elif spec["applied_value_squash"] in {"clip", "none"}:
+        bounded = scaled
+    else:  # Defensive even after canonical validation.
+        raise SystemExit(
+            f"unsupported applied value squash {spec['applied_value_squash']!r}"
+        )
+    # This is the final clip performed at every search call site, after squash.
+    bounded = np.clip(bounded, ROOT_VALUE_RANGE[0], ROOT_VALUE_RANGE[1])
+    if not np.all(np.isfinite(bounded)):
+        raise SystemExit("materialized root values contain non-finite value(s)")
+    if np.any(bounded < ROOT_VALUE_RANGE[0]) or np.any(bounded > ROOT_VALUE_RANGE[1]):
+        raise SystemExit("materialized root values escaped the declared [-1, 1] range")
+    return bounded.astype(np.float32, copy=False)
+
+
+def _is_hex_digest(value: object, length: int) -> bool:
+    if not isinstance(value, str) or len(value) != length:
+        return False
+    try:
+        int(value, 16)
+    except ValueError:
+        return False
+    return True
+
+
+def validate_q_head_provenance(
+    provenance: Path | dict | None,
+    *,
+    reanalyzer_meta: dict,
+    v_component: str,
+) -> dict | None:
+    """Fail closed before any q-head output can become a corpus target.
+
+    ``root_value`` uses the value head and needs no q provenance. Per-action
+    components use ``q_values`` and therefore require an explicit record bound to
+    the exact checkpoint. A path is normalized into a self-contained manifest
+    record (including the provenance file hash); an already-normalized dict is
+    accepted when re-validating a banked job manifest at ``run``/``merge`` time.
+    """
+    spec = V_COMPONENTS.get(v_component)
+    if spec is None:
+        raise SystemExit(
+            f"unknown --v-component {v_component!r}; choices: {sorted(V_COMPONENTS)}"
+        )
+    needs_q = spec["forward_output"] == "q_values"
+    if not needs_q:
+        if provenance is not None:
+            raise SystemExit(
+                "--q-head-provenance is only valid with a q_values component "
+                "(target_scores or afterstate_target); root_value uses the trained value head"
+            )
+        return None
+
+    if provenance is None:
+        raise SystemExit(
+            f"REFUSING --v-component {v_component}: it rewrites corpus targets from "
+            "q_values, but normal train_bc runs freeze an untrained q branch when "
+            "q_loss_weight=0. Use --v-component root_value (the safe default), or "
+            "supply --q-head-provenance for a q head trained and validated with the "
+            "required search-action-value semantics."
+        )
+
+    source_path: str | None = None
+    source_sha256: str | None = None
+    if isinstance(provenance, (str, Path)):
+        path = Path(provenance)
+        if not path.exists():
+            raise SystemExit(f"q-head provenance file not found: {path}")
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise SystemExit(f"invalid q-head provenance JSON {path}: {exc}") from exc
+        if not isinstance(raw, dict):
+            raise SystemExit(f"q-head provenance {path} must contain a JSON object")
+        source_path = str(path.resolve())
+        source_sha256 = sha256_file(path)
+    elif isinstance(provenance, dict):
+        raw = dict(provenance)
+        source_path = raw.pop("source_path", None)
+        source_sha256 = raw.pop("source_sha256", None)
+    else:
+        raise SystemExit("q-head provenance must be a JSON path or manifest object")
+
+    errors: list[str] = []
+    if raw.get("schema") != Q_HEAD_PROVENANCE_SCHEMA:
+        errors.append(
+            f"schema must be {Q_HEAD_PROVENANCE_SCHEMA!r} (got {raw.get('schema')!r})"
+        )
+
+    expected_md5 = str(reanalyzer_meta.get("md5", "")).lower()
+    claimed_md5 = str(raw.get("checkpoint_md5", "")).lower()
+    if not _is_hex_digest(claimed_md5, 32):
+        errors.append("checkpoint_md5 must be a 32-character hex md5")
+    elif claimed_md5 != expected_md5:
+        errors.append(
+            f"checkpoint_md5 {claimed_md5} does not match reanalyzer {expected_md5}"
+        )
+
+    q_head = raw.get("q_head")
+    if not isinstance(q_head, dict):
+        errors.append("q_head must be an object")
+    else:
+        if q_head.get("trained") is not True:
+            errors.append("q_head.trained must be true")
+        if q_head.get("target_semantics") != Q_HEAD_TARGET_SEMANTICS:
+            errors.append(
+                f"q_head.target_semantics must be {Q_HEAD_TARGET_SEMANTICS!r}"
+            )
+        value_range = q_head.get("value_range")
+        if value_range != [-1.0, 1.0] and value_range != [-1, 1]:
+            errors.append("q_head.value_range must be [-1, 1]")
+
+    validation = raw.get("validation")
+    if not isinstance(validation, dict):
+        errors.append("validation must be an object")
+    else:
+        if validation.get("passed") is not True:
+            errors.append("validation.passed must be true")
+        evidence = validation.get("evidence")
+        if not isinstance(evidence, str) or not evidence.strip():
+            errors.append("validation.evidence must be a non-empty run/report identifier")
+
+    if errors:
+        raise SystemExit("invalid q-head provenance: " + "; ".join(errors))
+
+    normalized = dict(raw)
+    normalized["checkpoint_md5"] = claimed_md5
+    if source_path is not None:
+        normalized["source_path"] = source_path
+    if source_sha256 is not None:
+        if not _is_hex_digest(source_sha256, 64):
+            raise SystemExit("invalid q-head provenance: source_sha256 must be 64 hex chars")
+        normalized["source_sha256"] = source_sha256.lower()
+    return normalized
 
 
 # --------------------------------------------------------------------------- #
@@ -239,13 +503,16 @@ def batch_forward(
     want_q: bool,
     legal_width: int,
     progress_every: int = 0,
+    value_materialization: dict | None = None,
 ) -> dict[str, np.ndarray]:
     """Batch-forward ``policy`` over ``corpus`` rows ``indices`` (inference only).
 
     Returns ``{"value": (M,)}`` and, when ``want_q``, ``{"q_values": (M, W)}``
-    aligned to the corpus legal width. Reuses ``_forward_legal_np_for_batch`` so
-    the entity/xdim batch construction and public-observation masking are byte-for
-    byte the lr-approx-0 probe's path.
+    aligned to the corpus legal width. When ``value_materialization`` is supplied,
+    ``value`` is the selected readout after the exact search scale/squash/final-
+    clip contract, never the model's raw scalar. Reuses
+    ``_forward_legal_np_for_batch`` so the entity/xdim batch construction and
+    public-observation masking are byte-for-byte the lr-approx-0 probe's path.
     """
     import torch
 
@@ -269,7 +536,20 @@ def batch_forward(
                 legal_action_ids,
                 return_q=want_q,
             )
-            value = outputs["value"].detach().float().reshape(-1).cpu().numpy()
+            if value_materialization is None:
+                if "value" not in outputs:
+                    raise SystemExit(
+                        f"forward pass emitted no 'value' output; keys={sorted(outputs)}"
+                    )
+                value = outputs["value"].detach().float().reshape(-1).cpu().numpy()
+                if not np.all(np.isfinite(value)):
+                    raise SystemExit("forward output 'value' contains non-finite value(s)")
+            else:
+                value = materialize_search_root_values(outputs, value_materialization)
+            if value.shape[0] != len(batch):
+                raise SystemExit(
+                    f"value output has {value.shape[0]} entries for batch size {len(batch)}"
+                )
             values[start : start + len(batch)] = value
             if want_q:
                 q = outputs["q_values"].detach().float().cpu().numpy()
@@ -358,13 +638,17 @@ def rewrite_per_state_column(
     fresh_values: np.ndarray,
     *,
     write_mask: np.ndarray | None = None,
+    column_provenance: dict | None = None,
 ) -> dict:
     """Write/overwrite a per-state scalar column with fresh value-head V(s).
 
     Materialises the column if the corpus does not already carry it (updates the
     copy's corpus_meta.json with a scalar ``fixed`` schema entry). Rows outside
     ``write_mask`` are left NaN (mixable-rows-only discipline; a corpus with no
-    full-search flag defaults to writing every row).
+    full-search flag defaults to writing every row). ``column_provenance`` is
+    embedded in the column schema and values are rejected unless they satisfy its
+    declared finite ``[-1, 1]`` target contract. This catches callers that bypass
+    the canonical batch-forward materializer.
     """
     n = int(len(corpus))
     fresh_values = np.asarray(fresh_values, dtype=np.float32).reshape(-1)
@@ -373,6 +657,27 @@ def rewrite_per_state_column(
     if write_mask is None:
         write_mask = np.ones(n, dtype=bool)
     write_mask = np.asarray(write_mask, dtype=bool).reshape(-1)
+    if write_mask.shape[0] != n:
+        raise SystemExit(f"write_mask length {write_mask.shape[0]} != row_count {n}")
+
+    canonical_provenance = None
+    if column_provenance is not None:
+        canonical_provenance = validate_root_value_materialization(
+            column_provenance, v_component=name
+        )
+        selected = fresh_values[write_mask]
+        if not np.all(np.isfinite(selected)):
+            raise SystemExit("refusing to write non-finite materialized root_value target(s)")
+        tolerance = 1.0e-6
+        if np.any(selected < ROOT_VALUE_RANGE[0] - tolerance) or np.any(
+            selected > ROOT_VALUE_RANGE[1] + tolerance
+        ):
+            lo = float(np.min(selected))
+            hi = float(np.max(selected))
+            raise SystemExit(
+                "refusing out-of-range materialized root_value target(s): "
+                f"observed [{lo}, {hi}], required [-1, 1]"
+            )
 
     existed = name in corpus
     old = np.asarray(corpus[name], dtype=np.float64).reshape(-1) if existed else None
@@ -382,12 +687,17 @@ def rewrite_per_state_column(
     np.ascontiguousarray(col).tofile(dst_dir / f"{name}.dat")
 
     meta_changed = False
-    if not existed:
+    if not existed or canonical_provenance is not None:
         meta_path = dst_dir / "corpus_meta.json"
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
-        meta["columns"][name] = {"kind": "fixed", "dtype": "<f4", "inner_shape": []}
-        meta_path.write_text(json.dumps(meta, indent=2, sort_keys=True), encoding="utf-8")
-        meta_changed = True
+        schema = {"kind": "fixed", "dtype": "<f4", "inner_shape": []}
+        if canonical_provenance is not None:
+            schema["target_semantics"] = ROOT_VALUE_TARGET_SEMANTICS
+            schema["materialization"] = canonical_provenance
+        if meta["columns"].get(name) != schema:
+            meta["columns"][name] = schema
+            meta_path.write_text(json.dumps(meta, indent=2, sort_keys=True), encoding="utf-8")
+            meta_changed = True
 
     changed = write_mask
     return {
@@ -468,6 +778,27 @@ def _resolve_mask_hidden_info(cli_value, checkpoint_mask: bool) -> bool:
     return bool(cli_value)
 
 
+def verify_reanalyzer_identity(reanalyzer_path: Path, reanalyzer_meta: dict) -> str:
+    """Bind caller-supplied metadata to the checkpoint bytes actually forwarded.
+
+    CLI callers normally obtain both values from ``resolve_reanalyzer_checkpoint``,
+    but programmatic callers can otherwise pass stale metadata for checkpoint A
+    while forwarding checkpoint B. That would also defeat q-provenance's exact-
+    checkpoint boundary. Hash the real path at execution time for every mode.
+    """
+    path = Path(reanalyzer_path)
+    if not path.is_file():
+        raise SystemExit(f"reanalyzer checkpoint not found: {path}")
+    actual_md5 = md5_file(path)
+    expected_md5 = str(reanalyzer_meta.get("md5", "")).lower()
+    if actual_md5 != expected_md5:
+        raise SystemExit(
+            f"reanalyzer checkpoint md5 mismatch: metadata pins {expected_md5!r}, "
+            f"but {path} hashes to {actual_md5}"
+        )
+    return actual_md5
+
+
 def run_reanalyze(
     *,
     corpus_dir: Path,
@@ -481,13 +812,32 @@ def run_reanalyze(
     sample: int | None,
     seed: int,
     progress_every: int,
+    q_head_provenance: Path | dict | None = None,
+    value_readout: str = "scalar",
+    value_squash: str = "tanh",
+    value_scale: float = 1.0,
 ) -> dict:
     import train_bc
     from train_bc import MemmapCorpus
 
     if v_component not in V_COMPONENTS:
         raise SystemExit(f"unknown --v-component {v_component!r}; choices: {sorted(V_COMPONENTS)}")
+    verify_reanalyzer_identity(reanalyzer_path, reanalyzer_meta)
     spec = V_COMPONENTS[v_component]
+    verified_q_provenance = validate_q_head_provenance(
+        q_head_provenance,
+        reanalyzer_meta=reanalyzer_meta,
+        v_component=v_component,
+    )
+    root_value_provenance = (
+        resolve_root_value_materialization(
+            value_readout=value_readout,
+            value_squash=value_squash,
+            value_scale=value_scale,
+        )
+        if v_component == "root_value"
+        else None
+    )
 
     corpus = MemmapCorpus(corpus_dir)
     legal_width = corpus.legal_width
@@ -518,6 +868,7 @@ def run_reanalyze(
         fwd = batch_forward(
             policy, corpus, idx, batch_size=batch_size, want_q=want_q,
             legal_width=legal_width, progress_every=progress_every,
+            value_materialization=root_value_provenance,
         )
         report = _sample_report(
             corpus, idx, fwd, v_component, spec, legal_width,
@@ -529,7 +880,13 @@ def run_reanalyze(
             "sampled_rows": take,
             "row_count": n,
             "v_component": v_component,
-            "forward_output": spec["forward_output"],
+            "forward_output": (
+                root_value_provenance["forward_output"]
+                if root_value_provenance is not None
+                else spec["forward_output"]
+            ),
+            "q_head_provenance": verified_q_provenance,
+            "root_value_materialization": root_value_provenance,
             "reanalyzer": reanalyzer_meta,
             "mask_hidden_info": bool(effective_mask),
             "device": device,
@@ -552,6 +909,7 @@ def run_reanalyze(
     fwd = batch_forward(
         policy, corpus, all_idx, batch_size=batch_size, want_q=want_q,
         legal_width=legal_width, progress_every=progress_every,
+        value_materialization=root_value_provenance,
     )
 
     shutil.copytree(corpus_dir, out_dir)
@@ -561,7 +919,13 @@ def run_reanalyze(
             corpus, out_dir, v_component, fwd["q_values"], legal_width=legal_width
         )
     else:
-        rewrite = rewrite_per_state_column(corpus, out_dir, v_component, fwd["value"])
+        rewrite = rewrite_per_state_column(
+            corpus,
+            out_dir,
+            v_component,
+            fwd["value"],
+            column_provenance=root_value_provenance,
+        )
 
     stats = compute_stats(rewrite, phases)
 
@@ -604,7 +968,13 @@ def run_reanalyze(
         "output_corpus": str(out_dir),
         "reanalyzer": reanalyzer_meta,
         "v_component": v_component,
-        "forward_output": spec["forward_output"],
+        "forward_output": (
+            root_value_provenance["forward_output"]
+            if root_value_provenance is not None
+            else spec["forward_output"]
+        ),
+        "q_head_provenance": verified_q_provenance,
+        "root_value_materialization": root_value_provenance,
         "mask_hidden_info": bool(effective_mask),
         "device": device,
         "batch_size": batch_size,
@@ -616,7 +986,8 @@ def run_reanalyze(
         "perspective_note": (
             "Fresh value/q come from the same policy class whose archived estimate "
             "they replace (root-to-move perspective), so no sign flip is applied. "
-            "target_scores <- q_values head; root_value <- value head V(s)."
+            "target_scores <- q_values head; root_value follows the persisted "
+            "search readout/scale/squash/final-clip materialization contract."
         ),
     }
     (out_dir / "reanalyze_manifest.json").write_text(
@@ -692,11 +1063,39 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--v-component",
-        default="target_scores",
+        default=DEFAULT_V_COMPONENT,
         choices=sorted(V_COMPONENTS),
-        help="which value-component column to rewrite (default: target_scores, the "
-        "only value column a standard corpus carries). root_value materialises a "
-        "fresh per-state V(s) column.",
+        help="which value-component column to rewrite (default: root_value, a fresh "
+        "per-state V(s) column from the trained value head). target_scores and "
+        "afterstate_target require --q-head-provenance.",
+    )
+    parser.add_argument(
+        "--q-head-provenance",
+        type=Path,
+        default=None,
+        help="required JSON provenance for target_scores/afterstate_target q_values "
+        "rewrites; must be bound to this checkpoint and attest trained, validated "
+        "root-to-move search-action-value semantics",
+    )
+    parser.add_argument(
+        "--value-readout",
+        choices=("scalar", "categorical"),
+        default="scalar",
+        help="root_value head to materialize. Must match the readout used by search; "
+        "categorical fails closed if the forward emits no value_categorical output.",
+    )
+    parser.add_argument(
+        "--value-squash",
+        choices=("tanh", "clip"),
+        default="tanh",
+        help="search value squash. Scalar applies it after --value-scale; categorical "
+        "records but bypasses it exactly like search, then final-clips to [-1,1].",
+    )
+    parser.add_argument(
+        "--value-scale",
+        type=float,
+        default=1.0,
+        help="positive finite search value scale applied before squash/final clipping",
     )
     parser.add_argument(
         "--reanalyzer-net",
@@ -759,6 +1158,10 @@ def main(argv: list[str] | None = None) -> None:
         sample=args.sample,
         seed=args.seed,
         progress_every=args.progress_every,
+        q_head_provenance=args.q_head_provenance,
+        value_readout=args.value_readout,
+        value_squash=args.value_squash,
+        value_scale=args.value_scale,
     )
 
 

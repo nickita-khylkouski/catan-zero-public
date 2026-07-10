@@ -117,6 +117,7 @@ def test_cli_dry_run_produces_parseable_json_with_expected_keys(tmp_path):
     data = json.loads(out_path.read_text())
     assert data["measurement"] == "search_snr_probe"
     assert data["dry_run"] is True
+    assert data["search_config"]["public_observation"] is False
     assert "per_checkpoint" in data
     assert len(data["checkpoints"]) >= 1
     for checkpoint in data["checkpoints"]:
@@ -151,3 +152,33 @@ def test_cli_help_does_not_crash():
         env=_subprocess_env(),
     )
     assert result.returncode == 0
+
+
+def test_cli_dry_run_records_explicit_production_regime(tmp_path):
+    out_path = tmp_path / "snr_prod_regime.json"
+    old_argv = sys.argv
+    sys.argv = [
+        "search_snr_probe.py",
+        "--dry-run",
+        "--public-observation",
+        "--lazy-interior-chance",
+        "--rust-featurize",
+        "--c-scale",
+        "0.03",
+        "--symmetry-averaged-eval",
+        "--wide-candidates-threshold",
+        "20",
+        "--out",
+        str(out_path),
+    ]
+    try:
+        main()
+    finally:
+        sys.argv = old_argv
+    cfg = json.loads(out_path.read_text())["search_config"]
+    assert cfg["public_observation"] is True
+    assert cfg["lazy_interior_chance"] is True
+    assert cfg["rust_featurize"] is True
+    assert cfg["c_scale"] == pytest.approx(0.03)
+    assert cfg["symmetry_averaged_eval"] is True
+    assert cfg["wide_candidates_threshold"] == 20

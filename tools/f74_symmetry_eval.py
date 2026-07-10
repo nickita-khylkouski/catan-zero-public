@@ -41,6 +41,8 @@ if str(_TOOLS_DIR) not in sys.path:
 from catan_zero.rl.entity_token_policy import EntityGraphPolicy
 from catan_zero.rl.hex_symmetry import N_SYMMETRIES, build_hex_symmetry
 from catan_zero.search.neural_rust_mcts import (
+    EntityGraphRustEvaluatorConfig,
+    _assert_public_observation_matches_checkpoint_training,
     rust_action_context_batch,
     rust_game_to_entity_batch,
     rust_policy_action_ids,
@@ -50,17 +52,21 @@ from factory_common import write_json
 from sigma_trace_placement_root import COLORS, find_placement_roots
 
 
-def _root_entity(policy: EntityGraphPolicy, game: Any) -> dict[str, Any]:
+def _root_entity(
+    policy: EntityGraphPolicy, game: Any, *, public_observation: bool = False
+) -> dict[str, Any]:
     acting = str(game.current_color())
     legal = tuple(int(a) for a in game.playable_action_indices(list(COLORS), None))
     pids = rust_policy_action_ids(game, legal, colors=COLORS, action_size=int(policy.action_size))
     entity = rust_game_to_entity_batch(
         game, legal, actor=acting, colors=COLORS,
         action_size=int(policy.action_size), policy_action_ids=pids,
+        public_observation=bool(public_observation),
     )
     context = rust_action_context_batch(
         game, legal, actor=acting, colors=COLORS,
         action_size=int(policy.action_size), policy_action_ids=pids,
+        public_observation=bool(public_observation),
     )
     legal_ids = np.asarray(pids, dtype=np.int64)[None, :]
     return {"entity": entity, "context": context, "legal_ids": legal_ids}
@@ -104,6 +110,13 @@ def main() -> None:
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--n-states", type=int, default=50)
     parser.add_argument("--base-seed", type=int, default=500001)
+    parser.add_argument(
+        "--public-observation",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Mask hidden opponent information during featurization. Must match "
+        "the checkpoint's recorded training regime.",
+    )
     parser.add_argument("--relabel-events", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--out", required=True)
     args = parser.parse_args()
@@ -114,6 +127,12 @@ def main() -> None:
     games = find_placement_roots(rs, n_states=int(args.n_states), base_seed=int(args.base_seed))
     policy = EntityGraphPolicy.load(args.checkpoint, device=args.device)
     policy.model.eval()
+    _assert_public_observation_matches_checkpoint_training(
+        policy,
+        EntityGraphRustEvaluatorConfig(
+            public_observation=bool(args.public_observation)
+        ),
+    )
     sym = build_hex_symmetry()
 
     def forward_fn(entity_n, legal_n, ctx_n, return_q):
@@ -133,7 +152,11 @@ def main() -> None:
     per_root = []
 
     for game in games:
-        r = _root_entity(policy, game.copy())
+        r = _root_entity(
+            policy,
+            game.copy(),
+            public_observation=bool(args.public_observation),
+        )
         avg = sym.average_forward(
             r["entity"], r["legal_ids"], r["context"], forward_fn,
             return_q=True, relabel_events=bool(args.relabel_events),
@@ -186,6 +209,7 @@ def main() -> None:
         "n_roots": len(per_root),
         "n_symmetries": N_SYMMETRIES,
         "relabel_events": bool(args.relabel_events),
+        "public_observation": bool(args.public_observation),
         "symmetry_inconsistency": {
             "value_orientation_std": _stat([r["value_orientation_std"] for r in per_root]),
             "value_orientation_range": _stat([r["value_orientation_range"] for r in per_root]),

@@ -32,7 +32,12 @@ def _worker_args(**overrides) -> dict:
         "rescale_noise_floor_c": 0.0,
         "sigma_eval": 0.79,
         "n_full_wide": None,
+        "n_full_wide_threshold": None,
+        "wide_roots_always_full": False,
         "raw_policy_above_width": None,
+        "symmetry_averaged_eval": False,
+        "symmetry_averaged_eval_threshold": None,
+        "wide_candidates_threshold": 24,
         "max_decisions": 600,
         "max_depth": 80,
         "temperature_move_fraction": 0.075,
@@ -102,6 +107,51 @@ def test_rescale_noise_floor_c_and_sigma_eval_thread_through_from_worker_args(mo
 
     assert captured["search_config"].rescale_noise_floor_c == 1.0
     assert captured["search_config"].sigma_eval == 0.5
+
+
+# --------------------------------------------------------------------------- D6 root denoising wiring
+
+
+def test_symmetry_averaging_defaults_to_off_with_canonical_wide_threshold(monkeypatch) -> None:
+    captured = _capture_configs(monkeypatch)
+    cli._run_worker(_worker_args())
+
+    assert captured["search_config"].symmetry_averaged_eval is False
+    assert captured["search_config"].symmetry_averaged_eval_threshold is None
+    assert captured["search_config"].wide_candidates_threshold == 24
+
+
+def test_symmetry_averaging_and_wide_threshold_thread_through(monkeypatch) -> None:
+    captured = _capture_configs(monkeypatch)
+    cli._run_worker(
+        _worker_args(
+            symmetry_averaged_eval=True,
+            symmetry_averaged_eval_threshold=20,
+            wide_candidates_threshold=24,
+        )
+    )
+
+    assert captured["search_config"].symmetry_averaged_eval is True
+    assert captured["search_config"].symmetry_averaged_eval_threshold == 20
+    assert captured["search_config"].wide_candidates_threshold == 24
+
+
+def test_adaptive_wide_budget_threshold_and_always_full_thread_through(monkeypatch) -> None:
+    captured = _capture_configs(monkeypatch)
+    cli._run_worker(
+        _worker_args(
+            p_full=0.25,
+            n_full_wide=256,
+            n_full_wide_threshold=40,
+            wide_roots_always_full=True,
+        )
+    )
+
+    search = captured["search_config"]
+    assert search.p_full == 0.25
+    assert search.n_full_wide == 256
+    assert search.n_full_wide_threshold == 40
+    assert search.wide_roots_always_full is True
 
 
 # --------------------------------------------------------------------------- late-temperature wiring

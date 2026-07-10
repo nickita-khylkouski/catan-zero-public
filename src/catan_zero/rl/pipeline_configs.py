@@ -90,7 +90,7 @@ _T = TypeVar("_T", bound="PipelineConfig")
 
 # Bump when the *set* of fields on any pipeline config changes so that hashes
 # from before/after the change are never mistaken for equal regimes.
-CONFIG_SCHEMA_VERSION = 2
+CONFIG_SCHEMA_VERSION = 4
 
 # Length (hex chars) of the short hash embedded in artifacts. 16 hex chars =
 # 64 bits; collision probability is negligible for the run counts here and the
@@ -200,6 +200,16 @@ class TrainConfig(PipelineConfig):
     PIPELINE: ClassVar[str] = "train"
 
     arch: str = "candidate"
+    # Input identities belong in the science hash: changing the corpus or the
+    # warm-start source changes the experiment even when every optimizer flag is
+    # identical. Output checkpoint/report paths are intentionally excluded.
+    data: str = ""
+    data_fingerprint: str = ""
+    init_checkpoint: str = ""
+    init_checkpoint_sha256: str = ""
+    grow_from_checkpoint: str = ""
+    grow_from_checkpoint_sha256: str = ""
+    resume_optimizer: bool = True
     data_format: str = "npz"
     track: str = "2p_no_trade"
     vps_to_win: int = 10
@@ -207,6 +217,10 @@ class TrainConfig(PipelineConfig):
     mask_hidden_info: bool = False
     seed: int = 1
     validation_seed: int = 17
+    validation_fraction: float = 0.05
+    validation_max_samples: int = 200_000
+    validation_game_seed_ranges: str = ""
+    allow_missing_game_seed_validation_split: bool = False
     epochs: int = 2
     max_steps: int = 0
     batch_size: int = 65536
@@ -234,6 +248,21 @@ class TrainConfig(PipelineConfig):
     q_loss_weight: float = 0.0
     policy_kl_anchor_weight: float = 0.0
     value_uncertainty_loss_weight: float = 0.0
+    value_uncertainty_head: bool = False
+    value_lr_mult: float = 1.0
+    action_module_lr_mult: float = 1.0
+    value_head_type: str = "mse"
+    # ``None`` is the raw argparse/default sentinel. train_bc resolves it to the
+    # effective fresh/checkpoint/grow integer before constructing a live config;
+    # keeping the sentinel here also preserves typed-default == CLI-default.
+    value_categorical_bins: int | None = None
+    value_categorical_loss_weight: float = 0.0
+    hlgauss_scalar_aux_loss_weight: float = 0.0
+    value_hlgauss_sigma_ratio: float = 0.75
+    value_target_lambda: float = 1.0
+    aux_subgoal_heads: bool = False
+    aux_subgoal_loss_weight: float = 0.0
+    edge_policy_head: bool = False
     truncated_vp_margin_value_weight: float = 0.25
     freeze_modules: str = ""
     train_value_only: bool = False
@@ -241,6 +270,11 @@ class TrainConfig(PipelineConfig):
     loser_sample_weight: float = 0.3
     vp_margin_weight: float = 0.0
     forced_action_weight: float = 0.1
+    forced_row_value_weight: float = 1.0
+    per_game_value_weight: bool = False
+    per_game_value_weight_mode: str = "equal"
+    policy_surprise_weight: float = 0.0
+    policy_surprise_cap: float = 4.0
     advantage_policy_weighting: str = "none"
     advantage_temperature: float = 1.0
     advantage_weight_cap: float = 5.0
@@ -283,31 +317,38 @@ class GenerateConfig(PipelineConfig):
     n_fast: int = 16
     p_full: float = 0.25
     n_full_wide: int | None = None
+    n_full_wide_threshold: int | None = None
+    wide_roots_always_full: bool = False
     raw_policy_above_width: int | None = None
+    symmetry_averaged_eval: bool = False
+    symmetry_averaged_eval_threshold: int | None = None
+    wide_candidates_threshold: int = 24
     c_visit: float = 50.0
     c_scale: float = 0.1
+    rescale_noise_floor_c: float = 0.0
+    sigma_eval: float = 0.79
     max_decisions: int = 600
     max_depth: int = 80
     temperature_decisions: int = 45
     temperature_high: float = 1.0
     temperature_low: float = 0.0
+    late_temperature_decisions: int | None = None
+    late_temperature: float = 0.0
     prior_temperature: float = 1.0
     value_scale: float = 1.0
+    value_readout: str = "scalar"
     correct_rust_chance_spectra: bool = True
     lazy_interior_chance: bool = False
     exact_budget_sh: bool = False
     exact_budget_sh_min_n: int = 0
     root_wave_batching: bool = False
-    rescale_noise_floor_c: float = 0.0
-    sigma_eval: float = 0.79
-    late_temperature_decisions: int | None = None
-    late_temperature: float = 0.0
     # Evaluator/transport choices can change batching composition and numeric
     # results, so they are part of provenance rather than "mere performance"
     # flags. In particular TF32 was measured to diverge self-play trajectories.
     rust_featurize: bool = False
     eval_server: bool = False
     eval_server_max_batch: int = 64
+    eval_server_max_neural_rows: int | None = None
     eval_server_max_wait_ms: float = 0.0
     eval_server_timeout_ms: float = 20_000.0
     eval_server_batch_timeout_sec: float = 0.0
@@ -389,20 +430,44 @@ class EvalConfig(PipelineConfig):
     pairs: int = 50
     # Gumbel search.
     n_full: int = 64
+    # Cross-net H2H resolves these role-specific fields from their explicit
+    # flags or the shared n_full fallback before hashing. Other eval modes
+    # leave them None.
+    candidate_n_full: int | None = None
+    baseline_n_full: int | None = None
     n_full_wide: int | None = None
+    # Same resolution contract for adaptive wide-root budgets. Recording both
+    # effective sides is required to distinguish a fair adaptive-vs-uniform
+    # gate from the old shared n_full_wide arm in the config hash.
+    candidate_n_full_wide: int | None = None
+    baseline_n_full_wide: int | None = None
+    n_full_wide_threshold: int | None = None
+    candidate_n_full_wide_threshold: int | None = None
+    baseline_n_full_wide_threshold: int | None = None
     raw_policy_above_width: int | None = None
     max_depth: int = 80
     max_decisions: int = 300
     c_visit: float = 50.0
     c_scale: float = 0.1
+    rescale_noise_floor_c: float = 0.0
+    sigma_eval: float = 0.79
     max_root_candidates: int = 16
     max_root_candidates_wide: int = 54
+    wide_candidates_threshold: int = 24
     symmetry_averaged_eval: bool = False
+    symmetry_averaged_eval_threshold: int | None = None
     correct_rust_chance_spectra: bool = True
     lazy_interior_chance: bool = False
     prior_temperature: float = 1.0
     value_scale: float = 1.0
     value_squash: str = "tanh"
+    # ``value_readout`` is the backwards-compatible shared CLI fallback.
+    # Cross-net gates record the effective role-specific values as well so a
+    # categorical candidate vs scalar incumbent is a distinct, auditable
+    # evaluation regime and therefore receives a distinct config hash.
+    value_readout: str = "scalar"
+    candidate_value_readout: str | None = None
+    baseline_value_readout: str | None = None
     # SPRT thresholds echoed by the eval tool (the gate re-derives its own).
     elo0: float = 0.0
     elo1: float = 30.0

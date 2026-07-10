@@ -147,6 +147,15 @@ def run_probe_on_checkpoint(
     base_seed: int,
     device: str,
     correct_rust_chance_spectra: bool = True,
+    public_observation: bool = False,
+    lazy_interior_chance: bool = False,
+    c_visit: float = 50.0,
+    c_scale: float = 0.1,
+    prior_temperature: float = 1.0,
+    value_scale: float = 1.0,
+    rust_featurize: bool = False,
+    symmetry_averaged_eval: bool = False,
+    wide_candidates_threshold: int = 24,
 ) -> dict[str, Any]:
     """Live (GPU/rust-dependent) path: load the checkpoint, sample fixed
     states, run two seeded searches per state, and return this checkpoint's
@@ -159,7 +168,14 @@ def run_probe_on_checkpoint(
     )
 
     evaluator = BatchedEntityGraphRustEvaluator.from_checkpoint(
-        checkpoint, device=device, config=EntityGraphRustEvaluatorConfig()
+        checkpoint,
+        device=device,
+        config=EntityGraphRustEvaluatorConfig(
+            public_observation=bool(public_observation),
+            prior_temperature=float(prior_temperature),
+            value_scale=float(value_scale),
+            rust_featurize=bool(rust_featurize),
+        ),
     )
     try:
         states = collect_fixed_states(
@@ -182,6 +198,11 @@ def run_probe_on_checkpoint(
                     max_depth=int(max_depth),
                     temperature=0.0,
                     correct_rust_chance_spectra=bool(correct_rust_chance_spectra),
+                    lazy_interior_chance=bool(lazy_interior_chance),
+                    c_visit=float(c_visit),
+                    c_scale=float(c_scale),
+                    symmetry_averaged_eval=bool(symmetry_averaged_eval),
+                    wide_candidates_threshold=int(wide_candidates_threshold),
                 )
                 mcts = GumbelChanceMCTS(config, evaluator)
                 result = mcts.search(state.copy(), force_full=True)
@@ -253,6 +274,35 @@ def main() -> None:
     parser.add_argument("--max-depth", type=int, default=80)
     parser.add_argument("--base-seed", type=int, default=DEFAULT_BASE_SEED)
     parser.add_argument("--device", default="cpu")
+    parser.add_argument("--c-visit", type=float, default=50.0)
+    parser.add_argument("--c-scale", type=float, default=0.1)
+    parser.add_argument("--prior-temperature", type=float, default=1.0)
+    parser.add_argument("--value-scale", type=float, default=1.0)
+    parser.add_argument(
+        "--public-observation",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Mask hidden opponent information in the evaluator. Pass this for masked champions.",
+    )
+    parser.add_argument(
+        "--lazy-interior-chance",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use the production lazy interior-chance search path when requested.",
+    )
+    parser.add_argument(
+        "--rust-featurize",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use the parity-gated native Rust entity featurizer.",
+    )
+    parser.add_argument(
+        "--symmetry-averaged-eval",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable 12-way D6 averaging at wide roots; leave off to measure the pre-denoise baseline.",
+    )
+    parser.add_argument("--wide-candidates-threshold", type=int, default=24)
     parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -289,6 +339,15 @@ def main() -> None:
                 max_depth=int(args.max_depth),
                 base_seed=int(args.base_seed),
                 device=args.device,
+                public_observation=bool(args.public_observation),
+                lazy_interior_chance=bool(args.lazy_interior_chance),
+                c_visit=float(args.c_visit),
+                c_scale=float(args.c_scale),
+                prior_temperature=float(args.prior_temperature),
+                value_scale=float(args.value_scale),
+                rust_featurize=bool(args.rust_featurize),
+                symmetry_averaged_eval=bool(args.symmetry_averaged_eval),
+                wide_candidates_threshold=int(args.wide_candidates_threshold),
             )
     elapsed = time.perf_counter() - started
 
@@ -302,6 +361,18 @@ def main() -> None:
         "n_full": int(args.n_full),
         "max_depth": int(args.max_depth),
         "base_seed": int(args.base_seed),
+        "search_config": {
+            "c_visit": float(args.c_visit),
+            "c_scale": float(args.c_scale),
+            "correct_rust_chance_spectra": True,
+            "lazy_interior_chance": bool(args.lazy_interior_chance),
+            "public_observation": bool(args.public_observation),
+            "prior_temperature": float(args.prior_temperature),
+            "value_scale": float(args.value_scale),
+            "rust_featurize": bool(args.rust_featurize),
+            "symmetry_averaged_eval": bool(args.symmetry_averaged_eval),
+            "wide_candidates_threshold": int(args.wide_candidates_threshold),
+        },
         "elapsed_sec": elapsed,
         "per_checkpoint": per_checkpoint,
     }

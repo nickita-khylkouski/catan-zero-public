@@ -118,6 +118,10 @@ def test_preserve_source_top_level_keys_restores_mask_hidden_info(tmp_path):
             "static_action_features_sha256": "abc",
             "config": {"flags": "NEW"},
             "model": {"w": torch.ones(2)},
+            # A config-only cat-head upgrade must not manufacture evidence that
+            # the new random readout was optimized.
+            "trained_value_readouts": ["categorical"],
+            "value_training": {"primary_readout": "categorical"},
         },
         out_ckpt,
     )
@@ -132,3 +136,60 @@ def test_preserve_source_top_level_keys_restores_mask_hidden_info(tmp_path):
     assert merged["config"] == {"flags": "NEW"}
     assert merged["model"]["w"].tolist() == [1.0, 1.0]
     assert "model" not in preserved and "config" not in preserved
+    assert "trained_value_readouts" not in merged
+    assert "value_training" not in merged
+
+
+def test_upgrade_seed_is_deterministic_and_durably_attested(
+    tmp_path, monkeypatch
+) -> None:
+    import torch
+
+    from catan_zero.rl.entity_token_policy import EntityGraphPolicy
+    from catan_zero.rl.self_play import make_env_config
+
+    source = tmp_path / "source.pt"
+    out_a = tmp_path / "a.pt"
+    out_b = tmp_path / "b.pt"
+    policy = EntityGraphPolicy.create(
+        env_config=make_env_config(vps_to_win=3),
+        hidden_size=16,
+        state_layers=1,
+        attention_heads=2,
+        seed=0,
+    )
+    policy.save(source)
+
+    for output in (out_a, out_b):
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "f69_upgrade_checkpoint_config.py",
+                "--in-checkpoint",
+                str(source),
+                "--out-checkpoint",
+                str(output),
+                "--flags",
+                "catbins:9",
+                "--seed",
+                "73",
+                "--device",
+                "cpu",
+                "--no-verify",
+            ],
+        )
+        upgrade_tool.main()
+
+    raw_a = torch.load(out_a, map_location="cpu", weights_only=False)
+    raw_b = torch.load(out_b, map_location="cpu", weights_only=False)
+    cat_keys = sorted(
+        key for key in raw_a["model"] if key.startswith("value_categorical_head.")
+    )
+    assert cat_keys
+    assert all(torch.equal(raw_a["model"][key], raw_b["model"][key]) for key in cat_keys)
+    assert raw_a["upgrade_provenance"]["initialization_seed"] == 73
+    assert raw_a["upgrade_provenance"]["trained_value_readouts_added"] == []
+    assert raw_a["upgrade_provenance"]["source_checkpoint_sha256"] == raw_b[
+        "upgrade_provenance"
+    ]["source_checkpoint_sha256"]

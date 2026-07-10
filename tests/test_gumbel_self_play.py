@@ -4,11 +4,13 @@ import json
 import random
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
 from catan_zero.rl.action_mask import ActionCatalog
+from catan_zero.rl.aux_subgoal_targets import AUX_TARGET_KEYS
 from catan_zero.rl.flywheel.opponent_mix import MixCategory, MixCheckpointRef, OpponentMixConfig
 from catan_zero.rl.gumbel_self_play import (
     COLORS,
@@ -215,6 +217,122 @@ def test_truncated_game_produces_no_outcome_labels():
         assert decision.row["has_final_actual_vps"] is False
 
 
+def test_play_one_game_materializes_aux_targets_from_full_rust_trajectory(monkeypatch):
+    """Exercise production wiring without requiring a particular local Rust wheel.
+
+    The real engine integration tests are version-gated above; this compact fake
+    verifies that play_one_game captures every ply, reuses native action payloads,
+    and stamps the recorded rows after the terminal state is known.
+    """
+    import catan_zero.rl.gumbel_self_play as gsp
+
+    actions = (
+        ["RED", "BUILD_SETTLEMENT", 5],
+        ["BLUE", "ROLL", None],
+        ["RED", "MOVE_ROBBER", [[-2, 0, 2], "BLUE"]],
+    )
+
+    class FakeGame:
+        def __init__(self):
+            self.step = 0
+
+        def winning_color(self):
+            return "RED" if self.step >= len(actions) else None
+
+        def current_color(self):
+            return ("RED", "BLUE", "RED")[self.step]
+
+        def playable_action_indices(self, _colors, _map_kind):
+            return [100]
+
+        def playable_actions_json(self):
+            return json.dumps([actions[self.step]])
+
+        def json_snapshot(self):
+            red_vp = (0, 1, 1, 3)[self.step]
+            return json.dumps(
+                {
+                    "colors": ["RED", "BLUE"],
+                    "current_prompt": "PLAY_TURN",
+                    "player_state": [
+                        {
+                            "actual_victory_points": red_vp,
+                            "has_road": self.step >= 3,
+                            "has_army": False,
+                        },
+                        {
+                            "actual_victory_points": 2,
+                            "has_road": False,
+                            "has_army": True,
+                        },
+                    ],
+                    "tiles": [
+                        {
+                            "coordinate": [-2, 0, 2],
+                            "tile": {"id": 11, "type": "RESOURCE_TILE"},
+                        }
+                    ],
+                }
+            )
+
+        def player_state_json(self, color):
+            if color == "RED":
+                return json.dumps({"victory_points": 3, "actual_victory_points": 3})
+            return json.dumps({"victory_points": 2, "actual_victory_points": 2})
+
+    game = FakeGame()
+
+    class FakeModule:
+        class Game:
+            @staticmethod
+            def simple(_colors, seed):
+                assert seed == 123
+                return game
+
+    class FakeMCTS:
+        def __init__(self):
+            self.config = GumbelChanceMCTSConfig()
+            self.evaluator = None
+
+        def search(self, _game, *, force_full):
+            assert force_full is None
+            return SimpleNamespace(selected_action=100, simulations_used=4)
+
+    def fake_build(game, **_kwargs):
+        return {"player": str(game.current_color())}, {}
+
+    def fake_apply(game, _action_index, **kwargs):
+        assert kwargs["action_json"] == actions[game.step]
+        game.step += 1
+        return game
+
+    monkeypatch.setattr(gsp, "_require_rust_module", lambda: FakeModule)
+    monkeypatch.setattr(gsp, "_build_decision_row", fake_build)
+    monkeypatch.setattr(gsp, "_apply_selected_action", fake_apply)
+
+    record = play_one_game(
+        FakeMCTS(),
+        object(),
+        config=GumbelSelfPlayConfig(max_decisions=3),
+        game_seed=123,
+        game_index=0,
+        action_size=1,
+    )
+
+    assert record.terminal is True
+    assert len(record.decisions) == 3
+    red0 = record.decisions[0].row
+    assert red0["aux_longest_road"] == np.float32(1.0)
+    assert red0["aux_largest_army"] == np.float32(0.0)
+    assert red0["aux_vp_in_n"] == np.float32(3.0)
+    assert red0["aux_next_settlement"] == np.int16(5)
+    assert red0["aux_robber_target"] == np.int16(11)
+    blue = record.decisions[1].row
+    assert blue["aux_largest_army"] == np.float32(1.0)
+    assert blue["aux_next_settlement"] == np.int16(-1)
+    assert blue["aux_robber_target"] == np.int16(-1)
+
+
 # ---------------------------------------------------------------------------
 # Fast-search rows must not carry policy weight (KataGo playout-cap
 # randomization: fast searches only advance the game / contribute a value
@@ -381,6 +499,19 @@ def test_run_worker_games_writes_valid_shards_that_round_trip_through_train_bc(t
         # round trip (they drive train_bc.py's loss weighting).
         assert "policy_weight_multiplier" in normalized
         assert "value_weight_multiplier" in normalized
+        # CAT-100 production wiring: the raw shard AND train_bc's normalized
+        # view retain every aux target. Numeric targets use NaN for an
+        # unobserved horizon; categorical targets use -1 as ignore_index.
+        assert set(AUX_TARGET_KEYS).issubset(raw.files)
+        assert set(AUX_TARGET_KEYS).issubset(normalized)
+        for key in ("aux_longest_road", "aux_largest_army", "aux_vp_in_n"):
+            assert normalized[key].dtype == np.float32
+        for key, upper in (("aux_next_settlement", 54), ("aux_robber_target", 19)):
+            assert normalized[key].dtype == np.int16
+            assert np.all(
+                (normalized[key] == -1)
+                | ((normalized[key] >= 0) & (normalized[key] < upper))
+            )
 
     assert total_rows == int(summary["rows"])
 

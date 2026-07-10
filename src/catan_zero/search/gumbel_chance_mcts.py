@@ -43,7 +43,7 @@ import math
 import random
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 from catan_zero.search.rust_mcts import (
     HeuristicRustEvaluator,
@@ -232,6 +232,47 @@ def _root_candidate_count(num_legal: int, config: "GumbelChanceMCTSConfig") -> i
     return max(m, 1)
 
 
+def _matches_explicit_or_legacy_width_gate(
+    num_legal: int,
+    *,
+    min_legal_actions: int | None,
+    legacy_exclusive_threshold: int,
+) -> bool:
+    """Evaluate a decoupled root-width gate without changing legacy defaults.
+
+    New explicit thresholds are inclusive (``num_legal >= min_legal_actions``),
+    matching recipe language such as "every >=40-action opening root".  When
+    the new field is unset, preserve the historical
+    ``num_legal > wide_candidates_threshold`` contract exactly.
+    """
+    if min_legal_actions is None:
+        return int(num_legal) > int(legacy_exclusive_threshold)
+    return int(num_legal) >= int(min_legal_actions)
+
+
+def _wide_budget_applies(num_legal: int, config: "GumbelChanceMCTSConfig") -> bool:
+    return config.n_full_wide is not None and _matches_explicit_or_legacy_width_gate(
+        num_legal,
+        min_legal_actions=config.n_full_wide_threshold,
+        legacy_exclusive_threshold=config.wide_candidates_threshold,
+    )
+
+
+def _choose_full_search(
+    config: "GumbelChanceMCTSConfig",
+    *,
+    force_full: bool | None,
+    wide_budget_root: bool,
+    random_draw: Callable[[], float],
+) -> bool:
+    """Resolve playout-cap randomization with an opt-in wide-root override."""
+    if force_full is not None:
+        return bool(force_full)
+    if bool(config.wide_roots_always_full) and wide_budget_root:
+        return True
+    return float(random_draw()) < float(config.p_full)
+
+
 def _prune_policy_target(
     policy: dict[int, float], visits: dict[int, int], *, min_visits: int
 ) -> dict[int, float]:
@@ -327,14 +368,14 @@ class GumbelChanceMCTSConfig:
     n_fast: int = 16
     p_full: float = 0.25
     # ARM (placement budget asymmetry, default disabled): when set and a FULL
-    # search hits a root wider than `wide_candidates_threshold` (the placement
-    # roots -- ~4 decisions/game), spend `n_full_wide` simulations there instead
-    # of `n_full`. Motivation: Gate-A losses concentrate at wide placement roots
-    # where n_full=64 over ~54 candidates leaves ~1.2 sims/candidate, so the
-    # completed-Q term is dominated by sampling noise. Because placements are so
-    # rare, a much larger budget (e.g. 512) costs little total compute. None
-    # (default) => use `n_full` everywhere, a pure no-op. Only affects full
-    # searches; fast searches always use `n_fast`.
+    # search hits a wide root, spend `n_full_wide` simulations there instead of
+    # `n_full`. `n_full_wide_threshold` decouples this budget gate from the
+    # candidate-cap/D6 threshold: an explicit value is an inclusive minimum
+    # legal-action count (40 => every >=40-action root); None preserves the old
+    # `len(legal) > wide_candidates_threshold` rule exactly. Motivation: Gate-A
+    # losses concentrate at wide placement roots where n_full=64 over ~54
+    # candidates leaves ~1.2 sims/candidate. None (default) => use `n_full`
+    # everywhere, a pure no-op.
     n_full_wide: int | None = None
     # ARM (phase-gated search, default disabled): when set, at any root wider than
     # `raw_policy_above_width` SKIP search entirely and play argmax(prior) (the raw
@@ -543,6 +584,19 @@ class GumbelChanceMCTSConfig:
     # keeps the existing per-candidate k-tuned shrinkage exactly.
     variance_aware_closed_form_js: bool = False
 
+    # CAT-25/B6 decoupled wide-root gates. APPENDED here (never inserted near
+    # their older related fields) because this frozen+slots dataclass pickles
+    # positionally; see the append-only boundary above.
+    # Inclusive minimum legal-action count for D6 averaging. None preserves
+    # the legacy `len(legal) > wide_candidates_threshold` gate exactly.
+    symmetry_averaged_eval_threshold: int | None = None
+    # Inclusive minimum legal-action count for n_full_wide. None preserves the
+    # legacy `len(legal) > wide_candidates_threshold` budget gate exactly.
+    n_full_wide_threshold: int | None = None
+    # When enabled, every root selected by the n_full_wide gate uses FULL
+    # search independently of p_full. Explicit search(force_full=...) wins.
+    wide_roots_always_full: bool = False
+
 
 @dataclass(frozen=True, slots=True)
 class SearchResult:
@@ -732,18 +786,17 @@ class GumbelChanceMCTS:
         if raw_above is not None and len(legal_actions) > int(raw_above):
             return self._raw_policy_root_result(game, root_color)
 
-        use_full = (
-            bool(force_full)
-            if force_full is not None
-            else self.rng.random() < float(self.config.p_full)
+        wide_budget_root = _wide_budget_applies(len(legal_actions), self.config)
+        use_full = _choose_full_search(
+            self.config,
+            force_full=force_full,
+            wide_budget_root=wide_budget_root,
+            random_draw=self.rng.random,
         )
         # ARM (placement budget asymmetry): a full search at a wide root spends
         # n_full_wide sims instead of n_full. Disabled (None) => n_full everywhere.
         n_full_effective = int(self.config.n_full)
-        if (
-            self.config.n_full_wide is not None
-            and len(legal_actions) > int(self.config.wide_candidates_threshold)
-        ):
+        if wide_budget_root:
             n_full_effective = int(self.config.n_full_wide)
         n_simulations = max(
             int(n_full_effective if use_full else self.config.n_fast), 1
@@ -1899,7 +1952,11 @@ class GumbelChanceMCTS:
         if (
             at_root
             and bool(self.config.symmetry_averaged_eval)
-            and len(legal_actions) > int(self.config.wide_candidates_threshold)
+            and _matches_explicit_or_legacy_width_gate(
+                len(legal_actions),
+                min_legal_actions=self.config.symmetry_averaged_eval_threshold,
+                legacy_exclusive_threshold=self.config.wide_candidates_threshold,
+            )
             and hasattr(self.evaluator, "evaluate_symmetry_averaged")
         ):
             # f74b: denoise the wide-root value+prior by averaging the net over
@@ -1908,7 +1965,10 @@ class GumbelChanceMCTS:
             # failure lives; a no-op when the evaluator lacks the method.
             priors, value, uncertainty = _split_evaluation(
                 self.evaluator.evaluate_symmetry_averaged(
-                    node.game, legal_actions, root_color=node.root_color, colors=self.config.colors
+                    node.game,
+                    legal_actions,
+                    root_color=node.root_color,
+                    colors=self.config.colors,
                 )
             )
         else:

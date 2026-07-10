@@ -154,6 +154,72 @@ class _ResolveCallCounter:
         neural_rust_mcts._resolve_entity_adapter = self._real
 
 
+class _SnapshotForbiddenGame:
+    """Delegate every native-game API except the one the warm path must skip."""
+
+    def __init__(self, game):
+        self.game = game
+        self.action_indices_calls = 0
+        self.actions_json_calls = 0
+
+    def json_snapshot(self):
+        raise AssertionError("json_snapshot must not be fetched on this path")
+
+    def playable_action_indices(self, *args, **kwargs):
+        self.action_indices_calls += 1
+        return self.game.playable_action_indices(*args, **kwargs)
+
+    def playable_actions_json(self, *args, **kwargs):
+        self.actions_json_calls += 1
+        return self.game.playable_actions_json(*args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self.game, name)
+
+
+class _StubPolicy:
+    action_size = 8
+    trained_with_masked_hidden_info = False
+
+    def forward_legal_np(self, _entity, legal_ids, _context, *, return_q=False):
+        import torch
+
+        del return_q
+        return {
+            "logits": torch.zeros(tuple(legal_ids.shape), dtype=torch.float32),
+            "value": torch.zeros((int(legal_ids.shape[0]),), dtype=torch.float32),
+        }
+
+
+class _StubGame:
+    def current_color(self):
+        return COLORS[0]
+
+    def playable_action_indices(self, _colors, _filter):
+        return [10, 11]
+
+    def playable_actions_json(self):
+        return json.dumps([[COLORS[0], "END_TURN"], [COLORS[0], "ROLL"]])
+
+
+def _stub_native_features(evaluator, monkeypatch):
+    monkeypatch.setattr(
+        neural_rust_mcts,
+        "rust_policy_action_ids",
+        lambda _game, legal, **_kwargs: tuple(range(len(legal))),
+    )
+    monkeypatch.setattr(
+        evaluator,
+        "_entity_batch_via_rust",
+        lambda *_args, **_kwargs: {"dummy": np.zeros((1, 1), dtype=np.float32)},
+    )
+    monkeypatch.setattr(
+        evaluator,
+        "_context_batch_via_rust",
+        lambda *_args, **_kwargs: np.zeros((1, 2, 1), dtype=np.float32),
+    )
+
+
 # ---------------------------------------------------------------------------
 # 1: shared `resolved` tuple must be bit-identical to independent resolution,
 # in both masking regimes.
@@ -343,6 +409,68 @@ def test_batched_evaluator_skips_adapter_after_rust_topology_is_warm():
         )
     finally:
         evaluator.close()
+
+
+@pytest.mark.parametrize("path", ["evaluate", "evaluate_many", "batched"])
+def test_warm_native_cache_zero_skips_snapshot_but_keeps_action_map(
+    path, monkeypatch
+):
+    """The production leaf path must not serialize an unused game snapshot."""
+    game = _StubGame()
+    legal = (10, 11)
+    actor = str(game.current_color())
+    config = EntityGraphRustEvaluatorConfig(cache_size=0, rust_featurize=True)
+    evaluator = (
+        BatchedEntityGraphRustEvaluator(
+            _StubPolicy(), config=config, max_batch_size=64, max_wait_ms=0.0
+        )
+        if path == "batched"
+        else EntityGraphRustEvaluator(_StubPolicy(), config=config)
+    )
+    try:
+        # This is the post-bootstrap production state; native builders receive
+        # this immutable object and do not need the Python snapshot adapter.
+        evaluator._rust_topology = object()
+        _stub_native_features(evaluator, monkeypatch)
+        guarded = _SnapshotForbiddenGame(game)
+
+        if path == "evaluate_many":
+            evaluator.evaluate_many(
+                [(guarded, legal)], root_color=actor, colors=COLORS
+            )
+        else:
+            evaluator.evaluate(guarded, legal, root_color=actor, colors=COLORS)
+
+        assert guarded.action_indices_calls == 1
+        assert guarded.actions_json_calls == 1
+    finally:
+        if isinstance(evaluator, BatchedEntityGraphRustEvaluator):
+            evaluator.close()
+
+
+@pytest.mark.parametrize("path", ["cold_native", "cache_enabled", "non_rust"])
+def test_snapshot_is_still_required_on_fallback_paths(path):
+    """Cold topology, cache keys, and Python features retain prior behavior."""
+    game = _StubGame()
+    legal = (10, 11)
+    actor = str(game.current_color())
+    config = EntityGraphRustEvaluatorConfig(
+        cache_size=1 if path == "cache_enabled" else 0,
+        rust_featurize=path != "non_rust",
+    )
+    evaluator = EntityGraphRustEvaluator(_StubPolicy(), config=config)
+    if path == "cache_enabled":
+        evaluator._rust_topology = object()
+
+    with pytest.raises(
+        AssertionError, match="json_snapshot must not be fetched on this path"
+    ):
+        evaluator.evaluate(
+            _SnapshotForbiddenGame(game),
+            legal,
+            root_color=actor,
+            colors=COLORS,
+        )
 
 
 @pytest.mark.parametrize("public_observation", [False, True])

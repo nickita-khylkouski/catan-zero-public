@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+import hashlib
 import io
 import json
 import math
@@ -16,7 +17,8 @@ from typing import Sequence
 
 import numpy as np
 
-from catan_zero.rl.config_cli import add_config_flags, resolve_config
+from catan_zero.rl.config_cli import add_config_flags, apply_config_file, resolve_config
+from catan_zero.rl.aux_subgoal_targets import AUX_TARGET_KEYS
 from catan_zero.rl.pipeline_configs import TrainConfig
 from catan_zero.rl.torch_ppo import build_action_feature_table, create_ppo_policy
 from catan_zero.rl.xdim_lite_policy import (
@@ -61,6 +63,42 @@ from catan_zero.rl.entity_token_features import (
 # disk -- one corpus serves both masked and unmasked training regimes.
 _MASK_HIDDEN_INFO_PLAYER_TOKENS = False
 
+MEMMAP_PAYLOAD_INVENTORY_SCHEMA = "memmap-payload-inventory-v1"
+A1_REQUIRED_LEARNER_CODE_SUFFIXES = {
+    "configs/guards/train_bc.json",
+    "tools/factory_common.py",
+    "tools/launcher_guards.py",
+    "tools/prelaunch_guard.py",
+    "tools/train_bc.py",
+    "tools/build_memmap_corpus.py",
+    "src/catan_zero/rl/config_cli.py",
+    "src/catan_zero/rl/entity_token_policy.py",
+    "src/catan_zero/rl/entity_token_features.py",
+    "src/catan_zero/rl/pipeline_configs.py",
+    "src/catan_zero/rl/aux_subgoal_targets.py",
+    "src/catan_zero/rl/config_serialization.py",
+    "src/catan_zero/rl/hex_symmetry.py",
+    "src/catan_zero/rl/multiagent_env.py",
+    "src/catan_zero/rl/optim_state.py",
+    "src/catan_zero/rl/torch_ppo.py",
+    "src/catan_zero/rl/xdim_lite_policy.py",
+}
+A1_REQUIRED_RUNTIME_CODE_SUFFIXES = (
+    A1_REQUIRED_LEARNER_CODE_SUFFIXES
+    | {
+        "configs/guards/generate_gumbel_selfplay_data.json",
+        "tools/generate_gumbel_selfplay_data.py",
+        "tools/opponent_mix_registry.py",
+        "src/catan_zero/rl/gumbel_self_play.py",
+        "src/catan_zero/rl/flywheel/opponent_mix.py",
+        "src/catan_zero/rl/action_features.py",
+        "src/catan_zero/rl/action_mask.py",
+        "src/catan_zero/search/gumbel_chance_mcts.py",
+        "src/catan_zero/search/neural_rust_mcts.py",
+        "src/catan_zero/search/rust_mcts.py",
+    }
+)
+
 
 ENTITY_BATCH_KEYS = (
     "hex_tokens",
@@ -102,6 +140,14 @@ ENTITY_FIELD_DTYPES = {
     "player_mask": np.bool_,
     "legal_action_mask": np.bool_,
     "event_mask": np.bool_,
+}
+
+AUX_SUBGOAL_FIELD_DTYPES = {
+    "aux_longest_road": np.float32,
+    "aux_largest_army": np.float32,
+    "aux_vp_in_n": np.float32,
+    "aux_next_settlement": np.int16,
+    "aux_robber_target": np.int16,
 }
 
 
@@ -230,6 +276,18 @@ def build_parser() -> argparse.ArgumentParser:
         "the cap).",
     )
     parser.add_argument(
+        "--validation-game-seed-manifest",
+        default="",
+        help=(
+            "Immutable train-validation-game-seeds-v1 manifest emitted by the A1 "
+            "post-wave audit. When set, these exact game seeds form the validation "
+            "split before the first optimizer step; the trainer rejects manifest "
+            "digest/config drift, missing seeds, --validation-game-seed-ranges, a "
+            "nonzero --validation-max-samples cap, or a memmap corpus bound to a "
+            "different A1 contract."
+        ),
+    )
+    parser.add_argument(
         "--allow-missing-game-seed-validation-split",
         action="store_true",
         help="CAT-52: split_train_validation_indices refuses, by default, to build a "
@@ -318,6 +376,18 @@ def build_parser() -> argparse.ArgumentParser:
             "scaled per group. Requires --arch entity_graph/xdim_lite/xdim_graph (the "
             "model must expose at least one of value_head/final_vp_head/"
             "value_uncertainty_head as a named submodule) -- SystemExit otherwise."
+        ),
+    )
+    parser.add_argument(
+        "--action-module-lr-mult",
+        type=float,
+        default=1.0,
+        help=(
+            "LR multiplier for the opt-in action-target gather/cross-attention "
+            "modules only. 1.0 keeps the historical flat/base LR; a smaller "
+            "value (for example 0.3) de-risks newly initialized action-local "
+            "modules during a warm-start A/B. Fails closed when the checkpoint "
+            "does not contain those modules."
         ),
     )
     parser.add_argument(
@@ -475,17 +545,33 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("mse", "hlgauss"),
         default="mse",
         help=(
-            "Which value head is the PRIMARY value target (CAT-39). 'mse' (default) is the "
-            "current behaviour exactly: only the scalar-MSE value head is trained, no "
-            "categorical CE. 'hlgauss' additionally trains the distributional HL-Gauss "
-            "categorical head (requires an --arch entity_graph model built with "
-            "value_categorical_bins >= 2; see f69_upgrade_checkpoint_config catbins:N) with a "
-            "Gaussian-smeared cross-entropy target, and keeps the scalar-MSE head fully "
-            "trained IN PARALLEL as the control arm. When 'hlgauss' and "
-            "--value-categorical-loss-weight is 0, the CE weight defaults to --value-loss-weight "
-            "so the primary head actually trains. The scalar `value` output stays the value "
-            "consumed by search/eval either way -- switching search to the categorical "
-            "win-value readout is a separate, flag-gated downstream step."
+            "Select the PRIMARY value objective (CAT-39). 'mse' (default) trains only the "
+            "historical scalar-MSE value head at --value-loss-weight. 'hlgauss' trains the "
+            "distributional categorical head at --value-categorical-loss-weight, falling "
+            "back to --value-loss-weight when that override is 0. The two modes therefore "
+            "carry the same primary value-loss budget in a matched tournament. HL-Gauss "
+            "requires an entity_graph model with value_categorical_bins >= 2 (use "
+            "--value-categorical-bins for fresh/grown models, or "
+            "f69_upgrade_checkpoint_config catbins:N for an existing checkpoint). To "
+            "deliberately retain scalar MSE as "
+            "an auxiliary in the HL-Gauss arm, set --hlgauss-scalar-aux-loss-weight; it is "
+            "OFF by default so the primary-head comparison is not silently confounded."
+        ),
+    )
+    parser.add_argument(
+        "--value-categorical-bins",
+        type=int,
+        default=None,
+        help=(
+            "Number of HL-Gauss win/loss support bins to build on a fresh "
+            "--arch entity_graph model (the optional truncation class is added "
+            "separately by EntityGraphConfig). Values must be 0 (disabled) or >=2. "
+            "With --init-checkpoint the default inherits the checkpoint value and an "
+            "explicit value must match it. With --grow-from-checkpoint the default "
+            "inherits the source value so a same-width/deeper model copies the trained "
+            "categorical head; an explicit different value deliberately starts a new "
+            "head. This makes fresh/grown HL-Gauss probes runnable without a mechanical "
+            "config-upgrade checkpoint."
         ),
     )
     parser.add_argument(
@@ -493,11 +579,21 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.0,
         help=(
-            "Explicit weight on the HL-Gauss categorical value head's cross-entropy loss "
-            "(CAT-39). 0.0 (default) means: in --value-head-type mse it is a pure no-op; in "
-            "hlgauss it falls back to --value-loss-weight. Set > 0 to weight the CE "
-            "independently of the scalar MSE control arm. Pure no-op when the categorical "
-            "head is absent from the model outputs."
+            "Override for the PRIMARY HL-Gauss categorical cross-entropy weight (CAT-39). "
+            "In --value-head-type hlgauss, 0.0 falls back to --value-loss-weight so scalar "
+            "and categorical tournament arms use the same primary-loss budget. A nonzero "
+            "value with --value-head-type mse is rejected as a contradictory configuration."
+        ),
+    )
+    parser.add_argument(
+        "--hlgauss-scalar-aux-loss-weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Optional scalar-MSE AUXILIARY weight in --value-head-type hlgauss. Default 0.0 "
+            "makes the categorical-vs-scalar tournament a matched primary-objective test. "
+            "Set explicitly only after the categorical primary wins and a hybrid objective "
+            "is being tested as its own ablation; nonzero in mse mode is rejected."
         ),
     )
     parser.add_argument(
@@ -571,9 +667,10 @@ def build_parser() -> argparse.ArgumentParser:
         default="",
         help=(
             "Comma-separated --arch entity_graph module groups to freeze "
-            "(requires_grad=False): trunk,action_encoder,policy_head. value_head and "
-            "final_vp_head can never be frozen this way. See --train-value-only for a "
-            "shortcut covering all three groups."
+            "(requires_grad=False): trunk,action_encoder,policy_head,value_heads. "
+            "The value_heads group includes scalar/categorical/final-VP/uncertainty "
+            "readouts and optional value-attention-pool parameters. See "
+            "--train-value-only for a shortcut covering the first three groups."
         ),
     )
     parser.add_argument(
@@ -736,6 +833,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--init-checkpoint",
         default="",
         help="Optional checkpoint to continue XDim-lite BC training from.",
+    )
+    parser.add_argument(
+        "--resume-optimizer",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Restore <init-checkpoint>.optimizer.pt when compatible. Disable "
+            "with --no-resume-optimizer for matched warm-start experiments so "
+            "both arms use fresh optimizer state even if only one source has a "
+            "sidecar. The resolved choice is recorded in the config/report."
+        ),
     )
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--report", required=True)
@@ -921,6 +1029,161 @@ def _build_guard_specs(
     return specs
 
 
+def _resolve_value_objective_weights(args) -> tuple[float, float]:
+    """Return ``(scalar_mse_weight, categorical_ce_weight)``.
+
+    ``--value-loss-weight`` is the primary-value budget shared by the matched
+    scalar and HL-Gauss arms.  Historically the HL-Gauss path applied that
+    budget to scalar MSE *and* again to categorical CE, so the purported
+    one-variable tournament doubled its value gradient and validation only
+    reported the scalar half.  Keep the default MSE path byte-for-byte, but
+    make the opt-in HL-Gauss mode categorical-primary and require any hybrid
+    scalar auxiliary to be explicit.
+    """
+
+    mode = str(getattr(args, "value_head_type", "mse"))
+    # ``scalar`` was used by pre-parser unit fixtures and early config JSONs;
+    # accept it as the exact historical alias for the CLI spelling ``mse``.
+    if mode == "scalar":
+        mode = "mse"
+    primary = float(getattr(args, "value_loss_weight", 0.10))
+    categorical_override = float(
+        getattr(args, "value_categorical_loss_weight", 0.0)
+    )
+    scalar_aux = float(getattr(args, "hlgauss_scalar_aux_loss_weight", 0.0))
+    weights = {
+        "value_loss_weight": primary,
+        "value_categorical_loss_weight": categorical_override,
+        "hlgauss_scalar_aux_loss_weight": scalar_aux,
+    }
+    if any(value < 0.0 for value in weights.values()):
+        raise SystemExit(
+            "value objective weights must be non-negative: "
+            + ", ".join(f"{key}={value}" for key, value in weights.items())
+        )
+    value_target_lambda = float(getattr(args, "value_target_lambda", 1.0))
+    if not 0.0 <= value_target_lambda <= 1.0:
+        raise SystemExit(
+            "--value-target-lambda must be in [0, 1]; values outside the convex "
+            "range create invalid categorical probability mass and extrapolated "
+            f"scalar targets (got {value_target_lambda})"
+        )
+    sigma_ratio = float(getattr(args, "value_hlgauss_sigma_ratio", 0.75))
+    if sigma_ratio <= 0.0:
+        raise SystemExit(
+            "--value-hlgauss-sigma-ratio must be > 0 so the HL-Gauss target is "
+            f"well-defined (got {sigma_ratio})"
+        )
+    if mode == "mse":
+        if categorical_override != 0.0:
+            raise SystemExit(
+                "--value-categorical-loss-weight is nonzero while "
+                "--value-head-type=mse; select --value-head-type=hlgauss instead"
+            )
+        if scalar_aux != 0.0:
+            raise SystemExit(
+                "--hlgauss-scalar-aux-loss-weight is only valid with "
+                "--value-head-type=hlgauss"
+            )
+        return primary, 0.0
+    if mode == "hlgauss":
+        categorical = categorical_override if categorical_override != 0.0 else primary
+        if categorical <= 0.0:
+            raise SystemExit(
+                "--value-head-type=hlgauss requires a positive categorical primary "
+                "weight via --value-loss-weight or --value-categorical-loss-weight"
+            )
+        return scalar_aux, categorical
+    raise SystemExit(f"unknown --value-head-type={mode!r}")
+
+
+def _value_training_metadata(
+    args,
+    *,
+    scalar_weight: float,
+    categorical_weight: float,
+    categorical_bins: int,
+    optimizer_steps: int,
+    completed_epochs: int,
+    scalar_training_weight_sum: float,
+    categorical_training_weight_sum: float,
+) -> dict[str, object]:
+    """Build durable checkpoint provenance for value readouts trained here.
+
+    Merely adding a categorical module to a checkpoint does not train it.  The
+    explicit readout list lets search fail closed on config-only upgrades while
+    remaining backwards compatible with legacy scalar checkpoints.
+    """
+
+    mode = str(getattr(args, "value_head_type", "mse"))
+    if mode == "scalar":
+        mode = "mse"
+    primary_readout = "categorical" if mode == "hlgauss" else "scalar"
+    trained_readouts: list[str] = []
+    has_updates = int(optimizer_steps) > 0 and int(completed_epochs) > 0
+    if (
+        has_updates
+        and float(scalar_weight) > 0.0
+        and float(scalar_training_weight_sum) > 0.0
+    ):
+        trained_readouts.append("scalar")
+    if (
+        has_updates
+        and float(categorical_weight) > 0.0
+        and float(categorical_training_weight_sum) > 0.0
+    ):
+        trained_readouts.append("categorical")
+    return {
+        "schema_version": "value-training-v1",
+        "primary_readout": primary_readout,
+        "trained_value_readouts": trained_readouts,
+        "resolved_scalar_mse_weight": float(scalar_weight),
+        "resolved_categorical_ce_weight": float(categorical_weight),
+        "hlgauss_scalar_aux_loss_weight": float(
+            getattr(args, "hlgauss_scalar_aux_loss_weight", 0.0)
+        ),
+        "hlgauss_bins": int(categorical_bins),
+        "hlgauss_sigma_ratio": float(
+            getattr(args, "value_hlgauss_sigma_ratio", 0.75)
+        ),
+        "value_target_lambda": float(getattr(args, "value_target_lambda", 1.0)),
+        "truncated_vp_margin_value_weight": float(
+            getattr(args, "truncated_vp_margin_value_weight", 0.0)
+        ),
+        "optimizer_steps": int(optimizer_steps),
+        "completed_epochs": int(completed_epochs),
+        "scalar_training_weight_sum": float(scalar_training_weight_sum),
+        "categorical_training_weight_sum": float(
+            categorical_training_weight_sum
+        ),
+        **(
+            {
+                "a1_contract_sha256": args.a1_contract_sha256,
+                "a1_selected_game_seed_set_sha256": (
+                    args.a1_selected_game_seed_set_sha256
+                ),
+                "a1_training_game_seed_set_sha256": (
+                    args.a1_training_game_seed_set_sha256
+                ),
+                "a1_learner_training_recipe_sha256": (
+                    args.a1_learner_training_recipe_sha256
+                ),
+                "a1_memmap_payload_inventory_sha256": (
+                    getattr(args, "a1_memmap_payload_inventory_sha256", None)
+                ),
+                "a1_learner_code_sha256": getattr(
+                    args, "a1_learner_code_sha256", None
+                ),
+                "a1_runtime_code_tree_sha256": getattr(
+                    args, "a1_runtime_code_tree_sha256", None
+                ),
+            }
+            if getattr(args, "a1_contract_sha256", None)
+            else {}
+        ),
+    }
+
+
 def _assert_value_heads_present_for_losses(model, args) -> None:
     """Fail LOUD (SystemExit) when a value-head objective was requested on the
     CLI but the constructed/loaded model lacks the head that objective needs --
@@ -937,7 +1200,8 @@ def _assert_value_heads_present_for_losses(model, args) -> None:
         submodule; without it "value_uncertainty" is never in outputs and the
         loss stays 0.0.
     """
-    if str(getattr(args, "value_head_type", "scalar")) == "hlgauss":
+    _resolve_value_objective_weights(args)
+    if str(getattr(args, "value_head_type", "mse")) == "hlgauss":
         bins = int(getattr(model, "value_categorical_bins", 0) or 0)
         if bins < 2:
             raise SystemExit(
@@ -946,7 +1210,8 @@ def _assert_value_heads_present_for_losses(model, args) -> None:
                 "f69_upgrade_checkpoint_config catbins:N), but the constructed/"
                 f"loaded model has value_categorical_bins={bins}. Without it the "
                 "HL-Gauss objective is silently inert and the run trains scalar-MSE "
-                "only. Upgrade the checkpoint to a catbins head or pass "
+                "only. Build/upgrade a catbins head (for a fresh model pass "
+                "--value-categorical-bins >=2) or pass "
                 "--value-head-type scalar."
             )
     if float(getattr(args, "value_uncertainty_loss_weight", 0.0) or 0.0) != 0.0:
@@ -961,9 +1226,1031 @@ def _assert_value_heads_present_for_losses(model, args) -> None:
             )
 
 
+def _checkpoint_value_categorical_bins(checkpoint_path: str) -> int:
+    """Read the categorical support width from a policy checkpoint config."""
+
+    import torch
+
+    from catan_zero.rl.config_serialization import config_attr_view
+
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    if not isinstance(checkpoint, dict) or "config" not in checkpoint:
+        raise SystemExit(
+            f"{checkpoint_path} is not a policy checkpoint with a config; cannot "
+            "resolve --value-categorical-bins"
+        )
+    config = config_attr_view(checkpoint["config"])
+    bins = int(getattr(config, "value_categorical_bins", 0) or 0)
+    if bins == 1 or bins < 0:
+        raise SystemExit(
+            f"{checkpoint_path} records invalid value_categorical_bins={bins}; "
+            "expected 0 (disabled) or >=2"
+        )
+    return bins
+
+
+def _sha256_existing_file(path: str | Path) -> str:
+    resolved = Path(path)
+    if not resolved.is_file():
+        return ""
+    digest = hashlib.sha256()
+    with open(resolved, "rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return f"sha256:{digest.hexdigest()}"
+
+
+def _canonical_json_sha256(value: object) -> str:
+    payload = json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("utf-8")
+    return f"sha256:{hashlib.sha256(payload).hexdigest()}"
+
+
+def _training_data_fingerprint(path: str, data_format: str) -> str:
+    """Return a durable corpus identity when the format exposes a manifest.
+
+    A memmap metadata file describes the payload layout but, by itself, does
+    not identify the flat-file bytes.  New corpora bind the metadata digest and
+    the content-addressed payload inventory into one training fingerprint.
+    Legacy non-A1 corpora without an inventory retain their historical metadata
+    fingerprint for compatibility.
+    """
+
+    root = Path(path)
+    candidates = (
+        (root / "corpus_meta.json", root / "manifest.json")
+        if str(data_format) == "memmap"
+        else (root / "manifest.json", root / "corpus_meta.json")
+    )
+    for candidate in candidates:
+        digest = _sha256_existing_file(candidate)
+        if not digest:
+            continue
+        if str(data_format) == "memmap" and candidate.name == "corpus_meta.json":
+            try:
+                meta = json.loads(candidate.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                return digest
+            inventory_sha = (
+                meta.get("payload_inventory_sha256")
+                if isinstance(meta, dict)
+                else None
+            )
+            if _is_sha256(inventory_sha):
+                return _canonical_json_sha256(
+                    {
+                        "corpus_meta_file_sha256": digest,
+                        "payload_inventory_sha256": inventory_sha,
+                    }
+                )
+        return digest
+    return ""
+
+
+def _expected_memmap_payload_filenames(
+    corpus_meta: dict[str, object],
+) -> set[str]:
+    columns = corpus_meta.get("columns")
+    if not isinstance(columns, dict) or not columns:
+        raise SystemExit("A1 memmap metadata has no column schema")
+    expected = {"row_offsets.dat"}
+    for name, raw_schema in columns.items():
+        if not isinstance(name, str) or not name or Path(name).name != name:
+            raise SystemExit("A1 memmap column name is not a safe filename component")
+        if not isinstance(raw_schema, dict):
+            raise SystemExit(f"A1 memmap column {name!r} has malformed schema")
+        kind = raw_schema.get("kind")
+        if kind not in {
+            "fixed",
+            "ragged2d",
+            "ragged3d",
+            "string",
+            "implicit_constant",
+        }:
+            raise SystemExit(
+                f"A1 memmap column {name!r} has unsupported kind {kind!r}"
+            )
+        if kind == "implicit_constant":
+            continue
+        expected.add(
+            f"{name}.codes.dat" if kind == "string" else f"{name}.dat"
+        )
+    return expected
+
+
+def _validate_memmap_payload_inventory(
+    data_path: str | Path, corpus_meta: dict[str, object]
+) -> str:
+    """Verify every A1 flat payload file against its immutable inventory."""
+
+    if (
+        corpus_meta.get("payload_inventory_schema")
+        != MEMMAP_PAYLOAD_INVENTORY_SCHEMA
+    ):
+        raise SystemExit(
+            "A1 memmap payload inventory schema is missing or unsupported"
+        )
+    inventory = corpus_meta.get("payload_inventory")
+    if not isinstance(inventory, list) or not inventory:
+        raise SystemExit("A1 memmap payload inventory is missing or empty")
+    declared_inventory_sha = corpus_meta.get("payload_inventory_sha256")
+    actual_inventory_sha = _canonical_json_sha256(inventory)
+    if (
+        not _is_sha256(declared_inventory_sha)
+        or declared_inventory_sha != actual_inventory_sha
+    ):
+        raise SystemExit(
+            "A1 memmap payload inventory semantic digest mismatch: "
+            f"declared={declared_inventory_sha!r} actual={actual_inventory_sha!r}"
+        )
+
+    expected_names = _expected_memmap_payload_filenames(corpus_meta)
+    records_by_name: dict[str, dict[str, object]] = {}
+    prior_name: str | None = None
+    for index, record in enumerate(inventory):
+        if not isinstance(record, dict) or set(record) != {
+            "filename",
+            "size_bytes",
+            "sha256",
+        }:
+            raise SystemExit(
+                f"A1 memmap payload inventory record {index} has malformed fields"
+            )
+        filename = record["filename"]
+        if (
+            not isinstance(filename, str)
+            or not filename
+            or Path(filename).name != filename
+        ):
+            raise SystemExit(
+                f"A1 memmap payload inventory record {index} has unsafe filename"
+            )
+        if prior_name is not None and filename <= prior_name:
+            raise SystemExit(
+                "A1 memmap payload inventory filenames must be strictly sorted"
+            )
+        prior_name = filename
+        size_bytes = record["size_bytes"]
+        if (
+            isinstance(size_bytes, bool)
+            or not isinstance(size_bytes, int)
+            or size_bytes < 0
+            or not _is_sha256(record["sha256"])
+        ):
+            raise SystemExit(
+                f"A1 memmap payload inventory record {index} has invalid size/hash"
+            )
+        records_by_name[filename] = record
+    if set(records_by_name) != expected_names:
+        raise SystemExit(
+            "A1 memmap payload inventory filenames differ from the column schema: "
+            f"missing={sorted(expected_names - set(records_by_name))} "
+            f"unexpected={sorted(set(records_by_name) - expected_names)}"
+        )
+
+    root = Path(data_path).expanduser()
+    actual_names = {
+        path.name
+        for path in root.iterdir()
+        if path.is_file()
+        and (path.name.endswith(".dat") or path.name.endswith(".codes.dat"))
+    }
+    if actual_names != expected_names:
+        raise SystemExit(
+            "A1 memmap on-disk payload filenames differ from the authenticated "
+            f"inventory: missing={sorted(expected_names - actual_names)} "
+            f"unexpected={sorted(actual_names - expected_names)}"
+        )
+    for filename in sorted(expected_names):
+        record = records_by_name[filename]
+        payload_path = root / filename
+        actual_size = payload_path.stat().st_size
+        if actual_size != record["size_bytes"]:
+            raise SystemExit(
+                f"A1 memmap payload {filename} size mismatch: "
+                f"declared={record['size_bytes']} actual={actual_size}"
+            )
+        actual_sha = _sha256_existing_file(payload_path)
+        if actual_sha != record["sha256"]:
+            raise SystemExit(
+                f"A1 memmap payload {filename} sha256 mismatch: "
+                f"declared={record['sha256']!r} actual={actual_sha!r}"
+            )
+    return actual_inventory_sha
+
+
+def _preflight_a1_memmap_metadata(
+    data_path: str | Path, *, validation_manifest_path: str | Path | None
+) -> dict[str, object] | None:
+    """Auto-detect an A1 corpus and forbid bypassing its exact holdout path."""
+
+    meta_path = Path(data_path).expanduser() / "corpus_meta.json"
+    if not meta_path.is_file():
+        return None
+    try:
+        payload = json.loads(meta_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise SystemExit(f"cannot load memmap corpus metadata {meta_path}: {error}") from error
+    if not isinstance(payload, dict):
+        raise SystemExit(f"{meta_path} must contain a JSON object")
+    selected = payload.get("selected_game_seed_manifest")
+    audit = payload.get("a1_post_wave_audit")
+    is_a1 = selected is not None or audit is not None
+    if not is_a1:
+        return None
+    if not isinstance(selected, dict) or not isinstance(audit, dict):
+        raise SystemExit(
+            "A1 memmap metadata must bind both selected_game_seed_manifest and "
+            "a1_post_wave_audit"
+        )
+    if not validation_manifest_path:
+        raise SystemExit(
+            "A1 memmap corpus detected: --validation-game-seed-manifest is "
+            "mandatory and cannot be replaced by a recomputed fraction/range split"
+        )
+    _validate_memmap_payload_inventory(data_path, payload)
+    return payload
+
+
+def _game_seed_set_sha256(seeds: np.ndarray) -> str:
+    canonical = np.sort(np.unique(np.asarray(seeds, dtype=np.int64))).astype(
+        "<i8", copy=False
+    )
+    return f"sha256:{hashlib.sha256(canonical.tobytes()).hexdigest()}"
+
+
+def _is_sha256(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and value.startswith("sha256:")
+        and len(value) == 71
+        and all(character in "0123456789abcdef" for character in value[7:])
+    )
+
+
+def _load_validation_game_seed_manifest_for_training(
+    path: str | Path,
+    *,
+    validation_fraction: float,
+    validation_seed: int,
+    validation_max_samples: int,
+    validation_game_seed_ranges: list[tuple[int, int]],
+) -> dict[str, object]:
+    """Validate the exact A1 holdout before any optimizer step can run.
+
+    This input is deliberately stricter than the trainer's output manifest.
+    It is the immutable sidecar emitted by ``a1_pre_wave_contract.py audit``
+    and binds the exact validation games, their byte-level seed digest, and
+    the A1 contract that selected the corpus.  Recomputing a nominally equal
+    5% split and comparing only after training would detect drift too late.
+    """
+
+    try:
+        manifest_path = Path(path).expanduser().resolve(strict=True)
+        raw = manifest_path.read_bytes()
+    except OSError as error:
+        raise SystemExit(
+            f"cannot read validation game-seed manifest {path}: {error}"
+        ) from error
+    try:
+        payload = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise SystemExit(
+            f"cannot parse validation game-seed manifest {manifest_path}: {error}"
+        ) from error
+    if not isinstance(payload, dict):
+        raise SystemExit("validation game-seed manifest must be a JSON object")
+    expected_fields = {
+        "schema_version",
+        "a1_contract_sha256",
+        "validation_fraction",
+        "validation_seed",
+        "validation_max_samples",
+        "validation_game_seed_ranges",
+        "validation_game_seed_count",
+        "validation_row_count",
+        "validation_game_seed_set_sha256",
+        "game_seeds",
+    }
+    if set(payload) != expected_fields:
+        raise SystemExit(
+            "validation game-seed manifest fields differ from the exact "
+            "train-validation-game-seeds-v1 schema; "
+            f"missing={sorted(expected_fields - set(payload))} "
+            f"extra={sorted(set(payload) - expected_fields)}"
+        )
+    if payload["schema_version"] != "train-validation-game-seeds-v1":
+        raise SystemExit(
+            "validation game-seed manifest schema must be "
+            "'train-validation-game-seeds-v1'"
+        )
+    if not _is_sha256(payload["a1_contract_sha256"]):
+        raise SystemExit("validation game-seed manifest has invalid a1_contract_sha256")
+
+    manifest_fraction = payload["validation_fraction"]
+    if isinstance(manifest_fraction, bool) or not isinstance(
+        manifest_fraction, (int, float)
+    ):
+        raise SystemExit("validation game-seed manifest validation_fraction is invalid")
+    if not math.isclose(
+        float(manifest_fraction),
+        float(validation_fraction),
+        rel_tol=0.0,
+        abs_tol=1e-12,
+    ):
+        raise SystemExit(
+            "validation game-seed manifest fraction differs from CLI: "
+            f"manifest={manifest_fraction} cli={validation_fraction}"
+        )
+    for field, cli_value in (
+        ("validation_seed", validation_seed),
+        ("validation_max_samples", validation_max_samples),
+    ):
+        value = payload[field]
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise SystemExit(f"validation game-seed manifest {field} is invalid")
+        if int(value) != int(cli_value):
+            raise SystemExit(
+                f"validation game-seed manifest {field} differs from CLI: "
+                f"manifest={value} cli={cli_value}"
+            )
+    if int(validation_max_samples) != 0:
+        raise SystemExit(
+            "--validation-game-seed-manifest requires --validation-max-samples 0; "
+            "row-capping an exact game holdout would change its semantics"
+        )
+    if validation_game_seed_ranges:
+        raise SystemExit(
+            "--validation-game-seed-manifest and --validation-game-seed-ranges "
+            "are mutually exclusive"
+        )
+    if payload["validation_game_seed_ranges"] != []:
+        raise SystemExit(
+            "A1 validation game-seed manifest must declare no range override"
+        )
+
+    raw_seeds = payload["game_seeds"]
+    if not isinstance(raw_seeds, list) or not raw_seeds:
+        raise SystemExit("validation game-seed manifest has no game_seeds")
+    if any(isinstance(seed, bool) or not isinstance(seed, int) for seed in raw_seeds):
+        raise SystemExit("validation game-seed manifest game_seeds must be integers")
+    try:
+        seeds = np.asarray(raw_seeds, dtype=np.int64)
+    except (OverflowError, TypeError, ValueError) as error:
+        raise SystemExit(
+            "validation game-seed manifest contains a seed outside int64"
+        ) from error
+    if not np.all(seeds[1:] > seeds[:-1]):
+        raise SystemExit(
+            "validation game-seed manifest game_seeds must be strictly sorted and unique"
+        )
+    count = payload["validation_game_seed_count"]
+    if isinstance(count, bool) or not isinstance(count, int) or int(count) != len(seeds):
+        raise SystemExit(
+            "validation game-seed manifest validation_game_seed_count does not "
+            f"match its seed list ({count!r} != {len(seeds)})"
+        )
+    row_count = payload["validation_row_count"]
+    if isinstance(row_count, bool) or not isinstance(row_count, int) or row_count <= 0:
+        raise SystemExit("validation game-seed manifest validation_row_count is invalid")
+    actual_digest = _game_seed_set_sha256(seeds)
+    if payload["validation_game_seed_set_sha256"] != actual_digest:
+        raise SystemExit(
+            "validation game-seed manifest seed digest mismatch: "
+            f"declared={payload['validation_game_seed_set_sha256']!r} "
+            f"actual={actual_digest!r}"
+        )
+    return {
+        "path": manifest_path,
+        "file_sha256": f"sha256:{hashlib.sha256(raw).hexdigest()}",
+        "manifest_sha256": _canonical_json_sha256(payload),
+        "a1_contract_sha256": payload["a1_contract_sha256"],
+        "validation_row_count": int(row_count),
+        "validation_game_seed_set_sha256": actual_digest,
+        "game_seeds": seeds,
+    }
+
+
+def _validate_a1_validation_manifest_corpus_binding(
+    corpus_meta: object, validation_seed_contract: dict[str, object]
+) -> None:
+    """Require the exact audited corpus selected by the holdout's A1 contract."""
+
+    if not isinstance(corpus_meta, dict):
+        raise SystemExit(
+            "--validation-game-seed-manifest requires memmap corpus metadata"
+        )
+    selected_meta = corpus_meta.get("selected_game_seed_manifest")
+    if not isinstance(selected_meta, dict):
+        raise SystemExit(
+            "the memmap corpus does not bind an audited A1 selected-game manifest"
+        )
+    expected_contract = str(validation_seed_contract["a1_contract_sha256"])
+    if selected_meta.get("a1_contract_sha256") != expected_contract:
+        raise SystemExit(
+            "validation holdout and memmap corpus bind different A1 contracts: "
+            f"holdout={expected_contract!r} "
+            f"corpus={selected_meta.get('a1_contract_sha256')!r}"
+        )
+    audit_meta = corpus_meta.get("a1_post_wave_audit")
+    if not isinstance(audit_meta, dict):
+        raise SystemExit(
+            "the memmap corpus does not bind a passing A1 post-wave audit"
+        )
+    if audit_meta.get("contract_sha256") != expected_contract:
+        raise SystemExit(
+            "A1 post-wave audit and validation holdout bind different contracts"
+        )
+    if not _is_sha256(audit_meta.get("file_sha256")) or not _is_sha256(
+        audit_meta.get("audit_sha256")
+    ):
+        raise SystemExit("memmap A1 post-wave audit provenance is malformed")
+    validation_meta = audit_meta.get("validation_holdout")
+    if not isinstance(validation_meta, dict):
+        raise SystemExit(
+            "memmap A1 post-wave audit does not bind the validation sidecar"
+        )
+    expected_validation_binding = {
+        "path": str(validation_seed_contract["path"]),
+        "file_sha256": validation_seed_contract["file_sha256"],
+        "manifest_sha256": validation_seed_contract["manifest_sha256"],
+        "a1_contract_sha256": validation_seed_contract["a1_contract_sha256"],
+        "validation_game_seed_count": int(
+            np.asarray(validation_seed_contract["game_seeds"], dtype=np.int64).size
+        ),
+        "validation_row_count": int(validation_seed_contract["validation_row_count"]),
+        "validation_game_seed_set_sha256": validation_seed_contract[
+            "validation_game_seed_set_sha256"
+        ],
+    }
+    if validation_meta != expected_validation_binding:
+        raise SystemExit(
+            "trainer validation sidecar differs from the exact file bound by the "
+            "A1 post-wave audit"
+        )
+    if selected_meta.get("selected_game_count") != 12_000:
+        raise SystemExit("A1 memmap corpus does not contain the exact 12,000-game selection")
+    expected_validation_count = int(
+        np.asarray(validation_seed_contract["game_seeds"], dtype=np.int64).size
+    )
+    if selected_meta.get("validation_game_count") != expected_validation_count:
+        raise SystemExit(
+            "validation holdout game count differs from the selected-game manifest "
+            "bound into corpus_meta.json"
+        )
+    selected_validation_digest = selected_meta.get(
+        "validation_game_seed_set_sha256"
+    )
+    if selected_validation_digest != validation_seed_contract[
+        "validation_game_seed_set_sha256"
+    ]:
+        raise SystemExit(
+            "validation holdout seed digest differs from the selected-game "
+            "manifest bound into corpus_meta.json"
+        )
+
+
+def _read_sha256_bound_json(
+    path_value: object, expected_file_sha256: object, *, label: str
+) -> tuple[Path, dict[str, object], str]:
+    try:
+        path = Path(str(path_value)).expanduser().resolve(strict=True)
+        raw = path.read_bytes()
+        payload = json.loads(raw)
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise SystemExit(f"cannot read bound {label} {path_value}: {error}") from error
+    actual_file_sha256 = f"sha256:{hashlib.sha256(raw).hexdigest()}"
+    if actual_file_sha256 != expected_file_sha256:
+        raise SystemExit(
+            f"bound {label} file SHA-256 drift: "
+            f"expected={expected_file_sha256!r} actual={actual_file_sha256!r}"
+        )
+    if not isinstance(payload, dict):
+        raise SystemExit(f"bound {label} must be a JSON object")
+    return path, payload, actual_file_sha256
+
+
+def _validate_a1_corpus_artifacts_and_seeds(
+    corpus_meta: dict[str, object],
+    validation_seed_contract: dict[str, object],
+    game_seed_column: np.ndarray,
+) -> dict[str, object]:
+    """Replay the selected/audit/lock chain against the actual memmap seeds."""
+
+    selected_meta = corpus_meta["selected_game_seed_manifest"]
+    audit_meta = corpus_meta["a1_post_wave_audit"]
+    assert isinstance(selected_meta, dict)
+    assert isinstance(audit_meta, dict)
+
+    selected_path, selected_payload, _ = _read_sha256_bound_json(
+        selected_meta.get("path"),
+        selected_meta.get("file_sha256"),
+        label="A1 selected-game manifest",
+    )
+    if str(selected_path) != str(selected_meta.get("path")):
+        raise SystemExit("A1 selected-game manifest path is not canonical")
+    if selected_payload.get("schema_version") != "a1-selected-training-games-v1":
+        raise SystemExit("A1 selected-game manifest schema drift")
+    if (
+        selected_payload.get("a1_contract_sha256")
+        != validation_seed_contract["a1_contract_sha256"]
+    ):
+        raise SystemExit("A1 selected-game manifest contract hash drift")
+    records = selected_payload.get("records")
+    if not isinstance(records, list) or len(records) != 12_000:
+        raise SystemExit("A1 selected-game manifest must contain exactly 12,000 records")
+    if selected_payload.get("records_sha256") != _canonical_json_sha256(records):
+        raise SystemExit("A1 selected-game manifest records_sha256 mismatch")
+
+    all_seeds: list[int] = []
+    train_seeds: list[int] = []
+    validation_seeds: list[int] = []
+    previous_seed: int | None = None
+    for index, record in enumerate(records):
+        if not isinstance(record, dict):
+            raise SystemExit(f"A1 selected-game record {index} is not an object")
+        seed = record.get("game_seed")
+        split = record.get("split")
+        if isinstance(seed, bool) or not isinstance(seed, int):
+            raise SystemExit(f"A1 selected-game record {index} has invalid game_seed")
+        if previous_seed is not None and int(seed) <= previous_seed:
+            raise SystemExit("A1 selected-game records are not strictly seed-sorted")
+        previous_seed = int(seed)
+        if split not in {"train", "validation"}:
+            raise SystemExit(f"A1 selected-game record {index} has invalid split")
+        all_seeds.append(int(seed))
+        (train_seeds if split == "train" else validation_seeds).append(int(seed))
+
+    digest_fields = {
+        "selected_game_count": len(all_seeds),
+        "selected_game_seed_set_sha256": _game_seed_set_sha256(
+            np.asarray(all_seeds, dtype=np.int64)
+        ),
+        "training_game_count": len(train_seeds),
+        "training_game_seed_set_sha256": _game_seed_set_sha256(
+            np.asarray(train_seeds, dtype=np.int64)
+        ),
+        "validation_game_count": len(validation_seeds),
+        "validation_game_seed_set_sha256": _game_seed_set_sha256(
+            np.asarray(validation_seeds, dtype=np.int64)
+        ),
+        "records_sha256": _canonical_json_sha256(records),
+    }
+    for field, actual in digest_fields.items():
+        if selected_payload.get(field) != actual or selected_meta.get(field) != actual:
+            raise SystemExit(f"A1 selected-game {field} drift")
+    if not np.array_equal(
+        np.asarray(validation_seeds, dtype=np.int64),
+        np.asarray(validation_seed_contract["game_seeds"], dtype=np.int64),
+    ):
+        raise SystemExit(
+            "A1 selected-game validation split differs from the exact holdout sidecar"
+        )
+
+    observed = np.asarray(game_seed_column, dtype=np.int64).reshape(-1)
+    if observed.size == 0:
+        raise SystemExit("A1 memmap corpus has no game_seed rows")
+    run_starts = np.concatenate(
+        (
+            np.asarray([0], dtype=np.int64),
+            np.flatnonzero(observed[1:] != observed[:-1]) + 1,
+        )
+    )
+    run_values = observed[run_starts]
+    if np.unique(run_values).size != run_values.size:
+        raise SystemExit(
+            "A1 memmap game_seed starts more than one non-contiguous run"
+        )
+    observed_unique = np.sort(np.unique(observed))
+    if not np.array_equal(observed_unique, np.asarray(all_seeds, dtype=np.int64)):
+        expected = set(all_seeds)
+        actual = set(map(int, observed_unique.tolist()))
+        raise SystemExit(
+            "A1 memmap actual game-seed set differs from its selected manifest: "
+            f"missing={len(expected - actual)} unexpected={len(actual - expected)}"
+        )
+
+    audit_path, audit_payload, _ = _read_sha256_bound_json(
+        audit_meta.get("path"),
+        audit_meta.get("file_sha256"),
+        label="A1 post-wave audit",
+    )
+    if str(audit_path) != str(audit_meta.get("path")):
+        raise SystemExit("A1 post-wave audit path is not canonical")
+    if (
+        audit_payload.get("schema_version") != "a1-post-wave-audit-v2"
+        or audit_payload.get("passed") is not True
+        or audit_payload.get("errors") != []
+    ):
+        raise SystemExit("A1 post-wave audit is not a clean passing artifact")
+    actual_audit_sha = _canonical_json_sha256(
+        {key: value for key, value in audit_payload.items() if key != "audit_sha256"}
+    )
+    if (
+        audit_payload.get("audit_sha256") != actual_audit_sha
+        or audit_meta.get("audit_sha256") != actual_audit_sha
+    ):
+        raise SystemExit("A1 post-wave audit semantic digest drift")
+    contract_sha = validation_seed_contract["a1_contract_sha256"]
+    if (
+        audit_payload.get("contract_sha256") != contract_sha
+        or audit_meta.get("contract_sha256") != contract_sha
+    ):
+        raise SystemExit("A1 post-wave audit contract hash drift")
+    selected_row_count = audit_payload.get("rows")
+    validation_row_count = int(validation_seed_contract["validation_row_count"])
+    if (
+        isinstance(selected_row_count, bool)
+        or not isinstance(selected_row_count, int)
+        or selected_row_count != int(observed.size)
+        or corpus_meta.get("row_count") != selected_row_count
+        or audit_meta.get("selected_row_count") != selected_row_count
+        or audit_meta.get("training_row_count")
+        != selected_row_count - validation_row_count
+    ):
+        raise SystemExit(
+            "A1 memmap row exposure differs from the passing audit: "
+            f"observed={observed.size} audit={selected_row_count!r} "
+            f"meta_selected={audit_meta.get('selected_row_count')!r} "
+            f"meta_training={audit_meta.get('training_row_count')!r}"
+        )
+    selected_binding = audit_payload.get("selected_training_games")
+    if not isinstance(selected_binding, dict) or selected_binding != {
+        "manifest": str(selected_path),
+        "manifest_sha256": _canonical_json_sha256(selected_payload),
+        "manifest_file_sha256": selected_meta["file_sha256"],
+        "selected_game_count": 12_000,
+        "selected_game_seed_set_sha256": digest_fields[
+            "selected_game_seed_set_sha256"
+        ],
+        "records_sha256": digest_fields["records_sha256"],
+    }:
+        raise SystemExit("A1 post-wave audit selected-game binding drift")
+    validation_binding = audit_payload.get("validation_holdout")
+    expected_validation_binding = {
+        "manifest": str(validation_seed_contract["path"]),
+        "manifest_sha256": validation_seed_contract["manifest_sha256"],
+        "manifest_file_sha256": validation_seed_contract["file_sha256"],
+        "validation_game_seed_count": len(validation_seeds),
+        "validation_game_seed_set_sha256": digest_fields[
+            "validation_game_seed_set_sha256"
+        ],
+    }
+    if validation_binding != expected_validation_binding:
+        raise SystemExit("A1 post-wave audit validation binding drift")
+
+    contract_path_value = audit_payload.get("contract_path")
+    lock_path, lock_payload, _ = _read_sha256_bound_json(
+        contract_path_value,
+        _sha256_existing_file(str(contract_path_value)),
+        label="A1 contract lock",
+    )
+    if str(lock_path) != str(contract_path_value):
+        raise SystemExit("A1 contract lock path is not canonical")
+    if lock_payload.get("schema_version") != "a1-pre-wave-contract-lock-v2":
+        raise SystemExit("A1 contract lock schema drift")
+    lock_digest = _canonical_json_sha256(
+        {key: value for key, value in lock_payload.items() if key != "contract_sha256"}
+    )
+    if lock_payload.get("contract_sha256") != contract_sha or lock_digest != contract_sha:
+        raise SystemExit("A1 contract lock semantic digest drift")
+    provenance = lock_payload.get("provenance")
+    if not isinstance(provenance, dict):
+        raise SystemExit("A1 contract lock has no provenance section")
+    learner_code = provenance.get("learner_code")
+    if not isinstance(learner_code, list) or not learner_code:
+        raise SystemExit("A1 contract lock does not bind learner implementation files")
+    learner_code_sha256 = _canonical_json_sha256(learner_code)
+    if provenance.get("learner_code_sha256") != learner_code_sha256:
+        raise SystemExit("A1 learner-code provenance digest drift")
+    learner_paths: list[str] = []
+    for index, record in enumerate(learner_code):
+        if not isinstance(record, dict) or set(record) != {"kind", "path", "sha256"}:
+            raise SystemExit(
+                f"A1 learner-code record {index} has malformed fields"
+            )
+        if record.get("kind") != "learner_code" or not _is_sha256(
+            record.get("sha256")
+        ):
+            raise SystemExit(f"A1 learner-code record {index} is malformed")
+        try:
+            code_path = Path(str(record["path"])).expanduser().resolve(strict=True)
+        except OSError as error:
+            raise SystemExit(
+                f"cannot resolve A1 learner-code file {record.get('path')}: {error}"
+            ) from error
+        if str(code_path) != str(record["path"]):
+            raise SystemExit(
+                f"A1 learner-code path is not canonical: {record['path']}"
+            )
+        actual_code_sha = _sha256_existing_file(code_path)
+        if actual_code_sha != record["sha256"]:
+            raise SystemExit(
+                "A1 learner implementation drift before optimizer construction: "
+                f"{code_path} declared={record['sha256']!r} actual={actual_code_sha!r}"
+            )
+        learner_paths.append(code_path.as_posix())
+    missing_learner_code = {
+        suffix
+        for suffix in A1_REQUIRED_LEARNER_CODE_SUFFIXES
+        if not any(path.endswith(suffix) for path in learner_paths)
+    }
+    if missing_learner_code:
+        raise SystemExit(
+            "A1 contract omits required learner implementation files: "
+            f"{sorted(missing_learner_code)}"
+        )
+    runtime_code_tree = provenance.get("runtime_code_tree")
+    if not isinstance(runtime_code_tree, list) or not runtime_code_tree:
+        raise SystemExit("A1 contract lock does not bind the transitive runtime tree")
+    runtime_code_tree_sha256 = _canonical_json_sha256(runtime_code_tree)
+    if provenance.get("runtime_code_tree_sha256") != runtime_code_tree_sha256:
+        raise SystemExit("A1 runtime-code-tree provenance digest drift")
+    runtime_paths: list[str] = []
+    for index, record in enumerate(runtime_code_tree):
+        if not isinstance(record, dict) or set(record) != {"kind", "path", "sha256"}:
+            raise SystemExit(
+                f"A1 runtime-code-tree record {index} has malformed fields"
+            )
+        if record.get("kind") != "runtime_code" or not _is_sha256(
+            record.get("sha256")
+        ):
+            raise SystemExit(f"A1 runtime-code-tree record {index} is malformed")
+        try:
+            runtime_path = Path(str(record["path"])).expanduser().resolve(strict=True)
+        except OSError as error:
+            raise SystemExit(
+                f"cannot resolve A1 runtime file {record.get('path')}: {error}"
+            ) from error
+        if str(runtime_path) != str(record["path"]):
+            raise SystemExit(
+                f"A1 runtime-code-tree path is not canonical: {record['path']}"
+            )
+        actual_runtime_sha = _sha256_existing_file(runtime_path)
+        if actual_runtime_sha != record["sha256"]:
+            raise SystemExit(
+                "A1 transitive runtime drift before optimizer construction: "
+                f"{runtime_path} declared={record['sha256']!r} "
+                f"actual={actual_runtime_sha!r}"
+            )
+        runtime_paths.append(runtime_path.as_posix())
+    missing_runtime_code = {
+        suffix
+        for suffix in A1_REQUIRED_RUNTIME_CODE_SUFFIXES
+        if not any(path.endswith(suffix) for path in runtime_paths)
+    }
+    if missing_runtime_code:
+        raise SystemExit(
+            "A1 contract omits required transitive runtime files: "
+            f"{sorted(missing_runtime_code)}"
+        )
+    science = lock_payload.get("science")
+    if not isinstance(science, dict):
+        raise SystemExit("A1 contract lock has no science section")
+    learner_objective = science.get("learner_value_objective")
+    if not isinstance(learner_objective, dict) or science.get(
+        "learner_value_objective_sha256"
+    ) != _canonical_json_sha256(learner_objective):
+        raise SystemExit("A1 learner objective binding drift")
+    learner_training_recipe = science.get("learner_training_recipe")
+    if not isinstance(learner_training_recipe, dict) or science.get(
+        "learner_training_recipe_sha256"
+    ) != _canonical_json_sha256(learner_training_recipe):
+        raise SystemExit("A1 learner training recipe binding drift")
+    producer_sha = next(
+        (
+            record.get("sha256")
+            for record in lock_payload.get("checkpoints", [])
+            if isinstance(record, dict) and record.get("role") == "producer"
+        ),
+        None,
+    )
+    if not _is_sha256(producer_sha):
+        raise SystemExit("A1 contract lock has no valid producer checkpoint")
+    return {
+        "learner_value_objective": learner_objective,
+        "learner_training_recipe": learner_training_recipe,
+        "learner_training_recipe_sha256": _canonical_json_sha256(
+            learner_training_recipe
+        ),
+        "learner_code_sha256": learner_code_sha256,
+        "runtime_code_tree_sha256": runtime_code_tree_sha256,
+        "producer_checkpoint_sha256": producer_sha,
+        "selected_game_seed_set_sha256": digest_fields[
+            "selected_game_seed_set_sha256"
+        ],
+        "training_game_seed_set_sha256": digest_fields[
+            "training_game_seed_set_sha256"
+        ],
+    }
+
+
+def _validate_a1_learner_objective(
+    args: argparse.Namespace, bound: dict[str, object]
+) -> None:
+    objective = bound["learner_value_objective"]
+    assert isinstance(objective, dict)
+    mode = str(getattr(args, "value_head_type", "mse"))
+    if mode == "scalar":
+        mode = "mse"
+    if mode != objective.get("objective"):
+        raise SystemExit(
+            "A1 learner objective differs from the immutable contract: "
+            f"contract={objective.get('objective')!r} cli={mode!r}"
+        )
+    expected_readout = "scalar" if mode == "mse" else "categorical"
+    if objective.get("value_readout") != expected_readout:
+        raise SystemExit("A1 learner readout differs from the immutable contract")
+    if mode == "mse":
+        if int(getattr(args, "value_categorical_bins", 0)) != 0:
+            raise SystemExit("A1 scalar learner cannot construct categorical bins")
+        scalar_weight, categorical_weight = _resolve_value_objective_weights(args)
+        if scalar_weight <= 0.0 or categorical_weight != 0.0:
+            raise SystemExit("A1 scalar learner objective weights are contradictory")
+    else:
+        expected_bins = objective.get("value_categorical_bins")
+        if int(getattr(args, "value_categorical_bins", 0)) != int(expected_bins):
+            raise SystemExit("A1 categorical bin count differs from the contract")
+        if not math.isclose(
+            float(getattr(args, "value_hlgauss_sigma_ratio", 0.0)),
+            float(objective.get("hlgauss_sigma_ratio")),
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        ):
+            raise SystemExit("A1 HL-Gauss sigma differs from the contract")
+    if getattr(args, "init_checkpoint_sha256", None) != bound[
+        "producer_checkpoint_sha256"
+    ]:
+        raise SystemExit(
+            "A1 warm-start checkpoint differs from the producer bound by the contract"
+        )
+
+
+def _effective_a1_learner_training_recipe(
+    args: argparse.Namespace, ddp: dict[str, int | bool]
+) -> dict[str, object]:
+    bound_fields = (
+        "track",
+        "vps_to_win",
+        "graph_history_features",
+        "seed",
+        "epochs",
+        "max_steps",
+        "batch_size",
+        "grad_accum_steps",
+        "optimizer",
+        "resume_optimizer",
+        "lr",
+        "lr_warmup_steps",
+        "lr_schedule",
+        "weight_decay",
+        "fused_optimizer",
+        "value_lr_mult",
+        "action_module_lr_mult",
+        "policy_loss_weight",
+        "soft_target_source",
+        "soft_target_weight",
+        "soft_target_temperature",
+        "soft_target_min_legal_coverage",
+        "value_loss_weight",
+        "value_target_lambda",
+        "value_categorical_loss_weight",
+        "hlgauss_scalar_aux_loss_weight",
+        "final_vp_loss_weight",
+        "q_loss_weight",
+        "policy_kl_anchor_weight",
+        "value_uncertainty_loss_weight",
+        "aux_subgoal_loss_weight",
+        "train_value_only",
+        "freeze_modules",
+        "policy_surprise_weight",
+        "advantage_policy_weighting",
+        "per_game_value_weight",
+        "vp_margin_weight",
+        "truncated_vp_margin_value_weight",
+        "amp",
+        "mask_hidden_info",
+        "symmetry_augment",
+        "forced_action_weight",
+        "forced_row_value_weight",
+        "winner_sample_weight",
+        "loser_sample_weight",
+        "teacher_weights",
+        "phase_weights",
+        "value_phase_weights",
+        "ddp_shard_data",
+    )
+    effective = {field: getattr(args, field) for field in bound_fields}
+    world_size = int(ddp["world_size"])
+    effective["world_size"] = world_size
+    effective["global_batch_size"] = (
+        int(args.batch_size) * int(args.grad_accum_steps) * world_size
+    )
+    return effective
+
+
+def _validate_a1_learner_training_recipe(
+    args: argparse.Namespace,
+    ddp: dict[str, int | bool],
+    bound: dict[str, object],
+) -> dict[str, object]:
+    expected = bound.get("learner_training_recipe")
+    if not isinstance(expected, dict):
+        raise SystemExit("A1 contract has no typed learner training recipe")
+    effective = _effective_a1_learner_training_recipe(args, ddp)
+    missing = set(expected) - set(effective)
+    extra = set(effective) - set(expected)
+    drift = {
+        key: {"contract": expected.get(key), "effective": effective.get(key)}
+        for key in sorted(set(expected) & set(effective))
+        if expected[key] != effective[key]
+    }
+    if missing or extra or drift:
+        raise SystemExit(
+            "A1 learner training recipe differs from the immutable one-dose "
+            "contract: "
+            f"missing={sorted(missing)} extra={sorted(extra)} drift={drift}"
+        )
+    if bound.get("learner_training_recipe_sha256") != _canonical_json_sha256(
+        effective
+    ):
+        raise SystemExit("A1 effective learner training recipe digest drift")
+    return effective
+
+
+def _resolve_effective_value_categorical_bins(args: argparse.Namespace) -> int:
+    """Resolve the fresh/resume/grow categorical-head construction contract.
+
+    ``None`` means inherit for checkpoint-backed runs and disabled for a truly
+    fresh run.  Resolving before ``TrainConfig`` construction ensures its hash
+    records the effective architecture rather than the CLI sentinel.
+    """
+
+    requested_raw = getattr(args, "value_categorical_bins", None)
+    requested = None if requested_raw is None else int(requested_raw)
+    if requested is not None and (requested < 0 or requested == 1):
+        raise SystemExit(
+            "--value-categorical-bins must be 0 (disabled) or >=2, got "
+            f"{requested}"
+        )
+    if str(args.arch) != "entity_graph":
+        if requested not in (None, 0):
+            raise SystemExit(
+                "--value-categorical-bins is only supported for --arch entity_graph"
+            )
+        return 0
+
+    init_checkpoint = str(getattr(args, "init_checkpoint", "") or "")
+    grow_checkpoint = str(getattr(args, "grow_from_checkpoint", "") or "")
+    if init_checkpoint:
+        inherited = _checkpoint_value_categorical_bins(init_checkpoint)
+        if requested is not None and requested != inherited:
+            raise SystemExit(
+                "--value-categorical-bins does not match --init-checkpoint: "
+                f"checkpoint={inherited} cli={requested}. Resume uses the checkpoint's "
+                "exact architecture; omit the flag to inherit it."
+            )
+        return inherited
+    if grow_checkpoint:
+        inherited = _checkpoint_value_categorical_bins(grow_checkpoint)
+        return inherited if requested is None else requested
+    return 0 if requested is None else requested
+
+
 def main(argv: Sequence[str] | None = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
+    # Resolve file-supplied architecture values before derived defaults and
+    # checkpoint inheritance. ``resolve_config`` calls this again later, which
+    # is idempotent; doing it here prevents a config's categorical-bin/width
+    # value from being mistaken for an omitted flag after we resolve sentinels.
+    apply_config_file(args, parser)
+
+    a1_preflight_meta: dict[str, object] | None = None
+    if args.data_format == "memmap":
+        a1_preflight_meta = _preflight_a1_memmap_metadata(
+            args.data,
+            validation_manifest_path=args.validation_game_seed_manifest or None,
+        )
+
+    validation_game_seed_ranges = _parse_game_seed_ranges(
+        args.validation_game_seed_ranges
+    )
+    validation_seed_contract: dict[str, object] | None = None
+    if args.validation_game_seed_manifest:
+        if args.data_format != "memmap":
+            raise SystemExit(
+                "--validation-game-seed-manifest is the audited A1 memmap path; "
+                "build the selected corpus first and pass --data-format memmap"
+            )
+        validation_seed_contract = _load_validation_game_seed_manifest_for_training(
+            args.validation_game_seed_manifest,
+            validation_fraction=float(args.validation_fraction),
+            validation_seed=int(args.validation_seed),
+            validation_max_samples=int(args.validation_max_samples),
+            validation_game_seed_ranges=validation_game_seed_ranges,
+        )
 
     launcher_guards.run_or_refuse(
         _build_guard_specs(args, argv if argv is not None else sys.argv[1:], parser),
@@ -1006,6 +2293,13 @@ def main(argv: Sequence[str] | None = None) -> None:
     # data load or GPU allocation).
     if int(args.grad_accum_steps) < 1:
         raise SystemExit("--grad-accum-steps must be >= 1")
+    if int(args.epochs) < 1:
+        raise SystemExit(
+            "--epochs must be >= 1; a zero-epoch run cannot produce a trained "
+            "checkpoint or value-readout provenance"
+        )
+    if int(args.max_steps) < 0:
+        raise SystemExit("--max-steps must be >= 0")
     if int(args.grad_accum_steps) > 1 and args.arch not in {"xdim_graph", "entity_graph"}:
         raise SystemExit(
             "--grad-accum-steps > 1 is only supported for --arch entity_graph/"
@@ -1020,6 +2314,17 @@ def main(argv: Sequence[str] | None = None) -> None:
         )
     if args.grow_from_checkpoint and args.arch != "entity_graph":
         raise SystemExit("--grow-from-checkpoint currently supports --arch entity_graph only")
+    args.value_categorical_bins = _resolve_effective_value_categorical_bins(args)
+    args.data_fingerprint = _training_data_fingerprint(args.data, args.data_format)
+    args.a1_memmap_payload_inventory_sha256 = (
+        None
+        if a1_preflight_meta is None
+        else a1_preflight_meta["payload_inventory_sha256"]
+    )
+    args.init_checkpoint_sha256 = _sha256_existing_file(args.init_checkpoint)
+    args.grow_from_checkpoint_sha256 = _sha256_existing_file(
+        args.grow_from_checkpoint
+    )
     ddp = _distributed_state()
     # CAT-66 typed config + config-hash. Built after --hidden-size resolution so
     # the recorded width is the effective one; registered only on rank 0 to avoid
@@ -1057,15 +2362,6 @@ def main(argv: Sequence[str] | None = None) -> None:
             raise SystemExit("--amp bf16 requested but CUDA device lacks BF16 support")
 
     _preflight_init_checkpoint_architecture(args, ddp)
-
-    if args.init_checkpoint and int(args.lr_warmup_steps) == 0:
-        _rank0_print(
-            "WARNING: --init-checkpoint is set but --lr-warmup-steps is 0. "
-            "Checkpoints do not persist optimizer state, so this resume restarts "
-            "Adam's moment estimates from zero -- training without a warmup ramp "
-            "risks catastrophic forgetting. Consider --lr-warmup-steps 500-1000.",
-            ddp,
-        )
 
     if args.skip_teacher_quality_gate:
         _rank0_print(
@@ -1107,6 +2403,36 @@ def main(argv: Sequence[str] | None = None) -> None:
         data = load_teacher_data_memmap(Path(args.data))
     else:
         data = load_teacher_data(Path(args.data), ddp=ddp, shard_data=bool(args.ddp_shard_data), mask_hidden_info=bool(getattr(args, "mask_hidden_info", False)))
+    a1_training_binding: dict[str, object] | None = None
+    if validation_seed_contract is not None:
+        _validate_a1_validation_manifest_corpus_binding(
+            getattr(data, "meta", None), validation_seed_contract
+        )
+        a1_training_binding = _validate_a1_corpus_artifacts_and_seeds(
+            getattr(data, "meta"),
+            validation_seed_contract,
+            np.asarray(data["game_seed"], dtype=np.int64),
+        )
+        _validate_a1_learner_objective(args, a1_training_binding)
+        a1_training_binding["effective_learner_training_recipe"] = (
+            _validate_a1_learner_training_recipe(args, ddp, a1_training_binding)
+        )
+        args.a1_contract_sha256 = validation_seed_contract["a1_contract_sha256"]
+        args.a1_selected_game_seed_set_sha256 = a1_training_binding[
+            "selected_game_seed_set_sha256"
+        ]
+        args.a1_training_game_seed_set_sha256 = a1_training_binding[
+            "training_game_seed_set_sha256"
+        ]
+        args.a1_learner_training_recipe_sha256 = a1_training_binding[
+            "learner_training_recipe_sha256"
+        ]
+        args.a1_learner_code_sha256 = a1_training_binding[
+            "learner_code_sha256"
+        ]
+        args.a1_runtime_code_tree_sha256 = a1_training_binding[
+            "runtime_code_tree_sha256"
+        ]
     env_config = _env_config_for_teacher_data(args, data, ddp)
     if args.trust_curated_data_quality:
         data_quality = {
@@ -1150,6 +2476,26 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "truncated_fraction": data_quality.get("truncated_fraction"),
                 "truncated_vp_margin_value_weight": truncated_vp_margin_value_weight,
                 "truncated_rows_contribute_value_signal": truncated_vp_margin_value_weight > 0.0,
+            },
+            sort_keys=True,
+        ),
+        ddp,
+    )
+    (
+        resolved_scalar_value_weight,
+        resolved_categorical_value_weight,
+    ) = _resolve_value_objective_weights(args)
+    _rank0_print(
+        json.dumps(
+            {
+                "progress": "value_objective",
+                "value_head_type": str(args.value_head_type),
+                "primary_value_loss_weight": float(args.value_loss_weight),
+                "resolved_scalar_mse_weight": resolved_scalar_value_weight,
+                "resolved_categorical_ce_weight": resolved_categorical_value_weight,
+                "hlgauss_scalar_aux_loss_weight": float(
+                    args.hlgauss_scalar_aux_loss_weight
+                ),
             },
             sort_keys=True,
         ),
@@ -1208,6 +2554,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                     seed=args.seed,
                     device=args.device,
                     value_uncertainty_head=bool(args.value_uncertainty_head),
+                    value_categorical_bins=int(args.value_categorical_bins),
                     edge_policy_head=bool(getattr(args, "edge_policy_head", False)),
                     aux_subgoal_heads=bool(getattr(args, "aux_subgoal_heads", False)),
                 )
@@ -1245,6 +2592,22 @@ def main(argv: Sequence[str] | None = None) -> None:
             )
         _enforce_35m_model_size(policy, args)
         _assert_value_heads_present_for_losses(policy.model, args)
+        if (
+            resolved_categorical_value_weight > 0.0
+            and resolved_scalar_value_weight == 0.0
+        ):
+            _set_scalar_value_head_trainable(policy.model, False)
+            _rank0_print(
+                json.dumps(
+                    {
+                        "progress": "scalar_value_head",
+                        "trainable": False,
+                        "reason": "categorical-primary with scalar auxiliary weight 0",
+                    },
+                    sort_keys=True,
+                ),
+                ddp,
+            )
         if float(args.q_loss_weight) == 0.0:
             _set_xdim_q_branch_trainable(policy.model, False)
             _rank0_print(
@@ -1363,7 +2726,10 @@ def main(argv: Sequence[str] | None = None) -> None:
         policy.model.train()
         optimizer = _make_optimizer(
             _build_optimizer_param_groups(
-                policy.model, base_lr=float(args.lr), value_lr_mult=float(args.value_lr_mult)
+                policy.model,
+                base_lr=float(args.lr),
+                value_lr_mult=float(args.value_lr_mult),
+                action_module_lr_mult=float(args.action_module_lr_mult),
             ),
             args,
             getattr(policy, "device", args.device),
@@ -1380,12 +2746,41 @@ def main(argv: Sequence[str] | None = None) -> None:
     # champion and any --grow-from-checkpoint arm have no matching sidecar, so this
     # returns False and training proceeds with a fresh optimizer -- the expected first
     # fine-tune behaviour; the win is on resuming a run this code started.
-    if args.init_checkpoint:
+    optimizer_restored = False
+    if args.init_checkpoint and bool(args.resume_optimizer):
         from catan_zero.rl.optim_state import load_optimizer_state
 
-        restored = load_optimizer_state(args.init_checkpoint, policy.model, optimizer, ddp)
+        optimizer_restored = bool(
+            load_optimizer_state(args.init_checkpoint, policy.model, optimizer, ddp)
+        )
         _rank0_print(
-            json.dumps({"progress": "optimizer_resume", "restored": bool(restored)}, sort_keys=True),
+            json.dumps(
+                {"progress": "optimizer_resume", "restored": optimizer_restored},
+                sort_keys=True,
+            ),
+            ddp,
+        )
+    elif args.init_checkpoint:
+        _rank0_print(
+            json.dumps(
+                {
+                    "progress": "optimizer_resume",
+                    "restored": False,
+                    "disabled": True,
+                },
+                sort_keys=True,
+            ),
+            ddp,
+        )
+    if (
+        args.init_checkpoint
+        and not optimizer_restored
+        and int(args.lr_warmup_steps) == 0
+    ):
+        _rank0_print(
+            "WARNING: warm-starting with fresh optimizer moments and "
+            "--lr-warmup-steps 0 risks catastrophic forgetting; consider a "
+            "500-1000 step warmup.",
             ddp,
         )
 
@@ -1446,17 +2841,90 @@ def main(argv: Sequence[str] | None = None) -> None:
         weight_scale=args.policy_surprise_weight,
         cap=args.policy_surprise_cap,
     )
-    validation_game_seed_ranges = _parse_game_seed_ranges(args.validation_game_seed_ranges)
     split = split_train_validation_indices(
         data,
         validation_fraction=args.validation_fraction,
         validation_seed=args.validation_seed,
         validation_max_samples=args.validation_max_samples,
         validation_game_seed_ranges=validation_game_seed_ranges,
+        validation_game_seeds=(
+            None
+            if validation_seed_contract is None
+            else np.asarray(validation_seed_contract["game_seeds"], dtype=np.int64)
+        ),
         allow_missing_game_seed=bool(args.allow_missing_game_seed_validation_split),
     )
     train_indices = split["train"]
     validation_indices = split["validation"]
+    if len(train_indices) == 0:
+        raise SystemExit(
+            "training split is empty; refusing to save a checkpoint that could "
+            "falsely attest a value readout without any optimizer update"
+        )
+    validation_seed_manifest_path: Path | None = None
+    validation_seed_set_sha256 = ""
+    validation_game_seed_count = 0
+    if "game_seed" in data:
+        all_game_seeds = np.asarray(data["game_seed"], dtype=np.int64)
+        held_out_game_seeds = np.sort(
+            np.unique(all_game_seeds[validation_indices])
+        ).astype(np.int64, copy=False)
+        validation_game_seed_count = int(len(held_out_game_seeds))
+        validation_seed_set_sha256 = _game_seed_set_sha256(held_out_game_seeds)
+        if validation_seed_contract is not None:
+            if (
+                validation_seed_set_sha256
+                != validation_seed_contract["validation_game_seed_set_sha256"]
+            ):
+                raise SystemExit(
+                    "trainer validation seed set differs from the immutable A1 "
+                    "validation manifest"
+                )
+            if int(len(validation_indices)) != int(
+                validation_seed_contract["validation_row_count"]
+            ):
+                raise SystemExit(
+                    "trainer validation row count differs from the immutable A1 "
+                    "validation manifest: "
+                    f"trainer={len(validation_indices)} "
+                    f"manifest={validation_seed_contract['validation_row_count']}"
+                )
+        validation_seed_manifest_path = Path(args.report).with_suffix(
+            ".validation_seeds.json"
+        )
+        if int(ddp["rank"]) == 0:
+            write_json(
+                validation_seed_manifest_path,
+                {
+                    "schema_version": "train-validation-game-seeds-v1",
+                    "data": str(args.data),
+                    "data_fingerprint": str(args.data_fingerprint),
+                    "validation_fraction": float(args.validation_fraction),
+                    "validation_seed": int(args.validation_seed),
+                    "validation_max_samples": int(args.validation_max_samples),
+                    "validation_game_seed_ranges": (
+                        validation_game_seed_ranges or []
+                    ),
+                    "validation_game_seed_count": validation_game_seed_count,
+                    "validation_game_seed_set_sha256": validation_seed_set_sha256,
+                    **(
+                        {
+                            "a1_contract_sha256": validation_seed_contract[
+                                "a1_contract_sha256"
+                            ],
+                            "input_validation_game_seed_manifest": str(
+                                validation_seed_contract["path"]
+                            ),
+                            "input_validation_game_seed_manifest_sha256": (
+                                validation_seed_contract["file_sha256"]
+                            ),
+                        }
+                        if validation_seed_contract is not None
+                        else {}
+                    ),
+                    "game_seeds": [int(seed) for seed in held_out_game_seeds],
+                },
+            )
     epoch_sample_weights = (
         policy_surprise_weights_full[train_indices]
         if float(args.policy_surprise_weight) > 0.0
@@ -1488,6 +2956,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     )
     first_batch_profile = None
     global_step = 0
+    cumulative_scalar_training_weight = 0.0
+    cumulative_categorical_training_weight = 0.0
     total_training_steps = int(args.max_steps) if int(args.max_steps) > 0 else 0
     # C1 gradient accumulation. accum==1 (default) preserves the pre-C1 path
     # exactly: every micro-batch zero-grads, backwards the undivided loss, clips,
@@ -1508,6 +2978,12 @@ def main(argv: Sequence[str] | None = None) -> None:
             "value_loss": 0.0,
             "final_vp_loss": 0.0,
             "q_loss": 0.0,
+            "policy_kl_anchor_loss": 0.0,
+            "value_uncertainty_loss": 0.0,
+            "aux_subgoal_loss": 0.0,
+            "value_categorical_loss": 0.0,
+            "value_categorical_clean_loss": 0.0,
+            "value_categorical_truncated_loss": 0.0,
             "q_score_rows_ge2": 0.0,
             "soft_distillation_rows": 0.0,
             "advantage_weight_rows": 0.0,
@@ -1519,6 +2995,12 @@ def main(argv: Sequence[str] | None = None) -> None:
             "value_loss": 0.0,
             "final_vp_loss": 0.0,
             "q_loss": 0.0,
+            "policy_kl_anchor_loss": 0.0,
+            "value_uncertainty_loss": 0.0,
+            "aux_subgoal_loss": 0.0,
+            "value_categorical_loss": 0.0,
+            "value_categorical_clean_loss": 0.0,
+            "value_categorical_truncated_loss": 0.0,
         }
         epoch_acc = []
         epoch_top3 = []
@@ -1552,17 +3034,11 @@ def main(argv: Sequence[str] | None = None) -> None:
         # does not accept them, so only forward them when the xdim trainer is active.
         train_fn_extra_kwargs: dict[str, float] = {}
         if train_fn is _train_xdim_batch:
-            # CAT-39: resolve the categorical CE weight. In hlgauss mode a 0 weight
-            # falls back to the scalar value-loss weight so the primary head trains;
-            # in mse mode it stays 0 (pure no-op, current behaviour untouched).
-            resolved_categorical_weight = float(args.value_categorical_loss_weight)
-            if str(args.value_head_type) == "hlgauss" and resolved_categorical_weight == 0.0:
-                resolved_categorical_weight = float(args.value_loss_weight)
             train_fn_extra_kwargs = {
                 "policy_kl_anchor_weight": float(args.policy_kl_anchor_weight),
                 "value_uncertainty_loss_weight": float(args.value_uncertainty_loss_weight),
                 "aux_subgoal_loss_weight": float(args.aux_subgoal_loss_weight),
-                "value_categorical_loss_weight": resolved_categorical_weight,
+                "value_categorical_loss_weight": resolved_categorical_value_weight,
                 "value_hlgauss_sigma_ratio": float(args.value_hlgauss_sigma_ratio),
                 "value_target_lambda": float(args.value_target_lambda),
             }
@@ -1622,7 +3098,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 args.soft_target_source,
                 args.soft_target_min_legal_coverage,
                 args.policy_loss_weight,
-                args.value_loss_weight,
+                resolved_scalar_value_weight,
                 args.final_vp_loss_weight,
                 args.q_loss_weight,
                 _parse_prefixes(args.q_skip_teacher_prefixes),
@@ -1667,7 +3143,18 @@ def main(argv: Sequence[str] | None = None) -> None:
             epoch_acc.append(accuracy * active_count)
             epoch_top3.append(float(batch_metrics["top3_accuracy"]) * active_count)
             epoch_active_count += active_count
-            for key in ("policy_loss", "value_loss", "final_vp_loss", "q_loss"):
+            for key in (
+                "policy_loss",
+                "value_loss",
+                "final_vp_loss",
+                "q_loss",
+                "policy_kl_anchor_loss",
+                "value_uncertainty_loss",
+                "aux_subgoal_loss",
+                "value_categorical_loss",
+                "value_categorical_clean_loss",
+                "value_categorical_truncated_loss",
+            ):
                 weighted_sum_key = f"{key}_weighted_sum"
                 weight_sum_key = f"{key}_weight_sum"
                 if weighted_sum_key in batch_metrics and weight_sum_key in batch_metrics:
@@ -1729,6 +3216,12 @@ def main(argv: Sequence[str] | None = None) -> None:
         top3_sum = float(np.sum(epoch_top3)) if epoch_top3 else 0.0
         epoch_extra_sums = _reduce_named_sums(epoch_extra_sums, ddp)
         epoch_extra_denominators = _reduce_named_sums(epoch_extra_denominators, ddp)
+        cumulative_scalar_training_weight += float(
+            epoch_extra_denominators["value_loss"]
+        )
+        cumulative_categorical_training_weight += float(
+            epoch_extra_denominators["value_categorical_loss"]
+        )
         loss_sum, acc_sum, top3_sum, total_count = _reduce_epoch_metrics(
             loss_sum,
             acc_sum,
@@ -1749,21 +3242,68 @@ def main(argv: Sequence[str] | None = None) -> None:
         q_loss_epoch = _metric_from_sum_denominator(
             epoch_extra_sums["q_loss"], epoch_extra_denominators["q_loss"]
         )
-        loss_epoch = (
-            policy_loss_epoch
-            + float(args.value_loss_weight) * value_loss_epoch
+        auxiliary_loss_epochs = {
+            key: _metric_from_sum_denominator(
+                epoch_extra_sums[key], epoch_extra_denominators[key]
+            )
+            for key in (
+                "policy_kl_anchor_loss",
+                "value_uncertainty_loss",
+                "aux_subgoal_loss",
+                "value_categorical_loss",
+            )
+        }
+        categorical_breakdown_epochs = {
+            key: _metric_from_sum_denominator(
+                epoch_extra_sums[key], epoch_extra_denominators[key]
+            )
+            for key in (
+                "value_categorical_clean_loss",
+                "value_categorical_truncated_loss",
+            )
+        }
+        # This is the objective that actually went through backward(), including
+        # optional categorical/auxiliary terms and non-unit policy weights.  The
+        # old component reconstruction omitted all of those terms and therefore
+        # made HL-Gauss/aux runs look artificially cheap in their reports.
+        loss_epoch = loss_sum / max(total_count, 1.0)
+        component_reconstructed_loss = (
+            float(args.policy_loss_weight) * policy_loss_epoch
+            + resolved_scalar_value_weight * value_loss_epoch
             + float(args.final_vp_loss_weight) * final_vp_loss_epoch
             + float(args.q_loss_weight) * q_loss_epoch
+            + float(args.policy_kl_anchor_weight)
+            * auxiliary_loss_epochs["policy_kl_anchor_loss"]
+            + float(args.value_uncertainty_loss_weight)
+            * auxiliary_loss_epochs["value_uncertainty_loss"]
+            + float(args.aux_subgoal_loss_weight)
+            * auxiliary_loss_epochs["aux_subgoal_loss"]
+            + resolved_categorical_value_weight
+            * auxiliary_loss_epochs["value_categorical_loss"]
         )
         metrics.append(
             {
                 "epoch": epoch + 1,
                 "loss": loss_epoch,
-                "raw_batch_mean_loss": loss_sum / max(total_count, 1.0),
+                "raw_batch_mean_loss": loss_epoch,
+                "component_reconstructed_loss": component_reconstructed_loss,
                 "policy_loss": policy_loss_epoch,
                 "value_loss": value_loss_epoch,
+                "scalar_value_mse_diagnostic": value_loss_epoch,
                 "final_vp_loss": final_vp_loss_epoch,
                 "q_loss": q_loss_epoch,
+                **auxiliary_loss_epochs,
+                **categorical_breakdown_epochs,
+                "primary_value_loss": (
+                    auxiliary_loss_epochs["value_categorical_loss"]
+                    if resolved_categorical_value_weight > 0.0
+                    else value_loss_epoch
+                ),
+                "primary_value_loss_kind": (
+                    "hlgauss_ce"
+                    if resolved_categorical_value_weight > 0.0
+                    else "scalar_mse"
+                ),
                 "loss_denominators": dict(epoch_extra_denominators),
                 "q_score_rows_ge2": int(round(epoch_extra_sums["q_score_rows_ge2"])),
                 "q_score_rows_ge2_fraction": epoch_extra_sums["q_score_rows_ge2"] / max(total_count, 1.0),
@@ -1798,7 +3338,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             args.soft_target_source,
             args.soft_target_min_legal_coverage,
             args.policy_loss_weight,
-            args.value_loss_weight,
+            resolved_scalar_value_weight,
             args.final_vp_loss_weight,
             args.q_loss_weight,
             _parse_prefixes(args.q_skip_teacher_prefixes),
@@ -1811,6 +3351,12 @@ def main(argv: Sequence[str] | None = None) -> None:
             args.amp,
             data_sharded=bool(args.ddp_shard_data),
             truncated_vp_margin_value_weight=args.truncated_vp_margin_value_weight,
+            policy_kl_anchor_weight=float(args.policy_kl_anchor_weight),
+            value_uncertainty_loss_weight=float(args.value_uncertainty_loss_weight),
+            aux_subgoal_loss_weight=float(args.aux_subgoal_loss_weight),
+            value_categorical_loss_weight=resolved_categorical_value_weight,
+            value_hlgauss_sigma_ratio=float(args.value_hlgauss_sigma_ratio),
+            value_target_lambda=float(args.value_target_lambda),
         )
         metrics[-1]["validation"] = validation_metrics
         _rank0_print(
@@ -1830,12 +3376,28 @@ def main(argv: Sequence[str] | None = None) -> None:
             # Called on every rank: _save_policy writes on rank 0 for DDP/single
             # and runs the collective full-state-dict gather (all ranks) for FSDP.
             epoch_path = _epoch_checkpoint_path(args.checkpoint, epoch + 1)
+            checkpoint_model = getattr(policy.model, "module", policy.model)
+            value_training = _value_training_metadata(
+                args,
+                scalar_weight=resolved_scalar_value_weight,
+                categorical_weight=resolved_categorical_value_weight,
+                categorical_bins=int(
+                    getattr(checkpoint_model, "value_categorical_bins", 0) or 0
+                ),
+                optimizer_steps=global_step,
+                completed_epochs=epoch + 1,
+                scalar_training_weight_sum=cumulative_scalar_training_weight,
+                categorical_training_weight_sum=(
+                    cumulative_categorical_training_weight
+                ),
+            )
             _save_policy(
                 policy,
                 str(epoch_path),
                 ddp,
                 mask_hidden_info=bool(args.mask_hidden_info),
                 soft_target_source=args.soft_target_source,
+                value_training=value_training,
             )
             # CAT-128 patch #8: persist optimizer (Adam) state as <ckpt>.optimizer.pt.
             # Called on ALL ranks (the FSDP gather is a collective); rank-0 writes.
@@ -1846,12 +3408,43 @@ def main(argv: Sequence[str] | None = None) -> None:
     # collective full-state-dict gather for FSDP (C1). MUST stay unconditional --
     # the FSDP gather is collective, so wrapping in `if rank==0` would deadlock/skip
     # it. OPT-8 soft_target_source provenance kwarg threaded in (recorded in metadata).
+    checkpoint_model = getattr(policy.model, "module", policy.model)
+    value_training = _value_training_metadata(
+        args,
+        scalar_weight=resolved_scalar_value_weight,
+        categorical_weight=resolved_categorical_value_weight,
+        categorical_bins=int(
+            getattr(checkpoint_model, "value_categorical_bins", 0) or 0
+        ),
+        optimizer_steps=global_step,
+        completed_epochs=len(metrics),
+        scalar_training_weight_sum=cumulative_scalar_training_weight,
+        categorical_training_weight_sum=(
+            cumulative_categorical_training_weight
+        ),
+    )
+    trained_value_readouts = set(value_training["trained_value_readouts"])
+    if (
+        resolved_categorical_value_weight > 0.0
+        and "categorical" not in trained_value_readouts
+    ):
+        raise RuntimeError(
+            "HL-Gauss objective completed without any effective categorical "
+            "training mass and optimizer update; refusing to save a checkpoint "
+            "that could be mistaken for a trained categorical readout"
+        )
+    if resolved_scalar_value_weight > 0.0 and "scalar" not in trained_value_readouts:
+        raise RuntimeError(
+            "scalar-MSE objective completed without any effective value training "
+            "mass and optimizer update; refusing to save false provenance"
+        )
     _save_policy(
         policy,
         args.checkpoint,
         ddp,
         mask_hidden_info=bool(args.mask_hidden_info),
         soft_target_source=args.soft_target_source,
+        value_training=value_training,
     )
     # CAT-128 patch #8: persist final optimizer (Adam) state alongside the checkpoint.
     _save_optimizer_sidecar(args.checkpoint, policy, optimizer, ddp)
@@ -1878,10 +3471,73 @@ def main(argv: Sequence[str] | None = None) -> None:
         "seed": int(args.seed),
         "symmetry_augment": bool(args.symmetry_augment),
         "data": str(args.data),
+        "data_fingerprint": str(args.data_fingerprint),
         "data_format": args.data_format,
         "track": args.track,
         "vps_to_win": int(args.vps_to_win),
         "validation_game_seed_ranges": validation_game_seed_ranges or None,
+        "validation_game_seed_manifest": (
+            str(validation_seed_manifest_path)
+            if validation_seed_manifest_path is not None
+            else None
+        ),
+        "input_validation_game_seed_manifest": (
+            None
+            if validation_seed_contract is None
+            else str(validation_seed_contract["path"])
+        ),
+        "input_validation_game_seed_manifest_sha256": (
+            None
+            if validation_seed_contract is None
+            else validation_seed_contract["file_sha256"]
+        ),
+        "a1_contract_sha256": (
+            None
+            if validation_seed_contract is None
+            else validation_seed_contract["a1_contract_sha256"]
+        ),
+        "a1_selected_game_seed_set_sha256": (
+            None
+            if a1_training_binding is None
+            else a1_training_binding["selected_game_seed_set_sha256"]
+        ),
+        "a1_training_game_seed_set_sha256": (
+            None
+            if a1_training_binding is None
+            else a1_training_binding["training_game_seed_set_sha256"]
+        ),
+        "a1_bound_learner_value_objective": (
+            None
+            if a1_training_binding is None
+            else a1_training_binding["learner_value_objective"]
+        ),
+        "a1_bound_learner_training_recipe": (
+            None
+            if a1_training_binding is None
+            else a1_training_binding["learner_training_recipe"]
+        ),
+        "a1_learner_training_recipe_sha256": (
+            None
+            if a1_training_binding is None
+            else a1_training_binding["learner_training_recipe_sha256"]
+        ),
+        "a1_memmap_payload_inventory_sha256": (
+            None
+            if a1_training_binding is None
+            else args.a1_memmap_payload_inventory_sha256
+        ),
+        "a1_learner_code_sha256": (
+            None
+            if a1_training_binding is None
+            else a1_training_binding["learner_code_sha256"]
+        ),
+        "a1_runtime_code_tree_sha256": (
+            None
+            if a1_training_binding is None
+            else a1_training_binding["runtime_code_tree_sha256"]
+        ),
+        "validation_game_seed_count": validation_game_seed_count,
+        "validation_game_seed_set_sha256": validation_seed_set_sha256 or None,
         "allow_missing_game_seed_validation_split": bool(
             args.allow_missing_game_seed_validation_split
         ),
@@ -1890,6 +3546,13 @@ def main(argv: Sequence[str] | None = None) -> None:
         ),
         "checkpoint": args.checkpoint,
         "init_checkpoint": args.init_checkpoint or None,
+        "init_checkpoint_sha256": str(args.init_checkpoint_sha256) or None,
+        "grow_from_checkpoint_sha256": (
+            str(args.grow_from_checkpoint_sha256) or None
+        ),
+        "resume_optimizer": bool(args.resume_optimizer),
+        "optimizer_restored": bool(optimizer_restored),
+        "grow_from_checkpoint": args.grow_from_checkpoint or None,
         "metrics": metrics,
         "data_quality": data_quality,
         "sample_weight_quality": policy_sample_weight_report,
@@ -1922,6 +3585,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         "soft_target_min_legal_coverage": args.soft_target_min_legal_coverage,
         "policy_loss_weight": args.policy_loss_weight,
         "value_loss_weight": args.value_loss_weight,
+        "action_module_lr_mult": args.action_module_lr_mult,
+        "resolved_scalar_value_loss_weight": resolved_scalar_value_weight,
         "truncated_vp_margin_value_weight": float(args.truncated_vp_margin_value_weight),
         "final_vp_loss_weight": args.final_vp_loss_weight,
         "q_loss_weight": args.q_loss_weight,
@@ -1929,7 +3594,11 @@ def main(argv: Sequence[str] | None = None) -> None:
         "value_uncertainty_loss_weight": args.value_uncertainty_loss_weight,
         "aux_subgoal_loss_weight": args.aux_subgoal_loss_weight,
         "value_head_type": args.value_head_type,
+        "value_categorical_bins": int(args.value_categorical_bins),
         "value_categorical_loss_weight": args.value_categorical_loss_weight,
+        "resolved_categorical_value_loss_weight": resolved_categorical_value_weight,
+        "hlgauss_scalar_aux_loss_weight": args.hlgauss_scalar_aux_loss_weight,
+        "value_training": value_training,
         "value_hlgauss_sigma_ratio": args.value_hlgauss_sigma_ratio,
         "value_target_lambda": args.value_target_lambda,
         "edge_policy_head": bool(getattr(args, "edge_policy_head", False)),
@@ -2557,9 +4226,20 @@ def _train_xdim_batch(
         # HL-Gauss categorical value head (CAT-39): cross-entropy against a
         # Gaussian-smeared win-loss target, with truncated rows routed to the
         # dedicated truncation class (R9 support = win/loss + truncation ONLY;
-        # VP-margin lives on the separate aux head). The scalar-MSE head above is
-        # trained IN PARALLEL as the control arm and is untouched by this term.
+        # VP-margin lives on the separate aux head). In HL-Gauss mode the scalar
+        # head above is diagnostic-only unless the explicit scalar-aux weight is
+        # nonzero; the matched MSE control is a separate run.
         value_categorical_loss = torch.tensor(0.0, dtype=torch.float32, device=policy.device)
+        value_categorical_loss_sum, value_categorical_loss_denominator = (
+            _zero_loss_parts(policy.device)
+        )
+        value_categorical_clean_loss_sum, value_categorical_clean_loss_denominator = (
+            _zero_loss_parts(policy.device)
+        )
+        (
+            value_categorical_truncated_loss_sum,
+            value_categorical_truncated_loss_denominator,
+        ) = _zero_loss_parts(policy.device)
         if (
             float(value_categorical_loss_weight) != 0.0
             and "value_categorical_logits" in outputs
@@ -2603,13 +4283,51 @@ def _train_xdim_batch(
             cat_log_probs = torch.nn.functional.log_softmax(cat_logits, dim=-1)
             cat_ce = -(cat_targets * cat_log_probs).sum(dim=-1)
             # Trainable rows: a real outcome OR a truncation label (both are
-            # certain, confidence 1.0). Rows with neither are masked out.
+            # explicit labels). Rows with neither are masked out. Match the
+            # historical MSE arm's truncation mass so the tournament does not
+            # silently give categorical truncations 4x the default weight.
             cat_mask = has_outcome | truncated_mask if has_trunc_class else has_outcome
-            value_categorical_loss = _weighted_mean_loss(
+            categorical_value_weights = value_weights * torch.where(
+                truncated_mask,
+                torch.full_like(
+                    value_weights, float(truncated_vp_margin_value_weight)
+                ),
+                torch.ones_like(value_weights),
+            )
+            (
+                value_categorical_loss_sum,
+                value_categorical_loss_denominator,
+            ) = _weighted_loss_parts(
                 cat_ce,
-                value_weights,
+                categorical_value_weights,
                 mask=cat_mask,
             )
+            # Training must use the same DDP-global denominator semantics as
+            # scalar MSE/policy CE.  The local parts above are telemetry only;
+            # averaging local rank means would bias gradients whenever masks or
+            # per-game weights differ across ranks.
+            value_categorical_loss = _weighted_mean_loss(
+                cat_ce,
+                categorical_value_weights,
+                mask=cat_mask,
+            )
+            (
+                value_categorical_clean_loss_sum,
+                value_categorical_clean_loss_denominator,
+            ) = _weighted_loss_parts(
+                cat_ce,
+                categorical_value_weights,
+                mask=has_outcome & ~truncated_mask,
+            )
+            if has_trunc_class:
+                (
+                    value_categorical_truncated_loss_sum,
+                    value_categorical_truncated_loss_denominator,
+                ) = _weighted_loss_parts(
+                    cat_ce,
+                    categorical_value_weights,
+                    mask=truncated_mask,
+                )
         # CAT-100 auxiliary subgoal heads (longest-road/largest-army/VP-in-N/
         # next-settlement/robber-target). No-op unless the weight is nonzero AND
         # the model has the heads AND the corpus has the target fields.
@@ -2709,6 +4427,17 @@ def _train_xdim_batch(
         "aux_subgoal_loss": float(aux_subgoal_loss.item()),
         "aux_subgoal_active_heads": int(aux_subgoal_active_heads),
         "value_categorical_loss": float(value_categorical_loss.item()),
+        "primary_value_loss": float(
+            value_categorical_loss.item()
+            if float(value_categorical_loss_weight) > 0.0
+            else value_loss.item()
+        ),
+        "primary_value_loss_kind": (
+            "hlgauss_ce"
+            if float(value_categorical_loss_weight) > 0.0
+            else "scalar_mse"
+        ),
+        "scalar_value_mse_diagnostic": float(value_loss.item()),
         "policy_loss_weighted_sum": float(policy_loss_sum.item()),
         "policy_loss_weight_sum": float(policy_loss_denominator.item()),
         "value_loss_weighted_sum": float(value_loss_sum.item()),
@@ -2717,6 +4446,24 @@ def _train_xdim_batch(
         "final_vp_loss_weight_sum": float(final_vp_loss_denominator.item()),
         "q_loss_weighted_sum": float(q_loss_sum.item()),
         "q_loss_weight_sum": float(q_loss_denominator.item()),
+        "value_categorical_loss_weighted_sum": float(
+            value_categorical_loss_sum.item()
+        ),
+        "value_categorical_loss_weight_sum": float(
+            value_categorical_loss_denominator.item()
+        ),
+        "value_categorical_clean_loss_weighted_sum": float(
+            value_categorical_clean_loss_sum.item()
+        ),
+        "value_categorical_clean_loss_weight_sum": float(
+            value_categorical_clean_loss_denominator.item()
+        ),
+        "value_categorical_truncated_loss_weighted_sum": float(
+            value_categorical_truncated_loss_sum.item()
+        ),
+        "value_categorical_truncated_loss_weight_sum": float(
+            value_categorical_truncated_loss_denominator.item()
+        ),
         "q_score_rows_ge2": q_score_rows_ge2,
         **advantage_stats,
         "soft_distillation_rows": int(has_soft.sum().item()) if soft_targets is not None else 0,
@@ -2755,6 +4502,12 @@ def evaluate_bc_batches(
     *,
     data_sharded: bool = False,
     truncated_vp_margin_value_weight: float = 0.0,
+    policy_kl_anchor_weight: float = 0.0,
+    value_uncertainty_loss_weight: float = 0.0,
+    aux_subgoal_loss_weight: float = 0.0,
+    value_categorical_loss_weight: float = 0.0,
+    value_hlgauss_sigma_ratio: float = 0.75,
+    value_target_lambda: float = 1.0,
 ) -> dict:
     if len(indices) == 0:
         return {}
@@ -2769,6 +4522,12 @@ def evaluate_bc_batches(
             "value_loss": 0.0,
             "final_vp_loss": 0.0,
             "q_loss": 0.0,
+            "policy_kl_anchor_loss": 0.0,
+            "value_uncertainty_loss": 0.0,
+            "aux_subgoal_loss": 0.0,
+            "value_categorical_loss": 0.0,
+            "value_categorical_clean_loss": 0.0,
+            "value_categorical_truncated_loss": 0.0,
             "q_score_rows_ge2": 0.0,
             "soft_distillation_rows": 0.0,
             "soft_distillation_active_rows": 0.0,
@@ -2784,6 +4543,12 @@ def evaluate_bc_batches(
             "value_loss": 0.0,
             "final_vp_loss": 0.0,
             "q_loss": 0.0,
+            "policy_kl_anchor_loss": 0.0,
+            "value_uncertainty_loss": 0.0,
+            "aux_subgoal_loss": 0.0,
+            "value_categorical_loss": 0.0,
+            "value_categorical_clean_loss": 0.0,
+            "value_categorical_truncated_loss": 0.0,
         }
         acc_sum = 0.0
         top3_sum = 0.0
@@ -2793,6 +4558,16 @@ def evaluate_bc_batches(
         phase_stats_unforced = _empty_phase_stats()
         teacher_stats = _empty_phase_stats()
         eval_fn = _eval_xdim_batch if hasattr(policy, "forward_legal_np") else _eval_candidate_batch
+        eval_fn_extra_kwargs: dict[str, float] = {}
+        if eval_fn is _eval_xdim_batch:
+            eval_fn_extra_kwargs = {
+                "policy_kl_anchor_weight": float(policy_kl_anchor_weight),
+                "value_uncertainty_loss_weight": float(value_uncertainty_loss_weight),
+                "aux_subgoal_loss_weight": float(aux_subgoal_loss_weight),
+                "value_categorical_loss_weight": float(value_categorical_loss_weight),
+                "value_hlgauss_sigma_ratio": float(value_hlgauss_sigma_ratio),
+                "value_target_lambda": float(value_target_lambda),
+            }
         for start_idx in range(0, len(eval_indices), batch_size):
             batch = eval_indices[start_idx : start_idx + batch_size]
             if len(batch) == 0:
@@ -2819,9 +4594,21 @@ def evaluate_bc_batches(
                 advantage_weight_floor,
                 amp,
                 truncated_vp_margin_value_weight=truncated_vp_margin_value_weight,
+                **eval_fn_extra_kwargs,
             )
             loss_sum += float(batch_metrics["loss"]) * len(batch)
-            for key in ("policy_loss", "value_loss", "final_vp_loss", "q_loss"):
+            for key in (
+                "policy_loss",
+                "value_loss",
+                "final_vp_loss",
+                "q_loss",
+                "policy_kl_anchor_loss",
+                "value_uncertainty_loss",
+                "aux_subgoal_loss",
+                "value_categorical_loss",
+                "value_categorical_clean_loss",
+                "value_categorical_truncated_loss",
+            ):
                 weighted_sum_key = f"{key}_weighted_sum"
                 weight_sum_key = f"{key}_weight_sum"
                 if weighted_sum_key in batch_metrics and weight_sum_key in batch_metrics:
@@ -2888,20 +4675,62 @@ def evaluate_bc_batches(
         q_loss_eval = _metric_from_sum_denominator(
             extra_sums["q_loss"], extra_denominators["q_loss"]
         )
-        loss_eval = (
-            policy_loss_eval
+        auxiliary_loss_eval = {
+            key: _metric_from_sum_denominator(
+                extra_sums[key], extra_denominators[key]
+            )
+            for key in (
+                "policy_kl_anchor_loss",
+                "value_uncertainty_loss",
+                "aux_subgoal_loss",
+                "value_categorical_loss",
+            )
+        }
+        categorical_breakdown_eval = {
+            key: _metric_from_sum_denominator(
+                extra_sums[key], extra_denominators[key]
+            )
+            for key in (
+                "value_categorical_clean_loss",
+                "value_categorical_truncated_loss",
+            )
+        }
+        loss_eval = loss_sum / max(total_count, 1.0)
+        component_reconstructed_loss = (
+            float(policy_loss_weight) * policy_loss_eval
             + float(value_loss_weight) * value_loss_eval
             + float(final_vp_loss_weight) * final_vp_loss_eval
             + float(q_loss_weight) * q_loss_eval
+            + float(policy_kl_anchor_weight)
+            * auxiliary_loss_eval["policy_kl_anchor_loss"]
+            + float(value_uncertainty_loss_weight)
+            * auxiliary_loss_eval["value_uncertainty_loss"]
+            + float(aux_subgoal_loss_weight) * auxiliary_loss_eval["aux_subgoal_loss"]
+            + float(value_categorical_loss_weight)
+            * auxiliary_loss_eval["value_categorical_loss"]
         )
         return {
             "samples": int(total_count),
             "loss": loss_eval,
-            "raw_batch_mean_loss": loss_sum / max(total_count, 1.0),
+            "raw_batch_mean_loss": loss_eval,
+            "component_reconstructed_loss": component_reconstructed_loss,
             "policy_loss": policy_loss_eval,
             "value_loss": value_loss_eval,
+            "scalar_value_mse_diagnostic": value_loss_eval,
             "final_vp_loss": final_vp_loss_eval,
             "q_loss": q_loss_eval,
+            **auxiliary_loss_eval,
+            **categorical_breakdown_eval,
+            "primary_value_loss": (
+                auxiliary_loss_eval["value_categorical_loss"]
+                if float(value_categorical_loss_weight) > 0.0
+                else value_loss_eval
+            ),
+            "primary_value_loss_kind": (
+                "hlgauss_ce"
+                if float(value_categorical_loss_weight) > 0.0
+                else "scalar_mse"
+            ),
             "loss_denominators": dict(extra_denominators),
             "q_score_rows_ge2": int(round(extra_sums["q_score_rows_ge2"])),
             "q_score_rows_ge2_fraction": extra_sums["q_score_rows_ge2"] / max(total_count, 1.0),
@@ -3198,6 +5027,12 @@ def _eval_xdim_batch(
     amp: str = "none",
     *,
     truncated_vp_margin_value_weight: float = 0.0,
+    policy_kl_anchor_weight: float = 0.0,
+    value_uncertainty_loss_weight: float = 0.0,
+    aux_subgoal_loss_weight: float = 0.0,
+    value_categorical_loss_weight: float = 0.0,
+    value_hlgauss_sigma_ratio: float = 0.75,
+    value_target_lambda: float = 1.0,
 ) -> dict:
     import torch
     from torch import nn
@@ -3260,6 +5095,32 @@ def _eval_xdim_batch(
                 vps_to_win,
                 truncated_vp_margin_value_weight=truncated_vp_margin_value_weight,
             )
+            truncated_mask = torch.as_tensor(
+                np.asarray(
+                    data.get(
+                        "truncated",
+                        np.zeros(len(data["action_taken"]), dtype=np.bool_),
+                    )[batch],
+                    dtype=np.bool_,
+                ),
+                dtype=torch.bool,
+                device=policy.device,
+            )
+            root_value, root_value_mask = _root_value_targets(
+                data, batch, policy.device
+            )
+            if (
+                float(value_target_lambda) != 1.0
+                and value_outcome_targets is not None
+                and root_value is not None
+            ):
+                lam = float(value_target_lambda)
+                blend_rows = root_value_mask & value_has_outcome
+                value_outcome_targets = torch.where(
+                    blend_rows,
+                    lam * value_outcome_targets + (1.0 - lam) * root_value,
+                    value_outcome_targets,
+                )
             # Advantage reweighting stays on the policy-safe (unfilled) outcome/has_outcome --
             # FIX F3 is scoped to the value head only, must not leak into POLICY weighting.
             policy_weights, advantage_stats = _advantage_reweighted_policy_weights(
@@ -3309,11 +5170,144 @@ def _eval_xdim_batch(
                     policy.device,
                     q_skip_teacher_prefixes=q_skip_teacher_prefixes,
                 )
+            kl_anchor_loss = torch.tensor(
+                0.0, dtype=torch.float32, device=policy.device
+            )
+            if float(policy_kl_anchor_weight) != 0.0:
+                anchor = _policy_kl_anchor_loss(
+                    data, batch, outputs["logits"], policy.device
+                )
+                if anchor is not None:
+                    kl_anchor_loss = anchor
+            value_uncertainty_loss = torch.tensor(
+                0.0, dtype=torch.float32, device=policy.device
+            )
+            if (
+                float(value_uncertainty_loss_weight) != 0.0
+                and "value_uncertainty" in outputs
+                and value_outcome_targets is not None
+                and "value" in outputs
+            ):
+                uncertainty_target = (
+                    value_outcome_targets - outputs["value"].detach()
+                ) ** 2
+                uncertainty_error = nn.functional.smooth_l1_loss(
+                    outputs["value_uncertainty"],
+                    uncertainty_target,
+                    reduction="none",
+                )
+                value_uncertainty_loss = _weighted_mean_loss(
+                    uncertainty_error,
+                    value_weights * outcome_confidence,
+                    mask=value_has_outcome,
+                )
+            value_categorical_loss = torch.tensor(
+                0.0, dtype=torch.float32, device=policy.device
+            )
+            value_categorical_loss_sum, value_categorical_loss_denominator = (
+                _zero_loss_parts(policy.device)
+            )
+            (
+                value_categorical_clean_loss_sum,
+                value_categorical_clean_loss_denominator,
+            ) = _zero_loss_parts(policy.device)
+            (
+                value_categorical_truncated_loss_sum,
+                value_categorical_truncated_loss_denominator,
+            ) = _zero_loss_parts(policy.device)
+            if (
+                float(value_categorical_loss_weight) != 0.0
+                and "value_categorical_logits" in outputs
+                and outcome_targets is not None
+            ):
+                cat_logits = outputs["value_categorical_logits"].float()
+                bins = int(policy.model.value_categorical_bins)
+                has_trunc_class = int(cat_logits.shape[-1]) > bins
+                cat_targets = _hl_gauss_value_targets(
+                    outcome_targets,
+                    bins,
+                    sigma_ratio=value_hlgauss_sigma_ratio,
+                    truncated=truncated_mask if has_trunc_class else None,
+                    add_truncation_class=has_trunc_class,
+                )
+                if float(value_target_lambda) != 1.0 and root_value is not None:
+                    lam = float(value_target_lambda)
+                    root_targets = _hl_gauss_value_targets(
+                        root_value,
+                        bins,
+                        sigma_ratio=value_hlgauss_sigma_ratio,
+                        truncated=None,
+                        add_truncation_class=has_trunc_class,
+                    )
+                    blend_rows = (
+                        root_value_mask & has_outcome & ~truncated_mask
+                    ).unsqueeze(-1)
+                    cat_targets = torch.where(
+                        blend_rows,
+                        lam * cat_targets + (1.0 - lam) * root_targets,
+                        cat_targets,
+                    )
+                cat_log_probs = torch.nn.functional.log_softmax(
+                    cat_logits, dim=-1
+                )
+                cat_error = -(cat_targets * cat_log_probs).sum(dim=-1)
+                cat_mask = (
+                    has_outcome | truncated_mask
+                    if has_trunc_class
+                    else has_outcome
+                )
+                categorical_value_weights = value_weights * torch.where(
+                    truncated_mask,
+                    torch.full_like(
+                        value_weights, float(truncated_vp_margin_value_weight)
+                    ),
+                    torch.ones_like(value_weights),
+                )
+                (
+                    value_categorical_loss_sum,
+                    value_categorical_loss_denominator,
+                ) = _weighted_loss_parts(
+                    cat_error, categorical_value_weights, mask=cat_mask
+                )
+                value_categorical_loss = value_categorical_loss_sum / torch.clamp(
+                    value_categorical_loss_denominator, min=1e-6
+                )
+                (
+                    value_categorical_clean_loss_sum,
+                    value_categorical_clean_loss_denominator,
+                ) = _weighted_loss_parts(
+                    cat_error,
+                    categorical_value_weights,
+                    mask=has_outcome & ~truncated_mask,
+                )
+                if has_trunc_class:
+                    (
+                        value_categorical_truncated_loss_sum,
+                        value_categorical_truncated_loss_denominator,
+                    ) = _weighted_loss_parts(
+                        cat_error,
+                        categorical_value_weights,
+                        mask=truncated_mask,
+                    )
+            aux_subgoal_loss = torch.tensor(
+                0.0, dtype=torch.float32, device=policy.device
+            )
+            aux_subgoal_active_heads = 0
+            if float(aux_subgoal_loss_weight) != 0.0:
+                aux_subgoal_loss, aux_subgoal_active_heads = _aux_subgoal_loss(
+                    outputs, data, batch, policy.device
+                )
             loss = (
                 float(policy_loss_weight) * policy_loss
                 + float(value_loss_weight) * value_loss
                 + float(final_vp_loss_weight) * final_vp_loss
                 + float(q_loss_weight) * q_loss
+                + float(policy_kl_anchor_weight) * kl_anchor_loss
+                + float(value_uncertainty_loss_weight)
+                * value_uncertainty_loss
+                + float(aux_subgoal_loss_weight) * aux_subgoal_loss
+                + float(value_categorical_loss_weight)
+                * value_categorical_loss
             )
         predictions = torch.argmax(outputs["logits"], dim=-1)
         active = policy_weights > 0.0
@@ -3347,6 +5341,22 @@ def _eval_xdim_batch(
             "value_loss": float(value_loss.item()),
             "final_vp_loss": float(final_vp_loss.item()),
             "q_loss": float(q_loss.item()),
+            "policy_kl_anchor_loss": float(kl_anchor_loss.item()),
+            "value_uncertainty_loss": float(value_uncertainty_loss.item()),
+            "aux_subgoal_loss": float(aux_subgoal_loss.item()),
+            "aux_subgoal_active_heads": int(aux_subgoal_active_heads),
+            "value_categorical_loss": float(value_categorical_loss.item()),
+            "primary_value_loss": float(
+                value_categorical_loss.item()
+                if float(value_categorical_loss_weight) > 0.0
+                else value_loss.item()
+            ),
+            "primary_value_loss_kind": (
+                "hlgauss_ce"
+                if float(value_categorical_loss_weight) > 0.0
+                else "scalar_mse"
+            ),
+            "scalar_value_mse_diagnostic": float(value_loss.item()),
             "policy_loss_weighted_sum": float(policy_loss_sum.item()),
             "policy_loss_weight_sum": float(policy_loss_denominator.item()),
             "value_loss_weighted_sum": float(value_loss_sum.item()),
@@ -3355,6 +5365,24 @@ def _eval_xdim_batch(
             "final_vp_loss_weight_sum": float(final_vp_loss_denominator.item()),
             "q_loss_weighted_sum": float(q_loss_sum.item()),
             "q_loss_weight_sum": float(q_loss_denominator.item()),
+            "value_categorical_loss_weighted_sum": float(
+                value_categorical_loss_sum.item()
+            ),
+            "value_categorical_loss_weight_sum": float(
+                value_categorical_loss_denominator.item()
+            ),
+            "value_categorical_clean_loss_weighted_sum": float(
+                value_categorical_clean_loss_sum.item()
+            ),
+            "value_categorical_clean_loss_weight_sum": float(
+                value_categorical_clean_loss_denominator.item()
+            ),
+            "value_categorical_truncated_loss_weighted_sum": float(
+                value_categorical_truncated_loss_sum.item()
+            ),
+            "value_categorical_truncated_loss_weight_sum": float(
+                value_categorical_truncated_loss_denominator.item()
+            ),
             "q_score_rows_ge2": q_score_rows_ge2,
             **advantage_stats,
             "soft_distillation_rows": int(has_soft.sum().item()) if soft_targets is not None else 0,
@@ -3859,6 +5887,8 @@ def load_teacher_data(
             flush=True,
         )
     arrays: dict[str, list[np.ndarray]] = {}
+    aux_targets_enabled = False
+    prior_row_counts: list[int] = []
     keys = (
         "obs",
         "legal_action_ids",
@@ -3886,6 +5916,7 @@ def load_teacher_data(
         "has_final_actual_vps",
         "policy_weight_multiplier",
         "value_weight_multiplier",
+        *AUX_TARGET_KEYS,
         "hex_tokens",
         "hex_vertex_ids",
         "hex_edge_ids",
@@ -3908,7 +5939,24 @@ def load_teacher_data(
     if mask_hidden_info:
         from catan_zero.rl.entity_token_features import mask_player_tokens_public
     for file in files:
-        shard = _normalize_teacher_shard(_load_npz(file), file)
+        raw = _load_npz(file)
+        raw_has_aux_targets = any(key in raw for key in AUX_TARGET_KEYS)
+        if raw_has_aux_targets and not aux_targets_enabled:
+            # A replay window may intentionally mix legacy shards with newly
+            # labeled CAT-100 shards. Backfill already-seen legacy rows with
+            # ignore values when the first labeled shard appears so every
+            # column remains aligned to action_taken.
+            aux_targets_enabled = True
+            for key in AUX_TARGET_KEYS:
+                arrays[key] = [
+                    _aux_subgoal_default_array(key, rows) for rows in prior_row_counts
+                ]
+        shard = _normalize_teacher_shard(
+            raw,
+            file,
+            include_aux_defaults=aux_targets_enabled,
+        )
+        prior_row_counts.append(int(len(shard["action_taken"])))
         if mask_hidden_info and "player_tokens" in shard:
             # f72 public-observation training: strip opponent hidden slots from the
             # banked (omniscient) tokens so this corpus trains a public-only model.
@@ -4105,7 +6153,12 @@ def _manifest_shard_files(manifest_path: Path) -> list[Path]:
     return files
 
 
-def _normalize_teacher_shard(shard, path: Path) -> dict[str, np.ndarray]:
+def _normalize_teacher_shard(
+    shard,
+    path: Path,
+    *,
+    include_aux_defaults: bool = False,
+) -> dict[str, np.ndarray]:
     required = ("obs", "legal_action_ids", "legal_action_context", "action_taken")
     missing = [key for key in required if key not in shard]
     if missing:
@@ -4307,6 +6360,21 @@ def _normalize_teacher_shard(shard, path: Path) -> dict[str, np.ndarray]:
             leading=n,
         ).astype(np.float32, copy=False),
     }
+    # CAT-100 columns are optional for legacy/non-self-play corpora, but when
+    # present they must survive normalization into the training dict. Numeric
+    # heads use NaN as their per-row ignore mask; categorical heads use -1.
+    for key, dtype in AUX_SUBGOAL_FIELD_DTYPES.items():
+        if key not in shard:
+            if not include_aux_defaults:
+                continue
+            value = _aux_subgoal_default_array(key, n)
+        else:
+            value = np.asarray(shard[key])
+        if value.shape != (n,):
+            raise SystemExit(
+                f"{path} field {key} has shape {value.shape}, expected ({n},)"
+            )
+        result[key] = value.astype(dtype, copy=False)
     for key, dtype in ENTITY_FIELD_DTYPES.items():
         if key not in shard:
             continue
@@ -4317,6 +6385,14 @@ def _normalize_teacher_shard(shard, path: Path) -> dict[str, np.ndarray]:
             )
         result[key] = value.astype(dtype, copy=False)
     return result
+
+
+def _aux_subgoal_default_array(key: str, rows: int) -> np.ndarray:
+    """Per-head ignore fill used when mixing legacy and CAT-100 shards."""
+
+    dtype = AUX_SUBGOAL_FIELD_DTYPES[key]
+    fill = -1 if key in {"aux_next_settlement", "aux_robber_target"} else np.nan
+    return np.full(int(rows), fill, dtype=dtype)
 
 
 def _field_or_default(
@@ -6321,6 +8397,7 @@ def split_train_validation_indices(
     validation_seed: int,
     validation_max_samples: int,
     validation_game_seed_ranges: list[tuple[int, int]] | None = None,
+    validation_game_seeds: np.ndarray | None = None,
     allow_missing_game_seed: bool = False,
 ) -> dict[str, np.ndarray]:
     """Split into train/validation indices.
@@ -6353,6 +8430,44 @@ def split_train_validation_indices(
             "verified this corpus has no meaningful game grouping and a "
             "row-level split is acceptable for your use case."
         )
+    if validation_game_seeds is not None:
+        if validation_game_seed_ranges:
+            raise SystemExit(
+                "choose validation_game_seeds or validation_game_seed_ranges, not both"
+            )
+        if int(validation_max_samples) != 0:
+            raise SystemExit(
+                "an exact validation game-seed manifest requires "
+                "validation_max_samples=0"
+            )
+        if "game_seed" not in data:
+            raise SystemExit(
+                "an exact validation game-seed manifest requires a game_seed column"
+            )
+        requested = np.asarray(validation_game_seeds, dtype=np.int64).reshape(-1)
+        if requested.size == 0 or len(np.unique(requested)) != len(requested):
+            raise SystemExit(
+                "exact validation game seeds must be non-empty and unique"
+            )
+        seeds = np.asarray(data["game_seed"], dtype=np.int64)
+        present = set(map(int, np.unique(seeds).tolist()))
+        missing = set(map(int, requested.tolist())) - present
+        if missing:
+            raise SystemExit(
+                "exact validation game-seed manifest references games absent from "
+                f"the corpus: missing={len(missing)}"
+            )
+        validation_mask = np.isin(seeds, requested)
+        validation = all_indices[validation_mask]
+        train = all_indices[~validation_mask]
+        if len(train) == 0:
+            raise SystemExit(
+                "exact validation game-seed manifest selects the entire corpus"
+            )
+        return {
+            "train": train.astype(np.int64, copy=False),
+            "validation": validation.astype(np.int64, copy=False),
+        }
     if validation_game_seed_ranges:
         # Explicit, deterministic held-out set (task #65): overrides the random
         # game_seed permutation below entirely -- these EXACT games are what a
@@ -6592,6 +8707,13 @@ def _checkpoint_config_mismatches(
         dropout = getattr(config, "dropout", None)
         if dropout is not None and abs(float(dropout) - float(args.graph_dropout)) > 1.0e-9:
             mismatches.append(f"graph_dropout checkpoint={dropout} cli={args.graph_dropout}")
+        categorical_bins = int(getattr(config, "value_categorical_bins", 0) or 0)
+        requested_bins = int(getattr(args, "value_categorical_bins", 0) or 0)
+        if categorical_bins != requested_bins:
+            mismatches.append(
+                "value_categorical_bins "
+                f"checkpoint={categorical_bins} cli={requested_bins}"
+            )
     return mismatches
 
 
@@ -6666,9 +8788,30 @@ def _set_xdim_q_branch_trainable(model, trainable: bool) -> None:
             param.requires_grad = bool(trainable)
 
 
+def _set_scalar_value_head_trainable(model, trainable: bool) -> None:
+    """Freeze the legacy scalar readout in categorical-primary runs.
+
+    A zero coefficient alone is insufficient under AdamW: a zero gradient can
+    still receive decoupled weight decay.  Freezing makes the reported scalar
+    metric a genuinely fixed diagnostic unless the explicit HL scalar-aux
+    weight is enabled.
+    """
+
+    module = getattr(model, "module", model)
+    value_head = getattr(module, "value_head", None)
+    if value_head is None:
+        raise SystemExit(
+            "categorical-primary training expected a named scalar value_head "
+            "to freeze for diagnostic integrity"
+        )
+    for parameter in value_head.parameters():
+        parameter.requires_grad = bool(trainable)
+
+
 # Named groups of EntityGraphNet submodules that --freeze-modules / --train-value-only can
-# freeze. value_head and final_vp_head are intentionally NOT included here -- they must stay
-# trainable for a value-head-repair pass by construction.
+# freeze. ``value_heads`` is opt-in: value-repair runs leave it trainable, while the
+# later action-local policy warmup can freeze every value-specific parameter cleanly
+# instead of relying on a zero loss coefficient (which is not an AdamW freeze).
 ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS: dict[str, tuple[str, ...]] = {
     "trunk": (
         "hex_encoder",
@@ -6684,6 +8827,17 @@ ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS: dict[str, tuple[str, ...]] = {
     ),
     "action_encoder": ("action_encoder",),
     "policy_head": ("action_bias", "logit_scale"),
+    "value_heads": (
+        "value_head",
+        "value_categorical_head",
+        "final_vp_head",
+        "value_uncertainty_head",
+        "value_probe",
+        "value_probe_norm_q",
+        "value_probe_norm_kv",
+        "value_probe_attn",
+        "value_pool_head",
+    ),
 }
 
 
@@ -6693,8 +8847,9 @@ def _set_entity_graph_modules_trainable(
     """Freeze/unfreeze named EntityGraphNet module groups (mirrors
     ``_set_xdim_q_branch_trainable``'s pattern for the XDim architecture).
 
-    Recognized group names: trunk, action_encoder, policy_head. Raises SystemExit on an
-    unrecognized name. Returns the list of attribute names actually touched, for logging.
+    Recognized group names are the keys of ``ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS``.
+    Raises SystemExit on an unrecognized name. Returns the list of attribute names
+    actually touched, for logging.
     """
     module = getattr(model, "module", model)
     group_names = list(group_names)
@@ -6788,51 +8943,103 @@ def _apply_lr_schedule(
 
 
 # Submodule attribute names treated as "value head" parameters for --value-lr-mult.
-# Mirrors ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS's own comment that value_head/
-# final_vp_head are intentionally excluded from the freeze groups because they must
-# always train; value_uncertainty_head is the third, optional value-adjacent head
-# (see --value-uncertainty-head). Present on both EntityGraphNet and XDimLite/
-# XDimGraph's underlying model as plain named submodules.
+# The opt-in ``--freeze-modules value_heads`` group is broader because it also
+# includes the optional attention-pool path; this LR group covers the primary and
+# auxiliary value readout heads used by current recipes. Present on both
+# EntityGraphNet and XDimLite/XDimGraph's underlying model as named submodules.
 VALUE_HEAD_MODULE_ATTRS: tuple[str, ...] = (
     "value_head",
+    "value_categorical_head",
     "final_vp_head",
     "value_uncertainty_head",
 )
 
+# Opt-in action-local modules introduced by the gather/cross-attention upgrade.
+# They are freshly initialized when upgrading a scalar/global-policy checkpoint,
+# so the later architecture A/B needs an independent LR from both the mature
+# trunk and the value heads.
+ACTION_LOCAL_MODULE_ATTRS: tuple[str, ...] = (
+    "target_gather_proj",
+    "action_cross_blocks",
+)
 
-def _build_optimizer_param_groups(model, *, base_lr: float, value_lr_mult: float):
+
+def _build_optimizer_param_groups(
+    model,
+    *,
+    base_lr: float,
+    value_lr_mult: float,
+    action_module_lr_mult: float = 1.0,
+):
     """Return the optimizer's ``params`` argument for ``model``'s trainable parameters.
 
-    ``value_lr_mult == 1.0`` (default) returns a FLAT list of parameters -- exactly the
-    single-implicit-group optimizer this trainer built before --value-lr-mult existed,
-    bit-identical training dynamics. Any other multiplier splits VALUE_HEAD_MODULE_ATTRS
-    submodules (value_head/final_vp_head/value_uncertainty_head, whichever are present
-    and have trainable parameters) into their own param-group dict at
-    ``base_lr * value_lr_mult``; every other trainable parameter stays in a base group
-    at ``base_lr``. Each group dict carries its own ``"base_lr"`` key so
+    Both multipliers at 1.0 return a FLAT list of parameters -- exactly the
+    historical single-implicit-group optimizer. Non-unit multipliers split the
+    corresponding named modules into independent groups; every other trainable
+    parameter stays in a base group at ``base_lr``. Each group dict carries its
+    own ``"base_lr"`` key so
     ``_apply_lr_schedule``/``_apply_lr_warmup`` scale the right rate per group instead
     of overwriting every group with the same absolute rate.
     """
     module = getattr(model, "module", model)
     trainable = [p for p in module.parameters() if p.requires_grad]
-    if float(value_lr_mult) == 1.0:
+    if float(value_lr_mult) <= 0.0 or float(action_module_lr_mult) <= 0.0:
+        raise SystemExit(
+            "--value-lr-mult and --action-module-lr-mult must both be > 0; "
+            "freeze modules explicitly instead of encoding a freeze as LR 0"
+        )
+    if float(value_lr_mult) == 1.0 and float(action_module_lr_mult) == 1.0:
         return trainable
-    value_params: list = []
-    for attr_name in VALUE_HEAD_MODULE_ATTRS:
-        submodule = getattr(module, attr_name, None)
-        if submodule is None:
-            continue
-        value_params.extend(p for p in submodule.parameters() if p.requires_grad)
-    if not value_params:
+
+    def _params_under(attrs: tuple[str, ...]) -> list:
+        params: list = []
+        for attr_name in attrs:
+            submodule = getattr(module, attr_name, None)
+            if submodule is None:
+                continue
+            params.extend(p for p in submodule.parameters() if p.requires_grad)
+        return params
+
+    value_params = (
+        _params_under(VALUE_HEAD_MODULE_ATTRS)
+        if float(value_lr_mult) != 1.0
+        else []
+    )
+    action_params = (
+        _params_under(ACTION_LOCAL_MODULE_ATTRS)
+        if float(action_module_lr_mult) != 1.0
+        else []
+    )
+    if float(value_lr_mult) != 1.0 and not value_params:
         raise SystemExit(
             "--value-lr-mult != 1.0 but the model has no trainable parameters under "
             f"any of {VALUE_HEAD_MODULE_ATTRS} -- nothing to apply the multiplier to."
         )
+    if float(action_module_lr_mult) != 1.0 and not action_params:
+        raise SystemExit(
+            "--action-module-lr-mult != 1.0 but the model has no trainable "
+            f"parameters under any of {ACTION_LOCAL_MODULE_ATTRS}"
+        )
     value_param_ids = {id(p) for p in value_params}
-    base_params = [p for p in trainable if id(p) not in value_param_ids]
-    value_lr = float(base_lr) * float(value_lr_mult)
-    groups = [{"params": base_params, "lr": float(base_lr), "base_lr": float(base_lr)}]
-    groups.append({"params": value_params, "lr": value_lr, "base_lr": value_lr})
+    action_param_ids = {id(p) for p in action_params}
+    overlap = value_param_ids & action_param_ids
+    if overlap:
+        raise RuntimeError("optimizer value/action parameter groups overlap")
+    grouped_ids = value_param_ids | action_param_ids
+    base_params = [p for p in trainable if id(p) not in grouped_ids]
+    groups = [
+        {"params": base_params, "lr": float(base_lr), "base_lr": float(base_lr)}
+    ]
+    if value_params:
+        value_lr = float(base_lr) * float(value_lr_mult)
+        groups.append(
+            {"params": value_params, "lr": value_lr, "base_lr": value_lr}
+        )
+    if action_params:
+        action_lr = float(base_lr) * float(action_module_lr_mult)
+        groups.append(
+            {"params": action_params, "lr": action_lr, "base_lr": action_lr}
+        )
     return groups
 
 
@@ -7309,6 +9516,7 @@ def _save_policy(
     *,
     mask_hidden_info: bool = False,
     soft_target_source: str | None = None,
+    value_training: dict[str, object] | None = None,
 ) -> None:
     """Write a policy checkpoint. Safe to call from EVERY rank: single-GPU and
     DDP write on rank 0 only, while FSDP gathers a full (unsharded) state_dict --
@@ -7341,6 +9549,7 @@ def _save_policy(
             model_state,
             mask_hidden_info,
             soft_target_source=soft_target_source,
+            value_training=value_training,
         )
         return
 
@@ -7349,11 +9558,15 @@ def _save_policy(
     tmp = output.with_name(f".{output.name}.tmp.{os.getpid()}")
     if not ddp["enabled"]:
         try:
-            policy.save(
-                tmp,
-                mask_hidden_info=bool(mask_hidden_info),
-                soft_target_source=soft_target_source,
-            )
+            if getattr(policy, "policy_type", "") == "entity_graph":
+                policy.save(
+                    tmp,
+                    mask_hidden_info=bool(mask_hidden_info),
+                    soft_target_source=soft_target_source,
+                    value_training=value_training,
+                )
+            else:
+                policy.save(tmp)
             if not tmp.exists() or tmp.stat().st_size <= 0:
                 raise RuntimeError(f"checkpoint temp file was not written: {tmp}")
             os.replace(tmp, output)
@@ -7372,6 +9585,7 @@ def _save_policy(
         policy.model.module.state_dict(),
         mask_hidden_info,
         soft_target_source=soft_target_source,
+        value_training=value_training,
     )
 
 
@@ -7382,6 +9596,7 @@ def _write_entity_checkpoint(
     mask_hidden_info: bool,
     *,
     soft_target_source: str | None = None,
+    value_training: dict[str, object] | None = None,
 ) -> None:
     """Atomically write the durable name-keyed checkpoint dict shared by the DDP
     and FSDP save paths (mirrors EntityGraphPolicy.save's fields)."""
@@ -7393,8 +9608,7 @@ def _write_entity_checkpoint(
     output.parent.mkdir(parents=True, exist_ok=True)
     tmp = output.with_name(f".{output.name}.tmp.{os.getpid()}")
     try:
-        torch.save(
-            {
+        payload = {
                 "policy_type": getattr(policy, "policy_type", "xdim_lite"),
                 "config": config_to_dict(policy.config),
                 "action_mask_version": str(getattr(policy.config, "action_mask_version", "")),
@@ -7406,9 +9620,18 @@ def _write_entity_checkpoint(
                 ),
                 "static_action_features": policy.static_action_features.detach().cpu(),
                 "model": model_state,
-            },
-            tmp,
-        )
+            }
+        if value_training is not None:
+            durable_value_training = dict(value_training)
+            payload["value_training"] = durable_value_training
+            payload["trained_value_readouts"] = [
+                str(readout)
+                for readout in durable_value_training.get(
+                    "trained_value_readouts", ()
+                )
+                if str(readout) in {"scalar", "categorical"}
+            ]
+        torch.save(payload, tmp)
         if not tmp.exists() or tmp.stat().st_size <= 0:
             raise RuntimeError(f"checkpoint temp file was not written: {tmp}")
         os.replace(tmp, output)

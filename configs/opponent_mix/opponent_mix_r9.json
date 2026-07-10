@@ -1,5 +1,5 @@
 {
-  "_comment": "Adopted CAT-5 R9 exact opponent mix (75/10/5/5/5), CAT-54 production template. Point \"registry\" at a real CAT-9 ChampionRegistry JSON (tools/champion_registry.py) before use -- registry_role/registry_pool categories below resolve against it via tools/opponent_mix_registry.py:resolve_opponent_mix_manifest. catanatron_value is marked pending until CAT-56 ('Exploiter lane: catanatron_value/AB3 as in-generator opponents') wires a real evaluator for it; until then this mix's effective (renormalized) ratios are 75/10/5/5 over the four checkpoint-backed categories.",
+  "_comment": "R9 75/10/5/5/5 template with the external slice pending. Before generation, freeze with tools/opponent_mix_registry.py so registry entries and md5s are verified, duplicate/self aliases are rejected, and the result is bound to the producer. Pool entries must use distinct older_champion and hard_negative provenance tags. See docs/OPPONENT_MIX_PRODUCTION.md.",
   "registry": "runs/champion_registry.json",
   "categories": [
     {
@@ -17,7 +17,7 @@
       "name": "older_champion",
       "weight": 5,
       "source": "registry_pool",
-      "filter": {"status": "active"}
+      "filter": {"tag": "older_champion"}
     },
     {
       "name": "hard_experimental",

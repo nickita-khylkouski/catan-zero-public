@@ -20,6 +20,7 @@ if str(_TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(_TOOLS_DIR))
 
 from build_memmap_corpus import _GameSeedRunTracker, build_memmap_corpus  # type: ignore  # noqa: E402
+from train_bc import MemmapCorpus, load_teacher_data  # type: ignore  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -89,17 +90,32 @@ def test_tracker_empty_shard_is_noop():
 # ---------------------------------------------------------------------------
 
 
-def _write_synthetic_shard(path: Path, *, game_seed: np.ndarray) -> None:
+def _write_synthetic_shard(
+    path: Path,
+    *,
+    game_seed: np.ndarray,
+    include_aux: bool = True,
+) -> None:
     n = int(game_seed.shape[0])
     legal_width = 2
-    np.savez(
-        path,
-        obs=np.zeros((n, 4), dtype=np.float16),
-        legal_action_ids=np.zeros((n, legal_width), dtype=np.int16),
-        legal_action_context=np.zeros((n, legal_width, 1), dtype=np.float16),
-        action_taken=np.zeros(n, dtype=np.int16),
-        game_seed=game_seed.astype(np.int64),
-    )
+    arrays = {
+        "obs": np.zeros((n, 4), dtype=np.float16),
+        "legal_action_ids": np.zeros((n, legal_width), dtype=np.int16),
+        "legal_action_context": np.zeros((n, legal_width, 1), dtype=np.float16),
+        "action_taken": np.zeros(n, dtype=np.int16),
+        "game_seed": game_seed.astype(np.int64),
+    }
+    if include_aux:
+        arrays.update(
+            {
+                "aux_longest_road": np.arange(n, dtype=np.float32) % 2,
+                "aux_largest_army": (np.arange(n, dtype=np.float32) + 1) % 2,
+                "aux_vp_in_n": np.arange(n, dtype=np.float32) / 10.0,
+                "aux_next_settlement": np.arange(n, dtype=np.int16) % 54,
+                "aux_robber_target": np.arange(n, dtype=np.int16) % 19,
+            }
+        )
+    np.savez(path, **arrays)
 
 
 def _make_duplicate_seed_shards(tmp_path: Path) -> Path:
@@ -162,3 +178,63 @@ def test_build_memmap_corpus_no_duplicates_does_not_abort(tmp_path):
     )
     assert meta["stats"]["has_duplicate_game_seeds"] is False
     assert meta["stats"]["duplicate_game_seed_count"] == 0
+
+    corpus = MemmapCorpus(tmp_path / "corpus")
+    for key in (
+        "aux_longest_road",
+        "aux_largest_army",
+        "aux_vp_in_n",
+        "aux_next_settlement",
+        "aux_robber_target",
+    ):
+        assert key in corpus
+        assert len(corpus[key]) == len(corpus)
+
+
+def test_legacy_and_aux_sources_mix_with_aligned_ignore_fills(tmp_path):
+    legacy = tmp_path / "legacy"
+    labeled = tmp_path / "labeled"
+    legacy.mkdir()
+    labeled.mkdir()
+    _write_synthetic_shard(
+        legacy / "shard0.npz",
+        game_seed=np.array([10, 10]),
+        include_aux=False,
+    )
+    _write_synthetic_shard(
+        labeled / "shard0.npz",
+        game_seed=np.array([11, 11]),
+        include_aux=True,
+    )
+
+    # In-RAM NPZ loading backfills already-seen legacy rows when the first
+    # labeled shard appears.
+    mixed = tmp_path / "mixed"
+    mixed.mkdir()
+    _write_synthetic_shard(
+        mixed / "shard0.npz",
+        game_seed=np.array([10, 10]),
+        include_aux=False,
+    )
+    _write_synthetic_shard(
+        mixed / "shard1.npz",
+        game_seed=np.array([11, 11]),
+        include_aux=True,
+    )
+    loaded = load_teacher_data(mixed)
+    assert len(loaded["aux_vp_in_n"]) == 4
+    assert np.all(np.isnan(loaded["aux_vp_in_n"][:2]))
+    assert np.all(loaded["aux_next_settlement"][:2] == -1)
+    np.testing.assert_array_equal(loaded["aux_next_settlement"][2:], np.array([0, 1]))
+
+    # The production memmap path detects CAT-100 at the per-source level and
+    # applies the same fills before enforcing its uniform column schema.
+    build_memmap_corpus(
+        [legacy, labeled],
+        tmp_path / "mixed_corpus",
+        progress_every=0,
+    )
+    corpus = MemmapCorpus(tmp_path / "mixed_corpus")
+    assert len(corpus["aux_vp_in_n"]) == 4
+    assert np.all(np.isnan(corpus["aux_vp_in_n"][:2]))
+    assert np.all(corpus["aux_next_settlement"][:2] == -1)

@@ -4,11 +4,13 @@
 Adapted from tools/gumbel_search_vs_raw_h2h.py (task #53 part 2), which plays
 GumbelChanceMCTS search vs the SAME checkpoint's raw policy to test whether
 search adds strength over one net. This variant instead plays TWO DIFFERENT
-checkpoints against each other, BOTH using GumbelChanceMCTS search with the
-IDENTICAL search config (n_full, c_scale, c_visit, public_observation, etc.)
--- isolating the CHECKPOINT's contribution (does a distilled/trained net beat
-its teacher under search) rather than confounding it with a different search
-budget.
+checkpoints against each other, BOTH using GumbelChanceMCTS search with an
+identical config by default -- isolating the CHECKPOINT's contribution (does a
+distilled/trained net beat its teacher under search). CAT-25 diagnostic flags
+can deliberately override ``n_full`` / ``n_full_wide`` by role to measure
+search-budget headroom; those effective per-role budgets are recorded and
+hashed in the output so such a run cannot masquerade as a checkpoint-only
+gate.
 
 Games are paired by seed AND color-swapped (each seed is played twice, once
 with candidate=RED/baseline=BLUE and once swapped) to cancel positional/color
@@ -38,7 +40,11 @@ if str(_TOOLS_DIR) not in sys.path:
 from catan_zero.rl.config_cli import add_config_flags, resolve_config
 from catan_zero.rl.gumbel_self_play import _apply_selected_action
 from catan_zero.rl.pipeline_configs import EvalConfig
-from catan_zero.search.gumbel_chance_mcts import GumbelChanceMCTS, GumbelChanceMCTSConfig
+from catan_zero.search.gumbel_chance_mcts import (
+    GumbelChanceMCTS,
+    GumbelChanceMCTSConfig,
+    _matches_explicit_or_legacy_width_gate,
+)
 from catan_zero.search.neural_rust_mcts import (
     BatchedEntityGraphRustEvaluator,
     EntityGraphRustEvaluatorConfig,
@@ -50,6 +56,119 @@ from sprt_gate import GATE_CONFIGS, evaluate_pentanomial_sprt, evaluate_sprt, pa
 COLORS: tuple[str, ...] = ("RED", "BLUE")
 
 
+def _new_search_telemetry() -> dict[str, dict[str, float | int]]:
+    return {
+        role: {
+            "search_calls": 0,
+            "non_forced_search_calls": 0,
+            "search_elapsed_sec": 0.0,
+            "simulations_used": 0,
+            "wide_root_calls": 0,
+            "wide_root_simulations_used": 0,
+            "selected_vs_prior_disagreement_calls": 0,
+            "wide_selected_vs_prior_disagreement_calls": 0,
+        }
+        for role in ("candidate", "baseline")
+    }
+
+
+def _add_search_telemetry(
+    target: dict[str, dict[str, float | int]],
+    source: dict[str, dict[str, float | int]],
+) -> None:
+    for role in ("candidate", "baseline"):
+        for key, value in source.get(role, {}).items():
+            target[role][key] = target[role].get(key, 0) + value
+
+
+def _finalize_search_telemetry(
+    totals: dict[str, dict[str, float | int]],
+) -> dict[str, Any]:
+    by_role: dict[str, Any] = {}
+    for role in ("candidate", "baseline"):
+        raw = totals.get(role, {})
+        calls = int(raw.get("search_calls", 0))
+        non_forced_calls = int(raw.get("non_forced_search_calls", calls))
+        elapsed = float(raw.get("search_elapsed_sec", 0.0))
+        simulations = int(raw.get("simulations_used", 0))
+        wide_calls = int(raw.get("wide_root_calls", 0))
+        wide_simulations = int(raw.get("wide_root_simulations_used", 0))
+        disagreements = int(raw.get("selected_vs_prior_disagreement_calls", 0))
+        wide_disagreements = int(
+            raw.get("wide_selected_vs_prior_disagreement_calls", 0)
+        )
+        by_role[role] = {
+            "search_calls": calls,
+            "non_forced_search_calls": non_forced_calls,
+            "search_elapsed_sec": elapsed,
+            "search_seconds_per_call": (elapsed / calls) if calls else None,
+            "simulations_used": simulations,
+            "simulations_per_call": (simulations / calls) if calls else None,
+            "wide_root_calls": wide_calls,
+            "wide_root_simulations_used": wide_simulations,
+            "wide_root_simulations_per_call": (
+                wide_simulations / wide_calls if wide_calls else None
+            ),
+            "selected_vs_prior_disagreement_calls": disagreements,
+            "selected_vs_prior_disagreement_rate": (
+                disagreements / non_forced_calls if non_forced_calls else None
+            ),
+            "wide_selected_vs_prior_disagreement_calls": wide_disagreements,
+            "wide_selected_vs_prior_disagreement_rate": (
+                wide_disagreements / wide_calls if wide_calls else None
+            ),
+        }
+
+    candidate = by_role["candidate"]
+    baseline = by_role["baseline"]
+    baseline_elapsed = float(baseline["search_elapsed_sec"])
+    baseline_simulations = int(baseline["simulations_used"])
+    candidate_per_call = candidate["search_seconds_per_call"]
+    baseline_per_call = baseline["search_seconds_per_call"]
+    candidate_simulations_per_call = candidate["simulations_per_call"]
+    baseline_simulations_per_call = baseline["simulations_per_call"]
+    return {
+        "by_role": by_role,
+        "candidate_over_baseline_elapsed_ratio": (
+            float(candidate["search_elapsed_sec"]) / baseline_elapsed
+            if baseline_elapsed > 0.0
+            else None
+        ),
+        "candidate_over_baseline_seconds_per_call_ratio": (
+            float(candidate_per_call) / float(baseline_per_call)
+            if candidate_per_call is not None
+            and baseline_per_call is not None
+            and float(baseline_per_call) > 0.0
+            else None
+        ),
+        "candidate_over_baseline_simulations_ratio": (
+            int(candidate["simulations_used"]) / baseline_simulations
+            if baseline_simulations > 0
+            else None
+        ),
+        "candidate_over_baseline_simulations_per_call_ratio": (
+            float(candidate_simulations_per_call)
+            / float(baseline_simulations_per_call)
+            if candidate_simulations_per_call is not None
+            and baseline_simulations_per_call is not None
+            and float(baseline_simulations_per_call) > 0.0
+            else None
+        ),
+        "search_cost_definition": (
+            "simulations_used is the exact sum returned by SearchResult for each role; "
+            "elapsed seconds additionally include root expansion, evaluator, D6, and "
+            "Python/Rust orchestration overhead"
+        ),
+        "selected_action_disagreement_definition": (
+            "selected_action != argmax(search root prior before MCTS improvement) on "
+            "that role's own decision; "
+            "rate denominator is non-forced decisions; not candidate-vs-baseline "
+            "disagreement because the roles do not search the same states in H2H "
+            "trajectories"
+        ),
+    }
+
+
 def play_one_h2h_game(
     mcts_by_role: dict[str, GumbelChanceMCTS],
     *,
@@ -57,6 +176,7 @@ def play_one_h2h_game(
     game_seed: int,
     max_decisions: int,
     correct_rust_chance_spectra: bool,
+    search_telemetry_by_role: dict[str, dict[str, float | int]] | None = None,
 ) -> dict[str, Any]:
     import random
 
@@ -78,8 +198,40 @@ def play_one_h2h_game(
 
         acting_color = str(game.current_color())
         role = role_by_color[acting_color]
-        result = mcts_by_role[role].search(game, force_full=True)
+        mcts = mcts_by_role[role]
+        started = time.perf_counter()
+        result = mcts.search(game, force_full=True)
+        search_elapsed = time.perf_counter() - started
         selected = int(result.selected_action)
+
+        if search_telemetry_by_role is not None:
+            role_telemetry = search_telemetry_by_role[role]
+            role_telemetry["search_calls"] += 1
+            if len(legal_rust) > 1:
+                role_telemetry["non_forced_search_calls"] += 1
+            role_telemetry["search_elapsed_sec"] += search_elapsed
+            role_telemetry["simulations_used"] += int(result.simulations_used)
+            wide_root = _matches_explicit_or_legacy_width_gate(
+                len(legal_rust),
+                min_legal_actions=mcts.config.n_full_wide_threshold,
+                legacy_exclusive_threshold=mcts.config.wide_candidates_threshold,
+            )
+            if wide_root:
+                role_telemetry["wide_root_calls"] += 1
+                role_telemetry["wide_root_simulations_used"] += int(
+                    result.simulations_used
+                )
+            if result.priors:
+                prior_argmax = max(
+                    result.priors,
+                    key=lambda action: (result.priors[action], -int(action)),
+                )
+                if selected != int(prior_argmax):
+                    role_telemetry["selected_vs_prior_disagreement_calls"] += 1
+                    if wide_root:
+                        role_telemetry[
+                            "wide_selected_vs_prior_disagreement_calls"
+                        ] += 1
 
         game = _apply_selected_action(
             game,
@@ -131,7 +283,125 @@ def _worker_entry(worker_args: dict[str, Any]) -> dict[str, Any]:
         }
 
 
-def _build_evaluator(checkpoint: str, worker_args: dict[str, Any]) -> Any:
+def _resolve_value_readouts(args: Any) -> tuple[str, str]:
+    """Return the effective candidate/baseline value readouts.
+
+    ``--value-readout`` remains the backwards-compatible shared fallback.  A
+    role-specific value only overrides its own side, which is required for the
+    first HL-Gauss promotion gate: categorical candidate vs scalar incumbent.
+    This helper accepts either an argparse namespace or the worker-argument
+    dict so config hashing, worker construction, and artifact reporting share
+    one resolution rule.
+    """
+
+    def _get(name: str, default: Any = None) -> Any:
+        if isinstance(args, dict):
+            return args.get(name, default)
+        return getattr(args, name, default)
+
+    shared = str(_get("value_readout", "scalar"))
+    candidate = _get("candidate_value_readout")
+    baseline = _get("baseline_value_readout")
+    resolved = (
+        str(candidate) if candidate is not None else shared,
+        str(baseline) if baseline is not None else shared,
+    )
+    allowed = {"scalar", "categorical"}
+    if any(value not in allowed for value in resolved):
+        raise ValueError(
+            "value readout must resolve to 'scalar' or 'categorical'; "
+            f"candidate={resolved[0]!r}, baseline={resolved[1]!r}"
+        )
+    return resolved
+
+
+def _resolve_search_budgets(args: Any) -> dict[str, int | None]:
+    """Resolve shared/role-specific normal and wide-root search budgets.
+
+    The shared ``n_full`` / ``n_full_wide`` values remain the backwards-
+    compatible fallback.  A role-specific value overrides only that side,
+    which makes a fair adaptive-opening comparison possible: candidate
+    ``n_full=128,n_full_wide=256`` versus baseline
+    ``n_full=128,n_full_wide=None``.  Keeping this resolution in one helper
+    prevents worker construction, typed-config hashing, and output provenance
+    from silently disagreeing.
+    """
+
+    def _get(name: str, default: Any = None) -> Any:
+        if isinstance(args, dict):
+            return args.get(name, default)
+        return getattr(args, name, default)
+
+    shared_n_full = int(_get("n_full", 64))
+    shared_n_full_wide_raw = _get("n_full_wide")
+    shared_n_full_wide = (
+        int(shared_n_full_wide_raw) if shared_n_full_wide_raw is not None else None
+    )
+    shared_n_full_wide_threshold_raw = _get("n_full_wide_threshold")
+    shared_n_full_wide_threshold = (
+        int(shared_n_full_wide_threshold_raw)
+        if shared_n_full_wide_threshold_raw is not None
+        else None
+    )
+
+    candidate_n_full_raw = _get("candidate_n_full")
+    baseline_n_full_raw = _get("baseline_n_full")
+    candidate_n_full_wide_raw = _get("candidate_n_full_wide")
+    baseline_n_full_wide_raw = _get("baseline_n_full_wide")
+    candidate_n_full_wide_threshold_raw = _get("candidate_n_full_wide_threshold")
+    baseline_n_full_wide_threshold_raw = _get("baseline_n_full_wide_threshold")
+
+    return {
+        "candidate_n_full": (
+            int(candidate_n_full_raw)
+            if candidate_n_full_raw is not None
+            else shared_n_full
+        ),
+        "baseline_n_full": (
+            int(baseline_n_full_raw)
+            if baseline_n_full_raw is not None
+            else shared_n_full
+        ),
+        "candidate_n_full_wide": (
+            int(candidate_n_full_wide_raw)
+            if candidate_n_full_wide_raw is not None
+            else shared_n_full_wide
+        ),
+        "baseline_n_full_wide": (
+            int(baseline_n_full_wide_raw)
+            if baseline_n_full_wide_raw is not None
+            else shared_n_full_wide
+        ),
+        "candidate_n_full_wide_threshold": (
+            int(candidate_n_full_wide_threshold_raw)
+            if candidate_n_full_wide_threshold_raw is not None
+            else shared_n_full_wide_threshold
+        ),
+        "baseline_n_full_wide_threshold": (
+            int(baseline_n_full_wide_threshold_raw)
+            if baseline_n_full_wide_threshold_raw is not None
+            else shared_n_full_wide_threshold
+        ),
+    }
+
+
+def _build_evaluator(
+    checkpoint: str,
+    worker_args: dict[str, Any],
+    *,
+    role: str | None = None,
+) -> Any:
+    candidate_readout, baseline_readout = _resolve_value_readouts(worker_args)
+    if role is None:
+        # Backwards compatibility for direct callers of this helper: when no
+        # role is supplied, retain the historical shared-readout behavior.
+        value_readout = str(worker_args.get("value_readout", "scalar"))
+    elif role == "candidate":
+        value_readout = candidate_readout
+    elif role == "baseline":
+        value_readout = baseline_readout
+    else:
+        raise ValueError(f"unknown evaluator role {role!r}; expected candidate|baseline")
     return BatchedEntityGraphRustEvaluator.from_checkpoint(
         checkpoint,
         device=worker_args["device"],
@@ -139,13 +409,19 @@ def _build_evaluator(checkpoint: str, worker_args: dict[str, Any]) -> Any:
             value_scale=float(worker_args["value_scale"]),
             prior_temperature=float(worker_args["prior_temperature"]),
             value_squash=str(worker_args.get("value_squash", "tanh")),
+            value_readout=value_readout,
             public_observation=bool(worker_args.get("public_observation", False)),
         ),
     )
 
 
 def _build_search_config(
-    worker_args: dict[str, Any], *, seed: int, n_full: int | None = None
+    worker_args: dict[str, Any],
+    *,
+    seed: int,
+    n_full: int | None = None,
+    n_full_wide: int | None = None,
+    n_full_wide_threshold: int | None = None,
 ) -> GumbelChanceMCTSConfig:
     """`n_full` defaults to `worker_args["n_full"]` when not given explicitly.
 
@@ -158,6 +434,24 @@ def _build_search_config(
     unchanged callers.
     """
     resolved_n_full = int(n_full) if n_full is not None else int(worker_args["n_full"])
+    resolved_n_full_wide = (
+        int(n_full_wide)
+        if n_full_wide is not None
+        else (
+            int(worker_args["n_full_wide"])
+            if worker_args.get("n_full_wide") is not None
+            else None
+        )
+    )
+    resolved_n_full_wide_threshold = (
+        int(n_full_wide_threshold)
+        if n_full_wide_threshold is not None
+        else (
+            int(worker_args["n_full_wide_threshold"])
+            if worker_args.get("n_full_wide_threshold") is not None
+            else None
+        )
+    )
     return GumbelChanceMCTSConfig(
         colors=COLORS,
         seed=int(seed),
@@ -171,17 +465,24 @@ def _build_search_config(
         belief_chance_spectra=bool(worker_args.get("belief_chance_spectra", False)),
         c_scale=float(worker_args.get("c_scale", 0.1)),
         c_visit=float(worker_args.get("c_visit", 50.0)),
+        rescale_noise_floor_c=float(worker_args.get("rescale_noise_floor_c", 0.0)),
+        sigma_eval=float(worker_args.get("sigma_eval", 0.79)),
         max_root_candidates=int(worker_args.get("max_root_candidates", 16)),
         max_root_candidates_wide=int(worker_args.get("max_root_candidates_wide", 54)),
-        n_full_wide=(
-            int(worker_args["n_full_wide"]) if worker_args.get("n_full_wide") is not None else None
-        ),
+        wide_candidates_threshold=int(worker_args.get("wide_candidates_threshold", 24)),
+        n_full_wide=resolved_n_full_wide,
+        n_full_wide_threshold=resolved_n_full_wide_threshold,
         raw_policy_above_width=(
             int(worker_args["raw_policy_above_width"])
             if worker_args.get("raw_policy_above_width") is not None
             else None
         ),
         symmetry_averaged_eval=bool(worker_args.get("symmetry_averaged_eval", False)),
+        symmetry_averaged_eval_threshold=(
+            int(worker_args["symmetry_averaged_eval_threshold"])
+            if worker_args.get("symmetry_averaged_eval_threshold") is not None
+            else None
+        ),
     )
 
 
@@ -210,24 +511,42 @@ def _run_worker(worker_args: dict[str, Any]) -> dict[str, Any]:
         torch.set_num_threads(threads_per_worker)
         torch.set_num_interop_threads(1)
 
-    candidate_evaluator = _build_evaluator(worker_args["candidate_checkpoint"], worker_args)
-    baseline_evaluator = _build_evaluator(worker_args["baseline_checkpoint"], worker_args)
+    candidate_evaluator = _build_evaluator(
+        worker_args["candidate_checkpoint"], worker_args, role="candidate"
+    )
+    baseline_evaluator = _build_evaluator(
+        worker_args["baseline_checkpoint"], worker_args, role="baseline"
+    )
 
     worker_seed = int(worker_args["worker_seed"])
-    candidate_n_full = int(worker_args.get("candidate_n_full", worker_args["n_full"]))
-    baseline_n_full = int(worker_args.get("baseline_n_full", worker_args["n_full"]))
+    budgets = _resolve_search_budgets(worker_args)
+    candidate_n_full = int(budgets["candidate_n_full"])
+    baseline_n_full = int(budgets["baseline_n_full"])
     candidate_mcts = GumbelChanceMCTS(
-        _build_search_config(worker_args, seed=worker_seed, n_full=candidate_n_full),
+        _build_search_config(
+            worker_args,
+            seed=worker_seed,
+            n_full=candidate_n_full,
+            n_full_wide=budgets["candidate_n_full_wide"],
+            n_full_wide_threshold=budgets["candidate_n_full_wide_threshold"],
+        ),
         candidate_evaluator,
     )
     baseline_mcts = GumbelChanceMCTS(
-        _build_search_config(worker_args, seed=worker_seed, n_full=baseline_n_full),
+        _build_search_config(
+            worker_args,
+            seed=worker_seed,
+            n_full=baseline_n_full,
+            n_full_wide=budgets["baseline_n_full_wide"],
+            n_full_wide_threshold=budgets["baseline_n_full_wide_threshold"],
+        ),
         baseline_evaluator,
     )
     mcts_by_role = {"candidate": candidate_mcts, "baseline": baseline_mcts}
 
     games: list[dict[str, Any]] = []
     pair_errors: list[dict[str, Any]] = []
+    search_telemetry = _new_search_telemetry()
     try:
         for pair in worker_args["pairs"]:
             game_seed = int(pair["game_seed"])
@@ -246,6 +565,7 @@ def _run_worker(worker_args: dict[str, Any]) -> dict[str, Any]:
                         game_seed=game_seed,
                         max_decisions=int(worker_args["max_decisions"]),
                         correct_rust_chance_spectra=bool(worker_args["correct_rust_chance_spectra"]),
+                        search_telemetry_by_role=search_telemetry,
                     )
                     record["orientation"] = orientation
                     record["pair_id"] = int(pair["pair_id"])
@@ -271,13 +591,15 @@ def _run_worker(worker_args: dict[str, Any]) -> dict[str, Any]:
         "games": games,
         "error": None,
         "pair_errors": pair_errors,
+        "search_telemetry": search_telemetry,
     }
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Cross-checkpoint H2H gate: candidate checkpoint vs baseline checkpoint, "
-        "BOTH using GumbelChanceMCTS search with identical config."
+        "both using GumbelChanceMCTS search with identical config by default; "
+        "role-specific budget flags are explicit CAT-25 diagnostic overrides."
     )
     parser.add_argument("--candidate", required=True, help="Candidate checkpoint path.")
     parser.add_argument("--baseline", required=True, help="Baseline checkpoint path.")
@@ -312,6 +634,25 @@ def main() -> None:
     parser.add_argument("--prior-temperature", type=float, default=1.0)
     parser.add_argument("--value-scale", type=float, default=1.0)
     parser.add_argument(
+        "--value-readout",
+        choices=("scalar", "categorical"),
+        default="scalar",
+        help="Backwards-compatible shared value source for both nets. A role-specific "
+        "flag overrides this fallback for only that side.",
+    )
+    parser.add_argument(
+        "--candidate-value-readout",
+        choices=("scalar", "categorical"),
+        default=None,
+        help="Candidate-only value source (default: inherit --value-readout).",
+    )
+    parser.add_argument(
+        "--baseline-value-readout",
+        choices=("scalar", "categorical"),
+        default=None,
+        help="Baseline-only value source (default: inherit --value-readout).",
+    )
+    parser.add_argument(
         "--correct-rust-chance-spectra",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -328,10 +669,29 @@ def main() -> None:
                         help="Sigma c_visit floor; 1.0 = visit-scaled sigma (armV diagnostic).")
     parser.add_argument("--c-scale", type=float, default=0.1,
                         help="Sigma scale multiplier (matches GumbelChanceMCTSConfig default).")
+    parser.add_argument(
+        "--rescale-noise-floor-c",
+        type=float,
+        default=0.0,
+        help="D1 noise-floor rescaling coefficient. Default 0.0 is the exact legacy no-op.",
+    )
+    parser.add_argument(
+        "--sigma-eval",
+        type=float,
+        default=0.79,
+        help="Value-estimate noise stdev used by --rescale-noise-floor-c.",
+    )
     parser.add_argument("--max-root-candidates", type=int, default=16,
                         help="Root Gumbel-Top-k candidate cap on normal roots (SNR arm: 8).")
     parser.add_argument("--max-root-candidates-wide", type=int, default=54,
                         help="Root Gumbel-Top-k cap on wide (placement) roots; 16 = narrow diagnostic arm.")
+    parser.add_argument(
+        "--wide-candidates-threshold",
+        type=int,
+        default=24,
+        help="Legacy exclusive threshold for the wide candidate cap and fallback "
+        "for D6/adaptive-budget gates when explicit thresholds are unset.",
+    )
     parser.add_argument(
         "--public-observation",
         action=argparse.BooleanOptionalAction,
@@ -350,9 +710,48 @@ def main() -> None:
         "both sides' search. Threads to GumbelChanceMCTSConfig.belief_chance_spectra.",
     )
     parser.add_argument("--n-full-wide", type=int, default=None,
-                        help="Placement-budget-asymmetry arm: full-search simulations to spend at "
-                        "roots wider than the config's wide_candidates_threshold (e.g. 512). "
-                        "Default None = use --n-full everywhere (disabled).")
+                        help="Backwards-compatible shared wide-root simulation budget for both "
+                        "roles. Role-specific flags override this fallback for only that side. "
+                        "Default None = use each role's normal n_full at wide roots.")
+    parser.add_argument(
+        "--n-full-wide-threshold",
+        type=int,
+        default=None,
+        help="Shared inclusive minimum legal-action count for n_full_wide. "
+        "Default None preserves the legacy > --wide-candidates-threshold gate.",
+    )
+    parser.add_argument(
+        "--candidate-n-full-wide",
+        type=int,
+        default=None,
+        help=(
+            "Candidate-only wide-root simulation budget. Default None = inherit "
+            "--n-full-wide (which itself defaults to disabled)."
+        ),
+    )
+    parser.add_argument(
+        "--baseline-n-full-wide",
+        type=int,
+        default=None,
+        help=(
+            "Baseline-only wide-root simulation budget. Default None = inherit "
+            "--n-full-wide (which itself defaults to disabled)."
+        ),
+    )
+    parser.add_argument(
+        "--candidate-n-full-wide-threshold",
+        type=int,
+        default=None,
+        help="Candidate-only inclusive n_full_wide width gate (default: inherit "
+        "--n-full-wide-threshold).",
+    )
+    parser.add_argument(
+        "--baseline-n-full-wide-threshold",
+        type=int,
+        default=None,
+        help="Baseline-only inclusive n_full_wide width gate (default: inherit "
+        "--n-full-wide-threshold).",
+    )
     parser.add_argument("--raw-policy-above-width", type=int, default=None,
                         help="Phase-gated-search arm: at roots wider than this many legal actions, "
                         "skip search and play argmax(prior). Default None = always search (disabled).")
@@ -362,9 +761,17 @@ def main() -> None:
         default=False,
         help=(
             "f74b: denoise wide-root leaf value+prior by averaging the evaluator over all "
-            "12 D6 board orientations (gated to roots wider than wide_candidates_threshold). "
+            "12 D6 board orientations (gated by --symmetry-averaged-eval-threshold, "
+            "or the legacy shared threshold when unset). "
             "Threads to GumbelChanceMCTSConfig.symmetry_averaged_eval."
         ),
+    )
+    parser.add_argument(
+        "--symmetry-averaged-eval-threshold",
+        type=int,
+        default=None,
+        help="Shared inclusive minimum legal-action count for D6 averaging. "
+        "Default None preserves the legacy > --wide-candidates-threshold gate.",
     )
     parser.add_argument("--base-seed", type=int, default=1)
     parser.add_argument(
@@ -390,10 +797,34 @@ def main() -> None:
     args.elo0, args.elo1 = _gate_params["elo0"], _gate_params["elo1"]
 
     # CAT-66 typed config + config-hash (cross-checkpoint search-vs-search regime).
+    def _build_eval_config(resolved_args: Any) -> EvalConfig:
+        candidate_readout, baseline_readout = _resolve_value_readouts(resolved_args)
+        budgets = _resolve_search_budgets(resolved_args)
+        return EvalConfig.from_namespace(
+            resolved_args,
+            mode="cross_net",
+            candidate_value_readout=candidate_readout,
+            baseline_value_readout=baseline_readout,
+            candidate_n_full=budgets["candidate_n_full"],
+            baseline_n_full=budgets["baseline_n_full"],
+            candidate_n_full_wide=budgets["candidate_n_full_wide"],
+            baseline_n_full_wide=budgets["baseline_n_full_wide"],
+            candidate_n_full_wide_threshold=budgets[
+                "candidate_n_full_wide_threshold"
+            ],
+            baseline_n_full_wide_threshold=budgets[
+                "baseline_n_full_wide_threshold"
+            ],
+        )
+
     eval_config = resolve_config(
-        args, lambda a: EvalConfig.from_namespace(a, mode="cross_net"), parser=parser
+        args,
+        _build_eval_config,
+        parser=parser,
     )
     eval_config_hash = eval_config.config_hash()
+    eval_full_config_hash = eval_config.full_config_hash()
+    candidate_value_readout, baseline_value_readout = _resolve_value_readouts(args)
 
     pairs = [{"pair_id": i, "game_seed": int(args.base_seed) + i} for i in range(max(1, int(args.pairs)))]
     workers = max(1, int(args.workers))
@@ -434,6 +865,9 @@ def main() -> None:
             "max_decisions": int(args.max_decisions),
             "prior_temperature": float(args.prior_temperature),
             "value_scale": float(args.value_scale),
+            "value_readout": str(args.value_readout),
+            "candidate_value_readout": candidate_value_readout,
+            "baseline_value_readout": baseline_value_readout,
             "correct_rust_chance_spectra": bool(args.correct_rust_chance_spectra),
             "lazy_interior_chance": bool(args.lazy_interior_chance),
             "public_observation": bool(args.public_observation),
@@ -441,15 +875,28 @@ def main() -> None:
             "value_squash": str(args.value_squash),
             "c_scale": float(args.c_scale),
             "c_visit": float(args.c_visit),
+            "rescale_noise_floor_c": float(args.rescale_noise_floor_c),
+            "sigma_eval": float(args.sigma_eval),
             "max_root_candidates": int(args.max_root_candidates),
             "max_root_candidates_wide": int(args.max_root_candidates_wide),
+            "wide_candidates_threshold": int(args.wide_candidates_threshold),
             "n_full_wide": (int(args.n_full_wide) if args.n_full_wide is not None else None),
+            "n_full_wide_threshold": (
+                int(args.n_full_wide_threshold)
+                if args.n_full_wide_threshold is not None
+                else None
+            ),
             "raw_policy_above_width": (
                 int(args.raw_policy_above_width)
                 if args.raw_policy_above_width is not None
                 else None
             ),
             "symmetry_averaged_eval": bool(args.symmetry_averaged_eval),
+            "symmetry_averaged_eval_threshold": (
+                int(args.symmetry_averaged_eval_threshold)
+                if args.symmetry_averaged_eval_threshold is not None
+                else None
+            ),
             "threads_per_worker": threads_per_worker,
             "worker_seed": int(args.base_seed) + 0x9E3779B9 * (worker_index + 1),
         }
@@ -461,6 +908,18 @@ def main() -> None:
             args_dict["candidate_n_full"] = int(args.candidate_n_full)
         if args.baseline_n_full is not None:
             args_dict["baseline_n_full"] = int(args.baseline_n_full)
+        if args.candidate_n_full_wide is not None:
+            args_dict["candidate_n_full_wide"] = int(args.candidate_n_full_wide)
+        if args.baseline_n_full_wide is not None:
+            args_dict["baseline_n_full_wide"] = int(args.baseline_n_full_wide)
+        if args.candidate_n_full_wide_threshold is not None:
+            args_dict["candidate_n_full_wide_threshold"] = int(
+                args.candidate_n_full_wide_threshold
+            )
+        if args.baseline_n_full_wide_threshold is not None:
+            args_dict["baseline_n_full_wide_threshold"] = int(
+                args.baseline_n_full_wide_threshold
+            )
         worker_args.append(args_dict)
 
     started = time.perf_counter()
@@ -484,8 +943,10 @@ def main() -> None:
 
     all_games: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
+    search_telemetry = _new_search_telemetry()
     for result in results:
         all_games.extend(result.get("games", ()))
+        _add_search_telemetry(search_telemetry, result.get("search_telemetry", {}))
         if result.get("error"):
             errors.append({"worker_index": result.get("worker_index"), "error": result["error"]})
         for pair_error in result.get("pair_errors") or ():
@@ -503,8 +964,11 @@ def main() -> None:
         workers=workers,
         threads_per_worker=threads_per_worker,
         errors=errors,
+        search_telemetry=search_telemetry,
     )
     summary["config_hash"] = eval_config_hash
+    summary["full_config_hash"] = eval_full_config_hash
+    summary["typed_config"] = eval_config.canonical_payload()
     write_json(args.out, summary)
     print(json.dumps({k: v for k, v in summary.items() if k != "games"}, indent=2, sort_keys=True))
 
@@ -520,6 +984,7 @@ def _build_summary(
     workers: int,
     threads_per_worker: int,
     errors: list[Any],
+    search_telemetry: dict[str, dict[str, float | int]] | None = None,
 ) -> dict[str, Any]:
     sprt = evaluate_sprt(outcomes=outcomes, elo0=float(args.elo0), elo1=float(args.elo1))
     pair_outcomes, pair_diagnostics = _concordant_pair_outcomes(all_games)
@@ -541,12 +1006,10 @@ def _build_summary(
     # itself applies, so a report always states the ACTUAL n_full each role searched
     # with, even when --candidate-n-full/--baseline-n-full were left at their
     # default (None) and --n-full was used for both roles.
-    resolved_candidate_n_full = (
-        int(args.candidate_n_full) if getattr(args, "candidate_n_full", None) is not None else int(args.n_full)
-    )
-    resolved_baseline_n_full = (
-        int(args.baseline_n_full) if getattr(args, "baseline_n_full", None) is not None else int(args.n_full)
-    )
+    budgets = _resolve_search_budgets(args)
+    resolved_candidate_n_full = int(budgets["candidate_n_full"])
+    resolved_baseline_n_full = int(budgets["baseline_n_full"])
+    candidate_value_readout, baseline_value_readout = _resolve_value_readouts(args)
 
     return {
         "candidate_checkpoint": args.candidate,
@@ -557,18 +1020,58 @@ def _build_summary(
         "baseline_n_full": resolved_baseline_n_full,
         "lazy_interior_chance": bool(args.lazy_interior_chance),
         "value_squash": str(args.value_squash),
+        "value_readout": str(args.value_readout),
+        "candidate_value_readout": candidate_value_readout,
+        "baseline_value_readout": baseline_value_readout,
         "c_scale": float(args.c_scale),
         "c_visit": float(args.c_visit),
+        "rescale_noise_floor_c": float(getattr(args, "rescale_noise_floor_c", 0.0)),
+        "sigma_eval": float(getattr(args, "sigma_eval", 0.79)),
         "max_root_candidates": int(args.max_root_candidates),
         "max_root_candidates_wide": int(args.max_root_candidates_wide),
+        "wide_candidates_threshold": int(getattr(args, "wide_candidates_threshold", 24)),
         "correct_rust_chance_spectra": bool(args.correct_rust_chance_spectra),
         "public_observation": bool(args.public_observation),
         "belief_chance_spectra": bool(args.belief_chance_spectra),
         "n_full_wide": (int(args.n_full_wide) if args.n_full_wide is not None else None),
+        "n_full_wide_threshold": (
+            int(args.n_full_wide_threshold)
+            if getattr(args, "n_full_wide_threshold", None) is not None
+            else None
+        ),
+        "candidate_n_full_wide": budgets["candidate_n_full_wide"],
+        "baseline_n_full_wide": budgets["baseline_n_full_wide"],
+        "candidate_n_full_wide_threshold": budgets[
+            "candidate_n_full_wide_threshold"
+        ],
+        "baseline_n_full_wide_threshold": budgets[
+            "baseline_n_full_wide_threshold"
+        ],
+        "search_budgets_by_role": {
+            "candidate": {
+                "n_full": resolved_candidate_n_full,
+                "n_full_wide": budgets["candidate_n_full_wide"],
+                "n_full_wide_threshold": budgets[
+                    "candidate_n_full_wide_threshold"
+                ],
+            },
+            "baseline": {
+                "n_full": resolved_baseline_n_full,
+                "n_full_wide": budgets["baseline_n_full_wide"],
+                "n_full_wide_threshold": budgets[
+                    "baseline_n_full_wide_threshold"
+                ],
+            },
+        },
         "raw_policy_above_width": (
             int(args.raw_policy_above_width) if args.raw_policy_above_width is not None else None
         ),
         "symmetry_averaged_eval": bool(args.symmetry_averaged_eval),
+        "symmetry_averaged_eval_threshold": (
+            int(args.symmetry_averaged_eval_threshold)
+            if getattr(args, "symmetry_averaged_eval_threshold", None) is not None
+            else None
+        ),
         "pairs_requested": len(pairs),
         "games_played": len(all_games),
         "games_with_winner": len(outcomes),
@@ -591,6 +1094,9 @@ def _build_summary(
         "elapsed_sec": elapsed,
         "workers": workers,
         "threads_per_worker": threads_per_worker,
+        "search_telemetry": _finalize_search_telemetry(
+            search_telemetry or _new_search_telemetry()
+        ),
         "errors": errors,
         "games": all_games,
     }

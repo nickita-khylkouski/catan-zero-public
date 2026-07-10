@@ -14,10 +14,12 @@ columns phase_sliced_value_calibration needs for slicing.
 
 This module is the join of the two: the probe's held-out filtering logic,
 extended to also carry the slicing columns, feeding directly into
-phase_sliced_value_calibration's existing (imported, not duplicated)
-`compute_q` / `_calibration_stats` / `_slice_by` / `_legal_bucket` /
-`_PHASE_LABELS` machinery.
+phase_sliced_value_calibration's existing (imported, not duplicated) readout,
+provenance, calibration, and slicing machinery. The scalar readout remains the
+default; categorical calibration uses the same fail-closed checkpoint
+provenance contract as the non-holdout tool.
 """
+
 from __future__ import annotations
 
 import sys
@@ -102,16 +104,30 @@ def main() -> None:
     import argparse
     import json
 
-    from value_repair_calibration_probe import DEFAULT_HOLDOUT_BLOCKS, compute_q
-    from phase_sliced_value_calibration import _calibration_stats, _slice_by, _legal_bucket
+    from value_repair_calibration_probe import DEFAULT_HOLDOUT_BLOCKS
+    from phase_sliced_value_calibration import (
+        build_calibration_summary,
+        compute_readout,
+    )
     from catan_zero.rl.entity_token_features import mask_player_tokens_public
     from catan_zero.rl.entity_token_policy import EntityGraphPolicy
+    from factory_common import write_json
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--device", default="cpu")
+    parser.add_argument(
+        "--value-readout",
+        choices=("scalar", "categorical"),
+        default="scalar",
+        help=(
+            "Value expectation to calibrate. Categorical fails closed unless "
+            "the checkpoint has positive value-training-v1 provenance."
+        ),
+    )
     parser.add_argument("--max-rows", type=int, default=None)
     parser.add_argument("--min-slice-rows", type=int, default=30)
+    parser.add_argument("--reliability-bins", type=int, default=10)
     parser.add_argument(
         "--mask-hidden-info",
         action=argparse.BooleanOptionalAction,
@@ -131,7 +147,9 @@ def main() -> None:
     parser.add_argument("--out", required=True)
     args = parser.parse_args()
 
-    groups = collect_holdout_rows_with_slices(DEFAULT_HOLDOUT_BLOCKS, max_rows=args.max_rows)
+    groups = collect_holdout_rows_with_slices(
+        DEFAULT_HOLDOUT_BLOCKS, max_rows=args.max_rows
+    )
     policy = EntityGraphPolicy.load(args.checkpoint, device=args.device)
 
     use_masking = resolve_use_masking(args.mask_hidden_info, policy)
@@ -139,23 +157,21 @@ def main() -> None:
         for group in groups:
             group["player_tokens"] = mask_player_tokens_public(group["player_tokens"])
 
-    q, z = compute_q(policy, groups)
-    phase = np.concatenate([g["phase_label"] for g in groups], axis=0)
-    forced = np.concatenate([g["forced"] for g in groups], axis=0)
-    legal_count = np.concatenate([g["legal_count"] for g in groups], axis=0)
-    legal_bucket = np.array([_legal_bucket(int(c)) for c in legal_count])
-    forced_label = np.where(forced, "forced", "unforced")
-
-    summary = {
-        "checkpoint": args.checkpoint,
-        "mask_hidden_info_applied": bool(use_masking),
-        "holdout_blocks": list(DEFAULT_HOLDOUT_BLOCKS),
-        "global": _calibration_stats(q, z, min_rows=args.min_slice_rows),
-        "by_phase": _slice_by(q, z, phase, min_rows=args.min_slice_rows),
-        "by_forced": _slice_by(q, z, forced_label, min_rows=args.min_slice_rows),
-        "by_legal_count_bucket": _slice_by(q, z, legal_bucket, min_rows=args.min_slice_rows),
-    }
-    Path(args.out).write_text(json.dumps(summary, indent=2, sort_keys=True))
+    predictions = compute_readout(policy, groups, value_readout=args.value_readout)
+    summary = build_calibration_summary(
+        predictions,
+        groups,
+        min_slice_rows=args.min_slice_rows,
+        reliability_bin_count=args.reliability_bins,
+    )
+    summary.update(
+        {
+            "checkpoint": args.checkpoint,
+            "mask_hidden_info_applied": bool(use_masking),
+            "holdout_blocks": list(DEFAULT_HOLDOUT_BLOCKS),
+        }
+    )
+    write_json(args.out, summary)
     print(json.dumps(summary, indent=2, sort_keys=True))
 
 

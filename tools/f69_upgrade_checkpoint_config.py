@@ -20,7 +20,9 @@ placement root before writing -- see `docs/f69_v3b_finetune_launch.md`.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import os
 import sys
 from dataclasses import fields
 from pathlib import Path
@@ -167,16 +169,65 @@ def _preserve_source_top_level_keys(
     return sorted(k for k in in_raw if k not in mutated_keys)
 
 
+def _sha256_file(path: str | Path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _record_upgrade_provenance(
+    out_checkpoint: str,
+    *,
+    in_checkpoint: str,
+    flags: dict[str, object],
+    seed: int,
+) -> None:
+    """Atomically attest how freshly initialized upgrade modules were built."""
+
+    import torch
+
+    output = Path(out_checkpoint)
+    raw = torch.load(output, map_location="cpu", weights_only=False)
+    raw["upgrade_provenance"] = {
+        "schema_version": "entity-graph-upgrade-v1",
+        "source_checkpoint_sha256": _sha256_file(in_checkpoint),
+        "flags": dict(flags),
+        "initialization_seed": int(seed),
+        "trained_value_readouts_added": [],
+    }
+    tmp = output.with_name(f".{output.name}.upgrade.tmp.{os.getpid()}")
+    try:
+        torch.save(raw, tmp)
+        os.replace(tmp, output)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--in-checkpoint", required=True)
     parser.add_argument("--out-checkpoint", required=True)
     parser.add_argument("--flags", default="gather,cross:2,value")
     parser.add_argument("--device", default="cpu")
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=1,
+        help="Deterministic initialization seed for every newly added module.",
+    )
     parser.add_argument("--no-verify", action="store_true")
     args = parser.parse_args()
 
     overrides = _parse_flags(args.flags)
+    import torch
+
+    np.random.seed(int(args.seed))
+    torch.manual_seed(int(args.seed))
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(int(args.seed))
     base = EntityGraphPolicy.load(args.in_checkpoint, device=args.device)
     base.model.eval()
 
@@ -201,6 +252,12 @@ def main() -> None:
     preserved_source_keys = _preserve_source_top_level_keys(
         args.in_checkpoint, args.out_checkpoint
     )
+    _record_upgrade_provenance(
+        args.out_checkpoint,
+        in_checkpoint=args.in_checkpoint,
+        flags=overrides,
+        seed=int(args.seed),
+    )
     print(json.dumps({
         "in_checkpoint": args.in_checkpoint,
         "out_checkpoint": args.out_checkpoint,
@@ -209,6 +266,7 @@ def main() -> None:
         "forward_max_diff": max_diff,
         "forward_identical_at_init": (max_diff == 0.0) if max_diff is not None else "skipped",
         "preserved_source_keys": preserved_source_keys,
+        "initialization_seed": int(args.seed),
     }, indent=2, sort_keys=True))
 
 

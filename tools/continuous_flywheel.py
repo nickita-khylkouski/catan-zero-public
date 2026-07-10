@@ -24,6 +24,8 @@ STATE (all under --loop-dir, resumable, atomic per round):
                          desync between the journal and checkpoint_registry's actual champion;
                          reconcile_pending_promotion() repairs this on the next startup.
   flywheel_config.json  resolved FlywheelConfig (name-keyed)
+  champion_registry.json CAT-9 role ledger. This loop advances generator_champion only;
+                         public_champion remains pinned for a separate certification workflow.
   flywheel.lock          exclusive, non-blocking fcntl lock held for the process lifetime (two
                          orchestrators on the same --loop-dir would otherwise race window_state.json)
   gen/round_NNN/.round_done   per-round completion marker (atomicity: window+journal persisted only
@@ -31,7 +33,8 @@ STATE (all under --loop-dir, resumable, atomic per round):
   corpus/round_NNN/      windowed memmap corpus for the round; PRIOR rounds' corpora are deleted
                          once a round's train step succeeds (only the current + about-to-be-
                          superseded round survive on disk -- see cleanup_old_corpora()).
-  gates/round_NNN.json   h2h gate summary JSON (tools/gumbel_search_cross_net_h2h.py output)
+  gates/round_NNN.json   named flywheel-gate verdict/provenance (300 games, extends to 600)
+  gates/round_NNN_tier_*.json raw masking-safe H2H summaries for each tier actually run
 
 THREE INTEGRATION FOLLOW-UPS this orchestrator depends on for the FULL design (flagged, not yet in
 the pipeline — see the review findings):
@@ -67,6 +70,7 @@ from pathlib import Path
 from typing import Sequence
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(REPO_ROOT / "src"))
 sys.path.insert(0, str(REPO_ROOT / "tools"))
 
@@ -76,6 +80,15 @@ from catan_zero.rl.flywheel import (  # noqa: E402
 )
 
 import launcher_guards  # noqa: E402
+from tools.champion_registry import ChampionRegistry  # noqa: E402
+from tools.promotion_gate_runner import finalize_verdict, h2h_extend_tiers  # noqa: E402
+from tools.sprt_gate import (  # noqa: E402
+    PAIR_VALUES,
+    evaluate_pentanomial_sprt,
+    pair_scores_from_h2h_games,
+    r9_timeout_verdict,
+    resolve_gate_config,
+)
 
 # Round-seed stride: each round's game_seed block starts here*round, disjoint across rounds so
 # game_seed = base + game_index never collides between rounds (the seed-collision bug class).
@@ -87,6 +100,11 @@ SEED_STRIDE = 10_000_019  # prime, matches selfplay_loop.py's stride convention
 # stride guarantees gate seeds never collide with training-data seeds, in either direction.
 GATE_SEED_BASE_OFFSET = 100_000_000_000  # 1e11
 GATE_SEED_STRIDE = 10_000_103            # distinct prime from SEED_STRIDE
+
+# The continuous producer may advance only the generator champion. Public gen-N
+# certification is a separate policy and pointer; it must never be inferred from
+# this ordinary flywheel gate.
+FLYWHEEL_GATE_CONFIG_NAME = "flywheel"
 
 
 # ------------------------------------------------------------------ journal
@@ -337,14 +355,29 @@ class Runner:
         # GATE_SEED_* module constants) -- gate games can NEVER replay a training-data seed.
         return self.base_seed + GATE_SEED_BASE_OFFSET + round_idx * GATE_SEED_STRIDE
 
-    def _h2h_gate_cmd(self, candidate_path: str, champion_path: str, round_idx: int, out: Path) -> list[str]:
-        pairs = max(1, self.cfg.gate_games // 2)  # total games played = 2x pairs (color-swapped)
+    def _h2h_gate_cmd(
+        self,
+        candidate_path: str,
+        champion_path: str,
+        round_idx: int,
+        out: Path,
+        *,
+        tier_games: int | None = None,
+    ) -> list[str]:
+        gate_config, gate_params = resolve_gate_config(FLYWHEEL_GATE_CONFIG_NAME)
+        games = gate_config.base_games if tier_games is None else int(tier_games)
+        if games <= 0 or games % 2:
+            raise ValueError(f"paired H2H gate tier must be a positive even game count, got {games}")
+        pairs = games // 2  # two color-swapped games per paired seed
         cmd = [
             _py(), "tools/gumbel_search_cross_net_h2h.py",
             "--candidate", candidate_path, "--baseline", champion_path,
             "--pairs", str(pairs),
-            "--n-full", str(self.cfg.gate_sims),   # reduced sim budget for a cheap, low-variance gate
+            "--gate-config", str(gate_params["gate_config"]),
+            "--n-full", str(gate_params["n_sims"]),
             "--c-scale", str(self.cfg.gate_c_scale),  # NEVER rely on the tool's 0.1 default (drift trap)
+            "--candidate-value-readout", self.cfg.gate_candidate_value_readout,
+            "--baseline-value-readout", self.cfg.gate_baseline_value_readout,
             "--devices", self.device,
             "--workers", str(self.workers),
             "--base-seed", str(self._gate_seed(round_idx)),
@@ -352,22 +385,22 @@ class Runner:
         ]
         if self.cfg.gate_lazy_interior_chance:
             cmd.append("--lazy-interior-chance")
-        if self.cfg.masked:
-            # Symmetric hidden-info masking for BOTH nets' search (f72): required so a candidate
-            # trained with train_bc --mask-hidden-info is gated on the SAME observation regime it
-            # was trained under, instead of the omniscient-feature train/eval mismatch this was
-            # replacing (finding #1). force_full=True is already hardcoded in play_one_h2h_game, so
-            # gate_sims (n_full) alone controls the reduced gate budget -- no separate "force full"
-            # switch is needed on this tool.
-            cmd.append("--public-observation")
+        # Symmetric hidden-info masking for BOTH nets' search (f72). Generation and
+        # train_window are unconditionally public-observation/masked, so the default
+        # promotion path must be too; an old cfg.masked=False value may not silently
+        # turn the gate omniscient. The deprecated scoreboard opt-out remains loudly
+        # marked unsafe in gate().
+        cmd.append("--public-observation")
         return cmd
 
     def gate(self, candidate_path: str, champion_path: str, round_idx: int) -> dict:
-        """Cheap KataGo-style gate. Returns {ok, pass, verdict}. ALLOWLIST: promote ONLY on an
-        explicit accept-H1 verdict — SPRT reject (H0) or continue (inconclusive) are both a HOLD,
-        never a promote (the review caught this: !=reject previously silently promoted inconclusive
-        candidates). KataGo-style >=50%-winrate promotion (rather than requiring a significant SPRT
-        win) is a config choice for later, not implemented on this path yet."""
+        """Named masking-safe flywheel gate. Returns {ok, pass, verdict}.
+
+        H1 promotes; H0 rejects; an ordinary inconclusive verdict holds. At the
+        600-game cap only, the shared R9 timeout rule may return
+        ``canary_promote``. That advances ``generator_champion`` for the next
+        self-play round but is explicitly never a public gen-N certification.
+        """
         if not self.cfg.gate_enabled:
             return {"ok": True, "pass": True, "verdict": "disabled", "note": "gate disabled"}
         if self.cfg.gate_style == "scoreboard":
@@ -382,28 +415,185 @@ class Runner:
     def _gate_h2h(self, candidate_path: str, champion_path: str, round_idx: int) -> dict:
         out = self.loop_dir / "gates" / f"round_{round_idx:03d}.json"
         out.parent.mkdir(parents=True, exist_ok=True)
-        cmd = self._h2h_gate_cmd(candidate_path, champion_path, round_idx, out)
+        gate_config, gate_params = resolve_gate_config(FLYWHEEL_GATE_CONFIG_NAME)
+        tiers = h2h_extend_tiers(
+            gate_config.base_games,
+            None,
+            max_games=gate_config.max_games,
+        )
+        common = {
+            "candidate": candidate_path,
+            "baseline": champion_path,
+            "gate_config_params": gate_params,
+            "h2h_tiers": tiers,
+            "public_observation": True,
+            "candidate_value_readout": self.cfg.gate_candidate_value_readout,
+            "baseline_value_readout": self.cfg.gate_baseline_value_readout,
+            "promotion_scope": "generator_champion_only",
+            "public_champion_updated": False,
+        }
         if self.dry_run:
             # Surface the exact planned gate command (masking flag, gate_sims -> --n-full, disjoint
             # gate seed) so dry-run control-flow coverage includes the real gate path, without
             # actually running search games.
+            raw_out = out.with_name(f"{out.stem}_tier_{tiers[0]}.json")
+            cmd = self._h2h_gate_cmd(
+                candidate_path,
+                champion_path,
+                round_idx,
+                raw_out,
+                tier_games=tiers[0],
+            )
             print(f"[flywheel][dry-run] gate cmd (round {round_idx}): {shlex.join(cmd)}", flush=True)
             wr = 0.50 + max(0.0, 0.06 - 0.01 * round_idx)
             v = "promote" if wr >= self.cfg.gate_min_winrate else "reject"
-            return {"ok": True, "pass": v == "promote", "verdict": v, "winrate": round(wr, 3),
-                    "note": "dry-run stub (h2h gate path)", "cmd": cmd}
-        code = _run(cmd, self.loop_dir / "gate.log")
-        summary = None
-        if out.exists():
-            try:
-                summary = json.loads(out.read_text())
-            except (json.JSONDecodeError, OSError):
-                pass
-        sprt = (summary or {}).get("pentanomial_sprt") or {}
-        decision = sprt.get("decision")  # "H1" (candidate better) | "H0" (reject) | "continue"
-        promoted = decision == "H1"
-        return {"ok": code == 0 and summary is not None, "pass": promoted, "verdict": decision,
-                "sprt": sprt, "winrate": (summary or {}).get("candidate_win_rate")}
+            result = {
+                **common,
+                "ok": True,
+                "pass": v == "promote",
+                "verdict": v,
+                "winrate": round(wr, 3),
+                "note": "dry-run stub (named masking-safe h2h gate path)",
+                "cmd": cmd,
+                "tiers_run": [],
+            }
+            _atomic_json(out, result)
+            return result
+
+        tiers_run: list[dict] = []
+        final_summary: dict | None = None
+        final_sprt: dict | None = None
+        for tier_index, tier_games in enumerate(tiers):
+            raw_out = out.with_name(f"{out.stem}_tier_{tier_games}.json")
+            cmd = self._h2h_gate_cmd(
+                candidate_path,
+                champion_path,
+                round_idx,
+                raw_out,
+                tier_games=tier_games,
+            )
+            code = _run(cmd, self.loop_dir / "gate.log")
+            summary = None
+            if raw_out.exists():
+                try:
+                    summary = json.loads(raw_out.read_text())
+                except (json.JSONDecodeError, OSError):
+                    pass
+            if code != 0 or summary is None:
+                result = {
+                    **common,
+                    "ok": False,
+                    "pass": False,
+                    "verdict": "gate_error",
+                    "exit_code": code,
+                    "tiers_run": tiers_run,
+                }
+                _atomic_json(out, result)
+                return result
+
+            # Fail closed if the subprocess did not attest the same public-only
+            # observation regime that its command requested. This protects against
+            # an old/mismatched H2H binary silently ignoring the flag.
+            if summary.get("public_observation") is not True:
+                result = {
+                    **common,
+                    "ok": False,
+                    "pass": False,
+                    "verdict": "masking_mismatch",
+                    "reason": "H2H artifact did not attest public_observation=true",
+                    "raw_summary": str(raw_out),
+                    "tiers_run": tiers_run,
+                }
+                _atomic_json(out, result)
+                return result
+
+            expected_readouts = (
+                self.cfg.gate_candidate_value_readout,
+                self.cfg.gate_baseline_value_readout,
+            )
+            observed_readouts = (
+                summary.get("candidate_value_readout"),
+                summary.get("baseline_value_readout"),
+            )
+            if observed_readouts != expected_readouts:
+                result = {
+                    **common,
+                    "ok": False,
+                    "pass": False,
+                    "verdict": "value_readout_mismatch",
+                    "reason": (
+                        "H2H artifact did not attest the requested role-specific "
+                        f"value readouts: expected={expected_readouts!r}, "
+                        f"observed={observed_readouts!r}"
+                    ),
+                    "raw_summary": str(raw_out),
+                    "tiers_run": tiers_run,
+                }
+                _atomic_json(out, result)
+                return result
+
+            pair_scores, pair_diagnostics = pair_scores_from_h2h_games(summary.get("games", []))
+            final_sprt = evaluate_pentanomial_sprt(
+                pair_scores,
+                elo0=float(gate_params["elo0"]),
+                elo1=float(gate_params["elo1"]),
+                alpha=float(gate_params["alpha"]),
+                beta=float(gate_params["beta"]),
+            )
+            final_sprt.update(
+                {
+                    "tier_games": int(summary.get("games_played", tier_games)),
+                    "tier_index": tier_index,
+                    "tiers": tiers,
+                    "pair_diagnostics": pair_diagnostics,
+                }
+            )
+            tiers_run.append(
+                {
+                    "games": tier_games,
+                    "raw_summary": str(raw_out),
+                    "decision": final_sprt["decision"],
+                }
+            )
+            final_summary = summary
+            if final_sprt["decision"] == "continue" and tier_index == len(tiers) - 1:
+                counts = (
+                    int(final_sprt.get("ll_pairs", 0)),
+                    int(final_sprt.get("split_pairs", 0)),
+                    int(final_sprt.get("ww_pairs", 0)),
+                )
+                timeout = r9_timeout_verdict(
+                    counts,
+                    values=PAIR_VALUES,
+                    elo_floor=float(gate_params["elo0"]),
+                )
+                final_sprt["r9_timeout"] = timeout
+                if timeout["canary_eligible"]:
+                    final_sprt["decision"] = "canary_promote"
+            if final_sprt["decision"] != "continue":
+                break
+
+        if final_summary is None or final_sprt is None:
+            result = {**common, "ok": False, "pass": False, "verdict": "gate_error", "tiers_run": tiers_run}
+            _atomic_json(out, result)
+            return result
+
+        # Reuse promotion_gate_runner's canonical H1/H0/continue/canary mapping;
+        # this masking-safe adapter has no unmasked roster legs, so the roster is
+        # deliberately empty rather than reimplementing its verdict semantics.
+        decision = finalize_verdict(final_sprt, {})
+        verdict = str(decision["verdict"])
+        result = {
+            **common,
+            **decision,
+            "ok": True,
+            "pass": verdict in {"promote", "canary_promote"},
+            "winrate": final_summary.get("candidate_win_rate"),
+            "tiers_run": tiers_run,
+            "raw_summary": tiers_run[-1]["raw_summary"],
+        }
+        _atomic_json(out, result)
+        return result
 
     def _gate_scoreboard(self, candidate_path: str, champion_path: str, round_idx: int) -> dict:
         """DEPRECATED gate path (finding #1): kept only behind ``gate_style="scoreboard"`` as an
@@ -519,6 +709,104 @@ def _run(cmd: list[str], log_path: Path) -> int:
         return subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT, cwd=str(REPO_ROOT)).returncode
 
 
+# ------------------------------------------------------------------ role registry
+def ensure_generator_champion_role(
+    registry_path: Path,
+    champion,
+    *,
+    reason: str = "continuous flywheel startup reconciliation",
+) -> dict:
+    """Make the CAT-9 ``generator_champion`` role match the checkpoint registry.
+
+    The lower-level flywheel checkpoint registry owns/copies the weight files;
+    ``ChampionRegistry`` is the durable role/provenance ledger. Only the generator
+    role is touched here. In particular, an existing ``public_champion`` remains
+    pinned until a separate certification workflow changes it.
+    """
+    registry = ChampionRegistry.load(registry_path)
+    public_before = registry.get_role("public_champion")
+    current = registry.get_role("generator_champion")
+    changed = not (
+        current is not None
+        and current.checkpoint_path == champion.path
+        and current.version == champion.version
+    )
+    if changed:
+        current = registry.set_role(
+            "generator_champion",
+            champion.path,
+            version=champion.version,
+            provenance={"source": "continuous_flywheel", "startup_reconciled": True},
+            reason=reason,
+        )
+        registry.save()
+    public_after = registry.get_role("public_champion")
+    if public_after != public_before:
+        raise RuntimeError("continuous flywheel changed public_champion during generator-role sync")
+    return {
+        "path": str(registry_path),
+        "generator_champion": current.to_dict() if current is not None else None,
+        "public_champion_updated": False,
+        "changed": changed,
+    }
+
+
+def record_generator_promotion(
+    registry_path: Path,
+    champion,
+    *,
+    round_idx: int,
+    gate: dict,
+) -> dict:
+    """Record one generator-only flywheel promotion atomically and idempotently.
+
+    A crash can happen after ``ChampionRegistry.save()`` but before the flywheel
+    journal clears ``promotion_pending``. The round marker in provenance makes the
+    recovery call idempotent, including the promotion counter.
+    """
+    registry = ChampionRegistry.load(registry_path)
+    public_before = registry.get_role("public_champion")
+    current = registry.get_role("generator_champion")
+    already_recorded = bool(
+        current is not None
+        and current.checkpoint_path == champion.path
+        and current.version == champion.version
+        and current.provenance.get("flywheel_round") == int(round_idx)
+    )
+    if not already_recorded:
+        gate_config_params = dict(gate.get("gate_config_params") or {})
+        current = registry.set_role(
+            "generator_champion",
+            champion.path,
+            version=champion.version,
+            provenance={
+                "source": "continuous_flywheel",
+                "flywheel_round": int(round_idx),
+                "gate_config_params": gate_config_params,
+                "gate_verdict": gate.get("verdict"),
+                "candidate_value_readout": gate.get("candidate_value_readout"),
+                "baseline_value_readout": gate.get("baseline_value_readout"),
+                "promotion_scope": "generator_champion_only",
+            },
+            reason=(
+                f"flywheel round {round_idx}: generator-only promotion "
+                f"({gate_config_params.get('gate_config', 'unnamed')} verdict={gate.get('verdict')})"
+            ),
+        )
+        registry.record_promotion("generator_champion")
+        registry.save()
+    public_after = registry.get_role("public_champion")
+    if public_after != public_before:
+        raise RuntimeError("continuous flywheel changed public_champion during generator promotion")
+    return {
+        "path": str(registry_path),
+        "generator_champion": current.to_dict() if current is not None else None,
+        "promotion_count": registry.promotion_count("generator_champion"),
+        "already_recorded": already_recorded,
+        "public_champion_updated": False,
+    }
+
+
 # ------------------------------------------------------------------ corpus cleanup (finding #3)
 def cleanup_old_corpora(loop_dir: Path, keep_round_idx: int) -> list[str]:
     """Delete ``corpus/round_NNN`` dirs from PRIOR rounds once THIS round's train step has
@@ -546,7 +834,12 @@ def cleanup_old_corpora(loop_dir: Path, keep_round_idx: int) -> list[str]:
 
 
 # ------------------------------------------------------------------ crash-atomicity (finding #4)
-def reconcile_pending_promotion(loop_dir: Path, journal: dict, gen_root: Path) -> None:
+def reconcile_pending_promotion(
+    loop_dir: Path,
+    journal: dict,
+    gen_root: Path,
+    champion_registry_path: Path | None = None,
+) -> None:
     """Startup crash-recovery for the two-phase promotion journal: if the LAST round record was
     left with ``promotion_pending=True`` (the process died between committing that pending record
     and ``promote()`` finishing), reconcile the journal against ``checkpoint_registry``'s actual
@@ -570,6 +863,19 @@ def reconcile_pending_promotion(loop_dir: Path, journal: dict, gen_root: Path) -
     last["decision"] = (f"promote(v{champ_version})_reconciled" if champ_version is not None
                         else "promote_reconcile_failed_no_champion")
     last["reconciled_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    target_version = (last.get("train") or {}).get("version")
+    if (
+        champion_registry_path is not None
+        and champ is not None
+        and target_version is not None
+        and int(target_version) == int(champ.version)
+    ):
+        last["champion_registry"] = record_generator_promotion(
+            champion_registry_path,
+            champ,
+            round_idx=int(last.get("round", -1)),
+            gate=dict(last.get("gate") or {}),
+        )
     save_journal(loop_dir, journal)
     round_idx = last.get("round")
     if round_idx is not None:
@@ -604,10 +910,31 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--loop-dir", required=True)
     p.add_argument("--seed-checkpoint", required=True, help="gen-0 champion (e.g. v3a masked)")
+    p.add_argument(
+        "--champion-registry",
+        default=None,
+        help=(
+            "CAT-9 role registry JSON (default <loop-dir>/champion_registry.json). "
+            "Ordinary flywheel promotions update generator_champion only; "
+            "public_champion remains pinned for separate certification."
+        ),
+    )
     p.add_argument("--regime", choices=["continuous", "discrete"], default="continuous")
     p.add_argument("--window-c-rows", type=int, default=300_000)
     p.add_argument("--opponent-pool-fraction", type=float, default=0.20)
     p.add_argument("--gate-games", type=int, default=150)
+    p.add_argument(
+        "--gate-candidate-value-readout",
+        choices=("scalar", "categorical"),
+        default="scalar",
+        help="Candidate search value source in the H2H promotion gate.",
+    )
+    p.add_argument(
+        "--gate-baseline-value-readout",
+        choices=("scalar", "categorical"),
+        default="scalar",
+        help="Incumbent search value source in the H2H promotion gate.",
+    )
     p.add_argument("--batch-size", type=int, default=65536, help="MUST match train_bc --batch-size")
     p.add_argument("--games-per-round", type=int, default=2000)
     p.add_argument("--workers", type=int, default=8)
@@ -622,6 +949,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--gen-n-full", type=int, default=None, help="CAT-88 gen search: full-sim budget (e.g. volume 64, teacher 128)")
     p.add_argument("--gen-n-fast", type=int, default=None, help="CAT-88 gen search: fast-sim budget (e.g. 16)")
     p.add_argument("--gen-p-full", type=float, default=None, help="CAT-88 gen search: full-sim probability (e.g. volume 0.25, teacher 1.0)")
+    p.add_argument("--gen-n-full-wide", type=int, default=None, help="Adaptive full-sim budget at wide roots (e.g. 256); default disabled")
+    p.add_argument("--gen-n-full-wide-threshold", type=int, default=None, help="Inclusive minimum legal-action count for the adaptive wide budget (e.g. 40)")
+    p.add_argument("--gen-wide-roots-always-full", action=argparse.BooleanOptionalAction, default=False, help="Bypass gen-p-full at roots selected by gen-n-full-wide")
+    p.add_argument("--gen-symmetry-averaged-eval", action=argparse.BooleanOptionalAction, default=None, help="Generation D6 wide-root denoising arm; explicit on/off is required")
+    p.add_argument("--gen-symmetry-averaged-eval-threshold", type=int, default=None, help="Inclusive D6 minimum root width, independent of adaptive-budget threshold")
+    p.add_argument("--gen-wide-candidates-threshold", type=int, default=None, help="Generation wide-root threshold for D6 averaging (canonical arm: 24)")
     p.add_argument("--gen-c-visit", type=float, default=None, help="CAT-88 gen search: c_visit (e.g. 50.0)")
     p.add_argument("--gen-c-scale", type=float, default=None, help="CAT-88 gen search: c_scale (canonical 0.03, NOT the tool default 0.1)")
     p.add_argument("--gen-max-decisions", type=int, default=None, help="CAT-88 gen search: max decisions/game (e.g. 600)")
@@ -693,6 +1026,8 @@ def _build_guard_specs(
                         "regime": args.regime,
                         "window_c_rows": args.window_c_rows,
                         "train_batch_size": args.batch_size,
+                        "gate_candidate_value_readout": args.gate_candidate_value_readout,
+                        "gate_baseline_value_readout": args.gate_baseline_value_readout,
                     },
                 },
             }
@@ -707,6 +1042,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     loop_dir = Path(args.loop_dir)
     loop_dir.mkdir(parents=True, exist_ok=True)
     gen_root = Path(args.gen_out_root) if args.gen_out_root else loop_dir / "gen"
+    champion_registry_path = (
+        Path(args.champion_registry) if args.champion_registry else loop_dir / "champion_registry.json"
+    )
 
     # Guards never run under --dry-run: dry-run exercises control flow only (stub
     # gen/train/gate, no fleet, no torch) and legitimately points --seed-checkpoint
@@ -732,12 +1070,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     cfg = FlywheelConfig(
         regime=args.regime, window_c_rows=args.window_c_rows,
         opponent_pool_fraction=args.opponent_pool_fraction, gate_games=args.gate_games,
+        gate_candidate_value_readout=args.gate_candidate_value_readout,
+        gate_baseline_value_readout=args.gate_baseline_value_readout,
         train_batch_size=args.batch_size, evict_stale_shards=args.evict_stale_shards,
         anchor_corpora=list(args.anchor_corpora), anchor_holdout_ranges=args.anchor_holdout_ranges,
         anchor_eval_every_rounds=args.anchor_eval_every_rounds,
         anchor_drift_alert_threshold=args.anchor_drift_alert_threshold,
         # CAT-88: gen search config (run-dependent; None -> raises at first generation).
         gen_n_full=args.gen_n_full, gen_n_fast=args.gen_n_fast, gen_p_full=args.gen_p_full,
+        gen_n_full_wide=args.gen_n_full_wide,
+        gen_n_full_wide_threshold=args.gen_n_full_wide_threshold,
+        gen_wide_roots_always_full=args.gen_wide_roots_always_full,
+        gen_symmetry_averaged_eval=args.gen_symmetry_averaged_eval,
+        gen_symmetry_averaged_eval_threshold=args.gen_symmetry_averaged_eval_threshold,
+        gen_wide_candidates_threshold=args.gen_wide_candidates_threshold,
         gen_c_visit=args.gen_c_visit, gen_c_scale=args.gen_c_scale,
         gen_max_decisions=args.gen_max_decisions, gen_max_depth=args.gen_max_depth,
         gen_temperature_decisions=args.gen_temperature_decisions,
@@ -756,7 +1102,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     journal = load_journal(loop_dir)
     if journal["started_at"] is None:
         journal["started_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    reconcile_pending_promotion(loop_dir, journal, gen_root)  # finding #4: crash-recovery
+    reconcile_pending_promotion(
+        loop_dir,
+        journal,
+        gen_root,
+        champion_registry_path,
+    )  # finding #4: crash-recovery
+    ensure_generator_champion_role(champion_registry_path, read_champion(loop_dir))
     runner = Runner(cfg, loop_dir, dry_run=args.dry_run,
                     workers=args.workers, device=args.device, base_seed=args.base_seed)
 
@@ -854,6 +1206,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             round_committed = True
 
             new_champ = promote(loop_dir, cand, gate=g, elo=None)
+            rec["champion_registry"] = record_generator_promotion(
+                champion_registry_path,
+                new_champ,
+                round_idx=round_idx,
+                gate=g,
+            )
             rec["decision"] = f"promote(v{new_champ.version})"
             rec["promotion_pending"] = False
             rec["promoted_version"] = new_champ.version

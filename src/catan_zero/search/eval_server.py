@@ -75,14 +75,21 @@ class EvalServerConfig:
 
     Attributes:
         max_batch_size: Max requests packed into one ``forward_legal_np`` window.
+        max_neural_rows: Optional hard cap on the number of neural rows in any
+            single policy forward. Unlike ``max_batch_size``, this counts the
+            rows inside batched chance/root-wave requests. Oversized requests
+            are row-sliced and reassembled into one response.
         max_wait_ms: Straggler timeout; window flushes at size OR timeout.
         device: Torch device the single server-resident policy runs on.
         transport: ``"mp_queue"`` or opt-in ``"shared_memory"`` request slots.
         client_timeout_ms: Per-request client wait before raising (or falling
             back to a local evaluator if one is supplied).
+        experimental_autocast_dtype: Benchmark-only ``"bf16"``/``"fp16"``
+            CUDA autocast. ``None`` is the strict-FP32 production default.
     """
 
     max_batch_size: int = 64
+    max_neural_rows: int | None = None
     # Immediate queue draining won the H100 sweep at every tested workload;
     # callers may opt into a non-zero aggregation window, but latency is the
     # safer and faster default for the single-outstanding-request clients.
@@ -105,6 +112,11 @@ class EvalServerConfig:
     # "highest" is strict FP32 matmul. "high" permits CUDA TF32 tensor-core
     # matmuls; kept explicit so throughput/strength gates can compare regimes.
     matmul_precision: str = "highest"
+    # Benchmark-only reduced-precision experiment. No fleet/generator CLI wires
+    # this option: only tools/bench_eval_server.py exposes it, and None keeps
+    # the production path in strict FP32. Any candidate still needs target and
+    # playing-strength gates because small logit changes can alter MCTS paths.
+    experimental_autocast_dtype: str | None = None
     # Opt-in CUDA Graph capture of the fixed-shape state trunk. The raw policy
     # remains authoritative for checkpoint metadata and the server performs
     # event-tail cropping before this wrapper sees a request.
@@ -124,8 +136,21 @@ class EvalServerConfig:
         192,
     )
     cuda_graph_warmup_iterations: int = 3
-    # Temporary exact-A/B harness; removed after the paired H100 measurement.
-    benchmark_legacy_merge: bool = False
+
+    def __post_init__(self) -> None:
+        if self.experimental_autocast_dtype not in {None, "bf16", "fp16"}:
+            raise ValueError(
+                "experimental_autocast_dtype must be None, 'bf16', or 'fp16'"
+            )
+        if self.max_neural_rows is not None:
+            if isinstance(self.max_neural_rows, bool):
+                raise TypeError("max_neural_rows must be an integer, not bool")
+            try:
+                value = operator.index(self.max_neural_rows)
+            except TypeError as error:
+                raise TypeError("max_neural_rows must be an integer") from error
+            if value <= 0:
+                raise ValueError("max_neural_rows must be positive")
 
 
 # --- window assembly ---------------------------------------------------------
@@ -133,8 +158,6 @@ class EvalServerConfig:
 
 def _merge_forward_payloads(
     payloads: list[dict[str, Any]],
-    *,
-    fixed_field_concatenate: bool = True,
 ) -> tuple[dict[str, np.ndarray], np.ndarray, np.ndarray, list[int]]:
     """Pad every request's legal dim to the window max and concatenate along the
     batch axis. Generalizes `_merge_batched_eval_requests` to variable-B requests
@@ -171,17 +194,9 @@ def _merge_forward_payloads(
             # window copy in C rather than issuing requests*fields small Python
             # slice assignments. np.concatenate also preserves the historical
             # mixed-dtype promotion contract.
-            if fixed_field_concatenate:
-                entity[key] = np.concatenate(
-                    [payload["entity"][key] for payload in payloads], axis=0
-                )
-            else:
-                dtype = np.result_type(
-                    *(np.asarray(payload["entity"][key]).dtype for payload in payloads)
-                )
-                entity[key] = np.empty(
-                    (total_rows, *value.shape[1:]), dtype=dtype
-                )
+            entity[key] = np.concatenate(
+                [payload["entity"][key] for payload in payloads], axis=0
+            )
 
     offset = 0
     for payload, n_rows in zip(payloads, row_counts):
@@ -190,13 +205,82 @@ def _merge_forward_payloads(
         legal_ids[offset:end, :legal_width] = payload["legal_ids"]
         context[offset:end, :legal_width] = payload["context"]
         for key, destination in entity.items():
+            if key not in _LEGAL_PADDED_ENTITY_KEYS:
+                continue
             value = payload["entity"][key]
-            if key in _LEGAL_PADDED_ENTITY_KEYS:
-                destination[offset:end, :legal_width] = value
-            elif not fixed_field_concatenate:
-                destination[offset:end] = value
+            destination[offset:end, :legal_width] = value
         offset = end
     return entity, legal_ids, context, row_counts
+
+
+def _slice_forward_payload(
+    payload: dict[str, Any], start: int, stop: int
+) -> dict[str, Any]:
+    """Return a zero-copy row view of one forward request.
+
+    Transport/source telemetry belongs to the original request and is counted
+    before slicing, so fragments intentionally carry only forward inputs and
+    the request's Q requirement.
+    """
+    return {
+        "entity": {
+            key: np.asarray(value)[start:stop]
+            for key, value in payload["entity"].items()
+        },
+        "legal_ids": np.asarray(payload["legal_ids"])[start:stop],
+        "context": np.asarray(payload["context"])[start:stop],
+        "return_q": bool(payload.get("return_q", False)),
+    }
+
+
+def _forward_groups(
+    payloads: list[dict[str, Any]], max_neural_rows: int | None
+) -> tuple[list[list[tuple[int, dict[str, Any]]]], int, int]:
+    """Plan ordered, row-capped forwards without losing request boundaries.
+
+    Returns ``(groups, oversized_requests, oversized_request_chunks)``. With no
+    cap, the single group contains the original payload objects, preserving the
+    historical merge/forward path exactly. With a cap, requests remain ordered;
+    an oversized request can span groups, and each tuple retains its original
+    request index for response reassembly.
+    """
+    if max_neural_rows is None:
+        return [[(index, payload) for index, payload in enumerate(payloads)]], 0, 0
+
+    cap = int(max_neural_rows)
+    groups: list[list[tuple[int, dict[str, Any]]]] = []
+    group: list[tuple[int, dict[str, Any]]] = []
+    group_rows = 0
+    oversized_requests = 0
+    oversized_request_chunks = 0
+    for request_index, payload in enumerate(payloads):
+        rows = int(payload["legal_ids"].shape[0])
+        if rows <= 0:
+            raise ValueError("EvalServer requests must contain at least one row")
+        oversized = rows > cap
+        if oversized:
+            oversized_requests += 1
+        start = 0
+        while start < rows:
+            if group_rows == cap:
+                groups.append(group)
+                group = []
+                group_rows = 0
+            take = min(rows - start, cap - group_rows)
+            stop = start + take
+            fragment = (
+                payload
+                if start == 0 and stop == rows
+                else _slice_forward_payload(payload, start, stop)
+            )
+            group.append((request_index, fragment))
+            group_rows += take
+            if oversized:
+                oversized_request_chunks += 1
+            start = stop
+    if group:
+        groups.append(group)
+    return groups, oversized_requests, oversized_request_chunks
 
 
 def _legal_cell_counts(payloads: list[dict[str, Any]]) -> tuple[int, int]:
@@ -208,12 +292,17 @@ def _legal_cell_counts(payloads: list[dict[str, Any]]) -> tuple[int, int]:
     per-row occupancy signal and excludes both that intra-request padding and
     the additional padding introduced while merging a server window.
     """
-    real_cells = sum(
-        int(np.count_nonzero(payload["entity"]["legal_action_mask"]))
-        for payload in payloads
-    )
     request_cells = sum(
         int(payload["legal_ids"].shape[0]) * int(payload["legal_ids"].shape[1])
+        for payload in payloads
+    )
+    # Production entity payloads always carry the authoritative mask. Retain
+    # compatibility with narrow custom/test policies that omit action-token
+    # fields entirely: their legal_ids rectangle is all real by contract.
+    real_cells = sum(
+        int(np.count_nonzero(mask))
+        if (mask := payload["entity"].get("legal_action_mask")) is not None
+        else int(payload["legal_ids"].size)
         for payload in payloads
     )
     return real_cells, request_cells
@@ -746,10 +835,13 @@ def _make_forward_policy(policy: Any, config: EvalServerConfig) -> Any:
     """
     if not config.cuda_graph:
         return policy
+    if config.experimental_autocast_dtype is not None:
+        raise ValueError(
+            "EvalServer CUDA Graph inference does not support experimental autocast"
+        )
     if str(config.matmul_precision) != "highest":
         raise ValueError(
-            "EvalServer CUDA Graph inference requires "
-            "matmul_precision='highest'"
+            "EvalServer CUDA Graph inference requires matmul_precision='highest'"
         )
     from catan_zero.search.cuda_graph_inference import (
         CudaGraphInferenceConfig,
@@ -770,9 +862,7 @@ def _make_forward_policy(policy: Any, config: EvalServerConfig) -> Any:
 def _record_cuda_graph_call(stats: dict[str, Any], forward_policy: Any) -> None:
     """Accumulate runner-path telemetry after one successful forward call."""
     stats["cuda_graph_calls"] += 1
-    stats["cuda_graph_graph_count"] = int(
-        getattr(forward_policy, "graph_count", 0)
-    )
+    stats["cuda_graph_graph_count"] = int(getattr(forward_policy, "graph_count", 0))
     if getattr(forward_policy, "last_path", None) == "cuda_graph":
         return
     stats["cuda_graph_fallbacks"] += 1
@@ -805,6 +895,19 @@ def _server_main(
     if precision not in {"highest", "high", "medium"}:
         raise ValueError(f"invalid EvalServer matmul_precision={precision!r}")
     torch.set_float32_matmul_precision(precision)
+    autocast_name = config.experimental_autocast_dtype
+    autocast_dtype: Any | None = None
+    configured_device: Any | None = None
+    if autocast_name is not None:
+        configured_device = torch.device(config.device)
+        if configured_device.type != "cuda":
+            raise ValueError(
+                "EvalServer experimental autocast requires a CUDA device"
+            )
+        autocast_dtype = {
+            "bf16": torch.bfloat16,
+            "fp16": torch.float16,
+        }[autocast_name]
     policy = EntityGraphPolicy.load(checkpoint, device=config.device)
     handshake["action_size"] = int(policy.action_size)
     handshake["trained_with_masked_hidden_info"] = bool(
@@ -812,17 +915,42 @@ def _server_main(
     )
     handshake["needs_action_targets"] = _policy_needs_action_targets(policy)
     handshake["matmul_precision"] = precision
+    handshake["experimental_autocast_dtype"] = autocast_name
     handshake["transport"] = str(config.transport)
+    handshake["max_neural_rows"] = config.max_neural_rows
     handshake["event_token_limit"] = config.event_token_limit
-    handshake["client_event_token_limit"] = (
-        None if config.benchmark_legacy_merge else config.event_token_limit
-    )
     handshake["cuda_graph"] = bool(config.cuda_graph)
     handshake["cuda_graph_batch_buckets"] = tuple(config.cuda_graph_batch_buckets)
-    handshake["cuda_graph_warmup_iterations"] = int(
-        config.cuda_graph_warmup_iterations
-    )
+    handshake["cuda_graph_warmup_iterations"] = int(config.cuda_graph_warmup_iterations)
     forward_policy = _make_forward_policy(policy, config)
+    policy_model = getattr(policy, "model", None)
+    categorical_bins = int(
+        getattr(policy_model, "value_categorical_bins", 0) or 0
+    )
+    missing_state_keys = tuple(getattr(policy, "_checkpoint_missing_state_keys", ()))
+    trained_readouts = tuple(
+        str(readout)
+        for readout in getattr(policy, "trained_value_readouts", ("scalar",))
+    )
+    handshake["value_categorical_bins"] = categorical_bins
+    handshake["value_categorical_head_available"] = bool(
+        categorical_bins >= 2
+        and getattr(policy_model, "value_categorical_head", None) is not None
+        and not any(
+            str(key).startswith("value_categorical_head.") for key in missing_state_keys
+        )
+        and "categorical" in trained_readouts
+    )
+    cuda_memory_device: Any | None = None
+    cuda_api = getattr(torch, "cuda", None)
+    if cuda_api is not None and cuda_api.is_available():
+        configured_device = torch.device(config.device)
+        if configured_device.type == "cuda":
+            cuda_memory_device = configured_device
+            # The model's live allocation remains in the new peak baseline;
+            # discard only checkpoint-load transients so row-cap sweeps compare
+            # steady-state policy plus forward workspace memory.
+            cuda_api.reset_peak_memory_stats(cuda_memory_device)
     # Warm the CUDA context / kernels once so the first real window isn't slow.
     handshake["ready"] = True
     ready_event.set()
@@ -835,6 +963,13 @@ def _server_main(
         "rows": 0,
         "max_window_requests": 0,
         "max_window_rows": 0,
+        "max_neural_rows": config.max_neural_rows,
+        "experimental_autocast_dtype": autocast_name,
+        "forward_calls": 0,
+        "max_forward_rows": 0,
+        "forward_row_histogram": {},
+        "oversized_requests": 0,
+        "oversized_request_chunks": 0,
         "real_legal_cells": 0,
         "request_legal_cells": 0,
         "padded_legal_cells": 0,
@@ -862,6 +997,9 @@ def _server_main(
         "cuda_graph_graph_count": 0,
         "cuda_graph_last_fallback_reason": None,
         "cuda_graph_fallback_reason_histogram": {},
+        "cuda_memory_stats_enabled": cuda_memory_device is not None,
+        "cuda_peak_memory_allocated_bytes": None,
+        "cuda_peak_memory_reserved_bytes": None,
     }
     stopping = False
 
@@ -943,93 +1081,165 @@ def _server_main(
                         "eval-server request collector failed"
                     ) from collector_error
                 merge_started = time.perf_counter()
-                event_active_tokens: int | None = None
-                event_padded_tokens: int | None = None
-                required_event_width: int | None = None
-                if (
-                    config.event_token_limit is not None
-                    and not config.benchmark_legacy_merge
-                ):
-                    event_source_counts = [
-                        _payload_event_source_counts(payload) for payload in payloads
-                    ]
-                    event_active_tokens = sum(
-                        counts[0] for counts in event_source_counts
-                    )
-                    event_padded_tokens = sum(
-                        counts[1] for counts in event_source_counts
-                    )
+                event_source_counts = [
+                    _payload_event_source_counts(payload) for payload in payloads
+                ]
+                event_active_tokens = sum(counts[0] for counts in event_source_counts)
+                event_padded_tokens = sum(counts[1] for counts in event_source_counts)
+                premerge_required_event_width: int | None = None
+                if config.event_token_limit is not None:
                     client_cropped_events = all(
-                        "_event_source_padded_tokens" in payload
-                        for payload in payloads
+                        "_event_source_padded_tokens" in payload for payload in payloads
                     )
                     if not client_cropped_events:
-                        required_event_width = _crop_payload_event_tails_before_merge(
-                            payloads, config.event_token_limit
+                        premerge_required_event_width = (
+                            _crop_payload_event_tails_before_merge(
+                                payloads, config.event_token_limit
+                            )
                         )
-                entity, legal_ids, context, row_counts = _merge_forward_payloads(
-                    payloads,
-                    fixed_field_concatenate=not config.benchmark_legacy_merge,
+                forward_groups, oversized_requests, oversized_chunks = _forward_groups(
+                    payloads, config.max_neural_rows
                 )
-                if event_active_tokens is None or event_padded_tokens is None:
-                    merged_event_mask = np.asarray(
-                        entity["event_mask"], dtype=np.bool_
-                    )
-                    event_active_tokens = int(np.count_nonzero(merged_event_mask))
-                    event_padded_tokens = int(merged_event_mask.size)
                 stats["event_active_tokens"] += int(event_active_tokens)
                 stats["event_padded_tokens"] += int(event_padded_tokens)
-                if required_event_width is None:
-                    required_event_width = _crop_masked_event_tail(
-                        entity, config.event_token_limit
-                    )
-                event_histogram = stats["event_required_width_histogram"]
-                event_histogram[required_event_width] = (
-                    int(event_histogram.get(required_event_width, 0)) + 1
-                )
                 stats["merge_sec"] += time.perf_counter() - merge_started
-            forward_started = time.perf_counter()
-            with torch.inference_mode():
-                outputs = forward_policy.forward_legal_np(
-                    entity, legal_ids, context, return_q=any(return_q_flags)
+
+            result_parts: list[dict[str, list[np.ndarray]]] = [
+                {} for _payload in payloads
+            ]
+            required_event_widths: list[int] = []
+            padded_legal_cells = 0
+            for forward_group in forward_groups:
+                group_request_indices = [item[0] for item in forward_group]
+                group_payloads = [item[1] for item in forward_group]
+                group_return_q = [
+                    bool(payload.get("return_q", False)) for payload in group_payloads
+                ]
+                with collector.paused() if collector is not None else nullcontext():
+                    merge_started = time.perf_counter()
+                    entity, legal_ids, context, row_counts = _merge_forward_payloads(
+                        group_payloads
+                    )
+                    required_event_widths.append(
+                        _crop_masked_event_tail(entity, config.event_token_limit)
+                    )
+                    stats["merge_sec"] += time.perf_counter() - merge_started
+
+                forward_rows = int(legal_ids.shape[0])
+                if config.max_neural_rows is not None and forward_rows > int(
+                    config.max_neural_rows
+                ):
+                    raise AssertionError(
+                        "EvalServer internal row-cap violation: "
+                        f"forward={forward_rows} cap={config.max_neural_rows}"
+                    )
+                forward_started = time.perf_counter()
+                with torch.inference_mode():
+                    autocast_context = (
+                        nullcontext()
+                        if autocast_dtype is None
+                        else torch.autocast(
+                            device_type="cuda", dtype=autocast_dtype
+                        )
+                    )
+                    with autocast_context:
+                        outputs = forward_policy.forward_legal_np(
+                            entity,
+                            legal_ids,
+                            context,
+                            return_q=any(group_return_q),
+                        )
+                if config.cuda_graph:
+                    _record_cuda_graph_call(stats, forward_policy)
+                logits = outputs["logits"].detach().float().cpu().numpy()
+                value = outputs["value"].detach().float().cpu().numpy()
+                value_categorical = outputs.get("value_categorical")
+                value_categorical = (
+                    None
+                    if value_categorical is None
+                    else value_categorical.detach().float().cpu().numpy()
                 )
-            if config.cuda_graph:
-                _record_cuda_graph_call(stats, forward_policy)
-            logits = outputs["logits"].detach().float().cpu().numpy()
-            value = outputs["value"].detach().float().cpu().numpy()
-            vu = outputs.get("value_uncertainty")
-            vu = None if vu is None else vu.detach().float().cpu().numpy()
-            q_values = outputs.get("q_values")
-            q_values = (
-                None if q_values is None else q_values.detach().float().cpu().numpy()
-            )
-            stats["forward_and_d2h_sec"] += time.perf_counter() - forward_started
-            with collector.paused() if collector is not None else nullcontext():
-                response_started = time.perf_counter()
+                vu = outputs.get("value_uncertainty")
+                vu = None if vu is None else vu.detach().float().cpu().numpy()
+                q_values = outputs.get("q_values")
+                q_values = (
+                    None
+                    if q_values is None
+                    else q_values.detach().float().cpu().numpy()
+                )
+                stats["forward_and_d2h_sec"] += time.perf_counter() - forward_started
+                stats["forward_calls"] += 1
+                stats["max_forward_rows"] = max(
+                    int(stats["max_forward_rows"]), forward_rows
+                )
+                forward_histogram = stats["forward_row_histogram"]
+                forward_histogram[forward_rows] = (
+                    int(forward_histogram.get(forward_rows, 0)) + 1
+                )
+
+                group_max_legal = int(legal_ids.shape[1])
+                padded_legal_cells += forward_rows * group_max_legal
                 offset = 0
-                for (client_id, req_id), n_rows, wants_q, payload in zip(
-                    ids, row_counts, return_q_flags, payloads
+                for request_index, n_rows, wants_q, payload in zip(
+                    group_request_indices,
+                    row_counts,
+                    group_return_q,
+                    group_payloads,
                 ):
                     sl = slice(offset, offset + n_rows)
                     offset += n_rows
                     legal_width = int(payload["legal_ids"].shape[1])
-                    result = {
-                        "logits": logits[sl, :legal_width].copy(),
-                        "value": value[sl].copy(),
-                    }
+                    parts = result_parts[request_index]
+                    parts.setdefault("logits", []).append(
+                        logits[sl, :legal_width].copy()
+                    )
+                    parts.setdefault("value", []).append(value[sl].copy())
+                    if value_categorical is not None:
+                        parts.setdefault("value_categorical", []).append(
+                            value_categorical[sl].copy()
+                        )
                     if vu is not None:
-                        result["value_uncertainty"] = vu[sl].copy()
+                        parts.setdefault("value_uncertainty", []).append(vu[sl].copy())
                     if wants_q:
                         if q_values is None:
                             raise RuntimeError(
                                 "EvalServer policy omitted q_values for return_q request"
                             )
-                        result["q_values"] = q_values[sl, :legal_width].copy()
-                    response_queues[client_id].put((req_id, result, None))
-                stats["response_enqueue_sec"] += time.perf_counter() - response_started
+                        parts.setdefault("q_values", []).append(
+                            q_values[sl, :legal_width].copy()
+                        )
+
+            with collector.paused() if collector is not None else nullcontext():
+                response_started = time.perf_counter()
+                total_rows = 0
+                completed_responses: list[tuple[int, int, dict[str, np.ndarray]]] = []
+                for (
+                    (client_id, req_id),
+                    wants_q,
+                    payload,
+                    parts,
+                ) in zip(ids, return_q_flags, payloads, result_parts):
+                    n_rows = int(payload["legal_ids"].shape[0])
+                    total_rows += n_rows
+                    result = {
+                        key: chunks[0]
+                        if len(chunks) == 1
+                        else np.concatenate(chunks, axis=0)
+                        for key, chunks in parts.items()
+                    }
+                    if int(result["value"].shape[0]) != n_rows:
+                        raise RuntimeError(
+                            "EvalServer response reassembly row mismatch: "
+                            f"got={result['value'].shape[0]} expected={n_rows}"
+                        )
+                    if wants_q and "q_values" not in result:
+                        raise RuntimeError("EvalServer omitted reassembled q_values")
+                    completed_responses.append((client_id, req_id, result))
                 stats["windows"] += 1
                 stats["requests"] += len(window)
-                stats["rows"] += int(offset)
+                stats["rows"] += int(total_rows)
+                stats["oversized_requests"] += int(oversized_requests)
+                stats["oversized_request_chunks"] += int(oversized_chunks)
                 shared_requests = sum(
                     payload.get("_transport") == "shared_memory" for payload in payloads
                 )
@@ -1041,21 +1251,35 @@ def _server_main(
                 stats["max_window_requests"] = max(
                     stats["max_window_requests"], len(window)
                 )
-                stats["max_window_rows"] = max(stats["max_window_rows"], int(offset))
+                stats["max_window_rows"] = max(
+                    stats["max_window_rows"], int(total_rows)
+                )
                 max_legal = max(
                     int(payload["legal_ids"].shape[1]) for payload in payloads
                 )
                 real_legal_cells, request_legal_cells = _legal_cell_counts(payloads)
                 stats["real_legal_cells"] += real_legal_cells
                 stats["request_legal_cells"] += request_legal_cells
-                stats["padded_legal_cells"] += int(offset) * max_legal
+                stats["padded_legal_cells"] += int(padded_legal_cells)
+                required_event_width = max(
+                    required_event_widths or [int(premerge_required_event_width or 0)]
+                )
+                event_histogram = stats["event_required_width_histogram"]
+                event_histogram[required_event_width] = (
+                    int(event_histogram.get(required_event_width, 0)) + 1
+                )
                 for histogram_name, key in (
                     ("window_request_histogram", len(window)),
-                    ("window_row_histogram", int(offset)),
+                    ("window_row_histogram", int(total_rows)),
                     ("window_legal_width_histogram", max_legal),
                 ):
                     histogram = stats[histogram_name]
                     histogram[key] = int(histogram.get(key, 0)) + 1
+                # Do not publish any partial success until every request has
+                # reassembled and all window telemetry inputs have validated.
+                for client_id, req_id, result in completed_responses:
+                    response_queues[client_id].put((req_id, result, None))
+                stats["response_enqueue_sec"] += time.perf_counter() - response_started
         except BaseException as error:  # pragma: no cover - surfaced to clients
             with collector.paused() if collector is not None else nullcontext():
                 for client_id, req_id in ids:
@@ -1063,6 +1287,13 @@ def _server_main(
 
     if collector is not None:
         collector.close(timeout=1.0)
+    if cuda_memory_device is not None:
+        stats["cuda_peak_memory_allocated_bytes"] = int(
+            cuda_api.max_memory_allocated(cuda_memory_device)
+        )
+        stats["cuda_peak_memory_reserved_bytes"] = int(
+            cuda_api.max_memory_reserved(cuda_memory_device)
+        )
     # Compatibility alias retained for older telemetry consumers.
     stats["sum_batch"] = int(stats["rows"])
     handshake["stats"] = dict(stats)
@@ -1161,17 +1392,22 @@ class EvalServer:
                 self._handshake.get("needs_action_targets", True)
             ),
             "matmul_precision": str(self._handshake.get("matmul_precision", "highest")),
-            "transport": str(self._handshake.get("transport", "mp_queue")),
-            "event_token_limit": self._handshake.get("event_token_limit"),
-            "client_event_token_limit": self._handshake.get(
-                "client_event_token_limit"
+            "experimental_autocast_dtype": self._handshake.get(
+                "experimental_autocast_dtype"
             ),
+            "transport": str(self._handshake.get("transport", "mp_queue")),
+            "max_neural_rows": self._handshake.get("max_neural_rows"),
+            "event_token_limit": self._handshake.get("event_token_limit"),
             "cuda_graph": bool(self._handshake.get("cuda_graph", False)),
             "cuda_graph_batch_buckets": tuple(
                 self._handshake.get("cuda_graph_batch_buckets", ())
             ),
             "cuda_graph_warmup_iterations": int(
                 self._handshake.get("cuda_graph_warmup_iterations", 0)
+            ),
+            "value_categorical_bins": int(self._handshake["value_categorical_bins"]),
+            "value_categorical_head_available": bool(
+                self._handshake["value_categorical_head_available"]
             ),
         }
 
@@ -1244,11 +1480,32 @@ class _RemoteForwardProxy:
     """
 
     def __init__(
-        self, client: "RemoteEvalClient", action_size: int, trained_masked: bool
+        self,
+        client: "RemoteEvalClient",
+        action_size: int,
+        trained_masked: bool,
+        *,
+        value_categorical_bins: int = 0,
+        value_categorical_head_available: bool = False,
     ) -> None:
         self._client = client
         self.action_size = int(action_size)
         self.trained_with_masked_hidden_info = bool(trained_masked)
+        self.trained_value_readouts = (
+            ("scalar", "categorical")
+            if value_categorical_head_available
+            else ("scalar",)
+        )
+        self.model = type(
+            "_RemoteModelMetadata",
+            (),
+            {
+                "value_categorical_bins": int(value_categorical_bins),
+                "value_categorical_head": (
+                    object() if value_categorical_head_available else None
+                ),
+            },
+        )()
 
     def forward_legal_np(
         self,
@@ -1281,12 +1538,20 @@ class RemoteEvalClient(EntityGraphRustEvaluator):
         trained_with_masked_hidden_info: bool,
         needs_action_targets: bool = True,
         event_token_limit: int | None = None,
+        value_categorical_bins: int = 0,
+        value_categorical_head_available: bool = False,
         config: EntityGraphRustEvaluatorConfig | None = None,
         client_timeout_ms: float = 5000.0,
         fallback_checkpoint: str | None = None,
         fallback_device: str = "cpu",
     ) -> None:
-        proxy = _RemoteForwardProxy(self, action_size, trained_with_masked_hidden_info)
+        proxy = _RemoteForwardProxy(
+            self,
+            action_size,
+            trained_with_masked_hidden_info,
+            value_categorical_bins=value_categorical_bins,
+            value_categorical_head_available=value_categorical_head_available,
+        )
         super().__init__(proxy, config=config)
         self._request_queue = request_queue
         self._response_queue = response_queue
@@ -1352,9 +1617,7 @@ class RemoteEvalClient(EntityGraphRustEvaluator):
                 "_event_source_active_tokens": int(np.count_nonzero(event_mask)),
                 "_event_source_padded_tokens": int(event_mask.size),
             }
-            _crop_masked_event_tail(
-                forward_entity_batch, self._event_token_limit
-            )
+            _crop_masked_event_tail(forward_entity_batch, self._event_token_limit)
 
         if self._degraded:
             return self._forward_local(

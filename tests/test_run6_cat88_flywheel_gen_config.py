@@ -36,6 +36,7 @@ def test_gen_search_config_partial_raises_and_names_missing() -> None:
 def test_gen_search_config_fully_set_returns_explicit_argv() -> None:
     cfg = FlywheelConfig(
         gen_n_full=64, gen_n_fast=16, gen_p_full=0.25, gen_c_visit=50.0,
+        gen_symmetry_averaged_eval=False, gen_wide_candidates_threshold=24,
         gen_c_scale=0.03, gen_max_decisions=600, gen_max_depth=80,
         gen_temperature_decisions=90, gen_lazy_interior_chance=True,
         gen_correct_rust_chance_spectra=True,
@@ -47,11 +48,40 @@ def test_gen_search_config_fully_set_returns_explicit_argv() -> None:
     assert "--lazy-interior-chance" in argv and "--no-lazy-interior-chance" not in argv
     assert "--correct-rust-chance-spectra" in argv
     assert argv[argv.index("--n-full") + 1] == "64"
+    assert "--no-symmetry-averaged-eval" in argv
+    assert "--no-wide-roots-always-full" in argv
+    assert argv[argv.index("--wide-candidates-threshold") + 1] == "24"
+
+
+def test_gen_search_config_threads_decoupled_d6_and_adaptive_wide_budget() -> None:
+    cfg = FlywheelConfig(
+        gen_n_full=128, gen_n_fast=16, gen_p_full=0.4,
+        gen_n_full_wide=256, gen_n_full_wide_threshold=40,
+        gen_wide_roots_always_full=True,
+        gen_symmetry_averaged_eval=True,
+        gen_symmetry_averaged_eval_threshold=20,
+        gen_wide_candidates_threshold=24,
+        gen_c_visit=50.0, gen_c_scale=0.1, gen_max_decisions=600,
+        gen_max_depth=80, gen_temperature_decisions=90,
+        gen_lazy_interior_chance=True,
+        gen_correct_rust_chance_spectra=True,
+    ).validate()
+    argv = cfg.resolve_gen_search_argv()
+    assert argv[argv.index("--n-full-wide") + 1] == "256"
+    assert argv[argv.index("--n-full-wide-threshold") + 1] == "40"
+    assert "--wide-roots-always-full" in argv
+    assert argv[argv.index("--symmetry-averaged-eval-threshold") + 1] == "20"
+
+
+def test_gen_wide_always_full_requires_wide_budget() -> None:
+    with pytest.raises(ValueError, match="gen_n_full_wide"):
+        FlywheelConfig(gen_wide_roots_always_full=True).validate()
 
 
 def test_gen_search_config_teacher_override_and_boolean_off_forms() -> None:
     cfg = FlywheelConfig(
         gen_n_full=128, gen_n_fast=32, gen_p_full=1.0, gen_c_visit=50.0,
+        gen_symmetry_averaged_eval=True, gen_wide_candidates_threshold=20,
         gen_c_scale=0.03, gen_max_decisions=600, gen_max_depth=80,
         gen_temperature_decisions=90, gen_lazy_interior_chance=False,
         gen_correct_rust_chance_spectra=False,
@@ -62,3 +92,5 @@ def test_gen_search_config_teacher_override_and_boolean_off_forms() -> None:
     # booleans set False -> explicit --no-x form (never left to a default)
     assert "--no-lazy-interior-chance" in argv and "--lazy-interior-chance" not in argv
     assert "--no-correct-rust-chance-spectra" in argv
+    assert "--symmetry-averaged-eval" in argv and "--no-symmetry-averaged-eval" not in argv
+    assert argv[argv.index("--wide-candidates-threshold") + 1] == "20"

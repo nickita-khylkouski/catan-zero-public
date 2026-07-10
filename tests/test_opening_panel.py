@@ -112,3 +112,29 @@ def test_evaluate_root_smoke_deep_search_oracle():
     assert 0.0 <= report["top3_coverage"] <= 1.0
     assert report["kendall_tau"] is None or -1.0 <= report["kendall_tau"] <= 1.0
     assert report["raw_q_spread"] >= 0.0
+
+
+def test_evaluate_root_without_oracle_keeps_real_spread_and_nulls_ranking():
+    catanatron_rs = _rust()
+    panel = build_panel(catanatron_rs, n_roots=1, base_seed=600001, min_settlement_candidates=40)
+    game = reconstruct_roots(catanatron_rs, panel)[0]
+    evaluator = HeuristicRustEvaluator(score_actions=False)
+    mcts = GumbelChanceMCTS(
+        GumbelChanceMCTSConfig(seed=1, n_full=4, n_fast=4, p_full=1.0, temperature=0.0),
+        evaluator,
+    )
+    report = evaluate_root(
+        mcts,
+        evaluator,
+        game.copy(),
+        top_k=1,
+        oracle="none",
+        oracle_sims=1,
+        oracle_rollouts=1,
+        rollout_max_steps=1,
+        seed=600001,
+    )
+    assert report["raw_q_spread"] >= 0.0
+    assert report["kendall_tau"] is None
+    assert report["top1_regret"] is None
+    assert report["top3_coverage"] is None

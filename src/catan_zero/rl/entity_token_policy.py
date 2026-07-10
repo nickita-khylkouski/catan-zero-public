@@ -899,6 +899,7 @@ class EntityGraphPolicy:
         seed: int = 0,
         device: str | None = None,
         value_uncertainty_head: bool = False,
+        value_categorical_bins: int = 0,
         edge_policy_head: bool = False,
         aux_subgoal_heads: bool = False,
         aux_vp_horizon: int = 8,
@@ -916,6 +917,7 @@ class EntityGraphPolicy:
                 dropout=dropout,
                 action_mask_version=str(info.get("action_mask_version", "")),
                 value_uncertainty_head=bool(value_uncertainty_head),
+                value_categorical_bins=int(value_categorical_bins),
                 edge_policy_head=bool(edge_policy_head),
                 aux_subgoal_heads=bool(aux_subgoal_heads),
                 aux_vp_horizon=int(aux_vp_horizon),
@@ -1113,6 +1115,7 @@ class EntityGraphPolicy:
         *,
         mask_hidden_info: bool = False,
         soft_target_source: str | None = None,
+        value_training: dict[str, object] | None = None,
     ) -> None:
         import torch
 
@@ -1120,8 +1123,7 @@ class EntityGraphPolicy:
         output.parent.mkdir(parents=True, exist_ok=True)
         from catan_zero.rl.config_serialization import config_to_dict
 
-        torch.save(
-            {
+        payload = {
                 "policy_type": self.policy_type,
                 # Durable name-keyed form (task #74): never pickle the frozen+slots
                 # dataclass itself -- positional state is crash/shift-prone across
@@ -1149,9 +1151,19 @@ class EntityGraphPolicy:
                 ),
                 "static_action_features": self.static_action_features.detach().cpu(),
                 "model": self.model.state_dict(),
-            },
-            output,
-        )
+            }
+        if value_training is not None:
+            durable_value_training = dict(value_training)
+            trained_readouts = tuple(
+                str(readout)
+                for readout in durable_value_training.get(
+                    "trained_value_readouts", ()
+                )
+                if str(readout) in {"scalar", "categorical"}
+            )
+            payload["value_training"] = durable_value_training
+            payload["trained_value_readouts"] = list(trained_readouts)
+        torch.save(payload, output)
 
     @classmethod
     def load(
@@ -1238,10 +1250,110 @@ class EntityGraphPolicy:
         # requested against a checkpoint that doesn't report having been trained
         # for it, so an old/legacy checkpoint correctly fails closed rather than
         # silently running mismatched.
-        policy.trained_with_masked_hidden_info = bool(
-            data.get("mask_hidden_info", False)
+        policy.trained_with_masked_hidden_info = bool(data.get("mask_hidden_info", False))
+        value_training = data.get("value_training")
+        policy.value_training = (
+            dict(value_training) if isinstance(value_training, dict) else None
         )
+        raw_trained_readouts = data.get("trained_value_readouts")
+        echo_readouts = (
+            tuple(
+                str(readout)
+                for readout in raw_trained_readouts
+                if str(readout) in {"scalar", "categorical"}
+            )
+            if isinstance(raw_trained_readouts, (list, tuple))
+            else ()
+        )
+        provenance_errors: list[str] = []
+        validated_readouts: list[str] = []
+        if isinstance(value_training, dict):
+            schema = str(value_training.get("schema_version", "") or "")
+            inner_raw = value_training.get("trained_value_readouts", ())
+            inner_readouts = (
+                tuple(
+                    str(readout)
+                    for readout in inner_raw
+                    if str(readout) in {"scalar", "categorical"}
+                )
+                if isinstance(inner_raw, (list, tuple))
+                else ()
+            )
+            if schema != "value-training-v1":
+                provenance_errors.append(
+                    f"unsupported value-training schema {schema!r}"
+                )
+            if set(echo_readouts) != set(inner_readouts):
+                provenance_errors.append(
+                    "top-level trained_value_readouts does not match "
+                    "value_training.trained_value_readouts"
+                )
+            try:
+                optimizer_steps = int(value_training.get("optimizer_steps", 0))
+                completed_epochs = int(value_training.get("completed_epochs", 0))
+                scalar_weight = float(
+                    value_training.get("resolved_scalar_mse_weight", 0.0)
+                )
+                categorical_weight = float(
+                    value_training.get("resolved_categorical_ce_weight", 0.0)
+                )
+                scalar_mass = float(
+                    value_training.get("scalar_training_weight_sum", 0.0)
+                )
+                categorical_mass = float(
+                    value_training.get("categorical_training_weight_sum", 0.0)
+                )
+                metadata_bins = int(value_training.get("hlgauss_bins", 0))
+            except (TypeError, ValueError) as error:
+                provenance_errors.append(
+                    f"non-numeric value-training metadata: {error}"
+                )
+                optimizer_steps = completed_epochs = metadata_bins = 0
+                scalar_weight = categorical_weight = scalar_mass = categorical_mass = 0.0
+            base_valid = (
+                schema == "value-training-v1"
+                and not provenance_errors
+                and optimizer_steps > 0
+                and completed_epochs > 0
+            )
+            if "scalar" in inner_readouts and base_valid:
+                if scalar_weight > 0.0 and scalar_mass > 0.0:
+                    validated_readouts.append("scalar")
+                else:
+                    provenance_errors.append(
+                        "scalar readout is attested without positive objective "
+                        "weight and training mass"
+                    )
+            if "categorical" in inner_readouts and base_valid:
+                config_bins = int(getattr(config, "value_categorical_bins", 0) or 0)
+                if (
+                    categorical_weight > 0.0
+                    and categorical_mass > 0.0
+                    and metadata_bins >= 2
+                    and metadata_bins == config_bins
+                ):
+                    validated_readouts.append("categorical")
+                else:
+                    provenance_errors.append(
+                        "categorical readout attestation has non-positive weight/mass "
+                        "or an HL-Gauss bin-count mismatch"
+                    )
+        else:
+            # Checkpoints predating value-training-v1 establish only the
+            # historical scalar head. A config-declared categorical module is
+            # never evidence that its random initialization was optimized.
+            validated_readouts.append("scalar")
+            if "categorical" in echo_readouts:
+                provenance_errors.append(
+                    "categorical top-level marker has no value-training-v1 record"
+                )
+        policy.trained_value_readouts = tuple(validated_readouts)
+        policy._value_training_provenance_errors = tuple(provenance_errors)
         missing, unexpected = policy.model.load_state_dict(data["model"], strict=False)
+        # Preserve load provenance for opt-in consumers that must distinguish a
+        # genuinely trained optional head from a config-only warm-start upgrade.
+        # The default scalar evaluator ignores this metadata entirely.
+        policy._checkpoint_missing_state_keys = tuple(str(key) for key in missing)
         # Optional aux heads and the f69 action-attention upgrade params are all
         # absent from checkpoints that predate them, so their freshly-initialised
         # weights are permitted to be "missing" when warm-starting an upgraded

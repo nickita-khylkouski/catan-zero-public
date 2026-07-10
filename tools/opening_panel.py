@@ -281,6 +281,27 @@ def evaluate_root(
     )
     spread_over_floor = (raw_spread / noise_floor) if noise_floor > 0 and math.isfinite(noise_floor) else None
 
+    # CAT-25 noise-vs-spread trend needs the shallow root's real Q spread but
+    # not the expensive deeper-ranking oracle. ``oracle=none`` makes that
+    # measurement explicit instead of running a token 1-sim oracle and then
+    # accidentally treating its low-quality ranking fields as meaningful.
+    if oracle == "none":
+        return {
+            "n_candidates": len(per),
+            "n_visited": len(visited),
+            "prior_argmax": int(prior_argmax),
+            "search_argmax": int(search_argmax),
+            "flipped": bool(prior_argmax != search_argmax),
+            "raw_q_spread": float(raw_spread),
+            "noise_floor": None if math.isinf(noise_floor) else float(noise_floor),
+            "spread_over_floor": spread_over_floor,
+            "mean_visits": float(mean_visits),
+            "kendall_tau": None,
+            "top1_regret": None,
+            "top3_coverage": None,
+            "oracle_best_in_shallow_top3": None,
+        }
+
     # Oracle ranking over the top-K prior candidates.
     top_candidates = sorted(per, key=lambda a: per[a]["prior"], reverse=True)[:top_k]
     oracle_values: dict[int, float] = {}
@@ -360,9 +381,12 @@ def _build_config(args: Any) -> GumbelChanceMCTSConfig:
         n_fast=int(args.n_full),
         p_full=1.0,
         temperature=0.0,
+        max_depth=int(args.max_depth),
         c_visit=float(args.c_visit),
         c_scale=float(args.c_scale),
         prior_temperature=float(args.prior_temperature),
+        correct_rust_chance_spectra=bool(args.correct_rust_chance_spectra),
+        lazy_interior_chance=bool(args.lazy_interior_chance),
         rescale_noise_floor_c=float(args.rescale_noise_floor_c),
         sigma_eval=float(args.sigma_eval),
         variance_aware_q=bool(args.variance_aware_q),
@@ -386,11 +410,20 @@ def main() -> None:
     p_eval.add_argument("--panel", default="runs/panels/opening_200.json")
     p_eval.add_argument("--checkpoint", required=True)
     p_eval.add_argument("--device", default="cpu")
+    p_eval.add_argument(
+        "--public-observation",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Mask hidden opponent information at the model-input boundary. Must "
+        "match the checkpoint's recorded training regime; masked lineage "
+        "checkpoints require --public-observation and fail closed otherwise.",
+    )
     p_eval.add_argument("--out", required=True)
     p_eval.add_argument("--max-roots", type=int, default=None, help="subsample the panel for a quick run")
     p_eval.add_argument("--seed", type=int, default=600001)
     # search-config knobs
     p_eval.add_argument("--n-full", type=int, default=64)
+    p_eval.add_argument("--max-depth", type=int, default=80)
     p_eval.add_argument("--c-visit", type=float, default=50.0)
     p_eval.add_argument("--c-scale", type=float, default=0.1)
     p_eval.add_argument("--prior-temperature", type=float, default=1.0)
@@ -398,8 +431,24 @@ def main() -> None:
     p_eval.add_argument("--sigma-eval", type=float, default=0.79)
     p_eval.add_argument("--variance-aware-q", action="store_true")
     p_eval.add_argument("--variance-aware-k", type=float, default=1.0)
+    p_eval.add_argument(
+        "--correct-rust-chance-spectra",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    p_eval.add_argument(
+        "--lazy-interior-chance",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
     # oracle knobs
-    p_eval.add_argument("--oracle", choices=("deep_search", "rollout"), default="deep_search")
+    p_eval.add_argument(
+        "--oracle",
+        choices=("deep_search", "rollout", "none"),
+        default="deep_search",
+        help="Use 'none' for the CAT-25 shallow Q-spread-only panel; oracle "
+        "ranking fields are then null rather than fabricated.",
+    )
     p_eval.add_argument("--oracle-sims", type=int, default=256)
     p_eval.add_argument("--oracle-rollouts", type=int, default=32)
     p_eval.add_argument("--rollout-max-steps", type=int, default=400)
@@ -433,7 +482,11 @@ def main() -> None:
         roots = roots[: int(args.max_roots)]
 
     evaluator = BatchedEntityGraphRustEvaluator.from_checkpoint(
-        args.checkpoint, device=args.device, config=EntityGraphRustEvaluatorConfig()
+        args.checkpoint,
+        device=args.device,
+        config=EntityGraphRustEvaluatorConfig(
+            public_observation=bool(args.public_observation)
+        ),
     )
     config = _build_config(args)
     t0 = time.time()
@@ -469,8 +522,10 @@ def main() -> None:
         "oracle": args.oracle,
         "oracle_sims": int(args.oracle_sims),
         "oracle_rollouts": int(args.oracle_rollouts),
+        "public_observation": bool(args.public_observation),
         "search_config": {
             "n_full": int(args.n_full),
+            "max_depth": int(args.max_depth),
             "c_visit": float(args.c_visit),
             "c_scale": float(args.c_scale),
             "prior_temperature": float(args.prior_temperature),
@@ -478,6 +533,8 @@ def main() -> None:
             "sigma_eval": float(args.sigma_eval),
             "variance_aware_q": bool(args.variance_aware_q),
             "variance_aware_k": float(args.variance_aware_k),
+            "correct_rust_chance_spectra": bool(args.correct_rust_chance_spectra),
+            "lazy_interior_chance": bool(args.lazy_interior_chance),
         },
         "elapsed_seconds": elapsed,
         "seconds_per_root": elapsed / len(root_reports) if root_reports else None,

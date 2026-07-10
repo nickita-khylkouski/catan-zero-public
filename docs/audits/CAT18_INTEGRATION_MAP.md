@@ -32,15 +32,15 @@ that set.
 | `rescue/a100a-untracked/tests/test_exact_budget_sh.py` (superset) | `tests/test_exact_budget_sh.py` | integrated — see **Divergent (resolved)** below, a100a's copy used (b200's is a strict subset) |
 | `rescue/a100a-untracked/tools/auto_refill.sh` (seed window used) | `tools/auto_refill.sh` | integrated — see **Divergent (flagged)** below, a100a's seed window kept as the checked-in default |
 | `rescue/a100a-untracked/tools/mps_rollout.sh` | `tools/mps_rollout.sh` | integrated — byte-identical a100a vs a100b |
-| `rescue/a100b-untracked/tools/packing_mps_experiment.sh` | `tools/packing_mps_experiment.sh` | integrated — a100b-only, no collision |
+| `rescue/a100b-untracked/tools/packing_mps_experiment.sh` | removed after completion | historical A100B experiment; canonical fleet launcher supersedes it |
 | `rescue/b200-untracked/docs/PHASE2_WINDOW_FEED.md` | `docs/PHASE2_WINDOW_FEED.md` | integrated — design notes for task #94, no collision |
-| `rescue/b200-untracked/launch_value_repair_v2_train.sh` | `tools/launch_value_repair_v2_train.sh` | integrated — moved from repo root into `tools/` to match the existing `tools/*.sh` launch-script convention (e.g. `tools/create_gen1_master_bundle.sh`) |
+| `rescue/b200-untracked/launch_value_repair_v2_train.sh` | removed after completion | dated hard-coded repair invocation; current guarded trainer supersedes it |
 | `rescue/b200-untracked/tests/test_concat_memmap_corpus.py` | `tests/test_concat_memmap_corpus.py` | integrated — no collision |
 | `rescue/b200-untracked/tests/test_flywheel_phase2_integration.py` | `tests/test_flywheel_phase2_integration.py` | integrated — no collision |
 | `rescue/b200-untracked/tests/test_value_target_lambda.py` | `tests/test_value_target_lambda.py` | integrated — no collision |
 | `rescue/b200-untracked/tools/continuous_flywheel_spec_staged.py` | `tools/continuous_flywheel_spec_staged.py` | integrated — no collision with the already-tracked `tools/continuous_flywheel.py` (staged variant, different name) |
 | `rescue/b200-untracked/tools/flywheel_feed_daemon.py` | `tools/flywheel_feed_daemon.py` | integrated — no collision |
-| `rescue/b200-untracked-f94feed-extra/tools/deploy_phase2.sh` | `tools/deploy_phase2.sh` | integrated — the f94feed dev-tree deploy runbook for the phase-2 window feed; references host-absolute `/home/ubuntu/catan-zero` paths, which matches this repo's existing convention (`configs/gpu_cluster_hosts.json` already tracks the same host/path pattern) |
+| `rescue/b200-untracked-f94feed-extra/tools/deploy_phase2.sh` | removed after completion | one-time f94feed deployment script; canonical install/fleet tooling supersedes it |
 | `rescue/b200-untracked-f94feed-extra/tools/feed_config.json` | `tools/flywheel_feed_daemon.example_config.json` | integrated **with rename** — see **Renamed** below |
 
 ## Skipped (duplicate / superseded)
@@ -94,13 +94,13 @@ round starts.
 
 ## Explicitly out of scope
 
-- **`src/catan_zero/rl/flywheel/replay_window.py`** — `tools/deploy_phase2.sh`
+- **`src/catan_zero/rl/flywheel/replay_window.py`** — historical phase-2 deployment (completed; script removed)
   (rescued) copies a modified copy of this file from the B200 dev tree
   (`~/catan-zero-f94feed`) over the live tree's tracked copy. Per the rescue
   branches' own README, only *untracked* files were captured — modifications
   to already-tracked files are working-tree diffs that were never rsynced.
   That means the actual phase-2 behavior change to `replay_window.py` is
-  **not** in this integration; `deploy_phase2.sh` is landed as a runbook
+  **not** in this integration; the completed `deploy_phase2.sh` runbook was removed
   script, but running it today would just copy the current tracked
   `replay_window.py` over itself (a no-op), not the dev tree's real diff.
   Flagging so whoever runs the phase-2 deploy knows the actual code change to

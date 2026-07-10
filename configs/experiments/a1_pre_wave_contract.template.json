@@ -1,0 +1,269 @@
+{
+  "schema_version": "a1-pre-wave-contract-draft-v2",
+  "contract_id": "a1-fresh-mixed-12000games",
+  "science": {
+    "search": {
+      "max_depth": 80,
+      "c_visit": 50.0,
+      "c_scale": "__UNRESOLVED__",
+      "prior_temperature": 1.0,
+      "n_full": "__UNRESOLVED__",
+      "n_fast": 16,
+      "p_full": "__UNRESOLVED__",
+      "n_full_wide": "__UNRESOLVED__",
+      "n_full_wide_threshold": "__UNRESOLVED__",
+      "wide_roots_always_full": "__UNRESOLVED__",
+      "raw_policy_above_width": null,
+      "symmetry_averaged_eval": "__UNRESOLVED__",
+      "symmetry_averaged_eval_threshold": "__UNRESOLVED__",
+      "wide_candidates_threshold": 24,
+      "correct_rust_chance_spectra": true,
+      "lazy_interior_chance": true,
+      "exact_budget_sh": "__UNRESOLVED__",
+      "exact_budget_sh_min_n": "__UNRESOLVED__",
+      "belief_chance_spectra": false,
+      "rescale_noise_floor_c": "__UNRESOLVED__",
+      "sigma_eval": "__UNRESOLVED__"
+    },
+    "evaluator": {
+      "value_scale": 1.0,
+      "prior_temperature": 1.0,
+      "context_fill": 0.0,
+      "cache_size": 0,
+      "value_squash": "tanh",
+      "value_readout": "__UNRESOLVED__",
+      "public_observation": true,
+      "rust_featurize": false,
+      "emit_uncertainty": false
+    },
+    "learner_value_objective": {
+      "objective": "__UNRESOLVED__",
+      "value_readout": "__UNRESOLVED__",
+      "value_categorical_bins": "__UNRESOLVED__",
+      "hlgauss_sigma_ratio": "__UNRESOLVED__"
+    },
+    "learner_training_recipe": {
+      "track": "2p_no_trade",
+      "vps_to_win": 10,
+      "graph_history_features": true,
+      "seed": 1,
+      "epochs": 1,
+      "max_steps": 0,
+      "batch_size": 4096,
+      "grad_accum_steps": 1,
+      "world_size": 1,
+      "global_batch_size": 4096,
+      "optimizer": "adam",
+      "resume_optimizer": false,
+      "lr": 0.00003,
+      "lr_warmup_steps": 100,
+      "lr_schedule": "flat",
+      "weight_decay": 0.0,
+      "fused_optimizer": false,
+      "value_lr_mult": 0.3,
+      "action_module_lr_mult": 1.0,
+      "policy_loss_weight": 1.0,
+      "soft_target_source": "policy",
+      "soft_target_weight": 0.9,
+      "soft_target_temperature": 0.7,
+      "soft_target_min_legal_coverage": 0.5,
+      "value_loss_weight": 0.25,
+      "value_target_lambda": 1.0,
+      "value_categorical_loss_weight": 0.0,
+      "hlgauss_scalar_aux_loss_weight": 0.0,
+      "final_vp_loss_weight": 0.0,
+      "q_loss_weight": 0.0,
+      "policy_kl_anchor_weight": 0.0,
+      "value_uncertainty_loss_weight": 0.0,
+      "aux_subgoal_loss_weight": 0.0,
+      "train_value_only": false,
+      "freeze_modules": "",
+      "policy_surprise_weight": 0.0,
+      "advantage_policy_weighting": "none",
+      "per_game_value_weight": false,
+      "vp_margin_weight": 0.0,
+      "truncated_vp_margin_value_weight": 0.25,
+      "amp": "bf16",
+      "mask_hidden_info": true,
+      "symmetry_augment": false,
+      "forced_action_weight": 0.1,
+      "forced_row_value_weight": 1.0,
+      "winner_sample_weight": 1.0,
+      "loser_sample_weight": 0.3,
+      "teacher_weights": "",
+      "phase_weights": "",
+      "value_phase_weights": "",
+      "ddp_shard_data": false
+    },
+    "evidence": [
+      {
+        "kind": "a0",
+        "path": "__UNRESOLVED__"
+      },
+      {
+        "kind": "s1",
+        "path": "__UNRESOLVED__"
+      },
+      {
+        "kind": "s2",
+        "path": "__UNRESOLVED__"
+      },
+      {
+        "kind": "s3",
+        "path": "__UNRESOLVED__"
+      }
+    ]
+  },
+  "generation": {
+    "track": "2p_no_trade",
+    "vps_to_win": 10,
+    "obs_width": 806,
+    "max_decisions": 600,
+    "temperature_decisions": 90,
+    "temperature_high": 1.0,
+    "temperature_low": 0.0,
+    "late_temperature_decisions": "__UNRESOLVED__",
+    "late_temperature": "__UNRESOLVED__",
+    "workers_per_gpu": 16,
+    "shard_size": 512,
+    "format": "npz",
+    "device": "cuda",
+    "eval_server": false
+  },
+  "checkpoints": [
+    {
+      "id": "winning_teacher",
+      "role": "producer",
+      "path": "__UNRESOLVED__",
+      "legacy_scalar_readout_attestation": "__UNRESOLVED__"
+    },
+    {
+      "id": "recent_champion",
+      "role": "history",
+      "path": "__UNRESOLVED__"
+    },
+    {
+      "id": "hard_negative",
+      "role": "hard_negative",
+      "path": "__UNRESOLVED__"
+    }
+  ],
+  "source_categories": [
+    {
+      "name": "current_producer",
+      "mode": "self",
+      "checkpoint_ids": []
+    },
+    {
+      "name": "recent_history",
+      "mode": "checkpoint_list",
+      "checkpoint_ids": [
+        "recent_champion"
+      ]
+    },
+    {
+      "name": "hard_negative",
+      "mode": "checkpoint_list",
+      "checkpoint_ids": [
+        "hard_negative"
+      ]
+    }
+  ],
+  "fleet": {
+    "workers": [
+      {"id": "c1_gpu0", "host_alias": "c1", "gpu": 0},
+      {"id": "c1_gpu1", "host_alias": "c1", "gpu": 1},
+      {"id": "c1_gpu2", "host_alias": "c1", "gpu": 2},
+      {"id": "c1_gpu3", "host_alias": "c1", "gpu": 3},
+      {"id": "c2_gpu0", "host_alias": "c2", "gpu": 0},
+      {"id": "c2_gpu1", "host_alias": "c2", "gpu": 1},
+      {"id": "c2_gpu2", "host_alias": "c2", "gpu": 2},
+      {"id": "c2_gpu3", "host_alias": "c2", "gpu": 3},
+      {"id": "c3_gpu0", "host_alias": "c3", "gpu": 0},
+      {"id": "c3_gpu1", "host_alias": "c3", "gpu": 1},
+      {"id": "c3_gpu2", "host_alias": "c3", "gpu": 2},
+      {"id": "c3_gpu3", "host_alias": "c3", "gpu": 3},
+      {"id": "c4_gpu0", "host_alias": "c4", "gpu": 0},
+      {"id": "c4_gpu1", "host_alias": "c4", "gpu": 1},
+      {"id": "c4_gpu2", "host_alias": "c4", "gpu": 2},
+      {"id": "c4_gpu3", "host_alias": "c4", "gpu": 3},
+      {"id": "c5_gpu0", "host_alias": "c5", "gpu": 0},
+      {"id": "c5_gpu1", "host_alias": "c5", "gpu": 1},
+      {"id": "c5_gpu2", "host_alias": "c5", "gpu": 2},
+      {"id": "c5_gpu3", "host_alias": "c5", "gpu": 3},
+      {"id": "c6_gpu0", "host_alias": "c6", "gpu": 0},
+      {"id": "c6_gpu1", "host_alias": "c6", "gpu": 1},
+      {"id": "c6_gpu2", "host_alias": "c6", "gpu": 2},
+      {"id": "c6_gpu3", "host_alias": "c6", "gpu": 3}
+    ],
+    "per_worker_games": {
+      "current_producer": 400,
+      "recent_history": 75,
+      "hard_negative": 25
+    },
+    "seed_base": "__UNRESOLVED__",
+    "seed_block_size": 1000,
+    "seed_ledger": "__UNRESOLVED__",
+    "output_root": "__UNRESOLVED__"
+  },
+  "provenance": {
+    "guard_config": "../guards/generate_gumbel_selfplay_data.json",
+    "generator_code_files": [
+      "../../tools/generate_gumbel_selfplay_data.py",
+      "../../tools/opponent_mix_registry.py",
+      "../../src/catan_zero/rl/gumbel_self_play.py",
+      "../../src/catan_zero/rl/flywheel/opponent_mix.py",
+      "../../src/catan_zero/rl/entity_token_policy.py",
+      "../../src/catan_zero/rl/entity_token_features.py",
+      "../../src/catan_zero/rl/hex_symmetry.py",
+      "../../src/catan_zero/search/gumbel_chance_mcts.py",
+      "../../src/catan_zero/search/neural_rust_mcts.py",
+      "../../src/catan_zero/rl/pipeline_configs.py"
+    ],
+    "learner_code_files": [
+      "../guards/train_bc.json",
+      "../../tools/factory_common.py",
+      "../../tools/launcher_guards.py",
+      "../../tools/prelaunch_guard.py",
+      "../../tools/train_bc.py",
+      "../../tools/build_memmap_corpus.py",
+      "../../src/catan_zero/rl/config_cli.py",
+      "../../src/catan_zero/rl/entity_token_policy.py",
+      "../../src/catan_zero/rl/entity_token_features.py",
+      "../../src/catan_zero/rl/pipeline_configs.py",
+      "../../src/catan_zero/rl/aux_subgoal_targets.py",
+      "../../src/catan_zero/rl/config_serialization.py",
+      "../../src/catan_zero/rl/hex_symmetry.py",
+      "../../src/catan_zero/rl/multiagent_env.py",
+      "../../src/catan_zero/rl/optim_state.py",
+      "../../src/catan_zero/rl/torch_ppo.py",
+      "../../src/catan_zero/rl/xdim_lite_policy.py"
+    ]
+  },
+  "post_wave_acceptance": {
+    "require_complete_games": true,
+    "selected_truncations_max": 0,
+    "invalid_teacher_actions_max": 0,
+    "require_public_observation": true,
+    "require_unique_game_seeds": true,
+    "require_no_val_only_overlap": true,
+    "selection_before_row_expansion": true,
+    "required_reports": [
+      "truncation",
+      "forced_fraction",
+      "phase_mix",
+      "decision_index_mix",
+      "legal_width",
+      "target_entropy",
+      "full_search_policy_mass"
+    ],
+    "require_shard_sha256": true,
+    "require_contract_attestation": true,
+    "validation_holdout": {
+      "split_unit": "game_seed",
+      "validation_fraction": 0.05,
+      "validation_seed": 17,
+      "validation_max_samples": 0
+    }
+  }
+}

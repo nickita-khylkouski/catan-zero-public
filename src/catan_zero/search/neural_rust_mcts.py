@@ -46,6 +46,16 @@ class EntityGraphRustEvaluatorConfig:
     # call sites as the only squash. Gate: post-Gate-A A/B (strength-based),
     # never blind-ship.
     value_squash: str = "tanh"
+    # Select which trained value head search backs up. ``scalar`` preserves the
+    # historical MSE-head path exactly. ``categorical`` opts into the calibrated
+    # support expectation emitted as ``outputs["value_categorical"]`` by an
+    # HL-Gauss checkpoint. That expectation is already bounded/calibrated, so it
+    # keeps value_scale but bypasses the scalar head's inference-time tanh; both
+    # modes retain the same perspective flip and final clipping.
+    # Categorical is deliberately fail-closed: evaluator construction rejects a
+    # checkpoint without a real categorical head instead of silently falling
+    # back to the scalar head (or using freshly initialised upgrade weights).
+    value_readout: str = "scalar"
     # Hidden-information leak fix (f72). When True, the model input is masked to
     # PUBLIC information from the acting player's perspective: every OPPONENT's
     # resource-hand composition, unplayed dev-card identities, and actual VP
@@ -87,6 +97,59 @@ class EntityGraphRustEvaluatorConfig:
     emit_uncertainty: bool = False
 
 
+def _assert_value_readout_available(
+    policy: "EntityGraphPolicy", config: "EntityGraphRustEvaluatorConfig"
+) -> None:
+    """Validate the science-critical value-head selection at load time."""
+    readout = str(config.value_readout)
+    if readout not in {"scalar", "categorical"}:
+        raise ValueError(
+            f"unknown value_readout mode: {readout!r} "
+            "(expected 'scalar' or 'categorical')"
+        )
+    if readout == "scalar":
+        return
+
+    model = getattr(policy, "model", None)
+    bins = int(getattr(model, "value_categorical_bins", 0) or 0)
+    head = getattr(model, "value_categorical_head", None)
+    missing_state_keys = tuple(getattr(policy, "_checkpoint_missing_state_keys", ()))
+    missing_head_weights = any(
+        str(key).startswith("value_categorical_head.") for key in missing_state_keys
+    )
+    trained_readouts = tuple(
+        str(readout)
+        for readout in getattr(policy, "trained_value_readouts", ("scalar",))
+    )
+    categorical_provenance = "categorical" in trained_readouts
+    if bins < 2 or head is None or missing_head_weights or not categorical_provenance:
+        detail = ""
+        if missing_head_weights:
+            detail = " (the checkpoint config declares the head but its trained weights are absent)"
+        elif not categorical_provenance:
+            provenance_errors = tuple(
+                str(error)
+                for error in getattr(
+                    policy, "_value_training_provenance_errors", ()
+                )
+            )
+            error_detail = (
+                f"; validation errors: {', '.join(provenance_errors)}"
+                if provenance_errors
+                else ""
+            )
+            detail = (
+                " (the checkpoint has no positive value-training-v1 provenance "
+                f"that the categorical readout was optimized{error_detail})"
+            )
+        raise ValueError(
+            "value_readout='categorical' requires a checkpoint with a trained "
+            f"HL-Gauss categorical value head (value_categorical_bins >= 2){detail}; "
+            f"loaded model reports value_categorical_bins={bins}. Use "
+            "value_readout='scalar' or load a categorical-value checkpoint."
+        )
+
+
 def _uncertainty_from_outputs(outputs: dict[str, Any], row: int) -> float:
     """Extract the value-uncertainty head's scalar for batch `row` (CAT-61).
 
@@ -110,8 +173,9 @@ def _fetch_leaf_decision_inputs(
     """ONE Rust round-trip for everything the leaf-eval preamble needs.
 
     Returns (snapshot_text, action_by_id). ``snapshot_text`` is ``None`` when
-    ``include_snapshot`` is false; the action map is always fetched. Previously each leaf evaluation
-    re-fetched `playable_action_indices`/`playable_actions_json` up to 3x
+    ``include_snapshot`` is false; the action map is always fetched. Previously
+    each leaf evaluation re-fetched `playable_action_indices`/
+    `playable_actions_json` up to 3x
     (rust_policy_action_ids + both featurizers via `_resolve_entity_adapter`)
     and `json_snapshot` up to 3x (_state_key + both featurizers) on the same,
     unchanged game state -- the measured top cost at wide placement roots
@@ -172,6 +236,7 @@ class EntityGraphRustEvaluator:
         self.policy = policy
         self.config = config or EntityGraphRustEvaluatorConfig()
         _assert_public_observation_matches_checkpoint_training(policy, self.config)
+        _assert_value_readout_available(policy, self.config)
         # CAT-126 #15: OrderedDict gives LRU eviction (move_to_end on hit,
         # popitem(last=False) on evict) instead of FIFO. Bit-identical outputs
         # (a hit returns the same deterministic value); only WHICH entry is
@@ -287,15 +352,30 @@ class EntityGraphRustEvaluator:
         bit-for-bit; "clip" returns the scaled value unchanged so the
         existing `np.clip(-1, 1)` at the call sites (applied AFTER the
         opponent sign flip, order unchanged in both modes) is the only
-        squash. See the config field comment for the #60 rationale.
+        squash. A categorical readout is already a calibrated expectation on
+        [-1, 1], so it always follows the latter path (scale + final clip) and
+        is never double-squashed. See the config field comments for rationale.
         """
         scaled = float(raw_value) * float(self.config.value_scale)
+        if str(self.config.value_readout) == "categorical":
+            return scaled
         squash = str(self.config.value_squash)
         if squash == "tanh":
             return float(np.tanh(scaled))
         if squash == "clip":
             return scaled
         raise ValueError(f"unknown value_squash mode: {squash!r} (expected 'tanh' or 'clip')")
+
+    def _value_output(self, outputs: dict[str, Any]) -> Any:
+        """Return the configured value tensor, never silently falling back."""
+        readout = str(self.config.value_readout)
+        key = "value" if readout == "scalar" else "value_categorical"
+        if key not in outputs:
+            raise RuntimeError(
+                f"value_readout={readout!r} requested model output {key!r}, but the "
+                f"forward pass emitted keys={sorted(outputs)}"
+            )
+        return outputs[key]
 
     def _eval_result(
         self, priors: dict[int, float], value: float, uncertainty: float
@@ -450,8 +530,6 @@ class EntityGraphRustEvaluator:
             context,
             return_q=False,
         )
-        import torch
-
         logits = outputs["logits"].detach().float().cpu().numpy()[0]
         temperature = max(float(self.config.prior_temperature), 1.0e-6)
         priors_arr = _softmax(logits / temperature)
@@ -460,7 +538,7 @@ class EntityGraphRustEvaluator:
             for action, probability in zip(legal_actions, priors_arr)
         }
 
-        raw_value = float(outputs["value"].detach().float().cpu().numpy()[0])
+        raw_value = float(self._value_output(outputs).detach().float().cpu().numpy()[0])
         value = self._apply_value_squash(raw_value)
         if acting_color != str(root_color) and len(tuple(colors)) == 2:
             value = -value
@@ -508,7 +586,11 @@ class EntityGraphRustEvaluator:
             dict[str, Any], "_RustEntityFeatureEnv", list[dict[str, Any]]
         ] | None = None
         if need_adapter_resolve:
-            snapshot_text, action_by_id = _fetch_leaf_decision_inputs(game, colors)
+            snapshot_text, action_by_id = _fetch_leaf_decision_inputs(
+                game,
+                colors,
+                include_snapshot=True,
+            )
             policy_action_ids = rust_policy_action_ids(
                 game,
                 legal_actions,
@@ -584,7 +666,7 @@ class EntityGraphRustEvaluator:
                 out = self.policy.forward_legal_np(entity_n, legal_n, ctx_n, return_q=return_q)
             return {
                 "logits": out["logits"].detach().float().cpu().numpy(),
-                "value": out["value"].detach().float().cpu().numpy().reshape(-1),
+                "value": self._value_output(out).detach().float().cpu().numpy().reshape(-1),
             }
 
         sym = build_hex_symmetry()
@@ -761,7 +843,7 @@ class EntityGraphRustEvaluator:
                     entity_batch, legal_ids, context, return_q=False
                 )
             logits_batch = outputs["logits"].detach().float().cpu().numpy()
-            values = outputs["value"].detach().float().cpu().numpy()
+            values = self._value_output(outputs).detach().float().cpu().numpy()
             temperature = max(float(self.config.prior_temperature), 1.0e-6)
             for batch_row, (request_index, batch_request) in enumerate(
                 zip(pending_indices, pending_batch_requests)
@@ -1052,7 +1134,7 @@ class BatchedEntityGraphRustEvaluator(EntityGraphRustEvaluator):
                     return_q=False,
                 )
             logits_batch = outputs["logits"].detach().float().cpu().numpy()
-            values = outputs["value"].detach().float().cpu().numpy()
+            values = self._value_output(outputs).detach().float().cpu().numpy()
             temperature = max(float(self.config.prior_temperature), 1.0e-6)
             for index, request in enumerate(requests):
                 width = len(request.legal_actions)

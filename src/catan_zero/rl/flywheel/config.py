@@ -46,9 +46,10 @@ class FlywheelConfig:
 
     # --- cheap gate (KataGo kept it, ~7% of fleet; trainer NEVER blocks on it) ---
     gate_enabled: bool = True
-    gate_games: int = 150                 # ~50-200 games; total games, split into gate_games/2 pairs
+    gate_games: int = 150                 # legacy scoreboard-only override; masking-safe H2H uses
+                                          # named flywheel config's 300 -> 600 total-game tiers
     gate_min_winrate: float = 0.50        # candidate must not REGRESS vs current champion
-    gate_sims: int = 16                   # reduced sim budget for cheap, low-variance gating (n_full)
+    gate_sims: int = 16                   # compatibility field; named H2H policy owns n_sims (=16)
     gate_noise: bool = False              # Dirichlet/forced-playout noise OFF during gating
     # "h2h" (default): tools/gumbel_search_cross_net_h2h.py, supports hidden-info masking end to end.
     # "scoreboard": tools/promotion_gate_runner.py -> evaluate_scoreboard.py, which has NO
@@ -64,6 +65,12 @@ class FlywheelConfig:
     # ``catan-cli-default-override-trap`` — so both are explicit config, always passed.
     gate_c_scale: float = 0.03            # threads to the h2h gate's --c-scale
     gate_lazy_interior_chance: bool = True  # threads to --lazy-interior-chance (cheap gate, G1 parity)
+    # Role-specific gate readouts. Scalar/scalar preserves existing flywheel
+    # behavior; an HL-Gauss run sets categorical/scalar to compare the trained
+    # candidate readout against the legacy incumbent without requiring the
+    # incumbent to have a categorical head.
+    gate_candidate_value_readout: str = "scalar"
+    gate_baseline_value_readout: str = "scalar"
 
     # --- generation search-operator config (CAT-88: pass EXPLICITLY, never inherit
     #     generate_gumbel_selfplay_data.py's own CLI defaults). The flywheel's generate()
@@ -78,6 +85,12 @@ class FlywheelConfig:
     gen_n_full: int | None = None
     gen_n_fast: int | None = None
     gen_p_full: float | None = None
+    gen_n_full_wide: int | None = None
+    gen_n_full_wide_threshold: int | None = None
+    gen_wide_roots_always_full: bool = False
+    gen_symmetry_averaged_eval: bool | None = None
+    gen_symmetry_averaged_eval_threshold: int | None = None
+    gen_wide_candidates_threshold: int | None = None
     gen_c_visit: float | None = None
     gen_c_scale: float | None = None
     gen_max_decisions: int | None = None
@@ -134,7 +147,8 @@ class FlywheelConfig:
     # CAT-88: the generation search-config fields the flywheel must pass EXPLICITLY to
     # every generate_gumbel_selfplay_data.py subprocess (no silent tool-default inherit).
     _REQUIRED_GEN_FIELDS = (
-        "gen_n_full", "gen_n_fast", "gen_p_full", "gen_c_visit", "gen_c_scale",
+        "gen_n_full", "gen_n_fast", "gen_p_full", "gen_symmetry_averaged_eval",
+        "gen_wide_candidates_threshold", "gen_c_visit", "gen_c_scale",
         "gen_max_decisions", "gen_max_depth", "gen_temperature_decisions",
         "gen_lazy_interior_chance", "gen_correct_rust_chance_spectra",
     )
@@ -151,14 +165,20 @@ class FlywheelConfig:
                 "CAT-88: continuous_flywheel refuses to generate with unset gen search "
                 f"config (run-dependent, no safe default): set {', '.join(missing)}. "
                 "e.g. volume: --gen-n-full 64 --gen-n-fast 16 --gen-p-full 0.25 "
+                "--no-gen-symmetry-averaged-eval --gen-wide-candidates-threshold 24 "
                 "--gen-c-visit 50 --gen-c-scale 0.03 --gen-max-decisions 600 "
                 "--gen-max-depth 80 --gen-temperature-decisions 90 --gen-lazy-interior-chance "
                 "--gen-correct-rust-chance-spectra; teacher: --gen-n-full 128 --gen-p-full 1.0."
             )
-        return [
+        argv = [
             "--n-full", str(self.gen_n_full),
             "--n-fast", str(self.gen_n_fast),
             "--p-full", str(self.gen_p_full),
+            ("--wide-roots-always-full" if self.gen_wide_roots_always_full
+             else "--no-wide-roots-always-full"),
+            ("--symmetry-averaged-eval" if self.gen_symmetry_averaged_eval
+             else "--no-symmetry-averaged-eval"),
+            "--wide-candidates-threshold", str(self.gen_wide_candidates_threshold),
             "--c-visit", str(self.gen_c_visit),
             "--c-scale", str(self.gen_c_scale),
             "--max-decisions", str(self.gen_max_decisions),
@@ -169,6 +189,20 @@ class FlywheelConfig:
             ("--correct-rust-chance-spectra" if self.gen_correct_rust_chance_spectra
              else "--no-correct-rust-chance-spectra"),
         ]
+        if self.gen_n_full_wide is not None:
+            argv.extend(["--n-full-wide", str(self.gen_n_full_wide)])
+        if self.gen_n_full_wide_threshold is not None:
+            argv.extend(
+                ["--n-full-wide-threshold", str(self.gen_n_full_wide_threshold)]
+            )
+        if self.gen_symmetry_averaged_eval_threshold is not None:
+            argv.extend(
+                [
+                    "--symmetry-averaged-eval-threshold",
+                    str(self.gen_symmetry_averaged_eval_threshold),
+                ]
+            )
+        return argv
 
     # ------------------------------------------------------------------ (de)serialize
     def to_dict(self) -> dict:
@@ -197,10 +231,20 @@ class FlywheelConfig:
             raise ValueError("gate_min_winrate must be in [0,1]")
         if self.gate_style not in ("h2h", "scoreboard"):
             raise ValueError(f"gate_style must be h2h|scoreboard, got {self.gate_style!r}")
+        for field_name in ("gate_candidate_value_readout", "gate_baseline_value_readout"):
+            value = getattr(self, field_name)
+            if value not in ("scalar", "categorical"):
+                raise ValueError(
+                    f"{field_name} must be scalar|categorical, got {value!r}"
+                )
         if self.anchor_eval_every_rounds < 0:
             raise ValueError("anchor_eval_every_rounds must be >= 0 (0 disables)")
         if self.anchor_drift_alert_threshold < 0.0:
             raise ValueError("anchor_drift_alert_threshold must be >= 0")
+        if self.gen_wide_roots_always_full and self.gen_n_full_wide is None:
+            raise ValueError(
+                "gen_wide_roots_always_full requires gen_n_full_wide"
+            )
         if len(self.anchor_corpora) != len(set(self.anchor_corpora)):
             raise ValueError(f"anchor_corpora must not contain duplicate names: {self.anchor_corpora}")
         # sanity: opponent policy constructs

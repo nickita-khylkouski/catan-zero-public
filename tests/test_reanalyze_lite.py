@@ -126,6 +126,34 @@ def corpus_dir(tmp_path: Path) -> Path:
     return d
 
 
+def _write_q_head_provenance(
+    directory: Path,
+    checkpoint: Path,
+    *,
+    checkpoint_md5: str | None = None,
+) -> Path:
+    path = directory / "q_head_provenance.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema": rl.Q_HEAD_PROVENANCE_SCHEMA,
+                "checkpoint_md5": checkpoint_md5 or rl.md5_file(checkpoint),
+                "q_head": {
+                    "trained": True,
+                    "target_semantics": rl.Q_HEAD_TARGET_SEMANTICS,
+                    "value_range": [-1, 1],
+                },
+                "validation": {
+                    "passed": True,
+                    "evidence": "pytest://trained-q-head-calibration",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
 # --------------------------------------------------------------------------- #
 # Rewrite correctness + backward-compat load
 # --------------------------------------------------------------------------- #
@@ -179,6 +207,8 @@ def test_full_run_manifest_and_integrity(corpus_dir, tmp_path, monkeypatch):
     assert manifest["tool"] == "reanalyze_lite"
     assert manifest["v_component"] == "target_scores"
     assert manifest["forward_output"] == "q_values"
+    assert manifest["q_head_provenance"]["schema"] == rl.Q_HEAD_PROVENANCE_SCHEMA
+    assert manifest["q_head_provenance"]["source_sha256"]
     assert manifest["reanalyzer"]["md5"]  # checkpoint md5 recorded
     assert manifest["source_corpus"]["corpus_meta_sha256"]
     assert manifest["source_corpus"]["dat_sha256"]  # per-file source hashes
@@ -215,6 +245,7 @@ def test_root_value_materialisation(corpus_dir, tmp_path, monkeypatch):
     out_dir = Path(manifest["output_corpus"])
     assert manifest["meta_changed"] is True
     assert manifest["forward_output"] == "value"
+    assert manifest["q_head_provenance"] is None
     assert (out_dir / "root_value.dat").exists()
 
     reloaded = MemmapCorpus(out_dir)
@@ -226,7 +257,14 @@ def test_root_value_materialisation(corpus_dir, tmp_path, monkeypatch):
     np.testing.assert_allclose(got, expected, rtol=0, atol=1e-6)
     # corpus_meta.json gained a scalar fixed schema entry.
     meta = json.loads((out_dir / "corpus_meta.json").read_text())
-    assert meta["columns"]["root_value"] == {"kind": "fixed", "dtype": "<f4", "inner_shape": []}
+    root_schema = meta["columns"]["root_value"]
+    assert {key: root_schema[key] for key in ("kind", "dtype", "inner_shape")} == {
+        "kind": "fixed",
+        "dtype": "<f4",
+        "inner_shape": [],
+    }
+    assert root_schema["target_semantics"] == rl.ROOT_VALUE_TARGET_SEMANTICS
+    assert root_schema["materialization"] == manifest["root_value_materialization"]
 
 
 def test_integrity_guard_detects_unexpected_change(corpus_dir, tmp_path, monkeypatch):
@@ -250,6 +288,97 @@ def test_out_dir_refuses_to_overwrite(corpus_dir, tmp_path, monkeypatch):
     out.mkdir()
     with pytest.raises(SystemExit, match="already exists"):
         _run_full_with_fake_forward(corpus_dir, tmp_path, monkeypatch, v_component="target_scores", out_dir=out)
+
+
+# --------------------------------------------------------------------------- #
+# Q-head safety boundary
+# --------------------------------------------------------------------------- #
+def test_cli_defaults_to_trained_value_head_root_value():
+    args = rl.build_arg_parser().parse_args(["--corpus", "corpus", "--checkpoint", "ckpt.pt"])
+    assert args.v_component == "root_value"
+    assert args.q_head_provenance is None
+
+
+def test_q_values_component_requires_explicit_provenance(tmp_path):
+    meta = {"md5": "a" * 32}
+    with pytest.raises(SystemExit, match="REFUSING --v-component target_scores"):
+        rl.validate_q_head_provenance(
+            None,
+            reanalyzer_meta=meta,
+            v_component="target_scores",
+        )
+
+
+def test_q_head_provenance_is_bound_to_exact_checkpoint(tmp_path):
+    checkpoint = tmp_path / "checkpoint.pt"
+    checkpoint.write_bytes(b"real checkpoint")
+    provenance = _write_q_head_provenance(
+        tmp_path,
+        checkpoint,
+        checkpoint_md5="0" * 32,
+    )
+    with pytest.raises(SystemExit, match="does not match reanalyzer"):
+        rl.validate_q_head_provenance(
+            provenance,
+            reanalyzer_meta={"md5": rl.md5_file(checkpoint)},
+            v_component="target_scores",
+        )
+
+
+def test_programmatic_run_metadata_is_bound_to_actual_reanalyzer_bytes(tmp_path):
+    checkpoint_a = tmp_path / "a.pt"
+    checkpoint_b = tmp_path / "b.pt"
+    checkpoint_a.write_bytes(b"checkpoint a")
+    checkpoint_b.write_bytes(b"checkpoint b")
+
+    assert rl.verify_reanalyzer_identity(
+        checkpoint_a, {"md5": rl.md5_file(checkpoint_a)}
+    ) == rl.md5_file(checkpoint_a)
+    with pytest.raises(SystemExit, match="reanalyzer checkpoint md5 mismatch"):
+        rl.verify_reanalyzer_identity(
+            checkpoint_b, {"md5": rl.md5_file(checkpoint_a)}
+        )
+
+
+def test_root_value_rejects_irrelevant_q_provenance(tmp_path):
+    with pytest.raises(SystemExit, match="only valid with a q_values component"):
+        rl.validate_q_head_provenance(
+            {"schema": rl.Q_HEAD_PROVENANCE_SCHEMA},
+            reanalyzer_meta={"md5": "a" * 32},
+            v_component="root_value",
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("trained", False, "q_head.trained must be true"),
+        ("target_semantics", "normalized_teacher_preference", "target_semantics"),
+        ("passed", False, "validation.passed must be true"),
+    ],
+)
+def test_q_head_provenance_rejects_untrained_wrong_semantics_or_unvalidated(
+    tmp_path,
+    field,
+    value,
+    message,
+):
+    checkpoint = tmp_path / "checkpoint.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    provenance = _write_q_head_provenance(tmp_path, checkpoint)
+    payload = json.loads(provenance.read_text(encoding="utf-8"))
+    if field == "passed":
+        payload["validation"][field] = value
+    else:
+        payload["q_head"][field] = value
+    provenance.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(SystemExit, match=message):
+        rl.validate_q_head_provenance(
+            provenance,
+            reanalyzer_meta={"md5": rl.md5_file(checkpoint)},
+            v_component="target_scores",
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -332,7 +461,6 @@ def test_batch_forward_assembles_value_and_q(corpus_dir, monkeypatch):
     fake_policy = type("P", (), {"model": _FakeModel(), "policy_type": "entity_graph"})()
 
     def _fake_forward(policy, data, batch, legal_action_ids, *, return_q, **kwargs):
-        b = len(batch)
         w = legal_action_ids.shape[1]
         out = {"value": torch.tensor((np.asarray(batch) * 0.01), dtype=torch.float32)}
         if return_q:
@@ -364,7 +492,17 @@ def _run_full_with_fake_forward(corpus_dir, tmp_path, monkeypatch, *, v_componen
 
     monkeypatch.setattr(rl, "load_policy", lambda *a, **k: object())
 
-    def _fake_batch_forward(policy, corpus, indices, *, batch_size, want_q, legal_width, progress_every=0):
+    def _fake_batch_forward(
+        policy,
+        corpus,
+        indices,
+        *,
+        batch_size,
+        want_q,
+        legal_width,
+        progress_every=0,
+        value_materialization=None,
+    ):
         n = len(indices)
         result = {"value": (np.asarray(indices) * 0.01).astype(np.float32)}
         if want_q:
@@ -379,6 +517,11 @@ def _run_full_with_fake_forward(corpus_dir, tmp_path, monkeypatch, *, v_componen
     reanalyzer_path, reanalyzer_meta = rl.resolve_reanalyzer_checkpoint(
         mode="checkpoint", checkpoint=ckpt, ema_checkpoints=None, ema_decay=0.75, work_dir=tmp_path
     )
+    q_head_provenance = (
+        _write_q_head_provenance(tmp_path, ckpt)
+        if rl.V_COMPONENTS[v_component]["forward_output"] == "q_values"
+        else None
+    )
     return rl.run_reanalyze(
         corpus_dir=corpus_dir,
         out_dir=out_dir,
@@ -391,4 +534,5 @@ def _run_full_with_fake_forward(corpus_dir, tmp_path, monkeypatch, *, v_componen
         sample=None,
         seed=0,
         progress_every=0,
+        q_head_provenance=q_head_provenance,
     )

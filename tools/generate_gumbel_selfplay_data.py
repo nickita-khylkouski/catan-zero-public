@@ -75,14 +75,20 @@ import launcher_guards
 
 
 def _resolve_mix_with_exploiter(
-    manifest_path: str, exploiter_fraction: float | None
+    manifest_path: str,
+    exploiter_fraction: float | None,
+    *,
+    producer_checkpoint: str | None = None,
 ) -> OpponentMixConfig:
     """Resolve an opponent-mix manifest (expanding any CAT-9 registry categories),
     apply the CAT-56 --exploiter-fraction rescale when given, and always enforce
-    the external-engine (exploiter-lane) cap. Called identically in the main
-    process (fail-fast, before workers spawn) and per-worker, so both agree on the
-    exact sampled mix."""
-    config = resolve_opponent_mix_manifest(manifest_path)
+    the external-engine (exploiter-lane) cap. The main process calls this before
+    spawn and passes the resulting immutable config to every worker; the worker
+    fallback exists only for direct legacy callers."""
+    config = resolve_opponent_mix_manifest(
+        manifest_path,
+        producer_checkpoint=producer_checkpoint,
+    )
     if exploiter_fraction is not None:
         if external_engine_effective_fraction(config) <= 0.0:
             raise SystemExit(
@@ -222,10 +228,27 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="Placement-budget-asymmetry arm: full-search simulations to spend at "
-        "roots wider than the config's wide_candidates_threshold (e.g. 512). "
+        "roots selected by --n-full-wide-threshold (or the legacy shared wide "
+        "threshold when that flag is unset; e.g. 256). "
         "Default None = use --n-full everywhere (disabled). Mirrors "
         "tools/gumbel_search_vs_raw_h2h.py's identical flag -- pre-wired so gen-1 "
         "generation can replicate whichever confirmation-H2H arm wins.",
+    )
+    parser.add_argument(
+        "--n-full-wide-threshold",
+        type=int,
+        default=None,
+        help="Inclusive minimum legal-action count for --n-full-wide (40 means "
+        "every >=40-action root). Default None preserves the legacy "
+        "len(legal) > --wide-candidates-threshold gate.",
+    )
+    parser.add_argument(
+        "--wide-roots-always-full",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="When --n-full-wide applies, bypass the --p-full coin flip and always "
+        "run the full wide budget. Default off preserves playout-cap "
+        "randomization exactly; requires --n-full-wide when enabled.",
     )
     parser.add_argument(
         "--raw-policy-above-width",
@@ -234,6 +257,31 @@ def build_parser() -> argparse.ArgumentParser:
         help="Phase-gated-search arm: at roots wider than this many legal actions, "
         "skip search and play argmax(prior). Default None = always search "
         "(disabled). Mirrors tools/gumbel_search_vs_raw_h2h.py's identical flag.",
+    )
+    parser.add_argument(
+        "--symmetry-averaged-eval",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="At wide roots, average the neural value/prior over all 12 D6 board "
+        "orientations before search. Threads to "
+        "GumbelChanceMCTSConfig.symmetry_averaged_eval. Default off preserves the "
+        "existing generation regime exactly; enable only as a measured denoising arm.",
+    )
+    parser.add_argument(
+        "--symmetry-averaged-eval-threshold",
+        type=int,
+        default=None,
+        help="Inclusive minimum legal-action count for D6 averaging. Default None "
+        "preserves the legacy len(legal) > --wide-candidates-threshold gate, while "
+        "an explicit value decouples D6 coverage from --n-full-wide-threshold.",
+    )
+    parser.add_argument(
+        "--wide-candidates-threshold",
+        type=int,
+        default=24,
+        help="Legacy exclusive threshold for the wide root-candidate cap, and the "
+        "backwards-compatible fallback for D6/adaptive-budget gates when their "
+        "new explicit thresholds are unset.",
     )
     parser.add_argument("--max-decisions", type=int, default=600)
     parser.add_argument("--max-depth", type=int, default=80)
@@ -286,6 +334,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--prior-temperature", type=float, default=1.0)
     parser.add_argument("--value-scale", type=float, default=1.0)
+    parser.add_argument(
+        "--value-readout",
+        choices=("scalar", "categorical"),
+        default="scalar",
+        help="Science-critical search value source. 'scalar' preserves the historical "
+        "MSE head; 'categorical' backs up the trained HL-Gauss support expectation "
+        "and fails loudly if --checkpoint lacks that head.",
+    )
     parser.add_argument(
         "--correct-rust-chance-spectra",
         action=argparse.BooleanOptionalAction,
@@ -381,6 +437,15 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=64,
         help="EvalServer window max batch size (CAT-67). Only used with --eval-server.",
+    )
+    parser.add_argument(
+        "--eval-server-max-neural-rows",
+        type=int,
+        default=None,
+        help="Optional hard cap on actual neural rows per EvalServer forward. "
+        "Unlike --eval-server-max-batch, this counts rows inside chance/root-wave "
+        "requests; oversized requests are chunked and returned as one response. "
+        "Default None preserves the historical uncapped path.",
     )
     parser.add_argument(
         "--eval-server-max-wait-ms",
@@ -695,6 +760,10 @@ def main(argv: Sequence[str] | None = None) -> None:
     # default. No-op to the run when no --config* flag is passed.
     generate_config = resolve_config(args, GenerateConfig.from_namespace, parser=parser)
     generate_config_hash = generate_config.config_hash()
+    if bool(args.wide_roots_always_full) and args.n_full_wide is None:
+        parser.error("--wide-roots-always-full requires --n-full-wide")
+    if str(args.value_readout) == "categorical" and not args.checkpoint:
+        parser.error("--value-readout categorical requires --checkpoint with a trained HL-Gauss head")
 
     # Opponent-pool (H2): validate the manifest ONCE in the main process, before
     # spawning workers -- a malformed manifest would otherwise be caught only
@@ -721,6 +790,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     # worker spawns, not per-worker.
     opponent_mix_effective_weights: dict[str, float] | None = None
     opponent_mix_exploiter_fraction: float | None = None
+    mix_config: OpponentMixConfig | None = None
     if args.opponent_mix_manifest:
         if not args.checkpoint:
             raise SystemExit(
@@ -733,7 +803,9 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "(both resolve the same per-game opponent assignment) -- pass at most one."
             )
         mix_config = _resolve_mix_with_exploiter(
-            args.opponent_mix_manifest, args.exploiter_fraction
+            args.opponent_mix_manifest,
+            args.exploiter_fraction,
+            producer_checkpoint=args.checkpoint,
         )
         opponent_mix_effective_weights = mix_config.effective_weights()
         opponent_mix_exploiter_fraction = external_engine_effective_fraction(mix_config)
@@ -779,14 +851,25 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "p_full": float(args.p_full),
                 "c_visit": float(args.c_visit),
                 "c_scale": float(args.c_scale),
-                "n_full_wide": (
-                    int(args.n_full_wide) if args.n_full_wide is not None else None
+                "n_full_wide": (int(args.n_full_wide) if args.n_full_wide is not None else None),
+                "n_full_wide_threshold": (
+                    int(args.n_full_wide_threshold)
+                    if args.n_full_wide_threshold is not None
+                    else None
                 ),
+                "wide_roots_always_full": bool(args.wide_roots_always_full),
                 "raw_policy_above_width": (
                     int(args.raw_policy_above_width)
                     if args.raw_policy_above_width is not None
                     else None
                 ),
+                "symmetry_averaged_eval": bool(args.symmetry_averaged_eval),
+                "symmetry_averaged_eval_threshold": (
+                    int(args.symmetry_averaged_eval_threshold)
+                    if args.symmetry_averaged_eval_threshold is not None
+                    else None
+                ),
+                "wide_candidates_threshold": int(args.wide_candidates_threshold),
                 "max_decisions": int(args.max_decisions),
                 "max_depth": int(args.max_depth),
                 "temperature_move_fraction": float(args.temperature_move_fraction),
@@ -798,6 +881,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "sigma_eval": float(args.sigma_eval),
                 "prior_temperature": float(args.prior_temperature),
                 "value_scale": float(args.value_scale),
+                "value_readout": str(args.value_readout),
                 "track": args.track,
                 "vps_to_win": int(args.vps_to_win),
                 "obs_width": int(args.obs_width),
@@ -817,6 +901,11 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "belief_chance_spectra": bool(args.belief_chance_spectra),
                 "opponent_pool_manifest": args.opponent_pool_manifest,
                 "opponent_mix_manifest": args.opponent_mix_manifest,
+                # Main-process resolution verifies every checkpoint's bytes and
+                # binds the mix against the producer before spawn. Passing the
+                # immutable dataclass prevents live registry drift from giving
+                # different workers different opponent sets.
+                "opponent_mix_config": mix_config,
                 "exploiter_fraction": (
                     float(args.exploiter_fraction)
                     if args.exploiter_fraction is not None
@@ -929,6 +1018,8 @@ def _server_worker_entry(
     trained_with_masked_hidden_info: bool,
     needs_action_targets: bool,
     event_token_limit: int | None,
+    value_categorical_bins: int,
+    value_categorical_head_available: bool,
     client_timeout_ms: float,
     allow_local_fallback: bool,
     result_queue: Any,
@@ -949,9 +1040,12 @@ def _server_worker_entry(
             trained_with_masked_hidden_info=bool(trained_with_masked_hidden_info),
             needs_action_targets=bool(needs_action_targets),
             event_token_limit=event_token_limit,
+            value_categorical_bins=int(value_categorical_bins),
+            value_categorical_head_available=bool(value_categorical_head_available),
             config=EntityGraphRustEvaluatorConfig(
                 value_scale=float(worker_args["value_scale"]),
                 prior_temperature=float(worker_args["prior_temperature"]),
+                value_readout=str(worker_args.get("value_readout", "scalar")),
                 public_observation=bool(worker_args["public_observation"]),
                 rust_featurize=bool(worker_args["rust_featurize"]),
                 cache_size=int(worker_args.get("eval_cache_size", 100_000)),
@@ -982,6 +1076,7 @@ def _run_eval_server_batch(
         num_clients=len(worker_args),
         config=EvalServerConfig(
             max_batch_size=int(args.eval_server_max_batch),
+            max_neural_rows=getattr(args, "eval_server_max_neural_rows", None),
             max_wait_ms=float(args.eval_server_max_wait_ms),
             device=str(args.device),
             transport=str(getattr(args, "eval_server_transport", "mp_queue")),
@@ -1043,6 +1138,8 @@ def _run_eval_server_batch(
                     bool(meta["trained_with_masked_hidden_info"]),
                     bool(meta.get("needs_action_targets", True)),
                     meta.get("event_token_limit"),
+                    int(meta.get("value_categorical_bins", 0)),
+                    bool(meta.get("value_categorical_head_available", False)),
                     float(args.eval_server_timeout_ms),
                     bool(args.eval_server_local_fallback),
                     result_queue,
@@ -1143,6 +1240,11 @@ def _run_worker(
     champion_evaluator: Any | None = None,
 ) -> dict[str, Any]:
     checkpoint = worker_args["checkpoint"]
+    if str(worker_args.get("value_readout", "scalar")) == "categorical" and not checkpoint:
+        raise ValueError(
+            "value_readout='categorical' requires a neural checkpoint with a trained "
+            "HL-Gauss categorical value head; heuristic generation has no categorical head"
+        )
     colors = COLORS
     if champion_evaluator is not None:
         # CAT-67 --eval-server path: the champion evaluator (a RemoteEvalClient)
@@ -1158,6 +1260,7 @@ def _run_worker(
             config=EntityGraphRustEvaluatorConfig(
                 value_scale=float(worker_args["value_scale"]),
                 prior_temperature=float(worker_args["prior_temperature"]),
+                value_readout=str(worker_args.get("value_readout", "scalar")),
                 public_observation=bool(worker_args["public_observation"]),
                 rust_featurize=bool(worker_args["rust_featurize"]),
                 cache_size=int(worker_args.get("eval_cache_size", 100_000)),
@@ -1186,6 +1289,7 @@ def _run_worker(
         opponent_eval_config = EntityGraphRustEvaluatorConfig(
             value_scale=float(worker_args["value_scale"]),
             prior_temperature=float(worker_args["prior_temperature"]),
+            value_readout=str(worker_args.get("value_readout", "scalar")),
             public_observation=bool(worker_args["public_observation"]),
             rust_featurize=bool(worker_args["rust_featurize"]),
             cache_size=int(worker_args.get("eval_cache_size", 100_000)),
@@ -1209,18 +1313,26 @@ def _run_worker(
             evaluator_factory=_load_opponent_evaluator,
         )
 
-    # Opponent MIX (CAT-54): same in-process re-parse-per-worker + evaluator
-    # factory construction as the H2 binary pool above (identical
-    # public_observation/value_scale/prior_temperature/device parity guard).
+    # Opponent MIX (CAT-54): use the main process's byte-verified, producer-bound
+    # resolved config. This is intentionally NOT re-resolved from a mutable
+    # registry after spawn; every worker gets the exact same opponent bytes.
+    # Direct legacy _run_worker callers without opponent_mix_config retain a
+    # strict fallback resolution. Evaluator construction keeps the same
+    # public_observation/value_scale/prior_temperature/device parity guard.
     opponent_mix_manifest = worker_args.get("opponent_mix_manifest")
     opponent_mix: MixRuntime | None = None
     if opponent_mix_manifest:
-        mix_config = _resolve_mix_with_exploiter(
-            opponent_mix_manifest, worker_args.get("exploiter_fraction")
-        )
+        mix_config = worker_args.get("opponent_mix_config")
+        if mix_config is None:  # backward-compatible direct _run_worker callers
+            mix_config = _resolve_mix_with_exploiter(
+                opponent_mix_manifest,
+                worker_args.get("exploiter_fraction"),
+                producer_checkpoint=worker_args.get("checkpoint"),
+            )
         mix_eval_config = EntityGraphRustEvaluatorConfig(
             value_scale=float(worker_args["value_scale"]),
             prior_temperature=float(worker_args["prior_temperature"]),
+            value_readout=str(worker_args.get("value_readout", "scalar")),
             public_observation=bool(worker_args["public_observation"]),
             cache_size=int(worker_args.get("eval_cache_size", 100_000)),
         )
@@ -1272,11 +1384,24 @@ def _run_worker(
             if worker_args.get("n_full_wide") is not None
             else None
         ),
+        n_full_wide_threshold=(
+            int(worker_args["n_full_wide_threshold"])
+            if worker_args.get("n_full_wide_threshold") is not None
+            else None
+        ),
+        wide_roots_always_full=bool(worker_args.get("wide_roots_always_full", False)),
         raw_policy_above_width=(
             int(worker_args["raw_policy_above_width"])
             if worker_args.get("raw_policy_above_width") is not None
             else None
         ),
+        symmetry_averaged_eval=bool(worker_args.get("symmetry_averaged_eval", False)),
+        symmetry_averaged_eval_threshold=(
+            int(worker_args["symmetry_averaged_eval_threshold"])
+            if worker_args.get("symmetry_averaged_eval_threshold") is not None
+            else None
+        ),
+        wide_candidates_threshold=int(worker_args.get("wide_candidates_threshold", 24)),
         correct_rust_chance_spectra=bool(worker_args["correct_rust_chance_spectra"]),
         lazy_interior_chance=bool(worker_args["lazy_interior_chance"]),
         exact_budget_sh=bool(worker_args.get("exact_budget_sh", False)),
@@ -1436,6 +1561,7 @@ def _merge_worker_summaries(
         "exact_budget_sh_min_n": int(getattr(args, "exact_budget_sh_min_n", 0)),
         "root_wave_batching": bool(getattr(args, "root_wave_batching", False)),
         "rust_featurize": bool(args.rust_featurize),
+        "value_readout": str(getattr(args, "value_readout", "scalar")),
         "checkpoint": args.checkpoint,
         "base_seed": int(args.base_seed),
         # Complete CLI-argument provenance so a shard batch is auditable after

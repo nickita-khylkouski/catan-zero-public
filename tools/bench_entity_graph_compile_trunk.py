@@ -17,8 +17,6 @@ import statistics
 import time
 from typing import Any, Callable
 
-import numpy as np
-
 from bench_entity_graph_stages import _host_to_device, _synthetic_batch
 
 

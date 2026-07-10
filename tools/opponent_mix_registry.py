@@ -23,7 +23,7 @@ Manifest schema (superset of ``opponent_mix.read_opponent_mix_manifest``'s):
         {"name": "previous_public_champion", "weight": 10,
          "source": "registry_role", "role": "public_champion"},
         {"name": "older_champion", "weight": 5,
-         "source": "registry_pool", "filter": {"status": "active"}},
+         "source": "registry_pool", "filter": {"tag": "older_champion"}},
         {"name": "hard_experimental", "weight": 5,
          "source": "registry_pool", "filter": {"tag": "hard_negative"}},
         {"name": "catanatron_value", "weight": 5, "source": "external_engine",
@@ -50,16 +50,154 @@ so loudly rather than silently vanish from the mix. "self"/"checkpoint_list"/
 """
 from __future__ import annotations
 
+import dataclasses
+import hashlib
 import json
+import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from catan_zero.rl.flywheel.opponent_mix import MixCategory, MixCheckpointRef, OpponentMixConfig
+from catan_zero.rl.flywheel.opponent_mix import (
+    MixCategory,
+    MixCheckpointRef,
+    OpponentMixConfig,
+    config_to_dict,
+    scale_external_engine_fraction,
+    validate_external_engine_fraction,
+)
 
 if TYPE_CHECKING:
     from tools.champion_registry import ChampionRegistry, PoolEntry, RolePointer
 
 REGISTRY_SOURCES: tuple[str, ...] = ("registry_role", "registry_pool")
+FROZEN_SCHEMA_VERSION = 1
+
+
+def _file_md5(path: Path, *, chunk_size: int = 1 << 20) -> str:
+    digest = hashlib.md5()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(chunk_size), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _file_sha256(path: Path, *, chunk_size: int = 1 << 20) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(chunk_size), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _canonical_json_bytes(value: Any) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+
+
+def _config_sha256(config: OpponentMixConfig) -> str:
+    return hashlib.sha256(_canonical_json_bytes(config_to_dict(config))).hexdigest()
+
+
+def _verify_checkpoint_file(
+    checkpoint: MixCheckpointRef, *, category_name: str
+) -> MixCheckpointRef:
+    path = Path(checkpoint.path).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"mix category {category_name!r} checkpoint missing or not a regular file: {path}"
+        )
+    actual_md5 = _file_md5(path)
+    expected_md5 = checkpoint.md5.strip().lower()
+    if expected_md5 and expected_md5 != actual_md5:
+        raise ValueError(
+            f"mix category {category_name!r} checkpoint md5 mismatch for {path}: "
+            f"manifest/registry says {expected_md5}, actual bytes are {actual_md5}"
+        )
+    return MixCheckpointRef(path=str(path), version=checkpoint.version, md5=actual_md5)
+
+
+def validate_resolved_opponent_mix(
+    config: OpponentMixConfig,
+    *,
+    producer_checkpoint: str | os.PathLike[str] | None = None,
+) -> OpponentMixConfig:
+    """Verify and byte-bind a fully resolved mix before generation starts.
+
+    Every checkpoint-list entry is required to exist and is re-hashed even when
+    it came from ``ChampionRegistry``. Missing md5 values in explicit lists are
+    filled with the computed digest; supplied/registry digests must match. The
+    same bytes cannot occupy two opponent slots, and the producer's bytes cannot
+    reappear as an opponent under an alias path.
+
+    The returned config contains absolute paths and computed md5 values, so it
+    can be pickled into workers or written as an immutable run manifest without
+    consulting the mutable registry again.
+    """
+    effective_self = [
+        category
+        for category in config.effective_categories
+        if category.source == "self"
+    ]
+    if len(effective_self) > 1:
+        names = ", ".join(repr(category.name) for category in effective_self)
+        raise ValueError(
+            f"opponent mix has multiple effective self categories ({names}); "
+            "use one producer self-play category so its probability is unambiguous"
+        )
+
+    producer_md5: str | None = None
+    producer_path: Path | None = None
+    if producer_checkpoint is not None:
+        producer_path = Path(producer_checkpoint).expanduser().resolve()
+        if not producer_path.is_file():
+            raise FileNotFoundError(
+                f"producer checkpoint missing or not a regular file: {producer_path}"
+            )
+        producer_md5 = _file_md5(producer_path)
+
+    seen_by_md5: dict[str, tuple[str, str]] = {}
+    verified_categories: list[MixCategory] = []
+    for category in config.categories:
+        if category.source == "self" and (category.checkpoints or category.engine):
+            raise ValueError(
+                f"self category {category.name!r} must not carry checkpoints or an engine"
+            )
+        if category.source == "external_engine" and category.checkpoints:
+            raise ValueError(
+                f"external-engine category {category.name!r} must not carry checkpoint entries"
+            )
+        if category.source != "checkpoint_list":
+            verified_categories.append(category)
+            continue
+        if category.engine:
+            raise ValueError(
+                f"checkpoint-list category {category.name!r} must not carry an engine name"
+            )
+
+        verified_checkpoints: list[MixCheckpointRef] = []
+        for checkpoint in category.checkpoints:
+            verified = _verify_checkpoint_file(checkpoint, category_name=category.name)
+            if producer_md5 is not None and verified.md5 == producer_md5:
+                raise ValueError(
+                    f"mix category {category.name!r} checkpoint {verified.path} has the same "
+                    f"bytes (md5={verified.md5}) as producer checkpoint {producer_path}; "
+                    "this is duplicate self-play disguised as an opponent reference"
+                )
+            previous = seen_by_md5.get(verified.md5)
+            if previous is not None:
+                previous_category, previous_path = previous
+                raise ValueError(
+                    "duplicate checkpoint bytes in opponent mix: "
+                    f"category {previous_category!r} path {previous_path} and category "
+                    f"{category.name!r} path {verified.path} both have md5={verified.md5}; "
+                    "each checkpoint must occupy exactly one mix slot"
+                )
+            seen_by_md5[verified.md5] = (category.name, verified.path)
+            verified_checkpoints.append(verified)
+        verified_categories.append(
+            dataclasses.replace(category, checkpoints=tuple(verified_checkpoints))
+        )
+
+    return OpponentMixConfig(categories=tuple(verified_categories))
 
 
 def _import_champion_registry() -> Any:
@@ -188,7 +326,12 @@ def _resolve_category(entry: dict[str, Any], *, registry: "ChampionRegistry | No
     )
 
 
-def resolve_opponent_mix_manifest(path: str | Path) -> OpponentMixConfig:
+def resolve_opponent_mix_manifest(
+    path: str | Path,
+    *,
+    producer_checkpoint: str | os.PathLike[str] | None = None,
+    registry_path_override: str | os.PathLike[str] | None = None,
+) -> OpponentMixConfig:
     """Parse an opponent-mix manifest that may reference the CAT-9 registry,
     resolving every "registry_role"/"registry_pool" category into a concrete
     "checkpoint_list" category, and return a plain, registry-free
@@ -199,30 +342,136 @@ def resolve_opponent_mix_manifest(path: str | Path) -> OpponentMixConfig:
     ``opponent_mix.read_opponent_mix_manifest``) -- ``ChampionRegistry.load``
     is pure JSON, no torch/device involved.
     """
-    data = json.loads(Path(path).read_text())
+    manifest_path = Path(path).expanduser().resolve()
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f"opponent-mix manifest not found: {manifest_path}")
+    data = json.loads(manifest_path.read_text(encoding="utf-8"))
     raw_categories = list(data.get("categories", []))
     if not raw_categories:
-        raise ValueError(f"opponent-mix manifest {path} has no 'categories' entries")
+        raise ValueError(f"opponent-mix manifest {manifest_path} has no 'categories' entries")
 
     registry: "ChampionRegistry | None" = None
-    registry_path = data.get("registry")
+    registry_path = registry_path_override or data.get("registry")
     needs_registry = any(str(entry.get("source")) in REGISTRY_SOURCES for entry in raw_categories)
     if needs_registry:
         if not registry_path:
             raise ValueError(
-                f"opponent-mix manifest {path} has a registry_role/registry_pool category but no "
+                f"opponent-mix manifest {manifest_path} has a registry_role/registry_pool category but no "
                 'top-level "registry" path'
             )
-        registry = _import_champion_registry().ChampionRegistry.load(registry_path)
+        resolved_registry_path = Path(registry_path).expanduser().resolve()
+        if not resolved_registry_path.is_file():
+            raise FileNotFoundError(
+                f"opponent-mix registry not found: {resolved_registry_path}"
+            )
+        registry = _import_champion_registry().ChampionRegistry.load(resolved_registry_path)
 
     categories = tuple(_resolve_category(entry, registry=registry) for entry in raw_categories)
-    return OpponentMixConfig(categories=categories)
+    config = validate_resolved_opponent_mix(
+        OpponentMixConfig(categories=categories),
+        producer_checkpoint=producer_checkpoint,
+    )
+
+    frozen = data.get("_frozen")
+    if frozen is not None:
+        if int(frozen.get("schema_version", -1)) != FROZEN_SCHEMA_VERSION:
+            raise ValueError(
+                f"unsupported frozen opponent-mix schema version "
+                f"{frozen.get('schema_version')!r}; expected {FROZEN_SCHEMA_VERSION}"
+            )
+        expected_digest = str(frozen.get("resolved_config_sha256", ""))
+        actual_digest = _config_sha256(config)
+        if not expected_digest or expected_digest != actual_digest:
+            raise ValueError(
+                "frozen opponent-mix digest mismatch: resolved config bytes do not match "
+                f"the frozen digest (expected {expected_digest or '<missing>'}, actual {actual_digest})"
+            )
+        frozen_producer = dict(frozen.get("producer_checkpoint", {}))
+        if producer_checkpoint is not None:
+            actual_producer_md5 = _file_md5(Path(producer_checkpoint).expanduser().resolve())
+            frozen_producer_md5 = str(frozen_producer.get("md5", ""))
+            if not frozen_producer_md5 or frozen_producer_md5 != actual_producer_md5:
+                raise ValueError(
+                    "frozen opponent mix was bound to a different producer checkpoint: "
+                    f"frozen md5={frozen_producer_md5 or '<missing>'}, "
+                    f"current producer md5={actual_producer_md5}"
+                )
+    return config
+
+
+def freeze_opponent_mix_manifest(
+    source_manifest: str | Path,
+    output_path: str | Path,
+    *,
+    producer_checkpoint: str | os.PathLike[str],
+    registry_path_override: str | os.PathLike[str] | None = None,
+    external_fraction: float | None = None,
+) -> Path:
+    """Resolve, validate, and write a content-bound run manifest exactly once.
+
+    Registry roles/pools are expanded to concrete absolute checkpoint paths;
+    every checkpoint and the producer are re-hashed; duplicate/self aliases are
+    rejected. ``external_fraction`` optionally applies the existing exploiter
+    rescaling algorithm before freezing. The output is created with O_EXCL and
+    chmod 0444, so this command never overwrites or silently mutates a run's
+    provenance file.
+    """
+    source_path = Path(source_manifest).expanduser().resolve()
+    producer_path = Path(producer_checkpoint).expanduser().resolve()
+    config = resolve_opponent_mix_manifest(
+        source_path,
+        producer_checkpoint=producer_path,
+        registry_path_override=registry_path_override,
+    )
+    if external_fraction is not None:
+        config = scale_external_engine_fraction(config, float(external_fraction))
+    validate_external_engine_fraction(config)
+
+    config_dict = config_to_dict(config)
+    payload = {
+        "_frozen": {
+            "schema_version": FROZEN_SCHEMA_VERSION,
+            "source_manifest": str(source_path),
+            "source_manifest_sha256": _file_sha256(source_path),
+            "producer_checkpoint": {
+                "path": str(producer_path),
+                "md5": _file_md5(producer_path),
+            },
+            "resolved_config_sha256": _config_sha256(config),
+        },
+        **config_dict,
+    }
+
+    output = Path(output_path).expanduser().resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    serialized = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+    try:
+        descriptor = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o444)
+    except FileExistsError as error:
+        raise FileExistsError(
+            f"refusing to overwrite frozen opponent-mix manifest: {output}"
+        ) from error
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(serialized)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(output, 0o444)
+    except BaseException:
+        output.unlink(missing_ok=True)
+        raise
+    return output
 
 
 def _cmd_show(args: Any) -> None:
-    from catan_zero.rl.flywheel.opponent_mix import config_to_dict
-
-    config = resolve_opponent_mix_manifest(args.manifest)
+    config = resolve_opponent_mix_manifest(
+        args.manifest,
+        producer_checkpoint=args.producer_checkpoint,
+        registry_path_override=args.registry,
+    )
+    if args.external_fraction is not None:
+        config = scale_external_engine_fraction(config, args.external_fraction)
+    validate_external_engine_fraction(config)
     print(json.dumps(config_to_dict(config), indent=2, sort_keys=True))
 
 
@@ -230,11 +479,52 @@ def main() -> None:
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Resolve a (possibly registry-referencing) opponent-mix manifest and print it."
+        description=(
+            "Resolve and byte-validate a registry-backed opponent mix. By default print the "
+            "resolved JSON; --freeze-output writes a read-only, content-bound run manifest."
+        )
     )
     parser.add_argument("--manifest", required=True, help="Path to the opponent-mix manifest JSON.")
+    parser.add_argument(
+        "--registry",
+        help="Override the manifest's top-level registry path (useful with the checked-in R9 template).",
+    )
+    parser.add_argument(
+        "--producer-checkpoint",
+        help=(
+            "Current producer checkpoint. Required for --freeze-output and recommended for validation; "
+            "rejects opponent entries whose bytes duplicate the producer."
+        ),
+    )
+    parser.add_argument(
+        "--external-fraction",
+        type=float,
+        help=(
+            "Apply the existing external-engine rescaling before printing/freezing, e.g. 0.03 for "
+            "the production 3%% catanatron lane. The existing 5%% safety cap still applies."
+        ),
+    )
+    parser.add_argument(
+        "--freeze-output",
+        help=(
+            "Create this resolved run manifest exactly once (absolute paths, verified md5s, config "
+            "digest, mode 0444). Existing files are never overwritten."
+        ),
+    )
     args = parser.parse_args()
-    _cmd_show(args)
+    if args.freeze_output:
+        if not args.producer_checkpoint:
+            parser.error("--freeze-output requires --producer-checkpoint")
+        output = freeze_opponent_mix_manifest(
+            args.manifest,
+            args.freeze_output,
+            producer_checkpoint=args.producer_checkpoint,
+            registry_path_override=args.registry,
+            external_fraction=args.external_fraction,
+        )
+        print(output)
+    else:
+        _cmd_show(args)
 
 
 if __name__ == "__main__":

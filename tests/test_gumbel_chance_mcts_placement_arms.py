@@ -10,6 +10,7 @@ in the game (>24 legal), which is exactly the root class these arms target.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 
 import pytest
@@ -17,6 +18,9 @@ import pytest
 from catan_zero.search.gumbel_chance_mcts import (
     GumbelChanceMCTS,
     GumbelChanceMCTSConfig,
+    _choose_full_search,
+    _matches_explicit_or_legacy_width_gate,
+    _wide_budget_applies,
 )
 from catan_zero.search.rust_mcts import _require_rust_module
 
@@ -59,7 +63,73 @@ def _narrow_root_game(catanatron_rs, *, seed: int, max_legal: int = 8):
 def test_arms_default_to_disabled():
     config = GumbelChanceMCTSConfig()
     assert config.n_full_wide is None
+    assert config.n_full_wide_threshold is None
+    assert config.wide_roots_always_full is False
+    assert config.symmetry_averaged_eval_threshold is None
     assert config.raw_policy_above_width is None
+
+
+def test_new_width_controls_are_appended_for_positional_pickle_safety():
+    names = tuple(field.name for field in dataclasses.fields(GumbelChanceMCTSConfig))
+    assert names[-3:] == (
+        "symmetry_averaged_eval_threshold",
+        "n_full_wide_threshold",
+        "wide_roots_always_full",
+    )
+
+
+def test_explicit_width_gate_is_inclusive_but_default_preserves_legacy_exclusive_rule():
+    assert not _matches_explicit_or_legacy_width_gate(
+        24, min_legal_actions=None, legacy_exclusive_threshold=24
+    )
+    assert _matches_explicit_or_legacy_width_gate(
+        25, min_legal_actions=None, legacy_exclusive_threshold=24
+    )
+    assert _matches_explicit_or_legacy_width_gate(
+        40, min_legal_actions=40, legacy_exclusive_threshold=24
+    )
+    assert not _matches_explicit_or_legacy_width_gate(
+        39, min_legal_actions=40, legacy_exclusive_threshold=24
+    )
+
+
+def test_wide_budget_threshold_is_independent_of_legacy_candidate_threshold():
+    config = GumbelChanceMCTSConfig(
+        n_full_wide=256,
+        wide_candidates_threshold=20,
+        n_full_wide_threshold=40,
+    )
+    assert not _wide_budget_applies(39, config)
+    assert _wide_budget_applies(40, config)
+
+
+def test_wide_roots_always_full_bypasses_p_full_coin_only_for_budgeted_roots():
+    config = GumbelChanceMCTSConfig(
+        n_full_wide=256,
+        n_full_wide_threshold=40,
+        wide_roots_always_full=True,
+        p_full=0.0,
+    )
+    draws = 0
+
+    def draw() -> float:
+        nonlocal draws
+        draws += 1
+        return 1.0
+
+    assert _choose_full_search(
+        config, force_full=None, wide_budget_root=True, random_draw=draw
+    )
+    assert draws == 0
+    assert not _choose_full_search(
+        config, force_full=None, wide_budget_root=False, random_draw=draw
+    )
+    assert draws == 1
+    # An explicit caller override remains authoritative.
+    assert not _choose_full_search(
+        config, force_full=False, wide_budget_root=True, random_draw=draw
+    )
+    assert draws == 1
 
 
 # ---------------------------------------------------------------------------
@@ -82,6 +152,28 @@ def test_n_full_wide_spends_more_sims_at_a_wide_root():
 
     assert wide.simulations_used > base.simulations_used
     assert wide.selected_action in _legal_ids(game)
+
+
+def test_explicit_wide_threshold_and_always_full_apply_at_equality():
+    catanatron_rs = _rust()
+    game = _wide_root_game(catanatron_rs, seed=11)
+    num_legal = len(_legal_ids(game))
+
+    result = GumbelChanceMCTS(
+        GumbelChanceMCTSConfig(
+            seed=3,
+            n_full=32,
+            n_fast=8,
+            p_full=0.0,
+            n_full_wide=64,
+            n_full_wide_threshold=num_legal,
+            wide_roots_always_full=True,
+        )
+    ).search(game)
+
+    assert result.used_full_search is True
+    assert result.simulations_used > 8
+    assert result.selected_action in _legal_ids(game)
 
 
 def test_n_full_wide_is_a_noop_at_a_narrow_root():

@@ -1,7 +1,7 @@
 # CAT-73 Verification Checklist — Findings
 
 Date: 2026-07-08
-Scope: five verification questions gating Phase-A decisions (A0-pre, per CAT-73's R9 edit). All checks are read-only, code/data-level, GPU-free. Worktree: `/Users/nickita/cz-cat73` (branch `cat-73-verifications`).
+Scope: five verification questions gating Phase-A decisions (A0-pre, per CAT-73's R9 edit). All checks are read-only, code/data-level, GPU-free. Historical worktree: `<repo-worktree>` (branch `cat-73-verifications`).
 
 ---
 
@@ -108,7 +108,7 @@ Substantially-nonzero, varying counts would close this out completely.
 - Gated at runtime behind `getattr(args, "symmetry_augment", False)` (`train_bc.py:891-899`) and requires `--arch entity_graph`.
 - Unlike the earlier `--mask-hidden-info` blind spot (which memory notes was NOT recorded into `report.json`), this flag's actual value **is** recorded: `train_bc.py:1274` — `"symmetry_augment": bool(args.symmetry_augment),` inside the report dict (confirmed by direct read, lines 1270-1278). So any `report.json` from a completed run gives zero-ambiguity ground truth.
 - All three production launch paths found in this worktree omit the flag (hence it runs at its `False` default):
-  - `tools/remote_b200_mcts_finetune_queue.sh:116-146` — the B200 finetune queue's `train_bc.py` invocation lists ~25 explicit flags and does not include `--symmetry-augment`.
+  - Historical B200 finetune queue (completed; script removed) did not include `--symmetry-augment`.
   - `tools/continuous_flywheel.py:253-259` — the flywheel's `train_window()` call (`--arch entity_graph --data-format memmap --mask-hidden-info --amp bf16 --max-steps ...`) omits it.
   - `tools/start_training_factory.py:245-270+` — grep for "symmetry" across the file returns nothing.
 - Corroborating project narrative: `docs/plans/CATAN_ZERO_RESEARCH_CHRONICLE.md:112,290` — symmetry augmentation was tried as an experimental recipe arm (H2), lost to H1, and was explicitly "not adopted." `docs/plans/CATAN_ZERO_MASTER_PLAN.md:292` lists it under a "build-and-shelve" pattern: "symmetry averaging (built, off)."

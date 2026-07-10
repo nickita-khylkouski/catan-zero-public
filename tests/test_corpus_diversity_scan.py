@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -197,8 +198,130 @@ def test_run_scan_end_to_end_on_synthetic_npz(tmp_path):
     assert report["opening_line_concentration"]["n_games"] == 3
 
 
+def test_npz_scan_hashes_entity_tokens_when_obs_is_zero_placeholder(tmp_path):
+    shards_dir = tmp_path / "entity_shards"
+    shards_dir.mkdir()
+    rows = _rows()
+    rows["obs"] = np.zeros_like(rows["obs"])
+    rows["global_tokens"] = np.arange(18, dtype=np.float32).reshape(18, 1, 1)
+    np.savez(shards_dir / "shard_000.npz", **rows)
+
+    report = run_scan(
+        shards_dir,
+        generation_label="entity-placeholder",
+        line_length=8,
+        decision_low=1,
+        decision_high=3,
+    )
+    content = report["unique_state_fraction_content"]
+    assert content["representation"] == "entity_tokens"
+    assert content["columns"] == ["global_tokens"]
+    assert content["unique_hashes"] == 18
+    assert content["unique_fraction"] == pytest.approx(1.0)
+
+
 def test_run_scan_errors_cleanly_on_empty_dir(tmp_path):
     shards_dir = tmp_path / "empty"
     shards_dir.mkdir()
     report = run_scan(shards_dir, generation_label="gen-empty", line_length=8, decision_low=1, decision_high=30)
     assert "error" in report
+
+
+def _write_memmap_corpus(corpus_dir: Path) -> None:
+    corpus_dir.mkdir()
+    rows = _rows()
+    counts = np.sum(rows["legal_action_ids"] >= 0, axis=1).astype(np.int64)
+    offsets = np.empty(len(counts) + 1, dtype=np.int64)
+    offsets[0] = 0
+    np.cumsum(counts, out=offsets[1:])
+    offsets.tofile(corpus_dir / "row_offsets.dat")
+    for name in ("game_seed", "decision_index", "action_taken", "obs"):
+        rows[name].tofile(corpus_dir / f"{name}.dat")
+    prefix = rows["legal_action_ids"] >= 0
+    rows["legal_action_ids"][prefix].tofile(corpus_dir / "legal_action_ids.dat")
+    rows["target_policy"][prefix].tofile(corpus_dir / "target_policy.dat")
+    meta = {
+        "schema": "memmap_corpus_v1",
+        "row_count": len(counts),
+        "flat_count": int(offsets[-1]),
+        "legal_width": int(rows["legal_action_ids"].shape[1]),
+        "shard_count": 1,
+        "source": "synthetic",
+        "sources": ["synthetic"],
+        "stats": {"has_duplicate_game_seeds": False},
+        "columns": {
+            "game_seed": {"kind": "fixed", "dtype": rows["game_seed"].dtype.str, "inner_shape": []},
+            "decision_index": {"kind": "fixed", "dtype": rows["decision_index"].dtype.str, "inner_shape": []},
+            "action_taken": {"kind": "fixed", "dtype": rows["action_taken"].dtype.str, "inner_shape": []},
+            "obs": {"kind": "fixed", "dtype": rows["obs"].dtype.str, "inner_shape": [2]},
+            "legal_action_ids": {"kind": "ragged2d", "dtype": rows["legal_action_ids"].dtype.str, "fill": -1.0},
+            "target_policy": {"kind": "ragged2d", "dtype": rows["target_policy"].dtype.str, "fill": 0.0},
+        },
+    }
+    (corpus_dir / "corpus_meta.json").write_text(json.dumps(meta), encoding="utf-8")
+
+
+def test_run_scan_memmap_matches_npz_metrics(tmp_path):
+    corpus_dir = tmp_path / "memmap"
+    _write_memmap_corpus(corpus_dir)
+
+    report = run_scan(
+        corpus_dir,
+        generation_label="gen-memmap",
+        line_length=8,
+        decision_low=1,
+        decision_high=3,
+    )
+    assert report["source_format"] == "memmap_corpus_v1"
+    assert report["rows_total"] == 18
+    assert report["games_total"] == 3
+    assert report["unique_state_fraction_cheap"]["unique_fraction"] == pytest.approx(16 / 18)
+    assert report["unique_state_fraction_content"]["unique_fraction"] == pytest.approx(17 / 18)
+    assert report["opening_entropy"]["rows_in_window"] == 9
+    assert report["opening_entropy"]["rows_with_entropy"] == 8
+    assert report["opening_line_concentration"]["n_games"] == 3
+
+
+def test_memmap_scan_hashes_entity_tokens_when_obs_is_zero_placeholder(tmp_path):
+    corpus_dir = tmp_path / "entity_memmap"
+    _write_memmap_corpus(corpus_dir)
+    rows = _rows()
+    np.zeros_like(rows["obs"]).tofile(corpus_dir / "obs.dat")
+    global_tokens = np.arange(18, dtype=np.float32).reshape(18, 1, 1)
+    global_tokens.tofile(corpus_dir / "global_tokens.dat")
+    meta_path = corpus_dir / "corpus_meta.json"
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    meta["columns"]["global_tokens"] = {
+        "kind": "fixed",
+        "dtype": global_tokens.dtype.str,
+        "inner_shape": [1, 1],
+    }
+    meta_path.write_text(json.dumps(meta), encoding="utf-8")
+
+    report = run_scan(
+        corpus_dir,
+        generation_label="entity-memmap-placeholder",
+        line_length=8,
+        decision_low=1,
+        decision_high=3,
+    )
+    content = report["unique_state_fraction_content"]
+    assert content["representation"] == "entity_tokens"
+    assert content["columns"] == ["global_tokens"]
+    assert content["unique_hashes"] == 18
+
+
+def test_memmap_scan_fails_on_inconsistent_final_offset(tmp_path):
+    corpus_dir = tmp_path / "bad_memmap"
+    _write_memmap_corpus(corpus_dir)
+    offsets = np.fromfile(corpus_dir / "row_offsets.dat", dtype=np.int64)
+    offsets[-1] -= 1
+    offsets.tofile(corpus_dir / "row_offsets.dat")
+    with pytest.raises(ValueError, match="final row offset"):
+        run_scan(
+            corpus_dir,
+            generation_label="bad",
+            line_length=8,
+            decision_low=1,
+            decision_high=3,
+        )

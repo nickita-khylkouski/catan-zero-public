@@ -245,7 +245,7 @@ Tiered checkpoint labels:
 SSH:
 
 ```bash
-ssh -i /Users/nickita/.ssh/gpu_access_ed25519 \
+ssh -i $HOME/.ssh/gpu_access_ed25519 \
   -o IdentitiesOnly=yes \
   -o StrictHostKeyChecking=accept-new \
   -o UserKnownHostsFile=/tmp/catanatron-b200-known_hosts \
@@ -284,7 +284,7 @@ scoreboard eval for the latest checkpoint.
 SSH:
 
 ```bash
-ssh -i /Users/nickita/.ssh/gpu_access_ed25519 \
+ssh -i $HOME/.ssh/gpu_access_ed25519 \
   -o IdentitiesOnly=yes \
   -o StrictHostKeyChecking=accept-new \
   ubuntu@a100-legacy
@@ -313,7 +313,7 @@ A100 GPUs are not the bottleneck for teacher rollout. Their CPUs are useful.
 SSH:
 
 ```bash
-ssh -i /Users/nickita/.ssh/gpu_access_ed25519 \
+ssh -i $HOME/.ssh/gpu_access_ed25519 \
   -o IdentitiesOnly=yes \
   -o StrictHostKeyChecking=accept-new \
   -o UserKnownHostsFile=/tmp/catanatron-gh200-new-known_hosts \
@@ -485,7 +485,7 @@ alive without opening every log manually.
 Local one-shot / watch command:
 
 ```bash
-cd /Users/nickita/.superset/worktrees/start/modest-bedbug/catan-zero
+cd <verified-local-checkout>
 
 python3 tools/cluster_teacher_status.py
 
@@ -512,7 +512,7 @@ python3 tools/cluster_teacher_status.py \
 Watchdog command:
 
 ```bash
-cd /Users/nickita/.superset/worktrees/start/modest-bedbug/catan-zero
+cd <verified-local-checkout>
 
 CATAN_ZERO_MODAL_RUNS=teacher_2p10_ab45_search_600cpu_YYYYMMDD_HHMM \
   python3 tools/teacher_phase_watchdog.py \
@@ -542,7 +542,7 @@ when Modal `observed_samples` stops advancing across checks.
 B200 status:
 
 ```bash
-ssh -i /Users/nickita/.ssh/gpu_access_ed25519 \
+ssh -i $HOME/.ssh/gpu_access_ed25519 \
   -o IdentitiesOnly=yes \
   -o StrictHostKeyChecking=accept-new \
   -o UserKnownHostsFile=/tmp/catanatron-b200-known_hosts \
@@ -570,14 +570,14 @@ partitioned and the launch command pins each job to disjoint GPUs.
 Current B200 train tail:
 
 ```bash
-cd /Users/nickita/.superset/worktrees/start/modest-bedbug/catan-zero
+cd <verified-local-checkout>
 python3 tools/teacher_phase_tail.py b200-train --follow
 ```
 
 Manual equivalent:
 
 ```bash
-ssh -i /Users/nickita/.ssh/gpu_access_ed25519 \
+ssh -i $HOME/.ssh/gpu_access_ed25519 \
   -o IdentitiesOnly=yes \
   -o StrictHostKeyChecking=accept-new \
   -o UserKnownHostsFile=/tmp/catanatron-b200-known_hosts \
@@ -591,14 +591,14 @@ tail -f "$RUN/train.log"
 Current B200 scoreboard tail:
 
 ```bash
-cd /Users/nickita/.superset/worktrees/start/modest-bedbug/catan-zero
+cd <verified-local-checkout>
 python3 tools/teacher_phase_tail.py b200-scoreboard
 ```
 
 Manual equivalent:
 
 ```bash
-ssh -i /Users/nickita/.ssh/gpu_access_ed25519 \
+ssh -i $HOME/.ssh/gpu_access_ed25519 \
   -o IdentitiesOnly=yes \
   -o StrictHostKeyChecking=accept-new \
   -o UserKnownHostsFile=/tmp/catanatron-b200-known_hosts \
@@ -615,14 +615,14 @@ for f in "$OUT"/*.json; do [ -f "$f" ] && echo "---- $f" && cat "$f"; done
 A100 data-generation status:
 
 ```bash
-cd /Users/nickita/.superset/worktrees/start/modest-bedbug/catan-zero
+cd <verified-local-checkout>
 python3 tools/teacher_phase_tail.py a100-generate --follow
 ```
 
 Manual status:
 
 ```bash
-ssh -i /Users/nickita/.ssh/gpu_access_ed25519 \
+ssh -i $HOME/.ssh/gpu_access_ed25519 \
   -o IdentitiesOnly=yes \
   -o StrictHostKeyChecking=accept-new \
   ubuntu@a100-legacy '
@@ -642,14 +642,14 @@ find runs/teacher -mindepth 1 -maxdepth 1 -type d -printf "%T@ %p\n" 2>/dev/null
 GH200 data-generation status:
 
 ```bash
-cd /Users/nickita/.superset/worktrees/start/modest-bedbug/catan-zero
+cd <verified-local-checkout>
 python3 tools/teacher_phase_tail.py gh200-generate --follow
 ```
 
 Manual status:
 
 ```bash
-ssh -i /Users/nickita/.ssh/gpu_access_ed25519 \
+ssh -i $HOME/.ssh/gpu_access_ed25519 \
   -o IdentitiesOnly=yes \
   -o StrictHostKeyChecking=accept-new \
   -o UserKnownHostsFile=/tmp/catanatron-gh200-new-known_hosts \
@@ -919,7 +919,7 @@ Preferred transfer:
 SRC_RUN=curated_soft_2p10_v1_YYYYMMDD_HHMM
 
 rsync -av --progress \
-  -e 'ssh -i /Users/nickita/.ssh/gpu_access_ed25519 -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new' \
+  -e 'ssh -i $HOME/.ssh/gpu_access_ed25519 -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new' \
   ubuntu@a100-legacy:/home/ubuntu/catan-zero/runs/teacher/"$SRC_RUN"/ \
   /tmp/"$SRC_RUN"/
 ```
@@ -928,7 +928,7 @@ Then push to B200:
 
 ```bash
 rsync -av --progress \
-  -e 'ssh -i /Users/nickita/.ssh/gpu_access_ed25519 -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/tmp/catanatron-b200-known_hosts' \
+  -e 'ssh -i $HOME/.ssh/gpu_access_ed25519 -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/tmp/catanatron-b200-known_hosts' \
   /tmp/"$SRC_RUN"/ \
   ubuntu@B200:/home/ubuntu/catan-zero/runs/teacher/"$SRC_RUN"/
 ```
@@ -954,7 +954,7 @@ find "$SCRATCH/parts" -name manifest.json | grep -q . || {
 }
 
 rsync -av --progress \
-  -e 'ssh -i /Users/nickita/.ssh/gpu_access_ed25519 -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/tmp/catanatron-b200-known_hosts' \
+  -e 'ssh -i $HOME/.ssh/gpu_access_ed25519 -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/tmp/catanatron-b200-known_hosts' \
   "$SCRATCH/parts" \
   ubuntu@B200:/home/ubuntu/catan-zero/runs/teacher/"$MODAL_RUN"/
 ```
@@ -965,7 +965,7 @@ can exceed laptop `/tmp` capacity.
 Then curate the Modal export on B200 before using it for training:
 
 ```bash
-ssh -i /Users/nickita/.ssh/gpu_access_ed25519 \
+ssh -i $HOME/.ssh/gpu_access_ed25519 \
   -o IdentitiesOnly=yes \
   -o StrictHostKeyChecking=accept-new \
   -o UserKnownHostsFile=/tmp/catanatron-b200-known_hosts \
@@ -1034,7 +1034,7 @@ directories will be consumed automatically.
 Concrete merged-production dataset build on B200:
 
 ```bash
-ssh -i /Users/nickita/.ssh/gpu_access_ed25519 \
+ssh -i $HOME/.ssh/gpu_access_ed25519 \
   -o IdentitiesOnly=yes \
   -o StrictHostKeyChecking=accept-new \
   -o UserKnownHostsFile=/tmp/catanatron-b200-known_hosts \

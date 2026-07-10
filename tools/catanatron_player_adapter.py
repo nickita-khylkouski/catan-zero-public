@@ -30,15 +30,23 @@ which we never call (catanatron's engine executes actions itself). See
 `_synthetic_event_log` for how that's reconstructed, and its docstring for
 the one deliberately-unfixed piece (turn-key ordinals).
 
-MODE
-----
-Only `mode="raw_policy"` is implemented (net's policy head, no search) -- see
-`SEARCH_MODE_TODO` for a precise account of what full-search mode needs and
-why it's a separate, larger piece of work.
+MODES
+-----
+`CatanZeroNetPlayer` is the original raw-policy adapter.  Search is exposed as
+the separate `CatanZeroSearchPlayer`: catanatron's native Python `Game.play()`
+loop remains the referee and owns the real game, while a verified TOURNAMENT-
+map Rust shadow is used only as the state passed to `GumbelChanceMCTS`.
+Native `ActionRecord`s are replayed into that shadow with their *already
+resolved* dice / robber-steal / development-card outcomes.  Every search call
+checks legal-action and state parity and fails closed on a divergence; it does
+not silently fall back to raw policy or pretend BASE-map RNG equivalence.
 """
+
+# ruff: noqa: E402 -- this executable adds its sibling tools directory before imports.
 
 from __future__ import annotations
 
+import json
 import sys
 import threading
 from pathlib import Path
@@ -53,6 +61,20 @@ if str(_TOOLS_DIR) not in sys.path:
 from catan_zero.rl._catanatron import import_catanatron_module
 from catan_zero.rl.entity_token_policy import EntityGraphPolicy
 from catan_zero.rl.multiagent_env import ColonistMultiAgentConfig, ColonistMultiAgentEnv
+from catan_zero.adapters.engine_equivalence import (
+    DEVELOPMENT_CARDS,
+    RESOURCES,
+    canonical_python_action_key,
+    canonical_rust_action_key,
+    diff_state_views,
+    is_chance_action,
+    legal_action_diff,
+    python_state_view,
+    raw_action_to_python_action,
+    rust_legal_actions,
+    rust_state_view,
+    vendor_symbols,
+)
 
 # Importing this module registers the vendored catanatron tree on sys.path
 # (see `catan_zero.rl._catanatron.ensure_catanatron`), so the direct
@@ -77,35 +99,20 @@ _NATIVE_TO_EVENT_ACTION_TYPE: dict[str, str] = {
 }
 
 SEARCH_MODE_TODO = """\
-Full search mode (GumbelChanceMCTS) is not wired into this adapter yet.
-Concretely, what's missing:
-
-  1. A shadow `catanatron_rs.Game` kept in lockstep with the REAL catanatron
-     `Game` this Player is handed each `decide()` call -- driven in the
-     OPPOSITE direction from the existing lockstep bridge in
-     `tools/gumbel_search_vs_bot_h2h.py` / `catan_zero.adapters.
-     engine_equivalence`. There, our own search picks every move and the two
-     engines are advanced together move-by-move. Here, catanatron's real
-     engine (and a real opponent Player, e.g. AlphaBetaPlayer) is what
-     advances state on the OTHER seats' turns, so every already-resolved
-     chance outcome (dice roll, robber-steal victim, dev-card draw) has to be
-     forced into the shadow Rust game via `apply_chance_step` /
-     `raw_action_to_python_action` instead of being re-sampled.
-  2. On this Player's own turns, hand the (kept-in-sync) shadow Rust game to
-     `GumbelChanceMCTS.search(...)`, exactly as
-     `tools/gumbel_search_vs_bot_h2h.py` does for its candidate side, then
-     translate the chosen action back to catanatron's native `Action` --
-     this file's `env._decode_action` covers that same translation for raw
-     policy, but the Rust engine's action-id space needs the
-     `rust_legal_actions` / `canonical_rust_action_key` matching from
-     `engine_equivalence` instead of `ActionCatalog`.
-  3. `engine_equivalence`'s board-parity guarantee is only established for
-     the TOURNAMENT map (its docstring: the vendored Python engine's
-     board-shuffle RNG doesn't match Rust's). Search mode would need to
-     either accept that map restriction, or extend the equivalence bridge to
-     BASE's random board shuffle -- which raw-policy mode does NOT need,
-     since it never touches a second engine at all.
+Use CatanZeroSearchPlayer for full-search native-harness games. Search cannot
+be enabled by changing CatanZeroNetPlayer.mode because it additionally needs
+the seating-aligned TOURNAMENT-map Rust shadow and a configured
+GumbelChanceMCTS instance created by the match runner. BASE-map search is
+intentionally unsupported: the Python and Rust map-shuffle RNGs do not match.
 """
+
+
+class SearchEngineBoundaryError(RuntimeError):
+    """The native Python referee and the Rust search shadow diverged.
+
+    A neutral-harness result is invalid after this boundary fails.  Callers
+    must record/exclude the game, never downgrade to raw policy.
+    """
 
 
 def standard_colors(num_players: int) -> tuple[Any, ...]:
@@ -181,7 +188,9 @@ def _color_name(color: Any) -> str:
 def _jsonable(value: Any) -> Any:
     if isinstance(value, (tuple, list)):
         return [_jsonable(item) for item in value]
-    if hasattr(value, "name") and hasattr(value, "value"):  # enum-like (Color, Resource, ...)
+    if hasattr(value, "name") and hasattr(
+        value, "value"
+    ):  # enum-like (Color, Resource, ...)
         return value.name
     return value
 
@@ -277,7 +286,9 @@ def _synthetic_event_log(
                     "action_index": action_index,
                     "action": {
                         "index": action_index,
-                        "action_type": _NATIVE_TO_EVENT_ACTION_TYPE.get(native_type, native_type),
+                        "action_type": _NATIVE_TO_EVENT_ACTION_TYPE.get(
+                            native_type, native_type
+                        ),
                         "value": _jsonable(action.value),
                     },
                     "result": _jsonable(record.result),
@@ -288,7 +299,9 @@ def _synthetic_event_log(
     return events[-history_limit:]
 
 
-def bind_external_game(env: ColonistMultiAgentEnv, game: Any, *, history_limit: int = 64) -> None:
+def bind_external_game(
+    env: ColonistMultiAgentEnv, game: Any, *, history_limit: int = 64
+) -> None:
     """Point `env` at an externally-owned, in-progress catanatron `Game`.
 
     Bypasses `.reset()` (which would create its own `Game` and dummy
@@ -450,7 +463,9 @@ class CatanZeroNetPlayer(CatanatronPlayer):
         except Exception:  # noqa: BLE001 - fall back rather than crash the match.
             native_action = None
 
-        if native_action is None or not self._is_legal(env, game, native_action, playable_actions):
+        if native_action is None or not self._is_legal(
+            env, game, native_action, playable_actions
+        ):
             self.stats["illegal_policy_picks"] += 1
             native_action = playable_actions[0]
         return native_action
@@ -466,16 +481,334 @@ class CatanZeroNetPlayer(CatanatronPlayer):
         return self._env
 
     @staticmethod
-    def _is_legal(env: ColonistMultiAgentEnv, game: Any, native_action: Any, playable_actions: list[Any]) -> bool:
+    def _is_legal(
+        env: ColonistMultiAgentEnv,
+        game: Any,
+        native_action: Any,
+        playable_actions: list[Any],
+    ) -> bool:
         try:
-            return bool(env.is_valid_action(playable_actions, game.state, native_action))
+            return bool(
+                env.is_valid_action(playable_actions, game.state, native_action)
+            )
         except Exception:  # noqa: BLE001 - be conservative: treat any check failure as illegal.
             return False
 
 
+def _enum_name(value: Any) -> str:
+    """Stable name for native enum/string chance outcomes."""
+    return str(getattr(value, "name", value))
+
+
+def _recorded_roll_outcome_index(rust_game: Any, raw_action: Any, result: Any) -> int:
+    try:
+        die_a, die_b = (int(value) for value in result)
+    except (TypeError, ValueError) as error:
+        raise SearchEngineBoundaryError(
+            f"native ROLL record has invalid result {result!r}"
+        ) from error
+    total = die_a + die_b
+    if not (1 <= die_a <= 6 and 1 <= die_b <= 6 and 2 <= total <= 12):
+        raise SearchEngineBoundaryError(
+            f"native ROLL record has impossible dice {result!r}"
+        )
+    spectrum = json.loads(rust_game.spectrum_json(json.dumps(raw_action)))
+    outcome_index = total - 2
+    if not 0 <= outcome_index < len(spectrum):
+        raise SearchEngineBoundaryError(
+            f"Rust ROLL spectrum cannot represent native dice {result!r}: {spectrum!r}"
+        )
+    return outcome_index
+
+
+def _recorded_robber_outcome_index(rust_game: Any, raw_action: Any, result: Any) -> int:
+    wanted_resource = _enum_name(result)
+    if wanted_resource not in RESOURCES:
+        raise SearchEngineBoundaryError(
+            f"native MOVE_ROBBER record has invalid stolen resource {result!r}"
+        )
+    victim_name = str(raw_action[2][1])
+    before = json.loads(rust_game.json_snapshot())
+    colors = [str(color) for color in before["colors"]]
+    try:
+        victim_index = colors.index(victim_name)
+    except ValueError as error:
+        raise SearchEngineBoundaryError(
+            f"Rust MOVE_ROBBER victim {victim_name!r} is absent from seats {colors!r}"
+        ) from error
+    before_hand = before["player_state"][victim_index]["resources"]
+    spectrum = json.loads(rust_game.spectrum_json(json.dumps(raw_action)))
+    matching: list[int] = []
+    for outcome_index in range(len(spectrum)):
+        candidate = rust_game.apply_chance_outcome(
+            json.dumps(raw_action), outcome_index
+        )
+        after = json.loads(candidate.json_snapshot())
+        after_hand = after["player_state"][victim_index]["resources"]
+        stolen = [
+            resource
+            for resource in RESOURCES
+            if int(after_hand[resource]) - int(before_hand[resource]) == -1
+        ]
+        clean = len(stolen) == 1 and all(
+            int(after_hand[resource]) - int(before_hand[resource]) in (0, -1)
+            for resource in RESOURCES
+        )
+        if clean and stolen[0] == wanted_resource:
+            matching.append(outcome_index)
+    if not matching:
+        raise SearchEngineBoundaryError(
+            "Rust MOVE_ROBBER spectrum cannot reproduce native stolen resource "
+            f"{wanted_resource!r} for action {raw_action!r}"
+        )
+    return matching[0]
+
+
+def _recorded_development_card_outcome_index(
+    rust_game: Any, raw_action: Any, result: Any
+) -> int:
+    wanted_card = _enum_name(result)
+    if wanted_card not in DEVELOPMENT_CARDS:
+        raise SearchEngineBoundaryError(
+            f"native BUY_DEVELOPMENT_CARD record has invalid card {result!r}"
+        )
+    actor_name = str(raw_action[0])
+    before = json.loads(rust_game.json_snapshot())
+    colors = [str(color) for color in before["colors"]]
+    try:
+        actor_index = colors.index(actor_name)
+    except ValueError as error:
+        raise SearchEngineBoundaryError(
+            f"Rust BUY_DEVELOPMENT_CARD actor {actor_name!r} is absent from seats {colors!r}"
+        ) from error
+    before_cards = before["player_state"][actor_index]["dev_cards"]
+    before_deck_count = int(before["development_deck_count"])
+    spectrum = json.loads(rust_game.spectrum_json(json.dumps(raw_action)))
+    matching: list[int] = []
+    for outcome_index in range(len(spectrum)):
+        candidate = rust_game.apply_chance_outcome(
+            json.dumps(raw_action), outcome_index
+        )
+        after = json.loads(candidate.json_snapshot())
+        after_cards = after["player_state"][actor_index]["dev_cards"]
+        gained = [
+            card
+            for card in DEVELOPMENT_CARDS
+            if int(after_cards[card]) - int(before_cards[card]) == 1
+        ]
+        if (
+            gained == [wanted_card]
+            and int(after["development_deck_count"]) == before_deck_count - 1
+        ):
+            matching.append(outcome_index)
+    if not matching:
+        raise SearchEngineBoundaryError(
+            "Rust BUY_DEVELOPMENT_CARD spectrum cannot reproduce native card "
+            f"{wanted_card!r} for action {raw_action!r}"
+        )
+    return matching[0]
+
+
+def apply_native_action_record_to_rust(
+    rust_game: Any,
+    action_record: Any,
+    *,
+    seated_colors: tuple[str, ...],
+    map_kind: str,
+) -> Any:
+    """Replay one authoritative native-catanatron ActionRecord in Rust.
+
+    Chance is never re-sampled.  The concrete result already chosen by the
+    native referee is located in the Rust spectrum and applied exactly.
+    Returns the new Rust game because `apply_chance_outcome` is functional.
+    """
+    ids, raw_actions = rust_legal_actions(rust_game, seated_colors, map_kind)
+    wanted_key = canonical_python_action_key(action_record.action)
+    matches = [
+        index
+        for index, raw_action in enumerate(raw_actions)
+        if canonical_rust_action_key(raw_action) == wanted_key
+    ]
+    if len(matches) != 1:
+        raise SearchEngineBoundaryError(
+            "native action has no unique Rust legal equivalent: "
+            f"key={wanted_key!r} matches={len(matches)}"
+        )
+    position = matches[0]
+    selected_id, raw_action = ids[position], raw_actions[position]
+    if not is_chance_action(raw_action):
+        rust_game.execute_action_index(int(selected_id), list(seated_colors), map_kind)
+        return rust_game
+
+    action_type = str(raw_action[1])
+    if action_type == "ROLL":
+        outcome_index = _recorded_roll_outcome_index(
+            rust_game, raw_action, action_record.result
+        )
+    elif action_type == "MOVE_ROBBER":
+        outcome_index = _recorded_robber_outcome_index(
+            rust_game, raw_action, action_record.result
+        )
+    elif action_type == "BUY_DEVELOPMENT_CARD":
+        outcome_index = _recorded_development_card_outcome_index(
+            rust_game, raw_action, action_record.result
+        )
+    else:  # pragma: no cover - guarded by engine_equivalence.is_chance_action.
+        raise SearchEngineBoundaryError(
+            f"unsupported chance action at native/Rust boundary: {raw_action!r}"
+        )
+    return rust_game.apply_chance_outcome(json.dumps(raw_action), outcome_index)
+
+
+class CatanZeroSearchPlayer(CatanatronPlayer):
+    """Gumbel-search player inside catanatron's native Game.play referee.
+
+    `rust_game` must be the seating-aligned TOURNAMENT shadow created alongside
+    the native game by `engine_equivalence.build_paired_games`.  Search never
+    changes the native referee state; only the selected action crosses back.
+    """
+
+    def __init__(
+        self,
+        color: Any,
+        *,
+        rust_game: Any,
+        search: Any,
+        seated_colors: tuple[str, ...],
+        map_kind: str = "TOURNAMENT",
+    ) -> None:
+        super().__init__(color, is_bot=True)
+        if str(map_kind) != "TOURNAMENT":
+            raise ValueError(
+                "CatanZeroSearchPlayer requires map_kind='TOURNAMENT': BASE map "
+                "shuffle parity is not established between native Python and Rust"
+            )
+        self._rust_game = rust_game
+        self._search = search
+        self.seated_colors = tuple(str(color_name) for color_name in seated_colors)
+        self.map_kind = str(map_kind)
+        self._synced_action_records = 0
+        self.stats: dict[str, int] = {
+            "decisions": 0,
+            "forced_decisions": 0,
+            "search_decisions": 0,
+            "simulations_used": 0,
+            "shadow_records_synced": 0,
+            "engine_divergences": 0,
+            "illegal_policy_picks": 0,
+        }
+
+    def reset_state(self) -> None:
+        # A search player owns a game-specific shadow and must not be reused.
+        raise RuntimeError(
+            "CatanZeroSearchPlayer is game-scoped; construct a new player"
+        )
+
+    @property
+    def rust_game(self) -> Any:
+        return self._rust_game
+
+    def _fail_boundary(self, detail: str) -> None:
+        self.stats["engine_divergences"] += 1
+        raise SearchEngineBoundaryError(detail)
+
+    def sync_from_native(self, game: Any, *, check_legal_actions: bool = True) -> None:
+        records = game.state.action_records
+        if len(records) < self._synced_action_records:
+            self._fail_boundary(
+                "native action history shrank; search player was reused across games"
+            )
+        divergences_before = self.stats["engine_divergences"]
+        try:
+            for action_record in records[self._synced_action_records :]:
+                self._rust_game = apply_native_action_record_to_rust(
+                    self._rust_game,
+                    action_record,
+                    seated_colors=self.seated_colors,
+                    map_kind=self.map_kind,
+                )
+                self._synced_action_records += 1
+                self.stats["shadow_records_synced"] += 1
+
+            symbols = vendor_symbols()
+            mismatches = diff_state_views(
+                rust_state_view(self._rust_game), python_state_view(game, symbols)
+            )
+            if mismatches:
+                self._fail_boundary(
+                    "state divergence after replaying native records "
+                    f"through index {self._synced_action_records}: "
+                    + "; ".join(mismatches[:5])
+                )
+
+            if check_legal_actions and game.winning_color() is None:
+                _ids, raw_actions = rust_legal_actions(
+                    self._rust_game, self.seated_colors, self.map_kind
+                )
+                only_rust, only_native = legal_action_diff(
+                    raw_actions, game.playable_actions
+                )
+                if only_rust or only_native:
+                    self._fail_boundary(
+                        "legal-action divergence at native decision boundary: "
+                        f"only_rust={sorted(only_rust)[:5]!r} "
+                        f"only_native={sorted(only_native)[:5]!r}"
+                    )
+        except SearchEngineBoundaryError:
+            if self.stats["engine_divergences"] == divergences_before:
+                self.stats["engine_divergences"] += 1
+            raise
+        except Exception as error:  # noqa: BLE001 - convert any bridge failure to fail-closed.
+            self._fail_boundary(
+                f"exception while syncing native referee into Rust shadow: {error!r}"
+            )
+
+    def audit_current_game(self, game: Any) -> None:
+        """Replay any final actions and verify terminal state parity."""
+        self.sync_from_native(game, check_legal_actions=False)
+
+    def decide(self, game: Any, playable_actions: Any) -> Any:
+        playable_actions = list(playable_actions)
+        self.sync_from_native(game)
+        self.stats["decisions"] += 1
+        if len(playable_actions) == 1:
+            self.stats["forced_decisions"] += 1
+            return playable_actions[0]
+
+        result = self._search.search(self._rust_game, force_full=True)
+        self.stats["search_decisions"] += 1
+        self.stats["simulations_used"] += int(result.simulations_used)
+        ids, raw_actions = rust_legal_actions(
+            self._rust_game, self.seated_colors, self.map_kind
+        )
+        try:
+            position = ids.index(int(result.selected_action))
+        except ValueError as error:
+            self.stats["illegal_policy_picks"] += 1
+            raise SearchEngineBoundaryError(
+                f"Gumbel search selected illegal Rust action {result.selected_action!r}"
+            ) from error
+        native_action = raw_action_to_python_action(
+            raw_actions[position], vendor_symbols()
+        )
+        native_keys = {
+            canonical_python_action_key(action) for action in playable_actions
+        }
+        if canonical_python_action_key(native_action) not in native_keys:
+            self.stats["illegal_policy_picks"] += 1
+            raise SearchEngineBoundaryError(
+                "Gumbel search action has no native playable equivalent: "
+                f"{native_action!r}"
+            )
+        return native_action
+
+
 __all__ = [
     "CatanZeroNetPlayer",
+    "CatanZeroSearchPlayer",
+    "SearchEngineBoundaryError",
     "SEARCH_MODE_TODO",
+    "apply_native_action_record_to_rust",
     "bind_external_game",
     "default_bridge_config",
     "make_bridge_env",

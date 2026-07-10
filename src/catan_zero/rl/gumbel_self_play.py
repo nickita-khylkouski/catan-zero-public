@@ -49,6 +49,15 @@ from typing import Any, Callable
 import numpy as np
 
 from catan_zero.rl.action_mask import ActionCatalog
+from catan_zero.rl.aux_subgoal_targets import (
+    AUX_TARGET_KEYS,
+    AUX_VP_HORIZON,
+    rust_aux_state_from_snapshot,
+    rust_hex_id_by_coordinate,
+    rust_robber_hex_of_action,
+    rust_settlement_node_of_action,
+    trajectory_targets,
+)
 from catan_zero.rl.flywheel import ChampionRef, OpponentPolicy, choose_opponent
 from catan_zero.rl.flywheel.opponent_mix import OpponentMixConfig, choose_mix_opponent
 from catan_zero.search.gumbel_chance_mcts import (
@@ -152,10 +161,9 @@ ENTITY_KEYS = (
     "event_mask",
 )
 
-# Extra columns beyond the shared schema above. Unknown to
-# `tools/train_bc.py`'s loader today (it only reads a fixed known-key list),
-# so these are written for forward-compatibility (a future afterstate head,
-# search-budget-aware analysis) without risk of breaking the current loader.
+# Extra columns beyond the shared schema above. The CAT-100 aux fields are
+# consumed by train_bc; the remaining analysis/provenance fields stay optional
+# and forward-compatible.
 EXTRA_KEYS = (
     "afterstate_target",
     "afterstate_target_mask",
@@ -163,6 +171,10 @@ EXTRA_KEYS = (
     "simulations_used",
     "is_forced",
     "prior_policy",
+    # CAT-100: realized-trajectory auxiliary targets. These are present on
+    # every production row; unavailable targets use NaN (binary/scalar) or -1
+    # (categorical), matching train_bc's per-head masks.
+    *AUX_TARGET_KEYS,
     # Opponent-pool provenance (H2). Only present on rows from a run where
     # --opponent-pool-manifest was set (see `play_one_game`'s `pool_assignment`);
     # absent entirely otherwise, so default (pool-disabled) shard schema is
@@ -442,6 +454,7 @@ def _apply_selected_action(
     colors: tuple[str, ...],
     rng: random.Random,
     correct_rust_chance_spectra: bool = True,
+    action_json: Any | None = None,
 ) -> Any:
     """Advance the live game by the selected action, sampling chance ourselves.
 
@@ -456,10 +469,11 @@ def _apply_selected_action(
     otherwise the recorded game trajectory would still be wrong even though
     the search itself now reasons about these chance nodes correctly.
     """
-    ids = [int(action) for action in game.playable_action_indices(list(colors), None)]
-    actions = json.loads(game.playable_actions_json())
-    action_by_id = {action_id: action for action_id, action in zip(ids, actions)}
-    action_json = action_by_id.get(int(action_index))
+    if action_json is None:
+        ids = [int(action) for action in game.playable_action_indices(list(colors), None)]
+        actions = json.loads(game.playable_actions_json())
+        action_by_id = {action_id: action for action_id, action in zip(ids, actions)}
+        action_json = action_by_id.get(int(action_index))
     if action_json is None:
         raise RuntimeError(f"selected action {action_index} is not legal")
 
@@ -570,6 +584,8 @@ def _build_decision_row(
     opponent_version: int | None = None,
     opponent_tag: str = "",
     opponent_checkpoint_md5: str = "",
+    snapshot: dict[str, Any] | None = None,
+    action_by_id: dict[int, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, np.ndarray]]:
     # legal_rust is exactly the key set of any of these dicts by
     # SearchResult's contract (covers ALL legal root actions).
@@ -588,10 +604,12 @@ def _build_decision_row(
     # re-fetch json_snapshot/playable_action_indices/playable_actions_json on
     # the same, unchanged game state -- see `_resolve_entity_adapter`'s
     # docstring in neural_rust_mcts.py).
-    snapshot = json.loads(game.json_snapshot())
-    action_ids = [int(action) for action in game.playable_action_indices(list(colors), None)]
-    raw_actions = json.loads(game.playable_actions_json())
-    action_by_id = {action_id: raw for action_id, raw in zip(action_ids, raw_actions)}
+    if snapshot is None:
+        snapshot = json.loads(game.json_snapshot())
+    if action_by_id is None:
+        action_ids = [int(action) for action in game.playable_action_indices(list(colors), None)]
+        raw_actions = json.loads(game.playable_actions_json())
+        action_by_id = {action_id: raw for action_id, raw in zip(action_ids, raw_actions)}
     entity = rust_game_to_entity_batch(
         game,
         legal_rust,
@@ -707,6 +725,15 @@ def _build_decision_row(
         "afterstate_target": afterstate_target,
         "afterstate_target_mask": afterstate_target_mask,
         "prior_policy": prior_policy,
+        # CAT-100 placeholders make the row schema uniform even for a source
+        # whose full future trajectory is unavailable (e.g. an engine-
+        # divergence-dropped exploiter game). play_one_game overwrites these
+        # from the realized trajectory after the game ends.
+        "aux_longest_road": np.float32(np.nan),
+        "aux_largest_army": np.float32(np.nan),
+        "aux_vp_in_n": np.float32(np.nan),
+        "aux_next_settlement": np.int16(-1),
+        "aux_robber_target": np.int16(-1),
     }
     # Opponent-pool provenance (H2): only stamped when the caller is running
     # with a pool assignment at all (`is_pool_game`/`opponent_version` passed
@@ -779,6 +806,11 @@ def play_one_game(
     chance_rng = random.Random(int(game_seed) ^ 0xA17E)
 
     decisions: list[DecisionRecord] = []
+    aux_states = []
+    aux_actor_colors: list[str] = []
+    aux_actions: list[Any] = []
+    recorded_aux_indices: list[int] = []
+    aux_hex_ids: dict[tuple[int, int, int], int] | None = None
     decision_index = 0
     forced_decisions = 0
     simulations_used_total = 0
@@ -794,6 +826,21 @@ def play_one_game(
         )
         if not legal_rust:
             break
+
+        # Capture one authoritative pre-action snapshot/action map per ply.
+        # _build_decision_row and _apply_selected_action consume the same
+        # objects below, avoiding the duplicate Rust JSON/FFI calls that aux
+        # labeling would otherwise add to the generation hot path.
+        snapshot = json.loads(game.json_snapshot())
+        action_ids = [
+            int(action)
+            for action in game.playable_action_indices(list(config.colors), None)
+        ]
+        raw_actions = json.loads(game.playable_actions_json())
+        action_by_id = dict(zip(action_ids, raw_actions))
+        aux_states.append(rust_aux_state_from_snapshot(snapshot))
+        if aux_hex_ids is None:
+            aux_hex_ids = rust_hex_id_by_coordinate(snapshot)
 
         temperature = _temperature_for_decision(
             decision_index, config=config, eval_override=eval_override
@@ -819,6 +866,11 @@ def play_one_game(
 
         result = mcts.search(game, force_full=True if eval_override else None)
         simulations_used_total += int(result.simulations_used)
+        selected_action = action_by_id.get(int(result.selected_action))
+        if selected_action is None:
+            raise RuntimeError(f"selected action {result.selected_action} is not legal")
+        aux_actor_colors.append(acting_color)
+        aux_actions.append(selected_action)
 
         if record_row:
             if len(legal_rust) <= 1:
@@ -839,8 +891,11 @@ def play_one_game(
                 opponent_checkpoint_md5=(
                     pool_assignment.opponent_md5 if pool_assignment is not None else ""
                 ),
+                snapshot=snapshot,
+                action_by_id=action_by_id,
             )
             decisions.append(DecisionRecord(row=row, features=features))
+            recorded_aux_indices.append(len(aux_states) - 1)
 
         game = _apply_selected_action(
             game,
@@ -848,6 +903,7 @@ def play_one_game(
             colors=config.colors,
             rng=chance_rng,
             correct_rust_chance_spectra=config.correct_rust_chance_spectra,
+            action_json=selected_action,
         )
         decision_index += 1
 
@@ -855,8 +911,34 @@ def play_one_game(
         terminal = game.winning_color() is not None
     truncated = not terminal
     outcome = _game_outcome_fields(game, terminal=terminal, colors=config.colors)
-    for record in decisions:
+    final_aux_state = rust_aux_state_from_snapshot(json.loads(game.json_snapshot()))
+    aux_targets = trajectory_targets(
+        states=aux_states,
+        actor_colors=aux_actor_colors,
+        actions=aux_actions,
+        horizon=AUX_VP_HORIZON,
+        victory_points_of=lambda state, color: state.victory_points(color),
+        holds_longest_road_at=lambda state, color: state.holds_longest_road(color),
+        holds_largest_army_at=lambda state, color: state.holds_largest_army(color),
+        settlement_node_of_action=rust_settlement_node_of_action,
+        robber_hex_of_action=lambda action: rust_robber_hex_of_action(
+            action, aux_hex_ids or {}
+        ),
+        final_state=final_aux_state,
+        trajectory_complete=terminal,
+    )
+    for record, aux_index in zip(decisions, recorded_aux_indices):
         record.row.update(outcome)
+        targets = aux_targets[aux_index]
+        record.row.update(
+            {
+                "aux_longest_road": np.float32(targets["aux_longest_road"]),
+                "aux_largest_army": np.float32(targets["aux_largest_army"]),
+                "aux_vp_in_n": np.float32(targets["aux_vp_in_n"]),
+                "aux_next_settlement": np.int16(targets["aux_next_settlement"]),
+                "aux_robber_target": np.int16(targets["aux_robber_target"]),
+            }
+        )
 
     return GameRecord(
         game_seed=int(game_seed),

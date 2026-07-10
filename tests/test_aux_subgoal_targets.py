@@ -8,13 +8,21 @@ against a real catanatron state where available.
 
 from __future__ import annotations
 
+import math
+
 import pytest
 
 from catan_zero.rl.aux_subgoal_targets import (
     AUX_IGNORE_INDEX,
+    AUX_VP_HORIZON,
     robber_hex_id,
+    rust_aux_state_from_snapshot,
+    rust_hex_id_by_coordinate,
+    rust_robber_hex_of_action,
+    rust_settlement_node_of_action,
     trajectory_targets,
 )
+from catan_zero.rl.entity_token_policy import EntityGraphConfig
 
 
 class _FakeBoard:
@@ -34,6 +42,11 @@ def test_robber_hex_id_uses_map_and_sentinel_without_map():
     assert robber_hex_id(state, {(1, 1, 1): 3}) == AUX_IGNORE_INDEX
     # No map at all -> ignore sentinel.
     assert robber_hex_id(state, None) == AUX_IGNORE_INDEX
+
+
+def test_production_aux_horizon_matches_checkpoint_metadata_default():
+    config = EntityGraphConfig(action_size=1, static_action_feature_size=1)
+    assert AUX_VP_HORIZON == config.aux_vp_horizon == 8
 
 
 def _trajectory_case():
@@ -107,6 +120,86 @@ def test_trajectory_targets_length_validation():
             settlement_node_of_action=lambda a: None,
             robber_hex_of_action=lambda a: None,
         )
+
+
+def test_truncated_trajectory_masks_unobserved_horizon_targets():
+    case = _trajectory_case()
+    case["final_state"] = 4
+    case["trajectory_complete"] = False
+    rows = trajectory_targets(**case)
+
+    # Four pre-action states plus the observed post-action final state provide
+    # a full two-ply horizon through row 2. Row 3 would need one more unseen
+    # transition, so its binary/scalar targets must fail closed rather than
+    # pretending the truncated state is a terminal outcome.
+    assert rows[2]["aux_vp_in_n"] == 2.0
+    assert math.isnan(rows[3]["aux_vp_in_n"])
+    assert math.isnan(rows[3]["aux_longest_road"])
+    assert math.isnan(rows[3]["aux_largest_army"])
+
+
+def test_completed_trajectory_clamps_horizon_to_terminal_state():
+    case = _trajectory_case()
+    case["final_state"] = 4
+    case["trajectory_complete"] = True
+    rows = trajectory_targets(**case)
+
+    # At a real terminal boundary a shorter remaining horizon is a complete
+    # realized outcome, not missing data.
+    assert rows[3]["aux_vp_in_n"] == 0.0
+    assert math.isfinite(rows[3]["aux_longest_road"])
+    assert math.isfinite(rows[3]["aux_largest_army"])
+
+
+def test_rust_snapshot_and_action_adapters_use_native_ids():
+    snapshot = {
+        "colors": ["RED", "BLUE"],
+        "player_state": [
+            {
+                "actual_victory_points": 4,
+                "has_road": True,
+                "has_army": False,
+            },
+            {
+                "actual_victory_points": 3,
+                "has_road": False,
+                "has_army": True,
+            },
+        ],
+        "tiles": [
+            {
+                "coordinate": [-2, 0, 2],
+                "tile": {"id": 11, "type": "RESOURCE_TILE"},
+            },
+            # Port ids overlap land ids and must never enter the 19-class hex
+            # target map.
+            {
+                "coordinate": [-3, 0, 3],
+                "tile": {"id": 3, "type": "PORT"},
+            },
+            {
+                "coordinate": [1, 0, -1],
+                "tile": {"id": 6, "type": "DESERT"},
+            },
+        ],
+    }
+    state = rust_aux_state_from_snapshot(snapshot)
+    assert state.victory_points("RED") == 4
+    assert state.holds_longest_road("RED") is True
+    assert state.holds_largest_army("BLUE") is True
+
+    hex_ids = rust_hex_id_by_coordinate(snapshot)
+    assert hex_ids == {(-2, 0, 2): 11, (1, 0, -1): 6}
+    assert rust_settlement_node_of_action(["RED", "BUILD_SETTLEMENT", 37]) == 37
+    assert rust_settlement_node_of_action(["RED", "BUILD_ROAD", [1, 2]]) is None
+    assert (
+        rust_robber_hex_of_action(
+            ["RED", "MOVE_ROBBER", [[-2, 0, 2], "BLUE"]],
+            hex_ids,
+        )
+        == 11
+    )
+    assert rust_robber_hex_of_action(["RED", "ROLL", None], hex_ids) is None
 
 
 def test_real_catanatron_current_state_smoke():

@@ -46,7 +46,7 @@ This is still an internal prototype checkpoint, not evidence of Colonist #1 stre
   - `gpu-v100`: `ubuntu@gpu-v100`, 8x Tesla V100-SXM2-16GB, 88 CPU cores.
   - `gpu-h100`: `ubuntu@gpu-h100`, 1x NVIDIA H100 80GB HBM3, 26 CPU cores.
 - Created a neutral SSH key for these hosts at
-  `/Users/nickita/.ssh/gpu_access_ed25519`; only the `.pub` key was added to
+  `$HOME/.ssh/gpu_access_ed25519`; only the `.pub` key was added to
   the hosts. Do not print or copy the private key.
 - Synced the lean CatanZero repo plus
   `runs/self_play/champions/current_best_s9752_iter0002.pt` to
@@ -1506,7 +1506,7 @@ PSRO population scheduling (`https://arxiv.org/abs/2605.28273`).
   `catanatron_value`, `jsettlers_lite`, heuristic, then
   `value_rollout_search`.
 - Next free-slot plan is PFSP, but only after a fresh `s9` one-worker preflight
-  and remote code sync. At least W4A's active `/home/nickita/catan-zero`
+  and remote code sync. At least W4A's active `<remote-home>/catan-zero`
   trainer copy lacked `pfsp_mixed` during the preflight.
 
 ## 2026-06-27 03:16 PDT Status

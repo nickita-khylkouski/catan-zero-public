@@ -189,7 +189,7 @@ def main() -> None:
         default="",
         help=(
             "Repo root on --source-worker. Defaults to --remote-repo, then "
-            "/home/nickita/catan-zero."
+            "~/catan-zero."
         ),
     )
     remote_grade_from_worker_parser.add_argument(
@@ -197,7 +197,7 @@ def main() -> None:
         default="",
         help=(
             "Repo root on the target --worker. Defaults to --remote-repo, then "
-            "/home/nickita/catan-zero."
+            "~/catan-zero."
         ),
     )
     remote_grade_from_worker_parser.add_argument("--checkpoint", required=True)
@@ -4904,7 +4904,7 @@ def run_remote_grade_from_worker(
 def _remote_scp_repo(remote_repo: str) -> str:
     if remote_repo:
         return remote_repo.rstrip("/")
-    return "/home/nickita/catan-zero"
+    return "~/catan-zero"
 
 
 def run_command_with_retries(command: list[str], *, attempts: int = 3) -> None:

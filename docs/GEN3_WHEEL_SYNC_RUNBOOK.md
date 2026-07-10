@@ -1,5 +1,8 @@
 # Gen-3 Wheel-Sync Runbook
 
+> Historical record only. The `mps_rollout.sh` path described below was removed;
+> all current launches go through `tools/fleet/fleet_launch.sh`.
+
 Status: DRAFT for review. Authored by the rust-featurize agent, coordinating
 with the speed-czar agent, at team-lead's request (task #81 "de-risk the
 landing"). This document exists because the sync is the most complex
@@ -118,7 +121,7 @@ specifically so it never conflates the two different kinds of gate.
 
 ```bash
 # 1. Confirm the scratch clone is the coherent, up-to-date working copy.
-cd /Users/nickita/catan-zero-gpu/scratch/catanatron-rs
+cd $HOME/catan-zero-gpu/scratch/catanatron-rs
 git status   # expect: modified Cargo.lock, src/lib.rs (uncommitted, both agents' work)
 git log --oneline -3   # expect HEAD = 8b78fa4 (the B200 canonical commit this was cloned from)
 
@@ -168,7 +171,7 @@ are pre-staged in this repo now, executable at sync time.
 **(a) Full test suite, including the fail-closed regime suite:**
 
 ```bash
-cd /Users/nickita/catan-zero-gpu
+cd $HOME/catan-zero-gpu
 PYTHONPATH=src python -m pytest tests/ -x -q
 # Expected as of this writing (verified locally, full entity+context wiring
 # including the evaluate_symmetry_averaged path, PYTHONPATH=.):

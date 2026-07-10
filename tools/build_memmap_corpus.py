@@ -31,19 +31,26 @@ converter asserts this per shard and aborts if a shard ever violates it.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import re
 import sys
 import time
+from collections import Counter
 from collections.abc import Sequence
 from pathlib import Path
+from typing import Any
 
 import numpy as np
+
+from catan_zero.rl.aux_subgoal_targets import AUX_TARGET_KEYS
 
 _TOOLS_DIR = Path(__file__).resolve().parent
 if str(_TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(_TOOLS_DIR))
 
 from train_bc import (  # noqa: E402  (sibling module bootstrap above)
+    _load_validation_game_seed_manifest_for_training,
     _load_npz,
     _normalize_teacher_shard,
     _teacher_shard_files,
@@ -58,6 +65,583 @@ MEMMAP_CORPUS_IMPLICIT_SCHEMA = "memmap_corpus_v2"
 # columns without a data file.  Keep this list deliberately narrow: other
 # constant-looking columns may have different fill semantics.
 IMPLICIT_ZERO_EVENT_COLUMNS = frozenset({"event_tokens", "event_mask"})
+MEMMAP_PAYLOAD_INVENTORY_SCHEMA = "memmap-payload-inventory-v1"
+A1_SELECTED_GAMES_SCHEMA = "a1-selected-training-games-v1"
+A1_SELECTION_RULE = "lowest_seed_complete_per_job"
+A1_SELECTED_GAME_COUNT = 12_000
+A1_CATEGORY_GAME_COUNTS = {
+    "current_producer": 9_600,
+    "recent_history": 1_800,
+    "hard_negative": 600,
+}
+_SHA256_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
+_A1_SELECTED_RECORD_FIELDS = {
+    "game_seed",
+    "job_id",
+    "worker_id",
+    "category",
+    "producer_checkpoint_sha256",
+    "opponent_checkpoint_sha256",
+    "split",
+}
+
+
+def _canonical_json_bytes(value: Any) -> bytes:
+    return json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("utf-8")
+
+
+def _value_sha256(value: Any) -> str:
+    return "sha256:" + hashlib.sha256(_canonical_json_bytes(value)).hexdigest()
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return "sha256:" + digest.hexdigest()
+
+
+def _load_direct_a1_source_attestations(
+    sources: Sequence[Path | str],
+) -> list[dict[str, Any]]:
+    """Discover the nearest A1 attestation at or above each source root.
+
+    A rendered A1 job writes its
+    immutable attestation to ``<output_dir>/a1_contract.json``. Shards and worker
+    manifests may live in descendants such as ``worker_000/``; checking the
+    nearest ancestor prevents callers from routing those same bytes through the
+    generic conversion path by selecting a nested directory.
+    """
+
+    attestations: list[dict[str, Any]] = []
+    seen_paths: set[Path] = set()
+    for source in sources:
+        source_root = Path(source).expanduser().resolve()
+        attestation_path = next(
+            (
+                candidate / "a1_contract.json"
+                for candidate in (source_root, *source_root.parents)
+                if (candidate / "a1_contract.json").is_file()
+            ),
+            None,
+        )
+        if attestation_path is None:
+            continue
+        try:
+            canonical_path = attestation_path.resolve(strict=True)
+        except OSError as error:
+            raise SystemExit(
+                f"cannot resolve A1 source attestation {attestation_path}: {error}"
+            ) from error
+        if canonical_path in seen_paths:
+            continue
+        seen_paths.add(canonical_path)
+        try:
+            payload = json.loads(canonical_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as error:
+            raise SystemExit(
+                f"cannot load A1 source attestation {canonical_path}: {error}"
+            ) from error
+        if not isinstance(payload, dict):
+            raise SystemExit(
+                f"A1 source attestation {canonical_path} must be a JSON object"
+            )
+        if payload.get("schema_version") != "a1-generation-job-attestation-v2":
+            raise SystemExit(
+                f"A1 source attestation {canonical_path} has unsupported schema"
+            )
+        contract_sha = payload.get("contract_sha256")
+        if not isinstance(contract_sha, str) or not _SHA256_RE.fullmatch(contract_sha):
+            raise SystemExit(
+                f"A1 source attestation {canonical_path} has invalid contract_sha256"
+            )
+        attestations.append(
+            {
+                "path": canonical_path,
+                "file_sha256": _file_sha256(canonical_path),
+                "contract_sha256": contract_sha,
+            }
+        )
+    return attestations
+
+
+def _memmap_payload_inventory(
+    out_dir: Path, schemas: dict[str, dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Hash the exact flat-file payload implied by the corpus column schemas."""
+
+    expected_names = {"row_offsets.dat"}
+    expected_names.update(
+        f"{name}.codes.dat" if schema["kind"] == "string" else f"{name}.dat"
+        for name, schema in schemas.items()
+        if schema["kind"] != "implicit_constant"
+    )
+    actual_names = {
+        path.name
+        for path in out_dir.iterdir()
+        if path.is_file()
+        and (path.name.endswith(".dat") or path.name.endswith(".codes.dat"))
+    }
+    if actual_names != expected_names:
+        raise SystemExit(
+            "memmap payload filenames differ from the column schema: "
+            f"missing={sorted(expected_names - actual_names)} "
+            f"unexpected={sorted(actual_names - expected_names)}"
+        )
+    inventory: list[dict[str, Any]] = []
+    for filename in sorted(expected_names):
+        path = out_dir / filename
+        inventory.append(
+            {
+                "filename": filename,
+                "size_bytes": path.stat().st_size,
+                "sha256": _file_sha256(path),
+            }
+        )
+    return inventory
+
+
+def _game_seed_set_sha256(seeds: Sequence[int]) -> str:
+    canonical = np.asarray(sorted(int(seed) for seed in seeds), dtype="<i8")
+    return "sha256:" + hashlib.sha256(canonical.tobytes()).hexdigest()
+
+
+def _load_a1_selected_game_manifest(path: Path) -> dict[str, Any]:
+    """Load and fail-closed validate the immutable A1 game-level selection.
+
+    The post-wave audit selects complete games *before* row expansion.  This
+    validator deliberately binds both the canonical record list and the raw
+    sidecar bytes so the converter cannot silently train on reserve or
+    truncated attempts that happen to share the same shard directory.
+    """
+    try:
+        manifest_path = path.expanduser().resolve(strict=True)
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise SystemExit(
+            f"cannot load selected-game seed manifest {path}: {error}"
+        ) from error
+    if not isinstance(payload, dict):
+        raise SystemExit("selected-game seed manifest must be a JSON object")
+
+    expected_fields = {
+        "schema_version",
+        "a1_contract_sha256",
+        "selection_rule",
+        "selected_game_count",
+        "selected_game_seed_set_sha256",
+        "category_game_counts",
+        "training_game_count",
+        "training_game_seed_set_sha256",
+        "validation_game_count",
+        "validation_game_seed_set_sha256",
+        "records_sha256",
+        "records",
+    }
+    if set(payload) != expected_fields:
+        raise SystemExit(
+            "selected-game seed manifest fields differ from the exact "
+            f"{A1_SELECTED_GAMES_SCHEMA} schema; "
+            f"missing={sorted(expected_fields - set(payload))} "
+            f"extra={sorted(set(payload) - expected_fields)}"
+        )
+    if payload["schema_version"] != A1_SELECTED_GAMES_SCHEMA:
+        raise SystemExit(
+            f"selected-game seed manifest schema must be {A1_SELECTED_GAMES_SCHEMA!r}"
+        )
+    if payload["selection_rule"] != A1_SELECTION_RULE:
+        raise SystemExit(
+            f"selected-game seed manifest selection_rule must be {A1_SELECTION_RULE!r}"
+        )
+    contract_sha = payload["a1_contract_sha256"]
+    if not isinstance(contract_sha, str) or not _SHA256_RE.fullmatch(contract_sha):
+        raise SystemExit("selected-game seed manifest has invalid a1_contract_sha256")
+    if (
+        isinstance(payload["selected_game_count"], bool)
+        or not isinstance(payload["selected_game_count"], int)
+        or payload["selected_game_count"] != A1_SELECTED_GAME_COUNT
+    ):
+        raise SystemExit(
+            f"selected-game seed manifest must declare exactly {A1_SELECTED_GAME_COUNT} games"
+        )
+    declared_category_counts = payload["category_game_counts"]
+    if (
+        not isinstance(declared_category_counts, dict)
+        or declared_category_counts != A1_CATEGORY_GAME_COUNTS
+        or any(
+            isinstance(value, bool) or not isinstance(value, int)
+            for value in declared_category_counts.values()
+        )
+    ):
+        raise SystemExit(
+            "selected-game seed manifest category_game_counts must be exactly "
+            f"{A1_CATEGORY_GAME_COUNTS}"
+        )
+
+    records = payload["records"]
+    if not isinstance(records, list) or len(records) != A1_SELECTED_GAME_COUNT:
+        raise SystemExit(
+            f"selected-game seed manifest records must contain exactly "
+            f"{A1_SELECTED_GAME_COUNT} entries"
+        )
+    normalized_records: list[dict[str, Any]] = []
+    prior_key: tuple[int, str] | None = None
+    seen_seeds: set[int] = set()
+    for index, record in enumerate(records):
+        if not isinstance(record, dict) or set(record) != _A1_SELECTED_RECORD_FIELDS:
+            raise SystemExit(
+                f"selected-game record {index} fields differ from the exact schema"
+            )
+        seed = record["game_seed"]
+        if isinstance(seed, bool) or not isinstance(seed, int):
+            raise SystemExit(f"selected-game record {index} game_seed must be an integer")
+        if seed < np.iinfo(np.int64).min or seed > np.iinfo(np.int64).max:
+            raise SystemExit(f"selected-game record {index} game_seed is outside int64")
+        job_id = record["job_id"]
+        if not isinstance(job_id, str) or not job_id:
+            raise SystemExit(f"selected-game record {index} has invalid job_id")
+        key = (seed, job_id)
+        if prior_key is not None and key <= prior_key:
+            raise SystemExit(
+                "selected-game records must be strictly sorted by "
+                f"(game_seed, job_id) (drift at index {index})"
+            )
+        prior_key = key
+        if seed in seen_seeds:
+            raise SystemExit(f"selected-game record {index} duplicates game_seed {seed}")
+        seen_seeds.add(seed)
+        if not isinstance(record["worker_id"], str) or not record["worker_id"]:
+            raise SystemExit(f"selected-game record {index} has invalid worker_id")
+        if record["category"] not in A1_CATEGORY_GAME_COUNTS:
+            raise SystemExit(f"selected-game record {index} has invalid category")
+        producer_sha = record["producer_checkpoint_sha256"]
+        if not isinstance(producer_sha, str) or not _SHA256_RE.fullmatch(producer_sha):
+            raise SystemExit(
+                f"selected-game record {index} has invalid producer_checkpoint_sha256"
+            )
+        opponent_shas = record["opponent_checkpoint_sha256"]
+        if (
+            not isinstance(opponent_shas, list)
+            or not opponent_shas
+            or any(
+                not isinstance(value, str) or not _SHA256_RE.fullmatch(value)
+                for value in opponent_shas
+            )
+            or opponent_shas != sorted(set(opponent_shas))
+        ):
+            raise SystemExit(
+                f"selected-game record {index} has invalid opponent_checkpoint_sha256"
+            )
+        if record["split"] not in {"train", "validation"}:
+            raise SystemExit(f"selected-game record {index} has invalid split")
+        normalized_records.append(dict(record))
+
+    actual_counts = dict(Counter(record["category"] for record in normalized_records))
+    if actual_counts != A1_CATEGORY_GAME_COUNTS:
+        raise SystemExit(
+            "selected-game record category counts do not match the declared A1 quotas: "
+            f"{actual_counts}"
+        )
+    all_seeds = [record["game_seed"] for record in normalized_records]
+    training_seeds = [
+        record["game_seed"]
+        for record in normalized_records
+        if record["split"] == "train"
+    ]
+    validation_seeds = [
+        record["game_seed"]
+        for record in normalized_records
+        if record["split"] == "validation"
+    ]
+    if not training_seeds or not validation_seeds:
+        raise SystemExit(
+            "selected-game seed manifest must contain non-empty train and validation splits"
+        )
+    if (
+        isinstance(payload["training_game_count"], bool)
+        or not isinstance(payload["training_game_count"], int)
+        or payload["training_game_count"] != len(training_seeds)
+        or isinstance(payload["validation_game_count"], bool)
+        or not isinstance(payload["validation_game_count"], int)
+        or payload["validation_game_count"] != len(validation_seeds)
+        or len(training_seeds) + len(validation_seeds) != A1_SELECTED_GAME_COUNT
+    ):
+        raise SystemExit("selected-game seed manifest split counts mismatch")
+
+    actual_selected_seed_sha = _game_seed_set_sha256(all_seeds)
+    if payload["selected_game_seed_set_sha256"] != actual_selected_seed_sha:
+        raise SystemExit(
+            "selected-game seed manifest selected_game_seed_set_sha256 mismatch: "
+            f"declared={payload['selected_game_seed_set_sha256']!r}, "
+            f"actual={actual_selected_seed_sha!r}"
+        )
+    actual_training_seed_sha = _game_seed_set_sha256(training_seeds)
+    if payload["training_game_seed_set_sha256"] != actual_training_seed_sha:
+        raise SystemExit(
+            "selected-game seed manifest training_game_seed_set_sha256 mismatch: "
+            f"declared={payload['training_game_seed_set_sha256']!r}, "
+            f"actual={actual_training_seed_sha!r}"
+        )
+    actual_validation_seed_sha = _game_seed_set_sha256(validation_seeds)
+    if payload["validation_game_seed_set_sha256"] != actual_validation_seed_sha:
+        raise SystemExit(
+            "selected-game seed manifest validation_game_seed_set_sha256 mismatch: "
+            f"declared={payload['validation_game_seed_set_sha256']!r}, "
+            f"actual={actual_validation_seed_sha!r}"
+        )
+    actual_records_sha = _value_sha256(normalized_records)
+    if payload["records_sha256"] != actual_records_sha:
+        raise SystemExit(
+            "selected-game seed manifest records_sha256 mismatch: "
+            f"declared={payload['records_sha256']!r}, actual={actual_records_sha!r}"
+        )
+    return {
+        "path": manifest_path,
+        "file_sha256": _file_sha256(manifest_path),
+        "manifest_sha256": _value_sha256(payload),
+        "a1_contract_sha256": contract_sha,
+        "selected_game_count": A1_SELECTED_GAME_COUNT,
+        "selected_game_seed_set_sha256": actual_selected_seed_sha,
+        "training_game_count": len(training_seeds),
+        "training_game_seed_set_sha256": actual_training_seed_sha,
+        "validation_game_count": len(validation_seeds),
+        "validation_game_seed_set_sha256": actual_validation_seed_sha,
+        "records_sha256": actual_records_sha,
+        "selected_game_seeds": np.asarray(all_seeds, dtype=np.int64),
+        "training_game_seeds": np.asarray(training_seeds, dtype=np.int64),
+        "validation_game_seeds": np.asarray(validation_seeds, dtype=np.int64),
+    }
+
+
+def _load_a1_post_wave_audit(
+    path: Path, selected_manifest: dict[str, Any]
+) -> dict[str, Any]:
+    """Validate the passing audit that authorizes the selected-game sidecar."""
+    try:
+        audit_path = path.expanduser().resolve(strict=True)
+        payload = json.loads(audit_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise SystemExit(f"cannot load A1 post-wave audit {path}: {error}") from error
+    if not isinstance(payload, dict):
+        raise SystemExit("A1 post-wave audit must be a JSON object")
+    if payload.get("schema_version") != "a1-post-wave-audit-v2":
+        raise SystemExit("A1 post-wave audit schema must be 'a1-post-wave-audit-v2'")
+    if payload.get("passed") is not True or payload.get("errors") != []:
+        raise SystemExit("A1 post-wave audit is not a clean passing report")
+    declared_audit_sha = payload.get("audit_sha256")
+    actual_audit_sha = _value_sha256(
+        {key: value for key, value in payload.items() if key != "audit_sha256"}
+    )
+    if declared_audit_sha != actual_audit_sha:
+        raise SystemExit(
+            "A1 post-wave audit audit_sha256 mismatch: "
+            f"declared={declared_audit_sha!r}, actual={actual_audit_sha!r}"
+        )
+    contract_sha = payload.get("contract_sha256")
+    if contract_sha != selected_manifest["a1_contract_sha256"]:
+        raise SystemExit(
+            "A1 audit/selected-game manifest contract hash mismatch: "
+            f"audit={contract_sha!r}, manifest={selected_manifest['a1_contract_sha256']!r}"
+        )
+
+    shards = payload.get("shards")
+    if not isinstance(shards, list):
+        raise SystemExit("A1 post-wave audit shards must be a list")
+    if payload.get("shard_inventory_sha256") != _value_sha256(shards):
+        raise SystemExit("A1 post-wave audit shard_inventory_sha256 mismatch")
+    data_shards: list[dict[str, Any]] = []
+    contract_attestations: list[dict[str, Any]] = []
+    seen_paths: set[Path] = set()
+    for index, record in enumerate(shards):
+        if not isinstance(record, dict):
+            raise SystemExit(f"A1 post-wave audit shard record {index} is not an object")
+        kind = record.get("kind")
+        if kind not in {"data_shard", "contract_attestation"}:
+            continue
+        try:
+            shard_path = Path(str(record["path"])).expanduser().resolve(strict=True)
+        except (KeyError, OSError) as error:
+            raise SystemExit(
+                f"A1 post-wave audit data shard {index} path is invalid: {error}"
+            ) from error
+        if shard_path in seen_paths:
+            raise SystemExit(
+                f"A1 post-wave audit repeats canonical data shard path {shard_path}"
+            )
+        seen_paths.add(shard_path)
+        declared_sha = record.get("sha256")
+        if not isinstance(declared_sha, str) or not _SHA256_RE.fullmatch(declared_sha):
+            raise SystemExit(
+                f"A1 post-wave audit {kind} {index} has invalid sha256"
+            )
+        if kind == "data_shard":
+            data_shards.append({**record, "path": str(shard_path)})
+            continue
+        actual_sha = _file_sha256(shard_path)
+        if actual_sha != declared_sha:
+            raise SystemExit(
+                f"A1 post-wave audit {kind} {index} byte digest mismatch: "
+                f"declared={declared_sha!r}, actual={actual_sha!r}"
+            )
+        try:
+            attestation = json.loads(shard_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as error:
+            raise SystemExit(
+                f"cannot load audited A1 contract attestation {shard_path}: {error}"
+            ) from error
+        if (
+            not isinstance(attestation, dict)
+            or attestation.get("schema_version")
+            != "a1-generation-job-attestation-v2"
+            or attestation.get("contract_sha256") != contract_sha
+        ):
+            raise SystemExit(
+                "audited A1 source attestation does not bind the audit contract: "
+                f"{shard_path}"
+            )
+        contract_attestations.append({**record, "path": str(shard_path)})
+    if not data_shards:
+        raise SystemExit("A1 post-wave audit contains no data_shard records")
+
+    selected = payload.get("selected_training_games")
+    if not isinstance(selected, dict):
+        raise SystemExit("A1 post-wave audit has no selected_training_games binding")
+    try:
+        bound_manifest_path = Path(str(selected["manifest"])).expanduser().resolve(
+            strict=True
+        )
+    except (KeyError, OSError) as error:
+        raise SystemExit(
+            f"A1 post-wave audit selected manifest path is invalid: {error}"
+        ) from error
+    expected_selected = {
+        "manifest": selected_manifest["path"],
+        "manifest_sha256": selected_manifest["manifest_sha256"],
+        "manifest_file_sha256": selected_manifest["file_sha256"],
+        "selected_game_count": selected_manifest["selected_game_count"],
+        "selected_game_seed_set_sha256": selected_manifest[
+            "selected_game_seed_set_sha256"
+        ],
+        "records_sha256": selected_manifest["records_sha256"],
+    }
+    actual_selected = {
+        "manifest": bound_manifest_path,
+        "manifest_sha256": selected.get("manifest_sha256"),
+        "manifest_file_sha256": selected.get("manifest_file_sha256"),
+        "selected_game_count": selected.get("selected_game_count"),
+        "selected_game_seed_set_sha256": selected.get(
+            "selected_game_seed_set_sha256"
+        ),
+        "records_sha256": selected.get("records_sha256"),
+    }
+    if actual_selected != expected_selected:
+        raise SystemExit("A1 post-wave audit selected-game manifest binding mismatch")
+
+    validation = payload.get("validation_holdout")
+    if not isinstance(validation, dict):
+        raise SystemExit("A1 post-wave audit has no validation_holdout binding")
+    try:
+        bound_validation_path = Path(str(validation["manifest"])).expanduser().resolve(
+            strict=True
+        )
+    except (KeyError, OSError) as error:
+        raise SystemExit(
+            f"A1 post-wave audit validation manifest path is invalid: {error}"
+        ) from error
+    validation_manifest = _load_validation_game_seed_manifest_for_training(
+        bound_validation_path,
+        validation_fraction=0.05,
+        validation_seed=17,
+        validation_max_samples=0,
+        validation_game_seed_ranges=[],
+    )
+    if (
+        validation_manifest["a1_contract_sha256"]
+        != selected_manifest["a1_contract_sha256"]
+    ):
+        raise SystemExit(
+            "A1 validation manifest and selected-game manifest contract hash mismatch"
+        )
+    if (
+        validation_manifest["validation_game_seed_set_sha256"]
+        != selected_manifest["validation_game_seed_set_sha256"]
+        or int(np.asarray(validation_manifest["game_seeds"]).size)
+        != int(selected_manifest["validation_game_count"])
+        or not np.array_equal(
+            np.asarray(validation_manifest["game_seeds"], dtype=np.int64),
+            np.asarray(selected_manifest["validation_game_seeds"], dtype=np.int64),
+        )
+    ):
+        raise SystemExit(
+            "A1 validation manifest does not match the validation split in the "
+            "selected-game manifest"
+        )
+    expected_validation = {
+        "manifest": validation_manifest["path"],
+        "manifest_sha256": validation_manifest["manifest_sha256"],
+        "manifest_file_sha256": validation_manifest["file_sha256"],
+        "validation_game_seed_count": int(
+            np.asarray(validation_manifest["game_seeds"]).size
+        ),
+        "validation_game_seed_set_sha256": validation_manifest[
+            "validation_game_seed_set_sha256"
+        ],
+    }
+    actual_validation = {
+        "manifest": bound_validation_path,
+        "manifest_sha256": validation.get("manifest_sha256"),
+        "manifest_file_sha256": validation.get("manifest_file_sha256"),
+        "validation_game_seed_count": validation.get("validation_game_seed_count"),
+        "validation_game_seed_set_sha256": validation.get(
+            "validation_game_seed_set_sha256"
+        ),
+    }
+    if actual_validation != expected_validation:
+        raise SystemExit("A1 post-wave audit validation manifest binding mismatch")
+    selected_row_count = payload.get("rows")
+    if (
+        isinstance(selected_row_count, bool)
+        or not isinstance(selected_row_count, int)
+        or selected_row_count <= 0
+    ):
+        raise SystemExit("A1 post-wave audit has invalid selected row count")
+    validation_row_count = int(validation_manifest["validation_row_count"])
+    if validation_row_count <= 0 or validation_row_count >= selected_row_count:
+        raise SystemExit(
+            "A1 post-wave audit validation row count is incompatible with total rows"
+        )
+
+    source_provenance = payload.get("source_provenance")
+    if not isinstance(source_provenance, dict) or not source_provenance:
+        raise SystemExit("A1 post-wave audit has invalid source_provenance")
+    return {
+        "path": audit_path,
+        "file_sha256": _file_sha256(audit_path),
+        "audit_sha256": actual_audit_sha,
+        "contract_sha256": contract_sha,
+        "shard_inventory_sha256": payload["shard_inventory_sha256"],
+        "source_provenance": source_provenance,
+        "selected_row_count": int(selected_row_count),
+        "training_row_count": int(selected_row_count) - validation_row_count,
+        "validation_holdout": {
+            "path": validation_manifest["path"],
+            "file_sha256": validation_manifest["file_sha256"],
+            "manifest_sha256": validation_manifest["manifest_sha256"],
+            "a1_contract_sha256": validation_manifest["a1_contract_sha256"],
+            "validation_game_seed_count": int(
+                np.asarray(validation_manifest["game_seeds"]).size
+            ),
+            "validation_row_count": validation_manifest["validation_row_count"],
+            "validation_game_seed_set_sha256": validation_manifest[
+                "validation_game_seed_set_sha256"
+            ],
+        },
+        "data_shards": data_shards,
+        "contract_attestations": contract_attestations,
+    }
 
 # The exact column set (and order) load_teacher_data keeps in its local ``keys``
 # tuple. Anything not present in a normalised shard is simply skipped, matching
@@ -89,6 +673,7 @@ LOADER_KEYS: tuple[str, ...] = (
     "has_final_actual_vps",
     "policy_weight_multiplier",
     "value_weight_multiplier",
+    *AUX_TARGET_KEYS,
     "hex_tokens",
     "hex_vertex_ids",
     "hex_edge_ids",
@@ -225,6 +810,44 @@ class _GameSeedRunTracker:
         return bool(self._duplicates)
 
 
+class _SelectedGameSeedRunTracker:
+    """Detect a selected seed starting more than one raw-source game run.
+
+    Unlike filtering followed by ``_GameSeedRunTracker``, this observes the
+    unfiltered stream so an unselected validation/reserve attempt remains a
+    boundary.  A legitimate game may still span adjacent shards when the raw
+    trailing and leading seed are equal.
+    """
+
+    def __init__(self, selected: set[int]) -> None:
+        self._selected = selected
+        self._seen: set[int] = set()
+        self._duplicates: set[int] = set()
+        self._current: int | None = None
+
+    def observe_shard(self, seed_column: np.ndarray) -> None:
+        seed_col = np.asarray(seed_column, dtype=np.int64).reshape(-1)
+        if not seed_col.size:
+            return
+        run_starts = np.concatenate(([0], np.flatnonzero(np.diff(seed_col) != 0) + 1))
+        for raw_value in seed_col[run_starts]:
+            value = int(raw_value)
+            if value not in self._selected:
+                self._current = None
+                continue
+            if value == self._current:
+                continue
+            if value in self._seen:
+                self._duplicates.add(value)
+            else:
+                self._seen.add(value)
+            self._current = value
+
+    @property
+    def duplicate_count(self) -> int:
+        return len(self._duplicates)
+
+
 def build_memmap_corpus(
     source: Path | str | Sequence[Path | str],
     out_dir: Path,
@@ -235,6 +858,8 @@ def build_memmap_corpus(
     abort_on_duplicate_seeds: bool = True,
     full_rows_only: bool = False,
     omit_zero_events: bool = False,
+    selected_game_seed_manifest: Path | str | None = None,
+    a1_post_wave_audit: Path | str | None = None,
 ) -> dict:
     """Stream one or more sources' npz shards into a flat memmap corpus.
 
@@ -243,20 +868,145 @@ def build_memmap_corpus(
     one corpus; every shard across all sources must share the same column schema
     (enforced per shard), and the global legal width, string categories and row
     offsets span the whole set. Returns the written ``corpus_meta.json`` payload.
+
+    When ``selected_game_seed_manifest`` is supplied, it must be the immutable
+    ``a1-selected-training-games-v1`` sidecar emitted by the A1 post-wave audit.
+    Every shard is filtered by the exact 12,000 selected complete-game seeds
+    before row sizing, statistics, duplicate tracking, or writes.  Both split
+    labels remain in the memmap: ``train_bc`` consumes the bound validation
+    manifest to exclude validation games before optimizer updates while still
+    evaluating every held-out row. Conversion fails unless every selected game
+    is present.
     """
     sources = [source] if isinstance(source, (str, Path)) else list(source)
+    source_attestations = _load_direct_a1_source_attestations(sources)
+    selected_manifest = (
+        None
+        if selected_game_seed_manifest is None
+        else _load_a1_selected_game_manifest(Path(selected_game_seed_manifest))
+    )
+    if source_attestations and (
+        selected_manifest is None or a1_post_wave_audit is None
+    ):
+        raise SystemExit(
+            "A1 source attestation detected: both --selected-game-seed-manifest "
+            "and --a1-post-wave-audit are mandatory; audited A1 shards cannot be "
+            "converted through the generic memmap path"
+        )
+    if (selected_manifest is None) != (a1_post_wave_audit is None):
+        raise SystemExit(
+            "--selected-game-seed-manifest and --a1-post-wave-audit must be "
+            "provided together; neither artifact authorizes ingest by itself"
+        )
+    if selected_manifest is not None and full_rows_only:
+        raise SystemExit(
+            "--full-rows-only is forbidden for audited A1 ingest: all rows from "
+            "the exact 12,000 selected complete games must remain available to the "
+            "one-dose learner and immutable validation holdout"
+        )
+    post_wave_audit = (
+        None
+        if a1_post_wave_audit is None
+        else _load_a1_post_wave_audit(Path(a1_post_wave_audit), selected_manifest)
+    )
+    if source_attestations:
+        expected_contract = selected_manifest["a1_contract_sha256"]
+        mismatched = [
+            str(record["path"])
+            for record in source_attestations
+            if record["contract_sha256"] != expected_contract
+        ]
+        if mismatched:
+            raise SystemExit(
+                "A1 source attestations do not all bind the selected/audited "
+                f"contract {expected_contract}: {mismatched}"
+            )
+    selected_game_seeds = (
+        None
+        if selected_manifest is None
+        else np.asarray(selected_manifest["selected_game_seeds"], dtype=np.int64)
+    )
+    expected_selected_seed_set = (
+        set()
+        if selected_game_seeds is None
+        else set(map(int, selected_game_seeds.tolist()))
+    )
+    observed_selected_seed_set: set[int] = set()
+    selected_source_tracker = (
+        None
+        if selected_manifest is None
+        else _SelectedGameSeedRunTracker(expected_selected_seed_set)
+    )
+
     files: list[Path] = []
+    source_first_files: list[Path] = []
     for src in sources:
         src_files = _teacher_shard_files(Path(src))
         if not src_files:
             raise SystemExit(f"no teacher shards found in {src}")
+        source_first_files.append(src_files[0])
         files.extend(src_files)
     if max_shards is not None:
         files = files[:max_shards]
+    if post_wave_audit is not None:
+        actual_by_path: dict[Path, Path] = {}
+        for file in files:
+            canonical = file.expanduser().resolve(strict=True)
+            if canonical in actual_by_path:
+                raise SystemExit(
+                    f"input sources repeat canonical data shard path {canonical}"
+                )
+            actual_by_path[canonical] = file
+        audited_paths = [
+            Path(record["path"]) for record in post_wave_audit["data_shards"]
+        ]
+        audited_path_set = set(audited_paths)
+        actual_path_set = set(actual_by_path)
+        if actual_path_set != audited_path_set:
+            raise SystemExit(
+                "input data-shard inventory differs from the passing A1 audit: "
+                f"missing={len(audited_path_set - actual_path_set)} "
+                f"unexpected={len(actual_path_set - audited_path_set)}"
+            )
+        # The audit's inventory order is authoritative.  This preserves a
+        # game that legitimately spans adjacent shards while preventing an
+        # alternate same-seed file from being substituted or reordered.
+        files = [actual_by_path[path] for path in audited_paths]
     out_dir.mkdir(parents=True, exist_ok=True)
 
     started = time.perf_counter()
-    first = _normalize_teacher_shard(_load_npz(files[0]), files[0])
+    # Replay windows commonly combine homogeneous per-round sources. If any
+    # source carries CAT-100 targets, normalize legacy sources with per-head
+    # ignore fills so the memmap keeps a single aligned schema. Inspecting one
+    # shard per source avoids decompressing every .npz.zst twice.
+    include_aux_targets = False
+    for first_file in source_first_files:
+        raw = _load_npz(first_file)
+        try:
+            include_aux_targets = include_aux_targets or any(
+                key in raw for key in AUX_TARGET_KEYS
+            )
+        finally:
+            close = getattr(raw, "close", None)
+            if callable(close):
+                close()
+    first = _normalize_teacher_shard(
+        _load_npz(files[0]),
+        files[0],
+        include_aux_defaults=include_aux_targets,
+    )
+    if selected_game_seeds is not None:
+        if "game_seed" not in first:
+            raise SystemExit(
+                f"{files[0]}: --selected-game-seed-manifest requires a game_seed column"
+            )
+        first_keep = np.isin(
+            np.asarray(first["game_seed"], dtype=np.int64),
+            selected_game_seeds,
+        )
+        first = {
+            name: np.asarray(value)[first_keep] for name, value in first.items()
+        }
     columns = [key for key in LOADER_KEYS if key in first]
     schemas = {name: _classify(name, first[name]) for name in columns}
     implicit_zero_columns: list[str] = []
@@ -306,7 +1056,11 @@ def build_memmap_corpus(
     dropped_fast_rows = 0
     for shard_index, file in enumerate(files):
         raw = _load_npz(file)
-        norm = _normalize_teacher_shard(raw, file)
+        norm = _normalize_teacher_shard(
+            raw,
+            file,
+            include_aux_defaults=include_aux_targets,
+        )
         # This check intentionally precedes --full-rows-only filtering.  The
         # opt-in contract is corpus-source-wide: a live event in even a row
         # that a later filter would drop must fail closed rather than allowing
@@ -320,6 +1074,34 @@ def build_memmap_corpus(
                     "to be exactly zero; found live/non-zero event data. Refusing "
                     "lossy conversion. Re-run without --omit-zero-events."
                 )
+        selected_row_mask: np.ndarray | None = None
+        if selected_game_seeds is not None:
+            if "game_seed" not in norm:
+                raise SystemExit(
+                    f"{file}: --selected-game-seed-manifest requires a game_seed column"
+                )
+            raw_game_seeds = np.asarray(norm["game_seed"], dtype=np.int64)
+            selected_source_tracker.observe_shard(raw_game_seeds)
+            selected_row_mask = np.isin(raw_game_seeds, selected_game_seeds)
+            # This is deliberately the first row-level transform.  Reserve,
+            # incomplete, and truncated attempts use unselected game seeds and
+            # therefore cannot affect output sizing, statistics, or bytes.
+            norm = {
+                name: np.asarray(value)[selected_row_mask]
+                for name, value in norm.items()
+            }
+            for status_name, expected in (("terminated", True), ("truncated", False)):
+                if status_name not in norm:
+                    raise SystemExit(
+                        f"{file}: --selected-game-seed-manifest requires a "
+                        f"{status_name} column"
+                    )
+                statuses = np.asarray(norm[status_name], dtype=bool)
+                if statuses.size and np.any(statuses != expected):
+                    raise SystemExit(
+                        f"{file}: selected rows include a non-complete game "
+                        f"({status_name} must be {expected})"
+                    )
         if full_rows_only:
             # Keep only FULL-search rows (drop fast rows). used_full_search is the
             # ground-truth per-row full/fast marker written by the generator; it is
@@ -337,6 +1119,13 @@ def build_memmap_corpus(
                     "shards with the current generator or drop --full-rows-only."
                 )
             keep = np.asarray(raw["used_full_search"]).astype(bool)
+            if selected_row_mask is not None:
+                if keep.shape[0] != selected_row_mask.shape[0]:
+                    raise SystemExit(
+                        f"{file}: used_full_search length {keep.shape[0]} != raw row "
+                        f"count {selected_row_mask.shape[0]}"
+                    )
+                keep = keep[selected_row_mask]
             if keep.shape[0] != int(np.asarray(norm["action_taken"]).shape[0]):
                 raise SystemExit(
                     f"{file}: used_full_search length {keep.shape[0]} != row count "
@@ -428,6 +1217,10 @@ def build_memmap_corpus(
                 stats["has_duplicate_legal_rows"] = True
         if "game_seed" in norm:
             _seed_tracker.observe_shard(norm["game_seed"])
+            if selected_game_seeds is not None:
+                observed_selected_seed_set.update(
+                    map(int, np.asarray(norm["game_seed"], dtype=np.int64).tolist())
+                )
 
         for name in columns:
             schema = schemas[name]
@@ -481,6 +1274,47 @@ def build_memmap_corpus(
     for handle in code_handles.values():
         handle.close()
 
+    for record in source_attestations:
+        actual_sha = _file_sha256(Path(record["path"]))
+        if actual_sha != record["file_sha256"]:
+            raise SystemExit(
+                "A1 source attestation changed while building the corpus: "
+                f"{record['path']}"
+            )
+
+    if post_wave_audit is not None:
+        # Verify bytes after conversion as the acceptance boundary. This both
+        # avoids hashing every large shard twice and catches ordinary mutation
+        # while a long conversion is reading the audited inventory.
+        for record in post_wave_audit["data_shards"]:
+            actual_sha = _file_sha256(Path(record["path"]))
+            if actual_sha != record["sha256"]:
+                raise SystemExit(
+                    "input data shard changed from the passing A1 audit while "
+                    f"building the corpus: {record['path']} "
+                    f"declared={record['sha256']} actual={actual_sha}"
+                )
+        if int(row_count) != int(post_wave_audit["selected_row_count"]):
+            raise SystemExit(
+                "A1 memmap row count differs from the passing audit's exact selected "
+                f"exposure: corpus={row_count} "
+                f"audit={post_wave_audit['selected_row_count']}"
+            )
+
+    if selected_manifest is not None:
+        if selected_source_tracker.duplicate_count:
+            raise SystemExit(
+                "selected game_seed starts more than one non-contiguous "
+                f"raw-source run for {selected_source_tracker.duplicate_count} seed(s)"
+            )
+        missing = expected_selected_seed_set - observed_selected_seed_set
+        unexpected = observed_selected_seed_set - expected_selected_seed_set
+        if missing or unexpected:
+            raise SystemExit(
+                "selected-game seed set in converted rows differs from the immutable "
+                f"manifest: missing={len(missing)} unexpected={len(unexpected)}"
+            )
+
     stats["duplicate_game_seed_count"] = _seed_tracker.duplicate_count
     stats["has_duplicate_game_seeds"] = _seed_tracker.has_duplicates
     if stats["has_duplicate_game_seeds"]:
@@ -513,8 +1347,13 @@ def build_memmap_corpus(
     for name in code_handles:
         schemas[name] = {"kind": "string", "categories": category_lists[name]}
 
+    payload_inventory = _memmap_payload_inventory(out_dir, schemas)
+
     meta = {
         "schema": MEMMAP_CORPUS_IMPLICIT_SCHEMA if implicit_zero_columns else MEMMAP_CORPUS_SCHEMA,
+        "payload_inventory_schema": MEMMAP_PAYLOAD_INVENTORY_SCHEMA,
+        "payload_inventory": payload_inventory,
+        "payload_inventory_sha256": _value_sha256(payload_inventory),
         "row_count": int(row_count),
         "flat_count": int(flat_count),
         "legal_width": int(legal_width),
@@ -542,6 +1381,43 @@ def build_memmap_corpus(
         "stats": stats,
         "conversion_seconds": round(time.perf_counter() - started, 2),
     }
+    if selected_manifest is not None:
+        meta["selected_game_seed_manifest"] = {
+            "path": str(selected_manifest["path"]),
+            "file_sha256": selected_manifest["file_sha256"],
+            "a1_contract_sha256": selected_manifest["a1_contract_sha256"],
+            "selected_game_count": selected_manifest["selected_game_count"],
+            "selected_game_seed_set_sha256": selected_manifest[
+                "selected_game_seed_set_sha256"
+            ],
+            "training_game_count": selected_manifest["training_game_count"],
+            "training_game_seed_set_sha256": selected_manifest[
+                "training_game_seed_set_sha256"
+            ],
+            "validation_game_count": selected_manifest["validation_game_count"],
+            "validation_game_seed_set_sha256": selected_manifest[
+                "validation_game_seed_set_sha256"
+            ],
+            "records_sha256": selected_manifest["records_sha256"],
+        }
+        meta["a1_post_wave_audit"] = {
+            "path": str(post_wave_audit["path"]),
+            "file_sha256": post_wave_audit["file_sha256"],
+            "audit_sha256": post_wave_audit["audit_sha256"],
+            "contract_sha256": post_wave_audit["contract_sha256"],
+            "shard_inventory_sha256": post_wave_audit[
+                "shard_inventory_sha256"
+            ],
+            "source_provenance": post_wave_audit["source_provenance"],
+            "selected_row_count": post_wave_audit["selected_row_count"],
+            "training_row_count": post_wave_audit["training_row_count"],
+            "validation_holdout": {
+                key: (
+                    str(value) if isinstance(value, Path) else value
+                )
+                for key, value in post_wave_audit["validation_holdout"].items()
+            },
+        }
     (out_dir / "corpus_meta.json").write_text(json.dumps(meta, indent=2, sort_keys=True), encoding="utf-8")
     print(json.dumps({"progress": "memmap_convert_done", **{k: meta[k] for k in ("row_count", "flat_count", "legal_width", "shard_count", "conversion_seconds")}}, sort_keys=True), flush=True)
     return meta
@@ -593,6 +1469,28 @@ def main() -> None:
             "Conversion aborts on any live event. Off by default."
         ),
     )
+    parser.add_argument(
+        "--selected-game-seed-manifest",
+        type=Path,
+        default=None,
+        help=(
+            "Immutable a1-selected-training-games-v1 sidecar from the A1 "
+            "post-wave audit. When set, only rows belonging to its exact 12,000 "
+            "selected complete game seeds enter the corpus. Validation rows remain "
+            "available for train_bc's exact game-level holdout; missing/tampered "
+            "selection evidence aborts conversion."
+        ),
+    )
+    parser.add_argument(
+        "--a1-post-wave-audit",
+        type=Path,
+        default=None,
+        help=(
+            "Passing a1-post-wave-audit-v2 report that binds the selected-game "
+            "manifest and exact input shard inventory/hashes. Required together "
+            "with --selected-game-seed-manifest."
+        ),
+    )
     parser.add_argument("--progress-every", type=int, default=500)
     parser.add_argument(
         "--abort-on-duplicate-seeds",
@@ -622,6 +1520,8 @@ def main() -> None:
         abort_on_duplicate_seeds=args.abort_on_duplicate_seeds,
         full_rows_only=args.full_rows_only,
         omit_zero_events=args.omit_zero_events,
+        selected_game_seed_manifest=args.selected_game_seed_manifest,
+        a1_post_wave_audit=args.a1_post_wave_audit,
     )
 
 

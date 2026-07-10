@@ -725,7 +725,7 @@ def test_plan_remote_train_blocks_workers_without_required_features() -> None:
                 "ok": True,
                 "running_train_processes": 0,
                 "candidate_checkpoints": [],
-                "repo": "/home/nickita/catan-zero",
+                "repo": "/home/worker/catan-zero",
                 "trainer_sha1": "abc123",
                 "trainer_features": {
                     "ema_policy_kl": True,
@@ -1349,8 +1349,8 @@ def test_remote_grade_from_worker_supports_mixed_repo_roots() -> None:
         leg_timeout_seconds=1200,
         project="proj",
         remote_repo="",
-        source_remote_repo="/home/nickita/catan-zero",
-        target_remote_repo="/home/nickita/catan-zero/catan-zero-gcp-bundle",
+        source_remote_repo="/home/worker/catan-zero",
+        target_remote_repo="/home/worker/catan-zero/catan-zero-gcp-bundle",
         force=True,
     )
 
@@ -1361,16 +1361,16 @@ def test_remote_grade_from_worker_supports_mixed_repo_roots() -> None:
     )
 
     assert payload["copy_from_source"][3] == (
-        "catan-zero-w4b:/home/nickita/catan-zero/"
+        "catan-zero-w4b:/home/worker/catan-zero/"
         "runs/self_play/candidate.iter0003.pt"
     )
     assert payload["copy_to_target"][4] == (
-        "catan-zero-w4d:/home/nickita/catan-zero/catan-zero-gcp-bundle/"
+        "catan-zero-w4d:/home/worker/catan-zero/catan-zero-gcp-bundle/"
         "runs/self_play/candidate.iter0003.pt"
     )
     grade = payload["grade"]
     assert grade[grade.index("--remote-repo") + 1] == (
-        "/home/nickita/catan-zero/catan-zero-gcp-bundle"
+        "/home/worker/catan-zero/catan-zero-gcp-bundle"
     )
 
 
@@ -1507,7 +1507,7 @@ def test_plan_remote_code_sync_targets_idle_missing_recipe_features() -> None:
                 "ok": True,
                 "running_train_processes": 1,
                 "trainer_features": {**base_features, "tactical_rollout_mixed": False},
-                "repo": "/home/nickita/catan-zero",
+                "repo": "/home/worker/catan-zero",
             },
             {
                 "worker": "catan-zero-w4d",
@@ -1515,7 +1515,7 @@ def test_plan_remote_code_sync_targets_idle_missing_recipe_features() -> None:
                 "ok": True,
                 "running_train_processes": 0,
                 "trainer_features": {**base_features, "tactical_rollout_mixed": False},
-                "repo": "/home/nickita/catan-zero/catan-zero-gcp-bundle",
+                "repo": "/home/worker/catan-zero/catan-zero-gcp-bundle",
                 "trainer_sha1": "oldsha",
             },
             {
@@ -1524,7 +1524,7 @@ def test_plan_remote_code_sync_targets_idle_missing_recipe_features() -> None:
                 "ok": True,
                 "running_train_processes": 0,
                 "trainer_features": {**base_features, "tactical_rollout_mixed": True},
-                "repo": "/home/nickita/catan-zero",
+                "repo": "/home/worker/catan-zero",
             },
         ]
     }
@@ -1543,12 +1543,12 @@ def test_plan_remote_code_sync_targets_idle_missing_recipe_features() -> None:
 
     assert plan["planned_count"] == 1
     assert plan["planned"][0]["worker"] == "catan-zero-w4d"
-    assert plan["planned"][0]["repo"] == "/home/nickita/catan-zero/catan-zero-gcp-bundle"
+    assert plan["planned"][0]["repo"] == "/home/worker/catan-zero/catan-zero-gcp-bundle"
     assert plan["planned"][0]["missing"] == ["tactical_rollout_mixed"]
     command = plan["planned"][0]["command"]
     assert "remote-sync-code" in command
     assert command[command.index("--remote-repo") + 1] == (
-        "/home/nickita/catan-zero/catan-zero-gcp-bundle"
+        "/home/worker/catan-zero/catan-zero-gcp-bundle"
     )
     assert plan["skipped"]["busy_worker"][0]["reason"] == "training"
     assert plan["skipped"]["already_satisfied"][0]["worker"] == "catan-zero-w1a"
@@ -1563,7 +1563,7 @@ def test_plan_remote_code_sync_treats_active_grade_as_busy() -> None:
                 "ok": True,
                 "running_train_processes": 0,
                 "trainer_features": {},
-                "repo": "/home/nickita/catan-zero",
+                "repo": "/home/worker/catan-zero",
             }
         ]
     }
@@ -1590,7 +1590,7 @@ def test_plan_remote_code_sync_treats_active_grade_as_busy() -> None:
 
 def test_remote_sync_code_command_backs_up_and_checks_busy_workers() -> None:
     command = remote_sync_preflight_command(
-        remote_repo="/home/nickita/catan-zero/catan-zero-gcp-bundle",
+        remote_repo="/home/worker/catan-zero/catan-zero-gcp-bundle",
         files=["tools/train_ppo.py"],
         backup_dir="runs/self_play/code_backups",
         allow_busy=False,
@@ -1607,14 +1607,14 @@ def test_remote_sync_code_launch_command_includes_files_and_backup_dir() -> None
     command = build_remote_sync_code_launch_command(
         worker=Worker("catan-zero-w4d", "us-west4-b"),
         project="proj",
-        remote_repo="/home/nickita/catan-zero/catan-zero-gcp-bundle",
+        remote_repo="/home/worker/catan-zero/catan-zero-gcp-bundle",
         files=["tools/train_ppo.py"],
         backup_dir="runs/self_play/code_backups",
     )
 
     assert command[command.index("--worker") + 1] == "catan-zero-w4d:us-west4-b"
     assert command[command.index("--remote-repo") + 1] == (
-        "/home/nickita/catan-zero/catan-zero-gcp-bundle"
+        "/home/worker/catan-zero/catan-zero-gcp-bundle"
     )
     assert "remote-sync-code" in command
     assert command[command.index("--file") + 1] == "tools/train_ppo.py"
@@ -2259,11 +2259,11 @@ def test_remote_grade_from_worker_copies_then_grades_target() -> None:
         "gcloud",
         "compute",
         "scp",
-        "source-vm:/home/nickita/catan-zero/runs/self_play/s9828.iter0004.pt",
+        "source-vm:~/catan-zero/runs/self_play/s9828.iter0004.pt",
     ]
     assert command["copy_to_target"][3] == "$TMPDIR/s9828.iter0004.pt"
     assert command["copy_to_target"][4] == (
-        "target-vm:/home/nickita/catan-zero/runs/self_play/s9828.iter0004.pt"
+        "target-vm:~/catan-zero/runs/self_play/s9828.iter0004.pt"
     )
     assert command["grade"][command["grade"].index("--worker") + 1] == (
         "target-vm:us-west1-b"
@@ -3471,7 +3471,7 @@ def test_plan_remote_transfer_gates_moves_busy_source_checkpoint_to_idle_target(
                 "worker": "catan-zero-w1a",
                 "zone": "us-west1-b",
                 "ok": True,
-                "repo": "/home/nickita/catan-zero/catan-zero-gcp-bundle",
+                "repo": "/home/worker/catan-zero/catan-zero-gcp-bundle",
                 "running_train_processes": 1,
                 "candidate_checkpoints": [
                     {
@@ -3484,7 +3484,7 @@ def test_plan_remote_transfer_gates_moves_busy_source_checkpoint_to_idle_target(
                 "worker": "catan-zero-c3",
                 "zone": "us-central1-c",
                 "ok": True,
-                "repo": "/home/nickita/catan-zero",
+                "repo": "/home/worker/catan-zero",
                 "running_train_processes": 0,
                 "candidate_checkpoints": [],
             },
@@ -3528,10 +3528,10 @@ def test_plan_remote_transfer_gates_moves_busy_source_checkpoint_to_idle_target(
         "catan-zero-w1a:us-west1-b"
     )
     assert planned["command"][planned["command"].index("--source-remote-repo") + 1] == (
-        "/home/nickita/catan-zero/catan-zero-gcp-bundle"
+        "/home/worker/catan-zero/catan-zero-gcp-bundle"
     )
     assert planned["command"][planned["command"].index("--target-remote-repo") + 1] == (
-        "/home/nickita/catan-zero"
+        "/home/worker/catan-zero"
     )
     assert plan["skipped"]["busy_target_worker"][0]["reason"] == "training"
 
@@ -3543,7 +3543,7 @@ def test_plan_remote_transfer_gates_normalizes_absolute_floor_below_prefix() -> 
                 "worker": "catan-zero-c1",
                 "zone": "us-central1-c",
                 "ok": True,
-                "repo": "/home/nickita/catan-zero",
+                "repo": "/home/worker/catan-zero",
                 "running_train_processes": 1,
                 "candidate_checkpoints": [
                     {
@@ -3556,7 +3556,7 @@ def test_plan_remote_transfer_gates_normalizes_absolute_floor_below_prefix() -> 
                 "worker": "catan-zero-w1a",
                 "zone": "us-west1-b",
                 "ok": True,
-                "repo": "/home/nickita/catan-zero",
+                "repo": "/home/worker/catan-zero",
                 "running_train_processes": 0,
                 "candidate_checkpoints": [],
             },

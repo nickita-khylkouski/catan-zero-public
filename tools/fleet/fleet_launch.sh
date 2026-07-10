@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # tools/fleet/fleet_launch.sh — ONE canonical, guarded fleet launcher (CAT-122).
 #
-# Supersedes the drifted per-box launch scripts (fire_*.sh, mps_rollout.sh,
-# fleet_launch_safe.sh stub) that the 2026-07-09 freeze indicted. Every launch —
+# Supersedes the removed drifted per-box launch scripts (fire_*.sh,
+# mps_rollout.sh, and the fleet_launch_safe.sh stub). Every launch —
 # generation (teacher/volume) and training (train) — goes through this one path,
 # so the guards, the seed-claim discipline, the interpreter resolution, and the
 # teardown-safe detach are identical on every box and can never drift again.
@@ -37,6 +37,16 @@
 #     --games N         total games per GPU, split across its workers (default 1500).
 #     --workers N       CPU game workers per GPU EvalServer (teacher default:
 #                       128 on <=4 GPUs, 64 on >4; volume default: 48/32).
+#     --max-neural-rows N
+#                       optional hard cap on rows per EvalServer forward
+#                       (default unset/uncapped while root waves are off).
+#     --n-full/--n-fast/--p-full/--c-scale VALUE
+#                       generation-only typed search overrides; role defaults remain
+#                       unchanged when omitted.
+#     --symmetry-averaged-eval [--symmetry-averaged-eval-threshold N]
+#     --n-full-wide N [--n-full-wide-threshold N] [--wide-roots-always-full]
+#     --wide-candidates-threshold N / --value-readout scalar|categorical
+#                       generation-only S1-S3 operator fields; all default to no-op.
 #     --no-cpu-affinity disable automatic GPU-local CPU pinning (default on).
 #     --mps             opt into CUDA MPS (default off; EvalServer already
 #                       collapses each GPU to one CUDA process).
@@ -57,19 +67,49 @@ source "$DIR/fleet_lib.sh" || { echo "fleet_launch: cannot load fleet_lib.sh"; e
 ALIAS="${1:?usage: fleet_launch.sh <alias> <role> [opts]}"; shift
 ROLE="${1:?role = teacher|volume|train}"; shift
 BASE_SEED=""; GPUS="0-3"; GAMES=1500; WORKERS=""; WAVE=1; DATA=""; GROW_FROM=""
+EVAL_SERVER_MAX_NEURAL_ROWS=""
+N_FULL_OVERRIDE=""; N_FAST_OVERRIDE=""; P_FULL_OVERRIDE=""; C_SCALE_OVERRIDE=""
+SYMMETRY_AVERAGED_EVAL_THRESHOLD=""; N_FULL_WIDE=""; N_FULL_WIDE_THRESHOLD=""
+WIDE_ROOTS_ALWAYS_FULL=0; WIDE_CANDIDATES_THRESHOLD=""; VALUE_READOUT=""
+NFAST=16; CSCALE=0.03
 TRUST_CURATED=0; USE_MPS=0; CPU_AFFINITY=1; GO=0
+SYMMETRY_AVERAGED_EVAL=0; RESCALE_NOISE_FLOOR_C=""; SIGMA_EVAL=""
+LATE_TEMPERATURE_DECISIONS=""; LATE_TEMPERATURE=""
+OPPONENT_MIX_MANIFEST=""; EXPLOITER_FRACTION=""; RUST_FEATURIZE=0
+EVAL_CACHE_SIZE=""; SHARD_SIZE=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --base-seed) BASE_SEED="$2"; shift 2;;
     --gpus)      GPUS="$2"; shift 2;;
     --games)     GAMES="$2"; shift 2;;
     --workers)   WORKERS="$2"; shift 2;;
+    --max-neural-rows) EVAL_SERVER_MAX_NEURAL_ROWS="$2"; shift 2;;
+    --n-full) N_FULL_OVERRIDE="$2"; shift 2;;
+    --n-fast) N_FAST_OVERRIDE="$2"; shift 2;;
+    --p-full) P_FULL_OVERRIDE="$2"; shift 2;;
+    --c-scale) C_SCALE_OVERRIDE="$2"; shift 2;;
     --wave)      WAVE="$2"; shift 2;;
     --data)      DATA="$2"; shift 2;;
     --grow-from) GROW_FROM="$2"; shift 2;;
     --trust-curated-data) TRUST_CURATED=1; shift;;
     --mps)       USE_MPS=1; shift;;
     --no-cpu-affinity) CPU_AFFINITY=0; shift;;
+    --symmetry-averaged-eval) SYMMETRY_AVERAGED_EVAL=1; shift;;
+    --symmetry-averaged-eval-threshold) SYMMETRY_AVERAGED_EVAL_THRESHOLD="$2"; shift 2;;
+    --n-full-wide) N_FULL_WIDE="$2"; shift 2;;
+    --n-full-wide-threshold) N_FULL_WIDE_THRESHOLD="$2"; shift 2;;
+    --wide-roots-always-full) WIDE_ROOTS_ALWAYS_FULL=1; shift;;
+    --wide-candidates-threshold) WIDE_CANDIDATES_THRESHOLD="$2"; shift 2;;
+    --value-readout) VALUE_READOUT="$2"; shift 2;;
+    --rescale-noise-floor-c) RESCALE_NOISE_FLOOR_C="$2"; shift 2;;
+    --sigma-eval) SIGMA_EVAL="$2"; shift 2;;
+    --late-temperature-decisions) LATE_TEMPERATURE_DECISIONS="$2"; shift 2;;
+    --late-temperature) LATE_TEMPERATURE="$2"; shift 2;;
+    --opponent-mix-manifest) OPPONENT_MIX_MANIFEST="$2"; shift 2;;
+    --exploiter-fraction) EXPLOITER_FRACTION="$2"; shift 2;;
+    --rust-featurize) RUST_FEATURIZE=1; shift;;
+    --eval-cache-size) EVAL_CACHE_SIZE="$2"; shift 2;;
+    --shard-size) SHARD_SIZE="$2"; shift 2;;
     --go)        GO=1; shift;;
     --skip-guards) echo "fleet_launch: --skip-guards is RETIRED (CAT-124). Claim your seed range first; guards now pass for a legitimate fresh claim." >&2; exit 2;;
     *) echo "fleet_launch: unknown option '$1'" >&2; exit 2;;
@@ -77,11 +117,15 @@ while [ "$#" -gt 0 ]; do
 done
 
 case "$ROLE" in
-  teacher) NFULL=128; PFULL=1.0;  SHARD_SIZE=512;  EVAL_SERVER_MAX_BATCH=96; EVAL_SERVER_REQUEST_COLLECTOR=1;;
-  volume)  NFULL=64;  PFULL=0.25; SHARD_SIZE=2048; EVAL_SERVER_MAX_BATCH=64; EVAL_SERVER_REQUEST_COLLECTOR=0;;
-  train)   SHARD_SIZE=0; EVAL_SERVER_MAX_BATCH=0; EVAL_SERVER_REQUEST_COLLECTOR=0;;
+  teacher) NFULL=128; PFULL=1.0;  EVAL_SERVER_MAX_BATCH=96; EVAL_SERVER_REQUEST_COLLECTOR=1;;
+  volume)  NFULL=64;  PFULL=0.25; EVAL_SERVER_MAX_BATCH=64; EVAL_SERVER_REQUEST_COLLECTOR=0;;
+  train)   EVAL_SERVER_MAX_BATCH=0; EVAL_SERVER_REQUEST_COLLECTOR=0;;
   *) echo "fleet_launch: role must be teacher|volume|train" >&2; exit 2;;
 esac
+[ -z "$N_FULL_OVERRIDE" ] || NFULL="$N_FULL_OVERRIDE"
+[ -z "$N_FAST_OVERRIDE" ] || NFAST="$N_FAST_OVERRIDE"
+[ -z "$P_FULL_OVERRIDE" ] || PFULL="$P_FULL_OVERRIDE"
+[ -z "$C_SCALE_OVERRIDE" ] || CSCALE="$C_SCALE_OVERRIDE"
 
 IP=$(fleet_host "$ALIAS") || exit 2
 KEY=$(fleet_key)
@@ -144,9 +188,35 @@ fi
 
 [[ "$GAMES" =~ ^[1-9][0-9]*$ ]] || { echo "fleet_launch: --games must be a positive integer" >&2; exit 2; }
 [[ "$WORKERS" =~ ^[1-9][0-9]*$ ]] || { echo "fleet_launch: --workers must be a positive integer" >&2; exit 2; }
+if [ -n "$EVAL_SERVER_MAX_NEURAL_ROWS" ]; then
+  [[ "$EVAL_SERVER_MAX_NEURAL_ROWS" =~ ^[1-9][0-9]*$ ]] \
+    || { echo "fleet_launch: --max-neural-rows must be a positive integer" >&2; exit 2; }
+fi
+for FIELD in "$N_FULL_OVERRIDE" "$N_FAST_OVERRIDE" "$N_FULL_WIDE" \
+  "$N_FULL_WIDE_THRESHOLD" "$SYMMETRY_AVERAGED_EVAL_THRESHOLD" \
+  "$WIDE_CANDIDATES_THRESHOLD"; do
+  [ -z "$FIELD" ] || [[ "$FIELD" =~ ^[1-9][0-9]*$ ]] \
+    || { echo "fleet_launch: search counts/thresholds must be positive integers" >&2; exit 2; }
+done
+case "$VALUE_READOUT" in
+  ""|scalar|categorical) ;;
+  *) echo "fleet_launch: --value-readout must be scalar or categorical" >&2; exit 2;;
+esac
 
 # ---- role-specific validation --------------------------------------------
 if [ "$ROLE" = "train" ]; then
+  if [ "$SYMMETRY_AVERAGED_EVAL" = 1 ] || [ -n "$RESCALE_NOISE_FLOOR_C" ] || [ -n "$SIGMA_EVAL" ] || \
+     [ -n "$LATE_TEMPERATURE_DECISIONS" ] || [ -n "$LATE_TEMPERATURE" ] || \
+     [ -n "$OPPONENT_MIX_MANIFEST" ] || [ -n "$EXPLOITER_FRACTION" ] || \
+     [ "$RUST_FEATURIZE" = 1 ] || [ -n "$EVAL_CACHE_SIZE" ] || [ -n "$SHARD_SIZE" ] || \
+     [ -n "$EVAL_SERVER_MAX_NEURAL_ROWS" ] || [ -n "$N_FULL_OVERRIDE" ] || \
+     [ -n "$N_FAST_OVERRIDE" ] || [ -n "$P_FULL_OVERRIDE" ] || [ -n "$C_SCALE_OVERRIDE" ] || \
+     [ -n "$SYMMETRY_AVERAGED_EVAL_THRESHOLD" ] || [ -n "$N_FULL_WIDE" ] || \
+     [ -n "$N_FULL_WIDE_THRESHOLD" ] || [ "$WIDE_ROOTS_ALWAYS_FULL" = 1 ] || \
+     [ -n "$WIDE_CANDIDATES_THRESHOLD" ] || [ -n "$VALUE_READOUT" ]; then
+    echo "fleet_launch: generation science options are not valid for role=train" >&2
+    exit 2
+  fi
   [ -n "$DATA" ] || { echo "fleet_launch: role=train needs --data <corpus dir>" >&2; exit 2; }
   [ "$TRUST_CURATED" -eq 1 ] || {
     echo "fleet_launch: role=train requires --trust-curated-data after corpus QA; refusing to silently bypass teacher-quality gates" >&2
@@ -160,6 +230,18 @@ else
   [ -n "$BASE_SEED" ] || { echo "fleet_launch: gen role needs --base-seed <fresh ledgered seed>" >&2; exit 2; }
   [[ "$BASE_SEED" =~ ^(0|[1-9][0-9]*)$ ]] \
     || { echo "fleet_launch: --base-seed must be a non-negative decimal integer" >&2; exit 2; }
+  if [ -n "$EXPLOITER_FRACTION" ] && [ -z "$OPPONENT_MIX_MANIFEST" ]; then
+    echo "fleet_launch: --exploiter-fraction requires --opponent-mix-manifest" >&2
+    exit 2
+  fi
+  if [ -n "$SYMMETRY_AVERAGED_EVAL_THRESHOLD" ] && [ "$SYMMETRY_AVERAGED_EVAL" != 1 ]; then
+    echo "fleet_launch: --symmetry-averaged-eval-threshold requires --symmetry-averaged-eval" >&2
+    exit 2
+  fi
+  if { [ -n "$N_FULL_WIDE_THRESHOLD" ] || [ "$WIDE_ROOTS_ALWAYS_FULL" = 1 ]; } && [ -z "$N_FULL_WIDE" ]; then
+    echo "fleet_launch: wide threshold/always-full requires --n-full-wide" >&2
+    exit 2
+  fi
 fi
 
 echo "===== fleet_launch $ALIAS/$ROLE gpus=$GPU_CSV ($NGPU) claim=$CLAIM_ID ($([ $GO = 1 ] && echo GO || echo DRY-RUN)) ====="
@@ -176,6 +258,15 @@ DATA="${13}"; GROW_FROM_IN="${14}"
 TRUST_CURATED="${15}"; USE_MPS="${16}"; CPU_AFFINITY="${17}"
 SHARD_SIZE="${18}"; EVAL_SERVER_MAX_BATCH="${19}"
 EVAL_SERVER_REQUEST_COLLECTOR="${20}"
+SYMMETRY_AVERAGED_EVAL="${21}"; RESCALE_NOISE_FLOOR_C="${22}"; SIGMA_EVAL="${23}"
+LATE_TEMPERATURE_DECISIONS="${24}"; LATE_TEMPERATURE="${25}"
+OPPONENT_MIX_MANIFEST="${26}"; EXPLOITER_FRACTION="${27}"
+RUST_FEATURIZE="${28}"; EVAL_CACHE_SIZE="${29}"
+EVAL_SERVER_MAX_NEURAL_ROWS="${30}"
+NFAST="${31}"; CSCALE="${32}"
+SYMMETRY_AVERAGED_EVAL_THRESHOLD="${33}"; N_FULL_WIDE="${34}"
+N_FULL_WIDE_THRESHOLD="${35}"; WIDE_ROOTS_ALWAYS_FULL="${36}"
+WIDE_CANDIDATES_THRESHOLD="${37}"; VALUE_READOUT="${38}"
 
 TREE="${TREE:-$HOME/catan-zero-v1}"
 CKPT="${CKPT:-$HOME/bundle/champion_v0.pt}"
@@ -208,6 +299,11 @@ if [ "$ROLE" = "train" ]; then
 else
   [ -f "$CKPT" ] && echo "ok: champion $CKPT" || { echo "FAIL: champion $CKPT missing"; FAIL=1; }
   [ -f "$LEDGER" ] && echo "ok: ledger $LEDGER" || { echo "FAIL: ledger $LEDGER missing (sync it here first — cross-host seed safety, CAT-125)"; FAIL=1; }
+  if [ -n "$OPPONENT_MIX_MANIFEST" ]; then
+    [ -f "$OPPONENT_MIX_MANIFEST" ] \
+      && echo "ok: opponent mix $OPPONENT_MIX_MANIFEST" \
+      || { echo "FAIL: --opponent-mix-manifest $OPPONENT_MIX_MANIFEST missing"; FAIL=1; }
+  fi
   if [ "$USE_MPS" = "1" ]; then
     command -v nvidia-cuda-mps-control >/dev/null 2>&1 \
       && echo "ok: optional nvidia-cuda-mps-control available" \
@@ -302,8 +398,14 @@ export PROGRESS_CMD="$PROG"
 if [ "$ROLE" != "train" ]; then
   # Values are inherited through the environment so the runner stays readable
   # and no shell-quoted mega-command is duplicated for every GPU.
-  export TREE CKPT GEN_PY OUT GPU_CSV GAMES WORKERS BASE_SEED NFULL PFULL CLAIM_ID USE_MPS CPU_AFFINITY
+  export TREE CKPT GEN_PY OUT GPU_CSV GAMES WORKERS BASE_SEED NFULL NFAST PFULL CSCALE CLAIM_ID USE_MPS CPU_AFFINITY
   export SHARD_SIZE EVAL_SERVER_MAX_BATCH EVAL_SERVER_REQUEST_COLLECTOR
+  export SYMMETRY_AVERAGED_EVAL RESCALE_NOISE_FLOOR_C SIGMA_EVAL
+  export LATE_TEMPERATURE_DECISIONS LATE_TEMPERATURE OPPONENT_MIX_MANIFEST
+  export EXPLOITER_FRACTION RUST_FEATURIZE EVAL_CACHE_SIZE
+  export EVAL_SERVER_MAX_NEURAL_ROWS
+  export SYMMETRY_AVERAGED_EVAL_THRESHOLD N_FULL_WIDE N_FULL_WIDE_THRESHOLD
+  export WIDE_ROOTS_ALWAYS_FULL WIDE_CANDIDATES_THRESHOLD VALUE_READOUT
   cat > "$RUNDIR/run_generation.sh" <<'GEN_RUNNER_EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -337,6 +439,25 @@ GPU_ORDINAL=0
 EVAL_SERVER_COLLECTOR_FLAG="--no-eval-server-request-collector"
 if [ "$EVAL_SERVER_REQUEST_COLLECTOR" = "1" ]; then
   EVAL_SERVER_COLLECTOR_FLAG="--eval-server-request-collector"
+fi
+SCIENCE_ARGS=()
+[ "$SYMMETRY_AVERAGED_EVAL" = "1" ] && SCIENCE_ARGS+=(--symmetry-averaged-eval)
+[ -z "$RESCALE_NOISE_FLOOR_C" ] || SCIENCE_ARGS+=(--rescale-noise-floor-c "$RESCALE_NOISE_FLOOR_C")
+[ -z "$SIGMA_EVAL" ] || SCIENCE_ARGS+=(--sigma-eval "$SIGMA_EVAL")
+[ -z "$LATE_TEMPERATURE_DECISIONS" ] || SCIENCE_ARGS+=(--late-temperature-decisions "$LATE_TEMPERATURE_DECISIONS")
+[ -z "$LATE_TEMPERATURE" ] || SCIENCE_ARGS+=(--late-temperature "$LATE_TEMPERATURE")
+[ -z "$OPPONENT_MIX_MANIFEST" ] || SCIENCE_ARGS+=(--opponent-mix-manifest "$OPPONENT_MIX_MANIFEST")
+[ -z "$EXPLOITER_FRACTION" ] || SCIENCE_ARGS+=(--exploiter-fraction "$EXPLOITER_FRACTION")
+[ -z "$SHARD_SIZE" ] || SCIENCE_ARGS+=(--shard-size "$SHARD_SIZE")
+[ -z "$SYMMETRY_AVERAGED_EVAL_THRESHOLD" ] || SCIENCE_ARGS+=(--symmetry-averaged-eval-threshold "$SYMMETRY_AVERAGED_EVAL_THRESHOLD")
+[ -z "$N_FULL_WIDE" ] || SCIENCE_ARGS+=(--n-full-wide "$N_FULL_WIDE")
+[ -z "$N_FULL_WIDE_THRESHOLD" ] || SCIENCE_ARGS+=(--n-full-wide-threshold "$N_FULL_WIDE_THRESHOLD")
+[ "$WIDE_ROOTS_ALWAYS_FULL" != 1 ] || SCIENCE_ARGS+=(--wide-roots-always-full)
+[ -z "$WIDE_CANDIDATES_THRESHOLD" ] || SCIENCE_ARGS+=(--wide-candidates-threshold "$WIDE_CANDIDATES_THRESHOLD")
+[ -z "$VALUE_READOUT" ] || SCIENCE_ARGS+=(--value-readout "$VALUE_READOUT")
+EVAL_SERVER_ROW_CAP_ARGS=()
+if [ -n "$EVAL_SERVER_MAX_NEURAL_ROWS" ]; then
+  EVAL_SERVER_ROW_CAP_ARGS=(--eval-server-max-neural-rows "$EVAL_SERVER_MAX_NEURAL_ROWS")
 fi
 
 # All generators, EvalServers, managers, and multiprocessing workers inherit
@@ -394,17 +515,20 @@ for GPU in "${GPU_IDS[@]}"; do
   CUDA_VISIBLE_DEVICES="$GPU" \
     "${CPU_PREFIX[@]}" "$GEN_PY" tools/generate_gumbel_selfplay_data.py \
     --out-dir "$GPU_OUT" --checkpoint "$CKPT" --device cuda \
-    --games "$GAMES" --workers "$WORKERS" --base-seed "$GPU_BASE_SEED" --shard-size "$SHARD_SIZE" \
-    --n-full "$NFULL" --n-fast 16 --p-full "$PFULL" --c-visit 50.0 --c-scale 0.03 \
+    --games "$GAMES" --workers "$WORKERS" --base-seed "$GPU_BASE_SEED" \
+    --n-full "$NFULL" --n-fast "$NFAST" --p-full "$PFULL" --c-visit 50.0 --c-scale "$CSCALE" \
     --max-decisions 600 --max-depth 80 --temperature-decisions 90 \
     --correct-rust-chance-spectra --lazy-interior-chance --public-observation \
     --rust-featurize --eval-server --eval-server-max-batch "$EVAL_SERVER_MAX_BATCH" \
     --eval-server-max-wait-ms 0.0 --eval-server-matmul-precision highest \
+    "${EVAL_SERVER_ROW_CAP_ARGS[@]}" \
     --eval-server-transport mp_queue --eval-server-event-token-limit 0 \
     --no-root-wave-batching --no-eval-server-cuda-graph \
-    "$EVAL_SERVER_COLLECTOR_FLAG" --no-eval-server-local-fallback --eval-cache-size 0 \
+    "$EVAL_SERVER_COLLECTOR_FLAG" --no-eval-server-local-fallback \
+    --eval-cache-size "${EVAL_CACHE_SIZE:-0}" \
     --track 2p_no_trade --vps-to-win 10 --format npz --score-actions \
     --ledger-claim-label "$CLAIM_ID" \
+    "${SCIENCE_ARGS[@]}" \
     >"$GPU_OUT/run.log" 2>&1 &
   PIDS+=("$!")
   GPU_ORDINAL=$(( GPU_ORDINAL + 1 ))
@@ -457,6 +581,13 @@ REMOTE_WORDS=(
   "$GAMES" "$WORKERS" "${BASE_SEED:-0}" "$CLAIM_ID" "$DATE_UTC" "${DATA:-}" "${GROW_FROM:-}"
   "$TRUST_CURATED" "$USE_MPS" "$CPU_AFFINITY" "$SHARD_SIZE" "$EVAL_SERVER_MAX_BATCH"
   "$EVAL_SERVER_REQUEST_COLLECTOR"
+  "$SYMMETRY_AVERAGED_EVAL" "$RESCALE_NOISE_FLOOR_C" "$SIGMA_EVAL"
+  "$LATE_TEMPERATURE_DECISIONS" "$LATE_TEMPERATURE" "$OPPONENT_MIX_MANIFEST"
+  "$EXPLOITER_FRACTION" "$RUST_FEATURIZE" "$EVAL_CACHE_SIZE"
+  "$EVAL_SERVER_MAX_NEURAL_ROWS"
+  "$NFAST" "$CSCALE" "$SYMMETRY_AVERAGED_EVAL_THRESHOLD" "$N_FULL_WIDE"
+  "$N_FULL_WIDE_THRESHOLD" "$WIDE_ROOTS_ALWAYS_FULL" "$WIDE_CANDIDATES_THRESHOLD"
+  "$VALUE_READOUT"
 )
 printf -v REMOTE_COMMAND '%q ' "${REMOTE_WORDS[@]}"
 timeout 90 ssh -o ConnectTimeout=10 -o BatchMode=yes -o StrictHostKeyChecking=accept-new -i "$KEY" ubuntu@"$IP" \

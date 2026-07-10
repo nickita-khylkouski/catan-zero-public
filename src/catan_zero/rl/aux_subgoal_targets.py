@@ -21,17 +21,169 @@ flat action-index space), those decoders are INJECTED as callbacks. That keeps
 this module engine-honest and fully unit-testable, and lets the corpus builder
 pass its own authoritative decoders.
 
--1 is the ignore sentinel for the categorical / horizon targets; the train-site
-loss (tools/train_bc.py) masks rows whose target is -1 so an unlabeled row never
-contributes gradient -- exactly the discipline the value-uncertainty head uses.
+-1 is the ignore sentinel for categorical targets; unavailable binary/scalar
+targets use NaN. The train-site loss (tools/train_bc.py) masks both forms so an
+unlabeled row never contributes gradient -- exactly the discipline the value-
+uncertainty head uses.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Optional, Sequence
 
 # Sentinel: "no label for this row" (categorical class id / horizon target).
 AUX_IGNORE_INDEX = -1
+
+# The exact shard/model field contract. Keeping it here lets the producer,
+# writer, loader, and tests share one spelling without importing tools/train_bc.
+AUX_TARGET_KEYS = (
+    "aux_longest_road",
+    "aux_largest_army",
+    "aux_vp_in_n",
+    "aux_next_settlement",
+    "aux_robber_target",
+)
+
+# Must match EntityGraphConfig.aux_vp_horizon. This is target provenance, not a
+# training-default switch: production shards always materialize the definition
+# the existing CAT-100 heads already advertise.
+AUX_VP_HORIZON = 8
+
+
+@dataclass(frozen=True, slots=True)
+class RustAuxState:
+    """Small, immutable CAT-100 view of a Rust engine snapshot.
+
+    Holding full ``json_snapshot`` payloads for every ply would retain the
+    board, bank, action history, and hands for an entire game in each worker.
+    Production labeling only needs three per-player facts, so compact them at
+    capture time and keep trajectory memory bounded.
+    """
+
+    colors: tuple[str, ...]
+    actual_victory_points: tuple[int, ...]
+    longest_road: tuple[bool, ...]
+    largest_army: tuple[bool, ...]
+
+    def _seat(self, color: Any) -> int:
+        name = str(color)
+        try:
+            return self.colors.index(name)
+        except ValueError as error:
+            raise KeyError(
+                f"color {name!r} is absent from Rust snapshot {self.colors!r}"
+            ) from error
+
+    def victory_points(self, color: Any) -> int:
+        return int(self.actual_victory_points[self._seat(color)])
+
+    def holds_longest_road(self, color: Any) -> bool:
+        return bool(self.longest_road[self._seat(color)])
+
+    def holds_largest_army(self, color: Any) -> bool:
+        return bool(self.largest_army[self._seat(color)])
+
+
+def rust_aux_state_from_snapshot(snapshot: Mapping[str, Any]) -> RustAuxState:
+    """Extract the CAT-100 state facts from ``catanatron_rs.json_snapshot``.
+
+    The Rust snapshot's ``colors`` and ``player_state`` arrays are aligned by
+    seat. ``has_road``/``has_army`` are the engine-adjudicated bonus holders;
+    ``actual_victory_points`` includes hidden VP cards and is safe as a target
+    (it is never copied into the public-observation model input).
+    """
+
+    colors = tuple(str(color) for color in snapshot.get("colors", ()))
+    players = tuple(snapshot.get("player_state", ()))
+    if len(colors) != len(players):
+        raise ValueError(
+            "Rust snapshot colors/player_state length mismatch: "
+            f"{len(colors)} != {len(players)}"
+        )
+    actual_vps: list[int] = []
+    longest_road: list[bool] = []
+    largest_army: list[bool] = []
+    for player in players:
+        state = player if isinstance(player, Mapping) else {}
+        actual_vps.append(
+            int(state.get("actual_victory_points", state.get("victory_points", 0)) or 0)
+        )
+        # Native catanatron_rs names are has_road/has_army. Tolerate the
+        # descriptive aliases used by Python-engine observation payloads so
+        # replay/conversion callers can reuse the adapter safely.
+        longest_road.append(
+            bool(state.get("has_road", state.get("has_longest_road", False)))
+        )
+        largest_army.append(
+            bool(state.get("has_army", state.get("has_largest_army", False)))
+        )
+    return RustAuxState(
+        colors=colors,
+        actual_victory_points=tuple(actual_vps),
+        longest_road=tuple(longest_road),
+        largest_army=tuple(largest_army),
+    )
+
+
+def rust_hex_id_by_coordinate(
+    snapshot: Mapping[str, Any],
+) -> dict[tuple[int, int, int], int]:
+    """Return the Rust board's coordinate -> entity-hex-id mapping.
+
+    ``json_snapshot['tiles']`` contains land, ports, and water. Port ids overlap
+    the 0..18 land ids, so filtering by tile type is essential; accepting every
+    numeric id would silently train robber targets against the wrong token.
+    """
+
+    result: dict[tuple[int, int, int], int] = {}
+    for entry in snapshot.get("tiles", ()):
+        if not isinstance(entry, Mapping):
+            continue
+        tile = entry.get("tile")
+        if not isinstance(tile, Mapping):
+            continue
+        tile_type = str(tile.get("type", "")).upper()
+        if tile_type != "RESOURCE_TILE" and "DESERT" not in tile_type:
+            continue
+        tile_id = tile.get("id")
+        coordinate = entry.get("coordinate")
+        if not isinstance(tile_id, int) or not 0 <= tile_id < 19:
+            continue
+        if not isinstance(coordinate, (list, tuple)) or len(coordinate) != 3:
+            continue
+        result[tuple(int(value) for value in coordinate)] = int(tile_id)
+    return result
+
+
+def rust_settlement_node_of_action(action: Any) -> Optional[int]:
+    """Decode a native Rust ``BUILD_SETTLEMENT`` action's node id."""
+
+    if not isinstance(action, (list, tuple)) or len(action) < 3:
+        return None
+    if str(action[1]) != "BUILD_SETTLEMENT":
+        return None
+    value = action[2]
+    return int(value) if isinstance(value, int) and 0 <= int(value) < 54 else None
+
+
+def rust_robber_hex_of_action(
+    action: Any,
+    hex_id_by_coordinate: Mapping[tuple[int, int, int], int],
+) -> Optional[int]:
+    """Decode a native Rust ``MOVE_ROBBER`` action to entity hex class 0..18."""
+
+    if not isinstance(action, (list, tuple)) or len(action) < 3:
+        return None
+    if str(action[1]) != "MOVE_ROBBER":
+        return None
+    value = action[2]
+    if not isinstance(value, (list, tuple)) or not value:
+        return None
+    coordinate = value[0]
+    if not isinstance(coordinate, (list, tuple)) or len(coordinate) != 3:
+        return None
+    return hex_id_by_coordinate.get(tuple(int(component) for component in coordinate))
 
 
 # --------------------------------------------------------------------------- #
@@ -109,7 +261,7 @@ def current_state_targets(
 # Forward-looking (trajectory) labels.
 # --------------------------------------------------------------------------- #
 def _horizon_index(row: int, horizon: int, last: int) -> int:
-    """Clamp ``row + horizon`` to the final decision index of the game."""
+    """Clamp ``row + horizon`` to the final observed state index."""
     return min(row + int(horizon), last)
 
 
@@ -124,6 +276,8 @@ def trajectory_targets(
     holds_largest_army_at: Callable[[Any, Any], bool],
     settlement_node_of_action: Callable[[Any], Optional[int]],
     robber_hex_of_action: Callable[[Any], Optional[int]],
+    final_state: Any | None = None,
+    trajectory_complete: bool = True,
 ) -> list[dict[str, float]]:
     """Per-decision-row aux targets for one recorded game.
 
@@ -138,8 +292,15 @@ def trajectory_targets(
     ``robber_hex_of_action`` return None for actions that are not a settlement /
     robber move.
 
-    Targets per row (all floats; -1 == ignore for the last two + vp uses a mask
-    flag alongside):
+    ``final_state`` is the observed state after ``actions[-1]``. Production
+    passes it so a terminal move's VP/road/army change is not lost merely
+    because no next decision exists. When ``trajectory_complete`` is False
+    (decision-cap truncation), rows without a fully observed horizon get NaN
+    binary/scalar labels; train_bc's finite mask then excludes them. Positive
+    settlement/robber actions already observed remain valid, while their -1
+    sentinel continues to mean "no usable categorical label".
+
+    Targets per row (all floats; -1 == ignore for the last two):
       aux_longest_road / aux_largest_army : bonus held by the row's actor at the
           horizon state (acquisition-by-horizon),
       aux_vp_in_n         : VP(actor, horizon) - VP(actor, now),
@@ -152,13 +313,30 @@ def trajectory_targets(
             "states, actor_colors, actions must be equal length: "
             f"{n}, {len(actor_colors)}, {len(actions)}"
         )
-    last = n - 1
+    state_sequence: list[Any] = list(states)
+    if final_state is not None:
+        state_sequence.append(final_state)
+    last = len(state_sequence) - 1
     rows: list[dict[str, float]] = []
     for i in range(n):
         actor = actor_colors[i]
         h_idx = _horizon_index(i, horizon, last)
-        vp_now = int(victory_points_of(states[i], actor))
-        vp_future = int(victory_points_of(states[h_idx], actor))
+        horizon_observed = i + int(horizon) <= last
+        horizon_valid = bool(trajectory_complete or horizon_observed)
+        if horizon_valid:
+            vp_now = int(victory_points_of(state_sequence[i], actor))
+            vp_future = int(victory_points_of(state_sequence[h_idx], actor))
+            longest_road = float(
+                bool(holds_longest_road_at(state_sequence[h_idx], actor))
+            )
+            largest_army = float(
+                bool(holds_largest_army_at(state_sequence[h_idx], actor))
+            )
+            vp_in_n = float(vp_future - vp_now)
+        else:
+            longest_road = float("nan")
+            largest_army = float("nan")
+            vp_in_n = float("nan")
 
         next_settlement = AUX_IGNORE_INDEX
         next_robber = AUX_IGNORE_INDEX
@@ -178,9 +356,9 @@ def trajectory_targets(
 
         rows.append(
             {
-                "aux_longest_road": float(bool(holds_longest_road_at(states[h_idx], actor))),
-                "aux_largest_army": float(bool(holds_largest_army_at(states[h_idx], actor))),
-                "aux_vp_in_n": float(vp_future - vp_now),
+                "aux_longest_road": longest_road,
+                "aux_largest_army": largest_army,
+                "aux_vp_in_n": vp_in_n,
                 "aux_next_settlement": float(next_settlement),
                 "aux_robber_target": float(next_robber),
             }

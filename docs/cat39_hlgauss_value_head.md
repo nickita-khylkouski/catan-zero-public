@@ -40,9 +40,13 @@ the f75 aux-head scaffolding, task #63, when merged).
 `outputs["value_categorical"]` is the **calibrated win-value**: the expectation
 over the win-loss bins, renormalised to drop truncation-class mass. That is the
 value the search backup should read (R9: never a blended win+margin value). The
-scalar-MSE `outputs["value"]` is left bit-identical and remains the value the
-evaluator consumes, so **the checkpoint interface stays backward-compatible** and
-switching search to the categorical readout is a separate, flag-gated step.
+scalar-MSE `outputs["value"]` is left bit-identical. Search, generation,
+reanalysis, calibration, and head-to-head evaluation select the readout
+explicitly with `value_readout={scalar,categorical}`; scalar remains the
+backward-compatible default. A categorical request fails closed unless the
+checkpoint metadata proves that the categorical head received positive training
+mass and optimizer steps. Merely adding categorical parameters to an old scalar
+checkpoint is therefore never mistaken for a trained search value.
 
 ## Distribution-space lambda blend
 
@@ -72,18 +76,26 @@ default to the OFF/current behaviour):
 `tools/train_bc.py`:
 
 - `--value-head-type {mse,hlgauss}` (default `mse`) — `mse` is the current
-  behaviour exactly. `hlgauss` trains the categorical CE **and** keeps the
-  scalar-MSE head trained in parallel as the control arm.
-- `--value-categorical-loss-weight` (default `0.0`) — explicit CE weight; in
-  `hlgauss` a `0` falls back to `--value-loss-weight`.
+  behaviour exactly. `hlgauss` makes categorical CE the **primary** value
+  objective and turns scalar MSE off, so the MSE-vs-HL-Gauss tournament changes
+  one objective without silently doubling the value-loss budget.
+- `--value-categorical-loss-weight` (default `0.0`) — categorical-primary
+  override; in `hlgauss`, `0` falls back to `--value-loss-weight`. Supplying a
+  nonzero categorical weight in `mse` mode is rejected as contradictory.
+- `--hlgauss-scalar-aux-loss-weight` (default `0.0`) — optional scalar-MSE
+  auxiliary in `hlgauss` mode. This is deliberately explicit and off for the
+  matched tournament; a nonzero value defines a separate hybrid ablation.
 - `--value-hlgauss-sigma-ratio` (default `0.75`) — `sigma / bin_width`
   (Farebrother-optimal; the CAT-39 spec says `sigma ~ bin width`).
 - `--value-target-lambda` (default `1.0`).
 
 Enable the head on an existing checkpoint with
-`f69_upgrade_checkpoint_config.py --flags catbins:33` (additive; the scalar
+`f69_upgrade_checkpoint_config.py --flags catbins:33 --seed <fixed-seed>`
+(additive and deterministic; the scalar
 `value`/`final_vp`/`q` outputs stay bit-identical, so the forward-identity
-assertion still holds).
+assertion still holds). The upgrade records the source checkpoint digest and
+construction seed, but deliberately does **not** add categorical training
+provenance; only a successful categorical-primary training run may do that.
 
 ## Recommended bins / sigma
 
@@ -91,24 +103,23 @@ assertion still holds).
 2/32 = 0.0625`) with `sigma_ratio = 0.75` (`sigma ≈ 0.047`). More bins → finer
 readout resolution at a modest logit-width cost.
 
-## Out of scope (RUN-2 campaign, not this ticket)
+## Decision probes, not a full production run
 
-The 3-epoch frozen-corpus probe and the 91M 2-epoch re-probe are the actual
-value-head tournament experiments and belong to production-scale training. The
-exact frozen-corpus smoke invocation for that campaign step:
+The local R&D plan owns the experiment contract. It deliberately separates:
 
-```
-python tools/train_bc.py \
-  --arch entity_graph \
-  --init-checkpoint <champion_upgraded_catbins33.pt> \
-  --data-format memmap --data <frozen_corpus> \
-  --epochs 3 --batch-size 4096 \
-  --value-head-type hlgauss \
-  --value-hlgauss-sigma-ratio 0.75 \
-  --value-loss-weight 0.25 \
-  --mask-hidden-info \
-  --game-level-val-split ...   # R6: game-level splits only
-```
+1. **A0 mechanism replication:** the exact historical gen2B/gen1-init scalar
+   recipe versus an otherwise matched HL-Gauss arm. This asks only whether
+   classification fixes the documented three-epoch reuse failure; it does not
+   tune a production recipe.
+2. **A1 fresh-data candidate:** game-level held-out validation, value budget
+   `0.25`, value-head LR multiplier `0.3`, and the winning readout on a fresh
+   curated window. This is the first candidate eligible for strength gates.
+3. **Conditional scale stress:** the ~87.85M model is not adopted until the 35M
+   categorical model passes A0/A1 and at least 10M fresh diverse rows exist.
 
-(Upgrade the champion first with `f69_upgrade_checkpoint_config.py --flags
-catbins:33`.)
+Both A0 arms use an explicit validation game-seed manifest and
+`--no-resume-optimizer`, so a scalar source checkpoint's optimizer sidecar
+cannot make the supposedly matched arms different. See
+`docs/plans/RL_RND_EXECUTION_PLAN_20260709.md` and
+`docs/plans/RL_ARCHITECTURE_SCALE_PROBE_20260709.md` for the exact commands,
+hashes, gates, and stop conditions.

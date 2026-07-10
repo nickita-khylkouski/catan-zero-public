@@ -103,6 +103,23 @@ def test_on_narrow_root_uses_plain_eval():
     assert abs(root.prior_value - ev.plain_value) < 1e-9
 
 
+def test_explicit_symmetry_threshold_is_independent_and_inclusive():
+    game = _opening_game()
+    width = len(game.playable_action_indices(list(COLORS), None))
+    ev = _MockEvaluator(with_symmetry=True)
+    cfg = GumbelChanceMCTSConfig(
+        colors=COLORS,
+        symmetry_averaged_eval=True,
+        # The legacy shared threshold would classify this root as narrow.
+        wide_candidates_threshold=width + 10,
+        # The decoupled explicit threshold includes equality.
+        symmetry_averaged_eval_threshold=width,
+    )
+    root = _expand_root(cfg, ev, game)
+    assert ev.calls == {"evaluate": 0, "symmetry": 1}
+    assert abs(root.prior_value - ev.avg_value) < 1e-9
+
+
 def test_missing_method_falls_back_gracefully():
     game = _opening_game()
     ev = _MockEvaluator(with_symmetry=False)  # no evaluate_symmetry_averaged

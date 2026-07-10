@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# ruff: noqa: E402 -- executable selects the adjacent checkout before imports.
 """CLI: joint c_visit x c_scale search-calibration ablation vs the production
 baseline (task: "top-ranked science experiment from three independent
 reviews").
@@ -141,6 +142,9 @@ SPECIAL_ARMS: tuple[str, ...] = (
 )
 
 _GRID_ARM_RE = re.compile(r"^cv(?P<c_visit>[0-9.]+)_cs(?P<c_scale>[0-9.]+)$")
+_GRID_D1_ARM_RE = re.compile(
+    r"^cv(?P<c_visit>[0-9.]+)_cs(?P<c_scale>[0-9.]+)\+D1$"
+)
 
 
 def _grid_arm_name(c_visit: float, c_scale: float) -> str:
@@ -157,8 +161,28 @@ def grid_arm_names() -> list[str]:
     return names
 
 
+def denoised_cscale_d1_arm_names() -> list[str]:
+    """Plan-exact post-D6 grid against the cs=.03/D1-off baseline.
+
+    The baseline itself is not an arm. ``D1`` is the existing cs=.03/D1-on
+    arm; the other four arms cross cs in {.1,.3} with D1 off/on. Invoke this
+    set with ``--arms denoise-grid --symmetry-averaged-eval``.
+    """
+    return [
+        "cv50_cs0.1",
+        "cv50_cs0.3",
+        "D1",
+        "cv50_cs0.1+D1",
+        "cv50_cs0.3+D1",
+    ]
+
+
+def d1_grid_arm_names() -> list[str]:
+    return ["cv50_cs0.1+D1", "cv50_cs0.3+D1"]
+
+
 def all_arm_names() -> list[str]:
-    return grid_arm_names() + list(SPECIAL_ARMS)
+    return grid_arm_names() + d1_grid_arm_names() + list(SPECIAL_ARMS)
 
 
 def _parse_requested_arms(spec: str) -> list[str]:
@@ -169,7 +193,56 @@ def _parse_requested_arms(spec: str) -> list[str]:
         return grid_arm_names()
     if spec == "special":
         return list(SPECIAL_ARMS)
+    if spec == "denoise-grid":
+        return denoised_cscale_d1_arm_names()
     return [a.strip() for a in spec.split(",") if a.strip()]
+
+
+def _validate_denoise_grid_invocation(args: argparse.Namespace) -> None:
+    """Fail before GPU allocation unless the binding S1 protocol is exact.
+
+    Historical exploratory defaults (300 decisions, 100 pairs, D6's legacy
+    width fallback and sigma=.79) produce useful diagnostics but cannot satisfy
+    the typed S1 adjudicator.  Keeping these checks at the runner boundary
+    prevents an hours-long experiment from becoming non-binding only after it
+    finishes.
+    """
+    if args.arms.strip() != "denoise-grid":
+        return
+    if not args.symmetry_averaged_eval:
+        raise ValueError("--arms denoise-grid requires --symmetry-averaged-eval")
+    if args.symmetry_averaged_eval_threshold != 20:
+        raise ValueError(
+            "--arms denoise-grid requires the explicit inclusive "
+            "--symmetry-averaged-eval-threshold 20"
+        )
+    exact = {
+        "pairs": 85,
+        "n_full": 64,
+        "max_depth": 80,
+        "max_decisions": 600,
+    }
+    for field, expected in exact.items():
+        actual = int(getattr(args, field))
+        if actual != expected:
+            raise ValueError(
+                f"--arms denoise-grid requires --{field.replace('_', '-')} "
+                f"{expected}, got {actual}"
+            )
+    if not args.masked:
+        raise ValueError("--arms denoise-grid requires public-observation masking")
+    if not args.lazy:
+        raise ValueError("--arms denoise-grid requires --lazy")
+    if float(args.d1_c) != 1.0:
+        raise ValueError("--arms denoise-grid requires --d1-c 1.0")
+    if float(args.d1_sigma_eval) != 0.98:
+        raise ValueError(
+            "--arms denoise-grid requires checkpoint-calibrated --d1-sigma-eval 0.98"
+        )
+    if float(args.elo0) != -10.0 or float(args.elo1) != 15.0:
+        raise ValueError(
+            "--arms denoise-grid requires the binding SPRT bounds --elo0 -10 --elo1 15"
+        )
 
 
 def _arm_slug(arm_name: str) -> str:
@@ -227,6 +300,23 @@ class ArmSpec:
 
 
 def resolve_arm(arm_name: str, args: argparse.Namespace) -> ArmSpec:
+    d1_match = _GRID_D1_ARM_RE.match(arm_name)
+    if d1_match:
+        c_visit = float(d1_match.group("c_visit"))
+        c_scale = float(d1_match.group("c_scale"))
+        return ArmSpec(
+            arm_name,
+            {
+                "c_visit": c_visit,
+                "c_scale": c_scale,
+                "rescale_noise_floor_c": float(args.d1_c),
+                "sigma_eval": float(args.d1_sigma_eval),
+            },
+            description=(
+                f"post-denoise grid cell: c_visit={c_visit:g}, c_scale={c_scale:g}, "
+                f"D1(c={args.d1_c:g}, sigma_eval={args.d1_sigma_eval:g})"
+            ),
+        )
     match = _GRID_ARM_RE.match(arm_name)
     if match:
         c_visit = float(match.group("c_visit"))
@@ -426,6 +516,7 @@ def _build_evaluator(checkpoint: str, worker_args: dict[str, Any]) -> Any:
             value_scale=float(worker_args["value_scale"]),
             prior_temperature=float(worker_args["prior_temperature"]),
             value_squash=str(worker_args.get("value_squash", "tanh")),
+            value_readout="scalar",
             public_observation=bool(worker_args.get("masked", True)),
             emit_uncertainty=bool(worker_args.get("emit_uncertainty", False)),
         ),
@@ -528,6 +619,12 @@ def _base_search_config_kwargs(args: argparse.Namespace) -> dict[str, Any]:
         c_scale=BASELINE_C_SCALE,
         max_root_candidates=16,
         max_root_candidates_wide=54,
+        symmetry_averaged_eval=bool(args.symmetry_averaged_eval),
+        symmetry_averaged_eval_threshold=(
+            None
+            if args.symmetry_averaged_eval_threshold is None
+            else int(args.symmetry_averaged_eval_threshold)
+        ),
     )
 
 
@@ -653,8 +750,28 @@ def run_one_arm(arm: ArmSpec, args: argparse.Namespace, *, seed_block: int) -> d
         "arm_mcts_cls_key": arm.mcts_cls_key,
         "checkpoint": args.checkpoint,
         "n_full": int(args.n_full),
+        "max_depth": int(args.max_depth),
+        "max_decisions": int(args.max_decisions),
         "masked": bool(args.masked),
         "lazy_interior_chance": bool(args.lazy),
+        "correct_rust_chance_spectra": True,
+        "prior_temperature": float(args.prior_temperature),
+        "value_scale": float(args.value_scale),
+        "value_squash": str(args.value_squash),
+        "value_readout": "scalar",
+        "d1_c": float(args.d1_c),
+        "d1_sigma_eval": float(args.d1_sigma_eval),
+        "gate_config": str(args.gate_config),
+        "elo0": float(args.elo0),
+        "elo1": float(args.elo1),
+        "symmetry_averaged_eval": bool(args.symmetry_averaged_eval),
+        "symmetry_averaged_eval_threshold": (
+            None
+            if args.symmetry_averaged_eval_threshold is None
+            else int(args.symmetry_averaged_eval_threshold)
+        ),
+        "baseline_search_config": baseline_kwargs,
+        "candidate_search_config": arm_kwargs,
         "wide_threshold": int(args.wide_threshold),
         "seed_block_base": int(seed_block),
         "seed_block_size": int(args.seed_block_size),
@@ -695,7 +812,8 @@ def _write_markdown_table(path: Path, ranked: list[dict[str, Any]], args: argpar
         "# Joint c_visit x c_scale search-calibration ablation",
         "",
         f"checkpoint={args.checkpoint}  n_full={args.n_full}  pairs/arm={args.pairs}  "
-        f"masked={args.masked}  lazy={args.lazy}  elo0={args.elo0}  elo1={args.elo1}  "
+        f"masked={args.masked}  lazy={args.lazy}  symmetry={args.symmetry_averaged_eval}  "
+        f"elo0={args.elo0}  elo1={args.elo1}  "
         f"baseline=(c_visit={BASELINE_C_VISIT:g}, c_scale={BASELINE_C_SCALE:g})",
         "",
         "Ranked by pentanomial mean pair score (candidate win rate estimate) vs the "
@@ -736,6 +854,15 @@ def _load_completed_arm(out_dir: Path, arm_name: str, *, pairs: int) -> dict[str
         return None
     if int(existing.get("games_played", -1)) != 2 * int(pairs):
         return None
+    if int(existing.get("complete_pairs", -1)) != int(pairs):
+        return None
+    if int(existing.get("games_truncated", 0)) != 0:
+        return None
+    if existing.get("errors") not in (None, []):
+        return None
+    pentanomial = existing.get("pentanomial_sprt")
+    if not isinstance(pentanomial, dict) or int(pentanomial.get("pairs", -1)) != int(pairs):
+        return None
     return existing
 
 
@@ -747,7 +874,8 @@ def main() -> None:
     parser.add_argument("--checkpoint", default="runs/bc/gen1_20260705/checkpoint.pt")
     parser.add_argument(
         "--arms", default="all",
-        help="comma-separated arm names, or 'all' (default) / 'grid' / 'special'. "
+        help="comma-separated arm names, or 'all' (default) / 'grid' / 'special' / "
+        "'denoise-grid' (plan-exact cs x D1 set; pair with --symmetry-averaged-eval). "
         f"Grid arms: {grid_arm_names()}. Special arms: {list(SPECIAL_ARMS)}.",
     )
     parser.add_argument("--pairs", type=int, default=100, help="paired seeds/arm; games/arm = 2x this")
@@ -766,6 +894,24 @@ def main() -> None:
     parser.add_argument("--lazy", action=argparse.BooleanOptionalAction, default=True,
                         help="GumbelChanceMCTSConfig.lazy_interior_chance, for BOTH sides "
                         "(production default per task #52).")
+    parser.add_argument(
+        "--symmetry-averaged-eval",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Apply 12-way D6 averaging at wide roots to BOTH the arm and baseline. "
+        "This is the required post-denoise calibration regime; off preserves all "
+        "pre-D6 ablation results.",
+    )
+    parser.add_argument(
+        "--symmetry-averaged-eval-threshold",
+        type=int,
+        default=None,
+        help=(
+            "Inclusive minimum legal-action width for D6 averaging. The plan-exact "
+            "post-D6 grid requires an explicit 20; None preserves the legacy "
+            ">wide-candidates-threshold fallback for non-plan historical runs."
+        ),
+    )
     parser.add_argument("--prior-temperature", type=float, default=1.0,
                         help="Evaluator prior temperature (EntityGraphRustEvaluatorConfig).")
     parser.add_argument("--value-scale", type=float, default=1.0)
@@ -815,6 +961,10 @@ def main() -> None:
     args.elo0, args.elo1 = _gate_params["elo0"], _gate_params["elo1"]
 
     requested_arms = _parse_requested_arms(args.arms)
+    try:
+        _validate_denoise_grid_invocation(args)
+    except ValueError as error:
+        parser.error(str(error))
     unknown = [name for name in requested_arms if name not in all_arm_names()]
     if unknown:
         raise SystemExit(f"unknown arm(s) {unknown!r}; choose from {all_arm_names()}")
@@ -860,12 +1010,26 @@ def main() -> None:
         "checkpoint": args.checkpoint,
         "gate_config": args.gate_config,
         "n_full": int(args.n_full),
+        "max_depth": int(args.max_depth),
+        "max_decisions": int(args.max_decisions),
         "pairs_per_arm": int(args.pairs),
         "masked": bool(args.masked),
         "lazy_interior_chance": bool(args.lazy),
+        "symmetry_averaged_eval": bool(args.symmetry_averaged_eval),
+        "symmetry_averaged_eval_threshold": (
+            None
+            if args.symmetry_averaged_eval_threshold is None
+            else int(args.symmetry_averaged_eval_threshold)
+        ),
         "wide_threshold": int(args.wide_threshold),
         "elo0": float(args.elo0),
         "elo1": float(args.elo1),
+        "prior_temperature": float(args.prior_temperature),
+        "value_scale": float(args.value_scale),
+        "value_squash": str(args.value_squash),
+        "value_readout": "scalar",
+        "d1_c": float(args.d1_c),
+        "d1_sigma_eval": float(args.d1_sigma_eval),
         "baseline": {"c_visit": BASELINE_C_VISIT, "c_scale": BASELINE_C_SCALE},
         "base_seed": int(args.base_seed),
         "seed_block_size": int(args.seed_block_size),

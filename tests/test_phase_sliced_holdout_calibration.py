@@ -7,6 +7,7 @@ reads a whole shard-dir with no held-out filtering) with
 phase_sliced_value_calibration's phase/legal-count slicing and calibration
 stats (reused directly, not duplicated).
 """
+
 from __future__ import annotations
 
 import numpy as np
@@ -88,7 +89,10 @@ class TestCollectHoldoutRowsWithSlices:
         # Fake a manifest so _iter_holdout_shards (reused from the probe
         # module) can find this one shard.
         import json
-        (tmp_path / "manifest.json").write_text(json.dumps({"shards": [str(shard_path)]}))
+
+        (tmp_path / "manifest.json").write_text(
+            json.dumps({"shards": [str(shard_path)]})
+        )
 
         groups = collect_holdout_rows_with_slices(((str(tmp_path), 1000, 1010),))
         assert len(groups) == 1
@@ -116,19 +120,31 @@ class TestCollectHoldoutRowsWithSlices:
             phase=np.array(["PLAY_TURN"] * n),
             is_forced=np.zeros(n, dtype=bool),
             legal_action_mask=legal_action_mask,
-            hex_tokens=np.zeros((n, 1)), hex_vertex_ids=np.zeros((n, 1)),
-            hex_edge_ids=np.zeros((n, 1)), vertex_tokens=np.zeros((n, 1)),
-            edge_tokens=np.zeros((n, 1)), edge_vertex_ids=np.zeros((n, 1)),
-            player_tokens=np.zeros((n, 1)), global_tokens=np.zeros((n, 1)),
-            legal_action_tokens=np.zeros((n, 1)), legal_action_target_ids=np.zeros((n, 1)),
-            event_tokens=np.zeros((n, 1)), event_target_ids=np.zeros((n, 1)),
-            hex_mask=np.zeros((n, 1)), vertex_mask=np.zeros((n, 1)),
-            edge_mask=np.zeros((n, 1)), player_mask=np.zeros((n, 1)),
-            event_mask=np.zeros((n, 1)), legal_action_ids=np.zeros((n, 2)),
+            hex_tokens=np.zeros((n, 1)),
+            hex_vertex_ids=np.zeros((n, 1)),
+            hex_edge_ids=np.zeros((n, 1)),
+            vertex_tokens=np.zeros((n, 1)),
+            edge_tokens=np.zeros((n, 1)),
+            edge_vertex_ids=np.zeros((n, 1)),
+            player_tokens=np.zeros((n, 1)),
+            global_tokens=np.zeros((n, 1)),
+            legal_action_tokens=np.zeros((n, 1)),
+            legal_action_target_ids=np.zeros((n, 1)),
+            event_tokens=np.zeros((n, 1)),
+            event_target_ids=np.zeros((n, 1)),
+            hex_mask=np.zeros((n, 1)),
+            vertex_mask=np.zeros((n, 1)),
+            edge_mask=np.zeros((n, 1)),
+            player_mask=np.zeros((n, 1)),
+            event_mask=np.zeros((n, 1)),
+            legal_action_ids=np.zeros((n, 2)),
             legal_action_context=np.zeros((n, 2, 1)),
         )
         import json
-        (tmp_path / "manifest.json").write_text(json.dumps({"shards": [str(shard_path)]}))
+
+        (tmp_path / "manifest.json").write_text(
+            json.dumps({"shards": [str(shard_path)]})
+        )
 
         # only seeds [3, 7) should survive
         groups = collect_holdout_rows_with_slices(((str(tmp_path), 3, 7),))

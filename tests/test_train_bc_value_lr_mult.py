@@ -1,26 +1,47 @@
 from __future__ import annotations
 
 import pytest
+from dataclasses import replace
 
 from tools.train_bc import (
+    ACTION_LOCAL_MODULE_ATTRS,
     VALUE_HEAD_MODULE_ATTRS,
     _apply_lr_schedule,
     _build_optimizer_param_groups,
     _make_optimizer,
+    _set_scalar_value_head_trainable,
 )
 
 
-def _make_entity_policy(hidden_size: int = 16):
+def _make_entity_policy(
+    hidden_size: int = 16,
+    *,
+    categorical_bins: int = 0,
+    action_local: bool = False,
+):
     from catan_zero.rl.entity_token_policy import EntityGraphPolicy
     from catan_zero.rl.self_play import make_env_config
 
-    return EntityGraphPolicy.create(
+    policy = EntityGraphPolicy.create(
         env_config=make_env_config(vps_to_win=3),
         hidden_size=hidden_size,
         state_layers=1,
         attention_heads=2,
         seed=0,
     )
+    if categorical_bins or action_local:
+        config = replace(
+            policy.config,
+            value_categorical_bins=int(categorical_bins),
+            action_target_gather=bool(action_local),
+            action_cross_attention_layers=2 if action_local else 0,
+        )
+        policy = EntityGraphPolicy(
+            config,
+            policy.static_action_features.detach().cpu().numpy(),
+            device="cpu",
+        )
+    return policy
 
 
 class _Args:
@@ -39,9 +60,10 @@ class _Args:
 # --------------------------------------------------------------------------- _build_optimizer_param_groups
 
 
-def test_value_head_module_attrs_covers_the_three_value_adjacent_heads() -> None:
+def test_value_head_module_attrs_covers_all_value_adjacent_heads() -> None:
     assert set(VALUE_HEAD_MODULE_ATTRS) == {
         "value_head",
+        "value_categorical_head",
         "final_vp_head",
         "value_uncertainty_head",
     }
@@ -49,7 +71,9 @@ def test_value_head_module_attrs_covers_the_three_value_adjacent_heads() -> None
 
 def test_mult_of_one_returns_a_flat_param_list_unchanged() -> None:
     policy = _make_entity_policy()
-    groups = _build_optimizer_param_groups(policy.model, base_lr=2e-4, value_lr_mult=1.0)
+    groups = _build_optimizer_param_groups(
+        policy.model, base_lr=2e-4, value_lr_mult=1.0
+    )
 
     assert isinstance(groups, list)
     assert groups and not isinstance(groups[0], dict)
@@ -58,8 +82,10 @@ def test_mult_of_one_returns_a_flat_param_list_unchanged() -> None:
 
 
 def test_mult_other_than_one_splits_value_head_params_into_their_own_group() -> None:
-    policy = _make_entity_policy()
-    groups = _build_optimizer_param_groups(policy.model, base_lr=2e-4, value_lr_mult=0.3)
+    policy = _make_entity_policy(categorical_bins=9)
+    groups = _build_optimizer_param_groups(
+        policy.model, base_lr=2e-4, value_lr_mult=0.3
+    )
 
     assert len(groups) == 2
     assert all(isinstance(group, dict) for group in groups)
@@ -89,7 +115,57 @@ def test_mult_other_than_one_splits_value_head_params_into_their_own_group() -> 
     assert base_param_ids | value_param_ids == all_trainable
 
 
-def test_mult_of_one_param_list_is_identical_order_and_identity_to_pre_cat12_construction() -> None:
+def test_categorical_primary_can_freeze_scalar_diagnostic_without_freezing_cat_head() -> (
+    None
+):
+    policy = _make_entity_policy(categorical_bins=9)
+
+    _set_scalar_value_head_trainable(policy.model, False)
+
+    assert all(not p.requires_grad for p in policy.model.value_head.parameters())
+    assert all(
+        p.requires_grad for p in policy.model.value_categorical_head.parameters()
+    )
+
+
+def test_action_local_modules_get_an_independent_lr_group() -> None:
+    policy = _make_entity_policy(categorical_bins=9, action_local=True)
+    groups = _build_optimizer_param_groups(
+        policy.model,
+        base_lr=2e-4,
+        value_lr_mult=0.3,
+        action_module_lr_mult=0.2,
+    )
+
+    assert [group["lr"] for group in groups] == pytest.approx(
+        [2e-4, 2e-4 * 0.3, 2e-4 * 0.2]
+    )
+    action_ids = {id(p) for p in groups[2]["params"]}
+    expected_action_ids = {
+        id(p)
+        for attr in ACTION_LOCAL_MODULE_ATTRS
+        for p in getattr(policy.model, attr).parameters()
+        if p.requires_grad
+    }
+    assert action_ids == expected_action_ids
+    assert action_ids.isdisjoint({id(p) for p in groups[0]["params"]})
+    assert action_ids.isdisjoint({id(p) for p in groups[1]["params"]})
+
+
+def test_action_module_lr_multiplier_fails_without_action_local_modules() -> None:
+    policy = _make_entity_policy()
+    with pytest.raises(SystemExit, match="action-module-lr-mult"):
+        _build_optimizer_param_groups(
+            policy.model,
+            base_lr=2e-4,
+            value_lr_mult=1.0,
+            action_module_lr_mult=0.3,
+        )
+
+
+def test_mult_of_one_param_list_is_identical_order_and_identity_to_pre_cat12_construction() -> (
+    None
+):
     """Bit-for-bit parity check, not just a length check: with the default
     --value-lr-mult 1.0, _build_optimizer_param_groups must return the exact same
     parameter tensors, in the exact same order, as the pre-CAT-12 construction
@@ -99,7 +175,9 @@ def test_mult_of_one_param_list_is_identical_order_and_identity_to_pre_cat12_con
     keyed by parameter identity) or silently change which group a value-head
     parameter lands in relative to the pre-patch flat list."""
     policy = _make_entity_policy()
-    groups = _build_optimizer_param_groups(policy.model, base_lr=2e-4, value_lr_mult=1.0)
+    groups = _build_optimizer_param_groups(
+        policy.model, base_lr=2e-4, value_lr_mult=1.0
+    )
     pre_cat12 = [p for p in policy.model.parameters() if p.requires_grad]
 
     assert len(groups) == len(pre_cat12)
@@ -119,7 +197,9 @@ def test_mult_other_than_one_raises_when_model_has_no_value_head_submodule() -> 
 
 def test_make_optimizer_builds_two_lr_groups_when_value_lr_mult_set() -> None:
     policy = _make_entity_policy()
-    groups = _build_optimizer_param_groups(policy.model, base_lr=2e-4, value_lr_mult=0.3)
+    groups = _build_optimizer_param_groups(
+        policy.model, base_lr=2e-4, value_lr_mult=0.3
+    )
     args = _Args(lr=2e-4)
 
     optimizer = _make_optimizer(groups, args, "cpu")
@@ -132,7 +212,9 @@ def test_make_optimizer_builds_two_lr_groups_when_value_lr_mult_set() -> None:
 
 def test_make_optimizer_single_group_when_mult_is_one() -> None:
     policy = _make_entity_policy()
-    groups = _build_optimizer_param_groups(policy.model, base_lr=2e-4, value_lr_mult=1.0)
+    groups = _build_optimizer_param_groups(
+        policy.model, base_lr=2e-4, value_lr_mult=1.0
+    )
     args = _Args(lr=2e-4)
 
     optimizer = _make_optimizer(groups, args, "cpu")
@@ -146,12 +228,19 @@ def test_make_optimizer_single_group_when_mult_is_one() -> None:
 
 def test_apply_lr_schedule_scales_each_group_by_its_own_base_lr() -> None:
     policy = _make_entity_policy()
-    groups = _build_optimizer_param_groups(policy.model, base_lr=2e-4, value_lr_mult=0.3)
+    groups = _build_optimizer_param_groups(
+        policy.model, base_lr=2e-4, value_lr_mult=0.3
+    )
     args = _Args(lr=2e-4)
     optimizer = _make_optimizer(groups, args, "cpu")
 
     multiplier = _apply_lr_schedule(
-        optimizer, base_lr=2e-4, step=3, warmup_steps=4, total_steps=100, schedule="flat"
+        optimizer,
+        base_lr=2e-4,
+        step=3,
+        warmup_steps=4,
+        total_steps=100,
+        schedule="flat",
     )
 
     assert multiplier == pytest.approx(1.0)
@@ -160,7 +249,9 @@ def test_apply_lr_schedule_scales_each_group_by_its_own_base_lr() -> None:
     assert lrs[1] == pytest.approx(2e-4 * multiplier)
 
 
-def test_default_flag_lr_trajectory_is_bit_identical_across_warmup_and_decay_to_pre_cat12_optimizer() -> None:
+def test_default_flag_lr_trajectory_is_bit_identical_across_warmup_and_decay_to_pre_cat12_optimizer() -> (
+    None
+):
     """The single most important CAT-12 regression given the prior "one LR stomped
     all param groups" bug history: with the default --value-lr-mult 1.0, build TWO
     optimizers on the SAME real (value_head/final_vp_head-bearing) model -- one via
@@ -178,7 +269,9 @@ def test_default_flag_lr_trajectory_is_bit_identical_across_warmup_and_decay_to_
     pre_cat12_params = [p for p in policy.model.parameters() if p.requires_grad]
     old_optimizer = _make_optimizer(pre_cat12_params, args, "cpu")
 
-    groups = _build_optimizer_param_groups(policy.model, base_lr=2e-4, value_lr_mult=1.0)
+    groups = _build_optimizer_param_groups(
+        policy.model, base_lr=2e-4, value_lr_mult=1.0
+    )
     new_optimizer = _make_optimizer(groups, args, "cpu")
 
     assert len(old_optimizer.param_groups) == 1
@@ -208,7 +301,9 @@ def test_default_flag_lr_trajectory_is_bit_identical_across_warmup_and_decay_to_
         assert new_lrs == pytest.approx(old_lrs)
 
 
-def test_apply_lr_schedule_still_uses_the_passed_base_lr_for_a_plain_single_group_optimizer() -> None:
+def test_apply_lr_schedule_still_uses_the_passed_base_lr_for_a_plain_single_group_optimizer() -> (
+    None
+):
     """A single-implicit-group optimizer (no "base_lr" key, e.g. every call site before
     --value-lr-mult existed, and the existing test_train_bc_lr_schedule.py suite) must
     keep using the schedule's passed ``base_lr`` -- this is the backward-compat
@@ -219,7 +314,12 @@ def test_apply_lr_schedule_still_uses_the_passed_base_lr_for_a_plain_single_grou
     optimizer = torch.optim.Adam(model.parameters(), lr=1.0)
 
     _apply_lr_schedule(
-        optimizer, base_lr=2e-4, step=0, warmup_steps=4, total_steps=100, schedule="flat"
+        optimizer,
+        base_lr=2e-4,
+        step=0,
+        warmup_steps=4,
+        total_steps=100,
+        schedule="flat",
     )
 
     for group in optimizer.param_groups:

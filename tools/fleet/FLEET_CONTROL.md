@@ -42,7 +42,7 @@ Per box: `gpus`, `busy` (>50%), `util_avg`, `mem_max`, inferred **role** (TRAINI
 / EVAL(vs-bot) / EVAL(vs-raw) / TEST(pytest) / GEN-TEACHER(nNN) / GEN-VOLUME(nNN) / idle from live cmdlines), MPS on/off, and
 matching generation/training process count.
 
-`fleet_launch_safe.sh` is retired. It points at the old runsix tree and old MPS
+The retired `fleet_launch_safe.sh` was removed. It pointed at the old runsix tree and old MPS
 recipe. Do not use it.
 
 ## Ops lesson baked in: one operator per box

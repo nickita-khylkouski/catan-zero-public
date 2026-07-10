@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import dataclasses
 from pathlib import Path
 
 import numpy as np
@@ -67,9 +66,17 @@ def _make_entity_policy():
 
 
 def test_freeze_module_groups_cover_expected_submodules() -> None:
-    assert set(ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS) == {"trunk", "action_encoder", "policy_head"}
-    assert "value_head" not in sum(ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS.values(), ())
-    assert "final_vp_head" not in sum(ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS.values(), ())
+    assert set(ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS) == {
+        "trunk",
+        "action_encoder",
+        "policy_head",
+        "value_heads",
+    }
+    assert "value_head" in ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS["value_heads"]
+    assert (
+        "value_categorical_head" in ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS["value_heads"]
+    )
+    assert "final_vp_head" in ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS["value_heads"]
 
 
 def test_set_entity_graph_modules_trainable_freezes_and_restores() -> None:
@@ -97,7 +104,7 @@ def test_set_entity_graph_modules_trainable_freezes_and_restores() -> None:
         attr = getattr(policy.model, name)
         params = attr.parameters() if hasattr(attr, "parameters") else (attr,)
         assert all(not p.requires_grad for p in params)
-    # value_head / final_vp_head must remain trainable -- never in the freezable groups.
+    # Value heads remain trainable unless their dedicated opt-in group is named.
     assert all(p.requires_grad for p in policy.model.value_head.parameters())
     assert all(p.requires_grad for p in policy.model.final_vp_head.parameters())
 
@@ -107,10 +114,59 @@ def test_set_entity_graph_modules_trainable_freezes_and_restores() -> None:
     assert all(not p.requires_grad for p in policy.model.action_encoder.parameters())
 
 
+def test_value_heads_group_freezes_scalar_categorical_and_auxiliary_readouts() -> None:
+    from dataclasses import replace
+
+    from catan_zero.rl.entity_token_policy import EntityGraphPolicy
+
+    policy = _make_entity_policy()
+    policy = EntityGraphPolicy(
+        replace(
+            policy.config,
+            value_categorical_bins=9,
+            value_uncertainty_head=True,
+            value_attention_pool=True,
+        ),
+        policy.static_action_features.detach().cpu().numpy(),
+        device="cpu",
+    )
+
+    touched = _set_entity_graph_modules_trainable(
+        policy.model, ["value_heads"], trainable=False
+    )
+
+    assert set(touched) == {
+        "value_head",
+        "value_categorical_head",
+        "final_vp_head",
+        "value_uncertainty_head",
+        "value_probe",
+        "value_probe_norm_q",
+        "value_probe_norm_kv",
+        "value_probe_attn",
+        "value_pool_head",
+    }
+    for name in touched:
+        attr = getattr(policy.model, name)
+        params = attr.parameters() if hasattr(attr, "parameters") else (attr,)
+        assert all(not parameter.requires_grad for parameter in params)
+
+    # The policy path remains trainable for an action-local warmup.
+    assert all(
+        parameter.requires_grad
+        for parameter in policy.model.action_encoder.parameters()
+    )
+    assert all(
+        parameter.requires_grad for parameter in policy.model.blocks.parameters()
+    )
+
+
 def test_set_entity_graph_modules_trainable_rejects_unknown_group() -> None:
     policy = _make_entity_policy()
     with pytest.raises(SystemExit):
-        _set_entity_graph_modules_trainable(policy.model, ["not_a_real_group"], trainable=False)
+        _set_entity_graph_modules_trainable(
+            policy.model, ["not_a_real_group"], trainable=False
+        )
 
 
 def test_value_only_smoke_frozen_params_stay_put_value_params_move() -> None:
@@ -190,13 +246,17 @@ def _collect_real_samples(n: int):
                     valid_actions=valid_actions,
                     action=int(valid_actions[0]),
                     player=player,
-                    action_context_features=build_action_context_feature_table(env, info),
+                    action_context_features=build_action_context_feature_table(
+                        env, info
+                    ),
                     entity_features=entity_features,
                     phase=_phase_from_info(info),
                     decision_index=decision_index,
                 )
             )
-            observations, _rewards, terminated, truncated, info = env.step(int(valid_actions[0]))
+            observations, _rewards, terminated, truncated, info = env.step(
+                int(valid_actions[0])
+            )
             if terminated or truncated:
                 observations, info = env.reset(seed=9 + decision_index + 1)
     finally:
@@ -215,11 +275,15 @@ def _pad_legal_action_arrays(policy, samples):
     max_legal = max(len(s.valid_actions) for s in samples)
     context_size = int(policy.context_action_feature_size)
     legal_action_ids = np.full((len(samples), max_legal), -1, dtype=np.int64)
-    legal_action_context = np.zeros((len(samples), max_legal, context_size), dtype=np.float32)
+    legal_action_context = np.zeros(
+        (len(samples), max_legal, context_size), dtype=np.float32
+    )
     for row, sample in enumerate(samples):
         n = len(sample.valid_actions)
         legal_action_ids[row, :n] = np.asarray(sample.valid_actions, dtype=np.int64)
-        ctx = np.asarray(sample.action_context_features, dtype=np.float32)[list(sample.valid_actions), :]
+        ctx = np.asarray(sample.action_context_features, dtype=np.float32)[
+            list(sample.valid_actions), :
+        ]
         legal_action_context[row, :n, : ctx.shape[1]] = ctx[:, :context_size]
     return legal_action_ids, legal_action_context
 
@@ -251,7 +315,9 @@ def _write_and_load_shard(tmp_path: Path, samples):
     return load_teacher_data(out)
 
 
-def test_policy_loss_weight_scales_the_policy_term_in_train_xdim_batch(tmp_path) -> None:
+def test_policy_loss_weight_scales_the_policy_term_in_train_xdim_batch(
+    tmp_path,
+) -> None:
     import torch
 
     samples = _collect_real_samples(6)
@@ -295,5 +361,9 @@ def test_policy_loss_weight_scales_the_policy_term_in_train_xdim_batch(tmp_path)
     # policy_loss/value_loss (the raw, UNweighted components) are always reported regardless
     # of the scalar weights -- only the combined "loss" used for backprop changes.
     assert value_only_metrics["policy_loss"] > 0.0
-    assert value_only_metrics["loss"] == pytest.approx(value_only_metrics["value_loss"], rel=1e-4)
-    assert policy_only_metrics["loss"] == pytest.approx(policy_only_metrics["policy_loss"], rel=1e-4)
+    assert value_only_metrics["loss"] == pytest.approx(
+        value_only_metrics["value_loss"], rel=1e-4
+    )
+    assert policy_only_metrics["loss"] == pytest.approx(
+        policy_only_metrics["policy_loss"], rel=1e-4
+    )

@@ -5,7 +5,7 @@ Date: 2026-06-26
 Repo path:
 
 ```text
-/Users/nickita/.superset/worktrees/start/modest-bedbug/catan-zero
+<verified-local-checkout>
 ```
 
 ## End Goal
@@ -363,7 +363,7 @@ gate ready checkpoints
 Important command:
 
 ```bash
-cd /Users/nickita/.superset/worktrees/start/modest-bedbug/catan-zero
+cd <verified-local-checkout>
 .venv/bin/python tools/reanalysis_orchestrator.py gate-ready --manifest runs/self_play/reanalysis_v1/manifest.json --promote-if-better
 ```
 
@@ -553,21 +553,21 @@ Next sequence should be:
 Poll current reanalysis manifest:
 
 ```bash
-cd /Users/nickita/.superset/worktrees/start/modest-bedbug/catan-zero
+cd <verified-local-checkout>
 .venv/bin/python tools/reanalysis_orchestrator.py poll --manifest runs/self_play/reanalysis_v1/manifest.json
 ```
 
 Pull/gate ready reanalysis checkpoints:
 
 ```bash
-cd /Users/nickita/.superset/worktrees/start/modest-bedbug/catan-zero
+cd <verified-local-checkout>
 .venv/bin/python tools/reanalysis_orchestrator.py gate-ready --manifest runs/self_play/reanalysis_v1/manifest.json --promote-if-better
 ```
 
 Generate sparse reanalysis locally for smoke:
 
 ```bash
-cd /Users/nickita/.superset/worktrees/start/modest-bedbug/catan-zero
+cd <verified-local-checkout>
 .venv/bin/python tools/generate_reanalysis.py \
   --output runs/self_play/sparse_reanalysis_smoke.jsonl \
   --seed 9001 \
@@ -582,7 +582,7 @@ cd /Users/nickita/.superset/worktrees/start/modest-bedbug/catan-zero
 Train reanalysis-only candidate:
 
 ```bash
-cd /Users/nickita/.superset/worktrees/start/modest-bedbug/catan-zero
+cd <verified-local-checkout>
 .venv/bin/python tools/train_ppo.py \
   --seed 9002 \
   --vps-to-win 3 \

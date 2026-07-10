@@ -370,6 +370,25 @@ def _summarize(args: argparse.Namespace) -> dict[str, Any]:
         if args.event_token_limit is not None
         else event_source_bytes
     )
+    legal_bytes_per_cell = {
+        "legal_ids": 8,
+        "context": 18 * 4,
+        "legal_action_tokens": 50 * 2,
+        "legal_action_mask": 1,
+    }
+    if args.include_action_targets:
+        legal_bytes_per_cell["legal_action_target_ids"] = 4 * 2
+    legal_padding_by_field = {
+        key: {
+            "allocated": allocated_legal * bytes_per_cell,
+            "useful": true_legal * bytes_per_cell,
+            "padding": (allocated_legal - true_legal) * bytes_per_cell,
+        }
+        for key, bytes_per_cell in legal_bytes_per_cell.items()
+    }
+    legal_padding_bytes = sum(
+        field["padding"] for field in legal_padding_by_field.values()
+    )
     return {
         "shape": {
             "requests": args.requests,
@@ -394,6 +413,9 @@ def _summarize(args: argparse.Namespace) -> dict[str, Any]:
             "source_event_fields": event_source_bytes,
             "transmitted_event_fields": event_transmitted_bytes,
             "event_ipc_bytes_avoided": event_source_bytes - event_transmitted_bytes,
+            "legal_padding_cells": allocated_legal - true_legal,
+            "legal_padding_bytes": legal_padding_bytes,
+            "legal_padding_by_field": legal_padding_by_field,
             "merged_output": sum(last_field_bytes.values()),
             "scatter_output_with_q": scatter_bytes,
             "merged_fields": dict(sorted(last_field_bytes.items())),

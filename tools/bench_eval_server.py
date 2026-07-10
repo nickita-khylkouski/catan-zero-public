@@ -217,6 +217,7 @@ def _run_arm(mode: str, a: dict[str, Any]) -> dict[str, Any]:
                 num_clients=workers,
                 config=EvalServerConfig(
                     max_batch_size=int(a["max_batch_size"]),
+                    max_neural_rows=a.get("max_neural_rows"),
                     max_wait_ms=float(a["max_wait_ms"]),
                     device=a["device"],
                     transport=str(a.get("transport", "mp_queue")),
@@ -225,6 +226,9 @@ def _run_arm(mode: str, a: dict[str, Any]) -> dict[str, Any]:
                     ),
                     event_token_limit=a.get("event_token_limit"),
                     matmul_precision=str(a["matmul_precision"]),
+                    experimental_autocast_dtype=a.get(
+                        "experimental_autocast_dtype"
+                    ),
                     request_collector=bool(a["request_collector"]),
                     cuda_graph=bool(a.get("cuda_graph", False)),
                     cuda_graph_batch_buckets=tuple(
@@ -236,7 +240,6 @@ def _run_arm(mode: str, a: dict[str, Any]) -> dict[str, Any]:
                     cuda_graph_warmup_iterations=int(
                         a.get("cuda_graph_warmup_iterations", 3)
                     ),
-                    benchmark_legacy_merge=bool(a.get("benchmark_legacy_merge", False)),
                 ),
                 public_observation=bool(a["public_observation"]),
                 mp_context=ctx,
@@ -255,7 +258,7 @@ def _run_arm(mode: str, a: dict[str, Any]) -> dict[str, Any]:
                     int(meta["action_size"]),
                     bool(meta["trained_with_masked_hidden_info"]),
                     bool(meta.get("needs_action_targets", True)),
-                    meta.get("client_event_token_limit"),
+                    meta.get("event_token_limit"),
                 )
 
         procs = []
@@ -331,6 +334,56 @@ def _run_arm(mode: str, a: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _parity_metrics(
+    local_res: list[tuple[dict[int, float], float]],
+    candidate_res: list[tuple[dict[int, float], float]],
+    *,
+    candidate_dtype: str,
+    matmul_precision: str,
+) -> dict[str, Any]:
+    """Summarize policy/value drift against strict-FP32 evaluator outputs."""
+    if len(local_res) != len(candidate_res):
+        raise ValueError("parity result counts differ")
+
+    prior_absdiffs: list[float] = []
+    value_absdiffs: list[float] = []
+    policy_l1: list[float] = []
+    top_action_disagreements = 0
+    for (pl, vl), (ps, vs) in zip(local_res, candidate_res):
+        if pl.keys() != ps.keys():
+            raise ValueError("parity legal-action keys differ")
+        state_diffs = [abs(pl[k] - ps[k]) for k in pl]
+        prior_absdiffs.extend(state_diffs)
+        policy_l1.append(sum(state_diffs))
+        value_absdiffs.append(abs(vl - vs))
+        if pl and max(pl, key=pl.__getitem__) != max(ps, key=ps.__getitem__):
+            top_action_disagreements += 1
+    max_prior = max(prior_absdiffs, default=0.0)
+    max_value = max(value_absdiffs, default=0.0)
+    num_states = len(local_res)
+    return {
+        "num_evals": num_states,
+        "reference_dtype": "fp32",
+        "candidate_dtype": candidate_dtype,
+        "matmul_precision": matmul_precision,
+        "max_prior_absdiff": max_prior,
+        "mean_prior_absdiff": (
+            sum(prior_absdiffs) / len(prior_absdiffs) if prior_absdiffs else 0.0
+        ),
+        "max_policy_l1": max(policy_l1, default=0.0),
+        "mean_policy_l1": sum(policy_l1) / len(policy_l1) if policy_l1 else 0.0,
+        "max_value_absdiff": max_value,
+        "mean_value_absdiff": (
+            sum(value_absdiffs) / len(value_absdiffs) if value_absdiffs else 0.0
+        ),
+        "top_action_disagreements": top_action_disagreements,
+        "top_action_disagreement_rate": (
+            top_action_disagreements / num_states if num_states else 0.0
+        ),
+        "within_1e-5": bool(max_prior < 1e-5 and max_value < 1e-5),
+    }
+
+
 def _parity(a: dict[str, Any]) -> dict[str, Any]:
     import torch
 
@@ -366,6 +419,7 @@ def _parity(a: dict[str, Any]) -> dict[str, Any]:
         num_clients=1,
         config=EvalServerConfig(
             max_batch_size=int(a["max_batch_size"]),
+            max_neural_rows=a.get("max_neural_rows"),
             max_wait_ms=0.0,
             device=a["device"],
             transport=str(a.get("transport", "mp_queue")),
@@ -374,6 +428,7 @@ def _parity(a: dict[str, Any]) -> dict[str, Any]:
             ),
             event_token_limit=a.get("event_token_limit"),
             matmul_precision=str(a["matmul_precision"]),
+            experimental_autocast_dtype=a.get("experimental_autocast_dtype"),
             request_collector=bool(a["request_collector"]),
             cuda_graph=bool(a.get("cuda_graph", False)),
             cuda_graph_batch_buckets=tuple(
@@ -382,10 +437,7 @@ def _parity(a: dict[str, Any]) -> dict[str, Any]:
                     (8, 16, 24, 32, 40, 48, 64, 80, 96, 128, 160, 192),
                 )
             ),
-            cuda_graph_warmup_iterations=int(
-                a.get("cuda_graph_warmup_iterations", 3)
-            ),
-            benchmark_legacy_merge=bool(a.get("benchmark_legacy_merge", False)),
+            cuda_graph_warmup_iterations=int(a.get("cuda_graph_warmup_iterations", 3)),
         ),
         public_observation=bool(a["public_observation"]),
         mp_context=ctx,
@@ -405,7 +457,7 @@ def _parity(a: dict[str, Any]) -> dict[str, Any]:
                 meta["trained_with_masked_hidden_info"]
             ),
             needs_action_targets=bool(meta.get("needs_action_targets", True)),
-            event_token_limit=meta.get("client_event_token_limit"),
+            event_token_limit=meta.get("event_token_limit"),
             config=cfg,
         )
         srv_res = [
@@ -415,19 +467,12 @@ def _parity(a: dict[str, Any]) -> dict[str, Any]:
     finally:
         server.stop()
 
-    max_prior = 0.0
-    max_value = 0.0
-    for (pl, vl), (ps, vs) in zip(local_res, srv_res):
-        assert pl.keys() == ps.keys()
-        for k in pl:
-            max_prior = max(max_prior, abs(pl[k] - ps[k]))
-        max_value = max(max_value, abs(vl - vs))
-    return {
-        "num_evals": len(states),
-        "max_prior_absdiff": max_prior,
-        "max_value_absdiff": max_value,
-        "within_1e-5": bool(max_prior < 1e-5 and max_value < 1e-5),
-    }
+    return _parity_metrics(
+        local_res,
+        srv_res,
+        candidate_dtype=a.get("experimental_autocast_dtype") or "fp32",
+        matmul_precision=str(a["matmul_precision"]),
+    )
 
 
 def main() -> None:
@@ -451,9 +496,24 @@ def main() -> None:
     ap.add_argument("--root-wave-batching", action="store_true")
     ap.add_argument("--correct-rust-chance-spectra", action="store_true")
     ap.add_argument("--max-batch-size", type=int, default=64)
+    ap.add_argument(
+        "--max-neural-rows",
+        type=int,
+        default=None,
+        help="Optional hard cap on actual rows in one policy forward.",
+    )
     ap.add_argument("--max-wait-ms", type=float, default=0.0)
     ap.add_argument(
         "--matmul-precision", choices=("highest", "high", "medium"), default="highest"
+    )
+    ap.add_argument(
+        "--experimental-autocast-dtype",
+        choices=("bf16", "fp16"),
+        default=None,
+        help=(
+            "Benchmark-only CUDA autocast. Production stays strict FP32; use "
+            "--parity to quantify output drift before any strength experiment."
+        ),
     )
     ap.add_argument(
         "--request-collector", action=argparse.BooleanOptionalAction, default=False
@@ -474,7 +534,6 @@ def main() -> None:
     )
     ap.add_argument("--cuda-graph-warmup-iterations", type=int, default=3)
     ap.add_argument("--client-timeout-ms", type=float, default=20000.0)
-    ap.add_argument("--benchmark-legacy-merge", action="store_true")
     ap.add_argument("--parity", action="store_true")
     ap.add_argument("--num-evals", type=int, default=128)
     ap.add_argument("--seed", type=int, default=7)

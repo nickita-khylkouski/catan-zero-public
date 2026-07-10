@@ -70,7 +70,7 @@ The narrative document is excellent as a research diary but has drifted from the
 
 ### 3.3 Robustness / provenance
 - **`report.json` still omits** `args.data` (which corpus trained this checkpoint), `truncated_vp_margin_value_weight` (was the proxy active), `validation_game_seed_ranges` (true-holdout vs random split). These are the three sharpest remaining provenance gaps. Cheap to add. ✓ VERIFIED
-- **Host-reimage bomb:** `tools/gumbel_search_cross_net_h2h.py` — the masked H2H tool that **decides every promotion** — is **untracked in git, zero history** (plus a stray `.bak.1783308135`). `tools/train_bc.py` and `tools/build_memmap_corpus.py` carry **uncommitted local diffs containing the very fixes the doc says landed** (`--max-steps`, dup-seed detector, arch-gating fix) — content confirmed correct, but **none is in git**. Also untracked: `build_synthetic_manifest.py`, `gumbel_search_vs_bot_h2h.py`, `launch_value_repair_v2_train.sh`. **If any host is lost, the promotion gate and the audited fixes vanish.** ✓ VERIFIED
+- **Historical host-reimage bomb (closed):** the masked H2H, trainer, corpus, and bot-evaluation fixes are now tracked canonically; the completed hard-coded value-repair launcher was removed. ✓ CLOSED
 - **Dead-code trap:** `src/catan_zero/rl/promotion_gate.py` (32 lines, its own unrelated `decide_promotion()`, zero importers) can misdirect a reader away from the real gate in `promotion_gate_runner.py:404`. `rust_mcts.py`'s standalone PUCT engine and the `reanalysis*.py` family are pre-pivot legacy (frozen at `7d08869`), not on the live path. ? INFERRED (grep-level) — grep before pruning.
 
 ---
