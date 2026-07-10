@@ -96,6 +96,9 @@ exclusive read-only receipt, it acquires each selected GPU's nonblocking
 `flock` lease, checks the GPU while that lease is held, and transfers the open
 lease descriptors into the detached process and heartbeat. The lease lives for
 the complete job, closing the zero-memory CUDA warmup race between two plans.
+After obtaining the allocation lock, the transaction also rechecks the exact
+deployed Git commit and literal GPU topology; the earlier outer preflight is
+never treated as authority across lock wait time.
 Status trusts neither marker files nor `kill -0`: it replays the exact
 receipt and validates PID=SID=PGID, non-zombie state, `/proc/PID/cmdline` hash,
 and the PID-bound fresh heartbeat.

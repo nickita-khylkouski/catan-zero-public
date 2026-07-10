@@ -488,6 +488,18 @@ def _launch_command(
             "set -euo pipefail",
             'lock_root="/run/user/$(id -u)/catan-zero-gpu-fleet"',
             'install -d -m 0700 "$lock_root"',
+            # The outer read is useful for fast failure, but it is not the
+            # transactional authority: deployment/topology can change while
+            # this process waits for another allocator. Re-read both only
+            # after this job owns the per-host allocation lock.
+            _host_preflight(
+                manifest,
+                plan,
+                {
+                    "gpu_count": row["host_gpu_count"],
+                    "accelerator": EXPECTED_ACCELERATOR,
+                },
+            ),
             f"mkdir -p {shlex.quote(job_dir)}",
             _validated_live_function(job_dir, receipt["cmdline_sha256"]),
             f"if [ -e {receipt_path} ] || [ -L {receipt_path} ]; then",

@@ -2,8 +2,10 @@ import json
 import os
 from pathlib import Path
 import shutil
+import shlex
 import subprocess
 import sys
+import time
 
 import pytest
 
@@ -166,6 +168,10 @@ def test_submit_is_dry_run_and_shell_quotes_argv(tmp_path):
     assert "flock --exclusive --close" in command
     assert 'exec {lease_fd}>"$lock_root/gpu-0.lock"' in command
     assert command.index("gpu-0.lock") < command.index("memory.used")
+    assert command.index("allocation.lock") < command.index("git -C")
+    assert command.index("git -C") < command.index("receipt.json")
+    assert "grep -Fxc" in command
+    assert fleet.EXPECTED_ACCELERATOR in command
 
 
 def test_gpu_lease_is_exclusive_across_concurrent_processes(tmp_path):
@@ -182,6 +188,101 @@ def test_gpu_lease_is_exclusive_across_concurrent_processes(tmp_path):
     finally:
         holder.wait(timeout=2)
     assert subprocess.run(["flock", "--nonblock", str(lease), "true"]).returncode == 0
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="rendered fleet launch is Linux")
+def test_two_rendered_controller_plans_cannot_share_one_gpu(tmp_path):
+    """Run two rendered transactions; zero GPU memory makes the lease decisive."""
+    remote_repo = tmp_path / "remote-repo"
+    launcher = remote_repo / "tools/fleet/launch_detached.sh"
+    launcher.parent.mkdir(parents=True)
+    source_launcher = (
+        Path(__file__).resolve().parents[1] / "tools/fleet/launch_detached.sh"
+    )
+    shutil.copy2(source_launcher, launcher)
+    launcher.chmod(0o755)
+    subprocess.run(["git", "init", "-q", str(remote_repo)], check=True)
+    subprocess.run(
+        ["git", "-C", str(remote_repo), "config", "user.email", "test@example.invalid"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(remote_repo), "config", "user.name", "Fleet Test"],
+        check=True,
+    )
+    subprocess.run(["git", "-C", str(remote_repo), "add", "."], check=True)
+    subprocess.run(
+        ["git", "-C", str(remote_repo), "commit", "-qm", "fixture"], check=True
+    )
+    commit = subprocess.check_output(
+        ["git", "-C", str(remote_repo), "rev-parse", "HEAD"], text=True
+    ).strip()
+
+    fake_nvidia = tmp_path / "nvidia-smi"
+    fake_nvidia.write_text(
+        """#!/usr/bin/env bash
+case "$*" in
+  *--query-compute-apps=*) exit 0 ;;
+  *--query-gpu=index*) printf '0\\n1\\n2\\n3\\n' ;;
+  *--query-gpu=name*) printf 'NVIDIA H100 80GB HBM3\\n%.0s' {1..4} ;;
+  *--query-gpu=uuid*) gpu=0; while [ "$#" -gt 0 ]; do [ "$1" = -i ] && { gpu="$2"; break; }; shift; done; printf 'GPU-%s\\n' "$gpu" ;;
+  *--query-gpu=memory.used*) printf '0\\n' ;;
+  *) exit 2 ;;
+esac
+"""
+    )
+    fake_nvidia.chmod(0o755)
+
+    manifest = _manifest(tmp_path)
+    manifest["remote_repo"] = str(remote_repo)
+    manifest["remote_root"] = str(tmp_path / "runs")
+    for host in manifest["hosts"]:
+        host["repo_commit"] = commit
+
+    def rendered(run_id, job_id, argv):
+        jobs = _jobset(
+            tmp_path,
+            [{"job_id": job_id, "host": "c1", "gpus": 1, "argv": argv}],
+        )
+        jobs["run_id"] = run_id
+        plan = fleet.build_plan(manifest, jobs, repo_commit=commit)
+        row = plan["assignments"][0]
+        command = fleet._launch_command(manifest, plan, row).replace(
+            "nvidia-smi", shlex.quote(str(fake_nvidia))
+        )
+        return row, command
+
+    row_a, command_a = rendered("rendered-a", "hold", ["sleep", "3"])
+    row_b, command_b = rendered("rendered-b", "collide", ["sleep", "1"])
+    first = subprocess.run(
+        ["bash", "-c", command_a], text=True, capture_output=True, timeout=5
+    )
+    assert first.returncode == 0, first.stderr
+    assert Path(row_a["job_dir"], "receipt.json").is_file()
+
+    collision = subprocess.run(
+        ["bash", "-c", command_b], text=True, capture_output=True, timeout=5
+    )
+    assert collision.returncode != 0
+    assert "gpu-lease-busy" in collision.stderr
+    assert not Path(row_b["job_dir"], "receipt.json").exists()
+
+    deadline = time.monotonic() + 10
+    while not Path(row_a["job_dir"], ".done").exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert Path(row_a["job_dir"], ".done").exists()
+
+    # The heartbeat can retain its inherited lease for one 5-second cadence.
+    retry = None
+    while time.monotonic() < deadline:
+        retry = subprocess.run(
+            ["bash", "-c", command_b], text=True, capture_output=True, timeout=5
+        )
+        if retry.returncode == 0:
+            break
+        time.sleep(0.1)
+    assert retry is not None and retry.returncode == 0, retry.stderr
+    assert Path(row_b["job_dir"], "receipt.json").is_file()
 
 
 def test_adversarial_argv_and_env_are_executed_as_literal_data(tmp_path):
