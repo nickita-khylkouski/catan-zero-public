@@ -26,6 +26,7 @@ from tools.rnd_topology_holdout_export import (
     RUN_SCHEMA,
     _DYNAMIC_TRAIN_CONFIG_FIELDS,
     _EXECUTING_LEARNER_SOURCE_FILES,
+    _resolve_report_repo_path,
     _validate_experiment_self_hash,
     export_holdout_evidence,
 )
@@ -514,6 +515,35 @@ def _export(paths: dict, **overrides) -> int:
         **overrides,
     }
     return export_holdout_evidence(**arguments)
+
+
+def test_nested_report_relative_artifact_path_resolves_from_trainer_repo_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "trainer-repo"
+    nested_report = repo / "runs" / "reports" / "nested" / "report.json"
+    checkpoint = repo / "runs" / "arm-1" / "checkpoint.pt"
+    nested_report.parent.mkdir(parents=True)
+    checkpoint.parent.mkdir(parents=True)
+    nested_report.write_text("{}")
+    checkpoint.write_bytes(b"checkpoint")
+    monkeypatch.setattr(holdout_exporter, "_ROOT", repo)
+
+    resolved = _resolve_report_repo_path(
+        "runs/arm-1/checkpoint.pt", label="checkpoint"
+    )
+    assert resolved == checkpoint.resolve()
+    assert resolved != (nested_report.parent / "runs/arm-1/checkpoint.pt").resolve()
+
+
+def test_report_relative_artifact_path_rejects_parent_traversal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "trainer-repo"
+    repo.mkdir()
+    monkeypatch.setattr(holdout_exporter, "_ROOT", repo)
+    with pytest.raises(ExportError, match="contains traversal"):
+        _resolve_report_repo_path("../outside/checkpoint.pt", label="checkpoint")
 
 
 def test_real_preregistration_self_hash_and_recipe_fields_are_valid() -> None:

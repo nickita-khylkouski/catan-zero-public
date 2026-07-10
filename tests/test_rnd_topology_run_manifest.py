@@ -67,6 +67,7 @@ def _fixture(tmp_path: Path) -> dict[str, object]:
         "checkpoint": checkpoint,
         "optimizer_sidecar": sidecar,
         "output": tmp_path / "run.json",
+        "repo_root": tmp_path,
     }
 
 
@@ -160,3 +161,46 @@ def test_rejects_invalid_experiment_self_hash(tmp_path: Path) -> None:
     _write(inputs["experiment_config"], experiment)
     with pytest.raises(ManifestError, match="self-hash is invalid"):
         build_run_manifest(**inputs)
+
+
+def test_report_paths_resolve_from_repo_root_not_nested_report_dir(tmp_path: Path) -> None:
+    inputs = _fixture(tmp_path)
+    run_dir = tmp_path / "runs" / "candidate"
+    report_dir = run_dir / "reports" / "nested"
+    report_dir.mkdir(parents=True)
+    checkpoint = run_dir / "checkpoint.pt"
+    checkpoint.write_bytes(b"real-layout checkpoint")
+    sidecar = Path(str(checkpoint) + ".optimizer.pt")
+    sidecar.write_bytes(b"real-layout optimizer")
+    report = _write(
+        report_dir / "report.json",
+        {
+            "seed": 1,
+            "checkpoint": "runs/candidate/checkpoint.pt",
+            "checkpoint_sha256": "sha256:" + _sha(checkpoint),
+            "optimizer_sidecar": "runs/candidate/checkpoint.pt.optimizer.pt",
+            "optimizer_sidecar_sha256": "sha256:" + _sha(sidecar),
+        },
+    )
+    inputs.update(
+        training_report=report,
+        checkpoint=checkpoint,
+        optimizer_sidecar=sidecar,
+    )
+
+    result = build_run_manifest(**inputs)
+
+    assert result["checkpoint"]["path"] == str(checkpoint.resolve())
+    assert result["optimizer_sidecar"]["path"] == str(sidecar.resolve())
+
+
+@pytest.mark.parametrize("field", ["checkpoint", "optimizer_sidecar"])
+def test_rejects_report_path_that_escapes_repo_root(tmp_path: Path, field: str) -> None:
+    inputs = _fixture(tmp_path)
+    report = json.loads(inputs["training_report"].read_text())
+    report[field] = "../outside.pt"
+    _write(inputs["training_report"], report)
+
+    with pytest.raises(ManifestError, match=rf"{field} path escapes"):
+        build_run_manifest(**inputs)
+    assert not inputs["output"].exists()

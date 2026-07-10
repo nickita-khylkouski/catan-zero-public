@@ -19,6 +19,7 @@ from typing import Any, Mapping
 
 
 RUN_SCHEMA = "catan-zero-topology-run/v1"
+_ROOT = Path(__file__).resolve().parents[1]
 
 
 class ManifestError(ValueError):
@@ -62,11 +63,14 @@ def _load_object(path: Path, *, name: str) -> dict[str, Any]:
     return value
 
 
-def _report_path(value: Any, *, report: Path, field: str) -> Path:
+def _report_path(value: Any, *, repo_root: Path, field: str) -> Path:
     if not isinstance(value, str) or not value:
         raise ManifestError(f"training report {field} must be a non-empty path")
     path = Path(value).expanduser()
-    return (report.parent / path).resolve() if not path.is_absolute() else path.resolve()
+    resolved = (repo_root / path).resolve() if not path.is_absolute() else path.resolve()
+    if not resolved.is_relative_to(repo_root):
+        raise ManifestError(f"training report {field} path escapes the repository root")
+    return resolved
 
 
 def _prefixed_sha(value: Any, *, field: str) -> str:
@@ -161,6 +165,7 @@ def build_run_manifest(
     checkpoint: Path,
     optimizer_sidecar: Path,
     output: Path,
+    repo_root: Path | None = None,
 ) -> dict[str, Any]:
     """Validate, bind, and exclusively publish one topology-run manifest."""
 
@@ -171,6 +176,9 @@ def build_run_manifest(
     if output.expanduser().resolve().exists():
         raise ManifestError(f"refusing to overwrite {output.expanduser().resolve()}")
 
+    repo_root = (repo_root or _ROOT).expanduser().resolve()
+    if not repo_root.is_dir():
+        raise ManifestError(f"repository root is not a directory: {repo_root}")
     training_manifest = _existing_file(training_manifest, name="training manifest")
     training_report = _existing_file(training_report, name="training report")
     experiment_config = _existing_file(experiment_config, name="experiment config")
@@ -190,7 +198,9 @@ def build_run_manifest(
     report = _load_object(training_report, name="training report")
     if report.get("seed") != training_seed:
         raise ManifestError("training report seed differs from the requested registered seed")
-    if _report_path(report.get("checkpoint"), report=training_report, field="checkpoint") != checkpoint:
+    if _report_path(
+        report.get("checkpoint"), repo_root=repo_root, field="checkpoint"
+    ) != checkpoint:
         raise ManifestError("training report checkpoint path differs from the requested checkpoint")
     checkpoint_sha = _sha256_file(checkpoint)
     if _prefixed_sha(report.get("checkpoint_sha256"), field="training report checkpoint_sha256") != checkpoint_sha:
@@ -199,7 +209,11 @@ def build_run_manifest(
     canonical_sidecar = Path(str(checkpoint) + ".optimizer.pt").resolve()
     if optimizer_sidecar != canonical_sidecar:
         raise ManifestError("optimizer sidecar is not the checkpoint's canonical sidecar")
-    if _report_path(report.get("optimizer_sidecar"), report=training_report, field="optimizer_sidecar") != optimizer_sidecar:
+    if _report_path(
+        report.get("optimizer_sidecar"),
+        repo_root=repo_root,
+        field="optimizer_sidecar",
+    ) != optimizer_sidecar:
         raise ManifestError("training report optimizer-sidecar path differs from the requested sidecar")
     sidecar_sha = _sha256_file(optimizer_sidecar)
     if _prefixed_sha(

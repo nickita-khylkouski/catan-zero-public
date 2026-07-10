@@ -409,6 +409,24 @@ def _artifact_reference(run: Mapping[str, Any], name: str) -> tuple[Path, str]:
     return path, expected
 
 
+def _resolve_report_repo_path(value: Any, *, label: str) -> Path:
+    if not isinstance(value, str) or not value:
+        raise ExportError(f"train_bc report {label} path must be a non-empty string")
+    path = Path(value).expanduser()
+    if path.is_absolute():
+        return path.resolve()
+    if ".." in path.parts:
+        raise ExportError(f"train_bc report {label} relative path contains traversal")
+    resolved = (_ROOT / path).resolve()
+    try:
+        resolved.relative_to(_ROOT.resolve())
+    except ValueError as exc:
+        raise ExportError(
+            f"train_bc report {label} relative path escapes repository root"
+        ) from exc
+    return resolved
+
+
 def _validate_executing_learner_sources(
     report: Mapping[str, Any], experiment_config: Mapping[str, Any]
 ) -> None:
@@ -575,11 +593,9 @@ def _validate_training_report(
     checkpoint_ref, checkpoint_sha = _artifact_reference(run, "checkpoint")
     if checkpoint_ref != checkpoint.expanduser().resolve():
         raise ExportError("run manifest checkpoint path differs from evaluated checkpoint")
-    report_checkpoint = Path(str(report.get("checkpoint", ""))).expanduser()
-    if not report_checkpoint.is_absolute():
-        report_checkpoint = (report_path.parent / report_checkpoint).resolve()
-    else:
-        report_checkpoint = report_checkpoint.resolve()
+    report_checkpoint = _resolve_report_repo_path(
+        report.get("checkpoint"), label="checkpoint"
+    )
     if report_checkpoint != checkpoint_ref:
         raise ExportError("train_bc report checkpoint path differs from evaluated checkpoint")
     sidecar_path, sidecar_sha = _artifact_reference(run, "optimizer_sidecar")
@@ -706,9 +722,9 @@ def _validate_training_report(
         raise ExportError("train_bc report checkpoint SHA differs from evaluated checkpoint")
     if report.get("optimizer_sidecar_sha256") != "sha256:" + sidecar_sha:
         raise ExportError("train_bc report optimizer-sidecar SHA mismatch")
-    report_sidecar = Path(str(report.get("optimizer_sidecar", ""))).expanduser()
-    if not report_sidecar.is_absolute():
-        report_sidecar = (report_path.parent / report_sidecar).resolve()
+    report_sidecar = _resolve_report_repo_path(
+        report.get("optimizer_sidecar"), label="optimizer_sidecar"
+    )
     if report_sidecar.resolve() != sidecar_path:
         raise ExportError("train_bc report optimizer-sidecar path mismatch")
 
