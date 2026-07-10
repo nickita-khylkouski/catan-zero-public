@@ -76,8 +76,34 @@ table is not a teacher/volume role split.
   homogeneous **INTEL Xeon**; `NOOP_ATOL=1e-4` is only the safety net for a
   future non-Intel box.
 
+### Canonical two-commit wheel release
+
+The native wheel and its checksum inventory are published as a two-commit
+transaction. Do not edit a tag, build from an arbitrary checkout path, or fold
+the checksum update into the source commit.
+
+1. Create clean **commit A** containing every release source, builder, test, and
+   documentation change. Run `tools/build_catanatron_rs_wheel.sh` twice from
+   independent clean build state. The builder stages commit A at its sealed
+   canonical path and emits both the wheel and
+   `catanatron_rs-0.1.4-build-receipt.json`. Require byte-identical wheel
+   SHA-256 values and matching sealed toolchain/environment provenance.
+2. Create **commit B** by changing only
+   `native/catanatron-rs/WHEEL_SHA256SUMS` to the verified wheel filename and
+   SHA-256. Verify `git diff --name-only A..B` prints exactly that one path.
+3. Rebuild clean commit B twice. The builder deliberately excludes the checksum
+   inventory from native build inputs, so both wheels must reproduce commit A's
+   exact SHA-256. Receipts must identify commit/tree B while retaining the same
+   builder, lockfile, toolchain, environment, wheel filename, and wheel digest.
+4. Create one new immutable release tag at commit B. Attach the exact verified
+   commit-B wheel and build receipt; never move the tag. Confirm the release
+   asset digest equals B's tracked inventory before provisioning any node.
+
+Any byte mismatch aborts the release. Diagnose it on the build host; never
+paper over it by updating the inventory to whichever build ran last.
+
 ## 4. Rust engine (CAT-133)
-- `native/catanatron-rs` v0.1.4 is now the canonical wheel source and builds `catanatron_rs-0.1.4-cp311-…manylinux_2_34`; `native/gumbel_mcts_rs` is its linked native-search dependency. `native/catanatron-rs/WHEEL_SHA256SUMS` seals the exact release asset and the installer rejects any byte mismatch. Fleet deployment must be uniform 0.1.4 before information-set generation.
+- `native/catanatron-rs` v0.1.4 is now the canonical wheel source and builds `catanatron_rs-0.1.4-cp311-…manylinux_2_34`; `native/gumbel_mcts_rs` is its linked native-search dependency. `native/catanatron-rs/WHEEL_SHA256SUMS` seals the exact release asset and the installer rejects any byte mismatch. The build receipt seals the source commit/tree, builder and lockfiles, exact toolchain/environment, and wheel digest. Fleet deployment must be uniform 0.1.4 before information-set generation.
 - **Licensing posture: pending user decision — see CAT-138.**
 
 ## 5. Seed ledger (CAT-125)
@@ -97,6 +123,14 @@ Interpreter is auto-resolved (`$GEN_PY` → `~/venv/bin/python` → `<tree>/.ven
   default; `--go` is the only execution boundary. The executor runs one
   category at a time per GPU under a detached resumable lane supervisor. Do
   not substitute the generic role launcher for A1.
+- **A1 live canary:** before production claims or a 40-lane launch, use
+  `tools/fleet/a1_live_canary.py` against the sealed lock/render and private
+  host manifest. It selects exactly `c1` GPU0-3 plus `h100-8a` GPU0-7, derives
+  36 validation-only jobs with the identical recipe, and writes only a private
+  ledger/quarantined outputs under `/home/ubuntu/gen_out`. `run` is a dry run;
+  inspect it before `run --go`, then require `status` and `audit` to pass.
+  Never execute rendered argv manually and never merge canary rows or its
+  ledger into production.
 - **A1 runtime:** one generator per physical GPU, 16 workers/GPU,
   systemd-managed MPS, EvalServer off, strict FP32, public-observation masking,
   `n_full=128`, `n_fast=16`, `p_full=0.25`, `c_scale=0.03`, D1 rescaling off,

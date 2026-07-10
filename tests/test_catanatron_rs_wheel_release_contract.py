@@ -1,0 +1,133 @@
+"""Release-contract tests for the sealed ``catanatron_rs`` wheel builder.
+
+These tests deliberately inspect the small shell entry point rather than build
+the Rust extension.  A native release build is a B200 acceptance test; CI's job
+is to prevent changes that silently weaken the inputs to that build.
+"""
+
+from __future__ import annotations
+
+import re
+import subprocess
+from pathlib import Path
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+BUILDER = REPO_ROOT / "tools" / "build_catanatron_rs_wheel.sh"
+CHECKSUM_INVENTORY = "native/catanatron-rs/WHEEL_SHA256SUMS"
+RECEIPT_NAME = "catanatron_rs-0.1.4-build-receipt.json"
+RECEIPT_SCHEMA = "catanatron-rs-wheel-build-receipt-v1"
+
+
+def _script() -> str:
+    return BUILDER.read_text()
+
+
+def _flat_script() -> str:
+    """Collapse shell line continuations/whitespace for command assertions."""
+
+    return " ".join(_script().replace("\\\n", " ").split())
+
+
+def test_builder_is_valid_bash_and_stages_the_committed_tree_at_one_root() -> None:
+    subprocess.run(["bash", "-n", str(BUILDER)], check=True)
+    script = _script()
+
+    assert "/tmp/catan-zero-catanatron-rs-wheel-src" in script
+    assert re.search(r"git\s+-C\s+.*\sarchive\s+", _flat_script())
+    assert "CATAN_RS_BUILD_STAGED" in script
+    assert "CATAN_RS_SOURCE_COMMIT" in script
+    assert "canonical_build_root" in script
+
+
+def test_builder_guards_the_recursive_delete_root_before_staging() -> None:
+    script = _script()
+    rm_offset = script.index('rm -rf "$CANONICAL_BUILD_ROOT"')
+    prefix = script[:rm_offset]
+
+    # The guard must be an explicit release contract, not reliance on rm's
+    # implementation-specific protection for '/'.  It also protects the
+    # checkout and an empty/unresolved path from a bad environment override.
+    assert '"$CANONICAL_BUILD_ROOT" = "$SEALED_CANONICAL_BUILD_ROOT"' in prefix
+    assert '"$CANONICAL_BUILD_ROOT" != "$SOURCE_ROOT"' in prefix
+    assert '"$CANONICAL_BUILD_ROOT" != "$OUT_DIR"' in prefix
+    assert "must be an absolute, dedicated" in prefix
+
+
+def test_checksum_inventory_is_not_an_input_to_the_wheel() -> None:
+    script = _script()
+    staged_call = script.index(
+        '"$CANONICAL_BUILD_ROOT/tools/build_catanatron_rs_wheel.sh"'
+    )
+    prefix = script[:staged_call]
+
+    # The checksum belongs to commit B of the release transaction.  Including
+    # it in commit A's staged source makes the digest inventory affect the
+    # binary it is meant to describe, creating a circular/non-reproducible
+    # release input.
+    assert CHECKSUM_INVENTORY in prefix
+    assert re.search(r"(?:rm\s+-f|--exclude(?:=|\s+))[^\n]*WHEEL_SHA256SUMS", prefix)
+    assert "checksum_inventory_excluded" in script
+
+
+def test_builder_rejects_dirty_tracked_or_staged_changes() -> None:
+    script = _flat_script()
+
+    assert re.search(r"git -C .* diff --quiet --exit-code", script)
+    assert re.search(r"git -C .* diff --cached --quiet --exit-code", script)
+    assert "refusing to build a release wheel from a dirty tracked tree" in script
+
+
+def test_all_cargo_resolution_is_locked() -> None:
+    script = _flat_script()
+
+    assert "cargo test --locked" in script
+    assert "maturin build --locked" in script
+    assert "native/catanatron-rs/Cargo.lock" in _script()
+    assert "native/catanatron-rs/python/Cargo.lock" in _script()
+
+
+def test_release_environment_and_toolchain_are_sealed() -> None:
+    script = _script()
+
+    assert "env -i" in script
+    assert "1783641600" in script
+    assert "--remap-path-prefix=" in script
+    assert "-C link-arg=-Wl,--build-id=none" in script
+    assert re.search(r"CARGO_BUILD_JOBS=(?:['\"]?1['\"]?)", script)
+
+    # These are exact release inputs.  Merely printing whatever happens to be
+    # installed is insufficient: a mismatched tool must fail before building.
+    for version in (
+        "rustc 1.96.1 (31fca3adb 2026-06-26)",
+        "cargo 1.96.1 (356927216 2026-06-26)",
+        "maturin 1.14.1",
+        "Python 3.11.15",
+    ):
+        assert version in script
+
+
+def test_builder_emits_a_complete_machine_readable_receipt() -> None:
+    script = _script()
+
+    assert RECEIPT_NAME in script
+    assert RECEIPT_SCHEMA in script
+    for key in (
+        "source_commit",
+        "source_tree",
+        "builder_sha256",
+        "cargo_lock_sha256",
+        "python_cargo_lock_sha256",
+        "rustc_version",
+        "cargo_version",
+        "maturin_version",
+        "python_version",
+        "canonical_build_root",
+        "source_date_epoch",
+        "rustflags",
+        "cargo_build_jobs",
+        "checksum_inventory_excluded",
+        "wheel_filename",
+        "wheel_sha256",
+    ):
+        assert f'"{key}"' in script or f"'{key}'" in script

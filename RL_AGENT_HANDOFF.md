@@ -143,13 +143,30 @@ runtime.
 
 ### 7.1 Publish one immutable release
 
-The maintainer must publish the verified tree under a new release tag and attach:
+The maintainer must use the canonical two-commit release transaction:
+
+1. Finalize clean release-source commit A. Run
+   `tools/build_catanatron_rs_wheel.sh` twice from independent clean build state
+   and require byte-identical wheel SHA-256 values. Preserve both machine-
+   readable build receipts and compare their sealed builder, lockfile,
+   toolchain, environment, filename, and digest fields.
+2. Create commit B by changing only
+   `native/catanatron-rs/WHEEL_SHA256SUMS` to record that digest. Confirm
+   `git diff --name-only A..B` contains exactly the inventory path.
+3. Build clean commit B twice. Its wheels must be byte-identical to each other
+   **and to commit A's wheel**. The builder excludes the inventory from native
+   build inputs, eliminating a checksum/self-reference cycle. The final build
+   receipts must name commit/tree B.
+4. Create a new immutable tag at commit B and attach exactly:
 
 ~~~text
 catanatron_rs-0.1.4-cp311-cp311-manylinux_2_34_x86_64.whl
+catanatron_rs-0.1.4-build-receipt.json
 ~~~
 
-Do not install v1.0-deploy.
+The attached wheel digest must equal commit B's tracked inventory and receipt.
+Abort on any mismatch; never move an existing tag or rewrite the inventory to
+bless a non-reproducing build. Do not install v1.0-deploy.
 
 On each node:
 
@@ -226,6 +243,30 @@ selected GPUs attach to the managed MPS service, guards pass, output rows and
 simulations advance, manifests reconcile, checkpoint/config hashes match, and
 there are zero failed games or worker errors. Retain the exact config dump and
 audit report for each host shape. Validation-only rows remain quarantined.
+
+Use the canonical selective transaction; `<fresh-val-only-base>` must fit the
+repository-declared VAL-only band and must not be reused from another canary:
+
+~~~bash
+python tools/fleet/a1_live_canary.py run \
+  --lock <immutable-a1-lock.json> \
+  --render <immutable-a1-render.json> \
+  --hosts <private-a1-hosts.json> \
+  --receipt <fresh-live-canary-receipt.json> \
+  --canary-id <unique-lowercase-id> \
+  --base-seed <fresh-val-only-base>
+
+# After inspecting the 12-lane/36-job dry plan:
+python tools/fleet/a1_live_canary.py run <same-arguments> --go
+python tools/fleet/a1_live_canary.py status <same-arguments>
+python tools/fleet/a1_live_canary.py audit <same-arguments>
+~~~
+
+The tool hard-selects `c1` GPU0-3 and `h100-8a` GPU0-7, uses a separate
+immutable canary ledger, records zero consumed production claims, and delegates
+launch/resume/stop to the production executor's receipt-bound process-group
+semantics. Stop with a dry inspection followed by the same command plus
+`--go`; do not use broad process matching.
 
 The older 80k/72k per-GPU threshold and 2.20M rows/hour projection belong to
 the historical w128 EvalServer capacity experiment. They are not acceptance
