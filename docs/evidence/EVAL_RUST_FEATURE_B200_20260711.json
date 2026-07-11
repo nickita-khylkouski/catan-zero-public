@@ -1,7 +1,7 @@
 {
   "schema": "eval-rust-feature-b200-evidence-v1",
   "commit": "6cb878e",
-  "host": "132.145.197.81",
+  "host": "b200",
   "device": "NVIDIA B200",
   "checkpoint": "/home/ubuntu/catan-zero/runs/bc/entity_graph_35m_v3b_arch_seed/checkpoint.pt",
   "checkpoint_sha256": "sha256:9852cc5c74de7f841e4887ffbf1a2d15f5b7f126c9b4834f2d37ee8ec3d5f998",

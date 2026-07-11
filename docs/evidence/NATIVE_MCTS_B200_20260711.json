@@ -1,7 +1,7 @@
 {
   "schema_version": "native-mcts-b200-evidence-v1",
   "recorded_utc": "2026-07-11",
-  "host": "132.145.197.81",
+  "host": "b200",
   "gpu": "NVIDIA B200",
   "implementation": {
     "initial_profile_commit": "4a6988a",

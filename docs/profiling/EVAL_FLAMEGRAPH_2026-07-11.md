@@ -225,7 +225,7 @@ snapshots are stored beside the flamegraphs.
 An earlier internal profile is deliberately rejected: a separate worker-
 packing experiment started on GPU 0 after sampling began.  It is retained only
 at `/home/ubuntu/catan-eval-profiles-c807874/internal.svg` on
-`132.145.197.81` and is not used anywhere in this report.
+the `b200` fleet alias and is not used anywhere in this report.
 
 Tracked artifacts:
 
@@ -239,7 +239,7 @@ Tracked artifacts:
 Untracked raw captures are preserved for reclassification without committing
 multi-megabyte stack text:
 
-- internal: `140.238.192.66:/home/ubuntu/catan-eval-profiles-c807874/internal-wall.raw`,
+- internal: `b200:/home/ubuntu/catan-eval-profiles-c807874/internal-wall.raw`,
   SHA-256 `82c8e9dbfb4f302cb589c69199d50e7fc5d428e39d2a9c639862a4ba14970457`;
-- external: `132.145.197.81:/home/ubuntu/catan-eval-profiles-c807874/external-wall.raw`,
+- external: `b200:/home/ubuntu/catan-eval-profiles-c807874/external-wall.raw`,
   SHA-256 `fa837f01f329c1cedf64a8e6364f039ff8ca9851ab83f0df6b39502338eebc28`.
