@@ -56,6 +56,26 @@ EXPECTED_A1_RECIPE: dict[str, Any] = {
 }
 
 
+def _expected_recipe(*, run: str, category: str) -> dict[str, Any]:
+    """Return the exact safe recipe for legacy or sealed dual-arm output.
+
+    The dual-arm wave nests outputs below ``.../<campaign>/<arm>/<job>`` and
+    intentionally uses c_scale=.10 for the current producer, while history and
+    hard-negative jobs retain c_scale=.03.  Legacy runs keep the pre-wave
+    n128/.03 expectation.
+    """
+
+    expected = dict(EXPECTED_A1_RECIPE)
+    if run in {"n128", "n256"} and category in {
+        "current_producer",
+        "recent_history",
+        "hard_negative",
+    }:
+        expected["n_full"] = int(run.removeprefix("n"))
+        expected["c_scale"] = 0.1 if category == "current_producer" else 0.03
+    return expected
+
+
 def _load_json(path: Path) -> dict[str, Any] | None:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
@@ -501,7 +521,10 @@ def snapshot_run(
         "belief_chance_spectra": belief_chance_spectra,
         "target_information_regime": target_information_regime,
     }
-    recipe_safe = effective_recipe == EXPECTED_A1_RECIPE
+    recipe_safe = effective_recipe == _expected_recipe(
+        run=run,
+        category=(a1_match.group("category") if a1_match is not None else "legacy"),
+    )
     seed_end = seed_start + games_requested
     if a1_contract is not None:
         attested_seed_end = int(_number(a1_contract.get("seed_end")))
@@ -568,6 +591,9 @@ def collect_snapshots(
         candidates = {
             *expanded.glob("*/gpu*"),
             *expanded.glob("*/*_gpu*__*"),
+            # Sealed dual-arm production layout:
+            #   <root>/<campaign>/<arm>/<arm>_gpuNN__<category>
+            *expanded.glob("*/*/*_gpu*__*"),
         }
         for gpu_dir in sorted(candidates):
             snapshot = snapshot_run(

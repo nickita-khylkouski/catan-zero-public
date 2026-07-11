@@ -222,6 +222,76 @@ def test_sealed_a1_categories_share_physical_gpu_slot_arbitration(
     assert snapshots[0].category == "recent_history"
 
 
+@pytest.mark.parametrize(
+    ("arm", "category", "c_scale"),
+    [
+        ("n128", "current_producer", 0.1),
+        ("n128", "recent_history", 0.03),
+        ("n256", "current_producer", 0.1),
+        ("n256", "hard_negative", 0.03),
+    ],
+)
+def test_nested_dual_arm_layout_is_discovered_with_category_recipe(
+    tmp_path: Path, arm: str, category: str, c_scale: float
+) -> None:
+    now = 16_500.0
+    root = tmp_path / "runs" / "selfplay"
+    output = root / "campaign-r1" / arm / f"{arm}_gpu00__{category}"
+    config = _config(n_full=int(arm.removeprefix("n")))
+    config["fields"]["c_scale"] = c_scale
+    _write_json(output / "config.json", config, mtime=now - 2)
+    _write_json(
+        output / "worker_000" / "progress.json",
+        {
+            "games_requested": 20,
+            "games_completed_local": 1,
+            "rows": 100,
+            "simulations_used_total": 1000,
+            "shard_count_confirmed": 1,
+            "games_failed": 0,
+            "games_truncated": 0,
+        },
+        mtime=now - 1,
+    )
+
+    snapshots = exporter.collect_snapshots(
+        [root],
+        host="fleet-host",
+        processes={str(output.resolve()): {123}},
+        now=now,
+        stale_after_seconds=60,
+        max_run_age_seconds=3600,
+    )
+
+    assert len(snapshots) == 1
+    assert snapshots[0].run == arm
+    assert snapshots[0].category == category
+    assert snapshots[0].n_full == int(arm.removeprefix("n"))
+    assert snapshots[0].c_scale == c_scale
+    assert snapshots[0].recipe_safe is True
+
+
+def test_nested_dual_arm_recipe_rejects_cross_arm_budget(tmp_path: Path) -> None:
+    now = 16_600.0
+    root = tmp_path / "runs" / "selfplay"
+    output = root / "campaign-r1" / "n256" / "n256_gpu00__current_producer"
+    config = _config(n_full=128)
+    config["fields"]["c_scale"] = 0.1
+    _write_json(output / "config.json", config, mtime=now - 1)
+
+    snapshots = exporter.collect_snapshots(
+        [root],
+        host="fleet-host",
+        processes={str(output.resolve()): {123}},
+        now=now,
+        stale_after_seconds=60,
+        max_run_age_seconds=3600,
+    )
+
+    assert len(snapshots) == 1
+    assert snapshots[0].recipe_safe is False
+
+
 def test_a1_contract_and_live_argv_supply_typed_attestation_labels(
     tmp_path: Path,
 ) -> None:
