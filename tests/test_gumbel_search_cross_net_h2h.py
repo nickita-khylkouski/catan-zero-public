@@ -68,7 +68,7 @@ def test_eval_config_hash_seals_native_hot_loop_choice() -> None:
     assert native.config_hash() != reference.config_hash()
 
 
-def test_pinned_replay_scope_rejects_path_aba_during_hash_and_copy(
+def test_pinned_replay_scope_is_safe_during_path_aba_hash_and_copy(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     scope = tmp_path / "worker"
@@ -104,10 +104,26 @@ def test_pinned_replay_scope_rejects_path_aba_during_hash_and_copy(
         return payload
 
     monkeypatch.setattr(replay_contract.os, "read", aba_read)
-    with pytest.raises(ValueError, match="changed while pinning"):
-        replay_contract.pin_replay_scope(
+    pinned_during_aba = None
+    try:
+        pinned_during_aba = replay_contract.pin_replay_scope(
             scope, expected_sha256=expected[0], expected_count=expected[1]
         )
+    except ValueError as error:
+        # Rename updates normally change ctime and are rejected. Some
+        # filesystems can complete the away/back sequence inside one timestamp
+        # tick; in that case the held descriptor still pins the original inode
+        # and bytes, which is the security property this mechanism needs.
+        assert "changed while pinning" in str(error)
+    else:
+        with np.load(
+            pinned_during_aba.snapshot_scope / "rows.npz", allow_pickle=False
+        ) as data:
+            assert int(data["action_taken"][0]) == 11
+    finally:
+        if pinned_during_aba is not None:
+            pinned_during_aba.close()
+    assert injected
     monkeypatch.setattr(replay_contract.os, "read", original_read)
     pinned = replay_contract.pin_replay_scope(
         scope, expected_sha256=expected[0], expected_count=expected[1]
