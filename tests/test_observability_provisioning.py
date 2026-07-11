@@ -151,6 +151,22 @@ def test_committed_dashboard_covers_required_gpu_and_generator_metrics() -> None
     titles = {panel["title"] for panel in dashboard["panels"]}
     assert "Active A1 lanes / expected 56" in titles
     assert "Recipe-safe active lanes / expected 56" in titles
+    arm_panel = next(
+        panel
+        for panel in dashboard["panels"]
+        if panel["title"] == "Active lanes by search budget / expected 28 each"
+    )
+    arm_query = arm_panel["targets"][0]["expr"]
+    assert 'count_values("n_full", catan_fleet_generator_n_full' in arm_query
+    assert "catan_fleet_generator_processes" in arm_query
+    assert "> 0" in arm_query
+    assert arm_panel["fieldConfig"]["defaults"]["max"] == 28
+    for title in (
+        "Active A1 lanes / expected 56",
+        "Recipe-safe active lanes / expected 56",
+    ):
+        panel = next(panel for panel in dashboard["panels"] if panel["title"] == title)
+        assert panel["fieldConfig"]["defaults"]["max"] == 56
 
 
 def test_dashboard_box_filter_uses_prometheus_fleet_alias_consistently() -> None:
