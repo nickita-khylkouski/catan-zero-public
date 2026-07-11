@@ -25,6 +25,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from tools import a1_pre_wave_contract as contract_tool  # noqa: E402
+from tools import a1_promotion_transaction as promotion_tool  # noqa: E402
 
 
 RECEIPT_SCHEMA = "a1-champion-registry-bootstrap-v1"
@@ -63,10 +64,24 @@ def _fresh(path: Path, *, where: str) -> Path:
     lexical = Path(os.path.abspath(os.fspath(path.expanduser())))
     if lexical.exists() or lexical.is_symlink():
         raise BootstrapError(f"refusing non-fresh {where}: {lexical}")
-    lexical.parent.mkdir(parents=True, exist_ok=True)
-    if lexical.parent.resolve(strict=True) != lexical.parent:
-        raise BootstrapError(f"{where} parent must be canonical")
+    # Planning is genuinely read-only.  Validate every already-existing prefix
+    # without manufacturing the destination parent as a side effect.
+    ancestor = lexical.parent
+    while not ancestor.exists() and not ancestor.is_symlink():
+        if ancestor == ancestor.parent:
+            raise BootstrapError(f"{where} has no existing parent ancestor")
+        ancestor = ancestor.parent
+    if ancestor.is_symlink() or ancestor.resolve(strict=True) != ancestor:
+        raise BootstrapError(f"{where} parent ancestry must be canonical")
     return lexical
+
+
+def _prepare_parent(path: Path, *, where: str) -> None:
+    """Create a destination parent only at the committed mutation boundary."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.parent.resolve(strict=True) != path.parent:
+        raise BootstrapError(f"{where} parent must be canonical")
 
 
 def _file_ref(path: Path, *, where: str) -> dict[str, str]:
@@ -107,6 +122,8 @@ def build_plan(
     pointer_path: Path,
     receipt_path: Path,
     incumbent: Path,
+    training_receipt: Path | None = None,
+    candidate: Path | None = None,
     verify_lock_fn: Callable[..., dict[str, Any]] = contract_tool.verify_lock,
 ) -> dict[str, Any]:
     registry = _fresh(registry_path, where="registry")
@@ -115,10 +132,43 @@ def build_plan(
     journal = _fresh(_journal_path(receipt), where="bootstrap prepared journal")
     try:
         lock = verify_lock_fn(lock_path, require_all_job_claims=True)
-    except (contract_tool.ContractError, OSError) as error:
-        raise BootstrapError(
-            f"sealed A1 contract verification failed: {error}"
-        ) from error
+    except (contract_tool.ContractError, OSError) as strict_error:
+        # There is exactly one historical, markerless v2 A1 lock.  Promotion's
+        # pinned attestation logic binds its file+semantic digests, source
+        # draft, and completed v4 one-dose receipt.  Reuse that allowlist here;
+        # never relax verification for markerless locks schema-wide.
+        if training_receipt is None or candidate is None:
+            raise BootstrapError(
+                "sealed A1 contract verification failed and the exact historical "
+                "fallback requires --training-receipt and --candidate: "
+                f"{strict_error}"
+            ) from strict_error
+        try:
+            _attestation, snapshot = (
+                promotion_tool._build_legacy_contract_attestation_snapshot(  # noqa: SLF001
+                    lock_path, training_receipt
+                )
+            )
+        except (promotion_tool.PromotionError, OSError) as fallback_error:
+            raise BootstrapError(
+                f"sealed A1 contract verification failed: {strict_error}; "
+                f"historical fallback failed: {fallback_error}"
+            ) from fallback_error
+        lock = dict(snapshot.contract_lock.value)
+        candidate_ref = _file_ref(candidate, where="historical A1 candidate")
+        receipt_value = snapshot.training_receipt.value
+        try:
+            outputs = receipt_value["outputs"]
+            output_path = Path(str(outputs["checkpoint"])).resolve(strict=True)
+            output_sha = str(outputs["checkpoint_sha256"])
+        except (KeyError, TypeError, OSError) as error:
+            raise BootstrapError(
+                "historical training receipt has no canonical candidate output"
+            ) from error
+        if candidate_ref != {"path": str(output_path), "sha256": output_sha}:
+            raise BootstrapError(
+                "candidate is not the exact output bound by the historical training receipt"
+            )
     lock_ref = _file_ref(lock_path, where="A1 contract lock")
     producer = _producer(lock)
     incumbent_ref = _file_ref(incumbent, where="incumbent checkpoint")
@@ -368,6 +418,13 @@ def commit(plan: dict[str, Any]) -> dict[str, Any]:
     pointer_path = Path(destinations["current_pointer"])
     receipt_path = Path(destinations["receipt"])
     journal_path = Path(destinations["prepared_journal"])
+    for path, where in (
+        (registry_path, "registry"),
+        (pointer_path, "current pointer"),
+        (receipt_path, "bootstrap receipt"),
+        (journal_path, "bootstrap prepared journal"),
+    ):
+        _prepare_parent(path, where=where)
     registry_bytes = _render_registry(plan)
     pointer_bytes = (plan["incumbent"]["path"] + "\n").encode()
     journal = _journal_payload(plan)
@@ -464,6 +521,8 @@ def main() -> None:
     parser.add_argument("--registry", required=True)
     parser.add_argument("--current-pointer", required=True)
     parser.add_argument("--receipt", required=True)
+    parser.add_argument("--training-receipt")
+    parser.add_argument("--candidate")
     parser.add_argument("--go", action="store_true")
     args = parser.parse_args()
     try:
@@ -485,6 +544,10 @@ def main() -> None:
                 pointer_path=Path(args.current_pointer),
                 receipt_path=receipt_path,
                 incumbent=Path(args.incumbent),
+                training_receipt=(
+                    Path(args.training_receipt) if args.training_receipt else None
+                ),
+                candidate=Path(args.candidate) if args.candidate else None,
             )
         result = commit(plan) if args.go else plan
     except (BootstrapError, OSError, ValueError) as error:
