@@ -99,6 +99,50 @@ referee-only samples total about 6.55%.  The same MCTS/feature/evaluator split
 appears in both harnesses.  Replacing Python Catanatron alone cannot produce a
 multi-x speedup.
 
+## Native hot-loop follow-up
+
+The feature-compatible Rust hot loop was subsequently wired behind
+`--native-mcts-hot-loop`, with the existing Python implementation retained as
+the default/fallback-free control.  The production recipe above was preserved,
+including P4/min32 information-set search, public observations, D6-at-20,
+corrected/lazy chance handling, scalar/tanh value semantics, and the native
+featurizer.  A fresh cp311 wheel passed 8 Rust semantic tests, strict Clippy,
+and 18 non-skipped Python binding/information-set tests.
+
+On the matched 12-decision neutral cohort, both implementations completed the
+same 1,152 simulations, 9 searched decisions, and 24 authoritative decisions
+with zero errors or engine divergences.  Elapsed time fell from 5.905s to
+4.676s (1.263x); game time fell from 5.386s to 4.134s (1.303x).  Internal H2H
+trajectories differ, so that comparison is normalized by reported work:
+201.86 simulations/s for Python versus 279.06 simulations/s after native clone
+reduction (1.383x).  These are performance canaries, not Elo evidence.
+
+The corrected post-native wall classifier no longer labels the surviving
+`_search_information_set` wrapper as Python traversal.  In the long internal
+capture, the non-idle buckets are now led by feature/leaf FFI (44.15%) and
+native traversal/allocation (26.62%); Python search orchestration is 3.73% and
+PIMC orchestration is 0.75%.  Recursive Python `_simulate`/`_traverse` frames
+are absent.  The next optimization ceiling is therefore the evaluator/feature
+boundary and neural batching, not another rewrite of the tree policy.
+
+The first native active profile exposed `malloc` at 29.64% inclusive and
+`Vec::clone` at 11.08%.  Moving chance-outcome `Game` values directly into
+arena nodes and borrowing evaluator requests removed `Vec::clone` from the
+top-40 post-change profile; `malloc` measured 15.0% in the shorter confirmation
+capture.  Because capture lengths differ, the defensible clone-change claim is
+the matched +1.4% internal normalized throughput and +0.8% neutral elapsed
+improvement.
+
+Tracked visual evidence:
+
+- [native internal active flamegraph](assets/2026-07-11/native-internal-n128.svg)
+- [native external active flamegraph](assets/2026-07-11/native-external-n128.svg)
+- [post-clone internal active flamegraph](assets/2026-07-11/native-internal-postclone.svg)
+- [native internal wall analysis](assets/2026-07-11/native-internal-wall-analysis.json)
+- [native external wall analysis](assets/2026-07-11/native-external-wall-analysis.json)
+- [post-clone internal wall analysis](assets/2026-07-11/native-internal-postclone-wall-analysis.json)
+- [complete B200 evidence receipt](../evidence/NATIVE_MCTS_B200_20260711.json)
+
 ## Optimization implications
 
 - Moving only traversal to Rust has an Amdahl ceiling near 1.52x internally.
