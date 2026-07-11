@@ -317,6 +317,37 @@ def _validate_relocation(
         raise ExportError("relocated validation manifest differs")
 
 
+def _validate_logical_validation_binding(
+    report: Mapping[str, Any], *, corpus_dir: Path
+) -> str:
+    """Validate the immutable logical identity without opening its old location."""
+
+    meta = _load_object(corpus_dir / "corpus_meta.json", name="corpus metadata")
+    audit = meta.get("a1_post_wave_audit")
+    validation = audit.get("validation_holdout") if isinstance(audit, dict) else None
+    expected = validation.get("path") if isinstance(validation, dict) else None
+    reported = report.get("input_validation_game_seed_manifest")
+    if (
+        not isinstance(expected, str)
+        or not Path(expected).is_absolute()
+        or str(Path(expected).expanduser()) != expected
+    ):
+        raise ExportError("corpus metadata validation logical path is invalid")
+    if reported != expected:
+        raise ExportError("training report input validation logical path differs")
+    relocation = report.get("rnd_a1_artifact_relocation")
+    files = relocation.get("files") if isinstance(relocation, dict) else None
+    relocated_validation = (
+        files.get("validation_manifest") if isinstance(files, dict) else None
+    )
+    if (
+        not isinstance(relocated_validation, dict)
+        or relocated_validation.get("logical_path") != expected
+    ):
+        raise ExportError("A1 relocation validation logical identity differs")
+    return expected
+
+
 def _validate_report(
     report: Mapping[str, Any],
     *,
@@ -474,12 +505,7 @@ def _validate_report(
         != validation_manifest.resolve()
     ):
         raise ExportError("resolved TrainConfig validation manifest path differs")
-    input_validation = _resolve_path(
-        report.get("input_validation_game_seed_manifest"),
-        field="training report input validation manifest",
-    )
-    if input_validation != validation_manifest.resolve():
-        raise ExportError("training report input validation path differs")
+    _validate_logical_validation_binding(report, corpus_dir=corpus_dir)
     output_validation = _resolve_path(
         report.get("validation_game_seed_manifest"),
         field="training report validation output sidecar",

@@ -287,6 +287,31 @@ def test_tampered_admission_experiment_binding_is_rejected(tmp_path: Path) -> No
         )
 
 
+def test_logical_validation_path_need_not_exist_under_rnd_relocation(
+    tmp_path: Path,
+) -> None:
+    logical = "/retired/production/a1_post_wave.audit.validation_seeds.json"
+    assert not Path(logical).exists()
+    corpus = tmp_path / "corpus"
+    _write(
+        corpus / "corpus_meta.json",
+        {"a1_post_wave_audit": {"validation_holdout": {"path": logical}}},
+    )
+    report = {
+        "input_validation_game_seed_manifest": logical,
+        "rnd_a1_artifact_relocation": {
+            "files": {"validation_manifest": {"logical_path": logical}}
+        },
+    }
+    assert (
+        exporter._validate_logical_validation_binding(report, corpus_dir=corpus)
+        == logical
+    )
+    report["input_validation_game_seed_manifest"] = "/wrong/logical/path.json"
+    with pytest.raises(exporter.ExportError, match="logical path differs"):
+        exporter._validate_logical_validation_binding(report, corpus_dir=corpus)
+
+
 def test_registered_parameter_contract_uses_current_shared_latent_size() -> None:
     assert ARMS["rrt-k0"][1] == 20_070_932
     assert {ARMS[arm][1] for arm in ARMS if arm != "rrt-k0"} == {22_146_068}
@@ -492,6 +517,14 @@ def test_mocked_export_schema_is_accepted_by_learning_gate(
                 "optimizer_steps": 250,
                 "global_batch_size": 4096,
                 "sample_presentations": 1_024_000,
+                "evidence_export_contract_sha256": gate[
+                    "evidence_export_contract_file_sha256"
+                ],
+                "evidence_export_contract_semantic_sha256": gate[
+                    "evidence_export_contract_semantic_sha256"
+                ],
+                "exporter_source_sha256": gate["exporter_source_sha256"],
+                "exporter_helper_source_sha256": gate["exporter_helper_source_sha256"],
             }
             for base in emitted:
                 row = dict(base)
