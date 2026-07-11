@@ -91,7 +91,9 @@ impl Evaluator for PyEvaluator {
         Python::attach(|py| {
             let py_list = PyList::empty(py);
             for (game, legal, rc) in requests {
-                let py_game = PyGame { game: game.clone() };
+                let py_game = PyGame {
+                    game: (*game).clone(),
+                };
                 let py_obj = Py::new(py, py_game).map_err(|e| e.to_string())?;
                 let rc_str = color_to_string(*rc);
                 py_list
