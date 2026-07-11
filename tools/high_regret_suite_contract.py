@@ -14,6 +14,16 @@ from typing import Any, Sequence
 
 import numpy as np
 
+try:
+    from tools.regret_common import discover_shards, load_shard
+except ModuleNotFoundError as error:
+    # ``python tools/gumbel_search_cross_net_h2h.py`` puts ``tools/`` rather
+    # than the repository root on sys.path.  Preserve that documented direct
+    # CLI entry point without hiding missing transitive dependencies.
+    if error.name != "tools":
+        raise
+    from regret_common import discover_shards, load_shard
+
 
 SUITE_SCHEMA = "a1-held-out-high-regret-suite-v3"
 REPLAY_CONTRACT = "authoritative-shard-parent-hashed-unique-contiguous-trajectory-v3"
@@ -337,8 +347,6 @@ def bind_state_to_manifest(
     source_rows = row_cache.get(authoritative_path)
     if source_rows is None:
         try:
-            from tools.regret_common import load_shard
-
             shard = load_shard(authoritative_path)
             source_rows = (
                 np.asarray(shard["game_seed"]).reshape(-1),
@@ -368,8 +376,6 @@ def bind_state_to_manifest(
 
 def validate_replay_trajectories(states: Sequence[dict[str, Any]]) -> None:
     """Replay the v3 contiguous/unique claim from immutable scope bytes."""
-
-    from tools.regret_common import discover_shards, load_shard
 
     requested: dict[Path, dict[int, int]] = {}
     for state in states:

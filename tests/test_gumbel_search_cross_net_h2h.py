@@ -9,6 +9,8 @@ from __future__ import annotations
 import sys
 import json
 import copy
+import os
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -37,6 +39,19 @@ from gumbel_search_cross_net_h2h import (  # type: ignore  # noqa: E402
     play_one_h2h_game,
     _validate_information_set_recipe,
 )
+
+
+def test_direct_cli_help_resolves_replay_contract_sibling_import() -> None:
+    repo = Path(__file__).resolve().parents[1]
+    completed = subprocess.run(
+        [sys.executable, str(repo / "tools/gumbel_search_cross_net_h2h.py"), "--help"],
+        cwd=repo,
+        env={**os.environ, "PYTHONPATH": str(repo / "src")},
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
 
 
 def test_pinned_replay_scope_rejects_path_aba_during_hash_and_copy(
