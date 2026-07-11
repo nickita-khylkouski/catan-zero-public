@@ -841,9 +841,9 @@
       "job_id": "neutral-19-gen3-h100-8b"
     }
   ],
-  "manifest_hash": "sha256:08cc48d2f32fab8882942ab2175d92dc92afbf9d42f584afb0eb997debdf1915",
-  "plan_hash": "sha256:b4c035e5c44548a5f89184ce6919a24901f979ab4cabcbe00924ed5a2b060ca6",
-  "repo_commit": "4b27cf4f4ca5153d71777bbd1af934af2f8e6814",
+  "manifest_hash": "sha256:31e447e1ba2d4d39edc648038e4fa0dc78f91af0e5183d26f4ccc39120983f6a",
+  "plan_hash": "sha256:b488725ce431fb3af11c7984935e3be3ab7cebd3733d2bcd6c3ac61bbddd44ed",
+  "repo_commit": "f0179eefc927666a4c704f6a3487521765058597",
   "run_id": "a1-neutral-python-panel-n128-20260710-v2",
   "schema_version": "catan-gpu-plan-v1"
 }
