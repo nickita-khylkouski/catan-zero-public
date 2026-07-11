@@ -75,6 +75,40 @@ def test_dry_run_is_read_only_and_binds_new_a1_lineage(tmp_path: Path) -> None:
     assert not registry.exists() and not pointer.exists() and not receipt.exists()
 
 
+def test_dry_run_does_not_create_absent_destination_parents(tmp_path: Path) -> None:
+    lock, lock_path, incumbent = _fixture(tmp_path)
+    root = tmp_path / "absent" / "private"
+    plan = bootstrap.build_plan(
+        lock_path=lock_path,
+        registry_path=root / "registry.json",
+        pointer_path=root / "CURRENT_CHAMPION",
+        receipt_path=root / "bootstrap.json",
+        incumbent=incumbent,
+        verify_lock_fn=_verify(lock),
+    )
+
+    assert plan["mode"] == "dry-run"
+    assert not (tmp_path / "absent").exists()
+
+
+def test_commit_creates_destination_parents_after_validation(tmp_path: Path) -> None:
+    lock, lock_path, incumbent = _fixture(tmp_path)
+    root = tmp_path / "absent" / "private"
+    plan = bootstrap.build_plan(
+        lock_path=lock_path,
+        registry_path=root / "registry.json",
+        pointer_path=root / "CURRENT_CHAMPION",
+        receipt_path=root / "bootstrap.json",
+        incumbent=incumbent,
+        verify_lock_fn=_verify(lock),
+    )
+
+    bootstrap.commit(plan)
+    assert (root / "registry.json").is_file()
+    assert (root / "CURRENT_CHAMPION").is_file()
+    assert (root / "bootstrap.json").is_file()
+
+
 def test_commit_publishes_roles_pool_pointer_and_receipt_once(tmp_path: Path) -> None:
     lock, lock_path, incumbent = _fixture(tmp_path)
     registry_path = tmp_path / "registry.json"
