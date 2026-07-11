@@ -255,7 +255,7 @@ def test_every_job_is_cuda_pinned_and_has_exact_n128_infoset_d6_recipe(
     assert "\ntools/fleet/launch_detached.sh " not in all_shell
 
 
-def test_launch_command_is_independent_of_remote_ssh_working_directory(
+def test_launch_command_creates_fresh_tree_and_ignores_ssh_working_directory(
     tmp_path: Path,
 ) -> None:
     remote_repo = tmp_path / "remote repo"
@@ -272,7 +272,10 @@ def test_launch_command_is_independent_of_remote_ssh_working_directory(
     )
     launcher.chmod(0o755)
 
-    job_dir = tmp_path / "remote output" / "job-0"
+    remote_root = tmp_path / "remote output"
+    job_dir = (
+        remote_root / "runs" / "a1-eval-0123456789abcdef" / "internal" / "job-0"
+    )
     report = job_dir / "report.json"
     job = {
         "job_id": "job-0",
@@ -286,10 +289,12 @@ def test_launch_command_is_independent_of_remote_ssh_working_directory(
         ],
     }
     command = fleet._launch_job_command(  # noqa: SLF001
-        {"remote_repo": str(remote_repo)}, job
+        {"remote_repo": str(remote_repo), "remote_root": str(remote_root)},
+        job,
     )
     unrelated_cwd = tmp_path / "unrelated-ssh-cwd"
     unrelated_cwd.mkdir()
+    assert not remote_root.exists()
 
     completed = subprocess.run(
         ["bash", "-lc", command],
@@ -300,10 +305,47 @@ def test_launch_command_is_independent_of_remote_ssh_working_directory(
     )
 
     assert completed.returncode == 0, completed.stderr
+    assert remote_root.is_dir()
+    assert (remote_root / "runs" / "a1-eval-0123456789abcdef" / "internal").is_dir()
     assert report.read_text(encoding="utf-8") == "ok"
     assert (job_dir / ".done").is_file()
     assert (job_dir / ".rc").read_text(encoding="utf-8") == "0\n"
     assert not (job_dir / ".failed").exists()
+
+
+def test_launch_refuses_symlinked_remote_root_before_writing_job(
+    tmp_path: Path,
+) -> None:
+    remote_repo = tmp_path / "repo"
+    launcher = remote_repo / "tools" / "fleet" / "launch_detached.sh"
+    launcher.parent.mkdir(parents=True)
+    launcher.write_text("#!/usr/bin/env bash\nexit 99\n", encoding="utf-8")
+    launcher.chmod(0o755)
+    escaped = tmp_path / "recovery-data"
+    escaped.mkdir()
+    remote_root = tmp_path / "eval-root"
+    remote_root.symlink_to(escaped, target_is_directory=True)
+    job_dir = remote_root / "runs" / "a1-eval-0123456789abcdef" / "internal" / "job-0"
+    job = {
+        "job_id": "job-0",
+        "job_dir": str(job_dir),
+        "report": str(job_dir / "report.json"),
+        "gpu": 0,
+        "argv": ["true"],
+    }
+
+    completed = subprocess.run(
+        ["bash", "-lc", fleet._launch_job_command(  # noqa: SLF001
+            {"remote_repo": str(remote_repo), "remote_root": str(remote_root)},
+            job,
+        )],
+        check=False,
+        text=True,
+        capture_output=True,
+    )
+
+    assert completed.returncode != 0
+    assert list(escaped.iterdir()) == []
 
 
 def test_checkpoint_staging_creates_both_distinct_remote_parent_dirs(
@@ -337,6 +379,58 @@ def test_plan_hash_and_checkpoint_bytes_are_replayed_on_load(tmp_path: Path) -> 
     Path(plan["candidate"]["source"]).write_bytes(b"changed")
     with pytest.raises(fleet.FleetError, match="candidate checkpoint bytes drifted"):
         fleet.load_plan(path, manifest)
+
+
+def test_remote_run_identity_binds_code_manifest_and_worker_packing(
+    tmp_path: Path,
+) -> None:
+    manifest, template = _plan(tmp_path)
+    candidate = Path(template["candidate"]["source"])
+    champion = Path(template["champion"]["source"])
+
+    def rebuild(**overrides: object) -> dict:
+        options = {
+            "candidate": candidate,
+            "champion": champion,
+            "internal_pairs": 600,
+            "external_pairs": 500,
+            "internal_base_seed": 6_190_000_000,
+            "external_base_seed": 6_191_000_000,
+            "workers_per_gpu": 8,
+            "repo_commit": "a" * 40,
+            "tool_hashes": template["tool_hashes"],
+        }
+        options.update(overrides)
+        return fleet.build_plan(manifest, **options)
+
+    assert rebuild()["run_id"] == template["run_id"]
+    assert rebuild(workers_per_gpu=16)["run_id"] != template["run_id"]
+    assert rebuild(repo_commit="b" * 40)["run_id"] != template["run_id"]
+    changed_tools = dict(template["tool_hashes"])
+    changed_tools["tools/gumbel_search_cross_net_h2h.py"] = "sha256:" + "9" * 64
+    assert rebuild(tool_hashes=changed_tools)["run_id"] != template["run_id"]
+
+    changed_manifest = copy.deepcopy(manifest)
+    changed_manifest["remote_root"] = "/home/ubuntu/a1-evaluation-other"
+    changed_manifest["manifest_hash"] = fleet._digest(  # noqa: SLF001
+        {
+            key: value
+            for key, value in changed_manifest.items()
+            if key != "manifest_hash"
+        }
+    )
+    assert fleet.build_plan(
+        changed_manifest,
+        candidate=candidate,
+        champion=champion,
+        internal_pairs=600,
+        external_pairs=500,
+        internal_base_seed=6_190_000_000,
+        external_base_seed=6_191_000_000,
+        workers_per_gpu=8,
+        repo_commit="a" * 40,
+        tool_hashes=template["tool_hashes"],
+    )["run_id"] != template["run_id"]
 
 
 def test_resume_selects_only_missing_failed_or_stale_jobs(tmp_path: Path) -> None:
@@ -407,6 +501,36 @@ def test_load_plan_rejects_semantic_tamper_even_if_old_hash_remains(
     path.write_text(json.dumps(tampered))
     with pytest.raises(fleet.FleetError, match="plan hash does not replay"):
         fleet.load_plan(path, manifest)
+
+
+def test_load_plan_replays_run_identity_and_confines_remote_job_paths(
+    tmp_path: Path,
+) -> None:
+    manifest, plan = _plan(tmp_path)
+
+    wrong_run = copy.deepcopy(plan)
+    wrong_run["run_id"] = "a1-eval-0000000000000000"
+    wrong_run["plan_hash"] = fleet._digest(  # noqa: SLF001
+        {key: value for key, value in wrong_run.items() if key != "plan_hash"}
+    )
+    wrong_run_path = tmp_path / "wrong-run.json"
+    wrong_run_path.write_text(json.dumps(wrong_run), encoding="utf-8")
+    with pytest.raises(fleet.FleetError, match="run identity does not replay"):
+        fleet.load_plan(wrong_run_path, manifest)
+
+    escaped = copy.deepcopy(plan)
+    job = escaped["jobs"][0]
+    job["job_dir"] = "/home/ubuntu/catan-zero-production/recovery/active"
+    job["report"] = f"{job['job_dir']}/report.json"
+    job["argv"][-1] = job["report"]
+    job["command_hash"] = fleet._digest(job["argv"])  # noqa: SLF001
+    escaped["plan_hash"] = fleet._digest(  # noqa: SLF001
+        {key: value for key, value in escaped.items() if key != "plan_hash"}
+    )
+    escaped_path = tmp_path / "escaped.json"
+    escaped_path.write_text(json.dumps(escaped), encoding="utf-8")
+    with pytest.raises(fleet.FleetError, match="path escapes its sealed run"):
+        fleet.load_plan(escaped_path, manifest)
 
 
 def test_validation_claim_is_atomic_idempotent_and_journaled(tmp_path: Path) -> None:

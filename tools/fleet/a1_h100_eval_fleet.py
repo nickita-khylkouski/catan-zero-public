@@ -100,6 +100,28 @@ def _digest(value: Any) -> str:
     return "sha256:" + hashlib.sha256(_canonical(value)).hexdigest()
 
 
+def _run_id_from_plan_fields(plan: dict[str, Any]) -> str:
+    run_key = {
+        "manifest_hash": plan["manifest_hash"],
+        "repo_commit": plan["repo_commit"],
+        "tool_hashes": plan["tool_hashes"],
+        "candidate_sha256": plan["candidate"]["sha256"],
+        "champion_sha256": plan["champion"]["sha256"],
+        "science_hash": plan["science_config_hash"],
+        "internal_pairs": plan["pair_claims"]["internal"]["pairs"],
+        "external_pairs": plan["pair_claims"]["external_matched"]["pairs"],
+        "internal_base_seed": plan["pair_claims"]["internal"]["base_seed"],
+        "external_base_seed": plan["pair_claims"]["external_matched"][
+            "base_seed"
+        ],
+        "iteration_id": plan["iteration_id"],
+        "seed_cohort_id": plan.get("seed_cohort_id"),
+        "scope": plan["scope"],
+        "workers_per_gpu": plan["workers_per_gpu"],
+    }
+    return "a1-eval-" + hashlib.sha256(_canonical(run_key)).hexdigest()[:16]
+
+
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -425,19 +447,31 @@ def build_plan(
     ):
         raise FleetError("internal and external validation seed intervals overlap")
     science_hash = _digest(SCIENCE_CONFIG)
-    run_key = {
-        "candidate_sha256": candidate_sha,
-        "champion_sha256": champion_sha,
-        "science_hash": science_hash,
-        "internal_pairs": internal_pairs,
-        "external_pairs": external_pairs,
-        "internal_base_seed": internal_base_seed,
-        "external_base_seed": external_base_seed,
+    resolved_repo_commit = repo_commit or _git_commit(repo_root)
+    resolved_tool_hashes = tool_hashes or _tool_hashes(repo_root)
+    run_identity = {
+        "manifest_hash": manifest["manifest_hash"],
+        "repo_commit": resolved_repo_commit,
+        "tool_hashes": resolved_tool_hashes,
+        "candidate": {"sha256": candidate_sha},
+        "champion": {"sha256": champion_sha},
+        "science_config_hash": science_hash,
+        "pair_claims": {
+            "internal": {
+                "base_seed": internal_base_seed,
+                "pairs": internal_pairs,
+            },
+            "external_matched": {
+                "base_seed": external_base_seed,
+                "pairs": external_pairs,
+            },
+        },
         "iteration_id": iteration_id,
         "seed_cohort_id": seed_cohort_id,
         "scope": scope,
+        "workers_per_gpu": workers_per_gpu,
     }
-    run_id = "a1-eval-" + hashlib.sha256(_canonical(run_key)).hexdigest()[:16]
+    run_id = _run_id_from_plan_fields(run_identity)
     run_root = f"{root}/runs/{run_id}"
     jobs: list[dict[str, Any]] = []
     for slot, (seed, count) in zip(
@@ -520,8 +554,8 @@ def build_plan(
         "seed_cohort_id": seed_cohort_id,
         "scope": scope,
         "manifest_hash": manifest["manifest_hash"],
-        "repo_commit": repo_commit or _git_commit(repo_root),
-        "tool_hashes": tool_hashes or _tool_hashes(repo_root),
+        "repo_commit": resolved_repo_commit,
+        "tool_hashes": resolved_tool_hashes,
         "science_config": SCIENCE_CONFIG,
         "science_config_hash": science_hash,
         "workers_per_gpu": workers_per_gpu,
@@ -588,6 +622,8 @@ def load_plan(path: Path, manifest: dict[str, Any]) -> dict[str, Any]:
         "science_config_hash"
     ) != _digest(SCIENCE_CONFIG):
         raise FleetError("evaluation plan science config drift")
+    if plan.get("run_id") != _run_id_from_plan_fields(plan):
+        raise FleetError("evaluation plan run identity does not replay")
     if not re.fullmatch(r"[0-9a-f]{40}", str(plan.get("repo_commit", ""))):
         raise FleetError("evaluation plan has no full Git commit")
     cohort = plan.get("seed_cohort_id")
@@ -629,6 +665,7 @@ def _validate_planned_jobs(plan: dict[str, Any], manifest: dict[str, Any]) -> No
         else all_slots
     )
     valid_slots = {(slot["alias"], slot["gpu"]): slot for slot in slots}
+    run_root = f"{str(manifest['remote_root']).rstrip('/')}/runs/{plan['run_id']}"
     job_ids: set[str] = set()
     by_phase: dict[str, list[dict[str, Any]]] = {"internal": [], "external": []}
     for job in jobs:
@@ -644,6 +681,11 @@ def _validate_planned_jobs(plan: dict[str, Any], manifest: dict[str, Any]) -> No
         if job_id in job_ids or not SAFE_NAME.fullmatch(job_id):
             raise FleetError(f"duplicate or invalid evaluation job id {job_id!r}")
         job_ids.add(job_id)
+        expected_job_dir = f"{run_root}/{job['phase']}/{job_id}"
+        if job.get("job_dir") != expected_job_dir or job.get(
+            "report"
+        ) != f"{expected_job_dir}/report.json":
+            raise FleetError(f"evaluation job path escapes its sealed run: {job_id}")
         if job.get("command_hash") != _digest(job.get("argv")):
             raise FleetError(f"evaluation job command hash drift: {job_id}")
         by_phase[job["phase"]].append(job)
@@ -1010,9 +1052,36 @@ def _launch_job_command(manifest: dict[str, Any], job: dict[str, Any]) -> str:
         "-lc",
         inner,
     ]
+    protected_paths = [
+        report,
+        log,
+        *(f"{job_dir}/{name}" for name in (".done", ".failed", ".pid", ".rc")),
+    ]
+    phase_root = str(Path(job_dir).parent)
+    run_root = str(Path(phase_root).parent)
+    remote_root = str(manifest["remote_root"]).rstrip("/")
+    protected_roots = [remote_root, f"{remote_root}/runs", run_root, phase_root]
+    create_roots: list[str] = []
+    for path in protected_roots:
+        quoted = shlex.quote(path)
+        create_roots.extend(
+            [
+                f"test ! -L {quoted}",
+                f"if [ ! -e {quoted} ]; then mkdir {quoted}; fi",
+                f"test -d {quoted}",
+                f"test \"$(readlink -f {quoted})\" = {quoted}",
+            ]
+        )
+    quoted_job_dir = shlex.quote(job_dir)
     return "\n".join(
         [
-            f"mkdir -p {shlex.quote(job_dir)}",
+            "set -euo pipefail",
+            *create_roots,
+            f"test ! -L {quoted_job_dir}",
+            f"if [ ! -e {quoted_job_dir} ]; then mkdir {quoted_job_dir}; fi",
+            f"test -d {quoted_job_dir}",
+            f"test \"$(readlink -f {quoted_job_dir})\" = {quoted_job_dir}",
+            *(f"test ! -L {shlex.quote(path)}" for path in protected_paths),
             f"if [ -f {shlex.quote(job_dir + '/.done')} ]; then echo {shlex.quote(job['job_id'] + ':done')};",
             f'elif [ -s {shlex.quote(job_dir + "/.pid")} ] && kill -0 "$(cat {shlex.quote(job_dir + "/.pid")})" 2>/dev/null; then echo {shlex.quote(job["job_id"] + ":active")};',
             "else",
@@ -1204,7 +1273,11 @@ def _status_command(jobs: Sequence[dict[str, Any]]) -> str:
         lines.extend(
             [
                 f"d={directory}; state=missing; pid='';",
-                'if [ -f "$d/.done" ]; then state=done; '
+                'if { [ -e "$d" ] && [ "$(readlink -f "$d")" != "$d" ]; } '
+                '|| [ -L "$d" ] || [ -L "$d/.done" ] || [ -L "$d/.failed" ] '
+                '|| [ -L "$d/.pid" ] || [ -L "$d/.rc" ] '
+                '|| [ -L "$d/report.json" ] || [ -L "$d/run.log" ]; then state=unsafe; '
+                'elif [ -f "$d/.done" ]; then state=done; '
                 'elif [ -f "$d/.failed" ]; then state=failed; '
                 'elif [ -s "$d/.pid" ]; then pid=$(cat "$d/.pid"); '
                 'if kill -0 "$pid" 2>/dev/null; then state=active; else state=stale; fi; fi;',
@@ -1252,7 +1325,7 @@ def status_phase(
     rows = [row for group in _parallel(sorted(grouped), poll) for row in group]
     counts = {
         state: sum(row["state"] == state for row in rows)
-        for state in ("done", "active", "failed", "stale", "missing")
+        for state in ("done", "active", "failed", "stale", "missing", "unsafe")
     }
     return {
         "phase": phase,
@@ -1271,6 +1344,9 @@ def jobs_to_resume(
         raise FleetError(
             "status response does not cover every planned job exactly once"
         )
+    valid_states = {"done", "active", "failed", "stale", "missing"}
+    if any(state not in valid_states for state in states.values()):
+        raise FleetError("status contains an unsafe or unknown remote job state")
     return {
         job_id
         for job_id, state in states.items()
@@ -1289,7 +1365,15 @@ def _fetch_report(
     digest_result = runner(
         [
             *_ssh_base(manifest, host),
-            f"test -f {shlex.quote(job['job_dir'] + '/.done')} && sha256sum {shlex.quote(job['report'])} | cut -d' ' -f1",
+            f"test ! -L {shlex.quote(job['job_dir'])} && "
+            f"test \"$(readlink -f {shlex.quote(job['job_dir'])})\" = "
+            f"{shlex.quote(job['job_dir'])} && "
+            f"test ! -L {shlex.quote(job['job_dir'] + '/.done')} && "
+            f"test ! -L {shlex.quote(job['report'])} && "
+            f"test \"$(readlink -f {shlex.quote(job['report'])})\" = "
+            f"{shlex.quote(job['report'])} && "
+            f"test -f {shlex.quote(job['job_dir'] + '/.done')} && "
+            f"sha256sum {shlex.quote(job['report'])} | cut -d' ' -f1",
         ]
     )
     expected = digest_result.stdout.strip()
