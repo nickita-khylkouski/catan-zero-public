@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from catan_zero.rl import entity_token_features_rust as feature_path
+from catan_zero.rl.pipeline_configs import EvalConfig
 
 
 TOOLS = Path(__file__).resolve().parents[1] / "tools"
@@ -38,6 +39,18 @@ def test_complete_native_feature_api_passes_preflight(
 
     assert feature_path.rust_feature_path_available() is True
     feature_path.require_rust_feature_path()
+
+
+def test_eval_config_hash_seals_native_feature_choice() -> None:
+    reference = EvalConfig(mode="cross_net", candidate="a.pt", baseline="b.pt")
+    native = EvalConfig(
+        mode="cross_net",
+        candidate="a.pt",
+        baseline="b.pt",
+        evaluator_rust_featurize=True,
+    )
+    assert reference.evaluator_rust_featurize is False
+    assert native.config_hash() != reference.config_hash()
 
 
 def test_neutral_harness_seals_native_feature_path_in_recipe() -> None:
