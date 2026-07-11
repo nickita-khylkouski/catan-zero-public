@@ -4244,6 +4244,11 @@ def _verify_generation_arm_lock(
         lock["provenance"]["harvest"],
         *lock["provenance"]["runtime_code_tree"],
     ]
+    historical_repo_root: Path | None = None
+    if campaign["contract_sha256"] == HISTORICAL_DB1_CAMPAIGN_SHA256:
+        campaign_source = Path(str(lock["source_campaign"]["path"]))
+        if len(campaign_source.parents) >= 4:
+            historical_repo_root = campaign_source.parents[3]
     for record in records:
         if (
             campaign["contract_sha256"] == HISTORICAL_DB1_CAMPAIGN_SHA256
@@ -4257,7 +4262,18 @@ def _verify_generation_arm_lock(
             continue
         raw_path = Path(str(record["path"]))
         source = raw_path if raw_path.is_absolute() else REPO_ROOT / raw_path
-        if not source.is_file() or _sha256(source) != record["sha256"]:
+        historical_source = (
+            historical_repo_root / raw_path
+            if historical_repo_root is not None and not raw_path.is_absolute()
+            else None
+        )
+        current_matches = source.is_file() and _sha256(source) == record["sha256"]
+        historical_matches = bool(
+            historical_source is not None
+            and historical_source.is_file()
+            and _sha256(historical_source) == record["sha256"]
+        )
+        if not current_matches and not historical_matches:
             raise ContractError(f"generation arm provenance drift: {source}")
     if _digest_value(lock["provenance"]["runtime_code_tree"]) != lock["provenance"][
         "runtime_code_tree_sha256"
