@@ -179,6 +179,7 @@ REQUIRED_EVIDENCE = {"a0", "s1", "s2", "s3"}
 HISTORICAL_HANDOFF_MODE = "historical_pre_promotion"
 POST_PROMOTION_HANDOFF_MODE = "post_promotion"
 GENERATION_CAMPAIGN_SCHEMA = "a1-dual-arm-generation-contract-v1"
+GENERATION_CAMPAIGN_REVISION_SCHEMA = "a1-dual-arm-generation-contract-v2"
 GENERATION_CAMPAIGN_CONTRACT_ID = "a1-dual-arm-n256-n128-56gpu-20260710-r1"
 GENERATION_CAMPAIGN_CONTRACT_SHA256 = (
     "sha256:029d4370c031d967994055b74578306fe99e34ec653221db39e277e6d22c1f74"
@@ -193,6 +194,26 @@ GENERATION_CAMPAIGN_CHECKPOINT_SHA256 = (
     "sha256:f7e93dfb8cdb713d647b3e142c949d59083de9f719b6688b6faa6c918ce3eed4"
 )
 GENERATION_CAMPAIGN_SEED_FLOOR = 300_000_160_000
+GENERATION_CAMPAIGN_R1_NEXT_SEED_FLOOR = 300_000_626_944
+GENERATION_CAMPAIGN_R1_TRANSACTION_ID = "f2e99d219c8f4825a80e1aaab70cb254"
+GENERATION_CAMPAIGN_R1_HANDOFF_SHA256 = (
+    "sha256:40a1eece93a9346030da2d569fccbfeac5e567ca66618cec936c78f3a2a16e51"
+)
+GENERATION_CAMPAIGN_REVISION_IMPLEMENTATION_COMMIT = (
+    "c179fe7f3ea314f675af9207275c78ee012a245b"
+)
+GENERATION_CAMPAIGN_R1_LOCKS = {
+    "n128": {
+        "contract_id": f"{GENERATION_CAMPAIGN_CONTRACT_ID}-n128",
+        "contract_sha256": "sha256:ab874b87aeff6817568349aa661f2e875cb0da402a7fe1f63574e9e1fa81019d",
+        "file_sha256": "sha256:dfee05c8dea9bc8ba0a0a82d1af9b785ba488f76b24bca49276faaf5779305b5",
+    },
+    "n256": {
+        "contract_id": f"{GENERATION_CAMPAIGN_CONTRACT_ID}-n256",
+        "contract_sha256": "sha256:0fa4af39b62e09151e49d9e06e147b6d929b9ab5e07db4e57ba81d5029c70333",
+        "file_sha256": "sha256:88f56891af3c6fa0b3dcd6fee7027e422004f6ca116c8e00e6faa7d02a7c5990",
+    },
+}
 HISTORICAL_DB1_CAMPAIGN_SHA256 = (
     "sha256:ceecfa414c006dbe37c34b7b8d1e2f27d4028779d3c49626b6b9562ebeb99153"
 )
@@ -410,6 +431,54 @@ def _tracked_history_contains_file_digest(relative_path: str, digest: str) -> bo
     except (OSError, subprocess.SubprocessError):
         return False
     return False
+
+
+def _git_blob(commit: str, relative_path: str) -> bytes:
+    relative = PurePath(relative_path)
+    if relative.is_absolute() or ".." in relative.parts or not relative.parts:
+        raise ContractError(f"invalid repository path: {relative_path}")
+    if not re.fullmatch(r"[0-9a-f]{40}", commit):
+        raise ContractError("generation revision implementation commit is malformed")
+    try:
+        return subprocess.run(
+            ["git", "-C", str(REPO_ROOT), "show", f"{commit}:{relative_path}"],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+        ).stdout
+    except (OSError, subprocess.SubprocessError) as error:
+        raise ContractError(
+            f"cannot recover {relative_path} from implementation commit {commit}"
+        ) from error
+
+
+def _generation_revision_provenance(commit: str) -> dict[str, Any]:
+    guards = [
+        "configs/guards/a1_generation_n256.json",
+        "configs/guards/a1_generation_n128.json",
+        "configs/guards/a1_generation_n256_legacy.json",
+        "configs/guards/a1_generation_n128_legacy.json",
+    ]
+    generator = sorted(
+        REQUIRED_GENERATOR_CODE_SUFFIXES
+        | {
+            "tools/launcher_guards.py",
+            "tools/prelaunch_guard.py",
+            "tools/fleet/a1_lane_supervisor.py",
+        }
+    )
+
+    def record(path: str) -> dict[str, str]:
+        return {"path": path, "sha256": _sha256_bytes(_git_blob(commit, path))}
+
+    return {
+        "arm_guards": [record(path) for path in guards],
+        "generator_code": [record(path) for path in generator],
+        "executor": record("tools/fleet/a1_production_executor.py"),
+        "harvest": record("tools/fleet/a1_harvest_transaction.py"),
+        "fleet_manifest": record("configs/gpu_fleet_56.json"),
+    }
 
 
 def _strict_config_registry_record(
@@ -2487,6 +2556,172 @@ def _verify_artifact_records(records: Iterable[dict[str, Any]]) -> None:
             )
 
 
+def _issued_arm_lock_fingerprint(path: Path) -> dict[str, str]:
+    value = _load_json(path)
+    expected_digest = str(value.get("contract_sha256", ""))
+    unhashed = dict(value)
+    unhashed.pop("contract_sha256", None)
+    if expected_digest != _digest_value(unhashed):
+        raise ContractError(f"superseded arm lock semantic digest drift: {path}")
+    arm_id = str(value.get("game_contract", {}).get("arm_id", ""))
+    expected = GENERATION_CAMPAIGN_R1_LOCKS.get(arm_id)
+    actual = {
+        "contract_id": str(value.get("contract_id", "")),
+        "contract_sha256": expected_digest,
+        "file_sha256": _sha256(path),
+    }
+    if expected is None or actual != expected:
+        raise ContractError(f"superseded {arm_id or 'unknown'} lock is not issued r1 bytes")
+    return {"arm_id": arm_id, **actual}
+
+
+def _generation_revision_payload(
+    source: dict[str, Any],
+    *,
+    contract_id: str,
+    output_root: Path,
+    superseded_locks: list[dict[str, str]],
+) -> dict[str, Any]:
+    if not re.fullmatch(
+        r"a1-dual-arm-n256-n128-56gpu-[0-9]{8}-r(?:[2-9]|[1-9][0-9]+)",
+        contract_id,
+    ):
+        raise ContractError("generation revision contract id must be a fresh r2+ id")
+    output_root = output_root.expanduser()
+    if not output_root.is_absolute():
+        raise ContractError("generation revision output root must be absolute")
+    output_root = Path(os.path.abspath(os.fspath(output_root)))
+    expected_locks = [
+        {"arm_id": arm_id, **GENERATION_CAMPAIGN_R1_LOCKS[arm_id]}
+        for arm_id in ("n128", "n256")
+    ]
+    if (
+        not isinstance(superseded_locks, list)
+        or len(superseded_locks) != 2
+        or any(
+            not isinstance(row, dict)
+            or set(row)
+            != {"arm_id", "contract_id", "contract_sha256", "file_sha256"}
+            for row in superseded_locks
+        )
+        or sorted(superseded_locks, key=lambda row: str(row["arm_id"]))
+        != expected_locks
+    ):
+        raise ContractError("generation revision does not bind both issued r1 arm locks")
+
+    value = json.loads(json.dumps(source))
+    value["schema_version"] = GENERATION_CAMPAIGN_REVISION_SCHEMA
+    value["contract_id"] = contract_id
+    value["implementation_commit"] = GENERATION_CAMPAIGN_REVISION_IMPLEMENTATION_COMMIT
+    value["supersedes"] = {
+        "campaign_contract_id": GENERATION_CAMPAIGN_CONTRACT_ID,
+        "campaign_contract_sha256": GENERATION_CAMPAIGN_CONTRACT_SHA256,
+        "reason": "original post-promotion lineage artifacts are unavailable; old locks remain immutable",
+        "arm_locks": expected_locks,
+    }
+    recipe = dict(value["common_recipe"])
+    recipe["native_mcts_hot_loop"] = True
+    recipe["rust_featurize"] = True
+    value["common_recipe"] = recipe
+    arms = {str(arm["id"]): arm for arm in value["arms"]}
+    cursor = GENERATION_CAMPAIGN_R1_NEXT_SEED_FLOOR
+    for arm_id in ("n256", "n128"):
+        arm = arms[arm_id]
+        arm["seed_start"] = cursor
+        cursor += int(arm["gpu_count"]) * int(arm["seed_block_size"])
+        arm["seed_end"] = cursor
+        arm["output_root"] = str(output_root / arm_id)
+    value["fleet"]["next_campaign_seed_floor"] = cursor
+    value["provenance"] = _generation_revision_provenance(
+        GENERATION_CAMPAIGN_REVISION_IMPLEMENTATION_COMMIT
+    )
+    value.pop("contract_sha256", None)
+    value["contract_sha256"] = _digest_value(value)
+    return value
+
+
+def build_generation_campaign_revision(
+    source_path: Path,
+    *,
+    superseded_lock_paths: Sequence[Path],
+    contract_id: str,
+    output_root: Path,
+    out_path: Path,
+) -> dict[str, Any]:
+    """Create a fresh pending blueprint; never restore, claim, render, or launch."""
+
+    source = validate_generation_campaign(source_path)
+    if source.get("schema_version") != GENERATION_CAMPAIGN_SCHEMA:
+        raise ContractError("generation revision source must be the canonical issued r1 campaign")
+    fingerprints = [_issued_arm_lock_fingerprint(path) for path in superseded_lock_paths]
+    value = _generation_revision_payload(
+        source,
+        contract_id=contract_id,
+        output_root=output_root,
+        superseded_locks=fingerprints,
+    )
+    _create_readonly(out_path.absolute(), value)
+    return value
+
+
+def _validate_generation_campaign_revision(
+    path: Path, value: dict[str, Any], *, require_ready: bool
+) -> dict[str, Any]:
+    del path
+    _require_exact_keys(
+        value,
+        {
+            "schema_version", "contract_id", "status", "promotion_handoff",
+            "checkpoints", "source_categories", "common_recipe", "arms", "fleet",
+            "provenance", "execution_policy", "implementation_commit", "supersedes",
+            "contract_sha256",
+        },
+        where="generation campaign revision",
+    )
+    declared = str(value.get("contract_sha256", ""))
+    unhashed = dict(value)
+    unhashed.pop("contract_sha256", None)
+    if declared != _digest_value(unhashed):
+        raise ContractError("generation campaign revision semantic digest mismatch")
+    if value.get("implementation_commit") != GENERATION_CAMPAIGN_REVISION_IMPLEMENTATION_COMMIT:
+        raise ContractError("generation campaign revision implementation commit drift")
+    arms = {str(arm.get("id")): dict(arm) for arm in value.get("arms", [])}
+    if set(arms) != {"n128", "n256"}:
+        raise ContractError("generation campaign revision arm set drift")
+    roots = {arm_id: Path(str(arm["output_root"])) for arm_id, arm in arms.items()}
+    if any(root.name != arm_id for arm_id, root in roots.items()):
+        raise ContractError("generation campaign revision output roots must end in arm ids")
+    if roots["n128"].parent != roots["n256"].parent:
+        raise ContractError("generation campaign revision output roots have different parents")
+    superseded = dict(value.get("supersedes", {}))
+    source = validate_generation_campaign(GENERATION_CAMPAIGN_CONTRACT_PATH)
+    expected = _generation_revision_payload(
+        source,
+        contract_id=str(value.get("contract_id", "")),
+        output_root=roots["n128"].parent,
+        superseded_locks=list(superseded.get("arm_locks", [])),
+    )
+    if value != expected:
+        raise ContractError("generation campaign revision differs from deterministic rebuild")
+    if require_ready:
+        raise ContractError(
+            "generation campaign revision is not launchable: a new committed promotion "
+            "handoff and newly sealed placement are required"
+        )
+    return value
+
+
+def _require_fresh_revision_handoff(record: Mapping[str, Any]) -> None:
+    if (
+        record.get("transaction_id") == GENERATION_CAMPAIGN_R1_TRANSACTION_ID
+        or record.get("handoff_sha256") == GENERATION_CAMPAIGN_R1_HANDOFF_SHA256
+    ):
+        raise ContractError(
+            "generation revision requires a newly revalidated promotion handoff; "
+            "the issued r1 lineage cannot authorize r2"
+        )
+
+
 def validate_generation_campaign(
     path: Path,
     *,
@@ -2501,6 +2736,10 @@ def validate_generation_campaign(
     """
 
     value = _load_json(path)
+    if value.get("schema_version") == GENERATION_CAMPAIGN_REVISION_SCHEMA:
+        return _validate_generation_campaign_revision(
+            path, value, require_ready=require_ready
+        )
     historical_lock_source = bool(
         _allow_historical_lock_source
         and value.get("contract_sha256") == HISTORICAL_DB1_CAMPAIGN_SHA256
@@ -2869,7 +3108,9 @@ def _campaign_science(campaign: dict[str, Any], *, n_full: int) -> tuple[dict[st
             "eval_server",
         }
     }
-    generation["native_mcts_hot_loop"] = False
+    generation["native_mcts_hot_loop"] = bool(
+        recipe.get("native_mcts_hot_loop", False)
+    )
     return _search_operator(search), _effective_evaluator(evaluator), generation
 
 
@@ -2983,6 +3224,22 @@ def materialize_generation_campaign(
     """Create two immutable sealed arm locks; never render, claim, or launch."""
 
     campaign = validate_generation_campaign(campaign_path)
+    if campaign.get("schema_version") == GENERATION_CAMPAIGN_REVISION_SCHEMA:
+        provenance = dict(campaign["provenance"])
+        records = [
+            *map(dict, provenance["arm_guards"]),
+            *map(dict, provenance["generator_code"]),
+            dict(provenance["executor"]),
+            dict(provenance["harvest"]),
+            dict(provenance["fleet_manifest"]),
+        ]
+        for record in records:
+            source = REPO_ROOT / str(record["path"])
+            if not source.is_file() or _sha256(source) != record["sha256"]:
+                raise ContractError(
+                    "generation revision materialization requires exact c179fe7 "
+                    f"runtime bytes: {record['path']}"
+                )
     placements = _campaign_placements(placement_path, campaign)
     checkpoints: list[dict[str, Any]] = []
     for raw in campaign["checkpoints"]:
@@ -3006,6 +3263,8 @@ def materialize_generation_campaign(
         evaluator=evaluator,
         generation=generation,
     )
+    if campaign.get("schema_version") == GENERATION_CAMPAIGN_REVISION_SCHEMA:
+        _require_fresh_revision_handoff(handoff_record)
     ledger_path = Path(str(campaign["fleet"]["seed_ledger"]))
     ledger_record = _seed_ledger_snapshot(ledger_path)
     provenance = dict(campaign["provenance"])
@@ -5786,6 +6045,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         action="store_true",
         help="fail unless promotion handoff and physical placement have been materialized",
     )
+    revision_parser = sub.add_parser(
+        "revise-generation-campaign",
+        help="derive a fresh pending campaign from the issued r1 locks; never launches",
+    )
+    revision_parser.add_argument("--source", required=True)
+    revision_parser.add_argument(
+        "--superseded-lock", required=True, action="append"
+    )
+    revision_parser.add_argument("--contract-id", required=True)
+    revision_parser.add_argument("--output-root", required=True)
+    revision_parser.add_argument("--out", required=True)
     materialize_parser = sub.add_parser(
         "materialize-generation-campaign",
         help="seal both arm locks after handoff and exact placement; never launches",
@@ -5864,6 +6134,26 @@ def main(argv: Sequence[str] | None = None) -> int:
                 json.dumps(
                     {
                         "status": campaign["status"],
+                        "contract_sha256": campaign["contract_sha256"],
+                        "launch_authorized": False,
+                    },
+                    sort_keys=True,
+                )
+            )
+            return 0
+        if args.command == "revise-generation-campaign":
+            campaign = build_generation_campaign_revision(
+                Path(args.source),
+                superseded_lock_paths=[Path(path) for path in args.superseded_lock],
+                contract_id=args.contract_id,
+                output_root=Path(args.output_root),
+                out_path=Path(args.out),
+            )
+            print(
+                json.dumps(
+                    {
+                        "status": campaign["status"],
+                        "contract_id": campaign["contract_id"],
                         "contract_sha256": campaign["contract_sha256"],
                         "launch_authorized": False,
                     },
