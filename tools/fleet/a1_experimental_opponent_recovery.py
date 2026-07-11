@@ -663,13 +663,21 @@ def _remote_python(base: list[str], program: str) -> Any:
     # Stream the program over stdin.  The sealed runtime/tree and append-only
     # ledger checks can be larger than Linux's argv limit; passing them through
     # ``python -c`` made a valid 56-lane launch fail before preflight.
-    result = subprocess.run(
-        [*base, "ulimit -n 65536; exec python3 -"],
-        check=True,
-        text=True,
-        capture_output=True,
-        input=program,
-    )
+    try:
+        result = subprocess.run(
+            [*base, "ulimit -n 65536; exec python3 -"],
+            check=True,
+            text=True,
+            capture_output=True,
+            input=program,
+        )
+    except subprocess.CalledProcessError as error:
+        stderr = (error.stderr or "")[-8_000:]
+        stdout = (error.stdout or "")[-2_000:]
+        raise RecoveryError(
+            f"remote Python failed on {base[-1]} with exit {error.returncode}; "
+            f"stdout={stdout!r}; stderr={stderr!r}"
+        ) from error
     return json.loads(result.stdout)
 
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -24,6 +25,17 @@ def test_remote_python_streams_large_program_over_stdin(monkeypatch) -> None:
     assert captured["input"] == program
     assert program not in " ".join(captured["argv"])
     assert captured["argv"][-1] == "ulimit -n 65536; exec python3 -"
+
+
+def test_remote_python_surfaces_remote_assertion(monkeypatch) -> None:
+    def fake_run(argv, **kwargs):
+        raise subprocess.CalledProcessError(
+            1, argv, output="remote-out", stderr="AssertionError: bad ledger"
+        )
+
+    monkeypatch.setattr(recovery.subprocess, "run", fake_run)
+    with pytest.raises(recovery.RecoveryError, match="bad ledger"):
+        recovery._remote_python(["ssh", "host"], "assert False")  # noqa: SLF001
 
 
 def _json(path: Path, value: dict) -> None:
