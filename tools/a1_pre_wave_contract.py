@@ -238,7 +238,9 @@ REQUIRED_GENERATOR_CODE_SUFFIXES = {
     "native/catanatron-rs/src/lib.rs",
     "native/catanatron-rs/python/src/lib.rs",
     "native/gumbel_mcts_rs/Cargo.toml",
+    "native/gumbel_mcts_rs/Cargo.lock",
     "native/gumbel_mcts_rs/src/lib.rs",
+    "native/gumbel_mcts_rs/src/python_binding.rs",
 }
 REQUIRED_LEARNER_CODE_SUFFIXES = {
     "configs/guards/train_bc.json",
@@ -258,6 +260,13 @@ REQUIRED_LEARNER_CODE_SUFFIXES = {
     "src/catan_zero/rl/optim_state.py",
     "src/catan_zero/rl/torch_ppo.py",
     "src/catan_zero/rl/xdim_lite_policy.py",
+}
+# The issued 56-GPU campaign schema is immutable and predates the two native
+# wheel inputs added to future draft/runtime closures. Keep its exact file-set
+# contract separate instead of retroactively rewriting already-running data.
+ISSUED_CAMPAIGN_GENERATOR_CODE_SUFFIXES = REQUIRED_GENERATOR_CODE_SUFFIXES - {
+    "native/gumbel_mcts_rs/Cargo.lock",
+    "native/gumbel_mcts_rs/src/python_binding.rs",
 }
 REQUIRED_RUNTIME_CODE_SUFFIXES = (
     REQUIRED_GENERATOR_CODE_SUFFIXES
@@ -321,6 +330,7 @@ _GENERATION_KEYS = {
     "format",
     "device",
     "eval_server",
+    "native_mcts_hot_loop",
 }
 
 
@@ -1053,6 +1063,7 @@ def _validate_guard_payload(
         "--symmetry-averaged-eval-threshold",
         "--belief-chance-spectra",
         "--information-set-search",
+        "--native-mcts-hot-loop",
         "--determinization-particles",
         "--determinization-min-simulations",
     }
@@ -1076,6 +1087,7 @@ def _validate_guard_payload(
         ],
         "--belief-chance-spectra": search["belief_chance_spectra"],
         "--information-set-search": search["information_set_search"],
+        "--native-mcts-hot-loop": generation["native_mcts_hot_loop"],
         "--determinization-particles": search["determinization_particles"],
         "--determinization-min-simulations": search[
             "determinization_min_simulations"
@@ -1215,7 +1227,8 @@ def sync_generation_guard(draft_path: Path) -> dict[str, Any]:
         raise ContractError("draft evaluator/generation objects are missing")
     guard_evaluator = {"public_observation": evaluator.get("public_observation")}
     guard_generation = {
-        "temperature_decisions": generation.get("temperature_decisions")
+        "temperature_decisions": generation.get("temperature_decisions"),
+        "native_mcts_hot_loop": generation.get("native_mcts_hot_loop"),
     }
 
     before_sha256 = _sha256(guard_path)
@@ -1314,7 +1327,7 @@ def sync_generation_guard(draft_path: Path) -> dict[str, Any]:
 
 def _validate_generation(generation: dict[str, Any]) -> None:
     _require_exact_keys(generation, _GENERATION_KEYS, where="generation")
-    for key in ("eval_server",):
+    for key in ("eval_server", "native_mcts_hot_loop"):
         if type(generation[key]) is not bool:
             raise ContractError(f"generation.{key} must be a JSON boolean")
     for key in (
@@ -2754,7 +2767,7 @@ def validate_generation_campaign(
         dict(provenance["harvest"]),
         dict(provenance["fleet_manifest"]),
     ]
-    expected_suffixes = REQUIRED_GENERATOR_CODE_SUFFIXES | {
+    expected_suffixes = ISSUED_CAMPAIGN_GENERATOR_CODE_SUFFIXES | {
         "configs/guards/a1_generation_n256.json",
         "configs/guards/a1_generation_n128.json",
         "configs/guards/a1_generation_n256_legacy.json",
@@ -2855,6 +2868,7 @@ def _campaign_science(campaign: dict[str, Any], *, n_full: int) -> tuple[dict[st
             "eval_server",
         }
     }
+    generation["native_mcts_hot_loop"] = False
     return _search_operator(search), _effective_evaluator(evaluator), generation
 
 
@@ -4043,6 +4057,9 @@ def _generator_argv(
         str(search["exact_budget_sh_min_n"]),
         _bool_flag("--belief-chance-spectra", bool(search["belief_chance_spectra"])),
         _bool_flag("--information-set-search", bool(search["information_set_search"])),
+        _bool_flag(
+            "--native-mcts-hot-loop", bool(generation["native_mcts_hot_loop"])
+        ),
         "--determinization-particles",
         str(search["determinization_particles"]),
         "--determinization-min-simulations",

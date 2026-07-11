@@ -19,6 +19,7 @@ def test_native_ci_builds_cp311_wheel_and_asserts_symbols() -> None:
     assert 'getattr(catanatron_rs, "build_entity_features_flat", None)' in source
     assert "tests/test_native_gumbel_hot_loop.py" in source
     assert "tests/test_native_information_set_search.py" in source
+    assert "tests/test_generate_information_set_invariants.py" in source
     assert "tests/test_generate_native_rollout.py" in source
 
 

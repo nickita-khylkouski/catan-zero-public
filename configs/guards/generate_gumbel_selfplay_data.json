@@ -16,6 +16,7 @@
           "--symmetry-averaged-eval-threshold",
           "--belief-chance-spectra",
           "--information-set-search",
+          "--native-mcts-hot-loop",
           "--determinization-particles",
           "--determinization-min-simulations"
         ],
@@ -33,6 +34,7 @@
           "--symmetry-averaged-eval-threshold": 20,
           "--belief-chance-spectra": false,
           "--information-set-search": true,
+          "--native-mcts-hot-loop": true,
           "--determinization-particles": 4,
           "--determinization-min-simulations": 32
         }
