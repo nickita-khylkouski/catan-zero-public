@@ -351,20 +351,23 @@ def play_one_search_game(
     }
 
 
-def _checkpoint_md5(path: str | Path) -> str:
-    digest = hashlib.md5()  # noqa: S324 - provenance identity, not cryptography.
+def _checkpoint_digests(path: str | Path) -> tuple[str, str]:
+    """Compute both required provenance digests in one checkpoint read."""
+    md5 = hashlib.md5()  # noqa: S324 - provenance identity, not cryptography.
+    sha256 = hashlib.sha256()
     with Path(path).open("rb") as handle:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
+            md5.update(block)
+            sha256.update(block)
+    return md5.hexdigest(), "sha256:" + sha256.hexdigest()
+
+
+def _checkpoint_md5(path: str | Path) -> str:
+    return _checkpoint_digests(path)[0]
 
 
 def _checkpoint_sha256(path: str | Path) -> str:
-    digest = hashlib.sha256()
-    with Path(path).open("rb") as handle:
-        for block in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(block)
-    return "sha256:" + digest.hexdigest()
+    return _checkpoint_digests(path)[1]
 
 
 def _run_fingerprint(config: dict[str, Any]) -> str:
@@ -1118,8 +1121,7 @@ def main() -> None:
         )
     args.threads_per_worker = threads_per_worker
 
-    checkpoint_md5 = _checkpoint_md5(args.checkpoint)
-    checkpoint_sha256 = _checkpoint_sha256(args.checkpoint)
+    checkpoint_md5, checkpoint_sha256 = _checkpoint_digests(args.checkpoint)
     trained_value_readouts = ("scalar",)
     if args.mode == "search":
         try:
