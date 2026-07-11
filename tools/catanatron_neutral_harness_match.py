@@ -46,6 +46,10 @@ from catan_zero.search.gumbel_chance_mcts import (
     GumbelChanceMCTS,
     GumbelChanceMCTSConfig,
 )
+from catan_zero.search.native_gumbel_mcts import (
+    create_gumbel_search,
+    native_hot_loop_available,
+)
 from catan_zero.search.neural_rust_mcts import (
     BatchedEntityGraphRustEvaluator,
     EntityGraphRustEvaluatorConfig,
@@ -244,6 +248,17 @@ def _search_config(
     )
 
 
+def _create_search(
+    config: GumbelChanceMCTSConfig,
+    evaluator: Any,
+    *,
+    native_mcts_hot_loop: bool,
+) -> GumbelChanceMCTS:
+    if not native_mcts_hot_loop:
+        return GumbelChanceMCTS(config, evaluator)
+    return create_gumbel_search(config, evaluator, native_hot_loop=True)
+
+
 def play_one_search_game(
     *,
     evaluator: Any,
@@ -273,8 +288,10 @@ def play_one_search_game(
     symbols = import_catanatron_module("catanatron.models.player")
     candidate_color = getattr(symbols.Color, candidate_name)
     baseline_color = getattr(symbols.Color, baseline_name)
-    search = GumbelChanceMCTS(
-        _search_config(search_kwargs, seated_colors, int(game_seed)), evaluator
+    search = _create_search(
+        _search_config(search_kwargs, seated_colors, int(game_seed)),
+        evaluator,
+        native_mcts_hot_loop=bool(search_kwargs.get("native_mcts_hot_loop", False)),
     )
     candidate = CatanZeroSearchPlayer(
         candidate_color,
@@ -439,6 +456,12 @@ def _search_recipe(args: Any) -> dict[str, Any]:
         "evaluator_cache_size": 0,
         "evaluator_rust_featurize": bool(
             getattr(args, "evaluator_rust_featurize", False)
+        ),
+        "native_mcts_hot_loop": bool(getattr(args, "native_mcts_hot_loop", False)),
+        "mcts_implementation": (
+            "rust_native_hot_loop_v1"
+            if bool(getattr(args, "native_mcts_hot_loop", False))
+            else "python_reference"
         ),
         "evaluator_emit_uncertainty": False,
         "symmetry_averaged_eval": bool(args.symmetry_averaged_eval),
@@ -1042,6 +1065,16 @@ def build_parser() -> argparse.ArgumentParser:
             "with the bit-exact native featurizer. Opt-in and fail-closed."
         ),
     )
+    parser.add_argument(
+        "--native-mcts-hot-loop",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Search mode only: explicitly use the feature-gated Rust MCTS tree "
+            "hot loop. Default Python; enabling fails closed if the matching "
+            "wheel is absent."
+        ),
+    )
 
     parser.add_argument(
         "--gate-config", choices=sorted(GATE_CONFIGS), default="certification"
@@ -1083,6 +1116,13 @@ def main() -> None:
         parser.error("--value-readout categorical is supported only with --mode search")
     if args.mode != "search" and bool(args.evaluator_rust_featurize):
         parser.error("--evaluator-rust-featurize is supported only with --mode search")
+    if args.mode != "search" and bool(args.native_mcts_hot_loop):
+        parser.error("--native-mcts-hot-loop is supported only with --mode search")
+    if bool(args.native_mcts_hot_loop) and not native_hot_loop_available():
+        parser.error(
+            "--native-mcts-hot-loop requires a matching catanatron_rs wheel "
+            "exporting gumbel_search; refusing silent Python fallback"
+        )
     if bool(args.evaluator_rust_featurize):
         try:
             require_rust_feature_path()

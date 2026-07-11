@@ -70,6 +70,10 @@ and full state view for equivalence after every ply and marks the game
 
 from __future__ import annotations
 
+# Direct-script execution adds the repository source roots below before loading
+# project modules; those imports are intentionally after the path bootstrap.
+# ruff: noqa: E402
+
 import argparse
 import json
 import multiprocessing
@@ -347,9 +351,7 @@ def _build_evaluator(checkpoint: str, worker_args: dict[str, Any]) -> Any:
             prior_temperature=float(worker_args["prior_temperature"]),
             value_squash=str(worker_args.get("value_squash", "tanh")),
             public_observation=bool(worker_args.get("public_observation", False)),
-            rust_featurize=bool(
-                worker_args.get("evaluator_rust_featurize", False)
-            ),
+            rust_featurize=bool(worker_args.get("evaluator_rust_featurize", False)),
         ),
     )
 

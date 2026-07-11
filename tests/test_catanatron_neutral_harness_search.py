@@ -14,6 +14,7 @@ if str(_TOOLS_DIR) not in sys.path:
 from catanatron_neutral_harness_match import (  # type: ignore  # noqa: E402
     ORIENTATIONS,
     _checkpoint_digests,
+    _create_search,
     _game_semantics,
     _load_game_artifacts,
     _prepare_manifest,
@@ -32,6 +33,37 @@ from catanatron_player_adapter import (  # type: ignore  # noqa: E402
     SearchEngineBoundaryError,
     apply_native_action_record_to_rust,
 )
+
+
+def test_native_hot_loop_is_explicit_and_fingerprinted(monkeypatch) -> None:
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "--checkpoint",
+            "candidate.pt",
+            "--opponent",
+            "catanatron_value",
+            "--mode",
+            "search",
+            "--native-mcts-hot-loop",
+            "--out",
+            "report.json",
+        ]
+    )
+    recipe = _search_recipe(args)
+    assert recipe["native_mcts_hot_loop"] is True
+    assert recipe["mcts_implementation"] == "rust_native_hot_loop_v1"
+
+    calls = []
+    sentinel = object()
+    monkeypatch.setattr(
+        "catanatron_neutral_harness_match.create_gumbel_search",
+        lambda config, evaluator, *, native_hot_loop: (
+            calls.append(native_hot_loop) or sentinel
+        ),
+    )
+    assert _create_search(object(), object(), native_mcts_hot_loop=True) is sentinel
+    assert calls == [True]
 
 
 class _Named:
