@@ -1610,6 +1610,17 @@ def test_post_wave_audit_fails_closed_when_manifests_are_missing(
     assert any("missing manifest" in error for error in payload["errors"])
 
 
+def test_create_or_verify_readonly_reuses_only_exact_bytes(tmp_path: Path) -> None:
+    path = tmp_path / "sidecar.json"
+    payload = {"schema_version": "fixture-v1", "value": 7}
+    contract._create_or_verify_readonly(path, payload)
+    contract._create_or_verify_readonly(path, payload)
+    path.chmod(0o644)
+    path.write_text('{"different":true}\n', encoding="utf-8")
+    with pytest.raises(contract.ContractError, match="differs"):
+        contract._create_or_verify_readonly(path, payload)
+
+
 def test_post_wave_audit_canonicalizes_symlinked_contract_path(
     tmp_path: Path,
 ) -> None:
@@ -1649,7 +1660,9 @@ def test_single_read_registry_evidence_rejects_in_place_mutation(
         contract._read_sealed_regular(registry, where="race-test")
 
 
-def test_post_wave_audit_accepts_exact_complete_category_corpus(tmp_path: Path) -> None:
+def test_post_wave_audit_accepts_exact_complete_category_corpus(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     lock_path, lock = _lock(tmp_path)
     _append_job_claims(lock)
     checkpoint_by_id = {record["id"]: record for record in lock["checkpoints"]}
@@ -1771,6 +1784,25 @@ def test_post_wave_audit_accepts_exact_complete_category_corpus(tmp_path: Path) 
             "public_conservation_pimc_v1": sum(contract.EXPECTED_ATTEMPTS.values())
         },
     }
+
+    original_create = contract._create_or_verify_readonly
+    for crash_after in (1, 2, 3):
+        crash_report = tmp_path / f"audit.crash-{crash_after}.json"
+        calls = 0
+
+        def crash_after_write(path: Path, payload: dict) -> None:
+            nonlocal calls
+            calls += 1
+            original_create(path, payload)
+            if calls == crash_after:
+                raise RuntimeError(f"injected crash after artifact {crash_after}")
+
+        monkeypatch.setattr(contract, "_create_or_verify_readonly", crash_after_write)
+        with pytest.raises(RuntimeError, match="injected crash"):
+            contract.audit_outputs(lock_path, crash_report)
+        monkeypatch.setattr(contract, "_create_or_verify_readonly", original_create)
+        replayed = contract.audit_outputs(lock_path, crash_report)
+        assert replayed["passed"] is True
 
     # The acceptance scanner binds the planner's information regime at the
     # row boundary, not merely via a top-level manifest assertion.  Corrupt a

@@ -1789,6 +1789,25 @@ def test_exclusive_lock_refuses_a_second_writer(tmp_path: Path) -> None:
         os.close(descriptor)
 
 
+def test_exclusive_lock_rejects_symlink_and_revalidates_named_inode(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "target.lock"
+    target.write_text("", encoding="utf-8")
+    symlink = tmp_path / "symlink.lock"
+    symlink.symlink_to(target)
+    with pytest.raises(OSError):
+        with promotion._exclusive_lock(symlink):
+            pass
+
+    lock = tmp_path / "promotion.lock"
+    with pytest.raises(promotion.PromotionError, match="identity drifted"):
+        with promotion._exclusive_lock(lock):
+            replacement = tmp_path / "replacement.lock"
+            replacement.write_text("", encoding="utf-8")
+            os.replace(replacement, lock)
+
+
 def test_alternate_lock_path_is_forbidden(tmp_path: Path) -> None:
     fixture = _fixture(tmp_path)
     with pytest.raises(promotion.PromotionError, match="alternate promotion lock"):

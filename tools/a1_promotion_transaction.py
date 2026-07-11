@@ -20,6 +20,7 @@ import fcntl
 import hashlib
 import json
 import os
+import stat
 import sys
 import time
 import uuid
@@ -262,7 +263,12 @@ def _validate_file_ref(
 
 
 def _fsync_dir(path: Path) -> None:
-    descriptor = os.open(path, os.O_RDONLY)
+    descriptor = os.open(
+        path,
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+    )
     try:
         os.fsync(descriptor)
     finally:
@@ -291,7 +297,14 @@ def _atomic_write_json(path: Path, value: Any) -> None:
 
 def _write_new_bytes(path: Path, data: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    descriptor = os.open(
+        path,
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
     try:
         with os.fdopen(descriptor, "wb", closefd=True) as handle:
             handle.write(data)
@@ -306,13 +319,39 @@ def _write_new_bytes(path: Path, data: bytes) -> None:
 @contextmanager
 def _exclusive_lock(path: Path) -> Iterator[None]:
     path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    created = False
     try:
+        descriptor = os.open(
+            path,
+            os.O_RDWR
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        created = True
+    except FileExistsError:
+        descriptor = os.open(
+            path, os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+        )
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1:
+            raise PromotionError(f"promotion lock is not a regular file: {path}")
+        os.fchmod(descriptor, 0o600)
+        if created:
+            _fsync_dir(path.parent)
         try:
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as error:
             raise PromotionError(f"promotion lock is already held: {path}") from error
         yield
+        named = path.stat(follow_symlinks=False)
+        if (
+            not stat.S_ISREG(named.st_mode)
+            or (named.st_dev, named.st_ino) != (opened.st_dev, opened.st_ino)
+        ):
+            raise PromotionError(f"promotion lock identity drifted: {path}")
     finally:
         try:
             fcntl.flock(descriptor, fcntl.LOCK_UN)

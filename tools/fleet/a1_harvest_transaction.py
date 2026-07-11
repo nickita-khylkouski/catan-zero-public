@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import ctypes
 import errno
+import fcntl
 import hashlib
 import json
 import os
@@ -24,10 +25,12 @@ import stat
 import subprocess
 import sys
 import tarfile
+import tempfile
 import uuid
 from collections import defaultdict
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
@@ -47,6 +50,88 @@ class HarvestError(RuntimeError):
     """A collection invariant failed; no final tree was published."""
 
 
+@dataclass
+class _PinnedInput:
+    path: Path
+    descriptor: int
+    identity: tuple[int, int, int, int, int]
+    data: bytes
+    sha256: str
+
+    @classmethod
+    def open(cls, path: Path) -> "_PinnedInput":
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags)
+        try:
+            before = os.fstat(descriptor)
+            if not stat.S_ISREG(before.st_mode):
+                raise HarvestError(f"immutable input is not a regular file: {path}")
+            chunks: list[bytes] = []
+            while True:
+                chunk = os.read(descriptor, 1 << 20)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            after = os.fstat(descriptor)
+            identity = _stat_identity(before)
+            if identity != _stat_identity(after):
+                raise HarvestError(f"immutable input changed while pinning: {path}")
+            data = b"".join(chunks)
+            if len(data) != before.st_size:
+                raise HarvestError(f"immutable input was partially read: {path}")
+            return cls(
+                path=path,
+                descriptor=descriptor,
+                identity=identity,
+                data=data,
+                sha256="sha256:" + hashlib.sha256(data).hexdigest(),
+            )
+        except BaseException:
+            os.close(descriptor)
+            raise
+
+    def revalidate(self) -> None:
+        if _stat_identity(os.fstat(self.descriptor)) != self.identity:
+            raise HarvestError(f"pinned immutable input descriptor drifted: {self.path}")
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            current = os.open(self.path, flags)
+        except OSError as error:
+            raise HarvestError(f"pinned immutable input path drifted: {self.path}: {error}") from error
+        try:
+            if _stat_identity(os.fstat(current)) != self.identity:
+                raise HarvestError(f"pinned immutable input inode drifted: {self.path}")
+        finally:
+            os.close(current)
+        if _sha256_descriptor(self.descriptor) != self.sha256:
+            raise HarvestError(f"pinned immutable input bytes drifted: {self.path}")
+
+    def close(self) -> None:
+        os.close(self.descriptor)
+
+
+def _stat_identity(value: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        int(value.st_dev),
+        int(value.st_ino),
+        int(value.st_size),
+        int(value.st_mtime_ns),
+        int(value.st_ctime_ns),
+    )
+
+
+def _sha256_descriptor(descriptor: int) -> str:
+    digest = hashlib.sha256()
+    offset = 0
+    while True:
+        chunk = os.pread(descriptor, 1 << 20, offset)
+        if not chunk:
+            break
+        digest.update(chunk)
+        offset += len(chunk)
+    return "sha256:" + digest.hexdigest()
+
+
 def _canonical_bytes(value: Any) -> bytes:
     return json.dumps(
         value, sort_keys=True, separators=(",", ":"), ensure_ascii=True
@@ -58,16 +143,37 @@ def _value_sha256(value: Any) -> str:
 
 
 def _file_sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1 << 20), b""):
-            digest.update(chunk)
-    return "sha256:" + digest.hexdigest()
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise HarvestError(f"cannot hash non-regular file {path}")
+        digest = _sha256_descriptor(descriptor)
+        if _stat_identity(before) != _stat_identity(os.fstat(descriptor)):
+            raise HarvestError(f"file changed during stable hash: {path}")
+        return digest
+    finally:
+        os.close(descriptor)
 
 
 def _load_json(path: Path) -> dict[str, Any]:
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            before = os.fstat(descriptor)
+            if not stat.S_ISREG(before.st_mode):
+                raise HarvestError(f"JSON artifact is not regular: {path}")
+            chunks: list[bytes] = []
+            while True:
+                chunk = os.read(descriptor, 1 << 20)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            if _stat_identity(before) != _stat_identity(os.fstat(descriptor)):
+                raise HarvestError(f"JSON artifact changed while reading: {path}")
+        finally:
+            os.close(descriptor)
+        value = json.loads(b"".join(chunks).decode("utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
         raise HarvestError(f"cannot load JSON {path}: {error}") from error
     if not isinstance(value, dict):
@@ -279,15 +385,38 @@ def _inventory_job(
 
 def _write_exclusive_json(path: Path, payload: dict[str, Any]) -> None:
     data = json.dumps(payload, indent=2, sort_keys=True).encode("utf-8") + b"\n"
-    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o444)
+    descriptor = os.open(
+        path,
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_NOFOLLOW", 0),
+        0o444,
+    )
     try:
         with os.fdopen(descriptor, "wb") as handle:
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
+        parent = os.open(
+            path.parent,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            os.fsync(parent)
+        finally:
+            os.close(parent)
     except BaseException:
         path.unlink(missing_ok=True)
         raise
+
+
+def _install_or_verify_json(path: Path, payload: dict[str, Any]) -> None:
+    if path.exists():
+        if path.is_symlink() or _load_json(path) != payload:
+            raise HarvestError(f"existing final metadata drifted: {path}")
+        return
+    _write_exclusive_json(path, payload)
 
 
 def _verify_state(
@@ -360,6 +489,8 @@ def _validate_published(
     rendered: dict[str, Any],
     lock_path: Path,
     render_path: Path,
+    lock_pin: _PinnedInput,
+    render_pin: _PinnedInput,
 ) -> dict[str, Any]:
     if destination.is_symlink() or destination.resolve(strict=True) != destination.absolute():
         raise HarvestError("published harvest root is a symlink")
@@ -397,14 +528,16 @@ def _validate_published(
     if receipt_digest != _value_sha256(receipt_unhashed):
         raise HarvestError("published receipt digest drift")
     if (
-        relocation.get("render_path") != str(render_path)
-        or relocation.get("render_file_sha256") != contract._sha256(render_path)
+        relocation.get("contract_path") != str(lock_path)
+        or relocation.get("contract_file_sha256") != lock_pin.sha256
+        or relocation.get("render_path") != str(render_path)
+        or relocation.get("render_file_sha256") != render_pin.sha256
         or relocation.get("render_sha256") != rendered["render_sha256"]
     ):
-        raise HarvestError("published harvest immutable render-file identity drift")
+        raise HarvestError("published harvest immutable input-file identity drift")
     try:
         contract._load_harvest_relocation(
-            destination / "relocation_map.json", lock=lock, lock_path=lock_path
+            destination / "relocation_map.json", lock=lock
         )
     except contract.ContractError as error:
         raise HarvestError(str(error)) from error
@@ -419,9 +552,16 @@ def _validate_published(
     return relocation
 
 
-def _atomic_publish_noreplace(source: Path, destination: Path) -> None:
+def _atomic_publish_noreplace(
+    source: Path,
+    destination: Path,
+    *,
+    preflight: Callable[[], None] | None = None,
+) -> None:
     """Atomically rename a directory while refusing every existing target."""
 
+    if preflight is not None:
+        preflight()
     libc = ctypes.CDLL(None, use_errno=True)
     source_bytes = os.fsencode(source)
     destination_bytes = os.fsencode(destination)
@@ -444,25 +584,21 @@ def _atomic_publish_noreplace(source: Path, destination: Path) -> None:
         raise OSError(error_number, os.strerror(error_number), str(destination))
 
 
-def harvest(
+def _harvest_locked(
     lock_path: Path,
     render_path: Path,
+    snapshot_lock_path: Path,
+    snapshot_render_path: Path,
     destination: Path,
     *,
+    lock_pin: _PinnedInput,
+    render_pin: _PinnedInput,
+    parent_fd: int,
     ssh_command: Sequence[str] = ("ssh",),
 ) -> dict[str, Any]:
     """Collect and atomically publish the exact sealed 120-job output set."""
 
-    lock_path = lock_path.expanduser().resolve(strict=True)
-    render_path = render_path.expanduser().resolve(strict=True)
-    destination = destination.expanduser().absolute()
-    try:
-        destination_parent = destination.parent.resolve(strict=True)
-    except OSError as error:
-        raise HarvestError(f"harvest destination parent is invalid: {error}") from error
-    if destination_parent != destination.parent.absolute():
-        raise HarvestError("harvest destination parent must not traverse a symlink")
-    lock, rendered, jobs = _validate_inputs(lock_path, render_path)
+    lock, rendered, jobs = _validate_inputs(snapshot_lock_path, snapshot_render_path)
     transaction_key = _value_sha256(
         {
             "contract_sha256": lock["contract_sha256"],
@@ -471,44 +607,41 @@ def harvest(
         }
     ).removeprefix("sha256:")[:20]
     if destination.exists():
-        return _validate_published(
+        lock_pin.revalidate()
+        render_pin.revalidate()
+        result = _validate_published(
             destination,
             lock=lock,
             rendered=rendered,
             lock_path=lock_path,
             render_path=render_path,
+            lock_pin=lock_pin,
+            render_pin=render_pin,
         )
+        lock_pin.revalidate()
+        render_pin.revalidate()
+        return result
     stage = destination.parent / f".{destination.name}.harvest-{transaction_key}.staging"
     payload = stage / "payload"
     jobs_root = payload / "jobs"
     state_root = stage / "state"
     incoming_root = stage / "incoming"
+    if not stage.exists():
+        try:
+            os.mkdir(stage.name, mode=0o700, dir_fd=parent_fd)
+        except FileExistsError:
+            pass
     if stage.exists() and (stage.is_symlink() or not stage.is_dir()):
         raise HarvestError(f"unsafe pre-existing harvest staging path {stage}")
-    for path in (stage, payload, jobs_root, state_root, incoming_root):
-        path.mkdir(parents=True, exist_ok=True)
+    for path in (payload, jobs_root, state_root, incoming_root):
+        path.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(path, 0o700)
         if path.is_symlink() or not path.is_dir() or path.resolve() != path.absolute():
             raise HarvestError(f"unsafe harvest staging directory {path}")
     staged_map = payload / "relocation_map.json"
     staged_receipt = payload / "harvest_receipt.json"
-    if staged_map.exists() != staged_receipt.exists():
-        raise HarvestError("staging contains a partial final harvest receipt")
-    if staged_map.exists():
-        result = _validate_published(
-            payload,
-            lock=lock,
-            rendered=rendered,
-            lock_path=lock_path,
-            render_path=render_path,
-        )
-        _atomic_publish_noreplace(payload, destination)
-        parent_fd = os.open(destination.parent, os.O_RDONLY)
-        try:
-            os.fsync(parent_fd)
-        finally:
-            os.close(parent_fd)
-        shutil.rmtree(stage, ignore_errors=True)
-        return result
+    if staged_receipt.exists() and not staged_map.exists():
+        raise HarvestError("staging receipt exists without its relocation map")
 
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for job in jobs:
@@ -562,7 +695,21 @@ def harvest(
 
     if set(inventories) != {str(job["job_id"]) for job in jobs}:
         raise HarvestError("staging does not cover the exact immutable job set")
-    files = [record for job in jobs for record in inventories[str(job["job_id"])] ]
+    # Re-read the entire staged payload immediately before metadata creation.
+    # State receipts accelerate network resume but are never final authority.
+    final_inventories = {
+        str(job["job_id"]): _inventory_job(
+            jobs_root / str(job["job_id"]), job, lock
+        )
+        for job in jobs
+    }
+    if final_inventories != inventories:
+        raise HarvestError("staged payload changed after its per-job receipts")
+    files = [
+        record
+        for job in jobs
+        for record in final_inventories[str(job["job_id"])]
+    ]
     source_paths = [record["source_path"] for record in files]
     if len(source_paths) != len(set(source_paths)):
         raise HarvestError("harvest contains duplicate immutable source paths")
@@ -576,10 +723,10 @@ def harvest(
     relocation = {
         "schema_version": SCHEMA,
         "contract_path": str(lock_path),
-        "contract_file_sha256": contract._sha256(lock_path),
+        "contract_file_sha256": lock_pin.sha256,
         "contract_sha256": lock["contract_sha256"],
         "render_path": str(render_path),
-        "render_file_sha256": contract._sha256(render_path),
+        "render_file_sha256": render_pin.sha256,
         "render_sha256": rendered["render_sha256"],
         "host_count": len(grouped),
         "job_count": len(jobs),
@@ -589,7 +736,7 @@ def harvest(
         "file_inventory_sha256": _value_sha256(files),
     }
     relocation["relocation_sha256"] = _value_sha256(relocation)
-    _write_exclusive_json(payload / "relocation_map.json", relocation)
+    _install_or_verify_json(staged_map, relocation)
     receipt = {
         "schema_version": RECEIPT_SCHEMA,
         "contract_sha256": lock["contract_sha256"],
@@ -601,26 +748,184 @@ def harvest(
         "file_inventory_sha256": relocation["file_inventory_sha256"],
     }
     receipt["receipt_sha256"] = _value_sha256(receipt)
-    _write_exclusive_json(payload / "harvest_receipt.json", receipt)
+    _install_or_verify_json(staged_receipt, receipt)
     directory_fd = os.open(payload, os.O_RDONLY)
     try:
         os.fsync(directory_fd)
     finally:
         os.close(directory_fd)
-    _atomic_publish_noreplace(payload, destination)
-    parent_fd = os.open(destination.parent, os.O_RDONLY)
+    def preflight() -> None:
+        lock_pin.revalidate()
+        render_pin.revalidate()
+        actual = _validate_published(
+            payload,
+            lock=lock,
+            rendered=rendered,
+            lock_path=lock_path,
+            render_path=render_path,
+            lock_pin=lock_pin,
+            render_pin=render_pin,
+        )
+        if actual != relocation:
+            raise HarvestError("staged relocation changed before atomic publish")
+
+    _atomic_publish_noreplace(payload, destination, preflight=preflight)
+    publish_parent_fd = os.open(destination.parent, os.O_RDONLY)
     try:
-        os.fsync(parent_fd)
+        os.fsync(publish_parent_fd)
     finally:
-        os.close(parent_fd)
+        os.close(publish_parent_fd)
     shutil.rmtree(stage, ignore_errors=True)
-    return _validate_published(
+    lock_pin.revalidate()
+    render_pin.revalidate()
+    result = _validate_published(
         destination,
         lock=lock,
         rendered=rendered,
         lock_path=lock_path,
         render_path=render_path,
+        lock_pin=lock_pin,
+        render_pin=render_pin,
     )
+    lock_pin.revalidate()
+    render_pin.revalidate()
+    return result
+
+
+def _write_snapshot(path: Path, data: bytes) -> None:
+    descriptor = os.open(
+        path,
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_NOFOLLOW", 0),
+        0o400,
+    )
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except BaseException:
+        path.unlink(missing_ok=True)
+        raise
+
+
+def harvest(
+    lock_path: Path,
+    render_path: Path,
+    destination: Path,
+    *,
+    ssh_command: Sequence[str] = ("ssh",),
+) -> dict[str, Any]:
+    """Pin immutable inputs, serialize the destination, then collect/publish."""
+
+    lock_path = lock_path.expanduser().absolute()
+    render_path = render_path.expanduser().absolute()
+    destination = destination.expanduser().absolute()
+    for label, path in (("lock", lock_path), ("render", render_path)):
+        try:
+            canonical = path.resolve(strict=True)
+        except OSError as error:
+            raise HarvestError(f"cannot resolve immutable {label} input: {error}") from error
+        if canonical != path:
+            raise HarvestError(f"immutable {label} input path must not traverse symlinks")
+    try:
+        destination_parent = destination.parent.resolve(strict=True)
+    except OSError as error:
+        raise HarvestError(f"harvest destination parent is invalid: {error}") from error
+    if destination_parent != destination.parent.absolute():
+        raise HarvestError("harvest destination parent must not traverse a symlink")
+    parent_fd = os.open(
+        destination_parent,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+    )
+    lock_name = (
+        ".a1-harvest-"
+        + hashlib.sha256(str(destination).encode("utf-8")).hexdigest()[:24]
+        + ".lock"
+    )
+    while True:
+        try:
+            transaction_fd = os.open(
+                lock_name,
+                os.O_RDWR
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+                dir_fd=parent_fd,
+            )
+            break
+        except FileExistsError:
+            try:
+                transaction_fd = os.open(
+                    lock_name,
+                    os.O_RDWR | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=parent_fd,
+                )
+                break
+            except FileNotFoundError:
+                continue
+    lock_pin: _PinnedInput | None = None
+    render_pin: _PinnedInput | None = None
+    snapshot_root: Path | None = None
+    try:
+        transaction_stat = os.fstat(transaction_fd)
+        if (
+            not stat.S_ISREG(transaction_stat.st_mode)
+            or transaction_stat.st_uid != os.getuid()
+            or transaction_stat.st_nlink != 1
+        ):
+            raise HarvestError("destination transaction lock is not a regular file")
+        os.fchmod(transaction_fd, 0o600)
+        fcntl.flock(transaction_fd, fcntl.LOCK_EX)
+        os.fsync(parent_fd)
+        lock_pin = _PinnedInput.open(lock_path)
+        render_pin = _PinnedInput.open(render_path)
+        lock_pin.revalidate()
+        render_pin.revalidate()
+        snapshot_root = Path(
+            tempfile.mkdtemp(
+                prefix=f".{destination.name}.inputs-", dir=destination_parent
+            )
+        )
+        os.chmod(snapshot_root, 0o700)
+        snapshot_lock = snapshot_root / "lock.json"
+        snapshot_render = snapshot_root / "render.json"
+        _write_snapshot(snapshot_lock, lock_pin.data)
+        _write_snapshot(snapshot_render, render_pin.data)
+        result = _harvest_locked(
+            lock_path,
+            render_path,
+            snapshot_lock,
+            snapshot_render,
+            destination,
+            lock_pin=lock_pin,
+            render_pin=render_pin,
+            parent_fd=parent_fd,
+            ssh_command=ssh_command,
+        )
+        named_lock = os.stat(lock_name, dir_fd=parent_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(named_lock.st_mode)
+            or (named_lock.st_dev, named_lock.st_ino)
+            != (transaction_stat.st_dev, transaction_stat.st_ino)
+        ):
+            raise HarvestError("destination transaction lock identity drifted")
+        return result
+    finally:
+        if snapshot_root is not None:
+            shutil.rmtree(snapshot_root, ignore_errors=True)
+        if render_pin is not None:
+            render_pin.close()
+        if lock_pin is not None:
+            lock_pin.close()
+        try:
+            fcntl.flock(transaction_fd, fcntl.LOCK_UN)
+        finally:
+            os.close(transaction_fd)
+            os.close(parent_fd)
 
 
 def main(argv: Sequence[str] | None = None) -> int:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -283,3 +284,92 @@ def test_relocation_loader_rejects_post_publish_symlink(fleet, tmp_path: Path) -
         contract._load_harvest_relocation(
             tmp_path / "published/relocation_map.json", lock=fleet[0]
         )
+
+
+@pytest.mark.parametrize("input_index", [2, 3], ids=["lock", "render"])
+def test_input_inode_drift_during_os_replace_never_publishes_mixed_identity(
+    fleet,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    input_index: int,
+) -> None:
+    input_path = fleet[input_index]
+    original_replace = harvest.os.replace
+    injected = False
+
+    def drifting_replace(source, destination, *args, **kwargs):
+        nonlocal injected
+        if not injected:
+            injected = True
+            replacement = input_path.with_suffix(input_path.suffix + ".replacement")
+            replacement.write_text('{"drift":true}\n', encoding="utf-8")
+            original_replace(replacement, input_path)
+        return original_replace(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(harvest.os, "replace", drifting_replace)
+    with pytest.raises(harvest.HarvestError, match="immutable input .*drifted"):
+        _run(fleet, tmp_path)
+    assert not (tmp_path / "published").exists()
+
+
+def test_receipt_write_crash_replays_existing_exact_map(
+    fleet, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original_write = harvest._write_exclusive_json
+    crashed = False
+
+    def crash_receipt(path: Path, payload: dict) -> None:
+        nonlocal crashed
+        if path.name == "harvest_receipt.json" and not crashed:
+            crashed = True
+            raise RuntimeError("injected receipt crash")
+        original_write(path, payload)
+
+    monkeypatch.setattr(harvest, "_write_exclusive_json", crash_receipt)
+    with pytest.raises(RuntimeError, match="receipt crash"):
+        _run(fleet, tmp_path)
+    assert not (tmp_path / "published").exists()
+    assert len(fleet[-1].read_text().splitlines()) == 8
+    stage = next(tmp_path.glob(".published.harvest-*.staging"))
+    assert stage.stat().st_mode & 0o777 == 0o700
+    assert all(
+        path.stat().st_mode & 0o777 == 0o700
+        for path in (stage / "payload", stage / "state", stage / "incoming")
+    )
+    monkeypatch.setattr(harvest, "_write_exclusive_json", original_write)
+
+    result = _run(fleet, tmp_path)
+
+    assert result["job_count"] == 120
+    assert len(fleet[-1].read_text().splitlines()) == 8
+
+
+def test_staged_mutation_immediately_before_rename_fails_preflight(
+    fleet, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original_publish = harvest._atomic_publish_noreplace
+
+    def mutate_then_publish(source: Path, destination: Path, *, preflight=None) -> None:
+        shard = next((source / "jobs").rglob("shard.npz"))
+        shard.chmod(0o644)
+        shard.write_bytes(b"mutated-before-rename")
+        original_publish(source, destination, preflight=preflight)
+
+    monkeypatch.setattr(harvest, "_atomic_publish_noreplace", mutate_then_publish)
+    with pytest.raises(
+        (harvest.HarvestError, contract.ContractError),
+        match="digest|bytes|changed",
+    ):
+        _run(fleet, tmp_path)
+    assert not (tmp_path / "published").exists()
+
+
+def test_concurrent_same_destination_invocations_serialize_on_parent_lock(
+    fleet, tmp_path: Path
+) -> None:
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(_run, fleet, tmp_path) for _ in range(2)]
+        results = [future.result(timeout=30) for future in futures]
+
+    assert results[0] == results[1]
+    assert len(fleet[-1].read_text().splitlines()) == 8

@@ -3260,14 +3260,24 @@ def _durable_replace(path: Path, data: bytes) -> None:
     temporary = path.with_name(f".{path.name}.claim-{uuid.uuid4().hex}.tmp")
     try:
         descriptor = os.open(
-            temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode
+            temporary,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0),
+            mode,
         )
         with os.fdopen(descriptor, "wb") as handle:
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
-        directory_fd = os.open(path.parent, os.O_RDONLY)
+        directory_fd = os.open(
+            path.parent,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
         try:
             os.fsync(directory_fd)
         finally:
@@ -3284,7 +3294,14 @@ def _create_durable_readonly(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     serialized = json.dumps(payload, indent=2, sort_keys=True).encode() + b"\n"
     try:
-        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o444)
+        descriptor = os.open(
+            path,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o444,
+        )
     except FileExistsError as error:
         raise ContractError(f"refusing to overwrite claim receipt {path}") from error
     try:
@@ -3293,7 +3310,12 @@ def _create_durable_readonly(path: Path, payload: dict[str, Any]) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.chmod(path, stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH)
-        directory_fd = os.open(path.parent, os.O_RDONLY)
+        directory_fd = os.open(
+            path.parent,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
         try:
             os.fsync(directory_fd)
         finally:
@@ -3432,7 +3454,14 @@ def _create_readonly(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     serialized = json.dumps(payload, indent=2, sort_keys=True) + "\n"
     try:
-        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o444)
+        descriptor = os.open(
+            path,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o444,
+        )
     except FileExistsError as error:
         raise ContractError(
             f"refusing to overwrite immutable artifact {path}"
@@ -3443,9 +3472,73 @@ def _create_readonly(path: Path, payload: dict[str, Any]) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.chmod(path, stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH)
+        directory_fd = os.open(
+            path.parent,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
     except BaseException:
         path.unlink(missing_ok=True)
         raise
+
+
+def _create_or_verify_readonly(path: Path, payload: dict[str, Any]) -> None:
+    """Durably create deterministic output, or verify an exact prior write."""
+
+    path = path.absolute()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    serialized = json.dumps(payload, indent=2, sort_keys=True).encode() + b"\n"
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except FileNotFoundError:
+        try:
+            _create_readonly(path, payload)
+            return
+        except ContractError:
+            # A cooperating retry may have won O_EXCL after our absence check.
+            try:
+                descriptor = os.open(path, flags)
+            except OSError as error:
+                raise ContractError(
+                    f"cannot replay immutable artifact {path}: {error}"
+                ) from error
+    except OSError as error:
+        raise ContractError(f"cannot replay immutable artifact {path}: {error}") from error
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise ContractError(f"immutable artifact is not regular: {path}")
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(descriptor, 1 << 20)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        after = os.fstat(descriptor)
+        identity_before = (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        )
+        identity_after = (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        )
+        if identity_before != identity_after or b"".join(chunks) != serialized:
+            raise ContractError(f"existing immutable artifact differs: {path}")
+    finally:
+        os.close(descriptor)
 
 
 def render(lock_path: Path, out_dir: Path) -> dict[str, Any]:
@@ -4635,9 +4728,9 @@ def audit_outputs(
     }
     report["audit_sha256"] = _digest_value(report)
     if validation_manifest is not None:
-        _create_readonly(validation_seed_manifest_path, validation_manifest)
+        _create_or_verify_readonly(validation_seed_manifest_path, validation_manifest)
         assert selected_game_manifest is not None
-        _create_readonly(selected_game_manifest_path, selected_game_manifest)
+        _create_or_verify_readonly(selected_game_manifest_path, selected_game_manifest)
         report["validation_holdout"]["manifest_file_sha256"] = _sha256(
             validation_seed_manifest_path
         )
@@ -4649,7 +4742,7 @@ def audit_outputs(
         report["audit_sha256"] = _digest_value(
             {key: value for key, value in report.items() if key != "audit_sha256"}
         )
-    _create_readonly(out_path.absolute(), report)
+    _create_or_verify_readonly(out_path.absolute(), report)
     if errors:
         raise ContractError(
             f"post-wave audit failed with {len(errors)} error(s); see {out_path}"
