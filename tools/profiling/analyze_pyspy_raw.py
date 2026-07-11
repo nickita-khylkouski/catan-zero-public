@@ -72,11 +72,23 @@ def _category(thread: str, stack: str) -> str:
         if "catanatron_rs" in stack or "gumbel_mcts::" in stack:
             return "native_mcts_traversal_and_allocator"
         return "python_pimc_orchestration"
+    if any(
+        token in stack
+        for token in (
+            "_simulate (",
+            "_traverse_single_sample (",
+            "_traverse_roll (",
+            "_traverse_robber_or_dev (",
+            "_enumerate_roll_outcomes (",
+            "_expand (",
+        )
+    ):
+        return "python_mcts_traversal"
     if (
         "catan_zero/search/gumbel_chance_mcts.py" in stack
         or "catan_zero/search/rust_mcts.py" in stack
     ):
-        return "python_mcts_traversal"
+        return "python_search_orchestration"
     if "/vendor/catanatron/" in stack:
         return "python_catanatron_referee"
     if any(
