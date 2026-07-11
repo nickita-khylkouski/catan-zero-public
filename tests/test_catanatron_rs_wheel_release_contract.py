@@ -15,7 +15,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 BUILDER = REPO_ROOT / "tools" / "build_catanatron_rs_wheel.sh"
 CHECKSUM_INVENTORY = "native/catanatron-rs/WHEEL_SHA256SUMS"
-RECEIPT_NAME = "catanatron_rs-0.1.4-build-receipt.json"
+RECEIPT_NAME = "catanatron_rs-0.1.5-build-receipt.json"
 RECEIPT_SCHEMA = "catanatron-rs-wheel-build-receipt-v2"
 
 
@@ -89,6 +89,24 @@ def test_all_cargo_resolution_is_locked() -> None:
     assert "native/gumbel_mcts_rs/Cargo.lock" in _script()
 
 
+def test_native_mcts_wheel_has_one_unique_015_package_identity() -> None:
+    expected = "0.1.5"
+    manifests = (
+        REPO_ROOT / "native/catanatron-rs/Cargo.toml",
+        REPO_ROOT / "native/catanatron-rs/python/Cargo.toml",
+        REPO_ROOT / "native/catanatron-rs/pyproject.toml",
+    )
+    for manifest in manifests:
+        match = re.search(r'^version = "([^"]+)"$', manifest.read_text(), re.MULTILINE)
+        assert match is not None
+        assert match.group(1) == expected
+
+    script = _script()
+    assert "catanatron_rs-0.1.5-cp311-cp311-manylinux_2_34_x86_64.whl" in script
+    assert "catanatron_rs-0.1.5-build-receipt.json" in script
+    assert "catanatron_rs-0.1.4-cp311" not in script
+
+
 def test_release_environment_and_toolchain_are_sealed() -> None:
     script = _script()
 
@@ -121,7 +139,7 @@ def test_source_identity_is_bound_only_after_compilation() -> None:
     assert 'CATAN_RS_SOURCE_TREE="$SEALED_COMPILE_IDENTITY"' in staged_environment
     assert 'CATAN_RS_SOURCE_COMMIT="$SOURCE_COMMIT"' not in staged_environment
     assert 'CATAN_RS_SOURCE_TREE="$SOURCE_TREE"' not in staged_environment
-    assert 'SEALED_COMPILE_IDENTITY="catanatron-rs-0.1.4-infoset-wheel-v1"' in script
+    assert 'SEALED_COMPILE_IDENTITY="catanatron-rs-0.1.5-native-mcts-wheel-v1"' in script
     assert 'payload["source_commit"] = sys.argv[2]' in script
     assert 'payload["source_tree"] = sys.argv[3]' in script
     assert '"source_commit": None' in script

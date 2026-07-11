@@ -9,7 +9,7 @@ import subprocess
 ROOT = Path(__file__).resolve().parents[1]
 INSTALLER = ROOT / "tools" / "install_v1_freeze.sh"
 MPS_UNIT = ROOT / "tools" / "fleet" / "systemd" / "nvidia-mps.service"
-WHEEL_NAME = "catanatron_rs-0.1.4-cp311-cp311-manylinux_2_34_x86_64.whl"
+WHEEL_NAME = "catanatron_rs-0.1.5-cp311-cp311-manylinux_2_34_x86_64.whl"
 
 
 def _run(*args: str, cwd: Path) -> subprocess.CompletedProcess[str]:
@@ -109,6 +109,9 @@ def test_installer_shell_syntax_and_preflight_order() -> None:
     assert 'git rev-parse --verify "refs/tags/${CATAN_REF}^{commit}"' in text
     assert "sha256sum -c --strict wheel.sha256" in text
     assert "CATAN_DEST must be an absolute systemd-safe path" in text
+    assert 'assert rs == "0.1.5"' in text
+    assert 'getattr(catanatron_rs, "gumbel_search", None)' in text
+    assert 'rust_version != "0.1.5"' in text
 
 
 def test_malformed_inventory_fails_before_any_privileged_mutation(
@@ -142,7 +145,7 @@ def test_additional_well_formed_inventory_record_fails_closed(tmp_path: Path) ->
     repo = _release_repo(
         tmp_path,
         f"{digest}  {WHEEL_NAME}\n"
-        f"{'1' * 64}  catanatron_rs-0.1.4-cp310-cp310-manylinux_2_34_x86_64.whl\n",
+        f"{'1' * 64}  catanatron_rs-0.1.5-cp310-cp310-manylinux_2_34_x86_64.whl\n",
     )
     result, sudo_marker, _destination = _invoke(tmp_path, repo=repo, wheel=wheel)
     assert result.returncode == 3
@@ -240,6 +243,7 @@ def test_receipt_is_outside_checkout_and_binds_release_evidence() -> None:
         '"checksum_inventory_sha256"',
         '"catanatron_rs_version"',
         '"determinize_for_player"',
+        '"gumbel_search"',
         '"fleet_exporter_fragment_path"',
         '"fleet_exporter_dropin_paths"',
         '"fleet_exporter_effective"',
