@@ -45,10 +45,10 @@ table is not a teacher/volume role split.
 
 ## 3. Canonical code + environment (CAT-117)
 - Repo: **`github.com/nickita-khylkouski/catan-zero-public`** (**PUBLIC**, no
-  auth required). **Release blocker:** the verified H100 changes currently live
-  only in this worktree; `v1.0-deploy` predates them. Publish an immutable new
-  release tag with the `catanatron_rs` wheel asset before provisioning any fleet
-  box.
+  auth required). The canonical native-MCTS release is
+  **`v1.4-native-mcts`**, created only at checksum commit B of the two-commit
+  transaction below. All earlier tags predate the `catanatron_rs 0.1.5` native
+  search API and must not provision or resume native-MCTS lanes.
 - Env target: **Python 3.11.15**, **torch cu128** (all H100 + B200), **catanatron_rs 0.1.5 cp311**.
 - Verification snapshot (2026-07-09): local full suite **1,737 passed / 200
   skipped**; H100 full suite **1,913 passed / 24 skipped**; native
