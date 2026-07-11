@@ -642,7 +642,7 @@ def test_legacy_incumbent_builder_refuses_adjacent_bare_checkpoint_name(
         )
 
 
-@pytest.mark.parametrize("link_kind", ["final", "ancestor"])
+@pytest.mark.parametrize("link_kind", ["final", "ancestor", "broken_ancestor"])
 def test_legacy_incumbent_builder_refuses_symlinked_relative_matches(
     tmp_path: Path, link_kind: str
 ) -> None:
@@ -655,11 +655,32 @@ def test_legacy_incumbent_builder_refuses_symlinked_relative_matches(
         link = decoy_root / declared
         link.parent.mkdir(parents=True)
         link.symlink_to(champion)
-    else:
+    elif link_kind == "ancestor":
         link = decoy_root / "runs"
         link.symlink_to(tmp_path / "runs", target_is_directory=True)
+    else:
+        link = decoy_root / "runs"
+        link.symlink_to(tmp_path / "missing-runs", target_is_directory=True)
 
     with pytest.raises(artifacts.ArtifactBuildError, match="must not contain symlinks"):
+        artifacts.build_legacy_incumbent_calibration_source(
+            calibration_path=calibration,
+            historical_training_report=historical,
+            contract=contract,
+            champion=champion,
+        )
+
+
+def test_legacy_incumbent_builder_translates_absolute_symlink_loop(
+    tmp_path: Path,
+) -> None:
+    loop = tmp_path / "checkpoint-loop.pt"
+    loop.symlink_to(loop)
+    champion, calibration, historical, contract = _legacy_incumbent_inputs(
+        tmp_path, historical_checkpoint=str(loop)
+    )
+
+    with pytest.raises(artifacts.ArtifactBuildError, match="cannot resolve"):
         artifacts.build_legacy_incumbent_calibration_source(
             calibration_path=calibration,
             historical_training_report=historical,

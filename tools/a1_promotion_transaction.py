@@ -197,7 +197,7 @@ def _canonical_existing_file(path: Path, *, where: str) -> Path:
     lexical = _lexical_absolute(path)
     try:
         resolved = lexical.resolve(strict=True)
-    except OSError as error:
+    except (OSError, RuntimeError) as error:
         raise PromotionError(f"cannot resolve {where}: {error}") from error
     if lexical != resolved:
         raise PromotionError(f"{where} must not contain symlinks: {lexical}")
@@ -230,6 +230,13 @@ def _historical_checkpoint_path(
     matches: list[Path] = []
     for base in (report_path.parent, *report_path.parent.parents):
         candidate = base.joinpath(*clean_parts)
+        lexical = _lexical_absolute(candidate)
+        try:
+            resolved = lexical.resolve(strict=False)
+        except (OSError, RuntimeError) as error:
+            raise PromotionError(f"cannot resolve {where}: {error}") from error
+        if lexical != resolved:
+            raise PromotionError(f"{where} must not contain symlinks: {lexical}")
         if candidate.exists() or candidate.is_symlink():
             matches.append(_canonical_existing_file(candidate, where=where))
     if len(matches) != 1:
