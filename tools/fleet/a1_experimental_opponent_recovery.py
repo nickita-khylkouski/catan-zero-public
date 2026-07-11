@@ -839,7 +839,7 @@ def _stage_host(
             "print(json.dumps({'state':'installed'}))",
         )
     tool_source = Path(__file__).resolve()
-    remote_tool = f"{operator_dir}/a1_experimental_opponent_recovery.py"
+    remote_tool = _remote_tool_path(plan)
     _stage_file(
         source=tool_source,
         destination=remote_tool,
@@ -870,6 +870,14 @@ def _stage_host(
             operator_dir=operator_dir,
         )
     return {"host_alias": alias, "runtime": runtime_repo, "operator": operator_dir}
+
+
+def _remote_tool_path(plan: dict[str, Any]) -> str:
+    digest = _sha256(Path(__file__).resolve()).removeprefix("sha256:")
+    return (
+        f"{plan['recovery_root']}/operator/"
+        f"a1_experimental_opponent_recovery-{digest}.py"
+    )
 
 
 def _preflight_host(
@@ -972,9 +980,7 @@ def launch(
     if not go:
         return {"mode": "dry-run", "label": LABEL, "targets": targets}
     remote_plan = f"{plan['recovery_root']}/operator/plan.json"
-    remote_tool = (
-        f"{plan['recovery_root']}/operator/a1_experimental_opponent_recovery.py"
-    )
+    remote_tool = _remote_tool_path(plan)
     aliases = sorted({lane["host_alias"] for lane in plan["lanes"]})
     source_repo = Path(plan["runtime_source_repo"])
     subprocess.run(
@@ -1162,9 +1168,7 @@ def fleet_stop(
     plan = _verify_plan(plan_path)
     fleet = _fleet(fleet_path)
     remote_plan = f"{plan['recovery_root']}/operator/plan.json"
-    remote_tool = (
-        f"{plan['recovery_root']}/operator/a1_experimental_opponent_recovery.py"
-    )
+    remote_tool = _remote_tool_path(plan)
     rows = []
     aliases = sorted({lane["host_alias"] for lane in plan["lanes"]})
     for alias in aliases:
