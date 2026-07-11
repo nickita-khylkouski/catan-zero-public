@@ -580,6 +580,7 @@ def _fixture(
             "champion": _checkpoint_ref(champion),
             "evaluation_config": {
                 **evidence_semantics,
+                "c_scale": candidate_search_config["c_scale"],
                 "candidate_c_scale": candidate_search_config["c_scale"],
                 "baseline_c_scale": champion_search_config["c_scale"],
                 "candidate_n_full": 128,
@@ -1625,6 +1626,26 @@ def test_high_regret_report_binds_candidate_and_incumbent_role_scales(
     )
 
     with pytest.raises(promotion.PromotionError, match="baseline_c_scale"):
+        _execute(fixture, go=False)
+
+
+def test_high_regret_report_rejects_forged_candidate_role_scale(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path)
+
+    def mutate(source: dict) -> None:
+        report_path = Path(source["report"]["path"])
+        report = json.loads(report_path.read_text())
+        report["evaluation_config"]["candidate_c_scale"] = 0.03
+        _write_json(report_path, report)
+        source["report"]["sha256"] = promotion._sha256(report_path)
+
+    _mutate_evidence_source(
+        fixture, kind="high_regret", role="high_regret", mutate=mutate
+    )
+
+    with pytest.raises(promotion.PromotionError, match="candidate_c_scale"):
         _execute(fixture, go=False)
 
 

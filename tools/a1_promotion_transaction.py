@@ -2152,6 +2152,7 @@ def _verify_high_regret_source(
         evaluation_config,
         {
             **sealed_semantics,
+            "c_scale": candidate_search_config["c_scale"],
             "candidate_c_scale": candidate_search_config["c_scale"],
             "baseline_c_scale": champion_search_config["c_scale"],
             "candidate_n_full": sealed_semantics["n_full"],

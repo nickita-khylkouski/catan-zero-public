@@ -213,6 +213,25 @@ def _validated_high_regret_games(
     return complete_games, normalized_games, len(incomplete_pairs)
 
 
+def _validate_high_regret_evaluation_config(raw: Any, *, where: str) -> None:
+    if not isinstance(raw, dict):
+        raise ArtifactBuildError(f"{where} must be an object")
+    expected = {
+        "c_scale": promotion.CANDIDATE_DEPLOYED_C_SCALE,
+        "candidate_c_scale": promotion.CANDIDATE_DEPLOYED_C_SCALE,
+        "baseline_c_scale": promotion.CHAMPION_DEPLOYED_C_SCALE,
+        "candidate_n_full": 128,
+        "baseline_n_full": 128,
+        "p_full": 1.0,
+        "force_full_every_decision": True,
+    }
+    for key, value in expected.items():
+        if raw.get(key) != value or type(raw.get(key)) is not type(value):
+            raise ArtifactBuildError(
+                f"{where} has inconsistent {key}={raw.get(key)!r}, expected {value!r}"
+            )
+
+
 def _write_new_readonly(path: Path, value: dict[str, Any]) -> None:
     path = Path(os.path.abspath(os.fspath(path.expanduser())))
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -272,6 +291,9 @@ def build_high_regret_source(
     )
     if raw["errors"] != []:
         raise ArtifactBuildError("high-regret report contains evaluation errors")
+    _validate_high_regret_evaluation_config(
+        raw["evaluation_config"], where="high-regret report.evaluation_config"
+    )
     _suite_path, suite_ref = _bound_file_ref(
         raw["suite_manifest"],
         base=report_path.parent,
@@ -717,6 +739,9 @@ def build_bucket_game_report(
         raise ArtifactBuildError(
             "bucket extraction requires a clean high-regret report"
         )
+    _validate_high_regret_evaluation_config(
+        raw["evaluation_config"], where="bucket report.evaluation_config"
+    )
     candidate_ref = _verify_checkpoint_ref(
         raw["candidate"], expected=candidate, where="bucket report.candidate"
     )

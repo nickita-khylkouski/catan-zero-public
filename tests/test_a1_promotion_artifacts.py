@@ -104,7 +104,15 @@ def _high_regret_report(
         "suite_manifest": _ref(suite),
         "candidate": _ref(candidate),
         "champion": _ref(champion),
-        "evaluation_config": {},
+        "evaluation_config": {
+            "c_scale": promotion.CANDIDATE_DEPLOYED_C_SCALE,
+            "candidate_c_scale": promotion.CANDIDATE_DEPLOYED_C_SCALE,
+            "baseline_c_scale": promotion.CHAMPION_DEPLOYED_C_SCALE,
+            "candidate_n_full": 128,
+            "baseline_n_full": 128,
+            "p_full": 1.0,
+            "force_full_every_decision": True,
+        },
         "errors": [],
         "games": games,
         "pentanomial_sprt": pentanomial,
@@ -517,6 +525,29 @@ def test_high_regret_builder_rejects_stale_truncation_statistics(
     _json(report, raw)
 
     with pytest.raises(artifacts.ArtifactBuildError, match="paired statistics"):
+        artifacts.build_high_regret_source(
+            report_path=report, candidate=candidate, champion=champion
+        )
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("c_scale", 0.03),
+        ("candidate_c_scale", 0.03),
+        ("baseline_c_scale", 0.10),
+    ],
+)
+def test_high_regret_builder_rejects_forged_role_scales(
+    tmp_path: Path, key: str, value: float
+) -> None:
+    candidate, champion = _checkpoints(tmp_path)
+    raw = _high_regret_report(tmp_path, candidate, champion)
+    raw["evaluation_config"][key] = value
+    report = tmp_path / f"forged-{key}.report.json"
+    _json(report, raw)
+
+    with pytest.raises(artifacts.ArtifactBuildError, match=key):
         artifacts.build_high_regret_source(
             report_path=report, candidate=candidate, champion=champion
         )
