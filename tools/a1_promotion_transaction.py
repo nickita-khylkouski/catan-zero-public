@@ -3102,11 +3102,16 @@ def prepare_promotion(
             "current_before": current_before,
             "current_after": current_after,
         },
+        "_legacy_snapshot": legacy_snapshot,
     }
 
 
 def _public_receipt(plan: dict[str, Any]) -> dict[str, Any]:
-    return {key: value for key, value in plan.items() if key != "_bytes"}
+    return {
+        key: value
+        for key, value in plan.items()
+        if key not in {"_bytes", "_legacy_snapshot"}
+    }
 
 
 def execute_promotion(
@@ -3158,6 +3163,11 @@ def execute_promotion(
             return _public_receipt(plan)
 
         payload = plan["_bytes"]
+        mutation_snapshot = plan.get("_legacy_snapshot")
+        if mutation_snapshot is not None:
+            if not isinstance(mutation_snapshot, _LegacyPromotionSnapshot):
+                raise PromotionError("legacy mutation snapshot is malformed")
+            _revalidate_legacy_snapshot(mutation_snapshot)
         registry_backup, current_backup = _backup_paths(receipt_path)
         if registry_backup.exists() or current_backup.exists():
             raise PromotionError("rollback backup path already exists")

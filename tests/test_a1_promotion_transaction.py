@@ -2035,3 +2035,38 @@ def test_legacy_attestation_replacement_before_plan_construction_is_rejected(
         promotion.PromotionError, match="legacy contract attestation pathname changed"
     ):
         _execute(fixture, go=False)
+
+
+def test_legacy_snapshot_is_revalidated_at_commit_mutation_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = _fixture(tmp_path)
+    snapshot = _legacy_snapshot_for_fixture(fixture, tmp_path)
+    monkeypatch.setattr(
+        promotion,
+        "_verify_contract_with_snapshot",
+        lambda *_args, **_kwargs: (fixture["contract"], snapshot),
+    )
+    original_prepare = promotion.prepare_promotion
+
+    def replace_after_prepare(**kwargs):
+        plan = original_prepare(**kwargs)
+        assert snapshot.attestation is not None
+        replacement = tmp_path / "replacement-at-mutation-boundary.json"
+        replacement.write_bytes(snapshot.attestation.data)
+        replacement.replace(snapshot.attestation.path)
+        return plan
+
+    monkeypatch.setattr(promotion, "prepare_promotion", replace_after_prepare)
+    registry_before = fixture["registry"].read_bytes()
+    pointer_before = fixture["pointer"].read_bytes()
+    with pytest.raises(
+        promotion.PromotionError, match="legacy contract attestation pathname changed"
+    ):
+        _execute(fixture, go=True)
+    assert fixture["registry"].read_bytes() == registry_before
+    assert fixture["pointer"].read_bytes() == pointer_before
+    assert not fixture["receipt"].exists()
+    assert not fixture["receipt"].with_name(
+        fixture["receipt"].name + ".registry.before"
+    ).exists()
