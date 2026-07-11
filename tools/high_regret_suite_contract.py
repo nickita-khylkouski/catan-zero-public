@@ -176,6 +176,10 @@ def bind_state_to_manifest(
     if not authoritative_path.is_absolute():
         authoritative_path = manifest_path.parent / authoritative_path
     authoritative_path = authoritative_path.resolve()
+    if not authoritative_path.name.endswith((".npz", ".npz.zst")):
+        raise ValueError(
+            "held-out suite authoritative shard is outside replay inventory namespace"
+        )
     declared_path = Path(str(state.get("shard_path", ""))).expanduser()
     if not declared_path.is_absolute():
         declared_path = suite_base / declared_path

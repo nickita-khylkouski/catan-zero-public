@@ -23,6 +23,7 @@ from catan_zero.rl.pipeline_configs import EvalConfig  # noqa: E402
 import gumbel_search_cross_net_h2h as h2h  # type: ignore  # noqa: E402
 from high_regret_suite_contract import (  # type: ignore  # noqa: E402
     REPLAY_CONTRACT,
+    bind_state_to_manifest,
     scope_inventory_sha256,
 )
 from gumbel_search_cross_net_h2h import (  # type: ignore  # noqa: E402
@@ -254,6 +255,52 @@ def test_held_out_suite_loader_replays_digest_and_source_manifest(
     path.write_text(json.dumps(adversarial), encoding="utf-8")
     with pytest.raises(ValueError, match="not bound to source manifest row"):
         _load_held_out_high_regret_suite(path)
+
+
+def test_manifest_source_must_belong_to_hashed_replay_inventory(
+    tmp_path: Path,
+) -> None:
+    scope = tmp_path / "worker"
+    scope.mkdir()
+    replay_shard = scope / "trajectory.npz"
+    np.savez(
+        replay_shard,
+        game_seed=np.asarray([123]),
+        decision_index=np.asarray([0]),
+        action_taken=np.asarray([1]),
+    )
+    unbound_npz = scope / "unbound.npz"
+    np.savez(
+        unbound_npz,
+        game_seed=np.asarray([123]),
+        decision_index=np.asarray([0]),
+        action_taken=np.asarray([1]),
+    )
+    unbound = scope / "unbound.bin"
+    unbound_npz.replace(unbound)
+    inventory_sha, inventory_count = scope_inventory_sha256(scope)
+    state = {
+        "shard_id": 0,
+        "row_index": 0,
+        "game_seed": 123,
+        "decision_index": 0,
+        "shard_path": str(unbound),
+        "replay_source": {
+            "contract": REPLAY_CONTRACT,
+            "scope": str(scope),
+            "scope_inventory_sha256": inventory_sha,
+            "scope_shard_count": inventory_count,
+        },
+    }
+
+    with pytest.raises(ValueError, match="outside replay inventory namespace"):
+        bind_state_to_manifest(
+            state,
+            suite_base=tmp_path,
+            manifest_path=tmp_path / "manifest.npz",
+            shard_paths=[str(unbound)],
+            identities={(0, 0, 123, 0)},
+        )
 
 
 def _base_worker_args(**overrides) -> dict:
