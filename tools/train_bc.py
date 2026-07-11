@@ -1999,11 +1999,31 @@ def _validate_a1_corpus_artifacts_and_seeds(
     )
     if str(lock_path) != str(contract_path_value):
         raise SystemExit("A1 contract lock path is not canonical")
-    if lock_payload.get("schema_version") not in {
+    lock_schema = lock_payload.get("schema_version")
+    if lock_schema not in {
         "a1-pre-wave-contract-lock-v2",
         "a1-pre-wave-contract-lock-v3",
     }:
         raise SystemExit("A1 contract lock schema drift")
+    promotion_handoff = lock_payload.get("promotion_handoff")
+    if lock_schema == "a1-pre-wave-contract-lock-v3":
+        if (
+            not isinstance(promotion_handoff, dict)
+            or promotion_handoff.get("mode") != "post_promotion"
+        ):
+            raise SystemExit("A1 v3 contract lacks its post-promotion producer handoff")
+    elif promotion_handoff is not None:
+        # v2 locks created after the boundary carry an explicit historical
+        # marker.  Markerless v2 remains readable only here for already-audited
+        # pre-boundary corpora; a1_pre_wave_contract can no longer seal one.
+        if (
+            not isinstance(promotion_handoff, dict)
+            or set(promotion_handoff) != {"mode", "reason"}
+            or promotion_handoff.get("mode") != "historical_pre_promotion"
+            or not isinstance(promotion_handoff.get("reason"), str)
+            or not promotion_handoff["reason"].strip()
+        ):
+            raise SystemExit("A1 v2 historical promotion marker drift")
     lock_digest = _canonical_json_sha256(
         {key: value for key, value in lock_payload.items() if key != "contract_sha256"}
     )

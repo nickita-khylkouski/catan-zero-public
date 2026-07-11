@@ -21,14 +21,25 @@ def _identity(checkpoint: Path) -> dict:
 def _state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict:
     checkpoint = tmp_path / "candidate.pt"
     checkpoint.write_bytes(b"candidate-v4")
+    identity = _identity(checkpoint)
+    receipt_path = tmp_path / "promotion.receipt.json"
     registry_path = tmp_path / "champions.json"
     registry = ChampionRegistry(registry_path)
-    registry.set_role("generator_champion", checkpoint, version=4)
+    registry.set_role(
+        "generator_champion",
+        checkpoint,
+        version=4,
+        provenance={
+            "a1_promotion_receipt": str(receipt_path),
+            "a1_candidate_agent_identity_sha256": identity[
+                "agent_identity_sha256"
+            ],
+            "a1_candidate_search_config": identity["search_config"],
+        },
+    )
     registry.save()
     pointer = tmp_path / "CURRENT_CHAMPION"
     pointer.write_bytes((str(checkpoint) + "\n").encode())
-    receipt_path = tmp_path / "promotion.receipt.json"
-    receipt_path.write_text("{}\n", encoding="utf-8")
     receipt = {
         "status": "committed",
         "transaction_id": "tx-4",
@@ -39,9 +50,13 @@ def _state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict:
             "path": str(checkpoint),
             "sha256": handoff._sha256(checkpoint),  # noqa: SLF001
             "version": 4,
-            "agent_identity": _identity(checkpoint),
+            "agent_identity": identity,
         },
     }
+    receipt_path.write_text(
+        json.dumps({"registry": {"path": str(registry_path)}}) + "\n",
+        encoding="utf-8",
+    )
 
     def load(_: Path):
         return receipt, receipt_path, registry_path, pointer, tmp_path / "rb", tmp_path / "pb"
@@ -63,6 +78,24 @@ def _write_handoff(state: dict, tmp_path: Path) -> tuple[Path, dict]:
     return path, payload
 
 
+def _science_args(monkeypatch: pytest.MonkeyPatch, *, c_scale: float = 0.1) -> dict:
+    monkeypatch.setattr(
+        promotion,
+        "_sealed_evaluation_semantics",
+        lambda _: {"c_scale": c_scale, "n_full": 128},
+    )
+    monkeypatch.setattr(
+        promotion,
+        "_role_search_config",
+        lambda _, role: {"c_scale": 0.1, "n_full": 128},
+    )
+    return {
+        "effective_search": {"c_scale": c_scale},
+        "evaluator": {},
+        "generation": {},
+    }
+
+
 def test_handoff_binds_committed_registry_pointer_and_producer(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -76,6 +109,7 @@ def test_handoff_binds_committed_registry_pointer_and_producer(
         {"mode": "post_promotion", "path": str(path)},
         base=tmp_path,
         producer=producer,
+        **_science_args(monkeypatch),
     )
     assert record["registry_role"] == "generator_champion"
     assert record["registry_version"] == 4
@@ -134,6 +168,44 @@ def test_refuses_wrong_registry_role_or_version(
         handoff.build_handoff(state["receipt_path"])
 
 
+def test_refuses_registry_provenance_identity_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state = _state(tmp_path, monkeypatch)
+    raw = json.loads(state["registry"].read_text())
+    raw["roles"]["generator_champion"]["provenance"][
+        "a1_candidate_search_config"
+    ] = {"c_scale": 0.03, "n_full": 128}
+    state["registry"].write_text(json.dumps(raw, sort_keys=True))
+    state["receipt"]["registry"]["after_sha256"] = handoff._sha256(  # noqa: SLF001
+        state["registry"]
+    )
+    with pytest.raises(handoff.HandoffError, match="registry generator provenance"):
+        handoff.build_handoff(state["receipt_path"])
+
+
+def test_refuses_atomic_replacement_before_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state = _state(tmp_path, monkeypatch)
+    original = handoff._revalidate_snapshot  # noqa: SLF001
+    calls = 0
+
+    def race(snapshot: dict[Path, bytes]) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            replacement = tmp_path / "registry.replacement"
+            replacement.write_bytes(state["registry"].read_bytes() + b" ")
+            replacement.replace(state["registry"])
+        original(snapshot)
+
+    monkeypatch.setattr(handoff, "_revalidate_snapshot", race)
+    with pytest.raises(handoff.HandoffError, match="replaced before output"):
+        handoff.write_handoff(state["receipt_path"], tmp_path / "handoff.json")
+    assert not (tmp_path / "handoff.json").exists()
+
+
 def test_refuses_draft_producer_not_equal_to_promoted_lineage(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -146,6 +218,25 @@ def test_refuses_draft_producer_not_equal_to_promoted_lineage(
             {"mode": "post_promotion", "path": str(path)},
             base=tmp_path,
             producer={"path": str(other), "sha256": handoff._sha256(other)},  # noqa: SLF001
+            **_science_args(monkeypatch),
+        )
+
+
+def test_refuses_promoted_point10_identity_with_point03_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state = _state(tmp_path, monkeypatch)
+    path, _ = _write_handoff(state, tmp_path)
+    producer = {
+        "path": str(state["checkpoint"]),
+        "sha256": handoff._sha256(state["checkpoint"]),  # noqa: SLF001
+    }
+    with pytest.raises(contract.ContractError, match="generation c_scale"):
+        contract._promotion_handoff_record(  # noqa: SLF001
+            {"mode": "post_promotion", "path": str(path)},
+            base=tmp_path,
+            producer=producer,
+            **_science_args(monkeypatch, c_scale=0.03),
         )
 
 

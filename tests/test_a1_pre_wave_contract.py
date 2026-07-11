@@ -391,6 +391,31 @@ def test_checked_in_relative_provenance_paths_canonicalize_to_required_files() -
     )
 
 
+@pytest.mark.parametrize(
+    "marker",
+    [
+        {"mode": "historical_pre_promotion", "reason": ""},
+        {
+            "mode": "historical_pre_promotion",
+            "reason": "predates promotion",
+            "unchecked": True,
+        },
+    ],
+)
+def test_verify_lock_refuses_malformed_historical_marker(
+    tmp_path: Path, marker: dict
+) -> None:
+    _, lock = _lock(tmp_path)
+    lock["promotion_handoff"] = marker
+    unhashed = dict(lock)
+    unhashed.pop("contract_sha256")
+    lock["contract_sha256"] = contract._digest_value(unhashed)
+    mutated = tmp_path / "mutated.lock.json"
+    mutated.write_text(json.dumps(lock, indent=2, sort_keys=True) + "\n")
+    with pytest.raises(contract.ContractError, match="historical promotion_handoff"):
+        contract.verify_lock(mutated)
+
+
 def test_seal_expands_exact_category_jobs_and_binds_science_hashes(
     tmp_path: Path,
 ) -> None:
