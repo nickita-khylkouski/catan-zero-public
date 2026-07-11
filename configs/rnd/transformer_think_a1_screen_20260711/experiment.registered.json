@@ -1,0 +1,179 @@
+{
+  "arms": [
+    {
+      "arm_id": "transformer-k0",
+      "capacity_class": "smaller_k0",
+      "comparison_role": "compute_control_only",
+      "expected_parameters": 35041353,
+      "latent_deliberation_steps": 0,
+      "promotion_eligible": false
+    },
+    {
+      "arm_id": "think-transformer-k1",
+      "capacity_class": "shared_think_40793673",
+      "comparison_role": "capacity_matched_reference",
+      "expected_parameters": 40793673,
+      "latent_deliberation_steps": 1,
+      "promotion_eligible": false
+    },
+    {
+      "arm_id": "think-transformer-k2",
+      "capacity_class": "shared_think_40793673",
+      "comparison_role": "primary_candidate",
+      "expected_parameters": 40793673,
+      "latent_deliberation_steps": 2,
+      "promotion_eligible": true
+    },
+    {
+      "arm_id": "think-transformer-k4",
+      "capacity_class": "shared_think_40793673",
+      "comparison_role": "primary_candidate",
+      "expected_parameters": 40793673,
+      "latent_deliberation_steps": 4,
+      "promotion_eligible": true
+    }
+  ],
+  "common": {
+    "attention_heads": 8,
+    "frozen_incumbent_checkpoint_sha256": "89aa133d629e747021bc725f2ad63e0563f3b76e71f0dd563f056c6de8f77ebb",
+    "hidden_size": 640,
+    "identity_initialization_required": true,
+    "information_regime": "public_conservation_pimc_v1",
+    "latent_deliberation_slots": 8,
+    "state_layers": 6,
+    "state_trunk": "transformer"
+  },
+  "comparison_contract": {
+    "capacity_matched_arm_ids": [
+      "think-transformer-k1",
+      "think-transformer-k2",
+      "think-transformer-k4"
+    ],
+    "compute_control_arms": [
+      "transformer-k0"
+    ],
+    "forbidden_primary_comparisons": [
+      "think-transformer-k2:transformer-k0",
+      "think-transformer-k4:transformer-k0"
+    ],
+    "maximum_nonforced_decision_micro_ce_regression": 0.005,
+    "minimum_relative_improvement_vs_k1": 0.02,
+    "primary_candidate_arms": [
+      "think-transformer-k2",
+      "think-transformer-k4"
+    ],
+    "primary_metric": "game_macro_soft_target_policy_ce_nonforced",
+    "primary_reference_arm": "think-transformer-k1",
+    "uncertainty": "paired_crossed_bootstrap_training_seed_and_common_holdout_game"
+  },
+  "config_sha256": "6d6630a3a2579f419ba8a9a1a2a34e4fcc52938680668dd40b3c2b2561d2dc09",
+  "config_sha256_scope": "canonical_json_without_config_sha256",
+  "production_defaults_changed": false,
+  "purpose": "Test fixed-depth shared recurrent latent computation on one Transformer h640/L6 family using the authenticated A1 public-information corpus.",
+  "registration": {
+    "a1_artifact_sha256": {
+      "contract_lock": "8301c7547e1745812c69ca04934424755c7116eb5e221688abc58c1bcb7a3122",
+      "post_wave_audit": "289ce0bee9e50889e4eb12830f0f2e66355294db7a0055553d4c2145280a06e3",
+      "selected_game_manifest": "dbd6c5deca4f5ef71aaadc6b7023310fb83f17cebfcb4dbdd9de061d2eda98f1",
+      "validation_manifest": "ade5dc03ebbfe6de9de13e469ec37dbef9ca797e515a1c19a144e86513f6c160"
+    },
+    "corpus_fingerprint": "2afe5c718493fc714c7d71fc492da5b0906d02db7a9017b2820c8cc5b78f10a2",
+    "executing_learner_source_sha256": {
+      "src/catan_zero/rl/entity_token_policy.py": "5dda873f2e3b38d48b0d162f04fb97f8e828ba88e8820469120cac92e0925b77",
+      "src/catan_zero/rl/pipeline_configs.py": "4bb20e0a404ea813c69d24da8cc37973b8bd984e45beff302e1221906d47618a",
+      "src/catan_zero/rl/sparse_topology_adapter.py": "9b2b83679dc600cd6624a4ff87b0604ec5bd45d4afb6ff8cbff8b4706a375165",
+      "tools/rnd_e3_a1_admission.py": "12fd6296c6e4c6a3b8d8b9869da2ace72ae5dc84e4980ceb51409e85e61a2e5a",
+      "tools/rnd_transformer_latent_upgrade_checkpoint.py": "c2c50424b74953809bd668ade369934ab6b3c61b733e9aa46bb70fe05e0e65aa",
+      "tools/rnd_transformer_think_a1_admission.py": "b1f894b36764158c4fe478b1179b34e9928cbcdf2a2f5c3a26c5f5a17876c5d3",
+      "tools/train_bc.py": "48a3e36124ed4e510fb1fa22612129e3a0df10f568ff552d20415fada20a5819"
+    },
+    "identity_report_sha256": "0bc3915daf23c6fbe8cd0a3c7e8063b02bcaaa2320e91038ced19e7cb8e10cf4",
+    "initial_checkpoint_sha256_by_arm_seed": {
+      "think-transformer-k1@101": "784abbd62af5fd7a38e53ae21796f8678d53c2c5ea38d4b6d730b452b1fbc44a",
+      "think-transformer-k1@103": "64dabef9ef5001915bb85df15de4a93a27b8692757460581996c222de6ecc14f",
+      "think-transformer-k1@107": "258dcfe18bf37707e0f3f0146fedeafc2d36b4fb3c667ec17f9042e3d5dab3af",
+      "think-transformer-k2@101": "eea65af1c3c9c5b8e5da3b86d74e5273af1e7e922219e385a8e10f1f9dca4a81",
+      "think-transformer-k2@103": "e2462a6c9cd73f2aeb10cadf8ad1945ab5f5839d67d5f7caa0e726171cf1bc5a",
+      "think-transformer-k2@107": "7954839a8d5bb71ee6fb22110c6244902820b742c1daf9d58298298ad3c5ce05",
+      "think-transformer-k4@101": "911b0a4a2a180ad073ad207cdb8ee046a859ae182524100b7f65c6a2bf1fcc89",
+      "think-transformer-k4@103": "db9e8709133d53b48d825fe413a03c457741e8caf79c1bba1ad8d2ec535c1de8",
+      "think-transformer-k4@107": "fdf6dfe73839faa475ae92df6f75a58e85dfbf1dd2e02b906933af8572ebba62",
+      "transformer-k0@101": "89aa133d629e747021bc725f2ad63e0563f3b76e71f0dd563f056c6de8f77ebb",
+      "transformer-k0@103": "89aa133d629e747021bc725f2ad63e0563f3b76e71f0dd563f056c6de8f77ebb",
+      "transformer-k0@107": "89aa133d629e747021bc725f2ad63e0563f3b76e71f0dd563f056c6de8f77ebb"
+    },
+    "source_teacher_checkpoint_sha256": "89aa133d629e747021bc725f2ad63e0563f3b76e71f0dd563f056c6de8f77ebb",
+    "training_manifest_sha256": "dbd6c5deca4f5ef71aaadc6b7023310fb83f17cebfcb4dbdd9de061d2eda98f1",
+    "validation_manifest_sha256": "ade5dc03ebbfe6de9de13e469ec37dbef9ca797e515a1c19a144e86513f6c160"
+  },
+  "run_matrix": {
+    "admission_manifest_filename": "admission.json",
+    "checkpoint_filename": "checkpoint.pt",
+    "initialization_directory_pattern": "runs/rnd_transformer_think_a1_screen_20260711/initialization/seed_{training_seed}",
+    "report_filename": "report.json",
+    "required_run_count": 12,
+    "run_directory_pattern": "runs/rnd_transformer_think_a1_screen_20260711/{arm_id}/seed_{training_seed}",
+    "seeds": [
+      101,
+      103,
+      107
+    ]
+  },
+  "schema_version": "catan-zero-transformer-think-a1-screen/v1",
+  "status": "registered_ready",
+  "training_recipe": {
+    "action_module_lr_mult": 1.0,
+    "allow_concurrent_bc": true,
+    "amp": "bf16",
+    "arch": "entity_graph",
+    "aux_subgoal_loss_weight": 0.0,
+    "batch_size": 1024,
+    "data_format": "memmap",
+    "device": "cuda",
+    "epochs": 1,
+    "final_vp_loss_weight": 0.0,
+    "forced_action_weight": 0.1,
+    "forced_row_value_weight": 1.0,
+    "fresh_optimizer": true,
+    "fused_optimizer": false,
+    "global_batch_size": 4096,
+    "grad_accum_steps": 4,
+    "graph_dropout": 0.05,
+    "graph_history_features": true,
+    "loser_sample_weight": 0.3,
+    "lr": 3e-05,
+    "lr_schedule": "flat",
+    "lr_warmup_steps": 25,
+    "mask_hidden_info": true,
+    "max_steps": 250,
+    "optimizer": "adam",
+    "policy_kl_anchor_weight": 0.0,
+    "policy_loss_weight": 1.0,
+    "progress_every_batches": 25,
+    "q_loss_weight": 0.0,
+    "resume_optimizer": false,
+    "rnd_allow_a1_learner_override": true,
+    "sample_presentations_per_arm_seed": 1024000,
+    "skip_teacher_quality_gate": true,
+    "soft_target_min_legal_coverage": 0.5,
+    "soft_target_source": "policy",
+    "soft_target_temperature": 0.7,
+    "soft_target_weight": 0.9,
+    "symmetry_augment": false,
+    "symmetry_augment_events": true,
+    "track": "2p_no_trade",
+    "truncated_vp_margin_value_weight": 0.25,
+    "trust_curated_data_quality": true,
+    "validation_fraction": 0.05,
+    "validation_max_samples": 0,
+    "validation_seed": 17,
+    "value_head_type": "mse",
+    "value_loss_weight": 0.25,
+    "value_lr_mult": 0.3,
+    "value_target_lambda": 1.0,
+    "value_uncertainty_loss_weight": 0.0,
+    "vps_to_win": 10,
+    "weight_decay": 0.0,
+    "winner_sample_weight": 1.0
+  }
+}
