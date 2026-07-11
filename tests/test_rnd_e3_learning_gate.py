@@ -8,6 +8,7 @@ import sys
 
 import pytest
 
+import tools.rnd_e3_learning_gate as gate_module
 from tools.rnd_e3_learning_gate import GateInputError, main, score_learning_gate
 
 
@@ -17,6 +18,15 @@ GATE_PATH = ROOT / "configs/rnd/e3_a1_screen_20260710/learning_gate.v1.json"
 EVIDENCE_CONTRACT_PATH = (
     ROOT / "configs/rnd/e3_a1_screen_20260710/evidence_export.v1.json"
 )
+
+
+@pytest.fixture(autouse=True)
+def _small_frozen_gate_fixture(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep unit tests small while exercising the same immutable-value checks."""
+    monkeypatch.setattr(gate_module, "FROZEN_MINIMUM_HOLDOUT_GAMES", 3)
+    monkeypatch.setattr(gate_module, "FROZEN_MINIMUM_NONFORCED_DECISIONS", 6)
+    monkeypatch.setattr(gate_module, "FROZEN_BOOTSTRAP_SAMPLES", 200)
+    monkeypatch.setattr(gate_module, "FROZEN_BOOTSTRAP_SEED", 20260710)
 
 
 def _canonical_sha(value) -> str:
@@ -249,6 +259,22 @@ def test_checked_in_gate_contract_is_self_hashed_and_pre_outcome_locked() -> Non
     ).hexdigest()
     assert gate["bootstrap_samples"] == 10_000
     assert gate["bootstrap_seed"] == 20260710
+
+
+def test_rejects_rehashed_decision_setting_drift() -> None:
+    experiment, gate, file_sha = _contracts()
+    gate["bootstrap_samples"] = 201
+    semantic = dict(gate)
+    semantic.pop("config_sha256")
+    gate["config_sha256"] = _canonical_sha(semantic)
+    with pytest.raises(GateInputError, match="frozen value"):
+        score_learning_gate(
+            _rows(experiment, file_sha),
+            experiment,
+            gate,
+            experiment_config_sha256=file_sha,
+            bootstrap_samples=201,
+        )
 
 
 def test_cli_hashes_exact_experiment_bytes_and_streams_jsonl(

@@ -26,6 +26,10 @@ PRIMARY = ("think-rrt-k2", "think-rrt-k4")
 SECONDARY = ("think-rrt-k8",)
 REFERENCE = "think-rrt-k1"
 _SHA_RE = re.compile(r"[0-9a-f]{64}\Z")
+FROZEN_MINIMUM_HOLDOUT_GAMES = 256
+FROZEN_MINIMUM_NONFORCED_DECISIONS = 1_024
+FROZEN_BOOTSTRAP_SAMPLES = 10_000
+FROZEN_BOOTSTRAP_SEED = 20260710
 
 
 class GateInputError(ValueError):
@@ -221,6 +225,17 @@ def _validate_config(
         gate.get("minimum_nonforced_decisions"),
         field="learning_gate.minimum_nonforced_decisions",
     )
+    frozen_decision_settings = {
+        "minimum_holdout_games": FROZEN_MINIMUM_HOLDOUT_GAMES,
+        "minimum_nonforced_decisions": FROZEN_MINIMUM_NONFORCED_DECISIONS,
+        "bootstrap_samples": FROZEN_BOOTSTRAP_SAMPLES,
+        "bootstrap_seed": FROZEN_BOOTSTRAP_SEED,
+    }
+    for field, expected_value in frozen_decision_settings.items():
+        if gate.get(field) != expected_value:
+            raise GateInputError(
+                f"learning_gate.{field} differs from the scorer's frozen value"
+            )
     improvement = _finite(
         gate.get("minimum_relative_improvement_vs_k1"),
         field="learning_gate.minimum_relative_improvement_vs_k1",

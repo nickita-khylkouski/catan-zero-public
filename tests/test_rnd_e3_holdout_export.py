@@ -10,6 +10,7 @@ import pytest
 import torch
 
 import tools.rnd_e3_holdout_export as exporter
+import tools.rnd_e3_learning_gate as gate_module
 from catan_zero.rl.entity_token_features import (
     PLAYER_ACTOR_FLAG_SLOT,
     PLAYER_FEATURE_SIZE,
@@ -460,6 +461,9 @@ def test_mocked_export_schema_is_accepted_by_learning_gate(
     gate["minimum_holdout_games"] = 1
     gate["minimum_nonforced_decisions"] = 2
     gate["bootstrap_samples"] = 100
+    monkeypatch.setattr(gate_module, "FROZEN_MINIMUM_HOLDOUT_GAMES", 1)
+    monkeypatch.setattr(gate_module, "FROZEN_MINIMUM_NONFORCED_DECISIONS", 2)
+    monkeypatch.setattr(gate_module, "FROZEN_BOOTSTRAP_SAMPLES", 100)
     semantic = dict(gate)
     semantic.pop("config_sha256")
     gate["config_sha256"] = _canonical_sha(semantic)

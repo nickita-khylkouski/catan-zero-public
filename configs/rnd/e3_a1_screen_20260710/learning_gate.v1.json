@@ -1,7 +1,7 @@
 {
   "schema_version": "catan-zero-e3-learning-gate-contract/v1",
   "config_sha256_scope": "canonical_json_without_config_sha256",
-  "config_sha256": "ad666cb66af2830641a623048e49c70087b8f7d5ee3079a31ae8e33b04e0efae",
+  "config_sha256": "09629ca38e56fe26ee144d1bfec1cd29c4112079173d77074a0e6135fe3a6c82",
   "experiment_semantic_sha256": "39438071adfe706619a97cf5ff5e4036d8b2c0afe45be94064cd63517cc47fba",
   "experiment_file_sha256": "2c67088f844ef058d39dbee549d42c7094fdbde3917e4ee42d277a5da718f6e6",
   "evidence_export_contract_file_sha256": "60363ad6d678c32dae80f0fdb1854d4363d2b93388fc5f743ced65c61802958c",
@@ -27,5 +27,5 @@
   "bootstrap_seed": 20260710,
   "uncertainty": "paired_crossed_bootstrap_training_seed_and_common_holdout_game",
   "scorer": "tools/rnd_e3_learning_gate.py",
-  "scorer_source_sha256": "e259069c5b49876b05e64a5d1bae183e12f5bced04f21cc41e2f4adeb5a00334"
+  "scorer_source_sha256": "68e3aeb4f95e0ffb2b26ad9ee0ca6d014e9303a44b8a4e05b485822378209395"
 }

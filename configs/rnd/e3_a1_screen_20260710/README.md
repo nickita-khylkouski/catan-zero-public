@@ -38,3 +38,7 @@ versus K1 using nonforced game-macro soft-target CE and a paired crossed
 seed/game bootstrap. K8 is secondary; K0 is descriptive only. The overall
 safety gate is nonforced decision-micro CE within seed, preserving the weight of
 large games. Bootstrap count and RNG seed are frozen in the gate contract.
+The scorer also hard-codes the registered support minima (256 games and 1,024
+nonforced decisions), 10,000 bootstrap samples, and seed 20260710. This second
+anchor prevents a modified, correctly self-rehashed gate file from weakening
+the decision contract.
