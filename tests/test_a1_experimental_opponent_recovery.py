@@ -317,6 +317,17 @@ def test_missing_historical_receipt_requires_explicit_annotation(
     assert plan["historical_parent_receipt"] == "historical_parent_receipt_unavailable"
 
 
+def test_plan_rejects_relative_remote_interpreter(tmp_path: Path) -> None:
+    config, failed = _fixture(tmp_path)
+    value = json.loads(config.read_text())
+    value["runtime_python"] = ".venv/bin/python"
+    _json(config, value)
+    with pytest.raises(recovery.RecoveryError, match="absolute remote path"):
+        recovery.build_plan(
+            config_path=config, failed_receipts=[failed], out=tmp_path / "plan.json"
+        )
+
+
 def test_launch_without_go_is_read_only(tmp_path: Path) -> None:
     config, failed = _fixture(tmp_path)
     plan_path = tmp_path / "plan.json"
@@ -352,3 +363,60 @@ def test_atomic_plan_refuses_different_existing_bytes(tmp_path: Path) -> None:
     recovery._atomic_exact(path, {"a": 1})  # noqa: SLF001
     with pytest.raises(recovery.RecoveryError, match="differs"):
         recovery._atomic_exact(path, {"a": 2})  # noqa: SLF001
+
+
+def test_run_lane_child_shares_supervisor_group_before_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "runtime"
+    repo.mkdir()
+    commit = "a" * 40
+    (repo / ".experimental_recovery_commit").write_text(commit + "\n")
+    output = tmp_path / "output"
+    receipt = tmp_path / "receipt.json"
+    captured: dict = {}
+    plan = {
+        "schema_version": recovery.PLAN_SCHEMA,
+        "label": recovery.LABEL,
+        "promotable": False,
+        "plan_sha256": "sha256:" + "1" * 64,
+        "runtime_repo": str(repo),
+        "runtime_python": "/opt/catan/.venv/bin/python",
+        "runtime_commit": commit,
+        "runtime_files": [],
+        "lanes": [
+            {
+                "lane_id": "n128-worker",
+                "gpu": 0,
+                "receipt": str(receipt),
+                "log_dir": str(tmp_path / "logs"),
+                "quarantine_dir": str(tmp_path / "quarantine"),
+                "commands": [
+                    {
+                        "job_id": "job",
+                        "output_dir": str(output),
+                        "argv": ["generator.py"],
+                        "ledger_claim": {"path": str(tmp_path / "ledger.md")},
+                    }
+                ],
+            }
+        ],
+    }
+
+    class FakeProcess:
+        pid = 31337
+
+        def wait(self) -> int:
+            (output / "manifest.json").write_text("{}\n")
+            return 0
+
+    def fake_popen(*args, **kwargs):
+        captured.update(kwargs)
+        return FakeProcess()
+
+    monkeypatch.setattr(recovery, "_verify_plan", lambda *_args, **_kwargs: plan)
+    monkeypatch.setattr(recovery.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(recovery.os, "getpgrp", lambda: 4242)
+    value = recovery.run_lane(tmp_path / "plan.json", "n128-worker", resume=False)
+    assert captured["start_new_session"] is False
+    assert value["jobs"]["job"]["process_group"] == 4242
