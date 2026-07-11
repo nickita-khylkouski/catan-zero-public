@@ -315,7 +315,7 @@ fn gumbel_search(
     let mut engine = GumbelMctsEngine::new(config);
     let result = engine
         .search(&native_game, &mut py_evaluator, force_full)
-        .map_err(|e| PyRuntimeError::new_err(e))?;
+        .map_err(PyRuntimeError::new_err)?;
 
     let out = PyDict::new(py);
     out.set_item("selected_action", result.selected_action)?;
