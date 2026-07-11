@@ -321,6 +321,100 @@ def test_repo_artifact_plan_binds_fixed_executor_and_supervisor() -> None:
     )
 
 
+def _historical_repo_pair(tmp_path: Path) -> tuple[Path, Path, Path, str]:
+    historical = tmp_path / "catan-db1c8b1-campaign"
+    current = tmp_path / "current"
+    relative = Path("configs/guards/generate_gumbel_selfplay_data.json")
+    for root in (historical, current):
+        artifact = root / relative
+        artifact.parent.mkdir(parents=True)
+        artifact.write_bytes(b"identical-runtime-bytes")
+    for source in (
+        Path(executor.__file__).resolve(),
+        Path(supervisor.__file__).resolve(),
+        executor._REPO_ROOT / "tools/fleet/a1_stop_helper.py",
+    ):
+        destination = current / source.relative_to(executor._REPO_ROOT)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(source.read_bytes())
+    return historical, current, relative, _sha(historical / relative)
+
+
+def test_live_shaped_db1_runtime_paths_relocate_to_identical_current_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    historical, current, relative, digest = _historical_repo_pair(tmp_path)
+    campaign = historical / "configs/operations/a1-dual-arm-56gpu-20260710/contract.json"
+    monkeypatch.setattr(executor, "HISTORICAL_DB1_REPO_ROOT", historical)
+    monkeypatch.setattr(executor, "HISTORICAL_DB1_CAMPAIGN_PATH", campaign)
+    lock = {
+        "source_campaign": {
+            "path": str(campaign),
+            "sha256": contract.HISTORICAL_DB1_CAMPAIGN_FILE_SHA256,
+        },
+        "provenance": {
+            "executor": {
+                "kind": "executor",
+                "path": "tools/fleet/a1_production_executor.py",
+                "sha256": contract.HISTORICAL_DB1_EXECUTOR_SHA256,
+            }
+        },
+    }
+    rendered = {
+        "required_artifacts": {
+            "guard_config": {
+                "path": str(historical / relative),
+                "sha256": digest,
+            },
+            "generator_code": [],
+            "runtime_code_tree": [],
+        }
+    }
+
+    artifacts = executor._repo_artifacts(
+        rendered,
+        repo_root=current,
+        historical_root=executor._historical_runtime_root(lock),
+    )
+    by_path = {record["path"]: record for record in artifacts}
+
+    assert by_path[str(relative)]["sha256"] == digest
+    assert by_path["tools/fleet/a1_lane_supervisor.py"]["sha256"] == _sha(
+        current / "tools/fleet/a1_lane_supervisor.py"
+    )
+    assert by_path["tools/fleet/a1_production_executor.py"]["sha256"] == _sha(
+        current / "tools/fleet/a1_production_executor.py"
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation", ["historical_mismatch", "current_mismatch", "symlink", "other_root"]
+)
+def test_db1_runtime_relocation_rejects_drift_symlinks_and_other_roots(
+    tmp_path: Path, mutation: str
+) -> None:
+    historical, current, relative, digest = _historical_repo_pair(tmp_path)
+    source = historical / relative
+    if mutation == "historical_mismatch":
+        source.write_bytes(b"drift")
+    elif mutation == "current_mismatch":
+        (current / relative).write_bytes(b"drift")
+    elif mutation == "symlink":
+        source.unlink()
+        source.symlink_to(current / relative)
+    elif mutation == "other_root":
+        source = tmp_path / "other" / relative
+        source.parent.mkdir(parents=True)
+        source.write_bytes(b"identical-runtime-bytes")
+
+    with pytest.raises(executor.ExecutorError):
+        executor._relocate_historical_artifact(
+            {"path": str(source), "sha256": digest},
+            historical_root=historical,
+            current_root=current,
+        )
+
+
 def test_dry_plan_is_exact_40_lane_120_job_n128_mps_contract(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -40,6 +40,11 @@ SUPERVISOR_ENVIRONMENT = {"PYTHONDONTWRITEBYTECODE": "1"}
 REQUIRED_NOFILE_SOFT = 65_536
 STOP_SSH_TIMEOUT_SECONDS = 45.0
 MPS_UNIT_PATH = _REPO_ROOT / "tools/fleet/systemd/nvidia-mps.service"
+HISTORICAL_DB1_REPO_ROOT = Path("/home/ubuntu/catan-db1c8b1-campaign")
+HISTORICAL_DB1_CAMPAIGN_PATH = (
+    HISTORICAL_DB1_REPO_ROOT
+    / "configs/operations/a1-dual-arm-56gpu-20260710/contract.json"
+)
 FORBIDDEN_ADAPTIVE_ARGV = (
     "--n-full-wide",
     "--n-full-wide-threshold",
@@ -372,10 +377,78 @@ def verify_render(
     return lock, rendered, by_lane
 
 
+def _historical_runtime_root(lock: Mapping[str, Any]) -> Path | None:
+    source = lock.get("source_campaign")
+    provenance = lock.get("provenance")
+    if not isinstance(source, dict) or not isinstance(provenance, dict):
+        return None
+    if source != {
+        "path": str(HISTORICAL_DB1_CAMPAIGN_PATH),
+        "sha256": contract.HISTORICAL_DB1_CAMPAIGN_FILE_SHA256,
+    }:
+        return None
+    if provenance.get("executor") != {
+        "kind": "executor",
+        "path": "tools/fleet/a1_production_executor.py",
+        "sha256": contract.HISTORICAL_DB1_EXECUTOR_SHA256,
+    }:
+        raise ExecutorError("historical db1 lock executor provenance drift")
+    return HISTORICAL_DB1_REPO_ROOT
+
+
+def _relocate_historical_artifact(
+    record: Mapping[str, Any], *, historical_root: Path, current_root: Path
+) -> tuple[str, Path]:
+    raw = Path(str(record["path"]))
+    try:
+        relative = raw.relative_to(historical_root)
+    except ValueError as error:
+        raise ExecutorError(
+            f"historical runtime artifact uses an unauthorized root: {raw}"
+        ) from error
+    if not relative.parts or ".." in relative.parts:
+        raise ExecutorError(f"historical runtime artifact escapes frozen root: {raw}")
+    current = current_root / relative
+    for label, path, root in (
+        ("historical", raw, historical_root),
+        ("current", current, current_root),
+    ):
+        try:
+            metadata = path.lstat()
+            resolved = path.resolve(strict=True)
+        except OSError as error:
+            raise ExecutorError(f"{label} runtime artifact is unavailable: {path}") from error
+        if (
+            stat.S_ISLNK(metadata.st_mode)
+            or not stat.S_ISREG(metadata.st_mode)
+            or resolved != path
+        ):
+            raise ExecutorError(
+                f"{label} runtime artifact is not canonical regular bytes: {path}"
+            )
+        try:
+            resolved.relative_to(root)
+        except ValueError as error:
+            raise ExecutorError(f"{label} runtime artifact escapes repo: {path}") from error
+        if _sha256(path) != record["sha256"]:
+            raise ExecutorError(f"{label} runtime artifact hash drift: {path}")
+    return str(relative), current
+
+
 def _repo_artifacts(
-    rendered: dict[str, Any], *, repo_root: Path = _REPO_ROOT
+    rendered: dict[str, Any],
+    *,
+    repo_root: Path = _REPO_ROOT,
+    historical_root: Path | None = None,
 ) -> list[dict[str, Any]]:
     root = repo_root.resolve(strict=True)
+    if historical_root is not None:
+        try:
+            resolved_historical_root = historical_root.resolve(strict=True)
+        except OSError as error:
+            raise ExecutorError("historical db1 repo root is unavailable") from error
+        if resolved_historical_root != historical_root:
+            raise ExecutorError("historical db1 repo root is not canonical")
     required = rendered["required_artifacts"]
     records = [
         *(required.get("guard_configs") or [required["guard_config"]]),
@@ -384,7 +457,14 @@ def _repo_artifacts(
     ]
     files: dict[str, Path] = {}
     for record in records:
-        path = Path(record["path"]).resolve()
+        raw = Path(str(record["path"]))
+        if historical_root is not None and raw.is_absolute():
+            relative, path = _relocate_historical_artifact(
+                record, historical_root=historical_root, current_root=root
+            )
+            files[relative] = path
+            continue
+        path = raw.resolve()
         if _sha256(path) != record["sha256"]:
             raise ExecutorError(f"required repo artifact drift: {path}")
         try:
@@ -502,7 +582,11 @@ def build_plan(
     lock, rendered, lanes = verify_render(
         lock_path, render_path, verify_lock_fn=verify_lock_fn
     )
-    repo_artifacts = _repo_artifacts(rendered, repo_root=repo_root)
+    repo_artifacts = _repo_artifacts(
+        rendered,
+        repo_root=repo_root,
+        historical_root=_historical_runtime_root(lock),
+    )
     live_ledger_path = Path(rendered["required_artifacts"]["seed_ledger"]["path"])
     live_seed_ledger_sha256 = _sha256(live_ledger_path)
     aliases = {lane[0]["host_alias"] for lane in lanes.values()}
