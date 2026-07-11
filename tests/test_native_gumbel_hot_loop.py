@@ -47,6 +47,20 @@ class _ScalarOnlyPublicEvaluator:
         return self.inner.evaluate(*args, **kwargs)
 
 
+class _WrongBatchPublicEvaluator(_ScalarOnlyPublicEvaluator):
+    def __init__(self, delta: int) -> None:
+        super().__init__()
+        self.delta = delta
+
+    def evaluate_many(self, requests, *, root_color, colors):
+        expected = self.inner.evaluate_many(
+            requests, root_color=root_color, colors=colors
+        )
+        if self.delta < 0:
+            return expected[: self.delta]
+        return expected + [({}, 0.0)] * self.delta
+
+
 def test_native_hot_loop_is_explicit_and_fallback_preserves_reference() -> None:
     pytest.importorskip("catanatron_rs")
     try:
@@ -253,6 +267,26 @@ def test_binding_rejects_experimental_deferred_batching() -> None:
             lambda *_args: ({}, 0.0),
             {"batch_size": 1, "colors": ["RED", "BLUE"]},
         )
+
+
+@pytest.mark.skipif(
+    not native_hot_loop_available(), reason="native wheel lacks gumbel_search"
+)
+@pytest.mark.parametrize("delta", [-1, 1])
+def test_native_chance_batch_length_mismatch_is_clean_error(delta: int) -> None:
+    rust = pytest.importorskip("catanatron_rs")
+    game = rust.Game.simple(["RED", "BLUE"], seed=53)
+    for _ in range(100):
+        actions = json.loads(game.playable_actions_json())
+        if len(actions) == 1 and actions[0][1] == "ROLL":
+            break
+        game.play_tick()
+    else:
+        pytest.fail("did not reach a forced ROLL root")
+    with pytest.raises(RuntimeError, match="batch length mismatch"):
+        NativeGumbelChanceMCTS(
+            GumbelChanceMCTSConfig(seed=7), _WrongBatchPublicEvaluator(delta)
+        ).search(game)
 
 
 @pytest.mark.skipif(

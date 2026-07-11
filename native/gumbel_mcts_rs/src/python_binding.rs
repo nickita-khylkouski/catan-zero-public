@@ -303,8 +303,6 @@ fn gumbel_search(
         root_eval_fn: root_evaluator,
         eval_many_fn: evaluator_many,
     };
-    let mut engine = GumbelMctsEngine::new(config);
-    // Enable batched leaf evaluation for GPU efficiency
     if let Some(v) = config_dict.get_item("batch_size")? {
         let batch_size: usize = v.extract()?;
         if batch_size > 0 {
@@ -314,6 +312,7 @@ fn gumbel_search(
             ));
         }
     }
+    let mut engine = GumbelMctsEngine::new(config);
     let result = engine
         .search(&native_game, &mut py_evaluator, force_full)
         .map_err(|e| PyRuntimeError::new_err(e))?;
