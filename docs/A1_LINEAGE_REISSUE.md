@@ -54,6 +54,7 @@ and refuses any incumbent, history, report, or checkpoint drift.
 cd "$REPO"
 python3 tools/a1_registry_bootstrap.py \
   --lock "$TRAIN_LOCK" --incumbent "$CHAMPION" \
+  --training-receipt "$TRAINING_RECEIPT" --candidate "$CANDIDATE" \
   --registry "$REGISTRY" --current-pointer "$POINTER" \
   --receipt "$BOOTSTRAP_RECEIPT"
 ```
@@ -63,6 +64,7 @@ Only after reviewing that plan, publish the new isolated baseline:
 ```bash
 python3 tools/a1_registry_bootstrap.py \
   --lock "$TRAIN_LOCK" --incumbent "$CHAMPION" \
+  --training-receipt "$TRAINING_RECEIPT" --candidate "$CANDIDATE" \
   --registry "$REGISTRY" --current-pointer "$POINTER" \
   --receipt "$BOOTSTRAP_RECEIPT" --go
 ```
