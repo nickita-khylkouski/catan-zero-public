@@ -360,6 +360,17 @@ def test_live_shaped_db1_runtime_paths_relocate_to_identical_current_bytes(
             }
         },
     }
+    historical_fixed_records = []
+    for fixed_relative in (
+        Path("tools/fleet/a1_lane_supervisor.py"),
+        Path("tools/fleet/a1_production_executor.py"),
+    ):
+        frozen_fixed = historical / fixed_relative
+        frozen_fixed.parent.mkdir(parents=True, exist_ok=True)
+        frozen_fixed.write_bytes(b"historical-sealed-control-plane")
+        historical_fixed_records.append(
+            {"path": str(frozen_fixed), "sha256": _sha(frozen_fixed)}
+        )
     rendered = {
         "required_artifacts": {
             "guard_config": {
@@ -367,7 +378,7 @@ def test_live_shaped_db1_runtime_paths_relocate_to_identical_current_bytes(
                 "sha256": digest,
             },
             "generator_code": [],
-            "runtime_code_tree": [],
+            "runtime_code_tree": historical_fixed_records,
         }
     }
 
@@ -386,9 +397,28 @@ def test_live_shaped_db1_runtime_paths_relocate_to_identical_current_bytes(
         current / "tools/fleet/a1_production_executor.py"
     )
 
+    (current / relative).write_bytes(b"changed-current-control-plane")
+    artifacts = executor._repo_artifacts(
+        rendered,
+        repo_root=current,
+        historical_root=executor._historical_runtime_root(lock),
+    )
+    by_path = {record["path"]: record for record in artifacts}
+    assert by_path[str(relative)]["source_path"] == str(historical / relative)
+    assert "source_path" not in by_path["tools/fleet/a1_lane_supervisor.py"]
+    assert "source_path" not in by_path["tools/fleet/a1_production_executor.py"]
+    archive = tmp_path / "repo.tar"
+    executor._build_repo_tar(
+        artifacts,
+        executor._repo_files(artifacts, repo_root=current),
+        archive,
+    )
+    with tarfile.open(archive) as staged:
+        assert staged.extractfile(str(relative)).read() == b"identical-runtime-bytes"
+
 
 @pytest.mark.parametrize(
-    "mutation", ["historical_mismatch", "current_mismatch", "symlink", "other_root"]
+    "mutation", ["historical_mismatch", "symlink", "current_symlink", "other_root"]
 )
 def test_db1_runtime_relocation_rejects_drift_symlinks_and_other_roots(
     tmp_path: Path, mutation: str
@@ -397,11 +427,13 @@ def test_db1_runtime_relocation_rejects_drift_symlinks_and_other_roots(
     source = historical / relative
     if mutation == "historical_mismatch":
         source.write_bytes(b"drift")
-    elif mutation == "current_mismatch":
-        (current / relative).write_bytes(b"drift")
     elif mutation == "symlink":
         source.unlink()
         source.symlink_to(current / relative)
+    elif mutation == "current_symlink":
+        current_source = current / relative
+        current_source.unlink()
+        current_source.symlink_to(source)
     elif mutation == "other_root":
         source = tmp_path / "other" / relative
         source.parent.mkdir(parents=True)

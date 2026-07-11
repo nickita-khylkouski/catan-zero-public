@@ -409,10 +409,7 @@ def _relocate_historical_artifact(
     if not relative.parts or ".." in relative.parts:
         raise ExecutorError(f"historical runtime artifact escapes frozen root: {raw}")
     current = current_root / relative
-    for label, path, root in (
-        ("historical", raw, historical_root),
-        ("current", current, current_root),
-    ):
+    for label, path, root in (("historical", raw, historical_root),):
         try:
             metadata = path.lstat()
             resolved = path.resolve(strict=True)
@@ -432,7 +429,30 @@ def _relocate_historical_artifact(
             raise ExecutorError(f"{label} runtime artifact escapes repo: {path}") from error
         if _sha256(path) != record["sha256"]:
             raise ExecutorError(f"{label} runtime artifact hash drift: {path}")
-    return str(relative), current
+    try:
+        current_metadata = current.lstat()
+        resolved_current = current.resolve(strict=True)
+    except FileNotFoundError:
+        return str(relative), raw
+    except OSError as error:
+        raise ExecutorError(f"current runtime artifact is unavailable: {current}") from error
+    if (
+        stat.S_ISLNK(current_metadata.st_mode)
+        or not stat.S_ISREG(current_metadata.st_mode)
+        or resolved_current != current
+    ):
+        raise ExecutorError(
+            f"current runtime artifact is not canonical regular bytes: {current}"
+        )
+    try:
+        resolved_current.relative_to(current_root)
+    except ValueError as error:
+        raise ExecutorError(f"current runtime artifact escapes repo: {current}") from error
+    return (
+        (str(relative), current)
+        if _sha256(current) == record["sha256"]
+        else (str(relative), raw)
+    )
 
 
 def _repo_artifacts(
@@ -483,6 +503,11 @@ def _repo_artifacts(
             "path": key,
             "sha256": _sha256(files[key]),
             "mode": 0o555 if os.access(files[key], os.X_OK) else 0o444,
+            **(
+                {"source_path": str(files[key])}
+                if files[key] != root / key
+                else {}
+            ),
         }
         for key in sorted(files)
     ]
@@ -497,12 +522,24 @@ def _repo_files(
         relative = PurePosixPath(str(record["path"]))
         if relative.is_absolute() or ".." in relative.parts:
             raise ExecutorError(f"unsafe repo artifact path: {relative}")
-        source = (root / Path(*relative.parts)).resolve(strict=True)
+        declared_source = record.get("source_path")
+        source = (
+            Path(str(declared_source))
+            if declared_source is not None
+            else root / Path(*relative.parts)
+        )
         try:
-            source.relative_to(root)
-        except ValueError as error:
-            raise ExecutorError(f"repo artifact escapes source root: {relative}") from error
-        if not source.is_file() or _sha256(source) != record["sha256"]:
+            metadata = source.lstat()
+            resolved = source.resolve(strict=True)
+        except OSError as error:
+            raise ExecutorError(f"repo artifact source is unavailable: {source}") from error
+        if (
+            not source.is_absolute()
+            or stat.S_ISLNK(metadata.st_mode)
+            or not stat.S_ISREG(metadata.st_mode)
+            or resolved != source
+            or _sha256(source) != record["sha256"]
+        ):
             raise ExecutorError(f"repo artifact source drift: {source}")
         files.append(source)
     return files
@@ -555,11 +592,16 @@ def _execution_repo_root(plan: Mapping[str, Any]) -> Path:
     return root
 
 
-def _build_repo_tar(files: Sequence[Path], destination: Path) -> str:
+def _build_repo_tar(
+    artifacts: Sequence[Mapping[str, Any]],
+    files: Sequence[Path],
+    destination: Path,
+) -> str:
+    if len(artifacts) != len(files):
+        raise ExecutorError("repo artifact/source count drift")
     with tarfile.open(destination, "w") as archive:
-        for source in files:
-            relative = source.relative_to(_REPO_ROOT)
-            info = tarfile.TarInfo(str(relative))
+        for record, source in zip(artifacts, files):
+            info = tarfile.TarInfo(str(record["path"]))
             data = source.read_bytes()
             info.size = len(data)
             info.mode = 0o755 if os.access(source, os.X_OK) else 0o444
@@ -1069,7 +1111,10 @@ def _stage_repo(
     manifest = {
         "schema_version": "a1-production-repo-v1",
         "repo_tar_sha256": repo_sha,
-        "artifacts": list(artifacts),
+        "artifacts": [
+            {key: record[key] for key in ("path", "sha256", "mode")}
+            for record in artifacts
+        ],
     }
     manifest["manifest_sha256"] = _digest(manifest)
     local_manifest = temporary_path / f"repo-manifest-{alias}.json"
@@ -1197,7 +1242,9 @@ def execute(plan: dict[str, Any], *, receipt_path: Path, resume: bool) -> dict[s
         if _digest(artifacts) != public["repo_artifacts_sha256"]:
             raise ExecutorError("repo artifact plan drift")
         repo_sha = _build_repo_tar(
-            _repo_files(artifacts, repo_root=repo_source_root), repo_tar
+            artifacts,
+            _repo_files(artifacts, repo_root=repo_source_root),
+            repo_tar,
         )
         repo_token = public["repo_artifacts_sha256"].removeprefix("sha256:")
         repo_dir = f"{hosts['remote_root']}/repo-{repo_token}"
