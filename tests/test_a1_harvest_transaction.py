@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -11,6 +12,40 @@ from tools.fleet import a1_harvest_transaction as harvest
 
 
 CATEGORIES = ("current_producer", "recent_history", "hard_negative")
+
+
+def test_bounded_fetch_uses_multiple_direct_host_streams(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    barrier = threading.Barrier(2)
+    state_lock = threading.Lock()
+    active = 0
+    max_active = 0
+
+    def fake_fetch(_command, _host, _outputs, _archive):
+        nonlocal active, max_active
+        with state_lock:
+            active += 1
+            max_active = max(max_active, active)
+        barrier.wait(timeout=2)
+        with state_lock:
+            active -= 1
+
+    monkeypatch.setattr(harvest, "_ssh_fetch", fake_fetch)
+    batches = [
+        harvest._HostFetch(  # noqa: SLF001 - focused transport concurrency test.
+            host=f"h{index}",
+            missing=(),
+            outputs=(Path(f"/sealed/a1/h{index}/job"),),
+            archive=tmp_path / f"h{index}.tar",
+            extracted=tmp_path / f"h{index}.extract",
+        )
+        for index in range(2)
+    ]
+
+    harvest._fetch_archives(("ssh",), batches, workers=2)  # noqa: SLF001
+
+    assert max_active == 2
 
 
 def _fixture_contract(tmp_path: Path) -> tuple[dict, dict, Path, Path, Path]:
@@ -159,10 +194,14 @@ def fleet(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     return lock, rendered, lock_path, render_path, remote, _fake_ssh(tmp_path), log
 
 
-def _run(fleet, tmp_path: Path):
+def _run(fleet, tmp_path: Path, *, fetch_workers: int = 1):
     _lock, _rendered, lock_path, render_path, _remote, ssh, _log = fleet
     return harvest.harvest(
-        lock_path, render_path, tmp_path / "published", ssh_command=(str(ssh),)
+        lock_path,
+        render_path,
+        tmp_path / "published",
+        ssh_command=(str(ssh),),
+        fetch_workers=fetch_workers,
     )
 
 
@@ -174,6 +213,21 @@ def test_collects_exact_120_jobs_from_eight_hosts_and_resumes_published(
     assert result["host_count"] == 8
     assert len(result["job_identities"]) == 120
     assert len((fleet[-1]).read_text().splitlines()) == 8
+
+
+def test_parallel_fetch_publishes_the_same_validated_inventory(
+    fleet, tmp_path: Path
+) -> None:
+    result = _run(fleet, tmp_path, fetch_workers=4)
+
+    assert result["job_count"] == 120
+    assert result["host_count"] == 8
+    assert len(result["job_identities"]) == 120
+    assert len(fleet[-1].read_text().splitlines()) == 8
+    loaded = contract._load_harvest_relocation(
+        tmp_path / "published/relocation_map.json", lock=fleet[0]
+    )
+    assert loaded.payload["relocation_sha256"] == result["relocation_sha256"]
     assert (tmp_path / "published/harvest_receipt.json").is_file()
     loaded = contract._load_harvest_relocation(
         tmp_path / "published/relocation_map.json", lock=fleet[0]
