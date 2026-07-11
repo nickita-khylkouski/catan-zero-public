@@ -132,15 +132,22 @@ def test_high_regret_builder_derives_source_from_passing_report(tmp_path: Path) 
 def test_held_out_suite_is_deterministic_and_derived_from_manifest(
     tmp_path: Path,
 ) -> None:
-    shard = tmp_path / "shard.npz"
-    shard.write_bytes(b"source shard")
+    shard_dir = tmp_path / "current_producer"
+    shard_dir.mkdir()
+    shard = shard_dir / "shard.npz"
+    np.savez(
+        shard,
+        game_seed=np.arange(10_000, 10_200, dtype=np.int64),
+        decision_index=np.zeros(200, dtype=np.int32),
+        action_taken=np.arange(200, dtype=np.int32),
+    )
     manifest = tmp_path / "regret.npz"
     np.savez(
         manifest,
         shard_id=np.zeros(200, dtype=np.int32),
         row_index=np.arange(200, dtype=np.int32),
         game_seed=np.arange(10_000, 10_200, dtype=np.int64),
-        decision_index=np.arange(200, dtype=np.int32) % 50,
+        decision_index=np.zeros(200, dtype=np.int32),
         regret_score=np.linspace(0.0, 2.0, 200, dtype=np.float32),
         phase=np.asarray(
             [
@@ -183,6 +190,136 @@ def test_held_out_suite_is_deterministic_and_derived_from_manifest(
         "phase:build_trade": 4,
         "41+": 4,
     }
+    assert first["selection"]["replay_preflight"]["replay_complete_states"] > 20
+    assert all(
+        state["replay_source"]["scope"] == str(shard_dir)
+        for state in first["states"]
+    )
+
+
+def test_held_out_suite_rejects_gaps_duplicates_and_partial_lanes(
+    tmp_path: Path,
+) -> None:
+    valid_dir = tmp_path / "current_producer"
+    gap_dir = tmp_path / "recent_history_gap"
+    duplicate_dir = tmp_path / "hard_negative_duplicate"
+    partial_dir = tmp_path / "recent_history_partial"
+    for directory in (valid_dir, gap_dir, duplicate_dir, partial_dir):
+        directory.mkdir()
+
+    valid_seeds = np.arange(20_000, 20_024, dtype=np.int64)
+    valid_rows = valid_dir / "rows.npz"
+    # Twenty-four shallow games plus one valid deeper current-producer source.
+    deep_seed = 29_999
+    np.savez(
+        valid_rows,
+        game_seed=np.concatenate([valid_seeds, np.full(3, deep_seed)]),
+        decision_index=np.concatenate(
+            [np.zeros(len(valid_seeds), dtype=np.int32), np.arange(3, dtype=np.int32)]
+        ),
+        action_taken=np.arange(len(valid_seeds) + 3, dtype=np.int32),
+    )
+    gap_rows = gap_dir / "rows.npz"
+    np.savez(
+        gap_rows,
+        game_seed=np.full(2, 30_001, dtype=np.int64),
+        decision_index=np.asarray([0, 2], dtype=np.int32),
+        action_taken=np.asarray([1, 2], dtype=np.int32),
+    )
+    duplicate_rows = duplicate_dir / "rows.npz"
+    np.savez(
+        duplicate_rows,
+        game_seed=np.full(3, 30_002, dtype=np.int64),
+        decision_index=np.asarray([0, 0, 1], dtype=np.int32),
+        action_taken=np.asarray([1, 2, 3], dtype=np.int32),
+    )
+    partial_rows = partial_dir / "rows.npz"
+    np.savez(
+        partial_rows,
+        game_seed=np.full(2, 30_003, dtype=np.int64),
+        decision_index=np.asarray([4, 5], dtype=np.int32),
+        action_taken=np.asarray([1, 2], dtype=np.int32),
+    )
+
+    source_paths = [valid_rows, gap_rows, duplicate_rows, partial_rows]
+    candidate_seeds = list(valid_seeds) + [deep_seed, 30_001, 30_002, 30_003]
+    candidate_decisions = [0] * len(valid_seeds) + [2, 2, 1, 5]
+    candidate_shards = [0] * (len(valid_seeds) + 1) + [1, 2, 3]
+    candidate_rows = list(range(len(valid_seeds))) + [len(valid_seeds) + 2, 1, 2, 1]
+    phases = [
+        (
+            "BUILD_INITIAL_SETTLEMENT",
+            "MOVE_ROBBER",
+            "ROLL",
+            "BUILD_ROAD",
+        )[index % 4]
+        for index in range(len(candidate_seeds))
+    ]
+    manifest = tmp_path / "regret.npz"
+    np.savez(
+        manifest,
+        shard_id=np.asarray(candidate_shards, dtype=np.int32),
+        row_index=np.asarray(candidate_rows, dtype=np.int32),
+        game_seed=np.asarray(candidate_seeds, dtype=np.int64),
+        decision_index=np.asarray(candidate_decisions, dtype=np.int32),
+        # Invalid partial sources rank first and must still be excluded.
+        regret_score=np.asarray(
+            [float(index) for index in range(len(candidate_seeds))], dtype=np.float32
+        ),
+        phase=np.asarray(phases),
+        legal_count=np.full(len(candidate_seeds), 54, dtype=np.int32),
+        shard_paths=np.asarray([str(path) for path in source_paths]),
+    )
+
+    suite = artifacts.build_held_out_high_regret_suite(
+        manifest_path=manifest,
+        holdout_fraction=0.999999999,
+        holdout_seed=17,
+        pairs=20,
+    )
+
+    identities = {
+        (state["game_seed"], state["decision_index"]) for state in suite["states"]
+    }
+    assert (deep_seed, 2) in identities
+    assert not identities.intersection({(30_001, 2), (30_002, 1), (30_003, 5)})
+    preflight = suite["selection"]["replay_preflight"]
+    assert preflight["rejected_noncontiguous"] == 3
+
+
+def test_held_out_suite_fails_clearly_when_replay_complete_pool_is_too_small(
+    tmp_path: Path,
+) -> None:
+    partial = tmp_path / "recent_history" / "rows.npz"
+    partial.parent.mkdir()
+    np.savez(
+        partial,
+        game_seed=np.arange(40_000, 40_040, dtype=np.int64),
+        decision_index=np.full(40, 3, dtype=np.int32),
+        action_taken=np.arange(40, dtype=np.int32),
+    )
+    manifest = tmp_path / "regret.npz"
+    np.savez(
+        manifest,
+        shard_id=np.zeros(40, dtype=np.int32),
+        row_index=np.arange(40, dtype=np.int32),
+        game_seed=np.arange(40_000, 40_040, dtype=np.int64),
+        decision_index=np.full(40, 3, dtype=np.int32),
+        regret_score=np.ones(40, dtype=np.float32),
+        phase=np.asarray(["BUILD_ROAD"] * 40),
+        legal_count=np.full(40, 54, dtype=np.int32),
+        shard_paths=np.asarray([str(partial)]),
+    )
+
+    with pytest.raises(
+        artifacts.ArtifactBuildError, match="after replay-completeness preflight"
+    ):
+        artifacts.build_held_out_high_regret_suite(
+            manifest_path=manifest,
+            holdout_fraction=0.999999999,
+            holdout_seed=17,
+            pairs=20,
+        )
 
 
 def test_bucket_report_is_extracted_from_retained_high_regret_games(

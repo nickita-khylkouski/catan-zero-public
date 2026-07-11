@@ -318,6 +318,17 @@ def build_held_out_high_regret_suite(
         {(int(game_seeds[index]), int(decisions[index])) for index in eligible}
     )
 
+    replay_complete, replay_stats = _replay_complete_manifest_rows(
+        manifest_path=manifest_path,
+        candidate_indices=eligible,
+        shard_paths=shard_paths,
+        shard_ids=shard_ids,
+        row_indices=row_indices,
+        game_seeds=game_seeds,
+        decisions=decisions,
+    )
+    eligible = [index for index in eligible if index in replay_complete]
+
     def phase_stratum(phase: str) -> str:
         upper = str(phase).upper()
         if "BUILD_INITIAL_SETTLEMENT" in upper or "BUILD_INITIAL_ROAD" in upper:
@@ -346,7 +357,8 @@ def build_held_out_high_regret_suite(
         if selected_by_stratum[label] != want:
             raise ArtifactBuildError(
                 f"held-out partition cannot fill required {label!r} stratum: "
-                f"{selected_by_stratum[label]} < {want}"
+                f"{selected_by_stratum[label]} < {want} after replay-completeness "
+                f"preflight ({replay_stats})"
             )
 
     stratum_min_pairs = max(4, pairs // 10)
@@ -372,7 +384,8 @@ def build_held_out_high_regret_suite(
                 break
     if len(selected) != pairs:
         raise ArtifactBuildError(
-            f"held-out partition has only {len(selected)} unique states, need {pairs}"
+            f"held-out partition has only {len(selected)} replay-complete unique "
+            f"states, need {pairs} ({replay_stats})"
         )
     states: list[dict[str, Any]] = []
     for pair_id, index in enumerate(selected):
@@ -395,6 +408,10 @@ def build_held_out_high_regret_suite(
                 "phase": str(phases[index]),
                 "legal_count": int(legal_counts[index]),
                 "regret_score": float(scores[index]),
+                "replay_source": {
+                    "contract": "authoritative-shard-parent-unique-contiguous-prefix-v1",
+                    "scope": str(shard_path.resolve().parent),
+                },
             }
         )
     value = {
@@ -410,11 +427,146 @@ def build_held_out_high_regret_suite(
             "selected_pairs": pairs,
             "stratum_min_pairs": stratum_min_pairs,
             "selected_by_stratum": selected_by_stratum,
+            "replay_preflight": replay_stats,
         },
         "states": states,
     }
     value["suite_sha256"] = promotion._digest_value(value)  # noqa: SLF001
     return value
+
+
+def _replay_complete_manifest_rows(
+    *,
+    manifest_path: Path,
+    candidate_indices: Sequence[int],
+    shard_paths: Sequence[str],
+    shard_ids: Any,
+    row_indices: Any,
+    game_seeds: Any,
+    decisions: Any,
+) -> tuple[set[int], dict[str, Any]]:
+    """Return candidates with an authoritative, replay-complete prefix.
+
+    The evaluator reconstructs a state by scanning every shard below the
+    selected shard's parent directory.  Mirror that contract before sealing:
+    the manifest row must bind to the stated source row and its source scope
+    must contain each decision exactly once from zero through the target.
+    Missing, duplicate, or role-filtered partial trajectories fail closed.
+    """
+
+    import numpy as np
+
+    from regret_common import discover_shards, load_shard
+
+    requested_by_scope: dict[Path, dict[int, int]] = {}
+    source_paths: dict[int, Path] = {}
+    rejected_bad_source = 0
+    for index in candidate_indices:
+        shard_id = int(shard_ids[index])
+        if shard_id < 0 or shard_id >= len(shard_paths):
+            rejected_bad_source += 1
+            continue
+        source = Path(shard_paths[shard_id]).expanduser()
+        if not source.is_absolute():
+            source = manifest_path.parent / source
+        source = source.resolve()
+        source_paths[index] = source
+        seed = int(game_seeds[index])
+        target = int(decisions[index])
+        if target < 0:
+            rejected_bad_source += 1
+            source_paths.pop(index, None)
+            continue
+        scope_targets = requested_by_scope.setdefault(source.parent, {})
+        scope_targets[seed] = max(scope_targets.get(seed, -1), target)
+
+    # Count decision occurrences only for requested games. Checking the whole
+    # recorded trajectory mirrors gather_game_action_sequence exactly while
+    # remaining streaming over shard files.
+    counts_by_scope: dict[Path, dict[int, dict[int, int]]] = {}
+    malformed_seeds_by_scope: dict[Path, set[int]] = {}
+    source_arrays: dict[Path, dict[str, Any] | None] = {}
+    selected_source_paths = set(source_paths.values())
+    for scope, targets in requested_by_scope.items():
+        seed_counts: dict[int, dict[int, int]] = {seed: {} for seed in targets}
+        malformed: set[int] = set()
+        for shard_path in discover_shards([scope]):
+            try:
+                shard = load_shard(shard_path)
+            except (OSError, ValueError):
+                # An unreadable shard makes this authoritative scope unsafe.
+                malformed.update(targets)
+                continue
+            if shard_path.resolve() in selected_source_paths:
+                source_arrays[shard_path.resolve()] = shard
+            if "game_seed" not in shard or "decision_index" not in shard:
+                continue
+            seeds = np.asarray(shard["game_seed"]).reshape(-1)
+            didx = np.asarray(shard["decision_index"]).reshape(-1)
+            actions = shard.get("action_taken")
+            if (
+                len(seeds) != len(didx)
+                or actions is None
+                or len(np.asarray(actions).reshape(-1)) != len(seeds)
+            ):
+                for seed in set(int(value) for value in seeds if int(value) in targets):
+                    malformed.add(seed)
+                continue
+            for row in range(len(seeds)):
+                seed = int(seeds[row])
+                if seed not in targets:
+                    continue
+                decision = int(didx[row])
+                if decision >= 0:
+                    per_seed = seed_counts[seed]
+                    per_seed[decision] = per_seed.get(decision, 0) + 1
+        counts_by_scope[scope] = seed_counts
+        malformed_seeds_by_scope[scope] = malformed
+
+    complete: set[int] = set()
+    rejected_noncontiguous = 0
+    for index, source in source_paths.items():
+        seed = int(game_seeds[index])
+        target = int(decisions[index])
+        shard = source_arrays.get(source)
+        row = int(row_indices[index])
+        source_bound = False
+        if shard is not None and row >= 0:
+            try:
+                source_seeds = np.asarray(shard["game_seed"]).reshape(-1)
+                source_decisions = np.asarray(shard["decision_index"]).reshape(-1)
+                source_actions = np.asarray(shard["action_taken"]).reshape(-1)
+                source_bound = (
+                    row < len(source_seeds)
+                    and row < len(source_decisions)
+                    and row < len(source_actions)
+                    and int(source_seeds[row]) == seed
+                    and int(source_decisions[row]) == target
+                )
+            except (KeyError, TypeError, ValueError):
+                source_bound = False
+        scope = source.parent
+        counts = counts_by_scope.get(scope, {}).get(seed, {})
+        max_recorded = max(counts, default=-1)
+        contiguous = (
+            seed not in malformed_seeds_by_scope.get(scope, set())
+            and max_recorded >= target
+            and all(counts.get(decision) == 1 for decision in range(max_recorded + 1))
+        )
+        if source_bound and contiguous:
+            complete.add(index)
+        elif not source_bound:
+            rejected_bad_source += 1
+        else:
+            rejected_noncontiguous += 1
+
+    return complete, {
+        "contract": "authoritative-shard-parent-unique-contiguous-prefix-v1",
+        "candidate_states": len(candidate_indices),
+        "replay_complete_states": len(complete),
+        "rejected_bad_source": rejected_bad_source,
+        "rejected_noncontiguous": rejected_noncontiguous,
+    }
 
 
 def build_bucket_game_report(
