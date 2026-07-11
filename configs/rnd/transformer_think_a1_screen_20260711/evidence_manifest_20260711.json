@@ -1,0 +1,22 @@
+{
+  "schema_version": "catan-zero-transformer-think-evidence-manifest/v1",
+  "experiment_config_sha256": "766f383ad8ca22a7c93b287d46fee1d23005c68a9891e94a9dc519ce083167a6",
+  "evidence_rows_per_run": 146517,
+  "combined_rows": 1758204,
+  "combined_sha256": "421d379a778562694121ec6cf2f0c7d6e74ea5619133ea4c13acd77734c3cfb5",
+  "result_sha256": "0362251d96d32ac061a2a0a56aff256681c774395d88e07f47648fb168598d85",
+  "runs": {
+    "transformer-k0@101": "abbf10b7f2f9e59f0a10df60ec7b6720ad66356851cb67177a0f4e57261227f8",
+    "transformer-k0@103": "5cf53f083fd37a43db888b6bc20d7a1fb3903d387c1264a49f61361baa3571e2",
+    "transformer-k0@107": "396038bfe18a22081e71576d85b79a8c777197f441681cb6d013e0ab5b33b94d",
+    "think-transformer-k1@101": "8810760f8a5989378182cb7a050623c6e40539caf5fe3758305e34262aacd280",
+    "think-transformer-k1@103": "1c1445d69eb5e18d22b76d1329bcdcfeb90d3da89bfee6dba866a498415abd30",
+    "think-transformer-k1@107": "2be4a361b7f65bb4d08af90d371a79673a1c0ad0e682ad2b402e3599b0b88bcb",
+    "think-transformer-k2@101": "49e4f5aba706e22825e9f5f9e12d9f1680640adb4a0b4ea4e22392dfeb03f43e",
+    "think-transformer-k2@103": "2d8c055b094360e9d8786bc52e51da1e4813a0050537623b0ebdeea3c4443f79",
+    "think-transformer-k2@107": "8c002fd341f8024a6017ffb64c509ac9892d392b6fd811b7faf2c6810e828a1b",
+    "think-transformer-k4@101": "be31e5312d841581bb94909bf40b60dec06e4c52006c7b808bf5e0777ce862f0",
+    "think-transformer-k4@103": "5278047cf0353dbbcc6759f9838b5c0498b978fe041d375fecebc920dcc6aa97",
+    "think-transformer-k4@107": "0e170325a8a647287675969d3e1d3fbbee4f11bfdcd6753b0088d8891f90fde6"
+  }
+}
