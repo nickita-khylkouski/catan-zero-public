@@ -332,7 +332,7 @@ def build_plan(
         "mode": "dry-run",
         "runtime_source_repo": runtime_source_repo,
         "runtime_repo": staged_runtime_repo,
-        "runtime_python": f"{runtime_source_repo}/.venv/bin/python",
+        "runtime_python": str(Path(config["runtime_python"])),
         "runtime_commit": config["runtime_commit"],
         "native_wheel": {**wheel, "filename": wheel_config["filename"]},
         "runtime_files": runtime_files,

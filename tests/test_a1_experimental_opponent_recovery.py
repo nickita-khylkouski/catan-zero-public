@@ -212,6 +212,7 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path]:
             "schema_version": recovery.CONFIG_SCHEMA,
             "label": recovery.LABEL,
             "runtime_repo": str(tmp_path),
+            "runtime_python": "/opt/catan/.venv/bin/python",
             "runtime_commit": "a" * 40,
             "native_wheel": {
                 "filename": wheel.name,
@@ -241,6 +242,7 @@ def test_plan_is_opponent_only_exact_and_nonpromotable(tmp_path: Path) -> None:
     plan = recovery.build_plan(config_path=config, failed_receipts=[failed], out=out)
     assert plan["label"] == recovery.LABEL
     assert plan["promotable"] is False
+    assert plan["runtime_python"] == "/opt/catan/.venv/bin/python"
     assert len(plan["lanes"]) == 56
     assert plan["native_wheel"]["sha256"] in {
         row["sha256"] for row in plan["required_host_files"]
