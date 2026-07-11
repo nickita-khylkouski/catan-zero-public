@@ -122,7 +122,47 @@ def _paired_game_identity(game: Any, *, index: int, where: str) -> tuple[int, st
     return pair_id, orientation
 
 
-_PAIR_ORIENTATIONS = {"candidate_first", "candidate_second"}
+_PAIR_ORIENTATIONS = {
+    "legacy": {"candidate_first", "candidate_second"},
+    "color": {"candidate_red", "candidate_blue"},
+}
+_COLOR_ORIENTATION = {
+    "candidate_red": ("RED", "BLUE"),
+    "candidate_blue": ("BLUE", "RED"),
+}
+
+
+def _paired_orientation_encoding(game: dict[str, Any], *, index: int, where: str) -> str:
+    orientation = game["orientation"]
+    if orientation in _COLOR_ORIENTATION:
+        expected_candidate, expected_baseline = _COLOR_ORIENTATION[orientation]
+        if (
+            game.get("candidate_color") != expected_candidate
+            or game.get("baseline_color") != expected_baseline
+        ):
+            raise ArtifactBuildError(
+                f"{where}[{index}] orientation does not bind candidate/baseline colors"
+            )
+        return "color"
+    if orientation in _PAIR_ORIENTATIONS["legacy"]:
+        candidate_color = game.get("candidate_color")
+        baseline_color = game.get("baseline_color")
+        if (candidate_color is None) != (baseline_color is None):
+            raise ArtifactBuildError(
+                f"{where}[{index}] has incomplete legacy color fields"
+            )
+        if candidate_color is not None:
+            expected = (
+                ("RED", "BLUE")
+                if orientation == "candidate_first"
+                else ("BLUE", "RED")
+            )
+            if (candidate_color, baseline_color) != expected:
+                raise ArtifactBuildError(
+                    f"{where}[{index}] legacy orientation has inconsistent colors"
+                )
+        return "legacy"
+    raise ArtifactBuildError(f"{where}[{index}] has invalid orientation")
 
 
 def _validated_high_regret_games(
@@ -134,13 +174,16 @@ def _validated_high_regret_games(
         raise ArtifactBuildError(f"{where} must be a non-empty list")
     identities: set[tuple[int, str]] = set()
     by_pair: dict[int, dict[str, dict[str, Any]]] = {}
+    encoding: str | None = None
     for index, game in enumerate(games):
         identity = _paired_game_identity(game, index=index, where=where)
         pair_id, orientation = identity
         if identity in identities:
             raise ArtifactBuildError(f"{where} contains duplicate games")
-        if orientation not in _PAIR_ORIENTATIONS:
-            raise ArtifactBuildError(f"{where}[{index}] has invalid orientation")
+        game_encoding = _paired_orientation_encoding(game, index=index, where=where)
+        if encoding is not None and game_encoding != encoding:
+            raise ArtifactBuildError(f"{where} mixes orientation encodings")
+        encoding = game_encoding
         truncated = game.get("truncated")
         outcome = game.get("candidate_won")
         if not isinstance(truncated, bool):
@@ -159,7 +202,7 @@ def _validated_high_regret_games(
 
     incomplete_pairs: set[int] = set()
     for pair_id, pair_games in by_pair.items():
-        if set(pair_games) != _PAIR_ORIENTATIONS:
+        if encoding is None or set(pair_games) != _PAIR_ORIENTATIONS[encoding]:
             raise ArtifactBuildError(
                 f"{where} pair {pair_id} must contain both orientations"
             )
@@ -712,6 +755,14 @@ def build_bucket_game_report(
                 "orientation": identity[1],
                 "candidate_won": outcome,
                 "buckets": sorted(labels),
+                **(
+                    {
+                        "candidate_color": game["candidate_color"],
+                        "baseline_color": game["baseline_color"],
+                    }
+                    if identity[1] in _COLOR_ORIENTATION
+                    else {}
+                ),
             }
         )
     return {

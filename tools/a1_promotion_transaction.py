@@ -2312,6 +2312,7 @@ def _verify_high_regret_source(
     identities: set[tuple[int, str]] = set()
     orientations_by_pair: dict[int, set[str]] = {}
     truncated_by_pair: dict[int, bool] = {}
+    orientation_encoding: str | None = None
     for index, game in enumerate(games):
         if not isinstance(game, dict):
             raise PromotionError(f"{where}.report.games[{index}] is malformed")
@@ -2321,10 +2322,45 @@ def _verify_high_regret_source(
             isinstance(pair_id, bool)
             or not isinstance(pair_id, int)
             or pair_id < 0
-            or orientation not in {"candidate_first", "candidate_second"}
+            or orientation
+            not in {
+                "candidate_first",
+                "candidate_second",
+                "candidate_red",
+                "candidate_blue",
+            }
         ):
             raise PromotionError(f"{where}.report.games[{index}] lacks pair identity")
         identity = (pair_id, orientation)
+        game_encoding = "color" if orientation in {"candidate_red", "candidate_blue"} else "legacy"
+        if orientation_encoding is not None and game_encoding != orientation_encoding:
+            raise PromotionError(f"{where}.report mixes orientation encodings")
+        orientation_encoding = game_encoding
+        if game_encoding == "color":
+            expected_colors = (
+                ("RED", "BLUE")
+                if orientation == "candidate_red"
+                else ("BLUE", "RED")
+            )
+            if (game.get("candidate_color"), game.get("baseline_color")) != expected_colors:
+                raise PromotionError(
+                    f"{where}.report.games[{index}] orientation/color mismatch"
+                )
+        else:
+            colors = (game.get("candidate_color"), game.get("baseline_color"))
+            if (colors[0] is None) != (colors[1] is None):
+                raise PromotionError(
+                    f"{where}.report.games[{index}] has incomplete legacy colors"
+                )
+            expected_colors = (
+                ("RED", "BLUE")
+                if orientation == "candidate_first"
+                else ("BLUE", "RED")
+            )
+            if colors[0] is not None and colors != expected_colors:
+                raise PromotionError(
+                    f"{where}.report.games[{index}] legacy orientation/color mismatch"
+                )
         truncated = game.get("truncated")
         outcome = game.get("candidate_won")
         if identity in identities or not isinstance(truncated, bool):
@@ -2348,7 +2384,12 @@ def _verify_high_regret_source(
         orientations_by_pair.setdefault(pair_id, set()).add(orientation)
         truncated_by_pair[pair_id] = truncated_by_pair.get(pair_id, False) or truncated
     if set(orientations_by_pair) != set(state_by_pair) or any(
-        orientations != {"candidate_first", "candidate_second"}
+        orientations
+        != (
+            {"candidate_red", "candidate_blue"}
+            if orientation_encoding == "color"
+            else {"candidate_first", "candidate_second"}
+        )
         for orientations in orientations_by_pair.values()
     ):
         raise PromotionError(f"{where}.report does not cover every suite pair twice")
@@ -2442,6 +2483,7 @@ def _verify_bucket_veto_source(
     counts: dict[str, list[int]] = {}
     identities: set[tuple[int, str]] = set()
     orientations_by_pair: dict[int, set[str]] = {}
+    orientation_encoding: str | None = None
     for index, game in enumerate(raw_games):
         if not isinstance(game, dict):
             raise PromotionError(f"{where}.report.games[{index}] is malformed")
@@ -2451,10 +2493,40 @@ def _verify_bucket_veto_source(
             isinstance(pair_id, bool)
             or not isinstance(pair_id, int)
             or pair_id < 0
-            or orientation not in {"candidate_first", "candidate_second"}
+            or orientation
+            not in {
+                "candidate_first",
+                "candidate_second",
+                "candidate_red",
+                "candidate_blue",
+            }
         ):
             raise PromotionError(f"{where}.report.games[{index}] lacks pair identity")
         identity = (pair_id, orientation)
+        game_encoding = "color" if orientation in {"candidate_red", "candidate_blue"} else "legacy"
+        if orientation_encoding is not None and game_encoding != orientation_encoding:
+            raise PromotionError(f"{where}.report mixes orientation encodings")
+        orientation_encoding = game_encoding
+        if game_encoding == "color":
+            expected_colors = (
+                ("RED", "BLUE")
+                if orientation == "candidate_red"
+                else ("BLUE", "RED")
+            )
+            if (game.get("candidate_color"), game.get("baseline_color")) != expected_colors:
+                raise PromotionError(
+                    f"{where}.report.games[{index}] orientation/color mismatch"
+                )
+        elif game.get("candidate_color") is not None or game.get("baseline_color") is not None:
+            expected_colors = (
+                ("RED", "BLUE")
+                if orientation == "candidate_first"
+                else ("BLUE", "RED")
+            )
+            if (game.get("candidate_color"), game.get("baseline_color")) != expected_colors:
+                raise PromotionError(
+                    f"{where}.report.games[{index}] legacy orientation/color mismatch"
+                )
         outcome = game.get("candidate_won")
         labels = game.get("buckets")
         if identity in identities or not isinstance(outcome, bool):
@@ -2474,7 +2546,12 @@ def _verify_bucket_veto_source(
             bucket_counts = counts.setdefault(label, [0, 0])
             bucket_counts[0 if outcome else 1] += 1
     if any(
-        orientations != {"candidate_first", "candidate_second"}
+        orientations
+        != (
+            {"candidate_red", "candidate_blue"}
+            if orientation_encoding == "color"
+            else {"candidate_first", "candidate_second"}
+        )
         for orientations in orientations_by_pair.values()
     ):
         raise PromotionError(f"{where}.report contains an incomplete bucket pair")

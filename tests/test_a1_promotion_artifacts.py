@@ -117,7 +117,7 @@ def _truncate_high_regret_pair(value: dict, pair_id: int = 0) -> None:
         game
         for game in value["games"]
         if game["pair_id"] == pair_id
-        and game["orientation"] == "candidate_first"
+        and game["orientation"] in {"candidate_first", "candidate_red"}
     )
     game["candidate_won"] = None
     game["truncated"] = True
@@ -127,6 +127,18 @@ def _truncate_high_regret_pair(value: dict, pair_id: int = 0) -> None:
     value["pentanomial_sprt"] = promotion.evaluate_pentanomial_sprt(
         scores, elo0=-10.0, elo1=15.0, alpha=0.05, beta=0.05
     )
+
+
+def _use_color_orientations(value: dict) -> None:
+    for game in value["games"]:
+        if game["orientation"] == "candidate_first":
+            game["orientation"] = "candidate_red"
+            game["candidate_color"] = "RED"
+            game["baseline_color"] = "BLUE"
+        else:
+            game["orientation"] = "candidate_blue"
+            game["candidate_color"] = "BLUE"
+            game["baseline_color"] = "RED"
 
 
 def test_high_regret_builder_derives_source_from_passing_report(tmp_path: Path) -> None:
@@ -154,6 +166,7 @@ def test_high_regret_builder_excludes_one_legitimate_truncated_pair(
 ) -> None:
     candidate, champion = _checkpoints(tmp_path)
     raw = _high_regret_report(tmp_path, candidate, champion, pairs=600)
+    _use_color_orientations(raw)
     _truncate_high_regret_pair(raw)
     report = tmp_path / "high-regret-truncated.report.json"
     _json(report, raw)
@@ -413,6 +426,7 @@ def test_bucket_report_excludes_both_orientations_of_truncated_pair(
 ) -> None:
     candidate, champion = _checkpoints(tmp_path)
     raw = _high_regret_report(tmp_path, candidate, champion, pairs=600)
+    _use_color_orientations(raw)
     _truncate_high_regret_pair(raw)
     report = tmp_path / "high-regret-truncated.report.json"
     _json(report, raw)
@@ -423,6 +437,42 @@ def test_bucket_report_excludes_both_orientations_of_truncated_pair(
 
     assert len(value["games"]) == 1_198
     assert {game["pair_id"] for game in value["games"]} == set(range(1, 600))
+    assert value["games"][0]["orientation"] == "candidate_red"
+    assert value["games"][0]["candidate_color"] == "RED"
+    assert value["games"][0]["baseline_color"] == "BLUE"
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        (
+            lambda value: value["games"][0].update(candidate_color="BLUE"),
+            "orientation does not bind",
+        ),
+        (
+            lambda value: value["games"][0].update(
+                orientation="candidate_first",
+                candidate_color="RED",
+                baseline_color="BLUE",
+            ),
+            "mixes orientation encodings",
+        ),
+    ],
+)
+def test_high_regret_builder_rejects_forged_or_mixed_color_orientations(
+    tmp_path: Path, mutation, message: str
+) -> None:
+    candidate, champion = _checkpoints(tmp_path)
+    raw = _high_regret_report(tmp_path, candidate, champion)
+    _use_color_orientations(raw)
+    mutation(raw)
+    report = tmp_path / "invalid-color-orientation.report.json"
+    _json(report, raw)
+
+    with pytest.raises(artifacts.ArtifactBuildError, match=message):
+        artifacts.build_high_regret_source(
+            report_path=report, candidate=candidate, champion=champion
+        )
 
 
 @pytest.mark.parametrize(

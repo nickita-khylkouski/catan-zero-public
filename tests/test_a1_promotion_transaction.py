@@ -1632,11 +1632,20 @@ def _install_truncated_high_regret_pair(fixture: dict) -> None:
     def mutate(source: dict) -> None:
         report_path = Path(source["report"]["path"])
         report = json.loads(report_path.read_text())
+        for row in report["games"]:
+            if row["orientation"] == "candidate_first":
+                row["orientation"] = "candidate_red"
+                row["candidate_color"] = "RED"
+                row["baseline_color"] = "BLUE"
+            else:
+                row["orientation"] = "candidate_blue"
+                row["candidate_color"] = "BLUE"
+                row["baseline_color"] = "RED"
         game = next(
             game
             for game in report["games"]
             if game["pair_id"] == 0
-            and game["orientation"] == "candidate_first"
+            and game["orientation"] == "candidate_red"
         )
         game["candidate_won"] = None
         game["truncated"] = True
@@ -1688,6 +1697,51 @@ def test_transaction_rejects_none_outcome_without_truncation(tmp_path: Path) -> 
     )
 
     with pytest.raises(promotion.PromotionError, match="inconsistent truncation"):
+        _execute(fixture, go=False)
+
+
+def test_transaction_rejects_forged_high_regret_orientation_color(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path)
+    _install_truncated_high_regret_pair(fixture)
+
+    def mutate(source: dict) -> None:
+        report_path = Path(source["report"]["path"])
+        report = json.loads(report_path.read_text())
+        report["games"][0]["candidate_color"] = "BLUE"
+        _write_json(report_path, report)
+        source["report"]["sha256"] = promotion._sha256(report_path)
+
+    _mutate_evidence_source(
+        fixture, kind="high_regret", role="high_regret", mutate=mutate
+    )
+
+    with pytest.raises(promotion.PromotionError, match="orientation/color mismatch"):
+        _execute(fixture, go=False)
+
+
+def test_transaction_rejects_mixed_high_regret_orientation_encodings(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path)
+    _install_truncated_high_regret_pair(fixture)
+
+    def mutate(source: dict) -> None:
+        report_path = Path(source["report"]["path"])
+        report = json.loads(report_path.read_text())
+        game = report["games"][2]
+        game["orientation"] = "candidate_first"
+        game["candidate_color"] = "RED"
+        game["baseline_color"] = "BLUE"
+        _write_json(report_path, report)
+        source["report"]["sha256"] = promotion._sha256(report_path)
+
+    _mutate_evidence_source(
+        fixture, kind="high_regret", role="high_regret", mutate=mutate
+    )
+
+    with pytest.raises(promotion.PromotionError, match="mixes orientation encodings"):
         _execute(fixture, go=False)
 
 
