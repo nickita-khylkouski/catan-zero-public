@@ -33,6 +33,13 @@ GENERATION_CAMPAIGN = (
     / "a1-dual-arm-56gpu-20260710"
     / "contract.json"
 )
+GENERATION_CAMPAIGN_R2 = (
+    Path(__file__).resolve().parents[1]
+    / "configs"
+    / "operations"
+    / "a1-dual-arm-56gpu-20260711-r2"
+    / "contract.json"
+)
 
 
 @pytest.fixture(autouse=True)
@@ -190,6 +197,90 @@ def test_dual_arm_generation_campaign_is_exact_and_fail_closed() -> None:
         contract.build_lock(GENERATION_CAMPAIGN)
 
 
+def test_dual_arm_r2_is_fresh_current_and_lineage_blocked() -> None:
+    payload = contract.validate_generation_campaign(GENERATION_CAMPAIGN_R2)
+    arms = {arm["id"]: arm for arm in payload["arms"]}
+
+    assert payload["schema_version"] == contract.GENERATION_CAMPAIGN_REVISION_SCHEMA
+    assert payload["contract_id"] == contract.GENERATION_CAMPAIGN_R2_CONTRACT_ID
+    assert payload["contract_sha256"] == contract.GENERATION_CAMPAIGN_R2_CONTRACT_SHA256
+    assert payload["implementation_commit"] == (
+        contract.GENERATION_CAMPAIGN_REVISION_IMPLEMENTATION_COMMIT
+    )
+    assert payload["common_recipe"]["native_mcts_hot_loop"] is True
+    assert payload["common_recipe"]["rust_featurize"] is True
+    assert arms["n256"]["seed_start"] == contract.GENERATION_CAMPAIGN_R1_NEXT_SEED_FLOOR
+    assert arms["n256"]["seed_end"] == arms["n128"]["seed_start"]
+    assert payload["fleet"]["next_campaign_seed_floor"] == arms["n128"]["seed_end"]
+    assert all("a1-dual-arm-20260711-r2" in arm["output_root"] for arm in arms.values())
+    assert payload["supersedes"]["campaign_contract_sha256"] == (
+        contract.GENERATION_CAMPAIGN_CONTRACT_SHA256
+    )
+    assert payload["promotion_handoff"] == {
+        "mode": "required_post_promotion",
+        "path": None,
+        "expected_schema": "a1-post-promotion-producer-handoff-v1",
+        "expected_checkpoint_sha256": payload["checkpoints"][0]["sha256"],
+    }
+    with pytest.raises(contract.ContractError, match="not launchable"):
+        contract.validate_generation_campaign(
+            GENERATION_CAMPAIGN_R2, require_ready=True
+        )
+
+
+def test_dual_arm_r2_binds_every_current_provenance_file() -> None:
+    payload = contract.validate_generation_campaign(GENERATION_CAMPAIGN_R2)
+    provenance = payload["provenance"]
+    records = [
+        *provenance["arm_guards"],
+        *provenance["generator_code"],
+        provenance["executor"],
+        provenance["harvest"],
+        provenance["fleet_manifest"],
+    ]
+
+    assert len({record["path"] for record in records}) == len(records)
+    for record in records:
+        assert record["sha256"] == contract._sha256_bytes(  # noqa: SLF001
+            contract._git_blob(  # noqa: SLF001
+                payload["implementation_commit"], record["path"]
+            )
+        )
+
+
+def test_dual_arm_r2_placement_uses_fresh_lane_ids_and_all_56_gpus() -> None:
+    payload = contract.validate_generation_campaign(GENERATION_CAMPAIGN_R2)
+    assignments = json.loads(
+        (GENERATION_CAMPAIGN_R2.parent / "placement.assignments.json").read_text()
+    )["assignments"]
+
+    assert len(assignments) == 56
+    assert len({item["logical_lane"] for item in assignments}) == 56
+    assert len({(item["host_alias"], item["gpu"]) for item in assignments}) == 56
+    assert {item["logical_lane"] for item in assignments} == {
+        lane for arm in payload["arms"] for lane in arm["logical_lanes"]
+    }
+    assert all(
+        item["logical_lane"].startswith(("n128_gpu", "n256_gpu"))
+        for item in assignments
+    )
+
+
+def test_dual_arm_r2_rejects_reusing_a_consumed_seed(tmp_path: Path) -> None:
+    payload = json.loads(GENERATION_CAMPAIGN_R2.read_text())
+    payload["arms"][0]["seed_start"] = contract.GENERATION_CAMPAIGN_R1_NEXT_SEED_FLOOR - 1
+    payload["arms"][0]["seed_end"] = (
+        payload["arms"][0]["seed_start"] + 28 * payload["arms"][0]["seed_block_size"]
+    )
+    payload.pop("contract_sha256")
+    payload["contract_sha256"] = contract._digest_value(payload)  # noqa: SLF001
+    path = tmp_path / "r2-reused-seed.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(contract.ContractError, match="deterministic rebuild"):
+        contract.validate_generation_campaign(path)
+
+
 @pytest.mark.parametrize(
     ("mutation", "message"),
     [
@@ -258,10 +349,11 @@ def test_dual_arm_placement_refuses_split_hosts(tmp_path: Path) -> None:
     assert not out.exists()
 
 
+@pytest.mark.parametrize("campaign_path", [GENERATION_CAMPAIGN, GENERATION_CAMPAIGN_R2])
 def test_dual_arm_materializes_renders_and_replays_in_production_executor(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, campaign_path: Path
 ) -> None:
-    campaign = json.loads(GENERATION_CAMPAIGN.read_text(encoding="utf-8"))
+    campaign = json.loads(campaign_path.read_text(encoding="utf-8"))
     checkpoint_dir = tmp_path / "checkpoints"
     checkpoint_dir.mkdir()
     for index, item in enumerate(campaign["checkpoints"]):
@@ -289,7 +381,8 @@ def test_dual_arm_materializes_renders_and_replays_in_production_executor(
     monkeypatch.setattr(
         contract, "validate_generation_campaign", lambda _path, **_kwargs: campaign
     )
-    monkeypatch.setattr(contract, "_runtime_code_tree_records", lambda: [])
+    if campaign_path == GENERATION_CAMPAIGN:
+        monkeypatch.setattr(contract, "_runtime_code_tree_records", lambda: [])
     monkeypatch.setattr(contract, "_validate_against_ledger", lambda *_args: None)
     monkeypatch.setattr(contract, "_verify_live_seed_ledger", lambda *_args, **_kwargs: None)
     handoff = tmp_path / "handoff.json"
@@ -305,18 +398,18 @@ def test_dual_arm_materializes_renders_and_replays_in_production_executor(
     )
     assignments = json.loads(
         (
-            GENERATION_CAMPAIGN.parent / "placement.assignments.json"
+            campaign_path.parent / "placement.assignments.json"
         ).read_text()
     )["assignments"]
     assignments_path = tmp_path / "assignments.json"
     assignments_path.write_text(json.dumps(assignments))
     placement_path = tmp_path / "placement.json"
     contract.seal_generation_placement(
-        GENERATION_CAMPAIGN, assignments_path, placement_path
+        campaign_path, assignments_path, placement_path
     )
 
     locks = contract.materialize_generation_campaign(
-        GENERATION_CAMPAIGN,
+        campaign_path,
         promotion_handoff_path=handoff,
         placement_path=placement_path,
         out_dir=tmp_path / "locks",
@@ -328,6 +421,22 @@ def test_dual_arm_materializes_renders_and_replays_in_production_executor(
     for lock_path in locks:
         lock = contract.verify_lock(lock_path)
         arm_id = lock["game_contract"]["arm_id"]
+        if campaign_path == GENERATION_CAMPAIGN_R2:
+            runtime_records = {
+                Path(record["path"]).resolve(): record["sha256"]
+                for record in lock["provenance"]["runtime_code_tree"]
+            }
+            for relative in (
+                "tools/a1_pre_wave_contract.py",
+                "tools/a1_dual_arm_subsets.py",
+                "tools/build_memmap_corpus.py",
+                "tools/train_bc.py",
+            ):
+                source = (contract.REPO_ROOT / relative).resolve()
+                assert runtime_records[source] == contract._sha256(source)  # noqa: SLF001
+            assert lock["provenance"]["harvest"]["sha256"] == contract._sha256(  # noqa: SLF001
+                contract.REPO_ROOT / "tools/fleet/a1_harvest_transaction.py"
+            )
         render_dir = tmp_path / f"render-{arm_id}"
         rendered = contract.render(lock_path, render_dir)
         replayed_lock, replayed_render, lanes = production_executor.verify_render(

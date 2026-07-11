@@ -187,6 +187,13 @@ GENERATION_CAMPAIGN_CONTRACT_SHA256 = (
 GENERATION_CAMPAIGN_CONTRACT_PATH = (
     REPO_ROOT / "configs/operations/a1-dual-arm-56gpu-20260710/contract.json"
 )
+GENERATION_CAMPAIGN_R2_CONTRACT_ID = "a1-dual-arm-n256-n128-56gpu-20260711-r2"
+GENERATION_CAMPAIGN_R2_CONTRACT_SHA256 = (
+    "sha256:a9b89b3885041b9d6f61c211d86d3e22cfb17426fdf4b221958a56d0def12e51"
+)
+GENERATION_CAMPAIGN_R2_CONTRACT_PATH = (
+    REPO_ROOT / "configs/operations/a1-dual-arm-56gpu-20260711-r2/contract.json"
+)
 GENERATION_PLACEMENT_SCHEMA = "a1-dual-arm-generation-placement-v1"
 GENERATION_ARM_LOCK_SCHEMA = "a1-generation-arm-lock-v1"
 GENERATION_CAMPAIGN_PENDING = "blocked_pending_post_promotion_handoff"
@@ -2667,7 +2674,6 @@ def build_generation_campaign_revision(
 def _validate_generation_campaign_revision(
     path: Path, value: dict[str, Any], *, require_ready: bool
 ) -> dict[str, Any]:
-    del path
     _require_exact_keys(
         value,
         {
@@ -2683,6 +2689,14 @@ def _validate_generation_campaign_revision(
     unhashed.pop("contract_sha256", None)
     if declared != _digest_value(unhashed):
         raise ContractError("generation campaign revision semantic digest mismatch")
+    if (
+        path.resolve() == GENERATION_CAMPAIGN_R2_CONTRACT_PATH.resolve()
+        and (
+            value.get("contract_id") != GENERATION_CAMPAIGN_R2_CONTRACT_ID
+            or declared != GENERATION_CAMPAIGN_R2_CONTRACT_SHA256
+        )
+    ):
+        raise ContractError("canonical r2 generation campaign identity drift")
     if value.get("implementation_commit") != GENERATION_CAMPAIGN_REVISION_IMPLEMENTATION_COMMIT:
         raise ContractError("generation campaign revision implementation commit drift")
     arms = {str(arm.get("id")): dict(arm) for arm in value.get("arms", [])}
