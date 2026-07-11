@@ -272,6 +272,26 @@ def test_launch_command_is_independent_of_remote_ssh_working_directory(
     assert not (job_dir / ".failed").exists()
 
 
+def test_checkpoint_staging_creates_both_distinct_remote_parent_dirs(
+    tmp_path: Path,
+) -> None:
+    manifest, plan = _plan(tmp_path)
+    plan = copy.deepcopy(plan)
+    plan["candidate"]["remote"] = "/srv/a1/candidates/candidate.pt"
+    plan["champion"]["remote"] = "/srv/a1/champions/champion.pt"
+    commands: list[list[str]] = []
+
+    def runner(command: list[str]) -> subprocess.CompletedProcess[str]:
+        commands.append(command)
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    fleet._prepare_remote_host(  # noqa: SLF001
+        manifest, plan, manifest["hosts"][0], runner=runner
+    )
+
+    assert "mkdir -p /srv/a1/candidates /srv/a1/champions" in commands[0][-1]
+
+
 def test_plan_hash_and_checkpoint_bytes_are_replayed_on_load(tmp_path: Path) -> None:
     manifest, plan = _plan(tmp_path)
     path = tmp_path / "plan.json"
@@ -383,6 +403,61 @@ def test_validation_claim_rejects_overlap_from_concurrent_plan(tmp_path: Path) -
         internal_base_seed=6_190_000_300,
         external_base_seed=6_192_000_000,
         iteration_id="a2",
+        repo_commit="a" * 40,
+        tool_hashes=first["tool_hashes"],
+    )
+    with pytest.raises(fleet.FleetError, match="VAL-only seed overlap"):
+        fleet.claim_validation_ranges(manifest, second)
+
+
+def test_explicit_common_seed_cohort_allows_only_exact_science_matched_reuse(
+    tmp_path: Path,
+) -> None:
+    manifest, template = _plan(tmp_path)
+    champion = Path(template["champion"]["source"])
+
+    def make(name: str, *, internal_base: int = 6_190_000_000) -> dict:
+        candidate = tmp_path / f"{name}.pt"
+        candidate.write_bytes(name.encode())
+        return fleet.build_plan(
+            manifest,
+            candidate=candidate,
+            champion=champion,
+            internal_pairs=600,
+            external_pairs=500,
+            internal_base_seed=internal_base,
+            external_base_seed=6_191_000_000,
+            iteration_id=name,
+            seed_cohort_id="dual-arm-common-v1",
+            repo_commit="a" * 40,
+            tool_hashes=template["tool_hashes"],
+        )
+
+    first = make("candidate-one")
+    second = make("candidate-two")
+    assert first["plan_hash"] != second["plan_hash"]
+    assert fleet.claim_validation_ranges(manifest, first) == "claimed"
+    assert fleet.claim_validation_ranges(manifest, second) == "claimed"
+
+    partial = make("candidate-partial", internal_base=6_190_000_001)
+    with pytest.raises(fleet.FleetError, match="VAL-only seed overlap"):
+        fleet.claim_validation_ranges(manifest, partial)
+
+
+def test_common_seed_reuse_requires_an_explicit_shared_cohort(tmp_path: Path) -> None:
+    manifest, first = _plan(tmp_path)
+    assert fleet.claim_validation_ranges(manifest, first) == "claimed"
+    candidate = tmp_path / "candidate-without-cohort.pt"
+    candidate.write_bytes(b"other")
+    second = fleet.build_plan(
+        manifest,
+        candidate=candidate,
+        champion=Path(first["champion"]["source"]),
+        internal_pairs=600,
+        external_pairs=500,
+        internal_base_seed=6_190_000_000,
+        external_base_seed=6_191_000_000,
+        iteration_id="no-common-cohort",
         repo_commit="a" * 40,
         tool_hashes=first["tool_hashes"],
     )

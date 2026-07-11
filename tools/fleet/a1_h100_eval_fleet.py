@@ -364,6 +364,7 @@ def build_plan(
     external_base_seed: int,
     workers_per_gpu: int = DEFAULT_WORKERS_PER_GPU,
     iteration_id: str = "a1",
+    seed_cohort_id: str | None = None,
     scope: str = "full",
     repo_root: Path = _REPO_ROOT,
     repo_commit: str | None = None,
@@ -392,6 +393,8 @@ def build_plan(
         )
     if not SAFE_NAME.fullmatch(iteration_id):
         raise FleetError("iteration_id must be a safe nonempty identifier")
+    if seed_cohort_id is not None and not SAFE_NAME.fullmatch(seed_cohort_id):
+        raise FleetError("seed_cohort_id must be a safe nonempty identifier")
     root = str(manifest["remote_root"])
     # All fleet nodes stage the bytes at the B200 source's exact absolute path.
     # This keeps evaluator typed-config paths aligned with the training receipt
@@ -424,6 +427,7 @@ def build_plan(
         "internal_base_seed": internal_base_seed,
         "external_base_seed": external_base_seed,
         "iteration_id": iteration_id,
+        "seed_cohort_id": seed_cohort_id,
         "scope": scope,
     }
     run_id = "a1-eval-" + hashlib.sha256(_canonical(run_key)).hexdigest()[:16]
@@ -506,6 +510,7 @@ def build_plan(
         "schema_version": PLAN_SCHEMA,
         "run_id": run_id,
         "iteration_id": iteration_id,
+        "seed_cohort_id": seed_cohort_id,
         "scope": scope,
         "manifest_hash": manifest["manifest_hash"],
         "repo_commit": repo_commit or _git_commit(repo_root),
@@ -578,6 +583,9 @@ def load_plan(path: Path, manifest: dict[str, Any]) -> dict[str, Any]:
         raise FleetError("evaluation plan science config drift")
     if not re.fullmatch(r"[0-9a-f]{40}", str(plan.get("repo_commit", ""))):
         raise FleetError("evaluation plan has no full Git commit")
+    cohort = plan.get("seed_cohort_id")
+    if cohort is not None and not SAFE_NAME.fullmatch(str(cohort)):
+        raise FleetError("evaluation plan has an invalid seed_cohort_id")
     expected_tools = {
         "tools/gumbel_search_cross_net_h2h.py",
         "tools/catanatron_neutral_harness_match.py",
@@ -714,10 +722,12 @@ def _claim_payload(plan: dict[str, Any]) -> dict[str, Any]:
             {"purpose": purpose, "base_seed": base, "end_seed": base + pairs}
         )
     return {
-        "schema_version": "a1-val-only-eval-claim-v1",
+        "schema_version": "a1-val-only-eval-claim-v2",
         "plan_hash": plan["plan_hash"],
         "run_id": plan["run_id"],
         "iteration_id": plan["iteration_id"],
+        "seed_cohort_id": plan.get("seed_cohort_id"),
+        "science_config_hash": plan["science_config_hash"],
         "status": "claimed",
         "intervals": intervals,
     }
@@ -727,6 +737,25 @@ def _claims_overlap(left: dict[str, Any], right: dict[str, Any]) -> bool:
     return int(left["base_seed"]) < int(right["end_seed"]) and int(
         right["base_seed"]
     ) < int(left["end_seed"])
+
+
+def _shared_claim_is_exact(
+    wanted_payload: dict[str, Any],
+    prior_payload: dict[str, Any],
+    wanted: dict[str, Any],
+    occupied: dict[str, Any],
+) -> bool:
+    """Allow only explicit common-random-number cohorts to share exact ranges."""
+    cohort = wanted_payload.get("seed_cohort_id")
+    return bool(
+        cohort
+        and cohort == prior_payload.get("seed_cohort_id")
+        and wanted_payload.get("science_config_hash")
+        == prior_payload.get("science_config_hash")
+        and wanted.get("purpose") == occupied.get("purpose")
+        and int(wanted["base_seed"]) == int(occupied["base_seed"])
+        and int(wanted["end_seed"]) == int(occupied["end_seed"])
+    )
 
 
 def claim_validation_ranges(manifest: dict[str, Any], plan: dict[str, Any]) -> str:
@@ -775,11 +804,16 @@ def claim_validation_ranges(manifest: dict[str, Any], plan: dict[str, Any]) -> s
                 return "adopted"
             for path in sorted(claims_dir.glob("*.json")):
                 prior = _read_json(path)
-                if prior.get("schema_version") != payload["schema_version"]:
+                if prior.get("schema_version") not in {
+                    "a1-val-only-eval-claim-v1",
+                    payload["schema_version"],
+                }:
                     raise FleetError(f"unknown validation claim schema in {path}")
                 for wanted in payload["intervals"]:
                     for occupied in prior.get("intervals", []):
-                        if _claims_overlap(wanted, occupied):
+                        if _claims_overlap(wanted, occupied) and not _shared_claim_is_exact(
+                            payload, prior, wanted, occupied
+                        ):
                             raise FleetError(
                                 "VAL-only seed overlap with prior claim "
                                 f"{prior.get('plan_hash')}: {wanted} vs {occupied}"
@@ -990,8 +1024,15 @@ def _prepare_remote_host(
     *,
     runner: Callable[[Sequence[str]], subprocess.CompletedProcess[str]] = _run,
 ) -> None:
-    checkpoint_dir = str(Path(plan["candidate"]["remote"]).parent)
-    runner([*_ssh_base(manifest, host), f"mkdir -p {shlex.quote(checkpoint_dir)}"])
+    checkpoint_dirs = sorted(
+        {str(Path(plan[role]["remote"]).parent) for role in ("candidate", "champion")}
+    )
+    runner(
+        [
+            *_ssh_base(manifest, host),
+            "mkdir -p " + " ".join(shlex.quote(path) for path in checkpoint_dirs),
+        ]
+    )
     target = f"{manifest['ssh_user']}@{host['address']}"
     for role in ("candidate", "champion"):
         remote = plan[role]["remote"]
@@ -1351,6 +1392,14 @@ def _parser() -> argparse.ArgumentParser:
         "--workers-per-gpu", type=int, default=DEFAULT_WORKERS_PER_GPU
     )
     plan.add_argument("--iteration-id", required=True)
+    plan.add_argument(
+        "--seed-cohort-id",
+        help=(
+            "Explicit common-random-number cohort. Plans with the same ID, "
+            "science hash, purpose, and exact interval may intentionally reuse "
+            "VAL seeds; partial overlap remains forbidden."
+        ),
+    )
     plan.add_argument("--scope", choices=("canary", "full"), default="full")
     plan.add_argument("--out", type=Path, required=True)
     for name in ("launch", "resume"):
@@ -1390,6 +1439,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 external_base_seed=args.external_base_seed,
                 workers_per_gpu=args.workers_per_gpu,
                 iteration_id=args.iteration_id,
+                seed_cohort_id=args.seed_cohort_id,
                 scope=args.scope,
             )
             write_new_readonly(args.out, value)
