@@ -17,6 +17,7 @@ from tools import a1_pre_wave_contract as contract
 from tools import generate_gumbel_selfplay_data as generator
 from tools import legacy_scalar_readout_attestation as legacy_scalar
 from tools import search_operator_binding as operator_binding
+from tools.fleet import a1_production_executor as production_executor
 
 
 TEMPLATE = (
@@ -24,6 +25,13 @@ TEMPLATE = (
     / "configs"
     / "experiments"
     / "a1_pre_wave_contract.template.json"
+)
+GENERATION_CAMPAIGN = (
+    Path(__file__).resolve().parents[1]
+    / "configs"
+    / "operations"
+    / "a1-dual-arm-56gpu-20260710"
+    / "contract.json"
 )
 
 
@@ -65,6 +73,259 @@ def _checkpoint(path: Path, marker: int) -> None:
         },
         path,
     )
+
+
+def _generation_campaign_copy(tmp_path: Path, mutate) -> Path:
+    payload = json.loads(GENERATION_CAMPAIGN.read_text(encoding="utf-8"))
+    mutate(payload)
+    payload.pop("contract_sha256", None)
+    payload["contract_sha256"] = contract._digest_value(payload)  # noqa: SLF001
+    path = tmp_path / "generation-campaign.json"
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    return path
+
+
+def test_dual_arm_generation_campaign_is_exact_and_fail_closed() -> None:
+    payload = contract.validate_generation_campaign(GENERATION_CAMPAIGN)
+    arms = {arm["id"]: arm for arm in payload["arms"]}
+
+    assert arms["n256"]["gpu_count"] == arms["n128"]["gpu_count"] == 28
+    assert arms["n256"]["games_per_gpu"] == 2_000
+    assert arms["n128"]["games_per_gpu"] == 5_000
+    assert arms["n256"]["seed_start"] == 300_000_168_192
+    assert arms["n256"]["seed_end"] == arms["n128"]["seed_start"]
+    assert arms["n256"]["seed_block_size"] == 8_192
+    assert arms["n128"]["seed_block_size"] == 8_192
+    assert arms["n256"]["selected_per_gpu"] == {
+        "current_producer": 1_600,
+        "recent_history": 300,
+        "hard_negative": 100,
+    }
+    assert arms["n128"]["selected_per_gpu"] == {
+        "current_producer": 4_000,
+        "recent_history": 750,
+        "hard_negative": 250,
+    }
+    assert arms["n256"]["total_games"] == 56_000
+    assert arms["n128"]["total_games"] == 140_000
+    assignments = json.loads(
+        (GENERATION_CAMPAIGN.parent / "placement.assignments.json").read_text()
+    )["assignments"]
+    assert len(assignments) == 56
+    assert len({(item["host_alias"], item["gpu"]) for item in assignments}) == 56
+    arms_by_host: dict[str, set[str]] = {}
+    for item in assignments:
+        arms_by_host.setdefault(item["host_alias"], set()).add(
+            item["logical_lane"].split("_", 1)[0]
+        )
+    assert all(len(host_arms) == 1 for host_arms in arms_by_host.values())
+    assert payload["common_recipe"]["p_full"] == 0.25
+    assert payload["common_recipe"]["n_fast"] == 16
+    assert payload["common_recipe"]["c_scale"] == 0.1
+    assert payload["common_recipe"]["symmetry_averaged_eval_threshold"] == 20
+    assert payload["execution_policy"]["launch_authorized"] is False
+    with pytest.raises(contract.ContractError, match="not launchable"):
+        contract.validate_generation_campaign(GENERATION_CAMPAIGN, require_ready=True)
+    with pytest.raises(contract.ContractError, match="draft schema"):
+        contract.build_lock(GENERATION_CAMPAIGN)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        (
+            lambda value: value["arms"][1].update(
+                seed_start=value["arms"][0]["seed_start"]
+            ),
+            "seed",
+        ),
+        (
+            lambda value: value["arms"][1].update(
+                output_root=value["arms"][0]["output_root"]
+            ),
+            "output roots overlap",
+        ),
+        (
+            lambda value: value["common_recipe"].update(p_full=1.0),
+            "common recipe drift",
+        ),
+        (
+            lambda value: value["execution_policy"].update(launch_authorized=True),
+            "execution policy drift",
+        ),
+        (
+            lambda value: value["promotion_handoff"].update(
+                mode="historical_pre_promotion"
+            ),
+            "handoff gate drift",
+        ),
+    ],
+)
+def test_dual_arm_generation_campaign_rejects_drift(
+    tmp_path: Path, mutation, message: str
+) -> None:
+    path = _generation_campaign_copy(tmp_path, mutation)
+    with pytest.raises(contract.ContractError, match=message):
+        contract.validate_generation_campaign(path)
+
+
+def test_dual_arm_generation_campaign_binds_immutable_tooling(
+    tmp_path: Path,
+) -> None:
+    def drift(value: dict) -> None:
+        value["provenance"]["executor"]["sha256"] = "sha256:" + "0" * 64
+
+    path = _generation_campaign_copy(tmp_path, drift)
+    with pytest.raises(contract.ContractError, match="immutable file drift"):
+        contract.validate_generation_campaign(path)
+
+
+def test_dual_arm_placement_refuses_split_hosts(tmp_path: Path) -> None:
+    contract.validate_generation_campaign(GENERATION_CAMPAIGN)
+    assignments = json.loads(
+        (GENERATION_CAMPAIGN.parent / "placement.assignments.json").read_text()
+    )["assignments"]
+    n256 = next(item for item in assignments if item["logical_lane"] == "n256_gpu00")
+    n128 = next(item for item in assignments if item["logical_lane"] == "n128_gpu00")
+    n256["host_alias"], n128["host_alias"] = n128["host_alias"], n256["host_alias"]
+    raw = tmp_path / "split-hosts.json"
+    raw.write_text(json.dumps(assignments))
+    out = tmp_path / "placement.json"
+
+    with pytest.raises(contract.ContractError, match="may not split one host"):
+        contract.seal_generation_placement(GENERATION_CAMPAIGN, raw, out)
+
+    assert not out.exists()
+
+
+def test_dual_arm_materializes_renders_and_replays_in_production_executor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    campaign = json.loads(GENERATION_CAMPAIGN.read_text(encoding="utf-8"))
+    checkpoint_dir = tmp_path / "checkpoints"
+    checkpoint_dir.mkdir()
+    for index, item in enumerate(campaign["checkpoints"]):
+        source = checkpoint_dir / f"checkpoint-{index}.pt"
+        source.write_bytes(f"checkpoint-{index}".encode())
+        item["path"] = str(source)
+        item["sha256"] = contract._sha256(source)  # noqa: SLF001
+    campaign["promotion_handoff"]["expected_checkpoint_sha256"] = campaign[
+        "checkpoints"
+    ][0]["sha256"]
+    campaign["fleet"]["seed_ledger"] = str(tmp_path / "SEED_LEDGER.md")
+    Path(campaign["fleet"]["seed_ledger"]).write_text("# ledger\n")
+    for key in ("arm_guards", "generator_code"):
+        for record in campaign["provenance"][key]:
+            record["sha256"] = contract._sha256(  # noqa: SLF001
+                contract.REPO_ROOT / record["path"]
+            )
+    for key in ("executor", "harvest", "fleet_manifest"):
+        record = campaign["provenance"][key]
+        record["sha256"] = contract._sha256(  # noqa: SLF001
+            contract.REPO_ROOT / record["path"]
+        )
+    campaign.pop("contract_sha256")
+    campaign["contract_sha256"] = contract._digest_value(campaign)  # noqa: SLF001
+    monkeypatch.setattr(
+        contract, "validate_generation_campaign", lambda _path, **_kwargs: campaign
+    )
+    monkeypatch.setattr(contract, "_runtime_code_tree_records", lambda: [])
+    monkeypatch.setattr(contract, "_validate_against_ledger", lambda *_args: None)
+    monkeypatch.setattr(contract, "_verify_live_seed_ledger", lambda *_args, **_kwargs: None)
+    handoff = tmp_path / "handoff.json"
+    handoff.write_text('{"handoff":"committed"}\n')
+    monkeypatch.setattr(
+        contract,
+        "_promotion_handoff_record",
+        lambda *_args, **_kwargs: {
+            "mode": contract.POST_PROMOTION_HANDOFF_MODE,
+            "path": str(handoff),
+            "sha256": contract._sha256(handoff),  # noqa: SLF001
+        },
+    )
+    assignments = json.loads(
+        (
+            GENERATION_CAMPAIGN.parent / "placement.assignments.json"
+        ).read_text()
+    )["assignments"]
+    assignments_path = tmp_path / "assignments.json"
+    assignments_path.write_text(json.dumps(assignments))
+    placement_path = tmp_path / "placement.json"
+    contract.seal_generation_placement(
+        GENERATION_CAMPAIGN, assignments_path, placement_path
+    )
+
+    locks = contract.materialize_generation_campaign(
+        GENERATION_CAMPAIGN,
+        promotion_handoff_path=handoff,
+        placement_path=placement_path,
+        out_dir=tmp_path / "locks",
+    )
+
+    assert len(locks) == 2
+    all_outputs: set[str] = set()
+    all_ranges: set[tuple[int, int]] = set()
+    for lock_path in locks:
+        lock = contract.verify_lock(lock_path)
+        arm_id = lock["game_contract"]["arm_id"]
+        render_dir = tmp_path / f"render-{arm_id}"
+        rendered = contract.render(lock_path, render_dir)
+        replayed_lock, replayed_render, lanes = production_executor.verify_render(
+            lock_path, render_dir / "commands.json"
+        )
+        assert replayed_lock["game_contract"]["arm_id"] == arm_id
+        assert replayed_render["render_sha256"] == rendered["render_sha256"]
+        assert len(lanes) == 28
+        assert len(rendered["commands"]) == 84
+        assert lock["game_contract"]["total_complete_games"] == (
+            56_000 if arm_id == "n256" else 140_000
+        )
+        for job in lock["fleet"]["jobs"]:
+            assert job["output_dir"] not in all_outputs
+            all_outputs.add(job["output_dir"])
+            interval = (job["base_seed"], job["seed_end"])
+            assert all(not (interval[0] < end and start < interval[1]) for start, end in all_ranges)
+            all_ranges.add(interval)
+        assert all(command["arm_id"] == arm_id for command in rendered["commands"])
+        assert all(
+            "--prelaunch-guard-config" in command["argv"]
+            and command["argv"][command["argv"].index("--generation-arm-id") + 1]
+            == arm_id
+            for command in rendered["commands"]
+        )
+        for command in rendered["commands"]:
+            expected_c_scale = (
+                "0.1" if command["category"] == "current_producer" else "0.03"
+            )
+            assert command["argv"][command["argv"].index("--c-scale") + 1] == (
+                expected_c_scale
+            )
+            guard_path = contract.REPO_ROOT / command["argv"][
+                command["argv"].index("--prelaunch-guard-config") + 1
+            ]
+            guard = json.loads(guard_path.read_text())
+            expected = guard["guards"][0]["args"]["expected_values"]
+            assert str(expected["--c-scale"]) == expected_c_scale
+            assert expected["--n-full"] == int(arm_id.removeprefix("n"))
+            assert "--information-set-search" in command["argv"]
+            assert "--public-observation" in command["argv"]
+            assert "--symmetry-averaged-eval" in command["argv"]
+            assert command["argv"][
+                command["argv"].index("--symmetry-averaged-eval-threshold") + 1
+            ] == "20"
+        receipt = contract.claim_seed_ledger(
+            lock_path,
+            render_dir / "commands.json",
+            tmp_path / f"{arm_id}.claim-receipt.json",
+        )
+        assert receipt["claim_count"] == 84
+        assert all(
+            command["ledger_claim"]["row"].startswith(
+                f"[{next(job for job in lock['fleet']['jobs'] if job['job_id'] == command['job_id'])['base_seed']}"
+            )
+            for command in rendered["commands"]
+        )
+    assert len(all_outputs) == len(all_ranges) == 168
 
 
 def _legacy_scalar_pair(

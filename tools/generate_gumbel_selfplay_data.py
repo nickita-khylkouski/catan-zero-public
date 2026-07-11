@@ -829,6 +829,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="Unique fleet pipeline identity recorded in the generation manifest.",
     )
     parser.add_argument(
+        "--generation-arm-id",
+        choices=("n256", "n128"),
+        default=None,
+        help="Sealed dual-arm generation identity propagated into every manifest.",
+    )
+    parser.add_argument(
+        "--prelaunch-guard-config",
+        type=Path,
+        default=None,
+        help=(
+            "Contract-bound static guard file under configs/guards. Production "
+            "executors must bind its exact bytes; omitted uses the canonical default."
+        ),
+    )
+    parser.add_argument(
         "--skip-guards",
         action="store_true",
         help=(
@@ -848,7 +863,7 @@ def _build_guard_specs(
     import os  # local: only used here to read the launcher-set claim id (CAT-124)
 
     static_specs = launcher_guards.load_static_guard_specs(
-        "generate_gumbel_selfplay_data"
+        "generate_gumbel_selfplay_data", config_path=args.prelaunch_guard_config
     )
     # CAT-124: the canonical launcher claims the seed range in the ledger BEFORE this tool
     # runs its guards (claim-then-verify), so by guard time our OWN row is already present.
@@ -1860,6 +1875,7 @@ def _merge_worker_summaries(
         "n_full": int(args.n_full),
         "n_fast": int(args.n_fast),
         "p_full": float(args.p_full),
+        "c_scale": float(getattr(args, "c_scale", 0.03)),
         "correct_rust_chance_spectra": bool(args.correct_rust_chance_spectra),
         "lazy_interior_chance": bool(args.lazy_interior_chance),
         # getattr-defaulted (like opponent_pool_manifest below) so summaries built
@@ -1872,6 +1888,7 @@ def _merge_worker_summaries(
         "value_readout": str(getattr(args, "value_readout", "scalar")),
         "checkpoint": args.checkpoint,
         "base_seed": int(args.base_seed),
+        "arm_id": getattr(args, "generation_arm_id", None),
         "fleet_pipelines_per_gpu": int(
             getattr(args, "fleet_pipelines_per_gpu", 1)
         ),

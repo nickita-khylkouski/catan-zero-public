@@ -42,12 +42,24 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 GUARD_CONFIG_DIR = REPO_ROOT / "configs" / "guards"
 
 
-def load_static_guard_specs(launcher: str) -> list[dict[str, Any]]:
+def load_static_guard_specs(
+    launcher: str, *, config_path: str | Path | None = None
+) -> list[dict[str, Any]]:
     """Load the ``{"guards": [{"name": ..., "args": {...}}, ...]}`` config
     committed at ``configs/guards/<launcher>.json``.
     """
-    config_path = GUARD_CONFIG_DIR / f"{launcher}.json"
-    payload = json.loads(config_path.read_text())
+    path = (
+        GUARD_CONFIG_DIR / f"{launcher}.json"
+        if config_path is None
+        else Path(config_path).expanduser()
+    )
+    lexical = Path(path).absolute()
+    resolved = lexical.resolve(strict=True)
+    if lexical != resolved or resolved.parent != GUARD_CONFIG_DIR.resolve(strict=True):
+        raise ValueError(
+            f"static guard config must be one canonical file in {GUARD_CONFIG_DIR}: {lexical}"
+        )
+    payload = json.loads(resolved.read_text())
     return list(payload["guards"])
 
 

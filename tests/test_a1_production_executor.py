@@ -229,6 +229,112 @@ def test_dry_plan_is_exact_40_lane_120_job_n128_mps_contract(
     assert not any(flag in command["argv"] for command in rendered["commands"] for flag in executor.FORBIDDEN_ADAPTIVE_ARGV)
 
 
+def test_dual_arm_n256_profile_is_exact_28_lane_84_job_contract(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lock_path, render_path, lock, rendered = _fixture(tmp_path)
+    lock["schema_version"] = contract.GENERATION_ARM_LOCK_SCHEMA
+    lock["game_contract"] = {
+        "profile": "dual_arm_generation_v1",
+        "arm_id": "n256",
+        "worker_count": 28,
+        "job_count": 84,
+    }
+    lock["science"]["search_operator"]["n_full"] = 256
+    lock["science"]["search_operator_sha256"] = contract._digest_value(  # noqa: SLF001
+        lock["science"]["search_operator"]
+    )
+    lock["science"]["effective_search_config_sha256"] = "sha256:" + "1" * 64
+    lock["science"]["evaluator_sha256"] = "sha256:" + "2" * 64
+    lock["science"]["value_readout"] = "scalar"
+    lock["provenance"] = {
+        "guard_configs": {
+            category: {"path": "configs/guards/a1_generation_n256.json"}
+            for category in executor.CATEGORY_ORDER
+        },
+        "runtime_code_tree_sha256": "sha256:" + "3" * 64,
+    }
+    lock["fleet"]["jobs"] = lock["fleet"]["jobs"][:84]
+    lock["fleet"]["seed_plan_sha256"] = contract._digest_value(  # noqa: SLF001
+        lock["fleet"]["jobs"]
+    )
+    lock["checkpoints"].extend(
+        [
+            {**lock["checkpoints"][0], "id": "history", "role": "history"},
+            {
+                **lock["checkpoints"][0],
+                "id": "hard-negative",
+                "role": "hard_negative",
+            },
+        ]
+    )
+    lock["source_categories"] = [
+        {"name": "current_producer", "mode": "self", "checkpoint_ids": []},
+        {
+            "name": "recent_history",
+            "mode": "checkpoint_list",
+            "checkpoint_ids": ["history"],
+        },
+        {
+            "name": "hard_negative",
+            "mode": "checkpoint_list",
+            "checkpoint_ids": ["hard-negative"],
+        },
+    ]
+    mix_paths = {
+        Path(item["path"]).stem: Path(item["path"])
+        for item in rendered["required_artifacts"]["rendered_opponent_mix"]
+    }
+    rendered["commands"] = rendered["commands"][:84]
+    for job, command in zip(lock["fleet"]["jobs"], rendered["commands"]):
+        job["arm_id"] = "n256"
+        job["c_scale"] = 0.1
+        command["arm_id"] = "n256"
+        command["argv"] = contract._generator_argv(  # noqa: SLF001
+            lock, job, mix_paths=mix_paths
+        )
+        command["argv_sha256"] = contract._digest_value(command["argv"])  # noqa: SLF001
+        command["config_provenance"] = contract._expected_generate_config_provenance(  # noqa: SLF001
+            lock,
+            job,
+            opponent_mix_manifest=(
+                None
+                if job["category"] == "current_producer"
+                else str(mix_paths[job["category"]])
+            ),
+        )
+        attestation = contract._job_attestation(lock, job)  # noqa: SLF001
+        source = Path(command["output_attestation"]["source"])
+        source.write_text(json.dumps(attestation))
+        command["output_attestation"]["source_file_sha256"] = _sha(source)
+        command["output_attestation"]["payload_sha256"] = contract._digest_value(  # noqa: SLF001
+            attestation
+        )
+    rendered["render_sha256"] = contract._digest_value(  # noqa: SLF001
+        {key: value for key, value in rendered.items() if key != "render_sha256"}
+    )
+    lock_path.write_text(json.dumps(lock), encoding="utf-8")
+    render_path.write_text(json.dumps(rendered), encoding="utf-8")
+    hosts = _hosts(tmp_path, rendered)
+    monkeypatch.setattr(executor, "_repo_artifacts", lambda _rendered, **_kwargs: [])
+
+    plan = executor.build_plan(
+        lock_path=lock_path,
+        render_path=render_path,
+        hosts_path=hosts,
+        receipt_path=tmp_path / "receipt.json",
+        verify_lock_fn=_verifier(lock),
+    )
+
+    assert plan["lane_count"] == 28
+    assert plan["job_count"] == plan["claim_count"] == 84
+    assert all(command["arm_id"] == "n256" for command in rendered["commands"])
+    assert all(
+        command["argv"][command["argv"].index("--n-full") + 1] == "256"
+        for command in rendered["commands"]
+    )
+
+
 def test_private_host_config_and_render_environment_fail_closed(tmp_path: Path) -> None:
     lock_path, render_path, lock, rendered = _fixture(tmp_path)
     hosts = _hosts(tmp_path, rendered)

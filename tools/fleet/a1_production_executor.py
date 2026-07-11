@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Manual, fail-closed executor for a sealed 40-lane/120-job A1 render."""
+"""Manual, fail-closed executor for sealed legacy and dual-arm A1 renders."""
 
 from __future__ import annotations
 
@@ -173,15 +173,27 @@ def verify_render(
         raise ExecutorError("render semantic digest mismatch")
     if rendered.get("contract_sha256") != lock["contract_sha256"]:
         raise ExecutorError("render binds a different contract")
+    game_contract = dict(lock.get("game_contract", {}))
+    arm_id = game_contract.get("arm_id")
+    expected_jobs = int(game_contract.get("job_count", 120))
+    expected_lanes = int(game_contract.get("worker_count", 40))
     commands = rendered.get("commands")
-    if not isinstance(commands, list) or len(commands) != 120:
-        raise ExecutorError("production render must contain exactly 120 commands")
+    if not isinstance(commands, list) or len(commands) != expected_jobs:
+        raise ExecutorError(
+            f"production render must contain exactly {expected_jobs} commands"
+        )
     jobs = {job["job_id"]: job for job in lock["fleet"]["jobs"]}
-    if len(jobs) != 120:
-        raise ExecutorError("sealed production lock must contain exactly 120 jobs")
+    if len(jobs) != expected_jobs:
+        raise ExecutorError(
+            f"sealed production lock must contain exactly {expected_jobs} jobs"
+        )
     search = lock.get("science", {}).get("search_operator", {})
-    if int(search.get("n_full", -1)) != 128:
-        raise ExecutorError("A1 production science is locked to n_full=128")
+    expected_n_full = 256 if arm_id == "n256" else 128
+    if int(search.get("n_full", -1)) != expected_n_full:
+        raise ExecutorError(
+            f"A1 production {arm_id or 'historical'} science is locked to "
+            f"n_full={expected_n_full}"
+        )
     if (
         search.get("n_full_wide") is not None
         or search.get("n_full_wide_threshold") is not None
@@ -202,6 +214,10 @@ def verify_render(
             raise ExecutorError(f"unknown/duplicate rendered job {job_id!r}")
         seen.add(job_id)
         job = jobs[job_id]
+        if arm_id is not None and (
+            command.get("arm_id") != arm_id or job.get("arm_id") != arm_id
+        ):
+            raise ExecutorError(f"arm identity drift for {job_id}")
         if command.get("argv_sha256") != contract._digest_value(command.get("argv")):
             raise ExecutorError(f"argv digest mismatch for {job_id}")
         expected_argv = contract._generator_argv(lock, job, mix_paths=mix_paths)
@@ -215,8 +231,12 @@ def verify_render(
             rendered_n_full = int(expected_argv[expected_argv.index("--n-full") + 1])
         except (ValueError, IndexError) as error:
             raise ExecutorError(f"{job_id} lacks an exact --n-full value") from error
-        if rendered_n_full != 128 or any(flag in expected_argv for flag in FORBIDDEN_ADAPTIVE_ARGV):
-            raise ExecutorError(f"{job_id} is not the sealed n128/no-adaptive recipe")
+        if rendered_n_full != expected_n_full or any(
+            flag in expected_argv for flag in FORBIDDEN_ADAPTIVE_ARGV
+        ):
+            raise ExecutorError(
+                f"{job_id} is not the sealed n{expected_n_full}/no-adaptive recipe"
+            )
         expected_environment = contract._job_environment(lock, job)
         if command.get("environment") != expected_environment:
             raise ExecutorError(f"exact client environment drift for {job_id}")
@@ -242,9 +262,20 @@ def verify_render(
         source = Path(command["output_attestation"]["source"])
         if not source.is_file() or _sha256(source) != command["output_attestation"]["source_file_sha256"]:
             raise ExecutorError(f"job attestation drift for {job_id}")
+        if arm_id is not None:
+            expected_attestation = contract._job_attestation(lock, job)
+            if (
+                contract._load_json(source) != expected_attestation
+                or command["output_attestation"].get("payload_sha256")
+                != contract._digest_value(expected_attestation)
+            ):
+                raise ExecutorError(f"dual-arm job attestation payload drift for {job_id}")
         by_lane.setdefault(command["worker_id"], []).append(command)
-    if seen != set(jobs) or len(by_lane) != 40:
-        raise ExecutorError("render must cover exactly 40 physical lanes and 120 jobs")
+    if seen != set(jobs) or len(by_lane) != expected_lanes:
+        raise ExecutorError(
+            f"render must cover exactly {expected_lanes} physical lanes and "
+            f"{expected_jobs} jobs"
+        )
     for worker_id, lane in by_lane.items():
         lane.sort(key=lambda item: CATEGORY_ORDER.index(item["category"]))
         if tuple(item["category"] for item in lane) != CATEGORY_ORDER:
@@ -264,7 +295,7 @@ def _repo_artifacts(
     root = repo_root.resolve(strict=True)
     required = rendered["required_artifacts"]
     records = [
-        required["guard_config"],
+        *(required.get("guard_configs") or [required["guard_config"]]),
         *required["generator_code"],
         *required["runtime_code_tree"],
     ]

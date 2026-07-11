@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Freeze, verify, render, and postflight-audit the A1 40-GPU data handoff.
+"""Freeze, verify, render, and postflight-audit sealed A1 data handoffs.
 
 This tool is deliberately *not* a launcher.  It turns the winning bounded-R&D
 artifacts into an immutable contract and renders argv/environment records for
-the data-production lane.  There is no subprocess/exec path: the 40-GPU wave
-remains an explicit operator boundary.
+the data-production lane.  There is no subprocess/exec path: every legacy or
+dual-arm wave remains an explicit operator boundary.
 
 The contract uses category-specific jobs rather than a probabilistic opponent
 mix.  Each of 40 workers attempts 245 current, 47 history, and 16 hard-negative
@@ -83,6 +83,7 @@ SEALED_RUNTIME_ENVIRONMENT = {
 }
 AUDIT_SCHEMA = "a1-post-wave-audit-v2"
 RELOCATED_AUDIT_SCHEMA = "a1-post-wave-audit-v3"
+DUAL_ARM_AUDIT_SCHEMA = "a1-dual-arm-post-wave-audit-v1"
 HARVEST_RELOCATION_SCHEMA = "a1-fleet-harvest-relocation-v1"
 GUARD_SYNC_SCHEMA = "a1-pre-wave-generation-guard-sync-v1"
 CLAIM_RECEIPT_SCHEMA = "a1-seed-claim-transaction-v1"
@@ -175,6 +176,14 @@ EXPECTED_LEARNER_TRAINING_RECIPE: dict[str, Any] = {
 REQUIRED_EVIDENCE = {"a0", "s1", "s2", "s3"}
 HISTORICAL_HANDOFF_MODE = "historical_pre_promotion"
 POST_PROMOTION_HANDOFF_MODE = "post_promotion"
+GENERATION_CAMPAIGN_SCHEMA = "a1-dual-arm-generation-contract-v1"
+GENERATION_PLACEMENT_SCHEMA = "a1-dual-arm-generation-placement-v1"
+GENERATION_ARM_LOCK_SCHEMA = "a1-generation-arm-lock-v1"
+GENERATION_CAMPAIGN_PENDING = "blocked_pending_post_promotion_handoff"
+GENERATION_CAMPAIGN_CHECKPOINT_SHA256 = (
+    "sha256:f7e93dfb8cdb713d647b3e142c949d59083de9f719b6688b6faa6c918ce3eed4"
+)
+GENERATION_CAMPAIGN_SEED_FLOOR = 300_000_160_000
 A0_EVIDENCE_SCHEMA = "a0-binding-verdict-v1"
 SEARCH_STAGE_EVIDENCE_SCHEMA = "rl-rnd-stage-decision-v1"
 REQUIRED_REPORTS = {
@@ -2395,6 +2404,613 @@ def _verify_artifact_records(records: Iterable[dict[str, Any]]) -> None:
             )
 
 
+def validate_generation_campaign(path: Path, *, require_ready: bool = False) -> dict[str, Any]:
+    """Validate the canonical post-A1 dual-arm generation blueprint.
+
+    This blueprint deliberately cannot be rendered or executed.  It freezes the
+    science, seeds, output roots, and implementation bytes while the committed
+    promotion handoff and exact 56-GPU host placement remain unavailable.
+    """
+
+    value = _load_json(path)
+    _require_exact_keys(
+        value,
+        {
+            "schema_version",
+            "contract_id",
+            "status",
+            "promotion_handoff",
+            "checkpoints",
+            "source_categories",
+            "common_recipe",
+            "arms",
+            "fleet",
+            "provenance",
+            "execution_policy",
+            "contract_sha256",
+        },
+        where="generation campaign",
+    )
+    if value["schema_version"] != GENERATION_CAMPAIGN_SCHEMA:
+        raise ContractError("generation campaign schema drift")
+    unhashed = dict(value)
+    declared = unhashed.pop("contract_sha256")
+    if declared != _digest_value(unhashed):
+        raise ContractError("generation campaign semantic digest mismatch")
+    if value["status"] != GENERATION_CAMPAIGN_PENDING:
+        raise ContractError("generation campaign must remain explicitly pending")
+    handoff = dict(value["promotion_handoff"])
+    if handoff != {
+        "mode": "required_post_promotion",
+        "path": None,
+        "expected_schema": promotion_handoff.HANDOFF_SCHEMA,
+        "expected_checkpoint_sha256": GENERATION_CAMPAIGN_CHECKPOINT_SHA256,
+    }:
+        raise ContractError("generation campaign promotion handoff gate drift")
+    checkpoints = list(value["checkpoints"])
+    expected_checkpoints = [
+        {
+            "id": "a1_producer",
+            "role": "producer",
+            "path": "/home/ubuntu/catan-zero-production/runs/learner/"
+            "a1-infoset-n128-20260710-r2/candidate.pt",
+            "sha256": GENERATION_CAMPAIGN_CHECKPOINT_SHA256,
+        },
+        {
+            "id": "gen3_history",
+            "role": "history",
+            "path": "/home/ubuntu/catan-zero/runs/bc/gen3_20260706/checkpoint.pt",
+            "sha256": "sha256:89aa133d629e747021bc725f2ad63e0563f3b76e71f0dd563f056c6de8f77ebb",
+        },
+        {
+            "id": "gen4_hard_negative",
+            "role": "hard_negative",
+            "path": "/home/ubuntu/catan-zero/runs/bc/gen4_20260708/checkpoint.pt",
+            "sha256": "sha256:b0f939464c138d6d0dca5586585d7e71aacb7ed86183cccbc2131d95750fe1c5",
+        },
+    ]
+    if checkpoints != expected_checkpoints:
+        raise ContractError("generation campaign checkpoint identities drift")
+    if list(value["source_categories"]) != [
+        {"name": "current_producer", "mode": "self", "checkpoint_ids": []},
+        {
+            "name": "recent_history",
+            "mode": "checkpoint_list",
+            "checkpoint_ids": ["gen3_history"],
+        },
+        {
+            "name": "hard_negative",
+            "mode": "checkpoint_list",
+            "checkpoint_ids": ["gen4_hard_negative"],
+        },
+    ]:
+        raise ContractError("generation campaign source-category bindings drift")
+
+    recipe = dict(value["common_recipe"])
+    expected_recipe = {
+        "track": "2p_no_trade",
+        "vps_to_win": 10,
+        "public_observation": True,
+        "information_set_search": True,
+        "belief_chance_spectra": False,
+        "determinization_particles": 4,
+        "determinization_min_simulations": 32,
+        "c_visit": 50.0,
+        "c_scale": 0.1,
+        "category_c_scale": {
+            "current_producer": 0.1,
+            "recent_history": 0.03,
+            "hard_negative": 0.03,
+        },
+        "prior_temperature": 1.0,
+        "n_fast": 16,
+        "p_full": 0.25,
+        "n_full_wide": None,
+        "n_full_wide_threshold": None,
+        "wide_roots_always_full": False,
+        "raw_policy_above_width": None,
+        "wide_candidates_threshold": 24,
+        "max_depth": 80,
+        "max_decisions": 600,
+        "correct_rust_chance_spectra": True,
+        "lazy_interior_chance": True,
+        "exact_budget_sh": False,
+        "exact_budget_sh_min_n": 0,
+        "rescale_noise_floor_c": 0.0,
+        "sigma_eval": 0.98,
+        "symmetry_averaged_eval": True,
+        "symmetry_averaged_eval_threshold": 20,
+        "value_scale": 1.0,
+        "value_squash": "tanh",
+        "value_readout": "scalar",
+        "context_fill": 0.0,
+        "cache_size": 0,
+        "rust_featurize": False,
+        "emit_uncertainty": False,
+        "obs_width": 806,
+        "temperature_decisions": 90,
+        "temperature_high": 1.0,
+        "temperature_low": 0.0,
+        "late_temperature_decisions": None,
+        "late_temperature": 0.0,
+        "shard_size": 512,
+        "format": "npz",
+        "device": "cuda",
+        "eval_server": False,
+        "workers_per_gpu": 16,
+        "mps_client_environment": {
+            "CUDA_MPS_PIPE_DIRECTORY": MPS_PIPE_DIRECTORY,
+            "CUDA_MPS_LOG_DIRECTORY": MPS_LOG_DIRECTORY,
+        },
+    }
+    if recipe != expected_recipe:
+        raise ContractError("generation campaign common recipe drift")
+
+    arms = list(value["arms"])
+    if len(arms) != 2 or {arm.get("id") for arm in arms} != {"n256", "n128"}:
+        raise ContractError("generation campaign requires exact n256/n128 arms")
+    expected_arms = {"n256": (256, 2_000), "n128": (128, 5_000)}
+    intervals: list[tuple[int, int]] = []
+    roots: list[PurePath] = []
+    lane_ids: set[str] = set()
+    for arm in arms:
+        _require_exact_keys(
+            arm,
+            {
+                "id",
+                "n_full",
+                "gpu_count",
+                "games_per_gpu",
+                "selected_per_gpu",
+                "max_attempts_per_gpu",
+                "total_games",
+                "seed_start",
+                "seed_end",
+                "seed_block_size",
+                "output_root",
+                "logical_lanes",
+            },
+            where="generation campaign arm",
+        )
+        arm_id = str(arm["id"])
+        expected_n, expected_games = expected_arms[arm_id]
+        expected_selected = (
+            {"current_producer": 1_600, "recent_history": 300, "hard_negative": 100}
+            if arm_id == "n256"
+            else {"current_producer": 4_000, "recent_history": 750, "hard_negative": 250}
+        )
+        expected_attempts = (
+            {"current_producer": 1_640, "recent_history": 310, "hard_negative": 104}
+            if arm_id == "n256"
+            else {"current_producer": 4_080, "recent_history": 765, "hard_negative": 255}
+        )
+        if (
+            int(arm["n_full"]) != expected_n
+            or int(arm["gpu_count"]) != 28
+            or int(arm["games_per_gpu"]) != expected_games
+            or dict(arm["selected_per_gpu"]) != expected_selected
+            or dict(arm["max_attempts_per_gpu"]) != expected_attempts
+            or sum(expected_attempts.values()) > int(arm["seed_block_size"])
+            or int(arm["seed_block_size"]) != 8_192
+            or int(arm["total_games"]) != 28 * expected_games
+        ):
+            raise ContractError(f"generation campaign {arm_id} budget drift")
+        start, end = int(arm["seed_start"]), int(arm["seed_end"])
+        if start <= GENERATION_CAMPAIGN_SEED_FLOOR or end != start + 28 * int(
+            arm["seed_block_size"]
+        ):
+            raise ContractError(f"generation campaign {arm_id} seed range drift")
+        intervals.append((start, end))
+        root = PurePath(str(arm["output_root"]))
+        if not root.is_absolute():
+            raise ContractError(f"generation campaign {arm_id} output root is relative")
+        roots.append(root)
+        lanes = list(map(str, arm["logical_lanes"]))
+        if len(lanes) != 28 or len(set(lanes)) != 28 or lane_ids.intersection(lanes):
+            raise ContractError("generation campaign logical lanes are not disjoint 28-lane sets")
+        lane_ids.update(lanes)
+    try:
+        assert_disjoint_seed_blocks(
+            [
+                (str(arms[index]["id"]), start, end - start)
+                for index, (start, end) in enumerate(intervals)
+            ]
+        )
+    except ValueError as error:
+        raise ContractError(f"generation campaign seed ranges overlap: {error}") from error
+    if roots[0] == roots[1] or roots[0] in roots[1].parents or roots[1] in roots[0].parents:
+        raise ContractError("generation campaign output roots overlap")
+
+    fleet = dict(value["fleet"])
+    expected_fleet = {
+        "total_gpus": 56,
+        "placement_mode": "canonical_assignments_pending_seal",
+        "seed_ledger": "/home/ubuntu/catan-zero-production/SEED_LEDGER.md",
+        "next_campaign_seed_floor": 300_000_626_944,
+        "placement_assignments": {
+            "path": "configs/operations/a1-dual-arm-56gpu-20260710/placement.assignments.json",
+            "sha256": "sha256:b977391d837888d5aea879bfaa0548feec19f70641253c6ba5bbefd22ee5c523",
+        },
+    }
+    if fleet != expected_fleet:
+        raise ContractError("generation campaign fleet gate drift")
+    assignment_path = REPO_ROOT / fleet["placement_assignments"]["path"]
+    if _sha256(assignment_path) != fleet["placement_assignments"]["sha256"]:
+        raise ContractError("generation campaign placement assignments drift")
+    assignment_payload = _load_json(assignment_path)
+    _validate_campaign_assignments(assignment_payload.get("assignments"), value)
+    policy = dict(value["execution_policy"])
+    if policy != {
+        "launch_authorized": False,
+        "seal_authorized": False,
+        "required_executor": "tools/fleet/a1_production_executor.py",
+        "required_harvest": "tools/fleet/a1_harvest_transaction.py",
+        "materialization": "seal_with_a1_pre_wave_contract_after_handoff_and_placement",
+    }:
+        raise ContractError("generation campaign execution policy drift")
+
+    provenance = dict(value["provenance"])
+    _require_exact_keys(
+        provenance,
+        {"arm_guards", "generator_code", "executor", "harvest", "fleet_manifest"},
+        where="generation campaign provenance",
+    )
+    records = [
+        *map(dict, provenance["arm_guards"]),
+        *map(dict, provenance["generator_code"]),
+        dict(provenance["executor"]),
+        dict(provenance["harvest"]),
+        dict(provenance["fleet_manifest"]),
+    ]
+    expected_suffixes = REQUIRED_GENERATOR_CODE_SUFFIXES | {
+        "configs/guards/a1_generation_n256.json",
+        "configs/guards/a1_generation_n128.json",
+        "configs/guards/a1_generation_n256_legacy.json",
+        "configs/guards/a1_generation_n128_legacy.json",
+        "tools/launcher_guards.py",
+        "tools/prelaunch_guard.py",
+        "tools/fleet/a1_production_executor.py",
+        "tools/fleet/a1_harvest_transaction.py",
+        "configs/gpu_fleet_56.json",
+    }
+    if {str(record.get("path")) for record in records} != expected_suffixes:
+        raise ContractError("generation campaign provenance file set drift")
+    guards = {record["path"] for record in provenance["arm_guards"]}
+    if guards != {
+        "configs/guards/a1_generation_n256.json",
+        "configs/guards/a1_generation_n128.json",
+        "configs/guards/a1_generation_n256_legacy.json",
+        "configs/guards/a1_generation_n128_legacy.json",
+    }:
+        raise ContractError("generation campaign arm guard bindings drift")
+    for record in records:
+        _require_exact_keys(record, {"path", "sha256"}, where="generation campaign file")
+        source = REPO_ROOT / str(record["path"])
+        if not source.is_file() or _sha256(source) != record["sha256"]:
+            raise ContractError(f"generation campaign immutable file drift: {source}")
+    for record in provenance["arm_guards"]:
+        name = Path(str(record["path"])).stem
+        match = re.fullmatch(r"a1_generation_(n128|n256)(_legacy)?", name)
+        if match is None:
+            raise ContractError(f"generation campaign has unknown arm guard {name}")
+        payload = _load_json(REPO_ROOT / str(record["path"]))
+        guards = list(payload.get("guards", []))
+        lint = next(
+            (item for item in guards if item.get("name") == "cli_flag_lint"), None
+        )
+        expected = dict((lint or {}).get("args", {}).get("expected_values", {}))
+        expected_n = int(match.group(1).removeprefix("n"))
+        expected_c = 0.03 if match.group(2) else 0.1
+        if (
+            expected.get("--n-full") != expected_n
+            or expected.get("--c-scale") != expected_c
+            or expected.get("--n-fast") != 16
+            or expected.get("--p-full") != 0.25
+        ):
+            raise ContractError(f"generation campaign arm guard science drift: {name}")
+    if require_ready:
+        raise ContractError(
+            "generation campaign is not launchable: committed post-promotion handoff "
+            "and a sealed copy of the canonical 56-GPU placement are required"
+        )
+    return value
+
+
+def _campaign_science(campaign: dict[str, Any], *, n_full: int) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    recipe = dict(campaign["common_recipe"])
+    search = {
+        key: recipe[key]
+        for key in _SEARCH_INPUT_KEYS
+        if key != "n_full"
+    }
+    search["n_full"] = n_full
+    evaluator = {
+        key: recipe[key]
+        for key in _EVALUATOR_INPUT_KEYS
+    }
+    generation = {
+        key: recipe[key]
+        for key in {
+            "track",
+            "vps_to_win",
+            "obs_width",
+            "max_decisions",
+            "temperature_decisions",
+            "temperature_high",
+            "temperature_low",
+            "late_temperature_decisions",
+            "late_temperature",
+            "workers_per_gpu",
+            "shard_size",
+            "format",
+            "device",
+            "eval_server",
+        }
+    }
+    return _search_operator(search), _effective_evaluator(evaluator), generation
+
+
+def _campaign_post_wave_acceptance() -> dict[str, Any]:
+    return {
+        "require_complete_games": True,
+        "selected_truncations_max": 0,
+        "invalid_teacher_actions_max": 0,
+        "require_public_observation": True,
+        "require_unique_game_seeds": True,
+        "require_no_val_only_overlap": True,
+        "selection_before_row_expansion": True,
+        "required_reports": sorted(REQUIRED_REPORTS),
+        "require_shard_sha256": True,
+        "require_contract_attestation": True,
+        "require_target_information_regime": TARGET_INFORMATION_REGIME_PUBLIC,
+        "validation_holdout": {
+            "split_unit": "game_seed",
+            "validation_fraction": 0.05,
+            "validation_seed": 17,
+            "validation_max_samples": 0,
+        },
+    }
+
+
+def _campaign_placements(path: Path, campaign: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    value = _load_json(path)
+    _require_exact_keys(
+        value,
+        {"schema_version", "campaign_sha256", "assignments", "placement_sha256"},
+        where="generation campaign placement",
+    )
+    unhashed = dict(value)
+    declared = unhashed.pop("placement_sha256")
+    if value["schema_version"] != GENERATION_PLACEMENT_SCHEMA or declared != _digest_value(unhashed):
+        raise ContractError("generation campaign placement digest/schema drift")
+    if value["campaign_sha256"] != campaign["contract_sha256"]:
+        raise ContractError("generation placement binds a different campaign")
+    return _validate_campaign_assignments(value["assignments"], campaign)
+
+
+def _validate_campaign_assignments(
+    raw_assignments: Any, campaign: dict[str, Any]
+) -> dict[str, dict[str, Any]]:
+    if not isinstance(raw_assignments, list):
+        raise ContractError("generation placement assignments must be a list")
+    expected_lanes = {
+        str(lane) for arm in campaign["arms"] for lane in arm["logical_lanes"]
+    }
+    assignments: dict[str, dict[str, Any]] = {}
+    placements: set[tuple[str, int]] = set()
+    for raw in raw_assignments:
+        item = dict(raw)
+        _require_exact_keys(
+            item, {"logical_lane", "host_alias", "gpu"}, where="generation placement"
+        )
+        lane = str(item["logical_lane"])
+        placement = (str(item["host_alias"]), int(item["gpu"]))
+        if lane in assignments or placement in placements or int(item["gpu"]) < 0:
+            raise ContractError("generation placement duplicates a lane or host/GPU")
+        assignments[lane] = item
+        placements.add(placement)
+    if set(assignments) != expected_lanes or len(assignments) != 56:
+        raise ContractError("generation placement must bind all 56 logical lanes exactly")
+    fleet = _load_json(REPO_ROOT / "configs/gpu_fleet_56.json")
+    authorized = {
+        (str(host["alias"]), gpu)
+        for host in fleet.get("hosts", [])
+        for gpu in range(int(host["gpu_count"]))
+    }
+    if placements != authorized or len(authorized) != 56:
+        raise ContractError("generation placement differs from the authorized 56-GPU fleet")
+    arms_by_host: dict[str, set[str]] = {}
+    for lane, item in assignments.items():
+        arms_by_host.setdefault(str(item["host_alias"]), set()).add(
+            lane.split("_", 1)[0]
+        )
+    if any(len(arms) != 1 for arms in arms_by_host.values()):
+        raise ContractError("generation placement may not split one host across arms")
+    return assignments
+
+
+def seal_generation_placement(
+    campaign_path: Path, assignments_path: Path, out_path: Path
+) -> dict[str, Any]:
+    """Seal an operator-supplied 56-row placement without launching anything."""
+
+    campaign = validate_generation_campaign(campaign_path)
+    raw = json.loads(assignments_path.read_text(encoding="utf-8"))
+    assignments = raw.get("assignments") if isinstance(raw, dict) else raw
+    if not isinstance(assignments, list):
+        raise ContractError("generation placement assignments input must be a list")
+    payload: dict[str, Any] = {
+        "schema_version": GENERATION_PLACEMENT_SCHEMA,
+        "campaign_sha256": campaign["contract_sha256"],
+        "assignments": assignments,
+    }
+    payload["placement_sha256"] = _digest_value(payload)
+    _validate_campaign_assignments(assignments, campaign)
+    _create_readonly(out_path.absolute(), payload)
+    return payload
+
+
+def materialize_generation_campaign(
+    campaign_path: Path,
+    *,
+    promotion_handoff_path: Path,
+    placement_path: Path,
+    out_dir: Path,
+) -> list[Path]:
+    """Create two immutable sealed arm locks; never render, claim, or launch."""
+
+    campaign = validate_generation_campaign(campaign_path)
+    placements = _campaign_placements(placement_path, campaign)
+    checkpoints: list[dict[str, Any]] = []
+    for raw in campaign["checkpoints"]:
+        item = dict(raw)
+        source = Path(str(item["path"]))
+        if not source.is_file() or _sha256(source) != item["sha256"]:
+            raise ContractError(f"generation campaign checkpoint drift: {source}")
+        checkpoints.append(
+            {
+                **item,
+                "md5": _md5(source),
+            }
+        )
+    producer = next(item for item in checkpoints if item["role"] == "producer")
+    n128_search, evaluator, generation = _campaign_science(campaign, n_full=128)
+    handoff_record = _promotion_handoff_record(
+        {"mode": POST_PROMOTION_HANDOFF_MODE, "path": str(promotion_handoff_path)},
+        base=Path.cwd(),
+        producer=producer,
+        effective_search=_effective_search(n128_search),
+        evaluator=evaluator,
+        generation=generation,
+    )
+    ledger_path = Path(str(campaign["fleet"]["seed_ledger"]))
+    ledger_record = _seed_ledger_snapshot(ledger_path)
+    provenance = dict(campaign["provenance"])
+    code_records = [
+        {"kind": "generator_code", **dict(item)}
+        for item in provenance["generator_code"]
+    ]
+    runtime_code_tree = _runtime_code_tree_records()
+    guard_by_name = {
+        Path(str(item["path"])).stem: dict(item)
+        for item in provenance["arm_guards"]
+    }
+    output_paths: list[Path] = []
+    out_dir = out_dir.absolute()
+    for arm in campaign["arms"]:
+        arm_id = str(arm["id"])
+        search, arm_evaluator, arm_generation = _campaign_science(
+            campaign, n_full=int(arm["n_full"])
+        )
+        jobs: list[dict[str, Any]] = []
+        categories = tuple(arm["selected_per_gpu"])
+        for lane_index, lane in enumerate(arm["logical_lanes"]):
+            placement = placements[str(lane)]
+            cursor = int(arm["seed_start"]) + lane_index * int(arm["seed_block_size"])
+            for category in categories:
+                attempts = int(arm["max_attempts_per_gpu"][category])
+                job_id = f"{lane}__{category}"
+                jobs.append(
+                    {
+                        "arm_id": arm_id,
+                        "job_id": job_id,
+                        "worker_id": str(lane),
+                        "host_alias": str(placement["host_alias"]),
+                        "gpu": int(placement["gpu"]),
+                        "category": category,
+                        "c_scale": float(campaign["common_recipe"]["category_c_scale"][category]),
+                        "base_seed": cursor,
+                        "games": int(arm["selected_per_gpu"][category]),
+                        "attempts": attempts,
+                        "seed_end": cursor + attempts,
+                        "output_dir": str(Path(str(arm["output_root"])) / job_id),
+                        "claim_label": f"{campaign['contract_id']}:{arm_id}:{job_id}",
+                    }
+                )
+                cursor += attempts
+        assert_disjoint_seed_blocks(
+            [(job["job_id"], int(job["base_seed"]), int(job["attempts"])) for job in jobs]
+        )
+        category_games = {
+            category: 28 * int(arm["selected_per_gpu"][category])
+            for category in categories
+        }
+        category_attempts = {
+            category: 28 * int(arm["max_attempts_per_gpu"][category])
+            for category in categories
+        }
+        _validate_against_ledger(jobs, ledger_path)
+        guard_configs = {
+            category: dict(
+                guard_by_name[
+                    f"a1_generation_{arm_id}"
+                    + ("" if category == "current_producer" else "_legacy")
+                ]
+            )
+            for category in categories
+        }
+        lock: dict[str, Any] = {
+            "schema_version": GENERATION_ARM_LOCK_SCHEMA,
+            "contract_id": f"{campaign['contract_id']}-{arm_id}",
+            "promotion_handoff": handoff_record,
+            "source_campaign": {"path": str(campaign_path.absolute()), "sha256": _sha256(campaign_path)},
+            "source_placement": {"path": str(placement_path.absolute()), "sha256": _sha256(placement_path)},
+            "science": {
+                "search_operator": search,
+                "search_operator_sha256": _digest_value(search),
+                "effective_search_config": _effective_search(search),
+                "effective_search_config_sha256": _digest_value(_effective_search(search)),
+                "evaluator": arm_evaluator,
+                "evaluator_sha256": _digest_value(arm_evaluator),
+                "value_readout": arm_evaluator["value_readout"],
+            },
+            "generation": arm_generation,
+            "checkpoints": checkpoints,
+            "source_categories": list(campaign["source_categories"]),
+            "game_contract": {
+                "profile": "dual_arm_generation_v1",
+                "arm_id": arm_id,
+                "worker_count": 28,
+                "job_count": 84,
+                "total_complete_games": sum(category_games.values()),
+                "category_games": category_games,
+                "total_attempts": sum(category_attempts.values()),
+                "category_attempts": category_attempts,
+                "selection_rule": "lowest_seed_complete_per_job",
+                "selection_before_row_expansion": True,
+            },
+            "fleet": {
+                "workers": [placements[str(lane)] | {"id": str(lane)} for lane in arm["logical_lanes"]],
+                "per_worker_games": dict(arm["selected_per_gpu"]),
+                "max_attempts_per_worker": dict(arm["max_attempts_per_gpu"]),
+                "seed_base": int(arm["seed_start"]),
+                "seed_block_size": int(arm["seed_block_size"]),
+                "seed_ledger": ledger_record,
+                "val_only_range": list(VAL_ONLY_SEED_RANGE),
+                "output_root": str(arm["output_root"]),
+                "jobs": jobs,
+                "seed_plan_sha256": _digest_value(jobs),
+            },
+            "provenance": {
+                "guard_configs": {
+                    category: {"kind": "guard_config", **record}
+                    for category, record in guard_configs.items()
+                },
+                "generator_code": code_records,
+                "executor": {"kind": "executor", **dict(provenance["executor"])},
+                "harvest": {"kind": "harvest", **dict(provenance["harvest"])},
+                "runtime_code_tree": runtime_code_tree,
+                "runtime_code_tree_sha256": _digest_value(runtime_code_tree),
+            },
+            "post_wave_acceptance": _campaign_post_wave_acceptance(),
+        }
+        lock["contract_sha256"] = _digest_value(lock)
+        target = out_dir / f"{arm_id}.lock.json"
+        _create_readonly(target, lock)
+        output_paths.append(target)
+    return output_paths
+
+
 def _verify_checkpoint_provenance_records(
     records: Iterable[dict[str, Any]], *, value_readout: str
 ) -> None:
@@ -2837,6 +3453,10 @@ def verify_lock(
 ) -> dict[str, Any]:
     lock = _load_json(lock_path)
     lock_schema = lock.get("schema_version")
+    if lock_schema == GENERATION_ARM_LOCK_SCHEMA:
+        return _verify_generation_arm_lock(
+            lock, require_all_job_claims=require_all_job_claims
+        )
     if lock_schema not in {LOCK_SCHEMA, LEGACY_LOCK_SCHEMA}:
         raise ContractError(
             f"lock schema must be {LOCK_SCHEMA!r} or historical {LEGACY_LOCK_SCHEMA!r}"
@@ -2986,6 +3606,185 @@ def verify_lock(
     return lock
 
 
+def _verify_generation_arm_lock(
+    lock: dict[str, Any], *, require_all_job_claims: bool
+) -> dict[str, Any]:
+    expected_digest = str(lock.get("contract_sha256", ""))
+    unhashed = dict(lock)
+    unhashed.pop("contract_sha256", None)
+    if expected_digest != _digest_value(unhashed):
+        raise ContractError("generation arm lock semantic digest mismatch")
+    game = dict(lock.get("game_contract", {}))
+    _require_exact_keys(
+        game,
+        {
+            "profile",
+            "arm_id",
+            "worker_count",
+            "job_count",
+            "total_complete_games",
+            "category_games",
+            "total_attempts",
+            "category_attempts",
+            "selection_rule",
+            "selection_before_row_expansion",
+        },
+        where="generation arm game contract",
+    )
+    arm_id = str(game.get("arm_id"))
+    if (
+        game.get("profile") != "dual_arm_generation_v1"
+        or arm_id not in {"n256", "n128"}
+        or int(game.get("worker_count", -1)) != 28
+        or int(game.get("job_count", -1)) != 84
+    ):
+        raise ContractError("generation arm profile drift")
+    if (
+        game["selection_rule"] != "lowest_seed_complete_per_job"
+        or game["selection_before_row_expansion"] is not True
+    ):
+        raise ContractError("generation arm selection policy drift")
+    _verify_artifact_records(
+        [lock["source_campaign"], lock["source_placement"], lock["promotion_handoff"]]
+    )
+    campaign = validate_generation_campaign(Path(str(lock["source_campaign"]["path"])))
+    placements = _campaign_placements(
+        Path(str(lock["source_placement"]["path"])), campaign
+    )
+    arm = next(item for item in campaign["arms"] if item["id"] == arm_id)
+    search, evaluator, generation = _campaign_science(
+        campaign, n_full=int(arm["n_full"])
+    )
+    science = dict(lock["science"])
+    if (
+        _digest_value(science["search_operator"]) != _digest_value(search)
+        or science["search_operator_sha256"] != _digest_value(search)
+        or _digest_value(science["effective_search_config"])
+        != _digest_value(_effective_search(search))
+        or science["effective_search_config_sha256"]
+        != _digest_value(_effective_search(search))
+        or _digest_value(science["evaluator"]) != _digest_value(evaluator)
+        or science["evaluator_sha256"] != _digest_value(evaluator)
+        or _digest_value(lock["generation"]) != _digest_value(generation)
+    ):
+        raise ContractError("generation arm science drift")
+    for expected, actual in zip(campaign["checkpoints"], lock["checkpoints"]):
+        source = Path(str(actual["path"]))
+        if (
+            {key: actual[key] for key in expected} != expected
+            or not source.is_file()
+            or _sha256(source) != actual["sha256"]
+            or _md5(source) != actual["md5"]
+        ):
+            raise ContractError("generation arm checkpoint drift")
+    producer = next(item for item in lock["checkpoints"] if item["role"] == "producer")
+    n128_search, n128_evaluator, n128_generation = _campaign_science(
+        campaign, n_full=128
+    )
+    rebuilt_handoff = _promotion_handoff_record(
+        {
+            "mode": POST_PROMOTION_HANDOFF_MODE,
+            "path": str(lock["promotion_handoff"]["path"]),
+        },
+        base=Path.cwd(),
+        producer=producer,
+        effective_search=_effective_search(n128_search),
+        evaluator=n128_evaluator,
+        generation=n128_generation,
+    )
+    if rebuilt_handoff != lock["promotion_handoff"]:
+        raise ContractError("generation arm promotion handoff replay drift")
+    if lock["source_categories"] != campaign["source_categories"]:
+        raise ContractError("generation arm source categories drift")
+    if lock.get("post_wave_acceptance") != _campaign_post_wave_acceptance():
+        raise ContractError("generation arm post-wave acceptance drift")
+    jobs = list(lock["fleet"]["jobs"])
+    if len(jobs) != 84 or _digest_value(jobs) != lock["fleet"]["seed_plan_sha256"]:
+        raise ContractError("generation arm job plan drift")
+    if any(
+        job.get("arm_id") != arm_id
+        or float(job.get("c_scale", -1.0))
+        != float(campaign["common_recipe"]["category_c_scale"][job["category"]])
+        for job in jobs
+    ):
+        raise ContractError("generation arm job identity drift")
+    expected_workers = [
+        placements[str(lane)] | {"id": str(lane)} for lane in arm["logical_lanes"]
+    ]
+    if lock["fleet"]["workers"] != expected_workers:
+        raise ContractError("generation arm physical placement drift")
+    expected_jobs: list[dict[str, Any]] = []
+    for lane_index, lane in enumerate(arm["logical_lanes"]):
+        placement = placements[str(lane)]
+        cursor = int(arm["seed_start"]) + lane_index * int(arm["seed_block_size"])
+        for category in arm["selected_per_gpu"]:
+            attempts = int(arm["max_attempts_per_gpu"][category])
+            job_id = f"{lane}__{category}"
+            expected_jobs.append(
+                {
+                    "arm_id": arm_id,
+                    "job_id": job_id,
+                    "worker_id": str(lane),
+                    "host_alias": str(placement["host_alias"]),
+                    "gpu": int(placement["gpu"]),
+                    "category": category,
+                    "c_scale": float(
+                        campaign["common_recipe"]["category_c_scale"][category]
+                    ),
+                    "base_seed": cursor,
+                    "games": int(arm["selected_per_gpu"][category]),
+                    "attempts": attempts,
+                    "seed_end": cursor + attempts,
+                    "output_dir": str(Path(str(arm["output_root"])) / job_id),
+                    "claim_label": f"{campaign['contract_id']}:{arm_id}:{job_id}",
+                }
+            )
+            cursor += attempts
+    if jobs != expected_jobs:
+        raise ContractError("generation arm jobs do not reconstruct from campaign/placement")
+    assert_disjoint_seed_blocks(
+        [(str(job["job_id"]), int(job["base_seed"]), int(job["attempts"])) for job in jobs]
+    )
+    category_games = {
+        category: sum(int(job["games"]) for job in jobs if job["category"] == category)
+        for category in arm["selected_per_gpu"]
+    }
+    category_attempts = {
+        category: sum(int(job["attempts"]) for job in jobs if job["category"] == category)
+        for category in arm["max_attempts_per_gpu"]
+    }
+    if (
+        category_games != game["category_games"]
+        or category_attempts != game["category_attempts"]
+        or sum(category_games.values()) != int(game["total_complete_games"])
+        or sum(category_attempts.values()) != int(game["total_attempts"])
+    ):
+        raise ContractError("generation arm category totals drift")
+    records = [
+        *lock["provenance"]["guard_configs"].values(),
+        *lock["provenance"]["generator_code"],
+        lock["provenance"]["executor"],
+        lock["provenance"]["harvest"],
+        *lock["provenance"]["runtime_code_tree"],
+    ]
+    for record in records:
+        raw_path = Path(str(record["path"]))
+        source = raw_path if raw_path.is_absolute() else REPO_ROOT / raw_path
+        if not source.is_file() or _sha256(source) != record["sha256"]:
+            raise ContractError(f"generation arm provenance drift: {source}")
+    if _digest_value(lock["provenance"]["runtime_code_tree"]) != lock["provenance"][
+        "runtime_code_tree_sha256"
+    ]:
+        raise ContractError("generation arm runtime tree digest drift")
+    _verify_live_seed_ledger(
+        dict(lock["fleet"]["seed_ledger"]),
+        jobs,
+        contract_sha256=expected_digest,
+        require_all_job_claims=require_all_job_claims,
+    )
+    return lock
+
+
 def _bool_flag(name: str, value: bool) -> str:
     return name if value else "--no-" + name.removeprefix("--")
 
@@ -3071,7 +3870,7 @@ def _generator_argv(
         "--c-visit",
         str(search["c_visit"]),
         "--c-scale",
-        str(search["c_scale"]),
+        str(job.get("c_scale", search["c_scale"])),
         "--rescale-noise-floor-c",
         str(search["rescale_noise_floor_c"]),
         "--sigma-eval",
@@ -3133,6 +3932,15 @@ def _generator_argv(
         "--seed-claim",
         "--resume",
     ]
+    if lock.get("schema_version") == GENERATION_ARM_LOCK_SCHEMA:
+        argv.extend(
+            (
+                "--prelaunch-guard-config",
+                str(lock["provenance"]["guard_configs"][job["category"]]["path"]),
+                "--generation-arm-id",
+                str(job["arm_id"]),
+            )
+        )
     optional = (
         ("--n-full-wide", search["n_full_wide"]),
         ("--n-full-wide-threshold", search["n_full_wide_threshold"]),
@@ -3171,6 +3979,8 @@ def _job_environment(lock: dict[str, Any], job: dict[str, Any]) -> dict[str, str
 def _job_attestation(lock: dict[str, Any], job: dict[str, Any]) -> dict[str, Any]:
     return {
         "schema_version": "a1-generation-job-attestation-v2",
+        **({} if "arm_id" not in job else {"arm_id": job["arm_id"]}),
+        **({} if "c_scale" not in job else {"c_scale": job["c_scale"]}),
         "contract_sha256": lock["contract_sha256"],
         "seed_plan_sha256": lock["fleet"]["seed_plan_sha256"],
         "job_id": job["job_id"],
@@ -3219,8 +4029,15 @@ def _validate_claim_render(
         raise ContractError("render binds a different sealed contract")
     commands = rendered.get("commands")
     jobs = {str(job["job_id"]): job for job in lock["fleet"]["jobs"]}
-    if not isinstance(commands, list) or len(commands) != len(jobs) or len(jobs) != 120:
-        raise ContractError("claim transaction requires exactly 120 rendered jobs")
+    expected_jobs = int(lock.get("game_contract", {}).get("job_count", 120))
+    if (
+        not isinstance(commands, list)
+        or len(commands) != len(jobs)
+        or len(jobs) != expected_jobs
+    ):
+        raise ContractError(
+            f"claim transaction requires exactly {expected_jobs} rendered jobs"
+        )
     expected_path = str(lock["fleet"]["seed_ledger"]["path"])
     rows_by_job: dict[str, str] = {}
     for command in commands:
@@ -3376,7 +4193,7 @@ def _verify_claim_receipt(
 def claim_seed_ledger(
     lock_path: Path, render_path: Path, receipt_path: Path
 ) -> dict[str, Any]:
-    """Atomically install all 120 exact claims, or validate the prior transaction."""
+    """Atomically install every sealed job claim, or validate the prior transaction."""
 
     lock_path = lock_path.absolute()
     render_path = render_path.absolute()
@@ -3569,6 +4386,7 @@ def render(lock_path: Path, out_dir: Path) -> dict[str, Any]:
         _create_readonly(attestation_source, attestation)
         commands.append(
             {
+                **({} if "arm_id" not in job else {"arm_id": job["arm_id"]}),
                 "job_id": job["job_id"],
                 "worker_id": job["worker_id"],
                 "host_alias": job["host_alias"],
@@ -3610,10 +4428,16 @@ def render(lock_path: Path, out_dir: Path) -> dict[str, Any]:
                 for record in lock["checkpoints"]
             ],
             "seed_ledger": lock["fleet"]["seed_ledger"],
-            "guard_config": lock["provenance"]["guard_config"],
+            **(
+                {"guard_config": lock["provenance"]["guard_config"]}
+                if "guard_config" in lock["provenance"]
+                else {"guard_configs": list(lock["provenance"]["guard_configs"].values())}
+            ),
             "generator_code": lock["provenance"]["generator_code"],
-            "learner_code": lock["provenance"]["learner_code"],
-            "learner_code_sha256": lock["provenance"]["learner_code_sha256"],
+            "learner_code": lock["provenance"].get("learner_code", []),
+            "learner_code_sha256": lock["provenance"].get(
+                "learner_code_sha256", _digest_value([])
+            ),
             "runtime_code_tree": lock["provenance"]["runtime_code_tree"],
             "runtime_code_tree_sha256": lock["provenance"][
                 "runtime_code_tree_sha256"
@@ -3680,24 +4504,25 @@ def _load_harvest_relocation(
         raise ContractError("harvest relocation semantic digest mismatch")
     if payload.get("contract_sha256") != lock["contract_sha256"]:
         raise ContractError("harvest relocation binds a different A1 contract")
+    arm_id = lock.get("game_contract", {}).get("arm_id")
+    if arm_id is not None and payload.get("arm_id") != arm_id:
+        raise ContractError("harvest relocation arm identity drift")
     if lock_path is not None and (
         payload.get("contract_path") != str(lock_path)
         or payload.get("contract_file_sha256") != _sha256(lock_path)
     ):
         raise ContractError("harvest relocation immutable lock-file identity drift")
     jobs = list(lock["fleet"]["jobs"])
+    identity_keys = (
+        "job_id",
+        "worker_id",
+        "host_alias",
+        "gpu",
+        "category",
+        "output_dir",
+    ) + (() if arm_id is None else ("arm_id",))
     expected_identities = [
-        {
-            key: job[key]
-            for key in (
-                "job_id",
-                "worker_id",
-                "host_alias",
-                "gpu",
-                "category",
-                "output_dir",
-            )
-        }
+        {key: job[key] for key in identity_keys}
         for job in jobs
     ]
     if (
@@ -3929,7 +4754,7 @@ def _expected_cli_fields(lock: dict[str, Any], job: dict[str, Any]) -> dict[str,
         "n_fast": search["n_fast"],
         "p_full": search["p_full"],
         "c_visit": search["c_visit"],
-        "c_scale": search["c_scale"],
+        "c_scale": job.get("c_scale", search["c_scale"]),
         "rescale_noise_floor_c": search["rescale_noise_floor_c"],
         "sigma_eval": search["sigma_eval"],
         "n_full_wide": search["n_full_wide"],
@@ -4048,6 +4873,15 @@ def audit_outputs(
     except OSError as error:
         raise ContractError(f"cannot resolve contract lock {lock_path}: {error}") from error
     lock = verify_lock(lock_path, require_all_job_claims=True)
+    game_contract = dict(lock["game_contract"])
+    expected_games = {
+        str(key): int(value) for key, value in game_contract["category_games"].items()
+    }
+    expected_attempts = {
+        str(key): int(value)
+        for key, value in game_contract["category_attempts"].items()
+    }
+    arm_id = game_contract.get("arm_id")
     relocation = (
         None
         if harvest_relocation is None
@@ -4056,7 +4890,7 @@ def audit_outputs(
         )
     )
     all_seeds: set[int] = set()
-    category_seeds: dict[str, set[int]] = {name: set() for name in EXPECTED_GAMES}
+    category_seeds: dict[str, set[int]] = {name: set() for name in expected_games}
     rows_by_seed: Counter[int] = Counter()
     shard_records: list[dict[str, Any]] = []
     invalid_actions = 0
@@ -4121,6 +4955,7 @@ def audit_outputs(
                 "path": str(manifest_path),
                 "sha256": _sha256(manifest_path),
                 "job_id": job["job_id"],
+                "arm_id": job.get("arm_id"),
                 "category": job["category"],
                 "producer_checkpoint_sha256": producer["sha256"],
                 "opponent_checkpoint_sha256": _category_opponent_sha256(
@@ -4537,9 +5372,9 @@ def audit_outputs(
             except (ContractError, KeyError, OSError, ValueError, IndexError) as error:
                 errors.append(f"{job['job_id']}: {error}")
     for category, seeds in category_seeds.items():
-        if len(seeds) != EXPECTED_GAMES[category]:
+        if len(seeds) != expected_games[category]:
             errors.append(
-                f"{category}: unique complete games={len(seeds)}, expected {EXPECTED_GAMES[category]}"
+                f"{category}: unique complete games={len(seeds)}, expected {expected_games[category]}"
             )
         duplicate = all_seeds.intersection(seeds)
         if duplicate:
@@ -4617,7 +5452,8 @@ def audit_outputs(
             "selected_game_count": len(selected_records),
             "selected_game_seed_set_sha256": "sha256:"
             + hashlib.sha256(selected_seed_array.tobytes()).hexdigest(),
-            "category_game_counts": dict(EXPECTED_GAMES),
+            "category_game_counts": dict(expected_games),
+            **({} if arm_id is None else {"arm_id": arm_id}),
             "training_game_count": int(training_seed_array.size),
             "training_game_seed_set_sha256": "sha256:"
             + hashlib.sha256(training_seed_array.tobytes()).hexdigest(),
@@ -4628,14 +5464,18 @@ def audit_outputs(
         }
     report: dict[str, Any] = {
         "schema_version": (
-            AUDIT_SCHEMA if relocation is None else RELOCATED_AUDIT_SCHEMA
+            DUAL_ARM_AUDIT_SCHEMA
+            if arm_id is not None
+            else (AUDIT_SCHEMA if relocation is None else RELOCATED_AUDIT_SCHEMA)
         ),
+        **({} if arm_id is None else {"arm_id": arm_id}),
         "contract_path": str(lock_path.absolute()),
         "contract_sha256": lock["contract_sha256"],
         "passed": not errors,
         "errors": errors,
         "games": {category: len(seeds) for category, seeds in category_seeds.items()},
-        "attempts": dict(EXPECTED_ATTEMPTS),
+        "attempts": dict(expected_attempts),
+        **({} if arm_id is None else {"category_game_counts": dict(expected_games)}),
         "total_unique_games": len(all_seeds),
         "selection_rule": "lowest_seed_complete_per_job",
         "job_selections": job_selections,
@@ -4676,13 +5516,14 @@ def audit_outputs(
                 ],
                 "evaluator_sha256": lock["science"]["evaluator_sha256"],
             }
-            for category in EXPECTED_GAMES
+            for category in expected_games
         },
         **(
             {}
             if relocation is None
             else {
                 "harvest_relocation": {
+                    **({} if arm_id is None else {"arm_id": arm_id}),
                     "path": str(relocation.path),
                     "file_sha256": _sha256(relocation.path),
                     "relocation_sha256": relocation.payload["relocation_sha256"],
@@ -4757,6 +5598,31 @@ def main(argv: Sequence[str] | None = None) -> int:
         "inspect-template", help="report unresolved fields; never seals"
     )
     inspect_parser.add_argument("--draft", required=True)
+    campaign_parser = sub.add_parser(
+        "verify-generation-campaign",
+        help="verify the immutable dual-arm blueprint; never seals or launches",
+    )
+    campaign_parser.add_argument("--contract", required=True)
+    campaign_parser.add_argument(
+        "--require-ready",
+        action="store_true",
+        help="fail unless promotion handoff and physical placement have been materialized",
+    )
+    materialize_parser = sub.add_parser(
+        "materialize-generation-campaign",
+        help="seal both arm locks after handoff and exact placement; never launches",
+    )
+    materialize_parser.add_argument("--contract", required=True)
+    materialize_parser.add_argument("--promotion-handoff", required=True)
+    materialize_parser.add_argument("--placement", required=True)
+    materialize_parser.add_argument("--out-dir", required=True)
+    placement_parser = sub.add_parser(
+        "seal-generation-placement",
+        help="seal the exact 56 logical-lane to host/GPU assignments; never launches",
+    )
+    placement_parser.add_argument("--contract", required=True)
+    placement_parser.add_argument("--assignments", required=True)
+    placement_parser.add_argument("--out", required=True)
     sync_guard_parser = sub.add_parser(
         "sync-generation-guard",
         help=(
@@ -4780,7 +5646,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     render_parser.add_argument("--lock", required=True)
     render_parser.add_argument("--out-dir", required=True)
     claim_parser = sub.add_parser(
-        "claim", help="atomically append all 120 exact rendered seed claims"
+        "claim", help="atomically append every exact rendered seed claim"
     )
     claim_parser.add_argument("--lock", required=True)
     claim_parser.add_argument("--render", required=True)
@@ -4809,6 +5675,41 @@ def main(argv: Sequence[str] | None = None) -> int:
                         "unresolved": unresolved,
                     },
                     indent=2,
+                )
+            )
+            return 0
+        if args.command == "verify-generation-campaign":
+            campaign = validate_generation_campaign(
+                Path(args.contract), require_ready=args.require_ready
+            )
+            print(
+                json.dumps(
+                    {
+                        "status": campaign["status"],
+                        "contract_sha256": campaign["contract_sha256"],
+                        "launch_authorized": False,
+                    },
+                    sort_keys=True,
+                )
+            )
+            return 0
+        if args.command == "materialize-generation-campaign":
+            locks = materialize_generation_campaign(
+                Path(args.contract),
+                promotion_handoff_path=Path(args.promotion_handoff),
+                placement_path=Path(args.placement),
+                out_dir=Path(args.out_dir),
+            )
+            print(json.dumps({"locks": list(map(str, locks))}, sort_keys=True))
+            return 0
+        if args.command == "seal-generation-placement":
+            placement = seal_generation_placement(
+                Path(args.contract), Path(args.assignments), Path(args.out)
+            )
+            print(
+                json.dumps(
+                    {"placement_sha256": placement["placement_sha256"]},
+                    sort_keys=True,
                 )
             )
             return 0
