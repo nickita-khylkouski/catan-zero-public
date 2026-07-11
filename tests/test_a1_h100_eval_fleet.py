@@ -228,6 +228,11 @@ def test_every_job_is_cuda_pinned_and_has_exact_n128_infoset_d6_recipe(
         ):
             assert argv.count(flag) == 1
         assert "--device" in argv and argv[argv.index("--device") + 1] == "cuda"
+        if job["phase"] == "external":
+            assert argv[argv.index("--vps-to-win") + 1] == "10"
+            assert (
+                argv[argv.index("--max-player-trade-offers-per-turn") + 1] == "0"
+            )
     rendered = fleet.dry_run_commands(manifest, plan, "internal")
     assert len(rendered["hosts"]) == 10
     all_shell = "\n".join(row["ssh_command"][-1] for row in rendered["hosts"])

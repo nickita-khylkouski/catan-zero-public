@@ -83,6 +83,8 @@ SCIENCE_CONFIG: dict[str, Any] = {
     "max_root_candidates_wide": 54,
     "wide_candidates_threshold": 24,
     "gate_config": "flywheel",
+    "external_vps_to_win": 10,
+    "external_max_player_trade_offers_per_turn": 0,
 }
 
 
@@ -314,6 +316,10 @@ def _external_argv(
         "catanatron_value",
         "--mode",
         "search",
+        "--vps-to-win",
+        "10",
+        "--max-player-trade-offers-per-turn",
+        "0",
         "--pairs",
         str(pairs),
         "--base-seed",
