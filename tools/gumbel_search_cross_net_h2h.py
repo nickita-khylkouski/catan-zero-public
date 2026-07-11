@@ -37,6 +37,12 @@ from pathlib import Path
 from typing import Any
 
 _TOOLS_DIR = Path(__file__).resolve().parent
+_REPO_ROOT = _TOOLS_DIR.parent
+_SRC_DIR = _REPO_ROOT / "src"
+if str(_SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(_SRC_DIR))
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 if str(_TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(_TOOLS_DIR))
 
@@ -54,7 +60,7 @@ from catan_zero.search.neural_rust_mcts import (  # noqa: E402
 )
 from catan_zero.search.rust_mcts import _require_rust_module  # noqa: E402
 from factory_common import write_json  # noqa: E402
-from high_regret_suite_contract import (  # noqa: E402
+from tools.high_regret_suite_contract import (  # noqa: E402
     PinnedReplayScope,
     SUITE_SCHEMA,
     bind_state_to_manifest,

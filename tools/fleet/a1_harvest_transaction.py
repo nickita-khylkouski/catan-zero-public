@@ -43,11 +43,46 @@ RECEIPT_SCHEMA = "a1-fleet-harvest-receipt-v1"
 STATE_SCHEMA = "a1-fleet-harvest-job-state-v1"
 EXPECTED_JOBS = 120
 EXPECTED_HOSTS = 8
+DUAL_ARM_PROFILE = "dual_arm_generation_v1"
 _HOST_RE = re.compile(r"[A-Za-z0-9_.@-]+\Z")
 
 
 class HarvestError(RuntimeError):
     """A collection invariant failed; no final tree was published."""
+
+
+def _contract_shape(lock: Mapping[str, Any]) -> dict[str, Any]:
+    game_contract = lock.get("game_contract")
+    if not isinstance(game_contract, dict) or game_contract.get("profile") != DUAL_ARM_PROFILE:
+        return {
+            "arm_id": None,
+            "job_count": EXPECTED_JOBS,
+            "host_count": EXPECTED_HOSTS,
+            "category_games": dict(contract.EXPECTED_GAMES),
+            "category_attempts": dict(contract.EXPECTED_ATTEMPTS),
+        }
+    arm_id = game_contract.get("arm_id")
+    category_games = game_contract.get("category_games")
+    category_attempts = game_contract.get("category_attempts")
+    if (
+        arm_id not in {"n128", "n256"}
+        or not isinstance(category_games, dict)
+        or not isinstance(category_attempts, dict)
+        or set(category_games) != set(contract.EXPECTED_GAMES)
+        or set(category_attempts) != set(contract.EXPECTED_GAMES)
+        or any(isinstance(value, bool) or not isinstance(value, int) or value <= 0 for value in category_games.values())
+        or any(isinstance(value, bool) or not isinstance(value, int) or value < category_games[key] for key, value in category_attempts.items())
+        or game_contract.get("total_complete_games") != sum(category_games.values())
+        or game_contract.get("total_attempts") != sum(category_attempts.values())
+    ):
+        raise HarvestError("dual-arm game_contract quotas are malformed")
+    return {
+        "arm_id": arm_id,
+        "job_count": 84,
+        "host_count": None,
+        "category_games": dict(category_games),
+        "category_attempts": dict(category_attempts),
+    }
 
 
 @dataclass
@@ -196,15 +231,18 @@ def _validate_inputs(
     lock = contract.verify_lock(lock_path)
     rendered, _rows = contract._validate_claim_render(lock, render_path)
     jobs = list(lock["fleet"]["jobs"])
-    if len(jobs) != EXPECTED_JOBS:
-        raise HarvestError(f"expected {EXPECTED_JOBS} sealed jobs, got {len(jobs)}")
+    shape = _contract_shape(lock)
+    if len(jobs) != shape["job_count"]:
+        raise HarvestError(f"expected {shape['job_count']} sealed jobs, got {len(jobs)}")
     commands = {str(item.get("job_id", "")): item for item in rendered["commands"]}
-    if len(commands) != EXPECTED_JOBS:
+    if len(commands) != shape["job_count"]:
         raise HarvestError("render contains duplicate job identities")
     seen_outputs: set[str] = set()
     hosts: set[str] = set()
     for job in jobs:
         job_id = str(job["job_id"])
+        if shape["arm_id"] is not None and job.get("arm_id") != shape["arm_id"]:
+            raise HarvestError(f"{job_id}: job arm_id differs from arm lock")
         host = str(job["host_alias"])
         if not _HOST_RE.fullmatch(host):
             raise HarvestError(f"unsafe host alias for {job_id}: {host!r}")
@@ -224,6 +262,7 @@ def _validate_inputs(
             "host_alias": host,
             "gpu": job["gpu"],
             "category": job["category"],
+            **({} if shape["arm_id"] is None else {"arm_id": shape["arm_id"]}),
         }
         if {key: command.get(key) for key in expected_identity} != expected_identity:
             raise HarvestError(f"render/lock job identity drift for {job_id}")
@@ -236,8 +275,18 @@ def _validate_inputs(
             contract._job_attestation(lock, job)
         ):
             raise HarvestError(f"rendered attestation identity drift for {job_id}")
-    if len(hosts) != EXPECTED_HOSTS:
-        raise HarvestError(f"expected {EXPECTED_HOSTS} immutable hosts, got {len(hosts)}")
+    if shape["arm_id"] is not None:
+        games = defaultdict(int)
+        attempts = defaultdict(int)
+        for job in jobs:
+            games[str(job["category"])] += int(job["games"])
+            attempts[str(job["category"])] += int(job["attempts"])
+        if dict(games) != shape["category_games"] or dict(attempts) != shape["category_attempts"]:
+            raise HarvestError("dual-arm jobs do not equal sealed category quotas")
+    if shape["host_count"] is not None and len(hosts) != shape["host_count"]:
+        raise HarvestError(f"expected {shape['host_count']} immutable hosts, got {len(hosts)}")
+    if shape["arm_id"] is not None and not hosts:
+        raise HarvestError("dual-arm harvest has no immutable hosts")
     return lock, rendered, jobs
 
 
@@ -361,6 +410,9 @@ def _inventory_job(
     manifest = _load_json(job_dir / "manifest.json")
     if int(manifest.get("base_seed", -1)) != int(job["base_seed"]):
         raise HarvestError(f"{job['job_id']}: manifest base_seed drift")
+    arm_id = dict(lock.get("game_contract") or {}).get("arm_id")
+    if arm_id is not None and manifest.get("arm_id") != arm_id:
+        raise HarvestError(f"{job['job_id']}: manifest arm_id drift")
     source_paths = {item["source_path"] for item in records}
     manifest_source = PurePosixPath(str(job["output_dir"])) / "manifest.json"
     for label, values in (
@@ -435,6 +487,7 @@ def _verify_state(
             "schema_version": STATE_SCHEMA,
             "job_id": job["job_id"],
             "host_alias": job["host_alias"],
+            **({} if job.get("arm_id") is None else {"arm_id": job["arm_id"]}),
             "inventory": inventory,
             "inventory_sha256": _value_sha256(inventory),
         }
@@ -448,6 +501,7 @@ def _verify_state(
         "schema_version": STATE_SCHEMA,
         "job_id": job["job_id"],
         "host_alias": job["host_alias"],
+        **({} if job.get("arm_id") is None else {"arm_id": job["arm_id"]}),
         "inventory": inventory,
         "inventory_sha256": _value_sha256(inventory),
     }
@@ -511,6 +565,9 @@ def _validate_published(
         "file_inventory_sha256",
         "receipt_sha256",
     }
+    shape = _contract_shape(lock)
+    if shape["arm_id"] is not None:
+        expected_receipt_fields.add("arm_id")
     if set(receipt) != expected_receipt_fields or (
         receipt.get("schema_version") != RECEIPT_SCHEMA
         or receipt.get("contract_sha256") != lock["contract_sha256"]
@@ -521,6 +578,9 @@ def _validate_published(
         or receipt.get("file_count") != len(relocation.get("files", []))
         or receipt.get("file_inventory_sha256")
         != relocation.get("file_inventory_sha256")
+        or (shape["arm_id"] is not None and receipt.get("arm_id") != shape["arm_id"])
+        or (shape["arm_id"] is not None and relocation.get("arm_id") != shape["arm_id"])
+        or (shape["arm_id"] is None and "arm_id" in relocation)
     ):
         raise HarvestError("published harvest receipt drift")
     receipt_unhashed = dict(receipt)
@@ -602,13 +662,14 @@ def _harvest_locked(
     lock, rendered, jobs = _validate_inputs(snapshot_lock_path, snapshot_render_path)
     if transaction_guard is not None:
         transaction_guard()
-    transaction_key = _value_sha256(
-        {
-            "contract_sha256": lock["contract_sha256"],
-            "render_sha256": rendered["render_sha256"],
-            "destination": str(destination),
-        }
-    ).removeprefix("sha256:")[:20]
+    transaction_identity = {
+        "contract_sha256": lock["contract_sha256"],
+        "render_sha256": rendered["render_sha256"],
+        "destination": str(destination),
+    }
+    if _contract_shape(lock)["arm_id"] is not None:
+        transaction_identity["arm_id"] = _contract_shape(lock)["arm_id"]
+    transaction_key = _value_sha256(transaction_identity).removeprefix("sha256:")[:20]
     if destination.exists():
         if transaction_guard is not None:
             transaction_guard()
@@ -691,6 +752,7 @@ def _harvest_locked(
                     "schema_version": STATE_SCHEMA,
                     "job_id": job_id,
                     "host_alias": host,
+                    **({} if job.get("arm_id") is None else {"arm_id": job["arm_id"]}),
                     "inventory": pending[job_id],
                     "inventory_sha256": _value_sha256(pending[job_id]),
                 }
@@ -720,15 +782,19 @@ def _harvest_locked(
     source_paths = [record["source_path"] for record in files]
     if len(source_paths) != len(set(source_paths)):
         raise HarvestError("harvest contains duplicate immutable source paths")
+    identity_fields = (
+        "job_id", "worker_id", "host_alias", "gpu", "category", "output_dir"
+    ) + (("arm_id",) if _contract_shape(lock)["arm_id"] is not None else ())
     job_identities = [
         {
             key: job[key]
-            for key in ("job_id", "worker_id", "host_alias", "gpu", "category", "output_dir")
+            for key in identity_fields
         }
         for job in jobs
     ]
     relocation = {
         "schema_version": SCHEMA,
+        **({} if _contract_shape(lock)["arm_id"] is None else {"arm_id": _contract_shape(lock)["arm_id"]}),
         "contract_path": str(lock_path),
         "contract_file_sha256": lock_pin.sha256,
         "contract_sha256": lock["contract_sha256"],
@@ -746,6 +812,7 @@ def _harvest_locked(
     _install_or_verify_json(staged_map, relocation)
     receipt = {
         "schema_version": RECEIPT_SCHEMA,
+        **({} if _contract_shape(lock)["arm_id"] is None else {"arm_id": _contract_shape(lock)["arm_id"]}),
         "contract_sha256": lock["contract_sha256"],
         "render_sha256": rendered["render_sha256"],
         "relocation_sha256": relocation["relocation_sha256"],

@@ -7,6 +7,7 @@ import json
 import os
 import shutil
 import stat
+import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,15 +15,11 @@ from typing import Any, Sequence
 
 import numpy as np
 
-try:
-    from tools.regret_common import discover_shards, load_shard
-except ModuleNotFoundError as error:
-    # ``python tools/gumbel_search_cross_net_h2h.py`` puts ``tools/`` rather
-    # than the repository root on sys.path.  Preserve that documented direct
-    # CLI entry point without hiding missing transitive dependencies.
-    if error.name != "tools":
-        raise
-    from regret_common import discover_shards, load_shard
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from tools import regret_common  # noqa: E402
 
 
 SUITE_SCHEMA = "a1-held-out-high-regret-suite-v3"
@@ -347,7 +344,7 @@ def bind_state_to_manifest(
     source_rows = row_cache.get(authoritative_path)
     if source_rows is None:
         try:
-            shard = load_shard(authoritative_path)
+            shard = regret_common.load_shard(authoritative_path)
             source_rows = (
                 np.asarray(shard["game_seed"]).reshape(-1),
                 np.asarray(shard["decision_index"]).reshape(-1),
@@ -398,9 +395,9 @@ def validate_replay_trajectories(states: Sequence[dict[str, Any]]) -> None:
             raise ValueError("held-out suite replay scope inventory is inconsistent")
         counts: dict[int, dict[int, int]] = {seed: {} for seed in targets}
         malformed: set[int] = set()
-        for shard_path in discover_shards([scope]):
+        for shard_path in regret_common.discover_shards([scope]):
             try:
-                shard = load_shard(shard_path)
+                shard = regret_common.load_shard(shard_path)
             except (OSError, ValueError) as error:
                 raise ValueError(
                     f"held-out replay scope contains unreadable shard {shard_path}: {error}"
