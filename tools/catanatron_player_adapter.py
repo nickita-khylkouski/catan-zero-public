@@ -712,7 +712,23 @@ class CatanZeroSearchPlayer(CatanatronPlayer):
         self.stats["engine_divergences"] += 1
         raise SearchEngineBoundaryError(detail)
 
-    def sync_from_native(self, game: Any, *, check_legal_actions: bool = True) -> None:
+    def sync_from_native(
+        self,
+        game: Any,
+        *,
+        check_legal_actions: bool = True,
+        native_playable_actions: Any | None = None,
+    ) -> tuple[list[int], list[Any]] | None:
+        """Bring the Rust shadow to the authoritative native state.
+
+        ``Game.play`` has already generated the native legal list before it
+        calls ``Player.decide``.  Accepting that exact list here avoids asking
+        the Python referee to generate it a second time.  Return the Rust legal
+        list used for the parity check so ``decide`` can map the search result
+        without a second Rust/Python JSON boundary crossing.  Neither reuse
+        weakens the check: the same native and Rust lists are compared at the
+        same decision boundary, and Gumbel search treats its root as immutable.
+        """
         records = game.state.action_records
         if len(records) < self._synced_action_records:
             self._fail_boundary(
@@ -741,12 +757,19 @@ class CatanZeroSearchPlayer(CatanatronPlayer):
                     + "; ".join(mismatches[:5])
                 )
 
+            rust_legals: tuple[list[int], list[Any]] | None = None
             if check_legal_actions and game.winning_color() is None:
-                _ids, raw_actions = rust_legal_actions(
+                rust_legals = rust_legal_actions(
                     self._rust_game, self.seated_colors, self.map_kind
                 )
+                _ids, raw_actions = rust_legals
+                native_actions = (
+                    game.playable_actions
+                    if native_playable_actions is None
+                    else native_playable_actions
+                )
                 only_rust, only_native = legal_action_diff(
-                    raw_actions, game.playable_actions
+                    raw_actions, native_actions
                 )
                 if only_rust or only_native:
                     self._fail_boundary(
@@ -754,6 +777,7 @@ class CatanZeroSearchPlayer(CatanatronPlayer):
                         f"only_rust={sorted(only_rust)[:5]!r} "
                         f"only_native={sorted(only_native)[:5]!r}"
                     )
+            return rust_legals
         except SearchEngineBoundaryError:
             if self.stats["engine_divergences"] == divergences_before:
                 self.stats["engine_divergences"] += 1
@@ -769,7 +793,9 @@ class CatanZeroSearchPlayer(CatanatronPlayer):
 
     def decide(self, game: Any, playable_actions: Any) -> Any:
         playable_actions = list(playable_actions)
-        self.sync_from_native(game)
+        rust_legals = self.sync_from_native(
+            game, native_playable_actions=playable_actions
+        )
         self.stats["decisions"] += 1
         if len(playable_actions) == 1:
             self.stats["forced_decisions"] += 1
@@ -778,9 +804,9 @@ class CatanZeroSearchPlayer(CatanatronPlayer):
         result = self._search.search(self._rust_game, force_full=True)
         self.stats["search_decisions"] += 1
         self.stats["simulations_used"] += int(result.simulations_used)
-        ids, raw_actions = rust_legal_actions(
-            self._rust_game, self.seated_colors, self.map_kind
-        )
+        if rust_legals is None:  # pragma: no cover - a live decision is nonterminal.
+            self._fail_boundary("native decision boundary has no Rust legal actions")
+        ids, raw_actions = rust_legals
         try:
             position = ids.index(int(result.selected_action))
         except ValueError as error:

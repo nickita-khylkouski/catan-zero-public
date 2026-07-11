@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import pytest
 
@@ -13,6 +13,7 @@ if str(_TOOLS_DIR) not in sys.path:
 
 from catanatron_neutral_harness_match import (  # type: ignore  # noqa: E402
     ORIENTATIONS,
+    _checkpoint_digests,
     _game_semantics,
     _load_game_artifacts,
     _prepare_manifest,
@@ -226,6 +227,45 @@ def test_search_player_refuses_unverified_base_map() -> None:
         )
 
 
+def test_search_player_reuses_boundary_legals_after_search(monkeypatch) -> None:
+    """The parity-checked Rust list is enough to map an immutable-root result."""
+    native_action = object()
+    player = object.__new__(CatanZeroSearchPlayer)
+    player._rust_game = object()
+    player._search = SimpleNamespace(
+        search=lambda _game, *, force_full: SimpleNamespace(
+            selected_action=17, simulations_used=128
+        )
+    )
+    player.stats = {
+        "decisions": 0,
+        "forced_decisions": 0,
+        "search_decisions": 0,
+        "simulations_used": 0,
+        "illegal_policy_picks": 0,
+    }
+    player.sync_from_native = MethodType(
+        lambda _self, _game, **_kwargs: ([17], [["BLUE", "END_TURN", None]]),
+        player,
+    )
+    monkeypatch.setattr(
+        "catanatron_player_adapter.rust_legal_actions",
+        lambda *_args, **_kwargs: pytest.fail("Rust legals were fetched twice"),
+    )
+    monkeypatch.setattr(
+        "catanatron_player_adapter.raw_action_to_python_action",
+        lambda *_args, **_kwargs: native_action,
+    )
+    monkeypatch.setattr(
+        "catanatron_player_adapter.canonical_python_action_key",
+        lambda action: id(action),
+    )
+
+    assert player.decide(object(), [native_action, object()]) is native_action
+    assert player.stats["search_decisions"] == 1
+    assert player.stats["simulations_used"] == 128
+
+
 def test_parser_preserves_raw_smoke_default_and_exposes_search_recipe() -> None:
     args = build_parser().parse_args(
         ["--checkpoint", "checkpoint.pt", "--opponent", "random", "--out", "out.json"]
@@ -247,6 +287,16 @@ def test_parser_preserves_raw_smoke_default_and_exposes_search_recipe() -> None:
     assert args.symmetry_averaged_eval is False
     assert args.symmetry_averaged_eval_threshold is None
     assert args.wide_candidates_threshold == 24
+
+
+def test_checkpoint_provenance_digests_share_one_read(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "checkpoint.pt"
+    checkpoint.write_bytes(b"checkpoint bytes")
+    md5, sha256 = _checkpoint_digests(checkpoint)
+    assert md5 == "c0167a0efffa000b43385e00e45658fe"
+    assert sha256 == (
+        "sha256:469f693d77e177ec6267a25a17f3d1c60a1156bbc63e63d23b2c02eb15d1a38c"
+    )
 
 
 def test_neutral_search_runtime_and_fingerprint_share_d6_adaptive_recipe() -> None:
