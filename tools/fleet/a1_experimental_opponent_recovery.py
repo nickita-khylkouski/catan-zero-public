@@ -160,6 +160,65 @@ def _failure_ref(path: Path) -> dict[str, Any]:
     return {**_file_ref(path, where="failed receipt"), "status": status}
 
 
+def _verify_ledger_snapshot_record(record: dict[str, Any]) -> None:
+    required = {
+        "kind",
+        "path",
+        "sha256",
+        "snapshot_text",
+        "snapshot_size_bytes",
+        "claims",
+        "claims_sha256",
+    }
+    if set(record) != required or record.get("kind") != "seed_ledger_snapshot":
+        raise RecoveryError("render seed ledger snapshot fields drift")
+    snapshot = record.get("snapshot_text")
+    if not isinstance(snapshot, str):
+        raise RecoveryError("render seed ledger snapshot text drift")
+    encoded = snapshot.encode("utf-8")
+    if (
+        int(record.get("snapshot_size_bytes", -1)) != len(encoded)
+        or "sha256:" + hashlib.sha256(encoded).hexdigest() != record.get("sha256")
+        or record.get("claims_sha256") != contract._digest_value(record.get("claims"))  # noqa: SLF001
+    ):
+        raise RecoveryError("render seed ledger snapshot digest drift")
+
+
+def _verify_live_ledger_bytes(
+    data: bytes, *, expected_rows: Sequence[str], snapshot_prefixes: Sequence[str]
+) -> str:
+    for snapshot in snapshot_prefixes:
+        if not data.startswith(snapshot.encode("utf-8")):
+            raise RecoveryError(
+                "live seed ledger is not an append-only snapshot extension"
+            )
+    try:
+        lines = data.decode("utf-8").splitlines()
+    except UnicodeDecodeError as error:
+        raise RecoveryError("live seed ledger is not UTF-8") from error
+    for row in expected_rows:
+        count = lines.count(row)
+        if count != 1:
+            raise RecoveryError(
+                f"live seed ledger claim must occur exactly once (found {count}): {row}"
+            )
+    return "sha256:" + hashlib.sha256(data).hexdigest()
+
+
+def _require_ledger_consensus(preflight: Sequence[dict[str, Any]]) -> str:
+    values = [str(row.get("live_ledger_sha256", "")) for row in preflight]
+    hashes = set(values)
+    if (
+        not values
+        or any(not value.startswith("sha256:") or len(value) != 71 for value in values)
+        or len(hashes) != 1
+    ):
+        raise RecoveryError(
+            f"fleet live seed ledger SHA consensus failed: {sorted(hashes)}"
+        )
+    return next(iter(hashes))
+
+
 def build_plan(
     *,
     config_path: Path,
@@ -233,16 +292,16 @@ def build_plan(
             if actual["sha256"] != checkpoint["sha256"]:
                 raise RecoveryError("required checkpoint hash drift")
             required_files[actual["path"]] = actual
-        ledger_record = render["required_artifacts"]["seed_ledger"]
-        ledger = _file_ref(Path(ledger_record["path"]), where="seed ledger")
-        if ledger["sha256"] != ledger_record["sha256"]:
-            raise RecoveryError("seed ledger hash drift")
-        required_files[ledger["path"]] = ledger
+        # The render binds an immutable historical prefix. The live ledger is
+        # append-only and must never be staged/replaced with these older bytes.
+        ledger_record = dict(render["required_artifacts"]["seed_ledger"])
+        _verify_ledger_snapshot_record(ledger_record)
         source_refs[arm] = {
             "lock": _file_ref(lock_path, where=f"{arm} lock"),
             "lock_sha256": lock["contract_sha256"],
             "render": _file_ref(render_path, where=f"{arm} render"),
             "render_sha256": render["render_sha256"],
+            "seed_ledger_snapshot": ledger_record,
         }
         lock_jobs = {job["job_id"]: job for job in lock["fleet"]["jobs"]}
         commands = [
@@ -286,6 +345,13 @@ def build_plan(
                 )
             if int(argv[argv.index("--games") + 1]) != int(sealed["attempts"]):
                 raise RecoveryError("recovery attempts differ from sealed maximum")
+            ledger_claim = dict(source["ledger_claim"])
+            if (
+                set(ledger_claim) != {"path", "row", "row_sha256"}
+                or ledger_claim["path"] != ledger_record["path"]
+                or ledger_claim["row_sha256"] != _digest(ledger_claim["row"])
+            ):
+                raise RecoveryError("rendered live ledger claim identity drift")
             command = {
                 "job_id": source["job_id"],
                 "worker_id": source["worker_id"],
@@ -298,7 +364,7 @@ def build_plan(
                 "base_seed": int(sealed["base_seed"]),
                 "seed_end": int(sealed["seed_end"]),
                 "claim_label": sealed["claim_label"],
-                "ledger_claim": source["ledger_claim"],
+                "ledger_claim": ledger_claim,
                 "opponent_manifest": opponent,
                 "source_argv_sha256": source["argv_sha256"],
                 "source_science_sha256": _digest(source_science),
@@ -805,11 +871,26 @@ def _preflight_host(
         {"path": f"{plan['runtime_repo']}/{row['path']}", "sha256": row["sha256"]}
         for row in plan["runtime_files"]
     ] + list(plan["required_host_files"])
+    host_lanes = [lane for lane in plan["lanes"] if lane["host_alias"] == alias]
+    ledger_claims = [
+        command["ledger_claim"] for lane in host_lanes for command in lane["commands"]
+    ]
+    ledger_paths = {str(claim["path"]) for claim in ledger_claims}
+    if len(ledger_paths) != 1:
+        raise RecoveryError(f"host {alias} has ambiguous live ledger paths")
+    expected_rows = [str(claim["row"]) for claim in ledger_claims]
+    if len(expected_rows) != len(set(expected_rows)):
+        raise RecoveryError(f"host {alias} has duplicate planned ledger claims")
+    snapshots = [
+        str(plan["source_artifacts"][arm]["seed_ledger_snapshot"]["snapshot_text"])
+        for arm in ("n128", "n256")
+    ]
+    ledger_path = next(iter(ledger_paths))
     base = _ssh_base(fleet, alias, ssh_key)
     result = _remote_python(
         base,
         "import hashlib,json,os,pathlib,resource,shutil,subprocess\n"
-        f"records={records!r}; repo=pathlib.Path({plan['runtime_repo']!r}); commit={plan['runtime_commit']!r}; wheel={plan['native_wheel']!r}; tree={tree_manifest!r}\n"
+        f"records={records!r}; repo=pathlib.Path({plan['runtime_repo']!r}); commit={plan['runtime_commit']!r}; wheel={plan['native_wheel']!r}; tree={tree_manifest!r}; ledger_path=pathlib.Path({ledger_path!r}); expected_rows={expected_rows!r}; snapshots={snapshots!r}\n"
         "def sha(q):\n"
         " h=hashlib.sha256()\n"
         " with q.open('rb') as f:\n"
@@ -826,6 +907,11 @@ def _preflight_host(
         " data=p.read_bytes(); actual=hashlib.sha1(b'blob '+str(len(data)).encode()+b'\\0'+data).hexdigest(); assert actual==r['git_blob_sha1'],r['path']\n"
         "for r in records:\n"
         " p=pathlib.Path(r['path']); assert p.is_file() and not p.is_symlink() and sha(p)==r['sha256'],r['path']\n"
+        "ledger_bytes=ledger_path.read_bytes()\n"
+        "for snapshot in snapshots: assert ledger_bytes.startswith(snapshot.encode('utf-8'))\n"
+        "ledger_lines=ledger_bytes.decode('utf-8').splitlines()\n"
+        "for row in expected_rows: assert ledger_lines.count(row)==1,(row,ledger_lines.count(row))\n"
+        "live_ledger_sha256='sha256:'+hashlib.sha256(ledger_bytes).hexdigest()\n"
         "assert subprocess.check_output(['systemctl','is-active','nvidia-mps'],text=True).strip()=='active'\n"
         "assert pathlib.Path('/tmp/mps_pipe_host/control').exists() or pathlib.Path('/tmp/mps_pipe_host/control_lock').exists()\n"
         "soft,hard=resource.getrlimit(resource.RLIMIT_NOFILE); assert hard>=65536\n"
@@ -833,7 +919,7 @@ def _preflight_host(
         f"assert shutil.disk_usage({plan['recovery_root']!r}).free>=20*1024**3\n"
         f'py={plan["runtime_python"]!r}; expected={plan["native_wheel"]["sha256"].removeprefix("sha256:")!r}; code=\'import json; from importlib.metadata import distribution,version; import catanatron_rs as r; assert version("catanatron_rs")=="0.1.5"; d=distribution("catanatron_rs"); p=d.locate_file("catanatron_rs-0.1.5.dist-info/direct_url.json"); u=json.load(open(p)); assert u["archive_info"]["hash"]=="sha256="+{plan["native_wheel"]["sha256"].removeprefix("sha256:")!r}; assert callable(getattr(r,"gumbel_search",None)); assert hasattr(r.Game,"determinize_for_player"); assert hasattr(r,"build_entity_features_flat")\'\n'
         "subprocess.run([py,'-c',code],check=True)\n"
-        "print(json.dumps({'state':'ready','files':len(records)}))",
+        "print(json.dumps({'state':'ready','files':len(records),'live_ledger_sha256':live_ledger_sha256}))",
     )
     return {"host_alias": alias, **result}
 
@@ -928,6 +1014,7 @@ def launch(
             preflight.append(
                 _preflight_host(plan, fleet, alias, ssh_key, tree_manifest)
             )
+        live_ledger_sha256 = _require_ledger_consensus(preflight)
     by_host = {
         alias: [lane for lane in plan["lanes"] if lane["host_alias"] == alias]
         for alias in aliases
@@ -1007,6 +1094,7 @@ def launch(
         "label": LABEL,
         "staged": staged,
         "preflight": preflight,
+        "live_ledger_sha256": live_ledger_sha256,
         "launched": launched,
     }
 
