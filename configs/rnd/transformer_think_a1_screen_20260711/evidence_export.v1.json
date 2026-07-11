@@ -1,0 +1,21 @@
+{
+  "schema_version": "catan-zero-transformer-think-evidence-export/v1",
+  "config_sha256_scope": "canonical_json_without_config_sha256",
+  "config_sha256": "e7bffda40155ce37f710c6b9ec901514c38e0d4e515d86b9518b6e38c98907f8",
+  "status": "preregistered_before_evidence_export",
+  "production_defaults_changed": false,
+  "experiment_file_sha256": "766f383ad8ca22a7c93b287d46fee1d23005c68a9891e94a9dc519ce083167a6",
+  "experiment_semantic_sha256": "6d6630a3a2579f419ba8a9a1a2a34e4fcc52938680668dd40b3c2b2561d2dc09",
+  "evidence_schema": "catan-zero-transformer-think-holdout-evidence/v1",
+  "information_regime": "public_conservation_pimc_v1",
+  "public_masking_required": true,
+  "holdout_games": 596,
+  "holdout_rows": 146517,
+  "arms": ["transformer-k0", "think-transformer-k1", "think-transformer-k2", "think-transformer-k4"],
+  "seeds": [101, 103, 107],
+  "runs": 12,
+  "atomic_no_overwrite_required": true,
+  "exporter_source_sha256": "0abe715e3ebf0de67fccf643683a9a750f6492e57c6505df8cd5751ec5122332",
+  "exporter_engine_source_sha256": "31e1afa0f4dc8a810e92c35da04e43a36abc8d666bae5d5ac7c2b9bad25cb74b",
+  "exporter_helper_source_sha256": "020664ea3eb8f835945e3a354611a15d3c0d6866f1964f4afcfa07ab46fa12fc"
+}
