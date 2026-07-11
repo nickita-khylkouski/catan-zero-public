@@ -1,0 +1,46 @@
+{
+  "schema_version": "a1-r1-opponent-recovery-config-v1",
+  "label": "experimental_nonpromotable",
+  "historical_parent_receipt": "historical_parent_receipt_unavailable",
+  "runtime_repo": "/home/ubuntu/catan-rl-loop-controller",
+  "runtime_commit": "26bd9a645ac5750d63e88da86ed665386c5c1cda",
+  "native_wheel": {
+    "filename": "catanatron_rs-0.1.5-cp311-cp311-manylinux_2_34_x86_64.whl",
+    "path": "/home/ubuntu/catanatron_rs-0.1.5-cp311-cp311-manylinux_2_34_x86_64.whl",
+    "sha256": "sha256:b6b9d1bed4e06a75eb0ee9338b2614b41db94600a04758310889bc427763b8c4"
+  },
+  "runtime_files": [
+    {
+      "path": "tools/generate_gumbel_selfplay_data.py",
+      "sha256": "sha256:695fe5fa62f8ab186d2a0401893a56cb5b7e74d79bd55d0754251e4c71ab8b5a"
+    },
+    {
+      "path": "native/catanatron-rs/WHEEL_SHA256SUMS",
+      "sha256": "sha256:0c675512b5afcb73e8fa0dc4f7979e752217ac7369c151c1b2f582e35d0162d7"
+    }
+  ],
+  "placement": {
+    "path": "configs/operations/a1-dual-arm-56gpu-20260710/placement.assignments.json",
+    "sha256": "sha256:b977391d837888d5aea879bfaa0548feec19f70641253c6ba5bbefd22ee5c523"
+  },
+  "arms": {
+    "n128": {
+      "lock": "/home/ubuntu/catan-zero-production/contracts/a1-dual-arm-20260710-r1/locks/n128.lock.json",
+      "lock_file_sha256": "sha256:dfee05c8dea9bc8ba0a0a82d1af9b785ba488f76b24bca49276faaf5779305b5",
+      "lock_sha256": "sha256:ab874b87aeff6817568349aa661f2e875cb0da402a7fe1f63574e9e1fa81019d",
+      "render": "/home/ubuntu/catan-zero-production/contracts/a1-dual-arm-20260710-r1/render-n128/commands.json",
+      "render_file_sha256": "sha256:dbf0db92d4fabe25e95a74ebf105232768b9fda7f2811682df72f6f7453b7a69",
+      "render_sha256": "sha256:d7b6678dbda2741de38ba35d37c0a35036c9d367a4992e71b57f15f5ab373c3e"
+    },
+    "n256": {
+      "lock": "/home/ubuntu/catan-zero-production/contracts/a1-dual-arm-20260710-r1/locks/n256.lock.json",
+      "lock_file_sha256": "sha256:88f56891af3c6fa0b3dcd6fee7027e422004f6ca116c8e00e6faa7d02a7c5990",
+      "lock_sha256": "sha256:0fa4af39b62e09151e49d9e06e147b6d929b9ab5e07db4e57ba81d5029c70333",
+      "render": "/home/ubuntu/catan-zero-production/contracts/a1-dual-arm-20260710-r1/render-n256/commands.json",
+      "render_file_sha256": "sha256:bbe910ef8ee57e60a7f37e96d5386b3b366c5a18fce6c4b56678716ebf6b7d6d",
+      "render_sha256": "sha256:89505b97364e61316a44bd3091a290555435e59ab11843e89d966bc3ad910c93"
+    }
+  },
+  "recovery_root": "/home/ubuntu/catan-zero-production/recovery/a1-r1-opponents-20260711",
+  "allowed_categories": ["recent_history", "hard_negative"]
+}
