@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -61,6 +62,23 @@ case "$*" in
   *--query-gpu=index,memory.used*) printf '0, %s\\n' "${FAKE_GPU_MEMORY:-0}" ;;
   *) exit 1 ;;
 esac
+""",
+    )
+    # The behavioral routine intentionally inspects the real process table.
+    # A developer/CI host may itself run persistent MPS infrastructure, which
+    # must not change the semantics of this fake-host test. Preserve real ps
+    # for process-group assertions while hiding only host MPS rows from the
+    # routine's dedicated daemon probe.
+    real_ps = shutil.which("ps")
+    assert real_ps is not None
+    _write_executable(
+        fake_bin / "ps",
+        f"""#!/usr/bin/env bash
+if [ "$*" = "-eo comm=,args=" ]; then
+  {shlex.quote(real_ps)} "$@" | grep -Ev '^nvidia-cuda-mps' || true
+else
+  exec {shlex.quote(real_ps)} "$@"
+fi
 """,
     )
     mps_pipe = tmp_path / "mps"
