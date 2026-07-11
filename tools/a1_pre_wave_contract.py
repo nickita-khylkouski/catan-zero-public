@@ -4058,7 +4058,12 @@ def _generator_argv(
         _bool_flag("--belief-chance-spectra", bool(search["belief_chance_spectra"])),
         _bool_flag("--information-set-search", bool(search["information_set_search"])),
         _bool_flag(
-            "--native-mcts-hot-loop", bool(generation["native_mcts_hot_loop"])
+            # Issued pre-native arm locks and their resumable executor receipts
+            # predate this implementation field. Future draft validation
+            # requires the key explicitly; only legacy/render-only shapes may
+            # reach this compatibility default.
+            "--native-mcts-hot-loop",
+            bool(generation.get("native_mcts_hot_loop", False)),
         ),
         "--determinization-particles",
         str(search["determinization_particles"]),
