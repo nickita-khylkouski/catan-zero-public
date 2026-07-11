@@ -27,10 +27,11 @@ _batch = _RELATIONAL_TEST_HELPERS["_batch"]
 _config = _RELATIONAL_TEST_HELPERS["_config"]
 
 
-def test_e3_shared_weights_keep_parameter_count_constant_across_k():
+@pytest.mark.parametrize("trunk", ["transformer", "rrt"])
+def test_e3_shared_weights_keep_parameter_count_constant_across_k(trunk):
     models = [
-        EntityGraphNet(_config("rrt", layers=3, latent_deliberation_steps=steps))
-        for steps in (1, 2, 4, 8)
+        EntityGraphNet(_config(trunk, layers=3, latent_deliberation_steps=steps))
+        for steps in (1, 2, 4)
     ]
     counts = [
         sum(parameter.numel() for parameter in model.parameters()) for model in models
@@ -49,10 +50,11 @@ def _align_shared_weights(source, target):
     target.load_state_dict(target_state, strict=True)
 
 
-def test_e3_k1_is_exactly_k0_at_function_preserving_initialization():
+@pytest.mark.parametrize("trunk", ["transformer", "rrt"])
+def test_e3_k1_is_exactly_k0_at_function_preserving_initialization(trunk):
     torch.manual_seed(20260710)
-    k0 = EntityGraphNet(_config("rrt", layers=3, latent_deliberation_steps=0)).eval()
-    k1 = EntityGraphNet(_config("rrt", layers=3, latent_deliberation_steps=1)).eval()
+    k0 = EntityGraphNet(_config(trunk, layers=3, latent_deliberation_steps=0)).eval()
+    k1 = EntityGraphNet(_config(trunk, layers=3, latent_deliberation_steps=1)).eval()
     _align_shared_weights(k0, k1)
     batch = _batch()
 
@@ -63,10 +65,11 @@ def test_e3_k1_is_exactly_k0_at_function_preserving_initialization():
         assert torch.equal(output_k0[key], output_k1[key]), key
 
 
-def test_e3_zero_fusion_has_learning_signal_and_unlocks_deliberation():
+@pytest.mark.parametrize("trunk", ["transformer", "rrt"])
+def test_e3_zero_fusion_has_learning_signal_and_unlocks_deliberation(trunk):
     torch.manual_seed(20260710)
     model = EntityGraphNet(
-        _config("rrt", layers=3, latent_deliberation_steps=1)
+        _config(trunk, layers=3, latent_deliberation_steps=1)
     ).eval()
     batch = _batch()
     optimizer = torch.optim.SGD(model.parameters(), lr=1e-2)
@@ -231,6 +234,23 @@ def test_e3_e4_checkpoint_round_trip(tmp_path):
         assert torch.equal(value, loaded.model.state_dict()[key]), key
 
 
+def test_transformer_latent_checkpoint_round_trip(tmp_path):
+    config = _config("transformer", layers=3, latent_deliberation_steps=2)
+    static = np.zeros(
+        (config.action_size, config.static_action_feature_size), dtype=np.float32
+    )
+    policy = EntityGraphPolicy(config, static, device="cpu")
+    checkpoint = tmp_path / "think-transformer.pt"
+    policy.save(checkpoint)
+    loaded = EntityGraphPolicy.load(checkpoint, device="cpu")
+
+    assert loaded.config.state_trunk == "transformer"
+    assert loaded.config.latent_deliberation_steps == 2
+    assert loaded.model.parameter_accounting() == policy.model.parameter_accounting()
+    for key, value in policy.model.state_dict().items():
+        assert torch.equal(value, loaded.model.state_dict()[key]), key
+
+
 def test_legacy_e3_checkpoint_fails_with_explicit_migration_error(tmp_path):
     config = _config("rrt", layers=3, latent_deliberation_steps=1)
     static = np.zeros(
@@ -295,7 +315,7 @@ def test_e3_e4_train_cli_knobs_are_explicit_and_science_hashed():
         ({"latent_deliberation_steps": -1}, "must be >= 0"),
         (
             {"state_trunk": "resrgcn", "latent_deliberation_steps": 1},
-            "requires state_trunk='rrt'",
+            "requires state_trunk='transformer' or 'rrt'",
         ),
         (
             {"state_trunk": "resrgcn", "moe_routed_experts": 4},

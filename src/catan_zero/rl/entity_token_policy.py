@@ -369,9 +369,10 @@ class EntityGraphNet:
                 if self.latent_deliberation_steps < 0:
                     raise ValueError("latent_deliberation_steps must be >= 0")
                 if self.latent_deliberation_steps > 0:
-                    if self.state_trunk != "rrt":
+                    if self.state_trunk not in {"transformer", "rrt"}:
                         raise ValueError(
-                            "latent deliberation currently requires state_trunk='rrt'"
+                            "latent deliberation requires state_trunk='transformer' "
+                            "or 'rrt'"
                         )
                     if self.latent_deliberation_slots < 1:
                         raise ValueError("latent_deliberation_slots must be >= 1")
