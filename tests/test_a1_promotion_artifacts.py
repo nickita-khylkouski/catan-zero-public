@@ -512,10 +512,12 @@ def test_bucket_builder_refuses_duplicate_games(tmp_path: Path) -> None:
         )
 
 
-def test_legacy_incumbent_builder_binds_contract_and_historical_report(
-    tmp_path: Path,
-) -> None:
-    _candidate, champion = _checkpoints(tmp_path)
+def _legacy_incumbent_inputs(
+    tmp_path: Path, *, historical_checkpoint: str
+) -> tuple[Path, Path, Path, dict]:
+    champion = tmp_path / "runs" / "bc" / "gen3_20260706" / "checkpoint.pt"
+    champion.parent.mkdir(parents=True)
+    champion.write_bytes(b"champion")
     calibration = tmp_path / "champion-calibration.json"
     _json(
         calibration,
@@ -531,11 +533,12 @@ def test_legacy_incumbent_builder_binds_contract_and_historical_report(
             },
         },
     )
-    historical = tmp_path / "gen3-training-report.json"
+    historical = tmp_path / "reports" / "archive" / "gen3-training-report.json"
+    historical.parent.mkdir(parents=True)
     _json(
         historical,
         {
-            "checkpoint": str(champion.resolve()),
+            "checkpoint": historical_checkpoint,
             "checkpoint_sha256": promotion._sha256(champion),
             "steps_completed": 912,
             "epochs": 1,
@@ -551,6 +554,18 @@ def test_legacy_incumbent_builder_binds_contract_and_historical_report(
             }
         ],
     }
+    return champion, calibration, historical, contract
+
+
+def test_legacy_incumbent_builder_resolves_historical_checkpoint_from_report_ancestors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    champion, calibration, historical, contract = _legacy_incumbent_inputs(
+        tmp_path, historical_checkpoint="runs/bc/gen3_20260706/checkpoint.pt"
+    )
+    unrelated_cwd = tmp_path / "unrelated-cwd"
+    unrelated_cwd.mkdir()
+    monkeypatch.chdir(unrelated_cwd)
 
     value = artifacts.build_legacy_incumbent_calibration_source(
         calibration_path=calibration,
@@ -565,6 +580,68 @@ def test_legacy_incumbent_builder_binds_contract_and_historical_report(
         "checkpoint_sha256": promotion._sha256(champion),
         "historical_training_report": _ref(historical),
     }
+
+
+def test_legacy_incumbent_builder_accepts_exact_absolute_historical_checkpoint(
+    tmp_path: Path,
+) -> None:
+    absolute_champion = (
+        tmp_path / "runs" / "bc" / "gen3_20260706" / "checkpoint.pt"
+    ).resolve()
+    champion, calibration, historical, contract = _legacy_incumbent_inputs(
+        tmp_path, historical_checkpoint=str(absolute_champion)
+    )
+
+    value = artifacts.build_legacy_incumbent_calibration_source(
+        calibration_path=calibration,
+        historical_training_report=historical,
+        contract=contract,
+        champion=champion,
+    )
+
+    assert value["legacy_incumbent_provenance"]["checkpoint_sha256"] == (
+        promotion._sha256(champion)
+    )
+
+
+@pytest.mark.parametrize(
+    "declared",
+    ["../../runs/bc/gen3_20260706/checkpoint.pt", "checkpoint.pt"],
+)
+def test_legacy_incumbent_builder_refuses_traversal_and_unrelated_suffixes(
+    tmp_path: Path, declared: str
+) -> None:
+    champion, calibration, historical, contract = _legacy_incumbent_inputs(
+        tmp_path, historical_checkpoint=declared
+    )
+
+    with pytest.raises(artifacts.ArtifactBuildError, match="historical report checkpoint"):
+        artifacts.build_legacy_incumbent_calibration_source(
+            calibration_path=calibration,
+            historical_training_report=historical,
+            contract=contract,
+            champion=champion,
+        )
+
+
+def test_legacy_incumbent_builder_refuses_ambiguous_ancestor_matches(
+    tmp_path: Path,
+) -> None:
+    declared = "runs/bc/gen3_20260706/checkpoint.pt"
+    champion, calibration, historical, contract = _legacy_incumbent_inputs(
+        tmp_path, historical_checkpoint=declared
+    )
+    decoy = historical.parent / declared
+    decoy.parent.mkdir(parents=True)
+    decoy.write_bytes(b"unrelated checkpoint")
+
+    with pytest.raises(artifacts.ArtifactBuildError, match="is ambiguous"):
+        artifacts.build_legacy_incumbent_calibration_source(
+            calibration_path=calibration,
+            historical_training_report=historical,
+            contract=contract,
+            champion=champion,
+        )
 
 
 def test_legacy_incumbent_builder_refuses_nonproducer_checkpoint(
