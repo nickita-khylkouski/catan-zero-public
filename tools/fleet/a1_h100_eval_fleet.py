@@ -927,8 +927,12 @@ def _run(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
             )
         except subprocess.CalledProcessError as error:
             last_error = error
-            if attempt + 1 < attempts:
+            executable = Path(argv[0]).name if argv else ""
+            retryable = executable == "scp" or error.returncode == 255
+            if retryable and attempt + 1 < attempts:
                 time.sleep(1 << attempt)
+            else:
+                break
     assert last_error is not None
     raise last_error
 

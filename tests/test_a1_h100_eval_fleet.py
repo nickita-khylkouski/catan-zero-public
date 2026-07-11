@@ -46,6 +46,8 @@ def test_remote_transport_retries_transient_failure_but_local_commands_do_not(
 
     def fake_run(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
         calls.append(argv)
+        if "false" in argv or (argv and argv[0] == "git"):
+            raise subprocess.CalledProcessError(1, argv, stderr="command refused")
         if len(calls) < 3:
             raise subprocess.CalledProcessError(255, argv, stderr="connection reset")
         return subprocess.CompletedProcess(argv, 0, "ok", "")
@@ -54,6 +56,11 @@ def test_remote_transport_retries_transient_failure_but_local_commands_do_not(
     monkeypatch.setattr(fleet.time, "sleep", lambda _seconds: None)
     assert fleet._run(["ssh", "host", "true"]).stdout == "ok"  # noqa: SLF001
     assert len(calls) == 3
+
+    calls.clear()
+    with pytest.raises(subprocess.CalledProcessError):
+        fleet._run(["ssh", "host", "false"])  # noqa: SLF001
+    assert len(calls) == 1
 
     calls.clear()
     with pytest.raises(subprocess.CalledProcessError):
