@@ -1,0 +1,25 @@
+{
+  "schema_version": "catan-zero-e3-evidence-manifest/v1",
+  "experiment_config_sha256": "2c67088f844ef058d39dbee549d42c7094fdbde3917e4ee42d277a5da718f6e6",
+  "evidence_rows_per_run": 146517,
+  "combined_rows": 2197755,
+  "combined_sha256": "f6e36517d79fe7228078a7b4514426fd32b3b77736288c91f33096f63f588ef4",
+  "result_sha256": "392c006835ffd2860021f44b2f98ea6aa43e280830273abd51b8bf8986074617",
+  "runs": {
+    "rrt-k0@11": "669b67eeea59951a7cc0acad76f4d501168fa28fe294bce688599b00e8a2873e",
+    "rrt-k0@29": "d1e1fdc5e1141d99a1e0f24b661693a5b159388916ffb09d4f29a8cbeb947619",
+    "rrt-k0@47": "68b6ece0fcfb73a303e8dae61b06178fbd3cc80bde1fced9541f2c3f8adce4bb",
+    "think-rrt-k1@11": "40d82e324e528c67646fa1e8fd45da85eb0d3ae632a630106217f8e0a6b24a4d",
+    "think-rrt-k1@29": "601a197a4fc1d601a8c9c9f43bb44d7eb109a694695ce005a8d4bb56cea782d4",
+    "think-rrt-k1@47": "fc96e813a252d9efcd7142a6f025f60a3ce54c9878647a94cf62a5f4f9a85c43",
+    "think-rrt-k2@11": "e74fd999c7f746480e97cda7c6e3595af2e1a8a9316b068f1a0268f2c0afb00d",
+    "think-rrt-k2@29": "abdff1fe8e2a6c8682d12184141d5c696156e560917ad419c3d5ee71f7e254ba",
+    "think-rrt-k2@47": "cb18c01509a1c39988395ea36922a679ed315bfd03ee13f423d10cfb84160ce8",
+    "think-rrt-k4@11": "01c822986ddb5c9e8986b624f5f44ff14991e7b37e503bdd06a17219491a43e3",
+    "think-rrt-k4@29": "4be0252f0d03f36d1184ba068e9d05bdc01a5eeddfa56067f0b2c1f4b25c4743",
+    "think-rrt-k4@47": "163694d8a2259e01171add0b9614a96028adc9743aaa8389c9373032b126bd1d",
+    "think-rrt-k8@11": "6c88c81d4e5c4717785819f0825ec9df1799304c7bc0b24566f462699ee0e33b",
+    "think-rrt-k8@29": "3dee5c5e4ddc843f51f2cbc939ca5e4d3f9679200c9e45741ccce0b93c27a744",
+    "think-rrt-k8@47": "a4035306f4a06e5df5cc36338b773b9e29078e8c89c9db5403c6cb5d80e963ae"
+  }
+}

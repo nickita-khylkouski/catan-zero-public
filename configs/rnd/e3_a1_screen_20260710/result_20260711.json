@@ -1,0 +1,171 @@
+{
+  "bootstrap": {
+    "samples": 10000,
+    "seed": 20260710
+  },
+  "comparisons": {
+    "think-rrt-k2": {
+      "comparison_role": "primary",
+      "confidence_pass": false,
+      "nonforced_decision_micro_safety": {
+        "candidate_ce": 1.587410277343241,
+        "candidate_minus_reference": 0.0002715137002393675,
+        "difference_ci95": [
+          -0.0011053073633400302,
+          0.0015343915900712657
+        ],
+        "reference_ce": 1.5871387636430017,
+        "relative_improvement": -0.00017107117944505047,
+        "relative_improvement_ci95": [
+          -0.0009685370995104675,
+          0.0006948659129628813
+        ],
+        "relative_regression": 0.00017107117944505047,
+        "relative_regression_ci95": [
+          -0.0006948659129628814,
+          0.0009685370995104671
+        ]
+      },
+      "overall_safety_pass": true,
+      "passed": false,
+      "primary_nonforced_game_macro": {
+        "candidate_ce": 1.5912250502374068,
+        "candidate_minus_reference": 0.0003641593897685258,
+        "difference_ci95": [
+          -0.0012148539469406638,
+          0.0016315824974699183
+        ],
+        "reference_ce": 1.5908608908476383,
+        "relative_improvement": -0.00022890712309515344,
+        "relative_improvement_ci95": [
+          -0.0010274695801704029,
+          0.0007650044452588193
+        ],
+        "relative_regression": 0.00022890712309515344,
+        "relative_regression_ci95": [
+          -0.0007650044452588197,
+          0.0010274695801704026
+        ]
+      },
+      "reference_arm": "think-rrt-k1",
+      "threshold_pass": false
+    },
+    "think-rrt-k4": {
+      "comparison_role": "primary",
+      "confidence_pass": false,
+      "nonforced_decision_micro_safety": {
+        "candidate_ce": 1.5873849773875943,
+        "candidate_minus_reference": 0.00024621374459266043,
+        "difference_ci95": [
+          -0.0015080228709563992,
+          0.0018325892327084314
+        ],
+        "reference_ce": 1.5871387636430017,
+        "relative_improvement": -0.00015513057221759206,
+        "relative_improvement_ci95": [
+          -0.0011526444701335215,
+          0.0009499145522713243
+        ],
+        "relative_regression": 0.00015513057221759206,
+        "relative_regression_ci95": [
+          -0.0009499145522713246,
+          0.0011526444701335208
+        ]
+      },
+      "overall_safety_pass": true,
+      "passed": false,
+      "primary_nonforced_game_macro": {
+        "candidate_ce": 1.5913436294926417,
+        "candidate_minus_reference": 0.00048273864500347763,
+        "difference_ci95": [
+          -0.001385358241833007,
+          0.001996818672425315
+        ],
+        "reference_ce": 1.5908608908476383,
+        "relative_improvement": -0.0003034449132420787,
+        "relative_improvement_ci95": [
+          -0.001256925543890168,
+          0.0008705841792863366
+        ],
+        "relative_regression": 0.0003034449132420787,
+        "relative_regression_ci95": [
+          -0.0008705841792863366,
+          0.001256925543890168
+        ]
+      },
+      "reference_arm": "think-rrt-k1",
+      "threshold_pass": false
+    },
+    "think-rrt-k8": {
+      "comparison_role": "secondary",
+      "confidence_pass": false,
+      "nonforced_decision_micro_safety": {
+        "candidate_ce": 1.5867788121317357,
+        "candidate_minus_reference": -0.000359951511265999,
+        "difference_ci95": [
+          -0.0012439604416976003,
+          0.0002773885291522338
+        ],
+        "reference_ce": 1.5871387636430017,
+        "relative_improvement": 0.0002267927162460532,
+        "relative_improvement_ci95": [
+          -0.00017477249981117242,
+          0.0007853730935587399
+        ],
+        "relative_regression": -0.0002267927162460532,
+        "relative_regression_ci95": [
+          -0.00078537309355874,
+          0.00017477249981117244
+        ]
+      },
+      "overall_safety_pass": true,
+      "passed": false,
+      "primary_nonforced_game_macro": {
+        "candidate_ce": 1.5905884234686734,
+        "candidate_minus_reference": -0.00027246737896491346,
+        "difference_ci95": [
+          -0.0008827600952463377,
+          0.00023812506419144673
+        ],
+        "reference_ce": 1.5908608908476383,
+        "relative_improvement": 0.00017127039864543915,
+        "relative_improvement_ci95": [
+          -0.00014994576407790746,
+          0.000554531172443803
+        ],
+        "relative_regression": -0.00017127039864543915,
+        "relative_regression_ci95": [
+          -0.0005545311724438032,
+          0.00014994576407790743
+        ]
+      },
+      "reference_arm": "think-rrt-k1",
+      "threshold_pass": false
+    }
+  },
+  "descriptive_compute_control": {
+    "arm": "rrt-k0",
+    "capacity_matched": false,
+    "nonforced_game_macro_ce": 1.5905990966443555,
+    "promotion_eligible": false,
+    "warning": "K0 is a smaller-parameter compute control and is excluded from promotion comparisons."
+  },
+  "experiment_config_sha256": "2c67088f844ef058d39dbee549d42c7094fdbde3917e4ee42d277a5da718f6e6",
+  "learning_gate_config_sha256": "09629ca38e56fe26ee144d1bfec1cd29c4112079173d77074a0e6135fe3a6c82",
+  "primary_metric": "game_macro_soft_target_policy_ce_nonforced",
+  "promotion_eligible_passed_arms": [],
+  "registered_thresholds": {
+    "maximum_overall_ce_regression": 0.005,
+    "minimum_relative_improvement_vs_k1": 0.02
+  },
+  "schema_version": "catan-zero-e3-learning-gate/v1",
+  "status": "fail",
+  "support": {
+    "arms": 5,
+    "decisions_per_run": 146517,
+    "holdout_games": 596,
+    "nonforced_decisions_per_run": 76038,
+    "runs": 15,
+    "training_seeds": 3
+  }
+}
