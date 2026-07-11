@@ -55,11 +55,14 @@ from tools import legacy_scalar_readout_attestation as legacy_scalar  # noqa: E4
 from tools import a0_binding_verdict as a0_binding  # noqa: E402
 from tools import search_teacher_adjudicator as search_adjudicator  # noqa: E402
 from tools import search_operator_binding as operator_binding  # noqa: E402
+from tools import a1_post_promotion_handoff as promotion_handoff  # noqa: E402
 from tools.prelaunch_guard import VAL_ONLY_SEED_RANGE, parse_seed_ledger  # noqa: E402
 from tools.seed_fleet_planner import assert_disjoint_seed_blocks  # noqa: E402
 
-DRAFT_SCHEMA = "a1-pre-wave-contract-draft-v2"
-LOCK_SCHEMA = "a1-pre-wave-contract-lock-v2"
+DRAFT_SCHEMA = "a1-pre-wave-contract-draft-v3"
+LEGACY_DRAFT_SCHEMA = "a1-pre-wave-contract-draft-v2"
+LOCK_SCHEMA = "a1-pre-wave-contract-lock-v3"
+LEGACY_LOCK_SCHEMA = "a1-pre-wave-contract-lock-v2"
 RENDER_SCHEMA = "a1-pre-wave-render-v2"
 MPS_PIPE_DIRECTORY = "/tmp/mps_pipe_host"
 MPS_LOG_DIRECTORY = "/tmp/mps_log_host"
@@ -168,6 +171,8 @@ EXPECTED_LEARNER_TRAINING_RECIPE: dict[str, Any] = {
     "ddp_shard_data": False,
 }
 REQUIRED_EVIDENCE = {"a0", "s1", "s2", "s3"}
+HISTORICAL_HANDOFF_MODE = "historical_pre_promotion"
+POST_PROMOTION_HANDOFF_MODE = "post_promotion"
 A0_EVIDENCE_SCHEMA = "a0-binding-verdict-v1"
 SEARCH_STAGE_EVIDENCE_SCHEMA = "rl-rnd-stage-decision-v1"
 REQUIRED_REPORTS = {
@@ -483,6 +488,77 @@ def _file_record(
     record = {"kind": kind, "path": str(path), "sha256": _sha256(path)}
     if artifact_id is not None:
         record["id"] = artifact_id
+    return record
+
+
+def _promotion_handoff_record(
+    raw: Any, *, base: Path, producer: dict[str, Any]
+) -> dict[str, Any]:
+    """Normalize and replay the producer lineage selected for this wave."""
+
+    if not isinstance(raw, dict):
+        raise ContractError("promotion_handoff must be an object")
+    mode = raw.get("mode")
+    if mode == HISTORICAL_HANDOFF_MODE:
+        _require_exact_keys(raw, {"mode", "reason"}, where="promotion_handoff")
+        reason = raw.get("reason")
+        if not isinstance(reason, str) or not reason.strip():
+            raise ContractError(
+                "historical pre-promotion contracts require a non-empty reason"
+            )
+        return {"mode": HISTORICAL_HANDOFF_MODE, "reason": reason}
+    if mode != POST_PROMOTION_HANDOFF_MODE:
+        raise ContractError(
+            "promotion_handoff must explicitly select historical_pre_promotion "
+            "or post_promotion"
+        )
+    _require_exact_keys(raw, {"mode", "path"}, where="promotion_handoff")
+    path = _absolute_ref(str(raw.get("path", "")), base=base)
+    payload = _load_json(path)
+    if payload.get("schema_version") != promotion_handoff.HANDOFF_SCHEMA:
+        raise ContractError("post-promotion handoff schema is not supported")
+    declared = payload.get("handoff_sha256")
+    unhashed = dict(payload)
+    unhashed.pop("handoff_sha256", None)
+    if declared != _digest_value(unhashed):
+        raise ContractError("post-promotion handoff semantic digest mismatch")
+    try:
+        replayed = promotion_handoff.build_handoff(
+            Path(str(payload.get("promotion_receipt", {}).get("path", "")))
+        )
+    except promotion_handoff.HandoffError as error:
+        raise ContractError(f"post-promotion handoff replay failed: {error}") from error
+    if payload != replayed:
+        raise ContractError("post-promotion handoff differs from committed live lineage")
+    registry_after = payload["registry_after"]
+    if registry_after.get("role") != promotion_handoff.GENERATOR_ROLE:
+        raise ContractError("post-promotion handoff role must be generator_champion")
+    bound_checkpoint = registry_after.get("checkpoint")
+    if not isinstance(bound_checkpoint, dict) or (
+        bound_checkpoint.get("path") != producer.get("path")
+        or bound_checkpoint.get("sha256") != producer.get("sha256")
+    ):
+        raise ContractError(
+            "draft producer is not exactly the committed promoted producer"
+        )
+    identity_checkpoint = payload.get("producer_identity", {}).get("checkpoint")
+    if identity_checkpoint != bound_checkpoint:
+        raise ContractError("post-promotion producer identity lineage drift")
+    record = _file_record(path, kind="post_promotion_handoff")
+    record.update(
+        {
+            "mode": POST_PROMOTION_HANDOFF_MODE,
+            "document_schema": payload["schema_version"],
+            "handoff_sha256": payload["handoff_sha256"],
+            "transaction_id": payload["promotion_receipt"]["transaction_id"],
+            "registry_role": registry_after["role"],
+            "registry_version": registry_after["version"],
+            "producer_checkpoint": dict(bound_checkpoint),
+            "producer_identity_sha256": payload["producer_identity"][
+                "agent_identity_sha256"
+            ],
+        }
+    )
     return record
 
 
@@ -931,8 +1007,10 @@ def sync_generation_guard(draft_path: Path) -> dict[str, Any]:
 
     draft_path = draft_path.resolve(strict=True)
     draft = _load_json(draft_path)
-    if draft.get("schema_version") != DRAFT_SCHEMA:
-        raise ContractError(f"draft schema must be {DRAFT_SCHEMA!r}")
+    if draft.get("schema_version") not in {DRAFT_SCHEMA, LEGACY_DRAFT_SCHEMA}:
+        raise ContractError(
+            f"draft schema must be {DRAFT_SCHEMA!r} or historical {LEGACY_DRAFT_SCHEMA!r}"
+        )
     science = draft.get("science")
     if not isinstance(science, dict) or not isinstance(science.get("search"), dict):
         raise ContractError("draft has no science.search object")
@@ -2310,12 +2388,15 @@ def build_lock(
 ) -> dict[str, Any]:
     draft_path = draft_path.absolute()
     draft = _load_json(draft_path)
-    if draft.get("schema_version") != DRAFT_SCHEMA:
-        raise ContractError(f"draft schema must be {DRAFT_SCHEMA!r}")
-    _assert_no_unresolved(draft)
+    draft_schema = draft.get("schema_version")
+    if draft_schema not in {DRAFT_SCHEMA, LEGACY_DRAFT_SCHEMA}:
+        raise ContractError(
+            f"draft schema must be {DRAFT_SCHEMA!r} or historical {LEGACY_DRAFT_SCHEMA!r}"
+        )
     required_top = {
         "schema_version",
         "contract_id",
+        "promotion_handoff",
         "science",
         "generation",
         "checkpoints",
@@ -2325,6 +2406,16 @@ def build_lock(
         "post_wave_acceptance",
     }
     _require_exact_keys(draft, required_top, where="draft")
+    handoff_mode = draft["promotion_handoff"].get("mode") if isinstance(
+        draft["promotion_handoff"], dict
+    ) else None
+    if draft_schema == LEGACY_DRAFT_SCHEMA and handoff_mode != HISTORICAL_HANDOFF_MODE:
+        raise ContractError(
+            "legacy v2 drafts are accepted only as explicitly historical pre-promotion contracts"
+        )
+    if draft_schema == DRAFT_SCHEMA and handoff_mode != POST_PROMOTION_HANDOFF_MODE:
+        raise ContractError("new v3 waves require a committed post-promotion handoff")
+    _assert_no_unresolved(draft)
     contract_id = str(draft["contract_id"])
     if not re.fullmatch(r"[a-z0-9][a-z0-9_.-]+", contract_id):
         raise ContractError("contract_id must be a stable lowercase identifier")
@@ -2512,6 +2603,9 @@ def build_lock(
     producer_record = next(
         record for record in checkpoint_records if record["role"] == "producer"
     )
+    handoff_record = _promotion_handoff_record(
+        draft["promotion_handoff"], base=base, producer=producer_record
+    )
     for stage in ("s1", "s2", "s3"):
         stage_checkpoint = evidence_by_kind[stage]["semantic_decision"]["checkpoint"]
         if (
@@ -2629,8 +2723,11 @@ def build_lock(
     _validate_post_wave(dict(draft["post_wave_acceptance"]))
 
     lock: dict[str, Any] = {
-        "schema_version": LOCK_SCHEMA,
+        "schema_version": (
+            LEGACY_LOCK_SCHEMA if draft_schema == LEGACY_DRAFT_SCHEMA else LOCK_SCHEMA
+        ),
         "contract_id": contract_id,
+        "promotion_handoff": handoff_record,
         "source_draft": {"path": str(draft_path), "sha256": _sha256(draft_path)},
         "science": {
             "search_operator": search,
@@ -2688,8 +2785,11 @@ def verify_lock(
     lock_path: Path, *, require_all_job_claims: bool = False
 ) -> dict[str, Any]:
     lock = _load_json(lock_path)
-    if lock.get("schema_version") != LOCK_SCHEMA:
-        raise ContractError(f"lock schema must be {LOCK_SCHEMA!r}")
+    lock_schema = lock.get("schema_version")
+    if lock_schema not in {LOCK_SCHEMA, LEGACY_LOCK_SCHEMA}:
+        raise ContractError(
+            f"lock schema must be {LOCK_SCHEMA!r} or historical {LEGACY_LOCK_SCHEMA!r}"
+        )
     _assert_no_unresolved(lock)
     expected_digest = str(lock.get("contract_sha256", ""))
     unhashed = dict(lock)
@@ -2700,6 +2800,17 @@ def verify_lock(
             f"contract digest mismatch: expected {expected_digest or '<missing>'}, got {actual_digest}"
         )
     _verify_artifact_records([lock["source_draft"]])
+    handoff_record = lock.get("promotion_handoff")
+    if not isinstance(handoff_record, dict):
+        raise ContractError("lock does not bind an explicit promotion handoff mode")
+    if handoff_record.get("mode") == POST_PROMOTION_HANDOFF_MODE:
+        if lock_schema != LOCK_SCHEMA:
+            raise ContractError("post-promotion handoffs require the v3 lock schema")
+        _verify_artifact_records([handoff_record])
+    elif handoff_record.get("mode") != HISTORICAL_HANDOFF_MODE:
+        raise ContractError("lock promotion handoff mode is invalid")
+    elif lock_schema != LEGACY_LOCK_SCHEMA:
+        raise ContractError("historical handoff mode is accepted only in legacy v2 locks")
     _verify_artifact_records(lock["science"]["evidence"])
     for evidence in lock["science"]["evidence"]:
         _verify_artifact_records(evidence["semantic_decision"]["source_artifacts"])

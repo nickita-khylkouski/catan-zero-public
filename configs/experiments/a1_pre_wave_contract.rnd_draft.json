@@ -1,6 +1,10 @@
 {
   "schema_version": "a1-pre-wave-contract-draft-v2",
   "contract_id": "a1-infoset-n128-p4-12000games-20260710-r1",
+  "promotion_handoff": {
+    "mode": "historical_pre_promotion",
+    "reason": "sealed R&D draft predates the A1 promotion transaction"
+  },
   "science": {
     "search": {
       "max_depth": 80,

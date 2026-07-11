@@ -1999,7 +1999,10 @@ def _validate_a1_corpus_artifacts_and_seeds(
     )
     if str(lock_path) != str(contract_path_value):
         raise SystemExit("A1 contract lock path is not canonical")
-    if lock_payload.get("schema_version") != "a1-pre-wave-contract-lock-v2":
+    if lock_payload.get("schema_version") not in {
+        "a1-pre-wave-contract-lock-v2",
+        "a1-pre-wave-contract-lock-v3",
+    }:
         raise SystemExit("A1 contract lock schema drift")
     lock_digest = _canonical_json_sha256(
         {key: value for key, value in lock_payload.items() if key != "contract_sha256"}
