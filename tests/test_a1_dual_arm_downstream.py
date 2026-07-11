@@ -252,6 +252,44 @@ def test_n128_subsets_are_deterministic_stratified_and_arm_pure(
         corpus._load_a1_selected_game_manifest(forged_path)  # noqa: SLF001
 
 
+@pytest.mark.parametrize("crash_after", range(1, 7))
+def test_subset_publication_resumes_exactly_after_every_crash_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, crash_after: int
+) -> None:
+    source = _full_manifest(tmp_path)
+    monkeypatch.setattr(subsets, "TARGETS", {
+        "matched-56k": {"current_producer": 2, "recent_history": 1, "hard_negative": 1},
+        "compute-112k": {"current_producer": 4, "recent_history": 2, "hard_negative": 1},
+    })
+    monkeypatch.setattr(corpus, "DUAL_ARM_SUBSET_CATEGORY_COUNTS", {
+        ("n128", "full-140k"): {"current_producer": 140, "recent_history": 56, "hard_negative": 28},
+        ("n128", "matched-56k"): {"current_producer": 56, "recent_history": 28, "hard_negative": 28},
+        ("n128", "compute-112k"): {"current_producer": 112, "recent_history": 56, "hard_negative": 28},
+    })
+    parent_audit = _full_audit(tmp_path, source)
+    out = tmp_path / f"resumable-{crash_after}"
+    original = subsets._write_immutable  # noqa: SLF001
+    writes = 0
+
+    def crash_after_publish(path: Path, value: dict) -> None:
+        nonlocal writes
+        original(path, value)
+        writes += 1
+        if writes == crash_after:
+            raise RuntimeError("simulated subset crash")
+
+    monkeypatch.setattr(subsets, "_write_immutable", crash_after_publish)
+    with pytest.raises(RuntimeError, match="subset crash"):
+        subsets.build_subsets(source, parent_audit, out)
+    assert len(list(out.glob("*.json"))) == crash_after
+
+    monkeypatch.setattr(subsets, "_write_immutable", original)
+    outputs = subsets.build_subsets(source, parent_audit, out)
+    assert set(outputs) == {"matched-56k", "compute-112k"}
+    assert len(list(out.glob("*.json"))) == 6
+    assert subsets.build_subsets(source, parent_audit, out) == outputs
+
+
 def test_real_dual_subset_corpus_and_trainer_preflight_chain(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

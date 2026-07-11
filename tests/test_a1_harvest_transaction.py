@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -32,6 +33,9 @@ def test_bounded_fetch_uses_multiple_direct_host_streams(
             active -= 1
 
     monkeypatch.setattr(harvest, "_ssh_fetch", fake_fetch)
+    monkeypatch.setattr(harvest, "_ssh_output_bytes", lambda *_args: 1)
+    monkeypatch.setattr(harvest, "_preflight_cohort_disk", lambda *_args: None)
+    monkeypatch.setattr(harvest, "_install_fetched_batch", lambda *_args, **_kwargs: None)
     batches = [
         harvest._HostFetch(  # noqa: SLF001 - focused transport concurrency test.
             host=f"h{index}",
@@ -43,7 +47,16 @@ def test_bounded_fetch_uses_multiple_direct_host_streams(
         for index in range(2)
     ]
 
-    harvest._fetch_archives(("ssh",), batches, workers=2)  # noqa: SLF001
+    harvest._fetch_archives(  # noqa: SLF001
+        ("ssh",),
+        batches,
+        workers=2,
+        incoming_root=tmp_path,
+        lock={},
+        jobs_root=tmp_path,
+        state_root=tmp_path,
+        inventories={},
+    )
 
     assert max_active == 2
 
@@ -150,12 +163,19 @@ import io, os, shlex, sys, tarfile
 from pathlib import Path
 
 host, command = sys.argv[1:3]
-with open(os.environ["FAKE_SSH_LOG"], "a", encoding="utf-8") as log:
-    log.write(host + "\\n")
 if os.environ.get("FAKE_FAIL_HOST") == host:
     print("injected transport failure", file=sys.stderr)
     raise SystemExit(23)
 tokens = shlex.split(command)
+if tokens[:2] == ["du", "-sb"]:
+    root = Path(os.environ["FAKE_REMOTE_ROOT"]) / host
+    for raw in tokens[tokens.index("--") + 1:]:
+        source = root / Path(raw).name
+        size = sum(path.stat().st_size for path in source.rglob("*") if path.is_file())
+        print(f"{max(size, 1)}\\t{raw}")
+    raise SystemExit(0)
+with open(os.environ["FAKE_SSH_LOG"], "a", encoding="utf-8") as log:
+    log.write(host + "\\n")
 names = tokens[tokens.index("--") + 1:]
 root = Path(os.environ["FAKE_REMOTE_ROOT"]) / host
 mode = os.environ.get("FAKE_MODE", "")
@@ -237,6 +257,77 @@ def test_parallel_fetch_publishes_the_same_validated_inventory(
     assert len((fleet[-1]).read_text().splitlines()) == 8
 
 
+def test_parallel_fetch_bounds_resident_archives_to_worker_count(
+    fleet, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original = harvest._ssh_fetch  # noqa: SLF001
+    observed: list[int] = []
+
+    def measured(*args, **kwargs) -> None:
+        original(*args, **kwargs)
+        incoming = args[3].parent
+        observed.append(len(list(incoming.glob("*.tar"))))
+
+    monkeypatch.setattr(harvest, "_ssh_fetch", measured)
+    result = _run(fleet, tmp_path, fetch_workers=2)
+
+    assert result["job_count"] == 120
+    assert observed and max(observed) <= 2
+
+
+def test_disk_preflight_refuses_before_archive_fetch(
+    fleet, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(harvest, "_ssh_output_bytes", lambda *_args: 100_000_000)
+    usage_type = type(shutil.disk_usage(tmp_path))
+    monkeypatch.setattr(
+        harvest.shutil,
+        "disk_usage",
+        lambda _path: usage_type(total=1_000, used=900, free=100),
+    )
+    called = False
+
+    def should_not_fetch(*_args, **_kwargs) -> None:
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr(harvest, "_ssh_fetch", should_not_fetch)
+    with pytest.raises(harvest.HarvestError, match="insufficient local disk"):
+        _run(fleet, tmp_path, fetch_workers=4)
+    assert called is False
+
+
+def test_interrupted_incoming_is_scavenged_on_retry(
+    fleet, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original = harvest._fetch_archives  # noqa: SLF001
+
+    def killed(*_args, incoming_root: Path, **_kwargs) -> None:
+        token = "1" * 32
+        (incoming_root / f"h0.{token}.tar").write_bytes(b"partial")
+        (incoming_root / f"h0.{token}.stderr").write_bytes(b"diagnostic")
+        (incoming_root / f"h0.{token}").mkdir()
+        raise RuntimeError("simulated hard interruption")
+
+    monkeypatch.setattr(harvest, "_fetch_archives", killed)
+    with pytest.raises(RuntimeError, match="hard interruption"):
+        _run(fleet, tmp_path, fetch_workers=4)
+    stage = next(tmp_path.glob(".published.harvest-*.staging"))
+    assert any((stage / "incoming").iterdir())
+
+    monkeypatch.setattr(harvest, "_fetch_archives", original)
+    result = _run(fleet, tmp_path, fetch_workers=4)
+    assert result["job_count"] == 120
+
+
+def test_incoming_scavenger_rejects_unknown_artifact(tmp_path: Path) -> None:
+    incoming = tmp_path / "incoming"
+    incoming.mkdir()
+    (incoming / "unowned-file").write_bytes(b"x")
+    with pytest.raises(harvest.HarvestError, match="unsafe unknown artifact"):
+        harvest._cleanup_owned_incoming(incoming, hosts={"h0"})  # noqa: SLF001
+
+
 @pytest.mark.parametrize("attack", ["duplicate", "traversal", "hostswap"])
 def test_archive_duplicate_path_attack_and_host_swap_fail_closed(
     fleet, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, attack: str
@@ -289,8 +380,9 @@ def test_resume_skips_hosts_already_receipted(
     monkeypatch.delenv("FAKE_FAIL_HOST")
     result = _run(fleet, tmp_path)
     assert result["job_count"] == 120
-    # h0..h3 succeeded, h4 failed, then h4..h7 were fetched on resume.
-    assert len(fleet[-1].read_text().splitlines()) == 9
+    # h0..h3 succeeded; h4 failed during the size preflight before an archive
+    # stream began, then h4..h7 were fetched on resume.
+    assert len(fleet[-1].read_text().splitlines()) == 8
 
 
 def test_resume_recovers_atomic_job_directory_before_state_receipt(
@@ -307,7 +399,7 @@ def test_resume_recovers_atomic_job_directory_before_state_receipt(
     result = _run(fleet, tmp_path)
 
     assert result["job_count"] == 120
-    assert len(fleet[-1].read_text().splitlines()) == 9
+    assert len(fleet[-1].read_text().splitlines()) == 8
 
 
 def test_resume_refuses_corrupt_staged_bytes(
