@@ -7,7 +7,7 @@ operation is gated by ``--go``.  A Ray cluster specification can be rendered
 for a later daemon-managed backend without installing or starting Ray.
 
 The unit of capacity is a physical GPU, never a host.  Six four-GPU hosts and
-two eight-GPU hosts therefore yield forty equal evaluator lanes.  Internal H2H
+four eight-GPU hosts therefore yield fifty-six equal evaluator lanes.  Internal H2H
 uses one shard per lane.  External candidate/incumbent panels pair adjacent
 lanes and assign both sides the exact same seed interval.
 """
@@ -49,6 +49,8 @@ EXPECTED_SHAPES = {
     "c6": 4,
     "h100-8a": 8,
     "h100-8b": 8,
+    "h100-8c": 8,
+    "h100-8d": 8,
 }
 CANARY_ALIASES = {"c1", "h100-8a"}
 DEFAULT_WORKERS_PER_GPU = 16
@@ -70,6 +72,8 @@ SCIENCE_CONFIG: dict[str, Any] = {
     "determinization_min_simulations": 32,
     "symmetry_averaged_eval": True,
     "symmetry_averaged_eval_threshold": 20,
+    "evaluator_rust_featurize": True,
+    "native_mcts_hot_loop": True,
     "value_readout": "scalar",
     "value_squash": "tanh",
     "max_depth": 80,
@@ -166,7 +170,7 @@ def load_manifest(path: Path) -> dict[str, Any]:
         raise FleetError("fleet manifest contains duplicate aliases")
     if actual != EXPECTED_SHAPES:
         raise FleetError(
-            "A1 eval requires exactly six 4xH100 and two 8xH100 hosts: "
+            "A1 eval requires exactly six 4xH100 and four 8xH100 hosts: "
             f"expected {EXPECTED_SHAPES}, got {actual}"
         )
     manifest["hosts"] = sorted(hosts, key=lambda item: item["alias"])
@@ -187,8 +191,11 @@ def gpu_slots(manifest: dict[str, Any]) -> list[dict[str, Any]]:
         for host in manifest["hosts"]
         for gpu in range(int(host["gpu_count"]))
     ]
-    if len(slots) != 40:
-        raise FleetError(f"A1 eval manifest resolved {len(slots)} GPUs, expected 40")
+    expected_slots = sum(EXPECTED_SHAPES.values())
+    if len(slots) != expected_slots:
+        raise FleetError(
+            f"A1 eval manifest resolved {len(slots)} GPUs, expected {expected_slots}"
+        )
     return slots
 
 
@@ -233,6 +240,8 @@ def _science_args() -> list[str]:
         "--symmetry-averaged-eval",
         "--symmetry-averaged-eval-threshold",
         "20",
+        "--evaluator-rust-featurize",
+        "--native-mcts-hot-loop",
         "--value-readout",
         "scalar",
         "--value-squash",
@@ -1307,6 +1316,7 @@ def ray_cluster_spec(manifest: dict[str, Any], plan: dict[str, Any]) -> dict[str
         }
         for host in manifest["hosts"]
     ]
+    physical_gpu_slots = sum(int(host["gpu_count"]) for host in manifest["hosts"])
     return {
         "schema_version": RAY_SCHEMA,
         "plan_hash": plan["plan_hash"],
@@ -1319,8 +1329,8 @@ def ray_cluster_spec(manifest: dict[str, Any], plan: dict[str, Any]) -> dict[str
         "workers": workers,
         "scheduler_contract": {
             "actor_resources": {"num_gpus": 1, "resources": {"H100": 1}},
-            "physical_gpu_slots": 40,
-            "max_concurrent_actors": 40,
+            "physical_gpu_slots": physical_gpu_slots,
+            "max_concurrent_actors": physical_gpu_slots,
             "job_commands_are_plan_argv": True,
         },
     }

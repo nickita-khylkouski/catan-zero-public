@@ -16,6 +16,8 @@
     {"alias": "c5", "address": "REPLACE_ME_c5_ip", "gpu_count": 4},
     {"alias": "c6", "address": "REPLACE_ME_c6_ip", "gpu_count": 4},
     {"alias": "h100-8a", "address": "REPLACE_ME_h100_8a_ip", "gpu_count": 8},
-    {"alias": "h100-8b", "address": "REPLACE_ME_h100_8b_ip", "gpu_count": 8}
+    {"alias": "h100-8b", "address": "REPLACE_ME_h100_8b_ip", "gpu_count": 8},
+    {"alias": "h100-8c", "address": "REPLACE_ME_h100_8c_ip", "gpu_count": 8},
+    {"alias": "h100-8d", "address": "REPLACE_ME_h100_8d_ip", "gpu_count": 8}
   ]
 }
