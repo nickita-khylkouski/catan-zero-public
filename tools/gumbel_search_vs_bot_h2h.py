@@ -106,6 +106,7 @@ from catan_zero.adapters.engine_equivalence import (
 )
 from catan_zero.rl._catanatron import import_catanatron_module
 from catan_zero.rl.config_cli import add_config_flags, resolve_config
+from catan_zero.rl.entity_token_features_rust import require_rust_feature_path
 from catan_zero.rl.pipeline_configs import EvalConfig
 from catan_zero.search.gumbel_chance_mcts import (
     GumbelChanceMCTS,
@@ -346,6 +347,9 @@ def _build_evaluator(checkpoint: str, worker_args: dict[str, Any]) -> Any:
             prior_temperature=float(worker_args["prior_temperature"]),
             value_squash=str(worker_args.get("value_squash", "tanh")),
             public_observation=bool(worker_args.get("public_observation", False)),
+            rust_featurize=bool(
+                worker_args.get("evaluator_rust_featurize", False)
+            ),
         ),
     )
 
@@ -552,6 +556,15 @@ def main() -> None:
         help="Explicitly use the feature-gated Rust MCTS tree hot loop. Default "
         "False preserves Python; enabling fails closed if the matching wheel is absent.",
     )
+    parser.add_argument(
+        "--evaluator-rust-featurize",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Build entity and legal-action context tensors with the bit-exact "
+            "native featurizer. Opt-in and fail-closed; no Python fallback."
+        ),
+    )
     parser.add_argument("--base-seed", type=int, default=1)
     parser.add_argument(
         "--gate-config",
@@ -574,6 +587,11 @@ def main() -> None:
             "--native-mcts-hot-loop requires a matching catanatron_rs wheel "
             "exporting gumbel_search; refusing silent Python fallback"
         )
+    if bool(args.evaluator_rust_featurize):
+        try:
+            require_rust_feature_path()
+        except RuntimeError as error:
+            parser.error(str(error))
     if bool(args.public_observation) != bool(args.information_set_search):
         parser.error(
             "--public-observation and --information-set-search must be enabled together"
@@ -655,6 +673,7 @@ def main() -> None:
                 "belief_chance_spectra": bool(args.belief_chance_spectra),
                 "information_set_search": bool(args.information_set_search),
                 "native_mcts_hot_loop": bool(args.native_mcts_hot_loop),
+                "evaluator_rust_featurize": bool(args.evaluator_rust_featurize),
                 "determinization_particles": int(args.determinization_particles),
                 "determinization_min_simulations": int(
                     args.determinization_min_simulations

@@ -47,6 +47,9 @@ if str(_TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(_TOOLS_DIR))
 
 from catan_zero.rl.config_cli import add_config_flags, resolve_config  # noqa: E402
+from catan_zero.rl.entity_token_features_rust import (  # noqa: E402
+    require_rust_feature_path,
+)
 from catan_zero.rl.gumbel_self_play import _apply_selected_action  # noqa: E402
 from catan_zero.rl.pipeline_configs import EvalConfig  # noqa: E402
 from catan_zero.search.gumbel_chance_mcts import (  # noqa: E402
@@ -1256,6 +1259,15 @@ def main() -> None:
         help="Explicitly use the feature-gated Rust MCTS tree hot loop. Default "
         "False preserves Python; enabling fails closed if the matching wheel is absent.",
     )
+    parser.add_argument(
+        "--evaluator-rust-featurize",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Build entity and legal-action context tensors with the bit-exact "
+            "native featurizer. Opt-in and fail-closed; no Python fallback."
+        ),
+    )
     parser.add_argument("--base-seed", type=int, default=1)
     parser.add_argument(
         "--held-out-high-regret-suite",
@@ -1294,6 +1306,11 @@ def main() -> None:
             "--native-mcts-hot-loop requires a matching catanatron_rs wheel "
             "exporting gumbel_search; refusing silent Python fallback"
         )
+    if bool(args.evaluator_rust_featurize):
+        try:
+            require_rust_feature_path()
+        except RuntimeError as error:
+            parser.error(str(error))
     try:
         _validate_information_set_recipe(args)
     except ValueError as exc:
@@ -1406,6 +1423,7 @@ def main() -> None:
             "belief_chance_spectra": bool(args.belief_chance_spectra),
             "information_set_search": bool(args.information_set_search),
             "native_mcts_hot_loop": bool(args.native_mcts_hot_loop),
+            "evaluator_rust_featurize": bool(args.evaluator_rust_featurize),
             "determinization_particles": int(args.determinization_particles),
             "determinization_min_simulations": int(
                 args.determinization_min_simulations

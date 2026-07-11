@@ -53,6 +53,7 @@ def test_direct_cli_help_resolves_replay_contract_sibling_import() -> None:
     )
     assert completed.returncode == 0, completed.stderr
     assert "--native-mcts-hot-loop" in completed.stdout
+    assert "--evaluator-rust-featurize" in completed.stdout
 
 
 def test_eval_config_hash_seals_native_hot_loop_choice() -> None:

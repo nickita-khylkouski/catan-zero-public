@@ -287,6 +287,7 @@ def test_parser_preserves_raw_smoke_default_and_exposes_search_recipe() -> None:
     assert args.symmetry_averaged_eval is False
     assert args.symmetry_averaged_eval_threshold is None
     assert args.wide_candidates_threshold == 24
+    assert args.evaluator_rust_featurize is False
 
 
 def test_checkpoint_provenance_digests_share_one_read(tmp_path: Path) -> None:
@@ -321,6 +322,7 @@ def test_neutral_search_runtime_and_fingerprint_share_d6_adaptive_recipe() -> No
             "--symmetry-averaged-eval",
             "--symmetry-averaged-eval-threshold",
             "20",
+            "--evaluator-rust-featurize",
             "--wide-candidates-threshold",
             "24",
         ]
@@ -339,6 +341,7 @@ def test_neutral_search_runtime_and_fingerprint_share_d6_adaptive_recipe() -> No
     assert config.information_set_search is True
     assert config.determinization_particles == 4
     assert config.determinization_min_simulations == 32
+    assert recipe["evaluator_rust_featurize"] is True
 
     semantics = _game_semantics(args, "checkpoint-md5", "sha256:" + "1" * 64)
     assert semantics["checkpoint_sha256"] == "sha256:" + "1" * 64

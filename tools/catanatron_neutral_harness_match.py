@@ -40,6 +40,7 @@ if str(_TOOLS_DIR) not in sys.path:
 
 from catan_zero.adapters.engine_equivalence import EquivalenceConfig, build_paired_games
 from catan_zero.rl._catanatron import import_catanatron_module
+from catan_zero.rl.entity_token_features_rust import require_rust_feature_path
 from catan_zero.rl.entity_token_policy import EntityGraphPolicy
 from catan_zero.search.gumbel_chance_mcts import (
     GumbelChanceMCTS,
@@ -436,7 +437,9 @@ def _search_recipe(args: Any) -> dict[str, Any]:
         "variance_aware_closed_form_js": False,
         "evaluator_context_fill": 0.0,
         "evaluator_cache_size": 0,
-        "evaluator_rust_featurize": False,
+        "evaluator_rust_featurize": bool(
+            getattr(args, "evaluator_rust_featurize", False)
+        ),
         "evaluator_emit_uncertainty": False,
         "symmetry_averaged_eval": bool(args.symmetry_averaged_eval),
         "symmetry_averaged_eval_threshold": (
@@ -1030,6 +1033,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Inclusive minimum legal-action count for D6 root averaging.",
     )
+    parser.add_argument(
+        "--evaluator-rust-featurize",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Search mode only: build entity and legal-action context tensors "
+            "with the bit-exact native featurizer. Opt-in and fail-closed."
+        ),
+    )
 
     parser.add_argument(
         "--gate-config", choices=sorted(GATE_CONFIGS), default="certification"
@@ -1069,6 +1081,13 @@ def main() -> None:
         )
     if args.mode != "search" and str(args.value_readout) != "scalar":
         parser.error("--value-readout categorical is supported only with --mode search")
+    if args.mode != "search" and bool(args.evaluator_rust_featurize):
+        parser.error("--evaluator-rust-featurize is supported only with --mode search")
+    if bool(args.evaluator_rust_featurize):
+        try:
+            require_rust_feature_path()
+        except RuntimeError as error:
+            parser.error(str(error))
     if args.devices and not [
         item.strip() for item in args.devices.split(",") if item.strip()
     ]:
@@ -1222,6 +1241,7 @@ def main() -> None:
             "value_squash": str(args.value_squash),
             "value_readout": str(args.value_readout),
             "public_observation": bool(args.public_observation),
+            "evaluator_rust_featurize": bool(args.evaluator_rust_featurize),
         }
         for index, shard in enumerate(shards)
         if shard
