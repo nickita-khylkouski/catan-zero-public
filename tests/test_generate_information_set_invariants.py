@@ -1,9 +1,15 @@
 from __future__ import annotations
 
 import argparse
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+
+TOOLS_DIR = Path(__file__).resolve().parents[1] / "tools"
+if str(TOOLS_DIR) not in sys.path:
+    sys.path.insert(0, str(TOOLS_DIR))
 
 from tools.generate_gumbel_selfplay_data import _validate_science_args
 
