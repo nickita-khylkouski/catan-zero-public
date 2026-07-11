@@ -4123,7 +4123,26 @@ def _verify_generation_arm_lock(
         != _digest_value(_effective_search(search))
         or _digest_value(science["evaluator"]) != _digest_value(evaluator)
         or science["evaluator_sha256"] != _digest_value(evaluator)
-        or _digest_value(lock["generation"]) != _digest_value(generation)
+        # Historical A1 locks were sealed before the explicit generation
+        # ``native_mcts_hot_loop`` field was added.  Its omitted value was the
+        # production default (False); normalize only that one additive field
+        # so old sealed locks remain replayable without accepting science drift.
+        or _digest_value(
+            {
+                **lock["generation"],
+                **(
+                    {
+                        "native_mcts_hot_loop": generation[
+                            "native_mcts_hot_loop"
+                        ]
+                    }
+                    if "native_mcts_hot_loop" in generation
+                    and "native_mcts_hot_loop" not in lock["generation"]
+                    else {}
+                ),
+            }
+        )
+        != _digest_value(generation)
     ):
         raise ContractError("generation arm science drift")
     for expected, actual in zip(campaign["checkpoints"], lock["checkpoints"]):
