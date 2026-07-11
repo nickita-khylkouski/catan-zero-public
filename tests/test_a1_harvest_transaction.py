@@ -364,6 +364,24 @@ def test_staged_mutation_immediately_before_rename_fails_preflight(
     assert not (tmp_path / "published").exists()
 
 
+def test_transaction_lock_unlink_before_rename_cannot_publish(
+    fleet, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original_publish = harvest._atomic_publish_noreplace
+
+    def unlink_lock_then_publish(
+        source: Path, destination: Path, *, preflight=None
+    ) -> None:
+        lock_path = next(tmp_path.glob(".a1-harvest-*.lock"))
+        lock_path.unlink()
+        original_publish(source, destination, preflight=preflight)
+
+    monkeypatch.setattr(harvest, "_atomic_publish_noreplace", unlink_lock_then_publish)
+    with pytest.raises(harvest.HarvestError, match="transaction lock"):
+        _run(fleet, tmp_path)
+    assert not (tmp_path / "published").exists()
+
+
 def test_concurrent_same_destination_invocations_serialize_on_parent_lock(
     fleet, tmp_path: Path
 ) -> None:

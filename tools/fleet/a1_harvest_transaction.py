@@ -594,11 +594,14 @@ def _harvest_locked(
     lock_pin: _PinnedInput,
     render_pin: _PinnedInput,
     parent_fd: int,
+    transaction_guard: Callable[[], None] | None = None,
     ssh_command: Sequence[str] = ("ssh",),
 ) -> dict[str, Any]:
     """Collect and atomically publish the exact sealed 120-job output set."""
 
     lock, rendered, jobs = _validate_inputs(snapshot_lock_path, snapshot_render_path)
+    if transaction_guard is not None:
+        transaction_guard()
     transaction_key = _value_sha256(
         {
             "contract_sha256": lock["contract_sha256"],
@@ -607,6 +610,8 @@ def _harvest_locked(
         }
     ).removeprefix("sha256:")[:20]
     if destination.exists():
+        if transaction_guard is not None:
+            transaction_guard()
         lock_pin.revalidate()
         render_pin.revalidate()
         result = _validate_published(
@@ -620,6 +625,8 @@ def _harvest_locked(
         )
         lock_pin.revalidate()
         render_pin.revalidate()
+        if transaction_guard is not None:
+            transaction_guard()
         return result
     stage = destination.parent / f".{destination.name}.harvest-{transaction_key}.staging"
     payload = stage / "payload"
@@ -755,6 +762,8 @@ def _harvest_locked(
     finally:
         os.close(directory_fd)
     def preflight() -> None:
+        if transaction_guard is not None:
+            transaction_guard()
         lock_pin.revalidate()
         render_pin.revalidate()
         actual = _validate_published(
@@ -881,6 +890,22 @@ def harvest(
         os.fchmod(transaction_fd, 0o600)
         fcntl.flock(transaction_fd, fcntl.LOCK_EX)
         os.fsync(parent_fd)
+
+        def transaction_guard() -> None:
+            held = os.fstat(transaction_fd)
+            try:
+                named = os.stat(lock_name, dir_fd=parent_fd, follow_symlinks=False)
+            except FileNotFoundError as error:
+                raise HarvestError("destination transaction lock was unlinked") from error
+            if (
+                not stat.S_ISREG(held.st_mode)
+                or held.st_nlink != 1
+                or not stat.S_ISREG(named.st_mode)
+                or (named.st_dev, named.st_ino) != (held.st_dev, held.st_ino)
+            ):
+                raise HarvestError("destination transaction lock identity drifted")
+
+        transaction_guard()
         lock_pin = _PinnedInput.open(lock_path)
         render_pin = _PinnedInput.open(render_path)
         lock_pin.revalidate()
@@ -904,15 +929,10 @@ def harvest(
             lock_pin=lock_pin,
             render_pin=render_pin,
             parent_fd=parent_fd,
+            transaction_guard=transaction_guard,
             ssh_command=ssh_command,
         )
-        named_lock = os.stat(lock_name, dir_fd=parent_fd, follow_symlinks=False)
-        if (
-            not stat.S_ISREG(named_lock.st_mode)
-            or (named_lock.st_dev, named_lock.st_ino)
-            != (transaction_stat.st_dev, transaction_stat.st_ino)
-        ):
-            raise HarvestError("destination transaction lock identity drifted")
+        transaction_guard()
         return result
     finally:
         if snapshot_root is not None:

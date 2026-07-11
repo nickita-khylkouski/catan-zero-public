@@ -44,8 +44,14 @@ def _state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict:
         "status": "committed",
         "transaction_id": "tx-4",
         "receipt_sha256": "sha256:" + "a" * 64,
-        "registry": {"after_sha256": handoff._sha256(registry_path)},  # noqa: SLF001
-        "current_pointer": {"after_sha256": handoff._sha256(pointer)},  # noqa: SLF001
+        "registry": {
+            "path": str(registry_path),
+            "after_sha256": handoff._sha256(registry_path),  # noqa: SLF001
+        },
+        "current_pointer": {
+            "path": str(pointer),
+            "after_sha256": handoff._sha256(pointer),  # noqa: SLF001
+        },
         "candidate": {
             "path": str(checkpoint),
             "sha256": handoff._sha256(checkpoint),  # noqa: SLF001
@@ -53,10 +59,7 @@ def _state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict:
             "agent_identity": identity,
         },
     }
-    receipt_path.write_text(
-        json.dumps({"registry": {"path": str(registry_path)}}) + "\n",
-        encoding="utf-8",
-    )
+    receipt_path.write_text(json.dumps(receipt) + "\n", encoding="utf-8")
 
     def load(_: Path):
         return receipt, receipt_path, registry_path, pointer, tmp_path / "rb", tmp_path / "pb"
@@ -163,6 +166,9 @@ def test_refuses_wrong_registry_role_or_version(
     state["receipt"]["registry"]["after_sha256"] = handoff._sha256(  # noqa: SLF001
         state["registry"]
     )
+    state["receipt_path"].write_text(
+        json.dumps(state["receipt"]) + "\n", encoding="utf-8"
+    )
     message = "no generator_champion" if mutation == "role" else "role/version"
     with pytest.raises(handoff.HandoffError, match=message):
         handoff.build_handoff(state["receipt_path"])
@@ -179,6 +185,9 @@ def test_refuses_registry_provenance_identity_drift(
     state["registry"].write_text(json.dumps(raw, sort_keys=True))
     state["receipt"]["registry"]["after_sha256"] = handoff._sha256(  # noqa: SLF001
         state["registry"]
+    )
+    state["receipt_path"].write_text(
+        json.dumps(state["receipt"]) + "\n", encoding="utf-8"
     )
     with pytest.raises(handoff.HandoffError, match="registry generator provenance"):
         handoff.build_handoff(state["receipt_path"])
@@ -204,6 +213,45 @@ def test_refuses_atomic_replacement_before_output(
     with pytest.raises(handoff.HandoffError, match="replaced before output"):
         handoff.write_handoff(state["receipt_path"], tmp_path / "handoff.json")
     assert not (tmp_path / "handoff.json").exists()
+
+
+def test_refuses_checkpoint_replacement_after_output_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state = _state(tmp_path, monkeypatch)
+    original = handoff._revalidate_snapshot  # noqa: SLF001
+    calls = 0
+
+    def race(snapshot: dict[Path, bytes]) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 3:
+            state["checkpoint"].write_bytes(b"changed-in-final-write-window")
+        original(snapshot)
+
+    monkeypatch.setattr(handoff, "_revalidate_snapshot", race)
+    out = tmp_path / "handoff.json"
+    with pytest.raises(handoff.HandoffError, match="replaced before output"):
+        handoff.write_handoff(state["receipt_path"], out)
+    assert not out.exists()
+
+
+def test_refuses_receipt_replacement_between_replay_and_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state = _state(tmp_path, monkeypatch)
+    original = promotion._load_recovery_receipt  # noqa: SLF001
+
+    def race(path: Path):
+        replayed = original(path)
+        changed = dict(state["receipt"])
+        changed["transaction_id"] = "different-transaction"
+        path.write_text(json.dumps(changed) + "\n", encoding="utf-8")
+        return replayed
+
+    monkeypatch.setattr(promotion, "_load_recovery_receipt", race)
+    with pytest.raises(handoff.HandoffError, match="semantic replay and byte snapshot"):
+        handoff.build_handoff(state["receipt_path"])
 
 
 def test_refuses_draft_producer_not_equal_to_promoted_lineage(

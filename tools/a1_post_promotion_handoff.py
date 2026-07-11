@@ -43,7 +43,9 @@ def _sha256_bytes(value: bytes) -> str:
     return "sha256:" + hashlib.sha256(value).hexdigest()
 
 
-def _stable_read(path: Path, *, where: str) -> tuple[bytes, tuple[int, int, int, int]]:
+def _stable_read(
+    path: Path, *, where: str
+) -> tuple[bytes, tuple[int, int, int, int, int]]:
     """Read one regular file without following a final symlink and pin its inode."""
 
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
@@ -61,14 +63,32 @@ def _stable_read(path: Path, *, where: str) -> tuple[bytes, tuple[int, int, int,
         after = os.fstat(descriptor)
     finally:
         os.close(descriptor)
-    identity = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
-    if identity != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns):
+    identity = (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+    )
+    if identity != (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    ):
         raise HandoffError(f"{where} changed while it was read")
     try:
         live = path.stat(follow_symlinks=False)
     except OSError as error:
         raise HandoffError(f"cannot restat {where}: {error}") from error
-    if (live.st_dev, live.st_ino, live.st_size, live.st_mtime_ns) != identity:
+    if (
+        live.st_dev,
+        live.st_ino,
+        live.st_size,
+        live.st_mtime_ns,
+        live.st_ctime_ns,
+    ) != identity:
         raise HandoffError(f"{where} was atomically replaced while it was read")
     return b"".join(chunks), identity
 
@@ -145,6 +165,12 @@ def _snapshot_handoff(receipt_path: Path, *, locked_registry: Path) -> tuple[dic
     if registry_path != locked_registry:
         raise HandoffError("promotion receipt registry changed across canonical lock acquisition")
     receipt_bytes, _ = _stable_read(receipt_path, where="promotion receipt")
+    try:
+        pinned_receipt = json.loads(receipt_bytes.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as error:
+        raise HandoffError(f"pinned promotion receipt is malformed: {error}") from error
+    if pinned_receipt != receipt:
+        raise HandoffError("promotion receipt changed between semantic replay and byte snapshot")
     registry_bytes, _ = _stable_read(registry_path, where="authoritative registry")
     pointer_bytes, _ = _stable_read(pointer_path, where="CURRENT_CHAMPION")
     if _sha256_bytes(registry_bytes) != receipt["registry"]["after_sha256"]:
@@ -268,15 +294,49 @@ def write_handoff(receipt_path: Path, out_path: Path) -> dict[str, Any]:
             raise HandoffError(f"handoff output must be fresh: {out_path}")
         out_path.parent.mkdir(parents=True, exist_ok=True)
         _revalidate_snapshot(snapshot)
+        serialized = json.dumps(payload, indent=2, sort_keys=True).encode("utf-8") + b"\n"
         descriptor = os.open(
             out_path,
             os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
             0o444,
         )
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            handle.write(json.dumps(payload, indent=2, sort_keys=True) + "\n")
-            handle.flush()
-            os.fsync(handle.fileno())
+        opened = os.fstat(descriptor)
+        try:
+            with os.fdopen(descriptor, "wb", closefd=False) as handle:
+                handle.write(serialized)
+                handle.flush()
+                os.fsync(handle.fileno())
+            # The checkpoint is not protected by the registry lock. Close the
+            # last write-window race before declaring this immutable handoff.
+            _revalidate_snapshot(snapshot)
+            published, published_identity = _stable_read(
+                out_path, where="published handoff"
+            )
+            if (
+                published_identity[:2] != (opened.st_dev, opened.st_ino)
+                or published != serialized
+            ):
+                raise HandoffError("handoff output identity drifted during publication")
+            directory = os.open(
+                out_path.parent,
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+            )
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+        except BaseException:
+            try:
+                named = out_path.stat(follow_symlinks=False)
+                if (named.st_dev, named.st_ino) == (opened.st_dev, opened.st_ino):
+                    out_path.unlink()
+            except OSError:
+                pass
+            raise
+        finally:
+            os.close(descriptor)
         return payload
     finally:
         context.__exit__(None, None, None)
