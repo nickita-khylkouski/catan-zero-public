@@ -195,6 +195,9 @@ def build_plan(
         runtime_files.append({**record, "path": str(Path(record["path"]))})
     recovery_root = str(Path(config["recovery_root"]))
     runtime_source_repo = str(Path(config["runtime_repo"]))
+    runtime_python = Path(config["runtime_python"])
+    if not runtime_python.is_absolute():
+        raise RecoveryError("runtime_python must be an absolute remote path")
     staged_runtime_repo = (
         f"{recovery_root}/runtime-{str(config['runtime_commit'])[:12]}"
     )
@@ -332,7 +335,7 @@ def build_plan(
         "mode": "dry-run",
         "runtime_source_repo": runtime_source_repo,
         "runtime_repo": staged_runtime_repo,
-        "runtime_python": str(Path(config["runtime_python"])),
+        "runtime_python": str(runtime_python),
         "runtime_commit": config["runtime_commit"],
         "native_wheel": {**wheel, "filename": wheel_config["filename"]},
         "runtime_files": runtime_files,
@@ -467,12 +470,16 @@ def run_lane(plan_path: Path, lane_id: str, *, resume: bool) -> dict[str, Any]:
                 env=environment,
                 stdout=handle,
                 stderr=subprocess.STDOUT,
-                start_new_session=True,
+                # The supervisor itself owns a fresh session/process group.
+                # Keep the generator in that same group so controller rollback
+                # cannot miss the Popen->receipt-write window.
+                start_new_session=False,
             )
             receipt["status"] = "running"
             receipt["jobs"][command["job_id"]] = {
                 "status": "running",
                 "pid": process.pid,
+                "process_group": os.getpgrp(),
                 "log": str(log),
             }
             _atomic_mutable(receipt_path, receipt)
@@ -528,7 +535,10 @@ def stop(plan_path: Path, *, go: bool) -> dict[str, Any]:
                     {"lane_id": lane["lane_id"], "job_id": job_id, "pid": pid}
                 )
                 if go:
-                    os.killpg(pid, signal.SIGTERM)
+                    process_group = row.get("process_group", pid)
+                    if not isinstance(process_group, int) or process_group <= 0:
+                        raise RecoveryError("invalid receipt process group")
+                    os.killpg(process_group, signal.SIGTERM)
     return {"mode": "committed" if go else "dry-run", "targets": targets}
 
 
@@ -807,6 +817,10 @@ def _preflight_host(
         " return 'sha256:'+h.hexdigest()\n"
         "assert (repo/'.experimental_recovery_commit').read_text().strip()==commit\n"
         "stored=json.load((repo/'.experimental_recovery_tree.json').open()); assert stored==tree\n"
+        "expected_paths={r['path'] for r in tree['files']}\n"
+        "allowed_extra={'.experimental_recovery_commit','.experimental_recovery_tree.json'}\n"
+        "actual_paths={str(p.relative_to(repo)) for p in repo.rglob('*') if p.is_file() or p.is_symlink()}\n"
+        "assert actual_paths==expected_paths|allowed_extra,sorted(actual_paths-(expected_paths|allowed_extra))\n"
         "for r in tree['files']:\n"
         " p=repo/r['path']; assert p.is_file() and not p.is_symlink(),r['path']\n"
         " data=p.read_bytes(); actual=hashlib.sha1(b'blob '+str(len(data)).encode()+b'\\0'+data).hexdigest(); assert actual==r['git_blob_sha1'],r['path']\n"
@@ -814,7 +828,8 @@ def _preflight_host(
         " p=pathlib.Path(r['path']); assert p.is_file() and not p.is_symlink() and sha(p)==r['sha256'],r['path']\n"
         "assert subprocess.check_output(['systemctl','is-active','nvidia-mps'],text=True).strip()=='active'\n"
         "assert pathlib.Path('/tmp/mps_pipe_host/control').exists() or pathlib.Path('/tmp/mps_pipe_host/control_lock').exists()\n"
-        "assert resource.getrlimit(resource.RLIMIT_NOFILE)[0]>=65536\n"
+        "soft,hard=resource.getrlimit(resource.RLIMIT_NOFILE); assert hard>=65536\n"
+        "resource.setrlimit(resource.RLIMIT_NOFILE,(65536,hard)); assert resource.getrlimit(resource.RLIMIT_NOFILE)[0]>=65536\n"
         f"assert shutil.disk_usage({plan['recovery_root']!r}).free>=20*1024**3\n"
         f'py={plan["runtime_python"]!r}; expected={plan["native_wheel"]["sha256"].removeprefix("sha256:")!r}; code=\'import json; from importlib.metadata import distribution,version; import catanatron_rs as r; assert version("catanatron_rs")=="0.1.5"; d=distribution("catanatron_rs"); p=d.locate_file("catanatron_rs-0.1.5.dist-info/direct_url.json"); u=json.load(open(p)); assert u["archive_info"]["hash"]=="sha256="+{plan["native_wheel"]["sha256"].removeprefix("sha256:")!r}; assert callable(getattr(r,"gumbel_search",None)); assert hasattr(r.Game,"determinize_for_player"); assert hasattr(r,"build_entity_features_flat")\'\n'
         "subprocess.run([py,'-c',code],check=True)\n"
@@ -929,9 +944,10 @@ def launch(
             ]
             result = _remote_python(
                 base,
-                "import json,os,pathlib,subprocess\n"
+                "import json,os,pathlib,resource,subprocess\n"
                 f"specs={lane_specs!r}; py={plan['runtime_python']!r}; tool={remote_tool!r}; plan={remote_plan!r}; repo={plan['runtime_repo']!r}; resume={resume!r}\n"
                 "started=[]\n"
+                "soft,hard=resource.getrlimit(resource.RLIMIT_NOFILE); assert hard>=65536; resource.setrlimit(resource.RLIMIT_NOFILE,(65536,hard))\n"
                 "try:\n"
                 " for s in specs:\n"
                 "  log=pathlib.Path(s['log']); log.parent.mkdir(parents=True,exist_ok=True)\n"
