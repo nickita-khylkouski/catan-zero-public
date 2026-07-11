@@ -30,3 +30,11 @@ Registration or admission fails on missing identity evidence, source drift,
 corpus inventory drift, an unregistered arm/seed, a wrong output directory, or
 an existing destination. No command changes production defaults or promotes a
 checkpoint.
+
+`learning_gate.v1.json` is a separate pre-outcome scoring contract bound to the
+immutable registered experiment's semantic and file hashes. The scorer requires
+all 15 runs on identical holdout decisions. Its primary comparisons are K2/K4
+versus K1 using nonforced game-macro soft-target CE and a paired crossed
+seed/game bootstrap. K8 is secondary; K0 is descriptive only. The overall
+safety gate is nonforced decision-micro CE within seed, preserving the weight of
+large games. Bootstrap count and RNG seed are frozen in the gate contract.
