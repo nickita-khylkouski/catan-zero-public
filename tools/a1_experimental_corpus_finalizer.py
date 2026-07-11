@@ -11,12 +11,16 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import fcntl
 import hashlib
 import json
 import os
 from pathlib import Path
+import shlex
 import subprocess
 import sys
+import time
 from typing import Any, Iterable, Sequence
 
 import numpy as np
@@ -189,6 +193,17 @@ def build_plan(
             "path": str(recovery_plan.resolve()),
             "sha256": _file_sha(recovery_plan),
         },
+        "source_recovery_plan_sha256": recovery["plan_sha256"],
+        "recovery_lanes": [
+            {
+                "lane_id": lane["lane_id"],
+                "host_alias": lane["host_alias"],
+                "receipt": lane["receipt"],
+                "job_ids": [row["job_id"] for row in lane["commands"]],
+            }
+            for lane in recovery.get("lanes", [])
+            if lane.get("arm_id") == arm
+        ],
         "current_jobs": current,
         "recovery_jobs": opponent,
         "unused_current_sum": current_total,
@@ -196,6 +211,118 @@ def build_plan(
     value["plan_sha256"] = _digest(value)
     _atomic_json(out, value)
     return value
+
+
+_REMOTE_RECEIPT_PROGRAM = r"""
+import json, pathlib, sys
+expected_plan = sys.argv[1]
+rows = json.loads(sys.argv[2])
+result = []
+for row in rows:
+    path = pathlib.Path(row['receipt'])
+    try:
+        value = json.loads(path.read_text())
+    except Exception as error:
+        result.append({'lane_id': row['lane_id'], 'status': 'missing_or_invalid', 'detail': str(error)})
+        continue
+    jobs = value.get('jobs', {})
+    ok = (
+        value.get('schema_version') == 'a1-r1-opponent-recovery-lane-receipt-v1'
+        and value.get('label') == 'experimental_nonpromotable'
+        and value.get('promotable') is False
+        and value.get('plan_sha256') == expected_plan
+        and value.get('lane_id') == row['lane_id']
+        and value.get('status') == 'complete'
+        and set(jobs) == set(row['job_ids'])
+        and all(item.get('status') == 'complete' and item.get('return_code') == 0 for item in jobs.values())
+    )
+    result.append({'lane_id': row['lane_id'], 'status': 'complete' if ok else str(value.get('status', 'invalid'))})
+print(json.dumps(result, sort_keys=True))
+"""
+
+
+def remote_completion(plan_path: Path, ssh_command: Sequence[str]) -> dict[str, Any]:
+    """Read and validate all arm lane receipts without touching output bytes."""
+    plan = _verified_plan(plan_path)
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for lane in plan["recovery_lanes"]:
+        grouped.setdefault(lane["host_alias"], []).append(lane)
+    results: list[dict[str, Any]] = []
+    with ThreadPoolExecutor(max_workers=min(10, len(grouped))) as executor:
+        futures = {
+            executor.submit(
+                subprocess.run,
+                [
+                    *ssh_command,
+                    host,
+                    " ".join(
+                        shlex.quote(value)
+                        for value in (
+                            "python3",
+                            "-c",
+                            _REMOTE_RECEIPT_PROGRAM,
+                            plan["source_recovery_plan_sha256"],
+                            json.dumps(sorted(lanes, key=lambda row: row["lane_id"])),
+                        )
+                    ),
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            ): host
+            for host, lanes in sorted(grouped.items())
+        }
+        for future in as_completed(futures):
+            host = futures[future]
+            response = future.result()
+            if response.returncode != 0:
+                raise FinalizerError(
+                    f"remote receipt preflight failed on {host}: {response.stderr[-2000:]}"
+                )
+            try:
+                rows = json.loads(response.stdout)
+            except json.JSONDecodeError as error:
+                raise FinalizerError(
+                    f"remote receipt response malformed on {host}"
+                ) from error
+            if not isinstance(rows, list):
+                raise FinalizerError(f"remote receipt response malformed on {host}")
+            results.extend({**row, "host_alias": host} for row in rows)
+    results.sort(key=lambda row: row["lane_id"])
+    expected = sorted(row["lane_id"] for row in plan["recovery_lanes"])
+    if [row.get("lane_id") for row in results] != expected:
+        raise FinalizerError("remote receipt response does not cover exact arm lanes")
+    complete = sum(row.get("status") == "complete" for row in results)
+    return {
+        "classification": LABEL,
+        "arm_id": plan["arm_id"],
+        "complete": complete,
+        "total": len(expected),
+        "ready": complete == len(expected),
+        "lanes": results,
+    }
+
+
+def wait_ready(
+    plan_path: Path,
+    ssh_command: Sequence[str],
+    *,
+    poll_seconds: float,
+    timeout_seconds: float,
+) -> dict[str, Any]:
+    if poll_seconds <= 0 or timeout_seconds < 0:
+        raise FinalizerError("poll seconds must be positive and timeout nonnegative")
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        result = remote_completion(plan_path, ssh_command)
+        if result["ready"]:
+            return result
+        if time.monotonic() >= deadline:
+            raise FinalizerError(
+                f"remote recovery is incomplete: {result['complete']}/{result['total']} lanes"
+            )
+        time.sleep(min(poll_seconds, max(0.0, deadline - time.monotonic())))
 
 
 def _verified_plan(path: Path) -> dict[str, Any]:
@@ -221,89 +348,132 @@ def _verified_plan(path: Path) -> dict[str, Any]:
     return value
 
 
-def harvest(
-    plan_path: Path, destination: Path, ssh_command: Sequence[str]
+def _harvest_job(
+    destination: Path, ssh_command: Sequence[str], job: dict[str, Any]
 ) -> dict[str, Any]:
-    """Crash-resumable direct remote-to-local rsync of the recovery tranche."""
-    plan = _verified_plan(plan_path)
-    destination = destination.absolute()
-    destination.mkdir(parents=True, exist_ok=True)
     state = destination / ".state"
     state.mkdir(exist_ok=True)
-    inventory: list[dict[str, Any]] = []
-    for job in sorted(plan["recovery_jobs"], key=lambda row: row["job_id"]):
-        job_id = job["job_id"]
-        final = destination / "jobs" / job_id
-        receipt = state / f"{job_id}.json"
-        if receipt.exists():
-            prior = _load(receipt)
-            if prior.get("job_id") != job_id or not final.is_dir():
-                raise FinalizerError(f"invalid resumed harvest state for {job_id}")
-            actual = []
-            for file in sorted(path for path in final.rglob("*") if path.is_file()):
-                actual.append(
-                    {
-                        "path": file.relative_to(final).as_posix(),
-                        "bytes": file.stat().st_size,
-                        "sha256": _file_sha(file),
-                    }
-                )
-            if actual != prior.get("files") or _digest(actual) != prior.get(
-                "files_sha256"
-            ):
-                raise FinalizerError(f"resumed harvested bytes drifted for {job_id}")
-            inventory.append(prior)
-            continue
-        incoming = destination / ".incoming" / job_id
-        if not final.exists():
-            incoming.mkdir(parents=True, exist_ok=True)
-            remote_shell = " ".join(map(str, ssh_command))
-            result = subprocess.run(
-                [
-                    "rsync",
-                    "-a",
-                    "--partial",
-                    "--append-verify",
-                    "--protect-args",
-                    "-e",
-                    remote_shell,
-                    f"{job['host_alias']}:{job['output_dir'].rstrip('/')}/",
-                    str(incoming) + "/",
-                ],
-                check=False,
-            )
-            if result.returncode != 0:
-                raise FinalizerError(
-                    f"rsync failed for {job_id}: exit {result.returncode}"
-                )
-            final.parent.mkdir(parents=True, exist_ok=True)
-            os.replace(incoming, final)
-        files = []
-        for path in sorted(p for p in final.rglob("*") if p.is_file()):
-            files.append(
+    job_id = job["job_id"]
+    final = destination / "jobs" / job_id
+    receipt = state / f"{job_id}.json"
+    if receipt.exists():
+        prior = _load(receipt)
+        if prior.get("job_id") != job_id or not final.is_dir():
+            raise FinalizerError(f"invalid resumed harvest state for {job_id}")
+        actual = []
+        for file in sorted(path for path in final.rglob("*") if path.is_file()):
+            actual.append(
                 {
-                    "path": path.relative_to(final).as_posix(),
-                    "bytes": path.stat().st_size,
-                    "sha256": _file_sha(path),
+                    "path": file.relative_to(final).as_posix(),
+                    "bytes": file.stat().st_size,
+                    "sha256": _file_sha(file),
                 }
             )
-        if not files or not any(row["path"].endswith(".npz") for row in files):
-            raise FinalizerError(f"harvested job has no NPZ shards: {job_id}")
-        row = {
-            "job_id": job_id,
-            "host_alias": job["host_alias"],
-            "source_dir": job["output_dir"],
-            "files": files,
-            "files_sha256": _digest(files),
-        }
-        _atomic_json(receipt, row)
-        inventory.append(row)
+        if actual != prior.get("files") or _digest(actual) != prior.get("files_sha256"):
+            raise FinalizerError(f"resumed harvested bytes drifted for {job_id}")
+        return prior
+    incoming = destination / ".incoming" / job_id
+    if not final.exists():
+        incoming.mkdir(parents=True, exist_ok=True)
+        remote_shell = " ".join(map(str, ssh_command))
+        result = subprocess.run(
+            [
+                "rsync",
+                "-a",
+                "--partial",
+                "--append-verify",
+                "--protect-args",
+                "-e",
+                remote_shell,
+                f"{job['host_alias']}:{job['output_dir'].rstrip('/')}/",
+                str(incoming) + "/",
+            ],
+            check=False,
+        )
+        if result.returncode != 0:
+            raise FinalizerError(f"rsync failed for {job_id}: exit {result.returncode}")
+        final.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(incoming, final)
+    files = []
+    for path in sorted(p for p in final.rglob("*") if p.is_file()):
+        files.append(
+            {
+                "path": path.relative_to(final).as_posix(),
+                "bytes": path.stat().st_size,
+                "sha256": _file_sha(path),
+            }
+        )
+    if not files or not any(row["path"].endswith(".npz") for row in files):
+        raise FinalizerError(f"harvested job has no NPZ shards: {job_id}")
+    row = {
+        "job_id": job_id,
+        "host_alias": job["host_alias"],
+        "source_dir": job["output_dir"],
+        "files": files,
+        "files_sha256": _digest(files),
+    }
+    _atomic_json(receipt, row)
+    return row
+
+
+def harvest(
+    plan_path: Path,
+    destination: Path,
+    ssh_command: Sequence[str],
+    *,
+    parallelism: int = 10,
+) -> dict[str, Any]:
+    """Crash-resumable bounded-parallel harvest of the complete recovery tranche."""
+    if (
+        isinstance(parallelism, bool)
+        or not isinstance(parallelism, int)
+        or not 1 <= parallelism <= 32
+    ):
+        raise FinalizerError("parallelism must be an integer in [1, 32]")
+    plan = _verified_plan(plan_path)
+    completion = remote_completion(plan_path, ssh_command)
+    if not completion["ready"]:
+        raise FinalizerError(
+            f"refusing partial harvest: {completion['complete']}/{completion['total']} remote lanes complete"
+        )
+    destination = destination.absolute()
+    destination.mkdir(parents=True, exist_ok=True)
+    lock_path = destination / ".harvest.lock"
+    lock_descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        try:
+            fcntl.flock(lock_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise FinalizerError("another harvest owns this destination") from error
+        jobs = sorted(plan["recovery_jobs"], key=lambda row: row["job_id"])
+        inventory_by_job: dict[str, dict[str, Any]] = {}
+        failures: list[str] = []
+        with ThreadPoolExecutor(max_workers=min(parallelism, len(jobs))) as executor:
+            futures = {
+                executor.submit(_harvest_job, destination, ssh_command, job): job
+                for job in jobs
+            }
+            for future in as_completed(futures):
+                job = futures[future]
+                try:
+                    inventory_by_job[job["job_id"]] = future.result()
+                except BaseException as error:  # drain every in-flight transfer
+                    failures.append(f"{job['job_id']}: {error}")
+        if failures:
+            raise FinalizerError(
+                "parallel harvest failed; completed jobs are resumable: "
+                + "; ".join(sorted(failures))
+            )
+        inventory = [inventory_by_job[job["job_id"]] for job in jobs]
+    finally:
+        os.close(lock_descriptor)
     receipt_value = {
         "schema_version": RECEIPT_SCHEMA,
         "classification": LABEL,
         "production_eligible": False,
         "arm_id": plan["arm_id"],
         "plan_sha256": plan["plan_sha256"],
+        "remote_completion_sha256": _digest(completion),
         "jobs": inventory,
         "jobs_sha256": _digest(inventory),
     }
@@ -773,6 +943,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     h.add_argument("--plan", required=True)
     h.add_argument("--destination", required=True)
     h.add_argument("--ssh-command", default="ssh")
+    h.add_argument("--parallelism", type=int, default=10)
+    w = sub.add_parser("wait-ready")
+    w.add_argument("--plan", required=True)
+    w.add_argument("--ssh-command", default="ssh")
+    w.add_argument("--poll-seconds", type=float, default=30.0)
+    w.add_argument("--timeout-seconds", type=float, default=0.0)
     f = sub.add_parser("finalize")
     f.add_argument("--plan", required=True)
     f.add_argument("--current-root", required=True)
@@ -789,7 +965,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         elif args.command == "harvest":
             result = harvest(
-                Path(args.plan), Path(args.destination), args.ssh_command.split()
+                Path(args.plan),
+                Path(args.destination),
+                shlex.split(args.ssh_command),
+                parallelism=args.parallelism,
+            )
+        elif args.command == "wait-ready":
+            result = wait_ready(
+                Path(args.plan),
+                shlex.split(args.ssh_command),
+                poll_seconds=args.poll_seconds,
+                timeout_seconds=args.timeout_seconds,
             )
         else:
             result = finalize(

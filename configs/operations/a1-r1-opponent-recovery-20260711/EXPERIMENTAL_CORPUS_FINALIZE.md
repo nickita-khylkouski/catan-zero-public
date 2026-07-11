@@ -21,7 +21,8 @@ python3 tools/a1_experimental_corpus_finalizer.py plan \
 python3 tools/a1_experimental_corpus_finalizer.py harvest \
   --plan "$FINAL_ROOT/n128.plan.json" \
   --destination "$FINAL_ROOT/n128.recovery-harvest" \
-  --ssh-command "$HOME/a1_h100_ssh"
+  --ssh-command "$HOME/a1_h100_ssh" \
+  --parallelism 10
 
 python3 tools/a1_experimental_corpus_finalizer.py finalize \
   --plan "$FINAL_ROOT/n128.plan.json" \
@@ -36,3 +37,22 @@ enforces the 112k/21k/7k or 44.8k/8.4k/2.8k category quotas, rejects duplicate
 seeds and non-public-information rows, hashes every shard, and writes an exact
 game-level validation lock. It never promotes, changes the champion, or alters
 the canonical production campaign.
+
+`harvest` independently verifies that all 28 arm lanes (56 jobs) have complete,
+zero-return-code remote receipts before it transfers a byte. To wait and trigger
+harvest only after readiness:
+
+```bash
+python3 tools/a1_experimental_corpus_finalizer.py wait-ready \
+  --plan "$FINAL_ROOT/n128.plan.json" \
+  --ssh-command "$HOME/a1_h100_ssh" \
+  --poll-seconds 30 --timeout-seconds 21600 \
+&& python3 tools/a1_experimental_corpus_finalizer.py harvest \
+  --plan "$FINAL_ROOT/n128.plan.json" \
+  --destination "$FINAL_ROOT/n128.recovery-harvest" \
+  --ssh-command "$HOME/a1_h100_ssh" --parallelism 10
+```
+
+Transfers use independent incoming directories and receipts. A failure never
+publishes the aggregate harvest receipt; rerunning resumes verified completed
+jobs and retries only missing work.
