@@ -238,6 +238,23 @@ def test_resume_skips_hosts_already_receipted(
     assert len(fleet[-1].read_text().splitlines()) == 9
 
 
+def test_resume_recovers_atomic_job_directory_before_state_receipt(
+    fleet, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("FAKE_FAIL_HOST", "h1")
+    with pytest.raises(harvest.HarvestError):
+        _run(fleet, tmp_path)
+    stage = next(tmp_path.glob(".published.harvest-*.staging"))
+    orphan_state = next((stage / "state").glob("w00__*.json"))
+    orphan_state.unlink()
+    monkeypatch.delenv("FAKE_FAIL_HOST")
+
+    result = _run(fleet, tmp_path)
+
+    assert result["job_count"] == 120
+    assert len(fleet[-1].read_text().splitlines()) == 9
+
+
 def test_resume_refuses_corrupt_staged_bytes(
     fleet, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

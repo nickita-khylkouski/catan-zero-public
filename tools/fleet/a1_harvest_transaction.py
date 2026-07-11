@@ -293,7 +293,25 @@ def _write_exclusive_json(path: Path, payload: dict[str, Any]) -> None:
 def _verify_state(
     state_path: Path, job_dir: Path, job: Mapping[str, Any], lock: Mapping[str, Any]
 ) -> list[dict[str, Any]] | None:
-    if not state_path.is_file() or not job_dir.is_dir():
+    state_exists = state_path.is_file()
+    job_exists = job_dir.is_dir() and not job_dir.is_symlink()
+    if state_exists and not job_exists:
+        raise HarvestError(f"resume state has no staged bytes for {job['job_id']}")
+    if job_exists and not state_exists:
+        # os.replace publishes a complete directory atomically. A crash in the
+        # tiny interval before its state receipt is therefore safely replayable
+        # by re-inventorying those already-local bytes.
+        inventory = _inventory_job(job_dir, job, lock)
+        recovered = {
+            "schema_version": STATE_SCHEMA,
+            "job_id": job["job_id"],
+            "host_alias": job["host_alias"],
+            "inventory": inventory,
+            "inventory_sha256": _value_sha256(inventory),
+        }
+        _write_exclusive_json(state_path, recovered)
+        return inventory
+    if not state_exists:
         return None
     state = _load_json(state_path)
     inventory = _inventory_job(job_dir, job, lock)
@@ -471,6 +489,26 @@ def harvest(
         path.mkdir(parents=True, exist_ok=True)
         if path.is_symlink() or not path.is_dir() or path.resolve() != path.absolute():
             raise HarvestError(f"unsafe harvest staging directory {path}")
+    staged_map = payload / "relocation_map.json"
+    staged_receipt = payload / "harvest_receipt.json"
+    if staged_map.exists() != staged_receipt.exists():
+        raise HarvestError("staging contains a partial final harvest receipt")
+    if staged_map.exists():
+        result = _validate_published(
+            payload,
+            lock=lock,
+            rendered=rendered,
+            lock_path=lock_path,
+            render_path=render_path,
+        )
+        _atomic_publish_noreplace(payload, destination)
+        parent_fd = os.open(destination.parent, os.O_RDONLY)
+        try:
+            os.fsync(parent_fd)
+        finally:
+            os.close(parent_fd)
+        shutil.rmtree(stage, ignore_errors=True)
+        return result
 
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for job in jobs:
