@@ -1,12 +1,29 @@
 from __future__ import annotations
 
-import json
 import hashlib
+import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from tools.fleet import a1_experimental_opponent_recovery as recovery
+
+
+def test_remote_python_streams_large_program_over_stdin(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_run(argv, **kwargs):
+        captured["argv"] = argv
+        captured.update(kwargs)
+        return SimpleNamespace(stdout='{"ok": true}')
+
+    monkeypatch.setattr(recovery.subprocess, "run", fake_run)
+    program = "#" * (3 * 1024 * 1024)
+    assert recovery._remote_python(["ssh", "host"], program) == {"ok": True}  # noqa: SLF001
+    assert captured["input"] == program
+    assert program not in " ".join(captured["argv"])
+    assert captured["argv"][-1] == "ulimit -n 65536; exec python3 -"
 
 
 def _json(path: Path, value: dict) -> None:

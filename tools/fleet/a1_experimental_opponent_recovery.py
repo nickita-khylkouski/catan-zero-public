@@ -660,11 +660,15 @@ def _scp_base(fleet: dict[str, Any], ssh_key: Path | None) -> list[str]:
 
 
 def _remote_python(base: list[str], program: str) -> Any:
+    # Stream the program over stdin.  The sealed runtime/tree and append-only
+    # ledger checks can be larger than Linux's argv limit; passing them through
+    # ``python -c`` made a valid 56-lane launch fail before preflight.
     result = subprocess.run(
-        [*base, "ulimit -n 65536; exec python3 -c " + shlex.quote(program)],
+        [*base, "ulimit -n 65536; exec python3 -"],
         check=True,
         text=True,
         capture_output=True,
+        input=program,
     )
     return json.loads(result.stdout)
 
