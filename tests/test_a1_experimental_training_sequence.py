@@ -21,6 +21,7 @@ def _config(tmp_path: Path) -> Path:
     python = tmp_path / "python"
     executor = tmp_path / "executor.py"
     python.write_text("python")
+    python.chmod(0o755)
     executor.write_text("executor")
     rows = []
     for arm in sequence.ARMS:
@@ -65,6 +66,26 @@ def test_plan_requires_ready_and_reviewed_lock_bytes(tmp_path: Path) -> None:
     Path(json.loads(config.read_text())["arms"][0]["learner_lock"]).write_text("drift")
     with pytest.raises(sequence.SequenceError, match="reviewed SHA-256"):
         sequence.build_plan(config)
+
+
+def test_plan_preserves_lexical_virtualenv_python_symlink(tmp_path: Path) -> None:
+    """Do not resolve venv/bin/python to a dependency-free base interpreter."""
+    config = _config(tmp_path)
+    value = json.loads(config.read_text())
+    base = tmp_path / "base-python-without-torch"
+    base.write_text("#!/bin/sh\nexit 1\n")
+    base.chmod(0o755)
+    venv_bin = tmp_path / "venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    lexical = venv_bin / "python"
+    lexical.symlink_to(base)
+    value["python"] = str(lexical)
+    config.write_text(json.dumps(value))
+
+    plan = sequence.build_plan(config)
+
+    assert Path(plan["commands"][0]["argv"][0]) == lexical.absolute()
+    assert Path(plan["commands"][0]["argv"][0]) != base.resolve()
 
 
 def test_plan_refuses_missing_ready_marker(tmp_path: Path) -> None:

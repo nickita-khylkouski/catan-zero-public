@@ -15,9 +15,18 @@ from contextlib import contextmanager
 import fcntl
 import hashlib
 import json
+import os
 from pathlib import Path
 import subprocess
+import sys
 from typing import Any, Callable, Sequence
+
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from tools import a1_one_dose_train as one_dose  # noqa: E402
 
 
 SCHEMA = "a1-experimental-training-sequence-v1"
@@ -73,7 +82,16 @@ def build_plan(config_path: Path) -> dict[str, Any]:
     config = _load_config(config_path)
     root = Path(config["root"]).expanduser().resolve(strict=True)
     marker = _file(root / READY_MARKER, where="training input readiness marker")
-    python = _file(config["python"], where="learner python")
+    # A venv's ``bin/python`` is normally a symlink to its base interpreter.
+    # Resolving that symlink for argv bypasses the adjacent ``pyvenv.cfg`` and
+    # silently loses Torch and the rest of the reviewed learner environment.
+    # Validate the target, but preserve the absolute lexical venv path.
+    try:
+        python = one_dose._lexical_python_executable(  # noqa: SLF001
+            Path(os.fspath(config["python"]))
+        )
+    except one_dose.ExecutorError as error:
+        raise SequenceError(f"cannot validate learner python: {error}") from error
     executor = _file(config["executor"], where="dual-arm executor")
     commands: list[dict[str, Any]] = []
     expected_fields = {
