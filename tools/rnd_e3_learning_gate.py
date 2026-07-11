@@ -140,6 +140,39 @@ def _validate_config(
     )
     if scorer_sha != hashlib.sha256(Path(__file__).read_bytes()).hexdigest():
         raise GateInputError("learning-gate scorer source differs from preregistration")
+    root = Path(__file__).resolve().parents[1]
+    evidence_path = root / "configs/rnd/e3_a1_screen_20260710/evidence_export.v1.json"
+    evidence_file_sha = _sha(
+        gate.get("evidence_export_contract_file_sha256"),
+        field="gate.evidence_export_contract_file_sha256",
+    )
+    if _sha_file(evidence_path) != evidence_file_sha:
+        raise GateInputError("evidence-export contract file differs from preregistration")
+    try:
+        evidence_contract = json.loads(evidence_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise GateInputError("cannot read evidence-export contract") from exc
+    evidence_semantic = dict(evidence_contract)
+    evidence_declared = evidence_semantic.pop("config_sha256", None)
+    expected_evidence_semantic = _sha(
+        gate.get("evidence_export_contract_semantic_sha256"),
+        field="gate.evidence_export_contract_semantic_sha256",
+    )
+    if (
+        evidence_declared != _canonical_sha(evidence_semantic)
+        or evidence_declared != expected_evidence_semantic
+    ):
+        raise GateInputError("evidence-export contract semantic binding is invalid")
+    exporter_sources = {
+        "exporter_source_sha256": root / "tools/rnd_e3_holdout_export.py",
+        "exporter_helper_source_sha256": root / "tools/rnd_topology_holdout_export.py",
+    }
+    expected_exporter_sources: dict[str, str] = {}
+    for field, path in exporter_sources.items():
+        expected = _sha(gate.get(field), field=f"gate.{field}")
+        if evidence_contract.get(field) != expected or _sha_file(path) != expected:
+            raise GateInputError(f"{field} differs from preregistration")
+        expected_exporter_sources[field] = expected
     if (
         comparison.get("primary_reference_arm") != REFERENCE
         or comparison.get("primary_candidate_arms") != list(PRIMARY)
@@ -229,6 +262,9 @@ def _validate_config(
             gate.get("experiment_file_sha256"), field="gate.experiment_file_sha256"
         ),
         "gate_config_sha256": gate_declared,
+        "evidence_export_contract_file_sha256": evidence_file_sha,
+        "evidence_export_contract_semantic_sha256": expected_evidence_semantic,
+        **expected_exporter_sources,
         "bootstrap_samples": _positive_int(
             gate.get("bootstrap_samples"), field="gate.bootstrap_samples"
         ),
@@ -383,15 +419,20 @@ def score_learning_gate(
         if not isinstance(raw, Mapping):
             raise GateInputError(f"row {row_number}: record must be an object")
         required = (
-            "arm_id", "training_seed", "game_id", "decision_id", "forced",
+            "schema_version", "arm_id", "training_seed", "game_id", "decision_id", "forced",
             "soft_target_policy_ce", "evaluation_split",
-            "is_training_game", "experiment_config_sha256",
+            "public_masked", "is_training_game", "experiment_config_sha256",
             "corpus_fingerprint", "training_manifest_sha256",
             "validation_manifest_sha256", "run_provenance",
         )
         missing = [field for field in required if field not in raw]
         if missing:
             raise GateInputError(f"row {row_number}: missing fields {missing}")
+        if (
+            raw["schema_version"] != "catan-zero-e3-holdout-evidence/v1"
+            or raw["public_masked"] is not True
+        ):
+            raise GateInputError(f"row {row_number}: evidence schema/public mask is invalid")
         arm, seed = raw["arm_id"], raw["training_seed"]
         if arm not in ARMS or type(seed) is not int or (arm, seed) not in expected_runs:
             raise GateInputError(f"row {row_number}: unregistered arm/seed")
@@ -448,6 +489,9 @@ def score_learning_gate(
             "initial_checkpoint_sha256", "resolved_train_config",
             "resolved_train_config_sha256", "graph_history_features",
             "parameter_count", "optimizer_steps", "global_batch_size", "sample_presentations",
+            "evidence_export_contract_sha256",
+            "evidence_export_contract_semantic_sha256",
+            "exporter_source_sha256", "exporter_helper_source_sha256",
         )
         absent = [field for field in provenance_required if field not in provenance]
         if absent:
@@ -455,8 +499,28 @@ def score_learning_gate(
         for field in (
             "checkpoint_sha256", "training_report_sha256", "admission_manifest_sha256",
             "initial_checkpoint_sha256", "resolved_train_config_sha256",
+            "evidence_export_contract_sha256",
+            "evidence_export_contract_semantic_sha256",
+            "exporter_source_sha256", "exporter_helper_source_sha256",
         ):
             _sha(provenance[field], field=f"run_provenance.{field}", row=row_number)
+        provenance_bindings = {
+            "evidence_export_contract_sha256": contract[
+                "evidence_export_contract_file_sha256"
+            ],
+            "evidence_export_contract_semantic_sha256": contract[
+                "evidence_export_contract_semantic_sha256"
+            ],
+            "exporter_source_sha256": contract["exporter_source_sha256"],
+            "exporter_helper_source_sha256": contract[
+                "exporter_helper_source_sha256"
+            ],
+        }
+        for field, expected in provenance_bindings.items():
+            if provenance[field] != expected:
+                raise GateInputError(
+                    f"row {row_number}: run_provenance.{field} differs from gate"
+                )
         if provenance["initial_checkpoint_sha256"] != registration[
             "initial_checkpoint_sha256_by_arm_seed"
         ][f"{arm}@{seed}"]:

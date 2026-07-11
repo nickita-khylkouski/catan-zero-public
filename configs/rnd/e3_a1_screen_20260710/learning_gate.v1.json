@@ -1,9 +1,13 @@
 {
   "schema_version": "catan-zero-e3-learning-gate-contract/v1",
   "config_sha256_scope": "canonical_json_without_config_sha256",
-  "config_sha256": "4ce69f858af4477efaef4bf28cc9d96cbc1e738ff158f138df1bd273486b32ea",
+  "config_sha256": "93bdc9f4c5716c8319fd25f8f251c4a8cebb8905ddae2d05c6890e9be5975eb0",
   "experiment_semantic_sha256": "39438071adfe706619a97cf5ff5e4036d8b2c0afe45be94064cd63517cc47fba",
   "experiment_file_sha256": "2c67088f844ef058d39dbee549d42c7094fdbde3917e4ee42d277a5da718f6e6",
+  "evidence_export_contract_file_sha256": "aff5f7f107a1b833804204d9d93a6fe9d7f8bd7f359c263aebd739949ce9c79e",
+  "evidence_export_contract_semantic_sha256": "9b9c9c61d4108ea2ca84432e8a119d71681ff8491532f70f5bd6b00b0795baa0",
+  "exporter_source_sha256": "6f153ccb51dfcd979dbb2904d8befe33f8061102988ea4903ca10aa61a8c6773",
+  "exporter_helper_source_sha256": "020664ea3eb8f835945e3a354611a15d3c0d6866f1964f4afcfa07ab46fa12fc",
   "seeds": [11, 29, 47],
   "optimizer_steps": 250,
   "global_batch_size": 4096,
@@ -23,5 +27,5 @@
   "bootstrap_seed": 20260710,
   "uncertainty": "paired_crossed_bootstrap_training_seed_and_common_holdout_game",
   "scorer": "tools/rnd_e3_learning_gate.py",
-  "scorer_source_sha256": "51343b010807949b1fac476f9b72afc70d59cc6a803fa647e2a47a6da75dcd28"
+  "scorer_source_sha256": "e259069c5b49876b05e64a5d1bae183e12f5bced04f21cc41e2f4adeb5a00334"
 }

@@ -14,6 +14,9 @@ from tools.rnd_e3_learning_gate import GateInputError, main, score_learning_gate
 ROOT = Path(__file__).resolve().parents[1]
 EXPERIMENT_PATH = ROOT / "configs/rnd/e3_a1_screen_20260710/experiment.registered.json"
 GATE_PATH = ROOT / "configs/rnd/e3_a1_screen_20260710/learning_gate.v1.json"
+EVIDENCE_CONTRACT_PATH = (
+    ROOT / "configs/rnd/e3_a1_screen_20260710/evidence_export.v1.json"
+)
 
 
 def _canonical_sha(value) -> str:
@@ -58,6 +61,10 @@ def _resolved(arm: dict) -> dict:
 
 def _rows(experiment: dict, file_sha: str, ce_fn=None, game_sizes=(2, 2, 2)) -> list[dict]:
     registration = experiment["registration"]
+    evidence_contract = json.loads(EVIDENCE_CONTRACT_PATH.read_text())
+    evidence_contract_file_sha = hashlib.sha256(
+        EVIDENCE_CONTRACT_PATH.read_bytes()
+    ).hexdigest()
     arms = {item["arm_id"]: item for item in experiment["arms"]}
     default_ce = {
         "rrt-k0": 0.80,
@@ -80,6 +87,16 @@ def _rows(experiment: dict, file_sha: str, ce_fn=None, game_sizes=(2, 2, 2)) -> 
                 "resolved_train_config": resolved,
                 "resolved_train_config_sha256": _canonical_sha(resolved),
                 "graph_history_features": True,
+                "evidence_export_contract_sha256": evidence_contract_file_sha,
+                "evidence_export_contract_semantic_sha256": evidence_contract[
+                    "config_sha256"
+                ],
+                "exporter_source_sha256": evidence_contract[
+                    "exporter_source_sha256"
+                ],
+                "exporter_helper_source_sha256": evidence_contract[
+                    "exporter_helper_source_sha256"
+                ],
                 "parameter_count": arm_config["expected_parameters"],
                 "optimizer_steps": 250,
                 "global_batch_size": 4096,
@@ -95,6 +112,7 @@ def _rows(experiment: dict, file_sha: str, ce_fn=None, game_sizes=(2, 2, 2)) -> 
                     )
                     rows.append(
                         {
+                            "schema_version": "catan-zero-e3-holdout-evidence/v1",
                             "arm_id": arm,
                             "training_seed": seed,
                             "game_id": game,
@@ -102,6 +120,7 @@ def _rows(experiment: dict, file_sha: str, ce_fn=None, game_sizes=(2, 2, 2)) -> 
                             "forced": False,
                             "soft_target_policy_ce": ce,
                             "evaluation_split": "holdout",
+                            "public_masked": True,
                             "is_training_game": False,
                             "experiment_config_sha256": file_sha,
                             "corpus_fingerprint": registration["corpus_fingerprint"],
@@ -190,6 +209,19 @@ def test_rejects_provenance_or_gate_binding_drift() -> None:
         score_learning_gate(
             rows, experiment, gate,
             experiment_config_sha256=file_sha, bootstrap_samples=200,
+        )
+    source_drift = _rows(experiment, file_sha)
+    source_drift[0]["run_provenance"] = dict(
+        source_drift[0]["run_provenance"]
+    )
+    source_drift[0]["run_provenance"]["exporter_helper_source_sha256"] = "0" * 64
+    with pytest.raises(GateInputError, match="exporter_helper_source_sha256"):
+        score_learning_gate(
+            source_drift,
+            experiment,
+            gate,
+            experiment_config_sha256=file_sha,
+            bootstrap_samples=200,
         )
     bad_gate = copy.deepcopy(gate)
     bad_gate["experiment_file_sha256"] = "f" * 64
