@@ -1,0 +1,261 @@
+{
+  "exclusive_categories": [
+    {
+      "category": "evaluator_queue_idle",
+      "pct": 65.95652173913044,
+      "samples": 4551
+    },
+    {
+      "category": "feature_encoding_and_leaf_ffi",
+      "pct": 34.5679012345679,
+      "samples": 812
+    },
+    {
+      "category": "python_mcts_traversal",
+      "pct": 34.312473392933164,
+      "samples": 806
+    },
+    {
+      "category": "neural_evaluator_wait",
+      "pct": 20.391656023839932,
+      "samples": 479
+    },
+    {
+      "category": "neural_forward",
+      "pct": 7.960834397616007,
+      "samples": 187
+    },
+    {
+      "category": "other_rust_ffi",
+      "pct": 1.7454235845040442,
+      "samples": 41
+    },
+    {
+      "category": "other_runtime",
+      "pct": 1.0217113665389528,
+      "samples": 24
+    }
+  ],
+  "inclusive_hotspots": [
+    {
+      "frame": "<module> (/home/ubuntu/catan-profile-c807874/tools/gumbel_search_cross_net_h2h.py:1743)",
+      "pct_main_thread": 100.0,
+      "samples": 2349
+    },
+    {
+      "frame": "_worker_entry (/home/ubuntu/catan-profile-c807874/tools/gumbel_search_cross_net_h2h.py:531)",
+      "pct_main_thread": 99.65942954448701,
+      "samples": 2341
+    },
+    {
+      "frame": "main (/home/ubuntu/catan-profile-c807874/tools/gumbel_search_cross_net_h2h.py:1445)",
+      "pct_main_thread": 99.65942954448701,
+      "samples": 2341
+    },
+    {
+      "frame": "_run_worker (/home/ubuntu/catan-profile-c807874/tools/gumbel_search_cross_net_h2h.py:938)",
+      "pct_main_thread": 96.72200936568753,
+      "samples": 2272
+    },
+    {
+      "frame": "search (/home/ubuntu/catan-profile-c807874/src/catan_zero/search/gumbel_chance_mcts.py:788)",
+      "pct_main_thread": 94.21030225627926,
+      "samples": 2213
+    },
+    {
+      "frame": "play_one_h2h_game (/home/ubuntu/catan-profile-c807874/tools/gumbel_search_cross_net_h2h.py:434)",
+      "pct_main_thread": 94.21030225627926,
+      "samples": 2213
+    },
+    {
+      "frame": "_search_information_set (/home/ubuntu/catan-profile-c807874/src/catan_zero/search/gumbel_chance_mcts.py:893)",
+      "pct_main_thread": 93.65687526607067,
+      "samples": 2200
+    },
+    {
+      "frame": "_run_root_search (/home/ubuntu/catan-profile-c807874/src/catan_zero/search/gumbel_chance_mcts.py:1247)",
+      "pct_main_thread": 87.9948914431673,
+      "samples": 2067
+    },
+    {
+      "frame": "_search_single_world (/home/ubuntu/catan-profile-c807874/src/catan_zero/search/gumbel_chance_mcts.py:1038)",
+      "pct_main_thread": 87.9948914431673,
+      "samples": 2067
+    },
+    {
+      "frame": "_simulate (/home/ubuntu/catan-profile-c807874/src/catan_zero/search/gumbel_chance_mcts.py:1811)",
+      "pct_main_thread": 73.9463601532567,
+      "samples": 1737
+    },
+    {
+      "frame": "0x723798029d90 (/usr/lib/x86_64-linux-gnu/libc.so.6)",
+      "pct_main_thread": 66.24095359727544,
+      "samples": 1556
+    },
+    {
+      "frame": "_traverse_single_sample (/home/ubuntu/catan-profile-c807874/src/catan_zero/search/gumbel_chance_mcts.py:1969)",
+      "pct_main_thread": 66.11323967645806,
+      "samples": 1553
+    },
+    {
+      "frame": "_expand (/home/ubuntu/catan-profile-c807874/src/catan_zero/search/gumbel_chance_mcts.py:2257)",
+      "pct_main_thread": 45.84929757343551,
+      "samples": 1077
+    },
+    {
+      "frame": "_simulate (/home/ubuntu/catan-profile-c807874/src/catan_zero/search/gumbel_chance_mcts.py:1809)",
+      "pct_main_thread": 33.92933163048106,
+      "samples": 797
+    },
+    {
+      "frame": "0x723798091117 (/usr/lib/x86_64-linux-gnu/libc.so.6)",
+      "pct_main_thread": 25.54278416347382,
+      "samples": 600
+    },
+    {
+      "frame": "_simulate (/home/ubuntu/catan-profile-c807874/src/catan_zero/search/gumbel_chance_mcts.py:1771)",
+      "pct_main_thread": 25.329927628778204,
+      "samples": 595
+    },
+    {
+      "frame": "_simulate (/home/ubuntu/catan-profile-c807874/src/catan_zero/search/gumbel_chance_mcts.py:1758)",
+      "pct_main_thread": 21.20051085568327,
+      "samples": 498
+    },
+    {
+      "frame": "lock_PyThread_acquire_lock (/home/ubuntu/.local/share/uv/python/cpython-3.11.15-linux-x86_64-gnu/bin/python3.11)",
+      "pct_main_thread": 20.434227330779056,
+      "samples": 480
+    },
+    {
+      "frame": "evaluate (/home/ubuntu/catan-profile-c807874/src/catan_zero/search/neural_rust_mcts.py:1057)",
+      "pct_main_thread": 20.434227330779056,
+      "samples": 480
+    },
+    {
+      "frame": "wait (/home/ubuntu/.local/share/uv/python/cpython-3.11.15-linux-x86_64-gnu/lib/python3.11/threading.py:327)",
+      "pct_main_thread": 20.391656023839932,
+      "samples": 479
+    },
+    {
+      "frame": "wait (/home/ubuntu/.local/share/uv/python/cpython-3.11.15-linux-x86_64-gnu/lib/python3.11/threading.py:629)",
+      "pct_main_thread": 20.391656023839932,
+      "samples": 479
+    },
+    {
+      "frame": "0x72379809cc78 (/usr/lib/x86_64-linux-gnu/libc.so.6)",
+      "pct_main_thread": 20.391656023839932,
+      "samples": 479
+    },
+    {
+      "frame": "PyThread_acquire_lock_timed (/home/ubuntu/.local/share/uv/python/cpython-3.11.15-linux-x86_64-gnu/bin/python3.11)",
+      "pct_main_thread": 20.391656023839932,
+      "samples": 479
+    },
+    {
+      "frame": "_evaluate_many_checked (/home/ubuntu/catan-profile-c807874/src/catan_zero/search/gumbel_chance_mcts.py:748)",
+      "pct_main_thread": 19.07194550872712,
+      "samples": 448
+    },
+    {
+      "frame": "_traverse_robber_or_dev (/home/ubuntu/catan-profile-c807874/src/catan_zero/search/gumbel_chance_mcts.py:2092)",
+      "pct_main_thread": 18.773946360153257,
+      "samples": 441
+    },
+    {
+      "frame": "_simulate (/home/ubuntu/catan-profile-c807874/src/catan_zero/search/gumbel_chance_mcts.py:1799)",
+      "pct_main_thread": 17.624521072796934,
+      "samples": 414
+    },
+    {
+      "frame": "rust_game_to_entity_batch (/home/ubuntu/catan-profile-c807874/src/catan_zero/search/neural_rust_mcts.py:1334)",
+      "pct_main_thread": 16.219667943805874,
+      "samples": 381
+    },
+    {
+      "frame": "_traverse_single_sample (/home/ubuntu/catan-profile-c807874/src/catan_zero/search/gumbel_chance_mcts.py:1957)",
+      "pct_main_thread": 16.219667943805874,
+      "samples": 381
+    },
+    {
+      "frame": "_spectrum (/home/ubuntu/catan-profile-c807874/src/catan_zero/search/rust_mcts.py:545)",
+      "pct_main_thread": 15.836526181353767,
+      "samples": 372
+    },
+    {
+      "frame": "_simulate (/home/ubuntu/catan-profile-c807874/src/catan_zero/search/gumbel_chance_mcts.py:1770)",
+      "pct_main_thread": 15.112813963388676,
+      "samples": 355
+    },
+    {
+      "frame": "_traverse_roll (/home/ubuntu/catan-profile-c807874/src/catan_zero/search/gumbel_chance_mcts.py:1931)",
+      "pct_main_thread": 14.431673052362708,
+      "samples": 339
+    },
+    {
+      "frame": "_enumerate_roll_outcomes (/home/ubuntu/catan-profile-c807874/src/catan_zero/search/gumbel_chance_mcts.py:1881)",
+      "pct_main_thread": 13.282247765006385,
+      "samples": 312
+    },
+    {
+      "frame": "malloc (/usr/lib/x86_64-linux-gnu/libc.so.6)",
+      "pct_main_thread": 12.303107705406555,
+      "samples": 289
+    },
+    {
+      "frame": "evaluate (/home/ubuntu/catan-profile-c807874/src/catan_zero/search/neural_rust_mcts.py:1018)",
+      "pct_main_thread": 10.983397190293742,
+      "samples": 258
+    },
+    {
+      "frame": "_fetch_leaf_decision_inputs (/home/ubuntu/catan-profile-c807874/src/catan_zero/search/neural_rust_mcts.py:187)",
+      "pct_main_thread": 10.344827586206897,
+      "samples": 243
+    },
+    {
+      "frame": "_traverse_robber_or_dev (/home/ubuntu/catan-profile-c807874/src/catan_zero/search/gumbel_chance_mcts.py:2069)",
+      "pct_main_thread": 9.876543209876543,
+      "samples": 232
+    },
+    {
+      "frame": "loads (/home/ubuntu/.local/share/uv/python/cpython-3.11.15-linux-x86_64-gnu/lib/python3.11/json/__init__.py:346)",
+      "pct_main_thread": 9.40825883354619,
+      "samples": 221
+    },
+    {
+      "frame": "evaluate (/home/ubuntu/catan-profile-c807874/src/catan_zero/search/neural_rust_mcts.py:953)",
+      "pct_main_thread": 9.365687526607067,
+      "samples": 220
+    },
+    {
+      "frame": "decode (/home/ubuntu/.local/share/uv/python/cpython-3.11.15-linux-x86_64-gnu/lib/python3.11/json/decoder.py:337)",
+      "pct_main_thread": 9.280544912728821,
+      "samples": 218
+    },
+    {
+      "frame": "_fetch_legal_actions (/home/ubuntu/catan-profile-c807874/src/catan_zero/search/gumbel_chance_mcts.py:2207)",
+      "pct_main_thread": 8.641975308641975,
+      "samples": 203
+    }
+  ],
+  "samples_main_thread": 2349,
+  "samples_total_all_threads": 6900,
+  "source": "/tmp/internal-wall.raw",
+  "threads": [
+    {
+      "pct_all_threads": 34.04347826086956,
+      "samples": 2349,
+      "thread": "thread (172889): MainThread"
+    },
+    {
+      "pct_all_threads": 33.028985507246375,
+      "samples": 2279,
+      "thread": "thread (172961): rust-mcts-batched-evaluator"
+    },
+    {
+      "pct_all_threads": 32.927536231884055,
+      "samples": 2272,
+      "thread": "thread (172962): rust-mcts-batched-evaluator"
+    }
+  ]
+}
