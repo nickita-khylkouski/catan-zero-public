@@ -150,9 +150,10 @@ Tracked visual evidence:
 - Removing both measured Python buckets has a 3.22x internal ceiling before
   neural evaluation becomes dominant.  The corresponding external ceiling is
   2.61x; removing bridge sync as well raises it to about 3.0x.
-- The existing Rust featurizer already realizes a measured 1.41–1.44x leaf
-  gain.  Production evaluation should expose it only after exact output/parity
-  tests prove it preserves every feature and action-row invariant.
+- The Rust featurizer realizes a measured 1.41–1.44x leaf gain and is now
+  exposed behind an explicit, provenance-bearing opt-in.  Exact feature,
+  action-row, native-search, and fresh-wheel parity gates must remain green
+  before that opt-in is enabled by a sealed production contract.
 - After the traversal/feature port, optimize neural batching rather than raw
   GPU count.  A one-worker canary uses only a small fraction of a B200; worker
   packing is what turns that headroom into throughput.
