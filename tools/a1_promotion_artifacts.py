@@ -110,41 +110,6 @@ def _bound_file_ref(raw: Any, *, base: Path, where: str) -> tuple[Path, dict[str
     return path.resolve(), expected
 
 
-def _historical_checkpoint_path(
-    raw: Any, *, report_path: Path, champion: Path
-) -> Path:
-    """Resolve a historical checkpoint without consulting the process cwd."""
-
-    if not isinstance(raw, str) or not raw:
-        raise ArtifactBuildError("historical report checkpoint must be a path")
-    declared = Path(raw).expanduser()
-    if ".." in declared.parts:
-        raise ArtifactBuildError("historical report checkpoint contains traversal")
-
-    if declared.is_absolute():
-        if (
-            not declared.is_file()
-            or declared.is_symlink()
-            or declared != champion
-        ):
-            raise ArtifactBuildError("historical report does not bind the incumbent")
-        return champion
-
-    matches: list[Path] = []
-    for base in (report_path.parent, *report_path.parent.parents):
-        candidate = base / declared
-        if candidate.is_file() and not candidate.is_symlink():
-            matches.append(candidate)
-    if len(matches) != 1:
-        qualifier = "ambiguous" if matches else "unresolvable"
-        raise ArtifactBuildError(
-            f"historical report checkpoint is {qualifier} relative to report ancestors"
-        )
-    if matches[0] != champion:
-        raise ArtifactBuildError("historical report does not bind the incumbent")
-    return champion
-
-
 def _paired_game_identity(game: Any, *, index: int, where: str) -> tuple[int, str]:
     if not isinstance(game, dict):
         raise ArtifactBuildError(f"{where}[{index}] must be an object")
@@ -844,9 +809,15 @@ def build_legacy_incumbent_calibration_source(
         raise ArtifactBuildError("champion is not the contract-bound producer")
     report_path = historical_training_report.expanduser().resolve()
     historical = _load_json(report_path)
-    _historical_checkpoint_path(
-        historical.get("checkpoint"), report_path=report_path, champion=champion
-    )
+    try:
+        promotion._historical_checkpoint_path(  # noqa: SLF001
+            historical.get("checkpoint"),
+            report_path=report_path,
+            checkpoint=champion,
+            where="historical report checkpoint",
+        )
+    except promotion.PromotionError as error:
+        raise ArtifactBuildError(str(error)) from error
     _positive_int(
         historical.get("steps_completed"), where="historical report.steps_completed"
     )

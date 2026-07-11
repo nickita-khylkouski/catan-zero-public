@@ -10,6 +10,7 @@ import pytest
 import numpy as np
 
 from tools import a1_promotion_transaction as promotion
+from tools import a1_promotion_artifacts as artifacts
 from tools import a1_one_dose_train as one_dose
 from tools.champion_registry import ChampionRegistry
 from tools.high_regret_suite_contract import REPLAY_CONTRACT, scope_inventory_sha256
@@ -207,9 +208,16 @@ def _write_evidence_envelope(
     _write_json(path, payload)
 
 
-def _fixture(tmp_path: Path, *, promotion_count: int = 0, n_full: int = 128) -> dict:
-    champion = tmp_path / "champion.pt"
+def _fixture(
+    tmp_path: Path,
+    *,
+    promotion_count: int = 0,
+    n_full: int = 128,
+    champion: Path | None = None,
+) -> dict:
+    champion = champion or tmp_path / "champion.pt"
     candidate = tmp_path / "candidate.pt"
+    champion.parent.mkdir(parents=True, exist_ok=True)
     champion.write_bytes(b"incumbent checkpoint")
     candidate.write_bytes(b"candidate checkpoint")
     registry_path = tmp_path / "registry.json"
@@ -1397,6 +1405,63 @@ def test_exact_contract_incumbent_accepts_typed_legacy_calibration_bridge(
 ) -> None:
     fixture = _fixture(tmp_path)
     _install_legacy_incumbent_bridge(fixture, tmp_path)
+
+    plan = _execute(fixture, go=False)
+
+    assert plan["status"] == "dry_run"
+
+
+def test_artifact_built_real_gen3_relative_bridge_passes_promotion_from_other_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    champion = tmp_path / "runs" / "bc" / "gen3_20260706" / "checkpoint.pt"
+    fixture = _fixture(tmp_path, champion=champion)
+    historical = tmp_path / "reports" / "archive" / "gen3-training-report.json"
+    historical.parent.mkdir(parents=True)
+    _write_json(
+        historical,
+        {
+            "checkpoint": "runs/bc/gen3_20260706/checkpoint.pt",
+            "checkpoint_sha256": promotion._sha256(champion),
+            "steps_completed": 912,
+            "epochs": 1,
+        },
+    )
+    adjudication = json.loads(fixture["adjudication"].read_text())
+    evidence_ref = next(
+        item
+        for item in adjudication["evidence"]
+        if item["kind"] == "mechanism_calibration"
+    )
+    envelope = json.loads(Path(evidence_ref["path"]).read_text())
+    source_ref = next(
+        item for item in envelope["sources"] if item["role"] == "champion_calibration"
+    )
+    source_path = Path(source_ref["path"])
+    calibration = json.loads(source_path.read_text())
+    calibration["readout_provenance"]["optimizer_steps"] = None
+    calibration["readout_provenance"]["completed_epochs"] = None
+    _write_json(source_path, calibration)
+    built = artifacts.build_legacy_incumbent_calibration_source(
+        calibration_path=source_path,
+        historical_training_report=historical,
+        contract=fixture["contract"],
+        champion=champion,
+    )
+
+    def install_built_bridge(source: dict) -> None:
+        source.clear()
+        source.update(built)
+
+    _mutate_evidence_source(
+        fixture,
+        kind="mechanism_calibration",
+        role="champion_calibration",
+        mutate=install_built_bridge,
+    )
+    unrelated_cwd = tmp_path / "unrelated-cwd"
+    unrelated_cwd.mkdir()
+    monkeypatch.chdir(unrelated_cwd)
 
     plan = _execute(fixture, go=False)
 

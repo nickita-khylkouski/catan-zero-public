@@ -624,6 +624,50 @@ def test_legacy_incumbent_builder_refuses_traversal_and_unrelated_suffixes(
         )
 
 
+def test_legacy_incumbent_builder_refuses_adjacent_bare_checkpoint_name(
+    tmp_path: Path,
+) -> None:
+    champion, calibration, historical, contract = _legacy_incumbent_inputs(
+        tmp_path, historical_checkpoint="checkpoint.pt"
+    )
+    adjacent_report = champion.with_name("gen3-training-report.json")
+    historical.replace(adjacent_report)
+
+    with pytest.raises(artifacts.ArtifactBuildError, match="multi-component"):
+        artifacts.build_legacy_incumbent_calibration_source(
+            calibration_path=calibration,
+            historical_training_report=adjacent_report,
+            contract=contract,
+            champion=champion,
+        )
+
+
+@pytest.mark.parametrize("link_kind", ["final", "ancestor"])
+def test_legacy_incumbent_builder_refuses_symlinked_relative_matches(
+    tmp_path: Path, link_kind: str
+) -> None:
+    declared = "runs/bc/gen3_20260706/checkpoint.pt"
+    champion, calibration, historical, contract = _legacy_incumbent_inputs(
+        tmp_path, historical_checkpoint=declared
+    )
+    decoy_root = historical.parent
+    if link_kind == "final":
+        link = decoy_root / declared
+        link.parent.mkdir(parents=True)
+        link.symlink_to(champion)
+    else:
+        link = decoy_root / "runs"
+        link.symlink_to(tmp_path / "runs", target_is_directory=True)
+
+    with pytest.raises(artifacts.ArtifactBuildError, match="must not contain symlinks"):
+        artifacts.build_legacy_incumbent_calibration_source(
+            calibration_path=calibration,
+            historical_training_report=historical,
+            contract=contract,
+            champion=champion,
+        )
+
+
 def test_legacy_incumbent_builder_refuses_ambiguous_ancestor_matches(
     tmp_path: Path,
 ) -> None:

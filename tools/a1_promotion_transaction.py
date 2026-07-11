@@ -206,6 +206,40 @@ def _canonical_existing_file(path: Path, *, where: str) -> Path:
     return resolved
 
 
+def _historical_checkpoint_path(
+    raw: Any, *, report_path: Path, checkpoint: Path, where: str
+) -> Path:
+    """Resolve a historical checkpoint against one unique report ancestor."""
+
+    if not isinstance(raw, str) or not raw.strip():
+        raise PromotionError(f"{where} must be a path")
+    declared = Path(raw).expanduser()
+    if ".." in declared.parts:
+        raise PromotionError(f"{where} contains traversal")
+
+    if declared.is_absolute():
+        resolved = _canonical_existing_file(declared, where=where)
+        if resolved != checkpoint:
+            raise PromotionError(f"{where} does not bind the incumbent checkpoint")
+        return resolved
+
+    clean_parts = tuple(part for part in declared.parts if part not in {"", "."})
+    if len(clean_parts) < 2:
+        raise PromotionError(f"{where} must be a multi-component relative path")
+
+    matches: list[Path] = []
+    for base in (report_path.parent, *report_path.parent.parents):
+        candidate = base.joinpath(*clean_parts)
+        if candidate.exists() or candidate.is_symlink():
+            matches.append(_canonical_existing_file(candidate, where=where))
+    if len(matches) != 1:
+        qualifier = "ambiguous" if matches else "unresolvable"
+        raise PromotionError(f"{where} is {qualifier} relative to report ancestors")
+    if matches[0] != checkpoint:
+        raise PromotionError(f"{where} does not bind the incumbent checkpoint")
+    return matches[0]
+
+
 def _canonical_new_file(path: Path, *, where: str) -> Path:
     """Return a canonical not-yet-existing path under a real directory."""
     lexical = _lexical_absolute(path)
@@ -1311,14 +1345,12 @@ def _verify_calibration_source(
             where=f"{where}.historical_training_report",
         )
         historical = _load_json(report_path)
-        historical_checkpoint = historical.get("checkpoint")
-        if (
-            not isinstance(historical_checkpoint, str)
-            or _absolute(historical_checkpoint, base=report_path.parent) != checkpoint
-        ):
-            raise PromotionError(
-                f"{where} historical report does not bind the incumbent checkpoint"
-            )
+        _historical_checkpoint_path(
+            historical.get("checkpoint"),
+            report_path=report_path,
+            checkpoint=checkpoint,
+            where=f"{where} historical report checkpoint",
+        )
         if (
             historical.get("checkpoint_sha256") is not None
             and historical["checkpoint_sha256"] != checkpoint_sha256
