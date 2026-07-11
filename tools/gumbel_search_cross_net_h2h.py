@@ -54,6 +54,12 @@ from catan_zero.search.neural_rust_mcts import (  # noqa: E402
 )
 from catan_zero.search.rust_mcts import _require_rust_module  # noqa: E402
 from factory_common import write_json  # noqa: E402
+from high_regret_suite_contract import (  # noqa: E402
+    SUITE_SCHEMA,
+    bind_state_to_manifest,
+    load_source_manifest,
+    validate_replay_metadata,
+)
 from sprt_gate import (  # noqa: E402
     GATE_CONFIGS,
     evaluate_pentanomial_sprt,
@@ -106,7 +112,7 @@ def _load_held_out_high_regret_suite(
     if not isinstance(suite, dict) or set(suite) != expected_keys:
         raise ValueError("held-out suite has an unexpected schema")
     if (
-        suite["schema_version"] != "a1-held-out-high-regret-suite-v1"
+        suite["schema_version"] != SUITE_SCHEMA
         or suite["suite"] != "held_out_high_regret"
         or suite["held_out"] is not True
     ):
@@ -133,6 +139,7 @@ def _load_held_out_high_regret_suite(
         or _checkpoint_sha256(source_path) != source_ref["sha256"]
     ):
         raise ValueError("held-out suite source manifest is missing or drifted")
+    shard_paths, manifest_identities = load_source_manifest(source_path)
     selection = suite["selection"]
     states = suite["states"]
     if (
@@ -143,6 +150,7 @@ def _load_held_out_high_regret_suite(
         or selection.get("selected_pairs") != len(states)
     ):
         raise ValueError("held-out suite selection is malformed")
+    validate_replay_metadata(selection, states)
     expected_strata = {
         "phase:opening",
         "phase:robber_dev",
@@ -165,14 +173,18 @@ def _load_held_out_high_regret_suite(
         raise ValueError("held-out suite does not satisfy the fixed stratified policy")
     pairs: list[dict[str, Any]] = []
     pair_ids: set[int] = set()
+    bound_states: list[dict[str, Any]] = []
     for index, raw_state in enumerate(states):
-        if not isinstance(raw_state, dict):
-            raise ValueError(f"held-out suite state {index} is malformed")
-        state = dict(raw_state)
-        shard_path = Path(str(state.get("shard_path", ""))).expanduser()
-        if not shard_path.is_absolute():
-            shard_path = suite_path.parent / shard_path
-        state["shard_path"] = str(shard_path.resolve())
+        try:
+            state = bind_state_to_manifest(
+                raw_state,
+                suite_base=suite_path.parent,
+                manifest_path=source_path,
+                shard_paths=shard_paths,
+                identities=manifest_identities,
+            )
+        except ValueError as error:
+            raise ValueError(f"held-out suite state {index}: {error}") from error
         pair_id = state.get("pair_id")
         game_seed = state.get("game_seed")
         decision_index = state.get("decision_index")
@@ -193,6 +205,7 @@ def _load_held_out_high_regret_suite(
         ):
             raise ValueError(f"held-out suite state {index} lacks valid identity")
         pair_ids.add(pair_id)
+        bound_states.append(state)
         pairs.append(
             {
                 "pair_id": pair_id,
@@ -203,11 +216,13 @@ def _load_held_out_high_regret_suite(
     actual_strata = {
         f"phase:{stratum}": sum(
             _promotion_phase_bucket({str(state.get("phase", ""))}) == stratum
-            for state in states
+            for state in bound_states
         )
         for stratum in ("opening", "robber_dev", "chance", "build_trade")
     }
-    actual_strata["41+"] = sum(state["legal_count"] >= 41 for state in states)
+    actual_strata["41+"] = sum(
+        state["legal_count"] >= 41 for state in bound_states
+    )
     if any(actual_strata[label] < stratum_min_pairs for label in expected_strata):
         raise ValueError("held-out suite retained states do not cover every stratum")
     return suite_path, suite, pairs
@@ -1177,7 +1192,7 @@ def main() -> None:
         default=None,
         help=(
             "Evaluate every archived state in an immutable "
-            "a1-held-out-high-regret-suite-v1 manifest instead of fresh starts; "
+            "a1-held-out-high-regret-suite-v2 manifest instead of fresh starts; "
             "emits a1-held-out-high-regret-report-v1 for promotion replay."
         ),
     )

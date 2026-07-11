@@ -29,10 +29,11 @@ if str(_REPO_ROOT) not in sys.path:
 
 from tools import a1_promotion_transaction as promotion  # noqa: E402
 from tools.champion_registry import ChampionRegistry  # noqa: E402
+from tools.high_regret_suite_contract import REPLAY_CONTRACT, SUITE_SCHEMA  # noqa: E402
 
 
 HIGH_REGRET_REPORT_SCHEMA = "a1-held-out-high-regret-report-v1"
-HIGH_REGRET_SUITE_SCHEMA = "a1-held-out-high-regret-suite-v1"
+HIGH_REGRET_SUITE_SCHEMA = SUITE_SCHEMA
 BUCKET_GAME_REPORT_SCHEMA = "a1-bucket-game-report-v1"
 
 
@@ -409,7 +410,7 @@ def build_held_out_high_regret_suite(
                 "legal_count": int(legal_counts[index]),
                 "regret_score": float(scores[index]),
                 "replay_source": {
-                    "contract": "authoritative-shard-parent-unique-contiguous-prefix-v1",
+                    "contract": REPLAY_CONTRACT,
                     "scope": str(shard_path.resolve().parent),
                 },
             }
@@ -450,8 +451,9 @@ def _replay_complete_manifest_rows(
     The evaluator reconstructs a state by scanning every shard below the
     selected shard's parent directory.  Mirror that contract before sealing:
     the manifest row must bind to the stated source row and its source scope
-    must contain each decision exactly once from zero through the target.
-    Missing, duplicate, or role-filtered partial trajectories fail closed.
+    must contain each decision exactly once from zero through its final row,
+    including the target. Missing, negative, duplicate, or role-filtered
+    partial trajectories fail closed exactly as evaluator replay would.
     """
 
     import numpy as np
@@ -517,9 +519,11 @@ def _replay_complete_manifest_rows(
                 if seed not in targets:
                     continue
                 decision = int(didx[row])
-                if decision >= 0:
-                    per_seed = seed_counts[seed]
-                    per_seed[decision] = per_seed.get(decision, 0) + 1
+                if decision < 0:
+                    malformed.add(seed)
+                    continue
+                per_seed = seed_counts[seed]
+                per_seed[decision] = per_seed.get(decision, 0) + 1
         counts_by_scope[scope] = seed_counts
         malformed_seeds_by_scope[scope] = malformed
 
@@ -561,7 +565,7 @@ def _replay_complete_manifest_rows(
             rejected_noncontiguous += 1
 
     return complete, {
-        "contract": "authoritative-shard-parent-unique-contiguous-prefix-v1",
+        "contract": REPLAY_CONTRACT,
         "candidate_states": len(candidate_indices),
         "replay_complete_states": len(complete),
         "rejected_bad_source": rejected_bad_source,

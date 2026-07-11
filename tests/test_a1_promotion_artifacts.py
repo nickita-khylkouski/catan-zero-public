@@ -204,7 +204,8 @@ def test_held_out_suite_rejects_gaps_duplicates_and_partial_lanes(
     gap_dir = tmp_path / "recent_history_gap"
     duplicate_dir = tmp_path / "hard_negative_duplicate"
     partial_dir = tmp_path / "recent_history_partial"
-    for directory in (valid_dir, gap_dir, duplicate_dir, partial_dir):
+    negative_dir = tmp_path / "hard_negative_negative"
+    for directory in (valid_dir, gap_dir, duplicate_dir, partial_dir, negative_dir):
         directory.mkdir()
 
     valid_seeds = np.arange(20_000, 20_024, dtype=np.int64)
@@ -240,12 +241,31 @@ def test_held_out_suite_rejects_gaps_duplicates_and_partial_lanes(
         decision_index=np.asarray([4, 5], dtype=np.int32),
         action_taken=np.asarray([1, 2], dtype=np.int32),
     )
+    negative_rows = negative_dir / "rows.npz"
+    np.savez(
+        negative_rows,
+        game_seed=np.full(2, 30_004, dtype=np.int64),
+        decision_index=np.asarray([-1, 0], dtype=np.int32),
+        action_taken=np.asarray([1, 2], dtype=np.int32),
+    )
 
-    source_paths = [valid_rows, gap_rows, duplicate_rows, partial_rows]
-    candidate_seeds = list(valid_seeds) + [deep_seed, 30_001, 30_002, 30_003]
-    candidate_decisions = [0] * len(valid_seeds) + [2, 2, 1, 5]
-    candidate_shards = [0] * (len(valid_seeds) + 1) + [1, 2, 3]
-    candidate_rows = list(range(len(valid_seeds))) + [len(valid_seeds) + 2, 1, 2, 1]
+    source_paths = [valid_rows, gap_rows, duplicate_rows, partial_rows, negative_rows]
+    candidate_seeds = list(valid_seeds) + [
+        deep_seed,
+        30_001,
+        30_002,
+        30_003,
+        30_004,
+    ]
+    candidate_decisions = [0] * len(valid_seeds) + [2, 2, 1, 5, 0]
+    candidate_shards = [0] * (len(valid_seeds) + 1) + [1, 2, 3, 4]
+    candidate_rows = list(range(len(valid_seeds))) + [
+        len(valid_seeds) + 2,
+        1,
+        2,
+        1,
+        1,
+    ]
     phases = [
         (
             "BUILD_INITIAL_SETTLEMENT",
@@ -282,9 +302,11 @@ def test_held_out_suite_rejects_gaps_duplicates_and_partial_lanes(
         (state["game_seed"], state["decision_index"]) for state in suite["states"]
     }
     assert (deep_seed, 2) in identities
-    assert not identities.intersection({(30_001, 2), (30_002, 1), (30_003, 5)})
+    assert not identities.intersection(
+        {(30_001, 2), (30_002, 1), (30_003, 5), (30_004, 0)}
+    )
     preflight = suite["selection"]["replay_preflight"]
-    assert preflight["rejected_noncontiguous"] == 3
+    assert preflight["rejected_noncontiguous"] == 4
 
 
 def test_held_out_suite_fails_clearly_when_replay_complete_pool_is_too_small(

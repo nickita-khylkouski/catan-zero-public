@@ -8,8 +8,11 @@ from __future__ import annotations
 
 import sys
 import json
+import copy
 from pathlib import Path
 from types import SimpleNamespace
+
+import numpy as np
 
 _TOOLS_DIR = Path(__file__).resolve().parents[1] / "tools"
 if str(_TOOLS_DIR) not in sys.path:
@@ -32,10 +35,19 @@ from gumbel_search_cross_net_h2h import (  # type: ignore  # noqa: E402
 def test_held_out_suite_loader_replays_digest_and_source_manifest(
     tmp_path: Path,
 ) -> None:
+    shard = tmp_path / "relative-shard.npz"
+    np.savez(shard, game_seed=np.arange(123, 143), decision_index=np.arange(20), action_taken=np.arange(20))
     source = tmp_path / "regret.npz"
-    source.write_bytes(b"manifest")
+    np.savez(
+        source,
+        shard_paths=np.asarray([str(shard)]),
+        shard_id=np.zeros(20, dtype=np.int32),
+        row_index=np.arange(20, dtype=np.int32),
+        game_seed=np.arange(123, 143, dtype=np.int64),
+        decision_index=np.arange(20, dtype=np.int32),
+    )
     suite = {
-        "schema_version": "a1-held-out-high-regret-suite-v1",
+        "schema_version": h2h.SUITE_SCHEMA,
         "suite": "held_out_high_regret",
         "held_out": True,
         "source_manifest": {
@@ -56,10 +68,19 @@ def test_held_out_suite_loader_replays_digest_and_source_manifest(
                 "phase:build_trade": 4,
                 "41+": 4,
             },
+            "replay_preflight": {
+                "contract": "authoritative-shard-parent-unique-contiguous-trajectory-v2",
+                "candidate_states": 20,
+                "replay_complete_states": 20,
+                "rejected_bad_source": 0,
+                "rejected_noncontiguous": 0,
+            },
         },
         "states": [
             {
                 "pair_id": pair,
+                "shard_id": 0,
+                "row_index": pair,
                 "game_seed": 123 + pair,
                 "decision_index": pair,
                 "shard_path": "relative-shard.npz",
@@ -70,6 +91,10 @@ def test_held_out_suite_loader_replays_digest_and_source_manifest(
                     "BUILD_ROAD",
                 )[pair % 4],
                 "legal_count": 54 if pair < 4 else 12,
+                "replay_source": {
+                    "contract": "authoritative-shard-parent-unique-contiguous-trajectory-v2",
+                    "scope": str(tmp_path),
+                },
             }
             for pair in range(20)
         ],
@@ -84,6 +109,7 @@ def test_held_out_suite_loader_replays_digest_and_source_manifest(
     path.write_text(json.dumps(suite), encoding="utf-8")
 
     resolved_path, loaded, pairs = _load_held_out_high_regret_suite(path)
+    sealed_suite = copy.deepcopy(suite)
 
     assert resolved_path == path.resolve()
     assert loaded == suite
@@ -102,6 +128,54 @@ def test_held_out_suite_loader_replays_digest_and_source_manifest(
     import pytest
 
     with pytest.raises(ValueError, match="semantic digest mismatch"):
+        _load_held_out_high_regret_suite(path)
+
+    adversarial = copy.deepcopy(sealed_suite)
+    adversarial["states"][0]["shard_path"] = str(tmp_path / "other.npz")
+    adversarial["suite_sha256"] = (
+        "sha256:"
+        + h2h.hashlib.sha256(
+            json.dumps(
+                {key: value for key, value in adversarial.items() if key != "suite_sha256"},
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+    )
+    path.write_text(json.dumps(adversarial), encoding="utf-8")
+    with pytest.raises(ValueError, match="shard_path differs"):
+        _load_held_out_high_regret_suite(path)
+
+    adversarial = copy.deepcopy(sealed_suite)
+    del adversarial["selection"]["replay_preflight"]
+    adversarial["suite_sha256"] = (
+        "sha256:"
+        + h2h.hashlib.sha256(
+            json.dumps(
+                {key: value for key, value in adversarial.items() if key != "suite_sha256"},
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+    )
+    path.write_text(json.dumps(adversarial), encoding="utf-8")
+    with pytest.raises(ValueError, match="lacks required replay preflight"):
+        _load_held_out_high_regret_suite(path)
+
+    adversarial = copy.deepcopy(sealed_suite)
+    adversarial["states"][0]["game_seed"] += 1
+    adversarial["suite_sha256"] = (
+        "sha256:"
+        + h2h.hashlib.sha256(
+            json.dumps(
+                {key: value for key, value in adversarial.items() if key != "suite_sha256"},
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+    )
+    path.write_text(json.dumps(adversarial), encoding="utf-8")
+    with pytest.raises(ValueError, match="not bound to source manifest row"):
         _load_held_out_high_regret_suite(path)
 
 

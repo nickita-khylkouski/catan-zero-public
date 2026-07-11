@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 
 import pytest
+import numpy as np
 
 from tools import a1_promotion_transaction as promotion
 from tools import a1_one_dose_train as one_dose
@@ -458,8 +459,22 @@ def _fixture(tmp_path: Path, *, promotion_count: int = 0, n_full: int = 128) -> 
         )
         external_sources.append((role, source))
 
+    high_regret_source_shard = tmp_path / "source-shard.npz"
+    np.savez(
+        high_regret_source_shard,
+        game_seed=np.arange(7_000_000, 7_000_200, dtype=np.int64),
+        decision_index=np.arange(200, dtype=np.int32) % 20,
+        action_taken=np.arange(200, dtype=np.int32),
+    )
     high_regret_source_manifest = tmp_path / "high_regret.source.npz"
-    high_regret_source_manifest.write_bytes(b"regret manifest fixture")
+    np.savez(
+        high_regret_source_manifest,
+        shard_paths=np.asarray([str(high_regret_source_shard)]),
+        shard_id=np.zeros(200, dtype=np.int32),
+        row_index=np.arange(200, dtype=np.int32),
+        game_seed=np.arange(7_000_000, 7_000_200, dtype=np.int64),
+        decision_index=np.arange(200, dtype=np.int32) % 20,
+    )
     high_regret_suite = tmp_path / "high_regret.suite.json"
     high_regret_suite_payload = {
         "schema_version": promotion.HIGH_REGRET_SUITE_SCHEMA,
@@ -480,6 +495,13 @@ def _fixture(tmp_path: Path, *, promotion_count: int = 0, n_full: int = 128) -> 
                 "phase:build_trade": 20,
                 "41+": 20,
             },
+            "replay_preflight": {
+                "contract": "authoritative-shard-parent-unique-contiguous-trajectory-v2",
+                "candidate_states": 200,
+                "replay_complete_states": 200,
+                "rejected_bad_source": 0,
+                "rejected_noncontiguous": 0,
+            },
         },
         "states": [
             {
@@ -497,6 +519,10 @@ def _fixture(tmp_path: Path, *, promotion_count: int = 0, n_full: int = 128) -> 
                 )[pair % 4],
                 "legal_count": 54 if pair < 20 else 12,
                 "regret_score": 1.0,
+                "replay_source": {
+                    "contract": "authoritative-shard-parent-unique-contiguous-trajectory-v2",
+                    "scope": str(tmp_path),
+                },
             }
             for pair in range(200)
         ],
@@ -1520,7 +1546,7 @@ def test_high_regret_games_must_match_frozen_suite_state_identities(
         fixture, kind="high_regret", role="high_regret", mutate=mutate
     )
 
-    with pytest.raises(promotion.PromotionError, match="not from its held-out"):
+    with pytest.raises(promotion.PromotionError, match="not bound to source manifest"):
         _execute(fixture, go=False)
 
 

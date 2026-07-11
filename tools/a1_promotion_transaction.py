@@ -34,6 +34,12 @@ if str(_REPO_ROOT) not in sys.path:
 from tools import a1_pre_wave_contract as a1_contract  # noqa: E402
 from tools import a1_one_dose_train as one_dose  # noqa: E402
 from tools.champion_registry import ChampionRegistry  # noqa: E402
+from tools.high_regret_suite_contract import (  # noqa: E402
+    SUITE_SCHEMA,
+    bind_state_to_manifest,
+    load_source_manifest,
+    validate_replay_metadata,
+)
 from tools.sprt_gate import evaluate_pentanomial_sprt, pair_scores_from_h2h_games  # noqa: E402
 
 
@@ -44,7 +50,7 @@ EVIDENCE_SCHEMA = "a1-promotion-evidence-v1"
 HIGH_REGRET_SCHEMA = "a1-high-regret-comparison-v1"
 BUCKET_VETO_SCHEMA = "a1-bucket-veto-v1"
 HIGH_REGRET_REPORT_SCHEMA = "a1-held-out-high-regret-report-v1"
-HIGH_REGRET_SUITE_SCHEMA = "a1-held-out-high-regret-suite-v1"
+HIGH_REGRET_SUITE_SCHEMA = SUITE_SCHEMA
 BUCKET_GAME_REPORT_SCHEMA = "a1-bucket-game-report-v1"
 FLEET_EVALUATION_POOL_SCHEMA = "a1-fleet-evaluation-pool-v1"
 LEGACY_INCUMBENT_PROVENANCE_SCHEMA = "a1-legacy-incumbent-provenance-v1"
@@ -1749,7 +1755,7 @@ def _verify_high_regret_source(
         or suite["held_out"] is not True
     ):
         raise PromotionError(f"{where} suite manifest is not a held-out suite")
-    _validate_file_ref(
+    source_manifest_path, _source_manifest_ref = _validate_file_ref(
         suite["source_manifest"],
         base=suite_path.parent,
         where=f"{where}.suite_manifest.source_manifest",
@@ -1764,6 +1770,11 @@ def _verify_high_regret_source(
         or selection.get("selected_pairs") != len(states)
     ):
         raise PromotionError(f"{where} held-out suite selection is malformed")
+    try:
+        validate_replay_metadata(selection, states)
+        shard_paths, manifest_identities = load_source_manifest(source_manifest_path)
+    except ValueError as error:
+        raise PromotionError(f"{where} {error}") from error
     expected_strata = {
         "phase:opening",
         "phase:robber_dev",
@@ -1788,9 +1799,17 @@ def _verify_high_regret_source(
         )
     state_by_pair: dict[int, tuple[int, int]] = {}
     actual_strata = {label: 0 for label in expected_strata}
-    for index, state in enumerate(states):
-        if not isinstance(state, dict):
-            raise PromotionError(f"{where}.suite.states[{index}] is malformed")
+    for index, raw_state in enumerate(states):
+        try:
+            state = bind_state_to_manifest(
+                raw_state,
+                suite_base=suite_path.parent,
+                manifest_path=source_manifest_path,
+                shard_paths=shard_paths,
+                identities=manifest_identities,
+            )
+        except ValueError as error:
+            raise PromotionError(f"{where}.suite.states[{index}] {error}") from error
         pair_id = state.get("pair_id")
         game_seed = state.get("game_seed")
         decision_index = state.get("decision_index")
