@@ -501,10 +501,57 @@ def _verify_training_report(
     producer_sha = _validate_sha256(
         producers[0].get("sha256"), where="contract producer sha256"
     )
-    if report.get("init_checkpoint_sha256") != producer_sha:
-        raise PromotionError(
-            "candidate training report init checkpoint differs from producer"
+    init_sha = report.get("init_checkpoint_sha256")
+    curriculum_parent = report.get("a1_curriculum_parent")
+    if init_sha != producer_sha:
+        # A combined-196k candidate is the sole supported exception: its n128
+        # second dose starts from the authenticated output of the completed
+        # n256 first dose.  The training receipt is replayed immediately after
+        # this report check and binds this object byte-for-byte to the reviewed
+        # dual learner lock, parent receipt, claim, and checkpoint.
+        parent_checkpoint = (
+            curriculum_parent.get("parent_checkpoint")
+            if isinstance(curriculum_parent, dict)
+            else None
         )
+        if (
+            not is_dual
+            or not isinstance(curriculum_parent, dict)
+            or set(curriculum_parent)
+            != {
+                "schema_version",
+                "receipt_path",
+                "receipt_sha256",
+                "parent_arm_id",
+                "parent_subset_id",
+                "parent_checkpoint",
+                "generation_producer_sha256",
+            }
+            or curriculum_parent.get("schema_version")
+            != "a1-curriculum-parent-binding-v1"
+            or curriculum_parent.get("parent_arm_id") != "n256"
+            or curriculum_parent.get("parent_subset_id") != "full-56k"
+            or curriculum_parent.get("generation_producer_sha256") != producer_sha
+            or not isinstance(parent_checkpoint, dict)
+            or set(parent_checkpoint) != {"path", "sha256"}
+            or parent_checkpoint.get("sha256") != init_sha
+        ):
+            raise PromotionError(
+                "candidate training report init checkpoint differs from producer"
+            )
+        parent_path = _canonical_existing_file(
+            Path(str(parent_checkpoint["path"])),
+            where="curriculum parent checkpoint",
+        )
+        parent_receipt = _canonical_existing_file(
+            Path(str(curriculum_parent["receipt_path"])),
+            where="curriculum parent receipt",
+        )
+        if (
+            _sha256(parent_path) != init_sha
+            or _sha256(parent_receipt) != curriculum_parent.get("receipt_sha256")
+        ):
+            raise PromotionError("curriculum parent checkpoint/receipt bytes drifted")
     steps = report.get("steps_completed")
     epochs = report.get("epochs")
     if isinstance(steps, bool) or not isinstance(steps, int) or steps <= 0:
