@@ -7,7 +7,9 @@ import argparse
 import hashlib
 import json
 import os
+import stat
 import sys
+import uuid
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Sequence
@@ -35,17 +37,82 @@ def _rank(record: dict[str, Any], subset_id: str) -> bytes:
     ).digest()
 
 
+def _existing_bytes_match(path: Path, expected: bytes) -> bool:
+    try:
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except FileNotFoundError:
+        return False
+    except OSError as error:
+        raise SystemExit(f"cannot inspect immutable subset artifact {path}: {error}") from error
+    try:
+        before = os.fstat(descriptor)
+        named = os.stat(path, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or not stat.S_ISREG(named.st_mode)
+            or (before.st_dev, before.st_ino) != (named.st_dev, named.st_ino)
+        ):
+            raise SystemExit(f"existing immutable subset artifact is unsafe: {path}")
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(descriptor, 1 << 20)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        after = os.fstat(descriptor)
+        if (
+            (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+            != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+            or b"".join(chunks) != expected
+        ):
+            raise SystemExit(f"existing immutable subset artifact drift: {path}")
+        return True
+    finally:
+        os.close(descriptor)
+
+
 def _write_immutable(path: Path, value: dict[str, Any]) -> None:
     data = json.dumps(value, indent=2, sort_keys=True).encode() + b"\n"
+    if _existing_bytes_match(path, data):
+        return
+    temporary = path.parent / f".{path.name}.{uuid.uuid4().hex}.tmp"
     descriptor = os.open(
-        path,
+        temporary,
         os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
         0o444,
     )
-    with os.fdopen(descriptor, "wb") as handle:
-        handle.write(data)
-        handle.flush()
-        os.fsync(handle.fileno())
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.link(temporary, path, follow_symlinks=False)
+        except FileExistsError:
+            if not _existing_bytes_match(path, data):
+                raise SystemExit(f"existing immutable subset artifact drift: {path}")
+        parent_fd = os.open(
+            path.parent,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            os.fsync(parent_fd)
+        finally:
+            os.close(parent_fd)
+    finally:
+        temporary.unlink(missing_ok=True)
+        parent_fd = os.open(
+            path.parent,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            os.fsync(parent_fd)
+        finally:
+            os.close(parent_fd)
 
 
 def _rows_by_seed(

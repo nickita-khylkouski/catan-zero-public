@@ -46,6 +46,13 @@ EXPECTED_JOBS = 120
 EXPECTED_HOSTS = 8
 DUAL_ARM_PROFILE = "dual_arm_generation_v1"
 _HOST_RE = re.compile(r"[A-Za-z0-9_.@-]+\Z")
+_INCOMING_RE = re.compile(
+    r"(?P<host>[A-Za-z0-9_.@-]+)\.(?P<token>[0-9a-f]{32})"
+    r"(?P<suffix>\.tar|\.stderr)?\Z"
+)
+_TAR_ESTIMATE_NUMERATOR = 105
+_TAR_ESTIMATE_DENOMINATOR = 100
+_TAR_ESTIMATE_FLOOR = 1 << 20
 
 
 class HarvestError(RuntimeError):
@@ -546,38 +553,150 @@ def _ssh_fetch(
     stderr_path.unlink(missing_ok=True)
 
 
-def _fetch_archives(
-    ssh_command: Sequence[str], batches: Sequence[_HostFetch], *, workers: int
-) -> None:
-    """Fetch independent host archives concurrently, with bounded fan-out.
+def _ssh_output_bytes(
+    ssh_command: Sequence[str], host: str, outputs: Sequence[PurePosixPath]
+) -> int:
+    """Measure the apparent remote bytes needed for a host archive."""
 
-    SSH streams write to host-unique O_EXCL archives.  No extraction or
-    publication occurs in worker threads; the caller retains the existing
-    deterministic validation and atomic-publish order after every stream has
-    completed successfully.
+    remote = " ".join(
+        ["du -sb --", *(shlex.quote(str(path)) for path in outputs)]
+    )
+    result = subprocess.run(
+        [*ssh_command, host, remote],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+        text=True,
+    )
+    if result.returncode != 0:
+        detail = result.stderr[-4000:]
+        raise HarvestError(
+            f"read-only size preflight failed on {host}: {detail.strip()}"
+        )
+    total = 0
+    for line in result.stdout.splitlines():
+        fields = line.split(maxsplit=1)
+        if not fields or not fields[0].isdigit():
+            raise HarvestError(f"malformed size preflight response from {host}")
+        total += int(fields[0])
+    if total <= 0:
+        raise HarvestError(f"size preflight returned no bytes for {host}")
+    return total
+
+
+def _estimated_archive_bytes(apparent_bytes: int) -> int:
+    return max(
+        _TAR_ESTIMATE_FLOOR,
+        (apparent_bytes * _TAR_ESTIMATE_NUMERATOR
+         + _TAR_ESTIMATE_DENOMINATOR - 1)
+        // _TAR_ESTIMATE_DENOMINATOR,
+    )
+
+
+def _preflight_cohort_disk(
+    incoming_root: Path,
+    sizes: Sequence[int],
+) -> None:
+    """Refuse a cohort unless archives plus one extraction fit locally."""
+
+    if not sizes:
+        return
+    archive_estimates = [_estimated_archive_bytes(value) for value in sizes]
+    required = sum(archive_estimates) + max(archive_estimates)
+    available = shutil.disk_usage(incoming_root).free
+    if available < required:
+        raise HarvestError(
+            "insufficient local disk for bounded harvest cohort: "
+            f"available={available} required={required} "
+            f"archives={sum(archive_estimates)} extraction={max(archive_estimates)}"
+        )
+
+
+def _cleanup_owned_incoming(incoming_root: Path, *, hosts: set[str]) -> None:
+    """Remove only transaction-owned interrupted fetch artifacts.
+
+    The caller holds the destination transaction lock and ``incoming_root`` is
+    a private, non-symlinked 0700 directory. Unknown names still fail closed so
+    this cleanup cannot become a broad recursive-delete primitive.
+    """
+
+    for path in incoming_root.iterdir():
+        match = _INCOMING_RE.fullmatch(path.name)
+        if match is None or match.group("host") not in hosts or path.is_symlink():
+            raise HarvestError(f"unsafe unknown artifact in harvest incoming: {path}")
+        suffix = match.group("suffix")
+        if suffix is None:
+            if not path.is_dir():
+                raise HarvestError(f"unsafe interrupted extraction artifact: {path}")
+            shutil.rmtree(path)
+        else:
+            if not path.is_file():
+                raise HarvestError(f"unsafe interrupted fetch artifact: {path}")
+            path.unlink()
+    directory_fd = os.open(
+        incoming_root,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+def _fetch_archives(
+    ssh_command: Sequence[str],
+    batches: Sequence[_HostFetch],
+    *,
+    workers: int,
+    incoming_root: Path,
+    lock: Mapping[str, Any],
+    jobs_root: Path,
+    state_root: Path,
+    inventories: dict[str, list[dict[str, Any]]],
+) -> None:
+    """Fetch and install host archives in bounded cohorts.
+
+    At most ``workers`` archives are resident: a cohort is sized, fetched, and
+    fully installed before the next cohort is submitted. Extraction and
+    publication remain deterministic in the caller thread.
     """
     if isinstance(workers, bool) or not isinstance(workers, int) or workers < 1:
         raise HarvestError("fetch_workers must be a positive integer")
     if not batches:
         return
-    with ThreadPoolExecutor(max_workers=min(workers, len(batches))) as executor:
-        futures = {
-            executor.submit(
-                _ssh_fetch,
-                ssh_command,
-                batch.host,
-                batch.outputs,
-                batch.archive,
-            ): batch.host
-            for batch in batches
-        }
-        try:
-            for future in as_completed(futures):
-                future.result()
-        except BaseException:
-            for future in futures:
-                future.cancel()
-            raise
+    for offset in range(0, len(batches), workers):
+        cohort = list(batches[offset : offset + workers])
+        sizes = [
+            _ssh_output_bytes(ssh_command, batch.host, batch.outputs)
+            for batch in cohort
+        ]
+        _preflight_cohort_disk(incoming_root, sizes)
+        with ThreadPoolExecutor(max_workers=len(cohort)) as executor:
+            futures = {
+                executor.submit(
+                    _ssh_fetch,
+                    ssh_command,
+                    batch.host,
+                    batch.outputs,
+                    batch.archive,
+                ): batch
+                for batch in cohort
+            }
+            try:
+                for future in as_completed(futures):
+                    future.result()
+            except BaseException:
+                for future in futures:
+                    future.cancel()
+                raise
+        for batch in cohort:
+            _install_fetched_batch(
+                batch,
+                lock=lock,
+                jobs_root=jobs_root,
+                state_root=state_root,
+                inventories=inventories,
+            )
 
 
 def _install_fetched_batch(
@@ -617,6 +736,7 @@ def _install_fetched_batch(
             inventories[job_id] = pending[job_id]
     finally:
         batch.archive.unlink(missing_ok=True)
+        batch.archive.with_suffix(".stderr").unlink(missing_ok=True)
         shutil.rmtree(batch.extracted, ignore_errors=True)
 
 
@@ -799,6 +919,7 @@ def _harvest_locked(
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for job in jobs:
         grouped[str(job["host_alias"])].append(job)
+    _cleanup_owned_incoming(incoming_root, hosts=set(grouped))
     inventories: dict[str, list[dict[str, Any]]] = {}
     fetches: list[_HostFetch] = []
     for host in sorted(grouped):
@@ -831,35 +952,24 @@ def _harvest_locked(
             )
         )
 
-    if fetch_workers == 1:
-        # Preserve the original host-at-a-time crash-resume behavior for the
-        # library default and low-disk environments.
+    try:
+        _fetch_archives(
+            ssh_command,
+            fetches,
+            workers=fetch_workers,
+            incoming_root=incoming_root,
+            lock=lock,
+            jobs_root=jobs_root,
+            state_root=state_root,
+            inventories=inventories,
+        )
+    finally:
+        # A failed stream or extraction must not strand hundred-GB
+        # untracked archives in the resumable staging directory.
         for batch in fetches:
-            _ssh_fetch(ssh_command, batch.host, batch.outputs, batch.archive)
-            _install_fetched_batch(
-                batch,
-                lock=lock,
-                jobs_root=jobs_root,
-                state_root=state_root,
-                inventories=inventories,
-            )
-    else:
-        try:
-            _fetch_archives(ssh_command, fetches, workers=fetch_workers)
-            for batch in fetches:
-                _install_fetched_batch(
-                    batch,
-                    lock=lock,
-                    jobs_root=jobs_root,
-                    state_root=state_root,
-                    inventories=inventories,
-                )
-        finally:
-            # A failed stream or extraction must not strand hundred-GB
-            # untracked archives in the resumable staging directory.
-            for batch in fetches:
-                batch.archive.unlink(missing_ok=True)
-                shutil.rmtree(batch.extracted, ignore_errors=True)
+            batch.archive.unlink(missing_ok=True)
+            batch.archive.with_suffix(".stderr").unlink(missing_ok=True)
+            shutil.rmtree(batch.extracted, ignore_errors=True)
 
     if set(inventories) != {str(job["job_id"]) for job in jobs}:
         raise HarvestError("staging does not cover the exact immutable job set")
