@@ -5,7 +5,10 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import stat
+import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -94,6 +97,120 @@ def scope_inventory_sha256(scope: Path) -> tuple[str, int]:
         records, sort_keys=True, separators=(",", ":"), ensure_ascii=True
     ).encode("utf-8")
     return "sha256:" + hashlib.sha256(encoded).hexdigest(), len(records)
+
+
+@dataclass
+class PinnedReplayScope:
+    original_scope: Path
+    snapshot_scope: Path
+    descriptors: list[int]
+
+    def close(self) -> None:
+        for descriptor in self.descriptors:
+            os.close(descriptor)
+        self.descriptors.clear()
+        shutil.rmtree(self.snapshot_scope, ignore_errors=True)
+
+
+def pin_replay_scope(
+    scope: Path, *, expected_sha256: str, expected_count: int
+) -> PinnedReplayScope:
+    """Snapshot exact bytes from the same held fds used for inventory hashing."""
+
+    scope = scope.expanduser().resolve(strict=True)
+    paths: list[Path] = []
+    for pattern in ("*.npz", "*.npz.zst"):
+        paths.extend(scope.rglob(pattern))
+    paths = sorted(set(paths))
+    snapshot = Path(tempfile.mkdtemp(prefix="a1-high-regret-replay-"))
+    os.chmod(snapshot, 0o700)
+    descriptors: list[int] = []
+    records: list[dict[str, Any]] = []
+    try:
+        for path in paths:
+            canonical = path.resolve(strict=True)
+            if path.is_symlink() or canonical != path.absolute() or scope not in canonical.parents:
+                raise ValueError(f"held-out replay shard is unsafe while pinning: {path}")
+            descriptor = os.open(
+                canonical, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+            )
+            descriptors.append(descriptor)
+            before = os.fstat(descriptor)
+            if not stat.S_ISREG(before.st_mode):
+                raise ValueError(f"held-out replay shard is not regular: {canonical}")
+            relative = canonical.relative_to(scope)
+            target = snapshot / relative
+            target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            output = os.open(
+                target,
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_NOFOLLOW", 0),
+                0o400,
+            )
+            digest = hashlib.sha256()
+            try:
+                while True:
+                    chunk = os.read(descriptor, 1 << 20)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+                    view = memoryview(chunk)
+                    while view:
+                        written = os.write(output, view)
+                        if written <= 0:
+                            raise OSError("short write while pinning replay shard")
+                        view = view[written:]
+                os.fsync(output)
+            finally:
+                os.close(output)
+            after = os.fstat(descriptor)
+            identity = (
+                before.st_dev,
+                before.st_ino,
+                before.st_size,
+                before.st_mtime_ns,
+                before.st_ctime_ns,
+            )
+            if identity != (
+                after.st_dev,
+                after.st_ino,
+                after.st_size,
+                after.st_mtime_ns,
+                after.st_ctime_ns,
+            ):
+                raise ValueError(f"held-out replay shard changed while pinning: {canonical}")
+            named = canonical.stat(follow_symlinks=False)
+            if identity != (
+                named.st_dev,
+                named.st_ino,
+                named.st_size,
+                named.st_mtime_ns,
+                named.st_ctime_ns,
+            ):
+                raise ValueError(
+                    f"held-out replay shard pathname changed while pinning: {canonical}"
+                )
+            records.append(
+                {
+                    "path": str(canonical),
+                    "size_bytes": int(before.st_size),
+                    "sha256": "sha256:" + digest.hexdigest(),
+                }
+            )
+        encoded = json.dumps(
+            records, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        ).encode("utf-8")
+        actual = "sha256:" + hashlib.sha256(encoded).hexdigest()
+        if actual != expected_sha256 or len(records) != expected_count:
+            raise ValueError("held-out worker pinned scope inventory drifted")
+        return PinnedReplayScope(scope, snapshot, descriptors)
+    except BaseException:
+        for descriptor in descriptors:
+            os.close(descriptor)
+        shutil.rmtree(snapshot, ignore_errors=True)
+        raise
 
 
 def validate_replay_metadata(selection: Any, states: Any) -> None:

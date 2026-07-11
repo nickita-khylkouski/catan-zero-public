@@ -55,9 +55,11 @@ from catan_zero.search.neural_rust_mcts import (  # noqa: E402
 from catan_zero.search.rust_mcts import _require_rust_module  # noqa: E402
 from factory_common import write_json  # noqa: E402
 from high_regret_suite_contract import (  # noqa: E402
+    PinnedReplayScope,
     SUITE_SCHEMA,
     bind_state_to_manifest,
     load_source_manifest,
+    pin_replay_scope,
     scope_inventory_sha256,
     validate_replay_metadata,
     validate_replay_trajectories,
@@ -865,7 +867,7 @@ def _run_worker(worker_args: dict[str, Any]) -> dict[str, Any]:
     pair_errors: list[dict[str, Any]] = []
     search_telemetry = _new_search_telemetry()
     archived_sequences: dict[tuple[str, int], Any] = {}
-    archived_inventory_cache: dict[Path, tuple[str, int]] = {}
+    pinned_replay_scopes: dict[Path, PinnedReplayScope] = {}
     try:
         for pair in worker_args["pairs"]:
             game_seed = int(pair["game_seed"])
@@ -887,16 +889,26 @@ def _run_worker(worker_args: dict[str, Any]) -> dict[str, Any]:
                             reconstruct_state,
                         )
 
-                        _validate_archived_scope_inventory(
-                            archived, archived_inventory_cache
-                        )
                         shard_path = str(archived["shard_path"])
+                        original_scope = Path(shard_path).parent
+                        pinned_scope = pinned_replay_scopes.get(original_scope)
+                        if pinned_scope is None:
+                            replay_source = archived["replay_source"]
+                            pinned_scope = pin_replay_scope(
+                                original_scope,
+                                expected_sha256=replay_source[
+                                    "scope_inventory_sha256"
+                                ],
+                                expected_count=replay_source["scope_shard_count"],
+                            )
+                            pinned_replay_scopes[original_scope] = pinned_scope
                         cache_key = (shard_path, game_seed)
                         if cache_key not in archived_sequences:
                             archived_sequences[cache_key] = gather_game_action_sequence(
-                                Path(shard_path).parent, game_seed, colors=COLORS
+                                pinned_scope.snapshot_scope,
+                                game_seed,
+                                colors=COLORS,
                             )
-                            _validate_archived_scope_inventory(archived, {})
                         sequence = archived_sequences[cache_key]
                         game, chance_rng = reconstruct_state(
                             game_seed,
@@ -950,6 +962,8 @@ def _run_worker(worker_args: dict[str, Any]) -> dict[str, Any]:
                 _wins,
             )
     finally:
+        for pinned_scope in pinned_replay_scopes.values():
+            pinned_scope.close()
         candidate_evaluator.close()
         baseline_evaluator.close()
 

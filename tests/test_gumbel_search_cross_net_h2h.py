@@ -21,6 +21,7 @@ if str(_TOOLS_DIR) not in sys.path:
 
 from catan_zero.rl.pipeline_configs import EvalConfig  # noqa: E402
 import gumbel_search_cross_net_h2h as h2h  # type: ignore  # noqa: E402
+import high_regret_suite_contract as replay_contract  # type: ignore  # noqa: E402
 from high_regret_suite_contract import (  # type: ignore  # noqa: E402
     REPLAY_CONTRACT,
     bind_state_to_manifest,
@@ -36,6 +37,63 @@ from gumbel_search_cross_net_h2h import (  # type: ignore  # noqa: E402
     play_one_h2h_game,
     _validate_information_set_recipe,
 )
+
+
+def test_pinned_replay_scope_rejects_path_aba_during_hash_and_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    scope = tmp_path / "worker"
+    scope.mkdir()
+    shard = scope / "rows.npz"
+    np.savez(
+        shard,
+        game_seed=np.asarray([77]),
+        decision_index=np.asarray([0]),
+        action_taken=np.asarray([11]),
+    )
+    expected = replay_contract.scope_inventory_sha256(scope)
+    forged = tmp_path / "forged.npz"
+    np.savez(
+        forged,
+        game_seed=np.asarray([77]),
+        decision_index=np.asarray([0]),
+        action_taken=np.asarray([99]),
+    )
+    original_read = replay_contract.os.read
+    injected = False
+
+    def aba_read(descriptor: int, size: int) -> bytes:
+        nonlocal injected
+        payload = original_read(descriptor, size)
+        if payload and not injected:
+            injected = True
+            backup = scope / "rows.original"
+            shard.replace(backup)
+            forged.replace(shard)
+            shard.unlink()
+            backup.replace(shard)
+        return payload
+
+    monkeypatch.setattr(replay_contract.os, "read", aba_read)
+    with pytest.raises(ValueError, match="changed while pinning"):
+        replay_contract.pin_replay_scope(
+            scope, expected_sha256=expected[0], expected_count=expected[1]
+        )
+    monkeypatch.setattr(replay_contract.os, "read", original_read)
+    pinned = replay_contract.pin_replay_scope(
+        scope, expected_sha256=expected[0], expected_count=expected[1]
+    )
+    try:
+        np.savez(
+            shard,
+            game_seed=np.asarray([77]),
+            decision_index=np.asarray([0]),
+            action_taken=np.asarray([99]),
+        )
+        with np.load(pinned.snapshot_scope / "rows.npz", allow_pickle=False) as data:
+            assert int(data["action_taken"][0]) == 11
+    finally:
+        pinned.close()
 
 
 def test_held_out_suite_loader_replays_digest_and_source_manifest(
