@@ -11,6 +11,8 @@ declare -A HOST=(
   [c6]=REPLACE_ME_c6_ip
   [h100-8a]=REPLACE_ME_h100_8a_ip
   [h100-8b]=REPLACE_ME_h100_8b_ip
+  [h100-8c]=REPLACE_ME_h100_8c_ip
+  [h100-8d]=REPLACE_ME_h100_8d_ip
   [b200]=REPLACE_ME_b200_ip
 )
 
@@ -27,4 +29,6 @@ declare -A DIRS=(
   [c6]="/home/ubuntu/gen_out/REPLACE_ME_c6_claim"
   [h100-8a]="/home/ubuntu/gen_out/REPLACE_ME_h100_8a_claim"
   [h100-8b]="/home/ubuntu/gen_out/REPLACE_ME_h100_8b_claim"
+  [h100-8c]="/home/ubuntu/gen_out/REPLACE_ME_h100_8c_claim"
+  [h100-8d]="/home/ubuntu/gen_out/REPLACE_ME_h100_8d_claim"
 )

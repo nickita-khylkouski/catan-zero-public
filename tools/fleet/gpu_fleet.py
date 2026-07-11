@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Daemonless, fail-closed scheduler for the canonical 40-H100 fleet."""
+"""Daemonless, fail-closed scheduler for the canonical 56-H100 fleet."""
 
 from __future__ import annotations
 
@@ -30,10 +30,11 @@ EXPECTED_HOSTS = {
     "c6": ("68.209.74.2", 4),
     "h100-8a": ("192.222.53.119", 8),
     "h100-8b": ("192.222.55.216", 8),
+    "h100-8c": ("192.222.54.141", 8),
+    "h100-8d": ("209.20.158.82", 8),
 }
 EXPECTED_SHAPES = {alias: shape[1] for alias, shape in EXPECTED_HOSTS.items()}
 EXPECTED_ACCELERATOR = "NVIDIA H100 80GB HBM3"
-EXCLUDED_ADDRESSES = {"192.222.54.141", "209.20.158.82"}
 SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 SAFE_ADDRESS = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.:-]*$")
 SAFE_ENV = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -93,10 +94,6 @@ def load_manifest(path: Path) -> dict[str, Any]:
             raise FleetError(f"invalid or duplicate host alias {alias!r}")
         if not SAFE_ADDRESS.fullmatch(address):
             raise FleetError(f"invalid address for {alias}")
-        if address in EXCLUDED_ADDRESSES:
-            raise FleetError(
-                f"address {address} is explicitly excluded from this fleet"
-            )
         if address in seen_addresses:
             raise FleetError(f"duplicate host address {address}")
         try:

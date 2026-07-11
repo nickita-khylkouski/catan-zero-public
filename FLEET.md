@@ -8,7 +8,7 @@
 
 ## 1. Box inventory (aliases + stable roles)
 Fleet is consolidated to **H100 + B200 only**. The production data lane has
-**40 H100s across eight boxes**: six four-GPU nodes and two eight-GPU nodes,
+**56 H100s across ten boxes**: six four-GPU nodes and four eight-GPU nodes,
 all with NVLink/NVSwitch. The prior A100 pool (`a100a`, `a100b`) and the older
 `a100-legacy` box are **RETIRED** — decommissioned from the active fleet; any
 useful data on them was salvaged separately before retirement. Do not launch
@@ -25,9 +25,11 @@ new work there, and drop any lingering A100 entries from your local
 | c6 | 4× H100 (NVLink) | A1 generation |
 | h100-8a | 8× H100 (NVSwitch) | A1 generation; eight-GPU shape canary first |
 | h100-8b | 8× H100 (NVSwitch) | A1 generation |
+| h100-8c | 8× H100 (NVSwitch) | A1 generation; audited 2026-07-10 |
+| h100-8d | 8× H100 (NVSwitch) | A1 generation; audited 2026-07-10 |
 | b200 | 2× B200 | eval + orchestration hub (gates, Grafana, banking) |
 
-The current A1 search decision is uniform across all 40 H100s:
+The current A1 search decision is uniform across all 56 H100s:
 `n_full=128`, `n_fast=16`, and `p_full=0.25`. There is no n64 production arm
 and no adaptive or blanket n196/n256 budget in this wave. Source categories are
 rendered as separate deterministic jobs from the sealed A1 contract; the box
@@ -161,7 +163,7 @@ at w128.
 
 These are preserved throughput-only results from the historical 24-H100
 EvalServer experiment with a synthetic same-shape masked 35M checkpoint. They
-are not the 40-H100 A1 runtime recipe and must not be multiplied to claim A1
+are not the 56-H100 A1 runtime recipe and must not be multiplied to claim A1
 capacity. TF32 remains rejected after same-seed trajectory divergence;
 `matmul_precision=highest` is mandatory.
 

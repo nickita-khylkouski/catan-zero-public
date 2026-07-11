@@ -12,6 +12,9 @@ import pytest
 from tools.fleet import gpu_fleet as fleet
 
 
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
 def _manifest(tmp_path: Path, commits: dict[str, str] | None = None):
     commits = commits or {}
     hosts = []
@@ -51,13 +54,40 @@ def _jobset(tmp_path: Path, jobs):
     return fleet.load_jobset(path)
 
 
-def test_manifest_is_exactly_the_canonical_40_gpu_shape(tmp_path):
+def test_committed_manifest_is_the_canonical_56_gpu_shape():
+    manifest = fleet.load_manifest(_REPO_ROOT / "configs" / "gpu_fleet_56.json")
+    assert len(manifest["hosts"]) == 10
+    assert sum(host["gpu_count"] for host in manifest["hosts"]) == 56
+    assert [(host["alias"], host["gpu_count"]) for host in manifest["hosts"][-2:]] == [
+        ("h100-8c", 8),
+        ("h100-8d", 8),
+    ]
+
+
+def test_new_eight_gpu_hosts_are_allocatable_only_at_their_audited_commit(tmp_path):
+    manifest = fleet.load_manifest(_REPO_ROOT / "configs" / "gpu_fleet_56.json")
+    jobs = _jobset(
+        tmp_path,
+        [
+            {"job_id": "new-c", "gpus": 8, "argv": ["true"]},
+            {"job_id": "new-d", "gpus": 8, "argv": ["true"]},
+        ],
+    )
+    plan = fleet.build_plan(
+        manifest,
+        jobs,
+        repo_commit="589e747ac5d2fcf857c8910df78e7b61d5b05da5",
+    )
+    assert [row["alias"] for row in plan["assignments"]] == ["h100-8c", "h100-8d"]
+
+
+def test_manifest_is_exactly_the_canonical_56_gpu_shape(tmp_path):
     manifest = _manifest(tmp_path)
-    assert sum(host["gpu_count"] for host in manifest["hosts"]) == 40
+    assert sum(host["gpu_count"] for host in manifest["hosts"]) == 56
     manifest["hosts"].append(
         {
-            "alias": "h100-8c",
-            "address": "192.222.54.141",
+            "alias": "h100-8e",
+            "address": "203.0.113.9",
             "gpu_count": 8,
             "accelerator": fleet.EXPECTED_ACCELERATOR,
             "repo_commit": "a" * 40,
@@ -67,7 +97,7 @@ def test_manifest_is_exactly_the_canonical_40_gpu_shape(tmp_path):
     path.write_text(
         json.dumps({k: v for k, v in manifest.items() if k != "manifest_hash"})
     )
-    with pytest.raises(fleet.FleetError, match="excluded"):
+    with pytest.raises(fleet.FleetError, match="mapping drift"):
         fleet.load_manifest(path)
 
 
@@ -77,11 +107,10 @@ def test_manifest_is_exactly_the_canonical_40_gpu_shape(tmp_path):
         (lambda hosts: hosts[0].update(address="203.0.113.9"), "mapping drift"),
         (lambda hosts: hosts[0].update(gpu_count=8), "mapping drift"),
         (lambda hosts: hosts[1].update(address=hosts[0]["address"]), "duplicate"),
-        (lambda hosts: hosts[0].update(address="209.20.158.82"), "excluded"),
         (lambda hosts: hosts[0].update(accelerator="H100"), "must be exactly"),
     ],
 )
-def test_manifest_rejects_wrong_duplicate_excluded_and_lookalike_hosts(
+def test_manifest_rejects_wrong_duplicate_and_lookalike_hosts(
     tmp_path, mutation, message
 ):
     manifest = _manifest(tmp_path)
@@ -332,7 +361,7 @@ def test_inventory_validates_shape_commit_and_busy_state(tmp_path):
     # The fake response has four GPUs for every host, so 8-GPU declarations fail.
     result = fleet.inventory(manifest, runner=runner)
     assert result["valid"] is False
-    assert result["gpu_capacity"] == 40
+    assert result["gpu_capacity"] == 56
 
 
 def _local_status_runner(argv):

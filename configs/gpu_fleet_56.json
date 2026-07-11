@@ -13,6 +13,8 @@
     {"alias": "c5", "address": "68.209.74.145", "gpu_count": 4, "accelerator": "NVIDIA H100 80GB HBM3", "repo_commit": "cfb21588db12ce1d3af9b838c43e912de913afcf"},
     {"alias": "c6", "address": "68.209.74.2", "gpu_count": 4, "accelerator": "NVIDIA H100 80GB HBM3", "repo_commit": "cfb21588db12ce1d3af9b838c43e912de913afcf"},
     {"alias": "h100-8a", "address": "192.222.53.119", "gpu_count": 8, "accelerator": "NVIDIA H100 80GB HBM3", "repo_commit": "cfb21588db12ce1d3af9b838c43e912de913afcf"},
-    {"alias": "h100-8b", "address": "192.222.55.216", "gpu_count": 8, "accelerator": "NVIDIA H100 80GB HBM3", "repo_commit": "cfb21588db12ce1d3af9b838c43e912de913afcf"}
+    {"alias": "h100-8b", "address": "192.222.55.216", "gpu_count": 8, "accelerator": "NVIDIA H100 80GB HBM3", "repo_commit": "cfb21588db12ce1d3af9b838c43e912de913afcf"},
+    {"alias": "h100-8c", "address": "192.222.54.141", "gpu_count": 8, "accelerator": "NVIDIA H100 80GB HBM3", "repo_commit": "589e747ac5d2fcf857c8910df78e7b61d5b05da5"},
+    {"alias": "h100-8d", "address": "209.20.158.82", "gpu_count": 8, "accelerator": "NVIDIA H100 80GB HBM3", "repo_commit": "589e747ac5d2fcf857c8910df78e7b61d5b05da5"}
   ]
 }
