@@ -18,7 +18,7 @@
 #                stale fallback: v1.0-deploy predates the H100 hardening.
 #   CATAN_DEST   fresh checkout dir (default ~/catan-zero-v1; an existing venv,
 #                dirty checkout, or non-empty non-git directory is refused)
-#   CATAN_RS_WHEEL  catanatron_rs 0.1.4 cp311 manylinux wheel (pip can't fetch it;
+#   CATAN_RS_WHEEL  catanatron_rs 0.1.5 cp311 manylinux wheel (pip can't fetch it;
 #                if unset/absent, auto-downloaded from the CATAN_REF release assets)
 #   TORCH_INDEX  torch wheel index (default cu128)
 #   PY           python interpreter (default python3.11; 3.11 REQUIRED). If
@@ -32,8 +32,8 @@ set -euo pipefail
 CATAN_REPO="${CATAN_REPO:-https://github.com/nickita-khylkouski/catan-zero-public}"
 CATAN_REF="${CATAN_REF:-}"
 CATAN_DEST="${CATAN_DEST:-$HOME/catan-zero-v1}"
-CATAN_RS_WHEEL="${CATAN_RS_WHEEL:-$HOME/bundle/catanatron_rs-0.1.4-cp311-cp311-manylinux_2_34_x86_64.whl}"
-RS_WHEEL_NAME="catanatron_rs-0.1.4-cp311-cp311-manylinux_2_34_x86_64.whl"
+CATAN_RS_WHEEL="${CATAN_RS_WHEEL:-$HOME/bundle/catanatron_rs-0.1.5-cp311-cp311-manylinux_2_34_x86_64.whl}"
+RS_WHEEL_NAME="catanatron_rs-0.1.5-cp311-cp311-manylinux_2_34_x86_64.whl"
 RS_WHEEL_SHA256_FILE_REL="native/catanatron-rs/WHEEL_SHA256SUMS"
 TORCH_INDEX="${TORCH_INDEX:-https://download.pytorch.org/whl/cu128}"
 PY="${PY:-python3.11}"
@@ -321,9 +321,10 @@ try:
     rs = version("catanatron-rs")
 except PackageNotFoundError:
     rs = version("catanatron_rs")
-assert rs == "0.1.4", f"catanatron_rs must be 0.1.4, got {rs}"
+assert rs == "0.1.5", f"catanatron_rs must be 0.1.5, got {rs}"
 import catanatron_rs
 assert hasattr(catanatron_rs.Game, "determinize_for_player"), "wheel lacks information-set determinization"
+assert callable(getattr(catanatron_rs, "gumbel_search", None)), "wheel lacks native Gumbel MCTS"
 import torch
 assert torch.cuda.is_available(), "canonical fleet install requires a CUDA-enabled torch build"
 assert torch.version.cuda == "12.8", f"canonical fleet install requires torch cu128, got CUDA {torch.version.cuda}"
@@ -331,7 +332,7 @@ print(f"env-doctor OK: py={sys.version.split()[0]} torch={torch.__version__} "
       f"cuda={torch.cuda.is_available()} catanatron_rs={rs}")
 PY
 
-# 6. smoke — rust featurizer parity + information-set API (0.1.4); fast, CPU-only
+# 6. smoke — Rust featurizer, information-set, and native MCTS API (0.1.5); fast, CPU-only
 ulimit -n 65536 2>/dev/null || true
 PYTHONPATH="$CATAN_DEST/src" python -m pytest \
   tests/test_rust_featurize_parity.py \
@@ -517,7 +518,8 @@ except PackageNotFoundError:
     rust_version = version("catanatron_rs")
 
 determinize_api = hasattr(catanatron_rs.Game, "determinize_for_player")
-if rust_version != "0.1.4" or not determinize_api:
+native_mcts_api = callable(getattr(catanatron_rs, "gumbel_search", None))
+if rust_version != "0.1.5" or not determinize_api or not native_mcts_api:
     raise SystemExit("refusing to write receipt for an invalid catanatron_rs install")
 
 payload = {
@@ -543,6 +545,7 @@ payload = {
         "cuda_available": bool(torch.cuda.is_available()),
         "catanatron_rs_version": rust_version,
         "determinize_for_player": bool(determinize_api),
+        "gumbel_search": bool(native_mcts_api),
     },
     "services": {
         "nvidia_mps_active": os.environ["CATAN_MPS_ACTIVE"],

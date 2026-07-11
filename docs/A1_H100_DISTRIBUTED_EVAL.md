@@ -11,6 +11,14 @@ work of each 4-GPU host. The sealed evaluator recipe is n128, c-scale 0.03,
 sigma 0.98, public-observation information-set search with four
 determinizations, and D6 averaging from width 20.
 
+Future plans default to 16 evaluator workers per GPU.  A counterbalanced,
+full-game n128 B200 packing run completed 128/128 games with zero truncations
+or errors and found 16 workers improved combined work-normalized throughput by
+19.4% over 8 workers; both independent seed cohorts agreed.  This changes only
+newly rendered plans.  Historical sealed plans retain their recorded worker
+count.  See
+[`EVAL_PACKING_B200_FULL_GAME_20260711.json`](evidence/EVAL_PACKING_B200_FULL_GAME_20260711.json).
+
 Copy `configs/a1_h100_eval_fleet.example.json` to the gitignored
 `configs/a1_h100_eval_fleet.json` on the B200 and fill private addresses. Then:
 

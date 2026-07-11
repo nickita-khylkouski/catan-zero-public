@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import inspect
 import json
 import subprocess
 from pathlib import Path
@@ -8,6 +9,34 @@ from pathlib import Path
 import pytest
 
 from tools.fleet import a1_h100_eval_fleet as fleet
+
+
+def test_future_plan_default_uses_validated_16_worker_packing() -> None:
+    assert fleet.DEFAULT_WORKERS_PER_GPU == 16
+    assert (
+        inspect.signature(fleet.build_plan).parameters["workers_per_gpu"].default
+        == fleet.DEFAULT_WORKERS_PER_GPU
+    )
+    args = fleet._parser().parse_args(
+        [
+            "--manifest",
+            "fleet.json",
+            "plan",
+            "--candidate",
+            "candidate.pt",
+            "--champion",
+            "champion.pt",
+            "--internal-base-seed",
+            "1",
+            "--external-base-seed",
+            "2",
+            "--iteration-id",
+            "packing-default",
+            "--out",
+            "plan.json",
+        ]
+    )
+    assert args.workers_per_gpu == fleet.DEFAULT_WORKERS_PER_GPU
 
 
 def _manifest_file(tmp_path: Path) -> Path:

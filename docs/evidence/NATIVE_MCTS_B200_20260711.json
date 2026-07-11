@@ -1,0 +1,109 @@
+{
+  "schema_version": "native-mcts-b200-evidence-v1",
+  "recorded_utc": "2026-07-11",
+  "host": "b200",
+  "gpu": "NVIDIA B200",
+  "implementation": {
+    "initial_profile_commit": "4a6988a",
+    "clone_reduction_commit": "a833ad3",
+    "profile_classifier_commit": "43b8c78",
+    "production_wiring_commit": "daac987",
+    "wheel_sha256_after_clone_reduction": "sha256:2058f654d6e9d66164901d2d82586b4530ceb723229779798e3941034334c6ed"
+  },
+  "science_recipe": {
+    "n_full": 128,
+    "c_scale": 0.03,
+    "c_visit": 50.0,
+    "sigma_eval": 0.98,
+    "rescale_noise_floor_c": 0.0,
+    "lazy_interior_chance": true,
+    "correct_rust_chance_spectra": true,
+    "public_observation": true,
+    "information_set_search": true,
+    "belief_chance_spectra": false,
+    "determinization_particles": 4,
+    "determinization_min_simulations": 32,
+    "symmetry_averaged_eval": true,
+    "symmetry_averaged_eval_threshold": 20,
+    "value_readout": "scalar",
+    "value_squash": "tanh",
+    "max_depth": 80,
+    "max_root_candidates": 16,
+    "max_root_candidates_wide": 54,
+    "wide_candidates_threshold": 24,
+    "evaluator_rust_featurize": true
+  },
+  "gates": {
+    "rust_release_tests": "8 passed",
+    "python_fresh_wheel_tests": "18 passed",
+    "cargo_check_release": "passed",
+    "cargo_clippy_release_all_targets_deny_warnings": "passed",
+    "cargo_fmt_check": "passed",
+    "tracked_cargo_target_files": 0
+  },
+  "matched_short_cohorts": {
+    "internal_cross_net": {
+      "base_seed": 6199000201,
+      "max_decisions": 12,
+      "python_reference": {
+        "simulations": 2304,
+        "search_seconds": 11.414050108054653,
+        "simulations_per_second": 201.857,
+        "outer_wall_seconds": 13.89,
+        "errors": 0
+      },
+      "native_before_clone_reduction": {
+        "simulations": 2432,
+        "search_seconds": 8.83600150491111,
+        "simulations_per_second": 275.238,
+        "outer_wall_seconds": 11.30,
+        "errors": 0
+      },
+      "native_after_clone_reduction": {
+        "simulations": 2432,
+        "search_seconds": 8.714895694283769,
+        "simulations_per_second": 279.062,
+        "outer_wall_seconds": 11.27,
+        "errors": 0
+      },
+      "normalized_native_vs_python_speedup": 1.383,
+      "clone_reduction_increment": 1.014,
+      "limitation": "The two implementations choose different legal trajectories, so internal throughput is normalized by reported simulations/search-second; this is not a strength or exact wall-workload comparison."
+    },
+    "neutral_external": {
+      "base_seed": 6199000101,
+      "max_decisions": 12,
+      "matched_simulations": 1152,
+      "matched_search_decisions": 9,
+      "matched_authoritative_decisions": 24,
+      "python_reference_elapsed_seconds": 5.904704622924328,
+      "python_game_seconds": 5.385647990973666,
+      "native_before_clone_elapsed_seconds": 4.715059084817767,
+      "native_before_clone_game_seconds": 4.213558722054586,
+      "native_after_clone_elapsed_seconds": 4.675542100099847,
+      "native_after_clone_game_seconds": 4.134364665020257,
+      "native_vs_python_elapsed_speedup": 1.263,
+      "native_vs_python_game_speedup": 1.303,
+      "clone_reduction_elapsed_increment": 1.008,
+      "engine_divergences": 0,
+      "errors": 0
+    }
+  },
+  "profile_findings": {
+    "baseline_profile": "The recursive Python _simulate/_traverse hot loop is absent. The dominant internal buckets are feature encoding/leaf FFI (44.154%) and native MCTS traversal/allocation (26.617%); Python PIMC orchestration is 0.746%. Percentages use the corrected v2 classifier and exclude the deliberately idle evaluator queue from non-idle denominators.",
+    "clone_reduction": "The pre-change active profile exposed libc malloc at 29.639% inclusive and Vec::clone at 11.083% inclusive. After moving outcome Games into arena Nodes and borrowing evaluator requests, Vec::clone left the top-40 hotspot list and malloc measured 15.0% in the shorter confirmation capture. Capture durations differ, so the matched cohort's +1.4% normalized throughput is the performance claim.",
+    "next_bottleneck": "Leaf feature construction, Python/PyO3 evaluator callbacks, and neural evaluation now dominate; additional raw tree-loop work has a much lower Amdahl ceiling than batching or removing the remaining owned Game copy at the Python evaluator boundary."
+  },
+  "remote_artifacts": [
+    {"path": "/home/ubuntu/native-hotloop-evidence/canonical-4a6988a/internal-native-wall.raw", "sha256": "dc175eeacbd78e04576fab1eed189148905700a014b624dcdc6b481303747b9a"},
+    {"path": "/home/ubuntu/native-hotloop-evidence/canonical-4a6988a/internal-native-active.svg", "sha256": "f46aaaa158967d7729de1428ac338fccd94f346d73ac38d733fffd2136510e27"},
+    {"path": "/home/ubuntu/native-hotloop-evidence/canonical-4a6988a/internal-native-wall-analysis-v2.json", "sha256": "9d12c9a60b6ff4060904191038041d24c64abc18366010dff4b2b61fca4b38c8"},
+    {"path": "/home/ubuntu/native-hotloop-evidence/canonical-4a6988a/neutral-native-wall.raw", "sha256": "da2d325d820a6637dec83fb9fe1e0a3607126b13189b39df97b13fd059b5cce7"},
+    {"path": "/home/ubuntu/native-hotloop-evidence/canonical-4a6988a/neutral-native-active.svg", "sha256": "9d48c374ac30561ee788828c7db45adb9777da28f5a3201a0d9410e3bdf6df3a"},
+    {"path": "/home/ubuntu/native-hotloop-evidence/canonical-4a6988a/neutral-native-wall-analysis-v2.json", "sha256": "07fe8920b63262d905fb5d3f56a9b477795d0f3725ee5074b3e247fa57173d45"},
+    {"path": "/home/ubuntu/native-hotloop-evidence/canonical-a833ad3/internal-native-postclone-wall.raw", "sha256": "81e06860392c0daff4c4e2f8be87824b3b20f8400fae365c810f2237def0417a"},
+    {"path": "/home/ubuntu/native-hotloop-evidence/canonical-a833ad3/internal-native-postclone-active.svg", "sha256": "f4f6bc7557f8f085f9db365a88318a157b69d6cb35e212261a14db15d503ad1f"},
+    {"path": "/home/ubuntu/native-hotloop-evidence/canonical-a833ad3/internal-native-postclone-wall-analysis-v2.json", "sha256": "c0714c48de7ba766bf6606eef6be76bf0cc50d7b3af4401e9d19162acfeb9ca1"}
+  ],
+  "scope": "Performance and semantic-canary evidence only; no Elo or promotion claim."
+}

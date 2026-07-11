@@ -6,11 +6,11 @@ PYTHON_BIN="${PYTHON_BIN:-python3.11}"
 OUT_DIR="${OUT_DIR:-$SOURCE_ROOT/dist}"
 SEALED_CANONICAL_BUILD_ROOT="/tmp/catan-zero-catanatron-rs-wheel-src"
 CANONICAL_BUILD_ROOT="${CATAN_RS_CANONICAL_BUILD_ROOT:-$SEALED_CANONICAL_BUILD_ROOT}"
-WHEEL_NAME="catanatron_rs-0.1.4-cp311-cp311-manylinux_2_34_x86_64.whl"
-RECEIPT_NAME="catanatron_rs-0.1.4-build-receipt.json"
+WHEEL_NAME="catanatron_rs-0.1.5-cp311-cp311-manylinux_2_34_x86_64.whl"
+RECEIPT_NAME="catanatron_rs-0.1.5-build-receipt.json"
 SEALED_SOURCE_DATE_EPOCH="1783641600"
 SEALED_RUSTFLAGS="--remap-path-prefix=/tmp/catan-zero-catanatron-rs-wheel-src=/src/catan-zero-public -C link-arg=-Wl,--build-id=none"
-SEALED_COMPILE_IDENTITY="catanatron-rs-0.1.4-infoset-wheel-v1"
+SEALED_COMPILE_IDENTITY="catanatron-rs-0.1.5-native-mcts-wheel-v1"
 
 die() {
   echo "build_catanatron_rs_wheel: $*" >&2
@@ -157,7 +157,7 @@ echo "$PYTHON_VERSION"
 echo "$STRIP_VERSION"
 
 mkdir -p "$OUT_DIR"
-rm -f "$OUT_DIR"/catanatron_rs-0.1.4-*.whl
+rm -f "$OUT_DIR"/catanatron_rs-0.1.5-*.whl
 rm -f "$OUT_DIR/$RECEIPT_NAME"
 cargo test \
   --locked \
@@ -251,6 +251,9 @@ WHEEL_SHA256="$(sha256sum "$WHEEL_PATH" | awk '{print $1}')"
 BUILDER_SHA256="$(sha256sum "$ROOT/tools/build_catanatron_rs_wheel.sh" | awk '{print $1}')"
 CARGO_LOCK_SHA256="$(sha256sum "$ROOT/native/catanatron-rs/Cargo.lock" | awk '{print $1}')"
 PYTHON_CARGO_LOCK_SHA256="$(sha256sum "$ROOT/native/catanatron-rs/python/Cargo.lock" | awk '{print $1}')"
+GUMBEL_CARGO_LOCK_SHA256="$(sha256sum "$ROOT/native/gumbel_mcts_rs/Cargo.lock" | awk '{print $1}')"
+GUMBEL_LIB_RS_SHA256="$(sha256sum "$ROOT/native/gumbel_mcts_rs/src/lib.rs" | awk '{print $1}')"
+GUMBEL_PYTHON_BINDING_RS_SHA256="$(sha256sum "$ROOT/native/gumbel_mcts_rs/src/python_binding.rs" | awk '{print $1}')"
 
 "$PYTHON_BIN" - "$OUT_DIR/$RECEIPT_NAME" <<PY
 import json
@@ -258,12 +261,15 @@ import pathlib
 import sys
 
 receipt = {
-    "schema_version": "catanatron-rs-wheel-build-receipt-v1",
+    "schema_version": "catanatron-rs-wheel-build-receipt-v2",
     "source_commit": None,
     "source_tree": None,
     "builder_sha256": "$BUILDER_SHA256",
     "cargo_lock_sha256": "$CARGO_LOCK_SHA256",
     "python_cargo_lock_sha256": "$PYTHON_CARGO_LOCK_SHA256",
+    "gumbel_cargo_lock_sha256": "$GUMBEL_CARGO_LOCK_SHA256",
+    "gumbel_lib_rs_sha256": "$GUMBEL_LIB_RS_SHA256",
+    "gumbel_python_binding_rs_sha256": "$GUMBEL_PYTHON_BINDING_RS_SHA256",
     "rustc_version": "$RUSTC_VERSION",
     "cargo_version": "$CARGO_VERSION",
     "maturin_version": "$MATURIN_VERSION",

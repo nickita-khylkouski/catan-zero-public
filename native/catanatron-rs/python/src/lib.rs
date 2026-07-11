@@ -6,6 +6,9 @@ use ::catanatron_rs as ctrs;
 use ctrs::python_bindings::PyGame;
 use ctrs::{Color, Game, action_to_json_value, game_to_json_value, generate_playable_actions};
 
+#[path = "../../../gumbel_mcts_rs/src/python_binding.rs"]
+mod gumbel_binding;
+
 // ---------------------------------------------------------------------------
 // GameWrapper — backward compat pyclass
 // ---------------------------------------------------------------------------
@@ -97,5 +100,6 @@ fn color_to_string(c: Color) -> String {
 fn catanatron_rs(module: &Bound<'_, PyModule>) -> PyResult<()> {
     init_python_module(module)?;
     module.add_class::<GameWrapper>()?;
+    gumbel_binding::register(module)?;
     Ok(())
 }

@@ -49,6 +49,45 @@ from catan_zero.rl.entity_token_features import (
 )
 
 
+_REQUIRED_NATIVE_FEATURE_APIS = (
+    "EntityTopology",
+    "build_entity_features_flat",
+    "build_action_context_flat",
+)
+
+
+def rust_feature_path_available() -> bool:
+    """Return whether the installed wheel supports the complete leaf path."""
+    try:
+        import catanatron_rs
+    except ImportError:
+        return False
+    return all(
+        callable(getattr(catanatron_rs, name, None))
+        for name in _REQUIRED_NATIVE_FEATURE_APIS
+    )
+
+
+def require_rust_feature_path() -> None:
+    """Fail closed unless both native entity and context builders exist."""
+    try:
+        import catanatron_rs
+    except ImportError as error:
+        raise RuntimeError(
+            "Rust feature path requested but catanatron_rs is not importable"
+        ) from error
+    missing = [
+        name
+        for name in _REQUIRED_NATIVE_FEATURE_APIS
+        if not callable(getattr(catanatron_rs, name, None))
+    ]
+    if missing:
+        raise RuntimeError(
+            "Rust feature path requested but the installed catanatron_rs wheel "
+            f"is missing {', '.join(missing)}; refusing Python fallback"
+        )
+
+
 class RustTopology:
     """Board topology + port assignment, computed once per board and reused
     across every leaf/batch featurization for that board (mirrors -- and

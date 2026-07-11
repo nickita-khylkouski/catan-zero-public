@@ -620,6 +620,7 @@ def _resolved_draft(tmp_path: Path) -> Path:
                                 "--symmetry-averaged-eval-threshold",
                                 "--belief-chance-spectra",
                                 "--information-set-search",
+                                "--native-mcts-hot-loop",
                                 "--determinization-particles",
                                 "--determinization-min-simulations",
                             ],
@@ -637,6 +638,7 @@ def _resolved_draft(tmp_path: Path) -> Path:
                                 "--symmetry-averaged-eval-threshold": 20,
                                 "--belief-chance-spectra": False,
                                 "--information-set-search": True,
+                                "--native-mcts-hot-loop": True,
                                 "--determinization-particles": 4,
                                 "--determinization-min-simulations": 32,
                             },
@@ -1664,6 +1666,7 @@ def test_render_writes_commands_only_and_never_overwrites(tmp_path: Path) -> Non
     assert "--n-full" in current["argv"] and "128" in current["argv"]
     assert "--p-full" in current["argv"] and "0.4" in current["argv"]
     assert "--symmetry-averaged-eval" in current["argv"]
+    assert "--native-mcts-hot-loop" in current["argv"]
     assert "--n-full-wide" in current["argv"] and "256" in current["argv"]
     assert "--value-readout" in current["argv"] and "scalar" in current["argv"]
     history = next(

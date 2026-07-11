@@ -1,0 +1,153 @@
+{
+  "schema_version": "eval-packing-full-game-evidence-v1",
+  "status": "production_default_supported",
+  "host": "132-145-197-81",
+  "accelerator": "NVIDIA B200",
+  "gpu": 0,
+  "repo_commit_under_test": "7d48ccc",
+  "native_engine_commit": "a833ad3",
+  "checkpoint": "/home/ubuntu/catan-zero-production/runs/learner/a1-infoset-n128-20260710-r2/candidate.pt",
+  "checkpoint_role": "same checkpoint on both H2H sides; packing measurement only",
+  "design": {
+    "order": ["seed1-w8", "seed1-w16", "seed2-w16", "seed2-w8"],
+    "description": "Counterbalanced ABBA with two independent seed cohorts. Each point runs 16 color-swapped pairs (32 games) to natural termination or the production cap.",
+    "seed_cohorts": [6199901100, 6199902100],
+    "pairs_per_point": 16,
+    "games_per_point": 32,
+    "mps": "active",
+    "cpu_affinity": "unbound",
+    "threads_per_worker": 1,
+    "cuda_visible_devices": "0"
+  },
+  "science_recipe": {
+    "n_full": 128,
+    "c_scale": 0.03,
+    "c_visit": 50.0,
+    "sigma_eval": 0.98,
+    "rescale_noise_floor_c": 0.0,
+    "lazy_interior_chance": true,
+    "correct_rust_chance_spectra": true,
+    "public_observation": true,
+    "information_set_search": true,
+    "belief_chance_spectra": false,
+    "determinization_particles": 4,
+    "determinization_min_simulations": 32,
+    "symmetry_averaged_eval": true,
+    "symmetry_averaged_eval_threshold": 20,
+    "value_readout": "scalar",
+    "value_squash": "tanh",
+    "max_depth": 80,
+    "max_decisions": 600,
+    "max_root_candidates": 16,
+    "max_root_candidates_wide": 54,
+    "wide_candidates_threshold": 24,
+    "evaluator_rust_featurize": true,
+    "native_mcts_hot_loop": true
+  },
+  "points": [
+    {
+      "label": "seed1-w8",
+      "workers": 8,
+      "base_seed": 6199901100,
+      "wall_seconds": 428.56,
+      "harness_elapsed_seconds": 428.14190869405866,
+      "games": 32,
+      "complete_pairs": 16,
+      "truncated": 0,
+      "errors": 0,
+      "simulations": 568960,
+      "simulations_per_wall_second": 1327.6087362329663,
+      "games_per_hour": 268.8071681911518
+    },
+    {
+      "label": "seed1-w16",
+      "workers": 16,
+      "base_seed": 6199901100,
+      "wall_seconds": 364.37,
+      "harness_elapsed_seconds": 363.9097620821558,
+      "games": 32,
+      "complete_pairs": 16,
+      "truncated": 0,
+      "errors": 0,
+      "simulations": 584192,
+      "simulations_per_wall_second": 1603.293355654966,
+      "games_per_hour": 316.1621428767462
+    },
+    {
+      "label": "seed2-w16",
+      "workers": 16,
+      "base_seed": 6199902100,
+      "wall_seconds": 363.0,
+      "harness_elapsed_seconds": 362.5855388441123,
+      "games": 32,
+      "complete_pairs": 16,
+      "truncated": 0,
+      "errors": 0,
+      "simulations": 560768,
+      "simulations_per_wall_second": 1544.8154269972451,
+      "games_per_hour": 317.35537190082647
+    },
+    {
+      "label": "seed2-w8",
+      "workers": 8,
+      "base_seed": 6199902100,
+      "wall_seconds": 406.7,
+      "harness_elapsed_seconds": 406.2373797399923,
+      "games": 32,
+      "complete_pairs": 16,
+      "truncated": 0,
+      "errors": 0,
+      "simulations": 532096,
+      "simulations_per_wall_second": 1308.3255470863044,
+      "games_per_hour": 283.255470863044
+    }
+  ],
+  "aggregate": {
+    "workers_8": {
+      "wall_seconds": 835.26,
+      "harness_elapsed_seconds": 834.379288434051,
+      "games": 64,
+      "simulations": 1101056,
+      "simulations_per_wall_second": 1318.2194765701697,
+      "games_per_hour": 275.8422527117305
+    },
+    "workers_16": {
+      "wall_seconds": 727.37,
+      "harness_elapsed_seconds": 726.4953009262681,
+      "games": 64,
+      "simulations": 1144960,
+      "simulations_per_wall_second": 1574.1094628593426,
+      "games_per_hour": 316.7576336664971
+    },
+    "workers_16_vs_8": {
+      "simulations_per_second_gain_fraction": 0.19411789223063547,
+      "games_per_hour_gain_fraction": 0.1483289110081525,
+      "seed1_simulations_per_second_gain_fraction": 0.20765502056294327,
+      "seed2_simulations_per_second_gain_fraction": 0.18075767184827485,
+      "total_games": 128,
+      "total_truncations": 0,
+      "total_errors": 0
+    }
+  },
+  "observed_gpu0_seed2": {
+    "workers_16": {"samples": 69, "mean_utilization_percent": 87.9275, "max_power_watts": 761.24, "max_memory_mib": 23845},
+    "workers_8": {"samples": 81, "mean_utilization_percent": 87.7407, "max_power_watts": 652.44, "max_memory_mib": 11964}
+  },
+  "recommendation": "Use 16 workers per GPU as the default for newly rendered A1 H100 evaluation plans. Both independent full-game cohorts improve work-normalized throughput, all games complete cleanly, and resource use remains within the B200 envelope. Do not rewrite historical sealed plans.",
+  "limitations": [
+    "Changing worker count changes which worker RNG stream handles a seed, so trajectories and total simulation counts differ. Simulations per wall-second is the primary comparison; games per hour is secondary.",
+    "This measures the B200 packing envelope. H100 production monitoring must still enforce error, memory, and throughput health, but the prior short-horizon result and both full-game replicates point in the same direction.",
+    "An unrelated pytest process used GPU1 and less than one CPU core during both seed2 points. The measured workload stayed pinned to GPU0; the counterbalanced seed2 comparison shared that background condition.",
+    "No strength conclusion is possible because both roles use identical checkpoint bytes."
+  ],
+  "remote_artifacts": {
+    "directory": "/home/ubuntu/native-hotloop-evidence/packing-full-7d48ccc",
+    "sha256": {
+      "seed1-w8.json": "81145123ee11c6a5abca9431fa2c50c1f9077b6cd999023c217625f9708288b2",
+      "seed1-w16.json": "1f6bbb2b826b9ab963bbe30d70b377443bd18cfc8a57f6775ea1ad4f25aaa850",
+      "seed2-w8.json": "ce194291a767bb78ede0b0aa7a926735b5fcb18eaae4620deaf46bacea651095",
+      "seed2-w16.json": "40b2b50e308778e254748c1fa127a0eef80e5ace10ccf20f860fb7b0e51e916a",
+      "gpu-samples.log": "843e38aefcfedf8472020ffb4a461b6976780dfb0d3650b9357dabbc8dc9a9ed"
+    }
+  }
+}

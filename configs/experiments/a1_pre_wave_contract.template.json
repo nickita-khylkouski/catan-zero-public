@@ -135,7 +135,8 @@
     "shard_size": 512,
     "format": "npz",
     "device": "cuda",
-    "eval_server": false
+    "eval_server": false,
+    "native_mcts_hot_loop": true
   },
   "checkpoints": [
     {
@@ -249,7 +250,9 @@
       "../../native/catanatron-rs/src/lib.rs",
       "../../native/catanatron-rs/python/src/lib.rs",
       "../../native/gumbel_mcts_rs/Cargo.toml",
-      "../../native/gumbel_mcts_rs/src/lib.rs"
+      "../../native/gumbel_mcts_rs/Cargo.lock",
+      "../../native/gumbel_mcts_rs/src/lib.rs",
+      "../../native/gumbel_mcts_rs/src/python_binding.rs"
     ],
     "learner_code_files": [
       "../guards/train_bc.json",

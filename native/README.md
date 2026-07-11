@@ -26,3 +26,7 @@ resources, face-down development cards, the remaining deck, and hidden victory
 points while preserving public state, the observer hand, and root legal actions.
 It does not yet condition samples on deductions from the complete public action
 history, so artifacts must not label it a full Bayesian information-set posterior.
+
+Version `0.1.5` adds the fail-closed `gumbel_search` Python binding used by the
+native MCTS hot loop. The distinct version is intentional: wheels without that
+required API must never share the new release artifact name or package identity.

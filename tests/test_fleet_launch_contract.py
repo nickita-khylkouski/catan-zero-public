@@ -501,6 +501,7 @@ def test_generation_enables_proven_speed_path_explicitly() -> None:
         "\nTRAIN_RUNNER_EOF", 1
     )[0]
     for flag in (
+        "--native-mcts-hot-loop",
         "--rust-featurize",
         "--eval-server",
         "--eval-server-max-wait-ms 0.0",

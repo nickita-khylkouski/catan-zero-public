@@ -1,0 +1,67 @@
+{
+  "schema": "eval-rust-feature-b200-evidence-v1",
+  "commit": "6cb878e",
+  "host": "b200",
+  "device": "NVIDIA B200",
+  "checkpoint": "/home/ubuntu/catan-zero/runs/bc/entity_graph_35m_v3b_arch_seed/checkpoint.pt",
+  "checkpoint_sha256": "sha256:9852cc5c74de7f841e4887ffbf1a2d15f5b7f126c9b4834f2d37ee8ec3d5f998",
+  "parity": {
+    "command": "PYTHONPATH=src .venv/bin/python -m pytest -q tests/test_eval_rust_feature_opt_in.py tests/test_rust_featurize_parity.py tests/test_rust_featurize_evaluator_wiring.py tests/test_rust_action_context_evaluator_wiring.py",
+    "passed": 26,
+    "failed": 0,
+    "skipped": 0,
+    "elapsed_sec": 7.19,
+    "coverage": "Exact entity, legal-action target, and action-context tensor parity across diverse seeded states in both public-observation and omniscient modes; complete native-API preflight and shared-topology reuse."
+  },
+  "real_checkpoint_output_parity": {
+    "seed": 2771,
+    "states": 128,
+    "exact_output_states": 128,
+    "max_abs_prior_diff": 0.0,
+    "max_abs_value_diff": 0.0,
+    "public_observation": false,
+    "cache_size": 0
+  },
+  "microbenchmark": {
+    "tool": "tools/perf_snapshot.py leaf",
+    "method": "Two sequential isolated processes on CUDA_VISIBLE_DEVICES=1, same real checkpoint, seed 1771, 1000 collected self-play-shaped leaves per arm, cache disabled by the profiler.",
+    "python": {
+      "rust_featurize": false,
+      "leaves": 1000,
+      "mean_ms": 8.716004418674856,
+      "p50_ms": 7.896636845543981,
+      "p95_ms": 8.43515619635582,
+      "stage_pct": {
+        "snapshot_fetch": 12.961924037821301,
+        "ffi_resolve": 1.8287464979391255,
+        "featurize": 8.725165403188731,
+        "ffi_context": 0.4543904723859774,
+        "nn_forward": 64.58928337193228,
+        "postprocess": 11.440490216732584
+      }
+    },
+    "rust": {
+      "rust_featurize": true,
+      "leaves": 1000,
+      "mean_ms": 6.608146285172552,
+      "p50_ms": 5.973094142973423,
+      "p95_ms": 6.205514073371887,
+      "topology_bootstrap_ms": 0.3345098812133074,
+      "stage_pct": {
+        "snapshot_fetch": 5.06597997397737,
+        "ffi_resolve": 0.14024574556075195,
+        "featurize": 1.516829503243738,
+        "ffi_context": 0.10948227545743887,
+        "nn_forward": 85.27867886047709,
+        "postprocess": 7.888783641283609
+      }
+    },
+    "speedup": {
+      "mean_x": 1.318978733602182,
+      "p50_x": 1.3220345530353574,
+      "p95_x": 1.359300147678565,
+      "mean_wall_reduction_pct": 24.183766233367447
+    }
+  },
+  "conclusion": "The existing native featurizer is bit-exact and removes about one quarter of real-checkpoint leaf latency. It is now an explicit, provenance-sealed opt-in; the historical Python path remains the default and requesting native features fails before worker launch when either required wheel API is absent."
+}

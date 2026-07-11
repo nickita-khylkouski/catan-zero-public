@@ -47,12 +47,19 @@ if str(_TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(_TOOLS_DIR))
 
 from catan_zero.rl.config_cli import add_config_flags, resolve_config  # noqa: E402
+from catan_zero.rl.entity_token_features_rust import (  # noqa: E402
+    require_rust_feature_path,
+)
 from catan_zero.rl.gumbel_self_play import _apply_selected_action  # noqa: E402
 from catan_zero.rl.pipeline_configs import EvalConfig  # noqa: E402
 from catan_zero.search.gumbel_chance_mcts import (  # noqa: E402
     GumbelChanceMCTS,
     GumbelChanceMCTSConfig,
     _matches_explicit_or_legacy_width_gate,
+)
+from catan_zero.search.native_gumbel_mcts import (  # noqa: E402
+    create_gumbel_search,
+    native_hot_loop_available,
 )
 from catan_zero.search.neural_rust_mcts import (  # noqa: E402
     BatchedEntityGraphRustEvaluator,
@@ -234,9 +241,7 @@ def _load_held_out_high_regret_suite(
         )
         for stratum in ("opening", "robber_dev", "chance", "build_trade")
     }
-    actual_strata["41+"] = sum(
-        state["legal_count"] >= 41 for state in bound_states
-    )
+    actual_strata["41+"] = sum(state["legal_count"] >= 41 for state in bound_states)
     if any(actual_strata[label] < stratum_min_pairs for label in expected_strata):
         raise ValueError("held-out suite retained states do not cover every stratum")
     validate_replay_trajectories(bound_states)
@@ -657,9 +662,7 @@ def _resolve_c_scales(args: Any) -> dict[str, float]:
     candidate = _get("candidate_c_scale")
     baseline = _get("baseline_c_scale")
     return {
-        "candidate_c_scale": (
-            float(candidate) if candidate is not None else shared
-        ),
+        "candidate_c_scale": (float(candidate) if candidate is not None else shared),
         "baseline_c_scale": float(baseline) if baseline is not None else shared,
     }
 
@@ -799,6 +802,17 @@ def _build_search_config(
     )
 
 
+def _create_search(
+    config: GumbelChanceMCTSConfig,
+    evaluator: Any,
+    *,
+    native_mcts_hot_loop: bool,
+) -> GumbelChanceMCTS:
+    if not native_mcts_hot_loop:
+        return GumbelChanceMCTS(config, evaluator)
+    return create_gumbel_search(config, evaluator, native_hot_loop=True)
+
+
 def _write_worker_progress(
     progress_dir: str, worker_index: int, games_done: int, wins: int
 ) -> None:
@@ -845,7 +859,7 @@ def _run_worker(worker_args: dict[str, Any]) -> dict[str, Any]:
     c_scales = _resolve_c_scales(worker_args)
     candidate_n_full = int(budgets["candidate_n_full"])
     baseline_n_full = int(budgets["baseline_n_full"])
-    candidate_mcts = GumbelChanceMCTS(
+    candidate_mcts = _create_search(
         _build_search_config(
             worker_args,
             seed=worker_seed,
@@ -855,8 +869,9 @@ def _run_worker(worker_args: dict[str, Any]) -> dict[str, Any]:
             c_scale=c_scales["candidate_c_scale"],
         ),
         candidate_evaluator,
+        native_mcts_hot_loop=bool(worker_args.get("native_mcts_hot_loop", False)),
     )
-    baseline_mcts = GumbelChanceMCTS(
+    baseline_mcts = _create_search(
         _build_search_config(
             worker_args,
             seed=worker_seed,
@@ -866,6 +881,7 @@ def _run_worker(worker_args: dict[str, Any]) -> dict[str, Any]:
             c_scale=c_scales["baseline_c_scale"],
         ),
         baseline_evaluator,
+        native_mcts_hot_loop=bool(worker_args.get("native_mcts_hot_loop", False)),
     )
     mcts_by_role = {"candidate": candidate_mcts, "baseline": baseline_mcts}
 
@@ -902,9 +918,7 @@ def _run_worker(worker_args: dict[str, Any]) -> dict[str, Any]:
                             replay_source = archived["replay_source"]
                             pinned_scope = pin_replay_scope(
                                 original_scope,
-                                expected_sha256=replay_source[
-                                    "scope_inventory_sha256"
-                                ],
+                                expected_sha256=replay_source["scope_inventory_sha256"],
                                 expected_count=replay_source["scope_shard_count"],
                             )
                             pinned_replay_scopes[original_scope] = pinned_scope
@@ -1238,6 +1252,22 @@ def main() -> None:
         help="Shared inclusive minimum legal-action count for D6 averaging. "
         "Default None preserves the legacy > --wide-candidates-threshold gate.",
     )
+    parser.add_argument(
+        "--native-mcts-hot-loop",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Explicitly use the feature-gated Rust MCTS tree hot loop. Default "
+        "False preserves Python; enabling fails closed if the matching wheel is absent.",
+    )
+    parser.add_argument(
+        "--evaluator-rust-featurize",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Build entity and legal-action context tensors with the bit-exact "
+            "native featurizer. Opt-in and fail-closed; no Python fallback."
+        ),
+    )
     parser.add_argument("--base-seed", type=int, default=1)
     parser.add_argument(
         "--held-out-high-regret-suite",
@@ -1271,6 +1301,16 @@ def main() -> None:
     parser.add_argument("--out", required=True)
     add_config_flags(parser, default_purpose="gumbel_search_cross_net_h2h")
     args = parser.parse_args()
+    if bool(args.native_mcts_hot_loop) and not native_hot_loop_available():
+        parser.error(
+            "--native-mcts-hot-loop requires a matching catanatron_rs wheel "
+            "exporting gumbel_search; refusing silent Python fallback"
+        )
+    if bool(args.evaluator_rust_featurize):
+        try:
+            require_rust_feature_path()
+        except RuntimeError as error:
+            parser.error(str(error))
     try:
         _validate_information_set_recipe(args)
     except ValueError as exc:
@@ -1382,6 +1422,8 @@ def main() -> None:
             "public_observation": bool(args.public_observation),
             "belief_chance_spectra": bool(args.belief_chance_spectra),
             "information_set_search": bool(args.information_set_search),
+            "native_mcts_hot_loop": bool(args.native_mcts_hot_loop),
+            "evaluator_rust_featurize": bool(args.evaluator_rust_featurize),
             "determinization_particles": int(args.determinization_particles),
             "determinization_min_simulations": int(
                 args.determinization_min_simulations
@@ -1635,6 +1677,12 @@ def _build_summary(
         "public_observation": bool(args.public_observation),
         "belief_chance_spectra": bool(args.belief_chance_spectra),
         "information_set_search": bool(args.information_set_search),
+        "native_mcts_hot_loop": bool(getattr(args, "native_mcts_hot_loop", False)),
+        "mcts_implementation": (
+            "rust_native_hot_loop_v1"
+            if bool(getattr(args, "native_mcts_hot_loop", False))
+            else "python_reference"
+        ),
         "determinization_particles": int(args.determinization_particles),
         "determinization_min_simulations": int(args.determinization_min_simulations),
         "n_full_wide": (

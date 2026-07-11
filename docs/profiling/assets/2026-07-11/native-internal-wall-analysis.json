@@ -1,0 +1,276 @@
+{
+  "exclusive_categories": [
+    {
+      "category": "evaluator_queue_idle",
+      "pct": 64.09111210361769,
+      "samples": 1435
+    },
+    {
+      "category": "feature_encoding_and_leaf_ffi",
+      "pct": 44.15422885572139,
+      "samples": 355
+    },
+    {
+      "category": "native_mcts_traversal_and_allocator",
+      "pct": 26.616915422885572,
+      "samples": 214
+    },
+    {
+      "category": "other_rust_ffi",
+      "pct": 9.950248756218905,
+      "samples": 80
+    },
+    {
+      "category": "neural_forward",
+      "pct": 8.457711442786069,
+      "samples": 68
+    },
+    {
+      "category": "other_runtime",
+      "pct": 5.845771144278607,
+      "samples": 47
+    },
+    {
+      "category": "python_search_orchestration",
+      "pct": 3.7313432835820897,
+      "samples": 30
+    },
+    {
+      "category": "python_pimc_orchestration",
+      "pct": 0.746268656716418,
+      "samples": 6
+    },
+    {
+      "category": "startup_import_checkpoint",
+      "pct": 0.4975124378109453,
+      "samples": 4
+    }
+  ],
+  "inclusive_hotspots": [
+    {
+      "frame": "<module> (/home/ubuntu/catan-native-hotloop-canary/tools/gumbel_search_cross_net_h2h.py:1791)",
+      "pct_main_thread": 99.50186799501869,
+      "samples": 799
+    },
+    {
+      "frame": "_worker_entry (/home/ubuntu/catan-native-hotloop-canary/tools/gumbel_search_cross_net_h2h.py:536)",
+      "pct_main_thread": 97.88293897882939,
+      "samples": 786
+    },
+    {
+      "frame": "main (/home/ubuntu/catan-native-hotloop-canary/tools/gumbel_search_cross_net_h2h.py:1487)",
+      "pct_main_thread": 97.88293897882939,
+      "samples": 786
+    },
+    {
+      "frame": "_run_worker (/home/ubuntu/catan-native-hotloop-canary/tools/gumbel_search_cross_net_h2h.py:952)",
+      "pct_main_thread": 89.16562889165628,
+      "samples": 716
+    },
+    {
+      "frame": "play_one_h2h_game (/home/ubuntu/catan-native-hotloop-canary/tools/gumbel_search_cross_net_h2h.py:439)",
+      "pct_main_thread": 74.09713574097135,
+      "samples": 595
+    },
+    {
+      "frame": "search (/home/ubuntu/catan-native-hotloop-canary/src/catan_zero/search/gumbel_chance_mcts.py:788)",
+      "pct_main_thread": 74.09713574097135,
+      "samples": 595
+    },
+    {
+      "frame": "_search_information_set (/home/ubuntu/catan-native-hotloop-canary/src/catan_zero/search/gumbel_chance_mcts.py:893)",
+      "pct_main_thread": 71.48194271481943,
+      "samples": 574
+    },
+    {
+      "frame": "_search_single_world (/home/ubuntu/catan-native-hotloop-canary/src/catan_zero/search/native_gumbel_mcts.py:197)",
+      "pct_main_thread": 69.7384806973848,
+      "samples": 560
+    },
+    {
+      "frame": "_fetch_leaf_decision_inputs (/home/ubuntu/catan-native-hotloop-canary/src/catan_zero/search/neural_rust_mcts.py:190)",
+      "pct_main_thread": 43.586550435865504,
+      "samples": 350
+    },
+    {
+      "frame": "evaluate (/home/ubuntu/catan-native-hotloop-canary/src/catan_zero/search/native_gumbel_mcts.py:157)",
+      "pct_main_thread": 37.359900373599004,
+      "samples": 300
+    },
+    {
+      "frame": "evaluate (/home/ubuntu/catan-native-hotloop-canary/src/catan_zero/search/neural_rust_mcts.py:953)",
+      "pct_main_thread": 31.63138231631382,
+      "samples": 254
+    },
+    {
+      "frame": "malloc (/usr/lib/x86_64-linux-gnu/libc.so.6)",
+      "pct_main_thread": 29.638854296388544,
+      "samples": 238
+    },
+    {
+      "frame": "0x7c4c96429d90 (/usr/lib/x86_64-linux-gnu/libc.so.6)",
+      "pct_main_thread": 16.189290161892902,
+      "samples": 130
+    },
+    {
+      "frame": "evaluate_many (/home/ubuntu/catan-native-hotloop-canary/src/catan_zero/search/native_gumbel_mcts.py:172)",
+      "pct_main_thread": 14.819427148194272,
+      "samples": 119
+    },
+    {
+      "frame": "play_one_h2h_game (/home/ubuntu/catan-native-hotloop-canary/tools/gumbel_search_cross_net_h2h.py:470)",
+      "pct_main_thread": 13.823163138231632,
+      "samples": 111
+    },
+    {
+      "frame": "evaluate_many (/home/ubuntu/catan-native-hotloop-canary/src/catan_zero/search/neural_rust_mcts.py:731)",
+      "pct_main_thread": 12.577833125778332,
+      "samples": 101
+    },
+    {
+      "frame": "_$LT$alloc..vec..Vec$LT$T$C$A$GT$$u20$as$u20$core..clone..Clone$GT$::clone::h77f0956de19aa7c6 (/home/ubuntu/catan-native-hotloop-canary/.venv-native/lib/python3.11/site-packages/catanatron_rs/catanatron_rs.cpython-311-x86_64-linux-gnu.so)",
+      "pct_main_thread": 11.083437110834371,
+      "samples": 89
+    },
+    {
+      "frame": "_apply_selected_action (/home/ubuntu/catan-native-hotloop-canary/src/catan_zero/rl/gumbel_self_play.py:530)",
+      "pct_main_thread": 10.95890410958904,
+      "samples": 88
+    },
+    {
+      "frame": "free (/usr/lib/x86_64-linux-gnu/libc.so.6)",
+      "pct_main_thread": 8.34371108343711,
+      "samples": 67
+    },
+    {
+      "frame": "_entity_batch_via_rust (/home/ubuntu/catan-native-hotloop-canary/src/catan_zero/search/neural_rust_mcts.py:291)",
+      "pct_main_thread": 7.347447073474471,
+      "samples": 59
+    },
+    {
+      "frame": "build_entity_features_rust (/home/ubuntu/catan-native-hotloop-canary/src/catan_zero/rl/entity_token_features_rust.py:244)",
+      "pct_main_thread": 7.347447073474471,
+      "samples": 59
+    },
+    {
+      "frame": "_find_and_load_unlocked (<frozen importlib._bootstrap>:1147)",
+      "pct_main_thread": 5.9775840597758405,
+      "samples": 48
+    },
+    {
+      "frame": "_load_unlocked (<frozen importlib._bootstrap>:690)",
+      "pct_main_thread": 5.9775840597758405,
+      "samples": 48
+    },
+    {
+      "frame": "_find_and_load (<frozen importlib._bootstrap>:1176)",
+      "pct_main_thread": 5.9775840597758405,
+      "samples": 48
+    },
+    {
+      "frame": "exec_module (<frozen importlib._bootstrap_external>:940)",
+      "pct_main_thread": 5.72851805728518,
+      "samples": 46
+    },
+    {
+      "frame": "_run_worker (/home/ubuntu/catan-native-hotloop-canary/tools/gumbel_search_cross_net_h2h.py:845)",
+      "pct_main_thread": 5.72851805728518,
+      "samples": 46
+    },
+    {
+      "frame": "_call_with_frames_removed (<frozen importlib._bootstrap>:241)",
+      "pct_main_thread": 5.72851805728518,
+      "samples": 46
+    },
+    {
+      "frame": "evaluate (/home/ubuntu/catan-native-hotloop-canary/src/catan_zero/search/neural_rust_mcts.py:1010)",
+      "pct_main_thread": 5.1058530510585305,
+      "samples": 41
+    },
+    {
+      "frame": "serde_core::ser::impls::_$LT$impl$u20$serde_core..ser..Serialize$u20$for$u20$$RF$T$GT$::serialize::h6475b937b637423c (/home/ubuntu/catan-native-hotloop-canary/.venv-native/lib/python3.11/site-packages/catanatron_rs/catanatron_rs.cpython-311-x86_64-linux-gnu.so)",
+      "pct_main_thread": 3.7359900373599,
+      "samples": 30
+    },
+    {
+      "frame": "0x7c4c964a3bdb (/usr/lib/x86_64-linux-gnu/libc.so.6)",
+      "pct_main_thread": 3.61145703611457,
+      "samples": 29
+    },
+    {
+      "frame": "hashbrown::raw::RawTable$LT$T$C$A$GT$::reserve_rehash::h7355a5d78a4598c6 (/home/ubuntu/catan-native-hotloop-canary/.venv-native/lib/python3.11/site-packages/catanatron_rs/catanatron_rs.cpython-311-x86_64-linux-gnu.so)",
+      "pct_main_thread": 3.61145703611457,
+      "samples": 29
+    },
+    {
+      "frame": "_RNvXs4_NtCs8y6E41fb8tc_5alloc6stringNtB5_6StringNtNtCs3BFokC4QLxY_4core5clone5Clone5clone (/home/ubuntu/catan-native-hotloop-canary/.venv-native/lib/python3.11/site-packages/catanatron_rs/catanatron_rs.cpython-311-x86_64-linux-gnu.so)",
+      "pct_main_thread": 3.61145703611457,
+      "samples": 29
+    },
+    {
+      "frame": "loads (/usr/lib/python3.11/json/__init__.py:346)",
+      "pct_main_thread": 3.3623910336239105,
+      "samples": 27
+    },
+    {
+      "frame": "decode (/usr/lib/python3.11/json/decoder.py:337)",
+      "pct_main_thread": 3.3623910336239105,
+      "samples": 27
+    },
+    {
+      "frame": "_$LT$serde_json..value..ser..Serializer$u20$as$u20$serde_core..ser..Serializer$GT$::serialize_seq::he2392181762b4dd5 (/home/ubuntu/catan-native-hotloop-canary/.venv-native/lib/python3.11/site-packages/catanatron_rs/catanatron_rs.cpython-311-x86_64-linux-gnu.so)",
+      "pct_main_thread": 3.3623910336239105,
+      "samples": 27
+    },
+    {
+      "frame": "_RNvXs2_NtNtCs3JBboNF8E1m_3std4hash6randomNtB5_13DefaultHasherNtNtCs3BFokC4QLxY_4core4hash6Hasher5write.llvm.6570245538188601329 (/home/ubuntu/catan-native-hotloop-canary/.venv-native/lib/python3.11/site-packages/catanatron_rs/catanatron_rs.cpython-311-x86_64-linux-gnu.so)",
+      "pct_main_thread": 3.3623910336239105,
+      "samples": 27
+    },
+    {
+      "frame": "0x7c4c9636480d (/usr/lib/python3.11/lib-dynload/_json.cpython-311-x86_64-linux-gnu.so)",
+      "pct_main_thread": 3.2378580323785804,
+      "samples": 26
+    },
+    {
+      "frame": "raw_decode (/usr/lib/python3.11/json/decoder.py:353)",
+      "pct_main_thread": 3.2378580323785804,
+      "samples": 26
+    },
+    {
+      "frame": "0x7c4c9636572d (/usr/lib/python3.11/lib-dynload/_json.cpython-311-x86_64-linux-gnu.so)",
+      "pct_main_thread": 3.1133250311332503,
+      "samples": 25
+    },
+    {
+      "frame": "0x7c4c96365ac1 (/usr/lib/python3.11/lib-dynload/_json.cpython-311-x86_64-linux-gnu.so)",
+      "pct_main_thread": 3.1133250311332503,
+      "samples": 25
+    }
+  ],
+  "samples_main_thread": 803,
+  "samples_total_all_threads": 2239,
+  "source": "/home/ubuntu/native-hotloop-evidence/canonical-4a6988a/internal-native-wall.raw",
+  "threads": [
+    {
+      "pct_all_threads": 35.86422510049129,
+      "samples": 803,
+      "thread": "thread (2491361): MainThread"
+    },
+    {
+      "pct_all_threads": 32.11255024564538,
+      "samples": 719,
+      "thread": "thread (2491451): rust-mcts-batched-evaluator"
+    },
+    {
+      "pct_all_threads": 31.97856185797231,
+      "samples": 716,
+      "thread": "thread (2491453): rust-mcts-batched-evaluator"
+    },
+    {
+      "pct_all_threads": 0.044662795891022775,
+      "samples": 1,
+      "thread": "thread (2491361)"
+    }
+  ]
+}

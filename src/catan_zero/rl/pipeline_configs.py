@@ -90,7 +90,7 @@ _T = TypeVar("_T", bound="PipelineConfig")
 
 # Bump when the *set* of fields on any pipeline config changes so that hashes
 # from before/after the change are never mistaken for equal regimes.
-CONFIG_SCHEMA_VERSION = 6
+CONFIG_SCHEMA_VERSION = 7
 
 # Length (hex chars) of the short hash embedded in artifacts. 16 hex chars =
 # 64 bits; collision probability is negligible for the run counts here and the
@@ -368,6 +368,10 @@ class GenerateConfig(PipelineConfig):
     exact_budget_sh: bool = False
     exact_budget_sh_min_n: int = 0
     root_wave_batching: bool = False
+    # Implementation choice is science-bearing: the native loop is required
+    # to be parity-gated, but recording it still prevents native/reference
+    # rows from being merged under one opaque config identity.
+    native_mcts_hot_loop: bool = False
     # Evaluator/transport choices can change batching composition and numeric
     # results, so they are part of provenance rather than "mere performance"
     # flags. In particular TF32 was measured to diverge self-play trajectories.
@@ -452,6 +456,10 @@ class EvalConfig(PipelineConfig):
     public_observation: bool = False
     belief_chance_spectra: bool = False
     information_set_search: bool = False
+    # Explicit implementation arm. False preserves the reference Python tree
+    # loop; True requires the matching catanatron_rs native-search binding and
+    # fails closed rather than silently changing the evaluation operator.
+    native_mcts_hot_loop: bool = False
     determinization_particles: int = 1
     determinization_min_simulations: int = 32
     # Seeds + games.

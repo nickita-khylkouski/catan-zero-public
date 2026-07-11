@@ -61,10 +61,12 @@ from catan_zero.rl.flywheel.opponent_mix import (
     scale_external_engine_fraction,
     validate_external_engine_fraction,
 )
+from catan_zero.rl.entity_token_features_rust import require_rust_feature_path
 from catan_zero.search.gumbel_chance_mcts import (
     GumbelChanceMCTSConfig,
     HeuristicRustEvaluator,
 )
+from catan_zero.search.native_gumbel_mcts import native_hot_loop_available
 from catan_zero.rl.config_cli import add_config_flags, apply_config_file, resolve_config
 from catan_zero.rl.pipeline_configs import GenerateConfig
 from catan_zero.search.neural_rust_mcts import (
@@ -226,7 +228,14 @@ def _stage_producer_checkpoint(
 def _validate_science_args(
     args: argparse.Namespace, parser: argparse.ArgumentParser
 ) -> None:
-    """Reject NaN/Inf science settings before guards, workers, or artifacts."""
+    """Reject invalid science settings before guards, workers, or artifacts.
+
+    Public-observation masking and information-set search are one semantic
+    regime, not independent tuning flags.  Masking only the evaluator while
+    traversing clones of the authoritative game would leak hidden truth into
+    the MCTS targets.  Keep this invariant inside the generator so direct
+    callers and intentional guard-skipping smoke tests cannot bypass it.
+    """
     finite_names = (
         "p_full",
         "c_visit",
@@ -252,6 +261,20 @@ def _validate_science_args(
                 "--temperature-move-fraction must be finite and in [0, 1] "
                 f"(got {args.temperature_move_fraction!r})"
             )
+    public = bool(args.public_observation)
+    information_set = bool(args.information_set_search)
+    if public and not information_set:
+        parser.error(
+            "--public-observation requires --information-set-search; masking NN "
+            "features alone does not make MCTS targets public-information safe"
+        )
+    if information_set and not public:
+        parser.error("--information-set-search requires --public-observation")
+    if information_set and bool(args.belief_chance_spectra):
+        parser.error(
+            "--information-set-search cannot be combined with "
+            "--belief-chance-spectra"
+        )
 
 
 def _guard_argv_with_config_values(
@@ -511,6 +534,13 @@ def build_parser() -> argparse.ArgumentParser:
         "Default off until H100 throughput and target-quality canaries pass.",
     )
     parser.add_argument(
+        "--native-mcts-hot-loop",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use the parity-gated Rust MCTS traversal/bookkeeping loop. Explicit "
+        "opt-in; fails closed if the installed catanatron_rs wheel lacks it.",
+    )
+    parser.add_argument(
         "--public-observation",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -522,6 +552,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--rust-featurize",
+        "--evaluator-rust-featurize",
+        dest="rust_featurize",
         action=argparse.BooleanOptionalAction,
         default=False,
         help="Build the ENTITY-TOKEN arrays via the native Rust featurizer "
@@ -905,6 +937,16 @@ def main(argv: Sequence[str] | None = None) -> None:
         argv=_raw_argv,
         expected_pipeline=GenerateConfig.PIPELINE,
     )
+    if bool(args.native_mcts_hot_loop) and not native_hot_loop_available():
+        parser.error(
+            "--native-mcts-hot-loop requires a matching catanatron_rs wheel "
+            "exporting gumbel_search; refusing silent Python fallback"
+        )
+    if bool(args.rust_featurize):
+        try:
+            require_rust_feature_path()
+        except RuntimeError as error:
+            parser.error(str(error))
     if int(args.fleet_pipeline_index) >= int(args.fleet_pipelines_per_gpu):
         parser.error(
             "--fleet-pipeline-index must be smaller than --fleet-pipelines-per-gpu"
@@ -1147,6 +1189,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "exact_budget_sh": bool(args.exact_budget_sh),
                 "exact_budget_sh_min_n": int(args.exact_budget_sh_min_n),
                 "root_wave_batching": bool(args.root_wave_batching),
+                "native_mcts_hot_loop": bool(args.native_mcts_hot_loop),
                 "public_observation": bool(args.public_observation),
                 "rust_featurize": bool(args.rust_featurize),
                 "eval_cache_size": int(args.eval_cache_size),
@@ -1727,6 +1770,7 @@ def _run_worker(
         run_id=str(worker_args.get("run_id", "")),
         opponent_pool=opponent_pool,
         opponent_mix=opponent_mix,
+        native_mcts_hot_loop=bool(worker_args.get("native_mcts_hot_loop", False)),
     )
     summary["worker_index"] = int(worker_args["worker_index"])
     return summary
@@ -1884,6 +1928,9 @@ def _merge_worker_summaries(
         "exact_budget_sh": bool(getattr(args, "exact_budget_sh", False)),
         "exact_budget_sh_min_n": int(getattr(args, "exact_budget_sh_min_n", 0)),
         "root_wave_batching": bool(getattr(args, "root_wave_batching", False)),
+        "native_mcts_hot_loop": bool(
+            getattr(args, "native_mcts_hot_loop", False)
+        ),
         "rust_featurize": bool(args.rust_featurize),
         "value_readout": str(getattr(args, "value_readout", "scalar")),
         "checkpoint": args.checkpoint,
