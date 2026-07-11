@@ -56,6 +56,18 @@ HIGH_REGRET_SUITE_SCHEMA = SUITE_SCHEMA
 BUCKET_GAME_REPORT_SCHEMA = "a1-bucket-game-report-v1"
 FLEET_EVALUATION_POOL_SCHEMA = "a1-fleet-evaluation-pool-v1"
 LEGACY_INCUMBENT_PROVENANCE_SCHEMA = "a1-legacy-incumbent-provenance-v1"
+LEGACY_CONTRACT_ATTESTATION_SCHEMA = "a1-markerless-v2-promotion-attestation-v1"
+# One immutable pre-promotion contract was sealed before promotion_handoff
+# existed.  Compatibility is intentionally an exact identity allowlist, not a
+# schema-wide bypass: new markerless v2 locks can never opt themselves in.
+HISTORICAL_MARKERLESS_A1_CONTRACT = {
+    "contract_id": "a1-infoset-n128-p4-12000games-20260710-r1",
+    "contract_sha256": "sha256:c88cec355237f4526159650befb209ea3a8c2d095a32dd645fe04bd01d1c59c4",
+    "lock_file_sha256": "sha256:8301c7547e1745812c69ca04934424755c7116eb5e221688abc58c1bcb7a3122",
+    "source_draft_sha256": "sha256:ae4af7ba7df732137bca201198bdbef73a2500bebe42bc8cda118cfb082d10fe",
+    "training_receipt_sha256": "sha256:3567ec5e8bd9716ec9ce738415a259f984e643e55735ecc594c7df46c0a4801f",
+    "training_receipt_digest": "sha256:187288dabbe4ce981196db63a2e73946587877f11afadcdc7994eec2b89067b1",
+}
 MAX_CALIBRATION_RMSE_REGRESSION = 0.02
 MAX_EXTERNAL_WIN_RATE_REGRESSION = 0.02
 CANDIDATE_DEPLOYED_C_SCALE = 0.10
@@ -725,17 +737,173 @@ def _verify_one_dose_training_receipt(
     }
 
 
+def build_legacy_contract_attestation(
+    contract_lock: Path, training_receipt: Path
+) -> dict[str, Any]:
+    """Bind the sole allowlisted markerless v2 lock to its completed dose.
+
+    This does not make the lock valid for generation, rendering, post-wave
+    audit, or producer handoff.  It is consumed only by this promotion module.
+    """
+
+    contract_lock = _canonical_existing_file(
+        contract_lock, where="historical markerless A1 contract lock"
+    )
+    training_receipt = _canonical_existing_file(
+        training_receipt, where="historical A1 training receipt"
+    )
+    lock = _load_json(contract_lock)
+    if lock.get("schema_version") != a1_contract.LEGACY_LOCK_SCHEMA:
+        raise PromotionError("legacy promotion attestation requires a v2 lock")
+    if "promotion_handoff" in lock:
+        raise PromotionError("legacy promotion attestation requires a markerless lock")
+    unhashed = dict(lock)
+    declared_contract_sha = unhashed.pop("contract_sha256", None)
+    if declared_contract_sha != _digest_value(unhashed):
+        raise PromotionError("markerless v2 contract semantic digest mismatch")
+    source_draft = lock.get("source_draft")
+    if not isinstance(source_draft, dict) or set(source_draft) != {"path", "sha256"}:
+        raise PromotionError("markerless v2 contract has no exact source_draft record")
+    source_path = _canonical_existing_file(
+        Path(str(source_draft["path"])), where="historical contract source draft"
+    )
+    source_payload = _load_json(source_path)
+    observed = {
+        "contract_id": lock.get("contract_id"),
+        "contract_sha256": declared_contract_sha,
+        "lock_file_sha256": _sha256(contract_lock),
+        "source_draft_sha256": source_draft.get("sha256"),
+    }
+    expected_contract = {
+        key: HISTORICAL_MARKERLESS_A1_CONTRACT[key] for key in observed
+    }
+    if observed != expected_contract:
+        raise PromotionError(
+            "markerless v2 contract is not the allowlisted historical A1 contract"
+        )
+    if (
+        _sha256(source_path) != source_draft["sha256"]
+        or source_payload.get("schema_version") != a1_contract.LEGACY_DRAFT_SCHEMA
+        or source_payload.get("contract_id") != lock["contract_id"]
+        or "promotion_handoff" in source_payload
+    ):
+        raise PromotionError("historical markerless source draft binding drift")
+
+    receipt = _verify_receipt_digest(_load_json(training_receipt))
+    if (
+        receipt.get("schema_version")
+        not in {one_dose.RECEIPT_SCHEMA, one_dose.RETRY_RECEIPT_SCHEMA}
+        or receipt.get("status") != "complete"
+        or receipt.get("returncode") != 0
+        or receipt.get("contract_sha256") != declared_contract_sha
+        or receipt.get("lock") != str(contract_lock)
+        or receipt.get("lock_file_sha256") != observed["lock_file_sha256"]
+        or _sha256(training_receipt)
+        != HISTORICAL_MARKERLESS_A1_CONTRACT["training_receipt_sha256"]
+        or receipt.get("receipt_sha256")
+        != HISTORICAL_MARKERLESS_A1_CONTRACT["training_receipt_digest"]
+    ):
+        raise PromotionError(
+            "training receipt does not bind the exact historical contract lock"
+        )
+    attestation: dict[str, Any] = {
+        "schema_version": LEGACY_CONTRACT_ATTESTATION_SCHEMA,
+        "purpose": "promotion_only_historical_pre_promotion_contract",
+        "contract_lock": {
+            "path": str(contract_lock),
+            "sha256": observed["lock_file_sha256"],
+            "contract_sha256": declared_contract_sha,
+            "contract_id": lock["contract_id"],
+        },
+        "source_draft": {
+            "path": str(source_path),
+            "sha256": source_draft["sha256"],
+        },
+        "training_receipt": {
+            "path": str(training_receipt),
+            "sha256": _sha256(training_receipt),
+            "receipt_sha256": receipt["receipt_sha256"],
+            "schema_version": receipt["schema_version"],
+        },
+    }
+    attestation["attestation_sha256"] = _digest_value(attestation)
+    return attestation
+
+
+def _verify_legacy_contract_attestation(
+    path: Path, *, contract_lock: Path
+) -> dict[str, Any]:
+    path = _canonical_existing_file(path, where="legacy contract attestation")
+    value = _require_exact_keys(
+        _load_json(path),
+        {
+            "schema_version",
+            "purpose",
+            "contract_lock",
+            "source_draft",
+            "training_receipt",
+            "attestation_sha256",
+        },
+        where="legacy contract attestation",
+    )
+    if (
+        value["schema_version"] != LEGACY_CONTRACT_ATTESTATION_SCHEMA
+        or value["purpose"] != "promotion_only_historical_pre_promotion_contract"
+    ):
+        raise PromotionError("legacy contract attestation schema/purpose drift")
+    declared = _validate_sha256(
+        value["attestation_sha256"], where="legacy attestation digest"
+    )
+    unhashed = dict(value)
+    unhashed.pop("attestation_sha256")
+    if declared != _digest_value(unhashed):
+        raise PromotionError("legacy contract attestation semantic digest mismatch")
+    contract_ref = _require_exact_keys(
+        value["contract_lock"],
+        {"path", "sha256", "contract_sha256", "contract_id"},
+        where="legacy attestation contract_lock",
+    )
+    if contract_ref["path"] != str(contract_lock):
+        raise PromotionError("legacy attestation binds a different contract path")
+    receipt_ref = _require_exact_keys(
+        value["training_receipt"],
+        {"path", "sha256", "receipt_sha256", "schema_version"},
+        where="legacy attestation training_receipt",
+    )
+    receipt_path = _canonical_existing_file(
+        Path(str(receipt_ref["path"])), where="attested training receipt"
+    )
+    rebuilt = build_legacy_contract_attestation(contract_lock, receipt_path)
+    if rebuilt != value or _sha256(receipt_path) != receipt_ref["sha256"]:
+        raise PromotionError("legacy contract attestation does not replay exactly")
+    return value
+
+
 def _verify_contract(
     path: Path,
     *,
     verify_lock_fn: Callable[..., dict[str, Any]] = a1_contract.verify_lock,
+    legacy_contract_attestation: Path | None = None,
+    expected_training_receipt: Path | None = None,
 ) -> dict[str, Any]:
-    try:
-        lock = verify_lock_fn(path, require_all_job_claims=True)
-    except Exception as error:
-        raise PromotionError(
-            f"sealed A1 contract verification failed: {error}"
-        ) from error
+    if legacy_contract_attestation is None:
+        try:
+            lock = verify_lock_fn(path, require_all_job_claims=True)
+        except Exception as error:
+            raise PromotionError(
+                f"sealed A1 contract verification failed: {error}"
+            ) from error
+    else:
+        legacy_value = _verify_legacy_contract_attestation(
+            legacy_contract_attestation, contract_lock=path
+        )
+        if expected_training_receipt is not None and legacy_value[
+            "training_receipt"
+        ]["path"] != str(expected_training_receipt):
+            raise PromotionError(
+                "legacy contract attestation binds a different training receipt"
+            )
+        lock = _load_json(path)
     search = lock.get("science", {}).get("search_operator", {})
     if search.get("n_full") != 128:
         raise PromotionError(
@@ -2658,6 +2826,7 @@ def prepare_promotion(
     training_receipt: Path,
     receipt_path: Path,
     reason: str,
+    legacy_contract_attestation: Path | None = None,
     verify_lock_fn: Callable[..., dict[str, Any]] = a1_contract.verify_lock,
 ) -> dict[str, Any]:
     registry_path = _canonical_existing_file(
@@ -2678,7 +2847,12 @@ def prepare_promotion(
         raise PromotionError(
             "authoritative registry must be an existing non-empty file"
         )
-    contract = _verify_contract(contract_lock, verify_lock_fn=verify_lock_fn)
+    contract = _verify_contract(
+        contract_lock,
+        verify_lock_fn=verify_lock_fn,
+        legacy_contract_attestation=legacy_contract_attestation,
+        expected_training_receipt=training_receipt,
+    )
     registry = ChampionRegistry.load(registry_path)
     verified = _verify_adjudication(
         adjudication_path,
@@ -2720,6 +2894,14 @@ def prepare_promotion(
             "contract_sha256": contract["contract_sha256"],
             "n_full": 128,
             "n_full_wide": None,
+            "legacy_contract_attestation": (
+                None
+                if legacy_contract_attestation is None
+                else {
+                    "path": str(legacy_contract_attestation.resolve(strict=True)),
+                    "sha256": _sha256(legacy_contract_attestation),
+                }
+            ),
         },
         "adjudication": {
             "path": str(adjudication_path.resolve()),
@@ -2756,6 +2938,7 @@ def execute_promotion(
     training_receipt: Path,
     receipt_path: Path,
     reason: str,
+    legacy_contract_attestation: Path | None = None,
     lock_path: Path | None = None,
     go: bool = False,
     verify_lock_fn: Callable[..., dict[str, Any]] = a1_contract.verify_lock,
@@ -2773,6 +2956,10 @@ def execute_promotion(
     training_receipt = _canonical_existing_file(
         training_receipt, where="A1 one-dose training receipt"
     )
+    if legacy_contract_attestation is not None:
+        legacy_contract_attestation = _canonical_existing_file(
+            legacy_contract_attestation, where="legacy contract attestation"
+        )
     receipt_path = _canonical_new_file(receipt_path, where="promotion receipt")
     lock_path = _enforce_canonical_lock(registry_path, lock_path)
     with _exclusive_lock(lock_path):
@@ -2784,6 +2971,7 @@ def execute_promotion(
             training_receipt=training_receipt,
             receipt_path=receipt_path,
             reason=reason,
+            legacy_contract_attestation=legacy_contract_attestation,
             verify_lock_fn=verify_lock_fn,
         )
         if not go:
@@ -3040,6 +3228,7 @@ def build_parser() -> argparse.ArgumentParser:
     promote.add_argument("--contract-lock", required=True, type=Path)
     promote.add_argument("--adjudication", required=True, type=Path)
     promote.add_argument("--training-receipt", required=True, type=Path)
+    promote.add_argument("--legacy-contract-attestation", type=Path, default=None)
     promote.add_argument("--receipt", required=True, type=Path)
     promote.add_argument("--reason", required=True)
     promote.add_argument("--lock-file", type=Path, default=None)
@@ -3066,6 +3255,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 contract_lock=args.contract_lock,
                 adjudication_path=args.adjudication,
                 training_receipt=args.training_receipt,
+                legacy_contract_attestation=args.legacy_contract_attestation,
                 receipt_path=args.receipt,
                 reason=args.reason,
                 lock_path=args.lock_file,

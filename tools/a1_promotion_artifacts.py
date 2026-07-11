@@ -1021,9 +1021,14 @@ def _parse_role_paths(values: Sequence[str], *, option: str) -> list[tuple[str, 
     return parsed
 
 
-def _contract(path: Path) -> dict[str, Any]:
+def _contract(
+    path: Path, legacy_contract_attestation: Path | None = None
+) -> dict[str, Any]:
     try:
-        return promotion._verify_contract(path.expanduser().resolve())  # noqa: SLF001
+        return promotion._verify_contract(  # noqa: SLF001
+            path.expanduser().resolve(),
+            legacy_contract_attestation=legacy_contract_attestation,
+        )
     except promotion.PromotionError as error:
         raise ArtifactBuildError(str(error)) from error
 
@@ -1031,6 +1036,14 @@ def _contract(path: Path) -> dict[str, Any]:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    legacy_contract = subparsers.add_parser(
+        "legacy-contract-attestation",
+        help="bind the allowlisted markerless v2 contract to its exact completed dose",
+    )
+    legacy_contract.add_argument("--contract-lock", type=Path, required=True)
+    legacy_contract.add_argument("--training-receipt", type=Path, required=True)
+    legacy_contract.add_argument("--out", type=Path, required=True)
 
     high = subparsers.add_parser("high-regret", help="derive a high-regret source")
     high.add_argument("--report", type=Path, required=True)
@@ -1068,6 +1081,7 @@ def _parser() -> argparse.ArgumentParser:
     legacy.add_argument("--calibration", type=Path, required=True)
     legacy.add_argument("--historical-training-report", type=Path, required=True)
     legacy.add_argument("--contract-lock", type=Path, required=True)
+    legacy.add_argument("--legacy-contract-attestation", type=Path)
     legacy.add_argument("--champion", type=Path, required=True)
     legacy.add_argument("--out", type=Path, required=True)
 
@@ -1076,6 +1090,7 @@ def _parser() -> argparse.ArgumentParser:
         "--kind", choices=sorted(promotion.REQUIRED_EVIDENCE_KINDS), required=True
     )
     evidence.add_argument("--contract-lock", type=Path, required=True)
+    evidence.add_argument("--legacy-contract-attestation", type=Path)
     evidence.add_argument("--candidate", type=Path, required=True)
     evidence.add_argument("--champion", type=Path, required=True)
     evidence.add_argument("--source", action="append", default=[], metavar="ROLE=PATH")
@@ -1085,6 +1100,7 @@ def _parser() -> argparse.ArgumentParser:
         "adjudicate", help="build final promotion adjudication"
     )
     adjudicate.add_argument("--contract-lock", type=Path, required=True)
+    adjudicate.add_argument("--legacy-contract-attestation", type=Path)
     adjudicate.add_argument("--training-receipt", type=Path, required=True)
     adjudicate.add_argument("--registry", type=Path, required=True)
     adjudicate.add_argument("--current-pointer", type=Path, required=True)
@@ -1104,7 +1120,11 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
-        if args.command == "high-regret":
+        if args.command == "legacy-contract-attestation":
+            value = promotion.build_legacy_contract_attestation(
+                args.contract_lock, args.training_receipt
+            )
+        elif args.command == "high-regret":
             value = build_high_regret_source(
                 report_path=args.report,
                 candidate=args.candidate,
@@ -1133,11 +1153,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             value = build_legacy_incumbent_calibration_source(
                 calibration_path=args.calibration,
                 historical_training_report=args.historical_training_report,
-                contract=_contract(args.contract_lock),
+                contract=_contract(
+                    args.contract_lock, args.legacy_contract_attestation
+                ),
                 champion=args.champion,
             )
         elif args.command == "evidence":
-            contract = _contract(args.contract_lock)
+            contract = _contract(
+                args.contract_lock, args.legacy_contract_attestation
+            )
             sources = _parse_role_paths(args.source, option="--source")
             value = build_evidence_envelope(
                 kind=args.kind,
@@ -1155,7 +1179,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 champion=args.champion,
             )
         else:
-            contract = _contract(args.contract_lock)
+            contract = _contract(
+                args.contract_lock, args.legacy_contract_attestation
+            )
             registry = ChampionRegistry.load(args.registry)
             value = build_adjudication(
                 contract=contract,
