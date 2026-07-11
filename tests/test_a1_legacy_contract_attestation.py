@@ -182,3 +182,34 @@ def test_promotion_cannot_substitute_a_different_training_receipt(
             legacy_contract_attestation=attestation,
             expected_training_receipt=other,
         )
+
+
+def test_contract_replacement_after_attestation_replay_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = _fixture(tmp_path, monkeypatch)
+    attestation = _attestation(fixture, tmp_path)
+    original = promotion.build_legacy_contract_attestation
+    replaced = False
+
+    def replace_after_replay(lock: Path, receipt: Path) -> dict:
+        nonlocal replaced
+        value = original(lock, receipt)
+        if not replaced:
+            replaced = True
+            malicious = dict(fixture["lock_payload"])
+            malicious["contract_id"] = "substituted-markerless-contract"
+            malicious.pop("contract_sha256")
+            malicious["contract_sha256"] = promotion._digest_value(malicious)
+            replacement = tmp_path / "replacement.lock.json"
+            _write(replacement, malicious)
+            replacement.replace(lock)
+        return value
+
+    monkeypatch.setattr(
+        promotion, "build_legacy_contract_attestation", replace_after_replay
+    )
+    with pytest.raises(promotion.PromotionError, match="changed after attestation replay"):
+        promotion._verify_contract(  # noqa: SLF001
+            fixture["lock"], legacy_contract_attestation=attestation
+        )
