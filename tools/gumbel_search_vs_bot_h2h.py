@@ -316,6 +316,11 @@ def _search_config_kwargs(worker_args: dict[str, Any]) -> dict[str, Any]:
             else None
         ),
         symmetry_averaged_eval=bool(worker_args.get("symmetry_averaged_eval", False)),
+        symmetry_averaged_eval_threshold=(
+            int(worker_args["symmetry_averaged_eval_threshold"])
+            if worker_args.get("symmetry_averaged_eval_threshold") is not None
+            else None
+        ),
     )
 
 
@@ -427,6 +432,13 @@ def main() -> None:
     parser.add_argument("--n-full-wide", type=int, default=None)
     parser.add_argument("--raw-policy-above-width", type=int, default=None)
     parser.add_argument("--symmetry-averaged-eval", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument(
+        "--symmetry-averaged-eval-threshold",
+        type=int,
+        default=None,
+        help="Inclusive minimum legal-action count for D6 evaluator averaging. "
+        "Default None preserves the legacy wide-root threshold gate.",
+    )
     parser.add_argument("--base-seed", type=int, default=1)
     parser.add_argument(
         "--gate-config",
@@ -521,6 +533,11 @@ def main() -> None:
                     int(args.raw_policy_above_width) if args.raw_policy_above_width is not None else None
                 ),
                 "symmetry_averaged_eval": bool(args.symmetry_averaged_eval),
+                "symmetry_averaged_eval_threshold": (
+                    int(args.symmetry_averaged_eval_threshold)
+                    if args.symmetry_averaged_eval_threshold is not None
+                    else None
+                ),
                 "threads_per_worker": threads_per_worker,
             }
         )
@@ -608,6 +625,12 @@ def _build_summary(
         ),
         "determinization_min_simulations": int(
             getattr(args, "determinization_min_simulations", 32)
+        ),
+        "symmetry_averaged_eval": bool(args.symmetry_averaged_eval),
+        "symmetry_averaged_eval_threshold": (
+            int(args.symmetry_averaged_eval_threshold)
+            if getattr(args, "symmetry_averaged_eval_threshold", None) is not None
+            else None
         ),
         "pairs_requested": len(pairs),
         "games_played": len(all_games),
