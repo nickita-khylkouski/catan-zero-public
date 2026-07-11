@@ -189,10 +189,10 @@ def test_contract_replacement_after_attestation_replay_is_rejected(
 ) -> None:
     fixture = _fixture(tmp_path, monkeypatch)
     attestation = _attestation(fixture, tmp_path)
-    original = promotion.build_legacy_contract_attestation
+    original = promotion._build_legacy_contract_attestation_snapshot  # noqa: SLF001
     replaced = False
 
-    def replace_after_replay(lock: Path, receipt: Path) -> dict:
+    def replace_after_replay(lock: Path, receipt: Path):
         nonlocal replaced
         value = original(lock, receipt)
         if not replaced:
@@ -207,9 +207,9 @@ def test_contract_replacement_after_attestation_replay_is_rejected(
         return value
 
     monkeypatch.setattr(
-        promotion, "build_legacy_contract_attestation", replace_after_replay
+        promotion, "_build_legacy_contract_attestation_snapshot", replace_after_replay
     )
-    with pytest.raises(promotion.PromotionError, match="changed after attestation replay"):
+    with pytest.raises(promotion.PromotionError, match="pathname changed after snapshot"):
         promotion._verify_contract(  # noqa: SLF001
             fixture["lock"], legacy_contract_attestation=attestation
         )

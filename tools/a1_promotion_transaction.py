@@ -16,6 +16,7 @@ mutation.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import fcntl
 import hashlib
 import json
@@ -461,6 +462,7 @@ def _verify_one_dose_training_receipt(
     candidate_sha256: str,
     training_report_path: Path,
     training_report_sha256: str,
+    legacy_snapshot: _LegacyPromotionSnapshot | None = None,
 ) -> dict[str, Any]:
     """Prove the candidate came from the sealed, environment-bound A1 dose.
 
@@ -472,7 +474,17 @@ def _verify_one_dose_training_receipt(
     """
 
     path = _canonical_existing_file(path, where="A1 one-dose training receipt")
-    value = _verify_receipt_digest(_load_json(path))
+    if legacy_snapshot is None:
+        value = _verify_receipt_digest(_load_json(path))
+    else:
+        if (
+            path != legacy_snapshot.training_receipt.path
+            or contract_lock != legacy_snapshot.contract_lock.path
+        ):
+            raise PromotionError("legacy snapshot paths differ from dose verification")
+        value = _verify_receipt_digest(
+            dict(legacy_snapshot.training_receipt.value)
+        )
     expected_keys = {
         "schema_version",
         "status",
@@ -528,7 +540,12 @@ def _verify_one_dose_training_receipt(
         raise PromotionError(
             "one-dose training receipt binds a different contract lock"
         )
-    if value["lock_file_sha256"] != _sha256(contract_lock):
+    contract_lock_sha256 = (
+        _sha256(contract_lock)
+        if legacy_snapshot is None
+        else _sha256_bytes(legacy_snapshot.contract_lock.data)
+    )
+    if value["lock_file_sha256"] != contract_lock_sha256:
         raise PromotionError("one-dose training receipt contract-lock bytes drifted")
     retry_reference: dict[str, Any] | None = None
     if is_retry:
@@ -729,7 +746,11 @@ def _verify_one_dose_training_receipt(
         raise PromotionError("one-dose receipt and durable claim disagree")
     return {
         "path": str(path),
-        "sha256": _sha256(path),
+        "sha256": (
+            _sha256(path)
+            if legacy_snapshot is None
+            else _sha256_bytes(legacy_snapshot.training_receipt.data)
+        ),
         "receipt_sha256": value["receipt_sha256"],
         "claim": str(claim_path),
         "claim_state_sha256": value["claim_state_sha256"],
@@ -737,24 +758,35 @@ def _verify_one_dose_training_receipt(
     }
 
 
-def build_legacy_contract_attestation(
+@dataclasses.dataclass(frozen=True)
+class _JsonSnapshot:
+    path: Path
+    data: bytes
+    value: dict[str, Any]
+    identity: tuple[int, int, int, int, int]
+
+
+@dataclasses.dataclass(frozen=True)
+class _LegacyPromotionSnapshot:
+    contract_lock: _JsonSnapshot
+    source_draft: _JsonSnapshot
+    training_receipt: _JsonSnapshot
+    attestation: _JsonSnapshot | None = None
+
+
+def _build_legacy_contract_attestation_snapshot(
     contract_lock: Path, training_receipt: Path
-) -> dict[str, Any]:
-    """Bind the sole allowlisted markerless v2 lock to its completed dose.
-
-    This does not make the lock valid for generation, rendering, post-wave
-    audit, or producer handoff.  It is consumed only by this promotion module.
-    """
-
+) -> tuple[dict[str, Any], _LegacyPromotionSnapshot]:
     contract_lock = _canonical_existing_file(
         contract_lock, where="historical markerless A1 contract lock"
     )
     training_receipt = _canonical_existing_file(
         training_receipt, where="historical A1 training receipt"
     )
-    lock_bytes, lock = _stable_json_snapshot(
+    lock_snapshot = _stable_json_snapshot(
         contract_lock, where="historical markerless A1 contract lock"
     )
+    lock_bytes, lock = lock_snapshot.data, lock_snapshot.value
     if lock.get("schema_version") != a1_contract.LEGACY_LOCK_SCHEMA:
         raise PromotionError("legacy promotion attestation requires a v2 lock")
     if "promotion_handoff" in lock:
@@ -769,9 +801,10 @@ def build_legacy_contract_attestation(
     source_path = _canonical_existing_file(
         Path(str(source_draft["path"])), where="historical contract source draft"
     )
-    source_bytes, source_payload = _stable_json_snapshot(
+    source_snapshot = _stable_json_snapshot(
         source_path, where="historical contract source draft"
     )
+    source_bytes, source_payload = source_snapshot.data, source_snapshot.value
     observed = {
         "contract_id": lock.get("contract_id"),
         "contract_sha256": declared_contract_sha,
@@ -793,9 +826,10 @@ def build_legacy_contract_attestation(
     ):
         raise PromotionError("historical markerless source draft binding drift")
 
-    receipt_bytes, receipt_value = _stable_json_snapshot(
+    receipt_snapshot = _stable_json_snapshot(
         training_receipt, where="historical A1 training receipt"
     )
+    receipt_bytes, receipt_value = receipt_snapshot.data, receipt_snapshot.value
     receipt = _verify_receipt_digest(receipt_value)
     if (
         receipt.get("schema_version")
@@ -834,10 +868,29 @@ def build_legacy_contract_attestation(
         },
     }
     attestation["attestation_sha256"] = _digest_value(attestation)
-    return attestation
+    return attestation, _LegacyPromotionSnapshot(
+        contract_lock=lock_snapshot,
+        source_draft=source_snapshot,
+        training_receipt=receipt_snapshot,
+    )
 
 
-def _stable_json_snapshot(path: Path, *, where: str) -> tuple[bytes, dict[str, Any]]:
+def build_legacy_contract_attestation(
+    contract_lock: Path, training_receipt: Path
+) -> dict[str, Any]:
+    """Bind the sole allowlisted markerless v2 lock to its completed dose.
+
+    This does not make the lock valid for generation, rendering, post-wave
+    audit, or producer handoff.  It is consumed only by this promotion module.
+    """
+
+    value, _snapshot = _build_legacy_contract_attestation_snapshot(
+        contract_lock, training_receipt
+    )
+    return value
+
+
+def _stable_json_snapshot(path: Path, *, where: str) -> _JsonSnapshot:
     """Read one canonical regular file once and bind bytes to its live pathname."""
 
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
@@ -889,16 +942,44 @@ def _stable_json_snapshot(path: Path, *, where: str) -> tuple[bytes, dict[str, A
         raise PromotionError(f"cannot parse {where}: {error}") from error
     if not isinstance(value, dict):
         raise PromotionError(f"{where} must contain a JSON object")
-    return data, value
+    return _JsonSnapshot(path=path, data=data, value=value, identity=identity)
+
+
+def _revalidate_snapshot_path(snapshot: _JsonSnapshot, *, where: str) -> None:
+    try:
+        named = snapshot.path.stat(follow_symlinks=False)
+    except OSError as error:
+        raise PromotionError(f"cannot revalidate {where}: {error}") from error
+    actual = (
+        named.st_dev,
+        named.st_ino,
+        named.st_size,
+        named.st_mtime_ns,
+        named.st_ctime_ns,
+    )
+    if actual != snapshot.identity or not stat.S_ISREG(named.st_mode):
+        raise PromotionError(f"{where} pathname changed after snapshot")
+
+
+def _revalidate_legacy_snapshot(snapshot: _LegacyPromotionSnapshot) -> None:
+    for where, item in (
+        ("historical contract lock", snapshot.contract_lock),
+        ("historical source draft", snapshot.source_draft),
+        ("historical training receipt", snapshot.training_receipt),
+        ("legacy contract attestation", snapshot.attestation),
+    ):
+        if item is not None:
+            _revalidate_snapshot_path(item, where=where)
 
 
 def _verify_legacy_contract_attestation(
     path: Path, *, contract_lock: Path
-) -> tuple[dict[str, Any], dict[str, Any]]:
+) -> tuple[dict[str, Any], _LegacyPromotionSnapshot]:
     path = _canonical_existing_file(path, where="legacy contract attestation")
-    _attestation_bytes, attestation_value = _stable_json_snapshot(
+    attestation_snapshot = _stable_json_snapshot(
         path, where="legacy contract attestation"
     )
+    attestation_value = attestation_snapshot.value
     value = _require_exact_keys(
         attestation_value,
         {
@@ -938,28 +1019,32 @@ def _verify_legacy_contract_attestation(
     receipt_path = _canonical_existing_file(
         Path(str(receipt_ref["path"])), where="attested training receipt"
     )
-    rebuilt = build_legacy_contract_attestation(contract_lock, receipt_path)
+    rebuilt, inputs = _build_legacy_contract_attestation_snapshot(
+        contract_lock, receipt_path
+    )
     if rebuilt != value:
         raise PromotionError("legacy contract attestation does not replay exactly")
-    lock_bytes, lock = _stable_json_snapshot(
-        contract_lock, where="attested historical contract lock"
-    )
+    snapshot = dataclasses.replace(inputs, attestation=attestation_snapshot)
+    _revalidate_legacy_snapshot(snapshot)
+    lock = snapshot.contract_lock.value
+    lock_bytes = snapshot.contract_lock.data
     if (
         _sha256_bytes(lock_bytes) != contract_ref["sha256"]
         or lock.get("contract_sha256") != contract_ref["contract_sha256"]
         or lock.get("contract_id") != contract_ref["contract_id"]
     ):
-        raise PromotionError("legacy contract changed after attestation replay")
-    return value, lock
+        raise PromotionError("legacy contract snapshot differs from attestation")
+    return value, snapshot
 
 
-def _verify_contract(
+def _verify_contract_with_snapshot(
     path: Path,
     *,
     verify_lock_fn: Callable[..., dict[str, Any]] = a1_contract.verify_lock,
     legacy_contract_attestation: Path | None = None,
     expected_training_receipt: Path | None = None,
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], _LegacyPromotionSnapshot | None]:
+    legacy_snapshot: _LegacyPromotionSnapshot | None = None
     if legacy_contract_attestation is None:
         try:
             lock = verify_lock_fn(path, require_all_job_claims=True)
@@ -968,9 +1053,10 @@ def _verify_contract(
                 f"sealed A1 contract verification failed: {error}"
             ) from error
     else:
-        legacy_value, lock = _verify_legacy_contract_attestation(
+        legacy_value, legacy_snapshot = _verify_legacy_contract_attestation(
             legacy_contract_attestation, contract_lock=path
         )
+        lock = legacy_snapshot.contract_lock.value
         if expected_training_receipt is not None and legacy_value[
             "training_receipt"
         ]["path"] != str(expected_training_receipt):
@@ -992,6 +1078,22 @@ def _verify_contract(
         )
     contract_sha = lock.get("contract_sha256")
     _validate_sha256(contract_sha, where="contract.contract_sha256")
+    return lock, legacy_snapshot
+
+
+def _verify_contract(
+    path: Path,
+    *,
+    verify_lock_fn: Callable[..., dict[str, Any]] = a1_contract.verify_lock,
+    legacy_contract_attestation: Path | None = None,
+    expected_training_receipt: Path | None = None,
+) -> dict[str, Any]:
+    lock, _snapshot = _verify_contract_with_snapshot(
+        path,
+        verify_lock_fn=verify_lock_fn,
+        legacy_contract_attestation=legacy_contract_attestation,
+        expected_training_receipt=expected_training_receipt,
+    )
     return lock
 
 
@@ -2603,6 +2705,7 @@ def _verify_adjudication(
     training_receipt: Path,
     registry: ChampionRegistry,
     current_pointer: Path,
+    legacy_snapshot: _LegacyPromotionSnapshot | None = None,
 ) -> dict[str, Any]:
     raw = _load_json(path)
     expected_keys = {
@@ -2663,6 +2766,7 @@ def _verify_adjudication(
         candidate_sha256=candidate_ref["sha256"],
         training_report_path=training_path,
         training_report_sha256=training_ref["sha256"],
+        legacy_snapshot=legacy_snapshot,
     )
     champion_raw = _require_exact_keys(
         value["champion"],
@@ -2920,7 +3024,7 @@ def prepare_promotion(
         raise PromotionError(
             "authoritative registry must be an existing non-empty file"
         )
-    contract = _verify_contract(
+    contract, legacy_snapshot = _verify_contract_with_snapshot(
         contract_lock,
         verify_lock_fn=verify_lock_fn,
         legacy_contract_attestation=legacy_contract_attestation,
@@ -2934,6 +3038,7 @@ def prepare_promotion(
         training_receipt=training_receipt,
         registry=registry,
         current_pointer=current_pointer,
+        legacy_snapshot=legacy_snapshot,
     )
     registry_before = registry_path.read_bytes()
     current_before = current_pointer.read_bytes()
@@ -2946,6 +3051,15 @@ def prepare_promotion(
         reason=reason,
     )
     current_after = (verified["candidate"]["path"] + "\n").encode("utf-8")
+    legacy_attestation_ref: dict[str, str] | None = None
+    if legacy_snapshot is not None:
+        _revalidate_legacy_snapshot(legacy_snapshot)
+        if legacy_snapshot.attestation is None:  # pragma: no cover - internal invariant.
+            raise PromotionError("legacy promotion snapshot has no attestation bytes")
+        legacy_attestation_ref = {
+            "path": str(legacy_snapshot.attestation.path),
+            "sha256": _sha256_bytes(legacy_snapshot.attestation.data),
+        }
     transaction_id = uuid.uuid4().hex
     return {
         "schema_version": RECEIPT_SCHEMA,
@@ -2967,14 +3081,7 @@ def prepare_promotion(
             "contract_sha256": contract["contract_sha256"],
             "n_full": 128,
             "n_full_wide": None,
-            "legacy_contract_attestation": (
-                None
-                if legacy_contract_attestation is None
-                else {
-                    "path": str(legacy_contract_attestation.resolve(strict=True)),
-                    "sha256": _sha256(legacy_contract_attestation),
-                }
-            ),
+            "legacy_contract_attestation": legacy_attestation_ref,
         },
         "adjudication": {
             "path": str(adjudication_path.resolve()),

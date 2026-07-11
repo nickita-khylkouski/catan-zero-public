@@ -1956,3 +1956,82 @@ def test_failed_recovery_restores_pre_recovery_committed_state(
     assert fixture["registry"].read_bytes() == committed_registry
     assert fixture["pointer"].read_bytes() == committed_pointer
     assert json.loads(fixture["receipt"].read_text())["status"] == "committed"
+
+
+def _legacy_snapshot_for_fixture(fixture: dict, tmp_path: Path):
+    source = tmp_path / "legacy-source.json"
+    attestation = tmp_path / "legacy-attestation.json"
+    _write_json(source, {"source": "pinned"})
+    _write_json(attestation, {"attestation": "pinned"})
+    return promotion._LegacyPromotionSnapshot(  # noqa: SLF001
+        contract_lock=promotion._stable_json_snapshot(  # noqa: SLF001
+            fixture["contract_path"], where="test contract"
+        ),
+        source_draft=promotion._stable_json_snapshot(  # noqa: SLF001
+            source, where="test source"
+        ),
+        training_receipt=promotion._stable_json_snapshot(  # noqa: SLF001
+            fixture["training_receipt"], where="test receipt"
+        ),
+        attestation=promotion._stable_json_snapshot(  # noqa: SLF001
+            attestation, where="test attestation"
+        ),
+    )
+
+
+def test_legacy_receipt_replacement_during_full_validation_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = _fixture(tmp_path)
+    snapshot = _legacy_snapshot_for_fixture(fixture, tmp_path)
+    monkeypatch.setattr(
+        promotion,
+        "_verify_contract_with_snapshot",
+        lambda *_args, **_kwargs: (fixture["contract"], snapshot),
+    )
+    original = promotion._verify_one_dose_training_receipt  # noqa: SLF001
+    replaced = False
+
+    def replace_then_validate(path: Path, **kwargs):
+        nonlocal replaced
+        if not replaced:
+            replaced = True
+            replacement = tmp_path / "replacement-receipt.json"
+            replacement.write_bytes(Path(path).read_bytes())
+            replacement.replace(path)
+        return original(path, **kwargs)
+
+    monkeypatch.setattr(
+        promotion, "_verify_one_dose_training_receipt", replace_then_validate
+    )
+    with pytest.raises(
+        promotion.PromotionError, match="historical training receipt pathname changed"
+    ):
+        _execute(fixture, go=False)
+
+
+def test_legacy_attestation_replacement_before_plan_construction_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = _fixture(tmp_path)
+    snapshot = _legacy_snapshot_for_fixture(fixture, tmp_path)
+    monkeypatch.setattr(
+        promotion,
+        "_verify_contract_with_snapshot",
+        lambda *_args, **_kwargs: (fixture["contract"], snapshot),
+    )
+    original = promotion._verify_adjudication  # noqa: SLF001
+
+    def replace_after_adjudication(*args, **kwargs):
+        result = original(*args, **kwargs)
+        assert snapshot.attestation is not None
+        replacement = tmp_path / "replacement-attestation.json"
+        replacement.write_bytes(snapshot.attestation.path.read_bytes())
+        replacement.replace(snapshot.attestation.path)
+        return result
+
+    monkeypatch.setattr(promotion, "_verify_adjudication", replace_after_adjudication)
+    with pytest.raises(
+        promotion.PromotionError, match="legacy contract attestation pathname changed"
+    ):
+        _execute(fixture, go=False)
