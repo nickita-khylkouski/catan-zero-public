@@ -308,7 +308,10 @@ fn gumbel_search(
     if let Some(v) = config_dict.get_item("batch_size")? {
         let batch_size: usize = v.extract()?;
         if batch_size > 0 {
-            engine = engine.with_batch_size(batch_size);
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "native batch_size>0 is experimental and not reference-equivalent; ".to_string()
+                    + "refusing until differential-gated",
+            ));
         }
     }
     let result = engine

@@ -2,6 +2,10 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 import json
+import os
+import subprocess
+import sys
+import textwrap
 
 import pytest
 
@@ -31,6 +35,15 @@ class _PublicCountingEvaluator:
 
     def evaluate_symmetry_averaged(self, *args, **kwargs):
         self.root_symmetry_calls += 1
+        return self.inner.evaluate(*args, **kwargs)
+
+
+class _ScalarOnlyPublicEvaluator:
+    def __init__(self) -> None:
+        self.config = SimpleNamespace(public_observation=True, cache_size=0)
+        self.inner = HeuristicRustEvaluator(score_actions=False)
+
+    def evaluate(self, *args, **kwargs):
         return self.inner.evaluate(*args, **kwargs)
 
 
@@ -119,6 +132,7 @@ def test_native_d6_is_root_only_not_same_turn_interior() -> None:
         ({"belief_chance_spectra": True}, "belief_chance_spectra"),
         ({"root_wave_batching": True}, "root_wave_batching"),
         ({"use_batch_api": False}, "use_batch_api"),
+        ({"uncertainty_backup_weighting": True}, "uncertainty_backup_weighting"),
     ],
 )
 def test_native_rejects_unsupported_operator_semantics(override, needle) -> None:
@@ -206,3 +220,116 @@ def test_native_forced_roll_expectation_matches_reference() -> None:
     assert native.afterstate_values == pytest.approx(
         reference.afterstate_values, abs=1e-12
     )
+
+
+@pytest.mark.skipif(
+    not native_hot_loop_available(), reason="native wheel lacks gumbel_search"
+)
+def test_native_forced_roll_supports_scalar_only_evaluator() -> None:
+    rust = pytest.importorskip("catanatron_rs")
+    game = rust.Game.simple(["RED", "BLUE"], seed=43)
+    for _ in range(100):
+        actions = json.loads(game.playable_actions_json())
+        if len(actions) == 1 and actions[0][1] == "ROLL":
+            break
+        game.play_tick()
+    else:
+        pytest.fail("did not reach a forced ROLL root")
+    result = NativeGumbelChanceMCTS(
+        GumbelChanceMCTSConfig(seed=3), _ScalarOnlyPublicEvaluator()
+    ).search(game)
+    assert result.selected_action in game.playable_action_indices(["RED", "BLUE"], None)
+
+
+@pytest.mark.skipif(
+    not native_hot_loop_available(), reason="native wheel lacks gumbel_search"
+)
+def test_binding_rejects_experimental_deferred_batching() -> None:
+    rust = pytest.importorskip("catanatron_rs")
+    game = rust.Game.simple(["RED", "BLUE"], seed=47)
+    with pytest.raises(ValueError, match="batch_size>0.*not reference-equivalent"):
+        rust.gumbel_search(
+            game,
+            lambda *_args: ({}, 0.0),
+            {"batch_size": 1, "colors": ["RED", "BLUE"]},
+        )
+
+
+@pytest.mark.skipif(
+    not native_hot_loop_available(), reason="native wheel lacks gumbel_search"
+)
+def test_native_result_json_is_deterministic_across_processes() -> None:
+    program = textwrap.dedent(
+        """
+        import json
+        from types import SimpleNamespace
+        import catanatron_rs
+        from catan_zero.search.gumbel_chance_mcts import GumbelChanceMCTSConfig
+        from catan_zero.search.native_gumbel_mcts import NativeGumbelChanceMCTS
+        from catan_zero.search.rust_mcts import HeuristicRustEvaluator
+        class Eval:
+            def __init__(self):
+                self.config = SimpleNamespace(public_observation=True, cache_size=0)
+                self.inner = HeuristicRustEvaluator(score_actions=False)
+            def evaluate(self, *args, **kwargs):
+                return self.inner.evaluate(*args, **kwargs)
+            def evaluate_many(self, requests, *, root_color, colors):
+                return self.inner.evaluate_many(requests, root_color=root_color, colors=colors)
+        config = GumbelChanceMCTSConfig(
+            seed=71, n_full=32, n_fast=32, p_full=1.0,
+            exact_budget_sh=True, max_depth=5,
+            variance_aware_q=True, variance_aware_closed_form_js=True,
+        )
+        result = NativeGumbelChanceMCTS(config, Eval()).search(
+            catanatron_rs.Game.simple(["RED", "BLUE"], seed=73), force_full=True
+        )
+        print(json.dumps({
+            "selected": result.selected_action,
+            "policy": result.improved_policy,
+            "visits": result.visit_counts,
+            "q": result.q_values,
+            "priors": result.priors,
+            "afterstates": result.afterstate_values,
+        }, sort_keys=True, separators=(",", ":")))
+        """
+    )
+    environment = {**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)}
+    outputs = [
+        subprocess.check_output(
+            [sys.executable, "-c", program], env=environment, text=True
+        ).strip()
+        for _ in range(2)
+    ]
+    assert outputs[0] == outputs[1]
+
+
+@pytest.mark.skipif(
+    not native_hot_loop_available(), reason="native wheel lacks gumbel_search"
+)
+def test_t0_exact_tie_preserves_unsorted_legal_insertion_order() -> None:
+    rust = pytest.importorskip("catanatron_rs")
+    game = rust.Game.simple(["RED", "BLUE"], seed=12)
+    for _ in range(377):
+        game.play_tick()
+    legal = game.playable_action_indices(["RED", "BLUE"], None)
+    assert legal == [209, 210, 211, 212, 213, 208, 337]
+    config = GumbelChanceMCTSConfig(
+        seed=101,
+        n_full=7,
+        n_fast=7,
+        p_full=1.0,
+        exact_budget_sh=True,
+        c_scale=0.0,
+        max_depth=3,
+    )
+    reference = GumbelChanceMCTS(config, _PublicCountingEvaluator()).search(
+        game.copy(), force_full=True
+    )
+    native = NativeGumbelChanceMCTS(config, _PublicCountingEvaluator()).search(
+        game.copy(), force_full=True
+    )
+    assert len(set(reference.improved_policy.values())) == 1
+    assert len(set(native.improved_policy.values())) == 1
+    assert reference.selected_action == legal[0]
+    assert native.selected_action == legal[0]
+    assert native.selected_action != min(legal)

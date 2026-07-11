@@ -56,6 +56,8 @@ class NativeGumbelChanceMCTS(GumbelChanceMCTS):
             unsupported.append("root_wave_batching=True")
         if not bool(self.config.use_batch_api):
             unsupported.append("use_batch_api=False")
+        if bool(self.config.uncertainty_backup_weighting):
+            unsupported.append("uncertainty_backup_weighting=True")
         if unsupported:
             raise ValueError(
                 "native MCTS hot loop does not implement the requested reference "
@@ -156,17 +158,22 @@ class NativeGumbelChanceMCTS(GumbelChanceMCTS):
                 native_game, tuple(legal), root_color=root_color, colors=colors
             )
 
-        def evaluate_many(requests: list[tuple[Any, list[int], str]]):
-            if not requests:
-                return []
-            root_colors = {str(request[2]) for request in requests}
-            if len(root_colors) != 1:
-                raise RuntimeError("native evaluation batch mixed root perspectives")
-            return self.evaluator.evaluate_many(
-                [(request[0], tuple(request[1])) for request in requests],
-                root_color=next(iter(root_colors)),
-                colors=colors,
-            )
+        evaluate_many = None
+        if callable(getattr(self.evaluator, "evaluate_many", None)):
+
+            def evaluate_many(requests: list[tuple[Any, list[int], str]]):
+                if not requests:
+                    return []
+                root_colors = {str(request[2]) for request in requests}
+                if len(root_colors) != 1:
+                    raise RuntimeError(
+                        "native evaluation batch mixed root perspectives"
+                    )
+                return self.evaluator.evaluate_many(
+                    [(request[0], tuple(request[1])) for request in requests],
+                    root_color=next(iter(root_colors)),
+                    colors=colors,
+                )
 
         root_evaluator = None
         legal_width = len(

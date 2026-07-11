@@ -10,8 +10,8 @@ use std::collections::HashMap;
 use std::f64;
 
 use catanatron_rs::{
-    execute_spectrum, generate_playable_actions, Action, ActionSpace, ActionType, Color, Game,
-    MapKind,
+    execute_spectrum, generate_playable_actions, Action, ActionSpace, ActionType, ActionValue,
+    Color, Game, MapKind,
 };
 
 // ---------------------------------------------------------------------------
@@ -406,23 +406,27 @@ impl GumbelMctsEngine {
                     format!("playable action {local} is absent from configured action space")
                 })
         };
-        let visit_counts: Vec<_> = root
+        let local_visit_counts: Vec<_> = root
             .actions
             .iter()
-            .map(|(&i, s)| Ok((to_global(i)?, s.visits)))
+            .map(|(&local, stats)| (local, stats.visits))
+            .collect();
+        let mut visit_counts: Vec<_> = local_visit_counts
+            .iter()
+            .map(|(local, visits)| Ok((to_global(*local)?, *visits)))
             .collect::<Result<_, String>>()?;
-        let q_values: Vec<_> = root
+        let mut q_values: Vec<_> = root
             .actions
             .iter()
             .filter(|(_, s)| s.visits > 0)
             .map(|(&i, s)| Ok((to_global(i)?, s.q())))
             .collect::<Result<_, String>>()?;
-        let priors: Vec<_> = root
+        let mut priors: Vec<_> = root
             .actions
             .iter()
             .map(|(&i, s)| Ok((to_global(i)?, s.prior)))
             .collect::<Result<_, String>>()?;
-        let afterstate_values: Vec<_> = root
+        let mut afterstate_values: Vec<_> = root
             .actions
             .iter()
             .filter_map(|(&i, s)| s.afterstate_value.map(|v| Ok((to_global(i)?, v))))
@@ -446,9 +450,11 @@ impl GumbelMctsEngine {
                                 .unwrap_or(std::cmp::Ordering::Equal)
                         })
                         .then_with(|| {
-                            to_global(b.0)
-                                .unwrap_or(usize::MAX)
-                                .cmp(&to_global(a.0).unwrap_or(usize::MAX))
+                            // Python max() preserves the first legal-action
+                            // insertion on an exact policy/visit/prior tie.
+                            // Local indices follow that playable-action order;
+                            // global-ID order can differ on real states.
+                            b.0.cmp(&a.0)
                         })
                 })
                 .map(|(i, _)| *i)
@@ -456,16 +462,21 @@ impl GumbelMctsEngine {
         };
 
         let training_policy = if self.config.policy_target_min_visits > 0 {
-            self.prune_policy_target(&improved_policy, &visit_counts)
+            self.prune_policy_target(&improved_policy, &local_visit_counts)
         } else {
             improved_policy.clone()
         };
 
         let selected_global = to_global(selected)?;
-        let training_policy = training_policy
+        let mut training_policy = training_policy
             .into_iter()
             .map(|(local, probability)| Ok((to_global(local)?, probability)))
             .collect::<Result<Vec<_>, String>>()?;
+        visit_counts.sort_unstable_by_key(|(action, _)| *action);
+        q_values.sort_unstable_by_key(|(action, _)| *action);
+        priors.sort_unstable_by_key(|(action, _)| *action);
+        afterstate_values.sort_unstable_by_key(|(action, _)| *action);
+        training_policy.sort_unstable_by_key(|(action, _)| *action);
         Ok(SearchResult {
             selected_action: selected_global,
             improved_policy: training_policy,
@@ -560,6 +571,13 @@ impl GumbelMctsEngine {
 
         // ONE batched evaluation call for ALL root children
         let results = evaluator.evaluate_many(&batch_requests)?;
+        if results.len() != batch_requests.len() {
+            return Err(format!(
+                "evaluator batch length mismatch: requested {}, received {}",
+                batch_requests.len(),
+                results.len()
+            ));
+        }
 
         // Create child nodes and store evaluation results
         let mut result_idx = 0;
@@ -661,7 +679,8 @@ impl GumbelMctsEngine {
         n_simulations: i32,
         evaluator: &mut E,
     ) -> Result<(usize, i32), String> {
-        let legal: Vec<usize> = arena.get(root_idx).actions.keys().copied().collect();
+        let mut legal: Vec<usize> = arena.get(root_idx).actions.keys().copied().collect();
+        legal.sort_unstable();
         let num_legal = legal.len();
         let m = self.root_candidate_count(num_legal);
         let mut gumbel: HashMap<usize, f64> = HashMap::new();
@@ -684,7 +703,8 @@ impl GumbelMctsEngine {
             let phases = exact_budget_sh_phases(m as i32, n_simulations);
             let mut used = 0;
             for &(count, budget) in &phases {
-                let visit: Vec<usize> = remaining.iter().take(count as usize).copied().collect();
+                let mut visit: Vec<usize> =
+                    remaining.iter().take(count as usize).copied().collect();
                 for &aid in &visit {
                     for _ in 0..budget {
                         if use_batching {
@@ -710,15 +730,15 @@ impl GumbelMctsEngine {
                 let cq = self.completed_q(arena, root_idx, arena.get(root_idx).root_color);
                 let rq = self.rescaled_completed_q_with_noise(arena, root_idx, &cq);
                 let scale = self.sigma_scale(arena, root_idx);
-                remaining.sort_by(|&a, &b| {
-                    let sa = gumbel[&a]
-                        + logits.get(&a).copied().unwrap_or(0.0)
-                        + scale * rq.get(&a).copied().unwrap_or(0.0);
-                    let sb = gumbel[&b]
-                        + logits.get(&b).copied().unwrap_or(0.0)
-                        + scale * rq.get(&b).copied().unwrap_or(0.0);
-                    sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+                visit = rerank_candidates(visit, |action| {
+                    gumbel[&action]
+                        + logits.get(&action).copied().unwrap_or(0.0)
+                        + scale * rq.get(&action).copied().unwrap_or(0.0)
                 });
+                // Exact-budget phases eliminate candidates just like the
+                // reference SH operator. Sorting the old full `remaining`
+                // vector let previously eliminated actions re-enter/win.
+                remaining = visit;
             }
             return Ok((*remaining.first().unwrap_or(&top_k[0]), used));
         }
@@ -873,10 +893,10 @@ impl GumbelMctsEngine {
         } else {
             self.select_nonroot_action(arena, node_idx)?
         };
-        let action_type = arena.get(node_idx).playable_actions[action_idx].action_type;
+        let action = arena.get(node_idx).playable_actions[action_idx].clone();
         path.push((node_idx, Some(action_idx)));
 
-        if self.expectation_backup(action_type, depth) {
+        if self.expectation_backup(&action, depth) {
             self.traverse_roll_deferred(arena, node_idx, action_idx, depth, path, evaluator)
         } else {
             self.traverse_single_sample_deferred(
@@ -904,8 +924,9 @@ impl GumbelMctsEngine {
         }
         let outcome_index = {
             let stats = arena.get(node_idx).actions.get(&action_idx).unwrap();
-            let probs: Vec<(usize, f64)> =
+            let mut probs: Vec<(usize, f64)> =
                 stats.probabilities.iter().map(|(&k, &v)| (k, v)).collect();
+            probs.sort_unstable_by_key(|(index, _)| *index);
             self.sample_outcome(&probs)
         };
         let child_idx = arena
@@ -954,8 +975,9 @@ impl GumbelMctsEngine {
         }
         let outcome_index = {
             let stats = arena.get(node_idx).actions.get(&action_idx).unwrap();
-            let probs: Vec<(usize, f64)> =
+            let mut probs: Vec<(usize, f64)> =
                 stats.probabilities.iter().map(|(&k, &v)| (k, v)).collect();
+            probs.sort_unstable_by_key(|(index, _)| *index);
             self.sample_outcome(&probs)
         };
         let child_idx = arena
@@ -1039,6 +1061,13 @@ impl GumbelMctsEngine {
 
         // ONE batched evaluation call
         let results = evaluator.evaluate_many(&requests)?;
+        if results.len() != requests.len() {
+            return Err(format!(
+                "evaluator batch length mismatch: requested {}, received {}",
+                requests.len(),
+                results.len()
+            ));
+        }
 
         // Drain pending leaves into a separate vec to avoid borrow conflicts
         let pending = std::mem::take(&mut self.pending_leaves);
@@ -1134,9 +1163,9 @@ impl GumbelMctsEngine {
         } else {
             self.select_nonroot_action(arena, node_idx)?
         };
-        let action_type = arena.get(node_idx).playable_actions[action_idx].action_type;
+        let action = arena.get(node_idx).playable_actions[action_idx].clone();
 
-        let value = if self.expectation_backup(action_type, depth) {
+        let value = if self.expectation_backup(&action, depth) {
             self.traverse_roll(arena, node_idx, action_idx, depth, evaluator)?
         } else {
             self.traverse_single_sample(arena, node_idx, action_idx, depth, evaluator)?
@@ -1158,12 +1187,15 @@ impl GumbelMctsEngine {
     }
 
     #[inline]
-    fn expectation_backup(&self, action_type: ActionType, depth: i32) -> bool {
-        match action_type {
+    fn expectation_backup(&self, action: &Action, depth: i32) -> bool {
+        match action.action_type {
             ActionType::Roll => !(self.config.lazy_interior_chance && depth > 0),
             // F7: these small hidden-outcome spaces are exact expectation
             // backups in the reference search, never single samples.
-            ActionType::MoveRobber | ActionType::BuyDevelopmentCard => true,
+            ActionType::MoveRobber => {
+                matches!(action.value, ActionValue::Robber(_, Some(_)))
+            }
+            ActionType::BuyDevelopmentCard => true,
             _ => false,
         }
     }
@@ -1189,8 +1221,9 @@ impl GumbelMctsEngine {
         }
         let outcome_index = {
             let stats = arena.get(node_idx).actions.get(&action_idx).unwrap();
-            let probs: Vec<(usize, f64)> =
+            let mut probs: Vec<(usize, f64)> =
                 stats.probabilities.iter().map(|(&k, &v)| (k, v)).collect();
+            probs.sort_unstable_by_key(|(index, _)| *index);
             self.sample_outcome(&probs)
         };
         let child_idx = arena
@@ -1203,7 +1236,10 @@ impl GumbelMctsEngine {
         let value = {
             let stats = arena.get(node_idx).actions.get(&action_idx).unwrap();
             let mut v = 0.0;
-            for (&idx, &child_idx) in &stats.children {
+            let mut child_indices = stats.children.keys().copied().collect::<Vec<_>>();
+            child_indices.sort_unstable();
+            for idx in child_indices {
+                let child_idx = stats.children[&idx];
                 let prob = stats.probabilities.get(&idx).copied().unwrap_or(0.0);
                 v += prob * arena.get(child_idx).value();
             }
@@ -1257,8 +1293,9 @@ impl GumbelMctsEngine {
         }
         let outcome_index = {
             let stats = arena.get(node_idx).actions.get(&action_idx).unwrap();
-            let probs: Vec<(usize, f64)> =
+            let mut probs: Vec<(usize, f64)> =
                 stats.probabilities.iter().map(|(&k, &v)| (k, v)).collect();
+            probs.sort_unstable_by_key(|(index, _)| *index);
             self.sample_outcome(&probs)
         };
         let child_idx = arena
@@ -1316,6 +1353,13 @@ impl GumbelMctsEngine {
             requests.push((child_game, legal_indices, root_color));
         }
         let results = evaluator.evaluate_many(&requests)?;
+        if results.len() != requests.len() {
+            return Err(format!(
+                "evaluator batch length mismatch: requested {}, received {}",
+                requests.len(),
+                results.len()
+            ));
+        }
         for (i, &child_idx) in new_child_indices.iter().enumerate() {
             let (priors, value, unc) = &results[i];
             let legal = generate_playable_actions(&arena.get(child_idx).game.state);
@@ -1365,7 +1409,10 @@ impl GumbelMctsEngine {
         let total_child_visits: i32 = node.actions.values().map(|s| s.visits).sum();
         let mut visited_prior_sum = 0.0;
         let mut visited_q_sum = 0.0;
-        for stats in node.actions.values() {
+        let mut action_ids = node.actions.keys().copied().collect::<Vec<_>>();
+        action_ids.sort_unstable();
+        for action_id in action_ids {
+            let stats = &node.actions[&action_id];
             if stats.visits > 0 {
                 visited_prior_sum += stats.prior;
                 let q = if use_weighted {
@@ -1411,12 +1458,13 @@ impl GumbelMctsEngine {
         v_mix: f64,
     ) {
         let node = arena.get(node_idx);
-        let visited: Vec<(usize, &ActionStats)> = node
+        let mut visited: Vec<(usize, &ActionStats)> = node
             .actions
             .iter()
             .filter(|(_, s)| s.visits > 0)
             .map(|(&k, v)| (k, v))
             .collect();
+        visited.sort_unstable_by_key(|(action_id, _)| *action_id);
         if visited.len() < 2 {
             return;
         }
@@ -1529,6 +1577,7 @@ impl GumbelMctsEngine {
                 (aid, logit + scale * rqv)
             })
             .collect();
+        scores.sort_unstable_by_key(|(action_id, _)| *action_id);
         let max_score = scores.iter().fold(f64::NEG_INFINITY, |a, &(_, b)| a.max(b));
         for (_, s) in scores.iter_mut() {
             *s = ((*s - max_score).clamp(-40.0, 40.0)).exp();
@@ -1715,12 +1764,13 @@ impl GumbelMctsEngine {
         let mut arena = Arena::new();
         let root_idx = arena.alloc(node);
         self.finish_expand(&mut arena, root_idx, legal.to_vec(), priors, value, 0.0)?;
-        let priors_vec: Vec<(usize, f64)> = arena
+        let mut priors_vec: Vec<(usize, f64)> = arena
             .get(root_idx)
             .actions
             .iter()
             .map(|(&local, stats)| Ok((self.action_ids(&legal[local..=local])?[0], stats.prior)))
             .collect::<Result<_, String>>()?;
+        priors_vec.sort_unstable_by_key(|(action, _)| *action);
         if priors_vec.is_empty() {
             return Err("no legal actions at raw-policy root".into());
         }
@@ -1798,15 +1848,69 @@ pub fn exact_budget_sh_phases(m: i32, n_simulations: i32) -> Vec<(i32, i32)> {
     phases
 }
 
+fn rerank_candidates<F>(mut survivors: Vec<usize>, mut score: F) -> Vec<usize>
+where
+    F: FnMut(usize) -> f64,
+{
+    survivors.sort_by(|a, b| {
+        score(*b)
+            .partial_cmp(&score(*a))
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.cmp(b))
+    });
+    survivors
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use catanatron_rs::Player;
+    use catanatron_rs::{Coordinate, Player};
 
     #[derive(Default)]
     struct CountingEvaluator {
         leaf_calls: usize,
         root_calls: usize,
+    }
+
+    struct ShortBatchEvaluator(CountingEvaluator);
+    struct LongBatchEvaluator(CountingEvaluator);
+
+    impl Evaluator for ShortBatchEvaluator {
+        fn evaluate(
+            &mut self,
+            game: &Game,
+            legal: &[usize],
+            root_color: Color,
+        ) -> Result<(HashMap<usize, f64>, f64, f64), String> {
+            self.0.evaluate(game, legal, root_color)
+        }
+
+        fn evaluate_many(
+            &mut self,
+            _requests: &[(Game, Vec<usize>, Color)],
+        ) -> Result<Vec<(HashMap<usize, f64>, f64, f64)>, String> {
+            Ok(Vec::new())
+        }
+    }
+
+    impl Evaluator for LongBatchEvaluator {
+        fn evaluate(
+            &mut self,
+            game: &Game,
+            legal: &[usize],
+            root_color: Color,
+        ) -> Result<(HashMap<usize, f64>, f64, f64), String> {
+            self.0.evaluate(game, legal, root_color)
+        }
+
+        fn evaluate_many(
+            &mut self,
+            requests: &[(Game, Vec<usize>, Color)],
+        ) -> Result<Vec<(HashMap<usize, f64>, f64, f64)>, String> {
+            let mut results = Evaluator::evaluate_many(&mut self.0, requests)?;
+            results.push((HashMap::new(), 0.0, 0.0));
+            Ok(results)
+        }
     }
 
     impl Evaluator for CountingEvaluator {
@@ -1885,8 +1989,8 @@ mod tests {
         let mut unrestricted_eval = CountingEvaluator::default();
         let mut bounded_eval = CountingEvaluator::default();
         let mut config = SearchConfig::default();
-        config.n_full = 32;
-        config.n_fast = 32;
+        config.n_full = 128;
+        config.n_fast = 128;
         config.p_full = 1.0;
         config.max_depth = 12;
         GumbelMctsEngine::new(config.clone())
@@ -1918,5 +2022,159 @@ mod tests {
             .unwrap();
         assert!(result.used_full_search);
         assert_eq!(result.simulations_used, 8);
+    }
+
+    #[test]
+    fn exact_budget_phases_spend_exactly_and_only_shrink_survivors() {
+        let phases = exact_budget_sh_phases(54, 128);
+        assert_eq!(
+            phases
+                .iter()
+                .map(|(count, budget)| count * budget)
+                .sum::<i32>(),
+            128
+        );
+        assert!(phases.windows(2).all(|pair| pair[1].0 <= pair[0].0));
+        let ranked = rerank_candidates(vec![2, 4], |action| {
+            if action == 99 {
+                1_000.0
+            } else {
+                action as f64
+            }
+        });
+        assert_eq!(ranked, vec![4, 2]);
+        assert!(
+            !ranked.contains(&99),
+            "an eliminated candidate cannot re-enter"
+        );
+    }
+
+    #[test]
+    fn seeded_search_is_deterministic_across_fresh_hashmaps() {
+        let game = opening(17);
+        for closed_form in [false, true] {
+            let mut signatures = Vec::new();
+            for _ in 0..8 {
+                let mut config = SearchConfig::default();
+                config.seed = 91;
+                config.n_full = 32;
+                config.n_fast = 32;
+                config.p_full = 1.0;
+                config.exact_budget_sh = true;
+                config.max_depth = 5;
+                config.variance_aware_q = true;
+                config.variance_aware_closed_form_js = closed_form;
+                let result = GumbelMctsEngine::new(config)
+                    .search(&game, &mut CountingEvaluator::default(), Some(true))
+                    .unwrap();
+                let mut visits = result.visit_counts;
+                visits.sort_unstable_by_key(|(action, _)| *action);
+                let mut policy = result.improved_policy;
+                policy.sort_unstable_by_key(|(action, _)| *action);
+                signatures.push((result.selected_action, visits, policy));
+            }
+            assert!(signatures.windows(2).all(|pair| pair[0] == pair[1]));
+        }
+    }
+
+    #[test]
+    fn short_evaluator_batch_returns_error_instead_of_panicking() {
+        let game = opening(23);
+        let mut engine = GumbelMctsEngine::new(SearchConfig::default());
+        let root_color = game.state.current_color();
+        let mut root = Node::new(game, root_color);
+        root.playable_actions = generate_playable_actions(&root.game.state);
+        let mut arena = Arena::new();
+        let root_idx = arena.alloc(root);
+        let mut evaluator = ShortBatchEvaluator(CountingEvaluator::default());
+        engine
+            .expand_root_node(&mut arena, root_idx, &mut evaluator)
+            .unwrap();
+        let error = engine
+            .pre_expand_root_children(&mut arena, root_idx, &mut evaluator)
+            .unwrap_err();
+        assert!(error.contains("batch length mismatch"));
+
+        let mut evaluator = LongBatchEvaluator(CountingEvaluator::default());
+        let error = engine
+            .pre_expand_root_children(&mut arena, root_idx, &mut evaluator)
+            .unwrap_err();
+        assert!(error.contains("batch length mismatch"));
+    }
+
+    #[test]
+    fn robber_without_victim_is_not_an_expectation_backup() {
+        let engine = GumbelMctsEngine::new(SearchConfig::default());
+        let no_victim = Action::new(
+            Color::Red,
+            ActionType::MoveRobber,
+            ActionValue::Robber(Coordinate(0, 0, 0), None),
+        );
+        let with_victim = Action::new(
+            Color::Red,
+            ActionType::MoveRobber,
+            ActionValue::Robber(Coordinate(0, 0, 0), Some(Color::Blue)),
+        );
+        assert!(!engine.expectation_backup(&no_victim, 1));
+        assert!(engine.expectation_backup(&with_victim, 1));
+    }
+
+    #[test]
+    fn policy_pruning_uses_local_visits_before_global_id_export() {
+        let game = opening(29);
+        let mut config = SearchConfig::default();
+        config.seed = 5;
+        config.n_full = 128;
+        config.n_fast = 128;
+        config.p_full = 1.0;
+        config.exact_budget_sh = true;
+        config.policy_target_min_visits = 2;
+        let result = GumbelMctsEngine::new(config)
+            .search(&game, &mut CountingEvaluator::default(), Some(true))
+            .unwrap();
+        let visits = result
+            .visit_counts
+            .iter()
+            .copied()
+            .collect::<HashMap<_, _>>();
+        assert_eq!(result.improved_policy.len(), visits.len());
+        for (action, probability) in result.improved_policy {
+            assert_eq!(
+                probability == 0.0,
+                visits[&action] < 2,
+                "policy zero-mask must use the matching global action's local visit count",
+            );
+        }
+    }
+
+    #[test]
+    fn exact_sh_winner_survives_every_phase_and_has_max_visits() {
+        let game = opening(31);
+        for seed in 0..24 {
+            let mut config = SearchConfig::default();
+            config.seed = seed;
+            config.n_full = 128;
+            config.n_fast = 128;
+            config.p_full = 1.0;
+            config.exact_budget_sh = true;
+            config.play_sh_winner = true;
+            config.max_depth = 5;
+            let result = GumbelMctsEngine::new(config)
+                .search(&game, &mut CountingEvaluator::default(), Some(true))
+                .unwrap();
+            let max_visits = result
+                .visit_counts
+                .iter()
+                .map(|(_, visits)| *visits)
+                .max()
+                .unwrap();
+            let winner_visits = result
+                .visit_counts
+                .iter()
+                .find(|(action, _)| *action == result.selected_action)
+                .unwrap()
+                .1;
+            assert_eq!(winner_visits, max_visits);
+        }
     }
 }
