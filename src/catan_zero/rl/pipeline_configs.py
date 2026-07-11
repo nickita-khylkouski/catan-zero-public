@@ -452,6 +452,10 @@ class EvalConfig(PipelineConfig):
     public_observation: bool = False
     belief_chance_spectra: bool = False
     information_set_search: bool = False
+    # Explicit implementation arm. False preserves the reference Python tree
+    # loop; True requires the matching catanatron_rs native-search binding and
+    # fails closed rather than silently changing the evaluation operator.
+    native_mcts_hot_loop: bool = False
     determinization_particles: int = 1
     determinization_min_simulations: int = 32
     # Seeds + games.

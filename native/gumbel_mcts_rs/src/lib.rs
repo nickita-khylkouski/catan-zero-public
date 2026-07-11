@@ -425,7 +425,26 @@ impl GumbelMctsEngine {
         } else {
             improved_policy
                 .iter()
-                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+                .max_by(|a, b| {
+                    a.1.partial_cmp(&b.1)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| {
+                            root.actions[&a.0]
+                                .visits
+                                .cmp(&root.actions[&b.0].visits)
+                        })
+                        .then_with(|| {
+                            root.actions[&a.0]
+                                .prior
+                                .partial_cmp(&root.actions[&b.0].prior)
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                        })
+                        .then_with(|| {
+                            to_global(b.0)
+                                .unwrap_or(usize::MAX)
+                                .cmp(&to_global(a.0).unwrap_or(usize::MAX))
+                        })
+                })
                 .map(|(i, _)| *i)
                 .unwrap_or(sh_winner)
         };
@@ -1701,7 +1720,11 @@ impl GumbelMctsEngine {
         }
         let selected = priors_vec
             .iter()
-            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .max_by(|a, b| {
+                a.1.partial_cmp(&b.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| b.0.cmp(&a.0))
+            })
             .map(|(i, _)| *i)
             .unwrap_or(0);
         Ok(SearchResult {

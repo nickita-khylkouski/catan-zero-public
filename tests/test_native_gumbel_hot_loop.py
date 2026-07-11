@@ -36,6 +36,12 @@ class _PublicCountingEvaluator:
 
 def test_native_hot_loop_is_explicit_and_fallback_preserves_reference() -> None:
     pytest.importorskip("catanatron_rs")
+    try:
+        from catan_zero.search.rust_mcts import _require_rust_module
+
+        _require_rust_module()
+    except RuntimeError as error:
+        pytest.skip(f"installed wheel lacks reference MCTS bindings: {error}")
     config = GumbelChanceMCTSConfig()
     evaluator = _PublicCountingEvaluator()
     search = create_gumbel_search(config, evaluator)

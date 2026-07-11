@@ -38,7 +38,9 @@ def test_vs_bot_search_threads_information_set_recipe() -> None:
 
 
 @pytest.mark.parametrize("threshold", [None, 20])
-def test_vs_bot_search_threads_symmetry_averaging_threshold(threshold: int | None) -> None:
+def test_vs_bot_search_threads_symmetry_averaging_threshold(
+    threshold: int | None,
+) -> None:
     config = _search_config_kwargs(
         {
             "n_full": 128,
@@ -52,7 +54,9 @@ def test_vs_bot_search_threads_symmetry_averaging_threshold(threshold: int | Non
     assert config["symmetry_averaged_eval_threshold"] == threshold
 
 
-def test_vs_bot_typed_config_threshold_roundtrip_and_hash_identity(tmp_path: Path) -> None:
+def test_vs_bot_typed_config_threshold_roundtrip_and_hash_identity(
+    tmp_path: Path,
+) -> None:
     config = EvalConfig(
         mode="vs_bot",
         candidate="candidate.pt",
@@ -68,7 +72,13 @@ def test_vs_bot_typed_config_threshold_roundtrip_and_hash_identity(tmp_path: Pat
     loaded = load_config(path)
     assert loaded == config
     assert loaded.config_hash() == config.config_hash()
-    assert replace(config, symmetry_averaged_eval_threshold=None).config_hash() != config.config_hash()
+    assert (
+        replace(config, symmetry_averaged_eval_threshold=None).config_hash()
+        != config.config_hash()
+    )
+    assert (
+        replace(config, native_mcts_hot_loop=True).config_hash() != config.config_hash()
+    )
 
 
 def test_vs_bot_summary_attests_symmetry_averaging_threshold() -> None:
@@ -91,6 +101,7 @@ def test_vs_bot_summary_attests_symmetry_averaging_threshold() -> None:
         determinization_min_simulations=32,
         symmetry_averaged_eval=True,
         symmetry_averaged_eval_threshold=20,
+        native_mcts_hot_loop=True,
         elo0=0.0,
         elo1=30.0,
     )
@@ -108,6 +119,8 @@ def test_vs_bot_summary_attests_symmetry_averaging_threshold() -> None:
     )
     assert summary["symmetry_averaged_eval"] is True
     assert summary["symmetry_averaged_eval_threshold"] == 20
+    assert summary["native_mcts_hot_loop"] is True
+    assert summary["mcts_implementation"] == "rust_native_hot_loop_v1"
 
 
 def test_vs_bot_cli_threshold_reaches_dumped_typed_config(
