@@ -37,12 +37,31 @@ class NativeGumbelChanceMCTS(GumbelChanceMCTS):
         allow_python_fallback: bool = False,
     ) -> None:
         super().__init__(config, evaluator)
+        self._validate_native_semantics()
         self.using_native_hot_loop = native_hot_loop_available()
         if not self.using_native_hot_loop and not allow_python_fallback:
             raise RuntimeError(
                 "native Gumbel hot loop requested but catanatron_rs.gumbel_search "
                 "is unavailable; install the matching native wheel or explicitly "
                 "set allow_python_fallback=True"
+            )
+
+    def _validate_native_semantics(self) -> None:
+        unsupported: list[str] = []
+        if not bool(self.config.correct_rust_chance_spectra):
+            unsupported.append("correct_rust_chance_spectra=False")
+        if bool(self.config.belief_chance_spectra):
+            unsupported.append("belief_chance_spectra=True")
+        if bool(self.config.root_wave_batching):
+            unsupported.append("root_wave_batching=True")
+        if not bool(self.config.use_batch_api):
+            unsupported.append("use_batch_api=False")
+        if unsupported:
+            raise ValueError(
+                "native MCTS hot loop does not implement the requested reference "
+                "semantics: "
+                + ", ".join(unsupported)
+                + "; refusing silent operator drift"
             )
 
     def _native_config(
@@ -78,6 +97,7 @@ class NativeGumbelChanceMCTS(GumbelChanceMCTS):
                 "uncertainty_backup_exp",
                 "uncertainty_backup_cap",
                 "policy_target_min_visits",
+                "wide_roots_always_full",
             )
         }
         values.update(
@@ -85,7 +105,12 @@ class NativeGumbelChanceMCTS(GumbelChanceMCTS):
             map_kind=config.map_kind or "BASE",
             stop_at_root_turn_boundary=bool(config.information_set_search),
         )
-        for optional in ("n_full_wide", "raw_policy_above_width", "root_candidate_cap"):
+        for optional in (
+            "n_full_wide",
+            "n_full_wide_threshold",
+            "raw_policy_above_width",
+            "root_candidate_cap",
+        ):
             value = getattr(config, optional)
             if value is not None:
                 values[optional] = value

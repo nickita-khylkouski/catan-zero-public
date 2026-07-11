@@ -82,6 +82,8 @@ pub struct SearchConfig {
     pub n_fast: i32,
     pub p_full: f64,
     pub n_full_wide: Option<i32>,
+    pub n_full_wide_threshold: Option<usize>,
+    pub wide_roots_always_full: bool,
     pub raw_policy_above_width: Option<usize>,
     pub lazy_interior_chance: bool,
     pub root_candidate_cap: Option<usize>,
@@ -121,6 +123,8 @@ impl Default for SearchConfig {
             n_fast: 16,
             p_full: 0.25,
             n_full_wide: None,
+            n_full_wide_threshold: None,
+            wide_roots_always_full: false,
             raw_policy_above_width: None,
             lazy_interior_chance: false,
             root_candidate_cap: None,
@@ -349,12 +353,18 @@ impl GumbelMctsEngine {
                 return self.raw_policy_root(game, root_color, &legal_actions, evaluator);
             }
         }
+        let wide_budget_root = self.config.n_full_wide.is_some()
+            && match self.config.n_full_wide_threshold {
+                Some(threshold) => legal_actions.len() >= threshold,
+                None => legal_actions.len() > self.config.wide_candidates_threshold,
+            };
         let use_full = match force_full {
             Some(f) => f,
+            None if wide_budget_root && self.config.wide_roots_always_full => true,
             None => self.rng.gen::<f64>() < self.config.p_full,
         };
         let n_full_eff = if let Some(nw) = self.config.n_full_wide {
-            if legal_actions.len() > self.config.wide_candidates_threshold {
+            if wide_budget_root {
                 nw
             } else {
                 self.config.n_full
@@ -428,11 +438,7 @@ impl GumbelMctsEngine {
                 .max_by(|a, b| {
                     a.1.partial_cmp(&b.1)
                         .unwrap_or(std::cmp::Ordering::Equal)
-                        .then_with(|| {
-                            root.actions[&a.0]
-                                .visits
-                                .cmp(&root.actions[&b.0].visits)
-                        })
+                        .then_with(|| root.actions[&a.0].visits.cmp(&root.actions[&b.0].visits))
                         .then_with(|| {
                             root.actions[&a.0]
                                 .prior
@@ -1892,5 +1898,25 @@ mod tests {
             .unwrap();
         assert!(bounded_eval.leaf_calls <= unrestricted_eval.leaf_calls);
         assert!(bounded.simulations_used >= 32);
+    }
+
+    #[test]
+    fn explicit_wide_budget_threshold_is_inclusive_and_can_force_full() {
+        let game = opening(13);
+        let width = generate_playable_actions(&game.state).len();
+        let mut evaluator = CountingEvaluator::default();
+        let mut config = SearchConfig::default();
+        config.n_full = 4;
+        config.n_fast = 2;
+        config.p_full = 0.0;
+        config.n_full_wide = Some(8);
+        config.n_full_wide_threshold = Some(width);
+        config.wide_roots_always_full = true;
+        config.exact_budget_sh = true;
+        let result = GumbelMctsEngine::new(config)
+            .search(&game, &mut evaluator, None)
+            .unwrap();
+        assert!(result.used_full_search);
+        assert_eq!(result.simulations_used, 8);
     }
 }

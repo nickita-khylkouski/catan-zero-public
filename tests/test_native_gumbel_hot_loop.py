@@ -112,6 +112,40 @@ def test_native_d6_is_root_only_not_same_turn_interior() -> None:
 @pytest.mark.skipif(
     not native_hot_loop_available(), reason="native wheel lacks gumbel_search"
 )
+@pytest.mark.parametrize(
+    ("override", "needle"),
+    [
+        ({"correct_rust_chance_spectra": False}, "correct_rust_chance_spectra"),
+        ({"belief_chance_spectra": True}, "belief_chance_spectra"),
+        ({"root_wave_batching": True}, "root_wave_batching"),
+        ({"use_batch_api": False}, "use_batch_api"),
+    ],
+)
+def test_native_rejects_unsupported_operator_semantics(override, needle) -> None:
+    config = GumbelChanceMCTSConfig(**override)
+    with pytest.raises(ValueError, match=needle):
+        NativeGumbelChanceMCTS(config, _PublicCountingEvaluator())
+
+
+@pytest.mark.skipif(
+    not native_hot_loop_available(), reason="native wheel lacks gumbel_search"
+)
+def test_native_maps_decoupled_wide_budget_fields() -> None:
+    config = GumbelChanceMCTSConfig(
+        n_full_wide=256,
+        n_full_wide_threshold=40,
+        wide_roots_always_full=True,
+    )
+    search = NativeGumbelChanceMCTS(config, _PublicCountingEvaluator())
+    native = search._native_config()
+    assert native["n_full_wide"] == 256
+    assert native["n_full_wide_threshold"] == 40
+    assert native["wide_roots_always_full"] is True
+
+
+@pytest.mark.skipif(
+    not native_hot_loop_available(), reason="native wheel lacks gumbel_search"
+)
 def test_native_forced_roll_expectation_matches_reference() -> None:
     rust = pytest.importorskip("catanatron_rs")
     game = rust.Game.simple(["RED", "BLUE"], seed=41)

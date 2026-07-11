@@ -224,6 +224,12 @@ fn gumbel_search(
     if let Some(v) = config_dict.get_item("n_full_wide")? {
         config.n_full_wide = Some(v.extract()?);
     }
+    if let Some(v) = config_dict.get_item("n_full_wide_threshold")? {
+        config.n_full_wide_threshold = Some(v.extract()?);
+    }
+    if let Some(v) = config_dict.get_item("wide_roots_always_full")? {
+        config.wide_roots_always_full = v.extract()?;
+    }
     if let Some(v) = config_dict.get_item("raw_policy_above_width")? {
         config.raw_policy_above_width = Some(v.extract()?);
     }
