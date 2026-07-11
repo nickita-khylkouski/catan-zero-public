@@ -1,0 +1,17 @@
+{
+  "schema_version": "catan-zero-e3-evidence-export/v1",
+  "config_sha256_scope": "canonical_json_without_config_sha256",
+  "config_sha256": "9b9c9c61d4108ea2ca84432e8a119d71681ff8491532f70f5bd6b00b0795baa0",
+  "status": "preregistered_before_evidence_export",
+  "production_defaults_changed": false,
+  "experiment_file_sha256": "2c67088f844ef058d39dbee549d42c7094fdbde3917e4ee42d277a5da718f6e6",
+  "experiment_semantic_sha256": "39438071adfe706619a97cf5ff5e4036d8b2c0afe45be94064cd63517cc47fba",
+  "evidence_schema": "catan-zero-e3-holdout-evidence/v1",
+  "information_regime": "public_conservation_pimc_v1",
+  "public_masking_required": true,
+  "holdout_games": 596,
+  "holdout_rows": 146517,
+  "atomic_no_overwrite_required": true,
+  "exporter_source_sha256": "6f153ccb51dfcd979dbb2904d8befe33f8061102988ea4903ca10aa61a8c6773",
+  "exporter_helper_source_sha256": "020664ea3eb8f835945e3a354611a15d3c0d6866f1964f4afcfa07ab46fa12fc"
+}
