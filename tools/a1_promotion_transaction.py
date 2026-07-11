@@ -2311,6 +2311,7 @@ def _verify_high_regret_source(
         raise PromotionError(f"{where}.report has no raw paired games")
     identities: set[tuple[int, str]] = set()
     orientations_by_pair: dict[int, set[str]] = {}
+    truncated_by_pair: dict[int, bool] = {}
     for index, game in enumerate(games):
         if not isinstance(game, dict):
             raise PromotionError(f"{where}.report.games[{index}] is malformed")
@@ -2320,14 +2321,21 @@ def _verify_high_regret_source(
             isinstance(pair_id, bool)
             or not isinstance(pair_id, int)
             or pair_id < 0
-            or not isinstance(orientation, str)
-            or not orientation
+            or orientation not in {"candidate_first", "candidate_second"}
         ):
             raise PromotionError(f"{where}.report.games[{index}] lacks pair identity")
         identity = (pair_id, orientation)
-        if identity in identities or not isinstance(game.get("candidate_won"), bool):
+        truncated = game.get("truncated")
+        outcome = game.get("candidate_won")
+        if identity in identities or not isinstance(truncated, bool):
             raise PromotionError(
                 f"{where}.report.games[{index}] is duplicate or incomplete"
+            )
+        if (truncated and outcome is not None) or (
+            not truncated and not isinstance(outcome, bool)
+        ):
+            raise PromotionError(
+                f"{where}.report.games[{index}] has inconsistent truncation outcome"
             )
         identities.add(identity)
         if state_by_pair.get(pair_id) != (
@@ -2338,8 +2346,10 @@ def _verify_high_regret_source(
                 f"{where}.report.games[{index}] is not from its held-out suite state"
             )
         orientations_by_pair.setdefault(pair_id, set()).add(orientation)
+        truncated_by_pair[pair_id] = truncated_by_pair.get(pair_id, False) or truncated
     if set(orientations_by_pair) != set(state_by_pair) or any(
-        len(orientations) != 2 for orientations in orientations_by_pair.values()
+        orientations != {"candidate_first", "candidate_second"}
+        for orientations in orientations_by_pair.values()
     ):
         raise PromotionError(f"{where}.report does not cover every suite pair twice")
     normalized_games = [{**game, "search_won": game["candidate_won"]} for game in games]
@@ -2350,8 +2360,10 @@ def _verify_high_regret_source(
     complete_pairs = (
         diagnostics["ww_pairs"] + diagnostics["split_pairs"] + diagnostics["ll_pairs"]
     )
+    truncated_pairs = sum(truncated_by_pair.values())
     if (
-        diagnostics["incomplete_pairs"] != 0
+        diagnostics["incomplete_pairs"] != truncated_pairs
+        or complete_pairs + truncated_pairs != len(state_by_pair)
         or diagnostics != report["pair_diagnostics"]
         or replayed != report["pentanomial_sprt"]
         or diagnostics != value["pair_diagnostics"]
@@ -2429,6 +2441,7 @@ def _verify_bucket_veto_source(
         raise PromotionError(f"{where}.report has no bucket-labelled games")
     counts: dict[str, list[int]] = {}
     identities: set[tuple[int, str]] = set()
+    orientations_by_pair: dict[int, set[str]] = {}
     for index, game in enumerate(raw_games):
         if not isinstance(game, dict):
             raise PromotionError(f"{where}.report.games[{index}] is malformed")
@@ -2438,8 +2451,7 @@ def _verify_bucket_veto_source(
             isinstance(pair_id, bool)
             or not isinstance(pair_id, int)
             or pair_id < 0
-            or not isinstance(orientation, str)
-            or not orientation
+            or orientation not in {"candidate_first", "candidate_second"}
         ):
             raise PromotionError(f"{where}.report.games[{index}] lacks pair identity")
         identity = (pair_id, orientation)
@@ -2457,9 +2469,15 @@ def _verify_bucket_veto_source(
         ):
             raise PromotionError(f"{where}.report.games[{index}] has invalid buckets")
         identities.add(identity)
+        orientations_by_pair.setdefault(pair_id, set()).add(orientation)
         for label in labels:
             bucket_counts = counts.setdefault(label, [0, 0])
             bucket_counts[0 if outcome else 1] += 1
+    if any(
+        orientations != {"candidate_first", "candidate_second"}
+        for orientations in orientations_by_pair.values()
+    ):
+        raise PromotionError(f"{where}.report contains an incomplete bucket pair")
     replayed_buckets: dict[str, dict[str, Any]] = {}
     replayed_veto: list[str] = []
     for label, (wins, losses) in sorted(counts.items()):

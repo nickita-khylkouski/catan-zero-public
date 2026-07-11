@@ -30,7 +30,9 @@ def _ref(path: Path) -> dict[str, str]:
     return {"path": str(path.resolve()), "sha256": promotion._sha256(path)}
 
 
-def _high_regret_report(tmp_path: Path, candidate: Path, champion: Path) -> dict:
+def _high_regret_report(
+    tmp_path: Path, candidate: Path, champion: Path, *, pairs: int = 200
+) -> dict:
     source_manifest = tmp_path / "regret-source.npz"
     source_manifest.write_bytes(b"regret manifest fixture")
     suite = tmp_path / "held-out-suite.json"
@@ -43,8 +45,8 @@ def _high_regret_report(tmp_path: Path, candidate: Path, champion: Path) -> dict
             "algorithm": "stable-hash-holdout-stratified-regret-v1",
             "holdout_fraction": 0.1,
             "holdout_seed": 17,
-            "eligible_unique_states": 200,
-            "selected_pairs": 200,
+            "eligible_unique_states": pairs,
+            "selected_pairs": pairs,
             "stratum_min_pairs": 20,
             "selected_by_stratum": {
                 "phase:opening": 20,
@@ -71,7 +73,7 @@ def _high_regret_report(tmp_path: Path, candidate: Path, champion: Path) -> dict
                 "legal_count": 54 if pair < 20 else 12,
                 "regret_score": 1.0,
             }
-            for pair in range(200)
+            for pair in range(pairs)
         ],
     }
     suite_payload["suite_sha256"] = promotion._digest_value(suite_payload)
@@ -81,11 +83,12 @@ def _high_regret_report(tmp_path: Path, candidate: Path, champion: Path) -> dict
             "pair_id": pair,
             "orientation": orientation,
             "candidate_won": True,
+            "truncated": False,
             "archived_game_seed": 50_000 + pair,
             "archived_decision_index": pair % 20,
             "buckets": ["phase:BUILD", "close"],
         }
-        for pair in range(200)
+        for pair in range(pairs)
         for orientation in ("candidate_first", "candidate_second")
     ]
     normalized = [{**game, "search_won": game["candidate_won"]} for game in games]
@@ -109,6 +112,23 @@ def _high_regret_report(tmp_path: Path, candidate: Path, champion: Path) -> dict
     }
 
 
+def _truncate_high_regret_pair(value: dict, pair_id: int = 0) -> None:
+    game = next(
+        game
+        for game in value["games"]
+        if game["pair_id"] == pair_id
+        and game["orientation"] == "candidate_first"
+    )
+    game["candidate_won"] = None
+    game["truncated"] = True
+    normalized = [{**row, "search_won": row["candidate_won"]} for row in value["games"]]
+    scores, diagnostics = promotion.pair_scores_from_h2h_games(normalized)
+    value["pair_diagnostics"] = diagnostics
+    value["pentanomial_sprt"] = promotion.evaluate_pentanomial_sprt(
+        scores, elo0=-10.0, elo1=15.0, alpha=0.05, beta=0.05
+    )
+
+
 def test_high_regret_builder_derives_source_from_passing_report(tmp_path: Path) -> None:
     candidate, champion = _checkpoints(tmp_path)
     report = tmp_path / "high-regret.report.json"
@@ -127,6 +147,29 @@ def test_high_regret_builder_derives_source_from_passing_report(tmp_path: Path) 
         == _high_regret_report(tmp_path, candidate, champion)["suite_manifest"]
     )
     assert value["pair_diagnostics"]["ww_pairs"] == 200
+
+
+def test_high_regret_builder_excludes_one_legitimate_truncated_pair(
+    tmp_path: Path,
+) -> None:
+    candidate, champion = _checkpoints(tmp_path)
+    raw = _high_regret_report(tmp_path, candidate, champion, pairs=600)
+    _truncate_high_regret_pair(raw)
+    report = tmp_path / "high-regret-truncated.report.json"
+    _json(report, raw)
+
+    value = artifacts.build_high_regret_source(
+        report_path=report, candidate=candidate, champion=champion
+    )
+
+    assert value["complete_pairs"] == 599
+    assert value["pair_diagnostics"] == {
+        "ww_pairs": 599,
+        "split_pairs": 0,
+        "ll_pairs": 0,
+        "incomplete_pairs": 1,
+    }
+    assert value["pentanomial_sprt"] == raw["pentanomial_sprt"]
 
 
 def test_held_out_suite_is_deterministic_and_derived_from_manifest(
@@ -363,6 +406,70 @@ def test_bucket_report_is_extracted_from_retained_high_regret_games(
         "candidate_won": True,
         "buckets": ["close", "phase:BUILD"],
     }
+
+
+def test_bucket_report_excludes_both_orientations_of_truncated_pair(
+    tmp_path: Path,
+) -> None:
+    candidate, champion = _checkpoints(tmp_path)
+    raw = _high_regret_report(tmp_path, candidate, champion, pairs=600)
+    _truncate_high_regret_pair(raw)
+    report = tmp_path / "high-regret-truncated.report.json"
+    _json(report, raw)
+
+    value = artifacts.build_bucket_game_report(
+        report_path=report, candidate=candidate, champion=champion
+    )
+
+    assert len(value["games"]) == 1_198
+    assert {game["pair_id"] for game in value["games"]} == set(range(1, 600))
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        (
+            lambda value: value["games"][0].update(candidate_won=None),
+            "nontruncated game",
+        ),
+        (
+            lambda value: value["games"][0].update(truncated=True),
+            "truncated game must have candidate_won=null",
+        ),
+        (
+            lambda value: value["games"].pop(1),
+            "must contain both orientations",
+        ),
+    ],
+)
+def test_high_regret_builder_rejects_mislabeled_or_half_pairs(
+    tmp_path: Path, mutation, message: str
+) -> None:
+    candidate, champion = _checkpoints(tmp_path)
+    raw = _high_regret_report(tmp_path, candidate, champion)
+    mutation(raw)
+    report = tmp_path / "invalid-high-regret.report.json"
+    _json(report, raw)
+
+    with pytest.raises(artifacts.ArtifactBuildError, match=message):
+        artifacts.build_high_regret_source(
+            report_path=report, candidate=candidate, champion=champion
+        )
+
+
+def test_high_regret_builder_rejects_stale_truncation_statistics(
+    tmp_path: Path,
+) -> None:
+    candidate, champion = _checkpoints(tmp_path)
+    raw = _high_regret_report(tmp_path, candidate, champion)
+    raw["games"][0].update(candidate_won=None, truncated=True)
+    report = tmp_path / "stale-high-regret.report.json"
+    _json(report, raw)
+
+    with pytest.raises(artifacts.ArtifactBuildError, match="paired statistics"):
+        artifacts.build_high_regret_source(
+            report_path=report, candidate=candidate, champion=champion
+        )
 
 
 @pytest.mark.parametrize(

@@ -550,6 +550,7 @@ def _fixture(
             "pair_id": pair,
             "orientation": orientation,
             "candidate_won": True,
+            "truncated": False,
             "archived_game_seed": 7_000_000 + pair,
             "archived_decision_index": 0,
             "buckets": ["phase:BUILD", "close"],
@@ -1624,6 +1625,134 @@ def test_high_regret_report_binds_candidate_and_incumbent_role_scales(
     )
 
     with pytest.raises(promotion.PromotionError, match="baseline_c_scale"):
+        _execute(fixture, go=False)
+
+
+def _install_truncated_high_regret_pair(fixture: dict) -> None:
+    def mutate(source: dict) -> None:
+        report_path = Path(source["report"]["path"])
+        report = json.loads(report_path.read_text())
+        game = next(
+            game
+            for game in report["games"]
+            if game["pair_id"] == 0
+            and game["orientation"] == "candidate_first"
+        )
+        game["candidate_won"] = None
+        game["truncated"] = True
+        normalized = [
+            {**row, "search_won": row["candidate_won"]}
+            for row in report["games"]
+        ]
+        scores, diagnostics = promotion.pair_scores_from_h2h_games(normalized)
+        pentanomial = promotion.evaluate_pentanomial_sprt(
+            scores, elo0=-10.0, elo1=15.0, alpha=0.05, beta=0.05
+        )
+        report["pair_diagnostics"] = diagnostics
+        report["pentanomial_sprt"] = pentanomial
+        _write_json(report_path, report)
+        source["complete_pairs"] = 199
+        source["pair_diagnostics"] = diagnostics
+        source["pentanomial_sprt"] = pentanomial
+        source["verdict"] = pentanomial["decision"]
+        source["report"]["sha256"] = promotion._sha256(report_path)
+
+    _mutate_evidence_source(
+        fixture, kind="high_regret", role="high_regret", mutate=mutate
+    )
+
+
+def test_transaction_independently_accepts_legitimate_truncated_high_regret_pair(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path)
+    _install_truncated_high_regret_pair(fixture)
+
+    plan = _execute(fixture, go=False)
+
+    assert plan["status"] == "dry_run"
+
+
+def test_transaction_rejects_none_outcome_without_truncation(tmp_path: Path) -> None:
+    fixture = _fixture(tmp_path)
+
+    def mutate(source: dict) -> None:
+        report_path = Path(source["report"]["path"])
+        report = json.loads(report_path.read_text())
+        report["games"][0]["candidate_won"] = None
+        _write_json(report_path, report)
+        source["report"]["sha256"] = promotion._sha256(report_path)
+
+    _mutate_evidence_source(
+        fixture, kind="high_regret", role="high_regret", mutate=mutate
+    )
+
+    with pytest.raises(promotion.PromotionError, match="inconsistent truncation"):
+        _execute(fixture, go=False)
+
+
+def test_transaction_rejects_half_high_regret_pair(tmp_path: Path) -> None:
+    fixture = _fixture(tmp_path)
+
+    def mutate(source: dict) -> None:
+        report_path = Path(source["report"]["path"])
+        report = json.loads(report_path.read_text())
+        report["games"].pop(1)
+        normalized = [
+            {**row, "search_won": row["candidate_won"]}
+            for row in report["games"]
+        ]
+        scores, diagnostics = promotion.pair_scores_from_h2h_games(normalized)
+        pentanomial = promotion.evaluate_pentanomial_sprt(
+            scores, elo0=-10.0, elo1=15.0, alpha=0.05, beta=0.05
+        )
+        report["pair_diagnostics"] = diagnostics
+        report["pentanomial_sprt"] = pentanomial
+        _write_json(report_path, report)
+        source["complete_pairs"] = 199
+        source["pair_diagnostics"] = diagnostics
+        source["pentanomial_sprt"] = pentanomial
+        source["report"]["sha256"] = promotion._sha256(report_path)
+
+    _mutate_evidence_source(
+        fixture, kind="high_regret", role="high_regret", mutate=mutate
+    )
+
+    with pytest.raises(promotion.PromotionError, match="cover every suite pair twice"):
+        _execute(fixture, go=False)
+
+
+def test_transaction_rejects_inconsistent_truncated_complete_pair_count(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path)
+    _install_truncated_high_regret_pair(fixture)
+    _mutate_evidence_source(
+        fixture,
+        kind="high_regret",
+        role="high_regret",
+        mutate=lambda source: source.__setitem__("complete_pairs", 200),
+    )
+
+    with pytest.raises(promotion.PromotionError, match="paired statistics"):
+        _execute(fixture, go=False)
+
+
+def test_transaction_rejects_incomplete_bucket_pair(tmp_path: Path) -> None:
+    fixture = _fixture(tmp_path)
+
+    def mutate(source: dict) -> None:
+        report_path = Path(source["report"]["path"])
+        report = json.loads(report_path.read_text())
+        report["games"].pop(0)
+        _write_json(report_path, report)
+        source["report"]["sha256"] = promotion._sha256(report_path)
+
+    _mutate_evidence_source(
+        fixture, kind="bucket_veto", role="bucket_veto", mutate=mutate
+    )
+
+    with pytest.raises(promotion.PromotionError, match="incomplete bucket pair"):
         _execute(fixture, go=False)
 
 

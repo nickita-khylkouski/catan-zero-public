@@ -122,6 +122,54 @@ def _paired_game_identity(game: Any, *, index: int, where: str) -> tuple[int, st
     return pair_id, orientation
 
 
+_PAIR_ORIENTATIONS = {"candidate_first", "candidate_second"}
+
+
+def _validated_high_regret_games(
+    games: Any, *, where: str
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int]:
+    """Validate raw outcomes and return complete games plus replay input."""
+
+    if not isinstance(games, list) or not games:
+        raise ArtifactBuildError(f"{where} must be a non-empty list")
+    identities: set[tuple[int, str]] = set()
+    by_pair: dict[int, dict[str, dict[str, Any]]] = {}
+    for index, game in enumerate(games):
+        identity = _paired_game_identity(game, index=index, where=where)
+        pair_id, orientation = identity
+        if identity in identities:
+            raise ArtifactBuildError(f"{where} contains duplicate games")
+        if orientation not in _PAIR_ORIENTATIONS:
+            raise ArtifactBuildError(f"{where}[{index}] has invalid orientation")
+        truncated = game.get("truncated")
+        outcome = game.get("candidate_won")
+        if not isinstance(truncated, bool):
+            raise ArtifactBuildError(f"{where}[{index}].truncated must be boolean")
+        if truncated:
+            if outcome is not None:
+                raise ArtifactBuildError(
+                    f"{where}[{index}] truncated game must have candidate_won=null"
+                )
+        elif not isinstance(outcome, bool):
+            raise ArtifactBuildError(
+                f"{where}[{index}] nontruncated game must have boolean candidate_won"
+            )
+        identities.add(identity)
+        by_pair.setdefault(pair_id, {})[orientation] = game
+
+    incomplete_pairs: set[int] = set()
+    for pair_id, pair_games in by_pair.items():
+        if set(pair_games) != _PAIR_ORIENTATIONS:
+            raise ArtifactBuildError(
+                f"{where} pair {pair_id} must contain both orientations"
+            )
+        if any(game["truncated"] for game in pair_games.values()):
+            incomplete_pairs.add(pair_id)
+    complete_games = [game for game in games if game["pair_id"] not in incomplete_pairs]
+    normalized_games = [{**game, "search_won": game["candidate_won"]} for game in games]
+    return complete_games, normalized_games, len(incomplete_pairs)
+
+
 def _write_new_readonly(path: Path, value: dict[str, Any]) -> None:
     path = Path(os.path.abspath(os.fspath(path.expanduser())))
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -186,22 +234,9 @@ def build_high_regret_source(
         base=report_path.parent,
         where="high-regret report.suite_manifest",
     )
-    games = raw["games"]
-    if not isinstance(games, list) or not games:
-        raise ArtifactBuildError("high-regret report.games must be a non-empty list")
-    identities: set[tuple[int, str]] = set()
-    for index, game in enumerate(games):
-        identity = _paired_game_identity(
-            game, index=index, where="high-regret report.games"
-        )
-        if identity in identities:
-            raise ArtifactBuildError("high-regret report contains duplicate games")
-        if not isinstance(game.get("candidate_won"), bool):
-            raise ArtifactBuildError(
-                f"high-regret report.games[{index}].candidate_won must be boolean"
-            )
-        identities.add(identity)
-    normalized_games = [{**game, "search_won": game["candidate_won"]} for game in games]
+    _complete_games, normalized_games, truncated_pairs = _validated_high_regret_games(
+        raw["games"], where="high-regret report.games"
+    )
     pair_scores, diagnostics = promotion.pair_scores_from_h2h_games(normalized_games)
     pentanomial = promotion.evaluate_pentanomial_sprt(
         pair_scores, elo0=-10.0, elo1=15.0, alpha=0.05, beta=0.05
@@ -210,8 +245,8 @@ def build_high_regret_source(
         diagnostics[key] for key in ("ww_pairs", "split_pairs", "ll_pairs")
     )
     _positive_int(complete_pairs, where="high-regret report complete pairs")
-    if diagnostics["incomplete_pairs"] != 0:
-        raise ArtifactBuildError("high-regret report contains incomplete pairs")
+    if diagnostics["incomplete_pairs"] != truncated_pairs:
+        raise ArtifactBuildError("high-regret report truncation diagnostics do not replay")
     if raw["pair_diagnostics"] != diagnostics or raw["pentanomial_sprt"] != pentanomial:
         raise ArtifactBuildError("high-regret report paired statistics do not replay")
     if pentanomial["decision"] != "H1":
@@ -645,17 +680,25 @@ def build_bucket_game_report(
     champion_ref = _verify_checkpoint_ref(
         raw["champion"], expected=champion, where="bucket report.champion"
     )
-    games = raw["games"]
-    if not isinstance(games, list) or not games:
-        raise ArtifactBuildError("bucket extraction report has no games")
+    games, normalized_games, truncated_pairs = _validated_high_regret_games(
+        raw["games"], where="report.games"
+    )
+    pair_scores, diagnostics = promotion.pair_scores_from_h2h_games(normalized_games)
+    pentanomial = promotion.evaluate_pentanomial_sprt(
+        pair_scores, elo0=-10.0, elo1=15.0, alpha=0.05, beta=0.05
+    )
+    if (
+        diagnostics["incomplete_pairs"] != truncated_pairs
+        or raw["pair_diagnostics"] != diagnostics
+        or raw["pentanomial_sprt"] != pentanomial
+        or pentanomial["decision"] != "H1"
+    ):
+        raise ArtifactBuildError("bucket extraction paired statistics do not replay")
     projected: list[dict[str, Any]] = []
-    identities: set[tuple[int, str]] = set()
     for index, game in enumerate(games):
         identity = _paired_game_identity(game, index=index, where="report.games")
         outcome = game.get("candidate_won")
         labels = game.get("buckets")
-        if identity in identities or not isinstance(outcome, bool):
-            raise ArtifactBuildError("bucket extraction has duplicate/incomplete games")
         if (
             not isinstance(labels, list)
             or not labels
@@ -663,7 +706,6 @@ def build_bucket_game_report(
             or len(labels) != len(set(labels))
         ):
             raise ArtifactBuildError(f"report.games[{index}] has invalid bucket labels")
-        identities.add(identity)
         projected.append(
             {
                 "pair_id": identity[0],
