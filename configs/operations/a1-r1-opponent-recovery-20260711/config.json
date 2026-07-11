@@ -3,6 +3,7 @@
   "label": "experimental_nonpromotable",
   "historical_parent_receipt": "historical_parent_receipt_unavailable",
   "runtime_repo": "/home/ubuntu/catan-rl-loop-controller",
+  "runtime_python": "/home/ubuntu/catan-zero-v1/.venv/bin/python",
   "runtime_commit": "26bd9a645ac5750d63e88da86ed665386c5c1cda",
   "native_wheel": {
     "filename": "catanatron_rs-0.1.5-cp311-cp311-manylinux_2_34_x86_64.whl",
