@@ -46,6 +46,89 @@ FORBIDDEN_ADAPTIVE_ARGV = (
     "--raw-policy-above-width",
 )
 
+_REMOTE_INSTALL_PRECHECK_SCRIPT = r"""
+import hashlib
+import pathlib
+import stat
+import sys
+
+destination = pathlib.Path(sys.argv[1])
+expected = sys.argv[2]
+
+def sha256(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(block)
+    return "sha256:" + digest.hexdigest()
+
+if not destination.is_absolute():
+    raise SystemExit("destination is not canonical")
+try:
+    metadata = destination.lstat()
+except FileNotFoundError:
+    if destination.resolve(strict=False) != destination:
+        raise SystemExit("destination is not canonical")
+    raise SystemExit(3)
+if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+    raise SystemExit("destination is not a regular non-symlink file")
+if destination.resolve(strict=False) != destination:
+    raise SystemExit("destination is not canonical")
+if sha256(destination) != expected:
+    raise SystemExit("destination exists with different bytes")
+"""
+
+_REMOTE_INSTALL_SCRIPT = r"""
+import hashlib
+import os
+import pathlib
+import shutil
+import stat
+import sys
+
+source = pathlib.Path(sys.argv[1])
+destination = pathlib.Path(sys.argv[2])
+expected = sys.argv[3]
+
+def sha256(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(block)
+    return "sha256:" + digest.hexdigest()
+
+source_metadata = source.lstat()
+if stat.S_ISLNK(source_metadata.st_mode) or not stat.S_ISREG(source_metadata.st_mode):
+    raise SystemExit("incoming source is not a regular non-symlink file")
+if sha256(source) != expected:
+    raise SystemExit("incoming source hash mismatch")
+destination.parent.mkdir(parents=True, exist_ok=True)
+if not destination.is_absolute():
+    raise SystemExit("destination is not canonical")
+try:
+    destination_metadata = destination.lstat()
+except FileNotFoundError:
+    destination_metadata = None
+if destination_metadata is not None:
+    if stat.S_ISLNK(destination_metadata.st_mode) or not stat.S_ISREG(destination_metadata.st_mode):
+        raise SystemExit("destination is not a regular non-symlink file")
+    if destination.resolve(strict=False) != destination:
+        raise SystemExit("destination is not canonical")
+    if sha256(destination) == expected:
+        raise SystemExit(0)
+    raise SystemExit("destination exists with different bytes")
+if destination.resolve(strict=False) != destination:
+    raise SystemExit("destination is not canonical")
+flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+descriptor = os.open(destination, flags, 0o444)
+with os.fdopen(descriptor, "wb") as output, source.open("rb") as input_handle:
+    shutil.copyfileobj(input_handle, output, length=1 << 20)
+    output.flush()
+    os.fsync(output.fileno())
+if sha256(destination) != expected:
+    raise SystemExit("installed destination hash mismatch")
+"""
+
 
 class ExecutorError(RuntimeError):
     pass
@@ -311,6 +394,8 @@ def _repo_artifacts(
         files[str(relative)] = path
     supervisor = (root / "tools/fleet/a1_lane_supervisor.py").resolve()
     files[str(supervisor.relative_to(root))] = supervisor
+    executor = (root / "tools/fleet/a1_production_executor.py").resolve()
+    files[str(executor.relative_to(root))] = executor
     stop_helper = (root / "tools/fleet/a1_stop_helper.py").resolve()
     files[str(stop_helper.relative_to(root))] = stop_helper
     return [
@@ -512,30 +597,76 @@ def _scp(hosts: dict[str, Any], alias: str, source: Path, destination: str) -> N
 def _remote_install(
     hosts: dict[str, Any], alias: str, source: Path, destination: str, expected: str
 ) -> None:
+    precheck_command = " ".join(
+        shlex.quote(value)
+        for value in (
+            hosts["python"],
+            "-c",
+            _REMOTE_INSTALL_PRECHECK_SCRIPT,
+            destination,
+            expected,
+        )
+    )
+    precheck = _ssh(hosts, alias, precheck_command)
+    if precheck.returncode == 0:
+        return
+    if precheck.returncode != 3:
+        detail = precheck.stderr.strip() or f"exit {precheck.returncode}"
+        raise ExecutorError(f"remote destination precheck failed on {alias}: {detail}")
+
     incoming = f"{hosts['remote_root']}/incoming/{uuid.uuid4().hex}"
     mkdir = _ssh(hosts, alias, f"mkdir -p {shlex.quote(str(Path(incoming).parent))}")
     if mkdir.returncode != 0:
         raise ExecutorError(f"remote mkdir failed on {alias}: {mkdir.stderr.strip()}")
     _scp(hosts, alias, source, incoming)
-    script = (
-        "import hashlib,os,pathlib,shutil,sys;"
-        "src=pathlib.Path(sys.argv[1]);dst=pathlib.Path(sys.argv[2]);exp=sys.argv[3];"
-        "h=lambda p:'sha256:'+hashlib.sha256(p.read_bytes()).hexdigest();"
-        "dst.parent.mkdir(parents=True,exist_ok=True);"
-        "assert h(src)==exp;"
-        "(None if not dst.exists() else (_ for _ in ()).throw(SystemExit(0 if h(dst)==exp else 9)));"
-        "fd=os.open(dst,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o444);"
-        "f=os.fdopen(fd,'wb');f.write(src.read_bytes());f.flush();os.fsync(f.fileno());f.close();"
-        "assert h(dst)==exp"
-    )
     command = " ".join(
         shlex.quote(value)
-        for value in (hosts["python"], "-c", script, incoming, destination, expected)
+        for value in (
+            hosts["python"],
+            "-c",
+            _REMOTE_INSTALL_SCRIPT,
+            incoming,
+            destination,
+            expected,
+        )
     )
     result = _ssh(hosts, alias, command)
     _ssh(hosts, alias, f"rm -f {shlex.quote(incoming)}")
     if result.returncode != 0:
         raise ExecutorError(f"immutable install failed on {alias}: {result.stderr.strip()}")
+
+
+def _stage_files_by_alias(
+    required: Mapping[str, Any], lanes: Mapping[str, Sequence[Mapping[str, Any]]]
+) -> dict[str, list[tuple[Path, str, str]]]:
+    global_files = [
+        *[
+            (Path(item["path"]), item["path"], item["sha256"])
+            for item in required.get("checkpoints", [])
+        ],
+        *[
+            (Path(item["path"]), item["path"], item["sha256"])
+            for item in required["rendered_opponent_mix"]
+        ],
+    ]
+    aliases = {str(lane[0]["host_alias"]) for lane in lanes.values()}
+    staged = {alias: list(global_files) for alias in aliases}
+    attestations: dict[str, dict[str, tuple[Path, str, str]]] = {
+        alias: {} for alias in aliases
+    }
+    for lane in lanes.values():
+        alias = str(lane[0]["host_alias"])
+        for command in lane:
+            record = command["output_attestation"]
+            source = str(record["source"])
+            candidate = (Path(source), source, str(record["source_file_sha256"]))
+            previous = attestations[alias].get(source)
+            if previous is not None and previous != candidate:
+                raise ExecutorError(f"conflicting attestation source on {alias}: {source}")
+            attestations[alias][source] = candidate
+    for alias in aliases:
+        staged[alias].extend(attestations[alias][path] for path in sorted(attestations[alias]))
+    return staged
 
 
 def _append_only_bytes(existing: bytes, desired: bytes) -> bytes:
@@ -988,17 +1119,9 @@ def execute(plan: dict[str, Any], *, receipt_path: Path, resume: bool) -> dict[s
         repo_dir = f"{hosts['remote_root']}/repo-{repo_token}"
         aliases = sorted({lane[0]["host_alias"] for lane in lanes.values()})
         required = rendered["required_artifacts"]
-        stage_files = [
-            *[(Path(item["path"]), item["path"], item["sha256"]) for item in required["checkpoints"]],
-            *[(Path(item["path"]), item["path"], item["sha256"]) for item in required["rendered_opponent_mix"]],
-        ]
+        stage_files_by_alias = _stage_files_by_alias(required, lanes)
         if _sha256(Path(required["seed_ledger"]["path"])) != public["live_seed_ledger_sha256"]:
             raise ExecutorError("live seed ledger changed after dry-run plan binding")
-        attestation_sources = {
-            item["output_attestation"]["source"]: item["output_attestation"]["source_file_sha256"]
-            for lane in lanes.values() for item in lane
-        }
-        stage_files.extend((Path(path), path, digest) for path, digest in attestation_sources.items())
         operator_manifests = {
             name: {
                 "path": f"{hosts['remote_root']}/operator/{record['remote_name']}",
@@ -1029,7 +1152,7 @@ def execute(plan: dict[str, Any], *, receipt_path: Path, resume: bool) -> dict[s
                 required["seed_ledger"]["path"],
                 public["live_seed_ledger_sha256"],
             )
-            for source, destination, digest in stage_files:
+            for source, destination, digest in stage_files_by_alias[alias]:
                 _remote_install(hosts, alias, source, destination, digest)
 
         lane_pids: dict[str, int] = dict(receipt.get("lane_pids", {}))

@@ -85,6 +85,66 @@ def _generation_campaign_copy(tmp_path: Path, mutate) -> Path:
     return path
 
 
+def _historical_db1_campaign(tmp_path: Path) -> Path:
+    lines = GENERATION_CAMPAIGN.read_text(encoding="utf-8").splitlines(keepends=True)
+    historical: list[str] = []
+    for line in lines:
+        if '"path": "tools/fleet/a1_lane_supervisor.py"' in line:
+            continue
+        if '"executor": {"path": "tools/fleet/a1_production_executor.py"' in line:
+            line = (
+                '    "executor": {"path": "tools/fleet/a1_production_executor.py", '
+                f'"sha256": "{contract.HISTORICAL_DB1_EXECUTOR_SHA256}"}},\n'
+            )
+        if '"contract_sha256":' in line:
+            line = f'  "contract_sha256": "{contract.HISTORICAL_DB1_CAMPAIGN_SHA256}"\n'
+        historical.append(line)
+    path = tmp_path / "historical-db1-campaign.json"
+    path.write_text("".join(historical), encoding="utf-8")
+    assert contract._sha256(path) == contract.HISTORICAL_DB1_CAMPAIGN_FILE_SHA256  # noqa: SLF001
+    return path
+
+
+def test_exact_db1_campaign_is_accepted_only_as_existing_lock_source(
+    tmp_path: Path,
+) -> None:
+    historical = _historical_db1_campaign(tmp_path)
+
+    with pytest.raises(contract.ContractError, match="provenance file set drift"):
+        contract.validate_generation_campaign(historical)
+    verified = contract.validate_generation_campaign(
+        historical, _allow_historical_lock_source=True
+    )
+    assert verified["contract_sha256"] == contract.HISTORICAL_DB1_CAMPAIGN_SHA256
+    with pytest.raises(contract.ContractError, match="provenance file set drift"):
+        contract.materialize_generation_campaign(
+            historical,
+            promotion_handoff_path=tmp_path / "handoff.json",
+            placement_path=tmp_path / "placement.json",
+            out_dir=tmp_path / "locks",
+        )
+
+
+@pytest.mark.parametrize("mutation", ["bytes", "provenance"])
+def test_db1_lock_source_compatibility_rejects_any_drift(
+    tmp_path: Path, mutation: str
+) -> None:
+    historical = _historical_db1_campaign(tmp_path)
+    if mutation == "bytes":
+        historical.write_bytes(historical.read_bytes().replace(b'"n_fast": 16', b'"n_fast": 17'))
+    else:
+        payload = json.loads(historical.read_text(encoding="utf-8"))
+        payload["provenance"]["executor"]["sha256"] = "sha256:" + "0" * 64
+        payload.pop("contract_sha256")
+        payload["contract_sha256"] = contract._digest_value(payload)  # noqa: SLF001
+        historical.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(contract.ContractError):
+        contract.validate_generation_campaign(
+            historical, _allow_historical_lock_source=True
+        )
+
+
 def test_dual_arm_generation_campaign_is_exact_and_fail_closed() -> None:
     payload = contract.validate_generation_campaign(GENERATION_CAMPAIGN)
     arms = {arm["id"]: arm for arm in payload["arms"]}

@@ -200,6 +200,127 @@ def _hosts(tmp_path: Path, rendered: dict) -> Path:
     return path
 
 
+def test_remote_install_exact_hit_skips_transfer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "artifact"
+    source.write_bytes(b"exact")
+    ssh_calls: list[str] = []
+    scp_calls: list[tuple] = []
+
+    def exact_precheck(_hosts: dict, _alias: str, command: str):
+        ssh_calls.append(command)
+        return subprocess.CompletedProcess([], 0, "", "")
+
+    monkeypatch.setattr(executor, "_ssh", exact_precheck)
+    monkeypatch.setattr(
+        executor, "_scp", lambda *args: scp_calls.append(args)
+    )
+    executor._remote_install(
+        {
+            "python": sys.executable,
+            "remote_root": "/remote",
+        },
+        "h00",
+        source,
+        "/remote/exact",
+        _sha(source),
+    )
+
+    assert len(ssh_calls) == 1
+    assert not scp_calls
+
+
+@pytest.mark.parametrize("kind", ["mismatch", "symlink"])
+def test_remote_install_precheck_refuses_mismatch_and_symlink(
+    tmp_path: Path, kind: str
+) -> None:
+    destination = tmp_path / "destination"
+    expected_source = tmp_path / "expected"
+    expected_source.write_bytes(b"expected")
+    if kind == "mismatch":
+        destination.write_bytes(b"different")
+        message = "different bytes"
+    else:
+        target = tmp_path / "target"
+        target.write_bytes(b"expected")
+        destination.symlink_to(target)
+        message = "regular non-symlink"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            executor._REMOTE_INSTALL_PRECHECK_SCRIPT,
+            str(destination),
+            _sha(expected_source),
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert message in result.stderr
+
+
+def test_stage_files_are_alias_scoped_except_global_artifacts(tmp_path: Path) -> None:
+    _lock_path, _render_path, lock, rendered = _fixture(tmp_path)
+    required = rendered["required_artifacts"] | {
+        "checkpoints": lock["checkpoints"]
+    }
+    lanes = {
+        "h00_gpu0": rendered["commands"][:3],
+        "h01_gpu0": rendered["commands"][12:15],
+    }
+
+    staged = executor._stage_files_by_alias(required, lanes)
+    by_alias = {
+        alias: {destination for _source, destination, _digest in records}
+        for alias, records in staged.items()
+    }
+    globals_expected = {
+        *(item["path"] for item in required["checkpoints"]),
+        *(item["path"] for item in required["rendered_opponent_mix"]),
+    }
+    h00_attestations = {
+        command["output_attestation"]["source"] for command in lanes["h00_gpu0"]
+    }
+    h01_attestations = {
+        command["output_attestation"]["source"] for command in lanes["h01_gpu0"]
+    }
+
+    assert by_alias["h00"] == globals_expected | h00_attestations
+    assert by_alias["h01"] == globals_expected | h01_attestations
+    assert by_alias["h00"].isdisjoint(h01_attestations)
+    assert by_alias["h01"].isdisjoint(h00_attestations)
+
+
+def test_repo_artifact_plan_binds_fixed_executor_and_supervisor() -> None:
+    supervisor_path = Path(supervisor.__file__).resolve()
+    rendered = {
+        "required_artifacts": {
+            "guard_config": {
+                "path": str(supervisor_path),
+                "sha256": _sha(supervisor_path),
+            },
+            "generator_code": [],
+            "runtime_code_tree": [],
+        }
+    }
+
+    artifacts = {
+        record["path"]: record for record in executor._repo_artifacts(rendered)
+    }
+
+    assert artifacts["tools/fleet/a1_lane_supervisor.py"]["sha256"] == _sha(
+        supervisor_path
+    )
+    assert artifacts["tools/fleet/a1_production_executor.py"]["sha256"] == _sha(
+        Path(executor.__file__).resolve()
+    )
+
+
 def test_dry_plan_is_exact_40_lane_120_job_n128_mps_contract(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

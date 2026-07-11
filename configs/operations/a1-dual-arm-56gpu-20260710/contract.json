@@ -165,7 +165,7 @@
       {"path": "native/gumbel_mcts_rs/Cargo.toml", "sha256": "sha256:3176ed9530ddccb4554ff5107b0d76cf09fc3b26fbe5e7e32c45c70fdf87e90e"},
       {"path": "native/gumbel_mcts_rs/src/lib.rs", "sha256": "sha256:556e9a9e67248a6d708e07b2267fbec377ba9593157d3f9fe90ba52731264329"}
     ],
-    "executor": {"path": "tools/fleet/a1_production_executor.py", "sha256": "sha256:fb92619ce98b2381267ba83a4d32c77236c54444c17d5d3258f3bac6b6a27db3"},
+    "executor": {"path": "tools/fleet/a1_production_executor.py", "sha256": "sha256:b224eaf2c9052f2d373fd127bc1e49984a241435fa9c358d1aa8d56fdb4d2c1e"},
     "harvest": {"path": "tools/fleet/a1_harvest_transaction.py", "sha256": "sha256:659e38c95d45a4fae6af98d0b4f224083282df00017cfad4475be7b1bb8e6697"},
     "fleet_manifest": {"path": "configs/gpu_fleet_56.json", "sha256": "sha256:39f0f62425261580cdbefad453c7eb651edf0562d9d87883daed791ef03b3088"}
   },
@@ -176,5 +176,5 @@
     "required_harvest": "tools/fleet/a1_harvest_transaction.py",
     "materialization": "seal_with_a1_pre_wave_contract_after_handoff_and_placement"
   },
-  "contract_sha256": "sha256:326655664b1a666189ff45698ddc1d28823cf5268a3bcd2716bcc24fdb892099"
+  "contract_sha256": "sha256:2498f0c9e04a3c0df1be74adc7762851e9671920387c35672b583993bc9a1e9e"
 }

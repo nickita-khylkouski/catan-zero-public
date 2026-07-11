@@ -184,6 +184,15 @@ GENERATION_CAMPAIGN_CHECKPOINT_SHA256 = (
     "sha256:f7e93dfb8cdb713d647b3e142c949d59083de9f719b6688b6faa6c918ce3eed4"
 )
 GENERATION_CAMPAIGN_SEED_FLOOR = 300_000_160_000
+HISTORICAL_DB1_CAMPAIGN_SHA256 = (
+    "sha256:ceecfa414c006dbe37c34b7b8d1e2f27d4028779d3c49626b6b9562ebeb99153"
+)
+HISTORICAL_DB1_CAMPAIGN_FILE_SHA256 = (
+    "sha256:27c893690c65c02a6cfb38560b92b402f0cb893474f5eafa8d540ad1f4cd1a82"
+)
+HISTORICAL_DB1_EXECUTOR_SHA256 = (
+    "sha256:fb92619ce98b2381267ba83a4d32c77236c54444c17d5d3258f3bac6b6a27db3"
+)
 A0_EVIDENCE_SCHEMA = "a0-binding-verdict-v1"
 SEARCH_STAGE_EVIDENCE_SCHEMA = "rl-rnd-stage-decision-v1"
 REQUIRED_REPORTS = {
@@ -2404,7 +2413,12 @@ def _verify_artifact_records(records: Iterable[dict[str, Any]]) -> None:
             )
 
 
-def validate_generation_campaign(path: Path, *, require_ready: bool = False) -> dict[str, Any]:
+def validate_generation_campaign(
+    path: Path,
+    *,
+    require_ready: bool = False,
+    _allow_historical_lock_source: bool = False,
+) -> dict[str, Any]:
     """Validate the canonical post-A1 dual-arm generation blueprint.
 
     This blueprint deliberately cannot be rendered or executed.  It freezes the
@@ -2413,6 +2427,12 @@ def validate_generation_campaign(path: Path, *, require_ready: bool = False) -> 
     """
 
     value = _load_json(path)
+    historical_lock_source = bool(
+        _allow_historical_lock_source
+        and value.get("contract_sha256") == HISTORICAL_DB1_CAMPAIGN_SHA256
+        and path.is_file()
+        and _sha256(path) == HISTORICAL_DB1_CAMPAIGN_FILE_SHA256
+    )
     _require_exact_keys(
         value,
         {
@@ -2674,6 +2694,8 @@ def validate_generation_campaign(path: Path, *, require_ready: bool = False) -> 
         "tools/fleet/a1_harvest_transaction.py",
         "configs/gpu_fleet_56.json",
     }
+    if historical_lock_source:
+        expected_suffixes.remove("tools/fleet/a1_lane_supervisor.py")
     if {str(record.get("path")) for record in records} != expected_suffixes:
         raise ContractError("generation campaign provenance file set drift")
     guards = {record["path"] for record in provenance["arm_guards"]}
@@ -2686,6 +2708,11 @@ def validate_generation_campaign(path: Path, *, require_ready: bool = False) -> 
         raise ContractError("generation campaign arm guard bindings drift")
     for record in records:
         _require_exact_keys(record, {"path", "sha256"}, where="generation campaign file")
+        if historical_lock_source and record == {
+            "path": "tools/fleet/a1_production_executor.py",
+            "sha256": HISTORICAL_DB1_EXECUTOR_SHA256,
+        }:
+            continue
         source = REPO_ROOT / str(record["path"])
         if not source.is_file() or _sha256(source) != record["sha256"]:
             raise ContractError(f"generation campaign immutable file drift: {source}")
@@ -3648,7 +3675,10 @@ def _verify_generation_arm_lock(
     _verify_artifact_records(
         [lock["source_campaign"], lock["source_placement"], lock["promotion_handoff"]]
     )
-    campaign = validate_generation_campaign(Path(str(lock["source_campaign"]["path"])))
+    campaign = validate_generation_campaign(
+        Path(str(lock["source_campaign"]["path"])),
+        _allow_historical_lock_source=True,
+    )
     placements = _campaign_placements(
         Path(str(lock["source_placement"]["path"])), campaign
     )
@@ -3769,6 +3799,16 @@ def _verify_generation_arm_lock(
         *lock["provenance"]["runtime_code_tree"],
     ]
     for record in records:
+        if (
+            campaign["contract_sha256"] == HISTORICAL_DB1_CAMPAIGN_SHA256
+            and record
+            == {
+                "kind": "executor",
+                "path": "tools/fleet/a1_production_executor.py",
+                "sha256": HISTORICAL_DB1_EXECUTOR_SHA256,
+            }
+        ):
+            continue
         raw_path = Path(str(record["path"]))
         source = raw_path if raw_path.is_absolute() else REPO_ROOT / raw_path
         if not source.is_file() or _sha256(source) != record["sha256"]:
