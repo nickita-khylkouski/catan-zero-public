@@ -416,6 +416,31 @@ def _harvest_job(
     return row
 
 
+def _host_round_robin_jobs(jobs: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return a deterministic schedule that spreads initial work across hosts.
+
+    ``ThreadPoolExecutor`` starts work in submission order.  Sorting solely by
+    job id can therefore fill the entire worker pool from the first host when
+    job ids are host-contiguous, serializing the available source links.  Keep
+    each host's jobs ordered for reproducibility, but interleave the sorted host
+    queues so every parallel wave uses as many distinct sources as possible.
+    """
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for job in jobs:
+        grouped.setdefault(str(job["host_alias"]), []).append(job)
+    for host_jobs in grouped.values():
+        host_jobs.sort(key=lambda row: row["job_id"])
+    hosts = sorted(grouped)
+    scheduled: list[dict[str, Any]] = []
+    index = 0
+    while True:
+        wave = [grouped[host][index] for host in hosts if index < len(grouped[host])]
+        if not wave:
+            return scheduled
+        scheduled.extend(wave)
+        index += 1
+
+
 def harvest(
     plan_path: Path,
     destination: Path,
@@ -446,12 +471,13 @@ def harvest(
         except BlockingIOError as error:
             raise FinalizerError("another harvest owns this destination") from error
         jobs = sorted(plan["recovery_jobs"], key=lambda row: row["job_id"])
+        scheduled_jobs = _host_round_robin_jobs(jobs)
         inventory_by_job: dict[str, dict[str, Any]] = {}
         failures: list[str] = []
         with ThreadPoolExecutor(max_workers=min(parallelism, len(jobs))) as executor:
             futures = {
                 executor.submit(_harvest_job, destination, ssh_command, job): job
-                for job in jobs
+                for job in scheduled_jobs
             }
             for future in as_completed(futures):
                 job = futures[future]

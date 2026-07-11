@@ -176,6 +176,31 @@ def test_parallel_harvest_is_bounded_deterministic_and_resumable_after_failure(
     )
 
 
+def test_harvest_schedule_round_robins_hosts_without_changing_receipt_order() -> None:
+    jobs = [
+        {"job_id": "job-04", "host_alias": "h2"},
+        {"job_id": "job-01", "host_alias": "h1"},
+        {"job_id": "job-03", "host_alias": "h1"},
+        {"job_id": "job-02", "host_alias": "h2"},
+        {"job_id": "job-00", "host_alias": "h0"},
+        {"job_id": "job-05", "host_alias": "h2"},
+    ]
+
+    scheduled = finalizer._host_round_robin_jobs(jobs)
+
+    assert [(row["host_alias"], row["job_id"]) for row in scheduled] == [
+        ("h0", "job-00"),
+        ("h1", "job-01"),
+        ("h2", "job-02"),
+        ("h1", "job-03"),
+        ("h2", "job-04"),
+        ("h2", "job-05"),
+    ]
+    assert sorted(row["job_id"] for row in scheduled) == sorted(
+        row["job_id"] for row in jobs
+    )
+
+
 def test_remote_receipt_gate_requires_exact_complete_jobs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
