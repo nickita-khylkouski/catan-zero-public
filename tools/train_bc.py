@@ -5012,9 +5012,13 @@ def _train_xdim_batch(
         # is a gen-1-onward lever, lambda=1.0 (default) is a pure no-op.
         truncated_mask = torch.as_tensor(
             np.asarray(
-                data.get(
-                    "truncated", np.zeros(len(data["action_taken"]), dtype=np.bool_)
-                )[batch],
+                _batch_array_or_fill(
+                    data,
+                    "truncated",
+                    batch,
+                    False,
+                    dtype=np.bool_,
+                ),
                 dtype=np.bool_,
             ),
             dtype=torch.bool,
@@ -6016,10 +6020,13 @@ def _eval_xdim_batch(
             )
             truncated_mask = torch.as_tensor(
                 np.asarray(
-                    data.get(
+                    _batch_array_or_fill(
+                        data,
                         "truncated",
-                        np.zeros(len(data["action_taken"]), dtype=np.bool_),
-                    )[batch],
+                        batch,
+                        False,
+                        dtype=np.bool_,
+                    ),
                     dtype=np.bool_,
                 ),
                 dtype=torch.bool,
@@ -8401,6 +8408,21 @@ def _soft_targets_full(
     return soft, has_soft, support_t
 
 
+def _batch_array_or_fill(
+    data: dict,
+    field: str,
+    batch: np.ndarray,
+    fill_value,
+    *,
+    dtype=None,
+) -> np.ndarray:
+    """Read one optional column without constructing a full-corpus default."""
+
+    if field in data:
+        return np.asarray(data[field][batch], dtype=dtype)
+    return np.full(len(batch), fill_value, dtype=dtype)
+
+
 def _soft_target_array(
     data: dict,
     batch: np.ndarray,
@@ -8439,11 +8461,12 @@ def _soft_target_array(
         )
         has_scores = np.sum(score_target, axis=1) > 0.0
 
-    teacher_names = np.asarray(
-        data.get("teacher_name", np.full(len(data["action_taken"]), ""))[batch]
-    ).astype(str)
-    score_sources = np.asarray(
-        data.get("target_score_source", np.full(len(data["action_taken"]), ""))[batch]
+    teacher_names = _batch_array_or_fill(data, "teacher_name", batch, "").astype(str)
+    score_sources = _batch_array_or_fill(
+        data,
+        "target_score_source",
+        batch,
+        "",
     ).astype(str)
     prefer_policy_rows = _prefer_policy_over_scores_for_teachers(
         teacher_names,
@@ -9020,8 +9043,11 @@ def _value_targets(
         return None, None, None, None, None, None, None
     winners = np.asarray(data["winner"][batch]).astype(str)
     players = np.asarray(data["player"][batch]).astype(str)
-    truncated = np.asarray(
-        data.get("truncated", np.zeros(len(data["action_taken"]), dtype=np.bool_))[batch],
+    truncated = _batch_array_or_fill(
+        data,
+        "truncated",
+        batch,
+        False,
         dtype=np.bool_,
     )
     has_outcome_np = (winners != "") & ~truncated
@@ -9056,10 +9082,11 @@ def _value_targets(
         seats = np.asarray(data["seat"][batch], dtype=np.int64)
         rows = np.arange(len(batch))
         actual_vps = np.asarray(data["final_actual_vps"][batch], dtype=np.float32)
-        has_actual = np.asarray(
-            data.get("has_final_actual_vps", np.zeros(len(data["action_taken"]), dtype=np.bool_))[
-                batch
-            ],
+        has_actual = _batch_array_or_fill(
+            data,
+            "has_final_actual_vps",
+            batch,
+            False,
             dtype=np.bool_,
         )
         valid_actual = (
@@ -9074,10 +9101,11 @@ def _value_targets(
         seats = np.asarray(data["seat"][batch], dtype=np.int64)
         rows = np.arange(len(batch))
         public_vps = np.asarray(data["final_public_vps"][batch], dtype=np.float32)
-        has_public = np.asarray(
-            data.get("has_final_public_vps", np.zeros(len(data["action_taken"]), dtype=np.bool_))[
-                batch
-            ],
+        has_public = _batch_array_or_fill(
+            data,
+            "has_final_public_vps",
+            batch,
+            False,
             dtype=np.bool_,
         )
         valid_public = (
@@ -9674,11 +9702,12 @@ def _teacher_name_has_prefix(values: np.ndarray, prefixes: tuple[str, ...]) -> n
 
 
 def _q_skip_rows(data: dict, batch: np.ndarray, prefixes: tuple[str, ...]) -> np.ndarray:
-    teacher_names = np.asarray(
-        data.get("teacher_name", np.full(len(data["action_taken"]), ""))[batch]
-    ).astype(str)
-    score_sources = np.asarray(
-        data.get("target_score_source", np.full(len(data["action_taken"]), ""))[batch]
+    teacher_names = _batch_array_or_fill(data, "teacher_name", batch, "").astype(str)
+    score_sources = _batch_array_or_fill(
+        data,
+        "target_score_source",
+        batch,
+        "",
     ).astype(str)
     return _q_skip_rows_for_arrays(teacher_names, score_sources, prefixes)
 
