@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+from datetime import timedelta
 import hashlib
 import io
 import json
@@ -14,7 +15,7 @@ import re
 import subprocess
 import sys
 import time
-from typing import Sequence
+from typing import Any, Sequence
 
 import numpy as np
 
@@ -1602,6 +1603,159 @@ def _preflight_a1_memmap_metadata(
     return payload
 
 
+def _single_node_ddp_preflight_enabled(ddp: dict[str, int | bool]) -> bool:
+    """Return whether all ranks are workers on this one shared-filesystem node.
+
+    ``LOCAL_WORLD_SIZE`` is deliberately required.  If a non-torchrun launcher
+    does not provide enough topology information, every rank retains the
+    historical independent verification instead of assuming shared storage.
+    Multi-node launches likewise keep per-rank verification because equal path
+    strings do not prove that the underlying files are equal across nodes.
+    """
+
+    local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", "0") or 0)
+    return (
+        bool(ddp.get("enabled", False))
+        and local_world_size > 1
+        and int(ddp.get("world_size", 1)) == local_world_size
+    )
+
+
+def _a1_preflight_store(
+    ddp: dict[str, int | bool],
+    *,
+    data_path: str | Path,
+    validation_manifest_path: str | Path | None,
+) -> Any:
+    """Connect to torchrun's CPU rendezvous store without initializing CUDA."""
+
+    import torch.distributed as dist
+
+    try:
+        timeout_seconds = int(
+            os.environ.get("TRAIN_BC_A1_PREFLIGHT_TIMEOUT_SECONDS", "21600")
+        )
+    except ValueError as error:
+        raise SystemExit(
+            "TRAIN_BC_A1_PREFLIGHT_TIMEOUT_SECONDS must be an integer"
+        ) from error
+    if timeout_seconds < 1:
+        raise SystemExit("TRAIN_BC_A1_PREFLIGHT_TIMEOUT_SECONDS must be >= 1")
+    master_addr = os.environ.get("MASTER_ADDR", "")
+    master_port = os.environ.get("MASTER_PORT", "")
+    if not master_addr or not master_port:
+        raise SystemExit(
+            "single-node DDP A1 preflight requires torchrun MASTER_ADDR/MASTER_PORT"
+        )
+    try:
+        store = dist.TCPStore(
+            master_addr,
+            int(master_port),
+            world_size=None,
+            is_master=False,
+            timeout=timedelta(seconds=timeout_seconds),
+        )
+    except Exception as error:
+        raise SystemExit(
+            "cannot connect to torchrun store for single-node A1 preflight: "
+            f"{error}"
+        ) from error
+    identity = {
+        "run_id": os.environ.get("TORCHELASTIC_RUN_ID", ""),
+        "restart_count": os.environ.get("TORCHELASTIC_RESTART_COUNT", "0"),
+        "world_size": int(ddp["world_size"]),
+        "data": str(Path(data_path).expanduser().absolute()),
+        "validation_manifest": (
+            ""
+            if validation_manifest_path is None
+            else str(Path(validation_manifest_path).expanduser().absolute())
+        ),
+    }
+    prefix = "train_bc/a1_preflight/" + _canonical_json_sha256(identity)[7:] + "/"
+    return dist.PrefixStore(prefix, store)
+
+
+def _coordinated_a1_memmap_preflight(
+    data_path: str | Path,
+    *,
+    validation_manifest_path: str | Path | None,
+    ddp: dict[str, int | bool],
+    _store: Any | None = None,
+) -> dict[str, object] | None:
+    """Verify an A1 corpus once for single-node DDP and fail closed on all ranks.
+
+    Rank 0 publishes a small authenticated-metadata result through torchrun's
+    CPU rendezvous store.  Peers never touch the large payload files during
+    this preflight.  A rank-0 verification error, malformed response, store
+    failure, or timeout stops the peer before CUDA/process-group setup.
+    """
+
+    if not _single_node_ddp_preflight_enabled(ddp):
+        return _preflight_a1_memmap_metadata(
+            data_path, validation_manifest_path=validation_manifest_path
+        )
+
+    store = (
+        _store
+        if _store is not None
+        else _a1_preflight_store(
+            ddp,
+            data_path=data_path,
+            validation_manifest_path=validation_manifest_path,
+        )
+    )
+    result_key = "result"
+    if int(ddp.get("rank", 0)) == 0:
+        try:
+            metadata = _preflight_a1_memmap_metadata(
+                data_path, validation_manifest_path=validation_manifest_path
+            )
+            packet = {"schema_version": 1, "ok": True, "metadata": metadata}
+        except BaseException as error:
+            packet = {
+                "schema_version": 1,
+                "ok": False,
+                "error_type": type(error).__name__,
+                "error": str(error),
+            }
+            try:
+                store.set(result_key, json.dumps(packet, sort_keys=True))
+            except Exception as publish_error:
+                raise SystemExit(
+                    "rank 0 A1 preflight failed and its failure could not be "
+                    f"published to peers: {publish_error}; original error: {error}"
+                ) from error
+            raise
+        try:
+            store.set(result_key, json.dumps(packet, sort_keys=True))
+        except Exception as error:
+            raise SystemExit(
+                f"rank 0 could not publish successful A1 preflight: {error}"
+            ) from error
+        return metadata
+
+    try:
+        raw = store.get(result_key)
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8")
+        packet = json.loads(raw)
+    except Exception as error:
+        raise SystemExit(
+            f"rank {ddp.get('rank')} could not receive rank-0 A1 preflight: {error}"
+        ) from error
+    if not isinstance(packet, dict) or packet.get("schema_version") != 1:
+        raise SystemExit("rank-0 A1 preflight returned a malformed response")
+    if packet.get("ok") is not True:
+        raise SystemExit(
+            "rank-0 A1 preflight failed: "
+            f"{packet.get('error_type', 'error')}: {packet.get('error', '')}"
+        )
+    metadata = packet.get("metadata")
+    if metadata is not None and not isinstance(metadata, dict):
+        raise SystemExit("rank-0 A1 preflight returned malformed metadata")
+    return metadata
+
+
 def _game_seed_set_sha256(seeds: np.ndarray) -> str:
     canonical = np.sort(np.unique(np.asarray(seeds, dtype=np.int64))).astype(
         "<i8", copy=False
@@ -2639,14 +2793,48 @@ def _validate_a1_learner_training_recipe(
             raise SystemExit("dual learner topology authorization cannot be an ablation")
         if bound.get("dual_arm") is not True:
             raise SystemExit("dual learner topology authorization requires a dual-arm corpus")
-        try:
-            from tools import a1_dual_learner_contract as dual_contract
+        from tools import a1_dual_learner_contract as dual_contract
 
-            authority = dual_contract.verify_lock(
-                Path(dual_lock_path), reviewed_file_sha256=dual_reviewed_sha
+        # The generation-lock replay reaches the canonical promotion handoff,
+        # whose registry snapshot is intentionally protected by a nonblocking
+        # exclusive lock.  Replaying it independently on every DDP rank races
+        # that lock and makes a valid world-size >1 learner nondeterministically
+        # refuse before its first optimizer step.  Rank 0 performs the complete
+        # byte/lineage replay once; all ranks consume that exact verified value.
+        distributed = bool(ddp.get("enabled", False)) and int(
+            ddp.get("world_size", 1)
+        ) > 1
+        rank = int(ddp.get("rank", 0))
+        authority_payload: list[dict[str, object] | None] = [None]
+        if not distributed or rank == 0:
+            try:
+                authority_payload[0] = {
+                    "authority": dual_contract.verify_lock(
+                        Path(dual_lock_path),
+                        reviewed_file_sha256=dual_reviewed_sha,
+                    )
+                }
+            # The generation-lock replay can leak PromotionError from the
+            # canonical handoff transaction.  Broadcast every ordinary replay
+            # exception so rank 0 cannot exit while peers block here.
+            except Exception as error:
+                # Broadcast the refusal as data so nonzero ranks cannot hang at
+                # the collective while rank 0 exits early.
+                authority_payload[0] = {"error": str(error)}
+        if distributed:
+            import torch.distributed as dist
+
+            dist.broadcast_object_list(authority_payload, src=0)
+        payload = authority_payload[0]
+        if not isinstance(payload, dict):
+            raise SystemExit("dual learner topology lock replay returned no authority")
+        if "error" in payload:
+            raise SystemExit(
+                f"dual learner topology lock refused: {payload['error']}"
             )
-        except (OSError, dual_contract.LearnerContractError) as error:
-            raise SystemExit(f"dual learner topology lock refused: {error}") from error
+        authority = payload.get("authority")
+        if not isinstance(authority, dict):
+            raise SystemExit("dual learner topology lock replay returned malformed authority")
         topology = authority.get("topology")
         if (
             authority.get("arm_id") != bound.get("arm_id")
@@ -2855,11 +3043,13 @@ def main(argv: Sequence[str] | None = None) -> None:
         argv=raw_argv,
         expected_pipeline=TrainConfig.PIPELINE,
     )
+    ddp = _distributed_state()
     a1_preflight_meta: dict[str, object] | None = None
     if args.data_format == "memmap":
-        a1_preflight_meta = _preflight_a1_memmap_metadata(
+        a1_preflight_meta = _coordinated_a1_memmap_preflight(
             args.data,
             validation_manifest_path=args.validation_game_seed_manifest or None,
+            ddp=ddp,
         )
 
     validation_game_seed_ranges = _parse_game_seed_ranges(
@@ -2953,7 +3143,6 @@ def main(argv: Sequence[str] | None = None) -> None:
     args.grow_from_checkpoint_sha256 = _sha256_existing_file(
         args.grow_from_checkpoint
     )
-    ddp = _distributed_state()
     # CAT-66 typed config + config-hash. Built after --hidden-size resolution so
     # the recorded width is the effective one; registered only on rank 0 to avoid
     # duplicate JSONL writes under DDP. A pure no-op to the run when no --config*

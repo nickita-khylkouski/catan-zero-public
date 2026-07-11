@@ -152,6 +152,135 @@ def test_train_bc_accepts_only_reviewed_two_rank_topology(
     assert bound["learner_topology_authorization"]["topology"]["world_size"] == 2
 
 
+def test_train_bc_ddp_replays_dual_authority_once_on_rank0(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Nonzero ranks consume rank 0's replay instead of racing its file lock."""
+
+    import torch.distributed as dist
+
+    verified = _verified(tmp_path)
+    (tmp_path / "lock").write_text("{}")
+    authority = {
+        "arm_id": verified["arm_id"],
+        "subset_id": verified["subset_id"],
+        "recipe": verified["bound_recipe"],
+        "objective": verified["objective"],
+        "topology": learner_contract.TOPOLOGIES[2],
+    }
+    effective = dict(verified["bound_recipe"])
+    effective.update(
+        {"world_size": 2, "batch_size": 512, "grad_accum_steps": 4}
+    )
+    args = SimpleNamespace(
+        **{key: value for key, value in effective.items() if key != "world_size"},
+        per_game_value_weight_mode="equal",
+        a1_learner_ablation_id="",
+        a1_effective_learner_recipe_json="",
+        a1_effective_learner_recipe_sha256="",
+        a1_ablation_code_binding_json="",
+        a1_ablation_code_tree_sha256="",
+        a1_reviewed_lock_file_sha256="",
+        a1_dual_learner_lock=str(tmp_path / "lock"),
+        a1_dual_reviewed_lock_file_sha256=SHA,
+    )
+    verify_calls: list[int] = []
+    published: list[dict[str, object] | None] = [None]
+    active_rank = {"value": 0}
+
+    def verify_once(*_args, **_kwargs):
+        verify_calls.append(active_rank["value"])
+        return authority
+
+    def broadcast(payload, *, src):
+        assert src == 0
+        if active_rank["value"] == 0:
+            published[0] = payload[0]
+        else:
+            payload[0] = published[0]
+
+    monkeypatch.setattr(learner_contract, "verify_lock", verify_once)
+    monkeypatch.setattr(dist, "broadcast_object_list", broadcast)
+
+    for rank in (0, 1):
+        active_rank["value"] = rank
+        bound = {
+            "dual_arm": True,
+            "arm_id": verified["arm_id"],
+            "subset_id": verified["subset_id"],
+            "learner_training_recipe": verified["bound_recipe"],
+            "learner_value_objective": verified["objective"],
+        }
+        actual = dual.train_bc._validate_a1_learner_training_recipe(  # noqa: SLF001
+            args,
+            {"enabled": True, "world_size": 2, "rank": rank},
+            bound,
+        )
+        assert actual["global_batch_size"] == 4096
+        assert bound["learner_topology_authorization"]["topology"]["world_size"] == 2
+
+    assert verify_calls == [0]
+
+
+def test_train_bc_ddp_broadcasts_leaked_promotion_lock_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A rank-0 PromotionError reaches peers instead of stranding the collective."""
+
+    import torch.distributed as dist
+    from tools import a1_promotion_transaction as promotion
+
+    verified = _verified(tmp_path)
+    (tmp_path / "lock").write_text("{}")
+    effective = dict(verified["bound_recipe"])
+    effective.update({"world_size": 2, "batch_size": 512, "grad_accum_steps": 4})
+    args = SimpleNamespace(
+        **{key: value for key, value in effective.items() if key != "world_size"},
+        per_game_value_weight_mode="equal", a1_learner_ablation_id="",
+        a1_effective_learner_recipe_json="",
+        a1_effective_learner_recipe_sha256="",
+        a1_ablation_code_binding_json="", a1_ablation_code_tree_sha256="",
+        a1_reviewed_lock_file_sha256="", a1_dual_learner_lock=str(tmp_path / "lock"),
+        a1_dual_reviewed_lock_file_sha256=SHA,
+    )
+    published: list[dict[str, object] | None] = [None]
+    active_rank = {"value": 0}
+    verify_calls: list[int] = []
+
+    def locked(*_args, **_kwargs):
+        verify_calls.append(active_rank["value"])
+        raise promotion.PromotionError("lock held at champion_registry.json.a1.lock")
+
+    def broadcast(payload, *, src):
+        assert src == 0
+        if active_rank["value"] == 0:
+            published[0] = payload[0]
+        else:
+            payload[0] = published[0]
+
+    monkeypatch.setattr(learner_contract, "verify_lock", locked)
+    monkeypatch.setattr(dist, "broadcast_object_list", broadcast)
+    for rank in (0, 1):
+        active_rank["value"] = rank
+        bound = {
+            "dual_arm": True,
+            "arm_id": verified["arm_id"],
+            "subset_id": verified["subset_id"],
+            "learner_training_recipe": verified["bound_recipe"],
+            "learner_value_objective": verified["objective"],
+        }
+        with pytest.raises(
+            SystemExit,
+            match="dual learner topology lock refused: lock held at champion_registry",
+        ):
+            dual.train_bc._validate_a1_learner_training_recipe(  # noqa: SLF001
+                args,
+                {"enabled": True, "world_size": 2, "rank": rank},
+                bound,
+            )
+    assert verify_calls == [0]
+
+
 def test_completed_receipt_replay_never_acquires_gpu_locks(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
