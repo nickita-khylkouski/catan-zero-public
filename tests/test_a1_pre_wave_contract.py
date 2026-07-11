@@ -190,6 +190,10 @@ def test_dual_arm_generation_campaign_is_exact_and_fail_closed() -> None:
     assert payload["common_recipe"]["n_fast"] == 16
     assert payload["common_recipe"]["c_scale"] == 0.1
     assert payload["common_recipe"]["symmetry_averaged_eval_threshold"] == 20
+    _, _, historical_generation = contract._campaign_science(  # noqa: SLF001
+        payload, n_full=128
+    )
+    assert "native_mcts_hot_loop" not in historical_generation
     assert payload["execution_policy"]["launch_authorized"] is False
     with pytest.raises(contract.ContractError, match="not launchable"):
         contract.validate_generation_campaign(GENERATION_CAMPAIGN, require_ready=True)

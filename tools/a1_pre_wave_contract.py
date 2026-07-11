@@ -3178,9 +3178,12 @@ def _campaign_science(campaign: dict[str, Any], *, n_full: int) -> tuple[dict[st
             "eval_server",
         }
     }
-    generation["native_mcts_hot_loop"] = bool(
-        recipe.get("native_mcts_hot_loop", False)
-    )
+    # The issued r1 generation-arm locks predate this implementation field and
+    # therefore bind a generation object with no such key.  Replaying an
+    # immutable r1 lock must reconstruct those historical semantics exactly;
+    # only revision campaigns that explicitly carry the field may add it.
+    if "native_mcts_hot_loop" in recipe:
+        generation["native_mcts_hot_loop"] = bool(recipe["native_mcts_hot_loop"])
     return _search_operator(search), _effective_evaluator(evaluator), generation
 
 
