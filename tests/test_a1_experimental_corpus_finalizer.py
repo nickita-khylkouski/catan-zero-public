@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import shlex
+import threading
+import time
 from types import SimpleNamespace
 
 import numpy as np
@@ -45,6 +48,9 @@ def _sources(tmp_path: Path, arm: str = "n128") -> tuple[Path, Path, Path, Path]
         recovery_lanes.append(
             {
                 "arm_id": arm,
+                "lane_id": f"{arm}-lane-{i:02d}",
+                "host_alias": "h0",
+                "receipt": f"/remote/receipts/{arm}-{i:02d}.json",
                 "commands": [
                     {
                         "arm_id": arm,
@@ -70,6 +76,7 @@ def _sources(tmp_path: Path, arm: str = "n128") -> tuple[Path, Path, Path, Path]
         },
         "lanes": recovery_lanes,
     }
+    recovery["plan_sha256"] = finalizer._digest(recovery)
     reconstruction_path = tmp_path / "reconstruction.json"
     recovery_path = tmp_path / "recovery.json"
     _write_json(reconstruction_path, reconstruction)
@@ -104,13 +111,93 @@ def test_harvest_resumes_and_rehashes_every_published_byte(
         return SimpleNamespace(returncode=0)
 
     monkeypatch.setattr(finalizer.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        finalizer,
+        "remote_completion",
+        lambda *_args, **_kwargs: {"ready": True, "complete": 28, "total": 28},
+    )
     root = tmp_path / "harvest"
-    first = finalizer.harvest(plan_path, root, ["ssh"])
+    first = finalizer.harvest(plan_path, root, ["ssh"], parallelism=4)
     assert len(first["jobs"]) == 56
-    assert finalizer.harvest(plan_path, root, ["ssh"]) == first
+    assert finalizer.harvest(plan_path, root, ["ssh"], parallelism=4) == first
     (root / "jobs" / first["jobs"][0]["job_id"] / "shard.npz").write_bytes(b"drift")
     with pytest.raises(finalizer.FinalizerError, match="drifted"):
-        finalizer.harvest(plan_path, root, ["ssh"])
+        finalizer.harvest(plan_path, root, ["ssh"], parallelism=4)
+
+
+def test_parallel_harvest_is_bounded_deterministic_and_resumable_after_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    reconstruction, recovery, _lock, _render = _sources(tmp_path)
+    plan_path = tmp_path / "plan.json"
+    finalizer.build_plan(reconstruction, recovery, "n128", plan_path)
+    monkeypatch.setattr(
+        finalizer,
+        "remote_completion",
+        lambda *_args, **_kwargs: {"ready": True, "complete": 28, "total": 28},
+    )
+    mutex = threading.Lock()
+    active = 0
+    maximum = 0
+    calls: list[str] = []
+    fail_once = {"needle": "recent_history", "armed": True}
+
+    def fake_run(argv: list[str], **_kwargs) -> SimpleNamespace:
+        nonlocal active, maximum
+        source = argv[-2]
+        with mutex:
+            active += 1
+            maximum = max(maximum, active)
+            calls.append(source)
+        try:
+            time.sleep(0.005)
+            if fail_once["armed"] and fail_once["needle"] in source:
+                fail_once["armed"] = False
+                return SimpleNamespace(returncode=23)
+            destination = Path(argv[-1])
+            destination.mkdir(parents=True, exist_ok=True)
+            np.savez(destination / "shard.npz", game_seed=np.asarray([1]))
+            return SimpleNamespace(returncode=0)
+        finally:
+            with mutex:
+                active -= 1
+
+    monkeypatch.setattr(finalizer.subprocess, "run", fake_run)
+    root = tmp_path / "harvest"
+    with pytest.raises(finalizer.FinalizerError, match="resumable"):
+        finalizer.harvest(plan_path, root, ["ssh"], parallelism=4)
+    assert maximum == 4
+    assert not (root / "harvest.receipt.json").exists()
+    first_call_count = len(calls)
+    value = finalizer.harvest(plan_path, root, ["ssh"], parallelism=4)
+    assert len(calls) == first_call_count + 1
+    assert [row["job_id"] for row in value["jobs"]] == sorted(
+        row["job_id"] for row in value["jobs"]
+    )
+
+
+def test_remote_receipt_gate_requires_exact_complete_jobs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    reconstruction, recovery, _lock, _render = _sources(tmp_path)
+    plan_path = tmp_path / "plan.json"
+    finalizer.build_plan(reconstruction, recovery, "n128", plan_path)
+
+    def fake_run(argv: list[str], **_kwargs) -> SimpleNamespace:
+        lanes = json.loads(shlex.split(argv[-1])[-1])
+        rows = [{"lane_id": lane["lane_id"], "status": "complete"} for lane in lanes]
+        return SimpleNamespace(returncode=0, stdout=json.dumps(rows), stderr="")
+
+    monkeypatch.setattr(finalizer.subprocess, "run", fake_run)
+    ready = finalizer.remote_completion(plan_path, ["ssh"])
+    assert ready["ready"] is True and ready["complete"] == 28
+
+    def incomplete(*_args, **_kwargs):
+        return {"ready": False, "complete": 27, "total": 28}
+
+    monkeypatch.setattr(finalizer, "remote_completion", incomplete)
+    with pytest.raises(finalizer.FinalizerError, match="27/28"):
+        finalizer.wait_ready(plan_path, ["ssh"], poll_seconds=0.001, timeout_seconds=0)
 
 
 def _shard(path: Path, seed: int, category: str) -> None:
