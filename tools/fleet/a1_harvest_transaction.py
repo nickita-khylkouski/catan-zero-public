@@ -28,6 +28,7 @@ import tarfile
 import tempfile
 import uuid
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Mapping, Sequence
@@ -143,6 +144,15 @@ class _PinnedInput:
 
     def close(self) -> None:
         os.close(self.descriptor)
+
+
+@dataclass(frozen=True)
+class _HostFetch:
+    host: str
+    missing: tuple[dict[str, Any], ...]
+    outputs: tuple[PurePosixPath, ...]
+    archive: Path
+    extracted: Path
 
 
 def _stat_identity(value: os.stat_result) -> tuple[int, int, int, int, int]:
@@ -536,6 +546,80 @@ def _ssh_fetch(
     stderr_path.unlink(missing_ok=True)
 
 
+def _fetch_archives(
+    ssh_command: Sequence[str], batches: Sequence[_HostFetch], *, workers: int
+) -> None:
+    """Fetch independent host archives concurrently, with bounded fan-out.
+
+    SSH streams write to host-unique O_EXCL archives.  No extraction or
+    publication occurs in worker threads; the caller retains the existing
+    deterministic validation and atomic-publish order after every stream has
+    completed successfully.
+    """
+    if isinstance(workers, bool) or not isinstance(workers, int) or workers < 1:
+        raise HarvestError("fetch_workers must be a positive integer")
+    if not batches:
+        return
+    with ThreadPoolExecutor(max_workers=min(workers, len(batches))) as executor:
+        futures = {
+            executor.submit(
+                _ssh_fetch,
+                ssh_command,
+                batch.host,
+                batch.outputs,
+                batch.archive,
+            ): batch.host
+            for batch in batches
+        }
+        try:
+            for future in as_completed(futures):
+                future.result()
+        except BaseException:
+            for future in futures:
+                future.cancel()
+            raise
+
+
+def _install_fetched_batch(
+    batch: _HostFetch,
+    *,
+    lock: Mapping[str, Any],
+    jobs_root: Path,
+    state_root: Path,
+    inventories: dict[str, list[dict[str, Any]]],
+) -> None:
+    """Validate and install one already-fetched host archive."""
+    try:
+        _extract_archive(
+            batch.archive,
+            batch.extracted,
+            expected_roots={path.name for path in batch.outputs},
+        )
+        pending: dict[str, list[dict[str, Any]]] = {}
+        for job in batch.missing:
+            job_id = str(job["job_id"])
+            pending[job_id] = _inventory_job(batch.extracted / job_id, job, lock)
+        for job in batch.missing:
+            job_id = str(job["job_id"])
+            final_job = jobs_root / job_id
+            if final_job.exists():
+                raise HarvestError(f"staging collision for {job_id}")
+            os.replace(batch.extracted / job_id, final_job)
+            state = {
+                "schema_version": STATE_SCHEMA,
+                "job_id": job_id,
+                "host_alias": batch.host,
+                **({} if job.get("arm_id") is None else {"arm_id": job["arm_id"]}),
+                "inventory": pending[job_id],
+                "inventory_sha256": _value_sha256(pending[job_id]),
+            }
+            _write_exclusive_json(state_root / f"{job_id}.json", state)
+            inventories[job_id] = pending[job_id]
+    finally:
+        batch.archive.unlink(missing_ok=True)
+        shutil.rmtree(batch.extracted, ignore_errors=True)
+
+
 def _validate_published(
     destination: Path,
     *,
@@ -656,6 +740,7 @@ def _harvest_locked(
     parent_fd: int,
     transaction_guard: Callable[[], None] | None = None,
     ssh_command: Sequence[str] = ("ssh",),
+    fetch_workers: int = 1,
 ) -> dict[str, Any]:
     """Collect and atomically publish the exact sealed 120-job output set."""
 
@@ -715,6 +800,7 @@ def _harvest_locked(
     for job in jobs:
         grouped[str(job["host_alias"])].append(job)
     inventories: dict[str, list[dict[str, Any]]] = {}
+    fetches: list[_HostFetch] = []
     for host in sorted(grouped):
         missing: list[dict[str, Any]] = []
         for job in grouped[host]:
@@ -735,32 +821,45 @@ def _harvest_locked(
             _normal_remote_path(str(job["output_dir"]), where=str(job["job_id"]))
             for job in missing
         ]
-        _ssh_fetch(ssh_command, host, outputs, archive)
+        fetches.append(
+            _HostFetch(
+                host=host,
+                missing=tuple(missing),
+                outputs=tuple(outputs),
+                archive=archive,
+                extracted=extracted,
+            )
+        )
+
+    if fetch_workers == 1:
+        # Preserve the original host-at-a-time crash-resume behavior for the
+        # library default and low-disk environments.
+        for batch in fetches:
+            _ssh_fetch(ssh_command, batch.host, batch.outputs, batch.archive)
+            _install_fetched_batch(
+                batch,
+                lock=lock,
+                jobs_root=jobs_root,
+                state_root=state_root,
+                inventories=inventories,
+            )
+    else:
         try:
-            _extract_archive(archive, extracted, expected_roots={path.name for path in outputs})
-            pending: dict[str, list[dict[str, Any]]] = {}
-            for job in missing:
-                job_id = str(job["job_id"])
-                pending[job_id] = _inventory_job(extracted / job_id, job, lock)
-            for job in missing:
-                job_id = str(job["job_id"])
-                final_job = jobs_root / job_id
-                if final_job.exists():
-                    raise HarvestError(f"staging collision for {job_id}")
-                os.replace(extracted / job_id, final_job)
-                state = {
-                    "schema_version": STATE_SCHEMA,
-                    "job_id": job_id,
-                    "host_alias": host,
-                    **({} if job.get("arm_id") is None else {"arm_id": job["arm_id"]}),
-                    "inventory": pending[job_id],
-                    "inventory_sha256": _value_sha256(pending[job_id]),
-                }
-                _write_exclusive_json(state_root / f"{job_id}.json", state)
-                inventories[job_id] = pending[job_id]
+            _fetch_archives(ssh_command, fetches, workers=fetch_workers)
+            for batch in fetches:
+                _install_fetched_batch(
+                    batch,
+                    lock=lock,
+                    jobs_root=jobs_root,
+                    state_root=state_root,
+                    inventories=inventories,
+                )
         finally:
-            archive.unlink(missing_ok=True)
-            shutil.rmtree(extracted, ignore_errors=True)
+            # A failed stream or extraction must not strand hundred-GB
+            # untracked archives in the resumable staging directory.
+            for batch in fetches:
+                batch.archive.unlink(missing_ok=True)
+                shutil.rmtree(batch.extracted, ignore_errors=True)
 
     if set(inventories) != {str(job["job_id"]) for job in jobs}:
         raise HarvestError("staging does not cover the exact immutable job set")
@@ -893,6 +992,7 @@ def harvest(
     destination: Path,
     *,
     ssh_command: Sequence[str] = ("ssh",),
+    fetch_workers: int = 1,
 ) -> dict[str, Any]:
     """Pin immutable inputs, serialize the destination, then collect/publish."""
 
@@ -998,6 +1098,7 @@ def harvest(
             parent_fd=parent_fd,
             transaction_guard=transaction_guard,
             ssh_command=ssh_command,
+            fetch_workers=fetch_workers,
         )
         transaction_guard()
         return result
@@ -1025,6 +1126,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         default="ssh",
         help="local SSH executable (tests may provide a read-only fixture transport)",
     )
+    parser.add_argument(
+        "--fetch-workers",
+        type=int,
+        default=4,
+        help="bounded number of direct host-to-harvester SSH streams (default: 4)",
+    )
     args = parser.parse_args(argv)
     try:
         result = harvest(
@@ -1032,6 +1139,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.render,
             args.destination,
             ssh_command=(args.ssh_command,),
+            fetch_workers=args.fetch_workers,
         )
     except (HarvestError, contract.ContractError, OSError, tarfile.TarError) as error:
         parser.error(str(error))
