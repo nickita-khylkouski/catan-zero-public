@@ -228,7 +228,14 @@ def _stage_producer_checkpoint(
 def _validate_science_args(
     args: argparse.Namespace, parser: argparse.ArgumentParser
 ) -> None:
-    """Reject NaN/Inf science settings before guards, workers, or artifacts."""
+    """Reject invalid science settings before guards, workers, or artifacts.
+
+    Public-observation masking and information-set search are one semantic
+    regime, not independent tuning flags.  Masking only the evaluator while
+    traversing clones of the authoritative game would leak hidden truth into
+    the MCTS targets.  Keep this invariant inside the generator so direct
+    callers and intentional guard-skipping smoke tests cannot bypass it.
+    """
     finite_names = (
         "p_full",
         "c_visit",
@@ -254,6 +261,20 @@ def _validate_science_args(
                 "--temperature-move-fraction must be finite and in [0, 1] "
                 f"(got {args.temperature_move_fraction!r})"
             )
+    public = bool(args.public_observation)
+    information_set = bool(args.information_set_search)
+    if public and not information_set:
+        parser.error(
+            "--public-observation requires --information-set-search; masking NN "
+            "features alone does not make MCTS targets public-information safe"
+        )
+    if information_set and not public:
+        parser.error("--information-set-search requires --public-observation")
+    if information_set and bool(args.belief_chance_spectra):
+        parser.error(
+            "--information-set-search cannot be combined with "
+            "--belief-chance-spectra"
+        )
 
 
 def _guard_argv_with_config_values(
