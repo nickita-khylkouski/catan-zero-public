@@ -754,6 +754,33 @@ def _rewrite_operator_binding(path: Path, mutate) -> None:
     payload["artifact_content_sha256"] = operator_binding._digest_value(unhashed)
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
     path.chmod(0o444)
+
+
+def test_point10_s1_operator_bridge_syncs_and_seals_exact_generation(
+    tmp_path: Path,
+) -> None:
+    """Exercise the exact final-loop S1(.10) -> S2/S3 bridge -> guard path."""
+
+    draft = _resolved_draft(tmp_path)
+    _payload, _ = _select_s1_c_scale(draft, 0.1)
+    _replace_s2_s3_with_operator_bindings(draft)
+
+    sync = contract.sync_generation_guard(draft)
+    assert sync["selected_c_scale"] == 0.1
+    assert sync["status"] == "synchronized"
+
+    lock = contract.build_lock(draft)
+    assert lock["science"]["effective_search_config"]["c_scale"] == 0.1
+    evidence = {row["kind"]: row for row in lock["science"]["evidence"]}
+    assert evidence["s1"]["semantic_decision"]["selected_fields"]["c_scale"] == 0.1
+    assert evidence["s2"]["semantic_decision"]["evidence_class"] == (
+        operator_binding.ARTIFACT_KIND
+    )
+    assert evidence["s3"]["semantic_decision"]["evidence_class"] == (
+        operator_binding.ARTIFACT_KIND
+    )
+
+
 def _rebind_search_evidence_checkpoint(payload: dict, checkpoint: Path) -> None:
     decisions: dict[str, Path] = {}
     for stage in ("s1", "s2", "s3"):
