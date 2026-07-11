@@ -2,7 +2,7 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
 
-use gumbel_mcts::{Evaluator, GumbelMctsEngine, SearchConfig};
+use gumbel_mcts::{EvaluationRequest, Evaluator, GumbelMctsEngine, SearchConfig};
 
 // Use :: to disambiguate from the pymodule function name
 use ::catanatron_rs as ctrs;
@@ -71,7 +71,7 @@ impl Evaluator for PyEvaluator {
 
     fn evaluate_many(
         &mut self,
-        requests: &[(Game, Vec<usize>, Color)],
+        requests: &[EvaluationRequest<'_>],
     ) -> Result<Vec<(std::collections::HashMap<usize, f64>, f64, f64)>, String> {
         if requests.is_empty() {
             return Ok(Vec::new());

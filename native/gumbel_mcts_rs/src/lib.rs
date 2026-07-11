@@ -15,6 +15,7 @@ use catanatron_rs::{
 };
 
 pub type Evaluation = (HashMap<usize, f64>, f64, f64);
+pub type EvaluationRequest<'a> = (&'a Game, Vec<usize>, Color);
 
 // ---------------------------------------------------------------------------
 // Evaluator trait — implemented by the Python binding
@@ -50,7 +51,7 @@ pub trait Evaluator {
     /// Default implementation calls evaluate() one at a time.
     fn evaluate_many(
         &mut self,
-        requests: &[(Game, Vec<usize>, Color)],
+        requests: &[EvaluationRequest<'_>],
     ) -> Result<Vec<Evaluation>, String> {
         let mut out = Vec::with_capacity(requests.len());
         for (game, legal, rc) in requests {
@@ -481,11 +482,12 @@ impl GumbelMctsEngine {
         node_idx: usize,
         evaluator: &mut E,
     ) -> Result<f64, String> {
-        let game = arena.get(node_idx).game.clone();
-        let root_color = arena.get(node_idx).root_color;
-        let legal_actions = generate_playable_actions(&game.state);
+        let node = arena.get(node_idx);
+        let root_color = node.root_color;
+        let legal_actions = generate_playable_actions(&node.game.state);
         let legal_indices = self.action_ids(&legal_actions)?;
-        let (priors, value, uncertainty) = evaluator.evaluate(&game, &legal_indices, root_color)?;
+        let (priors, value, uncertainty) =
+            evaluator.evaluate(&node.game, &legal_indices, root_color)?;
         self.finish_expand(arena, node_idx, legal_actions, priors, value, uncertainty)
     }
 
@@ -495,12 +497,12 @@ impl GumbelMctsEngine {
         node_idx: usize,
         evaluator: &mut E,
     ) -> Result<f64, String> {
-        let game = arena.get(node_idx).game.clone();
-        let root_color = arena.get(node_idx).root_color;
-        let legal_actions = generate_playable_actions(&game.state);
+        let node = arena.get(node_idx);
+        let root_color = node.root_color;
+        let legal_actions = generate_playable_actions(&node.game.state);
         let legal_indices = self.action_ids(&legal_actions)?;
         let (priors, value, uncertainty) =
-            evaluator.evaluate_root(&game, &legal_indices, root_color)?;
+            evaluator.evaluate_root(&node.game, &legal_indices, root_color)?;
         self.finish_expand(arena, node_idx, legal_actions, priors, value, uncertainty)
     }
 
@@ -671,8 +673,7 @@ impl GumbelMctsEngine {
             return Ok(arena.get(node_idx).prior_value);
         }
         if !arena.get(node_idx).expanded {
-            let game = arena.get(node_idx).game.clone();
-            let legal = generate_playable_actions(&game.state);
+            let legal = generate_playable_actions(&arena.get(node_idx).game.state);
             if legal.len() == 1 {
                 let root_color = arena.get(node_idx).root_color;
                 let node = arena.get_mut(node_idx);
@@ -711,9 +712,9 @@ impl GumbelMctsEngine {
         } else {
             self.select_nonroot_action(arena, node_idx)?
         };
-        let action = arena.get(node_idx).playable_actions[action_idx].clone();
-
-        let value = if self.expectation_backup(&action, depth) {
+        let expectation_backup =
+            self.expectation_backup(&arena.get(node_idx).playable_actions[action_idx], depth);
+        let value = if expectation_backup {
             self.traverse_roll(arena, node_idx, action_idx, depth, evaluator)?
         } else {
             self.traverse_single_sample(arena, node_idx, action_idx, depth, evaluator)?
@@ -820,15 +821,15 @@ impl GumbelMctsEngine {
             .get(&action_idx)
             .is_some_and(|s| !s.children.is_empty());
         if !child_exists {
-            let action = arena.get(node_idx).playable_actions[action_idx].clone();
-            let game = arena.get(node_idx).game.clone();
             let root_color = arena.get(node_idx).root_color;
-            let outcomes = execute_spectrum(&game, &action);
+            let outcomes = {
+                let node = arena.get(node_idx);
+                execute_spectrum(&node.game, &node.playable_actions[action_idx])
+            };
             let total_prob: f64 = outcomes.iter().map(|(_, p)| *p).sum();
-            let child_games: Vec<Game> = outcomes.iter().map(|(g, _)| g.clone()).collect();
             let probs: Vec<f64> = outcomes.iter().map(|(_, p)| *p / total_prob).collect();
-            let mut new_child_indices: Vec<usize> = Vec::with_capacity(child_games.len());
-            for child_game in child_games.into_iter() {
+            let mut new_child_indices: Vec<usize> = Vec::with_capacity(outcomes.len());
+            for (child_game, _) in outcomes {
                 let child_node = Node::new(child_game, root_color);
                 new_child_indices.push(arena.alloc(child_node));
             }
@@ -878,24 +879,26 @@ impl GumbelMctsEngine {
         action_idx: usize,
         evaluator: &mut E,
     ) -> Result<(), String> {
-        let action = arena.get(node_idx).playable_actions[action_idx].clone();
-        let game = arena.get(node_idx).game.clone();
         let root_color = arena.get(node_idx).root_color;
-        let outcomes = execute_spectrum(&game, &action);
+        let outcomes = {
+            let node = arena.get(node_idx);
+            execute_spectrum(&node.game, &node.playable_actions[action_idx])
+        };
         let total_prob: f64 = outcomes.iter().map(|(_, p)| *p).sum();
         if total_prob <= 0.0 || outcomes.is_empty() {
             return Ok(());
         }
-        let child_games: Vec<Game> = outcomes.iter().map(|(g, _)| g.clone()).collect();
-        let mut new_child_indices: Vec<usize> = Vec::with_capacity(child_games.len());
-        for child_game in &child_games {
-            let child_node = Node::new(child_game.clone(), root_color);
+        let mut outcome_probabilities = Vec::with_capacity(outcomes.len());
+        let mut new_child_indices: Vec<usize> = Vec::with_capacity(outcomes.len());
+        for (child_game, probability) in outcomes {
+            outcome_probabilities.push(probability);
+            let child_node = Node::new(child_game, root_color);
             new_child_indices.push(arena.alloc(child_node));
         }
         // Evaluate all children — batch if possible
-        let mut requests: Vec<(Game, Vec<usize>, Color)> = Vec::new();
+        let mut requests = Vec::with_capacity(new_child_indices.len());
         for &child_idx in &new_child_indices {
-            let child_game = arena.get(child_idx).game.clone();
+            let child_game = &arena.get(child_idx).game;
             let legal = generate_playable_actions(&child_game.state);
             let legal_indices = self.action_ids(&legal)?;
             requests.push((child_game, legal_indices, root_color));
@@ -915,7 +918,7 @@ impl GumbelMctsEngine {
         }
         let afterstate_value: f64 = {
             let mut weighted = 0.0;
-            for (i, (_, prob)) in outcomes.iter().enumerate() {
+            for (i, prob) in outcome_probabilities.iter().enumerate() {
                 weighted += prob * arena.get(new_child_indices[i]).prior_value;
             }
             weighted / total_prob
@@ -923,7 +926,7 @@ impl GumbelMctsEngine {
         let node = arena.get_mut(node_idx);
         let stats = node.actions.get_mut(&action_idx).unwrap();
         stats.afterstate_value = Some(afterstate_value);
-        for (i, (_, prob)) in outcomes.into_iter().enumerate() {
+        for (i, prob) in outcome_probabilities.into_iter().enumerate() {
             stats.probabilities.insert(i, prob / total_prob);
             stats.children.insert(i, new_child_indices[i]);
         }
@@ -1277,7 +1280,7 @@ impl GumbelMctsEngine {
         for (child_game, _) in &outcomes {
             let child_legal = generate_playable_actions(&child_game.state);
             let child_ids = self.action_ids(&child_legal)?;
-            requests.push((child_game.clone(), child_ids, root_color));
+            requests.push((child_game, child_ids, root_color));
         }
         let evaluations = evaluator.evaluate_many(&requests)?;
         if evaluations.len() != outcomes.len() {
