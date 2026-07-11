@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from catan_zero.rl import entity_token_features_rust as feature_path
+
+
+TOOLS = Path(__file__).resolve().parents[1] / "tools"
+if str(TOOLS) not in sys.path:
+    sys.path.insert(0, str(TOOLS))
 
 
 def test_complete_native_feature_api_is_required(monkeypatch: pytest.MonkeyPatch) -> None:
