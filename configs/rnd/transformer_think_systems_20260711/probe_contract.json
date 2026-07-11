@@ -1,0 +1,39 @@
+{
+  "schema_version": "catan-zero-transformer-think-systems-probe/v1",
+  "status": "preregistered_before_probe",
+  "production_defaults_changed": false,
+  "git_commit": "765a1d4497c34f7d51c790ba175ce861d036cfad",
+  "source_sha256": {
+    "tools/rnd_architecture_probe.py": "54a020da84063e5fd6443887362e9b91c3a4c527bdbd25cfb268b8a71e5dc96b",
+    "src/catan_zero/rl/entity_token_policy.py": "5dda873f2e3b38d48b0d162f04fb97f8e828ba88e8820469120cac92e0925b77",
+    "tools/rnd_transformer_latent_upgrade_checkpoint.py": "c2c50424b74953809bd668ade369934ab6b3c61b733e9aa46bb70fe05e0e65aa"
+  },
+  "arms": {
+    "transformer-k0": {"latent_deliberation_steps": 0, "expected_parameters": 35041353},
+    "think-transformer-k1": {"latent_deliberation_steps": 1, "expected_parameters": 40793673},
+    "think-transformer-k2": {"latent_deliberation_steps": 2, "expected_parameters": 40793673},
+    "think-transformer-k4": {"latent_deliberation_steps": 4, "expected_parameters": 40793673}
+  },
+  "probe_shape": {
+    "batch_size": 32,
+    "legal_actions": 64,
+    "events": 64,
+    "full_incidence": true,
+    "precision": "bfloat16_autocast_fp32_loss",
+    "warmup_iterations": 3,
+    "measured_iterations": 10
+  },
+  "replication": {
+    "hosts": ["209.20.158.82", "192.222.54.141"],
+    "isolated_repeats_per_arm_per_host": 2,
+    "total_runs": 16
+  },
+  "admission": {
+    "all_runs_finite": true,
+    "all_gradients_finite": true,
+    "all_parameter_counts_exact": true,
+    "minimum_k4_to_k0_median_rows_per_sec_ratio": 0.5,
+    "maximum_k4_to_k0_median_peak_allocated_bytes_ratio": 1.5
+  },
+  "scope": "Systems admission only; this probe cannot support a learning or strength claim."
+}
