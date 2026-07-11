@@ -102,6 +102,32 @@ def test_review_spec_can_explicitly_authorize_known_two_b200_fallback(
     assert spec["topology"]["global_batch_size"] == 4096
 
 
+def test_inspect_spec_cli_keeps_progress_off_stdout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    expected = {"schema_version": contract.SPEC_SCHEMA, "arm_id": "n128"}
+
+    def fake_render_spec(**_kwargs: object) -> dict[str, str]:
+        print(json.dumps({"progress": "bc_memmap_load", "rows": 123}))
+        return expected
+
+    monkeypatch.setattr(contract, "render_spec", fake_render_spec)
+    assert contract.main(
+        [
+            "inspect-spec",
+            "--data",
+            str(tmp_path),
+            "--validation",
+            str(tmp_path / "validation.json"),
+            "--producer-checkpoint",
+            str(tmp_path / "producer.pt"),
+        ]
+    ) == 0
+    captured = capsys.readouterr()
+    assert json.loads(captured.out) == expected
+    assert json.loads(captured.err)["progress"] == "bc_memmap_load"
+
+
 def test_reviewed_lock_rejects_recipe_and_runtime_mutation_even_if_rehashed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

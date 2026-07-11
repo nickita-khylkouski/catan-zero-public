@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import os
@@ -373,26 +374,30 @@ def main(argv: Sequence[str] | None = None) -> int:
     verify.add_argument("--reviewed-lock-file-sha256", required=True)
     args = parser.parse_args(argv)
     try:
-        if args.command == "inspect-spec":
-            value = render_spec(
-                data=args.data,
-                validation=args.validation,
-                producer_checkpoint=args.producer_checkpoint,
-                world_size=args.world_size,
-            )
-        elif args.command == "seal":
-            value = build_lock(
-                arm_lock=args.arm_lock,
-                learner_spec=args.learner_spec,
-                data=args.data,
-                validation=args.validation,
-                producer_checkpoint=args.producer_checkpoint,
-            )
-            _write_new(args.out, value)
-        else:
-            value = verify_lock(
-                args.lock, reviewed_file_sha256=args.reviewed_lock_file_sha256
-            )
+        # Helpers used here may emit structured progress records while scanning a
+        # large memmap.  Keep those records visible on stderr, but preserve the
+        # CLI's stdout contract as exactly one JSON document for shell callers.
+        with contextlib.redirect_stdout(sys.stderr):
+            if args.command == "inspect-spec":
+                value = render_spec(
+                    data=args.data,
+                    validation=args.validation,
+                    producer_checkpoint=args.producer_checkpoint,
+                    world_size=args.world_size,
+                )
+            elif args.command == "seal":
+                value = build_lock(
+                    arm_lock=args.arm_lock,
+                    learner_spec=args.learner_spec,
+                    data=args.data,
+                    validation=args.validation,
+                    producer_checkpoint=args.producer_checkpoint,
+                )
+                _write_new(args.out, value)
+            else:
+                value = verify_lock(
+                    args.lock, reviewed_file_sha256=args.reviewed_lock_file_sha256
+                )
         print(json.dumps(value, indent=2, sort_keys=True))
         return 0
     except (LearnerContractError, OSError) as error:
