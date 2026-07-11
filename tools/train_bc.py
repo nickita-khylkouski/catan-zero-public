@@ -950,6 +950,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--a1-ablation-code-binding-json", default="", help=argparse.SUPPRESS)
     parser.add_argument("--a1-ablation-code-tree-sha256", default="", help=argparse.SUPPRESS)
     parser.add_argument("--a1-reviewed-lock-file-sha256", default="", help=argparse.SUPPRESS)
+    parser.add_argument("--a1-dual-learner-lock", default="", help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--a1-dual-reviewed-lock-file-sha256", default="", help=argparse.SUPPRESS
+    )
     parser.add_argument(
         "--init-checkpoint",
         default="",
@@ -2620,6 +2624,59 @@ def _validate_a1_learner_training_recipe(
     reviewed_lock_sha = str(
         getattr(args, "a1_reviewed_lock_file_sha256", "") or ""
     )
+    dual_lock_path = str(getattr(args, "a1_dual_learner_lock", "") or "")
+    dual_reviewed_sha = str(
+        getattr(args, "a1_dual_reviewed_lock_file_sha256", "") or ""
+    )
+    if dual_lock_path or dual_reviewed_sha:
+        if not dual_lock_path or not _is_sha256(dual_reviewed_sha):
+            raise SystemExit(
+                "dual learner topology requires lock path and reviewed raw lock digest"
+            )
+        if ablation_id or any(
+            (declared_json, declared_sha, code_binding_json, declared_code_sha, reviewed_lock_sha)
+        ):
+            raise SystemExit("dual learner topology authorization cannot be an ablation")
+        if bound.get("dual_arm") is not True:
+            raise SystemExit("dual learner topology authorization requires a dual-arm corpus")
+        try:
+            from tools import a1_dual_learner_contract as dual_contract
+
+            authority = dual_contract.verify_lock(
+                Path(dual_lock_path), reviewed_file_sha256=dual_reviewed_sha
+            )
+        except (OSError, dual_contract.LearnerContractError) as error:
+            raise SystemExit(f"dual learner topology lock refused: {error}") from error
+        topology = authority.get("topology")
+        if (
+            authority.get("arm_id") != bound.get("arm_id")
+            or authority.get("subset_id") != bound.get("subset_id")
+            or authority.get("recipe") != expected
+            or authority.get("objective") != bound.get("learner_value_objective")
+            or topology not in dual_contract.TOPOLOGIES.values()
+        ):
+            raise SystemExit("dual learner topology lock differs from audited corpus")
+        authorized = dict(expected)
+        authorized.update(
+            {
+                "world_size": topology["world_size"],
+                "batch_size": topology["local_batch_size"],
+                "grad_accum_steps": topology["grad_accum_steps"],
+                "global_batch_size": topology["global_batch_size"],
+                "ddp_shard_data": topology["ddp_shard_data"],
+            }
+        )
+        if effective != authorized:
+            raise SystemExit("command differs from reviewed dual learner topology")
+        bound["learner_topology_authorization"] = {
+            "schema_version": "a1-dual-learner-topology-authorization-v1",
+            "learner_lock": str(Path(dual_lock_path).expanduser().resolve(strict=True)),
+            "learner_lock_file_sha256": dual_reviewed_sha,
+            "topology": topology,
+            "effective_recipe": effective,
+            "effective_recipe_sha256": _canonical_json_sha256(effective),
+        }
+        return effective
     if not ablation_id:
         if (
             declared_json
@@ -4265,6 +4322,25 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "a1_learner_ablation": learner_ablation,
                 "diagnostic_only": True,
                 "promotion_eligible": False,
+            }
+        )
+    topology_authorization = (
+        None
+        if a1_training_binding is None
+        else a1_training_binding.get("learner_topology_authorization")
+    )
+    if topology_authorization is not None:
+        report.update(
+            {
+                "a1_effective_learner_training_recipe": a1_training_binding[
+                    "effective_learner_training_recipe"
+                ],
+                "a1_effective_learner_training_recipe_sha256": (
+                    _canonical_json_sha256(
+                        a1_training_binding["effective_learner_training_recipe"]
+                    )
+                ),
+                "a1_learner_topology_authorization": topology_authorization,
             }
         )
     if ddp["rank"] == 0:

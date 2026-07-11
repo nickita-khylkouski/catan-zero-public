@@ -436,8 +436,36 @@ def _verify_training_report(
     candidate_sha256: str,
 ) -> dict[str, Any]:
     report = _load_json(path)
-    recipe = contract["science"]["learner_training_recipe"]
-    recipe_sha = contract["science"]["learner_training_recipe_sha256"]
+    is_dual = report.get("a1_dual_arm_execution_binding") is not None
+    if is_dual:
+        recipe = report.get("a1_bound_learner_training_recipe")
+        if not isinstance(recipe, dict):
+            raise PromotionError("dual-arm training report has no bound learner recipe")
+        recipe_sha = _digest_value(recipe)
+        world_size = report.get("world_size")
+        topology = {
+            2: {"batch_size": 512, "grad_accum_steps": 4},
+            8: {"batch_size": 512, "grad_accum_steps": 1},
+        }.get(world_size)
+        effective = (
+            recipe
+            if world_size == 8
+            else report.get("a1_effective_learner_training_recipe")
+        )
+        if (
+            topology is None
+            or report.get("batch_size") != topology["batch_size"]
+            or not isinstance(effective, dict)
+            or effective.get("world_size") != world_size
+            or effective.get("batch_size") != topology["batch_size"]
+            or effective.get("grad_accum_steps") != topology["grad_accum_steps"]
+            or effective.get("global_batch_size") != 4096
+            or effective.get("ddp_shard_data") is not False
+        ):
+            raise PromotionError("dual-arm training report topology drift")
+    else:
+        recipe = contract["science"]["learner_training_recipe"]
+        recipe_sha = contract["science"]["learner_training_recipe_sha256"]
     required = {
         "a1_contract_sha256": contract_sha256,
         "a1_learner_training_recipe_sha256": recipe_sha,
@@ -515,6 +543,129 @@ def _verify_one_dose_training_receipt(
     """
 
     path = _canonical_existing_file(path, where="A1 one-dose training receipt")
+    raw_schema = _load_json(path).get("schema_version")
+    if raw_schema == "a1-dual-arm-training-receipt-v1":
+        from tools import a1_dual_arm_train as dual_train
+        from tools import a1_dual_learner_contract as learner_contract
+
+        try:
+            value = dual_train.verify_receipt(path)
+        except dual_train.DualTrainError as error:
+            raise PromotionError(f"dual-arm training receipt refused: {error}") from error
+        if value.get("contract_sha256") != contract.get("contract_sha256"):
+            raise PromotionError("dual-arm receipt binds a different contract")
+        outputs = value.get("outputs")
+        inputs = value.get("inputs")
+        if not isinstance(outputs, dict) or not isinstance(inputs, dict):
+            raise PromotionError("dual-arm receipt input/output provenance is malformed")
+        learner_lock_input = inputs.get("learner_lock")
+        corpus_meta_input = inputs.get("corpus_meta")
+        validation_input = inputs.get("validation")
+        producer_input = inputs.get("producer")
+        if not all(
+            isinstance(ref, dict) and set(ref) == {"path", "sha256"}
+            for ref in (
+                learner_lock_input,
+                corpus_meta_input,
+                validation_input,
+                producer_input,
+            )
+        ):
+            raise PromotionError("dual-arm receipt lacks exact reviewed input refs")
+        try:
+            verified_training = dual_train.verify_inputs(
+                learner_lock=Path(str(learner_lock_input["path"])),
+                reviewed_lock_file_sha256=str(learner_lock_input["sha256"]),
+                data=Path(str(corpus_meta_input["path"])).parent,
+                validation=Path(str(validation_input["path"])),
+                producer_checkpoint=Path(str(producer_input["path"])),
+            )
+            value = dual_train.verify_receipt(path, verified=verified_training)
+        except dual_train.DualTrainError as error:
+            raise PromotionError(
+                f"dual-arm full training replay refused: {error}"
+            ) from error
+        checkpoint_ref = outputs.get("checkpoint")
+        report_ref = outputs.get("report")
+        optimizer_ref = outputs.get("optimizer")
+        if (
+            checkpoint_ref
+            != {"path": str(candidate_path), "sha256": candidate_sha256}
+            or report_ref
+            != {"path": str(training_report_path), "sha256": training_report_sha256}
+            or not isinstance(optimizer_ref, dict)
+            or _sha256(Path(str(optimizer_ref.get("path"))))
+            != optimizer_ref.get("sha256")
+        ):
+            raise PromotionError("dual-arm receipt output bytes differ from candidate")
+        producer_ref = inputs.get("producer")
+        producers = [
+            record
+            for record in contract.get("checkpoints", [])
+            if isinstance(record, dict) and record.get("role") == "producer"
+        ]
+        if (
+            len(producers) != 1
+            or not isinstance(producer_ref, dict)
+            or producer_ref.get("sha256") != producers[0].get("sha256")
+        ):
+            raise PromotionError("dual-arm receipt producer differs from contract")
+        audit_ref = inputs.get("audit")
+        if not isinstance(audit_ref, dict):
+            raise PromotionError("dual-arm receipt has no audit binding")
+        audit_path = _canonical_existing_file(
+            Path(str(audit_ref.get("path"))), where="dual-arm post-wave audit"
+        )
+        if _sha256(audit_path) != audit_ref.get("sha256"):
+            raise PromotionError("dual-arm receipt audit bytes drifted")
+        audit = _load_json(audit_path)
+        if (
+            audit.get("contract_sha256") != contract.get("contract_sha256")
+            or _absolute(audit.get("contract_path"), base=audit_path.parent)
+            != contract_lock
+        ):
+            raise PromotionError("dual-arm audit does not bind this contract lock")
+        report = _load_json(training_report_path)
+        if report.get("a1_dual_arm_execution_binding") != value.get(
+            "execution_binding"
+        ):
+            raise PromotionError("dual-arm report/receipt execution binding mismatch")
+        learner_lock_ref = inputs.get("learner_lock")
+        if not isinstance(learner_lock_ref, dict) or set(learner_lock_ref) != {
+            "path",
+            "sha256",
+        }:
+            raise PromotionError("dual-arm receipt has no reviewed learner lock")
+        try:
+            learner_lock = learner_contract.verify_lock(
+                Path(str(learner_lock_ref["path"])),
+                reviewed_file_sha256=str(learner_lock_ref["sha256"]),
+            )
+        except learner_contract.LearnerContractError as error:
+            raise PromotionError(f"dual learner lock refused: {error}") from error
+        generation_ref = learner_lock.get("generation_arm_lock")
+        if (
+            not isinstance(generation_ref, dict)
+            or generation_ref.get("path") != str(contract_lock)
+            or generation_ref.get("sha256") != _sha256(contract_lock)
+            or learner_lock.get("generation_contract_sha256")
+            != contract.get("contract_sha256")
+            or (learner_lock.get("arm_id"), learner_lock.get("subset_id"))
+            != (value.get("arm_id"), value.get("subset_id"))
+            or learner_lock.get("recipe")
+            != report.get("a1_bound_learner_training_recipe")
+            or learner_lock.get("objective")
+            != report.get("a1_bound_learner_value_objective")
+        ):
+            raise PromotionError("dual learner lock does not authorize candidate report")
+        return {
+            "path": str(path),
+            "sha256": _sha256(path),
+            "receipt_sha256": value["receipt_sha256"],
+            "claim": value["claim"]["path"],
+            "claim_state_sha256": value["claim_completion"]["sha256"],
+            "execution_binding_sha256": _digest_value(value["execution_binding"]),
+        }
     if legacy_snapshot is None:
         value = _verify_receipt_digest(_load_json(path))
     else:
