@@ -23,6 +23,7 @@ name = "catanatron-rs-python"
 version = "0.1.4"
 dependencies = [
  "catanatron-rs",
+ "gumbel-mcts",
  "pyo3",
  "serde_json",
 ]
@@ -73,6 +74,16 @@ dependencies = [
  "cfg-if",
  "libc",
  "wasi",
+]
+
+[[package]]
+name = "gumbel-mcts"
+version = "0.2.0"
+dependencies = [
+ "catanatron-rs",
+ "rand",
+ "rand_chacha",
+ "serde_json",
 ]
 
 [[package]]
