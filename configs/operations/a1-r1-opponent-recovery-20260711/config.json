@@ -42,6 +42,6 @@
       "render_sha256": "sha256:89505b97364e61316a44bd3091a290555435e59ab11843e89d966bc3ad910c93"
     }
   },
-  "recovery_root": "/home/ubuntu/catan-zero-production/recovery/a1-r1-opponents-20260711",
+  "recovery_root": "/home/ubuntu/catan-zero-production/recovery/a1-r1-opponents-20260711-v2",
   "allowed_categories": ["recent_history", "hard_negative"]
 }
