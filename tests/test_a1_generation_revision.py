@@ -154,3 +154,62 @@ def test_revision_refuses_to_reuse_issued_r1_handoff(record: dict[str, str]) -> 
     contract._require_fresh_revision_handoff(  # noqa: SLF001
         {"transaction_id": "new-transaction", "handoff_sha256": "sha256:new"}
     )
+
+
+def test_issued_r1_replays_versioned_guard_snapshots_after_live_guard_revision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Historical r1 science must never be parsed from the mutable r2 path."""
+
+    guard_paths = {
+        "configs/guards/a1_generation_n128.json",
+        "configs/guards/a1_generation_n256.json",
+    }
+    real_load = contract._load_json  # noqa: SLF001
+
+    def reject_mutable_guard_read(path: Path) -> dict:
+        try:
+            relative = path.resolve().relative_to(contract.REPO_ROOT).as_posix()
+        except ValueError:
+            relative = ""
+        if relative in guard_paths:
+            raise AssertionError(f"historical validation read mutable guard: {relative}")
+        return real_load(path)
+
+    # Capture the real history function before replacing it so the wrapper can
+    # continue validating the other immutable r1 provenance records.
+    real_history = contract._tracked_history_contains_file_digest  # noqa: SLF001
+    no_history_for_revised_guards = lambda relative_path, digest: (  # noqa: E731
+        False
+        if relative_path in guard_paths
+        else real_history(relative_path, digest)
+    )
+    monkeypatch.setattr(
+        contract, "_tracked_history_contains_file_digest", no_history_for_revised_guards
+    )
+    monkeypatch.setattr(contract, "_load_json", reject_mutable_guard_read)
+
+    payload = contract.validate_generation_campaign(SOURCE)
+    assert payload["contract_id"] == contract.GENERATION_CAMPAIGN_CONTRACT_ID
+
+
+def test_issued_r1_rejects_mutated_guard_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    relative = "configs/guards/a1_generation_n128.json"
+    digest = "sha256:81020e447a3bc55fbc17b6cdcdc1c56187e3f7266cfb92526746aa067661e1b3"
+    bad_snapshot = tmp_path / "a1_generation_n128.json"
+    original = contract.GENERATION_CAMPAIGN_R1_GUARD_SNAPSHOTS[(relative, digest)]
+    bad_snapshot.write_bytes(original.read_bytes() + b"\n")
+    snapshots = dict(contract.GENERATION_CAMPAIGN_R1_GUARD_SNAPSHOTS)
+    snapshots[(relative, digest)] = bad_snapshot
+    monkeypatch.setattr(contract, "GENERATION_CAMPAIGN_R1_GUARD_SNAPSHOTS", snapshots)
+    real_history = contract._tracked_history_contains_file_digest  # noqa: SLF001
+    monkeypatch.setattr(
+        contract,
+        "_tracked_history_contains_file_digest",
+        lambda path, sha: False if path == relative else real_history(path, sha),
+    )
+
+    with pytest.raises(contract.ContractError, match="immutable file drift"):
+        contract.validate_generation_campaign(SOURCE)

@@ -187,6 +187,25 @@ GENERATION_CAMPAIGN_CONTRACT_SHA256 = (
 GENERATION_CAMPAIGN_CONTRACT_PATH = (
     REPO_ROOT / "configs/operations/a1-dual-arm-56gpu-20260710/contract.json"
 )
+# The issued r1 campaign predates the native-hot-loop guard revision.  Its
+# contract cannot be rewritten, and its guard records deliberately continue to
+# name the production paths that were live when it was issued.  Keep exact
+# copies of those two historical guard blobs next to the contract so semantic
+# replay never reads newer bytes through the old path.  This allowlist is keyed
+# by both original path and sealed digest; it is not a general fallback for
+# missing or drifting files.
+GENERATION_CAMPAIGN_R1_GUARD_SNAPSHOTS = {
+    (
+        "configs/guards/a1_generation_n128.json",
+        "sha256:81020e447a3bc55fbc17b6cdcdc1c56187e3f7266cfb92526746aa067661e1b3",
+    ): GENERATION_CAMPAIGN_CONTRACT_PATH.parent
+    / "snapshots/guards/a1_generation_n128.json",
+    (
+        "configs/guards/a1_generation_n256.json",
+        "sha256:9fa693ba1bd87a422010cd992ae2f1ec0b4c20863b1dd7ef29aa59082306931a",
+    ): GENERATION_CAMPAIGN_CONTRACT_PATH.parent
+    / "snapshots/guards/a1_generation_n256.json",
+}
 GENERATION_CAMPAIGN_R2_CONTRACT_ID = "a1-dual-arm-n256-n128-56gpu-20260711-r2"
 GENERATION_CAMPAIGN_R2_CONTRACT_SHA256 = (
     "sha256:a9b89b3885041b9d6f61c211d86d3e22cfb17426fdf4b221958a56d0def12e51"
@@ -438,6 +457,22 @@ def _tracked_history_contains_file_digest(relative_path: str, digest: str) -> bo
     except (OSError, subprocess.SubprocessError):
         return False
     return False
+
+
+def _issued_r1_guard_snapshot(relative_path: str, digest: str) -> Path | None:
+    """Return an exact checked-in r1 guard blob, or fail closed.
+
+    The returned file must still hash to the digest in the issued contract.
+    A modified/missing snapshot is therefore no more trusted than a modified
+    live guard, and unknown path/digest pairs never receive archival treatment.
+    """
+
+    snapshot = GENERATION_CAMPAIGN_R1_GUARD_SNAPSHOTS.get(
+        (relative_path, digest)
+    )
+    if snapshot is None or not snapshot.is_file() or _sha256(snapshot) != digest:
+        return None
+    return snapshot
 
 
 def _git_blob(commit: str, relative_path: str) -> bytes:
@@ -3055,10 +3090,18 @@ def validate_generation_campaign(
         relative_path = str(record["path"])
         source = REPO_ROOT / relative_path
         current_matches = source.is_file() and _sha256(source) == record["sha256"]
+        guard_snapshot = (
+            _issued_r1_guard_snapshot(relative_path, str(record["sha256"]))
+            if allow_archived_provenance
+            else None
+        )
         archived_matches = bool(
             allow_archived_provenance
-            and _tracked_history_contains_file_digest(
-                relative_path, str(record["sha256"])
+            and (
+                guard_snapshot is not None
+                or _tracked_history_contains_file_digest(
+                    relative_path, str(record["sha256"])
+                )
             )
         )
         if not current_matches and not archived_matches:
@@ -3068,7 +3111,20 @@ def validate_generation_campaign(
         match = re.fullmatch(r"a1_generation_(n128|n256)(_legacy)?", name)
         if match is None:
             raise ContractError(f"generation campaign has unknown arm guard {name}")
-        payload = _load_json(REPO_ROOT / str(record["path"]))
+        relative_path = str(record["path"])
+        live_guard = REPO_ROOT / relative_path
+        guard_source = (
+            live_guard
+            if live_guard.is_file() and _sha256(live_guard) == record["sha256"]
+            else _issued_r1_guard_snapshot(relative_path, str(record["sha256"]))
+            if allow_archived_provenance
+            else None
+        )
+        if guard_source is None:
+            raise ContractError(
+                f"generation campaign immutable guard bytes unavailable: {live_guard}"
+            )
+        payload = _load_json(guard_source)
         guards = list(payload.get("guards", []))
         lint = next(
             (item for item in guards if item.get("name") == "cli_flag_lint"), None
