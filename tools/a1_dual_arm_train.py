@@ -41,6 +41,7 @@ RECEIPT_SCHEMA = "a1-dual-arm-training-receipt-v1"
 REPORT_BINDING_FIELD = "a1_dual_arm_execution_binding"
 GLOBAL_BATCH = 4096
 ALLOWED_IDENTITIES = frozenset(train_bc.DUAL_ARM_SUBSET_COUNTS)
+DUAL_CORRECTIVE_ABLATION_FIELDS = frozenset({"lr", "loser_sample_weight"})
 
 
 class DualTrainError(RuntimeError):
@@ -247,6 +248,21 @@ def verify_inputs(
         "corpus_rows": int(meta["row_count"]),
         "training_rows": training_rows,
         "validation_rows": int(holdout["validation_row_count"]),
+        # Re-express the reviewed dual-learner runtime as the lock-shaped code
+        # inventory consumed by the existing diagnostic-ablation binder.  This
+        # does not authorize recipe drift by itself; the caller must still bind
+        # an allowlisted override to the reviewed raw learner-lock digest.
+        "ablation_code_lock": {
+            "provenance": {
+                "learner_code": [
+                    {"path": str((_REPO_ROOT / "tools/train_bc.py").resolve())}
+                ],
+                "runtime_code_tree": [
+                    {"path": str((_REPO_ROOT / record["path"]).resolve())}
+                    for record in authority["runtime"]
+                ],
+            }
+        },
     }
     if curriculum_parent_receipt is not None:
         # Reuse train_bc's fail-closed receipt/checkpoint/producer validation so
@@ -259,12 +275,70 @@ def verify_inputs(
         # Replay the original claim/completion and every referenced input/output
         # byte before allowing train_bc's narrower producer/init check.
         parent_receipt = verify_receipt(curriculum_parent_receipt)
+        parent_inputs = parent_receipt["inputs"]
+        # Corrective parents are produced by this exact reviewed runtime, so
+        # replay their full report semantics.  Historical pre-ablation parents
+        # retain byte/claim/completion replay compatibility across executor
+        # upgrades; their immutable output refs are still checked above.
+        if parent_inputs.get("learner_ablation") is not None:
+            parent_verified = verify_inputs(
+                learner_lock=Path(parent_inputs["learner_lock"]["path"]),
+                reviewed_lock_file_sha256=parent_inputs["learner_lock"]["sha256"],
+                data=Path(parent_inputs["corpus_meta"]["path"]).parent,
+                validation=Path(parent_inputs["validation"]["path"]),
+                producer_checkpoint=Path(parent_inputs["producer"]["path"]),
+            )
+            parent_receipt = verify_receipt(
+                curriculum_parent_receipt, verified=parent_verified
+            )
         parent_args.init_checkpoint = parent_receipt["outputs"]["checkpoint"]["path"]
         parent_args.init_checkpoint_sha256 = parent_receipt["outputs"]["checkpoint"]["sha256"]
         parent = train_bc._validate_a1_curriculum_parent(parent_args, bound)  # noqa: SLF001
         assert parent is not None
         verified["curriculum_parent"] = parent
     return verified
+
+
+def bind_learner_ablation(
+    verified: dict[str, Any],
+    *,
+    ablation_id: str,
+    overrides_json: str,
+    reviewed_code_tree_sha256: str,
+) -> dict[str, Any]:
+    """Bind existing learner-only knobs without weakening dual-arm authority."""
+
+    try:
+        overrides = json.loads(overrides_json)
+    except json.JSONDecodeError as error:
+        raise DualTrainError(f"invalid corrective overrides JSON: {error}") from error
+    if not isinstance(overrides, dict) or not overrides:
+        raise DualTrainError("dual corrective overrides must be a nonempty object")
+    forbidden = set(overrides) - DUAL_CORRECTIVE_ABLATION_FIELDS
+    if forbidden:
+        raise DualTrainError(
+            "dual corrective ablation only permits lr and loser_sample_weight; "
+            f"got forbidden fields {sorted(forbidden)}"
+        )
+
+    original_bound_recipe = verified["bound_recipe"]
+    ablation_input = dict(verified)
+    ablation_input.update(
+        {
+            "lock": verified["ablation_code_lock"],
+            "lock_file_sha256": verified["learner_lock"]["sha256"],
+        }
+    )
+    result = one_dose.bind_learner_ablation(
+        ablation_input,
+        ablation_id=ablation_id,
+        overrides_json=overrides_json,
+        reviewed_code_tree_sha256=reviewed_code_tree_sha256,
+    )
+    # The child report must continue to distinguish the immutable generation
+    # recipe from the effective topology+ablation recipe.
+    result["bound_recipe"] = original_bound_recipe
+    return result
 
 
 def build_command(
@@ -276,6 +350,11 @@ def build_command(
             "producer": verified["producer"],
             "data_path": verified["data"],
             "validation_path": Path(verified["validation"]["path"]),
+            **(
+                {}
+                if verified.get("learner_ablation") is None
+                else {"learner_ablation": verified["learner_ablation"]}
+            ),
         },
         python=python,
         checkpoint=checkpoint,
@@ -352,6 +431,11 @@ def _claim_identity(verified: dict[str, Any]) -> str:
                 None
                 if verified.get("curriculum_parent") is None
                 else verified["curriculum_parent"]["receipt_sha256"]
+            ),
+            "learner_ablation_sha256": (
+                None
+                if verified.get("learner_ablation") is None
+                else _digest(verified["learner_ablation"])
             ),
         }
     )
@@ -611,6 +695,15 @@ def verify_outputs(
                 "a1_learner_topology_authorization": topology_authorization,
             }
         )
+    learner_ablation = verified.get("learner_ablation")
+    if learner_ablation is not None:
+        expected.update(
+            {
+                "a1_learner_ablation": learner_ablation,
+                "diagnostic_only": True,
+                "promotion_eligible": False,
+            }
+        )
     drift = {
         key: {"expected": value, "actual": payload.get(key)}
         for key, value in expected.items()
@@ -654,6 +747,10 @@ def verify_outputs(
         != _digest(recipe)
         or value_training.get("a1_memmap_payload_inventory_sha256")
         != verified["payload_inventory_sha256"]
+        or (
+            learner_ablation is not None
+            and value_training.get("learner_ablation") != learner_ablation
+        )
         or "scalar" not in value_training.get("trained_value_readouts", [])
     ):
         raise DualTrainError("dual-arm report lacks one complete 35M scalar-MSE dose")
@@ -701,6 +798,10 @@ def verify_receipt(
         or completion.get("claim_identity_sha256")
         != payload.get("claim_identity_sha256")
         or completion.get("receipt") != str(path)
+        or completion.get("outputs") != payload.get("outputs")
+        or completion.get("command_sha256") != payload.get("command_sha256")
+        or completion.get("execution_binding") != payload.get("execution_binding")
+        or completion.get("gpu_names") != payload.get("gpu_names")
     ):
         raise DualTrainError("dual-arm claim completion disagrees with receipt")
     for group in ("inputs", "outputs"):
@@ -803,6 +904,11 @@ def _publish_completion_and_receipt(
             "producer": verified["producer"],
             "executor": _file_ref(Path(__file__), where="dual learner executor"),
             "payload_inventory_sha256": verified["payload_inventory_sha256"],
+            **(
+                {}
+                if verified.get("learner_ablation") is None
+                else {"learner_ablation": verified["learner_ablation"]}
+            ),
             **(
                 {}
                 if verified.get("curriculum_parent") is None
@@ -948,6 +1054,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--validation-manifest", type=Path, required=True)
     parser.add_argument("--producer-checkpoint", type=Path, required=True)
     parser.add_argument("--curriculum-parent-receipt", type=Path)
+    parser.add_argument("--ablation-id", default="")
+    parser.add_argument("--recipe-overrides-json", default="")
+    parser.add_argument("--ablation-code-tree-sha256", default="")
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--report", type=Path, required=True)
     parser.add_argument("--receipt", type=Path, required=True)
@@ -969,6 +1078,23 @@ def main(argv: Sequence[str] | None = None) -> int:
             producer_checkpoint=args.producer_checkpoint,
             curriculum_parent_receipt=args.curriculum_parent_receipt,
         )
+        ablation_values = (
+            args.ablation_id,
+            args.recipe_overrides_json,
+            args.ablation_code_tree_sha256,
+        )
+        if any(ablation_values) and not all(ablation_values):
+            raise DualTrainError(
+                "--ablation-id, --recipe-overrides-json, and "
+                "--ablation-code-tree-sha256 must be supplied together"
+            )
+        if all(ablation_values):
+            verified = bind_learner_ablation(
+                verified,
+                ablation_id=args.ablation_id,
+                overrides_json=args.recipe_overrides_json,
+                reviewed_code_tree_sha256=args.ablation_code_tree_sha256,
+            )
         checkpoint = args.checkpoint.expanduser().resolve(strict=False)
         report = args.report.expanduser().resolve(strict=False)
         receipt = args.receipt.expanduser().resolve(strict=False)
@@ -1004,6 +1130,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                     else {"curriculum_parent": verified["curriculum_parent"]}
                 ),
                 "executor": _file_ref(Path(__file__), where="dual learner executor"),
+                **(
+                    {}
+                    if verified.get("learner_ablation") is None
+                    else {"learner_ablation": verified["learner_ablation"]}
+                ),
             },
             "outputs": {
                 "checkpoint": str(checkpoint),

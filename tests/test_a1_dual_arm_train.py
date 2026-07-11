@@ -4,6 +4,7 @@ import json
 import math
 from pathlib import Path
 import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -14,6 +15,12 @@ from tools import a1_dual_learner_contract as learner_contract
 
 
 SHA = "sha256:" + "a" * 64
+DUAL_RUNTIME = [
+    {"path": "tools/train_bc.py"},
+    {"path": "tools/a1_dual_arm_train.py"},
+    {"path": "tools/a1_dual_learner_contract.py"},
+    {"path": "tools/a1_one_dose_train.py"},
+]
 
 
 def _verified(tmp_path: Path) -> dict:
@@ -78,6 +85,29 @@ def _touch_ref(path: Path) -> dict[str, str]:
     return {"path": str(path.resolve()), "sha256": dual._sha256(path)}  # noqa: SLF001
 
 
+def _bind_corrective_ablation(verified: dict) -> dict:
+    repo = Path(dual.__file__).resolve().parents[1]
+    verified["ablation_code_lock"] = {
+        "provenance": {
+            "learner_code": [{"path": str(repo / "tools/train_bc.py")}],
+            "runtime_code_tree": [
+                {"path": str(repo / "tools/a1_dual_arm_train.py")},
+                {"path": str(repo / "tools/a1_dual_learner_contract.py")},
+                {"path": str(repo / "tools/a1_one_dose_train.py")},
+            ],
+        }
+    }
+    code = dual.one_dose._current_ablation_code_binding(  # noqa: SLF001
+        verified["ablation_code_lock"]
+    )
+    return dual.bind_learner_ablation(
+        verified,
+        ablation_id="all-196k-corrective-v1",
+        overrides_json=json.dumps({"lr": 0.00012, "loser_sample_weight": 1.0}),
+        reviewed_code_tree_sha256=code["code_tree_sha256"],
+    )
+
+
 def test_dry_run_command_is_direct_eight_rank_memmap_ddp(tmp_path: Path) -> None:
     verified = _verified(tmp_path)
     command = dual.build_command(
@@ -129,6 +159,114 @@ def test_curriculum_command_warm_starts_from_authenticated_parent(tmp_path: Path
     assert dual._claim_identity(verified) != plain_identity  # noqa: SLF001
 
 
+def test_dual_curriculum_supports_sealed_diagnostic_learner_ablation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    verified = _verified(tmp_path)
+    verified = _bind_corrective_ablation(verified)
+    command = dual.build_command(
+        verified,
+        python=Path(sys.executable),
+        checkpoint=tmp_path / "corrective.pt",
+        report=tmp_path / "corrective.json",
+    )
+    assert "--a1-dual-learner-lock" in command
+    assert "--a1-learner-ablation-id" in command
+    assert command[command.index("--lr") + 1] == "0.00012"
+    assert command[command.index("--loser-sample-weight") + 1] == "1.0"
+
+    args = dual.train_bc.build_parser().parse_args(command[6:])
+    bound = {
+        "dual_arm": True,
+        "arm_id": verified["arm_id"],
+        "subset_id": verified["subset_id"],
+        "learner_training_recipe": verified["bound_recipe"],
+        "learner_training_recipe_sha256": dual._digest(verified["bound_recipe"]),  # noqa: SLF001
+        "learner_value_objective": verified["objective"],
+    }
+    monkeypatch.setattr(
+        learner_contract,
+        "verify_lock",
+        lambda *_args, **_kwargs: {
+            "arm_id": verified["arm_id"],
+            "subset_id": verified["subset_id"],
+            "recipe": verified["bound_recipe"],
+            "objective": verified["objective"],
+            "topology": learner_contract.TOPOLOGY,
+            "runtime": DUAL_RUNTIME,
+        },
+    )
+    effective = dual.train_bc._validate_a1_learner_training_recipe(  # noqa: SLF001
+        args,
+        {"world_size": 8, "rank": 0, "local_rank": 0, "enabled": False},
+        bound,
+    )
+    assert effective["lr"] == pytest.approx(0.00012)
+    assert effective["loser_sample_weight"] == pytest.approx(1.0)
+    assert bound["learner_ablation"]["diagnostic_only"] is True
+    assert bound["learner_topology_authorization"]["topology"] == (
+        learner_contract.TOPOLOGY
+    )
+
+    bad_args = dual.train_bc.build_parser().parse_args(command[6:])
+    declared = json.loads(bad_args.a1_effective_learner_recipe_json)
+    declared["value_loss_weight"] = 1.0
+    bad_args.value_loss_weight = 1.0
+    bad_args.a1_effective_learner_recipe_json = dual._canonical(declared).decode()  # noqa: SLF001
+    bad_args.a1_effective_learner_recipe_sha256 = dual._digest(declared)  # noqa: SLF001
+    with pytest.raises(SystemExit, match="only permits lr and loser_sample_weight"):
+        dual.train_bc._validate_a1_learner_training_recipe(  # noqa: SLF001
+            bad_args,
+            {"world_size": 8, "rank": 0, "local_rank": 0, "enabled": False},
+            {
+                "dual_arm": True,
+                "arm_id": verified["arm_id"],
+                "subset_id": verified["subset_id"],
+                "learner_training_recipe": verified["bound_recipe"],
+                "learner_training_recipe_sha256": dual._digest(verified["bound_recipe"]),  # noqa: SLF001
+                "learner_value_objective": verified["objective"],
+            },
+        )
+
+    wrong_lock_args = dual.train_bc.build_parser().parse_args(command[6:])
+    wrong_lock_args.a1_reviewed_lock_file_sha256 = "sha256:" + "b" * 64
+    with pytest.raises(SystemExit, match="bind the reviewed dual learner lock"):
+        dual.train_bc._validate_a1_learner_training_recipe(  # noqa: SLF001
+            wrong_lock_args,
+            {"world_size": 8, "rank": 0, "local_rank": 0, "enabled": False},
+            {
+                "dual_arm": True,
+                "arm_id": verified["arm_id"],
+                "subset_id": verified["subset_id"],
+                "learner_training_recipe": verified["bound_recipe"],
+                "learner_training_recipe_sha256": dual._digest(verified["bound_recipe"]),  # noqa: SLF001
+                "learner_value_objective": verified["objective"],
+            },
+        )
+
+    short_code_args = dual.train_bc.build_parser().parse_args(command[6:])
+    code = json.loads(short_code_args.a1_ablation_code_binding_json)
+    code["records"] = code["records"][:-1]
+    unhashed = dict(code)
+    unhashed.pop("code_tree_sha256")
+    code["code_tree_sha256"] = dual._digest(unhashed)  # noqa: SLF001
+    short_code_args.a1_ablation_code_binding_json = dual._canonical(code).decode()  # noqa: SLF001
+    short_code_args.a1_ablation_code_tree_sha256 = code["code_tree_sha256"]
+    with pytest.raises(SystemExit, match="differs from reviewed runtime closure"):
+        dual.train_bc._validate_a1_learner_training_recipe(  # noqa: SLF001
+            short_code_args,
+            {"world_size": 8, "rank": 0, "local_rank": 0, "enabled": False},
+            {
+                "dual_arm": True,
+                "arm_id": verified["arm_id"],
+                "subset_id": verified["subset_id"],
+                "learner_training_recipe": verified["bound_recipe"],
+                "learner_training_recipe_sha256": dual._digest(verified["bound_recipe"]),  # noqa: SLF001
+                "learner_value_objective": verified["objective"],
+            },
+        )
+
+
 def test_two_b200_fallback_preserves_global_batch_4096(tmp_path: Path) -> None:
     verified = _verified(tmp_path)
     verified["topology"] = learner_contract.TOPOLOGIES[2]
@@ -175,6 +313,7 @@ def test_train_bc_accepts_only_reviewed_two_rank_topology(
             "arm_id": verified["arm_id"], "subset_id": verified["subset_id"],
             "recipe": verified["bound_recipe"], "objective": verified["objective"],
             "topology": learner_contract.TOPOLOGIES[2],
+            "runtime": DUAL_RUNTIME,
         },
     )
     actual = dual.train_bc._validate_a1_learner_training_recipe(  # noqa: SLF001
@@ -199,6 +338,7 @@ def test_train_bc_ddp_replays_dual_authority_once_on_rank0(
         "recipe": verified["bound_recipe"],
         "objective": verified["objective"],
         "topology": learner_contract.TOPOLOGIES[2],
+        "runtime": DUAL_RUNTIME,
     }
     effective = dict(verified["bound_recipe"])
     effective.update(

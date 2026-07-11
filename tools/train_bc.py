@@ -2818,6 +2818,7 @@ def _validate_a1_learner_training_recipe(
     expected = bound.get("learner_training_recipe")
     if not isinstance(expected, dict):
         raise SystemExit("A1 contract has no typed learner training recipe")
+    immutable_expected = expected
     effective = _effective_a1_learner_training_recipe(args, ddp)
     missing = set(expected) - set(effective)
     extra = set(effective) - set(expected)
@@ -2846,15 +2847,13 @@ def _validate_a1_learner_training_recipe(
     dual_reviewed_sha = str(
         getattr(args, "a1_dual_reviewed_lock_file_sha256", "") or ""
     )
+    dual_topology_authorization: dict[str, object] | None = None
+    dual_runtime_paths: set[str] | None = None
     if dual_lock_path or dual_reviewed_sha:
         if not dual_lock_path or not _is_sha256(dual_reviewed_sha):
             raise SystemExit(
                 "dual learner topology requires lock path and reviewed raw lock digest"
             )
-        if ablation_id or any(
-            (declared_json, declared_sha, code_binding_json, declared_code_sha, reviewed_lock_sha)
-        ):
-            raise SystemExit("dual learner topology authorization cannot be an ablation")
         if bound.get("dual_arm") is not True:
             raise SystemExit("dual learner topology authorization requires a dual-arm corpus")
         from tools import a1_dual_learner_contract as dual_contract
@@ -2908,6 +2907,13 @@ def _validate_a1_learner_training_recipe(
             or topology not in dual_contract.TOPOLOGIES.values()
         ):
             raise SystemExit("dual learner topology lock differs from audited corpus")
+        runtime = authority.get("runtime")
+        if not isinstance(runtime, list) or any(
+            not isinstance(record, dict) or not isinstance(record.get("path"), str)
+            for record in runtime
+        ):
+            raise SystemExit("dual learner topology lock has malformed runtime closure")
+        dual_runtime_paths = {str(record["path"]) for record in runtime}
         authorized = dict(expected)
         authorized.update(
             {
@@ -2918,9 +2924,7 @@ def _validate_a1_learner_training_recipe(
                 "ddp_shard_data": topology["ddp_shard_data"],
             }
         )
-        if effective != authorized:
-            raise SystemExit("command differs from reviewed dual learner topology")
-        bound["learner_topology_authorization"] = {
+        dual_topology_authorization = {
             "schema_version": "a1-dual-learner-topology-authorization-v1",
             "learner_lock": str(Path(dual_lock_path).expanduser().resolve(strict=True)),
             "learner_lock_file_sha256": dual_reviewed_sha,
@@ -2928,7 +2932,45 @@ def _validate_a1_learner_training_recipe(
             "effective_recipe": effective,
             "effective_recipe_sha256": _canonical_json_sha256(effective),
         }
-        return effective
+        ablation_metadata = (
+            declared_json,
+            declared_sha,
+            code_binding_json,
+            declared_code_sha,
+            reviewed_lock_sha,
+        )
+        if not ablation_id:
+            if any(ablation_metadata):
+                raise SystemExit(
+                    "A1 effective-recipe metadata requires a nonempty "
+                    "--a1-learner-ablation-id"
+                )
+            if effective != authorized:
+                raise SystemExit("command differs from reviewed dual learner topology")
+            bound["learner_topology_authorization"] = dual_topology_authorization
+            return effective
+
+        # A diagnostic ablation may alter only the existing learner-ablation
+        # allowlist.  The independently reviewed DDP topology remains exact.
+        for key in (
+            "world_size",
+            "batch_size",
+            "grad_accum_steps",
+            "global_batch_size",
+            "ddp_shard_data",
+        ):
+            if effective.get(key) != authorized.get(key):
+                raise SystemExit(
+                    f"dual learner ablation cannot alter topology field {key!r}"
+                )
+        expected = authorized
+        missing = set(expected) - set(effective)
+        extra = set(effective) - set(expected)
+        drift = {
+            key: {"contract": expected.get(key), "effective": effective.get(key)}
+            for key in sorted(set(expected) & set(effective))
+            if expected[key] != effective[key]
+        }
     if not ablation_id:
         if (
             declared_json
@@ -2998,8 +3040,20 @@ def _validate_a1_learner_training_recipe(
         )
     if not drift:
         raise SystemExit("A1 learner ablation must change at least one recipe field")
+    if dual_topology_authorization is not None:
+        allowed_dual_drift = {"lr", "loser_sample_weight"}
+        forbidden_dual_drift = set(drift) - allowed_dual_drift
+        if forbidden_dual_drift:
+            raise SystemExit(
+                "dual corrective ablation only permits lr and loser_sample_weight; "
+                f"got forbidden fields {sorted(forbidden_dual_drift)}"
+            )
+        if reviewed_lock_sha != dual_reviewed_sha:
+            raise SystemExit(
+                "dual corrective ablation must bind the reviewed dual learner lock"
+            )
     if bound.get("learner_training_recipe_sha256") != _canonical_json_sha256(
-        expected
+        immutable_expected
     ):
         raise SystemExit("A1 immutable bound learner recipe digest drift")
     try:
@@ -3035,6 +3089,12 @@ def _validate_a1_learner_training_recipe(
         seen_paths.add(str(path))
         if _sha256_existing_file(str(path)) != record["sha256"]:
             raise SystemExit(f"A1 ablation code file drift: {path}")
+    if dual_runtime_paths is not None and {
+        str(record["relative_path"]) for record in records
+    } != dual_runtime_paths:
+        raise SystemExit(
+            "dual corrective ablation code binding differs from reviewed runtime closure"
+        )
     bound["learner_ablation"] = {
         "schema_version": "a1-learner-ablation-v1",
         "ablation_id": ablation_id,
@@ -3051,6 +3111,13 @@ def _validate_a1_learner_training_recipe(
         "code_tree_sha256": declared_code_sha,
         "reviewed_lock_file_sha256": reviewed_lock_sha,
     }
+    if dual_topology_authorization is not None:
+        dual_topology_authorization = dict(dual_topology_authorization)
+        dual_topology_authorization["effective_recipe"] = dict(effective)
+        dual_topology_authorization["effective_recipe_sha256"] = (
+            _canonical_json_sha256(effective)
+        )
+        bound["learner_topology_authorization"] = dual_topology_authorization
     return effective
 
 
