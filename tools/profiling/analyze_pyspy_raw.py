@@ -64,6 +64,14 @@ def _category(thread: str, stack: str) -> str:
         )
     ):
         return "external_bot_policy"
+    # Once the native hot loop is enabled, ``_search_information_set`` remains
+    # as the Python PIMC particle orchestrator.  It is not tree traversal.  A
+    # sample that has crossed into the extension belongs to native traversal /
+    # allocation; samples between particle calls are Python orchestration.
+    if "catan_zero/search/native_gumbel_mcts.py" in stack:
+        if "catanatron_rs" in stack or "gumbel_mcts::" in stack:
+            return "native_mcts_traversal_and_allocator"
+        return "python_pimc_orchestration"
     if (
         "catan_zero/search/gumbel_chance_mcts.py" in stack
         or "catan_zero/search/rust_mcts.py" in stack
