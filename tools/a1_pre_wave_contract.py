@@ -85,6 +85,7 @@ SEALED_RUNTIME_ENVIRONMENT = {
 AUDIT_SCHEMA = "a1-post-wave-audit-v2"
 RELOCATED_AUDIT_SCHEMA = "a1-post-wave-audit-v3"
 DUAL_ARM_AUDIT_SCHEMA = "a1-dual-arm-post-wave-audit-v1"
+DUAL_ARM_SELECTED_GAMES_SCHEMA = "a1-dual-arm-selected-training-games-v1"
 HARVEST_RELOCATION_SCHEMA = "a1-fleet-harvest-relocation-v1"
 GUARD_SYNC_SCHEMA = "a1-pre-wave-generation-guard-sync-v1"
 CLAIM_RECEIPT_SCHEMA = "a1-seed-claim-transaction-v1"
@@ -5588,22 +5589,49 @@ def audit_outputs(
             ],
             dtype="<i8",
         )
+        dual_subset_id = (
+            None
+            if arm_id is None
+            else ("full-140k" if arm_id == "n128" else "full-56k")
+        )
         selected_game_manifest = {
-            "schema_version": "a1-selected-training-games-v1",
+            "schema_version": (
+                "a1-selected-training-games-v1"
+                if arm_id is None
+                else DUAL_ARM_SELECTED_GAMES_SCHEMA
+            ),
             "a1_contract_sha256": lock["contract_sha256"],
             "selection_rule": "lowest_seed_complete_per_job",
             "selected_game_count": len(selected_records),
             "selected_game_seed_set_sha256": "sha256:"
             + hashlib.sha256(selected_seed_array.tobytes()).hexdigest(),
             "category_game_counts": dict(expected_games),
-            **({} if arm_id is None else {"arm_id": arm_id}),
+            **(
+                {}
+                if arm_id is None
+                else {
+                    "arm_id": arm_id,
+                    "subset_id": dual_subset_id,
+                    # A full-arm audit is the root selection artifact.  Derived
+                    # comparison subsets bind this file's SHA-256 here instead.
+                    "parent_manifest_sha256": None,
+                }
+            ),
             "training_game_count": int(training_seed_array.size),
             "training_game_seed_set_sha256": "sha256:"
             + hashlib.sha256(training_seed_array.tobytes()).hexdigest(),
             "validation_game_count": int(held_out.size),
             "validation_game_seed_set_sha256": seed_set_digest,
-            "records": selected_records,
-            "records_sha256": _digest_value(selected_records),
+            "records": (
+                selected_records
+                if arm_id is None
+                else [{**record, "arm_id": arm_id} for record in selected_records]
+            ),
+            "records_sha256": _digest_value(
+                selected_records
+                if arm_id is None
+                else [{**record, "arm_id": arm_id} for record in selected_records]
+            ),
         }
     report: dict[str, Any] = {
         "schema_version": (
@@ -5611,7 +5639,14 @@ def audit_outputs(
             if arm_id is not None
             else (AUDIT_SCHEMA if relocation is None else RELOCATED_AUDIT_SCHEMA)
         ),
-        **({} if arm_id is None else {"arm_id": arm_id}),
+        **(
+            {}
+            if arm_id is None
+            else {
+                "arm_id": arm_id,
+                "subset_id": "full-140k" if arm_id == "n128" else "full-56k",
+            }
+        ),
         "contract_path": str(lock_path.absolute()),
         "contract_sha256": lock["contract_sha256"],
         "passed": not errors,

@@ -69,6 +69,7 @@ MEMMAP_PAYLOAD_INVENTORY_SCHEMA = "memmap-payload-inventory-v1"
 A1_SELECTED_GAMES_SCHEMA = "a1-selected-training-games-v1"
 DUAL_ARM_SELECTED_GAMES_SCHEMA = "a1-dual-arm-selected-training-games-v1"
 DUAL_ARM_AUDIT_SCHEMA = "a1-dual-arm-post-wave-audit-v1"
+DUAL_ARM_DERIVED_AUDIT_SCHEMA = "a1-dual-arm-derived-post-wave-audit-v1"
 DUAL_ARM_SUBSET_CATEGORY_COUNTS = {
     ("n128", "full-140k"): {
         "current_producer": 112_000,
@@ -461,12 +462,20 @@ def _load_dual_arm_selected_game_manifest(
     if (
         not isinstance(payload["a1_contract_sha256"], str)
         or not _SHA256_RE.fullmatch(payload["a1_contract_sha256"])
-        or not isinstance(payload["parent_manifest_sha256"], str)
-        or not _SHA256_RE.fullmatch(payload["parent_manifest_sha256"])
         or not isinstance(payload["selection_rule"], str)
         or not payload["selection_rule"]
     ):
         raise SystemExit("dual-arm selected-game provenance is invalid")
+    parent_sha = payload["parent_manifest_sha256"]
+    is_full = subset_id in {"full-140k", "full-56k"}
+    if (is_full and parent_sha is not None) or (
+        not is_full
+        and (
+            not isinstance(parent_sha, str)
+            or not _SHA256_RE.fullmatch(parent_sha)
+        )
+    ):
+        raise SystemExit("dual-arm selected-game parent provenance is invalid")
     counts = payload["category_game_counts"]
     expected_counts = DUAL_ARM_SUBSET_CATEGORY_COUNTS.get((arm_id, subset_id))
     if (
@@ -548,8 +557,8 @@ def _load_a1_post_wave_audit(
     if not isinstance(payload, dict):
         raise SystemExit("A1 post-wave audit must be a JSON object")
     audit_schema = payload.get("schema_version")
-    is_dual = audit_schema == DUAL_ARM_AUDIT_SCHEMA
-    if audit_schema not in {"a1-post-wave-audit-v2", "a1-post-wave-audit-v3", DUAL_ARM_AUDIT_SCHEMA}:
+    is_dual = audit_schema in {DUAL_ARM_AUDIT_SCHEMA, DUAL_ARM_DERIVED_AUDIT_SCHEMA}
+    if audit_schema not in {"a1-post-wave-audit-v2", "a1-post-wave-audit-v3", DUAL_ARM_AUDIT_SCHEMA, DUAL_ARM_DERIVED_AUDIT_SCHEMA}:
         raise SystemExit(
             "A1 post-wave audit schema must be 'a1-post-wave-audit-v2' or "
             "'a1-post-wave-audit-v3'"
@@ -557,6 +566,7 @@ def _load_a1_post_wave_audit(
     if is_dual and (
         selected_manifest.get("arm_id") not in {"n128", "n256"}
         or payload.get("arm_id") != selected_manifest.get("arm_id")
+        or payload.get("subset_id") != selected_manifest.get("subset_id")
         or payload.get("category_game_counts") != selected_manifest.get("category_game_counts")
     ):
         raise SystemExit("dual-arm audit/selection arm or quota mismatch")
@@ -578,13 +588,74 @@ def _load_a1_post_wave_audit(
             f"audit={contract_sha!r}, manifest={selected_manifest['a1_contract_sha256']!r}"
         )
 
+    if audit_schema == DUAL_ARM_DERIVED_AUDIT_SCHEMA:
+        parent_binding = payload.get("parent_audit")
+        expected_parent_fields = {
+            "path",
+            "file_sha256",
+            "audit_sha256",
+            "selected_manifest_file_sha256",
+            "shard_inventory_sha256",
+        }
+        if not isinstance(parent_binding, dict) or set(parent_binding) != expected_parent_fields:
+            raise SystemExit("derived dual-arm audit has an invalid parent binding")
+        try:
+            parent_path = Path(str(parent_binding["path"])).expanduser().resolve(
+                strict=True
+            )
+            parent_payload = json.loads(parent_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as error:
+            raise SystemExit(f"cannot load parent dual-arm audit: {error}") from error
+        parent_semantic_sha = _value_sha256(
+            {
+                key: value
+                for key, value in parent_payload.items()
+                if key != "audit_sha256"
+            }
+        )
+        if (
+            parent_payload.get("schema_version") != DUAL_ARM_AUDIT_SCHEMA
+            or parent_payload.get("passed") is not True
+            or parent_payload.get("errors") != []
+            or _file_sha256(parent_path) != parent_binding["file_sha256"]
+            or parent_payload.get("audit_sha256") != parent_semantic_sha
+            or parent_semantic_sha != parent_binding["audit_sha256"]
+            or parent_payload.get("arm_id") != selected_manifest["arm_id"]
+            or parent_payload.get("contract_sha256") != contract_sha
+            or parent_payload.get("shard_inventory_sha256")
+            != parent_binding["shard_inventory_sha256"]
+            or payload.get("shard_inventory_sha256")
+            != parent_binding["shard_inventory_sha256"]
+            or selected_manifest.get("file_sha256") is None
+            or selected_manifest.get("path") is None
+        ):
+            raise SystemExit("derived dual-arm parent audit binding/digest mismatch")
+        parent_selected = parent_payload.get("selected_training_games")
+        if (
+            not isinstance(parent_selected, dict)
+            or parent_selected.get("manifest_file_sha256")
+            != parent_binding["selected_manifest_file_sha256"]
+            or selected_manifest.get("arm_id") != "n128"
+            or selected_manifest.get("subset_id")
+            not in {"matched-56k", "compute-112k"}
+        ):
+            raise SystemExit("derived dual-arm audit is not authorized by its full selection")
+        selected_payload = json.loads(
+            Path(selected_manifest["path"]).read_text(encoding="utf-8")
+        )
+        if (
+            selected_payload.get("parent_manifest_sha256")
+            != parent_binding["selected_manifest_file_sha256"]
+        ):
+            raise SystemExit("derived selected manifest does not bind its full parent")
+
     shards = payload.get("shards")
     if not isinstance(shards, list):
         raise SystemExit("A1 post-wave audit shards must be a list")
     if payload.get("shard_inventory_sha256") != _value_sha256(shards):
         raise SystemExit("A1 post-wave audit shard_inventory_sha256 mismatch")
     harvest_provenance: dict[str, Any] | None = None
-    if audit_schema in {"a1-post-wave-audit-v3", DUAL_ARM_AUDIT_SCHEMA}:
+    if audit_schema in {"a1-post-wave-audit-v3", DUAL_ARM_AUDIT_SCHEMA, DUAL_ARM_DERIVED_AUDIT_SCHEMA}:
         binding = payload.get("harvest_relocation")
         expected_binding_keys = {
             "path",
@@ -1615,6 +1686,14 @@ def build_memmap_corpus(
             "path": str(selected_manifest["path"]),
             "file_sha256": selected_manifest["file_sha256"],
             "a1_contract_sha256": selected_manifest["a1_contract_sha256"],
+            **(
+                {}
+                if "arm_id" not in selected_manifest
+                else {
+                    "arm_id": selected_manifest["arm_id"],
+                    "subset_id": selected_manifest["subset_id"],
+                }
+            ),
             "selected_game_count": selected_manifest["selected_game_count"],
             "selected_game_seed_set_sha256": selected_manifest[
                 "selected_game_seed_set_sha256"

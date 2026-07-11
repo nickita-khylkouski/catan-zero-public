@@ -8,7 +8,7 @@ import hashlib
 import json
 import os
 import sys
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -35,13 +35,56 @@ def _rank(record: dict[str, Any], subset_id: str) -> bytes:
     ).digest()
 
 
-def build_subsets(source: Path, out_dir: Path) -> dict[str, Path]:
+def _write_immutable(path: Path, value: dict[str, Any]) -> None:
+    data = json.dumps(value, indent=2, sort_keys=True).encode() + b"\n"
+    descriptor = os.open(
+        path,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+        0o444,
+    )
+    with os.fdopen(descriptor, "wb") as handle:
+        handle.write(data)
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def _rows_by_seed(
+    data_shards: list[dict[str, Any]], selected: set[int]
+) -> Counter[int]:
+    import numpy as np
+
+    selected_array = np.asarray(sorted(selected), dtype=np.int64)
+    counts: Counter[int] = Counter()
+    for shard in data_shards:
+        with np.load(Path(str(shard["path"])), allow_pickle=False) as payload:
+            seeds = np.asarray(payload["game_seed"], dtype=np.int64)
+            counts.update(map(int, seeds[np.isin(seeds, selected_array)].tolist()))
+    missing = selected - set(counts)
+    if missing:
+        raise SystemExit(f"full dual-arm audit is missing {len(missing)} selected games")
+    return counts
+
+
+def build_subsets(
+    source: Path, parent_audit: Path, out_dir: Path
+) -> dict[str, Path]:
     source = source.expanduser().resolve(strict=True)
     payload = json.loads(source.read_text(encoding="utf-8"))
     validated = corpus._load_a1_selected_game_manifest(source)  # noqa: SLF001
     if validated.get("arm_id") != "n128" or validated.get("subset_id") != "full-140k":
         raise SystemExit("subset source must be the full n128 140k manifest")
+    parent_audit = parent_audit.expanduser().resolve(strict=True)
+    parent_validated = corpus._load_a1_post_wave_audit(  # noqa: SLF001
+        parent_audit, validated
+    )
+    parent_payload = json.loads(parent_audit.read_text(encoding="utf-8"))
+    if parent_payload.get("schema_version") != corpus.DUAL_ARM_AUDIT_SCHEMA:
+        raise SystemExit("subset parent must be a full dual-arm post-wave audit")
     records = list(payload["records"])
+    rows_by_seed = _rows_by_seed(
+        list(parent_validated["data_shards"]),
+        {int(record["game_seed"]) for record in records},
+    )
     workers = sorted({str(record["worker_id"]) for record in records})
     if len(workers) != 28:
         raise SystemExit("full n128 manifest must contain exactly 28 workers")
@@ -64,7 +107,7 @@ def build_subsets(source: Path, out_dir: Path) -> dict[str, Path]:
         if not training or not validation:
             raise SystemExit(f"{subset_id} has an empty train or validation split")
         category_counts = {name: count * len(workers) for name, count in targets.items()}
-        value = {
+        value: dict[str, Any] = {
             "schema_version": SCHEMA,
             "arm_id": "n128",
             "subset_id": subset_id,
@@ -82,12 +125,79 @@ def build_subsets(source: Path, out_dir: Path) -> dict[str, Path]:
             "parent_manifest_sha256": corpus._file_sha256(source),  # noqa: SLF001
         }
         path = out_dir / f"n128-{subset_id}.json"
-        data = json.dumps(value, indent=2, sort_keys=True).encode() + b"\n"
-        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o444)
-        with os.fdopen(descriptor, "wb") as handle:
-            handle.write(data)
-            handle.flush()
-            os.fsync(handle.fileno())
+        _write_immutable(path, value)
+
+        selected_set = {int(row["game_seed"]) for row in selected}
+        validation_set = {int(seed) for seed in validation}
+        selected_rows = sum(rows_by_seed[seed] for seed in selected_set)
+        validation_rows = sum(rows_by_seed[seed] for seed in validation_set)
+        if validation_rows <= 0 or validation_rows >= selected_rows:
+            raise SystemExit(
+                "derived subset has invalid selected/validation row exposure"
+            )
+        validation_path = out_dir / f"n128-{subset_id}.validation_seeds.json"
+        validation_value = {
+            "schema_version": "train-validation-game-seeds-v1",
+            "a1_contract_sha256": validated["a1_contract_sha256"],
+            "validation_fraction": 0.05,
+            "validation_seed": 17,
+            "validation_max_samples": 0,
+            "validation_game_seed_ranges": [],
+            "validation_game_seed_count": len(validation),
+            "validation_row_count": validation_rows,
+            "validation_game_seed_set_sha256": corpus._game_seed_set_sha256(validation),  # noqa: SLF001
+            "game_seeds": sorted(validation),
+        }
+        _write_immutable(validation_path, validation_value)
+
+        audit_path = out_dir / f"n128-{subset_id}.audit.json"
+        selected_binding = {
+            "manifest": str(path.resolve()),
+            "manifest_sha256": corpus._value_sha256(value),  # noqa: SLF001
+            "manifest_file_sha256": corpus._file_sha256(path),  # noqa: SLF001
+            "selected_game_count": len(selected),
+            "selected_game_seed_set_sha256": value["selected_game_seed_set_sha256"],
+            "records_sha256": value["records_sha256"],
+        }
+        validation_binding = {
+            "manifest": str(validation_path.resolve()),
+            "manifest_sha256": corpus._value_sha256(validation_value),  # noqa: SLF001
+            "manifest_file_sha256": corpus._file_sha256(validation_path),  # noqa: SLF001
+            "validation_game_seed_count": len(validation),
+            "validation_game_seed_set_sha256": validation_value[
+                "validation_game_seed_set_sha256"
+            ],
+        }
+        audit_value = {
+            "schema_version": corpus.DUAL_ARM_DERIVED_AUDIT_SCHEMA,
+            "arm_id": "n128",
+            "subset_id": subset_id,
+            "contract_path": parent_payload["contract_path"],
+            "contract_sha256": parent_payload["contract_sha256"],
+            "passed": True,
+            "errors": [],
+            "category_game_counts": category_counts,
+            "total_unique_games": len(selected),
+            "selection_rule": RULE,
+            "rows": selected_rows,
+            "shards": parent_payload["shards"],
+            "shard_inventory_sha256": parent_payload["shard_inventory_sha256"],
+            "source_provenance": parent_payload["source_provenance"],
+            "harvest_relocation": parent_payload["harvest_relocation"],
+            "selected_training_games": selected_binding,
+            "validation_holdout": validation_binding,
+            "parent_audit": {
+                "path": str(parent_audit),
+                "file_sha256": corpus._file_sha256(parent_audit),  # noqa: SLF001
+                "audit_sha256": parent_payload["audit_sha256"],
+                "selected_manifest_file_sha256": corpus._file_sha256(source),  # noqa: SLF001
+                "shard_inventory_sha256": parent_payload[
+                    "shard_inventory_sha256"
+                ],
+            },
+        }
+        audit_value["audit_sha256"] = corpus._value_sha256(audit_value)  # noqa: SLF001
+        _write_immutable(audit_path, audit_value)
         outputs[subset_id] = path
     return outputs
 
@@ -95,9 +205,12 @@ def build_subsets(source: Path, out_dir: Path) -> dict[str, Path]:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--n128-full-manifest", type=Path, required=True)
+    parser.add_argument("--n128-full-audit", type=Path, required=True)
     parser.add_argument("--out-dir", type=Path, required=True)
     args = parser.parse_args(argv)
-    outputs = build_subsets(args.n128_full_manifest, args.out_dir)
+    outputs = build_subsets(
+        args.n128_full_manifest, args.n128_full_audit, args.out_dir
+    )
     print(json.dumps({key: str(value) for key, value in outputs.items()}, sort_keys=True))
     return 0
 

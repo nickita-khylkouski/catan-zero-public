@@ -102,6 +102,40 @@ A1_REQUIRED_RUNTIME_CODE_SUFFIXES = (
     }
 )
 
+DUAL_ARM_SELECTED_GAMES_SCHEMA = "a1-dual-arm-selected-training-games-v1"
+DUAL_ARM_AUDIT_SCHEMAS = {
+    "a1-dual-arm-post-wave-audit-v1",
+    "a1-dual-arm-derived-post-wave-audit-v1",
+}
+DUAL_ARM_SUBSET_COUNTS = {
+    ("n256", "full-56k"): 56_000,
+    ("n128", "matched-56k"): 56_000,
+    ("n128", "compute-112k"): 112_000,
+    ("n128", "full-140k"): 140_000,
+}
+DUAL_ARM_SUBSET_CATEGORY_COUNTS = {
+    ("n256", "full-56k"): {
+        "current_producer": 44_800,
+        "recent_history": 8_400,
+        "hard_negative": 2_800,
+    },
+    ("n128", "matched-56k"): {
+        "current_producer": 44_800,
+        "recent_history": 8_400,
+        "hard_negative": 2_800,
+    },
+    ("n128", "compute-112k"): {
+        "current_producer": 89_600,
+        "recent_history": 16_800,
+        "hard_negative": 5_600,
+    },
+    ("n128", "full-140k"): {
+        "current_producer": 112_000,
+        "recent_history": 21_000,
+        "hard_negative": 7_000,
+    },
+}
+
 
 ENTITY_BATCH_KEYS = (
     "hex_tokens",
@@ -1780,8 +1814,18 @@ def _validate_a1_validation_manifest_corpus_binding(
             "trainer validation sidecar differs from the exact file bound by the "
             "A1 post-wave audit"
         )
-    if selected_meta.get("selected_game_count") != 12_000:
-        raise SystemExit("A1 memmap corpus does not contain the exact 12,000-game selection")
+    dual_identity = (selected_meta.get("arm_id"), selected_meta.get("subset_id"))
+    expected_selected_count = DUAL_ARM_SUBSET_COUNTS.get(dual_identity)
+    if expected_selected_count is None:
+        expected_selected_count = 12_000
+        if any(value is not None for value in dual_identity):
+            raise SystemExit("A1 memmap corpus has an invalid dual-arm identity")
+    if selected_meta.get("selected_game_count") != expected_selected_count:
+        raise SystemExit(
+            "A1 memmap corpus selected-game count differs from its exact "
+            f"contract ({selected_meta.get('selected_game_count')!r} != "
+            f"{expected_selected_count})"
+        )
     expected_validation_count = int(
         np.asarray(validation_seed_contract["game_seeds"], dtype=np.int64).size
     )
@@ -1822,6 +1866,281 @@ def _read_sha256_bound_json(
     return path, payload, actual_file_sha256
 
 
+def _validate_dual_arm_corpus_artifacts_and_seeds(
+    corpus_meta: dict[str, object],
+    validation_seed_contract: dict[str, object],
+    game_seed_column: np.ndarray,
+) -> dict[str, object]:
+    """Replay the dual-arm selection/audit chain before optimizer creation.
+
+    This is deliberately separate from the historical 12k validator below:
+    accepting a typed dual-arm corpus must not relax one byte of the frozen
+    A1 path.
+    """
+
+    selected_meta = corpus_meta["selected_game_seed_manifest"]
+    audit_meta = corpus_meta["a1_post_wave_audit"]
+    assert isinstance(selected_meta, dict) and isinstance(audit_meta, dict)
+    identity = (selected_meta.get("arm_id"), selected_meta.get("subset_id"))
+    expected_count = DUAL_ARM_SUBSET_COUNTS.get(identity)
+    if expected_count is None:
+        raise SystemExit("dual-arm corpus has an unauthorized arm/subset identity")
+
+    selected_path, selected_payload, _ = _read_sha256_bound_json(
+        selected_meta.get("path"),
+        selected_meta.get("file_sha256"),
+        label="dual-arm selected-game manifest",
+    )
+    if selected_payload.get("schema_version") != DUAL_ARM_SELECTED_GAMES_SCHEMA:
+        raise SystemExit("dual-arm selected-game manifest schema drift")
+    expected_selected_fields = {
+        "schema_version",
+        "arm_id",
+        "subset_id",
+        "a1_contract_sha256",
+        "selection_rule",
+        "selected_game_count",
+        "selected_game_seed_set_sha256",
+        "category_game_counts",
+        "training_game_count",
+        "training_game_seed_set_sha256",
+        "validation_game_count",
+        "validation_game_seed_set_sha256",
+        "records_sha256",
+        "records",
+        "parent_manifest_sha256",
+    }
+    if set(selected_payload) != expected_selected_fields:
+        raise SystemExit("dual-arm selected-game manifest fields drift")
+    if (selected_payload.get("arm_id"), selected_payload.get("subset_id")) != identity:
+        raise SystemExit("dual-arm selected-game manifest identity drift")
+    expected_categories = DUAL_ARM_SUBSET_CATEGORY_COUNTS.get(identity)
+    if selected_payload.get("category_game_counts") != expected_categories:
+        raise SystemExit("dual-arm selected-game category quotas drift")
+    parent_manifest_sha = selected_payload.get("parent_manifest_sha256")
+    is_full = identity[1] in {"full-56k", "full-140k"}
+    if (is_full and parent_manifest_sha is not None) or (
+        not is_full and not _is_sha256(parent_manifest_sha)
+    ):
+        raise SystemExit("dual-arm selected-game parent provenance drift")
+    records = selected_payload.get("records")
+    if not isinstance(records, list) or len(records) != expected_count:
+        raise SystemExit(
+            f"dual-arm selected-game manifest must contain exactly {expected_count} records"
+        )
+    if selected_payload.get("records_sha256") != _canonical_json_sha256(records):
+        raise SystemExit("dual-arm selected-game records_sha256 mismatch")
+
+    all_seeds: list[int] = []
+    train_seeds: list[int] = []
+    validation_seeds: list[int] = []
+    producer_shas: set[str] = set()
+    category_counts = {category: 0 for category in expected_categories or {}}
+    previous: tuple[int, str] | None = None
+    for index, record in enumerate(records):
+        if not isinstance(record, dict) or record.get("arm_id") != identity[0]:
+            raise SystemExit(f"dual-arm selected-game record {index} identity drift")
+        seed, job_id, split = (
+            record.get("game_seed"),
+            record.get("job_id"),
+            record.get("split"),
+        )
+        if (
+            isinstance(seed, bool)
+            or not isinstance(seed, int)
+            or not isinstance(job_id, str)
+            or not job_id
+            or split not in {"train", "validation"}
+        ):
+            raise SystemExit(f"dual-arm selected-game record {index} is malformed")
+        key = (int(seed), job_id)
+        if previous is not None and key <= previous:
+            raise SystemExit("dual-arm selected-game records are not strictly sorted")
+        previous = key
+        producer_sha = record.get("producer_checkpoint_sha256")
+        if not _is_sha256(producer_sha):
+            raise SystemExit(f"dual-arm selected-game record {index} producer drift")
+        producer_shas.add(str(producer_sha))
+        category = record.get("category")
+        if category not in category_counts:
+            raise SystemExit(f"dual-arm selected-game record {index} category drift")
+        category_counts[str(category)] += 1
+        all_seeds.append(int(seed))
+        (train_seeds if split == "train" else validation_seeds).append(int(seed))
+    if len(set(all_seeds)) != len(all_seeds) or len(producer_shas) != 1:
+        raise SystemExit("dual-arm selected-game seed or producer identity drift")
+    if category_counts != expected_categories:
+        raise SystemExit("dual-arm selected-game record category quotas drift")
+
+    digest_fields = {
+        "selected_game_count": len(all_seeds),
+        "selected_game_seed_set_sha256": _game_seed_set_sha256(
+            np.asarray(all_seeds, dtype=np.int64)
+        ),
+        "training_game_count": len(train_seeds),
+        "training_game_seed_set_sha256": _game_seed_set_sha256(
+            np.asarray(train_seeds, dtype=np.int64)
+        ),
+        "validation_game_count": len(validation_seeds),
+        "validation_game_seed_set_sha256": _game_seed_set_sha256(
+            np.asarray(validation_seeds, dtype=np.int64)
+        ),
+        "records_sha256": _canonical_json_sha256(records),
+    }
+    for field, actual in digest_fields.items():
+        if selected_payload.get(field) != actual or selected_meta.get(field) != actual:
+            raise SystemExit(f"dual-arm selected-game {field} drift")
+    if not np.array_equal(
+        np.asarray(validation_seeds, dtype=np.int64),
+        np.asarray(validation_seed_contract["game_seeds"], dtype=np.int64),
+    ):
+        raise SystemExit("dual-arm selected validation split differs from holdout")
+
+    observed = np.asarray(game_seed_column, dtype=np.int64).reshape(-1)
+    if observed.size == 0 or not np.array_equal(
+        np.sort(np.unique(observed)), np.asarray(all_seeds, dtype=np.int64)
+    ):
+        raise SystemExit("dual-arm memmap game-seed set differs from its selection")
+    run_starts = np.concatenate(
+        (np.asarray([0]), np.flatnonzero(observed[1:] != observed[:-1]) + 1)
+    )
+    if np.unique(observed[run_starts]).size != run_starts.size:
+        raise SystemExit("dual-arm memmap repeats a non-contiguous game seed run")
+
+    audit_path, audit_payload, _ = _read_sha256_bound_json(
+        audit_meta.get("path"), audit_meta.get("file_sha256"), label="dual-arm audit"
+    )
+    audit_schema = audit_payload.get("schema_version")
+    if (
+        audit_schema not in DUAL_ARM_AUDIT_SCHEMAS
+        or audit_payload.get("passed") is not True
+        or audit_payload.get("errors") != []
+        or (audit_payload.get("arm_id"), audit_payload.get("subset_id")) != identity
+    ):
+        raise SystemExit("dual-arm audit is not a clean matching authorization")
+    actual_audit_sha = _canonical_json_sha256(
+        {key: value for key, value in audit_payload.items() if key != "audit_sha256"}
+    )
+    if (
+        audit_payload.get("audit_sha256") != actual_audit_sha
+        or audit_meta.get("audit_sha256") != actual_audit_sha
+    ):
+        raise SystemExit("dual-arm audit semantic digest drift")
+    if audit_schema == "a1-dual-arm-derived-post-wave-audit-v1":
+        parent_binding = audit_payload.get("parent_audit")
+        if not isinstance(parent_binding, dict) or set(parent_binding) != {
+            "path",
+            "file_sha256",
+            "audit_sha256",
+            "selected_manifest_file_sha256",
+            "shard_inventory_sha256",
+        }:
+            raise SystemExit("derived dual-arm audit parent binding drift")
+        parent_path, parent_payload, _ = _read_sha256_bound_json(
+            parent_binding.get("path"),
+            parent_binding.get("file_sha256"),
+            label="parent dual-arm audit",
+        )
+        parent_audit_sha = _canonical_json_sha256(
+            {key: value for key, value in parent_payload.items() if key != "audit_sha256"}
+        )
+        parent_selected = parent_payload.get("selected_training_games")
+        if (
+            parent_payload.get("schema_version") != "a1-dual-arm-post-wave-audit-v1"
+            or parent_payload.get("passed") is not True
+            or parent_payload.get("errors") != []
+            or parent_payload.get("audit_sha256") != parent_audit_sha
+            or parent_binding.get("audit_sha256") != parent_audit_sha
+            or parent_payload.get("arm_id") != identity[0]
+            or parent_payload.get("contract_sha256")
+            != audit_payload.get("contract_sha256")
+            or parent_payload.get("shard_inventory_sha256")
+            != parent_binding.get("shard_inventory_sha256")
+            or audit_payload.get("shard_inventory_sha256")
+            != parent_binding.get("shard_inventory_sha256")
+            or not isinstance(parent_selected, dict)
+            or parent_selected.get("manifest_file_sha256")
+            != parent_binding.get("selected_manifest_file_sha256")
+            or parent_manifest_sha
+            != parent_binding.get("selected_manifest_file_sha256")
+            or not parent_path.is_file()
+        ):
+            raise SystemExit("derived dual-arm audit parent authorization drift")
+    contract_sha = validation_seed_contract["a1_contract_sha256"]
+    if (
+        audit_payload.get("contract_sha256") != contract_sha
+        or audit_meta.get("contract_sha256") != contract_sha
+        or selected_payload.get("a1_contract_sha256") != contract_sha
+    ):
+        raise SystemExit("dual-arm audit/selection/holdout contract mismatch")
+    validation_row_count = int(validation_seed_contract["validation_row_count"])
+    if (
+        audit_payload.get("rows") != int(observed.size)
+        or corpus_meta.get("row_count") != int(observed.size)
+        or audit_meta.get("selected_row_count") != int(observed.size)
+        or audit_meta.get("training_row_count")
+        != int(observed.size) - validation_row_count
+    ):
+        raise SystemExit("dual-arm memmap row exposure differs from its audit")
+    expected_selected_binding = {
+        "manifest": str(selected_path),
+        "manifest_sha256": _canonical_json_sha256(selected_payload),
+        "manifest_file_sha256": selected_meta["file_sha256"],
+        "selected_game_count": expected_count,
+        "selected_game_seed_set_sha256": digest_fields[
+            "selected_game_seed_set_sha256"
+        ],
+        "records_sha256": digest_fields["records_sha256"],
+    }
+    if audit_payload.get("selected_training_games") != expected_selected_binding:
+        raise SystemExit("dual-arm audit selected-game binding drift")
+    expected_validation_binding = {
+        "manifest": str(validation_seed_contract["path"]),
+        "manifest_sha256": validation_seed_contract["manifest_sha256"],
+        "manifest_file_sha256": validation_seed_contract["file_sha256"],
+        "validation_game_seed_count": len(validation_seeds),
+        "validation_game_seed_set_sha256": digest_fields[
+            "validation_game_seed_set_sha256"
+        ],
+    }
+    if audit_payload.get("validation_holdout") != expected_validation_binding:
+        raise SystemExit("dual-arm audit validation binding drift")
+
+    # The dual learner keeps the proven A1 objective/optimizer recipe while
+    # changing only topology: 8 ranks x 512 local = the same global batch 4096.
+    from tools.a1_pre_wave_contract import EXPECTED_LEARNER_TRAINING_RECIPE
+
+    recipe = dict(EXPECTED_LEARNER_TRAINING_RECIPE)
+    recipe.update({"batch_size": 512, "world_size": 8, "global_batch_size": 4096})
+    repo = Path(__file__).resolve().parents[1]
+    learner_snapshot = [
+        {"path": suffix, "sha256": _sha256_existing_file(repo / suffix)}
+        for suffix in sorted(A1_REQUIRED_LEARNER_CODE_SUFFIXES)
+    ]
+    runtime_snapshot = [
+        {"path": suffix, "sha256": _sha256_existing_file(repo / suffix)}
+        for suffix in sorted(A1_REQUIRED_RUNTIME_CODE_SUFFIXES)
+    ]
+    return {
+        "dual_arm": True,
+        "arm_id": identity[0],
+        "subset_id": identity[1],
+        "learner_value_objective": {"objective": "mse", "value_readout": "scalar"},
+        "learner_training_recipe": recipe,
+        "learner_training_recipe_sha256": _canonical_json_sha256(recipe),
+        "learner_code_sha256": _canonical_json_sha256(learner_snapshot),
+        "runtime_code_tree_sha256": _canonical_json_sha256(runtime_snapshot),
+        "producer_checkpoint_sha256": next(iter(producer_shas)),
+        "selected_game_seed_set_sha256": digest_fields[
+            "selected_game_seed_set_sha256"
+        ],
+        "training_game_seed_set_sha256": digest_fields[
+            "training_game_seed_set_sha256"
+        ],
+        "audit_file_sha256": _sha256_existing_file(audit_path),
+    }
+
+
 def _validate_a1_corpus_artifacts_and_seeds(
     corpus_meta: dict[str, object],
     validation_seed_contract: dict[str, object],
@@ -1833,6 +2152,11 @@ def _validate_a1_corpus_artifacts_and_seeds(
     audit_meta = corpus_meta["a1_post_wave_audit"]
     assert isinstance(selected_meta, dict)
     assert isinstance(audit_meta, dict)
+
+    if selected_meta.get("arm_id") is not None:
+        return _validate_dual_arm_corpus_artifacts_and_seeds(
+            corpus_meta, validation_seed_contract, game_seed_column
+        )
 
     selected_path, selected_payload, _ = _read_sha256_bound_json(
         selected_meta.get("path"),
