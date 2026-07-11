@@ -29,7 +29,7 @@ import stat
 import sys
 import uuid
 from collections import Counter
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import Any, Iterable, Mapping, Sequence
 
 import numpy as np
@@ -82,6 +82,8 @@ SEALED_RUNTIME_ENVIRONMENT = {
     "TZ": "UTC",
 }
 AUDIT_SCHEMA = "a1-post-wave-audit-v2"
+RELOCATED_AUDIT_SCHEMA = "a1-post-wave-audit-v3"
+HARVEST_RELOCATION_SCHEMA = "a1-fleet-harvest-relocation-v1"
 GUARD_SYNC_SCHEMA = "a1-pre-wave-generation-guard-sync-v1"
 CLAIM_RECEIPT_SCHEMA = "a1-seed-claim-transaction-v1"
 GUARD_SYNC_KEY = "a1_pre_wave_guard_sync"
@@ -492,7 +494,13 @@ def _file_record(
 
 
 def _promotion_handoff_record(
-    raw: Any, *, base: Path, producer: dict[str, Any]
+    raw: Any,
+    *,
+    base: Path,
+    producer: dict[str, Any],
+    effective_search: dict[str, Any] | None = None,
+    evaluator: dict[str, Any] | None = None,
+    generation: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Normalize and replay the producer lineage selected for this wave."""
 
@@ -544,6 +552,42 @@ def _promotion_handoff_record(
     identity_checkpoint = payload.get("producer_identity", {}).get("checkpoint")
     if identity_checkpoint != bound_checkpoint:
         raise ContractError("post-promotion producer identity lineage drift")
+    if effective_search is None or evaluator is None or generation is None:
+        raise ContractError("post-promotion handoff requires complete generation science")
+    identity_search = payload.get("producer_identity", {}).get("search_config")
+    if not isinstance(identity_search, dict):
+        raise ContractError("post-promotion producer identity has no typed search config")
+    # Promotion evaluates the deployed candidate with exactly four operational
+    # overrides: every decision is full n128 (n_fast=n_full, p_full=1,
+    # force_full_every_decision=true) and play temperature is zero.  Evaluator
+    # fields and max_decisions are projected into the typed identity; every
+    # other search semantic is inherited exactly.  In particular c_scale is
+    # the deployed agent's identity and is *not* an allowed generation drift.
+    try:
+        from tools import a1_promotion_transaction as promotion
+
+        sealed = promotion._sealed_evaluation_semantics(  # noqa: SLF001
+            {
+                "science": {
+                    "effective_search_config": effective_search,
+                    "evaluator": evaluator,
+                },
+                "generation": generation,
+            }
+        )
+        expected_identity_search = promotion._role_search_config(  # noqa: SLF001
+            sealed, role="candidate"
+        )
+    except promotion.PromotionError as error:
+        raise ContractError(f"cannot project promoted producer identity: {error}") from error
+    if identity_search != expected_identity_search:
+        raise ContractError(
+            "promoted deployed search identity differs from v3 generation science"
+        )
+    if effective_search.get("c_scale") != identity_search.get("c_scale"):
+        raise ContractError(
+            "generation c_scale differs from promoted deployed producer identity"
+        )
     record = _file_record(path, kind="post_promotion_handoff")
     record.update(
         {
@@ -557,6 +601,8 @@ def _promotion_handoff_record(
             "producer_identity_sha256": payload["producer_identity"][
                 "agent_identity_sha256"
             ],
+            "producer_search_config": dict(identity_search),
+            "producer_search_config_sha256": _digest_value(identity_search),
         }
     )
     return record
@@ -2604,7 +2650,12 @@ def build_lock(
         record for record in checkpoint_records if record["role"] == "producer"
     )
     handoff_record = _promotion_handoff_record(
-        draft["promotion_handoff"], base=base, producer=producer_record
+        draft["promotion_handoff"],
+        base=base,
+        producer=producer_record,
+        effective_search=effective_search,
+        evaluator=evaluator,
+        generation=generation,
     )
     for stage in ("s1", "s2", "s3"):
         stage_checkpoint = evidence_by_kind[stage]["semantic_decision"]["checkpoint"]
@@ -2811,6 +2862,13 @@ def verify_lock(
         raise ContractError("lock promotion handoff mode is invalid")
     elif lock_schema != LEGACY_LOCK_SCHEMA:
         raise ContractError("historical handoff mode is accepted only in legacy v2 locks")
+    else:
+        _require_exact_keys(
+            handoff_record, {"mode", "reason"}, where="historical promotion_handoff"
+        )
+        reason = handoff_record.get("reason")
+        if not isinstance(reason, str) or not reason.strip():
+            raise ContractError("historical promotion_handoff reason must be non-empty")
     _verify_artifact_records(lock["science"]["evidence"])
     for evidence in lock["science"]["evidence"]:
         _verify_artifact_records(evidence["semantic_decision"]["source_artifacts"])
@@ -3486,12 +3544,166 @@ def render(lock_path: Path, out_dir: Path) -> dict[str, Any]:
     return payload
 
 
-def _resolve_shard(manifest: Path, raw: str) -> Path:
+@dataclasses.dataclass(frozen=True)
+class _HarvestRelocation:
+    path: Path
+    payload: dict[str, Any]
+    by_source: dict[str, Path]
+    output_roots: tuple[PurePath, ...]
+
+    def resolve(self, raw: str | Path, *, owner_source: str | Path | None = None) -> Path:
+        source = PurePath(str(raw))
+        if not source.is_absolute():
+            if owner_source is None:
+                raise ContractError(f"relative relocated path has no owner: {raw}")
+            source = PurePath(str(owner_source)).parent / source
+        if ".." in source.parts:
+            raise ContractError(f"relocated path contains traversal: {raw}")
+        key = str(source)
+        relocated = self.by_source.get(key)
+        if relocated is not None:
+            return relocated
+        if any(source == root or root in source.parents for root in self.output_roots):
+            raise ContractError(f"harvest relocation is missing sealed output {key}")
+        original = Path(key)
+        if not original.is_file():
+            raise ContractError(f"unrelocated external artifact is missing: {key}")
+        return original.absolute()
+
+
+def _load_harvest_relocation(
+    path: Path, *, lock: dict[str, Any], lock_path: Path | None = None
+) -> _HarvestRelocation:
+    try:
+        relocation_path = path.expanduser().resolve(strict=True)
+    except OSError as error:
+        raise ContractError(f"cannot resolve harvest relocation map {path}: {error}") from error
+    payload = _load_json(relocation_path)
+    unhashed = dict(payload)
+    declared = unhashed.pop("relocation_sha256", None)
+    if payload.get("schema_version") != HARVEST_RELOCATION_SCHEMA:
+        raise ContractError("harvest relocation schema drift")
+    if declared != _digest_value(unhashed):
+        raise ContractError("harvest relocation semantic digest mismatch")
+    if payload.get("contract_sha256") != lock["contract_sha256"]:
+        raise ContractError("harvest relocation binds a different A1 contract")
+    if lock_path is not None and (
+        payload.get("contract_path") != str(lock_path)
+        or payload.get("contract_file_sha256") != _sha256(lock_path)
+    ):
+        raise ContractError("harvest relocation immutable lock-file identity drift")
+    jobs = list(lock["fleet"]["jobs"])
+    expected_identities = [
+        {
+            key: job[key]
+            for key in (
+                "job_id",
+                "worker_id",
+                "host_alias",
+                "gpu",
+                "category",
+                "output_dir",
+            )
+        }
+        for job in jobs
+    ]
+    if (
+        payload.get("job_count") != len(jobs)
+        or payload.get("host_count") != len({job["host_alias"] for job in jobs})
+        or payload.get("job_identities") != expected_identities
+        or payload.get("job_identities_sha256") != _digest_value(expected_identities)
+    ):
+        raise ContractError("harvest relocation job/host identity drift")
+    files = payload.get("files")
+    if not isinstance(files, list) or not files:
+        raise ContractError("harvest relocation has no file inventory")
+    if payload.get("file_inventory_sha256") != _digest_value(files):
+        raise ContractError("harvest relocation file inventory digest mismatch")
+    root = relocation_path.parent
+    by_source: dict[str, Path] = {}
+    seen_local: set[Path] = set()
+    expected_fields = {
+        "source_path",
+        "relative_path",
+        "size_bytes",
+        "sha256",
+        "job_id",
+        "host_alias",
+    }
+    jobs_by_id = {str(job["job_id"]): job for job in jobs}
+    for index, record in enumerate(files):
+        if not isinstance(record, dict) or set(record) != expected_fields:
+            raise ContractError(f"harvest relocation file record {index} fields drift")
+        source = PurePath(str(record["source_path"]))
+        relative = PurePath(str(record["relative_path"]))
+        job = jobs_by_id.get(str(record["job_id"]))
+        if (
+            job is None
+            or record["host_alias"] != job["host_alias"]
+            or not source.is_absolute()
+            or ".." in source.parts
+            or not relative.parts
+            or relative.is_absolute()
+            or ".." in relative.parts
+            or relative.parts[:2] != ("jobs", str(job["job_id"]))
+            or not (
+                source == PurePath(str(job["output_dir"]))
+                or PurePath(str(job["output_dir"])) in source.parents
+            )
+        ):
+            raise ContractError(f"harvest relocation file record {index} path/identity drift")
+        local = root.joinpath(*relative.parts)
+        try:
+            canonical = local.resolve(strict=True)
+        except OSError as error:
+            raise ContractError(f"harvested file {index} is missing: {error}") from error
+        if canonical != local.absolute() or not canonical.is_file():
+            raise ContractError(f"harvested file {index} uses a symlink or is not regular")
+        if source.as_posix() in by_source or canonical in seen_local:
+            raise ContractError("harvest relocation repeats a source or local file")
+        if (
+            isinstance(record["size_bytes"], bool)
+            or int(record["size_bytes"]) != canonical.stat().st_size
+            or record["sha256"] != _sha256(canonical)
+        ):
+            raise ContractError(f"harvested file {index} byte digest/size mismatch")
+        by_source[source.as_posix()] = canonical
+        seen_local.add(canonical)
+    local_items = list((root / "jobs").rglob("*"))
+    if any(item.is_symlink() for item in local_items):
+        raise ContractError("harvested jobs tree contains an unbound symlink")
+    if any(not item.is_dir() and not item.is_file() for item in local_items):
+        raise ContractError("harvested jobs tree contains an unbound special file")
+    actual_local = {
+        item.resolve(strict=True) for item in local_items if item.is_file()
+    }
+    if actual_local != seen_local:
+        raise ContractError("harvest relocation does not bijectively cover local job files")
+    return _HarvestRelocation(
+        path=relocation_path,
+        payload=payload,
+        by_source=by_source,
+        output_roots=tuple(PurePath(str(job["output_dir"])) for job in jobs),
+    )
+
+
+def _resolve_shard(
+    manifest: Path,
+    raw: str,
+    *,
+    relocation: _HarvestRelocation | None = None,
+    manifest_source: Path | None = None,
+) -> Path:
     path = Path(raw)
     # A frozen handoff may not guess by basename or process cwd.  Such fallback
     # made a stale absolute path silently bind unrelated bytes with the same
     # filename.  Relative shard paths have exactly one owner: the manifest.
-    resolved = path if path.is_absolute() else manifest.parent / path
+    if relocation is not None:
+        resolved = relocation.resolve(
+            raw, owner_source=manifest_source if manifest_source is not None else manifest
+        )
+    else:
+        resolved = path if path.is_absolute() else manifest.parent / path
     if not resolved.is_file():
         raise ContractError(f"manifest {manifest} points to missing shard {raw}")
     return resolved.absolute()
@@ -3731,13 +3943,25 @@ def _expected_selfplay_config(lock: dict[str, Any]) -> dict[str, Any]:
     return json.loads(json.dumps(effective))
 
 
-def audit_outputs(lock_path: Path, out_path: Path) -> dict[str, Any]:
+def audit_outputs(
+    lock_path: Path,
+    out_path: Path,
+    *,
+    harvest_relocation: Path | None = None,
+) -> dict[str, Any]:
     """Deep post-wave audit.  This is callable only after generation; it never launches it."""
     try:
         lock_path = lock_path.expanduser().resolve(strict=True)
     except OSError as error:
         raise ContractError(f"cannot resolve contract lock {lock_path}: {error}") from error
     lock = verify_lock(lock_path, require_all_job_claims=True)
+    relocation = (
+        None
+        if harvest_relocation is None
+        else _load_harvest_relocation(
+            harvest_relocation, lock=lock, lock_path=lock_path
+        )
+    )
     all_seeds: set[int] = set()
     category_seeds: dict[str, set[int]] = {name: set() for name in EXPECTED_GAMES}
     rows_by_seed: Counter[int] = Counter()
@@ -3763,7 +3987,12 @@ def audit_outputs(lock_path: Path, out_path: Path) -> dict[str, Any]:
     checkpoint_by_id = {record["id"]: record for record in lock["checkpoints"]}
     category_specs = {item["name"]: item for item in lock["source_categories"]}
     for job in lock["fleet"]["jobs"]:
-        attestation_path = Path(job["output_dir"]) / "a1_contract.json"
+        attestation_source = Path(job["output_dir"]) / "a1_contract.json"
+        attestation_path = (
+            attestation_source
+            if relocation is None
+            else relocation.resolve(attestation_source)
+        )
         expected_attestation = _job_attestation(lock, job)
         if not attestation_path.is_file():
             errors.append(f"missing contract attestation: {attestation_path}")
@@ -3783,7 +4012,12 @@ def audit_outputs(lock_path: Path, out_path: Path) -> dict[str, Any]:
                 )
             except ContractError as error:
                 errors.append(f"{job['job_id']}: {error}")
-        manifest_path = Path(job["output_dir"]) / "manifest.json"
+        manifest_source = Path(job["output_dir"]) / "manifest.json"
+        manifest_path = (
+            manifest_source
+            if relocation is None
+            else relocation.resolve(manifest_source)
+        )
         if not manifest_path.is_file():
             errors.append(f"missing manifest: {manifest_path}")
             continue
@@ -3852,7 +4086,12 @@ def audit_outputs(lock_path: Path, out_path: Path) -> dict[str, Any]:
             expected_config_provenance.pop("provenance_sha256")
             if actual_config_provenance != expected_config_provenance:
                 errors.append(f"{job['job_id']}: full typed GenerateConfig drift")
-        registry_path = Path(job["output_dir"]) / CONFIG_REGISTRY_FILENAME
+        registry_source = Path(job["output_dir"]) / CONFIG_REGISTRY_FILENAME
+        registry_path = (
+            registry_source
+            if relocation is None
+            else relocation.resolve(registry_source)
+        )
         try:
             registry_payload = _read_sealed_regular(
                 registry_path, where=str(job["job_id"])
@@ -3892,7 +4131,13 @@ def audit_outputs(lock_path: Path, out_path: Path) -> dict[str, Any]:
                 f"expected {expected_workers}"
             )
         for raw_worker_summary in worker_summaries:
-            worker_manifest_path = Path(raw_worker_summary)
+            worker_manifest_path = (
+                Path(raw_worker_summary)
+                if relocation is None
+                else relocation.resolve(
+                    str(raw_worker_summary), owner_source=manifest_source
+                )
+            )
             if not worker_manifest_path.is_file():
                 errors.append(
                     f"{job['job_id']}: missing worker manifest {worker_manifest_path}"
@@ -3933,7 +4178,12 @@ def audit_outputs(lock_path: Path, out_path: Path) -> dict[str, Any]:
             errors.append(f"{job['job_id']}: missing category-specific opponent mix")
         else:
             try:
-                mix_manifest = _load_json(Path(str(mix_manifest_raw)))
+                mix_manifest_path = (
+                    Path(str(mix_manifest_raw))
+                    if relocation is None
+                    else relocation.resolve(str(mix_manifest_raw))
+                )
+                mix_manifest = _load_json(mix_manifest_path)
                 attestation = dict(mix_manifest.get("_a1_contract", {}))
                 if attestation != {
                     "contract_sha256": lock["contract_sha256"],
@@ -3953,7 +4203,12 @@ def audit_outputs(lock_path: Path, out_path: Path) -> dict[str, Any]:
         closed_seed_runs: set[int] = set()
         for raw_shard in manifest.get("shards", []):
             try:
-                shard = _resolve_shard(manifest_path, str(raw_shard))
+                shard = _resolve_shard(
+                    manifest_path,
+                    str(raw_shard),
+                    relocation=relocation,
+                    manifest_source=manifest_source,
+                )
                 canonical_shard = shard.resolve(strict=True)
                 if canonical_shard in seen_shards:
                     raise ContractError(f"duplicate shard reference {canonical_shard}")
@@ -4279,7 +4534,9 @@ def audit_outputs(lock_path: Path, out_path: Path) -> dict[str, Any]:
             "records_sha256": _digest_value(selected_records),
         }
     report: dict[str, Any] = {
-        "schema_version": AUDIT_SCHEMA,
+        "schema_version": (
+            AUDIT_SCHEMA if relocation is None else RELOCATED_AUDIT_SCHEMA
+        ),
         "contract_path": str(lock_path.absolute()),
         "contract_sha256": lock["contract_sha256"],
         "passed": not errors,
@@ -4328,6 +4585,24 @@ def audit_outputs(lock_path: Path, out_path: Path) -> dict[str, Any]:
             }
             for category in EXPECTED_GAMES
         },
+        **(
+            {}
+            if relocation is None
+            else {
+                "harvest_relocation": {
+                    "path": str(relocation.path),
+                    "file_sha256": _sha256(relocation.path),
+                    "relocation_sha256": relocation.payload["relocation_sha256"],
+                    "render_sha256": relocation.payload["render_sha256"],
+                    "job_identities_sha256": relocation.payload[
+                        "job_identities_sha256"
+                    ],
+                    "file_inventory_sha256": relocation.payload[
+                        "file_inventory_sha256"
+                    ],
+                }
+            }
+        ),
         "selected_training_games": (
             {
                 "manifest": str(selected_game_manifest_path),
@@ -4422,6 +4697,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     audit_parser.add_argument("--lock", required=True)
     audit_parser.add_argument("--out", required=True)
+    audit_parser.add_argument(
+        "--harvest-relocation",
+        help=(
+            "typed a1-fleet-harvest-relocation-v1 map for atomically "
+            "consolidated fleet outputs"
+        ),
+    )
     args = parser.parse_args(argv)
     try:
         if args.command == "inspect-template":
@@ -4491,7 +4773,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
             )
             return 0
-        payload = audit_outputs(Path(args.lock).absolute(), Path(args.out).absolute())
+        payload = audit_outputs(
+            Path(args.lock).absolute(),
+            Path(args.out).absolute(),
+            harvest_relocation=(
+                None
+                if args.harvest_relocation is None
+                else Path(args.harvest_relocation).absolute()
+            ),
+        )
         print(json.dumps({"status": "PASS", "audit_sha256": payload["audit_sha256"]}))
         return 0
     except ContractError as error:

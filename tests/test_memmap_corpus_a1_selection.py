@@ -190,6 +190,66 @@ def _write_audit(
     return payload
 
 
+def _upgrade_audit_to_relocated_v3(audit_path: Path, shard: Path) -> dict:
+    """Bind a v2 fixture audit to the same local shard through a typed map."""
+
+    audit = json.loads(audit_path.read_text(encoding="utf-8"))
+    relative = shard.relative_to(audit_path.parent)
+    files = [
+        {
+            "source_path": "/sealed/a1/job-0/shard0.npz",
+            "relative_path": relative.as_posix(),
+            "size_bytes": shard.stat().st_size,
+            "sha256": _file_sha256(shard),
+            "job_id": "job-0",
+            "host_alias": "h0",
+        }
+    ]
+    identities = [
+        {
+            "job_id": "job-0",
+            "worker_id": "worker-0",
+            "host_alias": "h0",
+            "gpu": 0,
+            "category": "current_producer",
+            "output_dir": "/sealed/a1/job-0",
+        }
+    ]
+    relocation = {
+        "schema_version": "a1-fleet-harvest-relocation-v1",
+        "contract_path": "/sealed/lock.json",
+        "contract_file_sha256": "sha256:" + "7" * 64,
+        "contract_sha256": _CONTRACT_SHA,
+        "render_path": "/sealed/render.json",
+        "render_file_sha256": "sha256:" + "8" * 64,
+        "render_sha256": "sha256:" + "9" * 64,
+        "host_count": 1,
+        "job_count": 1,
+        "job_identities": identities,
+        "job_identities_sha256": _value_sha256(identities),
+        "files": files,
+        "file_inventory_sha256": _value_sha256(files),
+    }
+    relocation["relocation_sha256"] = _value_sha256(relocation)
+    relocation_path = audit_path.parent / "relocation_map.json"
+    relocation_path.write_text(
+        json.dumps(relocation, indent=2, sort_keys=True), encoding="utf-8"
+    )
+    audit["schema_version"] = "a1-post-wave-audit-v3"
+    audit["harvest_relocation"] = {
+        "path": str(relocation_path.resolve()),
+        "file_sha256": _file_sha256(relocation_path),
+        "relocation_sha256": relocation["relocation_sha256"],
+        "render_sha256": relocation["render_sha256"],
+        "job_identities_sha256": relocation["job_identities_sha256"],
+        "file_inventory_sha256": relocation["file_inventory_sha256"],
+    }
+    audit.pop("audit_sha256")
+    audit["audit_sha256"] = _value_sha256(audit)
+    audit_path.write_text(json.dumps(audit, indent=2, sort_keys=True), encoding="utf-8")
+    return relocation
+
+
 def _write_shard(
     path: Path,
     seeds: np.ndarray | list[int],
@@ -328,6 +388,64 @@ def test_selected_games_filter_preserves_game_split_across_shards(tmp_path: Path
     actual = _read_seed_memmap(tmp_path / "corpus", meta["row_count"])
     expected = {int(record["game_seed"]) for record in payload["records"]}
     assert set(map(int, actual.tolist())) == expected
+
+
+def test_relocated_v3_audit_is_consumed_without_losing_shard_identity(
+    tmp_path: Path,
+) -> None:
+    manifest_path = tmp_path / "selected.json"
+    manifest = _write_selected_manifest(manifest_path)
+    source = tmp_path / "jobs/job-0"
+    source.mkdir(parents=True)
+    shard = source / "shard0.npz"
+    _write_shard(shard, [record["game_seed"] for record in manifest["records"]])
+    audit_path = tmp_path / "audit.json"
+    audit = _write_audit(
+        audit_path, manifest_path=manifest_path, manifest=manifest, shards=[shard]
+    )
+    relocation = _upgrade_audit_to_relocated_v3(audit_path, shard)
+
+    meta = build_memmap_corpus(
+        source,
+        tmp_path / "corpus",
+        selected_game_seed_manifest=manifest_path,
+        a1_post_wave_audit=audit_path,
+        progress_every=0,
+    )
+
+    bound = meta["a1_post_wave_audit"]["harvest_relocation"]
+    assert bound["relocation_sha256"] == relocation["relocation_sha256"]
+    assert bound["file_inventory_sha256"] == relocation["file_inventory_sha256"]
+    assert meta["a1_post_wave_audit"]["shard_inventory_sha256"] == audit[
+        "shard_inventory_sha256"
+    ]
+
+
+def test_relocated_v3_audit_rejects_changed_map_bytes(tmp_path: Path) -> None:
+    manifest_path = tmp_path / "selected.json"
+    manifest = _write_selected_manifest(manifest_path)
+    source = tmp_path / "jobs/job-0"
+    source.mkdir(parents=True)
+    shard = source / "shard0.npz"
+    _write_shard(shard, [record["game_seed"] for record in manifest["records"]])
+    audit_path = tmp_path / "audit.json"
+    _write_audit(
+        audit_path, manifest_path=manifest_path, manifest=manifest, shards=[shard]
+    )
+    _upgrade_audit_to_relocated_v3(audit_path, shard)
+    relocation_path = tmp_path / "relocation_map.json"
+    relocation = json.loads(relocation_path.read_text(encoding="utf-8"))
+    relocation["render_path"] = "/tampered/render.json"
+    relocation_path.write_text(json.dumps(relocation), encoding="utf-8")
+
+    with pytest.raises(SystemExit, match="relocation binding/digest mismatch"):
+        build_memmap_corpus(
+            source,
+            tmp_path / "corpus",
+            selected_game_seed_manifest=manifest_path,
+            a1_post_wave_audit=audit_path,
+            progress_every=0,
+        )
 
 
 def test_selected_games_filter_excludes_unselected_complete_and_truncated_reserve(

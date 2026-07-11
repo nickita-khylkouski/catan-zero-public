@@ -120,3 +120,35 @@ Jobset schema:
   {"job_id":"eval-8gpu","gpus":8,"host":"h100-8b","argv":["bash","tools/run_eval.sh"]}
 ]}
 ```
+
+## A1 sealed-output harvest
+
+`a1_harvest_transaction.py` is the read-only collector for the exact A1
+pre-wave lock/render pair. It requires the sealed 120-job/8-host topology,
+opens one tar stream per host, rejects links/special files/traversal/duplicate
+members, hashes every output byte, and atomically publishes a canonical
+`jobs/<job_id>/...` tree plus a typed relocation map. A failed run leaves no
+published destination; rerunning the same command verifies and reuses only
+individually receipted staging jobs.
+
+```bash
+python tools/fleet/a1_harvest_transaction.py \
+  --lock artifacts/a1.lock.json \
+  --render artifacts/a1-render/commands.json \
+  --destination runs/a1-harvest
+
+python tools/a1_pre_wave_contract.py audit \
+  --lock artifacts/a1.lock.json \
+  --harvest-relocation runs/a1-harvest/relocation_map.json \
+  --out artifacts/a1-post-wave-audit.json
+
+python tools/build_memmap_corpus.py \
+  --source runs/a1-harvest/jobs \
+  --selected-game-seed-manifest artifacts/a1-post-wave-audit.selected_games.json \
+  --a1-post-wave-audit artifacts/a1-post-wave-audit.json \
+  --out runs/a1-memmap
+```
+
+Do not edit remote manifests to replace paths. The v1 relocation map and v3
+post-wave audit preserve the original absolute shard identity and exact hash;
+memmap ingestion rechecks both bindings and the shard bytes.

@@ -427,8 +427,12 @@ def _load_a1_post_wave_audit(
         raise SystemExit(f"cannot load A1 post-wave audit {path}: {error}") from error
     if not isinstance(payload, dict):
         raise SystemExit("A1 post-wave audit must be a JSON object")
-    if payload.get("schema_version") != "a1-post-wave-audit-v2":
-        raise SystemExit("A1 post-wave audit schema must be 'a1-post-wave-audit-v2'")
+    audit_schema = payload.get("schema_version")
+    if audit_schema not in {"a1-post-wave-audit-v2", "a1-post-wave-audit-v3"}:
+        raise SystemExit(
+            "A1 post-wave audit schema must be 'a1-post-wave-audit-v2' or "
+            "'a1-post-wave-audit-v3'"
+        )
     if payload.get("passed") is not True or payload.get("errors") != []:
         raise SystemExit("A1 post-wave audit is not a clean passing report")
     declared_audit_sha = payload.get("audit_sha256")
@@ -452,6 +456,80 @@ def _load_a1_post_wave_audit(
         raise SystemExit("A1 post-wave audit shards must be a list")
     if payload.get("shard_inventory_sha256") != _value_sha256(shards):
         raise SystemExit("A1 post-wave audit shard_inventory_sha256 mismatch")
+    harvest_provenance: dict[str, Any] | None = None
+    if audit_schema == "a1-post-wave-audit-v3":
+        binding = payload.get("harvest_relocation")
+        expected_binding_keys = {
+            "path",
+            "file_sha256",
+            "relocation_sha256",
+            "render_sha256",
+            "job_identities_sha256",
+            "file_inventory_sha256",
+        }
+        if not isinstance(binding, dict) or set(binding) != expected_binding_keys:
+            raise SystemExit("relocated A1 audit has an invalid harvest binding")
+        try:
+            relocation_path = Path(str(binding["path"])).expanduser().resolve(strict=True)
+            relocation = json.loads(relocation_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as error:
+            raise SystemExit(f"cannot load A1 harvest relocation map: {error}") from error
+        if not isinstance(relocation, dict):
+            raise SystemExit("A1 harvest relocation map must be an object")
+        unhashed_relocation = dict(relocation)
+        relocation_digest = unhashed_relocation.pop("relocation_sha256", None)
+        if (
+            relocation.get("schema_version") != "a1-fleet-harvest-relocation-v1"
+            or _file_sha256(relocation_path) != binding["file_sha256"]
+            or relocation_digest != _value_sha256(unhashed_relocation)
+            or relocation_digest != binding["relocation_sha256"]
+            or relocation.get("contract_sha256") != contract_sha
+            or relocation.get("render_sha256") != binding["render_sha256"]
+            or relocation.get("job_identities_sha256")
+            != binding["job_identities_sha256"]
+            or relocation.get("file_inventory_sha256")
+            != binding["file_inventory_sha256"]
+            or relocation.get("file_inventory_sha256")
+            != _value_sha256(relocation.get("files"))
+        ):
+            raise SystemExit("A1 harvest relocation binding/digest mismatch")
+        relocation_by_local: dict[Path, dict[str, Any]] = {}
+        for index, record in enumerate(relocation.get("files", [])):
+            if not isinstance(record, dict):
+                raise SystemExit(f"A1 harvest file record {index} is malformed")
+            relative = Path(str(record.get("relative_path", "")))
+            if (
+                relative.is_absolute()
+                or ".." in relative.parts
+                or not relative.parts
+                or relative.parts[0] != "jobs"
+            ):
+                raise SystemExit(f"A1 harvest file record {index} path is unsafe")
+            unresolved_local = relocation_path.parent / relative
+            try:
+                local = unresolved_local.resolve(strict=True)
+            except OSError as error:
+                raise SystemExit(
+                    f"A1 harvest file record {index} is missing: {error}"
+                ) from error
+            if local != unresolved_local.absolute() or not local.is_file():
+                raise SystemExit(
+                    f"A1 harvest file record {index} uses a symlink or non-file"
+                )
+            if local in relocation_by_local:
+                raise SystemExit("A1 harvest relocation repeats a local file")
+            relocation_by_local[local] = record
+        harvest_provenance = {
+            "path": relocation_path,
+            "file_sha256": binding["file_sha256"],
+            "relocation_sha256": relocation_digest,
+            "render_sha256": binding["render_sha256"],
+            "job_identities_sha256": binding["job_identities_sha256"],
+            "file_inventory_sha256": binding["file_inventory_sha256"],
+            "by_local": relocation_by_local,
+        }
+    elif "harvest_relocation" in payload:
+        raise SystemExit("legacy A1 audit must not carry a harvest relocation binding")
     data_shards: list[dict[str, Any]] = []
     contract_attestations: list[dict[str, Any]] = []
     seen_paths: set[Path] = set()
@@ -478,6 +556,17 @@ def _load_a1_post_wave_audit(
                 f"A1 post-wave audit {kind} {index} has invalid sha256"
             )
         if kind == "data_shard":
+            if harvest_provenance is not None:
+                relocation_record = harvest_provenance["by_local"].get(shard_path)
+                if (
+                    relocation_record is None
+                    or relocation_record.get("sha256") != declared_sha
+                    or relocation_record.get("size_bytes") != shard_path.stat().st_size
+                ):
+                    raise SystemExit(
+                        "relocated A1 audit data shard is not identically bound by "
+                        f"the harvest map: {shard_path}"
+                    )
             data_shards.append({**record, "path": str(shard_path)})
             continue
         actual_sha = _file_sha256(shard_path)
@@ -639,6 +728,7 @@ def _load_a1_post_wave_audit(
                 "validation_game_seed_set_sha256"
             ],
         },
+        "harvest_relocation": harvest_provenance,
         "data_shards": data_shards,
         "contract_attestations": contract_attestations,
     }
@@ -1420,6 +1510,19 @@ def build_memmap_corpus(
                 )
                 for key, value in post_wave_audit["validation_holdout"].items()
             },
+            **(
+                {}
+                if post_wave_audit["harvest_relocation"] is None
+                else {
+                    "harvest_relocation": {
+                        key: str(value) if isinstance(value, Path) else value
+                        for key, value in post_wave_audit[
+                            "harvest_relocation"
+                        ].items()
+                        if key != "by_local"
+                    }
+                }
+            ),
         }
     (out_dir / "corpus_meta.json").write_text(json.dumps(meta, indent=2, sort_keys=True), encoding="utf-8")
     print(json.dumps({"progress": "memmap_convert_done", **{k: meta[k] for k in ("row_count", "flat_count", "legal_width", "shard_count", "conversion_seconds")}}, sort_keys=True), flush=True)
@@ -1489,7 +1592,7 @@ def main() -> None:
         type=Path,
         default=None,
         help=(
-            "Passing a1-post-wave-audit-v2 report that binds the selected-game "
+            "Passing a1-post-wave-audit-v2/v3 report that binds the selected-game "
             "manifest and exact input shard inventory/hashes. Required together "
             "with --selected-game-seed-manifest."
         ),
