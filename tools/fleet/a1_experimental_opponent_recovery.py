@@ -897,6 +897,20 @@ def _preflight_host(
         str(plan["source_artifacts"][arm]["seed_ledger_snapshot"]["snapshot_text"])
         for arm in ("n128", "n256")
     ]
+    wheel_hash = plan["native_wheel"]["sha256"].removeprefix("sha256:")
+    native_probe = (
+        "import json\n"
+        "from importlib.metadata import distribution, version\n"
+        "import catanatron_rs as r\n"
+        "assert version('catanatron_rs') == '0.1.5'\n"
+        "d = distribution('catanatron_rs')\n"
+        "p = d.locate_file('catanatron_rs-0.1.5.dist-info/direct_url.json')\n"
+        "u = json.load(open(p))\n"
+        f"assert u['archive_info']['hash'] == {'sha256=' + wheel_hash!r}\n"
+        "assert callable(getattr(r, 'gumbel_search', None))\n"
+        "assert hasattr(r.Game, 'determinize_for_player')\n"
+        "assert hasattr(r, 'build_entity_features_flat')\n"
+    )
     ledger_path = next(iter(ledger_paths))
     base = _ssh_base(fleet, alias, ssh_key)
     result = _remote_python(
@@ -929,8 +943,8 @@ def _preflight_host(
         "soft,hard=resource.getrlimit(resource.RLIMIT_NOFILE); assert hard>=65536\n"
         "resource.setrlimit(resource.RLIMIT_NOFILE,(65536,hard)); assert resource.getrlimit(resource.RLIMIT_NOFILE)[0]>=65536\n"
         f"assert shutil.disk_usage({plan['recovery_root']!r}).free>=20*1024**3\n"
-        f'py={plan["runtime_python"]!r}; expected={plan["native_wheel"]["sha256"].removeprefix("sha256:")!r}; code=\'import json; from importlib.metadata import distribution,version; import catanatron_rs as r; assert version("catanatron_rs")=="0.1.5"; d=distribution("catanatron_rs"); p=d.locate_file("catanatron_rs-0.1.5.dist-info/direct_url.json"); u=json.load(open(p)); assert u["archive_info"]["hash"]=="sha256="+{plan["native_wheel"]["sha256"].removeprefix("sha256:")!r}; assert callable(getattr(r,"gumbel_search",None)); assert hasattr(r.Game,"determinize_for_player"); assert hasattr(r,"build_entity_features_flat")\'\n'
-        "subprocess.run([py,'-c',code],check=True)\n"
+        f"py={plan['runtime_python']!r}; native_probe={native_probe!r}\n"
+        "subprocess.run([py,'-c',native_probe],check=True)\n"
         "print(json.dumps({'state':'ready','files':len(records),'live_ledger_sha256':live_ledger_sha256}))",
     )
     return {"host_alias": alias, **result}
