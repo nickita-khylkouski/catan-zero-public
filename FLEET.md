@@ -89,7 +89,16 @@ the checksum update into the source commit.
    independent clean build state. The builder stages commit A at its sealed
    canonical path and emits both the wheel and
    `catanatron_rs-0.1.4-build-receipt.json`. Require byte-identical wheel
-   SHA-256 values and matching sealed toolchain/environment provenance.
+   SHA-256 values and matching sealed toolchain/environment provenance. The
+   receipt schema is `catanatron-rs-wheel-build-receipt-v2`; in addition to
+   both catanatron lockfiles it must bind
+   `native/gumbel_mcts_rs/Cargo.lock`, `src/lib.rs`, and
+   `src/python_binding.rs` by SHA-256. Before accepting the artifact, install
+   it into a clean CPython 3.11 environment and assert that both
+   `catanatron_rs.gumbel_search` and
+   `catanatron_rs.build_entity_features_flat` are callable, then run
+   `tests/test_native_gumbel_hot_loop.py` and
+   `tests/test_generate_native_rollout.py` without native-path skips.
 2. Create **commit B** by changing only
    `native/catanatron-rs/WHEEL_SHA256SUMS` to the verified wheel filename and
    SHA-256. Verify `git diff --name-only A..B` prints exactly that one path.
@@ -103,6 +112,16 @@ the checksum update into the source commit.
 
 Any byte mismatch aborts the release. Diagnose it on the build host; never
 paper over it by updating the inventory to whichever build ran last.
+
+The native-MCTS source changes make the currently tracked wheel digest stale
+until the two-commit transaction above is completed. The exact items to
+refresh are the CPython 3.11 wheel asset, its build receipt, and the single
+line in `native/catanatron-rs/WHEEL_SHA256SUMS`; the immutable release tag must
+point at checksum-only commit B. `tools/install_v1_freeze.sh` already downloads
+that exact filename from the selected tag and verifies it against the tracked
+inventory before any privileged or environment mutation. Do not publish an
+old wheel under a new tag, move an existing tag, or edit the inventory before
+two clean builds agree.
 
 ## 4. Rust engine (CAT-133)
 - `native/catanatron-rs` v0.1.4 is now the canonical wheel source and builds `catanatron_rs-0.1.4-cp311-…manylinux_2_34`; `native/gumbel_mcts_rs` is its linked native-search dependency. `native/catanatron-rs/WHEEL_SHA256SUMS` seals the exact release asset and the installer rejects any byte mismatch. The build receipt seals the source commit/tree, builder and lockfiles, exact toolchain/environment, and wheel digest. Fleet deployment must be uniform 0.1.4 before information-set generation.

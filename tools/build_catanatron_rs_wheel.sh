@@ -251,6 +251,9 @@ WHEEL_SHA256="$(sha256sum "$WHEEL_PATH" | awk '{print $1}')"
 BUILDER_SHA256="$(sha256sum "$ROOT/tools/build_catanatron_rs_wheel.sh" | awk '{print $1}')"
 CARGO_LOCK_SHA256="$(sha256sum "$ROOT/native/catanatron-rs/Cargo.lock" | awk '{print $1}')"
 PYTHON_CARGO_LOCK_SHA256="$(sha256sum "$ROOT/native/catanatron-rs/python/Cargo.lock" | awk '{print $1}')"
+GUMBEL_CARGO_LOCK_SHA256="$(sha256sum "$ROOT/native/gumbel_mcts_rs/Cargo.lock" | awk '{print $1}')"
+GUMBEL_LIB_RS_SHA256="$(sha256sum "$ROOT/native/gumbel_mcts_rs/src/lib.rs" | awk '{print $1}')"
+GUMBEL_PYTHON_BINDING_RS_SHA256="$(sha256sum "$ROOT/native/gumbel_mcts_rs/src/python_binding.rs" | awk '{print $1}')"
 
 "$PYTHON_BIN" - "$OUT_DIR/$RECEIPT_NAME" <<PY
 import json
@@ -258,12 +261,15 @@ import pathlib
 import sys
 
 receipt = {
-    "schema_version": "catanatron-rs-wheel-build-receipt-v1",
+    "schema_version": "catanatron-rs-wheel-build-receipt-v2",
     "source_commit": None,
     "source_tree": None,
     "builder_sha256": "$BUILDER_SHA256",
     "cargo_lock_sha256": "$CARGO_LOCK_SHA256",
     "python_cargo_lock_sha256": "$PYTHON_CARGO_LOCK_SHA256",
+    "gumbel_cargo_lock_sha256": "$GUMBEL_CARGO_LOCK_SHA256",
+    "gumbel_lib_rs_sha256": "$GUMBEL_LIB_RS_SHA256",
+    "gumbel_python_binding_rs_sha256": "$GUMBEL_PYTHON_BINDING_RS_SHA256",
     "rustc_version": "$RUSTC_VERSION",
     "cargo_version": "$CARGO_VERSION",
     "maturin_version": "$MATURIN_VERSION",

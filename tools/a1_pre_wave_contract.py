@@ -26,6 +26,7 @@ import json
 import os
 import re
 import stat
+import subprocess
 import sys
 import uuid
 from collections import Counter
@@ -177,6 +178,13 @@ REQUIRED_EVIDENCE = {"a0", "s1", "s2", "s3"}
 HISTORICAL_HANDOFF_MODE = "historical_pre_promotion"
 POST_PROMOTION_HANDOFF_MODE = "post_promotion"
 GENERATION_CAMPAIGN_SCHEMA = "a1-dual-arm-generation-contract-v1"
+GENERATION_CAMPAIGN_CONTRACT_ID = "a1-dual-arm-n256-n128-56gpu-20260710-r1"
+GENERATION_CAMPAIGN_CONTRACT_SHA256 = (
+    "sha256:029d4370c031d967994055b74578306fe99e34ec653221db39e277e6d22c1f74"
+)
+GENERATION_CAMPAIGN_CONTRACT_PATH = (
+    REPO_ROOT / "configs/operations/a1-dual-arm-56gpu-20260710/contract.json"
+)
 GENERATION_PLACEMENT_SCHEMA = "a1-dual-arm-generation-placement-v1"
 GENERATION_ARM_LOCK_SCHEMA = "a1-generation-arm-lock-v1"
 GENERATION_CAMPAIGN_PENDING = "blocked_pending_post_promotion_handoff"
@@ -340,6 +348,57 @@ def _sha256(path: Path) -> str:
 
 def _sha256_bytes(payload: bytes) -> str:
     return "sha256:" + hashlib.sha256(payload).hexdigest()
+
+
+def _tracked_history_contains_file_digest(relative_path: str, digest: str) -> bool:
+    """Verify an immutable provenance record after the checkout advances.
+
+    A sealed campaign binds file bytes, not the mutable worktree's latest
+    version.  Requiring every historical record to equal today's checkout
+    makes an honest code change retroactively invalidate already-running data.
+    When current bytes differ, accept only exact bytes for the same path that
+    are still recoverable from this repository's tracked commit history.
+    Unknown paths, malformed paths, git failures, and unknown digests fail
+    closed.  This does not rewrite or weaken the sealed record.
+    """
+
+    relative = PurePath(relative_path)
+    if relative.is_absolute() or ".." in relative.parts or not relative.parts:
+        return False
+    try:
+        history = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(REPO_ROOT),
+                "log",
+                "--format=%H",
+                "--all",
+                "--",
+                relative_path,
+            ],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=10,
+        ).stdout.splitlines()
+        # Campaign records are recent. A finite bound prevents a corrupt or
+        # adversarial repository from turning verification into an unbounded
+        # history walk.
+        for commit in history[:256]:
+            blob = subprocess.run(
+                ["git", "-C", str(REPO_ROOT), "show", f"{commit}:{relative_path}"],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+            ).stdout
+            if _sha256_bytes(blob) == digest:
+                return True
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return False
 
 
 def _strict_config_registry_record(
@@ -2458,6 +2517,18 @@ def validate_generation_campaign(
     declared = unhashed.pop("contract_sha256")
     if declared != _digest_value(unhashed):
         raise ContractError("generation campaign semantic digest mismatch")
+    # The already-issued campaign and the one explicit historical DB1 lock
+    # source may verify their sealed file bytes from tracked git history after
+    # this checkout advances. No copied/recomputed/new contract gets that
+    # privilege: it must bind the current source bytes.
+    canonical_archived_provenance = bool(
+        path.resolve() == GENERATION_CAMPAIGN_CONTRACT_PATH.resolve()
+        and value.get("contract_id") == GENERATION_CAMPAIGN_CONTRACT_ID
+        and declared == GENERATION_CAMPAIGN_CONTRACT_SHA256
+    )
+    allow_archived_provenance = (
+        historical_lock_source or canonical_archived_provenance
+    )
     if value["status"] != GENERATION_CAMPAIGN_PENDING:
         raise ContractError("generation campaign must remain explicitly pending")
     handoff = dict(value["promotion_handoff"])
@@ -2714,8 +2785,16 @@ def validate_generation_campaign(
             "sha256": HISTORICAL_DB1_EXECUTOR_SHA256,
         }:
             continue
-        source = REPO_ROOT / str(record["path"])
-        if not source.is_file() or _sha256(source) != record["sha256"]:
+        relative_path = str(record["path"])
+        source = REPO_ROOT / relative_path
+        current_matches = source.is_file() and _sha256(source) == record["sha256"]
+        archived_matches = bool(
+            allow_archived_provenance
+            and _tracked_history_contains_file_digest(
+                relative_path, str(record["sha256"])
+            )
+        )
+        if not current_matches and not archived_matches:
             raise ContractError(f"generation campaign immutable file drift: {source}")
     for record in provenance["arm_guards"]:
         name = Path(str(record["path"])).stem

@@ -116,6 +116,14 @@ def test_different_pipelines_with_same_field_names_do_not_collide() -> None:
     assert GenerateConfig().config_hash() != EvalConfig().config_hash()
 
 
+def test_generate_native_hot_loop_changes_science_hash() -> None:
+    reference = GenerateConfig()
+    native = GenerateConfig(native_mcts_hot_loop=True)
+
+    assert reference.native_mcts_hot_loop is False
+    assert native.config_hash() != reference.config_hash()
+
+
 def test_hash_is_field_order_independent() -> None:
     # sort_keys in canonical_json means declaration order never affects the hash.
     payload = TrainConfig(seed=5).canonical_payload()

@@ -83,7 +83,6 @@ dependencies = [
  "catanatron-rs",
  "rand",
  "rand_chacha",
- "serde_json",
 ]
 
 [[package]]

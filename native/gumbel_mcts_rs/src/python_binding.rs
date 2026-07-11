@@ -295,9 +295,7 @@ fn gumbel_search(
             .iter()
             .map(|color| {
                 string_to_color(color).ok_or_else(|| {
-                    pyo3::exceptions::PyValueError::new_err(format!(
-                        "unsupported color: {color}"
-                    ))
+                    pyo3::exceptions::PyValueError::new_err(format!("unsupported color: {color}"))
                 })
             })
             .collect::<PyResult<Vec<_>>>()?;

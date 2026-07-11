@@ -16,7 +16,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 BUILDER = REPO_ROOT / "tools" / "build_catanatron_rs_wheel.sh"
 CHECKSUM_INVENTORY = "native/catanatron-rs/WHEEL_SHA256SUMS"
 RECEIPT_NAME = "catanatron_rs-0.1.4-build-receipt.json"
-RECEIPT_SCHEMA = "catanatron-rs-wheel-build-receipt-v1"
+RECEIPT_SCHEMA = "catanatron-rs-wheel-build-receipt-v2"
 
 
 def _script() -> str:
@@ -86,6 +86,7 @@ def test_all_cargo_resolution_is_locked() -> None:
     assert "maturin build --locked" in script
     assert "native/catanatron-rs/Cargo.lock" in _script()
     assert "native/catanatron-rs/python/Cargo.lock" in _script()
+    assert "native/gumbel_mcts_rs/Cargo.lock" in _script()
 
 
 def test_release_environment_and_toolchain_are_sealed() -> None:
@@ -138,6 +139,9 @@ def test_builder_emits_a_complete_machine_readable_receipt() -> None:
         "builder_sha256",
         "cargo_lock_sha256",
         "python_cargo_lock_sha256",
+        "gumbel_cargo_lock_sha256",
+        "gumbel_lib_rs_sha256",
+        "gumbel_python_binding_rs_sha256",
         "rustc_version",
         "cargo_version",
         "maturin_version",
