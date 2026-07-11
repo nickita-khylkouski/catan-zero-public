@@ -97,6 +97,38 @@ def test_dry_run_command_is_direct_eight_rank_memmap_ddp(tmp_path: Path) -> None
     assert dual._execution_binding(command)["gpu_ids"] == list(range(8))  # noqa: SLF001
 
 
+def test_curriculum_command_warm_starts_from_authenticated_parent(tmp_path: Path) -> None:
+    verified = _verified(tmp_path)
+    plain_identity = dual._claim_identity(verified)  # noqa: SLF001
+    parent = tmp_path / "n256-candidate.pt"
+    parent.write_bytes(b"parent")
+    receipt = tmp_path / "n256.receipt.json"
+    receipt.write_text("{}")
+    verified["curriculum_parent"] = {
+        "schema_version": "a1-curriculum-parent-binding-v1",
+        "receipt_path": str(receipt.resolve()),
+        "receipt_sha256": dual._sha256(receipt),  # noqa: SLF001
+        "parent_arm_id": "n256",
+        "parent_subset_id": "full-56k",
+        "parent_checkpoint": {
+            "path": str(parent.resolve()),
+            "sha256": dual._sha256(parent),  # noqa: SLF001
+        },
+        "generation_producer_sha256": verified["producer"]["sha256"],
+    }
+    command = dual.build_command(
+        verified,
+        python=Path("/venv/bin/python"),
+        checkpoint=tmp_path / "combined.pt",
+        report=tmp_path / "combined.json",
+    )
+    assert command[command.index("--init-checkpoint") + 1] == str(parent.resolve())
+    assert command[command.index("--a1-curriculum-parent-receipt") + 1] == str(
+        receipt.resolve()
+    )
+    assert dual._claim_identity(verified) != plain_identity  # noqa: SLF001
+
+
 def test_two_b200_fallback_preserves_global_batch_4096(tmp_path: Path) -> None:
     verified = _verified(tmp_path)
     verified["topology"] = learner_contract.TOPOLOGIES[2]

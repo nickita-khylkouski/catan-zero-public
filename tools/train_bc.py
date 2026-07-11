@@ -956,6 +956,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--a1-dual-reviewed-lock-file-sha256", default="", help=argparse.SUPPRESS
     )
     parser.add_argument(
+        "--a1-curriculum-parent-receipt", default="", help=argparse.SUPPRESS
+    )
+    parser.add_argument(
         "--init-checkpoint",
         default="",
         help="Optional checkpoint to continue XDim-lite BC training from.",
@@ -2675,12 +2678,73 @@ def _validate_a1_learner_objective(
             abs_tol=1e-12,
         ):
             raise SystemExit("A1 HL-Gauss sigma differs from the contract")
-    if getattr(args, "init_checkpoint_sha256", None) != bound[
-        "producer_checkpoint_sha256"
-    ]:
+    curriculum_parent = _validate_a1_curriculum_parent(args, bound)
+    if (
+        getattr(args, "init_checkpoint_sha256", None)
+        != bound["producer_checkpoint_sha256"]
+        and curriculum_parent is None
+    ):
         raise SystemExit(
             "A1 warm-start checkpoint differs from the producer bound by the contract"
         )
+    args.a1_curriculum_parent = curriculum_parent
+
+
+def _validate_a1_curriculum_parent(
+    args: argparse.Namespace, bound: dict[str, object]
+) -> dict[str, object] | None:
+    """Authenticate the completed first dose used by a one-off two-arm curriculum.
+
+    Generation remains bound to its original producer.  This narrow path only
+    permits the learner warm start to advance to the exact output of a completed
+    sealed n256 dose, so n128 can be the second half of an all-games curriculum.
+    Ordinary A1 and production runs retain the historical producer-equality rule.
+    """
+
+    raw = str(getattr(args, "a1_curriculum_parent_receipt", "") or "")
+    if not raw:
+        return None
+    path = Path(raw).expanduser().resolve(strict=True)
+    try:
+        receipt = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise SystemExit(f"cannot load A1 curriculum parent receipt: {error}") from error
+    if not isinstance(receipt, dict):
+        raise SystemExit("A1 curriculum parent receipt must be a JSON object")
+    unhashed = dict(receipt)
+    stated = unhashed.pop("receipt_sha256", None)
+    if (
+        receipt.get("schema_version") != "a1-dual-arm-training-receipt-v1"
+        or receipt.get("status") != "complete"
+        or (receipt.get("arm_id"), receipt.get("subset_id"))
+        != ("n256", "full-56k")
+        or stated != _canonical_json_sha256(unhashed)
+    ):
+        raise SystemExit("A1 curriculum parent receipt schema/status/digest drift")
+    inputs = receipt.get("inputs")
+    outputs = receipt.get("outputs")
+    producer = inputs.get("producer") if isinstance(inputs, dict) else None
+    checkpoint = outputs.get("checkpoint") if isinstance(outputs, dict) else None
+    if (
+        not isinstance(producer, dict)
+        or producer.get("sha256") != bound.get("producer_checkpoint_sha256")
+        or not isinstance(checkpoint, dict)
+        or set(checkpoint) != {"path", "sha256"}
+        or checkpoint.get("sha256") != getattr(args, "init_checkpoint_sha256", None)
+        or str(Path(str(checkpoint.get("path"))).expanduser().resolve(strict=True))
+        != str(Path(str(args.init_checkpoint)).expanduser().resolve(strict=True))
+        or _sha256_existing_file(str(checkpoint.get("path"))) != checkpoint.get("sha256")
+    ):
+        raise SystemExit("A1 curriculum parent does not bind producer/init checkpoint")
+    return {
+        "schema_version": "a1-curriculum-parent-binding-v1",
+        "receipt_path": str(path),
+        "receipt_sha256": _sha256_existing_file(path),
+        "parent_arm_id": "n256",
+        "parent_subset_id": "full-56k",
+        "parent_checkpoint": checkpoint,
+        "generation_producer_sha256": producer["sha256"],
+    }
 
 
 def _effective_a1_learner_training_recipe(
@@ -4407,6 +4471,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         "checkpoint": args.checkpoint,
         "init_checkpoint": args.init_checkpoint or None,
         "init_checkpoint_sha256": str(args.init_checkpoint_sha256) or None,
+        "a1_curriculum_parent": getattr(args, "a1_curriculum_parent", None),
         "grow_from_checkpoint_sha256": (
             str(args.grow_from_checkpoint_sha256) or None
         ),

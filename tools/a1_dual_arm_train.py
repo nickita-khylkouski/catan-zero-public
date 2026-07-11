@@ -108,6 +108,7 @@ def verify_inputs(
     data: Path,
     validation: Path,
     producer_checkpoint: Path,
+    curriculum_parent_receipt: Path | None = None,
 ) -> dict[str, Any]:
     try:
         authority = learner_contract.verify_lock(
@@ -219,7 +220,7 @@ def verify_inputs(
         raise DualTrainError(
             "audited corpus/runtime differs from reviewed immutable learner lock"
         )
-    return {
+    verified = {
         "identity": identity,
         "arm_id": identity[0],
         "subset_id": identity[1],
@@ -247,6 +248,23 @@ def verify_inputs(
         "training_rows": training_rows,
         "validation_rows": int(holdout["validation_row_count"]),
     }
+    if curriculum_parent_receipt is not None:
+        # Reuse train_bc's fail-closed receipt/checkpoint/producer validation so
+        # the second curriculum dose cannot name an arbitrary warm start.
+        class _Args:
+            pass
+
+        parent_args = _Args()
+        parent_args.a1_curriculum_parent_receipt = str(curriculum_parent_receipt)
+        # Replay the original claim/completion and every referenced input/output
+        # byte before allowing train_bc's narrower producer/init check.
+        parent_receipt = verify_receipt(curriculum_parent_receipt)
+        parent_args.init_checkpoint = parent_receipt["outputs"]["checkpoint"]["path"]
+        parent_args.init_checkpoint_sha256 = parent_receipt["outputs"]["checkpoint"]["sha256"]
+        parent = train_bc._validate_a1_curriculum_parent(parent_args, bound)  # noqa: SLF001
+        assert parent is not None
+        verified["curriculum_parent"] = parent
+    return verified
 
 
 def build_command(
@@ -264,7 +282,7 @@ def build_command(
         report=report,
     )
     trainer = base[1]
-    return [
+    command = [
         str(python),
         "-m",
         "torch.distributed.run",
@@ -277,6 +295,14 @@ def build_command(
         "--a1-dual-reviewed-lock-file-sha256",
         verified["reviewed_lock_file_sha256"],
     ]
+    parent = verified.get("curriculum_parent")
+    if parent is not None:
+        init_index = command.index("--init-checkpoint") + 1
+        command[init_index] = str(parent["parent_checkpoint"]["path"])
+        command.extend(
+            ["--a1-curriculum-parent-receipt", str(parent["receipt_path"])]
+        )
+    return command
 
 
 def _gpu_ids(verified: dict[str, Any]) -> tuple[int, ...]:
@@ -322,6 +348,11 @@ def _claim_identity(verified: dict[str, Any]) -> str:
             "runtime_code_tree_sha256": verified["runtime_code_tree_sha256"],
             "executor_sha256": _sha256(Path(__file__).resolve()),
             "learner_lock_sha256": verified["learner_lock"]["sha256"],
+            "curriculum_parent_receipt_sha256": (
+                None
+                if verified.get("curriculum_parent") is None
+                else verified["curriculum_parent"]["receipt_sha256"]
+            ),
         }
     )
 
@@ -354,6 +385,10 @@ def _validate_output_paths(
         )
         for ref in (verified[key],)
     }
+    if verified.get("curriculum_parent") is not None:
+        input_paths.add(
+            Path(verified["curriculum_parent"]["receipt_path"]).resolve(strict=True)
+        )
     overlap = input_paths.intersection(canonical.values())
     if overlap:
         raise DualTrainError(f"dual learner output aliases immutable input: {sorted(map(str, overlap))}")
@@ -518,8 +553,17 @@ def verify_outputs(
         "track": "2p_no_trade",
         "vps_to_win": 10,
         "checkpoint": str(checkpoint),
-        "init_checkpoint": verified["producer"]["path"],
-        "init_checkpoint_sha256": verified["producer"]["sha256"],
+        "init_checkpoint": (
+            verified["producer"]["path"]
+            if verified.get("curriculum_parent") is None
+            else verified["curriculum_parent"]["parent_checkpoint"]["path"]
+        ),
+        "init_checkpoint_sha256": (
+            verified["producer"]["sha256"]
+            if verified.get("curriculum_parent") is None
+            else verified["curriculum_parent"]["parent_checkpoint"]["sha256"]
+        ),
+        "a1_curriculum_parent": verified.get("curriculum_parent"),
         "a1_contract_sha256": verified["contract_sha256"],
         "a1_selected_game_seed_set_sha256": verified[
             "selected_game_seed_set_sha256"
@@ -759,6 +803,11 @@ def _publish_completion_and_receipt(
             "producer": verified["producer"],
             "executor": _file_ref(Path(__file__), where="dual learner executor"),
             "payload_inventory_sha256": verified["payload_inventory_sha256"],
+            **(
+                {}
+                if verified.get("curriculum_parent") is None
+                else {"curriculum_parent": verified["curriculum_parent"]}
+            ),
         },
         "execution_binding": binding,
         "gpu_names": gpu_names,
@@ -898,6 +947,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--reviewed-lock-file-sha256", required=True)
     parser.add_argument("--validation-manifest", type=Path, required=True)
     parser.add_argument("--producer-checkpoint", type=Path, required=True)
+    parser.add_argument("--curriculum-parent-receipt", type=Path)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--report", type=Path, required=True)
     parser.add_argument("--receipt", type=Path, required=True)
@@ -917,6 +967,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             data=args.data,
             validation=args.validation_manifest,
             producer_checkpoint=args.producer_checkpoint,
+            curriculum_parent_receipt=args.curriculum_parent_receipt,
         )
         checkpoint = args.checkpoint.expanduser().resolve(strict=False)
         report = args.report.expanduser().resolve(strict=False)
@@ -947,6 +998,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "audit": verified["audit"],
                 "validation": verified["validation"],
                 "producer": verified["producer"],
+                **(
+                    {}
+                    if verified.get("curriculum_parent") is None
+                    else {"curriculum_parent": verified["curriculum_parent"]}
+                ),
                 "executor": _file_ref(Path(__file__), where="dual learner executor"),
             },
             "outputs": {
