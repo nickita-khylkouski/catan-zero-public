@@ -27,6 +27,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import time
 from typing import Any, Callable, Iterable, Sequence
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -906,13 +907,24 @@ def _scp_base(manifest: dict[str, Any]) -> list[str]:
 
 
 def _run(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        list(command),
-        check=True,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
+    argv = list(command)
+    attempts = 3 if argv and Path(argv[0]).name in {"ssh", "scp"} else 1
+    last_error: subprocess.CalledProcessError | None = None
+    for attempt in range(attempts):
+        try:
+            return subprocess.run(
+                argv,
+                check=True,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+        except subprocess.CalledProcessError as error:
+            last_error = error
+            if attempt + 1 < attempts:
+                time.sleep(1 << attempt)
+    assert last_error is not None
+    raise last_error
 
 
 def _host_by_alias(manifest: dict[str, Any]) -> dict[str, dict[str, Any]]:

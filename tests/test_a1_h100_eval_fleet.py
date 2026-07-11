@@ -39,6 +39,28 @@ def test_future_plan_default_uses_validated_16_worker_packing() -> None:
     assert args.workers_per_gpu == fleet.DEFAULT_WORKERS_PER_GPU
 
 
+def test_remote_transport_retries_transient_failure_but_local_commands_do_not(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[list[str]] = []
+
+    def fake_run(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        if len(calls) < 3:
+            raise subprocess.CalledProcessError(255, argv, stderr="connection reset")
+        return subprocess.CompletedProcess(argv, 0, "ok", "")
+
+    monkeypatch.setattr(fleet.subprocess, "run", fake_run)
+    monkeypatch.setattr(fleet.time, "sleep", lambda _seconds: None)
+    assert fleet._run(["ssh", "host", "true"]).stdout == "ok"  # noqa: SLF001
+    assert len(calls) == 3
+
+    calls.clear()
+    with pytest.raises(subprocess.CalledProcessError):
+        fleet._run(["git", "status"])  # noqa: SLF001
+    assert len(calls) == 1
+
+
 def _manifest_file(tmp_path: Path) -> Path:
     hosts = [
         {"alias": alias, "address": f"10.0.0.{index + 10}", "gpu_count": count}
