@@ -653,6 +653,7 @@ def _runtime_code_tree_records() -> list[dict[str, Any]]:
         "native/gumbel_mcts_rs/Cargo.toml",
         "native/gumbel_mcts_rs/Cargo.lock",
         "native/gumbel_mcts_rs/src/lib.rs",
+        "native/gumbel_mcts_rs/src/python_binding.rs",
         "tools/fleet/systemd/nvidia-mps.service",
     ):
         paths.add((REPO_ROOT / relative).resolve(strict=True))

@@ -70,6 +70,7 @@ from catan_zero.search.gumbel_chance_mcts import (
     move_robber_victim_outcome_weights,
 )
 from catan_zero.search import gumbel_chance_mcts as _gumbel_chance_mcts
+from catan_zero.search.native_gumbel_mcts import create_gumbel_search
 from catan_zero.search.neural_rust_mcts import (
     RUST_ENTITY_ADAPTER_VERSION,
     rust_action_context_batch,
@@ -1338,6 +1339,7 @@ def run_worker_games(
     resume: bool = False,
     opponent_pool: OpponentPoolRuntime | None = None,
     opponent_mix: MixRuntime | None = None,
+    native_mcts_hot_loop: bool = False,
 ) -> dict[str, Any]:
     """Play `games` self-play games in this process, writing shards to `out_dir`.
 
@@ -1408,7 +1410,11 @@ def run_worker_games(
         search_config,
         engine_supports_determinization=engine_supports_determinization,
     )
-    mcts = GumbelChanceMCTS(search_config, evaluator)
+    mcts = create_gumbel_search(
+        search_config,
+        evaluator,
+        native_hot_loop=bool(native_mcts_hot_loop),
+    )
 
     resume_offset = 0
     games_completed = 0
