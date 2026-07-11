@@ -146,6 +146,42 @@ def test_native_maps_decoupled_wide_budget_fields() -> None:
 @pytest.mark.skipif(
     not native_hot_loop_available(), reason="native wheel lacks gumbel_search"
 )
+def test_native_engine_seed_stream_advances_and_is_reproducible(monkeypatch) -> None:
+    rust = pytest.importorskip("catanatron_rs")
+    recorded: list[int] = []
+
+    def fake_search(game, evaluator, config, **kwargs):
+        recorded.append(int(config["seed"]))
+        legal = game.playable_action_indices(["RED", "BLUE"], None)
+        probability = 1.0 / len(legal)
+        policy = {action: probability for action in legal}
+        return {
+            "selected_action": legal[0],
+            "improved_policy": policy,
+            "visit_counts": {action: 0 for action in legal},
+            "q_values": {},
+            "priors": policy,
+            "root_value": 0.0,
+            "used_full_search": True,
+            "simulations_used": 1,
+            "afterstate_values": {},
+        }
+
+    monkeypatch.setattr(rust, "gumbel_search", fake_search)
+    config = GumbelChanceMCTSConfig(seed=997)
+    game = rust.Game.simple(["RED", "BLUE"], seed=5)
+    for _ in range(2):
+        search = NativeGumbelChanceMCTS(config, _PublicCountingEvaluator())
+        search._search_single_world(game, force_full=True)
+        search._search_single_world(game, force_full=True)
+
+    assert recorded[0] != recorded[1]
+    assert recorded[:2] == recorded[2:]
+
+
+@pytest.mark.skipif(
+    not native_hot_loop_available(), reason="native wheel lacks gumbel_search"
+)
 def test_native_forced_roll_expectation_matches_reference() -> None:
     rust = pytest.importorskip("catanatron_rs")
     game = rust.Game.simple(["RED", "BLUE"], seed=41)

@@ -104,6 +104,11 @@ class NativeGumbelChanceMCTS(GumbelChanceMCTS):
             colors=list(config.colors),
             map_kind=config.map_kind or "BASE",
             stop_at_root_turn_boundary=bool(config.information_set_search),
+            # A binding call constructs a fresh Rust engine. Seed it from the
+            # reference search object's ADVANCING RNG rather than resetting to
+            # config.seed on every move/particle. This is deterministic across
+            # identically seeded search objects but distinct within one run.
+            seed=self.rng.getrandbits(64),
         )
         for optional in (
             "n_full_wide",
