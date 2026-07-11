@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from pathlib import Path
 
 import pytest
@@ -166,6 +167,9 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path]:
                         "ledger_claim": {
                             "path": str(ledger),
                             "row": f"[{cursor} - {cursor + attempts})",
+                            "row_sha256": recovery._digest(  # noqa: SLF001
+                                f"[{cursor} - {cursor + attempts})"
+                            ),
                         },
                     }
                 )
@@ -190,8 +194,13 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path]:
                         }
                     ],
                     "seed_ledger": {
+                        "kind": "seed_ledger_snapshot",
                         "path": str(ledger),
                         "sha256": recovery._sha256(ledger),  # noqa: SLF001
+                        "snapshot_text": ledger.read_text(),
+                        "snapshot_size_bytes": len(ledger.read_bytes()),
+                        "claims": [],
+                        "claims_sha256": recovery._digest([]),  # noqa: SLF001
                     },
                 },
             },
@@ -246,6 +255,9 @@ def test_plan_is_opponent_only_exact_and_nonpromotable(tmp_path: Path) -> None:
     assert len(plan["lanes"]) == 56
     assert plan["native_wheel"]["sha256"] in {
         row["sha256"] for row in plan["required_host_files"]
+    }
+    assert str((tmp_path / "ledger.md").resolve()) not in {
+        row["path"] for row in plan["required_host_files"]
     }
     assert {lane["arm_id"] for lane in plan["lanes"]} == {"n128", "n256"}
     assert all(len(lane["commands"]) == 2 for lane in plan["lanes"])
@@ -420,3 +432,55 @@ def test_run_lane_child_shares_supervisor_group_before_receipt(
     value = recovery.run_lane(tmp_path / "plan.json", "n128-worker", resume=False)
     assert captured["start_new_session"] is False
     assert value["jobs"]["job"]["process_group"] == 4242
+
+
+def test_live_ledger_accepts_append_only_extension_with_exact_claims() -> None:
+    prefix = "# ledger\n[1 – 2) | old |\n"
+    rows = ["[10 – 20) | claim=a |", "[20 – 30) | claim=b |"]
+    data = (prefix + "\n".join(rows) + "\n").encode()
+    assert (
+        recovery._verify_live_ledger_bytes(  # noqa: SLF001
+            data, expected_rows=rows, snapshot_prefixes=[prefix]
+        )
+        == "sha256:" + hashlib.sha256(data).hexdigest()
+    )
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        b"# ledger\n[10 - 20) | claim=a |\n",
+        b"# ledger\n[10 - 20) | claim=a |\n[10 - 20) | claim=a |\n",
+    ],
+)
+def test_live_ledger_rejects_missing_or_duplicate_claim(data: bytes) -> None:
+    with pytest.raises(recovery.RecoveryError, match="exactly once"):
+        recovery._verify_live_ledger_bytes(  # noqa: SLF001
+            data,
+            expected_rows=["[10 - 20) | claim=a |", "[20 - 30) | claim=b |"],
+            snapshot_prefixes=["# ledger\n"],
+        )
+
+
+def test_live_ledger_consensus_rejects_cross_host_sha_drift() -> None:
+    with pytest.raises(recovery.RecoveryError, match="consensus"):
+        recovery._require_ledger_consensus(  # noqa: SLF001
+            [
+                {"host_alias": "a", "live_ledger_sha256": "sha256:" + "1" * 64},
+                {"host_alias": "b", "live_ledger_sha256": "sha256:" + "2" * 64},
+            ]
+        )
+    with pytest.raises(recovery.RecoveryError, match="consensus"):
+        recovery._require_ledger_consensus(  # noqa: SLF001
+            [{"host_alias": "a", "live_ledger_sha256": ""}]
+        )
+    expected = "sha256:" + "3" * 64
+    assert (
+        recovery._require_ledger_consensus(  # noqa: SLF001
+            [
+                {"host_alias": "a", "live_ledger_sha256": expected},
+                {"host_alias": "b", "live_ledger_sha256": expected},
+            ]
+        )
+        == expected
+    )
