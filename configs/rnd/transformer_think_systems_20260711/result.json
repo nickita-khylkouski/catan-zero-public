@@ -1,0 +1,44 @@
+{
+  "schema_version": "catan-zero-transformer-think-systems-result/v1",
+  "status": "pass",
+  "contract": "configs/rnd/transformer_think_systems_20260711/probe_contract.json",
+  "runs": 16,
+  "all_runs_finite": true,
+  "all_gradients_finite": true,
+  "all_parameter_counts_exact": true,
+  "arms": {
+    "transformer-k0": {
+      "parameters": 35041353,
+      "median_rows_per_sec": 1588.51950519094,
+      "median_peak_allocated_bytes": 1553824768,
+      "rows_per_sec": [1589.4302648874816, 1624.5003487412248, 1550.8532811634236, 1587.6087454943984]
+    },
+    "think-transformer-k1": {
+      "parameters": 40793673,
+      "median_rows_per_sec": 1352.4321197771933,
+      "median_peak_allocated_bytes": 1604660736,
+      "rows_per_sec": [1274.3900737270806, 1463.2464767857953, 1387.6713217372685, 1317.192917817118]
+    },
+    "think-transformer-k2": {
+      "parameters": 40793673,
+      "median_rows_per_sec": 1285.498772359962,
+      "median_peak_allocated_bytes": 1650892800,
+      "rows_per_sec": [1345.76186469965, 1225.235680020274, 1220.3837230377808, 1362.1805022645633]
+    },
+    "think-transformer-k4": {
+      "parameters": 40793673,
+      "median_rows_per_sec": 1189.5369434053182,
+      "median_peak_allocated_bytes": 1736968192,
+      "rows_per_sec": [1184.2220091790493, 1224.3973117566725, 1194.851877631587, 1160.6680374311418]
+    }
+  },
+  "admission_checks": {
+    "k4_to_k0_median_rows_per_sec_ratio": 0.7488337030286172,
+    "minimum_required_rows_per_sec_ratio": 0.5,
+    "throughput_pass": true,
+    "k4_to_k0_median_peak_allocated_bytes_ratio": 1.1178662020143575,
+    "maximum_allowed_peak_allocated_bytes_ratio": 1.5,
+    "memory_pass": true
+  },
+  "interpretation": "Systems admission only. The screen is feasible on H100, but this result contains no learning or strength evidence."
+}
