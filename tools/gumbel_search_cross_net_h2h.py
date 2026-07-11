@@ -58,7 +58,9 @@ from high_regret_suite_contract import (  # noqa: E402
     SUITE_SCHEMA,
     bind_state_to_manifest,
     load_source_manifest,
+    scope_inventory_sha256,
     validate_replay_metadata,
+    validate_replay_trajectories,
 )
 from sprt_gate import (  # noqa: E402
     GATE_CONFIGS,
@@ -174,6 +176,8 @@ def _load_held_out_high_regret_suite(
     pairs: list[dict[str, Any]] = []
     pair_ids: set[int] = set()
     bound_states: list[dict[str, Any]] = []
+    inventory_cache: dict[Path, tuple[str, int]] = {}
+    source_row_cache: dict[Path, tuple[Any, Any, int]] = {}
     for index, raw_state in enumerate(states):
         try:
             state = bind_state_to_manifest(
@@ -182,6 +186,8 @@ def _load_held_out_high_regret_suite(
                 manifest_path=source_path,
                 shard_paths=shard_paths,
                 identities=manifest_identities,
+                inventory_cache=inventory_cache,
+                source_row_cache=source_row_cache,
             )
         except ValueError as error:
             raise ValueError(f"held-out suite state {index}: {error}") from error
@@ -225,7 +231,28 @@ def _load_held_out_high_regret_suite(
     )
     if any(actual_strata[label] < stratum_min_pairs for label in expected_strata):
         raise ValueError("held-out suite retained states do not cover every stratum")
+    validate_replay_trajectories(bound_states)
     return suite_path, suite, pairs
+
+
+def _validate_archived_scope_inventory(
+    archived: dict[str, Any],
+    cache: dict[Path, tuple[str, int]],
+) -> None:
+    """Worker-side replay check after process handoff, before reconstruction."""
+
+    shard_path = Path(str(archived["shard_path"])).resolve(strict=True)
+    scope = shard_path.parent
+    actual = cache.get(scope)
+    if actual is None:
+        actual = scope_inventory_sha256(scope)
+        cache[scope] = actual
+    replay_source = archived.get("replay_source")
+    if not isinstance(replay_source, dict) or actual != (
+        replay_source.get("scope_inventory_sha256"),
+        replay_source.get("scope_shard_count"),
+    ):
+        raise ValueError("archived worker replay scope inventory drifted")
 
 
 def _new_search_telemetry() -> dict[str, dict[str, float | int]]:
@@ -838,6 +865,7 @@ def _run_worker(worker_args: dict[str, Any]) -> dict[str, Any]:
     pair_errors: list[dict[str, Any]] = []
     search_telemetry = _new_search_telemetry()
     archived_sequences: dict[tuple[str, int], Any] = {}
+    archived_inventory_cache: dict[Path, tuple[str, int]] = {}
     try:
         for pair in worker_args["pairs"]:
             game_seed = int(pair["game_seed"])
@@ -859,12 +887,16 @@ def _run_worker(worker_args: dict[str, Any]) -> dict[str, Any]:
                             reconstruct_state,
                         )
 
+                        _validate_archived_scope_inventory(
+                            archived, archived_inventory_cache
+                        )
                         shard_path = str(archived["shard_path"])
                         cache_key = (shard_path, game_seed)
                         if cache_key not in archived_sequences:
                             archived_sequences[cache_key] = gather_game_action_sequence(
                                 Path(shard_path).parent, game_seed, colors=COLORS
                             )
+                            _validate_archived_scope_inventory(archived, {})
                         sequence = archived_sequences[cache_key]
                         game, chance_rng = reconstruct_state(
                             game_seed,

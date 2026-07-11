@@ -13,6 +13,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 _TOOLS_DIR = Path(__file__).resolve().parents[1] / "tools"
 if str(_TOOLS_DIR) not in sys.path:
@@ -20,6 +21,10 @@ if str(_TOOLS_DIR) not in sys.path:
 
 from catan_zero.rl.pipeline_configs import EvalConfig  # noqa: E402
 import gumbel_search_cross_net_h2h as h2h  # type: ignore  # noqa: E402
+from high_regret_suite_contract import (  # type: ignore  # noqa: E402
+    REPLAY_CONTRACT,
+    scope_inventory_sha256,
+)
 from gumbel_search_cross_net_h2h import (  # type: ignore  # noqa: E402
     _build_search_config,
     _build_summary,
@@ -33,10 +38,17 @@ from gumbel_search_cross_net_h2h import (  # type: ignore  # noqa: E402
 
 
 def test_held_out_suite_loader_replays_digest_and_source_manifest(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch,
 ) -> None:
-    shard = tmp_path / "relative-shard.npz"
-    np.savez(shard, game_seed=np.arange(123, 143), decision_index=np.arange(20), action_taken=np.arange(20))
+    shard_dir = tmp_path / "worker"
+    shard_dir.mkdir()
+    shard = shard_dir / "relative-shard.npz"
+    np.savez(
+        shard,
+        game_seed=np.arange(123, 143),
+        decision_index=np.zeros(20, dtype=np.int32),
+        action_taken=np.arange(20),
+    )
     source = tmp_path / "regret.npz"
     np.savez(
         source,
@@ -44,8 +56,9 @@ def test_held_out_suite_loader_replays_digest_and_source_manifest(
         shard_id=np.zeros(20, dtype=np.int32),
         row_index=np.arange(20, dtype=np.int32),
         game_seed=np.arange(123, 143, dtype=np.int64),
-        decision_index=np.arange(20, dtype=np.int32),
+        decision_index=np.zeros(20, dtype=np.int32),
     )
+    scope_digest, scope_count = scope_inventory_sha256(shard_dir)
     suite = {
         "schema_version": h2h.SUITE_SCHEMA,
         "suite": "held_out_high_regret",
@@ -69,7 +82,7 @@ def test_held_out_suite_loader_replays_digest_and_source_manifest(
                 "41+": 4,
             },
             "replay_preflight": {
-                "contract": "authoritative-shard-parent-unique-contiguous-trajectory-v2",
+                "contract": REPLAY_CONTRACT,
                 "candidate_states": 20,
                 "replay_complete_states": 20,
                 "rejected_bad_source": 0,
@@ -82,8 +95,8 @@ def test_held_out_suite_loader_replays_digest_and_source_manifest(
                 "shard_id": 0,
                 "row_index": pair,
                 "game_seed": 123 + pair,
-                "decision_index": pair,
-                "shard_path": "relative-shard.npz",
+                "decision_index": 0,
+                "shard_path": "worker/relative-shard.npz",
                 "phase": (
                     "BUILD_INITIAL_SETTLEMENT",
                     "MOVE_ROBBER",
@@ -92,8 +105,10 @@ def test_held_out_suite_loader_replays_digest_and_source_manifest(
                 )[pair % 4],
                 "legal_count": 54 if pair < 4 else 12,
                 "replay_source": {
-                    "contract": "authoritative-shard-parent-unique-contiguous-trajectory-v2",
-                    "scope": str(tmp_path),
+                    "contract": REPLAY_CONTRACT,
+                    "scope": str(shard_dir),
+                    "scope_inventory_sha256": scope_digest,
+                    "scope_shard_count": scope_count,
                 },
             }
             for pair in range(20)
@@ -119,13 +134,75 @@ def test_held_out_suite_loader_replays_digest_and_source_manifest(
         "game_seed": 123,
         "archived_state": {
             **suite["states"][0],
-            "shard_path": str((tmp_path / "relative-shard.npz").resolve()),
+            "shard_path": str(shard.resolve()),
         },
     }
 
+    original_shard_bytes = shard.read_bytes()
+    h2h._validate_archived_scope_inventory(pairs[0]["archived_state"], {})
+
+    from tools import regret_common
+
+    original_load = regret_common.load_shard
+    swapped = False
+
+    def swap_before_load(load_path: Path):
+        nonlocal swapped
+        if Path(load_path).resolve() == shard.resolve() and not swapped:
+            swapped = True
+            replacement = shard.with_suffix(".replacement.npz")
+            np.savez(
+                replacement,
+                game_seed=np.arange(123, 143),
+                decision_index=np.zeros(20, dtype=np.int32),
+                action_taken=np.arange(20) + 100,
+            )
+            replacement.replace(shard)
+        return original_load(load_path)
+
+    monkeypatch.setattr(regret_common, "load_shard", swap_before_load)
+    with pytest.raises(ValueError, match="changed while loading source row"):
+        _load_held_out_high_regret_suite(path)
+    monkeypatch.setattr(regret_common, "load_shard", original_load)
+    shard.write_bytes(original_shard_bytes)
+
+    shard.write_bytes(b"replacement trajectory bytes")
+    with pytest.raises(ValueError, match="scope inventory drifted"):
+        _load_held_out_high_regret_suite(path)
+    with pytest.raises(ValueError, match="worker replay scope inventory drifted"):
+        h2h._validate_archived_scope_inventory(pairs[0]["archived_state"], {})
+    shard.write_bytes(original_shard_bytes)
+
+    injected = shard_dir / "injected.npz"
+    np.savez(
+        injected,
+        game_seed=np.asarray([123]),
+        decision_index=np.asarray([0]),
+        action_taken=np.asarray([99]),
+    )
+    with pytest.raises(ValueError, match="scope inventory drifted"):
+        _load_held_out_high_regret_suite(path)
+    injected.unlink()
+
+    legacy = copy.deepcopy(sealed_suite)
+    legacy["schema_version"] = "a1-held-out-high-regret-suite-v2"
+    legacy["suite_sha256"] = (
+        "sha256:"
+        + h2h.hashlib.sha256(
+            json.dumps(
+                {key: value for key, value in legacy.items() if key != "suite_sha256"},
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+    )
+    path.write_text(json.dumps(legacy), encoding="utf-8")
+    with pytest.raises(ValueError, match="identity is invalid"):
+        _load_held_out_high_regret_suite(path)
+    path.write_text(json.dumps(sealed_suite), encoding="utf-8")
+
     suite["states"][0]["decision_index"] = 8
     path.write_text(json.dumps(suite), encoding="utf-8")
-    import pytest
 
     with pytest.raises(ValueError, match="semantic digest mismatch"):
         _load_held_out_high_regret_suite(path)

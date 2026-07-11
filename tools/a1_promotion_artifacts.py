@@ -29,7 +29,11 @@ if str(_REPO_ROOT) not in sys.path:
 
 from tools import a1_promotion_transaction as promotion  # noqa: E402
 from tools.champion_registry import ChampionRegistry  # noqa: E402
-from tools.high_regret_suite_contract import REPLAY_CONTRACT, SUITE_SCHEMA  # noqa: E402
+from tools.high_regret_suite_contract import (  # noqa: E402
+    REPLAY_CONTRACT,
+    SUITE_SCHEMA,
+    scope_inventory_sha256,
+)
 
 
 HIGH_REGRET_REPORT_SCHEMA = "a1-held-out-high-regret-report-v1"
@@ -253,7 +257,7 @@ def build_held_out_high_regret_suite(
     if pairs < 20:
         raise ArtifactBuildError("held-out suite requires at least 20 pairs")
     try:
-        with np.load(manifest_path, allow_pickle=True) as data:
+        with np.load(manifest_path, allow_pickle=False) as data:
             required = {
                 "shard_id",
                 "row_index",
@@ -319,7 +323,7 @@ def build_held_out_high_regret_suite(
         {(int(game_seeds[index]), int(decisions[index])) for index in eligible}
     )
 
-    replay_complete, replay_stats = _replay_complete_manifest_rows(
+    replay_complete, replay_stats, scope_inventories = _replay_complete_manifest_rows(
         manifest_path=manifest_path,
         candidate_indices=eligible,
         shard_paths=shard_paths,
@@ -412,6 +416,12 @@ def build_held_out_high_regret_suite(
                 "replay_source": {
                     "contract": REPLAY_CONTRACT,
                     "scope": str(shard_path.resolve().parent),
+                    "scope_inventory_sha256": scope_inventories[
+                        shard_path.resolve().parent
+                    ][0],
+                    "scope_shard_count": scope_inventories[
+                        shard_path.resolve().parent
+                    ][1],
                 },
             }
         )
@@ -445,7 +455,7 @@ def _replay_complete_manifest_rows(
     row_indices: Any,
     game_seeds: Any,
     decisions: Any,
-) -> tuple[set[int], dict[str, Any]]:
+) -> tuple[set[int], dict[str, Any], dict[Path, tuple[str, int]]]:
     """Return candidates with an authoritative, replay-complete prefix.
 
     The evaluator reconstructs a state by scanning every shard below the
@@ -489,7 +499,12 @@ def _replay_complete_manifest_rows(
     malformed_seeds_by_scope: dict[Path, set[int]] = {}
     source_arrays: dict[Path, dict[str, Any] | None] = {}
     selected_source_paths = set(source_paths.values())
+    scope_inventories: dict[Path, tuple[str, int]] = {}
     for scope, targets in requested_by_scope.items():
+        try:
+            inventory_before = scope_inventory_sha256(scope)
+        except ValueError as error:
+            raise ArtifactBuildError(str(error)) from error
         seed_counts: dict[int, dict[int, int]] = {seed: {} for seed in targets}
         malformed: set[int] = set()
         for shard_path in discover_shards([scope]):
@@ -501,15 +516,26 @@ def _replay_complete_manifest_rows(
                 continue
             if shard_path.resolve() in selected_source_paths:
                 source_arrays[shard_path.resolve()] = shard
-            if "game_seed" not in shard or "decision_index" not in shard:
+            if "game_seed" not in shard:
+                # gather_game_action_sequence indexes game_seed in every shard
+                # discovered below the scope, even when that shard would not
+                # have contained the requested game.
+                malformed.update(targets)
                 continue
             seeds = np.asarray(shard["game_seed"]).reshape(-1)
+            if "decision_index" not in shard or "action_taken" not in shard:
+                for seed in set(int(value) for value in seeds if int(value) in targets):
+                    malformed.add(seed)
+                continue
             didx = np.asarray(shard["decision_index"]).reshape(-1)
-            actions = shard.get("action_taken")
+            actions = np.asarray(shard["action_taken"]).reshape(-1)
+            phase = shard.get("phase")
+            player = shard.get("player")
             if (
                 len(seeds) != len(didx)
-                or actions is None
-                or len(np.asarray(actions).reshape(-1)) != len(seeds)
+                or len(actions) != len(seeds)
+                or (phase is not None and len(np.asarray(phase).reshape(-1)) < len(seeds))
+                or (player is not None and len(np.asarray(player).reshape(-1)) < len(seeds))
             ):
                 for seed in set(int(value) for value in seeds if int(value) in targets):
                     malformed.add(seed)
@@ -526,6 +552,15 @@ def _replay_complete_manifest_rows(
                 per_seed[decision] = per_seed.get(decision, 0) + 1
         counts_by_scope[scope] = seed_counts
         malformed_seeds_by_scope[scope] = malformed
+        try:
+            inventory_after = scope_inventory_sha256(scope)
+        except ValueError as error:
+            raise ArtifactBuildError(str(error)) from error
+        if inventory_before != inventory_after:
+            raise ArtifactBuildError(
+                f"held-out replay scope changed during preflight: {scope}"
+            )
+        scope_inventories[scope] = inventory_after
 
     complete: set[int] = set()
     rejected_noncontiguous = 0
@@ -564,13 +599,17 @@ def _replay_complete_manifest_rows(
         else:
             rejected_noncontiguous += 1
 
-    return complete, {
-        "contract": REPLAY_CONTRACT,
-        "candidate_states": len(candidate_indices),
-        "replay_complete_states": len(complete),
-        "rejected_bad_source": rejected_bad_source,
-        "rejected_noncontiguous": rejected_noncontiguous,
-    }
+    return (
+        complete,
+        {
+            "contract": REPLAY_CONTRACT,
+            "candidate_states": len(candidate_indices),
+            "replay_complete_states": len(complete),
+            "rejected_bad_source": rejected_bad_source,
+            "rejected_noncontiguous": rejected_noncontiguous,
+        },
+        scope_inventories,
+    )
 
 
 def build_bucket_game_report(

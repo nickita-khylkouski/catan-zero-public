@@ -40,6 +40,7 @@ from tools.high_regret_suite_contract import (  # noqa: E402
     bind_state_to_manifest,
     load_source_manifest,
     validate_replay_metadata,
+    validate_replay_trajectories,
 )
 from tools.sprt_gate import evaluate_pentanomial_sprt, pair_scores_from_h2h_games  # noqa: E402
 
@@ -1663,6 +1664,8 @@ def _verify_high_regret_source(
     champion_sha256: str,
     where: str,
     sealed_semantics: dict[str, Any],
+    candidate_search_config: dict[str, Any],
+    champion_search_config: dict[str, Any],
 ) -> None:
     expected_keys = {
         "schema_version",
@@ -1765,8 +1768,36 @@ def _verify_high_regret_source(
         raise PromotionError(f"{where}.report has no evaluation_config")
     _require_sealed_semantics(
         evaluation_config,
-        sealed_semantics,
+        {
+            **sealed_semantics,
+            "candidate_c_scale": candidate_search_config["c_scale"],
+            "baseline_c_scale": champion_search_config["c_scale"],
+            "candidate_n_full": sealed_semantics["n_full"],
+            "baseline_n_full": sealed_semantics["n_full"],
+            "candidate_n_full_wide": sealed_semantics["n_full_wide"],
+            "baseline_n_full_wide": sealed_semantics["n_full_wide"],
+            "candidate_n_full_wide_threshold": sealed_semantics[
+                "n_full_wide_threshold"
+            ],
+            "baseline_n_full_wide_threshold": sealed_semantics[
+                "n_full_wide_threshold"
+            ],
+            "candidate_value_readout": sealed_semantics["value_readout"],
+            "baseline_value_readout": sealed_semantics["value_readout"],
+        },
         where=f"{where}.report.evaluation_config",
+    )
+    _verify_role_search_pair(
+        {
+            **candidate_search_config,
+            "c_scale": evaluation_config["candidate_c_scale"],
+        },
+        {
+            **champion_search_config,
+            "c_scale": evaluation_config["baseline_c_scale"],
+        },
+        sealed_semantics=sealed_semantics,
+        where=f"{where}.report deployed search",
     )
     suite = _require_exact_keys(
         _load_json(suite_path),
@@ -1838,6 +1869,9 @@ def _verify_high_regret_source(
         )
     state_by_pair: dict[int, tuple[int, int]] = {}
     actual_strata = {label: 0 for label in expected_strata}
+    inventory_cache: dict[Path, tuple[str, int]] = {}
+    source_row_cache: dict[Path, tuple[Any, Any, int]] = {}
+    bound_states: list[dict[str, Any]] = []
     for index, raw_state in enumerate(states):
         try:
             state = bind_state_to_manifest(
@@ -1846,6 +1880,8 @@ def _verify_high_regret_source(
                 manifest_path=source_manifest_path,
                 shard_paths=shard_paths,
                 identities=manifest_identities,
+                inventory_cache=inventory_cache,
+                source_row_cache=source_row_cache,
             )
         except ValueError as error:
             raise PromotionError(f"{where}.suite.states[{index}] {error}") from error
@@ -1869,6 +1905,7 @@ def _verify_high_regret_source(
         ):
             raise PromotionError(f"{where}.suite.states[{index}] has invalid identity")
         state_by_pair[pair_id] = (game_seed, decision_index)
+        bound_states.append(state)
         phase = str(state.get("phase", "")).upper()
         if "BUILD_INITIAL_SETTLEMENT" in phase or "BUILD_INITIAL_ROAD" in phase:
             phase_stratum = "opening"
@@ -1883,6 +1920,10 @@ def _verify_high_regret_source(
             actual_strata["41+"] += 1
     if any(actual_strata[label] < stratum_min_pairs for label in expected_strata):
         raise PromotionError(f"{where} held-out suite lacks required stratum coverage")
+    try:
+        validate_replay_trajectories(bound_states)
+    except ValueError as error:
+        raise PromotionError(f"{where} {error}") from error
     games = report["games"]
     if not isinstance(games, list) or not games:
         raise PromotionError(f"{where}.report has no raw paired games")
@@ -2290,6 +2331,8 @@ def _verify_promotion_evidence(
             champion_sha256=champion["sha256"],
             where="high-regret comparison",
             sealed_semantics=sealed_semantics,
+            candidate_search_config=candidate["search_config"],
+            champion_search_config=champion["search_config"],
         )
         if value["verdict"] != "pass":
             raise PromotionError("high-regret envelope verdict is not pass")

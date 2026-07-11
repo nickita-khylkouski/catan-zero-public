@@ -12,6 +12,7 @@ import numpy as np
 from tools import a1_promotion_transaction as promotion
 from tools import a1_one_dose_train as one_dose
 from tools.champion_registry import ChampionRegistry
+from tools.high_regret_suite_contract import REPLAY_CONTRACT, scope_inventory_sha256
 
 
 def _write_json(path: Path, value: object) -> None:
@@ -459,11 +460,13 @@ def _fixture(tmp_path: Path, *, promotion_count: int = 0, n_full: int = 128) -> 
         )
         external_sources.append((role, source))
 
-    high_regret_source_shard = tmp_path / "source-shard.npz"
+    high_regret_scope = tmp_path / "high-regret-worker"
+    high_regret_scope.mkdir()
+    high_regret_source_shard = high_regret_scope / "source-shard.npz"
     np.savez(
         high_regret_source_shard,
         game_seed=np.arange(7_000_000, 7_000_200, dtype=np.int64),
-        decision_index=np.arange(200, dtype=np.int32) % 20,
+        decision_index=np.zeros(200, dtype=np.int32),
         action_taken=np.arange(200, dtype=np.int32),
     )
     high_regret_source_manifest = tmp_path / "high_regret.source.npz"
@@ -473,8 +476,9 @@ def _fixture(tmp_path: Path, *, promotion_count: int = 0, n_full: int = 128) -> 
         shard_id=np.zeros(200, dtype=np.int32),
         row_index=np.arange(200, dtype=np.int32),
         game_seed=np.arange(7_000_000, 7_000_200, dtype=np.int64),
-        decision_index=np.arange(200, dtype=np.int32) % 20,
+        decision_index=np.zeros(200, dtype=np.int32),
     )
+    scope_digest, scope_count = scope_inventory_sha256(high_regret_scope)
     high_regret_suite = tmp_path / "high_regret.suite.json"
     high_regret_suite_payload = {
         "schema_version": promotion.HIGH_REGRET_SUITE_SCHEMA,
@@ -496,7 +500,7 @@ def _fixture(tmp_path: Path, *, promotion_count: int = 0, n_full: int = 128) -> 
                 "41+": 20,
             },
             "replay_preflight": {
-                "contract": "authoritative-shard-parent-unique-contiguous-trajectory-v2",
+                "contract": REPLAY_CONTRACT,
                 "candidate_states": 200,
                 "replay_complete_states": 200,
                 "rejected_bad_source": 0,
@@ -506,11 +510,11 @@ def _fixture(tmp_path: Path, *, promotion_count: int = 0, n_full: int = 128) -> 
         "states": [
             {
                 "pair_id": pair,
-                "shard_path": str(tmp_path / "source-shard.npz"),
+                "shard_path": str(high_regret_source_shard),
                 "shard_id": 0,
                 "row_index": pair,
                 "game_seed": 7_000_000 + pair,
-                "decision_index": pair % 20,
+                "decision_index": 0,
                 "phase": (
                     "BUILD_INITIAL_SETTLEMENT",
                     "MOVE_ROBBER",
@@ -520,8 +524,10 @@ def _fixture(tmp_path: Path, *, promotion_count: int = 0, n_full: int = 128) -> 
                 "legal_count": 54 if pair < 20 else 12,
                 "regret_score": 1.0,
                 "replay_source": {
-                    "contract": "authoritative-shard-parent-unique-contiguous-trajectory-v2",
-                    "scope": str(tmp_path),
+                    "contract": REPLAY_CONTRACT,
+                    "scope": str(high_regret_scope),
+                    "scope_inventory_sha256": scope_digest,
+                    "scope_shard_count": scope_count,
                 },
             }
             for pair in range(200)
@@ -537,7 +543,7 @@ def _fixture(tmp_path: Path, *, promotion_count: int = 0, n_full: int = 128) -> 
             "orientation": orientation,
             "candidate_won": True,
             "archived_game_seed": 7_000_000 + pair,
-            "archived_decision_index": pair % 20,
+            "archived_decision_index": 0,
             "buckets": ["phase:BUILD", "close"],
         }
         for pair in range(200)
@@ -563,7 +569,19 @@ def _fixture(tmp_path: Path, *, promotion_count: int = 0, n_full: int = 128) -> 
             "suite_manifest": _checkpoint_ref(high_regret_suite),
             "candidate": _checkpoint_ref(candidate),
             "champion": _checkpoint_ref(champion),
-            "evaluation_config": evidence_semantics,
+            "evaluation_config": {
+                **evidence_semantics,
+                "candidate_c_scale": candidate_search_config["c_scale"],
+                "baseline_c_scale": champion_search_config["c_scale"],
+                "candidate_n_full": 128,
+                "baseline_n_full": 128,
+                "candidate_n_full_wide": None,
+                "baseline_n_full_wide": None,
+                "candidate_n_full_wide_threshold": None,
+                "baseline_n_full_wide_threshold": None,
+                "candidate_value_readout": "scalar",
+                "baseline_value_readout": "scalar",
+            },
             "errors": [],
             "games": high_regret_games,
             "pentanomial_sprt": high_pentanomial,
@@ -1522,6 +1540,28 @@ def test_high_regret_report_cannot_launder_sealed_search_config(
         _execute(fixture, go=False)
 
 
+def test_high_regret_report_binds_candidate_and_incumbent_role_scales(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path)
+
+    def mutate(source: dict) -> None:
+        report_path = Path(source["report"]["path"])
+        report = json.loads(report_path.read_text())
+        report["evaluation_config"]["baseline_c_scale"] = report[
+            "evaluation_config"
+        ]["candidate_c_scale"]
+        _write_json(report_path, report)
+        source["report"]["sha256"] = promotion._sha256(report_path)
+
+    _mutate_evidence_source(
+        fixture, kind="high_regret", role="high_regret", mutate=mutate
+    )
+
+    with pytest.raises(promotion.PromotionError, match="baseline_c_scale"):
+        _execute(fixture, go=False)
+
+
 def test_high_regret_games_must_match_frozen_suite_state_identities(
     tmp_path: Path,
 ) -> None:
@@ -1547,6 +1587,17 @@ def test_high_regret_games_must_match_frozen_suite_state_identities(
     )
 
     with pytest.raises(promotion.PromotionError, match="not bound to source manifest"):
+        _execute(fixture, go=False)
+
+
+def test_high_regret_promotion_rejects_replaced_replay_scope_bytes(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path)
+    source_shard = tmp_path / "high-regret-worker/source-shard.npz"
+    source_shard.write_bytes(b"forged easier archived trajectory")
+
+    with pytest.raises(promotion.PromotionError, match="scope inventory drifted"):
         _execute(fixture, go=False)
 
 
