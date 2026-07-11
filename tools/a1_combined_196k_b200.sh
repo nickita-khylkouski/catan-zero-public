@@ -25,17 +25,35 @@ receipt=$out/training.receipt.json
 }
 mkdir -p "$out"
 
+tmp_raw=$out/.learner.spec.$$.raw
 tmp_spec=$out/.learner.spec.$$.tmp
 "$python" "$repo/tools/a1_dual_learner_contract.py" inspect-spec \
   --data "$data" --validation "$validation" \
-  --producer-checkpoint "$producer" --world-size 8 >"$tmp_spec"
-"$python" - "$tmp_spec" <<'PY'
+  --producer-checkpoint "$producer" --world-size 8 >"$tmp_raw"
+# Old reviewed runtimes emitted zero or more progress JSON objects before the
+# final spec on stdout.  Normalize that stream while new runtimes keep stdout
+# machine-readable directly.
+"$python" - "$tmp_raw" "$tmp_spec" <<'PY'
 import json, pathlib, sys
-p = pathlib.Path(sys.argv[1])
-v = json.loads(p.read_text())
+source, target = map(pathlib.Path, sys.argv[1:])
+text = source.read_text()
+decoder = json.JSONDecoder()
+values, offset = [], 0
+while offset < len(text):
+    while offset < len(text) and text[offset].isspace():
+        offset += 1
+    if offset == len(text):
+        break
+    value, offset = decoder.raw_decode(text, offset)
+    values.append(value)
+if not values or any(not isinstance(row, dict) or "progress" not in row for row in values[:-1]):
+    raise SystemExit("REFUSED: unexpected inspect-spec stdout stream")
+v = values[-1]
 assert v["arm_id"] == "n128" and v["subset_id"] == "full-140k"
 assert v["topology"]["world_size"] == 8 and v["topology"]["global_batch_size"] == 4096
+target.write_text(json.dumps(v, indent=2, sort_keys=True) + "\n")
 PY
+rm -f "$tmp_raw"
 if [[ -e "$spec" ]]; then
   cmp -s "$tmp_spec" "$spec" || { echo "REFUSED: learner spec drift" >&2; exit 2; }
   rm -f "$tmp_spec"
