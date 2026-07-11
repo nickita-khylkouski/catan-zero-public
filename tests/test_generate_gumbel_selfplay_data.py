@@ -96,6 +96,28 @@ def test_dual_pipeline_topology_is_validated_and_recorded(tmp_path):
     assert summary["fleet_pipeline_id"] == "claim-gpu0-pipeline1"
 
 
+def test_manifest_cli_provenance_normalizes_path_arguments(tmp_path):
+    parser = cli.build_parser()
+    guard_config = tmp_path / "prelaunch-guard.json"
+    args = parser.parse_args(
+        [
+            "--out-dir",
+            str(tmp_path / "out"),
+            "--prelaunch-guard-config",
+            str(guard_config),
+        ]
+    )
+
+    summary = cli._merge_worker_summaries(
+        [], out_dir=tmp_path / "out", elapsed_sec=1.0, args=args
+    )
+
+    # The production failure happened only after every worker had completed,
+    # when the strict top-level manifest writer encountered argparse's Path.
+    json.dumps(summary)
+    assert summary["cli_args"]["prelaunch_guard_config"] == str(guard_config)
+
+
 def test_dual_pipeline_index_must_fit_pipeline_count(tmp_path, capsys):
     with pytest.raises(SystemExit) as exc_info:
         cli.main(

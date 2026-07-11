@@ -1776,6 +1776,34 @@ def _run_worker(
     return summary
 
 
+def _json_cli_value(value: Any) -> Any:
+    """Return a strict-JSON representation of one parsed CLI value.
+
+    ``argparse`` options with ``type=Path`` remain ``Path`` objects after
+    parsing.  The top-level generation manifest records the complete parsed
+    argument set, so those values must be normalized before the strict atomic
+    JSON writer sees them.  Keep this conversion local to CLI provenance:
+    silently teaching the shared writer to stringify arbitrary objects would
+    hide schema mistakes elsewhere.
+    """
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(key): _json_cli_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_cli_value(item) for item in value]
+    raise TypeError(
+        "unsupported parsed CLI value in manifest provenance: "
+        f"{type(value).__name__}"
+    )
+
+
+def _json_cli_args(args: argparse.Namespace) -> dict[str, Any]:
+    return {key: _json_cli_value(value) for key, value in vars(args).items()}
+
+
 def _merge_worker_summaries(
     results: list[dict[str, Any]],
     *,
@@ -1943,7 +1971,7 @@ def _merge_worker_summaries(
         "fleet_pipeline_id": getattr(args, "fleet_pipeline_id", None),
         # Complete CLI-argument provenance so a shard batch is auditable after
         # the process exits (per build-equiv pilot-audit finding 2026-07-04).
-        "cli_args": {key: value for key, value in vars(args).items()},
+        "cli_args": _json_cli_args(args),
         "elapsed_sec": elapsed_sec,
         "rows_per_sec": rows / max(elapsed_sec, 1.0e-9),
         "shards": shards,
