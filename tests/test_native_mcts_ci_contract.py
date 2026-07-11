@@ -18,6 +18,7 @@ def test_native_ci_builds_cp311_wheel_and_asserts_symbols() -> None:
     assert 'getattr(catanatron_rs, "gumbel_search", None)' in source
     assert 'getattr(catanatron_rs, "build_entity_features_flat", None)' in source
     assert "tests/test_native_gumbel_hot_loop.py" in source
+    assert "tests/test_native_information_set_search.py" in source
     assert "tests/test_generate_native_rollout.py" in source
 
 
@@ -28,6 +29,8 @@ def test_native_ci_has_non_skipping_rust_gates() -> None:
         "cargo fmt --manifest-path native/gumbel_mcts_rs/Cargo.toml",
         "cargo check --locked --manifest-path native/gumbel_mcts_rs/Cargo.toml",
         "cargo test --locked --manifest-path native/gumbel_mcts_rs/Cargo.toml",
+        "cargo clippy --locked --manifest-path native/gumbel_mcts_rs/Cargo.toml --all-targets -- -D warnings",
+        "cargo clippy --locked --manifest-path native/catanatron-rs/python/Cargo.toml --all-targets -- -D warnings",
         "cargo check --locked --manifest-path native/catanatron-rs/python/Cargo.toml",
         "cargo test --locked --manifest-path native/catanatron-rs/Cargo.toml",
     ):
