@@ -410,6 +410,75 @@ def _lane(tmp_path: Path, commands: list[dict]) -> tuple[Path, dict]:
     return path, lane
 
 
+def _arm_lane(tmp_path: Path, arm_id: str) -> tuple[Path, dict]:
+    _lock_path, _render_path, _lock, rendered = _fixture(tmp_path)
+    commands = rendered["commands"][:3]
+    for command in commands:
+        command["arm_id"] = arm_id
+        argv = command["argv"]
+        argv[argv.index("--n-full") + 1] = str(supervisor.ARM_N_FULL[arm_id])
+        argv.extend(["--generation-arm-id", arm_id])
+        command["argv_sha256"] = supervisor._digest(argv)
+    return _lane(tmp_path, commands)
+
+
+@pytest.mark.parametrize("arm_id", ["n128", "n256"])
+def test_supervisor_accepts_live_shaped_arm_lane(
+    tmp_path: Path, arm_id: str
+) -> None:
+    lane_path, _lane_payload = _arm_lane(tmp_path, arm_id)
+
+    loaded = supervisor.load_lane(lane_path)
+
+    assert {command["arm_id"] for command in loaded["commands"]} == {arm_id}
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("missing_command_arm", "requires one command arm_id"),
+        ("missing_argv_arm", "requires one command arm_id"),
+        ("unknown_arm", "unknown generation arm"),
+        ("mismatched_markers", "generation arms mismatch"),
+        ("mixed_jobs", "mixes generation arms"),
+        ("wrong_budget", "requires --n-full 256"),
+        ("adaptive_override", "forbid adaptive/wide overrides"),
+    ],
+)
+def test_supervisor_rejects_malformed_live_shaped_arm_lane(
+    tmp_path: Path, mutation: str, message: str
+) -> None:
+    lane_path, lane = _arm_lane(tmp_path, "n256")
+    command = lane["commands"][1]
+    argv = command["argv"]
+    arm_index = argv.index("--generation-arm-id")
+    if mutation == "missing_command_arm":
+        command.pop("arm_id")
+    elif mutation == "missing_argv_arm":
+        del argv[arm_index : arm_index + 2]
+    elif mutation == "unknown_arm":
+        command["arm_id"] = "n512"
+        argv[arm_index + 1] = "n512"
+    elif mutation == "mismatched_markers":
+        argv[arm_index + 1] = "n128"
+    elif mutation == "mixed_jobs":
+        command["arm_id"] = "n128"
+        argv[arm_index + 1] = "n128"
+        argv[argv.index("--n-full") + 1] = "128"
+    elif mutation == "wrong_budget":
+        argv[argv.index("--n-full") + 1] = "128"
+    elif mutation == "adaptive_override":
+        argv.extend(["--n-full-wide", "512"])
+    command["argv_sha256"] = supervisor._digest(argv)
+    lane["lane_sha256"] = supervisor._digest(
+        {key: value for key, value in lane.items() if key != "lane_sha256"}
+    )
+    lane_path.write_text(json.dumps(lane), encoding="utf-8")
+
+    with pytest.raises(supervisor.SupervisorError, match=message):
+        supervisor.load_lane(lane_path)
+
+
 def _complete_output(command: dict) -> None:
     argv = command["argv"]
     out = Path(argv[argv.index("--out-dir") + 1])

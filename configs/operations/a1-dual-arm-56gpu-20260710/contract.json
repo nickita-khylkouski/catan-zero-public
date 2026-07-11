@@ -146,6 +146,7 @@
       {"path": "tools/generate_gumbel_selfplay_data.py", "sha256": "sha256:8ad7dac025d15213d230b463d5828c2d3f96181f704eb8d88d3b27606d6cadc1"},
       {"path": "tools/launcher_guards.py", "sha256": "sha256:76b9acc5a33acdfe2c0d1a845b9fd932a687b3202e7fb56344c967e1b0b4d5fb"},
       {"path": "tools/prelaunch_guard.py", "sha256": "sha256:beb03f5e017736d4c61a688d343607cf1ca06d15bae8d6facc835a64eaf2e553"},
+      {"path": "tools/fleet/a1_lane_supervisor.py", "sha256": "sha256:6ce13e5081bb6aa5a236723b40f38df0951e07a558d86ed123f055317a5d5893"},
       {"path": "tools/fleet/systemd/nvidia-mps.service", "sha256": "sha256:1523880d88af31bed6c2ccb03aaa15dab300b0989cc0bcc3aea55c31f1305e75"},
       {"path": "tools/opponent_mix_registry.py", "sha256": "sha256:02c3bf39a4ad59b59a4f6271b9233a735c32377387d65f94a27d522578d43be4"},
       {"path": "src/catan_zero/rl/gumbel_self_play.py", "sha256": "sha256:3cbe241092a7a6234d6e80b9941f59389e3b54475794f95d92d30f1eadc19a7a"},
@@ -175,5 +176,5 @@
     "required_harvest": "tools/fleet/a1_harvest_transaction.py",
     "materialization": "seal_with_a1_pre_wave_contract_after_handoff_and_placement"
   },
-  "contract_sha256": "sha256:ceecfa414c006dbe37c34b7b8d1e2f27d4028779d3c49626b6b9562ebeb99153"
+  "contract_sha256": "sha256:326655664b1a666189ff45698ddc1d28823cf5268a3bcd2716bcc24fdb892099"
 }

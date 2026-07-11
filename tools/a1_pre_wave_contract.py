@@ -2670,6 +2670,7 @@ def validate_generation_campaign(path: Path, *, require_ready: bool = False) -> 
         "tools/launcher_guards.py",
         "tools/prelaunch_guard.py",
         "tools/fleet/a1_production_executor.py",
+        "tools/fleet/a1_lane_supervisor.py",
         "tools/fleet/a1_harvest_transaction.py",
         "configs/gpu_fleet_56.json",
     }

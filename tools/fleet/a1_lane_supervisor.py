@@ -44,6 +44,7 @@ FORBIDDEN_ADAPTIVE_ARGV = (
     "--n-full-wide-threshold",
     "--raw-policy-above-width",
 )
+ARM_N_FULL = {"n128": 128, "n256": 256}
 
 
 class SupervisorError(RuntimeError):
@@ -269,6 +270,8 @@ def load_lane(path: Path) -> dict[str, Any]:
     worker = lane.get("worker_id")
     gpu = str(lane.get("gpu"))
     previous: str | None = None
+    lane_arm: str | None = None
+    saw_legacy_job = False
     for index, command in enumerate(commands):
         if command.get("worker_id") != worker or str(command.get("gpu")) != gpu:
             raise SupervisorError("lane mixes workers or physical GPUs")
@@ -281,12 +284,50 @@ def load_lane(path: Path) -> dict[str, Any]:
             raise SupervisorError("guard/seed-claim bypass is forbidden")
         if "--resume" not in argv:
             raise SupervisorError("exact A1 jobs must carry explicit --resume")
+        if argv.count("--n-full") != 1:
+            raise SupervisorError("exact A1 job requires one --n-full")
         try:
             n_full = int(argv[argv.index("--n-full") + 1])
         except (ValueError, IndexError) as error:
-            raise SupervisorError("exact A1 job lacks --n-full") from error
-        if n_full != 128 or any(flag in argv for flag in FORBIDDEN_ADAPTIVE_ARGV):
-            raise SupervisorError("exact A1 jobs require n128 with no adaptive/wide override")
+            raise SupervisorError("exact A1 job has invalid --n-full") from error
+        if any(flag in argv for flag in FORBIDDEN_ADAPTIVE_ARGV):
+            raise SupervisorError("exact A1 jobs forbid adaptive/wide overrides")
+
+        command_arm = command.get("arm_id")
+        arm_flag_count = argv.count("--generation-arm-id")
+        if command_arm is None and arm_flag_count == 0:
+            # Preserve support for pre-dual-arm n128 lanes. Once either arm
+            # marker is present, both markers are mandatory on all three jobs.
+            if lane_arm is not None:
+                raise SupervisorError("lane mixes legacy and arm-sealed jobs")
+            saw_legacy_job = True
+            expected_n_full = 128
+        else:
+            if command_arm is None or arm_flag_count != 1:
+                raise SupervisorError(
+                    "arm-sealed job requires one command arm_id and one "
+                    "--generation-arm-id"
+                )
+            if not isinstance(command_arm, str) or command_arm not in ARM_N_FULL:
+                raise SupervisorError(f"unknown generation arm: {command_arm!r}")
+            try:
+                argv_arm = argv[argv.index("--generation-arm-id") + 1]
+            except IndexError as error:
+                raise SupervisorError("generation arm flag lacks a value") from error
+            if argv_arm != command_arm:
+                raise SupervisorError("command and argv generation arms mismatch")
+            if saw_legacy_job:
+                raise SupervisorError("lane mixes legacy and arm-sealed jobs")
+            if lane_arm is None:
+                lane_arm = command_arm
+            elif command_arm != lane_arm:
+                raise SupervisorError("lane mixes generation arms")
+            expected_n_full = ARM_N_FULL[command_arm]
+        if n_full != expected_n_full:
+            arm_name = command_arm if command_arm is not None else "legacy n128"
+            raise SupervisorError(
+                f"generation arm {arm_name} requires --n-full {expected_n_full}"
+            )
         expected_dependencies = [] if index == 0 else [previous]
         if command.get("must_run_after") != expected_dependencies:
             raise SupervisorError("job dependency order drift")
