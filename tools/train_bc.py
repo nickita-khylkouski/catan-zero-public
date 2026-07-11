@@ -9141,9 +9141,14 @@ def _field_stats(
     *,
     field: str,
 ) -> dict[str, dict[str, int]]:
-    values = np.asarray(data.get(field, np.asarray(["unknown"] * len(data["action_taken"]))))[
-        batch
-    ].astype(str)
+    if field in data:
+        values = np.asarray(data[field])[batch].astype(str)
+    else:
+        # The old ``dict.get`` default constructed a full-corpus Python string
+        # list eagerly even when ``field`` existed.  Validation calls this for
+        # every batch, turning a 12M-row corpus into minutes of CPU allocation
+        # per batch.  Missing fields need only one constant per requested row.
+        values = np.full(len(batch), "unknown", dtype="<U7")
     top3 = _numpy_topk_contains(logits, targets, k=3)
     stats = _empty_phase_stats()
     for value, pred, target, in_top3 in zip(values, predictions, targets, top3, strict=False):
