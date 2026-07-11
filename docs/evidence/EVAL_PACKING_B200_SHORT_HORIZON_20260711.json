@@ -1,0 +1,105 @@
+{
+  "schema_version": "eval-packing-short-horizon-evidence-v1",
+  "status": "canary_recommendation_only",
+  "host": "132-145-197-81",
+  "accelerator": "NVIDIA B200",
+  "gpu": 0,
+  "cuda_visible_devices": "0",
+  "cpu_affinity_grid": "0-25",
+  "mps": "active",
+  "repo_commit": "c807874",
+  "checkpoint": "/home/ubuntu/catan-zero/runs/bc/gen3_20260706/checkpoint.pt",
+  "checkpoint_role": "same checkpoint on both H2H sides; packing measurement only",
+  "fixed_workload": {
+    "pairs": 24,
+    "games": 48,
+    "base_seed": 6199900100,
+    "n_full": 16,
+    "max_decisions": 60,
+    "threads_per_worker": 1,
+    "public_observation": true,
+    "information_set_search": true,
+    "determinization_particles": 4,
+    "determinization_min_simulations": 32,
+    "symmetry_averaged_eval": true,
+    "symmetry_averaged_eval_threshold": 20,
+    "lazy_interior_chance": true,
+    "correct_rust_chance_spectra": true,
+    "c_scale": 0.03
+  },
+  "points": [
+    {
+      "workers": 8,
+      "cpu_affinity": "0-25",
+      "wall_sec": 41.573824893,
+      "games": 48,
+      "truncated": 48,
+      "errors": 0,
+      "simulations": 22096,
+      "games_per_sec": 1.1545726216805712,
+      "simulations_per_sec": 531.4882635136229
+    },
+    {
+      "workers": 16,
+      "cpu_affinity": "0-25",
+      "wall_sec": 35.872443333,
+      "games": 48,
+      "truncated": 48,
+      "errors": 0,
+      "simulations": 21760,
+      "games_per_sec": 1.3380744532626676,
+      "simulations_per_sec": 606.5937521457427
+    },
+    {
+      "workers": 24,
+      "cpu_affinity": "0-25",
+      "wall_sec": 36.540260241,
+      "games": 48,
+      "truncated": 48,
+      "errors": 0,
+      "simulations": 22032,
+      "games_per_sec": 1.3136195441252385,
+      "simulations_per_sec": 602.9513707534845
+    },
+    {
+      "workers": 8,
+      "cpu_affinity": "unbound",
+      "wall_sec": 37.214548647,
+      "games": 48,
+      "truncated": 48,
+      "errors": 0,
+      "simulations": 22096,
+      "games_per_sec": 1.2898181422353339,
+      "simulations_per_sec": 593.7462848089987
+    },
+    {
+      "workers": 16,
+      "cpu_affinity": "unbound",
+      "wall_sec": 31.782867015,
+      "games": 48,
+      "truncated": 48,
+      "errors": 0,
+      "simulations": 21760,
+      "games_per_sec": 1.510247643088532,
+      "simulations_per_sec": 684.6455982001345
+    }
+  ],
+  "comparisons": {
+    "16_vs_8_simulations_per_sec_gain_fraction": 0.1413135669,
+    "16_vs_24_simulations_per_sec_gain_fraction": 0.0060406551,
+    "unbound_16_vs_unbound_8_simulations_per_sec_gain_fraction": 0.1530945384,
+    "unbound_vs_bound_16_simulations_per_sec_gain_fraction": 0.1286723541
+  },
+  "recommendation": "Use unbound 16 workers/GPU for the next full-game H100 packing canary. Do not add GPU-local CPU affinity: it regressed this B200 workload. Retain the sealed production default until the H100 canary confirms end-to-end games/hour and zero errors.",
+  "limitations": [
+    "Every game intentionally stopped at max_decisions=60, so this is a short-horizon packing microbenchmark, not full-game throughput proof.",
+    "The evaluator derives search RNG seeds from worker index; changing worker count therefore changes a small amount of explored work. Simulations/second is reported alongside equal game count to expose that variation.",
+    "This B200 result does not prove the H100 optimum. H100 full-game validation is required before changing the production worker default.",
+    "The unbound 8/16 controls used the same seeds and exact respective simulation counts as their bound counterparts, making the observed CPU-affinity regression directly comparable on this host.",
+    "No strength conclusion may be drawn because both roles used identical checkpoint bytes."
+  ],
+  "reproduction": {
+    "serialization": "worker counts ran sequentially in the order bound 8,16,24 then unbound 16,8",
+    "command_shape": "taskset -c 0-25 python tools/gumbel_search_cross_net_h2h.py --candidate CHECKPOINT --baseline CHECKPOINT --pairs 24 --base-seed 6199900100 --workers {8|16|24} --threads-per-worker 1 --device cuda --n-full 16 --max-decisions 60 --lazy-interior-chance --correct-rust-chance-spectra --public-observation --information-set-search --determinization-particles 4 --determinization-min-simulations 32 --symmetry-averaged-eval --symmetry-averaged-eval-threshold 20 --c-scale 0.03 --gate-config flywheel --out REPORT"
+  }
+}
