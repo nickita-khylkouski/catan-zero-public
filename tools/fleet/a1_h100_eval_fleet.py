@@ -51,6 +51,7 @@ EXPECTED_SHAPES = {
     "h100-8b": 8,
 }
 CANARY_ALIASES = {"c1", "h100-8a"}
+DEFAULT_WORKERS_PER_GPU = 16
 SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 SAFE_ADDRESS = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.:-]*$")
 
@@ -352,7 +353,7 @@ def build_plan(
     external_pairs: int,
     internal_base_seed: int,
     external_base_seed: int,
-    workers_per_gpu: int = 8,
+    workers_per_gpu: int = DEFAULT_WORKERS_PER_GPU,
     iteration_id: str = "a1",
     scope: str = "full",
     repo_root: Path = _REPO_ROOT,
@@ -1336,7 +1337,9 @@ def _parser() -> argparse.ArgumentParser:
     plan.add_argument("--external-pairs", type=int, default=500)
     plan.add_argument("--internal-base-seed", type=int, required=True)
     plan.add_argument("--external-base-seed", type=int, required=True)
-    plan.add_argument("--workers-per-gpu", type=int, default=8)
+    plan.add_argument(
+        "--workers-per-gpu", type=int, default=DEFAULT_WORKERS_PER_GPU
+    )
     plan.add_argument("--iteration-id", required=True)
     plan.add_argument("--scope", choices=("canary", "full"), default="full")
     plan.add_argument("--out", type=Path, required=True)
