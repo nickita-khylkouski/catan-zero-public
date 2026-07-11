@@ -6,7 +6,7 @@
   "implementation": {
     "initial_profile_commit": "4a6988a",
     "clone_reduction_commit": "a833ad3",
-    "profile_classifier_commit": "2260278",
+    "profile_classifier_commit": "43b8c78",
     "production_wiring_commit": "daac987",
     "wheel_sha256_after_clone_reduction": "sha256:2058f654d6e9d66164901d2d82586b4530ceb723229779798e3941034334c6ed"
   },
@@ -97,13 +97,13 @@
   "remote_artifacts": [
     {"path": "/home/ubuntu/native-hotloop-evidence/canonical-4a6988a/internal-native-wall.raw", "sha256": "dc175eeacbd78e04576fab1eed189148905700a014b624dcdc6b481303747b9a"},
     {"path": "/home/ubuntu/native-hotloop-evidence/canonical-4a6988a/internal-native-active.svg", "sha256": "f46aaaa158967d7729de1428ac338fccd94f346d73ac38d733fffd2136510e27"},
-    {"path": "/home/ubuntu/native-hotloop-evidence/canonical-4a6988a/internal-native-wall-analysis-v2.json", "sha256": "a414d780067ff56ae114477f2f90d0b852b5fa7b383668e293bf8dca1de39993"},
+    {"path": "/home/ubuntu/native-hotloop-evidence/canonical-4a6988a/internal-native-wall-analysis-v2.json", "sha256": "9d12c9a60b6ff4060904191038041d24c64abc18366010dff4b2b61fca4b38c8"},
     {"path": "/home/ubuntu/native-hotloop-evidence/canonical-4a6988a/neutral-native-wall.raw", "sha256": "da2d325d820a6637dec83fb9fe1e0a3607126b13189b39df97b13fd059b5cce7"},
     {"path": "/home/ubuntu/native-hotloop-evidence/canonical-4a6988a/neutral-native-active.svg", "sha256": "9d48c374ac30561ee788828c7db45adb9777da28f5a3201a0d9410e3bdf6df3a"},
-    {"path": "/home/ubuntu/native-hotloop-evidence/canonical-4a6988a/neutral-native-wall-analysis-v2.json", "sha256": "2f12119b51d14b4c3ee219cbed5fe51bf3fb52ef63a1a9ffed8e8f9f656e800f"},
+    {"path": "/home/ubuntu/native-hotloop-evidence/canonical-4a6988a/neutral-native-wall-analysis-v2.json", "sha256": "07fe8920b63262d905fb5d3f56a9b477795d0f3725ee5074b3e247fa57173d45"},
     {"path": "/home/ubuntu/native-hotloop-evidence/canonical-a833ad3/internal-native-postclone-wall.raw", "sha256": "81e06860392c0daff4c4e2f8be87824b3b20f8400fae365c810f2237def0417a"},
     {"path": "/home/ubuntu/native-hotloop-evidence/canonical-a833ad3/internal-native-postclone-active.svg", "sha256": "f4f6bc7557f8f085f9db365a88318a157b69d6cb35e212261a14db15d503ad1f"},
-    {"path": "/home/ubuntu/native-hotloop-evidence/canonical-a833ad3/internal-native-postclone-wall-analysis-v2.json", "sha256": "80bc2975cf8071da16da23f17d5f6781f8aa15b3c250eac2025e59473edd5684"}
+    {"path": "/home/ubuntu/native-hotloop-evidence/canonical-a833ad3/internal-native-postclone-wall-analysis-v2.json", "sha256": "c0714c48de7ba766bf6606eef6be76bf0cc50d7b3af4401e9d19162acfeb9ca1"}
   ],
   "scope": "Performance and semantic-canary evidence only; no Elo or promotion claim."
 }
