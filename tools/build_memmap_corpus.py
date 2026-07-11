@@ -85,10 +85,10 @@ DUAL_ARM_SUBSET_CATEGORY_COUNTS = {
         "recent_history": 16_800,
         "hard_negative": 5_600,
     },
-    ("n256", "full-140k"): {
-        "current_producer": 112_000,
-        "recent_history": 21_000,
-        "hard_negative": 7_000,
+    ("n256", "full-56k"): {
+        "current_producer": 44_800,
+        "recent_history": 8_400,
+        "hard_negative": 2_800,
     },
 }
 A1_SELECTION_RULE = "lowest_seed_complete_per_job"

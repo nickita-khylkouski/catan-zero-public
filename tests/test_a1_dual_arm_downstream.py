@@ -75,6 +75,42 @@ def test_dual_shape_preserves_historical_and_requires_exact_quotas() -> None:
         harvest._contract_shape(bad)  # noqa: SLF001
 
 
+def test_n256_full_56k_identity_is_exact_and_old_140k_label_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    expected = {
+        "current_producer": 44_800,
+        "recent_history": 8_400,
+        "hard_negative": 2_800,
+    }
+    assert corpus.DUAL_ARM_SUBSET_CATEGORY_COUNTS[("n256", "full-56k")] == expected
+    assert ("n256", "full-140k") not in corpus.DUAL_ARM_SUBSET_CATEGORY_COUNTS
+
+    payload = json.loads(_full_manifest(tmp_path).read_text())
+    payload["arm_id"] = "n256"
+    payload["subset_id"] = "full-56k"
+    for record in payload["records"]:
+        record["arm_id"] = "n256"
+    payload["records_sha256"] = corpus._value_sha256(payload["records"])  # noqa: SLF001
+    miniature_counts = payload["category_game_counts"]
+    monkeypatch.setattr(
+        corpus,
+        "DUAL_ARM_SUBSET_CATEGORY_COUNTS",
+        {("n256", "full-56k"): miniature_counts},
+    )
+    accepted = tmp_path / "n256-full-56k.json"
+    accepted.write_text(json.dumps(payload, sort_keys=True))
+    loaded = corpus._load_a1_selected_game_manifest(accepted)  # noqa: SLF001
+    assert loaded["arm_id"] == "n256"
+    assert loaded["subset_id"] == "full-56k"
+
+    payload["subset_id"] = "full-140k"
+    rejected = tmp_path / "n256-mislabeled-full-140k.json"
+    rejected.write_text(json.dumps(payload, sort_keys=True))
+    with pytest.raises(SystemExit, match="arm/subset category quotas"):
+        corpus._load_a1_selected_game_manifest(rejected)  # noqa: SLF001
+
+
 def test_n128_subsets_are_deterministic_stratified_and_arm_pure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
