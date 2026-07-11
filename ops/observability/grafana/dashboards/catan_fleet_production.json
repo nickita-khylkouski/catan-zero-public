@@ -166,7 +166,7 @@
     {
       "id": 13,
       "type": "stat",
-      "title": "Active A1 lanes / expected 40",
+      "title": "Active A1 lanes / expected 56",
       "description": "The sealed wave has exactly 40 physical H100 lanes.",
       "gridPos": {"h": 5, "w": 6, "x": 0, "y": 38},
       "datasource": {"type": "prometheus", "uid": "prometheus"},
@@ -177,7 +177,7 @@
     {
       "id": 14,
       "type": "stat",
-      "title": "Recipe-safe active lanes / expected 40",
+      "title": "Recipe-safe active lanes / expected 56",
       "description": "Active lanes matching every exact n128 information-set recipe field and the public target regime.",
       "gridPos": {"h": 5, "w": 6, "x": 6, "y": 38},
       "datasource": {"type": "prometheus", "uid": "prometheus"},

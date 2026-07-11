@@ -148,6 +148,9 @@ def test_committed_dashboard_covers_required_gpu_and_generator_metrics() -> None
         "catan_fleet_output_disk_free_bytes",
     ):
         assert metric in expressions
+    titles = {panel["title"] for panel in dashboard["panels"]}
+    assert "Active A1 lanes / expected 56" in titles
+    assert "Recipe-safe active lanes / expected 56" in titles
 
 
 def test_dashboard_box_filter_uses_prometheus_fleet_alias_consistently() -> None:

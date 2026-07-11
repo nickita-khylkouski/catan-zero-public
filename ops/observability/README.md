@@ -102,7 +102,7 @@ activity cannot trigger it. Before expanding beyond one host:
 5. use stale and exited-incomplete fixtures and verify both generator alerts;
 6. deliberately alter one canary recipe field and verify
    `CatanGeneratorRecipeMismatch` fires;
-7. verify the dashboard reaches exactly 40 active and 40 recipe-safe lanes;
+7. verify the dashboard reaches exactly 56 active and 56 recipe-safe lanes;
 8. verify no exporter port listens on a public interface.
 
 The dashboard is observability only. It never authorizes harvest, training,
