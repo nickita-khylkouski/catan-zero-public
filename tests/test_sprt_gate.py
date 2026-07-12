@@ -298,6 +298,41 @@ def test_pentanomial_extracts_more_than_concordant_from_same_pairs() -> None:
     assert concordant["decision"] == "continue"
 
 
+def test_pentanomial_continuations_recompute_union_instead_of_summing_llrs() -> None:
+    """Regression for sequential fleet continuations.
+
+    The statistic estimates variance over its complete input and applies one
+    regularizing prior, so independently finalized cohort LLRs are not
+    increments.  These are the exact three continuation cohorts from the
+    topology-gather audit: every cohort remains unresolved, while their raw
+    union resolves H1.  The raw-union replay is authoritative.
+    """
+    cohorts = ((10, 38, 12), (19, 64, 37), (33, 144, 43))
+    reports = [
+        evaluate_pentanomial_sprt(counts=counts, elo0=-10.0, elo1=15.0)
+        for counts in cohorts
+    ]
+    pooled_counts = tuple(sum(values) for values in zip(*cohorts))
+    pooled = evaluate_pentanomial_sprt(
+        counts=pooled_counts, elo0=-10.0, elo1=15.0
+    )
+
+    assert pooled_counts == (62, 246, 92)
+    assert [report["decision"] for report in reports] == [
+        "continue",
+        "continue",
+        "continue",
+    ]
+    assert sum(report["llr"] for report in reports) == pytest.approx(
+        4.73476002203981
+    )
+    assert pooled["llr"] == pytest.approx(5.097807900340944)
+    assert pooled["decision"] == "H1"
+    assert pooled["llr"] != pytest.approx(
+        sum(report["llr"] for report in reports)
+    )
+
+
 def test_evaluate_pentanomial_sprt_requires_pairs_or_counts() -> None:
     with pytest.raises(ValueError):
         evaluate_pentanomial_sprt()

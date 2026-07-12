@@ -354,6 +354,11 @@ def pool_internal(
         }
         if len(results) == 1:
             concordant.append(next(iter(results)))
+    # The mean/variance GSPRT is a terminal statistic with a pooled nuisance
+    # variance and one shared regularizing prior.  Per-cohort terminal LLRs are
+    # deliberately NOT summed: they are non-additive.  Recompute once from the
+    # union of retained raw games, which is the authoritative continuation
+    # verdict (see tools/sprt_gate.py).
     pentanomial = evaluate_pentanomial_sprt(
         pair_scores, elo0=-10.0, elo1=15.0, alpha=0.05, beta=0.05
     )
