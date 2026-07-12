@@ -130,8 +130,14 @@ def _args(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         "policy_distillation_component_ids": ["n128_current", "n256_current"],
         "value_training_component_ids": ["n128_current", "n256_current"],
     }, arm.corrected._file_ref(descriptor)))
+    executor = tmp_path / arm.EXECUTOR_RELATIVE_PATH
+    executor.parent.mkdir(exist_ok=True)
+    executor.write_text("# sealed topology executor\n", encoding="utf-8")
     monkeypatch.setattr(arm, "_source_binding", lambda repo: {
-        "repository_root": str(repo), "git_commit": "abc", "files": {}
+        "repository_root": str(repo), "git_commit": "abc",
+        "files": {
+            arm.EXECUTOR_RELATIVE_PATH: arm.corrected._file_ref(executor),
+        },
     })
     return type("Args", (), {
         "source_manifest": manifest,
@@ -148,8 +154,13 @@ def test_prepares_one_axis_gather_k3_without_launch(tmp_path, monkeypatch):
     manifest, path = arm.prepare(_args(tmp_path, monkeypatch))
     assert path.is_file()
     assert manifest["launch_authorized"] is False
-    assert manifest["diagnostic_execution_authorized"] is False
-    assert manifest["launch_interface_present"] is False
+    assert manifest["diagnostic_execution_authorized"] is True
+    assert manifest["launch_interface_present"] == (
+        "tools/a1_topology_gather_arm_execute.py --go"
+    )
+    assert manifest["diagnostic_executor"] == manifest["source_binding"]["files"][
+        arm.EXECUTOR_RELATIVE_PATH
+    ]
     assert manifest["only_declared_optimization_delta"] == "action_target_gather=true"
     assert manifest["matched_contract"]["dose_sampler_objective_operator_unchanged"] is True
     assert manifest["matched_contract"]["step0_network_outputs_bit_identical"] is True
@@ -158,10 +169,8 @@ def test_prepares_one_axis_gather_k3_without_launch(tmp_path, monkeypatch):
         arm.EXPECTED_NEW_PARAMETERS
     )
     assert len(manifest["corpus_topology_target_coverage"]["components"]) == 2
-    assert manifest["executor_compatibility"]["compatible_now"] is False
-    assert "exact a1-corrected-policy-arm-manifest-v1" in (
-        manifest["executor_compatibility"]["reason"]
-    )
+    assert manifest["executor_compatibility"]["compatible_now"] is True
+    assert manifest["executor_compatibility"]["one_shot"] is True
     command = manifest["command"]
     assert "--a1-learner-ablation-id" not in command
     assert arm.corrected._option(command, "--init-checkpoint") == str(

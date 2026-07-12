@@ -199,6 +199,31 @@ def execute(
     if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.@-]{0,79}", unit) is None:
         raise ExecutionError("systemd unit name is invalid")
     verified = verify(manifest_path)
+    return _submit_verified(
+        verified,
+        unit=unit,
+        runner=runner,
+        conflict_probe=conflict_probe,
+        claim_schema="a1-corrected-policy-arm-execution-claim-v1",
+        receipt_schema=RECEIPT_SCHEMA,
+        status_schema=STATUS_SCHEMA,
+    )
+
+
+def _submit_verified(
+    verified: dict[str, Any],
+    *,
+    unit: str,
+    runner: Callable[..., subprocess.CompletedProcess[str]],
+    conflict_probe: Callable[[], list[str]],
+    claim_schema: str,
+    receipt_schema: str,
+    status_schema: str,
+) -> dict[str, Any]:
+    """Submit one already schema-verified diagnostic with append-only evidence."""
+
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.@-]{0,79}", unit) is None:
+        raise ExecutionError("systemd unit name is invalid")
     conflicts = conflict_probe()
     if conflicts:
         raise ExecutionError(f"B200 compute is not idle: {conflicts}")
@@ -206,17 +231,22 @@ def execute(
     output_root.mkdir(parents=True, exist_ok=True)
     now = time.time_ns()
     claim = {
-        "schema_version": "a1-corrected-policy-arm-execution-claim-v1",
+        "schema_version": claim_schema,
         "created_at_unix_ns": now,
         "manifest": verified["manifest_ref"],
         "unit": unit,
     }
     claim["claim_sha256"] = prepare._digest(claim)  # noqa: SLF001
     claim_path = output_root / "diagnostic-execution.claim.json"
-    _write_exclusive(claim_path, claim)
+    try:
+        _write_exclusive(claim_path, claim)
+    except FileExistsError as error:
+        raise ExecutionError(
+            f"diagnostic execution was already claimed: {claim_path}"
+        ) from error
     status_path = output_root / "diagnostic-execution.status.jsonl"
     _append_status(status_path, {
-        "schema_version": STATUS_SCHEMA, "event": "authorized",
+        "schema_version": status_schema, "event": "authorized",
         "created_at_unix_ns": now, "claim_sha256": claim["claim_sha256"],
     })
     stdout = output_root / "stdout.log"
@@ -235,12 +265,12 @@ def execute(
         result = runner(systemd_command, check=True, text=True, capture_output=True)
     except (OSError, subprocess.CalledProcessError) as error:
         _append_status(status_path, {
-            "schema_version": STATUS_SCHEMA, "event": "submission_failed",
+            "schema_version": status_schema, "event": "submission_failed",
             "created_at_unix_ns": time.time_ns(), "error": str(error),
         })
         raise ExecutionError(f"systemd submission failed: {error}") from error
     receipt = {
-        "schema_version": RECEIPT_SCHEMA,
+        "schema_version": receipt_schema,
         "diagnostic_only": True,
         "promotion_eligible": False,
         "created_at_unix_ns": time.time_ns(),
@@ -255,7 +285,7 @@ def execute(
     receipt_path = output_root / "diagnostic-execution.receipt.json"
     _write_exclusive(receipt_path, receipt)
     _append_status(status_path, {
-        "schema_version": STATUS_SCHEMA, "event": "submitted",
+        "schema_version": status_schema, "event": "submitted",
         "created_at_unix_ns": receipt["created_at_unix_ns"],
         "receipt_sha256": receipt["receipt_sha256"], "unit": unit,
     })

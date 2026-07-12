@@ -28,8 +28,11 @@ from tools import a1_corrected_policy_arm as corrected  # noqa: E402
 
 SCHEMA = "a1-topology-gather-arm-manifest-v1"
 SOURCE_SCHEMA = corrected.SCHEMA
+EXECUTOR_RELATIVE_PATH = "tools/a1_topology_gather_arm_execute.py"
 SOURCE_FILES = (
     "tools/a1_topology_gather_arm.py",
+    EXECUTOR_RELATIVE_PATH,
+    "tools/a1_corrected_policy_arm_execute.py",
     "tools/a1_corrected_policy_arm.py",
     "tools/f69_upgrade_checkpoint_config.py",
     "tools/audit_memmap_architecture_targets.py",
@@ -353,13 +356,17 @@ def prepare(args: argparse.Namespace) -> tuple[dict[str, Any], Path]:
     # no hidden A1 ablation metadata flags; the sealed manifest recipe/hash is
     # the authoritative objective identity.
     source_binding = _source_binding(repo)
+    executor_ref = source_binding.get("files", {}).get(EXECUTOR_RELATIVE_PATH)
+    if not isinstance(executor_ref, dict):
+        raise ArmError("source binding does not authenticate the topology executor")
     manifest: dict[str, Any] = {
         "schema_version": SCHEMA,
         "diagnostic_only": True,
         "promotion_eligible": False,
         "launch_authorized": False,
-        "diagnostic_execution_authorized": False,
-        "launch_interface_present": False,
+        "diagnostic_execution_authorized": True,
+        "launch_interface_present": f"{EXECUTOR_RELATIVE_PATH} --go",
+        "diagnostic_executor": executor_ref,
         "source_corrected_k3_manifest": source_ref,
         "source_corrected_k3_manifest_sha256": source["manifest_sha256"],
         "source_recipe": source["recipe"],
@@ -387,20 +394,11 @@ def prepare(args: argparse.Namespace) -> tuple[dict[str, Any], Path]:
         "command": command,
         "command_sha256": corrected._digest(command),  # noqa: SLF001
         "executor_compatibility": {
-            "source_executor": "tools/a1_corrected_policy_arm_execute.py --go",
-            "source_executor_receipt_schema": (
-                "a1-corrected-policy-arm-execution-receipt-v1"
-            ),
-            "compatible_now": False,
-            "reason": (
-                "the corrected executor intentionally accepts only the exact "
-                "a1-corrected-policy-arm-manifest-v1 schema; this treatment remains "
-                "non-executable until corrected K3 is selected"
-            ),
-            "required_before_execution": (
-                "a separately reviewed topology manifest executor with the same "
-                "idle-B200, systemd, receipt, and output-exclusion guarantees"
-            ),
+            "executor": f"{EXECUTOR_RELATIVE_PATH} --go",
+            "receipt_schema": "a1-topology-gather-arm-execution-receipt-v1",
+            "compatible_now": True,
+            "idle_topology": "exactly_8_visible_B200s",
+            "one_shot": True,
         },
     }
     manifest["manifest_sha256"] = corrected._digest(manifest)  # noqa: SLF001
