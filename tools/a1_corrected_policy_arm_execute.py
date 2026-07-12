@@ -161,8 +161,11 @@ def verify(manifest_path: Path) -> dict[str, Any]:
         descriptor_meta, _ = prepare._preflight_descriptor(  # noqa: SLF001
             Path(manifest["descriptor"]["path"])
         )
+        policy_active_dose = prepare._derive_policy_active_dose(  # noqa: SLF001
+            descriptor_meta
+        )
         supervision_contract = prepare._next_supervision_contract(  # noqa: SLF001
-            descriptor_meta, command
+            descriptor_meta, command, policy_active_dose
         )
     except prepare.ArmError as error:
         raise ExecutionError(str(error)) from error
@@ -220,31 +223,81 @@ def verify_training_report(manifest_path: Path, report_path: Path) -> dict[str, 
         raise ExecutionError(f"training report is unreadable: {error}") from error
     if not isinstance(report, dict):
         raise ExecutionError("training report must contain an object")
+    exact_execution = {
+        "init_checkpoint_sha256": manifest["initialization"]["sha256"],
+        "optimizer_restored": False,
+        "resume_optimizer": False,
+        "resumed_optimizer_step": None,
+        "world_size": 8,
+        "batch_size": 512,
+        "max_steps": 1024,
+        "steps_completed": 1024,
+        "total_training_steps": 1024,
+        "data_fingerprint": manifest["descriptor_fingerprint"],
+        "input_validation_game_seed_manifest": manifest["validation_sentinel"]["path"],
+        "input_validation_game_seed_manifest_sha256": manifest["validation_sentinel"]["sha256"],
+        "input_validation_game_sentinel_manifest": manifest["validation_sentinel"]["path"],
+        "validation_game_seed_set_sha256": manifest[
+            "validation_sentinel_selection_sha256"
+        ],
+    }
+    observed_execution = {key: report.get(key) for key in exact_execution}
+    if observed_execution != exact_execution:
+        raise ExecutionError(
+            f"training report one-dose execution identity drift: {observed_execution}"
+        )
+    command = manifest.get("command")
+    if not isinstance(command, list):
+        raise ExecutionError("manifest training command is malformed")
+    command_bound_operator = {
+        "epochs": int(prepare._option(command, "--epochs")),  # noqa: SLF001
+        "lr": float(prepare._option(command, "--lr")),  # noqa: SLF001
+        "lr_warmup_steps": int(prepare._option(command, "--lr-warmup-steps")),  # noqa: SLF001
+        "lr_schedule": prepare._option(command, "--lr-schedule"),  # noqa: SLF001
+        "value_loss_weight": float(prepare._option(command, "--value-loss-weight")),  # noqa: SLF001
+        "value_lr_mult": float(prepare._option(command, "--value-lr-mult")),  # noqa: SLF001
+        "value_target_lambda": float(prepare._option(command, "--value-target-lambda")),  # noqa: SLF001
+        "forced_action_weight": float(prepare._option(command, "--forced-action-weight")),  # noqa: SLF001
+        "forced_row_value_weight": float(prepare._option(command, "--forced-row-value-weight")),  # noqa: SLF001
+        "policy_loss_weight": float(prepare._option(command, "--policy-loss-weight")),  # noqa: SLF001
+        "soft_target_temperature": float(prepare._option(command, "--soft-target-temperature")),  # noqa: SLF001
+        "soft_target_min_legal_coverage": float(
+            prepare._option(command, "--soft-target-min-legal-coverage")  # noqa: SLF001
+        ),
+        "mask_hidden_info": "--mask-hidden-info" in command,
+    }
+    observed_operator = {key: report.get(key) for key in command_bound_operator}
+    if observed_operator != command_bound_operator:
+        raise ExecutionError(
+            f"training report command-bound operator drift: {observed_operator}"
+        )
     contract = manifest.get("supervision_contract")
     if not isinstance(contract, dict) or contract.get(
         "schema_version"
     ) != prepare.SUPERVISION_CONTRACT_SCHEMA:
         raise ExecutionError("manifest has no next-learner supervision contract")
-    expected_current = list(prepare.CURRENT_TEACHER_COMPONENT_IDS)
+    expected_components = contract.get("component_ids")
+    if not isinstance(expected_components, list) or len(expected_components) < 2:
+        raise ExecutionError("manifest winning component scope is malformed")
     policy_scope = report.get("policy_distillation_scope")
     value_scope = report.get("value_training_scope")
     composite = report.get("memmap_composite")
     if not (
         isinstance(policy_scope, dict)
-        and policy_scope.get("component_ids") == expected_current
+        and policy_scope.get("component_ids") == expected_components
         and isinstance(value_scope, dict)
-        and value_scope.get("component_ids") == expected_current
+        and value_scope.get("component_ids") == expected_components
         and isinstance(composite, dict)
-        and composite.get("policy_distillation_component_ids") == expected_current
-        and composite.get("value_training_component_ids") == expected_current
-        and composite.get("policy_kl_anchor_component_ids") == expected_current
+        and composite.get("policy_distillation_component_ids") == expected_components
+        and composite.get("value_training_component_ids") == expected_components
+        and composite.get("policy_kl_anchor_component_ids") == expected_components
         and composite.get("policy_distillation_scope_explicit") is True
         and composite.get("value_training_scope_explicit") is True
     ):
         raise ExecutionError("training report supervision-scope provenance drift")
     exact_scalars = {
         "soft_target_source": "policy",
-        "soft_target_weight": 1.0,
+        "soft_target_weight": 0.9,
         "policy_aux_active_batch_size": 0,
         "policy_kl_anchor_direction": "forward",
         "policy_kl_anchor_weight": prepare.REPLAY_ANCHOR_WEIGHT,
@@ -255,24 +308,31 @@ def verify_training_report(manifest_path: Path, report_path: Path) -> dict[str, 
     if observed != exact_scalars:
         raise ExecutionError(f"training report supervision scalar drift: {observed}")
     dose_contract = contract.get("policy_active_row_dose")
-    expected_dose = {
-        "reference_component_active_fractions": prepare.POLICY_BASE_ACTIVE_FRACTIONS,
-        "component_sampling_ratios": [5.0 / 7.0, 2.0 / 7.0],
-        "global_row_dose": 4_194_304,
-        "reference_base_active_rows": prepare.EXPECTED_POLICY_BASE_ACTIVE_ROWS,
-        "base_active_rows_tolerance": prepare.POLICY_BASE_ACTIVE_ROW_TOLERANCE,
-        "min_base_active_rows": (
-            prepare.EXPECTED_POLICY_BASE_ACTIVE_ROWS
-            - prepare.POLICY_BASE_ACTIVE_ROW_TOLERANCE
-        ),
-        "max_base_active_rows": (
-            prepare.EXPECTED_POLICY_BASE_ACTIVE_ROWS
-            + prepare.POLICY_BASE_ACTIVE_ROW_TOLERANCE
-        ),
-        "expected_aux_active_rows": prepare.EXPECTED_POLICY_AUX_ACTIVE_ROWS,
-        "accounting": "realized_policy_active_rows_not_global_samples",
-    }
-    if dose_contract != expected_dose:
+    recipe = manifest.get("recipe")
+    reference = dose_contract.get("reference_base_active_rows") if isinstance(dose_contract, dict) else None
+    expected_dose_shape = (
+        isinstance(dose_contract, dict)
+        and dose_contract.get("derivation")
+        == "authenticated_game_uniform_activity_weighted_by_component_sampling_ratio"
+        and dose_contract.get("component_sampling_ratios")
+        == contract.get("component_game_sampling_ratios")
+        and dose_contract.get("global_row_dose") == prepare.GLOBAL_ROW_DOSE
+        and isinstance(reference, int) and not isinstance(reference, bool)
+        and dose_contract.get("base_active_rows_tolerance")
+        == prepare.POLICY_BASE_ACTIVE_ROW_TOLERANCE
+        and dose_contract.get("min_base_active_rows")
+        == reference - prepare.POLICY_BASE_ACTIVE_ROW_TOLERANCE
+        and dose_contract.get("max_base_active_rows")
+        == reference + prepare.POLICY_BASE_ACTIVE_ROW_TOLERANCE
+        and dose_contract.get("expected_aux_active_rows")
+        == prepare.EXPECTED_POLICY_AUX_ACTIVE_ROWS
+        and dose_contract.get("accounting")
+        == "realized_policy_active_rows_not_global_samples"
+        and isinstance(dose_contract.get("component_statistics"), list)
+        and isinstance(recipe, dict)
+        and recipe.get("expected_policy_base_active_rows") == reference
+    )
+    if not expected_dose_shape:
         raise ExecutionError("manifest policy-active dose contract drift")
     base_active = report.get("policy_base_active_rows")
     aux_active = report.get("policy_aux_active_rows")

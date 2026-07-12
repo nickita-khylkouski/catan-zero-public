@@ -26,9 +26,14 @@ def test_direct_cli_help_works_outside_repository(tmp_path: Path) -> None:
 
 
 def _manifest(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    future_two_component: bool = False,
 ) -> tuple[Path, dict]:
-    args = _args(tmp_path, monkeypatch)
+    args = _args(
+        tmp_path, monkeypatch, future_two_component=future_two_component
+    )
     trainer = tmp_path / "tools" / "train_bc.py"
     trainer.parent.mkdir(exist_ok=True)
     trainer.write_text("# exact trainer\n", encoding="utf-8")
@@ -61,13 +66,61 @@ def test_verify_replays_manifest_inputs_and_real_sentinel_flag(
     assert "--validation-game-seed-manifest" not in verified["command"]
 
 
+def test_future_n128_plus_predecessor_operator_replays_through_executor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path, payload = _manifest(
+        tmp_path, monkeypatch, future_two_component=True
+    )
+    assert payload["supervision_contract"]["component_ids"] == [
+        "n128_current", "predecessor_replay"
+    ]
+    assert payload["supervision_contract"]["component_game_sampling_ratios"] == [
+        0.8, 0.2
+    ]
+    verified = executor.verify(path)
+    assert verified["manifest_ref"]["sha256"] == arm._file_sha(path)
+
+
 def _write_realized_report(payload: dict) -> Path:
     report = Path(arm._option(payload["command"], "--report"))
     report.parent.mkdir(parents=True, exist_ok=True)
-    current = list(arm.CURRENT_TEACHER_COMPONENT_IDS)
+    current = list(payload["supervision_contract"]["component_ids"])
+    expected_active = payload["supervision_contract"]["policy_active_row_dose"][
+        "reference_base_active_rows"
+    ]
     report.write_text(
         json.dumps(
             {
+                "init_checkpoint_sha256": payload["initialization"]["sha256"],
+                "optimizer_restored": False,
+                "resume_optimizer": False,
+                "resumed_optimizer_step": None,
+                "world_size": 8,
+                "batch_size": 512,
+                "max_steps": 1024,
+                "steps_completed": 1024,
+                "total_training_steps": 1024,
+                "data_fingerprint": payload["descriptor_fingerprint"],
+                "input_validation_game_seed_manifest": payload["validation_sentinel"]["path"],
+                "input_validation_game_seed_manifest_sha256": payload["validation_sentinel"]["sha256"],
+                "input_validation_game_sentinel_manifest": payload["validation_sentinel"]["path"],
+                "validation_game_seed_set_sha256": payload[
+                    "validation_sentinel_selection_sha256"
+                ],
+                "epochs": 1,
+                "lr": 3e-5,
+                "lr_warmup_steps": 100,
+                "lr_schedule": "flat",
+                "value_loss_weight": 0.25,
+                "value_lr_mult": 0.3,
+                "value_target_lambda": 1.0,
+                "forced_action_weight": 0.0,
+                "forced_row_value_weight": 1.0,
+                "policy_loss_weight": 1.0,
+                "soft_target_temperature": 0.7,
+                "soft_target_min_legal_coverage": 0.5,
+                "mask_hidden_info": True,
                 "policy_distillation_scope": {"component_ids": current},
                 "value_training_scope": {"component_ids": current},
                 "memmap_composite": {
@@ -78,20 +131,84 @@ def _write_realized_report(payload: dict) -> Path:
                     "value_training_scope_explicit": True,
                 },
                 "soft_target_source": "policy",
-                "soft_target_weight": 1.0,
+                "soft_target_weight": 0.9,
                 "policy_aux_active_batch_size": 0,
                 "policy_kl_anchor_direction": "forward",
                 "policy_kl_anchor_weight": arm.REPLAY_ANCHOR_WEIGHT,
                 "winner_sample_weight": 1.0,
                 "loser_sample_weight": 1.0,
-                "policy_base_active_rows": arm.EXPECTED_POLICY_BASE_ACTIVE_ROWS,
+                "policy_base_active_rows": expected_active,
                 "policy_aux_active_rows": arm.EXPECTED_POLICY_AUX_ACTIVE_ROWS,
-                "policy_total_active_rows": arm.EXPECTED_POLICY_BASE_ACTIVE_ROWS,
+                "policy_total_active_rows": expected_active,
             }
         ),
         encoding="utf-8",
     )
     return report
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("init_checkpoint_sha256", "sha256:" + "0" * 64),
+        ("optimizer_restored", True),
+        ("resume_optimizer", True),
+        ("resumed_optimizer_step", 7),
+        ("world_size", 4),
+        ("batch_size", 256),
+        ("max_steps", 2048),
+        ("steps_completed", 1023),
+        ("data_fingerprint", "sha256:" + "1" * 64),
+        ("input_validation_game_seed_manifest_sha256", "sha256:" + "2" * 64),
+        ("validation_game_seed_set_sha256", "sha256:" + "3" * 64),
+    ],
+)
+def test_verify_training_report_refuses_one_dose_identity_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    value: object,
+) -> None:
+    path, payload = _manifest(tmp_path, monkeypatch)
+    report = _write_realized_report(payload)
+    report_payload = json.loads(report.read_text(encoding="utf-8"))
+    report_payload[field] = value
+    report.write_text(json.dumps(report_payload), encoding="utf-8")
+    with pytest.raises(executor.ExecutionError, match="one-dose execution identity drift"):
+        executor.verify_training_report(path, report)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("epochs", 2),
+        ("lr", 6e-5),
+        ("lr_warmup_steps", 0),
+        ("lr_schedule", "cosine"),
+        ("value_loss_weight", 1.0),
+        ("value_lr_mult", 1.0),
+        ("value_target_lambda", 0.5),
+        ("forced_action_weight", 0.1),
+        ("forced_row_value_weight", 0.0),
+        ("policy_loss_weight", 0.5),
+        ("soft_target_temperature", 1.0),
+        ("soft_target_min_legal_coverage", 0.0),
+        ("mask_hidden_info", False),
+    ],
+)
+def test_verify_training_report_refuses_command_bound_operator_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    value: object,
+) -> None:
+    path, payload = _manifest(tmp_path, monkeypatch)
+    report = _write_realized_report(payload)
+    report_payload = json.loads(report.read_text(encoding="utf-8"))
+    report_payload[field] = value
+    report.write_text(json.dumps(report_payload), encoding="utf-8")
+    with pytest.raises(executor.ExecutionError, match="command-bound operator drift"):
+        executor.verify_training_report(path, report)
 
 
 def test_verify_training_report_replays_supervision_provenance(
@@ -104,10 +221,13 @@ def test_verify_training_report_replays_supervision_provenance(
     assert verified["supervision_contract_sha256"] == payload[
         "supervision_contract"
     ]["contract_sha256"]
+    expected_active = payload["supervision_contract"]["policy_active_row_dose"][
+        "reference_base_active_rows"
+    ]
     assert verified["policy_active_row_dose"] == {
-        "base": arm.EXPECTED_POLICY_BASE_ACTIVE_ROWS,
+        "base": expected_active,
         "aux": 0,
-        "total": arm.EXPECTED_POLICY_BASE_ACTIVE_ROWS,
+        "total": expected_active,
     }
 
 
@@ -160,7 +280,7 @@ def test_verify_refuses_manifest_semantic_drift(
 @pytest.mark.parametrize(
     ("flag", "value"),
     [
-        ("--soft-target-weight", "0.9"),
+        ("--soft-target-weight", "1.0"),
         ("--policy-aux-active-batch-size", "128"),
         ("--policy-kl-anchor-weight", "0.006"),
         ("--loser-sample-weight", "0.3"),

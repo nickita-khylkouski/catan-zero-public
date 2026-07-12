@@ -1,15 +1,12 @@
 #!/usr/bin/env python3
 """Prepare, but never launch, the next one-dose A1 learner recipe.
 
-The builder derives a command from an authenticated prior launch receipt so
-that obscure production flags cannot disappear during experiment iteration.
-It applies pure search targets to the two current-teacher components. Historical
-replay is removed from the sampling measure: the light K3 anchor has not shown
-an independent strength win over L1, so retaining a 20% replay draw as an
-unproven default would either dilute supervision or waste compute. The
-previously tested auxiliary policy-row
-stream is deliberately off: adding more active rows did not beat L1 and its
-largest dose regressed. The emitted manifest is preparation only; this module
+The production-next control preserves the operator that actually won: the
+4/7 n128, 8/35 n256, 1/5 predecessor-replay mixture supervises policy and value
+on all three components, uses 0.9 soft targets, loser weight 1, no auxiliary
+policy stream, and no KL anchor.  Replay removal and pure 1.0 search targets are
+useful *separate* ablations, but combining them in the default would destroy the
+causal control.  The emitted manifest is preparation only; this module
 deliberately has no launch mode.
 """
 
@@ -25,6 +22,8 @@ import subprocess
 import sys
 from typing import Any, Mapping, Sequence
 
+import numpy as np
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
@@ -37,18 +36,11 @@ SUPERVISION_CONTRACT_SCHEMA = "a1-next-learner-supervision-contract-v2"
 CURRENT_TEACHER_COMPONENT_IDS = ("n128_current", "n256_current")
 REPLAY_COMPONENT_ID = "gen3_replay"
 REPLAY_ANCHOR_WEIGHT = 0.0
-# The successful L1 dose consumed 4,194,304 global rows but only about 515K
-# multi-action rows carried policy gradient.  For the new 5:2 current-teacher
-# mixture, exact training-only corpus scans (validation seeds excluded) give
-# the active fractions below and an expected 508,059 rows (binomial sigma
-# ~=668).  A 4,100-row band is wider than 6 sigma
-# while still rejecting roughly 0.8% realized-dose drift.  Auxiliary policy
-# rows remain exactly off until an independently winning dose is found.
-POLICY_BASE_ACTIVE_FRACTIONS = {
-    "n128_current": 0.12113176383916897,
-    "n256_current": 0.12112785317546192,
-}
-EXPECTED_POLICY_BASE_ACTIVE_ROWS = 508_059
+WINNING_COMPONENT_RATIOS = (4.0 / 7.0, 8.0 / 35.0, 1.0 / 5.0)
+GLOBAL_ROW_DOSE = 4_194_304
+# The expectation is derived from authenticated training-only rows for every
+# concrete descriptor.  This tolerance is wider than six binomial sigmas for
+# the historical winning mix while still rejecting ~0.8% dose drift.
 POLICY_BASE_ACTIVE_ROW_TOLERANCE = 4_100
 EXPECTED_POLICY_AUX_ACTIVE_ROWS = 0
 EVENT_HISTORY_COMMAND_CONTRACT_SCHEMA = "a1-event-history-command-contract-v1"
@@ -244,23 +236,211 @@ def _preflight_descriptor(path: Path) -> tuple[dict[str, Any], dict[str, str]]:
     return verified, _file_ref(path)
 
 
+def _component_training_policy_activity(component: Mapping[str, Any]) -> dict[str, Any]:
+    """Measure policy-active mass on authenticated non-validation rows."""
+
+    component_id = component.get("component_id")
+    corpus_dir = Path(str(component.get("corpus_dir", ""))).expanduser().resolve(strict=True)
+    corpus_meta = component.get("corpus_meta")
+    if not isinstance(component_id, str) or not isinstance(corpus_meta, Mapping):
+        raise ArmError("descriptor component lacks authenticated corpus metadata")
+    row_count = int(corpus_meta.get("row_count", 0))
+    if row_count <= 0:
+        raise ArmError(f"component {component_id} has no rows")
+    validation_path = Path(
+        str(component.get("validation_manifest", ""))
+    ).expanduser().resolve(strict=True)
+    validation = json.loads(validation_path.read_text(encoding="utf-8"))
+    validation_seeds = validation.get("game_seeds")
+    if not isinstance(validation_seeds, list) or not all(
+        isinstance(seed, int) for seed in validation_seeds
+    ):
+        raise ArmError(f"component {component_id} validation seeds are malformed")
+    game_seeds = np.memmap(
+        corpus_dir / "game_seed.dat", dtype=np.dtype("<i8"), mode="r", shape=(row_count,)
+    )
+    policy_weights = np.memmap(
+        corpus_dir / "policy_weight_multiplier.dat",
+        dtype=np.dtype("<f4"), mode="r", shape=(row_count,),
+    )
+    held_out = np.asarray(validation_seeds, dtype=np.int64)
+    training_rows = 0
+    active_rows = 0
+    per_game_rows: dict[int, int] = {}
+    per_game_active: dict[int, int] = {}
+    chunk_rows = 1 << 22
+    for start in range(0, row_count, chunk_rows):
+        stop = min(start + chunk_rows, row_count)
+        is_validation = np.isin(game_seeds[start:stop], held_out)
+        training = ~is_validation
+        training_rows += int(np.count_nonzero(training))
+        active = training & (policy_weights[start:stop] > 0.0)
+        active_rows += int(np.count_nonzero(active))
+        training_seeds = np.asarray(game_seeds[start:stop][training], dtype=np.int64)
+        unique, inverse = np.unique(training_seeds, return_inverse=True)
+        row_counts = np.bincount(inverse)
+        active_counts = np.bincount(
+            inverse, weights=np.asarray(active[training], dtype=np.int64)
+        ).astype(np.int64)
+        for seed, rows, active_count in zip(
+            unique.tolist(), row_counts.tolist(), active_counts.tolist(), strict=True
+        ):
+            per_game_rows[seed] = per_game_rows.get(seed, 0) + int(rows)
+            per_game_active[seed] = per_game_active.get(seed, 0) + int(active_count)
+    expected_training_rows = (
+        corpus_meta.get("a1_post_wave_audit", {}).get("training_row_count")
+        if isinstance(corpus_meta.get("a1_post_wave_audit"), Mapping)
+        else None
+    )
+    if expected_training_rows is not None and training_rows != int(expected_training_rows):
+        raise ArmError(
+            f"component {component_id} training-row count differs from authenticated audit"
+        )
+    if training_rows <= 0 or active_rows <= 0:
+        raise ArmError(f"component {component_id} has no training policy-active mass")
+    expected_training_games = (
+        corpus_meta.get("selected_game_seed_manifest", {}).get("training_game_count")
+        if isinstance(corpus_meta.get("selected_game_seed_manifest"), Mapping)
+        else None
+    )
+    if expected_training_games is not None and len(per_game_rows) != int(expected_training_games):
+        raise ArmError(
+            f"component {component_id} training-game count differs from authenticated audit"
+        )
+    game_uniform_fraction = float(
+        np.mean(
+            [
+                per_game_active.get(seed, 0) / rows
+                for seed, rows in per_game_rows.items()
+            ]
+        )
+    )
+    return {
+        "component_id": component_id,
+        "training_rows": training_rows,
+        "training_policy_active_rows": active_rows,
+        "training_game_count": len(per_game_rows),
+        "raw_row_policy_active_fraction": active_rows / training_rows,
+        "game_uniform_policy_active_fraction": game_uniform_fraction,
+        "validation_manifest_sha256": component.get("validation_manifest_sha256"),
+        "payload_inventory_sha256": component.get("payload_inventory_sha256"),
+    }
+
+
+def _derive_policy_active_dose(
+    descriptor_meta: Mapping[str, Any], *, global_row_dose: int = GLOBAL_ROW_DOSE
+) -> dict[str, Any]:
+    component_ids = descriptor_meta.get("component_ids")
+    ratios = descriptor_meta.get("component_game_sampling_ratios")
+    components = descriptor_meta.get("components")
+    if (
+        not isinstance(component_ids, list)
+        or not isinstance(ratios, list)
+        or not isinstance(components, list)
+        or len(component_ids) != len(ratios)
+        or len(component_ids) != len(components)
+        or not np.isclose(sum(float(value) for value in ratios), 1.0)
+    ):
+        raise ArmError("cannot derive active dose from malformed component mixture")
+    stats = [_component_training_policy_activity(component) for component in components]
+    if [row["component_id"] for row in stats] != component_ids:
+        raise ArmError("active-dose component ordering drift")
+    expected_fraction = sum(
+        float(ratio) * float(row["game_uniform_policy_active_fraction"])
+        for ratio, row in zip(ratios, stats, strict=True)
+    )
+    expected_rows = int(round(global_row_dose * expected_fraction))
+    tolerance = POLICY_BASE_ACTIVE_ROW_TOLERANCE
+    return {
+        "derivation": "authenticated_game_uniform_activity_weighted_by_component_sampling_ratio",
+        "component_statistics": stats,
+        "component_sampling_ratios": [float(value) for value in ratios],
+        "global_row_dose": int(global_row_dose),
+        "expected_active_fraction": expected_fraction,
+        "reference_base_active_rows": expected_rows,
+        "base_active_rows_tolerance": tolerance,
+        "min_base_active_rows": expected_rows - tolerance,
+        "max_base_active_rows": expected_rows + tolerance,
+        "expected_aux_active_rows": EXPECTED_POLICY_AUX_ACTIVE_ROWS,
+        "accounting": "realized_policy_active_rows_not_global_samples",
+    }
+
+
+def _bind_teacher_lineage(
+    descriptor_meta: Mapping[str, Any], *, parent_checkpoint_sha256: str
+) -> dict[str, Any]:
+    """Bind current data to the parent and replay to its predecessor."""
+
+    rows = []
+    for component in descriptor_meta.get("components", ()):
+        component_id = component.get("component_id")
+        corpus_meta = component.get("corpus_meta")
+        audit = (
+            corpus_meta.get("a1_post_wave_audit")
+            if isinstance(corpus_meta, Mapping)
+            else None
+        )
+        provenance = audit.get("source_provenance") if isinstance(audit, Mapping) else None
+        if not isinstance(provenance, Mapping) or not provenance:
+            raise ArmError(f"component {component_id} lacks producer provenance")
+        producer_shas = sorted(
+            {
+                row.get("producer_checkpoint_sha256")
+                for row in provenance.values()
+                if isinstance(row, Mapping)
+                and isinstance(row.get("producer_checkpoint_sha256"), str)
+            }
+        )
+        if len(producer_shas) != 1:
+            raise ArmError(f"component {component_id} has ambiguous producer lineage")
+        rows.append(
+            {"component_id": component_id, "producer_checkpoint_sha256": producer_shas[0]}
+        )
+    if len(rows) < 2:
+        raise ArmError("winning operator requires current data plus predecessor replay")
+    if any(
+        row["producer_checkpoint_sha256"] != parent_checkpoint_sha256
+        for row in rows[:-1]
+    ):
+        raise ArmError("current teacher data was not generated by the learner parent")
+    predecessor_sha = rows[-1]["producer_checkpoint_sha256"]
+    if predecessor_sha == parent_checkpoint_sha256:
+        raise ArmError("replay must come from the learner parent's predecessor")
+    return {
+        "schema_version": "a1-next-teacher-lineage-v1",
+        "learner_parent_checkpoint_sha256": parent_checkpoint_sha256,
+        "predecessor_checkpoint_sha256": predecessor_sha,
+        "components": rows,
+    }
+
+
 def _build_corrected_descriptor(
     source_path: Path, output_path: Path
 ) -> tuple[dict[str, Any], dict[str, str], dict[str, str]]:
     source, source_ref = _preflight_descriptor(source_path)
-    if source.get("schema_version") != "memmap_composite_v2" or source.get(
-        "component_ids"
-    ) != ["n128_current", "n256_current", "gen3_replay"]:
-        raise ArmError("source descriptor must bind n128, n256, and gen3 replay in order")
+    component_ids = source.get("component_ids")
+    ratios = source.get("component_game_sampling_ratios")
+    if (
+        source.get("schema_version") != "memmap_composite_v2"
+        or not isinstance(component_ids, list)
+        or len(component_ids) < 2
+        or len(set(component_ids)) != len(component_ids)
+        or not all(component in CURRENT_TEACHER_COMPONENT_IDS for component in component_ids[:-1])
+        or component_ids[-1] not in {REPLAY_COMPONENT_ID, "predecessor_replay"}
+        or not isinstance(ratios, list)
+        or len(ratios) != len(component_ids)
+        or not np.isclose(sum(float(value) for value in ratios[:-1]), 0.8)
+        or not np.isclose(float(ratios[-1]), 0.2)
+    ):
+        raise ArmError(
+            "source descriptor must bind 80% current teachers then 20% predecessor replay"
+        )
     overrides = dict(source["learner_recipe_overrides"])
     overrides["policy_kl_anchor_weight"] = REPLAY_ANCHOR_WEIGHT
     overrides["policy_kl_anchor_direction"] = "forward"
     overrides["loser_sample_weight"] = 1.0
     components = []
-    # Preserve the n128:n256 ratio while renormalizing away the unproven 20%
-    # replay draw: (4/7):(8/35) == 5:2.
-    ratios = (5.0 / 7.0, 2.0 / 7.0)
-    for source_component, ratio in zip(source["components"][:2], ratios):
+    for source_component, ratio in zip(source["components"], ratios, strict=True):
         components.append(
             {
                 key: source_component[key]
@@ -278,12 +458,9 @@ def _build_corrected_descriptor(
         "components": components,
         "learner_recipe_overrides": overrides,
         "learner_recipe_overrides_sha256": _digest(overrides),
-        # Schema v2 requires an authenticated anchor scope even when its
-        # coefficient is zero. Bind it to the current components; the command
-        # and supervision contract separately prove the objective is disabled.
-        "policy_kl_anchor_component_ids": list(CURRENT_TEACHER_COMPONENT_IDS),
-        "policy_distillation_component_ids": ["n128_current", "n256_current"],
-        "value_training_component_ids": ["n128_current", "n256_current"],
+        "policy_kl_anchor_component_ids": list(component_ids),
+        "policy_distillation_component_ids": list(component_ids),
+        "value_training_component_ids": list(component_ids),
     }
     encoded = json.dumps(payload, indent=2, sort_keys=True) + "\n"
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -299,18 +476,13 @@ def _build_corrected_descriptor(
     if (
         verified.get("schema_version") != "memmap_composite_v2"
         or verified.get("policy_distillation_scope_explicit") is not True
-        or verified.get("policy_distillation_component_ids")
-        != ["n128_current", "n256_current"]
-        or verified.get("component_ids") != list(CURRENT_TEACHER_COMPONENT_IDS)
+        or verified.get("policy_distillation_component_ids") != component_ids
+        or verified.get("component_ids") != component_ids
         or verified.get("component_game_sampling_ratios") != list(ratios)
-        or verified.get("policy_kl_anchor_component_ids")
-        != list(CURRENT_TEACHER_COMPONENT_IDS)
-        or verified.get("value_training_component_ids")
-        != ["n128_current", "n256_current"]
+        or verified.get("policy_kl_anchor_component_ids") != component_ids
+        or verified.get("value_training_component_ids") != component_ids
     ):
-        raise ArmError(
-            "derived descriptor must preserve the current-teacher 5:2 ratio"
-        )
+        raise ArmError("derived descriptor must preserve the winning 80:20 operator mix")
     verified_overrides = verified.get("learner_recipe_overrides")
     if not isinstance(verified_overrides, dict) or (
         float(verified_overrides.get("policy_kl_anchor_weight", -1.0))
@@ -452,7 +624,7 @@ def _rebind_a1_metadata(command: list[str], repo: Path) -> dict[str, Any]:
         "loser_sample_weight": 1.0, "winner_sample_weight": 1.0,
         "forced_action_weight": 0.0, "forced_row_value_weight": 1.0,
         "policy_loss_weight": 1.0, "soft_target_source": "policy",
-        "soft_target_weight": 1.0, "soft_target_temperature": 0.7,
+        "soft_target_weight": 0.9, "soft_target_temperature": 0.7,
         "soft_target_min_legal_coverage": 0.5,
         "policy_aux_active_batch_size": 0,
         "policy_kl_anchor_weight": REPLAY_ANCHOR_WEIGHT,
@@ -500,7 +672,7 @@ def _rebind_a1_metadata(command: list[str], repo: Path) -> dict[str, Any]:
     }
     code_sha = _digest(binding)
     binding["code_tree_sha256"] = code_sha
-    _set_option(command, "--a1-learner-ablation-id", "next-current-teacher-pure")
+    _set_option(command, "--a1-learner-ablation-id", "next-winning-operator-control")
     _set_option(command, "--a1-effective-learner-recipe-json", _canonical(effective).decode())
     _set_option(command, "--a1-effective-learner-recipe-sha256", _digest(effective))
     _set_option(command, "--a1-ablation-code-binding-json", _canonical(binding).decode())
@@ -542,7 +714,7 @@ def _derive_command(
         "--forced-row-value-weight": "1.0",
         "--policy-loss-weight": "1.0",
         "--soft-target-source": "policy",
-        "--soft-target-weight": "1.0",
+        "--soft-target-weight": "0.9",
         "--soft-target-temperature": "0.7",
         "--soft-target-min-legal-coverage": "0.5",
         "--policy-aux-active-batch-size": "0",
@@ -569,33 +741,33 @@ def _derive_command(
 
 
 def _next_supervision_contract(
-    descriptor_meta: Mapping[str, Any], command: Sequence[str]
+    descriptor_meta: Mapping[str, Any], command: Sequence[str],
+    policy_active_dose: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Recompute the exact supervision operator for prepare and execution.
+    """Recompute the exact winning supervision operator."""
 
-    A replay component with no supervised policy/value loss and a zero anchor
-    would consume draws while contributing no objective.  K3 has not shown an
-    independent win, so the production-next default removes replay entirely.
-    """
-
-    current = list(CURRENT_TEACHER_COMPONENT_IDS)
     component_ids = list(descriptor_meta.get("component_ids", ()))
     ratios = list(descriptor_meta.get("component_game_sampling_ratios", ()))
-    if component_ids != current or ratios != [5.0 / 7.0, 2.0 / 7.0]:
-        raise ArmError("next learner component identity/ratio contract drift")
+    if (
+        len(component_ids) < 2
+        or len(set(component_ids)) != len(component_ids)
+        or not all(component in CURRENT_TEACHER_COMPONENT_IDS for component in component_ids[:-1])
+        or component_ids[-1] not in {REPLAY_COMPONENT_ID, "predecessor_replay"}
+        or not np.isclose(sum(ratios[:-1]), 0.8)
+        or not np.isclose(ratios[-1], 0.2)
+    ):
+        raise ArmError("next learner winning component identity/ratio contract drift")
     if (
         descriptor_meta.get("policy_distillation_scope_explicit") is not True
         or descriptor_meta.get("value_training_scope_explicit") is not True
-        or descriptor_meta.get("policy_distillation_component_ids") != current
-        or descriptor_meta.get("value_training_component_ids") != current
-        or descriptor_meta.get("policy_kl_anchor_component_ids") != current
+        or descriptor_meta.get("policy_distillation_component_ids") != component_ids
+        or descriptor_meta.get("value_training_component_ids") != component_ids
+        or descriptor_meta.get("policy_kl_anchor_component_ids") != component_ids
     ):
-        raise ArmError(
-            "next learner must contain and supervise only current teachers"
-        )
+        raise ArmError("next learner must supervise the exact winning component mix")
     exact_options = {
         "--soft-target-source": "policy",
-        "--soft-target-weight": "1.0",
+        "--soft-target-weight": "0.9",
         "--policy-aux-active-batch-size": "0",
         "--policy-kl-anchor-direction": "forward",
         "--policy-kl-anchor-weight": str(REPLAY_ANCHOR_WEIGHT),
@@ -608,37 +780,30 @@ def _next_supervision_contract(
     contract = {
         "schema_version": SUPERVISION_CONTRACT_SCHEMA,
         "component_ids": component_ids,
+        "component_roles": [
+            *[
+                {"component_id": component, "role": "current_teacher"}
+                for component in component_ids[:-1]
+            ],
+            {"component_id": component_ids[-1], "role": "immediate_predecessor_replay"},
+        ],
         "component_game_sampling_ratios": ratios,
-        "policy_distillation_component_ids": current,
-        "value_training_component_ids": current,
-        "replay_component_id": None,
-        "replay_sampling_ratio": 0.0,
-        "replay_objective": "disabled_until_independent_strength_win",
+        "policy_distillation_component_ids": component_ids,
+        "value_training_component_ids": component_ids,
+        "replay_component_id": component_ids[-1],
+        "replay_sampling_ratio": ratios[-1],
+        "replay_objective": "supervised_policy_and_value_exact_winning_operator",
         "replay_forward_kl_weight": 0.0,
         "soft_target_source": "policy",
-        "soft_target_weight": 1.0,
+        "soft_target_weight": 0.9,
         "policy_aux_active_batch_size_per_rank": 0,
-        "policy_active_row_dose": {
-            "reference_component_active_fractions": POLICY_BASE_ACTIVE_FRACTIONS,
-            "component_sampling_ratios": [5.0 / 7.0, 2.0 / 7.0],
-            "global_row_dose": 4_194_304,
-            "reference_base_active_rows": EXPECTED_POLICY_BASE_ACTIVE_ROWS,
-            "base_active_rows_tolerance": POLICY_BASE_ACTIVE_ROW_TOLERANCE,
-            "min_base_active_rows": (
-                EXPECTED_POLICY_BASE_ACTIVE_ROWS - POLICY_BASE_ACTIVE_ROW_TOLERANCE
-            ),
-            "max_base_active_rows": (
-                EXPECTED_POLICY_BASE_ACTIVE_ROWS + POLICY_BASE_ACTIVE_ROW_TOLERANCE
-            ),
-            "expected_aux_active_rows": EXPECTED_POLICY_AUX_ACTIVE_ROWS,
-            "accounting": "realized_policy_active_rows_not_global_samples",
-        },
+        "policy_active_row_dose": dict(policy_active_dose),
         "outcome_conditioned_policy_weighting": False,
         "expected_train_report_provenance": {
-            "policy_distillation_scope.component_ids": current,
-            "value_training_scope.component_ids": current,
-            "memmap_composite.policy_kl_anchor_component_ids": current,
-            "soft_target_weight": 1.0,
+            "policy_distillation_scope.component_ids": component_ids,
+            "value_training_scope.component_ids": component_ids,
+            "memmap_composite.policy_kl_anchor_component_ids": component_ids,
+            "soft_target_weight": 0.9,
         },
     }
     contract["contract_sha256"] = _digest(contract)
@@ -654,6 +819,7 @@ def prepare(args: argparse.Namespace) -> tuple[dict[str, Any], Path]:
     descriptor_meta, descriptor_ref, source_descriptor_ref = _build_corrected_descriptor(
         source_descriptor, descriptor
     )
+    policy_active_dose = _derive_policy_active_dose(descriptor_meta)
     parent_checkpoint = getattr(args, "parent_checkpoint", None)
     expected_parent_sha256 = getattr(args, "expected_parent_sha256", None)
     legacy_checkpoint = getattr(args, "f7_checkpoint", None)
@@ -699,6 +865,9 @@ def prepare(args: argparse.Namespace) -> tuple[dict[str, Any], Path]:
         raise ArmError("initialization checkpoint differs from the expected parent bytes")
     if new_mode and handoff_payload["producer_identity"]["checkpoint"] != parent_ref:
         raise ArmError("current learner parent differs from promoted generator identity")
+    teacher_lineage = _bind_teacher_lineage(
+        descriptor_meta, parent_checkpoint_sha256=parent_ref["sha256"]
+    )
     source_identities = {
         "parent_checkpoint_sha256": parent_ref["sha256"],
         "descriptor_sha256": source_descriptor_ref["sha256"],
@@ -731,24 +900,32 @@ def prepare(args: argparse.Namespace) -> tuple[dict[str, Any], Path]:
     )
     changes.update(event_history_changes)
     a1_metadata = _rebind_a1_metadata(command, repo)
-    supervision_contract = _next_supervision_contract(descriptor_meta, command)
+    supervision_contract = _next_supervision_contract(
+        descriptor_meta, command, policy_active_dose
+    )
+    component_ids = list(descriptor_meta["component_ids"])
+    component_ratios = list(descriptor_meta["component_game_sampling_ratios"])
+    expected_policy_base_active_rows = int(
+        policy_active_dose["reference_base_active_rows"]
+    )
     recipe = {
         "world_size": 8, "local_batch_size": 512, "global_batch_size": 4096,
-        "steps": 1024, "base_value_row_dose": 4_194_304,
+        "steps": 1024, "base_value_row_dose": GLOBAL_ROW_DOSE,
         "policy_aux_active_batch_size_per_rank": 0,
         "policy_aux_active_row_dose": 0,
-        "expected_policy_base_active_rows": EXPECTED_POLICY_BASE_ACTIVE_ROWS,
+        "expected_policy_base_active_rows": expected_policy_base_active_rows,
         "policy_base_active_row_tolerance": POLICY_BASE_ACTIVE_ROW_TOLERANCE,
         "expected_policy_aux_active_rows": EXPECTED_POLICY_AUX_ACTIVE_ROWS,
-        "policy_distillation_component_ids": list(CURRENT_TEACHER_COMPONENT_IDS),
-        "value_training_component_ids": list(CURRENT_TEACHER_COMPONENT_IDS),
-        "component_game_sampling_ratios": [5.0 / 7.0, 2.0 / 7.0],
-        "current_supervised_base_row_dose": 4_194_304.0,
+        "policy_distillation_component_ids": component_ids,
+        "value_training_component_ids": component_ids,
+        "component_game_sampling_ratios": component_ratios,
+        "current_supervised_base_row_dose": GLOBAL_ROW_DOSE * 0.8,
+        "replay_supervised_base_row_dose": GLOBAL_ROW_DOSE * 0.2,
         "replay_anchor_base_row_dose": 0.0,
-        "replay_supervised_policy": False,
-        "replay_supervised_value": False,
+        "replay_supervised_policy": True,
+        "replay_supervised_value": True,
         "replay_forward_kl_weight": REPLAY_ANCHOR_WEIGHT,
-        "soft_target_weight": 1.0, "fresh_optimizer": True,
+        "soft_target_weight": 0.9, "fresh_optimizer": True,
         "independent_parent_initialization": True,
     }
     manifest: dict[str, Any] = {
@@ -770,6 +947,7 @@ def prepare(args: argparse.Namespace) -> tuple[dict[str, Any], Path]:
         ],
         "initialization": parent_ref,
         "parent_lineage": parent_lineage,
+        "teacher_lineage": teacher_lineage,
         "source_binding": source_binding,
         "a1_runtime_metadata": a1_metadata,
         "event_history_training_contract": event_history_contract,
@@ -777,12 +955,30 @@ def prepare(args: argparse.Namespace) -> tuple[dict[str, Any], Path]:
         "recipe": recipe,
         "recipe_sha256": _digest(recipe),
         "causal_interpretation": {
-            "bundled_optimization_not_parent_replication": True,
+            "exact_winning_operator_control": True,
+            "bundled_optimization_not_parent_replication": False,
             "reason": (
-                "this loser=1, 4.19M, current-teacher-only pure-target arm is an "
-                "optimization bundle, not a one-axis replication of its parent"
+                "preserve the realized r3 supervision operator before changing one "
+                "causal axis at a time"
             ),
         },
+        "diagnostic_ablations": [
+            {
+                "arm_id": "CURRENT_ONLY_REPLAY_ABLATION",
+                "single_delta": (
+                    "remove predecessor replay and renormalize authenticated current "
+                    "teacher weights to sum to one"
+                ),
+                "soft_target_weight": 0.9,
+                "production_default": False,
+            },
+            {
+                "arm_id": "PURE_SEARCH_TARGET_ABLATION",
+                "single_delta": "soft_target_weight 0.9 -> 1.0",
+                "component_game_sampling_ratios": component_ratios,
+                "production_default": False,
+            },
+        ],
         "allowlisted_command_changes": changes,
         "command": command,
         "command_sha256": _digest(command),
