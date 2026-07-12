@@ -70,29 +70,51 @@ def test_weighted_q_is_the_weight_weighted_mean():
 
 
 # --- backup weight formula + cap ---------------------------------------------
-def test_backup_weight_formula_matches_min_cap_a_err_exp():
-    mcts = _mcts(uncertainty_backup_a=0.25, uncertainty_backup_exp=2.0, uncertainty_backup_cap=10.0)
-    # a * err**exp = 0.25 * 3**2 = 2.25 (below the cap)
-    assert mcts._backup_weight(3.0) == pytest.approx(2.25)
+def test_backup_weight_formula_matches_inverse_uncertainty_operator():
+    mcts = _mcts(
+        uncertainty_backup_a=0.25,
+        uncertainty_backup_exp=2.0,
+        uncertainty_backup_cap=10.0,
+    )
+    # The head predicts squared error: sigma=sqrt(3), then
+    # weight = 0.25 / (sigma**2 + 0.25/10).
+    assert mcts._backup_weight(3.0) == pytest.approx(0.25 / 3.025)
 
 
 def test_backup_weight_cap_engages():
-    mcts = _mcts(uncertainty_backup_a=0.25, uncertainty_backup_exp=1.0, uncertainty_backup_cap=0.5)
-    # a * err = 0.25 * 4 = 1.0, capped to 0.5
-    assert mcts._backup_weight(4.0) == pytest.approx(0.5)
-    # small err stays below the cap
-    assert mcts._backup_weight(1.0) == pytest.approx(0.25)
+    mcts = _mcts(
+        uncertainty_backup_a=0.25,
+        uncertainty_backup_exp=1.0,
+        uncertainty_backup_cap=0.5,
+    )
+    assert mcts._backup_weight(0.0) == pytest.approx(0.5)
+    assert mcts._backup_weight(1.0) == pytest.approx(1.0 / 6.0)
+    assert mcts._backup_weight(4.0) == pytest.approx(0.1)
+    assert mcts._backup_weight(0.0) > mcts._backup_weight(1.0) > mcts._backup_weight(4.0)
 
 
 def test_backup_weight_clamps_negative_err():
     mcts = _mcts(uncertainty_backup_a=0.25, uncertainty_backup_exp=0.5, uncertainty_backup_cap=10.0)
-    # err clamped to 0 before the fractional power (no complex/NaN)
-    assert mcts._backup_weight(-2.0) == 0.0
+    # Squared-error predictions are clamped to 0 before sqrt/fractional power.
+    assert mcts._backup_weight(-2.0) == pytest.approx(10.0)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("uncertainty_backup_a", 0.0),
+        ("uncertainty_backup_exp", 0.0),
+        ("uncertainty_backup_cap", 0.0),
+    ],
+)
+def test_backup_weight_rejects_invalid_operator_parameters(field, value):
+    mcts = _mcts(**{field: value})
+    with pytest.raises(ValueError, match="finite and > 0"):
+        mcts._backup_weight(1.0)
 
 
 def test_accumulate_backup_weight_records_distribution_and_cap_hits():
-    """Verification (b): the cap actually engages -- feed a spread of leaf
-    uncertainties and confirm the high ones land exactly on the cap."""
+    """Certain leaves hit the cap; uncertain leaves receive less influence."""
     mcts = _mcts(
         uncertainty_backup_weighting=True,
         uncertainty_backup_a=0.25,
@@ -101,15 +123,16 @@ def test_accumulate_backup_weight_records_distribution_and_cap_hits():
     )
     mcts._last_backup_weights = []
     stats = _GAction(prior=1.0)
-    for err, value in [(0.4, 0.1), (4.0, -0.2), (8.0, 0.3)]:
+    for err, value in [(0.0, 0.1), (4.0, -0.2), (8.0, 0.3)]:
         mcts._accumulate_backup_weight(stats, value, err)
     weights = mcts._last_backup_weights
-    assert weights[0] == pytest.approx(0.1)  # 0.25*0.4, below cap
-    assert weights[1] == pytest.approx(0.5) and weights[2] == pytest.approx(0.5)  # capped
-    assert any(w == pytest.approx(0.5) for w in weights), "cap must engage"
+    assert weights[0] == pytest.approx(0.5)
+    assert weights[1] == pytest.approx(0.1)
+    assert weights[2] == pytest.approx(0.25 / (8.0**0.5 + 0.5))
+    assert weights[0] > weights[1] > weights[2]
     assert stats.weight_sum == pytest.approx(sum(weights))
     assert stats.weighted_value_sum == pytest.approx(
-        0.1 * 0.1 + 0.5 * -0.2 + 0.5 * 0.3
+        weights[0] * 0.1 + weights[1] * -0.2 + weights[2] * 0.3
     )
 
 
