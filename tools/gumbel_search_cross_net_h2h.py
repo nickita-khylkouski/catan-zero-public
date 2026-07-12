@@ -387,6 +387,7 @@ def play_one_h2h_game(
     game_seed: int,
     max_decisions: int,
     correct_rust_chance_spectra: bool,
+    map_kind: str = "BASE",
     search_telemetry_by_role: dict[str, dict[str, float | int]] | None = None,
     initial_game: Any | None = None,
     initial_chance_rng: Any | None = None,
@@ -403,7 +404,12 @@ def play_one_h2h_game(
         )
     if initial_game is None:
         catanatron_rs = _require_rust_module()
-        game = catanatron_rs.Game.simple(list(COLORS), seed=int(game_seed))
+        game = catanatron_rs.Game(
+            colors=list(COLORS),
+            seed=int(game_seed),
+            player_kind="simple",
+            map_kind=str(map_kind),
+        )
         chance_rng = random.Random(int(game_seed) ^ 0xA17E)
     else:
         game = initial_game
@@ -511,6 +517,7 @@ def play_one_h2h_game(
 
     return {
         "game_seed": int(game_seed),
+        "map_kind": str(map_kind),
         "candidate_color": candidate_color,
         "baseline_color": baseline_color,
         "winner": winner,
@@ -957,6 +964,7 @@ def _run_worker(worker_args: dict[str, Any]) -> dict[str, Any]:
                         correct_rust_chance_spectra=bool(
                             worker_args["correct_rust_chance_spectra"]
                         ),
+                        map_kind=str(worker_args["map_kind"]),
                         search_telemetry_by_role=search_telemetry,
                         **initial,
                     )
@@ -1270,6 +1278,16 @@ def main() -> None:
     )
     parser.add_argument("--base-seed", type=int, default=1)
     parser.add_argument(
+        "--map-kind",
+        choices=("BASE", "TOURNAMENT"),
+        default="BASE",
+        help=(
+            "Board distribution for fresh-start games. BASE is the broad randomized "
+            "direct-H2H stratum; TOURNAMENT is the fixed-map bridge to the neutral "
+            "Python-referee stratum."
+        ),
+    )
+    parser.add_argument(
         "--held-out-high-regret-suite",
         default=None,
         help=(
@@ -1328,6 +1346,7 @@ def main() -> None:
         return EvalConfig.from_namespace(
             resolved_args,
             mode="cross_net",
+            map_kind=str(resolved_args.map_kind),
             n_fast=budgets["candidate_n_full"],
             p_full=1.0,
             force_full_every_decision=True,
@@ -1412,6 +1431,7 @@ def main() -> None:
             "n_full": int(args.n_full),
             "max_depth": int(args.max_depth),
             "max_decisions": int(args.max_decisions),
+            "map_kind": str(args.map_kind),
             "prior_temperature": float(args.prior_temperature),
             "value_scale": float(args.value_scale),
             "value_readout": str(args.value_readout),
@@ -1638,6 +1658,7 @@ def _build_summary(
         "candidate_checkpoint_sha256": candidate_checkpoint_sha256,
         "baseline_checkpoint": args.baseline,
         "baseline_checkpoint_sha256": baseline_checkpoint_sha256,
+        "map_kind": str(getattr(args, "map_kind", "BASE")),
         "gate_config": getattr(args, "gate_config", None),
         "n_full": int(args.n_full),
         "candidate_n_full": resolved_candidate_n_full,

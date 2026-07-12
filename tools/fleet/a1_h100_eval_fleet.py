@@ -59,6 +59,11 @@ SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 SAFE_ADDRESS = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.:-]*$")
 
 SCIENCE_CONFIG: dict[str, Any] = {
+    # Deliberate two-stratum evaluation: broad randomized BASE maps for direct
+    # candidate-vs-incumbent strength; fixed TOURNAMENT for the cross-engine
+    # Python referee, whose map parity is certified only there.
+    "internal_map_kind": "BASE",
+    "external_map_kind": "TOURNAMENT",
     "n_full": 128,
     "c_scale": 0.03,
     "c_visit": 50.0,
@@ -472,6 +477,8 @@ def _internal_argv(
         "1",
         "--device",
         "cuda",
+        "--map-kind",
+        str(SCIENCE_CONFIG["internal_map_kind"]),
         *_science_args(
             c_scale=(
                 0.03

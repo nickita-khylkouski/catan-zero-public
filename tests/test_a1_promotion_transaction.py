@@ -382,6 +382,7 @@ def _fixture(
         "fields": {
             **evidence_semantics,
             "mode": "cross_net",
+            "map_kind": "BASE",
             "candidate": str(candidate),
             "baseline": str(champion),
             "public_observation": True,
@@ -1707,6 +1708,30 @@ def test_external_comparison_rejects_different_pair_seed_cohorts(
         _execute(fixture, go=False)
 
 
+def test_internal_promotion_h2h_must_attest_randomized_base_map(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path)
+
+    def use_fixed_tournament_map(source: dict) -> None:
+        source["typed_config"]["fields"]["map_kind"] = "TOURNAMENT"
+        digest = hashlib.sha256(
+            promotion._canonical_bytes(source["typed_config"])
+        ).hexdigest()
+        source["config_hash"] = "sha256:" + digest[:16]
+        source["full_config_hash"] = "sha256:" + digest
+
+    _mutate_evidence_source(
+        fixture,
+        kind="internal_h2h",
+        role="internal_h2h",
+        mutate=use_fixed_tournament_map,
+    )
+
+    with pytest.raises(promotion.PromotionError, match="randomized BASE"):
+        _execute(fixture, go=False)
+
+
 def test_external_comparison_rejects_different_search_configs(tmp_path: Path) -> None:
     fixture = _fixture(tmp_path)
 
@@ -2099,7 +2124,7 @@ def test_external_comparative_regression_fails_at_fixed_two_percent_limit(
     _set_external_panel_outcomes(fixture, role="candidate_panel", wins=390)
     _set_external_panel_outcomes(fixture, role="champion_panel", wins=420)
 
-    with pytest.raises(promotion.PromotionError, match="allowed regression"):
+    with pytest.raises(promotion.PromotionError, match="noninferiority is unresolved"):
         _execute(fixture, go=False)
 
 
@@ -2130,7 +2155,7 @@ def test_external_sprt_threshold_overrides_cannot_change_comparative_eligibility
     if passes:
         assert _execute(fixture, go=False)["status"] == "dry_run"
     else:
-        with pytest.raises(promotion.PromotionError, match="allowed regression"):
+        with pytest.raises(promotion.PromotionError, match="noninferiority is unresolved"):
             _execute(fixture, go=False)
 
 
@@ -2172,6 +2197,48 @@ def test_external_comparison_accepts_hash_replayed_fleet_pools(
         )
 
     assert _execute(fixture, go=False)["status"] == "dry_run"
+
+
+def test_external_point_delta_cannot_pass_without_paired_noninferiority(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path)
+    joint = (
+        [(True, True)] * 233
+        + [(True, False)] * 229
+        + [(False, True)] * 219
+        + [(False, False)] * 319
+    )
+
+    def set_vector(role: str, column: int) -> None:
+        def mutate(source: dict) -> None:
+            outcomes = [row[column] for row in joint]
+            for game, outcome in zip(source["games"], outcomes, strict=True):
+                game["candidate_won"] = outcome
+            wins = sum(outcomes)
+            source["candidate_wins"] = wins
+            source["baseline_wins"] = len(outcomes) - wins
+            source["candidate_win_rate"] = wins / len(outcomes)
+            normalized = [
+                {**game, "search_won": game["candidate_won"]}
+                for game in source["games"]
+            ]
+            scores, diagnostics = promotion.pair_scores_from_h2h_games(normalized)
+            source["pair_diagnostics"] = diagnostics
+            source["pentanomial_sprt"] = promotion.evaluate_pentanomial_sprt(
+                scores, elo0=-10.0, elo1=15.0, alpha=0.05, beta=0.05
+            )
+            source["verdict"] = source["pentanomial_sprt"]["decision"]
+
+        _mutate_evidence_source(
+            fixture, kind="external_panel", role=role, mutate=mutate
+        )
+
+    set_vector("candidate_panel", 0)
+    set_vector("champion_panel", 1)
+
+    with pytest.raises(promotion.PromotionError, match="noninferiority is unresolved"):
+        _execute(fixture, go=False)
 
 
 def _different_json_value(value: object) -> object:
