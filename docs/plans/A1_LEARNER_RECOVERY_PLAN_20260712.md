@@ -87,12 +87,16 @@ These defaults apply to every arm unless the arm names an explicit delta:
 - data: globally shuffled n128+n256 rows plus authenticated incumbent-era
   mixed replay (approximately 80% f7, 15% gen3 history, 5% gen4 hard-negative)
   sampled component → uniform game → uniform row, with game-disjoint validation;
-- loss weighting: match the successful f7 learner: loser weight 0.3, value-head
-  LR multiplier 0.3, no per-game policy/value loss correction, forced policy
-  unchanged (already zero from corpus multiplier), and forced value weight 1.0
-  initially. The composite sampler already samples component → uniform game →
-  uniform row; another inverse-length loss factor would double-correct game
-  length and over-weight short games;
+- loss weighting: use the independently validated L1 correction: winner and
+  loser policy weights both 1.0. The historical f7 learner used loser weight
+  0.3, but that outcome-conditioned the search-policy objective and allocated
+  only 18.14% of policy mass to losing trajectories; L1 removed that bias and
+  won both the direct incumbent gate and the matched external panel. Keep the
+  value-head LR multiplier at 0.3, no per-game policy/value loss correction,
+  forced policy unchanged (already zero from the corpus multiplier), and
+  forced value weight 1.0 initially. The composite sampler already samples
+  component → uniform game → uniform row; another inverse-length loss
+  factor would double-correct game length and over-weight short games;
 - optimizer: Adam, bf16, 100-step warmup, flat LR for a short dose;
 - LR: flat `3e-5` for P1. The f7/gen3 topology has no action-local gather or
   cross-attention parameters, so an action-module `2x` multiplier is a fake
