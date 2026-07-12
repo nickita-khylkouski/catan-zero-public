@@ -90,3 +90,41 @@ def test_concat_categorical_weight_report_avoids_global_decode(tmp_path) -> None
         "n256": {"raw_samples": 1, "weight_sum": 2.0, "mean_weight": 2.0},
         "replay": {"raw_samples": 1, "weight_sum": 5.0, "mean_weight": 5.0},
     }
+    assert concat.value_counts(np.asarray([0, 2, 4, 5, 6])) == {
+        "n128": 4,
+        "replay": 1,
+    }
+
+
+def test_root_blend_audit_counts_concat_provenance_without_decode(tmp_path) -> None:
+    def provenance(name: str, codes: list[int], categories: list[str]):
+        path = tmp_path / f"{name}.dat"
+        np.asarray(codes, dtype=np.int32).tofile(path)
+        return train_bc._MemmapCategoricalColumn(  # noqa: SLF001
+            np.memmap(path, dtype=np.int32, mode="r", shape=(len(codes),)),
+            np.asarray(categories),
+        )
+
+    left = provenance("p-left", [0, 1, 0], ["public", "legacy"])
+    right = provenance("p-right", [0, 0], ["public"])
+    information = _ConcatColumn((left, right), (3, 2))
+    data = {
+        "action_taken": np.zeros(5),
+        "target_information_regime": information,
+    }
+    report = train_bc._audit_value_root_blend_corpus(  # noqa: SLF001
+        data,
+        np.ones(5, dtype=np.float32),
+        regime={
+            "schema_version": "value-root-blend-regime-v1",
+            "lambda": 1.0,
+            "phases": [],
+            "mode": "disabled",
+        },
+        indices=np.asarray([0, 1, 3, 4]),
+    )
+    assert report["target_information_regime_counts"] == {
+        "public": 3,
+        "legacy": 1,
+    }
+    assert report["public_target_information_only"] is False

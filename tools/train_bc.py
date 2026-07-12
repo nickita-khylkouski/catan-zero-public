@@ -9052,6 +9052,16 @@ class _MemmapCategoricalColumn:
             for index in np.flatnonzero(counts)
         }
 
+    def value_counts(self, index=None) -> dict[str, int]:
+        codes = np.asarray(
+            self._codes if index is None else self._codes[index], dtype=np.int64
+        )
+        counts = np.bincount(codes, minlength=len(self.categories))
+        return {
+            str(self.categories[position]): int(counts[position])
+            for position in np.flatnonzero(counts)
+        }
+
 
 class _ImplicitConstantColumn:
     """File-free fixed-width column materialised only for requested rows."""
@@ -12023,13 +12033,22 @@ def _audit_value_root_blend_corpus(
         "public_target_information_only": None,
     }
     if "target_information_regime" in data:
-        values, counts = np.unique(
-            np.asarray(data["target_information_regime"][rows]).astype(str),
-            return_counts=True,
-        )
-        report["target_information_regime_counts"] = {
-            str(value): int(count) for value, count in zip(values, counts, strict=True)
-        }
+        information_column = data["target_information_regime"]
+        if bool(getattr(information_column, "supports_value_counts", False)) or isinstance(
+            information_column, _MemmapCategoricalColumn
+        ):
+            report["target_information_regime_counts"] = (
+                information_column.value_counts(rows)
+            )
+        else:
+            values, counts = np.unique(
+                np.asarray(information_column[rows]).astype(str),
+                return_counts=True,
+            )
+            report["target_information_regime_counts"] = {
+                str(value): int(count)
+                for value, count in zip(values, counts, strict=True)
+            }
         report["public_target_information_only"] = set(
             report["target_information_regime_counts"]
         ) == {"public_conservation_pimc_v1"}

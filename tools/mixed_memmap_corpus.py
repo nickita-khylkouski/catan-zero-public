@@ -110,6 +110,10 @@ class _ConcatColumn:
             callable(getattr(column, "grouped_weights", None))
             for column in self._columns
         )
+        self.supports_value_counts = all(
+            callable(getattr(column, "value_counts", None))
+            for column in self._columns
+        )
 
     def __len__(self) -> int:
         return self._n
@@ -184,6 +188,32 @@ class _ConcatColumn:
             }
             for category, row in ordered
         }
+
+    def value_counts(self, index: Any = None) -> dict[str, int]:
+        """Count concatenated dictionary labels without global decoding."""
+
+        if not self.supports_value_counts:
+            raise TypeError("concatenated column is not dictionary-encoded")
+        if index is None:
+            indices = None
+        else:
+            indices = np.asarray(index, dtype=np.int64).reshape(-1)
+            if indices.size and bool(
+                np.any((indices < 0) | (indices >= self._n))
+            ):
+                raise IndexError("value-count index outside concatenated row range")
+        merged: dict[str, int] = {}
+        for part, column in enumerate(self._columns):
+            start, stop = int(self._offsets[part]), int(self._offsets[part + 1])
+            local = None
+            if indices is not None:
+                selected = (indices >= start) & (indices < stop)
+                if not bool(np.any(selected)):
+                    continue
+                local = indices[selected] - start
+            for category, count in column.value_counts(local).items():
+                merged[str(category)] = merged.get(str(category), 0) + int(count)
+        return merged
 
 
 class _ConstantColumn:
