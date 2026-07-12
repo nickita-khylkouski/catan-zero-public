@@ -151,16 +151,22 @@ def _seed_interval(report: dict[str, Any], *, where: str) -> tuple[int, int]:
 
 def _contiguous_intervals(
     reports: Sequence[tuple[Path, dict[str, Any]]],
+    *,
+    allow_gaps: bool = False,
 ) -> list[dict[str, Any]]:
     intervals = sorted(
         ((*_seed_interval(report, where=str(path)), path) for path, report in reports),
         key=lambda row: (row[0], row[1], str(row[2])),
     )
     for previous, current in zip(intervals, intervals[1:]):
-        if previous[1] != current[0]:
-            relation = "an overlap" if previous[1] > current[0] else "a gap"
+        if previous[1] > current[0]:
             raise PoolError(
-                f"fleet seed intervals have {relation}: "
+                "fleet seed intervals have an overlap: "
+                f"[{previous[0]}, {previous[1]}) then [{current[0]}, {current[1]})"
+            )
+        if previous[1] < current[0] and not allow_gaps:
+            raise PoolError(
+                "fleet seed intervals have a gap: "
                 f"[{previous[0]}, {previous[1]}) then [{current[0]}, {current[1]})"
             )
     return [
@@ -292,7 +298,11 @@ def _pool_internal_search_telemetry(
 
 
 def pool_internal(
-    paths: Sequence[Path], *, candidate: Path, champion: Path
+    paths: Sequence[Path],
+    *,
+    candidate: Path,
+    champion: Path,
+    allow_disjoint_cohorts: bool = False,
 ) -> dict[str, Any]:
     if not paths:
         raise PoolError("at least one internal H2H report is required")
@@ -332,7 +342,7 @@ def pool_internal(
             "pair_diagnostics"
         ):
             raise PoolError(f"{path} gate statistics do not replay")
-    intervals = _contiguous_intervals(loaded)
+    intervals = _contiguous_intervals(loaded, allow_gaps=allow_disjoint_cohorts)
     games = _validate_and_normalize_games(loaded, kind="internal")
     search_telemetry = _pool_internal_search_telemetry(loaded)
     outcomes = [bool(game["candidate_won"]) for game in games]
@@ -393,6 +403,7 @@ def pool_internal(
                 "champion": artifacts._checkpoint_ref(champion),  # noqa: SLF001
                 "sources": _source_refs([path for path, _ in loaded]),
                 "seed_intervals": intervals,
+                "disjoint_cohorts": bool(allow_disjoint_cohorts),
                 "shard_config_hashes": [
                     {
                         "path": str(path),
@@ -545,6 +556,14 @@ def _parser() -> argparse.ArgumentParser:
     internal.add_argument("--report", action="append", type=Path, required=True)
     internal.add_argument("--candidate", type=Path, required=True)
     internal.add_argument("--champion", type=Path, required=True)
+    internal.add_argument(
+        "--allow-disjoint-cohorts",
+        action="store_true",
+        help=(
+            "Pool non-overlapping fresh seed intervals from sequential continuations. "
+            "Default remains one contiguous fleet cohort; overlaps are always refused."
+        ),
+    )
     internal.add_argument("--out", type=Path, required=True)
     neutral = subparsers.add_parser("neutral", help="pool neutral-harness reports")
     neutral.add_argument("--report", action="append", type=Path, required=True)
@@ -557,7 +576,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
         value = (
-            pool_internal(args.report, candidate=args.candidate, champion=args.champion)
+            pool_internal(
+                args.report,
+                candidate=args.candidate,
+                champion=args.champion,
+                allow_disjoint_cohorts=bool(args.allow_disjoint_cohorts),
+            )
             if args.command == "internal"
             else pool_neutral(args.report, checkpoint=args.checkpoint)
         )

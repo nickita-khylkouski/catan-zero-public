@@ -239,6 +239,49 @@ def test_internal_pool_refuses_duplicate_seed_across_hosts(tmp_path: Path) -> No
         pool.pool_internal(paths, candidate=candidate, champion=champion)
 
 
+def test_internal_pool_allows_explicit_disjoint_fresh_cohorts(tmp_path: Path) -> None:
+    candidate = _checkpoint(tmp_path, "candidate.pt")
+    champion = _checkpoint(tmp_path, "champion.pt")
+    paths = []
+    for index, seed in enumerate((9001, 9101)):
+        path = tmp_path / f"internal-disjoint-{index}.json"
+        _write(path, _internal_report(candidate, champion, seed))
+        paths.append(path)
+
+    with pytest.raises(pool.PoolError, match="seed intervals have a gap"):
+        pool.pool_internal(paths, candidate=candidate, champion=champion)
+
+    result = pool.pool_internal(
+        paths,
+        candidate=candidate,
+        champion=champion,
+        allow_disjoint_cohorts=True,
+    )
+    assert result["complete_pairs"] == 2
+    assert result["fleet_merge"]["disjoint_cohorts"] is True
+    assert [
+        (row["base_seed"], row["end_seed"])
+        for row in result["fleet_merge"]["seed_intervals"]
+    ] == [(9001, 9002), (9101, 9102)]
+
+
+def test_internal_pool_disjoint_mode_still_refuses_overlap(tmp_path: Path) -> None:
+    candidate = _checkpoint(tmp_path, "candidate.pt")
+    champion = _checkpoint(tmp_path, "champion.pt")
+    paths = []
+    for index in range(2):
+        path = tmp_path / f"internal-overlap-{index}.json"
+        _write(path, _internal_report(candidate, champion, 9001))
+        paths.append(path)
+    with pytest.raises(pool.PoolError, match="seed intervals have an overlap"):
+        pool.pool_internal(
+            paths,
+            candidate=candidate,
+            champion=champion,
+            allow_disjoint_cohorts=True,
+        )
+
+
 def test_internal_pool_refuses_config_drift(tmp_path: Path) -> None:
     candidate = _checkpoint(tmp_path, "candidate.pt")
     champion = _checkpoint(tmp_path, "champion.pt")
