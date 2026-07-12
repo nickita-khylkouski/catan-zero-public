@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Emit the smallest matched post-P1 optimization-vs-architecture matrix.
+"""Emit the Pareto post-P1 learner/architecture probe sequence.
 
-This is a non-launching diagnostic manifest.  It reuses the selected P1
-full-update checkpoint as a zero-cost control and schedules exactly two new
-sample-matched B200 runs.  No Cartesian sweep and no concurrent B200 launch is
-authorized.
+The first P1 checkpoint used loser_weight=.3, so it is evidence, not a clean
+control for the independently successful loser_weight=1 learner.  This typed,
+non-launching plan changes one causal axis at a time: restore loser targets,
+restore the winning policy-active dose without increasing value dose, then add
+the zero-init action-target gather that exposes topology already stored in the
+corpus.  Full relational warm-starts and Cartesian sweeps are forbidden.
 """
 
 from __future__ import annotations
@@ -52,7 +54,7 @@ def build_plan(
         "trunk_lr_mult": 1.0,
         "weight_decay": 0.0,
         "amp": "bf16",
-        "policy_kl_anchor_weight": "inherit exact selected P1 value",
+        "policy_kl_anchor_weight": 0.0,
         "policy_kl_anchor_direction": "forward",
         "policy_loss_weight": 1.0,
         "soft_target_source": "policy",
@@ -66,7 +68,7 @@ def build_plan(
         "per_game_policy_weight_mode": "equal",
         "per_game_value_weight": False,
         "per_game_value_weight_mode": "equal",
-        "loser_sample_weight": 0.3,
+        "loser_sample_weight": 1.0,
         "winner_sample_weight": 1.0,
         "value_loss_weight": 0.25,
         "final_vp_loss_weight": 0.0,
@@ -76,7 +78,12 @@ def build_plan(
         "q_loss_weight": 0.0,
         "aux_subgoal_heads": False,
         "aux_subgoal_loss_weight": 0.0,
-        "graph_history_features": True,
+        "graph_history_feature_flag": True,
+        "event_history_available": False,
+        "event_history_semantics": (
+            "Rust v1 emits constant-zero event tensors; the 806-wide schema flag "
+            "must not be reported as observed history"
+        ),
         "mask_hidden_info": True,
         "symmetry_augment": False,
         "validation": "same game-disjoint P1 validation identity",
@@ -87,33 +94,46 @@ def build_plan(
     }
     arms = [
         {
-            "arm_id": "FULL_CONTROL",
-            "training": "reuse selected P1 checkpoint and report; no new B200 run",
-            "recipe_delta": {"freeze_modules": "", "trunk_lr_mult": 1.0},
-            "purpose": "observed full-trunk optimization control",
+            "arm_id": "LEGACY_L03",
+            "training": "reuse recovered P1 K0 checkpoint; no new B200 run",
+            "recipe_delta": {"loser_sample_weight": 0.3},
+            "purpose": (
+                "observed asymmetric-forgetting evidence; never use as the "
+                "loser=1 control"
+            ),
         },
         {
-            "arm_id": "HEAD_ONLY",
+            "arm_id": "L1_CONTROL",
             "training": "new matched B200 run",
             "recipe_delta": {
-                "freeze_modules": "trunk",
-                "trunk_lr_mult": 1.0,
                 "checkpoint_upgrade": "none",
-                "action_module_lr_mult": 1.0,
+                "policy_aux_active_batch_size": 0,
             },
-            "purpose": "test whether trunk drift causes external forgetting",
+            "purpose": "replicate the winning a73 loser-policy objective at one dose",
         },
         {
-            "arm_id": "HEAD_GX1",
+            "arm_id": "L1_POLICY_AUX",
             "training": "new matched B200 run",
             "recipe_delta": {
-                "freeze_modules": "trunk",
-                "trunk_lr_mult": 1.0,
-                "checkpoint_upgrade": "f69_upgrade_checkpoint_config.py --flags gather,cross:1",
-                "checkpoint_upgrade_forward_max_diff": 0.0,
-                "action_module_lr_mult": 1.0,
+                "checkpoint_upgrade": "none",
+                "policy_aux_active_batch_size": 128,
             },
-            "purpose": "isolate action-local gather/cross capacity over HEAD_ONLY",
+            "purpose": (
+                "match a73's ~1.55M active-policy exposures while holding value "
+                "dose at 4.19M rows"
+            ),
+        },
+        {
+            "arm_id": "L1_GATHER",
+            "training": "new matched B200 run",
+            "recipe_delta": {
+                "checkpoint_upgrade": "f69_upgrade_checkpoint_config.py --flags gather",
+                "checkpoint_upgrade_forward_max_diff": 0.0,
+                "policy_aux_active_batch_size": 128,
+            },
+            "purpose": (
+                "isolate learned legal-action-to-target binding over L1_POLICY_AUX"
+            ),
         },
     ]
     for arm in arms:
@@ -127,6 +147,7 @@ def build_plan(
             "pairs": 300,
             "games": 600,
             "opponent": "f7 producer",
+            "map_kind": "BASE",
             "seat_swapped": True,
             "common_random_numbers": True,
         },
@@ -136,6 +157,13 @@ def build_plan(
             "opponent": "catanatron_value",
             "compare_to": "f7 on the identical seeds",
             "common_random_numbers": True,
+            "map_kind": "TOURNAMENT",
+        },
+        "direct_tournament_bridge": {
+            "pairs": 300,
+            "opponent": "f7 producer",
+            "map_kind": "TOURNAMENT",
+            "purpose": "separate map specialization from opponent nontransitivity",
         },
         "binding_floor": "external win-rate delta versus f7 >= -2 percentage points",
         "diagnostics": [
@@ -152,17 +180,21 @@ def build_plan(
         ],
     }
     decision = {
-        "optimization": (
-            "HEAD_ONLY clears the external floor and dominates FULL_CONTROL: "
-            "trunk optimization/forgetting is causal"
+        "loser_targets": (
+            "L1_CONTROL repairs replay teacher-gap versus LEGACY_L03: suppressing "
+            "loser search targets was causal"
         ),
-        "architecture": (
-            "HEAD_GX1 clears the external floor and improves over HEAD_ONLY on "
-            "internal strength plus teacher-gap: action-local capacity is causal"
+        "active_policy_dose": (
+            "L1_POLICY_AUX improves over L1_CONTROL at equal value dose: policy "
+            "underexposure was causal"
+        ),
+        "target_binding": (
+            "L1_GATHER improves topology-sensitive buckets over L1_POLICY_AUX: "
+            "spatial state-action aliasing was causal"
         ),
         "neither": (
-            "both new arms fail the external floor: keep architecture unchanged "
-            "and return to data/objective diagnosis"
+            "L1_CONTROL and L1_POLICY_AUX fail: inspect objective-specific trunk "
+            "gradients and deployed value squash before architecture escalation"
         ),
         "escalation": (
             "advance at most one Pareto arm to 8,388,608 samples from the original "
@@ -176,9 +208,10 @@ def build_plan(
         "launch_authorized": False,
         "launch_condition": "P1 training and checkpoint write have completed",
         "gpu_schedule": [
-            "reuse FULL_CONTROL without B200 compute",
-            "run HEAD_ONLY on all 8 B200s",
-            "run HEAD_GX1 on all 8 B200s only after HEAD_ONLY releases DDP",
+            "reuse LEGACY_L03 without B200 compute",
+            "run L1_CONTROL on all 8 B200s",
+            "run L1_POLICY_AUX only after L1_CONTROL releases DDP",
+            "run L1_GATHER only after L1_POLICY_AUX releases DDP",
             "evaluate arms in parallel on the H100 fleet; do not consume B200s",
         ],
         "fixed_recipe": fixed,
@@ -200,7 +233,10 @@ def build_plan(
                 "roots are correlated, stale f7 search estimates and changing the "
                 "blend would confound the trunk-localization experiment"
             ),
-            "graph_history_features": "already ON in P1; held fixed",
+            "graph_history_features": (
+                "flag/schema present but event payload proven absent; never claim "
+                "history conditioning until a redacted v2 producer exists"
+            ),
         },
         "arms": arms,
         "evaluation": evaluation,
@@ -248,13 +284,26 @@ def build_plan(
         "decision_rules": decision,
         "explicitly_deferred": {
             "auxiliary_heads": "objective/regularization change; conditional after diagnosis",
+            "public_event_history": (
+                "requires versioned redacted Rust/Python parity; current 261GB "
+                "constant event payload is omission/storage debt, not signal"
+            ),
             "root_value_blend": (
                 "objective change deferred until trunk localization; root operator "
                 "identity is valid but the estimates are correlated and stale"
             ),
             "hlgauss": "value-objective change; conditional after scalar stability",
-            "relational_trunk": "larger architecture bundle than the attributable gather/cross probe",
+            "relational_trunk": (
+                "short warm-start is invalid: only 13.66% transfers and 86.34% is "
+                "newly initialized; use gather-only or a function-preserving transplant"
+            ),
             "model_scale": "only after corrected 35M underfitting is established",
+        },
+        "value_readout_probe": {
+            "mismatch": "learner fits raw value while deployed search consumes tanh(raw)",
+            "calibration": ["raw", "tanh", "clip"],
+            "operator_panel": "matched tanh versus clip, same squash for both agents",
+            "default_change_authorized": False,
         },
     }
     payload["plan_sha256"] = _digest(payload)

@@ -7,30 +7,29 @@ import pytest
 from tools.a1_post_p1_diagnosis_plan import SAMPLE_DOSE, build_plan
 
 
-def test_matrix_reuses_control_and_adds_exactly_two_matched_runs() -> None:
+def test_matrix_reuses_legacy_evidence_and_adds_three_causal_runs() -> None:
     plan = build_plan()
     assert [arm["arm_id"] for arm in plan["arms"]] == [
-        "FULL_CONTROL",
-        "HEAD_ONLY",
-        "HEAD_GX1",
+        "LEGACY_L03",
+        "L1_CONTROL",
+        "L1_POLICY_AUX",
+        "L1_GATHER",
     ]
-    assert sum(arm["training"] == "new matched B200 run" for arm in plan["arms"]) == 2
+    assert sum(arm["training"] == "new matched B200 run" for arm in plan["arms"]) == 3
     assert plan["fixed_recipe"]["sample_dose"] == SAMPLE_DOSE
     assert plan["fixed_recipe"]["max_steps"] == math.ceil(SAMPLE_DOSE / 4096)
 
 
-def test_architecture_arm_is_single_delta_over_head_only() -> None:
+def test_policy_dose_and_gather_arms_are_single_sequential_deltas() -> None:
     plan = build_plan()
     fixed = plan["fixed_recipe"]
-    head, gather = plan["arms"][1:]
-    assert head["recipe_delta"]["freeze_modules"] == "trunk"
-    assert gather["recipe_delta"]["freeze_modules"] == "trunk"
-    assert head["recipe_delta"]["action_module_lr_mult"] == 1.0
-    assert gather["recipe_delta"]["action_module_lr_mult"] == 1.0
-    assert head["recipe_delta"]["trunk_lr_mult"] == 1.0
-    assert gather["recipe_delta"]["trunk_lr_mult"] == 1.0
-    assert head["recipe_delta"]["checkpoint_upgrade"] == "none"
-    assert "gather,cross:1" in gather["recipe_delta"]["checkpoint_upgrade"]
+    control, aux, gather = plan["arms"][1:]
+    assert control["recipe_delta"]["policy_aux_active_batch_size"] == 0
+    assert aux["recipe_delta"]["policy_aux_active_batch_size"] == 128
+    assert gather["recipe_delta"]["policy_aux_active_batch_size"] == 128
+    assert control["recipe_delta"]["checkpoint_upgrade"] == "none"
+    assert aux["recipe_delta"]["checkpoint_upgrade"] == "none"
+    assert "gather" in gather["recipe_delta"]["checkpoint_upgrade"]
     assert fixed["aux_subgoal_heads"] is False
     assert fixed["value_target_lambda"] == 1.0
     assert fixed["value_lr_mult"] == 0.3
@@ -38,7 +37,8 @@ def test_architecture_arm_is_single_delta_over_head_only() -> None:
     assert fixed["policy_loss_weight"] == 1.0
     assert fixed["soft_target_weight"] == 0.9
     assert fixed["final_vp_loss_weight"] == 0.0
-    assert fixed["loser_sample_weight"] == 0.3
+    assert fixed["loser_sample_weight"] == 1.0
+    assert fixed["event_history_available"] is False
     assert fixed["per_game_policy_weight"] is False
     assert fixed["per_game_value_weight"] is False
     assert "checkpoint chaining forbidden" in fixed["initialization_policy"]
@@ -51,8 +51,17 @@ def test_matrix_is_sequential_and_non_launching() -> None:
     plan = build_plan()
     assert plan["launch_authorized"] is False
     assert "P1" in plan["launch_condition"]
-    assert any("only after HEAD_ONLY releases DDP" in row for row in plan["gpu_schedule"])
+    assert any("only after L1_CONTROL releases DDP" in row for row in plan["gpu_schedule"])
     assert "operator identity is valid" in plan["explicitly_deferred"]["root_value_blend"]
+
+
+def test_evaluation_types_randomized_primary_and_tournament_bridge() -> None:
+    plan = build_plan()
+    assert plan["evaluation"]["internal"]["map_kind"] == "BASE"
+    assert plan["evaluation"]["external"]["map_kind"] == "TOURNAMENT"
+    assert plan["evaluation"]["direct_tournament_bridge"]["map_kind"] == "TOURNAMENT"
+    assert plan["value_readout_probe"]["calibration"] == ["raw", "tanh", "clip"]
+    assert plan["value_readout_probe"]["default_change_authorized"] is False
 
 
 def test_only_eight_b200_topology_is_admitted() -> None:
