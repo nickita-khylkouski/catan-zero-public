@@ -126,5 +126,5 @@ def test_run_terminates_before_validation_and_writes_no_candidate(
     assert result["steps_observed"] == 32
     assert result["termination"] == "bounded_before_validation_and_checkpoint"
     assert result["promotion_artifacts_emitted"] is False
-    assert not any((output / name).exists() for name in probe.FORBIDDEN_OUTPUT_NAMES)
+    assert not (output / ".trainer-ephemeral").exists()
     assert (output / "gradient-probe.result.json").is_file()

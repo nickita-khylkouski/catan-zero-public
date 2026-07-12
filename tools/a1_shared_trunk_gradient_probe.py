@@ -23,6 +23,7 @@ import math
 import os
 from pathlib import Path
 import resource
+import shutil
 import signal
 import statistics
 import subprocess
@@ -187,8 +188,9 @@ def build_plan(
     _set_option(command, "--max-steps", str(max(steps + 1, 1024)))
     _set_option(command, "--train-diagnostics-every-batches", "1")
     _set_option(command, "--progress-every-batches", "1")
-    _set_option(command, "--checkpoint", str(output_dir / "candidate.pt"))
-    _set_option(command, "--report", str(output_dir / "train.report.json"))
+    ephemeral = output_dir / ".trainer-ephemeral"
+    _set_option(command, "--checkpoint", str(ephemeral / "candidate.pt"))
+    _set_option(command, "--report", str(ephemeral / "train.report.json"))
     source_args = source_command[
         next(i for i, item in enumerate(source_command) if Path(item).name == "train_bc.py")
         + 1 :
@@ -350,9 +352,11 @@ def run_plan(plan_path: Path) -> dict[str, Any]:
     if _file_sha(Path(plan["authenticated_composite"])) != plan["authenticated_composite_sha256"]:
         raise ProbeError("composite descriptor drift after planning")
     output_dir = plan_path.parent
-    forbidden = [output_dir / name for name in FORBIDDEN_OUTPUT_NAMES]
+    ephemeral = output_dir / ".trainer-ephemeral"
+    forbidden = [ephemeral / name for name in FORBIDDEN_OUTPUT_NAMES]
     if any(path.exists() for path in forbidden):
         raise ProbeError("candidate/report artifact exists before diagnostic launch")
+    ephemeral.mkdir(mode=0o700)
     gpu = int(plan["gpu"])
     _require_gpu_idle(gpu)
     env = dict(os.environ)
@@ -416,6 +420,10 @@ def run_plan(plan_path: Path) -> dict[str, Any]:
     leaked = [str(path) for path in forbidden if path.exists()]
     if leaked:
         raise ProbeError(f"trainer reached forbidden candidate/report finalization: {leaked}")
+    # Startup may emit a held-out-seed provenance sidecar next to --report.
+    # It is not a model artifact and validation never consumes it, but retain no
+    # ambiguous trainer-owned outputs: only the sealed probe plan/log/result live.
+    shutil.rmtree(ephemeral)
     result: dict[str, Any] = {
         "schema_version": SCHEMA,
         "diagnostic_only": True,
