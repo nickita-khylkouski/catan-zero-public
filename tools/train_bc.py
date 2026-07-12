@@ -1362,13 +1362,13 @@ def _value_training_metadata(
             {
                 "a1_contract_sha256": args.a1_contract_sha256,
                 "a1_selected_game_seed_set_sha256": (
-                    args.a1_selected_game_seed_set_sha256
+                    getattr(args, "a1_selected_game_seed_set_sha256", None)
                 ),
                 "a1_training_game_seed_set_sha256": (
-                    args.a1_training_game_seed_set_sha256
+                    getattr(args, "a1_training_game_seed_set_sha256", None)
                 ),
                 "a1_learner_training_recipe_sha256": (
-                    args.a1_learner_training_recipe_sha256
+                    getattr(args, "a1_learner_training_recipe_sha256", None)
                 ),
                 "a1_memmap_payload_inventory_sha256": (
                     getattr(args, "a1_memmap_payload_inventory_sha256", None)

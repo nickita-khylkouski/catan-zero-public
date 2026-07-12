@@ -34,6 +34,34 @@ from train_bc import (  # type: ignore  # noqa: E402
 _CONTRACT_SHA = "sha256:" + "a" * 64
 
 
+def test_composite_contract_value_metadata_allows_no_single_corpus_binding() -> None:
+    """A composite binds component holdouts, not one selected-game manifest.
+
+    The trainer used to complete every optimizer step and validation batch,
+    then crash while saving provenance because these single-corpus attributes
+    were read unconditionally whenever an A1 contract was present.
+    """
+
+    args = argparse.Namespace(
+        a1_contract_sha256=_CONTRACT_SHA,
+        value_head_type="mse",
+    )
+    metadata = _value_training_metadata(
+        args,
+        scalar_weight=0.25,
+        categorical_weight=0.0,
+        categorical_bins=0,
+        optimizer_steps=1024,
+        completed_epochs=1,
+        scalar_training_weight_sum=1.0,
+        categorical_training_weight_sum=0.0,
+    )
+    assert metadata["a1_contract_sha256"] == _CONTRACT_SHA
+    assert metadata["a1_selected_game_seed_set_sha256"] is None
+    assert metadata["a1_training_game_seed_set_sha256"] is None
+    assert metadata["a1_learner_training_recipe_sha256"] is None
+
+
 def _write_manifest(path: Path, *, seeds: list[int] | None = None) -> dict:
     seeds = [11, 13] if seeds is None else seeds
     seed_array = np.asarray(seeds, dtype="<i8")
