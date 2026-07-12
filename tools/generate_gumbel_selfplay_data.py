@@ -1610,6 +1610,22 @@ def _run_worker(
             score_actions=bool(worker_args["score_actions"])
         )
 
+    # A configured teacher-side denoiser must never degrade silently to the
+    # plain evaluator.  ``GumbelChanceMCTS`` intentionally keeps a graceful
+    # fallback for generic/legacy callers, but the generation manifest is a
+    # data contract: claiming ``symmetry_averaged_eval=true`` while using an
+    # evaluator without the 12-orientation entry point would mislabel every
+    # emitted target.  Neural local and eval-server evaluators implement the
+    # method; the heuristic smoke evaluator deliberately does not.
+    if bool(worker_args.get("symmetry_averaged_eval", False)) and not callable(
+        getattr(evaluator, "evaluate_symmetry_averaged", None)
+    ):
+        raise ValueError(
+            "symmetry_averaged_eval=True requires a symmetry-capable neural "
+            "evaluator; refusing to emit data whose manifest claims D6 root "
+            "averaging while the evaluator would fall back to plain inference"
+        )
+
     # Opponent pool (H2): re-parse the manifest in-process (each worker is a
     # separate spawned process; cheap pure-JSON re-parse rather than trying to
     # pickle a ChampionRef/OpponentPolicy tuple across the spawn boundary).
