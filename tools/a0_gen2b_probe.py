@@ -698,6 +698,14 @@ def _arm_contract(
         "--device",
         "cuda:0",
     ]
+    # This sealed A0 tool is explicitly diagnostic-only. Preserve replay of its
+    # historical 0.3 recipe under train_bc's production fail-closed contract by
+    # carrying the required acknowledgement in the reconstructed command. The
+    # learner weights themselves remain byte-semantically unchanged.
+    if float(recipe.get("loser_sample_weight", 1.0)) < 1.0:
+        argv.append(
+            "--acknowledge-diagnostic-outcome-conditioned-policy-distillation"
+        )
     if objective == "hlgauss":
         argv.extend(["--value-categorical-bins", str(int(bins))])
     return {

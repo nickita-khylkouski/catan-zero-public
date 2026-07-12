@@ -288,7 +288,9 @@ class TrainConfig(PipelineConfig):
     freeze_modules: str = ""
     train_value_only: bool = False
     winner_sample_weight: float = 1.0
-    loser_sample_weight: float = 0.3
+    # Search targets remain supervised signal even when later stochastic play
+    # loses the game. Outcome-conditioned downweighting is diagnostic-only.
+    loser_sample_weight: float = 1.0
     vp_margin_weight: float = 0.0
     forced_action_weight: float = 0.1
     per_game_policy_weight: bool = False

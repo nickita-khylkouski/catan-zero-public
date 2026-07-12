@@ -85,7 +85,15 @@ def main() -> None:
         default="robber=3.0,initial_build=2.0,discard=1.5",
     )
     parser.add_argument("--winner-sample-weight", type=float, default=1.0)
-    parser.add_argument("--loser-sample-weight", type=float, default=0.3)
+    parser.add_argument("--loser-sample-weight", type=float, default=1.0)
+    parser.add_argument(
+        "--acknowledge-diagnostic-outcome-conditioned-policy-distillation",
+        action="store_true",
+        help=(
+            "Permit --loser-sample-weight < 1 for an explicitly diagnostic-only "
+            "run. Normal production teacher distillation refuses this selection bias."
+        ),
+    )
     parser.add_argument("--value-loss-weight", type=float, default=0.25)
     parser.add_argument("--final-vp-loss-weight", type=float, default=0.05)
     parser.add_argument(
@@ -122,6 +130,16 @@ def main() -> None:
         help="Write/print the pipeline manifest without running commands.",
     )
     args = parser.parse_args()
+    if (
+        float(args.loser_sample_weight) < 1.0
+        and not args.acknowledge_diagnostic_outcome_conditioned_policy_distillation
+    ):
+        raise SystemExit(
+            "--loser-sample-weight < 1 outcome-conditions policy distillation and "
+            "is diagnostic-only; pass "
+            "--acknowledge-diagnostic-outcome-conditioned-policy-distillation "
+            "to authorize that non-production experiment"
+        )
     if args.allow_ppo:
         raise SystemExit(
             "--allow-ppo is disabled for the 35M teacher-only phase. "
@@ -295,6 +313,11 @@ def main() -> None:
         )
         + (["--init-checkpoint", args.init_checkpoint] if args.init_checkpoint else [])
         + (["--save-each-epoch"] if args.save_each_epoch else [])
+        + (
+            ["--acknowledge-diagnostic-outcome-conditioned-policy-distillation"]
+            if args.acknowledge_diagnostic_outcome_conditioned_policy_distillation
+            else []
+        )
         + (
             ["--require-production-35m-teacher"]
             if args.quality_gate == "production"

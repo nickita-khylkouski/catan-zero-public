@@ -170,7 +170,7 @@ EXPECTED_LEARNER_TRAINING_RECIPE: dict[str, Any] = {
     "forced_action_weight": 0.1,
     "forced_row_value_weight": 1.0,
     "winner_sample_weight": 1.0,
-    "loser_sample_weight": 0.3,
+    "loser_sample_weight": 1.0,
     "teacher_weights": "",
     "phase_weights": "",
     "value_phase_weights": "",

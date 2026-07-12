@@ -1013,7 +1013,27 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--winner-sample-weight", type=float, default=1.0)
-    parser.add_argument("--loser-sample-weight", type=float, default=0.3)
+    parser.add_argument(
+        "--loser-sample-weight",
+        type=float,
+        default=1.0,
+        help=(
+            "Policy-loss multiplier for rows whose acting player eventually lost. "
+            "The production default is unbiased: MCTS targets remain valid on losing "
+            "trajectories. Values below 1 require the explicit diagnostic-only "
+            "acknowledgement flag."
+        ),
+    )
+    parser.add_argument(
+        "--acknowledge-diagnostic-outcome-conditioned-policy-distillation",
+        action="store_true",
+        help=(
+            "Acknowledge that --loser-sample-weight < 1 outcome-conditions the "
+            "policy objective and is diagnostic-only, never promotion-eligible. "
+            "This authorization changes no weights and exists solely to prevent a "
+            "normal production launch from silently discarding losing MCTS rows."
+        ),
+    )
     parser.add_argument(
         "--vp-margin-weight",
         type=float,
@@ -4261,6 +4281,64 @@ def _resolve_effective_value_categorical_bins(args: argparse.Namespace) -> int:
     return 0 if requested is None else requested
 
 
+def _validate_outcome_conditioned_policy_distillation(
+    args: argparse.Namespace,
+    *,
+    a1_preflight_meta: dict[str, object] | None,
+) -> dict[str, object]:
+    """Refuse silent winner-conditioned policy imitation in production.
+
+    An MCTS policy target describes the searched action distribution at the
+    recorded state.  A later stochastic game loss does not invalidate that
+    target.  Downweighting the acting player merely because it eventually lost
+    therefore selects policy examples by a downstream outcome and suppresses
+    recovery/defensive trajectories.  Historical diagnostic descriptors remain
+    replayable because their existing ``diagnostic_only`` and
+    ``promotion_eligible`` declarations are themselves an explicit binding.
+    Generic/single-corpus experiments must use the deliberately long CLI
+    acknowledgement so a normal launch cannot inherit the old 0.3 default.
+    """
+
+    loser_weight = float(args.loser_sample_weight)
+    if not math.isfinite(loser_weight) or loser_weight < 0.0:
+        raise SystemExit("--loser-sample-weight must be finite and >= 0")
+    policy_enabled = float(args.policy_loss_weight) > 0.0
+    outcome_conditioned = policy_enabled and loser_weight < 1.0
+    descriptor_diagnostic = bool(
+        isinstance(a1_preflight_meta, dict)
+        and a1_preflight_meta.get("diagnostic_only") is True
+        and a1_preflight_meta.get("promotion_eligible") is False
+    )
+    cli_acknowledged = bool(
+        args.acknowledge_diagnostic_outcome_conditioned_policy_distillation
+    )
+    if outcome_conditioned and not (descriptor_diagnostic or cli_acknowledged):
+        raise SystemExit(
+            "--loser-sample-weight < 1 outcome-conditions MCTS policy "
+            "distillation and is diagnostic-only; normal production must use 1.0. "
+            "To replay an intentional non-production experiment, pass "
+            "--acknowledge-diagnostic-outcome-conditioned-policy-distillation "
+            "or use an authenticated descriptor declaring diagnostic_only=true "
+            "and promotion_eligible=false"
+        )
+    authorization = (
+        "authenticated_diagnostic_descriptor"
+        if outcome_conditioned and descriptor_diagnostic
+        else "explicit_cli_acknowledgement"
+        if outcome_conditioned and cli_acknowledged
+        else "not_required"
+    )
+    return {
+        "schema_version": "outcome-conditioned-policy-distillation-v1",
+        "loser_sample_weight": loser_weight,
+        "policy_loss_enabled": policy_enabled,
+        "outcome_conditioned": outcome_conditioned,
+        "diagnostic_only": outcome_conditioned,
+        "promotion_eligible": not outcome_conditioned,
+        "authorization": authorization,
+    }
+
+
 def main(argv: Sequence[str] | None = None) -> None:
     checkout_runtime_binding = _assert_checkout_runtime_binding()
     parser = build_parser()
@@ -4334,6 +4412,11 @@ def main(argv: Sequence[str] | None = None) -> None:
         and a1_preflight_meta.get("schema_version") in {
             "memmap_composite_v1", "memmap_composite_v2"
         }
+    )
+    outcome_conditioned_policy_distillation = (
+        _validate_outcome_conditioned_policy_distillation(
+            args, a1_preflight_meta=a1_preflight_meta
+        )
     )
     if is_memmap_composite:
         _validate_composite_learner_recipe_authorization(args, a1_preflight_meta)
@@ -6588,6 +6671,9 @@ def main(argv: Sequence[str] | None = None) -> None:
         "per_game_value_weight_mode": str(args.per_game_value_weight_mode),
         "winner_sample_weight": args.winner_sample_weight,
         "loser_sample_weight": args.loser_sample_weight,
+        "outcome_conditioned_policy_distillation": (
+            outcome_conditioned_policy_distillation
+        ),
         "vp_margin_weight": args.vp_margin_weight,
         "advantage_policy_weighting": args.advantage_policy_weighting,
         "advantage_temperature": args.advantage_temperature,

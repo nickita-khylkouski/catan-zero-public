@@ -146,6 +146,7 @@ def test_checked_in_manifest_resolves_and_both_full_commands_parse() -> None:
     assert scalar.lr_warmup_steps == 134
     assert scalar.lr_schedule == "cosine"
     assert scalar.resume_optimizer is False
+    assert scalar.acknowledge_diagnostic_outcome_conditioned_policy_distillation is True
     assert hl.value_head_type == "hlgauss"
     assert hl.value_categorical_bins == 33
     assert hl.hlgauss_scalar_aux_loss_weight == 0.0
