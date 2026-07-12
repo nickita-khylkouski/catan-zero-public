@@ -367,3 +367,83 @@ def test_policy_loss_weight_scales_the_policy_term_in_train_xdim_batch(
     assert policy_only_metrics["loss"] == pytest.approx(
         policy_only_metrics["policy_loss"], rel=1e-4
     )
+
+
+def test_policy_aux_batch_combines_parts_and_adds_no_value_gradient(tmp_path) -> None:
+    import copy
+    import torch
+
+    samples = _collect_real_samples(6)
+    data = _write_and_load_shard(tmp_path, samples)
+    n = len(data["action_taken"])
+    batch = np.arange(n)
+    weights = np.ones(n, dtype=np.float32)
+    template = _make_entity_policy()
+    initial = copy.deepcopy(template.model.state_dict())
+
+    def run(*, auxiliary: bool):
+        policy = _make_entity_policy()
+        policy.model.load_state_dict(initial)
+        policy.model.eval()  # make the duplicated-forward equality exact (no dropout)
+        optimizer = torch.optim.SGD(policy.model.parameters(), lr=0.0)
+        metrics = _train_xdim_batch(
+            policy,
+            optimizer,
+            data,
+            batch,
+            weights,
+            weights,
+            soft_target_temperature=1.0,
+            soft_target_weight=0.0,
+            soft_target_source="scores",
+            soft_target_min_legal_coverage=0.0,
+            policy_loss_weight=1.0,
+            value_loss_weight=0.0,
+            final_vp_loss_weight=0.0,
+            q_loss_weight=0.0,
+            q_skip_teacher_prefixes=(),
+            vps_to_win=10,
+            advantage_policy_weighting="none",
+            advantage_temperature=1.0,
+            advantage_weight_cap=5.0,
+            advantage_weight_floor=0.05,
+            amp="none",
+            diagnostics=False,
+            **(
+                {
+                    "policy_aux_data": data,
+                    "policy_aux_batch": batch,
+                    "policy_aux_sample_weights": weights,
+                }
+                if auxiliary
+                else {}
+            ),
+        )
+        return policy, metrics
+
+    _control_policy, control = run(auxiliary=False)
+    aux_policy, auxiliary = run(auxiliary=True)
+    # Duplicating the same policy rows must double numerator and denominator,
+    # not sum two independently-normalized means.
+    assert auxiliary["policy_loss"] == pytest.approx(control["policy_loss"], rel=1e-6)
+    assert auxiliary["policy_loss_weighted_sum"] == pytest.approx(
+        2.0 * control["policy_loss_weighted_sum"], rel=1e-6
+    )
+    assert auxiliary["policy_loss_weight_sum"] == pytest.approx(
+        2.0 * control["policy_loss_weight_sum"], rel=1e-6
+    )
+    # Value telemetry/dose is base-only and value-head parameters receive no
+    # gradient from the policy-only auxiliary forward.
+    assert auxiliary["value_loss_weight_sum"] == pytest.approx(
+        control["value_loss_weight_sum"]
+    )
+    assert auxiliary["policy_aux_active_count"] == n
+    value_grads = [p.grad for p in aux_policy.model.value_head.parameters()]
+    assert all(
+        grad is None or torch.count_nonzero(grad).item() == 0 for grad in value_grads
+    )
+    policy_grads = [p.grad for p in aux_policy.model.action_encoder.parameters()]
+    assert any(
+        grad is not None and torch.count_nonzero(grad).item() > 0
+        for grad in policy_grads
+    )
