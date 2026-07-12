@@ -12,6 +12,75 @@ def test_optimizer_observability_reuses_default_off_diagnostics_cadence() -> Non
     assert parser.get_default("train_diagnostics_every_batches") == 0
 
 
+def test_max_grad_norm_cli_default_preserves_historical_threshold() -> None:
+    parser = train_bc.build_parser()
+    required = [
+        "--data",
+        "data",
+        "--checkpoint",
+        "model.pt",
+        "--report",
+        "report.json",
+    ]
+    assert parser.get_default("max_grad_norm") == pytest.approx(1.0)
+    assert parser.parse_args(
+        required + ["--max-grad-norm", "2.0"]
+    ).max_grad_norm == pytest.approx(2.0)
+    assert parser.parse_args(
+        required + ["--max-grad-norm", "0"]
+    ).max_grad_norm == pytest.approx(0.0)
+
+
+@pytest.mark.parametrize("value", [-1.0, float("inf"), float("-inf"), float("nan")])
+def test_max_grad_norm_rejects_negative_or_nonfinite_values(value: float) -> None:
+    with pytest.raises(SystemExit, match="use 0 to disable"):
+        train_bc._validate_max_grad_norm(value)
+
+
+def test_max_grad_norm_two_and_explicit_off_have_distinct_semantics() -> None:
+    torch = pytest.importorskip("torch")
+
+    def policy_with_grad() -> SimpleNamespace:
+        model = torch.nn.Linear(1, 1, bias=False)
+        model.weight.grad = torch.tensor([[3.0]])
+        return SimpleNamespace(model=model)
+
+    clipped_policy = policy_with_grad()
+    pre_clip = train_bc._clip_grad_norm(clipped_policy, 2.0)
+    clipped = train_bc._optimizer_clip_observability(
+        pre_clip, max_grad_norm=2.0
+    )
+    assert pre_clip.item() == pytest.approx(3.0)
+    assert clipped_policy.model.weight.grad.item() == pytest.approx(2.0)
+    assert clipped["pre_clip_total_grad_norm"] == pytest.approx(3.0)
+    assert clipped["max_grad_norm"] == pytest.approx(2.0)
+    assert clipped["gradient_clipping_enabled"] is True
+    assert clipped["clipped"] is True
+
+    off_policy = policy_with_grad()
+    pre_clip = train_bc._clip_grad_norm(off_policy, 0.0)
+    off = train_bc._optimizer_clip_observability(pre_clip, max_grad_norm=0.0)
+    assert pre_clip.item() == pytest.approx(3.0)
+    assert off_policy.model.weight.grad.item() == pytest.approx(3.0)
+    assert off["gradient_clipping_enabled"] is False
+    assert off["clipped"] is False
+
+
+def test_max_grad_norm_keeps_legacy_candidate_side_modules_in_global_norm() -> None:
+    torch = pytest.importorskip("torch")
+    model = torch.nn.Linear(1, 1, bias=False)
+    actor = torch.nn.Linear(1, 1, bias=False)
+    model.weight.grad = torch.tensor([[3.0]])
+    actor.weight.grad = torch.tensor([[4.0]])
+    policy = SimpleNamespace(model=model, actor=actor)
+
+    pre_clip = train_bc._clip_grad_norm(policy, 1.0)
+
+    assert pre_clip.item() == pytest.approx(5.0)
+    assert model.weight.grad.item() == pytest.approx(0.6)
+    assert actor.weight.grad.item() == pytest.approx(0.8)
+
+
 def test_optimizer_observability_reports_preclip_norm_clip_and_module_updates() -> None:
     torch = pytest.importorskip("torch")
 

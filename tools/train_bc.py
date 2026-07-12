@@ -543,6 +543,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument(
+        "--max-grad-norm",
+        type=float,
+        default=1.0,
+        help=(
+            "Clip the global optimizer gradient norm to this threshold. "
+            "1.0 (default) preserves the historical learner exactly; 0 explicitly "
+            "disables clipping while still measuring and reporting the pre-clip "
+            "norm. Values must be finite and non-negative."
+        ),
+    )
+    parser.add_argument(
         "--lr-warmup-steps",
         type=int,
         default=0,
@@ -4241,6 +4252,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         argv=raw_argv,
         expected_pipeline=TrainConfig.PIPELINE,
     )
+    args.max_grad_norm = _validate_max_grad_norm(args.max_grad_norm)
     ddp = _distributed_state()
     # Authenticate diagnostic batch/topology drift before the expensive A1
     # memmap preflight.  The same authorization is replayed again when the
@@ -5745,6 +5757,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                     args.advantage_weight_cap,
                     args.advantage_weight_floor,
                     args.amp,
+                    max_grad_norm=float(args.max_grad_norm),
                     diagnostics=(
                         int(args.train_diagnostics_every_batches) > 0
                         and batch_number % int(args.train_diagnostics_every_batches) == 0
@@ -5780,25 +5793,29 @@ def main(argv: Sequence[str] | None = None) -> None:
                 optimizer_pre_clip_grad_norm_max = max(
                     optimizer_pre_clip_grad_norm_max, pre_clip_norm
                 )
-                _rank0_print(
-                    json.dumps(
-                        {
-                            "progress": "bc_optimizer_observability",
-                            "arch": args.arch,
-                            "epoch": epoch + 1,
-                            "batch": batch_number,
-                            "optimizer_step": global_step + 1,
-                            **optimizer_observability,
-                            "observed_steps": optimizer_observed_steps,
-                            "clipped_steps": optimizer_clipped_steps,
-                            "clipped_fraction": (
-                                optimizer_clipped_steps / optimizer_observed_steps
-                            ),
-                        },
-                        sort_keys=True,
-                    ),
-                    ddp,
-                )
+                # Basic clip telemetry is collected every optimizer step. Emit
+                # the verbose progress record only on the existing diagnostics
+                # cadence, identified by the detailed module norms.
+                if "module_pre_clip_grad_norms" in optimizer_observability:
+                    _rank0_print(
+                        json.dumps(
+                            {
+                                "progress": "bc_optimizer_observability",
+                                "arch": args.arch,
+                                "epoch": epoch + 1,
+                                "batch": batch_number,
+                                "optimizer_step": global_step + 1,
+                                **optimizer_observability,
+                                "observed_steps": optimizer_observed_steps,
+                                "clipped_steps": optimizer_clipped_steps,
+                                "clipped_fraction": (
+                                    optimizer_clipped_steps / optimizer_observed_steps
+                                ),
+                            },
+                            sort_keys=True,
+                        ),
+                        ddp,
+                    )
             if first_batch_profile is None:
                 first_batch_profile = _batch_profile(policy, batch_data, batch)
                 _rank0_print(
@@ -6070,6 +6087,10 @@ def main(argv: Sequence[str] | None = None) -> None:
                 **(
                     {
                         "optimizer_observability": {
+                            "max_grad_norm": float(args.max_grad_norm),
+                            "gradient_clipping_enabled": bool(
+                                float(args.max_grad_norm) > 0.0
+                            ),
                             "observed_steps": optimizer_observed_steps,
                             "clipped_steps": optimizer_clipped_steps,
                             "clipped_fraction": (
@@ -6341,6 +6362,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         "amp": args.amp,
         "optimizer": args.optimizer,
         "lr": float(args.lr),
+        "max_grad_norm": float(args.max_grad_norm),
+        "gradient_clipping_enabled": bool(float(args.max_grad_norm) > 0.0),
         "weight_decay": float(args.weight_decay),
         "fused_optimizer": bool(args.fused_optimizer),
         "hidden_size": int(args.hidden_size),
@@ -6688,6 +6711,7 @@ def _train_candidate_batch(
     advantage_weight_floor: float,
     amp: str = "none",
     *,
+    max_grad_norm: float = 1.0,
     diagnostics: bool = True,
     truncated_vp_margin_value_weight: float = 0.0,
 ) -> dict:
@@ -6767,8 +6791,12 @@ def _train_candidate_batch(
         raise FloatingPointError(f"non-finite BC loss: {float(loss.detach().cpu())}")
     optimizer.zero_grad(set_to_none=True)
     loss.backward()
-    torch.nn.utils.clip_grad_norm_(list(_params(policy)), 1.0)
+    pre_clip_total_grad_norm = _clip_grad_norm(policy, max_grad_norm)
     optimizer.step()
+    optimizer_observability = _optimizer_clip_observability(
+        pre_clip_total_grad_norm,
+        max_grad_norm=max_grad_norm,
+    )
     predictions = torch.argmax(masked, dim=-1)
     active = policy_weights > 0.0
     active_count = int(active.sum().item())
@@ -6832,6 +6860,7 @@ def _train_candidate_batch(
         "phase_stats": phase_stats,
         "teacher_stats": teacher_stats,
         "phase_stats_unforced": phase_stats_unforced,
+        "optimizer_observability": optimizer_observability,
     }
 
 
@@ -7090,6 +7119,7 @@ def _train_xdim_batch(
     advantage_weight_floor: float,
     amp: str = "none",
     *,
+    max_grad_norm: float = 1.0,
     diagnostics: bool = True,
     truncated_vp_margin_value_weight: float = 0.0,
     policy_kl_anchor_weight: float = 0.0,
@@ -7564,14 +7594,20 @@ def _train_xdim_batch(
         observability_state = (
             _capture_optimizer_observability(policy) if diagnostics else None
         )
-        pre_clip_total_grad_norm = _clip_grad_norm(policy, 1.0)
+        pre_clip_total_grad_norm = _clip_grad_norm(policy, max_grad_norm)
         optimizer.step()
+        optimizer_observability = _optimizer_clip_observability(
+            pre_clip_total_grad_norm,
+            max_grad_norm=max_grad_norm,
+        )
         if observability_state is not None:
-            optimizer_observability = _finish_optimizer_observability(
-                policy,
-                observability_state,
-                pre_clip_total_grad_norm=pre_clip_total_grad_norm,
-                max_grad_norm=1.0,
+            optimizer_observability.update(
+                _finish_optimizer_observability(
+                    policy,
+                    observability_state,
+                    pre_clip_total_grad_norm=pre_clip_total_grad_norm,
+                    max_grad_norm=max_grad_norm,
+                )
             )
             optimizer_observability["objective_gradient_interference"] = (
                 objective_gradient_interference
@@ -13001,12 +13037,56 @@ def _finish_optimizer_observability(
     return {
         "pre_clip_total_grad_norm": total_norm,
         "max_grad_norm": float(max_grad_norm),
-        "clipped": bool(not math.isfinite(total_norm) or total_norm > max_grad_norm),
+        "gradient_clipping_enabled": bool(max_grad_norm > 0.0),
+        "clipped": bool(
+            max_grad_norm > 0.0
+            and (not math.isfinite(total_norm) or total_norm > max_grad_norm)
+        ),
         "module_pre_clip_grad_norms": state["module_pre_clip_grad_norms"],
         "module_parameter_delta_norms": _norms_from_squared_sums(
             delta_squared_sums
         ),
         "module_norm_scope": state["module_norm_scope"],
+    }
+
+
+def _validate_max_grad_norm(value: float) -> float:
+    """Return the canonical clipping threshold or reject an unsafe value.
+
+    Positive finite values enable clipping. Zero is the sole explicit no-clip
+    representation; negative, NaN, and infinite values fail before data or GPU
+    setup.
+    """
+
+    value = float(value)
+    if not math.isfinite(value) or value < 0.0:
+        raise SystemExit(
+            "--max-grad-norm must be finite and non-negative; use 0 to disable "
+            f"gradient clipping explicitly (got {value})"
+        )
+    return value
+
+
+def _optimizer_clip_observability(
+    pre_clip_total_grad_norm,
+    *,
+    max_grad_norm: float,
+) -> dict[str, float | bool]:
+    """Return cheap per-step clipping telemetry without parameter snapshots."""
+
+    if hasattr(pre_clip_total_grad_norm, "detach"):
+        total_norm = float(pre_clip_total_grad_norm.detach().cpu().item())
+    else:
+        total_norm = float(pre_clip_total_grad_norm)
+    enabled = bool(max_grad_norm > 0.0)
+    return {
+        "pre_clip_total_grad_norm": total_norm,
+        "max_grad_norm": float(max_grad_norm),
+        "gradient_clipping_enabled": enabled,
+        "clipped": bool(
+            enabled
+            and (not math.isfinite(total_norm) or total_norm > max_grad_norm)
+        ),
     }
 
 
@@ -13019,6 +13099,8 @@ def _clip_grad_norm(policy, max_norm: float = 1.0):
     pre-C1 ``torch.nn.utils.clip_grad_norm_(policy.model.parameters(), 1.0)``)."""
     import torch
 
+    max_norm = _validate_max_grad_norm(max_norm)
+    effective_max_norm = math.inf if max_norm == 0.0 else max_norm
     model = policy.model
     fsdp_clip = getattr(model, "clip_grad_norm_", None)
     if callable(fsdp_clip) and not isinstance(
@@ -13032,8 +13114,11 @@ def _clip_grad_norm(policy, max_norm: float = 1.0):
         for param in getattr(policy, "_fsdp_ignored_params", []) or []:
             if param.grad is not None:
                 dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
-        return fsdp_clip(max_norm)
-    return torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
+        return fsdp_clip(effective_max_norm)
+    # The legacy candidate policy keeps its actor/action modules beside
+    # ``model`` rather than inside it. `_params` is the historical authoritative
+    # parameter set there; entity/DDP policies yield only ``model.parameters()``.
+    return torch.nn.utils.clip_grad_norm_(list(_params(policy)), effective_max_norm)
 
 
 def _torch_ppo_masked_logits(logits, valid_actions, action_size):

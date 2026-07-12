@@ -227,6 +227,9 @@ class TrainConfig(PipelineConfig):
     optimizer: str = "adam"
     weight_decay: float = 0.0
     lr: float = 2e-4
+    # Global gradient-norm clipping. 0 is the explicit no-clip sentinel; the
+    # historical/default trajectory remains exactly 1.0.
+    max_grad_norm: float = 1.0
     lr_warmup_steps: int = 0
     lr_schedule: str = "flat"
     hidden_size: int | None = None
