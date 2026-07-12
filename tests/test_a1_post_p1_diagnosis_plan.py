@@ -12,11 +12,14 @@ def test_matrix_reuses_legacy_evidence_and_adds_conditional_anchor() -> None:
     assert [arm["arm_id"] for arm in plan["arms"]] == [
         "LEGACY_L03",
         "L1_CONTROL",
+        "L1_PURE_SEARCH_TARGET",
         "L1_POLICY_AUX",
         "L1_AUX_REPLAY_ANCHOR",
         "L1_GATHER",
     ]
-    assert sum(arm["training"] == "new matched B200 run" for arm in plan["arms"]) == 3
+    assert sum(
+        arm["training"].startswith("new matched B200 run") for arm in plan["arms"]
+    ) == 4
     assert plan["fixed_recipe"]["sample_dose"] == SAMPLE_DOSE
     assert plan["fixed_recipe"]["max_steps"] == math.ceil(SAMPLE_DOSE / 4096)
 
@@ -24,8 +27,9 @@ def test_matrix_reuses_legacy_evidence_and_adds_conditional_anchor() -> None:
 def test_policy_dose_and_gather_arms_are_single_sequential_deltas() -> None:
     plan = build_plan()
     fixed = plan["fixed_recipe"]
-    control, aux, anchor, gather = plan["arms"][1:]
+    control, pure_target, aux, anchor, gather = plan["arms"][1:]
     assert control["recipe_delta"]["policy_aux_active_batch_size"] == 0
+    assert pure_target["recipe_delta"]["soft_target_weight"] == 1.0
     assert aux["recipe_delta"]["policy_aux_active_batch_size"] == 128
     assert anchor["recipe_delta"]["policy_aux_active_batch_size"] == 128
     assert "exact eligible-mass" in anchor["recipe_delta"]["policy_kl_anchor_weight"]
@@ -40,6 +44,10 @@ def test_policy_dose_and_gather_arms_are_single_sequential_deltas() -> None:
     assert fixed["value_loss_weight"] == 0.25
     assert fixed["policy_loss_weight"] == 1.0
     assert fixed["soft_target_weight"] == 0.9
+    assert fixed["policy_distillation_component_ids"] == [
+        "n128_current",
+        "n256_current",
+    ]
     assert fixed["final_vp_loss_weight"] == 0.0
     assert fixed["forced_action_weight"] == 0.0
     assert fixed["truncated_vp_margin_value_weight"] == 0.0

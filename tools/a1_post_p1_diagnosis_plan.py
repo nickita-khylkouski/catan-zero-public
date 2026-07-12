@@ -56,6 +56,11 @@ def build_plan(
         "amp": "bf16",
         "policy_kl_anchor_weight": 0.0,
         "policy_kl_anchor_direction": "forward",
+        "policy_distillation_component_ids": ["n128_current", "n256_current"],
+        "gen3_replay_policy_objective": (
+            "zero search-target CE; value rehearsal plus optional authenticated "
+            "stored-prior forward KL only"
+        ),
         "policy_loss_weight": 1.0,
         "soft_target_source": "policy",
         "soft_target_weight": 0.9,
@@ -110,6 +115,19 @@ def build_plan(
                 "policy_aux_active_batch_size": 0,
             },
             "purpose": "replicate the winning a73 loser-policy objective at one dose",
+        },
+        {
+            "arm_id": "L1_PURE_SEARCH_TARGET",
+            "training": "new matched B200 run after L1_CONTROL",
+            "recipe_delta": {
+                "checkpoint_upgrade": "none",
+                "policy_aux_active_batch_size": 0,
+                "soft_target_weight": 1.0,
+            },
+            "purpose": (
+                "remove deterministic post-temperature argmax re-sharpening and "
+                "distill the completed-Q improved policy exactly"
+            ),
         },
         {
             "arm_id": "L1_POLICY_AUX",
@@ -208,6 +226,10 @@ def build_plan(
             "L1_POLICY_AUX improves over L1_CONTROL at equal value dose: policy "
             "underexposure was causal"
         ),
+        "target_semantics": (
+            "L1_PURE_SEARCH_TARGET improves over L1_CONTROL: the 10% played-action "
+            "hard label was harmful deterministic re-sharpening"
+        ),
         "replay_anchor": (
             "L1_AUX_REPLAY_ANCHOR improves exact forward replay KL without erasing "
             "n128/n256 teacher-gap closure: population-behavior drift was causal"
@@ -231,9 +253,26 @@ def build_plan(
         "promotion_eligible": False,
         "launch_authorized": False,
         "launch_condition": "P1 training and checkpoint write have completed",
+        "target_semantics_audit": {
+            "path": (
+                "/home/ubuntu/experimental_nonpromotable/"
+                "a1-combined-80-20-20260711/diagnostics/"
+                "policy-target-semantics-6e59f5e/"
+                "full-corpus-policy-target-semantics.json"
+            ),
+            "sha256": (
+                "sha256:53e9b92402af598bbe2e2a20ce0fb1d4d36dbb059cad8de772b16c555c58151d"
+            ),
+            "audit_code_commit": "6e59f5e",
+            "conclusion": (
+                "gen3 replay is an older, materially softer policy teacher; "
+                "exclude its search-target CE and retain value/prior rehearsal only"
+            ),
+        },
         "gpu_schedule": [
             "reuse LEGACY_L03 without B200 compute",
             "run L1_CONTROL on all 8 B200s",
+            "run L1_PURE_SEARCH_TARGET after L1_CONTROL releases DDP",
             "run L1_POLICY_AUX only after L1_CONTROL releases DDP",
             (
                 "run L1_AUX_REPLAY_ANCHOR only if exact-v2 telemetry shows harmful "

@@ -2,12 +2,26 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
 from tools import posthoc_composite_validation_v2 as posthoc
+
+
+def test_cli_imports_tools_when_launched_outside_repo(tmp_path: Path) -> None:
+    result = subprocess.run(
+        [sys.executable, str(Path(posthoc.__file__).resolve()), "--help"],
+        cwd=tmp_path,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "--validation-manifest" in result.stdout
 
 
 class _Composite:
@@ -141,6 +155,12 @@ def test_run_rescore_is_read_only_and_emits_exact_v2(tmp_path: Path, monkeypatch
         "build_sample_weights",
         lambda *a, **k: np.ones(6, dtype=np.float32),
     )
+    scope_calls = []
+    monkeypatch.setattr(
+        posthoc.train_bc,
+        "_apply_authenticated_policy_distillation_scope",
+        lambda corpus, weights: scope_calls.append(corpus) or weights,
+    )
     monkeypatch.setattr(
         posthoc.train_bc,
         "build_value_sample_weights",
@@ -178,6 +198,7 @@ def test_run_rescore_is_read_only_and_emits_exact_v2(tmp_path: Path, monkeypatch
 
     assert result["read_only"] is True
     assert result["optimizer_steps"] == 0
+    assert scope_calls == [data]
     assert result["checkpoint_mutated"] is False
     assert result["evaluation_repo_commit"] == "abc123"
     assert result["evaluation_tool_sha256"].startswith("sha256:")

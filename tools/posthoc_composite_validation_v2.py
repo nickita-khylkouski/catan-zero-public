@@ -21,6 +21,8 @@ from typing import Any
 import numpy as np
 
 REPO = Path(__file__).resolve().parents[1]
+if str(REPO) not in sys.path:
+    sys.path.insert(0, str(REPO))
 if str(REPO / "src") not in sys.path:
     sys.path.insert(0, str(REPO / "src"))
 
@@ -201,6 +203,9 @@ def run_rescore(
         per_game_policy_weight_mode=str(
             _required(report, "per_game_policy_weight_mode")
         ),
+    )
+    policy_weights = train_bc._apply_authenticated_policy_distillation_scope(
+        data, policy_weights
     )
     value_weights = train_bc.build_value_sample_weights(
         data,

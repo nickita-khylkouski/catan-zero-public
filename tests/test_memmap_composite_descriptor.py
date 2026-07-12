@@ -80,7 +80,9 @@ def _descriptor(tmp_path: Path) -> Path:
     return path
 
 
-def _descriptor_v2(tmp_path: Path) -> Path:
+def _descriptor_v2(
+    tmp_path: Path, *, policy_distillation_component_ids: list[str] | None = None
+) -> Path:
     overrides = {
         "per_game_policy_weight": True,
         "per_game_policy_weight_mode": "sqrt",
@@ -105,6 +107,8 @@ def _descriptor_v2(tmp_path: Path) -> Path:
         "policy_kl_anchor_component_ids": ["gen3"],
         "components": components,
     }
+    if policy_distillation_component_ids is not None:
+        payload["policy_distillation_component_ids"] = policy_distillation_component_ids
     path = tmp_path / "composite-v2.json"
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     return path
@@ -132,6 +136,8 @@ def test_v2_authenticates_three_component_ratios_and_anchor_scope(tmp_path):
     assert verified["component_ids"] == ["n128", "n256", "gen3"]
     assert verified["component_game_sampling_ratios"] == [0.57, 0.23, 0.20]
     assert verified["policy_kl_anchor_component_ids"] == ["gen3"]
+    assert verified["policy_distillation_component_ids"] == ["n128", "n256", "gen3"]
+    assert verified["policy_distillation_scope_explicit"] is False
     assert verified["descriptor_fingerprint"] == train_bc._training_data_fingerprint(
         str(path), "memmap"
     )
@@ -143,6 +149,21 @@ def test_v2_refuses_ratio_and_anchor_scope_drift(tmp_path):
     payload["components"][0]["game_sampling_ratio"] = 0.50
     path.write_text(json.dumps(payload), encoding="utf-8")
     with pytest.raises(SystemExit, match="ratios must sum to 1"):
+        train_bc._preflight_memmap_composite_descriptor(path)
+
+
+def test_v2_authenticates_policy_distillation_scope_and_refuses_drift(tmp_path):
+    path = _descriptor_v2(
+        tmp_path, policy_distillation_component_ids=["n128", "n256"]
+    )
+    verified = train_bc._preflight_memmap_composite_descriptor(path)
+    assert verified["policy_distillation_component_ids"] == ["n128", "n256"]
+    assert verified["policy_distillation_scope_explicit"] is True
+
+    payload = json.loads(path.read_text())
+    payload["policy_distillation_component_ids"] = ["n256", "n128"]
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(SystemExit, match="must follow component order"):
         train_bc._preflight_memmap_composite_descriptor(path)
 
     second = tmp_path / "second"
@@ -360,6 +381,45 @@ def test_policy_aux_conditioning_preserves_authenticated_base_measure() -> None:
     # Conditioning changes admission only. A multiplier of 2 does not become a
     # sampling-frequency weight; phase/winner/etc. remain loss weights.
     assert conditioned == pytest.approx([0.0, 2.0 / 7.0, 1.0 / 7.0, 4.0 / 7.0])
+
+
+def test_authenticated_policy_scope_excludes_replay_ce_and_aux_sampling() -> None:
+    data = ConcatMemmapCorpus(
+        [
+            _TinyGameCorpus([1, 1]),
+            _TinyGameCorpus([10, 10]),
+            _TinyGameCorpus([20, 20]),
+        ]
+    )
+    data.component_ids = ("n128", "n256", "gen3")
+    data.policy_distillation_component_indices = (0, 1)
+    data.policy_distillation_scope_authenticated = True
+    scoped = train_bc._apply_authenticated_policy_distillation_scope(
+        data, np.ones(6, dtype=np.float32)
+    )
+    assert scoped.tolist() == [1.0, 1.0, 1.0, 1.0, 0.0, 0.0]
+
+    base = np.full(6, 1.0 / 6.0, dtype=np.float64)
+    aux = train_bc._conditioned_policy_aux_sampling_weights(base, scoped)
+    assert aux.tolist() == pytest.approx([0.25, 0.25, 0.25, 0.25, 0.0, 0.0])
+    report = train_bc._policy_distillation_scope_report(data, scoped)
+    assert report is not None
+    assert report["component_ids"] == ["n128", "n256"]
+    assert report["components"]["gen3"]["policy_weight_sum"] == 0.0
+    assert report["components"]["gen3"]["positive_policy_rows"] == 0
+
+
+def test_authenticated_policy_scope_fails_closed_when_empty() -> None:
+    data = ConcatMemmapCorpus(
+        [_TinyGameCorpus([1]), _TinyGameCorpus([10])]
+    )
+    data.component_ids = ("current", "replay")
+    data.policy_distillation_component_indices = ()
+    data.policy_distillation_scope_authenticated = True
+    with pytest.raises(SystemExit, match="scope is invalid"):
+        train_bc._apply_authenticated_policy_distillation_scope(
+            data, np.ones(2, dtype=np.float32)
+        )
 
 
 def test_policy_aux_order_is_exact_and_ddp_rank_sliced() -> None:

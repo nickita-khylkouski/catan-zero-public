@@ -264,6 +264,8 @@ class ConcatMemmapCorpus:
         self.component_game_sampling_ratios: tuple[float, ...] = tuple()
         self.policy_kl_anchor_component_indices: tuple[int, ...] = tuple()
         self.policy_kl_anchor_scope_authenticated = False
+        self.policy_distillation_component_indices: tuple[int, ...] = tuple()
+        self.policy_distillation_scope_authenticated = False
         self.legal_width = int(first.legal_width)
         self._columns = {
             key: next(

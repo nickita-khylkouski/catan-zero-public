@@ -1660,14 +1660,20 @@ def _preflight_memmap_composite_descriptor(path: str | Path) -> dict[str, object
         "schema_version", "diagnostic_only", "promotion_eligible", "components",
         "learner_recipe_overrides", "learner_recipe_overrides_sha256",
     }
-    expected_fields = (
-        common_fields
-        if schema_version == "memmap_composite_v1"
-        else common_fields | {"policy_kl_anchor_component_ids"}
-    )
+    if schema_version == "memmap_composite_v1":
+        valid_field_sets = (common_fields,)
+    else:
+        v2_fields = common_fields | {"policy_kl_anchor_component_ids"}
+        # Optional for backward compatibility: absence preserves the historical
+        # all-components policy-CE scope. Presence is authenticated by the
+        # descriptor fingerprint and enables value-only replay components.
+        valid_field_sets = (
+            v2_fields,
+            v2_fields | {"policy_distillation_component_ids"},
+        )
     if schema_version not in {"memmap_composite_v1", "memmap_composite_v2"} or set(
         descriptor
-    ) != expected_fields:
+    ) not in valid_field_sets:
         raise SystemExit("memmap composite descriptor fields differ from its schema")
     if (
         descriptor.get("diagnostic_only") is not True
@@ -1789,6 +1795,8 @@ def _preflight_memmap_composite_descriptor(path: str | Path) -> dict[str, object
             "payload_inventory_sha256": actual_inventory_sha,
         })
     anchor_component_ids: list[str] = []
+    distillation_component_ids: list[str] = []
+    distillation_scope_explicit = False
     if schema_version == "memmap_composite_v2":
         if not math.isclose(sum(component_ratios), 1.0, rel_tol=0.0, abs_tol=1e-9):
             raise SystemExit("memmap composite v2 game sampling ratios must sum to 1")
@@ -1801,6 +1809,30 @@ def _preflight_memmap_composite_descriptor(path: str | Path) -> dict[str, object
         ):
             raise SystemExit("memmap composite v2 anchor component ids are invalid")
         anchor_component_ids = list(raw_anchor_ids)
+        raw_distillation_ids = descriptor.get(
+            "policy_distillation_component_ids", component_ids
+        )
+        if (
+            not isinstance(raw_distillation_ids, list)
+            or not raw_distillation_ids
+            or any(not isinstance(value, str) for value in raw_distillation_ids)
+            or len(set(raw_distillation_ids)) != len(raw_distillation_ids)
+            or not set(raw_distillation_ids).issubset(component_ids)
+        ):
+            raise SystemExit(
+                "memmap composite v2 policy distillation component ids are invalid"
+            )
+        # Canonical component order prevents a semantically-identical scope
+        # from acquiring multiple authenticated identities.
+        if raw_distillation_ids != [
+            value for value in component_ids if value in set(raw_distillation_ids)
+        ]:
+            raise SystemExit(
+                "memmap composite v2 policy distillation component ids must follow "
+                "component order"
+            )
+        distillation_component_ids = list(raw_distillation_ids)
+        distillation_scope_explicit = "policy_distillation_component_ids" in descriptor
     return {
         "schema_version": schema_version, "diagnostic_only": True,
         "promotion_eligible": False, "descriptor_path": str(descriptor_path),
@@ -1815,6 +1847,8 @@ def _preflight_memmap_composite_descriptor(path: str | Path) -> dict[str, object
         "component_ids": component_ids,
         "component_game_sampling_ratios": component_ratios,
         "policy_kl_anchor_component_ids": anchor_component_ids,
+        "policy_distillation_component_ids": distillation_component_ids,
+        "policy_distillation_scope_explicit": distillation_scope_explicit,
     }
 
 
@@ -4953,6 +4987,9 @@ def main(argv: Sequence[str] | None = None) -> None:
             per_game_policy_weight=bool(args.per_game_policy_weight),
             per_game_policy_weight_mode=str(args.per_game_policy_weight_mode),
         )
+        policy_weights = _apply_authenticated_policy_distillation_scope(
+            data, policy_weights
+        )
         value_weights = build_value_sample_weights(
             data,
             phase_weights=value_phase_weight_map,
@@ -5076,6 +5113,12 @@ def main(argv: Sequence[str] | None = None) -> None:
                     data, "component_game_sampling_ratios", tuple()
                 )
             ],
+            "policy_distillation_component_indices": [
+                int(value)
+                for value in getattr(
+                    data, "policy_distillation_component_indices", tuple()
+                )
+            ],
         }
         _cache_key, cache_identity = _derived_array_cache_key(cache_payload)
         cache_root = Path(
@@ -5118,6 +5161,9 @@ def main(argv: Sequence[str] | None = None) -> None:
         derived = _build_derived_training_arrays()
 
     policy_sample_weights = derived["policy_sample_weights"]
+    policy_distillation_scope_report = _policy_distillation_scope_report(
+        data, policy_sample_weights
+    )
     value_sample_weights = derived["value_sample_weights"]
     value_root_blend_audit = _audit_value_root_blend_corpus(
         data,
@@ -5253,7 +5299,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             )
         policy_aux_sampling_weights = _conditioned_policy_aux_sampling_weights(
             component_game_sampling,
-            np.asarray(data["policy_weight_multiplier"])[train_indices],
+            np.asarray(policy_sample_weights)[train_indices],
         )
     if int(ddp["rank"]) == 0:
         policy_sample_weight_report = sample_weight_quality(data, policy_sample_weights)
@@ -5354,6 +5400,28 @@ def main(argv: Sequence[str] | None = None) -> None:
                 local_draws=local_aux_draws,
                 ddp=ddp,
             )
+        epoch_policy_component_dose: dict[str, float] = {}
+        if bool(getattr(data, "policy_distillation_scope_authenticated", False)):
+            component_ids = tuple(data.component_ids)
+            base_rows = train_indices[np.asarray(order, dtype=np.int64)]
+            base_rows = base_rows[
+                np.asarray(policy_sample_weights[base_rows], dtype=np.float32) > 0.0
+            ]
+            base_components = data.component_indices_for_rows(base_rows)
+            aux_components = (
+                np.empty(0, dtype=np.int64)
+                if aux_order is None
+                else data.component_indices_for_rows(
+                    train_indices[np.asarray(aux_order, dtype=np.int64)]
+                )
+            )
+            for component, component_id in enumerate(component_ids):
+                epoch_policy_component_dose[f"{component_id}.base"] = float(
+                    np.count_nonzero(base_components == component)
+                )
+                epoch_policy_component_dose[f"{component_id}.aux"] = float(
+                    np.count_nonzero(aux_components == component)
+                )
         epoch_losses = []
         epoch_extra_sums: dict[str, float] = {
             "policy_loss": 0.0,
@@ -5674,6 +5742,26 @@ def main(argv: Sequence[str] | None = None) -> None:
         )
         active_count_total = _reduce_scalar_sum(float(epoch_active_count), ddp)
         aux_active_count_total = _reduce_scalar_sum(float(epoch_aux_active_count), ddp)
+        epoch_policy_component_dose = _reduce_named_sums(
+            epoch_policy_component_dose, ddp
+        )
+        policy_component_active_dose = {
+            component_id: {
+                "base_active_rows": int(
+                    round(epoch_policy_component_dose[f"{component_id}.base"])
+                ),
+                "aux_active_rows": int(
+                    round(epoch_policy_component_dose[f"{component_id}.aux"])
+                ),
+                "total_active_rows": int(
+                    round(
+                        epoch_policy_component_dose[f"{component_id}.base"]
+                        + epoch_policy_component_dose[f"{component_id}.aux"]
+                    )
+                ),
+            }
+            for component_id in getattr(data, "component_ids", tuple())
+        }
         policy_loss_epoch = _metric_from_sum_denominator(
             epoch_extra_sums["policy_loss"], epoch_extra_denominators["policy_loss"]
         )
@@ -5740,6 +5828,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "policy_total_active_rows": int(
                     active_count_total + aux_active_count_total
                 ),
+                "policy_component_active_dose": policy_component_active_dose,
                 "value_loss": value_loss_epoch,
                 "scalar_value_mse_diagnostic": value_loss_epoch,
                 "final_vp_loss": final_vp_loss_epoch,
@@ -5986,6 +6075,22 @@ def main(argv: Sequence[str] | None = None) -> None:
         categorical_training_weight_sum=cumulative_categorical_training_weight,
         ddp=ddp,
     )
+    policy_component_active_dose = {
+        component_id: {
+            key: int(
+                sum(
+                    int(
+                        metric.get("policy_component_active_dose", {})
+                        .get(component_id, {})
+                        .get(key, 0)
+                    )
+                    for metric in metrics
+                )
+            )
+            for key in ("base_active_rows", "aux_active_rows", "total_active_rows")
+        }
+        for component_id in getattr(data, "component_ids", tuple())
+    }
     report = {
         "checkout_runtime_binding": checkout_runtime_binding,
         "arch": args.arch,
@@ -6132,6 +6237,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         "grow_from_checkpoint": args.grow_from_checkpoint or None,
         "metrics": metrics,
         "data_quality": data_quality,
+        "policy_distillation_scope": policy_distillation_scope_report,
+        "policy_component_active_dose": policy_component_active_dose,
         "sample_weight_quality": policy_sample_weight_report,
         "policy_sample_weight_quality": policy_sample_weight_report,
         "value_sample_weight_quality": value_sample_weight_report,
@@ -6249,6 +6356,12 @@ def main(argv: Sequence[str] | None = None) -> None:
                 ),
                 "policy_kl_anchor_component_ids": a1_preflight_meta.get(
                     "policy_kl_anchor_component_ids", []
+                ),
+                "policy_distillation_component_ids": a1_preflight_meta.get(
+                    "policy_distillation_component_ids", []
+                ),
+                "policy_distillation_scope_explicit": bool(
+                    a1_preflight_meta.get("policy_distillation_scope_explicit", False)
                 ),
                 "component_contract_sha256s": [
                     contract["a1_contract_sha256"]
@@ -7612,6 +7725,20 @@ def evaluate_composite_validation_measure(
             "objective-matched validation requires authenticated composite ids/ratios"
         )
     indices = np.asarray(validation_indices, dtype=np.int64)
+    distillation_scope_authenticated = bool(
+        getattr(data, "policy_distillation_scope_authenticated", False)
+    )
+    distillation_indices = set(
+        int(value)
+        for value in getattr(data, "policy_distillation_component_indices", tuple())
+    )
+    if distillation_scope_authenticated and (
+        not distillation_indices
+        or any(value < 0 or value >= len(component_ids) for value in distillation_indices)
+    ):
+        raise SystemExit(
+            "objective-matched validation received invalid policy distillation scope"
+        )
     components = np.asarray(data.component_indices_for_rows(indices), dtype=np.int64)
     seeds = np.asarray(data["game_seed"][indices], dtype=np.int64)
     component_reports: dict[str, dict[str, object]] = {}
@@ -7641,6 +7768,10 @@ def evaluate_composite_validation_measure(
         )
         component_reports[str(component_id)] = {
             "component_index": int(component),
+            "policy_distillation_enabled": bool(
+                not distillation_scope_authenticated
+                or component in distillation_indices
+            ),
             "authenticated_sampling_ratio": float(ratios[component]),
             "games": int(len(games)),
             "rows": int(positions.size),
@@ -7671,6 +7802,11 @@ def evaluate_composite_validation_measure(
             str(component_id): float(ratio)
             for component_id, ratio in zip(component_ids, ratios, strict=True)
         },
+        "policy_distillation_component_ids": (
+            [component_ids[index] for index in sorted(distillation_indices)]
+            if distillation_scope_authenticated
+            else list(component_ids)
+        ),
         "metrics": aggregate,
         "components": component_reports,
         **(
@@ -9249,6 +9385,15 @@ def load_teacher_data_memmap(
                 if component_id in anchor_ids
             )
             corpus.policy_kl_anchor_scope_authenticated = True
+            distillation_ids = set(
+                authenticated["policy_distillation_component_ids"]
+            )
+            corpus.policy_distillation_component_indices = tuple(
+                index
+                for index, component_id in enumerate(corpus.component_ids)
+                if component_id in distillation_ids
+            )
+            corpus.policy_distillation_scope_authenticated = True
         corpus.meta.update({
             "schema": authenticated["schema_version"],
             "descriptor_path": authenticated["descriptor_path"],
@@ -12671,6 +12816,64 @@ def build_sample_weights(
     if mean > 0:
         weights = weights / mean
     return weights.astype(np.float32, copy=False)
+
+
+def _apply_authenticated_policy_distillation_scope(
+    data, weights: np.ndarray
+) -> np.ndarray:
+    """Zero policy CE outside an authenticated composite component scope.
+
+    Value weights are intentionally untouched. Stored-prior KL has its own
+    independently authenticated component scope, so a replay component can
+    rehearse outcomes and optionally anchor incumbent behavior without
+    distilling an obsolete search teacher.
+    """
+
+    if not bool(getattr(data, "policy_distillation_scope_authenticated", False)):
+        return weights
+    component_ids = tuple(getattr(data, "component_ids", tuple()))
+    eligible = tuple(
+        int(value)
+        for value in getattr(data, "policy_distillation_component_indices", tuple())
+    )
+    if (
+        not component_ids
+        or not eligible
+        or any(value < 0 or value >= len(component_ids) for value in eligible)
+        or len(set(eligible)) != len(eligible)
+    ):
+        raise SystemExit("authenticated policy distillation component scope is invalid")
+    rows = np.arange(len(weights), dtype=np.int64)
+    component_indices = data.component_indices_for_rows(rows)
+    keep = np.isin(component_indices, np.asarray(eligible, dtype=np.int64))
+    scoped = np.asarray(weights, dtype=np.float32).copy()
+    scoped[~keep] = 0.0
+    if not np.any(scoped > 0.0):
+        raise SystemExit("authenticated policy distillation scope has no positive policy rows")
+    return scoped
+
+
+def _policy_distillation_scope_report(data, weights: np.ndarray) -> dict[str, object] | None:
+    if not bool(getattr(data, "policy_distillation_scope_authenticated", False)):
+        return None
+    component_ids = tuple(data.component_ids)
+    eligible = set(data.policy_distillation_component_indices)
+    offsets = np.asarray(data.component_offsets, dtype=np.int64)
+    components = {}
+    for index, component_id in enumerate(component_ids):
+        part = np.asarray(weights[offsets[index] : offsets[index + 1]], dtype=np.float64)
+        components[str(component_id)] = {
+            "component_index": int(index),
+            "policy_distillation_enabled": bool(index in eligible),
+            "rows": int(part.size),
+            "positive_policy_rows": int(np.count_nonzero(part > 0.0)),
+            "policy_weight_sum": float(part.sum()),
+        }
+    return {
+        "schema_version": "component-policy-distillation-scope-v1",
+        "component_ids": [component_ids[index] for index in sorted(eligible)],
+        "components": components,
+    }
 
 
 def build_value_sample_weights(

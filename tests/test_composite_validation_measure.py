@@ -155,6 +155,31 @@ def test_objective_measure_aggregates_weight_density_before_dividing() -> None:
     assert report["metrics"]["raw_batch_mean_loss"] == 5.0
 
 
+def test_objective_matched_validation_excludes_value_only_replay_policy_ce() -> None:
+    data = _Composite()
+    data.policy_distillation_scope_authenticated = True
+    data.policy_distillation_component_indices = (0,)
+
+    def evaluate(indices: np.ndarray) -> dict:
+        replay = bool(np.all(indices >= 4))
+        return {
+            "samples": int(len(indices)),
+            "loss": 0.0 if replay else 2.0,
+            "policy_loss": 0.0 if replay else 2.0,
+            "loss_denominators": {"policy_loss": 0.0 if replay else float(len(indices))},
+            "objective_coefficients": {"policy_loss": 1.0},
+        }
+
+    report = evaluate_composite_validation_measure(
+        data, np.arange(6, dtype=np.int64), evaluate
+    )
+    assert report["policy_distillation_component_ids"] == ["n128"]
+    assert report["components"]["n128"]["policy_distillation_enabled"] is True
+    assert report["components"]["replay"]["policy_distillation_enabled"] is False
+    assert report["components"]["replay"]["metrics"]["policy_loss"] == 0.0
+    assert report["metrics"]["policy_loss"] == 2.0
+
+
 def test_teacher_gap_closure_uses_aggregate_kl_mass_not_mean_of_game_ratios() -> None:
     data = _Composite()
 
