@@ -66,7 +66,7 @@ def test_forced_policy_is_not_reintroduced_as_a_recipe_override():
         arm["recipe"]["policy_kl_anchor_direction"] == "forward"
         for arm in plan["arms"]
     )
-    assert plan["fixed_data_recipe"]["old_gen3_replay_ratio_by_game"] == 0.2
+    assert plan["fixed_data_recipe"]["incumbent_mixed_replay_ratio_by_game"] == 0.2
     assert next(arm for arm in plan["arms"] if arm["arm_id"] == "HEAD_ONLY")[
         "recipe"
     ]["freeze_modules"] == "trunk"

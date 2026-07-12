@@ -141,7 +141,7 @@ def build_plan(*, world_size: int, local_batch_size: int, grad_accum_steps: int)
             "fresh_components": ["n128", "n256"],
             "global_shuffle": True,
             "validation_split": "game-disjoint",
-            "old_gen3_replay_ratio_by_game": 0.2,
+            "incumbent_mixed_replay_ratio_by_game": 0.2,
             "replay_stage": "fixed throughout P1; K0 is replay without KL anchor",
         },
         "prerequisites": [

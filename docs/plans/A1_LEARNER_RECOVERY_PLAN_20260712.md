@@ -54,8 +54,9 @@ These defaults apply to every arm unless the arm names an explicit delta:
 
 - initialization: the f7 producer bytes, independently reloaded
   for every arm; never chain arms through each other's optimizer state;
-- data: globally shuffled n128+n256 rows plus authenticated gen3 replay sampled
-  component → uniform game → uniform row, with game-disjoint validation;
+- data: globally shuffled n128+n256 rows plus authenticated incumbent-era
+  mixed replay (approximately 80% f7, 15% gen3 history, 5% gen4 hard-negative)
+  sampled component → uniform game → uniform row, with game-disjoint validation;
 - loss weighting: loser weight 1.0, per-game policy `sqrt`, per-game value
   `sqrt`, forced policy unchanged (already zero from corpus multiplier), forced
   value weight 1.0 initially;
@@ -104,13 +105,15 @@ Hold every field fixed and sweep only `policy_kl_anchor_weight`:
 | K3 | 0.03 | light behavioral anchor |
 | K10 | 0.10 | strong behavioral anchor |
 
-All three arms use a fixed 20% authenticated gen3 replay component; K0 tests
+All three arms use a fixed 20% authenticated incumbent-era mixed replay
+component; K0 tests
 replay without a behavior anchor, while K3/K10 isolate anchor strength. Run
 the 4.19M-sample sentinel from the same initialization. Advance at most the
 Pareto winner to 8.39M samples, again from the original initialization. Current
-rows' stored priors came from f7 and are anchor-ineligible. The anchor is
-computed only against verified gen3 priors on the authenticated gen3 replay
-component; it is not a second teacher target.
+rows' stored priors came from the current wave and are anchor-ineligible. The
+anchor is computed only against verified priors on the replay component
+(mostly f7, with gen3/gen4 population coverage); it is not a second teacher
+target.
 
 ### P2 — localize the destructive update
 

@@ -56,7 +56,7 @@ def build_plan(
         "inherit_recipe_from": "authenticated P1 winner",
         "sample_dose": SAMPLE_DOSE,
         "max_steps": max_steps,
-        "data": "same authenticated n128+n256+gen3-replay composite selected by P1",
+        "data": "same authenticated n128+n256+incumbent-mixed-replay composite selected by P1",
         "validation": "same deterministic 262144-row game-disjoint sentinel and common-random-number panels",
         "validation_max_samples": 262_144,
         "initialization": "same authenticated P1 parent checkpoint bytes",
