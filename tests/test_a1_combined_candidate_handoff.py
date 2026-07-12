@@ -115,6 +115,9 @@ def test_combined_handoff_requires_internal_h1_and_matched_external_nonregressio
     _install_replays(monkeypatch, files, internal_verdict="continue")
     assert handoff.adjudicate(manifest)["passed"] is False
 
+    _install_replays(monkeypatch, files, internal_verdict="H1")
+    assert handoff.adjudicate(manifest)["gates"]["internal_h2h"]["passed"] is True
+
     _install_replays(monkeypatch, files, candidate_rate=0.39, champion_rate=0.42)
     rejected = handoff.adjudicate(manifest)
     assert rejected["passed"] is False

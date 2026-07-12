@@ -218,7 +218,10 @@ def adjudicate(manifest_path: Path) -> dict[str, Any]:
     candidate_rate = float(candidate_external["candidate_win_rate"])
     champion_rate = float(champion_external["candidate_win_rate"])
     max_regression = promotion.MAX_EXTERNAL_WIN_RATE_REGRESSION
-    internal_pass = internal.get("verdict") == "accept_h1"
+    # The direct pool uses the SPRT-native spelling ``H1`` while older
+    # adjudicator receipts normalize it to ``accept_h1``.  Both mean the same
+    # accepted alternative hypothesis and must replay identically.
+    internal_pass = internal.get("verdict") in {"H1", "accept_h1"}
     external_pass = candidate_rate + max_regression >= champion_rate
     passed = internal_pass and external_pass
     result = {
