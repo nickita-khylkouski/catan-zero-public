@@ -81,17 +81,16 @@ run_dose() {
   local arm=$1 subset=$2 data=$3 validation=$4 parent=${5:-}
   local dose=$out/$arm spec=$out/$arm/learner.spec.json
   local lock=$out/$arm/learner.lock.json lock_digest code_digest tmp
-  tmp=$spec.tmp.$$
-  "$python" "$repo/tools/a1_dual_learner_contract.py" inspect-spec \
-    --data "$data" --validation "$validation" \
-    --producer-checkpoint "$producer" --world-size 8 >"$tmp"
-  if [[ -e "$spec" ]]; then
-    cmp -s "$tmp" "$spec" || { echo "REFUSED: $arm corrective spec drift" >&2; exit 2; }
-    rm -f "$tmp"
+  if [[ -e "$spec" || -e "$lock" ]]; then
+    [[ -s "$spec" && -s "$lock" ]] || {
+      echo "REFUSED: $arm corrective spec/lock pair is incomplete" >&2; exit 2;
+    }
   else
+    tmp=$spec.tmp.$$
+    "$python" "$repo/tools/a1_dual_learner_contract.py" inspect-spec \
+      --data "$data" --validation "$validation" \
+      --producer-checkpoint "$producer" --world-size 8 >"$tmp"
     chmod 0444 "$tmp"; mv "$tmp" "$spec"
-  fi
-  if [[ ! -e "$lock" ]]; then
     "$python" "$repo/tools/a1_dual_learner_contract.py" seal \
       --arm-lock "$contracts/$arm.lock.json" --learner-spec "$spec" \
       --data "$data" --validation "$validation" \
