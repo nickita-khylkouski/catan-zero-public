@@ -13,6 +13,7 @@ import operator
 import os
 from pathlib import Path
 import re
+import stat
 import subprocess
 import sys
 import tempfile
@@ -71,6 +72,9 @@ TARGET_INFORMATION_REGIME_PUBLIC = "public_conservation_pimc_v1"
 TARGET_INFORMATION_REGIME_UNKNOWN = "unknown"
 
 MEMMAP_PAYLOAD_INVENTORY_SCHEMA = "memmap-payload-inventory-v1"
+MEMMAP_PAYLOAD_AUTH_CACHE_SCHEMA = "memmap-payload-auth-cache-v1"
+# Bump whenever the inventory validation semantics or cache identity changes.
+MEMMAP_PAYLOAD_AUTH_VALIDATOR_VERSION = 1
 A1_REQUIRED_LEARNER_CODE_SUFFIXES = {
     "configs/guards/train_bc.json",
     "tools/factory_common.py",
@@ -1792,6 +1796,169 @@ def _expected_memmap_payload_filenames(
     return expected
 
 
+def _payload_auth_cache_root() -> Path:
+    override = os.environ.get("TRAIN_BC_PAYLOAD_AUTH_CACHE_DIR")
+    if override:
+        return Path(override).expanduser()
+    xdg = os.environ.get("XDG_CACHE_HOME")
+    base = Path(xdg).expanduser() if xdg else Path.home() / ".cache"
+    return base / "catan-zero" / "payload-auth"
+
+
+def _payload_filesystem_identity(path: Path) -> dict[str, int | str]:
+    """Return a fail-closed identity for one immutable payload path."""
+
+    try:
+        before = path.lstat()
+    except OSError as error:
+        raise SystemExit(f"cannot stat A1 memmap payload {path}: {error}") from error
+    if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+        raise SystemExit(f"A1 memmap payload must be a non-symlink regular file: {path}")
+    return _payload_stat_identity(path.name, before)
+
+
+def _payload_stat_identity(
+    filename: str, value: os.stat_result
+) -> dict[str, int | str]:
+    return {
+        "filename": filename,
+        "device": int(value.st_dev),
+        "inode": int(value.st_ino),
+        "size_bytes": int(value.st_size),
+        "mtime_ns": int(value.st_mtime_ns),
+        "ctime_ns": int(value.st_ctime_ns),
+        "mode": int(stat.S_IMODE(value.st_mode)),
+    }
+
+
+def _sha256_stable_payload(
+    path: Path, expected_identity: dict[str, int | str]
+) -> str:
+    """Hash one exact inode and reject mutation or pathname replacement."""
+
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError as error:
+        raise SystemExit(f"cannot open A1 memmap payload {path}: {error}") from error
+    digest = hashlib.sha256()
+    try:
+        with os.fdopen(fd, "rb") as handle:
+            identity_before = _payload_stat_identity(path.name, os.fstat(handle.fileno()))
+            if identity_before != expected_identity:
+                raise SystemExit(
+                    f"A1 memmap payload {path.name} identity changed before hashing"
+                )
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+            identity_after = _payload_stat_identity(path.name, os.fstat(handle.fileno()))
+    except OSError as error:
+        raise SystemExit(f"cannot hash A1 memmap payload {path}: {error}") from error
+    if identity_after != expected_identity or _payload_filesystem_identity(path) != expected_identity:
+        raise SystemExit(f"A1 memmap payload {path.name} changed while being authenticated")
+    return f"sha256:{digest.hexdigest()}"
+
+
+def _payload_auth_cache_binding(
+    root: Path,
+    corpus_meta: dict[str, object],
+    inventory_sha: str,
+    identities: list[dict[str, int | str]],
+) -> dict[str, object]:
+    meta_path = root / "corpus_meta.json"
+    return {
+        "schema_version": MEMMAP_PAYLOAD_AUTH_CACHE_SCHEMA,
+        "validator_version": MEMMAP_PAYLOAD_AUTH_VALIDATOR_VERSION,
+        "corpus_dir": str(root.resolve(strict=True)),
+        "corpus_meta_file_sha256": _sha256_existing_file(meta_path),
+        "corpus_descriptor_sha256": _canonical_json_sha256(corpus_meta),
+        "payload_inventory_schema": corpus_meta.get("payload_inventory_schema"),
+        "payload_inventory_sha256": inventory_sha,
+        "payloads": identities,
+    }
+
+
+def _payload_auth_cache_path(binding: dict[str, object]) -> Path:
+    digest = _canonical_json_sha256(binding).split(":", 1)[1]
+    return _payload_auth_cache_root() / f"{digest}.json"
+
+
+def _load_payload_auth_cache(
+    binding: dict[str, object], *, total_bytes: int
+) -> bool:
+    path = _payload_auth_cache_path(binding)
+    try:
+        directory = path.parent
+        directory_stat = directory.lstat()
+        if (
+            not stat.S_ISDIR(directory_stat.st_mode)
+            or directory_stat.st_uid != os.geteuid()
+            or stat.S_IMODE(directory_stat.st_mode) & 0o077
+        ):
+            return False
+        cache_stat = path.lstat()
+        if (
+            not stat.S_ISREG(cache_stat.st_mode)
+            or stat.S_ISLNK(cache_stat.st_mode)
+            or cache_stat.st_uid != os.geteuid()
+            or stat.S_IMODE(cache_stat.st_mode) & 0o077
+        ):
+            return False
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return False
+    if not isinstance(payload, dict) or set(payload) != {
+        "binding", "binding_sha256", "authenticated_bytes", "entry_sha256"
+    }:
+        return False
+    unsigned = dict(payload)
+    entry_sha = unsigned.pop("entry_sha256", None)
+    return bool(
+        payload.get("binding") == binding
+        and payload.get("binding_sha256") == _canonical_json_sha256(binding)
+        and payload.get("authenticated_bytes") == total_bytes
+        and entry_sha == _canonical_json_sha256(unsigned)
+    )
+
+
+def _publish_payload_auth_cache(
+    binding: dict[str, object], *, total_bytes: int
+) -> None:
+    """Best-effort publish; inability to cache never weakens verification."""
+
+    path = _payload_auth_cache_path(binding)
+    try:
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        directory_stat = path.parent.lstat()
+        if (
+            not stat.S_ISDIR(directory_stat.st_mode)
+            or directory_stat.st_uid != os.geteuid()
+            or stat.S_IMODE(directory_stat.st_mode) != 0o700
+        ):
+            return
+        unsigned = {
+            "binding": binding,
+            "binding_sha256": _canonical_json_sha256(binding),
+            "authenticated_bytes": total_bytes,
+        }
+        payload = {**unsigned, "entry_sha256": _canonical_json_sha256(unsigned)}
+        fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, sort_keys=True, separators=(",", ":"))
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.chmod(temporary, 0o600)
+            os.replace(temporary, path)
+        finally:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+    except OSError:
+        return
+
+
 def _validate_memmap_payload_inventory(
     data_path: str | Path, corpus_meta: dict[str, object]
 ) -> str:
@@ -1875,21 +2042,73 @@ def _validate_memmap_payload_inventory(
             f"inventory: missing={sorted(expected_names - actual_names)} "
             f"unexpected={sorted(actual_names - expected_names)}"
         )
+    identities = [
+        _payload_filesystem_identity(root / filename)
+        for filename in sorted(expected_names)
+    ]
+    total_bytes = sum(int(identity["size_bytes"]) for identity in identities)
+    binding = _payload_auth_cache_binding(
+        root, corpus_meta, actual_inventory_sha, identities
+    )
+    cache_eligible = all(
+        int(identity["mode"]) & 0o222 == 0 for identity in identities
+    )
+    if cache_eligible and _load_payload_auth_cache(binding, total_bytes=total_bytes):
+        print(json.dumps({
+            "progress": "a1_payload_auth_cache",
+            "status": "hit",
+            "payload_count": len(identities),
+            "authenticated_bytes": total_bytes,
+            "bytes_avoided": total_bytes,
+            "binding_sha256": _canonical_json_sha256(binding),
+        }, sort_keys=True), flush=True)
+        return actual_inventory_sha
+
     for filename in sorted(expected_names):
         record = records_by_name[filename]
         payload_path = root / filename
-        actual_size = payload_path.stat().st_size
+        identity_before = _payload_filesystem_identity(payload_path)
+        actual_size = int(identity_before["size_bytes"])
         if actual_size != record["size_bytes"]:
             raise SystemExit(
                 f"A1 memmap payload {filename} size mismatch: "
                 f"declared={record['size_bytes']} actual={actual_size}"
             )
-        actual_sha = _sha256_existing_file(payload_path)
+        actual_sha = _sha256_stable_payload(payload_path, identity_before)
+        identity_after = _payload_filesystem_identity(payload_path)
+        if identity_after != identity_before:
+            raise SystemExit(
+                f"A1 memmap payload {filename} changed while being authenticated"
+            )
         if actual_sha != record["sha256"]:
             raise SystemExit(
                 f"A1 memmap payload {filename} sha256 mismatch: "
                 f"declared={record['sha256']!r} actual={actual_sha!r}"
             )
+    # Recompute the complete binding after hashing. This also catches a sibling
+    # payload changing while a different file was being read.
+    final_identities = [
+        _payload_filesystem_identity(root / filename)
+        for filename in sorted(expected_names)
+    ]
+    if final_identities != identities:
+        raise SystemExit("A1 memmap payload identity changed during authentication")
+    if cache_eligible:
+        _publish_payload_auth_cache(binding, total_bytes=total_bytes)
+    print(json.dumps({
+        "progress": "a1_payload_auth_cache",
+        "status": "miss",
+        "miss_reason": (
+            "cache_absent_or_invalid"
+            if cache_eligible
+            else "payload_not_read_only"
+        ),
+        "payload_count": len(identities),
+        "authenticated_bytes": total_bytes,
+        "bytes_avoided": 0,
+        "cache_eligible": cache_eligible,
+        "binding_sha256": _canonical_json_sha256(binding),
+    }, sort_keys=True), flush=True)
     return actual_inventory_sha
 
 
