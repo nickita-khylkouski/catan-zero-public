@@ -3,6 +3,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
+
 # `tools/generate_gumbel_selfplay_data.py` does bare sibling imports
 # (`from factory_common import ...`), so it only works with `tools/` itself on
 # sys.path (matches the bootstrap pattern in tests/test_gumbel_self_play.py and
@@ -123,17 +125,36 @@ def test_symmetry_averaging_defaults_to_off_with_canonical_wide_threshold(monkey
 
 def test_symmetry_averaging_and_wide_threshold_thread_through(monkeypatch) -> None:
     captured = _capture_configs(monkeypatch)
+
+    class _SymmetryCapableEvaluator:
+        def evaluate_symmetry_averaged(self, *args, **kwargs):
+            raise AssertionError("configuration wiring test must not evaluate")
+
     cli._run_worker(
         _worker_args(
             symmetry_averaged_eval=True,
             symmetry_averaged_eval_threshold=20,
             wide_candidates_threshold=24,
-        )
+        ),
+        champion_evaluator=_SymmetryCapableEvaluator(),
     )
 
     assert captured["search_config"].symmetry_averaged_eval is True
     assert captured["search_config"].symmetry_averaged_eval_threshold == 20
     assert captured["search_config"].wide_candidates_threshold == 24
+
+
+def test_symmetry_averaging_fails_closed_for_incapable_evaluator(monkeypatch) -> None:
+    """A generation manifest may not claim D6 when the evaluator would no-op."""
+
+    _capture_configs(monkeypatch)
+    with pytest.raises(ValueError, match="symmetry-capable neural evaluator"):
+        cli._run_worker(
+            _worker_args(
+                symmetry_averaged_eval=True,
+                symmetry_averaged_eval_threshold=20,
+            )
+        )
 
 
 def test_adaptive_wide_budget_threshold_and_always_full_thread_through(monkeypatch) -> None:
