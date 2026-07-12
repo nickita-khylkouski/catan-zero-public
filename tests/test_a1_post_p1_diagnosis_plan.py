@@ -39,7 +39,7 @@ def test_matrix_is_sequential_and_non_launching() -> None:
     assert plan["launch_authorized"] is False
     assert "P1" in plan["launch_condition"]
     assert any("only after HEAD_ONLY releases DDP" in row for row in plan["gpu_schedule"])
-    assert "rejected c_scale=.03" in plan["explicitly_deferred"]["root_value_blend"]
+    assert "operator identity is valid" in plan["explicitly_deferred"]["root_value_blend"]
 
 
 def test_only_eight_b200_topology_is_admitted() -> None:

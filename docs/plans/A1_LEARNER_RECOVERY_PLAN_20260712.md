@@ -9,12 +9,23 @@ competitive overfitting: optimizer updates improve some same-lineage matchups
 while losing external strength. The learner is also not using all trustworthy
 search supervision.
 
-The decisive upstream regression is a **producer/operator identity mismatch**.
-The f7 checkpoint was promoted as an agent at `c_scale=0.10`, but the n128/n256
-wave paired those bytes with `c_scale=0.03`. Matched same-checkpoint probes had
-already measured f7 at 42.19% versus gen3 under `.03` and 56.25% under `.10`.
-The corpus therefore contains valid rows from a degraded search operator; it
-is recovery data, not evidence that n128/n256 or 35M capacity failed.
+The authoritative n128/n256 locks rule out a producer/operator mismatch. Both
+arms bind the promoted f7 checkpoint and handoff, and every current-producer
+job uses `c_scale=0.10`; only gen3 recent-history and gen4 hard-negative jobs
+intentionally use `.03`. A fresh 576-game native-runtime pilot also matched a
+576-game historical current-producer sample: target/prior KL differed by
+0.43%, forced fraction by 0.14 percentage points, full-search fraction by 0.13
+points, and every phase fraction by less than 0.18 points. Both samples had
+zero failures and truncations. The generator and teacher-target distribution
+are therefore not the proximal regression source.
+
+The strongest surviving evidence is learner-side. Failed candidates improved
+held-out loss or internal play while regressing externally, and 96--98% of
+their update energy landed in the shared trunk. Trunk drift rose from 8.96%
+to 30.18% with learning rate while value-head drift remained 2.19--5.13%.
+The same 35M architecture produced both gen3 and the stronger f7 agent, so
+capacity is not the first hypothesis; behavior forgetting and objective
+imbalance are.
 
 Forced rows are **not** the missing policy signal. Generation writes
 `policy_weight_multiplier=0` for every single-legal-action row and every
@@ -51,8 +62,8 @@ These defaults apply to every arm unless the arm names an explicit delta:
 - optimizer: Adam, bf16, 100-step warmup, flat LR for a short dose;
 - LR: flat `3e-5` for P1. The f7/gen3 topology has no action-local gather or
   cross-attention parameters, so an action-module `2x` multiplier is a fake
-  no-op and is rejected. P2 compares this protected low-dose update with a
-  matched flat `6e-5` arm;
+  no-op and is rejected. P2 localizes whether shared-trunk updates are the
+  source of forgetting before adding any discriminative LR;
 - primary value objective: scalar MSE until the stability recipe is selected;
 - search-value blend: lambda 1.0 until the stability recipe is selected;
 - update dose: first sentinel at 4,194,304 global samples, then 8,388,608 only
@@ -63,12 +74,12 @@ These defaults apply to every arm unless the arm names an explicit delta:
 
 ## Pareto-ranked execution sequence
 
-### P0 — free recovery: checkpoint interpolation
+### P0 — free recovery: checkpoint interpolation (completed)
 
-Evaluate champion-to-candidate interpolation at alpha 0.10, 0.25, 0.50 and
-1.00 using common-random-number internal and external panels. This can recover
-a useful partial update without another training run. Reject any alpha that
-loses external strength even if its internal panel improves.
+The alpha-0.10 candidate scored 46.43% internally and 48.21% externally versus
+the incumbent's 50% external result. It was not a winner, so larger alphas
+were pruned. Interpolation remains a valid cheap recovery tool, but it did not
+solve this regression.
 
 ### P1 — anti-forgetting anchor sweep (three short B200 arms)
 
@@ -79,7 +90,8 @@ that denominator, diluting the configured coefficient by roughly their corpus
 fraction. Use multi-action rows only (retain fast-PCR multi-action rows as
 rehearsal) and forward `KL(prior || new)`/old-policy cross-entropy as the
 behavior-preservation objective. Preserve the reverse direction only as an
-explicit legacy ablation.
+explicit legacy ablation. This implementation repair is complete and
+regression-tested.
 
 Hold every field fixed and sweep only `policy_kl_anchor_weight`:
 
@@ -89,27 +101,28 @@ Hold every field fixed and sweep only `policy_kl_anchor_weight`:
 | K3 | 0.03 | light behavioral anchor |
 | K10 | 0.10 | strong behavioral anchor |
 
-Run the 4.19M-sample sentinel from the same initialization. Advance at most the
+All three arms use a fixed 20% authenticated gen3 replay component; K0 tests
+replay without a behavior anchor, while K3/K10 isolate anchor strength. Run
+the 4.19M-sample sentinel from the same initialization. Advance at most the
 Pareto winner to 8.39M samples, again from the original initialization. Current
 rows' stored priors came from f7 and are anchor-ineligible. The anchor is
 computed only against verified gen3 priors on the authenticated gen3 replay
 component; it is not a second teacher target.
 
-### P2 — replay and discriminative-LR separation
+### P2 — localize the destructive update
 
-First compare the P1 winner against one full-update arm with base LR `6e-5`,
-action multiplier 1.0 and the same winning KL. This isolates whether protecting
-the trunk matters.
+Reuse the selected P1 checkpoint as the full-update control at zero additional
+training cost. From an independent f7 initialization, run one matched
+`--freeze-modules trunk` arm with the selected P1 replay/KL recipe. If this
+head-only arm restores external strength, destructive shared-trunk updates are
+causal. Only then add a parameter-group trunk LR multiplier and compare trunk
+multipliers `{0, 0.1, 0.25}` at fixed total sample dose; do not infer a
+discriminative LR from a full-model LR change.
 
-Then add old-gen3 replay by game, not by raw row. Compare replay ratios 0%, 10%
-and 20% while keeping the total sample dose fixed. Replay games must receive the
-same per-game weighting as fresh games. Do not let a long old game acquire more
-mass merely because it contains more rows. If a replay corpus lacks current
-soft-target/root-value semantics, use it for a champion KL/rehearsal objective,
-not as if it were fresh n256 supervision.
-
-Advance replay only when it improves the external sentinel or materially
-reduces parameter/behavior drift without erasing active teacher-gap closure.
+If every K arm forgets despite 20% replay, add one R0 control with no replay at
+the selected KL weight. Do not sweep replay ratios unless that matched control
+shows replay itself is harmful. Replay remains component → uniform game →
+uniform row so long games cannot dominate by row count.
 
 ### P3 — use trustworthy search value
 
@@ -156,9 +169,10 @@ The three-way outcome separates the proximal hypotheses: head-only recovering
 external strength implicates trunk optimization/forgetting; gather/cross
 improving over head-only implicates missing action-local capacity.  Auxiliary
 heads and root-value blending are held off because they alter the objective,
-not just the architecture.  In particular, the large n128/n256 corpus root
-values were produced under the now-rejected `.03` operator identity; do not
-turn them into learner targets.  Scale beyond 35M only if the corrected 35M
+not just the architecture. Root-value blending remains deferred here because
+it changes the objective and the stored roots are correlated, stale f7 search
+estimates—not because their operator identity is invalid. Scale beyond 35M
+only if the corrected 35M
 learner still underfits active teacher targets and its external strength is
 non-regressing.
 
@@ -188,10 +202,12 @@ shared `.03` assumption.
 
 ## Expected compute order
 
-P0 runs on the evaluator fleet while P1 trains sequentially on 8xB200. P1's
-three 4.19M-sample arms are the highest-information training spend. P2 adds at
-most two new arms after the P1 loser arms are killed. P3 adds two arms. P4 and
-P5 are conditional. This is successive halving, not an exhaustive Cartesian
+P0 is complete. P1 trains sequentially on 8xB200 while completed checkpoints
+evaluate on the approved 40-H100 fleet. P1's three 4.19M-sample arms are the
+highest-information training spend. P2 adds one head-only localization arm;
+only a positive result unlocks a trunk-LR sweep. P3 adds one value-blend arm,
+then categorical value only if the blend wins. P4 adds one forced-value arm.
+P5 is conditional. This is successive halving, not an exhaustive Cartesian
 grid.
 
 Primary methodological references already reflected in the repository review:

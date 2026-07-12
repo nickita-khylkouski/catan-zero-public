@@ -169,8 +169,9 @@ def build_plan(
             "action_cross_attention": "implemented, warm-start-safe, f7 effective layers=0",
             "auxiliary_heads": "implemented but f7 OFF and P1 loss weight zero",
             "root_value_blend": (
-                "implemented and loader-preserved; lambda remains 1 because existing "
-                "large-corpus roots bind the rejected producer/operator identity"
+                "implemented and loader-preserved; lambda remains 1 because stored "
+                "roots are correlated, stale f7 search estimates and changing the "
+                "blend would confound the trunk-localization experiment"
             ),
             "graph_history_features": "already ON in P1; held fixed",
         },
@@ -188,7 +189,10 @@ def build_plan(
         "decision_rules": decision,
         "explicitly_deferred": {
             "auxiliary_heads": "objective/regularization change; conditional after diagnosis",
-            "root_value_blend": "large corpus roots were generated under rejected c_scale=.03 identity",
+            "root_value_blend": (
+                "objective change deferred until trunk localization; root operator "
+                "identity is valid but the estimates are correlated and stale"
+            ),
             "hlgauss": "value-objective change; conditional after scalar stability",
             "relational_trunk": "larger architecture bundle than the attributable gather/cross probe",
             "model_scale": "only after corrected 35M underfitting is established",
