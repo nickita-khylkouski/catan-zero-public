@@ -220,8 +220,10 @@ def _completion_outputs(manifest: dict, path: Path, *, unit: str) -> Path:
     }
     (root / "train.report.json").write_text(json.dumps(report), encoding="utf-8")
     progress = {
-        "checkpoint": _ref(checkpoint),
-        "optimizer": _ref(optimizer),
+        # train_bc intentionally records colocated outputs lexically relative
+        # to this progress file, as the real production artifact does.
+        "checkpoint": {"path": checkpoint.name, "sha256": _ref(checkpoint)["sha256"]},
+        "optimizer": {"path": optimizer.name, "sha256": _ref(optimizer)["sha256"]},
         "optimizer_step": 2048,
         "completed_epochs": 1,
         "rank_torch_rng_states": [f"rank-{index}" for index in range(4)],

@@ -532,6 +532,22 @@ def _verify_adapter_only_model_delta(initializer: Path, candidate: Path) -> dict
     return evidence
 
 
+def _verify_progress_output_ref(
+    value: Any, *, progress_path: Path, label: str
+) -> Path:
+    """Verify a train_bc progress ref relative to the progress-file directory."""
+
+    if not isinstance(value, dict) or set(value) != {"path", "sha256"}:
+        raise GatherRetrainError(f"{label} reference is malformed")
+    lexical = Path(str(value["path"])).expanduser()
+    resolved = lexical if lexical.is_absolute() else progress_path.parent / lexical
+    normalized = {"path": str(resolved.resolve(strict=True)), "sha256": value["sha256"]}
+    try:
+        return base._verify_ref(normalized, label)  # noqa: SLF001
+    except base.L1Error as error:
+        raise GatherRetrainError(str(error)) from error
+
+
 def finalize(
     manifest_path: Path,
     *,
@@ -632,9 +648,17 @@ def finalize(
         or progress.get("completed_epochs") != 1
         or not isinstance(progress.get("rank_torch_rng_states"), list)
         or len(progress["rank_torch_rng_states"]) != WORLD_SIZE
-        or base._verify_ref(progress.get("checkpoint"), "progress checkpoint")  # noqa: SLF001
+        or _verify_progress_output_ref(
+            progress.get("checkpoint"),
+            progress_path=progress_path,
+            label="progress checkpoint",
+        )
         != Path(checkpoint["path"])
-        or base._verify_ref(progress.get("optimizer"), "progress optimizer")  # noqa: SLF001
+        or _verify_progress_output_ref(
+            progress.get("optimizer"),
+            progress_path=progress_path,
+            label="progress optimizer",
+        )
         != optimizer_path.resolve(strict=True)
     ):
         raise GatherRetrainError("target-gather progress/RNG/optimizer dose drifted")
