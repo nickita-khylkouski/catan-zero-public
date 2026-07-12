@@ -895,8 +895,6 @@ def _shared_claim_is_exact(
     return bool(
         cohort
         and cohort == prior_payload.get("seed_cohort_id")
-        and wanted_payload.get("science_config_hash")
-        == prior_payload.get("science_config_hash")
         and wanted.get("purpose") == occupied.get("purpose")
         and int(wanted["base_seed"]) == int(occupied["base_seed"])
         and int(wanted["end_seed"]) == int(occupied["end_seed"])
@@ -1598,8 +1596,9 @@ def _parser() -> argparse.ArgumentParser:
         "--seed-cohort-id",
         help=(
             "Explicit common-random-number cohort. Plans with the same ID, "
-            "science hash, purpose, and exact interval may intentionally reuse "
-            "VAL seeds; partial overlap remains forbidden."
+            "purpose, and exact interval may intentionally reuse VAL seeds for "
+            "matched checkpoint or search-config comparisons; partial overlap "
+            "remains forbidden."
         ),
     )
     plan.add_argument("--scope", choices=("canary", "full"), default="full")

@@ -626,7 +626,7 @@ def test_validation_claim_rejects_overlap_from_concurrent_plan(tmp_path: Path) -
         fleet.claim_validation_ranges(manifest, second)
 
 
-def test_explicit_common_seed_cohort_allows_only_exact_science_matched_reuse(
+def test_explicit_common_seed_cohort_allows_only_exact_interval_reuse(
     tmp_path: Path,
 ) -> None:
     manifest, template = _plan(tmp_path)
@@ -654,6 +654,24 @@ def test_explicit_common_seed_cohort_allows_only_exact_science_matched_reuse(
     assert first["plan_hash"] != second["plan_hash"]
     assert fleet.claim_validation_ranges(manifest, first) == "claimed"
     assert fleet.claim_validation_ranges(manifest, second) == "claimed"
+
+    calibrated = fleet.build_plan(
+        manifest,
+        candidate=Path(second["candidate"]["source"]),
+        champion=champion,
+        internal_pairs=600,
+        external_pairs=500,
+        internal_base_seed=6_190_000_000,
+        external_base_seed=6_191_000_000,
+        iteration_id="candidate-two-calibrated",
+        seed_cohort_id="dual-arm-common-v1",
+        candidate_c_scale=0.10,
+        champion_c_scale=0.03,
+        repo_commit="a" * 40,
+        tool_hashes=template["tool_hashes"],
+    )
+    assert calibrated["science_config_hash"] != second["science_config_hash"]
+    assert fleet.claim_validation_ranges(manifest, calibrated) == "claimed"
 
     partial = make("candidate-partial", internal_base=6_190_000_001)
     with pytest.raises(fleet.FleetError, match="VAL-only seed overlap"):
