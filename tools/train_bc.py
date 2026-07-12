@@ -140,6 +140,7 @@ from catan_zero.rl.entity_token_features import (  # noqa: E402
 # train and eval decode paths mask identically. The corpus stays UNMASKED on
 # disk -- one corpus serves both masked and unmasked training regimes.
 _MASK_HIDDEN_INFO_PLAYER_TOKENS = False
+_CROP_AUTHENTICATED_EMPTY_EVENT_HISTORY = False
 
 TARGET_INFORMATION_REGIME_PUBLIC = "public_conservation_pimc_v1"
 TARGET_INFORMATION_REGIME_UNKNOWN = "unknown"
@@ -343,6 +344,17 @@ def build_parser() -> argparse.ArgumentParser:
             "shape-compatible training only; it never claims the event encoder "
             "was trained. Entity-graph A1 training fails closed without the exact "
             "set."
+        ),
+    )
+    parser.add_argument(
+        "--crop-authenticated-empty-event-history",
+        action="store_true",
+        help=(
+            "After the A1 event-history contract passes, scan the complete "
+            "authenticated event_mask before optimizer construction and require it "
+            "to be all false. Then omit the 64 masked event rows from entity-graph "
+            "training batches. This is an explicit performance optimization; it "
+            "is refused for generic/non-A1, live-history, or non-entity runs."
         ),
     )
     parser.add_argument("--epochs", type=int, default=2)
@@ -4634,6 +4646,34 @@ def main(argv: Sequence[str] | None = None) -> None:
     training_information_surface = _a1_training_event_history_contract(
         args, a1_preflight_meta, env_config
     )
+    global _CROP_AUTHENTICATED_EMPTY_EVENT_HISTORY
+    if bool(args.crop_authenticated_empty_event_history):
+        if (
+            training_information_surface is None
+            or training_information_surface.get("event_history_consumer_enabled")
+            is not True
+            or training_information_surface.get("training_event_history_trainable")
+            is not False
+            or training_information_surface.get("event_history_end_to_end_usable")
+            is not False
+        ):
+            raise SystemExit(
+                "--crop-authenticated-empty-event-history requires an authenticated "
+                "A1 entity-event contract declaring non-trainable, non-usable history"
+            )
+        empty_scan = _rank0_authoritative_call(
+            ddp,
+            "authenticated empty event-mask scan",
+            lambda: _scan_empty_event_mask(data),
+        )
+        training_information_surface = {
+            **training_information_surface,
+            "training_event_tensor_width": 0,
+            "empty_event_mask_scan": empty_scan,
+        }
+        _CROP_AUTHENTICATED_EMPTY_EVENT_HISTORY = True
+    else:
+        _CROP_AUTHENTICATED_EMPTY_EVENT_HISTORY = False
     _rank0_print(
         json.dumps(
             {
@@ -6901,7 +6941,28 @@ def _entity_batch(data: dict, batch: np.ndarray) -> dict[str, np.ndarray]:
             f"missing {missing[:8]}{'...' if len(missing) > 8 else ''}. "
             "Run tools/convert_teacher_to_entity_tokens.py first."
         )
-    result = {key: data[key][batch] for key in ENTITY_BATCH_KEYS}
+    if _CROP_AUTHENTICATED_EMPTY_EVENT_HISTORY:
+        event_keys = {"event_tokens", "event_target_ids", "event_mask"}
+        result = {
+            key: data[key][batch] for key in ENTITY_BATCH_KEYS if key not in event_keys
+        }
+        full_mask = np.asarray(data["event_mask"][batch], dtype=np.bool_)
+        if bool(np.any(full_mask)):
+            raise RuntimeError(
+                "authenticated empty-event optimization observed a live event token"
+            )
+        batch_size = int(len(batch))
+        token_width = int(data["event_tokens"].shape[2])
+        target_width = int(data["event_target_ids"].shape[2])
+        result["event_tokens"] = np.empty(
+            (batch_size, 0, token_width), dtype=data["event_tokens"].dtype
+        )
+        result["event_target_ids"] = np.empty(
+            (batch_size, 0, target_width), dtype=data["event_target_ids"].dtype
+        )
+        result["event_mask"] = full_mask[:, :0]
+    else:
+        result = {key: data[key][batch] for key in ENTITY_BATCH_KEYS}
     if _MASK_HIDDEN_INFO_PLAYER_TOKENS:
         # Load-time public-observation masking: zero non-actor hidden slots so a
         # model trained here matches the public-observation evaluator (task #72).
@@ -10155,6 +10216,33 @@ def _a1_training_event_history_contract(
         )
     except InformationSurfaceError as error:
         raise SystemExit(f"A1 event-history contract refused training: {error}") from error
+
+
+def _scan_empty_event_mask(data: dict, *, chunk_rows: int = 262_144) -> dict[str, object]:
+    """Exactly prove the loaded immutable corpus exposes no live event rows."""
+
+    if isinstance(chunk_rows, bool) or int(chunk_rows) < 1:
+        raise ValueError("chunk_rows must be a positive integer")
+    column = data["event_mask"]
+    rows = int(column.shape[0])
+    width = int(column.shape[1])
+    nonzero = 0
+    for start in range(0, rows, int(chunk_rows)):
+        chunk = np.asarray(column[start : start + int(chunk_rows)], dtype=np.bool_)
+        nonzero += int(np.count_nonzero(chunk))
+        if nonzero:
+            raise SystemExit(
+                "--crop-authenticated-empty-event-history found a live event mask: "
+                f"first_nonempty_chunk_start={start} nonzero_count_at_least={nonzero}"
+            )
+    scan = {
+        "schema": "training-empty-event-mask-scan-v1",
+        "row_count": rows,
+        "padded_event_width": width,
+        "nonzero_event_mask_count": 0,
+    }
+    scan["scan_sha256"] = _canonical_json_sha256(scan)
+    return scan
 
 
 def _teacher_shard_files(path: Path) -> list[Path]:

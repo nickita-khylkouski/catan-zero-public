@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import copy
+
 import numpy as np
 import pytest
 
@@ -182,6 +184,62 @@ def test_fully_masked_event_history_can_be_removed_entirely():
     # CLS + hex + vertex + edge + player + global = 151 fixed tokens.
     assert cropped_tokens.shape[1] == 151
     assert cropped_mask.shape[1] == 151
+
+
+def test_event0_preserves_logits_value_loss_and_gradients_for_ddp_sized_batch():
+    """The training optimization must preserve the complete learner signal."""
+
+    full_model = EntityGraphNet(
+        _config(
+            action_target_gather=True,
+            action_cross_attention_layers=1,
+            value_attention_pool=True,
+        )
+    ).train()
+    cropped_model = copy.deepcopy(full_model).train()
+    full_batch = _batch(
+        batch_size=8,
+        action_width=7,
+        event_width=64,
+        live_event_width=0,
+    )
+    cropped_batch = {
+        key: (
+            value[:, :0]
+            if key in {"event_tokens", "event_mask"}
+            else value.clone()
+        )
+        for key, value in full_batch.items()
+    }
+    targets = torch.arange(8, dtype=torch.long).remainder(7)
+    value_targets = torch.linspace(-1.0, 1.0, 8)
+
+    full = full_model(full_batch)
+    cropped = cropped_model(cropped_batch)
+    full_loss = torch.nn.functional.cross_entropy(full["logits"], targets) + 0.25 * (
+        full["value"] - value_targets
+    ).square().mean()
+    cropped_loss = torch.nn.functional.cross_entropy(
+        cropped["logits"], targets
+    ) + 0.25 * (cropped["value"] - value_targets).square().mean()
+    full_loss.backward()
+    cropped_loss.backward()
+
+    torch.testing.assert_close(full["logits"], cropped["logits"], rtol=1e-6, atol=1e-6)
+    torch.testing.assert_close(full["value"], cropped["value"], rtol=1e-6, atol=1e-6)
+    torch.testing.assert_close(full_loss, cropped_loss, rtol=1e-6, atol=1e-6)
+    cropped_parameters = dict(cropped_model.named_parameters())
+    for name, parameter in full_model.named_parameters():
+        left = parameter.grad
+        right = cropped_parameters[name].grad
+        if left is None or right is None:
+            # The cropped event encoder is correctly disconnected. The full
+            # all-masked path may expose either None or an exact zero gradient.
+            present = left if left is not None else right
+            if present is not None:
+                assert torch.count_nonzero(present).item() == 0, name
+            continue
+        torch.testing.assert_close(left, right, rtol=2e-5, atol=2e-6, msg=name)
 
 
 def test_event0_short_circuits_empty_event_encoder_without_changing_output():

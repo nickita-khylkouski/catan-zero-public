@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 from tools import train_bc
@@ -106,3 +107,44 @@ def test_non_event_arch_rejects_meaningless_ack() -> None:
             metadata,
             SimpleNamespace(use_graph_history_features=True),
         )
+
+
+def test_exact_empty_mask_scan_and_nonempty_refusal() -> None:
+    data = {"event_mask": np.zeros((9, 64), dtype=np.bool_)}
+    report = train_bc._scan_empty_event_mask(data, chunk_rows=4)
+    assert report["row_count"] == 9
+    assert report["padded_event_width"] == 64
+    assert report["nonzero_event_mask_count"] == 0
+    assert str(report["scan_sha256"]).startswith("sha256:")
+
+    data["event_mask"][7, 3] = True
+    with pytest.raises(SystemExit, match="live event mask"):
+        train_bc._scan_empty_event_mask(data, chunk_rows=4)
+
+
+def test_cropped_entity_batch_skips_event_payload_and_refuses_live_mask(
+    monkeypatch,
+) -> None:
+    class RefusingEventTokens:
+        shape = (2, 64, 41)
+        dtype = np.dtype(np.float16)
+
+        def __getitem__(self, _index):
+            raise AssertionError("event token payload must not be read")
+
+    data = {
+        key: np.zeros((2, 1), dtype=np.float32)
+        for key in train_bc.ENTITY_BATCH_KEYS
+    }
+    data["event_tokens"] = RefusingEventTokens()
+    data["event_target_ids"] = np.full((2, 64, 4), -1, dtype=np.int16)
+    data["event_mask"] = np.zeros((2, 64), dtype=np.bool_)
+    monkeypatch.setattr(train_bc, "_CROP_AUTHENTICATED_EMPTY_EVENT_HISTORY", True)
+    batch = train_bc._entity_batch(data, np.asarray([0, 1], dtype=np.int64))
+    assert batch["event_tokens"].shape == (2, 0, 41)
+    assert batch["event_target_ids"].shape == (2, 0, 4)
+    assert batch["event_mask"].shape == (2, 0)
+
+    data["event_mask"][1, 5] = True
+    with pytest.raises(RuntimeError, match="live event token"):
+        train_bc._entity_batch(data, np.asarray([0, 1], dtype=np.int64))

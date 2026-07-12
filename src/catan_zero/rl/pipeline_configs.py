@@ -90,7 +90,7 @@ _T = TypeVar("_T", bound="PipelineConfig")
 
 # Bump when the *set* of fields on any pipeline config changes so that hashes
 # from before/after the change are never mistaken for equal regimes.
-CONFIG_SCHEMA_VERSION = 8
+CONFIG_SCHEMA_VERSION = 9
 
 # Length (hex chars) of the short hash embedded in artifacts. 16 hex chars =
 # 64 bits; collision probability is negligible for the run counts here and the
@@ -218,6 +218,7 @@ class TrainConfig(PipelineConfig):
     acknowledge_empty_event_history_payload_inventory_sha256: list[str] = (
         dataclasses.field(default_factory=list)
     )
+    crop_authenticated_empty_event_history: bool = False
     seed: int = 1
     validation_seed: int = 17
     validation_fraction: float = 0.05
