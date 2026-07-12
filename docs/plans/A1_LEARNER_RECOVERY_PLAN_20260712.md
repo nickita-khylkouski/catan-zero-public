@@ -16,11 +16,15 @@ policy loss, so those rows contribute neither policy numerator nor policy
 denominator. Forced rows remain value rows by design. They represent real
 states and realized outcomes; dropping them is an ablation, not a safe default.
 
-The trustworthy unused search signal is `root_value` on non-forced full-search
-rows. Current runs use `value_target_lambda=1`, hence pure terminal outcomes.
-`target_scores` must not be enabled blindly as a Q loss: they are only valid if
-the corpus provenance proves return-scale completed-Q semantics rather than a
-teacher preference/Gumbel score.
+The most defensible unused search signal is `root_value` on non-forced
+full-search rows. Current runs use `value_target_lambda=1`, hence pure terminal
+outcomes. `target_scores` must not be enabled blindly as a Q loss: current
+Gumbel shards explicitly contain raw visit Q for visited actions, **not** the
+completed-Q values used to form the improved policy. Moreover the optional
+learner loss row-standardizes those values, which is incompatible with a head
+later interpreted as return-scale Q. Other teacher sources can carry preference
+scores in the same generic column. Bind source provenance and one head semantic
+contract before a Q arm.
 
 The existing one-epoch LR curve also used a much larger update dose than the
 incumbent's training dose. LR, batch size and epochs must therefore be compared

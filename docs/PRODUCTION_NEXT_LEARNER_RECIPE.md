@@ -33,8 +33,11 @@ mixed into the value target because it was produced by the generating network
 and is a stale bootstrap.  `value_target_lambda=1` keeps the unbiased realized
 outcome target until a refreshed/lagged-root experiment wins.  Likewise,
 `q_loss_weight=0` remains required until the Q head and target have the same
-return-scale semantics; normalized teacher preference scores are not a safe PPO
-Q target.
+semantics.  Current Gumbel shards store raw return-scale visit Q for visited
+actions only, but the learner's optional Q objective row-standardizes those
+targets; that would train relative z-scores into a head other consumers treat as
+return-scale Q.  Other teacher families may store preference scores under the
+same generic column, so source provenance remains mandatory.
 
 The forced-ROLL afterstate column was stored in NPZ shards but omitted by both
 training loader paths, along with `simulations_used`; existing n128/n256 memmaps
