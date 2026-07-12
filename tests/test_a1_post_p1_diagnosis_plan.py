@@ -37,6 +37,8 @@ def test_policy_dose_and_gather_arms_are_single_sequential_deltas() -> None:
     assert fixed["policy_loss_weight"] == 1.0
     assert fixed["soft_target_weight"] == 0.9
     assert fixed["final_vp_loss_weight"] == 0.0
+    assert fixed["forced_action_weight"] == 0.0
+    assert fixed["truncated_vp_margin_value_weight"] == 0.0
     assert fixed["loser_sample_weight"] == 1.0
     assert fixed["event_history_available"] is False
     assert fixed["per_game_policy_weight"] is False
