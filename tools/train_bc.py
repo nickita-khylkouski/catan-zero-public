@@ -633,6 +633,17 @@ def build_parser() -> argparse.ArgumentParser:
             "--freeze-modules to also stop the policy backbone from moving)."
         ),
     )
+    parser.add_argument(
+        "--policy-aux-active-batch-size",
+        type=int,
+        default=0,
+        help=(
+            "Opt-in local-rank microbatch of additional policy-active rows per "
+            "optimizer step. Draws use the authenticated composite base measure "
+            "conditioned on policy_weight_multiplier>0 and contribute policy loss "
+            "only. 0 (default) is a strict no-op."
+        ),
+    )
     # EXP3 (value-reuse-discipline ablation, task #40): at a fixed policy recipe,
     # value-loss-weight 0.10 was strictly better than 0.25 under multi-epoch reuse
     # (same policy loss, lower value overfit). RUN-6 adopts 0.10 as the default.
@@ -3552,6 +3563,8 @@ def _effective_a1_learner_training_recipe(
     effective["global_batch_size"] = (
         int(args.batch_size) * int(args.grad_accum_steps) * world_size
     )
+    if int(getattr(args, "policy_aux_active_batch_size", 0)) > 0:
+        effective["policy_aux_active_batch_size"] = int(args.policy_aux_active_batch_size)
     return effective
 
 
@@ -3861,8 +3874,11 @@ def _validate_a1_learner_training_recipe(
             "--a1-learner-ablation-id must be 1-80 safe identifier characters"
         )
     effective["per_game_value_weight_mode"] = str(args.per_game_value_weight_mode)
+    authorized_extra_fields = {"per_game_value_weight_mode"}
+    if int(getattr(args, "policy_aux_active_batch_size", 0)) > 0:
+        authorized_extra_fields.add("policy_aux_active_batch_size")
     missing = set(expected) - set(effective)
-    extra = set(effective) - (set(expected) | {"per_game_value_weight_mode"})
+    extra = set(effective) - (set(expected) | authorized_extra_fields)
     drift = {
         key: {"contract": expected.get(key), "effective": effective.get(key)}
         for key in sorted(set(expected) & set(effective))
@@ -3872,6 +3888,11 @@ def _validate_a1_learner_training_recipe(
         drift["per_game_value_weight_mode"] = {
             "contract": "equal (implicit train_bc default; weighting locked off)",
             "effective": effective["per_game_value_weight_mode"],
+        }
+    if "policy_aux_active_batch_size" in effective:
+        drift["policy_aux_active_batch_size"] = {
+            "contract": 0,
+            "effective": int(effective["policy_aux_active_batch_size"]),
         }
     if not declared_json or not _is_sha256(declared_sha):
         raise SystemExit(
@@ -3885,7 +3906,7 @@ def _validate_a1_learner_training_recipe(
         raise SystemExit("A1 effective learner recipe must be a JSON object")
     if _canonical_json_sha256(declared) != declared_sha:
         raise SystemExit("A1 declared effective learner recipe digest drift")
-    expected_effective_keys = set(expected) | {"per_game_value_weight_mode"}
+    expected_effective_keys = set(expected) | authorized_extra_fields
     if set(declared) != expected_effective_keys:
         raise SystemExit(
             "A1 ablation effective recipe key set differs from bound recipe: "
@@ -4176,6 +4197,26 @@ def main(argv: Sequence[str] | None = None) -> None:
         )
     if int(args.max_steps) < 0:
         raise SystemExit("--max-steps must be >= 0")
+    if int(args.policy_aux_active_batch_size) < 0:
+        raise SystemExit("--policy-aux-active-batch-size must be >= 0")
+    if int(args.policy_aux_active_batch_size) > 0:
+        if args.arch not in {"xdim_graph", "entity_graph"}:
+            raise SystemExit(
+                "--policy-aux-active-batch-size requires --arch entity_graph/xdim_graph"
+            )
+        if int(args.grad_accum_steps) != 1:
+            raise SystemExit(
+                "--policy-aux-active-batch-size requires --grad-accum-steps 1"
+            )
+        if not is_memmap_composite:
+            raise SystemExit(
+                "--policy-aux-active-batch-size requires an authenticated "
+                "memmap_composite_v2 descriptor"
+            )
+        if float(args.policy_loss_weight) <= 0.0:
+            raise SystemExit(
+                "--policy-aux-active-batch-size requires positive --policy-loss-weight"
+            )
     if int(args.grad_accum_steps) > 1 and args.arch not in {"xdim_graph", "entity_graph"}:
         raise SystemExit(
             "--grad-accum-steps > 1 is only supported for --arch entity_graph/"
@@ -5126,6 +5167,16 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "must be explicitly specified"
             )
         epoch_sample_weights = component_game_sampling
+    policy_aux_sampling_weights = None
+    if int(args.policy_aux_active_batch_size) > 0:
+        if component_game_sampling is None:
+            raise SystemExit(
+                "policy auxiliary sampling requires authenticated composite base weights"
+            )
+        policy_aux_sampling_weights = _conditioned_policy_aux_sampling_weights(
+            component_game_sampling,
+            np.asarray(data["policy_weight_multiplier"])[train_indices],
+        )
     if int(ddp["rank"]) == 0:
         policy_sample_weight_report = sample_weight_quality(data, policy_sample_weights)
         value_sample_weight_report = sample_weight_quality(data, value_sample_weights)
@@ -5207,6 +5258,24 @@ def main(argv: Sequence[str] | None = None) -> None:
             sample_weights=epoch_sample_weights,
             max_samples=remaining_order_samples,
         )
+        aux_order = None
+        if policy_aux_sampling_weights is not None:
+            # Stateless per-epoch seed preserves exact resume behavior without
+            # perturbing or extending the historical persisted base RNG state.
+            policy_aux_rng = np.random.default_rng(
+                np.random.SeedSequence([int(args.seed), 0xA17C1E, int(epoch)])
+            )
+            local_aux_draws = (
+                int(np.ceil(len(order) / max(1, int(args.batch_size))))
+                * int(args.policy_aux_active_batch_size)
+            )
+            aux_order = _policy_aux_epoch_order(
+                policy_aux_rng,
+                len(train_indices),
+                policy_aux_sampling_weights,
+                local_draws=local_aux_draws,
+                ddp=ddp,
+            )
         epoch_losses = []
         epoch_extra_sums: dict[str, float] = {
             "policy_loss": 0.0,
@@ -5243,6 +5312,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         epoch_top3 = []
         epoch_count = 0
         epoch_active_count = 0.0
+        epoch_aux_active_count = 0.0
         phase_stats = _empty_phase_stats()
         phase_stats_unforced = _empty_phase_stats()
         teacher_stats = _empty_phase_stats()
@@ -5303,6 +5373,13 @@ def main(argv: Sequence[str] | None = None) -> None:
             batch_data, batch, batch_policy_weights, batch_value_weights = _batch_tuple
             if len(batch) == 0:
                 continue
+            aux_batch = None
+            if aux_order is not None:
+                aux_start = (batch_number - 1) * int(args.policy_aux_active_batch_size)
+                aux_stop = aux_start + int(args.policy_aux_active_batch_size)
+                aux_batch = train_indices[aux_order[aux_start:aux_stop]]
+                if len(aux_batch) != int(args.policy_aux_active_batch_size):
+                    raise RuntimeError("policy auxiliary draw dose drift")
             # C1 grad-accum bookkeeping. At accum==1 do_zero_grad and do_step are
             # both True every batch (identical to pre-C1). The LR schedule uses
             # global_step (optimizer steps), so within an accumulation group every
@@ -5365,6 +5442,15 @@ def main(argv: Sequence[str] | None = None) -> None:
                 ),
                 **train_fn_extra_kwargs,
                 **accum_kwargs,
+                **(
+                    {
+                        "policy_aux_data": data,
+                        "policy_aux_batch": aux_batch,
+                        "policy_aux_sample_weights": policy_sample_weights,
+                    }
+                    if aux_batch is not None
+                    else {}
+                ),
             )
             loss = float(batch_metrics["loss"])
             accuracy = float(batch_metrics["accuracy"])
@@ -5418,6 +5504,9 @@ def main(argv: Sequence[str] | None = None) -> None:
             epoch_acc.append(accuracy * active_count)
             epoch_top3.append(float(batch_metrics["top3_accuracy"]) * active_count)
             epoch_active_count += active_count
+            epoch_aux_active_count += float(
+                batch_metrics.get("policy_aux_active_count", 0)
+            )
             for key in (
                 "policy_loss",
                 "value_loss",
@@ -5506,6 +5595,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             ddp,
         )
         active_count_total = _reduce_scalar_sum(float(epoch_active_count), ddp)
+        aux_active_count_total = _reduce_scalar_sum(float(epoch_aux_active_count), ddp)
         policy_loss_epoch = _metric_from_sum_denominator(
             epoch_extra_sums["policy_loss"], epoch_extra_denominators["policy_loss"]
         )
@@ -5567,6 +5657,11 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "raw_batch_mean_loss": loss_epoch,
                 "component_reconstructed_loss": component_reconstructed_loss,
                 "policy_loss": policy_loss_epoch,
+                "policy_base_active_rows": int(active_count_total),
+                "policy_aux_active_rows": int(aux_active_count_total),
+                "policy_total_active_rows": int(
+                    active_count_total + aux_active_count_total
+                ),
                 "value_loss": value_loss_epoch,
                 "scalar_value_mse_diagnostic": value_loss_epoch,
                 "final_vp_loss": final_vp_loss_epoch,
@@ -5982,6 +6077,13 @@ def main(argv: Sequence[str] | None = None) -> None:
         "soft_target_source": args.soft_target_source,
         "soft_target_min_legal_coverage": args.soft_target_min_legal_coverage,
         "policy_loss_weight": args.policy_loss_weight,
+        "policy_aux_active_batch_size": int(args.policy_aux_active_batch_size),
+        "policy_aux_active_rows": int(
+            sum(int(metric.get("policy_aux_active_rows", 0)) for metric in metrics)
+        ),
+        "policy_base_active_rows": int(
+            sum(int(metric.get("policy_base_active_rows", 0)) for metric in metrics)
+        ),
         "value_loss_weight": args.value_loss_weight,
         "action_module_lr_mult": args.action_module_lr_mult,
         "trunk_lr_mult": args.trunk_lr_mult,
@@ -6523,6 +6625,9 @@ def _train_xdim_batch(
     grad_accum_steps: int = 1,
     accum_do_zero_grad: bool = True,
     accum_do_step: bool = True,
+    policy_aux_data=None,
+    policy_aux_batch: np.ndarray | None = None,
+    policy_aux_sample_weights: np.ndarray | None = None,
 ) -> dict:
     import torch
     from torch import nn
@@ -6643,8 +6748,68 @@ def _train_xdim_batch(
             advantage_weight_cap,
             advantage_weight_floor,
         )
-        policy_loss = _weighted_mean_loss(per_sample_loss, policy_weights)
-        policy_loss_sum, policy_loss_denominator = _weighted_loss_parts(per_sample_loss, policy_weights)
+        policy_loss_sum, policy_loss_denominator = _weighted_loss_parts(
+            per_sample_loss, policy_weights
+        )
+        policy_aux_active_count = 0
+        if policy_aux_batch is not None:
+            if policy_aux_data is None or policy_aux_sample_weights is None:
+                raise ValueError("incomplete policy auxiliary batch inputs")
+            aux_legal_ids = policy_aux_data["legal_action_ids"][policy_aux_batch]
+            aux_actions = torch.as_tensor(
+                _target_columns(
+                    aux_legal_ids,
+                    policy_aux_data["action_taken"][policy_aux_batch].astype(np.int64),
+                ),
+                dtype=torch.long,
+                device=policy.device,
+            )
+            aux_weights = torch.as_tensor(
+                policy_aux_sample_weights[policy_aux_batch],
+                dtype=torch.float32,
+                device=policy.device,
+            )
+            if not bool((aux_weights > 0.0).all().item()):
+                raise ValueError("policy auxiliary sampler admitted an inactive row")
+            aux_outputs = _forward_legal_np_for_batch(
+                policy,
+                policy_aux_data,
+                policy_aux_batch,
+                aux_legal_ids,
+                return_q=False,
+                symmetry=symmetry,
+                symmetry_rng=symmetry_rng,
+                symmetry_relabel_events=symmetry_relabel_events,
+            )
+            aux_hard = nn.functional.cross_entropy(
+                aux_outputs["logits"], aux_actions, reduction="none"
+            )
+            aux_soft, aux_has_soft, aux_support = _soft_targets_legal(
+                policy_aux_data,
+                policy_aux_batch,
+                policy.device,
+                soft_target_temperature,
+                soft_target_source,
+                soft_target_min_legal_coverage,
+            )
+            if aux_soft is not None:
+                aux_log_probs = _support_log_softmax(aux_outputs["logits"], aux_support)
+                aux_soft_loss = -(aux_soft * aux_log_probs).sum(dim=-1)
+                alpha = float(np.clip(soft_target_weight, 0.0, 1.0))
+                aux_per_sample = torch.where(
+                    aux_has_soft,
+                    alpha * aux_soft_loss + (1.0 - alpha) * aux_hard,
+                    aux_hard,
+                )
+            else:
+                aux_per_sample = aux_hard
+            aux_sum, aux_denominator = _weighted_loss_parts(aux_per_sample, aux_weights)
+            policy_loss_sum = policy_loss_sum + aux_sum
+            policy_loss_denominator = policy_loss_denominator + aux_denominator
+            policy_aux_active_count = int(len(policy_aux_batch))
+        policy_loss = _weighted_mean_from_parts(
+            policy_loss_sum, policy_loss_denominator
+        )
         value_loss = torch.tensor(0.0, dtype=torch.float32, device=policy.device)
         final_vp_loss = torch.tensor(0.0, dtype=torch.float32, device=policy.device)
         q_loss = torch.tensor(0.0, dtype=torch.float32, device=policy.device)
@@ -7011,6 +7176,7 @@ def _train_xdim_batch(
         **advantage_stats,
         "soft_distillation_rows": int(has_soft.sum().item()) if soft_targets is not None else 0,
         "active_count": active_count,
+        "policy_aux_active_count": int(policy_aux_active_count),
         "accuracy": float(accuracy.item()),
         "top3_accuracy": float(top3_accuracy.item()),
         "phase_stats": phase_stats,
@@ -11010,9 +11176,14 @@ def _policy_kl_anchor_loss_parts(
 
 
 def _weighted_mean_loss(values, weights, *, mask=None):
+    numerator, denominator = _weighted_loss_parts(values, weights, mask=mask)
+    return _weighted_mean_from_parts(numerator, denominator)
+
+
+def _weighted_mean_from_parts(numerator, denominator):
+    """Form one DDP-correct mean after independently accumulated loss parts."""
     import torch
 
-    numerator, denominator = _weighted_loss_parts(values, weights, mask=mask)
     if torch.is_grad_enabled():
         try:
             import torch.distributed as dist
@@ -13377,6 +13548,52 @@ def _composite_game_sampling_weights(
     return weights
 
 
+def _conditioned_policy_aux_sampling_weights(
+    base_sampling_weights: np.ndarray,
+    policy_weight_multiplier: np.ndarray,
+) -> np.ndarray:
+    """Condition an authenticated base row measure on policy-active rows."""
+    base = np.asarray(base_sampling_weights, dtype=np.float64)
+    multiplier = np.asarray(policy_weight_multiplier)
+    if base.ndim != 1 or multiplier.ndim != 1 or base.shape != multiplier.shape:
+        raise ValueError("policy auxiliary base/multiplier shape drift")
+    if not np.isfinite(base).all() or np.any(base < 0.0):
+        raise ValueError("policy auxiliary base measure is invalid")
+    # Admission only: phase/winner/loser weights remain loss weights and must
+    # not silently become a second sampling-frequency correction.
+    conditioned = np.where(multiplier > 0.0, base, 0.0)
+    total = float(conditioned.sum())
+    if not math.isfinite(total) or total <= 0.0:
+        raise ValueError("policy auxiliary measure has no active mass")
+    conditioned /= total
+    return conditioned
+
+
+def _policy_aux_epoch_order(
+    rng: np.random.Generator,
+    n: int,
+    sample_weights: np.ndarray,
+    *,
+    local_draws: int,
+    ddp: dict[str, int | bool],
+) -> np.ndarray:
+    """Draw an exact per-rank dose from one deterministic global stream."""
+    if int(local_draws) < 0:
+        raise ValueError("policy auxiliary local_draws must be non-negative")
+    weights = np.asarray(sample_weights, dtype=np.float64)
+    if weights.shape != (int(n),):
+        raise ValueError("policy auxiliary sampling weight length drift")
+    total = float(weights.sum())
+    if not math.isfinite(total) or total <= 0.0:
+        raise ValueError("policy auxiliary sampling weights have no mass")
+    world = int(ddp["world_size"]) if ddp.get("enabled", False) else 1
+    rank = int(ddp["rank"]) if ddp.get("enabled", False) else 0
+    global_order = rng.choice(
+        int(n), size=int(local_draws) * world, replace=True, p=weights / total
+    )
+    return np.asarray(global_order[rank::world], dtype=np.int64)
+
+
 def _epoch_order(
     rng: np.random.Generator,
     n: int,
@@ -13573,6 +13790,7 @@ def _training_resume_recipe_identity(
         "world_size": int(ddp["world_size"]),
         "ddp_shard_data": bool(args.ddp_shard_data),
         "fsdp": bool(args.fsdp),
+        "policy_aux_active_batch_size": int(args.policy_aux_active_batch_size),
     }
 
 

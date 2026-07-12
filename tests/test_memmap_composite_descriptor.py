@@ -345,12 +345,42 @@ def test_component_sampling_is_component_then_game_then_row_uniform():
     assert weights is not None
     assert weights.sum() == pytest.approx(1.0)
     offsets = data.component_offsets
-    assert [weights[offsets[i] : offsets[i + 1]].sum() for i in range(3)] == pytest.approx(
-        [0.5, 0.3, 0.2]
-    )
+    assert [
+        weights[offsets[i] : offsets[i + 1]].sum() for i in range(3)
+    ] == pytest.approx([0.5, 0.3, 0.2])
     # Component 0 gives each game 0.25 mass despite their 3:1 row counts.
     assert weights[:3].sum() == pytest.approx(0.25)
     assert weights[3] == pytest.approx(0.25)
+
+
+def test_policy_aux_conditioning_preserves_authenticated_base_measure() -> None:
+    base = np.asarray([0.30, 0.20, 0.10, 0.40], dtype=np.float64)
+    multiplier = np.asarray([0.0, 1.0, 2.0, 1.0], dtype=np.float32)
+    conditioned = train_bc._conditioned_policy_aux_sampling_weights(base, multiplier)
+    # Conditioning changes admission only. A multiplier of 2 does not become a
+    # sampling-frequency weight; phase/winner/etc. remain loss weights.
+    assert conditioned == pytest.approx([0.0, 2.0 / 7.0, 1.0 / 7.0, 4.0 / 7.0])
+
+
+def test_policy_aux_order_is_exact_and_ddp_rank_sliced() -> None:
+    weights = np.asarray([0.0, 0.25, 0.0, 0.75], dtype=np.float64)
+    orders = []
+    for rank in range(3):
+        orders.append(
+            train_bc._policy_aux_epoch_order(
+                np.random.default_rng(81),
+                4,
+                weights,
+                local_draws=17,
+                ddp={"enabled": True, "world_size": 3, "rank": rank},
+            )
+        )
+    assert all(len(order) == 17 for order in orders)
+    assert all(set(order.tolist()) <= {1, 3} for order in orders)
+    global_draw = np.random.default_rng(81).choice(4, size=51, replace=True, p=weights)
+    assert np.array_equal(orders[0], global_draw[0::3])
+    assert np.array_equal(orders[1], global_draw[1::3])
+    assert np.array_equal(orders[2], global_draw[2::3])
 
 
 def test_global_epoch_shuffle_interleaves_component_rows_with_prefetch():
