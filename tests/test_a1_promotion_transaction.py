@@ -2886,3 +2886,33 @@ def test_contract_value_readout_rejects_ambiguous_or_missing_binding() -> None:
         )
     with pytest.raises(promotion.PromotionError, match="unsupported value_readout"):
         promotion._contract_value_readout({"science": {}})
+
+
+def test_role_search_config_accepts_only_complete_native_runtime_binding() -> None:
+    expected = {"n_full": 128, "c_scale": 0.1}
+    raw = {
+        **expected,
+        "native_mcts_hot_loop": True,
+        "mcts_implementation": "rust_native_hot_loop_v1",
+    }
+    assert promotion._verify_role_search_config(
+        raw, expected_search_config=expected, where="panel"
+    ) == expected
+
+    for drifted in (
+        {**expected, "native_mcts_hot_loop": True},
+        {
+            **expected,
+            "native_mcts_hot_loop": False,
+            "mcts_implementation": "rust_native_hot_loop_v1",
+        },
+        {
+            **expected,
+            "native_mcts_hot_loop": True,
+            "mcts_implementation": "python",
+        },
+    ):
+        with pytest.raises(promotion.PromotionError, match="native MCTS runtime binding"):
+            promotion._verify_role_search_config(
+                drifted, expected_search_config=expected, where="panel"
+            )

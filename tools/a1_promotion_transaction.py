@@ -1998,12 +1998,27 @@ def _verify_role_search_config(
 ) -> dict[str, Any]:
     """Validate a complete, typed, role-specific deployed search operator.
 
-    This is intentionally an exact-key comparator.  A report may carry
-    scheduling metadata beside this object, but no unknown or omitted search
-    field can become part of the promoted agent identity.
+    This is intentionally an exact-key comparator after removing the one
+    fully specified, parity-gated Rust execution binding.  Those two runtime
+    fields select an implementation of the same operator and therefore do not
+    become part of the promoted agent identity.  No partial, alternate, or
+    unknown field is accepted.
     """
 
-    actual = _require_exact_keys(raw, set(expected_search_config), where=where)
+    if not isinstance(raw, dict):
+        raise PromotionError(f"{where} must be an object")
+    actual = dict(raw)
+    runtime_keys = {"native_mcts_hot_loop", "mcts_implementation"}
+    present_runtime = runtime_keys & set(actual)
+    if present_runtime:
+        if present_runtime != runtime_keys:
+            raise PromotionError(f"{where} has an incomplete native MCTS runtime binding")
+        if (
+            actual.pop("native_mcts_hot_loop") is not True
+            or actual.pop("mcts_implementation") != "rust_native_hot_loop_v1"
+        ):
+            raise PromotionError(f"{where} has an unsupported native MCTS runtime binding")
+    actual = _require_exact_keys(actual, set(expected_search_config), where=where)
     _require_sealed_semantics(actual, expected_search_config, where=where)
     return actual
 
