@@ -360,13 +360,37 @@ def prepare(
             raise L1Error("failed retry lineage unexpectedly contains training outputs")
         stderr = _ref(failed_root / "stderr.log")
         stderr_text = Path(stderr["path"]).read_text(encoding="utf-8", errors="replace")
-        if "No module named 'torch'" not in stderr_text:
-            raise L1Error("failed retry lineage is not the authorized pre-training venv failure")
+        if "No module named 'torch'" in stderr_text:
+            failure = "missing_torch_before_training"
+            in_memory_optimizer_steps = 0
+        elif (
+            "Expected to have finished reduction in the prior iteration" in stderr_text
+            and "Parameter indices which did not receive grad" in stderr_text
+            and "33 34 35 36 37 38" in stderr_text
+        ):
+            failure = "cropped_event_encoder_unused_at_second_ddp_forward"
+            # The DDP reducer raises at the start of forward two, so iteration
+            # one may have updated only ephemeral in-memory weights.  There is
+            # no checkpoint/optimizer/report to resume; r3 reloads exact f7 and
+            # constructs fresh Adam for the full selected dose.
+            in_memory_optimizer_steps = 1
+        else:
+            raise L1Error("failed retry lineage is not an authorized launch failure")
+        claim = _ref(failed_root / "execution.claim.json")
+        claim_payload = _load(Path(claim["path"]))
+        failed_manifest = _verify_ref(claim_payload.get("manifest"), "failed manifest")
         manifest["pre_training_retry_lineage"] = {
-            "repair": "preserve lexical venv interpreter path",
-            "optimizer_steps": 0,
-            "outputs": None,
-            "claim": _ref(failed_root / "execution.claim.json"),
+            "failure": failure,
+            "repair": (
+                "preserve lexical venv interpreter path"
+                if in_memory_optimizer_steps == 0
+                else "freeze exactly cropped event_encoder before optimizer and DDP"
+            ),
+            "in_memory_optimizer_steps_before_failure": in_memory_optimizer_steps,
+            "persisted_outputs": None,
+            "restart": "exact f7 parent plus fresh Adam for full 1024-step dose",
+            "manifest": _ref(failed_manifest),
+            "claim": claim,
             "submission": _ref(failed_root / "submission.receipt.json"),
             "stderr": stderr,
         }
@@ -402,9 +426,15 @@ def verify(manifest_path: Path) -> dict[str, Any]:
     lexical_python = _verify_python_binding(manifest.get("runtime_python"))
     if manifest.get("pre_training_retry_lineage") is not None:
         lineage = manifest["pre_training_retry_lineage"]
-        if not isinstance(lineage, dict) or lineage.get("optimizer_steps") != 0 or lineage.get("outputs") is not None:
+        if (
+            not isinstance(lineage, dict)
+            or lineage.get("in_memory_optimizer_steps_before_failure") not in {0, 1}
+            or lineage.get("persisted_outputs") is not None
+            or lineage.get("restart")
+            != "exact f7 parent plus fresh Adam for full 1024-step dose"
+        ):
             raise L1Error("pre-training retry lineage is malformed")
-        for field in ("claim", "submission", "stderr"):
+        for field in ("manifest", "claim", "submission", "stderr"):
             _verify_ref(lineage.get(field), f"retry.{field}")
     for row in manifest.get("component_bindings", []):
         _verify_ref(row.get("corpus_meta"), f"{row.get('component_id')}.corpus_meta")

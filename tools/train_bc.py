@@ -4975,6 +4975,18 @@ def main(argv: Sequence[str] | None = None) -> None:
                 ),
                 ddp,
             )
+        if _CROP_AUTHENTICATED_EMPTY_EVENT_HISTORY:
+            event_freeze = _freeze_authenticated_empty_event_encoder(policy.model)
+            _rank0_print(
+                json.dumps(
+                    {
+                        "progress": "authenticated_empty_event_history_freeze",
+                        **event_freeze,
+                    },
+                    sort_keys=True,
+                ),
+                ddp,
+            )
         freeze_module_groups = set(_parse_prefixes(args.freeze_modules))
         if bool(args.train_value_only):
             freeze_module_groups |= {"trunk", "action_encoder", "policy_head"}
@@ -14160,6 +14172,71 @@ def _set_xdim_q_branch_trainable(model, trainable: bool) -> None:
             continue
         for param in layer.parameters():
             param.requires_grad = bool(trainable)
+
+
+def _freeze_authenticated_empty_event_encoder(model) -> dict[str, object]:
+    """Freeze exactly the encoder bypassed by authenticated event0 cropping.
+
+    Cropping a proven-empty event axis to width zero intentionally bypasses the
+    event MLP.  Leaving that MLP trainable makes DDP fail on its second forward
+    because the parameters do not participate in the first backward pass.
+    Freezing is preferable to global unused-parameter discovery: it preserves
+    checkpoint bytes, excludes only the mathematically disconnected tensors
+    from the optimizer, and adds no per-step DDP graph traversal.
+    """
+
+    module = getattr(model, "module", model)
+    event_encoder = getattr(module, "event_encoder", None)
+    if event_encoder is None:
+        raise SystemExit(
+            "authenticated empty-event crop expected a named event_encoder"
+        )
+    before = {
+        name: bool(parameter.requires_grad)
+        for name, parameter in module.named_parameters()
+    }
+    event_parameters = {
+        f"event_encoder.{name}": parameter
+        for name, parameter in event_encoder.named_parameters()
+    }
+    if not event_parameters:
+        raise SystemExit(
+            "authenticated empty-event crop found no event_encoder parameters"
+        )
+    already_frozen = sorted(
+        name for name, parameter in event_parameters.items()
+        if not parameter.requires_grad
+    )
+    if already_frozen:
+        raise SystemExit(
+            "authenticated empty-event crop expected a fully trainable event_encoder "
+            f"before its operational freeze: {already_frozen}"
+        )
+    for parameter in event_parameters.values():
+        parameter.requires_grad = False
+    after = {
+        name: bool(parameter.requires_grad)
+        for name, parameter in module.named_parameters()
+    }
+    changed = sorted(
+        name for name in before
+        if before[name] != after.get(name)
+    )
+    expected = sorted(event_parameters)
+    if changed != expected:
+        raise SystemExit(
+            "authenticated empty-event crop changed an unexpected trainability set: "
+            f"expected={expected} observed={changed}"
+        )
+    return {
+        "reason": "authenticated empty event axis is cropped to width zero",
+        "frozen_parameter_names": expected,
+        "frozen_parameter_tensors": len(expected),
+        "frozen_parameters": int(
+            sum(parameter.numel() for parameter in event_parameters.values())
+        ),
+        "unexpected_frozen_parameter_tensors": 0,
+    }
 
 
 def _set_scalar_value_head_trainable(model, trainable: bool) -> None:
