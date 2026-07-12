@@ -345,6 +345,12 @@ def _derive_policy_active_dose(
     stats = [_component_training_policy_activity(component) for component in components]
     if [row["component_id"] for row in stats] != component_ids:
         raise ArmError("active-dose component ordering drift")
+    available_training_rows = sum(int(row["training_rows"]) for row in stats)
+    if available_training_rows < int(global_row_dose):
+        raise ArmError(
+            "authenticated training corpus is smaller than the sealed one-dose draw; "
+            "epochs=1 would stop before max_steps"
+        )
     expected_fraction = sum(
         float(ratio) * float(row["game_uniform_policy_active_fraction"])
         for ratio, row in zip(ratios, stats, strict=True)
@@ -356,6 +362,7 @@ def _derive_policy_active_dose(
         "component_statistics": stats,
         "component_sampling_ratios": [float(value) for value in ratios],
         "global_row_dose": int(global_row_dose),
+        "available_training_rows": available_training_rows,
         "expected_active_fraction": expected_fraction,
         "reference_base_active_rows": expected_rows,
         "base_active_rows_tolerance": tolerance,
@@ -1090,6 +1097,7 @@ def prepare(args: argparse.Namespace) -> tuple[dict[str, Any], Path]:
         ],
         "validation_independence_contract": validation_independence_contract,
         "initialization": parent_ref,
+        "evaluation_baseline": parent_ref,
         "parent_lineage": parent_lineage,
         "teacher_lineage": teacher_lineage,
         "source_binding": source_binding,
@@ -1101,6 +1109,8 @@ def prepare(args: argparse.Namespace) -> tuple[dict[str, Any], Path]:
         "causal_interpretation": {
             "exact_winning_operator_control": True,
             "bundled_optimization_not_parent_replication": False,
+            "current_teacher_prior_is_initializer": True,
+            "teacher_gap_closure_is_search_improvement_over_initializer": True,
             "reason": (
                 "preserve the realized r3 supervision operator before changing one "
                 "causal axis at a time"

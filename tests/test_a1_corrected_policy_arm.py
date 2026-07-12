@@ -71,7 +71,12 @@ def _args(
     descriptor.write_text("{}", encoding="utf-8")
     sentinel = _write_json(
         tmp_path / "validation.sentinel.json",
-        {"schema_version": "train-validation-game-sentinel-v1"},
+        {
+            "schema_version": "train-validation-game-sentinel-v1",
+            "selected_game_seed_set_sha256": "sha256:source-selection",
+            "selected_row_count": 3,
+            "game_seeds": [1],
+        },
     )
     f7 = (tmp_path / "f7.pt")
     f7.write_bytes(b"f7")
@@ -176,20 +181,47 @@ def _args(
         "_rebind_a1_metadata",
         lambda command, repo: {"effective_recipe": {}, "code_binding": {}},
     )
-    monkeypatch.setattr(
-        arm,
-        "_build_corrected_sentinel",
-        lambda **kwargs: (
-            {"selected_game_seed_set_sha256": "sha256:selection"},
-            arm._file_ref(sentinel),
-            arm._file_ref(sentinel),
+    def fake_sentinel(**_kwargs):
+        fresh = _write_json(
+            tmp_path / "fresh.validation.sentinel.json",
             {
-                "schema_version": "a1-validation-independence-contract-v1",
-                "selection_overlap_game_count": 0,
-                "predecessor_target_row_ratio": 0.2,
+                "schema_version": "train-validation-game-sentinel-v1",
+                "selected_game_seed_set_sha256": "sha256:selection",
+                "selected_row_count": len(source_ids),
+                "game_seeds": list(range(2, 2 + len(source_ids))),
             },
-        ),
-    )
+        )
+        component_rows = [
+            {
+                "component_id": component_id,
+                "target_row_ratio": float(ratio),
+                "target_row_count": 1,
+                "selected_game_count": 1,
+                "selected_row_count": 1,
+                "max_whole_game_row_count": 1,
+            }
+            for component_id, ratio in zip(source_ids, source_ratios, strict=True)
+        ]
+        independence = {
+            "schema_version": "a1-validation-independence-contract-v1",
+            "source_selected_game_seed_set_sha256": "sha256:source-selection",
+            "fresh_selected_game_seed_set_sha256": "sha256:selection",
+            "selection_overlap_game_count": 0,
+            "selection_scope": "fresh_whole_games_stratified_to_winning_operator",
+            "component_rows": component_rows,
+            "predecessor_component_id": source_ids[-1],
+            "predecessor_target_row_ratio": 0.2,
+            "complete_component_holdouts_remain_training_excluded": True,
+        }
+        independence["contract_sha256"] = arm._digest(independence)
+        return (
+            json.loads(fresh.read_text()),
+            arm._file_ref(fresh),
+            arm._file_ref(sentinel),
+            independence,
+        )
+
+    monkeypatch.setattr(arm, "_build_corrected_sentinel", fake_sentinel)
     active_rows = {
         "n128_current": 121_132,
         "n256_current": 121_128,
@@ -207,7 +239,7 @@ def _args(
         "_component_training_policy_activity",
         lambda component: {
             "component_id": component["component_id"],
-            "training_rows": 1_000_000,
+            "training_rows": 5_000_000,
             "training_policy_active_rows": active_rows[component["component_id"]],
             "training_game_count": 10_000,
             "raw_row_policy_active_fraction": (
@@ -255,6 +287,10 @@ def test_prepares_exact_one_dose_winning_operator_control_without_launch(
     assert manifest["causal_interpretation"]["exact_winning_operator_control"] is True
     assert manifest["causal_interpretation"]["bundled_optimization_not_parent_replication"] is False
     assert manifest["recipe"]["independent_parent_initialization"] is True
+    assert manifest["evaluation_baseline"] == manifest["initialization"]
+    assert manifest["causal_interpretation"][
+        "teacher_gap_closure_is_search_improvement_over_initializer"
+    ] is True
     assert manifest["parent_lineage"]["mode"] == "historical_f7_cli_compatibility"
     assert manifest["validation_independence_contract"][
         "selection_overlap_game_count"
@@ -303,6 +339,7 @@ def test_prepares_exact_one_dose_winning_operator_control_without_launch(
         "component_statistics": active_dose["component_statistics"],
         "component_sampling_ratios": pytest.approx([4 / 7, 8 / 35, 1 / 5]),
         "global_row_dose": 4_194_304,
+        "available_training_rows": 15_000_000,
         "expected_active_fraction": pytest.approx(0.1229147619829968),
         "reference_base_active_rows": 515_542,
         "base_active_rows_tolerance": 4_100,
@@ -389,6 +426,30 @@ def test_active_dose_is_derived_from_training_only_component_rows(tmp_path: Path
     assert measured["training_game_count"] == 2
     assert measured["raw_row_policy_active_fraction"] == 0.5
     assert measured["game_uniform_policy_active_fraction"] == 0.5
+
+
+def test_active_dose_refuses_corpus_that_cannot_reach_one_dose(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    descriptor = {
+        "component_ids": ["n128_current", "predecessor_replay"],
+        "component_game_sampling_ratios": [0.8, 0.2],
+        "components": [
+            {"component_id": "n128_current"},
+            {"component_id": "predecessor_replay"},
+        ],
+    }
+    monkeypatch.setattr(
+        arm,
+        "_component_training_policy_activity",
+        lambda component: {
+            "component_id": component["component_id"],
+            "training_rows": 1_000_000,
+            "game_uniform_policy_active_fraction": 0.1,
+        },
+    )
+    with pytest.raises(arm.ArmError, match="smaller than the sealed one-dose draw"):
+        arm._derive_policy_active_dose(descriptor)
 
 
 def test_teacher_lineage_refuses_stale_current_data_and_parent_replay() -> None:

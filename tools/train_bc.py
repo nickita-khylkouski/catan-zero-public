@@ -4975,10 +4975,8 @@ def main(argv: Sequence[str] | None = None) -> None:
                 ),
                 ddp,
             )
-        event_encoder_freeze = None
         if _CROP_AUTHENTICATED_EMPTY_EVENT_HISTORY:
             event_freeze = _freeze_authenticated_empty_event_encoder(policy.model)
-            event_encoder_freeze = event_freeze
             training_information_surface = {
                 **(training_information_surface or {}),
                 "event_encoder_freeze": event_freeze,
@@ -6209,6 +6207,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         metrics.append(
             {
                 "epoch": epoch + 1,
+                "samples": int(total_count),
                 "loss": loss_epoch,
                 "raw_batch_mean_loss": loss_epoch,
                 "component_reconstructed_loss": component_reconstructed_loss,
@@ -6539,6 +6538,15 @@ def main(argv: Sequence[str] | None = None) -> None:
         "max_steps": int(args.max_steps),
         "steps_completed": int(global_step),
         "batch_size": args.batch_size,
+        "grad_accum_steps": int(args.grad_accum_steps),
+        "effective_global_batch_size": (
+            int(args.batch_size)
+            * int(args.grad_accum_steps)
+            * int(ddp["world_size"])
+        ),
+        "training_row_draws": int(
+            sum(int(metric.get("samples", 0)) for metric in metrics)
+        ),
         "amp": args.amp,
         "optimizer": args.optimizer,
         "lr": float(args.lr),

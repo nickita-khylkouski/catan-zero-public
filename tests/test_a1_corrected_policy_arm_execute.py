@@ -64,6 +64,9 @@ def test_verify_replays_manifest_inputs_and_real_sentinel_flag(
     verified = executor.verify(path)
     assert "--validation-game-sentinel-manifest" in verified["command"]
     assert "--validation-game-seed-manifest" not in verified["command"]
+    assert verified["manifest"]["evaluation_baseline"] == verified["manifest"][
+        "initialization"
+    ]
 
 
 def test_future_n128_plus_predecessor_operator_replays_through_executor(
@@ -82,6 +85,36 @@ def test_future_n128_plus_predecessor_operator_replays_through_executor(
     assert verified["manifest_ref"]["sha256"] == arm._file_sha(path)
 
 
+def test_verify_refuses_reused_validation_games(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path, payload = _manifest(tmp_path, monkeypatch, future_two_component=True)
+    fresh = Path(payload["validation_sentinel"]["path"])
+    value = json.loads(fresh.read_text(encoding="utf-8"))
+    value["game_seeds"] = [1]
+    fresh.write_text(json.dumps(value), encoding="utf-8")
+    payload["validation_sentinel"] = arm._file_ref(fresh)
+    payload.pop("manifest_sha256", None)
+    payload["manifest_sha256"] = arm._digest(payload)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(executor.ExecutionError, match="fresh disjoint games"):
+        executor.verify(path)
+
+
+def test_verify_refuses_evaluation_baseline_different_from_initializer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path, payload = _manifest(tmp_path, monkeypatch)
+    other = tmp_path / "other-baseline.pt"
+    other.write_bytes(b"other")
+    payload["evaluation_baseline"] = arm._file_ref(other)
+    payload.pop("manifest_sha256", None)
+    payload["manifest_sha256"] = arm._digest(payload)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(executor.ExecutionError, match="differs from learner initializer"):
+        executor.verify(path)
+
+
 def _write_realized_report(payload: dict) -> Path:
     report = Path(arm._option(payload["command"], "--report"))
     report.parent.mkdir(parents=True, exist_ok=True)
@@ -89,6 +122,21 @@ def _write_realized_report(payload: dict) -> Path:
     expected_active = payload["supervision_contract"]["policy_active_row_dose"][
         "reference_base_active_rows"
     ]
+    ratios = payload["supervision_contract"]["component_game_sampling_ratios"]
+    component_metrics = {
+        component_id: {
+            "games": 3,
+            "rows": 9,
+            "metrics": {
+                "loss": 1.0,
+                "policy_loss": 0.8,
+                "value_loss": 0.8,
+                "accuracy": 0.6,
+                "active_policy_teacher_gap_closure": 0.1,
+            },
+        }
+        for component_id in current
+    }
     report.write_text(
         json.dumps(
             {
@@ -98,6 +146,9 @@ def _write_realized_report(payload: dict) -> Path:
                 "resumed_optimizer_step": None,
                 "world_size": 8,
                 "batch_size": 512,
+                "grad_accum_steps": 1,
+                "effective_global_batch_size": 4096,
+                "training_row_draws": arm.GLOBAL_ROW_DOSE,
                 "max_steps": 1024,
                 "steps_completed": 1024,
                 "total_training_steps": 1024,
@@ -140,6 +191,17 @@ def _write_realized_report(payload: dict) -> Path:
                 "policy_base_active_rows": expected_active,
                 "policy_aux_active_rows": arm.EXPECTED_POLICY_AUX_ACTIVE_ROWS,
                 "policy_total_active_rows": expected_active,
+                "metrics": [
+                    {
+                        "epoch": 1,
+                        "validation_objective_matched": {
+                            "schema_version": "composite-validation-measure-v2",
+                            "objective_matched": True,
+                            "component_sampling_ratios": dict(zip(current, ratios, strict=True)),
+                            "components": component_metrics,
+                        },
+                    }
+                ],
             }
         ),
         encoding="utf-8",
@@ -156,6 +218,9 @@ def _write_realized_report(payload: dict) -> Path:
         ("resumed_optimizer_step", 7),
         ("world_size", 4),
         ("batch_size", 256),
+        ("grad_accum_steps", 2),
+        ("effective_global_batch_size", 8192),
+        ("training_row_draws", arm.GLOBAL_ROW_DOSE - 1),
         ("max_steps", 2048),
         ("steps_completed", 1023),
         ("data_fingerprint", "sha256:" + "1" * 64),
@@ -229,6 +294,18 @@ def test_verify_training_report_replays_supervision_provenance(
         "aux": 0,
         "total": expected_active,
     }
+
+
+def test_verify_training_report_requires_objective_matched_component_metrics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path, payload = _manifest(tmp_path, monkeypatch)
+    report = _write_realized_report(payload)
+    value = json.loads(report.read_text(encoding="utf-8"))
+    del value["metrics"][0]["validation_objective_matched"]
+    report.write_text(json.dumps(value), encoding="utf-8")
+    with pytest.raises(executor.ExecutionError, match="objective-matched validation"):
+        executor.verify_training_report(path, report)
 
 
 @pytest.mark.parametrize(

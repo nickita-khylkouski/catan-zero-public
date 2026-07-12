@@ -14,6 +14,8 @@ import sys
 import time
 from typing import Any, Callable, Sequence
 
+import numpy as np
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
@@ -111,11 +113,77 @@ def _verify_event_history_training_contract(
         raise ExecutionError("command lacks the authenticated empty-history crop flag")
 
 
+def _verify_validation_independence_contract(
+    manifest: dict[str, Any], descriptor_meta: dict[str, Any]
+) -> None:
+    contract = manifest.get("validation_independence_contract")
+    if not isinstance(contract, dict):
+        raise ExecutionError("manifest has no validation independence contract")
+    stated = contract.get("contract_sha256")
+    unhashed = {key: value for key, value in contract.items() if key != "contract_sha256"}
+    if stated != prepare._digest(unhashed):  # noqa: SLF001
+        raise ExecutionError("validation independence contract digest drift")
+    source_path = _verify_ref(
+        manifest.get("source_validation_sentinel"), label="source_validation_sentinel"
+    )
+    fresh_path = _verify_ref(
+        manifest.get("validation_sentinel"), label="validation_sentinel"
+    )
+    try:
+        source = json.loads(source_path.read_text(encoding="utf-8"))
+        fresh = json.loads(fresh_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ExecutionError(f"validation sentinel is unreadable: {error}") from error
+    source_games = source.get("game_seeds") if isinstance(source, dict) else None
+    fresh_games = fresh.get("game_seeds") if isinstance(fresh, dict) else None
+    if not (
+        isinstance(source_games, list)
+        and source_games
+        and isinstance(fresh_games, list)
+        and fresh_games
+        and not set(source_games).intersection(fresh_games)
+    ):
+        raise ExecutionError("validation sentinel does not use fresh disjoint games")
+    component_ids = list(descriptor_meta.get("component_ids", ()))
+    ratios = list(descriptor_meta.get("component_game_sampling_ratios", ()))
+    rows = contract.get("component_rows")
+    if not isinstance(rows, list) or [row.get("component_id") for row in rows] != component_ids:
+        raise ExecutionError("validation independence component identity drift")
+    for row, ratio in zip(rows, ratios, strict=True):
+        if (
+            not isinstance(row, dict)
+            or not np.isclose(float(row.get("target_row_ratio", -1.0)), float(ratio))
+            or int(row.get("selected_game_count", 0)) <= 0
+            or int(row.get("selected_row_count", 0)) <= 0
+            or abs(
+                int(row.get("selected_row_count", 0))
+                - int(row.get("target_row_count", -1))
+            ) > int(row.get("max_whole_game_row_count", -1))
+        ):
+            raise ExecutionError("validation independence component allocation drift")
+    if not (
+        contract.get("source_selected_game_seed_set_sha256")
+        == source.get("selected_game_seed_set_sha256")
+        and contract.get("fresh_selected_game_seed_set_sha256")
+        == fresh.get("selected_game_seed_set_sha256")
+        and contract.get("selection_overlap_game_count") == 0
+        and contract.get("selection_scope")
+        == "fresh_whole_games_stratified_to_winning_operator"
+        and contract.get("predecessor_component_id") == component_ids[-1]
+        and np.isclose(float(contract.get("predecessor_target_row_ratio", -1.0)), 0.2)
+        and contract.get("complete_component_holdouts_remain_training_excluded") is True
+        and sum(int(row["selected_row_count"]) for row in rows)
+        == int(fresh.get("selected_row_count", -1))
+    ):
+        raise ExecutionError("validation independence evidence differs from sentinels")
+
+
 def verify(manifest_path: Path) -> dict[str, Any]:
     manifest, manifest_ref = _read_manifest(manifest_path)
     for field in (
         "source_receipt", "source_descriptor", "descriptor",
         "source_validation_sentinel", "validation_sentinel", "initialization",
+        "evaluation_baseline",
     ):
         _verify_ref(manifest.get(field), label=field)
     lineage = manifest.get("failed_retry_lineage", {}).get("artifacts")
@@ -151,6 +219,8 @@ def verify(manifest_path: Path) -> dict[str, Any]:
         "--validation-game-sentinel-manifest": manifest["validation_sentinel"]["path"],
         "--init-checkpoint": manifest["initialization"]["path"],
     }
+    if manifest["evaluation_baseline"] != manifest["initialization"]:
+        raise ExecutionError("evaluation baseline differs from learner initializer")
     for flag, expected in exact_inputs.items():
         if _option(command, flag) != expected:
             raise ExecutionError(f"command differs from bound {flag}")
@@ -161,6 +231,7 @@ def verify(manifest_path: Path) -> dict[str, Any]:
         descriptor_meta, _ = prepare._preflight_descriptor(  # noqa: SLF001
             Path(manifest["descriptor"]["path"])
         )
+        _verify_validation_independence_contract(manifest, descriptor_meta)
         policy_active_dose = prepare._derive_policy_active_dose(  # noqa: SLF001
             descriptor_meta
         )
@@ -230,6 +301,9 @@ def verify_training_report(manifest_path: Path, report_path: Path) -> dict[str, 
         "resumed_optimizer_step": None,
         "world_size": 8,
         "batch_size": 512,
+        "grad_accum_steps": 1,
+        "effective_global_batch_size": 4096,
+        "training_row_draws": prepare.GLOBAL_ROW_DOSE,
         "max_steps": 1024,
         "steps_completed": 1024,
         "total_training_steps": 1024,
@@ -317,6 +391,8 @@ def verify_training_report(manifest_path: Path, report_path: Path) -> dict[str, 
         and dose_contract.get("component_sampling_ratios")
         == contract.get("component_game_sampling_ratios")
         and dose_contract.get("global_row_dose") == prepare.GLOBAL_ROW_DOSE
+        and isinstance(dose_contract.get("available_training_rows"), int)
+        and dose_contract["available_training_rows"] >= prepare.GLOBAL_ROW_DOSE
         and isinstance(reference, int) and not isinstance(reference, bool)
         and dose_contract.get("base_active_rows_tolerance")
         == prepare.POLICY_BASE_ACTIVE_ROW_TOLERANCE
@@ -356,6 +432,52 @@ def verify_training_report(manifest_path: Path, report_path: Path) -> dict[str, 
         )
     if total_active != base_active + aux_active:
         raise ExecutionError("training report total policy-active dose does not add up")
+    metrics = report.get("metrics")
+    if not isinstance(metrics, list) or len(metrics) != 1 or not isinstance(metrics[0], dict):
+        raise ExecutionError("one-dose report must contain exactly one epoch of metrics")
+    matched = metrics[0].get("validation_objective_matched")
+    if not (
+        isinstance(matched, dict)
+        and matched.get("schema_version") == "composite-validation-measure-v2"
+        and matched.get("objective_matched") is True
+        and matched.get("component_sampling_ratios")
+        == {
+            component_id: float(ratio)
+            for component_id, ratio in zip(
+                expected_components,
+                contract["component_game_sampling_ratios"],
+                strict=True,
+            )
+        }
+    ):
+        raise ExecutionError("training report lacks objective-matched validation")
+    components = matched.get("components")
+    if not isinstance(components, dict) or set(components) != set(expected_components):
+        raise ExecutionError("objective-matched validation component scope drift")
+    required_metrics = (
+        "loss",
+        "policy_loss",
+        "value_loss",
+        "accuracy",
+        "active_policy_teacher_gap_closure",
+    )
+    for component_id in expected_components:
+        component = components[component_id]
+        component_metrics = component.get("metrics") if isinstance(component, dict) else None
+        if not (
+            isinstance(component_metrics, dict)
+            and int(component.get("games", 0)) > 0
+            and int(component.get("rows", 0)) > 0
+            and all(
+                isinstance(component_metrics.get(key), (int, float))
+                and not isinstance(component_metrics.get(key), bool)
+                and np.isfinite(float(component_metrics[key]))
+                for key in required_metrics
+            )
+        ):
+            raise ExecutionError(
+                f"objective-matched validation metrics are incomplete for {component_id}"
+            )
     return {
         "manifest": manifest_ref,
         "report": {"path": str(report_path), "sha256": prepare._file_sha(report_path)},  # noqa: SLF001
