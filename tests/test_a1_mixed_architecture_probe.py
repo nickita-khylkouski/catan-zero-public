@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 import pytest
+import torch
 
 from catan_zero.rl.pipeline_configs import TrainConfig
 from tools import a1_mixed_architecture_probe as probe
@@ -72,6 +73,32 @@ def _argv(tmp_path: Path, *, runnable: bool = True, max_steps: int = 1000) -> li
     n128, n128_validation = _corpus(tmp_path, "n128")
     initialization = tmp_path / "init.pt"
     initialization.write_bytes(b"shared warm-start source")
+    gather = tmp_path / "gather.pt"
+    torch.save(
+        {
+            "config": {
+                "__config_dataclass__": "EntityGraphConfig",
+                "__config_schema__": 1,
+                "fields": {
+                    "state_trunk": "transformer",
+                    "action_target_gather": True,
+                    "action_cross_attention_layers": 0,
+                    "edge_policy_head": False,
+                    "value_attention_pool": False,
+                },
+            },
+            "upgrade_provenance": {
+                "schema_version": "entity-graph-upgrade-v1",
+                "source_checkpoint_sha256": hashlib.sha256(
+                    initialization.read_bytes()
+                ).hexdigest(),
+                "flags": {"action_target_gather": True},
+                "forward_max_diff": 0.0,
+                "forward_identical_at_init": True,
+            },
+        },
+        gather,
+    )
     audit = _audit(tmp_path / "audit.json", [n256, n128], runnable=runnable)
     return [
         "--lr",
@@ -88,6 +115,8 @@ def _argv(tmp_path: Path, *, runnable: bool = True, max_steps: int = 1000) -> li
         str(n128_validation),
         "--initialization-checkpoint",
         str(initialization),
+        "--gather-checkpoint",
+        str(gather),
         "--architecture-audit",
         str(audit),
         "--output-root",
@@ -116,7 +145,7 @@ def test_prepare_seals_matched_action_only_architecture_ab_without_launch(
     assert manifest["diagnostic_only"] is True
     assert manifest["promotion_eligible"] is False
     assert manifest["event_path"]["included"] is False
-    assert manifest["only_declared_arm_delta"] == "architecture"
+    assert manifest["only_declared_arm_delta"] == "zero-init action_target_gather"
     assert manifest["topology"] == {
         "world_size": 8,
         "local_batch_size": 512,
@@ -126,22 +155,24 @@ def test_prepare_seals_matched_action_only_architecture_ab_without_launch(
     }
 
     baseline = manifest["arms"]["baseline"]
-    treatment = manifest["arms"]["relational_action"]
+    treatment = manifest["arms"]["target_gather"]
     assert baseline["training_recipe"] == treatment["training_recipe"]
-    assert baseline["initialization"] == treatment["initialization"]
+    assert baseline["initialization"] != treatment["initialization"]
+    assert baseline["initialization_source"] == treatment["initialization_source"]
+    assert treatment["upgrade_evidence"]["forward_identical_at_init"] is True
     assert baseline["descriptor"] == treatment["descriptor"]
     assert baseline["architecture_audit"] == treatment["architecture_audit"]
     assert baseline["architecture"]["entity_state_trunk"] == "transformer"
     assert baseline["architecture"]["effective_action_target_gather"] is False
     assert treatment["architecture"] == {
-        "entity_state_trunk": "rrt",
-        "relational_block_pattern": "RRTRRT",
+        "entity_state_trunk": "transformer",
+        "relational_block_pattern": "",
         "relational_ff_size": 0,
         "relational_bases": 4,
         "relational_action_cross_layers": 1,
         "effective_action_target_gather": True,
-        "effective_action_cross_attention_layers": 1,
-        "effective_graph_relational_encoding": True,
+        "effective_action_cross_attention_layers": 0,
+        "effective_graph_relational_encoding": False,
         "effective_edge_policy_head": False,
     }
     assert manifest["manifest_sha256"] == _sha(
@@ -161,14 +192,14 @@ def test_commands_bind_same_source_optimizer_split_steps_and_topology(tmp_path):
         assert _option(command, "--lr") == "0.00012"
         assert _option(command, "--seed") == "1"
         assert _option(command, "--validation-max-samples") == "0"
-        assert "--grow-from-checkpoint" in command
+        assert "--init-checkpoint" in command
         assert "--no-resume-optimizer" in command
         assert "--no-fused-optimizer" in command
         assert "--no-relational-edge-policy-head" in command
         assert "--symmetry-augment-events" not in command
     assert _option(commands[0], "--entity-state-trunk") == "transformer"
-    assert _option(commands[1], "--entity-state-trunk") == "rrt"
-    assert _option(commands[1], "--relational-block-pattern") == "RRTRRT"
+    assert _option(commands[1], "--entity-state-trunk") == "transformer"
+    assert "--relational-block-pattern" not in commands[1]
     assert _option(commands[1], "--relational-action-cross-layers") == "1"
 
 

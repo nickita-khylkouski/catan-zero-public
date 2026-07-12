@@ -17,8 +17,8 @@ if str(REPO_ROOT) not in sys.path:
 from tools import a1_mixed_value_objective_probe as common  # noqa: E402
 
 
-SCHEMA = "a1-mixed-relational-architecture-probe-v1"
-ARMS = ("baseline", "relational_action")
+SCHEMA = "a1-mixed-gather-architecture-probe-v2"
+ARMS = ("baseline", "target_gather")
 SOURCE_PATHS = (
     "tools/a1_mixed_architecture_probe.py",
     "tools/a1_mixed_value_objective_probe.py",
@@ -26,7 +26,7 @@ SOURCE_PATHS = (
     "tools/train_bc.py",
     "tools/mixed_memmap_corpus.py",
     "src/catan_zero/rl/entity_token_policy.py",
-    "src/catan_zero/rl/relational_trunks.py",
+    "tools/f69_upgrade_checkpoint_config.py",
 )
 
 
@@ -43,16 +43,16 @@ def _architecture(arm: str) -> dict[str, Any]:
             "effective_graph_relational_encoding": False,
             "effective_edge_policy_head": False,
         }
-    if arm == "relational_action":
+    if arm == "target_gather":
         return {
-            "entity_state_trunk": "rrt",
-            "relational_block_pattern": "RRTRRT",
+            "entity_state_trunk": "transformer",
+            "relational_block_pattern": "",
             "relational_ff_size": 0,
             "relational_bases": 4,
             "relational_action_cross_layers": 1,
             "effective_action_target_gather": True,
-            "effective_action_cross_attention_layers": 1,
-            "effective_graph_relational_encoding": True,
+            "effective_action_cross_attention_layers": 0,
+            "effective_graph_relational_encoding": False,
             "effective_edge_policy_head": False,
         }
     raise ValueError(f"unknown architecture arm {arm!r}")
@@ -189,7 +189,7 @@ def _command(
         str(descriptor),
         "--data-format",
         "memmap",
-        "--grow-from-checkpoint",
+        "--init-checkpoint",
         str(initialization),
         "--arch",
         "entity_graph",
@@ -233,11 +233,12 @@ def _command(
 
 def _assert_matched(arms: dict[str, dict[str, Any]]) -> None:
     baseline = arms["baseline"]
-    treatment = arms["relational_action"]
+    treatment = arms["target_gather"]
     for field in (
         "training_recipe",
         "training_recipe_sha256",
-        "initialization",
+        "initialization_source",
+        "initial_outputs_sha256",
         "descriptor",
         "architecture_audit",
     ):
@@ -247,9 +248,49 @@ def _assert_matched(arms: dict[str, dict[str, Any]]) -> None:
         raise SystemExit("REFUSED: architecture treatment has no declared delta")
 
 
+def _validate_gather_upgrade(source: Path, upgraded: Path) -> dict[str, Any]:
+    """Bind a function-preserving transformer+gather-only checkpoint upgrade."""
+    import torch
+
+    source_ref = common._file_ref(source)
+    upgraded_ref = common._file_ref(upgraded)
+    raw = torch.load(upgraded, map_location="cpu", weights_only=False)
+    provenance = raw.get("upgrade_provenance") if isinstance(raw, dict) else None
+    expected_flags = {"action_target_gather": True}
+    if (
+        not isinstance(provenance, dict)
+        or provenance.get("schema_version") != "entity-graph-upgrade-v1"
+        or provenance.get("source_checkpoint_sha256")
+        != source_ref["sha256"].removeprefix("sha256:")
+        or provenance.get("flags") != expected_flags
+        or provenance.get("forward_max_diff") != 0.0
+        or provenance.get("forward_identical_at_init") is not True
+    ):
+        raise SystemExit("REFUSED: gather checkpoint lacks exact source/flag provenance")
+    config = raw.get("config")
+    if not isinstance(config, dict):
+        raise SystemExit("REFUSED: gather checkpoint config is not durable name-keyed data")
+    values = config.get("fields", config)
+    if not isinstance(values, dict) or not (
+        values.get("state_trunk", "transformer") == "transformer"
+        and values.get("action_target_gather") is True
+        and int(values.get("action_cross_attention_layers", 0)) == 0
+        and values.get("edge_policy_head", False) is False
+        and values.get("value_attention_pool", False) is False
+    ):
+        raise SystemExit("REFUSED: upgraded checkpoint is not gather-only transformer")
+    return {
+        "source": source_ref,
+        "upgraded": upgraded_ref,
+        "flags": expected_flags,
+        "forward_max_diff": 0.0,
+        "forward_identical_at_init": True,
+    }
+
+
 def _receipt(arm: dict[str, Any], manifest_path: Path) -> dict[str, Any]:
     payload = {
-        "schema_version": "a1-mixed-relational-architecture-receipt-v1",
+        "schema_version": "a1-mixed-gather-architecture-receipt-v2",
         "diagnostic_only": True,
         "promotion_eligible": False,
         "arm": arm["arm"],
@@ -293,6 +334,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--n128-corpus", required=True, type=Path)
     parser.add_argument("--n128-validation", required=True, type=Path)
     parser.add_argument("--initialization-checkpoint", required=True, type=Path)
+    parser.add_argument("--gather-checkpoint", required=True, type=Path)
     parser.add_argument("--architecture-audit", required=True, type=Path)
     parser.add_argument("--output-root", required=True, type=Path)
     parser.add_argument("--repo", type=Path, default=REPO_ROOT)
@@ -307,6 +349,8 @@ def prepare(args: argparse.Namespace) -> tuple[dict[str, Any], Path]:
     repo = args.repo.expanduser().resolve(strict=True)
     python = args.python.expanduser().resolve(strict=True)
     initialization = args.initialization_checkpoint.expanduser().resolve(strict=True)
+    gather_checkpoint = args.gather_checkpoint.expanduser().resolve(strict=True)
+    upgrade = _validate_gather_upgrade(initialization, gather_checkpoint)
     output_root = args.output_root.expanduser().resolve()
     components = [
         common._component(args.n256_corpus, args.n256_validation),
@@ -323,11 +367,12 @@ def prepare(args: argparse.Namespace) -> tuple[dict[str, Any], Path]:
         arm_dir = output_root / arm_name
         arm_dir.mkdir(parents=True, exist_ok=True)
         architecture = _architecture(arm_name)
+        arm_initialization = initialization if arm_name == "baseline" else gather_checkpoint
         command = _command(
             python=python,
             repo=repo,
             descriptor=descriptor_path,
-            initialization=initialization,
+            initialization=arm_initialization,
             arm_dir=arm_dir,
             recipe=recipe,
             architecture=architecture,
@@ -338,7 +383,12 @@ def prepare(args: argparse.Namespace) -> tuple[dict[str, Any], Path]:
             "architecture_sha256": common._canonical_sha(architecture),
             "training_recipe": recipe,
             "training_recipe_sha256": common._canonical_sha(recipe),
-            "initialization": initialization_ref,
+            "initialization": common._file_ref(arm_initialization),
+            "initialization_source": initialization_ref,
+            "initial_outputs_sha256": common._canonical_sha(
+                {"source": initialization_ref, "forward_max_diff": 0.0}
+            ),
+            "upgrade_evidence": None if arm_name == "baseline" else upgrade,
             "architecture_audit": audit_ref,
             "descriptor": str(descriptor_path),
             "checkpoint": str(arm_dir / "checkpoint.pt"),
@@ -367,16 +417,17 @@ def prepare(args: argparse.Namespace) -> tuple[dict[str, Any], Path]:
         "descriptor": common._file_ref(descriptor_path),
         "architecture_audit": audit_ref,
         "initialization": initialization_ref,
+        "gather_upgrade": upgrade,
         "source_binding": _source_binding(repo),
         "matched_fields": [
-            "initialization",
+            "function-identical initialization source",
             "data",
             "validation_split",
             "optimizer",
             "max_steps",
             "seed",
         ],
-        "only_declared_arm_delta": "architecture",
+        "only_declared_arm_delta": "zero-init action_target_gather",
         "arms": arms,
     }
     manifest["manifest_sha256"] = common._canonical_sha(manifest)

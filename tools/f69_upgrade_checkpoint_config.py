@@ -183,6 +183,7 @@ def _record_upgrade_provenance(
     in_checkpoint: str,
     flags: dict[str, object],
     seed: int,
+    forward_max_diff: float | None,
 ) -> None:
     """Atomically attest how freshly initialized upgrade modules were built."""
 
@@ -196,6 +197,10 @@ def _record_upgrade_provenance(
         "flags": dict(flags),
         "initialization_seed": int(seed),
         "trained_value_readouts_added": [],
+        "forward_max_diff": forward_max_diff,
+        "forward_identical_at_init": (
+            forward_max_diff == 0.0 if forward_max_diff is not None else False
+        ),
     }
     tmp = output.with_name(f".{output.name}.upgrade.tmp.{os.getpid()}")
     try:
@@ -257,6 +262,7 @@ def main() -> None:
         in_checkpoint=args.in_checkpoint,
         flags=overrides,
         seed=int(args.seed),
+        forward_max_diff=max_diff,
     )
     print(json.dumps({
         "in_checkpoint": args.in_checkpoint,
