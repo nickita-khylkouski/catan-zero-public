@@ -540,9 +540,19 @@ def derive_canary_plan(
         "validation_only": True,
     }
 
-    required = dict(rendered["required_artifacts"])
+    required = json.loads(json.dumps(rendered["required_artifacts"]))
     production_ledger_path = str(required["seed_ledger"]["path"])
     required["seed_ledger"] = canary_ledger_record
+    if native_runtime:
+        runtime_records = contract._runtime_code_tree_records()  # noqa: SLF001
+        guard_path = (_REPO_ROOT / "configs/guards/a1_generation_n128.json").resolve(
+            strict=True
+        )
+        required["guard_configs"] = [
+            contract._file_record(guard_path, kind="guard_config")  # noqa: SLF001
+        ]
+        required["generator_code"] = runtime_records
+        required["runtime_code_tree"] = runtime_records
     canary_render: dict[str, Any] = {
         "schema_version": RENDER_SCHEMA,
         "validation_only": True,
@@ -574,7 +584,7 @@ def derive_canary_plan(
     canary_render_path = root / "operator" / "commands.canary.json"
     _create_exact(canary_render_path, canary_render)
 
-    repo_artifacts = executor._repo_artifacts(rendered, repo_root=repo_root)
+    repo_artifacts = executor._repo_artifacts(canary_render, repo_root=repo_root)
     companion = Path(__file__).resolve()
     relative_companion = companion.relative_to(repo_root.resolve())
     if not any(record["path"] == str(relative_companion) for record in repo_artifacts):
