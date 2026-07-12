@@ -126,6 +126,24 @@ def test_forward_is_exact_composition_of_state_and_action_apis():
     assert encoded_state[0].shape[0] == batch["hex_tokens"].shape[0]
 
 
+def test_zero_init_target_gather_gets_a_nonzero_first_step_gradient():
+    """Exact warm-start must not make the topology branch permanently inert."""
+    model = EntityGraphNet(_config(action_target_gather=True)).train()
+    batch = _batch(batch_size=3, action_width=5)
+    outputs = model(batch)
+    target = torch.tensor([0, 1, 2], dtype=torch.long)
+    torch.nn.functional.cross_entropy(outputs["logits"], target).backward()
+
+    projection = model.target_gather_proj[1]
+    # Its zero weight blocks first-step gradients *through* the new path into
+    # the trunk (the exact-function warm-start contract), but the projection
+    # itself must learn immediately so topology gradients reach the trunk on
+    # subsequent steps.
+    assert torch.count_nonzero(projection.weight).item() == 0
+    assert projection.weight.grad is not None
+    assert projection.weight.grad.abs().sum().item() > 0.0
+
+
 def test_event_tail_crop_preserves_outputs_with_all_consumers_enabled():
     model = EntityGraphNet(
         _config(

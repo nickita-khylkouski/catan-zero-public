@@ -97,3 +97,52 @@ def test_partial_head_subset_counted():
     loss, active = train_bc._aux_subgoal_loss(out, data, np.arange(_N), _DEVICE)
     assert active == 2
     assert torch.isfinite(loss) and float(loss) > 0.0
+
+
+def test_spatial_aux_labels_follow_the_exact_sampled_d6_orientation():
+    """D6-augmented inputs must not retain absolute-coordinate aux labels."""
+    class _FakeSymmetry:
+        fwd_vertex = np.stack(
+            [np.arange(54), np.roll(np.arange(54), -1)], axis=0
+        )
+        fwd_hex = np.stack(
+            [np.arange(19), np.roll(np.arange(19), -1)], axis=0
+        )
+
+        @staticmethod
+        def _remap_values(ids, table_g):
+            rows = np.arange(ids.shape[0])
+            return np.where(ids < 0, -1, table_g[rows, np.maximum(ids, 0)])
+
+    symmetry = _FakeSymmetry()
+    batch = np.arange(2)
+    g = np.array([1, 1], dtype=np.int64)
+    settlement = np.array([5, 31], dtype=np.int64)
+    robber = np.array([3, 14], dtype=np.int64)
+    mapped_settlement = symmetry.fwd_vertex[g, settlement]
+    mapped_robber = symmetry.fwd_hex[g, robber]
+
+    settlement_logits = torch.full((2, 54), -20.0, requires_grad=True)
+    robber_logits = torch.full((2, 19), -20.0, requires_grad=True)
+    with torch.no_grad():
+        settlement_logits[torch.arange(2), torch.as_tensor(mapped_settlement)] = 20.0
+        robber_logits[torch.arange(2), torch.as_tensor(mapped_robber)] = 20.0
+    outputs = {
+        "aux_next_settlement": settlement_logits,
+        "aux_robber_target": robber_logits,
+    }
+    data = {
+        "aux_next_settlement": settlement,
+        "aux_robber_target": robber,
+    }
+
+    loss, active = train_bc._aux_subgoal_loss(
+        outputs,
+        data,
+        batch,
+        _DEVICE,
+        symmetry=symmetry,
+        symmetry_ids=g,
+    )
+    assert active == 2
+    assert float(loss) < 1.0e-6

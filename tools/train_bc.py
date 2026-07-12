@@ -6506,6 +6506,7 @@ def _forward_legal_np_for_batch(
 ) -> dict:
     if getattr(policy, "policy_type", "") == "entity_graph":
         entity = _entity_batch(data, batch)
+        symmetry_ids = None
         if symmetry is not None:
             # f74: draw one D6 orientation per row and relabel the board tokens.
             # Legal-action rows keep their order (only their target ids move), so
@@ -6515,6 +6516,7 @@ def _forward_legal_np_for_batch(
             b = int(np.asarray(entity["hex_tokens"]).shape[0])
             gen = symmetry_rng if symmetry_rng is not None else np.random.default_rng()
             g = gen.integers(n_sym, size=b)
+            symmetry_ids = g
             entity = symmetry.permute_entity_batch(
                 entity,
                 g,
@@ -6522,12 +6524,20 @@ def _forward_legal_np_for_batch(
                 legal_action_ids=legal_action_ids,
                 action_size=int(policy.action_size),
             )
-        return policy.forward_legal_np(
+        outputs = policy.forward_legal_np(
             entity,
             legal_action_ids,
             data["legal_action_context"][batch],
             return_q=return_q,
         )
+        # Keep the exact sampled orientation with the forward result. Spatial
+        # auxiliary labels live outside ``entity`` and must be relabelled by the
+        # same per-row D6 element before their loss is computed. Without this
+        # metadata, combining --symmetry-augment with CAT-100 silently trains
+        # next-settlement/robber heads against the unrotated coordinates.
+        if symmetry_ids is not None:
+            outputs["_symmetry_ids"] = symmetry_ids
+        return outputs
     return policy.forward_legal_np(
         data["obs"][batch],
         legal_action_ids,
@@ -6603,7 +6613,15 @@ _AUX_SUBGOAL_SPECS = (
 )
 
 
-def _aux_subgoal_loss(outputs: dict, data: dict, batch: np.ndarray, device) -> tuple:
+def _aux_subgoal_loss(
+    outputs: dict,
+    data: dict,
+    batch: np.ndarray,
+    device,
+    *,
+    symmetry=None,
+    symmetry_ids: np.ndarray | None = None,
+) -> tuple:
     """Combined CAT-100 auxiliary-subgoal loss over head/target pairs present in
     BOTH the model outputs and the corpus. Returns (loss_tensor, active_heads).
 
@@ -6643,6 +6661,23 @@ def _aux_subgoal_loss(outputs: dict, data: dict, batch: np.ndarray, device) -> t
         if field not in outputs or field not in data:
             continue
         raw = np.asarray(data[field][batch])
+        if symmetry_ids is not None and field in {
+            "aux_next_settlement",
+            "aux_robber_target",
+        }:
+            if symmetry is None:
+                raise ValueError("spatial aux relabel requires the D6 symmetry tables")
+            g = np.asarray(symmetry_ids, dtype=np.int64)
+            if g.shape != (len(batch),):
+                raise ValueError(
+                    "spatial aux symmetry ids must have one entry per batch row"
+                )
+            table = (
+                symmetry.fwd_vertex[g]
+                if field == "aux_next_settlement"
+                else symmetry.fwd_hex[g]
+            )
+            raw = symmetry._remap_values(np.asarray(raw), table)
         pred = outputs[field]
         if kind == "categorical":
             target = torch.as_tensor(raw.astype(np.int64), device=device)
@@ -7103,7 +7138,12 @@ def _train_xdim_batch(
         aux_subgoal_active_heads = 0
         if float(aux_subgoal_loss_weight) != 0.0:
             aux_subgoal_loss, aux_subgoal_active_heads = _aux_subgoal_loss(
-                outputs, data, batch, policy.device
+                outputs,
+                data,
+                batch,
+                policy.device,
+                symmetry=symmetry,
+                symmetry_ids=outputs.get("_symmetry_ids"),
             )
         moe_balance_loss = outputs.get("moe_balance_metric")
         if moe_balance_loss is None:

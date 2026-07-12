@@ -185,6 +185,16 @@ def audit_corpus(root: Path, *, chunk_rows: int = 4096) -> dict[str, Any]:
     action_groups: dict[str, dict[str, int]] = {}
     phase_groups: dict[str, dict[str, int]] = {}
     cohort_groups: dict[str, dict[str, int]] = {}
+    chosen_action_groups: dict[str, dict[str, int]] = {}
+    chosen_phase_groups: dict[str, dict[str, int]] = {}
+    chosen_actions = 0
+    chosen_actions_with_target = 0
+    chosen_policy_active = 0
+    chosen_policy_active_with_target = 0
+    chosen_search_active = 0
+    chosen_search_active_with_target = 0
+    chosen_action_missing_from_legal = 0
+    chosen_action_duplicate_in_legal = 0
     total_rows_with_target = 0
     policy_active_rows_with_target = 0
     search_active_rows_with_target = 0
@@ -253,6 +263,40 @@ def audit_corpus(root: Path, *, chunk_rows: int = 4096) -> dict[str, Any]:
             total_rows_with_target += int(np.sum(row_has_target))
             policy_active_rows_with_target += int(np.sum(row_has_target & policy_active))
             search_active_rows_with_target += int(np.sum(row_has_target & search_active))
+
+            # The gather branch receives gradients through every legal logit,
+            # but coverage of the demonstrated/MCTS-selected action is the
+            # clearest measure of whether its positive target has an explicit
+            # topology pointer. Bind that row by exact global action id rather
+            # than assuming a legal-list order.
+            if reader.has("action_taken"):
+                taken = reader.rows_slice("action_taken", start, stop).astype(
+                    np.int64, copy=False
+                )
+                selected = legal_ids.astype(np.int64, copy=False) == taken[row_index]
+                match_count = np.zeros(row_count, dtype=np.int64)
+                np.add.at(match_count, row_index, selected.astype(np.int64))
+                chosen_action_missing_from_legal += int(np.sum(match_count == 0))
+                chosen_action_duplicate_in_legal += int(np.sum(match_count > 1))
+                exact = selected & (match_count[row_index] == 1)
+                chosen_targets = targets[exact]
+                chosen_labels = labels[exact]
+                chosen_phases = phases[row_index][exact]
+                chosen_actions += int(len(chosen_targets))
+                chosen_has_target = np.any(chosen_targets >= 0, axis=1)
+                chosen_actions_with_target += int(np.sum(chosen_has_target))
+                chosen_policy = policy_active[match_count == 1]
+                chosen_search = search_active[match_count == 1]
+                chosen_policy_active += int(np.sum(chosen_policy))
+                chosen_policy_active_with_target += int(
+                    np.sum(chosen_policy & chosen_has_target)
+                )
+                chosen_search_active += int(np.sum(chosen_search))
+                chosen_search_active_with_target += int(
+                    np.sum(chosen_search & chosen_has_target)
+                )
+                _add_group(chosen_action_groups, chosen_labels, chosen_targets)
+                _add_group(chosen_phase_groups, chosen_phases, chosen_targets)
 
         if reader.has("event_target_ids"):
             event_targets = reader.rows_slice("event_target_ids", start, stop).astype(
@@ -347,6 +391,22 @@ def audit_corpus(root: Path, *, chunk_rows: int = 4096) -> dict[str, Any]:
             "by_action_kind": by_action,
             "by_phase": by_phase,
             "by_search_cohort": by_cohort,
+            "chosen_actions": chosen_actions,
+            "chosen_actions_with_any_target": chosen_actions_with_target,
+            "chosen_action_target_coverage": chosen_actions_with_target
+            / max(chosen_actions, 1),
+            "chosen_policy_active": chosen_policy_active,
+            "chosen_policy_active_with_any_target": chosen_policy_active_with_target,
+            "chosen_policy_active_target_coverage": chosen_policy_active_with_target
+            / max(chosen_policy_active, 1),
+            "chosen_search_active": chosen_search_active,
+            "chosen_search_active_with_any_target": chosen_search_active_with_target,
+            "chosen_search_active_target_coverage": chosen_search_active_with_target
+            / max(chosen_search_active, 1),
+            "chosen_action_missing_from_legal": chosen_action_missing_from_legal,
+            "chosen_action_duplicate_in_legal": chosen_action_duplicate_in_legal,
+            "chosen_by_action_kind": _finalize_groups(chosen_action_groups),
+            "chosen_by_phase": _finalize_groups(chosen_phase_groups),
         },
         "event_targets": event,
         "graph_incidence": {

@@ -40,6 +40,12 @@ def _corpus(tmp_path: Path, *, invalid_target: bool = False, event_targets: bool
     (root / "row_offsets.dat").write_bytes(offsets.tobytes())
     columns = {}
     _ragged(root, columns, "legal_action_ids", np.arange(6, dtype=np.int16))
+    _fixed(
+        root,
+        columns,
+        "action_taken",
+        np.asarray([0, 2, 4, 5], dtype=np.int16),
+    )
     tokens = np.zeros((6, 50), dtype=np.float16)
     for row, action_index in enumerate((0, 1, 16, 10, 2, 17)):
         tokens[row, 2 + action_index] = 1.0
@@ -105,6 +111,14 @@ def test_chunked_audit_quantifies_action_phase_search_event_and_graph_targets(tm
     assert legal["policy_active_rows"] == 3
     assert legal["search_active_rows"] == 2
     assert legal["search_active_rows_with_any_target"] == 1
+    assert legal["chosen_actions"] == 4
+    assert legal["chosen_actions_with_any_target"] == 2
+    assert legal["chosen_action_target_coverage"] == 0.5
+    assert legal["chosen_policy_active_target_coverage"] == 2 / 3
+    assert legal["chosen_search_active_target_coverage"] == 0.5
+    assert legal["chosen_action_missing_from_legal"] == 0
+    assert legal["chosen_action_duplicate_in_legal"] == 0
+    assert legal["chosen_by_action_kind"]["BUILD_SETTLEMENT"]["target_coverage"] == 1.0
     assert legal["by_action_kind"]["BUILD_SETTLEMENT"]["vertex_targets"] == 1
     assert legal["by_action_kind"]["BUILD_ROAD"]["edge_targets"] == 1
     assert legal["by_action_kind"]["MOVE_ROBBER"]["hex_targets"] == 1
