@@ -617,8 +617,10 @@ def build_parser() -> argparse.ArgumentParser:
             "so a linear value head is no longer the only free parameter. Scoped to rows "
             "with a recorded prior (raw/gumbel self-play rows -- teacher rows contribute "
             "nothing, same has_prior filter as the KL telemetry). Anchors to the SAME "
-            "quantity the prior_kl telemetry already tracks, so prior_kl_ratio reports "
-            "whether the anchor is binding."
+            "quantity the legacy prior_kl telemetry tracks. Do not interpret "
+            "prior_kl_ratio as teacher-target uptake: it is reverse KL on every row "
+            "with a prior. Use active_policy_teacher_gap_closure for objective-aligned "
+            "distillation telemetry."
         ),
     )
     parser.add_argument(
@@ -5826,9 +5828,9 @@ def evaluate_bc_batches(
             "phase_accuracy": _finalize_phase_stats(phase_stats),
             "phase_accuracy_excluding_forced": _finalize_phase_stats(phase_stats_unforced),
             "teacher_accuracy": _finalize_phase_stats(teacher_stats),
-            # SUCCESS TELEMETRY (gen-1 recipe): "worked" once prior_kl_ratio
-            # reaches 0.6-0.8; <0.3 by the end of training signals underfit
-            # (retrain at a higher LR before spending gate games on it).
+            # Legacy drift telemetry. This reverse-KL ratio is retained for report
+            # compatibility and anchor diagnostics, but is not a calibrated teacher
+            # uptake fraction and must not be used as an LR or launch gate.
             "prior_kl_rows": int(round(extra_sums["prior_kl_rows"])),
             "prior_kl_model_prior_mean": (
                 extra_sums["prior_kl_model_prior_sum"] / max(extra_sums["prior_kl_rows"], 1.0)

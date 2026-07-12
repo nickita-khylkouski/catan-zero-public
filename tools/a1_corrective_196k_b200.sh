@@ -179,12 +179,22 @@ run_dose n128 full-140k "$root/n128/n128.memmap" \
 
 "$python" - "$out/n128/report.json" "$out/final.telemetry.json" <<'PY'
 import json, os, sys
-r=json.load(open(sys.argv[1],encoding="utf-8")); v=r["metrics"][-1]["validation"]
-value={"prior_kl_ratio":v["prior_kl_ratio"],"target_range":[0.6,0.8],
-       "in_target_range":0.6 <= v["prior_kl_ratio"] <= 0.8,
-       "diagnostic_only":True,"promotion_eligible":False}
-fd=os.open(sys.argv[2],os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o444)
-with os.fdopen(fd,"w",encoding="utf-8") as f:
- json.dump(value,f,indent=2,sort_keys=True); f.write("\n"); f.flush(); os.fsync(f.fileno())
-print(json.dumps(value,sort_keys=True))
+r = json.load(open(sys.argv[1], encoding="utf-8"))
+v = r["metrics"][-1]["validation"]
+value={
+ "active_policy_teacher_gap_rows":v["active_policy_teacher_gap_rows"],
+ "active_policy_kl_target_model_mean":v["active_policy_kl_target_model_mean"],
+ "active_policy_kl_target_prior_mean":v["active_policy_kl_target_prior_mean"],
+ "active_policy_teacher_gap_closure":v["active_policy_teacher_gap_closure"],
+ "legacy_prior_kl_ratio":v["prior_kl_ratio"],
+ "legacy_prior_kl_ratio_is_gate":False,
+ "diagnostic_only":True,"promotion_eligible":False,
+}
+fd = os.open(sys.argv[2], os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o444)
+with os.fdopen(fd, "w", encoding="utf-8") as f:
+    json.dump(value, f, indent=2, sort_keys=True)
+    f.write("\n")
+    f.flush()
+    os.fsync(f.fileno())
+print(json.dumps(value, sort_keys=True))
 PY
