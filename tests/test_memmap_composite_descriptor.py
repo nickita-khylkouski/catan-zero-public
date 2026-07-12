@@ -81,7 +81,10 @@ def _descriptor(tmp_path: Path) -> Path:
 
 
 def _descriptor_v2(
-    tmp_path: Path, *, policy_distillation_component_ids: list[str] | None = None
+    tmp_path: Path,
+    *,
+    policy_distillation_component_ids: list[str] | None = None,
+    value_training_component_ids: list[str] | None = None,
 ) -> Path:
     overrides = {
         "per_game_policy_weight": True,
@@ -109,6 +112,8 @@ def _descriptor_v2(
     }
     if policy_distillation_component_ids is not None:
         payload["policy_distillation_component_ids"] = policy_distillation_component_ids
+    if value_training_component_ids is not None:
+        payload["value_training_component_ids"] = value_training_component_ids
     path = tmp_path / "composite-v2.json"
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     return path
@@ -138,6 +143,8 @@ def test_v2_authenticates_three_component_ratios_and_anchor_scope(tmp_path):
     assert verified["policy_kl_anchor_component_ids"] == ["gen3"]
     assert verified["policy_distillation_component_ids"] == ["n128", "n256", "gen3"]
     assert verified["policy_distillation_scope_explicit"] is False
+    assert verified["value_training_component_ids"] == ["n128", "n256", "gen3"]
+    assert verified["value_training_scope_explicit"] is False
     assert verified["descriptor_fingerprint"] == train_bc._training_data_fingerprint(
         str(path), "memmap"
     )
@@ -164,6 +171,21 @@ def test_v2_authenticates_policy_distillation_scope_and_refuses_drift(tmp_path):
     payload["policy_distillation_component_ids"] = ["n256", "n128"]
     path.write_text(json.dumps(payload), encoding="utf-8")
     with pytest.raises(SystemExit, match="must follow component order"):
+        train_bc._preflight_memmap_composite_descriptor(path)
+
+
+def test_v2_authenticates_value_training_scope_and_refuses_drift(tmp_path):
+    path = _descriptor_v2(
+        tmp_path, value_training_component_ids=["n128", "n256"]
+    )
+    verified = train_bc._preflight_memmap_composite_descriptor(path)
+    assert verified["value_training_component_ids"] == ["n128", "n256"]
+    assert verified["value_training_scope_explicit"] is True
+
+    payload = json.loads(path.read_text())
+    payload["value_training_component_ids"] = ["n256", "n128"]
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(SystemExit, match="value training.*must follow component order"):
         train_bc._preflight_memmap_composite_descriptor(path)
 
     second = tmp_path / "second"

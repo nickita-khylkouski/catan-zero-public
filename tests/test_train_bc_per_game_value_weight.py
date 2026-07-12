@@ -3,7 +3,11 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from tools.train_bc import build_value_sample_weights, per_game_weight_quality
+from tools.train_bc import (
+    _apply_authenticated_value_training_scope,
+    build_value_sample_weights,
+    per_game_weight_quality,
+)
 
 
 def _legal_action_ids(counts: list[int], width: int = 4) -> np.ndarray:
@@ -86,6 +90,23 @@ def test_forced_row_value_weight_default_is_noop() -> None:
     weights = build_value_sample_weights(data)
 
     assert weights[0] == pytest.approx(weights[1])
+
+
+def test_authenticated_value_scope_can_make_replay_anchor_only() -> None:
+    class _Composite:
+        component_ids = ("n128", "n256", "gen3_replay")
+        value_training_component_indices = (0, 1)
+        value_training_scope_authenticated = True
+
+        @staticmethod
+        def component_indices_for_rows(rows):
+            mapping = np.asarray([0, 0, 1, 1, 2, 2], dtype=np.int64)
+            return mapping[np.asarray(rows, dtype=np.int64)]
+
+    weights = np.ones(6, dtype=np.float32)
+    scoped = _apply_authenticated_value_training_scope(_Composite(), weights)
+    assert scoped.tolist() == [1.0, 1.0, 1.0, 1.0, 0.0, 0.0]
+    assert weights.tolist() == [1.0] * 6
 
 
 def test_per_game_value_weight_composes_with_forced_row_and_multiplier() -> None:

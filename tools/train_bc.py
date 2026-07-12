@@ -1661,19 +1661,22 @@ def _preflight_memmap_composite_descriptor(path: str | Path) -> dict[str, object
         "learner_recipe_overrides", "learner_recipe_overrides_sha256",
     }
     if schema_version == "memmap_composite_v1":
-        valid_field_sets = (common_fields,)
+        fields_valid = set(descriptor) == common_fields
     else:
-        v2_fields = common_fields | {"policy_kl_anchor_component_ids"}
+        required_v2_fields = common_fields | {"policy_kl_anchor_component_ids"}
+        optional_v2_fields = {
+            "policy_distillation_component_ids",
+            "value_training_component_ids",
+        }
         # Optional for backward compatibility: absence preserves the historical
-        # all-components policy-CE scope. Presence is authenticated by the
-        # descriptor fingerprint and enables value-only replay components.
-        valid_field_sets = (
-            v2_fields,
-            v2_fields | {"policy_distillation_component_ids"},
+        # all-components objective scopes. Presence is authenticated by the
+        # descriptor fingerprint and can make replay anchor-only rather than
+        # treating an old-policy Monte-Carlo outcome as an f7 value label.
+        fields_valid = (
+            required_v2_fields.issubset(descriptor)
+            and set(descriptor).issubset(required_v2_fields | optional_v2_fields)
         )
-    if schema_version not in {"memmap_composite_v1", "memmap_composite_v2"} or set(
-        descriptor
-    ) not in valid_field_sets:
+    if schema_version not in {"memmap_composite_v1", "memmap_composite_v2"} or not fields_valid:
         raise SystemExit("memmap composite descriptor fields differ from its schema")
     if (
         descriptor.get("diagnostic_only") is not True
@@ -1797,6 +1800,8 @@ def _preflight_memmap_composite_descriptor(path: str | Path) -> dict[str, object
     anchor_component_ids: list[str] = []
     distillation_component_ids: list[str] = []
     distillation_scope_explicit = False
+    value_training_component_ids: list[str] = []
+    value_training_scope_explicit = False
     if schema_version == "memmap_composite_v2":
         if not math.isclose(sum(component_ratios), 1.0, rel_tol=0.0, abs_tol=1e-9):
             raise SystemExit("memmap composite v2 game sampling ratios must sum to 1")
@@ -1833,6 +1838,26 @@ def _preflight_memmap_composite_descriptor(path: str | Path) -> dict[str, object
             )
         distillation_component_ids = list(raw_distillation_ids)
         distillation_scope_explicit = "policy_distillation_component_ids" in descriptor
+        raw_value_ids = descriptor.get("value_training_component_ids", component_ids)
+        if (
+            not isinstance(raw_value_ids, list)
+            or not raw_value_ids
+            or any(not isinstance(value, str) for value in raw_value_ids)
+            or len(set(raw_value_ids)) != len(raw_value_ids)
+            or not set(raw_value_ids).issubset(component_ids)
+        ):
+            raise SystemExit(
+                "memmap composite v2 value training component ids are invalid"
+            )
+        if raw_value_ids != [
+            value for value in component_ids if value in set(raw_value_ids)
+        ]:
+            raise SystemExit(
+                "memmap composite v2 value training component ids must follow "
+                "component order"
+            )
+        value_training_component_ids = list(raw_value_ids)
+        value_training_scope_explicit = "value_training_component_ids" in descriptor
     return {
         "schema_version": schema_version, "diagnostic_only": True,
         "promotion_eligible": False, "descriptor_path": str(descriptor_path),
@@ -1849,6 +1874,8 @@ def _preflight_memmap_composite_descriptor(path: str | Path) -> dict[str, object
         "policy_kl_anchor_component_ids": anchor_component_ids,
         "policy_distillation_component_ids": distillation_component_ids,
         "policy_distillation_scope_explicit": distillation_scope_explicit,
+        "value_training_component_ids": value_training_component_ids,
+        "value_training_scope_explicit": value_training_scope_explicit,
     }
 
 
@@ -4997,6 +5024,9 @@ def main(argv: Sequence[str] | None = None) -> None:
             per_game_value_weight=args.per_game_value_weight,
             per_game_value_weight_mode=args.per_game_value_weight_mode,
         )
+        value_weights = _apply_authenticated_value_training_scope(
+            data, value_weights
+        )
         # Flag-off must remain exact rng.permutation, so these all-ones are only
         # retained for reporting and are not passed to _epoch_order.
         if float(args.policy_surprise_weight) == 0.0:
@@ -5117,6 +5147,12 @@ def main(argv: Sequence[str] | None = None) -> None:
                 int(value)
                 for value in getattr(
                     data, "policy_distillation_component_indices", tuple()
+                )
+            ],
+            "value_training_component_indices": [
+                int(value)
+                for value in getattr(
+                    data, "value_training_component_indices", tuple()
                 )
             ],
         }
@@ -6378,6 +6414,12 @@ def main(argv: Sequence[str] | None = None) -> None:
                 ),
                 "policy_distillation_scope_explicit": bool(
                     a1_preflight_meta.get("policy_distillation_scope_explicit", False)
+                ),
+                "value_training_component_ids": a1_preflight_meta.get(
+                    "value_training_component_ids", []
+                ),
+                "value_training_scope_explicit": bool(
+                    a1_preflight_meta.get("value_training_scope_explicit", False)
                 ),
                 "component_contract_sha256s": [
                     contract["a1_contract_sha256"]
@@ -9413,6 +9455,13 @@ def load_teacher_data_memmap(
                 if component_id in distillation_ids
             )
             corpus.policy_distillation_scope_authenticated = True
+            value_ids = set(authenticated["value_training_component_ids"])
+            corpus.value_training_component_indices = tuple(
+                index
+                for index, component_id in enumerate(corpus.component_ids)
+                if component_id in value_ids
+            )
+            corpus.value_training_scope_authenticated = True
         corpus.meta.update({
             "schema": authenticated["schema_version"],
             "descriptor_path": authenticated["descriptor_path"],
@@ -12906,6 +12955,41 @@ def _policy_distillation_scope_report(data, weights: np.ndarray) -> dict[str, ob
         "component_ids": [component_ids[index] for index in sorted(eligible)],
         "components": components,
     }
+
+
+def _apply_authenticated_value_training_scope(
+    data, weights: np.ndarray
+) -> np.ndarray:
+    """Zero value objectives outside an authenticated composite scope.
+
+    A realised outcome is policy-conditional: replay ``z`` estimates the old
+    self-play continuation, not the current checkpoint's continuation.  This
+    scope lets replay remain available to its independently authenticated KL
+    anchor without silently using old-policy returns as current value labels.
+    Ordinary corpora and old descriptors retain all-component behavior.
+    """
+
+    if not bool(getattr(data, "value_training_scope_authenticated", False)):
+        return weights
+    component_ids = tuple(getattr(data, "component_ids", tuple()))
+    eligible = tuple(
+        int(value)
+        for value in getattr(data, "value_training_component_indices", tuple())
+    )
+    if (
+        not component_ids
+        or not eligible
+        or any(value < 0 or value >= len(component_ids) for value in eligible)
+        or len(set(eligible)) != len(eligible)
+    ):
+        raise SystemExit("authenticated value training component scope is invalid")
+    rows = np.arange(len(weights), dtype=np.int64)
+    components = data.component_indices_for_rows(rows)
+    scoped = np.asarray(weights, dtype=np.float32).copy()
+    scoped[~np.isin(components, np.asarray(eligible, dtype=np.int64))] = 0.0
+    if not np.any(scoped > 0.0):
+        raise SystemExit("authenticated value training scope has no positive rows")
+    return scoped
 
 
 def build_value_sample_weights(
