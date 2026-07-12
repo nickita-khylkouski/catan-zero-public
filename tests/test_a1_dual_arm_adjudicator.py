@@ -205,15 +205,19 @@ def test_stage_b_requires_winner_full_evidence_before_rendering_promotion(
         for name in (
             "registry.jsonl", "CURRENT_CHAMPION", "contract.lock.json",
             "promotion.adjudication.json",
+            "cohort-exclusions.json",
         )
     }
     manifest = {
-        "schema_version": "a1-dual-arm-winner-promotion-manifest-v1",
+        "schema_version": adjudicator.WINNER_PROMOTION_MANIFEST_SCHEMA,
         "registry": adjudicator._ref(files["registry.jsonl"], where="fixture"),  # noqa: SLF001
         "current_pointer": adjudicator._ref(files["CURRENT_CHAMPION"], where="fixture"),  # noqa: SLF001
         "contract_lock": adjudicator._ref(files["contract.lock.json"], where="fixture"),  # noqa: SLF001
         "adjudication": adjudicator._ref(files["promotion.adjudication.json"], where="fixture"),  # noqa: SLF001
         "training_receipt": adjudicator._ref(winner_receipt, where="fixture"),  # noqa: SLF001
+        "cohort_exclusions": adjudicator._ref(  # noqa: SLF001
+            files["cohort-exclusions.json"], where="fixture"
+        ),
         "receipt": str(tmp_path / "promotion.receipt.json"),
         "reason": "winner cleared full evidence",
     }

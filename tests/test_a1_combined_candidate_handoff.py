@@ -178,12 +178,16 @@ def test_promotion_plan_requires_passing_handoff_and_full_transaction_preflight(
             "CURRENT_CHAMPION",
             "contract.lock.json",
             "promotion.adjudication.json",
+            "cohort-exclusions.json",
             "candidate.pt",
         )
     }
     passing = {
         "passed": True,
         "training_receipt": handoff._ref(training_receipt, where="fixture"),  # noqa: SLF001
+        "cohort_exclusions": handoff._ref(  # noqa: SLF001
+            files["cohort-exclusions.json"], where="fixture"
+        ),
         "candidate": handoff._ref(files["candidate.pt"], where="fixture"),  # noqa: SLF001
     }
     monkeypatch.setattr(handoff, "verify_result", lambda _path: passing)
@@ -196,6 +200,9 @@ def test_promotion_plan_requires_passing_handoff_and_full_transaction_preflight(
             files["promotion.adjudication.json"], where="fixture"
         ),
         "training_receipt": handoff._ref(training_receipt, where="fixture"),  # noqa: SLF001
+        "cohort_exclusions": handoff._ref(  # noqa: SLF001
+            files["cohort-exclusions.json"], where="fixture"
+        ),
         "receipt": str(tmp_path / "promotion.receipt.json"),
         "reason": "combined candidate cleared every gate",
     }

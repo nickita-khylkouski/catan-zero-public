@@ -29,7 +29,8 @@ from tools import a1_promotion_transaction as promotion  # noqa: E402
 
 MANIFEST_SCHEMA = "a1-dual-arm-adjudication-manifest-v1"
 RESULT_SCHEMA = "a1-dual-arm-adjudication-v1"
-PROMOTION_PLAN_SCHEMA = "a1-dual-arm-promotion-plan-v1"
+WINNER_PROMOTION_MANIFEST_SCHEMA = "a1-dual-arm-winner-promotion-manifest-v2"
+PROMOTION_PLAN_SCHEMA = "a1-dual-arm-promotion-plan-v2"
 IDENTITIES = frozenset(dual_train.ALLOWED_IDENTITIES)
 
 
@@ -455,9 +456,10 @@ def build_promotion_plan(
         "contract_lock",
         "adjudication",
         "training_receipt",
+        "cohort_exclusions",
         "receipt",
         "reason",
-    } or value.get("schema_version") != "a1-dual-arm-winner-promotion-manifest-v1":
+    } or value.get("schema_version") != WINNER_PROMOTION_MANIFEST_SCHEMA:
         raise DualAdjudicationError("winner promotion manifest schema/fields drift")
     base = promotion_manifest_path.parent
     registry = _bound_ref(value["registry"], base=base, where="registry")
@@ -468,6 +470,9 @@ def build_promotion_plan(
     )
     training_receipt = _bound_ref(
         value["training_receipt"], base=base, where="winner training receipt"
+    )
+    cohort_exclusions = _bound_ref(
+        value["cohort_exclusions"], base=base, where="cohort exclusions"
     )
     if _ref(training_receipt, where="winner training receipt") != winner.get(
         "training_receipt"
@@ -484,6 +489,7 @@ def build_promotion_plan(
             contract_lock=contract_lock,
             adjudication_path=final_adjudication,
             training_receipt=training_receipt,
+            cohort_exclusions=cohort_exclusions,
             receipt_path=receipt,
             reason=reason,
         )
@@ -505,6 +511,8 @@ def build_promotion_plan(
         str(final_adjudication),
         "--training-receipt",
         str(training_receipt),
+        "--cohort-exclusions",
+        str(cohort_exclusions),
         "--receipt",
         str(receipt),
         "--reason",

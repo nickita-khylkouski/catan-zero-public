@@ -51,8 +51,10 @@ from tools.sprt_gate import evaluate_pentanomial_sprt, pair_scores_from_h2h_game
 
 
 ADJUDICATION_SCHEMA = "a1-promotion-adjudication-v1"
-RECEIPT_SCHEMA = "a1-promotion-transaction-receipt-v2"
+RECEIPT_SCHEMA = "a1-promotion-transaction-receipt-v3"
+PREVIOUS_RECEIPT_SCHEMA = "a1-promotion-transaction-receipt-v2"
 LEGACY_RECEIPT_SCHEMA = "a1-promotion-transaction-receipt-v1"
+COHORT_EXCLUSIONS_SCHEMA = "a1-promotion-cohort-exclusions-v1"
 EVIDENCE_SCHEMA = "a1-promotion-evidence-v1"
 HIGH_REGRET_SCHEMA = "a1-high-regret-comparison-v1"
 BUCKET_VETO_SCHEMA = "a1-bucket-veto-v1"
@@ -3254,6 +3256,218 @@ def _verify_promotion_evidence(
     return value
 
 
+def _contiguous_seed_intervals(
+    seeds: set[int], *, kind: str, where: str
+) -> list[dict[str, Any]]:
+    if not seeds:
+        raise PromotionError(f"{where} has no explicit game seeds")
+    ordered = sorted(seeds)
+    intervals: list[dict[str, Any]] = []
+    start = previous = ordered[0]
+    for seed in ordered[1:]:
+        if seed == previous + 1:
+            previous = seed
+            continue
+        intervals.append({"kind": kind, "base_seed": start, "end_seed": previous + 1})
+        start = previous = seed
+    intervals.append({"kind": kind, "base_seed": start, "end_seed": previous + 1})
+    return intervals
+
+
+def _explicit_game_seeds(payload: dict[str, Any], *, where: str) -> set[int]:
+    games = payload.get("games")
+    if not isinstance(games, list) or not games:
+        raise PromotionError(f"{where} has no retained games for cohort isolation")
+    seeds: set[int] = set()
+    for index, game in enumerate(games):
+        if not isinstance(game, dict):
+            raise PromotionError(f"{where}.games[{index}] is not an object")
+        seed = game.get("game_seed")
+        if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
+            raise PromotionError(
+                f"{where}.games[{index}] has no non-negative integer game_seed; "
+                "promotion cohorts must retain exact seed identity"
+            )
+        seeds.add(seed)
+    return seeds
+
+
+def _promotion_cohort_intervals(
+    evidence_path: Path, evidence: dict[str, Any], *, kind: str
+) -> list[dict[str, Any]]:
+    """Recover the selection-sensitive final cohort from verified raw evidence."""
+    sources = {
+        str(item["role"]): _absolute(item["path"], base=evidence_path.parent)
+        for item in evidence["sources"]
+    }
+    if kind == "internal_h2h":
+        payload = _load_json(sources["internal_h2h"])
+        return _contiguous_seed_intervals(
+            _explicit_game_seeds(payload, where="internal H2H"),
+            kind=kind,
+            where="internal H2H",
+        )
+    if kind == "external_panel":
+        candidate_payload = _load_json(sources["candidate_panel"])
+        champion_payload = _load_json(sources["champion_panel"])
+        candidate_seeds = _explicit_game_seeds(
+            candidate_payload, where="candidate external panel"
+        )
+        champion_seeds = _explicit_game_seeds(
+            champion_payload, where="champion external panel"
+        )
+        if candidate_seeds != champion_seeds:
+            raise PromotionError(
+                "candidate and champion external panels have different game-seed cohorts"
+            )
+        return _contiguous_seed_intervals(
+            candidate_seeds,
+            kind=kind,
+            where="external panel",
+        )
+    return []
+
+
+def _seed_interval(
+    raw: Any, *, where: str, kind: str | None = None
+) -> dict[str, Any]:
+    value = _require_exact_keys(
+        raw, {"base_seed", "end_seed"}, where=where
+    )
+    base_seed = value["base_seed"]
+    end_seed = value["end_seed"]
+    if (
+        isinstance(base_seed, bool)
+        or not isinstance(base_seed, int)
+        or base_seed < 0
+        or isinstance(end_seed, bool)
+        or not isinstance(end_seed, int)
+        or end_seed <= base_seed
+    ):
+        raise PromotionError(f"{where} must be a non-empty non-negative half-open range")
+    result: dict[str, Any] = {"base_seed": base_seed, "end_seed": end_seed}
+    if kind is not None:
+        result["kind"] = kind
+    return result
+
+
+def _verify_cohort_exclusions(
+    path: Path,
+    *,
+    contract_sha256: str,
+    candidate_sha256: str,
+    final_intervals: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Bind prior selection cohorts and prove the final cohort is fresh."""
+    value = _require_exact_keys(
+        _load_json(path),
+        {
+            "schema_version",
+            "contract_sha256",
+            "candidate_sha256",
+            "cohorts",
+            "manifest_sha256",
+        },
+        where="promotion cohort-exclusions manifest",
+    )
+    if value["schema_version"] != COHORT_EXCLUSIONS_SCHEMA:
+        raise PromotionError(
+            f"cohort-exclusions schema must be {COHORT_EXCLUSIONS_SCHEMA!r}"
+        )
+    declared = _validate_sha256(
+        value["manifest_sha256"], where="cohort exclusions.manifest_sha256"
+    )
+    unhashed = dict(value)
+    unhashed.pop("manifest_sha256")
+    if declared != _digest_value(unhashed):
+        raise PromotionError("cohort-exclusions semantic digest mismatch")
+    if value["contract_sha256"] != contract_sha256:
+        raise PromotionError("cohort exclusions bind a different A1 contract")
+    if value["candidate_sha256"] != candidate_sha256:
+        raise PromotionError("cohort exclusions bind a different candidate")
+    cohorts = value["cohorts"]
+    if not isinstance(cohorts, list) or not cohorts:
+        raise PromotionError(
+            "cohort exclusions must bind at least one prior diagnostic/adjudication cohort"
+        )
+    excluded: list[dict[str, Any]] = []
+    labels: set[str] = set()
+    bound_sources: list[dict[str, str]] = []
+    for index, raw in enumerate(cohorts):
+        cohort = _require_exact_keys(
+            raw,
+            {"label", "kind", "source", "seed_intervals"},
+            where=f"cohort exclusions.cohorts[{index}]",
+        )
+        label = cohort["label"]
+        kind = cohort["kind"]
+        if (
+            not isinstance(label, str)
+            or not label.strip()
+            or label in labels
+            or not isinstance(kind, str)
+            or not kind.strip()
+        ):
+            raise PromotionError("cohort exclusion label/kind is invalid or duplicated")
+        labels.add(label)
+        _source_path, source_ref = _validate_file_ref(
+            cohort["source"],
+            base=path.parent,
+            where=f"cohort exclusions.cohorts[{index}].source",
+        )
+        bound_sources.append({"label": label, **source_ref})
+        intervals = cohort["seed_intervals"]
+        if not isinstance(intervals, list) or not intervals:
+            raise PromotionError(
+                f"cohort exclusions.cohorts[{index}].seed_intervals must be non-empty"
+            )
+        for interval_index, interval in enumerate(intervals):
+            excluded.append(
+                {
+                    "label": label,
+                    **_seed_interval(
+                        interval,
+                        where=(
+                            f"cohort exclusions.cohorts[{index}]."
+                            f"seed_intervals[{interval_index}]"
+                        ),
+                        kind=kind,
+                    ),
+                }
+            )
+    overlaps: list[dict[str, Any]] = []
+    for final in final_intervals:
+        for prior in excluded:
+            overlap_start = max(final["base_seed"], prior["base_seed"])
+            overlap_end = min(final["end_seed"], prior["end_seed"])
+            if overlap_start < overlap_end:
+                overlaps.append(
+                    {
+                        "final_kind": final["kind"],
+                        "prior_kind": prior["kind"],
+                        "prior_label": prior["label"],
+                        "base_seed": overlap_start,
+                        "end_seed": overlap_end,
+                    }
+                )
+    if overlaps:
+        raise PromotionError(
+            "final promotion cohort overlaps a prior diagnostic/adjudication cohort: "
+            f"{overlaps[:5]}"
+        )
+    return {
+        "manifest": {
+            "path": str(path.resolve()),
+            "sha256": _sha256(path),
+            "manifest_sha256": declared,
+        },
+        "bound_sources": bound_sources,
+        "excluded_seed_intervals": excluded,
+        "final_seed_intervals": final_intervals,
+        "overlap_count": 0,
+    }
+
+
 def _verify_adjudication(
     path: Path,
     *,
@@ -3453,6 +3667,7 @@ def _verify_adjudication(
     if not isinstance(evidence, list):
         raise PromotionError("adjudication.evidence must be a list")
     evidence_by_kind: dict[str, dict[str, Any]] = {}
+    final_cohort_intervals: list[dict[str, Any]] = []
     for index, record in enumerate(evidence):
         item = _require_exact_keys(
             record, {"kind", "path", "sha256"}, where=f"evidence[{index}]"
@@ -3465,7 +3680,7 @@ def _verify_adjudication(
             base=base,
             where=f"evidence[{index}]",
         )
-        _verify_promotion_evidence(
+        evidence_value = _verify_promotion_evidence(
             evidence_path,
             kind=kind,
             contract=contract,
@@ -3474,6 +3689,11 @@ def _verify_adjudication(
             ),
             candidate=candidate_binding,
             champion=champion_binding,
+        )
+        final_cohort_intervals.extend(
+            _promotion_cohort_intervals(
+                evidence_path, evidence_value, kind=kind
+            )
         )
         evidence_by_kind[kind] = {"kind": kind, **verified}
     missing_evidence = REQUIRED_EVIDENCE_KINDS - set(evidence_by_kind)
@@ -3503,6 +3723,7 @@ def _verify_adjudication(
         "adjudication_sha256": declared_digest,
         "next_promotion_count": next_count,
         "nth_confirmation_required": nth_required,
+        "final_cohort_intervals": final_cohort_intervals,
     }
 
 
@@ -3583,6 +3804,7 @@ def prepare_promotion(
     contract_lock: Path,
     adjudication_path: Path,
     training_receipt: Path,
+    cohort_exclusions: Path,
     receipt_path: Path,
     reason: str,
     legacy_contract_attestation: Path | None = None,
@@ -3600,6 +3822,9 @@ def prepare_promotion(
     )
     training_receipt = _canonical_existing_file(
         training_receipt, where="A1 one-dose training receipt"
+    )
+    cohort_exclusions = _canonical_existing_file(
+        cohort_exclusions, where="promotion cohort-exclusions manifest"
     )
     receipt_path = _canonical_new_file(receipt_path, where="promotion receipt")
     if registry_path.stat().st_size == 0:
@@ -3621,6 +3846,12 @@ def prepare_promotion(
         registry=registry,
         current_pointer=current_pointer,
         legacy_snapshot=legacy_snapshot,
+    )
+    cohort_disjointness = _verify_cohort_exclusions(
+        cohort_exclusions,
+        contract_sha256=contract["contract_sha256"],
+        candidate_sha256=verified["candidate"]["sha256"],
+        final_intervals=verified["final_cohort_intervals"],
     )
     registry_before = registry_path.read_bytes()
     current_before = current_pointer.read_bytes()
@@ -3670,6 +3901,7 @@ def prepare_promotion(
             "adjudication_sha256": verified["adjudication_sha256"],
         },
         "training_receipt": verified["training_receipt"],
+        "promotion_cohort_disjointness": cohort_disjointness,
         "candidate": verified["candidate"],
         "champion": verified["champion"],
         "evidence": verified["evidence"],
@@ -3703,6 +3935,7 @@ def execute_promotion(
     contract_lock: Path,
     adjudication_path: Path,
     training_receipt: Path,
+    cohort_exclusions: Path,
     receipt_path: Path,
     reason: str,
     legacy_contract_attestation: Path | None = None,
@@ -3723,6 +3956,9 @@ def execute_promotion(
     training_receipt = _canonical_existing_file(
         training_receipt, where="A1 one-dose training receipt"
     )
+    cohort_exclusions = _canonical_existing_file(
+        cohort_exclusions, where="promotion cohort-exclusions manifest"
+    )
     if legacy_contract_attestation is not None:
         legacy_contract_attestation = _canonical_existing_file(
             legacy_contract_attestation, where="legacy contract attestation"
@@ -3736,6 +3972,7 @@ def execute_promotion(
             contract_lock=contract_lock,
             adjudication_path=adjudication_path,
             training_receipt=training_receipt,
+            cohort_exclusions=cohort_exclusions,
             receipt_path=receipt_path,
             reason=reason,
             legacy_contract_attestation=legacy_contract_attestation,
@@ -3815,10 +4052,14 @@ def _load_recovery_receipt(
     receipt_path = _canonical_existing_file(receipt_path, where="promotion receipt")
     receipt = _verify_receipt_digest(_load_json(receipt_path))
     receipt_schema = receipt.get("schema_version")
-    if receipt_schema not in {RECEIPT_SCHEMA, LEGACY_RECEIPT_SCHEMA}:
+    if receipt_schema not in {
+        RECEIPT_SCHEMA,
+        PREVIOUS_RECEIPT_SCHEMA,
+        LEGACY_RECEIPT_SCHEMA,
+    }:
         raise PromotionError(
-            f"receipt schema must be {RECEIPT_SCHEMA!r} or legacy "
-            f"{LEGACY_RECEIPT_SCHEMA!r}"
+            f"receipt schema must be {RECEIPT_SCHEMA!r}, previous "
+            f"{PREVIOUS_RECEIPT_SCHEMA!r}, or legacy {LEGACY_RECEIPT_SCHEMA!r}"
         )
     status = receipt.get("status")
     if status not in {"prepared", "committed", "rollback_failed"}:
@@ -3843,8 +4084,10 @@ def _load_recovery_receipt(
         "lock_path",
         "receipt_sha256",
     }
-    if receipt_schema == RECEIPT_SCHEMA:
+    if receipt_schema in {RECEIPT_SCHEMA, PREVIOUS_RECEIPT_SCHEMA}:
         base_keys.add("training_receipt")
+    if receipt_schema == RECEIPT_SCHEMA:
+        base_keys.add("promotion_cohort_disjointness")
     status_keys = {
         "prepared": set(),
         "committed": {"committed_at"},
@@ -4000,6 +4243,7 @@ def build_parser() -> argparse.ArgumentParser:
     promote.add_argument("--contract-lock", required=True, type=Path)
     promote.add_argument("--adjudication", required=True, type=Path)
     promote.add_argument("--training-receipt", required=True, type=Path)
+    promote.add_argument("--cohort-exclusions", required=True, type=Path)
     promote.add_argument("--legacy-contract-attestation", type=Path, default=None)
     promote.add_argument("--receipt", required=True, type=Path)
     promote.add_argument("--reason", required=True)
@@ -4027,6 +4271,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 contract_lock=args.contract_lock,
                 adjudication_path=args.adjudication,
                 training_receipt=args.training_receipt,
+                cohort_exclusions=args.cohort_exclusions,
                 legacy_contract_attestation=args.legacy_contract_attestation,
                 receipt_path=args.receipt,
                 reason=args.reason,
