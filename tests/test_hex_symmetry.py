@@ -263,6 +263,82 @@ def test_event_action_zero_relabels_when_masked_present(sym, real_entity):
     )
 
 
+def test_event_spatial_targets_relabel_with_the_same_symmetry(sym, real_entity):
+    """Event topology must follow the rotated event action/history."""
+
+    entity = {key: np.array(value, copy=True) for key, value in real_entity.items()}
+    row = entity["event_target_ids"].shape[1] - 1
+    entity["event_mask"][0, row] = True
+    entity["event_target_ids"][0, row] = (3, 7, 11, 1)
+    g = 1
+
+    out = sym.permute_entity_batch(entity, g, relabel_events=True)
+
+    assert out["event_target_ids"][0, row].tolist() == [
+        int(sym.fwd_hex[g, 3]),
+        int(sym.fwd_vertex[g, 7]),
+        int(sym.fwd_edge[g, 11]),
+        1,
+    ]
+
+
+def test_event_relation_graph_points_to_rotated_target(sym, real_entity):
+    """The relational trunk must not connect a rotated event to the old node."""
+
+    import torch
+
+    from catan_zero.rl.relational_trunks import (
+        REL_EVENT_TO_TARGET,
+        build_relation_ids,
+    )
+
+    entity = {key: np.array(value, copy=True) for key, value in real_entity.items()}
+    event_row = entity["event_target_ids"].shape[1] - 1
+    old_vertex = 7
+    entity["event_mask"][0, event_row] = True
+    entity["event_target_ids"][0, event_row] = (-1, old_vertex, -1, -1)
+    g = next(
+        index
+        for index in range(N_SYMMETRIES)
+        if int(sym.fwd_vertex[index, old_vertex]) != old_vertex
+    )
+    out = sym.permute_entity_batch(entity, g, relabel_events=True)
+    tensor_batch = {
+        key: torch.as_tensor(value)
+        for key, value in out.items()
+        if key in {
+            "hex_vertex_ids",
+            "hex_edge_ids",
+            "edge_vertex_ids",
+            "event_target_ids",
+        }
+    }
+    sequence_length = 151 + int(entity["event_target_ids"].shape[1])
+    relations = build_relation_ids(tensor_batch, sequence_length=sequence_length)
+    event_token = 151 + event_row
+    new_vertex_token = 20 + int(sym.fwd_vertex[g, old_vertex])
+    old_vertex_token = 20 + old_vertex
+
+    assert int(relations[0, event_token, new_vertex_token]) == REL_EVENT_TO_TARGET
+    assert int(relations[0, event_token, old_vertex_token]) != REL_EVENT_TO_TARGET
+
+
+def test_disabling_event_relabel_leaves_action_and_targets_untouched(sym, real_entity):
+    entity = {key: np.array(value, copy=True) for key, value in real_entity.items()}
+    row = entity["event_target_ids"].shape[1] - 1
+    entity["event_mask"][0, row] = True
+    entity["event_tokens"][0, row, 35] = 0.0
+    entity["event_target_ids"][0, row] = (3, 7, 11, 1)
+    g = next(index for index in range(N_SYMMETRIES) if sym.pi_act[index, 0] != 0)
+
+    out = sym.permute_entity_batch(entity, g, relabel_events=False)
+
+    assert out["event_tokens"][0, row, 35] == entity["event_tokens"][0, row, 35]
+    assert np.array_equal(
+        out["event_target_ids"][0, row], entity["event_target_ids"][0, row]
+    )
+
+
 def test_intrinsic_features_are_a_pure_permutation(sym, real_entity):
     """Vertex/edge token rows are only reordered (multiset preserved); hex rows
     likewise except the slot-fixed coordinate is restored to canonical."""
@@ -296,7 +372,8 @@ def test_round_trip_inverse(sym, real_entity):
         once = sym.permute_entity_batch(real_entity, g)
         back = sym.permute_entity_batch(once, inv_g)
         for key in ("vertex_tokens", "edge_tokens", "hex_tokens",
-                    "hex_vertex_ids", "edge_vertex_ids", "legal_action_target_ids"):
+                    "hex_vertex_ids", "edge_vertex_ids", "legal_action_target_ids",
+                    "event_target_ids"):
             assert np.array_equal(back[key], real_entity[key]), (g, key)
 
 

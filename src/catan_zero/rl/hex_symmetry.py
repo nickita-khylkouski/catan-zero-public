@@ -263,6 +263,25 @@ class HexSymmetry:
             ev_tok[:, :, _EVENT_ACTION_ID_DIM] = new_scaled.astype(ev_tok.dtype)
             out["event_tokens"] = ev_tok
 
+            # Relational trunks consume the event's explicit board target as a
+            # directed event<->entity edge.  Relabelling only the scalar action
+            # id above leaves that edge attached to the pre-symmetry hex/node/
+            # edge and therefore describes a different history.  Event targets
+            # use the same four-column convention as legal-action targets:
+            # (hex, vertex, edge, player).  Player identity is not spatial.
+            if "event_target_ids" in entity:
+                event_targets = np.asarray(entity["event_target_ids"]).copy()
+                event_targets[:, :, 0] = self._remap_values(
+                    event_targets[:, :, 0], fwd_hex
+                )
+                event_targets[:, :, 1] = self._remap_values(
+                    event_targets[:, :, 1], fwd_vertex
+                )
+                event_targets[:, :, 2] = self._remap_values(
+                    event_targets[:, :, 2], fwd_edge
+                )
+                out["event_target_ids"] = event_targets
+
         return out
 
     def orientations_entity(
