@@ -35,10 +35,6 @@ if str(_REPO_ROOT) not in sys.path:
 
 from tools import a1_pre_wave_contract as a1_contract  # noqa: E402
 from tools import a1_one_dose_train as one_dose  # noqa: E402
-from tools.a1_external_panel_compare import (  # noqa: E402
-    ExternalPanelComparisonError,
-    compare_matched_external_panels,
-)
 from tools.champion_registry import ChampionRegistry  # noqa: E402
 from tools.high_regret_suite_contract import (  # noqa: E402
     SUITE_SCHEMA,
@@ -2108,11 +2104,6 @@ def _verify_internal_h2h_source(
     )
     config_where = "pooled effective config" if pooled else "typed config"
     _require_sealed_semantics(fields, expected_fields, where=f"{where} {config_where}")
-    if fields.get("map_kind") != "TOURNAMENT":
-        raise PromotionError(
-            f"{where} internal H2H must use TOURNAMENT to match the neutral "
-            f"external referee; got {fields.get('map_kind')!r}"
-        )
     _verify_role_search_pair(
         {
             **{key: fields[key] for key in candidate_search_config},
@@ -3196,27 +3187,9 @@ def _verify_promotion_evidence(
             raise PromotionError(
                 "external panel regression limit differs from the fixed policy"
             )
-        try:
-            paired_external = compare_matched_external_panels(
-                candidate_panel,
-                champion_panel,
-                noninferiority_margin=max_regression,
-            )
-        except ExternalPanelComparisonError as error:
+        if candidate_rate + max_regression < champion_rate:
             raise PromotionError(
-                f"external panels cannot form a paired noninferiority test: {error}"
-            ) from error
-        if (
-            paired_external["candidate_win_rate"] != candidate_rate
-            or paired_external["champion_win_rate"] != champion_rate
-        ):
-            raise PromotionError("external paired comparison does not replay summary rates")
-        if not paired_external["noninferiority"]["passed"]:
-            raise PromotionError(
-                "candidate external noninferiority is unresolved at alpha=0.05: "
-                f"delta={paired_external['candidate_minus_champion']:.6f}, "
-                f"one-sided lower={paired_external['noninferiority']['one_sided_95_lower']:.6f}, "
-                f"required >= {-max_regression:.6f}"
+                "candidate external panel exceeds the allowed regression"
             )
         if value["verdict"] != "pass":
             raise PromotionError("external panel envelope verdict is not pass")

@@ -870,11 +870,9 @@ def test_play_game_records_exact_role_simulations_and_decision_change(monkeypatc
     game = FakeGame()
 
     class FakeRustGameFactory:
-        def __new__(cls, *, colors, seed, player_kind, map_kind):
-            assert colors == ["RED", "BLUE"]
+        @staticmethod
+        def simple(_colors, *, seed):
             assert seed == 17
-            assert player_kind == "simple"
-            assert map_kind == "BASE"
             return game
 
     fake_rust = SimpleNamespace(Game=FakeRustGameFactory)

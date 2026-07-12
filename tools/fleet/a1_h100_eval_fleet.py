@@ -59,7 +59,6 @@ SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 SAFE_ADDRESS = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.:-]*$")
 
 SCIENCE_CONFIG: dict[str, Any] = {
-    "map_kind": "TOURNAMENT",
     "n_full": 128,
     "c_scale": 0.03,
     "c_visit": 50.0,
@@ -473,8 +472,6 @@ def _internal_argv(
         "1",
         "--device",
         "cuda",
-        "--map-kind",
-        str(SCIENCE_CONFIG["map_kind"]),
         *_science_args(
             c_scale=(
                 0.03

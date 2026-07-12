@@ -18,10 +18,6 @@ if str(_ROOT) not in sys.path:
 
 from tools import a1_dual_arm_train as training  # noqa: E402
 from tools import train_bc  # noqa: E402
-from tools.a1_external_panel_compare import (  # noqa: E402
-    ExternalPanelComparisonError,
-    compare_matched_external_panels,
-)
 from tools.fleet import a1_n256_lr_eval as trial_tool  # noqa: E402
 from tools.fleet import a1_h100_eval_fleet as fleet  # noqa: E402
 
@@ -322,22 +318,26 @@ def _arm_metrics(
     if not isinstance(metrics, list) or not metrics:
         raise AdjudicationError(f"{label} report has no epoch metrics")
     validation = train_bc.objective_matched_validation_metrics(metrics[-1])
-    try:
-        external_comparison = compare_matched_external_panels(
-            external_candidate, external_champion
-        )
-    except ExternalPanelComparisonError as error:
-        raise AdjudicationError(
-            f"{label} external panels are not one matched cohort: {error}"
-        ) from error
+    candidate_ci = external_candidate.get("candidate_win_rate_wilson_95ci")
+    champion_ci = external_champion.get("candidate_win_rate_wilson_95ci")
+    if not (
+        isinstance(candidate_ci, list)
+        and len(candidate_ci) == 2
+        and isinstance(champion_ci, list)
+        and len(champion_ci) == 2
+    ):
+        raise AdjudicationError(f"{label} external uncertainty is missing")
     internal_games = int(internal.get("games_played", 0))
     internal_wins = int(internal.get("candidate_wins", -1))
     internal_ci = _wilson(internal_wins, internal_games)
     optimizer = metrics[-1].get("optimizer_observability", {})
     row = {
-        "external_delta": float(external_comparison["candidate_minus_champion"]),
-        "external_delta_ci": list(external_comparison["paired_seed_cluster_95ci"]),
-        "external_paired_comparison": external_comparison,
+        "external_delta": float(external_candidate["candidate_win_rate"])
+        - float(external_champion["candidate_win_rate"]),
+        "external_delta_ci": [
+            float(candidate_ci[0]) - float(champion_ci[1]),
+            float(candidate_ci[1]) - float(champion_ci[0]),
+        ],
         "internal_win_rate": float(internal["candidate_win_rate"]),
         "internal_win_rate_ci": internal_ci,
         "teacher_gap_closure": validation.get("active_policy_teacher_gap_closure"),

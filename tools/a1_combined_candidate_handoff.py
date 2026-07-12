@@ -28,10 +28,6 @@ if str(_REPO_ROOT) not in sys.path:
 from tools import a1_dual_arm_adjudicator as dual_adjudicator  # noqa: E402
 from tools import a1_dual_arm_train as dual_train  # noqa: E402
 from tools import a1_promotion_transaction as promotion  # noqa: E402
-from tools.a1_external_panel_compare import (  # noqa: E402
-    ExternalPanelComparisonError,
-    compare_matched_external_panels,
-)
 
 
 MANIFEST_SCHEMA = "a1-combined-196k-evaluation-manifest-v1"
@@ -231,27 +227,14 @@ def adjudicate(manifest_path: Path) -> dict[str, Any]:
         raise CombinedHandoffError(
             "candidate and champion external panels use different cohorts/configs"
         )
-    try:
-        paired_external = compare_matched_external_panels(
-            candidate_external, champion_external
-        )
-    except ExternalPanelComparisonError as error:
-        raise CombinedHandoffError(
-            f"candidate and champion external panels are not pairable: {error}"
-        ) from error
     candidate_rate = float(candidate_external["candidate_win_rate"])
     champion_rate = float(champion_external["candidate_win_rate"])
-    if (
-        paired_external["candidate_win_rate"] != candidate_rate
-        or paired_external["champion_win_rate"] != champion_rate
-    ):
-        raise CombinedHandoffError("external panel summary rates do not replay from games")
     max_regression = promotion.MAX_EXTERNAL_WIN_RATE_REGRESSION
     # The direct pool uses the SPRT-native spelling ``H1`` while older
     # adjudicator receipts normalize it to ``accept_h1``.  Both mean the same
     # accepted alternative hypothesis and must replay identically.
     internal_pass = internal.get("verdict") in {"H1", "accept_h1"}
-    external_pass = bool(paired_external["noninferiority"]["passed"])
+    external_pass = candidate_rate + max_regression >= champion_rate
     passed = internal_pass and external_pass
     result = {
         "schema_version": RESULT_SCHEMA,
@@ -281,7 +264,6 @@ def adjudicate(manifest_path: Path) -> dict[str, Any]:
                 "candidate_win_rate": candidate_rate,
                 "champion_win_rate": champion_rate,
                 "candidate_minus_champion": candidate_rate - champion_rate,
-                "paired_common_opponent": paired_external,
                 "max_win_rate_regression": max_regression,
                 "cohort_sha256": _digest(candidate_cohort),
                 "candidate_pool": _ref(

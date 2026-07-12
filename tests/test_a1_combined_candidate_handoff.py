@@ -77,20 +77,8 @@ def _install_replays(
 
     def replay_external(path: Path, *, candidate: Path) -> dict:
         is_candidate = path.name.startswith("candidate.")
-        rate = candidate_rate if is_candidate else champion_rate
-        games = [
-            {
-                "game_seed": 10 + index // 2,
-                "orientation": (
-                    "candidate_first" if index % 2 == 0 else "candidate_second"
-                ),
-                "candidate_won": index < int(rate * 1_000),
-            }
-            for index in range(1_000)
-        ]
         return {
-            "candidate_win_rate": rate,
-            "games": games,
+            "candidate_win_rate": candidate_rate if is_candidate else champion_rate,
             "effective_search_config": {"n_full": 128, "c_scale": 0.03},
             "fleet_merge": {
                 "seed_intervals": (
