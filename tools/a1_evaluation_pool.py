@@ -15,6 +15,7 @@ import argparse
 import copy
 import hashlib
 import json
+import math
 import sys
 from pathlib import Path
 from typing import Any, Sequence
@@ -25,6 +26,11 @@ if str(_REPO_ROOT) not in sys.path:
 
 from tools import a1_promotion_artifacts as artifacts  # noqa: E402
 from tools import a1_promotion_transaction as promotion  # noqa: E402
+from tools.gumbel_search_cross_net_h2h import (  # noqa: E402
+    _add_search_telemetry,
+    _finalize_search_telemetry,
+    _new_search_telemetry,
+)
 from tools.sprt_gate import (  # noqa: E402
     evaluate_pentanomial_sprt,
     evaluate_sprt,
@@ -237,6 +243,54 @@ def _source_refs(paths: Sequence[Path]) -> list[dict[str, str]]:
     ]
 
 
+def _pool_internal_search_telemetry(
+    reports: Sequence[tuple[Path, dict[str, Any]]],
+) -> dict[str, Any]:
+    """Reconstruct additive H2H search telemetry across every fleet shard.
+
+    Individual H2H reports contain finalized rates as well as the additive
+    counters from which those rates were derived.  Copying the first report's
+    finalized object into the pool makes a many-shard cohort look like one
+    shard.  Retain only the exact additive fields, sum them, and derive rates
+    once from the fleet totals.
+    """
+
+    totals = _new_search_telemetry()
+    additive_fields = tuple(next(iter(totals.values())).keys())
+    for path, report in reports:
+        telemetry = report.get("search_telemetry")
+        by_role = telemetry.get("by_role") if isinstance(telemetry, dict) else None
+        if not isinstance(by_role, dict):
+            raise PoolError(f"{path} has no finalized search_telemetry.by_role")
+        raw: dict[str, dict[str, float | int]] = {}
+        for role in ("candidate", "baseline"):
+            values = by_role.get(role)
+            if not isinstance(values, dict):
+                raise PoolError(f"{path} has no search telemetry for role {role!r}")
+            raw[role] = {}
+            for field in additive_fields:
+                value = values.get(field)
+                if isinstance(value, bool) or not isinstance(value, (int, float)):
+                    raise PoolError(
+                        f"{path} search telemetry {role}.{field} is not numeric"
+                    )
+                numeric = float(value)
+                if not math.isfinite(numeric) or numeric < 0.0:
+                    raise PoolError(
+                        f"{path} search telemetry {role}.{field} is invalid"
+                    )
+                raw[role][field] = value
+            if int(raw[role]["non_forced_search_calls"]) > int(
+                raw[role]["search_calls"]
+            ):
+                raise PoolError(
+                    f"{path} search telemetry {role} has more non-forced than "
+                    "total calls"
+                )
+        _add_search_telemetry(totals, raw)
+    return _finalize_search_telemetry(totals)
+
+
 def pool_internal(
     paths: Sequence[Path], *, candidate: Path, champion: Path
 ) -> dict[str, Any]:
@@ -280,6 +334,7 @@ def pool_internal(
             raise PoolError(f"{path} gate statistics do not replay")
     intervals = _contiguous_intervals(loaded)
     games = _validate_and_normalize_games(loaded, kind="internal")
+    search_telemetry = _pool_internal_search_telemetry(loaded)
     outcomes = [bool(game["candidate_won"]) for game in games]
     pair_scores, diagnostics = _pair_diagnostics(games)
     concordant = []
@@ -328,6 +383,7 @@ def pool_internal(
                 float(report.get("elapsed_sec", 0.0)) for _, report in loaded
             ),
             "workers": sum(int(report.get("workers", 0)) for _, report in loaded),
+            "search_telemetry": search_telemetry,
             "errors": [],
             "games": games,
             "fleet_merge": {

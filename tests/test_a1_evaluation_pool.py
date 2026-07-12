@@ -99,7 +99,27 @@ def _internal_report(candidate: Path, champion: Path, seed: int) -> dict:
         "elapsed_sec": 10.0,
         "workers": 1,
         "threads_per_worker": 1,
-        "search_telemetry": {},
+        "search_telemetry": {
+            "by_role": {
+                role: {
+                    "search_calls": 10,
+                    "non_forced_search_calls": 8,
+                    "search_elapsed_sec": 2.0,
+                    "simulations_used": 1_280,
+                    "wide_root_calls": 2,
+                    "wide_root_simulations_used": 256,
+                    "selected_vs_prior_disagreement_calls": 3,
+                    "wide_selected_vs_prior_disagreement_calls": 1,
+                    # Derived fields must be ignored and recomputed by pooling.
+                    "search_seconds_per_call": 0.2,
+                    "simulations_per_call": 128.0,
+                    "wide_root_simulations_per_call": 128.0,
+                    "selected_vs_prior_disagreement_rate": 0.375,
+                    "wide_selected_vs_prior_disagreement_rate": 0.5,
+                }
+                for role in ("candidate", "baseline")
+            }
+        },
         "errors": [],
         "games": games,
     }
@@ -194,6 +214,13 @@ def test_internal_pool_reindexes_local_pair_ids_and_recomputes_gate(
     assert "typed_config" not in result
     assert "config_hash" not in result
     assert result["effective_search_config"]["mode"] == "cross_net"
+    assert result["search_telemetry"]["by_role"]["candidate"]["search_calls"] == 20
+    assert (
+        result["search_telemetry"]["by_role"]["candidate"][
+            "selected_vs_prior_disagreement_rate"
+        ]
+        == 0.375
+    )
     assert [row["base_seed"] for row in result["fleet_merge"]["seed_intervals"]] == [
         9001,
         9002,
@@ -240,6 +267,25 @@ def test_internal_pool_refuses_forged_shard_statistics(tmp_path: Path) -> None:
     report["pentanomial_sprt"]["llr"] = 999.0
     _write(path, report)
     with pytest.raises(pool.PoolError, match="statistics do not replay"):
+        pool.pool_internal([path], candidate=candidate, champion=champion)
+
+
+def test_internal_pool_refuses_missing_or_invalid_search_telemetry(
+    tmp_path: Path,
+) -> None:
+    candidate = _checkpoint(tmp_path, "candidate.pt")
+    champion = _checkpoint(tmp_path, "champion.pt")
+    path = tmp_path / "missing-telemetry.json"
+    report = _internal_report(candidate, champion, 9001)
+    report.pop("search_telemetry")
+    _write(path, report)
+    with pytest.raises(pool.PoolError, match="search_telemetry.by_role"):
+        pool.pool_internal([path], candidate=candidate, champion=champion)
+
+    report = _internal_report(candidate, champion, 9001)
+    report["search_telemetry"]["by_role"]["candidate"]["search_calls"] = -1
+    _write(path, report)
+    with pytest.raises(pool.PoolError, match="candidate.search_calls is invalid"):
         pool.pool_internal([path], candidate=candidate, champion=champion)
 
 
