@@ -1,4 +1,10 @@
-# Phase-2 Window Feed — design notes (task #94)
+# Phase-2 Window Feed — historical design notes (task #94)
+
+> Historical/noncanonical: this document describes the experimental
+> `continuous_flywheel.py` prototype. Current A1 production uses the sealed,
+> separated generation, one-dose training, evidence, and promotion transactions
+> in `RL_AGENT_HANDOFF.md`. Do not use the batch/topology values below as current
+> production defaults.
 
 2026-07-07, ml-czar v2. Companion to the implementation in tools/flywheel_feed_daemon.py,
 tools/continuous_flywheel.py (ingest_feed_batches / build_round_corpus / --max-ckpt-lag),

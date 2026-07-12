@@ -73,6 +73,13 @@ boundaries. They remain deliberately separate: postflight evidence must be
 accepted before training, and gate/veto evidence must be accepted before
 promotion.
 
+`tools/continuous_flywheel.py` is a retained experimental prototype, not an A1
+production entry point. It has no production caller, still carries unresolved
+continuous hot-reload/opponent-pool/incremental-build gaps, and fails closed for
+real execution unless its explicit noncanonical acknowledgement flag is passed.
+Do not infer learner hardware defaults from it. The sealed production learner
+topology belongs to `tools/a1_one_dose_train.py`.
+
 ## 4. Source-of-truth order
 
 Use each source for its declared scope:

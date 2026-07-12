@@ -271,6 +271,7 @@ GOLDEN_OPTION_STRINGS = {
         ("--winner-sample-weight",),
     },
     "continuous_flywheel": {
+        ("--allow-noncanonical-experimental-loop",),
         ("--anchor-corpus",),
         ("--anchor-drift-alert-threshold",),
         ("--anchor-eval-every-rounds",),

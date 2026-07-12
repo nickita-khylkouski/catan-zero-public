@@ -453,7 +453,7 @@ Orphaned multiprocessing workers survive parent kills (clear via GPU-process lis
 | `build_memmap_corpus.py` | npz→memmap, duplicate-seed detection, path-sorted manifests | |
 | `gumbel_search_cross_net_h2h.py` | THE promotion gate (paired pentanomial SPRT, per-pair isolation, progress files, provenance) | |
 | `gumbel_search_vs_bot_h2h.py` | external panel vs catanatron bots (cross-engine lockstep) | |
-| `continuous_flywheel.py` | the loop: generate → ingest → train → gate → promote; journaled rounds | |
+| `continuous_flywheel.py` | historical experimental prototype (noncanonical); current A1 uses separate sealed generation, one-dose training, evidence, and promotion transactions | |
 | `flywheel_feed_daemon.py` | fleet→window ingestion (md5 champion contract, dedup, quarantine, val-range enforcement) | |
 | `sprt_gate.py` | pentanomial GSPRT math (Van den Bergh/fishtest port, verified) | |
 | catanatron_rs (Rust crate) | engine: corrected rules, batched chance spectra, featurizers, 0.1.2/0.1.3 wheels | |

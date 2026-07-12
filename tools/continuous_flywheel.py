@@ -1,4 +1,19 @@
-"""Continuous KataGo-hybrid flywheel orchestrator (Step 7, the continuous regime).
+"""Experimental legacy continuous-flywheel prototype; not a production entry point.
+
+The canonical A1 loop is intentionally split across the sealed production
+executor, one-dose learner, evidence builders, and promotion transaction (see
+``RL_AGENT_HANDOFF.md``). This module has no production caller and retains
+unresolved H1/H2/T4 integration gaps described below. Real execution therefore
+fails closed unless an operator explicitly acknowledges the noncanonical path
+with ``--allow-noncanonical-experimental-loop``. ``--dry-run`` remains available
+for unit and control-flow tests without that acknowledgement.
+
+Do not tune this prototype's historical hardware defaults and mistake that for
+changing the production learner. A1 learner topology is sealed by
+``tools/a1_one_dose_train.py``; production generation is sealed by
+``tools/fleet/a1_production_executor.py``.
+
+Continuous KataGo-hybrid flywheel orchestrator (Step 7, the continuous regime).
 
 Continuous counterpart to ``tools/selfplay_loop.py`` (the DISCRETE generational baseline). Same
 external scripts (generate / build_memmap / train / gate), different data-flow:
@@ -89,6 +104,9 @@ from tools.sprt_gate import (  # noqa: E402
     r9_timeout_verdict,
     resolve_gate_config,
 )
+
+
+NONCANONICAL_ACK_FLAG = "--allow-noncanonical-experimental-loop"
 
 # Round-seed stride: each round's game_seed block starts here*round, disjoint across rounds so
 # game_seed = base + game_index never collides between rounds (the seed-collision bug class).
@@ -989,7 +1007,15 @@ def build_parser() -> argparse.ArgumentParser:
         default="scalar",
         help="Incumbent search value source in the H2H promotion gate.",
     )
-    p.add_argument("--batch-size", type=int, default=65536, help="MUST match train_bc --batch-size")
+    p.add_argument(
+        "--batch-size",
+        type=int,
+        default=65536,
+        help=(
+            "Historical prototype batch size; MUST match train_bc --batch-size. "
+            "This is not an A1 production learner default."
+        ),
+    )
     p.add_argument("--games-per-round", type=int, default=2000)
     p.add_argument("--workers", type=int, default=8)
     p.add_argument("--device", default="cuda")
@@ -1032,6 +1058,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--evict-grace-seconds", type=float, default=0.0,
                    help="defer deletion until a shard has been out-of-window this long (async safety)")
     p.add_argument("--dry-run", action="store_true", help="stub gen/train/gate; exercise control flow only")
+    p.add_argument(
+        NONCANONICAL_ACK_FLAG,
+        action="store_true",
+        help=(
+            "Acknowledge that this legacy prototype is not the canonical A1 "
+            "production loop and permit a real (non-dry-run) execution."
+        ),
+    )
     p.add_argument(
         "--anchor-corpus", dest="anchor_corpora", action="append", default=[],
         help="Name of an anchor corpus (built by tools/build_anchor_corpus.py, lives at "
@@ -1103,6 +1137,20 @@ def _build_guard_specs(
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    if not args.dry_run and not args.allow_noncanonical_experimental_loop:
+        print(
+            "[flywheel] ERROR: tools/continuous_flywheel.py is a noncanonical "
+            "experimental prototype with unresolved integration gaps. Use "
+            "tools/fleet/a1_production_executor.py for generation, "
+            "tools/a1_one_dose_train.py for training, and "
+            "tools/a1_promotion_transaction.py for promotion. If you are "
+            "deliberately testing this legacy path, pass "
+            f"{NONCANONICAL_ACK_FLAG}.",
+            file=sys.stderr,
+            flush=True,
+        )
+        return 2
 
     loop_dir = Path(args.loop_dir)
     loop_dir.mkdir(parents=True, exist_ok=True)
@@ -1202,7 +1250,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         rec["generate"] = gen
         if not gen.get("ok"):
             rec["decision"] = "abort_generation"
-            journal["rounds"].append(rec); save_journal(loop_dir, journal)
+            journal["rounds"].append(rec)
+            save_journal(loop_dir, journal)
             print(f"[round {round_idx}] generation failed — stopping.", flush=True)
             return 1
 
@@ -1244,7 +1293,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         rec["train"] = tr
         if not tr.get("ok"):
             rec["decision"] = "abort_train"
-            window.save(); journal["rounds"].append(rec); save_journal(loop_dir, journal)
+            window.save()
+            journal["rounds"].append(rec)
+            save_journal(loop_dir, journal)
             return 1
         # actual rows consumed by the trainer this round (steps*batch), not the window size.
         journal["total_rows_trained"] = journal.get("total_rows_trained", 0) + int(tr["steps"]) * cfg.train_batch_size
