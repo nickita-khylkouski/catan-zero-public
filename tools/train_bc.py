@@ -976,6 +976,15 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--require-only-trainable-prefixes",
+        default="",
+        help=(
+            "Fail closed unless every trainable --arch entity_graph parameter is "
+            "under one of these comma-separated exact module prefixes. This is a "
+            "production architecture-warmup guard, not a freezing mechanism."
+        ),
+    )
+    parser.add_argument(
         "--train-value-only",
         action="store_true",
         help=(
@@ -5014,6 +5023,22 @@ def main(argv: Sequence[str] | None = None) -> None:
                 ),
                 ddp,
             )
+        trainable_prefixes = _parse_prefixes(args.require_only_trainable_prefixes)
+        if trainable_prefixes:
+            trainable_surface = _require_only_trainable_prefixes(
+                policy.model, trainable_prefixes
+            )
+            training_information_surface = {
+                **(training_information_surface or {}),
+                "required_trainable_surface": trainable_surface,
+            }
+            _rank0_print(
+                json.dumps(
+                    {"progress": "required_trainable_surface", **trainable_surface},
+                    sort_keys=True,
+                ),
+                ddp,
+            )
         if bool(args.fsdp):
             # C1 minimal FSDP: FULL_SHARD across ranks, transformer blocks
             # auto-wrapped by module type. use_orig_params=True so
@@ -6782,6 +6807,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         "value_root_blend_audit": value_root_blend_audit,
         **effective_architecture,
         "freeze_modules": args.freeze_modules,
+        "require_only_trainable_prefixes": args.require_only_trainable_prefixes,
         "train_value_only": bool(args.train_value_only),
         "lr_warmup_steps": args.lr_warmup_steps,
         "lr_schedule": args.lr_schedule,
@@ -14460,6 +14486,52 @@ def _set_entity_graph_modules_trainable(
             for param in parameters:
                 param.requires_grad = bool(trainable)
     return touched
+
+
+def _require_only_trainable_prefixes(model, prefixes) -> dict[str, object]:
+    """Prove the optimizer surface is exactly inside reviewed module prefixes."""
+
+    module = getattr(model, "module", model)
+    normalized_prefixes = tuple(str(prefix).strip().rstrip(".") for prefix in prefixes)
+    if not normalized_prefixes or any(not prefix for prefix in normalized_prefixes):
+        raise SystemExit("--require-only-trainable-prefixes contains an empty prefix")
+    trainable: list[tuple[str, object]] = []
+    for raw_name, parameter in module.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        name = str(raw_name)
+        while name.startswith("_fsdp_wrapped_module."):
+            name = name[len("_fsdp_wrapped_module.") :]
+        trainable.append((name, parameter))
+    unexpected = [
+        name
+        for name, _ in trainable
+        if not any(name == prefix or name.startswith(prefix + ".") for prefix in normalized_prefixes)
+    ]
+    counts = {
+        prefix: sum(
+            int(parameter.numel())
+            for name, parameter in trainable
+            if name == prefix or name.startswith(prefix + ".")
+        )
+        for prefix in normalized_prefixes
+    }
+    if unexpected:
+        raise SystemExit(
+            "trainable parameter escaped --require-only-trainable-prefixes: "
+            + ", ".join(unexpected[:16])
+        )
+    missing = [prefix for prefix, count in counts.items() if count <= 0]
+    if missing or not trainable:
+        raise SystemExit(
+            "required trainable prefix has no parameters: " + ", ".join(missing)
+        )
+    return {
+        "prefixes": list(normalized_prefixes),
+        "parameter_tensors": len(trainable),
+        "parameters": sum(int(parameter.numel()) for _, parameter in trainable),
+        "parameters_by_prefix": counts,
+    }
 
 
 def _lr_warmup_multiplier(step: int, warmup_steps: int) -> float:
