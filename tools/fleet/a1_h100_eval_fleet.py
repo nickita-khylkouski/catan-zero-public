@@ -7,7 +7,7 @@ operation is gated by ``--go``.  A Ray cluster specification can be rendered
 for a later daemon-managed backend without installing or starting Ray.
 
 The unit of capacity is a physical GPU, never a host.  Six four-GPU hosts and
-four eight-GPU hosts therefore yield fifty-six equal evaluator lanes.  Internal H2H
+two eight-GPU hosts therefore yield forty equal evaluator lanes.  Internal H2H
 uses one shard per lane.  External candidate/incumbent panels pair adjacent
 lanes and assign both sides the exact same seed interval.
 """
@@ -51,8 +51,6 @@ EXPECTED_SHAPES = {
     "c6": 4,
     "h100-8a": 8,
     "h100-8b": 8,
-    "h100-8c": 8,
-    "h100-8d": 8,
 }
 CANARY_ALIASES = {"c1", "h100-8a"}
 DEFAULT_WORKERS_PER_GPU = 16
@@ -200,7 +198,7 @@ def load_manifest(path: Path) -> dict[str, Any]:
         raise FleetError("fleet manifest contains duplicate aliases")
     if actual != EXPECTED_SHAPES:
         raise FleetError(
-            "A1 eval requires exactly six 4xH100 and four 8xH100 hosts: "
+            "A1 eval requires exactly six 4xH100 and two 8xH100 hosts: "
             f"expected {EXPECTED_SHAPES}, got {actual}"
         )
     manifest["hosts"] = sorted(hosts, key=lambda item: item["alias"])

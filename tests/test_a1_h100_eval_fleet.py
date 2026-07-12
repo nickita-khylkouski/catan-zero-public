@@ -115,14 +115,14 @@ def _plan(tmp_path: Path) -> tuple[dict, dict]:
     return manifest, plan
 
 
-def test_manifest_requires_exact_six_four_and_four_eight_gpu_hosts(
+def test_manifest_requires_exact_approved_six_four_and_two_eight_gpu_hosts(
     tmp_path: Path,
 ) -> None:
     path = _manifest_file(tmp_path)
     value = json.loads(path.read_text())
     value["hosts"][-1]["gpu_count"] = 4
     path.write_text(json.dumps(value))
-    with pytest.raises(fleet.FleetError, match="exactly six 4xH100 and four 8xH100"):
+    with pytest.raises(fleet.FleetError, match="exactly six 4xH100 and two 8xH100"):
         fleet.load_manifest(path)
 
 
@@ -131,15 +131,15 @@ def test_internal_plan_weights_by_physical_gpu_and_conserves_seed_interval(
 ) -> None:
     _manifest, plan = _plan(tmp_path)
     jobs = [job for job in plan["jobs"] if job["phase"] == "internal"]
-    assert len(jobs) == 56
+    assert len(jobs) == 40
     assert sum(job["pairs"] for job in jobs) == 600
-    assert {job["pairs"] for job in jobs} == {10, 11}
+    assert {job["pairs"] for job in jobs} == {15}
     by_host = {
         alias: sum(job["pairs"] for job in jobs if job["alias"] == alias)
         for alias in fleet.EXPECTED_SHAPES
     }
-    assert by_host["c1"] == 44
-    assert by_host["h100-8a"] == 88
+    assert by_host["c1"] == 60
+    assert by_host["h100-8a"] == 120
     intervals = sorted(
         (job["base_seed"], job["base_seed"] + job["pairs"]) for job in jobs
     )
@@ -151,15 +151,15 @@ def test_internal_plan_weights_by_physical_gpu_and_conserves_seed_interval(
 def test_external_plan_uses_matched_candidate_champion_cohorts(tmp_path: Path) -> None:
     _manifest, plan = _plan(tmp_path)
     jobs = [job for job in plan["jobs"] if job["phase"] == "external"]
-    assert len(jobs) == 56
+    assert len(jobs) == 40
     cohorts: dict[str, list[dict]] = {}
     for job in jobs:
         cohorts.setdefault(job["cohort_id"], []).append(job)
-    assert len(cohorts) == 28
+    assert len(cohorts) == 20
     for cohort in cohorts.values():
         assert {job["role"] for job in cohort} == {"candidate", "champion"}
         assert len({(job["base_seed"], job["pairs"]) for job in cohort}) == 1
-        assert {job["pairs"] for job in cohort} in ({17}, {18})
+        assert {job["pairs"] for job in cohort} == {25}
         assert len({job["slot_id"] for job in cohort}) == 2
     by_role = {
         role: sorted(
@@ -246,7 +246,7 @@ def test_every_job_is_cuda_pinned_and_has_exact_n128_infoset_d6_recipe(
                 argv[argv.index("--max-player-trade-offers-per-turn") + 1] == "0"
             )
     rendered = fleet.dry_run_commands(manifest, plan, "internal")
-    assert len(rendered["hosts"]) == 10
+    assert len(rendered["hosts"]) == 8
     all_shell = "\n".join(row["ssh_command"][-1] for row in rendered["hosts"])
     for gpu in range(8):
         assert f"CUDA_VISIBLE_DEVICES={gpu}" in all_shell
@@ -516,11 +516,11 @@ def test_resume_selects_only_missing_failed_or_stale_jobs(tmp_path: Path) -> Non
     assert sum(row["jobs"] for row in rendered["hosts"]) == len(selected)
 
 
-def test_ray_spec_advertises_no_b200_gpu_and_all_56_h100_slots(tmp_path: Path) -> None:
+def test_ray_spec_advertises_no_b200_gpu_and_all_40_h100_slots(tmp_path: Path) -> None:
     manifest, plan = _plan(tmp_path)
     spec = fleet.ray_cluster_spec(manifest, plan)
     assert spec["head"]["num_gpus"] == 0
-    assert sum(worker["num_gpus"] for worker in spec["workers"]) == 56
+    assert sum(worker["num_gpus"] for worker in spec["workers"]) == 40
     assert spec["scheduler_contract"]["actor_resources"] == {
         "num_gpus": 1,
         "resources": {"H100": 1},
