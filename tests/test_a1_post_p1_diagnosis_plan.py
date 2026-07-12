@@ -26,11 +26,13 @@ def test_architecture_arm_is_single_delta_over_head_only() -> None:
     assert gather["recipe_delta"]["freeze_modules"] == "trunk"
     assert head["recipe_delta"]["action_module_lr_mult"] == 1.0
     assert gather["recipe_delta"]["action_module_lr_mult"] == 1.0
+    assert head["recipe_delta"]["trunk_lr_mult"] == 1.0
+    assert gather["recipe_delta"]["trunk_lr_mult"] == 1.0
     assert head["recipe_delta"]["checkpoint_upgrade"] == "none"
     assert "gather,cross:1" in gather["recipe_delta"]["checkpoint_upgrade"]
     assert plan["fixed_recipe"]["aux_subgoal_heads"] is False
     assert plan["fixed_recipe"]["value_target_lambda"] == 1.0
-    assert "not implemented" in plan["historical_feature_audit"]["trunk_lr_multiplier"]
+    assert "implemented" in plan["historical_feature_audit"]["trunk_lr_multiplier"]
     assert "f7 default OFF" in plan["historical_feature_audit"]["action_target_gather"]
 
 

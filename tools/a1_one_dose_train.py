@@ -881,6 +881,8 @@ def build_train_command(
             str(recipe["value_lr_mult"]),
             "--action-module-lr-mult",
             str(recipe["action_module_lr_mult"]),
+            "--trunk-lr-mult",
+            str(recipe.get("trunk_lr_mult", 1.0)),
             "--policy-loss-weight",
             str(recipe["policy_loss_weight"]),
             "--soft-target-source",

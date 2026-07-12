@@ -524,6 +524,18 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--trunk-lr-mult",
+        type=float,
+        default=1.0,
+        help=(
+            "LR multiplier for the canonical EntityGraphNet trunk modules. 1.0 "
+            "preserves the historical single optimizer group exactly. A non-unit "
+            "value is supported only with --arch entity_graph and fails closed if "
+            "the named trunk is absent or has no trainable parameters. Use "
+            "--freeze-modules trunk for a true freeze rather than LR 0."
+        ),
+    )
+    parser.add_argument(
         "--weight-decay",
         type=float,
         default=0.0,
@@ -3233,6 +3245,7 @@ def _effective_a1_learner_training_recipe(
         "fused_optimizer",
         "value_lr_mult",
         "action_module_lr_mult",
+        "trunk_lr_mult",
         "policy_loss_weight",
         "soft_target_source",
         "soft_target_weight",
@@ -4165,6 +4178,11 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "value_uncertainty_head submodule to split into its own param group), "
                 "not --arch candidate"
             )
+        if float(args.trunk_lr_mult) != 1.0:
+            raise SystemExit(
+                "--trunk-lr-mult is supported only for --arch entity_graph, not "
+                "--arch candidate"
+            )
         params = []
         for name in ("model", "actor", "action_encoder", "action_id_embedding", "action_bias"):
             module = getattr(policy, name, None)
@@ -4388,13 +4406,28 @@ def main(argv: Sequence[str] | None = None) -> None:
                 find_unused_parameters=bool(args.ddp_find_unused_parameters),
             )
         policy.model.train()
-        optimizer = _make_optimizer(
-            _build_optimizer_param_groups(
-                policy.model,
-                base_lr=float(args.lr),
-                value_lr_mult=float(args.value_lr_mult),
-                action_module_lr_mult=float(args.action_module_lr_mult),
+        optimizer_params = _build_optimizer_param_groups(
+            policy.model,
+            base_lr=float(args.lr),
+            value_lr_mult=float(args.value_lr_mult),
+            action_module_lr_mult=float(args.action_module_lr_mult),
+            trunk_lr_mult=float(args.trunk_lr_mult),
+            architecture=str(args.arch),
+        )
+        _rank0_print(
+            json.dumps(
+                {
+                    "progress": "optimizer_param_groups",
+                    "groups": _optimizer_param_group_report(
+                        optimizer_params, base_lr=float(args.lr)
+                    ),
+                },
+                sort_keys=True,
             ),
+            ddp,
+        )
+        optimizer = _make_optimizer(
+            optimizer_params,
             args,
             getattr(policy, "device", args.device),
         )
@@ -5545,6 +5578,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         "policy_loss_weight": args.policy_loss_weight,
         "value_loss_weight": args.value_loss_weight,
         "action_module_lr_mult": args.action_module_lr_mult,
+        "trunk_lr_mult": args.trunk_lr_mult,
         "resolved_scalar_value_loss_weight": resolved_scalar_value_weight,
         "truncated_vp_margin_value_weight": float(args.truncated_vp_margin_value_weight),
         "final_vp_loss_weight": args.final_vp_loss_weight,
@@ -11798,16 +11832,46 @@ ACTION_LOCAL_MODULE_ATTRS: tuple[str, ...] = (
 )
 
 
+def _optimizer_param_group_report(params, *, base_lr: float) -> list[dict[str, object]]:
+    """Describe optimizer groups without mutating the objects passed to torch.
+
+    ``_group_name`` is private construction metadata and is stripped by
+    ``_make_optimizer`` before optimizer/checkpoint state is created.
+    """
+    param_groups = list(params)
+    if not param_groups or not isinstance(param_groups[0], dict):
+        tensors = [p for p in param_groups if p.requires_grad]
+        return [
+            {
+                "group": "historical_flat",
+                "lr": float(base_lr),
+                "parameter_tensors": len(tensors),
+                "parameters": sum(int(p.numel()) for p in tensors),
+            }
+        ]
+    return [
+        {
+            "group": str(group.get("_group_name", "unnamed")),
+            "lr": float(group["lr"]),
+            "parameter_tensors": len(group["params"]),
+            "parameters": sum(int(p.numel()) for p in group["params"]),
+        }
+        for group in param_groups
+    ]
+
+
 def _build_optimizer_param_groups(
     model,
     *,
     base_lr: float,
     value_lr_mult: float,
     action_module_lr_mult: float = 1.0,
+    trunk_lr_mult: float = 1.0,
+    architecture: str | None = None,
 ):
     """Return the optimizer's ``params`` argument for ``model``'s trainable parameters.
 
-    Both multipliers at 1.0 return a FLAT list of parameters -- exactly the
+    All multipliers at 1.0 return a FLAT list of parameters -- exactly the
     historical single-implicit-group optimizer. Non-unit multipliers split the
     corresponding named modules into independent groups; every other trainable
     parameter stays in a base group at ``base_lr``. Each group dict carries its
@@ -11817,13 +11881,24 @@ def _build_optimizer_param_groups(
     """
     module = getattr(model, "module", model)
     trainable = [p for p in module.parameters() if p.requires_grad]
-    if float(value_lr_mult) <= 0.0 or float(action_module_lr_mult) <= 0.0:
+    multipliers = {
+        "value-lr-mult": float(value_lr_mult),
+        "action-module-lr-mult": float(action_module_lr_mult),
+        "trunk-lr-mult": float(trunk_lr_mult),
+    }
+    if any(not math.isfinite(value) or value <= 0.0 for value in multipliers.values()):
         raise SystemExit(
-            "--value-lr-mult and --action-module-lr-mult must both be > 0; "
+            "--value-lr-mult, --action-module-lr-mult, and --trunk-lr-mult "
+            "must all be > 0; "
             "freeze modules explicitly instead of encoding a freeze as LR 0"
         )
-    if float(value_lr_mult) == 1.0 and float(action_module_lr_mult) == 1.0:
+    if all(value == 1.0 for value in multipliers.values()):
         return trainable
+    if float(trunk_lr_mult) != 1.0 and architecture != "entity_graph":
+        raise SystemExit(
+            "--trunk-lr-mult != 1.0 is supported only for --arch entity_graph; "
+            f"received architecture={architecture!r}"
+        )
 
     def _params_under(attrs: tuple[str, ...]) -> list:
         params: list = []
@@ -11831,7 +11906,12 @@ def _build_optimizer_param_groups(
             submodule = getattr(module, attr_name, None)
             if submodule is None:
                 continue
-            params.extend(p for p in submodule.parameters() if p.requires_grad)
+            parameters = (
+                submodule.parameters()
+                if hasattr(submodule, "parameters")
+                else (submodule,)
+            )
+            params.extend(p for p in parameters if p.requires_grad)
         return params
 
     value_params = (
@@ -11844,6 +11924,11 @@ def _build_optimizer_param_groups(
         if float(action_module_lr_mult) != 1.0
         else []
     )
+    trunk_params = (
+        _params_under(ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS["trunk"])
+        if float(trunk_lr_mult) != 1.0
+        else []
+    )
     if float(value_lr_mult) != 1.0 and not value_params:
         raise SystemExit(
             "--value-lr-mult != 1.0 but the model has no trainable parameters under "
@@ -11854,25 +11939,71 @@ def _build_optimizer_param_groups(
             "--action-module-lr-mult != 1.0 but the model has no trainable "
             f"parameters under any of {ACTION_LOCAL_MODULE_ATTRS}"
         )
+    if float(trunk_lr_mult) != 1.0 and not trunk_params:
+        raise SystemExit(
+            "--trunk-lr-mult != 1.0 but the entity-graph model has no trainable "
+            "parameters under the canonical trunk module group"
+        )
     value_param_ids = {id(p) for p in value_params}
     action_param_ids = {id(p) for p in action_params}
-    overlap = value_param_ids & action_param_ids
-    if overlap:
-        raise RuntimeError("optimizer value/action parameter groups overlap")
-    grouped_ids = value_param_ids | action_param_ids
+    trunk_param_ids = {id(p) for p in trunk_params}
+    pairwise_overlaps = {
+        "value/action": value_param_ids & action_param_ids,
+        "value/trunk": value_param_ids & trunk_param_ids,
+        "action/trunk": action_param_ids & trunk_param_ids,
+    }
+    overlapping = {name: ids for name, ids in pairwise_overlaps.items() if ids}
+    if overlapping:
+        raise RuntimeError(
+            "optimizer parameter groups overlap: "
+            + ", ".join(f"{name}={len(ids)}" for name, ids in overlapping.items())
+        )
+    grouped_ids = value_param_ids | action_param_ids | trunk_param_ids
     base_params = [p for p in trainable if id(p) not in grouped_ids]
     groups = [
-        {"params": base_params, "lr": float(base_lr), "base_lr": float(base_lr)}
+        {
+            "params": base_params,
+            "lr": float(base_lr),
+            "base_lr": float(base_lr),
+            "_group_name": "base",
+        }
     ]
     if value_params:
         value_lr = float(base_lr) * float(value_lr_mult)
         groups.append(
-            {"params": value_params, "lr": value_lr, "base_lr": value_lr}
+            {
+                "params": value_params,
+                "lr": value_lr,
+                "base_lr": value_lr,
+                "_group_name": "value",
+            }
         )
     if action_params:
         action_lr = float(base_lr) * float(action_module_lr_mult)
         groups.append(
-            {"params": action_params, "lr": action_lr, "base_lr": action_lr}
+            {
+                "params": action_params,
+                "lr": action_lr,
+                "base_lr": action_lr,
+                "_group_name": "action_local",
+            }
+        )
+    if trunk_params:
+        trunk_lr = float(base_lr) * float(trunk_lr_mult)
+        groups.append(
+            {
+                "params": trunk_params,
+                "lr": trunk_lr,
+                "base_lr": trunk_lr,
+                "_group_name": "trunk",
+            }
+        )
+    assigned = [id(p) for group in groups for p in group["params"]]
+    trainable_ids = [id(p) for p in trainable]
+    if len(assigned) != len(set(assigned)) or set(assigned) != set(trainable_ids):
+        raise RuntimeError(
+            "optimizer parameter grouping did not assign every trainable parameter "
+            "exactly once"
         )
     return groups
 
@@ -11886,7 +12017,10 @@ def _make_optimizer(params, args, device):
         # `_build_optimizer_param_groups`), each carrying its own "lr". Drop any
         # non-trainable stragglers per group (mirrors the flat-list branch below).
         trainable_params = [
-            {**group, "params": [p for p in group["params"] if p.requires_grad]}
+            {
+                **{key: value for key, value in group.items() if key != "_group_name"},
+                "params": [p for p in group["params"] if p.requires_grad],
+            }
             for group in param_groups
         ]
         if not any(group["params"] for group in trainable_params):

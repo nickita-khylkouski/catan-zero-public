@@ -58,6 +58,7 @@ def test_weight_decay_and_optimizer_defaults_unchanged() -> None:
     assert parser.get_default("weight_decay") == pytest.approx(0.0)
     assert parser.get_default("resume_optimizer") is True
     assert parser.get_default("action_module_lr_mult") == pytest.approx(1.0)
+    assert parser.get_default("trunk_lr_mult") == pytest.approx(1.0)
 
 
 def test_policy_surprise_weight_defaults_off() -> None:

@@ -5,6 +5,7 @@ from dataclasses import replace
 
 from tools.train_bc import (
     ACTION_LOCAL_MODULE_ATTRS,
+    ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS,
     VALUE_HEAD_MODULE_ATTRS,
     _apply_lr_schedule,
     _build_optimizer_param_groups,
@@ -161,6 +162,130 @@ def test_action_module_lr_multiplier_fails_without_action_local_modules() -> Non
             value_lr_mult=1.0,
             action_module_lr_mult=0.3,
         )
+
+
+def test_trunk_lr_multiplier_changes_only_canonical_entity_graph_trunk() -> None:
+    policy = _make_entity_policy(categorical_bins=9, action_local=True)
+    groups = _build_optimizer_param_groups(
+        policy.model,
+        base_lr=2e-4,
+        value_lr_mult=0.3,
+        action_module_lr_mult=0.2,
+        trunk_lr_mult=0.1,
+        architecture="entity_graph",
+    )
+
+    by_name = {group["_group_name"]: group for group in groups}
+    assert set(by_name) == {"base", "value", "action_local", "trunk"}
+    assert by_name["base"]["lr"] == pytest.approx(2e-4)
+    assert by_name["value"]["lr"] == pytest.approx(2e-4 * 0.3)
+    assert by_name["action_local"]["lr"] == pytest.approx(2e-4 * 0.2)
+    assert by_name["trunk"]["lr"] == pytest.approx(2e-4 * 0.1)
+
+    direct_trunk_ids = {
+        id(parameter)
+        for attr_name in ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS["trunk"]
+        for submodule in [getattr(policy.model, attr_name, None)]
+        if submodule is not None
+        for parameter in (
+            submodule.parameters()
+            if hasattr(submodule, "parameters")
+            else (submodule,)
+        )
+        if parameter.requires_grad
+    }
+    assert {id(p) for p in by_name["trunk"]["params"]} == direct_trunk_ids
+
+    assigned = [id(p) for group in groups for p in group["params"]]
+    expected = [id(p) for p in policy.model.parameters() if p.requires_grad]
+    assert len(assigned) == len(set(assigned))
+    assert set(assigned) == set(expected)
+
+
+def test_trunk_lr_multiplier_fails_closed_for_unsupported_architecture() -> None:
+    policy = _make_entity_policy()
+    with pytest.raises(SystemExit, match="only for --arch entity_graph"):
+        _build_optimizer_param_groups(
+            policy.model,
+            base_lr=2e-4,
+            value_lr_mult=1.0,
+            trunk_lr_mult=0.3,
+            architecture="xdim_graph",
+        )
+
+
+def test_trunk_lr_multiplier_fails_when_trunk_was_frozen() -> None:
+    policy = _make_entity_policy()
+    for attr_name in ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS["trunk"]:
+        submodule = getattr(policy.model, attr_name, None)
+        if submodule is None:
+            continue
+        parameters = (
+            submodule.parameters()
+            if hasattr(submodule, "parameters")
+            else (submodule,)
+        )
+        for parameter in parameters:
+            parameter.requires_grad = False
+    with pytest.raises(SystemExit, match="no trainable parameters"):
+        _build_optimizer_param_groups(
+            policy.model,
+            base_lr=2e-4,
+            value_lr_mult=1.0,
+            trunk_lr_mult=0.3,
+            architecture="entity_graph",
+        )
+
+
+def test_grouped_optimizer_state_restores_only_into_matching_group_topology(
+    tmp_path,
+) -> None:
+    import torch
+
+    from catan_zero.rl.optim_state import load_optimizer_state, save_optimizer_state
+
+    checkpoint = tmp_path / "model.pt"
+    checkpoint.write_bytes(b"model identity placeholder")
+    policy = _make_entity_policy()
+    groups = _build_optimizer_param_groups(
+        policy.model,
+        base_lr=2e-4,
+        value_lr_mult=1.0,
+        trunk_lr_mult=0.3,
+        architecture="entity_graph",
+    )
+    optimizer = _make_optimizer(groups, _Args(), "cpu")
+    for parameter in policy.model.parameters():
+        if parameter.requires_grad:
+            parameter.grad = torch.ones_like(parameter)
+    optimizer.step()
+    assert save_optimizer_state(checkpoint, policy.model, optimizer, {"rank": 0})
+
+    matching = _make_optimizer(
+        _build_optimizer_param_groups(
+            policy.model,
+            base_lr=2e-4,
+            value_lr_mult=1.0,
+            trunk_lr_mult=0.3,
+            architecture="entity_graph",
+        ),
+        _Args(),
+        "cpu",
+    )
+    assert load_optimizer_state(checkpoint, policy.model, matching, {"rank": 0})
+    assert matching.state
+
+    historical_flat = _make_optimizer(
+        _build_optimizer_param_groups(
+            policy.model, base_lr=2e-4, value_lr_mult=1.0
+        ),
+        _Args(),
+        "cpu",
+    )
+    assert not load_optimizer_state(
+        checkpoint, policy.model, historical_flat, {"rank": 0}
+    )
+    assert not historical_flat.state
 
 
 def test_mult_of_one_param_list_is_identical_order_and_identity_to_pre_cat12_construction() -> (

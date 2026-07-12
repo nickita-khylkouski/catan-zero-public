@@ -142,6 +142,7 @@ EXPECTED_LEARNER_TRAINING_RECIPE: dict[str, Any] = {
     "fused_optimizer": False,
     "value_lr_mult": 0.3,
     "action_module_lr_mult": 1.0,
+    "trunk_lr_mult": 1.0,
     "policy_loss_weight": 1.0,
     "soft_target_source": "policy",
     "soft_target_weight": 0.9,

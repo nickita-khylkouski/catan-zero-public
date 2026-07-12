@@ -264,6 +264,7 @@ class TrainConfig(PipelineConfig):
     value_uncertainty_head: bool = False
     value_lr_mult: float = 1.0
     action_module_lr_mult: float = 1.0
+    trunk_lr_mult: float = 1.0
     value_head_type: str = "mse"
     # ``None`` is the raw argparse/default sentinel. train_bc resolves it to the
     # effective fresh/checkpoint/grow integer before constructing a live config;

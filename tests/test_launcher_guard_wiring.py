@@ -248,6 +248,7 @@ GOLDEN_OPTION_STRINGS = {
         ("--track",),
         ("--train-diagnostics-every-batches",),
         ("--train-value-only",),
+        ("--trunk-lr-mult",),
         ("--truncated-vp-margin-value-weight",),
         ("--trust-curated-data-quality",),
         ("--validation-fraction",),

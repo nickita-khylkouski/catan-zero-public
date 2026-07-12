@@ -41,6 +41,7 @@ def _base_recipe() -> dict[str, Any]:
         # protected-trunk recipe.  Architecture probes bind their own explicit
         # multiplier only after those modules exist.
         "action_module_lr_mult": 1.0,
+        "trunk_lr_mult": 1.0,
         "amp": "bf16",
         "forced_row_value_weight": 1.0,
         "grad_accum_steps": 1,

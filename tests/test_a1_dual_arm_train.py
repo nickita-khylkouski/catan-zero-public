@@ -42,6 +42,7 @@ def _verified(tmp_path: Path) -> dict:
         "resume_optimizer": False, "lr": 3e-5, "lr_warmup_steps": 100,
         "lr_schedule": "flat", "weight_decay": 0.0, "fused_optimizer": False,
         "value_lr_mult": 0.3, "action_module_lr_mult": 1.0,
+        "trunk_lr_mult": 1.0,
         "policy_loss_weight": 1.0, "soft_target_source": "policy",
         "soft_target_weight": 0.9, "soft_target_temperature": 0.7,
         "soft_target_min_legal_coverage": 0.5, "value_loss_weight": 0.25,

@@ -49,6 +49,7 @@ def build_plan(
         "lr": 3e-5,
         "lr_warmup_steps": 100,
         "lr_schedule": "flat",
+        "trunk_lr_mult": 1.0,
         "weight_decay": 0.0,
         "amp": "bf16",
         "policy_kl_anchor_weight": "inherit exact selected P1 value",
@@ -70,7 +71,7 @@ def build_plan(
         {
             "arm_id": "FULL_CONTROL",
             "training": "reuse selected P1 checkpoint and report; no new B200 run",
-            "recipe_delta": {"freeze_modules": ""},
+            "recipe_delta": {"freeze_modules": "", "trunk_lr_mult": 1.0},
             "purpose": "observed full-trunk optimization control",
         },
         {
@@ -78,6 +79,7 @@ def build_plan(
             "training": "new matched B200 run",
             "recipe_delta": {
                 "freeze_modules": "trunk",
+                "trunk_lr_mult": 1.0,
                 "checkpoint_upgrade": "none",
                 "action_module_lr_mult": 1.0,
             },
@@ -88,6 +90,7 @@ def build_plan(
             "training": "new matched B200 run",
             "recipe_delta": {
                 "freeze_modules": "trunk",
+                "trunk_lr_mult": 1.0,
                 "checkpoint_upgrade": "f69_upgrade_checkpoint_config.py --flags gather,cross:1",
                 "checkpoint_upgrade_forward_max_diff": 0.0,
                 "action_module_lr_mult": 1.0,
@@ -158,8 +161,9 @@ def build_plan(
         "fixed_recipe": fixed,
         "historical_feature_audit": {
             "trunk_lr_multiplier": (
-                "not implemented in train_bc; --freeze-modules trunk is the only "
-                "attributable protected-trunk diagnostic"
+                "implemented as --trunk-lr-mult for the exact canonical entity-graph "
+                "trunk; default 1.0 preserves historical grouping and non-unit use "
+                "fails closed on unsupported/empty trunks"
             ),
             "action_module_lr_multiplier": (
                 "implemented, but f7 has no gather/cross action-local parameters; "
