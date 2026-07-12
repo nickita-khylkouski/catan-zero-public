@@ -53,11 +53,11 @@ def test_anchor_sweep_is_single_variable_and_q_stays_disabled():
     assert stripped[0] == stripped[1] == stripped[2]
 
 
-def test_recovery_baseline_matches_successful_f7_recipe_without_double_game_weighting():
+def test_recovery_baseline_fixes_f7_outcome_bias_without_double_game_weighting():
     plan = build_plan(world_size=8, local_batch_size=1024, grad_accum_steps=1)
     recipe = plan["arms"][0]["recipe"]
     assert recipe["value_lr_mult"] == 0.3
-    assert recipe["loser_sample_weight"] == 0.3
+    assert recipe["loser_sample_weight"] == 1.0
     assert recipe["per_game_policy_weight"] is False
     assert recipe["per_game_value_weight"] is False
     assert recipe["per_game_policy_weight_mode"] == "equal"

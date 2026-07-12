@@ -1,5 +1,10 @@
 # Entity-Graph 35M B200 Teacher Training Plan
 
+> **Historical plan, not a current production recipe.** The retained
+> `loser_sample_weight=0.3` command records the old experiment exactly. Current
+> MCTS policy distillation uses `1.0` because eventual game loss does not
+> invalidate a searched policy target.
+
 Objective: replace the flat/chunked 35M BC model with a true Catan entity-token model, keep all current teacher data, convert it into typed tensors, and train on the 2x B200 box until the checkpoint is competitive with the strongest teachers before PPO.
 
 ## Current Decision

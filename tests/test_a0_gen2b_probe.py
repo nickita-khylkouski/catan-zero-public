@@ -20,6 +20,11 @@ _REPO = Path(__file__).resolve().parents[1]
 def _manifest() -> dict:
     return {
         "schema_version": probe.SCHEMA,
+        "diagnostic_only": True,
+        "promotion_eligible": False,
+        "obsolete_recipe_note": (
+            "Historical exact-replay probe: loser_sample_weight=0.3 is obsolete."
+        ),
         "experiment_id": "test",
         "inputs": {"expected_rows": 12},
         "historical_value_trace": [0.6, 0.8, 0.84],
@@ -106,6 +111,9 @@ def test_checked_in_manifest_resolves_and_both_full_commands_parse() -> None:
         )
     )
     probe._validate_manifest(manifest)
+    assert manifest["diagnostic_only"] is True
+    assert manifest["promotion_eligible"] is False
+    assert "Historical exact-replay" in manifest["obsolete_recipe_note"]
     report = {
         "samples": manifest["inputs"]["expected_rows"],
         "data": manifest["inputs"]["corpus_dir"],

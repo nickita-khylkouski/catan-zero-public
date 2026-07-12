@@ -1,5 +1,10 @@
 # Unfreeze-with-KL Value-Repair Recipe (contingency f67, D1)
 
+> **Historical diagnostic only.** Commands below preserve the old
+> `loser_sample_weight=0.3` experiment for exact replay. That outcome-conditioned
+> policy setting is obsolete and is not a production recommendation; current
+> MCTS distillation uses `1.0`.
+
 **Status:** LAND-READY contingency, PREP ONLY. Not launched. Runs on the f67
 branch's `tools/train_bc.py`. The team lead decides whether/when to launch based
 on the running H2H arm verdicts.

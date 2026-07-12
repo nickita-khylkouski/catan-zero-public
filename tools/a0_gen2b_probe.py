@@ -166,6 +166,18 @@ def _validate_manifest(manifest: Mapping[str, Any]) -> None:
         raise ContractError(
             f"manifest schema must be {SCHEMA!r}, got {manifest.get('schema_version')!r}"
         )
+    if (
+        manifest.get("diagnostic_only") is not True
+        or manifest.get("promotion_eligible") is not False
+    ):
+        raise ContractError(
+            "historical A0 loser-weight replay must declare "
+            "diagnostic_only=true and promotion_eligible=false"
+        )
+    if "loser_sample_weight=0.3" not in str(manifest.get("obsolete_recipe_note", "")):
+        raise ContractError(
+            "historical A0 manifest must label loser_sample_weight=0.3 obsolete"
+        )
     inputs = manifest.get("inputs")
     recipe = manifest.get("recipe")
     upgrade = manifest.get("upgrade")

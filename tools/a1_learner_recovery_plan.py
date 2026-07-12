@@ -46,10 +46,11 @@ def _base_recipe() -> dict[str, Any]:
         "forced_row_value_weight": 1.0,
         "grad_accum_steps": 1,
         "hlgauss_scalar_aux_loss_weight": 0.0,
-        # Match the successful f7 learner. The composite sampler already draws
-        # component -> uniform game -> uniform row, so a second per-game loss
-        # correction would over-weight short games.
-        "loser_sample_weight": 0.3,
+        # MCTS targets remain valid when later stochastic play loses the game.
+        # The historical f7 value (0.3) outcome-conditioned policy imitation
+        # and suppressed recovery trajectories; live recovery arms must retain
+        # unbiased winner/loser policy mass.
+        "loser_sample_weight": 1.0,
         "lr": 0.00003,
         "lr_schedule": "flat",
         "lr_warmup_steps": 100,

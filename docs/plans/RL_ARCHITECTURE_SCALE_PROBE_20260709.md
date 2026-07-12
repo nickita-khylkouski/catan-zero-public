@@ -1,5 +1,10 @@
 # RL architecture, value, and scale protocol — bounded B200 R&D
 
+> **Historical diagnostic recipe notice.** The `loser_sample_weight=0.3`
+> command retained below is obsolete outcome-conditioned policy distillation,
+> not a production default. Current production and live recovery arms use
+> `1.0`; replaying the old diagnostic requires explicit acknowledgement.
+
 Status: executable protocol with fail-closed prerequisites. It authorizes short
 B200 probes only. It does **not** authorize an H100 production wave or a full
 80–100M training campaign.

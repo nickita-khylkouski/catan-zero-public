@@ -1,5 +1,10 @@
 # 35M Teacher Training Plan
 
+> **Historical plan, not a current production recipe.** Its retained
+> `loser_sample_weight=0.3` commands document old runs. That setting was found to
+> suppress valid MCTS targets on losing trajectories; current production uses
+> `1.0`, and the trainer refuses an unacknowledged value below one.
+
 Date: 2026-06-28
 
 Formal goal-tool status:

@@ -1,5 +1,8 @@
 {
   "schema_version": "a0-gen2b-probe-manifest-v1",
+  "diagnostic_only": true,
+  "promotion_eligible": false,
+  "obsolete_recipe_note": "Historical exact-replay probe: loser_sample_weight=0.3 outcome-conditions policy targets. Current production and recovery recipes require 1.0.",
   "experiment_id": "a0_gen2b_scalar_vs_hlgauss33",
   "inputs": {
     "corpus_dir": "runs/memmap_gen2_20260706",
