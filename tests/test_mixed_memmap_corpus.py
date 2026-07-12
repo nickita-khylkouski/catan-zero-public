@@ -135,6 +135,68 @@ def test_schema_mismatch_fails_closed():
         module.ConcatMemmapCorpus([_Corpus(0, 2), wrong])
 
 
+def test_known_optional_columns_are_synthesized_with_safe_semantics():
+    module = _module()
+    current = _Corpus(0, 2)
+    current._eager.update(
+        {
+            "legal_action_ids": np.asarray([[1, -1], [1, 2]], dtype=np.int16),
+            "policy_weight_multiplier": np.asarray([0.0, 1.0], dtype=np.float32),
+            "is_forced": np.asarray([True, False]),
+            "used_full_search": np.asarray([False, True]),
+            "root_value": np.asarray([0.2, 0.4], dtype=np.float32),
+            "root_value_mask": np.asarray([True, True]),
+        }
+    )
+    current._columns.update(
+        {
+            "legal_action_ids": {"kind": "fixed", "dtype": "int16", "inner_shape": [2]},
+            "policy_weight_multiplier": {"kind": "fixed", "dtype": "float32", "inner_shape": []},
+            "is_forced": {"kind": "fixed", "dtype": "bool", "inner_shape": []},
+            "used_full_search": {"kind": "fixed", "dtype": "bool", "inner_shape": []},
+            "root_value": {"kind": "fixed", "dtype": "float32", "inner_shape": []},
+            "root_value_mask": {"kind": "fixed", "dtype": "bool", "inner_shape": []},
+        }
+    )
+    old = _Corpus(2, 2)
+    old._eager.update(
+        {
+            "legal_action_ids": np.asarray([[3, -1], [3, 4]], dtype=np.int16),
+            "policy_weight_multiplier": np.asarray([0.0, 1.0], dtype=np.float32),
+        }
+    )
+    old._columns.update(
+        {
+            "legal_action_ids": {"kind": "fixed", "dtype": "int16", "inner_shape": [2]},
+            "policy_weight_multiplier": {"kind": "fixed", "dtype": "float32", "inner_shape": []},
+        }
+    )
+
+    mixed = module.ConcatMemmapCorpus([current, old])
+
+    assert np.array_equal(mixed["is_forced"][:], [True, False, True, False])
+    assert np.array_equal(mixed["used_full_search"][:], [False, True, False, True])
+    assert np.allclose(mixed["root_value"][:], [0.2, 0.4, 0.0, 0.0])
+    assert np.array_equal(mixed["root_value_mask"][:], [True, True, False, False])
+    assert mixed.synthesized_columns_by_component == {
+        1: ("is_forced", "root_value", "root_value_mask", "used_full_search")
+    }
+
+
+def test_unknown_missing_column_still_fails_closed():
+    module = _module()
+    left = _Corpus(0, 2)
+    right = _Corpus(2, 2)
+    left._eager["unknown_future_target"] = np.zeros(2, dtype=np.float32)
+    left._columns["unknown_future_target"] = {
+        "kind": "fixed",
+        "dtype": "float32",
+        "inner_shape": [],
+    }
+    with pytest.raises(SystemExit, match="unsupported missing columns"):
+        module.ConcatMemmapCorpus([left, right])
+
+
 def test_invalid_indices_match_numpy_fail_closed_behavior(composite):
     mixed, _, _ = composite
     with pytest.raises(IndexError):

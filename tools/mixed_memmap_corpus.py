@@ -16,6 +16,14 @@ from typing import Any, Sequence
 import numpy as np
 
 
+# These columns were added after the original gen3 corpus was converted. Their
+# absence has an exact, loss-safe interpretation that can be reconstructed from
+# older required columns. Any other schema gap remains a hard error.
+SYNTHESIZABLE_COLUMNS = frozenset(
+    {"is_forced", "used_full_search", "root_value", "root_value_mask"}
+)
+
+
 def _semantic_column_schema(schema: dict[str, Any]) -> tuple[Any, ...]:
     """Compatibility fields that affect the decoded NumPy column surface."""
     kind = schema.get("kind")
@@ -128,6 +136,60 @@ class _ConcatColumn:
         return array
 
 
+class _ConstantColumn:
+    """Lazy scalar column used for semantically absent optional targets."""
+
+    def __init__(self, row_count: int, value: Any, dtype: Any):
+        self._n = int(row_count)
+        self._value = value
+        self.shape = (self._n,)
+        self.ndim = 1
+        self.dtype = np.dtype(dtype)
+
+    def __len__(self) -> int:
+        return self._n
+
+    def __getitem__(self, index: Any):
+        indices, scalar = _normalize_global_index(index, self._n)
+        if scalar:
+            return np.asarray(self._value, dtype=self.dtype)
+        return np.full(indices.shape, self._value, dtype=self.dtype)
+
+
+class _DerivedBooleanColumn:
+    """Lazy boolean derived from an older corpus' required source column."""
+
+    def __init__(self, source: Any, *, mode: str):
+        self._source = source
+        self._mode = mode
+        self.shape = (int(source.shape[0]),)
+        self.ndim = 1
+        self.dtype = np.dtype(np.bool_)
+
+    def __len__(self) -> int:
+        return self.shape[0]
+
+    def __getitem__(self, index: Any):
+        source = np.asarray(self._source[index])
+        if self._mode == "is_forced":
+            return np.sum(source >= 0, axis=-1) == 1
+        if self._mode == "used_full_search":
+            return source > 0.0
+        raise AssertionError(self._mode)
+
+
+def _synthesized_column(corpus: Any, key: str):
+    if key == "is_forced":
+        return _DerivedBooleanColumn(corpus["legal_action_ids"], mode=key)
+    if key == "used_full_search":
+        return _DerivedBooleanColumn(corpus["policy_weight_multiplier"], mode=key)
+    if key == "root_value":
+        return _ConstantColumn(corpus.row_count, 0.0, np.float32)
+    if key == "root_value_mask":
+        return _ConstantColumn(corpus.row_count, False, np.bool_)
+    raise KeyError(key)
+
+
 # Historical phase-2 equivalence test name; every composite column uses the
 # same lazy global-index mapping, while `_lazy` identifies large payloads.
 _ConcatLazyColumn = _ConcatColumn
@@ -152,9 +214,17 @@ class ConcatMemmapCorpus:
             raise SystemExit("component directory count differs from corpus count")
 
         first = self.corpora[0]
-        first_keys = tuple(first.keys())
-        first_key_set = set(first_keys)
-        first_schemas = first._columns
+        component_key_sets = [set(corpus.keys()) for corpus in self.corpora]
+        union_keys = set.union(*component_key_sets)
+        common_keys = set.intersection(*component_key_sets)
+        missing_keys = union_keys - common_keys
+        unsupported_missing = missing_keys - SYNTHESIZABLE_COLUMNS
+        if unsupported_missing:
+            raise SystemExit(
+                "memmap components are not schema-compatible: unsupported missing "
+                f"columns {sorted(unsupported_missing)}"
+            )
+        first_keys = tuple(first.keys()) + tuple(sorted(union_keys - set(first.keys())))
         for index, corpus in enumerate(self.corpora[1:], start=1):
             if int(corpus.legal_width) != int(first.legal_width):
                 raise SystemExit(
@@ -162,14 +232,17 @@ class ConcatMemmapCorpus:
                     f"legal_width component0={first.legal_width} "
                     f"component{index}={corpus.legal_width}"
                 )
-            if set(corpus.keys()) != first_key_set:
-                raise SystemExit(
-                    "memmap components are not schema-compatible: column keys differ"
-                )
             for key in first_keys:
-                if _semantic_column_schema(
-                    corpus._columns[key]
-                ) != _semantic_column_schema(first_schemas[key]):
+                present_schemas = [
+                    part._columns[key]
+                    for part, keys in zip(self.corpora, component_key_sets, strict=True)
+                    if key in keys
+                ]
+                if any(
+                    _semantic_column_schema(schema)
+                    != _semantic_column_schema(present_schemas[0])
+                    for schema in present_schemas[1:]
+                ):
                     raise SystemExit(
                         "memmap components are not schema-compatible: "
                         f"column {key!r} differs"
@@ -192,15 +265,36 @@ class ConcatMemmapCorpus:
         self.policy_kl_anchor_component_indices: tuple[int, ...] = tuple()
         self.policy_kl_anchor_scope_authenticated = False
         self.legal_width = int(first.legal_width)
-        self._columns = dict(first_schemas)
+        self._columns = {
+            key: next(
+                corpus._columns[key]
+                for corpus, keys in zip(self.corpora, component_key_sets, strict=True)
+                if key in keys
+            )
+            for key in first_keys
+        }
+        self.synthesized_columns_by_component: dict[int, tuple[str, ...]] = {
+            index: tuple(sorted(union_keys - keys))
+            for index, keys in enumerate(component_key_sets)
+            if union_keys - keys
+        }
         self._eager: dict[str, _ConcatColumn] = {}
         self._lazy: dict[str, _ConcatColumn] = {}
         row_counts = [int(corpus.row_count) for corpus in self.corpora]
         for key in first_keys:
-            column = _ConcatColumn([corpus[key] for corpus in self.corpora], row_counts)
+            columns = [
+                corpus[key] if key in keys else _synthesized_column(corpus, key)
+                for corpus, keys in zip(self.corpora, component_key_sets, strict=True)
+            ]
+            column = _ConcatColumn(columns, row_counts)
             destination = (
                 self._lazy
-                if all(key in getattr(corpus, "_lazy", {}) for corpus in self.corpora)
+                if all(
+                    key not in keys or key in getattr(corpus, "_lazy", {})
+                    for corpus, keys in zip(
+                        self.corpora, component_key_sets, strict=True
+                    )
+                )
                 else self._eager
             )
             destination[key] = column
@@ -209,6 +303,10 @@ class ConcatMemmapCorpus:
             "row_count": self.row_count,
             "legal_width": self.legal_width,
             "component_count": len(self.corpora),
+            "synthesized_columns_by_component": {
+                str(index): list(keys)
+                for index, keys in self.synthesized_columns_by_component.items()
+            },
             "shard_count": sum(
                 int(getattr(corpus, "meta", {}).get("shard_count", 0))
                 for corpus in self.corpora
