@@ -6524,6 +6524,11 @@ def main(argv: Sequence[str] | None = None) -> None:
             }
             for component_id in getattr(data, "component_ids", tuple())
         }
+    effective_architecture = _effective_entity_graph_architecture_report(
+        policy,
+        requested_edge_policy_head=bool(getattr(args, "edge_policy_head", False)),
+        requested_aux_subgoal_heads=bool(getattr(args, "aux_subgoal_heads", False)),
+    )
     report = {
         "checkout_runtime_binding": checkout_runtime_binding,
         "arch": args.arch,
@@ -6770,8 +6775,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         "value_target_lambda": args.value_target_lambda,
         "value_root_blend_regime": value_root_blend_regime,
         "value_root_blend_audit": value_root_blend_audit,
-        "edge_policy_head": bool(getattr(args, "edge_policy_head", False)),
-        "aux_subgoal_heads": bool(getattr(args, "aux_subgoal_heads", False)),
+        **effective_architecture,
         "freeze_modules": args.freeze_modules,
         "train_value_only": bool(args.train_value_only),
         "lr_warmup_steps": args.lr_warmup_steps,
@@ -14367,6 +14371,59 @@ ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS: dict[str, tuple[str, ...]] = {
         "value_pool_head",
     ),
 }
+
+
+def _effective_entity_graph_architecture_report(
+    policy,
+    *,
+    requested_edge_policy_head: bool = False,
+    requested_aux_subgoal_heads: bool = False,
+) -> dict[str, object]:
+    """Bind learner reports to the architecture that actually ran.
+
+    Entity-graph warm-start experiments normally flip optional architecture
+    fields in an upgraded checkpoint.  ``--init-checkpoint`` then reconstructs
+    the model from that checkpoint's config, so CLI defaults are not evidence
+    that an optional path was disabled.  In particular, reporting
+    ``args.edge_policy_head`` mislabeled an upgraded edge-head model as OFF,
+    while gather and cross-attention were omitted from the report entirely.
+
+    Keep the requested CLI values separately for diagnosis, but make the
+    historical top-level feature fields describe the effective loaded model.
+    """
+
+    config = getattr(policy, "config", None)
+    if config is None or getattr(policy, "policy_type", "") != "entity_graph":
+        return {
+            "action_target_gather": False,
+            "action_cross_attention_layers": 0,
+            "edge_policy_head": bool(requested_edge_policy_head),
+            "aux_subgoal_heads": bool(requested_aux_subgoal_heads),
+            "requested_edge_policy_head": bool(requested_edge_policy_head),
+            "requested_aux_subgoal_heads": bool(requested_aux_subgoal_heads),
+        }
+    return {
+        "action_target_gather": bool(
+            getattr(config, "action_target_gather", False)
+        ),
+        "action_cross_attention_layers": int(
+            getattr(config, "action_cross_attention_layers", 0) or 0
+        ),
+        "edge_policy_head": bool(getattr(config, "edge_policy_head", False)),
+        "aux_subgoal_heads": bool(getattr(config, "aux_subgoal_heads", False)),
+        "state_trunk": str(getattr(config, "state_trunk", "transformer")),
+        "relational_block_pattern": str(
+            getattr(config, "relational_block_pattern", "") or ""
+        ),
+        "relational_action_cross_layers": int(
+            getattr(config, "relational_action_cross_layers", 1) or 0
+        ),
+        "relational_edge_policy_head": bool(
+            getattr(config, "relational_edge_policy_head", True)
+        ),
+        "requested_edge_policy_head": bool(requested_edge_policy_head),
+        "requested_aux_subgoal_heads": bool(requested_aux_subgoal_heads),
+    }
 
 
 def _set_entity_graph_modules_trainable(
