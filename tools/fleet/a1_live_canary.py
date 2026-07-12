@@ -349,6 +349,7 @@ def derive_canary_plan(
     canary_aliases: Mapping[str, int] = CANARY_ALIASES,
     games_per_job: int = GAMES_PER_JOB,
     native_runtime: bool = False,
+    categories: Sequence[str] = CATEGORY_ORDER,
     allowed_root: Path = CANARY_ROOT,
     repo_root: Path = _REPO_ROOT,
 ) -> dict[str, Any]:
@@ -370,6 +371,11 @@ def derive_canary_plan(
         raise CanaryError("canary output root overlaps the production output tree")
 
     canary_aliases = dict(canary_aliases)
+    categories = tuple(categories)
+    if not categories or any(category not in CATEGORY_ORDER for category in categories):
+        raise CanaryError("canary categories must be a non-empty production-order subset")
+    if tuple(sorted(categories, key=CATEGORY_ORDER.index)) != categories:
+        raise CanaryError("canary categories must retain production dependency order")
     if not canary_aliases or any(
         not alias or isinstance(count, bool) or count <= 0
         for alias, count in canary_aliases.items()
@@ -379,7 +385,7 @@ def derive_canary_plan(
         raise CanaryError("games per job must be positive")
     chosen = _selected_lanes(lanes, canary_aliases)
     lo, hi = contract.VAL_ONLY_SEED_RANGE
-    job_count = sum(canary_aliases.values()) * len(CATEGORY_ORDER)
+    job_count = sum(canary_aliases.values()) * len(categories)
     total_games = job_count * games_per_job
     if base_seed < lo or base_seed + total_games > hi:
         raise CanaryError(
@@ -401,6 +407,8 @@ def derive_canary_plan(
         previous: str | None = None
         for source_command in source_lane:
             category = str(source_command["category"])
+            if category not in categories:
+                continue
             source_job = str(source_command["job_id"])
             if source_by_job.get(source_job) != source_command:
                 raise CanaryError(f"source lane command drift for {source_job}")
@@ -545,6 +553,7 @@ def derive_canary_plan(
         "games_per_job": games_per_job,
         "canary_aliases": canary_aliases,
         "native_runtime": native_runtime,
+        "categories": list(categories),
         "lane_count": len(new_lanes),
         "job_count": len(new_commands),
         "required_artifacts": required,
@@ -602,7 +611,7 @@ def derive_canary_plan(
         "claim_count": 0,
         "canary_claim_count": len(ledger_rows),
         "production_claims_consumed": 0,
-        "category_order": list(CATEGORY_ORDER),
+        "category_order": list(categories),
         "client_environment": dict(executor.CLIENT_ENVIRONMENT),
         "repo_artifacts_sha256": _digest(repo_artifacts),
         "live_seed_ledger_sha256": _sha256(canary_ledger),
@@ -636,10 +645,11 @@ def validate_canary_plan(plan: Mapping[str, Any]) -> None:
     aliases = plan.get("canary_aliases", CANARY_ALIASES)
     games_per_job = plan.get("games_per_job", GAMES_PER_JOB)
     native_runtime = bool(plan.get("native_runtime", False))
+    categories = tuple(plan.get("category_order", CATEGORY_ORDER))
     if not isinstance(aliases, Mapping) or not aliases:
         raise CanaryError("canary host topology is missing")
     expected_lanes = sum(int(count) for count in aliases.values())
-    expected_jobs = expected_lanes * len(CATEGORY_ORDER)
+    expected_jobs = expected_lanes * len(categories)
     if (
         plan.get("validation_only") is not True
         or plan.get("canary_schema_version") != SCHEMA
@@ -719,6 +729,74 @@ def validate_canary_plan(plan: Mapping[str, Any]) -> None:
                 raise CanaryError("canary command escaped the VAL-ONLY seed band")
 
 
+def _verify_current_producer_source(
+    lock_path: Path,
+    render_path: Path,
+    *,
+    verify_lock_fn: Any,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, list[dict[str, Any]]]]:
+    """Verify the valid promoted self-play slice of a mixed historical render.
+
+    The issued dual-arm lock contains opponent jobs that predate the promoted
+    checkpoint/search-identity guard and execute at c_scale=.03.  Those jobs
+    are intentionally unusable.  A corrected-teacher pilot needs only the
+    current-producer self-play jobs, all of which execute at the promoted .10
+    identity.  Verify every byte and typed field for that slice while refusing
+    to reinterpret or execute the invalid opponent rows.
+    """
+
+    lock = verify_lock_fn(lock_path, require_all_job_claims=False)
+    rendered = _load(render_path)
+    unhashed = dict(rendered)
+    declared = unhashed.pop("render_sha256", None)
+    if declared != _digest(unhashed):
+        raise CanaryError("source render semantic digest mismatch")
+    if rendered.get("contract_sha256") != lock.get("contract_sha256"):
+        raise CanaryError("source render binds a different lock")
+    jobs = {str(job["job_id"]): job for job in lock["fleet"]["jobs"]}
+    mix_paths = {
+        Path(record["path"]).stem: Path(record["path"])
+        for record in rendered["required_artifacts"]["rendered_opponent_mix"]
+    }
+    commands = [
+        command
+        for command in rendered.get("commands", [])
+        if command.get("category") == "current_producer"
+    ]
+    expected_lanes = int(lock["game_contract"]["worker_count"])
+    if len(commands) != expected_lanes:
+        raise CanaryError("source render does not contain one current job per lane")
+    lanes: dict[str, list[dict[str, Any]]] = {}
+    for command in commands:
+        job_id = str(command.get("job_id", ""))
+        job = jobs.get(job_id)
+        if not isinstance(job, Mapping) or job.get("category") != "current_producer":
+            raise CanaryError(f"unknown current-producer source job {job_id!r}")
+        try:
+            identity = contract._promoted_producer_job_identity(lock, job)  # noqa: SLF001
+        except contract.ContractError as error:
+            raise CanaryError(f"unsafe promoted producer identity for {job_id}: {error}") from error
+        if identity is None or float(identity["executed_search_operator"]["c_scale"]) != 0.1:
+            raise CanaryError(f"{job_id} is not bound to promoted c_scale=.10")
+        expected_argv = contract._generator_argv(lock, job, mix_paths=mix_paths)  # noqa: SLF001
+        expected_environment = contract._job_environment(lock, job)  # noqa: SLF001
+        if command.get("argv") != expected_argv or command.get("argv_sha256") != _digest(expected_argv):
+            raise CanaryError(f"source argv drift for {job_id}")
+        if command.get("environment") != expected_environment or command.get(
+            "environment_sha256"
+        ) != _digest(expected_environment):
+            raise CanaryError(f"source environment drift for {job_id}")
+        source = Path(str(command["output_attestation"]["source"]))
+        if not source.is_file() or _sha256(source) != command["output_attestation"].get(
+            "source_file_sha256"
+        ):
+            raise CanaryError(f"source attestation drift for {job_id}")
+        lanes.setdefault(str(command["worker_id"]), []).append(command)
+    if len(lanes) != expected_lanes or any(len(lane) != 1 for lane in lanes.values()):
+        raise CanaryError("source current-producer lane topology drift")
+    return lock, rendered, lanes
+
+
 def build_canary_plan(
     *,
     lock_path: Path,
@@ -731,6 +809,7 @@ def build_canary_plan(
     canary_aliases: Mapping[str, int] = CANARY_ALIASES,
     games_per_job: int = GAMES_PER_JOB,
     native_runtime: bool = False,
+    categories: Sequence[str] = CATEGORY_ORDER,
 ) -> dict[str, Any]:
     lock_path = lock_path.resolve(strict=True)
     render_path = render_path.resolve(strict=True)
@@ -744,9 +823,16 @@ def build_canary_plan(
         # claims exist. It must never require or append those claims.
         return contract.verify_lock(lock_path, require_all_job_claims=False)
 
-    lock, rendered, lanes = executor.verify_render(
-        lock_path, render_path, verify_lock_fn=verify_without_claims
-    )
+    if tuple(categories) == CATEGORY_ORDER:
+        lock, rendered, lanes = executor.verify_render(
+            lock_path, render_path, verify_lock_fn=verify_without_claims
+        )
+    elif tuple(categories) == ("current_producer",):
+        lock, rendered, lanes = _verify_current_producer_source(
+            lock_path, render_path, verify_lock_fn=verify_without_claims
+        )
+    else:
+        raise CanaryError("selective live canary supports current_producer only")
     aliases = {lane[0]["host_alias"] for lane in lanes.values()}
     hosts = executor.load_hosts(hosts_path, aliases)
     return derive_canary_plan(
@@ -764,6 +850,7 @@ def build_canary_plan(
         canary_aliases=canary_aliases,
         games_per_job=games_per_job,
         native_runtime=native_runtime,
+        categories=categories,
     )
 
 
@@ -1083,6 +1170,11 @@ def build_parser() -> argparse.ArgumentParser:
             help="use parity-proven Rust featurization and native MCTS hot loop",
         )
         item.add_argument(
+            "--current-producer-only",
+            action="store_true",
+            help="pilot only promoted self-play; refuse legacy mismatched opponent jobs",
+        )
+        item.add_argument(
             "--canary-root",
             type=Path,
             help="must equal /home/ubuntu/gen_out/a1-live-canary-CANARY_ID",
@@ -1109,6 +1201,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             canary_aliases=canary_aliases,
             games_per_job=args.games_per_job,
             native_runtime=bool(args.native_runtime),
+            categories=(
+                ("current_producer",)
+                if args.current_producer_only
+                else CATEGORY_ORDER
+            ),
         )
         if args.command == "status":
             result = executor.status(plan, receipt_path=args.receipt)

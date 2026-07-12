@@ -287,12 +287,14 @@ def test_derives_operator_selected_cohort_and_game_count(
         canary_aliases={"c2": 4, "h100-8b": 8},
         games_per_job=8,
         native_runtime=True,
+        categories=("current_producer",),
     )
     assert plan["canary_aliases"] == {"c2": 4, "h100-8b": 8}
     assert plan["games_per_job"] == 8
     assert plan["native_runtime"] is True
     assert plan["lane_count"] == 12
-    assert plan["job_count"] == 36
+    assert plan["job_count"] == 12
+    assert plan["category_order"] == ["current_producer"]
     assert set(plan["_private"]["hosts"]["hosts"]) == {"c2", "h100-8b"}
     assert all(
         canary._flag_value(command["argv"], "--games") == "8"
