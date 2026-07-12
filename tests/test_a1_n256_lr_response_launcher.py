@@ -18,6 +18,14 @@ def test_n256_lr_response_launcher_is_syntax_clean_and_fail_closed() -> None:
     assert "all-196k-corrective-lr120u-loser1" in text
     assert 'effective.get("lr") != 0.00012' in text
     assert 'effective.get("loser_sample_weight") != 1.0' in text
+    assert "midpoint learner lock binds another spec" in text
+    assert "midpoint contract is writable" in text
+    assert "inspect-spec" not in text
+    assert 'a1_dual_learner_contract.py" seal' not in text
+    assert "spec=$midpoint_dir/learner.spec.json" in text
+    assert "lock=$midpoint_dir/learner.lock.json" in text
+    assert "spec=$dose/learner.spec.json" not in text
+    assert "lock=$dose/learner.lock.json" not in text
     assert 'set(a["recipe_drift"]) == {"lr", "loser_sample_weight"}' in text
     assert 'a["effective_recipe"]["epochs"] == 1' in text
     assert 'p["world_size"] == 8 and p["global_batch_size"] == 4096' in text

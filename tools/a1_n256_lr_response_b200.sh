@@ -26,14 +26,14 @@ script_repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 repo=${A1_REPO:-$script_repo}
 python=${A1_PYTHON:-$repo/.venv/bin/python}
 producer=${A1_PRODUCER:-/home/ubuntu/catan-zero-production/runs/learner/a1-infoset-n128-20260710-r2/candidate.pt}
-contracts=${A1_CONTRACTS:-/home/ubuntu/catan-zero-production/contracts/a1-dual-arm-20260710-r1/locks}
-midpoint_receipt=${A1_CORRECTIVE_MIDPOINT_RECEIPT:-$root/training/corrective-196k-lr120u-loser1/n256/training.receipt.json}
+midpoint_dir=${A1_CORRECTIVE_MIDPOINT_DIR:-$root/training/corrective-196k-lr120u-loser1/n256}
+midpoint_receipt=$midpoint_dir/training.receipt.json
 data=$root/n256-early/n256.memmap
 validation=$root/n256-early/n256.validation_seeds.json
 out=$root/training/n256-lr-response-${lr_label}-loser1
 dose=$out/n256
-spec=$dose/learner.spec.json
-lock=$dose/learner.lock.json
+spec=$midpoint_dir/learner.spec.json
+lock=$midpoint_dir/learner.lock.json
 receipt=$dose/training.receipt.json
 ablation_id=n256-lr-response-${lr_label}-loser1
 overrides=$(printf '{"loser_sample_weight":1.0,"lr":%s}' "$lr")
@@ -66,11 +66,12 @@ verify_midpoint() {
   [[ -s "$midpoint_receipt" ]] || {
     echo "REFUSED: completed 1.2e-4 n256 midpoint receipt is required" >&2; exit 2;
   }
-  "$python" - "$repo" "$midpoint_receipt" <<'PY'
-import sys
+  "$python" - "$repo" "$midpoint_receipt" "$spec" "$lock" <<'PY'
+import stat, sys
 from pathlib import Path
 sys.path.insert(0, sys.argv[1])
 from tools import a1_dual_arm_train as train
+from tools import a1_dual_learner_contract as contract
 r = train.verify_receipt(Path(sys.argv[2]))
 if (r.get("arm_id"), r.get("subset_id")) != ("n256", "full-56k"):
     raise SystemExit("REFUSED: midpoint receipt is not the full n256 dose")
@@ -82,6 +83,23 @@ if (a.get("ablation_id"), a.get("diagnostic_only"), a.get("promotion_eligible"))
 effective = a.get("effective_recipe", {})
 if effective.get("lr") != 0.00012 or effective.get("loser_sample_weight") != 1.0:
     raise SystemExit("REFUSED: midpoint receipt recipe drift")
+spec = Path(sys.argv[3]).expanduser().resolve(strict=True)
+lock = Path(sys.argv[4]).expanduser().resolve(strict=True)
+for path in (spec, lock):
+    if path.stat().st_mode & (stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH):
+        raise SystemExit(f"REFUSED: midpoint contract is writable: {path}")
+lock_ref = r.get("inputs", {}).get("learner_lock")
+if lock_ref != train._file_ref(lock, where="midpoint learner lock"):
+    raise SystemExit("REFUSED: midpoint receipt binds another learner lock")
+authority = contract.verify_lock(lock, reviewed_file_sha256=lock_ref["sha256"])
+if authority.get("learner_spec") != train._file_ref(spec, where="midpoint learner spec"):
+    raise SystemExit("REFUSED: midpoint learner lock binds another spec")
+if (authority.get("arm_id"), authority.get("subset_id")) != ("n256", "full-56k"):
+    raise SystemExit("REFUSED: midpoint learner contract is not full n256")
+if authority.get("topology", {}).get("world_size") != 8:
+    raise SystemExit("REFUSED: midpoint learner contract is not world8")
+if authority.get("recipe", {}).get("epochs") != 1:
+    raise SystemExit("REFUSED: midpoint learner contract is not exactly one epoch")
 print("authenticated completed n256 midpoint at lr=1.2e-4")
 PY
 }
@@ -122,22 +140,7 @@ for partial in "$dose/candidate.pt" "$dose/candidate.pt.optimizer.pt" \
     exit 2
   }
 done
-
-if [[ -e "$spec" || -e "$lock" ]]; then
-  [[ -s "$spec" && -s "$lock" ]] || {
-    echo "REFUSED: n256 LR-response spec/lock pair is incomplete" >&2; exit 2;
-  }
-else
-  tmp=$spec.tmp.$$
-  "$python" "$repo/tools/a1_dual_learner_contract.py" inspect-spec \
-    --data "$data" --validation "$validation" \
-    --producer-checkpoint "$producer" --world-size 8 >"$tmp"
-  chmod 0444 "$tmp"; mv "$tmp" "$spec"
-  "$python" "$repo/tools/a1_dual_learner_contract.py" seal \
-    --arm-lock "$contracts/n256.lock.json" --learner-spec "$spec" \
-    --data "$data" --validation "$validation" \
-    --producer-checkpoint "$producer" --out "$lock"
-fi
+[[ "$mode" == go ]] || verify_midpoint
 
 lock_digest=$(lock_sha "$lock")
 code_digest=$(code_sha "$lock")
