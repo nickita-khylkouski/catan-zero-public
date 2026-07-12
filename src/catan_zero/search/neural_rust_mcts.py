@@ -150,6 +150,48 @@ def _assert_value_readout_available(
         )
 
 
+def _assert_uncertainty_readout_available(
+    policy: "EntityGraphPolicy", config: "EntityGraphRustEvaluatorConfig"
+) -> None:
+    """Fail closed before search can consume an untrained uncertainty head.
+
+    ``EntityGraphPolicy.load`` deliberately permits optional-head tensors to be
+    absent so an older checkpoint can be warm-started into a newer architecture.
+    In that case the module exists in memory but its parameters are freshly
+    initialized.  That is safe while uncertainty emission is disabled, but it
+    is not a valid search signal: backup weighting would otherwise consume
+    random predictions merely because the checkpoint config names the head.
+
+    This is intentionally narrower than a training-provenance requirement.  It
+    verifies only that an opted-in consumer has a real module whose complete
+    tensor set came from the checkpoint.
+    """
+
+    if not bool(config.emit_uncertainty):
+        return
+
+    model = getattr(policy, "model", None)
+    head = getattr(model, "value_uncertainty_head", None)
+    missing_state_keys = tuple(
+        str(key) for key in getattr(policy, "_checkpoint_missing_state_keys", ())
+    )
+    missing_head_weights = any(
+        key.startswith("value_uncertainty_head.") for key in missing_state_keys
+    )
+    if head is None or missing_head_weights:
+        detail = (
+            " (the checkpoint config declares the head but its trained weights "
+            "are absent)"
+            if missing_head_weights
+            else ""
+        )
+        raise ValueError(
+            "emit_uncertainty=True requires a checkpoint with a complete "
+            f"value_uncertainty_head{detail}; disable uncertainty emission or "
+            "load a checkpoint containing the head tensors."
+        )
+
+
 def _uncertainty_from_outputs(outputs: dict[str, Any], row: int) -> float:
     """Extract the value-uncertainty head's scalar for batch `row` (CAT-61).
 
@@ -252,6 +294,7 @@ class EntityGraphRustEvaluator:
         self.config = config or EntityGraphRustEvaluatorConfig()
         _assert_public_observation_matches_checkpoint_training(policy, self.config)
         _assert_value_readout_available(policy, self.config)
+        _assert_uncertainty_readout_available(policy, self.config)
         # CAT-126 #15: OrderedDict gives LRU eviction (move_to_end on hit,
         # popitem(last=False) on evict) instead of FIFO. Bit-identical outputs
         # (a hit returns the same deterministic value); only WHICH entry is

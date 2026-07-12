@@ -178,3 +178,53 @@ def test_uncertainty_from_outputs_absent_and_present():
     assert _uncertainty_from_outputs({"value": torch.zeros(3)}, 0) == 0.0
     outputs = {"value_uncertainty": torch.tensor([0.1, 0.4, 0.9])}
     assert _uncertainty_from_outputs(outputs, 2) == pytest.approx(0.9)
+
+
+def test_evaluator_rejects_checkpoint_with_deleted_uncertainty_weights(tmp_path):
+    """A config-only warm start may reconstruct the optional module, but an
+    uncertainty consumer must not mistake its random parameters for trained
+    checkpoint state.  The default/off path remains load-compatible."""
+    import torch
+
+    from catan_zero.rl.entity_token_policy import EntityGraphPolicy
+    from catan_zero.search.neural_rust_mcts import (
+        EntityGraphRustEvaluator,
+        EntityGraphRustEvaluatorConfig,
+    )
+
+    config = dataclasses.replace(_base_config(), value_uncertainty_head=True)
+    policy = EntityGraphPolicy(
+        config,
+        np.zeros(
+            (int(config.action_size), int(config.static_action_feature_size)),
+            dtype=np.float32,
+        ),
+        device="cpu",
+    )
+    checkpoint = tmp_path / "missing-uncertainty-head.pt"
+    policy.save(checkpoint)
+    payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    removed = [
+        key
+        for key in tuple(payload["model"])
+        if key.startswith("value_uncertainty_head.")
+    ]
+    assert removed
+    for key in removed:
+        del payload["model"][key]
+    torch.save(payload, checkpoint)
+
+    loaded = EntityGraphPolicy.load(checkpoint, device="cpu")
+    assert loaded.model.value_uncertainty_head is not None
+    assert set(removed) <= set(loaded._checkpoint_missing_state_keys)
+
+    # Backward compatibility: the optional branch is inert when not consumed.
+    EntityGraphRustEvaluator(
+        loaded,
+        config=EntityGraphRustEvaluatorConfig(emit_uncertainty=False),
+    )
+    with pytest.raises(ValueError, match="trained weights are absent"):
+        EntityGraphRustEvaluator(
+            loaded,
+            config=EntityGraphRustEvaluatorConfig(emit_uncertainty=True),
+        )
