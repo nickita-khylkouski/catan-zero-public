@@ -107,3 +107,18 @@ def test_is_near_zero_when_model_equals_prior():
     anchor = _policy_kl_anchor_loss(data, batch, logits, torch.device("cpu"))
     assert anchor is not None
     assert abs(float(anchor.item())) < 1e-5
+
+
+def test_forced_prior_rows_do_not_dilute_anchor_denominator():
+    data = _base_data()
+    # Row 0 is forced and therefore has identically-zero KL. Row 1 is the sole
+    # meaningful anchor row. The result must equal row 1, not half of row 1.
+    data["legal_action_ids"][0] = np.asarray([5, -1, -1, -1], dtype=np.int16)
+    data["prior_policy"][0] = np.asarray([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+    logits = _logits()
+    anchor = _policy_kl_anchor_loss(data, np.arange(3), logits, torch.device("cpu"))
+    row_one = _policy_kl_anchor_loss(
+        data, np.asarray([1]), logits[1:2], torch.device("cpu")
+    )
+    assert anchor is not None and row_one is not None
+    assert torch.allclose(anchor, row_one, atol=1e-6)

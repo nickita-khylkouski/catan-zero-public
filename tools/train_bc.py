@@ -9732,8 +9732,8 @@ def policy_surprise_sampling_weights(
 
 
 def _policy_kl_anchor_loss(data: dict, batch: np.ndarray, logits, device):
-    """Differentiable policy-KL anchor loss: the mean over rows-with-a-recorded-
-    prior of KL(pi_theta || prior_policy), pulling the trained policy toward the
+    """Differentiable policy-KL anchor loss: the mean over non-forced rows with
+    a recorded prior of KL(pi_theta || prior_policy), pulling the trained policy toward the
     frozen seed checkpoint's recorded per-state prior (the `prior_policy` column).
 
     Reuses _prior_kl_telemetry's exact per-row computation (un-detached here),
@@ -9750,7 +9750,17 @@ def _policy_kl_anchor_loss(data: dict, batch: np.ndarray, logits, device):
     terms = _prior_kl_telemetry(data, batch, logits, device)
     if terms is None:
         return None
-    weights = terms["has_prior"].to(torch.float32)
+    # A forced row has a one-element legal simplex, so its KL is identically
+    # zero for every model.  Counting those rows in the denominator diluted the
+    # configured anchor by roughly the corpus forced fraction (~51.5%) even
+    # though they can never contribute an anchor gradient.
+    legal = np.asarray(data["legal_action_ids"][batch])
+    non_forced = torch.as_tensor(
+        np.sum(legal >= 0, axis=1) > 1,
+        dtype=torch.bool,
+        device=device,
+    )
+    weights = (terms["has_prior"] & non_forced).to(torch.float32)
     if float(weights.sum().item()) <= 0.0:
         return None
     return _weighted_mean_loss(terms["kl_model_prior"], weights)
