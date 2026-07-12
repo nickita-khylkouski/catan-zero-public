@@ -7,12 +7,13 @@ import pytest
 from tools.a1_post_p1_diagnosis_plan import SAMPLE_DOSE, build_plan
 
 
-def test_matrix_reuses_legacy_evidence_and_adds_three_causal_runs() -> None:
+def test_matrix_reuses_legacy_evidence_and_adds_conditional_anchor() -> None:
     plan = build_plan()
     assert [arm["arm_id"] for arm in plan["arms"]] == [
         "LEGACY_L03",
         "L1_CONTROL",
         "L1_POLICY_AUX",
+        "L1_AUX_REPLAY_ANCHOR",
         "L1_GATHER",
     ]
     assert sum(arm["training"] == "new matched B200 run" for arm in plan["arms"]) == 3
@@ -23,9 +24,12 @@ def test_matrix_reuses_legacy_evidence_and_adds_three_causal_runs() -> None:
 def test_policy_dose_and_gather_arms_are_single_sequential_deltas() -> None:
     plan = build_plan()
     fixed = plan["fixed_recipe"]
-    control, aux, gather = plan["arms"][1:]
+    control, aux, anchor, gather = plan["arms"][1:]
     assert control["recipe_delta"]["policy_aux_active_batch_size"] == 0
     assert aux["recipe_delta"]["policy_aux_active_batch_size"] == 128
+    assert anchor["recipe_delta"]["policy_aux_active_batch_size"] == 128
+    assert "exact eligible-mass" in anchor["recipe_delta"]["policy_kl_anchor_weight"]
+    assert "stored_prior" in anchor["recipe_delta"]["policy_kl_anchor_direction"]
     assert gather["recipe_delta"]["policy_aux_active_batch_size"] == 128
     assert control["recipe_delta"]["checkpoint_upgrade"] == "none"
     assert aux["recipe_delta"]["checkpoint_upgrade"] == "none"
@@ -47,6 +51,7 @@ def test_policy_dose_and_gather_arms_are_single_sequential_deltas() -> None:
     assert fixed["lineage_dose_schema"] == "a1-lineage-dose-v1"
     assert "implemented" in plan["historical_feature_audit"]["trunk_lr_multiplier"]
     assert "f7 default OFF" in plan["historical_feature_audit"]["action_target_gather"]
+    assert "contaminated" in plan["historical_feature_audit"]["d6_symmetry"]
 
 
 def test_matrix_is_sequential_and_non_launching() -> None:
@@ -62,6 +67,7 @@ def test_evaluation_types_randomized_primary_and_tournament_bridge() -> None:
     assert plan["evaluation"]["internal"]["map_kind"] == "BASE"
     assert plan["evaluation"]["external"]["map_kind"] == "TOURNAMENT"
     assert plan["evaluation"]["direct_tournament_bridge"]["map_kind"] == "TOURNAMENT"
+    assert "disjoint" in plan["evaluation"]["promotion_confirmation"]
     assert plan["value_readout_probe"]["calibration"] == ["raw", "tanh", "clip"]
     assert plan["value_readout_probe"]["default_change_authorized"] is False
 

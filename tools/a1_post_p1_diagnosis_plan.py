@@ -124,6 +124,22 @@ def build_plan(
             ),
         },
         {
+            "arm_id": "L1_AUX_REPLAY_ANCHOR",
+            "training": "conditional matched B200 run after exact-v2 replay telemetry",
+            "recipe_delta": {
+                "checkpoint_upgrade": "none",
+                "policy_aux_active_batch_size": 128,
+                "policy_kl_anchor_scope": "authenticated gen3_replay multi-action rows",
+                "policy_kl_anchor_direction": "forward (KL(stored_prior || model))",
+                "policy_kl_anchor_weight": "choose from exact eligible-mass telemetry",
+            },
+            "purpose": (
+                "preserve the authenticated incumbent-era replay population without "
+                "confounding value dose or policy-active exposure; never describe "
+                "0.03/0.10 as a global-mass equivalent using replay ratio alone"
+            ),
+        },
+        {
             "arm_id": "L1_GATHER",
             "training": "new matched B200 run",
             "recipe_delta": {
@@ -166,6 +182,10 @@ def build_plan(
             "purpose": "separate map specialization from opponent nontransitivity",
         },
         "binding_floor": "external win-rate delta versus f7 >= -2 percentage points",
+        "promotion_confirmation": (
+            "the selected arm must use a fresh seed cohort disjoint from every "
+            "diagnostic/adjudication cohort used to select it"
+        ),
         "diagnostics": [
             "active-only teacher-gap and target-to-model KL",
             "value RMSE/calibration by phase and root width",
@@ -187,6 +207,10 @@ def build_plan(
         "active_policy_dose": (
             "L1_POLICY_AUX improves over L1_CONTROL at equal value dose: policy "
             "underexposure was causal"
+        ),
+        "replay_anchor": (
+            "L1_AUX_REPLAY_ANCHOR improves exact forward replay KL without erasing "
+            "n128/n256 teacher-gap closure: population-behavior drift was causal"
         ),
         "target_binding": (
             "L1_GATHER improves topology-sensitive buckets over L1_POLICY_AUX: "
@@ -211,7 +235,11 @@ def build_plan(
             "reuse LEGACY_L03 without B200 compute",
             "run L1_CONTROL on all 8 B200s",
             "run L1_POLICY_AUX only after L1_CONTROL releases DDP",
-            "run L1_GATHER only after L1_POLICY_AUX releases DDP",
+            (
+                "run L1_AUX_REPLAY_ANCHOR only if exact-v2 telemetry shows harmful "
+                "authenticated replay forward-KL drift"
+            ),
+            "run L1_GATHER only after selecting the corrected learner objective",
             "evaluate arms in parallel on the H100 fleet; do not consume B200s",
         ],
         "fixed_recipe": fixed,
@@ -236,6 +264,11 @@ def build_plan(
             "graph_history_features": (
                 "flag/schema present but event payload proven absent; never claim "
                 "history conditioning until a redacted v2 producer exists"
+            ),
+            "d6_symmetry": (
+                "legal-action identity and valid action-id zero relabeling were fixed; "
+                "the earlier 3.3x denoising estimate is contaminated and non-binding "
+                "until rerun with exact 567-wide action-catalog semantics"
             ),
         },
         "arms": arms,
