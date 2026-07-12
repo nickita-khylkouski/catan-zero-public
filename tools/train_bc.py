@@ -7328,6 +7328,7 @@ _OBJECTIVE_MATCHED_VALIDATION_MEANS = (
     "advantage_mean",
     "advantage_weight_mean",
     "prior_kl_model_prior_mean",
+    "prior_kl_prior_model_mean",
     "prior_kl_target_prior_mean",
     "prior_kl_ratio",
     "active_policy_kl_target_model_mean",
@@ -7336,7 +7337,9 @@ _OBJECTIVE_MATCHED_VALIDATION_MEANS = (
 )
 
 
-def objective_matched_validation_metrics(epoch_metrics: dict) -> dict:
+def objective_matched_validation_metrics(
+    epoch_metrics: dict, *, require_matched: bool = False
+) -> dict:
     """Return promotion-facing validation means, with historical fallback.
 
     Composite reports wrap their authenticated aggregate with measure metadata;
@@ -7349,8 +7352,37 @@ def objective_matched_validation_metrics(epoch_metrics: dict) -> dict:
         metrics = matched.get("metrics")
         if matched.get("objective_matched") is True and isinstance(metrics, dict):
             return metrics
+    if require_matched:
+        raise ValueError(
+            "authenticated composite adjudication requires objective-matched "
+            "validation; raw concatenated-row fallback is not admissible"
+        )
     legacy = epoch_metrics.get("validation")
     return legacy if isinstance(legacy, dict) else {}
+
+
+def objective_matched_validation_component_metrics(
+    epoch_metrics: dict, *, require_matched: bool = False
+) -> dict[str, dict]:
+    """Return per-component metrics from an authenticated matched wrapper."""
+
+    matched = epoch_metrics.get("validation_objective_matched")
+    if isinstance(matched, dict) and matched.get("objective_matched") is True:
+        components = matched.get("components")
+        if isinstance(components, dict) and components:
+            result = {}
+            for component_id, report in components.items():
+                metrics = report.get("metrics") if isinstance(report, dict) else None
+                if not isinstance(component_id, str) or not isinstance(metrics, dict):
+                    raise ValueError("objective-matched component metrics are malformed")
+                result[component_id] = metrics
+            return result
+    if require_matched:
+        raise ValueError(
+            "authenticated composite adjudication requires per-component "
+            "objective-matched validation metrics"
+        )
+    return {}
 
 
 def _weighted_validation_means(
@@ -7410,12 +7442,11 @@ def _objective_measure_validation_aggregate(
     normalized = normalized / float(normalized.sum())
     metrics = _weighted_validation_means(reports, normalized)
     coefficient_rows = [report.get("objective_coefficients") for report in reports]
-    if not coefficient_rows or not all(
+    has_objective_coefficients = bool(coefficient_rows) and all(
         isinstance(row, dict) and row == coefficient_rows[0]
         for row in coefficient_rows
-    ):
-        return metrics, None
-    coefficients = coefficient_rows[0]
+    )
+    coefficients = coefficient_rows[0] if has_objective_coefficients else {}
     sufficient: dict[str, dict[str, float]] = {}
     for key in _TRAINING_OBJECTIVE_METRIC_KEYS:
         if not all(
@@ -7444,7 +7475,58 @@ def _objective_measure_validation_aggregate(
             "weighted_numerator_per_sample": numerator_density,
             "weight_per_sample": denominator_density,
         }
-    if all(key in metrics for key in coefficients):
+    # These diagnostics are also conditional means.  In particular, averaging
+    # per-game teacher-gap closure can Simpson-reverse an arm when games differ
+    # in active-row density or target/prior gap. Reconstruct the KL densities
+    # first, then form the ratio exactly once under the training measure.
+    conditional_metrics = {
+        "prior_kl_model_prior_mean": "prior_kl_rows",
+        "prior_kl_prior_model_mean": "prior_kl_rows",
+        "prior_kl_target_prior_mean": "prior_kl_rows",
+        "active_policy_kl_target_model_mean": "active_policy_teacher_gap_rows",
+        "active_policy_kl_target_prior_mean": "active_policy_teacher_gap_rows",
+    }
+    for key, denominator_key in conditional_metrics.items():
+        if not all(
+            key in report
+            and denominator_key in report
+            and int(report.get("samples", 0)) > 0
+            for report in reports
+        ):
+            continue
+        numerator_density = 0.0
+        denominator_density = 0.0
+        for probability, report in zip(normalized, reports, strict=True):
+            samples = float(report["samples"])
+            denominator = float(report[denominator_key])
+            numerator_density += (
+                float(probability) * float(report[key]) * denominator / samples
+            )
+            denominator_density += float(probability) * denominator / samples
+        metrics[key] = (
+            numerator_density / denominator_density
+            if denominator_density > 0.0
+            else 0.0
+        )
+        sufficient[key] = {
+            "weighted_numerator_per_sample": numerator_density,
+            "weight_per_sample": denominator_density,
+        }
+    target_model = metrics.get("active_policy_kl_target_model_mean")
+    target_prior = metrics.get("active_policy_kl_target_prior_mean")
+    if target_model is not None and target_prior is not None:
+        metrics["active_policy_teacher_gap_closure"] = (
+            1.0 - target_model / target_prior if target_prior > 1.0e-8 else 0.0
+        )
+    model_prior = metrics.get("prior_kl_model_prior_mean")
+    target_prior_legacy = metrics.get("prior_kl_target_prior_mean")
+    if model_prior is not None and target_prior_legacy is not None:
+        metrics["prior_kl_ratio"] = (
+            model_prior / target_prior_legacy
+            if target_prior_legacy > 1.0e-8
+            else 0.0
+        )
+    if coefficients and all(key in metrics for key in coefficients):
         exact_loss = sum(
             float(coefficients[key]) * float(metrics[key]) for key in coefficients
         )
@@ -7454,7 +7536,7 @@ def _objective_measure_validation_aggregate(
         metrics["raw_batch_mean_loss"] = metrics.get("loss", exact_loss)
         metrics["component_reconstructed_loss"] = exact_loss
         metrics["loss"] = exact_loss
-    return metrics, sufficient
+    return metrics, sufficient or None
 
 
 def evaluate_composite_validation_measure(
@@ -7626,6 +7708,7 @@ def evaluate_bc_batches(
             "advantage_weight_mean_sum": 0.0,
             "prior_kl_rows": 0.0,
             "prior_kl_model_prior_sum": 0.0,
+            "prior_kl_prior_model_sum": 0.0,
             "prior_kl_target_prior_sum": 0.0,
             "active_policy_teacher_gap_rows": 0.0,
             "active_policy_kl_target_model_sum": 0.0,
@@ -7752,6 +7835,9 @@ def evaluate_bc_batches(
             extra_sums["prior_kl_rows"] += float(batch_metrics.get("prior_kl_rows", 0.0))
             extra_sums["prior_kl_model_prior_sum"] += float(
                 batch_metrics.get("prior_kl_model_prior_sum", 0.0)
+            )
+            extra_sums["prior_kl_prior_model_sum"] += float(
+                batch_metrics.get("prior_kl_prior_model_sum", 0.0)
             )
             extra_sums["prior_kl_target_prior_sum"] += float(
                 batch_metrics.get("prior_kl_target_prior_sum", 0.0)
@@ -7903,6 +7989,9 @@ def evaluate_bc_batches(
             "prior_kl_rows": int(round(extra_sums["prior_kl_rows"])),
             "prior_kl_model_prior_mean": (
                 extra_sums["prior_kl_model_prior_sum"] / max(extra_sums["prior_kl_rows"], 1.0)
+            ),
+            "prior_kl_prior_model_mean": (
+                extra_sums["prior_kl_prior_model_sum"] / max(extra_sums["prior_kl_rows"], 1.0)
             ),
             "prior_kl_target_prior_mean": (
                 extra_sums["prior_kl_target_prior_sum"] / max(extra_sums["prior_kl_rows"], 1.0)
@@ -8347,20 +8436,22 @@ def _eval_xdim_batch(
             kl_anchor_loss_sum, kl_anchor_loss_denominator = _zero_loss_parts(
                 policy.device
             )
-            if float(policy_kl_anchor_weight) != 0.0:
-                anchor = _policy_kl_anchor_loss_parts(
-                    data,
-                    batch,
-                    outputs["logits"],
-                    policy.device,
-                    direction=policy_kl_anchor_direction,
-                )
-                if anchor is not None:
-                    (
-                        kl_anchor_loss,
-                        kl_anchor_loss_sum,
-                        kl_anchor_loss_denominator,
-                    ) = anchor
+            # Always measure the exact configured anchor direction and
+            # authenticated replay scope during validation, including K0. A
+            # zero coefficient still contributes nothing to the objective.
+            anchor = _policy_kl_anchor_loss_parts(
+                data,
+                batch,
+                outputs["logits"],
+                policy.device,
+                direction=policy_kl_anchor_direction,
+            )
+            if anchor is not None:
+                (
+                    kl_anchor_loss,
+                    kl_anchor_loss_sum,
+                    kl_anchor_loss_denominator,
+                ) = anchor
             value_uncertainty_loss = torch.tensor(
                 0.0, dtype=torch.float32, device=policy.device
             )
@@ -8532,10 +8623,12 @@ def _eval_xdim_batch(
             has_prior = prior_kl["has_prior"]
             prior_kl_rows = int(has_prior.sum().item())
             kl_model_prior_sum = float(prior_kl["kl_model_prior"][has_prior].sum().item())
+            kl_prior_model_sum = float(prior_kl["kl_prior_model"][has_prior].sum().item())
             kl_target_prior_sum = float(prior_kl["kl_target_prior"][has_prior].sum().item())
         else:
             prior_kl_rows = 0
             kl_model_prior_sum = 0.0
+            kl_prior_model_sum = 0.0
             kl_target_prior_sum = 0.0
         teacher_gap = _active_policy_teacher_gap_telemetry(
             data,
@@ -8651,6 +8744,7 @@ def _eval_xdim_batch(
             ),
             "prior_kl_rows": prior_kl_rows,
             "prior_kl_model_prior_sum": kl_model_prior_sum,
+            "prior_kl_prior_model_sum": kl_prior_model_sum,
             "prior_kl_target_prior_sum": kl_target_prior_sum,
             "active_policy_teacher_gap_rows": teacher_gap_rows,
             "active_policy_kl_target_model_sum": teacher_kl_target_model_sum,

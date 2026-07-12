@@ -593,7 +593,7 @@ def test_a1_artifact_chain_rejects_learner_code_drift_before_training(
     meta, validation_contract, seeds = _write_a1_chain(tmp_path)
     train_code = tmp_path / "learner" / "tools" / "train_bc.py"
     original = train_code.read_bytes()
-    train_code.write_bytes(b"#" + original[1:])
+    train_code.write_bytes(b"!" + original[1:])
     with pytest.raises(SystemExit, match="learner implementation drift"):
         _validate_a1_corpus_artifacts_and_seeds(
             meta, validation_contract, seeds

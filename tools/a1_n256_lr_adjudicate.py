@@ -321,7 +321,16 @@ def _arm_metrics(
     metrics = report.get("metrics")
     if not isinstance(metrics, list) or not metrics:
         raise AdjudicationError(f"{label} report has no epoch metrics")
-    validation = train_bc.objective_matched_validation_metrics(metrics[-1])
+    validation = train_bc.objective_matched_validation_metrics(
+        metrics[-1], require_matched=True
+    )
+    component_validation = train_bc.objective_matched_validation_component_metrics(
+        metrics[-1], require_matched=True
+    )
+    component_closures = {
+        component_id: float(values["active_policy_teacher_gap_closure"])
+        for component_id, values in component_validation.items()
+    }
     try:
         external_comparison = compare_matched_external_panels(
             external_candidate, external_champion
@@ -341,6 +350,8 @@ def _arm_metrics(
         "internal_win_rate": float(internal["candidate_win_rate"]),
         "internal_win_rate_ci": internal_ci,
         "teacher_gap_closure": validation.get("active_policy_teacher_gap_closure"),
+        "teacher_gap_closure_by_component": component_closures,
+        "worst_component_teacher_gap_closure": min(component_closures.values()),
         "value_mse": validation.get("scalar_value_mse_diagnostic"),
         "validation_loss": validation.get("loss"),
         "clipped_fraction": optimizer.get("clipped_fraction"),
