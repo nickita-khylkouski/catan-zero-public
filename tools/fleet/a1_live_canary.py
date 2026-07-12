@@ -277,7 +277,7 @@ def _validate_scalar_attestation(lock: Mapping[str, Any]) -> None:
     if not isinstance(attestation, Mapping) or attestation.get(
         "schema_version"
     ) != "legacy-scalar-readout-attestation-v1":
-        raise CanaryError("producer lacks trained scalar-readout provenance")
+        raise CanaryError("producer lacks typed legacy scalar or trained scalar-readout provenance")
 
 
 def _selected_lanes(

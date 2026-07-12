@@ -1157,6 +1157,7 @@ def _lane_payload(
     hosts: dict[str, Any],
     operator_manifests: Mapping[str, Mapping[str, str]],
     repo_dir: str,
+    category_order: Sequence[str] = CATEGORY_ORDER,
 ) -> dict[str, Any]:
     remote = hosts["remote_root"]
     materialized_lane = [
@@ -1174,6 +1175,7 @@ def _lane_payload(
         "log_dir": f"{remote}/logs",
         "lane_lock": f"{remote}/locks/{worker_id}.lock",
         "client_environment": dict(CLIENT_ENVIRONMENT),
+        "category_order": list(category_order),
         "operator_manifests": dict(operator_manifests),
         "commands": materialized_lane,
     }
@@ -1299,6 +1301,7 @@ def execute(plan: dict[str, Any], *, receipt_path: Path, resume: bool) -> dict[s
                 hosts=hosts,
                 operator_manifests=operator_manifests,
                 repo_dir=repo_dir,
+                category_order=tuple(public["category_order"]),
             )
             local_lane = temporary_path / f"{worker_id}.json"
             local_lane.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")

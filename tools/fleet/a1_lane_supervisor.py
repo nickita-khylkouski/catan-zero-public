@@ -249,9 +249,16 @@ def load_lane(path: Path) -> dict[str, Any]:
     if digest != _digest(unhashed):
         raise SupervisorError("lane semantic digest mismatch")
     commands = lane.get("commands")
-    if not isinstance(commands, list) or len(commands) != 3:
-        raise SupervisorError("lane must contain exactly three jobs")
-    if tuple(command.get("category") for command in commands) != CATEGORY_ORDER:
+    category_order = tuple(lane.get("category_order", CATEGORY_ORDER))
+    if (
+        not category_order
+        or any(category not in CATEGORY_ORDER for category in category_order)
+        or tuple(sorted(category_order, key=CATEGORY_ORDER.index)) != category_order
+    ):
+        raise SupervisorError("lane category contract is invalid")
+    if not isinstance(commands, list) or len(commands) != len(category_order):
+        raise SupervisorError("lane job count differs from its sealed category contract")
+    if tuple(command.get("category") for command in commands) != category_order:
         raise SupervisorError("lane category order drift")
     if lane.get("client_environment") != CLIENT_ENVIRONMENT:
         raise SupervisorError("lane MPS client environment drift")
