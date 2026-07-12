@@ -19,6 +19,7 @@ def _make_entity_policy(
     *,
     categorical_bins: int = 0,
     action_local: bool = False,
+    value_attention_pool: bool = False,
 ):
     from catan_zero.rl.entity_token_policy import EntityGraphPolicy
     from catan_zero.rl.self_play import make_env_config
@@ -30,12 +31,13 @@ def _make_entity_policy(
         attention_heads=2,
         seed=0,
     )
-    if categorical_bins or action_local:
+    if categorical_bins or action_local or value_attention_pool:
         config = replace(
             policy.config,
             value_categorical_bins=int(categorical_bins),
             action_target_gather=bool(action_local),
             action_cross_attention_layers=2 if action_local else 0,
+            value_attention_pool=bool(value_attention_pool),
         )
         policy = EntityGraphPolicy(
             config,
@@ -67,6 +69,11 @@ def test_value_head_module_attrs_covers_all_value_adjacent_heads() -> None:
         "value_categorical_head",
         "final_vp_head",
         "value_uncertainty_head",
+        "value_probe",
+        "value_probe_norm_q",
+        "value_probe_norm_kv",
+        "value_probe_attn",
+        "value_pool_head",
     }
 
 
@@ -114,6 +121,28 @@ def test_mult_other_than_one_splits_value_head_params_into_their_own_group() -> 
 
     all_trainable = {id(p) for p in policy.model.parameters() if p.requires_grad}
     assert base_param_ids | value_param_ids == all_trainable
+
+
+def test_value_multiplier_covers_optional_value_attention_pool() -> None:
+    policy = _make_entity_policy(value_attention_pool=True)
+    groups = _build_optimizer_param_groups(
+        policy.model, base_lr=2e-4, value_lr_mult=0.3
+    )
+    value_ids = {id(parameter) for parameter in groups[1]["params"]}
+    for attr_name in (
+        "value_probe",
+        "value_probe_norm_q",
+        "value_probe_norm_kv",
+        "value_probe_attn",
+        "value_pool_head",
+    ):
+        submodule = getattr(policy.model, attr_name)
+        parameters = (
+            submodule.parameters()
+            if hasattr(submodule, "parameters")
+            else (submodule,)
+        )
+        assert {id(parameter) for parameter in parameters} <= value_ids
 
 
 def test_categorical_primary_can_freeze_scalar_diagnostic_without_freezing_cat_head() -> (

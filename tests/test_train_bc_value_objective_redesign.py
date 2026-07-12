@@ -121,6 +121,24 @@ def test_weighted_objective_uses_ddp_global_denominator(monkeypatch) -> None:
     assert value.grad.item() == pytest.approx(0.5)
 
 
+def test_weighted_objective_fails_closed_on_collective_error(monkeypatch) -> None:
+    torch = pytest.importorskip("torch")
+    import torch.distributed as dist
+
+    monkeypatch.setattr(dist, "is_available", lambda: True)
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+
+    def failed_collective(*args, **kwargs):
+        del args, kwargs
+        raise RuntimeError("collective failed")
+
+    monkeypatch.setattr(dist, "all_reduce", failed_collective)
+    with pytest.raises(RuntimeError, match="collective failed"):
+        _weighted_mean_loss(
+            torch.tensor([2.0], requires_grad=True), torch.tensor([1.0])
+        )
+
+
 def test_scalar_aux_round_trips_and_changes_typed_config_hash() -> None:
     baseline = TrainConfig(value_head_type="hlgauss")
     hybrid = TrainConfig(

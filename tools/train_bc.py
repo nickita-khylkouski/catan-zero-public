@@ -7374,6 +7374,85 @@ def _weighted_validation_means(
     return result
 
 
+_TRAINING_OBJECTIVE_METRIC_KEYS = (
+    "policy_loss",
+    "value_loss",
+    "final_vp_loss",
+    "q_loss",
+    "policy_kl_anchor_loss",
+    "value_uncertainty_loss",
+    "aux_subgoal_loss",
+    "moe_balance_loss",
+    "value_categorical_loss",
+)
+
+
+def _objective_measure_validation_aggregate(
+    reports: list[dict], weights: np.ndarray
+) -> tuple[dict[str, float], dict[str, dict[str, float]] | None]:
+    """Aggregate validation under a row-sampling measure before normalization.
+
+    A training loss is ``E_p[w * loss] / E_p[w]``. Averaging one normalized
+    loss per game instead computes ``E_game[E_row[w*loss]/E_row[w]]`` and is
+    different whenever active-policy or loser/value mass varies by game. The
+    latter was incorrectly called objective-matched validation. Convert each
+    game's sums to per-row densities, average those densities under the exact
+    game/component draw probabilities, and divide only once.
+
+    Historical/generic callbacks without sufficient statistics retain the old
+    mean aggregation rather than fabricating exactness.
+    """
+    normalized = np.asarray(weights, dtype=np.float64)
+    normalized = normalized / float(normalized.sum())
+    metrics = _weighted_validation_means(reports, normalized)
+    coefficient_rows = [report.get("objective_coefficients") for report in reports]
+    if not coefficient_rows or not all(
+        isinstance(row, dict) and row == coefficient_rows[0]
+        for row in coefficient_rows
+    ):
+        return metrics, None
+    coefficients = coefficient_rows[0]
+    sufficient: dict[str, dict[str, float]] = {}
+    for key in _TRAINING_OBJECTIVE_METRIC_KEYS:
+        if not all(
+            key in report
+            and isinstance(report.get("loss_denominators"), dict)
+            and key in report["loss_denominators"]
+            and int(report.get("samples", 0)) > 0
+            for report in reports
+        ):
+            continue
+        numerator_density = 0.0
+        denominator_density = 0.0
+        for probability, report in zip(normalized, reports, strict=True):
+            samples = float(report["samples"])
+            denominator = float(report["loss_denominators"][key])
+            numerator_density += (
+                float(probability) * float(report[key]) * denominator / samples
+            )
+            denominator_density += float(probability) * denominator / samples
+        metrics[key] = (
+            numerator_density / denominator_density
+            if denominator_density > 0.0
+            else 0.0
+        )
+        sufficient[key] = {
+            "weighted_numerator_per_sample": numerator_density,
+            "weight_per_sample": denominator_density,
+        }
+    if all(key in metrics for key in coefficients):
+        exact_loss = sum(
+            float(coefficients[key]) * float(metrics[key]) for key in coefficients
+        )
+        # Promotion-facing loss is now the exact configured population objective.
+        # Preserve the historical batch/game-normalized statistic under its honest
+        # name for diagnostics and backwards comparisons.
+        metrics["raw_batch_mean_loss"] = metrics.get("loss", exact_loss)
+        metrics["component_reconstructed_loss"] = exact_loss
+        metrics["loss"] = exact_loss
+    return metrics, sufficient
+
+
 def evaluate_composite_validation_measure(
     data,
     validation_indices: np.ndarray,
@@ -7410,7 +7489,8 @@ def evaluate_composite_validation_measure(
     components = np.asarray(data.component_indices_for_rows(indices), dtype=np.int64)
     seeds = np.asarray(data["game_seed"][indices], dtype=np.int64)
     component_reports: dict[str, dict[str, object]] = {}
-    component_means: list[dict] = []
+    all_game_reports: list[dict] = []
+    all_game_weights: list[float] = []
     for component, component_id in enumerate(component_ids):
         positions = np.flatnonzero(components == component)
         if positions.size == 0:
@@ -7426,10 +7506,13 @@ def evaluate_composite_validation_measure(
             game_indices = component_indices[component_seeds == game_seed]
             game_reports.append(evaluate_indices(game_indices))
             rows_per_game.append(int(game_indices.size))
-        game_uniform = _weighted_validation_means(
+        game_uniform, sufficient = _objective_measure_validation_aggregate(
             game_reports, np.ones(len(game_reports), dtype=np.float64)
         )
-        component_means.append(game_uniform)
+        all_game_reports.extend(game_reports)
+        all_game_weights.extend(
+            [float(ratios[component]) / len(game_reports)] * len(game_reports)
+        )
         component_reports[str(component_id)] = {
             "component_index": int(component),
             "authenticated_sampling_ratio": float(ratios[component]),
@@ -7438,11 +7521,21 @@ def evaluate_composite_validation_measure(
             "min_rows_per_game": int(min(rows_per_game)),
             "max_rows_per_game": int(max(rows_per_game)),
             "metrics": game_uniform,
+            **(
+                {"objective_measure_sufficient_statistics": sufficient}
+                if sufficient is not None
+                else {}
+            ),
         }
-    aggregate = _weighted_validation_means(component_means, ratios)
+    aggregate, aggregate_sufficient = _objective_measure_validation_aggregate(
+        all_game_reports, np.asarray(all_game_weights, dtype=np.float64)
+    )
     return {
-        "schema_version": "composite-validation-measure-v1",
-        "measure": "authenticated_component_then_uniform_game_then_uniform_row",
+        "schema_version": "composite-validation-measure-v2",
+        "measure": (
+            "authenticated_component_then_uniform_game_then_uniform_row_"
+            "with_objective_weight_density"
+        ),
         "objective_matched": True,
         "samples": int(indices.size),
         "games": int(
@@ -7454,6 +7547,11 @@ def evaluate_composite_validation_measure(
         },
         "metrics": aggregate,
         "components": component_reports,
+        **(
+            {"objective_measure_sufficient_statistics": aggregate_sufficient}
+            if aggregate_sufficient is not None
+            else {}
+        ),
     }
 
 
@@ -7759,6 +7857,17 @@ def evaluate_bc_batches(
                 else "scalar_mse"
             ),
             "loss_denominators": dict(extra_denominators),
+            "objective_coefficients": {
+                "policy_loss": float(policy_loss_weight),
+                "value_loss": float(value_loss_weight),
+                "final_vp_loss": float(final_vp_loss_weight),
+                "q_loss": float(q_loss_weight),
+                "policy_kl_anchor_loss": float(policy_kl_anchor_weight),
+                "value_uncertainty_loss": float(value_uncertainty_loss_weight),
+                "aux_subgoal_loss": float(aux_subgoal_loss_weight),
+                "moe_balance_loss": float(moe_balance_loss_weight),
+                "value_categorical_loss": float(value_categorical_loss_weight),
+            },
             "q_score_rows_ge2": int(round(extra_sums["q_score_rows_ge2"])),
             "q_score_rows_ge2_fraction": extra_sums["q_score_rows_ge2"] / max(total_count, 1.0),
             "soft_distillation_rows": int(round(extra_sums["soft_distillation_rows"])),
@@ -11295,19 +11404,20 @@ def _weighted_mean_from_parts(numerator, denominator):
     import torch
 
     if torch.is_grad_enabled():
-        try:
-            import torch.distributed as dist
+        import torch.distributed as dist
 
-            if dist.is_available() and dist.is_initialized():
-                global_denominator = denominator.detach().clone()
-                dist.all_reduce(global_denominator, op=dist.ReduceOp.SUM)
-                return (
-                    numerator
-                    * float(dist.get_world_size())
-                    / torch.clamp(global_denominator, min=1.0e-6)
-                )
-        except Exception:
-            pass
+        if dist.is_available() and dist.is_initialized():
+            # Never fall back to the local denominator after a collective error.
+            # That would silently make each rank optimize a different ratio while
+            # DDP still averages their gradients -- exactly the biased mean-of-rank-
+            # means estimator this collective exists to prevent.
+            global_denominator = denominator.detach().clone()
+            dist.all_reduce(global_denominator, op=dist.ReduceOp.SUM)
+            return (
+                numerator
+                * float(dist.get_world_size())
+                / torch.clamp(global_denominator, min=1.0e-6)
+            )
     return numerator / torch.clamp(denominator, min=1.0e-6)
 
 
@@ -13136,15 +13246,20 @@ def _apply_lr_schedule(
 
 
 # Submodule attribute names treated as "value head" parameters for --value-lr-mult.
-# The opt-in ``--freeze-modules value_heads`` group is broader because it also
-# includes the optional attention-pool path; this LR group covers the primary and
-# auxiliary value readout heads used by current recipes. Present on both
-# EntityGraphNet and XDimLite/XDimGraph's underlying model as named submodules.
+# This must cover the complete value-only readout path, including the optional
+# attention pool. Otherwise ``--value-lr-mult`` misleadingly slows the final
+# linear head while its fresh value probe/attention layers train at trunk LR.
+# Missing attributes are harmless for XDimLite/XDimGraph.
 VALUE_HEAD_MODULE_ATTRS: tuple[str, ...] = (
     "value_head",
     "value_categorical_head",
     "final_vp_head",
     "value_uncertainty_head",
+    "value_probe",
+    "value_probe_norm_q",
+    "value_probe_norm_kv",
+    "value_probe_attn",
+    "value_pool_head",
 )
 
 # Opt-in action-local modules introduced by the gather/cross-attention upgrade.

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from tools.train_bc import (
     evaluate_composite_validation_measure,
@@ -59,6 +60,7 @@ def test_objective_matched_validation_is_component_then_game_then_row() -> None:
     assert report["components"]["n128"]["max_rows_per_game"] == 3
     assert report["components"]["replay"]["metrics"]["loss"] == 10.0
     assert report["component_sampling_ratios"] == {"n128": 0.75, "replay": 0.25}
+    assert report["schema_version"] == "composite-validation-measure-v2"
     assert calls == [(0,), (1, 2, 3), (4, 5)]
 
 
@@ -101,3 +103,36 @@ def test_downstream_metric_selector_does_not_trust_unmarked_wrapper() -> None:
         },
     }
     assert objective_matched_validation_metrics(epoch) == {"loss": 2.0}
+
+
+def test_objective_measure_aggregates_weight_density_before_dividing() -> None:
+    data = _Composite()
+
+    def evaluate(indices: np.ndarray) -> dict:
+        # Game 11 has one active row with loss 1. Game 12 has one active row out
+        # of three with loss 9. Equal-game averaging of normalized losses gives
+        # 5, but the actual component->game->row training objective is
+        # ((1/1 + 9/3)/2) / ((1/1 + 1/3)/2) = 3.
+        seed = int(data["game_seed"][indices[0]])
+        policy_loss = {11: 1.0, 12: 9.0, 21: 5.0}[seed]
+        denominator = {11: 1.0, 12: 1.0, 21: 2.0}[seed]
+        return {
+            "samples": int(len(indices)),
+            "loss": policy_loss,
+            "raw_batch_mean_loss": policy_loss,
+            "component_reconstructed_loss": policy_loss,
+            "policy_loss": policy_loss,
+            "loss_denominators": {"policy_loss": denominator},
+            "objective_coefficients": {"policy_loss": 1.0},
+        }
+
+    report = evaluate_composite_validation_measure(
+        data, np.arange(6, dtype=np.int64), evaluate
+    )
+
+    assert report["components"]["n128"]["metrics"]["policy_loss"] == 3.0
+    # Overall: n128 numerator density=2, denominator density=2/3; replay both
+    # densities are 5 and 1. Apply .75/.25, then divide: 2.75 / .75.
+    assert report["metrics"]["policy_loss"] == pytest.approx(11.0 / 3.0)
+    assert report["metrics"]["loss"] == pytest.approx(11.0 / 3.0)
+    assert report["metrics"]["raw_batch_mean_loss"] == 5.0
