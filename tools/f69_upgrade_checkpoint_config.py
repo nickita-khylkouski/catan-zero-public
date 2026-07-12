@@ -33,7 +33,10 @@ _TOOLS_DIR = Path(__file__).resolve().parent
 if str(_TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(_TOOLS_DIR))
 
-from catan_zero.rl.entity_token_policy import EntityGraphConfig, EntityGraphPolicy
+from catan_zero.rl.entity_token_policy import (  # noqa: E402
+    EntityGraphConfig,
+    EntityGraphPolicy,
+)
 
 # The exact param prefixes introduced by the three upgrades (see
 # entity_token_policy.EntityGraphNet). Must equal the load() allow-list.
