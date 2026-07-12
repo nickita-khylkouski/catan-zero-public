@@ -549,11 +549,17 @@ class GumbelChanceMCTSConfig:
     policy_target_min_visits: int = 0
 
     # --- CAT-61: V4 uncertainty-driven capped backup weighting (default OFF) ---
-    # When True, each per-visit node backup is weighted by the leaf value-error
-    # head's prediction, following KataGo's capped uncertainty weighting:
-    #     weight = min(uncertainty_backup_cap, a * err ** exp)
-    # with a = uncertainty_backup_a, exp = uncertainty_backup_exp, and `err` the
-    # predicted value error of the leaf whose value is being backed up (surfaced
+    # When True, each per-visit node backup is weighted inversely by the leaf
+    # value-error head's prediction, following KataGo's uncertainty weighting:
+    #     sigma = sqrt(predicted_squared_error)
+    #     weight = a / (sigma ** exp + a / max_weight)
+    # with a = uncertainty_backup_a, exp = uncertainty_backup_exp, and
+    # max_weight = uncertainty_backup_cap. The square root is required because
+    # our auxiliary head predicts squared error while KataGo's operator consumes
+    # an error scale. Low-error leaves approach max_weight; uncertain leaves get
+    # less influence. (The previous ``min(cap, a * err**exp)`` implementation
+    # accidentally did the opposite and upweighted the least reliable leaves.)
+    # The prediction is surfaced
     # by EntityGraphRustEvaluatorConfig.emit_uncertainty and carried on each
     # node's `prior_uncertainty`). A visited action's completed-Q then uses the
     # weight-weighted mean of its backups (`_GAction.weighted_q`) instead of the
@@ -563,7 +569,8 @@ class GumbelChanceMCTSConfig:
     #
     # Default OFF is bit-identical: no weight is accumulated, completed-Q reads
     # the plain `stats.q`, and the tree traversal/visit budget is unchanged. With
-    # a non-emitting evaluator every `err` is 0.0 (weight -> 0), so the feature is
+    # a non-emitting evaluator every prediction is 0.0, so every backup receives
+    # the same max weight and weighted-Q equals plain Q; the feature is therefore
     # inert unless paired with an uncertainty-emitting evaluator AND a trained
     # error head. This is a search-semantics change: shipping is gated on a
     # strength-based H2H, never blind-shipped.
@@ -1567,16 +1574,32 @@ class GumbelChanceMCTS:
     # Simulation / backup.
     # ------------------------------------------------------------------
     def _backup_weight(self, uncertainty: float) -> float:
-        """KataGo capped uncertainty backup weight: min(cap, a * err**exp)
-        (CAT-61). `uncertainty` is the leaf value-error head's prediction for
-        the value being backed up; it is clamped to be non-negative before the
-        power so a spuriously negative err can never yield a complex or negative
-        weight. Only called when `config.uncertainty_backup_weighting` is True."""
-        err = max(0.0, float(uncertainty))
+        """Return KataGo's inverse-uncertainty backup weight (CAT-61).
+
+        ``uncertainty`` is our head's predicted squared value error. Convert it
+        to an error scale before applying KataGo's exponent, then use the
+        coefficient/max-weight floor from ``searchupdatehelpers.cpp``. A zero
+        (terminal or uniformly non-emitting evaluator) receives ``cap``; larger
+        predicted error monotonically receives less weight.
+        """
+        predicted_squared_error = max(0.0, float(uncertainty))
         a = float(self.config.uncertainty_backup_a)
         exp = float(self.config.uncertainty_backup_exp)
         cap = float(self.config.uncertainty_backup_cap)
-        return min(cap, a * (err ** exp))
+        if (
+            not math.isfinite(a)
+            or not math.isfinite(exp)
+            or not math.isfinite(cap)
+            or a <= 0.0
+            or exp <= 0.0
+            or cap <= 0.0
+        ):
+            raise ValueError(
+                "uncertainty backup coefficient, exponent, and cap must be "
+                "finite and > 0"
+            )
+        sigma = math.sqrt(predicted_squared_error)
+        return a / ((sigma**exp) + a / cap)
 
     def _accumulate_backup_weight(
         self, stats: _GAction, value: float, uncertainty: float
