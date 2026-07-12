@@ -4465,15 +4465,19 @@ def main(argv: Sequence[str] | None = None) -> None:
         )
     else:
         data = load_teacher_data(Path(args.data), ddp=ddp, shard_data=bool(args.ddp_shard_data), mask_hidden_info=bool(getattr(args, "mask_hidden_info", False)))
-    target_information_admission = _validate_target_information_admission(
-        data,
-        mask_hidden_info=bool(args.mask_hidden_info),
-        soft_target_weight=float(args.soft_target_weight),
-        policy_loss_weight=float(args.policy_loss_weight),
-        q_loss_weight=float(args.q_loss_weight),
-        value_target_lambda=float(args.value_target_lambda),
-        policy_kl_anchor_weight=float(args.policy_kl_anchor_weight),
-        policy_surprise_weight=float(args.policy_surprise_weight),
+    target_information_admission = _rank0_authoritative_call(
+        ddp,
+        "target-information admission",
+        lambda: _validate_target_information_admission(
+            data,
+            mask_hidden_info=bool(args.mask_hidden_info),
+            soft_target_weight=float(args.soft_target_weight),
+            policy_loss_weight=float(args.policy_loss_weight),
+            q_loss_weight=float(args.q_loss_weight),
+            value_target_lambda=float(args.value_target_lambda),
+            policy_kl_anchor_weight=float(args.policy_kl_anchor_weight),
+            policy_surprise_weight=float(args.policy_surprise_weight),
+        ),
     )
     _rank0_print(
         json.dumps(
@@ -4488,31 +4492,42 @@ def main(argv: Sequence[str] | None = None) -> None:
         # component payloads/holdouts are authenticated, but this mixed run is
         # diagnostic-only until a contract binds the ordered component set.
         args.a1_contract_sha256 = validation_seed_contract["a1_contract_sha256"]
-        component_seed_sets: list[set[int]] = []
-        for index, (corpus, contract) in enumerate(
-            zip(data.corpora, validation_seed_contract["component_contracts"])
-        ):
-            component_seeds = set(
-                map(int, np.unique(np.asarray(corpus["game_seed"], dtype=np.int64)))
-            )
-            for prior in component_seed_sets:
-                overlap = prior & component_seeds
-                if overlap:
-                    raise SystemExit(
-                        "memmap composite corpus game seeds overlap across components: "
-                        f"component={index} overlap_count={len(overlap)}"
-                    )
-            component_seed_sets.append(component_seeds)
-            heldout_rows = int(np.isin(
-                np.asarray(corpus["game_seed"], dtype=np.int64),
-                np.asarray(contract["game_seeds"], dtype=np.int64),
-            ).sum())
-            if heldout_rows != int(contract["validation_row_count"]):
-                raise SystemExit(
-                    "memmap composite component holdout row count drift: "
-                    f"component={index} corpus={heldout_rows} "
-                    f"manifest={contract['validation_row_count']}"
+        def _validate_composite_seed_binding() -> None:
+            component_seed_sets: list[set[int]] = []
+            for index, (corpus, contract) in enumerate(
+                zip(data.corpora, validation_seed_contract["component_contracts"])
+            ):
+                seeds = np.asarray(corpus["game_seed"], dtype=np.int64)
+                component_seeds = set(map(int, np.unique(seeds)))
+                for prior in component_seed_sets:
+                    overlap = prior & component_seeds
+                    if overlap:
+                        raise SystemExit(
+                            "memmap composite corpus game seeds overlap across components: "
+                            f"component={index} overlap_count={len(overlap)}"
+                        )
+                component_seed_sets.append(component_seeds)
+                heldout_rows = int(
+                    np.isin(
+                        seeds,
+                        np.asarray(contract["game_seeds"], dtype=np.int64),
+                    ).sum()
                 )
+                if heldout_rows != int(contract["validation_row_count"]):
+                    raise SystemExit(
+                        "memmap composite component holdout row count drift: "
+                        f"component={index} corpus={heldout_rows} "
+                        f"manifest={contract['validation_row_count']}"
+                    )
+
+        # Every local DDP rank maps the same immutable corpus.  Repeating two
+        # full game-seed scans and Python set construction eight times delays
+        # the first GPU step without increasing assurance.  Rank 0 performs
+        # the exact historical validation and broadcasts either success or its
+        # refusal before any rank proceeds.
+        _rank0_authoritative_call(
+            ddp, "composite game-seed binding", _validate_composite_seed_binding
+        )
     elif validation_seed_contract is not None:
         _validate_a1_validation_manifest_corpus_binding(
             getattr(data, "meta", None), validation_seed_contract
@@ -4882,7 +4897,11 @@ def main(argv: Sequence[str] | None = None) -> None:
         )
         train_fn = _train_xdim_batch
 
-    validate_teacher_data_schema(policy, data, data_quality, env_config)
+    _rank0_authoritative_call(
+        ddp,
+        "teacher-data schema validation",
+        lambda: validate_teacher_data_schema(policy, data, data_quality, env_config),
+    )
 
     # CAT-128 patch #8: resume optimizer (Adam) moment state from the --init-checkpoint's
     # sidecar so a stop/crash continues with warm moments + correct LR position rather
@@ -5197,18 +5216,26 @@ def main(argv: Sequence[str] | None = None) -> None:
         derived = _build_derived_training_arrays()
 
     policy_sample_weights = derived["policy_sample_weights"]
-    policy_distillation_scope_report = _policy_distillation_scope_report(
-        data, policy_sample_weights
+    policy_distillation_scope_report = (
+        _policy_distillation_scope_report(data, policy_sample_weights)
+        if int(ddp["rank"]) == 0
+        else None
     )
     value_sample_weights = derived["value_sample_weights"]
-    value_training_scope_report = _value_training_scope_report(
-        data, value_sample_weights
+    value_training_scope_report = (
+        _value_training_scope_report(data, value_sample_weights)
+        if int(ddp["rank"]) == 0
+        else None
     )
-    value_root_blend_audit = _audit_value_root_blend_corpus(
-        data,
-        value_sample_weights,
-        regime=value_root_blend_regime,
-        indices=np.asarray(derived["train_indices"], dtype=np.int64),
+    value_root_blend_audit = _rank0_authoritative_call(
+        ddp,
+        "value root-blend audit",
+        lambda: _audit_value_root_blend_corpus(
+            data,
+            value_sample_weights,
+            regime=value_root_blend_regime,
+            indices=np.asarray(derived["train_indices"], dtype=np.int64),
+        ),
     )
     # `_value_training_metadata` is rebuilt for every epoch checkpoint and the
     # final checkpoint; attach the immutable pre-optimizer realization once so
@@ -9103,20 +9130,41 @@ class _MemmapCategoricalColumn:
             }
         return result
 
+    def _code_counts(self) -> np.ndarray:
+        """Count mapped int32 codes with bounded temporary memory.
+
+        ``np.bincount(np.asarray(codes, dtype=np.int64))`` copied the complete
+        column solely because bincount requires platform integers. At 47.6M
+        rows that is a ~363 MiB transient allocation. Chunking changes no
+        integer result and keeps peak scratch independent of corpus size.
+        """
+
+        counts = np.zeros(len(self.categories), dtype=np.int64)
+        block_rows = 8 * 1024 * 1024
+        for start in range(0, len(self), block_rows):
+            stop = min(start + block_rows, len(self))
+            block = np.asarray(self._codes[start:stop], dtype=np.int64)
+            partial = np.bincount(block, minlength=len(self.categories))
+            if len(partial) != len(self.categories):
+                raise SystemExit("categorical memmap contains an out-of-range code")
+            counts += partial
+        return counts
+
     def present_values(self) -> set[str]:
-        counts = np.bincount(
-            np.asarray(self._codes, dtype=np.int64), minlength=len(self.categories)
-        )
+        counts = self._code_counts()
         return {
             str(self.categories[index])
             for index in np.flatnonzero(counts)
         }
 
     def value_counts(self, index=None) -> dict[str, int]:
-        codes = np.asarray(
-            self._codes if index is None else self._codes[index], dtype=np.int64
-        )
-        counts = np.bincount(codes, minlength=len(self.categories))
+        if index is None:
+            counts = self._code_counts()
+        else:
+            codes = np.asarray(self._codes[index], dtype=np.int64)
+            counts = np.bincount(codes, minlength=len(self.categories))
+            if len(counts) != len(self.categories):
+                raise SystemExit("categorical memmap contains an out-of-range code")
         return {
             str(self.categories[position]): int(counts[position])
             for position in np.flatnonzero(counts)
@@ -9704,22 +9752,37 @@ def _validate_target_information_admission(
     """
 
     n = int(len(data["action_taken"]))
-    regimes = np.asarray(
-        data.get(
-            "target_information_regime",
-            np.full(n, TARGET_INFORMATION_REGIME_UNKNOWN),
-        )
-    ).astype(str)
-    if regimes.shape != (n,):
+    regime_column = data.get("target_information_regime")
+    if regime_column is None:
+        counts = {TARGET_INFORMATION_REGIME_UNKNOWN: n}
+    else:
+        if tuple(getattr(regime_column, "shape", ())) != (n,):
+            raise SystemExit(
+                "target_information_regime must be a one-dimensional per-row column: "
+                f"expected {(n,)}, got {getattr(regime_column, 'shape', None)}"
+            )
+        # Dictionary-encoded memmaps can count their compact integer codes
+        # directly.  Decoding a 47.6M-row composite to a temporary Unicode
+        # array here used hundreds of MiB and was repeated by every DDP rank.
+        if isinstance(regime_column, _MemmapCategoricalColumn) or bool(
+            getattr(regime_column, "supports_value_counts", False)
+        ):
+            counts = {
+                str(value): int(count)
+                for value, count in regime_column.value_counts().items()
+            }
+        else:
+            regimes = np.asarray(regime_column).astype(str)
+            counts = {
+                str(value): int(count)
+                for value, count in zip(*np.unique(regimes, return_counts=True))
+            }
+    if sum(counts.values()) != n:
         raise SystemExit(
-            "target_information_regime must be a one-dimensional per-row column: "
-            f"expected {(n,)}, got {regimes.shape}"
+            "target_information_regime counts do not cover the corpus: "
+            f"counts={sum(counts.values())} rows={n}"
         )
-    counts = {
-        str(value): int(count)
-        for value, count in zip(*np.unique(regimes, return_counts=True))
-    }
-    unsafe_count = int(np.sum(regimes != TARGET_INFORMATION_REGIME_PUBLIC))
+    unsafe_count = n - int(counts.get(TARGET_INFORMATION_REGIME_PUBLIC, 0))
     objectives: list[str] = []
     if (
         float(policy_loss_weight) != 0.0
@@ -14290,6 +14353,58 @@ def _distributed_state() -> dict[str, int | bool]:
         "rank": int(os.environ.get("RANK", "0")),
         "local_rank": int(os.environ.get("LOCAL_RANK", "0")),
     }
+
+
+def _rank0_authoritative_call(
+    ddp: dict[str, int | bool],
+    label: str,
+    operation,
+):
+    """Run one deterministic read-only startup check per local DDP job.
+
+    DDP ranks on this learner map the same authenticated immutable memmap.  A
+    check that only returns JSON/pickle-safe metadata therefore has exactly the
+    same result on every rank, while independently scanning tens of millions
+    of rows multiplies startup I/O and host memory pressure by world size.
+
+    Rank 0 broadcasts both success and ordinary refusal as data.  This detail
+    is essential: raising on rank 0 before peers reach a collective leaves the
+    remaining ranks hung rather than failing the job coherently.
+    """
+
+    world_size = int(ddp.get("world_size", 1))
+    local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", world_size))
+    distributed = bool(ddp.get("enabled", False)) and world_size > 1
+    # On multi-node jobs each host may have its own corpus staging/filesystem.
+    # A global rank-0 result cannot attest those independent local mappings, so
+    # retain the historical per-rank check outside a single-node torchrun.
+    single_node = distributed and world_size == local_world_size
+    if not single_node:
+        return operation()
+
+    rank = int(ddp.get("rank", 0))
+    payload: list[dict[str, object] | None] = [None]
+    if rank == 0:
+        try:
+            payload[0] = {"ok": True, "value": operation()}
+        except (Exception, SystemExit) as error:
+            payload[0] = {
+                "ok": False,
+                "error_type": type(error).__name__,
+                "error": str(error),
+            }
+    import torch.distributed as dist
+
+    dist.broadcast_object_list(payload, src=0)
+    result = payload[0]
+    if not isinstance(result, dict) or result.get("ok") not in {True, False}:
+        raise SystemExit(f"{label} rank-0 authority returned malformed status")
+    if result["ok"] is not True:
+        raise SystemExit(
+            f"{label} refused on rank 0 "
+            f"({result.get('error_type', 'error')}): {result.get('error', '')}"
+        )
+    return result.get("value")
 
 
 _TRAINING_PRECOMPUTE_CACHE_SCHEMA = "train-bc-derived-arrays-v1"

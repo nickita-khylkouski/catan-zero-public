@@ -1,9 +1,27 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from tools import train_bc
 from tools.mixed_memmap_corpus import _ConcatColumn
+
+
+class _CountOnlyColumn:
+    """Categorical test double that refuses global Unicode materialisation."""
+
+    supports_value_counts = True
+
+    def __init__(self, counts: dict[str, int]):
+        self._counts = counts
+        self.shape = (sum(counts.values()),)
+
+    def value_counts(self, index=None):
+        assert index is None
+        return dict(self._counts)
+
+    def __array__(self, *args, **kwargs):  # pragma: no cover - failure sentinel
+        raise AssertionError("startup admission decoded the full categorical column")
 
 
 def _reference_per_game_weight_quality(
@@ -96,6 +114,26 @@ def test_concat_categorical_weight_report_avoids_global_decode(tmp_path) -> None
     }
 
 
+def test_categorical_full_value_counts_are_exact_and_reject_bad_codes(tmp_path) -> None:
+    path = tmp_path / "codes.dat"
+    np.asarray([2, 0, 2, 1, 0, 2], dtype=np.int32).tofile(path)
+    column = train_bc._MemmapCategoricalColumn(  # noqa: SLF001
+        np.memmap(path, dtype=np.int32, mode="r", shape=(6,)),
+        np.asarray(["a", "b", "c"]),
+    )
+    assert column.value_counts() == {"a": 2, "b": 1, "c": 3}
+    assert column.present_values() == {"a", "b", "c"}
+
+    bad_path = tmp_path / "bad-codes.dat"
+    np.asarray([0, 3], dtype=np.int32).tofile(bad_path)
+    bad = train_bc._MemmapCategoricalColumn(  # noqa: SLF001
+        np.memmap(bad_path, dtype=np.int32, mode="r", shape=(2,)),
+        np.asarray(["a", "b", "c"]),
+    )
+    with pytest.raises(SystemExit, match="out-of-range code"):
+        bad.value_counts()
+
+
 def test_root_blend_audit_counts_concat_provenance_without_decode(tmp_path) -> None:
     def provenance(name: str, codes: list[int], categories: list[str]):
         path = tmp_path / f"{name}.dat"
@@ -128,3 +166,65 @@ def test_root_blend_audit_counts_concat_provenance_without_decode(tmp_path) -> N
         "legacy": 1,
     }
     assert report["public_target_information_only"] is False
+
+
+def test_target_information_admission_counts_dictionary_column_without_decode() -> None:
+    regimes = _CountOnlyColumn(
+        {"public_conservation_pimc_v1": 8, "unknown": 2}
+    )
+    data = {
+        "action_taken": np.zeros(10, dtype=np.int64),
+        "target_information_regime": regimes,
+        "target_policy": np.zeros((10, 2), dtype=np.float32),
+    }
+    report = train_bc._validate_target_information_admission(  # noqa: SLF001
+        data,
+        mask_hidden_info=False,
+        soft_target_weight=1.0,
+        policy_loss_weight=1.0,
+        q_loss_weight=0.0,
+        value_target_lambda=1.0,
+        policy_kl_anchor_weight=0.0,
+        policy_surprise_weight=0.0,
+    )
+    assert report["unsafe_or_unknown_rows"] == 2
+    assert report["target_information_regime_counts"] == {
+        "public_conservation_pimc_v1": 8,
+        "unknown": 2,
+    }
+
+
+def test_rank0_authoritative_call_broadcasts_success(monkeypatch) -> None:
+    calls = []
+
+    def broadcast(payload, src):
+        calls.append((payload[0], src))
+
+    import torch.distributed as dist
+
+    monkeypatch.setattr(dist, "broadcast_object_list", broadcast)
+    result = train_bc._rank0_authoritative_call(  # noqa: SLF001
+        {"enabled": True, "world_size": 8, "rank": 0, "local_rank": 0},
+        "test check",
+        lambda: {"rows": 47_600_000},
+    )
+    assert result == {"rows": 47_600_000}
+    assert calls == [({"ok": True, "value": result}, 0)]
+
+
+def test_rank0_authoritative_call_broadcasts_refusal(monkeypatch) -> None:
+    import torch.distributed as dist
+
+    monkeypatch.setattr(dist, "broadcast_object_list", lambda payload, src: None)
+
+    def refuse():
+        raise SystemExit("bad corpus")
+
+    with pytest.raises(
+        SystemExit, match=r"test check refused on rank 0 \(SystemExit\): bad corpus"
+    ):
+        train_bc._rank0_authoritative_call(  # noqa: SLF001
+            {"enabled": True, "world_size": 8, "rank": 0, "local_rank": 0},
+            "test check",
+            refuse,
+        )
