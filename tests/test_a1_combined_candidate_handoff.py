@@ -84,7 +84,13 @@ def _install_replays(
                 "seed_intervals": (
                     candidate_seeds
                     if is_candidate and candidate_seeds is not None
-                    else [{"base_seed": 10, "end_seed": 570}]
+                    else [
+                        {
+                            "base_seed": 10,
+                            "end_seed": 570,
+                            "path": "candidate.json" if is_candidate else "champion.json",
+                        }
+                    ]
                 )
             },
         }

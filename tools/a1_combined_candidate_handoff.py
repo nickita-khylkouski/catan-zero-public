@@ -183,13 +183,33 @@ def adjudicate(manifest_path: Path) -> dict[str, Any]:
     champion_merge = champion_external.get("fleet_merge")
     if not isinstance(candidate_merge, dict) or not isinstance(champion_merge, dict):
         raise CombinedHandoffError("external panels lack pooled provenance")
+    def seed_intervals(merge: dict[str, Any], *, where: str) -> list[dict[str, int]]:
+        raw = merge.get("seed_intervals")
+        if not isinstance(raw, list) or any(
+            not isinstance(row, dict)
+            or isinstance(row.get("base_seed"), bool)
+            or not isinstance(row.get("base_seed"), int)
+            or isinstance(row.get("end_seed"), bool)
+            or not isinstance(row.get("end_seed"), int)
+            or row["end_seed"] <= row["base_seed"]
+            for row in raw
+        ):
+            raise CombinedHandoffError(f"{where} has invalid seed intervals")
+        # Artifact paths are role-specific by construction.  The cohort
+        # identity is the ordered set of half-open seed intervals, not where
+        # each role's shard report was collected.
+        return [
+            {"base_seed": row["base_seed"], "end_seed": row["end_seed"]}
+            for row in raw
+        ]
+
     candidate_cohort = {
         "search": candidate_external.get("effective_search_config"),
-        "seeds": candidate_merge.get("seed_intervals"),
+        "seeds": seed_intervals(candidate_merge, where="candidate external panel"),
     }
     champion_cohort = {
         "search": champion_external.get("effective_search_config"),
-        "seeds": champion_merge.get("seed_intervals"),
+        "seeds": seed_intervals(champion_merge, where="champion external panel"),
     }
     if _canonical(candidate_cohort) != _canonical(champion_cohort):
         raise CombinedHandoffError(
