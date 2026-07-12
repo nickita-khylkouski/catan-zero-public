@@ -318,6 +318,14 @@ class Runner:
         """Build a windowed corpus over ``window_paths`` and train a bounded number of steps, then
         publish a candidate. Steps are sized so INCREMENTAL reuse on this round's NEW rows tracks
         target_reuse (not the whole window — the reuse-math bug the review caught)."""
+        if self.cfg.learner_replay_required and len(window_paths) < 2:
+            return {
+                "ok": False,
+                "note": (
+                    "production-next learner requires at least two replay components; "
+                    "seed the window with authenticated prior/current corpora"
+                ),
+            }
         steps = self._planned_steps(new_rows_this_round)
         if self.dry_run:
             cand = publish_candidate(self.loop_dir, lambda p: Path(p).write_text(f"cand-{round_idx}"),
@@ -336,14 +344,15 @@ class Runner:
             return {"ok": False, "note": "memmap build failed", "exit_code": build}
         ckpt = corpus_dir / "candidate.pt"
         report = corpus_dir / "report.json"
-        train = _run([_py(), "tools/train_bc.py", "--arch", "entity_graph",
+        train_cmd = [_py(), "tools/train_bc.py", "--arch", "entity_graph",
                       "--data-format", "memmap", "--data", str(corpus_dir),
                       "--init-checkpoint", init_ckpt, "--checkpoint", str(ckpt),
                       "--report", str(report),           # REQUIRED flag (was missing)
                       "--batch-size", str(self.cfg.train_batch_size),  # must match reuse math
                       "--mask-hidden-info", "--amp", "bf16",
-                      "--max-steps", str(steps)],        # NEEDS T3: add --max-steps to train_bc (only --epochs today)
-                     self.loop_dir / "train.log")
+                      "--max-steps", str(steps)]         # bounded continuous update
+        train_cmd += self.cfg.resolve_learner_argv()
+        train = _run(train_cmd, self.loop_dir / "train.log")
         if train != 0 or not ckpt.exists():
             return {"ok": False, "note": "train failed (or --max-steps unsupported: NEEDS T3)",
                     "exit_code": train, "steps": steps}

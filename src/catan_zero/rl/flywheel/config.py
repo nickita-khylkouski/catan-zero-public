@@ -17,7 +17,7 @@ from dataclasses import dataclass, asdict, field, fields
 from .replay_window import DEFAULT_ALPHA, DEFAULT_BETA
 from .opponent_pool import OpponentPolicy
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 @dataclass
@@ -38,6 +38,34 @@ class FlywheelConfig:
     max_reuse: float = 8.0               # hard ceiling on CUMULATIVE reuse; trainer clamps past it
     train_batch_size: int = 65536        # MUST equal train_bc.py --batch-size; drives the reuse math
                                          # (was silently mismatched 16x when hardcoded to 4096)
+
+    # --- production-next learner objective (schema v2) ---
+    # Forced actions have zero policy information: after legal masking their
+    # probability is identically one, so including them can only dilute policy
+    # accounting.  They still carry state/value information, but at low weight
+    # because rows from one game are strongly correlated.  The per-game sqrt
+    # correction retains more effective sample size than exact equalization
+    # while preventing long games from dominating the scalar value objective.
+    learner_forced_action_weight: float = 0.0
+    # Keep forced-state value mass unchanged until the matched {1.0, 0.25}
+    # experiment adjudicates it.  Per-game normalization below already removes
+    # the much larger long-game replication bias.
+    learner_forced_row_value_weight: float = 1.0
+    learner_per_game_policy_weight: bool = True
+    learner_per_game_policy_weight_mode: str = "sqrt"
+    learner_per_game_value_weight: bool = True
+    learner_per_game_value_weight_mode: str = "sqrt"
+    learner_loser_sample_weight: float = 1.0
+    learner_global_shuffle: bool = True
+    # Catastrophic-forgetting control is mandatory.  Replay is the default;
+    # a positive KL anchor remains an explicit alternative/ablation rather than
+    # an unmeasured global constant.
+    learner_replay_required: bool = True
+    learner_policy_kl_anchor_weight: float = 0.0
+    # Do not silently consume stale/bootstrap targets.  Refreshed-root lambda
+    # and return-scale Q are separate experiments with their own provenance.
+    learner_value_target_lambda: float = 1.0
+    learner_q_loss_weight: float = 0.0
 
     # --- checkpoint refresh cadence (KataGo snapshot+EMA; wall-clock, not per-step) ---
     checkpoint_every_rows: int = 500_000  # publish a candidate every N new rows trained-through
@@ -166,6 +194,50 @@ class FlywheelConfig:
         "gen_determinization_min_simulations",
     )
 
+    _REQUIRED_LEARNER_FIELDS = (
+        "learner_forced_action_weight",
+        "learner_forced_row_value_weight",
+        "learner_per_game_policy_weight",
+        "learner_per_game_policy_weight_mode",
+        "learner_per_game_value_weight",
+        "learner_per_game_value_weight_mode",
+        "learner_loser_sample_weight",
+        "learner_global_shuffle",
+        "learner_replay_required",
+        "learner_policy_kl_anchor_weight",
+        "learner_value_target_lambda",
+        "learner_q_loss_weight",
+    )
+
+    def resolve_learner_argv(self) -> list[str]:
+        """Return the explicit production-next learner objective.
+
+        Keeping this at the flywheel boundary preserves historical ``train_bc``
+        replay while making every new iteration use one fail-closed recipe.
+        """
+        self.validate()
+        argv = [
+            "--forced-action-weight", str(self.learner_forced_action_weight),
+            "--forced-row-value-weight", str(self.learner_forced_row_value_weight),
+            "--per-game-policy-weight-mode", self.learner_per_game_policy_weight_mode,
+            "--per-game-value-weight-mode", self.learner_per_game_value_weight_mode,
+            "--loser-sample-weight", str(self.learner_loser_sample_weight),
+            "--policy-kl-anchor-weight", str(self.learner_policy_kl_anchor_weight),
+            "--value-target-lambda", str(self.learner_value_target_lambda),
+            "--q-loss-weight", str(self.learner_q_loss_weight),
+        ]
+        argv.append(
+            "--per-game-policy-weight"
+            if self.learner_per_game_policy_weight
+            else "--no-per-game-policy-weight"
+        )
+        argv.append(
+            "--per-game-value-weight"
+            if self.learner_per_game_value_weight
+            else "--no-per-game-value-weight"
+        )
+        return argv
+
     def resolve_gen_search_argv(self) -> list[str]:
         """CAT-88: return the EXPLICIT generation search-config CLI args, or RAISE if any
         field is unset. gen config is RUN-DEPENDENT (volume n64/p0.25 vs teacher n128/p1.0),
@@ -237,6 +309,12 @@ class FlywheelConfig:
         if sv != SCHEMA_VERSION:
             raise ValueError(f"FlywheelConfig schema {sv} != {SCHEMA_VERSION}; migrate explicitly")
         known = {f.name for f in fields(FlywheelConfig)}
+        missing_learner = set(FlywheelConfig._REQUIRED_LEARNER_FIELDS) - set(d)
+        if missing_learner:
+            raise ValueError(
+                "FlywheelConfig v2 is missing production learner recipe fields: "
+                + ", ".join(sorted(missing_learner))
+            )
         return FlywheelConfig(**{k: v for k, v in d.items() if k in known})
 
     def validate(self) -> "FlywheelConfig":
@@ -248,6 +326,28 @@ class FlywheelConfig:
             raise ValueError("opponent_pool_fraction must be in [0,1]")
         if self.max_reuse < self.target_reuse:
             raise ValueError("max_reuse must be >= target_reuse")
+        if self.learner_forced_action_weight != 0.0:
+            raise ValueError("production learner requires forced policy weight 0")
+        if not 0.0 <= self.learner_forced_row_value_weight <= 1.0:
+            raise ValueError("learner_forced_row_value_weight must be in [0,1]")
+        if not self.learner_per_game_policy_weight:
+            raise ValueError("production learner requires per-game policy weighting")
+        if not self.learner_per_game_value_weight:
+            raise ValueError("production learner requires per-game value weighting")
+        if self.learner_per_game_policy_weight_mode != "sqrt":
+            raise ValueError("production learner requires sqrt per-game policy weighting")
+        if self.learner_per_game_value_weight_mode != "sqrt":
+            raise ValueError("production learner requires sqrt per-game value weighting")
+        if self.learner_loser_sample_weight != 1.0:
+            raise ValueError("production learner requires loser_sample_weight=1")
+        if not self.learner_global_shuffle:
+            raise ValueError("production learner requires a global mixed-corpus shuffle")
+        if not self.learner_replay_required and self.learner_policy_kl_anchor_weight <= 0.0:
+            raise ValueError("production learner requires replay or a positive anti-forgetting KL anchor")
+        if self.learner_value_target_lambda != 1.0:
+            raise ValueError("production learner requires outcome-only value targets until refreshed-root graduation")
+        if self.learner_q_loss_weight != 0.0:
+            raise ValueError("production learner requires q_loss_weight=0 until return-scale Q graduation")
         if self.gate_enabled and not (0.0 <= self.gate_min_winrate <= 1.0):
             raise ValueError("gate_min_winrate must be in [0,1]")
         if self.gate_style not in ("h2h", "scoreboard"):
