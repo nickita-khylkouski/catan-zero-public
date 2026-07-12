@@ -367,7 +367,8 @@ def _derive_policy_active_dose(
 
 
 def _bind_teacher_lineage(
-    descriptor_meta: Mapping[str, Any], *, parent_checkpoint_sha256: str
+    descriptor_meta: Mapping[str, Any], *, parent_checkpoint_sha256: str,
+    expected_predecessor_sha256: str | None = None,
 ) -> dict[str, Any]:
     """Bind current data to the parent and replay to its predecessor."""
 
@@ -406,10 +407,16 @@ def _bind_teacher_lineage(
     predecessor_sha = rows[-1]["producer_checkpoint_sha256"]
     if predecessor_sha == parent_checkpoint_sha256:
         raise ArmError("replay must come from the learner parent's predecessor")
+    if (
+        expected_predecessor_sha256 is not None
+        and predecessor_sha != expected_predecessor_sha256
+    ):
+        raise ArmError("replay producer differs from the exact dethroned champion")
     return {
         "schema_version": "a1-next-teacher-lineage-v1",
         "learner_parent_checkpoint_sha256": parent_checkpoint_sha256,
         "predecessor_checkpoint_sha256": predecessor_sha,
+        "expected_predecessor_checkpoint_sha256": expected_predecessor_sha256,
         "components": rows,
     }
 
@@ -830,6 +837,7 @@ def prepare(args: argparse.Namespace) -> tuple[dict[str, Any], Path]:
         raise ArmError(
             "select exactly one parent interface: current --parent-* or legacy --f7-*"
         )
+    expected_predecessor_sha256: str | None = None
     if new_mode:
         if parent_checkpoint is None or expected_parent_sha256 is None:
             raise ArmError("current parent checkpoint and digest must be supplied together")
@@ -848,11 +856,24 @@ def prepare(args: argparse.Namespace) -> tuple[dict[str, Any], Path]:
             raise ArmError(f"current parent handoff replay failed: {error}") from error
         if handoff_payload != replayed:
             raise ArmError("current parent handoff differs from committed live lineage")
+        promotion_receipt_path = Path(
+            str(handoff_payload["promotion_receipt"]["path"])
+        )
+        promotion_receipt, promotion_receipt_ref = _load_json(promotion_receipt_path)
+        if promotion_receipt_ref["sha256"] != handoff_payload["promotion_receipt"]["sha256"]:
+            raise ArmError("post-promotion receipt bytes differ from handoff")
+        dethroned = promotion_receipt.get("champion")
+        if not isinstance(dethroned, Mapping) or not isinstance(
+            dethroned.get("sha256"), str
+        ):
+            raise ArmError("promotion receipt does not bind the dethroned champion")
+        expected_predecessor_sha256 = str(dethroned["sha256"])
         parent_lineage = {
             "mode": "post_promotion_current_parent",
             "handoff": handoff_ref,
             "handoff_sha256": handoff_payload["handoff_sha256"],
             "registry_version": handoff_payload["registry_after"]["version"],
+            "dethroned_champion_sha256": expected_predecessor_sha256,
         }
     else:
         if legacy_checkpoint is None or legacy_sha256 is None:
@@ -866,7 +887,9 @@ def prepare(args: argparse.Namespace) -> tuple[dict[str, Any], Path]:
     if new_mode and handoff_payload["producer_identity"]["checkpoint"] != parent_ref:
         raise ArmError("current learner parent differs from promoted generator identity")
     teacher_lineage = _bind_teacher_lineage(
-        descriptor_meta, parent_checkpoint_sha256=parent_ref["sha256"]
+        descriptor_meta,
+        parent_checkpoint_sha256=parent_ref["sha256"],
+        expected_predecessor_sha256=expected_predecessor_sha256,
     )
     source_identities = {
         "parent_checkpoint_sha256": parent_ref["sha256"],

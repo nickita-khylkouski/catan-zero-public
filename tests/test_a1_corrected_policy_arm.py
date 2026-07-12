@@ -408,7 +408,9 @@ def test_teacher_lineage_refuses_stale_current_data_and_parent_replay() -> None:
         ]
     }
     assert arm._bind_teacher_lineage(
-        valid, parent_checkpoint_sha256=parent
+        valid,
+        parent_checkpoint_sha256=parent,
+        expected_predecessor_sha256=predecessor,
     )["predecessor_checkpoint_sha256"] == predecessor
     stale = {
         "components": [
@@ -426,6 +428,12 @@ def test_teacher_lineage_refuses_stale_current_data_and_parent_replay() -> None:
     }
     with pytest.raises(arm.ArmError, match="parent's predecessor"):
         arm._bind_teacher_lineage(self_replay, parent_checkpoint_sha256=parent)
+    with pytest.raises(arm.ArmError, match="exact dethroned champion"):
+        arm._bind_teacher_lineage(
+            valid,
+            parent_checkpoint_sha256=parent,
+            expected_predecessor_sha256="sha256:" + "c" * 64,
+        )
 
 
 def test_rederives_sentinel_after_descriptor_scope_is_made_explicit(
