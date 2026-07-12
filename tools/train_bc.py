@@ -4975,8 +4975,14 @@ def main(argv: Sequence[str] | None = None) -> None:
                 ),
                 ddp,
             )
+        event_encoder_freeze = None
         if _CROP_AUTHENTICATED_EMPTY_EVENT_HISTORY:
             event_freeze = _freeze_authenticated_empty_event_encoder(policy.model)
+            event_encoder_freeze = event_freeze
+            training_information_surface = {
+                **(training_information_surface or {}),
+                "event_encoder_freeze": event_freeze,
+            }
             _rank0_print(
                 json.dumps(
                     {
@@ -14195,6 +14201,13 @@ def _freeze_authenticated_empty_event_encoder(model) -> dict[str, object]:
         name: bool(parameter.requires_grad)
         for name, parameter in module.named_parameters()
     }
+    parameters_by_name = dict(module.named_parameters())
+    total_parameter_tensors = len(parameters_by_name)
+    total_parameters = int(sum(p.numel() for p in parameters_by_name.values()))
+    trainable_parameter_tensors_before = sum(before.values())
+    trainable_parameters_before = int(
+        sum(p.numel() for name, p in parameters_by_name.items() if before[name])
+    )
     event_parameters = {
         f"event_encoder.{name}": parameter
         for name, parameter in event_encoder.named_parameters()
@@ -14236,6 +14249,18 @@ def _freeze_authenticated_empty_event_encoder(model) -> dict[str, object]:
             sum(parameter.numel() for parameter in event_parameters.values())
         ),
         "unexpected_frozen_parameter_tensors": 0,
+        "total_parameter_tensors": total_parameter_tensors,
+        "total_parameters": total_parameters,
+        "trainable_parameter_tensors_before": trainable_parameter_tensors_before,
+        "trainable_parameter_tensors_after": int(sum(after.values())),
+        "trainable_parameters_before": trainable_parameters_before,
+        "trainable_parameters_after": int(
+            sum(p.numel() for name, p in parameters_by_name.items() if after[name])
+        ),
+        "optimizer_excluded_parameter_tensors": len(expected),
+        "optimizer_excluded_parameters": int(
+            sum(parameter.numel() for parameter in event_parameters.values())
+        ),
     }
 
 
