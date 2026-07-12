@@ -63,9 +63,14 @@ def test_feature_layout_constants():
     assert etf.HEX_FEATURE_SIZE == 13
     assert etf.EVENT_FEATURE_SIZE == 41
     # coord occupies dims 1:4, event action-id is dim 35 (see featurizer source).
-    from catan_zero.rl.hex_symmetry import _HEX_COORD_SLICE, _EVENT_ACTION_ID_DIM
+    from catan_zero.rl.hex_symmetry import (
+        _EVENT_ACTION_ID_DIM,
+        _HEX_COORD_SLICE,
+        _LEGAL_ACTION_ID_DIM,
+    )
     assert (_HEX_COORD_SLICE.start, _HEX_COORD_SLICE.stop) == (1, 4)
     assert _EVENT_ACTION_ID_DIM == 35
+    assert _LEGAL_ACTION_ID_DIM == 1
 
 
 # --- group laws --------------------------------------------------------------
@@ -192,6 +197,39 @@ def test_target_token_gather_is_invariant(sym, real_entity):
                 # hex intrinsic dims (all but the coord slice) must match.
                 intr = [d for d in range(13) if d not in (1, 2, 3)]
                 assert np.array_equal(htok[h1][intr], htok0[h0][intr]), (g, row, "hex")
+
+
+def test_legal_action_id_feature_moves_with_board(sym, real_entity):
+    """Rows stay aligned, but each row must encode its transformed action id."""
+
+    action_size = sym.pi_act.shape[1]
+    tokens = real_entity["legal_action_tokens"]
+    ids = np.rint(tokens[:, :, 1].astype(np.float64) * action_size).astype(np.int64)
+    assert np.all((ids >= 0) & (ids < action_size))
+    for g in range(N_SYMMETRIES):
+        out = sym.permute_entity_batch(
+            real_entity,
+            g,
+            legal_action_ids=ids,
+            action_size=action_size,
+        )
+        expected = sym.pi_act[g, ids] / float(action_size)
+        assert np.allclose(
+            out["legal_action_tokens"][:, :, 1].astype(np.float64),
+            expected,
+            atol=5e-4,
+        )
+
+
+def test_legal_action_relabel_refuses_wrong_action_space(sym, real_entity):
+    ids = np.zeros(real_entity["legal_action_tokens"].shape[:2], dtype=np.int64)
+    with pytest.raises(ValueError, match="action permutation width"):
+        sym.permute_entity_batch(
+            real_entity,
+            0,
+            legal_action_ids=ids,
+            action_size=sym.pi_act.shape[1] + 1,
+        )
 
 
 def test_intrinsic_features_are_a_pure_permutation(sym, real_entity):

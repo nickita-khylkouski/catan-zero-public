@@ -6516,7 +6516,11 @@ def _forward_legal_np_for_batch(
             gen = symmetry_rng if symmetry_rng is not None else np.random.default_rng()
             g = gen.integers(n_sym, size=b)
             entity = symmetry.permute_entity_batch(
-                entity, g, relabel_events=symmetry_relabel_events
+                entity,
+                g,
+                relabel_events=symmetry_relabel_events,
+                legal_action_ids=legal_action_ids,
+                action_size=int(policy.action_size),
             )
         return policy.forward_legal_np(
             entity,

@@ -37,6 +37,7 @@ N_SYMMETRIES = 12
 # Feature layout constants mirrored from entity_token_features (kept local to
 # avoid a heavy import at table-build time; asserted against it in tests).
 _HEX_COORD_SLICE = slice(1, 4)
+_LEGAL_ACTION_ID_DIM = 1
 _EVENT_ACTION_ID_DIM = 35
 _EVENT_ACTION_ID_SCALE = 607.0
 
@@ -147,6 +148,8 @@ class HexSymmetry:
         g,
         *,
         relabel_events: bool = True,
+        legal_action_ids: np.ndarray | None = None,
+        action_size: int | None = None,
     ) -> dict:
         """Return a new entity dict with symmetry ``g`` applied.
 
@@ -191,6 +194,40 @@ class HexSymmetry:
             if key in entity:
                 out[key] = self._gather_rows(np.asarray(entity[key]), inv_sel)
 
+        # Legal-action rows stay fixed so row-wise policy targets remain
+        # aligned, but the action's GLOBAL spatial identity must move with the
+        # board.  Before this correction only target ids moved; the incumbent
+        # ignores those target ids, so D6 evaluated a rotated board against the
+        # original node/edge action-id feature.  Use the exact integer ids
+        # supplied by the caller rather than reverse-engineering fp16-scaled
+        # tokens.  Current D6 tables are the 2p BASE action space and therefore
+        # fail closed on a different action-space width.
+        if legal_action_ids is not None:
+            ids = np.asarray(legal_action_ids, dtype=np.int64)
+            if ids.shape[:2] != np.asarray(entity["legal_action_tokens"]).shape[:2]:
+                raise ValueError(
+                    "legal_action_ids shape does not match legal_action_tokens: "
+                    f"{ids.shape} vs {np.asarray(entity['legal_action_tokens']).shape}"
+                )
+            resolved_action_size = int(action_size or self.pi_act.shape[1])
+            if resolved_action_size != int(self.pi_act.shape[1]):
+                raise ValueError(
+                    "D6 action permutation width does not match action_size: "
+                    f"{self.pi_act.shape[1]} != {resolved_action_size}"
+                )
+            valid = ids >= 0
+            if np.any(ids[valid] >= self.pi_act.shape[1]):
+                raise ValueError("legal_action_ids contain an id outside D6 action space")
+            clipped = np.where(valid, ids, 0)
+            mapped = self.pi_act[g_arr[:, None], clipped]
+            action_tokens = np.asarray(entity["legal_action_tokens"]).copy()
+            action_tokens[:, :, _LEGAL_ACTION_ID_DIM] = np.where(
+                valid,
+                mapped / float(resolved_action_size),
+                action_tokens[:, :, _LEGAL_ACTION_ID_DIM],
+            ).astype(action_tokens.dtype)
+            out["legal_action_tokens"] = action_tokens
+
         # Legal-action target ids: rows fixed, columns relabelled by kind.
         if "legal_action_target_ids" in entity:
             tids = np.asarray(entity["legal_action_target_ids"]).copy()
@@ -214,7 +251,14 @@ class HexSymmetry:
 
         return out
 
-    def orientations_entity(self, entity: dict, *, relabel_events: bool = True) -> dict:
+    def orientations_entity(
+        self,
+        entity: dict,
+        *,
+        relabel_events: bool = True,
+        legal_action_ids: np.ndarray | None = None,
+        action_size: int | None = None,
+    ) -> dict:
         """Expand a single-state (B=1) entity dict into all ``N_SYMMETRIES``
         orientations, returning a B=N_SYMMETRIES batch (orientation 0 is the
         canonical/identity state). Used by the test-time value/prior denoiser."""
@@ -228,7 +272,15 @@ class HexSymmetry:
             for k, v in entity.items()
         }
         return self.permute_entity_batch(
-            tiled, np.arange(N_SYMMETRIES), relabel_events=relabel_events
+            tiled,
+            np.arange(N_SYMMETRIES),
+            relabel_events=relabel_events,
+            legal_action_ids=(
+                None
+                if legal_action_ids is None
+                else np.repeat(np.asarray(legal_action_ids), N_SYMMETRIES, axis=0)
+            ),
+            action_size=action_size,
         )
 
     def average_forward(
@@ -254,7 +306,12 @@ class HexSymmetry:
         permutation is required. Returns the averaged ``value`` (scalar),
         ``logits`` (A,), ``q_values`` (A,), plus the raw per-orientation arrays.
         """
-        ent_n = self.orientations_entity(entity, relabel_events=relabel_events)
+        ent_n = self.orientations_entity(
+            entity,
+            relabel_events=relabel_events,
+            legal_action_ids=legal_action_ids,
+            action_size=self.pi_act.shape[1],
+        )
         legal_n = np.repeat(np.asarray(legal_action_ids), N_SYMMETRIES, axis=0)
         ctx_n = np.repeat(np.asarray(legal_action_context), N_SYMMETRIES, axis=0)
         out = forward_fn(ent_n, legal_n, ctx_n, return_q)

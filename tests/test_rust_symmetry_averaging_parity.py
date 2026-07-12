@@ -168,7 +168,12 @@ def test_batched_average_matches_naive_per_orientation_loop():
         naive_values: list[float] = []
         naive_logits: list[np.ndarray] = []
         for g in range(N_SYMMETRIES):
-            ent_g = sym.permute_entity_batch(entity, g)  # B=1, single symmetry
+            ent_g = sym.permute_entity_batch(
+                entity,
+                g,
+                legal_action_ids=legal_ids,
+                action_size=sym.pi_act.shape[1],
+            )  # B=1, single symmetry
             out_g = forward_fn(ent_g, legal_ids, context, False)
             naive_values.append(float(np.asarray(out_g["value"]).reshape(-1)[0]))
             naive_logits.append(np.asarray(out_g["logits"], dtype=np.float64)[0])
