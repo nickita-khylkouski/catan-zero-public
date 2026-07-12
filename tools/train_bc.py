@@ -5360,43 +5360,62 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "teacher_accuracy": _finalize_phase_stats(teacher_stats),
             }
         )
-        validation_metrics = evaluate_bc_batches(
-            policy,
-            data,
-            validation_indices,
-            policy_sample_weights,
-            value_sample_weights,
-            args.batch_size,
-            args.soft_target_temperature,
-            args.soft_target_weight,
-            args.soft_target_source,
-            args.soft_target_min_legal_coverage,
-            args.policy_loss_weight,
-            resolved_scalar_value_weight,
-            args.final_vp_loss_weight,
-            args.q_loss_weight,
-            _parse_prefixes(args.q_skip_teacher_prefixes),
-            args.vps_to_win,
-            args.advantage_policy_weighting,
-            args.advantage_temperature,
-            args.advantage_weight_cap,
-            args.advantage_weight_floor,
-            ddp,
-            args.amp,
-            data_sharded=bool(args.ddp_shard_data),
-            truncated_vp_margin_value_weight=args.truncated_vp_margin_value_weight,
-            policy_kl_anchor_weight=float(args.policy_kl_anchor_weight),
-            policy_kl_anchor_direction=str(args.policy_kl_anchor_direction),
-            value_uncertainty_loss_weight=float(args.value_uncertainty_loss_weight),
-            aux_subgoal_loss_weight=float(args.aux_subgoal_loss_weight),
-            moe_balance_loss_weight=float(args.moe_balance_loss_weight),
-            value_categorical_loss_weight=resolved_categorical_value_weight,
-            value_hlgauss_sigma_ratio=float(args.value_hlgauss_sigma_ratio),
-            value_target_lambda=float(args.value_target_lambda),
-            data_loader_workers=int(args.data_loader_workers),
-            data_loader_prefetch=int(args.data_loader_prefetch),
+        def _evaluate_validation_indices(eval_indices: np.ndarray) -> dict:
+            return evaluate_bc_batches(
+                policy,
+                data,
+                eval_indices,
+                policy_sample_weights,
+                value_sample_weights,
+                args.batch_size,
+                args.soft_target_temperature,
+                args.soft_target_weight,
+                args.soft_target_source,
+                args.soft_target_min_legal_coverage,
+                args.policy_loss_weight,
+                resolved_scalar_value_weight,
+                args.final_vp_loss_weight,
+                args.q_loss_weight,
+                _parse_prefixes(args.q_skip_teacher_prefixes),
+                args.vps_to_win,
+                args.advantage_policy_weighting,
+                args.advantage_temperature,
+                args.advantage_weight_cap,
+                args.advantage_weight_floor,
+                ddp,
+                args.amp,
+                data_sharded=bool(args.ddp_shard_data),
+                truncated_vp_margin_value_weight=args.truncated_vp_margin_value_weight,
+                policy_kl_anchor_weight=float(args.policy_kl_anchor_weight),
+                policy_kl_anchor_direction=str(args.policy_kl_anchor_direction),
+                value_uncertainty_loss_weight=float(args.value_uncertainty_loss_weight),
+                aux_subgoal_loss_weight=float(args.aux_subgoal_loss_weight),
+                moe_balance_loss_weight=float(args.moe_balance_loss_weight),
+                value_categorical_loss_weight=resolved_categorical_value_weight,
+                value_hlgauss_sigma_ratio=float(args.value_hlgauss_sigma_ratio),
+                value_target_lambda=float(args.value_target_lambda),
+                data_loader_workers=int(args.data_loader_workers),
+                data_loader_prefetch=int(args.data_loader_prefetch),
+            )
+
+        validation_metrics = _evaluate_validation_indices(validation_indices)
+        validation_metrics["measure"] = "raw_row_concat"
+        validation_metrics["objective_matched"] = False
+        validation_metrics["warning"] = (
+            "compatibility metric: raw held-out rows do not follow the "
+            "authenticated component->game->row training measure"
         )
         metrics[-1]["validation"] = validation_metrics
+        if is_memmap_composite and tuple(
+            getattr(data, "component_game_sampling_ratios", tuple())
+        ):
+            metrics[-1]["validation_objective_matched"] = (
+                evaluate_composite_validation_measure(
+                    data,
+                    validation_indices,
+                    _evaluate_validation_indices,
+                )
+            )
         _rank0_print(
             json.dumps(
                 {
@@ -6709,6 +6728,163 @@ def _train_xdim_batch(
             if optimizer_observability is not None
             else {}
         ),
+    }
+
+
+_OBJECTIVE_MATCHED_VALIDATION_MEANS = (
+    "loss",
+    "raw_batch_mean_loss",
+    "component_reconstructed_loss",
+    "policy_loss",
+    "value_loss",
+    "scalar_value_mse_diagnostic",
+    "final_vp_loss",
+    "q_loss",
+    "policy_kl_anchor_loss",
+    "value_uncertainty_loss",
+    "aux_subgoal_loss",
+    "moe_balance_loss",
+    "value_categorical_loss",
+    "value_categorical_clean_loss",
+    "value_categorical_truncated_loss",
+    "primary_value_loss",
+    "accuracy",
+    "top3_accuracy",
+    "soft_distillation_fraction",
+    "soft_distillation_active_fraction",
+    "advantage_mean",
+    "advantage_weight_mean",
+    "prior_kl_model_prior_mean",
+    "prior_kl_target_prior_mean",
+    "prior_kl_ratio",
+    "active_policy_kl_target_model_mean",
+    "active_policy_kl_target_prior_mean",
+    "active_policy_teacher_gap_closure",
+)
+
+
+def objective_matched_validation_metrics(epoch_metrics: dict) -> dict:
+    """Return promotion-facing validation means, with historical fallback.
+
+    Composite reports wrap their authenticated aggregate with measure metadata;
+    ordinary and historical reports only have the raw ``validation`` object.
+    Centralizing this choice prevents downstream sweep/adjudication code from
+    accidentally continuing to rank new composite candidates by raw row mix.
+    """
+    matched = epoch_metrics.get("validation_objective_matched")
+    if isinstance(matched, dict):
+        metrics = matched.get("metrics")
+        if matched.get("objective_matched") is True and isinstance(metrics, dict):
+            return metrics
+    legacy = epoch_metrics.get("validation")
+    return legacy if isinstance(legacy, dict) else {}
+
+
+def _weighted_validation_means(
+    reports: list[dict], weights: np.ndarray
+) -> dict[str, float]:
+    """Combine mean-like validation fields under an explicit probability measure."""
+    if not reports:
+        raise SystemExit("cannot aggregate an empty validation report set")
+    normalized = np.asarray(weights, dtype=np.float64)
+    if normalized.shape != (len(reports),) or not np.isfinite(normalized).all():
+        raise SystemExit("validation aggregation weights are malformed")
+    total = float(normalized.sum())
+    if total <= 0.0:
+        raise SystemExit("validation aggregation weights have no mass")
+    normalized = normalized / total
+    result: dict[str, float] = {}
+    for key in _OBJECTIVE_MATCHED_VALIDATION_MEANS:
+        if all(key in report for report in reports):
+            result[key] = float(
+                np.dot(
+                    normalized,
+                    np.asarray([float(report[key]) for report in reports]),
+                )
+            )
+    return result
+
+
+def evaluate_composite_validation_measure(
+    data,
+    validation_indices: np.ndarray,
+    evaluate_indices,
+) -> dict[str, object]:
+    """Evaluate a composite under its authenticated training distribution.
+
+    The v2 learner samples ``component -> game -> row``. Concatenating holdout
+    rows instead samples components and games in proportion to their row counts;
+    on A1 that diluted the replay component by about 3.15x. Evaluate every game
+    independently so rows are uniform *within* a game, average games uniformly
+    inside each component, then apply the descriptor's authenticated component
+    ratios. ``evaluate_indices`` performs all DDP reductions, and every rank
+    traverses this deterministic component/game order, so collectives remain
+    aligned even when a game has fewer rows than ranks.
+    """
+    ratios = np.asarray(
+        getattr(data, "component_game_sampling_ratios", tuple()), dtype=np.float64
+    )
+    component_ids = tuple(getattr(data, "component_ids", tuple()))
+    corpora = tuple(getattr(data, "corpora", tuple()))
+    if (
+        ratios.shape != (len(corpora),)
+        or len(component_ids) != len(corpora)
+        or len(corpora) < 2
+        or not np.isfinite(ratios).all()
+        or np.any(ratios <= 0.0)
+        or not math.isclose(float(ratios.sum()), 1.0, rel_tol=0.0, abs_tol=1e-9)
+    ):
+        raise SystemExit(
+            "objective-matched validation requires authenticated composite ids/ratios"
+        )
+    indices = np.asarray(validation_indices, dtype=np.int64)
+    components = np.asarray(data.component_indices_for_rows(indices), dtype=np.int64)
+    seeds = np.asarray(data["game_seed"][indices], dtype=np.int64)
+    component_reports: dict[str, dict[str, object]] = {}
+    component_means: list[dict] = []
+    for component, component_id in enumerate(component_ids):
+        positions = np.flatnonzero(components == component)
+        if positions.size == 0:
+            raise SystemExit(
+                f"authenticated validation component {component_id!r} has no rows"
+            )
+        component_indices = indices[positions]
+        component_seeds = seeds[positions]
+        games = np.unique(component_seeds)
+        game_reports: list[dict] = []
+        rows_per_game: list[int] = []
+        for game_seed in games:
+            game_indices = component_indices[component_seeds == game_seed]
+            game_reports.append(evaluate_indices(game_indices))
+            rows_per_game.append(int(game_indices.size))
+        game_uniform = _weighted_validation_means(
+            game_reports, np.ones(len(game_reports), dtype=np.float64)
+        )
+        component_means.append(game_uniform)
+        component_reports[str(component_id)] = {
+            "component_index": int(component),
+            "authenticated_sampling_ratio": float(ratios[component]),
+            "games": int(len(games)),
+            "rows": int(positions.size),
+            "min_rows_per_game": int(min(rows_per_game)),
+            "max_rows_per_game": int(max(rows_per_game)),
+            "metrics": game_uniform,
+        }
+    aggregate = _weighted_validation_means(component_means, ratios)
+    return {
+        "schema_version": "composite-validation-measure-v1",
+        "measure": "authenticated_component_then_uniform_game_then_uniform_row",
+        "objective_matched": True,
+        "samples": int(indices.size),
+        "games": int(
+            sum(int(report["games"]) for report in component_reports.values())
+        ),
+        "component_sampling_ratios": {
+            str(component_id): float(ratio)
+            for component_id, ratio in zip(component_ids, ratios, strict=True)
+        },
+        "metrics": aggregate,
+        "components": component_reports,
     }
 
 

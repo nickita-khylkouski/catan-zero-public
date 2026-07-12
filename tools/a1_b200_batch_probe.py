@@ -29,6 +29,7 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from tools import a1_dual_arm_train as dual  # noqa: E402
+from tools import train_bc  # noqa: E402
 
 
 SCHEMA = "a1-b200-batch-probe-plan-v1"
@@ -481,7 +482,9 @@ def summarize(run: dict[str, Any]) -> dict[str, Any]:
     elapsed = (int(runtime["finished_unix_ns"]) - int(runtime["started_unix_ns"])) / 1e9
     steps = int(report["steps_completed"])
     samples = steps * int(run["global_batch_size"])
-    validation = report["metrics"][-1]["validation"]
+    validation = train_bc.objective_matched_validation_metrics(
+        report["metrics"][-1]
+    )
     closure = float(validation["active_policy_teacher_gap_closure"])
     optimizer = _optimizer_log_summary(run_dir / "train.log")
     return {

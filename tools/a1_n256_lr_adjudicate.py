@@ -17,6 +17,7 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from tools import a1_dual_arm_train as training  # noqa: E402
+from tools import train_bc  # noqa: E402
 from tools.fleet import a1_n256_lr_eval as trial_tool  # noqa: E402
 from tools.fleet import a1_h100_eval_fleet as fleet  # noqa: E402
 
@@ -316,7 +317,7 @@ def _arm_metrics(
     metrics = report.get("metrics")
     if not isinstance(metrics, list) or not metrics:
         raise AdjudicationError(f"{label} report has no epoch metrics")
-    validation = metrics[-1].get("validation", {})
+    validation = train_bc.objective_matched_validation_metrics(metrics[-1])
     candidate_ci = external_candidate.get("candidate_win_rate_wilson_95ci")
     champion_ci = external_champion.get("candidate_win_rate_wilson_95ci")
     if not (
