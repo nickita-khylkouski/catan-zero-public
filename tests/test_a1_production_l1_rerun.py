@@ -86,3 +86,17 @@ def test_projection_rejects_extra_or_reordered_inventory_ack() -> None:
     ]
     with pytest.raises(l1.L1Error, match="order drift"):
         l1._historical_projection(derived, inventories)
+
+
+def test_python_binding_preserves_lexical_venv_symlink(tmp_path) -> None:
+    real = tmp_path / "python-real"
+    real.write_bytes(b"#!/bin/sh\n")
+    real.chmod(0o755)
+    lexical = tmp_path / "venv-python"
+    lexical.symlink_to(real)
+
+    binding = l1._python_binding(lexical)
+
+    assert binding["lexical_path"] == str(lexical)
+    assert binding["resolved_path"] == str(real)
+    assert l1._verify_python_binding(binding) == str(lexical)

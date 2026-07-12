@@ -80,6 +80,34 @@ def _ref(path: Path) -> dict[str, str]:
     return {"path": str(resolved), "sha256": _file_sha(resolved)}
 
 
+def _python_binding(path: Path) -> dict[str, str]:
+    """Bind venv Python bytes without replacing its lexical activation path."""
+
+    lexical = path.expanduser()
+    if not lexical.is_absolute() or not lexical.exists() or not os.access(lexical, os.X_OK):
+        raise L1Error(f"Python must be an executable absolute path: {lexical}")
+    resolved = lexical.resolve(strict=True)
+    return {
+        "lexical_path": str(lexical),
+        "resolved_path": str(resolved),
+        "sha256": _file_sha(resolved),
+    }
+
+
+def _verify_python_binding(value: Any) -> str:
+    if not isinstance(value, dict) or set(value) != {
+        "lexical_path", "resolved_path", "sha256"
+    }:
+        raise L1Error("runtime Python binding is malformed")
+    lexical = Path(str(value["lexical_path"]))
+    if not lexical.is_absolute() or not lexical.exists() or not os.access(lexical, os.X_OK):
+        raise L1Error("bound lexical venv Python is unavailable")
+    resolved = lexical.resolve(strict=True)
+    if str(resolved) != value["resolved_path"] or _file_sha(resolved) != value["sha256"]:
+        raise L1Error("bound runtime Python drifted")
+    return str(lexical)
+
+
 def _verify_ref(value: Any, label: str) -> Path:
     if not isinstance(value, dict) or set(value) != {"path", "sha256"}:
         raise L1Error(f"{label} reference is malformed")
@@ -231,7 +259,7 @@ def _descriptor_inventory(descriptor: Path) -> tuple[list[str], list[dict[str, A
 
 def prepare(
     *, source_receipt: Path, repo: Path, output_root: Path, manifest_path: Path,
-    python: Path,
+    python: Path, failed_attempt_root: Path | None = None,
 ) -> dict[str, Any]:
     repo = repo.expanduser().resolve(strict=True)
     commit = _assert_bound_checkout(repo)
@@ -270,8 +298,9 @@ def prepare(
         "execution.claim.json", "submission.receipt.json", "completion.receipt.json",
     )):
         raise L1Error("production L1 output root is not fresh")
+    python_binding = _python_binding(python)
     command = list(source_command)
-    command[0] = str(python.expanduser().resolve(strict=True))
+    command[0] = python_binding["lexical_path"]
     trainer_index = command.index(next(v for v in command if Path(v).name == "train_bc.py"))
     command[trainer_index] = str((repo / "tools/train_bc.py").resolve(strict=True))
     _replace_option(command, "--data", descriptor["path"])
@@ -312,6 +341,7 @@ def prepare(
             "public_main_commit": commit,
             "files": source_files,
         },
+        "runtime_python": python_binding,
         "execution_preconditions": {
             "visible_gpu_count": 8,
             "gpu_model_substring": "B200",
@@ -323,6 +353,23 @@ def prepare(
         "command_sha256": _digest(command),
         "output_root": str(output_root),
     }
+    if failed_attempt_root is not None:
+        failed_root = failed_attempt_root.expanduser().resolve(strict=True)
+        absent = [failed_root / "candidate.pt", failed_root / "train.report.json"]
+        if any(path.exists() for path in absent):
+            raise L1Error("failed retry lineage unexpectedly contains training outputs")
+        stderr = _ref(failed_root / "stderr.log")
+        stderr_text = Path(stderr["path"]).read_text(encoding="utf-8", errors="replace")
+        if "No module named 'torch'" not in stderr_text:
+            raise L1Error("failed retry lineage is not the authorized pre-training venv failure")
+        manifest["pre_training_retry_lineage"] = {
+            "repair": "preserve lexical venv interpreter path",
+            "optimizer_steps": 0,
+            "outputs": None,
+            "claim": _ref(failed_root / "execution.claim.json"),
+            "submission": _ref(failed_root / "submission.receipt.json"),
+            "stderr": stderr,
+        }
     manifest["manifest_sha256"] = _digest(manifest)
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     descriptor_fd = os.open(
@@ -352,6 +399,13 @@ def verify(manifest_path: Path) -> dict[str, Any]:
         raise L1Error("manifest does not authorize the production L1 rerun")
     for field in ("source_receipt", "source_descriptor", "validation_sentinel", "f7_parent"):
         _verify_ref(manifest.get(field), field)
+    lexical_python = _verify_python_binding(manifest.get("runtime_python"))
+    if manifest.get("pre_training_retry_lineage") is not None:
+        lineage = manifest["pre_training_retry_lineage"]
+        if not isinstance(lineage, dict) or lineage.get("optimizer_steps") != 0 or lineage.get("outputs") is not None:
+            raise L1Error("pre-training retry lineage is malformed")
+        for field in ("claim", "submission", "stderr"):
+            _verify_ref(lineage.get(field), f"retry.{field}")
     for row in manifest.get("component_bindings", []):
         _verify_ref(row.get("corpus_meta"), f"{row.get('component_id')}.corpus_meta")
         _verify_ref(row.get("validation_manifest"), f"{row.get('component_id')}.validation")
@@ -368,6 +422,8 @@ def verify(manifest_path: Path) -> dict[str, Any]:
         raise L1Error("command is malformed")
     if manifest.get("command_sha256") != _digest(command):
         raise L1Error("command digest drift")
+    if command[0] != lexical_python:
+        raise L1Error("command does not preserve the bound lexical venv interpreter")
     inventories = manifest["event_history_training_contract"][
         "payload_inventory_acknowledgements"
     ]
@@ -462,7 +518,7 @@ def execute(
     stdout, stderr = root / "stdout.log", root / "stderr.log"
     systemd_command = [
         "sudo", "-n", "systemd-run", f"--unit={unit}", "--uid=ubuntu", "--gid=ubuntu",
-        "--service-type=exec", "--collect", "--property=LimitNOFILE=65536",
+        "--service-type=exec", "--property=LimitNOFILE=65536",
         f"--property=WorkingDirectory={verified['repo']}",
         f"--property=StandardOutput=append:{stdout}",
         f"--property=StandardError=append:{stderr}",
@@ -538,6 +594,7 @@ def build_parser() -> argparse.ArgumentParser:
     prep.add_argument("--output-root", required=True, type=Path)
     prep.add_argument("--manifest", required=True, type=Path)
     prep.add_argument("--python", required=True, type=Path)
+    prep.add_argument("--failed-attempt-root", type=Path)
     run = sub.add_parser("execute")
     run.add_argument("--manifest", required=True, type=Path)
     run.add_argument("--unit", default="a1-production-l1-rerun")
@@ -555,7 +612,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             payload = prepare(
                 source_receipt=args.source_receipt, repo=args.repo,
                 output_root=args.output_root, manifest_path=args.manifest,
-                python=args.python,
+                python=args.python, failed_attempt_root=args.failed_attempt_root,
             )
             print(json.dumps({"prepared": True, "launched": False,
                               "manifest_sha256": payload["manifest_sha256"]}, sort_keys=True))
