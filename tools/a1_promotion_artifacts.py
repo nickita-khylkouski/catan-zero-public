@@ -32,6 +32,7 @@ from tools.champion_registry import ChampionRegistry  # noqa: E402
 from tools.high_regret_suite_contract import (  # noqa: E402
     REPLAY_CONTRACT,
     SUITE_SCHEMA,
+    load_source_validation_binding,
     scope_inventory_sha256,
 )
 
@@ -354,6 +355,12 @@ def build_held_out_high_regret_suite(
     import numpy as np
 
     manifest_path = manifest_path.expanduser().resolve()
+    try:
+        held_out_seeds, validation_binding = load_source_validation_binding(
+            manifest_path
+        )
+    except ValueError as error:
+        raise ArtifactBuildError(str(error)) from error
     if not (0.0 < holdout_fraction < 1.0):
         raise ArtifactBuildError("holdout_fraction must be in (0, 1)")
     pairs = _positive_int(pairs, where="held-out suite pairs")
@@ -401,6 +408,11 @@ def build_held_out_high_regret_suite(
     }
     if len(lengths) != 1 or not game_seeds.size:
         raise ArtifactBuildError("regret manifest columns are empty or misaligned")
+    leaked = set(map(int, game_seeds)) - held_out_seeds
+    if leaked:
+        raise ArtifactBuildError(
+            f"regret manifest contains {len(leaked)} non-validation game seeds"
+        )
 
     def stable_unit_hash(game_seed: int, decision_index: int) -> float:
         return (
@@ -533,6 +545,7 @@ def build_held_out_high_regret_suite(
         "suite": "held_out_high_regret",
         "held_out": True,
         "source_manifest": _file_ref(manifest_path, where="regret manifest"),
+        "validation_seed_manifest": validation_binding,
         "selection": {
             "algorithm": "stable-hash-holdout-stratified-regret-v1",
             "holdout_fraction": float(holdout_fraction),

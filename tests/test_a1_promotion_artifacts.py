@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import stat
 from pathlib import Path
 
@@ -28,6 +29,29 @@ def _checkpoints(tmp_path: Path) -> tuple[Path, Path]:
 
 def _ref(path: Path) -> dict[str, str]:
     return {"path": str(path.resolve()), "sha256": promotion._sha256(path)}
+
+
+def _held_out_npz(tmp_path: Path, seeds) -> dict:
+    values = np.sort(np.unique(np.asarray(seeds, dtype=np.int64)))
+    manifest = tmp_path / "validation-seeds.json"
+    payload = {
+        "schema_version": "train-validation-game-seeds-v1",
+        "game_seeds": values.tolist(),
+        "validation_game_seed_count": len(values),
+        "validation_game_seed_set_sha256": "sha256:"
+        + hashlib.sha256(values.astype("<i8").tobytes()).hexdigest(),
+    }
+    _json(manifest, payload)
+    return {
+        "held_out_only": np.asarray(True),
+        "validation_seed_manifest_path": np.asarray(str(manifest.resolve())),
+        "validation_seed_manifest_sha256": np.asarray(promotion._sha256(manifest)),
+        "validation_seed_manifest_schema_version": np.asarray(payload["schema_version"]),
+        "validation_game_seed_count": np.asarray(len(values), dtype=np.int64),
+        "validation_game_seed_set_sha256": np.asarray(
+            payload["validation_game_seed_set_sha256"]
+        ),
+    }
 
 
 def _high_regret_report(
@@ -208,6 +232,7 @@ def test_held_out_suite_is_deterministic_and_derived_from_manifest(
     manifest = tmp_path / "regret.npz"
     np.savez(
         manifest,
+        **_held_out_npz(tmp_path, np.arange(10_000, 10_200)),
         shard_id=np.zeros(200, dtype=np.int32),
         row_index=np.arange(200, dtype=np.int32),
         game_seed=np.arange(10_000, 10_200, dtype=np.int64),
@@ -342,6 +367,7 @@ def test_held_out_suite_rejects_gaps_duplicates_and_partial_lanes(
     manifest = tmp_path / "regret.npz"
     np.savez(
         manifest,
+        **_held_out_npz(tmp_path, candidate_seeds),
         shard_id=np.asarray(candidate_shards, dtype=np.int32),
         row_index=np.asarray(candidate_rows, dtype=np.int32),
         game_seed=np.asarray(candidate_seeds, dtype=np.int64),
@@ -387,6 +413,7 @@ def test_held_out_suite_fails_clearly_when_replay_complete_pool_is_too_small(
     manifest = tmp_path / "regret.npz"
     np.savez(
         manifest,
+        **_held_out_npz(tmp_path, np.arange(40_000, 40_040)),
         shard_id=np.zeros(40, dtype=np.int32),
         row_index=np.arange(40, dtype=np.int32),
         game_seed=np.arange(40_000, 40_040, dtype=np.int64),
@@ -403,6 +430,68 @@ def test_held_out_suite_fails_clearly_when_replay_complete_pool_is_too_small(
         artifacts.build_held_out_high_regret_suite(
             manifest_path=manifest,
             holdout_fraction=0.999999999,
+            holdout_seed=17,
+            pairs=20,
+        )
+
+
+def test_held_out_suite_refuses_any_non_validation_source_row(tmp_path: Path) -> None:
+    shard = tmp_path / "rows.npz"
+    np.savez(
+        shard,
+        game_seed=np.asarray([1, 2]),
+        decision_index=np.asarray([0, 0]),
+        action_taken=np.asarray([1, 2]),
+    )
+    manifest = tmp_path / "regret.npz"
+    np.savez(
+        manifest,
+        **_held_out_npz(tmp_path, [1]),
+        shard_id=np.asarray([0, 0]),
+        row_index=np.asarray([0, 1]),
+        game_seed=np.asarray([1, 2]),
+        decision_index=np.asarray([0, 0]),
+        regret_score=np.asarray([1.0, 0.5]),
+        phase=np.asarray(["ROLL", "ROLL"]),
+        legal_count=np.asarray([54, 54]),
+        shard_paths=np.asarray([str(shard)]),
+    )
+    with pytest.raises(artifacts.ArtifactBuildError, match="non-validation"):
+        artifacts.build_held_out_high_regret_suite(
+            manifest_path=manifest,
+            holdout_fraction=0.10,
+            holdout_seed=17,
+            pairs=20,
+        )
+
+
+def test_held_out_suite_refuses_validation_manifest_drift(tmp_path: Path) -> None:
+    shard = tmp_path / "rows.npz"
+    np.savez(
+        shard,
+        game_seed=np.asarray([1]),
+        decision_index=np.asarray([0]),
+        action_taken=np.asarray([1]),
+    )
+    fields = _held_out_npz(tmp_path, [1])
+    manifest = tmp_path / "regret.npz"
+    np.savez(
+        manifest,
+        **fields,
+        shard_id=np.asarray([0]),
+        row_index=np.asarray([0]),
+        game_seed=np.asarray([1]),
+        decision_index=np.asarray([0]),
+        regret_score=np.asarray([1.0]),
+        phase=np.asarray(["ROLL"]),
+        legal_count=np.asarray([54]),
+        shard_paths=np.asarray([str(shard)]),
+    )
+    (tmp_path / "validation-seeds.json").write_text("{}", encoding="utf-8")
+    with pytest.raises(artifacts.ArtifactBuildError, match="unsupported"):
+        artifacts.build_held_out_high_regret_suite(
+            manifest_path=manifest,
+            holdout_fraction=0.10,
             holdout_seed=17,
             pairs=20,
         )

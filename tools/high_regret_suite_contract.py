@@ -22,8 +22,137 @@ if str(_REPO_ROOT) not in sys.path:
 from tools import regret_common  # noqa: E402
 
 
-SUITE_SCHEMA = "a1-held-out-high-regret-suite-v3"
+SUITE_SCHEMA = "a1-held-out-high-regret-suite-v4"
 REPLAY_CONTRACT = "authoritative-shard-parent-hashed-unique-contiguous-trajectory-v3"
+
+
+def _seed_set_sha256(seeds: np.ndarray) -> str:
+    values = np.sort(np.asarray(seeds, dtype=np.int64).reshape(-1))
+    return "sha256:" + hashlib.sha256(
+        values.astype("<i8", copy=False).tobytes()
+    ).hexdigest()
+
+
+def load_validation_seed_manifest(
+    path: Path,
+) -> tuple[set[int], dict[str, Any]]:
+    """Load and bind the trainer's exact game-level held-out set.
+
+    High-regret's own hash partition is not a training holdout.  Promotion
+    evidence must first be restricted to a trainer-authenticated validation
+    manifest, then may rank/stratify within that fixed set.
+    """
+
+    path = path.expanduser().absolute()
+    if path.is_symlink() or path.resolve(strict=True) != path:
+        raise ValueError("validation-seed manifest is not a canonical regular file")
+    before = _stable_file_record(path)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"cannot load validation-seed manifest: {error}") from error
+    if not isinstance(payload, dict):
+        raise ValueError("validation-seed manifest is not a JSON object")
+    schema = payload.get("schema_version")
+    if schema == "train-validation-game-seeds-v1":
+        raw_seeds = payload.get("game_seeds")
+        declared_count = payload.get("validation_game_seed_count")
+        declared_digest = payload.get("validation_game_seed_set_sha256")
+    elif schema == "value-calibration-validation-seeds-v1":
+        raw_seeds = payload.get("validation_game_seeds")
+        declared_count = payload.get("validation_game_seed_count")
+        declared_digest = payload.get("validation_game_seed_set_sha256")
+    else:
+        raise ValueError(
+            f"unsupported validation-seed manifest schema {schema!r}"
+        )
+    if not isinstance(raw_seeds, list) or not raw_seeds:
+        raise ValueError("validation-seed manifest contains no game seeds")
+    if any(isinstance(seed, bool) or not isinstance(seed, int) for seed in raw_seeds):
+        raise ValueError("validation-seed manifest game seeds must be integers")
+    values = np.asarray(raw_seeds, dtype=np.int64)
+    if len(np.unique(values)) != len(values):
+        raise ValueError("validation-seed manifest contains duplicate game seeds")
+    digest = _seed_set_sha256(values)
+    if declared_count is not None and (
+        isinstance(declared_count, bool)
+        or not isinstance(declared_count, int)
+        or declared_count != len(values)
+    ):
+        raise ValueError("validation-seed manifest count mismatch")
+    if declared_digest is not None and declared_digest != digest:
+        raise ValueError("validation-seed manifest seed-set digest mismatch")
+    after = _stable_file_record(path)
+    if after != before:
+        raise ValueError("validation-seed manifest changed while loading")
+    return set(map(int, values)), {
+        "path": str(path),
+        "sha256": before["sha256"],
+        "schema_version": schema,
+        "game_seed_count": len(values),
+        "game_seed_set_sha256": digest,
+    }
+
+
+def load_source_validation_binding(
+    source_manifest: Path,
+) -> tuple[set[int], dict[str, Any]]:
+    """Replay the validation binding embedded by the regret extractor."""
+
+    required = {
+        "held_out_only",
+        "validation_seed_manifest_path",
+        "validation_seed_manifest_sha256",
+        "validation_seed_manifest_schema_version",
+        "validation_game_seed_count",
+        "validation_game_seed_set_sha256",
+        "game_seed",
+    }
+    try:
+        with np.load(source_manifest, allow_pickle=False) as data:
+            if not required.issubset(data.files):
+                raise ValueError(
+                    "regret manifest lacks an authenticated validation-seed binding"
+                )
+
+            def scalar(name: str) -> Any:
+                values = np.asarray(data[name]).reshape(-1)
+                if len(values) != 1:
+                    raise ValueError(f"regret manifest {name} must be scalar")
+                return values[0].item() if hasattr(values[0], "item") else values[0]
+
+            held_out_only = scalar("held_out_only")
+            path = Path(str(scalar("validation_seed_manifest_path")))
+            stated = {
+                "sha256": str(scalar("validation_seed_manifest_sha256")),
+                "schema_version": str(
+                    scalar("validation_seed_manifest_schema_version")
+                ),
+                "game_seed_count": int(scalar("validation_game_seed_count")),
+                "game_seed_set_sha256": str(
+                    scalar("validation_game_seed_set_sha256")
+                ),
+            }
+            source_seeds = np.asarray(data["game_seed"], dtype=np.int64).reshape(-1)
+    except (OSError, ValueError, TypeError) as error:
+        raise ValueError(f"cannot replay regret validation binding: {error}") from error
+    if held_out_only is not True and held_out_only != np.bool_(True):
+        raise ValueError("regret manifest is not held-out-only")
+    if not path.is_absolute():
+        path = source_manifest.parent / path
+    allowed, actual = load_validation_seed_manifest(path)
+    comparable = {key: actual[key] for key in stated}
+    if stated != comparable:
+        raise ValueError("regret validation-seed binding drifted")
+    observed = set(map(int, source_seeds))
+    if not observed:
+        raise ValueError("held-out regret manifest contains no rows")
+    leaked = observed - allowed
+    if leaked:
+        raise ValueError(
+            f"held-out regret manifest contains {len(leaked)} non-validation game seeds"
+        )
+    return allowed, actual
 
 
 def _stable_file_record(path: Path) -> dict[str, Any]:

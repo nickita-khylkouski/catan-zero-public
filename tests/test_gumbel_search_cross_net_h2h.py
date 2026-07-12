@@ -155,8 +155,37 @@ def test_held_out_suite_loader_replays_digest_and_source_manifest(
         action_taken=np.arange(20),
     )
     source = tmp_path / "regret.npz"
+    validation = tmp_path / "validation-seeds.json"
+    validation_seeds = np.arange(123, 143, dtype=np.int64)
+    validation_payload = {
+        "schema_version": "train-validation-game-seeds-v1",
+        "game_seeds": validation_seeds.tolist(),
+        "validation_game_seed_count": len(validation_seeds),
+        "validation_game_seed_set_sha256": "sha256:"
+        + h2h.hashlib.sha256(validation_seeds.astype("<i8").tobytes()).hexdigest(),
+    }
+    validation.write_text(json.dumps(validation_payload), encoding="utf-8")
+    validation_binding = {
+        "path": str(validation.resolve()),
+        "sha256": h2h._checkpoint_sha256(validation),
+        "schema_version": validation_payload["schema_version"],
+        "game_seed_count": len(validation_seeds),
+        "game_seed_set_sha256": validation_payload[
+            "validation_game_seed_set_sha256"
+        ],
+    }
     np.savez(
         source,
+        held_out_only=np.asarray(True),
+        validation_seed_manifest_path=np.asarray(str(validation.resolve())),
+        validation_seed_manifest_sha256=np.asarray(validation_binding["sha256"]),
+        validation_seed_manifest_schema_version=np.asarray(
+            validation_binding["schema_version"]
+        ),
+        validation_game_seed_count=np.asarray(len(validation_seeds), dtype=np.int64),
+        validation_game_seed_set_sha256=np.asarray(
+            validation_binding["game_seed_set_sha256"]
+        ),
         shard_paths=np.asarray([str(shard)]),
         shard_id=np.zeros(20, dtype=np.int32),
         row_index=np.arange(20, dtype=np.int32),
@@ -172,6 +201,7 @@ def test_held_out_suite_loader_replays_digest_and_source_manifest(
             "path": str(source),
             "sha256": h2h._checkpoint_sha256(source),
         },
+        "validation_seed_manifest": validation_binding,
         "selection": {
             "algorithm": "stable-hash-holdout-stratified-regret-v1",
             "holdout_fraction": 0.10,

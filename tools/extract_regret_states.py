@@ -39,6 +39,7 @@ from regret_common import (
     score_shard,
     write_json_atomic,
 )
+from high_regret_suite_contract import load_validation_seed_manifest
 
 # Fixed histogram support for the streaming score distribution. Scores are a
 # small non-negative sum of ~[0,1] components; 0..4 covers the weighted range
@@ -100,8 +101,23 @@ def main() -> None:
     parser.add_argument("--w-kl-disagreement", type=float, default=0.5)
     parser.add_argument("--w-argmax-mismatch-lost", type=float, default=0.4)
     parser.add_argument("--include-forced", action="store_true")
+    parser.add_argument(
+        "--validation-seed-manifest",
+        default=None,
+        help=(
+            "restrict every retained row to an immutable trainer validation-game "
+            "manifest; required for promotion-grade high-regret suites"
+        ),
+    )
     parser.add_argument("--max-shards", type=int, default=0, help="0 = all (debug cap)")
     args = parser.parse_args()
+
+    held_out_seeds: set[int] | None = None
+    held_out_binding: dict[str, Any] | None = None
+    if args.validation_seed_manifest:
+        held_out_seeds, held_out_binding = load_validation_seed_manifest(
+            Path(args.validation_seed_manifest)
+        )
 
     config = RegretConfig(
         value_surprise_weight=args.w_value_surprise,
@@ -176,6 +192,13 @@ def main() -> None:
             phase_counts[str(ph)] = phase_counts.get(str(ph), 0) + int(c)
 
         cand = scored["is_candidate"]
+        seeds = np.asarray(shard["game_seed"]).reshape(-1)
+        if held_out_seeds is not None:
+            cand = cand & np.isin(
+                seeds,
+                np.fromiter(held_out_seeds, dtype=np.int64),
+                assume_unique=False,
+            )
         candidate_rows += int(cand.sum())
         cand_idx = np.nonzero(cand)[0]
         if cand_idx.size == 0:
@@ -188,7 +211,6 @@ def main() -> None:
         for ph, c in zip(*np.unique(phases[cand_idx], return_counts=True)):
             phase_counts_candidates[str(ph)] = phase_counts_candidates.get(str(ph), 0) + int(c)
 
-        seeds = np.asarray(shard["game_seed"]).reshape(-1)
         didx = np.asarray(shard["decision_index"]).reshape(-1)
         legal_count = scored["legal_count"]
         # Only offer rows that could plausibly enter the heap (cheap gate).
@@ -219,7 +241,14 @@ def main() -> None:
             )
 
     records = topk.sorted_desc()
-    _write_manifest(Path(args.out), records, shard_paths, config, args)
+    if held_out_binding is not None and not records:
+        raise SystemExit(
+            "validation-seed filtering retained no high-regret candidate rows"
+        )
+    _write_manifest(
+        Path(args.out), records, shard_paths, config, args,
+        held_out_binding=held_out_binding,
+    )
     summary = _build_summary(
         records=records,
         shard_paths=shard_paths,
@@ -249,10 +278,16 @@ def _write_manifest(
     shard_paths: list[str],
     config: RegretConfig,
     args: argparse.Namespace,
+    *,
+    held_out_binding: dict[str, Any] | None = None,
 ) -> None:
     out = Path(out)
     out.parent.mkdir(parents=True, exist_ok=True)
     if not records:
+        if held_out_binding is not None:
+            raise ValueError(
+                "validation-seed filtering retained no high-regret candidate rows"
+            )
         np.savez(out, shard_paths=np.asarray(shard_paths))
         return
     cols = {
@@ -272,6 +307,27 @@ def _write_manifest(
         "teacher": np.asarray([r["teacher"] for r in records]),
         "shard_paths": np.asarray(shard_paths),
     }
+    if held_out_binding is not None:
+        cols.update(
+            {
+                "held_out_only": np.asarray(True),
+                "validation_seed_manifest_path": np.asarray(
+                    held_out_binding["path"]
+                ),
+                "validation_seed_manifest_sha256": np.asarray(
+                    held_out_binding["sha256"]
+                ),
+                "validation_seed_manifest_schema_version": np.asarray(
+                    held_out_binding["schema_version"]
+                ),
+                "validation_game_seed_count": np.asarray(
+                    held_out_binding["game_seed_count"], dtype=np.int64
+                ),
+                "validation_game_seed_set_sha256": np.asarray(
+                    held_out_binding["game_seed_set_sha256"]
+                ),
+            }
+        )
     tmp = out.with_name(out.name + ".tmp")
     with tmp.open("wb") as handle:
         np.savez(handle, **cols)

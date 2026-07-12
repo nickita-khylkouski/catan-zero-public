@@ -72,6 +72,7 @@ from tools.high_regret_suite_contract import (  # noqa: E402
     SUITE_SCHEMA,
     bind_state_to_manifest,
     load_source_manifest,
+    load_source_validation_binding,
     pin_replay_scope,
     scope_inventory_sha256,
     validate_replay_metadata,
@@ -122,6 +123,7 @@ def _load_held_out_high_regret_suite(
         "suite",
         "held_out",
         "source_manifest",
+        "validation_seed_manifest",
         "selection",
         "states",
         "suite_sha256",
@@ -157,6 +159,9 @@ def _load_held_out_high_regret_suite(
     ):
         raise ValueError("held-out suite source manifest is missing or drifted")
     shard_paths, manifest_identities = load_source_manifest(source_path)
+    allowed_seeds, validation_binding = load_source_validation_binding(source_path)
+    if suite["validation_seed_manifest"] != validation_binding:
+        raise ValueError("held-out suite validation-seed binding drifted")
     selection = suite["selection"]
     states = suite["states"]
     if (
@@ -226,6 +231,10 @@ def _load_held_out_high_regret_suite(
         ):
             raise ValueError(f"held-out suite state {index} lacks valid identity")
         pair_ids.add(pair_id)
+        if game_seed not in allowed_seeds:
+            raise ValueError(
+                f"held-out suite state {index} is outside the training validation set"
+            )
         bound_states.append(state)
         pairs.append(
             {
@@ -1292,7 +1301,7 @@ def main() -> None:
         default=None,
         help=(
             "Evaluate every archived state in an immutable "
-            "a1-held-out-high-regret-suite-v2 manifest instead of fresh starts; "
+            "a1-held-out-high-regret-suite-v4 manifest instead of fresh starts; "
             "emits a1-held-out-high-regret-report-v1 for promotion replay."
         ),
     )
