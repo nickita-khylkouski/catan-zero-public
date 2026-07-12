@@ -28,6 +28,12 @@ def _receipt(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
         "1",
         "--lr",
         "0.00012",
+        "--validation-fraction",
+        "0.05",
+        "--validation-seed",
+        "17",
+        "--validation-max-samples",
+        "0",
         "--validation-game-seed-manifest",
         "/data/validation.json",
         "--a1-dual-learner-lock",
@@ -106,8 +112,15 @@ def test_plan_separates_fixed_step_and_equal_sample_questions(
         assert "/repo/tools/train_bc.py" not in command
         assert not any(item.startswith("--a1-") for item in command)
         assert command.count("--validation-game-seed-manifest") == 1
-        validation_index = command.index("--validation-game-seed-manifest")
-        assert command[validation_index + 1] == "/data/validation.json"
+        expected_validation = {
+            "--validation-fraction": "0.05",
+            "--validation-seed": "17",
+            "--validation-max-samples": "0",
+            "--validation-game-seed-manifest": "/data/validation.json",
+        }
+        for flag, value in expected_validation.items():
+            assert command.count(flag) == 1
+            assert command[command.index(flag) + 1] == value
         assert command[command.index("--train-diagnostics-every-batches") + 1] == "1"
         assert command[command.index("--batch-size") + 1] == str(run["local_batch_size"])
         assert command[command.index("--max-steps") + 1] == str(run["max_steps"])

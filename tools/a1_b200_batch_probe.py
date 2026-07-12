@@ -37,6 +37,12 @@ BATCHES = (512, 768, 1024)
 WORLD_SIZE = 8
 REFERENCE_LR = 0.00012
 REFERENCE_BATCH = 512
+VALIDATION_SPLIT_FLAGS = (
+    "--validation-fraction",
+    "--validation-seed",
+    "--validation-max-samples",
+    "--validation-game-seed-manifest",
+)
 STRIP_VALUE_FLAGS = {
     "--a1-dual-learner-lock",
     "--a1-dual-reviewed-lock-file-sha256",
@@ -185,11 +191,13 @@ def build_plan(
     midpoint = _authenticated_midpoint(midpoint_receipt)
     runtime = _current_runtime()
     base = _strip_production_authority(list(midpoint["payload"]["command"]))
-    # The held-out game-seed manifest is data-split provenance, not production
-    # authority.  Keeping it makes every batch arm use the exact authenticated
-    # validation cohort and satisfies the fail-closed A1 memmap contract.
-    if base.count("--validation-game-seed-manifest") != 1:
-        raise ProbeError("midpoint command lacks one validation seed manifest")
+    # The complete held-out split tuple is data-split provenance, not
+    # production authority.  Keep it byte-for-byte from the authenticated
+    # midpoint command; changing even the nominal fraction or seed makes the
+    # manifest contract internally inconsistent.
+    for flag in VALIDATION_SPLIT_FLAGS:
+        if base.count(flag) != 1:
+            raise ProbeError(f"midpoint command lacks exactly one {flag}")
     _bind_current_trainer(base, runtime)
     output_dir = output_dir.expanduser().resolve()
     if output_dir.exists():
@@ -211,9 +219,6 @@ def build_plan(
                 ("--max-steps", str(steps)),
                 ("--epochs", "1"),
                 ("--lr", repr(_scaled_lr(batch, lr_policy))),
-                ("--validation-fraction", "0.02"),
-                ("--validation-max-samples", "200000"),
-                ("--validation-seed", "1701"),
                 ("--train-diagnostics-every-batches", "1"),
                 ("--checkpoint", str(run_dir / "candidate.pt")),
                 ("--report", str(run_dir / "train.report.json")),
