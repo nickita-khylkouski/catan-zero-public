@@ -14796,20 +14796,29 @@ def _apply_authenticated_policy_aux_phase_allocation(
     active_sampling_weights: np.ndarray,
     phase_values: np.ndarray,
     phase_sampling_weights: dict[str, float],
+    component_values: np.ndarray | None = None,
 ) -> np.ndarray:
     """Allocate exact AUX draw mass across authenticated, explicit phases.
 
     ``active_sampling_weights`` is already the authenticated composite base
     measure conditioned on the policy-distillation scope and positive policy
-    loss.  Within each requested phase we preserve that measure exactly; only
-    the phase's total probability mass changes.  Unlisted phases receive no
-    auxiliary draws.  This never changes the base sampler or any value loss.
+    loss. Within each component and requested phase we preserve that measure
+    exactly. Each component keeps its original total AUX mass, preventing a
+    phase arm from becoming a hidden n128:n256 mixture arm. Unlisted phases
+    receive no auxiliary draws. This never changes the base sampler/value loss.
     """
 
     base = np.asarray(active_sampling_weights, dtype=np.float64)
     phases = np.asarray(phase_values).astype(str, copy=False)
     if base.ndim != 1 or phases.ndim != 1 or base.shape != phases.shape:
         raise ValueError("policy auxiliary phase allocation shape drift")
+    components = (
+        np.zeros(base.size, dtype=np.int16)
+        if component_values is None
+        else np.asarray(component_values)
+    )
+    if components.ndim != 1 or components.shape != base.shape:
+        raise ValueError("policy auxiliary phase component alignment drift")
     if not isinstance(phase_sampling_weights, dict) or not phase_sampling_weights:
         raise ValueError("policy auxiliary phase allocation is empty")
     if not np.isfinite(base).all() or np.any(base < 0.0):
@@ -14819,20 +14828,25 @@ def _apply_authenticated_policy_aux_phase_allocation(
         raise ValueError("policy auxiliary phase allocation must sum to 1")
 
     allocated = np.zeros_like(base)
-    for phase, raw_share in phase_sampling_weights.items():
-        share = float(raw_share)
-        if not phase or not math.isfinite(share) or share <= 0.0:
-            raise ValueError(
-                f"policy auxiliary phase allocation is invalid for {phase!r}"
+    for component in np.unique(components[base > 0.0]):
+        component_mask = components == component
+        component_mass = float(base[component_mask].sum())
+        for phase, raw_share in phase_sampling_weights.items():
+            share = float(raw_share)
+            if not phase or not math.isfinite(share) or share <= 0.0:
+                raise ValueError(
+                    f"policy auxiliary phase allocation is invalid for {phase!r}"
+                )
+            mask = component_mask & (phases == phase)
+            stratum_mass = float(base[mask].sum())
+            if not math.isfinite(stratum_mass) or stratum_mass <= 0.0:
+                raise ValueError(
+                    "policy auxiliary requested phase has no policy-active mass "
+                    f"in component {component!r}: {phase!r}"
+                )
+            allocated[mask] = base[mask] * (
+                component_mass * share / stratum_mass
             )
-        mask = phases == phase
-        stratum_mass = float(base[mask].sum())
-        if not math.isfinite(stratum_mass) or stratum_mass <= 0.0:
-            raise ValueError(
-                "policy auxiliary requested phase has no policy-active mass: "
-                f"{phase!r}"
-            )
-        allocated[mask] = base[mask] * (share / stratum_mass)
     total = float(allocated.sum())
     if not math.isclose(total, 1.0, rel_tol=0.0, abs_tol=1e-9):
         raise ValueError("policy auxiliary phase allocation mass drift")
@@ -14864,6 +14878,9 @@ def _authenticated_policy_aux_phase_sampling_weights(
     if len(phase_names) > np.iinfo(np.int16).max:
         raise ValueError("policy auxiliary phase allocation has too many strata")
     labels = np.full(rows.size, -1, dtype=np.int16)
+    components = np.asarray(
+        data.component_indices_for_rows(rows), dtype=np.int16
+    )
     chunk = max(1, int(chunk_rows))
     for start in range(0, rows.size, chunk):
         stop = min(start + chunk, rows.size)
@@ -14881,20 +14898,21 @@ def _authenticated_policy_aux_phase_sampling_weights(
         float(shares.sum()), 1.0, rel_tol=0.0, abs_tol=1e-9
     ):
         raise ValueError("policy auxiliary phase allocation is invalid")
-    valid = labels >= 0
-    masses = np.bincount(
-        labels[valid].astype(np.int64, copy=False),
-        weights=base[valid],
-        minlength=len(phase_names),
-    )
-    empty = [phase_names[index] for index in np.flatnonzero(masses <= 0.0)]
-    if empty:
-        raise ValueError(
-            "policy auxiliary requested phases have no policy-active mass: "
-            + ", ".join(repr(phase) for phase in empty)
-        )
     allocated = np.zeros_like(base)
-    allocated[valid] = base[valid] * (shares[labels[valid]] / masses[labels[valid]])
+    for component in np.unique(components[base > 0.0]):
+        component_mask = components == component
+        component_mass = float(base[component_mask].sum())
+        for label, phase in enumerate(phase_names):
+            mask = component_mask & (labels == label)
+            stratum_mass = float(base[mask].sum())
+            if not math.isfinite(stratum_mass) or stratum_mass <= 0.0:
+                raise ValueError(
+                    "policy auxiliary requested phase has no policy-active mass "
+                    f"in component {int(component)}: {phase!r}"
+                )
+            allocated[mask] = base[mask] * (
+                component_mass * shares[label] / stratum_mass
+            )
     if not math.isclose(float(allocated.sum()), 1.0, rel_tol=0.0, abs_tol=1e-9):
         raise ValueError("policy auxiliary phase allocation mass drift")
     return allocated

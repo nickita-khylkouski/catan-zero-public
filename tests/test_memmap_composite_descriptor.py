@@ -469,6 +469,22 @@ def test_policy_aux_phase_allocation_sets_exact_phase_shares() -> None:
     assert allocated[0] / allocated[1] == pytest.approx(0.5)
 
 
+def test_policy_aux_phase_allocation_preserves_component_marginals() -> None:
+    active = np.asarray([0.45, 0.05, 0.10, 0.40], dtype=np.float64)
+    phases = np.asarray(["PLAY", "ROBBER", "PLAY", "ROBBER"])
+    components = np.asarray([0, 0, 1, 1], dtype=np.int16)
+    allocated = train_bc._apply_authenticated_policy_aux_phase_allocation(
+        active,
+        phases,
+        {"PLAY": 0.25, "ROBBER": 0.75},
+        components,
+    )
+    assert allocated[components == 0].sum() == pytest.approx(0.5)
+    assert allocated[components == 1].sum() == pytest.approx(0.5)
+    assert allocated[phases == "PLAY"].sum() == pytest.approx(0.25)
+    assert allocated[phases == "ROBBER"].sum() == pytest.approx(0.75)
+
+
 def test_policy_aux_phase_allocation_fails_closed_for_empty_active_stratum() -> None:
     with pytest.raises(ValueError, match="has no policy-active mass"):
         train_bc._apply_authenticated_policy_aux_phase_allocation(
@@ -481,16 +497,18 @@ def test_policy_aux_phase_allocation_fails_closed_for_empty_active_stratum() -> 
 def test_chunked_policy_aux_phase_allocation_uses_corpus_rows() -> None:
     data = ConcatMemmapCorpus(
         [
-            _TinyGameCorpus([1, 1, 1]),
-            _TinyGameCorpus([10, 10, 10]),
+            _TinyGameCorpus([1, 1, 1, 1]),
+            _TinyGameCorpus([10, 10, 10, 10]),
         ]
     )
-    phases = np.asarray(["PLAY", "ROBBER", "PLAY", "PLAY", "ROBBER", "DISCARD"])
+    phases = np.asarray(
+        ["PLAY", "ROBBER", "DISCARD", "PLAY"] * 2
+    )
     data._eager["phase"] = phases  # type: ignore[assignment]
     weights = train_bc._authenticated_policy_aux_phase_sampling_weights(
         data,
-        np.arange(6, dtype=np.int64),
-        np.full(6, 1.0 / 6.0, dtype=np.float64),
+        np.arange(8, dtype=np.int64),
+        np.full(8, 1.0 / 8.0, dtype=np.float64),
         {"PLAY": 0.5, "ROBBER": 0.3, "DISCARD": 0.2},
         chunk_rows=2,
     )
