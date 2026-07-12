@@ -1095,7 +1095,7 @@ def build_adjudication(
     champion: Path,
     champion_version: int,
     evidence: Sequence[tuple[str, Path]],
-    nth_confirmation_passed: bool,
+    nth_confirmation: Path | None,
 ) -> dict[str, Any]:
     by_kind = dict(evidence)
     if (
@@ -1107,11 +1107,13 @@ def build_adjudication(
         )
     next_count = registry.promotion_count("generator_champion") + 1
     nth_required = next_count % 3 == 0
-    if nth_required and not nth_confirmation_passed:
-        raise ArtifactBuildError("this promotion requires a passing n64 confirmation")
-    if not nth_required and nth_confirmation_passed:
+    if nth_required and nth_confirmation is None:
         raise ArtifactBuildError(
-            "n64 confirmation was asserted for a non-third promotion"
+            "this promotion requires an immutable n64 confirmation artifact"
+        )
+    if not nth_required and nth_confirmation is not None:
+        raise ArtifactBuildError(
+            "n64 confirmation was supplied for a non-third promotion"
         )
     candidate_search_config = promotion._candidate_search_config(contract)  # noqa: SLF001
     champion_search_config = promotion._incumbent_search_config(  # noqa: SLF001
@@ -1149,7 +1151,14 @@ def build_adjudication(
         },
         "checks": {name: True for name in promotion.REQUIRED_CHECKS},
         "nth_confirmation_required": nth_required,
-        "nth_confirmation_passed": nth_confirmation_passed,
+        "nth_confirmation": (
+            None
+            if nth_confirmation is None
+            else {
+                "path": str(nth_confirmation.expanduser().resolve()),
+                "sha256": promotion._sha256(nth_confirmation),  # noqa: SLF001
+            }
+        ),
         "evidence": [
             {
                 "kind": kind,
@@ -1368,7 +1377,7 @@ def _parser() -> argparse.ArgumentParser:
     adjudicate.add_argument(
         "--evidence", action="append", default=[], metavar="KIND=PATH"
     )
-    adjudicate.add_argument("--nth-confirmation-passed", action="store_true")
+    adjudicate.add_argument("--nth-confirmation", type=Path)
     adjudicate.add_argument("--out", type=Path, required=True)
     return parser
 
@@ -1460,7 +1469,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 champion=args.champion,
                 champion_version=args.champion_version,
                 evidence=_parse_role_paths(args.evidence, option="--evidence"),
-                nth_confirmation_passed=args.nth_confirmation_passed,
+                nth_confirmation=args.nth_confirmation,
             )
             # Transaction replay is the final authority.  Use a temporary file
             # because the verifier deliberately consumes a path.

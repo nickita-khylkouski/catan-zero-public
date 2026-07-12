@@ -1232,6 +1232,8 @@ def test_adjudication_builder_derives_every_third_requirement(
         path = tmp_path / f"{kind}.json"
         _json(path, {"kind": kind})
         evidence.append((kind, path))
+    nth_confirmation = tmp_path / "n64-confirmation.json"
+    _json(nth_confirmation, {"verdict": "H1"})
 
     value = artifacts.build_adjudication(
         contract=_contract(),
@@ -1245,11 +1247,14 @@ def test_adjudication_builder_derives_every_third_requirement(
         champion=champion,
         champion_version=4,
         evidence=evidence,
-        nth_confirmation_passed=True,
+        nth_confirmation=nth_confirmation,
     )
 
     assert value["nth_confirmation_required"] is True
-    assert value["nth_confirmation_passed"] is True
+    assert value["nth_confirmation"] == {
+        "path": str(nth_confirmation.resolve()),
+        "sha256": promotion._sha256(nth_confirmation),
+    }
     assert value["candidate"]["agent_identity"]["search_config"]["c_scale"] == 0.10
     assert value["champion"]["agent_identity"]["search_config"]["c_scale"] == 0.03
     digest = value.pop("adjudication_sha256")
@@ -1273,7 +1278,7 @@ def test_adjudication_builder_refuses_missing_evidence(tmp_path: Path) -> None:
             champion=champion,
             champion_version=4,
             evidence=[],
-            nth_confirmation_passed=False,
+            nth_confirmation=None,
         )
 
 

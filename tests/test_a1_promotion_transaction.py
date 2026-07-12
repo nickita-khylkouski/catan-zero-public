@@ -865,6 +865,25 @@ def _fixture(
         )
     next_count = promotion_count + 1
     nth_required = next_count % 3 == 0
+    nth_confirmation = None
+    if nth_required:
+        nth_source = tmp_path / "nth_confirmation_n64.raw.json"
+        nth_payload = json.loads(internal_source.read_text(encoding="utf-8"))
+        fields = nth_payload["typed_config"]["fields"]
+        for key in ("n_full", "n_fast", "candidate_n_full", "baseline_n_full"):
+            fields[key] = 64
+        digest = hashlib.sha256(
+            promotion._canonical_bytes(nth_payload["typed_config"])
+        ).hexdigest()
+        nth_payload["config_hash"] = "sha256:" + digest[:16]
+        nth_payload["full_config_hash"] = "sha256:" + digest
+        for budget in nth_payload["search_budgets_by_role"].values():
+            budget["n_full"] = 64
+        _write_json(nth_source, nth_payload)
+        nth_confirmation = {
+            "path": str(nth_source),
+            "sha256": promotion._sha256(nth_source),
+        }
     adjudication = {
         "schema_version": promotion.ADJUDICATION_SCHEMA,
         "passed": True,
@@ -892,7 +911,7 @@ def _fixture(
         },
         "checks": {name: True for name in promotion.REQUIRED_CHECKS},
         "nth_confirmation_required": nth_required,
-        "nth_confirmation_passed": True if nth_required else False,
+        "nth_confirmation": nth_confirmation,
         "evidence": evidence,
     }
     adjudication["adjudication_sha256"] = promotion._digest_value(adjudication)
@@ -2592,12 +2611,118 @@ def test_every_third_confirmation_is_derived_from_registry(tmp_path: Path) -> No
     fixture = _fixture(tmp_path, promotion_count=2)
     payload = json.loads(fixture["adjudication"].read_text())
     payload["nth_confirmation_required"] = False
-    payload["nth_confirmation_passed"] = False
     payload.pop("adjudication_sha256")
     payload["adjudication_sha256"] = promotion._digest_value(payload)
     _write_json(fixture["adjudication"], payload)
 
     with pytest.raises(promotion.PromotionError, match="every-third"):
+        _execute(fixture, go=False)
+
+
+def test_every_third_confirmation_accepts_replayed_n64_artifact(tmp_path: Path) -> None:
+    fixture = _fixture(tmp_path, promotion_count=2)
+
+    plan = _execute(fixture, go=False)
+
+    assert plan["promotion_count"] == 3
+    assert plan["nth_confirmation_required"] is True
+
+
+def test_every_third_confirmation_requires_an_immutable_artifact(tmp_path: Path) -> None:
+    fixture = _fixture(tmp_path, promotion_count=2)
+    payload = json.loads(fixture["adjudication"].read_text())
+    payload["nth_confirmation"] = None
+    payload.pop("adjudication_sha256")
+    payload["adjudication_sha256"] = promotion._digest_value(payload)
+    _write_json(fixture["adjudication"], payload)
+
+    with pytest.raises(promotion.PromotionError, match="immutable evidence"):
+        _execute(fixture, go=False)
+
+
+def test_every_third_confirmation_must_be_global_n64(tmp_path: Path) -> None:
+    fixture = _fixture(tmp_path, promotion_count=2)
+    payload = json.loads(fixture["adjudication"].read_text())
+    confirmation = Path(payload["nth_confirmation"]["path"])
+    source = json.loads(confirmation.read_text())
+    source["typed_config"]["fields"]["candidate_n_full"] = 128
+    digest = hashlib.sha256(
+        promotion._canonical_bytes(source["typed_config"])
+    ).hexdigest()
+    source["config_hash"] = "sha256:" + digest[:16]
+    source["full_config_hash"] = "sha256:" + digest
+    _write_json(confirmation, source)
+    payload["nth_confirmation"]["sha256"] = promotion._sha256(confirmation)
+    payload.pop("adjudication_sha256")
+    payload["adjudication_sha256"] = promotion._digest_value(payload)
+    _write_json(fixture["adjudication"], payload)
+
+    with pytest.raises(promotion.PromotionError, match="expected 64"):
+        _execute(fixture, go=False)
+
+
+def test_non_third_promotion_rejects_confirmation_artifact(tmp_path: Path) -> None:
+    fixture = _fixture(tmp_path)
+    payload = json.loads(fixture["adjudication"].read_text())
+    internal = next(
+        item for item in payload["evidence"] if item["kind"] == "internal_h2h"
+    )
+    payload["nth_confirmation"] = {
+        "path": internal["path"],
+        "sha256": internal["sha256"],
+    }
+    payload.pop("adjudication_sha256")
+    payload["adjudication_sha256"] = promotion._digest_value(payload)
+    _write_json(fixture["adjudication"], payload)
+
+    with pytest.raises(promotion.PromotionError, match="must be null"):
+        _execute(fixture, go=False)
+
+
+def test_historical_v1_non_third_false_confirmation_remains_replayable(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path)
+    payload = json.loads(fixture["adjudication"].read_text())
+    payload["schema_version"] = promotion.PREVIOUS_ADJUDICATION_SCHEMA
+    payload.pop("nth_confirmation")
+    payload["nth_confirmation_passed"] = False
+    payload.pop("adjudication_sha256")
+    payload["adjudication_sha256"] = promotion._digest_value(payload)
+    _write_json(fixture["adjudication"], payload)
+
+    assert _execute(fixture, go=False)["status"] == "dry_run"
+
+
+def test_historical_v1_cannot_authorize_every_third_promotion(tmp_path: Path) -> None:
+    fixture = _fixture(tmp_path, promotion_count=2)
+    payload = json.loads(fixture["adjudication"].read_text())
+    payload["schema_version"] = promotion.PREVIOUS_ADJUDICATION_SCHEMA
+    payload.pop("nth_confirmation")
+    payload["nth_confirmation_passed"] = True
+    payload.pop("adjudication_sha256")
+    payload["adjudication_sha256"] = promotion._digest_value(payload)
+    _write_json(fixture["adjudication"], payload)
+
+    with pytest.raises(promotion.PromotionError, match="cannot authorize"):
+        _execute(fixture, go=False)
+
+
+def test_every_third_confirmation_rejects_split_pair_seed_identity(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path, promotion_count=2)
+    payload = json.loads(fixture["adjudication"].read_text())
+    confirmation = Path(payload["nth_confirmation"]["path"])
+    source = json.loads(confirmation.read_text())
+    source["games"][1]["game_seed"] += 1_000_000
+    _write_json(confirmation, source)
+    payload["nth_confirmation"]["sha256"] = promotion._sha256(confirmation)
+    payload.pop("adjudication_sha256")
+    payload["adjudication_sha256"] = promotion._digest_value(payload)
+    _write_json(fixture["adjudication"], payload)
+
+    with pytest.raises(promotion.PromotionError, match="different seeds"):
         _execute(fixture, go=False)
 
 

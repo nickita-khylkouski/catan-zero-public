@@ -95,7 +95,7 @@ The adjudication has this exact top-level shape (extra keys fail closed):
 
 ```json
 {
-  "schema_version": "a1-promotion-adjudication-v1",
+  "schema_version": "a1-promotion-adjudication-v2",
   "passed": true,
   "decision": "promote",
   "contract_sha256": "sha256:...",
@@ -115,7 +115,7 @@ The adjudication has this exact top-level shape (extra keys fail closed):
     "bucket_veto": true
   },
   "nth_confirmation_required": false,
-  "nth_confirmation_passed": false,
+  "nth_confirmation": null,
   "evidence": [
     {"kind": "mechanism_calibration", "path": "/immutable/calibration.json", "sha256": "sha256:..."},
     {"kind": "internal_h2h", "path": "/immutable/h2h.json", "sha256": "sha256:..."},
@@ -256,9 +256,12 @@ python tools/a1_promotion_artifacts.py adjudicate \
 ```
 
 For every third generator promotion, the registry-derived policy additionally
-requires `--nth-confirmation-passed`; the flag is refused on other promotions.
-The subsequent promotion transaction still re-verifies the entire graph, so
-the builder is not a second authorization boundary.
+requires `--nth-confirmation /immutable/n64-h2h.raw.json`; non-third promotions
+require this field to remain null. The transaction hashes the artifact, binds
+the exact candidate and incumbent checkpoints, replays the global-n64 operator,
+verifies the paired seed/orientation cohort, and requires the fixed
+`-10/+15` pentanomial SPRT to replay to H1. The builder is not a second
+authorization boundary.
 
 ## Dry-run, commit, and recovery
 

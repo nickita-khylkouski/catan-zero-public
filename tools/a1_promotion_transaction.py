@@ -55,7 +55,8 @@ from tools.high_regret_suite_contract import (  # noqa: E402
 from tools.sprt_gate import evaluate_pentanomial_sprt, pair_scores_from_h2h_games  # noqa: E402
 
 
-ADJUDICATION_SCHEMA = "a1-promotion-adjudication-v1"
+ADJUDICATION_SCHEMA = "a1-promotion-adjudication-v2"
+PREVIOUS_ADJUDICATION_SCHEMA = "a1-promotion-adjudication-v1"
 RECEIPT_SCHEMA = "a1-promotion-transaction-receipt-v3"
 PREVIOUS_RECEIPT_SCHEMA = "a1-promotion-transaction-receipt-v2"
 LEGACY_RECEIPT_SCHEMA = "a1-promotion-transaction-receipt-v1"
@@ -2402,6 +2403,7 @@ def _verify_internal_h2h_source(
     sealed_semantics: dict[str, Any],
     candidate_search_config: dict[str, Any],
     champion_search_config: dict[str, Any],
+    required_n_full: int = 128,
 ) -> None:
     _verify_evaluation_baseline_binding(
         payload.get("evaluation_binding"),
@@ -2474,6 +2476,8 @@ def _verify_internal_h2h_source(
             "baseline_value_readout": sealed_semantics["value_readout"],
         }
     )
+    for key in ("n_full", "n_fast", "candidate_n_full", "baseline_n_full"):
+        expected_fields[key] = int(required_n_full)
     config_where = "pooled effective config" if pooled else "typed config"
     runtime_fields = dict(fields)
     if (
@@ -2502,6 +2506,12 @@ def _verify_internal_h2h_source(
             f"{where} internal H2H must explicitly attest randomized BASE maps; "
             f"got {fields.get('map_kind')!r}"
         )
+    candidate_evaluation_config = dict(candidate_search_config)
+    candidate_evaluation_config["n_full"] = int(required_n_full)
+    candidate_evaluation_config["n_fast"] = int(required_n_full)
+    champion_evaluation_config = dict(champion_search_config)
+    champion_evaluation_config["n_full"] = int(required_n_full)
+    champion_evaluation_config["n_fast"] = int(required_n_full)
     _verify_role_search_pair(
         {
             **{key: normalized_fields[key] for key in candidate_search_config},
@@ -2511,8 +2521,8 @@ def _verify_internal_h2h_source(
             **{key: normalized_fields[key] for key in champion_search_config},
             "c_scale": normalized_fields["baseline_c_scale"],
         },
-        candidate_search_config=candidate_search_config,
-        champion_search_config=champion_search_config,
+        candidate_search_config=candidate_evaluation_config,
+        champion_search_config=champion_evaluation_config,
         where=f"{where} deployed search",
     )
     if fields.get("public_observation") is not True:
@@ -2528,8 +2538,13 @@ def _verify_internal_h2h_source(
                 f"{where} typed config has unsafe information-set recipe: "
                 f"{key}={fields.get(key)!r}, expected {expected!r}"
             )
-    if fields.get("candidate_n_full") != 128 or fields.get("baseline_n_full") != 128:
-        raise PromotionError(f"{where} typed config is not global n128")
+    if (
+        fields.get("candidate_n_full") != int(required_n_full)
+        or fields.get("baseline_n_full") != int(required_n_full)
+    ):
+        raise PromotionError(
+            f"{where} typed config is not global n{int(required_n_full)}"
+        )
     for key in (
         "n_full_wide",
         "candidate_n_full_wide",
@@ -2559,7 +2574,7 @@ def _verify_internal_h2h_source(
             )
     budgets = payload.get("search_budgets_by_role")
     expected_budget = {
-        "n_full": 128,
+        "n_full": int(required_n_full),
         "n_full_wide": None,
         "n_full_wide_threshold": None,
     }
@@ -2596,6 +2611,96 @@ def _verify_internal_h2h_source(
         raise PromotionError(f"{where} pentanomial evidence does not replay exactly")
     if diagnostics != payload.get("pair_diagnostics"):
         raise PromotionError(f"{where} pair diagnostics do not replay exactly")
+
+
+def _verify_internal_h2h_cohort(payload: dict[str, Any], *, where: str) -> None:
+    """Bind the paired seed cohort, not merely its aggregate SPRT verdict."""
+
+    games = payload.get("games")
+    if not isinstance(games, list):
+        raise PromotionError(f"{where} games must be a list")
+    by_pair: dict[int, dict[str, Any]] = {}
+    identities: set[tuple[int, str]] = set()
+    seed_to_pair: dict[int, int] = {}
+    orientation_encoding: str | None = None
+    for index, game in enumerate(games):
+        if not isinstance(game, dict):
+            raise PromotionError(f"{where}.games[{index}] must be an object")
+        pair_id = game.get("pair_id")
+        game_seed = game.get("game_seed")
+        orientation = game.get("orientation")
+        if (
+            isinstance(pair_id, bool)
+            or not isinstance(pair_id, int)
+            or isinstance(game_seed, bool)
+            or not isinstance(game_seed, int)
+            or orientation
+            not in {
+                "candidate_first",
+                "candidate_second",
+                "candidate_red",
+                "candidate_blue",
+            }
+        ):
+            raise PromotionError(f"{where}.games[{index}] has invalid cohort identity")
+        game_encoding = (
+            "color"
+            if orientation in {"candidate_red", "candidate_blue"}
+            else "legacy"
+        )
+        if orientation_encoding is not None and game_encoding != orientation_encoding:
+            raise PromotionError(f"{where} mixes orientation encodings")
+        orientation_encoding = game_encoding
+        identity = (pair_id, orientation)
+        if identity in identities:
+            raise PromotionError(f"{where} repeats a paired orientation")
+        identities.add(identity)
+        prior = by_pair.setdefault(pair_id, {"seed": game_seed, "orientations": set()})
+        if prior["seed"] != game_seed:
+            raise PromotionError(f"{where} pair uses different seeds by orientation")
+        prior["orientations"].add(orientation)
+        owner = seed_to_pair.setdefault(game_seed, pair_id)
+        if owner != pair_id:
+            raise PromotionError(f"{where} reuses one game seed across multiple pairs")
+    required_orientations = (
+        {"candidate_red", "candidate_blue"}
+        if orientation_encoding == "color"
+        else {"candidate_first", "candidate_second"}
+    )
+    if any(row["orientations"] != required_orientations for row in by_pair.values()):
+        raise PromotionError(f"{where} does not cover both orientations per seed")
+    if len(by_pair) != int(payload.get("complete_pairs", -1)):
+        raise PromotionError(f"{where} complete-pair count differs from its cohort")
+
+
+def _verify_n64_confirmation(
+    raw: Any,
+    *,
+    base: Path,
+    contract: dict[str, Any],
+    candidate: dict[str, Any],
+    champion: dict[str, Any],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    ref = _require_exact_keys(raw, {"path", "sha256"}, where="nth_confirmation")
+    path, verified = _validate_file_ref(ref, base=base, where="nth_confirmation")
+    payload = _load_json(path)
+    _verify_internal_h2h_source(
+        payload,
+        candidate=Path(candidate["path"]),
+        champion=Path(champion["path"]),
+        where="nth_confirmation",
+        sealed_semantics=_sealed_evaluation_semantics(contract),
+        candidate_search_config=candidate["search_config"],
+        champion_search_config=champion["search_config"],
+        required_n_full=64,
+    )
+    _verify_internal_h2h_cohort(payload, where="nth_confirmation")
+    intervals = _contiguous_seed_intervals(
+        _explicit_game_seeds(payload, where="nth_confirmation"),
+        kind="internal_h2h_n64_confirmation",
+        where="nth_confirmation",
+    )
+    return verified, intervals
 
 
 def _verify_external_panel_source(
@@ -3969,7 +4074,7 @@ def _verify_adjudication(
     legacy_snapshot: _LegacyPromotionSnapshot | None = None,
 ) -> dict[str, Any]:
     raw = _load_json(path)
-    expected_keys = {
+    common_keys = {
         "schema_version",
         "passed",
         "decision",
@@ -3978,13 +4083,21 @@ def _verify_adjudication(
         "champion",
         "checks",
         "nth_confirmation_required",
-        "nth_confirmation_passed",
         "evidence",
         "adjudication_sha256",
     }
+    schema_version = raw.get("schema_version")
+    if schema_version == ADJUDICATION_SCHEMA:
+        expected_keys = common_keys | {"nth_confirmation"}
+    elif schema_version == PREVIOUS_ADJUDICATION_SCHEMA:
+        expected_keys = common_keys | {"nth_confirmation_passed"}
+    else:
+        raise PromotionError(
+            "adjudication schema must be "
+            f"{ADJUDICATION_SCHEMA!r} (or historical {PREVIOUS_ADJUDICATION_SCHEMA!r})"
+        )
     value = _require_exact_keys(raw, expected_keys, where="adjudication")
-    if value["schema_version"] != ADJUDICATION_SCHEMA:
-        raise PromotionError(f"adjudication schema must be {ADJUDICATION_SCHEMA!r}")
+    legacy_v1 = schema_version == PREVIOUS_ADJUDICATION_SCHEMA
     declared_digest = _validate_sha256(
         value["adjudication_sha256"], where="adjudication.adjudication_sha256"
     )
@@ -4153,16 +4266,39 @@ def _verify_adjudication(
         raise PromotionError(
             "adjudication every-third confirmation requirement disagrees with registry count"
         )
-    if nth_required and value["nth_confirmation_passed"] is not True:
-        raise PromotionError("required every-third n64 confirmation did not pass")
-    if not nth_required and value["nth_confirmation_passed"] not in {False, None}:
-        raise PromotionError("non-required nth confirmation must be false or null")
+    nth_confirmation = None
+    nth_confirmation_intervals: list[dict[str, Any]] = []
+    if legacy_v1:
+        if nth_required:
+            raise PromotionError(
+                "historical v1 adjudication cannot authorize an every-third "
+                "promotion without immutable n64 evidence"
+            )
+        if value["nth_confirmation_passed"] not in {False, None}:
+            raise PromotionError(
+                "historical v1 non-third adjudication cannot assert a naked "
+                "n64 confirmation boolean"
+            )
+    elif nth_required:
+        if value["nth_confirmation"] is None:
+            raise PromotionError(
+                "required every-third n64 confirmation lacks immutable evidence"
+            )
+        nth_confirmation, nth_confirmation_intervals = _verify_n64_confirmation(
+            value["nth_confirmation"],
+            base=base,
+            contract=contract,
+            candidate=candidate_binding,
+            champion=champion_binding,
+        )
+    elif value["nth_confirmation"] is not None:
+        raise PromotionError("non-required nth confirmation must be null")
 
     evidence = value["evidence"]
     if not isinstance(evidence, list):
         raise PromotionError("adjudication.evidence must be a list")
     evidence_by_kind: dict[str, dict[str, Any]] = {}
-    final_cohort_intervals: list[dict[str, Any]] = []
+    final_cohort_intervals: list[dict[str, Any]] = list(nth_confirmation_intervals)
     for index, record in enumerate(evidence):
         item = _require_exact_keys(
             record, {"kind", "path", "sha256"}, where=f"evidence[{index}]"
@@ -4216,6 +4352,7 @@ def _verify_adjudication(
         "adjudication_sha256": declared_digest,
         "next_promotion_count": next_count,
         "nth_confirmation_required": nth_required,
+        "nth_confirmation": nth_confirmation,
         "final_cohort_intervals": final_cohort_intervals,
     }
 
