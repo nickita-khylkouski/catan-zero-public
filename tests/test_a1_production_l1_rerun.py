@@ -9,7 +9,7 @@ from tools import a1_production_l1_rerun as l1
 
 def _historical() -> list[str]:
     return [
-        "python", "-m", "torch.distributed.run", "--nproc-per-node", "8",
+        "python", "-m", "torch.distributed.run", "--nproc-per-node=8",
         "train_bc.py", "--arch", "entity_graph", "--hidden-size", "640",
         "--graph-layers", "6", "--attention-heads", "8", "--epochs", "1",
         "--max-steps", "1024", "--batch-size", "512", "--grad-accum-steps", "1",

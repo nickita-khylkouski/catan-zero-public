@@ -111,8 +111,17 @@ def _assert_bound_checkout(repo: Path, expected_commit: str | None = None) -> st
 
 def _option(command: Sequence[str], flag: str) -> str:
     positions = [index for index, value in enumerate(command) if value == flag]
-    if len(positions) != 1 or positions[0] + 1 >= len(command):
+    equals = [
+        value[len(flag) + 1 :]
+        for value in command
+        if value.startswith(flag + "=")
+    ]
+    if len(positions) + len(equals) != 1:
         raise L1Error(f"command must contain exactly one {flag}")
+    if equals:
+        return equals[0]
+    if positions[0] + 1 >= len(command):
+        raise L1Error(f"command has no value for {flag}")
     return command[positions[0] + 1]
 
 
