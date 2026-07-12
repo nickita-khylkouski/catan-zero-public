@@ -21,11 +21,20 @@ def test_n256_lr_response_launcher_is_syntax_clean_and_fail_closed() -> None:
     assert "midpoint learner lock binds another spec" in text
     assert "midpoint contract is writable" in text
     assert "inspect-spec" not in text
-    assert 'a1_dual_learner_contract.py" seal' not in text
-    assert "spec=$midpoint_dir/learner.spec.json" in text
-    assert "lock=$midpoint_dir/learner.lock.json" in text
+    assert text.count('a1_dual_learner_contract.py" seal') == 1
+    assert "midpoint_spec=$midpoint_dir/learner.spec.json" in text
+    assert "midpoint_lock=$midpoint_dir/learner.lock.json" in text
+    assert "shared_contract_dir=$root/training/n256-lr-response-contracts/$repo_commit" in text
+    assert 'flock "$contract_fd"' in text
+    assert 'cp "$midpoint_spec" "$spec_tmp"' in text
     assert "spec=$dose/learner.spec.json" not in text
     assert "lock=$dose/learner.lock.json" not in text
+    midpoint_verifier = text.split("verify_midpoint() {", 1)[1].split(
+        "prepare_shared_contract() {", 1
+    )[0]
+    assert "a1-dual-arm-learner-lock-v1" in midpoint_verifier
+    assert "midpoint historical runtime binding drift" in midpoint_verifier
+    assert "contract.verify_lock" not in midpoint_verifier
     assert 'set(a["recipe_drift"]) == {"lr", "loser_sample_weight"}' in text
     assert 'a["effective_recipe"]["epochs"] == 1' in text
     assert 'p["world_size"] == 8 and p["global_batch_size"] == 4096' in text

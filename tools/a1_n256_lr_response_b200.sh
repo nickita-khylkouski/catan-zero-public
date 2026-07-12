@@ -26,14 +26,22 @@ script_repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 repo=${A1_REPO:-$script_repo}
 python=${A1_PYTHON:-$repo/.venv/bin/python}
 producer=${A1_PRODUCER:-/home/ubuntu/catan-zero-production/runs/learner/a1-infoset-n128-20260710-r2/candidate.pt}
+generation_contracts=${A1_CONTRACTS:-/home/ubuntu/catan-zero-production/contracts/a1-dual-arm-20260710-r1/locks}
 midpoint_dir=${A1_CORRECTIVE_MIDPOINT_DIR:-$root/training/corrective-196k-lr120u-loser1/n256}
 midpoint_receipt=$midpoint_dir/training.receipt.json
+midpoint_spec=$midpoint_dir/learner.spec.json
+midpoint_lock=$midpoint_dir/learner.lock.json
 data=$root/n256-early/n256.memmap
 validation=$root/n256-early/n256.validation_seeds.json
 out=$root/training/n256-lr-response-${lr_label}-loser1
 dose=$out/n256
-spec=$midpoint_dir/learner.spec.json
-lock=$midpoint_dir/learner.lock.json
+repo_commit=$(git -C "$repo" rev-parse HEAD)
+[[ -z $(git -C "$repo" status --porcelain --untracked-files=no) ]] || {
+  echo "REFUSED: LR-response runtime repository has tracked modifications" >&2; exit 2;
+}
+shared_contract_dir=$root/training/n256-lr-response-contracts/$repo_commit
+spec=$shared_contract_dir/learner.spec.json
+lock=$shared_contract_dir/learner.lock.json
 receipt=$dose/training.receipt.json
 ablation_id=n256-lr-response-${lr_label}-loser1
 overrides=$(printf '{"loser_sample_weight":1.0,"lr":%s}' "$lr")
@@ -66,12 +74,16 @@ verify_midpoint() {
   [[ -s "$midpoint_receipt" ]] || {
     echo "REFUSED: completed 1.2e-4 n256 midpoint receipt is required" >&2; exit 2;
   }
-  "$python" - "$repo" "$midpoint_receipt" "$spec" "$lock" <<'PY'
-import stat, sys
+  "$python" - "$repo" "$midpoint_receipt" "$midpoint_spec" "$midpoint_lock" <<'PY'
+import hashlib, json, stat, sys
 from pathlib import Path
 sys.path.insert(0, sys.argv[1])
 from tools import a1_dual_arm_train as train
-from tools import a1_dual_learner_contract as contract
+
+def digest(value):
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
 r = train.verify_receipt(Path(sys.argv[2]))
 if (r.get("arm_id"), r.get("subset_id")) != ("n256", "full-56k"):
     raise SystemExit("REFUSED: midpoint receipt is not the full n256 dose")
@@ -91,17 +103,97 @@ for path in (spec, lock):
 lock_ref = r.get("inputs", {}).get("learner_lock")
 if lock_ref != train._file_ref(lock, where="midpoint learner lock"):
     raise SystemExit("REFUSED: midpoint receipt binds another learner lock")
-authority = contract.verify_lock(lock, reviewed_file_sha256=lock_ref["sha256"])
+try:
+    authority = json.loads(lock.read_text(encoding="utf-8"))
+    reviewed_spec = json.loads(spec.read_text(encoding="utf-8"))
+except (OSError, UnicodeError, json.JSONDecodeError) as error:
+    raise SystemExit(f"REFUSED: cannot parse midpoint learner contract: {error}") from error
+expected_lock_fields = {
+    "schema_version", "arm_id", "subset_id", "generation_arm_lock",
+    "generation_contract_sha256", "learner_spec", "objective", "recipe",
+    "topology", "inputs", "payload_inventory_sha256", "data_fingerprint",
+    "row_counts", "selected_game_seed_set_sha256",
+    "training_game_seed_set_sha256", "validation_game_seed_set_sha256",
+    "runtime", "runtime_sha256", "trainer_report_bindings", "lock_sha256",
+}
+if not isinstance(authority, dict) or set(authority) != expected_lock_fields:
+    raise SystemExit("REFUSED: midpoint learner lock fields drift")
+unhashed = dict(authority); stated_lock_sha = unhashed.pop("lock_sha256", None)
+if authority.get("schema_version") != "a1-dual-arm-learner-lock-v1" or stated_lock_sha != digest(unhashed):
+    raise SystemExit("REFUSED: midpoint learner lock schema/digest drift")
+runtime = authority.get("runtime")
+if not isinstance(runtime, list) or authority.get("runtime_sha256") != digest(runtime):
+    raise SystemExit("REFUSED: midpoint historical runtime binding drift")
 if authority.get("learner_spec") != train._file_ref(spec, where="midpoint learner spec"):
     raise SystemExit("REFUSED: midpoint learner lock binds another spec")
 if (authority.get("arm_id"), authority.get("subset_id")) != ("n256", "full-56k"):
     raise SystemExit("REFUSED: midpoint learner contract is not full n256")
-if authority.get("topology", {}).get("world_size") != 8:
+expected_topology = {
+    "world_size": 8, "local_batch_size": 512, "grad_accum_steps": 1,
+    "global_batch_size": 4096, "data_format": "memmap",
+    "ddp_shard_data": False, "fsdp": False,
+}
+if authority.get("topology") != expected_topology:
     raise SystemExit("REFUSED: midpoint learner contract is not world8")
 if authority.get("recipe", {}).get("epochs") != 1:
     raise SystemExit("REFUSED: midpoint learner contract is not exactly one epoch")
+expected_spec_fields = {"schema_version", "arm_id", "subset_id", "objective", "recipe", "topology"}
+if (
+    not isinstance(reviewed_spec, dict)
+    or set(reviewed_spec) != expected_spec_fields
+    or reviewed_spec.get("schema_version") != "a1-dual-arm-learner-spec-v1"
+    or reviewed_spec.get("arm_id") != authority.get("arm_id")
+    or reviewed_spec.get("subset_id") != authority.get("subset_id")
+    or reviewed_spec.get("objective") != authority.get("objective")
+    or reviewed_spec.get("recipe") != authority.get("recipe")
+    or reviewed_spec.get("topology") != authority.get("topology")
+):
+    raise SystemExit("REFUSED: midpoint learner spec/lock semantics drift")
+lock_inputs = authority.get("inputs")
+if not isinstance(lock_inputs, dict) or set(lock_inputs) != {
+    "corpus_meta", "selected_manifest", "audit", "validation", "producer"
+}:
+    raise SystemExit("REFUSED: midpoint learner input bindings drift")
+receipt_inputs = r.get("inputs", {})
+for name, ref in lock_inputs.items():
+    if ref != train._file_ref(Path(ref.get("path", "")), where=f"midpoint {name}"):
+        raise SystemExit(f"REFUSED: midpoint learner input bytes drift: {name}")
+    if receipt_inputs.get(name) != ref:
+        raise SystemExit(f"REFUSED: midpoint receipt/lock input mismatch: {name}")
 print("authenticated completed n256 midpoint at lr=1.2e-4")
 PY
+}
+
+prepare_shared_contract() {
+  mkdir -p "$shared_contract_dir"
+  exec {contract_fd}>"$shared_contract_dir/build.lock"
+  flock "$contract_fd"
+  if [[ -s "$spec" && -s "$lock" ]]; then
+    :
+  elif [[ -e "$lock" ]]; then
+    echo "REFUSED: shared current-runtime lock exists without its spec" >&2
+    exit 2
+  else
+    if [[ ! -s "$spec" ]]; then
+      [[ ! -e "$spec" ]] || {
+        echo "REFUSED: shared current-runtime spec is incomplete" >&2; exit 2;
+      }
+      local spec_tmp=$spec.tmp.$$
+      cp "$midpoint_spec" "$spec_tmp"
+      chmod 0444 "$spec_tmp"
+      mv "$spec_tmp" "$spec"
+    fi
+    # One authoritative payload scan creates a lock whose runtime records match
+    # this exact clean commit. Every LR arm then reuses these immutable bytes.
+    "$python" "$repo/tools/a1_dual_learner_contract.py" seal \
+      --arm-lock "$generation_contracts/n256.lock.json" --learner-spec "$spec" \
+      --data "$data" --validation "$validation" \
+      --producer-checkpoint "$producer" --out "$lock"
+  fi
+  "$python" "$repo/tools/a1_dual_learner_contract.py" verify \
+    --lock "$lock" --reviewed-lock-file-sha256 "$(lock_sha "$lock")" >/dev/null
+  flock -u "$contract_fd"
+  exec {contract_fd}>&-
 }
 
 verify_completed() {
@@ -141,6 +233,7 @@ for partial in "$dose/candidate.pt" "$dose/candidate.pt.optimizer.pt" \
   }
 done
 [[ "$mode" == go ]] || verify_midpoint
+prepare_shared_contract
 
 lock_digest=$(lock_sha "$lock")
 code_digest=$(code_sha "$lock")
