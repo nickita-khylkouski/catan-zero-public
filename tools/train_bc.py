@@ -7673,6 +7673,9 @@ def load_teacher_data(
         "target_information_regime",
         "root_value",
         "root_value_mask",
+        "afterstate_target",
+        "afterstate_target_mask",
+        "simulations_used",
         "is_forced",
         "used_full_search",
         "game_seed",
@@ -8233,6 +8236,31 @@ def _normalize_teacher_shard(
             path,
             leading=n,
         ).astype(np.bool_, copy=False)
+    if "afterstate_target" in shard:
+        result["afterstate_target"] = _field_or_default(
+            shard,
+            "afterstate_target",
+            np.full((n, legal_width), np.nan, dtype=np.float32),
+            path,
+            leading=n,
+            width=legal_width,
+        ).astype(np.float32, copy=False)
+        result["afterstate_target_mask"] = _field_or_default(
+            shard,
+            "afterstate_target_mask",
+            np.isfinite(result["afterstate_target"]),
+            path,
+            leading=n,
+            width=legal_width,
+        ).astype(np.bool_, copy=False)
+    if "simulations_used" in shard:
+        result["simulations_used"] = _field_or_default(
+            shard,
+            "simulations_used",
+            np.zeros(n, dtype=np.int32),
+            path,
+            leading=n,
+        ).astype(np.int32, copy=False)
     # Preserve optional self-play search provenance when present.  Besides
     # supporting shard audits, these columns make the root-value admission
     # mask independently checkable after normalization.
@@ -9156,13 +9184,20 @@ def _concat_padded(key: str, values: list[np.ndarray]) -> np.ndarray:
         "target_scores",
         "target_policy_mask",
         "target_scores_mask",
+        "afterstate_target",
+        "afterstate_target_mask",
         "legal_action_mask",
     }:
         if key == "legal_action_ids":
             fill = -1
-        elif key == "target_scores":
+        elif key in {"target_scores", "afterstate_target"}:
             fill = np.nan
-        elif key in {"target_policy_mask", "target_scores_mask", "legal_action_mask"}:
+        elif key in {
+            "target_policy_mask",
+            "target_scores_mask",
+            "afterstate_target_mask",
+            "legal_action_mask",
+        }:
             fill = False
         else:
             fill = 0.0

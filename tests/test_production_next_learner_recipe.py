@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 
 from catan_zero.rl.flywheel.config import FlywheelConfig
+from tools.build_memmap_corpus import build_memmap_corpus
 from tools import train_bc
 from tools.continuous_flywheel import Runner
 
@@ -73,3 +74,37 @@ def test_production_next_training_refuses_single_component_without_anchor(tmp_pa
     assert result["ok"] is False
     assert "requires at least two replay components" in result["note"]
 
+
+def test_search_afterstate_and_budget_survive_npz_and_memmap_loaders(tmp_path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    shard = source / "shard.npz"
+    np.savez(
+        shard,
+        obs=np.zeros((2, 3), dtype=np.float16),
+        legal_action_ids=np.asarray([[1, -1], [2, 3]], dtype=np.int16),
+        legal_action_context=np.zeros((2, 2, 1), dtype=np.float16),
+        action_taken=np.asarray([1, 2], dtype=np.int16),
+        afterstate_target=np.asarray([[0.25, np.nan], [0.5, -0.5]], dtype=np.float32),
+        afterstate_target_mask=np.asarray([[True, False], [True, True]], dtype=np.bool_),
+        simulations_used=np.asarray([0, 128], dtype=np.int32),
+    )
+    (source / "manifest.json").write_text(
+        '{"shards":["' + str(shard) + '"]}', encoding="utf-8"
+    )
+
+    loaded = train_bc.load_teacher_data(source)
+    np.testing.assert_array_equal(
+        loaded["afterstate_target_mask"],
+        np.asarray([[True, False], [True, True]], dtype=np.bool_),
+    )
+    np.testing.assert_array_equal(loaded["simulations_used"], [0, 128])
+
+    corpus_path = tmp_path / "corpus"
+    build_memmap_corpus(source, corpus_path, progress_every=0)
+    corpus = train_bc.MemmapCorpus(corpus_path)
+    np.testing.assert_array_equal(
+        np.asarray(corpus["afterstate_target_mask"]),
+        np.asarray([[True, False], [True, True]], dtype=np.bool_),
+    )
+    np.testing.assert_array_equal(np.asarray(corpus["simulations_used"]), [0, 128])

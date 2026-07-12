@@ -135,6 +135,11 @@ def build_plan(*, world_size: int, local_batch_size: int, grad_accum_steps: int)
             "old_gen3_replay_ratios_by_game": [0.0, 0.1, 0.2],
             "replay_stage": "P2 after anchor selection",
         },
+        "prerequisites": [
+            "KL anchor excludes single-legal-action rows from its denominator",
+            "KL anchor uses forward KL(champion_prior || candidate) behavior distillation",
+            "multi-action fast-PCR rows remain eligible anchor rehearsal rows",
+        ],
         "arms": arms,
         "adjudication_order": [
             "external_population",

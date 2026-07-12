@@ -36,11 +36,14 @@ outcome target until a refreshed/lagged-root experiment wins.  Likewise,
 return-scale semantics; normalized teacher preference scores are not a safe PPO
 Q target.
 
-The forced-ROLL afterstate column is stored but is not consumed by the canonical
-loss.  A superseded implementation blended the played-action Q/afterstate into
-the value target.  It was intentionally not merged because it silently changed
-the blend direction and introduced a self-estimated target.  Reintroduce that
-signal only as an authenticated, matched refreshed-target arm.
+The forced-ROLL afterstate column was stored in NPZ shards but omitted by both
+training loader paths, along with `simulations_used`; existing n128/n256 memmaps
+therefore do not contain it.  Schema v2 now preserves both columns in future
+NPZ and memmap loads, but the canonical loss still does not consume them.  A
+superseded implementation blended the played-action Q/afterstate into the value
+target.  It was intentionally not merged because it silently changed the blend
+direction and introduced a self-estimated target.  Reintroduce that signal only
+as an authenticated, matched refreshed-target arm.
 
 ## Default iteration recipe
 
@@ -56,4 +59,3 @@ signal only as an authenticated, matched refreshed-target arm.
 
 This addresses the proximal failure—large fresh-Adam drift on one correlated
 distribution—without claiming that stale search values are ground truth.
-

@@ -58,6 +58,15 @@ loses external strength even if its internal panel improves.
 
 ### P1 — anti-forgetting anchor sweep (three short B200 arms)
 
+Prerequisite: repair the anchor scope and direction before spending this sweep.
+The current implementation averages reverse `KL(new || prior)` over all rows
+with priors. Forced single-action rows have identically zero KL but still enter
+that denominator, diluting the configured coefficient by roughly their corpus
+fraction. Use multi-action rows only (retain fast-PCR multi-action rows as
+rehearsal) and forward `KL(prior || new)`/old-policy cross-entropy as the
+behavior-preservation objective. Preserve the reverse direction only as an
+explicit legacy ablation.
+
 Hold every field fixed and sweep only `policy_kl_anchor_weight`:
 
 | Arm | KL weight | Purpose |

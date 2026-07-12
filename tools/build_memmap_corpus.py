@@ -955,6 +955,13 @@ LOADER_KEYS: tuple[str, ...] = (
     "target_information_regime",
     "root_value",
     "root_value_mask",
+    # Preserve the search products even while the canonical learner keeps
+    # bootstrap losses off.  The generator paid for these columns; dropping
+    # them here made authenticated refreshed-target/Q ablations impossible
+    # without returning to the original NPZ shards.
+    "afterstate_target",
+    "afterstate_target_mask",
+    "simulations_used",
     "game_seed",
     "teacher_name",
     "player",
@@ -1003,6 +1010,8 @@ RAGGED_FILLS: dict[str, float] = {
     "target_scores": float("nan"),
     "target_policy_mask": 0.0,  # False
     "target_scores_mask": 0.0,  # False
+    "afterstate_target": float("nan"),
+    "afterstate_target_mask": 0.0,  # False
     "legal_action_mask": 0.0,  # False
     "legal_action_context": 0.0,
     "legal_action_tokens": 0.0,

@@ -66,3 +66,5 @@ def test_forced_policy_is_not_reintroduced_as_a_recipe_override():
         0.1,
         0.2,
     ]
+    assert any("forward KL" in item for item in plan["prerequisites"])
+    assert any("single-legal-action" in item for item in plan["prerequisites"])
