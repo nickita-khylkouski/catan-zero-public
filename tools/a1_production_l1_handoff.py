@@ -125,10 +125,41 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
     ):
         raise HandoffError("pending direct plan is not the r3-v-f7 promotion-parent panel")
     direct_result = args.direct_result.expanduser().resolve(strict=False)
-    if direct_result.exists():
-        raise HandoffError(
-            "direct result now exists; build a completed adjudication instead of a pending bundle"
-        )
+    direct_evidence: dict[str, Any]
+    direct_complete = direct_result.exists()
+    if direct_complete:
+        direct_ref = _ref(direct_result)
+        direct_payload = _load(Path(direct_ref["path"]))
+        if (
+            _checkpoint_sha(direct_payload, "direct result") != candidate["sha256"]
+            or direct_payload.get("baseline_checkpoint_sha256") != args.f7_sha256
+            or direct_payload.get("verdict") not in {"H1", "accept_h1"}
+            or direct_payload.get("errors") not in {None, []}
+        ):
+            raise HandoffError("completed direct result is not a clean r3-v-f7 H1")
+        direct_evidence = {
+            "status": "complete_h1",
+            "plan": direct_plan,
+            "artifact": direct_ref,
+            "plan_semantic_sha256": direct_plan_payload.get("plan_hash"),
+            "run_id": direct_plan_payload.get("run_id"),
+            "candidate_wins": direct_payload.get("candidate_wins"),
+            "baseline_wins": direct_payload.get("baseline_wins"),
+            "candidate_win_rate": direct_payload.get("candidate_win_rate"),
+            "verdict": direct_payload.get("verdict"),
+            "required_candidate_sha256": candidate["sha256"],
+            "required_champion_sha256": args.f7_sha256,
+        }
+    else:
+        direct_evidence = {
+            "status": "pending",
+            "plan": direct_plan,
+            "plan_semantic_sha256": direct_plan_payload.get("plan_hash"),
+            "run_id": direct_plan_payload.get("run_id"),
+            "expected_result": str(direct_result),
+            "required_candidate_sha256": candidate["sha256"],
+            "required_champion_sha256": args.f7_sha256,
+        }
 
     transaction_tool = _ref(args.transaction_tool)
     registry = _ref(args.registry)
@@ -147,7 +178,11 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
     ]
     bundle: dict[str, Any] = {
         "schema_version": SCHEMA,
-        "status": "awaiting_direct_r3_vs_f7",
+        "status": (
+            "direct_complete_pending_typed_adjudication"
+            if direct_complete
+            else "awaiting_direct_r3_vs_f7"
+        ),
         "promotion_ready": False,
         "pointer_mutation_authorized": False,
         "learner": {
@@ -177,15 +212,7 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
                 "champion_win_rate": champion_external_payload["candidate_win_rate"],
                 "candidate_minus_champion": expected_delta,
             },
-            "direct_r3_vs_f7": {
-                "status": "pending",
-                "plan": direct_plan,
-                "plan_semantic_sha256": direct_plan_payload.get("plan_hash"),
-                "run_id": direct_plan_payload.get("run_id"),
-                "expected_result": str(direct_result),
-                "required_candidate_sha256": candidate["sha256"],
-                "required_champion_sha256": args.f7_sha256,
-            },
+            "direct_r3_vs_f7": direct_evidence,
         },
         "authoritative_transaction_audit": {
             "tool": transaction_tool,
@@ -207,10 +234,9 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
             ),
         },
         "blockers": [
-            "direct r3-v-f7 promotion-parent result is pending",
+            *([] if direct_complete else ["direct r3-v-f7 promotion-parent result is pending"]),
             "passing typed adjudication and complete required evidence set are not sealed",
             "promotion cohort-exclusions manifest is not sealed",
-            "authoritative transaction currently rejects the new 8-rank production completion receipt schema; add reviewed verifier support before dry-run",
         ],
     }
     bundle["bundle_sha256"] = _digest(bundle)
@@ -235,6 +261,8 @@ def verify(path: Path) -> dict[str, Any]:
     for key in ("candidate", "champion", "comparison"):
         _verify_ref(evidence["external_matched_vs_f7"][key], f"external.{key}")
     _verify_ref(evidence["direct_r3_vs_f7"]["plan"], "direct plan")
+    if evidence["direct_r3_vs_f7"]["status"] == "complete_h1":
+        _verify_ref(evidence["direct_r3_vs_f7"]["artifact"], "direct result")
     audit = value["authoritative_transaction_audit"]
     for key in ("tool", "registry_snapshot", "current_pointer_snapshot"):
         _verify_ref(audit[key], f"transaction.{key}")
