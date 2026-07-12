@@ -59,7 +59,7 @@ def _source_manifest(tmp_path: Path, source: Path, descriptor: Path,
         "python", "-m", "torch.distributed.run", "--standalone",
         "--nproc-per-node=8", "tools/train_bc.py",
         "--data", str(descriptor.resolve()),
-        "--validation-game-seed-manifest", str(validation.resolve()),
+        "--validation-game-sentinel-manifest", str(validation.resolve()),
         "--init-checkpoint", str(source.resolve()),
         "--checkpoint", str(tmp_path / "source-candidate.pt"),
         "--report", str(tmp_path / "source-report.json"),
@@ -80,11 +80,13 @@ def _source_manifest(tmp_path: Path, source: Path, descriptor: Path,
     payload = {
         "schema_version": arm.SOURCE_SCHEMA,
         "diagnostic_only": True, "promotion_eligible": False,
-        "launch_authorized": False, "launch_interface_present": False,
+        "launch_authorized": False, "diagnostic_execution_authorized": True,
+        "launch_interface_present": "tools/a1_corrected_policy_arm_execute.py --go",
         "recipe": recipe, "recipe_sha256": arm.corrected._digest(recipe),
         "initialization": arm.corrected._file_ref(source),
         "descriptor": arm.corrected._file_ref(descriptor),
-        "validation_manifest": arm.corrected._file_ref(validation),
+        "validation_sentinel": arm.corrected._file_ref(validation),
+        "validation_sentinel_selection_sha256": "sha256:selection",
         "command": command, "command_sha256": arm.corrected._digest(command),
     }
     payload["manifest_sha256"] = arm.corrected._digest(payload)
@@ -141,6 +143,7 @@ def test_prepares_one_axis_gather_k3_without_launch(tmp_path, monkeypatch):
     manifest, path = arm.prepare(_args(tmp_path, monkeypatch))
     assert path.is_file()
     assert manifest["launch_authorized"] is False
+    assert manifest["diagnostic_execution_authorized"] is False
     assert manifest["launch_interface_present"] is False
     assert manifest["only_declared_optimization_delta"] == "action_target_gather=true"
     assert manifest["matched_contract"]["dose_sampler_objective_operator_unchanged"] is True
@@ -150,9 +153,10 @@ def test_prepares_one_axis_gather_k3_without_launch(tmp_path, monkeypatch):
         arm.EXPECTED_NEW_PARAMETERS
     )
     assert len(manifest["corpus_topology_target_coverage"]["components"]) == 3
-    assert manifest["executor_contract"]["world_size"] == 8
-    assert manifest["executor_contract"]["required_nofile_soft"] == 65_536
-    assert manifest["executor_contract"]["launch_authorized"] is False
+    assert manifest["executor_compatibility"]["compatible_now"] is False
+    assert "exact a1-corrected-policy-arm-manifest-v1" in (
+        manifest["executor_compatibility"]["reason"]
+    )
     command = manifest["command"]
     assert arm.corrected._option(command, "--a1-learner-ablation-id") == (
         "corrected-anchor-K3-topology-gather"
@@ -219,4 +223,27 @@ def test_source_manifest_refuses_recipe_drift(tmp_path, monkeypatch):
     )
     args.source_manifest.write_text(json.dumps(payload), encoding="utf-8")
     with pytest.raises(arm.ArmError, match="exact corrected anchor-only K3"):
+        arm.prepare(args)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("diagnostic_execution_authorized", False),
+        ("launch_interface_present", False),
+        ("launch_interface_present", "some_other_executor.py --go"),
+        ("promotion_eligible", True),
+    ],
+)
+def test_source_requires_exact_finalized_diagnostic_executor_shape(
+    tmp_path, monkeypatch, field, value
+):
+    args = _args(tmp_path, monkeypatch)
+    payload = json.loads(args.source_manifest.read_text())
+    payload[field] = value
+    payload["manifest_sha256"] = arm.corrected._digest(
+        {key: item for key, item in payload.items() if key != "manifest_sha256"}
+    )
+    args.source_manifest.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(arm.ArmError, match="exact diagnostic executor"):
         arm.prepare(args)

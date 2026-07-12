@@ -61,9 +61,11 @@ def _load_source(path: Path) -> tuple[dict[str, Any], dict[str, str]]:
         payload.get("diagnostic_only") is True
         and payload.get("promotion_eligible") is False
         and payload.get("launch_authorized") is False
-        and payload.get("launch_interface_present") is False
+        and payload.get("diagnostic_execution_authorized") is True
+        and payload.get("launch_interface_present")
+        == "tools/a1_corrected_policy_arm_execute.py --go"
     ):
-        raise ArmError("source corrected K3 manifest is not sealed preparation-only evidence")
+        raise ArmError("source corrected K3 manifest lacks its exact diagnostic executor")
     recipe = payload.get("recipe")
     command = payload.get("command")
     if (
@@ -95,15 +97,20 @@ def _load_source(path: Path) -> tuple[dict[str, Any], dict[str, str]]:
         raise ArmError("source command is not corrected-anchor-K3")
     initialization = payload.get("initialization")
     descriptor = payload.get("descriptor")
-    if not isinstance(initialization, dict) or not isinstance(descriptor, dict):
-        raise ArmError("source K3 omits initialization or descriptor identity")
-    for identity in (initialization, descriptor):
+    sentinel = payload.get("validation_sentinel")
+    if not all(isinstance(value, dict) for value in (initialization, descriptor, sentinel)):
+        raise ArmError("source K3 omits initialization, descriptor, or sentinel identity")
+    for identity in (initialization, descriptor, sentinel):
         if corrected._file_ref(Path(identity.get("path", ""))) != identity:  # noqa: SLF001
             raise ArmError("source K3 bound artifact bytes drifted")
     if corrected._option(command, "--init-checkpoint") != initialization["path"]:  # noqa: SLF001
         raise ArmError("source command/checkpoint identity mismatch")
     if corrected._option(command, "--data") != descriptor["path"]:  # noqa: SLF001
         raise ArmError("source command/descriptor identity mismatch")
+    if corrected._option(command, "--validation-game-sentinel-manifest") != sentinel["path"]:  # noqa: SLF001
+        raise ArmError("source command/validation sentinel identity mismatch")
+    if "--validation-game-seed-manifest" in command:
+        raise ArmError("source K3 command mixes validation controls")
     return payload, ref
 
 
@@ -329,29 +336,22 @@ def prepare(args: argparse.Namespace) -> tuple[dict[str, Any], Path]:
     if source_effective != treatment_effective:
         raise ArmError("topology arm effective learner recipe drift")
     source_binding = _source_binding(repo)
-    executor_contract = {
-        "schema_version": "a1-sealed-torchrun-command-v1",
-        "working_directory": str(repo),
-        "world_size": 8,
-        "required_nofile_soft": 65_536,
-        "command": command,
-        "command_sha256": corrected._digest(command),  # noqa: SLF001
-        "expected_outputs": [str(output_root / "candidate.pt"), str(output_root / "train.report.json")],
-        "fresh_optimizer_required": True,
-        "launch_authorized": False,
-    }
     manifest: dict[str, Any] = {
         "schema_version": SCHEMA,
         "diagnostic_only": True,
         "promotion_eligible": False,
         "launch_authorized": False,
+        "diagnostic_execution_authorized": False,
         "launch_interface_present": False,
         "source_corrected_k3_manifest": source_ref,
         "source_corrected_k3_manifest_sha256": source["manifest_sha256"],
         "source_recipe": source["recipe"],
         "source_recipe_sha256": source["recipe_sha256"],
         "descriptor": source["descriptor"],
-        "validation_manifest": source["validation_manifest"],
+        "validation_sentinel": source["validation_sentinel"],
+        "validation_sentinel_selection_sha256": source[
+            "validation_sentinel_selection_sha256"
+        ],
         "initialization_source": source["initialization"],
         "initialization_treatment": upgrade["upgraded"],
         "function_preserving_upgrade": upgrade,
@@ -361,7 +361,7 @@ def prepare(args: argparse.Namespace) -> tuple[dict[str, Any], Path]:
         "matched_contract": {
             "recipe_sha256": source["recipe_sha256"],
             "descriptor": source["descriptor"],
-            "validation_manifest": source["validation_manifest"],
+            "validation_sentinel": source["validation_sentinel"],
             "dose_sampler_objective_operator_unchanged": True,
             "optimizer_state_reused": False,
             "step0_network_outputs_bit_identical": True,
@@ -369,8 +369,22 @@ def prepare(args: argparse.Namespace) -> tuple[dict[str, Any], Path]:
         "allowlisted_command_changes": changes,
         "command": command,
         "command_sha256": corrected._digest(command),  # noqa: SLF001
-        "executor_contract": executor_contract,
-        "executor_contract_sha256": corrected._digest(executor_contract),  # noqa: SLF001
+        "executor_compatibility": {
+            "source_executor": "tools/a1_corrected_policy_arm_execute.py --go",
+            "source_executor_receipt_schema": (
+                "a1-corrected-policy-arm-execution-receipt-v1"
+            ),
+            "compatible_now": False,
+            "reason": (
+                "the corrected executor intentionally accepts only the exact "
+                "a1-corrected-policy-arm-manifest-v1 schema; this treatment remains "
+                "non-executable until corrected K3 is selected"
+            ),
+            "required_before_execution": (
+                "a separately reviewed topology manifest executor with the same "
+                "idle-B200, systemd, receipt, and output-exclusion guarantees"
+            ),
+        },
     }
     manifest["manifest_sha256"] = corrected._digest(manifest)  # noqa: SLF001
     output_root.mkdir(parents=True, exist_ok=True)
