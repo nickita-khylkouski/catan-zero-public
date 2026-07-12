@@ -47,6 +47,65 @@ def _verify_ref(value: Any, *, label: str) -> Path:
     return base._verify_ref(value, label=label)  # noqa: SLF001
 
 
+def _source_trainer_binding(
+    source_manifest: Path,
+) -> tuple[dict[str, Any], Path, Path]:
+    """Authenticate the trainer/runtime checkout selected by corrected K3."""
+
+    try:
+        source = json.loads(source_manifest.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ExecutionError(f"cannot decode source corrected-K3 manifest: {error}") from error
+    if not isinstance(source, dict):
+        raise ExecutionError("source corrected-K3 manifest is not an object")
+    stated = source.get("manifest_sha256")
+    unhashed = {key: value for key, value in source.items() if key != "manifest_sha256"}
+    source_command = source.get("command")
+    if not (
+        source.get("schema_version") == prepare.SOURCE_SCHEMA
+        and stated == prepare.corrected._digest(unhashed)  # noqa: SLF001
+        and isinstance(source_command, list)
+        and all(isinstance(value, str) for value in source_command)
+        and source.get("command_sha256")
+        == prepare.corrected._digest(source_command)  # noqa: SLF001
+    ):
+        raise ExecutionError("source corrected-K3 manifest/command digest drift")
+    binding = source.get("source_binding")
+    if not isinstance(binding, dict):
+        raise ExecutionError("source corrected-K3 manifest has no checkout binding")
+    try:
+        source_repo = Path(str(binding.get("repository_root", ""))).resolve(strict=True)
+    except OSError as error:
+        raise ExecutionError(f"cannot resolve source trainer checkout: {error}") from error
+    if base._git_head(source_repo) != binding.get("git_commit"):  # noqa: SLF001
+        raise ExecutionError("source trainer checkout commit differs from corrected K3")
+    files = binding.get("files")
+    if not isinstance(files, dict) or not files:
+        raise ExecutionError("source corrected-K3 checkout binding has no files")
+    bound_paths: dict[Path, str] = {}
+    for relative, ref in files.items():
+        path = _verify_ref(ref, label=f"corrected_source.{relative}")
+        try:
+            expected = (source_repo / relative).resolve(strict=True)
+        except OSError as error:
+            raise ExecutionError(
+                f"cannot resolve corrected source path {relative}: {error}"
+            ) from error
+        if path != expected:
+            raise ExecutionError(f"corrected source path escaped checkout: {relative}")
+        bound_paths[path] = relative
+    trainers = [
+        Path(value).resolve()
+        for value in source_command
+        if Path(value).name == "train_bc.py"
+    ]
+    if len(trainers) != 1 or trainers[0] not in bound_paths:
+        raise ExecutionError(
+            "source corrected-K3 trainer is not authenticated by its checkout binding"
+        )
+    return source, source_repo, trainers[0]
+
+
 def verify(manifest_path: Path) -> dict[str, Any]:
     manifest, manifest_ref = _read_manifest(manifest_path)
     executor = _verify_ref(manifest.get("diagnostic_executor"), label="diagnostic_executor")
@@ -56,6 +115,7 @@ def verify(manifest_path: Path) -> dict[str, Any]:
     source_manifest = _verify_ref(
         manifest.get("source_corrected_k3_manifest"), label="source_corrected_k3_manifest"
     )
+    source, trainer_repo, source_trainer = _source_trainer_binding(source_manifest)
     descriptor = _verify_ref(manifest.get("descriptor"), label="descriptor")
     sentinel = _verify_ref(
         manifest.get("validation_sentinel"), label="validation_sentinel"
@@ -87,10 +147,12 @@ def verify(manifest_path: Path) -> dict[str, Any]:
     if not isinstance(source_binding, dict):
         raise ExecutionError("manifest has no source checkout binding")
     try:
-        repo = Path(str(source_binding.get("repository_root", ""))).resolve(strict=True)
+        preparer_repo = Path(str(source_binding.get("repository_root", ""))).resolve(
+            strict=True
+        )
     except OSError as error:
         raise ExecutionError(f"cannot resolve execution checkout: {error}") from error
-    if base._git_head(repo) != source_binding.get("git_commit"):  # noqa: SLF001
+    if base._git_head(preparer_repo) != source_binding.get("git_commit"):  # noqa: SLF001
         raise ExecutionError("execution checkout commit differs from topology manifest")
     files = source_binding.get("files")
     if not isinstance(files, dict) or prepare.EXECUTOR_RELATIVE_PATH not in files:
@@ -98,7 +160,7 @@ def verify(manifest_path: Path) -> dict[str, Any]:
     for relative, ref in files.items():
         path = _verify_ref(ref, label=f"source.{relative}")
         try:
-            expected = (repo / relative).resolve(strict=True)
+            expected = (preparer_repo / relative).resolve(strict=True)
         except OSError as error:
             raise ExecutionError(f"cannot resolve source path {relative}: {error}") from error
         if path != expected:
@@ -112,8 +174,10 @@ def verify(manifest_path: Path) -> dict[str, Any]:
     if manifest.get("command_sha256") != prepare.corrected._digest(command):  # noqa: SLF001
         raise ExecutionError("manifest command digest drift")
     trainer = [Path(value).resolve() for value in command if Path(value).name == "train_bc.py"]
-    if trainer != [(repo / "tools/train_bc.py").resolve(strict=True)]:
-        raise ExecutionError("manifest trainer is not the bound checkout")
+    if trainer != [source_trainer]:
+        raise ExecutionError(
+            "topology command trainer differs from bound corrected-K3 trainer"
+        )
     exact_inputs = {
         "--data": str(descriptor),
         "--validation-game-sentinel-manifest": str(sentinel),
@@ -129,7 +193,7 @@ def verify(manifest_path: Path) -> dict[str, Any]:
         and manifest.get("source_recipe_sha256")
         == prepare.corrected._digest(manifest.get("source_recipe"))  # noqa: SLF001
         and manifest.get("source_corrected_k3_manifest_sha256")
-        == json.loads(source_manifest.read_text(encoding="utf-8")).get("manifest_sha256")
+        == source.get("manifest_sha256")
         and source_init == Path(upgrade["source"]["path"])
     ):
         raise ExecutionError("topology source/recipe identity drift")
@@ -158,7 +222,12 @@ def verify(manifest_path: Path) -> dict[str, Any]:
     return {
         "manifest": manifest,
         "manifest_ref": manifest_ref,
-        "repo": repo,
+        # Run from the corrected-K3 checkout as well as invoking its exact
+        # trainer bytes. Relative imports/config paths therefore retain the
+        # source arm's runtime semantics; the current checkout only supplies
+        # the independently authenticated preparer/executor.
+        "repo": trainer_repo,
+        "preparer_repo": preparer_repo,
         "command": command,
         "output_root": output_root,
     }

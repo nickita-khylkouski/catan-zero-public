@@ -54,9 +54,13 @@ def _checkpoints(tmp_path: Path) -> tuple[Path, Path]:
 
 def _source_manifest(tmp_path: Path, source: Path, descriptor: Path,
                      validation: Path) -> Path:
+    source_repo = tmp_path / "source-checkout"
+    trainer = source_repo / "tools/train_bc.py"
+    trainer.parent.mkdir(parents=True)
+    trainer.write_text("# exact source K3 trainer\n", encoding="utf-8")
     command = [
         "python", "-m", "torch.distributed.run", "--standalone",
-        "--nproc-per-node=8", "tools/train_bc.py",
+        "--nproc-per-node=8", str(trainer.resolve()),
         "--data", str(descriptor.resolve()),
         "--validation-game-sentinel-manifest", str(validation.resolve()),
         "--init-checkpoint", str(source.resolve()),
@@ -83,6 +87,13 @@ def _source_manifest(tmp_path: Path, source: Path, descriptor: Path,
         "descriptor": arm.corrected._file_ref(descriptor),
         "validation_sentinel": arm.corrected._file_ref(validation),
         "validation_sentinel_selection_sha256": "sha256:selection",
+        "source_binding": {
+            "repository_root": str(source_repo.resolve()),
+            "git_commit": "source-test-head",
+            "files": {
+                "tools/train_bc.py": arm.corrected._file_ref(trainer),
+            },
+        },
         "command": command, "command_sha256": arm.corrected._digest(command),
     }
     payload["manifest_sha256"] = arm.corrected._digest(payload)
