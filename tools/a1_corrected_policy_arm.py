@@ -505,7 +505,7 @@ def _build_corrected_sentinel(
     *, source_receipt: dict[str, Any], source_descriptor: dict[str, Any],
     descriptor: Path, descriptor_meta: dict[str, Any], output_path: Path,
     python: str, repo: Path,
-) -> tuple[dict[str, Any], dict[str, str], dict[str, str]]:
+) -> tuple[dict[str, Any], dict[str, str], dict[str, str], dict[str, Any]]:
     raw_source = source_receipt.get("sentinel")
     expected_source_sha = source_receipt.get("sentinel_sha256")
     if not isinstance(raw_source, str) or not isinstance(expected_source_sha, str):
@@ -521,6 +521,25 @@ def _build_corrected_sentinel(
         != source_descriptor["descriptor_fingerprint"]
     ):
         raise ArmError("source validation sentinel is not bound to source descriptor")
+    source_games = source_payload.get("game_seeds")
+    if (
+        not isinstance(source_games, list)
+        or not source_games
+        or any(isinstance(seed, bool) or not isinstance(seed, int) for seed in source_games)
+    ):
+        raise ArmError("source validation sentinel has no authenticated selected games")
+    component_ids = list(descriptor_meta.get("component_ids", ()))
+    component_ratios = list(descriptor_meta.get("component_game_sampling_ratios", ()))
+    if (
+        len(component_ids) < 2
+        or len(component_ids) != len(component_ratios)
+        or not np.isclose(sum(float(value) for value in component_ratios), 1.0)
+    ):
+        raise ArmError("next validation sentinel component mixture is malformed")
+    ratio_contract = {
+        component_id: float(ratio)
+        for component_id, ratio in zip(component_ids, component_ratios, strict=True)
+    }
     if not output_path.exists():
         command = [
             python, str(repo / "tools/derive_validation_game_sentinel.py"),
@@ -528,6 +547,8 @@ def _build_corrected_sentinel(
             "--target-rows", str(source_payload["target_row_count"]),
             "--selection-seed", str(source_payload["selection_seed"]),
             "--validation-fraction", "0.05", "--validation-seed", "17",
+            "--exclude-selected-games-from", str(source_ref["path"]),
+            "--component-target-ratios-json", _canonical(ratio_contract).decode(),
         ]
         try:
             subprocess.run(command, cwd=repo, check=True)
@@ -551,7 +572,101 @@ def _build_corrected_sentinel(
         or int(corrected.get("selected_row_count", 0)) <= 0
     ):
         raise ArmError("next validation sentinel contains no authenticated selection")
-    return corrected, corrected_ref, source_ref
+    corrected_games = corrected.get("game_seeds")
+    if not isinstance(corrected_games, list) or any(
+        isinstance(seed, bool) or not isinstance(seed, int) for seed in corrected_games
+    ):
+        raise ArmError("next validation sentinel selected games are malformed")
+    overlap = set(source_games).intersection(corrected_games)
+    if overlap:
+        raise ArmError(
+            "next validation sentinel reuses games already consumed for model selection"
+        )
+    selected = set(corrected_games)
+    component_rows: list[dict[str, Any]] = []
+    assigned: set[int] = set()
+    total_rows = 0
+    assigned_target_rows = 0
+    for component_index, component in enumerate(descriptor_meta.get("components", ())):
+        component_id = component.get("component_id")
+        if component_id not in ratio_contract:
+            raise ArmError("next validation sentinel component identity drift")
+        validation_payload, _ = _load_json(Path(str(component["validation_manifest"])))
+        validation_games = validation_payload.get("game_seeds")
+        if not isinstance(validation_games, list):
+            raise ArmError(f"component {component_id} validation games are malformed")
+        component_selected = selected.intersection(validation_games)
+        if assigned.intersection(component_selected):
+            raise ArmError("next validation sentinel games overlap components")
+        assigned.update(component_selected)
+        corpus_meta = component.get("corpus_meta")
+        row_count = int(corpus_meta.get("row_count", 0)) if isinstance(corpus_meta, Mapping) else 0
+        if row_count <= 0:
+            raise ArmError(f"component {component_id} has no authenticated rows")
+        corpus_dir = Path(str(component["corpus_dir"])).expanduser().resolve(strict=True)
+        game_seeds = np.memmap(
+            corpus_dir / "game_seed.dat", dtype=np.dtype("<i8"), mode="r", shape=(row_count,)
+        )
+        validation_array = np.asarray(sorted(set(validation_games)), dtype=np.int64)
+        validation_row_counts: dict[int, int] = {}
+        for start in range(0, row_count, 1 << 22):
+            stop = min(start + (1 << 22), row_count)
+            heldout = np.asarray(game_seeds[start:stop][
+                np.isin(game_seeds[start:stop], validation_array)
+            ], dtype=np.int64)
+            unique, counts = np.unique(heldout, return_counts=True)
+            for seed, count in zip(unique.tolist(), counts.tolist(), strict=True):
+                validation_row_counts[seed] = validation_row_counts.get(seed, 0) + int(count)
+        selected_rows = sum(validation_row_counts.get(seed, 0) for seed in component_selected)
+        max_game_rows = max(validation_row_counts.values(), default=0)
+        if component_index + 1 == len(component_ids):
+            target_component_rows = int(corrected["target_row_count"]) - assigned_target_rows
+        else:
+            target_component_rows = int(round(
+                int(corrected["target_row_count"]) * ratio_contract[component_id]
+            ))
+            assigned_target_rows += target_component_rows
+        if max_game_rows <= 0 or abs(selected_rows - target_component_rows) > max_game_rows:
+            raise ArmError(
+                f"component {component_id} validation rows are not near its sealed target"
+            )
+        total_rows += selected_rows
+        component_rows.append({
+            "component_id": component_id,
+            "target_row_ratio": ratio_contract[component_id],
+            "target_row_count": target_component_rows,
+            "selected_game_count": len(component_selected),
+            "selected_row_count": selected_rows,
+            "max_whole_game_row_count": max_game_rows,
+        })
+    if assigned != selected or total_rows != int(corrected["selected_row_count"]):
+        raise ArmError("next validation sentinel component row accounting drift")
+    predecessor = component_ids[-1]
+    predecessor_row = component_rows[-1]
+    if (
+        predecessor not in {REPLAY_COMPONENT_ID, "predecessor_replay"}
+        or predecessor_row["selected_game_count"] <= 0
+        or predecessor_row["selected_row_count"] <= 0
+        or not np.isclose(predecessor_row["target_row_ratio"], 0.2)
+    ):
+        raise ArmError("next validation sentinel lacks fresh predecessor coverage")
+    independence = {
+        "schema_version": "a1-validation-independence-contract-v1",
+        "source_selected_game_seed_set_sha256": source_payload[
+            "selected_game_seed_set_sha256"
+        ],
+        "fresh_selected_game_seed_set_sha256": corrected[
+            "selected_game_seed_set_sha256"
+        ],
+        "selection_overlap_game_count": 0,
+        "selection_scope": "fresh_whole_games_stratified_to_winning_operator",
+        "component_rows": component_rows,
+        "predecessor_component_id": predecessor,
+        "predecessor_target_row_ratio": 0.2,
+        "complete_component_holdouts_remain_training_excluded": True,
+    }
+    independence["contract_sha256"] = _digest(independence)
+    return corrected, corrected_ref, source_ref, independence
 
 
 def _lineage(entries: Sequence[str]) -> dict[str, Any]:
@@ -901,7 +1016,12 @@ def prepare(args: argparse.Namespace) -> tuple[dict[str, Any], Path]:
     lineage = _lineage(args.failed_lineage_artifact)
     source_binding = _source_binding(repo)
     source_descriptor_meta = _preflight_descriptor(source_descriptor)[0]
-    sentinel_payload, sentinel_ref, source_sentinel_ref = _build_corrected_sentinel(
+    (
+        sentinel_payload,
+        sentinel_ref,
+        source_sentinel_ref,
+        validation_independence_contract,
+    ) = _build_corrected_sentinel(
         source_receipt=source,
         source_descriptor=source_descriptor_meta,
         descriptor=descriptor,
@@ -968,6 +1088,7 @@ def prepare(args: argparse.Namespace) -> tuple[dict[str, Any], Path]:
         "validation_sentinel_selection_sha256": sentinel_payload[
             "selected_game_seed_set_sha256"
         ],
+        "validation_independence_contract": validation_independence_contract,
         "initialization": parent_ref,
         "parent_lineage": parent_lineage,
         "teacher_lineage": teacher_lineage,

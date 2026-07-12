@@ -183,6 +183,11 @@ def _args(
             {"selected_game_seed_set_sha256": "sha256:selection"},
             arm._file_ref(sentinel),
             arm._file_ref(sentinel),
+            {
+                "schema_version": "a1-validation-independence-contract-v1",
+                "selection_overlap_game_count": 0,
+                "predecessor_target_row_ratio": 0.2,
+            },
         ),
     )
     active_rows = {
@@ -251,6 +256,9 @@ def test_prepares_exact_one_dose_winning_operator_control_without_launch(
     assert manifest["causal_interpretation"]["bundled_optimization_not_parent_replication"] is False
     assert manifest["recipe"]["independent_parent_initialization"] is True
     assert manifest["parent_lineage"]["mode"] == "historical_f7_cli_compatibility"
+    assert manifest["validation_independence_contract"][
+        "selection_overlap_game_count"
+    ] == 0
     assert manifest["teacher_lineage"]["learner_parent_checkpoint_sha256"] == (
         manifest["initialization"]["sha256"]
     )
@@ -446,8 +454,9 @@ def test_rederives_sentinel_after_descriptor_scope_is_made_explicit(
             "source_composite_descriptor_file_sha256": "sha256:old-file",
             "source_composite_descriptor_fingerprint": "sha256:old-fingerprint",
             "selection_seed": 20260711,
-            "target_row_count": 262144,
+            "target_row_count": 4,
             "selected_game_seed_set_sha256": "sha256:same-games",
+            "game_seeds": [1, 2],
         },
     )
     receipt = {
@@ -465,17 +474,32 @@ def test_rederives_sentinel_after_descriptor_scope_is_made_explicit(
                 "source_composite_descriptor_file_sha256": "sha256:new-file",
                 "source_composite_descriptor_fingerprint": "sha256:new-fingerprint",
                 "selection_seed": 20260711,
-                "target_row_count": 262144,
+                "target_row_count": 4,
                 "selected_game_seed_set_sha256": "sha256:new-current-games",
                 "excluded_game_seed_set_sha256": "sha256:current-holdout",
-                "selected_game_seed_count": 100,
-                "selected_row_count": 262100,
+                "selected_game_seed_count": 2,
+                "selected_row_count": 4,
+                "game_seeds": [3, 4],
             },
         )
         return None
 
     monkeypatch.setattr(arm.subprocess, "run", run)
-    corrected, _ref, source_ref = arm._build_corrected_sentinel(
+    current_dir = tmp_path / "current"
+    predecessor_dir = tmp_path / "predecessor"
+    current_dir.mkdir()
+    predecessor_dir.mkdir()
+    np.asarray([1, 3, 3, 3], dtype="<i8").tofile(current_dir / "game_seed.dat")
+    np.asarray([2, 4], dtype="<i8").tofile(predecessor_dir / "game_seed.dat")
+    current_validation = _write_json(
+        tmp_path / "current.validation.json",
+        {"schema_version": "train-validation-game-seeds-v1", "game_seeds": [1, 3]},
+    )
+    predecessor_validation = _write_json(
+        tmp_path / "predecessor.validation.json",
+        {"schema_version": "train-validation-game-seeds-v1", "game_seeds": [2, 4]},
+    )
+    corrected, _ref, source_ref, independence = arm._build_corrected_sentinel(
         source_receipt=receipt,
         source_descriptor={
             "descriptor_file_sha256": "sha256:old-file",
@@ -485,6 +509,22 @@ def test_rederives_sentinel_after_descriptor_scope_is_made_explicit(
         descriptor_meta={
             "descriptor_file_sha256": "sha256:new-file",
             "descriptor_fingerprint": "sha256:new-fingerprint",
+            "component_ids": ["n128_current", "predecessor_replay"],
+            "component_game_sampling_ratios": [0.8, 0.2],
+            "components": [
+                {
+                    "component_id": "n128_current",
+                    "validation_manifest": str(current_validation),
+                    "corpus_dir": str(current_dir),
+                    "corpus_meta": {"row_count": 4},
+                },
+                {
+                    "component_id": "predecessor_replay",
+                    "validation_manifest": str(predecessor_validation),
+                    "corpus_dir": str(predecessor_dir),
+                    "corpus_meta": {"row_count": 2},
+                },
+            ],
         },
         output_path=output,
         python="python",
@@ -492,6 +532,8 @@ def test_rederives_sentinel_after_descriptor_scope_is_made_explicit(
     )
     assert corrected["selected_game_seed_set_sha256"] == "sha256:new-current-games"
     assert source_ref["sha256"] == receipt["sentinel_sha256"]
+    assert independence["selection_overlap_game_count"] == 0
+    assert independence["predecessor_component_id"] == "predecessor_replay"
 
 
 def test_descriptor_builder_refuses_noncanonical_source_components(

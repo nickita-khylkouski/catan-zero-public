@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 
 from tools import train_bc
+from tools import derive_validation_game_sentinel as sentinel
 from tools.derive_validation_game_sentinel import select_whole_games_near_target
 
 
@@ -83,6 +84,84 @@ def test_whole_game_selection_is_deterministic_and_near_target() -> None:
     seeds, rows = first
     assert rows == sum(counts[seed] for seed in seeds)
     assert abs(rows - 300) <= max(counts.values())
+
+
+def test_derive_can_exclude_consumed_games_and_stratify_components(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    meta = {
+        "descriptor_file_sha256": _sha("a"),
+        "descriptor_fingerprint": _sha("b"),
+        "component_ids": ["current", "predecessor_replay"],
+    }
+    full_seeds = np.asarray([1, 2, 3, 4, 5, 6], dtype=np.int64)
+    full = {
+        "game_seeds": full_seeds,
+        "validation_game_seed_set_sha256": train_bc._game_seed_set_sha256(full_seeds),
+        "component_contracts": [
+            {"file_sha256": _sha("1"), "manifest_sha256": _sha("2"),
+             "validation_game_seed_set_sha256": _sha("3")},
+            {"file_sha256": _sha("4"), "manifest_sha256": _sha("5"),
+             "validation_game_seed_set_sha256": _sha("6")},
+        ],
+    }
+    corpus = type("Corpus", (), {"corpora": [
+        {"game_seed": np.asarray([1] * 4 + [2] * 4 + [3] * 4)},
+        {"game_seed": np.asarray([4] * 4 + [5] * 4 + [6] * 4)},
+    ]})()
+    monkeypatch.setattr(sentinel.train_bc, "_preflight_memmap_composite_descriptor", lambda _p: meta)
+    monkeypatch.setattr(sentinel.train_bc, "_load_composite_validation_contract", lambda *_a, **_k: full)
+    monkeypatch.setattr(sentinel.train_bc, "load_teacher_data_memmap", lambda *_a, **_k: corpus)
+    value = sentinel.derive(
+        tmp_path / "descriptor.json",
+        target_rows=8,
+        selection_seed=7,
+        validation_fraction=0.05,
+        validation_seed=17,
+        excluded_selection_game_seeds={1, 4},
+        component_target_ratios={"current": 0.5, "predecessor_replay": 0.5},
+    )
+    assert not set(value["game_seeds"]) & {1, 4}
+    assert len(set(value["game_seeds"]) & {2, 3}) == 1
+    assert len(set(value["game_seeds"]) & {5, 6}) == 1
+
+
+def test_stratified_derive_refuses_exclusion_that_exhausts_component(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    meta = {
+        "descriptor_file_sha256": _sha("a"),
+        "descriptor_fingerprint": _sha("b"),
+        "component_ids": ["current", "predecessor_replay"],
+    }
+    full_seeds = np.asarray([1, 2], dtype=np.int64)
+    full = {
+        "game_seeds": full_seeds,
+        "validation_game_seed_set_sha256": train_bc._game_seed_set_sha256(full_seeds),
+        "component_contracts": [
+            {"file_sha256": _sha("1"), "manifest_sha256": _sha("2"),
+             "validation_game_seed_set_sha256": _sha("3")},
+            {"file_sha256": _sha("4"), "manifest_sha256": _sha("5"),
+             "validation_game_seed_set_sha256": _sha("6")},
+        ],
+    }
+    corpus = type("Corpus", (), {"corpora": [
+        {"game_seed": np.asarray([1, 1])},
+        {"game_seed": np.asarray([2, 2])},
+    ]})()
+    monkeypatch.setattr(sentinel.train_bc, "_preflight_memmap_composite_descriptor", lambda _p: meta)
+    monkeypatch.setattr(sentinel.train_bc, "_load_composite_validation_contract", lambda *_a, **_k: full)
+    monkeypatch.setattr(sentinel.train_bc, "load_teacher_data_memmap", lambda *_a, **_k: corpus)
+    with pytest.raises(SystemExit, match="predecessor_replay has no fresh validation games"):
+        sentinel.derive(
+            tmp_path / "descriptor.json",
+            target_rows=2,
+            selection_seed=7,
+            validation_fraction=0.05,
+            validation_seed=17,
+            excluded_selection_game_seeds={2},
+            component_target_ratios={"current": 0.8, "predecessor_replay": 0.2},
+        )
 
 
 def test_sentinel_authentication_retains_full_training_exclusion(tmp_path: Path) -> None:
