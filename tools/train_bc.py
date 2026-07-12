@@ -1,3 +1,4 @@
+# ruff: noqa: E402
 from __future__ import annotations
 
 import argparse
@@ -68,6 +69,9 @@ def _path_within(path: Path, root: Path) -> bool:
 
 def _assert_checkout_runtime_binding() -> dict[str, object]:
     """Refuse a trainer whose script and imported package come from different trees."""
+
+    if _checkout_optim_state is not sys.modules.get("catan_zero.rl.optim_state"):
+        raise RuntimeError("checkout optimizer module identity changed after import")
 
     modules: dict[str, dict[str, str]] = {}
     for name, module in sorted(sys.modules.items()):
