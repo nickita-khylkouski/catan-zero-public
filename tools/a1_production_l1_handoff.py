@@ -134,7 +134,7 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
             _checkpoint_sha(direct_payload, "direct result") != candidate["sha256"]
             or direct_payload.get("baseline_checkpoint_sha256") != args.f7_sha256
             or direct_payload.get("verdict") not in {"H1", "accept_h1"}
-            or direct_payload.get("errors") not in {None, []}
+            or direct_payload.get("errors") not in (None, [])
         ):
             raise HandoffError("completed direct result is not a clean r3-v-f7 H1")
         direct_evidence = {
