@@ -21,6 +21,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import stat
 import sys
 import time
@@ -41,6 +42,7 @@ from tools.a1_external_panel_compare import (  # noqa: E402
 )
 from tools.champion_registry import ChampionRegistry  # noqa: E402
 from tools.high_regret_suite_contract import (  # noqa: E402
+    REPLAY_CONTRACT,
     SUITE_SCHEMA,
     bind_state_to_manifest,
     load_source_manifest,
@@ -60,6 +62,8 @@ EVIDENCE_SCHEMA = "a1-promotion-evidence-v1"
 HIGH_REGRET_SCHEMA = "a1-high-regret-comparison-v1"
 BUCKET_VETO_SCHEMA = "a1-bucket-veto-v1"
 HIGH_REGRET_REPORT_SCHEMA = "a1-held-out-high-regret-report-v1"
+HIGH_REGRET_ENGINE_IDENTITY_SCHEMA = "a1-high-regret-engine-identity-v1"
+ARCHIVED_STATE_RECONSTRUCTION_SCHEMA = "a1-archived-state-reconstruction-v1"
 HIGH_REGRET_SUITE_SCHEMA = SUITE_SCHEMA
 BUCKET_GAME_REPORT_SCHEMA = "a1-bucket-game-report-v1"
 FLEET_EVALUATION_POOL_SCHEMA = "a1-fleet-evaluation-pool-v1"
@@ -2774,6 +2778,9 @@ def _verify_high_regret_source(
             "pentanomial_sprt",
             "pair_diagnostics",
             "evaluation_config",
+            "planned_engine_identity",
+            "engine_identity",
+            "archived_state_reconstruction",
         },
         where=f"{where}.report payload",
     )
@@ -2846,6 +2853,53 @@ def _verify_high_regret_source(
         champion_search_config=champion_search_config,
         where=f"{where}.report deployed search",
     )
+    planned_engine = _require_exact_keys(
+        report["planned_engine_identity"],
+        {
+            "schema_version", "repo_commit", "native_wheel_sha256",
+            "evaluator_sha256", "replay_sha256",
+        },
+        where=f"{where}.report.planned_engine_identity",
+    )
+    actual_engine = _require_exact_keys(
+        report["engine_identity"],
+        {
+            "schema_version", "repo_commit", "native_wheel_sha256",
+            "evaluator_sha256", "replay_sha256", "native_runtime_sha256",
+        },
+        where=f"{where}.report.engine_identity",
+    )
+    if planned_engine.get("schema_version") != HIGH_REGRET_ENGINE_IDENTITY_SCHEMA:
+        raise PromotionError(f"{where}.report has an unknown engine identity schema")
+    for key, expected in planned_engine.items():
+        if actual_engine.get(key) != expected:
+            raise PromotionError(f"{where}.report runtime engine identity drift at {key}")
+    if not isinstance(planned_engine["repo_commit"], str) or not re.fullmatch(
+        r"[0-9a-f]{40}", planned_engine["repo_commit"]
+    ):
+        raise PromotionError(f"{where}.report engine repo commit is invalid")
+    for key in (
+        "native_wheel_sha256", "evaluator_sha256", "replay_sha256",
+        "native_runtime_sha256",
+    ):
+        _validate_sha256(actual_engine[key], where=f"{where}.report.engine_identity.{key}")
+    reconstruction = _require_exact_keys(
+        report["archived_state_reconstruction"],
+        {
+            "schema_version", "constructor", "map_kind", "action_prefix",
+            "chance_stream", "replay_contract",
+        },
+        where=f"{where}.report.archived_state_reconstruction",
+    )
+    if reconstruction != {
+        "schema_version": ARCHIVED_STATE_RECONSTRUCTION_SCHEMA,
+        "constructor": "catanatron_rs.Game.simple",
+        "map_kind": "BASE",
+        "action_prefix": "[0,target_decision)",
+        "chance_stream": "random.Random(game_seed ^ 0xA17E)",
+        "replay_contract": REPLAY_CONTRACT,
+    }:
+        raise PromotionError(f"{where}.report archived-state reconstruction drift")
     suite = _require_exact_keys(
         _load_json(suite_path),
         {

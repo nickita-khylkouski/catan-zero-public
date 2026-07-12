@@ -54,6 +54,19 @@ def test_direct_cli_help_resolves_replay_contract_sibling_import() -> None:
     assert completed.returncode == 0, completed.stderr
     assert "--native-mcts-hot-loop" in completed.stdout
     assert "--evaluator-rust-featurize" in completed.stdout
+    assert "--engine-repo-commit" in completed.stdout
+    assert "--native-wheel-path" in completed.stdout
+
+
+def test_archived_state_reconstruction_binding_is_explicit_base_replay() -> None:
+    assert h2h._archived_state_reconstruction_binding() == {
+        "schema_version": h2h.ARCHIVED_STATE_RECONSTRUCTION_SCHEMA,
+        "constructor": "catanatron_rs.Game.simple",
+        "map_kind": "BASE",
+        "action_prefix": "[0,target_decision)",
+        "chance_stream": "random.Random(game_seed ^ 0xA17E)",
+        "replay_contract": REPLAY_CONTRACT,
+    }
 
 
 def test_eval_config_hash_seals_native_hot_loop_choice() -> None:

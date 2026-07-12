@@ -31,6 +31,8 @@ import argparse
 import hashlib
 import json
 import multiprocessing
+import re
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -69,6 +71,7 @@ from catan_zero.search.rust_mcts import _require_rust_module  # noqa: E402
 from factory_common import write_json  # noqa: E402
 from tools.high_regret_suite_contract import (  # noqa: E402
     PinnedReplayScope,
+    REPLAY_CONTRACT,
     SUITE_SCHEMA,
     bind_state_to_manifest,
     load_source_manifest,
@@ -78,6 +81,70 @@ from tools.high_regret_suite_contract import (  # noqa: E402
     validate_replay_metadata,
     validate_replay_trajectories,
 )
+
+
+HIGH_REGRET_ENGINE_IDENTITY_SCHEMA = "a1-high-regret-engine-identity-v1"
+ARCHIVED_STATE_RECONSTRUCTION_SCHEMA = "a1-archived-state-reconstruction-v1"
+
+
+def _held_out_engine_identity(args: Any) -> tuple[dict[str, str], dict[str, str]]:
+    """Bind a held-out run to clean Git, wheel, runtime, and replay bytes."""
+
+    commit = str(getattr(args, "engine_repo_commit", "") or "")
+    wheel_sha = str(getattr(args, "native_wheel_sha256", "") or "")
+    wheel_raw = str(getattr(args, "native_wheel_path", "") or "")
+    if not re.fullmatch(r"[0-9a-f]{40}", commit):
+        raise ValueError("held-out high-regret requires --engine-repo-commit")
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", wheel_sha):
+        raise ValueError("held-out high-regret requires --native-wheel-sha256")
+    if not wheel_raw:
+        raise ValueError("held-out high-regret requires --native-wheel-path")
+    wheel = Path(wheel_raw).expanduser().resolve(strict=True)
+    if not wheel.is_file() or wheel.is_symlink():
+        raise ValueError("held-out high-regret native wheel is not a regular file")
+    if _checkpoint_sha256(wheel) != wheel_sha:
+        raise ValueError("held-out high-regret native wheel digest mismatch")
+    try:
+        actual_commit = subprocess.check_output(
+            ("git", "rev-parse", "HEAD"), cwd=_REPO_ROOT, text=True
+        ).strip()
+        subprocess.run(
+            ("git", "diff", "--quiet", "HEAD"), cwd=_REPO_ROOT, check=True
+        )
+        subprocess.run(
+            ("git", "diff", "--cached", "--quiet", "HEAD"),
+            cwd=_REPO_ROOT,
+            check=True,
+        )
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise ValueError("held-out high-regret checkout is not clean Git bytes") from error
+    if actual_commit != commit:
+        raise ValueError("held-out high-regret repo commit differs from checked-out HEAD")
+    try:
+        import catanatron_rs
+
+        runtime = Path(catanatron_rs.__file__).resolve(strict=True)
+    except (ImportError, OSError, TypeError, ValueError) as error:
+        raise ValueError("cannot fingerprint held-out native runtime") from error
+    planned = {
+        "schema_version": HIGH_REGRET_ENGINE_IDENTITY_SCHEMA,
+        "repo_commit": commit,
+        "native_wheel_sha256": wheel_sha,
+        "evaluator_sha256": _checkpoint_sha256(Path(__file__).resolve()),
+        "replay_sha256": _checkpoint_sha256(_TOOLS_DIR / "reconstruct_state.py"),
+    }
+    return planned, {**planned, "native_runtime_sha256": _checkpoint_sha256(runtime)}
+
+
+def _archived_state_reconstruction_binding() -> dict[str, Any]:
+    return {
+        "schema_version": ARCHIVED_STATE_RECONSTRUCTION_SCHEMA,
+        "constructor": "catanatron_rs.Game.simple",
+        "map_kind": "BASE",
+        "action_prefix": "[0,target_decision)",
+        "chance_stream": "random.Random(game_seed ^ 0xA17E)",
+        "replay_contract": REPLAY_CONTRACT,
+    }
 from sprt_gate import (  # noqa: E402
     GATE_CONFIGS,
     evaluate_pentanomial_sprt,
@@ -1305,6 +1372,9 @@ def main() -> None:
             "emits a1-held-out-high-regret-report-v1 for promotion replay."
         ),
     )
+    parser.add_argument("--engine-repo-commit", default=None)
+    parser.add_argument("--native-wheel-path", default=None)
+    parser.add_argument("--native-wheel-sha256", default=None)
     parser.add_argument(
         "--gate-config",
         choices=sorted(GATE_CONFIGS),
@@ -1384,10 +1454,15 @@ def main() -> None:
     c_scales = _resolve_c_scales(args)
 
     high_regret_suite_path: Path | None = None
+    high_regret_planned_engine: dict[str, str] | None = None
+    high_regret_engine: dict[str, str] | None = None
     if args.held_out_high_regret_suite:
         try:
             high_regret_suite_path, _high_regret_suite, pairs = (
                 _load_held_out_high_regret_suite(args.held_out_high_regret_suite)
+            )
+            high_regret_planned_engine, high_regret_engine = (
+                _held_out_engine_identity(args)
             )
         except ValueError as error:
             parser.error(str(error))
@@ -1604,6 +1679,9 @@ def main() -> None:
             "games": summary["games"],
             "pentanomial_sprt": summary["pentanomial_sprt"],
             "pair_diagnostics": summary["pair_diagnostics"],
+            "planned_engine_identity": high_regret_planned_engine,
+            "engine_identity": high_regret_engine,
+            "archived_state_reconstruction": _archived_state_reconstruction_binding(),
         }
     write_json(args.out, summary)
     print(

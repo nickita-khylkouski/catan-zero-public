@@ -278,6 +278,9 @@ def build_high_regret_source(
             "pentanomial_sprt",
             "pair_diagnostics",
             "evaluation_config",
+            "planned_engine_identity",
+            "engine_identity",
+            "archived_state_reconstruction",
         },
         where="high-regret report",
     )
@@ -748,6 +751,9 @@ def build_bucket_game_report(
             "games",
             "pentanomial_sprt",
             "pair_diagnostics",
+            "planned_engine_identity",
+            "engine_identity",
+            "archived_state_reconstruction",
         },
         where="high-regret evaluation report",
     )
