@@ -3643,6 +3643,14 @@ def main(argv: Sequence[str] | None = None) -> None:
             args,
             _effective_a1_learner_training_recipe(args, ddp),
         )
+    # Fail cheap launch/host checks before authenticating a potentially
+    # hundreds-of-gigabytes memmap payload. A missing explicit CLI value or a
+    # low file-descriptor limit must not be reported only after the byte scan.
+    launcher_guards.run_or_refuse(
+        _build_guard_specs(args, raw_argv, parser),
+        launcher="train_bc",
+        skip=bool(args.skip_guards),
+    )
     a1_preflight_meta: dict[str, object] | None = None
     if args.data_format == "memmap":
         a1_preflight_meta = _coordinated_a1_memmap_preflight(
@@ -3683,12 +3691,6 @@ def main(argv: Sequence[str] | None = None) -> None:
             validation_max_samples=int(args.validation_max_samples),
             validation_game_seed_ranges=validation_game_seed_ranges,
         )
-
-    launcher_guards.run_or_refuse(
-        _build_guard_specs(args, argv if argv is not None else sys.argv[1:], parser),
-        launcher="train_bc",
-        skip=bool(args.skip_guards),
-    )
 
     if args.hidden_size is None:
         args.hidden_size = 640 if args.arch == "entity_graph" else 768 if args.arch == "xdim_graph" else 512

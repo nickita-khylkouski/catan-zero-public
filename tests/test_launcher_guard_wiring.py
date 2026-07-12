@@ -140,6 +140,8 @@ GOLDEN_OPTION_STRINGS = {
     "train_bc": {
         ("--a1-ablation-code-binding-json",),
         ("--a1-ablation-code-tree-sha256",),
+        ("--a1-batch-probe-plan",),
+        ("--a1-batch-probe-run-id",),
         ("--a1-curriculum-parent-receipt",),
         ("--a1-dual-learner-lock",),
         ("--a1-dual-reviewed-lock-file-sha256",),
@@ -216,6 +218,7 @@ GOLDEN_OPTION_STRINGS = {
         ("--per-game-value-weight",),
         ("--per-game-value-weight-mode",),
         ("--phase-weights",),
+        ("--policy-kl-anchor-direction",),
         ("--policy-kl-anchor-weight",),
         ("--policy-loss-weight",),
         ("--policy-surprise-cap",),
@@ -227,6 +230,7 @@ GOLDEN_OPTION_STRINGS = {
         ("--relational-bases",),
         ("--relational-block-pattern",),
         ("--relational-ff-size",),
+        ("--no-relational-edge-policy-head", "--relational-edge-policy-head"),
         ("--report",),
         ("--no-resume-optimizer", "--resume-optimizer"),
         ("--require-35m-model",),
@@ -942,3 +946,38 @@ def test_help_exits_before_any_guard_runs(module, extra_argv, monkeypatch):
         module.main(extra_argv + ["--help"])
     assert exc_info.value.code == 0
     assert calls == []
+
+
+def test_train_bc_guards_run_before_expensive_memmap_preflight(monkeypatch):
+    """A cheap launch refusal must not first scan the entire corpus payload."""
+
+    class GuardRefused(RuntimeError):
+        pass
+
+    preflight_calls: list[object] = []
+    monkeypatch.setattr(
+        train_bc,
+        "_coordinated_a1_memmap_preflight",
+        lambda *args, **kwargs: preflight_calls.append((args, kwargs)),
+    )
+    monkeypatch.setattr(
+        launcher_guards,
+        "run_or_refuse",
+        lambda *args, **kwargs: (_ for _ in ()).throw(GuardRefused()),
+    )
+
+    with pytest.raises(GuardRefused):
+        train_bc.main(
+            [
+                "--data",
+                "/does/not/need/to/exist",
+                "--data-format",
+                "memmap",
+                "--checkpoint",
+                "/does/not/need/to/exist.pt",
+                "--report",
+                "/does/not/need/to/exist.json",
+            ]
+        )
+
+    assert preflight_calls == []
