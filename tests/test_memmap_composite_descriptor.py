@@ -80,6 +80,36 @@ def _descriptor(tmp_path: Path) -> Path:
     return path
 
 
+def _descriptor_v2(tmp_path: Path) -> Path:
+    overrides = {
+        "per_game_policy_weight": True,
+        "per_game_policy_weight_mode": "sqrt",
+        "policy_kl_anchor_direction": "forward",
+        "policy_kl_anchor_weight": 0.03,
+    }
+    components = []
+    for name, ratio in (("n128", 0.57), ("n256", 0.23), ("gen3", 0.20)):
+        components.append(
+            {
+                **_component(tmp_path, name),
+                "component_id": name,
+                "game_sampling_ratio": ratio,
+            }
+        )
+    payload = {
+        "schema_version": "memmap_composite_v2",
+        "diagnostic_only": True,
+        "promotion_eligible": False,
+        "learner_recipe_overrides": overrides,
+        "learner_recipe_overrides_sha256": _canonical(overrides),
+        "policy_kl_anchor_component_ids": ["gen3"],
+        "components": components,
+    }
+    path = tmp_path / "composite-v2.json"
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return path
+
+
 def test_descriptor_authenticates_ordered_component_bytes(tmp_path):
     path = _descriptor(tmp_path)
     verified = train_bc._preflight_memmap_composite_descriptor(path)
@@ -93,6 +123,36 @@ def test_descriptor_authenticates_ordered_component_bytes(tmp_path):
     assert verified["descriptor_fingerprint"] == train_bc._training_data_fingerprint(
         str(path), "memmap"
     )
+
+
+def test_v2_authenticates_three_component_ratios_and_anchor_scope(tmp_path):
+    path = _descriptor_v2(tmp_path)
+    verified = train_bc._preflight_memmap_composite_descriptor(path)
+    assert verified["schema_version"] == "memmap_composite_v2"
+    assert verified["component_ids"] == ["n128", "n256", "gen3"]
+    assert verified["component_game_sampling_ratios"] == [0.57, 0.23, 0.20]
+    assert verified["policy_kl_anchor_component_ids"] == ["gen3"]
+    assert verified["descriptor_fingerprint"] == train_bc._training_data_fingerprint(
+        str(path), "memmap"
+    )
+
+
+def test_v2_refuses_ratio_and_anchor_scope_drift(tmp_path):
+    path = _descriptor_v2(tmp_path)
+    payload = json.loads(path.read_text())
+    payload["components"][0]["game_sampling_ratio"] = 0.50
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(SystemExit, match="ratios must sum to 1"):
+        train_bc._preflight_memmap_composite_descriptor(path)
+
+    second = tmp_path / "second"
+    second.mkdir()
+    path = _descriptor_v2(second)
+    payload = json.loads(path.read_text())
+    payload["policy_kl_anchor_component_ids"] = ["f7-current"]
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(SystemExit, match="anchor component ids"):
+        train_bc._preflight_memmap_composite_descriptor(path)
 
 
 @pytest.mark.parametrize(
@@ -248,6 +308,49 @@ class _TinyCorpus:
 
     def __getitem__(self, key):
         return self._eager[key]
+
+
+class _TinyGameCorpus:
+    def __init__(self, seeds):
+        array = np.asarray(seeds, dtype=np.int64)
+        self.row_count = len(array)
+        self.legal_width = 1
+        self._columns = {
+            "game_seed": {"kind": "fixed", "dtype": "<i8", "inner_shape": []}
+        }
+        self._eager = {"game_seed": array}
+        self._lazy = {}
+        self.meta = {}
+        self.stats = {}
+
+    def keys(self):
+        return ["game_seed"]
+
+    def __getitem__(self, key):
+        return self._eager[key]
+
+
+def test_component_sampling_is_component_then_game_then_row_uniform():
+    data = ConcatMemmapCorpus(
+        [
+            _TinyGameCorpus([1, 1, 1, 2]),
+            _TinyGameCorpus([10, 11, 11]),
+            _TinyGameCorpus([20, 20]),
+        ]
+    )
+    data.component_game_sampling_ratios = (0.5, 0.3, 0.2)
+    weights = train_bc._composite_game_sampling_weights(
+        data, np.arange(len(data), dtype=np.int64)
+    )
+    assert weights is not None
+    assert weights.sum() == pytest.approx(1.0)
+    offsets = data.component_offsets
+    assert [weights[offsets[i] : offsets[i + 1]].sum() for i in range(3)] == pytest.approx(
+        [0.5, 0.3, 0.2]
+    )
+    # Component 0 gives each game 0.25 mass despite their 3:1 row counts.
+    assert weights[:3].sum() == pytest.approx(0.25)
+    assert weights[3] == pytest.approx(0.25)
 
 
 def test_global_epoch_shuffle_interleaves_component_rows_with_prefetch():

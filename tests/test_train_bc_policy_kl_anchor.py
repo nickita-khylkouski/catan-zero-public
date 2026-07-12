@@ -147,6 +147,28 @@ def test_multi_action_zero_policy_weight_row_remains_anchor_eligible():
     assert float(anchor.item()) > 0.0
 
 
+def test_composite_anchor_scope_excludes_current_producer_priors():
+    class ScopedData(dict):
+        policy_kl_anchor_component_indices = (1,)
+        policy_kl_anchor_scope_authenticated = True
+
+        @staticmethod
+        def component_indices_for_rows(rows):
+            # Row 0 is the current/regressed producer; row 1 is gen3 replay.
+            return np.asarray([0 if int(row) == 0 else 1 for row in rows])
+
+    data = ScopedData(_base_data())
+    logits = _logits()
+    scoped = _policy_kl_anchor_loss(
+        data, np.asarray([0, 1]), logits[:2], torch.device("cpu")
+    )
+    gen3_only = _policy_kl_anchor_loss(
+        data, np.asarray([1]), logits[1:2], torch.device("cpu")
+    )
+    assert scoped is not None and gen3_only is not None
+    assert torch.allclose(scoped, gen3_only, atol=1e-6)
+
+
 def test_unknown_anchor_direction_is_rejected():
     with pytest.raises(ValueError, match="unknown policy KL anchor direction"):
         _policy_kl_anchor_loss(

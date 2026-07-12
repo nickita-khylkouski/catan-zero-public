@@ -1463,7 +1463,9 @@ def _training_data_fingerprint(path: str, data_format: str) -> str:
             return _sha256_existing_file(root)
         if (
             isinstance(descriptor, dict)
-            and descriptor.get("schema_version") == "memmap_composite_v1"
+            and descriptor.get("schema_version") in {
+                "memmap_composite_v1", "memmap_composite_v2"
+            }
         ):
             return _canonical_json_sha256(descriptor)
     candidates = (
@@ -1497,20 +1499,37 @@ def _training_data_fingerprint(path: str, data_format: str) -> str:
 
 
 def _preflight_memmap_composite_descriptor(path: str | Path) -> dict[str, object]:
-    """Authenticate an ordered, diagnostic-only two-corpus no-copy descriptor."""
+    """Authenticate an ordered diagnostic-only no-copy descriptor.
+
+    V1 remains the exact historical two-component format. V2 admits two or
+    more components and binds a game-uniform sampling ratio for each one, plus
+    the components whose recorded priors are allowed to enter the behavioral
+    anchor. This prevents a current but regressed producer from silently
+    becoming the policy that a recovery run preserves.
+    """
     descriptor_path = Path(path).expanduser().resolve(strict=True)
     try:
         descriptor = json.loads(descriptor_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
         raise SystemExit(f"cannot load memmap composite descriptor {path}: {error}") from error
-    if not isinstance(descriptor, dict) or set(descriptor) != {
+    if not isinstance(descriptor, dict):
+        raise SystemExit("memmap composite descriptor is not an object")
+    schema_version = descriptor.get("schema_version")
+    common_fields = {
         "schema_version", "diagnostic_only", "promotion_eligible", "components",
         "learner_recipe_overrides", "learner_recipe_overrides_sha256",
-    }:
-        raise SystemExit("memmap composite descriptor fields differ from v1 schema")
+    }
+    expected_fields = (
+        common_fields
+        if schema_version == "memmap_composite_v1"
+        else common_fields | {"policy_kl_anchor_component_ids"}
+    )
+    if schema_version not in {"memmap_composite_v1", "memmap_composite_v2"} or set(
+        descriptor
+    ) != expected_fields:
+        raise SystemExit("memmap composite descriptor fields differ from its schema")
     if (
-        descriptor.get("schema_version") != "memmap_composite_v1"
-        or descriptor.get("diagnostic_only") is not True
+        descriptor.get("diagnostic_only") is not True
         or descriptor.get("promotion_eligible") is not False
     ):
         raise SystemExit(
@@ -1518,8 +1537,13 @@ def _preflight_memmap_composite_descriptor(path: str | Path) -> dict[str, object
             "diagnostic_only=true, promotion_eligible=false"
         )
     raw_components = descriptor.get("components")
-    if not isinstance(raw_components, list) or len(raw_components) != 2:
-        raise SystemExit("memmap composite v1 requires exactly two ordered components")
+    if not isinstance(raw_components, list) or (
+        len(raw_components) != 2
+        if schema_version == "memmap_composite_v1"
+        else len(raw_components) < 2
+    ):
+        requirement = "exactly two" if schema_version == "memmap_composite_v1" else "at least two"
+        raise SystemExit(f"{schema_version} requires {requirement} ordered components")
     overrides = descriptor.get("learner_recipe_overrides")
     required_override_fields = {
         "per_game_policy_weight", "per_game_policy_weight_mode",
@@ -1550,13 +1574,35 @@ def _preflight_memmap_composite_descriptor(path: str | Path) -> dict[str, object
     components: list[dict[str, object]] = []
     inventory_bindings: list[dict[str, object]] = []
     seen_dirs: set[str] = set()
-    expected = {
+    expected_v1 = {
         "corpus_dir", "corpus_meta_sha256", "payload_inventory_sha256",
         "validation_manifest", "validation_manifest_sha256",
     }
+    expected = (
+        expected_v1
+        if schema_version == "memmap_composite_v1"
+        else expected_v1 | {"component_id", "game_sampling_ratio"}
+    )
+    component_ids: list[str] = []
+    component_ratios: list[float] = []
     for index, raw in enumerate(raw_components):
         if not isinstance(raw, dict) or set(raw) != expected:
-            raise SystemExit(f"memmap composite component {index} fields differ from v1 schema")
+            raise SystemExit(f"memmap composite component {index} fields differ from schema")
+        if schema_version == "memmap_composite_v2":
+            component_id = raw["component_id"]
+            ratio = raw["game_sampling_ratio"]
+            if (
+                not isinstance(component_id, str)
+                or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,79}", component_id) is None
+                or component_id in component_ids
+            ):
+                raise SystemExit(f"memmap composite component {index} has invalid/duplicate id")
+            if isinstance(ratio, bool) or not isinstance(ratio, (int, float)) or not math.isfinite(
+                float(ratio)
+            ) or float(ratio) <= 0.0:
+                raise SystemExit(f"memmap composite component {index} has invalid sampling ratio")
+            component_ids.append(component_id)
+            component_ratios.append(float(ratio))
         try:
             corpus_dir = Path(str(raw["corpus_dir"])).expanduser().resolve(strict=True)
             validation_path = Path(str(raw["validation_manifest"])).expanduser().resolve(strict=True)
@@ -1601,8 +1647,21 @@ def _preflight_memmap_composite_descriptor(path: str | Path) -> dict[str, object
             "corpus_meta_sha256": actual_meta_sha,
             "payload_inventory_sha256": actual_inventory_sha,
         })
+    anchor_component_ids: list[str] = []
+    if schema_version == "memmap_composite_v2":
+        if not math.isclose(sum(component_ratios), 1.0, rel_tol=0.0, abs_tol=1e-9):
+            raise SystemExit("memmap composite v2 game sampling ratios must sum to 1")
+        raw_anchor_ids = descriptor["policy_kl_anchor_component_ids"]
+        if (
+            not isinstance(raw_anchor_ids, list)
+            or any(not isinstance(value, str) for value in raw_anchor_ids)
+            or len(set(raw_anchor_ids)) != len(raw_anchor_ids)
+            or not set(raw_anchor_ids).issubset(component_ids)
+        ):
+            raise SystemExit("memmap composite v2 anchor component ids are invalid")
+        anchor_component_ids = list(raw_anchor_ids)
     return {
-        "schema_version": "memmap_composite_v1", "diagnostic_only": True,
+        "schema_version": schema_version, "diagnostic_only": True,
         "promotion_eligible": False, "descriptor_path": str(descriptor_path),
         "descriptor_file_sha256": _sha256_existing_file(descriptor_path),
         "descriptor_fingerprint": _canonical_json_sha256(descriptor),
@@ -1612,6 +1671,9 @@ def _preflight_memmap_composite_descriptor(path: str | Path) -> dict[str, object
             "learner_recipe_overrides_sha256"
         ],
         "components": components,
+        "component_ids": component_ids,
+        "component_game_sampling_ratios": component_ratios,
+        "policy_kl_anchor_component_ids": anchor_component_ids,
     }
 
 
@@ -2144,7 +2206,7 @@ def _load_composite_validation_contract(
 ) -> dict[str, object]:
     """Validate both bound holdouts and return their game-disjoint union."""
     raw_components = composite_meta.get("components")
-    if not isinstance(raw_components, list) or len(raw_components) != 2:
+    if not isinstance(raw_components, list) or len(raw_components) < 2:
         raise SystemExit("authenticated memmap composite metadata has invalid components")
     contracts: list[dict[str, object]] = []
     seen: set[int] = set()
@@ -3595,7 +3657,9 @@ def main(argv: Sequence[str] | None = None) -> None:
     validation_seed_contract: dict[str, object] | None = None
     is_memmap_composite = bool(
         isinstance(a1_preflight_meta, dict)
-        and a1_preflight_meta.get("schema_version") == "memmap_composite_v1"
+        and a1_preflight_meta.get("schema_version") in {
+            "memmap_composite_v1", "memmap_composite_v2"
+        }
     )
     if is_memmap_composite:
         _validate_composite_learner_recipe_authorization(args, a1_preflight_meta)
@@ -4376,6 +4440,15 @@ def main(argv: Sequence[str] | None = None) -> None:
         if float(args.policy_surprise_weight) > 0.0
         else None
     )
+    component_game_sampling = _composite_game_sampling_weights(data, train_indices)
+    if component_game_sampling is not None:
+        if epoch_sample_weights is not None:
+            raise SystemExit(
+                "authenticated component game sampling cannot be combined with "
+                "--policy-surprise-weight yet; their joint probability semantics "
+                "must be explicitly specified"
+            )
+        epoch_sample_weights = component_game_sampling
     policy_sample_weight_report = sample_weight_quality(data, policy_sample_weights)
     value_sample_weight_report = sample_weight_quality(data, value_sample_weights)
     policy_surprise_weight_report = sample_weight_quality(data, policy_surprise_weights_full)
@@ -5149,7 +5222,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     if is_memmap_composite:
         report.update({
             "memmap_composite": {
-                "schema_version": "memmap_composite_v1",
+                "schema_version": a1_preflight_meta["schema_version"],
                 "descriptor_path": a1_preflight_meta["descriptor_path"],
                 "descriptor_file_sha256": a1_preflight_meta["descriptor_file_sha256"],
                 "descriptor_fingerprint": a1_preflight_meta["descriptor_fingerprint"],
@@ -5161,6 +5234,13 @@ def main(argv: Sequence[str] | None = None) -> None:
                     "learner_recipe_overrides_sha256"
                 ],
                 "component_count": len(a1_preflight_meta["components"]),
+                "component_ids": a1_preflight_meta.get("component_ids", []),
+                "component_game_sampling_ratios": a1_preflight_meta.get(
+                    "component_game_sampling_ratios", []
+                ),
+                "policy_kl_anchor_component_ids": a1_preflight_meta.get(
+                    "policy_kl_anchor_component_ids", []
+                ),
                 "component_contract_sha256s": [
                     contract["a1_contract_sha256"]
                     for contract in validation_seed_contract["component_contracts"]
@@ -7557,7 +7637,9 @@ def load_teacher_data_memmap(
             if composite_meta is not None
             else _preflight_memmap_composite_descriptor(path)
         )
-        if authenticated.get("schema_version") != "memmap_composite_v1":
+        if authenticated.get("schema_version") not in {
+            "memmap_composite_v1", "memmap_composite_v2"
+        }:
             raise SystemExit("memmap composite loader received invalid authenticated metadata")
         components = authenticated["components"]
         assert isinstance(components, list)
@@ -7565,8 +7647,21 @@ def load_teacher_data_memmap(
         corpus = ConcatMemmapCorpus(
             [MemmapCorpus(component_dir) for component_dir in dirs], dirs=dirs
         )
+        if authenticated["schema_version"] == "memmap_composite_v2":
+            corpus.component_ids = tuple(authenticated["component_ids"])
+            corpus.component_game_sampling_ratios = tuple(
+                float(value)
+                for value in authenticated["component_game_sampling_ratios"]
+            )
+            anchor_ids = set(authenticated["policy_kl_anchor_component_ids"])
+            corpus.policy_kl_anchor_component_indices = tuple(
+                index
+                for index, component_id in enumerate(corpus.component_ids)
+                if component_id in anchor_ids
+            )
+            corpus.policy_kl_anchor_scope_authenticated = True
         corpus.meta.update({
-            "schema": "memmap_composite_v1",
+            "schema": authenticated["schema_version"],
             "descriptor_path": authenticated["descriptor_path"],
             "descriptor_fingerprint": authenticated["descriptor_fingerprint"],
             "payload_inventory_sha256": authenticated["payload_inventory_sha256"],
@@ -9806,6 +9901,15 @@ def _policy_kl_anchor_loss(
         device=device,
     )
     weights = (terms["has_prior"] & non_forced).to(torch.float32)
+    eligible_components = getattr(data, "policy_kl_anchor_component_indices", tuple())
+    if bool(getattr(data, "policy_kl_anchor_scope_authenticated", False)):
+        component_indices = data.component_indices_for_rows(batch)
+        eligible = torch.as_tensor(
+            np.isin(component_indices, np.asarray(eligible_components, dtype=np.int64)),
+            dtype=torch.bool,
+            device=device,
+        )
+        weights = weights * eligible.to(torch.float32)
     if float(weights.sum().item()) <= 0.0:
         return None
     if direction == "forward":
@@ -11664,6 +11768,51 @@ def _distributed_state() -> dict[str, int | bool]:
         "rank": int(os.environ.get("RANK", "0")),
         "local_rank": int(os.environ.get("LOCAL_RANK", "0")),
     }
+
+
+def _composite_game_sampling_weights(
+    data, train_indices: np.ndarray
+) -> np.ndarray | None:
+    """Return authenticated component->game->row sampling probabilities.
+
+    For a v2 composite, a draw first selects a component by its bound ratio,
+    then a training game uniformly within that component, then a row uniformly
+    within that game.  Returning weights aligned to ``train_indices`` lets the
+    existing seeded weighted epoch sampler perform that hierarchy without
+    copying any corpus payload. V1 and ordinary corpora return ``None`` and
+    therefore retain the historical permutation path exactly.
+    """
+    ratios = tuple(getattr(data, "component_game_sampling_ratios", tuple()))
+    if not ratios:
+        return None
+    if len(ratios) != len(getattr(data, "corpora", tuple())):
+        raise SystemExit("authenticated component sampling ratio count drift")
+    indices = np.asarray(train_indices, dtype=np.int64)
+    components = np.asarray(data.component_indices_for_rows(indices), dtype=np.int64)
+    seeds = np.asarray(data["game_seed"][indices], dtype=np.int64)
+    weights = np.zeros(indices.shape[0], dtype=np.float64)
+    for component, ratio in enumerate(ratios):
+        positions = np.flatnonzero(components == component)
+        if positions.size == 0:
+            raise SystemExit(
+                f"authenticated component {component} has no training rows"
+            )
+        component_seeds = seeds[positions]
+        _games, inverse, counts = np.unique(
+            component_seeds, return_inverse=True, return_counts=True
+        )
+        if counts.size == 0:
+            raise SystemExit(
+                f"authenticated component {component} has no training games"
+            )
+        weights[positions] = float(ratio) / (
+            float(counts.size) * counts[inverse].astype(np.float64)
+        )
+    if not np.isfinite(weights).all() or np.any(weights <= 0.0):
+        raise SystemExit("authenticated component game sampling produced invalid weights")
+    if not math.isclose(float(weights.sum()), 1.0, rel_tol=0.0, abs_tol=1e-9):
+        raise SystemExit("authenticated component game sampling mass drift")
+    return weights
 
 
 def _epoch_order(

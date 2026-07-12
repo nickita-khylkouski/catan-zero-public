@@ -176,6 +176,21 @@ class ConcatMemmapCorpus:
                     )
 
         self.row_count = sum(int(corpus.row_count) for corpus in self.corpora)
+        self.component_offsets = np.concatenate(
+            (
+                np.asarray([0], dtype=np.int64),
+                np.cumsum(
+                    [int(corpus.row_count) for corpus in self.corpora],
+                    dtype=np.int64,
+                ),
+            )
+        )
+        # Populated only by an authenticated v2 descriptor.  Keeping these
+        # attributes inert by default preserves the exact v1 runtime surface.
+        self.component_ids: tuple[str, ...] = tuple()
+        self.component_game_sampling_ratios: tuple[float, ...] = tuple()
+        self.policy_kl_anchor_component_indices: tuple[int, ...] = tuple()
+        self.policy_kl_anchor_scope_authenticated = False
         self.legal_width = int(first.legal_width)
         self._columns = dict(first_schemas)
         self._eager: dict[str, _ConcatColumn] = {}
@@ -221,3 +236,10 @@ class ConcatMemmapCorpus:
 
     def __len__(self) -> int:
         return self.row_count
+
+    def component_indices_for_rows(self, rows: Any) -> np.ndarray:
+        """Map global row indices to their authenticated component index."""
+        indices, _scalar = _normalize_global_index(rows, self.row_count)
+        return np.searchsorted(
+            self.component_offsets, indices, side="right"
+        ).astype(np.int64, copy=False) - 1
