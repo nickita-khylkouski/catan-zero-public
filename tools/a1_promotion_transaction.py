@@ -31,15 +31,13 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Iterator, Sequence
 
-
-_LOCK_STATE = threading.local()
-
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from tools import a1_pre_wave_contract as a1_contract  # noqa: E402
 from tools import a1_one_dose_train as one_dose  # noqa: E402
+from tools import _a1_promotion_lock_state as promotion_lock_state  # noqa: E402
 from tools.a1_external_panel_compare import (  # noqa: E402
     ExternalPanelComparisonError,
     compare_matched_external_panels,
@@ -400,10 +398,10 @@ def _exclusive_lock(path: Path) -> Iterator[None]:
     # may nest.  Other threads and processes still contend on the kernel lock.
     absolute_path = Path(os.path.abspath(os.fspath(path)))
     key = (os.getpid(), threading.get_ident(), os.fspath(absolute_path))
-    held = getattr(_LOCK_STATE, "held", None)
+    held = getattr(promotion_lock_state.LOCK_STATE, "held", None)
     if held is None:
         held = {}
-        _LOCK_STATE.held = held
+        promotion_lock_state.LOCK_STATE.held = held
     inherited = held.get(key)
     if inherited is not None:
         opened_dev, opened_ino, depth = inherited

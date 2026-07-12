@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import fcntl
 import hashlib
+import importlib.util
 import json
 import os
+import sys
 import threading
 from pathlib import Path
 
@@ -2554,6 +2556,28 @@ def test_exclusive_lock_allows_same_thread_nested_replay(tmp_path: Path) -> None
     lock = tmp_path / "promotion.lock"
     with promotion._exclusive_lock(lock):
         with promotion._exclusive_lock(lock):
+            assert lock.is_file()
+
+
+def test_exclusive_lock_reentrancy_is_shared_across_module_identities(
+    tmp_path: Path,
+) -> None:
+    """The CLI is __main__ while handoff replay imports the tools module."""
+    source = Path(promotion.__file__)
+    spec = importlib.util.spec_from_file_location(
+        "_promotion_transaction_duplicate_for_test", source
+    )
+    assert spec is not None and spec.loader is not None
+    duplicate = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = duplicate
+    try:
+        spec.loader.exec_module(duplicate)
+    finally:
+        sys.modules.pop(spec.name, None)
+
+    lock = tmp_path / "promotion.lock"
+    with promotion._exclusive_lock(lock):
+        with duplicate._exclusive_lock(lock):
             assert lock.is_file()
 
 
