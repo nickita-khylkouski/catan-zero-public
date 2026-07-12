@@ -106,6 +106,10 @@ class _ConcatColumn:
         self.dtype = np.result_type(
             *(np.dtype(column.dtype) for column in self._columns)
         )
+        self.supports_grouped_weights = all(
+            callable(getattr(column, "grouped_weights", None))
+            for column in self._columns
+        )
 
     def __len__(self) -> int:
         return self._n
@@ -134,6 +138,52 @@ class _ConcatColumn:
         if copy:
             array = array.copy()
         return array
+
+    def grouped_weights(
+        self, weights: np.ndarray, *, limit: int
+    ) -> dict[str, dict[str, float | int]]:
+        """Reduce concatenated dictionary columns without decoding all rows.
+
+        String codebooks are component-local, so merge the small decoded
+        category summaries rather than materialising a global Unicode array.
+        Numeric/other columns reject this path and retain normal NumPy
+        semantics through ``__array__``.
+        """
+
+        if not self.supports_grouped_weights:
+            raise TypeError("concatenated column is not dictionary-encoded")
+        values = np.asarray(weights)
+        if values.ndim != 1 or values.shape[0] != self._n:
+            raise ValueError("concatenated grouped-weight vector shape drift")
+        merged: dict[str, dict[str, float | int]] = {}
+        for part, column in enumerate(self._columns):
+            start, stop = int(self._offsets[part]), int(self._offsets[part + 1])
+            category_count = len(getattr(column, "categories", ()))
+            report = column.grouped_weights(
+                values[start:stop], limit=max(int(limit), category_count)
+            )
+            for category, row in report.items():
+                target = merged.setdefault(
+                    str(category), {"raw_samples": 0, "weight_sum": 0.0}
+                )
+                target["raw_samples"] = int(target["raw_samples"]) + int(
+                    row["raw_samples"]
+                )
+                target["weight_sum"] = float(target["weight_sum"]) + float(
+                    row["weight_sum"]
+                )
+        ordered = sorted(
+            merged.items(), key=lambda item: (-int(item[1]["raw_samples"]), item[0])
+        )[: int(limit)]
+        return {
+            category: {
+                "raw_samples": int(row["raw_samples"]),
+                "weight_sum": float(row["weight_sum"]),
+                "mean_weight": float(row["weight_sum"])
+                / max(int(row["raw_samples"]), 1),
+            }
+            for category, row in ordered
+        }
 
 
 class _ConstantColumn:

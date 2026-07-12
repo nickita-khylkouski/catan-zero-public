@@ -10953,7 +10953,9 @@ def _weight_by_field(
 ) -> dict[str, dict]:
     n = int(len(data["action_taken"]))
     column = data.get(field)
-    if isinstance(column, _MemmapCategoricalColumn):
+    if isinstance(column, _MemmapCategoricalColumn) or bool(
+        getattr(column, "supports_grouped_weights", False)
+    ):
         return column.grouped_weights(weights, limit=limit)
     values = np.asarray(np.full(n, "") if column is None else column).astype(str)
     result = {}

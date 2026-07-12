@@ -3,6 +3,7 @@ from __future__ import annotations
 import numpy as np
 
 from tools import train_bc
+from tools.mixed_memmap_corpus import _ConcatColumn
 
 
 def _reference_per_game_weight_quality(
@@ -62,3 +63,30 @@ def test_per_game_weight_quality_repeated_run_falls_back_exactly() -> None:
         train_bc.per_game_weight_quality(data, weights),
         _reference_per_game_weight_quality(seeds, weights),
     )
+
+
+def test_concat_categorical_weight_report_avoids_global_decode(tmp_path) -> None:
+    def column(name: str, codes: list[int], categories: list[str]):
+        path = tmp_path / f"{name}.dat"
+        np.asarray(codes, dtype=np.int32).tofile(path)
+        return train_bc._MemmapCategoricalColumn(  # noqa: SLF001
+            np.memmap(path, dtype=np.int32, mode="r", shape=(len(codes),)),
+            np.asarray(categories),
+        )
+
+    # Deliberately use different local category-code orders. The composite
+    # reduction must merge by decoded label, not by integer code.
+    left = column("left", [0, 1, 0], ["n128", "n256"])
+    right = column("right", [1, 0, 1, 1], ["replay", "n128"])
+    concat = _ConcatColumn((left, right), (3, 4))
+    weights = np.asarray([1, 2, 3, 4, 5, 6, 7], dtype=np.float32)
+    data = {"action_taken": np.zeros(7), "teacher_name": concat}
+
+    report = train_bc._weight_by_field(  # noqa: SLF001
+        data, weights, "teacher_name"
+    )
+    assert report == {
+        "n128": {"raw_samples": 5, "weight_sum": 21.0, "mean_weight": 4.2},
+        "n256": {"raw_samples": 1, "weight_sum": 2.0, "mean_weight": 2.0},
+        "replay": {"raw_samples": 1, "weight_sum": 5.0, "mean_weight": 5.0},
+    }
