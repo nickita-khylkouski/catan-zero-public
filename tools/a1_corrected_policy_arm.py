@@ -3,9 +3,10 @@
 
 The builder derives a command from an authenticated prior launch receipt so
 that obscure production flags cannot disappear during experiment iteration.
-It then applies a small allowlisted delta: pure search targets, an auxiliary
-active-policy stream, and zero replay KL.  The emitted manifest is preparation
-only; this module deliberately has no launch mode.
+It then applies pure search targets, an auxiliary active-policy stream, and a
+light forward-KL replay anchor. Authenticated policy and value scopes exclude
+replay from supervised targets, making it genuinely anchor-only. The emitted
+manifest is preparation only; this module deliberately has no launch mode.
 """
 
 from __future__ import annotations
@@ -127,12 +128,62 @@ def _load_source_receipt(path: Path) -> tuple[dict[str, Any], dict[str, str]]:
     return payload, ref
 
 
-def _validate_descriptor(path: Path) -> tuple[dict[str, Any], dict[str, str]]:
+def _preflight_descriptor(path: Path) -> tuple[dict[str, Any], dict[str, str]]:
     path = path.expanduser().resolve(strict=True)
     try:
         verified = train_bc._preflight_memmap_composite_descriptor(path)  # noqa: SLF001
     except SystemExit as error:
         raise ArmError(f"corrected descriptor preflight failed: {error}") from error
+    return verified, _file_ref(path)
+
+
+def _build_corrected_descriptor(
+    source_path: Path, output_path: Path
+) -> tuple[dict[str, Any], dict[str, str], dict[str, str]]:
+    source, source_ref = _preflight_descriptor(source_path)
+    if source.get("schema_version") != "memmap_composite_v2" or source.get(
+        "component_ids"
+    ) != ["n128_current", "n256_current", "gen3_replay"]:
+        raise ArmError("source descriptor must bind n128, n256, and gen3 replay in order")
+    overrides = dict(source["learner_recipe_overrides"])
+    overrides["policy_kl_anchor_weight"] = 0.006
+    overrides["policy_kl_anchor_direction"] = "forward"
+    overrides["loser_sample_weight"] = 1.0
+    components = []
+    ratios = (4.0 / 7.0, 8.0 / 35.0, 1.0 / 5.0)
+    for source_component, ratio in zip(source["components"], ratios):
+        components.append(
+            {
+                key: source_component[key]
+                for key in (
+                    "corpus_dir", "corpus_meta_sha256", "payload_inventory_sha256",
+                    "validation_manifest", "validation_manifest_sha256", "component_id",
+                )
+            }
+            | {"game_sampling_ratio": ratio}
+        )
+    payload = {
+        "schema_version": "memmap_composite_v2",
+        "diagnostic_only": True,
+        "promotion_eligible": False,
+        "components": components,
+        "learner_recipe_overrides": overrides,
+        "learner_recipe_overrides_sha256": _digest(overrides),
+        "policy_kl_anchor_component_ids": ["gen3_replay"],
+        "policy_distillation_component_ids": ["n128_current", "n256_current"],
+        "value_training_component_ids": ["n128_current", "n256_current"],
+    }
+    encoded = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if output_path.exists():
+        if output_path.read_text(encoding="utf-8") != encoded:
+            raise ArmError(f"prepared descriptor drift: {output_path}")
+    else:
+        temporary = output_path.with_name(f".{output_path.name}.tmp.{os.getpid()}")
+        temporary.write_text(encoded, encoding="utf-8")
+        os.chmod(temporary, 0o444)
+        os.replace(temporary, output_path)
+    verified, ref = _preflight_descriptor(output_path)
     if (
         verified.get("schema_version") != "memmap_composite_v2"
         or verified.get("policy_distillation_scope_explicit") is not True
@@ -140,20 +191,22 @@ def _validate_descriptor(path: Path) -> tuple[dict[str, Any], dict[str, str]]:
         != ["n128_current", "n256_current"]
         or verified.get("component_ids")
         != ["n128_current", "n256_current", "gen3_replay"]
+        or verified.get("component_game_sampling_ratios") != list(ratios)
         or verified.get("policy_kl_anchor_component_ids") != ["gen3_replay"]
+        or verified.get("value_training_component_ids")
+        != ["n128_current", "n256_current"]
     ):
         raise ArmError(
-            "descriptor must explicitly make n128/n256 current policy teachers "
-            "and gen3 replay value/anchor-only"
+            "derived descriptor must preserve exact 57.14/22.86/20 component ratios"
         )
-    overrides = verified.get("learner_recipe_overrides")
-    if not isinstance(overrides, dict) or (
-        float(overrides.get("policy_kl_anchor_weight", -1.0)) != 0.0
-        or overrides.get("policy_kl_anchor_direction") != "forward"
-        or float(overrides.get("loser_sample_weight", -1.0)) != 1.0
+    verified_overrides = verified.get("learner_recipe_overrides")
+    if not isinstance(verified_overrides, dict) or (
+        float(verified_overrides.get("policy_kl_anchor_weight", -1.0)) != 0.006
+        or verified_overrides.get("policy_kl_anchor_direction") != "forward"
+        or float(verified_overrides.get("loser_sample_weight", -1.0)) != 1.0
     ):
-        raise ArmError("descriptor must bind loser=1 and zero-weight forward replay KL")
-    return verified, _file_ref(path)
+        raise ArmError("derived descriptor must bind loser=1 and exact light forward anchor")
+    return verified, ref, source_ref
 
 
 def _lineage(entries: Sequence[str]) -> dict[str, Any]:
@@ -229,7 +282,7 @@ def _rebind_a1_metadata(command: list[str], repo: Path) -> dict[str, Any]:
         "soft_target_weight": 1.0, "soft_target_temperature": 0.7,
         "soft_target_min_legal_coverage": 0.5,
         "policy_aux_active_batch_size": 128,
-        "policy_kl_anchor_weight": 0.0,
+        "policy_kl_anchor_weight": 0.006,
         "value_loss_weight": 0.25, "value_lr_mult": 0.3,
         "value_target_lambda": 1.0, "lr": 3e-5,
         "lr_warmup_steps": 100, "lr_schedule": "flat",
@@ -274,7 +327,7 @@ def _rebind_a1_metadata(command: list[str], repo: Path) -> dict[str, Any]:
     }
     code_sha = _digest(binding)
     binding["code_tree_sha256"] = code_sha
-    _set_option(command, "--a1-learner-ablation-id", "l1-pure-current-aux128")
+    _set_option(command, "--a1-learner-ablation-id", "corrected-anchor-K3")
     _set_option(command, "--a1-effective-learner-recipe-json", _canonical(effective).decode())
     _set_option(command, "--a1-effective-learner-recipe-sha256", _digest(effective))
     _set_option(command, "--a1-ablation-code-binding-json", _canonical(binding).decode())
@@ -321,7 +374,7 @@ def _derive_command(
         "--soft-target-min-legal-coverage": "0.5",
         "--policy-aux-active-batch-size": "128",
         "--policy-kl-anchor-direction": "forward",
-        "--policy-kl-anchor-weight": "0.0",
+        "--policy-kl-anchor-weight": "0.006",
         "--value-loss-weight": "0.25",
         "--value-lr-mult": "0.3",
         "--value-target-lambda": "1.0",
@@ -343,15 +396,19 @@ def _derive_command(
 def prepare(args: argparse.Namespace) -> tuple[dict[str, Any], Path]:
     repo = args.repo.expanduser().resolve(strict=True)
     source, source_ref = _load_source_receipt(args.source_receipt)
-    descriptor = args.descriptor.expanduser().resolve(strict=True)
-    descriptor_meta, descriptor_ref = _validate_descriptor(descriptor)
+    source_descriptor = args.source_descriptor.expanduser().resolve(strict=True)
+    output_root = args.output_root.expanduser().resolve()
+    descriptor = output_root / "corrected-anchor-memmap-composite.json"
+    descriptor_meta, descriptor_ref, source_descriptor_ref = _build_corrected_descriptor(
+        source_descriptor, descriptor
+    )
     validation_ref = _file_ref(args.validation_manifest)
     f7_ref = _file_ref(args.f7_checkpoint)
     if f7_ref["sha256"] != args.expected_f7_sha256:
         raise ArmError("initialization checkpoint is not the explicitly expected f7 bytes")
     source_identities = {
         "parent_checkpoint_sha256": f7_ref["sha256"],
-        "descriptor_sha256": descriptor_ref["sha256"],
+        "descriptor_sha256": source_descriptor_ref["sha256"],
         "validation_manifest_sha256": validation_ref["sha256"],
     }
     for field, expected in source_identities.items():
@@ -359,7 +416,6 @@ def prepare(args: argparse.Namespace) -> tuple[dict[str, Any], Path]:
             raise ArmError(f"source receipt does not reuse exact {field} identity")
     lineage = _lineage(args.failed_lineage_artifact)
     source_binding = _source_binding(repo)
-    output_root = args.output_root.expanduser().resolve()
     for name in ("candidate.pt", "candidate.pt.optimizer.pt", "train.report.json"):
         if (output_root / name).exists():
             raise ArmError(f"refusing existing corrected-arm output: {output_root / name}")
@@ -375,7 +431,12 @@ def prepare(args: argparse.Namespace) -> tuple[dict[str, Any], Path]:
         "policy_aux_active_batch_size_per_rank": 128,
         "policy_aux_active_row_dose": 1_048_576,
         "policy_distillation_component_ids": ["n128_current", "n256_current"],
-        "replay_objective": "value-only; forward-KL coefficient 0.0",
+        "component_game_sampling_ratios": [4.0 / 7.0, 8.0 / 35.0, 1.0 / 5.0],
+        "current_supervised_base_row_dose": 3_355_443.2,
+        "replay_anchor_base_row_dose": 838_860.8,
+        "replay_supervised_policy": False,
+        "replay_supervised_value": False,
+        "replay_forward_kl_weight": 0.006,
         "soft_target_weight": 1.0, "fresh_optimizer": True,
         "independent_f7_initialization": True,
     }
@@ -387,6 +448,7 @@ def prepare(args: argparse.Namespace) -> tuple[dict[str, Any], Path]:
         "launch_interface_present": False,
         "source_receipt": source_ref,
         "failed_retry_lineage": lineage,
+        "source_descriptor": source_descriptor_ref,
         "descriptor": descriptor_ref,
         "descriptor_fingerprint": descriptor_meta["descriptor_fingerprint"],
         "validation_manifest": validation_ref,
@@ -395,18 +457,9 @@ def prepare(args: argparse.Namespace) -> tuple[dict[str, Any], Path]:
         "a1_runtime_metadata": a1_metadata,
         "recipe": recipe,
         "recipe_sha256": _digest(recipe),
-        "semantic_risk": {
-            "replay_value_is_off_policy": True,
-            "descriptor_supports_value_component_scope": False,
-            "current_effect": (
-                "gen3_replay contributes terminal-return value loss; with forward-KL "
-                "coefficient 0 it is value-only, not anchor-only"
-            ),
-            "launch_block": (
-                "do not launch until exact telemetry explicitly accepts stale replay "
-                "value rehearsal or a reviewed value-component/anchor-only scope exists"
-            ),
-            "causal_interpretation": (
+        "causal_interpretation": {
+            "bundled_optimization_not_f7_replication": True,
+            "reason": (
                 "f7 used loser=.3 and about 2.78M samples; this loser=1, 4.19M, "
                 "aux128, pure-target arm is an optimization bundle, not a one-axis "
                 "replication of f7"
@@ -434,7 +487,7 @@ def prepare(args: argparse.Namespace) -> tuple[dict[str, Any], Path]:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source-receipt", required=True, type=Path)
-    parser.add_argument("--descriptor", required=True, type=Path)
+    parser.add_argument("--source-descriptor", required=True, type=Path)
     parser.add_argument("--validation-manifest", required=True, type=Path)
     parser.add_argument("--f7-checkpoint", required=True, type=Path)
     parser.add_argument("--expected-f7-sha256", required=True)

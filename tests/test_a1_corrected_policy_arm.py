@@ -78,13 +78,52 @@ def _args(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> argparse.Namespace
         payload[arm.LINEAGE_DIGEST_FIELDS[role]] = arm._digest(payload)
         artifact = _write_json(tmp_path / f"{role}.json", payload)
         lineage.append(f"{role}={artifact}")
-    monkeypatch.setattr(
-        arm,
-        "_validate_descriptor",
-        lambda path: (
-            {"descriptor_fingerprint": "sha256:descriptor"}, arm._file_ref(path)
-        ),
-    )
+    source_components = [
+        {
+            "corpus_dir": f"/corpus/{component_id}",
+            "corpus_meta_sha256": f"sha256:meta-{component_id}",
+            "payload_inventory_sha256": f"sha256:inventory-{component_id}",
+            "validation_manifest": f"/validation/{component_id}.json",
+            "validation_manifest_sha256": f"sha256:validation-{component_id}",
+            "component_id": component_id,
+        }
+        for component_id in ("n128_current", "n256_current", "gen3_replay")
+    ]
+
+    def fake_preflight(path: Path):
+        if Path(path).resolve() == descriptor.resolve():
+            return (
+                {
+                    "schema_version": "memmap_composite_v2",
+                    "component_ids": ["n128_current", "n256_current", "gen3_replay"],
+                    "components": source_components,
+                    "learner_recipe_overrides": {
+                        "per_game_policy_weight": False,
+                        "per_game_policy_weight_mode": "equal",
+                        "policy_kl_anchor_weight": 0.0,
+                        "policy_kl_anchor_direction": "forward",
+                        "loser_sample_weight": 0.3,
+                    },
+                },
+                arm._file_ref(descriptor),
+            )
+        payload = json.loads(Path(path).read_text())
+        return (
+            {
+                "schema_version": "memmap_composite_v2",
+                "descriptor_fingerprint": arm._digest(payload),
+                "policy_distillation_scope_explicit": True,
+                "policy_distillation_component_ids": ["n128_current", "n256_current"],
+                "value_training_component_ids": ["n128_current", "n256_current"],
+                "component_ids": ["n128_current", "n256_current", "gen3_replay"],
+                "component_game_sampling_ratios": [4.0 / 7.0, 8.0 / 35.0, 1.0 / 5.0],
+                "policy_kl_anchor_component_ids": ["gen3_replay"],
+                "learner_recipe_overrides": payload["learner_recipe_overrides"],
+            },
+            arm._file_ref(path),
+        )
+
+    monkeypatch.setattr(arm, "_preflight_descriptor", fake_preflight)
     monkeypatch.setattr(
         arm,
         "_source_binding",
@@ -97,7 +136,7 @@ def _args(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> argparse.Namespace
     )
     return argparse.Namespace(
         source_receipt=source,
-        descriptor=descriptor,
+        source_descriptor=descriptor,
         validation_manifest=validation,
         f7_checkpoint=f7,
         expected_f7_sha256=arm._file_sha(f7),
@@ -119,12 +158,30 @@ def test_prepares_exact_one_dose_pure_current_policy_arm_without_launch(
     assert manifest["recipe"]["policy_distillation_component_ids"] == [
         "n128_current", "n256_current"
     ]
-    assert manifest["semantic_risk"]["replay_value_is_off_policy"] is True
-    assert manifest["semantic_risk"]["descriptor_supports_value_component_scope"] is False
+    assert manifest["recipe"]["component_game_sampling_ratios"] == pytest.approx(
+        [4 / 7, 8 / 35, 1 / 5]
+    )
+    assert manifest["recipe"]["replay_supervised_policy"] is False
+    assert manifest["recipe"]["replay_supervised_value"] is False
+    assert manifest["recipe"]["replay_forward_kl_weight"] == 0.006
+    assert manifest["causal_interpretation"]["bundled_optimization_not_f7_replication"] is True
+    descriptor = json.loads(Path(manifest["descriptor"]["path"]).read_text())
+    assert [row["component_id"] for row in descriptor["components"]] == [
+        "n128_current", "n256_current", "gen3_replay"
+    ]
+    assert descriptor["policy_kl_anchor_component_ids"] == ["gen3_replay"]
+    assert descriptor["policy_distillation_component_ids"] == [
+        "n128_current", "n256_current"
+    ]
+    assert descriptor["value_training_component_ids"] == [
+        "n128_current", "n256_current"
+    ]
+    assert descriptor["learner_recipe_overrides"]["policy_kl_anchor_weight"] == 0.006
     command = manifest["command"]
     assert arm._option(command, "--soft-target-weight") == "1.0"
     assert arm._option(command, "--policy-aux-active-batch-size") == "128"
-    assert arm._option(command, "--policy-kl-anchor-weight") == "0.0"
+    assert arm._option(command, "--policy-kl-anchor-weight") == "0.006"
+    assert arm._option(command, "--policy-kl-anchor-direction") == "forward"
     assert arm._option(command, "--loser-sample-weight") == "1.0"
     assert arm._option(command, "--max-steps") == "1024"
     assert command[command.index("torch.distributed.run") + 1] == "--standalone"
@@ -151,29 +208,21 @@ def test_refuses_source_receipt_command_digest_drift(tmp_path: Path) -> None:
         arm._load_source_receipt(path)
 
 
-def test_descriptor_requires_current_only_policy_and_zero_replay_kl(
+def test_descriptor_builder_refuses_noncanonical_source_components(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     path = tmp_path / "descriptor.json"
     path.write_text("{}", encoding="utf-8")
     monkeypatch.setattr(
-        arm.train_bc,
-        "_preflight_memmap_composite_descriptor",
-        lambda _path: {
+        arm,
+        "_preflight_descriptor",
+        lambda _path: ({
             "schema_version": "memmap_composite_v2",
-            "policy_distillation_scope_explicit": True,
-            "policy_distillation_component_ids": ["n128_current", "n256_current", "gen3_replay"],
-            "component_ids": ["n128_current", "n256_current", "gen3_replay"],
-            "policy_kl_anchor_component_ids": ["gen3_replay"],
-            "learner_recipe_overrides": {
-                "policy_kl_anchor_weight": 0.0,
-                "policy_kl_anchor_direction": "forward",
-                "loser_sample_weight": 1.0,
-            },
-        },
+            "component_ids": ["n128_current", "gen3_replay", "n256_current"],
+        }, arm._file_ref(path)),
     )
-    with pytest.raises(arm.ArmError, match="n128/n256 current policy teachers"):
-        arm._validate_descriptor(path)
+    with pytest.raises(arm.ArmError, match="n128, n256, and gen3 replay in order"):
+        arm._build_corrected_descriptor(path, tmp_path / "out.json")
 
 
 def test_command_requires_fsdp_and_hidden_information_masking(tmp_path: Path) -> None:
@@ -228,7 +277,7 @@ def test_rebinds_full_tracked_runtime_closure_and_effective_recipe(
     result = arm._rebind_a1_metadata(command, tmp_path)
     assert result["effective_recipe"]["policy_aux_active_batch_size"] == 128
     assert result["effective_recipe"]["soft_target_weight"] == 1.0
-    assert arm._option(command, "--a1-learner-ablation-id") == "l1-pure-current-aux128"
+    assert arm._option(command, "--a1-learner-ablation-id") == "corrected-anchor-K3"
     rebound = json.loads(arm._option(command, "--a1-ablation-code-binding-json"))
     assert rebound["records"][0]["path"] == str(trainer)
     assert rebound["records"][0]["sha256"] == arm._file_sha(trainer)
