@@ -181,10 +181,18 @@ class _StubPolicy:
     action_size = 8
     trained_with_masked_hidden_info = False
 
-    def forward_legal_np(self, _entity, legal_ids, _context, *, return_q=False):
+    def forward_legal_np(
+        self,
+        _entity,
+        legal_ids,
+        _context,
+        *,
+        return_q=False,
+        return_final_vp=False,
+    ):
         import torch
 
-        del return_q
+        del return_q, return_final_vp
         return {
             "logits": torch.zeros(tuple(legal_ids.shape), dtype=torch.float32),
             "value": torch.zeros((int(legal_ids.shape[0]),), dtype=torch.float32),
@@ -561,10 +569,21 @@ def test_warm_concurrent_batched_evaluation_matches_singles(
         observed_batch_sizes: list[int] = []
         real_forward = policy.forward_legal_np
 
-        def tracked_forward(entity_batch, legal_ids, context, *, return_q=False):
+        def tracked_forward(
+            entity_batch,
+            legal_ids,
+            context,
+            *,
+            return_q=False,
+            return_final_vp=False,
+        ):
             observed_batch_sizes.append(int(legal_ids.shape[0]))
             return real_forward(
-                entity_batch, legal_ids, context, return_q=return_q
+                entity_batch,
+                legal_ids,
+                context,
+                return_q=return_q,
+                return_final_vp=return_final_vp,
             )
 
         monkeypatch.setattr(policy, "forward_legal_np", tracked_forward)
