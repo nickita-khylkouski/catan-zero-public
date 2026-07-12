@@ -3302,11 +3302,11 @@ def _validate_a1_learner_training_recipe(
     if not drift:
         raise SystemExit("A1 learner ablation must change at least one recipe field")
     if dual_topology_authorization is not None:
-        allowed_dual_drift = {"lr", "loser_sample_weight"}
+        allowed_dual_drift = {"epochs", "lr", "loser_sample_weight"}
         forbidden_dual_drift = set(drift) - allowed_dual_drift
         if forbidden_dual_drift:
             raise SystemExit(
-                "dual corrective ablation only permits lr and loser_sample_weight; "
+                "dual corrective ablation only permits epochs, lr, and loser_sample_weight; "
                 f"got forbidden fields {sorted(forbidden_dual_drift)}"
             )
         if reviewed_lock_sha != dual_reviewed_sha:

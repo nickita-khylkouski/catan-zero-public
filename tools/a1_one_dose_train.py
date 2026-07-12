@@ -117,6 +117,7 @@ CHILD_ENVIRONMENT_KEYS = frozenset(
 # remain sealed by the original contract and are never accepted as overrides.
 A1_LEARNER_ABLATION_FIELDS = frozenset(
     {
+        "epochs",
         "lr",
         "lr_warmup_steps",
         "lr_schedule",
@@ -681,6 +682,7 @@ def bind_learner_ablation(
             )
         effective[key] = value
     numeric_domains: dict[str, tuple[float | None, float | None, bool]] = {
+        "epochs": (1.0, None, True),
         "lr": (0.0, None, False),
         "lr_warmup_steps": (0.0, None, True),
         "value_lr_mult": (0.0, None, False),

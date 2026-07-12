@@ -41,7 +41,9 @@ RECEIPT_SCHEMA = "a1-dual-arm-training-receipt-v1"
 REPORT_BINDING_FIELD = "a1_dual_arm_execution_binding"
 GLOBAL_BATCH = 4096
 ALLOWED_IDENTITIES = frozenset(train_bc.DUAL_ARM_SUBSET_COUNTS)
-DUAL_CORRECTIVE_ABLATION_FIELDS = frozenset({"lr", "loser_sample_weight"})
+DUAL_CORRECTIVE_ABLATION_FIELDS = frozenset(
+    {"epochs", "lr", "loser_sample_weight"}
+)
 
 
 class DualTrainError(RuntimeError):
@@ -275,7 +277,6 @@ def verify_inputs(
         # Replay the original claim/completion and every referenced input/output
         # byte before allowing train_bc's narrower producer/init check.
         parent_receipt = verify_receipt(curriculum_parent_receipt)
-        parent_inputs = parent_receipt["inputs"]
         # The receipt has already replayed its claim/completion and every bound
         # input/output byte. Do not require the current executor checkout to
         # reproduce an older diagnostic executor's source lock; verifier-only
@@ -306,7 +307,7 @@ def bind_learner_ablation(
     forbidden = set(overrides) - DUAL_CORRECTIVE_ABLATION_FIELDS
     if forbidden:
         raise DualTrainError(
-            "dual corrective ablation only permits lr and loser_sample_weight; "
+            "dual corrective ablation only permits epochs, lr, and loser_sample_weight; "
             f"got forbidden fields {sorted(forbidden)}"
         )
 
@@ -363,6 +364,17 @@ def build_command(
         "--a1-dual-reviewed-lock-file-sha256",
         verified["reviewed_lock_file_sha256"],
     ]
+    if int(verified["recipe"].get("epochs", 1)) > 1:
+        # Epoch-curve diagnostics must be one uninterrupted optimizer trajectory.
+        # Persist every integer exposure with its exact Adam state, and sample the
+        # opt-in optimizer/teacher telemetry without changing training math.
+        command.extend(
+            [
+                "--save-each-epoch",
+                "--train-diagnostics-every-batches",
+                "100",
+            ]
+        )
     parent = verified.get("curriculum_parent")
     if parent is not None:
         init_index = command.index("--init-checkpoint") + 1
@@ -602,7 +614,9 @@ def verify_outputs(
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
         raise DualTrainError(f"cannot parse training report: {error}") from error
     recipe = verified["recipe"]
-    steps = math.ceil(int(verified["training_rows"]) / GLOBAL_BATCH)
+    completed_epochs = int(recipe.get("epochs", 1))
+    steps_per_epoch = math.ceil(int(verified["training_rows"]) / GLOBAL_BATCH)
+    steps = steps_per_epoch * completed_epochs
     expected = {
         "arch": "entity_graph",
         "hidden_size": 640,
@@ -614,7 +628,7 @@ def verify_outputs(
         "ddp_shard_data": False,
         "steps_completed": steps,
         "total_training_steps": steps,
-        "epochs": 1,
+        "epochs": completed_epochs,
         "max_steps": 0,
         "samples": verified["corpus_rows"],
         "global_samples": verified["corpus_rows"],
@@ -706,30 +720,35 @@ def verify_outputs(
     parameter_count = payload.get("parameter_count")
     metrics = payload.get("metrics")
     value_training = payload.get("value_training")
-    epoch_metrics = metrics[0] if isinstance(metrics, list) and len(metrics) == 1 else {}
-    finite_metrics = all(
-        isinstance(epoch_metrics.get(key), (int, float))
-        and not isinstance(epoch_metrics.get(key), bool)
-        and math.isfinite(float(epoch_metrics[key]))
-        for key in ("loss", "policy_loss", "value_loss")
+    epoch_metrics = metrics if isinstance(metrics, list) else []
+    finite_metrics = len(epoch_metrics) == completed_epochs and all(
+        row.get("epoch") == index
+        and all(
+            isinstance(row.get(key), (int, float))
+            and not isinstance(row.get(key), bool)
+            and math.isfinite(float(row[key]))
+            for key in ("loss", "policy_loss", "value_loss")
+        )
+        for index, row in enumerate(epoch_metrics, start=1)
     )
-    validation_metrics = epoch_metrics.get("validation", {})
+    validation_metrics = [row.get("validation", {}) for row in epoch_metrics]
+    valid_validation_metrics = len(validation_metrics) == completed_epochs and all(
+        isinstance(value, dict)
+        and value.get("samples") == verified["validation_rows"]
+        and isinstance(value.get("loss"), (int, float))
+        and not isinstance(value.get("loss"), bool)
+        and math.isfinite(float(value["loss"]))
+        for value in validation_metrics
+    )
     if (
         isinstance(parameter_count, bool)
         or not isinstance(parameter_count, int)
         or not 30_000_000 <= parameter_count <= 40_000_000
-        or not isinstance(metrics, list)
-        or len(metrics) != 1
-        or metrics[0].get("epoch") != 1
         or not finite_metrics
-        or not isinstance(validation_metrics, dict)
-        or validation_metrics.get("samples") != verified["validation_rows"]
-        or not isinstance(validation_metrics.get("loss"), (int, float))
-        or isinstance(validation_metrics.get("loss"), bool)
-        or not math.isfinite(float(validation_metrics["loss"]))
+        or not valid_validation_metrics
         or not isinstance(value_training, dict)
         or value_training.get("optimizer_steps") != steps
-        or value_training.get("completed_epochs") != 1
+        or value_training.get("completed_epochs") != completed_epochs
         or value_training.get("a1_contract_sha256") != verified["contract_sha256"]
         or value_training.get("a1_selected_game_seed_set_sha256")
         != verified["selected_game_seed_set_sha256"]
@@ -745,13 +764,32 @@ def verify_outputs(
         )
         or "scalar" not in value_training.get("trained_value_readouts", [])
     ):
-        raise DualTrainError("dual-arm report lacks one complete 35M scalar-MSE dose")
-    return {
+        raise DualTrainError(
+            "dual-arm report lacks the complete authenticated 35M scalar-MSE trajectory"
+        )
+    outputs = {
         "checkpoint": _file_ref(checkpoint, where="candidate checkpoint"),
         "optimizer": _file_ref(optimizer, where="optimizer sidecar"),
         "report": _file_ref(report, where="training report"),
         "steps_completed": steps,
     }
+    if completed_epochs > 1:
+        epoch_outputs: dict[str, dict[str, Any]] = {}
+        for epoch in range(1, completed_epochs + 1):
+            epoch_checkpoint = train_bc._epoch_checkpoint_path(str(checkpoint), epoch)  # noqa: SLF001
+            epoch_optimizer = Path(str(epoch_checkpoint) + ".optimizer.pt")
+            epoch_outputs[str(epoch)] = {
+                "exposures": float(epoch),
+                "checkpoint": _file_ref(
+                    epoch_checkpoint, where=f"epoch {epoch} candidate checkpoint"
+                ),
+                "optimizer": _file_ref(
+                    epoch_optimizer, where=f"epoch {epoch} optimizer sidecar"
+                ),
+                "validation": epoch_metrics[epoch - 1]["validation"],
+            }
+        outputs["epoch_checkpoints"] = epoch_outputs
+    return outputs
 
 
 def verify_receipt(

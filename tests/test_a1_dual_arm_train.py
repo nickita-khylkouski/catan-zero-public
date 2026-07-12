@@ -85,7 +85,9 @@ def _touch_ref(path: Path) -> dict[str, str]:
     return {"path": str(path.resolve()), "sha256": dual._sha256(path)}  # noqa: SLF001
 
 
-def _bind_corrective_ablation(verified: dict) -> dict:
+def _bind_corrective_ablation(
+    verified: dict, *, overrides: dict | None = None
+) -> dict:
     repo = Path(dual.__file__).resolve().parents[1]
     verified["ablation_code_lock"] = {
         "provenance": {
@@ -103,7 +105,9 @@ def _bind_corrective_ablation(verified: dict) -> dict:
     return dual.bind_learner_ablation(
         verified,
         ablation_id="all-196k-corrective-v1",
-        overrides_json=json.dumps({"lr": 0.00012, "loser_sample_weight": 1.0}),
+        overrides_json=json.dumps(
+            overrides or {"lr": 0.00012, "loser_sample_weight": 1.0}
+        ),
         reviewed_code_tree_sha256=code["code_tree_sha256"],
     )
 
@@ -214,7 +218,9 @@ def test_dual_curriculum_supports_sealed_diagnostic_learner_ablation(
     bad_args.value_loss_weight = 1.0
     bad_args.a1_effective_learner_recipe_json = dual._canonical(declared).decode()  # noqa: SLF001
     bad_args.a1_effective_learner_recipe_sha256 = dual._digest(declared)  # noqa: SLF001
-    with pytest.raises(SystemExit, match="only permits lr and loser_sample_weight"):
+    with pytest.raises(
+        SystemExit, match="only permits epochs, lr, and loser_sample_weight"
+    ):
         dual.train_bc._validate_a1_learner_training_recipe(  # noqa: SLF001
             bad_args,
             {"world_size": 8, "rank": 0, "local_rank": 0, "enabled": False},
@@ -478,12 +484,13 @@ def _write_outputs(
     checkpoint.write_bytes(b"candidate")
     Path(str(checkpoint) + ".optimizer.pt").write_bytes(b"optimizer")
     report = tmp_path / "report.json"
-    steps = math.ceil(verified["training_rows"] / 4096)
+    epochs = int(verified["recipe"].get("epochs", 1))
+    steps = math.ceil(verified["training_rows"] / 4096) * epochs
     payload = {
         "arch": "entity_graph", "hidden_size": 640, "graph_layers": 6,
         "attention_heads": 8, "graph_dropout": 0.05, "world_size": world_size,
         "batch_size": 512, "ddp_shard_data": False, "steps_completed": steps,
-        "total_training_steps": steps, "epochs": 1, "max_steps": 0,
+        "total_training_steps": steps, "epochs": epochs, "max_steps": 0,
         "samples": verified["corpus_rows"], "global_samples": verified["corpus_rows"],
         "train_samples": verified["training_rows"],
         "validation_samples": verified["validation_rows"],
@@ -509,12 +516,16 @@ def _write_outputs(
         "optimizer": "adam", "resume_optimizer": False,
         "optimizer_restored": False, "fused_optimizer": False, "amp": "bf16",
         dual.REPORT_BINDING_FIELD: binding, "parameter_count": 35_000_000,
-        "metrics": [{
-            "epoch": 1, "loss": 1.0, "policy_loss": 0.7, "value_loss": 0.3,
-            "validation": {"samples": verified["validation_rows"], "loss": 1.1},
-        }],
+        "metrics": [
+            {
+                "epoch": epoch, "loss": 1.0, "policy_loss": 0.7,
+                "value_loss": 0.3,
+                "validation": {"samples": verified["validation_rows"], "loss": 1.1},
+            }
+            for epoch in range(1, epochs + 1)
+        ],
         "value_training": {
-            "optimizer_steps": steps, "completed_epochs": 1,
+            "optimizer_steps": steps, "completed_epochs": epochs,
             "trained_value_readouts": ["scalar"],
             "a1_contract_sha256": verified["contract_sha256"],
             "a1_selected_game_seed_set_sha256": verified["selected_game_seed_set_sha256"],
@@ -543,6 +554,15 @@ def _write_outputs(
             "promotion_eligible": False,
         })
         payload["value_training"]["learner_ablation"] = verified["learner_ablation"]
+    if epochs > 1:
+        for epoch in range(1, epochs + 1):
+            epoch_checkpoint = dual.train_bc._epoch_checkpoint_path(  # noqa: SLF001
+                str(checkpoint), epoch
+            )
+            epoch_checkpoint.write_bytes(f"candidate-{epoch}".encode())
+            Path(str(epoch_checkpoint) + ".optimizer.pt").write_bytes(
+                f"optimizer-{epoch}".encode()
+            )
     report.write_text(json.dumps(payload))
     return checkpoint, report
 
@@ -578,6 +598,45 @@ def test_output_verifier_accepts_separately_bound_effective_ablation(
     )
 
     assert outputs["steps_completed"] == 3
+
+
+def test_three_epoch_diagnostic_is_one_clean_trajectory_with_sealed_checkpoints(
+    tmp_path: Path,
+) -> None:
+    verified = _bind_corrective_ablation(
+        _verified(tmp_path),
+        overrides={"epochs": 3, "lr": 0.00012, "loser_sample_weight": 1.0},
+    )
+    command = dual.build_command(
+        verified,
+        python=Path("/venv/bin/python"),
+        checkpoint=tmp_path / "candidate.pt",
+        report=tmp_path / "report.json",
+    )
+    assert command[command.index("--epochs") + 1] == "3"
+    assert "--no-resume-optimizer" in command
+    assert "--save-each-epoch" in command
+    assert command[command.index("--train-diagnostics-every-batches") + 1] == "100"
+
+    binding = dual._execution_binding(command, verified)  # noqa: SLF001
+    checkpoint, report = _write_outputs(tmp_path, verified, binding)
+    outputs = dual.verify_outputs(
+        verified=verified, checkpoint=checkpoint, report=report, binding=binding
+    )
+
+    assert outputs["steps_completed"] == 9
+    assert set(outputs["epoch_checkpoints"]) == {"1", "2", "3"}
+    assert [
+        outputs["epoch_checkpoints"][str(epoch)]["exposures"]
+        for epoch in range(1, 4)
+    ] == [1.0, 2.0, 3.0]
+
+    epoch_two = dual.train_bc._epoch_checkpoint_path(str(checkpoint), 2)  # noqa: SLF001
+    Path(str(epoch_two) + ".optimizer.pt").unlink()
+    with pytest.raises(dual.DualTrainError, match="epoch 2 optimizer sidecar"):
+        dual.verify_outputs(
+            verified=verified, checkpoint=checkpoint, report=report, binding=binding
+        )
 
 
 def test_promotion_receipt_verifier_accepts_dual_transaction(
