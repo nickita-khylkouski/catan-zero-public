@@ -1430,6 +1430,7 @@ class EntityGraphPolicy:
         mask_hidden_info: bool = False,
         soft_target_source: str | None = None,
         value_training: dict[str, object] | None = None,
+        training_information_surface: dict[str, object] | None = None,
     ) -> None:
         import torch
 
@@ -1477,6 +1478,10 @@ class EntityGraphPolicy:
             )
             payload["value_training"] = durable_value_training
             payload["trained_value_readouts"] = list(trained_readouts)
+        if training_information_surface is not None:
+            payload["training_information_surface"] = dict(
+                training_information_surface
+            )
         torch.save(payload, output)
 
     @classmethod

@@ -5,6 +5,7 @@ indistinguishable from a policy-target one without digging through report.json.
 EntityGraphPolicy.save now stamps soft_target_source into the checkpoint dict
 (mirroring the mask_hidden_info provenance field).
 """
+
 from __future__ import annotations
 
 import sys
@@ -80,3 +81,25 @@ def test_distributed_checkpoint_writer_records_soft_target_source(tmp_path):
     data = _load_raw(path)
     assert data["soft_target_source"] == "policy"
     assert data["mask_hidden_info"] is True
+
+
+def test_all_entity_checkpoint_writers_record_information_surface(tmp_path):
+    contract = {
+        "schema": "a1-training-event-history-contract-v1",
+        "training_event_history_trainable": False,
+        "event_history_end_to_end_usable": False,
+    }
+    direct = tmp_path / "direct.pt"
+    _tiny_policy().save(direct, training_information_surface=contract)
+    assert _load_raw(direct)["training_information_surface"] == contract
+
+    distributed = tmp_path / "distributed.pt"
+    policy = _tiny_policy()
+    train_bc._write_entity_checkpoint(
+        policy,
+        str(distributed),
+        policy.model.state_dict(),
+        True,
+        training_information_surface=contract,
+    )
+    assert _load_raw(distributed)["training_information_surface"] == contract

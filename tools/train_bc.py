@@ -332,6 +332,19 @@ def build_parser() -> argparse.ArgumentParser:
             "observation width matches the graph-history schema."
         ),
     )
+    parser.add_argument(
+        "--acknowledge-empty-event-history-payload-inventory-sha256",
+        action="append",
+        default=[],
+        help=(
+            "Repeat once for every authenticated A1 corpus component whose "
+            "entity event history is empty/unverified. The value must be that "
+            "component's exact payload_inventory_sha256. This authorizes "
+            "shape-compatible training only; it never claims the event encoder "
+            "was trained. Entity-graph A1 training fails closed without the exact "
+            "set."
+        ),
+    )
     parser.add_argument("--epochs", type=int, default=2)
     parser.add_argument(
         "--max-steps",
@@ -4618,6 +4631,19 @@ def main(argv: Sequence[str] | None = None) -> None:
         ]
         args.a1_learner_ablation = a1_training_binding.get("learner_ablation")
     env_config = _env_config_for_teacher_data(args, data, ddp)
+    training_information_surface = _a1_training_event_history_contract(
+        args, a1_preflight_meta, env_config
+    )
+    _rank0_print(
+        json.dumps(
+            {
+                "progress": "training_information_surface",
+                "contract": training_information_surface,
+            },
+            sort_keys=True,
+        ),
+        ddp,
+    )
     if args.trust_curated_data_quality:
         data_quality = {
             "samples": int(len(data["action_taken"])),
@@ -6217,6 +6243,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 mask_hidden_info=bool(args.mask_hidden_info),
                 soft_target_source=args.soft_target_source,
                 value_training=value_training,
+                training_information_surface=training_information_surface,
             )
             # CAT-128 patch #8: persist optimizer (Adam) state as <ckpt>.optimizer.pt.
             # Called on ALL ranks (the FSDP gather is a collective); rank-0 writes.
@@ -6284,6 +6311,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         mask_hidden_info=bool(args.mask_hidden_info),
         soft_target_source=args.soft_target_source,
         value_training=value_training,
+        training_information_surface=training_information_surface,
     )
     # CAT-128 patch #8: persist final optimizer (Adam) state alongside the checkpoint.
     optimizer_saved = _save_optimizer_sidecar(
@@ -6471,6 +6499,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         "graph_history_features": bool(
             getattr(env_config, "use_graph_history_features", False)
         ),
+        "training_information_surface": training_information_surface,
         "checkpoint": args.checkpoint,
         "init_checkpoint": args.init_checkpoint or None,
         "init_checkpoint_sha256": str(args.init_checkpoint_sha256) or None,
@@ -10085,6 +10114,47 @@ def _env_config_for_teacher_data(args, data: dict, ddp: dict[str, int | bool]):
         ddp,
     )
     return selected
+
+
+def _a1_training_event_history_contract(
+    args,
+    a1_preflight_meta: dict[str, object] | None,
+    env_config,
+) -> dict[str, object] | None:
+    """Build the fail-closed entity-event contract for authenticated A1 data."""
+
+    if a1_preflight_meta is None:
+        # Backward compatibility: generic/legacy non-A1 corpora retain their
+        # historical behavior. A1 and production paths are authenticated above.
+        return None
+    from audit_entity_graph_information_surface import (
+        InformationSurfaceError,
+        build_a1_training_event_history_contract,
+    )
+
+    if a1_preflight_meta.get("schema_version") in {
+        "memmap_composite_v1",
+        "memmap_composite_v2",
+    }:
+        components = {
+            str(component["component_id"]): component["corpus_meta"]
+            for component in a1_preflight_meta["components"]
+        }
+    else:
+        components = {"a1": a1_preflight_meta}
+    try:
+        return build_a1_training_event_history_contract(
+            components,
+            graph_history_features=bool(
+                getattr(env_config, "use_graph_history_features", False)
+            ),
+            event_history_consumer_enabled=str(args.arch) == "entity_graph",
+            empty_payload_inventory_acknowledgements=tuple(
+                args.acknowledge_empty_event_history_payload_inventory_sha256
+            ),
+        )
+    except InformationSurfaceError as error:
+        raise SystemExit(f"A1 event-history contract refused training: {error}") from error
 
 
 def _teacher_shard_files(path: Path) -> list[Path]:
@@ -15407,6 +15477,7 @@ def _save_policy(
     mask_hidden_info: bool = False,
     soft_target_source: str | None = None,
     value_training: dict[str, object] | None = None,
+    training_information_surface: dict[str, object] | None = None,
 ) -> None:
     """Write a policy checkpoint. Safe to call from EVERY rank: single-GPU and
     DDP write on rank 0 only, while FSDP gathers a full (unsharded) state_dict --
@@ -15438,6 +15509,7 @@ def _save_policy(
             mask_hidden_info,
             soft_target_source=soft_target_source,
             value_training=value_training,
+            training_information_surface=training_information_surface,
         )
         return
 
@@ -15452,6 +15524,7 @@ def _save_policy(
                     mask_hidden_info=bool(mask_hidden_info),
                     soft_target_source=soft_target_source,
                     value_training=value_training,
+                    training_information_surface=training_information_surface,
                 )
             else:
                 policy.save(tmp)
@@ -15474,6 +15547,7 @@ def _save_policy(
         mask_hidden_info,
         soft_target_source=soft_target_source,
         value_training=value_training,
+        training_information_surface=training_information_surface,
     )
 
 
@@ -15485,6 +15559,7 @@ def _write_entity_checkpoint(
     *,
     soft_target_source: str | None = None,
     value_training: dict[str, object] | None = None,
+    training_information_surface: dict[str, object] | None = None,
 ) -> None:
     """Atomically write the durable name-keyed checkpoint dict shared by the DDP
     and FSDP save paths (mirrors EntityGraphPolicy.save's fields)."""
@@ -15519,6 +15594,10 @@ def _write_entity_checkpoint(
                 )
                 if str(readout) in {"scalar", "categorical"}
             ]
+        if training_information_surface is not None:
+            payload["training_information_surface"] = dict(
+                training_information_surface
+            )
         torch.save(payload, tmp)
         if not tmp.exists() or tmp.stat().st_size <= 0:
             raise RuntimeError(f"checkpoint temp file was not written: {tmp}")

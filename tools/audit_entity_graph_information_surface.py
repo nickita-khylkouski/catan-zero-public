@@ -22,6 +22,7 @@ import numpy as np
 
 SCHEMA = "entity-graph-information-surface-audit-v1"
 TRAINING_CONTRACT_SCHEMA = "a1-training-event-history-contract-v1"
+NATIVE_INFERENCE_CONTRACT_SCHEMA = "native-entity-event-history-v1"
 _SHA256_RE = re.compile(r"sha256:[0-9a-f]{64}")
 
 
@@ -305,20 +306,47 @@ def enforce_graph_history_contract(
         )
 
 
+def native_inference_event_history_capability() -> dict[str, Any]:
+    """Describe the checked-in native inference event-information surface.
+
+    This is deliberately not a caller-controlled boolean.  Both native paths
+    are constant-empty in the current source: the Rust featurizer allocates a
+    false ``event_mask`` and the Rust-snapshot adapter supplies ``event_log=[]``.
+    The entity schema is recorded so a future implementation must deliberately
+    revise this contract when it starts carrying public events end to end.
+    """
+
+    from catan_zero.rl.entity_token_features import ENTITY_TOKEN_SCHEMA_VERSION
+
+    return {
+        "schema": NATIVE_INFERENCE_CONTRACT_SCHEMA,
+        "entity_token_schema": ENTITY_TOKEN_SCHEMA_VERSION,
+        "available": False,
+        "providers": [
+            "catanatron_rs.build_entity_features_flat",
+            "catan_zero.search.neural_rust_mcts._entity_payload_from_rust_snapshot",
+        ],
+        "evidence": [
+            "native Rust entity featurizer emits constant-zero event_tokens/event_mask",
+            "Rust snapshot adapter emits an empty event_log",
+        ],
+    }
+
+
 def build_a1_training_event_history_contract(
     component_metadata: Mapping[str, Mapping[str, Any]],
     *,
     graph_history_features: bool,
+    event_history_consumer_enabled: bool,
     empty_payload_inventory_acknowledgements: Sequence[str] = (),
     component_payload_scans: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Bind an A1 learner's history claim to authenticated corpus payloads.
 
-    ``graph_history_features`` historically names both an observation *shape*
-    and usable public event history.  Existing A1 corpora have that shape but
-    physical, all-zero legacy event columns.  Silently calling the event
-    encoder trainable is false; globally disabling the graph/history schema is
-    also impossible because it changes the checkpoint input width.
+    ``graph_history_features`` names a legacy flat-observation *shape*, not the
+    entity model's event consumer.  ``EntityGraphPolicy`` owns an event encoder
+    regardless of that flag.  Existing A1 corpora have physical, all-zero
+    legacy event columns, so silently calling that encoder trainable is false.
 
     This contract keeps those two facts separate.  Nonzero history must be
     proven by metadata or an exact payload scan.  Empty/unverified legacy
@@ -410,20 +438,23 @@ def build_a1_training_event_history_contract(
         )
 
     provided = set(acknowledgements)
-    if not graph_history_features:
+    if not event_history_consumer_enabled:
         if provided:
             raise InformationSurfaceError(
-                "empty-history acknowledgements are invalid when the graph/history "
-                "observation schema is disabled"
+                "empty-history acknowledgements are invalid when no event-history "
+                "consumer is enabled"
             )
         for component in components:
-            component["status"] = "schema_disabled"
+            component["status"] = "consumer_disabled"
             del component["pre_acknowledgement_disposition"]
         return {
             "schema": TRAINING_CONTRACT_SCHEMA,
-            "graph_history_observation_schema": False,
-            "event_history_trainable": False,
-            "status": "schema_disabled",
+            "graph_history_observation_schema": bool(graph_history_features),
+            "event_history_consumer_enabled": False,
+            "training_event_history_trainable": False,
+            "native_inference": native_inference_event_history_capability(),
+            "event_history_end_to_end_usable": False,
+            "status": "consumer_disabled",
             "components": components,
             "empty_payload_inventory_acknowledgements": [],
         }
@@ -456,6 +487,12 @@ def build_a1_training_event_history_contract(
         del component["pre_acknowledgement_disposition"]
 
     any_trainable = trainable_components > 0
+    native_capability = native_inference_event_history_capability()
+    if any_trainable and native_capability["available"] is not True:
+        raise InformationSurfaceError(
+            "A1 corpus proves nonzero event history but native inference does not "
+            "provide event history; refusing train/deploy information-surface skew"
+        )
     if any_trainable and required_acknowledgements:
         status = "partially_trainable_with_empty_components_acknowledged"
     elif any_trainable:
@@ -464,8 +501,13 @@ def build_a1_training_event_history_contract(
         status = "empty_payloads_acknowledged"
     return {
         "schema": TRAINING_CONTRACT_SCHEMA,
-        "graph_history_observation_schema": True,
-        "event_history_trainable": any_trainable,
+        "graph_history_observation_schema": bool(graph_history_features),
+        "event_history_consumer_enabled": True,
+        "training_event_history_trainable": any_trainable,
+        "native_inference": native_capability,
+        "event_history_end_to_end_usable": bool(
+            any_trainable and native_capability["available"] is True
+        ),
         "status": status,
         "components": components,
         "empty_payload_inventory_acknowledgements": sorted(provided),
