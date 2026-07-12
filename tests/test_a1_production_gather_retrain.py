@@ -169,3 +169,164 @@ def test_rejects_semantically_rehashed_geometry_command_and_identity_tampering(
     )
     with pytest.raises(gather.GatherRetrainError, match="upgrade/source"):
         gather.verify(path)
+
+
+def _completion_outputs(manifest: dict, path: Path, *, unit: str) -> Path:
+    root = Path(manifest["output_root"])
+    root.mkdir(parents=True)
+    checkpoint = root / "candidate.pt"
+    checkpoint.write_bytes(b"trained gather candidate")
+    optimizer = root / "candidate.pt.optimizer.pt"
+    optimizer.write_bytes(b"fresh adam state at step 2048")
+    report = {
+        "checkpoint": str(checkpoint),
+        "init_checkpoint": manifest["function_preserving_upgrade"][
+            "upgraded_initializer"
+        ]["path"],
+        "init_checkpoint_sha256": manifest["function_preserving_upgrade"][
+            "upgraded_initializer"
+        ]["sha256"],
+        "world_size": 4,
+        "batch_size": 512,
+        "effective_global_batch_size": 2048,
+        "max_steps": 2048,
+        "steps_completed": 2048,
+        "training_row_draws": 4_194_304,
+        "soft_target_weight": 0.9,
+        "value_loss_weight": 0.25,
+        "loser_sample_weight": 1.0,
+        "action_module_lr_mult": 4.0,
+        "freeze_modules": gather.FREEZE_MODULES,
+        "require_only_trainable_prefixes": gather.TRAINABLE_PREFIX,
+        "action_target_gather": True,
+        "ddp_find_unused_parameters": True,
+        "ddp_shard_data": False,
+        "value_target_lambda": 1.0,
+        "forced_action_weight": 0.0,
+        "forced_row_value_weight": 1.0,
+        "winner_sample_weight": 1.0,
+        "lr_schedule": "flat",
+        "lr_warmup_steps": 100,
+        "weight_decay": 0.0,
+        "max_grad_norm": 1.0,
+        "seed": 1,
+        "training_information_surface": {
+            "required_trainable_surface": {
+                "prefixes": [gather.TRAINABLE_PREFIX],
+                "parameter_tensors": 4,
+                "parameters": 1234,
+            }
+        },
+    }
+    (root / "train.report.json").write_text(json.dumps(report), encoding="utf-8")
+    progress = {
+        "checkpoint": _ref(checkpoint),
+        "optimizer": _ref(optimizer),
+        "optimizer_step": 2048,
+        "completed_epochs": 1,
+        "rank_torch_rng_states": [f"rank-{index}" for index in range(4)],
+    }
+    progress["progress_sha256"] = gather.base._digest(progress)  # noqa: SLF001
+    (root / "candidate.pt.training-progress.json").write_text(
+        json.dumps(progress), encoding="utf-8"
+    )
+    claim = {
+        "schema_version": gather.CLAIM_SCHEMA,
+        "created_at_unix_ns": 1,
+        "manifest": _ref(path),
+        "unit": unit,
+    }
+    claim["claim_sha256"] = gather.base._digest(claim)  # noqa: SLF001
+    claim_path = root / "execution.claim.json"
+    claim_path.write_text(json.dumps(claim), encoding="utf-8")
+    submission = {
+        "schema_version": gather.SUBMISSION_SCHEMA,
+        "diagnostic_only": False,
+        "production_eligible": True,
+        "created_at_unix_ns": 2,
+        "manifest": _ref(path),
+        "claim": _ref(claim_path),
+        "unit": unit,
+        "command_sha256": manifest["command_sha256"],
+        "systemd_command_sha256": "sha256:" + "5" * 64,
+        "systemd_stdout": "Running as unit.",
+    }
+    submission["receipt_sha256"] = gather.base._digest(submission)  # noqa: SLF001
+    (root / "submission.receipt.json").write_text(
+        json.dumps(submission), encoding="utf-8"
+    )
+    return root / "candidate.pt.training-progress.json"
+
+
+def test_finalize_binds_exact_progress_rng_and_fresh_optimizer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manifest, path = _fixture(tmp_path, monkeypatch)
+    unit = "a1-gather-test"
+    progress_path = _completion_outputs(manifest, path, unit=unit)
+    monkeypatch.setattr(
+        gather,
+        "_verify_adapter_only_model_delta",
+        lambda *_args: {"inherited_parameters_bit_identical": True},
+    )
+    state = lambda *_args, **_kwargs: (  # noqa: E731
+        "ActiveState=inactive\nResult=success\nExecMainStatus=0\n"
+    )
+    completion = gather.finalize(path, unit=unit, state_reader=state)
+    assert completion["operator_sha256"] == manifest["operator_sha256"]
+    assert completion["progress"] == _ref(progress_path)
+    assert completion["optimizer"]["path"].endswith("candidate.pt.optimizer.pt")
+
+
+def test_finalize_rejects_rehashed_progress_geometry_tamper(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manifest, path = _fixture(tmp_path, monkeypatch)
+    unit = "a1-gather-test"
+    progress_path = _completion_outputs(manifest, path, unit=unit)
+    monkeypatch.setattr(
+        gather,
+        "_verify_adapter_only_model_delta",
+        lambda *_args: {"inherited_parameters_bit_identical": True},
+    )
+    progress = json.loads(progress_path.read_text(encoding="utf-8"))
+    progress["optimizer_step"] = 2047
+    progress.pop("progress_sha256")
+    progress["progress_sha256"] = gather.base._digest(progress)  # noqa: SLF001
+    progress_path.write_text(json.dumps(progress), encoding="utf-8")
+    with pytest.raises(gather.GatherRetrainError, match="progress/RNG/optimizer"):
+        gather.finalize(
+            path,
+            unit=unit,
+            state_reader=lambda *_args, **_kwargs: (
+                "ActiveState=inactive\nResult=success\nExecMainStatus=0\n"
+            ),
+        )
+
+
+def test_model_delta_requires_all_and_only_four_gather_tensors(tmp_path: Path) -> None:
+    import torch
+
+    names = sorted(
+        gather.upgrade.ALLOWLIST[gather.upgrade.MODULE_TARGET_GATHER][
+            "new_parameter_initialization"
+        ]
+    )
+    model = {"trunk.weight": torch.ones(2, 2)}
+    for name in names:
+        model[name] = torch.zeros(2, 2)
+    initializer = tmp_path / "init.pt"
+    candidate = tmp_path / "candidate.pt"
+    torch.save({"model": model}, initializer)
+    changed = {key: value.clone() for key, value in model.items()}
+    for index, name in enumerate(names, start=1):
+        changed[name].fill_(float(index))
+    torch.save({"model": changed}, candidate)
+    evidence = gather._verify_adapter_only_model_delta(initializer, candidate)  # noqa: SLF001
+    assert evidence["changed_parameter_tensors"] == names
+    assert evidence["inherited_parameters_bit_identical"] is True
+
+    changed["trunk.weight"][0, 0] = 2
+    torch.save({"model": changed}, candidate)
+    with pytest.raises(gather.GatherRetrainError, match="exact gather adapter"):
+        gather._verify_adapter_only_model_delta(initializer, candidate)  # noqa: SLF001

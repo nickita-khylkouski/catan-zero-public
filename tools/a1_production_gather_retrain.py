@@ -110,8 +110,16 @@ def _validate_geometry(command: list[str]) -> None:
         "--optimizer": "adam",
         "--lr": "3e-05",
         "--lr-warmup-steps": "100",
+        "--lr-schedule": "flat",
+        "--weight-decay": "0.0",
+        "--max-grad-norm": "1.0",
+        "--seed": "1",
         "--soft-target-weight": "0.9",
+        "--value-target-lambda": "1.0",
         "--value-loss-weight": "0.25",
+        "--forced-action-weight": "0.0",
+        "--forced-row-value-weight": "1.0",
+        "--winner-sample-weight": "1.0",
         "--loser-sample-weight": "1.0",
         "--policy-aux-active-batch-size": "0",
         "--action-module-lr-mult": "4.0",
@@ -128,14 +136,11 @@ def _validate_geometry(command: list[str]) -> None:
         "--mask-hidden-info",
         "--graph-history-features",
         "--trust-curated-data-quality",
+        "--ddp-find-unused-parameters",
     ):
         if required not in command:
             raise GatherRetrainError(f"target-gather command lacks {required}")
-    forbidden = {
-        "--ddp-find-unused-parameters",
-        "--fsdp",
-        "--train-value-only",
-    }
+    forbidden = {"--fsdp", "--train-value-only", "--ddp-shard-data"}
     present = sorted(forbidden & set(command))
     if present:
         raise GatherRetrainError(
@@ -199,8 +204,16 @@ def prepare(
         "--batch-size": str(LOCAL_BATCH),
         "--grad-accum-steps": "1",
         "--soft-target-weight": "0.9",
+        "--value-target-lambda": "1.0",
         "--value-loss-weight": "0.25",
+        "--forced-action-weight": "0.0",
+        "--forced-row-value-weight": "1.0",
+        "--winner-sample-weight": "1.0",
         "--loser-sample-weight": "1.0",
+        "--lr-schedule": "flat",
+        "--weight-decay": "0.0",
+        "--max-grad-norm": "1.0",
+        "--seed": "1",
         "--policy-aux-active-batch-size": "0",
         "--action-module-lr-mult": "4.0",
         "--value-lr-mult": "1.0",
@@ -209,6 +222,8 @@ def prepare(
     }
     for flag, value in replacements.items():
         _set(command, flag, value)
+    if "--ddp-find-unused-parameters" not in command:
+        command.append("--ddp-find-unused-parameters")
     _validate_geometry(command)
     source_files = {relative: base._ref(repo / relative) for relative in BOUND_SOURCE_FILES}  # noqa: SLF001
     operator = {
@@ -227,6 +242,7 @@ def prepare(
         "freeze_modules": FREEZE_MODULES.split(","),
         "required_trainable_prefixes": [TRAINABLE_PREFIX],
         "fresh_optimizer": True,
+        "ddp_find_unused_parameters": True,
     }
     manifest: dict[str, Any] = {
         "schema_version": MANIFEST_SCHEMA,
@@ -320,6 +336,7 @@ def verify(manifest_path: Path) -> dict[str, Any]:
         "freeze_modules": FREEZE_MODULES.split(","),
         "required_trainable_prefixes": [TRAINABLE_PREFIX],
         "fresh_optimizer": True,
+        "ddp_find_unused_parameters": True,
     }
     if operator != expected_operator or manifest.get("operator_sha256") != base._digest(operator):  # noqa: SLF001
         raise GatherRetrainError("target-gather operator geometry drifted")
@@ -448,6 +465,50 @@ def execute(
     return receipt
 
 
+def _verify_adapter_only_model_delta(initializer: Path, candidate: Path) -> dict[str, Any]:
+    """Prove training changed exactly the four reviewed gather tensors."""
+
+    import hashlib
+    import torch
+
+    before = torch.load(initializer, map_location="cpu", weights_only=False)
+    after = torch.load(candidate, map_location="cpu", weights_only=False)
+    before_model = before.get("model") if isinstance(before, dict) else None
+    after_model = after.get("model") if isinstance(after, dict) else None
+    if not isinstance(before_model, dict) or not isinstance(after_model, dict):
+        raise GatherRetrainError("initializer/candidate model state is malformed")
+    if set(before_model) != set(after_model):
+        raise GatherRetrainError("candidate model parameter keys drifted")
+    changed = sorted(
+        name for name in before_model if not torch.equal(before_model[name], after_model[name])
+    )
+    expected = sorted(
+        upgrade.ALLOWLIST[upgrade.MODULE_TARGET_GATHER][
+            "new_parameter_initialization"
+        ]
+    )
+    if changed != expected:
+        raise GatherRetrainError(
+            f"candidate changed tensors outside/excluding exact gather adapter: {changed}"
+        )
+    tensor_digests: dict[str, str] = {}
+    for name in changed:
+        tensor = after_model[name].detach().cpu().contiguous()
+        digest = hashlib.sha256()
+        digest.update(str(tensor.dtype).encode())
+        digest.update(json.dumps(list(tensor.shape)).encode())
+        digest.update(tensor.numpy().tobytes())
+        tensor_digests[name] = "sha256:" + digest.hexdigest()
+    evidence = {
+        "inherited_parameter_tensors": len(before_model) - len(changed),
+        "inherited_parameters_bit_identical": True,
+        "changed_parameter_tensors": changed,
+        "changed_tensor_sha256": tensor_digests,
+    }
+    evidence["model_delta_sha256"] = base._digest(evidence)  # noqa: SLF001
+    return evidence
+
+
 def finalize(
     manifest_path: Path,
     *,
@@ -458,8 +519,30 @@ def finalize(
     root = verified["output_root"]
     submission_path = root / "submission.receipt.json"
     submission = base._load(submission_path)  # noqa: SLF001
-    if submission.get("schema_version") != SUBMISSION_SCHEMA or submission.get("unit") != unit:
+    submission_unhashed = dict(submission)
+    submission_digest = submission_unhashed.pop("receipt_sha256", None)
+    if (
+        submission_digest != base._digest(submission_unhashed)  # noqa: SLF001
+        or submission.get("schema_version") != SUBMISSION_SCHEMA
+        or submission.get("unit") != unit
+        or submission.get("manifest") != verified["manifest_ref"]
+        or submission.get("command_sha256")
+        != verified["manifest"]["command_sha256"]
+        or submission.get("diagnostic_only") is not False
+        or submission.get("production_eligible") is not True
+    ):
         raise GatherRetrainError("submission receipt/unit does not match")
+    claim_path = base._verify_ref(submission.get("claim"), "submission claim")  # noqa: SLF001
+    claim = base._load(claim_path)  # noqa: SLF001
+    claim_unhashed = dict(claim)
+    claim_digest = claim_unhashed.pop("claim_sha256", None)
+    if (
+        claim_digest != base._digest(claim_unhashed)  # noqa: SLF001
+        or claim.get("schema_version") != CLAIM_SCHEMA
+        or claim.get("manifest") != verified["manifest_ref"]
+        or claim.get("unit") != unit
+    ):
+        raise GatherRetrainError("target-gather one-shot claim drifted")
     state = state_reader(
         ("systemctl", "show", unit, "--property=ActiveState,Result,ExecMainStatus"),
         text=True,
@@ -490,6 +573,17 @@ def finalize(
         "freeze_modules": FREEZE_MODULES,
         "require_only_trainable_prefixes": TRAINABLE_PREFIX,
         "action_target_gather": True,
+        "ddp_find_unused_parameters": True,
+        "ddp_shard_data": False,
+        "value_target_lambda": 1.0,
+        "forced_action_weight": 0.0,
+        "forced_row_value_weight": 1.0,
+        "winner_sample_weight": 1.0,
+        "lr_schedule": "flat",
+        "lr_warmup_steps": 100,
+        "weight_decay": 0.0,
+        "max_grad_norm": 1.0,
+        "seed": 1,
     }
     drift = {key: {"expected": value, "actual": payload.get(key)} for key, value in expected.items() if payload.get(key) != value}
     surface = payload.get("training_information_surface", {}).get(
@@ -516,6 +610,14 @@ def finalize(
         != optimizer_path.resolve(strict=True)
     ):
         raise GatherRetrainError("target-gather progress/RNG/optimizer dose drifted")
+    model_delta = _verify_adapter_only_model_delta(
+        Path(
+            verified["manifest"]["function_preserving_upgrade"][
+                "upgraded_initializer"
+            ]["path"]
+        ),
+        Path(checkpoint["path"]),
+    )
     completion = {
         "schema_version": COMPLETION_SCHEMA,
         "diagnostic_only": False,
@@ -528,6 +630,7 @@ def finalize(
         "operator_sha256": verified["manifest"]["operator_sha256"],
         "progress": base._ref(progress_path),  # noqa: SLF001
         "optimizer": base._ref(optimizer_path),  # noqa: SLF001
+        "model_delta": model_delta,
         "unit_state": fields,
     }
     completion["receipt_sha256"] = base._digest(completion)  # noqa: SLF001
