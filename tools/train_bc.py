@@ -10462,11 +10462,11 @@ def per_game_weight_quality(data: dict, weights: np.ndarray) -> dict:
     if n == 0:
         return {"n_games": 0, "rows_per_game": {}, "total_weight_per_game": {}}
     seeds = np.asarray(data.get("game_seed", np.arange(n, dtype=np.int64)), dtype=np.int64)
-    weights64 = np.asarray(weights, dtype=np.float64)
+    weight_array = np.asarray(weights)
     # Production memmaps are written game-by-game, so every game's rows form
     # one contiguous run.  Exploit that layout before falling back to the fully
     # general factorisation.  ``np.unique(..., return_inverse=True)`` allocates
-    # an int64 inverse for every row (about 381 MiB at 47.6M rows) and sorts all
+    # an int64 inverse for every row (about 363 MiB at 47.6M rows) and sorts all
     # of those rows merely to produce four scalar diagnostics.  The run path
     # allocates one boundary per game and remains exact for arbitrary seed
     # ordering.  A repeated non-contiguous seed is detected and takes the old
@@ -10478,14 +10478,16 @@ def per_game_weight_quality(data: dict, weights: np.ndarray) -> dict:
         counts = np.diff(
             np.concatenate((starts, np.asarray([n], dtype=np.int64)))
         )
-        totals = np.add.reduceat(weights64, starts)
+        # Accumulate as float64 without first materialising a float64 copy of
+        # the whole row vector (another ~363 MiB at production scale).
+        totals = np.add.reduceat(weight_array, starts, dtype=np.float64)
         unique_seed_count = len(run_seeds)
     else:
         unique_seeds, inverse, counts = np.unique(
             seeds, return_inverse=True, return_counts=True
         )
         totals = np.zeros(len(unique_seeds), dtype=np.float64)
-        np.add.at(totals, inverse, weights64)
+        np.add.at(totals, inverse, np.asarray(weight_array, dtype=np.float64))
         unique_seed_count = len(unique_seeds)
     return {
         "n_games": int(unique_seed_count),
