@@ -6,6 +6,8 @@ from catanatron.state_functions import (
     buy_dev_card,
     get_actual_victory_points,
     get_largest_army,
+    maintain_longest_road,
+    player_key,
     play_dev_card,
     player_deck_random_select,
     player_deck_replenish,
@@ -19,6 +21,27 @@ from catanatron.models.enums import (
     ActionType,
 )
 from catanatron.models.player import Color, SimplePlayer
+
+
+def test_longest_road_is_revoked_when_no_player_still_qualifies():
+    players = [SimplePlayer(Color.RED), SimplePlayer(Color.BLUE)]
+    state = State(players)
+    red_key = player_key(state, Color.RED)
+    state.player_state[f"{red_key}_HAS_ROAD"] = True
+    state.player_state[f"{red_key}_VICTORY_POINTS"] = 2
+    state.player_state[f"{red_key}_ACTUAL_VICTORY_POINTS"] = 2
+
+    maintain_longest_road(
+        state,
+        previous_road_color=Color.RED,
+        road_color=None,
+        road_lengths={Color.RED: 4, Color.BLUE: 3},
+    )
+
+    assert state.player_state[f"{red_key}_LONGEST_ROAD_LENGTH"] == 4
+    assert state.player_state[f"{red_key}_HAS_ROAD"] is False
+    assert state.player_state[f"{red_key}_VICTORY_POINTS"] == 0
+    assert state.player_state[f"{red_key}_ACTUAL_VICTORY_POINTS"] == 0
 
 
 def test_cant_steal_devcards():
