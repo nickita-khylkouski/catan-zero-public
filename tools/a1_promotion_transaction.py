@@ -24,11 +24,15 @@ import os
 import re
 import stat
 import sys
+import threading
 import time
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Iterator, Sequence
+
+
+_LOCK_STATE = threading.local()
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
@@ -388,8 +392,51 @@ def _write_new_bytes(path: Path, data: bytes) -> None:
 
 @contextmanager
 def _exclusive_lock(path: Path) -> Iterator[None]:
+    # Contract verification may replay a post-promotion handoff while the
+    # transaction already holds this exact registry lock.  ``flock`` is not
+    # reentrant across separately opened file descriptions, so blindly opening
+    # the lock again makes a transaction reject itself.  Reuse is deliberately
+    # narrower than process-wide: only the same PID, thread, and absolute path
+    # may nest.  Other threads and processes still contend on the kernel lock.
+    absolute_path = Path(os.path.abspath(os.fspath(path)))
+    key = (os.getpid(), threading.get_ident(), os.fspath(absolute_path))
+    held = getattr(_LOCK_STATE, "held", None)
+    if held is None:
+        held = {}
+        _LOCK_STATE.held = held
+    inherited = held.get(key)
+    if inherited is not None:
+        opened_dev, opened_ino, depth = inherited
+        named = absolute_path.stat(follow_symlinks=False)
+        if (
+            not stat.S_ISREG(named.st_mode)
+            or (named.st_dev, named.st_ino) != (opened_dev, opened_ino)
+        ):
+            raise PromotionError(f"promotion lock identity drifted: {absolute_path}")
+        held[key] = (opened_dev, opened_ino, depth + 1)
+        try:
+            yield
+            named = absolute_path.stat(follow_symlinks=False)
+            if (
+                not stat.S_ISREG(named.st_mode)
+                or (named.st_dev, named.st_ino) != (opened_dev, opened_ino)
+            ):
+                raise PromotionError(
+                    f"promotion lock identity drifted: {absolute_path}"
+                )
+        finally:
+            current = held.get(key)
+            if current is not None:
+                if current[2] <= 2:
+                    held[key] = (opened_dev, opened_ino, 1)
+                else:
+                    held[key] = (opened_dev, opened_ino, current[2] - 1)
+        return
+
+    path = absolute_path
     path.parent.mkdir(parents=True, exist_ok=True)
     created = False
+    registered = False
     try:
         descriptor = os.open(
             path,
@@ -415,6 +462,8 @@ def _exclusive_lock(path: Path) -> Iterator[None]:
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as error:
             raise PromotionError(f"promotion lock is already held: {path}") from error
+        held[key] = (opened.st_dev, opened.st_ino, 1)
+        registered = True
         yield
         named = path.stat(follow_symlinks=False)
         if (
@@ -423,6 +472,8 @@ def _exclusive_lock(path: Path) -> Iterator[None]:
         ):
             raise PromotionError(f"promotion lock identity drifted: {path}")
     finally:
+        if registered:
+            held.pop(key, None)
         try:
             fcntl.flock(descriptor, fcntl.LOCK_UN)
         finally:

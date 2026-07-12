@@ -4,6 +4,7 @@ import fcntl
 import hashlib
 import json
 import os
+import threading
 from pathlib import Path
 
 import pytest
@@ -2547,6 +2548,130 @@ def test_exclusive_lock_refuses_a_second_writer(tmp_path: Path) -> None:
     finally:
         fcntl.flock(descriptor, fcntl.LOCK_UN)
         os.close(descriptor)
+
+
+def test_exclusive_lock_allows_same_thread_nested_replay(tmp_path: Path) -> None:
+    lock = tmp_path / "promotion.lock"
+    with promotion._exclusive_lock(lock):
+        with promotion._exclusive_lock(lock):
+            assert lock.is_file()
+
+
+def test_execute_dry_run_allows_verifier_to_reenter_registry_lock(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path)
+
+    def verify(path: Path, *, require_all_job_claims: bool = False) -> dict:
+        assert path == fixture["contract_path"]
+        assert require_all_job_claims is True
+        with promotion._exclusive_lock(fixture["lock"]):
+            assert fixture["lock"].is_file()
+        return fixture["contract"]
+
+    result = promotion.execute_promotion(
+        registry_path=fixture["registry"],
+        current_pointer=fixture["pointer"],
+        contract_lock=fixture["contract_path"],
+        adjudication_path=fixture["adjudication"],
+        training_receipt=fixture["training_receipt"],
+        cohort_exclusions=fixture["cohort_exclusions"],
+        receipt_path=fixture["receipt"],
+        reason="A1 typed promotion",
+        lock_path=fixture["lock"],
+        go=False,
+        verify_lock_fn=verify,
+    )
+
+    assert result["status"] == "dry_run"
+    assert not fixture["receipt"].exists()
+
+
+def test_execute_go_allows_verifier_to_reenter_registry_lock(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path)
+
+    def verify(path: Path, *, require_all_job_claims: bool = False) -> dict:
+        assert path == fixture["contract_path"]
+        assert require_all_job_claims is True
+        with promotion._exclusive_lock(fixture["lock"]):
+            pass
+        return fixture["contract"]
+
+    result = promotion.execute_promotion(
+        registry_path=fixture["registry"],
+        current_pointer=fixture["pointer"],
+        contract_lock=fixture["contract_path"],
+        adjudication_path=fixture["adjudication"],
+        training_receipt=fixture["training_receipt"],
+        cohort_exclusions=fixture["cohort_exclusions"],
+        receipt_path=fixture["receipt"],
+        reason="A1 typed promotion",
+        lock_path=fixture["lock"],
+        go=True,
+        verify_lock_fn=verify,
+    )
+
+    assert result["status"] == "committed"
+    assert fixture["receipt"].is_file()
+
+
+def test_exclusive_lock_nested_exception_does_not_leak_depth(tmp_path: Path) -> None:
+    lock = tmp_path / "promotion.lock"
+    with promotion._exclusive_lock(lock):
+        with pytest.raises(RuntimeError, match="nested failure"):
+            with promotion._exclusive_lock(lock):
+                raise RuntimeError("nested failure")
+        result: list[str] = []
+
+        def contend() -> None:
+            try:
+                with promotion._exclusive_lock(lock):
+                    result.append("acquired")
+            except promotion.PromotionError as error:
+                result.append(str(error))
+
+        thread = threading.Thread(target=contend)
+        thread.start()
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+        assert len(result) == 1
+        assert "already held" in result[0]
+        with promotion._exclusive_lock(lock):
+            pass
+    with promotion._exclusive_lock(lock):
+        pass
+
+
+def test_exclusive_lock_still_refuses_competing_thread(tmp_path: Path) -> None:
+    lock = tmp_path / "promotion.lock"
+    result: list[str] = []
+
+    def contend() -> None:
+        try:
+            with promotion._exclusive_lock(lock):
+                result.append("acquired")
+        except promotion.PromotionError as error:
+            result.append(str(error))
+
+    with promotion._exclusive_lock(lock):
+        thread = threading.Thread(target=contend)
+        thread.start()
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+    assert len(result) == 1
+    assert "already held" in result[0]
+
+
+def test_nested_exclusive_lock_revalidates_named_inode(tmp_path: Path) -> None:
+    lock = tmp_path / "promotion.lock"
+    with pytest.raises(promotion.PromotionError, match="identity drifted"):
+        with promotion._exclusive_lock(lock):
+            with promotion._exclusive_lock(lock):
+                replacement = tmp_path / "replacement.lock"
+                replacement.write_text("", encoding="utf-8")
+                os.replace(replacement, lock)
 
 
 def test_exclusive_lock_rejects_symlink_and_revalidates_named_inode(
