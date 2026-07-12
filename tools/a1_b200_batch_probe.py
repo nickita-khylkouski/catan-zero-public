@@ -404,7 +404,10 @@ def _without_mps(*, runner=subprocess.run):
 
 
 def _gpu_samples(path: Path) -> dict[str, float | int]:
-    rows = list(csv.DictReader(path.open(encoding="utf-8")))
+    # nvidia-smi emits a space after each comma in both the header and rows.
+    # Without skipinitialspace all queried names except ``timestamp`` carry a
+    # leading space and silently produce zero-valued telemetry.
+    rows = list(csv.DictReader(path.open(encoding="utf-8"), skipinitialspace=True))
 
     def numeric(key: str) -> list[float]:
         return [float(row[key]) for row in rows if row.get(key, "").strip()]

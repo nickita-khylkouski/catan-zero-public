@@ -316,6 +316,22 @@ def test_train_bc_probe_authorization_rejects_lr_scaling(
         train_bc._validate_a1_batch_probe_authorization(args, effective)  # noqa: SLF001
 
 
+def test_gpu_samples_parses_nvidia_smi_spaced_csv(tmp_path: Path) -> None:
+    telemetry = tmp_path / "gpu.csv"
+    telemetry.write_text(
+        "timestamp, index, utilization.gpu [%], power.draw [W], memory.used [MiB]\n"
+        "2026/07/12 00:00:00.000, 0, 80, 600.0, 22000\n"
+        "2026/07/12 00:00:00.000, 1, 100, 700.0, 24000\n",
+        encoding="utf-8",
+    )
+
+    result = probe._gpu_samples(telemetry)  # noqa: SLF001
+
+    assert result["sm_util_mean_pct"] == 90.0
+    assert result["power_mean_w"] == 650.0
+    assert result["hbm_memory_mean_mib"] == 23000.0
+
+
 def test_gpu_occupancy_allows_only_mps_server() -> None:
     def runner(command: list[str], **_kwargs: object):
         return probe.subprocess.CompletedProcess(
