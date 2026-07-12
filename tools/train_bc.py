@@ -1499,12 +1499,24 @@ def _preflight_memmap_composite_descriptor(path: str | Path) -> dict[str, object
     if not isinstance(raw_components, list) or len(raw_components) != 2:
         raise SystemExit("memmap composite v1 requires exactly two ordered components")
     overrides = descriptor.get("learner_recipe_overrides")
-    if not isinstance(overrides, dict) or set(overrides) != {
+    required_override_fields = {
         "per_game_policy_weight", "per_game_policy_weight_mode",
-    }:
+    }
+    allowed_override_fields = {
+        *required_override_fields,
+        "forced_row_value_weight", "hlgauss_scalar_aux_loss_weight", "loser_sample_weight",
+        "lr", "per_game_value_weight", "per_game_value_weight_mode",
+        "value_categorical_bins", "value_categorical_loss_weight",
+        "value_head_type", "value_hlgauss_sigma_ratio", "value_loss_weight",
+    }
+    if (
+        not isinstance(overrides, dict)
+        or not required_override_fields.issubset(overrides)
+        or not set(overrides).issubset(allowed_override_fields)
+    ):
         raise SystemExit(
-            "memmap composite learner_recipe_overrides must bind exactly "
-            "per-game policy weighting"
+            "memmap composite learner_recipe_overrides must bind per-game policy "
+            "weighting and may contain only supported diagnostic recipe fields"
         )
     if not isinstance(overrides["per_game_policy_weight"], bool) or overrides[
         "per_game_policy_weight_mode"
@@ -1584,9 +1596,26 @@ def _validate_composite_learner_recipe_authorization(
     args: argparse.Namespace, composite_meta: dict[str, object]
 ) -> None:
     expected = composite_meta.get("learner_recipe_overrides")
+    if not isinstance(expected, dict):
+        raise SystemExit("memmap composite has no authenticated learner recipe override")
+    converters = {
+        "forced_row_value_weight": float,
+        "hlgauss_scalar_aux_loss_weight": float,
+        "loser_sample_weight": float,
+        "lr": float,
+        "per_game_policy_weight": bool,
+        "per_game_policy_weight_mode": str,
+        "per_game_value_weight": bool,
+        "per_game_value_weight_mode": str,
+        "value_categorical_bins": int,
+        "value_categorical_loss_weight": float,
+        "value_head_type": str,
+        "value_hlgauss_sigma_ratio": float,
+        "value_loss_weight": float,
+    }
     actual = {
-        "per_game_policy_weight": bool(args.per_game_policy_weight),
-        "per_game_policy_weight_mode": str(args.per_game_policy_weight_mode),
+        key: converters[key](getattr(args, key))
+        for key in expected
     }
     if expected != actual:
         raise SystemExit(
