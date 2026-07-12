@@ -37,6 +37,9 @@ M=configs/a1_h100_eval_fleet.json
 $PY "$CTL" --manifest "$M" plan \
   --candidate /immutable/a1/candidate.pt \
   --champion /immutable/champion/champion.pt \
+  --candidate-parent /immutable/champion/champion.pt \
+  --registry /immutable/champion/champion_registry.json \
+  --candidate-c-scale 0.10 --champion-c-scale 0.10 \
   --internal-base-seed <VAL_ONLY_INTERNAL_BASE> \
   --external-base-seed <VAL_ONLY_EXTERNAL_BASE> \
   --iteration-id a1-infoset-n128-v133 \
@@ -52,6 +55,14 @@ $PY "$CTL" --manifest "$M" status --plan /immutable/a1/eval.plan.json \
 $PY "$CTL" --manifest "$M" collect --plan /immutable/a1/eval.plan.json \
   --phase internal --output-dir /immutable/a1/evaluation
 ```
+
+The default `promotion_parent` mode requires the authenticated candidate
+parent/init checkpoint, the internal baseline, and the registry's
+`generator_champion` agent identity to name the same bytes. A diagnostic panel
+against an older checkpoint must explicitly use
+`--comparison-mode historical_comparison` and
+`--historical-comparison-reason ...`; such a plan is sealed
+`promotion_eligible=false` and promotion artifact construction rejects it.
 
 Before the full plan, use `--scope canary` with 24 internal pairs and 12
 external pairs. That exercises every GPU on `c1` (4 GPUs) and `h100-8a` (8

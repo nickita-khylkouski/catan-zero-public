@@ -36,6 +36,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from tools import a1_evaluation_pool as evaluation_pool  # noqa: E402
+from tools.champion_registry import ChampionRegistry  # noqa: E402
 from tools.prelaunch_guard import VAL_ONLY_SEED_RANGE  # noqa: E402
 
 
@@ -106,6 +107,8 @@ def _run_id_from_plan_fields(plan: dict[str, Any]) -> str:
         "tool_hashes": plan["tool_hashes"],
         "candidate_sha256": plan["candidate"]["sha256"],
         "champion_sha256": plan["champion"]["sha256"],
+        "evaluation_binding": plan["evaluation_binding"],
+        "engine_identity": plan["engine_identity"],
         "science_hash": plan["science_config_hash"],
         "internal_pairs": plan["pair_claims"]["internal"]["pairs"],
         "external_pairs": plan["pair_claims"]["external_matched"]["pairs"],
@@ -133,6 +136,111 @@ def _sha256(path: Path) -> str:
     return "sha256:" + digest.hexdigest()
 
 
+def _md5(path: Path) -> str:
+    digest = hashlib.md5()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _checkpoint_ref(path: Path) -> dict[str, str]:
+    path = path.expanduser().resolve(strict=True)
+    return {"path": str(path), "sha256": _sha256(path)}
+
+
+def _evaluation_binding(
+    *,
+    candidate_parent: Path,
+    baseline: Path,
+    registry: ChampionRegistry,
+    comparison_mode: str,
+    historical_comparison_reason: str | None,
+    champion_c_scale: float,
+) -> dict[str, Any]:
+    """Bind the causal parent, comparison baseline, and registry incumbent.
+
+    Promotion-grade evaluation is deliberately strict: the candidate's parent,
+    the internal baseline, and the authoritative generator champion must be the
+    same checkpoint.  A different historical baseline is diagnostic-only and
+    requires an explicit typed mode plus a nonempty reason.
+    """
+    if comparison_mode not in {"promotion_parent", "historical_comparison"}:
+        raise FleetError(f"unknown evaluation comparison mode {comparison_mode!r}")
+    parent_ref = _checkpoint_ref(candidate_parent)
+    baseline_ref = _checkpoint_ref(baseline)
+    pointer = registry.get_role("generator_champion")
+    if pointer is None:
+        raise FleetError("authoritative registry has no generator_champion")
+    incumbent_path = Path(pointer.checkpoint_path).expanduser().resolve(strict=True)
+    if pointer.md5 != _md5(incumbent_path):
+        raise FleetError("registry generator_champion MD5 differs from its bytes")
+    search_config = pointer.provenance.get("a1_candidate_search_config")
+    identity_sha = pointer.provenance.get("a1_candidate_agent_identity_sha256")
+    if not isinstance(search_config, dict) or not search_config:
+        raise FleetError("registry incumbent has no bound search operator identity")
+    if not isinstance(identity_sha, str) or not re.fullmatch(
+        r"sha256:[0-9a-f]{64}", identity_sha
+    ):
+        raise FleetError("registry incumbent has no valid agent identity digest")
+    incumbent_ref = _checkpoint_ref(incumbent_path)
+    expected_identity = _digest(
+        {
+            "schema_version": "a1-deployed-agent-search-config-v1",
+            "checkpoint": incumbent_ref,
+            "search_config": search_config,
+        }
+    )
+    if identity_sha != expected_identity:
+        raise FleetError(
+            "registry incumbent identity does not bind its checkpoint and search config"
+        )
+    if comparison_mode == "promotion_parent":
+        if historical_comparison_reason is not None:
+            raise FleetError("promotion-parent evaluation cannot carry a historical reason")
+        if parent_ref != baseline_ref:
+            raise FleetError(
+                "promotion baseline differs from candidate parent/init checkpoint"
+            )
+        if baseline_ref != incumbent_ref:
+            raise FleetError(
+                "promotion baseline differs from authoritative registry incumbent"
+            )
+        try:
+            incumbent_c_scale = float(search_config["c_scale"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise FleetError("registry incumbent has no valid c_scale") from error
+        if incumbent_c_scale != float(champion_c_scale):
+            raise FleetError(
+                "explicit champion c_scale differs from registry incumbent identity"
+            )
+        promotion_eligible = True
+    else:
+        if not isinstance(historical_comparison_reason, str) or not historical_comparison_reason.strip():
+            raise FleetError(
+                "historical comparison requires an explicit nonempty reason"
+            )
+        promotion_eligible = False
+    return {
+        "schema_version": "a1-evaluation-baseline-binding-v1",
+        "comparison_mode": comparison_mode,
+        "promotion_eligible": promotion_eligible,
+        "historical_comparison_reason": historical_comparison_reason,
+        "candidate_parent": parent_ref,
+        "baseline": baseline_ref,
+        "registry": {
+            "path": str(registry.path.expanduser().resolve(strict=True)),
+            "sha256": _sha256(registry.path.expanduser().resolve(strict=True)),
+        },
+        "authoritative_incumbent": {
+            **incumbent_ref,
+            "version": pointer.version,
+            "agent_identity_sha256": identity_sha,
+            "search_config": search_config,
+        },
+    }
+
+
 def _read_json(path: Path) -> dict[str, Any]:
     try:
         value = json.loads(path.expanduser().read_text(encoding="utf-8"))
@@ -152,7 +260,9 @@ def _absolute(value: Any, *, field: str) -> str:
     return str(path)
 
 
-def load_manifest(path: Path) -> dict[str, Any]:
+def load_manifest(
+    path: Path, *, expected_shapes: dict[str, int] | None = None
+) -> dict[str, Any]:
     manifest = _read_json(path)
     if manifest.get("schema_version") != MANIFEST_SCHEMA:
         raise FleetError(f"unsupported fleet manifest schema in {path}")
@@ -196,10 +306,11 @@ def load_manifest(path: Path) -> dict[str, Any]:
     actual = {host["alias"]: host["gpu_count"] for host in hosts}
     if len(actual) != len(hosts):
         raise FleetError("fleet manifest contains duplicate aliases")
-    if actual != EXPECTED_SHAPES:
+    approved_shapes = EXPECTED_SHAPES if expected_shapes is None else expected_shapes
+    if actual != approved_shapes:
         raise FleetError(
-            "A1 eval requires exactly six 4xH100 and two 8xH100 hosts: "
-            f"expected {EXPECTED_SHAPES}, got {actual}"
+            "A1 eval manifest differs from its exact approved fleet shape: "
+            f"expected {approved_shapes}, got {actual}"
         )
     manifest["hosts"] = sorted(hosts, key=lambda item: item["alias"])
     manifest["manifest_hash"] = _digest(
@@ -219,7 +330,7 @@ def gpu_slots(manifest: dict[str, Any]) -> list[dict[str, Any]]:
         for host in manifest["hosts"]
         for gpu in range(int(host["gpu_count"]))
     ]
-    expected_slots = sum(EXPECTED_SHAPES.values())
+    expected_slots = sum(int(host["gpu_count"]) for host in manifest["hosts"])
     if len(slots) != expected_slots:
         raise FleetError(
             f"A1 eval manifest resolved {len(slots)} GPUs, expected {expected_slots}"
@@ -394,6 +505,7 @@ def _external_argv(
     artifact_dir: str,
     out: str,
     c_scale: float = 0.03,
+    engine_identity: dict[str, str],
 ) -> list[str]:
     return [
         python,
@@ -404,6 +516,12 @@ def _external_argv(
         "catanatron_value",
         "--mode",
         "search",
+        "--engine-repo-commit",
+        engine_identity["repo_commit"],
+        "--native-wheel-sha256",
+        engine_identity["native_wheel_sha256"],
+        "--python-referee-sha256",
+        engine_identity["python_referee_sha256"],
         "--vps-to-win",
         "10",
         "--max-player-trade-offers-per-turn",
@@ -448,11 +566,38 @@ def _tool_hashes(repo_root: Path) -> dict[str, str]:
     return {name: _sha256(repo_root / name) for name in names}
 
 
+def _engine_identity(repo_root: Path, repo_commit: str) -> dict[str, str]:
+    inventory = repo_root / "native/catanatron-rs/WHEEL_SHA256SUMS"
+    rows = [line.split() for line in inventory.read_text(encoding="utf-8").splitlines() if line.strip()]
+    if len(rows) != 1 or len(rows[0]) != 2 or not re.fullmatch(r"[0-9a-f]{64}", rows[0][0]):
+        raise FleetError("native wheel checksum inventory is not one sealed wheel")
+    referee_root = repo_root / "vendor/catanatron/catanatron"
+    referee_files = sorted(path for path in referee_root.rglob("*.py") if path.is_file())
+    if not referee_files:
+        raise FleetError("vendored Python referee source tree is empty")
+    referee_hasher = hashlib.sha256()
+    for path in referee_files:
+        relative = path.relative_to(referee_root).as_posix().encode("utf-8")
+        referee_hasher.update(len(relative).to_bytes(8, "big"))
+        referee_hasher.update(relative)
+        payload = path.read_bytes()
+        referee_hasher.update(len(payload).to_bytes(8, "big"))
+        referee_hasher.update(payload)
+    return {
+        "schema_version": "a1-neutral-engine-identity-v1",
+        "repo_commit": repo_commit,
+        "native_wheel_sha256": "sha256:" + rows[0][0],
+        "python_referee_sha256": "sha256:" + referee_hasher.hexdigest(),
+    }
+
+
 def build_plan(
     manifest: dict[str, Any],
     *,
     candidate: Path,
     champion: Path,
+    candidate_parent: Path,
+    registry: ChampionRegistry,
     internal_pairs: int,
     external_pairs: int,
     internal_base_seed: int,
@@ -466,6 +611,8 @@ def build_plan(
     tool_hashes: dict[str, str] | None = None,
     candidate_c_scale: float = 0.03,
     champion_c_scale: float = 0.03,
+    comparison_mode: str = "promotion_parent",
+    historical_comparison_reason: str | None = None,
 ) -> dict[str, Any]:
     candidate = candidate.expanduser().resolve(strict=True)
     champion = champion.expanduser().resolve(strict=True)
@@ -518,6 +665,14 @@ def build_plan(
         candidate_c_scale=candidate_c_scale,
         champion_c_scale=champion_c_scale,
     )
+    evaluation_binding = _evaluation_binding(
+        candidate_parent=candidate_parent,
+        baseline=champion,
+        registry=registry,
+        comparison_mode=comparison_mode,
+        historical_comparison_reason=historical_comparison_reason,
+        champion_c_scale=role_search_config["champion"]["c_scale"],
+    )
     science_hash = _digest(
         {
             "science_config": SCIENCE_CONFIG,
@@ -526,12 +681,15 @@ def build_plan(
     )
     resolved_repo_commit = repo_commit or _git_commit(repo_root)
     resolved_tool_hashes = tool_hashes or _tool_hashes(repo_root)
+    engine_identity = _engine_identity(repo_root, resolved_repo_commit)
     run_identity = {
         "manifest_hash": manifest["manifest_hash"],
         "repo_commit": resolved_repo_commit,
         "tool_hashes": resolved_tool_hashes,
         "candidate": {"sha256": candidate_sha},
         "champion": {"sha256": champion_sha},
+        "evaluation_binding": evaluation_binding,
+        "engine_identity": engine_identity,
         "science_config_hash": science_hash,
         "role_search_config": role_search_config,
         "pair_claims": {
@@ -612,6 +770,7 @@ def build_plan(
                 artifact_dir=f"{job_dir}/games",
                 out=f"{job_dir}/report.json",
                 c_scale=role_search_config[role]["c_scale"],
+                engine_identity=engine_identity,
             )
             jobs.append(
                 {
@@ -640,6 +799,8 @@ def build_plan(
         "science_config": SCIENCE_CONFIG,
         "science_config_hash": science_hash,
         "role_search_config": role_search_config,
+        "evaluation_binding": evaluation_binding,
+        "engine_identity": engine_identity,
         "workers_per_gpu": workers_per_gpu,
         "candidate": {
             "source": str(candidate),
@@ -688,6 +849,29 @@ def write_new_readonly_or_identical(path: Path, value: dict[str, Any]) -> None:
     write_new_readonly(path, value)
 
 
+def _verify_plan_evaluation_binding(plan: dict[str, Any]) -> None:
+    raw = plan.get("evaluation_binding")
+    if not isinstance(raw, dict):
+        raise FleetError("evaluation plan has no typed baseline binding")
+    registry_ref = raw.get("registry")
+    parent_ref = raw.get("candidate_parent")
+    if not isinstance(registry_ref, dict) or not isinstance(parent_ref, dict):
+        raise FleetError("evaluation plan baseline binding is malformed")
+    registry_path = Path(str(registry_ref.get("path"))).expanduser().resolve(strict=True)
+    if _sha256(registry_path) != registry_ref.get("sha256"):
+        raise FleetError("evaluation registry bytes drifted after planning")
+    expected = _evaluation_binding(
+        candidate_parent=Path(str(parent_ref.get("path"))),
+        baseline=Path(str(plan["champion"]["source"])),
+        registry=ChampionRegistry.load(registry_path),
+        comparison_mode=str(raw.get("comparison_mode")),
+        historical_comparison_reason=raw.get("historical_comparison_reason"),
+        champion_c_scale=_plan_role_search_config(plan)["champion"]["c_scale"],
+    )
+    if _canonical(raw) != _canonical(expected):
+        raise FleetError("evaluation plan baseline binding does not replay")
+
+
 def load_plan(path: Path, manifest: dict[str, Any]) -> dict[str, Any]:
     plan = _read_json(path)
     if plan.get("schema_version") != PLAN_SCHEMA:
@@ -703,6 +887,11 @@ def load_plan(path: Path, manifest: dict[str, Any]) -> dict[str, Any]:
     if plan.get("science_config") != SCIENCE_CONFIG:
         raise FleetError("evaluation plan science config drift")
     _plan_role_search_config(plan)
+    _verify_plan_evaluation_binding(plan)
+    if plan.get("engine_identity") != _engine_identity(
+        _REPO_ROOT, str(plan.get("repo_commit"))
+    ):
+        raise FleetError("evaluation plan engine identity does not replay")
     if plan.get("science_config_hash") != _science_hash(plan):
         raise FleetError("evaluation plan science config drift")
     if plan.get("run_id") != _run_id_from_plan_fields(plan):
@@ -835,9 +1024,10 @@ def _validate_planned_jobs(plan: dict[str, Any], manifest: dict[str, Any]) -> No
                 seed=seed,
                 workers=int(plan["workers_per_gpu"]),
                 artifact_dir=f"{job['job_dir']}/games",
-                out=job["report"],
-                c_scale=role_search_config[role]["c_scale"],
-            )
+                    out=job["report"],
+                    c_scale=role_search_config[role]["c_scale"],
+                    engine_identity=plan["engine_identity"],
+                )
             if (
                 job["role"] != role
                 or job["cohort_id"] != f"cohort-{cohort:02d}"
@@ -1091,6 +1281,18 @@ def _preflight_command(
         "set -euo pipefail",
         f"cd {repo}",
         f'test "$(git rev-parse HEAD)" = {shlex.quote(plan["repo_commit"])}',
+        "git diff --quiet --exit-code -- .",
+        "git diff --cached --quiet --exit-code -- .",
+        (
+            "grep -Fxq "
+            + shlex.quote(
+                plan["engine_identity"]["native_wheel_sha256"].removeprefix(
+                    "sha256:"
+                )
+                + "  catanatron_rs-0.1.5-cp311-cp311-manylinux_2_34_x86_64.whl"
+            )
+            + " native/catanatron-rs/WHEEL_SHA256SUMS"
+        ),
         f'test "$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)" -eq {host["gpu_count"]}',
         "test \"$(nvidia-smi --query-gpu=name --format=csv,noheader | grep -vc 'H100')\" -eq 0",
         # A healthy idle fleet keeps one MPS server attached to every GPU.
@@ -1513,6 +1715,8 @@ def collect_phase(
             candidate=Path(plan["candidate"]["remote"]),
             champion=Path(plan["champion"]["remote"]),
         )
+        result["evaluation_binding"] = plan["evaluation_binding"]
+        result["planned_engine_identity"] = plan["engine_identity"]
         destination = pooled_dir / "internal.json"
         write_new_readonly_or_identical(destination, result)
         outputs = {"internal": str(destination)}
@@ -1526,6 +1730,8 @@ def collect_phase(
             result = evaluation_pool.pool_neutral(
                 by_role[role], checkpoint=Path(plan[role]["remote"])
             )
+            result["evaluation_binding"] = plan["evaluation_binding"]
+            result["planned_engine_identity"] = plan["engine_identity"]
             destination = pooled_dir / f"external-{role}.json"
             write_new_readonly_or_identical(destination, result)
             outputs[role] = str(destination)
@@ -1584,6 +1790,19 @@ def _parser() -> argparse.ArgumentParser:
     plan = commands.add_parser("plan")
     plan.add_argument("--candidate", type=Path, required=True)
     plan.add_argument("--champion", type=Path, required=True)
+    plan.add_argument(
+        "--candidate-parent",
+        type=Path,
+        required=True,
+        help="Authenticated parent/init checkpoint from the candidate training receipt.",
+    )
+    plan.add_argument("--registry", type=Path, required=True)
+    plan.add_argument(
+        "--comparison-mode",
+        choices=("promotion_parent", "historical_comparison"),
+        default="promotion_parent",
+    )
+    plan.add_argument("--historical-comparison-reason")
     plan.add_argument("--internal-pairs", type=int, default=600)
     plan.add_argument("--external-pairs", type=int, default=500)
     plan.add_argument("--internal-base-seed", type=int, required=True)
@@ -1646,6 +1865,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 manifest,
                 candidate=args.candidate,
                 champion=args.champion,
+                candidate_parent=args.candidate_parent,
+                registry=ChampionRegistry.load(args.registry),
                 internal_pairs=args.internal_pairs,
                 external_pairs=args.external_pairs,
                 internal_base_seed=args.internal_base_seed,
@@ -1656,6 +1877,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 scope=args.scope,
                 candidate_c_scale=args.candidate_c_scale,
                 champion_c_scale=args.champion_c_scale,
+                comparison_mode=args.comparison_mode,
+                historical_comparison_reason=args.historical_comparison_reason,
             )
             write_new_readonly(args.out, value)
             result = {

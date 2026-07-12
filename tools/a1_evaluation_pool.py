@@ -102,6 +102,7 @@ def _neutral_effective_search_config(
         "stratum": report.get("stratum"),
         "harness": report.get("harness"),
         "referee_engine": report.get("referee_engine"),
+        "engine_identity": report.get("engine_identity"),
         "baseline_bot": report.get("baseline_bot"),
         "mode": report.get("mode"),
         "map_kind": report.get("map_kind"),

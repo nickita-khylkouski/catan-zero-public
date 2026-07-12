@@ -395,6 +395,33 @@ def test_neutral_search_runtime_and_fingerprint_share_d6_adaptive_recipe() -> No
     )
 
 
+def test_retry_fingerprint_changes_across_engine_build_identity() -> None:
+    args = build_parser().parse_args(
+        [
+            "--checkpoint",
+            "checkpoint.pt",
+            "--opponent",
+            "random",
+            "--mode",
+            "search",
+            "--out",
+            "out.json",
+            "--engine-repo-commit",
+            "a" * 40,
+            "--native-wheel-sha256",
+            "sha256:" + "b" * 64,
+            "--python-referee-sha256",
+            "sha256:" + "c" * 64,
+        ]
+    )
+    args.native_runtime_sha256 = "sha256:" + "d" * 64
+    first = _game_semantics(args, "checkpoint-md5", "sha256:" + "1" * 64)
+    args.engine_repo_commit = "e" * 40
+    second = _game_semantics(args, "checkpoint-md5", "sha256:" + "1" * 64)
+    assert first["engine_identity"]["native_runtime_sha256"] == "sha256:" + "d" * 64
+    assert _run_fingerprint(first) != _run_fingerprint(second)
+
+
 def test_search_evaluator_receives_explicit_categorical_readout(monkeypatch) -> None:
     captured = {}
 

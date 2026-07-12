@@ -1853,6 +1853,79 @@ def _verify_agent_identity(
     return value
 
 
+def _verify_evaluation_baseline_binding(
+    raw: Any,
+    *,
+    champion_path: Path,
+    champion_sha256: str,
+    champion_search_config: dict[str, Any],
+    base: Path,
+    where: str,
+) -> dict[str, Any]:
+    value = _require_exact_keys(
+        raw,
+        {
+            "schema_version",
+            "comparison_mode",
+            "promotion_eligible",
+            "historical_comparison_reason",
+            "candidate_parent",
+            "baseline",
+            "registry",
+            "authoritative_incumbent",
+        },
+        where=where,
+    )
+    if (
+        value["schema_version"] != "a1-evaluation-baseline-binding-v1"
+        or value["comparison_mode"] != "promotion_parent"
+        or value["promotion_eligible"] is not True
+        or value["historical_comparison_reason"] is not None
+    ):
+        raise PromotionError(f"{where} is not a promotion-parent evaluation binding")
+    for label in ("candidate_parent", "baseline"):
+        _verify_bound_checkpoint(
+            value[label],
+            expected_path=champion_path,
+            expected_sha256=champion_sha256,
+            where=f"{where}.{label}",
+            base=base,
+        )
+    _validate_file_ref(value["registry"], base=base, where=f"{where}.registry")
+    incumbent = _require_exact_keys(
+        value["authoritative_incumbent"],
+        {
+            "path",
+            "sha256",
+            "version",
+            "agent_identity_sha256",
+            "search_config",
+        },
+        where=f"{where}.authoritative_incumbent",
+    )
+    _verify_bound_checkpoint(
+        {"path": incumbent["path"], "sha256": incumbent["sha256"]},
+        expected_path=champion_path,
+        expected_sha256=champion_sha256,
+        where=f"{where}.authoritative_incumbent",
+        base=base,
+    )
+    _verify_role_search_config(
+        incumbent["search_config"],
+        expected_search_config=champion_search_config,
+        where=f"{where}.authoritative_incumbent.search_config",
+    )
+    expected_identity = _agent_identity(
+        {"path": str(champion_path), "sha256": champion_sha256},
+        champion_search_config,
+    )["agent_identity_sha256"]
+    if incumbent["agent_identity_sha256"] != expected_identity:
+        raise PromotionError(
+            f"{where} incumbent identity does not bind the adjudicated champion"
+        )
+    return value
+
+
 def _sealed_evaluation_semantics(contract: dict[str, Any]) -> dict[str, Any]:
     """Project the immutable A1 lock into deterministic evaluation semantics.
 
@@ -1958,6 +2031,14 @@ def _verify_internal_h2h_source(
     candidate_search_config: dict[str, Any],
     champion_search_config: dict[str, Any],
 ) -> None:
+    _verify_evaluation_baseline_binding(
+        payload.get("evaluation_binding"),
+        champion_path=champion,
+        champion_sha256=_sha256(champion),
+        champion_search_config=champion_search_config,
+        base=champion.parent,
+        where=f"{where}.evaluation_binding",
+    )
     if (
         _absolute(payload.get("candidate_checkpoint"), base=candidate.parent)
         != candidate
@@ -3018,6 +3099,48 @@ def _verify_promotion_evidence(
             raise PromotionError("external panel source roles mismatch")
         candidate_panel = source_by_role["candidate_panel"][1]
         champion_panel = source_by_role["champion_panel"][1]
+        for panel_name, panel in (
+            ("candidate external panel", candidate_panel),
+            ("champion external panel", champion_panel),
+        ):
+            _verify_evaluation_baseline_binding(
+                panel.get("evaluation_binding"),
+                champion_path=champion_path,
+                champion_sha256=champion["sha256"],
+                champion_search_config=champion["search_config"],
+                base=champion_path.parent,
+                where=f"{panel_name}.evaluation_binding",
+            )
+            planned_engine = _require_exact_keys(
+                panel.get("planned_engine_identity"),
+                {
+                    "schema_version",
+                    "repo_commit",
+                    "native_wheel_sha256",
+                    "python_referee_sha256",
+                },
+                where=f"{panel_name}.planned_engine_identity",
+            )
+            actual_engine = _require_exact_keys(
+                panel.get("engine_identity"),
+                {
+                    "schema_version",
+                    "repo_commit",
+                    "native_wheel_sha256",
+                    "native_runtime_sha256",
+                    "python_referee_sha256",
+                },
+                where=f"{panel_name}.engine_identity",
+            )
+            for key, expected in planned_engine.items():
+                if actual_engine.get(key) != expected:
+                    raise PromotionError(
+                        f"{panel_name} runtime engine identity drift at {key}"
+                    )
+            _validate_sha256(
+                actual_engine["native_runtime_sha256"],
+                where=f"{panel_name}.engine_identity.native_runtime_sha256",
+            )
         if (
             candidate_panel.get("baseline_bot") != "catanatron_value"
             or champion_panel.get("baseline_bot") != "catanatron_value"
@@ -3158,7 +3281,7 @@ def _verify_adjudication(
     training_path, training_ref = _validate_file_ref(
         candidate_raw["training_report"], base=base, where="candidate.training_report"
     )
-    _verify_training_report(
+    training_report_payload = _verify_training_report(
         training_path,
         contract=contract,
         contract_sha256=contract_sha,
@@ -3185,6 +3308,26 @@ def _verify_adjudication(
         base=base,
         where="champion",
     )
+    curriculum_parent = training_report_payload.get("a1_curriculum_parent")
+    evaluation_parent_sha = (
+        curriculum_parent.get("generation_producer_sha256")
+        if isinstance(curriculum_parent, dict)
+        else training_report_payload.get("init_checkpoint_sha256")
+    )
+    if evaluation_parent_sha != champion_ref["sha256"]:
+        raise PromotionError(
+            "candidate training parent/init checkpoint differs from adjudicated "
+            "promotion baseline"
+        )
+    # Ordinary candidates also bind the exact init path. Curriculum candidates
+    # legitimately warm-start from an intermediate dose, while their sealed
+    # generation producer remains the promotion parent checked above.
+    init_path = training_report_payload.get("init_checkpoint")
+    if curriculum_parent is None and init_path is not None:
+        if _absolute(init_path, base=training_path.parent) != champion_path:
+            raise PromotionError(
+                "candidate training init path differs from adjudicated promotion baseline"
+            )
     if (
         candidate_path == champion_path
         or candidate_ref["sha256"] == champion_ref["sha256"]

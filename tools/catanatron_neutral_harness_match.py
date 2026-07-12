@@ -29,6 +29,7 @@ import hashlib
 import json
 import multiprocessing
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -393,6 +394,16 @@ def _run_fingerprint(config: dict[str, Any]) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def _engine_identity(args: Any) -> dict[str, Any]:
+    return {
+        "schema_version": "a1-neutral-engine-identity-v1",
+        "repo_commit": getattr(args, "engine_repo_commit", None),
+        "native_wheel_sha256": getattr(args, "native_wheel_sha256", None),
+        "native_runtime_sha256": getattr(args, "native_runtime_sha256", None),
+        "python_referee_sha256": getattr(args, "python_referee_sha256", None),
+    }
+
+
 def _search_recipe(args: Any) -> dict[str, Any]:
     """Canonical runtime/manifest record for the neutral search operator.
 
@@ -498,6 +509,9 @@ def _game_semantics(
         # count itself is only scheduling.
         "inference_devices": inference_devices,
         "threads_per_worker": int(args.threads_per_worker),
+        # Retry/resume artifacts are reusable only under the exact engine
+        # build. Search flags alone do not identify native or referee code.
+        "engine_identity": _engine_identity(args),
     }
     if args.mode == "search":
         semantics["search"] = _search_recipe(args)
@@ -796,6 +810,7 @@ def build_summary(
         "stratum": "neutral-harness",
         "harness": "catanatron_native_engine",
         "referee_engine": "vendored_python_catanatron",
+        "engine_identity": _engine_identity(args),
         "candidate_checkpoint": str(args.checkpoint),
         "candidate_checkpoint_md5": checkpoint_md5,
         "candidate_checkpoint_sha256": checkpoint_sha256,
@@ -924,6 +939,9 @@ def build_parser() -> argparse.ArgumentParser:
         )
     )
     parser.add_argument("--checkpoint", required=True)
+    parser.add_argument("--engine-repo-commit")
+    parser.add_argument("--native-wheel-sha256")
+    parser.add_argument("--python-referee-sha256")
     parser.add_argument("--opponent", required=True, choices=BOT_KINDS)
     parser.add_argument(
         "--mode", choices=("raw_policy", "search"), default="raw_policy"
@@ -1108,6 +1126,22 @@ def main() -> None:
         parser.error(
             "--sample is raw-policy-only; search panel roots use deterministic argmax"
         )
+    if args.mode == "search":
+        engine_identity = _engine_identity(args)
+        if not re.fullmatch(r"[0-9a-f]{40}", str(engine_identity["repo_commit"])):
+            parser.error("search mode requires --engine-repo-commit")
+        for name in ("native_wheel_sha256", "python_referee_sha256"):
+            if not re.fullmatch(
+                r"sha256:[0-9a-f]{64}", str(engine_identity[name])
+            ):
+                parser.error(f"search mode requires --{name.replace('_', '-')}")
+        try:
+            import catanatron_rs
+
+            native_runtime = Path(catanatron_rs.__file__).resolve(strict=True)
+            args.native_runtime_sha256 = _checkpoint_sha256(native_runtime)
+        except (ImportError, OSError, TypeError, ValueError) as error:
+            parser.error(f"cannot fingerprint installed native runtime: {error}")
     if args.mode == "search" and int(args.max_player_trade_offers_per_turn) != 0:
         parser.error(
             "search neutral harness is pinned to --max-player-trade-offers-per-turn 0"

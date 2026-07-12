@@ -17,6 +17,7 @@ if str(_REPO_ROOT) not in sys.path:
 
 from tools.fleet import a1_h100_eval_fleet as fleet  # noqa: E402
 from tools.fleet.a1_n256_lr_eval import APPROVED_SHAPES  # noqa: E402
+from tools.champion_registry import ChampionRegistry  # noqa: E402
 
 
 TRIAL_SCHEMA = "a1-checkpoint-interpolation-eval-v1"
@@ -77,17 +78,21 @@ def build_trial(
     external_base_seed: int,
     trial_id: str,
     output_dir: Path,
+    registry_path: Path,
+    candidate_c_scale: float,
+    champion_c_scale: float,
     internal_pairs: int = 112,
     external_pairs: int = 56,
 ) -> dict[str, Any]:
     if not SAFE_ID.fullmatch(trial_id):
         raise InterpolationEvalError("trial_id must be a safe nonempty identifier")
     receipt, receipt_path = _load_receipt(receipt_path)
-    manifest = fleet.load_manifest(manifest_path)
+    manifest = fleet.load_manifest(manifest_path, expected_shapes=APPROVED_SHAPES)
     shape = {row["alias"]: int(row["gpu_count"]) for row in manifest["hosts"]}
     if shape != APPROVED_SHAPES:
         raise InterpolationEvalError("interpolation panel requires the approved 56-H100 fleet")
     champion = Path(receipt["base"]["path"])
+    registry = ChampionRegistry.load(registry_path.expanduser().resolve(strict=True))
     output_dir = output_dir.expanduser().resolve()
     if output_dir.exists():
         raise InterpolationEvalError(f"refusing existing trial directory: {output_dir}")
@@ -103,6 +108,8 @@ def build_trial(
             manifest,
             candidate=checkpoint,
             champion=champion,
+            candidate_parent=champion,
+            registry=registry,
             internal_pairs=internal_pairs,
             external_pairs=external_pairs,
             internal_base_seed=internal_base_seed,
@@ -110,6 +117,10 @@ def build_trial(
             workers_per_gpu=fleet.DEFAULT_WORKERS_PER_GPU,
             iteration_id=f"{trial_id}-{label}",
             seed_cohort_id=cohort,
+            candidate_c_scale=candidate_c_scale,
+            champion_c_scale=champion_c_scale,
+            comparison_mode="historical_comparison",
+            historical_comparison_reason="diagnostic checkpoint interpolation curve",
         )
     if len({p["science_config_hash"] for p in plans.values()}) != 1:
         raise AssertionError("interpolation science configuration drifted")
@@ -149,6 +160,9 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--receipt", type=Path, required=True)
+    parser.add_argument("--registry", type=Path, required=True)
+    parser.add_argument("--candidate-c-scale", type=float, required=True)
+    parser.add_argument("--champion-c-scale", type=float, required=True)
     parser.add_argument("--internal-base-seed", type=int, required=True)
     parser.add_argument("--external-base-seed", type=int, required=True)
     parser.add_argument("--trial-id", required=True)
@@ -167,6 +181,9 @@ def main() -> None:
         external_base_seed=args.external_base_seed,
         trial_id=args.trial_id,
         output_dir=args.out_dir,
+        registry_path=args.registry,
+        candidate_c_scale=args.candidate_c_scale,
+        champion_c_scale=args.champion_c_scale,
         internal_pairs=args.internal_pairs,
         external_pairs=args.external_pairs,
     )

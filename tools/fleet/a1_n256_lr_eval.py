@@ -23,6 +23,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from tools import a1_dual_arm_train as training  # noqa: E402
+from tools.champion_registry import ChampionRegistry  # noqa: E402
 from tools.fleet import a1_h100_eval_fleet as fleet  # noqa: E402
 
 
@@ -89,11 +90,19 @@ def _checkpoint_from_receipt(path: Path, label: str) -> dict[str, str]:
     actual = fleet._sha256(checkpoint_path)  # noqa: SLF001
     if checkpoint["sha256"] != actual:
         raise TrialError(f"{label} checkpoint bytes differ from its receipt")
+    parent = receipt.get("inputs", {}).get("producer")
+    if not isinstance(parent, dict) or set(parent) != {"path", "sha256"}:
+        raise TrialError(f"{label} receipt has no authenticated parent checkpoint")
+    parent_path = Path(str(parent["path"])).expanduser().resolve(strict=True)
+    if fleet._sha256(parent_path) != parent["sha256"]:  # noqa: SLF001
+        raise TrialError(f"{label} parent checkpoint bytes differ from its receipt")
     return {
         "path": str(checkpoint_path),
         "sha256": actual,
         "receipt": str(receipt_path),
         "receipt_sha256": fleet._sha256(receipt_path),  # noqa: SLF001
+        "parent_path": str(parent_path),
+        "parent_sha256": parent["sha256"],
     }
 
 
@@ -109,11 +118,16 @@ def build_trial(
     *,
     manifest_path: Path,
     champion: Path,
+    registry_path: Path,
     receipts: dict[str, Path],
     internal_base_seed: int,
     external_base_seed: int,
     trial_id: str,
     output_dir: Path,
+    candidate_c_scale: float,
+    champion_c_scale: float,
+    comparison_mode: str = "promotion_parent",
+    historical_comparison_reason: str | None = None,
 ) -> dict[str, Any]:
     if not SAFE_ID.fullmatch(trial_id):
         raise TrialError("trial_id must be a safe nonempty identifier")
@@ -123,15 +137,22 @@ def build_trial(
     # keeps a partially completed LR sweep from producing a misleading plan.
     for label in ARM_SPECS:
         receipts[label].expanduser().resolve(strict=True)
-    manifest = fleet.load_manifest(manifest_path)
+    manifest = fleet.load_manifest(manifest_path, expected_shapes=APPROVED_SHAPES)
     _require_approved_fleet(manifest)
     champion = champion.expanduser().resolve(strict=True)
+    registry = ChampionRegistry.load(registry_path.expanduser().resolve(strict=True))
     checkpoints = {
         label: _checkpoint_from_receipt(receipts[label], label)
         for label in ARM_SPECS
     }
     if len({row["sha256"] for row in checkpoints.values()}) != len(ARM_SPECS):
         raise TrialError("LR receipts do not bind three distinct checkpoints")
+    parent_refs = {
+        (row["parent_path"], row["parent_sha256"]) for row in checkpoints.values()
+    }
+    if len(parent_refs) != 1:
+        raise TrialError("LR receipts do not bind one common parent/init checkpoint")
+    parent_path = Path(next(iter(parent_refs))[0])
     output_dir = output_dir.expanduser().resolve()
     if output_dir.exists():
         raise TrialError(f"refusing existing trial directory: {output_dir}")
@@ -142,6 +163,8 @@ def build_trial(
             manifest,
             candidate=Path(checkpoints[label]["path"]),
             champion=champion,
+            candidate_parent=parent_path,
+            registry=registry,
             internal_pairs=112,
             external_pairs=56,
             internal_base_seed=internal_base_seed,
@@ -149,6 +172,10 @@ def build_trial(
             workers_per_gpu=fleet.DEFAULT_WORKERS_PER_GPU,
             iteration_id=f"{trial_id}-{label}",
             seed_cohort_id=cohort,
+            candidate_c_scale=candidate_c_scale,
+            champion_c_scale=champion_c_scale,
+            comparison_mode=comparison_mode,
+            historical_comparison_reason=historical_comparison_reason,
         )
     science = {plan["science_config_hash"] for plan in plans.values()}
     claims = {json.dumps(plan["pair_claims"], sort_keys=True) for plan in plans.values()}
@@ -168,6 +195,8 @@ def build_trial(
             "path": str(champion),
             "sha256": fleet._sha256(champion),  # noqa: SLF001
         },
+        "candidate_parent": fleet._checkpoint_ref(parent_path),  # noqa: SLF001
+        "comparison_mode": comparison_mode,
         "micro_panel": {"internal_pairs": 112, "external_pairs": 56},
         "seed_cohort_id": cohort,
         "science_config_hash": next(iter(science)),
@@ -250,6 +279,15 @@ def _parser() -> argparse.ArgumentParser:
     plan = commands.add_parser("plan")
     plan.add_argument("--manifest", type=Path, required=True)
     plan.add_argument("--champion", type=Path, required=True)
+    plan.add_argument("--registry", type=Path, required=True)
+    plan.add_argument("--candidate-c-scale", type=float, required=True)
+    plan.add_argument("--champion-c-scale", type=float, required=True)
+    plan.add_argument(
+        "--comparison-mode",
+        choices=("promotion_parent", "historical_comparison"),
+        default="promotion_parent",
+    )
+    plan.add_argument("--historical-comparison-reason")
     plan.add_argument("--low-receipt", type=Path, required=True)
     plan.add_argument("--mid-receipt", type=Path, required=True)
     plan.add_argument("--high-receipt", type=Path, required=True)
@@ -269,6 +307,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             result = build_trial(
                 manifest_path=args.manifest,
                 champion=args.champion,
+                registry_path=args.registry,
                 receipts={
                     "lr60u": args.low_receipt,
                     "lr120u": args.mid_receipt,
@@ -278,6 +317,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 external_base_seed=args.external_base_seed,
                 trial_id=args.trial_id,
                 output_dir=args.out_dir,
+                candidate_c_scale=args.candidate_c_scale,
+                champion_c_scale=args.champion_c_scale,
+                comparison_mode=args.comparison_mode,
+                historical_comparison_reason=args.historical_comparison_reason,
             )
         else:
             result = render_commands(args.trial)

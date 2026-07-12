@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from tools.fleet import a1_h100_eval_fleet as fleet
+from tools.champion_registry import ChampionRegistry
 
 
 def test_future_plan_default_uses_validated_16_worker_packing() -> None:
@@ -26,6 +27,10 @@ def test_future_plan_default_uses_validated_16_worker_packing() -> None:
             "candidate.pt",
             "--champion",
             "champion.pt",
+            "--candidate-parent",
+            "champion.pt",
+            "--registry",
+            "registry.json",
             "--internal-base-seed",
             "1",
             "--external-base-seed",
@@ -100,10 +105,13 @@ def _plan(tmp_path: Path) -> tuple[dict, dict]:
     champion = tmp_path / "champion.pt"
     candidate.write_bytes(b"candidate")
     champion.write_bytes(b"champion")
+    registry = _registry(tmp_path, champion)
     plan = fleet.build_plan(
         manifest,
         candidate=candidate,
         champion=champion,
+        candidate_parent=champion,
+        registry=registry,
         internal_pairs=600,
         external_pairs=500,
         internal_base_seed=6_190_000_000,
@@ -119,6 +127,39 @@ def _plan(tmp_path: Path) -> tuple[dict, dict]:
     return manifest, plan
 
 
+def _registry(tmp_path: Path, champion: Path, *, c_scale: float = 0.03) -> ChampionRegistry:
+    registry = ChampionRegistry(tmp_path / "champion_registry.json")
+    search_config = {"c_scale": c_scale}
+    checkpoint = fleet._checkpoint_ref(champion)  # noqa: SLF001
+    identity = fleet._digest(  # noqa: SLF001
+        {
+            "schema_version": "a1-deployed-agent-search-config-v1",
+            "checkpoint": checkpoint,
+            "search_config": search_config,
+        }
+    )
+    registry.set_role(
+        "generator_champion",
+        champion,
+        version=4,
+        provenance={
+            "a1_candidate_agent_identity_sha256": identity,
+            "a1_candidate_search_config": search_config,
+        },
+        reason="test",
+    )
+    registry.save()
+    return registry
+
+
+def _binding_kwargs(plan: dict) -> dict:
+    binding = plan["evaluation_binding"]
+    return {
+        "candidate_parent": Path(binding["candidate_parent"]["path"]),
+        "registry": ChampionRegistry.load(binding["registry"]["path"]),
+    }
+
+
 def test_manifest_requires_exact_approved_six_four_and_two_eight_gpu_hosts(
     tmp_path: Path,
 ) -> None:
@@ -126,7 +167,7 @@ def test_manifest_requires_exact_approved_six_four_and_two_eight_gpu_hosts(
     value = json.loads(path.read_text())
     value["hosts"][-1]["gpu_count"] = 4
     path.write_text(json.dumps(value))
-    with pytest.raises(fleet.FleetError, match="exactly six 4xH100 and two 8xH100"):
+    with pytest.raises(fleet.FleetError, match="exact approved fleet shape"):
         fleet.load_manifest(path)
 
 
@@ -165,6 +206,17 @@ def test_external_plan_uses_matched_candidate_champion_cohorts(tmp_path: Path) -
         assert len({(job["base_seed"], job["pairs"]) for job in cohort}) == 1
         assert {job["pairs"] for job in cohort} == {25}
         assert len({job["slot_id"] for job in cohort}) == 2
+        for job in cohort:
+            argv = job["argv"]
+            assert argv[argv.index("--engine-repo-commit") + 1] == plan["repo_commit"]
+            assert (
+                argv[argv.index("--native-wheel-sha256") + 1]
+                == plan["engine_identity"]["native_wheel_sha256"]
+            )
+            assert (
+                argv[argv.index("--python-referee-sha256") + 1]
+                == plan["engine_identity"]["python_referee_sha256"]
+            )
     by_role = {
         role: sorted(
             (job["base_seed"], job["base_seed"] + job["pairs"])
@@ -178,6 +230,53 @@ def test_external_plan_uses_matched_candidate_champion_cohorts(tmp_path: Path) -
     assert by_role["candidate"][-1][1] == 6_191_000_500
 
 
+def test_n256_initialized_from_f7_cannot_default_to_gen3_baseline(
+    tmp_path: Path,
+) -> None:
+    manifest = fleet.load_manifest(_manifest_file(tmp_path))
+    candidate = tmp_path / "n256-candidate.pt"
+    f7_parent = tmp_path / "f7.pt"
+    gen3 = tmp_path / "gen3.pt"
+    candidate.write_bytes(b"n256")
+    f7_parent.write_bytes(b"f7")
+    gen3.write_bytes(b"gen3")
+    registry = _registry(tmp_path, f7_parent, c_scale=0.10)
+    common = {
+        "candidate": candidate,
+        "champion": gen3,
+        "candidate_parent": f7_parent,
+        "registry": registry,
+        "internal_pairs": 600,
+        "external_pairs": 500,
+        "internal_base_seed": 6_190_000_000,
+        "external_base_seed": 6_191_000_000,
+        "candidate_c_scale": 0.10,
+        "champion_c_scale": 0.03,
+        "repo_commit": "a" * 40,
+        "tool_hashes": {},
+    }
+    with pytest.raises(
+        fleet.FleetError,
+        match="promotion baseline differs from candidate parent/init checkpoint",
+    ):
+        fleet.build_plan(manifest, **common)
+
+    historical = fleet.build_plan(
+        manifest,
+        **common,
+        comparison_mode="historical_comparison",
+        historical_comparison_reason="diagnose n256 against archived gen3 only",
+    )
+    assert historical["evaluation_binding"]["promotion_eligible"] is False
+    assert historical["evaluation_binding"]["candidate_parent"]["sha256"] == fleet._sha256(  # noqa: SLF001
+        f7_parent
+    )
+    assert historical["role_search_config"] == {
+        "candidate": {"c_scale": 0.10},
+        "champion": {"c_scale": 0.03},
+    }
+
+
 def test_canary_scope_uses_every_gpu_on_one_four_and_one_eight_gpu_host(
     tmp_path: Path,
 ) -> None:
@@ -186,6 +285,7 @@ def test_canary_scope_uses_every_gpu_on_one_four_and_one_eight_gpu_host(
         manifest,
         candidate=Path(full["candidate"]["source"]),
         champion=Path(full["champion"]["source"]),
+        **_binding_kwargs(full),
         internal_pairs=24,
         external_pairs=12,
         internal_base_seed=6_192_000_000,
@@ -272,6 +372,7 @@ def test_role_specific_search_calibration_is_sealed_into_jobs_and_identity(
         manifest,
         candidate=Path(default["candidate"]["source"]),
         champion=Path(default["champion"]["source"]),
+        **_binding_kwargs(default),
         internal_pairs=600,
         external_pairs=500,
         internal_base_seed=6_190_000_000,
@@ -306,6 +407,7 @@ def test_role_specific_search_calibration_rejects_invalid_values(
             manifest,
             candidate=Path(default["candidate"]["source"]),
             champion=Path(default["champion"]["source"]),
+            **_binding_kwargs(default),
             internal_pairs=600,
             external_pairs=500,
             internal_base_seed=6_190_000_000,
@@ -454,6 +556,7 @@ def test_remote_run_identity_binds_code_manifest_and_worker_packing(
         options = {
             "candidate": candidate,
             "champion": champion,
+            **_binding_kwargs(template),
             "internal_pairs": 600,
             "external_pairs": 500,
             "internal_base_seed": 6_190_000_000,
@@ -485,6 +588,7 @@ def test_remote_run_identity_binds_code_manifest_and_worker_packing(
         changed_manifest,
         candidate=candidate,
         champion=champion,
+        **_binding_kwargs(template),
         internal_pairs=600,
         external_pairs=500,
         internal_base_seed=6_190_000_000,
@@ -539,11 +643,14 @@ def test_plan_rejects_overlapping_internal_external_seed_claims(tmp_path: Path) 
     champion = tmp_path / "champion.pt"
     candidate.write_bytes(b"candidate")
     champion.write_bytes(b"champion")
+    registry = _registry(tmp_path, champion)
     with pytest.raises(fleet.FleetError, match="seed intervals overlap"):
         fleet.build_plan(
             manifest,
             candidate=candidate,
             champion=champion,
+            candidate_parent=champion,
+            registry=registry,
             internal_pairs=600,
             external_pairs=500,
             internal_base_seed=6_190_000_000,
@@ -618,6 +725,7 @@ def test_validation_claim_rejects_overlap_from_concurrent_plan(tmp_path: Path) -
         manifest,
         candidate=candidate,
         champion=Path(first["champion"]["source"]),
+        **_binding_kwargs(first),
         internal_pairs=600,
         external_pairs=500,
         internal_base_seed=6_190_000_300,
@@ -643,6 +751,7 @@ def test_explicit_common_seed_cohort_allows_only_exact_interval_reuse(
             manifest,
             candidate=candidate,
             champion=champion,
+            **_binding_kwargs(template),
             internal_pairs=600,
             external_pairs=500,
             internal_base_seed=internal_base,
@@ -663,6 +772,7 @@ def test_explicit_common_seed_cohort_allows_only_exact_interval_reuse(
         manifest,
         candidate=Path(second["candidate"]["source"]),
         champion=champion,
+        **_binding_kwargs(template),
         internal_pairs=600,
         external_pairs=500,
         internal_base_seed=6_190_000_000,
@@ -691,6 +801,7 @@ def test_common_seed_reuse_requires_an_explicit_shared_cohort(tmp_path: Path) ->
         manifest,
         candidate=candidate,
         champion=Path(first["champion"]["source"]),
+        **_binding_kwargs(first),
         internal_pairs=600,
         external_pairs=500,
         internal_base_seed=6_190_000_000,

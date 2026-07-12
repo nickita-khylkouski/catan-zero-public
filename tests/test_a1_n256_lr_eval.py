@@ -49,8 +49,10 @@ def _fake_receipts(
     monkeypatch: pytest.MonkeyPatch,
     receipts: dict[str, Path],
     checkpoints: dict[str, Path],
-) -> None:
+) -> Path:
     by_path = {path.resolve(): label for label, path in receipts.items()}
+    parent = next(iter(receipts.values())).parent / "f7.pt"
+    parent.write_bytes(b"f7-parent")
 
     def verify(path: Path) -> dict:
         label = by_path[path.resolve()]
@@ -59,6 +61,10 @@ def _fake_receipts(
             "arm_id": "n256",
             "subset_id": "full-56k",
             "inputs": {
+                "producer": {
+                    "path": str(parent.resolve()),
+                    "sha256": trial.fleet._sha256(parent),  # noqa: SLF001
+                },
                 "learner_ablation": {
                     "ablation_id": ablation,
                     "diagnostic_only": True,
@@ -79,6 +85,32 @@ def _fake_receipts(
         }
 
     monkeypatch.setattr(trial.training, "verify_receipt", verify)
+    return parent
+
+
+def _registry(tmp_path: Path, champion: Path) -> Path:
+    path = tmp_path / "registry.json"
+    registry = trial.ChampionRegistry(path)
+    search_config = {"c_scale": 0.10}
+    checkpoint = trial.fleet._checkpoint_ref(champion)  # noqa: SLF001
+    identity = trial.fleet._digest(  # noqa: SLF001
+        {
+            "schema_version": "a1-deployed-agent-search-config-v1",
+            "checkpoint": checkpoint,
+            "search_config": search_config,
+        }
+    )
+    registry.set_role(
+        "generator_champion",
+        champion,
+        version=4,
+        provenance={
+            "a1_candidate_agent_identity_sha256": identity,
+            "a1_candidate_search_config": search_config,
+        },
+    )
+    registry.save()
+    return path
 
 
 def test_trial_refuses_before_all_three_receipts_exist(tmp_path: Path) -> None:
@@ -86,15 +118,19 @@ def test_trial_refuses_before_all_three_receipts_exist(tmp_path: Path) -> None:
     receipts["lr240u"].unlink()
     champion = tmp_path / "champion.pt"
     champion.write_bytes(b"champion")
+    registry = _registry(tmp_path, champion)
     with pytest.raises(FileNotFoundError):
         trial.build_trial(
             manifest_path=_manifest(tmp_path),
             champion=champion,
+            registry_path=registry,
             receipts=receipts,
             internal_base_seed=6_190_100_000,
             external_base_seed=6_190_200_000,
             trial_id="n256-lr-micro",
             output_dir=tmp_path / "trial",
+            candidate_c_scale=0.10,
+            champion_c_scale=0.10,
         )
     assert not (tmp_path / "trial").exists()
     assert checkpoints["lr240u"].is_file()
@@ -104,18 +140,20 @@ def test_three_arm_trial_is_exactly_matched_and_diagnostic_only(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     receipts, checkpoints = _receipts(tmp_path)
-    _fake_receipts(monkeypatch, receipts, checkpoints)
-    champion = tmp_path / "champion.pt"
-    champion.write_bytes(b"champion")
+    champion = _fake_receipts(monkeypatch, receipts, checkpoints)
+    registry = _registry(tmp_path, champion)
     output = tmp_path / "trial"
     result = trial.build_trial(
         manifest_path=_manifest(tmp_path),
         champion=champion,
+        registry_path=registry,
         receipts=receipts,
         internal_base_seed=6_190_100_000,
         external_base_seed=6_190_200_000,
         trial_id="n256-lr-micro",
         output_dir=output,
+        candidate_c_scale=0.10,
+        champion_c_scale=0.10,
     )
 
     assert result["diagnostic_only"] is True
@@ -155,11 +193,37 @@ def test_three_arm_trial_is_exactly_matched_and_diagnostic_only(
     assert all(row["launch"][-1] == "--go" for row in commands["commands"])
 
 
+def test_n256_receipt_parent_f7_rejects_default_gen3_baseline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    receipts, checkpoints = _receipts(tmp_path)
+    f7 = _fake_receipts(monkeypatch, receipts, checkpoints)
+    registry = _registry(tmp_path, f7)
+    gen3 = tmp_path / "gen3.pt"
+    gen3.write_bytes(b"gen3")
+    with pytest.raises(
+        trial.fleet.FleetError,
+        match="promotion baseline differs from candidate parent/init checkpoint",
+    ):
+        trial.build_trial(
+            manifest_path=_manifest(tmp_path),
+            champion=gen3,
+            registry_path=registry,
+            receipts=receipts,
+            internal_base_seed=6_190_100_000,
+            external_base_seed=6_190_200_000,
+            trial_id="n256-wrong-gen3-baseline",
+            output_dir=tmp_path / "trial",
+            candidate_c_scale=0.10,
+            champion_c_scale=0.03,
+        )
+
+
 def test_receipt_recipe_drift_is_rejected(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     receipts, checkpoints = _receipts(tmp_path)
-    _fake_receipts(monkeypatch, receipts, checkpoints)
+    champion = _fake_receipts(monkeypatch, receipts, checkpoints)
     original = trial.training.verify_receipt
 
     def drift(path: Path) -> dict:
@@ -169,15 +233,17 @@ def test_receipt_recipe_drift_is_rejected(
         return value
 
     monkeypatch.setattr(trial.training, "verify_receipt", drift)
-    champion = tmp_path / "champion.pt"
-    champion.write_bytes(b"champion")
+    registry = _registry(tmp_path, champion)
     with pytest.raises(trial.TrialError, match="wrong effective recipe"):
         trial.build_trial(
             manifest_path=_manifest(tmp_path),
             champion=champion,
+            registry_path=registry,
             receipts=receipts,
             internal_base_seed=6_190_100_000,
             external_base_seed=6_190_200_000,
             trial_id="n256-lr-micro",
             output_dir=tmp_path / "trial",
+            candidate_c_scale=0.10,
+            champion_c_scale=0.10,
         )

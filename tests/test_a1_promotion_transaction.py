@@ -262,6 +262,40 @@ def _fixture(
         champion_path=champion.resolve(),
         champion_sha256=promotion._sha256(champion),
     )
+    champion_identity = promotion._agent_identity(
+        _checkpoint_ref(champion), champion_search_config
+    )
+    registry.set_role(
+        "generator_champion",
+        champion,
+        expected_md5=promotion._md5(champion),
+        version=4,
+        provenance={
+            "a1_candidate_agent_identity_sha256": champion_identity[
+                "agent_identity_sha256"
+            ],
+            "a1_candidate_search_config": champion_search_config,
+        },
+        reason="fixture agent identity",
+    )
+    registry.save()
+    evaluation_binding = {
+        "schema_version": "a1-evaluation-baseline-binding-v1",
+        "comparison_mode": "promotion_parent",
+        "promotion_eligible": True,
+        "historical_comparison_reason": None,
+        "candidate_parent": _checkpoint_ref(champion),
+        "baseline": _checkpoint_ref(champion),
+        "registry": _checkpoint_ref(registry_path),
+        "authoritative_incumbent": {
+            **_checkpoint_ref(champion),
+            "version": 4,
+            "agent_identity_sha256": champion_identity[
+                "agent_identity_sha256"
+            ],
+            "search_config": champion_search_config,
+        },
+    }
     report_path = tmp_path / "report.json"
     command = ["/usr/bin/python3", "tools/train_bc.py", "--sealed-a1"]
     execution_binding = one_dose._execution_binding(
@@ -371,6 +405,7 @@ def _fixture(
     _write_json(
         internal_source,
         {
+            "evaluation_binding": evaluation_binding,
             "candidate_checkpoint": str(candidate),
             "baseline_checkpoint": str(champion),
             "typed_config": typed_config,
@@ -403,6 +438,16 @@ def _fixture(
     )
 
     external_sources = []
+    planned_engine_identity = {
+        "schema_version": "a1-neutral-engine-identity-v1",
+        "repo_commit": "a" * 40,
+        "native_wheel_sha256": "sha256:" + "b" * 64,
+        "python_referee_sha256": "sha256:" + "c" * 64,
+    }
+    runtime_engine_identity = {
+        **planned_engine_identity,
+        "native_runtime_sha256": "sha256:" + "d" * 64,
+    }
     for role, checkpoint, win_rate, external_search_config in (
         ("candidate_panel", candidate, 0.55, candidate_search_config),
         ("champion_panel", champion, 0.54, champion_search_config),
@@ -438,6 +483,9 @@ def _fixture(
         _write_json(
             source,
             {
+                "evaluation_binding": evaluation_binding,
+                "planned_engine_identity": planned_engine_identity,
+                "engine_identity": runtime_engine_identity,
                 "stratum": "neutral-harness",
                 "harness": "catanatron_native_engine",
                 "baseline_bot": "catanatron_value",
@@ -1112,6 +1160,29 @@ def _mutate_evidence_source(fixture: dict, *, kind: str, role: str, mutate) -> N
     adjudication.pop("adjudication_sha256")
     adjudication["adjudication_sha256"] = promotion._digest_value(adjudication)
     _write_json(fixture["adjudication"], adjudication)
+
+
+def test_historical_comparison_cannot_be_used_as_promotion_baseline(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path)
+
+    def make_historical(source: dict) -> None:
+        binding = source["evaluation_binding"]
+        binding["comparison_mode"] = "historical_comparison"
+        binding["promotion_eligible"] = False
+        binding["historical_comparison_reason"] = "diagnostic gen3 comparison"
+
+    _mutate_evidence_source(
+        fixture,
+        kind="internal_h2h",
+        role="internal_h2h",
+        mutate=make_historical,
+    )
+    with pytest.raises(
+        promotion.PromotionError, match="not a promotion-parent evaluation binding"
+    ):
+        _execute(fixture, go=False)
 
 
 def test_dry_run_is_read_only_and_attests_global_n128(tmp_path: Path) -> None:
