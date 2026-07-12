@@ -89,8 +89,9 @@ run_dose() {
     --receipt "$dose/training.receipt.json" --python "$python"
   )
   [[ -z "$parent" ]] || command+=(--curriculum-parent-receipt "$parent")
-  "${command[@]}" >"$dose/dry-run.json"
-  "$python" - "$dose/dry-run.json" "$arm" "$subset" <<'PY'
+  if [[ "$mode" != --go ]]; then
+    "${command[@]}" >"$dose/dry-run.json"
+    "$python" - "$dose/dry-run.json" "$arm" "$subset" <<'PY'
 import json, math, pathlib, sys
 text=pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
 decoder=json.JSONDecoder(); values=[]; offset=0
@@ -115,7 +116,10 @@ meta=json.load(open(p["inputs"]["corpus_meta"]["path"],encoding="utf-8"))
 rows=int(meta["a1_post_wave_audit"]["training_row_count"])
 print(json.dumps({"arm":sys.argv[2],"training_rows":rows,"optimizer_steps":math.ceil(rows/4096)},sort_keys=True))
 PY
-  [[ "$mode" == --go ]] || return 0
+    return 0
+  fi
+  # --go emits the same plan before executing the authoritative verification.
+  # Do not replay the hundreds-of-GB payload hash in a redundant dry run first.
   "${command[@]}" --go >"$dose/go.json" 2>"$dose/go.stderr.log"
   test -s "$dose/training.receipt.json"
 }

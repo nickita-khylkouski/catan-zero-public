@@ -21,3 +21,5 @@ def test_corrective_launcher_is_syntax_clean_and_fail_closed_on_handoff() -> Non
     assert "--curriculum-parent-receipt" in text
     assert "decoder.raw_decode" in text
     assert "unexpected dual learner dry-run stdout stream" in text
+    assert 'if [[ "$mode" != --go ]]; then' in text
+    assert "Do not replay the hundreds-of-GB payload hash" in text
