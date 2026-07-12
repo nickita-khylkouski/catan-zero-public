@@ -783,6 +783,8 @@ def build_calibration_summary(
     *,
     min_slice_rows: int,
     reliability_bin_count: int,
+    deployed_value_scale: float = 1.0,
+    deployed_value_squash: str = "tanh",
 ) -> dict[str, Any]:
     """Build the identical global/phase/forced/legal-width view for either head."""
 
@@ -805,6 +807,49 @@ def build_calibration_summary(
         ),
         "reliability_bin_count": reliability_bin_count,
     }
+    if not math.isfinite(float(deployed_value_scale)) or float(deployed_value_scale) <= 0:
+        raise ValueError("deployed_value_scale must be finite and > 0")
+    if deployed_value_squash not in {"tanh", "clip"}:
+        raise ValueError("deployed_value_squash must be tanh or clip")
+
+    def _view(view_q: np.ndarray) -> dict[str, Any]:
+        # Transform comparisons deliberately score only the scalar expectation.
+        # Proper categorical CE/NLL is invariant to a post-readout scalar
+        # transform and remains reported once in the historical top-level view.
+        view_common = {
+            "min_rows": min_slice_rows,
+            "reliability_bin_count": reliability_bin_count,
+        }
+        return {
+            "global": _calibration_stats(view_q, z, **view_common),
+            "by_phase": _slice_by(view_q, z, phase, **view_common),
+            "by_forced": _slice_by(view_q, z, forced_label, **view_common),
+            "by_legal_count_bucket": _slice_by(
+                view_q, z, legal_bucket, **view_common
+            ),
+        }
+
+    scaled = q.astype(np.float64) * float(deployed_value_scale)
+    transformed_views = {
+        "raw_training_readout": {
+            "formula": "q_raw",
+            **_view(q),
+        },
+        "scalar_tanh": {
+            "formula": "tanh(q_raw * value_scale)",
+            **_view(np.tanh(scaled)),
+        },
+        "scalar_clip": {
+            "formula": "clip(q_raw * value_scale, -1, 1)",
+            **_view(np.clip(scaled, -1.0, 1.0)),
+        },
+    }
+    configured_transform = (
+        f"scalar_{deployed_value_squash}"
+        if predictions.provenance["requested_readout"] == "scalar"
+        else "scalar_clip"
+    )
+
     return {
         "schema_version": "phase-sliced-value-calibration-v2",
         "value_readout": predictions.provenance["requested_readout"],
@@ -823,6 +868,17 @@ def build_calibration_summary(
                 "hard terminal-endpoint NLL from the full categorical softmax, "
                 "including optional truncation-class mass; null for scalar"
             ),
+        },
+        "deployed_readout_diagnostics": {
+            "diagnostic_only": True,
+            "changes_operator_default": False,
+            "value_scale": float(deployed_value_scale),
+            "configured_value_squash": deployed_value_squash,
+            "configured_effective_transform": configured_transform,
+            "categorical_bypasses_scalar_tanh": (
+                predictions.provenance["requested_readout"] == "categorical"
+            ),
+            "views": transformed_views,
         },
         "global": _calibration_stats(q, z, **common),
         "by_phase": _slice_by(q, z, phase, **common),
@@ -875,6 +931,18 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--shard-dir", required=True, help="dir searched recursively for *.npz"
+    )
+    parser.add_argument(
+        "--deployed-value-scale",
+        type=float,
+        default=1.0,
+        help="search evaluator value_scale to apply in diagnostic transform views",
+    )
+    parser.add_argument(
+        "--deployed-value-squash",
+        choices=("tanh", "clip"),
+        default="tanh",
+        help="current search transform to mark as configured (does not change it)",
     )
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--device", default="cpu")
@@ -997,6 +1065,8 @@ def main() -> None:
         groups,
         min_slice_rows=args.min_slice_rows,
         reliability_bin_count=args.reliability_bins,
+        deployed_value_scale=args.deployed_value_scale,
+        deployed_value_squash=args.deployed_value_squash,
     )
     summary["checkpoint"] = args.checkpoint
     summary["shard_dir"] = args.shard_dir

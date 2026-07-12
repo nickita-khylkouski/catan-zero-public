@@ -358,11 +358,70 @@ def test_categorical_summary_reports_same_slices_plus_proper_score() -> None:
     assert set(summary["by_phase"]) == {"opening_placement", "play_turn"}
     assert set(summary["by_forced"]) == {"forced", "unforced"}
     assert set(summary["by_legal_count_bucket"]) == {"1", "41+"}
+    deployed = summary["deployed_readout_diagnostics"]
+    assert deployed["diagnostic_only"] is True
+    assert deployed["changes_operator_default"] is False
+    assert deployed["categorical_bypasses_scalar_tanh"] is True
+    assert deployed["configured_effective_transform"] == "scalar_clip"
     assert summary["by_phase"]["opening_placement"][
         "categorical_terminal_nll"
     ] == pytest.approx(np.log(2.0))
 
 
+def test_scalar_summary_reports_raw_tanh_and_clip_by_phase() -> None:
+    predictions = compute_readout(
+        _FakeReadoutPolicy(trained_categorical=False),
+        _fake_groups(),
+        value_readout="scalar",
+    )
+    summary = build_calibration_summary(
+        predictions,
+        _fake_groups(),
+        min_slice_rows=1,
+        reliability_bin_count=4,
+        deployed_value_scale=2.0,
+        deployed_value_squash="tanh",
+    )
+    diagnostic = summary["deployed_readout_diagnostics"]
+    assert diagnostic["configured_effective_transform"] == "scalar_tanh"
+    assert set(diagnostic["views"]) == {
+        "raw_training_readout",
+        "scalar_tanh",
+        "scalar_clip",
+    }
+    raw = diagnostic["views"]["raw_training_readout"]
+    tanh = diagnostic["views"]["scalar_tanh"]
+    clip = diagnostic["views"]["scalar_clip"]
+    assert raw["global"]["value_rmse"] == pytest.approx(
+        np.sqrt(((0.9 - 1.0) ** 2 + (-0.8 + 1.0) ** 2) / 2)
+    )
+    expected_tanh = np.tanh(np.array([1.8, -1.6]))
+    assert tanh["global"]["value_rmse"] == pytest.approx(
+        np.sqrt(np.mean((expected_tanh - np.array([1.0, -1.0])) ** 2))
+    )
+    assert clip["global"]["value_rmse"] == pytest.approx(0.0)
+    assert set(tanh["by_phase"]) == {"opening_placement", "play_turn"}
+
+
+@pytest.mark.parametrize(
+    ("scale", "squash", "message"),
+    [(0.0, "tanh", "value_scale"), (1.0, "sigmoid", "value_squash")],
+)
+def test_deployed_readout_diagnostics_fail_closed(scale, squash, message) -> None:
+    predictions = compute_readout(
+        _FakeReadoutPolicy(trained_categorical=False),
+        _fake_groups(),
+        value_readout="scalar",
+    )
+    with pytest.raises(ValueError, match=message):
+        build_calibration_summary(
+            predictions,
+            _fake_groups(),
+            min_slice_rows=1,
+            reliability_bin_count=4,
+            deployed_value_scale=scale,
+            deployed_value_squash=squash,
+        )
 def test_categorical_nll_partitioning_tracks_each_slice() -> None:
     q = np.array([0.5, -0.5], dtype=np.float32)
     z = np.array([1.0, -1.0], dtype=np.float32)
