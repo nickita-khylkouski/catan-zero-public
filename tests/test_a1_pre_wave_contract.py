@@ -799,6 +799,43 @@ def _append_job_claims(lock: dict, jobs: list[dict] | None = None) -> None:
             handle.write(contract._ledger_claim_row(lock, job) + "\n")
 
 
+def test_realized_search_identity_binds_category_c_scale(tmp_path: Path) -> None:
+    _path, lock = _lock(tmp_path)
+    base_job = dict(lock["fleet"]["jobs"][0])
+    producer_job = {**base_job, "c_scale": 0.1}
+    legacy_job = {**base_job, "c_scale": 0.03}
+    producer = contract._job_search_identity(lock, producer_job)  # noqa: SLF001
+    legacy = contract._job_search_identity(lock, legacy_job)  # noqa: SLF001
+    assert producer["search_operator"]["c_scale"] == 0.1
+    assert legacy["search_operator"]["c_scale"] == 0.03
+    assert producer["search_operator_sha256"] != legacy["search_operator_sha256"]
+    assert producer["effective_search_config_sha256"] != legacy["effective_search_config_sha256"]
+    assert contract._job_attestation(lock, producer_job)["search_operator_sha256"] == producer["search_operator_sha256"]  # noqa: SLF001
+
+
+@pytest.mark.parametrize("bad", [True, "0.03", 0.0, -0.1, float("inf"), float("nan")])
+def test_realized_search_identity_rejects_invalid_c_scale(
+    tmp_path: Path, bad: object
+) -> None:
+    _path, lock = _lock(tmp_path)
+    job = {**lock["fleet"]["jobs"][0], "c_scale": bad}
+    with pytest.raises(contract.ContractError, match="c_scale"):
+        contract._job_search_identity(lock, job)  # noqa: SLF001
+
+
+def test_legacy_job_attestation_remains_exact_but_is_not_new_identity(
+    tmp_path: Path,
+) -> None:
+    _path, lock = _lock(tmp_path)
+    job = {**lock["fleet"]["jobs"][0], "c_scale": 0.1}
+    current = contract._job_attestation(lock, job)  # noqa: SLF001
+    legacy = contract._legacy_job_attestation(lock, job)  # noqa: SLF001
+    assert current["schema_version"] == "a1-generation-job-attestation-v3"
+    assert legacy["schema_version"] == "a1-generation-job-attestation-v2"
+    assert current["search_operator_sha256"] != legacy["search_operator_sha256"]
+    assert legacy["search_operator_sha256"] == lock["science"]["search_operator_sha256"]
+
+
 def test_checked_in_template_is_intentionally_unresolved_and_refuses_seal() -> None:
     payload = json.loads(TEMPLATE.read_text(encoding="utf-8"))
     unresolved = contract._find_unresolved(payload)
@@ -2193,7 +2230,9 @@ def test_post_wave_audit_accepts_exact_complete_category_corpus(
             json.dumps(
                 {
                     "search_config": {
-                        **lock["science"]["effective_search_config"],
+                        **contract._job_search_identity(lock, job)[  # noqa: SLF001
+                            "effective_search_config"
+                        ],
                         "seed": 123,
                     },
                     "selfplay_config": contract._expected_selfplay_config(lock),

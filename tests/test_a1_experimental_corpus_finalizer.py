@@ -327,3 +327,45 @@ def test_finalize_selects_lowest_complete_seed_and_emits_training_artifacts(
     assert loaded_audit["arm_id"] == "n128"
     assert loaded_audit["selected_row_count"] == 168
     assert loaded_audit["harvest_relocation"]["arm_id"] == "n128"
+
+
+def test_v3_attestation_rejects_tampered_realized_search_identity(tmp_path: Path) -> None:
+    root = tmp_path / "job"
+    root.mkdir()
+    producer = "sha256:" + "1" * 64
+    opponent = "sha256:" + "2" * 64
+    _write_json(
+        root / "a1_contract.json",
+        {
+            "schema_version": "a1-generation-job-attestation-v3",
+            "contract_sha256": SHA,
+            "job_id": "lane__recent_history",
+            "worker_id": "lane",
+            "category": "recent_history",
+            "arm_id": "n128",
+            "games": 1,
+            "producer_checkpoint_sha256": producer,
+            "opponent_checkpoint_sha256": [opponent],
+            "search_operator_sha256": "sha256:" + "3" * 64,
+            "effective_search_config_sha256": "sha256:" + "4" * 64,
+            "evaluator_sha256": SHA,
+            "runtime_code_tree_sha256": SHA,
+        },
+    )
+    job = {
+        "job_id": "lane__recent_history",
+        "worker_id": "lane",
+        "category": "recent_history",
+        "arm_id": "n128",
+        "producer_checkpoint_sha256": producer,
+        "opponent_checkpoint_sha256": [opponent],
+    }
+    with pytest.raises(finalizer.FinalizerError, match="realized search identity drift"):
+        finalizer._verify_job_attestation(  # noqa: SLF001
+            root,
+            job,
+            contract_sha256=SHA,
+            selected_quota=1,
+            expected_search_operator_sha256="sha256:" + "5" * 64,
+            expected_effective_search_config_sha256="sha256:" + "4" * 64,
+        )

@@ -566,6 +566,8 @@ def _verify_job_attestation(
     *,
     contract_sha256: str,
     selected_quota: int,
+    expected_search_operator_sha256: str | None = None,
+    expected_effective_search_config_sha256: str | None = None,
 ) -> None:
     path = root / "a1_contract.json"
     if not path.is_file():
@@ -583,7 +585,11 @@ def _verify_job_attestation(
         "runtime_code_tree_sha256",
     )
     if (
-        value.get("schema_version") != "a1-generation-job-attestation-v2"
+        value.get("schema_version")
+        not in {
+            "a1-generation-job-attestation-v2",
+            "a1-generation-job-attestation-v3",
+        }
         or value.get("contract_sha256") != contract_sha256
         or value.get("job_id") != job["job_id"]
         or value.get("worker_id") != job["worker_id"]
@@ -599,6 +605,14 @@ def _verify_job_attestation(
         )
     ):
         raise FinalizerError(f"job attestation/config/checkpoint drift: {path}")
+    if value["schema_version"] == "a1-generation-job-attestation-v3" and (
+        expected_search_operator_sha256 is None
+        or expected_effective_search_config_sha256 is None
+        or value["search_operator_sha256"] != expected_search_operator_sha256
+        or value["effective_search_config_sha256"]
+        != expected_effective_search_config_sha256
+    ):
+        raise FinalizerError(f"realized search identity drift: {path}")
     expected_attempts = job.get("max_attempts")
     if expected_attempts is not None and value.get("attempts") != expected_attempts:
         raise FinalizerError(f"job attempt quota drift: {path}")
@@ -704,6 +718,10 @@ def finalize(
     all_jobs = relocated_jobs
     per_category_job_quota = {key: value // 28 for key, value in quotas.items()}
     seen: set[int] = set()
+    lock = contract.verify_lock(Path(plan["contract"]["path"]))
+    lock_jobs = {
+        str(row["job_id"]): row for row in lock.get("fleet", {}).get("jobs", [])
+    }
     for raw, root in sorted(all_jobs, key=lambda pair: pair[0]["job_id"]):
         category = raw.get("category", "current_producer")
         job = {
@@ -721,7 +739,6 @@ def finalize(
         }
         # Recovery plan has authoritative checkpoint refs in argv-bound manifests;
         # use the lock's checkpoint identities when compact fields are absent.
-        lock = contract.verify_lock(Path(plan["contract"]["path"]))
         producer = next(
             row["sha256"] for row in lock["checkpoints"] if row["role"] == "producer"
         )
@@ -739,11 +756,27 @@ def finalize(
         )
         job["producer_checkpoint_sha256"] = producer
         job["opponent_checkpoint_sha256"] = opponent
+        lock_job = lock_jobs.get(str(job["job_id"]))
+        realized_identity = (
+            None
+            if lock_job is None
+            else contract._job_search_identity(lock, lock_job)  # noqa: SLF001
+        )
         _verify_job_attestation(
             root,
             job,
             contract_sha256=plan["contract_sha256"],
             selected_quota=per_category_job_quota[category],
+            expected_search_operator_sha256=(
+                None
+                if realized_identity is None
+                else realized_identity["search_operator_sha256"]
+            ),
+            expected_effective_search_config_sha256=(
+                None
+                if realized_identity is None
+                else realized_identity["effective_search_config_sha256"]
+            ),
         )
         selected, job_rows_by_seed, job_shards = _job_evidence(
             root, job, per_category_job_quota[category]

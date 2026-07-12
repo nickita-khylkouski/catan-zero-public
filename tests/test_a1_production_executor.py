@@ -488,6 +488,7 @@ def test_dual_arm_n256_profile_is_exact_28_lane_84_job_contract(
         "job_count": 84,
     }
     lock["science"]["search_operator"]["n_full"] = 256
+    lock["science"]["search_operator"]["prior_temperature"] = 1.0
     lock["science"]["search_operator_sha256"] = contract._digest_value(  # noqa: SLF001
         lock["science"]["search_operator"]
     )

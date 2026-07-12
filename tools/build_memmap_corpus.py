@@ -174,7 +174,10 @@ def _load_direct_a1_source_attestations(
             raise SystemExit(
                 f"A1 source attestation {canonical_path} must be a JSON object"
             )
-        if payload.get("schema_version") != "a1-generation-job-attestation-v2":
+        if payload.get("schema_version") not in {
+            "a1-generation-job-attestation-v2",
+            "a1-generation-job-attestation-v3",
+        }:
             raise SystemExit(
                 f"A1 source attestation {canonical_path} has unsupported schema"
             )
@@ -787,7 +790,10 @@ def _load_a1_post_wave_audit(
         if (
             not isinstance(attestation, dict)
             or attestation.get("schema_version")
-            != "a1-generation-job-attestation-v2"
+            not in {
+                "a1-generation-job-attestation-v2",
+                "a1-generation-job-attestation-v3",
+            }
             or attestation.get("contract_sha256") != contract_sha
             or (is_dual and attestation.get("arm_id") != selected_manifest["arm_id"])
         ):

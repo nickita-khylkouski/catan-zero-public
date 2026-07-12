@@ -23,6 +23,7 @@ import datetime as dt
 import fcntl
 import hashlib
 import json
+import math
 import os
 import re
 import stat
@@ -218,6 +219,8 @@ GENERATION_CAMPAIGN_R2_CONTRACT_PATH = (
 )
 GENERATION_PLACEMENT_SCHEMA = "a1-dual-arm-generation-placement-v1"
 GENERATION_ARM_LOCK_SCHEMA = "a1-generation-arm-lock-v1"
+GENERATION_JOB_ATTESTATION_SCHEMA = "a1-generation-job-attestation-v3"
+LEGACY_GENERATION_JOB_ATTESTATION_SCHEMA = "a1-generation-job-attestation-v2"
 GENERATION_CAMPAIGN_PENDING = "blocked_pending_post_promotion_handoff"
 GENERATION_CAMPAIGN_CHECKPOINT_SHA256 = (
     "sha256:f7e93dfb8cdb713d647b3e142c949d59083de9f719b6688b6faa6c918ce3eed4"
@@ -1090,6 +1093,55 @@ def _effective_search(raw: dict[str, Any]) -> dict[str, Any]:
     effective = dataclasses.asdict(config)
     effective.pop("seed")
     return effective
+
+
+def _realized_search_identity(
+    search_operator: Mapping[str, Any], *, c_scale: Any
+) -> dict[str, Any]:
+    """Bind the search identity actually realized by a category/job."""
+
+    if isinstance(c_scale, bool) or not isinstance(c_scale, (int, float)):
+        raise ContractError("realized search c_scale must be numeric")
+    realized_c_scale = float(c_scale)
+    if not math.isfinite(realized_c_scale) or realized_c_scale <= 0.0:
+        raise ContractError("realized search c_scale must be finite and positive")
+    realized_operator = dict(search_operator)
+    realized_operator["c_scale"] = realized_c_scale
+    realized_operator = _search_operator(realized_operator)
+    effective = json.loads(json.dumps(_effective_search(realized_operator)))
+    return {
+        "search_operator": realized_operator,
+        "search_operator_sha256": _digest_value(realized_operator),
+        "effective_search_config": effective,
+        "effective_search_config_sha256": _digest_value(effective),
+    }
+
+
+def _job_search_identity(
+    lock: Mapping[str, Any], job: Mapping[str, Any]
+) -> dict[str, Any]:
+    search = dict(lock["science"]["search_operator"])
+    return _realized_search_identity(
+        search, c_scale=job.get("c_scale", search["c_scale"])
+    )
+
+
+def _category_search_identities(
+    search_operator: Mapping[str, Any], jobs: Sequence[Mapping[str, Any]]
+) -> dict[str, dict[str, Any]]:
+    identities: dict[str, dict[str, Any]] = {}
+    for job in jobs:
+        category = str(job["category"])
+        identity = _realized_search_identity(
+            search_operator,
+            c_scale=job.get("c_scale", search_operator["c_scale"]),
+        )
+        previous = identities.setdefault(category, identity)
+        if previous != identity:
+            raise ContractError(
+                f"category {category!r} has multiple realized search operators"
+            )
+    return {category: identities[category] for category in sorted(identities)}
 
 
 def _search_operator(raw: dict[str, Any]) -> dict[str, Any]:
@@ -3705,6 +3757,7 @@ def materialize_generation_campaign(
                 "search_operator_sha256": _digest_value(search),
                 "effective_search_config": _effective_search(search),
                 "effective_search_config_sha256": _digest_value(_effective_search(search)),
+                "category_search_identities": _category_search_identities(search, jobs),
                 "evaluator": arm_evaluator,
                 "evaluator_sha256": _digest_value(arm_evaluator),
                 "value_readout": arm_evaluator["value_readout"],
@@ -4475,6 +4528,14 @@ def _verify_generation_arm_lock(
         for job in jobs
     ):
         raise ContractError("generation arm job identity drift")
+    expected_category_identities = _category_search_identities(search, jobs)
+    sealed_category_identities = science.get("category_search_identities")
+    if (
+        sealed_category_identities is not None
+        and _digest_value(sealed_category_identities)
+        != _digest_value(expected_category_identities)
+    ):
+        raise ContractError("generation arm realized search identity drift")
     expected_workers = [
         placements[str(lane)] | {"id": str(lane)} for lane in arm["logical_lanes"]
     ]
@@ -4778,8 +4839,9 @@ def _job_environment(lock: dict[str, Any], job: dict[str, Any]) -> dict[str, str
 
 
 def _job_attestation(lock: dict[str, Any], job: dict[str, Any]) -> dict[str, Any]:
+    search_identity = _job_search_identity(lock, job)
     return {
-        "schema_version": "a1-generation-job-attestation-v2",
+        "schema_version": GENERATION_JOB_ATTESTATION_SCHEMA,
         **({} if "arm_id" not in job else {"arm_id": job["arm_id"]}),
         **({} if "c_scale" not in job else {"c_scale": job["c_scale"]}),
         "contract_sha256": lock["contract_sha256"],
@@ -4795,8 +4857,8 @@ def _job_attestation(lock: dict[str, Any], job: dict[str, Any]) -> dict[str, Any
         "opponent_checkpoint_sha256": _category_opponent_sha256(
             lock, job["category"]
         ),
-        "search_operator_sha256": lock["science"]["search_operator_sha256"],
-        "effective_search_config_sha256": lock["science"][
+        "search_operator_sha256": search_identity["search_operator_sha256"],
+        "effective_search_config_sha256": search_identity[
             "effective_search_config_sha256"
         ],
         "evaluator_sha256": lock["science"]["evaluator_sha256"],
@@ -4805,6 +4867,18 @@ def _job_attestation(lock: dict[str, Any], job: dict[str, Any]) -> dict[str, Any
         ],
         "teacher_value_readout": lock["science"]["value_readout"],
     }
+
+
+def _legacy_job_attestation(lock: dict[str, Any], job: dict[str, Any]) -> dict[str, Any]:
+    """Reconstruct immutable v2 sidecars issued before realized-operator binding."""
+
+    value = _job_attestation(lock, job)
+    value["schema_version"] = LEGACY_GENERATION_JOB_ATTESTATION_SCHEMA
+    value["search_operator_sha256"] = lock["science"]["search_operator_sha256"]
+    value["effective_search_config_sha256"] = lock["science"][
+        "effective_search_config_sha256"
+    ]
+    return value
 
 
 def _ledger_claim_row(lock: dict[str, Any], job: dict[str, Any]) -> str:
@@ -5727,7 +5801,8 @@ def audit_outputs(
         else:
             try:
                 actual_attestation = _load_json(attestation_path)
-                if actual_attestation != expected_attestation:
+                legacy_attestation = _legacy_job_attestation(lock, job)
+                if actual_attestation not in (expected_attestation, legacy_attestation):
                     errors.append(f"{job['job_id']}: output contract attestation drift")
                 shard_records.append(
                     {
@@ -5884,7 +5959,9 @@ def audit_outputs(
                 )
             actual_search = dict(worker_manifest.get("search_config", {}))
             actual_search.pop("seed", None)
-            if actual_search != lock["science"]["effective_search_config"]:
+            if actual_search != _job_search_identity(lock, job)[
+                "effective_search_config"
+            ]:
                 errors.append(f"{job['job_id']}: worker effective search config drift")
             if worker_manifest.get("selfplay_config") != _expected_selfplay_config(
                 lock
@@ -5954,12 +6031,12 @@ def audit_outputs(
                         "opponent_checkpoint_sha256": _category_opponent_sha256(
                             lock, job["category"]
                         ),
-                        "search_operator_sha256": lock["science"][
+                        "search_operator_sha256": _job_search_identity(lock, job)[
                             "search_operator_sha256"
                         ],
-                        "effective_search_config_sha256": lock["science"][
-                            "effective_search_config_sha256"
-                        ],
+                        "effective_search_config_sha256": _job_search_identity(
+                            lock, job
+                        )["effective_search_config_sha256"],
                         "evaluator_sha256": lock["science"]["evaluator_sha256"],
                     }
                 )
@@ -6345,10 +6422,12 @@ def audit_outputs(
                 "opponent_checkpoint_sha256": _category_opponent_sha256(
                     lock, category
                 ),
-                "search_operator_sha256": lock["science"]["search_operator_sha256"],
-                "effective_search_config_sha256": lock["science"][
-                    "effective_search_config_sha256"
-                ],
+                "search_operator_sha256": _category_search_identities(
+                    lock["science"]["search_operator"], lock["fleet"]["jobs"]
+                )[category]["search_operator_sha256"],
+                "effective_search_config_sha256": _category_search_identities(
+                    lock["science"]["search_operator"], lock["fleet"]["jobs"]
+                )[category]["effective_search_config_sha256"],
                 "evaluator_sha256": lock["science"]["evaluator_sha256"],
             }
             for category in expected_games
