@@ -115,17 +115,21 @@ def _args(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> argparse.Namespace
                 arm._file_ref(descriptor),
             )
         payload = json.loads(Path(path).read_text())
+        component_ids = [row["component_id"] for row in payload["components"]]
         return (
             {
                 "schema_version": "memmap_composite_v2",
                 "descriptor_fingerprint": arm._digest(payload),
                 "policy_distillation_scope_explicit": True,
+                "value_training_scope_explicit": True,
                 "policy_distillation_component_ids": ["n128_current", "n256_current"],
                 "value_training_component_ids": ["n128_current", "n256_current"],
-                "component_ids": ["n128_current", "n256_current", "gen3_replay"],
+                "component_ids": component_ids,
                 "components": payload["components"],
-                "component_game_sampling_ratios": [4.0 / 7.0, 8.0 / 35.0, 1.0 / 5.0],
-                "policy_kl_anchor_component_ids": ["gen3_replay"],
+                "component_game_sampling_ratios": [
+                    row["game_sampling_ratio"] for row in payload["components"]
+                ],
+                "policy_kl_anchor_component_ids": ["n128_current", "n256_current"],
                 "learner_recipe_overrides": payload["learner_recipe_overrides"],
             },
             arm._file_ref(path),
@@ -170,46 +174,84 @@ def test_prepares_exact_one_dose_pure_current_policy_arm_without_launch(
     assert manifest["launch_authorized"] is False
     assert manifest["diagnostic_execution_authorized"] is True
     assert manifest["recipe"]["base_value_row_dose"] == 4_194_304
-    assert manifest["recipe"]["policy_aux_active_row_dose"] == 1_048_576
+    assert manifest["recipe"]["policy_aux_active_row_dose"] == 0
     assert manifest["recipe"]["policy_distillation_component_ids"] == [
         "n128_current", "n256_current"
     ]
     assert manifest["recipe"]["component_game_sampling_ratios"] == pytest.approx(
-        [4 / 7, 8 / 35, 1 / 5]
+        [5 / 7, 2 / 7]
     )
     assert manifest["recipe"]["replay_supervised_policy"] is False
     assert manifest["recipe"]["replay_supervised_value"] is False
-    assert manifest["recipe"]["replay_forward_kl_weight"] == 0.006
+    assert manifest["recipe"]["replay_forward_kl_weight"] == 0.0
     assert manifest["causal_interpretation"]["bundled_optimization_not_f7_replication"] is True
     descriptor = json.loads(Path(manifest["descriptor"]["path"]).read_text())
     assert [row["component_id"] for row in descriptor["components"]] == [
-        "n128_current", "n256_current", "gen3_replay"
+        "n128_current", "n256_current"
     ]
-    assert descriptor["policy_kl_anchor_component_ids"] == ["gen3_replay"]
+    assert descriptor["policy_kl_anchor_component_ids"] == [
+        "n128_current", "n256_current"
+    ]
     assert descriptor["policy_distillation_component_ids"] == [
         "n128_current", "n256_current"
     ]
     assert descriptor["value_training_component_ids"] == [
         "n128_current", "n256_current"
     ]
-    assert descriptor["learner_recipe_overrides"]["policy_kl_anchor_weight"] == 0.006
+    assert descriptor["learner_recipe_overrides"]["policy_kl_anchor_weight"] == 0.0
     command = manifest["command"]
     assert arm._option(command, "--soft-target-weight") == "1.0"
-    assert arm._option(command, "--policy-aux-active-batch-size") == "128"
-    assert arm._option(command, "--policy-kl-anchor-weight") == "0.006"
+    assert arm._option(command, "--policy-aux-active-batch-size") == "0"
+    assert arm._option(command, "--policy-kl-anchor-weight") == "0.0"
     assert arm._option(command, "--policy-kl-anchor-direction") == "forward"
     assert arm._option(command, "--loser-sample-weight") == "1.0"
     assert arm._option(command, "--max-steps") == "1024"
     assert command.count("--validation-game-sentinel-manifest") == 1
-    assert command.count(arm.EVENT_HISTORY_ACK_FLAG) == 3
+    assert command.count(arm.EVENT_HISTORY_ACK_FLAG) == 2
     assert command.count(arm.EVENT_HISTORY_CROP_FLAG) == 1
     assert manifest["event_history_training_contract"][
         "crop_authenticated_empty_event_history"
     ] is True
+    assert manifest["supervision_contract"]["soft_target_weight"] == 1.0
+    assert manifest["supervision_contract"]["replay_objective"] == (
+        "disabled_until_independent_strength_win"
+    )
+    assert manifest["supervision_contract"]["policy_aux_active_batch_size_per_rank"] == 0
     assert "--validation-game-seed-manifest" not in command
     assert command[command.index("torch.distributed.run") + 1] == "--standalone"
     assert [row["role"] for row in manifest["failed_retry_lineage"]["artifacts"]] == list(
         arm.LINEAGE_ROLES
+    )
+
+
+def test_event_history_binding_replaces_removed_replay_ack() -> None:
+    current = ["sha256:" + "1" * 64, "sha256:" + "2" * 64]
+    replay = "sha256:" + "3" * 64
+    command = ["python", "train_bc.py"]
+    for inventory in [*current, replay]:
+        command.extend((arm.EVENT_HISTORY_ACK_FLAG, inventory))
+    descriptor = {
+        "components": [
+            {
+                "component_id": component,
+                "payload_inventory_sha256": inventory,
+            }
+            for component, inventory in zip(
+                arm.CURRENT_TEACHER_COMPONENT_IDS, current, strict=True
+            )
+        ]
+    }
+
+    contract, change = arm._bind_event_history_training_command(command, descriptor)
+
+    positions = [
+        index for index, value in enumerate(command) if value == arm.EVENT_HISTORY_ACK_FLAG
+    ]
+    assert [command[index + 1] for index in positions] == current
+    assert replay not in command
+    assert change["event_history_acknowledgements"]["source"] == [*current, replay]
+    assert contract["empty_payload_inventory_acknowledgements"][0]["component_id"] == (
+        "n128_current"
     )
 
 
@@ -231,7 +273,7 @@ def test_refuses_source_receipt_command_digest_drift(tmp_path: Path) -> None:
         arm._load_source_receipt(path)
 
 
-def test_rederives_sentinel_for_corrected_descriptor_with_same_game_selection(
+def test_rederives_sentinel_after_replay_component_is_removed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     source_sentinel = _write_json(
@@ -261,7 +303,10 @@ def test_rederives_sentinel_for_corrected_descriptor_with_same_game_selection(
                 "source_composite_descriptor_fingerprint": "sha256:new-fingerprint",
                 "selection_seed": 20260711,
                 "target_row_count": 262144,
-                "selected_game_seed_set_sha256": "sha256:same-games",
+                "selected_game_seed_set_sha256": "sha256:new-current-games",
+                "excluded_game_seed_set_sha256": "sha256:current-holdout",
+                "selected_game_seed_count": 100,
+                "selected_row_count": 262100,
             },
         )
         return None
@@ -282,7 +327,7 @@ def test_rederives_sentinel_for_corrected_descriptor_with_same_game_selection(
         python="python",
         repo=tmp_path,
     )
-    assert corrected["selected_game_seed_set_sha256"] == "sha256:same-games"
+    assert corrected["selected_game_seed_set_sha256"] == "sha256:new-current-games"
     assert source_ref["sha256"] == receipt["sentinel_sha256"]
 
 
@@ -353,9 +398,9 @@ def test_rebinds_full_tracked_runtime_closure_and_effective_recipe(
     ]
     monkeypatch.setattr(arm.subprocess, "run", lambda *args, **kwargs: None)
     result = arm._rebind_a1_metadata(command, tmp_path)
-    assert result["effective_recipe"]["policy_aux_active_batch_size"] == 128
+    assert result["effective_recipe"]["policy_aux_active_batch_size"] == 0
     assert result["effective_recipe"]["soft_target_weight"] == 1.0
-    assert arm._option(command, "--a1-learner-ablation-id") == "corrected-anchor-K3"
+    assert arm._option(command, "--a1-learner-ablation-id") == "next-current-teacher-pure"
     rebound = json.loads(arm._option(command, "--a1-ablation-code-binding-json"))
     assert rebound["records"][0]["path"] == str(trainer)
     assert rebound["records"][0]["sha256"] == arm._file_sha(trainer)

@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
-"""Prepare, but never launch, the corrected one-dose A1 policy arm.
+"""Prepare, but never launch, the next one-dose A1 learner recipe.
 
 The builder derives a command from an authenticated prior launch receipt so
 that obscure production flags cannot disappear during experiment iteration.
-It then applies pure search targets, an auxiliary active-policy stream, and a
-light forward-KL replay anchor. Authenticated policy and value scopes exclude
-replay from supervised targets, making it genuinely anchor-only. The emitted
-manifest is preparation only; this module deliberately has no launch mode.
+It applies pure search targets to the two current-teacher components. Historical
+replay is removed from the sampling measure: the light K3 anchor has not shown
+an independent strength win over L1, so retaining a 20% replay draw as an
+unproven default would either dilute supervision or waste compute. The
+previously tested auxiliary policy-row
+stream is deliberately off: adding more active rows did not beat L1 and its
+largest dose regressed. The emitted manifest is preparation only; this module
+deliberately has no launch mode.
 """
 
 from __future__ import annotations
@@ -28,7 +32,11 @@ if str(REPO_ROOT) not in sys.path:
 from tools import train_bc  # noqa: E402
 
 
-SCHEMA = "a1-corrected-policy-arm-manifest-v1"
+SCHEMA = "a1-next-production-learner-manifest-v2"
+SUPERVISION_CONTRACT_SCHEMA = "a1-next-learner-supervision-contract-v1"
+CURRENT_TEACHER_COMPONENT_IDS = ("n128_current", "n256_current")
+REPLAY_COMPONENT_ID = "gen3_replay"
+REPLAY_ANCHOR_WEIGHT = 0.0
 EVENT_HISTORY_COMMAND_CONTRACT_SCHEMA = "a1-event-history-command-contract-v1"
 EVENT_HISTORY_ACK_FLAG = (
     "--acknowledge-empty-event-history-payload-inventory-sha256"
@@ -163,8 +171,21 @@ def _bind_event_history_training_command(
             for index in positions
             if index + 1 < len(command) and not command[index + 1].startswith("--")
         ]
-        if len(observed) != len(positions) or observed != expected:
+        if (
+            len(observed) != len(positions)
+            or len(set(observed)) != len(observed)
+            or any(re.fullmatch(r"sha256:[0-9a-f]{64}", value) is None for value in observed)
+        ):
             raise ArmError("source command event-history acknowledgements drift")
+        # The next recipe removes the replay component, so an authenticated
+        # three-component source command legitimately carries one obsolete ACK.
+        # Replace the complete valued set; never leave an extra authorization
+        # that is no longer represented by the derived descriptor.
+        if observed != expected:
+            for index in reversed(positions):
+                del command[index : index + 2]
+            for inventory in expected:
+                command.extend((EVENT_HISTORY_ACK_FLAG, inventory))
     else:
         for inventory in expected:
             command.extend((EVENT_HISTORY_ACK_FLAG, inventory))
@@ -174,7 +195,7 @@ def _bind_event_history_training_command(
         raise ArmError("source command repeats authenticated event-history crop flag")
     return contract, {
         "event_history_acknowledgements": {
-            "source": "absent" if not positions else expected,
+            "source": "absent" if not positions else observed,
             "treatment": expected,
         },
         EVENT_HISTORY_CROP_FLAG: {
@@ -218,12 +239,14 @@ def _build_corrected_descriptor(
     ) != ["n128_current", "n256_current", "gen3_replay"]:
         raise ArmError("source descriptor must bind n128, n256, and gen3 replay in order")
     overrides = dict(source["learner_recipe_overrides"])
-    overrides["policy_kl_anchor_weight"] = 0.006
+    overrides["policy_kl_anchor_weight"] = REPLAY_ANCHOR_WEIGHT
     overrides["policy_kl_anchor_direction"] = "forward"
     overrides["loser_sample_weight"] = 1.0
     components = []
-    ratios = (4.0 / 7.0, 8.0 / 35.0, 1.0 / 5.0)
-    for source_component, ratio in zip(source["components"], ratios):
+    # Preserve the n128:n256 ratio while renormalizing away the unproven 20%
+    # replay draw: (4/7):(8/35) == 5:2.
+    ratios = (5.0 / 7.0, 2.0 / 7.0)
+    for source_component, ratio in zip(source["components"][:2], ratios):
         components.append(
             {
                 key: source_component[key]
@@ -241,7 +264,10 @@ def _build_corrected_descriptor(
         "components": components,
         "learner_recipe_overrides": overrides,
         "learner_recipe_overrides_sha256": _digest(overrides),
-        "policy_kl_anchor_component_ids": ["gen3_replay"],
+        # Schema v2 requires an authenticated anchor scope even when its
+        # coefficient is zero. Bind it to the current components; the command
+        # and supervision contract separately prove the objective is disabled.
+        "policy_kl_anchor_component_ids": list(CURRENT_TEACHER_COMPONENT_IDS),
         "policy_distillation_component_ids": ["n128_current", "n256_current"],
         "value_training_component_ids": ["n128_current", "n256_current"],
     }
@@ -261,23 +287,24 @@ def _build_corrected_descriptor(
         or verified.get("policy_distillation_scope_explicit") is not True
         or verified.get("policy_distillation_component_ids")
         != ["n128_current", "n256_current"]
-        or verified.get("component_ids")
-        != ["n128_current", "n256_current", "gen3_replay"]
+        or verified.get("component_ids") != list(CURRENT_TEACHER_COMPONENT_IDS)
         or verified.get("component_game_sampling_ratios") != list(ratios)
-        or verified.get("policy_kl_anchor_component_ids") != ["gen3_replay"]
+        or verified.get("policy_kl_anchor_component_ids")
+        != list(CURRENT_TEACHER_COMPONENT_IDS)
         or verified.get("value_training_component_ids")
         != ["n128_current", "n256_current"]
     ):
         raise ArmError(
-            "derived descriptor must preserve exact 57.14/22.86/20 component ratios"
+            "derived descriptor must preserve the current-teacher 5:2 ratio"
         )
     verified_overrides = verified.get("learner_recipe_overrides")
     if not isinstance(verified_overrides, dict) or (
-        float(verified_overrides.get("policy_kl_anchor_weight", -1.0)) != 0.006
+        float(verified_overrides.get("policy_kl_anchor_weight", -1.0))
+        != REPLAY_ANCHOR_WEIGHT
         or verified_overrides.get("policy_kl_anchor_direction") != "forward"
         or float(verified_overrides.get("loser_sample_weight", -1.0)) != 1.0
     ):
-        raise ArmError("derived descriptor must bind loser=1 and exact light forward anchor")
+        raise ArmError("derived descriptor must bind loser=1 and disabled replay anchor")
     return verified, ref, source_ref
 
 
@@ -322,10 +349,15 @@ def _build_corrected_sentinel(
         != descriptor_meta["descriptor_fingerprint"]
         or corrected.get("selection_seed") != source_payload.get("selection_seed")
         or corrected.get("target_row_count") != source_payload.get("target_row_count")
-        or corrected.get("selected_game_seed_set_sha256")
-        != source_payload.get("selected_game_seed_set_sha256")
     ):
-        raise ArmError("corrected validation sentinel identity differs from source selection")
+        raise ArmError("next validation sentinel derivation contract drifted")
+    if (
+        not isinstance(corrected.get("selected_game_seed_set_sha256"), str)
+        or not isinstance(corrected.get("excluded_game_seed_set_sha256"), str)
+        or int(corrected.get("selected_game_seed_count", 0)) <= 0
+        or int(corrected.get("selected_row_count", 0)) <= 0
+    ):
+        raise ArmError("next validation sentinel contains no authenticated selection")
     return corrected, corrected_ref, source_ref
 
 
@@ -408,8 +440,8 @@ def _rebind_a1_metadata(command: list[str], repo: Path) -> dict[str, Any]:
         "policy_loss_weight": 1.0, "soft_target_source": "policy",
         "soft_target_weight": 1.0, "soft_target_temperature": 0.7,
         "soft_target_min_legal_coverage": 0.5,
-        "policy_aux_active_batch_size": 128,
-        "policy_kl_anchor_weight": 0.006,
+        "policy_aux_active_batch_size": 0,
+        "policy_kl_anchor_weight": REPLAY_ANCHOR_WEIGHT,
         "value_loss_weight": 0.25, "value_lr_mult": 0.3,
         "value_target_lambda": 1.0, "lr": 3e-5,
         "lr_warmup_steps": 100, "lr_schedule": "flat",
@@ -454,7 +486,7 @@ def _rebind_a1_metadata(command: list[str], repo: Path) -> dict[str, Any]:
     }
     code_sha = _digest(binding)
     binding["code_tree_sha256"] = code_sha
-    _set_option(command, "--a1-learner-ablation-id", "corrected-anchor-K3")
+    _set_option(command, "--a1-learner-ablation-id", "next-current-teacher-pure")
     _set_option(command, "--a1-effective-learner-recipe-json", _canonical(effective).decode())
     _set_option(command, "--a1-effective-learner-recipe-sha256", _digest(effective))
     _set_option(command, "--a1-ablation-code-binding-json", _canonical(binding).decode())
@@ -499,9 +531,9 @@ def _derive_command(
         "--soft-target-weight": "1.0",
         "--soft-target-temperature": "0.7",
         "--soft-target-min-legal-coverage": "0.5",
-        "--policy-aux-active-batch-size": "128",
+        "--policy-aux-active-batch-size": "0",
         "--policy-kl-anchor-direction": "forward",
-        "--policy-kl-anchor-weight": "0.006",
+        "--policy-kl-anchor-weight": str(REPLAY_ANCHOR_WEIGHT),
         "--value-loss-weight": "0.25",
         "--value-lr-mult": "0.3",
         "--value-target-lambda": "1.0",
@@ -520,6 +552,68 @@ def _derive_command(
         if before[flag] != value
     }
     return command, changes
+
+
+def _next_supervision_contract(
+    descriptor_meta: Mapping[str, Any], command: Sequence[str]
+) -> dict[str, Any]:
+    """Recompute the exact supervision operator for prepare and execution.
+
+    A replay component with no supervised policy/value loss and a zero anchor
+    would consume draws while contributing no objective.  K3 has not shown an
+    independent win, so the production-next default removes replay entirely.
+    """
+
+    current = list(CURRENT_TEACHER_COMPONENT_IDS)
+    component_ids = list(descriptor_meta.get("component_ids", ()))
+    ratios = list(descriptor_meta.get("component_game_sampling_ratios", ()))
+    if component_ids != current or ratios != [5.0 / 7.0, 2.0 / 7.0]:
+        raise ArmError("next learner component identity/ratio contract drift")
+    if (
+        descriptor_meta.get("policy_distillation_scope_explicit") is not True
+        or descriptor_meta.get("value_training_scope_explicit") is not True
+        or descriptor_meta.get("policy_distillation_component_ids") != current
+        or descriptor_meta.get("value_training_component_ids") != current
+        or descriptor_meta.get("policy_kl_anchor_component_ids") != current
+    ):
+        raise ArmError(
+            "next learner must contain and supervise only current teachers"
+        )
+    exact_options = {
+        "--soft-target-source": "policy",
+        "--soft-target-weight": "1.0",
+        "--policy-aux-active-batch-size": "0",
+        "--policy-kl-anchor-direction": "forward",
+        "--policy-kl-anchor-weight": str(REPLAY_ANCHOR_WEIGHT),
+        "--winner-sample-weight": "1.0",
+        "--loser-sample-weight": "1.0",
+    }
+    observed = {flag: _option(command, flag) for flag in exact_options}
+    if observed != exact_options:
+        raise ArmError(f"next learner command supervision drift: {observed}")
+    contract = {
+        "schema_version": SUPERVISION_CONTRACT_SCHEMA,
+        "component_ids": component_ids,
+        "component_game_sampling_ratios": ratios,
+        "policy_distillation_component_ids": current,
+        "value_training_component_ids": current,
+        "replay_component_id": None,
+        "replay_sampling_ratio": 0.0,
+        "replay_objective": "disabled_until_independent_strength_win",
+        "replay_forward_kl_weight": 0.0,
+        "soft_target_source": "policy",
+        "soft_target_weight": 1.0,
+        "policy_aux_active_batch_size_per_rank": 0,
+        "outcome_conditioned_policy_weighting": False,
+        "expected_train_report_provenance": {
+            "policy_distillation_scope.component_ids": current,
+            "value_training_scope.component_ids": current,
+            "memmap_composite.policy_kl_anchor_component_ids": current,
+            "soft_target_weight": 1.0,
+        },
+    }
+    contract["contract_sha256"] = _digest(contract)
+    return contract
 
 
 def prepare(args: argparse.Namespace) -> tuple[dict[str, Any], Path]:
@@ -566,18 +660,20 @@ def prepare(args: argparse.Namespace) -> tuple[dict[str, Any], Path]:
     )
     changes.update(event_history_changes)
     a1_metadata = _rebind_a1_metadata(command, repo)
+    supervision_contract = _next_supervision_contract(descriptor_meta, command)
     recipe = {
         "world_size": 8, "local_batch_size": 512, "global_batch_size": 4096,
         "steps": 1024, "base_value_row_dose": 4_194_304,
-        "policy_aux_active_batch_size_per_rank": 128,
-        "policy_aux_active_row_dose": 1_048_576,
-        "policy_distillation_component_ids": ["n128_current", "n256_current"],
-        "component_game_sampling_ratios": [4.0 / 7.0, 8.0 / 35.0, 1.0 / 5.0],
-        "current_supervised_base_row_dose": 3_355_443.2,
-        "replay_anchor_base_row_dose": 838_860.8,
+        "policy_aux_active_batch_size_per_rank": 0,
+        "policy_aux_active_row_dose": 0,
+        "policy_distillation_component_ids": list(CURRENT_TEACHER_COMPONENT_IDS),
+        "value_training_component_ids": list(CURRENT_TEACHER_COMPONENT_IDS),
+        "component_game_sampling_ratios": [5.0 / 7.0, 2.0 / 7.0],
+        "current_supervised_base_row_dose": 4_194_304.0,
+        "replay_anchor_base_row_dose": 0.0,
         "replay_supervised_policy": False,
         "replay_supervised_value": False,
-        "replay_forward_kl_weight": 0.006,
+        "replay_forward_kl_weight": REPLAY_ANCHOR_WEIGHT,
         "soft_target_weight": 1.0, "fresh_optimizer": True,
         "independent_f7_initialization": True,
     }
@@ -602,13 +698,14 @@ def prepare(args: argparse.Namespace) -> tuple[dict[str, Any], Path]:
         "source_binding": source_binding,
         "a1_runtime_metadata": a1_metadata,
         "event_history_training_contract": event_history_contract,
+        "supervision_contract": supervision_contract,
         "recipe": recipe,
         "recipe_sha256": _digest(recipe),
         "causal_interpretation": {
             "bundled_optimization_not_f7_replication": True,
             "reason": (
                 "f7 used loser=.3 and about 2.78M samples; this loser=1, 4.19M, "
-                "aux128, pure-target arm is an optimization bundle, not a one-axis "
+                "current-teacher-only pure-target arm is an optimization bundle, not a one-axis "
                 "replication of f7"
             ),
         },

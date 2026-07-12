@@ -61,6 +61,60 @@ def test_verify_replays_manifest_inputs_and_real_sentinel_flag(
     assert "--validation-game-seed-manifest" not in verified["command"]
 
 
+def _write_realized_report(payload: dict) -> Path:
+    report = Path(arm._option(payload["command"], "--report"))
+    report.parent.mkdir(parents=True, exist_ok=True)
+    current = list(arm.CURRENT_TEACHER_COMPONENT_IDS)
+    report.write_text(
+        json.dumps(
+            {
+                "policy_distillation_scope": {"component_ids": current},
+                "value_training_scope": {"component_ids": current},
+                "memmap_composite": {
+                    "policy_distillation_component_ids": current,
+                    "value_training_component_ids": current,
+                    "policy_kl_anchor_component_ids": current,
+                    "policy_distillation_scope_explicit": True,
+                    "value_training_scope_explicit": True,
+                },
+                "soft_target_source": "policy",
+                "soft_target_weight": 1.0,
+                "policy_aux_active_batch_size": 0,
+                "policy_kl_anchor_direction": "forward",
+                "policy_kl_anchor_weight": arm.REPLAY_ANCHOR_WEIGHT,
+                "winner_sample_weight": 1.0,
+                "loser_sample_weight": 1.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return report
+
+
+def test_verify_training_report_replays_supervision_provenance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path, payload = _manifest(tmp_path, monkeypatch)
+    report = _write_realized_report(payload)
+    verified = executor.verify_training_report(path, report)
+    assert verified["verified"] is True
+    assert verified["supervision_contract_sha256"] == payload[
+        "supervision_contract"
+    ]["contract_sha256"]
+
+
+def test_verify_training_report_refuses_scope_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path, payload = _manifest(tmp_path, monkeypatch)
+    report = _write_realized_report(payload)
+    value = json.loads(report.read_text())
+    value["value_training_scope"]["component_ids"].append(arm.REPLAY_COMPONENT_ID)
+    report.write_text(json.dumps(value), encoding="utf-8")
+    with pytest.raises(executor.ExecutionError, match="scope provenance drift"):
+        executor.verify_training_report(path, report)
+
+
 def test_verify_refuses_manifest_semantic_drift(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -68,6 +122,33 @@ def test_verify_refuses_manifest_semantic_drift(
     payload["recipe"]["replay_forward_kl_weight"] = 999
     path.write_text(json.dumps(payload))
     with pytest.raises(executor.ExecutionError, match="semantic digest drift"):
+        executor.verify(path)
+
+
+@pytest.mark.parametrize(
+    ("flag", "value"),
+    [
+        ("--soft-target-weight", "0.9"),
+        ("--policy-aux-active-batch-size", "128"),
+        ("--policy-kl-anchor-weight", "0.006"),
+        ("--loser-sample-weight", "0.3"),
+    ],
+)
+def test_verify_refuses_rehashed_supervision_operator_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    flag: str,
+    value: str,
+) -> None:
+    path, payload = _manifest(tmp_path, monkeypatch)
+    index = payload["command"].index(flag)
+    payload["command"][index + 1] = value
+    payload["command_sha256"] = arm._digest(payload["command"])
+    payload.pop("manifest_sha256", None)
+    payload["manifest_sha256"] = arm._digest(payload)
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+
+    with pytest.raises(executor.ExecutionError, match="supervision drift"):
         executor.verify(path)
 
 

@@ -71,10 +71,10 @@ def _source_manifest(tmp_path: Path, source: Path, descriptor: Path,
     recipe = {
         "world_size": 8, "local_batch_size": 512, "global_batch_size": 4096,
         "steps": 1024, "base_value_row_dose": 4_194_304,
-        "policy_aux_active_batch_size_per_rank": 128,
-        "policy_aux_active_row_dose": 1_048_576,
+        "policy_aux_active_batch_size_per_rank": 0,
+        "policy_aux_active_row_dose": 0,
         "replay_supervised_policy": False, "replay_supervised_value": False,
-        "replay_forward_kl_weight": 0.006, "soft_target_weight": 1.0,
+        "replay_forward_kl_weight": 0.0, "soft_target_weight": 1.0,
         "fresh_optimizer": True, "independent_f7_initialization": True,
     }
     payload = {
@@ -139,7 +139,7 @@ def _args(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
                 "payload_inventory_sha256": "sha256:" + str(index) * 64,
             }
             for index, (component_id, path) in enumerate(zip(
-                ("n128_current", "n256_current", "gen3_replay"), corpora
+                ("n128_current", "n256_current"), corpora[:2]
             ), start=1)
         ],
         "policy_distillation_component_ids": ["n128_current", "n256_current"],
@@ -187,7 +187,7 @@ def test_prepares_one_axis_gather_k3_without_launch(tmp_path, monkeypatch):
     assert manifest["executor_compatibility"]["compatible_now"] is True
     assert manifest["executor_compatibility"]["one_shot"] is True
     command = manifest["command"]
-    assert command.count(arm.corrected.EVENT_HISTORY_ACK_FLAG) == 3
+    assert command.count(arm.corrected.EVENT_HISTORY_ACK_FLAG) == 2
     assert command.count(arm.corrected.EVENT_HISTORY_CROP_FLAG) == 1
     assert manifest["event_history_training_contract"][
         "crop_authenticated_empty_event_history"

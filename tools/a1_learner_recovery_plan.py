@@ -61,6 +61,15 @@ def _base_recipe() -> dict[str, Any]:
         "per_game_value_weight_mode": "equal",
         "policy_kl_anchor_weight": 0.0,
         "policy_kl_anchor_direction": "forward",
+        # Next-production supervision contract. Search-policy CE and terminal
+        # value targets belong only to the current n128/n256 teachers. The
+        # older gen3 component is behavior rehearsal through forward prior KL,
+        # never an obsolete search/value teacher.
+        "policy_distillation_component_ids": ["n128_current", "n256_current"],
+        "value_training_component_ids": ["n128_current", "n256_current"],
+        "policy_kl_anchor_component_ids": ["gen3_replay"],
+        "soft_target_source": "policy",
+        "soft_target_weight": 1.0,
         "q_loss_weight": 0.0,
         "value_head_type": "mse",
         "value_lr_mult": 0.3,
@@ -157,12 +166,22 @@ def build_plan(*, world_size: int, local_batch_size: int, grad_accum_steps: int)
             "escalated_steps": _steps(ESCALATED_SAMPLES, global_batch),
         },
         "fixed_data_recipe": {
-            "fresh_components": ["n128", "n256"],
+            "fresh_components": ["n128_current", "n256_current"],
             "global_shuffle": True,
             "validation_split": "game-disjoint",
             "incumbent_mixed_replay_ratio_by_game": 0.2,
             "replay_stage": "fixed throughout P1; K0 is replay without KL anchor",
+            "policy_distillation_component_ids": ["n128_current", "n256_current"],
+            "value_training_component_ids": ["n128_current", "n256_current"],
+            "policy_kl_anchor_component_ids": ["gen3_replay"],
+            "replay_objective": "forward_kl_prior_rehearsal_only",
         },
+        "production_next_default_arm": "CURRENT_PURE",
+        "production_next_default_reason": (
+            "the sealed next-production builder removes replay and renormalizes the "
+            "current n128:n256 measure to 5:2; K0/K3/K10 remain historical diagnostic "
+            "controls because K3 has no independent strength win over L1"
+        ),
         "initialization_and_dose_policy": {
             "default_mode": "direct_from_declared_producer",
             "required_init_sha": "declared producer/incumbent checkpoint SHA-256",

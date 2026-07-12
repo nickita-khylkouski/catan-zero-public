@@ -157,6 +157,19 @@ def verify(manifest_path: Path) -> dict[str, Any]:
     _verify_event_history_training_contract(
         manifest, command, Path(manifest["descriptor"]["path"])
     )
+    try:
+        descriptor_meta, _ = prepare._preflight_descriptor(  # noqa: SLF001
+            Path(manifest["descriptor"]["path"])
+        )
+        supervision_contract = prepare._next_supervision_contract(  # noqa: SLF001
+            descriptor_meta, command
+        )
+    except prepare.ArmError as error:
+        raise ExecutionError(str(error)) from error
+    if manifest.get("supervision_contract") != supervision_contract:
+        raise ExecutionError(
+            "manifest supervision contract differs from executable descriptor/command"
+        )
     if "--validation-game-seed-manifest" in command:
         raise ExecutionError("command contains a second validation control")
     output_root = Path(_option(command, "--checkpoint")).parent.resolve()
@@ -180,6 +193,72 @@ def verify(manifest_path: Path) -> dict[str, Any]:
     return {
         "manifest": manifest, "manifest_ref": manifest_ref, "repo": repo,
         "command": command, "output_root": output_root,
+    }
+
+
+def verify_training_report(manifest_path: Path, report_path: Path) -> dict[str, Any]:
+    """Authenticate the realized trainer report against the next recipe.
+
+    This is intentionally separate from :func:`verify`: pre-submit verification
+    requires fresh output paths, while completion verification necessarily runs
+    after ``train.report.json`` exists.
+    """
+
+    manifest, manifest_ref = _read_manifest(manifest_path)
+    command = manifest.get("command")
+    if not isinstance(command, list) or manifest.get("command_sha256") != prepare._digest(  # noqa: SLF001
+        command
+    ):
+        raise ExecutionError("manifest command is malformed or drifted")
+    expected_path = Path(_option(command, "--report")).resolve()
+    report_path = report_path.expanduser().resolve(strict=True)
+    if report_path != expected_path:
+        raise ExecutionError("training report path differs from sealed command")
+    try:
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ExecutionError(f"training report is unreadable: {error}") from error
+    if not isinstance(report, dict):
+        raise ExecutionError("training report must contain an object")
+    contract = manifest.get("supervision_contract")
+    if not isinstance(contract, dict) or contract.get(
+        "schema_version"
+    ) != prepare.SUPERVISION_CONTRACT_SCHEMA:
+        raise ExecutionError("manifest has no next-learner supervision contract")
+    expected_current = list(prepare.CURRENT_TEACHER_COMPONENT_IDS)
+    policy_scope = report.get("policy_distillation_scope")
+    value_scope = report.get("value_training_scope")
+    composite = report.get("memmap_composite")
+    if not (
+        isinstance(policy_scope, dict)
+        and policy_scope.get("component_ids") == expected_current
+        and isinstance(value_scope, dict)
+        and value_scope.get("component_ids") == expected_current
+        and isinstance(composite, dict)
+        and composite.get("policy_distillation_component_ids") == expected_current
+        and composite.get("value_training_component_ids") == expected_current
+        and composite.get("policy_kl_anchor_component_ids") == expected_current
+        and composite.get("policy_distillation_scope_explicit") is True
+        and composite.get("value_training_scope_explicit") is True
+    ):
+        raise ExecutionError("training report supervision-scope provenance drift")
+    exact_scalars = {
+        "soft_target_source": "policy",
+        "soft_target_weight": 1.0,
+        "policy_aux_active_batch_size": 0,
+        "policy_kl_anchor_direction": "forward",
+        "policy_kl_anchor_weight": prepare.REPLAY_ANCHOR_WEIGHT,
+        "winner_sample_weight": 1.0,
+        "loser_sample_weight": 1.0,
+    }
+    observed = {key: report.get(key) for key in exact_scalars}
+    if observed != exact_scalars:
+        raise ExecutionError(f"training report supervision scalar drift: {observed}")
+    return {
+        "manifest": manifest_ref,
+        "report": {"path": str(report_path), "sha256": prepare._file_sha(report_path)},  # noqa: SLF001
+        "supervision_contract_sha256": contract.get("contract_sha256"),
+        "verified": True,
     }
 
 
@@ -338,7 +417,13 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--manifest", required=True, type=Path)
     parser.add_argument("--unit", default="a1-corrected-anchor-k3")
     parser.add_argument("--go", action="store_true")
+    parser.add_argument("--verify-report", type=Path)
     args = parser.parse_args(argv)
+    if args.verify_report is not None:
+        if args.go:
+            raise SystemExit("--verify-report and --go are mutually exclusive")
+        print(json.dumps(verify_training_report(args.manifest, args.verify_report), sort_keys=True))
+        return
     if not args.go:
         verified = verify(args.manifest)
         print(json.dumps({"verified": True, "launched": False,
