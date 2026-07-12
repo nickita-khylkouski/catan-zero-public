@@ -981,3 +981,46 @@ def test_train_bc_guards_run_before_expensive_memmap_preflight(monkeypatch):
         )
 
     assert preflight_calls == []
+
+
+def test_train_bc_checkpoint_topology_runs_before_memmap_preflight(monkeypatch):
+    """A warm-start topology mismatch must not first hash the data payload."""
+
+    class TopologyRefused(RuntimeError):
+        pass
+
+    preflight_calls: list[object] = []
+    monkeypatch.setattr(launcher_guards, "run_or_refuse", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        train_bc, "_resolve_effective_value_categorical_bins", lambda args: 0
+    )
+    monkeypatch.setattr(
+        train_bc,
+        "_preflight_init_checkpoint_architecture",
+        lambda *args, **kwargs: (_ for _ in ()).throw(TopologyRefused()),
+    )
+    monkeypatch.setattr(
+        train_bc,
+        "_coordinated_a1_memmap_preflight",
+        lambda *args, **kwargs: preflight_calls.append((args, kwargs)),
+    )
+
+    with pytest.raises(TopologyRefused):
+        train_bc.main(
+            [
+                "--arch",
+                "entity_graph",
+                "--data",
+                "/does/not/need/to/exist",
+                "--data-format",
+                "memmap",
+                "--init-checkpoint",
+                "/does/not/need/to/exist.pt",
+                "--checkpoint",
+                "/does/not/need/to/exist-output.pt",
+                "--report",
+                "/does/not/need/to/exist.json",
+            ]
+        )
+
+    assert preflight_calls == []

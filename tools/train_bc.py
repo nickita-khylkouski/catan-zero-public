@@ -3651,6 +3651,28 @@ def main(argv: Sequence[str] | None = None) -> None:
         launcher="train_bc",
         skip=bool(args.skip_guards),
     )
+    # Check checkpoint/topology compatibility before authenticating the data
+    # payload.  A parser default that disagrees with a warm-start checkpoint is
+    # a command-construction error and must fail in seconds, not after hashing
+    # hundreds of gigabytes.
+    if args.hidden_size is None:
+        args.hidden_size = (
+            640
+            if args.arch == "entity_graph"
+            else 768
+            if args.arch == "xdim_graph"
+            else 512
+        )
+    if args.grow_from_checkpoint and args.init_checkpoint:
+        raise SystemExit(
+            "--grow-from-checkpoint and --init-checkpoint are mutually exclusive: "
+            "--init-checkpoint resumes at the checkpoint's exact architecture, "
+            "--grow-from-checkpoint warm-starts a fresh (bigger) architecture"
+        )
+    if args.grow_from_checkpoint and args.arch != "entity_graph":
+        raise SystemExit("--grow-from-checkpoint currently supports --arch entity_graph only")
+    args.value_categorical_bins = _resolve_effective_value_categorical_bins(args)
+    _preflight_init_checkpoint_architecture(args, ddp)
     a1_preflight_meta: dict[str, object] | None = None
     if args.data_format == "memmap":
         a1_preflight_meta = _coordinated_a1_memmap_preflight(
@@ -3798,8 +3820,6 @@ def main(argv: Sequence[str] | None = None) -> None:
         torch.set_float32_matmul_precision("high")
         if str(args.device).startswith("cuda") and not torch.cuda.is_bf16_supported():
             raise SystemExit("--amp bf16 requested but CUDA device lacks BF16 support")
-
-    _preflight_init_checkpoint_architecture(args, ddp)
 
     if args.skip_teacher_quality_gate:
         _rank0_print(
