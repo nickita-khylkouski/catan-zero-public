@@ -19,3 +19,5 @@ def test_corrective_launcher_is_syntax_clean_and_fail_closed_on_handoff() -> Non
     assert 'overrides=\'{"loser_sample_weight":1.0,"lr":0.00012}\'' in text
     assert "--world-size 8" in text
     assert "--curriculum-parent-receipt" in text
+    assert "decoder.raw_decode" in text
+    assert "unexpected dual learner dry-run stdout stream" in text

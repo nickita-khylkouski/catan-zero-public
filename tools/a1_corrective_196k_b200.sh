@@ -91,8 +91,22 @@ run_dose() {
   [[ -z "$parent" ]] || command+=(--curriculum-parent-receipt "$parent")
   "${command[@]}" >"$dose/dry-run.json"
   "$python" - "$dose/dry-run.json" "$arm" "$subset" <<'PY'
-import json, math, sys
-p=json.load(open(sys.argv[1],encoding="utf-8"))
+import json, math, pathlib, sys
+text=pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+decoder=json.JSONDecoder(); values=[]; offset=0
+while offset < len(text):
+    while offset < len(text) and text[offset].isspace():
+        offset += 1
+    if offset == len(text):
+        break
+    value, offset = decoder.raw_decode(text, offset)
+    values.append(value)
+if not values or any(
+    not isinstance(value, dict) or "progress" not in value
+    for value in values[:-1]
+):
+    raise SystemExit("REFUSED: unexpected dual learner dry-run stdout stream")
+p=values[-1]
 assert (p["arm_id"],p["subset_id"])==(sys.argv[2],sys.argv[3])
 assert p["world_size"]==8 and p["global_batch_size"]==4096
 assert p["inputs"]["learner_ablation"]["effective_recipe"]["lr"]==0.00012
