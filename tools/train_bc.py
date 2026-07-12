@@ -6734,6 +6734,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         "parameter_count": int(_parameter_count(policy)),
         "world_size": ddp["world_size"],
         "ddp_shard_data": bool(args.ddp_shard_data),
+        "ddp_find_unused_parameters": bool(args.ddp_find_unused_parameters),
         "teacher_weights": _parse_weight_map(args.teacher_weights),
         "phase_weights": _parse_weight_map(args.phase_weights),
         "value_phase_weights": _parse_weight_map(value_phase_weights_raw),
