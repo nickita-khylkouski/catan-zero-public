@@ -369,6 +369,72 @@ def test_policy_loss_weight_scales_the_policy_term_in_train_xdim_batch(
     )
 
 
+def test_train_xdim_reports_soft_targets_conditioned_on_policy_active_rows(
+    tmp_path, monkeypatch
+) -> None:
+    import torch
+    from tools import train_bc
+
+    samples = _collect_real_samples(6)
+    data = _write_and_load_shard(tmp_path, samples)
+    n = len(data["action_taken"])
+    batch = np.arange(n)
+    legal = np.asarray(data["legal_action_ids"][batch])
+    multi_action = np.sum(legal >= 0, axis=1) > 1
+    assert np.count_nonzero(multi_action) >= 2
+
+    # Every multi-action row has a valid soft distribution, while only one of
+    # those rows is admitted to policy CE. This reproduces the production
+    # distinction between stored targets and policy_weight_multiplier.
+    def uniform_soft_targets(data_arg, batch_arg, device, *_args):
+        legal_arg = np.asarray(data_arg["legal_action_ids"][batch_arg])
+        support_np = legal_arg >= 0
+        counts = np.maximum(support_np.sum(axis=1, keepdims=True), 1)
+        targets_np = support_np.astype(np.float32) / counts
+        has_soft_np = support_np.sum(axis=1) > 1
+        return (
+            torch.as_tensor(targets_np, device=device),
+            torch.as_tensor(has_soft_np, dtype=torch.bool, device=device),
+            torch.as_tensor(support_np, dtype=torch.bool, device=device),
+        )
+
+    monkeypatch.setattr(train_bc, "_soft_targets_legal", uniform_soft_targets)
+    policy_weights = np.zeros(n, dtype=np.float32)
+    active_row = int(np.flatnonzero(multi_action)[0])
+    policy_weights[active_row] = 1.0
+    policy = _make_entity_policy()
+    optimizer = torch.optim.SGD(policy.model.parameters(), lr=0.0)
+
+    metrics = _train_xdim_batch(
+        policy,
+        optimizer,
+        data,
+        batch,
+        policy_weights,
+        np.ones(n, dtype=np.float32),
+        soft_target_temperature=1.0,
+        soft_target_weight=1.0,
+        soft_target_source="policy",
+        soft_target_min_legal_coverage=0.0,
+        policy_loss_weight=1.0,
+        value_loss_weight=0.0,
+        final_vp_loss_weight=0.0,
+        q_loss_weight=0.0,
+        q_skip_teacher_prefixes=(),
+        vps_to_win=10,
+        advantage_policy_weighting="none",
+        advantage_temperature=1.0,
+        advantage_weight_cap=5.0,
+        advantage_weight_floor=0.05,
+        amp="none",
+        diagnostics=False,
+    )
+
+    assert metrics["soft_distillation_rows"] == int(np.count_nonzero(multi_action))
+    assert metrics["soft_distillation_active_rows"] == 1
+    assert metrics["active_count"] == 1
+
+
 def test_policy_aux_batch_combines_parts_and_adds_no_value_gradient(tmp_path) -> None:
     import copy
     import torch

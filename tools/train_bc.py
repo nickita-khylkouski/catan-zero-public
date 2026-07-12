@@ -5769,6 +5769,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             "value_categorical_truncated_loss": 0.0,
             "q_score_rows_ge2": 0.0,
             "soft_distillation_rows": 0.0,
+            "soft_distillation_active_rows": 0.0,
             "advantage_weight_rows": 0.0,
             "advantage_mean_sum": 0.0,
             "advantage_weight_mean_sum": 0.0,
@@ -6031,6 +6032,9 @@ def main(argv: Sequence[str] | None = None) -> None:
             epoch_extra_sums["soft_distillation_rows"] += float(
                 batch_metrics.get("soft_distillation_rows", 0.0)
             )
+            epoch_extra_sums["soft_distillation_active_rows"] += float(
+                batch_metrics.get("soft_distillation_active_rows", 0.0)
+            )
             advantage_rows = float(batch_metrics.get("advantage_weight_rows", 0.0))
             epoch_extra_sums["advantage_weight_rows"] += advantage_rows
             epoch_extra_sums["advantage_mean_sum"] += (
@@ -6239,6 +6243,13 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "q_score_rows_ge2_fraction": epoch_extra_sums["q_score_rows_ge2"] / max(total_count, 1.0),
                 "soft_distillation_rows": int(round(epoch_extra_sums["soft_distillation_rows"])),
                 "soft_distillation_fraction": epoch_extra_sums["soft_distillation_rows"] / max(total_count, 1.0),
+                "soft_distillation_active_rows": int(
+                    round(epoch_extra_sums["soft_distillation_active_rows"])
+                ),
+                "soft_distillation_active_fraction": (
+                    epoch_extra_sums["soft_distillation_active_rows"]
+                    / max(epoch_active_count, 1.0)
+                ),
                 "advantage_weight_rows": int(round(epoch_extra_sums["advantage_weight_rows"])),
                 "advantage_mean": (
                     epoch_extra_sums["advantage_mean_sum"]
@@ -7910,6 +7921,14 @@ def _train_xdim_batch(
         "q_score_rows_ge2": q_score_rows_ge2,
         **advantage_stats,
         "soft_distillation_rows": int(has_soft.sum().item()) if soft_targets is not None else 0,
+        # ``has_soft`` describes every row carrying a target distribution, but
+        # policy_weight_multiplier deliberately makes most fast/forced rows
+        # value-only.  Report the intersection as well: the unconditional count
+        # made A1 look only ~49% soft-distilled even though 100% of the rows that
+        # actually entered policy CE used the search distribution.
+        "soft_distillation_active_rows": (
+            int((has_soft & active).sum().item()) if soft_targets is not None else 0
+        ),
         "active_count": active_count,
         "policy_aux_active_count": int(policy_aux_active_count),
         "accuracy": float(accuracy.item()),
