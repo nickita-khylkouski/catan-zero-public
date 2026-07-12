@@ -1055,8 +1055,15 @@ class ColonistMultiAgentEnv:
         elif action_type == "DISCARD_RESOURCE":
             if isinstance(action, dict):
                 action = dict(action)
+                # The flat action index is itself private here: each
+                # DISCARD_RESOURCE catalog entry is keyed by the discarded
+                # resource. Redacting only ``value`` while preserving
+                # ``index`` leaks the exact card through entity event-token
+                # slot 35 (``_event_action_id``).
+                action["index"] = None
                 action["value"] = "hidden_resource"
                 payload["action"] = action
+            payload["action_index"] = None
             payload["result"] = "hidden_resource"
         redacted["payload"] = payload
         return redacted

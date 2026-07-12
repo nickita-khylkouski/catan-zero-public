@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -41,11 +42,35 @@ from catan_zero.rl.multiagent_env import ColonistMultiAgentEnv
 
 from catanatron_player_adapter import (  # type: ignore  # noqa: E402
     CatanZeroNetPlayer,
+    _reencode_action_index,
+    _synthetic_event_log,
     bind_external_game,
     default_bridge_config,
     make_bridge_env,
     standard_colors,
 )
+
+
+def test_synthetic_discard_history_never_reemits_hidden_resource_id() -> None:
+    action_type = SimpleNamespace(name="DISCARD_RESOURCE")
+    action = SimpleNamespace(
+        action_type=action_type,
+        color=SimpleNamespace(name="RED"),
+        value=SimpleNamespace(name="ORE", value="ORE"),
+    )
+    env = SimpleNamespace(action_catalog=SimpleNamespace(try_encode=lambda _action: 123))
+    game = SimpleNamespace(
+        state=SimpleNamespace(
+            action_records=[SimpleNamespace(action=action, result=action.value)]
+        )
+    )
+
+    assert _reencode_action_index(env, action) is None
+    event = _synthetic_event_log(env, game, history_limit=64)[-1]
+    assert event["payload"]["action_index"] is None
+    assert event["payload"]["action"]["index"] is None
+    assert event["payload"]["action"]["value"] == "hidden_resource"
+    assert event["payload"]["result"] == "hidden_resource"
 
 # entity_token_features._event_tokens slots 15/16 encode a per-event
 # `turn_key` ordinal that `_synthetic_event_log` deliberately does not
@@ -54,14 +79,15 @@ _EVENT_TURN_KEY_SLOTS = (15, 16)
 
 # entity_token_features._event_tokens slot 35 encodes the event's numeric
 # action-id (`_event_action_id`). `_reencode_action_index`'s docstring
-# documents exactly two categories of native action that are NOT re-encoded:
+# documents the categories of native action that are NOT re-encoded:
 # trade-negotiation actions (colonist-specific offer combos / dynamic
 # `current_trade` state) and chance-resolved actions ROLL/BUY_DEVELOPMENT_
 # CARD (ActionCatalog only has one generic pre-resolution entry for each;
-# the executed action carries the resolved dice/card). Masked ONLY for rows
-# matching one of those, so this test still strictly verifies action-id
-# fidelity for every OTHER action type (build, end_turn, move_robber,
-# discard, maritime_trade, play_*).
+# the executed action carries the resolved dice/card), plus DISCARD_RESOURCE,
+# whose otherwise recoverable index is deliberately redacted because it
+# identifies the hidden resource. Masked ONLY for rows matching one of those,
+# so this test still strictly verifies action-id fidelity for every OTHER
+# action type (build, end_turn, move_robber, maritime_trade, play_*).
 _ACTION_ID_SLOT = 35
 _UNRECODABLE_ACTION_TYPE_COLUMNS = tuple(
     17 + ACTION_TYPES.index(kind)
@@ -73,6 +99,7 @@ _UNRECODABLE_ACTION_TYPE_COLUMNS = tuple(
         "confirm_trade",
         "ROLL",
         "BUY_DEVELOPMENT_CARD",
+        "DISCARD_RESOURCE",
     )
 )
 

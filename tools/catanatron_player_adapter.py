@@ -201,8 +201,8 @@ def _reencode_action_index(env: ColonistMultiAgentEnv, action: Any) -> int | Non
     (`entity_token_features._event_action_id` -> slot 35), via the same
     `ActionCatalog` used for live decoding.
 
-    Two categories of native action are NOT recoverable this way, and
-    `try_encode` correctly misses on them (returning the same safe `None`
+    Three categories of native action are not emitted this way. Most are not
+    recoverable and `try_encode` correctly misses on them (returning the same safe `None`
     default the live path already falls back to -- see
     `ColonistMultiAgentEnv.valid_actions`'s `_trade_response_indices_for`
     fallback):
@@ -213,6 +213,11 @@ def _reencode_action_index(env: ColonistMultiAgentEnv, action: Any) -> int | Non
         need not match; ACCEPT/REJECT/CANCEL/CONFIRM_TRADE are keyed
         dynamically off `state.current_trade` (only meaningful for the
         CURRENT trade, not a past one).
+      - Publicly-redacted discard actions (DISCARD_RESOURCE): its otherwise
+        recoverable catalog id uniquely identifies the hidden discarded
+        resource, so emitting it would undo the value redaction through event
+        token slot 35, so this case is deliberately suppressed even though it
+        is technically recoverable.
       - Chance-resolved actions (ROLL, BUY_DEVELOPMENT_CARD): `ActionCatalog`
         only has ONE generic pre-resolution entry for each
         (`action_mask._action_array`: `(ActionType.ROLL, None)`,
@@ -225,6 +230,8 @@ def _reencode_action_index(env: ColonistMultiAgentEnv, action: Any) -> int | Non
         resolved MOVE_ROBBER (a player CHOICE, not a chance outcome) encodes
         the same as any other choice-driven action.
     """
+    if str(getattr(action.action_type, "name", action.action_type)) == "DISCARD_RESOURCE":
+        return None
     index = env.action_catalog.try_encode(action)
     return int(index) if index is not None else None
 
@@ -276,6 +283,11 @@ def _synthetic_event_log(
         action = record.action
         native_type = str(action.action_type.name)
         action_index = _reencode_action_index(env, action)
+        action_value = _jsonable(action.value)
+        result = _jsonable(record.result)
+        if native_type == "DISCARD_RESOURCE":
+            action_value = "hidden_resource"
+            result = "hidden_resource"
         events.append(
             {
                 "event_id": len(events),
@@ -289,9 +301,9 @@ def _synthetic_event_log(
                         "action_type": _NATIVE_TO_EVENT_ACTION_TYPE.get(
                             native_type, native_type
                         ),
-                        "value": _jsonable(action.value),
+                        "value": action_value,
                     },
-                    "result": _jsonable(record.result),
+                    "result": result,
                     "next_player": None,
                 },
             }

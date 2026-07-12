@@ -274,9 +274,38 @@ def test_colonist_multiagent_env_public_event_log_redacts_hidden_results() -> No
 
         assert events[-2]["payload"]["result"] == "hidden_development_card"
         assert events[-1]["payload"]["action"]["value"] == "hidden_resource"
+        assert events[-1]["payload"]["action"]["index"] is None
+        assert events[-1]["payload"]["action_index"] is None
         assert events[-1]["payload"]["result"] == "hidden_resource"
     finally:
         env.close()
+
+
+def test_discard_event_redaction_removes_resource_bearing_flat_action_id() -> None:
+    """The discard catalog id is as private as the discarded value itself."""
+    env = object.__new__(ColonistMultiAgentEnv)
+    event = {
+        "event_type": "board_action",
+        "payload": {
+            "action_index": 123,
+            "action": {
+                "index": 123,
+                "action_type": "DISCARD_RESOURCE",
+                "value": "ORE",
+            },
+            "result": "ORE",
+        },
+    }
+
+    redacted = env._redact_event(event, actor="BLUE")
+
+    assert redacted["payload"]["action_index"] is None
+    assert redacted["payload"]["action"]["index"] is None
+    assert redacted["payload"]["action"]["value"] == "hidden_resource"
+    assert redacted["payload"]["result"] == "hidden_resource"
+    # The caller-owned event remains reusable for another observer.
+    assert event["payload"]["action_index"] == 123
+    assert event["payload"]["action"]["index"] == 123
 
 
 def test_colonist_multiagent_env_trade_panel_exposes_colonist_response_state() -> None:
