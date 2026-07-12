@@ -496,7 +496,7 @@ def _rebind_a1_metadata(command: list[str], repo: Path) -> dict[str, Any]:
 
 def _derive_command(
     source: Sequence[str], *, repo: Path, descriptor: Path, sentinel: Path,
-    f7: Path, output_root: Path,
+    parent: Path, output_root: Path,
 ) -> tuple[list[str], dict[str, dict[str, str]]]:
     command = list(source)
     if "torch.distributed.run" not in command or not any(
@@ -515,7 +515,7 @@ def _derive_command(
     updates = {
         "--data": str(descriptor),
         "--validation-game-sentinel-manifest": str(sentinel),
-        "--init-checkpoint": str(f7),
+        "--init-checkpoint": str(parent),
         "--checkpoint": str(output_root / "candidate.pt"),
         "--report": str(output_root / "train.report.json"),
         "--batch-size": "512",
@@ -625,11 +625,53 @@ def prepare(args: argparse.Namespace) -> tuple[dict[str, Any], Path]:
     descriptor_meta, descriptor_ref, source_descriptor_ref = _build_corrected_descriptor(
         source_descriptor, descriptor
     )
-    f7_ref = _file_ref(args.f7_checkpoint)
-    if f7_ref["sha256"] != args.expected_f7_sha256:
-        raise ArmError("initialization checkpoint is not the explicitly expected f7 bytes")
+    parent_checkpoint = getattr(args, "parent_checkpoint", None)
+    expected_parent_sha256 = getattr(args, "expected_parent_sha256", None)
+    legacy_checkpoint = getattr(args, "f7_checkpoint", None)
+    legacy_sha256 = getattr(args, "expected_f7_sha256", None)
+    new_mode = parent_checkpoint is not None or expected_parent_sha256 is not None
+    legacy_mode = legacy_checkpoint is not None or legacy_sha256 is not None
+    if new_mode == legacy_mode:
+        raise ArmError(
+            "select exactly one parent interface: current --parent-* or legacy --f7-*"
+        )
+    if new_mode:
+        if parent_checkpoint is None or expected_parent_sha256 is None:
+            raise ArmError("current parent checkpoint and digest must be supplied together")
+        handoff_path = getattr(args, "post_promotion_handoff", None)
+        if handoff_path is None:
+            raise ArmError("current parent requires --post-promotion-handoff")
+        from tools import a1_post_promotion_handoff as promotion_handoff
+
+        handoff_path = Path(handoff_path).expanduser().resolve(strict=True)
+        handoff_payload, handoff_ref = _load_json(handoff_path)
+        try:
+            replayed = promotion_handoff.build_handoff(
+                Path(str(handoff_payload.get("promotion_receipt", {}).get("path", "")))
+            )
+        except promotion_handoff.HandoffError as error:
+            raise ArmError(f"current parent handoff replay failed: {error}") from error
+        if handoff_payload != replayed:
+            raise ArmError("current parent handoff differs from committed live lineage")
+        parent_lineage = {
+            "mode": "post_promotion_current_parent",
+            "handoff": handoff_ref,
+            "handoff_sha256": handoff_payload["handoff_sha256"],
+            "registry_version": handoff_payload["registry_after"]["version"],
+        }
+    else:
+        if legacy_checkpoint is None or legacy_sha256 is None:
+            raise ArmError("legacy f7 checkpoint and digest must be supplied together")
+        parent_checkpoint = legacy_checkpoint
+        expected_parent_sha256 = legacy_sha256
+        parent_lineage = {"mode": "historical_f7_cli_compatibility"}
+    parent_ref = _file_ref(Path(parent_checkpoint))
+    if parent_ref["sha256"] != expected_parent_sha256:
+        raise ArmError("initialization checkpoint differs from the expected parent bytes")
+    if new_mode and handoff_payload["producer_identity"]["checkpoint"] != parent_ref:
+        raise ArmError("current learner parent differs from promoted generator identity")
     source_identities = {
-        "parent_checkpoint_sha256": f7_ref["sha256"],
+        "parent_checkpoint_sha256": parent_ref["sha256"],
         "descriptor_sha256": source_descriptor_ref["sha256"],
     }
     for field, expected in source_identities.items():
@@ -652,7 +694,7 @@ def prepare(args: argparse.Namespace) -> tuple[dict[str, Any], Path]:
             raise ArmError(f"refusing existing corrected-arm output: {output_root / name}")
     command, changes = _derive_command(
         source["command"], repo=repo, descriptor=descriptor,
-        sentinel=Path(sentinel_ref["path"]), f7=Path(f7_ref["path"]),
+        sentinel=Path(sentinel_ref["path"]), parent=Path(parent_ref["path"]),
         output_root=output_root,
     )
     event_history_contract, event_history_changes = (
@@ -675,7 +717,7 @@ def prepare(args: argparse.Namespace) -> tuple[dict[str, Any], Path]:
         "replay_supervised_value": False,
         "replay_forward_kl_weight": REPLAY_ANCHOR_WEIGHT,
         "soft_target_weight": 1.0, "fresh_optimizer": True,
-        "independent_f7_initialization": True,
+        "independent_parent_initialization": True,
     }
     manifest: dict[str, Any] = {
         "schema_version": SCHEMA,
@@ -694,7 +736,8 @@ def prepare(args: argparse.Namespace) -> tuple[dict[str, Any], Path]:
         "validation_sentinel_selection_sha256": sentinel_payload[
             "selected_game_seed_set_sha256"
         ],
-        "initialization": f7_ref,
+        "initialization": parent_ref,
+        "parent_lineage": parent_lineage,
         "source_binding": source_binding,
         "a1_runtime_metadata": a1_metadata,
         "event_history_training_contract": event_history_contract,
@@ -702,11 +745,10 @@ def prepare(args: argparse.Namespace) -> tuple[dict[str, Any], Path]:
         "recipe": recipe,
         "recipe_sha256": _digest(recipe),
         "causal_interpretation": {
-            "bundled_optimization_not_f7_replication": True,
+            "bundled_optimization_not_parent_replication": True,
             "reason": (
-                "f7 used loser=.3 and about 2.78M samples; this loser=1, 4.19M, "
-                "current-teacher-only pure-target arm is an optimization bundle, not a one-axis "
-                "replication of f7"
+                "this loser=1, 4.19M, current-teacher-only pure-target arm is an "
+                "optimization bundle, not a one-axis replication of its parent"
             ),
         },
         "allowlisted_command_changes": changes,
@@ -732,8 +774,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source-receipt", required=True, type=Path)
     parser.add_argument("--source-descriptor", required=True, type=Path)
-    parser.add_argument("--f7-checkpoint", required=True, type=Path)
-    parser.add_argument("--expected-f7-sha256", required=True)
+    parser.add_argument("--parent-checkpoint", type=Path)
+    parser.add_argument("--expected-parent-sha256")
+    parser.add_argument("--post-promotion-handoff", type=Path)
+    # Historical interface remains parseable solely to replay issued manifests.
+    parser.add_argument("--f7-checkpoint", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--expected-f7-sha256", help=argparse.SUPPRESS)
     parser.add_argument(
         "--failed-lineage-artifact", action="append", default=[],
         help="Repeat ROLE=PATH for parent claim/receipt and retry contract/receipt.",

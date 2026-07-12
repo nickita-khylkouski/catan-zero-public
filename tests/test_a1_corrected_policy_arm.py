@@ -184,7 +184,9 @@ def test_prepares_exact_one_dose_pure_current_policy_arm_without_launch(
     assert manifest["recipe"]["replay_supervised_policy"] is False
     assert manifest["recipe"]["replay_supervised_value"] is False
     assert manifest["recipe"]["replay_forward_kl_weight"] == 0.0
-    assert manifest["causal_interpretation"]["bundled_optimization_not_f7_replication"] is True
+    assert manifest["causal_interpretation"]["bundled_optimization_not_parent_replication"] is True
+    assert manifest["recipe"]["independent_parent_initialization"] is True
+    assert manifest["parent_lineage"]["mode"] == "historical_f7_cli_compatibility"
     descriptor = json.loads(Path(manifest["descriptor"]["path"]).read_text())
     assert [row["component_id"] for row in descriptor["components"]] == [
         "n128_current", "n256_current"
@@ -357,7 +359,7 @@ def test_command_requires_hidden_information_masking(tmp_path: Path) -> None:
             repo=tmp_path,
             descriptor=tmp_path / "d",
             sentinel=tmp_path / "v",
-            f7=tmp_path / "f",
+            parent=tmp_path / "f",
             output_root=tmp_path / "out",
         )
 
