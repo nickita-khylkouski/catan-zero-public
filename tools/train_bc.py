@@ -6748,6 +6748,11 @@ def main(argv: Sequence[str] | None = None) -> None:
             )
         ),
         "value_loss_weight": args.value_loss_weight,
+        # Science-critical optimizer provenance: this multiplier changes the
+        # value-head update by up to an order of magnitude while leaving the
+        # shared ``lr`` unchanged. Omitting it made a report claim only
+        # ``lr=3e-5`` even when the actual value readout trained at 0.3x.
+        "value_lr_mult": args.value_lr_mult,
         "action_module_lr_mult": args.action_module_lr_mult,
         "trunk_lr_mult": args.trunk_lr_mult,
         "resolved_scalar_value_loss_weight": resolved_scalar_value_weight,

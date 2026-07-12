@@ -19,6 +19,7 @@ REQUIRED_REPORT_KEYS = (
     "data",
     "validation_game_seed_ranges",
     "truncated_vp_margin_value_weight",
+    "value_lr_mult",
 )
 
 
