@@ -1990,21 +1990,9 @@ def _incumbent_search_config(
     return actual
 
 
-def _verify_role_search_config(
-    raw: Any,
-    *,
-    expected_search_config: dict[str, Any],
-    where: str,
+def _normalize_search_runtime_binding(
+    raw: Any, *, expected_search_config: dict[str, Any], where: str
 ) -> dict[str, Any]:
-    """Validate a complete, typed, role-specific deployed search operator.
-
-    This is intentionally an exact-key comparator after removing the one
-    fully specified, parity-gated Rust execution binding.  Those two runtime
-    fields select an implementation of the same operator and therefore do not
-    become part of the promoted agent identity.  No partial, alternate, or
-    unknown field is accepted.
-    """
-
     if not isinstance(raw, dict):
         raise PromotionError(f"{where} must be an object")
     actual = dict(raw)
@@ -2033,6 +2021,27 @@ def _verify_role_search_config(
         # deployed agent identity at the contract's semantic value while the
         # report and engine identity retain proof of the accelerated runtime.
         actual["evaluator_rust_featurize"] = False
+    return actual
+
+
+def _verify_role_search_config(
+    raw: Any,
+    *,
+    expected_search_config: dict[str, Any],
+    where: str,
+) -> dict[str, Any]:
+    """Validate a complete, typed, role-specific deployed search operator.
+
+    This is intentionally an exact-key comparator after removing the one
+    fully specified, parity-gated Rust execution binding.  Those runtime
+    fields select an implementation of the same operator and therefore do not
+    become part of the promoted agent identity.  No partial, alternate, or
+    unknown field is accepted.
+    """
+
+    actual = _normalize_search_runtime_binding(
+        raw, expected_search_config=expected_search_config, where=where
+    )
     actual = _require_exact_keys(actual, set(expected_search_config), where=where)
     _require_sealed_semantics(actual, expected_search_config, where=where)
     return actual
@@ -2377,7 +2386,14 @@ def _verify_internal_h2h_source(
         }
     )
     config_where = "pooled effective config" if pooled else "typed config"
-    _require_sealed_semantics(fields, expected_fields, where=f"{where} {config_where}")
+    normalized_fields = _normalize_search_runtime_binding(
+        fields,
+        expected_search_config=expected_fields,
+        where=f"{where} {config_where}",
+    )
+    _require_sealed_semantics(
+        normalized_fields, expected_fields, where=f"{where} {config_where}"
+    )
     if fields.get("map_kind") != "BASE":
         raise PromotionError(
             f"{where} internal H2H must explicitly attest randomized BASE maps; "
@@ -2385,12 +2401,12 @@ def _verify_internal_h2h_source(
         )
     _verify_role_search_pair(
         {
-            **{key: fields[key] for key in candidate_search_config},
-            "c_scale": fields["candidate_c_scale"],
+            **{key: normalized_fields[key] for key in candidate_search_config},
+            "c_scale": normalized_fields["candidate_c_scale"],
         },
         {
-            **{key: fields[key] for key in champion_search_config},
-            "c_scale": fields["baseline_c_scale"],
+            **{key: normalized_fields[key] for key in champion_search_config},
+            "c_scale": normalized_fields["baseline_c_scale"],
         },
         candidate_search_config=candidate_search_config,
         champion_search_config=champion_search_config,
