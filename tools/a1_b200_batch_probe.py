@@ -12,11 +12,13 @@ from __future__ import annotations
 
 import argparse
 import csv
+from contextlib import contextmanager
 import hashlib
 import json
 import math
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import time
@@ -67,6 +69,41 @@ def _file_sha(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return "sha256:" + digest.hexdigest()
+
+
+def _current_runtime() -> dict[str, str]:
+    trainer = (_ROOT / "tools" / "train_bc.py").resolve(strict=True)
+    commit = subprocess.run(
+        ["git", "-C", str(_ROOT), "rev-parse", "HEAD"],
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+    ).stdout.strip()
+    if not re.fullmatch(r"[0-9a-f]{40}", commit):
+        raise ProbeError("probe runtime has no full Git commit")
+    dirty = subprocess.run(
+        ["git", "-C", str(_ROOT), "status", "--porcelain", "--untracked-files=no"],
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+    ).stdout.strip()
+    if dirty:
+        raise ProbeError("probe runtime has tracked modifications")
+    return {
+        "repository_root": str(_ROOT.resolve()),
+        "repository_commit": commit,
+        "trainer": str(trainer),
+        "trainer_sha256": _file_sha(trainer),
+    }
+
+
+def _bind_current_trainer(command: list[str], runtime: dict[str, str]) -> None:
+    indices = [
+        index for index, item in enumerate(command) if Path(item).name == "train_bc.py"
+    ]
+    if len(indices) != 1:
+        raise ProbeError("midpoint command does not name exactly one trainer script")
+    command[indices[0]] = runtime["trainer"]
 
 
 def _set_option(command: list[str], flag: str, value: str) -> None:
@@ -147,7 +184,9 @@ def build_plan(
     if equal_sample_reference_steps % 3:
         raise ProbeError("equal-sample reference steps must be divisible by 3")
     midpoint = _authenticated_midpoint(midpoint_receipt)
+    runtime = _current_runtime()
     base = _strip_production_authority(list(midpoint["payload"]["command"]))
+    _bind_current_trainer(base, runtime)
     output_dir = output_dir.expanduser().resolve()
     if output_dir.exists():
         raise ProbeError(f"refusing existing output directory: {output_dir}")
@@ -206,6 +245,7 @@ def build_plan(
         "diagnostic_only": True,
         "promotion_eligible": False,
         "midpoint_receipt": {key: midpoint[key] for key in ("path", "sha256")},
+        "runtime": runtime,
         "lr_scaling": {
             "policy": lr_policy,
             "fixed": "isolates batch/system effects at the production LR",
@@ -259,6 +299,82 @@ def _read_plan(path: Path) -> dict[str, Any]:
     if plan.get("schema_version") != SCHEMA or stated != actual:
         raise ProbeError("batch-probe plan schema/digest drift")
     return plan
+
+
+def _verify_runtime(plan: dict[str, Any], run: dict[str, Any]) -> None:
+    runtime = plan.get("runtime")
+    if not isinstance(runtime, dict):
+        raise ProbeError("batch-probe plan has no runtime binding")
+    current = _current_runtime()
+    if runtime != current:
+        raise ProbeError(f"batch-probe runtime drift: planned={runtime} current={current}")
+    trainers = [
+        str(Path(item).resolve(strict=False))
+        for item in run["command"]
+        if Path(item).name == "train_bc.py"
+    ]
+    if trainers != [runtime["trainer"]]:
+        raise ProbeError("batch-probe command does not use its bound current trainer")
+    if run.get("command_sha256") != _digest(run.get("command")):
+        raise ProbeError("batch-probe command digest drift")
+
+
+def _require_no_non_mps_compute(*, runner=subprocess.run) -> None:
+    result = runner(
+        [
+            "nvidia-smi",
+            "--query-compute-apps=pid,process_name",
+            "--format=csv,noheader",
+        ],
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    occupied = [
+        line.strip()
+        for line in result.stdout.splitlines()
+        if line.strip() and "nvidia-cuda-mps-server" not in line
+    ]
+    if occupied:
+        raise ProbeError(f"B200 GPUs have active non-MPS compute: {occupied}")
+
+
+@contextmanager
+def _without_mps(*, runner=subprocess.run):
+    """Transfer the host from fleet MPS ownership to DDP and always restore it."""
+
+    status = runner(
+        ["systemctl", "is-active", "nvidia-mps.service"],
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if status.returncode != 0 or status.stdout.strip() != "active":
+        raise ProbeError("MPS must be active at the DDP ownership handoff")
+    runner(["sudo", "-n", "true"], check=True)
+    runner(["sudo", "-n", "systemctl", "stop", "nvidia-mps.service"], check=True)
+    stopped = runner(
+        ["systemctl", "is-active", "nvidia-mps.service"],
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if stopped.stdout.strip() == "active":
+        runner(
+            ["sudo", "-n", "systemctl", "start", "nvidia-mps.service"],
+            check=False,
+        )
+        raise ProbeError("MPS remained active after stop; refusing DDP")
+    try:
+        yield
+    finally:
+        runner(
+            ["sudo", "-n", "systemctl", "start", "nvidia-mps.service"],
+            check=False,
+        )
 
 
 def _gpu_samples(path: Path) -> dict[str, float | int]:
@@ -356,6 +472,7 @@ def run_one(plan_path: Path, run_id: str, *, go: bool) -> dict[str, Any]:
     if len(matches) != 1:
         raise ProbeError(f"unknown run id {run_id!r}")
     run = matches[0]
+    _verify_runtime(plan, run)
     if not go:
         return {"dry_run": True, **run}
     names = subprocess.run(
@@ -366,37 +483,40 @@ def run_one(plan_path: Path, run_id: str, *, go: bool) -> dict[str, Any]:
     ).stdout.splitlines()
     if len(names) != WORLD_SIZE or any("B200" not in name.upper() for name in names):
         raise ProbeError(f"--go requires exactly 8 B200 GPUs, got {names}")
-    run_dir = Path(run["run_dir"])
-    run_dir.mkdir(parents=True, exist_ok=False)
-    gpu_file = (run_dir / "gpu.csv").open("w", encoding="utf-8")
-    monitor = subprocess.Popen(
-        [
-            "nvidia-smi",
-            "--query-gpu=timestamp,index,utilization.gpu,power.draw,memory.used",
-            "--format=csv,nounits",
-            "-lms",
-            "500",
-        ],
-        stdout=gpu_file,
-        stderr=subprocess.DEVNULL,
-        text=True,
-    )
-    started = time.time_ns()
-    try:
-        with (run_dir / "train.log").open("w", encoding="utf-8") as log:
-            completed = subprocess.run(
-                run["command"],
-                cwd=_ROOT,
-                check=False,
-                text=True,
-                stdout=log,
-                stderr=subprocess.STDOUT,
-            )
-    finally:
-        finished = time.time_ns()
-        monitor.terminate()
-        monitor.wait(timeout=10)
-        gpu_file.close()
+    _require_no_non_mps_compute()
+    with _without_mps():
+        _require_no_non_mps_compute()
+        run_dir = Path(run["run_dir"])
+        run_dir.mkdir(parents=True, exist_ok=False)
+        gpu_file = (run_dir / "gpu.csv").open("w", encoding="utf-8")
+        monitor = subprocess.Popen(
+            [
+                "nvidia-smi",
+                "--query-gpu=timestamp,index,utilization.gpu,power.draw,memory.used",
+                "--format=csv,nounits",
+                "-lms",
+                "500",
+            ],
+            stdout=gpu_file,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+        started = time.time_ns()
+        try:
+            with (run_dir / "train.log").open("w", encoding="utf-8") as log:
+                completed = subprocess.run(
+                    run["command"],
+                    cwd=_ROOT,
+                    check=False,
+                    text=True,
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                )
+        finally:
+            finished = time.time_ns()
+            monitor.terminate()
+            monitor.wait(timeout=10)
+            gpu_file.close()
     runtime = {
         "schema_version": RUN_SCHEMA,
         "run_id": run_id,

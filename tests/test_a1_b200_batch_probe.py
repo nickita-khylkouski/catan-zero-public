@@ -58,6 +58,17 @@ def _receipt(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
             "command": command,
         },
     )
+    trainer = (Path(probe.__file__).resolve().parents[1] / "tools" / "train_bc.py")
+    monkeypatch.setattr(
+        probe,
+        "_current_runtime",
+        lambda: {
+            "repository_root": str(trainer.parents[1]),
+            "repository_commit": "a" * 40,
+            "trainer": str(trainer),
+            "trainer_sha256": probe._file_sha(trainer),  # noqa: SLF001
+        },
+    )
     return receipt
 
 
@@ -82,6 +93,7 @@ def test_plan_separates_fixed_step_and_equal_sample_questions(
     )
     assert plan["diagnostic_only"] is True
     assert plan["promotion_eligible"] is False
+    assert plan["runtime"]["repository_commit"] == "a" * 40
     throughput = [run for run in plan["runs"] if run["cohort"] == "throughput_fixed_steps"]
     learning = [run for run in plan["runs"] if run["cohort"] == "learning_equal_samples"]
     assert [run["max_steps"] for run in throughput] == [24, 24, 24]
@@ -90,6 +102,8 @@ def test_plan_separates_fixed_step_and_equal_sample_questions(
     assert [run["lr"] for run in throughput] == pytest.approx(expected)
     for run in plan["runs"]:
         command = run["command"]
+        assert plan["runtime"]["trainer"] in command
+        assert "/repo/tools/train_bc.py" not in command
         assert not any(item.startswith("--a1-") for item in command)
         assert "--validation-game-seed-manifest" not in command
         assert command[command.index("--train-diagnostics-every-batches") + 1] == "1"
@@ -120,6 +134,63 @@ def test_plan_requires_exact_eight_b200_midpoint_command(
             output_dir=tmp_path / "probe",
             lr_policy="fixed",
         )
+
+
+def test_runtime_drift_is_rejected_before_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plan = probe.build_plan(
+        midpoint_receipt=_receipt(tmp_path, monkeypatch),
+        output_dir=tmp_path / "probe",
+        lr_policy="fixed",
+    )
+    run = plan["runs"][0]
+    changed = dict(plan["runtime"])
+    changed["repository_commit"] = "b" * 40
+    monkeypatch.setattr(probe, "_current_runtime", lambda: changed)
+    with pytest.raises(probe.ProbeError, match="runtime drift"):
+        probe._verify_runtime(plan, run)  # noqa: SLF001
+
+
+def test_mps_handoff_restores_service_after_failure() -> None:
+    calls: list[tuple[str, ...]] = []
+    active = True
+
+    def runner(command: list[str], **_kwargs: object):
+        nonlocal active
+        calls.append(tuple(command))
+        if command[:2] == ["systemctl", "is-active"]:
+            return probe.subprocess.CompletedProcess(
+                command, 0 if active else 3, "active\n" if active else "inactive\n", ""
+            )
+        if command[-2:] == ["stop", "nvidia-mps.service"]:
+            active = False
+        elif command[-2:] == ["start", "nvidia-mps.service"]:
+            active = True
+        return probe.subprocess.CompletedProcess(command, 0, "", "")
+
+    with pytest.raises(RuntimeError, match="boom"):
+        with probe._without_mps(runner=runner):  # noqa: SLF001
+            assert active is False
+            raise RuntimeError("boom")
+    assert active is True
+    assert ("sudo", "-n", "systemctl", "stop", "nvidia-mps.service") in calls
+    assert ("sudo", "-n", "systemctl", "start", "nvidia-mps.service") in calls
+
+
+def test_gpu_occupancy_allows_only_mps_server() -> None:
+    def runner(command: list[str], **_kwargs: object):
+        return probe.subprocess.CompletedProcess(
+            command, 0, "10, nvidia-cuda-mps-server\n", ""
+        )
+
+    probe._require_no_non_mps_compute(runner=runner)  # noqa: SLF001
+
+    def occupied(command: list[str], **_kwargs: object):
+        return probe.subprocess.CompletedProcess(command, 0, "11, python\n", "")
+
+    with pytest.raises(probe.ProbeError, match="active non-MPS compute"):
+        probe._require_no_non_mps_compute(runner=occupied)  # noqa: SLF001
 
 
 def test_summary_reports_efficiency_and_never_ranks_hbm(tmp_path: Path) -> None:
