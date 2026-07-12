@@ -21,6 +21,7 @@ from tools.a1_mixed_value_objective_probe import (
     _component,
     _descriptor,
     _file_ref,
+    _lexical_python_executable,
     _write_once_or_match,
 )
 
@@ -95,7 +96,7 @@ def prepare(args: argparse.Namespace) -> tuple[dict[str, Any], Path]:
     if args.max_steps <= 0:
         raise SystemExit("--max-steps must be positive for the bounded diagnostic")
     repo = args.repo.expanduser().resolve(strict=True)
-    python = args.python.expanduser().resolve(strict=True)
+    python = _lexical_python_executable(args.python)
     init = args.init_checkpoint.expanduser().resolve(strict=True)
     root = args.output_root.expanduser().resolve()
     components = [

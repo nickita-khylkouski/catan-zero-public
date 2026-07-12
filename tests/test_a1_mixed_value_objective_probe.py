@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -152,6 +153,17 @@ def test_unsupported_lr_is_rejected_before_preparation(tmp_path):
     with pytest.raises(SystemExit):
         probe.build_parser().parse_args(_argv(tmp_path, "3e-4"))
     assert not (tmp_path / "out").exists()
+
+
+def test_prepare_preserves_lexical_virtualenv_python(tmp_path: Path) -> None:
+    lexical = tmp_path / "venv-python"
+    lexical.symlink_to(Path(sys.executable))
+    args = probe.build_parser().parse_args(
+        [*_argv(tmp_path), "--python", str(lexical)]
+    )
+    manifest, _ = probe.prepare(args)
+    assert all(arm["command"][0] == str(lexical) for arm in manifest["arms"].values())
+    assert str(lexical) != str(lexical.resolve())
 
 
 def test_descriptors_authenticate_full_recipe_and_refuse_objective_drift(tmp_path):

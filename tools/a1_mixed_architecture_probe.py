@@ -347,7 +347,7 @@ def prepare(args: argparse.Namespace) -> tuple[dict[str, Any], Path]:
     if args.max_steps <= 0:
         raise SystemExit("REFUSED: --max-steps must be positive and identical across arms")
     repo = args.repo.expanduser().resolve(strict=True)
-    python = args.python.expanduser().resolve(strict=True)
+    python = common._lexical_python_executable(args.python)  # noqa: SLF001
     initialization = args.initialization_checkpoint.expanduser().resolve(strict=True)
     gather_checkpoint = args.gather_checkpoint.expanduser().resolve(strict=True)
     upgrade = _validate_gather_upgrade(initialization, gather_checkpoint)

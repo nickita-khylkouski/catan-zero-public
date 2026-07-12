@@ -49,6 +49,24 @@ def _file_ref(path: Path) -> dict[str, str]:
     return {"path": str(resolved), "sha256": _file_sha(resolved)}
 
 
+def _lexical_python_executable(path: Path) -> Path:
+    """Validate but do not dereference a virtualenv interpreter entry point."""
+
+    lexical = Path(os.path.abspath(os.fspath(path.expanduser())))
+    try:
+        target = lexical.resolve(strict=True)
+    except OSError as error:
+        raise SystemExit(f"REFUSED: cannot resolve training Python: {error}") from error
+    if (
+        not lexical.is_file()
+        or not target.is_file()
+        or not os.access(lexical, os.X_OK)
+        or not os.access(target, os.X_OK)
+    ):
+        raise SystemExit(f"REFUSED: training Python is not executable: {lexical}")
+    return lexical
+
+
 def _write_once_or_match(path: Path, payload: dict[str, Any]) -> None:
     encoded = json.dumps(payload, indent=2, sort_keys=True) + "\n"
     if path.exists():
@@ -245,7 +263,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def prepare(args: argparse.Namespace) -> tuple[dict[str, Any], Path]:
     repo = args.repo.expanduser().resolve(strict=True)
-    python = args.python.expanduser().resolve(strict=True)
+    python = _lexical_python_executable(args.python)
     init_checkpoint = args.categorical_init_checkpoint.expanduser().resolve(strict=True)
     output_root = args.output_root.expanduser().resolve()
     components = [

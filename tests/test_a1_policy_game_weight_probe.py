@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -85,3 +86,14 @@ def test_nonpositive_step_budget_is_refused(tmp_path: Path) -> None:
     argv[argv.index("--max-steps") + 1] = "0"
     with pytest.raises(SystemExit, match="must be positive"):
         probe.prepare(probe.build_parser().parse_args(argv))
+
+
+def test_prepare_preserves_lexical_virtualenv_python(tmp_path: Path) -> None:
+    lexical = tmp_path / "venv-python"
+    lexical.symlink_to(Path(sys.executable))
+    args = probe.build_parser().parse_args(
+        [*_args(tmp_path), "--python", str(lexical)]
+    )
+    manifest, _ = probe.prepare(args)
+    assert all(arm["command"][0] == str(lexical) for arm in manifest["arms"].values())
+    assert str(lexical) != str(lexical.resolve())
