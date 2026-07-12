@@ -313,6 +313,16 @@ def _load_paired_outcomes(
 # resolve faster at the same error rates (verified in
 # tools/pentanomial_power_sim.py).
 #
+# TERMINAL VALUES ARE NOT ADDITIVE.  This is a generalized statistic whose
+# nuisance variance is estimated from the complete sample (and regularized by
+# one shared pseudo-sample below), not a sum of per-pair log-probability
+# increments.  Therefore a continuation made of several fresh seed cohorts
+# must concatenate/replay the raw pair outcomes and call this function once.
+# Summing the terminal ``llr`` fields from separately finalized cohorts would
+# estimate the variance independently and apply the prior once per cohort;
+# it is not the LLR of their union.  ``a1_evaluation_pool.py`` deliberately
+# recomputes from the retained raw games for this reason.
+#
 # WHY THE MEAN/VARIANCE FORM (not the exact empirical-likelihood MLE tilt).
 # The exact multinomial GSPRT (constrained-MLE "tilt" of the empirical pdf)
 # is degenerate on the small samples our gates actually collect: when the
