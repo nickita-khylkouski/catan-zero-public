@@ -33,6 +33,7 @@ def build_status(run_dir: Path, *, pid: int, target_games: int) -> dict[str, Any
     log_path = run_dir / "train.log"
     log_lines = _read_lines(log_path)
     teacher_progress = _parse_teacher_progress(log_lines)
+    bc_events = _parse_bc_events(log_lines)
     bc_progress = _parse_bc_progress(log_lines)
     manifest = _read_json(run_dir / "teacher_data" / "manifest.json")
     candidate_report = _read_json(run_dir / "candidate_strong_bc.json")
@@ -50,6 +51,7 @@ def build_status(run_dir: Path, *, pid: int, target_games: int) -> dict[str, Any
         candidate_scoreboard=candidate_scoreboard,
         xdim_scoreboard=xdim_scoreboard,
         process=process,
+        training_progress=bool(bc_events),
     )
     games = int(teacher_progress.get("games") or manifest.get("games") or 0)
     samples = int(teacher_progress.get("samples") or manifest.get("samples") or 0)
@@ -72,6 +74,10 @@ def build_status(run_dir: Path, *, pid: int, target_games: int) -> dict[str, Any
         "bc": {
             "candidate": _bc_summary(candidate_report),
             "xdim_lite": _bc_summary(xdim_report),
+        },
+        "training": {
+            "latest": bc_events[-1] if bc_events else {},
+            "curve": bc_events,
         },
         "scoreboards": {
             "candidate": _scoreboard_summary(candidate_scoreboard),
@@ -113,15 +119,25 @@ def _parse_bc_progress(lines: list[str]) -> dict[str, dict[str, Any]]:
     latest: dict[str, dict[str, Any]] = {}
     for line in lines:
         parsed = _parse_line_object(line)
-        if isinstance(parsed, dict) and parsed.get("progress") == "bc":
+        if isinstance(parsed, dict) and parsed.get("progress") in {"bc", "bc_batch"}:
             arch = str(parsed.get("arch") or "")
             if arch:
                 latest[arch] = {
                     "last_epoch": parsed.get("epoch"),
                     "loss": parsed.get("loss"),
                     "accuracy": parsed.get("accuracy"),
+                    "samples": parsed.get("samples"),
                 }
     return latest
+
+
+def _parse_bc_events(lines: list[str]) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    for line in lines:
+        parsed = _parse_line_object(line)
+        if isinstance(parsed, dict) and parsed.get("progress") in {"bc", "bc_batch"}:
+            events.append(parsed)
+    return events
 
 
 def _parse_line_object(line: str) -> Any:
@@ -176,6 +192,8 @@ def _phase(**values: Any) -> str:
         return "evaluating_candidate"
     if values["candidate_report"]:
         return "training_xdim_lite_bc"
+    if values.get("training_progress"):
+        return "training_bc"
     if values["manifest"]:
         return "training_candidate_bc"
     if values["process"] and values["process"].get("alive"):
@@ -333,6 +351,26 @@ def _fmt(value: Any) -> str:
     return str(value)
 
 
+def _sparkline(events: list[dict[str, Any]], key: str) -> str:
+    values = [float(event[key]) for event in events if isinstance(event.get(key), (int, float))]
+    if not values:
+        return '<span class="muted">no samples yet</span>'
+    width, height, pad = 520, 120, 6
+    low, high = min(values), max(values)
+    span = high - low or 1.0
+    count = max(1, len(values) - 1)
+    points = " ".join(
+        f"{pad + (width - 2 * pad) * index / count:.1f},"
+        f"{height - pad - (height - 2 * pad) * (value - low) / span:.1f}"
+        for index, value in enumerate(values)
+    )
+    return (
+        f'<svg class="spark" viewBox="0 0 {width} {height}" role="img" '
+        f'aria-label="{html.escape(key)} curve"><polyline points="{points}"/></svg>'
+        f'<div class="muted">min {_fmt(low)} · max {_fmt(high)} · {len(values)} points</div>'
+    )
+
+
 def _html(status: dict[str, Any], *, refresh_seconds: int) -> str:
     teacher = status["teacher"]
     bc = status["bc"]
@@ -340,6 +378,11 @@ def _html(status: dict[str, Any], *, refresh_seconds: int) -> str:
     artifacts = status["artifacts"]
     gpu = status["gpu"]
     process = status["process"] or {}
+    training = status.get("training") or {}
+    latest = training.get("latest") or {}
+    curve = training.get("curve") or []
+    batch = int(latest.get("batch") or 0)
+    batches = int(latest.get("batches") or 0)
     gpu_rows = "".join(
         "<tr>"
         f"<td>{_fmt(item.get('index'))}</td>"
@@ -421,6 +464,9 @@ def _html(status: dict[str, Any], *, refresh_seconds: int) -> str:
     table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
     th, td {{ border-bottom: 1px solid #d8dee4; padding: 7px; text-align: left; }}
     code {{ background: #f6f8fa; padding: 2px 4px; border-radius: 4px; }}
+    .spark {{ width: 100%; height: 120px; background: #f6f8fa; border-radius: 6px; }}
+    .spark polyline {{ fill: none; stroke: #0969da; stroke-width: 2; vector-effect: non-scaling-stroke; }}
+    progress {{ width: 100%; }}
   </style>
 </head>
 <body>
@@ -432,6 +478,12 @@ def _html(status: dict[str, Any], *, refresh_seconds: int) -> str:
     <div class="card"><h2>Teacher Samples</h2><div class="metric">{teacher['samples']:,}</div><div class="muted">{teacher['workers']} workers</div></div>
     <div class="card"><h2>GPU</h2><table><thead><tr><th>#</th><th>Name</th><th>Util</th><th>MiB</th></tr></thead><tbody>{gpu_rows}</tbody></table></div>
     <div class="card"><h2>Process</h2><div class="metric">{'alive' if process.get('alive') else 'not running'}</div><div class="muted">{html.escape(str(process.get('ps', '')))}</div></div>
+    <div class="card"><h2>Optimizer Progress</h2><div class="metric">{batch:,} / {batches:,}</div><progress max="{max(1, batches)}" value="{batch}"></progress><div class="muted">{_pct(batch / batches if batches else None)}</div></div>
+    <div class="card"><h2>Latest Batch</h2><div class="metric">loss {_fmt(latest.get('loss'))}</div><div class="muted">accuracy {_fmt(latest.get('accuracy'))} · samples {_fmt(latest.get('samples'))}</div></div>
+  </div>
+  <div class="grid">
+    <div class="card"><h2>Batch Loss</h2>{_sparkline(curve, 'loss')}</div>
+    <div class="card"><h2>Batch Accuracy</h2>{_sparkline(curve, 'accuracy')}</div>
   </div>
   <h2>Behavior Cloning</h2>
   <table><thead><tr><th>Model</th><th>Samples</th><th>Epoch</th><th>Accuracy</th><th>Loss</th><th>Checkpoint</th></tr></thead><tbody>{''.join(rows)}</tbody></table>
