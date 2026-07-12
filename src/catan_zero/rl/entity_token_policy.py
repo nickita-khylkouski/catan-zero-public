@@ -1784,6 +1784,58 @@ def _assert_entity_batch_shapes(
         value = np.asarray(entity_batch[key])
         if value.shape != (batch_size, int(width)):
             raise ValueError(f"{key} shape {value.shape} != {(batch_size, int(width))}")
+
+    needs_action_targets = (
+        str(getattr(config, "state_trunk", "transformer")) != "transformer"
+        or bool(getattr(config, "action_target_gather", False))
+        or bool(getattr(config, "edge_policy_head", False))
+    )
+    if needs_action_targets:
+        key = "legal_action_target_ids"
+        if key not in entity_batch:
+            raise ValueError(
+                "target-aware policy requires entity batch field "
+                "legal_action_target_ids"
+            )
+        target_ids = np.asarray(entity_batch[key])
+        expected_shape = (batch_size, legal_width, 4)
+        if target_ids.shape != expected_shape:
+            raise ValueError(f"{key} shape {target_ids.shape} != {expected_shape}")
+        if not np.issubdtype(target_ids.dtype, np.integer):
+            raise ValueError(f"{key} must contain integer per-namespace ids")
+
+        # Columns are LOCAL ids in four disjoint namespaces.  The gather adds
+        # the corresponding sequence offsets later; accepting a global token
+        # offset here would encode the wrong entity.  Do not clamp malformed
+        # ids to the final token (the historical gather did that silently).
+        namespace_widths = np.asarray(
+            (
+                19,
+                54,
+                72,
+                int(np.asarray(entity_batch["player_tokens"]).shape[1]),
+            ),
+            dtype=np.int64,
+        )
+        invalid = (target_ids < -1) | (
+            target_ids >= namespace_widths.reshape(1, 1, 4)
+        )
+        if bool(np.any(invalid)):
+            row, action, column = np.argwhere(invalid)[0]
+            raise ValueError(
+                "legal_action_target_ids contains an out-of-range local id: "
+                f"row={int(row)} action={int(action)} column={int(column)} "
+                f"value={int(target_ids[row, action, column])} "
+                f"namespace_width={int(namespace_widths[column])}"
+            )
+        padded_has_target = (legal < 0)[..., None] & (target_ids != -1)
+        if bool(np.any(padded_has_target)):
+            row, action, column = np.argwhere(padded_has_target)[0]
+            raise ValueError(
+                "padded legal action carries a target id: "
+                f"row={int(row)} action={int(action)} column={int(column)}"
+            )
+
     if str(getattr(config, "state_trunk", "transformer")) != "transformer":
         topology_shapes = {
             "hex_vertex_ids": (batch_size, 19, 6),
@@ -1794,7 +1846,6 @@ def _assert_entity_batch_shapes(
                 int(np.asarray(entity_batch["event_tokens"]).shape[1]),
                 4,
             ),
-            "legal_action_target_ids": (batch_size, legal_width, 4),
         }
         for key, expected_shape in topology_shapes.items():
             if key not in entity_batch:

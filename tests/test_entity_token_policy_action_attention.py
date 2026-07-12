@@ -247,6 +247,89 @@ def test_each_flag_alone_warm_starts_exactly(flags):
         assert (ob[key] - ou[key]).abs().max().item() == 0.0, key
 
 
+def test_target_gather_uses_disjoint_local_id_namespaces_exactly():
+    """Hex/vertex/edge/player ids are local, then receive sequence offsets."""
+
+    import torch
+
+    from catan_zero.rl.entity_token_policy import EntityGraphNet
+
+    model = EntityGraphNet(
+        dataclasses.replace(_base_config(), action_target_gather=True)
+    )
+    # [CLS | 19 hex | 54 vertex | 72 edge | 4 player | 1 global].  Put the
+    # absolute sequence index in the first channel so an incorrect namespace
+    # offset is directly observable.
+    sequence_length = 1 + 19 + 54 + 72 + 4 + 1
+    tokens = torch.zeros(1, sequence_length, 64)
+    tokens[0, :, 0] = torch.arange(sequence_length)
+    targets = -torch.ones(1, 6, 4, dtype=torch.long)
+    targets[0, 0, 0] = 3   # hex token 1 + 3
+    targets[0, 1, 1] = 7   # vertex token 1 + 19 + 7
+    targets[0, 2, 2] = 11  # edge token 1 + 19 + 54 + 11
+    targets[0, 3, 3] = 1   # player token 1 + 19 + 54 + 72 + 1
+    targets[0, 4, 0] = 2   # mean-pool a robber hex and victim player
+    targets[0, 4, 3] = 0
+    batch = {
+        "hex_tokens": torch.zeros(1, 19, 1),
+        "vertex_tokens": torch.zeros(1, 54, 1),
+        "edge_tokens": torch.zeros(1, 72, 1),
+        "legal_action_target_ids": targets,
+    }
+
+    pooled = model._gather_target_tokens(tokens, batch)
+    expected = torch.tensor(
+        [4.0, 27.0, 85.0, 147.0, (3.0 + 146.0) / 2.0, 0.0]
+    )
+    torch.testing.assert_close(pooled[0, :, 0], expected, rtol=0.0, atol=0.0)
+
+
+@pytest.mark.parametrize(
+    ("column", "bad_value", "namespace_width"),
+    [(0, 19, 19), (1, 54, 54), (2, 72, 72), (3, 4, 4), (1, -2, 54)],
+)
+def test_target_aware_policy_rejects_out_of_range_local_ids(
+    column, bad_value, namespace_width
+):
+    from catan_zero.rl.entity_token_policy import _assert_entity_batch_shapes
+
+    batch = _real_entity_batch(n_states=1)
+    context = batch.pop("legal_action_context")
+    legal_mask = np.asarray(batch["legal_action_mask"], dtype=np.bool_)
+    legal_ids = np.full(legal_mask.shape, -1, dtype=np.int64)
+    legal_ids[legal_mask] = np.arange(int(legal_mask.sum()), dtype=np.int64)
+    batch["legal_action_target_ids"][0, 0, column] = bad_value
+    config = dataclasses.replace(_base_config(), action_target_gather=True)
+
+    with pytest.raises(
+        ValueError,
+        match=rf"column={column}.*namespace_width={namespace_width}",
+    ):
+        _assert_entity_batch_shapes(batch, legal_ids, context, config)
+
+
+def test_target_aware_policy_rejects_target_on_padded_action():
+    from catan_zero.rl.entity_token_policy import _assert_entity_batch_shapes
+
+    batch = _real_entity_batch(n_states=2)
+    context = batch.pop("legal_action_context")
+    legal_mask = np.asarray(batch["legal_action_mask"], dtype=np.bool_)
+    legal_ids = np.full(legal_mask.shape, -1, dtype=np.int64)
+    for row in range(int(legal_mask.shape[0])):
+        legal_ids[row, legal_mask[row]] = np.arange(
+            int(legal_mask[row].sum()), dtype=np.int64
+        )
+    padded = np.argwhere(~legal_mask)
+    if not len(padded):
+        pytest.skip("fixture rows happened to have identical legal widths")
+    row, action = padded[0]
+    batch["legal_action_target_ids"][row, action, 0] = 0
+    config = dataclasses.replace(_base_config(), action_target_gather=True)
+
+    with pytest.raises(ValueError, match="padded legal action carries a target id"):
+        _assert_entity_batch_shapes(batch, legal_ids, context, config)
+
+
 def test_transport_filtered_entity_fields_are_exact_noop_with_all_optional_heads():
     """EvalServer may omit only fields no current model variant consumes.
 

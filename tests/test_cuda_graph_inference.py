@@ -74,6 +74,7 @@ def _batch(batch_size=3, legal_width=5, event_width=8, live_events=0):
     )
     legal_ids = np.tile(np.arange(legal_width, dtype=np.int64), (batch_size, 1))
     legal_ids[-1, -1] = -1
+    entity["legal_action_target_ids"][legal_ids < 0] = -1
     entity["legal_action_mask"] = legal_ids >= 0
     context = rng.normal(
         size=(batch_size, legal_width, CONTEXT_ACTION_FEATURE_SIZE)
