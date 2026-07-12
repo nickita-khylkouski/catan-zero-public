@@ -22,6 +22,7 @@ import json
 import math
 import os
 from pathlib import Path
+import resource
 import signal
 import statistics
 import subprocess
@@ -357,16 +358,27 @@ def run_plan(plan_path: Path) -> dict[str, Any]:
     env = dict(os.environ)
     env["CUDA_VISIBLE_DEVICES"] = str(gpu)
     started = time.time()
-    process = subprocess.Popen(
-        plan["command"],
-        cwd=runtime["repository_root"],
-        env=env,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        bufsize=1,
-        start_new_session=True,
-    )
+    old_nofile = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if old_nofile[1] < 65_536:
+        raise ProbeError(
+            f"hard RLIMIT_NOFILE={old_nofile[1]} is below trainer requirement 65536"
+        )
+    try:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (65_536, old_nofile[1]))
+        process = subprocess.Popen(
+            plan["command"],
+            cwd=runtime["repository_root"],
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            bufsize=1,
+            start_new_session=True,
+        )
+    finally:
+        # The child inherited the raised soft limit; the orchestration process
+        # does not need to retain it.
+        resource.setrlimit(resource.RLIMIT_NOFILE, old_nofile)
     observations: list[dict[str, Any]] = []
     log_path = output_dir / "trainer.stdout.log"
     try:
