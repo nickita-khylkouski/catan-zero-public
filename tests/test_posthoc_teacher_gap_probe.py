@@ -247,8 +247,26 @@ def test_modern_report_binds_emitted_holdout_not_input_sentinel(tmp_path, monkey
     paths = _paths(tmp_path, report)
     report["validation_game_seed_manifest"] = str(paths[3])
     report["input_validation_game_seed_manifest_sha256"] = "sha256:upstream-sentinel"
+    seeds = np.asarray([101, 103], dtype=np.int64)
+    emitted = {
+        "schema_version": "train-validation-game-seeds-v1",
+        "data": str(paths[2]),
+        "data_fingerprint": "sha256:data",
+        "validation_fraction": 0.05,
+        "validation_seed": 17,
+        "validation_max_samples": 0,
+        "validation_game_seed_ranges": [],
+        "validation_game_seed_count": 2,
+        "validation_game_seed_set_sha256": "sha256:seeds",
+        "game_seeds": [101, 103],
+    }
+    paths[3].write_text(json.dumps(emitted), encoding="utf-8")
     paths[0].write_text(json.dumps(report), encoding="utf-8")
     fake = _FakeTrainBC()
+    fake._game_seed_set_sha256 = lambda value: (
+        "sha256:seeds" if np.array_equal(value, seeds) else "sha256:wrong"
+    )
+    fake._canonical_json_sha256 = lambda value: "sha256:manifest-semantic"
     monkeypatch.setattr(module, "_load_train_bc", lambda: fake)
     monkeypatch.setattr(module, "_load_policy", lambda *args: SimpleNamespace())
 

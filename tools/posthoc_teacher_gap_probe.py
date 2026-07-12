@@ -116,13 +116,59 @@ def run_probe(
             )
 
     ranges = report.get("validation_game_seed_ranges") or []
-    validation_contract = train_bc._load_validation_game_seed_manifest_for_training(
-        validation_manifest_path,
-        validation_fraction=float(_required(report, "validation_fraction")),
-        validation_seed=int(_required(report, "validation_seed")),
-        validation_max_samples=int(_required(report, "validation_max_samples")),
-        validation_game_seed_ranges=[tuple(map(int, item)) for item in ranges],
-    )
+    if emitted_manifest:
+        emitted = json.loads(validation_manifest_path.read_text(encoding="utf-8"))
+        required_emitted = {
+            "schema_version",
+            "data",
+            "data_fingerprint",
+            "validation_fraction",
+            "validation_seed",
+            "validation_max_samples",
+            "validation_game_seed_ranges",
+            "validation_game_seed_count",
+            "validation_game_seed_set_sha256",
+            "game_seeds",
+        }
+        if not isinstance(emitted, dict) or not required_emitted.issubset(emitted):
+            raise SystemExit("emitted validation holdout manifest is malformed")
+        if emitted["schema_version"] != "train-validation-game-seeds-v1":
+            raise SystemExit("emitted validation holdout schema drifted")
+        seeds = np.asarray(emitted["game_seeds"], dtype=np.int64)
+        if (
+            seeds.ndim != 1
+            or seeds.size == 0
+            or not np.all(seeds[1:] > seeds[:-1])
+            or int(emitted["validation_game_seed_count"]) != int(seeds.size)
+            or emitted["validation_game_seed_set_sha256"]
+            != train_bc._game_seed_set_sha256(seeds)
+            or Path(str(emitted["data"])).expanduser().resolve(strict=True) != data_path
+            or emitted["data_fingerprint"] != expected_fingerprint
+            or float(emitted["validation_fraction"])
+            != float(_required(report, "validation_fraction"))
+            or int(emitted["validation_seed"])
+            != int(_required(report, "validation_seed"))
+            or int(emitted["validation_max_samples"])
+            != int(_required(report, "validation_max_samples"))
+            or emitted["validation_game_seed_ranges"] != ranges
+        ):
+            raise SystemExit("emitted validation holdout semantics drifted")
+        validation_contract = {
+            "game_seeds": seeds,
+            "validation_row_count": None,
+            "validation_game_seed_set_sha256": emitted[
+                "validation_game_seed_set_sha256"
+            ],
+            "manifest_sha256": train_bc._canonical_json_sha256(emitted),
+        }
+    else:
+        validation_contract = train_bc._load_validation_game_seed_manifest_for_training(
+            validation_manifest_path,
+            validation_fraction=float(_required(report, "validation_fraction")),
+            validation_seed=int(_required(report, "validation_seed")),
+            validation_max_samples=int(_required(report, "validation_max_samples")),
+            validation_game_seed_ranges=[tuple(map(int, item)) for item in ranges],
+        )
     data = train_bc.MemmapCorpus(data_path)
     split = train_bc.split_train_validation_indices(
         data,
@@ -138,11 +184,14 @@ def run_probe(
         ),
     )
     validation_indices = np.asarray(split["validation"], dtype=np.int64)
-    if validation_indices.size != int(validation_contract["validation_row_count"]):
+    expected_validation_rows = validation_contract.get("validation_row_count")
+    if expected_validation_rows is not None and validation_indices.size != int(
+        expected_validation_rows
+    ):
         raise SystemExit(
             "locked holdout row count differs from validation manifest: "
             f"split={validation_indices.size} "
-            f"manifest={validation_contract['validation_row_count']}"
+            f"manifest={expected_validation_rows}"
         )
 
     policy_weights = train_bc.build_sample_weights(
