@@ -190,6 +190,10 @@ class EntityGraphConfig:
     moe_top_k: int = 2
     # 0 selects width 384 at model width 384 and scales proportionally.
     moe_expert_ff_size: int = 0
+    # Relational trunks historically bundled CAT-97's direct target-token
+    # policy logit. Keep that behavior by default, but allow a causal
+    # relational/gather/cross-attention probe to exclude the extra head.
+    relational_edge_policy_head: bool = True
 
 
 class EntityGraphNet:
@@ -593,7 +597,10 @@ class EntityGraphNet:
                     nn.init.zeros_(self.value_pool_head[4].bias)
 
                 # --- CAT-97 GATEAU edge/node-feature policy head (default OFF) ---
-                self.edge_policy_head = self.uses_relational_topology or bool(
+                self.edge_policy_head = (
+                    self.uses_relational_topology
+                    and bool(getattr(cfg, "relational_edge_policy_head", True))
+                ) or bool(
                     getattr(cfg, "edge_policy_head", False)
                 )
                 if self.edge_policy_head:
@@ -1189,6 +1196,7 @@ class EntityGraphPolicy:
         moe_routed_experts: int = 0,
         moe_top_k: int = 2,
         moe_expert_ff_size: int = 0,
+        relational_edge_policy_head: bool = True,
     ) -> EntityGraphPolicy:
         env = ColonistMultiAgentEnv(env_config or ColonistMultiAgentConfig())
         try:
@@ -1217,6 +1225,7 @@ class EntityGraphPolicy:
                 moe_routed_experts=int(moe_routed_experts),
                 moe_top_k=int(moe_top_k),
                 moe_expert_ff_size=int(moe_expert_ff_size),
+                relational_edge_policy_head=bool(relational_edge_policy_head),
             )
             return cls(config, static, seed=seed, device=device)
         finally:

@@ -115,6 +115,20 @@ def test_default_trunk_and_state_dict_remain_incumbent_compatible():
     explicit.load_state_dict(base.state_dict(), strict=True)
 
 
+def test_relational_probe_can_exclude_direct_edge_policy_head():
+    historical = EntityGraphNet(_config("rrt"))
+    isolated = EntityGraphNet(
+        _config("rrt", relational_edge_policy_head=False)
+    )
+    assert historical.action_target_gather is True
+    assert historical.action_cross_attention_layers == 1
+    assert historical.edge_policy_head is True
+    assert isolated.action_target_gather is True
+    assert isolated.action_cross_attention_layers == 1
+    assert isolated.edge_policy_head is False
+    assert not hasattr(isolated, "edge_policy_mlp")
+
+
 def test_relation_builder_uses_live_directed_incidence():
     batch = _batch(batch_size=1, events=0)
     relation = build_relation_ids(batch, sequence_length=151)

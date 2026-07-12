@@ -402,6 +402,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="From-scratch action-to-board cross-attention blocks for relational arms.",
     )
     parser.add_argument(
+        "--relational-edge-policy-head",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Whether topology-aware trunks also enable CAT-97's direct target-token "
+            "policy logit. Default true preserves existing relational models; disable "
+            "for a causal relational/gather/cross-attention-only probe."
+        ),
+    )
+    parser.add_argument(
         "--latent-deliberation-steps",
         type=int,
         default=0,
@@ -3841,6 +3851,9 @@ def main(argv: Sequence[str] | None = None) -> None:
                     relational_bases=int(args.relational_bases),
                     relational_action_cross_layers=int(
                         args.relational_action_cross_layers
+                    ),
+                    relational_edge_policy_head=bool(
+                        args.relational_edge_policy_head
                     ),
                     latent_deliberation_steps=int(args.latent_deliberation_steps),
                     latent_deliberation_slots=int(args.latent_deliberation_slots),
@@ -10750,6 +10763,11 @@ def _checkpoint_config_mismatches(
                 "relational_action_cross_layers",
                 "relational_action_cross_layers",
                 1,
+            ),
+            (
+                "relational_edge_policy_head",
+                "relational_edge_policy_head",
+                True,
             ),
             ("latent_deliberation_steps", "latent_deliberation_steps", 0),
             ("latent_deliberation_slots", "latent_deliberation_slots", 8),

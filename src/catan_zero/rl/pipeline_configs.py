@@ -245,6 +245,7 @@ class TrainConfig(PipelineConfig):
     moe_top_k: int = 2
     moe_expert_ff_size: int = 0
     moe_balance_loss_weight: float = 0.01
+    relational_edge_policy_head: bool = True
     symmetry_augment: bool = False
     symmetry_augment_events: bool = True
     soft_target_temperature: float = 0.7
