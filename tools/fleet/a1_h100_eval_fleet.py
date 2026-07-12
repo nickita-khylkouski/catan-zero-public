@@ -19,6 +19,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import fcntl
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -119,6 +120,10 @@ def _run_id_from_plan_fields(plan: dict[str, Any]) -> str:
         "scope": plan["scope"],
         "workers_per_gpu": plan["workers_per_gpu"],
     }
+    # Legacy v1 plans predate role-specific search calibration.  Do not add a
+    # synthetic field while replaying their immutable run IDs.
+    if "role_search_config" in plan:
+        run_key["role_search_config"] = plan["role_search_config"]
     return "a1-eval-" + hashlib.sha256(_canonical(run_key)).hexdigest()[:16]
 
 
@@ -241,12 +246,10 @@ def _split_ranges(total: int, lanes: int, base_seed: int) -> list[tuple[int, int
     return result
 
 
-def _science_args() -> list[str]:
-    return [
+def _science_args(*, c_scale: float | None = 0.03) -> list[str]:
+    args = [
         "--n-full",
         "128",
-        "--c-scale",
-        "0.03",
         "--c-visit",
         "50.0",
         "--sigma-eval",
@@ -284,6 +287,51 @@ def _science_args() -> list[str]:
         "--gate-config",
         "flywheel",
     ]
+    if c_scale is not None:
+        args[2:2] = ["--c-scale", str(float(c_scale))]
+    return args
+
+
+def _role_search_config(
+    *, candidate_c_scale: float, champion_c_scale: float
+) -> dict[str, dict[str, float]]:
+    values = {
+        "candidate": float(candidate_c_scale),
+        "champion": float(champion_c_scale),
+    }
+    for role, value in values.items():
+        if not math.isfinite(value) or value <= 0.0:
+            raise FleetError(f"{role}_c_scale must be finite and positive")
+    return {role: {"c_scale": value} for role, value in values.items()}
+
+
+def _plan_role_search_config(plan: dict[str, Any]) -> dict[str, dict[str, float]]:
+    raw = plan.get("role_search_config")
+    if raw is None:
+        return _role_search_config(candidate_c_scale=0.03, champion_c_scale=0.03)
+    if not isinstance(raw, dict):
+        raise FleetError("evaluation plan role_search_config is malformed")
+    try:
+        config = _role_search_config(
+            candidate_c_scale=raw["candidate"]["c_scale"],
+            champion_c_scale=raw["champion"]["c_scale"],
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise FleetError("evaluation plan role_search_config is malformed") from error
+    if raw != config:
+        raise FleetError("evaluation plan role_search_config is not canonical")
+    return config
+
+
+def _science_hash(plan: dict[str, Any]) -> str:
+    if "role_search_config" not in plan:
+        return _digest(SCIENCE_CONFIG)
+    return _digest(
+        {
+            "science_config": SCIENCE_CONFIG,
+            "role_search_config": _plan_role_search_config(plan),
+        }
+    )
 
 
 def _internal_argv(
@@ -295,8 +343,10 @@ def _internal_argv(
     seed: int,
     workers: int,
     out: str,
+    candidate_c_scale: float | None = None,
+    champion_c_scale: float | None = None,
 ) -> list[str]:
-    return [
+    argv = [
         python,
         "tools/gumbel_search_cross_net_h2h.py",
         "--candidate",
@@ -313,10 +363,27 @@ def _internal_argv(
         "1",
         "--device",
         "cuda",
-        *_science_args(),
+        *_science_args(
+            c_scale=(
+                0.03
+                if candidate_c_scale is None and champion_c_scale is None
+                else None
+            )
+        ),
         "--out",
         out,
     ]
+    if candidate_c_scale is not None or champion_c_scale is not None:
+        if candidate_c_scale is None or champion_c_scale is None:
+            raise FleetError("both internal role c_scale values must be explicit")
+        out_index = argv.index("--out")
+        argv[out_index:out_index] = [
+            "--candidate-c-scale",
+            str(float(candidate_c_scale)),
+            "--baseline-c-scale",
+            str(float(champion_c_scale)),
+        ]
+    return argv
 
 
 def _external_argv(
@@ -328,6 +395,7 @@ def _external_argv(
     workers: int,
     artifact_dir: str,
     out: str,
+    c_scale: float = 0.03,
 ) -> list[str]:
     return [
         python,
@@ -352,7 +420,7 @@ def _external_argv(
         "1",
         "--device",
         "cuda",
-        *_science_args(),
+        *_science_args(c_scale=c_scale),
         "--artifact-dir",
         artifact_dir,
         "--resume",
@@ -398,6 +466,8 @@ def build_plan(
     repo_root: Path = _REPO_ROOT,
     repo_commit: str | None = None,
     tool_hashes: dict[str, str] | None = None,
+    candidate_c_scale: float = 0.03,
+    champion_c_scale: float = 0.03,
 ) -> dict[str, Any]:
     candidate = candidate.expanduser().resolve(strict=True)
     champion = champion.expanduser().resolve(strict=True)
@@ -446,7 +516,16 @@ def build_plan(
         or seed_intervals[1][1] <= seed_intervals[0][0]
     ):
         raise FleetError("internal and external validation seed intervals overlap")
-    science_hash = _digest(SCIENCE_CONFIG)
+    role_search_config = _role_search_config(
+        candidate_c_scale=candidate_c_scale,
+        champion_c_scale=champion_c_scale,
+    )
+    science_hash = _digest(
+        {
+            "science_config": SCIENCE_CONFIG,
+            "role_search_config": role_search_config,
+        }
+    )
     resolved_repo_commit = repo_commit or _git_commit(repo_root)
     resolved_tool_hashes = tool_hashes or _tool_hashes(repo_root)
     run_identity = {
@@ -456,6 +535,7 @@ def build_plan(
         "candidate": {"sha256": candidate_sha},
         "champion": {"sha256": champion_sha},
         "science_config_hash": science_hash,
+        "role_search_config": role_search_config,
         "pair_claims": {
             "internal": {
                 "base_seed": internal_base_seed,
@@ -491,6 +571,8 @@ def build_plan(
             seed=seed,
             workers=workers_per_gpu,
             out=f"{job_dir}/report.json",
+            candidate_c_scale=role_search_config["candidate"]["c_scale"],
+            champion_c_scale=role_search_config["champion"]["c_scale"],
         )
         jobs.append(
             {
@@ -531,6 +613,7 @@ def build_plan(
                 workers=workers_per_gpu,
                 artifact_dir=f"{job_dir}/games",
                 out=f"{job_dir}/report.json",
+                c_scale=role_search_config[role]["c_scale"],
             )
             jobs.append(
                 {
@@ -558,6 +641,7 @@ def build_plan(
         "tool_hashes": resolved_tool_hashes,
         "science_config": SCIENCE_CONFIG,
         "science_config_hash": science_hash,
+        "role_search_config": role_search_config,
         "workers_per_gpu": workers_per_gpu,
         "candidate": {
             "source": str(candidate),
@@ -618,9 +702,10 @@ def load_plan(path: Path, manifest: dict[str, Any]) -> dict[str, Any]:
         raise FleetError(
             "evaluation plan was built for a different private fleet manifest"
         )
-    if plan.get("science_config") != SCIENCE_CONFIG or plan.get(
-        "science_config_hash"
-    ) != _digest(SCIENCE_CONFIG):
+    if plan.get("science_config") != SCIENCE_CONFIG:
+        raise FleetError("evaluation plan science config drift")
+    _plan_role_search_config(plan)
+    if plan.get("science_config_hash") != _science_hash(plan):
         raise FleetError("evaluation plan science config drift")
     if plan.get("run_id") != _run_id_from_plan_fields(plan):
         raise FleetError("evaluation plan run identity does not replay")
@@ -668,6 +753,8 @@ def _validate_planned_jobs(plan: dict[str, Any], manifest: dict[str, Any]) -> No
     run_root = f"{str(manifest['remote_root']).rstrip('/')}/runs/{plan['run_id']}"
     job_ids: set[str] = set()
     by_phase: dict[str, list[dict[str, Any]]] = {"internal": [], "external": []}
+    role_search_config = _plan_role_search_config(plan)
+    legacy_shared_search = "role_search_config" not in plan
     for job in jobs:
         if not isinstance(job, dict) or job.get("phase") not in by_phase:
             raise FleetError("evaluation plan contains an invalid job")
@@ -718,6 +805,16 @@ def _validate_planned_jobs(plan: dict[str, Any], manifest: dict[str, Any]) -> No
             seed=seed,
             workers=int(plan["workers_per_gpu"]),
             out=job["report"],
+            candidate_c_scale=(
+                None
+                if legacy_shared_search
+                else role_search_config["candidate"]["c_scale"]
+            ),
+            champion_c_scale=(
+                None
+                if legacy_shared_search
+                else role_search_config["champion"]["c_scale"]
+            ),
         )
         if job["pairs"] != pairs or job["base_seed"] != seed or job["argv"] != expected:
             raise FleetError(f"internal shard contract drift: {job['job_id']}")
@@ -741,6 +838,7 @@ def _validate_planned_jobs(plan: dict[str, Any], manifest: dict[str, Any]) -> No
                 workers=int(plan["workers_per_gpu"]),
                 artifact_dir=f"{job['job_dir']}/games",
                 out=job["report"],
+                c_scale=role_search_config[role]["c_scale"],
             )
             if (
                 job["role"] != role
@@ -1507,6 +1605,8 @@ def _parser() -> argparse.ArgumentParser:
         ),
     )
     plan.add_argument("--scope", choices=("canary", "full"), default="full")
+    plan.add_argument("--candidate-c-scale", type=float, default=0.03)
+    plan.add_argument("--champion-c-scale", type=float, default=0.03)
     plan.add_argument("--out", type=Path, required=True)
     for name in ("launch", "resume"):
         operation = commands.add_parser(name)
@@ -1547,6 +1647,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 iteration_id=args.iteration_id,
                 seed_cohort_id=args.seed_cohort_id,
                 scope=args.scope,
+                candidate_c_scale=args.candidate_c_scale,
+                champion_c_scale=args.champion_c_scale,
             )
             write_new_readonly(args.out, value)
             result = {

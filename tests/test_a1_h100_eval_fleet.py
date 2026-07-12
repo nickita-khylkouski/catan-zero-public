@@ -210,7 +210,6 @@ def test_every_job_is_cuda_pinned_and_has_exact_n128_infoset_d6_recipe(
     manifest, plan = _plan(tmp_path)
     required = {
         "--n-full": "128",
-        "--c-scale": "0.03",
         "--c-visit": "50.0",
         "--sigma-eval": "0.98",
         "--determinization-particles": "4",
@@ -223,6 +222,12 @@ def test_every_job_is_cuda_pinned_and_has_exact_n128_infoset_d6_recipe(
         argv = job["argv"]
         for flag, expected in required.items():
             assert argv[argv.index(flag) + 1] == expected
+        if job["phase"] == "internal":
+            assert argv[argv.index("--candidate-c-scale") + 1] == "0.03"
+            assert argv[argv.index("--baseline-c-scale") + 1] == "0.03"
+            assert "--c-scale" not in argv
+        else:
+            assert argv[argv.index("--c-scale") + 1] == "0.03"
         for flag in (
             "--lazy-interior-chance",
             "--correct-rust-chance-spectra",
@@ -253,6 +258,59 @@ def test_every_job_is_cuda_pinned_and_has_exact_n128_infoset_d6_recipe(
     assert "/home/ubuntu/catan-zero-v1/src" in all_shell
     assert "/home/ubuntu/catan-zero-v1/tools/fleet/launch_detached.sh" in all_shell
     assert "\ntools/fleet/launch_detached.sh " not in all_shell
+
+
+def test_role_specific_search_calibration_is_sealed_into_jobs_and_identity(
+    tmp_path: Path,
+) -> None:
+    manifest, default = _plan(tmp_path)
+    calibrated = fleet.build_plan(
+        manifest,
+        candidate=Path(default["candidate"]["source"]),
+        champion=Path(default["champion"]["source"]),
+        internal_pairs=600,
+        external_pairs=500,
+        internal_base_seed=6_190_000_000,
+        external_base_seed=6_191_000_000,
+        workers_per_gpu=8,
+        candidate_c_scale=0.10,
+        champion_c_scale=0.03,
+        repo_commit="a" * 40,
+        tool_hashes=default["tool_hashes"],
+    )
+    assert calibrated["run_id"] != default["run_id"]
+    assert calibrated["science_config_hash"] != default["science_config_hash"]
+    assert calibrated["role_search_config"] == {
+        "candidate": {"c_scale": 0.10},
+        "champion": {"c_scale": 0.03},
+    }
+    internal = next(job for job in calibrated["jobs"] if job["phase"] == "internal")
+    assert internal["argv"][internal["argv"].index("--candidate-c-scale") + 1] == "0.1"
+    assert internal["argv"][internal["argv"].index("--baseline-c-scale") + 1] == "0.03"
+    for job in (job for job in calibrated["jobs"] if job["phase"] == "external"):
+        expected = "0.1" if job["role"] == "candidate" else "0.03"
+        assert job["argv"][job["argv"].index("--c-scale") + 1] == expected
+
+
+@pytest.mark.parametrize("value", [0.0, -0.1, float("nan"), float("inf")])
+def test_role_specific_search_calibration_rejects_invalid_values(
+    tmp_path: Path, value: float
+) -> None:
+    manifest, default = _plan(tmp_path)
+    with pytest.raises(fleet.FleetError, match="candidate_c_scale"):
+        fleet.build_plan(
+            manifest,
+            candidate=Path(default["candidate"]["source"]),
+            champion=Path(default["champion"]["source"]),
+            internal_pairs=600,
+            external_pairs=500,
+            internal_base_seed=6_190_000_000,
+            external_base_seed=6_191_000_000,
+            workers_per_gpu=8,
+            candidate_c_scale=value,
+            repo_commit="a" * 40,
+            tool_hashes=default["tool_hashes"],
+        )
 
 
 def test_launch_command_creates_fresh_tree_and_ignores_ssh_working_directory(
