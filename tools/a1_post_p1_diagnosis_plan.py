@@ -54,20 +54,31 @@ def build_plan(
         "amp": "bf16",
         "policy_kl_anchor_weight": "inherit exact selected P1 value",
         "policy_kl_anchor_direction": "forward",
+        "policy_loss_weight": 1.0,
+        "soft_target_source": "policy",
+        "soft_target_weight": 0.9,
+        "soft_target_temperature": 0.7,
+        "soft_target_min_legal_coverage": 0.5,
         "forced_policy_effective_weight": 0.0,
+        "forced_action_weight": 0.1,
         "forced_row_value_weight": 1.0,
         "per_game_policy_weight": False,
         "per_game_policy_weight_mode": "equal",
         "per_game_value_weight": False,
         "per_game_value_weight_mode": "equal",
         "loser_sample_weight": 0.3,
+        "winner_sample_weight": 1.0,
+        "value_loss_weight": 0.25,
+        "final_vp_loss_weight": 0.0,
         "value_lr_mult": 0.3,
         "value_target_lambda": 1.0,
+        "truncated_vp_margin_value_weight": 0.25,
         "q_loss_weight": 0.0,
         "aux_subgoal_heads": False,
         "aux_subgoal_loss_weight": 0.0,
         "graph_history_features": True,
         "mask_hidden_info": True,
+        "symmetry_augment": False,
         "validation": "same game-disjoint P1 validation identity",
         "initialization_policy": (
             "independent authenticated f7 producer bytes; checkpoint chaining forbidden"
@@ -132,6 +143,11 @@ def build_plan(
             "value RMSE/calibration by phase and root width",
             "parameter drift split into trunk/action/value groups",
             "model-to-f7 KL on multi-action rows",
+            (
+                "weighted policy-vs-value shared-trunk gradient norms, cosine, "
+                "opposing-coordinate fraction, and per-block concentration; collect "
+                "on a single-GPU/DDP diagnostic because FSDP flattens logical blocks"
+            ),
             "gradient clipping and non-finite telemetry",
         ],
     }
@@ -190,13 +206,45 @@ def build_plan(
         "evaluation": evaluation,
         "early_stop": [
             "abort immediately on non-finite loss/gradient/parameters",
-            "abort when post-warmup clipping exceeds 10% of optimizer steps",
+            (
+                "do not abort on clipped fraction alone: Adam largely normalizes a "
+                "common gradient rescale; require objective-specific trunk conflict "
+                "or pathological parameter-update evidence"
+            ),
             (
                 "at the 2,097,152-sample midpoint, stop an arm only when both "
                 "active teacher-gap and held-out loss are worse than FULL_CONTROL "
                 "at the matched dose and its behavior drift is larger"
             ),
         ],
+        "prelaunch_gradient_probe": {
+            "purpose": (
+                "distinguish destructive multi-task trunk interference from an "
+                "ordinary learning-rate problem before spending another full dose"
+            ),
+            "initialization": "reload f7 independently",
+            "data": "exact P1 authenticated composite and sampler",
+            "execution": (
+                "single GPU, 32 optimizer steps, diagnostics every step; diagnostic-only "
+                "checkpoint must never enter candidate lineage"
+            ),
+            "primary_readouts": [
+                "value_to_policy_grad_norm_ratio",
+                "trunk_gradient_cosine",
+                "blocks.0 policy/value norms and cosine",
+                "combined pre-clip norm and actual block parameter delta",
+            ],
+            "interpretation": {
+                "negative_cosine_or_block0_value_dominance": (
+                    "value-head LR is not a fix; test value-facing trunk gradient "
+                    "scaling/projection or head-only value repair"
+                ),
+                "aligned_balanced_gradients": (
+                    "shared objective is not the proximal cause; prioritize total "
+                    "dose/LR schedule and policy-active sample budget"
+                ),
+            },
+        },
         "decision_rules": decision,
         "explicitly_deferred": {
             "auxiliary_heads": "objective/regularization change; conditional after diagnosis",

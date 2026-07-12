@@ -34,6 +34,10 @@ def test_architecture_arm_is_single_delta_over_head_only() -> None:
     assert fixed["aux_subgoal_heads"] is False
     assert fixed["value_target_lambda"] == 1.0
     assert fixed["value_lr_mult"] == 0.3
+    assert fixed["value_loss_weight"] == 0.25
+    assert fixed["policy_loss_weight"] == 1.0
+    assert fixed["soft_target_weight"] == 0.9
+    assert fixed["final_vp_loss_weight"] == 0.0
     assert fixed["loser_sample_weight"] == 0.3
     assert fixed["per_game_policy_weight"] is False
     assert fixed["per_game_value_weight"] is False
@@ -54,3 +58,15 @@ def test_matrix_is_sequential_and_non_launching() -> None:
 def test_only_eight_b200_topology_is_admitted() -> None:
     with pytest.raises(ValueError, match="eight B200"):
         build_plan(world_size=4)
+
+
+def test_plan_uses_objective_conflict_not_clip_frequency_as_stop_signal() -> None:
+    plan = build_plan()
+    probe = plan["prelaunch_gradient_probe"]
+    assert probe["initialization"] == "reload f7 independently"
+    assert "single GPU" in probe["execution"]
+    assert "value_to_policy_grad_norm_ratio" in probe["primary_readouts"]
+    assert any(
+        "do not abort on clipped fraction alone" in row
+        for row in plan["early_stop"]
+    )

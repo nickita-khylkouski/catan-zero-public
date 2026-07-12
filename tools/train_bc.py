@@ -7038,6 +7038,27 @@ def _train_xdim_batch(
             + float(aux_subgoal_loss_weight) * aux_subgoal_loss
             + float(moe_balance_loss_weight) * moe_balance_loss
         )
+        objective_gradient_interference = None
+        if diagnostics and accum_do_step:
+            # Exact configured task objectives. Value-head LR groups cannot scale
+            # either objective's gradient through the shared transformer.
+            policy_objective = (
+                float(policy_loss_weight) * policy_loss
+                + float(q_loss_weight) * q_loss
+                + float(policy_kl_anchor_weight) * kl_anchor_loss
+            )
+            value_objective = (
+                float(value_loss_weight) * value_loss
+                + float(final_vp_loss_weight) * final_vp_loss
+                + float(value_uncertainty_loss_weight) * value_uncertainty_loss
+                + float(value_categorical_loss_weight) * value_categorical_loss
+                + float(aux_subgoal_loss_weight) * aux_subgoal_loss
+            )
+            objective_gradient_interference = _objective_gradient_interference(
+                policy,
+                policy_objective=policy_objective,
+                value_objective=value_objective,
+            )
     # C1 gradient accumulation. At grad_accum_steps==1 (accum_do_zero_grad and
     # accum_do_step both True) this is byte-identical to the pre-C1 path:
     # zero_grad, backward on the undivided loss, clip, step. For N>1 the loss is
@@ -7070,6 +7091,9 @@ def _train_xdim_batch(
                 observability_state,
                 pre_clip_total_grad_norm=pre_clip_total_grad_norm,
                 max_grad_norm=1.0,
+            )
+            optimizer_observability["objective_gradient_interference"] = (
+                objective_gradient_interference
             )
     predictions = torch.argmax(outputs["logits"], dim=-1)
     active = policy_weights > 0.0
@@ -11906,6 +11930,179 @@ def _optimizer_observability_module_name(parameter_name: str) -> str:
         while name.startswith(prefix):
             name = name[len(prefix) :]
     return name.split(".", 1)[0] or "<root>"
+
+
+def _objective_gradient_module_name(parameter_name: str) -> str:
+    """Keep transformer block indices in objective-interference telemetry."""
+    name = str(parameter_name)
+    for prefix in ("module.", "_fsdp_wrapped_module."):
+        while name.startswith(prefix):
+            name = name[len(prefix) :]
+    parts = name.split(".")
+    if len(parts) >= 2 and parts[0] == "blocks" and parts[1].isdigit():
+        return f"blocks.{parts[1]}"
+    return parts[0] or "<root>"
+
+
+def _shared_trunk_named_parameters(policy) -> list[tuple[str, object]]:
+    """Select logical EntityGraph trunk parameters without either task head."""
+    model = policy.model
+    module = getattr(model, "module", model)
+    trunk_names = ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS["trunk"]
+    trunk_prefixes = tuple(f"{name}." for name in trunk_names)
+    selected = []
+    for name, parameter in module.named_parameters():
+        normalized = str(name)
+        while normalized.startswith("_fsdp_wrapped_module."):
+            normalized = normalized[len("_fsdp_wrapped_module.") :]
+        if parameter.requires_grad and (
+            normalized in trunk_names or normalized.startswith(trunk_prefixes)
+        ):
+            selected.append((normalized, parameter))
+    return selected
+
+
+def _objective_gradient_interference(
+    policy,
+    *,
+    policy_objective,
+    value_objective,
+) -> dict[str, object]:
+    """Measure weighted policy/value gradient interaction in the shared trunk.
+
+    ``autograd.grad`` leaves ``Parameter.grad`` and the optimizer trajectory
+    untouched. Objectives already include configured loss coefficients. This
+    therefore measures what reaches shared layers, unlike ``--value-lr-mult``,
+    which only changes named value-head parameter groups.
+
+    FSDP flattens logical parameters, so it cannot provide a faithful block-level
+    decomposition here. Report that limitation instead of plausible false data;
+    run this high-information diagnostic on one GPU or DDP. DDP results are
+    explicitly rank-local because ranks see different microbatches.
+    """
+    import torch
+
+    model = policy.model
+    is_fsdp = "FullyShardedDataParallel" in type(model).__name__ or (
+        callable(getattr(model, "clip_grad_norm_", None))
+        and not isinstance(model, torch.nn.parallel.DistributedDataParallel)
+    )
+    if is_fsdp:
+        return {
+            "available": False,
+            "reason": "fsdp_logical_parameters_are_flattened",
+            "recommended_probe": "single_gpu_or_ddp",
+        }
+    named = _shared_trunk_named_parameters(policy)
+    if not named:
+        return {"available": False, "reason": "no_trainable_shared_trunk_parameters"}
+    if any(
+        not getattr(objective, "requires_grad", False)
+        for objective in (policy_objective, value_objective)
+    ):
+        return {"available": False, "reason": "inactive_policy_or_value_objective"}
+    parameters = [parameter for _, parameter in named]
+    try:
+        policy_grads = torch.autograd.grad(
+            policy_objective, parameters, retain_graph=True, allow_unused=True
+        )
+        value_grads = torch.autograd.grad(
+            value_objective, parameters, retain_graph=True, allow_unused=True
+        )
+    except RuntimeError as exc:
+        return {
+            "available": False,
+            "reason": "autograd_probe_failed",
+            "detail": str(exc)[:240],
+        }
+
+    zero = torch.zeros((), dtype=torch.float64, device=parameters[0].device)
+    policy_sq = zero.clone()
+    value_sq = zero.clone()
+    dot = zero.clone()
+    conflict_coordinates = zero.clone()
+    joint_coordinates = zero.clone()
+    by_module: dict[str, dict[str, object]] = {}
+    for (name, _), policy_grad, value_grad in zip(named, policy_grads, value_grads):
+        if policy_grad is None and value_grad is None:
+            continue
+        if policy_grad is None:
+            policy_grad = torch.zeros_like(value_grad)
+        if value_grad is None:
+            value_grad = torch.zeros_like(policy_grad)
+        pg = policy_grad.detach().double()
+        vg = value_grad.detach().double()
+        p_sq = pg.square().sum()
+        v_sq = vg.square().sum()
+        pv = (pg * vg).sum()
+        jointly_nonzero = (pg != 0) & (vg != 0)
+        policy_sq += p_sq
+        value_sq += v_sq
+        dot += pv
+        joint_coordinates += jointly_nonzero.sum(dtype=torch.float64)
+        conflict_coordinates += (
+            jointly_nonzero & ((pg * vg) < 0)
+        ).sum(dtype=torch.float64)
+        group = _objective_gradient_module_name(name)
+        row = by_module.setdefault(
+            group,
+            {"policy_sq": zero.clone(), "value_sq": zero.clone(), "dot": zero.clone()},
+        )
+        row["policy_sq"] += p_sq
+        row["value_sq"] += v_sq
+        row["dot"] += pv
+
+    epsilon = torch.finfo(torch.float64).eps
+    policy_norm = torch.sqrt(policy_sq)
+    value_norm = torch.sqrt(value_sq)
+    denominator = policy_norm * value_norm
+
+    def _float(value) -> float:
+        return float(value.detach().cpu().item())
+
+    modules = {}
+    for group, row in sorted(by_module.items()):
+        p_norm = torch.sqrt(row["policy_sq"])
+        v_norm = torch.sqrt(row["value_sq"])
+        denom = p_norm * v_norm
+        modules[group] = {
+            "policy_grad_norm": _float(p_norm),
+            "value_grad_norm": _float(v_norm),
+            "cosine": _float(row["dot"] / denom.clamp_min(epsilon))
+            if _float(denom) > 0.0
+            else None,
+        }
+    combined_sq = policy_sq + value_sq + 2.0 * dot
+    return {
+        "available": True,
+        "scope": (
+            "rank_local_microbatch"
+            if isinstance(model, torch.nn.parallel.DistributedDataParallel)
+            else "single_process_microbatch"
+        ),
+        "value_lr_mult_scales_shared_trunk": False,
+        "policy_objective": _float(policy_objective.detach()),
+        "value_objective": _float(value_objective.detach()),
+        "policy_trunk_grad_norm": _float(policy_norm),
+        "value_trunk_grad_norm": _float(value_norm),
+        "value_to_policy_grad_norm_ratio": (
+            _float(value_norm / policy_norm.clamp_min(epsilon))
+            if _float(policy_norm) > 0.0
+            else None
+        ),
+        "trunk_gradient_cosine": (
+            _float(dot / denominator.clamp_min(epsilon))
+            if _float(denominator) > 0.0
+            else None
+        ),
+        "opposing_coordinate_fraction": (
+            _float(conflict_coordinates / joint_coordinates)
+            if _float(joint_coordinates) > 0.0
+            else None
+        ),
+        "combined_trunk_grad_norm": _float(torch.sqrt(combined_sq.clamp_min(0.0))),
+        "modules": modules,
+    }
 
 
 def _norms_from_squared_sums(squared_sums: dict[str, object]) -> dict[str, float]:
