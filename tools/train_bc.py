@@ -6552,9 +6552,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             * int(args.grad_accum_steps)
             * int(ddp["world_size"])
         ),
-        "training_row_draws": int(
-            sum(int(metric.get("samples", 0)) for metric in metrics)
-        ),
+        **_training_draw_accounting(metrics),
         "amp": args.amp,
         "optimizer": args.optimizer,
         "lr": float(args.lr),
@@ -15628,6 +15626,32 @@ def _reduce_epoch_metrics(
         float(values[2].item()),
         float(values[3].item()),
     )
+
+
+def _training_draw_accounting(metrics: list[dict]) -> dict[str, int | str | None]:
+    """Report optimizer row draw events without calling them unique examples.
+
+    ``metrics[*].samples`` is the DDP-reduced base sampler dose. Composite
+    sampling is with replacement (and DDP padding can also repeat positions),
+    so this is not a unique-row count. Policy-auxiliary batches are additional
+    row draws consumed by the same optimizer steps and were historically absent
+    from ``training_row_draws``. Keep that field's established base-dose meaning
+    for contract compatibility while exposing the complete accounting.
+    """
+    base = sum(int(metric.get("samples", 0)) for metric in metrics)
+    policy_aux = sum(
+        int(metric.get("policy_aux_active_rows", 0)) for metric in metrics
+    )
+    return {
+        "training_row_draws": int(base),
+        "training_row_draws_semantics": (
+            "base_sampler_draw_events; may repeat rows; excludes_policy_aux"
+        ),
+        "base_training_row_draws": int(base),
+        "policy_aux_training_row_draws": int(policy_aux),
+        "total_training_row_draws": int(base + policy_aux),
+        "unique_training_rows_drawn": None,
+    }
 
 
 def _reduce_named_sums(
