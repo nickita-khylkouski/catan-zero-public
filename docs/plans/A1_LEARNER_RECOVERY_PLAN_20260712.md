@@ -20,12 +20,32 @@ zero failures and truncations. The generator and teacher-target distribution
 are therefore not the proximal regression source.
 
 The strongest surviving evidence is learner-side. Failed candidates improved
-held-out loss or internal play while regressing externally, and 96--98% of
-their update energy landed in the shared trunk. Trunk drift rose from 8.96%
-to 30.18% with learning rate while value-head drift remained 2.19--5.13%.
-The same 35M architecture produced both gen3 and the stronger f7 agent, so
-capacity is not the first hypothesis; behavior forgetting and objective
-imbalance are.
+held-out imitation metrics while regressing in the original external panel,
+and 96--98% of their update energy landed in the shared trunk. Trunk drift
+rose from 8.96% to 30.18% with learning rate while value-head drift remained
+2.19--5.13%. The same 35M architecture produced both gen3 and the stronger f7
+agent, so capacity is not the first hypothesis; behavior forgetting and
+objective imbalance are.
+
+The original internal labels did **not** establish monotonic learner
+improvement. The combined candidate was initialized from an already-trained
+n256 candidate, and the corrective n128 candidate was initialized from its
+corrective n256 candidate. Each chain therefore accumulated 44,692,523 sampled
+rows and 10,365 optimizer steps after f7 rather than taking one independent
+champion-started dose. Their 52.14% and 55.45% internal H1 results were then
+measured against the older gen3 checkpoint under a shared `c_scale=0.03`, not
+against their actual initializer or f7's deployed `c_scale=0.10` agent
+identity. Those H1 labels were a baseline/operator confound, not proof that the
+chained candidates improved over their parent.
+
+A zero-training correction made the consequence concrete: the independent
+n256 LR=1.2e-4 checkpoint, previously reported as inconclusive internally,
+beat its actual f7 initializer 360--240 over 600 games (60.0%, pentanomial
+LLR +9.10) when both agents used their matched `c_scale=0.10` operator. Its
+external matched-operator panel remains the binding generalization test. This
+does not rehabilitate candidate chaining or oversized doses; it establishes
+that checkpoint and search operator are one agent identity and that evaluation
+against the wrong baseline/operator can reverse the scientific conclusion.
 
 Forced rows are **not** the missing policy signal. Generation writes
 `policy_weight_multiplier=0` for every single-legal-action row and every
