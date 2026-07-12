@@ -62,6 +62,7 @@ class FlywheelConfig:
     # an unmeasured global constant.
     learner_replay_required: bool = True
     learner_policy_kl_anchor_weight: float = 0.0
+    learner_policy_kl_anchor_direction: str = "forward"
     # Do not silently consume stale/bootstrap targets.  Refreshed-root lambda
     # and return-scale Q are separate experiments with their own provenance.
     learner_value_target_lambda: float = 1.0
@@ -205,6 +206,7 @@ class FlywheelConfig:
         "learner_global_shuffle",
         "learner_replay_required",
         "learner_policy_kl_anchor_weight",
+        "learner_policy_kl_anchor_direction",
         "learner_value_target_lambda",
         "learner_q_loss_weight",
     )
@@ -223,6 +225,7 @@ class FlywheelConfig:
             "--per-game-value-weight-mode", self.learner_per_game_value_weight_mode,
             "--loser-sample-weight", str(self.learner_loser_sample_weight),
             "--policy-kl-anchor-weight", str(self.learner_policy_kl_anchor_weight),
+            "--policy-kl-anchor-direction", self.learner_policy_kl_anchor_direction,
             "--value-target-lambda", str(self.learner_value_target_lambda),
             "--q-loss-weight", str(self.learner_q_loss_weight),
         ]
@@ -344,6 +347,8 @@ class FlywheelConfig:
             raise ValueError("production learner requires a global mixed-corpus shuffle")
         if not self.learner_replay_required and self.learner_policy_kl_anchor_weight <= 0.0:
             raise ValueError("production learner requires replay or a positive anti-forgetting KL anchor")
+        if self.learner_policy_kl_anchor_direction != "forward":
+            raise ValueError("production learner requires forward policy-KL distillation")
         if self.learner_value_target_lambda != 1.0:
             raise ValueError("production learner requires outcome-only value targets until refreshed-root graduation")
         if self.learner_q_loss_weight != 0.0:

@@ -50,6 +50,7 @@ def test_production_next_recipe_is_explicit_and_keeps_unproven_bootstraps_off() 
     assert value("--per-game-value-weight-mode") == "sqrt"
     assert value("--loser-sample-weight") == "1.0"
     assert value("--policy-kl-anchor-weight") == "0.0"
+    assert value("--policy-kl-anchor-direction") == "forward"
     assert value("--value-target-lambda") == "1.0"
     assert value("--q-loss-weight") == "0.0"
 

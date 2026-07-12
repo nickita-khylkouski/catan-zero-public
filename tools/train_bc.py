@@ -619,7 +619,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.0,
         help=(
-            "Weight on a policy-KL anchor loss KL(pi_theta || prior_policy), pulling "
+            "Weight on a policy-KL anchor loss, pulling "
             "the trained policy toward the frozen seed checkpoint's recorded per-state "
             "prior distribution (the `prior_policy` shard column). 0.0 (default) disables "
             "it -- a pure no-op, bit-identical to prior runs. Its purpose is the "
@@ -628,10 +628,20 @@ def build_parser() -> argparse.ArgumentParser:
             "so a linear value head is no longer the only free parameter. Scoped to rows "
             "with a recorded prior (raw/gumbel self-play rows -- teacher rows contribute "
             "nothing, same has_prior filter as the KL telemetry). Anchors to the SAME "
-            "quantity the legacy prior_kl telemetry tracks. Do not interpret "
-            "prior_kl_ratio as teacher-target uptake: it is reverse KL on every row "
-            "with a prior. Use active_policy_teacher_gap_closure for objective-aligned "
-            "distillation telemetry."
+            "stored priors. Forced single-action rows are excluded from its denominator. "
+            "Use --policy-kl-anchor-direction to select the recovery-default forward "
+            "distillation KL or the historical reverse-KL ablation."
+        ),
+    )
+    parser.add_argument(
+        "--policy-kl-anchor-direction",
+        choices=("forward", "reverse"),
+        default="forward",
+        help=(
+            "Direction of the behavior-preservation KL. 'forward' (default) is "
+            "KL(champion_prior || trained_policy), the standard old-policy "
+            "distillation objective. 'reverse' preserves the historical "
+            "KL(trained_policy || champion_prior) only as an explicit legacy ablation."
         ),
     )
     parser.add_argument(
@@ -1518,6 +1528,7 @@ def _preflight_memmap_composite_descriptor(path: str | Path) -> dict[str, object
         *required_override_fields,
         "forced_row_value_weight", "hlgauss_scalar_aux_loss_weight", "loser_sample_weight",
         "lr", "per_game_value_weight", "per_game_value_weight_mode",
+        "policy_kl_anchor_direction", "policy_kl_anchor_weight",
         "value_categorical_bins", "value_categorical_loss_weight",
         "value_head_type", "value_hlgauss_sigma_ratio", "value_loss_weight",
     }
@@ -1619,6 +1630,8 @@ def _validate_composite_learner_recipe_authorization(
         "per_game_policy_weight_mode": str,
         "per_game_value_weight": bool,
         "per_game_value_weight_mode": str,
+        "policy_kl_anchor_direction": str,
+        "policy_kl_anchor_weight": float,
         "value_categorical_bins": int,
         "value_categorical_loss_weight": float,
         "value_head_type": str,
@@ -4471,10 +4484,11 @@ def main(argv: Sequence[str] | None = None) -> None:
         # The policy-KL anchor and value-uncertainty auxiliary loss are entity_graph
         # (_train_xdim_batch) features -- the legacy dense _train_candidate_batch path
         # does not accept them, so only forward them when the xdim trainer is active.
-        train_fn_extra_kwargs: dict[str, float] = {}
+        train_fn_extra_kwargs: dict[str, object] = {}
         if train_fn is _train_xdim_batch:
             train_fn_extra_kwargs = {
                 "policy_kl_anchor_weight": float(args.policy_kl_anchor_weight),
+                "policy_kl_anchor_direction": str(args.policy_kl_anchor_direction),
                 "value_uncertainty_loss_weight": float(args.value_uncertainty_loss_weight),
                 "aux_subgoal_loss_weight": float(args.aux_subgoal_loss_weight),
                 "value_categorical_loss_weight": resolved_categorical_value_weight,
@@ -4846,6 +4860,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             data_sharded=bool(args.ddp_shard_data),
             truncated_vp_margin_value_weight=args.truncated_vp_margin_value_weight,
             policy_kl_anchor_weight=float(args.policy_kl_anchor_weight),
+            policy_kl_anchor_direction=str(args.policy_kl_anchor_direction),
             value_uncertainty_loss_weight=float(args.value_uncertainty_loss_weight),
             aux_subgoal_loss_weight=float(args.aux_subgoal_loss_weight),
             moe_balance_loss_weight=float(args.moe_balance_loss_weight),
@@ -5089,6 +5104,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         "final_vp_loss_weight": args.final_vp_loss_weight,
         "q_loss_weight": args.q_loss_weight,
         "policy_kl_anchor_weight": args.policy_kl_anchor_weight,
+        "policy_kl_anchor_direction": args.policy_kl_anchor_direction,
         "value_uncertainty_loss_weight": args.value_uncertainty_loss_weight,
         "aux_subgoal_loss_weight": args.aux_subgoal_loss_weight,
         "moe_balance_loss_weight": args.moe_balance_loss_weight,
@@ -5591,6 +5607,7 @@ def _train_xdim_batch(
     diagnostics: bool = True,
     truncated_vp_margin_value_weight: float = 0.0,
     policy_kl_anchor_weight: float = 0.0,
+    policy_kl_anchor_direction: str = "forward",
     value_uncertainty_loss_weight: float = 0.0,
     aux_subgoal_loss_weight: float = 0.0,
     moe_balance_loss_weight: float = 0.0,
@@ -5764,7 +5781,13 @@ def _train_xdim_batch(
         # so a 0-weight run is bit-identical to pre-anchor behavior.
         kl_anchor_loss = torch.tensor(0.0, dtype=torch.float32, device=policy.device)
         if float(policy_kl_anchor_weight) != 0.0:
-            _anchor = _policy_kl_anchor_loss(data, batch, outputs["logits"], policy.device)
+            _anchor = _policy_kl_anchor_loss(
+                data,
+                batch,
+                outputs["logits"],
+                policy.device,
+                direction=policy_kl_anchor_direction,
+            )
             if _anchor is not None:
                 kl_anchor_loss = _anchor
         # Value-uncertainty auxiliary head: regress the value head's own squared
@@ -6097,6 +6120,7 @@ def evaluate_bc_batches(
     data_sharded: bool = False,
     truncated_vp_margin_value_weight: float = 0.0,
     policy_kl_anchor_weight: float = 0.0,
+    policy_kl_anchor_direction: str = "forward",
     value_uncertainty_loss_weight: float = 0.0,
     aux_subgoal_loss_weight: float = 0.0,
     moe_balance_loss_weight: float = 0.0,
@@ -6158,10 +6182,11 @@ def evaluate_bc_batches(
         phase_stats_unforced = _empty_phase_stats()
         teacher_stats = _empty_phase_stats()
         eval_fn = _eval_xdim_batch if hasattr(policy, "forward_legal_np") else _eval_candidate_batch
-        eval_fn_extra_kwargs: dict[str, float] = {}
+        eval_fn_extra_kwargs: dict[str, object] = {}
         if eval_fn is _eval_xdim_batch:
             eval_fn_extra_kwargs = {
                 "policy_kl_anchor_weight": float(policy_kl_anchor_weight),
+                "policy_kl_anchor_direction": str(policy_kl_anchor_direction),
                 "value_uncertainty_loss_weight": float(value_uncertainty_loss_weight),
                 "aux_subgoal_loss_weight": float(aux_subgoal_loss_weight),
                 "moe_balance_loss_weight": float(moe_balance_loss_weight),
@@ -6651,6 +6676,7 @@ def _eval_xdim_batch(
     *,
     truncated_vp_margin_value_weight: float = 0.0,
     policy_kl_anchor_weight: float = 0.0,
+    policy_kl_anchor_direction: str = "forward",
     value_uncertainty_loss_weight: float = 0.0,
     aux_subgoal_loss_weight: float = 0.0,
     moe_balance_loss_weight: float = 0.0,
@@ -6808,7 +6834,11 @@ def _eval_xdim_batch(
             )
             if float(policy_kl_anchor_weight) != 0.0:
                 anchor = _policy_kl_anchor_loss(
-                    data, batch, outputs["logits"], policy.device
+                    data,
+                    batch,
+                    outputs["logits"],
+                    policy.device,
+                    direction=policy_kl_anchor_direction,
                 )
                 if anchor is not None:
                     kl_anchor_loss = anchor
@@ -9543,12 +9573,16 @@ def _prior_kl_telemetry(
     kl_model_prior = torch.where(valid, model_probs * (model_log_probs - log_prior), zeros).sum(
         dim=-1
     )
+    kl_prior_model = torch.where(
+        valid, prior_norm * (log_prior - model_log_probs), zeros
+    ).sum(dim=-1)
     kl_target_prior = torch.where(valid, target_norm * (log_target - log_prior), zeros).sum(
         dim=-1
     )
     return {
         "has_prior": has_prior,
         "kl_model_prior": kl_model_prior,
+        "kl_prior_model": kl_prior_model,
         "kl_target_prior": kl_target_prior,
     }
 
@@ -9731,10 +9765,19 @@ def policy_surprise_sampling_weights(
     return weights.astype(np.float32, copy=False)
 
 
-def _policy_kl_anchor_loss(data: dict, batch: np.ndarray, logits, device):
-    """Differentiable policy-KL anchor loss: the mean over non-forced rows with
-    a recorded prior of KL(pi_theta || prior_policy), pulling the trained policy toward the
-    frozen seed checkpoint's recorded per-state prior (the `prior_policy` column).
+def _policy_kl_anchor_loss(
+    data: dict,
+    batch: np.ndarray,
+    logits,
+    device,
+    *,
+    direction: str = "forward",
+):
+    """Differentiable behavior anchor over multi-action rows with a prior.
+
+    ``forward`` is KL(prior_policy || pi_theta), the recovery/default old-policy
+    distillation objective. ``reverse`` retains historical KL(pi_theta ||
+    prior_policy) only as an explicit compatibility ablation.
 
     Reuses _prior_kl_telemetry's exact per-row computation (un-detached here).
     Its optimization mean then excludes forced rows, whose one-element policy
@@ -9765,7 +9808,13 @@ def _policy_kl_anchor_loss(data: dict, batch: np.ndarray, logits, device):
     weights = (terms["has_prior"] & non_forced).to(torch.float32)
     if float(weights.sum().item()) <= 0.0:
         return None
-    return _weighted_mean_loss(terms["kl_model_prior"], weights)
+    if direction == "forward":
+        values = terms["kl_prior_model"]
+    elif direction == "reverse":
+        values = terms["kl_model_prior"]
+    else:
+        raise ValueError(f"unknown policy KL anchor direction {direction!r}")
+    return _weighted_mean_loss(values, weights)
 
 
 def _weighted_mean_loss(values, weights, *, mask=None):

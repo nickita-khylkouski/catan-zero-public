@@ -51,6 +51,7 @@ def _base_recipe() -> dict[str, Any]:
         "per_game_value_weight": True,
         "per_game_value_weight_mode": "sqrt",
         "policy_kl_anchor_weight": 0.0,
+        "policy_kl_anchor_direction": "forward",
         "q_loss_weight": 0.0,
         "value_head_type": "mse",
         "value_lr_mult": 1.0,

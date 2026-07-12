@@ -259,6 +259,7 @@ class TrainConfig(PipelineConfig):
     final_vp_loss_weight: float = 0.05
     q_loss_weight: float = 0.0
     policy_kl_anchor_weight: float = 0.0
+    policy_kl_anchor_direction: str = "forward"
     value_uncertainty_loss_weight: float = 0.0
     value_uncertainty_head: bool = False
     value_lr_mult: float = 1.0

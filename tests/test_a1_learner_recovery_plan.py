@@ -61,6 +61,10 @@ def test_accumulation_is_reflected_in_topology_and_every_recipe():
 def test_forced_policy_is_not_reintroduced_as_a_recipe_override():
     plan = build_plan(world_size=8, local_batch_size=1024, grad_accum_steps=1)
     assert all("forced_action_weight" not in arm["recipe"] for arm in plan["arms"])
+    assert all(
+        arm["recipe"]["policy_kl_anchor_direction"] == "forward"
+        for arm in plan["arms"]
+    )
     assert plan["fixed_data_recipe"]["old_gen3_replay_ratios_by_game"] == [
         0.0,
         0.1,

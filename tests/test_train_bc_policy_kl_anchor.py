@@ -1,8 +1,7 @@
 """Tests for the differentiable policy-KL anchor loss (contingency f67, D1).
 
-The anchor reuses _prior_kl_telemetry's exact per-row KL(model || prior_policy)
-computation, un-detached, as a trainable loss term (mean over rows that carry a
-recorded prior). It must (a) match the telemetry it mirrors, (b) be
+The recovery-default anchor is forward KL(prior_policy || model); historical
+reverse KL remains an explicit ablation. Both exclude forced rows. It must be
 differentiable through the logits, and (c) be a clean None when no prior rows
 exist so a caller adds nothing to the loss.
 """
@@ -10,6 +9,7 @@ exist so a caller adds nothing to the loss.
 from __future__ import annotations
 
 import numpy as np
+import pytest
 import torch
 
 from tools.train_bc import _policy_kl_anchor_loss, _prior_kl_telemetry
@@ -70,7 +70,7 @@ def test_returns_none_when_all_rows_lack_a_prior():
     assert result is None
 
 
-def test_matches_mean_of_telemetry_kl_over_prior_rows():
+def test_default_matches_forward_kl_over_prior_rows():
     data = _base_data()
     batch = np.arange(3)
     logits = _logits()
@@ -78,11 +78,25 @@ def test_matches_mean_of_telemetry_kl_over_prior_rows():
     terms = _prior_kl_telemetry(data, batch, logits, torch.device("cpu"))
 
     has_prior = terms["has_prior"]
-    expected = terms["kl_model_prior"][has_prior].mean()
+    expected = terms["kl_prior_model"][has_prior].mean()
     assert anchor is not None
     assert torch.allclose(anchor, expected, atol=1e-6)
     # Only rows 0 and 1 carry a prior; row 2 (teacher) is excluded.
     assert int(has_prior.sum().item()) == 2
+
+
+def test_legacy_reverse_direction_is_explicit_and_matches_telemetry():
+    data = _base_data()
+    batch = np.arange(3)
+    logits = _logits()
+    anchor = _policy_kl_anchor_loss(
+        data, batch, logits, torch.device("cpu"), direction="reverse"
+    )
+    terms = _prior_kl_telemetry(data, batch, logits, torch.device("cpu"))
+    assert anchor is not None
+    assert torch.allclose(
+        anchor, terms["kl_model_prior"][terms["has_prior"]].mean(), atol=1e-6
+    )
 
 
 def test_is_differentiable_through_logits():
@@ -122,3 +136,23 @@ def test_forced_prior_rows_do_not_dilute_anchor_denominator():
     )
     assert anchor is not None and row_one is not None
     assert torch.allclose(anchor, row_one, atol=1e-6)
+
+
+def test_multi_action_zero_policy_weight_row_remains_anchor_eligible():
+    data = _base_data(policy_weight_multiplier=np.zeros(3, dtype=np.float32))
+    anchor = _policy_kl_anchor_loss(
+        data, np.asarray([0]), _logits(n=1), torch.device("cpu")
+    )
+    assert anchor is not None
+    assert float(anchor.item()) > 0.0
+
+
+def test_unknown_anchor_direction_is_rejected():
+    with pytest.raises(ValueError, match="unknown policy KL anchor direction"):
+        _policy_kl_anchor_loss(
+            _base_data(),
+            np.asarray([0]),
+            _logits(n=1),
+            torch.device("cpu"),
+            direction="sideways",
+        )
