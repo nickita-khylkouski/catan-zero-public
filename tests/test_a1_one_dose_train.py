@@ -1252,7 +1252,11 @@ def test_output_report_must_semantically_prove_the_sealed_dose(
     execution_binding = executor._execution_binding(
         command=command, environment=executor._child_environment(0)
     )
-    executor._bind_training_report(report, execution_binding=execution_binding)
+    executor._bind_training_report(
+        report,
+        execution_binding=execution_binding,
+        lineage_dose=executor._direct_lineage_dose(verified),  # noqa: SLF001
+    )
 
     with pytest.raises(executor.ExecutorError, match="report invariant drift"):
         executor._verify_training_outputs(
@@ -1281,10 +1285,18 @@ def test_report_binding_rejects_child_spoof_and_verifier_rejects_drift(
     spoofed[executor.REPORT_EXECUTION_BINDING_FIELD] = binding
     report.write_text(json.dumps(spoofed))
     with pytest.raises(executor.ExecutorError, match="pre-populated"):
-        executor._bind_training_report(report, execution_binding=binding)
+        executor._bind_training_report(
+            report,
+            execution_binding=binding,
+            lineage_dose=executor._direct_lineage_dose(verified),  # noqa: SLF001
+        )
 
     report.write_text(json.dumps(_training_report(verified, checkpoint)))
-    executor._bind_training_report(report, execution_binding=binding)
+    executor._bind_training_report(
+        report,
+        execution_binding=binding,
+        lineage_dose=executor._direct_lineage_dose(verified),  # noqa: SLF001
+    )
     drifted = dict(binding)
     drifted["command_sha256"] = "sha256:" + "0" * 64
     with pytest.raises(executor.ExecutorError, match="does not bind"):

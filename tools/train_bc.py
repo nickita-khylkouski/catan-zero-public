@@ -3195,13 +3195,36 @@ def _validate_a1_curriculum_parent(
         or receipt.get("status") != "complete"
         or (receipt.get("arm_id"), receipt.get("subset_id"))
         != ("n256", "full-56k")
+        or (bound.get("arm_id"), bound.get("subset_id"))
+        != ("n128", "full-140k")
         or stated != _canonical_json_sha256(unhashed)
     ):
         raise SystemExit("A1 curriculum parent receipt schema/status/digest drift")
     inputs = receipt.get("inputs")
     outputs = receipt.get("outputs")
+    lineage_dose = receipt.get("lineage_dose")
     producer = inputs.get("producer") if isinstance(inputs, dict) else None
     checkpoint = outputs.get("checkpoint") if isinstance(outputs, dict) else None
+    if (
+        not isinstance(lineage_dose, dict)
+        or lineage_dose.get("schema_version") != "a1-lineage-dose-v1"
+        or lineage_dose.get("mode") != "direct_from_declared_producer"
+        or lineage_dose.get("optimizer_state_continuity")
+        != "fresh_optimizer_per_dose"
+        or lineage_dose.get("declared_producer_sha256")
+        != bound.get("producer_checkpoint_sha256")
+        or lineage_dose.get("init_checkpoint_sha256")
+        != bound.get("producer_checkpoint_sha256")
+        or isinstance(lineage_dose.get("cumulative_sampled_rows"), bool)
+        or not isinstance(lineage_dose.get("cumulative_sampled_rows"), int)
+        or lineage_dose["cumulative_sampled_rows"] <= 0
+        or isinstance(lineage_dose.get("cumulative_optimizer_steps"), bool)
+        or not isinstance(lineage_dose.get("cumulative_optimizer_steps"), int)
+        or lineage_dose["cumulative_optimizer_steps"] <= 0
+    ):
+        raise SystemExit(
+            "A1 curriculum parent lacks a typed direct-producer cumulative dose"
+        )
     if (
         not isinstance(producer, dict)
         or producer.get("sha256") != bound.get("producer_checkpoint_sha256")

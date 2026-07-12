@@ -139,6 +139,12 @@ def test_curriculum_command_warm_starts_from_authenticated_parent(tmp_path: Path
     parent.write_bytes(b"parent")
     receipt = tmp_path / "n256.receipt.json"
     receipt.write_text("{}")
+    parent_dose = dual.lineage.direct_lineage_dose(
+        declared_producer_sha256=verified["producer"]["sha256"],
+        init_checkpoint_sha256=verified["producer"]["sha256"],
+        current_sampled_rows=56_000,
+        current_optimizer_steps=14,
+    )
     verified["curriculum_parent"] = {
         "schema_version": "a1-curriculum-parent-binding-v1",
         "receipt_path": str(receipt.resolve()),
@@ -151,6 +157,24 @@ def test_curriculum_command_warm_starts_from_authenticated_parent(tmp_path: Path
         },
         "generation_producer_sha256": verified["producer"]["sha256"],
     }
+    verified["curriculum_declaration"] = {
+        "schema_version": "a1-curriculum-declaration-v1",
+        "kind": "sequential_checkpoint_curriculum",
+        "parent_receipt_path": str(receipt.resolve()),
+        "parent_receipt_sha256": dual._sha256(receipt),  # noqa: SLF001
+        "parent_arm_id": "n256",
+        "parent_subset_id": "full-56k",
+        "parent_checkpoint": {
+            "path": str(parent.resolve()),
+            "sha256": dual._sha256(parent),  # noqa: SLF001
+        },
+        "generation_producer_sha256": verified["producer"]["sha256"],
+        "parent_lineage_dose": parent_dose,
+        "parent_cumulative_sampled_rows": 56_000,
+        "parent_cumulative_optimizer_steps": 14,
+        "child_arm_id": "n128",
+        "child_subset_id": "full-140k",
+    }
     command = dual.build_command(
         verified,
         python=Path("/venv/bin/python"),
@@ -162,6 +186,10 @@ def test_curriculum_command_warm_starts_from_authenticated_parent(tmp_path: Path
         receipt.resolve()
     )
     assert dual._claim_identity(verified) != plain_identity  # noqa: SLF001
+    dose = dual._lineage_dose(verified)  # noqa: SLF001
+    assert dose["mode"] == "typed_curriculum"
+    assert dose["cumulative_sampled_rows"] == 65_000
+    assert dose["cumulative_optimizer_steps"] == 17
 
 
 def test_dual_curriculum_supports_sealed_diagnostic_learner_ablation(
@@ -487,6 +515,8 @@ def _write_outputs(
     report = tmp_path / "report.json"
     epochs = int(verified["recipe"].get("epochs", 1))
     steps = math.ceil(verified["training_rows"] / 4096) * epochs
+    lineage_dose = dual._lineage_dose(verified)  # noqa: SLF001
+    parent = verified.get("curriculum_parent")
     payload = {
         "arch": "entity_graph", "hidden_size": 640, "graph_layers": 6,
         "attention_heads": 8, "graph_dropout": 0.05, "world_size": world_size,
@@ -499,8 +529,19 @@ def _write_outputs(
         "data_fingerprint": verified["data_fingerprint"],
         "track": "2p_no_trade", "vps_to_win": 10,
         "checkpoint": str(checkpoint),
-        "init_checkpoint": verified["producer"]["path"],
-        "init_checkpoint_sha256": verified["producer"]["sha256"],
+        "init_checkpoint": (
+            verified["producer"]["path"]
+            if parent is None
+            else parent["parent_checkpoint"]["path"]
+        ),
+        "init_checkpoint_sha256": (
+            verified["producer"]["sha256"]
+            if parent is None
+            else parent["parent_checkpoint"]["sha256"]
+        ),
+        "a1_curriculum_parent": parent,
+        "a1_curriculum_declaration": verified.get("curriculum_declaration"),
+        "a1_lineage_dose": lineage_dose,
         "a1_contract_sha256": verified["contract_sha256"],
         "a1_selected_game_seed_set_sha256": verified["selected_game_seed_set_sha256"],
         "a1_training_game_seed_set_sha256": verified["training_game_seed_set_sha256"],
@@ -578,12 +619,36 @@ def test_output_verifier_accepts_exact_ddp_and_rejects_world_size_drift(
         verified=verified, checkpoint=checkpoint, report=report, binding=binding
     )
     assert outputs["steps_completed"] == 3
+    assert outputs["lineage_dose"]["cumulative_sampled_rows"] == 9_000
 
     report.unlink()
     _checkpoint, report = _write_outputs(tmp_path, verified, binding, world_size=1)
     with pytest.raises(dual.DualTrainError, match="world_size"):
         dual.verify_outputs(
             verified=verified, checkpoint=checkpoint, report=report, binding=binding
+        )
+
+
+def test_output_verifier_rejects_accidental_n256_to_n128_chaining_without_declaration(
+    tmp_path: Path,
+) -> None:
+    verified = _verified(tmp_path)
+    verified["arm_id"] = "n128"
+    verified["subset_id"] = "full-140k"
+    binding = dual._execution_binding(["train"], verified)  # noqa: SLF001
+    checkpoint, report = _write_outputs(tmp_path, verified, binding)
+    payload = json.loads(report.read_text())
+    accidental_parent = tmp_path / "n256-candidate.pt"
+    accidental_parent.write_bytes(b"previous-dose")
+    payload["init_checkpoint"] = str(accidental_parent)
+    payload["init_checkpoint_sha256"] = dual._sha256(accidental_parent)  # noqa: SLF001
+    report.write_text(json.dumps(payload))
+    with pytest.raises(dual.DualTrainError, match="init_checkpoint"):
+        dual.verify_outputs(
+            verified=verified,
+            checkpoint=checkpoint,
+            report=report,
+            binding=binding,
         )
 
 
@@ -778,6 +843,8 @@ def _runner_that_writes_outputs(
         checkpoint, report = _write_outputs(tmp_path, verified, binding)
         payload = json.loads(report.read_text())
         payload.pop(dual.REPORT_BINDING_FIELD)
+        payload.pop("a1_lineage_dose")
+        payload.pop("a1_curriculum_declaration")
         report.write_text(json.dumps(payload))
         assert checkpoint == tmp_path / "candidate.pt"
         return subprocess.CompletedProcess([], 0)
@@ -818,6 +885,8 @@ def test_recovery_quarantines_unbound_child_outputs_then_replays(
     _checkpoint, report = _write_outputs(tmp_path, verified, binding)
     payload = json.loads(report.read_text())
     payload.pop(dual.REPORT_BINDING_FIELD)
+    payload.pop("a1_lineage_dose")
+    payload.pop("a1_curriculum_declaration")
     report.write_text(json.dumps(payload))
     monkeypatch.setattr(dual.one_dose, "_physical_gpu_lock", lambda _gpu: _nullcontext())
     calls: list[int] = []
@@ -874,7 +943,9 @@ def test_recovery_finalizes_existing_completion_before_receipt(
         "command_sha256": dual._digest(command),  # noqa: SLF001
         "execution_binding": binding,
         "gpu_names": [f"NVIDIA B200 gpu{i}" for i in range(8)],
-        "outputs": outputs, "finished_unix_ns": 1,
+        "outputs": outputs,
+        "lineage_dose": outputs["lineage_dose"],
+        "finished_unix_ns": 1,
     }
     dual._write_new(dual._completion_path(claim), completion)  # noqa: SLF001
     monkeypatch.setattr(dual.one_dose, "_physical_gpu_lock", lambda _gpu: _nullcontext())

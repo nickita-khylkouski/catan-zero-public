@@ -99,3 +99,8 @@ def test_forced_policy_is_not_reintroduced_as_a_recipe_override():
     assert all(arm["arm_id"] != "FULL_LR" for arm in plan["arms"])
     assert any("forward KL" in item for item in plan["prerequisites"])
     assert any("single-legal-action" in item for item in plan["prerequisites"])
+    assert (
+        plan["initialization_and_dose_policy"]["default_mode"]
+        == "direct_from_declared_producer"
+    )
+    assert "forbidden" in plan["initialization_and_dose_policy"]["checkpoint_chaining"]

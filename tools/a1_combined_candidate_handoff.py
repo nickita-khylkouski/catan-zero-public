@@ -102,6 +102,7 @@ def _verify_training_receipt(path: Path) -> tuple[dict[str, Any], Path]:
         ):
             raise CombinedHandoffError("combined receipt lacks exact training inputs")
         parent = inputs.get("curriculum_parent")
+        declaration = inputs.get("curriculum_declaration")
         if (
             not isinstance(parent, dict)
             or parent.get("schema_version") != "a1-curriculum-parent-binding-v1"
@@ -111,6 +112,17 @@ def _verify_training_receipt(path: Path) -> tuple[dict[str, Any], Path]:
         ):
             raise CombinedHandoffError(
                 "combined receipt lacks the authenticated n256/full-56k first dose"
+            )
+        if (
+            not isinstance(declaration, dict)
+            or declaration.get("schema_version")
+            != "a1-curriculum-declaration-v1"
+            or declaration.get("kind") != "sequential_checkpoint_curriculum"
+            or declaration.get("parent_receipt_path") != parent["receipt_path"]
+            or declaration.get("parent_checkpoint") != parent["parent_checkpoint"]
+        ):
+            raise CombinedHandoffError(
+                "combined receipt lacks the typed cumulative curriculum declaration"
             )
         verified = dual_train.verify_inputs(
             learner_lock=Path(str(refs["learner_lock"]["path"])),

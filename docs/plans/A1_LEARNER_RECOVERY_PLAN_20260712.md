@@ -74,6 +74,16 @@ These defaults apply to every arm unless the arm names an explicit delta:
 
 - initialization: the f7 producer bytes, independently reloaded
   for every arm; never chain arms through each other's optimizer state;
+- provenance enforcement: every direct arm must report an initialization SHA
+  equal to the declared producer/incumbent SHA. Sequential checkpoint curricula
+  are refused unless an `a1-curriculum-declaration-v1` authenticates the parent
+  receipt/checkpoint and carries prior plus cumulative sampled-row and optimizer-
+  step dose under `a1-lineage-dose-v1`. These recovery doses intentionally use
+  fresh Adam state, so cumulative steps mean lineage exposure rather than a
+  restored scheduler counter. The schema also reserves typed policy-active,
+  value-active and anchor-eligible exposure fields; they remain explicitly null
+  until the trainer emits exact training-split counts (corpus-wide weight
+  telemetry is not an acceptable substitute);
 - data: globally shuffled n128+n256 rows plus authenticated incumbent-era
   mixed replay (approximately 80% f7, 15% gen3 history, 5% gen4 hard-negative)
   sampled component → uniform game → uniform row, with game-disjoint validation;

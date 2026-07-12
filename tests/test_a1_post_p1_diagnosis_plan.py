@@ -37,6 +37,8 @@ def test_architecture_arm_is_single_delta_over_head_only() -> None:
     assert fixed["loser_sample_weight"] == 0.3
     assert fixed["per_game_policy_weight"] is False
     assert fixed["per_game_value_weight"] is False
+    assert "checkpoint chaining forbidden" in fixed["initialization_policy"]
+    assert fixed["lineage_dose_schema"] == "a1-lineage-dose-v1"
     assert "implemented" in plan["historical_feature_audit"]["trunk_lr_multiplier"]
     assert "f7 default OFF" in plan["historical_feature_audit"]["action_target_gather"]
 

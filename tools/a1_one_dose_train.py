@@ -39,6 +39,7 @@ if str(_TOOLS_DIR) not in sys.path:
 
 from tools import a1_pre_wave_contract as a1_contract  # noqa: E402
 from tools import train_bc  # noqa: E402
+from tools import a1_lineage_dose as lineage  # noqa: E402
 
 
 RECEIPT_SCHEMA = "a1-one-dose-training-receipt-v3"
@@ -1716,7 +1717,35 @@ def _write_receipt_no_clobber(path: Path, payload: dict[str, Any]) -> dict[str, 
     return payload
 
 
-def _bind_training_report(report: Path, *, execution_binding: dict[str, Any]) -> None:
+def _direct_lineage_dose(verified: dict[str, Any]) -> dict[str, Any]:
+    recipe = verified["recipe"]
+    if recipe.get("resume_optimizer") is not False:
+        raise ExecutorError(
+            "canonical one-dose lineage requires a fresh optimizer per dose"
+        )
+    steps = math.ceil(
+        int(verified["training_row_count"])
+        / (int(recipe["batch_size"]) * int(recipe["grad_accum_steps"]))
+    )
+    if int(recipe["max_steps"]) > 0:
+        steps = min(steps, int(recipe["max_steps"]))
+    try:
+        return lineage.direct_lineage_dose(
+            declared_producer_sha256=verified["producer"]["sha256"],
+            init_checkpoint_sha256=verified["producer"]["sha256"],
+            current_sampled_rows=int(verified["training_row_count"]),
+            current_optimizer_steps=steps,
+        )
+    except lineage.LineageDoseError as error:
+        raise ExecutorError(f"invalid one-dose learner lineage: {error}") from error
+
+
+def _bind_training_report(
+    report: Path,
+    *,
+    execution_binding: dict[str, Any],
+    lineage_dose: dict[str, Any],
+) -> None:
     """Atomically bind the trainer report to the exact executor environment.
 
     ``train_bc`` is part of the immutable A1 learner runtime inventory and must
@@ -1733,12 +1762,13 @@ def _bind_training_report(report: Path, *, execution_binding: dict[str, Any]) ->
         raise ExecutorError(f"cannot parse A1 training report: {error}") from error
     if not isinstance(payload, dict):
         raise ExecutorError("A1 training report must be a JSON object")
-    if REPORT_EXECUTION_BINDING_FIELD in payload:
+    if REPORT_EXECUTION_BINDING_FIELD in payload or "a1_lineage_dose" in payload:
         raise ExecutorError(
-            "A1 training child pre-populated the executor-owned report binding"
+            "A1 training child pre-populated executor-owned provenance"
         )
     _validate_execution_binding(execution_binding)
     payload[REPORT_EXECUTION_BINDING_FIELD] = execution_binding
+    payload["a1_lineage_dose"] = lineage.validate_lineage_dose(lineage_dose)
     tmp = report.with_name(f".{report.name}.tmp.{os.getpid()}.{time.time_ns()}")
     try:
         with tmp.open("xb") as handle:
@@ -1780,6 +1810,7 @@ def _verify_training_outputs(
     )
     if int(recipe["max_steps"]) > 0:
         expected_steps = min(expected_steps, int(recipe["max_steps"]))
+    lineage_dose = _direct_lineage_dose(verified)
     expected = {
         "arch": "entity_graph",
         **SEALED_A1_MODEL_REPORT,
@@ -1810,6 +1841,7 @@ def _verify_training_outputs(
         "checkpoint": str(checkpoint),
         "init_checkpoint": str(verified["producer"]["path"]),
         "init_checkpoint_sha256": verified["producer"]["sha256"],
+        "a1_lineage_dose": lineage_dose,
         "input_validation_game_seed_manifest": str(verified["validation_path"]),
         "input_validation_game_seed_manifest_sha256": verified[
             "validation_file_sha256"
@@ -1922,6 +1954,8 @@ def _verify_training_outputs(
         "report_sha256": _file_sha256(report),
         "execution_binding_sha256": _value_sha256(execution_binding),
         "steps_completed": expected_steps,
+        "sampled_rows": lineage_dose["current_sampled_rows"],
+        "lineage_dose": lineage_dose,
         "corpus_row_count": int(verified["corpus_row_count"]),
         "training_row_count": int(verified["training_row_count"]),
         "validation_row_count": int(verified["validation_row_count"]),
@@ -2031,7 +2065,11 @@ def _execute_locked(
         returncode = int(result.returncode)
         if returncode != 0:
             raise ExecutorError(f"train_bc exited nonzero: {returncode}")
-        _bind_training_report(report, execution_binding=execution_binding)
+        _bind_training_report(
+            report,
+            execution_binding=execution_binding,
+            lineage_dose=_direct_lineage_dose(verified),
+        )
         output_artifacts = _verify_training_outputs(
             checkpoint=checkpoint,
             report=report,
@@ -2073,6 +2111,9 @@ def _execute_locked(
         "finished_unix_ns": finished_ns,
         "returncode": returncode,
         "outputs": output_artifacts,
+        "lineage_dose": (
+            None if output_artifacts is None else output_artifacts["lineage_dose"]
+        ),
         "failure": failure,
     }
     if is_retry:

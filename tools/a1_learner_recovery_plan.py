@@ -162,6 +162,16 @@ def build_plan(*, world_size: int, local_batch_size: int, grad_accum_steps: int)
             "incumbent_mixed_replay_ratio_by_game": 0.2,
             "replay_stage": "fixed throughout P1; K0 is replay without KL anchor",
         },
+        "initialization_and_dose_policy": {
+            "default_mode": "direct_from_declared_producer",
+            "required_init_sha": "declared producer/incumbent checkpoint SHA-256",
+            "checkpoint_chaining": "forbidden without a1-curriculum-declaration-v1",
+            "curriculum_requirements": [
+                "authenticated parent receipt and checkpoint",
+                "parent cumulative sampled rows and optimizer steps",
+                "child report and receipt carry cumulative lineage dose",
+            ],
+        },
         "policy_kl_anchor_semantics": {
             "normalization": "conditional_authenticated_multi_action_prior_rows",
             "weight_formula": (

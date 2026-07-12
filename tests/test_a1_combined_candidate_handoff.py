@@ -225,6 +225,40 @@ def test_promotion_report_accepts_only_exact_authenticated_curriculum_parent(
         },
         "generation_producer_sha256": producer_sha,
     }
+    curriculum_declaration = {
+        "schema_version": "a1-curriculum-declaration-v1",
+        "kind": "sequential_checkpoint_curriculum",
+        "parent_receipt_path": str(parent_receipt),
+        "parent_receipt_sha256": handoff.promotion._sha256(parent_receipt),  # noqa: SLF001
+        "parent_arm_id": "n256",
+        "parent_subset_id": "full-56k",
+        "parent_checkpoint": parent_binding["parent_checkpoint"],
+        "generation_producer_sha256": producer_sha,
+        "parent_lineage_dose": {
+            "schema_version": "a1-lineage-dose-v1",
+            "mode": "direct_from_declared_producer",
+            "declared_producer_sha256": producer_sha,
+            "init_checkpoint_sha256": producer_sha,
+            "parent_receipt_sha256": None,
+            "optimizer_state_continuity": "fresh_optimizer_per_dose",
+            "objective_exposure": {
+                "measurement_status": "not_yet_bound_exactly",
+                "policy_active_sampled_rows": None,
+                "value_active_sampled_rows": None,
+                "anchor_eligible_sampled_rows": None,
+            },
+            "prior_sampled_rows": 0,
+            "prior_optimizer_steps": 0,
+            "current_sampled_rows": 56_000,
+            "current_optimizer_steps": 14,
+            "cumulative_sampled_rows": 56_000,
+            "cumulative_optimizer_steps": 14,
+        },
+        "parent_cumulative_sampled_rows": 56_000,
+        "parent_cumulative_optimizer_steps": 14,
+        "child_arm_id": "n128",
+        "child_subset_id": "full-140k",
+    }
     recipe = {
         "epochs": 1,
         "max_steps": 0,
@@ -249,6 +283,7 @@ def test_promotion_report_accepts_only_exact_authenticated_curriculum_parent(
         "checkpoint": str(candidate),
         "init_checkpoint_sha256": parent_binding["parent_checkpoint"]["sha256"],
         "a1_curriculum_parent": parent_binding,
+        "a1_curriculum_declaration": curriculum_declaration,
         "steps_completed": 10,
         "epochs": 1,
         "max_steps": 0,

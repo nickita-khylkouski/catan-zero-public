@@ -8,6 +8,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 
 import train_bc  # type: ignore  # noqa: E402
+import a1_lineage_dose as lineage  # type: ignore  # noqa: E402
 
 
 def _parent(tmp_path: Path) -> tuple[argparse.Namespace, dict[str, object]]:
@@ -24,6 +25,12 @@ def _parent(tmp_path: Path) -> tuple[argparse.Namespace, dict[str, object]]:
         "outputs": {
             "checkpoint": {"path": str(checkpoint.resolve()), "sha256": checkpoint_sha}
         },
+        "lineage_dose": lineage.direct_lineage_dose(
+            declared_producer_sha256=producer_sha,
+            init_checkpoint_sha256=producer_sha,
+            current_sampled_rows=56_000,
+            current_optimizer_steps=1_000,
+        ),
     }
     receipt["receipt_sha256"] = train_bc._canonical_json_sha256(receipt)  # noqa: SLF001
     receipt_path = tmp_path / "receipt.json"
@@ -33,7 +40,11 @@ def _parent(tmp_path: Path) -> tuple[argparse.Namespace, dict[str, object]]:
         init_checkpoint=str(checkpoint),
         init_checkpoint_sha256=checkpoint_sha,
     )
-    return args, {"producer_checkpoint_sha256": producer_sha}
+    return args, {
+        "producer_checkpoint_sha256": producer_sha,
+        "arm_id": "n128",
+        "subset_id": "full-140k",
+    }
 
 
 def test_curriculum_parent_authenticates_completed_n256_dose(tmp_path: Path) -> None:

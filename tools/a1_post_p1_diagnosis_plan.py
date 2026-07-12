@@ -69,6 +69,10 @@ def build_plan(
         "graph_history_features": True,
         "mask_hidden_info": True,
         "validation": "same game-disjoint P1 validation identity",
+        "initialization_policy": (
+            "independent authenticated f7 producer bytes; checkpoint chaining forbidden"
+        ),
+        "lineage_dose_schema": "a1-lineage-dose-v1",
     }
     arms = [
         {

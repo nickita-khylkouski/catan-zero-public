@@ -33,6 +33,7 @@ if str(_REPO_ROOT) not in sys.path:
 from tools import a1_one_dose_train as one_dose  # noqa: E402
 from tools import a1_dual_learner_contract as learner_contract  # noqa: E402
 from tools import train_bc  # noqa: E402
+from tools import a1_lineage_dose as lineage  # noqa: E402
 
 
 PLAN_SCHEMA = "a1-dual-arm-training-plan-v1"
@@ -286,6 +287,31 @@ def verify_inputs(
         parent = train_bc._validate_a1_curriculum_parent(parent_args, bound)  # noqa: SLF001
         assert parent is not None
         verified["curriculum_parent"] = parent
+        try:
+            parent_lineage = lineage.validate_lineage_dose(
+                parent_receipt.get("lineage_dose")
+            )
+        except lineage.LineageDoseError as error:
+            raise DualTrainError(
+                f"invalid curriculum parent lineage dose: {error}"
+            ) from error
+        verified["curriculum_declaration"] = {
+            "schema_version": lineage.CURRICULUM_DECLARATION_SCHEMA,
+            "kind": "sequential_checkpoint_curriculum",
+            "parent_receipt_path": parent["receipt_path"],
+            "parent_receipt_sha256": parent["receipt_sha256"],
+            "parent_arm_id": parent["parent_arm_id"],
+            "parent_subset_id": parent["parent_subset_id"],
+            "parent_checkpoint": parent["parent_checkpoint"],
+            "generation_producer_sha256": parent["generation_producer_sha256"],
+            "parent_lineage_dose": parent_lineage,
+            "parent_cumulative_sampled_rows": parent_lineage["cumulative_sampled_rows"],
+            "parent_cumulative_optimizer_steps": parent_lineage[
+                "cumulative_optimizer_steps"
+            ],
+            "child_arm_id": verified["arm_id"],
+            "child_subset_id": verified["subset_id"],
+        }
     return verified
 
 
@@ -474,6 +500,11 @@ def _validate_output_paths(
         input_paths.add(
             Path(verified["curriculum_parent"]["receipt_path"]).resolve(strict=True)
         )
+        input_paths.add(
+            Path(
+                verified["curriculum_parent"]["parent_checkpoint"]["path"]
+            ).resolve(strict=True)
+        )
     overlap = input_paths.intersection(canonical.values())
     if overlap:
         raise DualTrainError(f"dual learner output aliases immutable input: {sorted(map(str, overlap))}")
@@ -583,19 +614,67 @@ def _write_attempt_failure(
     _write_new(root / f"failed-{attempt:04d}.json", value)
 
 
-def _bind_report(report: Path, binding: dict[str, Any]) -> dict[str, Any]:
+def _bind_report(
+    report: Path,
+    binding: dict[str, Any],
+    lineage_dose: dict[str, Any],
+    curriculum_declaration: dict[str, Any] | None,
+) -> dict[str, Any]:
     try:
         payload = json.loads(report.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
         raise DualTrainError(f"cannot read training report: {error}") from error
-    if not isinstance(payload, dict) or REPORT_BINDING_FIELD in payload:
-        raise DualTrainError("training report is malformed or pre-populated executor binding")
+    if (
+        not isinstance(payload, dict)
+        or REPORT_BINDING_FIELD in payload
+        or "a1_lineage_dose" in payload
+        or "a1_curriculum_declaration" in payload
+    ):
+        raise DualTrainError(
+            "training report is malformed or pre-populated executor provenance"
+        )
     payload[REPORT_BINDING_FIELD] = binding
+    payload["a1_lineage_dose"] = lineage.validate_lineage_dose(lineage_dose)
+    payload["a1_curriculum_declaration"] = curriculum_declaration
     temporary = report.with_name(f".{report.name}.bind.{os.getpid()}.{time.time_ns()}")
     _write_new(temporary, payload)
     os.chmod(temporary, 0o600)
     os.replace(temporary, report)
     return payload
+
+
+def _lineage_dose(verified: dict[str, Any]) -> dict[str, Any]:
+    if verified["recipe"].get("resume_optimizer") is not False:
+        raise DualTrainError(
+            "canonical dual-arm lineage requires a fresh optimizer per dose"
+        )
+    completed_epochs = int(verified["recipe"].get("epochs", 1))
+    steps = math.ceil(int(verified["training_rows"]) / GLOBAL_BATCH) * completed_epochs
+    sampled_rows = int(verified["training_rows"]) * completed_epochs
+    parent = verified.get("curriculum_parent")
+    try:
+        if parent is None:
+            return lineage.direct_lineage_dose(
+                declared_producer_sha256=verified["producer"]["sha256"],
+                init_checkpoint_sha256=verified["producer"]["sha256"],
+                current_sampled_rows=sampled_rows,
+                current_optimizer_steps=steps,
+            )
+        declaration = verified.get("curriculum_declaration")
+        if not isinstance(declaration, dict):
+            raise lineage.LineageDoseError(
+                "curriculum parent is present without a typed declaration"
+            )
+        return lineage.curriculum_lineage_dose(
+            declared_producer_sha256=verified["producer"]["sha256"],
+            init_checkpoint_sha256=parent["parent_checkpoint"]["sha256"],
+            parent_receipt_sha256=parent["receipt_sha256"],
+            parent_lineage_dose=declaration["parent_lineage_dose"],
+            current_sampled_rows=sampled_rows,
+            current_optimizer_steps=steps,
+        )
+    except lineage.LineageDoseError as error:
+        raise DualTrainError(f"invalid learner lineage dose: {error}") from error
 
 
 def verify_outputs(
@@ -617,6 +696,7 @@ def verify_outputs(
     completed_epochs = int(recipe.get("epochs", 1))
     steps_per_epoch = math.ceil(int(verified["training_rows"]) / GLOBAL_BATCH)
     steps = steps_per_epoch * completed_epochs
+    lineage_dose = _lineage_dose(verified)
     expected = {
         "arch": "entity_graph",
         "hidden_size": 640,
@@ -651,6 +731,8 @@ def verify_outputs(
             else verified["curriculum_parent"]["parent_checkpoint"]["sha256"]
         ),
         "a1_curriculum_parent": verified.get("curriculum_parent"),
+        "a1_curriculum_declaration": verified.get("curriculum_declaration"),
+        "a1_lineage_dose": lineage_dose,
         "a1_contract_sha256": verified["contract_sha256"],
         "a1_selected_game_seed_set_sha256": verified[
             "selected_game_seed_set_sha256"
@@ -772,6 +854,8 @@ def verify_outputs(
         "optimizer": _file_ref(optimizer, where="optimizer sidecar"),
         "report": _file_ref(report, where="training report"),
         "steps_completed": steps,
+        "sampled_rows": lineage_dose["current_sampled_rows"],
+        "lineage_dose": lineage_dose,
     }
     if completed_epochs > 1:
         epoch_outputs: dict[str, dict[str, Any]] = {}
@@ -829,11 +913,18 @@ def verify_receipt(
         != payload.get("claim_identity_sha256")
         or completion.get("receipt") != str(path)
         or completion.get("outputs") != payload.get("outputs")
+        or completion.get("lineage_dose") != payload.get("lineage_dose")
         or completion.get("command_sha256") != payload.get("command_sha256")
         or completion.get("execution_binding") != payload.get("execution_binding")
         or completion.get("gpu_names") != payload.get("gpu_names")
     ):
         raise DualTrainError("dual-arm claim completion disagrees with receipt")
+    try:
+        receipt_lineage = lineage.validate_lineage_dose(payload.get("lineage_dose"))
+    except lineage.LineageDoseError as error:
+        raise DualTrainError(f"dual-arm receipt lineage dose drift: {error}") from error
+    if payload.get("outputs", {}).get("lineage_dose") != receipt_lineage:
+        raise DualTrainError("dual-arm receipt/output lineage dose disagreement")
     for group in ("inputs", "outputs"):
         values = payload.get(group)
         if not isinstance(values, dict):
@@ -893,6 +984,7 @@ def _publish_completion_and_receipt(
         "execution_binding": binding,
         "gpu_names": gpu_names,
         "outputs": output_refs,
+        "lineage_dose": output_refs["lineage_dose"],
         "finished_unix_ns": time.time_ns(),
     }
     if completion.exists():
@@ -909,6 +1001,7 @@ def _publish_completion_and_receipt(
                 "execution_binding",
                 "gpu_names",
                 "outputs",
+                "lineage_dose",
             )
         }
         if any(existing_completion.get(key) != value for key, value in stable_fields.items()):
@@ -942,7 +1035,10 @@ def _publish_completion_and_receipt(
             **(
                 {}
                 if verified.get("curriculum_parent") is None
-                else {"curriculum_parent": verified["curriculum_parent"]}
+                else {
+                    "curriculum_parent": verified["curriculum_parent"],
+                    "curriculum_declaration": verified["curriculum_declaration"],
+                }
             ),
         },
         "execution_binding": binding,
@@ -950,6 +1046,7 @@ def _publish_completion_and_receipt(
         "command": command,
         "command_sha256": _digest(command),
         "outputs": output_refs,
+        "lineage_dose": output_refs["lineage_dose"],
         "finished_unix_ns": completion_payload["finished_unix_ns"],
     }
     receipt_payload["receipt_sha256"] = _digest(receipt_payload)
@@ -1058,7 +1155,12 @@ def execute(
             returncode = int(result.returncode)
             if returncode != 0:
                 raise DualTrainError(f"torchrun exited nonzero: {returncode}")
-            _bind_report(report, binding)
+            _bind_report(
+                report,
+                binding,
+                _lineage_dose(verified),
+                verified.get("curriculum_declaration"),
+            )
             return _publish_completion_and_receipt(
                 verified=verified,
                 command=command,
@@ -1157,7 +1259,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 **(
                     {}
                     if verified.get("curriculum_parent") is None
-                    else {"curriculum_parent": verified["curriculum_parent"]}
+                    else {
+                        "curriculum_parent": verified["curriculum_parent"],
+                        "curriculum_declaration": verified[
+                            "curriculum_declaration"
+                        ],
+                    }
                 ),
                 "executor": _file_ref(Path(__file__), where="dual learner executor"),
                 **(
