@@ -597,6 +597,30 @@ def test_private_host_config_and_render_environment_fail_closed(tmp_path: Path) 
         executor.verify_render(lock_path, render_path, verify_lock_fn=_verifier(lock))
 
 
+def test_executor_refuses_promoted_checkpoint_under_different_c_scale(
+    tmp_path: Path,
+) -> None:
+    lock_path, render_path, lock, _rendered = _fixture(tmp_path)
+    producer = contract._producer(lock)  # noqa: SLF001
+    deployed = {"c_scale": 0.10, "n_full": 128}
+    lock["promotion_handoff"] = {
+        "mode": contract.POST_PROMOTION_HANDOFF_MODE,
+        "document_schema": contract.promotion_handoff.HANDOFF_SCHEMA,
+        "producer_checkpoint": {
+            "path": producer["path"],
+            "sha256": producer["sha256"],
+        },
+        "producer_identity_sha256": "sha256:" + "2" * 64,
+        "producer_search_config": deployed,
+        "producer_search_config_sha256": contract._digest_value(deployed),
+    }
+    with pytest.raises(
+        executor.ExecutorError,
+        match=r"unsafe promoted producer identity.*executes c_scale=0\.03",
+    ):
+        executor.verify_render(lock_path, render_path, verify_lock_fn=_verifier(lock))
+
+
 def test_render_environment_digest_and_per_job_registry_fail_closed(
     tmp_path: Path,
 ) -> None:

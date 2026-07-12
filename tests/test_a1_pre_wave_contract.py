@@ -395,7 +395,9 @@ def test_dual_arm_materializes_renders_and_replays_in_production_executor(
         contract,
         "_promotion_handoff_record",
         lambda *_args, **_kwargs: {
-            "mode": contract.POST_PROMOTION_HANDOFF_MODE,
+            # This synthetic round-trip does not model a promotion receipt;
+            # exact post-promotion identity enforcement has dedicated tests.
+            "mode": contract.HISTORICAL_HANDOFF_MODE,
             "path": str(handoff),
             "sha256": contract._sha256(handoff),  # noqa: SLF001
         },
@@ -2388,3 +2390,45 @@ def test_categorical_teacher_requires_positive_hlgauss_provenance(
         contract.ContractError, match="teacher readout 'categorical' was trained"
     ):
         contract.build_lock(draft)
+
+
+def _promoted_job_identity_fixture(*, deployed_c_scale: float, job_c_scale: float):
+    checkpoint = {"role": "producer", "path": "/tmp/producer.pt", "sha256": "sha256:" + "1" * 64}
+    deployed = {"c_scale": deployed_c_scale, "n_full": 128}
+    lock = {
+        "promotion_handoff": {
+            "mode": contract.POST_PROMOTION_HANDOFF_MODE,
+            "document_schema": contract.promotion_handoff.HANDOFF_SCHEMA,
+            "producer_checkpoint": {
+                "path": checkpoint["path"],
+                "sha256": checkpoint["sha256"],
+            },
+            "producer_identity_sha256": "sha256:" + "2" * 64,
+            "producer_search_config": deployed,
+            "producer_search_config_sha256": contract._digest_value(deployed),
+        },
+        "checkpoints": [checkpoint],
+        "science": {"search_operator": {"c_scale": deployed_c_scale, "n_full": 256}},
+    }
+    return lock, {"job_id": "n256_gpu00__recent_history", "c_scale": job_c_scale}
+
+
+def test_promoted_producer_job_binds_checkpoint_and_executed_operator() -> None:
+    lock, job = _promoted_job_identity_fixture(deployed_c_scale=0.10, job_c_scale=0.10)
+    identity = contract._promoted_producer_job_identity(lock, job)
+    assert identity is not None
+    assert identity["checkpoint"] == {
+        "path": "/tmp/producer.pt",
+        "sha256": "sha256:" + "1" * 64,
+    }
+    assert identity["executed_search_operator"] == {"c_scale": 0.10, "n_full": 256}
+    assert identity["checkpoint_search_identity_sha256"].startswith("sha256:")
+
+
+def test_promoted_producer_job_refuses_deployed_c_scale_mismatch() -> None:
+    lock, job = _promoted_job_identity_fixture(deployed_c_scale=0.10, job_c_scale=0.03)
+    with pytest.raises(
+        contract.ContractError,
+        match=r"executes c_scale=0\.03.*deployed at c_scale=0\.1",
+    ):
+        contract._promoted_producer_job_identity(lock, job)

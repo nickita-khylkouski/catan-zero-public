@@ -314,6 +314,13 @@ def build_plan(
         by_worker: dict[str, list[dict[str, Any]]] = {}
         for source in commands:
             sealed = lock_jobs[source["job_id"]]
+            try:
+                contract._promoted_producer_job_identity(lock, sealed)  # noqa: SLF001
+            except contract.ContractError as error:
+                raise RecoveryError(
+                    f"{source['job_id']} cannot recover a promoted checkpoint under "
+                    f"a different deployed search identity: {error}"
+                ) from error
             if (source["host_alias"], int(source["gpu"])) != assignments[
                 source["worker_id"]
             ]:

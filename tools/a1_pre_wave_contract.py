@@ -807,6 +807,69 @@ def _promotion_handoff_record(
     return record
 
 
+def _promoted_producer_job_identity(
+    lock: Mapping[str, Any], job: Mapping[str, Any]
+) -> dict[str, Any] | None:
+    """Bind one promoted producer to the identity-stable search semantics it runs.
+
+    Search *budget* is a data-generation operator choice, so n128/n256 and PCR
+    may legitimately differ from the promotion panel.  ``c_scale`` is not: it
+    changes how the deployed agent combines its policy and value estimates and
+    is part of the promoted ``agent_identity``.  Historically the dual-arm job
+    table overrode that field to .03 for opponent jobs while the promoted f7
+    producer was bound at .10.  The lock still named the base operator digest,
+    so checkpoint and executed operator were never joined into one identity.
+
+    Historical pre-promotion locks remain replayable.  Every post-promotion job
+    must return this exact checkpoint/operator pair or fail before execution.
+    """
+
+    handoff = lock.get("promotion_handoff")
+    if not isinstance(handoff, Mapping) or handoff.get("mode") != POST_PROMOTION_HANDOFF_MODE:
+        return None
+    if handoff.get("document_schema") != promotion_handoff.HANDOFF_SCHEMA:
+        raise ContractError("promoted producer job handoff schema drift")
+    producer = _producer(dict(lock))
+    bound_checkpoint = handoff.get("producer_checkpoint")
+    if bound_checkpoint != {
+        "path": producer.get("path"),
+        "sha256": producer.get("sha256"),
+    }:
+        raise ContractError("promoted producer job checkpoint identity drift")
+    deployed = handoff.get("producer_search_config")
+    if not isinstance(deployed, Mapping) or not deployed:
+        raise ContractError("promoted producer job lacks deployed search identity")
+    search = lock.get("science", {}).get("search_operator")
+    if not isinstance(search, Mapping):
+        raise ContractError("promoted producer job lacks a typed search operator")
+    executed = dict(search)
+    if "c_scale" in job:
+        executed["c_scale"] = float(job["c_scale"])
+    if float(executed.get("c_scale", float("nan"))) != float(
+        deployed.get("c_scale", float("nan"))
+    ):
+        raise ContractError(
+            "promoted producer search identity mismatch: "
+            f"job {job.get('job_id', '<unknown>')} executes c_scale="
+            f"{executed.get('c_scale')!r}, promoted checkpoint is deployed at "
+            f"c_scale={deployed.get('c_scale')!r}"
+        )
+    identity = {
+        "checkpoint": {
+            "path": producer["path"],
+            "sha256": producer["sha256"],
+        },
+        "producer_identity_sha256": handoff.get("producer_identity_sha256"),
+        "deployed_search_config_sha256": handoff.get(
+            "producer_search_config_sha256"
+        ),
+        "executed_search_operator": executed,
+        "executed_search_operator_sha256": _digest_value(executed),
+    }
+    identity["checkpoint_search_identity_sha256"] = _digest_value(identity)
+    return identity
+
+
 def _runtime_code_tree_records() -> list[dict[str, Any]]:
     """Content-address the complete local Python runtime used by gen/A1.
 

@@ -302,6 +302,10 @@ def verify_render(
             raise ExecutorError(f"unknown/duplicate rendered job {job_id!r}")
         seen.add(job_id)
         job = jobs[job_id]
+        try:
+            contract._promoted_producer_job_identity(lock, job)  # noqa: SLF001
+        except contract.ContractError as error:
+            raise ExecutorError(f"unsafe promoted producer identity for {job_id}: {error}") from error
         if arm_id is not None and (
             command.get("arm_id") != arm_id or job.get("arm_id") != arm_id
         ):
