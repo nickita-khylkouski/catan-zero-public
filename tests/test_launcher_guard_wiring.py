@@ -140,6 +140,7 @@ GOLDEN_OPTION_STRINGS = {
     "train_bc": {
         ("--a1-ablation-code-binding-json",),
         ("--a1-ablation-code-tree-sha256",),
+        ("--a1-curriculum-parent-receipt",),
         ("--a1-dual-learner-lock",),
         ("--a1-dual-reviewed-lock-file-sha256",),
         ("--a1-effective-learner-recipe-json",),
