@@ -14,6 +14,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import tempfile
 import time
 from typing import Any, Sequence
 
@@ -4332,62 +4333,185 @@ def main(argv: Sequence[str] | None = None) -> None:
     start = time.perf_counter()
     metrics = []
     n = len(data["action_taken"])
-    policy_sample_weights = build_sample_weights(
-        data,
-        teacher_weights=_parse_weight_map(args.teacher_weights),
-        phase_weights=_parse_weight_map(args.phase_weights),
-        forced_action_weight=args.forced_action_weight,
-        winner_sample_weight=args.winner_sample_weight,
-        loser_sample_weight=args.loser_sample_weight,
-        vp_margin_weight=args.vp_margin_weight,
-        vps_to_win=args.vps_to_win,
-        per_game_policy_weight=bool(args.per_game_policy_weight),
-        per_game_policy_weight_mode=str(args.per_game_policy_weight_mode),
-    )
+    teacher_weight_map = _parse_weight_map(args.teacher_weights)
+    policy_phase_weight_map = _parse_weight_map(args.phase_weights)
     value_phase_weights_raw = args.value_phase_weights or args.phase_weights
-    value_sample_weights = build_value_sample_weights(
-        data,
-        phase_weights=_parse_weight_map(value_phase_weights_raw),
-        forced_row_value_weight=args.forced_row_value_weight,
-        per_game_value_weight=args.per_game_value_weight,
-        per_game_value_weight_mode=args.per_game_value_weight_mode,
-    )
-    # CAT-45: policy-surprise sample-frequency weighting. Independent axis from
-    # policy_sample_weights/value_sample_weights above (those scale LOSS
-    # magnitude; this scales how often a row is DRAWN per epoch -- see
-    # _epoch_order's docstring for the explicit non-combination rule). Computed
-    # unconditionally (cheap: target_policy/prior_policy are already eagerly
-    # materialized) so its quality report is always available for audit, but
-    # only ever passed into _epoch_order when the flag is on (see below) --
-    # flag-off must reuse rng.permutation exactly, not a uniform-weighted choice.
-    if float(args.policy_surprise_weight) == 0.0:
-        # The flag-off result is exactly uniform. Avoid reconstructing the full
-        # padded prior/target matrices in every DDP rank merely to multiply the
-        # resulting KL by zero.
-        policy_surprise_weights_full = np.ones(n, dtype=np.float32)
-    else:
-        policy_surprise_kl, policy_surprise_has_prior = compute_policy_surprise_kl(data)
-        policy_surprise_weights_full = policy_surprise_sampling_weights(
-            policy_surprise_kl,
-            policy_surprise_has_prior,
-            weight_scale=args.policy_surprise_weight,
-            cap=args.policy_surprise_cap,
+    value_phase_weight_map = _parse_weight_map(value_phase_weights_raw)
+
+    def _build_derived_training_arrays() -> dict[str, np.ndarray]:
+        """Build deterministic O(rows) learner arrays once per host."""
+
+        policy_weights = build_sample_weights(
+            data,
+            teacher_weights=teacher_weight_map,
+            phase_weights=policy_phase_weight_map,
+            forced_action_weight=args.forced_action_weight,
+            winner_sample_weight=args.winner_sample_weight,
+            loser_sample_weight=args.loser_sample_weight,
+            vp_margin_weight=args.vp_margin_weight,
+            vps_to_win=args.vps_to_win,
+            per_game_policy_weight=bool(args.per_game_policy_weight),
+            per_game_policy_weight_mode=str(args.per_game_policy_weight_mode),
         )
-    split = split_train_validation_indices(
-        data,
-        validation_fraction=args.validation_fraction,
-        validation_seed=args.validation_seed,
-        validation_max_samples=args.validation_max_samples,
-        validation_game_seed_ranges=validation_game_seed_ranges,
-        validation_game_seeds=(
-            None
-            if validation_seed_contract is None
-            else np.asarray(validation_seed_contract["game_seeds"], dtype=np.int64)
-        ),
-        allow_missing_game_seed=bool(args.allow_missing_game_seed_validation_split),
+        value_weights = build_value_sample_weights(
+            data,
+            phase_weights=value_phase_weight_map,
+            forced_row_value_weight=args.forced_row_value_weight,
+            per_game_value_weight=args.per_game_value_weight,
+            per_game_value_weight_mode=args.per_game_value_weight_mode,
+        )
+        # Flag-off must remain exact rng.permutation, so these all-ones are only
+        # retained for reporting and are not passed to _epoch_order.
+        if float(args.policy_surprise_weight) == 0.0:
+            surprise_weights = np.ones(n, dtype=np.float32)
+        else:
+            surprise_kl, surprise_has_prior = compute_policy_surprise_kl(data)
+            surprise_weights = policy_surprise_sampling_weights(
+                surprise_kl,
+                surprise_has_prior,
+                weight_scale=args.policy_surprise_weight,
+                cap=args.policy_surprise_cap,
+            )
+        split_result = split_train_validation_indices(
+            data,
+            validation_fraction=args.validation_fraction,
+            validation_seed=args.validation_seed,
+            validation_max_samples=args.validation_max_samples,
+            validation_game_seed_ranges=validation_game_seed_ranges,
+            validation_game_seeds=(
+                None
+                if validation_seed_contract is None
+                else np.asarray(
+                    validation_seed_contract["game_seeds"], dtype=np.int64
+                )
+            ),
+            allow_missing_game_seed=bool(
+                args.allow_missing_game_seed_validation_split
+            ),
+        )
+        result = {
+            "policy_sample_weights": policy_weights,
+            "value_sample_weights": value_weights,
+            "policy_surprise_weights_full": surprise_weights,
+            "train_indices": np.asarray(split_result["train"], dtype=np.int64),
+            "validation_indices": np.asarray(
+                split_result["validation"], dtype=np.int64
+            ),
+        }
+        if "game_seed" in data:
+            result["held_out_game_seeds"] = np.sort(
+                np.unique(
+                    np.asarray(
+                        data["game_seed"][result["validation_indices"]],
+                        dtype=np.int64,
+                    )
+                )
+            ).astype(np.int64, copy=False)
+        component_weights = _composite_game_sampling_weights(
+            data, result["train_indices"]
+        )
+        if component_weights is not None:
+            result["component_game_sampling"] = component_weights
+        return result
+
+    local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", ddp["world_size"]))
+    cache_enabled = (
+        bool(ddp["enabled"])
+        and args.data_format == "memmap"
+        and int(ddp["world_size"]) == local_world_size
     )
-    train_indices = split["train"]
-    validation_indices = split["validation"]
+    if cache_enabled:
+        cache_payload = {
+            "data_fingerprint": str(args.data_fingerprint),
+            "row_count": int(n),
+            "teacher_weights": teacher_weight_map,
+            "policy_phase_weights": policy_phase_weight_map,
+            "value_phase_weights": value_phase_weight_map,
+            "forced_action_weight": float(args.forced_action_weight),
+            "winner_sample_weight": float(args.winner_sample_weight),
+            "loser_sample_weight": float(args.loser_sample_weight),
+            "vp_margin_weight": float(args.vp_margin_weight),
+            "vps_to_win": int(args.vps_to_win),
+            "per_game_policy_weight": bool(args.per_game_policy_weight),
+            "per_game_policy_weight_mode": str(args.per_game_policy_weight_mode),
+            "forced_row_value_weight": float(args.forced_row_value_weight),
+            "per_game_value_weight": bool(args.per_game_value_weight),
+            "per_game_value_weight_mode": str(args.per_game_value_weight_mode),
+            "policy_surprise_weight": float(args.policy_surprise_weight),
+            "policy_surprise_cap": float(args.policy_surprise_cap),
+            "validation_fraction": float(args.validation_fraction),
+            "validation_seed": int(args.validation_seed),
+            "validation_max_samples": int(args.validation_max_samples),
+            "validation_game_seed_ranges": validation_game_seed_ranges or [],
+            "allow_missing_game_seed_validation_split": bool(
+                args.allow_missing_game_seed_validation_split
+            ),
+            "validation_contract_file_sha256": (
+                ""
+                if validation_seed_contract is None
+                else str(validation_seed_contract.get("file_sha256", ""))
+            ),
+            "validation_game_seed_set_sha256": (
+                ""
+                if validation_seed_contract is None
+                else str(
+                    validation_seed_contract.get(
+                        "validation_game_seed_set_sha256", ""
+                    )
+                )
+            ),
+            "component_game_sampling_ratios": [
+                float(value)
+                for value in getattr(
+                    data, "component_game_sampling_ratios", tuple()
+                )
+            ],
+        }
+        _cache_key, cache_identity = _derived_array_cache_key(cache_payload)
+        cache_root = Path(
+            os.environ.get(
+                "CATAN_TRAIN_PRECOMPUTE_CACHE_DIR",
+                "/dev/shm/catan-zero-train-precompute",
+            )
+        )
+        if int(ddp["rank"]) == 0:
+            cache_directory = cache_root / _cache_key
+            if not cache_directory.exists():
+                _write_derived_array_cache(
+                    cache_root, cache_identity, _build_derived_training_arrays()
+                )
+            # One local rank authenticates every byte before releasing peers.
+            # Peers subsequently map the exact same read-only files; rehashing
+            # ~1 GiB eight times would recreate the startup bottleneck.
+            derived = _load_derived_array_cache(cache_root, cache_identity)
+        import torch.distributed as dist
+
+        dist.barrier()
+        if int(ddp["rank"]) != 0:
+            derived = _load_derived_array_cache(
+                cache_root, cache_identity, verify_digests=False
+            )
+        _rank0_print(
+            json.dumps(
+                {
+                    "progress": "training_precompute_cache",
+                    "cache_key": _cache_key,
+                    "cache_root": str(cache_root),
+                    "array_count": len(derived),
+                    "shared_across_local_ddp_ranks": True,
+                },
+                sort_keys=True,
+            ),
+            ddp,
+        )
+    else:
+        derived = _build_derived_training_arrays()
+
+    policy_sample_weights = derived["policy_sample_weights"]
+    value_sample_weights = derived["value_sample_weights"]
+    policy_surprise_weights_full = derived["policy_surprise_weights_full"]
+    train_indices = derived["train_indices"]
+    validation_indices = derived["validation_indices"]
     if len(train_indices) == 0:
         raise SystemExit(
             "training split is empty; refusing to save a checkpoint that could "
@@ -4397,10 +4521,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     validation_seed_set_sha256 = ""
     validation_game_seed_count = 0
     if "game_seed" in data:
-        all_game_seeds = np.asarray(data["game_seed"], dtype=np.int64)
-        held_out_game_seeds = np.sort(
-            np.unique(all_game_seeds[validation_indices])
-        ).astype(np.int64, copy=False)
+        held_out_game_seeds = derived["held_out_game_seeds"]
         validation_game_seed_count = int(len(held_out_game_seeds))
         validation_seed_set_sha256 = _game_seed_set_sha256(held_out_game_seeds)
         if validation_seed_contract is not None:
@@ -4462,7 +4583,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         if float(args.policy_surprise_weight) > 0.0
         else None
     )
-    component_game_sampling = _composite_game_sampling_weights(data, train_indices)
+    component_game_sampling = derived.get("component_game_sampling")
     if component_game_sampling is not None:
         if epoch_sample_weights is not None:
             raise SystemExit(
@@ -4471,10 +4592,21 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "must be explicitly specified"
             )
         epoch_sample_weights = component_game_sampling
-    policy_sample_weight_report = sample_weight_quality(data, policy_sample_weights)
-    value_sample_weight_report = sample_weight_quality(data, value_sample_weights)
-    policy_surprise_weight_report = sample_weight_quality(data, policy_surprise_weights_full)
-    value_sample_weight_report["by_game"] = per_game_weight_quality(data, value_sample_weights)
+    if int(ddp["rank"]) == 0:
+        policy_sample_weight_report = sample_weight_quality(data, policy_sample_weights)
+        value_sample_weight_report = sample_weight_quality(data, value_sample_weights)
+        policy_surprise_weight_report = sample_weight_quality(
+            data, policy_surprise_weights_full
+        )
+        value_sample_weight_report["by_game"] = per_game_weight_quality(
+            data, value_sample_weights
+        )
+    else:
+        # Reports are only printed/written by rank 0. Avoid repeating their
+        # O(rows) grouping work and transient arrays on every local DDP rank.
+        policy_sample_weight_report = {}
+        value_sample_weight_report = {}
+        policy_surprise_weight_report = {}
     _rank0_print(
         json.dumps(
             {
@@ -4509,6 +4641,20 @@ def main(argv: Sequence[str] | None = None) -> None:
     # and steps, and global_step (== optimizer steps) advances once per batch.
     accum = max(1, int(args.grad_accum_steps))
     for epoch in range(args.epochs):
+        remaining_order_samples = None
+        if int(args.max_steps) > 0 and epoch_sample_weights is not None:
+            # Weighted sampling is with replacement, so a bounded draw is the
+            # exact prefix of the historical full-epoch draw. Do not allocate
+            # tens of millions of positions when a max-step probe consumes only
+            # a few million. Uniform permutation remains uncapped because there
+            # is no cheaper way to preserve np.random.permutation's exact prefix.
+            remaining_optimizer_steps = max(0, int(args.max_steps) - global_step)
+            remaining_order_samples = (
+                remaining_optimizer_steps
+                * accum
+                * int(args.batch_size)
+                * (int(ddp["world_size"]) if ddp["enabled"] else 1)
+            )
         order = _epoch_order(
             rng,
             len(train_indices),
@@ -4516,6 +4662,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             ddp,
             data_sharded=bool(args.ddp_shard_data),
             sample_weights=epoch_sample_weights,
+            max_samples=remaining_order_samples,
         )
         epoch_losses = []
         epoch_extra_sums: dict[str, float] = {
@@ -11792,6 +11939,155 @@ def _distributed_state() -> dict[str, int | bool]:
     }
 
 
+_TRAINING_PRECOMPUTE_CACHE_SCHEMA = "train-bc-derived-arrays-v1"
+
+
+def _array_content_sha256(array: np.ndarray) -> str:
+    """Hash an array's exact C-order bytes without materialising a second copy."""
+
+    contiguous = np.ascontiguousarray(array)
+    digest = hashlib.sha256()
+    view = memoryview(contiguous).cast("B")
+    block = 8 * 1024 * 1024
+    for offset in range(0, len(view), block):
+        digest.update(view[offset : offset + block])
+    return f"sha256:{digest.hexdigest()}"
+
+
+def _derived_array_cache_key(payload: dict[str, object]) -> tuple[str, dict[str, object]]:
+    """Return a content key and the canonical, versioned cache identity.
+
+    The caller must bind every corpus and recipe input that can affect an array.
+    The implementation file and NumPy version are bound here centrally, so a
+    code or numerical-runtime change cannot silently reuse an older result.
+    """
+
+    identity = {
+        "schema_version": _TRAINING_PRECOMPUTE_CACHE_SCHEMA,
+        "implementation_sha256": _sha256_existing_file(__file__),
+        "numpy_version": str(np.__version__),
+        "inputs": payload,
+    }
+    digest = _canonical_json_sha256(identity).removeprefix("sha256:")
+    return digest, identity
+
+
+def _write_derived_array_cache(
+    cache_root: Path,
+    identity: dict[str, object],
+    arrays: dict[str, np.ndarray],
+) -> Path:
+    """Atomically publish immutable, checksummed ``.npy`` derived arrays."""
+
+    key = _canonical_json_sha256(identity).removeprefix("sha256:")
+    destination = cache_root / key
+    cache_root.mkdir(parents=True, exist_ok=True)
+    if destination.exists():
+        # Never overwrite an existing content-addressed entry. Validation is
+        # deliberately delegated to the loader, which fails closed on damage.
+        return destination
+    temporary = Path(tempfile.mkdtemp(prefix=f".{key}.", dir=cache_root))
+    try:
+        inventory: dict[str, dict[str, object]] = {}
+        for name, value in sorted(arrays.items()):
+            if not re.fullmatch(r"[a-z][a-z0-9_]*", name):
+                raise ValueError(f"unsafe derived-array cache name {name!r}")
+            array = np.ascontiguousarray(value)
+            path = temporary / f"{name}.npy"
+            with open(path, "wb") as handle:
+                np.save(handle, array, allow_pickle=False)
+                handle.flush()
+                os.fsync(handle.fileno())
+            path.chmod(0o444)
+            inventory[name] = {
+                "file": path.name,
+                "dtype": array.dtype.str,
+                "shape": [int(item) for item in array.shape],
+                "content_sha256": _array_content_sha256(array),
+                "file_sha256": _sha256_existing_file(path),
+            }
+        manifest = {
+            "schema_version": _TRAINING_PRECOMPUTE_CACHE_SCHEMA,
+            "identity": identity,
+            "identity_sha256": f"sha256:{key}",
+            "arrays": inventory,
+        }
+        manifest_path = temporary / "manifest.json"
+        with open(manifest_path, "w", encoding="utf-8") as handle:
+            json.dump(manifest, handle, sort_keys=True, separators=(",", ":"))
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        manifest_path.chmod(0o444)
+        try:
+            os.replace(temporary, destination)
+        except FileExistsError:
+            # A concurrent run with the same authenticated identity won the
+            # publish race. Its atomic rename guarantees a complete entry;
+            # the caller still authenticates every byte before use.
+            import shutil
+
+            shutil.rmtree(temporary)
+        directory_fd = os.open(cache_root, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except BaseException:
+        if temporary.exists():
+            import shutil
+
+            shutil.rmtree(temporary)
+        raise
+    return destination
+
+
+def _load_derived_array_cache(
+    cache_root: Path,
+    identity: dict[str, object],
+    *,
+    verify_digests: bool = True,
+) -> dict[str, np.ndarray]:
+    """Authenticate a cache entry before exposing read-only memory maps.
+
+    Both the ``.npy`` file bytes and decoded C-order array bytes are checked.
+    This is intentionally fail-closed: an existing but partial/tampered entry
+    aborts training instead of being silently regenerated or reused.
+    """
+
+    key = _canonical_json_sha256(identity).removeprefix("sha256:")
+    directory = cache_root / key
+    manifest_path = directory / "manifest.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise SystemExit(f"derived-array cache manifest is unreadable: {manifest_path}") from error
+    if manifest.get("schema_version") != _TRAINING_PRECOMPUTE_CACHE_SCHEMA:
+        raise SystemExit("derived-array cache schema drift")
+    if manifest.get("identity") != identity or manifest.get("identity_sha256") != f"sha256:{key}":
+        raise SystemExit("derived-array cache identity drift")
+    inventory = manifest.get("arrays")
+    if not isinstance(inventory, dict) or not inventory:
+        raise SystemExit("derived-array cache has no array inventory")
+    loaded: dict[str, np.ndarray] = {}
+    for name, record in sorted(inventory.items()):
+        if not isinstance(record, dict) or record.get("file") != f"{name}.npy":
+            raise SystemExit(f"derived-array cache inventory is invalid for {name!r}")
+        path = directory / f"{name}.npy"
+        if verify_digests and _sha256_existing_file(path) != record.get("file_sha256"):
+            raise SystemExit(f"derived-array cache file digest mismatch: {name}")
+        try:
+            array = np.load(path, mmap_mode="r", allow_pickle=False)
+        except (OSError, ValueError) as error:
+            raise SystemExit(f"derived-array cache cannot decode {name}") from error
+        if array.dtype.str != record.get("dtype") or list(array.shape) != record.get("shape"):
+            raise SystemExit(f"derived-array cache shape/dtype drift: {name}")
+        if verify_digests and _array_content_sha256(array) != record.get("content_sha256"):
+            raise SystemExit(f"derived-array cache content digest mismatch: {name}")
+        loaded[name] = array
+    return loaded
+
+
 def _composite_game_sampling_weights(
     data, train_indices: np.ndarray
 ) -> np.ndarray | None:
@@ -11845,6 +12141,7 @@ def _epoch_order(
     *,
     data_sharded: bool = False,
     sample_weights: np.ndarray | None = None,
+    max_samples: int | None = None,
 ) -> np.ndarray:
     """Per-epoch traversal order over ``train_indices`` positions ``0..n-1``.
 
@@ -11869,6 +12166,11 @@ def _epoch_order(
     change epoch sampling frequency (not loss weight), it must combine its
     weights with these explicitly (e.g. multiply then renormalize) rather than
     overwriting this argument.
+
+    ``max_samples`` only bounds the weighted-with-replacement path. Its result
+    is byte-identical to the same-length prefix of the historical ``size=n``
+    draw for the same RNG state. ``None`` and values >= ``n`` retain the exact
+    historical call. The permutation path intentionally ignores the bound.
     """
     if sample_weights is None:
         order = rng.permutation(n)
@@ -11881,12 +12183,21 @@ def _epoch_order(
         total = float(weights.sum())
         if total <= 0.0:
             raise ValueError("sample_weights must sum to a positive value")
-        order = rng.choice(n, size=n, replace=True, p=weights / total)
+        draw_count = n
+        if max_samples is not None:
+            if int(max_samples) < 0:
+                raise ValueError("max_samples must be non-negative")
+            draw_count = min(n, int(max_samples))
+        order = rng.choice(n, size=draw_count, replace=True, p=weights / total)
     if not ddp["enabled"]:
         return order
     if data_sharded:
+        local_order_size = len(order) if max_samples is not None else n
         total_size = int(
-            np.ceil(_distributed_scalar_max(float(n), ddp) / max(1, int(batch_size)))
+            np.ceil(
+                _distributed_scalar_max(float(local_order_size), ddp)
+                / max(1, int(batch_size))
+            )
             * max(1, int(batch_size))
         )
         if total_size > len(order):
@@ -11896,7 +12207,7 @@ def _epoch_order(
     world_size = int(ddp["world_size"])
     rank = int(ddp["rank"])
     global_batch = max(1, int(batch_size)) * world_size
-    total_size = int(np.ceil(n / global_batch) * global_batch)
+    total_size = int(np.ceil(len(order) / global_batch) * global_batch)
     if total_size > len(order):
         pad = np.resize(order, total_size - len(order))
         order = np.concatenate((order, pad), axis=0)
