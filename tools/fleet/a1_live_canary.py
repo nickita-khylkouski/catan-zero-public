@@ -265,26 +265,27 @@ def _validate_scalar_attestation(lock: Mapping[str, Any]) -> None:
 
 def _selected_lanes(
     lanes: Mapping[str, list[dict[str, Any]]],
+    canary_aliases: Mapping[str, int] = CANARY_ALIASES,
 ) -> dict[str, list[dict[str, Any]]]:
     selected: dict[str, list[dict[str, Any]]] = {}
-    placements: dict[str, list[int]] = {alias: [] for alias in CANARY_ALIASES}
+    placements: dict[str, list[int]] = {alias: [] for alias in canary_aliases}
     for worker_id, lane in lanes.items():
         if not lane:
             continue
         alias = str(lane[0].get("host_alias"))
-        if alias not in CANARY_ALIASES:
+        if alias not in canary_aliases:
             continue
         gpu = int(lane[0].get("gpu", -1))
         placements[alias].append(gpu)
         selected[worker_id] = lane
-    for alias, count in CANARY_ALIASES.items():
+    for alias, count in canary_aliases.items():
         if sorted(placements[alias]) != list(range(count)):
             raise CanaryError(
                 f"source render must expose {alias} gpu0-{count - 1}, got "
                 f"{sorted(placements[alias])}"
             )
-    if len(selected) != sum(CANARY_ALIASES.values()):
-        raise CanaryError("source render does not yield exactly 12 canary lanes")
+    if len(selected) != sum(canary_aliases.values()):
+        raise CanaryError("source render does not yield the requested canary lanes")
     return selected
 
 
@@ -332,6 +333,8 @@ def derive_canary_plan(
     canary_id: str,
     base_seed: int,
     canary_root: Path,
+    canary_aliases: Mapping[str, int] = CANARY_ALIASES,
+    games_per_job: int = GAMES_PER_JOB,
     allowed_root: Path = CANARY_ROOT,
     repo_root: Path = _REPO_ROOT,
 ) -> dict[str, Any]:
@@ -352,9 +355,18 @@ def derive_canary_plan(
     ):
         raise CanaryError("canary output root overlaps the production output tree")
 
-    chosen = _selected_lanes(lanes)
+    canary_aliases = dict(canary_aliases)
+    if not canary_aliases or any(
+        not alias or isinstance(count, bool) or count <= 0
+        for alias, count in canary_aliases.items()
+    ):
+        raise CanaryError("canary aliases must bind positive GPU counts")
+    if isinstance(games_per_job, bool) or games_per_job <= 0:
+        raise CanaryError("games per job must be positive")
+    chosen = _selected_lanes(lanes, canary_aliases)
     lo, hi = contract.VAL_ONLY_SEED_RANGE
-    total_games = JOB_COUNT * GAMES_PER_JOB
+    job_count = sum(canary_aliases.values()) * len(CATEGORY_ORDER)
+    total_games = job_count * games_per_job
     if base_seed < lo or base_seed + total_games > hi:
         raise CanaryError(
             f"canary [{base_seed},{base_seed + total_games}) must fit VAL-ONLY [{lo},{hi})"
@@ -382,13 +394,13 @@ def derive_canary_plan(
             out_dir = root / f"{alias}_gpu{gpu}__{category}"
             claim = f"val-{canary_id}-{alias}-gpu{gpu}-{category}"
             seed_start = next_seed
-            seed_end = seed_start + GAMES_PER_JOB
+            seed_end = seed_start + games_per_job
             next_seed = seed_end
             argv = _replace_values(
                 source_command["argv"],
                 {
                     "--out-dir": str(out_dir),
-                    "--games": str(GAMES_PER_JOB),
+                    "--games": str(games_per_job),
                     "--base-seed": str(seed_start),
                     "--ledger-claim-label": claim,
                 },
@@ -428,7 +440,7 @@ def derive_canary_plan(
                 "gpu": gpu,
                 "category": category,
                 "base_seed": seed_start,
-                "games": GAMES_PER_JOB,
+                "games": games_per_job,
                 "seed_end": seed_end,
                 "output_dir": str(out_dir),
                 "argv_sha256": _digest(argv),
@@ -448,7 +460,7 @@ def derive_canary_plan(
                 "environment_sha256": _digest(environment),
                 "config_provenance": _canary_config_provenance(
                     source_command,
-                    games=GAMES_PER_JOB,
+                    games=games_per_job,
                     base_seed=seed_start,
                 ),
                 "ledger_claim": {
@@ -504,7 +516,8 @@ def derive_canary_plan(
         "canary_seed_ledger": canary_ledger_record,
         "seed_range": [base_seed, next_seed],
         "output_root": str(root),
-        "games_per_job": GAMES_PER_JOB,
+        "games_per_job": games_per_job,
+        "canary_aliases": canary_aliases,
         "lane_count": len(new_lanes),
         "job_count": len(new_commands),
         "required_artifacts": required,
@@ -529,7 +542,7 @@ def derive_canary_plan(
 
     subset_hosts = dict(hosts)
     subset_hosts["hosts"] = {
-        alias: hosts["hosts"][alias] for alias in sorted(CANARY_ALIASES)
+        alias: hosts["hosts"][alias] for alias in sorted(canary_aliases)
     }
     subset_hosts["remote_root"] = (
         str(hosts["remote_root"]).rstrip("/") + f"/live-canary-{canary_id}"
@@ -556,6 +569,8 @@ def derive_canary_plan(
         "remote_root": subset_hosts["remote_root"],
         "lane_count": len(new_lanes),
         "job_count": len(new_commands),
+        "canary_aliases": canary_aliases,
+        "games_per_job": games_per_job,
         "claim_count": 0,
         "canary_claim_count": len(ledger_rows),
         "production_claims_consumed": 0,
@@ -590,11 +605,17 @@ def derive_canary_plan(
 
 def validate_canary_plan(plan: Mapping[str, Any]) -> None:
     executor._verify_plan_digest(plan)
+    aliases = plan.get("canary_aliases", CANARY_ALIASES)
+    games_per_job = plan.get("games_per_job", GAMES_PER_JOB)
+    if not isinstance(aliases, Mapping) or not aliases:
+        raise CanaryError("canary host topology is missing")
+    expected_lanes = sum(int(count) for count in aliases.values())
+    expected_jobs = expected_lanes * len(CATEGORY_ORDER)
     if (
         plan.get("validation_only") is not True
         or plan.get("canary_schema_version") != SCHEMA
-        or plan.get("lane_count") != 12
-        or plan.get("job_count") != 36
+        or plan.get("lane_count") != expected_lanes
+        or plan.get("job_count") != expected_jobs
         or plan.get("claim_count") != 0
         or plan.get("production_claims_consumed") != 0
     ):
@@ -611,8 +632,8 @@ def validate_canary_plan(plan: Mapping[str, Any]) -> None:
         or not isinstance(lanes, Mapping)
     ):
         raise CanaryError("canary private execution state is malformed")
-    if set(hosts.get("hosts", {})) != set(CANARY_ALIASES):
-        raise CanaryError("canary host set must be exactly c1 and h100-8a")
+    if set(hosts.get("hosts", {})) != set(aliases):
+        raise CanaryError("canary host set differs from its sealed topology")
     canary_ledger = str(plan.get("canary_seed_ledger"))
     if rendered["required_artifacts"]["seed_ledger"]["path"] != canary_ledger:
         raise CanaryError("executor seed-ledger stage is not the canary ledger")
@@ -655,7 +676,7 @@ def validate_canary_plan(plan: Mapping[str, Any]) -> None:
             if (
                 declared != _digest(unhashed)
                 or not isinstance(fields, Mapping)
-                or fields.get("games") != GAMES_PER_JOB
+                or fields.get("games") != games_per_job
                 or fields.get("base_seed")
                 != int(_flag_value(command["argv"], "--base-seed"))
             ):
@@ -676,6 +697,8 @@ def build_canary_plan(
     canary_id: str,
     base_seed: int,
     canary_root: Path,
+    canary_aliases: Mapping[str, int] = CANARY_ALIASES,
+    games_per_job: int = GAMES_PER_JOB,
 ) -> dict[str, Any]:
     lock_path = lock_path.resolve(strict=True)
     render_path = render_path.resolve(strict=True)
@@ -706,6 +729,8 @@ def build_canary_plan(
         canary_id=canary_id,
         base_seed=base_seed,
         canary_root=canary_root,
+        canary_aliases=canary_aliases,
+        games_per_job=games_per_job,
     )
 
 
@@ -824,7 +849,8 @@ def _runtime_lane_expectations(
                 ],
             }
         )
-    expected_gpus = list(range(CANARY_ALIASES[alias]))
+    aliases = plan.get("canary_aliases", CANARY_ALIASES)
+    expected_gpus = list(range(int(aliases[alias])))
     if sorted(item["gpu"] for item in expectations) != expected_gpus:
         raise CanaryError(f"runtime lane topology drift on {alias}")
     return expectations
@@ -848,7 +874,7 @@ def attest_mps_runtime(
     not_before_ns = int(float(not_before_epoch) * 1_000_000_000)
     hosts = plan["_private"]["hosts"]
     reports: dict[str, Any] = {}
-    for alias in sorted(CANARY_ALIASES):
+    for alias in sorted(plan.get("canary_aliases", CANARY_ALIASES)):
         expected_lanes = _runtime_lane_expectations(plan, alias)
         command = " ".join(
             shlex.quote(value)
@@ -948,6 +974,26 @@ def _public(plan: Mapping[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in plan.items() if key != "_private"}
 
 
+def _parse_host_shapes(values: Sequence[str] | None) -> dict[str, int]:
+    if not values:
+        return dict(CANARY_ALIASES)
+    result: dict[str, int] = {}
+    for value in values:
+        alias, separator, raw_count = value.partition("=")
+        if not separator or not alias or alias in result:
+            raise CanaryError(
+                f"invalid/duplicate --host-shape {value!r}; expected ALIAS=GPU_COUNT"
+            )
+        try:
+            count = int(raw_count)
+        except ValueError as error:
+            raise CanaryError(f"invalid GPU count in --host-shape {value!r}") from error
+        if count not in (4, 8):
+            raise CanaryError("live canary host shapes must contain 4 or 8 GPUs")
+        result[alias] = count
+    return result
+
+
 def _receipt_has_launch_state(plan: Mapping[str, Any], receipt_path: Path) -> bool:
     """Return whether an interrupted execute durably recorded a live lane prefix."""
 
@@ -987,6 +1033,18 @@ def build_parser() -> argparse.ArgumentParser:
         item.add_argument("--canary-id", required=True)
         item.add_argument("--base-seed", required=True, type=int)
         item.add_argument(
+            "--host-shape",
+            action="append",
+            metavar="ALIAS=GPU_COUNT",
+            help="select an exact source-render host; repeat to form the pilot cohort",
+        )
+        item.add_argument(
+            "--games-per-job",
+            type=int,
+            default=GAMES_PER_JOB,
+            help="validation games for each of the three sealed source categories",
+        )
+        item.add_argument(
             "--canary-root",
             type=Path,
             help="must equal /home/ubuntu/gen_out/a1-live-canary-CANARY_ID",
@@ -1001,6 +1059,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     canary_root = args.canary_root or CANARY_ROOT / f"a1-live-canary-{args.canary_id}"
     try:
+        canary_aliases = _parse_host_shapes(args.host_shape)
         plan = build_canary_plan(
             lock_path=args.lock,
             render_path=args.render,
@@ -1009,6 +1068,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             canary_id=args.canary_id,
             base_seed=args.base_seed,
             canary_root=canary_root,
+            canary_aliases=canary_aliases,
+            games_per_job=args.games_per_job,
         )
         if args.command == "status":
             result = executor.status(plan, receipt_path=args.receipt)

@@ -256,6 +256,48 @@ def test_derives_exact_twelve_lane_validation_transaction(
     canary.validate_canary_plan(plan)
 
 
+def test_derives_operator_selected_cohort_and_game_count(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (
+        _default,
+        lock,
+        rendered,
+        lanes,
+        hosts,
+        _root,
+        _production_ledger,
+    ) = _fixture(tmp_path, monkeypatch)
+    chosen_root = tmp_path / "allowed" / "a1-live-canary-n128pilot"
+    plan = canary.derive_canary_plan(
+        lock=lock,
+        rendered=rendered,
+        lanes=lanes,
+        hosts=hosts,
+        lock_path=tmp_path / "lock.json",
+        render_path=tmp_path / "render.json",
+        hosts_path=tmp_path / "hosts.json",
+        receipt_path=tmp_path / "pilot.receipt.json",
+        canary_id="n128pilot",
+        base_seed=canary.contract.VAL_ONLY_SEED_RANGE[0] + 10_000,
+        canary_root=chosen_root,
+        allowed_root=tmp_path / "allowed",
+        canary_aliases={"c2": 4, "h100-8b": 8},
+        games_per_job=8,
+    )
+    assert plan["canary_aliases"] == {"c2": 4, "h100-8b": 8}
+    assert plan["games_per_job"] == 8
+    assert plan["lane_count"] == 12
+    assert plan["job_count"] == 36
+    assert set(plan["_private"]["hosts"]["hosts"]) == {"c2", "h100-8b"}
+    assert all(
+        canary._flag_value(command["argv"], "--games") == "8"
+        for lane in plan["_private"]["lanes"].values()
+        for command in lane
+    )
+    canary.validate_canary_plan(plan)
+
+
 def test_only_identity_seed_output_and_attempt_values_change(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
