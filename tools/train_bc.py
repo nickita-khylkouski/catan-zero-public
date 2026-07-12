@@ -49,6 +49,7 @@ if str(_TOOLS_DIR) not in sys.path:
 
 from factory_common import parse_track, write_json  # noqa: E402
 import launcher_guards  # noqa: E402
+from mixed_memmap_corpus import ConcatMemmapCorpus  # noqa: E402
 
 
 # Public-observation masking of hidden player info (task #72). Canonical
@@ -1413,6 +1414,16 @@ def _training_data_fingerprint(path: str, data_format: str) -> str:
     """
 
     root = Path(path)
+    if str(data_format) == "memmap" and root.is_file():
+        try:
+            descriptor = json.loads(root.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return _sha256_existing_file(root)
+        if (
+            isinstance(descriptor, dict)
+            and descriptor.get("schema_version") == "memmap_composite_v1"
+        ):
+            return _canonical_json_sha256(descriptor)
     candidates = (
         (root / "corpus_meta.json", root / "manifest.json")
         if str(data_format) == "memmap"
@@ -1441,6 +1452,93 @@ def _training_data_fingerprint(path: str, data_format: str) -> str:
                 )
         return digest
     return ""
+
+
+def _preflight_memmap_composite_descriptor(path: str | Path) -> dict[str, object]:
+    """Authenticate an ordered, diagnostic-only two-corpus no-copy descriptor."""
+    descriptor_path = Path(path).expanduser().resolve(strict=True)
+    try:
+        descriptor = json.loads(descriptor_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise SystemExit(f"cannot load memmap composite descriptor {path}: {error}") from error
+    if not isinstance(descriptor, dict) or set(descriptor) != {
+        "schema_version", "diagnostic_only", "promotion_eligible", "components",
+    }:
+        raise SystemExit("memmap composite descriptor fields differ from v1 schema")
+    if (
+        descriptor.get("schema_version") != "memmap_composite_v1"
+        or descriptor.get("diagnostic_only") is not True
+        or descriptor.get("promotion_eligible") is not False
+    ):
+        raise SystemExit(
+            "memmap composite v1 is diagnostic-only and must declare "
+            "diagnostic_only=true, promotion_eligible=false"
+        )
+    raw_components = descriptor.get("components")
+    if not isinstance(raw_components, list) or len(raw_components) != 2:
+        raise SystemExit("memmap composite v1 requires exactly two ordered components")
+    components: list[dict[str, object]] = []
+    inventory_bindings: list[dict[str, object]] = []
+    seen_dirs: set[str] = set()
+    expected = {
+        "corpus_dir", "corpus_meta_sha256", "payload_inventory_sha256",
+        "validation_manifest", "validation_manifest_sha256",
+    }
+    for index, raw in enumerate(raw_components):
+        if not isinstance(raw, dict) or set(raw) != expected:
+            raise SystemExit(f"memmap composite component {index} fields differ from v1 schema")
+        try:
+            corpus_dir = Path(str(raw["corpus_dir"])).expanduser().resolve(strict=True)
+            validation_path = Path(str(raw["validation_manifest"])).expanduser().resolve(strict=True)
+        except OSError as error:
+            raise SystemExit(f"cannot resolve memmap composite component {index}: {error}") from error
+        if not corpus_dir.is_dir() or str(corpus_dir) != str(raw["corpus_dir"]):
+            raise SystemExit(f"memmap composite component {index} corpus_dir is not canonical")
+        if str(validation_path) != str(raw["validation_manifest"]):
+            raise SystemExit(f"memmap composite component {index} validation_manifest is not canonical")
+        if str(corpus_dir) in seen_dirs:
+            raise SystemExit("memmap composite component corpus directories must be unique")
+        seen_dirs.add(str(corpus_dir))
+        meta_path = corpus_dir / "corpus_meta.json"
+        actual_meta_sha = _sha256_existing_file(meta_path)
+        if not _is_sha256(raw["corpus_meta_sha256"]) or raw["corpus_meta_sha256"] != actual_meta_sha:
+            raise SystemExit(f"memmap composite component {index} corpus metadata hash mismatch")
+        try:
+            corpus_meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as error:
+            raise SystemExit(f"cannot load component {index} corpus metadata {meta_path}: {error}") from error
+        if not isinstance(corpus_meta, dict):
+            raise SystemExit(f"memmap composite component {index} metadata is not an object")
+        if not isinstance(corpus_meta.get("selected_game_seed_manifest"), dict) or not isinstance(
+            corpus_meta.get("a1_post_wave_audit"), dict
+        ):
+            raise SystemExit(f"memmap composite component {index} is not an authenticated A1 corpus")
+        actual_inventory_sha = _validate_memmap_payload_inventory(corpus_dir, corpus_meta)
+        if not _is_sha256(raw["payload_inventory_sha256"]) or raw[
+            "payload_inventory_sha256"
+        ] != actual_inventory_sha:
+            raise SystemExit(f"memmap composite component {index} payload inventory hash mismatch")
+        actual_validation_sha = _sha256_existing_file(validation_path)
+        if not _is_sha256(raw["validation_manifest_sha256"]) or raw[
+            "validation_manifest_sha256"
+        ] != actual_validation_sha:
+            raise SystemExit(f"memmap composite component {index} validation manifest hash mismatch")
+        components.append({
+            **raw, "corpus_dir": str(corpus_dir),
+            "validation_manifest": str(validation_path), "corpus_meta": corpus_meta,
+        })
+        inventory_bindings.append({
+            "corpus_meta_sha256": actual_meta_sha,
+            "payload_inventory_sha256": actual_inventory_sha,
+        })
+    return {
+        "schema_version": "memmap_composite_v1", "diagnostic_only": True,
+        "promotion_eligible": False, "descriptor_path": str(descriptor_path),
+        "descriptor_file_sha256": _sha256_existing_file(descriptor_path),
+        "descriptor_fingerprint": _canonical_json_sha256(descriptor),
+        "payload_inventory_sha256": _canonical_json_sha256(inventory_bindings),
+        "components": components,
+    }
 
 
 def _expected_memmap_payload_filenames(
@@ -1580,7 +1678,15 @@ def _preflight_a1_memmap_metadata(
 ) -> dict[str, object] | None:
     """Auto-detect an A1 corpus and forbid bypassing its exact holdout path."""
 
-    meta_path = Path(data_path).expanduser() / "corpus_meta.json"
+    expanded = Path(data_path).expanduser()
+    if expanded.is_file():
+        if validation_manifest_path:
+            raise SystemExit(
+                "memmap composite descriptor binds each component validation manifest; "
+                "do not also pass --validation-game-seed-manifest"
+            )
+        return _preflight_memmap_composite_descriptor(expanded)
+    meta_path = expanded / "corpus_meta.json"
     if not meta_path.is_file():
         return None
     try:
@@ -1917,6 +2023,69 @@ def _load_validation_game_seed_manifest_for_training(
         "validation_row_count": int(row_count),
         "validation_game_seed_set_sha256": actual_digest,
         "game_seeds": seeds,
+    }
+
+
+def _load_composite_validation_contract(
+    composite_meta: dict[str, object],
+    *,
+    validation_fraction: float,
+    validation_seed: int,
+    validation_max_samples: int,
+    validation_game_seed_ranges: list[tuple[int, int]],
+) -> dict[str, object]:
+    """Validate both bound holdouts and return their game-disjoint union."""
+    raw_components = composite_meta.get("components")
+    if not isinstance(raw_components, list) or len(raw_components) != 2:
+        raise SystemExit("authenticated memmap composite metadata has invalid components")
+    contracts: list[dict[str, object]] = []
+    seen: set[int] = set()
+    union: list[int] = []
+    total_rows = 0
+    bindings: list[dict[str, object]] = []
+    for index, component in enumerate(raw_components):
+        if not isinstance(component, dict):
+            raise SystemExit(f"memmap composite component {index} metadata is malformed")
+        contract = _load_validation_game_seed_manifest_for_training(
+            component["validation_manifest"],
+            validation_fraction=validation_fraction,
+            validation_seed=validation_seed,
+            validation_max_samples=validation_max_samples,
+            validation_game_seed_ranges=validation_game_seed_ranges,
+        )
+        if contract["file_sha256"] != component["validation_manifest_sha256"]:
+            raise SystemExit(f"memmap composite component {index} validation manifest binding drift")
+        _validate_a1_validation_manifest_corpus_binding(component["corpus_meta"], contract)
+        seeds = [int(seed) for seed in np.asarray(contract["game_seeds"], dtype=np.int64)]
+        overlap = seen.intersection(seeds)
+        if overlap:
+            raise SystemExit(
+                "memmap composite validation game seeds are not disjoint: "
+                f"component={index} overlap_count={len(overlap)}"
+            )
+        seen.update(seeds)
+        union.extend(seeds)
+        total_rows += int(contract["validation_row_count"])
+        contracts.append(contract)
+        bindings.append({
+            "a1_contract_sha256": contract["a1_contract_sha256"],
+            "manifest_sha256": contract["manifest_sha256"],
+            "validation_game_seed_set_sha256": contract["validation_game_seed_set_sha256"],
+        })
+    union_seeds = np.sort(np.asarray(union, dtype=np.int64))
+    return {
+        "path": Path(str(composite_meta["descriptor_path"])),
+        "file_sha256": composite_meta["descriptor_file_sha256"],
+        "manifest_sha256": _canonical_json_sha256(bindings),
+        "a1_contract_sha256": _canonical_json_sha256(
+            [binding["a1_contract_sha256"] for binding in bindings]
+        ),
+        "validation_row_count": total_rows,
+        "validation_game_seed_set_sha256": _game_seed_set_sha256(union_seeds),
+        "game_seeds": union_seeds,
+        "component_contracts": contracts,
+        "diagnostic_only": True,
+        "promotion_eligible": False,
     }
 
 
@@ -3189,7 +3358,19 @@ def main(argv: Sequence[str] | None = None) -> None:
         args.validation_game_seed_ranges
     )
     validation_seed_contract: dict[str, object] | None = None
-    if args.validation_game_seed_manifest:
+    is_memmap_composite = bool(
+        isinstance(a1_preflight_meta, dict)
+        and a1_preflight_meta.get("schema_version") == "memmap_composite_v1"
+    )
+    if is_memmap_composite:
+        validation_seed_contract = _load_composite_validation_contract(
+            a1_preflight_meta,
+            validation_fraction=float(args.validation_fraction),
+            validation_seed=int(args.validation_seed),
+            validation_max_samples=int(args.validation_max_samples),
+            validation_game_seed_ranges=validation_game_seed_ranges,
+        )
+    elif args.validation_game_seed_manifest:
         if args.data_format != "memmap":
             raise SystemExit(
                 "--validation-game-seed-manifest is the audited A1 memmap path; "
@@ -3355,7 +3536,10 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "memmap corpus is streamed per batch, so per-rank RAM is already "
                 "bounded and DDP batch sharding is handled at the index level."
             )
-        data = load_teacher_data_memmap(Path(args.data))
+        data = load_teacher_data_memmap(
+            Path(args.data),
+            composite_meta=(a1_preflight_meta if is_memmap_composite else None),
+        )
     else:
         data = load_teacher_data(Path(args.data), ddp=ddp, shard_data=bool(args.ddp_shard_data), mask_hidden_info=bool(getattr(args, "mask_hidden_info", False)))
     target_information_admission = _validate_target_information_admission(
@@ -3376,7 +3560,37 @@ def main(argv: Sequence[str] | None = None) -> None:
         ddp,
     )
     a1_training_binding: dict[str, object] | None = None
-    if validation_seed_contract is not None:
+    if is_memmap_composite:
+        # Existing promotion receipts bind one A1 learner contract. Both
+        # component payloads/holdouts are authenticated, but this mixed run is
+        # diagnostic-only until a contract binds the ordered component set.
+        args.a1_contract_sha256 = validation_seed_contract["a1_contract_sha256"]
+        component_seed_sets: list[set[int]] = []
+        for index, (corpus, contract) in enumerate(
+            zip(data.corpora, validation_seed_contract["component_contracts"])
+        ):
+            component_seeds = set(
+                map(int, np.unique(np.asarray(corpus["game_seed"], dtype=np.int64)))
+            )
+            for prior in component_seed_sets:
+                overlap = prior & component_seeds
+                if overlap:
+                    raise SystemExit(
+                        "memmap composite corpus game seeds overlap across components: "
+                        f"component={index} overlap_count={len(overlap)}"
+                    )
+            component_seed_sets.append(component_seeds)
+            heldout_rows = int(np.isin(
+                np.asarray(corpus["game_seed"], dtype=np.int64),
+                np.asarray(contract["game_seeds"], dtype=np.int64),
+            ).sum())
+            if heldout_rows != int(contract["validation_row_count"]):
+                raise SystemExit(
+                    "memmap composite component holdout row count drift: "
+                    f"component={index} corpus={heldout_rows} "
+                    f"manifest={contract['validation_row_count']}"
+                )
+    elif validation_seed_contract is not None:
         _validate_a1_validation_manifest_corpus_binding(
             getattr(data, "meta", None), validation_seed_contract
         )
@@ -4680,6 +4894,23 @@ def main(argv: Sequence[str] | None = None) -> None:
         "train_diagnostics_every_batches": args.train_diagnostics_every_batches,
         "elapsed_sec": time.perf_counter() - start,
     }
+    if is_memmap_composite:
+        report.update({
+            "memmap_composite": {
+                "schema_version": "memmap_composite_v1",
+                "descriptor_path": a1_preflight_meta["descriptor_path"],
+                "descriptor_file_sha256": a1_preflight_meta["descriptor_file_sha256"],
+                "descriptor_fingerprint": a1_preflight_meta["descriptor_fingerprint"],
+                "payload_inventory_sha256": a1_preflight_meta["payload_inventory_sha256"],
+                "component_count": len(a1_preflight_meta["components"]),
+                "component_contract_sha256s": [
+                    contract["a1_contract_sha256"]
+                    for contract in validation_seed_contract["component_contracts"]
+                ],
+            },
+            "diagnostic_only": True,
+            "promotion_eligible": False,
+        })
     learner_ablation = (
         None
         if a1_training_binding is None
@@ -6970,21 +7201,46 @@ class MemmapCorpus:
         return self.row_count
 
 
-def load_teacher_data_memmap(path: Path) -> MemmapCorpus:
-    corpus = MemmapCorpus(path)
-    print(
-        json.dumps(
-            {
-                "progress": "bc_memmap_load",
-                "corpus_dir": str(path),
-                "rows": corpus.row_count,
-                "legal_width": corpus.legal_width,
-                "shard_count": int(corpus.meta.get("shard_count", 0)),
-            },
-            sort_keys=True,
-        ),
-        flush=True,
-    )
+def load_teacher_data_memmap(
+    path: Path, *, composite_meta: dict[str, object] | None = None
+) -> MemmapCorpus | ConcatMemmapCorpus:
+    if path.is_file():
+        authenticated = (
+            composite_meta
+            if composite_meta is not None
+            else _preflight_memmap_composite_descriptor(path)
+        )
+        if authenticated.get("schema_version") != "memmap_composite_v1":
+            raise SystemExit("memmap composite loader received invalid authenticated metadata")
+        components = authenticated["components"]
+        assert isinstance(components, list)
+        dirs = [Path(str(component["corpus_dir"])) for component in components]
+        corpus = ConcatMemmapCorpus(
+            [MemmapCorpus(component_dir) for component_dir in dirs], dirs=dirs
+        )
+        corpus.meta.update({
+            "schema": "memmap_composite_v1",
+            "descriptor_path": authenticated["descriptor_path"],
+            "descriptor_fingerprint": authenticated["descriptor_fingerprint"],
+            "payload_inventory_sha256": authenticated["payload_inventory_sha256"],
+            "diagnostic_only": True,
+            "promotion_eligible": False,
+        })
+    else:
+        corpus = MemmapCorpus(path)
+    load_event = {
+        "progress": "bc_memmap_load",
+        "corpus_dir": str(path),
+        "rows": corpus.row_count,
+        "legal_width": corpus.legal_width,
+        "shard_count": int(corpus.meta.get("shard_count", 0)),
+    }
+    if isinstance(corpus, ConcatMemmapCorpus):
+        load_event.update({
+            "progress": "bc_memmap_composite_load",
+            "component_count": len(corpus.corpora),
+        })
+    print(json.dumps(load_event, sort_keys=True), flush=True)
     return corpus
 
 
@@ -7019,7 +7275,7 @@ def _iterate_training_batches(
     ]
     batches = [b for b in batches if len(b) > 0]
 
-    if num_workers <= 0 or not isinstance(data, MemmapCorpus):
+    if num_workers <= 0 or not isinstance(data, (MemmapCorpus, ConcatMemmapCorpus)):
         for batch in batches:
             yield data, batch, policy_sample_weights, value_sample_weights
         return

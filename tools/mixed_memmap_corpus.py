@@ -128,6 +128,11 @@ class _ConcatColumn:
         return array
 
 
+# Historical phase-2 equivalence test name; every composite column uses the
+# same lazy global-index mapping, while `_lazy` identifies large payloads.
+_ConcatLazyColumn = _ConcatColumn
+
+
 class ConcatMemmapCorpus:
     """Dict-like global row view over two or more compatible MemmapCorpus parts."""
 
