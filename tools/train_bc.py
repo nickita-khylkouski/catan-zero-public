@@ -9736,10 +9736,12 @@ def _policy_kl_anchor_loss(data: dict, batch: np.ndarray, logits, device):
     a recorded prior of KL(pi_theta || prior_policy), pulling the trained policy toward the
     frozen seed checkpoint's recorded per-state prior (the `prior_policy` column).
 
-    Reuses _prior_kl_telemetry's exact per-row computation (un-detached here),
-    so a run's prior_kl_ratio telemetry directly reflects how hard this anchor is
-    binding. The masked mean goes through _weighted_mean_loss so it inherits the
-    same DDP-correct global-denominator reduction the value/policy losses use.
+    Reuses _prior_kl_telemetry's exact per-row computation (un-detached here).
+    Its optimization mean then excludes forced rows, whose one-element policy
+    simplex makes KL identically zero; raw prior-KL telemetry may still report
+    those rows as coverage. The masked mean goes through _weighted_mean_loss so
+    it inherits the same DDP-correct global-denominator reduction the
+    value/policy losses use.
 
     Returns None when the batch has no prior rows (caller then adds nothing to
     the loss). MUST be called with grad enabled -- i.e. from the training path,
