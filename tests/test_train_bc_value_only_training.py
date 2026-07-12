@@ -71,6 +71,9 @@ def test_freeze_module_groups_cover_expected_submodules() -> None:
         "action_encoder",
         "policy_head",
         "value_heads",
+        "target_gather",
+        "edge_policy",
+        "action_cross",
     }
     assert "value_head" in ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS["value_heads"]
     assert (
@@ -158,6 +161,54 @@ def test_value_heads_group_freezes_scalar_categorical_and_auxiliary_readouts() -
     )
     assert all(
         parameter.requires_grad for parameter in policy.model.blocks.parameters()
+    )
+
+
+def test_action_local_groups_freeze_independently() -> None:
+    from dataclasses import replace
+
+    from catan_zero.rl.entity_token_policy import EntityGraphPolicy
+
+    base = _make_entity_policy()
+    policy = EntityGraphPolicy(
+        replace(
+            base.config,
+            action_target_gather=True,
+            edge_policy_head=True,
+            action_cross_attention_layers=1,
+        ),
+        base.static_action_features.detach().cpu().numpy(),
+        device="cpu",
+    )
+
+    touched = _set_entity_graph_modules_trainable(
+        policy.model, ["target_gather"], trainable=False
+    )
+    assert touched == ["target_gather_proj"]
+    assert all(
+        not parameter.requires_grad
+        for parameter in policy.model.target_gather_proj.parameters()
+    )
+    assert all(
+        parameter.requires_grad
+        for parameter in policy.model.edge_policy_mlp.parameters()
+    )
+    assert all(
+        parameter.requires_grad
+        for parameter in policy.model.action_cross_blocks.parameters()
+    )
+
+    touched = _set_entity_graph_modules_trainable(
+        policy.model, ["edge_policy", "action_cross"], trainable=False
+    )
+    assert set(touched) == {"edge_policy_mlp", "action_cross_blocks"}
+    assert all(
+        not parameter.requires_grad
+        for parameter in policy.model.edge_policy_mlp.parameters()
+    )
+    assert all(
+        not parameter.requires_grad
+        for parameter in policy.model.action_cross_blocks.parameters()
     )
 
 

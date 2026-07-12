@@ -969,9 +969,12 @@ def build_parser() -> argparse.ArgumentParser:
         default="",
         help=(
             "Comma-separated --arch entity_graph module groups to freeze "
-            "(requires_grad=False): trunk,action_encoder,policy_head,value_heads. "
+            "(requires_grad=False): trunk,action_encoder,policy_head,value_heads,"
+            "target_gather,edge_policy,action_cross. "
             "The value_heads group includes scalar/categorical/final-VP/uncertainty "
-            "readouts and optional value-attention-pool parameters. See "
+            "readouts and optional value-attention-pool parameters. The three "
+            "action-local groups allow causal adapter ablations without retraining "
+            "already-learned neighboring adapters. See "
             "--train-value-only for a shortcut covering the first three groups."
         ),
     )
@@ -14359,6 +14362,12 @@ ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS: dict[str, tuple[str, ...]] = {
     ),
     "action_encoder": ("action_encoder",),
     "policy_head": ("action_bias", "logit_scale"),
+    # Keep optional action-local adapters independently freezable.  Grouping
+    # them together would make a gather+edge ablation silently update the
+    # already-trained gather branch while claiming to isolate the edge head.
+    "target_gather": ("target_gather_proj",),
+    "edge_policy": ("edge_policy_mlp",),
+    "action_cross": ("action_cross_blocks",),
     "value_heads": (
         "value_head",
         "value_categorical_head",
