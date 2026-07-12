@@ -364,8 +364,10 @@ def build_held_out_high_regret_suite(
         )
     except ValueError as error:
         raise ArtifactBuildError(str(error)) from error
-    if not (0.0 < holdout_fraction < 1.0):
-        raise ArtifactBuildError("holdout_fraction must be in (0, 1)")
+    if holdout_fraction != 1.0:
+        raise ArtifactBuildError(
+            "promotion suite must use the full authenticated trainer validation set"
+        )
     pairs = _positive_int(pairs, where="held-out suite pairs")
     if pairs < 20:
         raise ArtifactBuildError("held-out suite requires at least 20 pairs")
@@ -417,17 +419,10 @@ def build_held_out_high_regret_suite(
             f"regret manifest contains {len(leaked)} non-validation game seeds"
         )
 
-    def stable_unit_hash(game_seed: int, decision_index: int) -> float:
-        return (
-            hash((int(game_seed), int(decision_index), int(holdout_seed))) & 0xFFFFFFFF
-        ) / 0xFFFFFFFF
-
-    eligible = [
-        index
-        for index in range(len(game_seeds))
-        if stable_unit_hash(int(game_seeds[index]), int(decisions[index]))
-        < holdout_fraction
-    ]
+    # The source manifest is already restricted to the trainer-authenticated
+    # game-level holdout. A second per-state hash split both wastes power and
+    # can cluster the retained states into too few source games.
+    eligible = list(range(len(game_seeds)))
     eligible.sort(
         key=lambda index: (
             -float(scores[index]),
@@ -440,6 +435,7 @@ def build_held_out_high_regret_suite(
     eligible_unique_states = len(
         {(int(game_seeds[index]), int(decisions[index])) for index in eligible}
     )
+    eligible_unique_games = len({int(game_seeds[index]) for index in eligible})
 
     replay_complete, replay_stats, scope_inventories = _replay_complete_manifest_rows(
         manifest_path=manifest_path,
@@ -451,6 +447,9 @@ def build_held_out_high_regret_suite(
         decisions=decisions,
     )
     eligible = [index for index in eligible if index in replay_complete]
+    replay_complete_unique_games = len(
+        {int(game_seeds[index]) for index in eligible}
+    )
 
     def phase_stratum(phase: str) -> str:
         upper = str(phase).upper()
@@ -463,16 +462,16 @@ def build_held_out_high_regret_suite(
         return "build_trade"
 
     selected: list[int] = []
-    seen: set[tuple[int, int]] = set()
+    seen_game_seeds: set[int] = set()
     selected_by_stratum: dict[str, int] = {}
 
     def select_from(indices: Sequence[int], want: int, *, label: str) -> None:
         before = len(selected)
         for index in indices:
-            identity = (int(game_seeds[index]), int(decisions[index]))
-            if identity in seen:
+            game_seed = int(game_seeds[index])
+            if game_seed in seen_game_seeds:
                 continue
-            seen.add(identity)
+            seen_game_seeds.add(game_seed)
             selected.append(index)
             if len(selected) - before == want:
                 break
@@ -498,17 +497,17 @@ def build_held_out_high_regret_suite(
     )
     if len(selected) < pairs:
         for index in eligible:
-            identity = (int(game_seeds[index]), int(decisions[index]))
-            if identity in seen:
+            game_seed = int(game_seeds[index])
+            if game_seed in seen_game_seeds:
                 continue
-            seen.add(identity)
+            seen_game_seeds.add(game_seed)
             selected.append(index)
             if len(selected) == pairs:
                 break
     if len(selected) != pairs:
         raise ArtifactBuildError(
             f"held-out partition has only {len(selected)} replay-complete unique "
-            f"states, need {pairs} ({replay_stats})"
+            f"independent source games, need {pairs} ({replay_stats})"
         )
     states: list[dict[str, Any]] = []
     for pair_id, index in enumerate(selected):
@@ -550,10 +549,14 @@ def build_held_out_high_regret_suite(
         "source_manifest": _file_ref(manifest_path, where="regret manifest"),
         "validation_seed_manifest": validation_binding,
         "selection": {
-            "algorithm": "stable-hash-holdout-stratified-regret-v1",
+            "algorithm": "trainer-validation-stratified-regret-unique-game-v3",
+            "selection_scope": "full_authenticated_training_validation_manifest",
             "holdout_fraction": float(holdout_fraction),
             "holdout_seed": int(holdout_seed),
             "eligible_unique_states": eligible_unique_states,
+            "eligible_unique_games": eligible_unique_games,
+            "replay_complete_unique_games": replay_complete_unique_games,
+            "selected_unique_games": len({state["game_seed"] for state in states}),
             "selected_pairs": pairs,
             "stratum_min_pairs": stratum_min_pairs,
             "selected_by_stratum": selected_by_stratum,
@@ -1295,7 +1298,7 @@ def _parser() -> argparse.ArgumentParser:
         "held-out-suite", help="materialize a deterministic high-regret suite"
     )
     suite.add_argument("--manifest", type=Path, required=True)
-    suite.add_argument("--holdout-fraction", type=float, default=0.10)
+    suite.add_argument("--holdout-fraction", type=float, default=1.0)
     suite.add_argument("--holdout-seed", type=int, required=True)
     suite.add_argument("--pairs", type=int, required=True)
     suite.add_argument("--out", type=Path, required=True)

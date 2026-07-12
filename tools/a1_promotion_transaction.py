@@ -2947,7 +2947,8 @@ def _verify_high_regret_source(
     states = suite["states"]
     if (
         not isinstance(selection, dict)
-        or selection.get("algorithm") != "stable-hash-holdout-stratified-regret-v1"
+        or selection.get("algorithm")
+        != "trainer-validation-stratified-regret-unique-game-v3"
         or not isinstance(states, list)
         or not states
         or selection.get("selected_pairs") != len(states)
@@ -2975,11 +2976,14 @@ def _verify_high_regret_source(
     selected_by_stratum = selection.get("selected_by_stratum")
     stratum_min_pairs = selection.get("stratum_min_pairs")
     if (
-        selection.get("holdout_fraction") != 0.10
+        selection.get("selection_scope")
+        != "full_authenticated_training_validation_manifest"
+        or selection.get("holdout_fraction") != 1.0
+        or selection.get("selected_pairs") != 240
         or selection.get("holdout_seed") != 17
         or isinstance(stratum_min_pairs, bool)
         or not isinstance(stratum_min_pairs, int)
-        or stratum_min_pairs < 4
+        or stratum_min_pairs != 24
         or not isinstance(selected_by_stratum, dict)
         or set(selected_by_stratum) != expected_strata
         or any(value != stratum_min_pairs for value in selected_by_stratum.values())
@@ -2988,6 +2992,7 @@ def _verify_high_regret_source(
             f"{where} held-out suite violates the fixed stratified policy"
         )
     state_by_pair: dict[int, tuple[int, int]] = {}
+    selected_game_seeds: set[int] = set()
     actual_strata = {label: 0 for label in expected_strata}
     inventory_cache: dict[Path, tuple[str, int]] = {}
     source_row_cache: dict[Path, tuple[Any, Any, int]] = {}
@@ -3016,6 +3021,7 @@ def _verify_high_regret_source(
             or isinstance(game_seed, bool)
             or not isinstance(game_seed, int)
             or game_seed not in held_out_seeds
+            or game_seed in selected_game_seeds
             or isinstance(decision_index, bool)
             or not isinstance(decision_index, int)
             or decision_index < 0
@@ -3026,6 +3032,7 @@ def _verify_high_regret_source(
         ):
             raise PromotionError(f"{where}.suite.states[{index}] has invalid identity")
         state_by_pair[pair_id] = (game_seed, decision_index)
+        selected_game_seeds.add(game_seed)
         bound_states.append(state)
         phase = str(state.get("phase", "")).upper()
         if "BUILD_INITIAL_SETTLEMENT" in phase or "BUILD_INITIAL_ROAD" in phase:
@@ -3041,6 +3048,14 @@ def _verify_high_regret_source(
             actual_strata["41+"] += 1
     if any(actual_strata[label] < stratum_min_pairs for label in expected_strata):
         raise PromotionError(f"{where} held-out suite lacks required stratum coverage")
+    if (
+        selection.get("eligible_unique_games")
+        != len({identity[2] for identity in manifest_identities})
+        or selection.get("replay_complete_unique_games", 0) < len(states)
+        or selection.get("selected_unique_games") != len(states)
+        or len(selected_game_seeds) != len(states)
+    ):
+        raise PromotionError(f"{where} held-out suite is not source-game independent")
     try:
         validate_replay_trajectories(bound_states)
     except ValueError as error:

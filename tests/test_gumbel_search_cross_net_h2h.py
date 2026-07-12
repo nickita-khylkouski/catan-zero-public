@@ -216,10 +216,14 @@ def test_held_out_suite_loader_replays_digest_and_source_manifest(
         },
         "validation_seed_manifest": validation_binding,
         "selection": {
-            "algorithm": "stable-hash-holdout-stratified-regret-v1",
-            "holdout_fraction": 0.10,
+            "algorithm": "trainer-validation-stratified-regret-unique-game-v3",
+            "selection_scope": "full_authenticated_training_validation_manifest",
+            "holdout_fraction": 1.0,
             "holdout_seed": 17,
             "eligible_unique_states": 20,
+            "eligible_unique_games": 20,
+            "replay_complete_unique_games": 20,
+            "selected_unique_games": 20,
             "selected_pairs": 20,
             "stratum_min_pairs": 4,
             "selected_by_stratum": {

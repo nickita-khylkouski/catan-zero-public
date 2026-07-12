@@ -233,7 +233,8 @@ def _load_held_out_high_regret_suite(
     states = suite["states"]
     if (
         not isinstance(selection, dict)
-        or selection.get("algorithm") != "stable-hash-holdout-stratified-regret-v1"
+        or selection.get("algorithm")
+        != "trainer-validation-stratified-regret-unique-game-v3"
         or not isinstance(states, list)
         or not states
         or selection.get("selected_pairs") != len(states)
@@ -250,7 +251,9 @@ def _load_held_out_high_regret_suite(
     selected_by_stratum = selection.get("selected_by_stratum")
     stratum_min_pairs = selection.get("stratum_min_pairs")
     if (
-        selection.get("holdout_fraction") != 0.10
+        selection.get("selection_scope")
+        != "full_authenticated_training_validation_manifest"
+        or selection.get("holdout_fraction") != 1.0
         or selection.get("holdout_seed") != 17
         or isinstance(stratum_min_pairs, bool)
         or not isinstance(stratum_min_pairs, int)
@@ -262,6 +265,7 @@ def _load_held_out_high_regret_suite(
         raise ValueError("held-out suite does not satisfy the fixed stratified policy")
     pairs: list[dict[str, Any]] = []
     pair_ids: set[int] = set()
+    selected_game_seeds: set[int] = set()
     bound_states: list[dict[str, Any]] = []
     inventory_cache: dict[Path, tuple[str, int]] = {}
     source_row_cache: dict[Path, tuple[Any, Any, int]] = {}
@@ -289,6 +293,7 @@ def _load_held_out_high_regret_suite(
             or pair_id in pair_ids
             or isinstance(game_seed, bool)
             or not isinstance(game_seed, int)
+            or game_seed in selected_game_seeds
             or isinstance(decision_index, bool)
             or not isinstance(decision_index, int)
             or decision_index < 0
@@ -298,6 +303,7 @@ def _load_held_out_high_regret_suite(
         ):
             raise ValueError(f"held-out suite state {index} lacks valid identity")
         pair_ids.add(pair_id)
+        selected_game_seeds.add(game_seed)
         if game_seed not in allowed_seeds:
             raise ValueError(
                 f"held-out suite state {index} is outside the training validation set"
@@ -320,6 +326,13 @@ def _load_held_out_high_regret_suite(
     actual_strata["41+"] = sum(state["legal_count"] >= 41 for state in bound_states)
     if any(actual_strata[label] < stratum_min_pairs for label in expected_strata):
         raise ValueError("held-out suite retained states do not cover every stratum")
+    if (
+        selection.get("eligible_unique_games")
+        != len({identity[2] for identity in manifest_identities})
+        or selection.get("replay_complete_unique_games", 0) < len(bound_states)
+        or selection.get("selected_unique_games") != len(bound_states)
+    ):
+        raise ValueError("held-out suite lacks enough independent source games")
     validate_replay_trajectories(bound_states)
     return suite_path, suite, pairs
 

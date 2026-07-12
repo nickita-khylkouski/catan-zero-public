@@ -536,12 +536,12 @@ def _fixture(
     high_regret_source_shard = high_regret_scope / "source-shard.npz"
     np.savez(
         high_regret_source_shard,
-        game_seed=np.arange(7_000_000, 7_000_200, dtype=np.int64),
-        decision_index=np.zeros(200, dtype=np.int32),
-        action_taken=np.arange(200, dtype=np.int32),
+        game_seed=np.arange(7_000_000, 7_000_240, dtype=np.int64),
+        decision_index=np.zeros(240, dtype=np.int32),
+        action_taken=np.arange(240, dtype=np.int32),
     )
     high_regret_source_manifest = tmp_path / "high_regret.source.npz"
-    validation_seeds = np.arange(7_000_000, 7_000_200, dtype=np.int64)
+    validation_seeds = np.arange(7_000_000, 7_000_240, dtype=np.int64)
     validation_seed_manifest = tmp_path / "high_regret.validation-seeds.json"
     validation_seed_digest = "sha256:" + hashlib.sha256(
         validation_seeds.astype("<i8", copy=False).tobytes()
@@ -565,10 +565,10 @@ def _fixture(
     np.savez(
         high_regret_source_manifest,
         shard_paths=np.asarray([str(high_regret_source_shard)]),
-        shard_id=np.zeros(200, dtype=np.int32),
-        row_index=np.arange(200, dtype=np.int32),
+        shard_id=np.zeros(240, dtype=np.int32),
+        row_index=np.arange(240, dtype=np.int32),
         game_seed=validation_seeds,
-        decision_index=np.zeros(200, dtype=np.int32),
+        decision_index=np.zeros(240, dtype=np.int32),
         held_out_only=np.asarray(True),
         validation_seed_manifest_path=np.asarray(
             str(validation_seed_manifest.resolve())
@@ -591,23 +591,27 @@ def _fixture(
         "source_manifest": _checkpoint_ref(high_regret_source_manifest),
         "validation_seed_manifest": validation_binding,
         "selection": {
-            "algorithm": "stable-hash-holdout-stratified-regret-v1",
-            "holdout_fraction": 0.1,
+            "algorithm": "trainer-validation-stratified-regret-unique-game-v3",
+            "selection_scope": "full_authenticated_training_validation_manifest",
+            "holdout_fraction": 1.0,
             "holdout_seed": 17,
-            "eligible_unique_states": 200,
-            "selected_pairs": 200,
-            "stratum_min_pairs": 20,
+            "eligible_unique_states": 240,
+            "eligible_unique_games": 240,
+            "replay_complete_unique_games": 240,
+            "selected_unique_games": 240,
+            "selected_pairs": 240,
+            "stratum_min_pairs": 24,
             "selected_by_stratum": {
-                "phase:opening": 20,
-                "phase:robber_dev": 20,
-                "phase:chance": 20,
-                "phase:build_trade": 20,
-                "41+": 20,
+                "phase:opening": 24,
+                "phase:robber_dev": 24,
+                "phase:chance": 24,
+                "phase:build_trade": 24,
+                "41+": 24,
             },
             "replay_preflight": {
                 "contract": REPLAY_CONTRACT,
-                "candidate_states": 200,
-                "replay_complete_states": 200,
+                "candidate_states": 240,
+                "replay_complete_states": 240,
                 "rejected_bad_source": 0,
                 "rejected_noncontiguous": 0,
             },
@@ -626,7 +630,7 @@ def _fixture(
                     "ROLL",
                     "BUILD_ROAD",
                 )[pair % 4],
-                "legal_count": 54 if pair < 20 else 12,
+                "legal_count": 54 if pair < 24 else 12,
                 "regret_score": 1.0,
                 "replay_source": {
                     "contract": REPLAY_CONTRACT,
@@ -635,7 +639,7 @@ def _fixture(
                     "scope_shard_count": scope_count,
                 },
             }
-            for pair in range(200)
+            for pair in range(240)
         ],
     }
     high_regret_suite_payload["suite_sha256"] = promotion._digest_value(
@@ -652,7 +656,7 @@ def _fixture(
             "archived_decision_index": 0,
             "buckets": ["phase:BUILD", "close"],
         }
-        for pair in range(200)
+        for pair in range(240)
         for orientation in ("candidate_first", "candidate_second")
     ]
     normalized_high_regret_games = [
@@ -729,7 +733,7 @@ def _fixture(
             "champion": _checkpoint_ref(champion),
             "passed": True,
             "verdict": "H1",
-            "complete_pairs": 200,
+            "complete_pairs": 240,
             "errors": [],
             "report": _checkpoint_ref(high_regret_report),
             "suite_manifest": _checkpoint_ref(high_regret_suite),
@@ -2054,7 +2058,7 @@ def _install_truncated_high_regret_pair(fixture: dict) -> None:
         report["pair_diagnostics"] = diagnostics
         report["pentanomial_sprt"] = pentanomial
         _write_json(report_path, report)
-        source["complete_pairs"] = 199
+        source["complete_pairs"] = 239
         source["pair_diagnostics"] = diagnostics
         source["pentanomial_sprt"] = pentanomial
         source["verdict"] = pentanomial["decision"]
@@ -2179,7 +2183,7 @@ def test_transaction_rejects_inconsistent_truncated_complete_pair_count(
         fixture,
         kind="high_regret",
         role="high_regret",
-        mutate=lambda source: source.__setitem__("complete_pairs", 200),
+        mutate=lambda source: source.__setitem__("complete_pairs", 240),
     )
 
     with pytest.raises(promotion.PromotionError, match="paired statistics"):

@@ -178,11 +178,12 @@ bucket veto from raw, bucket-labelled game records. Aggregate counts are not
 accepted because they cannot prove cohort identity or be independently replayed:
 
 ```bash
-# One-time frozen suite: deterministic 10% hash holdout, then fixed stratified
-# regret-descending selection (opening, robber/dev, chance, build/trade, 41+).
+# One-time frozen suite: use the full trainer-authenticated validation manifest,
+# then select 240 regret-ranked states from 240 distinct source games with fixed
+# opening/robber/chance/build/41+ stratification. No second per-state thinning.
 python tools/a1_promotion_artifacts.py held-out-suite \
-  --manifest /immutable/raw_10pct_regret.npz \
-  --holdout-fraction 0.10 --holdout-seed 17 --pairs 200 \
+  --manifest /immutable/raw_validation_regret.npz \
+  --holdout-fraction 1.0 --holdout-seed 17 --pairs 240 \
   --out /immutable/a1-high-regret.suite.json
 
 # Real candidate-vs-champion continuations from every frozen archived state.

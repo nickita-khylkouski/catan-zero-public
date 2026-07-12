@@ -134,10 +134,14 @@ def _high_regret_report(
         "held_out": True,
         "source_manifest": _ref(source_manifest),
         "selection": {
-            "algorithm": "stable-hash-holdout-stratified-regret-v1",
-            "holdout_fraction": 0.1,
+            "algorithm": "trainer-validation-stratified-regret-unique-game-v3",
+            "selection_scope": "full_authenticated_training_validation_manifest",
+            "holdout_fraction": 1.0,
             "holdout_seed": 17,
             "eligible_unique_states": pairs,
+            "eligible_unique_games": pairs,
+            "replay_complete_unique_games": pairs,
+            "selected_unique_games": pairs,
             "selected_pairs": pairs,
             "stratum_min_pairs": 20,
             "selected_by_stratum": {
@@ -346,19 +350,21 @@ def test_held_out_suite_is_deterministic_and_derived_from_manifest(
 
     first = artifacts.build_held_out_high_regret_suite(
         manifest_path=manifest,
-        holdout_fraction=0.75,
+        holdout_fraction=1.0,
         holdout_seed=17,
         pairs=20,
     )
     second = artifacts.build_held_out_high_regret_suite(
         manifest_path=manifest,
-        holdout_fraction=0.75,
+        holdout_fraction=1.0,
         holdout_seed=17,
         pairs=20,
     )
 
     assert first == second
     assert len(first["states"]) == 20
+    assert len({state["game_seed"] for state in first["states"]}) == 20
+    assert first["selection"]["selected_unique_games"] == 20
     assert first["source_manifest"] == _ref(manifest)
     assert first["suite_sha256"] == promotion._digest_value(
         {key: value for key, value in first.items() if key != "suite_sha256"}
@@ -474,7 +480,7 @@ def test_held_out_suite_rejects_gaps_duplicates_and_partial_lanes(
 
     suite = artifacts.build_held_out_high_regret_suite(
         manifest_path=manifest,
-        holdout_fraction=0.999999999,
+        holdout_fraction=1.0,
         holdout_seed=17,
         pairs=20,
     )
@@ -520,7 +526,7 @@ def test_held_out_suite_fails_clearly_when_replay_complete_pool_is_too_small(
     ):
         artifacts.build_held_out_high_regret_suite(
             manifest_path=manifest,
-            holdout_fraction=0.999999999,
+            holdout_fraction=1.0,
             holdout_seed=17,
             pairs=20,
         )
@@ -550,7 +556,7 @@ def test_held_out_suite_refuses_any_non_validation_source_row(tmp_path: Path) ->
     with pytest.raises(artifacts.ArtifactBuildError, match="non-validation"):
         artifacts.build_held_out_high_regret_suite(
             manifest_path=manifest,
-            holdout_fraction=0.10,
+            holdout_fraction=1.0,
             holdout_seed=17,
             pairs=20,
         )
@@ -582,7 +588,7 @@ def test_held_out_suite_refuses_validation_manifest_drift(tmp_path: Path) -> Non
     with pytest.raises(artifacts.ArtifactBuildError, match="unsupported"):
         artifacts.build_held_out_high_regret_suite(
             manifest_path=manifest,
-            holdout_fraction=0.10,
+            holdout_fraction=1.0,
             holdout_seed=17,
             pairs=20,
         )
