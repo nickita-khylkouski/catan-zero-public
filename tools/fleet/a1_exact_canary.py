@@ -35,7 +35,7 @@ EXPECTED_VALUE_FLAGS = {
     "--n-full": "128",
     "--n-fast": "16",
     "--p-full": "0.25",
-    "--c-scale": "0.03",
+    "--c-scale": "0.1",
     "--c-visit": "50.0",
     "--max-depth": "80",
     "--workers": "16",

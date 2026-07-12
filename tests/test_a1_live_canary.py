@@ -35,7 +35,7 @@ def _source_argv(out_dir: str, base_seed: int, claim: str) -> list[str]:
         "--c-visit",
         "50.0",
         "--c-scale",
-        "0.03",
+        "0.1",
         "--rescale-noise-floor-c",
         "0.0",
         "--sigma-eval",
@@ -60,6 +60,8 @@ def _source_argv(out_dir: str, base_seed: int, claim: str) -> list[str]:
         "--no-belief-chance-spectra",
         "--information-set-search",
         "--public-observation",
+        "--no-native-mcts-hot-loop",
+        "--no-rust-featurize",
         "--no-eval-server",
         "--seed-claim",
         "--resume",
@@ -284,14 +286,24 @@ def test_derives_operator_selected_cohort_and_game_count(
         allowed_root=tmp_path / "allowed",
         canary_aliases={"c2": 4, "h100-8b": 8},
         games_per_job=8,
+        native_runtime=True,
     )
     assert plan["canary_aliases"] == {"c2": 4, "h100-8b": 8}
     assert plan["games_per_job"] == 8
+    assert plan["native_runtime"] is True
     assert plan["lane_count"] == 12
     assert plan["job_count"] == 36
     assert set(plan["_private"]["hosts"]["hosts"]) == {"c2", "h100-8b"}
     assert all(
         canary._flag_value(command["argv"], "--games") == "8"
+        for lane in plan["_private"]["lanes"].values()
+        for command in lane
+    )
+    assert all(
+        "--native-mcts-hot-loop" in command["argv"]
+        and "--rust-featurize" in command["argv"]
+        and "--no-native-mcts-hot-loop" not in command["argv"]
+        and "--no-rust-featurize" not in command["argv"]
         for lane in plan["_private"]["lanes"].values()
         for command in lane
     )

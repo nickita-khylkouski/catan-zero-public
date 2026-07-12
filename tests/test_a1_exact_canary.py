@@ -29,7 +29,7 @@ def _command(alias: str, gpu: int, category: str, seed: int) -> dict:
         "--n-fast", "16",
         "--p-full", "0.25",
         "--c-visit", "50.0",
-        "--c-scale", "0.03",
+        "--c-scale", "0.1",
         "--max-depth", "80",
         "--rescale-noise-floor-c", "0.0",
         "--sigma-eval", "0.98",

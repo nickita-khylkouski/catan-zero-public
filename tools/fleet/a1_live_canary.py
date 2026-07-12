@@ -211,14 +211,20 @@ def _replace_values(argv: Sequence[str], replacements: Mapping[str, str]) -> lis
     return result
 
 
-def _assert_exact_recipe(original: Sequence[str], derived: Sequence[str]) -> None:
+def _assert_exact_recipe(
+    original: Sequence[str], derived: Sequence[str], *, native_runtime: bool = False
+) -> None:
     original_values, original_switches = static_canary._flag_map(
         list(original), job_id="source"
     )
     derived_values, derived_switches = static_canary._flag_map(
         list(derived), job_id="canary"
     )
-    if original_switches != derived_switches:
+    expected_switches = set(original_switches)
+    if native_runtime:
+        expected_switches -= {"--no-native-mcts-hot-loop", "--no-rust-featurize"}
+        expected_switches |= {"--native-mcts-hot-loop", "--rust-featurize"}
+    if expected_switches != derived_switches:
         raise CanaryError("canary changed a source recipe switch")
     if set(original_values) != set(derived_values):
         raise CanaryError("canary changed the source recipe flag set")
@@ -294,7 +300,11 @@ def _canary_ledger_row(start: int, end: int, job_id: str, claim: str) -> str:
 
 
 def _canary_config_provenance(
-    source: Mapping[str, Any], *, games: int, base_seed: int
+    source: Mapping[str, Any],
+    *,
+    games: int,
+    base_seed: int,
+    native_runtime: bool = False,
 ) -> dict[str, Any]:
     """Derive the validation-only typed config from its verified source command."""
 
@@ -309,6 +319,9 @@ def _canary_config_provenance(
         raise CanaryError("source typed config fields are malformed")
     fields["games"] = int(games)
     fields["base_seed"] = int(base_seed)
+    if native_runtime:
+        fields["native_mcts_hot_loop"] = True
+        fields["rust_featurize"] = True
     full_hash = _digest(config)
     result = {
         "pipeline": "generate",
@@ -335,6 +348,7 @@ def derive_canary_plan(
     canary_root: Path,
     canary_aliases: Mapping[str, int] = CANARY_ALIASES,
     games_per_job: int = GAMES_PER_JOB,
+    native_runtime: bool = False,
     allowed_root: Path = CANARY_ROOT,
     repo_root: Path = _REPO_ROOT,
 ) -> dict[str, Any]:
@@ -405,7 +419,18 @@ def derive_canary_plan(
                     "--ledger-claim-label": claim,
                 },
             )
-            _assert_exact_recipe(source_command["argv"], argv)
+            if native_runtime:
+                if argv.count("--no-native-mcts-hot-loop") != 1:
+                    raise CanaryError("source command lacks explicit native-loop binding")
+                if argv.count("--no-rust-featurize") != 1:
+                    raise CanaryError("source command lacks explicit Rust-featurizer binding")
+                argv[argv.index("--no-native-mcts-hot-loop")] = (
+                    "--native-mcts-hot-loop"
+                )
+                argv[argv.index("--no-rust-featurize")] = "--rust-featurize"
+            _assert_exact_recipe(
+                source_command["argv"], argv, native_runtime=native_runtime
+            )
             environment = {
                 **source_command["environment"],
                 "CATAN_SEED_LEDGER": str(canary_ledger),
@@ -462,6 +487,7 @@ def derive_canary_plan(
                     source_command,
                     games=games_per_job,
                     base_seed=seed_start,
+                    native_runtime=native_runtime,
                 ),
                 "ledger_claim": {
                     "validation_only": True,
@@ -518,6 +544,7 @@ def derive_canary_plan(
         "output_root": str(root),
         "games_per_job": games_per_job,
         "canary_aliases": canary_aliases,
+        "native_runtime": native_runtime,
         "lane_count": len(new_lanes),
         "job_count": len(new_commands),
         "required_artifacts": required,
@@ -571,6 +598,7 @@ def derive_canary_plan(
         "job_count": len(new_commands),
         "canary_aliases": canary_aliases,
         "games_per_job": games_per_job,
+        "native_runtime": native_runtime,
         "claim_count": 0,
         "canary_claim_count": len(ledger_rows),
         "production_claims_consumed": 0,
@@ -607,6 +635,7 @@ def validate_canary_plan(plan: Mapping[str, Any]) -> None:
     executor._verify_plan_digest(plan)
     aliases = plan.get("canary_aliases", CANARY_ALIASES)
     games_per_job = plan.get("games_per_job", GAMES_PER_JOB)
+    native_runtime = bool(plan.get("native_runtime", False))
     if not isinstance(aliases, Mapping) or not aliases:
         raise CanaryError("canary host topology is missing")
     expected_lanes = sum(int(count) for count in aliases.values())
@@ -677,6 +706,8 @@ def validate_canary_plan(plan: Mapping[str, Any]) -> None:
                 declared != _digest(unhashed)
                 or not isinstance(fields, Mapping)
                 or fields.get("games") != games_per_job
+                or bool(fields.get("native_mcts_hot_loop", False)) != native_runtime
+                or bool(fields.get("rust_featurize", False)) != native_runtime
                 or fields.get("base_seed")
                 != int(_flag_value(command["argv"], "--base-seed"))
             ):
@@ -699,6 +730,7 @@ def build_canary_plan(
     canary_root: Path,
     canary_aliases: Mapping[str, int] = CANARY_ALIASES,
     games_per_job: int = GAMES_PER_JOB,
+    native_runtime: bool = False,
 ) -> dict[str, Any]:
     lock_path = lock_path.resolve(strict=True)
     render_path = render_path.resolve(strict=True)
@@ -731,6 +763,7 @@ def build_canary_plan(
         canary_root=canary_root,
         canary_aliases=canary_aliases,
         games_per_job=games_per_job,
+        native_runtime=native_runtime,
     )
 
 
@@ -1045,6 +1078,11 @@ def build_parser() -> argparse.ArgumentParser:
             help="validation games for each of the three sealed source categories",
         )
         item.add_argument(
+            "--native-runtime",
+            action="store_true",
+            help="use parity-proven Rust featurization and native MCTS hot loop",
+        )
+        item.add_argument(
             "--canary-root",
             type=Path,
             help="must equal /home/ubuntu/gen_out/a1-live-canary-CANARY_ID",
@@ -1070,6 +1108,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             canary_root=canary_root,
             canary_aliases=canary_aliases,
             games_per_job=args.games_per_job,
+            native_runtime=bool(args.native_runtime),
         )
         if args.command == "status":
             result = executor.status(plan, receipt_path=args.receipt)
