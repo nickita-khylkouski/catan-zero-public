@@ -670,55 +670,100 @@ def _verify_training_report(
     )
     init_sha = report.get("init_checkpoint_sha256")
     curriculum_parent = report.get("a1_curriculum_parent")
+    architecture_upgrade_binding: dict[str, Any] | None = None
     if init_sha != producer_sha:
-        # A combined-196k candidate is the sole supported exception: its n128
-        # second dose starts from the authenticated output of the completed
-        # n256 first dose.  The training receipt is replayed immediately after
-        # this report check and binds this object byte-for-byte to the reviewed
-        # dual learner lock, parent receipt, claim, and checkpoint.
-        parent_checkpoint = (
-            curriculum_parent.get("parent_checkpoint")
-            if isinstance(curriculum_parent, dict)
-            else None
+        lineage_value = report.get("a1_lineage_dose")
+        try:
+            lineage_value = one_dose.lineage.validate_lineage_dose(lineage_value)
+        except one_dose.lineage.LineageDoseError as error:
+            raise PromotionError(f"candidate initialization lineage refused: {error}") from error
+        architecture_upgrade_binding = lineage_value.get(
+            "function_preserving_upgrade"
         )
-        if (
-            not is_dual
-            or not isinstance(curriculum_parent, dict)
-            or set(curriculum_parent)
-            != {
-                "schema_version",
-                "receipt_path",
-                "receipt_sha256",
-                "parent_arm_id",
-                "parent_subset_id",
-                "parent_checkpoint",
-                "generation_producer_sha256",
-            }
-            or curriculum_parent.get("schema_version")
-            != "a1-curriculum-parent-binding-v1"
-            or curriculum_parent.get("parent_arm_id") != "n256"
-            or curriculum_parent.get("parent_subset_id") != "full-56k"
-            or curriculum_parent.get("generation_producer_sha256") != producer_sha
-            or not isinstance(parent_checkpoint, dict)
-            or set(parent_checkpoint) != {"path", "sha256"}
-            or parent_checkpoint.get("sha256") != init_sha
-        ):
-            raise PromotionError(
-                "candidate training report init checkpoint differs from producer"
+        if architecture_upgrade_binding is not None:
+            receipt_path = _canonical_existing_file(
+                Path(str(architecture_upgrade_binding["receipt"])),
+                where="function-preserving architecture upgrade receipt",
             )
-        parent_path = _canonical_existing_file(
-            Path(str(parent_checkpoint["path"])),
-            where="curriculum parent checkpoint",
-        )
-        parent_receipt = _canonical_existing_file(
-            Path(str(curriculum_parent["receipt_path"])),
-            where="curriculum parent receipt",
-        )
-        if (
-            _sha256(parent_path) != init_sha
-            or _sha256(parent_receipt) != curriculum_parent.get("receipt_sha256")
-        ):
-            raise PromotionError("curriculum parent checkpoint/receipt bytes drifted")
+            try:
+                upgrade = one_dose.architecture_upgrade.verify_receipt(receipt_path)
+            except one_dose.architecture_upgrade.UpgradeError as error:
+                raise PromotionError(
+                    f"function-preserving architecture upgrade refused: {error}"
+                ) from error
+            expected_binding = {
+                "schema_version": "a1-lineage-function-preserving-upgrade-v1",
+                "module": upgrade["module"],
+                "receipt": upgrade["receipt"]["path"],
+                "receipt_sha256": upgrade["receipt"]["sha256"],
+                "source_checkpoint_sha256": upgrade["source"]["sha256"],
+                "upgraded_initializer_sha256": upgrade["upgraded_initializer"][
+                    "sha256"
+                ],
+            }
+            if (
+                architecture_upgrade_binding != expected_binding
+                or upgrade["source"]["sha256"] != producer_sha
+                or upgrade["upgraded_initializer"]["sha256"] != init_sha
+            ):
+                raise PromotionError(
+                    "function-preserving architecture upgrade does not bind producer/init"
+                )
+            init_path = _canonical_existing_file(
+                Path(str(report.get("init_checkpoint"))),
+                where="architecture-upgraded initializer",
+            )
+            if (
+                init_path != Path(upgrade["upgraded_initializer"]["path"])
+                or _sha256(init_path) != init_sha
+            ):
+                raise PromotionError("architecture-upgraded initializer bytes drifted")
+        else:
+            # A combined-196k candidate is the sole supported curriculum
+            # exception. Its parent receipt is independently authenticated.
+            parent_checkpoint = (
+                curriculum_parent.get("parent_checkpoint")
+                if isinstance(curriculum_parent, dict)
+                else None
+            )
+            if (
+                not is_dual
+                or not isinstance(curriculum_parent, dict)
+                or set(curriculum_parent)
+                != {
+                    "schema_version",
+                    "receipt_path",
+                    "receipt_sha256",
+                    "parent_arm_id",
+                    "parent_subset_id",
+                    "parent_checkpoint",
+                    "generation_producer_sha256",
+                }
+                or curriculum_parent.get("schema_version")
+                != "a1-curriculum-parent-binding-v1"
+                or curriculum_parent.get("parent_arm_id") != "n256"
+                or curriculum_parent.get("parent_subset_id") != "full-56k"
+                or curriculum_parent.get("generation_producer_sha256") != producer_sha
+                or not isinstance(parent_checkpoint, dict)
+                or set(parent_checkpoint) != {"path", "sha256"}
+                or parent_checkpoint.get("sha256") != init_sha
+            ):
+                raise PromotionError(
+                    "candidate training report init checkpoint differs from producer"
+                )
+            parent_path = _canonical_existing_file(
+                Path(str(parent_checkpoint["path"])),
+                where="curriculum parent checkpoint",
+            )
+            parent_receipt = _canonical_existing_file(
+                Path(str(curriculum_parent["receipt_path"])),
+                where="curriculum parent receipt",
+            )
+            if (
+                _sha256(parent_path) != init_sha
+                or _sha256(parent_receipt) != curriculum_parent.get("receipt_sha256")
+            ):
+                raise PromotionError("curriculum parent checkpoint/receipt bytes drifted")
     steps = report.get("steps_completed")
     epochs = report.get("epochs")
     if isinstance(steps, bool) or not isinstance(steps, int) or steps <= 0:
@@ -930,12 +975,18 @@ def _verify_one_dose_training_receipt(
     }
     receipt_schema = value.get("schema_version")
     is_retry = receipt_schema == one_dose.RETRY_RECEIPT_SCHEMA
+    is_upgrade = receipt_schema == one_dose.UPGRADE_RECEIPT_SCHEMA
     if is_retry:
         expected_keys |= {"claim_identity_sha256", "retry_contract"}
+    if "lineage_dose" in value:
+        expected_keys.add("lineage_dose")
+    if is_upgrade:
+        expected_keys |= {"claim_identity_sha256", "function_preserving_upgrade"}
     value = _require_exact_keys(value, expected_keys, where="one-dose training receipt")
     if receipt_schema not in {
         one_dose.RECEIPT_SCHEMA,
         one_dose.RETRY_RECEIPT_SCHEMA,
+        one_dose.UPGRADE_RECEIPT_SCHEMA,
     }:
         raise PromotionError(
             "one-dose receipt schema must be a supported direct or sealed-retry schema"
@@ -998,6 +1049,32 @@ def _verify_one_dose_training_receipt(
             != retry_contract.get("retry_identity_sha256")
         ):
             raise PromotionError("one-dose learner retry identity is invalid")
+    upgrade_value: dict[str, Any] | None = None
+    if is_upgrade:
+        raw_upgrade = value.get("function_preserving_upgrade")
+        if not isinstance(raw_upgrade, dict):
+            raise PromotionError("architecture-upgrade receipt lacks upgrade evidence")
+        receipt_ref = raw_upgrade.get("receipt")
+        if not isinstance(receipt_ref, dict) or set(receipt_ref) != {"path", "sha256"}:
+            raise PromotionError("architecture-upgrade receipt has malformed receipt ref")
+        try:
+            upgrade_value = one_dose.architecture_upgrade.verify_receipt(
+                Path(str(receipt_ref["path"]))
+            )
+        except one_dose.architecture_upgrade.UpgradeError as error:
+            raise PromotionError(f"architecture-upgrade receipt refused: {error}") from error
+        if upgrade_value != raw_upgrade:
+            raise PromotionError("training receipt architecture-upgrade evidence drifted")
+        expected_identity = _digest_value(
+            {
+                "schema_version": "a1-architecture-upgrade-training-identity-v1",
+                "contract_sha256": contract["contract_sha256"],
+                "upgrade_receipt_sha256": receipt_ref["sha256"],
+                "upgrade_receipt_digest": upgrade_value["receipt_sha256"],
+            }
+        )
+        if value.get("claim_identity_sha256") != expected_identity:
+            raise PromotionError("architecture-upgrade training identity drifted")
     gpu = value["gpu"]
     if (
         isinstance(gpu, bool)
@@ -1048,21 +1125,24 @@ def _verify_one_dose_training_receipt(
             "one-dose child environment differs from the exact allowlist"
         )
 
+    output_keys = {
+        "checkpoint",
+        "checkpoint_sha256",
+        "optimizer_sidecar",
+        "optimizer_sidecar_sha256",
+        "report",
+        "report_sha256",
+        "execution_binding_sha256",
+        "steps_completed",
+        "corpus_row_count",
+        "training_row_count",
+        "validation_row_count",
+    }
+    if isinstance(value.get("outputs"), dict) and "lineage_dose" in value["outputs"]:
+        output_keys |= {"lineage_dose", "sampled_rows"}
     outputs = _require_exact_keys(
         value["outputs"],
-        {
-            "checkpoint",
-            "checkpoint_sha256",
-            "optimizer_sidecar",
-            "optimizer_sidecar_sha256",
-            "report",
-            "report_sha256",
-            "execution_binding_sha256",
-            "steps_completed",
-            "corpus_row_count",
-            "training_row_count",
-            "validation_row_count",
-        },
+        output_keys,
         where="one-dose training receipt.outputs",
     )
     output_checkpoint = _absolute(outputs["checkpoint"], base=path.parent)
@@ -1122,6 +1202,23 @@ def _verify_one_dose_training_receipt(
         raise PromotionError(
             "candidate training report does not bind the one-dose command/environment"
         )
+    if is_upgrade:
+        try:
+            report_lineage = one_dose.lineage.validate_lineage_dose(
+                report.get("a1_lineage_dose")
+            )
+        except one_dose.lineage.LineageDoseError as error:
+            raise PromotionError(f"architecture-upgrade lineage refused: {error}") from error
+        if (
+            value.get("lineage_dose") != report_lineage
+            or outputs.get("lineage_dose") != report_lineage
+            or upgrade_value is None
+            or report_lineage.get("function_preserving_upgrade", {}).get(
+                "receipt_sha256"
+            )
+            != upgrade_value["receipt"]["sha256"]
+        ):
+            raise PromotionError("architecture-upgrade report/receipt lineage drifted")
     if value["learner_training_recipe_sha256"] != contract["science"].get(
         "learner_training_recipe_sha256"
     ):
@@ -1144,7 +1241,7 @@ def _verify_one_dose_training_receipt(
             claim_path,
             contract_sha256=contract["contract_sha256"],
             claim_identity_sha256=(
-                value["claim_identity_sha256"] if is_retry else None
+                value["claim_identity_sha256"] if (is_retry or is_upgrade) else None
             ),
         )
     except one_dose.ExecutorError as error:
@@ -1157,6 +1254,10 @@ def _verify_one_dose_training_receipt(
         or claim.get("execution_binding") != execution_binding
         or claim.get("outputs") != outputs
         or (is_retry and claim.get("retry_contract") != retry_reference)
+        or (
+            is_upgrade
+            and claim.get("function_preserving_upgrade") != upgrade_value
+        )
     ):
         raise PromotionError("one-dose receipt and durable claim disagree")
     return {
@@ -4227,9 +4328,17 @@ def _verify_adjudication(
         where="champion",
     )
     curriculum_parent = training_report_payload.get("a1_curriculum_parent")
+    lineage_value = training_report_payload.get("a1_lineage_dose")
+    function_upgrade = (
+        lineage_value.get("function_preserving_upgrade")
+        if isinstance(lineage_value, dict)
+        else None
+    )
     evaluation_parent_sha = (
         curriculum_parent.get("generation_producer_sha256")
         if isinstance(curriculum_parent, dict)
+        else function_upgrade.get("source_checkpoint_sha256")
+        if isinstance(function_upgrade, dict)
         else training_report_payload.get("init_checkpoint_sha256")
     )
     if evaluation_parent_sha != champion_ref["sha256"]:
@@ -4241,7 +4350,7 @@ def _verify_adjudication(
     # legitimately warm-start from an intermediate dose, while their sealed
     # generation producer remains the promotion parent checked above.
     init_path = training_report_payload.get("init_checkpoint")
-    if curriculum_parent is None and init_path is not None:
+    if curriculum_parent is None and function_upgrade is None and init_path is not None:
         if _absolute(init_path, base=training_path.parent) != champion_path:
             raise PromotionError(
                 "candidate training init path differs from adjudicated promotion baseline"

@@ -1,0 +1,301 @@
+#!/usr/bin/env python3
+"""Issue and replay immutable, promotion-eligible architecture-upgrade receipts.
+
+The normal A1 learner invariant is exact checkpoint identity: the learner must
+start from the declared producer bytes.  A function-preserving architecture
+upgrade necessarily changes those bytes by adding parameters, so it needs a
+stronger proof than a boolean or an in-checkpoint provenance claim.  This
+module provides that proof for a deliberately tiny allowlist of reviewed
+zero-output adapters.
+
+Receipts are content addressed, written once, and replay the source/upgraded
+checkpoint delta.  Adding another module requires code review here; arbitrary
+flags, parameter names, or merely-small forward differences are refused.
+"""
+
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import hashlib
+import json
+import os
+from pathlib import Path
+import sys
+import time
+from typing import Any, Mapping, Sequence
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+
+SCHEMA = "a1-function-preserving-architecture-upgrade-v1"
+MODULE_TARGET_GATHER = "entity_graph.action_target_gather.v1"
+
+# This is intentionally code, not caller-controlled configuration.  A new
+# architecture exception must be reviewed and tested before it can initialize
+# a promotion-eligible learner.
+ALLOWLIST: dict[str, dict[str, Any]] = {
+    MODULE_TARGET_GATHER: {
+        "flags": {"action_target_gather": True},
+        "new_parameter_initialization": {
+            "target_gather_proj.0.bias": "zeros",
+            "target_gather_proj.0.weight": "ones",
+            "target_gather_proj.1.bias": "zeros",
+            "target_gather_proj.1.weight": "zeros",
+        },
+        "config_delta": {"action_target_gather": True},
+    },
+}
+
+
+class UpgradeError(ValueError):
+    """The architecture delta is not an allowlisted exact function upgrade."""
+
+
+def _sha(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return "sha256:" + digest.hexdigest()
+
+
+def _digest(value: Any) -> str:
+    encoded = json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def _ref(path: Path) -> dict[str, str]:
+    if path.is_symlink() or not path.is_file():
+        raise UpgradeError(f"checkpoint must be a regular non-symlink file: {path}")
+    resolved = path.resolve(strict=True)
+    return {"path": str(resolved), "sha256": _sha(resolved)}
+
+
+def _load_checkpoint(path: Path) -> Mapping[str, Any]:
+    import torch
+
+    try:
+        raw = torch.load(path, map_location="cpu", weights_only=False)
+    except Exception as error:
+        raise UpgradeError(f"cannot load checkpoint {path}: {error}") from error
+    if not isinstance(raw, Mapping):
+        raise UpgradeError("checkpoint root is not a mapping")
+    return raw
+
+
+def _config(raw: Any) -> dict[str, Any]:
+    if dataclasses.is_dataclass(raw):
+        return {
+            field.name: getattr(raw, field.name)
+            for field in dataclasses.fields(raw)
+            if hasattr(raw, field.name)
+        }
+    if isinstance(raw, Mapping):
+        fields = raw.get("fields", raw)
+        if isinstance(fields, Mapping):
+            return dict(fields)
+    raise UpgradeError("checkpoint config cannot be normalized")
+
+
+def _equal(left: Any, right: Any) -> bool:
+    import numpy as np
+    import torch
+
+    if torch.is_tensor(left) or torch.is_tensor(right):
+        return torch.is_tensor(left) and torch.is_tensor(right) and torch.equal(left, right)
+    if isinstance(left, np.ndarray) or isinstance(right, np.ndarray):
+        return (
+            isinstance(left, np.ndarray)
+            and isinstance(right, np.ndarray)
+            and np.array_equal(left, right)
+        )
+    if isinstance(left, Mapping) or isinstance(right, Mapping):
+        return (
+            isinstance(left, Mapping)
+            and isinstance(right, Mapping)
+            and set(left) == set(right)
+            and all(_equal(left[key], right[key]) for key in left)
+        )
+    if isinstance(left, (list, tuple)) or isinstance(right, (list, tuple)):
+        return (
+            type(left) is type(right)
+            and len(left) == len(right)
+            and all(_equal(a, b) for a, b in zip(left, right))
+        )
+    return bool(left == right)
+
+
+def inspect_upgrade(
+    source: Path, upgraded: Path, *, module: str = MODULE_TARGET_GATHER
+) -> dict[str, Any]:
+    """Replay the checkpoint delta and return its typed semantic evidence."""
+    import torch
+
+    spec = ALLOWLIST.get(module)
+    if spec is None:
+        raise UpgradeError(f"architecture module is not allowlisted: {module!r}")
+    source_ref, upgraded_ref = _ref(source), _ref(upgraded)
+    before, after = _load_checkpoint(Path(source_ref["path"])), _load_checkpoint(
+        Path(upgraded_ref["path"])
+    )
+    provenance = after.get("upgrade_provenance")
+    seed = provenance.get("initialization_seed") if isinstance(provenance, Mapping) else None
+    if (
+        not isinstance(provenance, Mapping)
+        or provenance.get("schema_version") != "entity-graph-upgrade-v1"
+        or provenance.get("source_checkpoint_sha256")
+        != source_ref["sha256"].removeprefix("sha256:")
+        or provenance.get("flags") != spec["flags"]
+        or isinstance(seed, bool)
+        or not isinstance(seed, int)
+        or seed < 0
+        or provenance.get("forward_max_diff") != 0.0
+        or provenance.get("forward_identical_at_init") is not True
+        or provenance.get("trained_value_readouts_added") != []
+    ):
+        raise UpgradeError("checkpoint upgrade provenance is not exact and zero-diff")
+
+    before_model, after_model = before.get("model"), after.get("model")
+    if not isinstance(before_model, Mapping) or not isinstance(after_model, Mapping):
+        raise UpgradeError("checkpoint model state is malformed")
+    added = sorted(set(after_model) - set(before_model))
+    removed = sorted(set(before_model) - set(after_model))
+    expected_added = sorted(spec["new_parameter_initialization"])
+    if removed or added != expected_added:
+        raise UpgradeError(f"parameter key delta is not allowlisted: added={added} removed={removed}")
+    changed = [name for name in before_model if not torch.equal(before_model[name], after_model[name])]
+    if changed:
+        raise UpgradeError(f"shared checkpoint parameters changed: {changed[:8]}")
+    for name, kind in spec["new_parameter_initialization"].items():
+        tensor = after_model[name]
+        expected = torch.ones_like(tensor) if kind == "ones" else torch.zeros_like(tensor)
+        if not torch.equal(tensor, expected):
+            raise UpgradeError(f"new parameter is not deterministic {kind}: {name}")
+
+    before_config, after_config = _config(before.get("config")), _config(after.get("config"))
+    expected_config = dict(before_config)
+    expected_config.update(spec["config_delta"])
+    # Old checkpoints omit default-valued fields while the upgrade utility may
+    # serialize a complete config.  Compare effective current configs.
+    from catan_zero.rl.entity_token_policy import EntityGraphConfig
+
+    known = {field.name for field in dataclasses.fields(EntityGraphConfig)}
+    effective_before = dataclasses.asdict(
+        EntityGraphConfig(**{key: value for key, value in before_config.items() if key in known})
+    )
+    effective_expected = dataclasses.asdict(
+        EntityGraphConfig(**{key: value for key, value in expected_config.items() if key in known})
+    )
+    effective_after = dataclasses.asdict(
+        EntityGraphConfig(**{key: value for key, value in after_config.items() if key in known})
+    )
+    if effective_after != effective_expected:
+        raise UpgradeError("effective checkpoint config delta is not allowlisted")
+
+    ignored = {"model", "config", "upgrade_provenance"}
+    drift = [
+        key
+        for key in before
+        if key not in ignored and (key not in after or not _equal(before[key], after[key]))
+    ]
+    if drift:
+        raise UpgradeError(f"checkpoint metadata/provenance changed: {drift}")
+    return {
+        "module": module,
+        "source": source_ref,
+        "upgraded_initializer": upgraded_ref,
+        "flags": dict(spec["flags"]),
+        "initialization_seed": seed,
+        "forward_max_diff": 0.0,
+        "forward_identical_at_init": True,
+        "shared_parameters_bit_identical": True,
+        "shared_parameter_count": len(before_model),
+        "new_parameters": added,
+        "new_parameter_initialization": dict(spec["new_parameter_initialization"]),
+        "effective_source_config_sha256": _digest(effective_before),
+        "effective_upgraded_config_sha256": _digest(effective_after),
+    }
+
+
+def issue_receipt(
+    source: Path,
+    upgraded: Path,
+    output: Path,
+    *,
+    module: str = MODULE_TARGET_GATHER,
+) -> dict[str, Any]:
+    evidence = inspect_upgrade(source, upgraded, module=module)
+    payload = {"schema_version": SCHEMA, **evidence}
+    payload["receipt_sha256"] = _digest(payload)
+    output = output.expanduser().resolve(strict=False)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    data = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    tmp = output.with_name(f".{output.name}.tmp.{os.getpid()}.{time.time_ns()}")
+    try:
+        with tmp.open("xb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.link(tmp, output)
+    except FileExistsError as error:
+        raise UpgradeError(f"refusing to overwrite architecture upgrade receipt: {output}") from error
+    finally:
+        tmp.unlink(missing_ok=True)
+    return payload
+
+
+def verify_receipt(path: Path) -> dict[str, Any]:
+    path = path.expanduser().resolve(strict=True)
+    if path.is_symlink() or not path.is_file():
+        raise UpgradeError("architecture upgrade receipt must be a regular file")
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise UpgradeError(f"cannot decode architecture upgrade receipt: {error}") from error
+    if not isinstance(value, dict) or value.get("schema_version") != SCHEMA:
+        raise UpgradeError("architecture upgrade receipt schema drift")
+    stated = value.get("receipt_sha256")
+    unhashed = dict(value)
+    unhashed.pop("receipt_sha256", None)
+    if stated != _digest(unhashed):
+        raise UpgradeError("architecture upgrade receipt digest drift")
+    expected = inspect_upgrade(
+        Path(str(value.get("source", {}).get("path", ""))),
+        Path(str(value.get("upgraded_initializer", {}).get("path", ""))),
+        module=str(value.get("module", "")),
+    )
+    if unhashed != {"schema_version": SCHEMA, **expected}:
+        raise UpgradeError("architecture upgrade receipt does not replay exactly")
+    return {
+        **value,
+        "receipt": {"path": str(path), "sha256": _sha(path)},
+    }
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--source", required=True, type=Path)
+    parser.add_argument("--upgraded", required=True, type=Path)
+    parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--module", default=MODULE_TARGET_GATHER, choices=tuple(ALLOWLIST))
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        payload = issue_receipt(args.source, args.upgraded, args.output, module=args.module)
+    except UpgradeError as error:
+        raise SystemExit(f"REFUSED: {error}") from error
+    print(json.dumps(payload, indent=2, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

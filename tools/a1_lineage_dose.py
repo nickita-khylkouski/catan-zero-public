@@ -72,14 +72,55 @@ def validate_lineage_dose(value: Any) -> dict[str, Any]:
         raw = value.get(field)
         if not isinstance(raw, str) or not raw.startswith("sha256:") or len(raw) != 71:
             raise LineageDoseError(f"{field} is not a typed SHA-256")
+    upgrade = value.get("function_preserving_upgrade")
+    if mode == "typed_curriculum":
+        if upgrade is not None:
+            raise LineageDoseError(
+                "curriculum lineage cannot also claim an architecture upgrade"
+            )
+    elif value["init_checkpoint_sha256"] == value["declared_producer_sha256"]:
+        if upgrade is not None:
+            raise LineageDoseError(
+                "function-preserving upgrade is forbidden for an exact-parent init"
+            )
+    else:
+        if (
+            not isinstance(upgrade, Mapping)
+            or set(upgrade) != {
+                "schema_version",
+                "module",
+                "receipt",
+                "receipt_sha256",
+                "source_checkpoint_sha256",
+                "upgraded_initializer_sha256",
+            }
+            or upgrade.get("schema_version")
+            != "a1-lineage-function-preserving-upgrade-v1"
+            or upgrade.get("source_checkpoint_sha256")
+            != value["declared_producer_sha256"]
+            or upgrade.get("upgraded_initializer_sha256")
+            != value["init_checkpoint_sha256"]
+            or not isinstance(upgrade.get("module"), str)
+            or not upgrade["module"]
+        ):
+            raise LineageDoseError(
+                "non-parent init requires an exact typed function-preserving upgrade"
+            )
+        for field in ("receipt_sha256",):
+            raw = upgrade.get(field)
+            if not isinstance(raw, str) or not raw.startswith("sha256:") or len(raw) != 71:
+                raise LineageDoseError(f"upgrade {field} is not a typed SHA-256")
+        if not isinstance(upgrade.get("receipt"), str) or not upgrade["receipt"]:
+            raise LineageDoseError("upgrade receipt path is missing")
     return dict(value)
 
 
 def direct_lineage_dose(
     *, declared_producer_sha256: str, init_checkpoint_sha256: str,
     current_sampled_rows: int, current_optimizer_steps: int,
+    function_preserving_upgrade: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    if init_checkpoint_sha256 != declared_producer_sha256:
+    if init_checkpoint_sha256 != declared_producer_sha256 and function_preserving_upgrade is None:
         raise LineageDoseError(
             "untyped checkpoint chaining: init SHA differs from declared producer SHA"
         )
@@ -88,6 +129,9 @@ def direct_lineage_dose(
         "mode": "direct_from_declared_producer",
         "declared_producer_sha256": declared_producer_sha256,
         "init_checkpoint_sha256": init_checkpoint_sha256,
+        "function_preserving_upgrade": (
+            None if function_preserving_upgrade is None else dict(function_preserving_upgrade)
+        ),
         "parent_receipt_sha256": None,
         "optimizer_state_continuity": "fresh_optimizer_per_dose",
         "objective_exposure": {

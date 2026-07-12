@@ -40,6 +40,7 @@ if str(_TOOLS_DIR) not in sys.path:
 from tools import a1_pre_wave_contract as a1_contract  # noqa: E402
 from tools import train_bc  # noqa: E402
 from tools import a1_lineage_dose as lineage  # noqa: E402
+from tools import a1_function_preserving_upgrade as architecture_upgrade  # noqa: E402
 
 
 RECEIPT_SCHEMA = "a1-one-dose-training-receipt-v3"
@@ -54,6 +55,8 @@ RETRY_IDENTITY_SCHEMA = "a1-one-dose-learner-retry-identity-v1"
 RETRY_REPAIR_KIND = "entity_graph_graph_layers_default_4_to_checkpoint_6"
 ABLATION_RECEIPT_SCHEMA = "a1-learner-ablation-training-receipt-v1"
 ABLATION_CLAIM_SCHEMA = "a1-learner-ablation-training-claim-v1"
+UPGRADE_RECEIPT_SCHEMA = "a1-architecture-upgrade-training-receipt-v1"
+UPGRADE_CLAIM_SCHEMA = "a1-architecture-upgrade-training-claim-v1"
 CLAIM_DIRECTORY = ".a1-one-dose-training-claims"
 MIN_NOFILE = 65_536
 MAX_IDLE_GPU_MEMORY_MIB = 64
@@ -822,7 +825,7 @@ def build_train_command(
     """Render every effective learner field bound by the sealed recipe."""
 
     recipe = verified["recipe"]
-    producer = verified["producer"]
+    initializer = verified.get("architecture_initializer", verified["producer"])
     trainer_path = _REPO_ROOT / "tools" / "train_bc.py"
     if verified.get("learner_ablation") is None:
         candidates = [
@@ -957,7 +960,7 @@ def build_train_command(
             "--validation-game-seed-manifest",
             str(verified["validation_path"]),
             "--init-checkpoint",
-            str(producer["path"]),
+            str(initializer["path"]),
             "--checkpoint",
             str(checkpoint),
             "--report",
@@ -999,6 +1002,51 @@ def build_train_command(
             ]
         )
     return command
+
+
+def bind_function_preserving_upgrade(
+    verified: dict[str, Any], receipt_path: Path
+) -> dict[str, Any]:
+    """Select a non-byte-identical initializer only after replaying its receipt."""
+
+    if verified.get("learner_ablation") is not None:
+        raise ExecutorError(
+            "promotion-eligible architecture upgrades cannot be learner ablations"
+        )
+    try:
+        upgrade = architecture_upgrade.verify_receipt(receipt_path)
+    except architecture_upgrade.UpgradeError as error:
+        raise ExecutorError(f"architecture upgrade receipt refused: {error}") from error
+    if upgrade["source"]["sha256"] != verified["producer"]["sha256"]:
+        raise ExecutorError(
+            "architecture upgrade source differs from sealed producer checkpoint"
+        )
+    if Path(upgrade["source"]["path"]) != Path(verified["producer"]["path"]):
+        raise ExecutorError(
+            "architecture upgrade source path differs from sealed producer checkpoint"
+        )
+    receipt = upgrade["receipt"]
+    lineage_binding = {
+        "schema_version": "a1-lineage-function-preserving-upgrade-v1",
+        "module": upgrade["module"],
+        "receipt": receipt["path"],
+        "receipt_sha256": receipt["sha256"],
+        "source_checkpoint_sha256": upgrade["source"]["sha256"],
+        "upgraded_initializer_sha256": upgrade["upgraded_initializer"]["sha256"],
+    }
+    result = dict(verified)
+    result["architecture_initializer"] = dict(upgrade["upgraded_initializer"])
+    result["function_preserving_upgrade"] = upgrade
+    result["function_preserving_upgrade_lineage"] = lineage_binding
+    result["claim_identity_sha256"] = _value_sha256(
+        {
+            "schema_version": "a1-architecture-upgrade-training-identity-v1",
+            "contract_sha256": verified["contract_sha256"],
+            "upgrade_receipt_sha256": receipt["sha256"],
+            "upgrade_receipt_digest": upgrade["receipt_sha256"],
+        }
+    )
+    return result
 
 
 def _active_mps_processes(proc_root: Path = Path("/proc")) -> list[str]:
@@ -1237,7 +1285,7 @@ def _load_claim_state(
     if stated_digest != _value_sha256(unhashed):
         raise ExecutorError(f"A1 contract claim digest is invalid: {claim}")
     expected_schemas = (
-        {RETRY_CLAIM_SCHEMA, ABLATION_CLAIM_SCHEMA}
+        {RETRY_CLAIM_SCHEMA, ABLATION_CLAIM_SCHEMA, UPGRADE_CLAIM_SCHEMA}
         if claim_identity_sha256 is not None
         and claim_identity_sha256 != contract_sha256
         else {CLAIM_SCHEMA}
@@ -1739,7 +1787,12 @@ def _direct_lineage_dose(verified: dict[str, Any]) -> dict[str, Any]:
     try:
         return lineage.direct_lineage_dose(
             declared_producer_sha256=verified["producer"]["sha256"],
-            init_checkpoint_sha256=verified["producer"]["sha256"],
+            init_checkpoint_sha256=verified.get(
+                "architecture_initializer", verified["producer"]
+            )["sha256"],
+            function_preserving_upgrade=verified.get(
+                "function_preserving_upgrade_lineage"
+            ),
             current_sampled_rows=int(verified["training_row_count"]),
             current_optimizer_steps=steps,
         )
@@ -1846,8 +1899,12 @@ def _verify_training_outputs(
         "track": recipe["track"],
         "vps_to_win": int(recipe["vps_to_win"]),
         "checkpoint": str(checkpoint),
-        "init_checkpoint": str(verified["producer"]["path"]),
-        "init_checkpoint_sha256": verified["producer"]["sha256"],
+        "init_checkpoint": str(
+            verified.get("architecture_initializer", verified["producer"])["path"]
+        ),
+        "init_checkpoint_sha256": verified.get(
+            "architecture_initializer", verified["producer"]
+        )["sha256"],
         "a1_lineage_dose": lineage_dose,
         "input_validation_game_seed_manifest": str(verified["validation_path"]),
         "input_validation_game_seed_manifest_sha256": verified[
@@ -2019,6 +2076,7 @@ def _execute_locked(
     )
     is_retry = "retry_contract" in verified
     is_ablation = verified.get("learner_ablation") is not None
+    is_upgrade = verified.get("function_preserving_upgrade") is not None
     retry_reference = (
         {
             "path": str(verified["retry_contract_path"]),
@@ -2036,6 +2094,8 @@ def _execute_locked(
             if is_retry
             else ABLATION_CLAIM_SCHEMA
             if is_ablation
+            else UPGRADE_CLAIM_SCHEMA
+            if is_upgrade
             else CLAIM_SCHEMA
         ),
         "status": "claimed",
@@ -2044,7 +2104,7 @@ def _execute_locked(
         "execution_binding": execution_binding,
         "started_unix_ns": started_ns,
     }
-    if is_retry or is_ablation:
+    if is_retry or is_ablation or is_upgrade:
         claim_payload["claim_identity_sha256"] = claim_identity
     if is_retry:
         claim_payload.update(
@@ -2093,6 +2153,8 @@ def _execute_locked(
             if is_retry
             else ABLATION_RECEIPT_SCHEMA
             if is_ablation
+            else UPGRADE_RECEIPT_SCHEMA
+            if is_upgrade
             else RECEIPT_SCHEMA
         ),
         "status": status,
@@ -2142,12 +2204,19 @@ def _execute_locked(
                 "promotion_eligible": False,
             }
         )
+    if is_upgrade:
+        evidence_payload["claim_identity_sha256"] = claim_identity
+        evidence_payload["function_preserving_upgrade"] = verified[
+            "function_preserving_upgrade"
+        ]
     terminal_claim_payload = dict(evidence_payload)
     terminal_claim_payload["schema_version"] = (
         RETRY_CLAIM_SCHEMA
         if is_retry
         else ABLATION_CLAIM_SCHEMA
         if is_ablation
+        else UPGRADE_CLAIM_SCHEMA
+        if is_upgrade
         else CLAIM_SCHEMA
     )
     terminal_claim_payload["receipt_target"] = str(receipt)
@@ -2203,6 +2272,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--report", required=True, type=Path)
     parser.add_argument("--receipt", required=True, type=Path)
     parser.add_argument("--python", type=Path, default=Path(sys.executable))
+    parser.add_argument(
+        "--architecture-upgrade-receipt",
+        type=Path,
+        default=None,
+        help=(
+            "immutable allowlisted zero-diff initializer receipt; exact producer "
+            "bytes remain the default"
+        ),
+    )
     parser.add_argument("--gpu", type=int, default=0, help="one physical B200 index")
     parser.add_argument(
         "--ablation-id",
@@ -2276,6 +2354,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 overrides_json=args.recipe_overrides_json,
                 reviewed_code_tree_sha256=args.ablation_code_tree_sha256,
             )
+        if args.architecture_upgrade_receipt is not None:
+            verified = bind_function_preserving_upgrade(
+                verified, args.architecture_upgrade_receipt
+            )
         checkpoint = args.checkpoint.expanduser().resolve(strict=False)
         report = args.report.expanduser().resolve(strict=False)
         receipt = args.receipt.expanduser().resolve(strict=False)
@@ -2328,6 +2410,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             "checkpoint": str(checkpoint),
             "report": str(report),
             "receipt": str(receipt),
+            "function_preserving_upgrade": verified.get(
+                "function_preserving_upgrade"
+            ),
         }
         if verified.get("learner_ablation") is not None:
             plan.update(
