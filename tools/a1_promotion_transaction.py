@@ -2010,6 +2010,7 @@ def _verify_role_search_config(
     actual = dict(raw)
     runtime_keys = {"native_mcts_hot_loop", "mcts_implementation"}
     present_runtime = runtime_keys & set(actual)
+    native_runtime_bound = False
     if present_runtime:
         if present_runtime != runtime_keys:
             raise PromotionError(f"{where} has an incomplete native MCTS runtime binding")
@@ -2018,6 +2019,20 @@ def _verify_role_search_config(
             or actual.pop("mcts_implementation") != "rust_native_hot_loop_v1"
         ):
             raise PromotionError(f"{where} has an unsupported native MCTS runtime binding")
+        native_runtime_bound = True
+    if (
+        actual.get("evaluator_rust_featurize") is True
+        and expected_search_config.get("evaluator_rust_featurize") is False
+    ):
+        if not native_runtime_bound:
+            raise PromotionError(
+                f"{where} sealed A1 semantic drift: Rust featurization lacks "
+                "the sealed native runtime binding"
+            )
+        # The Rust feature path is parity-gated execution machinery.  Keep the
+        # deployed agent identity at the contract's semantic value while the
+        # report and engine identity retain proof of the accelerated runtime.
+        actual["evaluator_rust_featurize"] = False
     actual = _require_exact_keys(actual, set(expected_search_config), where=where)
     _require_sealed_semantics(actual, expected_search_config, where=where)
     return actual

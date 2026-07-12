@@ -2889,9 +2889,10 @@ def test_contract_value_readout_rejects_ambiguous_or_missing_binding() -> None:
 
 
 def test_role_search_config_accepts_only_complete_native_runtime_binding() -> None:
-    expected = {"n_full": 128, "c_scale": 0.1}
+    expected = {"n_full": 128, "c_scale": 0.1, "evaluator_rust_featurize": False}
     raw = {
         **expected,
+        "evaluator_rust_featurize": True,
         "native_mcts_hot_loop": True,
         "mcts_implementation": "rust_native_hot_loop_v1",
     }
@@ -2901,6 +2902,7 @@ def test_role_search_config_accepts_only_complete_native_runtime_binding() -> No
 
     for drifted in (
         {**expected, "native_mcts_hot_loop": True},
+        {**expected, "evaluator_rust_featurize": True},
         {
             **expected,
             "native_mcts_hot_loop": False,
@@ -2912,7 +2914,10 @@ def test_role_search_config_accepts_only_complete_native_runtime_binding() -> No
             "mcts_implementation": "python",
         },
     ):
-        with pytest.raises(promotion.PromotionError, match="native MCTS runtime binding"):
+        with pytest.raises(
+            promotion.PromotionError,
+            match="native MCTS runtime binding|sealed A1 semantic drift",
+        ):
             promotion._verify_role_search_config(
                 drifted, expected_search_config=expected, where="panel"
             )
