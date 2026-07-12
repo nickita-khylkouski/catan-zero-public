@@ -519,10 +519,30 @@ def _write_outputs(
             "a1_contract_sha256": verified["contract_sha256"],
             "a1_selected_game_seed_set_sha256": verified["selected_game_seed_set_sha256"],
             "a1_training_game_seed_set_sha256": verified["training_game_seed_set_sha256"],
-            "a1_learner_training_recipe_sha256": dual._digest(verified["recipe"]),  # noqa: SLF001
+            "a1_learner_training_recipe_sha256": dual._digest(verified["bound_recipe"]),  # noqa: SLF001
             "a1_memmap_payload_inventory_sha256": verified["payload_inventory_sha256"],
         },
     }
+    if verified["recipe"] != verified["bound_recipe"]:
+        payload.update({
+            "a1_effective_learner_training_recipe": verified["recipe"],
+            "a1_effective_learner_training_recipe_sha256": dual._digest(verified["recipe"]),  # noqa: SLF001
+            "a1_learner_topology_authorization": {
+                "schema_version": "a1-dual-learner-topology-authorization-v1",
+                "learner_lock": verified["learner_lock"]["path"],
+                "learner_lock_file_sha256": verified["reviewed_lock_file_sha256"],
+                "topology": verified["topology"],
+                "effective_recipe": verified["recipe"],
+                "effective_recipe_sha256": dual._digest(verified["recipe"]),  # noqa: SLF001
+            },
+        })
+    if verified.get("learner_ablation") is not None:
+        payload.update({
+            "a1_learner_ablation": verified["learner_ablation"],
+            "diagnostic_only": True,
+            "promotion_eligible": False,
+        })
+        payload["value_training"]["learner_ablation"] = verified["learner_ablation"]
     report.write_text(json.dumps(payload))
     return checkpoint, report
 
@@ -544,6 +564,20 @@ def test_output_verifier_accepts_exact_ddp_and_rejects_world_size_drift(
         dual.verify_outputs(
             verified=verified, checkpoint=checkpoint, report=report, binding=binding
         )
+
+
+def test_output_verifier_accepts_separately_bound_effective_ablation(
+    tmp_path: Path,
+) -> None:
+    verified = _bind_corrective_ablation(_verified(tmp_path))
+    binding = dual._execution_binding(["train"], verified)  # noqa: SLF001
+    checkpoint, report = _write_outputs(tmp_path, verified, binding)
+
+    outputs = dual.verify_outputs(
+        verified=verified, checkpoint=checkpoint, report=report, binding=binding
+    )
+
+    assert outputs["steps_completed"] == 3
 
 
 def test_promotion_receipt_verifier_accepts_dual_transaction(

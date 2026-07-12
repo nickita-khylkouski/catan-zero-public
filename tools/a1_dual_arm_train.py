@@ -662,7 +662,10 @@ def verify_outputs(
         "input_validation_game_seed_manifest_sha256": verified["validation"]["sha256"],
         "a1_bound_learner_training_recipe": verified["bound_recipe"],
         "a1_bound_learner_value_objective": verified["objective"],
-        "a1_learner_training_recipe_sha256": _digest(recipe),
+        # train_bc preserves this legacy field as the immutable corpus-bound
+        # recipe digest. Diagnostic overrides are authenticated separately by
+        # the effective-recipe and learner-ablation fields below.
+        "a1_learner_training_recipe_sha256": _digest(verified["bound_recipe"]),
         "a1_learner_code_sha256": verified["learner_code_sha256"],
         "a1_runtime_code_tree_sha256": verified["runtime_code_tree_sha256"],
         "a1_memmap_payload_inventory_sha256": verified[
@@ -744,7 +747,7 @@ def verify_outputs(
         or value_training.get("a1_training_game_seed_set_sha256")
         != verified["training_game_seed_set_sha256"]
         or value_training.get("a1_learner_training_recipe_sha256")
-        != _digest(recipe)
+        != _digest(verified["bound_recipe"])
         or value_training.get("a1_memmap_payload_inventory_sha256")
         != verified["payload_inventory_sha256"]
         or (
