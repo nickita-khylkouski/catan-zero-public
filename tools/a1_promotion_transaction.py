@@ -547,8 +547,68 @@ def _verify_training_report(
     candidate_path: Path,
     candidate_sha256: str,
     production_l1_completion: bool = False,
+    production_target_gather_completion: bool = False,
 ) -> dict[str, Any]:
     report = _load_json(path)
+    if production_l1_completion and production_target_gather_completion:
+        raise PromotionError("training report cannot use two production schemas")
+    if production_target_gather_completion:
+        recipe = contract.get("science", {}).get("learner_training_recipe")
+        if not isinstance(recipe, dict):
+            recipe = {"symmetry_augment": False}
+        _verify_symmetry_training_provenance(
+            report, recipe, where="production target-gather report"
+        )
+        required = {
+            "arch": "entity_graph",
+            "mask_hidden_info": True,
+            "track": "2p_no_trade",
+            "vps_to_win": 10,
+            "world_size": 4,
+            "batch_size": 512,
+            "effective_global_batch_size": 2048,
+            "epochs": 1,
+            "max_steps": 2048,
+            "steps_completed": 2048,
+            "training_row_draws": 4_194_304,
+            "optimizer": "adam",
+            "resume_optimizer": False,
+            "optimizer_restored": False,
+            "soft_target_weight": 0.9,
+            "value_loss_weight": 0.25,
+            "loser_sample_weight": 1.0,
+            "policy_aux_active_batch_size": 0,
+            "action_module_lr_mult": 4.0,
+            "value_lr_mult": 1.0,
+            "freeze_modules": "trunk,action_encoder,policy_head,value_heads",
+            "require_only_trainable_prefixes": "target_gather_proj",
+            "action_target_gather": True,
+            "ddp_find_unused_parameters": True,
+            "ddp_shard_data": False,
+            "value_target_lambda": 1.0,
+            "forced_action_weight": 0.0,
+            "forced_row_value_weight": 1.0,
+            "winner_sample_weight": 1.0,
+            "lr_schedule": "flat",
+            "lr_warmup_steps": 100,
+            "weight_decay": 0.0,
+            "seed": 1,
+            "max_grad_norm": 1.0,
+            "gradient_clipping_enabled": True,
+        }
+        for key, expected in required.items():
+            if report.get(key) != expected:
+                raise PromotionError(
+                    f"production target-gather report drift at {key}: "
+                    f"{report.get(key)!r} != {expected!r}"
+                )
+        report_checkpoint = _absolute(report.get("checkpoint"), base=path.parent)
+        if (
+            report_checkpoint != candidate_path
+            or _sha256(report_checkpoint) != candidate_sha256
+        ):
+            raise PromotionError("production target-gather report candidate bytes drifted")
+        return report
     if production_l1_completion:
         recipe = contract.get("science", {}).get("learner_training_recipe")
         if not isinstance(recipe, dict):
@@ -805,6 +865,15 @@ def _verify_one_dose_training_receipt(
     raw_schema = _load_json(path).get("schema_version")
     if raw_schema == "a1-production-l1-rerun-completion-v1":
         return _verify_production_l1_completion_receipt(
+            path,
+            contract=contract,
+            candidate_path=candidate_path,
+            candidate_sha256=candidate_sha256,
+            training_report_path=training_report_path,
+            training_report_sha256=training_report_sha256,
+        )
+    if raw_schema == "a1-production-target-gather-retrain-completion-v1":
+        return _verify_production_target_gather_completion_receipt(
             path,
             contract=contract,
             candidate_path=candidate_path,
@@ -1430,6 +1499,306 @@ def _verify_production_l1_completion_receipt(
         "claim": str(claim_path),
         "claim_state_sha256": claim_digest,
         "execution_binding_sha256": _digest_value(execution_binding),
+    }
+
+
+def _verify_architecture_retrain_tensor_invariant(
+    *, source: Path, candidate: Path, upgrade: dict[str, Any]
+) -> None:
+    """Prove an adapter-only retrain did not mutate inherited model tensors."""
+    try:
+        import torch
+
+        source_raw = torch.load(source, map_location="cpu", weights_only=False)
+        candidate_raw = torch.load(candidate, map_location="cpu", weights_only=False)
+    except Exception as error:
+        raise PromotionError(
+            f"cannot replay architecture-retrain checkpoint tensors: {error}"
+        ) from error
+    source_model = source_raw.get("model") if isinstance(source_raw, dict) else None
+    candidate_model = (
+        candidate_raw.get("model") if isinstance(candidate_raw, dict) else None
+    )
+    if not isinstance(source_model, dict) or not isinstance(candidate_model, dict):
+        raise PromotionError("architecture-retrain checkpoint model state is malformed")
+    added = upgrade.get("new_parameters")
+    if not isinstance(added, list) or not all(isinstance(key, str) for key in added):
+        raise PromotionError("architecture-upgrade new-parameter evidence is malformed")
+    expected_keys = set(source_model) | set(added)
+    if set(candidate_model) != expected_keys or set(source_model) & set(added):
+        raise PromotionError("architecture-retrain candidate parameter keys drifted")
+    changed = [
+        key
+        for key, source_tensor in source_model.items()
+        if not torch.equal(source_tensor, candidate_model[key])
+    ]
+    if changed:
+        raise PromotionError(
+            "architecture-retrain inherited shared tensors changed: "
+            f"{changed[:8]}"
+        )
+
+
+def _verify_production_target_gather_completion_receipt(
+    path: Path,
+    *,
+    contract: dict[str, Any],
+    candidate_path: Path,
+    candidate_sha256: str,
+    training_report_path: Path,
+    training_report_sha256: str,
+) -> dict[str, Any]:
+    """Replay the sealed four-rank, adapter-only production retrain."""
+    from tools import a1_production_gather_retrain as gather
+
+    value = _require_exact_keys(
+        _load_json(path),
+        {
+            "schema_version", "diagnostic_only", "production_eligible",
+            "created_at_unix_ns", "manifest", "submission", "checkpoint",
+            "report", "operator_sha256", "progress", "optimizer",
+            "model_delta", "unit_state", "receipt_sha256",
+        },
+        where="production target-gather completion receipt",
+    )
+    unhashed = dict(value)
+    stated = unhashed.pop("receipt_sha256")
+    if stated != _digest_value(unhashed):
+        raise PromotionError("production target-gather completion digest mismatch")
+    if (
+        value["schema_version"] != gather.COMPLETION_SCHEMA
+        or value["diagnostic_only"] is not False
+        or value["production_eligible"] is not True
+        or value["unit_state"]
+        != {"ActiveState": "inactive", "Result": "success", "ExecMainStatus": "0"}
+    ):
+        raise PromotionError("production target-gather completion is not eligible")
+
+    manifest_path, manifest_ref = _validate_file_ref(
+        value["manifest"], base=path.parent,
+        where="production target-gather manifest",
+    )
+    try:
+        verified = gather.verify(manifest_path)
+    except (gather.GatherRetrainError, OSError, KeyError, ValueError) as error:
+        raise PromotionError(
+            f"production target-gather manifest replay refused: {error}"
+        ) from error
+    manifest = verified["manifest"]
+    if verified["manifest_ref"] != manifest_ref:
+        raise PromotionError("production target-gather manifest reference drifted")
+    operator = manifest.get("operator")
+    exact_operator = {
+        "world_size": 4,
+        "per_rank_batch_size": 512,
+        "optimizer_steps": 2048,
+        "global_base_draws": 4_194_304,
+        "current_fraction": 0.8,
+        "current_n128_fraction": 5.0 / 7.0,
+        "current_n256_fraction": 2.0 / 7.0,
+        "exact_predecessor_replay_fraction": 0.2,
+        "soft_target_weight": 0.9,
+        "value_loss_weight": 0.25,
+        "loser_sample_weight": 1.0,
+        "action_module_lr_mult": 4.0,
+        "freeze_modules": ["trunk", "action_encoder", "policy_head", "value_heads"],
+        "required_trainable_prefixes": ["target_gather_proj"],
+        "fresh_optimizer": True,
+        "ddp_find_unused_parameters": True,
+    }
+    if (
+        operator != exact_operator
+        or value["operator_sha256"] != manifest.get("operator_sha256")
+        or value["operator_sha256"] != _digest_value(exact_operator)
+    ):
+        raise PromotionError("production target-gather operator drifted")
+
+    checkpoint_path, checkpoint_ref = _validate_file_ref(
+        value["checkpoint"], base=path.parent,
+        where="production target-gather checkpoint",
+    )
+    report_path, report_ref = _validate_file_ref(
+        value["report"], base=path.parent,
+        where="production target-gather report",
+    )
+    progress_path, progress_ref = _validate_file_ref(
+        value["progress"], base=path.parent,
+        where="production target-gather progress",
+    )
+    optimizer_path, optimizer_ref = _validate_file_ref(
+        value["optimizer"], base=path.parent,
+        where="production target-gather optimizer",
+    )
+    if (
+        checkpoint_path != candidate_path
+        or checkpoint_ref["sha256"] != candidate_sha256
+        or report_path != training_report_path
+        or report_ref["sha256"] != training_report_sha256
+    ):
+        raise PromotionError(
+            "production target-gather completion outputs differ from adjudication"
+        )
+
+    submission_path, submission_ref = _validate_file_ref(
+        value["submission"], base=path.parent,
+        where="production target-gather submission",
+    )
+    submission = _require_exact_keys(
+        _load_json(submission_path),
+        {
+            "schema_version", "diagnostic_only", "production_eligible",
+            "created_at_unix_ns", "manifest", "claim", "unit",
+            "command_sha256", "systemd_command_sha256", "systemd_stdout",
+            "execution_binding", "execution_binding_sha256",
+            "receipt_sha256",
+        },
+        where="production target-gather submission receipt",
+    )
+    submission_unhashed = dict(submission)
+    submission_digest = submission_unhashed.pop("receipt_sha256")
+    if (
+        submission["schema_version"] != gather.SUBMISSION_SCHEMA
+        or submission["diagnostic_only"] is not False
+        or submission["production_eligible"] is not True
+        or submission["manifest"] != manifest_ref
+        or submission["command_sha256"] != manifest.get("command_sha256")
+        or submission["systemd_command_sha256"]
+        != _digest_value(gather._systemd_command(verified, submission["unit"]))  # noqa: SLF001
+        or submission["execution_binding"]
+        != gather._execution_binding(verified)  # noqa: SLF001
+        or submission["execution_binding_sha256"]
+        != _digest_value(gather._execution_binding(verified))  # noqa: SLF001
+        or submission_digest != _digest_value(submission_unhashed)
+    ):
+        raise PromotionError("production target-gather submission drifted")
+    claim_path, claim_ref = _validate_file_ref(
+        submission["claim"], base=submission_path.parent,
+        where="production target-gather claim",
+    )
+    claim = _require_exact_keys(
+        _load_json(claim_path),
+        {"schema_version", "created_at_unix_ns", "manifest", "unit", "claim_sha256"},
+        where="production target-gather claim",
+    )
+    claim_unhashed = dict(claim)
+    claim_digest = claim_unhashed.pop("claim_sha256")
+    if (
+        claim["schema_version"] != gather.CLAIM_SCHEMA
+        or claim["manifest"] != manifest_ref
+        or claim["unit"] != submission["unit"]
+        or claim_digest != _digest_value(claim_unhashed)
+    ):
+        raise PromotionError("production target-gather claim drifted")
+
+    progress = _load_json(progress_path)
+    progress_unhashed = dict(progress)
+    progress_digest = progress_unhashed.pop("progress_sha256", None)
+    progress_checkpoint = _validate_file_ref(
+        progress.get("checkpoint"), base=progress_path.parent,
+        where="production target-gather progress checkpoint",
+    )[1]
+    progress_optimizer_path, progress_optimizer = _validate_file_ref(
+        progress.get("optimizer"), base=progress_path.parent,
+        where="production target-gather progress optimizer",
+    )
+    if (
+        progress_digest != _digest_value(progress_unhashed)
+        or progress_checkpoint != checkpoint_ref
+        or progress_optimizer_path != optimizer_path
+        or progress_optimizer != optimizer_ref
+        or progress.get("optimizer_step") != 2048
+        or progress.get("completed_epochs") != 1
+        or not isinstance(progress.get("rank_torch_rng_states"), list)
+        or len(progress["rank_torch_rng_states"]) != 4
+    ):
+        raise PromotionError("production target-gather progress/dose topology drifted")
+
+    upgrade = manifest.get("function_preserving_upgrade")
+    if not isinstance(upgrade, dict):
+        raise PromotionError("production target-gather upgrade evidence is malformed")
+    try:
+        replayed_upgrade = one_dose.architecture_upgrade.verify_receipt(
+            Path(str(upgrade.get("receipt", {}).get("path", "")))
+        )
+    except one_dose.architecture_upgrade.UpgradeError as error:
+        raise PromotionError(
+            f"production target-gather architecture upgrade refused: {error}"
+        ) from error
+    source_path, source_ref = _validate_file_ref(
+        manifest.get("learner_source_incumbent"), base=manifest_path.parent,
+        where="production target-gather learner source incumbent",
+    )
+    init_path, init_ref = _validate_file_ref(
+        replayed_upgrade.get("upgraded_initializer"), base=manifest_path.parent,
+        where="production target-gather upgraded initializer",
+    )
+    if (
+        replayed_upgrade != upgrade
+        or replayed_upgrade.get("source") != source_ref
+        or manifest.get("corpus_producer") == source_ref
+    ):
+        raise PromotionError(
+            "production target-gather learner source/upgrade binding drifted"
+        )
+    producers = [
+        record for record in contract.get("checkpoints", [])
+        if isinstance(record, dict) and record.get("role") == "producer"
+    ]
+    if (
+        len(producers) != 1
+        or manifest.get("corpus_producer", {}).get("sha256")
+        != producers[0].get("sha256")
+    ):
+        raise PromotionError(
+            "production target-gather corpus producer differs from contract producer"
+        )
+    report = _load_json(report_path)
+    if (
+        report.get("init_checkpoint") != str(init_path)
+        or report.get("init_checkpoint_sha256") != init_ref["sha256"]
+        or report.get("resume_optimizer") is not False
+        or report.get("optimizer_restored") is not False
+        or report.get("training_row_draws") != 4_194_304
+        or report.get("require_only_trainable_prefixes") != "target_gather_proj"
+    ):
+        raise PromotionError(
+            "production target-gather report parent/optimizer/trainable surface drifted"
+        )
+    try:
+        replayed_delta = gather._verify_adapter_only_model_delta(  # noqa: SLF001
+            init_path, checkpoint_path
+        )
+    except gather.GatherRetrainError as error:
+        raise PromotionError(
+            f"production target-gather model delta refused: {error}"
+        ) from error
+    if value["model_delta"] != replayed_delta:
+        raise PromotionError("production target-gather model-delta evidence drifted")
+    _verify_architecture_retrain_tensor_invariant(
+        source=source_path, candidate=checkpoint_path, upgrade=replayed_upgrade
+    )
+    execution_binding = {
+        "schema_version": "a1-production-target-gather-promotion-execution-binding-v1",
+        "manifest": manifest_ref,
+        "submission": submission_ref,
+        "claim": claim_ref,
+        "command_sha256": manifest["command_sha256"],
+        "unit": submission["unit"],
+        "world_size": 4,
+        "learner_source_incumbent": source_ref,
+        "corpus_producer": manifest["corpus_producer"],
+        "architecture_upgrade_receipt": upgrade["receipt"],
+        "optimizer": optimizer_ref,
+        "progress": progress_ref,
+    }
+    return {
+        "path": str(path),
+        "sha256": _sha256(path),
+        "receipt_sha256": stated,
+        "claim": str(claim_path),
+        "claim_state_sha256": claim_digest,
+        "execution_binding_sha256": _digest_value(execution_binding),
+        "evaluation_parent_sha256": source_ref["sha256"],
     }
 
 
@@ -4295,9 +4664,13 @@ def _verify_adjudication(
     training_path, training_ref = _validate_file_ref(
         candidate_raw["training_report"], base=base, where="candidate.training_report"
     )
+    training_receipt_schema = _load_json(training_receipt).get("schema_version")
     production_l1_completion = (
-        _load_json(training_receipt).get("schema_version")
-        == "a1-production-l1-rerun-completion-v1"
+        training_receipt_schema == "a1-production-l1-rerun-completion-v1"
+    )
+    production_target_gather_completion = (
+        training_receipt_schema
+        == "a1-production-target-gather-retrain-completion-v1"
     )
     training_report_payload = _verify_training_report(
         training_path,
@@ -4306,6 +4679,7 @@ def _verify_adjudication(
         candidate_path=candidate_path,
         candidate_sha256=candidate_ref["sha256"],
         production_l1_completion=production_l1_completion,
+        production_target_gather_completion=production_target_gather_completion,
     )
     training_receipt_ref = _verify_one_dose_training_receipt(
         training_receipt,
@@ -4334,13 +4708,15 @@ def _verify_adjudication(
         if isinstance(lineage_value, dict)
         else None
     )
-    evaluation_parent_sha = (
-        curriculum_parent.get("generation_producer_sha256")
-        if isinstance(curriculum_parent, dict)
-        else function_upgrade.get("source_checkpoint_sha256")
-        if isinstance(function_upgrade, dict)
-        else training_report_payload.get("init_checkpoint_sha256")
-    )
+    evaluation_parent_sha = training_receipt_ref.get("evaluation_parent_sha256")
+    if evaluation_parent_sha is None:
+        evaluation_parent_sha = (
+            curriculum_parent.get("generation_producer_sha256")
+            if isinstance(curriculum_parent, dict)
+            else function_upgrade.get("source_checkpoint_sha256")
+            if isinstance(function_upgrade, dict)
+            else training_report_payload.get("init_checkpoint_sha256")
+        )
     if evaluation_parent_sha != champion_ref["sha256"]:
         raise PromotionError(
             "candidate training parent/init checkpoint differs from adjudicated "

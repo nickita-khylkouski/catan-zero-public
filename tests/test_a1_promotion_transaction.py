@@ -16,6 +16,7 @@ from tools import a1_promotion_transaction as promotion
 from tools import a1_promotion_artifacts as artifacts
 from tools import a1_one_dose_train as one_dose
 from tools import a1_production_l1_rerun as production_l1
+from tools import a1_production_gather_retrain as production_gather
 from tools.champion_registry import ChampionRegistry
 from tools.high_regret_suite_contract import REPLAY_CONTRACT, scope_inventory_sha256
 
@@ -3306,6 +3307,338 @@ def test_production_l1_completion_refuses_optimizer_drift(
 
     with pytest.raises(promotion.PromotionError, match="optimizer sidecar artifact drift"):
         promotion._verify_production_l1_completion_receipt(
+            fixture["completion"], contract=fixture["contract"],
+            candidate_path=fixture["candidate"],
+            candidate_sha256=promotion._sha256(fixture["candidate"]),
+            training_report_path=fixture["report"],
+            training_report_sha256=promotion._sha256(fixture["report"]),
+        )
+
+
+def _production_gather_receipt_fixture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    import torch
+
+    source = tmp_path / "r3.pt"
+    torch.save({"model": {"shared.weight": torch.tensor([1.0, 2.0])}}, source)
+    init = tmp_path / "r3-gather-init.pt"
+    new_parameters = [
+        "target_gather_proj.0.bias",
+        "target_gather_proj.0.weight",
+        "target_gather_proj.1.bias",
+        "target_gather_proj.1.weight",
+    ]
+    init_model = {"shared.weight": torch.tensor([1.0, 2.0])}
+    init_model.update({key: torch.zeros(1) for key in new_parameters})
+    torch.save({"model": init_model}, init)
+    candidate = tmp_path / "candidate.pt"
+    candidate_model = {"shared.weight": torch.tensor([1.0, 2.0])}
+    candidate_model.update({key: torch.ones(1) for key in new_parameters})
+    torch.save({"model": candidate_model}, candidate)
+    f7 = tmp_path / "f7.pt"
+    f7.write_bytes(b"f7 corpus producer")
+    upgrade_receipt = tmp_path / "architecture-upgrade.json"
+    _write_json(upgrade_receipt, {"sealed": True})
+    upgrade = {
+        "schema_version": "a1-function-preserving-architecture-upgrade-v1",
+        "module": "entity_graph.action_target_gather.v1",
+        "source": {"path": str(source), "sha256": promotion._sha256(source)},
+        "upgraded_initializer": {
+            "path": str(init), "sha256": promotion._sha256(init),
+        },
+        "new_parameters": new_parameters,
+        "receipt_sha256": "sha256:" + "a" * 64,
+        "receipt": {
+            "path": str(upgrade_receipt),
+            "sha256": promotion._sha256(upgrade_receipt),
+        },
+    }
+    monkeypatch.setattr(
+        promotion.one_dose.architecture_upgrade,
+        "verify_receipt",
+        lambda path: upgrade,
+    )
+    report = tmp_path / "train.report.json"
+    _write_json(
+        report,
+        {
+            "arch": "entity_graph", "mask_hidden_info": True,
+            "track": "2p_no_trade", "vps_to_win": 10,
+            "world_size": 4, "batch_size": 512,
+            "effective_global_batch_size": 2048, "epochs": 1,
+            "max_steps": 2048, "steps_completed": 2048,
+            "training_row_draws": 4_194_304, "optimizer": "adam",
+            "resume_optimizer": False, "optimizer_restored": False,
+            "soft_target_weight": 0.9, "value_loss_weight": 0.25,
+            "loser_sample_weight": 1.0, "policy_aux_active_batch_size": 0,
+            "action_module_lr_mult": 4.0, "value_lr_mult": 1.0,
+            "freeze_modules": "trunk,action_encoder,policy_head,value_heads",
+            "require_only_trainable_prefixes": "target_gather_proj",
+            "action_target_gather": True, "ddp_find_unused_parameters": True,
+            "ddp_shard_data": False, "value_target_lambda": 1.0,
+            "forced_action_weight": 0.0, "forced_row_value_weight": 1.0,
+            "winner_sample_weight": 1.0, "lr_schedule": "flat",
+            "lr_warmup_steps": 100, "weight_decay": 0.0, "seed": 1,
+            "max_grad_norm": 1.0, "gradient_clipping_enabled": True,
+            "checkpoint": str(candidate), "init_checkpoint": str(init),
+            "init_checkpoint_sha256": promotion._sha256(init),
+        },
+    )
+    optimizer = tmp_path / "candidate.pt.optimizer.pt"
+    optimizer.write_bytes(b"fresh optimizer")
+    progress_path = tmp_path / "candidate.pt.training-progress.json"
+    progress = {
+        "checkpoint": {"path": str(candidate), "sha256": promotion._sha256(candidate)},
+        "optimizer": {"path": str(optimizer), "sha256": promotion._sha256(optimizer)},
+        "optimizer_step": 2048,
+        "completed_epochs": 1,
+        "rank_torch_rng_states": [{} for _ in range(4)],
+    }
+    progress["progress_sha256"] = promotion._digest_value(progress)
+    _write_json(progress_path, progress)
+    manifest_path = tmp_path / "gather.manifest.json"
+    _write_json(manifest_path, {"sealed": True})
+    manifest_ref = {"path": str(manifest_path), "sha256": promotion._sha256(manifest_path)}
+    operator = {
+        "world_size": 4, "per_rank_batch_size": 512,
+        "optimizer_steps": 2048, "global_base_draws": 4_194_304,
+        "current_fraction": 0.8, "current_n128_fraction": 5.0 / 7.0,
+        "current_n256_fraction": 2.0 / 7.0,
+        "exact_predecessor_replay_fraction": 0.2,
+        "soft_target_weight": 0.9, "value_loss_weight": 0.25,
+        "loser_sample_weight": 1.0, "action_module_lr_mult": 4.0,
+        "freeze_modules": ["trunk", "action_encoder", "policy_head", "value_heads"],
+        "required_trainable_prefixes": ["target_gather_proj"],
+        "fresh_optimizer": True,
+        "ddp_find_unused_parameters": True,
+    }
+    manifest = {
+        "operator": operator,
+        "operator_sha256": promotion._digest_value(operator),
+        "command_sha256": "sha256:" + "b" * 64,
+        "runtime_python": {"lexical_path": "/usr/bin/python3"},
+        "repo_binding": {"public_main_commit": "a" * 40},
+        "learner_source_incumbent": upgrade["source"],
+        "corpus_producer": {"path": str(f7), "sha256": promotion._sha256(f7)},
+        "function_preserving_upgrade": upgrade,
+    }
+    verified_manifest = {
+        "manifest": manifest, "manifest_ref": manifest_ref,
+        "repo": tmp_path, "command": ["/usr/bin/python3", "train.py"],
+        "output_root": tmp_path,
+    }
+    monkeypatch.setattr(
+        production_gather,
+        "verify",
+        lambda path: verified_manifest,
+    )
+    claim_path = tmp_path / "execution.claim.json"
+    claim = {
+        "schema_version": production_gather.CLAIM_SCHEMA,
+        "created_at_unix_ns": 1, "manifest": manifest_ref, "unit": "gather-unit",
+    }
+    claim["claim_sha256"] = promotion._digest_value(claim)
+    _write_json(claim_path, claim)
+    submission_path = tmp_path / "submission.receipt.json"
+    submission = {
+        "schema_version": production_gather.SUBMISSION_SCHEMA,
+        "diagnostic_only": False, "production_eligible": True,
+        "created_at_unix_ns": 2, "manifest": manifest_ref,
+        "claim": {"path": str(claim_path), "sha256": promotion._sha256(claim_path)},
+        "unit": "gather-unit", "command_sha256": manifest["command_sha256"],
+        "systemd_command_sha256": promotion._digest_value(
+            production_gather._systemd_command(verified_manifest, "gather-unit")  # noqa: SLF001
+        ),
+        "execution_binding": production_gather._execution_binding(  # noqa: SLF001
+            verified_manifest
+        ),
+        "systemd_stdout": "submitted",
+    }
+    submission["execution_binding_sha256"] = promotion._digest_value(
+        submission["execution_binding"]
+    )
+    submission["receipt_sha256"] = promotion._digest_value(submission)
+    _write_json(submission_path, submission)
+    completion_path = tmp_path / "completion.receipt.json"
+    completion = {
+        "schema_version": production_gather.COMPLETION_SCHEMA,
+        "diagnostic_only": False, "production_eligible": True,
+        "created_at_unix_ns": 3, "manifest": manifest_ref,
+        "submission": {"path": str(submission_path), "sha256": promotion._sha256(submission_path)},
+        "checkpoint": {"path": str(candidate), "sha256": promotion._sha256(candidate)},
+        "report": {"path": str(report), "sha256": promotion._sha256(report)},
+        "operator_sha256": manifest["operator_sha256"],
+        "progress": {"path": str(progress_path), "sha256": promotion._sha256(progress_path)},
+        "optimizer": {"path": str(optimizer), "sha256": promotion._sha256(optimizer)},
+        "model_delta": production_gather._verify_adapter_only_model_delta(  # noqa: SLF001
+            init, candidate
+        ),
+        "unit_state": {"ActiveState": "inactive", "Result": "success", "ExecMainStatus": "0"},
+    }
+    completion["receipt_sha256"] = promotion._digest_value(completion)
+    _write_json(completion_path, completion)
+    return {
+        "source": source, "init": init, "candidate": candidate, "f7": f7,
+        "report": report, "progress": progress_path, "optimizer": optimizer,
+        "completion": completion_path, "manifest": manifest,
+        "contract": {"checkpoints": [{"role": "producer", **manifest["corpus_producer"]}]},
+    }
+
+
+def test_production_target_gather_completion_binds_r3_not_corpus_f7(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = _production_gather_receipt_fixture(tmp_path, monkeypatch)
+
+    verified = promotion._verify_production_target_gather_completion_receipt(
+        fixture["completion"], contract=fixture["contract"],
+        candidate_path=fixture["candidate"],
+        candidate_sha256=promotion._sha256(fixture["candidate"]),
+        training_report_path=fixture["report"],
+        training_report_sha256=promotion._sha256(fixture["report"]),
+    )
+
+    assert verified["evaluation_parent_sha256"] == promotion._sha256(fixture["source"])
+    assert verified["evaluation_parent_sha256"] != promotion._sha256(fixture["f7"])
+
+
+def test_production_target_gather_completion_refuses_inherited_tensor_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = _production_gather_receipt_fixture(tmp_path, monkeypatch)
+    import torch
+
+    raw = torch.load(fixture["candidate"], map_location="cpu", weights_only=False)
+    raw["model"]["shared.weight"] = torch.tensor([9.0, 2.0])
+    torch.save(raw, fixture["candidate"])
+    completion = json.loads(fixture["completion"].read_text())
+    completion["checkpoint"]["sha256"] = promotion._sha256(fixture["candidate"])
+    completion["receipt_sha256"] = promotion._digest_value(
+        {key: value for key, value in completion.items() if key != "receipt_sha256"}
+    )
+    _write_json(fixture["completion"], completion)
+    progress = json.loads(fixture["progress"].read_text())
+    progress["checkpoint"]["sha256"] = promotion._sha256(fixture["candidate"])
+    progress["progress_sha256"] = promotion._digest_value(
+        {key: value for key, value in progress.items() if key != "progress_sha256"}
+    )
+    _write_json(fixture["progress"], progress)
+    completion["progress"]["sha256"] = promotion._sha256(fixture["progress"])
+    completion["receipt_sha256"] = promotion._digest_value(
+        {key: value for key, value in completion.items() if key != "receipt_sha256"}
+    )
+    _write_json(fixture["completion"], completion)
+
+    with pytest.raises(promotion.PromotionError, match="model delta refused"):
+        promotion._verify_production_target_gather_completion_receipt(
+            fixture["completion"], contract=fixture["contract"],
+            candidate_path=fixture["candidate"],
+            candidate_sha256=promotion._sha256(fixture["candidate"]),
+            training_report_path=fixture["report"],
+            training_report_sha256=promotion._sha256(fixture["report"]),
+        )
+
+
+def test_production_target_gather_completion_requires_four_rank_rng_states(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = _production_gather_receipt_fixture(tmp_path, monkeypatch)
+    progress = json.loads(fixture["progress"].read_text())
+    progress["rank_torch_rng_states"].append({})
+    progress["progress_sha256"] = promotion._digest_value(
+        {key: value for key, value in progress.items() if key != "progress_sha256"}
+    )
+    _write_json(fixture["progress"], progress)
+    completion = json.loads(fixture["completion"].read_text())
+    completion["progress"]["sha256"] = promotion._sha256(fixture["progress"])
+    completion["receipt_sha256"] = promotion._digest_value(
+        {key: value for key, value in completion.items() if key != "receipt_sha256"}
+    )
+    _write_json(fixture["completion"], completion)
+
+    with pytest.raises(promotion.PromotionError, match="progress/dose topology"):
+        promotion._verify_production_target_gather_completion_receipt(
+            fixture["completion"], contract=fixture["contract"],
+            candidate_path=fixture["candidate"],
+            candidate_sha256=promotion._sha256(fixture["candidate"]),
+            training_report_path=fixture["report"],
+            training_report_sha256=promotion._sha256(fixture["report"]),
+        )
+
+
+def test_production_target_gather_report_requires_exact_four_rank_recipe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = _production_gather_receipt_fixture(tmp_path, monkeypatch)
+    contract = {
+        **fixture["contract"],
+        "science": {"learner_training_recipe": {"symmetry_augment": False}},
+    }
+    replay = promotion._verify_training_report(
+        fixture["report"], contract=contract,
+        contract_sha256="sha256:" + "0" * 64,
+        candidate_path=fixture["candidate"],
+        candidate_sha256=promotion._sha256(fixture["candidate"]),
+        production_target_gather_completion=True,
+    )
+    assert replay["training_row_draws"] == 4_194_304
+
+    report = json.loads(fixture["report"].read_text())
+    report["ddp_find_unused_parameters"] = False
+    _write_json(fixture["report"], report)
+    with pytest.raises(promotion.PromotionError, match="ddp_find_unused_parameters"):
+        promotion._verify_training_report(
+            fixture["report"], contract=contract,
+            contract_sha256="sha256:" + "0" * 64,
+            candidate_path=fixture["candidate"],
+            candidate_sha256=promotion._sha256(fixture["candidate"]),
+            production_target_gather_completion=True,
+        )
+
+
+def test_production_target_gather_completion_refuses_wrong_corpus_producer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = _production_gather_receipt_fixture(tmp_path, monkeypatch)
+    other = tmp_path / "other-producer.pt"
+    other.write_bytes(b"other")
+    fixture["contract"]["checkpoints"][0] = {
+        "role": "producer", "path": str(other), "sha256": promotion._sha256(other)
+    }
+    with pytest.raises(promotion.PromotionError, match="corpus producer differs"):
+        promotion._verify_production_target_gather_completion_receipt(
+            fixture["completion"], contract=fixture["contract"],
+            candidate_path=fixture["candidate"],
+            candidate_sha256=promotion._sha256(fixture["candidate"]),
+            training_report_path=fixture["report"],
+            training_report_sha256=promotion._sha256(fixture["report"]),
+        )
+
+
+def test_production_target_gather_completion_replays_execution_binding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = _production_gather_receipt_fixture(tmp_path, monkeypatch)
+    completion = json.loads(fixture["completion"].read_text())
+    submission_path = Path(completion["submission"]["path"])
+    submission = json.loads(submission_path.read_text())
+    submission["execution_binding"]["environment"]["CUDA_VISIBLE_DEVICES"] = "0,1"
+    submission["execution_binding_sha256"] = promotion._digest_value(
+        submission["execution_binding"]
+    )
+    submission["receipt_sha256"] = promotion._digest_value(
+        {key: value for key, value in submission.items() if key != "receipt_sha256"}
+    )
+    _write_json(submission_path, submission)
+    completion["submission"]["sha256"] = promotion._sha256(submission_path)
+    completion["receipt_sha256"] = promotion._digest_value(
+        {key: value for key, value in completion.items() if key != "receipt_sha256"}
+    )
+    _write_json(fixture["completion"], completion)
+
+    with pytest.raises(promotion.PromotionError, match="submission drifted"):
+        promotion._verify_production_target_gather_completion_receipt(
             fixture["completion"], contract=fixture["contract"],
             candidate_path=fixture["candidate"],
             candidate_sha256=promotion._sha256(fixture["candidate"]),
