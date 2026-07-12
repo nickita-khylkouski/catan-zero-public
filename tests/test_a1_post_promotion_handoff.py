@@ -139,6 +139,8 @@ def test_rebases_next_campaign_to_committed_producer_and_prior_history(
         "role": "producer",
         **payload["producer_identity"]["checkpoint"],
     }
+    assert campaign["common_recipe"]["c_scale"] == 0.1
+    assert campaign["common_recipe"]["category_c_scale"]["current_producer"] == 0.1
     prior = next(row for row in campaign["checkpoints"] if row["id"] == "prior_generator")
     assert prior["role"] == "history"
     recent = next(

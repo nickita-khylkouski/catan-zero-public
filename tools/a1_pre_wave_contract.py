@@ -2906,6 +2906,16 @@ def _post_promotion_campaign_payload(
         *[item for item in recent["checkpoint_ids"] if item != "prior_generator"],
     ]
     value = json.loads(json.dumps(source))
+    producer_search = handoff.get("producer_identity", {}).get("search_config")
+    if not isinstance(producer_search, dict) or not isinstance(
+        producer_search.get("c_scale"), (int, float)
+    ):
+        raise ContractError("post-promotion producer has no deployed c_scale identity")
+    common_recipe = dict(value["common_recipe"])
+    common_recipe["c_scale"] = float(producer_search["c_scale"])
+    category_c_scale = dict(common_recipe["category_c_scale"])
+    category_c_scale["current_producer"] = float(producer_search["c_scale"])
+    common_recipe["category_c_scale"] = category_c_scale
     value.update(
         {
             "schema_version": POST_PROMOTION_CAMPAIGN_SCHEMA,
@@ -2922,6 +2932,7 @@ def _post_promotion_campaign_payload(
             },
             "checkpoints": checkpoints,
             "source_categories": categories,
+            "common_recipe": common_recipe,
             "implementation_commit": _current_repo_commit(),
             "provenance": _refresh_campaign_provenance(source["provenance"]),
         }
