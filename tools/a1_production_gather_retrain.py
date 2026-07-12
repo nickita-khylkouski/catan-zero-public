@@ -36,6 +36,7 @@ OPTIMIZER_STEPS = 2048
 GLOBAL_DRAWS = WORLD_SIZE * LOCAL_BATCH * OPTIMIZER_STEPS
 BOUND_SOURCE_FILES = (
     "tools/a1_production_gather_retrain.py",
+    "tools/a1_production_l1_rerun.py",
     "tools/a1_function_preserving_upgrade.py",
     "tools/f69_upgrade_checkpoint_config.py",
     "tools/train_bc.py",
@@ -130,6 +131,16 @@ def _validate_geometry(command: list[str]) -> None:
     ):
         if required not in command:
             raise GatherRetrainError(f"target-gather command lacks {required}")
+    forbidden = {
+        "--ddp-find-unused-parameters",
+        "--fsdp",
+        "--train-value-only",
+    }
+    present = sorted(forbidden & set(command))
+    if present:
+        raise GatherRetrainError(
+            f"target-gather command enables an unreviewed distributed mode: {present}"
+        )
 
 
 def prepare(
