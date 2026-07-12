@@ -315,6 +315,9 @@ def _evaluate(
         truncated_vp_margin_value_weight=truncation_weight,
         value_categorical_loss_weight=categorical_weight,
         value_target_lambda=target_lambda,
+        # These tests exercise the superseded corpus-global operator. Production
+        # CLI runs now have to request it explicitly.
+        value_root_blend_global_compat=(target_lambda != 1.0),
         data_loader_workers=data_loader_workers,
         data_loader_prefetch=data_loader_prefetch,
     )
