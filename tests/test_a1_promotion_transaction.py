@@ -367,9 +367,15 @@ def _fixture(
         )
         calibration_sources.append((role, source))
     internal_games = [
-        {"pair_id": pair, "search_won": True, "candidate_won": True}
+        {
+            "pair_id": pair,
+            "game_seed": 7_000_000 + pair,
+            "orientation": orientation,
+            "search_won": True,
+            "candidate_won": True,
+        }
         for pair in range(200)
-        for _orientation in range(2)
+        for orientation in ("candidate_first", "candidate_second")
     ]
     pair_scores, pair_diagnostics = promotion.pair_scores_from_h2h_games(internal_games)
     pentanomial = promotion.evaluate_pentanomial_sprt(
@@ -806,6 +812,31 @@ def _fixture(
     adjudication["adjudication_sha256"] = promotion._digest_value(adjudication)
     adjudication_path = tmp_path / "adjudication.json"
     _write_json(adjudication_path, adjudication)
+    diagnostic_source = tmp_path / "prior-diagnostic-cohort.json"
+    _write_json(
+        diagnostic_source,
+        {"kind": "arm_selection", "seed_intervals": [[9_000_000, 9_000_200]]},
+    )
+    cohort_exclusions = {
+        "schema_version": promotion.COHORT_EXCLUSIONS_SCHEMA,
+        "contract_sha256": contract["contract_sha256"],
+        "candidate_sha256": promotion._sha256(candidate),
+        "cohorts": [
+            {
+                "label": "p1-arm-selection",
+                "kind": "internal_h2h",
+                "source": _checkpoint_ref(diagnostic_source),
+                "seed_intervals": [
+                    {"base_seed": 9_000_000, "end_seed": 9_000_200}
+                ],
+            }
+        ],
+    }
+    cohort_exclusions["manifest_sha256"] = promotion._digest_value(
+        cohort_exclusions
+    )
+    cohort_exclusions_path = tmp_path / "promotion-cohort-exclusions.json"
+    _write_json(cohort_exclusions_path, cohort_exclusions)
     return {
         "champion": champion,
         "candidate": candidate,
@@ -816,6 +847,7 @@ def _fixture(
         "adjudication": adjudication_path,
         "report": report_path,
         "training_receipt": training_receipt,
+        "cohort_exclusions": cohort_exclusions_path,
         "receipt": tmp_path / "promotion.receipt.json",
         "lock": registry_path.with_suffix(registry_path.suffix + ".a1.lock"),
     }
@@ -930,6 +962,7 @@ def _execute(fixture: dict, *, go: bool):
         contract_lock=fixture["contract_path"],
         adjudication_path=fixture["adjudication"],
         training_receipt=fixture["training_receipt"],
+        cohort_exclusions=fixture["cohort_exclusions"],
         receipt_path=fixture["receipt"],
         reason="A1 typed promotion",
         lock_path=fixture["lock"],
@@ -1031,6 +1064,76 @@ def test_dry_run_binds_v3_one_dose_receipt(tmp_path: Path) -> None:
             fixture["training_receipt"].read_text(encoding="utf-8")
         )["outputs"]["execution_binding_sha256"],
     }
+    isolation = plan["promotion_cohort_disjointness"]
+    assert isolation["overlap_count"] == 0
+    assert isolation["manifest"]["path"] == str(fixture["cohort_exclusions"])
+    assert {item["kind"] for item in isolation["final_seed_intervals"]} == {
+        "internal_h2h",
+        "external_panel",
+    }
+
+
+def _mutate_cohort_exclusions(fixture: dict, mutate) -> dict:
+    path = fixture["cohort_exclusions"]
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload.pop("manifest_sha256")
+    mutate(payload)
+    payload["manifest_sha256"] = promotion._digest_value(payload)
+    _write_json(path, payload)
+    return payload
+
+
+@pytest.mark.parametrize(
+    ("base_seed", "end_seed", "expected_kind"),
+    [
+        (7_000_050, 7_000_060, "internal_h2h"),
+        (8_100_050, 8_100_060, "external_panel"),
+    ],
+)
+def test_promotion_refuses_reused_diagnostic_cohort(
+    tmp_path: Path, base_seed: int, end_seed: int, expected_kind: str
+) -> None:
+    fixture = _fixture(tmp_path)
+
+    def overlap(payload: dict) -> None:
+        payload["cohorts"][0]["seed_intervals"] = [
+            {"base_seed": base_seed, "end_seed": end_seed}
+        ]
+
+    _mutate_cohort_exclusions(fixture, overlap)
+    with pytest.raises(
+        promotion.PromotionError,
+        match=rf"overlaps.*{expected_kind}",
+    ):
+        _execute(fixture, go=False)
+
+
+def test_promotion_refuses_mutated_bound_diagnostic_source(tmp_path: Path) -> None:
+    fixture = _fixture(tmp_path)
+    exclusions = json.loads(fixture["cohort_exclusions"].read_text(encoding="utf-8"))
+    source = Path(exclusions["cohorts"][0]["source"]["path"])
+    source.write_text("mutated\n", encoding="utf-8")
+
+    with pytest.raises(promotion.PromotionError, match="artifact drift"):
+        _execute(fixture, go=False)
+
+
+def test_promotion_refuses_final_internal_cohort_without_exact_seeds(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path)
+
+    def remove_seed(source: dict) -> None:
+        source["games"][0].pop("game_seed")
+
+    _mutate_evidence_source(
+        fixture,
+        kind="internal_h2h",
+        role="internal_h2h",
+        mutate=remove_seed,
+    )
+    with pytest.raises(promotion.PromotionError, match="exact seed identity"):
+        _execute(fixture, go=False)
 
 
 def test_promotion_receipt_binds_deployed_agent_identities(tmp_path: Path) -> None:
@@ -1372,7 +1475,23 @@ def test_recovery_accepts_pre_v2_promotion_receipt(tmp_path: Path) -> None:
     receipt = json.loads(fixture["receipt"].read_text(encoding="utf-8"))
     receipt.pop("receipt_sha256")
     receipt.pop("training_receipt")
+    receipt.pop("promotion_cohort_disjointness")
     receipt["schema_version"] = promotion.LEGACY_RECEIPT_SCHEMA
+    receipt["receipt_sha256"] = promotion._digest_value(receipt)
+    _write_json(fixture["receipt"], receipt)
+
+    result = promotion.recover_transaction(receipt_path=fixture["receipt"], go=False)
+
+    assert result["status"] == "recovery_dry_run"
+
+
+def test_recovery_accepts_v2_promotion_receipt(tmp_path: Path) -> None:
+    fixture = _fixture(tmp_path)
+    _execute(fixture, go=True)
+    receipt = json.loads(fixture["receipt"].read_text(encoding="utf-8"))
+    receipt.pop("receipt_sha256")
+    receipt.pop("promotion_cohort_disjointness")
+    receipt["schema_version"] = promotion.PREVIOUS_RECEIPT_SCHEMA
     receipt["receipt_sha256"] = promotion._digest_value(receipt)
     _write_json(fixture["receipt"], receipt)
 
@@ -2375,6 +2494,7 @@ def test_alternate_lock_path_is_forbidden(tmp_path: Path) -> None:
             contract_lock=fixture["contract_path"],
             adjudication_path=fixture["adjudication"],
             training_receipt=fixture["training_receipt"],
+            cohort_exclusions=fixture["cohort_exclusions"],
             receipt_path=fixture["receipt"],
             reason="A1 typed promotion",
             lock_path=tmp_path / "bypass.lock",
@@ -2395,6 +2515,7 @@ def test_symlink_registry_is_rejected_before_lock_or_mutation(tmp_path: Path) ->
             contract_lock=fixture["contract_path"],
             adjudication_path=fixture["adjudication"],
             training_receipt=fixture["training_receipt"],
+            cohort_exclusions=fixture["cohort_exclusions"],
             receipt_path=fixture["receipt"],
             reason="A1 typed promotion",
             go=False,

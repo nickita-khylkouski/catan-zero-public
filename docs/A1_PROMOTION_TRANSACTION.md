@@ -32,9 +32,35 @@ gate, alter `public_champion`, or deploy checkpoint bytes to the fleet.
   executor-owned report binding, candidate/report/optimizer hashes, and
   terminal durable-claim agreement. A plausible standalone training report
   cannot authorize promotion.
+- A candidate-specific `a1-promotion-cohort-exclusions-v1` binds every prior
+  diagnostic/arm-selection source by SHA-256 and lists its half-open game-seed
+  intervals. The final internal H2H and external neutral-panel evidence must
+  retain exact per-game seeds, and the transaction proves their union is
+  disjoint from every listed prior cohort. This prevents selecting an arm and
+  then "confirming" it on the same random cohort (winner's curse). Exploratory
+  diagnostic panels do not require this manifest; only the promotion boundary
+  does.
 - The registry is nonempty, its `generator_champion` path/version/MD5 matches
   the adjudicated incumbent, and `CURRENT_CHAMPION` contains that same single
   path.
+
+The exclusion manifest is candidate- and contract-specific. Each source is an
+immutable diagnostic/adjudication result; intervals are half-open:
+
+```json
+{
+  "schema_version": "a1-promotion-cohort-exclusions-v1",
+  "contract_sha256": "sha256:...",
+  "candidate_sha256": "sha256:...",
+  "cohorts": [{
+    "label": "p1-arm-selection",
+    "kind": "internal_h2h",
+    "source": {"path": "/immutable/p1-selection.json", "sha256": "sha256:..."},
+    "seed_intervals": [{"base_seed": 9000000, "end_seed": 9000200}]
+  }],
+  "manifest_sha256": "sha256:..."
+}
+```
 
 ## One-time A1 registry bootstrap
 
@@ -244,6 +270,7 @@ python tools/a1_promotion_transaction.py promote \
   --contract-lock /immutable/a1.lock.json \
   --adjudication /immutable/a1.promotion.json \
   --training-receipt /immutable/a1.one-dose.receipt.json \
+  --cohort-exclusions /immutable/a1.cohort-exclusions.json \
   --receipt /private/receipts/a1-p5.json \
   --reason "A1 typed promotion"
 ```
@@ -255,9 +282,11 @@ the plain-text current pointer changes to the candidate path. Receipt
 provenance explicitly records `fleet_ckpt_updated=false`; remote fleet paths
 remain a separate hash-verified deployment action.
 
-New transactions use `a1-promotion-transaction-receipt-v2` and bind the
-verified v3 direct-dose or v4 derived-retry receipt. Recovery remains compatible
-with already-prepared v1 promotion receipts.
+New transactions use `a1-promotion-transaction-receipt-v3` and bind the
+verified v3 direct-dose or v4 derived-retry receipt plus the exact exclusion
+manifest, its source artifacts, the excluded intervals, the final promotion
+intervals, and a zero-overlap result. Recovery remains compatible with
+already-prepared v1 and v2 promotion receipts.
 
 The lock is always derived from the canonical registry path as
 `<registry>.a1.lock`. `--lock-file` remains accepted for command compatibility

@@ -36,8 +36,8 @@ from tools.a1_external_panel_compare import (  # noqa: E402
 
 MANIFEST_SCHEMA = "a1-combined-196k-evaluation-manifest-v1"
 RESULT_SCHEMA = "a1-combined-196k-evaluation-handoff-v1"
-PROMOTION_MANIFEST_SCHEMA = "a1-combined-196k-promotion-manifest-v1"
-PROMOTION_PLAN_SCHEMA = "a1-combined-196k-promotion-plan-v1"
+PROMOTION_MANIFEST_SCHEMA = "a1-combined-196k-promotion-manifest-v2"
+PROMOTION_PLAN_SCHEMA = "a1-combined-196k-promotion-plan-v2"
 
 
 class CombinedHandoffError(RuntimeError):
@@ -348,6 +348,7 @@ def build_promotion_plan(
         "contract_lock",
         "adjudication",
         "training_receipt",
+        "cohort_exclusions",
         "receipt",
         "reason",
     }
@@ -367,6 +368,9 @@ def build_promotion_plan(
     training_receipt = _bound_ref(
         manifest["training_receipt"], base=base, where="training receipt"
     )
+    cohort_exclusions = _bound_ref(
+        manifest["cohort_exclusions"], base=base, where="cohort exclusions"
+    )
     if _ref(training_receipt, where="training receipt") != handoff["training_receipt"]:
         raise CombinedHandoffError("promotion manifest names a different training receipt")
     receipt = Path(str(manifest["receipt"])).expanduser().resolve(strict=False)
@@ -380,6 +384,7 @@ def build_promotion_plan(
             contract_lock=contract,
             adjudication_path=adjudication,
             training_receipt=training_receipt,
+            cohort_exclusions=cohort_exclusions,
             receipt_path=receipt,
             reason=reason,
         )
@@ -399,6 +404,8 @@ def build_promotion_plan(
         str(adjudication),
         "--training-receipt",
         str(training_receipt),
+        "--cohort-exclusions",
+        str(cohort_exclusions),
         "--receipt",
         str(receipt),
         "--reason",
