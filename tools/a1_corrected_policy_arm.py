@@ -37,13 +37,18 @@ SUPERVISION_CONTRACT_SCHEMA = "a1-next-learner-supervision-contract-v2"
 CURRENT_TEACHER_COMPONENT_IDS = ("n128_current", "n256_current")
 REPLAY_COMPONENT_ID = "gen3_replay"
 REPLAY_ANCHOR_WEIGHT = 0.0
-# The successful L1 dose consumed 4,194,304 global rows but only 515,337
-# multi-action rows carried policy gradient.  The current-teacher-only mixture
-# changes that fraction slightly, so bind a narrow realized-dose band rather
-# than pretending global samples are policy samples.  Auxiliary policy rows
-# remain exactly off until an independently winning dose is found.
-EXPECTED_POLICY_BASE_ACTIVE_ROWS = 515_337
-POLICY_BASE_ACTIVE_ROW_TOLERANCE = 12_000
+# The successful L1 dose consumed 4,194,304 global rows but only about 515K
+# multi-action rows carried policy gradient.  For the new 5:2 current-teacher
+# mixture, exact corpus scans give the active fractions below and an expected
+# 508,121 rows (binomial sigma ~=668).  A 4,100-row band is wider than 6 sigma
+# while still rejecting roughly 0.8% realized-dose drift.  Auxiliary policy
+# rows remain exactly off until an independently winning dose is found.
+POLICY_BASE_ACTIVE_FRACTIONS = {
+    "n128_current": 0.12115209004114003,
+    "n256_current": 0.12112910679641598,
+}
+EXPECTED_POLICY_BASE_ACTIVE_ROWS = 508_121
+POLICY_BASE_ACTIVE_ROW_TOLERANCE = 4_100
 EXPECTED_POLICY_AUX_ACTIVE_ROWS = 0
 EVENT_HISTORY_COMMAND_CONTRACT_SCHEMA = "a1-event-history-command-contract-v1"
 EVENT_HISTORY_ACK_FLAG = (
@@ -613,6 +618,9 @@ def _next_supervision_contract(
         "soft_target_weight": 1.0,
         "policy_aux_active_batch_size_per_rank": 0,
         "policy_active_row_dose": {
+            "reference_component_active_fractions": POLICY_BASE_ACTIVE_FRACTIONS,
+            "component_sampling_ratios": [5.0 / 7.0, 2.0 / 7.0],
+            "global_row_dose": 4_194_304,
             "reference_base_active_rows": EXPECTED_POLICY_BASE_ACTIVE_ROWS,
             "base_active_rows_tolerance": POLICY_BASE_ACTIVE_ROW_TOLERANCE,
             "min_base_active_rows": (

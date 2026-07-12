@@ -256,6 +256,9 @@ def verify_training_report(manifest_path: Path, report_path: Path) -> dict[str, 
         raise ExecutionError(f"training report supervision scalar drift: {observed}")
     dose_contract = contract.get("policy_active_row_dose")
     expected_dose = {
+        "reference_component_active_fractions": prepare.POLICY_BASE_ACTIVE_FRACTIONS,
+        "component_sampling_ratios": [5.0 / 7.0, 2.0 / 7.0],
+        "global_row_dose": 4_194_304,
         "reference_base_active_rows": prepare.EXPECTED_POLICY_BASE_ACTIVE_ROWS,
         "base_active_rows_tolerance": prepare.POLICY_BASE_ACTIVE_ROW_TOLERANCE,
         "min_base_active_rows": (
