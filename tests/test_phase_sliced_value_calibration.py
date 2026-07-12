@@ -184,6 +184,17 @@ def test_heldout_range_filter_and_manifest_are_explicit(tmp_path: Path) -> None:
     assert provenance["seed_manifest_sha256"] == actual_sha
 
 
+def test_per_shard_cap_spreads_small_probe_across_shards(tmp_path: Path) -> None:
+    _write_calibration_shard(tmp_path / "a.npz", [10, 10, 10, 10])
+    _write_calibration_shard(tmp_path / "b.npz", [20, 20, 20, 20])
+    groups = collect_rows(
+        str(tmp_path), max_rows=4, max_rows_per_shard=2
+    )
+    assert len(groups) == 2
+    assert [len(group["z"]) for group in groups] == [2, 2]
+    assert set(np.concatenate([group["game_seed"] for group in groups])) == {10, 20}
+
+
 def test_loads_trainers_exact_validation_seed_manifest_and_verifies_digest(
     tmp_path: Path,
 ) -> None:

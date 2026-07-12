@@ -344,6 +344,7 @@ def collect_rows(
     shard_dir: str,
     *,
     max_rows: int | None = None,
+    max_rows_per_shard: int | None = None,
     validation_game_seeds: np.ndarray | None = None,
     validation_game_seed_ranges: tuple[tuple[int, int], ...] = (),
 ) -> list[dict[str, np.ndarray]]:
@@ -355,6 +356,8 @@ def collect_rows(
         raise ValueError(
             "choose validation_game_seeds or validation_game_seed_ranges, not both"
         )
+    if max_rows_per_shard is not None and int(max_rows_per_shard) < 1:
+        raise ValueError("max_rows_per_shard must be positive")
     groups: list[dict[str, np.ndarray]] = []
     total = 0
     for shard_path in _iter_shards(shard_dir):
@@ -378,6 +381,8 @@ def collect_rows(
         if not np.any(terminated):
             continue
         idx = np.where(terminated)[0]
+        if max_rows_per_shard is not None:
+            idx = idx[: int(max_rows_per_shard)]
         if max_rows is not None:
             remaining = max(0, int(max_rows) - total)
             idx = idx[:remaining]
@@ -957,6 +962,12 @@ def main() -> None:
         ),
     )
     parser.add_argument("--max-rows", type=int, default=None)
+    parser.add_argument(
+        "--max-rows-per-shard",
+        type=int,
+        default=None,
+        help="cap each shard before the global cap to spread diagnostics across games",
+    )
     selection = parser.add_mutually_exclusive_group()
     selection.add_argument(
         "--validation-fraction",
@@ -1054,6 +1065,7 @@ def main() -> None:
     groups = collect_rows(
         args.shard_dir,
         max_rows=args.max_rows,
+        max_rows_per_shard=args.max_rows_per_shard,
         validation_game_seeds=selected_seeds,
         validation_game_seed_ranges=ranges,
     )
