@@ -8,6 +8,7 @@ import pytest
 from catan_zero.rl.action_mask import ActionCatalog
 from catan_zero.rl.gumbel_self_play import COLORS
 from catan_zero.search.neural_rust_mcts import (
+    _forward_search_policy,
     rust_action_context_batch,
     rust_game_to_entity_batch,
     rust_policy_action_ids,
@@ -36,6 +37,27 @@ def _advance_to_multi_action_state(catanatron_rs, *, seed: int, min_legal: int =
 
 def _legal_rust_actions(game) -> tuple[int, ...]:
     return tuple(int(action) for action in game.playable_action_indices(list(COLORS), None))
+
+
+def test_search_requests_no_diagnostic_final_vp_when_policy_supports_selection():
+    class Policy:
+        supports_final_vp_selection = True
+
+        def forward_legal_np(self, *_args, **kwargs):
+            self.kwargs = kwargs
+            return {"logits": object(), "value": object()}
+
+    policy = Policy()
+    result = _forward_search_policy(
+        policy,
+        {},
+        np.zeros((1, 1), dtype=np.int64),
+        np.zeros((1, 1, 1), dtype=np.float32),
+        return_q=False,
+    )
+
+    assert set(result) == {"logits", "value"}
+    assert policy.kwargs == {"return_q": False, "return_final_vp": False}
 
 
 # ---------------------------------------------------------------------------

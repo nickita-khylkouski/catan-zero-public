@@ -268,13 +268,24 @@ def test_server_honors_return_q_and_preserves_q_values(monkeypatch) -> None:
     from catan_zero.rl.entity_token_policy import EntityGraphPolicy
 
     seen_return_q: list[bool] = []
+    seen_return_final_vp: list[bool] = []
 
     class _Policy:
         action_size = 8
         trained_with_masked_hidden_info = False
+        supports_final_vp_selection = True
 
-        def forward_legal_np(self, _entity, legal_ids, _context, *, return_q=False):
+        def forward_legal_np(
+            self,
+            _entity,
+            legal_ids,
+            _context,
+            *,
+            return_q=False,
+            return_final_vp=True,
+        ):
             seen_return_q.append(bool(return_q))
+            seen_return_final_vp.append(bool(return_final_vp))
             rows, width = legal_ids.shape
             outputs = {
                 "logits": torch.zeros((rows, width), dtype=torch.float32),
@@ -327,6 +338,7 @@ def test_server_honors_return_q_and_preserves_q_values(monkeypatch) -> None:
     assert req_id == 51
     assert error is None
     assert seen_return_q == [True]
+    assert seen_return_final_vp == [False]
     np.testing.assert_array_equal(result["q_values"], np.full((1, 2), 0.25))
 
 

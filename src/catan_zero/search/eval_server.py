@@ -1119,12 +1119,21 @@ def _server_main(
                         f"forward={forward_rows} cap={config.max_neural_rows}"
                     )
                 forward_started = time.perf_counter()
+                forward_kwargs = {"return_q": any(group_return_q)}
+                if bool(
+                    getattr(
+                        forward_policy,
+                        "supports_final_vp_selection",
+                        False,
+                    )
+                ):
+                    forward_kwargs["return_final_vp"] = False
                 with torch.inference_mode():
                     outputs = forward_policy.forward_legal_np(
                         entity,
                         legal_ids,
                         context,
-                        return_q=any(group_return_q),
+                        **forward_kwargs,
                     )
                 if config.cuda_graph:
                     _record_cuda_graph_call(stats, forward_policy)

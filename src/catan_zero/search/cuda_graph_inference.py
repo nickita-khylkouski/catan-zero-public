@@ -148,6 +148,7 @@ class CudaGraphInferenceRunner:
         legal_action_context: np.ndarray,
         *,
         return_q: bool = False,
+        return_final_vp: bool = True,
     ) -> dict[str, Any]:
         """Score a NumPy batch, returning tensors with unpadded output shapes."""
         import torch
@@ -177,6 +178,7 @@ class CudaGraphInferenceRunner:
                 legal_action_ids,
                 legal_action_context,
                 return_q=return_q,
+                return_final_vp=return_final_vp,
             )
 
         bucket = self.selected_batch_bucket(batch_size)
@@ -190,6 +192,7 @@ class CudaGraphInferenceRunner:
                 legal_action_ids,
                 legal_action_context,
                 return_q=return_q,
+                return_final_vp=return_final_vp,
             )
 
         with (
@@ -213,6 +216,7 @@ class CudaGraphInferenceRunner:
                         legal_action_ids,
                         legal_action_context,
                         return_q=return_q,
+                        return_final_vp=return_final_vp,
                     )
                 self._graphs[signature] = entry
 
@@ -232,6 +236,7 @@ class CudaGraphInferenceRunner:
                 encoded_state,
                 action_batch,
                 return_q=return_q,
+                return_final_vp=return_final_vp,
             )
             outputs["logits"] = outputs["logits"].masked_fill(action_ids < 0, -1.0e9)
 
@@ -380,6 +385,7 @@ class CudaGraphInferenceRunner:
         legal_action_context: np.ndarray,
         *,
         return_q: bool,
+        return_final_vp: bool,
     ) -> dict[str, Any]:
         import torch
 
@@ -403,6 +409,7 @@ class CudaGraphInferenceRunner:
                 encoded_state,
                 action_batch,
                 return_q=return_q,
+                return_final_vp=return_final_vp,
             )
             outputs["logits"] = outputs["logits"].masked_fill(action_ids < 0, -1.0e9)
             return outputs

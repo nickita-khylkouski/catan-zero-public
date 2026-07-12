@@ -656,6 +656,7 @@ class EntityGraphNet:
                 batch: dict[str, Any],
                 *,
                 return_q: bool = False,
+                return_final_vp: bool = True,
                 event_token_limit: int | None = None,
             ):
                 """Encode a state and score its legal actions.
@@ -677,6 +678,7 @@ class EntityGraphNet:
                     encoded_state,
                     batch,
                     return_q=return_q,
+                    return_final_vp=return_final_vp,
                 )
 
             def parameter_accounting(self) -> dict[str, int]:
@@ -795,6 +797,7 @@ class EntityGraphNet:
                 batch: dict[str, Any],
                 *,
                 return_q: bool = False,
+                return_final_vp: bool = True,
             ):
                 """Score legal actions and emit value heads from encoded state."""
                 tokens, padding_mask, state = encoded_state[:3]
@@ -840,8 +843,9 @@ class EntityGraphNet:
                 outputs = {
                     "logits": logits,
                     "value": value,
-                    "final_vp": self.final_vp_head(state).squeeze(-1),
                 }
+                if return_final_vp:
+                    outputs["final_vp"] = self.final_vp_head(state).squeeze(-1)
                 if self.latent_deliberation_steps > 0:
                     outputs["deliberation_halt_logit"] = (
                         self.deliberation_halt_head(state).squeeze(-1)
@@ -1139,6 +1143,9 @@ def event_batch_shape_telemetry(event_mask: Any) -> dict[str, int | float]:
 
 
 class EntityGraphPolicy:
+    # Inference schedulers may omit diagnostic-only heads without changing the
+    # checkpoint or the policy/value tensors consumed by search.
+    supports_final_vp_selection = True
     name = "entity_graph"
     policy_type = "entity_graph"
 
@@ -1238,6 +1245,7 @@ class EntityGraphPolicy:
         legal_action_context: np.ndarray,
         *,
         return_q: bool = False,
+        return_final_vp: bool = True,
     ):
         import torch
 
@@ -1280,7 +1288,11 @@ class EntityGraphPolicy:
         action_ids = torch.as_tensor(
             legal_action_ids, dtype=torch.long, device=self.device
         )
-        outputs = self.model(batch, return_q=return_q)
+        outputs = self.model(
+            batch,
+            return_q=return_q,
+            return_final_vp=return_final_vp,
+        )
         valid = action_ids >= 0
         outputs["logits"] = outputs["logits"].masked_fill(~valid, -1.0e9)
         return outputs

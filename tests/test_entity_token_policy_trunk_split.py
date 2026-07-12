@@ -128,6 +128,30 @@ def test_forward_is_exact_composition_of_state_and_action_apis():
     assert encoded_state[0].shape[0] == batch["hex_tokens"].shape[0]
 
 
+def test_policy_value_only_output_selection_is_bit_identical_and_skips_final_vp():
+    model = EntityGraphNet(_config()).eval()
+    batch = _batch()
+    calls = 0
+
+    def count_call(_module, _inputs, _output):
+        nonlocal calls
+        calls += 1
+
+    handle = model.final_vp_head.register_forward_hook(count_call)
+    try:
+        with torch.no_grad():
+            full = model(batch, return_final_vp=True)
+            policy_value = model(batch, return_final_vp=False)
+    finally:
+        handle.remove()
+
+    assert calls == 1
+    assert "final_vp" in full
+    assert "final_vp" not in policy_value
+    assert torch.equal(full["logits"], policy_value["logits"])
+    assert torch.equal(full["value"], policy_value["value"])
+
+
 def test_zero_init_target_gather_gets_a_nonzero_first_step_gradient():
     """Exact warm-start must not make the topology branch permanently inert."""
     model = EntityGraphNet(_config(action_target_gather=True)).train()

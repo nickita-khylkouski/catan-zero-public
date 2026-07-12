@@ -164,6 +164,21 @@ def _uncertainty_from_outputs(outputs: dict[str, Any], row: int) -> float:
     return float(tensor.detach().float().cpu().numpy()[row])
 
 
+def _forward_search_policy(
+    policy: Any,
+    entity: dict[str, np.ndarray],
+    legal_ids: np.ndarray,
+    context: np.ndarray,
+    *,
+    return_q: bool,
+) -> dict[str, Any]:
+    """Request only tensors consumed by search when the policy supports it."""
+    kwargs: dict[str, bool] = {"return_q": bool(return_q)}
+    if bool(getattr(policy, "supports_final_vp_selection", False)):
+        kwargs["return_final_vp"] = False
+    return policy.forward_legal_np(entity, legal_ids, context, **kwargs)
+
+
 def _fetch_leaf_decision_inputs(
     game: Any,
     colors: tuple[str, ...],
@@ -524,7 +539,8 @@ class EntityGraphRustEvaluator:
                 resolved=resolved,
             )
 
-        outputs = self.policy.forward_legal_np(
+        outputs = _forward_search_policy(
+            self.policy,
             entity,
             legal_ids,
             context,
@@ -663,7 +679,13 @@ class EntityGraphRustEvaluator:
 
         def forward_fn(entity_n, legal_n, ctx_n, return_q):
             with torch.no_grad():
-                out = self.policy.forward_legal_np(entity_n, legal_n, ctx_n, return_q=return_q)
+                out = _forward_search_policy(
+                    self.policy,
+                    entity_n,
+                    legal_n,
+                    ctx_n,
+                    return_q=return_q,
+                )
             return {
                 "logits": out["logits"].detach().float().cpu().numpy(),
                 "value": self._value_output(out).detach().float().cpu().numpy().reshape(-1),
@@ -846,8 +868,12 @@ class EntityGraphRustEvaluator:
             import torch
 
             with torch.no_grad():
-                outputs = self.policy.forward_legal_np(
-                    entity_batch, legal_ids, context, return_q=False
+                outputs = _forward_search_policy(
+                    self.policy,
+                    entity_batch,
+                    legal_ids,
+                    context,
+                    return_q=False,
                 )
             logits_batch = outputs["logits"].detach().float().cpu().numpy()
             values = self._value_output(outputs).detach().float().cpu().numpy()
@@ -1134,7 +1160,8 @@ class BatchedEntityGraphRustEvaluator(EntityGraphRustEvaluator):
             import torch
 
             with torch.no_grad():
-                outputs = self.policy.forward_legal_np(
+                outputs = _forward_search_policy(
+                    self.policy,
                     entity_batch,
                     legal_ids,
                     context,
