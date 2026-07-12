@@ -256,17 +256,28 @@ def _validate_scalar_attestation(lock: Mapping[str, Any]) -> None:
     if len(producers) != 1:
         raise CanaryError("live canary requires exactly one producer checkpoint")
     metadata = producers[0].get("metadata")
-    if (
-        not isinstance(metadata, Mapping)
-        or metadata.get("mask_hidden_info") is not True
-    ):
+    if not isinstance(metadata, Mapping):
+        try:
+            metadata = contract._checkpoint_metadata(  # noqa: SLF001
+                Path(str(producers[0]["path"])),
+                checkpoint_sha256=str(producers[0]["sha256"]),
+                value_readout="scalar",
+                require_trained_readout=True,
+                legacy_scalar_attestation=None,
+            )
+        except (contract.ContractError, KeyError) as error:
+            raise CanaryError(
+                f"producer lacks inspectable masked-checkpoint provenance: {error}"
+            ) from error
+    if metadata.get("mask_hidden_info") is not True:
         raise CanaryError("producer lacks masked-checkpoint provenance")
     attestation = metadata.get("legacy_scalar_readout_attestation")
-    if (
-        not isinstance(attestation, Mapping)
-        or attestation.get("schema_version") != "legacy-scalar-readout-attestation-v1"
-    ):
-        raise CanaryError("producer lacks the typed legacy scalar attestation")
+    if metadata.get("value_training_schema") == "value-training-v1":
+        return
+    if not isinstance(attestation, Mapping) or attestation.get(
+        "schema_version"
+    ) != "legacy-scalar-readout-attestation-v1":
+        raise CanaryError("producer lacks trained scalar-readout provenance")
 
 
 def _selected_lanes(
