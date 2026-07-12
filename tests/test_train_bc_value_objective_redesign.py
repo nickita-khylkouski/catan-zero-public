@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+from tools import train_bc
 from tools.train_bc import (
     _hl_gauss_value_targets,
     _resolve_value_objective_weights,
@@ -282,6 +283,8 @@ def _evaluate(
     value_weights: np.ndarray | None = None,
     batch_size: int = 2,
     truncation_weight: float = 0.25,
+    data_loader_workers: int = 0,
+    data_loader_prefetch: int = 2,
 ) -> dict:
     n = len(data["action_taken"])
     if value_weights is None:
@@ -312,7 +315,38 @@ def _evaluate(
         truncated_vp_margin_value_weight=truncation_weight,
         value_categorical_loss_weight=categorical_weight,
         value_target_lambda=target_lambda,
+        data_loader_workers=data_loader_workers,
+        data_loader_prefetch=data_loader_prefetch,
     )
+
+
+def test_xdim_validation_memmap_prefetch_is_metric_identical() -> None:
+    """Threaded validation changes scheduling, never rows, order, or metrics."""
+    policy, data = _validation_fixture()
+    corpus = object.__new__(train_bc.MemmapCorpus)
+    corpus._eager = data
+    corpus._lazy = {}
+    corpus.row_count = len(data["action_taken"])
+
+    synchronous = _evaluate(
+        policy,
+        corpus,
+        scalar_weight=0.25,
+        categorical_weight=0.0,
+        batch_size=2,
+        data_loader_workers=0,
+    )
+    prefetched = _evaluate(
+        policy,
+        corpus,
+        scalar_weight=0.25,
+        categorical_weight=0.0,
+        batch_size=2,
+        data_loader_workers=2,
+        data_loader_prefetch=2,
+    )
+
+    assert prefetched == synchronous
 
 
 def test_xdim_validation_default_mse_objective_and_telemetry() -> None:

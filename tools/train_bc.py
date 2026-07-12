@@ -218,9 +218,10 @@ def build_parser() -> argparse.ArgumentParser:
         default=0,
         help=(
             "Background prefetch threads for --data-format memmap. 0 (default) "
-            "reconstructs each batch synchronously in the train loop. >0 overlaps "
-            "per-batch reconstruction with GPU compute to recover the streaming "
-            "throughput cost; ignored for --data-format npz (batches are cheap views)."
+            "reconstructs each batch synchronously in the train and validation "
+            "loops. >0 overlaps per-batch reconstruction with GPU compute to "
+            "recover the streaming throughput cost; ignored for --data-format npz "
+            "(batches are cheap views)."
         ),
     )
     parser.add_argument(
@@ -5109,6 +5110,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             value_categorical_loss_weight=resolved_categorical_value_weight,
             value_hlgauss_sigma_ratio=float(args.value_hlgauss_sigma_ratio),
             value_target_lambda=float(args.value_target_lambda),
+            data_loader_workers=int(args.data_loader_workers),
+            data_loader_prefetch=int(args.data_loader_prefetch),
         )
         metrics[-1]["validation"] = validation_metrics
         _rank0_print(
@@ -6376,6 +6379,8 @@ def evaluate_bc_batches(
     value_categorical_loss_weight: float = 0.0,
     value_hlgauss_sigma_ratio: float = 0.75,
     value_target_lambda: float = 1.0,
+    data_loader_workers: int = 0,
+    data_loader_prefetch: int = 2,
 ) -> dict:
     if len(indices) == 0:
         return {}
@@ -6443,16 +6448,32 @@ def evaluate_bc_batches(
                 "value_hlgauss_sigma_ratio": float(value_hlgauss_sigma_ratio),
                 "value_target_lambda": float(value_target_lambda),
             }
-        for start_idx in range(0, len(eval_indices), batch_size):
-            batch = eval_indices[start_idx : start_idx + batch_size]
-            if len(batch) == 0:
-                continue
-            batch_metrics = eval_fn(
-                policy,
+        # Validation used to bypass the streaming loader and synchronously
+        # reconstruct every ragged memmap batch on the rank's main thread. On a
+        # large validation sentinel that leaves the GPU idle while one CPU is
+        # materialising the next batch. Reuse the exact training iterator: its
+        # synchronous path preserves historical global indices, while its
+        # threaded path materialises the same rows in deterministic order and
+        # overlaps future CPU work with the current GPU forward pass.
+        eval_order = np.arange(len(eval_indices), dtype=np.int64)
+        for batch_data, batch, batch_policy_weights, batch_value_weights in (
+            _iterate_training_batches(
                 data,
-                batch,
+                eval_order,
+                eval_indices,
+                batch_size,
                 policy_sample_weights,
                 value_sample_weights,
+                num_workers=int(data_loader_workers),
+                prefetch=int(data_loader_prefetch),
+            )
+        ):
+            batch_metrics = eval_fn(
+                policy,
+                batch_data,
+                batch,
+                batch_policy_weights,
+                batch_value_weights,
                 soft_target_temperature,
                 soft_target_weight,
                 soft_target_source,
