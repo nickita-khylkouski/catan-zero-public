@@ -95,6 +95,45 @@ def test_graph_history_contract_rejects_unverified_v1_metadata() -> None:
     enforce_graph_history_contract(audit, required=False)
 
 
+def test_malformed_payload_scan_cannot_fail_open_as_nonzero_history() -> None:
+    metadata = {
+        "row_count": 3,
+        "payload_inventory_sha256": "sha256:" + "a" * 64,
+        "implicit_zero_columns": [],
+    }
+    with pytest.raises(InformationSurfaceError, match="exact nonnegative"):
+        audit_memmap_metadata(
+            metadata,
+            payload_scan={
+                "row_count": 3,
+                "payload_inventory_sha256": metadata["payload_inventory_sha256"],
+                "columns": {},
+            },
+        )
+
+
+def test_payload_scan_must_bind_authenticated_inventory_and_rows() -> None:
+    metadata = {
+        "row_count": 3,
+        "payload_inventory_sha256": "sha256:" + "a" * 64,
+        "implicit_zero_columns": [],
+    }
+    scan = {
+        "row_count": 3,
+        "payload_inventory_sha256": "sha256:" + "b" * 64,
+        "columns": {
+            "event_tokens": {"nonzero_count": 1},
+            "event_mask": {"nonzero_count": 1},
+        },
+    }
+    with pytest.raises(InformationSurfaceError, match="authenticated payload"):
+        audit_memmap_metadata(metadata, payload_scan=scan)
+    scan["payload_inventory_sha256"] = metadata["payload_inventory_sha256"]
+    scan["row_count"] = 4
+    with pytest.raises(InformationSurfaceError, match="row count"):
+        audit_memmap_metadata(metadata, payload_scan=scan)
+
+
 @pytest.mark.parametrize("trunk", ["rrt", "resrgcn"])
 def test_relational_trunks_consume_topology_and_bind_actions(trunk: str) -> None:
     report = build_report(_base(state_trunk=trunk))

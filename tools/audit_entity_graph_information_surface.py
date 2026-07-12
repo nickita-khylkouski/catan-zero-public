@@ -193,13 +193,48 @@ def audit_memmap_metadata(
         )
     scan_tokens_zero = scan_mask_zero = None
     if payload_scan is not None:
+        metadata_rows = metadata.get("row_count")
+        scan_rows = payload_scan.get("row_count")
+        if (
+            isinstance(metadata_rows, bool)
+            or not isinstance(metadata_rows, int)
+            or isinstance(scan_rows, bool)
+            or not isinstance(scan_rows, int)
+            or scan_rows != metadata_rows
+        ):
+            raise InformationSurfaceError(
+                "payload scan row count does not match memmap metadata"
+            )
+        metadata_inventory = metadata.get("payload_inventory_sha256")
+        scan_inventory = payload_scan.get("payload_inventory_sha256")
+        if (
+            not isinstance(metadata_inventory, str)
+            or _SHA256_RE.fullmatch(metadata_inventory) is None
+            or scan_inventory != metadata_inventory
+        ):
+            raise InformationSurfaceError(
+                "payload scan is not bound to the authenticated payload inventory"
+            )
         scanned = payload_scan.get("columns")
         if not isinstance(scanned, Mapping):
             raise InformationSurfaceError("payload scan has no columns mapping")
         token_scan = scanned.get("event_tokens", {})
         mask_scan = scanned.get("event_mask", {})
-        scan_tokens_zero = int(token_scan.get("nonzero_count", -1)) == 0
-        scan_mask_zero = int(mask_scan.get("nonzero_count", -1)) == 0
+        token_nonzero = token_scan.get("nonzero_count")
+        mask_nonzero = mask_scan.get("nonzero_count")
+        if (
+            isinstance(token_nonzero, bool)
+            or not isinstance(token_nonzero, int)
+            or token_nonzero < 0
+            or isinstance(mask_nonzero, bool)
+            or not isinstance(mask_nonzero, int)
+            or mask_nonzero < 0
+        ):
+            raise InformationSurfaceError(
+                "payload scan must contain exact nonnegative event token/mask counts"
+            )
+        scan_tokens_zero = token_nonzero == 0
+        scan_mask_zero = mask_nonzero == 0
         if scan_tokens_zero != scan_mask_zero:
             raise InformationSurfaceError(
                 "event token/mask payload scans disagree about zero history"
@@ -381,6 +416,9 @@ def build_a1_training_event_history_contract(
                 "empty-history acknowledgements are invalid when the graph/history "
                 "observation schema is disabled"
             )
+        for component in components:
+            component["status"] = "schema_disabled"
+            del component["pre_acknowledgement_disposition"]
         return {
             "schema": TRAINING_CONTRACT_SCHEMA,
             "graph_history_observation_schema": False,
