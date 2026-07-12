@@ -143,6 +143,12 @@ def test_rebases_next_campaign_to_committed_producer_and_prior_history(
     assert campaign["common_recipe"]["category_c_scale"]["current_producer"] == 0.1
     prior = next(row for row in campaign["checkpoints"] if row["id"] == "prior_generator")
     assert prior["role"] == "history"
+    assert campaign["rebase"]["builder"] == {
+        "path": "tools/a1_pre_wave_contract.py",
+        "sha256": contract._sha256(  # noqa: SLF001
+            Path(contract.__file__).resolve()
+        ),
+    }
     recent = next(
         row for row in campaign["source_categories"] if row["name"] == "recent_history"
     )
@@ -152,6 +158,40 @@ def test_rebases_next_campaign_to_committed_producer_and_prior_history(
         "next_campaign_seed_floor"
     ]
     assert contract.validate_generation_campaign(out) == campaign
+    relocated_root = tmp_path / "second-clean-checkout"
+    relocated_builder = relocated_root / "tools/a1_pre_wave_contract.py"
+    relocated_builder.parent.mkdir(parents=True)
+    relocated_builder.write_bytes(Path(contract.__file__).resolve().read_bytes())
+    (relocated_root / "configs").symlink_to(
+        contract.REPO_ROOT / "configs", target_is_directory=True
+    )
+    with monkeypatch.context() as relocated:
+        relocated.setattr(contract, "REPO_ROOT", relocated_root)
+        relocated.setattr(
+            contract,
+            "_current_repo_commit",
+            lambda: campaign["implementation_commit"],
+        )
+        relocated.setattr(
+            contract,
+            "_refresh_campaign_provenance",
+            lambda _source: campaign["provenance"],
+        )
+        # The source campaign is independently covered by its own immutable-
+        # provenance tests.  Stub that recursive validation here so this test
+        # isolates the property under test: rebuilding the post-promotion
+        # payload must not depend on the checkout's absolute directory.
+        relocated.setattr(
+            contract,
+            "validate_generation_campaign",
+            lambda _path, **_kwargs: source_payload,
+        )
+        assert (
+            contract._validate_post_promotion_campaign(  # noqa: SLF001
+                out, campaign, require_ready=False
+            )
+            == campaign
+        )
     with pytest.raises(contract.ContractError, match="not launchable until exact placement"):
         contract.validate_generation_campaign(out, require_ready=True)
 

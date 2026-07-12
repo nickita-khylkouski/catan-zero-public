@@ -2953,8 +2953,11 @@ def _post_promotion_campaign_payload(
         "previous_producer": old_producers[0],
         "promoted_producer": producer,
         "builder": {
-            "path": str(Path(__file__).resolve()),
-            "sha256": _sha256(Path(__file__).resolve()),
+            # Bind source identity, not the ephemeral checkout that happened
+            # to build the campaign.  An absolute ``__file__`` made otherwise
+            # identical clean worktrees rebuild different payloads.
+            "path": "tools/a1_pre_wave_contract.py",
+            "sha256": _sha256(REPO_ROOT / "tools/a1_pre_wave_contract.py"),
         },
     }
     value.pop("supersedes", None)
