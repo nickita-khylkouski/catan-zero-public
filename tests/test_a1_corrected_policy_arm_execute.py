@@ -84,6 +84,9 @@ def _write_realized_report(payload: dict) -> Path:
                 "policy_kl_anchor_weight": arm.REPLAY_ANCHOR_WEIGHT,
                 "winner_sample_weight": 1.0,
                 "loser_sample_weight": 1.0,
+                "policy_base_active_rows": arm.EXPECTED_POLICY_BASE_ACTIVE_ROWS,
+                "policy_aux_active_rows": arm.EXPECTED_POLICY_AUX_ACTIVE_ROWS,
+                "policy_total_active_rows": arm.EXPECTED_POLICY_BASE_ACTIVE_ROWS,
             }
         ),
         encoding="utf-8",
@@ -101,6 +104,35 @@ def test_verify_training_report_replays_supervision_provenance(
     assert verified["supervision_contract_sha256"] == payload[
         "supervision_contract"
     ]["contract_sha256"]
+    assert verified["policy_active_row_dose"] == {
+        "base": arm.EXPECTED_POLICY_BASE_ACTIVE_ROWS,
+        "aux": 0,
+        "total": arm.EXPECTED_POLICY_BASE_ACTIVE_ROWS,
+    }
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("policy_base_active_rows", 1, "base policy-active dose"),
+        ("policy_aux_active_rows", 1, "auxiliary policy-active dose"),
+        ("policy_total_active_rows", 1, "does not add up"),
+    ],
+)
+def test_verify_training_report_refuses_policy_active_dose_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    value: int,
+    message: str,
+) -> None:
+    path, payload = _manifest(tmp_path, monkeypatch)
+    report = _write_realized_report(payload)
+    result = json.loads(report.read_text())
+    result[field] = value
+    report.write_text(json.dumps(result), encoding="utf-8")
+    with pytest.raises(executor.ExecutionError, match=message):
+        executor.verify_training_report(path, report)
 
 
 def test_verify_training_report_refuses_scope_drift(

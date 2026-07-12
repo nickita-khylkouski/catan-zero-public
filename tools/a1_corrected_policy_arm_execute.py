@@ -254,10 +254,54 @@ def verify_training_report(manifest_path: Path, report_path: Path) -> dict[str, 
     observed = {key: report.get(key) for key in exact_scalars}
     if observed != exact_scalars:
         raise ExecutionError(f"training report supervision scalar drift: {observed}")
+    dose_contract = contract.get("policy_active_row_dose")
+    expected_dose = {
+        "reference_base_active_rows": prepare.EXPECTED_POLICY_BASE_ACTIVE_ROWS,
+        "base_active_rows_tolerance": prepare.POLICY_BASE_ACTIVE_ROW_TOLERANCE,
+        "min_base_active_rows": (
+            prepare.EXPECTED_POLICY_BASE_ACTIVE_ROWS
+            - prepare.POLICY_BASE_ACTIVE_ROW_TOLERANCE
+        ),
+        "max_base_active_rows": (
+            prepare.EXPECTED_POLICY_BASE_ACTIVE_ROWS
+            + prepare.POLICY_BASE_ACTIVE_ROW_TOLERANCE
+        ),
+        "expected_aux_active_rows": prepare.EXPECTED_POLICY_AUX_ACTIVE_ROWS,
+        "accounting": "realized_policy_active_rows_not_global_samples",
+    }
+    if dose_contract != expected_dose:
+        raise ExecutionError("manifest policy-active dose contract drift")
+    base_active = report.get("policy_base_active_rows")
+    aux_active = report.get("policy_aux_active_rows")
+    total_active = report.get("policy_total_active_rows")
+    if any(
+        isinstance(value, bool) or not isinstance(value, int) or value < 0
+        for value in (base_active, aux_active, total_active)
+    ):
+        raise ExecutionError("training report policy-active dose is missing or malformed")
+    if not (
+        dose_contract["min_base_active_rows"]
+        <= base_active
+        <= dose_contract["max_base_active_rows"]
+    ):
+        raise ExecutionError(
+            "training report base policy-active dose differs from the sealed band"
+        )
+    if aux_active != dose_contract["expected_aux_active_rows"]:
+        raise ExecutionError(
+            "training report auxiliary policy-active dose differs from the sealed recipe"
+        )
+    if total_active != base_active + aux_active:
+        raise ExecutionError("training report total policy-active dose does not add up")
     return {
         "manifest": manifest_ref,
         "report": {"path": str(report_path), "sha256": prepare._file_sha(report_path)},  # noqa: SLF001
         "supervision_contract_sha256": contract.get("contract_sha256"),
+        "policy_active_row_dose": {
+            "base": base_active,
+            "aux": aux_active,
+            "total": total_active,
+        },
         "verified": True,
     }
 

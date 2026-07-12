@@ -32,11 +32,19 @@ if str(REPO_ROOT) not in sys.path:
 from tools import train_bc  # noqa: E402
 
 
-SCHEMA = "a1-next-production-learner-manifest-v2"
-SUPERVISION_CONTRACT_SCHEMA = "a1-next-learner-supervision-contract-v1"
+SCHEMA = "a1-next-production-learner-manifest-v3"
+SUPERVISION_CONTRACT_SCHEMA = "a1-next-learner-supervision-contract-v2"
 CURRENT_TEACHER_COMPONENT_IDS = ("n128_current", "n256_current")
 REPLAY_COMPONENT_ID = "gen3_replay"
 REPLAY_ANCHOR_WEIGHT = 0.0
+# The successful L1 dose consumed 4,194,304 global rows but only 515,337
+# multi-action rows carried policy gradient.  The current-teacher-only mixture
+# changes that fraction slightly, so bind a narrow realized-dose band rather
+# than pretending global samples are policy samples.  Auxiliary policy rows
+# remain exactly off until an independently winning dose is found.
+EXPECTED_POLICY_BASE_ACTIVE_ROWS = 515_337
+POLICY_BASE_ACTIVE_ROW_TOLERANCE = 12_000
+EXPECTED_POLICY_AUX_ACTIVE_ROWS = 0
 EVENT_HISTORY_COMMAND_CONTRACT_SCHEMA = "a1-event-history-command-contract-v1"
 EVENT_HISTORY_ACK_FLAG = (
     "--acknowledge-empty-event-history-payload-inventory-sha256"
@@ -604,6 +612,18 @@ def _next_supervision_contract(
         "soft_target_source": "policy",
         "soft_target_weight": 1.0,
         "policy_aux_active_batch_size_per_rank": 0,
+        "policy_active_row_dose": {
+            "reference_base_active_rows": EXPECTED_POLICY_BASE_ACTIVE_ROWS,
+            "base_active_rows_tolerance": POLICY_BASE_ACTIVE_ROW_TOLERANCE,
+            "min_base_active_rows": (
+                EXPECTED_POLICY_BASE_ACTIVE_ROWS - POLICY_BASE_ACTIVE_ROW_TOLERANCE
+            ),
+            "max_base_active_rows": (
+                EXPECTED_POLICY_BASE_ACTIVE_ROWS + POLICY_BASE_ACTIVE_ROW_TOLERANCE
+            ),
+            "expected_aux_active_rows": EXPECTED_POLICY_AUX_ACTIVE_ROWS,
+            "accounting": "realized_policy_active_rows_not_global_samples",
+        },
         "outcome_conditioned_policy_weighting": False,
         "expected_train_report_provenance": {
             "policy_distillation_scope.component_ids": current,
@@ -708,6 +728,9 @@ def prepare(args: argparse.Namespace) -> tuple[dict[str, Any], Path]:
         "steps": 1024, "base_value_row_dose": 4_194_304,
         "policy_aux_active_batch_size_per_rank": 0,
         "policy_aux_active_row_dose": 0,
+        "expected_policy_base_active_rows": EXPECTED_POLICY_BASE_ACTIVE_ROWS,
+        "policy_base_active_row_tolerance": POLICY_BASE_ACTIVE_ROW_TOLERANCE,
+        "expected_policy_aux_active_rows": EXPECTED_POLICY_AUX_ACTIVE_ROWS,
         "policy_distillation_component_ids": list(CURRENT_TEACHER_COMPONENT_IDS),
         "value_training_component_ids": list(CURRENT_TEACHER_COMPONENT_IDS),
         "component_game_sampling_ratios": [5.0 / 7.0, 2.0 / 7.0],

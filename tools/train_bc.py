@@ -6720,6 +6720,13 @@ def main(argv: Sequence[str] | None = None) -> None:
         "policy_base_active_rows": int(
             sum(int(metric.get("policy_base_active_rows", 0)) for metric in metrics)
         ),
+        "policy_total_active_rows": int(
+            sum(
+                int(metric.get("policy_base_active_rows", 0))
+                + int(metric.get("policy_aux_active_rows", 0))
+                for metric in metrics
+            )
+        ),
         "value_loss_weight": args.value_loss_weight,
         "action_module_lr_mult": args.action_module_lr_mult,
         "trunk_lr_mult": args.trunk_lr_mult,

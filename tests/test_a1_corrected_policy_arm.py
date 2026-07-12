@@ -175,6 +175,9 @@ def test_prepares_exact_one_dose_pure_current_policy_arm_without_launch(
     assert manifest["diagnostic_execution_authorized"] is True
     assert manifest["recipe"]["base_value_row_dose"] == 4_194_304
     assert manifest["recipe"]["policy_aux_active_row_dose"] == 0
+    assert manifest["recipe"]["expected_policy_base_active_rows"] == 515_337
+    assert manifest["recipe"]["policy_base_active_row_tolerance"] == 12_000
+    assert manifest["recipe"]["expected_policy_aux_active_rows"] == 0
     assert manifest["recipe"]["policy_distillation_component_ids"] == [
         "n128_current", "n256_current"
     ]
@@ -219,6 +222,14 @@ def test_prepares_exact_one_dose_pure_current_policy_arm_without_launch(
         "disabled_until_independent_strength_win"
     )
     assert manifest["supervision_contract"]["policy_aux_active_batch_size_per_rank"] == 0
+    assert manifest["supervision_contract"]["policy_active_row_dose"] == {
+        "reference_base_active_rows": 515_337,
+        "base_active_rows_tolerance": 12_000,
+        "min_base_active_rows": 503_337,
+        "max_base_active_rows": 527_337,
+        "expected_aux_active_rows": 0,
+        "accounting": "realized_policy_active_rows_not_global_samples",
+    }
     assert "--validation-game-seed-manifest" not in command
     assert command[command.index("torch.distributed.run") + 1] == "--standalone"
     assert [row["role"] for row in manifest["failed_retry_lineage"]["artifacts"]] == list(
