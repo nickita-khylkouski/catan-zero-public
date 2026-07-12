@@ -7,6 +7,7 @@ from catan_zero.rl.entity_token_policy import EntityGraphConfig
 from tools.audit_entity_graph_information_surface import (
     InformationSurfaceError,
     audit_memmap_metadata,
+    build_a1_training_event_history_contract,
     build_report,
     enforce_graph_history_contract,
     scan_event_payload,
@@ -67,9 +68,7 @@ def test_exact_scan_proves_old_physical_event_columns_are_constant(tmp_path) -> 
     }
     np.zeros((rows, 2, 3), dtype=np.float16).tofile(tmp_path / "event_tokens.dat")
     np.zeros((rows, 2), dtype=np.bool_).tofile(tmp_path / "event_mask.dat")
-    np.full((rows, 2, 4), -1, dtype=np.int16).tofile(
-        tmp_path / "event_target_ids.dat"
-    )
+    np.full((rows, 2, 4), -1, dtype=np.int16).tofile(tmp_path / "event_target_ids.dat")
     metadata = {
         "row_count": rows,
         "columns": columns,
@@ -112,3 +111,114 @@ def test_half_declared_implicit_event_columns_fail_closed() -> None:
 def test_malformed_implicit_columns_fail_closed() -> None:
     with pytest.raises(InformationSurfaceError, match="sequence"):
         audit_memmap_metadata({"implicit_zero_columns": "event_tokens"})
+
+
+def _a1_meta(digit: str, *, implicit_zero: bool) -> dict:
+    return {
+        "payload_inventory_sha256": "sha256:" + digit * 64,
+        "row_count": 3,
+        "implicit_zero_columns": (
+            ["event_mask", "event_tokens"] if implicit_zero else []
+        ),
+    }
+
+
+def test_a1_training_contract_binds_empty_ack_to_exact_payload_inventory() -> None:
+    metadata = {
+        "n128": _a1_meta("1", implicit_zero=True),
+        # A physical v1 payload is unknown without a scan.  Its explicit
+        # acknowledgement truthfully authorizes only shape-compatible use.
+        "n256": _a1_meta("2", implicit_zero=False),
+    }
+    report = build_a1_training_event_history_contract(
+        metadata,
+        graph_history_features=True,
+        empty_payload_inventory_acknowledgements=[
+            metadata["n128"]["payload_inventory_sha256"],
+            metadata["n256"]["payload_inventory_sha256"],
+        ],
+    )
+    assert report["status"] == "empty_payloads_acknowledged"
+    assert report["graph_history_observation_schema"] is True
+    assert report["event_history_trainable"] is False
+    assert [item["status"] for item in report["components"]] == [
+        "empty_acknowledged_machine_proven",
+        "empty_acknowledged_legacy_payload",
+    ]
+
+
+@pytest.mark.parametrize(
+    "acknowledgements, expected",
+    [
+        ([], "missing="),
+        (["sha256:" + "9" * 64], "missing="),
+        (
+            ["sha256:" + "1" * 64, "sha256:" + "9" * 64],
+            "extra=",
+        ),
+    ],
+)
+def test_a1_training_contract_rejects_missing_or_extra_payload_ack(
+    acknowledgements, expected
+) -> None:
+    with pytest.raises(InformationSurfaceError, match=expected):
+        build_a1_training_event_history_contract(
+            {"n128": _a1_meta("1", implicit_zero=True)},
+            graph_history_features=True,
+            empty_payload_inventory_acknowledgements=acknowledgements,
+        )
+
+
+def test_a1_training_contract_rejects_ack_when_schema_disabled() -> None:
+    with pytest.raises(InformationSurfaceError, match="schema is disabled"):
+        build_a1_training_event_history_contract(
+            {"n128": _a1_meta("1", implicit_zero=True)},
+            graph_history_features=False,
+            empty_payload_inventory_acknowledgements=["sha256:" + "1" * 64],
+        )
+
+
+def test_a1_training_contract_rejects_unbound_inventory_identity() -> None:
+    with pytest.raises(InformationSurfaceError, match="payload_inventory_sha256"):
+        build_a1_training_event_history_contract(
+            {"n128": {"implicit_zero_columns": []}},
+            graph_history_features=True,
+        )
+
+
+def test_a1_training_contract_accepts_inventory_bound_nonzero_scan() -> None:
+    metadata = {"fresh": _a1_meta("3", implicit_zero=False)}
+    scan = {
+        "payload_inventory_sha256": metadata["fresh"]["payload_inventory_sha256"],
+        "row_count": 3,
+        "columns": {
+            "event_tokens": {"nonzero_count": 7},
+            "event_mask": {"nonzero_count": 2},
+        },
+    }
+    report = build_a1_training_event_history_contract(
+        metadata,
+        graph_history_features=True,
+        component_payload_scans={"fresh": scan},
+    )
+    assert report["status"] == "verified_nonzero"
+    assert report["event_history_trainable"] is True
+    assert report["empty_payload_inventory_acknowledgements"] == []
+
+
+def test_a1_training_contract_rejects_scan_for_different_inventory() -> None:
+    metadata = {"fresh": _a1_meta("3", implicit_zero=False)}
+    scan = {
+        "payload_inventory_sha256": "sha256:" + "4" * 64,
+        "row_count": 3,
+        "columns": {
+            "event_tokens": {"nonzero_count": 7},
+            "event_mask": {"nonzero_count": 2},
+        },
+    }
+    with pytest.raises(InformationSurfaceError, match="not bound"):
+        build_a1_training_event_history_contract(
+            metadata,
+            graph_history_features=True,
+            component_payload_scans={"fresh": scan},
+        )

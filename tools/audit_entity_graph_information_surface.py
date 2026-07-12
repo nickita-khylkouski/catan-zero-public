@@ -13,13 +13,16 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 import numpy as np
 
 
 SCHEMA = "entity-graph-information-surface-audit-v1"
+TRAINING_CONTRACT_SCHEMA = "a1-training-event-history-contract-v1"
+_SHA256_RE = re.compile(r"sha256:[0-9a-f]{64}")
 
 
 class InformationSurfaceError(ValueError):
@@ -228,11 +231,16 @@ def audit_memmap_metadata(
     }
 
 
-def build_report(config: Any, metadata: Mapping[str, Any] | None = None) -> dict[str, Any]:
+def build_report(
+    config: Any, metadata: Mapping[str, Any] | None = None
+) -> dict[str, Any]:
     architecture = audit_architecture_config(config)
     corpus = audit_memmap_metadata(metadata) if metadata is not None else None
     critical: list[str] = []
-    if not architecture["topology_consumed"] and not architecture["action_target_bound"]:
+    if (
+        not architecture["topology_consumed"]
+        and not architecture["action_target_bound"]
+    ):
         critical.append("spatial_state_action_aliasing")
     if corpus is not None and corpus["event_history_trainable"] is False:
         critical.append("public_history_absent")
@@ -260,6 +268,170 @@ def enforce_graph_history_contract(
         raise InformationSurfaceError(
             "graph_history_features=true but event history is " + reason
         )
+
+
+def build_a1_training_event_history_contract(
+    component_metadata: Mapping[str, Mapping[str, Any]],
+    *,
+    graph_history_features: bool,
+    empty_payload_inventory_acknowledgements: Sequence[str] = (),
+    component_payload_scans: Mapping[str, Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Bind an A1 learner's history claim to authenticated corpus payloads.
+
+    ``graph_history_features`` historically names both an observation *shape*
+    and usable public event history.  Existing A1 corpora have that shape but
+    physical, all-zero legacy event columns.  Silently calling the event
+    encoder trainable is false; globally disabling the graph/history schema is
+    also impossible because it changes the checkpoint input width.
+
+    This contract keeps those two facts separate.  Nonzero history must be
+    proven by metadata or an exact payload scan.  Empty/unverified legacy
+    components may be used only when the operator explicitly acknowledges the
+    exact authenticated ``payload_inventory_sha256`` for every such component.
+    The acknowledgement authorizes shape-compatible training; it never turns
+    empty history into trainable history.
+
+    The caller must pass metadata only after the normal A1 payload-inventory
+    authentication.  Requiring component ids as mapping keys makes a composite
+    report stable and prevents positional ambiguity.
+    """
+
+    if not isinstance(component_metadata, Mapping) or not component_metadata:
+        raise InformationSurfaceError(
+            "A1 event-history contract requires at least one named component"
+        )
+    if isinstance(empty_payload_inventory_acknowledgements, (str, bytes)):
+        raise InformationSurfaceError(
+            "empty-history payload acknowledgements must be a sequence"
+        )
+    acknowledgements = [
+        str(value) for value in empty_payload_inventory_acknowledgements
+    ]
+    if any(_SHA256_RE.fullmatch(value) is None for value in acknowledgements):
+        raise InformationSurfaceError(
+            "empty-history payload acknowledgements must be sha256:<64 lowercase hex>"
+        )
+    if len(set(acknowledgements)) != len(acknowledgements):
+        raise InformationSurfaceError(
+            "empty-history payload acknowledgements must not contain duplicates"
+        )
+
+    payload_scans = component_payload_scans or {}
+    if not isinstance(payload_scans, Mapping) or not set(payload_scans).issubset(
+        {str(key) for key in component_metadata}
+    ):
+        raise InformationSurfaceError(
+            "event payload scans must be a mapping for named corpus components"
+        )
+
+    components: list[dict[str, Any]] = []
+    required_acknowledgements: set[str] = set()
+    trainable_components = 0
+    for raw_component_id, metadata in component_metadata.items():
+        component_id = str(raw_component_id)
+        if not component_id or not isinstance(metadata, Mapping):
+            raise InformationSurfaceError(
+                "A1 event-history components require non-empty ids and metadata objects"
+            )
+        inventory_sha256 = metadata.get("payload_inventory_sha256")
+        if (
+            not isinstance(inventory_sha256, str)
+            or _SHA256_RE.fullmatch(inventory_sha256) is None
+        ):
+            raise InformationSurfaceError(
+                f"component {component_id!r} lacks an authenticated "
+                "payload_inventory_sha256"
+            )
+        payload_scan = payload_scans.get(component_id)
+        if payload_scan is not None and (
+            payload_scan.get("payload_inventory_sha256") != inventory_sha256
+            or int(payload_scan.get("row_count", -1))
+            != int(metadata.get("row_count", -2))
+        ):
+            raise InformationSurfaceError(
+                f"component {component_id!r} event payload scan is not bound to "
+                "its authenticated inventory and row count"
+            )
+        corpus_audit = audit_memmap_metadata(metadata, payload_scan=payload_scan)
+        observed = corpus_audit["event_history_trainable"]
+        if observed is True:
+            trainable_components += 1
+            disposition = "verified_nonzero"
+        else:
+            required_acknowledgements.add(inventory_sha256)
+            disposition = (
+                "machine_proven_empty"
+                if observed is False
+                else "legacy_payload_unverified"
+            )
+        components.append(
+            {
+                "component_id": component_id,
+                "payload_inventory_sha256": inventory_sha256,
+                "event_history_trainable": observed,
+                "pre_acknowledgement_disposition": disposition,
+            }
+        )
+
+    provided = set(acknowledgements)
+    if not graph_history_features:
+        if provided:
+            raise InformationSurfaceError(
+                "empty-history acknowledgements are invalid when the graph/history "
+                "observation schema is disabled"
+            )
+        return {
+            "schema": TRAINING_CONTRACT_SCHEMA,
+            "graph_history_observation_schema": False,
+            "event_history_trainable": False,
+            "status": "schema_disabled",
+            "components": components,
+            "empty_payload_inventory_acknowledgements": [],
+        }
+
+    missing = sorted(required_acknowledgements - provided)
+    extra = sorted(provided - required_acknowledgements)
+    if missing or extra:
+        details: list[str] = []
+        if missing:
+            details.append("missing=" + repr(missing))
+        if extra:
+            details.append("extra=" + repr(extra))
+        raise InformationSurfaceError(
+            "graph/history observation schema has absent or unverified event history; "
+            "acknowledgements must exactly match authenticated payload inventories "
+            + " ".join(details)
+        )
+
+    for component in components:
+        if component["payload_inventory_sha256"] in required_acknowledgements:
+            component["event_history_trainable"] = False
+            component["status"] = (
+                "empty_acknowledged_machine_proven"
+                if component["pre_acknowledgement_disposition"]
+                == "machine_proven_empty"
+                else "empty_acknowledged_legacy_payload"
+            )
+        else:
+            component["status"] = "verified_nonzero"
+        del component["pre_acknowledgement_disposition"]
+
+    any_trainable = trainable_components > 0
+    if any_trainable and required_acknowledgements:
+        status = "partially_trainable_with_empty_components_acknowledged"
+    elif any_trainable:
+        status = "verified_nonzero"
+    else:
+        status = "empty_payloads_acknowledged"
+    return {
+        "schema": TRAINING_CONTRACT_SCHEMA,
+        "graph_history_observation_schema": True,
+        "event_history_trainable": any_trainable,
+        "status": status,
+        "components": components,
+        "empty_payload_inventory_acknowledgements": sorted(provided),
+    }
 
 
 def _load_checkpoint_config(path: Path) -> Any:
@@ -297,18 +469,14 @@ def main() -> None:
         parser.error("--scan-event-payload requires --corpus-meta")
     report = build_report(_load_checkpoint_config(args.checkpoint), metadata)
     if metadata is not None and payload_scan is not None:
-        report["corpus"] = audit_memmap_metadata(
-            metadata, payload_scan=payload_scan
-        )
+        report["corpus"] = audit_memmap_metadata(metadata, payload_scan=payload_scan)
         report["critical_information_bottlenecks"] = [
             item
             for item in report["critical_information_bottlenecks"]
             if item != "public_history_unverified"
         ]
         if report["corpus"]["event_history_trainable"] is False:
-            report["critical_information_bottlenecks"].append(
-                "public_history_absent"
-            )
+            report["critical_information_bottlenecks"].append("public_history_absent")
         report["safe_for_scale_only_ablation"] = not report[
             "critical_information_bottlenecks"
         ]
