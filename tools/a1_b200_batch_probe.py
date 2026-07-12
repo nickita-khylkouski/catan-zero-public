@@ -183,11 +183,18 @@ def build_plan(
     lr_policy: str,
     throughput_steps: int = 24,
     equal_sample_reference_steps: int = 48,
+    batches: Sequence[int] = BATCHES,
 ) -> dict[str, Any]:
     if throughput_steps <= 0 or equal_sample_reference_steps <= 0:
         raise ProbeError("step budgets must be positive")
-    if equal_sample_reference_steps % 3:
-        raise ProbeError("equal-sample reference steps must be divisible by 3")
+    batches = tuple(int(batch) for batch in batches)
+    if not batches or any(batch <= 0 for batch in batches) or len(set(batches)) != len(batches):
+        raise ProbeError("batch sizes must be unique positive integers")
+    reference_samples_per_rank = equal_sample_reference_steps * REFERENCE_BATCH
+    if any(reference_samples_per_rank % batch for batch in batches):
+        raise ProbeError(
+            "equal-sample reference exposure must be divisible by every batch size"
+        )
     midpoint = _authenticated_midpoint(midpoint_receipt)
     midpoint_recipe = midpoint["payload"].get("inputs", {}).get(
         "learner_ablation", {}
@@ -209,7 +216,7 @@ def build_plan(
         raise ProbeError(f"refusing existing output directory: {output_dir}")
     runs: list[dict[str, Any]] = []
     for cohort in ("throughput_fixed_steps", "learning_equal_samples"):
-        for batch in BATCHES:
+        for batch in batches:
             global_batch = batch * WORLD_SIZE
             steps = (
                 throughput_steps
@@ -572,6 +579,13 @@ def _parser() -> argparse.ArgumentParser:
     plan.add_argument("--lr-policy", choices=("fixed", "sqrt", "linear"), default="fixed")
     plan.add_argument("--throughput-steps", type=int, default=24)
     plan.add_argument("--equal-sample-reference-steps", type=int, default=48)
+    plan.add_argument(
+        "--batch-size",
+        dest="batches",
+        action="append",
+        type=int,
+        help="Local batch size; repeat to override the default 512/768/1024 sweep.",
+    )
     run = commands.add_parser("run")
     run.add_argument("--plan", type=Path, required=True)
     run.add_argument("--run-id", required=True)
@@ -591,6 +605,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 lr_policy=args.lr_policy,
                 throughput_steps=args.throughput_steps,
                 equal_sample_reference_steps=args.equal_sample_reference_steps,
+                batches=args.batches or BATCHES,
             )
         elif args.command == "run":
             result = run_one(args.plan, args.run_id, go=args.go)

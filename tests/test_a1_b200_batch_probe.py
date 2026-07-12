@@ -332,6 +332,23 @@ def test_gpu_samples_parses_nvidia_smi_spaced_csv(tmp_path: Path) -> None:
     assert result["hbm_memory_mean_mib"] == 23000.0
 
 
+def test_plan_supports_conditional_large_batch_extension(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plan = probe.build_plan(
+        midpoint_receipt=_receipt(tmp_path, monkeypatch),
+        output_dir=tmp_path / "probe",
+        lr_policy="fixed",
+        batches=(1536, 2048),
+    )
+
+    throughput = [run for run in plan["runs"] if run["cohort"] == "throughput_fixed_steps"]
+    learning = [run for run in plan["runs"] if run["cohort"] == "learning_equal_samples"]
+    assert [run["local_batch_size"] for run in throughput] == [1536, 2048]
+    assert [run["max_steps"] for run in learning] == [16, 12]
+    assert len({run["planned_samples"] for run in learning}) == 1
+
+
 def test_gpu_occupancy_allows_only_mps_server() -> None:
     def runner(command: list[str], **_kwargs: object):
         return probe.subprocess.CompletedProcess(
