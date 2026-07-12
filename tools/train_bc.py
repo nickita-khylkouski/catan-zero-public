@@ -4126,13 +4126,19 @@ def main(argv: Sequence[str] | None = None) -> None:
     # materialized) so its quality report is always available for audit, but
     # only ever passed into _epoch_order when the flag is on (see below) --
     # flag-off must reuse rng.permutation exactly, not a uniform-weighted choice.
-    policy_surprise_kl, policy_surprise_has_prior = compute_policy_surprise_kl(data)
-    policy_surprise_weights_full = policy_surprise_sampling_weights(
-        policy_surprise_kl,
-        policy_surprise_has_prior,
-        weight_scale=args.policy_surprise_weight,
-        cap=args.policy_surprise_cap,
-    )
+    if float(args.policy_surprise_weight) == 0.0:
+        # The flag-off result is exactly uniform. Avoid reconstructing the full
+        # padded prior/target matrices in every DDP rank merely to multiply the
+        # resulting KL by zero.
+        policy_surprise_weights_full = np.ones(n, dtype=np.float32)
+    else:
+        policy_surprise_kl, policy_surprise_has_prior = compute_policy_surprise_kl(data)
+        policy_surprise_weights_full = policy_surprise_sampling_weights(
+            policy_surprise_kl,
+            policy_surprise_has_prior,
+            weight_scale=args.policy_surprise_weight,
+            cap=args.policy_surprise_cap,
+        )
     split = split_train_validation_indices(
         data,
         validation_fraction=args.validation_fraction,
@@ -6959,6 +6965,7 @@ def _eval_xdim_batch(
 MEMMAP_LAZY_COLUMNS = frozenset(
     {
         "obs",
+        "legal_action_ids",
         "legal_action_context",
         "legal_action_tokens",
         "legal_action_target_ids",
@@ -6978,6 +6985,11 @@ MEMMAP_LAZY_COLUMNS = frozenset(
         "event_tokens",
         "event_target_ids",
         "event_mask",
+        "prior_policy",
+        "target_policy",
+        "target_policy_mask",
+        "target_scores",
+        "target_scores_mask",
     }
 )
 
@@ -7011,6 +7023,64 @@ class _MemmapFixedColumn:
     def __array__(self, dtype=None):
         arr = np.asarray(self._mm)
         return arr.astype(dtype) if dtype is not None else arr
+
+
+class _MemmapCategoricalColumn:
+    """Dictionary-encoded string column decoded only for requested rows.
+
+    Production corpora repeat a handful of labels across millions of rows.
+    Eager ``categories[codes]`` creates a large fixed-width Unicode array in
+    every DDP rank.  Keeping the int32 codes mapped preserves identical NumPy
+    indexing/array semantics without retaining the decoded corpus eight times.
+    """
+
+    def __init__(self, codes: np.memmap, categories: np.ndarray):
+        self._codes = codes
+        self.categories = categories
+        self.shape = tuple(codes.shape)
+        self.ndim = codes.ndim
+        self.dtype = categories.dtype
+
+    def __len__(self) -> int:
+        return int(self._codes.shape[0])
+
+    def __getitem__(self, idx):
+        return self.categories[np.asarray(self._codes[idx])]
+
+    def __array__(self, dtype=None):
+        values = self.categories[np.asarray(self._codes)]
+        return values.astype(dtype) if dtype is not None else values
+
+    def grouped_weights(
+        self, weights: np.ndarray, *, limit: int
+    ) -> dict[str, dict[str, float | int]]:
+        codes = np.asarray(self._codes, dtype=np.int64)
+        counts = np.bincount(codes, minlength=len(self.categories))
+        totals = np.bincount(
+            codes, weights=np.asarray(weights, dtype=np.float64), minlength=len(self.categories)
+        )
+        order = np.argsort(-counts)
+        result: dict[str, dict[str, float | int]] = {}
+        for index in order[:limit]:
+            raw = int(counts[index])
+            if raw == 0:
+                continue
+            total = float(totals[index])
+            result[str(self.categories[index])] = {
+                "raw_samples": raw,
+                "weight_sum": total,
+                "mean_weight": total / raw,
+            }
+        return result
+
+    def present_values(self) -> set[str]:
+        counts = np.bincount(
+            np.asarray(self._codes, dtype=np.int64), minlength=len(self.categories)
+        )
+        return {
+            str(self.categories[index])
+            for index in np.flatnonzero(counts)
+        }
 
 
 class _ImplicitConstantColumn:
@@ -7115,6 +7185,12 @@ class _MemmapRaggedColumn:
 
     def __len__(self) -> int:
         return self._n
+
+    def row_counts(self) -> np.ndarray:
+        """Return legal-width prefix lengths without reconstructing padding."""
+        return (self._offsets[1:] - self._offsets[:-1]).astype(
+            np.int64, copy=False
+        )
 
     def _reconstruct(self, indices: np.ndarray | None) -> np.ndarray:
         width = self._width
@@ -7231,11 +7307,16 @@ class MemmapCorpus:
         for name, schema in self._columns.items():
             kind = schema["kind"]
             if kind == "string":
-                codes = np.fromfile(corpus_dir / f"{name}.codes.dat", dtype=np.int32)
+                codes = np.memmap(
+                    corpus_dir / f"{name}.codes.dat",
+                    dtype=np.int32,
+                    mode="r",
+                    shape=(self.row_count,),
+                )
                 categories = np.asarray(schema["categories"], dtype=str)
                 if categories.size == 0:
                     categories = np.asarray([""], dtype=str)
-                self._eager[name] = categories[codes]
+                self._lazy[name] = _MemmapCategoricalColumn(codes, categories)
                 continue
             if kind == "fixed":
                 inner = tuple(int(d) for d in schema["inner_shape"])
@@ -8470,9 +8551,18 @@ def validate_teacher_data_schema(policy, data: dict, data_quality: dict, env_con
             f"invalid_teacher_actions={int(data_quality['invalid_teacher_actions'])}; "
             "teacher action must be present in legal_action_ids"
         )
-    versions = np.asarray(data.get("action_mask_version", np.full(len(actions), ""))).astype(str)
-    nonempty_versions = sorted({version for version in versions if version})
-    if nonempty_versions and np.any(versions == ""):
+    version_column = data.get("action_mask_version")
+    if isinstance(version_column, _MemmapCategoricalColumn):
+        present_versions = version_column.present_values()
+        nonempty_versions = sorted(version for version in present_versions if version)
+        has_empty_version = "" in present_versions
+    else:
+        versions = np.asarray(
+            np.full(len(actions), "") if version_column is None else version_column
+        ).astype(str)
+        nonempty_versions = sorted({version for version in versions if version})
+        has_empty_version = bool(np.any(versions == ""))
+    if nonempty_versions and has_empty_version:
         problems.append(
             "mixed known and unknown action_mask_version values; regenerate or curate "
             "old shards instead of mixing empty-version rows with versioned rows"
@@ -8797,7 +8887,10 @@ def _weight_by_field(
     limit: int = 40,
 ) -> dict[str, dict]:
     n = int(len(data["action_taken"]))
-    values = np.asarray(data.get(field, np.full(n, ""))).astype(str)
+    column = data.get(field)
+    if isinstance(column, _MemmapCategoricalColumn):
+        return column.grouped_weights(weights, limit=limit)
+    values = np.asarray(np.full(n, "") if column is None else column).astype(str)
     result = {}
     for key in _top_group_keys(values, limit=limit):
         mask = values == key
@@ -10131,9 +10224,18 @@ def build_sample_weights(
         for phase, weight in phase_weights.items():
             weights[phases == phase] *= float(weight)
     if forced_action_weight != 1.0:
-        legal_counts = np.sum(data["legal_action_ids"] >= 0, axis=1)
+        legal_column = data["legal_action_ids"]
+        legal_counts = (
+            legal_column.row_counts()
+            if isinstance(legal_column, _MemmapRaggedColumn)
+            else np.sum(np.asarray(legal_column) >= 0, axis=1)
+        )
         weights[legal_counts == 1] *= float(forced_action_weight)
-    if "winner" in data and "player" in data:
+    if (
+        (float(winner_sample_weight) != 1.0 or float(loser_sample_weight) != 1.0)
+        and "winner" in data
+        and "player" in data
+    ):
         winners = np.asarray(data["winner"]).astype(str)
         players = np.asarray(data["player"]).astype(str)
         truncated = np.asarray(
