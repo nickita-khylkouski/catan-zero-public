@@ -242,7 +242,14 @@ class HexSymmetry:
             ev_tok = np.asarray(entity["event_tokens"]).copy()
             scaled = ev_tok[:, :, _EVENT_ACTION_ID_DIM].astype(np.float32)
             ids = np.rint(scaled * _EVENT_ACTION_ID_SCALE).astype(np.int64)
-            present = ids > 0
+            # Action id 0 is a valid spatial action, not an absence sentinel.
+            # Event occupancy is carried by event_mask; using ``ids > 0``
+            # silently left action 0 unrotated once real history is enabled.
+            present = np.asarray(entity.get("event_mask", ids >= 0)).astype(bool)
+            if present.shape != ids.shape:
+                raise ValueError(
+                    f"event_mask shape {present.shape} != event action ids {ids.shape}"
+                )
             ids_c = np.clip(ids, 0, self.pi_act.shape[1] - 1)
             new_ids = self.pi_act[g_arr[:, None], ids_c]
             new_scaled = np.where(present, new_ids / _EVENT_ACTION_ID_SCALE, scaled)

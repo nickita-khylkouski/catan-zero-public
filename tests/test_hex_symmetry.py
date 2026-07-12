@@ -232,6 +232,18 @@ def test_legal_action_relabel_refuses_wrong_action_space(sym, real_entity):
         )
 
 
+def test_event_action_zero_relabels_when_masked_present(sym, real_entity):
+    entity = {key: np.array(value, copy=True) for key, value in real_entity.items()}
+    entity["event_tokens"][0, -1, 35] = 0.0  # exact action id 0
+    entity["event_mask"][0, -1] = True
+    g = next(index for index in range(N_SYMMETRIES) if sym.pi_act[index, 0] != 0)
+    out = sym.permute_entity_batch(entity, g, relabel_events=True)
+    assert out["event_tokens"][0, -1, 35] == pytest.approx(
+        sym.pi_act[g, 0] / 607.0,
+        abs=5e-4,
+    )
+
+
 def test_intrinsic_features_are_a_pure_permutation(sym, real_entity):
     """Vertex/edge token rows are only reordered (multiset preserved); hex rows
     likewise except the slot-fixed coordinate is restored to canonical."""
