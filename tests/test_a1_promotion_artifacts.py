@@ -64,7 +64,7 @@ def test_cohort_exclusions_are_derived_from_candidate_bound_game_seeds(
     assert unhashed.pop("manifest_sha256") == promotion._digest_value(unhashed)
 
 
-def test_cohort_exclusions_reject_source_for_another_candidate(tmp_path: Path) -> None:
+def test_cohort_exclusions_accept_recipe_selection_ancestor(tmp_path: Path) -> None:
     candidate = tmp_path / "candidate.pt"
     candidate.write_bytes(b"candidate")
     source = tmp_path / "other.json"
@@ -75,11 +75,27 @@ def test_cohort_exclusions_reject_source_for_another_candidate(tmp_path: Path) -
             "games": [{"game_seed": 100}],
         },
     )
-    with pytest.raises(artifacts.ArtifactBuildError, match="promoted candidate bytes"):
+    value = artifacts.build_cohort_exclusions(
+        contract={"contract_sha256": "sha256:" + "a" * 64},
+        candidate=candidate,
+        cohorts=[("ancestor", "internal_h2h", source)],
+    )
+    assert value["candidate_sha256"] == promotion._sha256(candidate)
+    assert value["cohorts"][0]["seed_intervals"] == [
+        {"base_seed": 100, "end_seed": 101}
+    ]
+
+
+def test_cohort_exclusions_reject_source_without_candidate_binding(tmp_path: Path) -> None:
+    candidate = tmp_path / "candidate.pt"
+    candidate.write_bytes(b"candidate")
+    source = tmp_path / "unbound.json"
+    _json(source, {"games": [{"game_seed": 100}]})
+    with pytest.raises(artifacts.ArtifactBuildError, match="no explicit candidate"):
         artifacts.build_cohort_exclusions(
             contract={"contract_sha256": "sha256:" + "a" * 64},
             candidate=candidate,
-            cohorts=[("wrong", "internal_h2h", source)],
+            cohorts=[("unbound", "internal_h2h", source)],
         )
 
 

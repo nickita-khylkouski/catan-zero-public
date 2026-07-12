@@ -1197,10 +1197,18 @@ def build_cohort_exclusions(
                 else None
             ),
         }
-        if candidate_ref["sha256"] not in bound_hashes:
+        explicit_hashes = [value for value in bound_hashes if value is not None]
+        if not explicit_hashes:
             raise ArtifactBuildError(
-                f"prior cohort {label!r} does not bind the promoted candidate bytes"
+                f"prior cohort {label!r} has no explicit candidate checkpoint binding"
             )
+        for value in explicit_hashes:
+            try:
+                promotion._validate_sha256(  # noqa: SLF001
+                    value, where=f"prior cohort {label!r} candidate checkpoint"
+                )
+            except promotion.PromotionError as error:
+                raise ArtifactBuildError(str(error)) from error
         try:
             seeds = promotion._explicit_game_seeds(  # noqa: SLF001
                 payload, where=f"prior cohort {label!r}"
