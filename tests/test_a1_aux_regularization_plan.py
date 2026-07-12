@@ -14,7 +14,8 @@ def test_probe_has_exactly_two_equal_sample_arms():
     assert all(
         arm["fixed_recipe"]["sample_dose"] == SAMPLE_DOSE
         and arm["fixed_recipe"]["max_steps"] == plan["max_steps"]
-        and arm["fixed_recipe"]["validation_max_samples"] == 262_144
+        and arm["fixed_recipe"]["validation_max_samples"] == 0
+        and arm["fixed_recipe"]["validation_game_sentinel_target_rows"] == 262_144
         for arm in plan["arms"]
     )
 

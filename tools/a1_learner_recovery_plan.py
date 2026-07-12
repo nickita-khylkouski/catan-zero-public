@@ -60,10 +60,12 @@ def _base_recipe() -> dict[str, Any]:
         "value_head_type": "mse",
         "value_lr_mult": 1.0,
         "value_target_lambda": 1.0,
-        # External play is binding. A deterministic 262k-row sentinel is ample
-        # for loss/calibration ranking and avoids evaluating millions of rows
-        # after every short hyperparameter arm.
-        "validation_max_samples": 262_144,
+        # The trainer's row cap cannot be combined with an authenticated exact
+        # game holdout. Derive this whole-game sentinel once, bind its receipt,
+        # and retain the complete source holdout as a training exclusion.
+        "validation_max_samples": 0,
+        "validation_game_sentinel_schema": "train-validation-game-sentinel-v1",
+        "validation_game_sentinel_target_rows": 262_144,
         "weight_decay": 0.0,
     }
 

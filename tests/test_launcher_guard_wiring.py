@@ -252,6 +252,7 @@ GOLDEN_OPTION_STRINGS = {
         ("--trust-curated-data-quality",),
         ("--validation-fraction",),
         ("--validation-game-seed-manifest",),
+        ("--validation-game-sentinel-manifest",),
         ("--validation-game-seed-ranges",),
         ("--validation-max-samples",),
         ("--validation-seed",),

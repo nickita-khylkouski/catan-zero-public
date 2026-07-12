@@ -329,6 +329,17 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--validation-game-sentinel-manifest",
+        default="",
+        help=(
+            "Optional immutable train-validation-game-sentinel-v1 receipt for an "
+            "authenticated memmap composite. The selected whole games are evaluated, "
+            "while the complete component holdouts remain excluded from training. "
+            "Requires --validation-max-samples 0; derive with "
+            "tools/derive_validation_game_sentinel.py."
+        ),
+    )
+    parser.add_argument(
         "--allow-missing-game-seed-validation-split",
         action="store_true",
         help="CAT-52: split_train_validation_indices refuses, by default, to build a "
@@ -2261,6 +2272,113 @@ def _load_composite_validation_contract(
     }
 
 
+def _load_composite_validation_sentinel_manifest(
+    path: str | Path,
+    *,
+    composite_meta: dict[str, object],
+    full_contract: dict[str, object],
+) -> dict[str, object]:
+    """Authenticate a whole-game subset of a composite's full holdout.
+
+    The returned contract deliberately retains ``excluded_game_seeds`` as the
+    complete authenticated holdout. Only ``game_seeds`` is narrowed for metric
+    evaluation, so unused sentinel games can never leak back into training.
+    """
+    if int(full_contract.get("validation_row_count", 0)) <= 0:
+        raise SystemExit("cannot derive a sentinel from an empty validation contract")
+    try:
+        manifest_path = Path(path).expanduser().resolve(strict=True)
+        raw = manifest_path.read_bytes()
+        payload = json.loads(raw)
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise SystemExit(f"cannot load validation sentinel manifest {path}: {error}") from error
+    expected_fields = {
+        "schema_version", "source_composite_descriptor_file_sha256",
+        "source_composite_descriptor_fingerprint", "source_validation_bindings",
+        "selection_seed", "target_row_count", "selected_row_count",
+        "selected_game_seed_count", "selected_game_seed_set_sha256",
+        "excluded_game_seed_count", "excluded_game_seed_set_sha256", "game_seeds",
+    }
+    if not isinstance(payload, dict) or set(payload) != expected_fields:
+        raise SystemExit("validation sentinel manifest fields differ from its schema")
+    if payload["schema_version"] != "train-validation-game-sentinel-v1":
+        raise SystemExit("validation sentinel manifest schema is unsupported")
+    for field in (
+        "selection_seed", "target_row_count", "selected_row_count",
+        "selected_game_seed_count", "excluded_game_seed_count",
+    ):
+        value = payload[field]
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise SystemExit(f"validation sentinel manifest {field} is invalid")
+    if payload["target_row_count"] <= 0 or payload["selected_row_count"] <= 0:
+        raise SystemExit("validation sentinel row counts must be positive")
+    if payload["source_composite_descriptor_file_sha256"] != composite_meta.get(
+        "descriptor_file_sha256"
+    ) or payload["source_composite_descriptor_fingerprint"] != composite_meta.get(
+        "descriptor_fingerprint"
+    ):
+        raise SystemExit("validation sentinel source composite binding drift")
+
+    contracts = full_contract.get("component_contracts")
+    if not isinstance(contracts, list):
+        raise SystemExit("validation sentinel source has no component contracts")
+    expected_bindings = [
+        {
+            "component_index": index,
+            "validation_manifest_file_sha256": contract["file_sha256"],
+            "validation_manifest_sha256": contract["manifest_sha256"],
+            "validation_game_seed_set_sha256": contract[
+                "validation_game_seed_set_sha256"
+            ],
+        }
+        for index, contract in enumerate(contracts)
+    ]
+    if payload["source_validation_bindings"] != expected_bindings:
+        raise SystemExit("validation sentinel source manifest binding drift")
+
+    raw_seeds = payload["game_seeds"]
+    if (
+        not isinstance(raw_seeds, list)
+        or not raw_seeds
+        or any(isinstance(seed, bool) or not isinstance(seed, int) for seed in raw_seeds)
+    ):
+        raise SystemExit("validation sentinel game_seeds must be non-empty integers")
+    try:
+        selected = np.asarray(raw_seeds, dtype=np.int64)
+    except (OverflowError, TypeError, ValueError) as error:
+        raise SystemExit("validation sentinel contains a seed outside int64") from error
+    if not np.all(selected[1:] > selected[:-1]):
+        raise SystemExit("validation sentinel game_seeds must be strictly sorted and unique")
+    full = np.asarray(full_contract["game_seeds"], dtype=np.int64)
+    if not set(map(int, selected)).issubset(set(map(int, full))):
+        raise SystemExit("validation sentinel contains games outside the authenticated holdout")
+    if payload["selected_game_seed_count"] != int(selected.size):
+        raise SystemExit("validation sentinel selected game count mismatch")
+    selected_digest = _game_seed_set_sha256(selected)
+    if payload["selected_game_seed_set_sha256"] != selected_digest:
+        raise SystemExit("validation sentinel selected seed digest mismatch")
+    if (
+        payload["excluded_game_seed_count"] != int(full.size)
+        or payload["excluded_game_seed_set_sha256"]
+        != full_contract["validation_game_seed_set_sha256"]
+    ):
+        raise SystemExit("validation sentinel full-holdout exclusion binding drift")
+
+    return {
+        **full_contract,
+        "path": manifest_path,
+        "file_sha256": f"sha256:{hashlib.sha256(raw).hexdigest()}",
+        "manifest_sha256": _canonical_json_sha256(payload),
+        "validation_row_count": int(payload["selected_row_count"]),
+        "validation_game_seed_set_sha256": selected_digest,
+        "game_seeds": selected,
+        "excluded_game_seeds": full,
+        "full_validation_row_count": int(full_contract["validation_row_count"]),
+        "sentinel_target_row_count": int(payload["target_row_count"]),
+        "sentinel_selection_seed": int(payload["selection_seed"]),
+    }
+
+
 def _validate_a1_validation_manifest_corpus_binding(
     corpus_meta: object, validation_seed_contract: dict[str, object]
 ) -> None:
@@ -3695,14 +3813,30 @@ def main(argv: Sequence[str] | None = None) -> None:
     )
     if is_memmap_composite:
         _validate_composite_learner_recipe_authorization(args, a1_preflight_meta)
+        if int(args.validation_max_samples) != 0:
+            raise SystemExit(
+                "authenticated composite validation requires --validation-max-samples 0; "
+                "use a whole-game --validation-game-sentinel-manifest instead"
+            )
         validation_seed_contract = _load_composite_validation_contract(
             a1_preflight_meta,
             validation_fraction=float(args.validation_fraction),
             validation_seed=int(args.validation_seed),
-            validation_max_samples=int(args.validation_max_samples),
+            validation_max_samples=0,
             validation_game_seed_ranges=validation_game_seed_ranges,
         )
+        if args.validation_game_sentinel_manifest:
+            validation_seed_contract = _load_composite_validation_sentinel_manifest(
+                args.validation_game_sentinel_manifest,
+                composite_meta=a1_preflight_meta,
+                full_contract=validation_seed_contract,
+            )
     elif args.validation_game_seed_manifest:
+        if args.validation_game_sentinel_manifest:
+            raise SystemExit(
+                "--validation-game-sentinel-manifest is supported only for an "
+                "authenticated memmap composite"
+            )
         if args.data_format != "memmap":
             raise SystemExit(
                 "--validation-game-seed-manifest is the audited A1 memmap path; "
@@ -3714,6 +3848,10 @@ def main(argv: Sequence[str] | None = None) -> None:
             validation_seed=int(args.validation_seed),
             validation_max_samples=int(args.validation_max_samples),
             validation_game_seed_ranges=validation_game_seed_ranges,
+        )
+    elif args.validation_game_sentinel_manifest:
+        raise SystemExit(
+            "--validation-game-sentinel-manifest requires an authenticated memmap composite"
         )
 
     if args.hidden_size is None:
@@ -4386,6 +4524,16 @@ def main(argv: Sequence[str] | None = None) -> None:
                     validation_seed_contract["game_seeds"], dtype=np.int64
                 )
             ),
+            training_excluded_game_seeds=(
+                None
+                if validation_seed_contract is None
+                else np.asarray(
+                    validation_seed_contract.get(
+                        "excluded_game_seeds", validation_seed_contract["game_seeds"]
+                    ),
+                    dtype=np.int64,
+                )
+            ),
             allow_missing_game_seed=bool(
                 args.allow_missing_game_seed_validation_split
             ),
@@ -4561,6 +4709,32 @@ def main(argv: Sequence[str] | None = None) -> None:
                     ),
                     "validation_game_seed_count": validation_game_seed_count,
                     "validation_game_seed_set_sha256": validation_seed_set_sha256,
+                    "training_excluded_game_seed_count": (
+                        int(
+                            np.asarray(
+                                validation_seed_contract.get(
+                                    "excluded_game_seeds",
+                                    validation_seed_contract["game_seeds"],
+                                ),
+                                dtype=np.int64,
+                            ).size
+                        )
+                        if validation_seed_contract is not None
+                        else validation_game_seed_count
+                    ),
+                    "training_excluded_game_seed_set_sha256": (
+                        _game_seed_set_sha256(
+                            np.asarray(
+                                validation_seed_contract.get(
+                                    "excluded_game_seeds",
+                                    validation_seed_contract["game_seeds"],
+                                ),
+                                dtype=np.int64,
+                            )
+                        )
+                        if validation_seed_contract is not None
+                        else validation_seed_set_sha256
+                    ),
                     **(
                         {
                             "a1_contract_sha256": validation_seed_contract[
@@ -5245,6 +5419,33 @@ def main(argv: Sequence[str] | None = None) -> None:
             None
             if validation_seed_contract is None
             else validation_seed_contract["file_sha256"]
+        ),
+        "input_validation_game_sentinel_manifest": (
+            str(args.validation_game_sentinel_manifest) or None
+        ),
+        "training_excluded_game_seed_count": (
+            0
+            if validation_seed_contract is None
+            else int(
+                np.asarray(
+                    validation_seed_contract.get(
+                        "excluded_game_seeds", validation_seed_contract["game_seeds"]
+                    ),
+                    dtype=np.int64,
+                ).size
+            )
+        ),
+        "training_excluded_game_seed_set_sha256": (
+            None
+            if validation_seed_contract is None
+            else _game_seed_set_sha256(
+                np.asarray(
+                    validation_seed_contract.get(
+                        "excluded_game_seeds", validation_seed_contract["game_seeds"]
+                    ),
+                    dtype=np.int64,
+                )
+            )
         ),
         "a1_contract_sha256": (
             None
@@ -10973,6 +11174,7 @@ def split_train_validation_indices(
     validation_max_samples: int,
     validation_game_seed_ranges: list[tuple[int, int]] | None = None,
     validation_game_seeds: np.ndarray | None = None,
+    training_excluded_game_seeds: np.ndarray | None = None,
     allow_missing_game_seed: bool = False,
 ) -> dict[str, np.ndarray]:
     """Split into train/validation indices.
@@ -11032,9 +11234,25 @@ def split_train_validation_indices(
                 "exact validation game-seed manifest references games absent from "
                 f"the corpus: missing={len(missing)}"
             )
+        excluded = (
+            requested
+            if training_excluded_game_seeds is None
+            else np.asarray(training_excluded_game_seeds, dtype=np.int64).reshape(-1)
+        )
+        if excluded.size == 0 or len(np.unique(excluded)) != len(excluded):
+            raise SystemExit("training-excluded game seeds must be non-empty and unique")
+        excluded_set = set(map(int, excluded.tolist()))
+        if not set(map(int, requested.tolist())).issubset(excluded_set):
+            raise SystemExit("validation game seeds must be a subset of training exclusions")
+        excluded_missing = excluded_set - present
+        if excluded_missing:
+            raise SystemExit(
+                "training-excluded game seeds reference games absent from the corpus: "
+                f"missing={len(excluded_missing)}"
+            )
         validation_mask = np.isin(seeds, requested)
         validation = all_indices[validation_mask]
-        train = all_indices[~validation_mask]
+        train = all_indices[~np.isin(seeds, excluded)]
         if len(train) == 0:
             raise SystemExit(
                 "exact validation game-seed manifest selects the entire corpus"

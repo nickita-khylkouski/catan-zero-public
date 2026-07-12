@@ -46,6 +46,23 @@ present is compared to the effective command before data loading. This
 explicitly authorizes the diagnostic learner drift without weakening
 single-contract A1 runs.
 
+Short diagnostic sweeps must not use `--validation-max-samples` to row-slice
+this exact holdout. Derive one immutable whole-game sentinel instead:
+
+```bash
+python tools/derive_validation_game_sentinel.py \
+  --composite /absolute/composite.json \
+  --target-rows 262144 \
+  --out /absolute/composite.validation_sentinel.json
+```
+
+Then train with `--validation-max-samples 0` and
+`--validation-game-sentinel-manifest /absolute/composite.validation_sentinel.json`.
+The sentinel receipt binds the descriptor and every source validation-manifest
+hash. Only its selected games are evaluated, but the complete original union
+holdout remains excluded from training; unused holdout games never leak into
+gradients.
+
 The corrected mixed value-objective probe is prepared with
 `tools/a1_mixed_value_objective_probe.py`. It accepts an LR verdict only from
 `6e-5`, `1.2e-4`, or `2.4e-4`, binds the ordered n256+n128 corpora and their
