@@ -10,6 +10,7 @@ mode=${1:-}
 root=${A1_COMBINED_ROOT:-/home/ubuntu/experimental_nonpromotable/a1-combined-80-20-20260711}
 script_repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 repo=${A1_REPO:-$script_repo}
+handoff_repo=${A1_HANDOFF_REPO:-$repo}
 python=${A1_PYTHON:-$repo/.venv/bin/python}
 producer=${A1_PRODUCER:-/home/ubuntu/catan-zero-production/runs/learner/a1-infoset-n128-20260710-r2/candidate.pt}
 contracts=${A1_CONTRACTS:-/home/ubuntu/catan-zero-production/contracts/a1-dual-arm-20260710-r1/locks}
@@ -19,7 +20,7 @@ overrides='{"loser_sample_weight":1.0,"lr":0.00012}'
 
 if [[ "$mode" == --go ]]; then
   [[ -s "$handoff" ]] || { echo "REFUSED: canonical combined handoff is not complete" >&2; exit 2; }
-  "$python" - "$repo" "$handoff" <<'PY'
+  "$python" - "$handoff_repo" "$handoff" <<'PY'
 import sys
 from pathlib import Path
 sys.path.insert(0,sys.argv[1])

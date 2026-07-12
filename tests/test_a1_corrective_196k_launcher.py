@@ -9,6 +9,7 @@ def test_corrective_launcher_is_syntax_clean_and_fail_closed_on_handoff() -> Non
     subprocess.run(["bash", "-n", str(SCRIPT)], check=True)
     text = SCRIPT.read_text(encoding="utf-8")
     assert "a1_combined_candidate_handoff" in text
+    assert "A1_HANDOFF_REPO" in text
     assert "combined.verify_result" in text
     assert 'result["passed"]' in text
     assert "final.summary.json" not in text
