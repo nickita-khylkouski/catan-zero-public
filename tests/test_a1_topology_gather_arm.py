@@ -133,10 +133,14 @@ def _args(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     manifest = _source_manifest(tmp_path, source, descriptor, validation)
     monkeypatch.setattr(arm.corrected, "_preflight_descriptor", lambda _path: ({
         "components": [
-            {"component_id": component_id, "corpus_dir": str(path.resolve())}
-            for component_id, path in zip(
+            {
+                "component_id": component_id,
+                "corpus_dir": str(path.resolve()),
+                "payload_inventory_sha256": "sha256:" + str(index) * 64,
+            }
+            for index, (component_id, path) in enumerate(zip(
                 ("n128_current", "n256_current", "gen3_replay"), corpora
-            )
+            ), start=1)
         ],
         "policy_distillation_component_ids": ["n128_current", "n256_current"],
         "value_training_component_ids": ["n128_current", "n256_current"],
@@ -183,6 +187,11 @@ def test_prepares_one_axis_gather_k3_without_launch(tmp_path, monkeypatch):
     assert manifest["executor_compatibility"]["compatible_now"] is True
     assert manifest["executor_compatibility"]["one_shot"] is True
     command = manifest["command"]
+    assert command.count(arm.corrected.EVENT_HISTORY_ACK_FLAG) == 3
+    assert command.count(arm.corrected.EVENT_HISTORY_CROP_FLAG) == 1
+    assert manifest["event_history_training_contract"][
+        "crop_authenticated_empty_event_history"
+    ] is True
     assert "--a1-learner-ablation-id" not in command
     assert arm.corrected._option(command, "--init-checkpoint") == str(
         _args_checkpoint(manifest)

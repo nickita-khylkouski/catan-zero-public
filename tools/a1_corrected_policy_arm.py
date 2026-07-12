@@ -16,9 +16,10 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -28,6 +29,11 @@ from tools import train_bc  # noqa: E402
 
 
 SCHEMA = "a1-corrected-policy-arm-manifest-v1"
+EVENT_HISTORY_COMMAND_CONTRACT_SCHEMA = "a1-event-history-command-contract-v1"
+EVENT_HISTORY_ACK_FLAG = (
+    "--acknowledge-empty-event-history-payload-inventory-sha256"
+)
+EVENT_HISTORY_CROP_FLAG = "--crop-authenticated-empty-event-history"
 LINEAGE_ROLES = (
     "parent_failed_claim",
     "parent_failed_receipt",
@@ -111,6 +117,71 @@ def _set_option(command: list[str], flag: str, value: str) -> None:
         command[index + 1] = value
     else:
         command.extend((flag, value))
+
+
+def _event_history_training_contract(
+    descriptor_meta: Mapping[str, Any],
+) -> dict[str, Any]:
+    components = descriptor_meta.get("components")
+    if not isinstance(components, list) or not components:
+        raise ArmError("descriptor has no authenticated event-history components")
+    bindings = []
+    for component in components:
+        if not isinstance(component, Mapping):
+            raise ArmError("descriptor event-history component is malformed")
+        component_id = component.get("component_id")
+        inventory = component.get("payload_inventory_sha256")
+        if (
+            not isinstance(component_id, str)
+            or not isinstance(inventory, str)
+            or re.fullmatch(r"sha256:[0-9a-f]{64}", inventory) is None
+        ):
+            raise ArmError("descriptor component lacks an authenticated payload inventory")
+        bindings.append(
+            {"component_id": component_id, "payload_inventory_sha256": inventory}
+        )
+    return {
+        "schema": EVENT_HISTORY_COMMAND_CONTRACT_SCHEMA,
+        "empty_payload_inventory_acknowledgements": bindings,
+        "crop_authenticated_empty_event_history": True,
+    }
+
+
+def _bind_event_history_training_command(
+    command: list[str], descriptor_meta: Mapping[str, Any]
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    contract = _event_history_training_contract(descriptor_meta)
+    expected = [
+        row["payload_inventory_sha256"]
+        for row in contract["empty_payload_inventory_acknowledgements"]
+    ]
+    positions = [index for index, value in enumerate(command) if value == EVENT_HISTORY_ACK_FLAG]
+    had_crop = EVENT_HISTORY_CROP_FLAG in command
+    if positions:
+        observed = [
+            command[index + 1]
+            for index in positions
+            if index + 1 < len(command) and not command[index + 1].startswith("--")
+        ]
+        if len(observed) != len(positions) or observed != expected:
+            raise ArmError("source command event-history acknowledgements drift")
+    else:
+        for inventory in expected:
+            command.extend((EVENT_HISTORY_ACK_FLAG, inventory))
+    if EVENT_HISTORY_CROP_FLAG not in command:
+        command.append(EVENT_HISTORY_CROP_FLAG)
+    elif command.count(EVENT_HISTORY_CROP_FLAG) != 1:
+        raise ArmError("source command repeats authenticated event-history crop flag")
+    return contract, {
+        "event_history_acknowledgements": {
+            "source": "absent" if not positions else expected,
+            "treatment": expected,
+        },
+        EVENT_HISTORY_CROP_FLAG: {
+            "source": "present" if had_crop else "absent",
+            "treatment": "present",
+        },
+    }
 
 
 def _load_source_receipt(path: Path) -> tuple[dict[str, Any], dict[str, str]]:
@@ -490,6 +561,10 @@ def prepare(args: argparse.Namespace) -> tuple[dict[str, Any], Path]:
         sentinel=Path(sentinel_ref["path"]), f7=Path(f7_ref["path"]),
         output_root=output_root,
     )
+    event_history_contract, event_history_changes = (
+        _bind_event_history_training_command(command, descriptor_meta)
+    )
+    changes.update(event_history_changes)
     a1_metadata = _rebind_a1_metadata(command, repo)
     recipe = {
         "world_size": 8, "local_batch_size": 512, "global_batch_size": 4096,
@@ -526,6 +601,7 @@ def prepare(args: argparse.Namespace) -> tuple[dict[str, Any], Path]:
         "initialization": f7_ref,
         "source_binding": source_binding,
         "a1_runtime_metadata": a1_metadata,
+        "event_history_training_contract": event_history_contract,
         "recipe": recipe,
         "recipe_sha256": _digest(recipe),
         "causal_interpretation": {

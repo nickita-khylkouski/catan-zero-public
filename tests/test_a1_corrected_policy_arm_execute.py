@@ -71,6 +71,27 @@ def test_verify_refuses_manifest_semantic_drift(
         executor.verify(path)
 
 
+@pytest.mark.parametrize("missing", ["ack", "crop", "manifest"])
+def test_verify_refuses_missing_event_history_command_contract(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, missing: str
+) -> None:
+    path, payload = _manifest(tmp_path, monkeypatch)
+    command = payload["command"]
+    if missing == "ack":
+        index = command.index(arm.EVENT_HISTORY_ACK_FLAG)
+        del command[index : index + 2]
+    elif missing == "crop":
+        command.remove(arm.EVENT_HISTORY_CROP_FLAG)
+    else:
+        payload.pop("event_history_training_contract")
+    payload["command_sha256"] = arm._digest(command)
+    payload.pop("manifest_sha256", None)
+    payload["manifest_sha256"] = arm._digest(payload)
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    with pytest.raises(executor.ExecutionError, match="event-history|crop flag"):
+        executor.verify(path)
+
+
 def test_explicit_execute_submits_exact_command_and_writes_append_only_evidence(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

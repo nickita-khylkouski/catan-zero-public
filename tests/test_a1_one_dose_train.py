@@ -282,8 +282,33 @@ def test_command_is_direct_one_b200_fresh_unfused_adam(tmp_path: Path) -> None:
     assert "--no-symmetry-augment" in command
     assert "--validation-game-seed-manifest" in command
     assert "--p-full" not in command  # generation choice remains contract-bound.
+    # Historical source-bound production commands remain causally immutable.
+    assert executor.EVENT_HISTORY_ACK_FLAG not in command
+    assert executor.EVENT_HISTORY_CROP_FLAG not in command
     for flag, value in executor.SEALED_A1_MODEL_CLI.items():
         assert _option(command, flag) == value
+
+
+def test_latest_main_ablation_command_binds_inventory_ack_and_crop(tmp_path: Path) -> None:
+    verified = _verified(tmp_path)
+    verified["recipe"]["per_game_value_weight_mode"] = "equal"
+    verified["learner_ablation"] = {
+        "ablation_id": "new-main-arm",
+        "code_binding": {},
+        "code_tree_sha256": "sha256:" + "8" * 64,
+        "reviewed_lock_file_sha256": "sha256:" + "9" * 64,
+    }
+    command = executor.build_train_command(
+        verified,
+        python=Path(sys.executable),
+        checkpoint=tmp_path / "candidate.pt",
+        report=tmp_path / "report.json",
+    )
+    assert command.count(executor.EVENT_HISTORY_ACK_FLAG) == 1
+    assert _option(command, executor.EVENT_HISTORY_ACK_FLAG) == verified[
+        "payload_inventory_sha256"
+    ]
+    assert command.count(executor.EVENT_HISTORY_CROP_FLAG) == 1
 
 
 def test_real_gen3_architecture_cannot_fall_back_to_cli_defaults(

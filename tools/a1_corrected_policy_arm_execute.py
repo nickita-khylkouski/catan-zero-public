@@ -73,6 +73,44 @@ def _git_head(repo: Path) -> str:
         raise ExecutionError(f"cannot identify execution checkout: {error}") from error
 
 
+def _verify_event_history_training_contract(
+    manifest: dict[str, Any], command: list[str], descriptor: Path
+) -> None:
+    contract = manifest.get("event_history_training_contract")
+    if not isinstance(contract, dict) or not (
+        contract.get("schema") == prepare.EVENT_HISTORY_COMMAND_CONTRACT_SCHEMA
+        and contract.get("crop_authenticated_empty_event_history") is True
+    ):
+        raise ExecutionError("manifest has no authenticated event-history contract")
+    try:
+        descriptor_meta, _ = prepare._preflight_descriptor(descriptor)  # noqa: SLF001
+        expected_contract = prepare._event_history_training_contract(  # noqa: SLF001
+            descriptor_meta
+        )
+    except prepare.ArmError as error:
+        raise ExecutionError(str(error)) from error
+    if contract != expected_contract:
+        raise ExecutionError("event-history contract differs from descriptor inventories")
+    expected = [
+        row["payload_inventory_sha256"]
+        for row in contract["empty_payload_inventory_acknowledgements"]
+    ]
+    positions = [
+        index
+        for index, value in enumerate(command)
+        if value == prepare.EVENT_HISTORY_ACK_FLAG
+    ]
+    observed = [
+        command[index + 1]
+        for index in positions
+        if index + 1 < len(command) and not command[index + 1].startswith("--")
+    ]
+    if observed != expected or len(positions) != len(expected):
+        raise ExecutionError("command lacks the exact event-history inventory ACK set")
+    if command.count(prepare.EVENT_HISTORY_CROP_FLAG) != 1:
+        raise ExecutionError("command lacks the authenticated empty-history crop flag")
+
+
 def verify(manifest_path: Path) -> dict[str, Any]:
     manifest, manifest_ref = _read_manifest(manifest_path)
     for field in (
@@ -116,6 +154,9 @@ def verify(manifest_path: Path) -> dict[str, Any]:
     for flag, expected in exact_inputs.items():
         if _option(command, flag) != expected:
             raise ExecutionError(f"command differs from bound {flag}")
+    _verify_event_history_training_contract(
+        manifest, command, Path(manifest["descriptor"]["path"])
+    )
     if "--validation-game-seed-manifest" in command:
         raise ExecutionError("command contains a second validation control")
     output_root = Path(_option(command, "--checkpoint")).parent.resolve()

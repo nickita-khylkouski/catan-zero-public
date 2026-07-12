@@ -59,6 +59,10 @@ MIN_NOFILE = 65_536
 MAX_IDLE_GPU_MEMORY_MIB = 64
 DATA_LOADER_WORKERS = 2
 DATA_LOADER_PREFETCH = 2
+EVENT_HISTORY_ACK_FLAG = (
+    "--acknowledge-empty-event-history-payload-inventory-sha256"
+)
+EVENT_HISTORY_CROP_FLAG = "--crop-authenticated-empty-event-history"
 TRUSTED_A1_LOCK_FILE_SHA256 = (
     "sha256:8301c7547e1745812c69ca04934424755c7116eb5e221688abc58c1bcb7a3122"
 )
@@ -975,6 +979,9 @@ def build_train_command(
                 # otherwise serialize or reject independent diagnostic arms.
                 # Never add this to the historical/default one-dose command.
                 "--allow-concurrent-bc",
+                EVENT_HISTORY_ACK_FLAG,
+                str(verified["payload_inventory_sha256"]),
+                EVENT_HISTORY_CROP_FLAG,
                 "--per-game-value-weight-mode",
                 str(recipe["per_game_value_weight_mode"]),
                 "--a1-learner-ablation-id",
@@ -2326,6 +2333,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             plan.update(
                 {
                     "learner_ablation": verified["learner_ablation"],
+                    "event_history_training_contract": {
+                        "schema": "a1-event-history-command-contract-v1",
+                        "empty_payload_inventory_acknowledgements": [
+                            {
+                                "component_id": "a1",
+                                "payload_inventory_sha256": verified[
+                                    "payload_inventory_sha256"
+                                ],
+                            }
+                        ],
+                        "crop_authenticated_empty_event_history": True,
+                    },
                     "diagnostic_only": True,
                     "promotion_eligible": False,
                 }

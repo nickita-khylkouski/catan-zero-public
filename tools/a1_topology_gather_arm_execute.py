@@ -186,6 +186,33 @@ def verify(manifest_path: Path) -> dict[str, Any]:
     for flag, expected in exact_inputs.items():
         if base._option(command, flag) != expected:  # noqa: SLF001
             raise ExecutionError(f"command differs from bound {flag}")
+    contract = manifest.get("event_history_training_contract")
+    descriptor_meta, _ = prepare.corrected._preflight_descriptor(  # noqa: SLF001
+        descriptor
+    )
+    expected_contract = prepare.corrected._event_history_training_contract(  # noqa: SLF001
+        descriptor_meta
+    )
+    if contract != expected_contract:
+        raise ExecutionError("topology manifest event-history contract drift")
+    expected_acks = [
+        row["payload_inventory_sha256"]
+        for row in expected_contract["empty_payload_inventory_acknowledgements"]
+    ]
+    positions = [
+        index
+        for index, value in enumerate(command)
+        if value == prepare.corrected.EVENT_HISTORY_ACK_FLAG
+    ]
+    observed_acks = [
+        command[index + 1]
+        for index in positions
+        if index + 1 < len(command) and not command[index + 1].startswith("--")
+    ]
+    if observed_acks != expected_acks or len(positions) != len(expected_acks):
+        raise ExecutionError("topology command lacks exact event-history ACK set")
+    if command.count(prepare.corrected.EVENT_HISTORY_CROP_FLAG) != 1:
+        raise ExecutionError("topology command lacks authenticated event crop flag")
     if "--validation-game-seed-manifest" in command:
         raise ExecutionError("command contains a second validation control")
     if not (

@@ -350,6 +350,15 @@ def prepare(args: argparse.Namespace) -> tuple[dict[str, Any], Path]:
     upgrade = _validate_upgrade(source_init, upgraded)
     coverage = _validate_coverage(args.architecture_audit, Path(source["descriptor"]["path"]))
     command, changes = _derive_command(source["command"], upgraded=upgraded, output_root=output_root)
+    descriptor_meta, _ = corrected._preflight_descriptor(  # noqa: SLF001
+        Path(source["descriptor"]["path"])
+    )
+    event_history_contract, event_history_changes = (
+        corrected._bind_event_history_training_command(  # noqa: SLF001
+            command, descriptor_meta
+        )
+    )
+    changes.update(event_history_changes)
     # Everything that affects optimization remains byte-identical because the
     # derived argv changes only checkpoint/output paths.  Real corrected-K3
     # receipts are plain diagnostic torchrun commands and intentionally carry
@@ -380,6 +389,7 @@ def prepare(args: argparse.Namespace) -> tuple[dict[str, Any], Path]:
         "initialization_treatment": upgrade["upgraded"],
         "function_preserving_upgrade": upgrade,
         "corpus_topology_target_coverage": coverage,
+        "event_history_training_contract": event_history_contract,
         "source_binding": source_binding,
         "only_declared_optimization_delta": "action_target_gather=true",
         "matched_contract": {

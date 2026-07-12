@@ -109,6 +109,27 @@ def test_verify_refuses_semantic_digest_drift(
         executor.verify(path)
 
 
+def test_verify_refuses_topology_manifest_without_crop_proof(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path, payload = _manifest(tmp_path, monkeypatch)
+    payload["command"].remove(arm.corrected.EVENT_HISTORY_CROP_FLAG)
+    payload["command_sha256"] = arm.corrected._digest(payload["command"])
+    _write_manifest(path, payload)
+    with pytest.raises(executor.ExecutionError, match="crop flag"):
+        executor.verify(path)
+
+
+def test_verify_refuses_topology_manifest_without_event_contract(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path, payload = _manifest(tmp_path, monkeypatch)
+    payload.pop("event_history_training_contract")
+    _write_manifest(path, payload)
+    with pytest.raises(executor.ExecutionError, match="event-history contract drift"):
+        executor.verify(path)
+
+
 def test_verify_refuses_bound_source_bytes_drift(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

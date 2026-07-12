@@ -87,12 +87,14 @@ def _args(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> argparse.Namespace
         {
             "corpus_dir": f"/corpus/{component_id}",
             "corpus_meta_sha256": f"sha256:meta-{component_id}",
-            "payload_inventory_sha256": f"sha256:inventory-{component_id}",
+            "payload_inventory_sha256": "sha256:" + str(index) * 64,
             "validation_manifest": f"/validation/{component_id}.json",
             "validation_manifest_sha256": f"sha256:validation-{component_id}",
             "component_id": component_id,
         }
-        for component_id in ("n128_current", "n256_current", "gen3_replay")
+        for index, component_id in enumerate(
+            ("n128_current", "n256_current", "gen3_replay"), start=1
+        )
     ]
 
     def fake_preflight(path: Path):
@@ -121,6 +123,7 @@ def _args(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> argparse.Namespace
                 "policy_distillation_component_ids": ["n128_current", "n256_current"],
                 "value_training_component_ids": ["n128_current", "n256_current"],
                 "component_ids": ["n128_current", "n256_current", "gen3_replay"],
+                "components": payload["components"],
                 "component_game_sampling_ratios": [4.0 / 7.0, 8.0 / 35.0, 1.0 / 5.0],
                 "policy_kl_anchor_component_ids": ["gen3_replay"],
                 "learner_recipe_overrides": payload["learner_recipe_overrides"],
@@ -198,6 +201,11 @@ def test_prepares_exact_one_dose_pure_current_policy_arm_without_launch(
     assert arm._option(command, "--loser-sample-weight") == "1.0"
     assert arm._option(command, "--max-steps") == "1024"
     assert command.count("--validation-game-sentinel-manifest") == 1
+    assert command.count(arm.EVENT_HISTORY_ACK_FLAG) == 3
+    assert command.count(arm.EVENT_HISTORY_CROP_FLAG) == 1
+    assert manifest["event_history_training_contract"][
+        "crop_authenticated_empty_event_history"
+    ] is True
     assert "--validation-game-seed-manifest" not in command
     assert command[command.index("torch.distributed.run") + 1] == "--standalone"
     assert [row["role"] for row in manifest["failed_retry_lineage"]["artifacts"]] == list(
