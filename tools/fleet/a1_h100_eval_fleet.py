@@ -130,6 +130,10 @@ def _run_id_from_plan_fields(plan: dict[str, Any]) -> str:
     # synthetic field while replaying their immutable run IDs.
     if "role_search_config" in plan:
         run_key["role_search_config"] = plan["role_search_config"]
+    # Optional host subsets were added after the original immutable fleet
+    # plans.  Bind them into new run IDs without changing legacy replay.
+    if "host_aliases" in plan:
+        run_key["host_aliases"] = plan["host_aliases"]
     return "a1-eval-" + hashlib.sha256(_canonical(run_key)).hexdigest()[:16]
 
 
@@ -613,6 +617,7 @@ def build_plan(
     iteration_id: str = "a1",
     seed_cohort_id: str | None = None,
     scope: str = "full",
+    host_aliases: Sequence[str] | None = None,
     repo_root: Path = _REPO_ROOT,
     repo_commit: str | None = None,
     tool_hashes: dict[str, str] | None = None,
@@ -637,6 +642,23 @@ def build_plan(
         if scope == "canary"
         else all_slots
     )
+    selected_aliases: list[str] | None = None
+    if host_aliases is not None:
+        requested = set(host_aliases)
+        known = {str(host["alias"]) for host in manifest["hosts"]}
+        unknown = sorted(requested - known)
+        if unknown:
+            raise FleetError(f"unknown evaluation host aliases: {unknown}")
+        if not requested:
+            raise FleetError("evaluation host subset must not be empty")
+        slots = [slot for slot in slots if slot["alias"] in requested]
+        selected_aliases = [
+            str(host["alias"])
+            for host in manifest["hosts"]
+            if host["alias"] in requested
+        ]
+        if not slots or {slot["alias"] for slot in slots} != requested:
+            raise FleetError("evaluation host subset is incompatible with plan scope")
     if internal_pairs < len(slots) or external_pairs < len(slots) // 2:
         raise FleetError(
             "production fleet plan requires at least one pair per internal GPU "
@@ -714,6 +736,8 @@ def build_plan(
         "scope": scope,
         "workers_per_gpu": workers_per_gpu,
     }
+    if selected_aliases is not None:
+        run_identity["host_aliases"] = selected_aliases
     run_id = _run_id_from_plan_fields(run_identity)
     run_root = f"{root}/runs/{run_id}"
     jobs: list[dict[str, Any]] = []
@@ -828,6 +852,8 @@ def build_plan(
         },
         "jobs": jobs,
     }
+    if selected_aliases is not None:
+        plan["host_aliases"] = selected_aliases
     plan["plan_hash"] = _digest(plan)
     return plan
 
@@ -943,6 +969,25 @@ def _validate_planned_jobs(plan: dict[str, Any], manifest: dict[str, Any]) -> No
         if scope == "canary"
         else all_slots
     )
+    if "host_aliases" in plan:
+        raw_aliases = plan["host_aliases"]
+        if (
+            not isinstance(raw_aliases, list)
+            or not raw_aliases
+            or any(not isinstance(alias, str) for alias in raw_aliases)
+            or len(set(raw_aliases)) != len(raw_aliases)
+        ):
+            raise FleetError("evaluation plan has an invalid host subset")
+        manifest_order = [
+            str(host["alias"])
+            for host in manifest["hosts"]
+            if host["alias"] in set(raw_aliases)
+        ]
+        if manifest_order != raw_aliases:
+            raise FleetError("evaluation plan host subset is unknown or out of order")
+        slots = [slot for slot in slots if slot["alias"] in set(raw_aliases)]
+        if not slots or {slot["alias"] for slot in slots} != set(raw_aliases):
+            raise FleetError("evaluation plan host subset is incompatible with scope")
     valid_slots = {(slot["alias"], slot["gpu"]): slot for slot in slots}
     run_root = f"{str(manifest['remote_root']).rstrip('/')}/runs/{plan['run_id']}"
     job_ids: set[str] = set()
@@ -1829,6 +1874,13 @@ def _parser() -> argparse.ArgumentParser:
     )
     plan.add_argument("--scope", choices=("canary", "full"), default="full")
     plan.add_argument(
+        "--host-aliases",
+        help=(
+            "Optional comma-separated approved host subset. The private manifest "
+            "still validates the complete fleet; only sealed jobs are restricted."
+        ),
+    )
+    plan.add_argument(
         "--candidate-c-scale",
         type=float,
         required=True,
@@ -1882,6 +1934,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 iteration_id=args.iteration_id,
                 seed_cohort_id=args.seed_cohort_id,
                 scope=args.scope,
+                host_aliases=(
+                    [alias for alias in args.host_aliases.split(",") if alias]
+                    if args.host_aliases is not None
+                    else None
+                ),
                 candidate_c_scale=args.candidate_c_scale,
                 champion_c_scale=args.champion_c_scale,
                 comparison_mode=args.comparison_mode,

@@ -193,6 +193,39 @@ def test_internal_plan_weights_by_physical_gpu_and_conserves_seed_interval(
     assert all(left[1] == right[0] for left, right in zip(intervals, intervals[1:]))
 
 
+def test_full_plan_can_seal_an_approved_host_subset(tmp_path: Path) -> None:
+    manifest, template = _plan(tmp_path)
+    aliases = ["c2", "c3", "c4", "c5", "c6", "h100-8b"]
+    plan = fleet.build_plan(
+        manifest,
+        candidate=Path(template["candidate"]["source"]),
+        champion=Path(template["champion"]["source"]),
+        **_binding_kwargs(template),
+        internal_pairs=280,
+        external_pairs=14,
+        internal_base_seed=6_195_600_000,
+        external_base_seed=6_195_601_000,
+        workers_per_gpu=16,
+        scope="full",
+        host_aliases=aliases,
+        repo_commit="a" * 40,
+        tool_hashes=template["tool_hashes"],
+    )
+
+    assert plan["host_aliases"] == aliases
+    internal = [job for job in plan["jobs"] if job["phase"] == "internal"]
+    assert len(internal) == 28
+    assert sum(job["pairs"] for job in internal) == 280
+    assert {job["pairs"] for job in internal} == {10}
+    assert {job["alias"] for job in internal} == set(aliases)
+    fleet._validate_planned_jobs(plan, manifest)  # noqa: SLF001
+
+    drifted = copy.deepcopy(plan)
+    drifted["host_aliases"] = list(reversed(aliases))
+    with pytest.raises(fleet.FleetError, match="unknown or out of order"):
+        fleet._validate_planned_jobs(drifted, manifest)  # noqa: SLF001
+
+
 def test_external_plan_uses_matched_candidate_champion_cohorts(tmp_path: Path) -> None:
     _manifest, plan = _plan(tmp_path)
     jobs = [job for job in plan["jobs"] if job["phase"] == "external"]
