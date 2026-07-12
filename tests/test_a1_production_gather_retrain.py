@@ -239,6 +239,8 @@ def _completion_outputs(manifest: dict, path: Path, *, unit: str) -> Path:
     claim["claim_sha256"] = gather.base._digest(claim)  # noqa: SLF001
     claim_path = root / "execution.claim.json"
     claim_path.write_text(json.dumps(claim), encoding="utf-8")
+    verified = gather.verify(path)
+    execution_binding = gather._execution_binding(verified)  # noqa: SLF001
     submission = {
         "schema_version": gather.SUBMISSION_SCHEMA,
         "diagnostic_only": False,
@@ -248,7 +250,11 @@ def _completion_outputs(manifest: dict, path: Path, *, unit: str) -> Path:
         "claim": _ref(claim_path),
         "unit": unit,
         "command_sha256": manifest["command_sha256"],
-        "systemd_command_sha256": "sha256:" + "5" * 64,
+        "systemd_command_sha256": gather.base._digest(  # noqa: SLF001
+            gather._systemd_command(verified, unit)  # noqa: SLF001
+        ),
+        "execution_binding": execution_binding,
+        "execution_binding_sha256": gather.base._digest(execution_binding),  # noqa: SLF001
         "systemd_stdout": "Running as unit.",
     }
     submission["receipt_sha256"] = gather.base._digest(submission)  # noqa: SLF001

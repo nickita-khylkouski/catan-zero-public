@@ -268,6 +268,13 @@ def prepare(
         },
         "runtime_python": python_binding,
         "visible_devices": [0, 1, 2, 3],
+        "execution_preconditions": {
+            "visible_host_gpu_count": 8,
+            "selected_device_count": 4,
+            "gpu_model_substring": "B200",
+            "selected_devices_idle": True,
+            "one_shot_systemd": True,
+        },
         "command": command,
         "command_sha256": base._digest(command),  # noqa: SLF001
         "output_root": str(output_root),
@@ -388,6 +395,37 @@ def verify(manifest_path: Path) -> dict[str, Any]:
     }
 
 
+def _execution_binding(verified: dict[str, Any]) -> dict[str, Any]:
+    manifest = verified["manifest"]
+    return {
+        "schema_version": "a1-production-target-gather-execution-binding-v1",
+        "visible_devices": [0, 1, 2, 3],
+        "world_size": 4,
+        "runtime_python": manifest["runtime_python"],
+        "repository_commit": manifest["repo_binding"]["public_main_commit"],
+        "command_sha256": manifest["command_sha256"],
+        "environment": {
+            "HOME": "/home/ubuntu",
+            "PYTHONNOUSERSITE": "1",
+            "CUDA_VISIBLE_DEVICES": "0,1,2,3",
+        },
+    }
+
+
+def _systemd_command(verified: dict[str, Any], unit: str) -> list[str]:
+    root = verified["output_root"]
+    stdout, stderr = root / "stdout.log", root / "stderr.log"
+    return [
+        "sudo", "-n", "systemd-run", f"--unit={unit}", "--uid=ubuntu",
+        "--gid=ubuntu", "--service-type=exec", "--property=LimitNOFILE=65536",
+        f"--property=WorkingDirectory={verified['repo']}",
+        f"--property=StandardOutput=append:{stdout}",
+        f"--property=StandardError=append:{stderr}",
+        "--setenv=HOME=/home/ubuntu", "--setenv=PYTHONNOUSERSITE=1",
+        "--setenv=CUDA_VISIBLE_DEVICES=0,1,2,3", "--", *verified["command"],
+    ]
+
+
 def execute(
     manifest_path: Path,
     *,
@@ -425,25 +463,8 @@ def execute(
     claim["claim_sha256"] = base._digest(claim)  # noqa: SLF001
     claim_path = root / "execution.claim.json"
     base._write_exclusive(claim_path, claim)  # noqa: SLF001
-    stdout, stderr = root / "stdout.log", root / "stderr.log"
-    systemd_command = [
-        "sudo",
-        "-n",
-        "systemd-run",
-        f"--unit={unit}",
-        "--uid=ubuntu",
-        "--gid=ubuntu",
-        "--service-type=exec",
-        "--property=LimitNOFILE=65536",
-        f"--property=WorkingDirectory={verified['repo']}",
-        f"--property=StandardOutput=append:{stdout}",
-        f"--property=StandardError=append:{stderr}",
-        "--setenv=HOME=/home/ubuntu",
-        "--setenv=PYTHONNOUSERSITE=1",
-        "--setenv=CUDA_VISIBLE_DEVICES=0,1,2,3",
-        "--",
-        *verified["command"],
-    ]
+    systemd_command = _systemd_command(verified, unit)
+    execution_binding = _execution_binding(verified)
     try:
         result = runner(systemd_command, check=True, text=True, capture_output=True)
     except (OSError, subprocess.CalledProcessError) as error:
@@ -458,6 +479,8 @@ def execute(
         "unit": unit,
         "command_sha256": verified["manifest"]["command_sha256"],
         "systemd_command_sha256": base._digest(systemd_command),  # noqa: SLF001
+        "execution_binding": execution_binding,
+        "execution_binding_sha256": base._digest(execution_binding),  # noqa: SLF001
         "systemd_stdout": result.stdout.strip(),
     }
     receipt["receipt_sha256"] = base._digest(receipt)  # noqa: SLF001
@@ -528,6 +551,11 @@ def finalize(
         or submission.get("manifest") != verified["manifest_ref"]
         or submission.get("command_sha256")
         != verified["manifest"]["command_sha256"]
+        or submission.get("systemd_command_sha256")
+        != base._digest(_systemd_command(verified, unit))  # noqa: SLF001
+        or submission.get("execution_binding") != _execution_binding(verified)
+        or submission.get("execution_binding_sha256")
+        != base._digest(_execution_binding(verified))  # noqa: SLF001
         or submission.get("diagnostic_only") is not False
         or submission.get("production_eligible") is not True
     ):
