@@ -30,9 +30,13 @@ def test_future_plan_default_uses_validated_16_worker_packing() -> None:
             "1",
             "--external-base-seed",
             "2",
-            "--iteration-id",
-            "packing-default",
-            "--out",
+                "--iteration-id",
+                "packing-default",
+                "--candidate-c-scale",
+                "0.10",
+                "--champion-c-scale",
+                "0.03",
+                "--out",
             "plan.json",
         ]
     )

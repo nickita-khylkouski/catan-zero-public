@@ -71,8 +71,12 @@ HISTORICAL_MARKERLESS_A1_CONTRACT = {
 }
 MAX_CALIBRATION_RMSE_REGRESSION = 0.02
 MAX_EXTERNAL_WIN_RATE_REGRESSION = 0.02
-CANDIDATE_DEPLOYED_C_SCALE = 0.10
-CHAMPION_DEPLOYED_C_SCALE = 0.03
+# Exact one-time compatibility for the historical pre-promotion lock.  These
+# values are NOT loop defaults: after the first promotion the incumbent
+# operator comes from the authoritative registry agent identity, and a new
+# candidate operator comes from the newly sealed contract.
+BOOTSTRAP_CANDIDATE_C_SCALE = 0.10
+BOOTSTRAP_CHAMPION_C_SCALE = 0.03
 ROLE_SEARCH_CONFIG_SCHEMA = "a1-deployed-agent-search-config-v1"
 MIN_BUCKET_WIN_RATE = 0.45
 MIN_BUCKET_GAMES = 8
@@ -1655,25 +1659,97 @@ def _require_sealed_semantics(
             )
 
 
-def _role_search_config(
-    sealed_semantics: dict[str, Any], *, role: str
-) -> dict[str, Any]:
-    """Return the exact search operator bound to one deployed agent role."""
-
-    if role not in {"candidate", "champion"}:
-        raise PromotionError(f"unknown deployed-agent role {role!r}")
-    config = dict(sealed_semantics)
-    config["c_scale"] = (
-        CANDIDATE_DEPLOYED_C_SCALE if role == "candidate" else CHAMPION_DEPLOYED_C_SCALE
+def _is_bootstrap_transition_contract(contract: dict[str, Any]) -> bool:
+    return (
+        contract.get("contract_id")
+        == HISTORICAL_MARKERLESS_A1_CONTRACT["contract_id"]
+        and contract.get("contract_sha256")
+        == HISTORICAL_MARKERLESS_A1_CONTRACT["contract_sha256"]
     )
+
+
+def _candidate_search_config(contract: dict[str, Any]) -> dict[str, Any]:
+    """Return the candidate operator explicitly bound by this contract.
+
+    Only the one allowlisted markerless contract predates an explicit candidate
+    identity and receives the historical .10 bootstrap compatibility value.
+    Every subsequent cycle uses the contract's effective c_scale verbatim.
+    """
+    config = _sealed_evaluation_semantics(contract)
+    if _is_bootstrap_transition_contract(contract):
+        config["c_scale"] = BOOTSTRAP_CANDIDATE_C_SCALE
     return config
+
+
+def _incumbent_search_config(
+    contract: dict[str, Any],
+    *,
+    registry: ChampionRegistry,
+    champion_path: Path,
+    champion_sha256: str,
+) -> dict[str, Any]:
+    """Recover the incumbent operator from its authoritative registry identity."""
+    pointer = registry.get_role("generator_champion")
+    if pointer is None:
+        raise PromotionError("authoritative registry has no generator_champion")
+    if Path(pointer.checkpoint_path).expanduser().resolve() != champion_path:
+        raise PromotionError("registry incumbent differs from adjudicated champion")
+    provenance = pointer.provenance if isinstance(pointer.provenance, dict) else {}
+    raw = provenance.get("a1_candidate_search_config")
+    if raw is None:
+        if not _is_bootstrap_transition_contract(contract):
+            raise PromotionError(
+                "registry incumbent has no bound agent search identity; the .03 "
+                "bootstrap is permitted only for the exact historical first transition"
+            )
+        config = _sealed_evaluation_semantics(contract)
+        config["c_scale"] = BOOTSTRAP_CHAMPION_C_SCALE
+        return config
+    sealed = _sealed_evaluation_semantics(contract)
+    actual = _require_exact_keys(
+        raw, set(sealed), where="registry generator_champion search_config"
+    )
+    _finite_number(
+        actual["c_scale"],
+        where="registry generator_champion search_config.c_scale",
+        minimum=0.0,
+    )
+    if float(actual["c_scale"]) <= 0.0:
+        raise PromotionError(
+            "registry generator_champion search_config.c_scale must be positive"
+        )
+    # The incumbent's c_scale is part of the promoted agent identity and may
+    # intentionally differ from the next candidate contract.  Every other
+    # search semantic remains contract-sealed so the comparison changes only
+    # the explicitly supported operator axis.
+    for key, expected in sealed.items():
+        if key == "c_scale":
+            continue
+        if _canonical_bytes(actual[key]) != _canonical_bytes(expected):
+            raise PromotionError(
+                "registry generator_champion search_config sealed A1 semantic "
+                f"drift: {key}"
+            )
+    identity_sha = provenance.get("a1_candidate_agent_identity_sha256")
+    _validate_sha256(
+        identity_sha, where="registry incumbent agent identity sha256"
+    )
+    _validate_sha256(champion_sha256, where="incumbent checkpoint sha256")
+    expected_identity_sha = _agent_identity(
+        {"path": str(champion_path), "sha256": champion_sha256}, actual
+    )["agent_identity_sha256"]
+    if identity_sha != expected_identity_sha:
+        raise PromotionError(
+            "registry incumbent agent identity does not bind its checkpoint and "
+            "search_config"
+        )
+    return actual
 
 
 def _verify_role_search_config(
     raw: Any,
     *,
-    role: str,
-    sealed_semantics: dict[str, Any],
+    expected_search_config: dict[str, Any],
     where: str,
 ) -> dict[str, Any]:
     """Validate a complete, typed, role-specific deployed search operator.
@@ -1683,9 +1759,8 @@ def _verify_role_search_config(
     field can become part of the promoted agent identity.
     """
 
-    expected = _role_search_config(sealed_semantics, role=role)
-    actual = _require_exact_keys(raw, set(expected), where=where)
-    _require_sealed_semantics(actual, expected, where=where)
+    actual = _require_exact_keys(raw, set(expected_search_config), where=where)
+    _require_sealed_semantics(actual, expected_search_config, where=where)
     return actual
 
 
@@ -1693,21 +1768,20 @@ def _verify_role_search_pair(
     candidate_raw: Any,
     champion_raw: Any,
     *,
-    sealed_semantics: dict[str, Any],
+    candidate_search_config: dict[str, Any],
+    champion_search_config: dict[str, Any],
     where: str,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Prove two reports differ only by the approved role c_scale."""
 
     candidate = _verify_role_search_config(
         candidate_raw,
-        role="candidate",
-        sealed_semantics=sealed_semantics,
+        expected_search_config=candidate_search_config,
         where=f"{where}.candidate",
     )
     champion = _verify_role_search_config(
         champion_raw,
-        role="champion",
-        sealed_semantics=sealed_semantics,
+        expected_search_config=champion_search_config,
         where=f"{where}.champion",
     )
     for key in sorted(set(candidate) | set(champion)):
@@ -1736,10 +1810,9 @@ def _agent_identity(
 def _verify_agent_identity(
     raw: Any,
     *,
-    role: str,
+    expected_search_config: dict[str, Any],
     checkpoint_path: Path,
     checkpoint_sha256: str,
-    sealed_semantics: dict[str, Any],
     base: Path,
     where: str,
 ) -> dict[str, Any]:
@@ -1771,11 +1844,11 @@ def _verify_agent_identity(
     )
     if value["checkpoint"]["path"] != str(checkpoint_path):
         raise PromotionError(f"{where}.checkpoint.path must be canonical and absolute")
-    _verify_role_search_config(
-        value["search_config"],
-        role=role,
-        sealed_semantics=sealed_semantics,
-        where=f"{where}.search_config",
+    actual_search = _require_exact_keys(
+        value["search_config"], set(expected_search_config), where=f"{where}.search_config"
+    )
+    _require_sealed_semantics(
+        actual_search, expected_search_config, where=f"{where}.search_config"
     )
     return value
 
@@ -1959,7 +2032,8 @@ def _verify_internal_h2h_source(
             **{key: fields[key] for key in champion_search_config},
             "c_scale": fields["baseline_c_scale"],
         },
-        sealed_semantics=sealed_semantics,
+        candidate_search_config=candidate_search_config,
+        champion_search_config=champion_search_config,
         where=f"{where} deployed search",
     )
     if fields.get("public_observation") is not True:
@@ -2052,9 +2126,10 @@ def _verify_external_panel_source(
     checkpoint_md5: str,
     where: str,
     sealed_semantics: dict[str, Any],
-    role: str,
     deployed_search_config: dict[str, Any],
+    role: str | None = None,
 ) -> tuple[float, dict[str, Any]]:
+    del role  # Compatibility-only label; exact config is supplied explicitly.
     if payload.get("stratum") != "neutral-harness":
         raise PromotionError(f"{where} is not a neutral-harness panel")
     if payload.get("harness") != "catanatron_native_engine":
@@ -2113,8 +2188,7 @@ def _verify_external_panel_source(
         raise PromotionError(f"{where} has no resolved search_config")
     verified_search_config = _verify_role_search_config(
         search_config,
-        role=role,
-        sealed_semantics=sealed_semantics,
+        expected_search_config=deployed_search_config,
         where=f"{where}.search_config",
     )
     if verified_search_config != deployed_search_config:
@@ -2377,7 +2451,8 @@ def _verify_high_regret_source(
             **champion_search_config,
             "c_scale": evaluation_config["baseline_c_scale"],
         },
-        sealed_semantics=sealed_semantics,
+        candidate_search_config=candidate_search_config,
+        champion_search_config=champion_search_config,
         where=f"{where}.report deployed search",
     )
     suite = _require_exact_keys(
@@ -2954,7 +3029,6 @@ def _verify_promotion_evidence(
             checkpoint_md5=candidate["md5"],
             where="candidate external panel",
             sealed_semantics=sealed_semantics,
-            role="candidate",
             deployed_search_config=candidate["search_config"],
         )
         champion_rate, champion_cohort = _verify_external_panel_source(
@@ -2963,13 +3037,13 @@ def _verify_promotion_evidence(
             checkpoint_md5=champion["md5"],
             where="champion external panel",
             sealed_semantics=sealed_semantics,
-            role="champion",
             deployed_search_config=champion["search_config"],
         )
         _verify_role_search_pair(
             candidate_panel["search_config"],
             champion_panel["search_config"],
-            sealed_semantics=sealed_semantics,
+            candidate_search_config=candidate["search_config"],
+            champion_search_config=champion["search_config"],
             where="external panel deployed agents",
         )
         if candidate_cohort != champion_cohort:
@@ -3153,29 +3227,34 @@ def _verify_adjudication(
 
     candidate_binding = {**candidate_ref, "md5": _md5(candidate_path)}
     champion_binding = {**champion_ref, "md5": _md5(champion_path)}
-    sealed_semantics = _sealed_evaluation_semantics(contract)
+    candidate_search_config = _candidate_search_config(contract)
+    champion_search_config = _incumbent_search_config(
+        contract,
+        registry=registry,
+        champion_path=champion_path,
+        champion_sha256=champion_ref["sha256"],
+    )
     candidate_identity = _verify_agent_identity(
         candidate_raw["agent_identity"],
-        role="candidate",
+        expected_search_config=candidate_search_config,
         checkpoint_path=candidate_path,
         checkpoint_sha256=candidate_ref["sha256"],
-        sealed_semantics=sealed_semantics,
         base=base,
         where="candidate.agent_identity",
     )
     champion_identity = _verify_agent_identity(
         champion_raw["agent_identity"],
-        role="champion",
+        expected_search_config=champion_search_config,
         checkpoint_path=champion_path,
         checkpoint_sha256=champion_ref["sha256"],
-        sealed_semantics=sealed_semantics,
         base=base,
         where="champion.agent_identity",
     )
     _verify_role_search_pair(
         candidate_identity["search_config"],
         champion_identity["search_config"],
-        sealed_semantics=sealed_semantics,
+        candidate_search_config=candidate_search_config,
+        champion_search_config=champion_search_config,
         where="adjudication deployed agents",
     )
     candidate_binding["agent_identity"] = candidate_identity

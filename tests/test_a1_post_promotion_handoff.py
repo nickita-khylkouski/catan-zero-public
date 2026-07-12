@@ -87,11 +87,6 @@ def _science_args(monkeypatch: pytest.MonkeyPatch, *, c_scale: float = 0.1) -> d
         "_sealed_evaluation_semantics",
         lambda _: {"c_scale": c_scale, "n_full": 128},
     )
-    monkeypatch.setattr(
-        promotion,
-        "_role_search_config",
-        lambda _, role: {"c_scale": 0.1, "n_full": 128},
-    )
     return {
         "effective_search": {"c_scale": c_scale},
         "evaluator": {},

@@ -775,18 +775,20 @@ def _promotion_handoff_record(
                 "generation": generation,
             }
         )
-        expected_identity_search = promotion._role_search_config(  # noqa: SLF001
-            sealed, role="candidate"
-        )
+        # This is already a committed post-promotion identity. Its c_scale is
+        # the producer's durable operator identity and must match the next
+        # contract's generation science verbatim; never reclassify it through a
+        # hardcoded candidate/champion role default.
+        expected_identity_search = sealed
     except promotion.PromotionError as error:
         raise ContractError(f"cannot project promoted producer identity: {error}") from error
-    if identity_search != expected_identity_search:
-        raise ContractError(
-            "promoted deployed search identity differs from v3 generation science"
-        )
     if effective_search.get("c_scale") != identity_search.get("c_scale"):
         raise ContractError(
             "generation c_scale differs from promoted deployed producer identity"
+        )
+    if identity_search != expected_identity_search:
+        raise ContractError(
+            "promoted deployed search identity differs from v3 generation science"
         )
     record = _file_record(path, kind="post_promotion_handoff")
     record.update(

@@ -1602,8 +1602,18 @@ def _parser() -> argparse.ArgumentParser:
         ),
     )
     plan.add_argument("--scope", choices=("canary", "full"), default="full")
-    plan.add_argument("--candidate-c-scale", type=float, default=0.03)
-    plan.add_argument("--champion-c-scale", type=float, default=0.03)
+    plan.add_argument(
+        "--candidate-c-scale",
+        type=float,
+        required=True,
+        help="Contract-bound candidate agent c_scale (never inferred by role).",
+    )
+    plan.add_argument(
+        "--champion-c-scale",
+        type=float,
+        required=True,
+        help="Registry-bound incumbent agent c_scale (never inferred by role).",
+    )
     plan.add_argument("--out", type=Path, required=True)
     for name in ("launch", "resume"):
         operation = commands.add_parser(name)

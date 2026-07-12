@@ -217,9 +217,6 @@ def _validate_high_regret_evaluation_config(raw: Any, *, where: str) -> None:
     if not isinstance(raw, dict):
         raise ArtifactBuildError(f"{where} must be an object")
     expected = {
-        "c_scale": promotion.CANDIDATE_DEPLOYED_C_SCALE,
-        "candidate_c_scale": promotion.CANDIDATE_DEPLOYED_C_SCALE,
-        "baseline_c_scale": promotion.CHAMPION_DEPLOYED_C_SCALE,
         "candidate_n_full": 128,
         "baseline_n_full": 128,
         "p_full": 1.0,
@@ -230,6 +227,12 @@ def _validate_high_regret_evaluation_config(raw: Any, *, where: str) -> None:
             raise ArtifactBuildError(
                 f"{where} has inconsistent {key}={raw.get(key)!r}, expected {value!r}"
             )
+    for key in ("c_scale", "candidate_c_scale", "baseline_c_scale"):
+        value = raw.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+            raise ArtifactBuildError(f"{where} has invalid {key}={value!r}")
+    if float(raw["c_scale"]) != float(raw["candidate_c_scale"]):
+        raise ArtifactBuildError(f"{where} c_scale must echo candidate_c_scale")
 
 
 def _write_new_readonly(path: Path, value: dict[str, Any]) -> None:
@@ -1016,6 +1019,7 @@ def _validate_envelope_before_write(
     contract: dict[str, Any],
     candidate: Path,
     champion: Path,
+    registry: ChampionRegistry,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(
@@ -1026,7 +1030,14 @@ def _validate_envelope_before_write(
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
             json.dump(value, handle, indent=2, sort_keys=True)
             handle.write("\n")
-        sealed_semantics = promotion._sealed_evaluation_semantics(contract)  # noqa: SLF001
+        candidate_search_config = promotion._candidate_search_config(contract)  # noqa: SLF001
+        champion_ref = _checkpoint_ref(champion)
+        champion_search_config = promotion._incumbent_search_config(  # noqa: SLF001
+            contract,
+            registry=registry,
+            champion_path=champion.expanduser().resolve(),
+            champion_sha256=champion_ref["sha256"],
+        )
         promotion._verify_promotion_evidence(  # noqa: SLF001
             temporary,
             kind=kind,
@@ -1037,16 +1048,12 @@ def _validate_envelope_before_write(
             candidate={
                 **_checkpoint_ref(candidate),
                 "md5": promotion._md5(candidate),  # noqa: SLF001
-                "search_config": promotion._role_search_config(  # noqa: SLF001
-                    sealed_semantics, role="candidate"
-                ),
+                "search_config": candidate_search_config,
             },
             champion={
                 **_checkpoint_ref(champion),
                 "md5": promotion._md5(champion),  # noqa: SLF001
-                "search_config": promotion._role_search_config(  # noqa: SLF001
-                    sealed_semantics, role="champion"
-                ),
+                "search_config": champion_search_config,
             },
         )
     except promotion.PromotionError as error:
@@ -1088,7 +1095,13 @@ def build_adjudication(
         raise ArtifactBuildError(
             "n64 confirmation was asserted for a non-third promotion"
         )
-    sealed_semantics = promotion._sealed_evaluation_semantics(contract)  # noqa: SLF001
+    candidate_search_config = promotion._candidate_search_config(contract)  # noqa: SLF001
+    champion_search_config = promotion._incumbent_search_config(  # noqa: SLF001
+        contract,
+        registry=registry,
+        champion_path=champion.expanduser().resolve(),
+        champion_sha256=_checkpoint_ref(champion)["sha256"],
+    )
     candidate_ref = _checkpoint_ref(candidate)
     champion_ref = _checkpoint_ref(champion)
     value = {
@@ -1101,9 +1114,7 @@ def build_adjudication(
             "version": candidate_version,
             "agent_identity": promotion._agent_identity(  # noqa: SLF001
                 candidate_ref,
-                promotion._role_search_config(  # noqa: SLF001
-                    sealed_semantics, role="candidate"
-                ),
+                candidate_search_config,
             ),
             "training_report": {
                 "path": str(training_report.expanduser().resolve()),
@@ -1115,9 +1126,7 @@ def build_adjudication(
             "version": champion_version,
             "agent_identity": promotion._agent_identity(  # noqa: SLF001
                 champion_ref,
-                promotion._role_search_config(  # noqa: SLF001
-                    sealed_semantics, role="champion"
-                ),
+                champion_search_config,
             ),
         },
         "checks": {name: True for name in promotion.REQUIRED_CHECKS},
@@ -1218,6 +1227,7 @@ def _parser() -> argparse.ArgumentParser:
     evidence.add_argument("--legacy-contract-attestation", type=Path)
     evidence.add_argument("--candidate", type=Path, required=True)
     evidence.add_argument("--champion", type=Path, required=True)
+    evidence.add_argument("--registry", type=Path, required=True)
     evidence.add_argument("--source", action="append", default=[], metavar="ROLE=PATH")
     evidence.add_argument("--out", type=Path, required=True)
 
@@ -1302,6 +1312,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 contract=contract,
                 candidate=args.candidate,
                 champion=args.champion,
+                registry=ChampionRegistry.load(args.registry),
             )
         else:
             contract = _contract(

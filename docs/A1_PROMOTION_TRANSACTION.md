@@ -206,6 +206,7 @@ Wrap each verified source and then build the final adjudication. `--source` and
 python tools/a1_promotion_artifacts.py evidence \
   --kind high_regret \
   --contract-lock /immutable/a1.lock.json \
+  --registry /private/champion_registry.json \
   --candidate /immutable/candidate.pt \
   --champion /immutable/champion.pt \
   --source high_regret=/immutable/high-regret.source.json \

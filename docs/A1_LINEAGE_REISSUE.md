@@ -80,29 +80,29 @@ sources fail closed.
 
 ```bash
 python3 tools/a1_promotion_artifacts.py evidence --kind mechanism_calibration \
-  --contract-lock "$TRAIN_LOCK" --candidate "$CANDIDATE" --champion "$CHAMPION" \
+  --contract-lock "$TRAIN_LOCK" --registry "$REGISTRY" --candidate "$CANDIDATE" --champion "$CHAMPION" \
   --source candidate_calibration="$CANDIDATE_CALIBRATION" \
   --source champion_calibration="$CHAMPION_CALIBRATION" \
   --out "$RECOVERY/evidence/mechanism-calibration.evidence.json"
 
 python3 tools/a1_promotion_artifacts.py evidence --kind internal_h2h \
-  --contract-lock "$TRAIN_LOCK" --candidate "$CANDIDATE" --champion "$CHAMPION" \
+  --contract-lock "$TRAIN_LOCK" --registry "$REGISTRY" --candidate "$CANDIDATE" --champion "$CHAMPION" \
   --source internal_h2h="$INTERNAL_H2H" \
   --out "$RECOVERY/evidence/internal-h2h.evidence.json"
 
 python3 tools/a1_promotion_artifacts.py evidence --kind external_panel \
-  --contract-lock "$TRAIN_LOCK" --candidate "$CANDIDATE" --champion "$CHAMPION" \
+  --contract-lock "$TRAIN_LOCK" --registry "$REGISTRY" --candidate "$CANDIDATE" --champion "$CHAMPION" \
   --source candidate_panel="$CANDIDATE_PANEL" \
   --source champion_panel="$CHAMPION_PANEL" \
   --out "$RECOVERY/evidence/external-panel.evidence.json"
 
 python3 tools/a1_promotion_artifacts.py evidence --kind high_regret \
-  --contract-lock "$TRAIN_LOCK" --candidate "$CANDIDATE" --champion "$CHAMPION" \
+  --contract-lock "$TRAIN_LOCK" --registry "$REGISTRY" --candidate "$CANDIDATE" --champion "$CHAMPION" \
   --source high_regret="$HIGH_REGRET_SOURCE" \
   --out "$RECOVERY/evidence/high-regret.evidence.json"
 
 python3 tools/a1_promotion_artifacts.py evidence --kind bucket_veto \
-  --contract-lock "$TRAIN_LOCK" --candidate "$CANDIDATE" --champion "$CHAMPION" \
+  --contract-lock "$TRAIN_LOCK" --registry "$REGISTRY" --candidate "$CANDIDATE" --champion "$CHAMPION" \
   --source bucket_veto="$BUCKET_VETO_SOURCE" \
   --out "$RECOVERY/evidence/bucket-veto.evidence.json"
 

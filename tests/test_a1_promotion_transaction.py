@@ -21,7 +21,11 @@ def _write_json(path: Path, value: object) -> None:
 
 
 def _contract(
-    *, n_full: int = 128, n_full_wide=None, producer: Path | None = None
+    *,
+    n_full: int = 128,
+    n_full_wide=None,
+    producer: Path | None = None,
+    c_scale: float = 0.03,
 ) -> dict:
     recipe = {
         "world_size": 1,
@@ -33,7 +37,7 @@ def _contract(
     producer = producer or Path("/producer.pt")
     search = {
         "belief_chance_spectra": False,
-        "c_scale": 0.03,
+        "c_scale": c_scale,
         "c_visit": 50.0,
         "correct_rust_chance_spectra": True,
         "determinization_min_simulations": 32,
@@ -82,7 +86,10 @@ def _contract(
         "value_squash": "tanh",
     }
     return {
-        "contract_sha256": "sha256:" + "a" * 64,
+        "contract_id": promotion.HISTORICAL_MARKERLESS_A1_CONTRACT["contract_id"],
+        "contract_sha256": promotion.HISTORICAL_MARKERLESS_A1_CONTRACT[
+            "contract_sha256"
+        ],
         "science": {
             "search_operator": search,
             "effective_search_config": search,
@@ -246,14 +253,14 @@ def _fixture(
     contract = _contract(n_full=n_full, producer=champion)
     # The n196 negative fixture must still be constructible so execution can
     # prove the contract is rejected before any mutation/evidence processing.
-    evidence_semantics = promotion._sealed_evaluation_semantics(
-        contract if n_full == 128 else _contract(n_full=128, producer=champion)
-    )
-    candidate_search_config = promotion._role_search_config(
-        evidence_semantics, role="candidate"
-    )
-    champion_search_config = promotion._role_search_config(
-        evidence_semantics, role="champion"
+    evidence_contract = contract if n_full == 128 else _contract(n_full=128, producer=champion)
+    evidence_semantics = promotion._sealed_evaluation_semantics(evidence_contract)
+    candidate_search_config = promotion._candidate_search_config(evidence_contract)
+    champion_search_config = promotion._incumbent_search_config(
+        evidence_contract,
+        registry=registry,
+        champion_path=champion.resolve(),
+        champion_sha256=promotion._sha256(champion),
     )
     report_path = tmp_path / "report.json"
     command = ["/usr/bin/python3", "tools/train_bc.py", "--sealed-a1"]
@@ -763,6 +770,99 @@ def _fixture(
         "receipt": tmp_path / "promotion.receipt.json",
         "lock": registry_path.with_suffix(registry_path.suffix + ".a1.lock"),
     }
+
+
+def test_promoted_candidate_operator_becomes_next_cycle_incumbent_operator(
+    tmp_path: Path,
+) -> None:
+    """A .10 promotion must never be silently reclassified as champion@.03."""
+    old = tmp_path / "gen3.pt"
+    promoted = tmp_path / "f7.pt"
+    old.write_bytes(b"gen3")
+    promoted.write_bytes(b"f7")
+    first_contract = _contract(producer=old, c_scale=0.03)
+    promoted_config = promotion._candidate_search_config(first_contract)
+    assert promoted_config["c_scale"] == 0.10
+    promoted_identity = promotion._agent_identity(
+        _checkpoint_ref(promoted), promoted_config
+    )
+
+    registry = ChampionRegistry(tmp_path / "registry.json")
+    registry.set_role(
+        "generator_champion",
+        promoted,
+        expected_md5=promotion._md5(promoted),
+        version=5,
+        provenance={
+            "a1_candidate_agent_identity_sha256": promoted_identity[
+                "agent_identity_sha256"
+            ],
+            "a1_candidate_search_config": promoted_config,
+        },
+        reason="simulated committed first promotion",
+    )
+    registry.record_promotion("generator_champion")
+    registry.save()
+
+    # The next candidate may tune its operator; that must not reclassify the
+    # incumbent, whose exact promoted .10 identity remains authoritative.
+    next_contract = _contract(producer=promoted, c_scale=0.15)
+    next_contract["contract_id"] = "a1-next-cycle"
+    next_contract["contract_sha256"] = "sha256:" + "2" * 64
+    incumbent_config = promotion._incumbent_search_config(
+        next_contract,
+        registry=ChampionRegistry.load(registry.path),
+        champion_path=promoted.resolve(),
+        champion_sha256=promotion._sha256(promoted),
+    )
+    assert incumbent_config["c_scale"] == 0.10
+    assert promotion._candidate_search_config(next_contract)["c_scale"] == 0.15
+
+    checkpoint_ref = _checkpoint_ref(promoted)
+    silently_downgraded = dict(incumbent_config, c_scale=0.03)
+    identity = promotion._agent_identity(checkpoint_ref, silently_downgraded)
+    with pytest.raises(
+        promotion.PromotionError, match="search_config sealed A1 semantic drift"
+    ):
+        promotion._verify_agent_identity(
+            identity,
+            expected_search_config=incumbent_config,
+            checkpoint_path=promoted.resolve(),
+            checkpoint_sha256=checkpoint_ref["sha256"],
+            base=tmp_path,
+            where="next-cycle champion.agent_identity",
+        )
+
+
+def test_next_cycle_incumbent_without_bound_operator_identity_fails_closed(
+    tmp_path: Path,
+) -> None:
+    """Only the exact historical bootstrap may lack incumbent provenance."""
+    promoted = tmp_path / "f7.pt"
+    promoted.write_bytes(b"f7")
+    registry = ChampionRegistry(tmp_path / "registry.json")
+    registry.set_role(
+        "generator_champion",
+        promoted,
+        expected_md5=promotion._md5(promoted),
+        version=5,
+        provenance={},
+        reason="simulated malformed promotion",
+    )
+    registry.save()
+
+    next_contract = _contract(producer=promoted, c_scale=0.10)
+    next_contract["contract_id"] = "a1-next-cycle"
+    next_contract["contract_sha256"] = "sha256:" + "2" * 64
+    with pytest.raises(
+        promotion.PromotionError, match="no bound agent search identity"
+    ):
+        promotion._incumbent_search_config(
+            next_contract,
+            registry=ChampionRegistry.load(registry.path),
+            champion_path=promoted.resolve(),
+            champion_sha256=promotion._sha256(promoted),
+        )
 
 
 def _verify(fixture: dict):

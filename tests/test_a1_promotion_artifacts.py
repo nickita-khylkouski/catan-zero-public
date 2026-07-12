@@ -105,9 +105,9 @@ def _high_regret_report(
         "candidate": _ref(candidate),
         "champion": _ref(champion),
         "evaluation_config": {
-            "c_scale": promotion.CANDIDATE_DEPLOYED_C_SCALE,
-            "candidate_c_scale": promotion.CANDIDATE_DEPLOYED_C_SCALE,
-            "baseline_c_scale": promotion.CHAMPION_DEPLOYED_C_SCALE,
+            "c_scale": promotion.BOOTSTRAP_CANDIDATE_C_SCALE,
+            "candidate_c_scale": promotion.BOOTSTRAP_CANDIDATE_C_SCALE,
+            "baseline_c_scale": promotion.BOOTSTRAP_CHAMPION_C_SCALE,
             "candidate_n_full": 128,
             "baseline_n_full": 128,
             "p_full": 1.0,
@@ -535,7 +535,6 @@ def test_high_regret_builder_rejects_stale_truncation_statistics(
     [
         ("c_scale", 0.03),
         ("candidate_c_scale", 0.03),
-        ("baseline_c_scale", 0.10),
     ],
 )
 def test_high_regret_builder_rejects_forged_role_scales(
@@ -1000,8 +999,14 @@ def test_evidence_prewrite_replays_transaction_validator(
 
     monkeypatch.setattr(promotion, "_verify_promotion_evidence", verify)
     monkeypatch.setattr(
-        promotion, "_sealed_evaluation_semantics", lambda _contract: {"c_scale": 0.03}
+        promotion, "_candidate_search_config", lambda _contract: {"c_scale": 0.10}
     )
+    monkeypatch.setattr(
+        promotion,
+        "_incumbent_search_config",
+        lambda _contract, **_kwargs: {"c_scale": 0.03},
+    )
+    registry = ChampionRegistry(tmp_path / "registry.json")
     artifacts._validate_envelope_before_write(
         tmp_path / "final.json",
         value=value,
@@ -1009,6 +1014,7 @@ def test_evidence_prewrite_replays_transaction_validator(
         contract=_contract(),
         candidate=candidate,
         champion=champion,
+        registry=registry,
     )
     assert len(called) == 1
     assert not called[0].exists()
@@ -1018,7 +1024,12 @@ def test_adjudication_builder_derives_every_third_requirement(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(
-        promotion, "_sealed_evaluation_semantics", lambda _contract: {"c_scale": 0.03}
+        promotion, "_candidate_search_config", lambda _contract: {"c_scale": 0.10}
+    )
+    monkeypatch.setattr(
+        promotion,
+        "_incumbent_search_config",
+        lambda _contract, **_kwargs: {"c_scale": 0.03},
     )
     candidate, champion = _checkpoints(tmp_path)
     report = tmp_path / "training.json"
