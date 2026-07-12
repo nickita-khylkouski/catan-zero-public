@@ -5201,6 +5201,9 @@ def main(argv: Sequence[str] | None = None) -> None:
         data, policy_sample_weights
     )
     value_sample_weights = derived["value_sample_weights"]
+    value_training_scope_report = _value_training_scope_report(
+        data, value_sample_weights
+    )
     value_root_blend_audit = _audit_value_root_blend_corpus(
         data,
         value_sample_weights,
@@ -6290,6 +6293,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         "metrics": metrics,
         "data_quality": data_quality,
         "policy_distillation_scope": policy_distillation_scope_report,
+        "value_training_scope": value_training_scope_report,
         "policy_component_active_dose": policy_component_active_dose,
         "sample_weight_quality": policy_sample_weight_report,
         "policy_sample_weight_quality": policy_sample_weight_report,
@@ -7822,6 +7826,11 @@ def evaluate_composite_validation_measure(
             "policy_distillation_enabled": bool(
                 not distillation_scope_authenticated
                 or component in distillation_indices
+            ),
+            "value_training_enabled": bool(
+                not bool(getattr(data, "value_training_scope_authenticated", False))
+                or component
+                in set(getattr(data, "value_training_component_indices", tuple()))
             ),
             "authenticated_sampling_ratio": float(ratios[component]),
             "games": int(len(games)),
@@ -12990,6 +12999,33 @@ def _apply_authenticated_value_training_scope(
     if not np.any(scoped > 0.0):
         raise SystemExit("authenticated value training scope has no positive rows")
     return scoped
+
+
+def _value_training_scope_report(
+    data, weights: np.ndarray
+) -> dict[str, object] | None:
+    if not bool(getattr(data, "value_training_scope_authenticated", False)):
+        return None
+    component_ids = tuple(data.component_ids)
+    eligible = set(data.value_training_component_indices)
+    offsets = np.asarray(data.component_offsets, dtype=np.int64)
+    components = {}
+    for index, component_id in enumerate(component_ids):
+        part = np.asarray(
+            weights[offsets[index] : offsets[index + 1]], dtype=np.float64
+        )
+        components[str(component_id)] = {
+            "component_index": int(index),
+            "value_training_enabled": bool(index in eligible),
+            "rows": int(part.size),
+            "positive_value_rows": int(np.count_nonzero(part > 0.0)),
+            "value_weight_sum": float(part.sum()),
+        }
+    return {
+        "schema_version": "component-value-training-scope-v1",
+        "component_ids": [component_ids[index] for index in sorted(eligible)],
+        "components": components,
+    }
 
 
 def build_value_sample_weights(

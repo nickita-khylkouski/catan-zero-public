@@ -5,6 +5,7 @@ import pytest
 
 from tools.train_bc import (
     _apply_authenticated_value_training_scope,
+    _value_training_scope_report,
     build_value_sample_weights,
     per_game_weight_quality,
 )
@@ -97,6 +98,7 @@ def test_authenticated_value_scope_can_make_replay_anchor_only() -> None:
         component_ids = ("n128", "n256", "gen3_replay")
         value_training_component_indices = (0, 1)
         value_training_scope_authenticated = True
+        component_offsets = (0, 2, 4, 6)
 
         @staticmethod
         def component_indices_for_rows(rows):
@@ -107,6 +109,9 @@ def test_authenticated_value_scope_can_make_replay_anchor_only() -> None:
     scoped = _apply_authenticated_value_training_scope(_Composite(), weights)
     assert scoped.tolist() == [1.0, 1.0, 1.0, 1.0, 0.0, 0.0]
     assert weights.tolist() == [1.0] * 6
+    report = _value_training_scope_report(_Composite(), scoped)
+    assert report["component_ids"] == ["n128", "n256"]
+    assert report["components"]["gen3_replay"]["positive_value_rows"] == 0
 
 
 def test_per_game_value_weight_composes_with_forced_row_and_multiplier() -> None:
