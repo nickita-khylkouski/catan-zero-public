@@ -32,7 +32,7 @@ if result["decision"] != "reject_candidate":
     raise SystemExit("REFUSED: canonical combined handoff has no rejection decision")
 print("canonical combined handoff rejects candidate; corrective diagnostic is eligible")
 PY
-  [[ -s "$root/n128.training_input.ready" ]] || { echo "REFUSED: n128 input is not ready" >&2; exit 2; }
+  [[ -f "$root/n128.training_input.ready" ]] || { echo "REFUSED: n128 input is not ready" >&2; exit 2; }
 fi
 mkdir -p "$out/n256" "$out/n128"
 
