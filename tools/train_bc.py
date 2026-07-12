@@ -5482,6 +5482,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         # every optimizer step and flushed at epoch end so gradients never carry
         # across the epoch boundary.
         micro_in_group = 0
+        accumulation_group_size = accum
         # The policy-KL anchor and value-uncertainty auxiliary loss are entity_graph
         # (_train_xdim_batch) features -- the legacy dense _train_candidate_batch path
         # does not accept them, so only forward them when the xdim trainer is active.
@@ -5538,11 +5539,21 @@ def main(argv: Sequence[str] | None = None) -> None:
             # row), so no pending gradient can survive the loop.
             micro_in_group += 1
             accum_do_zero_grad = micro_in_group == 1
+            if accum_do_zero_grad:
+                # The final accumulation group can contain fewer than ``accum``
+                # micro-batches.  Dividing those losses by the configured size
+                # would shrink the final optimizer update by k/accum and break
+                # equivalence with the same effective batch trained directly.
+                accumulation_group_size = _accumulation_group_size(
+                    configured_size=accum,
+                    batch_number=batch_number,
+                    total_batches=total_batches,
+                )
             accum_do_step = (micro_in_group >= accum) or bool(_is_last_batch)
             accum_kwargs: dict = {}
             if train_fn is _train_xdim_batch:
                 accum_kwargs = {
-                    "grad_accum_steps": accum,
+                    "grad_accum_steps": accumulation_group_size,
                     "accum_do_zero_grad": accum_do_zero_grad,
                     "accum_do_step": accum_do_step,
                 }
@@ -5554,50 +5565,55 @@ def main(argv: Sequence[str] | None = None) -> None:
                 total_steps=total_training_steps,
                 schedule=str(args.lr_schedule),
             )
-            batch_metrics = train_fn(
-                policy,
-                optimizer,
-                batch_data,
-                batch,
-                batch_policy_weights,
-                batch_value_weights,
-                args.soft_target_temperature,
-                args.soft_target_weight,
-                args.soft_target_source,
-                args.soft_target_min_legal_coverage,
-                args.policy_loss_weight,
-                resolved_scalar_value_weight,
-                args.final_vp_loss_weight,
-                args.q_loss_weight,
-                _parse_prefixes(args.q_skip_teacher_prefixes),
-                args.vps_to_win,
-                args.advantage_policy_weighting,
-                args.advantage_temperature,
-                args.advantage_weight_cap,
-                args.advantage_weight_floor,
-                args.amp,
-                diagnostics=(
-                    int(args.train_diagnostics_every_batches) > 0
-                    and batch_number % int(args.train_diagnostics_every_batches) == 0
-                ),
-                truncated_vp_margin_value_weight=args.truncated_vp_margin_value_weight,
-                symmetry=symmetry,
-                symmetry_rng=symmetry_rng,
-                symmetry_relabel_events=bool(
-                    getattr(args, "symmetry_augment_events", True)
-                ),
-                **train_fn_extra_kwargs,
-                **accum_kwargs,
-                **(
-                    {
-                        "policy_aux_data": data,
-                        "policy_aux_batch": aux_batch,
-                        "policy_aux_sample_weights": policy_sample_weights,
-                    }
-                    if aux_batch is not None
-                    else {}
-                ),
-            )
+            # DDP documents that no_sync() must wrap the forward pass as well as
+            # backward().  Applying it only inside _train_xdim_batch after the
+            # forward leaves reducer hooks armed and silently synchronizes every
+            # micro-batch, defeating gradient accumulation's communication win.
+            with _gradient_sync_context(policy.model, accum_do_step=accum_do_step):
+                batch_metrics = train_fn(
+                    policy,
+                    optimizer,
+                    batch_data,
+                    batch,
+                    batch_policy_weights,
+                    batch_value_weights,
+                    args.soft_target_temperature,
+                    args.soft_target_weight,
+                    args.soft_target_source,
+                    args.soft_target_min_legal_coverage,
+                    args.policy_loss_weight,
+                    resolved_scalar_value_weight,
+                    args.final_vp_loss_weight,
+                    args.q_loss_weight,
+                    _parse_prefixes(args.q_skip_teacher_prefixes),
+                    args.vps_to_win,
+                    args.advantage_policy_weighting,
+                    args.advantage_temperature,
+                    args.advantage_weight_cap,
+                    args.advantage_weight_floor,
+                    args.amp,
+                    diagnostics=(
+                        int(args.train_diagnostics_every_batches) > 0
+                        and batch_number % int(args.train_diagnostics_every_batches) == 0
+                    ),
+                    truncated_vp_margin_value_weight=args.truncated_vp_margin_value_weight,
+                    symmetry=symmetry,
+                    symmetry_rng=symmetry_rng,
+                    symmetry_relabel_events=bool(
+                        getattr(args, "symmetry_augment_events", True)
+                    ),
+                    **train_fn_extra_kwargs,
+                    **accum_kwargs,
+                    **(
+                        {
+                            "policy_aux_data": data,
+                            "policy_aux_batch": aux_batch,
+                            "policy_aux_sample_weights": policy_sample_weights,
+                        }
+                        if aux_batch is not None
+                        else {}
+                    ),
+                )
             loss = float(batch_metrics["loss"])
             accuracy = float(batch_metrics["accuracy"])
             optimizer_observability = batch_metrics.get("optimizer_observability")
@@ -7308,19 +7324,12 @@ def _train_xdim_batch(
     # divided by N and grads accumulate across N micro-batches; only the stepping
     # micro-batch zero-grads (at group start), all-reduces (the rest run under
     # no_sync), clips, and steps.
-    import contextlib
-
     if accum_do_zero_grad:
         optimizer.zero_grad(set_to_none=True)
     if not torch.isfinite(loss):
         raise FloatingPointError(f"non-finite BC loss: {float(loss.detach().cpu())}")
     backward_loss = loss / float(grad_accum_steps) if int(grad_accum_steps) > 1 else loss
-    if (not accum_do_step) and hasattr(policy.model, "no_sync"):
-        _sync_ctx = policy.model.no_sync()
-    else:
-        _sync_ctx = contextlib.nullcontext()
-    with _sync_ctx:
-        backward_loss.backward()
+    backward_loss.backward()
     optimizer_observability = None
     if accum_do_step:
         observability_state = (
@@ -14048,6 +14057,32 @@ def _iter_with_last(iterable):
         yield previous, False
         previous = current
     yield previous, True
+
+
+def _gradient_sync_context(model, *, accum_do_step: bool):
+    """Suppress DDP/FSDP gradient sync around a complete micro-batch.
+
+    PyTorch requires ``no_sync`` to cover the forward pass that creates reducer
+    hooks, not merely ``backward``.  The caller therefore enters this context
+    before invoking the batch trainer.  Plain modules retain a strict no-op.
+    """
+    import contextlib
+
+    if not bool(accum_do_step) and hasattr(model, "no_sync"):
+        return model.no_sync()
+    return contextlib.nullcontext()
+
+
+def _accumulation_group_size(
+    *, configured_size: int, batch_number: int, total_batches: int
+) -> int:
+    """Return the actual divisor for the group beginning at ``batch_number``."""
+    configured = int(configured_size)
+    batch = int(batch_number)
+    total = int(total_batches)
+    if configured < 1 or batch < 1 or total < batch:
+        raise ValueError("invalid gradient accumulation group bounds")
+    return min(configured, total - batch + 1)
 
 
 def _warm_start_grow(policy, checkpoint_path: str, *, device: str) -> dict:
