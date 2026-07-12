@@ -44,6 +44,7 @@ def test_anchor_sweep_is_single_variable_and_q_stays_disabled():
         recipe.pop("policy_kl_anchor_weight")
         stripped.append(recipe)
         assert arm["recipe"]["q_loss_weight"] == 0.0
+        assert arm["recipe"]["validation_max_samples"] == 262_144
     assert stripped[0] == stripped[1] == stripped[2]
 
 

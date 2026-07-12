@@ -68,6 +68,9 @@ These defaults apply to every arm unless the arm names an explicit delta:
 - search-value blend: lambda 1.0 until the stability recipe is selected;
 - update dose: first sentinel at 4,194,304 global samples, then 8,388,608 only
   for Pareto-surviving recipes;
+- validation: a deterministic, game-disjoint 262,144-row sentinel for each
+  short arm; the external playing panel is binding, so repeatedly scoring the
+  full multi-million-row holdout is wasted latency;
 - batch size: use the largest measured batch before throughput plateaus or
   quality changes. HBM occupancy is telemetry, not the objective. Recompute
   `max_steps = ceil(sample_dose / (local_batch * world_size * grad_accum))`.
