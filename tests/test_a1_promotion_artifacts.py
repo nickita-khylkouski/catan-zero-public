@@ -31,6 +31,58 @@ def _ref(path: Path) -> dict[str, str]:
     return {"path": str(path.resolve()), "sha256": promotion._sha256(path)}
 
 
+def test_cohort_exclusions_are_derived_from_candidate_bound_game_seeds(
+    tmp_path: Path,
+) -> None:
+    candidate = tmp_path / "candidate.pt"
+    candidate.write_bytes(b"candidate")
+    source = tmp_path / "arm-selection.json"
+    _json(
+        source,
+        {
+            "candidate_checkpoint_sha256": promotion._sha256(candidate),
+            "games": [
+                {"game_seed": 100},
+                {"game_seed": 100},
+                {"game_seed": 101},
+                {"game_seed": 104},
+            ],
+        },
+    )
+    contract = {"contract_sha256": "sha256:" + "a" * 64}
+    value = artifacts.build_cohort_exclusions(
+        contract=contract,
+        candidate=candidate,
+        cohorts=[("p1-arm-selection", "internal_h2h", source)],
+    )
+    assert value["candidate_sha256"] == promotion._sha256(candidate)
+    assert value["cohorts"][0]["seed_intervals"] == [
+        {"base_seed": 100, "end_seed": 102},
+        {"base_seed": 104, "end_seed": 105},
+    ]
+    unhashed = dict(value)
+    assert unhashed.pop("manifest_sha256") == promotion._digest_value(unhashed)
+
+
+def test_cohort_exclusions_reject_source_for_another_candidate(tmp_path: Path) -> None:
+    candidate = tmp_path / "candidate.pt"
+    candidate.write_bytes(b"candidate")
+    source = tmp_path / "other.json"
+    _json(
+        source,
+        {
+            "candidate_checkpoint_sha256": "sha256:" + "b" * 64,
+            "games": [{"game_seed": 100}],
+        },
+    )
+    with pytest.raises(artifacts.ArtifactBuildError, match="promoted candidate bytes"):
+        artifacts.build_cohort_exclusions(
+            contract={"contract_sha256": "sha256:" + "a" * 64},
+            candidate=candidate,
+            cohorts=[("wrong", "internal_h2h", source)],
+        )
+
+
 def _held_out_npz(tmp_path: Path, seeds) -> dict:
     values = np.sort(np.unique(np.asarray(seeds, dtype=np.int64)))
     manifest = tmp_path / "validation-seeds.json"

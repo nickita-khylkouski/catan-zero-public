@@ -1899,6 +1899,32 @@ def _candidate_search_config(contract: dict[str, Any]) -> dict[str, Any]:
     return config
 
 
+def _contract_value_readout(contract: dict[str, Any]) -> str:
+    """Return the value readout bound by either supported A1 lock shape.
+
+    The historical bootstrap lock embeds the readout in its learner objective.
+    Post-promotion generation-arm locks intentionally carry only the deployed
+    scalar ``science.value_readout``.  Promotion of a child of that deployed
+    producer must accept the latter without silently inventing a learner
+    objective.  If both representations are present they must agree.
+    """
+
+    science = contract.get("science")
+    if not isinstance(science, dict):
+        raise PromotionError("sealed A1 contract has no science object")
+    direct = science.get("value_readout")
+    learner = science.get("learner_value_objective")
+    nested = learner.get("value_readout") if isinstance(learner, dict) else None
+    if direct is not None and nested is not None and direct != nested:
+        raise PromotionError("sealed A1 contract value_readout representations disagree")
+    value = nested if nested is not None else direct
+    if value not in {"scalar", "categorical"}:
+        raise PromotionError(
+            f"sealed A1 contract has unsupported value_readout {value!r}"
+        )
+    return str(value)
+
+
 def _incumbent_search_config(
     contract: dict[str, Any],
     *,
@@ -3901,9 +3927,7 @@ def _verify_adjudication(
             evidence_path,
             kind=kind,
             contract=contract,
-            expected_readout=str(
-                contract["science"]["learner_value_objective"]["value_readout"]
-            ),
+            expected_readout=_contract_value_readout(contract),
             candidate=candidate_binding,
             champion=champion_binding,
         )

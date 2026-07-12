@@ -2863,3 +2863,26 @@ def test_production_l1_report_requires_exact_selected_recipe(tmp_path: Path) -> 
             candidate_path=candidate, candidate_sha256=promotion._sha256(candidate),
             production_l1_completion=True,
         )
+
+
+def test_contract_value_readout_accepts_bootstrap_and_post_promotion_shapes() -> None:
+    assert promotion._contract_value_readout(
+        {"science": {"learner_value_objective": {"value_readout": "scalar"}}}
+    ) == "scalar"
+    assert promotion._contract_value_readout(
+        {"science": {"value_readout": "scalar"}}
+    ) == "scalar"
+
+
+def test_contract_value_readout_rejects_ambiguous_or_missing_binding() -> None:
+    with pytest.raises(promotion.PromotionError, match="representations disagree"):
+        promotion._contract_value_readout(
+            {
+                "science": {
+                    "value_readout": "scalar",
+                    "learner_value_objective": {"value_readout": "categorical"},
+                }
+            }
+        )
+    with pytest.raises(promotion.PromotionError, match="unsupported value_readout"):
+        promotion._contract_value_readout({"science": {}})

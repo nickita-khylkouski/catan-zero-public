@@ -1000,9 +1000,7 @@ def build_evidence_envelope(
     result: dict[str, Any]
     if kind == "mechanism_calibration":
         result = {
-            "value_readout": str(
-                contract["science"]["learner_value_objective"]["value_readout"]
-            ),
+            "value_readout": promotion._contract_value_readout(contract),  # noqa: SLF001
             "max_rmse_regression": promotion.MAX_CALIBRATION_RMSE_REGRESSION,
         }
     elif kind == "external_panel":
@@ -1055,9 +1053,7 @@ def _validate_envelope_before_write(
             temporary,
             kind=kind,
             contract=contract,
-            expected_readout=str(
-                contract["science"]["learner_value_objective"]["value_readout"]
-            ),
+            expected_readout=promotion._contract_value_readout(contract),  # noqa: SLF001
             candidate={
                 **_checkpoint_ref(candidate),
                 "md5": promotion._md5(candidate),  # noqa: SLF001
@@ -1168,6 +1164,89 @@ def _parse_role_paths(values: Sequence[str], *, option: str) -> list[tuple[str, 
     return parsed
 
 
+def build_cohort_exclusions(
+    *,
+    contract: dict[str, Any],
+    candidate: Path,
+    cohorts: Sequence[tuple[str, str, Path]],
+) -> dict[str, Any]:
+    """Build exclusions from explicit seed identities in prior reports.
+
+    Callers do not provide ranges: they provide immutable source reports and
+    this producer derives the minimal contiguous intervals from retained game
+    seeds.  That prevents a typo (or a conveniently narrow hand-authored
+    range) from weakening the freshness check.
+    """
+
+    candidate_ref = _checkpoint_ref(candidate)
+    if not cohorts:
+        raise ArtifactBuildError("cohort exclusions require at least one prior source")
+    labels: set[str] = set()
+    records: list[dict[str, Any]] = []
+    for label, kind, source in cohorts:
+        if not label.strip() or label in labels or not kind.strip():
+            raise ArtifactBuildError("cohort label/kind is empty or duplicated")
+        labels.add(label)
+        source = source.expanduser().resolve()
+        payload = _load_json(source)
+        bound_hashes = {
+            payload.get("candidate_checkpoint_sha256"),
+            (
+                payload.get("candidate", {}).get("sha256")
+                if isinstance(payload.get("candidate"), dict)
+                else None
+            ),
+        }
+        if candidate_ref["sha256"] not in bound_hashes:
+            raise ArtifactBuildError(
+                f"prior cohort {label!r} does not bind the promoted candidate bytes"
+            )
+        try:
+            seeds = promotion._explicit_game_seeds(  # noqa: SLF001
+                payload, where=f"prior cohort {label!r}"
+            )
+            intervals = promotion._contiguous_seed_intervals(  # noqa: SLF001
+                seeds, kind=kind, where=f"prior cohort {label!r}"
+            )
+        except promotion.PromotionError as error:
+            raise ArtifactBuildError(str(error)) from error
+        records.append(
+            {
+                "label": label,
+                "kind": kind,
+                "source": _file_ref(source, where=f"prior cohort {label!r}"),
+                "seed_intervals": [
+                    {
+                        "base_seed": interval["base_seed"],
+                        "end_seed": interval["end_seed"],
+                    }
+                    for interval in intervals
+                ],
+            }
+        )
+    value = {
+        "schema_version": promotion.COHORT_EXCLUSIONS_SCHEMA,
+        "contract_sha256": contract["contract_sha256"],
+        "candidate_sha256": candidate_ref["sha256"],
+        "cohorts": records,
+    }
+    value["manifest_sha256"] = promotion._digest_value(value)  # noqa: SLF001
+    return value
+
+
+def _parse_cohort_paths(values: Sequence[str]) -> list[tuple[str, str, Path]]:
+    parsed: list[tuple[str, str, Path]] = []
+    for raw in values:
+        identity, separator, path = raw.partition("=")
+        label, kind_separator, kind = identity.partition(":")
+        if not separator or not kind_separator or not label or not kind or not path:
+            raise ArtifactBuildError(
+                "--cohort entries must be LABEL:KIND=PATH"
+            )
+        parsed.append((label, kind, Path(path)))
+    return parsed
+
+
 def _contract(
     path: Path, legacy_contract_attestation: Path | None = None
 ) -> dict[str, Any]:
@@ -1243,6 +1322,18 @@ def _parser() -> argparse.ArgumentParser:
     evidence.add_argument("--registry", type=Path, required=True)
     evidence.add_argument("--source", action="append", default=[], metavar="ROLE=PATH")
     evidence.add_argument("--out", type=Path, required=True)
+
+    exclusions = subparsers.add_parser(
+        "cohort-exclusions",
+        help="derive candidate-bound prior-cohort seed exclusions from raw reports",
+    )
+    exclusions.add_argument("--contract-lock", type=Path, required=True)
+    exclusions.add_argument("--legacy-contract-attestation", type=Path)
+    exclusions.add_argument("--candidate", type=Path, required=True)
+    exclusions.add_argument(
+        "--cohort", action="append", default=[], metavar="LABEL:KIND=PATH"
+    )
+    exclusions.add_argument("--out", type=Path, required=True)
 
     adjudicate = subparsers.add_parser(
         "adjudicate", help="build final promotion adjudication"
@@ -1326,6 +1417,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 candidate=args.candidate,
                 champion=args.champion,
                 registry=ChampionRegistry.load(args.registry),
+            )
+        elif args.command == "cohort-exclusions":
+            value = build_cohort_exclusions(
+                contract=_contract(
+                    args.contract_lock, args.legacy_contract_attestation
+                ),
+                candidate=args.candidate,
+                cohorts=_parse_cohort_paths(args.cohort),
             )
         else:
             contract = _contract(
