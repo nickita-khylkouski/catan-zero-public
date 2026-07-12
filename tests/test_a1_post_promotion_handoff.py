@@ -116,6 +116,52 @@ def test_handoff_binds_committed_registry_pointer_and_producer(
     ]
 
 
+def test_rebases_next_campaign_to_committed_producer_and_prior_history(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state = _state(tmp_path, monkeypatch)
+    handoff_path, payload = _write_handoff(state, tmp_path)
+    source = (
+        Path(__file__).resolve().parents[1]
+        / "configs/operations/a1-dual-arm-56gpu-20260711-r2/contract.json"
+    )
+    out = tmp_path / "next-campaign.json"
+    campaign = contract.build_post_promotion_generation_campaign(
+        source,
+        handoff_path=handoff_path,
+        contract_id="a1-next-r3-producer-wave",
+        output_root=tmp_path / "next-wave",
+        out_path=out,
+    )
+    producer = next(row for row in campaign["checkpoints"] if row["role"] == "producer")
+    assert producer == {
+        "id": "a1_producer",
+        "role": "producer",
+        **payload["producer_identity"]["checkpoint"],
+    }
+    prior = next(row for row in campaign["checkpoints"] if row["id"] == "prior_generator")
+    assert prior["role"] == "history"
+    recent = next(
+        row for row in campaign["source_categories"] if row["name"] == "recent_history"
+    )
+    assert recent["checkpoint_ids"][0] == "prior_generator"
+    source_payload = json.loads(source.read_text())
+    assert campaign["arms"][0]["seed_start"] == source_payload["fleet"][
+        "next_campaign_seed_floor"
+    ]
+    assert contract.validate_generation_campaign(out) == campaign
+    with pytest.raises(contract.ContractError, match="not launchable until exact placement"):
+        contract.validate_generation_campaign(out, require_ready=True)
+
+    assignments = (
+        Path(__file__).resolve().parents[1]
+        / "configs/operations/a1-dual-arm-56gpu-20260710/placement.assignments.json"
+    )
+    placement_path = tmp_path / "next-placement.json"
+    placement = contract.seal_generation_placement(out, assignments, placement_path)
+    assert placement["campaign_sha256"] == campaign["contract_sha256"]
+
+
 def test_refuses_uncommitted_dry_run_receipt(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -181,6 +181,8 @@ HISTORICAL_HANDOFF_MODE = "historical_pre_promotion"
 POST_PROMOTION_HANDOFF_MODE = "post_promotion"
 GENERATION_CAMPAIGN_SCHEMA = "a1-dual-arm-generation-contract-v1"
 GENERATION_CAMPAIGN_REVISION_SCHEMA = "a1-dual-arm-generation-contract-v2"
+POST_PROMOTION_CAMPAIGN_SCHEMA = "a1-post-promotion-generation-campaign-v1"
+POST_PROMOTION_CAMPAIGN_STATUS = "ready_post_promotion_pending_placement"
 GENERATION_CAMPAIGN_CONTRACT_ID = "a1-dual-arm-n256-n128-56gpu-20260710-r1"
 GENERATION_CAMPAIGN_CONTRACT_SHA256 = (
     "sha256:029d4370c031d967994055b74578306fe99e34ec653221db39e277e6d22c1f74"
@@ -2837,6 +2839,199 @@ def _require_fresh_revision_handoff(record: Mapping[str, Any]) -> None:
         )
 
 
+def _current_repo_commit() -> str:
+    try:
+        commit = subprocess.check_output(
+            ("git", "rev-parse", "HEAD"), cwd=REPO_ROOT, text=True
+        ).strip()
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise ContractError("cannot resolve campaign-rebase Git identity") from error
+    if not re.fullmatch(r"[0-9a-f]{40}", commit):
+        raise ContractError("campaign-rebase Git identity is malformed")
+    return commit
+
+
+def _refresh_campaign_provenance(source: Mapping[str, Any]) -> dict[str, Any]:
+    refreshed: dict[str, Any] = {}
+    for group in ("arm_guards", "generator_code"):
+        rows = []
+        for raw in source[group]:
+            item = dict(raw)
+            path = REPO_ROOT / str(item["path"])
+            item["sha256"] = _sha256(path)
+            rows.append(item)
+        refreshed[group] = rows
+    for group in ("executor", "harvest", "fleet_manifest"):
+        item = dict(source[group])
+        item["sha256"] = _sha256(REPO_ROOT / str(item["path"]))
+        refreshed[group] = item
+    return refreshed
+
+
+def _post_promotion_campaign_payload(
+    source_path: Path,
+    source: dict[str, Any],
+    handoff_path: Path,
+    handoff: dict[str, Any],
+    *,
+    contract_id: str,
+    output_root: Path,
+) -> dict[str, Any]:
+    if source.get("schema_version") != GENERATION_CAMPAIGN_REVISION_SCHEMA:
+        raise ContractError("post-promotion rebase requires the latest sealed revision")
+    if not re.fullmatch(r"[a-z0-9][a-z0-9_.-]+", contract_id):
+        raise ContractError("post-promotion campaign id is malformed")
+    output_root = Path(os.path.abspath(os.fspath(output_root.expanduser())))
+    if not output_root.is_absolute():
+        raise ContractError("post-promotion output root must be absolute")
+    producer = handoff.get("producer_identity", {}).get("checkpoint")
+    if not isinstance(producer, dict) or set(producer) != {"path", "sha256"}:
+        raise ContractError("post-promotion handoff has no producer checkpoint")
+    producer_path = Path(str(producer["path"]))
+    if not producer_path.is_file() or _sha256(producer_path) != producer["sha256"]:
+        raise ContractError("post-promotion producer bytes drifted")
+    old_producers = [row for row in source["checkpoints"] if row["role"] == "producer"]
+    if len(old_producers) != 1 or old_producers[0]["sha256"] == producer["sha256"]:
+        raise ContractError("post-promotion rebase requires a distinct prior producer")
+    prior = {**old_producers[0], "id": "prior_generator", "role": "history"}
+    checkpoints = [
+        {"id": "a1_producer", "role": "producer", **producer},
+        prior,
+        *[row for row in source["checkpoints"] if row["role"] != "producer"],
+    ]
+    categories = json.loads(json.dumps(source["source_categories"]))
+    recent = next(row for row in categories if row["name"] == "recent_history")
+    recent["checkpoint_ids"] = [
+        "prior_generator",
+        *[item for item in recent["checkpoint_ids"] if item != "prior_generator"],
+    ]
+    value = json.loads(json.dumps(source))
+    value.update(
+        {
+            "schema_version": POST_PROMOTION_CAMPAIGN_SCHEMA,
+            "contract_id": contract_id,
+            "status": POST_PROMOTION_CAMPAIGN_STATUS,
+            "promotion_handoff": {
+                "mode": "post_promotion",
+                "path": str(handoff_path),
+                "sha256": _sha256(handoff_path),
+                "handoff_sha256": handoff["handoff_sha256"],
+                "transaction_id": handoff["promotion_receipt"]["transaction_id"],
+                "expected_schema": promotion_handoff.HANDOFF_SCHEMA,
+                "expected_checkpoint_sha256": producer["sha256"],
+            },
+            "checkpoints": checkpoints,
+            "source_categories": categories,
+            "implementation_commit": _current_repo_commit(),
+            "provenance": _refresh_campaign_provenance(source["provenance"]),
+        }
+    )
+    cursor = int(source["fleet"]["next_campaign_seed_floor"])
+    for arm in sorted(value["arms"], key=lambda row: 0 if row["id"] == "n256" else 1):
+        arm["seed_start"] = cursor
+        cursor += int(arm["gpu_count"]) * int(arm["seed_block_size"])
+        arm["seed_end"] = cursor
+        arm["output_root"] = str(output_root / str(arm["id"]))
+    value["fleet"]["next_campaign_seed_floor"] = cursor
+    value["rebase"] = {
+        "source_campaign": {
+            "path": str(source_path),
+            "sha256": _sha256(source_path),
+            "contract_sha256": source["contract_sha256"],
+        },
+        "previous_producer": old_producers[0],
+        "promoted_producer": producer,
+        "builder": {
+            "path": str(Path(__file__).resolve()),
+            "sha256": _sha256(Path(__file__).resolve()),
+        },
+    }
+    value.pop("supersedes", None)
+    value.pop("contract_sha256", None)
+    value["contract_sha256"] = _digest_value(value)
+    return value
+
+
+def build_post_promotion_generation_campaign(
+    source_path: Path,
+    *,
+    handoff_path: Path,
+    contract_id: str,
+    output_root: Path,
+    out_path: Path,
+) -> dict[str, Any]:
+    source_path = source_path.expanduser().resolve(strict=True)
+    source = validate_generation_campaign(source_path)
+    handoff_path = handoff_path.expanduser().resolve(strict=True)
+    handoff = _load_json(handoff_path)
+    try:
+        replayed = promotion_handoff.build_handoff(
+            Path(str(handoff.get("promotion_receipt", {}).get("path", "")))
+        )
+    except promotion_handoff.HandoffError as error:
+        raise ContractError(f"post-promotion handoff replay failed: {error}") from error
+    if handoff != replayed:
+        raise ContractError("post-promotion handoff differs from committed live lineage")
+    value = _post_promotion_campaign_payload(
+        source_path, source, handoff_path, handoff,
+        contract_id=contract_id, output_root=output_root,
+    )
+    _create_readonly(out_path.absolute(), value)
+    return value
+
+
+def _validate_post_promotion_campaign(
+    path: Path, value: dict[str, Any], *, require_ready: bool
+) -> dict[str, Any]:
+    expected_keys = {
+        "schema_version", "contract_id", "status", "promotion_handoff",
+        "checkpoints", "source_categories", "common_recipe", "arms", "fleet",
+        "provenance", "execution_policy", "implementation_commit", "rebase",
+        "contract_sha256",
+    }
+    _require_exact_keys(value, expected_keys, where="post-promotion generation campaign")
+    unhashed = dict(value)
+    declared = unhashed.pop("contract_sha256")
+    if declared != _digest_value(unhashed):
+        raise ContractError("post-promotion campaign semantic digest mismatch")
+    if value["status"] != POST_PROMOTION_CAMPAIGN_STATUS:
+        raise ContractError("post-promotion campaign status drift")
+    source_ref = value["rebase"]["source_campaign"]
+    source_path = Path(str(source_ref["path"]))
+    if _sha256(source_path) != source_ref["sha256"]:
+        raise ContractError("post-promotion source campaign bytes drifted")
+    source = validate_generation_campaign(source_path)
+    if source["contract_sha256"] != source_ref["contract_sha256"]:
+        raise ContractError("post-promotion source campaign identity drifted")
+    handoff_path = Path(str(value["promotion_handoff"]["path"]))
+    if _sha256(handoff_path) != value["promotion_handoff"]["sha256"]:
+        raise ContractError("post-promotion handoff bytes drifted")
+    handoff = _load_json(handoff_path)
+    try:
+        replayed = promotion_handoff.build_handoff(
+            Path(str(handoff.get("promotion_receipt", {}).get("path", "")))
+        )
+    except promotion_handoff.HandoffError as error:
+        raise ContractError(f"post-promotion handoff replay failed: {error}") from error
+    if handoff != replayed:
+        raise ContractError("post-promotion handoff live lineage drifted")
+    roots = {row["id"]: Path(row["output_root"]).parent for row in value["arms"]}
+    if len(set(roots.values())) != 1:
+        raise ContractError("post-promotion campaign output roots diverge")
+    expected = _post_promotion_campaign_payload(
+        source_path, source, handoff_path, handoff,
+        contract_id=value["contract_id"], output_root=next(iter(roots.values())),
+    )
+    if expected != value:
+        raise ContractError("post-promotion campaign differs from deterministic rebuild")
+    if require_ready:
+        raise ContractError(
+            "post-promotion campaign is not launchable until exact placement and arm "
+            "locks are sealed"
+        )
+    return value
+
+
 def validate_generation_campaign(
     path: Path,
     *,
@@ -2851,6 +3046,10 @@ def validate_generation_campaign(
     """
 
     value = _load_json(path)
+    if value.get("schema_version") == POST_PROMOTION_CAMPAIGN_SCHEMA:
+        return _validate_post_promotion_campaign(
+            path, value, require_ready=require_ready
+        )
     if value.get("schema_version") == GENERATION_CAMPAIGN_REVISION_SCHEMA:
         return _validate_generation_campaign_revision(
             path, value, require_ready=require_ready
@@ -3363,7 +3562,10 @@ def materialize_generation_campaign(
     """Create two immutable sealed arm locks; never render, claim, or launch."""
 
     campaign = validate_generation_campaign(campaign_path)
-    if campaign.get("schema_version") == GENERATION_CAMPAIGN_REVISION_SCHEMA:
+    if campaign.get("schema_version") in {
+        GENERATION_CAMPAIGN_REVISION_SCHEMA,
+        POST_PROMOTION_CAMPAIGN_SCHEMA,
+    }:
         provenance = dict(campaign["provenance"])
         records = [
             *map(dict, provenance["arm_guards"]),
@@ -3376,9 +3578,17 @@ def materialize_generation_campaign(
             source = REPO_ROOT / str(record["path"])
             if not source.is_file() or _sha256(source) != record["sha256"]:
                 raise ContractError(
-                    "generation revision materialization requires exact c179fe7 "
-                    f"runtime bytes: {record['path']}"
+                    "generation materialization requires exact bound runtime bytes: "
+                    f"{record['path']}"
                 )
+    if campaign.get("schema_version") == POST_PROMOTION_CAMPAIGN_SCHEMA:
+        bound_handoff = campaign["promotion_handoff"]
+        supplied = promotion_handoff_path.expanduser().resolve(strict=True)
+        if (
+            supplied != Path(str(bound_handoff["path"])).resolve(strict=True)
+            or _sha256(supplied) != bound_handoff["sha256"]
+        ):
+            raise ContractError("materialization handoff differs from rebased campaign")
     placements = _campaign_placements(placement_path, campaign)
     checkpoints: list[dict[str, Any]] = []
     for raw in campaign["checkpoints"]:
@@ -6230,6 +6440,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     revision_parser.add_argument("--contract-id", required=True)
     revision_parser.add_argument("--output-root", required=True)
     revision_parser.add_argument("--out", required=True)
+    rebase_parser = sub.add_parser(
+        "rebase-post-promotion-campaign",
+        help="bind a fresh campaign to the committed promoted producer; never launches",
+    )
+    rebase_parser.add_argument("--source", required=True)
+    rebase_parser.add_argument("--promotion-handoff", required=True)
+    rebase_parser.add_argument("--contract-id", required=True)
+    rebase_parser.add_argument("--output-root", required=True)
+    rebase_parser.add_argument("--out", required=True)
     materialize_parser = sub.add_parser(
         "materialize-generation-campaign",
         help="seal both arm locks after handoff and exact placement; never launches",
@@ -6334,6 +6553,24 @@ def main(argv: Sequence[str] | None = None) -> int:
                     sort_keys=True,
                 )
             )
+            return 0
+        if args.command == "rebase-post-promotion-campaign":
+            campaign = build_post_promotion_generation_campaign(
+                Path(args.source),
+                handoff_path=Path(args.promotion_handoff),
+                contract_id=args.contract_id,
+                output_root=Path(args.output_root),
+                out_path=Path(args.out),
+            )
+            print(json.dumps({
+                "status": campaign["status"],
+                "contract_id": campaign["contract_id"],
+                "contract_sha256": campaign["contract_sha256"],
+                "producer": next(
+                    row for row in campaign["checkpoints"] if row["role"] == "producer"
+                ),
+                "launch_authorized": False,
+            }, sort_keys=True))
             return 0
         if args.command == "materialize-generation-campaign":
             locks = materialize_generation_campaign(
