@@ -159,7 +159,9 @@ def main() -> None:
         )
         avg = sym.average_forward(
             r["entity"], r["legal_ids"], r["context"], forward_fn,
-            return_q=True, relabel_events=bool(args.relabel_events),
+            return_q=True,
+            relabel_events=bool(args.relabel_events),
+            action_size=int(policy.action_size),
         )
         vpo = np.asarray(avg["value_per_orientation"], dtype=np.float64)  # (N,)
         value_per_root.append(vpo)

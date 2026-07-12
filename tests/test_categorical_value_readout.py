@@ -102,7 +102,17 @@ def evaluator_inputs(monkeypatch):
     import catan_zero.rl.hex_symmetry as hex_symmetry
 
     class _IdentityAverage:
-        def average_forward(self, entity, legal_ids, context, forward_fn, *, return_q):
+        def average_forward(
+            self,
+            entity,
+            legal_ids,
+            context,
+            forward_fn,
+            *,
+            return_q,
+            action_size=None,
+        ):
+            del action_size
             out = forward_fn(entity, legal_ids, context, return_q)
             return {"logits": out["logits"][0], "value": float(out["value"][0])}
 

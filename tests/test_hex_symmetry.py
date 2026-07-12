@@ -223,13 +223,32 @@ def test_legal_action_id_feature_moves_with_board(sym, real_entity):
 
 def test_legal_action_relabel_refuses_wrong_action_space(sym, real_entity):
     ids = np.zeros(real_entity["legal_action_tokens"].shape[:2], dtype=np.int64)
-    with pytest.raises(ValueError, match="action permutation width"):
+    with pytest.raises(ValueError, match="permutation exceeds action_size"):
         sym.permute_entity_batch(
             real_entity,
             0,
             legal_action_ids=ids,
-            action_size=sym.pi_act.shape[1] + 1,
+            action_size=sym.pi_act.shape[1] - 1,
         )
+
+
+def test_nonspatial_extended_action_id_stays_fixed(sym, real_entity):
+    extended_size = sym.pi_act.shape[1] + 235  # production 332 + 235 = 567
+    extended_id = sym.pi_act.shape[1]
+    entity = {key: np.array(value, copy=True) for key, value in real_entity.items()}
+    ids = np.full(entity["legal_action_tokens"].shape[:2], extended_id, dtype=np.int64)
+    entity["legal_action_tokens"][:, :, 1] = extended_id / float(extended_size)
+    out = sym.permute_entity_batch(
+        entity,
+        1,
+        legal_action_ids=ids,
+        action_size=extended_size,
+    )
+    assert np.allclose(
+        out["legal_action_tokens"][:, :, 1],
+        extended_id / float(extended_size),
+        atol=5e-4,
+    )
 
 
 def test_event_action_zero_relabels_when_masked_present(sym, real_entity):

@@ -670,7 +670,14 @@ class EntityGraphRustEvaluator:
             }
 
         sym = build_hex_symmetry()
-        avg = sym.average_forward(entity, legal_ids, context, forward_fn, return_q=False)
+        avg = sym.average_forward(
+            entity,
+            legal_ids,
+            context,
+            forward_fn,
+            return_q=False,
+            action_size=int(self.policy.action_size),
+        )
 
         logits = np.asarray(avg["logits"], dtype=np.float64)
         temperature = max(float(self.config.prior_temperature), 1.0e-6)

@@ -210,16 +210,21 @@ class HexSymmetry:
                     f"{ids.shape} vs {np.asarray(entity['legal_action_tokens']).shape}"
                 )
             resolved_action_size = int(action_size or self.pi_act.shape[1])
-            if resolved_action_size != int(self.pi_act.shape[1]):
+            if resolved_action_size < int(self.pi_act.shape[1]):
                 raise ValueError(
-                    "D6 action permutation width does not match action_size: "
-                    f"{self.pi_act.shape[1]} != {resolved_action_size}"
+                    "D6 spatial action permutation exceeds action_size: "
+                    f"{self.pi_act.shape[1]} > {resolved_action_size}"
                 )
             valid = ids >= 0
-            if np.any(ids[valid] >= self.pi_act.shape[1]):
-                raise ValueError("legal_action_ids contain an id outside D6 action space")
-            clipped = np.where(valid, ids, 0)
-            mapped = self.pi_act[g_arr[:, None], clipped]
+            if np.any(ids[valid] >= resolved_action_size):
+                raise ValueError("legal_action_ids contain an id outside action_size")
+            spatial = valid & (ids < self.pi_act.shape[1])
+            clipped = np.where(spatial, ids, 0)
+            mapped_spatial = self.pi_act[g_arr[:, None], clipped]
+            # The production checkpoint has a 567-wide catalog whose first 332
+            # entries are the BASE board actions in pi_act; later trade/control
+            # extensions are non-spatial and remain fixed under D6.
+            mapped = np.where(spatial, mapped_spatial, ids)
             action_tokens = np.asarray(entity["legal_action_tokens"]).copy()
             action_tokens[:, :, _LEGAL_ACTION_ID_DIM] = np.where(
                 valid,
@@ -250,8 +255,10 @@ class HexSymmetry:
                 raise ValueError(
                     f"event_mask shape {present.shape} != event action ids {ids.shape}"
                 )
-            ids_c = np.clip(ids, 0, self.pi_act.shape[1] - 1)
-            new_ids = self.pi_act[g_arr[:, None], ids_c]
+            spatial = present & (ids >= 0) & (ids < self.pi_act.shape[1])
+            ids_c = np.where(spatial, ids, 0)
+            mapped_spatial = self.pi_act[g_arr[:, None], ids_c]
+            new_ids = np.where(spatial, mapped_spatial, ids)
             new_scaled = np.where(present, new_ids / _EVENT_ACTION_ID_SCALE, scaled)
             ev_tok[:, :, _EVENT_ACTION_ID_DIM] = new_scaled.astype(ev_tok.dtype)
             out["event_tokens"] = ev_tok
@@ -299,6 +306,7 @@ class HexSymmetry:
         *,
         return_q: bool = False,
         relabel_events: bool = True,
+        action_size: int | None = None,
     ) -> dict:
         """Denoise a single-state evaluation by averaging the net over all 12
         board orientations (the ``sqrt(12)`` value-noise reducer).
@@ -317,7 +325,7 @@ class HexSymmetry:
             entity,
             relabel_events=relabel_events,
             legal_action_ids=legal_action_ids,
-            action_size=self.pi_act.shape[1],
+            action_size=(self.pi_act.shape[1] if action_size is None else action_size),
         )
         legal_n = np.repeat(np.asarray(legal_action_ids), N_SYMMETRIES, axis=0)
         ctx_n = np.repeat(np.asarray(legal_action_context), N_SYMMETRIES, axis=0)
