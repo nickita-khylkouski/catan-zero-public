@@ -5588,6 +5588,9 @@ def evaluate_bc_batches(
             "prior_kl_rows": 0.0,
             "prior_kl_model_prior_sum": 0.0,
             "prior_kl_target_prior_sum": 0.0,
+            "active_policy_teacher_gap_rows": 0.0,
+            "active_policy_kl_target_model_sum": 0.0,
+            "active_policy_kl_target_prior_sum": 0.0,
         }
         extra_denominators: dict[str, float] = {
             "policy_loss": 0.0,
@@ -5692,6 +5695,15 @@ def evaluate_bc_batches(
             )
             extra_sums["prior_kl_target_prior_sum"] += float(
                 batch_metrics.get("prior_kl_target_prior_sum", 0.0)
+            )
+            extra_sums["active_policy_teacher_gap_rows"] += float(
+                batch_metrics.get("active_policy_teacher_gap_rows", 0.0)
+            )
+            extra_sums["active_policy_kl_target_model_sum"] += float(
+                batch_metrics.get("active_policy_kl_target_model_sum", 0.0)
+            )
+            extra_sums["active_policy_kl_target_prior_sum"] += float(
+                batch_metrics.get("active_policy_kl_target_prior_sum", 0.0)
             )
             batch_active_count = float(batch_metrics.get("active_count", len(batch)))
             acc_sum += float(batch_metrics["accuracy"]) * batch_active_count
@@ -5829,6 +5841,18 @@ def evaluate_bc_batches(
                 / max(extra_sums["prior_kl_target_prior_sum"], 1.0e-6)
                 if extra_sums["prior_kl_rows"] > 0
                 else 0.0
+            ),
+            # Objective-aligned teacher uptake. Unlike the legacy prior_kl_* fields,
+            # these rows exactly match positive policy weight + a usable
+            # multi-action soft target + a recorded prior.
+            **_active_policy_teacher_gap_report(
+                rows=extra_sums["active_policy_teacher_gap_rows"],
+                kl_target_model_sum=extra_sums[
+                    "active_policy_kl_target_model_sum"
+                ],
+                kl_target_prior_sum=extra_sums[
+                    "active_policy_kl_target_prior_sum"
+                ],
             ),
         }
     finally:
@@ -6135,6 +6159,12 @@ def _eval_xdim_batch(
                 )
             else:
                 per_sample_loss = hard_loss
+            # Teacher-gap telemetry must follow the rows the POLICY objective can
+            # actually update.  In PCR corpora, fast-search and forced rows still
+            # carry stored target/prior distributions but have zero policy weight;
+            # including them made the historical prior_kl_ratio compare against a
+            # much larger, untrained target population.
+            policy_active_for_teacher_gap = policy_weights > 0.0
             (
                 outcome_targets,
                 vp_targets,
@@ -6406,6 +6436,27 @@ def _eval_xdim_batch(
             prior_kl_rows = 0
             kl_model_prior_sum = 0.0
             kl_target_prior_sum = 0.0
+        teacher_gap = _active_policy_teacher_gap_telemetry(
+            data,
+            batch,
+            outputs["logits"],
+            policy.device,
+            soft_targets=soft_targets,
+            has_soft=has_soft,
+            policy_active=policy_active_for_teacher_gap,
+        )
+        if teacher_gap is not None:
+            teacher_gap_rows = int(teacher_gap["eligible"].sum().item())
+            teacher_kl_target_model_sum = float(
+                teacher_gap["kl_target_model"][teacher_gap["eligible"]].sum().item()
+            )
+            teacher_kl_target_prior_sum = float(
+                teacher_gap["kl_target_prior"][teacher_gap["eligible"]].sum().item()
+            )
+        else:
+            teacher_gap_rows = 0
+            teacher_kl_target_model_sum = 0.0
+            teacher_kl_target_prior_sum = 0.0
         return {
             "loss": float(loss.item()),
             "policy_loss": float(policy_loss.item()),
@@ -6491,6 +6542,9 @@ def _eval_xdim_batch(
             "prior_kl_rows": prior_kl_rows,
             "prior_kl_model_prior_sum": kl_model_prior_sum,
             "prior_kl_target_prior_sum": kl_target_prior_sum,
+            "active_policy_teacher_gap_rows": teacher_gap_rows,
+            "active_policy_kl_target_model_sum": teacher_kl_target_model_sum,
+            "active_policy_kl_target_prior_sum": teacher_kl_target_prior_sum,
         }
 
 
@@ -8784,6 +8838,105 @@ def _prior_kl_telemetry(
         "has_prior": has_prior,
         "kl_model_prior": kl_model_prior,
         "kl_target_prior": kl_target_prior,
+    }
+
+
+def _active_policy_teacher_gap_telemetry(
+    data: dict,
+    batch: np.ndarray,
+    logits,
+    device,
+    *,
+    soft_targets,
+    has_soft,
+    policy_active,
+):
+    """Measure how much of the active soft-policy teacher gap was closed.
+
+    This intentionally differs from the historical ``_prior_kl_telemetry``:
+
+    * only rows with positive policy loss weight are eligible;
+    * only usable multi-action soft targets are eligible; and
+    * the primary distance is ``KL(target || model)``, the direction aligned
+      with the soft cross-entropy objective.
+
+    PCR shards retain improved policies for fast-search and forced rows even
+    when their ``policy_weight_multiplier`` is zero.  Those rows are useful for
+    provenance but are not optimization targets, so including them in a
+    teacher-uptake denominator makes the resulting ratio structurally
+    unattainable.  Rows without a recorded prior are also excluded because the
+    baseline gap ``KL(target || prior)`` is undefined for them.
+    """
+
+    import torch
+
+    if soft_targets is None or has_soft is None or "prior_policy" not in data:
+        return None
+
+    legal_np = np.asarray(data["legal_action_ids"][batch]) >= 0
+    prior_np = np.asarray(data["prior_policy"][batch], dtype=np.float32)
+    if prior_np.shape != legal_np.shape:
+        return None
+
+    valid = torch.as_tensor(legal_np, dtype=torch.bool, device=device)
+    target = soft_targets.to(device=device, dtype=torch.float32)
+    if target.shape != valid.shape or logits.shape != valid.shape:
+        return None
+    zeros = torch.zeros_like(target)
+    eps = 1.0e-8
+
+    target = torch.where(valid, torch.clamp(target, min=0.0), zeros)
+    target = target / torch.clamp(target.sum(dim=-1, keepdim=True), min=eps)
+    prior = torch.as_tensor(prior_np, dtype=torch.float32, device=device)
+    prior = torch.where(valid, torch.clamp(prior, min=0.0), zeros)
+    prior_mass = prior.sum(dim=-1)
+    prior = prior / torch.clamp(prior_mass.unsqueeze(-1), min=eps)
+
+    has_multi_action_target = ((target > 0.0) & valid).sum(dim=-1) > 1
+    eligible = (
+        policy_active.to(device=device, dtype=torch.bool)
+        & has_soft.to(device=device, dtype=torch.bool)
+        & has_multi_action_target
+        & (prior_mass > eps)
+    )
+
+    log_target = torch.log(torch.clamp(target, min=eps))
+    log_prior = torch.log(torch.clamp(prior, min=eps))
+    model_log_probs = torch.nn.functional.log_softmax(logits.float(), dim=-1)
+    kl_target_model = torch.where(
+        valid,
+        target * (log_target - model_log_probs),
+        zeros,
+    ).sum(dim=-1).clamp_min(0.0)
+    kl_target_prior = torch.where(
+        valid,
+        target * (log_target - log_prior),
+        zeros,
+    ).sum(dim=-1).clamp_min(0.0)
+    return {
+        "eligible": eligible,
+        "kl_target_model": kl_target_model,
+        "kl_target_prior": kl_target_prior,
+    }
+
+
+def _active_policy_teacher_gap_report(
+    *, rows: float, kl_target_model_sum: float, kl_target_prior_sum: float
+) -> dict[str, float | int]:
+    """Reduce additive teacher-gap statistics into report-level metrics."""
+
+    count = max(float(rows), 0.0)
+    target_model = float(kl_target_model_sum)
+    target_prior = float(kl_target_prior_sum)
+    return {
+        "active_policy_teacher_gap_rows": int(round(count)),
+        "active_policy_kl_target_model_mean": target_model / max(count, 1.0),
+        "active_policy_kl_target_prior_mean": target_prior / max(count, 1.0),
+        "active_policy_teacher_gap_closure": (
+            1.0 - target_model / target_prior
+            if count > 0.0 and target_prior > 1.0e-8
+            else 0.0
+        ),
     }
 
 
