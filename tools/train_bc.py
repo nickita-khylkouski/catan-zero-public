@@ -991,6 +991,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--a1-curriculum-parent-receipt", default="", help=argparse.SUPPRESS
     )
+    parser.add_argument("--a1-batch-probe-plan", default="", help=argparse.SUPPRESS)
+    parser.add_argument("--a1-batch-probe-run-id", default="", help=argparse.SUPPRESS)
     parser.add_argument(
         "--init-checkpoint",
         default="",
@@ -3078,6 +3080,109 @@ def _effective_a1_learner_training_recipe(
     return effective
 
 
+def _validate_a1_batch_probe_authorization(
+    args: argparse.Namespace,
+    effective: dict[str, object],
+) -> dict[str, object] | None:
+    """Authenticate the narrow, non-promotable B200 batch-probe recipe."""
+    plan_value = str(getattr(args, "a1_batch_probe_plan", "") or "")
+    run_id = str(getattr(args, "a1_batch_probe_run_id", "") or "")
+    if not plan_value and not run_id:
+        return None
+    if not plan_value or not run_id:
+        raise SystemExit("A1 batch probe requires both plan and run id")
+    plan_path = Path(plan_value).expanduser().resolve(strict=True)
+    try:
+        plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise SystemExit(f"cannot load A1 batch-probe plan: {error}") from error
+    if not isinstance(plan, dict):
+        raise SystemExit("A1 batch-probe plan is not a JSON object")
+    stated = plan.get("plan_sha256")
+    replay = _canonical_json_sha256(
+        {key: value for key, value in plan.items() if key != "plan_sha256"}
+    )
+    if (
+        plan.get("schema_version") != "a1-b200-batch-probe-plan-v1"
+        or plan.get("diagnostic_only") is not True
+        or plan.get("promotion_eligible") is not False
+        or stated != replay
+    ):
+        raise SystemExit("A1 batch-probe plan schema/digest/authority drift")
+    matches = [row for row in plan.get("runs", []) if row.get("run_id") == run_id]
+    if len(matches) != 1:
+        raise SystemExit("A1 batch-probe run id is absent or duplicated")
+    run = matches[0]
+    command = run.get("command")
+    if not isinstance(command, list):
+        raise SystemExit("A1 batch-probe command is malformed")
+    trainer_indices = [
+        index for index, value in enumerate(command) if Path(str(value)).name == "train_bc.py"
+    ]
+    actual_argv = [str(Path(__file__).resolve()), *sys.argv[1:]]
+    if len(trainer_indices) != 1 or command[trainer_indices[0] :] != actual_argv:
+        raise SystemExit("A1 batch-probe plan does not bind the executing argv")
+    runtime = plan.get("runtime", {})
+    if (
+        runtime.get("trainer") != str(Path(__file__).resolve())
+        or runtime.get("trainer_sha256") != _sha256_existing_file(__file__)
+    ):
+        raise SystemExit("A1 batch-probe trainer runtime drift")
+    receipt_ref = plan.get("midpoint_receipt", {})
+    receipt_path = Path(str(receipt_ref.get("path", ""))).expanduser().resolve(strict=True)
+    if receipt_ref.get("sha256") != _sha256_existing_file(receipt_path):
+        raise SystemExit("A1 batch-probe midpoint receipt file drift")
+    try:
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise SystemExit(f"cannot load A1 batch-probe receipt: {error}") from error
+    receipt_unhashed = dict(receipt)
+    receipt_stated = receipt_unhashed.pop("receipt_sha256", None)
+    if receipt.get("status") != "complete" or receipt_stated != _canonical_json_sha256(
+        receipt_unhashed
+    ):
+        raise SystemExit("A1 batch-probe midpoint receipt digest/status drift")
+    authorization = plan.get("batch_probe_authorization", {})
+    baseline = receipt.get("inputs", {}).get("learner_ablation", {}).get(
+        "effective_recipe"
+    )
+    allowed = {"batch_size", "global_batch_size", "max_steps"}
+    if (
+        not isinstance(baseline, dict)
+        or authorization.get("baseline_effective_recipe") != baseline
+        or authorization.get("baseline_effective_recipe_sha256")
+        != _canonical_json_sha256(baseline)
+        or set(authorization.get("allowed_recipe_drift", [])) != allowed
+    ):
+        raise SystemExit("A1 batch-probe baseline recipe authorization drift")
+    actual = dict(effective)
+    actual["per_game_value_weight_mode"] = str(args.per_game_value_weight_mode)
+    if set(actual) != set(baseline):
+        raise SystemExit("A1 batch-probe effective recipe shape drift")
+    drift = {
+        key: {"baseline": baseline[key], "effective": actual[key]}
+        for key in baseline
+        if baseline[key] != actual[key]
+    }
+    if not drift or set(drift) - allowed:
+        raise SystemExit(
+            "A1 batch-probe recipe exceeds its allowed drift: "
+            f"drift={sorted(drift)} allowed={sorted(allowed)}"
+        )
+    return {
+        "schema_version": "a1-b200-batch-probe-authorization-v1",
+        "diagnostic_only": True,
+        "promotion_eligible": False,
+        "plan": str(plan_path),
+        "plan_sha256": stated,
+        "run_id": run_id,
+        "baseline_effective_recipe_sha256": _canonical_json_sha256(baseline),
+        "effective_recipe": actual,
+        "effective_recipe_sha256": _canonical_json_sha256(actual),
+        "recipe_drift": drift,
+    }
+
+
 def _validate_a1_learner_training_recipe(
     args: argparse.Namespace,
     ddp: dict[str, int | bool],
@@ -3095,6 +3200,11 @@ def _validate_a1_learner_training_recipe(
         raise SystemExit("A1 contract has no typed learner training recipe")
     immutable_expected = expected
     effective = _effective_a1_learner_training_recipe(args, ddp)
+    batch_probe = _validate_a1_batch_probe_authorization(args, effective)
+    if batch_probe is not None:
+        bound["learner_ablation"] = batch_probe
+        bound["batch_probe_authorization"] = batch_probe
+        return effective
     missing = set(expected) - set(effective)
     extra = set(effective) - set(expected)
     drift = {
@@ -3450,6 +3560,14 @@ def main(argv: Sequence[str] | None = None) -> None:
         expected_pipeline=TrainConfig.PIPELINE,
     )
     ddp = _distributed_state()
+    # Authenticate diagnostic batch/topology drift before the expensive A1
+    # memmap preflight.  The same authorization is replayed again when the
+    # audited corpus recipe is bound below.
+    if args.a1_batch_probe_plan or args.a1_batch_probe_run_id:
+        _validate_a1_batch_probe_authorization(
+            args,
+            _effective_a1_learner_training_recipe(args, ddp),
+        )
     a1_preflight_meta: dict[str, object] | None = None
     if args.data_format == "memmap":
         a1_preflight_meta = _coordinated_a1_memmap_preflight(

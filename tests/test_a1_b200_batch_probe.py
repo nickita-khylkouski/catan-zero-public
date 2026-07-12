@@ -8,11 +8,11 @@ import sys
 import pytest
 
 from tools import a1_b200_batch_probe as probe
+from tools import train_bc
 
 
 def _receipt(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     receipt = tmp_path / "training.receipt.json"
-    receipt.write_text("{}", encoding="utf-8")
     command = [
         "/venv/python",
         "-m",
@@ -30,6 +30,8 @@ def _receipt(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
         "1",
         "--lr",
         "0.00012",
+        "--loser-sample-weight",
+        "1.0",
         "--validation-fraction",
         "0.05",
         "--validation-seed",
@@ -47,24 +49,31 @@ def _receipt(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
         "--report",
         "/old/report.json",
     ]
+    trainer_index = command.index("/repo/tools/train_bc.py")
+    args = train_bc.build_parser().parse_args(command[trainer_index + 1 :])
+    recipe = train_bc._effective_a1_learner_training_recipe(  # noqa: SLF001
+        args, {"world_size": 8, "rank": 0, "enabled": True}
+    )
+    recipe["per_game_value_weight_mode"] = "equal"
+    payload = {
+        "status": "complete",
+        "arm_id": "n256",
+        "subset_id": "full-56k",
+        "inputs": {
+            "learner_ablation": {
+                "ablation_id": "all-196k-corrective-lr120u-loser1",
+                "diagnostic_only": True,
+                "effective_recipe": recipe,
+            }
+        },
+        "command": command,
+    }
+    payload["receipt_sha256"] = probe._digest(payload)  # noqa: SLF001
+    receipt.write_text(json.dumps(payload), encoding="utf-8")
     monkeypatch.setattr(
         probe.dual,
         "verify_receipt",
-        lambda _path: {
-            "arm_id": "n256",
-            "subset_id": "full-56k",
-            "inputs": {
-                "learner_ablation": {
-                    "ablation_id": "all-196k-corrective-lr120u-loser1",
-                    "diagnostic_only": True,
-                    "effective_recipe": {
-                        "lr": 0.00012,
-                        "loser_sample_weight": 1.0,
-                    },
-                }
-            },
-            "command": command,
-        },
+        lambda _path: payload,
     )
     trainer = (Path(probe.__file__).resolve().parents[1] / "tools" / "train_bc.py")
     monkeypatch.setattr(
@@ -112,7 +121,13 @@ def test_plan_separates_fixed_step_and_equal_sample_questions(
         command = run["command"]
         assert plan["runtime"]["trainer"] in command
         assert "/repo/tools/train_bc.py" not in command
-        assert not any(item.startswith("--a1-") for item in command)
+        assert {
+            item for item in command if item.startswith("--a1-")
+        } == {"--a1-batch-probe-plan", "--a1-batch-probe-run-id"}
+        assert command[command.index("--a1-batch-probe-run-id") + 1] == run["run_id"]
+        assert command[command.index("--a1-batch-probe-plan") + 1] == str(
+            tmp_path / "probe" / "plan.json"
+        )
         assert command.count("--validation-game-seed-manifest") == 1
         expected_validation = {
             "--validation-fraction": "0.05",
@@ -213,6 +228,92 @@ def test_train_bc_sibling_contract_import_works_without_repo_on_pythonpath() -> 
         stderr=subprocess.PIPE,
     )
     assert result.returncode == 0, result.stderr
+
+
+def test_train_bc_authenticates_exact_probe_command_before_memmap_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plan = probe.build_plan(
+        midpoint_receipt=_receipt(tmp_path, monkeypatch),
+        output_dir=tmp_path / "probe",
+        lr_policy="fixed",
+    )
+    run = plan["runs"][1]
+    trainer_index = next(
+        index
+        for index, value in enumerate(run["command"])
+        if Path(value).name == "train_bc.py"
+    )
+    argv = run["command"][trainer_index:]
+    monkeypatch.setattr(sys, "argv", argv)
+    args = train_bc.build_parser().parse_args(argv[1:])
+    effective = train_bc._effective_a1_learner_training_recipe(  # noqa: SLF001
+        args, {"world_size": 8, "rank": 0, "enabled": True}
+    )
+
+    authorization = train_bc._validate_a1_batch_probe_authorization(  # noqa: SLF001
+        args, effective
+    )
+
+    assert authorization is not None
+    assert authorization["run_id"] == run["run_id"]
+    assert set(authorization["recipe_drift"]) == {
+        "batch_size",
+        "global_batch_size",
+        "max_steps",
+    }
+
+
+def test_train_bc_probe_authorization_rejects_unplanned_argv(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plan = probe.build_plan(
+        midpoint_receipt=_receipt(tmp_path, monkeypatch),
+        output_dir=tmp_path / "probe",
+        lr_policy="fixed",
+    )
+    run = plan["runs"][0]
+    trainer_index = next(
+        index
+        for index, value in enumerate(run["command"])
+        if Path(value).name == "train_bc.py"
+    )
+    argv = run["command"][trainer_index:]
+    args = train_bc.build_parser().parse_args(argv[1:])
+    effective = train_bc._effective_a1_learner_training_recipe(  # noqa: SLF001
+        args, {"world_size": 8, "rank": 0, "enabled": True}
+    )
+    tampered = list(argv)
+    tampered[tampered.index("--batch-size") + 1] = "513"
+    monkeypatch.setattr(sys, "argv", tampered)
+
+    with pytest.raises(SystemExit, match="does not bind the executing argv"):
+        train_bc._validate_a1_batch_probe_authorization(args, effective)  # noqa: SLF001
+
+
+def test_train_bc_probe_authorization_rejects_lr_scaling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plan = probe.build_plan(
+        midpoint_receipt=_receipt(tmp_path, monkeypatch),
+        output_dir=tmp_path / "probe",
+        lr_policy="sqrt",
+    )
+    run = plan["runs"][1]
+    trainer_index = next(
+        index
+        for index, value in enumerate(run["command"])
+        if Path(value).name == "train_bc.py"
+    )
+    argv = run["command"][trainer_index:]
+    monkeypatch.setattr(sys, "argv", argv)
+    args = train_bc.build_parser().parse_args(argv[1:])
+    effective = train_bc._effective_a1_learner_training_recipe(  # noqa: SLF001
+        args, {"world_size": 8, "rank": 0, "enabled": True}
+    )
+
+    with pytest.raises(SystemExit, match="exceeds its allowed drift"):
+        train_bc._validate_a1_batch_probe_authorization(args, effective)  # noqa: SLF001
 
 
 def test_gpu_occupancy_allows_only_mps_server() -> None:

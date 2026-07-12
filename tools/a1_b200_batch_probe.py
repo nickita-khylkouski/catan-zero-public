@@ -189,6 +189,11 @@ def build_plan(
     if equal_sample_reference_steps % 3:
         raise ProbeError("equal-sample reference steps must be divisible by 3")
     midpoint = _authenticated_midpoint(midpoint_receipt)
+    midpoint_recipe = midpoint["payload"].get("inputs", {}).get(
+        "learner_ablation", {}
+    ).get("effective_recipe")
+    if not isinstance(midpoint_recipe, dict) or not midpoint_recipe:
+        raise ProbeError("midpoint receipt has no authenticated effective recipe")
     runtime = _current_runtime()
     base = _strip_production_authority(list(midpoint["payload"]["command"]))
     # The complete held-out split tuple is data-split provenance, not
@@ -222,9 +227,12 @@ def build_plan(
                 ("--train-diagnostics-every-batches", "1"),
                 ("--checkpoint", str(run_dir / "candidate.pt")),
                 ("--report", str(run_dir / "train.report.json")),
+                ("--a1-batch-probe-plan", str(output_dir / "plan.json")),
+                ("--a1-batch-probe-run-id", run_id),
             ):
                 _set_option(command, flag, value)
-            if any(item.startswith("--a1-") for item in command):
+            a1_flags = {item for item in command if item.startswith("--a1-")}
+            if a1_flags != {"--a1-batch-probe-plan", "--a1-batch-probe-run-id"}:
                 raise AssertionError("production A1 authority leaked into topology probe")
             runs.append(
                 {
@@ -254,6 +262,15 @@ def build_plan(
         "diagnostic_only": True,
         "promotion_eligible": False,
         "midpoint_receipt": {key: midpoint[key] for key in ("path", "sha256")},
+        "batch_probe_authorization": {
+            "baseline_effective_recipe": midpoint_recipe,
+            "baseline_effective_recipe_sha256": _digest(midpoint_recipe),
+            "allowed_recipe_drift": [
+                "batch_size",
+                "global_batch_size",
+                "max_steps",
+            ],
+        },
         "runtime": runtime,
         "lr_scaling": {
             "policy": lr_policy,
