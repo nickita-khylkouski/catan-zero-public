@@ -20,20 +20,36 @@ patch #8, which is wrong under FSDP):
   This mirrors the FULL_STATE_DICT model-weight gather in train_bc ``_save_policy``
   (C1); ``is_fsdp`` here is the single FSDP-detection path both call sites share.
 
-``load_optimizer_state`` is FAIL-SAFE: a missing sidecar or ANY mismatch (arch change
-from grow-from-checkpoint, param-group/shape drift, torch-version API drift) is logged
-and returns ``False`` -- the caller then trains with a fresh optimizer. It NEVER raises,
-so resume degrades gracefully to today's behaviour rather than crashing a run.
+The optimizer pickle alone is not a resumable checkpoint: Adam moments without the
+matching LR step caused warmup, max-step dose, and reports to restart at zero. A
+versioned ``<checkpoint>.training-progress.json`` commit marker therefore binds hashes
+of the model and optimizer files to the exact recipe/schedule identity and records the
+optimizer step, completed epochs, cumulative value dose, NumPy sampler state, and
+per-rank CPU/CUDA torch RNG (dropout) state. ``train_bc``
+only restores moments after that marker validates. Any partial/mixed/legacy set fails
+closed; an operator can deliberately choose fresh Adam with ``--no-resume-optimizer``.
+
+The low-level ``load_optimizer_state`` remains fail-soft and returns ``False`` on a
+pickle/API mismatch. The trainer converts that into a fail-closed resume error after a
+progress marker has committed continuity; callers that use this utility independently
+retain its historical behavior.
 """
 
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 from pathlib import Path
 from typing import Any
 
 _OPTIM_SIDECAR_SUFFIX = ".optimizer.pt"
+_PROGRESS_SIDECAR_SUFFIX = ".training-progress.json"
+TRAINING_PROGRESS_SCHEMA = "train-bc-progress-v1"
+
+
+class TrainingProgressError(RuntimeError):
+    """The checkpoint set cannot be proven to describe one training trajectory."""
 
 
 def optimizer_sidecar_path(checkpoint_path: str | os.PathLike) -> Path:
@@ -41,6 +57,162 @@ def optimizer_sidecar_path(checkpoint_path: str | os.PathLike) -> Path:
     Matches patch #8's convention so any existing sidecars interoperate."""
     p = Path(checkpoint_path)
     return p.with_name(p.name + _OPTIM_SIDECAR_SUFFIX)
+
+
+def training_progress_sidecar_path(checkpoint_path: str | os.PathLike) -> Path:
+    """Commit marker for a model + optimizer checkpoint pair."""
+    p = Path(checkpoint_path)
+    return p.with_name(p.name + _PROGRESS_SIDECAR_SUFFIX)
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(8 << 20), b""):
+            digest.update(chunk)
+    return f"sha256:{digest.hexdigest()}"
+
+
+def _canonical_sha256(payload: dict[str, Any]) -> str:
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return f"sha256:{hashlib.sha256(raw).hexdigest()}"
+
+
+def _atomic_json_save(payload: dict[str, Any], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.tmp.{os.getpid()}")
+    try:
+        with tmp.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, sort_keys=True, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+
+
+def save_training_progress(
+    checkpoint_path: str | os.PathLike,
+    *,
+    optimizer_step: int,
+    completed_epochs: int,
+    recipe_identity: dict[str, Any],
+    rng_state: dict[str, Any],
+    symmetry_rng_state: dict[str, Any] | None,
+    rank_torch_rng_states: list[dict[str, Any]],
+    scalar_training_weight_sum: float,
+    categorical_training_weight_sum: float,
+    ddp: dict | None,
+) -> Path | None:
+    """Atomically commit progress after model and optimizer sidecars are durable.
+
+    The JSON is deliberately written last. Its byte hashes bind the two independently
+    atomic torch files into one checkpoint set; a crash or overwrite between any of the
+    three writes is detected on resume instead of mixing model weights, Adam moments,
+    and an unrelated LR-schedule position.
+    """
+    if _rank(ddp) != 0:
+        return None
+    checkpoint = Path(checkpoint_path)
+    optimizer_path = optimizer_sidecar_path(checkpoint)
+    if not checkpoint.is_file() or not optimizer_path.is_file():
+        raise TrainingProgressError(
+            "cannot commit training progress without both model and optimizer files"
+        )
+    payload: dict[str, Any] = {
+        "schema_version": TRAINING_PROGRESS_SCHEMA,
+        "status": "complete",
+        "checkpoint": {
+            "path": checkpoint.name,
+            "sha256": _file_sha256(checkpoint),
+        },
+        "optimizer": {
+            "path": optimizer_path.name,
+            "sha256": _file_sha256(optimizer_path),
+        },
+        "optimizer_step": int(optimizer_step),
+        "completed_epochs": int(completed_epochs),
+        "recipe_identity": recipe_identity,
+        "recipe_identity_sha256": _canonical_sha256(recipe_identity),
+        "rng_state": rng_state,
+        "symmetry_rng_state": symmetry_rng_state,
+        "rank_torch_rng_states": rank_torch_rng_states,
+        "scalar_training_weight_sum": float(scalar_training_weight_sum),
+        "categorical_training_weight_sum": float(categorical_training_weight_sum),
+    }
+    payload["progress_sha256"] = _canonical_sha256(payload)
+    output = training_progress_sidecar_path(checkpoint)
+    _atomic_json_save(payload, output)
+    _log(f"committed training progress -> {output}", ddp)
+    return output
+
+
+def load_training_progress(
+    checkpoint_path: str | os.PathLike,
+    *,
+    expected_recipe_identity: dict[str, Any],
+) -> dict[str, Any]:
+    """Validate and return a committed checkpoint set, otherwise fail closed."""
+    checkpoint = Path(checkpoint_path)
+    optimizer_path = optimizer_sidecar_path(checkpoint)
+    progress_path = training_progress_sidecar_path(checkpoint)
+    try:
+        payload = json.loads(progress_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise TrainingProgressError(
+            f"cannot read training progress {progress_path}: {error}"
+        ) from error
+    if not isinstance(payload, dict):
+        raise TrainingProgressError("training progress is not a JSON object")
+    stated = payload.get("progress_sha256")
+    unhashed = {key: value for key, value in payload.items() if key != "progress_sha256"}
+    if (
+        payload.get("schema_version") != TRAINING_PROGRESS_SCHEMA
+        or payload.get("status") != "complete"
+        or stated != _canonical_sha256(unhashed)
+    ):
+        raise TrainingProgressError("training progress schema/status/digest mismatch")
+    if (
+        payload.get("recipe_identity") != expected_recipe_identity
+        or payload.get("recipe_identity_sha256")
+        != _canonical_sha256(expected_recipe_identity)
+    ):
+        raise TrainingProgressError("training recipe/schedule identity mismatch")
+    checkpoint_record = payload.get("checkpoint", {})
+    optimizer_record = payload.get("optimizer", {})
+    if (
+        checkpoint_record.get("path") != checkpoint.name
+        or optimizer_record.get("path") != optimizer_path.name
+        or not checkpoint.is_file()
+        or not optimizer_path.is_file()
+        or checkpoint_record.get("sha256") != _file_sha256(checkpoint)
+        or optimizer_record.get("sha256") != _file_sha256(optimizer_path)
+    ):
+        raise TrainingProgressError("model/optimizer checkpoint binding mismatch")
+    for field in ("optimizer_step", "completed_epochs"):
+        value = payload.get(field)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise TrainingProgressError(f"invalid training progress field {field}")
+    if not isinstance(payload.get("rng_state"), dict):
+        raise TrainingProgressError("training progress lacks numpy RNG state")
+    rank_rng = payload.get("rank_torch_rng_states")
+    expected_world_size = expected_recipe_identity.get("world_size")
+    if (
+        not isinstance(rank_rng, list)
+        or isinstance(expected_world_size, bool)
+        or not isinstance(expected_world_size, int)
+        or len(rank_rng) != expected_world_size
+        or any(
+            not isinstance(row, dict)
+            or not isinstance(row.get("cpu"), list)
+            or (row.get("cuda") is not None and not isinstance(row.get("cuda"), list))
+            for row in rank_rng
+        )
+    ):
+        raise TrainingProgressError("training progress lacks per-rank torch RNG state")
+    return payload
 
 
 def is_fsdp(model: Any) -> bool:

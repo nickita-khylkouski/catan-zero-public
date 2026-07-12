@@ -11,6 +11,7 @@ GPU verify give optim_state.py: single / DDP / real-FSDP-collective coverage.
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 from pathlib import Path
 
@@ -19,10 +20,14 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from catan_zero.rl.optim_state import (  # noqa: E402
+    TrainingProgressError,
     is_fsdp,
+    load_training_progress,
     load_optimizer_state,
     optimizer_sidecar_path,
+    save_training_progress,
     save_optimizer_state,
+    training_progress_sidecar_path,
 )
 
 _DDP_SINGLE = {"enabled": False, "world_size": 1, "rank": 0, "local_rank": 0}
@@ -71,6 +76,73 @@ def test_load_corrupt_sidecar_never_raises(tmp_path):
     assert load_optimizer_state(ckpt, model, opt, _DDP_SINGLE) is False
 
 
+def _committed_progress(tmp_path: Path, *, recipe=None):
+    ckpt = tmp_path / "checkpoint.pt"
+    ckpt.write_bytes(b"model-v1")
+    model, optimizer = _stepped_adam()
+    save_optimizer_state(ckpt, model, optimizer, _DDP_SINGLE)
+    rng = __import__("numpy").random.default_rng(17)
+    rng.random(9)
+    identity = recipe or {
+        "schema_version": "recipe-v1",
+        "lr": 3e-5,
+        "world_size": 1,
+    }
+    save_training_progress(
+        ckpt,
+        optimizer_step=713,
+        completed_epochs=2,
+        recipe_identity=identity,
+        rng_state=rng.bit_generator.state,
+        symmetry_rng_state=None,
+        rank_torch_rng_states=[
+            {"rank": 0, "cpu": torch.get_rng_state().tolist(), "cuda": None}
+        ],
+        scalar_training_weight_sum=123.5,
+        categorical_training_weight_sum=44.0,
+        ddp=_DDP_SINGLE,
+    )
+    return ckpt, identity, rng.bit_generator.state
+
+
+def test_progress_commit_binds_model_optimizer_recipe_and_exact_step(tmp_path):
+    ckpt, identity, rng_state = _committed_progress(tmp_path)
+    loaded = load_training_progress(ckpt, expected_recipe_identity=identity)
+    assert loaded["optimizer_step"] == 713
+    assert loaded["completed_epochs"] == 2
+    assert loaded["rng_state"] == rng_state
+    assert training_progress_sidecar_path(ckpt).name.endswith(
+        ".training-progress.json"
+    )
+
+
+@pytest.mark.parametrize("mutated", ["model", "optimizer"])
+def test_progress_rejects_mixed_checkpoint_set(tmp_path, mutated):
+    ckpt, identity, _ = _committed_progress(tmp_path)
+    path = ckpt if mutated == "model" else optimizer_sidecar_path(ckpt)
+    path.write_bytes(path.read_bytes() + b"different generation")
+    with pytest.raises(TrainingProgressError, match="binding mismatch"):
+        load_training_progress(ckpt, expected_recipe_identity=identity)
+
+
+def test_progress_rejects_schedule_recipe_drift(tmp_path):
+    ckpt, identity, _ = _committed_progress(tmp_path)
+    with pytest.raises(TrainingProgressError, match="recipe/schedule"):
+        load_training_progress(
+            ckpt, expected_recipe_identity={**identity, "lr": 1.2e-4}
+        )
+
+
+def test_progress_rejects_tampered_counter_even_when_json_parses(tmp_path):
+    ckpt, identity, _ = _committed_progress(tmp_path)
+    path = training_progress_sidecar_path(ckpt)
+    payload = json.loads(path.read_text())
+    payload["optimizer_step"] = 0
+    path.write_text(json.dumps(payload))
+    with pytest.raises(TrainingProgressError, match="digest mismatch"):
+        load_training_progress(ckpt, expected_recipe_identity=identity)
+
+
 def test_fsdp_optim_state_roundtrip_2gpu():
     """Real 2-rank FSDP-collective save/restore verify (FSDP.optim_state_dict /
     optim_state_dict_to_load). GPU-gated: FSDP needs an accelerator (no CPU/gloo path on
@@ -117,3 +189,35 @@ def test_memmap_incompatible_with_strict_teacher_gate_fails_fast():
             ]
         )
     assert "incompatible with --data-format memmap" in str(exc.value)
+
+
+def test_train_bc_restores_schedule_counter_epoch_and_sampler_rng():
+    tb = _load_train_bc()
+    np = __import__("numpy")
+    source_rng = np.random.default_rng(91)
+    source_rng.random(11)
+    expected_next = source_rng.random(4)
+    # Recreate the state before consuming the expected continuation.
+    source_rng = np.random.default_rng(91)
+    source_rng.random(11)
+    resumed_rng = np.random.default_rng(999)
+    progress = {
+        "optimizer_step": 713,
+        "completed_epochs": 2,
+        "rng_state": source_rng.bit_generator.state,
+        "symmetry_rng_state": None,
+        "rank_torch_rng_states": [
+            {"rank": 0, "cpu": torch.get_rng_state().tolist(), "cuda": None}
+        ],
+        "scalar_training_weight_sum": 123.5,
+        "categorical_training_weight_sum": 44.0,
+    }
+    restored = tb._restore_training_progress_state(
+        progress,
+        epochs=4,
+        rng=resumed_rng,
+        symmetry_rng=None,
+        ddp=_DDP_SINGLE,
+    )
+    assert restored == (713, 2, 123.5, 44.0)
+    assert np.array_equal(resumed_rng.random(4), expected_next)

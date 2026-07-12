@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+import dataclasses
 from datetime import timedelta
 import hashlib
 import io
@@ -1038,10 +1039,12 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=True,
         help=(
-            "Restore <init-checkpoint>.optimizer.pt when compatible. Disable "
-            "with --no-resume-optimizer for matched warm-start experiments so "
-            "both arms use fresh optimizer state even if only one source has a "
-            "sidecar. The resolved choice is recorded in the config/report."
+            "Restore a committed <init-checkpoint>.optimizer.pt + training-progress "
+            "checkpoint set when its model hashes and recipe/schedule identity match. "
+            "A partial, legacy, or mismatched set fails closed instead of silently "
+            "restarting the LR/dose at step zero. Disable with --no-resume-optimizer "
+            "for an explicit fresh-Adam warm start (including matched experiments). "
+            "The resolved choice and restored step are recorded in the report."
         ),
     )
     parser.add_argument("--checkpoint", required=True)
@@ -3969,6 +3972,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         register=(ddp["rank"] == 0),
     )
     train_config_hash = train_config.config_hash()
+    resume_recipe_identity = _training_resume_recipe_identity(train_config, args, ddp)
     _train_lock = None
     if not args.allow_concurrent_bc:
         # Retain the lock object for the entire training lifetime.
@@ -4467,15 +4471,55 @@ def main(argv: Sequence[str] | None = None) -> None:
     # returns False and training proceeds with a fresh optimizer -- the expected first
     # fine-tune behaviour; the win is on resuming a run this code started.
     optimizer_restored = False
+    resume_progress = None
     if args.init_checkpoint and bool(args.resume_optimizer):
-        from catan_zero.rl.optim_state import load_optimizer_state
-
-        optimizer_restored = bool(
-            load_optimizer_state(args.init_checkpoint, policy.model, optimizer, ddp)
+        from catan_zero.rl.optim_state import (
+            TrainingProgressError,
+            load_optimizer_state,
+            load_training_progress,
+            optimizer_sidecar_path,
+            training_progress_sidecar_path,
         )
+
+        optimizer_path = optimizer_sidecar_path(args.init_checkpoint)
+        progress_path = training_progress_sidecar_path(args.init_checkpoint)
+        if optimizer_path.exists() or progress_path.exists():
+            if not optimizer_path.exists() or not progress_path.exists():
+                raise SystemExit(
+                    "incomplete resumable checkpoint set: model, optimizer, and "
+                    "training-progress sidecars must all belong to one atomic commit; "
+                    "use --no-resume-optimizer for an explicit fresh-optimizer start"
+                )
+            try:
+                resume_progress = load_training_progress(
+                    args.init_checkpoint,
+                    expected_recipe_identity=resume_recipe_identity,
+                )
+            except TrainingProgressError as error:
+                raise SystemExit(
+                    f"refusing incompatible optimizer resume: {error}; use "
+                    "--no-resume-optimizer for an explicit fresh-optimizer start"
+                ) from error
+            optimizer_restored = bool(
+                load_optimizer_state(args.init_checkpoint, policy.model, optimizer, ddp)
+            )
+            if not optimizer_restored:
+                raise SystemExit(
+                    "training progress validated but optimizer restore failed; refusing "
+                    "to restart Adam/LR state silently (use --no-resume-optimizer for "
+                    "an explicit fresh-optimizer start)"
+                )
         _rank0_print(
             json.dumps(
-                {"progress": "optimizer_resume", "restored": optimizer_restored},
+                {
+                    "progress": "optimizer_resume",
+                    "restored": optimizer_restored,
+                    "optimizer_step": (
+                        None
+                        if resume_progress is None
+                        else int(resume_progress["optimizer_step"])
+                    ),
+                },
                 sort_keys=True,
             ),
             ddp,
@@ -4859,9 +4903,18 @@ def main(argv: Sequence[str] | None = None) -> None:
         ddp,
     )
     first_batch_profile = None
-    global_step = 0
-    cumulative_scalar_training_weight = 0.0
-    cumulative_categorical_training_weight = 0.0
+    (
+        global_step,
+        start_epoch,
+        cumulative_scalar_training_weight,
+        cumulative_categorical_training_weight,
+    ) = _restore_training_progress_state(
+        resume_progress,
+        epochs=int(args.epochs),
+        rng=rng,
+        symmetry_rng=symmetry_rng,
+        ddp=ddp,
+    )
     optimizer_observed_steps = 0
     optimizer_clipped_steps = 0
     optimizer_pre_clip_grad_norm_sum = 0.0
@@ -4871,7 +4924,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     # exactly: every micro-batch zero-grads, backwards the undivided loss, clips,
     # and steps, and global_step (== optimizer steps) advances once per batch.
     accum = max(1, int(args.grad_accum_steps))
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         remaining_order_samples = None
         if int(args.max_steps) > 0 and epoch_sample_weights is not None:
             # Weighted sampling is with replacement, so a bounded draw is the
@@ -5386,7 +5439,23 @@ def main(argv: Sequence[str] | None = None) -> None:
             )
             # CAT-128 patch #8: persist optimizer (Adam) state as <ckpt>.optimizer.pt.
             # Called on ALL ranks (the FSDP gather is a collective); rank-0 writes.
-            _save_optimizer_sidecar(str(epoch_path), policy, optimizer, ddp)
+            optimizer_saved = _save_optimizer_sidecar(
+                str(epoch_path), policy, optimizer, ddp
+            )
+            _save_training_progress_sidecar(
+                str(epoch_path),
+                optimizer_saved=optimizer_saved,
+                optimizer_step=global_step,
+                completed_epochs=epoch + 1,
+                recipe_identity=resume_recipe_identity,
+                rng=rng,
+                symmetry_rng=symmetry_rng,
+                scalar_training_weight_sum=cumulative_scalar_training_weight,
+                categorical_training_weight_sum=(
+                    cumulative_categorical_training_weight
+                ),
+                ddp=ddp,
+            )
         if args.max_steps > 0 and global_step >= args.max_steps:
             break
     # Called on every rank (see _save_policy): rank-0 write for DDP/single, and a
@@ -5402,7 +5471,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             getattr(checkpoint_model, "value_categorical_bins", 0) or 0
         ),
         optimizer_steps=global_step,
-        completed_epochs=len(metrics),
+        completed_epochs=start_epoch + len(metrics),
         scalar_training_weight_sum=cumulative_scalar_training_weight,
         categorical_training_weight_sum=(
             cumulative_categorical_training_weight
@@ -5432,7 +5501,21 @@ def main(argv: Sequence[str] | None = None) -> None:
         value_training=value_training,
     )
     # CAT-128 patch #8: persist final optimizer (Adam) state alongside the checkpoint.
-    _save_optimizer_sidecar(args.checkpoint, policy, optimizer, ddp)
+    optimizer_saved = _save_optimizer_sidecar(
+        args.checkpoint, policy, optimizer, ddp
+    )
+    _save_training_progress_sidecar(
+        args.checkpoint,
+        optimizer_saved=optimizer_saved,
+        optimizer_step=global_step,
+        completed_epochs=start_epoch + len(metrics),
+        recipe_identity=resume_recipe_identity,
+        rng=rng,
+        symmetry_rng=symmetry_rng,
+        scalar_training_weight_sum=cumulative_scalar_training_weight,
+        categorical_training_weight_sum=cumulative_categorical_training_weight,
+        ddp=ddp,
+    )
     report = {
         "arch": args.arch,
         "config_hash": train_config_hash,
@@ -5565,6 +5648,16 @@ def main(argv: Sequence[str] | None = None) -> None:
         ),
         "resume_optimizer": bool(args.resume_optimizer),
         "optimizer_restored": bool(optimizer_restored),
+        "resumed_optimizer_step": (
+            None
+            if resume_progress is None
+            else int(resume_progress["optimizer_step"])
+        ),
+        "resumed_completed_epochs": (
+            None
+            if resume_progress is None
+            else int(resume_progress["completed_epochs"])
+        ),
         "grow_from_checkpoint": args.grow_from_checkpoint or None,
         "metrics": metrics,
         "data_quality": data_quality,
@@ -12753,14 +12846,168 @@ def _is_fsdp(model) -> bool:
     return is_fsdp(model)
 
 
-def _save_optimizer_sidecar(checkpoint_path: str, policy, optimizer, ddp: dict) -> None:
+def _training_resume_recipe_identity(
+    train_config: TrainConfig,
+    args: argparse.Namespace,
+    ddp: dict[str, int | bool],
+) -> dict[str, object]:
+    """Stable identity of the trajectory whose Adam/schedule state may continue.
+
+    ``init_checkpoint`` necessarily changes from the original parent to the checkpoint
+    being resumed, so it is normalized out. Everything else in the typed science
+    config remains bound, augmented with optimizer-step topology fields not yet in
+    TrainConfig. This intentionally rejects changing max_steps, warmup/decay, loss
+    recipe, corpus, batch geometry, or world size while reusing moments.
+    """
+    normalized = dataclasses.replace(
+        train_config,
+        init_checkpoint="",
+        init_checkpoint_sha256="",
+        resume_optimizer=True,
+    )
+    return {
+        "schema_version": "train-bc-resume-recipe-v1",
+        "normalized_train_config_sha256": normalized.full_config_hash(),
+        "grad_accum_steps": int(args.grad_accum_steps),
+        "world_size": int(ddp["world_size"]),
+        "ddp_shard_data": bool(args.ddp_shard_data),
+        "fsdp": bool(args.fsdp),
+    }
+
+
+def _restore_training_progress_state(
+    progress: dict[str, object] | None,
+    *,
+    epochs: int,
+    rng,
+    symmetry_rng,
+    ddp: dict[str, int | bool],
+) -> tuple[int, int, float, float]:
+    """Restore schedule/dose counters and sampler RNG from validated progress."""
+    if progress is None:
+        return 0, 0, 0.0, 0.0
+    global_step = int(progress["optimizer_step"])
+    completed_epochs = int(progress["completed_epochs"])
+    if completed_epochs > int(epochs):
+        raise SystemExit(
+            f"resumed completed_epochs={completed_epochs} exceeds --epochs={epochs}"
+        )
+    rng.bit_generator.state = progress["rng_state"]
+    saved_symmetry_state = progress.get("symmetry_rng_state")
+    if symmetry_rng is not None:
+        if not isinstance(saved_symmetry_state, dict):
+            raise SystemExit(
+                "resumed symmetry-augmentation recipe lacks symmetry RNG state"
+            )
+        symmetry_rng.bit_generator.state = saved_symmetry_state
+    elif saved_symmetry_state is not None:
+        raise SystemExit(
+            "training progress has symmetry RNG state but current recipe disables it"
+        )
+    rank_rng_states = progress.get("rank_torch_rng_states")
+    if not isinstance(rank_rng_states, list) or len(rank_rng_states) != int(
+        ddp["world_size"]
+    ):
+        raise SystemExit("resumed checkpoint lacks matching per-rank torch RNG state")
+    rank_rng = rank_rng_states[int(ddp["rank"])]
+    import torch
+
+    torch.set_rng_state(torch.tensor(rank_rng["cpu"], dtype=torch.uint8))
+    if rank_rng.get("cuda") is not None:
+        if not torch.cuda.is_available():
+            raise SystemExit("resumed checkpoint requires CUDA RNG state on a CPU run")
+        torch.cuda.set_rng_state(
+            torch.tensor(rank_rng["cuda"], dtype=torch.uint8),
+            device=int(ddp["local_rank"]),
+        )
+    return (
+        global_step,
+        completed_epochs,
+        float(progress["scalar_training_weight_sum"]),
+        float(progress["categorical_training_weight_sum"]),
+    )
+
+
+def _save_optimizer_sidecar(checkpoint_path: str, policy, optimizer, ddp: dict):
     """CAT-128 patch #8 wrapper: persist optimizer (Adam) state as
     ``<checkpoint_path>.optimizer.pt`` via the shared FSDP-safe util. MUST be called on
     every rank (the FSDP gather is collective); the util rank-guards the write and is
     fail-soft (a save error logs and does not crash the run)."""
     from catan_zero.rl.optim_state import save_optimizer_state
 
-    save_optimizer_state(checkpoint_path, policy.model, optimizer, ddp)
+    return save_optimizer_state(checkpoint_path, policy.model, optimizer, ddp)
+
+
+def _save_training_progress_sidecar(
+    checkpoint_path: str,
+    *,
+    optimizer_saved,
+    optimizer_step: int,
+    completed_epochs: int,
+    recipe_identity: dict[str, object],
+    rng,
+    symmetry_rng,
+    scalar_training_weight_sum: float,
+    categorical_training_weight_sum: float,
+    ddp: dict,
+) -> None:
+    """Write the checkpoint-set commit marker on rank 0 after optimizer save."""
+    from catan_zero.rl.optim_state import (
+        TrainingProgressError,
+        save_training_progress,
+    )
+
+    import torch
+
+    local_rng = {
+        "rank": int(ddp["rank"]),
+        "cpu": torch.get_rng_state().tolist(),
+        "cuda": (
+            torch.cuda.get_rng_state(int(ddp["local_rank"])).tolist()
+            if torch.cuda.is_available()
+            else None
+        ),
+    }
+    if bool(ddp["enabled"]):
+        import torch.distributed as dist
+
+        rank_rng_states: list[dict[str, object] | None] = [
+            None for _ in range(int(ddp["world_size"]))
+        ]
+        dist.all_gather_object(rank_rng_states, local_rng)
+        gathered_rng_states = [row for row in rank_rng_states if row is not None]
+    else:
+        gathered_rng_states = [local_rng]
+
+    # Non-zero DDP/FSDP ranks participate in optimizer/RNG collectives but never write.
+    if int(ddp["rank"]) != 0:
+        return
+    if optimizer_saved is None:
+        raise RuntimeError(
+            "model checkpoint saved but optimizer sidecar failed; refusing to emit "
+            "a falsely resumable training checkpoint"
+        )
+    try:
+        save_training_progress(
+            checkpoint_path,
+            optimizer_step=int(optimizer_step),
+            completed_epochs=int(completed_epochs),
+            recipe_identity=recipe_identity,
+            rng_state=rng.bit_generator.state,
+            symmetry_rng_state=(
+                None if symmetry_rng is None else symmetry_rng.bit_generator.state
+            ),
+            rank_torch_rng_states=gathered_rng_states,
+            scalar_training_weight_sum=float(scalar_training_weight_sum),
+            categorical_training_weight_sum=float(
+                categorical_training_weight_sum
+            ),
+            ddp=ddp,
+        )
+    except TrainingProgressError as error:
+        raise RuntimeError(
+            f"could not commit resumable checkpoint set: {error}"
+        ) from error
 
 
 def _save_policy(
