@@ -9,6 +9,13 @@ competitive overfitting: optimizer updates improve some same-lineage matchups
 while losing external strength. The learner is also not using all trustworthy
 search supervision.
 
+The decisive upstream regression is a **producer/operator identity mismatch**.
+The f7 checkpoint was promoted as an agent at `c_scale=0.10`, but the n128/n256
+wave paired those bytes with `c_scale=0.03`. Matched same-checkpoint probes had
+already measured f7 at 42.19% versus gen3 under `.03` and 56.25% under `.10`.
+The corpus therefore contains valid rows from a degraded search operator; it
+is recovery data, not evidence that n128/n256 or 35M capacity failed.
+
 Forced rows are **not** the missing policy signal. Generation writes
 `policy_weight_multiplier=0` for every single-legal-action row and every
 fast-PCR row. `train_bc` multiplies by that field before its weighted-mean
@@ -34,15 +41,18 @@ at equal **samples seen**, not equal optimizer steps or equal epochs.
 
 These defaults apply to every arm unless the arm names an explicit delta:
 
-- initialization: the current champion/producer bytes, independently reloaded
+- initialization: the f7 producer bytes, independently reloaded
   for every arm; never chain arms through each other's optimizer state;
-- data: globally shuffled n128+n256 rows, with game-disjoint validation;
+- data: globally shuffled n128+n256 rows plus authenticated gen3 replay sampled
+  component → uniform game → uniform row, with game-disjoint validation;
 - loss weighting: loser weight 1.0, per-game policy `sqrt`, per-game value
   `sqrt`, forced policy unchanged (already zero from corpus multiplier), forced
   value weight 1.0 initially;
 - optimizer: Adam, bf16, 100-step warmup, flat LR for a short dose;
-- discriminative LR: trunk `3e-5`, action modules `2x` (effective `6e-5`),
-  value modules `1x` (effective `3e-5`);
+- LR: flat `3e-5` for P1. The f7/gen3 topology has no action-local gather or
+  cross-attention parameters, so an action-module `2x` multiplier is a fake
+  no-op and is rejected. P2 compares this protected low-dose update with a
+  matched flat `6e-5` arm;
 - primary value objective: scalar MSE until the stability recipe is selected;
 - search-value blend: lambda 1.0 until the stability recipe is selected;
 - update dose: first sentinel at 4,194,304 global samples, then 8,388,608 only
@@ -80,9 +90,10 @@ Hold every field fixed and sweep only `policy_kl_anchor_weight`:
 | K10 | 0.10 | strong behavioral anchor |
 
 Run the 4.19M-sample sentinel from the same initialization. Advance at most the
-Pareto winner to 8.39M samples, again from the original initialization. The
-anchor is computed against stored pre-search champion priors on eligible rows;
-it is not a second teacher target.
+Pareto winner to 8.39M samples, again from the original initialization. Current
+rows' stored priors came from f7 and are anchor-ineligible. The anchor is
+computed only against verified gen3 priors on the authenticated gen3 replay
+component; it is not a second teacher target.
 
 ### P2 — replay and discriminative-LR separation
 
@@ -157,6 +168,12 @@ drift exceeds the best non-regressing arm without a strength gain, validation
 and teacher-gap metrics jointly worsen, or non-finite/clipping telemetry trips.
 Do not select by validation loss alone: the current LR curve already showed it
 does not predict external playing strength.
+
+Before external evaluation, calibrate each candidate checkpoint internally at
+candidate `c_scale ∈ {0.03, 0.10}` against gen3 at `.03` on common random
+numbers. The selected checkpoint+operator pair is the candidate identity used
+for the external panel; never silently evaluate every new checkpoint under a
+shared `.03` assumption.
 
 ## Expected compute order
 
