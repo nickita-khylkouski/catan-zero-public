@@ -17,6 +17,10 @@ handoff=${A1_COMBINED_HANDOFF:-$root/evaluation/combined-196k-0f53e97/handoff.re
 out=$root/training/corrective-196k-lr120u-loser1
 overrides='{"loser_sample_weight":1.0,"lr":0.00012}'
 
+# Contract replay resolves relative provenance paths from the campaign runtime.
+# Make service and interactive launches identical regardless of the caller's cwd.
+cd "$repo"
+
 if [[ "$mode" == --go ]]; then
   [[ -s "$handoff" ]] || { echo "REFUSED: canonical combined handoff is not complete" >&2; exit 2; }
   # This is diagnostic eligibility, not promotion. Authenticate the sealed
