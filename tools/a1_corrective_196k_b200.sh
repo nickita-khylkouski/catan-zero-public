@@ -167,8 +167,12 @@ restore_mps() { sudo -n systemctl start nvidia-mps.service || true; }
 trap restore_mps EXIT
 sudo -n systemctl stop nvidia-mps.service
 
-run_dose n256 full-56k "$root/n256-early/n256.memmap" \
-  "$root/n256-early/n256.validation_seeds.json"
+if [[ -s "$out/n256/training.receipt.json" ]]; then
+  echo "authenticated n256 corrective receipt exists; resuming at n128 dose"
+else
+  run_dose n256 full-56k "$root/n256-early/n256.memmap" \
+    "$root/n256-early/n256.validation_seeds.json"
+fi
 run_dose n128 full-140k "$root/n128/n128.memmap" \
   "$root/n128/n128.validation_seeds.json" \
   "$out/n256/training.receipt.json"

@@ -24,3 +24,4 @@ def test_corrective_launcher_is_syntax_clean_and_fail_closed_on_handoff() -> Non
     assert "Do not replay the hundreds-of-GB payload hash" in text
     assert "corrective spec/lock pair is incomplete" in text
     assert 'cd "$repo"' in text
+    assert "authenticated n256 corrective receipt exists; resuming at n128 dose" in text

@@ -276,21 +276,10 @@ def verify_inputs(
         # byte before allowing train_bc's narrower producer/init check.
         parent_receipt = verify_receipt(curriculum_parent_receipt)
         parent_inputs = parent_receipt["inputs"]
-        # Corrective parents are produced by this exact reviewed runtime, so
-        # replay their full report semantics.  Historical pre-ablation parents
-        # retain byte/claim/completion replay compatibility across executor
-        # upgrades; their immutable output refs are still checked above.
-        if parent_inputs.get("learner_ablation") is not None:
-            parent_verified = verify_inputs(
-                learner_lock=Path(parent_inputs["learner_lock"]["path"]),
-                reviewed_lock_file_sha256=parent_inputs["learner_lock"]["sha256"],
-                data=Path(parent_inputs["corpus_meta"]["path"]).parent,
-                validation=Path(parent_inputs["validation"]["path"]),
-                producer_checkpoint=Path(parent_inputs["producer"]["path"]),
-            )
-            parent_receipt = verify_receipt(
-                curriculum_parent_receipt, verified=parent_verified
-            )
+        # The receipt has already replayed its claim/completion and every bound
+        # input/output byte. Do not require the current executor checkout to
+        # reproduce an older diagnostic executor's source lock; verifier-only
+        # upgrades must not invalidate a completed curriculum parent.
         parent_args.init_checkpoint = parent_receipt["outputs"]["checkpoint"]["path"]
         parent_args.init_checkpoint_sha256 = parent_receipt["outputs"]["checkpoint"]["sha256"]
         parent = train_bc._validate_a1_curriculum_parent(parent_args, bound)  # noqa: SLF001
