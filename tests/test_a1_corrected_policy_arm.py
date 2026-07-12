@@ -20,7 +20,8 @@ def _source_receipt(
     *,
     parent_checkpoint_sha256: str = "sha256:parent",
     descriptor_sha256: str = "sha256:descriptor",
-    validation_manifest_sha256: str = "sha256:validation",
+    sentinel: str = "/validation/sentinel.json",
+    sentinel_sha256: str = "sha256:sentinel",
 ) -> Path:
     payload = {
         "schema_version": "existing-sealed-training-receipt-v4",
@@ -30,7 +31,8 @@ def _source_receipt(
         "command_sha256": arm._digest(command),
         "parent_checkpoint_sha256": parent_checkpoint_sha256,
         "descriptor_sha256": descriptor_sha256,
-        "validation_manifest_sha256": validation_manifest_sha256,
+        "sentinel": sentinel,
+        "sentinel_sha256": sentinel_sha256,
     }
     payload["receipt_sha256"] = arm._digest(payload)
     return _write_json(path, payload)
@@ -41,7 +43,7 @@ def _base_command(tmp_path: Path) -> list[str]:
         "/venv/bin/python", "-m", "torch.distributed.run", "--standalone",
         "--nproc_per_node=8", "/old/tools/train_bc.py",
         "--data", "/old/descriptor.json", "--data-format", "memmap",
-        "--validation-game-seed-manifest", "/old/validation.json",
+        "--validation-game-sentinel-manifest", "/old/validation.sentinel.json",
         "--init-checkpoint", "/old/f7.pt", "--checkpoint", "/old/candidate.pt",
         "--report", "/old/report.json", "--batch-size", "512",
         "--grad-accum-steps", "1", "--max-steps", "1024", "--epochs", "1",
@@ -54,15 +56,17 @@ def _base_command(tmp_path: Path) -> list[str]:
         "--value-loss-weight", "0.25", "--value-lr-mult", "0.3",
         "--value-target-lambda", "1.0", "--lr", "3e-5",
         "--lr-warmup-steps", "100", "--lr-schedule", "flat",
-        "--no-resume-optimizer", "--fsdp", "--mask-hidden-info",
+        "--no-resume-optimizer", "--mask-hidden-info",
     ]
 
 
 def _args(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> argparse.Namespace:
     descriptor = (tmp_path / "descriptor.json")
     descriptor.write_text("{}", encoding="utf-8")
-    validation = (tmp_path / "validation.json")
-    validation.write_text("{}", encoding="utf-8")
+    sentinel = _write_json(
+        tmp_path / "validation.sentinel.json",
+        {"schema_version": "train-validation-game-sentinel-v1"},
+    )
     f7 = (tmp_path / "f7.pt")
     f7.write_bytes(b"f7")
     source = _source_receipt(
@@ -70,7 +74,8 @@ def _args(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> argparse.Namespace
         _base_command(tmp_path),
         parent_checkpoint_sha256=arm._file_sha(f7),
         descriptor_sha256=arm._file_sha(descriptor),
-        validation_manifest_sha256=arm._file_sha(validation),
+        sentinel=str(sentinel),
+        sentinel_sha256=arm._file_sha(sentinel),
     )
     lineage = []
     for role in arm.LINEAGE_ROLES:
@@ -134,10 +139,18 @@ def _args(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> argparse.Namespace
         "_rebind_a1_metadata",
         lambda command, repo: {"effective_recipe": {}, "code_binding": {}},
     )
+    monkeypatch.setattr(
+        arm,
+        "_build_corrected_sentinel",
+        lambda **kwargs: (
+            {"selected_game_seed_set_sha256": "sha256:selection"},
+            arm._file_ref(sentinel),
+            arm._file_ref(sentinel),
+        ),
+    )
     return argparse.Namespace(
         source_receipt=source,
         source_descriptor=descriptor,
-        validation_manifest=validation,
         f7_checkpoint=f7,
         expected_f7_sha256=arm._file_sha(f7),
         failed_lineage_artifact=lineage,
@@ -152,7 +165,7 @@ def test_prepares_exact_one_dose_pure_current_policy_arm_without_launch(
     manifest, path = arm.prepare(_args(tmp_path, monkeypatch))
     assert path.is_file()
     assert manifest["launch_authorized"] is False
-    assert manifest["launch_interface_present"] is False
+    assert manifest["diagnostic_execution_authorized"] is True
     assert manifest["recipe"]["base_value_row_dose"] == 4_194_304
     assert manifest["recipe"]["policy_aux_active_row_dose"] == 1_048_576
     assert manifest["recipe"]["policy_distillation_component_ids"] == [
@@ -184,6 +197,8 @@ def test_prepares_exact_one_dose_pure_current_policy_arm_without_launch(
     assert arm._option(command, "--policy-kl-anchor-direction") == "forward"
     assert arm._option(command, "--loser-sample-weight") == "1.0"
     assert arm._option(command, "--max-steps") == "1024"
+    assert command.count("--validation-game-sentinel-manifest") == 1
+    assert "--validation-game-seed-manifest" not in command
     assert command[command.index("torch.distributed.run") + 1] == "--standalone"
     assert [row["role"] for row in manifest["failed_retry_lineage"]["artifacts"]] == list(
         arm.LINEAGE_ROLES
@@ -208,6 +223,61 @@ def test_refuses_source_receipt_command_digest_drift(tmp_path: Path) -> None:
         arm._load_source_receipt(path)
 
 
+def test_rederives_sentinel_for_corrected_descriptor_with_same_game_selection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_sentinel = _write_json(
+        tmp_path / "source.sentinel.json",
+        {
+            "schema_version": "train-validation-game-sentinel-v1",
+            "source_composite_descriptor_file_sha256": "sha256:old-file",
+            "source_composite_descriptor_fingerprint": "sha256:old-fingerprint",
+            "selection_seed": 20260711,
+            "target_row_count": 262144,
+            "selected_game_seed_set_sha256": "sha256:same-games",
+        },
+    )
+    receipt = {
+        "sentinel": str(source_sentinel),
+        "sentinel_sha256": arm._file_sha(source_sentinel),
+    }
+    output = tmp_path / "new.sentinel.json"
+
+    def run(command, **_kwargs):
+        assert "--validation-game-seed-manifest" not in command
+        _write_json(
+            output,
+            {
+                "schema_version": "train-validation-game-sentinel-v1",
+                "source_composite_descriptor_file_sha256": "sha256:new-file",
+                "source_composite_descriptor_fingerprint": "sha256:new-fingerprint",
+                "selection_seed": 20260711,
+                "target_row_count": 262144,
+                "selected_game_seed_set_sha256": "sha256:same-games",
+            },
+        )
+        return None
+
+    monkeypatch.setattr(arm.subprocess, "run", run)
+    corrected, _ref, source_ref = arm._build_corrected_sentinel(
+        source_receipt=receipt,
+        source_descriptor={
+            "descriptor_file_sha256": "sha256:old-file",
+            "descriptor_fingerprint": "sha256:old-fingerprint",
+        },
+        descriptor=tmp_path / "descriptor.json",
+        descriptor_meta={
+            "descriptor_file_sha256": "sha256:new-file",
+            "descriptor_fingerprint": "sha256:new-fingerprint",
+        },
+        output_path=output,
+        python="python",
+        repo=tmp_path,
+    )
+    assert corrected["selected_game_seed_set_sha256"] == "sha256:same-games"
+    assert source_ref["sha256"] == receipt["sentinel_sha256"]
+
+
 def test_descriptor_builder_refuses_noncanonical_source_components(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -225,15 +295,15 @@ def test_descriptor_builder_refuses_noncanonical_source_components(
         arm._build_corrected_descriptor(path, tmp_path / "out.json")
 
 
-def test_command_requires_fsdp_and_hidden_information_masking(tmp_path: Path) -> None:
+def test_command_requires_hidden_information_masking(tmp_path: Path) -> None:
     command = _base_command(tmp_path)
-    command.remove("--fsdp")
+    command.remove("--mask-hidden-info")
     with pytest.raises(arm.ArmError, match="required safety flag"):
         arm._derive_command(
             command,
             repo=tmp_path,
             descriptor=tmp_path / "d",
-            validation=tmp_path / "v",
+            sentinel=tmp_path / "v",
             f7=tmp_path / "f",
             output_root=tmp_path / "out",
         )

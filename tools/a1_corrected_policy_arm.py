@@ -42,6 +42,7 @@ LINEAGE_DIGEST_FIELDS = {
 }
 SOURCE_FILES = (
     "tools/a1_corrected_policy_arm.py",
+    "tools/a1_corrected_policy_arm_execute.py",
     "tools/train_bc.py",
     "tools/mixed_memmap_corpus.py",
     "src/catan_zero/rl/entity_token_policy.py",
@@ -209,6 +210,54 @@ def _build_corrected_descriptor(
     return verified, ref, source_ref
 
 
+def _build_corrected_sentinel(
+    *, source_receipt: dict[str, Any], source_descriptor: dict[str, Any],
+    descriptor: Path, descriptor_meta: dict[str, Any], output_path: Path,
+    python: str, repo: Path,
+) -> tuple[dict[str, Any], dict[str, str], dict[str, str]]:
+    raw_source = source_receipt.get("sentinel")
+    expected_source_sha = source_receipt.get("sentinel_sha256")
+    if not isinstance(raw_source, str) or not isinstance(expected_source_sha, str):
+        raise ArmError("source receipt does not bind a validation sentinel")
+    source_payload, source_ref = _load_json(Path(raw_source))
+    if source_ref["sha256"] != expected_source_sha:
+        raise ArmError("source receipt validation sentinel bytes drifted")
+    if (
+        source_payload.get("schema_version") != "train-validation-game-sentinel-v1"
+        or source_payload.get("source_composite_descriptor_file_sha256")
+        != source_descriptor["descriptor_file_sha256"]
+        or source_payload.get("source_composite_descriptor_fingerprint")
+        != source_descriptor["descriptor_fingerprint"]
+    ):
+        raise ArmError("source validation sentinel is not bound to source descriptor")
+    if not output_path.exists():
+        command = [
+            python, str(repo / "tools/derive_validation_game_sentinel.py"),
+            "--composite", str(descriptor), "--out", str(output_path),
+            "--target-rows", str(source_payload["target_row_count"]),
+            "--selection-seed", str(source_payload["selection_seed"]),
+            "--validation-fraction", "0.05", "--validation-seed", "17",
+        ]
+        try:
+            subprocess.run(command, cwd=repo, check=True)
+        except (OSError, subprocess.CalledProcessError) as error:
+            raise ArmError(f"cannot derive corrected validation sentinel: {error}") from error
+    corrected, corrected_ref = _load_json(output_path)
+    if (
+        corrected.get("schema_version") != "train-validation-game-sentinel-v1"
+        or corrected.get("source_composite_descriptor_file_sha256")
+        != descriptor_meta["descriptor_file_sha256"]
+        or corrected.get("source_composite_descriptor_fingerprint")
+        != descriptor_meta["descriptor_fingerprint"]
+        or corrected.get("selection_seed") != source_payload.get("selection_seed")
+        or corrected.get("target_row_count") != source_payload.get("target_row_count")
+        or corrected.get("selected_game_seed_set_sha256")
+        != source_payload.get("selected_game_seed_set_sha256")
+    ):
+        raise ArmError("corrected validation sentinel identity differs from source selection")
+    return corrected, corrected_ref, source_ref
+
+
 def _lineage(entries: Sequence[str]) -> dict[str, Any]:
     parsed: dict[str, dict[str, Any]] = {}
     for entry in entries:
@@ -264,7 +313,14 @@ def _rebind_a1_metadata(command: list[str], repo: Path) -> dict[str, Any]:
         "--a1-ablation-code-tree-sha256",
         "--a1-reviewed-lock-file-sha256",
     )
-    if any(flag not in command for flag in required):
+    present = [flag in command for flag in required]
+    if not any(present):
+        return {
+            "mode": "plain-authenticated-composite-diagnostic",
+            "effective_recipe": None,
+            "code_binding": _source_binding(repo),
+        }
+    if not all(present):
         raise ArmError("source command lacks sealed A1 effective-recipe/code metadata")
     try:
         effective = json.loads(_option(command, "--a1-effective-learner-recipe-json"))
@@ -336,7 +392,7 @@ def _rebind_a1_metadata(command: list[str], repo: Path) -> dict[str, Any]:
 
 
 def _derive_command(
-    source: Sequence[str], *, repo: Path, descriptor: Path, validation: Path,
+    source: Sequence[str], *, repo: Path, descriptor: Path, sentinel: Path,
     f7: Path, output_root: Path,
 ) -> tuple[list[str], dict[str, dict[str, str]]]:
     command = list(source)
@@ -350,12 +406,12 @@ def _derive_command(
     if len(trainer_positions) != 1:
         raise ArmError("source command must name exactly one train_bc.py")
     command[trainer_positions[0]] = str(repo / "tools/train_bc.py")
-    required_flags = ("--no-resume-optimizer", "--fsdp", "--mask-hidden-info")
+    required_flags = ("--no-resume-optimizer", "--mask-hidden-info")
     if any(flag not in command for flag in required_flags):
         raise ArmError(f"source command is missing a required safety flag: {required_flags}")
     updates = {
         "--data": str(descriptor),
-        "--validation-game-seed-manifest": str(validation),
+        "--validation-game-sentinel-manifest": str(sentinel),
         "--init-checkpoint": str(f7),
         "--checkpoint": str(output_root / "candidate.pt"),
         "--report": str(output_root / "train.report.json"),
@@ -385,6 +441,8 @@ def _derive_command(
     before = {flag: _option(command, flag) if flag in command else "<absent>" for flag in updates}
     for flag, value in updates.items():
         _set_option(command, flag, value)
+    if "--validation-game-seed-manifest" in command:
+        raise ArmError("source command mixes seed-manifest and sentinel validation controls")
     changes = {
         flag: {"source": before[flag], "corrected": value}
         for flag, value in updates.items()
@@ -402,26 +460,34 @@ def prepare(args: argparse.Namespace) -> tuple[dict[str, Any], Path]:
     descriptor_meta, descriptor_ref, source_descriptor_ref = _build_corrected_descriptor(
         source_descriptor, descriptor
     )
-    validation_ref = _file_ref(args.validation_manifest)
     f7_ref = _file_ref(args.f7_checkpoint)
     if f7_ref["sha256"] != args.expected_f7_sha256:
         raise ArmError("initialization checkpoint is not the explicitly expected f7 bytes")
     source_identities = {
         "parent_checkpoint_sha256": f7_ref["sha256"],
         "descriptor_sha256": source_descriptor_ref["sha256"],
-        "validation_manifest_sha256": validation_ref["sha256"],
     }
     for field, expected in source_identities.items():
         if source.get(field) != expected:
             raise ArmError(f"source receipt does not reuse exact {field} identity")
     lineage = _lineage(args.failed_lineage_artifact)
     source_binding = _source_binding(repo)
+    source_descriptor_meta = _preflight_descriptor(source_descriptor)[0]
+    sentinel_payload, sentinel_ref, source_sentinel_ref = _build_corrected_sentinel(
+        source_receipt=source,
+        source_descriptor=source_descriptor_meta,
+        descriptor=descriptor,
+        descriptor_meta=descriptor_meta,
+        output_path=output_root / "validation.sentinel.json",
+        python=str(source["command"][0]),
+        repo=repo,
+    )
     for name in ("candidate.pt", "candidate.pt.optimizer.pt", "train.report.json"):
         if (output_root / name).exists():
             raise ArmError(f"refusing existing corrected-arm output: {output_root / name}")
     command, changes = _derive_command(
         source["command"], repo=repo, descriptor=descriptor,
-        validation=Path(validation_ref["path"]), f7=Path(f7_ref["path"]),
+        sentinel=Path(sentinel_ref["path"]), f7=Path(f7_ref["path"]),
         output_root=output_root,
     )
     a1_metadata = _rebind_a1_metadata(command, repo)
@@ -445,13 +511,18 @@ def prepare(args: argparse.Namespace) -> tuple[dict[str, Any], Path]:
         "diagnostic_only": True,
         "promotion_eligible": False,
         "launch_authorized": False,
-        "launch_interface_present": False,
+        "diagnostic_execution_authorized": True,
+        "launch_interface_present": "tools/a1_corrected_policy_arm_execute.py --go",
         "source_receipt": source_ref,
         "failed_retry_lineage": lineage,
         "source_descriptor": source_descriptor_ref,
         "descriptor": descriptor_ref,
         "descriptor_fingerprint": descriptor_meta["descriptor_fingerprint"],
-        "validation_manifest": validation_ref,
+        "source_validation_sentinel": source_sentinel_ref,
+        "validation_sentinel": sentinel_ref,
+        "validation_sentinel_selection_sha256": sentinel_payload[
+            "selected_game_seed_set_sha256"
+        ],
         "initialization": f7_ref,
         "source_binding": source_binding,
         "a1_runtime_metadata": a1_metadata,
@@ -488,7 +559,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source-receipt", required=True, type=Path)
     parser.add_argument("--source-descriptor", required=True, type=Path)
-    parser.add_argument("--validation-manifest", required=True, type=Path)
     parser.add_argument("--f7-checkpoint", required=True, type=Path)
     parser.add_argument("--expected-f7-sha256", required=True)
     parser.add_argument(
