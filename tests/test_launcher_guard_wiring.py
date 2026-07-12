@@ -211,6 +211,8 @@ GOLDEN_OPTION_STRINGS = {
         ("--no-symmetry-augment", "--symmetry-augment"),
         ("--no-symmetry-augment-events", "--symmetry-augment-events"),
         ("--optimizer",),
+        ("--per-game-policy-weight",),
+        ("--per-game-policy-weight-mode",),
         ("--per-game-value-weight",),
         ("--per-game-value-weight-mode",),
         ("--phase-weights",),
