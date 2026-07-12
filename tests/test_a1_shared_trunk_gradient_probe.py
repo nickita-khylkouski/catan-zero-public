@@ -57,6 +57,11 @@ def test_single_gpu_command_removes_only_torchrun_prefix() -> None:
     ]
 
 
+def test_optional_option_distinguishes_omitted_default() -> None:
+    command = ["--seed", "1"]
+    assert probe._optional_option(command, "--progress-every-batches") is None  # noqa: SLF001
+
+
 def test_aggregate_retains_per_block_conflict_and_actual_update_norms() -> None:
     result = probe._aggregate([_event(1), _event(2)])  # noqa: SLF001
     assert result["trunk_gradient_cosine"]["mean"] == pytest.approx(-0.25)

@@ -66,6 +66,15 @@ def _option(command: Sequence[str], flag: str) -> str:
     return str(command[indices[0] + 1])
 
 
+def _optional_option(command: Sequence[str], flag: str) -> str | None:
+    indices = [index for index, item in enumerate(command) if item == flag]
+    if not indices:
+        return None
+    if len(indices) != 1 or indices[0] + 1 >= len(command):
+        raise ProbeError(f"source command has malformed {flag}")
+    return str(command[indices[0] + 1])
+
+
 def _set_option(command: list[str], flag: str, value: str) -> None:
     indices = [index for index, item in enumerate(command) if item == flag]
     if len(indices) > 1:
@@ -188,7 +197,10 @@ def build_plan(
         + 1 :
     ]
     changed_flags = {
-        flag: {"source": _option(source_args, flag), "probe": _option(probe_args, flag)}
+        flag: {
+            "source": _optional_option(source_args, flag),
+            "probe": _option(probe_args, flag),
+        }
         for flag in (
             "--max-steps",
             "--train-diagnostics-every-batches",
