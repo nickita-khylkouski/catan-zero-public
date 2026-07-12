@@ -35,6 +35,7 @@ start data on separate metrics.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import random
 from dataclasses import dataclass
@@ -256,6 +257,7 @@ def featurize_state(
         policy_action_ids=mapped,
         snapshot=snapshot,
         action_by_id=action_by_id,
+        public_observation=True,
     )
     features = {key: value[0] for key, value in entity.items()}
     context = rust_action_context_batch(
@@ -267,6 +269,7 @@ def featurize_state(
         policy_action_ids=mapped,
         snapshot=snapshot,
         action_by_id=action_by_id,
+        public_observation=True,
     )[0]
     return {
         "features": features,
@@ -291,6 +294,16 @@ _ROUNDTRIP_ENTITY_KEYS = (
     "edge_mask",
     "player_mask",
     "event_mask",
+)
+
+# These tensors are indexed by the row's legal-action ordering.  Shards pad
+# them to the widest row in the shard, whereas a reconstructed state emits
+# only its live legal actions, so round-trip comparison trims the stored side
+# to the authenticated legal-id width first.
+_ROUNDTRIP_ACTION_KEYS = (
+    "legal_action_tokens",
+    "legal_action_mask",
+    "legal_action_target_ids",
 )
 
 
@@ -330,8 +343,11 @@ def round_trip_row(
     stored_ids = np.asarray(stored_legal_ids).reshape(-1)
     stored_ids = stored_ids[stored_ids >= 0]
     recon_ids = np.asarray(feat["legal_policy_ids"], dtype=stored_ids.dtype)
+    # Ordering is part of the policy-target contract.  Sorting here would let
+    # an action-token/target permutation pass while assigning probabilities to
+    # the wrong actions.
     legal_ids_match = stored_ids.shape == recon_ids.shape and bool(
-        np.array_equal(np.sort(stored_ids), np.sort(recon_ids))
+        np.array_equal(stored_ids, recon_ids)
     )
 
     worst_key = ""
@@ -349,6 +365,37 @@ def round_trip_row(
         if diff > max_abs_diff:
             max_abs_diff = diff
             worst_key = key
+    for key in _ROUNDTRIP_ACTION_KEYS:
+        if key not in stored_features or key not in feat["features"]:
+            continue
+        a = np.asarray(stored_features[key])[: stored_ids.size]
+        b = np.asarray(feat["features"][key])
+        if a.shape != b.shape:
+            worst_key = key
+            max_abs_diff = float("inf")
+            break
+        if np.issubdtype(a.dtype, np.floating) or np.issubdtype(b.dtype, np.floating):
+            diff = float(
+                np.max(np.abs(a.astype(np.float32) - b.astype(np.float32)))
+            ) if a.size else 0.0
+        else:
+            diff = 0.0 if np.array_equal(a, b) else float("inf")
+        if diff > max_abs_diff:
+            max_abs_diff = diff
+            worst_key = key
+
+    stored_context = stored_features.get("legal_action_context")
+    if stored_context is not None:
+        a = np.asarray(stored_context)[: stored_ids.size].astype(np.float32)
+        b = np.asarray(feat["context"]).astype(np.float32)
+        if a.shape != b.shape:
+            worst_key = "legal_action_context"
+            max_abs_diff = float("inf")
+        else:
+            diff = float(np.max(np.abs(a - b))) if a.size else 0.0
+            if diff > max_abs_diff:
+                max_abs_diff = diff
+                worst_key = "legal_action_context"
     ok = legal_ids_match and math_isfinite(max_abs_diff) and max_abs_diff <= fp16_atol
     return RoundTripResult(
         game_seed=seq.game_seed,
@@ -372,6 +419,7 @@ def round_trip_shard_rows(
     colors: tuple[str, ...] = DEFAULT_COLORS,
     fp16_atol: float = 1e-2,
     seed: int = 0,
+    row_indices: list[int] | tuple[int, ...] | np.ndarray | None = None,
 ) -> dict[str, Any]:
     """Round-trip a sample of rows from one shard, self-locating each game's scope.
 
@@ -385,8 +433,19 @@ def round_trip_shard_rows(
     scope = shard_path.parent
     shard = load_shard(shard_path)
     n = int(np.asarray(shard["action_taken"]).shape[0])
-    rng = np.random.default_rng(seed)
-    idx = rng.permutation(n)[: min(max_rows, n)]
+    if row_indices is None:
+        rng = np.random.default_rng(seed)
+        idx = rng.permutation(n)[: min(max_rows, n)]
+        selection = {"kind": "seeded_sample", "seed": int(seed)}
+    else:
+        idx = np.asarray(row_indices, dtype=np.int64).reshape(-1)
+        if idx.size == 0:
+            raise ValueError("row_indices must not be empty")
+        if np.any(idx < 0) or np.any(idx >= n):
+            raise ValueError(f"row_indices out of range for {n}-row shard")
+        if np.unique(idx).size != idx.size:
+            raise ValueError("row_indices must be unique")
+        selection = {"kind": "explicit_rows", "row_indices": idx.tolist()}
 
     flags = [correct_rust_chance_spectra] if correct_rust_chance_spectra is not None else [True, False]
     best: dict[str, Any] | None = None
@@ -406,8 +465,14 @@ def round_trip_shard_rows(
                 )
             seq = seq_cache[gseed]
             stored_features = {
-                key: shard[key][i] for key in _ROUNDTRIP_ENTITY_KEYS if key in shard
+                key: shard[key][i]
+                for key in (*_ROUNDTRIP_ENTITY_KEYS, *_ROUNDTRIP_ACTION_KEYS)
+                if key in shard
             }
+            if "legal_action_context" in shard:
+                stored_features["legal_action_context"] = shard[
+                    "legal_action_context"
+                ][i]
             try:
                 res = round_trip_row(
                     seq,
@@ -432,6 +497,8 @@ def round_trip_shard_rows(
         passed = sum(1 for r in results if r.ok)
         summary = {
             "shard": str(shard_path),
+            "shard_sha256": _file_sha256(shard_path),
+            "selection": selection,
             "correct_rust_chance_spectra": bool(flag),
             "rows_checked": len(results),
             "rows_passed": passed,
@@ -455,6 +522,41 @@ def round_trip_shard_rows(
         if summary["pass_rate"] == 1.0:
             break
     return best or {}
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for block in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(block)
+    return "sha256:" + digest.hexdigest()
+
+
+def _locate_round_trip_row(
+    scope: Path, *, game_seed: int, decision_index: int
+) -> tuple[Path, int]:
+    """Locate exactly one archived row, refusing absent or duplicate identity."""
+
+    from regret_common import discover_shards, load_shard
+
+    matches: list[tuple[Path, int]] = []
+    for shard_path in discover_shards([Path(scope)]):
+        shard = load_shard(shard_path)
+        if "game_seed" not in shard or "decision_index" not in shard:
+            continue
+        seeds = np.asarray(shard["game_seed"]).reshape(-1)
+        decisions = np.asarray(shard["decision_index"]).reshape(-1)
+        rows = np.flatnonzero(
+            (seeds == int(game_seed)) & (decisions == int(decision_index))
+        )
+        matches.extend((Path(shard_path), int(row)) for row in rows)
+    if len(matches) != 1:
+        raise ValueError(
+            "round-trip row identity must resolve exactly once: "
+            f"game_seed={game_seed} decision_index={decision_index} "
+            f"matches={len(matches)}"
+        )
+    return matches[0]
 
 
 def main() -> None:
@@ -488,20 +590,34 @@ def main() -> None:
     )
     snapshot = json.loads(game.json_snapshot())
     legal = list(game.playable_action_indices(list(colors), None))
-    print(
-        json.dumps(
-            {
-                "game_seed": args.game_seed,
-                "decision_index": args.decision_index,
-                "total_decisions": len(seq),
-                "acting_color": str(game.current_color()),
-                "phase": str(snapshot.get("current_prompt", "")),
-                "winning_color": str(game.winning_color()),
-                "n_legal": len(legal),
-            },
-            indent=2,
+    output = {
+        "game_seed": args.game_seed,
+        "decision_index": args.decision_index,
+        "total_decisions": len(seq),
+        "acting_color": str(game.current_color()),
+        "phase": str(snapshot.get("current_prompt", "")),
+        "winning_color": str(game.winning_color()),
+        "n_legal": len(legal),
+    }
+    if args.round_trip:
+        shard_path, row_index = _locate_round_trip_row(
+            Path(args.scope),
+            game_seed=args.game_seed,
+            decision_index=args.decision_index,
         )
-    )
+        round_trip = round_trip_shard_rows(
+            shard_path,
+            correct_rust_chance_spectra=args.correct_rust_chance_spectra,
+            colors=colors,
+            fp16_atol=1e-2,
+            row_indices=[row_index],
+        )
+        output["round_trip"] = round_trip
+        print(json.dumps(output, indent=2, sort_keys=True))
+        if round_trip.get("rows_checked") != 1 or round_trip.get("rows_passed") != 1:
+            raise SystemExit("round-trip verification FAILED")
+        return
+    print(json.dumps(output, indent=2, sort_keys=True))
 
 
 if __name__ == "__main__":
