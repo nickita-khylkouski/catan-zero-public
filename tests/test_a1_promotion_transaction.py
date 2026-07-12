@@ -366,6 +366,25 @@ def _fixture(
                     "observed_game_seed_count": 256,
                     "observed_row_count": 4096,
                 },
+                "deployed_readout_diagnostics": {
+                    "diagnostic_only": True,
+                    "changes_operator_default": False,
+                    "value_scale": 1.0,
+                    "configured_value_squash": "tanh",
+                    "configured_effective_transform": "scalar_tanh",
+                    "categorical_bypasses_scalar_tanh": False,
+                    "views": {
+                        "raw_training_readout": {
+                            "global": {"n": 4096, "value_rmse": rmse}
+                        },
+                        "scalar_tanh": {
+                            "global": {"n": 4096, "value_rmse": rmse}
+                        },
+                        "scalar_clip": {
+                            "global": {"n": 4096, "value_rmse": rmse}
+                        },
+                    },
+                },
                 "global": {"n": 4096, "value_rmse": rmse},
             },
         )
@@ -1725,6 +1744,48 @@ def test_calibration_comparison_rejects_different_validation_seed_cohorts(
     )
 
     with pytest.raises(promotion.PromotionError, match="different cohorts"):
+        _execute(fixture, go=False)
+
+
+def test_calibration_gate_scores_the_sealed_deployed_transform(tmp_path: Path) -> None:
+    fixture = _fixture(tmp_path)
+
+    def regress_only_after_tanh(source: dict) -> None:
+        # The historical raw-readout check would accept 0.20 versus the
+        # incumbent's 0.21.  The actual sealed MCTS operator consumes tanh,
+        # whose deliberately regressed RMSE must be the binding value.
+        assert source["global"]["value_rmse"] == pytest.approx(0.20)
+        source["deployed_readout_diagnostics"]["views"]["scalar_tanh"][
+            "global"
+        ]["value_rmse"] = 0.50
+
+    _mutate_evidence_source(
+        fixture,
+        kind="mechanism_calibration",
+        role="candidate_calibration",
+        mutate=regress_only_after_tanh,
+    )
+
+    with pytest.raises(promotion.PromotionError, match="allowed RMSE regression"):
+        _execute(fixture, go=False)
+
+
+def test_calibration_gate_rejects_deployed_transform_drift(tmp_path: Path) -> None:
+    fixture = _fixture(tmp_path)
+
+    def drift_transform(source: dict) -> None:
+        source["deployed_readout_diagnostics"]["configured_effective_transform"] = (
+            "scalar_clip"
+        )
+
+    _mutate_evidence_source(
+        fixture,
+        kind="mechanism_calibration",
+        role="candidate_calibration",
+        mutate=drift_transform,
+    )
+
+    with pytest.raises(promotion.PromotionError, match="deployed value transform"):
         _execute(fixture, go=False)
 
 

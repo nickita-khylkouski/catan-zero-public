@@ -1758,6 +1758,8 @@ def _verify_calibration_source(
     source_path: Path,
     checkpoint: Path,
     expected_readout: str,
+    expected_value_scale: float,
+    expected_value_squash: str,
     where: str,
     contract: dict[str, Any] | None = None,
     allow_legacy_incumbent: bool = False,
@@ -1883,9 +1885,42 @@ def _verify_calibration_source(
     if not isinstance(global_metrics, dict):
         raise PromotionError(f"{where}.global must be an object")
     _positive_int(global_metrics.get("n"), where=f"{where}.global.n")
+    # Training reports score the raw scalar readout, but the playing operator
+    # consumes the sealed post-readout transform (historically tanh).  Using
+    # the top-level raw RMSE here can therefore bless a checkpoint whose
+    # calibration regresses after the exact transform used by MCTS.  The
+    # calibration artifact already computes all transform views; bind and use
+    # the deployed one instead of silently validating a different function.
+    diagnostics = payload.get("deployed_readout_diagnostics")
+    if not isinstance(diagnostics, dict):
+        raise PromotionError(f"{where} has no deployed readout diagnostics")
+    expected_scale = _finite_number(
+        expected_value_scale,
+        where=f"{where}.expected_value_scale",
+        minimum=0.0,
+    )
+    if float(diagnostics.get("value_scale", float("nan"))) != expected_scale:
+        raise PromotionError(f"{where} deployed value scale differs from the sealed operator")
+    expected_transform = (
+        f"scalar_{expected_value_squash}"
+        if expected_readout == "scalar"
+        else "scalar_clip"
+    )
+    if diagnostics.get("configured_value_squash") != expected_value_squash:
+        raise PromotionError(f"{where} deployed value squash differs from the sealed operator")
+    if diagnostics.get("configured_effective_transform") != expected_transform:
+        raise PromotionError(f"{where} deployed value transform differs from the sealed operator")
+    views = diagnostics.get("views")
+    if not isinstance(views, dict) or not isinstance(views.get(expected_transform), dict):
+        raise PromotionError(f"{where} lacks the sealed deployed readout view")
+    deployed_global = views[expected_transform].get("global")
+    if not isinstance(deployed_global, dict):
+        raise PromotionError(f"{where} deployed readout global metrics are missing")
+    if deployed_global.get("n") != global_metrics.get("n"):
+        raise PromotionError(f"{where} raw/deployed calibration cohort size differs")
     rmse = _finite_number(
-        global_metrics.get("value_rmse"),
-        where=f"{where}.global.value_rmse",
+        deployed_global.get("value_rmse"),
+        where=f"{where}.deployed_readout_diagnostics.views.{expected_transform}.global.value_rmse",
         minimum=0.0,
     )
     shard_dir = payload.get("shard_dir")
@@ -3512,6 +3547,8 @@ def _verify_promotion_evidence(
             source_path=source_by_role["candidate_calibration"][0],
             checkpoint=candidate_path,
             expected_readout=expected_readout,
+            expected_value_scale=sealed_semantics["value_scale"],
+            expected_value_squash=sealed_semantics["value_squash"],
             where="candidate calibration",
         )
         champion_rmse, champion_cohort = _verify_calibration_source(
@@ -3519,6 +3556,8 @@ def _verify_promotion_evidence(
             source_path=source_by_role["champion_calibration"][0],
             checkpoint=champion_path,
             expected_readout=expected_readout,
+            expected_value_scale=sealed_semantics["value_scale"],
+            expected_value_squash=sealed_semantics["value_squash"],
             where="champion calibration",
             contract=contract,
             allow_legacy_incumbent=True,
