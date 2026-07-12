@@ -145,11 +145,22 @@ Epoch boundaries are not comparable when corpus or batch size changes.
 
 ### P5 — architecture only after the learner is stable
 
-Run the existing matched transformer-vs-relational-action probe using the
-winning data/loss/dose recipe. Do not attribute an architecture loss to the
-architecture if it was trained with the old unstable value/forgetting recipe.
-Scale beyond 35M only if the corrected 35M learner still underfits active
-teacher targets and its external strength is non-regressing.
+Run `tools/a1_post_p1_diagnosis_plan.py`.  It reuses the selected P1 full-update
+checkpoint as the no-cost control, then adds only two matched 4.19M-sample
+arms: a trunk-frozen head update and that same trunk-frozen update with the
+zero-init `gather,cross:1` action path.  This is smaller and more attributable
+than the older mixed relational probe, whose recipe predates the corrected
+forced-value, per-game, replay/anchor and producer-identity work.
+
+The three-way outcome separates the proximal hypotheses: head-only recovering
+external strength implicates trunk optimization/forgetting; gather/cross
+improving over head-only implicates missing action-local capacity.  Auxiliary
+heads and root-value blending are held off because they alter the objective,
+not just the architecture.  In particular, the large n128/n256 corpus root
+values were produced under the now-rejected `.03` operator identity; do not
+turn them into learner targets.  Scale beyond 35M only if the corrected 35M
+learner still underfits active teacher targets and its external strength is
+non-regressing.
 
 ## Arm adjudication
 

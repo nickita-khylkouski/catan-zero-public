@@ -36,7 +36,11 @@ def _steps(samples: int, global_batch: int) -> int:
 
 def _base_recipe() -> dict[str, Any]:
     return {
-        "action_module_lr_mult": 2.0,
+        # The current f7 transformer has no action-local gather/cross modules.
+        # A non-unit multiplier is therefore a fail-closed fake knob, not a
+        # protected-trunk recipe.  Architecture probes bind their own explicit
+        # multiplier only after those modules exist.
+        "action_module_lr_mult": 1.0,
         "amp": "bf16",
         "forced_row_value_weight": 1.0,
         "grad_accum_steps": 1,
