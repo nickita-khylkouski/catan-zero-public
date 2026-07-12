@@ -14016,6 +14016,7 @@ VALUE_HEAD_MODULE_ATTRS: tuple[str, ...] = (
 ACTION_LOCAL_MODULE_ATTRS: tuple[str, ...] = (
     "target_gather_proj",
     "action_cross_blocks",
+    "edge_policy_mlp",
 )
 
 

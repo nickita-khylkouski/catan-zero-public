@@ -19,6 +19,7 @@ def _make_entity_policy(
     *,
     categorical_bins: int = 0,
     action_local: bool = False,
+    edge_policy_head: bool = False,
     value_attention_pool: bool = False,
 ):
     from catan_zero.rl.entity_token_policy import EntityGraphPolicy
@@ -31,12 +32,13 @@ def _make_entity_policy(
         attention_heads=2,
         seed=0,
     )
-    if categorical_bins or action_local or value_attention_pool:
+    if categorical_bins or action_local or edge_policy_head or value_attention_pool:
         config = replace(
             policy.config,
             value_categorical_bins=int(categorical_bins),
             action_target_gather=bool(action_local),
             action_cross_attention_layers=2 if action_local else 0,
+            edge_policy_head=bool(edge_policy_head),
             value_attention_pool=bool(value_attention_pool),
         )
         policy = EntityGraphPolicy(
@@ -174,12 +176,33 @@ def test_action_local_modules_get_an_independent_lr_group() -> None:
     expected_action_ids = {
         id(p)
         for attr in ACTION_LOCAL_MODULE_ATTRS
-        for p in getattr(policy.model, attr).parameters()
+        for submodule in [getattr(policy.model, attr, None)]
+        if submodule is not None
+        for p in submodule.parameters()
         if p.requires_grad
     }
     assert action_ids == expected_action_ids
     assert action_ids.isdisjoint({id(p) for p in groups[0]["params"]})
     assert action_ids.isdisjoint({id(p) for p in groups[1]["params"]})
+
+
+def test_direct_edge_policy_head_gets_action_module_lr_multiplier() -> None:
+    policy = _make_entity_policy(edge_policy_head=True)
+    groups = _build_optimizer_param_groups(
+        policy.model,
+        base_lr=2e-4,
+        value_lr_mult=1.0,
+        action_module_lr_mult=2.0,
+    )
+
+    by_name = {group["_group_name"]: group for group in groups}
+    assert set(by_name) == {"base", "action_local"}
+    assert by_name["action_local"]["lr"] == pytest.approx(4e-4)
+    edge_ids = {id(parameter) for parameter in policy.model.edge_policy_mlp.parameters()}
+    assert {id(parameter) for parameter in by_name["action_local"]["params"]} == edge_ids
+    assert edge_ids.isdisjoint(
+        {id(parameter) for parameter in by_name["base"]["params"]}
+    )
 
 
 def test_action_module_lr_multiplier_fails_without_action_local_modules() -> None:
