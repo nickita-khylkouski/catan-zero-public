@@ -12,6 +12,7 @@ import numpy as np
 from tools import a1_promotion_transaction as promotion
 from tools import a1_promotion_artifacts as artifacts
 from tools import a1_one_dose_train as one_dose
+from tools import a1_production_l1_rerun as production_l1
 from tools.champion_registry import ChampionRegistry
 from tools.high_regret_suite_contract import REPLAY_CONTRACT, scope_inventory_sha256
 
@@ -2698,3 +2699,167 @@ def test_legacy_snapshot_is_revalidated_at_commit_mutation_boundary(
     assert not fixture["receipt"].with_name(
         fixture["receipt"].name + ".registry.before"
     ).exists()
+
+
+def _production_l1_receipt_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    candidate = tmp_path / "candidate.pt"
+    candidate.write_bytes(b"candidate")
+    f7 = tmp_path / "f7.pt"
+    f7.write_bytes(b"f7")
+    report = tmp_path / "train.report.json"
+    _write_json(
+        report,
+        {
+            "steps_completed": 1024,
+            "world_size": 8,
+            "batch_size": 512,
+            "init_checkpoint_sha256": promotion._sha256(f7),
+        },
+    )
+    optimizer = tmp_path / "candidate.pt.optimizer.pt"
+    optimizer.write_bytes(b"optimizer")
+    progress_path = tmp_path / "candidate.pt.training-progress.json"
+    progress = {
+        "checkpoint": {"path": candidate.name, "sha256": promotion._sha256(candidate)},
+        "optimizer": {"path": optimizer.name, "sha256": promotion._sha256(optimizer)},
+        "optimizer_step": 1024,
+        "completed_epochs": 1,
+        "rank_torch_rng_states": [{} for _ in range(8)],
+    }
+    progress["progress_sha256"] = promotion._digest_value(progress)
+    _write_json(progress_path, progress)
+    manifest_path = tmp_path / "manifest.json"
+    _write_json(manifest_path, {"sealed": True})
+    manifest_ref = {"path": str(manifest_path), "sha256": promotion._sha256(manifest_path)}
+    command_sha = "sha256:" + "1" * 64
+    manifest = {
+        "selected_dose": {
+            "optimizer_steps": 1024, "world_size": 8,
+            "per_rank_batch_size": 512, "global_samples": 4_194_304,
+            "policy_aux_active_batch_size": 0,
+        },
+        "f7_parent": {"path": str(f7), "sha256": promotion._sha256(f7)},
+        "command_sha256": command_sha,
+    }
+    monkeypatch.setattr(
+        production_l1, "verify",
+        lambda path: {"manifest": manifest, "manifest_ref": manifest_ref},
+    )
+    claim_path = tmp_path / "execution.claim.json"
+    claim = {
+        "schema_version": production_l1.CLAIM_SCHEMA,
+        "created_at_unix_ns": 1,
+        "manifest": manifest_ref,
+        "unit": "production-l1",
+    }
+    claim["claim_sha256"] = promotion._digest_value(claim)
+    _write_json(claim_path, claim)
+    submission_path = tmp_path / "submission.receipt.json"
+    submission = {
+        "schema_version": production_l1.SUBMISSION_SCHEMA,
+        "diagnostic_only": False,
+        "production_eligible": True,
+        "manifest": manifest_ref,
+        "claim": {"path": str(claim_path), "sha256": promotion._sha256(claim_path)},
+        "command_sha256": command_sha,
+        "unit": "production-l1",
+    }
+    submission["receipt_sha256"] = promotion._digest_value(submission)
+    _write_json(submission_path, submission)
+    completion_path = tmp_path / "completion.receipt.json"
+    completion = {
+        "schema_version": production_l1.COMPLETION_SCHEMA,
+        "diagnostic_only": False,
+        "production_eligible": True,
+        "created_at_unix_ns": 2,
+        "manifest": manifest_ref,
+        "submission": {
+            "path": str(submission_path), "sha256": promotion._sha256(submission_path),
+        },
+        "checkpoint": {
+            "path": str(candidate), "sha256": promotion._sha256(candidate),
+        },
+        "report": {"path": str(report), "sha256": promotion._sha256(report)},
+        "unit_state": {"ActiveState": "inactive", "Result": "success", "ExecMainStatus": "0"},
+    }
+    completion["receipt_sha256"] = promotion._digest_value(completion)
+    _write_json(completion_path, completion)
+    contract = {
+        "checkpoints": [
+            {"role": "producer", "path": str(f7), "sha256": promotion._sha256(f7)}
+        ]
+    }
+    return {
+        "candidate": candidate, "f7": f7, "report": report,
+        "optimizer": optimizer, "progress": progress_path,
+        "completion": completion_path, "contract": contract,
+    }
+
+
+def test_production_l1_completion_replays_eight_rank_sidecars(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = _production_l1_receipt_fixture(tmp_path, monkeypatch)
+
+    verified = promotion._verify_production_l1_completion_receipt(
+        fixture["completion"], contract=fixture["contract"],
+        candidate_path=fixture["candidate"],
+        candidate_sha256=promotion._sha256(fixture["candidate"]),
+        training_report_path=fixture["report"],
+        training_report_sha256=promotion._sha256(fixture["report"]),
+    )
+
+    assert verified["receipt_sha256"].startswith("sha256:")
+    assert verified["execution_binding_sha256"].startswith("sha256:")
+
+
+def test_production_l1_completion_refuses_optimizer_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = _production_l1_receipt_fixture(tmp_path, monkeypatch)
+    fixture["optimizer"].write_bytes(b"replaced")
+
+    with pytest.raises(promotion.PromotionError, match="optimizer sidecar artifact drift"):
+        promotion._verify_production_l1_completion_receipt(
+            fixture["completion"], contract=fixture["contract"],
+            candidate_path=fixture["candidate"],
+            candidate_sha256=promotion._sha256(fixture["candidate"]),
+            training_report_path=fixture["report"],
+            training_report_sha256=promotion._sha256(fixture["report"]),
+        )
+
+
+def test_production_l1_report_requires_exact_selected_recipe(tmp_path: Path) -> None:
+    candidate = tmp_path / "candidate.pt"
+    candidate.write_bytes(b"candidate")
+    f7 = tmp_path / "f7.pt"
+    f7.write_bytes(b"f7")
+    report = {
+        "arch": "entity_graph", "mask_hidden_info": True, "track": "2p_no_trade",
+        "vps_to_win": 10, "world_size": 8, "batch_size": 512, "epochs": 1,
+        "max_steps": 1024, "steps_completed": 1024, "optimizer": "adam",
+        "resume_optimizer": False, "optimizer_restored": False,
+        "loser_sample_weight": 1.0, "soft_target_weight": 0.9,
+        "policy_aux_active_batch_size": 0, "max_grad_norm": 1.0,
+        "gradient_clipping_enabled": True, "checkpoint": str(candidate),
+        "init_checkpoint": str(f7), "init_checkpoint_sha256": promotion._sha256(f7),
+    }
+    report_path = tmp_path / "report.json"
+    _write_json(report_path, report)
+    contract = {"checkpoints": [{"role": "producer", "sha256": promotion._sha256(f7)}]}
+
+    replay = promotion._verify_training_report(
+        report_path, contract=contract, contract_sha256="sha256:" + "0" * 64,
+        candidate_path=candidate, candidate_sha256=promotion._sha256(candidate),
+        production_l1_completion=True,
+    )
+    assert replay["steps_completed"] == 1024
+
+    report["loser_sample_weight"] = 0.3
+    _write_json(report_path, report)
+    with pytest.raises(promotion.PromotionError, match="loser_sample_weight"):
+        promotion._verify_training_report(
+            report_path, contract=contract, contract_sha256="sha256:" + "0" * 64,
+            candidate_path=candidate, candidate_sha256=promotion._sha256(candidate),
+            production_l1_completion=True,
+        )

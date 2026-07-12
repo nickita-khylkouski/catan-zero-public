@@ -444,8 +444,52 @@ def _verify_training_report(
     contract_sha256: str,
     candidate_path: Path,
     candidate_sha256: str,
+    production_l1_completion: bool = False,
 ) -> dict[str, Any]:
     report = _load_json(path)
+    if production_l1_completion:
+        required = {
+            "arch": "entity_graph",
+            "mask_hidden_info": True,
+            "track": "2p_no_trade",
+            "vps_to_win": 10,
+            "world_size": 8,
+            "batch_size": 512,
+            "epochs": 1,
+            "max_steps": 1024,
+            "steps_completed": 1024,
+            "optimizer": "adam",
+            "resume_optimizer": False,
+            "optimizer_restored": False,
+            "loser_sample_weight": 1.0,
+            "soft_target_weight": 0.9,
+            "policy_aux_active_batch_size": 0,
+            "max_grad_norm": 1.0,
+            "gradient_clipping_enabled": True,
+        }
+        for key, expected in required.items():
+            if report.get(key) != expected:
+                raise PromotionError(
+                    f"production L1 report drift at {key}: "
+                    f"{report.get(key)!r} != {expected!r}"
+                )
+        report_checkpoint = _absolute(report.get("checkpoint"), base=path.parent)
+        if report_checkpoint != candidate_path or _sha256(report_checkpoint) != candidate_sha256:
+            raise PromotionError("production L1 report candidate bytes drifted")
+        producers = [
+            record for record in contract.get("checkpoints", [])
+            if isinstance(record, dict) and record.get("role") == "producer"
+        ]
+        if len(producers) != 1 or report.get("init_checkpoint_sha256") != producers[0].get(
+            "sha256"
+        ):
+            raise PromotionError("production L1 report parent differs from contract producer")
+        init_path = _canonical_existing_file(
+            Path(str(report.get("init_checkpoint"))), where="production L1 parent"
+        )
+        if _sha256(init_path) != report["init_checkpoint_sha256"]:
+            raise PromotionError("production L1 parent bytes drifted")
+        return report
     is_dual = report.get("a1_dual_arm_execution_binding") is not None
     if is_dual:
         recipe = report.get("a1_bound_learner_training_recipe")
@@ -601,6 +645,15 @@ def _verify_one_dose_training_receipt(
 
     path = _canonical_existing_file(path, where="A1 one-dose training receipt")
     raw_schema = _load_json(path).get("schema_version")
+    if raw_schema == "a1-production-l1-rerun-completion-v1":
+        return _verify_production_l1_completion_receipt(
+            path,
+            contract=contract,
+            candidate_path=candidate_path,
+            candidate_sha256=candidate_sha256,
+            training_report_path=training_report_path,
+            training_report_sha256=training_report_sha256,
+        )
     if raw_schema == "a1-dual-arm-training-receipt-v1":
         from tools import a1_dual_arm_train as dual_train
         from tools import a1_dual_learner_contract as learner_contract
@@ -1004,6 +1057,165 @@ def _verify_one_dose_training_receipt(
         "claim": str(claim_path),
         "claim_state_sha256": value["claim_state_sha256"],
         "execution_binding_sha256": outputs["execution_binding_sha256"],
+    }
+
+
+def _verify_production_l1_completion_receipt(
+    path: Path,
+    *,
+    contract: dict[str, Any],
+    candidate_path: Path,
+    candidate_sha256: str,
+    training_report_path: Path,
+    training_report_sha256: str,
+) -> dict[str, Any]:
+    """Replay the sealed 8-rank production-L1 execution and durable sidecars."""
+
+    from tools import a1_production_l1_rerun as production_l1
+
+    value = _load_json(path)
+    expected = {
+        "schema_version", "diagnostic_only", "production_eligible",
+        "created_at_unix_ns", "manifest", "submission", "checkpoint",
+        "report", "unit_state", "receipt_sha256",
+    }
+    value = _require_exact_keys(value, expected, where="production L1 completion receipt")
+    unhashed = dict(value)
+    stated = unhashed.pop("receipt_sha256")
+    if stated != _digest_value(unhashed):
+        raise PromotionError("production L1 completion receipt digest mismatch")
+    if (
+        value["schema_version"] != production_l1.COMPLETION_SCHEMA
+        or value["diagnostic_only"] is not False
+        or value["production_eligible"] is not True
+        or value["unit_state"]
+        != {"ActiveState": "inactive", "Result": "success", "ExecMainStatus": "0"}
+    ):
+        raise PromotionError("production L1 completion is not a clean eligible run")
+    manifest_path, manifest_ref = _validate_file_ref(
+        value["manifest"], base=path.parent, where="production L1 manifest"
+    )
+    try:
+        verified_manifest = production_l1.verify(manifest_path)
+    except (production_l1.L1Error, OSError, KeyError, ValueError) as error:
+        raise PromotionError(f"production L1 manifest replay refused: {error}") from error
+    manifest = verified_manifest["manifest"]
+    selected = manifest.get("selected_dose")
+    if not isinstance(selected, dict) or {
+        "optimizer_steps": selected.get("optimizer_steps"),
+        "world_size": selected.get("world_size"),
+        "per_rank_batch_size": selected.get("per_rank_batch_size"),
+        "global_samples": selected.get("global_samples"),
+        "policy_aux_active_batch_size": selected.get("policy_aux_active_batch_size"),
+    } != {
+        "optimizer_steps": 1024,
+        "world_size": 8,
+        "per_rank_batch_size": 512,
+        "global_samples": 4_194_304,
+        "policy_aux_active_batch_size": 0,
+    }:
+        raise PromotionError("production L1 manifest selected dose drifted")
+    checkpoint_path, checkpoint_ref = _validate_file_ref(
+        value["checkpoint"], base=path.parent, where="production L1 checkpoint"
+    )
+    report_path, report_ref = _validate_file_ref(
+        value["report"], base=path.parent, where="production L1 report"
+    )
+    if (
+        checkpoint_path != candidate_path
+        or checkpoint_ref["sha256"] != candidate_sha256
+        or report_path != training_report_path
+        or report_ref["sha256"] != training_report_sha256
+    ):
+        raise PromotionError("production L1 completion outputs differ from adjudication")
+    submission_path, submission_ref = _validate_file_ref(
+        value["submission"], base=path.parent, where="production L1 submission"
+    )
+    submission = _load_json(submission_path)
+    submission_unhashed = dict(submission)
+    submission_digest = submission_unhashed.pop("receipt_sha256", None)
+    if (
+        submission.get("schema_version") != production_l1.SUBMISSION_SCHEMA
+        or submission.get("diagnostic_only") is not False
+        or submission.get("production_eligible") is not True
+        or submission.get("manifest") != manifest_ref
+        or submission.get("command_sha256") != manifest.get("command_sha256")
+        or submission_digest != _digest_value(submission_unhashed)
+    ):
+        raise PromotionError("production L1 submission receipt drifted")
+    claim_path, claim_ref = _validate_file_ref(
+        submission.get("claim"), base=submission_path.parent,
+        where="production L1 one-shot claim",
+    )
+    claim = _load_json(claim_path)
+    claim_unhashed = dict(claim)
+    claim_digest = claim_unhashed.pop("claim_sha256", None)
+    if (
+        claim.get("schema_version") != production_l1.CLAIM_SCHEMA
+        or claim.get("manifest") != manifest_ref
+        or claim.get("unit") != submission.get("unit")
+        or claim_digest != _digest_value(claim_unhashed)
+    ):
+        raise PromotionError("production L1 one-shot claim drifted")
+
+    report = _load_json(report_path)
+    progress_path = Path(str(checkpoint_path) + ".training-progress.json")
+    optimizer_path = Path(str(checkpoint_path) + ".optimizer.pt")
+    progress = _load_json(
+        _canonical_existing_file(progress_path, where="production L1 progress sidecar")
+    )
+    progress_unhashed = dict(progress)
+    progress_digest = progress_unhashed.pop("progress_sha256", None)
+    if progress_digest != _digest_value(progress_unhashed):
+        raise PromotionError("production L1 progress sidecar semantic digest drift")
+    progress_checkpoint = _validate_file_ref(
+        progress.get("checkpoint"), base=progress_path.parent,
+        where="production L1 progress checkpoint",
+    )[1]
+    progress_optimizer_path, progress_optimizer = _validate_file_ref(
+        progress.get("optimizer"), base=progress_path.parent,
+        where="production L1 optimizer sidecar",
+    )
+    if (
+        progress_checkpoint != checkpoint_ref
+        or progress_optimizer_path != optimizer_path
+        or progress.get("optimizer_step") != 1024
+        or progress.get("completed_epochs") != 1
+        or not isinstance(progress.get("rank_torch_rng_states"), list)
+        or len(progress["rank_torch_rng_states"]) != 8
+        or report.get("steps_completed") != 1024
+        or report.get("world_size") != 8
+        or report.get("batch_size") != 512
+    ):
+        raise PromotionError("production L1 progress/dose topology drifted")
+    producers = [
+        record for record in contract.get("checkpoints", [])
+        if isinstance(record, dict) and record.get("role") == "producer"
+    ]
+    if (
+        len(producers) != 1
+        or manifest.get("f7_parent", {}).get("sha256") != producers[0].get("sha256")
+        or report.get("init_checkpoint_sha256") != producers[0].get("sha256")
+    ):
+        raise PromotionError("production L1 receipt parent differs from contract producer")
+    execution_binding = {
+        "schema_version": "a1-production-l1-promotion-execution-binding-v1",
+        "manifest": manifest_ref,
+        "submission": submission_ref,
+        "claim": claim_ref,
+        "command_sha256": manifest["command_sha256"],
+        "unit": submission["unit"],
+        "world_size": 8,
+        "optimizer": progress_optimizer,
+        "progress": {"path": str(progress_path), "sha256": _sha256(progress_path)},
+    }
+    return {
+        "path": str(path),
+        "sha256": _sha256(path),
+        "receipt_sha256": stated,
+        "claim": str(claim_path),
+        "claim_state_sha256": claim_digest,
+        "execution_binding_sha256": _digest_value(execution_binding),
     }
 
 
@@ -3522,12 +3734,17 @@ def _verify_adjudication(
     training_path, training_ref = _validate_file_ref(
         candidate_raw["training_report"], base=base, where="candidate.training_report"
     )
+    production_l1_completion = (
+        _load_json(training_receipt).get("schema_version")
+        == "a1-production-l1-rerun-completion-v1"
+    )
     training_report_payload = _verify_training_report(
         training_path,
         contract=contract,
         contract_sha256=contract_sha,
         candidate_path=candidate_path,
         candidate_sha256=candidate_ref["sha256"],
+        production_l1_completion=production_l1_completion,
     )
     training_receipt_ref = _verify_one_dose_training_receipt(
         training_receipt,
