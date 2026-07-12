@@ -411,8 +411,12 @@ def _science_args(*, c_scale: float | None = 0.03) -> list[str]:
 
 
 def _role_search_config(
-    *, candidate_c_scale: float, champion_c_scale: float
-) -> dict[str, dict[str, float]]:
+    *,
+    candidate_c_scale: float,
+    champion_c_scale: float,
+    candidate_value_squash: str = "tanh",
+    champion_value_squash: str = "tanh",
+) -> dict[str, dict[str, float | str]]:
     values = {
         "candidate": float(candidate_c_scale),
         "champion": float(champion_c_scale),
@@ -420,10 +424,22 @@ def _role_search_config(
     for role, value in values.items():
         if not math.isfinite(value) or value <= 0.0:
             raise FleetError(f"{role}_c_scale must be finite and positive")
-    return {role: {"c_scale": value} for role, value in values.items()}
+    squashes = {
+        "candidate": str(candidate_value_squash),
+        "champion": str(champion_value_squash),
+    }
+    for role, value in squashes.items():
+        if value not in {"tanh", "clip"}:
+            raise FleetError(f"{role}_value_squash must be tanh or clip")
+    return {
+        role: {"c_scale": values[role], "value_squash": squashes[role]}
+        for role in values
+    }
 
 
-def _plan_role_search_config(plan: dict[str, Any]) -> dict[str, dict[str, float]]:
+def _plan_role_search_config(
+    plan: dict[str, Any],
+) -> dict[str, dict[str, float | str]]:
     raw = plan.get("role_search_config")
     if raw is None:
         return _role_search_config(candidate_c_scale=0.03, champion_c_scale=0.03)
@@ -433,10 +449,15 @@ def _plan_role_search_config(plan: dict[str, Any]) -> dict[str, dict[str, float]
         config = _role_search_config(
             candidate_c_scale=raw["candidate"]["c_scale"],
             champion_c_scale=raw["champion"]["c_scale"],
+            candidate_value_squash=raw["candidate"].get("value_squash", "tanh"),
+            champion_value_squash=raw["champion"].get("value_squash", "tanh"),
         )
     except (KeyError, TypeError, ValueError) as error:
         raise FleetError("evaluation plan role_search_config is malformed") from error
-    if raw != config:
+    historical = {
+        role: {"c_scale": config[role]["c_scale"]} for role in ("candidate", "champion")
+    }
+    if raw != config and raw != historical:
         raise FleetError("evaluation plan role_search_config is not canonical")
     return config
 
@@ -447,7 +468,9 @@ def _science_hash(plan: dict[str, Any]) -> str:
     return _digest(
         {
             "science_config": SCIENCE_CONFIG,
-            "role_search_config": _plan_role_search_config(plan),
+            # Preserve the exact historical c_scale-only identity when loading
+            # an old plan; new plans bind the enriched role evaluator config.
+            "role_search_config": plan["role_search_config"],
         }
     )
 
@@ -463,6 +486,8 @@ def _internal_argv(
     out: str,
     candidate_c_scale: float | None = None,
     champion_c_scale: float | None = None,
+    candidate_value_squash: str | None = None,
+    champion_value_squash: str | None = None,
 ) -> list[str]:
     argv = [
         python,
@@ -502,6 +527,16 @@ def _internal_argv(
             str(float(candidate_c_scale)),
             "--baseline-c-scale",
             str(float(champion_c_scale)),
+        ]
+    if candidate_value_squash is not None or champion_value_squash is not None:
+        if candidate_value_squash is None or champion_value_squash is None:
+            raise FleetError("both internal role value squash values must be explicit")
+        out_index = argv.index("--out")
+        argv[out_index:out_index] = [
+            "--candidate-value-squash",
+            str(candidate_value_squash),
+            "--baseline-value-squash",
+            str(champion_value_squash),
         ]
     return argv
 
@@ -623,6 +658,8 @@ def build_plan(
     tool_hashes: dict[str, str] | None = None,
     candidate_c_scale: float = 0.03,
     champion_c_scale: float = 0.03,
+    candidate_value_squash: str = "tanh",
+    champion_value_squash: str = "tanh",
     comparison_mode: str = "promotion_parent",
     historical_comparison_reason: str | None = None,
 ) -> dict[str, Any]:
@@ -630,8 +667,21 @@ def build_plan(
     champion = champion.expanduser().resolve(strict=True)
     candidate_sha = _sha256(candidate)
     champion_sha = _sha256(champion)
+    role_search_config = _role_search_config(
+        candidate_c_scale=candidate_c_scale,
+        champion_c_scale=champion_c_scale,
+        candidate_value_squash=candidate_value_squash,
+        champion_value_squash=champion_value_squash,
+    )
     if candidate_sha == champion_sha:
-        raise FleetError("candidate and champion checkpoint bytes are identical")
+        if role_search_config["candidate"] == role_search_config["champion"]:
+            raise FleetError(
+                "identical checkpoint bytes require distinct role operators"
+            )
+        if comparison_mode != "historical_comparison":
+            raise FleetError(
+                "same-checkpoint operator tests must be diagnostic historical comparisons"
+            )
     if workers_per_gpu <= 0:
         raise FleetError("workers_per_gpu must be positive")
     if scope not in {"canary", "full"}:
@@ -690,10 +740,6 @@ def build_plan(
         or seed_intervals[1][1] <= seed_intervals[0][0]
     ):
         raise FleetError("internal and external validation seed intervals overlap")
-    role_search_config = _role_search_config(
-        candidate_c_scale=candidate_c_scale,
-        champion_c_scale=champion_c_scale,
-    )
     evaluation_binding = _evaluation_binding(
         candidate_parent=candidate_parent,
         baseline=champion,
@@ -760,6 +806,8 @@ def build_plan(
             out=f"{job_dir}/report.json",
             candidate_c_scale=role_search_config["candidate"]["c_scale"],
             champion_c_scale=role_search_config["champion"]["c_scale"],
+            candidate_value_squash=role_search_config["candidate"]["value_squash"],
+            champion_value_squash=role_search_config["champion"]["value_squash"],
         )
         jobs.append(
             {
@@ -994,6 +1042,9 @@ def _validate_planned_jobs(plan: dict[str, Any], manifest: dict[str, Any]) -> No
     by_phase: dict[str, list[dict[str, Any]]] = {"internal": [], "external": []}
     role_search_config = _plan_role_search_config(plan)
     legacy_shared_search = "role_search_config" not in plan
+    legacy_shared_squash = legacy_shared_search or "value_squash" not in plan[
+        "role_search_config"
+    ]["candidate"]
     for job in jobs:
         if not isinstance(job, dict) or job.get("phase") not in by_phase:
             raise FleetError("evaluation plan contains an invalid job")
@@ -1053,6 +1104,16 @@ def _validate_planned_jobs(plan: dict[str, Any], manifest: dict[str, Any]) -> No
                 None
                 if legacy_shared_search
                 else role_search_config["champion"]["c_scale"]
+            ),
+            candidate_value_squash=(
+                None
+                if legacy_shared_squash
+                else str(role_search_config["candidate"]["value_squash"])
+            ),
+            champion_value_squash=(
+                None
+                if legacy_shared_squash
+                else str(role_search_config["champion"]["value_squash"])
             ),
         )
         if job["pairs"] != pairs or job["base_seed"] != seed or job["argv"] != expected:
@@ -1892,6 +1953,18 @@ def _parser() -> argparse.ArgumentParser:
         required=True,
         help="Registry-bound incumbent agent c_scale (never inferred by role).",
     )
+    plan.add_argument(
+        "--candidate-value-squash",
+        choices=("tanh", "clip"),
+        default="tanh",
+        help="Candidate evaluator value transform (default: tanh).",
+    )
+    plan.add_argument(
+        "--champion-value-squash",
+        choices=("tanh", "clip"),
+        default="tanh",
+        help="Champion evaluator value transform (default: tanh).",
+    )
     plan.add_argument("--out", type=Path, required=True)
     for name in ("launch", "resume"):
         operation = commands.add_parser(name)
@@ -1941,6 +2014,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 ),
                 candidate_c_scale=args.candidate_c_scale,
                 champion_c_scale=args.champion_c_scale,
+                candidate_value_squash=args.candidate_value_squash,
+                champion_value_squash=args.champion_value_squash,
                 comparison_mode=args.comparison_mode,
                 historical_comparison_reason=args.historical_comparison_reason,
             )

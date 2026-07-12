@@ -763,6 +763,28 @@ def _resolve_c_scales(args: Any) -> dict[str, float]:
     }
 
 
+def _resolve_value_squashes(args: Any) -> dict[str, str]:
+    """Resolve per-role value transforms with the shared flag as fallback."""
+
+    def _get(name: str, default: Any = None) -> Any:
+        if isinstance(args, dict):
+            return args.get(name, default)
+        return getattr(args, name, default)
+
+    shared = str(_get("value_squash", "tanh"))
+    candidate = _get("candidate_value_squash")
+    baseline = _get("baseline_value_squash")
+    resolved = {
+        "candidate_value_squash": (
+            str(candidate) if candidate is not None else shared
+        ),
+        "baseline_value_squash": str(baseline) if baseline is not None else shared,
+    }
+    if any(value not in {"tanh", "clip"} for value in resolved.values()):
+        raise ValueError("value squash must be tanh or clip")
+    return resolved
+
+
 def _build_evaluator(
     checkpoint: str,
     worker_args: dict[str, Any],
@@ -770,6 +792,7 @@ def _build_evaluator(
     role: str | None = None,
 ) -> Any:
     candidate_readout, baseline_readout = _resolve_value_readouts(worker_args)
+    squashes = _resolve_value_squashes(worker_args)
     if role is None:
         # Backwards compatibility for direct callers of this helper: when no
         # role is supplied, retain the historical shared-readout behavior.
@@ -782,6 +805,11 @@ def _build_evaluator(
         raise ValueError(
             f"unknown evaluator role {role!r}; expected candidate|baseline"
         )
+    value_squash = (
+        str(worker_args.get("value_squash", "tanh"))
+        if role is None
+        else squashes[f"{role}_value_squash"]
+    )
     return BatchedEntityGraphRustEvaluator.from_checkpoint(
         checkpoint,
         device=worker_args["device"],
@@ -790,7 +818,7 @@ def _build_evaluator(
             prior_temperature=float(worker_args["prior_temperature"]),
             context_fill=float(worker_args.get("evaluator_context_fill", 0.0)),
             cache_size=int(worker_args.get("evaluator_cache_size", 0)),
-            value_squash=str(worker_args.get("value_squash", "tanh")),
+            value_squash=value_squash,
             value_readout=value_readout,
             public_observation=bool(worker_args.get("public_observation", False)),
             rust_featurize=bool(worker_args.get("evaluator_rust_featurize", False)),
@@ -1194,6 +1222,18 @@ def main() -> None:
         help="Evaluator value squash (#60 diagnostic arm).",
     )
     parser.add_argument(
+        "--candidate-value-squash",
+        choices=("tanh", "clip"),
+        default=None,
+        help="Candidate-only value squash (default: inherit --value-squash).",
+    )
+    parser.add_argument(
+        "--baseline-value-squash",
+        choices=("tanh", "clip"),
+        default=None,
+        help="Baseline-only value squash (default: inherit --value-squash).",
+    )
+    parser.add_argument(
         "--c-visit",
         type=float,
         default=50.0,
@@ -1435,6 +1475,7 @@ def main() -> None:
         candidate_readout, baseline_readout = _resolve_value_readouts(resolved_args)
         budgets = _resolve_search_budgets(resolved_args)
         c_scales = _resolve_c_scales(resolved_args)
+        squashes = _resolve_value_squashes(resolved_args)
         return EvalConfig.from_namespace(
             resolved_args,
             mode="cross_net",
@@ -1452,6 +1493,8 @@ def main() -> None:
             baseline_n_full_wide_threshold=budgets["baseline_n_full_wide_threshold"],
             candidate_c_scale=c_scales["candidate_c_scale"],
             baseline_c_scale=c_scales["baseline_c_scale"],
+            candidate_value_squash=squashes["candidate_value_squash"],
+            baseline_value_squash=squashes["baseline_value_squash"],
         )
 
     eval_config = resolve_config(
@@ -1465,6 +1508,7 @@ def main() -> None:
     baseline_checkpoint_sha256 = _checkpoint_sha256(args.baseline)
     candidate_value_readout, baseline_value_readout = _resolve_value_readouts(args)
     c_scales = _resolve_c_scales(args)
+    value_squashes = _resolve_value_squashes(args)
 
     high_regret_suite_path: Path | None = None
     high_regret_planned_engine: dict[str, str] | None = None
@@ -1546,6 +1590,10 @@ def main() -> None:
                 args.determinization_min_simulations
             ),
             "value_squash": str(args.value_squash),
+            "candidate_value_squash": value_squashes[
+                "candidate_value_squash"
+            ],
+            "baseline_value_squash": value_squashes["baseline_value_squash"],
             "c_scale": float(args.c_scale),
             "candidate_c_scale": c_scales["candidate_c_scale"],
             "baseline_c_scale": c_scales["baseline_c_scale"],
@@ -1752,6 +1800,7 @@ def _build_summary(
     resolved_baseline_n_full = int(budgets["baseline_n_full"])
     candidate_value_readout, baseline_value_readout = _resolve_value_readouts(args)
     c_scales = _resolve_c_scales(args)
+    value_squashes = _resolve_value_squashes(args)
 
     return {
         "candidate_checkpoint": args.candidate,
@@ -1765,6 +1814,8 @@ def _build_summary(
         "baseline_n_full": resolved_baseline_n_full,
         "lazy_interior_chance": bool(args.lazy_interior_chance),
         "value_squash": str(args.value_squash),
+        "candidate_value_squash": value_squashes["candidate_value_squash"],
+        "baseline_value_squash": value_squashes["baseline_value_squash"],
         "value_readout": str(args.value_readout),
         "candidate_value_readout": candidate_value_readout,
         "baseline_value_readout": baseline_value_readout,
@@ -1775,15 +1826,21 @@ def _build_summary(
             "candidate": {
                 "c_scale": c_scales["candidate_c_scale"],
                 "c_visit": float(args.c_visit),
+                "value_squash": value_squashes["candidate_value_squash"],
             },
             "baseline": {
                 "c_scale": c_scales["baseline_c_scale"],
                 "c_visit": float(args.c_visit),
+                "value_squash": value_squashes["baseline_value_squash"],
             },
         },
         "comparison_contract": (
             "paired_same_seed_color_swap_role_specific_search_operators"
-            if c_scales["candidate_c_scale"] != c_scales["baseline_c_scale"]
+            if (
+                c_scales["candidate_c_scale"] != c_scales["baseline_c_scale"]
+                or value_squashes["candidate_value_squash"]
+                != value_squashes["baseline_value_squash"]
+            )
             else "paired_same_seed_color_swap_shared_search_operator"
         ),
         "c_visit": float(args.c_visit),

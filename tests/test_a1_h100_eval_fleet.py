@@ -305,8 +305,8 @@ def test_n256_initialized_from_f7_cannot_default_to_gen3_baseline(
         f7_parent
     )
     assert historical["role_search_config"] == {
-        "candidate": {"c_scale": 0.10},
-        "champion": {"c_scale": 0.03},
+        "candidate": {"c_scale": 0.10, "value_squash": "tanh"},
+        "champion": {"c_scale": 0.03, "value_squash": "tanh"},
     }
 
 
@@ -362,6 +362,8 @@ def test_every_job_is_cuda_pinned_and_has_exact_n128_infoset_d6_recipe(
         if job["phase"] == "internal":
             assert argv[argv.index("--candidate-c-scale") + 1] == "0.03"
             assert argv[argv.index("--baseline-c-scale") + 1] == "0.03"
+            assert argv[argv.index("--candidate-value-squash") + 1] == "tanh"
+            assert argv[argv.index("--baseline-value-squash") + 1] == "tanh"
             assert "--c-scale" not in argv
         else:
             assert argv[argv.index("--c-scale") + 1] == "0.03"
@@ -419,8 +421,8 @@ def test_role_specific_search_calibration_is_sealed_into_jobs_and_identity(
     assert calibrated["run_id"] != default["run_id"]
     assert calibrated["science_config_hash"] != default["science_config_hash"]
     assert calibrated["role_search_config"] == {
-        "candidate": {"c_scale": 0.10},
-        "champion": {"c_scale": 0.03},
+        "candidate": {"c_scale": 0.10, "value_squash": "tanh"},
+        "champion": {"c_scale": 0.03, "value_squash": "tanh"},
     }
     internal = next(job for job in calibrated["jobs"] if job["phase"] == "internal")
     assert internal["argv"][internal["argv"].index("--candidate-c-scale") + 1] == "0.1"
@@ -428,6 +430,75 @@ def test_role_specific_search_calibration_is_sealed_into_jobs_and_identity(
     for job in (job for job in calibrated["jobs"] if job["phase"] == "external"):
         expected = "0.1" if job["role"] == "candidate" else "0.03"
         assert job["argv"][job["argv"].index("--c-scale") + 1] == expected
+
+
+def test_role_specific_value_squash_is_sealed_into_plan_and_internal_jobs(
+    tmp_path: Path,
+) -> None:
+    manifest, default = _plan(tmp_path)
+    diagnostic = fleet.build_plan(
+        manifest,
+        candidate=Path(default["candidate"]["source"]),
+        champion=Path(default["champion"]["source"]),
+        **_binding_kwargs(default),
+        internal_pairs=600,
+        external_pairs=500,
+        internal_base_seed=6_190_000_000,
+        external_base_seed=6_191_000_000,
+        workers_per_gpu=8,
+        candidate_c_scale=0.03,
+        champion_c_scale=0.03,
+        candidate_value_squash="clip",
+        champion_value_squash="tanh",
+        repo_commit="a" * 40,
+        tool_hashes=default["tool_hashes"],
+    )
+
+    assert diagnostic["run_id"] != default["run_id"]
+    assert diagnostic["science_config_hash"] != default["science_config_hash"]
+    assert diagnostic["role_search_config"] == {
+        "candidate": {"c_scale": 0.03, "value_squash": "clip"},
+        "champion": {"c_scale": 0.03, "value_squash": "tanh"},
+    }
+    for job in (job for job in diagnostic["jobs"] if job["phase"] == "internal"):
+        argv = job["argv"]
+        assert argv[argv.index("--candidate-value-squash") + 1] == "clip"
+        assert argv[argv.index("--baseline-value-squash") + 1] == "tanh"
+        assert job["command_hash"] == fleet._digest(argv)  # noqa: SLF001
+
+
+def test_same_checkpoint_clip_vs_tanh_plan_is_diagnostic_and_executable(
+    tmp_path: Path,
+) -> None:
+    manifest, default = _plan(tmp_path)
+    checkpoint = Path(default["champion"]["source"])
+    diagnostic = fleet.build_plan(
+        manifest,
+        candidate=checkpoint,
+        champion=checkpoint,
+        candidate_parent=checkpoint,
+        registry=ChampionRegistry.load(
+            Path(default["evaluation_binding"]["registry"]["path"])
+        ),
+        internal_pairs=600,
+        external_pairs=500,
+        internal_base_seed=6_190_000_000,
+        external_base_seed=6_191_000_000,
+        candidate_c_scale=0.03,
+        champion_c_scale=0.03,
+        candidate_value_squash="clip",
+        champion_value_squash="tanh",
+        comparison_mode="historical_comparison",
+        historical_comparison_reason="same-checkpoint value transform diagnostic",
+        repo_commit="a" * 40,
+        tool_hashes=default["tool_hashes"],
+    )
+
+    assert diagnostic["candidate"]["sha256"] == diagnostic["champion"]["sha256"]
+    assert diagnostic["evaluation_binding"]["promotion_eligible"] is False
+    internal = next(job for job in diagnostic["jobs"] if job["phase"] == "internal")
+    assert internal["argv"][internal["argv"].index("--candidate-value-squash") + 1] == "clip"
+    assert internal["argv"][internal["argv"].index("--baseline-value-squash") + 1] == "tanh"
 
 
 @pytest.mark.parametrize("value", [0.0, -0.1, float("nan"), float("inf")])
@@ -575,6 +646,25 @@ def test_plan_hash_and_checkpoint_bytes_are_replayed_on_load(tmp_path: Path) -> 
     Path(plan["candidate"]["source"]).chmod(0o644)
     Path(plan["candidate"]["source"]).write_bytes(b"changed")
     with pytest.raises(fleet.FleetError, match="candidate checkpoint bytes drifted"):
+        fleet.load_plan(path, manifest)
+
+
+def test_load_plan_rejects_rehashed_internal_role_squash_command_drift(
+    tmp_path: Path,
+) -> None:
+    manifest, plan = _plan(tmp_path)
+    drifted = copy.deepcopy(plan)
+    job = next(job for job in drifted["jobs"] if job["phase"] == "internal")
+    index = job["argv"].index("--candidate-value-squash")
+    del job["argv"][index : index + 2]
+    job["command_hash"] = fleet._digest(job["argv"])  # noqa: SLF001
+    drifted["plan_hash"] = fleet._digest(  # noqa: SLF001
+        {key: value for key, value in drifted.items() if key != "plan_hash"}
+    )
+    path = tmp_path / "role-squash-command-drift.json"
+    path.write_text(json.dumps(drifted), encoding="utf-8")
+
+    with pytest.raises(fleet.FleetError, match="internal shard contract drift"):
         fleet.load_plan(path, manifest)
 
 

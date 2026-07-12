@@ -518,6 +518,11 @@ class EvalConfig(PipelineConfig):
     prior_temperature: float = 1.0
     value_scale: float = 1.0
     value_squash: str = "tanh"
+    # Cross-net H2H resolves these from role-specific flags or the shared
+    # value_squash fallback. This makes clip-vs-tanh comparisons part of the
+    # typed evaluation identity instead of an untracked evaluator detail.
+    candidate_value_squash: str | None = None
+    baseline_value_squash: str | None = None
     # ``value_readout`` is the backwards-compatible shared CLI fallback.
     # Cross-net gates record the effective role-specific values as well so a
     # categorical candidate vs scalar incumbent is a distinct, auditable

@@ -2532,12 +2532,23 @@ def _verify_internal_h2h_source(
             "baseline_n_full_wide_threshold": sealed_semantics["n_full_wide_threshold"],
             "candidate_value_readout": sealed_semantics["value_readout"],
             "baseline_value_readout": sealed_semantics["value_readout"],
+            "candidate_value_squash": sealed_semantics["value_squash"],
+            "baseline_value_squash": sealed_semantics["value_squash"],
         }
     )
     for key in ("n_full", "n_fast", "candidate_n_full", "baseline_n_full"):
         expected_fields[key] = int(required_n_full)
     config_where = "pooled effective config" if pooled else "typed config"
     runtime_fields = dict(fields)
+    # Historical cross-net reports had only the shared value_squash field.
+    # Normalize that exact legacy shape, while binding new role-specific fields
+    # so a diagnostic clip-vs-tanh operator cannot be laundered into promotion.
+    runtime_fields.setdefault(
+        "candidate_value_squash", runtime_fields.get("value_squash")
+    )
+    runtime_fields.setdefault(
+        "baseline_value_squash", runtime_fields.get("value_squash")
+    )
     if (
         pooled
         and runtime_fields.get("native_mcts_hot_loop") is True

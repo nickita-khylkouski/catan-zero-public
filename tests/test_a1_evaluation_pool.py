@@ -259,6 +259,29 @@ def test_internal_pool_refuses_config_drift(tmp_path: Path) -> None:
         pool.pool_internal([first, second], candidate=candidate, champion=champion)
 
 
+def test_internal_pool_refuses_role_value_squash_drift_with_valid_shard_hash(
+    tmp_path: Path,
+) -> None:
+    candidate = _checkpoint(tmp_path, "candidate.pt")
+    champion = _checkpoint(tmp_path, "champion.pt")
+    first = tmp_path / "first.json"
+    second = tmp_path / "second.json"
+    _write(first, _internal_report(candidate, champion, 9001))
+    drifted = _internal_report(candidate, champion, 9002)
+    drifted["typed_config"]["fields"]["candidate_value_squash"] = "clip"
+    digest = hashlib.sha256(
+        json.dumps(
+            drifted["typed_config"], sort_keys=True, separators=(",", ":")
+        ).encode()
+    ).hexdigest()
+    drifted["config_hash"] = "sha256:" + digest[:16]
+    drifted["full_config_hash"] = "sha256:" + digest
+    _write(second, drifted)
+
+    with pytest.raises(pool.PoolError, match="science/config drift"):
+        pool.pool_internal([first, second], candidate=candidate, champion=champion)
+
+
 def test_internal_pool_refuses_forged_shard_statistics(tmp_path: Path) -> None:
     candidate = _checkpoint(tmp_path, "candidate.pt")
     champion = _checkpoint(tmp_path, "champion.pt")

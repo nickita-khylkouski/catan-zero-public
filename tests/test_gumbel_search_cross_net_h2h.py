@@ -35,6 +35,7 @@ from gumbel_search_cross_net_h2h import (  # type: ignore  # noqa: E402
     _load_held_out_high_regret_suite,
     _new_search_telemetry,
     _resolve_c_scales,
+    _resolve_value_squashes,
     _resolve_search_budgets,
     play_one_h2h_game,
     _validate_information_set_recipe,
@@ -53,6 +54,8 @@ def test_direct_cli_help_resolves_replay_contract_sibling_import() -> None:
     )
     assert completed.returncode == 0, completed.stderr
     assert "--native-mcts-hot-loop" in completed.stdout
+    assert "--candidate-value-squash" in completed.stdout
+    assert "--baseline-value-squash" in completed.stdout
     assert "--evaluator-rust-featurize" in completed.stdout
     assert "--engine-repo-commit" in completed.stdout
     assert "--native-wheel-path" in completed.stdout
@@ -614,6 +617,46 @@ def test_shared_c_scale_is_backward_compatible_role_fallback():
     }
 
 
+def test_role_specific_value_squashes_override_shared_fallback_independently():
+    assert _resolve_value_squashes(
+        _base_worker_args(
+            value_squash="tanh",
+            candidate_value_squash="clip",
+            baseline_value_squash=None,
+        )
+    ) == {
+        "candidate_value_squash": "clip",
+        "baseline_value_squash": "tanh",
+    }
+
+
+def test_build_evaluator_uses_role_specific_value_squash(monkeypatch):
+    captured = []
+
+    def fake_from_checkpoint(_checkpoint, *, device, config):
+        captured.append((device, config))
+        return object()
+
+    monkeypatch.setattr(
+        h2h.BatchedEntityGraphRustEvaluator,
+        "from_checkpoint",
+        fake_from_checkpoint,
+    )
+    args = {
+        "device": "cpu",
+        "value_scale": 1.0,
+        "prior_temperature": 1.0,
+        "value_squash": "tanh",
+        "candidate_value_squash": "clip",
+        "baseline_value_squash": "tanh",
+    }
+
+    h2h._build_evaluator("same.pt", args, role="candidate")
+    h2h._build_evaluator("same.pt", args, role="baseline")
+
+    assert [config.value_squash for _, config in captured] == ["clip", "tanh"]
+
+
 def test_worker_constructs_each_role_with_its_effective_c_scale(monkeypatch):
     built_configs = []
 
@@ -776,6 +819,20 @@ def test_eval_config_hash_distinguishes_role_specific_c_scales():
     assert shared.config_hash() != tuned.config_hash()
 
 
+def test_eval_config_hash_distinguishes_role_specific_value_squashes():
+    shared = EvalConfig(
+        mode="cross_net",
+        candidate_value_squash="tanh",
+        baseline_value_squash="tanh",
+    )
+    diagnostic = EvalConfig(
+        mode="cross_net",
+        candidate_value_squash="clip",
+        baseline_value_squash="tanh",
+    )
+    assert shared.config_hash() != diagnostic.config_hash()
+
+
 def test_h2h_summary_records_resolved_adaptive_budget_by_role():
     args = SimpleNamespace(
         candidate="same.pt",
@@ -864,8 +921,8 @@ def test_h2h_summary_records_resolved_adaptive_budget_by_role():
     assert summary["candidate_c_scale"] == 0.1
     assert summary["baseline_c_scale"] == 0.03
     assert summary["search_parameters_by_role"] == {
-        "candidate": {"c_scale": 0.1, "c_visit": 50.0},
-        "baseline": {"c_scale": 0.03, "c_visit": 50.0},
+        "candidate": {"c_scale": 0.1, "c_visit": 50.0, "value_squash": "tanh"},
+        "baseline": {"c_scale": 0.03, "c_visit": 50.0, "value_squash": "tanh"},
     }
     assert (
         summary["comparison_contract"]
