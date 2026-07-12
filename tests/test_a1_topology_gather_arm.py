@@ -121,7 +121,14 @@ def _args(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         corpus.mkdir()
     manifest = _source_manifest(tmp_path, source, descriptor, validation)
     monkeypatch.setattr(arm.corrected, "_preflight_descriptor", lambda _path: ({
-        "components": [{"corpus_dir": str(path.resolve())} for path in corpora]
+        "components": [
+            {"component_id": component_id, "corpus_dir": str(path.resolve())}
+            for component_id, path in zip(
+                ("n128_current", "n256_current", "gen3_replay"), corpora
+            )
+        ],
+        "policy_distillation_component_ids": ["n128_current", "n256_current"],
+        "value_training_component_ids": ["n128_current", "n256_current"],
     }, arm.corrected._file_ref(descriptor)))
     monkeypatch.setattr(arm, "_source_binding", lambda repo: {
         "repository_root": str(repo), "git_commit": "abc", "files": {}
@@ -129,7 +136,9 @@ def _args(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     return type("Args", (), {
         "source_manifest": manifest,
         "gather_checkpoint": gather,
-        "architecture_audit": _audit(tmp_path, corpora),
+        # The production audit predates the K3 descriptor and records only the
+        # two current supervised corpora, in a different (valid) order.
+        "architecture_audit": _audit(tmp_path, list(reversed(corpora[:2]))),
         "output_root": tmp_path / "out",
         "repo": tmp_path,
     })()
@@ -148,7 +157,7 @@ def test_prepares_one_axis_gather_k3_without_launch(tmp_path, monkeypatch):
     assert manifest["function_preserving_upgrade"]["new_parameters"] == list(
         arm.EXPECTED_NEW_PARAMETERS
     )
-    assert len(manifest["corpus_topology_target_coverage"]["components"]) == 3
+    assert len(manifest["corpus_topology_target_coverage"]["components"]) == 2
     assert manifest["executor_compatibility"]["compatible_now"] is False
     assert "exact a1-corrected-policy-arm-manifest-v1" in (
         manifest["executor_compatibility"]["reason"]
@@ -204,6 +213,15 @@ def test_coverage_refuses_zero_search_active_topology_rows(tmp_path, monkeypatch
     payload["audits"][1]["legal_action_targets"]["search_active_rows_with_any_target"] = 0
     args.architecture_audit.write_text(json.dumps(payload), encoding="utf-8")
     with pytest.raises(arm.ArmError, match="learnable topology target coverage"):
+        arm.prepare(args)
+
+
+def test_coverage_refuses_anchor_or_duplicate_audit_rows(tmp_path, monkeypatch):
+    args = _args(tmp_path, monkeypatch)
+    payload = json.loads(args.architecture_audit.read_text())
+    payload["audits"].append(dict(payload["audits"][0]))
+    args.architecture_audit.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(arm.ArmError, match="exactly the supervised K3 corpora"):
         arm.prepare(args)
 
 

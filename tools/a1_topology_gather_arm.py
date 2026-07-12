@@ -253,10 +253,30 @@ def _validate_coverage(path: Path, descriptor_path: Path) -> dict[str, Any]:
     if audit.get("schema_version") != "memmap-architecture-target-audit-bundle-v1":
         raise ArmError("architecture target audit schema drift")
     descriptor, _ = corrected._preflight_descriptor(descriptor_path)  # noqa: SLF001
-    expected_dirs = [str(Path(row["corpus_dir"]).resolve()) for row in descriptor["components"]]
+    components = descriptor["components"]
+    supervised_ids = set(descriptor.get("policy_distillation_component_ids", ())) | set(
+        descriptor.get("value_training_component_ids", ())
+    )
+    component_by_id = {row.get("component_id"): row for row in components}
+    if not supervised_ids or not supervised_ids <= set(component_by_id):
+        raise ArmError("K3 descriptor has an invalid supervised component scope")
+    # Topology targets are consumed only by supervised policy/value rows.  The
+    # replay component in K3 is deliberately KL-anchor-only, so requiring it in
+    # the architecture audit both confuses the causal contract and rejects the
+    # real two-corpus audit.  Bind the audited set by resolved corpus identity;
+    # audit ordering is not semantically meaningful.
+    expected_dirs = {
+        str(Path(component_by_id[component_id]["corpus_dir"]).resolve())
+        for component_id in supervised_ids
+    }
     rows = audit.get("audits")
-    if not isinstance(rows, list) or [row.get("corpus_dir") for row in rows] != expected_dirs:
-        raise ArmError("coverage audit does not bind the K3 corpora in exact order")
+    audited_dirs = [row.get("corpus_dir") for row in rows] if isinstance(rows, list) else []
+    if (
+        len(audited_dirs) != len(expected_dirs)
+        or len(set(audited_dirs)) != len(audited_dirs)
+        or set(audited_dirs) != expected_dirs
+    ):
+        raise ArmError("coverage audit does not bind exactly the supervised K3 corpora")
     coverage = []
     for row in rows:
         legal = row.get("legal_action_targets", {})
