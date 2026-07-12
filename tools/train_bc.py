@@ -5585,6 +5585,12 @@ def main(argv: Sequence[str] | None = None) -> None:
         "q_loss_weight": args.q_loss_weight,
         "policy_kl_anchor_weight": args.policy_kl_anchor_weight,
         "policy_kl_anchor_direction": args.policy_kl_anchor_direction,
+        "policy_kl_anchor_normalization": (
+            "conditional_authenticated_multi_action_prior_rows"
+        ),
+        "policy_kl_anchor_weight_semantics": (
+            "coefficient_multiplies_the_conditional_eligible_row_mean"
+        ),
         "value_uncertainty_loss_weight": args.value_uncertainty_loss_weight,
         "aux_subgoal_loss_weight": args.aux_subgoal_loss_weight,
         "moe_balance_loss_weight": args.moe_balance_loss_weight,
@@ -6267,8 +6273,9 @@ def _train_xdim_batch(
         # policy toward the seed's recorded prior_policy. Only computed when enabled,
         # so a 0-weight run is bit-identical to pre-anchor behavior.
         kl_anchor_loss = torch.tensor(0.0, dtype=torch.float32, device=policy.device)
+        kl_anchor_loss_sum, kl_anchor_loss_denominator = _zero_loss_parts(policy.device)
         if float(policy_kl_anchor_weight) != 0.0:
-            _anchor = _policy_kl_anchor_loss(
+            _anchor = _policy_kl_anchor_loss_parts(
                 data,
                 batch,
                 outputs["logits"],
@@ -6276,7 +6283,11 @@ def _train_xdim_batch(
                 direction=policy_kl_anchor_direction,
             )
             if _anchor is not None:
-                kl_anchor_loss = _anchor
+                (
+                    kl_anchor_loss,
+                    kl_anchor_loss_sum,
+                    kl_anchor_loss_denominator,
+                ) = _anchor
         # Value-uncertainty auxiliary head: regress the value head's own squared
         # error (z - v)^2 with a stop-gradient on v (KataGo short-term-error style;
         # Huber loss because the target is already a squared quantity). No-op unless
@@ -6521,6 +6532,11 @@ def _train_xdim_batch(
         "final_vp_loss": float(final_vp_loss.item()),
         "q_loss": float(q_loss.item()),
         "policy_kl_anchor_loss": float(kl_anchor_loss.item()),
+        "policy_kl_anchor_loss_weighted_sum": float(kl_anchor_loss_sum.item()),
+        "policy_kl_anchor_loss_weight_sum": float(
+            kl_anchor_loss_denominator.item()
+        ),
+        "policy_kl_anchor_eligible_rows": int(kl_anchor_loss_denominator.item()),
         "value_uncertainty_loss": float(value_uncertainty_loss.item()),
         "aux_subgoal_loss": float(aux_subgoal_loss.item()),
         "moe_balance_loss": float(moe_balance_loss.item()),
@@ -7337,8 +7353,11 @@ def _eval_xdim_batch(
             kl_anchor_loss = torch.tensor(
                 0.0, dtype=torch.float32, device=policy.device
             )
+            kl_anchor_loss_sum, kl_anchor_loss_denominator = _zero_loss_parts(
+                policy.device
+            )
             if float(policy_kl_anchor_weight) != 0.0:
-                anchor = _policy_kl_anchor_loss(
+                anchor = _policy_kl_anchor_loss_parts(
                     data,
                     batch,
                     outputs["logits"],
@@ -7346,7 +7365,11 @@ def _eval_xdim_batch(
                     direction=policy_kl_anchor_direction,
                 )
                 if anchor is not None:
-                    kl_anchor_loss = anchor
+                    (
+                        kl_anchor_loss,
+                        kl_anchor_loss_sum,
+                        kl_anchor_loss_denominator,
+                    ) = anchor
             value_uncertainty_loss = torch.tensor(
                 0.0, dtype=torch.float32, device=policy.device
             )
@@ -7544,6 +7567,15 @@ def _eval_xdim_batch(
             "final_vp_loss": float(final_vp_loss.item()),
             "q_loss": float(q_loss.item()),
             "policy_kl_anchor_loss": float(kl_anchor_loss.item()),
+            "policy_kl_anchor_loss_weighted_sum": float(
+                kl_anchor_loss_sum.item()
+            ),
+            "policy_kl_anchor_loss_weight_sum": float(
+                kl_anchor_loss_denominator.item()
+            ),
+            "policy_kl_anchor_eligible_rows": int(
+                kl_anchor_loss_denominator.item()
+            ),
             "value_uncertainty_loss": float(value_uncertainty_loss.item()),
             "aux_subgoal_loss": float(aux_subgoal_loss.item()),
             "moe_balance_loss": float(moe_balance_loss.item()),
@@ -10310,6 +10342,27 @@ def _policy_kl_anchor_loss(
     the loss). MUST be called with grad enabled -- i.e. from the training path,
     not the no_grad eval path where the telemetry variant lives.
     """
+    parts = _policy_kl_anchor_loss_parts(
+        data, batch, logits, device, direction=direction
+    )
+    return None if parts is None else parts[0]
+
+
+def _policy_kl_anchor_loss_parts(
+    data: dict,
+    batch: np.ndarray,
+    logits,
+    device,
+    *,
+    direction: str = "forward",
+):
+    """Return conditional anchor mean plus its eligible-row sum/denominator.
+
+    The scalar objective is normalized over authenticated, multi-action rows
+    that carry a prior. Returning the raw parts lets epoch/eval telemetry use
+    that same denominator instead of silently diluting the reported metric by
+    the full batch size.
+    """
     import torch
 
     terms = _prior_kl_telemetry(data, batch, logits, device)
@@ -10343,7 +10396,8 @@ def _policy_kl_anchor_loss(
         values = terms["kl_model_prior"]
     else:
         raise ValueError(f"unknown policy KL anchor direction {direction!r}")
-    return _weighted_mean_loss(values, weights)
+    weighted_sum, denominator = _weighted_loss_parts(values, weights)
+    return _weighted_mean_loss(values, weights), weighted_sum, denominator
 
 
 def _weighted_mean_loss(values, weights, *, mask=None):

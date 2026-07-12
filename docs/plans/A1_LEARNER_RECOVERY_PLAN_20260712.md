@@ -57,9 +57,12 @@ These defaults apply to every arm unless the arm names an explicit delta:
 - data: globally shuffled n128+n256 rows plus authenticated incumbent-era
   mixed replay (approximately 80% f7, 15% gen3 history, 5% gen4 hard-negative)
   sampled component → uniform game → uniform row, with game-disjoint validation;
-- loss weighting: loser weight 1.0, per-game policy `sqrt`, per-game value
-  `sqrt`, forced policy unchanged (already zero from corpus multiplier), forced
-  value weight 1.0 initially;
+- loss weighting: match the successful f7 learner: loser weight 0.3, value-head
+  LR multiplier 0.3, no per-game policy/value loss correction, forced policy
+  unchanged (already zero from corpus multiplier), and forced value weight 1.0
+  initially. The composite sampler already samples component → uniform game →
+  uniform row; another inverse-length loss factor would double-correct game
+  length and over-weight short games;
 - optimizer: Adam, bf16, 100-step warmup, flat LR for a short dose;
 - LR: flat `3e-5` for P1. The f7/gen3 topology has no action-local gather or
   cross-attention parameters, so an action-module `2x` multiplier is a fake
@@ -99,11 +102,11 @@ regression-tested.
 
 Hold every field fixed and sweep only `policy_kl_anchor_weight`:
 
-| Arm | KL weight | Purpose |
-|---|---:|---|
-| K0 | 0.00 | corrected mixed-data control |
-| K3 | 0.03 | light behavioral anchor |
-| K10 | 0.10 | strong behavioral anchor |
+| Arm | Conditional KL weight | Global-mass equivalent | Purpose |
+|---|---:|---:|---|
+| K0 | 0.000 | 0.00 | corrected mixed-data control |
+| K3 | 0.006 | 0.03 | light behavioral anchor |
+| K10 | 0.020 | 0.10 | strong behavioral anchor |
 
 All three arms use a fixed 20% authenticated incumbent-era mixed replay
 component; K0 tests
@@ -114,6 +117,14 @@ rows' stored priors came from the current wave and are anchor-ineligible. The
 anchor is computed only against verified priors on the replay component
 (mostly f7, with gen3/gen4 population coverage); it is not a second teacher
 target.
+
+The trainer normalizes KL over authenticated replay rows that both carry a
+prior and have more than one legal action. Its coefficient therefore multiplies
+`E[KL | eligible replay row]`, not an all-corpus row mean. With fixed replay
+mass 0.20, the configured weights are `0.20 * {0.03, 0.10}`. Training and eval
+reports record this normalization and aggregate the KL numerator over the exact
+eligible-row denominator; batches without eligible rows no longer dilute the
+reported anchor metric.
 
 ### P2 — localize the destructive update
 
@@ -155,8 +166,9 @@ auxiliary, never as part of P1.
 
 Only after P1-P3, compare `forced_row_value_weight=1.0` against 0.25. The policy
 side is already zero. The question is whether forced-state value labels help
-state coverage or merely add correlated terminal labels. Per-game sqrt remains
-on in both arms.
+state coverage or merely add correlated terminal labels. The f7-matched
+component → game → row sampler remains unchanged in both arms; no second
+per-game loss correction is added.
 
 For the winning objective, run independent producer-started sample doses at
 4.19M, 8.39M and 16.78M samples. This is the actual early-stopping curve.

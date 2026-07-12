@@ -46,20 +46,23 @@ def _base_recipe() -> dict[str, Any]:
         "forced_row_value_weight": 1.0,
         "grad_accum_steps": 1,
         "hlgauss_scalar_aux_loss_weight": 0.0,
-        "loser_sample_weight": 1.0,
+        # Match the successful f7 learner. The composite sampler already draws
+        # component -> uniform game -> uniform row, so a second per-game loss
+        # correction would over-weight short games.
+        "loser_sample_weight": 0.3,
         "lr": 0.00003,
         "lr_schedule": "flat",
         "lr_warmup_steps": 100,
         "optimizer": "adam",
-        "per_game_policy_weight": True,
-        "per_game_policy_weight_mode": "sqrt",
-        "per_game_value_weight": True,
-        "per_game_value_weight_mode": "sqrt",
+        "per_game_policy_weight": False,
+        "per_game_policy_weight_mode": "equal",
+        "per_game_value_weight": False,
+        "per_game_value_weight_mode": "equal",
         "policy_kl_anchor_weight": 0.0,
         "policy_kl_anchor_direction": "forward",
         "q_loss_weight": 0.0,
         "value_head_type": "mse",
-        "value_lr_mult": 1.0,
+        "value_lr_mult": 0.3,
         "value_target_lambda": 1.0,
         # The trainer's row cap cannot be combined with an authenticated exact
         # game holdout. Derive this whole-game sentinel once, bind its receipt,
@@ -79,11 +82,12 @@ def _arm(
     samples: int,
     global_batch: int,
     condition: str,
+    anchor_global_mass_equivalent: float | None = None,
 ) -> dict[str, Any]:
     recipe = _base_recipe()
     recipe.update(delta)
     recipe["max_steps"] = _steps(samples, global_batch)
-    return {
+    arm = {
         "arm_id": arm_id,
         "stage": stage,
         "condition": condition,
@@ -92,6 +96,14 @@ def _arm(
         "recipe": recipe,
         "recipe_sha256": _canonical_sha(recipe),
     }
+    if anchor_global_mass_equivalent is not None:
+        arm["policy_kl_anchor_semantics"] = {
+            "normalization": "conditional_authenticated_multi_action_prior_rows",
+            "configured_conditional_weight": float(recipe["policy_kl_anchor_weight"]),
+            "assumed_authenticated_replay_mass": 0.2,
+            "global_mass_equivalent_weight": float(anchor_global_mass_equivalent),
+        }
+    return arm
 
 
 def build_plan(*, world_size: int, local_batch_size: int, grad_accum_steps: int) -> dict[str, Any]:
@@ -107,11 +119,14 @@ def build_plan(*, world_size: int, local_batch_size: int, grad_accum_steps: int)
     accumulation = {"grad_accum_steps": grad_accum_steps}
     arms = [
         _arm("K0", "P1_anchor", accumulation, samples=SENTINEL_SAMPLES,
-             global_batch=global_batch, condition="always"),
-        _arm("K3", "P1_anchor", {**accumulation, "policy_kl_anchor_weight": 0.03},
-             samples=SENTINEL_SAMPLES, global_batch=global_batch, condition="always"),
-        _arm("K10", "P1_anchor", {**accumulation, "policy_kl_anchor_weight": 0.10},
-             samples=SENTINEL_SAMPLES, global_batch=global_batch, condition="always"),
+             global_batch=global_batch, condition="always",
+             anchor_global_mass_equivalent=0.0),
+        _arm("K3", "P1_anchor", {**accumulation, "policy_kl_anchor_weight": 0.006},
+             samples=SENTINEL_SAMPLES, global_batch=global_batch, condition="always",
+             anchor_global_mass_equivalent=0.03),
+        _arm("K10", "P1_anchor", {**accumulation, "policy_kl_anchor_weight": 0.020},
+             samples=SENTINEL_SAMPLES, global_batch=global_batch, condition="always",
+             anchor_global_mass_equivalent=0.10),
         _arm("HEAD_ONLY", "P2_trunk_drift",
              {**accumulation, "freeze_modules": "trunk"},
              samples=SENTINEL_SAMPLES, global_batch=global_batch,
@@ -146,6 +161,16 @@ def build_plan(*, world_size: int, local_batch_size: int, grad_accum_steps: int)
             "validation_split": "game-disjoint",
             "incumbent_mixed_replay_ratio_by_game": 0.2,
             "replay_stage": "fixed throughout P1; K0 is replay without KL anchor",
+        },
+        "policy_kl_anchor_semantics": {
+            "normalization": "conditional_authenticated_multi_action_prior_rows",
+            "weight_formula": (
+                "configured_conditional_weight = desired_global_mass_equivalent_weight "
+                "* authenticated_replay_mass"
+            ),
+            "authenticated_replay_mass": 0.2,
+            "forced_rows_in_denominator": False,
+            "rows_without_prior_in_denominator": False,
         },
         "prerequisites": [
             "KL anchor excludes single-legal-action rows from its denominator",

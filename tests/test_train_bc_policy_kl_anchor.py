@@ -12,7 +12,11 @@ import numpy as np
 import pytest
 import torch
 
-from tools.train_bc import _policy_kl_anchor_loss, _prior_kl_telemetry
+from tools.train_bc import (
+    _policy_kl_anchor_loss,
+    _policy_kl_anchor_loss_parts,
+    _prior_kl_telemetry,
+)
 
 
 def _base_data(**overrides):
@@ -136,6 +140,19 @@ def test_forced_prior_rows_do_not_dilute_anchor_denominator():
     )
     assert anchor is not None and row_one is not None
     assert torch.allclose(anchor, row_one, atol=1e-6)
+
+
+def test_anchor_parts_expose_the_same_conditional_denominator_used_by_the_loss():
+    data = _base_data()
+    data["legal_action_ids"][0] = np.asarray([5, -1, -1, -1], dtype=np.int16)
+    data["prior_policy"][0] = np.asarray([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+    parts = _policy_kl_anchor_loss_parts(
+        data, np.arange(3), _logits(), torch.device("cpu")
+    )
+    assert parts is not None
+    loss, weighted_sum, denominator = parts
+    assert denominator.item() == 1.0
+    assert torch.allclose(loss, weighted_sum / denominator, atol=1e-6)
 
 
 def test_multi_action_zero_policy_weight_row_remains_anchor_eligible():

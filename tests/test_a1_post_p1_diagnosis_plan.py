@@ -21,6 +21,7 @@ def test_matrix_reuses_control_and_adds_exactly_two_matched_runs() -> None:
 
 def test_architecture_arm_is_single_delta_over_head_only() -> None:
     plan = build_plan()
+    fixed = plan["fixed_recipe"]
     head, gather = plan["arms"][1:]
     assert head["recipe_delta"]["freeze_modules"] == "trunk"
     assert gather["recipe_delta"]["freeze_modules"] == "trunk"
@@ -30,8 +31,12 @@ def test_architecture_arm_is_single_delta_over_head_only() -> None:
     assert gather["recipe_delta"]["trunk_lr_mult"] == 1.0
     assert head["recipe_delta"]["checkpoint_upgrade"] == "none"
     assert "gather,cross:1" in gather["recipe_delta"]["checkpoint_upgrade"]
-    assert plan["fixed_recipe"]["aux_subgoal_heads"] is False
-    assert plan["fixed_recipe"]["value_target_lambda"] == 1.0
+    assert fixed["aux_subgoal_heads"] is False
+    assert fixed["value_target_lambda"] == 1.0
+    assert fixed["value_lr_mult"] == 0.3
+    assert fixed["loser_sample_weight"] == 0.3
+    assert fixed["per_game_policy_weight"] is False
+    assert fixed["per_game_value_weight"] is False
     assert "implemented" in plan["historical_feature_audit"]["trunk_lr_multiplier"]
     assert "f7 default OFF" in plan["historical_feature_audit"]["action_target_gather"]
 

@@ -35,9 +35,13 @@ def test_anchor_sweep_is_single_variable_and_q_stays_disabled():
     assert [arm["arm_id"] for arm in anchors] == ["K0", "K3", "K10"]
     assert [arm["recipe"]["policy_kl_anchor_weight"] for arm in anchors] == [
         0.0,
-        0.03,
-        0.10,
+        0.006,
+        0.020,
     ]
+    assert [
+        arm["policy_kl_anchor_semantics"]["global_mass_equivalent_weight"]
+        for arm in anchors
+    ] == [0.0, 0.03, 0.10]
     stripped = []
     for arm in anchors:
         recipe = dict(arm["recipe"])
@@ -47,6 +51,27 @@ def test_anchor_sweep_is_single_variable_and_q_stays_disabled():
         assert arm["recipe"]["validation_max_samples"] == 0
         assert arm["recipe"]["validation_game_sentinel_target_rows"] == 262_144
     assert stripped[0] == stripped[1] == stripped[2]
+
+
+def test_recovery_baseline_matches_successful_f7_recipe_without_double_game_weighting():
+    plan = build_plan(world_size=8, local_batch_size=1024, grad_accum_steps=1)
+    recipe = plan["arms"][0]["recipe"]
+    assert recipe["value_lr_mult"] == 0.3
+    assert recipe["loser_sample_weight"] == 0.3
+    assert recipe["per_game_policy_weight"] is False
+    assert recipe["per_game_value_weight"] is False
+    assert recipe["per_game_policy_weight_mode"] == "equal"
+    assert recipe["per_game_value_weight_mode"] == "equal"
+    assert plan["policy_kl_anchor_semantics"] == {
+        "normalization": "conditional_authenticated_multi_action_prior_rows",
+        "weight_formula": (
+            "configured_conditional_weight = desired_global_mass_equivalent_weight "
+            "* authenticated_replay_mass"
+        ),
+        "authenticated_replay_mass": 0.2,
+        "forced_rows_in_denominator": False,
+        "rows_without_prior_in_denominator": False,
+    }
 
 
 def test_plan_rejects_invalid_topology():
