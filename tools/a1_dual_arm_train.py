@@ -366,6 +366,7 @@ def build_command(
             "producer": verified["producer"],
             "data_path": verified["data"],
             "validation_path": Path(verified["validation"]["path"]),
+            "payload_inventory_sha256": verified["payload_inventory_sha256"],
             **(
                 {}
                 if verified.get("learner_ablation") is None

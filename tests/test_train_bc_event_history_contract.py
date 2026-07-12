@@ -140,6 +140,7 @@ def test_cropped_entity_batch_skips_event_payload_and_refuses_live_mask(
     data["event_target_ids"] = np.full((2, 64, 4), -1, dtype=np.int16)
     data["event_mask"] = np.zeros((2, 64), dtype=np.bool_)
     monkeypatch.setattr(train_bc, "_CROP_AUTHENTICATED_EMPTY_EVENT_HISTORY", True)
+    monkeypatch.setattr(train_bc, "_MASK_HIDDEN_INFO_PLAYER_TOKENS", False)
     batch = train_bc._entity_batch(data, np.asarray([0, 1], dtype=np.int64))
     assert batch["event_tokens"].shape == (2, 0, 41)
     assert batch["event_target_ids"].shape == (2, 0, 4)

@@ -31,6 +31,7 @@ def _verified() -> dict[str, object]:
         "producer": {"path": "/sealed/champion.pt", "sha256": "sha256:" + "b" * 64},
         "data_path": Path("/sealed/a1-memmap"),
         "validation_path": Path("/sealed/holdout.json"),
+        "payload_inventory_sha256": "sha256:" + "d" * 64,
         "lock_file_sha256": "sha256:" + "c" * 64,
         "reviewed_lock_file_sha256": "sha256:" + "c" * 64,
     }
@@ -62,7 +63,6 @@ def test_ablation_reuses_existing_weighting_knobs_and_binds_exact_drift() -> Non
     assert result["recipe"]["per_game_value_weight"] is True
     assert set(ablation["recipe_drift"]) == {
         "forced_row_value_weight",
-        "loser_sample_weight",
         "per_game_value_weight",
         "per_game_value_weight_mode",
         "soft_target_weight",

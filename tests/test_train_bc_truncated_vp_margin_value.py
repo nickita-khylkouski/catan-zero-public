@@ -77,8 +77,9 @@ def test_truncated_vp_margin_fills_in_a_soft_outcome_at_reduced_confidence():
         data,
         batch,
         torch.device("cpu"),
-        vps_to_win=10,
-        truncated_vp_margin_value_weight=0.25,
+            vps_to_win=10,
+            truncated_vp_margin_value_weight=0.25,
+            public_information_only=False,
     )
 
     # Policy-safe view is completely unaffected by F3.
@@ -113,7 +114,12 @@ def test_truncated_vp_margin_clips_to_unit_range():
     batch = np.arange(4)
 
     _, _, _, _, value_outcome, _, _ = _value_targets(
-        data, batch, torch.device("cpu"), vps_to_win=10, truncated_vp_margin_value_weight=0.25
+        data,
+        batch,
+        torch.device("cpu"),
+        vps_to_win=10,
+        truncated_vp_margin_value_weight=0.25,
+        public_information_only=False,
     )
 
     assert float(value_outcome[1]) == pytest.approx(0.9)
