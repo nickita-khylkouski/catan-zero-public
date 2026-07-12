@@ -10,7 +10,6 @@ mode=${1:-}
 root=${A1_COMBINED_ROOT:-/home/ubuntu/experimental_nonpromotable/a1-combined-80-20-20260711}
 script_repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 repo=${A1_REPO:-$script_repo}
-handoff_repo=${A1_HANDOFF_REPO:-$repo}
 python=${A1_PYTHON:-$repo/.venv/bin/python}
 producer=${A1_PRODUCER:-/home/ubuntu/catan-zero-production/runs/learner/a1-infoset-n128-20260710-r2/candidate.pt}
 contracts=${A1_CONTRACTS:-/home/ubuntu/catan-zero-production/contracts/a1-dual-arm-20260710-r1/locks}
@@ -20,15 +19,38 @@ overrides='{"loser_sample_weight":1.0,"lr":0.00012}'
 
 if [[ "$mode" == --go ]]; then
   [[ -s "$handoff" ]] || { echo "REFUSED: canonical combined handoff is not complete" >&2; exit 2; }
-  "$python" - "$handoff_repo" "$handoff" <<'PY'
-import sys
+  # This is diagnostic eligibility, not promotion. Authenticate the sealed
+  # rejection and every byte it names without replaying the 618 GB learner
+  # corpus through a historical source checkout merely to restate the result.
+  "$python" - "$handoff" <<'PY'
+import hashlib, json, sys
 from pathlib import Path
-sys.path.insert(0,sys.argv[1])
-from tools import a1_combined_candidate_handoff as combined
-result=combined.verify_result(Path(sys.argv[2]))
-if result["passed"]:
+
+def canonical(value):
+    return json.dumps(value,sort_keys=True,separators=(",",":")).encode()
+
+def sha256(path):
+    digest=hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return "sha256:"+digest.hexdigest()
+
+path=Path(sys.argv[1]).expanduser().resolve(strict=True)
+result=json.loads(path.read_text(encoding="utf-8"))
+unhashed=dict(result); stated=unhashed.pop("handoff_sha256",None)
+actual="sha256:"+hashlib.sha256(canonical(unhashed)).hexdigest()
+if result.get("schema_version") != "a1-combined-196k-evaluation-handoff-v1" or stated != actual:
+    raise SystemExit("REFUSED: canonical combined handoff schema/digest drift")
+for name in ("manifest","training_receipt","candidate","champion"):
+    ref=result.get(name)
+    if not isinstance(ref,dict) or set(ref) != {"path","sha256"}:
+        raise SystemExit(f"REFUSED: malformed combined handoff {name} reference")
+    if sha256(Path(ref["path"]).expanduser().resolve(strict=True)) != ref["sha256"]:
+        raise SystemExit(f"REFUSED: combined handoff {name} bytes drift")
+if result.get("passed") is not False:
     raise SystemExit("REFUSED: combined candidate passed; corrective run is unauthorized")
-if result["decision"] != "reject_candidate":
+if result.get("decision") != "reject_candidate":
     raise SystemExit("REFUSED: canonical combined handoff has no rejection decision")
 print("canonical combined handoff rejects candidate; corrective diagnostic is eligible")
 PY

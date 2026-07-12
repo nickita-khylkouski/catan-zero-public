@@ -8,11 +8,10 @@ SCRIPT = Path(__file__).resolve().parents[1] / "tools/a1_corrective_196k_b200.sh
 def test_corrective_launcher_is_syntax_clean_and_fail_closed_on_handoff() -> None:
     subprocess.run(["bash", "-n", str(SCRIPT)], check=True)
     text = SCRIPT.read_text(encoding="utf-8")
-    assert "a1_combined_candidate_handoff" in text
-    assert "A1_HANDOFF_REPO" in text
+    assert "a1-combined-196k-evaluation-handoff-v1" in text
     assert '[[ -f "$root/n128.training_input.ready" ]]' in text
-    assert "combined.verify_result" in text
-    assert 'result["passed"]' in text
+    assert 'result.get("passed") is not False' in text
+    assert 'for name in ("manifest","training_receipt","candidate","champion")' in text
     assert "final.summary.json" not in text
     assert "--go" in text
     assert "lr=1.2e-4" in text
