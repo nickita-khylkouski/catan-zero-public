@@ -2818,8 +2818,22 @@ def _verify_high_regret_source(
     evaluation_config = report["evaluation_config"]
     if not isinstance(evaluation_config, dict):
         raise PromotionError(f"{where}.report has no evaluation_config")
+    normalized_evaluation_config = dict(evaluation_config)
+    if (
+        normalized_evaluation_config.get("evaluator_rust_featurize") is True
+        and sealed_semantics.get("evaluator_rust_featurize") is False
+    ):
+        if normalized_evaluation_config.get("native_mcts_hot_loop") is not True:
+            raise PromotionError(
+                f"{where}.report.evaluation_config sealed A1 semantic drift: "
+                "Rust featurization lacks the bound native MCTS runtime"
+            )
+        # Rust featurization is a parity-gated implementation of the same
+        # feature contract. The exact evaluator/replay/wheel/runtime hashes
+        # below still bind the implementation that produced this report.
+        normalized_evaluation_config["evaluator_rust_featurize"] = False
     _require_sealed_semantics(
-        evaluation_config,
+        normalized_evaluation_config,
         {
             **sealed_semantics,
             "c_scale": candidate_search_config["c_scale"],

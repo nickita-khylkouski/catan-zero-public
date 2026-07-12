@@ -681,6 +681,8 @@ def _fixture(
             "champion": _checkpoint_ref(champion),
             "evaluation_config": {
                 **evidence_semantics,
+                "evaluator_rust_featurize": True,
+                "native_mcts_hot_loop": True,
                 "c_scale": candidate_search_config["c_scale"],
                 "candidate_c_scale": candidate_search_config["c_scale"],
                 "baseline_c_scale": champion_search_config["c_scale"],
@@ -1981,6 +1983,25 @@ def test_high_regret_report_cannot_launder_sealed_search_config(
     )
 
     with pytest.raises(promotion.PromotionError, match="sealed A1 semantic drift"):
+        _execute(fixture, go=False)
+
+
+def test_high_regret_rust_featurize_requires_native_runtime_binding(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path)
+
+    def mutate(source: dict) -> None:
+        report_path = Path(source["report"]["path"])
+        report = json.loads(report_path.read_text())
+        report["evaluation_config"]["native_mcts_hot_loop"] = False
+        _write_json(report_path, report)
+        source["report"]["sha256"] = promotion._sha256(report_path)
+
+    _mutate_evidence_source(
+        fixture, kind="high_regret", role="high_regret", mutate=mutate
+    )
+    with pytest.raises(promotion.PromotionError, match="bound native MCTS runtime"):
         _execute(fixture, go=False)
 
 
