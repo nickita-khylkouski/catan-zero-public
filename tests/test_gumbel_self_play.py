@@ -123,6 +123,54 @@ def test_game_outcome_fields_are_zero_sum_across_seats():
     assert {red_value, blue_value} == {1.0, -1.0}
 
 
+def test_initial_settlement_and_road_change_perspective_only_after_road():
+    """Opening settlement and its road are consecutive prompts for one actor.
+
+    Search values are expressed from the root actor's perspective.  A sign
+    change between the settlement root and its road child would therefore be
+    wrong; perspective changes only after the road hands control to the next
+    player.  This guards the exact transition behind the opening phase-value
+    calibration audit.
+    """
+    catanatron_rs = _rust()
+    game = catanatron_rs.Game.simple(list(COLORS), seed=7)
+    root_actor = str(game.current_color())
+
+    def apply_first_action_with_type(position, action_type: str):
+        action_ids = [
+            int(action)
+            for action in position.playable_action_indices(list(COLORS), None)
+        ]
+        actions = json.loads(position.playable_actions_json())
+        action_id, action_json = next(
+            (action_id, action_json)
+            for action_id, action_json in zip(action_ids, actions)
+            if str(action_json[1]) == action_type
+        )
+        return _apply_selected_action(
+            position,
+            action_id,
+            colors=COLORS,
+            rng=random.Random(0),
+            correct_rust_chance_spectra=True,
+            action_json=action_json,
+        )
+
+    after_settlement = apply_first_action_with_type(game, "BUILD_SETTLEMENT")
+    settlement_snapshot = json.loads(after_settlement.json_snapshot())
+    assert settlement_snapshot["current_prompt"] == "BUILD_INITIAL_ROAD"
+    assert str(after_settlement.current_color()) == root_actor
+    assert (
+        1.0 if str(after_settlement.current_color()) == root_actor else -1.0
+    ) == 1.0
+
+    after_road = apply_first_action_with_type(after_settlement, "BUILD_ROAD")
+    road_snapshot = json.loads(after_road.json_snapshot())
+    assert road_snapshot["current_prompt"] == "BUILD_INITIAL_SETTLEMENT"
+    assert str(after_road.current_color()) != root_actor
+    assert (1.0 if str(after_road.current_color()) == root_actor else -1.0) == -1.0
+
+
 # ---------------------------------------------------------------------------
 # Regression: "seat" must index into PLAYER_NAMES order, not `colors` order.
 # COLORS=("RED","BLUE") gives RED=0 under colors.index(), but PLAYER_NAMES=

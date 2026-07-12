@@ -25,6 +25,47 @@ def test_categorical_memmap_decodes_only_requested_rows(tmp_path: Path) -> None:
     assert grouped["teacher"]["weight_sum"] == 2.0
 
 
+def test_value_targets_decode_independent_winner_and_player_codebooks(
+    tmp_path: Path,
+) -> None:
+    """Column-local category codes are not comparable across columns.
+
+    Production corpora are allowed to encode the same labels in different
+    category orders.  In particular, ``winner`` may encode RED as 0 while
+    ``player`` encodes BLUE as 0.  Comparing those raw codes would invert every
+    outcome; the learner must compare the independently decoded strings.
+    """
+    winner_path = tmp_path / "winner.codes.dat"
+    player_path = tmp_path / "player.codes.dat"
+    np.asarray([0, 1], dtype=np.int32).tofile(winner_path)  # RED, BLUE
+    np.asarray([1, 0], dtype=np.int32).tofile(player_path)  # RED, BLUE
+
+    winner = train_bc._MemmapCategoricalColumn(  # noqa: SLF001
+        np.memmap(winner_path, dtype=np.int32, mode="r", shape=(2,)),
+        np.asarray(["RED", "BLUE"], dtype=str),
+    )
+    player = train_bc._MemmapCategoricalColumn(  # noqa: SLF001
+        np.memmap(player_path, dtype=np.int32, mode="r", shape=(2,)),
+        np.asarray(["BLUE", "RED"], dtype=str),
+    )
+
+    outcome, _vp, has_outcome, _has_vp, *_ = train_bc._value_targets(  # noqa: SLF001
+        {
+            "winner": winner,
+            "player": player,
+            "truncated": np.zeros(2, dtype=np.bool_),
+        },
+        np.arange(2, dtype=np.int64),
+        "cpu",
+        vps_to_win=10,
+    )
+
+    assert np.asarray(winner).tolist() == ["RED", "BLUE"]
+    assert np.asarray(player).tolist() == ["RED", "BLUE"]
+    assert outcome.tolist() == [1.0, 1.0]
+    assert has_outcome.tolist() == [True, True]
+
+
 def test_production_ragged_policy_columns_are_batch_lazy() -> None:
     assert {
         "legal_action_ids",
