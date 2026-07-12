@@ -64,8 +64,24 @@ def _sha(path: Path) -> str:
 
 
 def _digest(value: Any) -> str:
+    def _json_default(item: Any) -> Any:
+        # Checkpoint configs can retain NumPy scalar types (for example an
+        # action_size loaded as np.int64).  They are semantically ordinary
+        # JSON scalars, but json.dumps rejects them without normalization.
+        # Keep this deliberately narrow: arbitrary objects must still fail
+        # closed instead of acquiring a surprising string representation.
+        import numpy as np
+
+        if isinstance(item, np.generic):
+            return item.item()
+        raise TypeError(f"Object of type {type(item).__name__} is not JSON serializable")
+
     encoded = json.dumps(
-        value, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        default=_json_default,
     ).encode("utf-8")
     return "sha256:" + hashlib.sha256(encoded).hexdigest()
 

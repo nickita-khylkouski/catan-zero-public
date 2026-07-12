@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import numpy as np
 import pytest
 import torch
 
@@ -91,6 +92,26 @@ def test_receipt_replays_exact_allowlisted_zero_diff_upgrade(tmp_path: Path) -> 
             Path(payload["upgraded_initializer"]["path"]),
             receipt,
         )
+
+
+def test_receipt_digest_normalizes_numpy_config_scalars(tmp_path: Path) -> None:
+    source, initializer = _checkpoints(tmp_path)
+    for path in (source, initializer):
+        raw = torch.load(path, map_location="cpu", weights_only=False)
+        raw["config"]["fields"]["action_size"] = np.int64(567)
+        torch.save(raw, path)
+    raw = torch.load(initializer, map_location="cpu", weights_only=False)
+    raw["upgrade_provenance"]["source_checkpoint_sha256"] = upgrade._sha(  # noqa: SLF001
+        source
+    ).removeprefix("sha256:")
+    torch.save(raw, initializer)
+
+    receipt = tmp_path / "numpy-config.receipt.json"
+    payload = upgrade.issue_receipt(source, initializer, receipt)
+    assert upgrade.verify_receipt(receipt)["receipt_sha256"] == payload["receipt_sha256"]
+    assert upgrade._digest({"value": np.int64(7)}) == upgrade._digest(  # noqa: SLF001
+        {"value": 7}
+    )
 
 
 @pytest.mark.parametrize(
