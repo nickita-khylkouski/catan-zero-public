@@ -346,6 +346,8 @@ class ConcatMemmapCorpus:
         self.policy_kl_anchor_scope_authenticated = False
         self.policy_distillation_component_indices: tuple[int, ...] = tuple()
         self.policy_distillation_scope_authenticated = False
+        self.policy_aux_phase_sampling_weights: dict[str, float] | None = None
+        self.policy_aux_phase_scope_authenticated = False
         self.legal_width = int(first.legal_width)
         self._columns = {
             key: next(

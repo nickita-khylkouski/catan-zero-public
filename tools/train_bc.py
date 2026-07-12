@@ -1666,6 +1666,7 @@ def _preflight_memmap_composite_descriptor(path: str | Path) -> dict[str, object
         required_v2_fields = common_fields | {"policy_kl_anchor_component_ids"}
         optional_v2_fields = {
             "policy_distillation_component_ids",
+            "policy_aux_phase_sampling_weights",
             "value_training_component_ids",
         }
         # Optional for backward compatibility: absence preserves the historical
@@ -1800,6 +1801,7 @@ def _preflight_memmap_composite_descriptor(path: str | Path) -> dict[str, object
     anchor_component_ids: list[str] = []
     distillation_component_ids: list[str] = []
     distillation_scope_explicit = False
+    policy_aux_phase_sampling_weights: dict[str, float] | None = None
     value_training_component_ids: list[str] = []
     value_training_scope_explicit = False
     if schema_version == "memmap_composite_v2":
@@ -1838,6 +1840,50 @@ def _preflight_memmap_composite_descriptor(path: str | Path) -> dict[str, object
             )
         distillation_component_ids = list(raw_distillation_ids)
         distillation_scope_explicit = "policy_distillation_component_ids" in descriptor
+        raw_aux_phase_weights = descriptor.get("policy_aux_phase_sampling_weights")
+        if raw_aux_phase_weights is not None:
+            if not distillation_scope_explicit:
+                raise SystemExit(
+                    "memmap composite v2 policy auxiliary phase sampling requires "
+                    "an explicit policy distillation component scope"
+                )
+            if not isinstance(raw_aux_phase_weights, dict) or not raw_aux_phase_weights:
+                raise SystemExit(
+                    "memmap composite v2 policy auxiliary phase sampling weights "
+                    "must be a non-empty object"
+                )
+            policy_aux_phase_sampling_weights = {}
+            for phase, raw_weight in raw_aux_phase_weights.items():
+                if (
+                    not isinstance(phase, str)
+                    or not phase
+                    or "\0" in phase
+                    or len(phase) > 160
+                ):
+                    raise SystemExit(
+                        "memmap composite v2 policy auxiliary phase name is invalid"
+                    )
+                if (
+                    isinstance(raw_weight, bool)
+                    or not isinstance(raw_weight, (int, float))
+                    or not math.isfinite(float(raw_weight))
+                    or float(raw_weight) <= 0.0
+                ):
+                    raise SystemExit(
+                        "memmap composite v2 policy auxiliary phase sampling "
+                        f"weight is invalid for {phase!r}"
+                    )
+                policy_aux_phase_sampling_weights[phase] = float(raw_weight)
+            if not math.isclose(
+                sum(policy_aux_phase_sampling_weights.values()),
+                1.0,
+                rel_tol=0.0,
+                abs_tol=1e-9,
+            ):
+                raise SystemExit(
+                    "memmap composite v2 policy auxiliary phase sampling weights "
+                    "must sum to 1"
+                )
         raw_value_ids = descriptor.get("value_training_component_ids", component_ids)
         if (
             not isinstance(raw_value_ids, list)
@@ -1874,6 +1920,7 @@ def _preflight_memmap_composite_descriptor(path: str | Path) -> dict[str, object
         "policy_kl_anchor_component_ids": anchor_component_ids,
         "policy_distillation_component_ids": distillation_component_ids,
         "policy_distillation_scope_explicit": distillation_scope_explicit,
+        "policy_aux_phase_sampling_weights": policy_aux_phase_sampling_weights,
         "value_training_component_ids": value_training_component_ids,
         "value_training_scope_explicit": value_training_scope_explicit,
     }
@@ -5358,6 +5405,17 @@ def main(argv: Sequence[str] | None = None) -> None:
             )
         epoch_sample_weights = component_game_sampling
     policy_aux_sampling_weights = None
+    policy_aux_phase_sampling_weights = getattr(
+        data, "policy_aux_phase_sampling_weights", None
+    )
+    if (
+        bool(getattr(data, "policy_aux_phase_scope_authenticated", False))
+        and int(args.policy_aux_active_batch_size) <= 0
+    ):
+        raise SystemExit(
+            "authenticated policy auxiliary phase allocation requires "
+            "--policy-aux-active-batch-size > 0"
+        )
     if int(args.policy_aux_active_batch_size) > 0:
         if component_game_sampling is None:
             raise SystemExit(
@@ -5367,6 +5425,15 @@ def main(argv: Sequence[str] | None = None) -> None:
             component_game_sampling,
             np.asarray(policy_sample_weights)[train_indices],
         )
+        if bool(getattr(data, "policy_aux_phase_scope_authenticated", False)):
+            policy_aux_sampling_weights = (
+                _authenticated_policy_aux_phase_sampling_weights(
+                    data,
+                    train_indices,
+                    policy_aux_sampling_weights,
+                    policy_aux_phase_sampling_weights,
+                )
+            )
     if int(ddp["rank"]) == 0:
         policy_sample_weight_report = sample_weight_quality(data, policy_sample_weights)
         value_sample_weight_report = sample_weight_quality(data, value_sample_weights)
@@ -5467,6 +5534,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 ddp=ddp,
             )
         epoch_policy_component_dose: dict[str, float] = {}
+        epoch_policy_component_phase_dose: dict[str, float] = {}
         if bool(getattr(data, "policy_distillation_scope_authenticated", False)):
             component_ids = tuple(data.component_ids)
             base_rows = train_indices[np.asarray(order, dtype=np.int64)]
@@ -5487,6 +5555,25 @@ def main(argv: Sequence[str] | None = None) -> None:
                 )
                 epoch_policy_component_dose[f"{component_id}.aux"] = float(
                     np.count_nonzero(aux_components == component)
+                )
+            if policy_aux_phase_sampling_weights is not None:
+                phase_names = tuple(policy_aux_phase_sampling_weights)
+                epoch_policy_component_phase_dose.update(
+                    _policy_component_phase_dose(
+                        data, base_rows, phase_names, suffix="base"
+                    )
+                )
+                epoch_policy_component_phase_dose.update(
+                    _policy_component_phase_dose(
+                        data,
+                        (
+                            np.empty(0, dtype=np.int64)
+                            if aux_order is None
+                            else train_indices[np.asarray(aux_order, dtype=np.int64)]
+                        ),
+                        phase_names,
+                        suffix="aux",
+                    )
                 )
         epoch_losses = []
         epoch_extra_sums: dict[str, float] = {
@@ -5827,6 +5914,9 @@ def main(argv: Sequence[str] | None = None) -> None:
         epoch_policy_component_dose = _reduce_named_sums(
             epoch_policy_component_dose, ddp
         )
+        epoch_policy_component_phase_dose = _reduce_named_sums(
+            epoch_policy_component_phase_dose, ddp
+        )
         policy_component_active_dose = {
             component_id: {
                 "base_active_rows": int(
@@ -5844,6 +5934,36 @@ def main(argv: Sequence[str] | None = None) -> None:
             }
             for component_id in getattr(data, "component_ids", tuple())
         }
+        policy_component_phase_active_dose = None
+        if policy_aux_phase_sampling_weights is not None:
+            policy_component_phase_active_dose = {
+                component_id: {
+                    phase: {
+                        "base_active_rows": int(
+                            round(
+                                epoch_policy_component_phase_dose[
+                                    f"{component_id}\0{phase}\0base"
+                                ]
+                            )
+                        ),
+                        "aux_active_rows": int(
+                            round(
+                                epoch_policy_component_phase_dose[
+                                    f"{component_id}\0{phase}\0aux"
+                                ]
+                            )
+                        ),
+                    }
+                    for phase in policy_aux_phase_sampling_weights
+                }
+                for component_id in getattr(data, "component_ids", tuple())
+            }
+            for component in policy_component_phase_active_dose.values():
+                for phase_dose in component.values():
+                    phase_dose["total_active_rows"] = (
+                        phase_dose["base_active_rows"]
+                        + phase_dose["aux_active_rows"]
+                    )
         policy_loss_epoch = _metric_from_sum_denominator(
             epoch_extra_sums["policy_loss"], epoch_extra_denominators["policy_loss"]
         )
@@ -5911,6 +6031,9 @@ def main(argv: Sequence[str] | None = None) -> None:
                     active_count_total + aux_active_count_total
                 ),
                 "policy_component_active_dose": policy_component_active_dose,
+                "policy_component_phase_active_dose": (
+                    policy_component_phase_active_dose
+                ),
                 "value_loss": value_loss_epoch,
                 "scalar_value_mse_diagnostic": value_loss_epoch,
                 "final_vp_loss": final_vp_loss_epoch,
@@ -6173,6 +6296,34 @@ def main(argv: Sequence[str] | None = None) -> None:
         }
         for component_id in getattr(data, "component_ids", tuple())
     }
+    policy_component_phase_active_dose = None
+    if policy_aux_phase_sampling_weights is not None:
+        policy_component_phase_active_dose = {
+            component_id: {
+                phase: {
+                    key: int(
+                        sum(
+                            int(
+                                metric.get(
+                                    "policy_component_phase_active_dose", {}
+                                )
+                                .get(component_id, {})
+                                .get(phase, {})
+                                .get(key, 0)
+                            )
+                            for metric in metrics
+                        )
+                    )
+                    for key in (
+                        "base_active_rows",
+                        "aux_active_rows",
+                        "total_active_rows",
+                    )
+                }
+                for phase in policy_aux_phase_sampling_weights
+            }
+            for component_id in getattr(data, "component_ids", tuple())
+        }
     report = {
         "checkout_runtime_binding": checkout_runtime_binding,
         "arch": args.arch,
@@ -6322,6 +6473,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         "policy_distillation_scope": policy_distillation_scope_report,
         "value_training_scope": value_training_scope_report,
         "policy_component_active_dose": policy_component_active_dose,
+        "policy_aux_phase_sampling_weights": policy_aux_phase_sampling_weights,
+        "policy_component_phase_active_dose": policy_component_phase_active_dose,
         "sample_weight_quality": policy_sample_weight_report,
         "policy_sample_weight_quality": policy_sample_weight_report,
         "value_sample_weight_quality": value_sample_weight_report,
@@ -6445,6 +6598,9 @@ def main(argv: Sequence[str] | None = None) -> None:
                 ),
                 "policy_distillation_scope_explicit": bool(
                     a1_preflight_meta.get("policy_distillation_scope_explicit", False)
+                ),
+                "policy_aux_phase_sampling_weights": a1_preflight_meta.get(
+                    "policy_aux_phase_sampling_weights"
                 ),
                 "value_training_component_ids": a1_preflight_meta.get(
                     "value_training_component_ids", []
@@ -9512,6 +9668,20 @@ def load_teacher_data_memmap(
                 if component_id in distillation_ids
             )
             corpus.policy_distillation_scope_authenticated = True
+            raw_aux_phase_weights = authenticated.get(
+                "policy_aux_phase_sampling_weights"
+            )
+            corpus.policy_aux_phase_sampling_weights = (
+                None
+                if raw_aux_phase_weights is None
+                else {
+                    str(phase): float(weight)
+                    for phase, weight in raw_aux_phase_weights.items()
+                }
+            )
+            corpus.policy_aux_phase_scope_authenticated = (
+                raw_aux_phase_weights is not None
+            )
             value_ids = set(authenticated["value_training_component_ids"])
             corpus.value_training_component_indices = tuple(
                 index
@@ -14620,6 +14790,149 @@ def _conditioned_policy_aux_sampling_weights(
         raise ValueError("policy auxiliary measure has no active mass")
     conditioned /= total
     return conditioned
+
+
+def _apply_authenticated_policy_aux_phase_allocation(
+    active_sampling_weights: np.ndarray,
+    phase_values: np.ndarray,
+    phase_sampling_weights: dict[str, float],
+) -> np.ndarray:
+    """Allocate exact AUX draw mass across authenticated, explicit phases.
+
+    ``active_sampling_weights`` is already the authenticated composite base
+    measure conditioned on the policy-distillation scope and positive policy
+    loss.  Within each requested phase we preserve that measure exactly; only
+    the phase's total probability mass changes.  Unlisted phases receive no
+    auxiliary draws.  This never changes the base sampler or any value loss.
+    """
+
+    base = np.asarray(active_sampling_weights, dtype=np.float64)
+    phases = np.asarray(phase_values).astype(str, copy=False)
+    if base.ndim != 1 or phases.ndim != 1 or base.shape != phases.shape:
+        raise ValueError("policy auxiliary phase allocation shape drift")
+    if not isinstance(phase_sampling_weights, dict) or not phase_sampling_weights:
+        raise ValueError("policy auxiliary phase allocation is empty")
+    if not np.isfinite(base).all() or np.any(base < 0.0):
+        raise ValueError("policy auxiliary active measure is invalid")
+    configured_total = float(sum(phase_sampling_weights.values()))
+    if not math.isclose(configured_total, 1.0, rel_tol=0.0, abs_tol=1e-9):
+        raise ValueError("policy auxiliary phase allocation must sum to 1")
+
+    allocated = np.zeros_like(base)
+    for phase, raw_share in phase_sampling_weights.items():
+        share = float(raw_share)
+        if not phase or not math.isfinite(share) or share <= 0.0:
+            raise ValueError(
+                f"policy auxiliary phase allocation is invalid for {phase!r}"
+            )
+        mask = phases == phase
+        stratum_mass = float(base[mask].sum())
+        if not math.isfinite(stratum_mass) or stratum_mass <= 0.0:
+            raise ValueError(
+                "policy auxiliary requested phase has no policy-active mass: "
+                f"{phase!r}"
+            )
+        allocated[mask] = base[mask] * (share / stratum_mass)
+    total = float(allocated.sum())
+    if not math.isclose(total, 1.0, rel_tol=0.0, abs_tol=1e-9):
+        raise ValueError("policy auxiliary phase allocation mass drift")
+    return allocated
+
+
+def _authenticated_policy_aux_phase_sampling_weights(
+    data,
+    train_indices: np.ndarray,
+    active_sampling_weights: np.ndarray,
+    phase_sampling_weights: dict[str, float],
+    *,
+    chunk_rows: int = 1_000_000,
+) -> np.ndarray:
+    """Chunk-decode corpus phases, then apply an authenticated allocation.
+
+    Memmap string columns decode to NumPy Unicode.  Keeping only an int16
+    stratum id avoids a multi-gigabyte full-corpus Unicode temporary on large
+    composites while preserving exact row probabilities.
+    """
+
+    rows = np.asarray(train_indices, dtype=np.int64)
+    base = np.asarray(active_sampling_weights, dtype=np.float64)
+    if rows.ndim != 1 or base.shape != rows.shape:
+        raise ValueError("policy auxiliary phase corpus alignment drift")
+    if "phase" not in data:
+        raise ValueError("policy auxiliary phase allocation requires a phase column")
+    phase_names = tuple(phase_sampling_weights)
+    if len(phase_names) > np.iinfo(np.int16).max:
+        raise ValueError("policy auxiliary phase allocation has too many strata")
+    labels = np.full(rows.size, -1, dtype=np.int16)
+    chunk = max(1, int(chunk_rows))
+    for start in range(0, rows.size, chunk):
+        stop = min(start + chunk, rows.size)
+        decoded = np.asarray(data["phase"][rows[start:stop]]).astype(
+            str, copy=False
+        )
+        for label, phase in enumerate(phase_names):
+            labels[start:stop][decoded == phase] = label
+
+    shares = np.asarray(
+        [float(phase_sampling_weights[phase]) for phase in phase_names],
+        dtype=np.float64,
+    )
+    if not np.isfinite(shares).all() or np.any(shares <= 0.0) or not math.isclose(
+        float(shares.sum()), 1.0, rel_tol=0.0, abs_tol=1e-9
+    ):
+        raise ValueError("policy auxiliary phase allocation is invalid")
+    valid = labels >= 0
+    masses = np.bincount(
+        labels[valid].astype(np.int64, copy=False),
+        weights=base[valid],
+        minlength=len(phase_names),
+    )
+    empty = [phase_names[index] for index in np.flatnonzero(masses <= 0.0)]
+    if empty:
+        raise ValueError(
+            "policy auxiliary requested phases have no policy-active mass: "
+            + ", ".join(repr(phase) for phase in empty)
+        )
+    allocated = np.zeros_like(base)
+    allocated[valid] = base[valid] * (shares[labels[valid]] / masses[labels[valid]])
+    if not math.isclose(float(allocated.sum()), 1.0, rel_tol=0.0, abs_tol=1e-9):
+        raise ValueError("policy auxiliary phase allocation mass drift")
+    return allocated
+
+
+def _policy_component_phase_dose(
+    data,
+    rows: np.ndarray,
+    phase_names: tuple[str, ...],
+    *,
+    suffix: str,
+    chunk_rows: int = 1_000_000,
+) -> dict[str, float]:
+    """Count realized rows by authenticated component and configured phase."""
+
+    indices = np.asarray(rows, dtype=np.int64)
+    component_ids = tuple(getattr(data, "component_ids", tuple()))
+    result = {
+        f"{component_id}\0{phase}\0{suffix}": 0.0
+        for component_id in component_ids
+        for phase in phase_names
+    }
+    if indices.size == 0:
+        return result
+    chunk = max(1, int(chunk_rows))
+    for start in range(0, indices.size, chunk):
+        part = indices[start : start + chunk]
+        components = np.asarray(
+            data.component_indices_for_rows(part), dtype=np.int64
+        )
+        phases = np.asarray(data["phase"][part]).astype(str, copy=False)
+        for component, component_id in enumerate(component_ids):
+            component_mask = components == component
+            for phase in phase_names:
+                result[f"{component_id}\0{phase}\0{suffix}"] += float(
+                    np.count_nonzero(component_mask & (phases == phase))
+                )
+    return result
 
 
 def _policy_aux_epoch_order(

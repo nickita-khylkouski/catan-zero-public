@@ -84,6 +84,7 @@ def _descriptor_v2(
     tmp_path: Path,
     *,
     policy_distillation_component_ids: list[str] | None = None,
+    policy_aux_phase_sampling_weights: dict[str, float] | None = None,
     value_training_component_ids: list[str] | None = None,
 ) -> Path:
     overrides = {
@@ -112,6 +113,10 @@ def _descriptor_v2(
     }
     if policy_distillation_component_ids is not None:
         payload["policy_distillation_component_ids"] = policy_distillation_component_ids
+    if policy_aux_phase_sampling_weights is not None:
+        payload["policy_aux_phase_sampling_weights"] = (
+            policy_aux_phase_sampling_weights
+        )
     if value_training_component_ids is not None:
         payload["value_training_component_ids"] = value_training_component_ids
     path = tmp_path / "composite-v2.json"
@@ -171,6 +176,49 @@ def test_v2_authenticates_policy_distillation_scope_and_refuses_drift(tmp_path):
     payload["policy_distillation_component_ids"] = ["n256", "n128"]
     path.write_text(json.dumps(payload), encoding="utf-8")
     with pytest.raises(SystemExit, match="must follow component order"):
+        train_bc._preflight_memmap_composite_descriptor(path)
+
+
+def test_v2_authenticates_policy_aux_phase_allocation(tmp_path):
+    allocation = {"PLAY_TURN": 0.60, "MOVE_ROBBER": 0.25, "DISCARD": 0.15}
+    path = _descriptor_v2(
+        tmp_path,
+        policy_distillation_component_ids=["n128", "n256"],
+        policy_aux_phase_sampling_weights=allocation,
+    )
+    verified = train_bc._preflight_memmap_composite_descriptor(path)
+    assert verified["policy_aux_phase_sampling_weights"] == allocation
+    assert verified["descriptor_fingerprint"] == train_bc._training_data_fingerprint(
+        str(path), "memmap"
+    )
+
+
+@pytest.mark.parametrize(
+    "allocation",
+    [
+        {},
+        {"PLAY_TURN": 0.9},
+        {"PLAY_TURN": 1.0, "DISCARD": 0.0},
+        {"PLAY_TURN": True},
+    ],
+)
+def test_v2_refuses_invalid_policy_aux_phase_allocation(tmp_path, allocation):
+    path = _descriptor_v2(
+        tmp_path, policy_distillation_component_ids=["n128", "n256"]
+    )
+    payload = json.loads(path.read_text())
+    payload["policy_aux_phase_sampling_weights"] = allocation
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(SystemExit, match="policy auxiliary phase"):
+        train_bc._preflight_memmap_composite_descriptor(path)
+
+
+def test_v2_refuses_phase_allocation_without_explicit_policy_scope(tmp_path):
+    path = _descriptor_v2(tmp_path)
+    payload = json.loads(path.read_text())
+    payload["policy_aux_phase_sampling_weights"] = {"PLAY_TURN": 1.0}
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(SystemExit, match="explicit policy distillation"):
         train_bc._preflight_memmap_composite_descriptor(path)
 
 
@@ -403,6 +451,74 @@ def test_policy_aux_conditioning_preserves_authenticated_base_measure() -> None:
     # Conditioning changes admission only. A multiplier of 2 does not become a
     # sampling-frequency weight; phase/winner/etc. remain loss weights.
     assert conditioned == pytest.approx([0.0, 2.0 / 7.0, 1.0 / 7.0, 4.0 / 7.0])
+
+
+def test_policy_aux_phase_allocation_sets_exact_phase_shares() -> None:
+    active = np.asarray([0.10, 0.20, 0.30, 0.40, 0.0], dtype=np.float64)
+    phases = np.asarray(["PLAY", "PLAY", "ROBBER", "DISCARD", "PLAY"])
+    allocated = train_bc._apply_authenticated_policy_aux_phase_allocation(
+        active,
+        phases,
+        {"PLAY": 0.50, "ROBBER": 0.30, "DISCARD": 0.20},
+    )
+    assert allocated.sum() == pytest.approx(1.0)
+    assert allocated[phases == "PLAY"].sum() == pytest.approx(0.50)
+    assert allocated[phases == "ROBBER"].sum() == pytest.approx(0.30)
+    assert allocated[phases == "DISCARD"].sum() == pytest.approx(0.20)
+    # The authenticated base measure remains proportional inside each phase.
+    assert allocated[0] / allocated[1] == pytest.approx(0.5)
+
+
+def test_policy_aux_phase_allocation_fails_closed_for_empty_active_stratum() -> None:
+    with pytest.raises(ValueError, match="has no policy-active mass"):
+        train_bc._apply_authenticated_policy_aux_phase_allocation(
+            np.asarray([0.5, 0.5], dtype=np.float64),
+            np.asarray(["PLAY", "PLAY"]),
+            {"PLAY": 0.5, "ROBBER": 0.5},
+        )
+
+
+def test_chunked_policy_aux_phase_allocation_uses_corpus_rows() -> None:
+    data = ConcatMemmapCorpus(
+        [
+            _TinyGameCorpus([1, 1, 1]),
+            _TinyGameCorpus([10, 10, 10]),
+        ]
+    )
+    phases = np.asarray(["PLAY", "ROBBER", "PLAY", "PLAY", "ROBBER", "DISCARD"])
+    data._eager["phase"] = phases  # type: ignore[assignment]
+    weights = train_bc._authenticated_policy_aux_phase_sampling_weights(
+        data,
+        np.arange(6, dtype=np.int64),
+        np.full(6, 1.0 / 6.0, dtype=np.float64),
+        {"PLAY": 0.5, "ROBBER": 0.3, "DISCARD": 0.2},
+        chunk_rows=2,
+    )
+    assert weights[phases == "PLAY"].sum() == pytest.approx(0.5)
+    assert weights[phases == "ROBBER"].sum() == pytest.approx(0.3)
+    assert weights[phases == "DISCARD"].sum() == pytest.approx(0.2)
+
+
+def test_policy_component_phase_dose_reports_exact_realized_draws() -> None:
+    data = ConcatMemmapCorpus(
+        [_TinyGameCorpus([1, 1, 1]), _TinyGameCorpus([10, 10, 10])]
+    )
+    data.component_ids = ("n128", "n256")
+    data._eager["phase"] = np.asarray(  # type: ignore[assignment]
+        ["PLAY", "ROBBER", "PLAY", "PLAY", "ROBBER", "DISCARD"]
+    )
+    dose = train_bc._policy_component_phase_dose(
+        data,
+        np.asarray([0, 1, 1, 3, 4, 5, 5], dtype=np.int64),
+        ("PLAY", "ROBBER", "DISCARD"),
+        suffix="aux",
+        chunk_rows=2,
+    )
+    assert dose["n128\0PLAY\0aux"] == 1
+    assert dose["n128\0ROBBER\0aux"] == 2
+    assert dose["n256\0PLAY\0aux"] == 1
+    assert dose["n256\0ROBBER\0aux"] == 1
+    assert dose["n256\0DISCARD\0aux"] == 2
 
 
 def test_authenticated_policy_scope_excludes_replay_ce_and_aux_sampling() -> None:
