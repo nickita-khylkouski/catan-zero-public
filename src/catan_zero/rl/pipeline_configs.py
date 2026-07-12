@@ -281,6 +281,8 @@ class TrainConfig(PipelineConfig):
     loser_sample_weight: float = 0.3
     vp_margin_weight: float = 0.0
     forced_action_weight: float = 0.1
+    per_game_policy_weight: bool = False
+    per_game_policy_weight_mode: str = "equal"
     forced_row_value_weight: float = 1.0
     per_game_value_weight: bool = False
     per_game_value_weight_mode: str = "equal"

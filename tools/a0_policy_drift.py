@@ -179,6 +179,10 @@ def _policy_weights(data: Any, recipe: Mapping[str, Any]) -> np.ndarray:
         loser_sample_weight=float(recipe["loser_sample_weight"]),
         vp_margin_weight=float(recipe["vp_margin_weight"]),
         vps_to_win=int(recipe["vps_to_win"]),
+        per_game_policy_weight=bool(recipe.get("per_game_policy_weight", False)),
+        per_game_policy_weight_mode=str(
+            recipe.get("per_game_policy_weight_mode", "equal")
+        ),
     )
 
 

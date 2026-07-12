@@ -884,6 +884,26 @@ def build_parser() -> argparse.ArgumentParser:
         help="Multiplier for samples with exactly one legal action.",
     )
     parser.add_argument(
+        "--per-game-policy-weight",
+        action="store_true",
+        help=(
+            "Normalize positive POLICY-loss weights within each game_seed so long "
+            "games do not contribute more policy mass merely because they contain "
+            "more recorded rows. Zero-policy rows remain zero. Default OFF preserves "
+            "historical row-level policy weighting exactly."
+        ),
+    )
+    parser.add_argument(
+        "--per-game-policy-weight-mode",
+        choices=("equal", "sqrt"),
+        default="equal",
+        help=(
+            "How --per-game-policy-weight scales positive per-game policy mass: "
+            "'equal' gives every game equal total mass; 'sqrt' retains total mass "
+            "proportional to sqrt(the game's original positive policy mass)."
+        ),
+    )
+    parser.add_argument(
         "--policy-surprise-weight",
         type=float,
         default=0.0,
@@ -1463,6 +1483,7 @@ def _preflight_memmap_composite_descriptor(path: str | Path) -> dict[str, object
         raise SystemExit(f"cannot load memmap composite descriptor {path}: {error}") from error
     if not isinstance(descriptor, dict) or set(descriptor) != {
         "schema_version", "diagnostic_only", "promotion_eligible", "components",
+        "learner_recipe_overrides", "learner_recipe_overrides_sha256",
     }:
         raise SystemExit("memmap composite descriptor fields differ from v1 schema")
     if (
@@ -1477,6 +1498,20 @@ def _preflight_memmap_composite_descriptor(path: str | Path) -> dict[str, object
     raw_components = descriptor.get("components")
     if not isinstance(raw_components, list) or len(raw_components) != 2:
         raise SystemExit("memmap composite v1 requires exactly two ordered components")
+    overrides = descriptor.get("learner_recipe_overrides")
+    if not isinstance(overrides, dict) or set(overrides) != {
+        "per_game_policy_weight", "per_game_policy_weight_mode",
+    }:
+        raise SystemExit(
+            "memmap composite learner_recipe_overrides must bind exactly "
+            "per-game policy weighting"
+        )
+    if not isinstance(overrides["per_game_policy_weight"], bool) or overrides[
+        "per_game_policy_weight_mode"
+    ] not in {"equal", "sqrt"}:
+        raise SystemExit("memmap composite per-game policy recipe override is invalid")
+    if descriptor.get("learner_recipe_overrides_sha256") != _canonical_json_sha256(overrides):
+        raise SystemExit("memmap composite learner recipe override digest mismatch")
     components: list[dict[str, object]] = []
     inventory_bindings: list[dict[str, object]] = []
     seen_dirs: set[str] = set()
@@ -1537,8 +1572,27 @@ def _preflight_memmap_composite_descriptor(path: str | Path) -> dict[str, object
         "descriptor_file_sha256": _sha256_existing_file(descriptor_path),
         "descriptor_fingerprint": _canonical_json_sha256(descriptor),
         "payload_inventory_sha256": _canonical_json_sha256(inventory_bindings),
+        "learner_recipe_overrides": overrides,
+        "learner_recipe_overrides_sha256": descriptor[
+            "learner_recipe_overrides_sha256"
+        ],
         "components": components,
     }
+
+
+def _validate_composite_learner_recipe_authorization(
+    args: argparse.Namespace, composite_meta: dict[str, object]
+) -> None:
+    expected = composite_meta.get("learner_recipe_overrides")
+    actual = {
+        "per_game_policy_weight": bool(args.per_game_policy_weight),
+        "per_game_policy_weight_mode": str(args.per_game_policy_weight_mode),
+    }
+    if expected != actual:
+        raise SystemExit(
+            "memmap composite command differs from its authenticated diagnostic "
+            f"learner recipe override: descriptor={expected!r} command={actual!r}"
+        )
 
 
 def _expected_memmap_payload_filenames(
@@ -2986,6 +3040,13 @@ def _validate_a1_learner_training_recipe(
     ddp: dict[str, int | bool],
     bound: dict[str, object],
 ) -> dict[str, object]:
+    if bool(getattr(args, "per_game_policy_weight", False)) or str(
+        getattr(args, "per_game_policy_weight_mode", "equal")
+    ) != "equal":
+        raise SystemExit(
+            "A1 single-contract learner does not bind per-game policy weighting; "
+            "use an explicitly authorized diagnostic recipe"
+        )
     expected = bound.get("learner_training_recipe")
     if not isinstance(expected, dict):
         raise SystemExit("A1 contract has no typed learner training recipe")
@@ -3363,6 +3424,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         and a1_preflight_meta.get("schema_version") == "memmap_composite_v1"
     )
     if is_memmap_composite:
+        _validate_composite_learner_recipe_authorization(args, a1_preflight_meta)
         validation_seed_contract = _load_composite_validation_contract(
             a1_preflight_meta,
             validation_fraction=float(args.validation_fraction),
@@ -4016,6 +4078,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         loser_sample_weight=args.loser_sample_weight,
         vp_margin_weight=args.vp_margin_weight,
         vps_to_win=args.vps_to_win,
+        per_game_policy_weight=bool(args.per_game_policy_weight),
+        per_game_policy_weight_mode=str(args.per_game_policy_weight_mode),
     )
     value_phase_weights_raw = args.value_phase_weights or args.phase_weights
     value_sample_weights = build_value_sample_weights(
@@ -4831,6 +4895,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         "phase_weights": _parse_weight_map(args.phase_weights),
         "value_phase_weights": _parse_weight_map(value_phase_weights_raw),
         "forced_action_weight": args.forced_action_weight,
+        "per_game_policy_weight": bool(args.per_game_policy_weight),
+        "per_game_policy_weight_mode": str(args.per_game_policy_weight_mode),
         "forced_row_value_weight": args.forced_row_value_weight,
         "per_game_value_weight": bool(args.per_game_value_weight),
         "per_game_value_weight_mode": str(args.per_game_value_weight_mode),
@@ -4902,6 +4968,12 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "descriptor_file_sha256": a1_preflight_meta["descriptor_file_sha256"],
                 "descriptor_fingerprint": a1_preflight_meta["descriptor_fingerprint"],
                 "payload_inventory_sha256": a1_preflight_meta["payload_inventory_sha256"],
+                "learner_recipe_overrides": a1_preflight_meta[
+                    "learner_recipe_overrides"
+                ],
+                "learner_recipe_overrides_sha256": a1_preflight_meta[
+                    "learner_recipe_overrides_sha256"
+                ],
                 "component_count": len(a1_preflight_meta["components"]),
                 "component_contract_sha256s": [
                     contract["a1_contract_sha256"]
@@ -10016,6 +10088,8 @@ def build_sample_weights(
     loser_sample_weight: float,
     vp_margin_weight: float,
     vps_to_win: int,
+    per_game_policy_weight: bool = False,
+    per_game_policy_weight_mode: str = "equal",
 ) -> np.ndarray:
     n = len(data["action_taken"])
     weights = np.ones(n, dtype=np.float32)
@@ -10075,6 +10149,19 @@ def build_sample_weights(
     mean = float(np.mean(weights)) if len(weights) else 1.0
     if "policy_weight_multiplier" in data:
         weights *= np.asarray(data["policy_weight_multiplier"], dtype=np.float32)
+        mean = float(np.mean(weights)) if len(weights) else 1.0
+    if per_game_policy_weight and len(weights):
+        # Only rows that already carry policy loss are redistributed. In
+        # particular, fast/filtered rows with policy_weight_multiplier=0 stay
+        # exactly zero and zero-active games acquire no synthetic policy mass.
+        if per_game_policy_weight_mode not in {"equal", "sqrt"}:
+            raise ValueError(
+                f"unknown per_game_policy_weight_mode {per_game_policy_weight_mode!r}"
+            )
+        positive = np.where(weights > 0.0, weights, 0.0).astype(np.float32, copy=False)
+        weights = _normalize_weights_per_game(
+            data, positive, mode=per_game_policy_weight_mode
+        )
         mean = float(np.mean(weights)) if len(weights) else 1.0
     if mean > 0:
         weights = weights / mean

@@ -63,10 +63,16 @@ def _component(root: Path, name: str) -> dict:
 
 
 def _descriptor(tmp_path: Path) -> Path:
+    overrides = {
+        "per_game_policy_weight": True,
+        "per_game_policy_weight_mode": "equal",
+    }
     payload = {
         "schema_version": "memmap_composite_v1",
         "diagnostic_only": True,
         "promotion_eligible": False,
+        "learner_recipe_overrides": overrides,
+        "learner_recipe_overrides_sha256": _canonical(overrides),
         "components": [_component(tmp_path, "a"), _component(tmp_path, "b")],
     }
     path = tmp_path / "composite.json"
@@ -113,6 +119,25 @@ def test_descriptor_cannot_claim_promotion_eligibility(tmp_path):
     path.write_text(json.dumps(payload), encoding="utf-8")
     with pytest.raises(SystemExit, match="diagnostic-only"):
         train_bc._preflight_memmap_composite_descriptor(path)
+
+
+def test_descriptor_authorizes_exact_diagnostic_policy_weighting_and_refuses_drift(
+    tmp_path,
+):
+    verified = train_bc._preflight_memmap_composite_descriptor(_descriptor(tmp_path))
+    matching = type(
+        "Args",
+        (),
+        {"per_game_policy_weight": True, "per_game_policy_weight_mode": "equal"},
+    )()
+    train_bc._validate_composite_learner_recipe_authorization(matching, verified)
+    drifted = type(
+        "Args",
+        (),
+        {"per_game_policy_weight": False, "per_game_policy_weight_mode": "equal"},
+    )()
+    with pytest.raises(SystemExit, match="authenticated diagnostic learner recipe"):
+        train_bc._validate_composite_learner_recipe_authorization(drifted, verified)
 
 
 def test_validation_contract_unions_disjoint_component_seeds(monkeypatch):

@@ -140,6 +140,10 @@ def run_probe(
         loser_sample_weight=float(_required(report, "loser_sample_weight")),
         vp_margin_weight=float(_required(report, "vp_margin_weight")),
         vps_to_win=int(_required(report, "vps_to_win")),
+        per_game_policy_weight=bool(report.get("per_game_policy_weight", False)),
+        per_game_policy_weight_mode=str(
+            report.get("per_game_policy_weight_mode", "equal")
+        ),
     )
     value_weights = train_bc.build_value_sample_weights(
         data,

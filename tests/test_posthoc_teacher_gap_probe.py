@@ -35,6 +35,8 @@ def _report() -> dict:
         "phase_weights": {"main": 3.0},
         "value_phase_weights": {"main": 4.0},
         "forced_action_weight": 0.1,
+        "per_game_policy_weight": True,
+        "per_game_policy_weight_mode": "sqrt",
         "forced_row_value_weight": 0.7,
         "per_game_value_weight": True,
         "per_game_value_weight_mode": "equal",
@@ -161,6 +163,8 @@ def test_reconstructs_exact_weights_holdout_and_evaluation_recipe(
         "loser_sample_weight": 0.3,
         "vp_margin_weight": 0.4,
         "vps_to_win": 10,
+        "per_game_policy_weight": True,
+        "per_game_policy_weight_mode": "sqrt",
     }
     assert fake.calls["value_weights"] == {
         "phase_weights": {"main": 4.0},

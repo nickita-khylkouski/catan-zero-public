@@ -11,6 +11,11 @@ sum of both row counts.
   "schema_version": "memmap_composite_v1",
   "diagnostic_only": true,
   "promotion_eligible": false,
+  "learner_recipe_overrides": {
+    "per_game_policy_weight": true,
+    "per_game_policy_weight_mode": "equal"
+  },
+  "learner_recipe_overrides_sha256": "sha256:...",
   "components": [
     {
       "corpus_dir": "/absolute/n256.memmap",
@@ -34,6 +39,9 @@ Paths must be canonical absolute paths. Each component's metadata, payload
 inventory, and exact A1 validation binding are checked independently. Validation
 game sets and complete component game-seed sets must be disjoint. Do not pass
 `--validation-game-seed-manifest`; the descriptor binds both manifests.
+The command's per-game policy settings must exactly match the canonical
+`learner_recipe_overrides` object and digest. This explicitly authorizes the
+diagnostic learner drift without weakening single-contract A1 runs.
 
 The current schema is deliberately diagnostic-only. Existing promotion receipts
 bind one A1 learner contract, one selected-game identity, and one payload

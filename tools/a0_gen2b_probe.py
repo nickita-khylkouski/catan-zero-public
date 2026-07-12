@@ -73,6 +73,7 @@ _STORE_TRUE = {
     "aux_subgoal_heads",
     "edge_policy_head",
     "train_value_only",
+    "per_game_policy_weight",
     "per_game_value_weight",
     "allow_teacher_score_q_loss",
     "allow_legacy_action_mask_upgrade",
