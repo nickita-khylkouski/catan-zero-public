@@ -2386,8 +2386,22 @@ def _verify_internal_h2h_source(
         }
     )
     config_where = "pooled effective config" if pooled else "typed config"
+    runtime_fields = dict(fields)
+    if (
+        pooled
+        and runtime_fields.get("native_mcts_hot_loop") is True
+        and "mcts_implementation" not in runtime_fields
+    ):
+        if (
+            payload.get("native_mcts_hot_loop") is not True
+            or payload.get("mcts_implementation") != "rust_native_hot_loop_v1"
+        ):
+            raise PromotionError(
+                f"{where} pooled native runtime lacks its top-level implementation binding"
+            )
+        runtime_fields["mcts_implementation"] = payload["mcts_implementation"]
     normalized_fields = _normalize_search_runtime_binding(
-        fields,
+        runtime_fields,
         expected_search_config=expected_fields,
         where=f"{where} {config_where}",
     )
