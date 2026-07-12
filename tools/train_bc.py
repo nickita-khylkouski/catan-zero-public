@@ -20,17 +20,6 @@ import tempfile
 import time
 from typing import Any, Sequence
 
-# A script path does not bind Python imports to the same checkout.  In particular,
-# ``python /new/checkout/tools/train_bc.py`` can otherwise import ``catan_zero``
-# from an older editable install or an ambient PYTHONPATH.  Put this checkout's
-# source tree first *before the first project import*.  The assertion below also
-# refuses execution when a caller has already imported a different checkout into
-# this interpreter (inserting a path cannot repair an existing sys.modules entry).
-_REPO_ROOT = Path(__file__).resolve().parents[1]
-_REPO_SRC = (_REPO_ROOT / "src").resolve(strict=True)
-sys.path[:] = [entry for entry in sys.path if Path(entry or ".").resolve() != _REPO_SRC]
-sys.path.insert(0, str(_REPO_SRC))
-
 import numpy as np
 
 from catan_zero.rl.config_cli import add_config_flags, apply_config_file, resolve_config
@@ -52,64 +41,6 @@ from catan_zero.rl.entity_token_features import (
     PLAYER_FEATURE_SIZE,
     VERTEX_FEATURE_SIZE,
 )
-from catan_zero.rl import optim_state as _checkout_optim_state
-
-
-CHECKOUT_RUNTIME_BINDING_SCHEMA = "train-bc-checkout-runtime-v1"
-
-
-def _path_within(path: Path, root: Path) -> bool:
-    try:
-        path.relative_to(root)
-        return True
-    except ValueError:
-        return False
-
-
-def _assert_checkout_runtime_binding() -> dict[str, object]:
-    """Refuse a trainer whose script and imported package come from different trees."""
-
-    modules: dict[str, dict[str, str]] = {}
-    for name, module in sorted(sys.modules.items()):
-        if name != "catan_zero" and not name.startswith("catan_zero."):
-            continue
-        raw_path = getattr(module, "__file__", None)
-        if raw_path is None:
-            continue
-        module_path = Path(raw_path).resolve(strict=True)
-        if not _path_within(module_path, _REPO_SRC):
-            raise RuntimeError(
-                "checkout/runtime package skew: "
-                f"{name} resolved to {module_path}, but trainer {Path(__file__).resolve()} "
-                f"requires every catan_zero module under {_REPO_SRC}"
-            )
-        modules[name] = {
-            "path": str(module_path),
-            "sha256": _sha256_existing_file(module_path),
-        }
-    required = {
-        "catan_zero",
-        "catan_zero.rl.optim_state",
-        "catan_zero.rl.entity_token_policy",
-    }
-    missing = required - modules.keys()
-    if missing:
-        raise RuntimeError(
-            f"checkout runtime binding cannot identify required modules: {sorted(missing)}"
-        )
-    trainer = Path(__file__).resolve(strict=True)
-    binding: dict[str, object] = {
-        "schema_version": CHECKOUT_RUNTIME_BINDING_SCHEMA,
-        "repo_root": str(_REPO_ROOT),
-        "source_root": str(_REPO_SRC),
-        "trainer": str(trainer),
-        "trainer_sha256": _sha256_existing_file(trainer),
-        "modules": modules,
-    }
-    binding["binding_sha256"] = "sha256:" + hashlib.sha256(
-        json.dumps(binding, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
-    return binding
 
 # Make the sibling ``tools/`` modules importable (factory_common) whether this module is run
 # as a script (``python tools/train_bc.py``) or imported as a package submodule
@@ -1463,9 +1394,6 @@ def _value_training_metadata(
         "scalar_training_weight_sum": float(scalar_training_weight_sum),
         "categorical_training_weight_sum": float(
             categorical_training_weight_sum
-        ),
-        "checkout_runtime_binding": getattr(
-            args, "checkout_runtime_binding", None
         ),
         **(
             {
@@ -4114,10 +4042,8 @@ def _resolve_effective_value_categorical_bins(args: argparse.Namespace) -> int:
 
 
 def main(argv: Sequence[str] | None = None) -> None:
-    checkout_runtime_binding = _assert_checkout_runtime_binding()
     parser = build_parser()
     args = parser.parse_args(argv)
-    args.checkout_runtime_binding = checkout_runtime_binding
     raw_argv = list(argv) if argv is not None else sys.argv[1:]
     # Resolve file-supplied architecture values before derived defaults and
     # checkpoint inheritance. ``resolve_config`` calls this again later, which
@@ -5983,7 +5909,6 @@ def main(argv: Sequence[str] | None = None) -> None:
         ddp=ddp,
     )
     report = {
-        "checkout_runtime_binding": checkout_runtime_binding,
         "arch": args.arch,
         "config_hash": train_config_hash,
         "samples": int(n),
