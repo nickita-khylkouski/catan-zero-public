@@ -239,3 +239,35 @@ def test_refuses_validation_manifest_byte_drift(tmp_path, monkeypatch):
             validation_manifest_path=paths[3],
             device="cpu",
         )
+
+
+def test_modern_report_binds_emitted_holdout_not_input_sentinel(tmp_path, monkeypatch):
+    module = _module()
+    report = _report()
+    paths = _paths(tmp_path, report)
+    report["validation_game_seed_manifest"] = str(paths[3])
+    report["input_validation_game_seed_manifest_sha256"] = "sha256:upstream-sentinel"
+    paths[0].write_text(json.dumps(report), encoding="utf-8")
+    fake = _FakeTrainBC()
+    monkeypatch.setattr(module, "_load_train_bc", lambda: fake)
+    monkeypatch.setattr(module, "_load_policy", lambda *args: SimpleNamespace())
+
+    result = module.run_probe(
+        report_path=paths[0],
+        checkpoint_path=paths[1],
+        data_path=paths[2],
+        validation_manifest_path=paths[3],
+        device="cpu",
+    )
+    assert result["teacher_gap"]["active_policy_teacher_gap_rows"] == 2
+
+    other = tmp_path / "other-validation.json"
+    other.write_text("{}\n", encoding="utf-8")
+    with pytest.raises(SystemExit, match="path differs from emitted"):
+        module.run_probe(
+            report_path=paths[0],
+            checkpoint_path=paths[1],
+            data_path=paths[2],
+            validation_manifest_path=other,
+            device="cpu",
+        )

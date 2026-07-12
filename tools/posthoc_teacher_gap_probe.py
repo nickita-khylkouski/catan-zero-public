@@ -92,12 +92,28 @@ def run_probe(
             f"report={expected_fingerprint!r} actual={actual_fingerprint!r}"
         )
     manifest_sha = _sha256(validation_manifest_path)
-    expected_manifest_sha = report.get("input_validation_game_seed_manifest_sha256")
-    if expected_manifest_sha and manifest_sha != expected_manifest_sha:
-        raise SystemExit(
-            "validation manifest bytes differ from training report: "
-            f"report={expected_manifest_sha!r} actual={manifest_sha!r}"
-        )
+    emitted_manifest = report.get("validation_game_seed_manifest")
+    if emitted_manifest:
+        expected_path = Path(str(emitted_manifest)).expanduser()
+        if not expected_path.is_absolute():
+            expected_path = report_path.parent / expected_path
+        expected_path = expected_path.resolve(strict=True)
+        if validation_manifest_path != expected_path:
+            raise SystemExit(
+                "validation manifest path differs from emitted training holdout: "
+                f"report={str(expected_path)!r} actual={str(validation_manifest_path)!r}"
+            )
+    else:
+        # Legacy reports only recorded the manifest supplied to training.
+        # Modern reports additionally emit the concrete train-validation seed
+        # manifest consumed by this probe; its schema and bytes intentionally
+        # differ from the upstream selection sentinel.
+        expected_manifest_sha = report.get("input_validation_game_seed_manifest_sha256")
+        if expected_manifest_sha and manifest_sha != expected_manifest_sha:
+            raise SystemExit(
+                "validation manifest bytes differ from training report: "
+                f"report={expected_manifest_sha!r} actual={manifest_sha!r}"
+            )
 
     ranges = report.get("validation_game_seed_ranges") or []
     validation_contract = train_bc._load_validation_game_seed_manifest_for_training(
