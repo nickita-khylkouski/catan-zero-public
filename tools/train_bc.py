@@ -774,11 +774,31 @@ def build_parser() -> argparse.ArgumentParser:
             "MuZero/ReZero-style value-target blend (CAT-39, arXiv:2404.16364): value target "
             "= lambda*z + (1-lambda)*V_search on rows carrying a stored search root value "
             "(the `root_value` / `root_value_mask` shard columns). 1.0 (default) is a pure "
-            "no-op (pure realised-outcome z); inert on shards with no root_value column. The "
+            "no-op (pure realised-outcome z). Non-unit values require an explicit phase "
+            "scope (or the named global-compatibility mode) and fail closed when no eligible "
+            "root rows exist. The "
             "blend is applied in DISTRIBUTION space for the HL-Gauss head (project z and "
             "V_search each to a categorical distribution, then mix) and in scalar space for "
             "the MSE control arm -- the two are consistent because HL-Gauss preserves the "
             "expectation and blending is linear."
+        ),
+    )
+    parser.add_argument(
+        "--value-root-blend-phases",
+        default="",
+        help=(
+            "Comma-separated authoritative game phases eligible for the search-root "
+            "value blend. Example: DISCARD,MOVE_ROBBER,PLAY_TURN. When lambda < 1, "
+            "either this option or --value-root-blend-global-compat is required. "
+            "Opening placement/road rows remain pure outcome targets unless named."
+        ),
+    )
+    parser.add_argument(
+        "--value-root-blend-global-compat",
+        action="store_true",
+        help=(
+            "Explicit compatibility mode for the historical behavior that blends every "
+            "valid root-value row. Mutually exclusive with --value-root-blend-phases."
         ),
     )
     parser.add_argument(
@@ -1349,6 +1369,8 @@ def _value_training_metadata(
             getattr(args, "value_hlgauss_sigma_ratio", 0.75)
         ),
         "value_target_lambda": float(getattr(args, "value_target_lambda", 1.0)),
+        "value_root_blend_regime": _resolve_value_root_blend_regime(args),
+        "value_root_blend_audit": getattr(args, "value_root_blend_audit", None),
         "truncated_vp_margin_value_weight": float(
             getattr(args, "truncated_vp_margin_value_weight", 0.0)
         ),
@@ -4174,6 +4196,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         resolved_scalar_value_weight,
         resolved_categorical_value_weight,
     ) = _resolve_value_objective_weights(args)
+    value_root_blend_regime = _resolve_value_root_blend_regime(args)
     _rank0_print(
         json.dumps(
             {
@@ -4758,6 +4781,23 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     policy_sample_weights = derived["policy_sample_weights"]
     value_sample_weights = derived["value_sample_weights"]
+    value_root_blend_audit = _audit_value_root_blend_corpus(
+        data,
+        value_sample_weights,
+        regime=value_root_blend_regime,
+        indices=np.asarray(derived["train_indices"], dtype=np.int64),
+    )
+    # `_value_training_metadata` is rebuilt for every epoch checkpoint and the
+    # final checkpoint; attach the immutable pre-optimizer realization once so
+    # every saved artifact carries the same audited target operator.
+    args.value_root_blend_audit = value_root_blend_audit
+    _rank0_print(
+        json.dumps(
+            {"progress": "value_root_blend_audit", **value_root_blend_audit},
+            sort_keys=True,
+        ),
+        ddp,
+    )
     policy_surprise_weights_full = derived["policy_surprise_weights_full"]
     train_indices = derived["train_indices"]
     validation_indices = derived["validation_indices"]
@@ -5020,6 +5060,12 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "value_categorical_loss_weight": resolved_categorical_value_weight,
                 "value_hlgauss_sigma_ratio": float(args.value_hlgauss_sigma_ratio),
                 "value_target_lambda": float(args.value_target_lambda),
+                "value_root_blend_phases": tuple(
+                    value_root_blend_regime["phases"]
+                ),
+                "value_root_blend_global_compat": (
+                    value_root_blend_regime["mode"] == "global_compat"
+                ),
                 "moe_balance_loss_weight": float(args.moe_balance_loss_weight),
             }
         batch_iterator = _iterate_training_batches(
@@ -5394,6 +5440,12 @@ def main(argv: Sequence[str] | None = None) -> None:
                 value_categorical_loss_weight=resolved_categorical_value_weight,
                 value_hlgauss_sigma_ratio=float(args.value_hlgauss_sigma_ratio),
                 value_target_lambda=float(args.value_target_lambda),
+                value_root_blend_phases=tuple(
+                    value_root_blend_regime["phases"]
+                ),
+                value_root_blend_global_compat=(
+                    value_root_blend_regime["mode"] == "global_compat"
+                ),
                 data_loader_workers=int(args.data_loader_workers),
                 data_loader_prefetch=int(args.data_loader_prefetch),
             )
@@ -5737,6 +5789,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         "value_training": value_training,
         "value_hlgauss_sigma_ratio": args.value_hlgauss_sigma_ratio,
         "value_target_lambda": args.value_target_lambda,
+        "value_root_blend_regime": value_root_blend_regime,
+        "value_root_blend_audit": value_root_blend_audit,
         "edge_policy_head": bool(getattr(args, "edge_policy_head", False)),
         "aux_subgoal_heads": bool(getattr(args, "aux_subgoal_heads", False)),
         "freeze_modules": args.freeze_modules,
@@ -6242,6 +6296,8 @@ def _train_xdim_batch(
     value_categorical_loss_weight: float = 0.0,
     value_hlgauss_sigma_ratio: float = 0.75,
     value_target_lambda: float = 1.0,
+    value_root_blend_phases: tuple[str, ...] = (),
+    value_root_blend_global_compat: bool = False,
     symmetry=None,
     symmetry_rng=None,
     symmetry_relabel_events: bool = True,
@@ -6341,7 +6397,16 @@ def _train_xdim_batch(
             and root_value is not None
         ):
             lam = float(value_target_lambda)
-            blend_rows = root_value_mask & value_has_outcome
+            blend_rows = _value_root_blend_mask(
+                data,
+                batch,
+                policy.device,
+                root_value_mask,
+                value_has_outcome,
+                truncated_mask,
+                phases=value_root_blend_phases,
+                global_compat=value_root_blend_global_compat,
+            )
             value_outcome_targets = torch.where(
                 blend_rows,
                 lam * value_outcome_targets + (1.0 - lam) * root_value,
@@ -6494,7 +6559,16 @@ def _train_xdim_batch(
                     truncated=None,
                     add_truncation_class=has_trunc_class,
                 )
-                blend_rows = (root_value_mask & has_outcome & ~truncated_mask).unsqueeze(-1)
+                blend_rows = _value_root_blend_mask(
+                    data,
+                    batch,
+                    policy.device,
+                    root_value_mask,
+                    has_outcome,
+                    truncated_mask,
+                    phases=value_root_blend_phases,
+                    global_compat=value_root_blend_global_compat,
+                ).unsqueeze(-1)
                 cat_targets = torch.where(
                     blend_rows,
                     lam * cat_targets + (1.0 - lam) * rv_targets,
@@ -6922,6 +6996,8 @@ def evaluate_bc_batches(
     value_categorical_loss_weight: float = 0.0,
     value_hlgauss_sigma_ratio: float = 0.75,
     value_target_lambda: float = 1.0,
+    value_root_blend_phases: tuple[str, ...] = (),
+    value_root_blend_global_compat: bool = False,
     data_loader_workers: int = 0,
     data_loader_prefetch: int = 2,
 ) -> dict:
@@ -6990,6 +7066,10 @@ def evaluate_bc_batches(
                 "value_categorical_loss_weight": float(value_categorical_loss_weight),
                 "value_hlgauss_sigma_ratio": float(value_hlgauss_sigma_ratio),
                 "value_target_lambda": float(value_target_lambda),
+                "value_root_blend_phases": tuple(value_root_blend_phases),
+                "value_root_blend_global_compat": bool(
+                    value_root_blend_global_compat
+                ),
             }
         # Validation used to bypass the streaming loader and synchronously
         # reconstruct every ragged memmap batch on the rank's main thread. On a
@@ -7496,6 +7576,8 @@ def _eval_xdim_batch(
     value_categorical_loss_weight: float = 0.0,
     value_hlgauss_sigma_ratio: float = 0.75,
     value_target_lambda: float = 1.0,
+    value_root_blend_phases: tuple[str, ...] = (),
+    value_root_blend_global_compat: bool = False,
 ) -> dict:
     import torch
     from torch import nn
@@ -7587,7 +7669,16 @@ def _eval_xdim_batch(
                 and root_value is not None
             ):
                 lam = float(value_target_lambda)
-                blend_rows = root_value_mask & value_has_outcome
+                blend_rows = _value_root_blend_mask(
+                    data,
+                    batch,
+                    policy.device,
+                    root_value_mask,
+                    value_has_outcome,
+                    truncated_mask,
+                    phases=value_root_blend_phases,
+                    global_compat=value_root_blend_global_compat,
+                )
                 value_outcome_targets = torch.where(
                     blend_rows,
                     lam * value_outcome_targets + (1.0 - lam) * root_value,
@@ -7722,8 +7813,15 @@ def _eval_xdim_batch(
                         truncated=None,
                         add_truncation_class=has_trunc_class,
                     )
-                    blend_rows = (
-                        root_value_mask & has_outcome & ~truncated_mask
+                    blend_rows = _value_root_blend_mask(
+                        data,
+                        batch,
+                        policy.device,
+                        root_value_mask,
+                        has_outcome,
+                        truncated_mask,
+                        phases=value_root_blend_phases,
+                        global_compat=value_root_blend_global_compat,
                     ).unsqueeze(-1)
                     cat_targets = torch.where(
                         blend_rows,
@@ -10874,6 +10972,214 @@ def _truncated_vp_margin_outcome(
         outcome[valid] = np.clip(margin, -1.0, 1.0)
         mask[valid] = True
     return mask, outcome
+
+
+_KNOWN_VALUE_ROOT_BLEND_PHASES = frozenset(
+    {
+        "BUILD_INITIAL_SETTLEMENT",
+        "BUILD_INITIAL_ROAD",
+        "DISCARD",
+        "MOVE_ROBBER",
+        "DECIDE_TRADE",
+        "DECIDE_ACCEPTEES",
+        "PLAY_TURN",
+    }
+)
+
+
+def _parse_value_root_blend_phases(value: str | tuple[str, ...]) -> tuple[str, ...]:
+    raw = value if isinstance(value, tuple) else tuple(str(value).split(","))
+    phases = tuple(dict.fromkeys(part.strip().upper() for part in raw if part.strip()))
+    unknown = sorted(set(phases) - _KNOWN_VALUE_ROOT_BLEND_PHASES)
+    if unknown:
+        raise SystemExit(
+            "unknown --value-root-blend-phases value(s): "
+            + ", ".join(unknown)
+            + "; known phases are "
+            + ", ".join(sorted(_KNOWN_VALUE_ROOT_BLEND_PHASES))
+        )
+    return phases
+
+
+def _resolve_value_root_blend_regime(args) -> dict[str, object]:
+    """Resolve the root-value target operator, requiring explicit scope.
+
+    ``lambda=1`` stays an exact no-op. A non-unit lambda may either target named
+    phases or request the historical global operator explicitly; it can never
+    silently fall back to global blending.
+    """
+
+    lam = float(getattr(args, "value_target_lambda", 1.0))
+    phases = _parse_value_root_blend_phases(
+        getattr(args, "value_root_blend_phases", "")
+    )
+    global_compat = bool(getattr(args, "value_root_blend_global_compat", False))
+    if phases and global_compat:
+        raise SystemExit(
+            "--value-root-blend-phases and --value-root-blend-global-compat are "
+            "mutually exclusive"
+        )
+    if lam != 1.0 and not phases and not global_compat:
+        raise SystemExit(
+            "--value-target-lambda < 1 requires an explicit target-information "
+            "scope: use --value-root-blend-phases or the historical "
+            "--value-root-blend-global-compat"
+        )
+    return {
+        "schema_version": "value-root-blend-regime-v1",
+        "mode": "phase_gated" if phases else ("global_compat" if global_compat else "disabled"),
+        "lambda": lam,
+        "phases": list(phases),
+    }
+
+
+def _value_root_phase_mask(
+    data: dict,
+    batch: np.ndarray,
+    phases: tuple[str, ...],
+    *,
+    global_compat: bool,
+) -> np.ndarray:
+    if global_compat:
+        return np.ones(len(batch), dtype=np.bool_)
+    if not phases or "phase" not in data:
+        return np.zeros(len(batch), dtype=np.bool_)
+    observed = np.char.upper(np.asarray(data["phase"][batch]).astype(str))
+    return np.isin(observed, np.asarray(phases, dtype=str))
+
+
+def _value_root_blend_mask(
+    data: dict,
+    batch: np.ndarray,
+    device,
+    root_value_mask,
+    value_has_outcome,
+    truncated_mask,
+    *,
+    phases: tuple[str, ...] = (),
+    global_compat: bool = False,
+):
+    import torch
+
+    phase_mask = torch.as_tensor(
+        _value_root_phase_mask(data, batch, phases, global_compat=global_compat),
+        dtype=torch.bool,
+        device=device,
+    )
+    # Truncated games and missing/invalid search roots retain pure z. This also
+    # keeps scalar and categorical objectives on exactly the same row operator.
+    return phase_mask & root_value_mask & value_has_outcome & ~truncated_mask
+
+
+def _audit_value_root_blend_corpus(
+    data: dict,
+    value_sample_weights: np.ndarray,
+    *,
+    regime: dict[str, object],
+    indices: np.ndarray | None = None,
+) -> dict[str, object]:
+    """Fail-closed corpus realization and durable target-operator telemetry."""
+
+    total_rows = len(data["action_taken"])
+    rows = (
+        np.arange(total_rows, dtype=np.int64)
+        if indices is None
+        else np.asarray(indices, dtype=np.int64)
+    )
+    n = len(rows)
+    lam = float(regime["lambda"])
+    phases = tuple(str(value) for value in regime["phases"])
+    mode = str(regime["mode"])
+    report: dict[str, object] = {
+        **regime,
+        "rows": n,
+        "eligible_rows": 0,
+        "blended_rows": 0,
+        "eligible_weighted_mass": 0.0,
+        "blended_weighted_mass": 0.0,
+        "per_phase": {},
+        "mean_abs_root_minus_z": None,
+        "root_value_finite": True,
+        "root_value_in_range": True,
+        "target_information_regime_counts": {},
+        "public_target_information_only": None,
+    }
+    if "target_information_regime" in data:
+        values, counts = np.unique(
+            np.asarray(data["target_information_regime"][rows]).astype(str),
+            return_counts=True,
+        )
+        report["target_information_regime_counts"] = {
+            str(value): int(count) for value, count in zip(values, counts, strict=True)
+        }
+        report["public_target_information_only"] = set(
+            report["target_information_regime_counts"]
+        ) == {"public_conservation_pimc_v1"}
+    if lam == 1.0:
+        return report
+    if "root_value" not in data:
+        raise SystemExit("requested root-value blend but corpus has no root_value column")
+    root = np.asarray(data["root_value"][rows], dtype=np.float32).reshape(n)
+    mask = np.asarray(
+        (
+            data["root_value_mask"][rows]
+            if "root_value_mask" in data
+            else np.isfinite(root)
+        ),
+        dtype=np.bool_,
+    ).reshape(n)
+    masked_finite = np.isfinite(root[mask])
+    masked_range = np.abs(root[mask]) <= 1.0
+    report["root_value_finite"] = bool(np.all(masked_finite))
+    report["root_value_in_range"] = bool(np.all(masked_range))
+    if not report["root_value_finite"] or not report["root_value_in_range"]:
+        raise SystemExit(
+            "requested root-value blend contains masked non-finite or out-of-range "
+            "root_value values; expected finite [-1, 1]"
+        )
+    phase_mask = _value_root_phase_mask(
+        data, rows, phases, global_compat=(mode == "global_compat")
+    )
+    truncated = np.asarray(
+        data["truncated"][rows] if "truncated" in data else np.zeros(n),
+        dtype=np.bool_,
+    )
+    # Outcome existence is deliberately conservative and public: winner labels
+    # are the realized z source. Rows without one retain pure z/no blend.
+    winner = np.asarray(
+        data["winner"][rows] if "winner" in data else np.full(n, "")
+    ).astype(str)
+    has_outcome = winner != ""
+    eligible = phase_mask & mask & has_outcome & ~truncated
+    weights = np.asarray(value_sample_weights[rows], dtype=np.float64)
+    report["eligible_rows"] = int(np.sum(eligible))
+    report["blended_rows"] = int(np.sum(eligible))
+    report["eligible_weighted_mass"] = float(np.sum(weights[eligible]))
+    report["blended_weighted_mass"] = float(np.sum(weights[eligible]))
+    observed_phases = np.asarray(
+        data["phase"][rows] if "phase" in data else np.full(n, "")
+    ).astype(str)
+    report["per_phase"] = {
+        phase: {
+            "eligible_rows": int(np.sum(eligible & (np.char.upper(observed_phases) == phase))),
+            "weighted_mass": float(
+                np.sum(weights[eligible & (np.char.upper(observed_phases) == phase)])
+            ),
+        }
+        for phase in (phases or tuple(sorted(set(np.char.upper(observed_phases[eligible])))))
+    }
+    if not np.any(eligible) or float(report["blended_weighted_mass"]) <= 0.0:
+        raise SystemExit(
+            "requested root-value blend realized zero eligible rows or weighted mass "
+            "after phase, outcome, truncation, root-value, and learner-weight masks"
+        )
+    if "player" in data:
+        player = np.asarray(data["player"][rows]).astype(str)
+        z = np.where(player == winner, 1.0, -1.0)
+        report["mean_abs_root_minus_z"] = float(
+            np.average(np.abs(root[eligible] - z[eligible]), weights=weights[eligible])
+        )
+    return report
 
 
 def _root_value_targets(data: dict, batch: np.ndarray, device):
