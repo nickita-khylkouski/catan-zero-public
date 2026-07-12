@@ -8,6 +8,29 @@ from pathlib import Path
 from typing import Any
 
 
+# Checkpoints contain both learned parameters and immutable inference inputs.
+# Interpolating the latter is unsafe even when the endpoints are identical:
+# floating-point ``x * (1-a) + x * a`` is not guaranteed to reproduce ``x``
+# bit-for-bit.  In particular, changing static action-feature tables while
+# retaining their authenticated hash makes an otherwise valid checkpoint
+# unloadable.  These are the trainable state roots used by the supported
+# policy families; everything else is copied exactly from the base checkpoint.
+LEARNED_STATE_ROOTS = frozenset(
+    {
+        "model",
+        "actor",
+        "critic",
+        "q_head",
+        "q_state",
+        "q_action_encoder",
+        "q_action_bias",
+        "action_encoder",
+        "action_id_embedding",
+        "action_bias",
+    }
+)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
@@ -81,7 +104,7 @@ def interpolate_checkpoints(
     for alpha in alphas:
         if alpha < 0.0 or alpha > 1.0:
             raise ValueError("alpha must be in [0, 1]")
-        blended = _blend_value(base_data, candidate_data, alpha)
+        blended = _blend_checkpoint(base_data, candidate_data, alpha)
         output = Path(output_template.format(alpha=_format_alpha(alpha)))
         output.parent.mkdir(parents=True, exist_ok=True)
         torch.save(blended, output)
@@ -115,7 +138,9 @@ def write_interpolation_receipt(
         "schema_version": "checkpoint-interpolation-receipt-v1",
         "diagnostic_only": True,
         "promotion_eligible": False,
-        "formula": "output=(1-alpha)*base+alpha*candidate",
+        "formula": "learned_state=(1-alpha)*base+alpha*candidate",
+        "learned_state_roots": sorted(LEARNED_STATE_ROOTS),
+        "immutable_tensor_source": "base (endpoint equality required)",
         "non_floating_source": "base",
         "output_metadata_source": "base",
         "candidate_only_metadata_ignored": sorted(set(candidate_data) - set(base_data)),
@@ -167,6 +192,13 @@ def _assert_compatible(base: dict[str, Any], candidate: dict[str, Any]) -> None:
         raise ValueError("checkpoint tensor key/schema sets differ")
     if not _mapping_contains(base, candidate):
         raise ValueError("candidate checkpoint is missing base metadata keys")
+    for key, base_value in base.items():
+        if key not in LEARNED_STATE_ROOTS:
+            _assert_tensor_values_equal(
+                base_value,
+                candidate[key],
+                path=f"checkpoint.{key}",
+            )
     # Newer trainers may append diagnostic metadata (for example the sealed
     # value-training receipt) without changing the deployable model schema.
     # Outputs intentionally retain the base metadata and interpolate only the
@@ -188,6 +220,33 @@ def _mapping_contains(base: Any, candidate: Any) -> bool:
             for left, right in zip(base, candidate)
         )
     return True
+
+
+def _blend_checkpoint(
+    base: dict[str, Any], candidate: dict[str, Any], alpha: float
+) -> dict[str, Any]:
+    blended = deepcopy(base)
+    for key in LEARNED_STATE_ROOTS:
+        if key in base:
+            blended[key] = _blend_value(base[key], candidate[key], alpha)
+    return blended
+
+
+def _assert_tensor_values_equal(base: Any, candidate: Any, *, path: str) -> None:
+    """Require immutable tensor leaves to match exactly at both endpoints."""
+    import torch
+
+    if isinstance(base, dict):
+        for key, value in base.items():
+            _assert_tensor_values_equal(value, candidate[key], path=f"{path}.{key}")
+    elif isinstance(base, (list, tuple)):
+        for index, value in enumerate(base):
+            _assert_tensor_values_equal(
+                value, candidate[index], path=f"{path}[{index}]"
+            )
+    elif torch.is_tensor(base):
+        if not torch.equal(base, candidate):
+            raise ValueError(f"immutable checkpoint tensor differs: {path}")
 
 
 def _blend_value(base: Any, candidate: Any, alpha: float) -> Any:
