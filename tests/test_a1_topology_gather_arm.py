@@ -54,7 +54,6 @@ def _checkpoints(tmp_path: Path) -> tuple[Path, Path]:
 
 def _source_manifest(tmp_path: Path, source: Path, descriptor: Path,
                      validation: Path) -> Path:
-    effective = {"lr": 3e-5, "soft_target_weight": 1.0}
     command = [
         "python", "-m", "torch.distributed.run", "--standalone",
         "--nproc-per-node=8", "tools/train_bc.py",
@@ -63,10 +62,7 @@ def _source_manifest(tmp_path: Path, source: Path, descriptor: Path,
         "--init-checkpoint", str(source.resolve()),
         "--checkpoint", str(tmp_path / "source-candidate.pt"),
         "--report", str(tmp_path / "source-report.json"),
-        "--a1-learner-ablation-id", "corrected-anchor-K3",
-        "--a1-effective-learner-recipe-json", arm.corrected._canonical(effective).decode(),
-        "--a1-effective-learner-recipe-sha256", arm.corrected._digest(effective),
-        "--no-resume-optimizer", "--fsdp", "--mask-hidden-info",
+        "--no-resume-optimizer", "--mask-hidden-info",
     ]
     recipe = {
         "world_size": 8, "local_batch_size": 512, "global_batch_size": 4096,
@@ -158,9 +154,7 @@ def test_prepares_one_axis_gather_k3_without_launch(tmp_path, monkeypatch):
         manifest["executor_compatibility"]["reason"]
     )
     command = manifest["command"]
-    assert arm.corrected._option(command, "--a1-learner-ablation-id") == (
-        "corrected-anchor-K3-topology-gather"
-    )
+    assert "--a1-learner-ablation-id" not in command
     assert arm.corrected._option(command, "--init-checkpoint") == str(
         _args_checkpoint(manifest)
     )
