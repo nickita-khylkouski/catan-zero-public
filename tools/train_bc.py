@@ -6558,6 +6558,13 @@ def main(argv: Sequence[str] | None = None) -> None:
         "mask_hidden_info": bool(args.mask_hidden_info),
         "seed": int(args.seed),
         "symmetry_augment": bool(args.symmetry_augment),
+        # Record the *effective* event-history transform.  The raw CLI defaults
+        # to relabelling events, but that switch is semantically inert while
+        # symmetry augmentation itself is disabled.  Collapsing the two flags
+        # here gives old flag-off reports one unambiguous compatibility value
+        # (False), while every symmetry-on checkpoint attests whether its
+        # event/action history was transformed with the board.
+        "symmetry_augment_events": _effective_symmetry_augment_events(args),
         "data": str(args.data),
         "data_fingerprint": str(args.data_fingerprint),
         "data_format": args.data_format,
@@ -14212,6 +14219,12 @@ def _set_xdim_q_branch_trainable(model, trainable: bool) -> None:
             continue
         for param in layer.parameters():
             param.requires_grad = bool(trainable)
+
+
+def _effective_symmetry_augment_events(args: argparse.Namespace) -> bool:
+    """Return the event relabel setting that can affect learner outputs."""
+
+    return bool(args.symmetry_augment and args.symmetry_augment_events)
 
 
 def _freeze_authenticated_empty_event_encoder(model) -> dict[str, object]:

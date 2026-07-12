@@ -149,3 +149,22 @@ def test_cropped_entity_batch_skips_event_payload_and_refuses_live_mask(
     data["event_mask"][1, 5] = True
     with pytest.raises(RuntimeError, match="live event token"):
         train_bc._entity_batch(data, np.asarray([0, 1], dtype=np.int64))
+
+
+@pytest.mark.parametrize(
+    ("augment", "relabel_events", "expected"),
+    [
+        (False, False, False),
+        (False, True, False),
+        (True, False, False),
+        (True, True, True),
+    ],
+)
+def test_effective_symmetry_event_report_collapses_inert_flag(
+    augment: bool, relabel_events: bool, expected: bool
+) -> None:
+    args = SimpleNamespace(
+        symmetry_augment=augment,
+        symmetry_augment_events=relabel_events,
+    )
+    assert train_bc._effective_symmetry_augment_events(args) is expected

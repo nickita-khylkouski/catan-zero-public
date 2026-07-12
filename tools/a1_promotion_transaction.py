@@ -492,6 +492,53 @@ def _read_current_pointer(path: Path) -> str:
     return str(_absolute(nonempty[0], base=path.parent))
 
 
+def _verify_symmetry_training_provenance(
+    report: dict[str, Any], recipe: dict[str, Any], *, where: str
+) -> None:
+    """Bind learner D6 event semantics, with flag-off history compatibility.
+
+    Historical reports always recorded ``symmetry_augment`` but predate the
+    effective ``symmetry_augment_events`` field.  Missing event provenance is
+    harmless only when augmentation was off.  Once augmentation is enabled,
+    omitting either the recipe declaration or the report result would make two
+    different training operators indistinguishable at promotion time.
+    """
+
+    expected_augment = recipe.get("symmetry_augment")
+    actual_augment = report.get("symmetry_augment")
+    if expected_augment is False and actual_augment is None:
+        # The sealed historical production-L1 recipe was flag-off before the
+        # report carried either symmetry field.
+        actual_augment = False
+    if not isinstance(expected_augment, bool) or not isinstance(actual_augment, bool):
+        raise PromotionError(f"{where} has no boolean symmetry_augment binding")
+    if actual_augment is not expected_augment:
+        raise PromotionError(f"{where} symmetry_augment differs from its sealed recipe")
+
+    if actual_augment:
+        if not isinstance(recipe.get("symmetry_augment_events"), bool):
+            raise PromotionError(
+                f"{where} symmetry-on recipe omits symmetry_augment_events"
+            )
+        if not isinstance(report.get("symmetry_augment_events"), bool):
+            raise PromotionError(
+                f"{where} symmetry-on report omits symmetry_augment_events"
+            )
+        expected_events = bool(recipe["symmetry_augment_events"])
+        if bool(report["symmetry_augment_events"]) is not expected_events:
+            raise PromotionError(
+                f"{where} symmetry_augment_events differs from its sealed recipe"
+            )
+        return
+
+    # Backward compatibility is deliberately limited to flag-off reports.
+    # New reports emit the effective False value; old ones may omit the field.
+    if "symmetry_augment_events" in report and report["symmetry_augment_events"] is not False:
+        raise PromotionError(
+            f"{where} flag-off report has active symmetry_augment_events"
+        )
+
+
 def _verify_training_report(
     path: Path,
     *,
@@ -503,6 +550,14 @@ def _verify_training_report(
 ) -> dict[str, Any]:
     report = _load_json(path)
     if production_l1_completion:
+        recipe = contract.get("science", {}).get("learner_training_recipe")
+        if not isinstance(recipe, dict):
+            # Historical production-L1 manifests predate a nested learner
+            # recipe, but their verifier fixes the exact flag-off recipe below.
+            recipe = {"symmetry_augment": False}
+        _verify_symmetry_training_provenance(
+            report, recipe, where="production L1 report"
+        )
         required = {
             "arch": "entity_graph",
             "mask_hidden_info": True,
@@ -575,6 +630,9 @@ def _verify_training_report(
     else:
         recipe = contract["science"]["learner_training_recipe"]
         recipe_sha = contract["science"]["learner_training_recipe_sha256"]
+    _verify_symmetry_training_provenance(
+        report, recipe, where="candidate training report"
+    )
     required = {
         "a1_contract_sha256": contract_sha256,
         "a1_learner_training_recipe_sha256": recipe_sha,

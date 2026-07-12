@@ -35,6 +35,7 @@ def _contract(
         "world_size": 1,
         "optimizer": "adam",
         "mask_hidden_info": True,
+        "symmetry_augment": False,
         "epochs": 1,
         "max_steps": 0,
     }
@@ -317,6 +318,7 @@ def _fixture(
             ],
             "arch": "entity_graph",
             "mask_hidden_info": True,
+            "symmetry_augment": False,
             "track": "2p_no_trade",
             "vps_to_win": 10,
             "steps_completed": 7,
@@ -2724,6 +2726,47 @@ def test_every_third_confirmation_rejects_split_pair_seed_identity(
 
     with pytest.raises(promotion.PromotionError, match="different seeds"):
         _execute(fixture, go=False)
+
+
+def test_symmetry_event_provenance_requires_explicit_on_recipe_and_report() -> None:
+    recipe = {"symmetry_augment": True, "symmetry_augment_events": True}
+    report = {"symmetry_augment": True, "symmetry_augment_events": True}
+
+    promotion._verify_symmetry_training_provenance(  # noqa: SLF001
+        report, recipe, where="test report"
+    )
+    for missing_from in ("recipe", "report"):
+        bad_recipe = dict(recipe)
+        bad_report = dict(report)
+        (bad_recipe if missing_from == "recipe" else bad_report).pop(
+            "symmetry_augment_events"
+        )
+        with pytest.raises(promotion.PromotionError, match="omits"):
+            promotion._verify_symmetry_training_provenance(  # noqa: SLF001
+                bad_report, bad_recipe, where="test report"
+            )
+
+
+def test_symmetry_event_provenance_rejects_mismatch_and_limits_legacy_compat() -> None:
+    with pytest.raises(promotion.PromotionError, match="differs"):
+        promotion._verify_symmetry_training_provenance(  # noqa: SLF001
+            {"symmetry_augment": True, "symmetry_augment_events": False},
+            {"symmetry_augment": True, "symmetry_augment_events": True},
+            where="test report",
+        )
+
+    # Historical omission is accepted only when augmentation itself was off.
+    promotion._verify_symmetry_training_provenance(  # noqa: SLF001
+        {"symmetry_augment": False},
+        {"symmetry_augment": False},
+        where="historical report",
+    )
+    with pytest.raises(promotion.PromotionError, match="active"):
+        promotion._verify_symmetry_training_provenance(  # noqa: SLF001
+            {"symmetry_augment": False, "symmetry_augment_events": True},
+            {"symmetry_augment": False},
+            where="historical report",
+        )
 
 
 def test_exclusive_lock_refuses_a_second_writer(tmp_path: Path) -> None:
