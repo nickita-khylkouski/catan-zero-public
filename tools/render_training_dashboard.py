@@ -31,10 +31,10 @@ def main() -> None:
 
 def build_status(run_dir: Path, *, pid: int, target_games: int) -> dict[str, Any]:
     log_path = run_dir / "train.log"
-    log_lines = _read_lines(log_path)
-    teacher_progress = _parse_teacher_progress(log_lines)
-    bc_events = _parse_bc_events(log_lines)
-    bc_progress = _parse_bc_progress(log_lines)
+    log_objects = _parse_json_stream(log_path)
+    teacher_progress = _parse_teacher_progress(log_objects)
+    bc_events = _parse_bc_events(log_objects)
+    bc_progress = _parse_bc_progress(log_objects)
     manifest = _read_json(run_dir / "teacher_data" / "manifest.json")
     candidate_report = _read_json(run_dir / "candidate_strong_bc.json")
     xdim_report = _read_json(run_dir / "xdim_lite_strong_bc.json")
@@ -52,6 +52,7 @@ def build_status(run_dir: Path, *, pid: int, target_games: int) -> dict[str, Any
         xdim_scoreboard=xdim_scoreboard,
         process=process,
         training_progress=bool(bc_events),
+        generic_reports=generic_reports,
     )
     games = int(teacher_progress.get("games") or manifest.get("games") or 0)
     samples = int(teacher_progress.get("samples") or manifest.get("samples") or 0)
@@ -106,7 +107,7 @@ def write_outputs(run_dir: Path, status: dict[str, Any], *, refresh_seconds: int
     )
 
 
-def _parse_teacher_progress(lines: list[str]) -> dict[str, Any]:
+def _parse_teacher_progress(lines: list[Any]) -> dict[str, Any]:
     latest: dict[str, Any] = {}
     for line in lines:
         parsed = _parse_line_object(line)
@@ -115,7 +116,7 @@ def _parse_teacher_progress(lines: list[str]) -> dict[str, Any]:
     return latest
 
 
-def _parse_bc_progress(lines: list[str]) -> dict[str, dict[str, Any]]:
+def _parse_bc_progress(lines: list[Any]) -> dict[str, dict[str, Any]]:
     latest: dict[str, dict[str, Any]] = {}
     for line in lines:
         parsed = _parse_line_object(line)
@@ -131,7 +132,7 @@ def _parse_bc_progress(lines: list[str]) -> dict[str, dict[str, Any]]:
     return latest
 
 
-def _parse_bc_events(lines: list[str]) -> list[dict[str, Any]]:
+def _parse_bc_events(lines: list[Any]) -> list[dict[str, Any]]:
     events: list[dict[str, Any]] = []
     for line in lines:
         parsed = _parse_line_object(line)
@@ -141,6 +142,8 @@ def _parse_bc_events(lines: list[str]) -> list[dict[str, Any]]:
 
 
 def _parse_line_object(line: str) -> Any:
+    if isinstance(line, (dict, list)):
+        return line
     line = line.strip()
     if not line or not line.startswith(("{", "[")):
         return None
@@ -151,6 +154,29 @@ def _parse_line_object(line: str) -> Any:
             return ast.literal_eval(line)
         except Exception:
             return None
+
+
+def _parse_json_stream(path: Path) -> list[Any]:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return []
+    decoder = json.JSONDecoder()
+    values: list[Any] = []
+    offset = 0
+    while offset < len(text):
+        while offset < len(text) and text[offset].isspace():
+            offset += 1
+        if offset == len(text):
+            break
+        try:
+            value, offset = decoder.raw_decode(text, offset)
+        except json.JSONDecodeError:
+            # A writer may be appending the final object. Preserve every
+            # complete event already decoded and retry on the next refresh.
+            break
+        values.append(value)
+    return values
 
 
 def _bc_summary(report: dict[str, Any]) -> dict[str, Any]:
@@ -184,6 +210,8 @@ def _scoreboard_summary(report: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _phase(**values: Any) -> str:
+    if values.get("generic_reports"):
+        return "complete"
     if values["xdim_scoreboard"]:
         return "complete"
     if values["candidate_scoreboard"] and values["xdim_report"]:
@@ -282,6 +310,8 @@ def _generic_reports(run_dir: Path) -> list[dict[str, Any]]:
         if not isinstance(data, dict):
             continue
         metrics = data.get("metrics") or []
+        if not isinstance(metrics, list) or not metrics:
+            continue
         last = metrics[-1] if metrics else {}
         output.append(
             {
