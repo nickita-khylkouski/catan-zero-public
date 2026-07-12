@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 from copy import deepcopy
+import hashlib
+import json
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +32,13 @@ def main() -> None:
             "in the path, e.g. runs/self_play/blend_a{alpha}.pt."
         ),
     )
+    parser.add_argument(
+        "--receipt",
+        help=(
+            "Optional new JSON receipt binding both source checkpoints, the "
+            "tensor schema, interpolation formula, and every output digest."
+        ),
+    )
     args = parser.parse_args()
 
     outputs = interpolate_checkpoints(
@@ -38,6 +47,14 @@ def main() -> None:
         alphas=tuple(args.alpha),
         output_template=args.output,
     )
+    if args.receipt:
+        write_interpolation_receipt(
+            base=Path(args.base),
+            candidate=Path(args.candidate),
+            alphas=tuple(args.alpha),
+            outputs=outputs,
+            receipt=Path(args.receipt),
+        )
     for output in outputs:
         print(output)
 
@@ -72,6 +89,51 @@ def interpolate_checkpoints(
     return outputs
 
 
+def write_interpolation_receipt(
+    *,
+    base: Path,
+    candidate: Path,
+    alphas: tuple[float, ...],
+    outputs: list[Path],
+    receipt: Path,
+) -> dict[str, Any]:
+    """Write an authenticated, diagnostic-only interpolation receipt."""
+    if len(alphas) != len(outputs):
+        raise ValueError("alphas and outputs must have the same length")
+    base = base.expanduser().resolve(strict=True)
+    candidate = candidate.expanduser().resolve(strict=True)
+    resolved_outputs = [path.expanduser().resolve(strict=True) for path in outputs]
+    receipt = receipt.expanduser().resolve()
+    if receipt.exists():
+        raise FileExistsError(f"refusing existing receipt: {receipt}")
+
+    base_data = _load_checkpoint(base)
+    candidate_data = _load_checkpoint(candidate)
+    _assert_compatible(base_data, candidate_data)
+    schema = _tensor_schema(base_data)
+    value: dict[str, Any] = {
+        "schema_version": "checkpoint-interpolation-receipt-v1",
+        "diagnostic_only": True,
+        "promotion_eligible": False,
+        "formula": "output=(1-alpha)*base+alpha*candidate",
+        "non_floating_source": "base",
+        "output_metadata_source": "base",
+        "candidate_only_metadata_ignored": sorted(set(candidate_data) - set(base_data)),
+        "base": {"path": str(base), "sha256": _sha256(base)},
+        "candidate": {"path": str(candidate), "sha256": _sha256(candidate)},
+        "tensor_schema": schema,
+        "tensor_schema_sha256": _json_sha256(schema),
+        "outputs": [
+            {"alpha": alpha, "path": str(path), "sha256": _sha256(path)}
+            for alpha, path in zip(alphas, resolved_outputs, strict=True)
+        ],
+    }
+    value["receipt_sha256"] = _json_sha256(value)
+    receipt.parent.mkdir(parents=True, exist_ok=True)
+    receipt.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return value
+
+
 def _load_checkpoint(path: Path) -> dict[str, Any]:
     import torch
 
@@ -99,36 +161,33 @@ def _assert_compatible(base: dict[str, Any], candidate: dict[str, Any]) -> None:
                 f"incompatible checkpoint metadata for {key}: "
                 f"{base.get(key)!r} != {candidate.get(key)!r}"
             )
-    if set(base) != set(candidate):
-        raise ValueError("checkpoint key sets differ")
-    _assert_same_tensor_structure(base, candidate, path="checkpoint")
+    base_schema = _tensor_schema(base)
+    candidate_schema = _tensor_schema(candidate)
+    if base_schema != candidate_schema:
+        raise ValueError("checkpoint tensor key/schema sets differ")
+    if not _mapping_contains(base, candidate):
+        raise ValueError("candidate checkpoint is missing base metadata keys")
+    # Newer trainers may append diagnostic metadata (for example the sealed
+    # value-training receipt) without changing the deployable model schema.
+    # Outputs intentionally retain the base metadata and interpolate only the
+    # exactly matching base tensor tree.
+    # Non-tensor training metadata may legitimately differ.  The structural
+    # inference fields above and the complete tensor path/shape/dtype schema
+    # are the deployable compatibility boundary.
 
 
-def _assert_same_tensor_structure(left: Any, right: Any, *, path: str) -> None:
-    import torch
-
-    if isinstance(left, dict):
-        if not isinstance(right, dict) or set(left) != set(right):
-            raise ValueError(f"structure mismatch at {path}")
-        for key in left:
-            _assert_same_tensor_structure(left[key], right[key], path=f"{path}.{key}")
-        return
-    if isinstance(left, (list, tuple)):
-        if not isinstance(right, type(left)) or len(left) != len(right):
-            raise ValueError(f"sequence mismatch at {path}")
-        for idx, (left_item, right_item) in enumerate(zip(left, right, strict=True)):
-            _assert_same_tensor_structure(left_item, right_item, path=f"{path}[{idx}]")
-        return
-    if torch.is_tensor(left):
-        if not torch.is_tensor(right):
-            raise ValueError(f"tensor/type mismatch at {path}")
-        if left.shape != right.shape:
-            raise ValueError(f"tensor shape mismatch at {path}")
-        if left.dtype != right.dtype:
-            raise ValueError(f"tensor dtype mismatch at {path}")
-        return
-    if left != right:
-        raise ValueError(f"non-tensor value mismatch at {path}: {left!r} != {right!r}")
+def _mapping_contains(base: Any, candidate: Any) -> bool:
+    if isinstance(base, dict):
+        return isinstance(candidate, dict) and all(
+            key in candidate and _mapping_contains(item, candidate[key])
+            for key, item in base.items()
+        )
+    if isinstance(base, (list, tuple)):
+        return isinstance(candidate, type(base)) and len(candidate) >= len(base) and all(
+            _mapping_contains(left, right)
+            for left, right in zip(base, candidate)
+        )
+    return True
 
 
 def _blend_value(base: Any, candidate: Any, alpha: float) -> Any:
@@ -145,6 +204,41 @@ def _blend_value(base: Any, candidate: Any, alpha: float) -> Any:
             return (base * (1.0 - alpha)) + (candidate * alpha)
         return deepcopy(base)
     return deepcopy(base)
+
+
+def _tensor_schema(value: Any, *, path: str = "checkpoint") -> list[dict[str, Any]]:
+    import torch
+
+    rows: list[dict[str, Any]] = []
+    if isinstance(value, dict):
+        for key in sorted(value):
+            rows.extend(_tensor_schema(value[key], path=f"{path}.{key}"))
+    elif isinstance(value, (list, tuple)):
+        for index, item in enumerate(value):
+            rows.extend(_tensor_schema(item, path=f"{path}[{index}]"))
+    elif torch.is_tensor(value):
+        rows.append(
+            {
+                "path": path,
+                "shape": list(value.shape),
+                "dtype": str(value.dtype),
+                "floating": bool(torch.is_floating_point(value)),
+            }
+        )
+    return rows
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return "sha256:" + digest.hexdigest()
+
+
+def _json_sha256(value: Any) -> str:
+    payload = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+    return "sha256:" + hashlib.sha256(payload).hexdigest()
 
 
 def _format_alpha(alpha: float) -> str:

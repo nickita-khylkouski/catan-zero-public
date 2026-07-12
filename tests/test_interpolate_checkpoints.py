@@ -5,7 +5,10 @@ from pathlib import Path
 import pytest
 import torch
 
-from tools.interpolate_checkpoints import interpolate_checkpoints
+from tools.interpolate_checkpoints import (
+    interpolate_checkpoints,
+    write_interpolation_receipt,
+)
 
 
 def _write_checkpoint(path: Path, *, bias: float, hidden_size: int = 2) -> None:
@@ -28,9 +31,16 @@ def _write_checkpoint(path: Path, *, bias: float, hidden_size: int = 2) -> None:
             "action_encoder": {"0.weight": torch.full((2, 3), bias)},
             "action_id_embedding": {"weight": torch.full((4, 2), bias)},
             "action_bias": {"weight": torch.full((1, 3), bias)},
+            "step": torch.tensor(7, dtype=torch.int64),
         },
         path,
     )
+
+
+def _append_metadata(path: Path) -> None:
+    value = torch.load(path, map_location="cpu", weights_only=False)
+    value["value_training"] = {"trained_value_readouts": ["scalar"]}
+    torch.save(value, path)
 
 
 def test_interpolate_checkpoints_writes_multiple_alpha_outputs(tmp_path: Path) -> None:
@@ -38,6 +48,7 @@ def test_interpolate_checkpoints_writes_multiple_alpha_outputs(tmp_path: Path) -
     candidate = tmp_path / "candidate.pt"
     _write_checkpoint(base, bias=0.0)
     _write_checkpoint(candidate, bias=1.0)
+    _append_metadata(candidate)
 
     outputs = interpolate_checkpoints(
         base=base,
@@ -52,6 +63,28 @@ def test_interpolate_checkpoints_writes_multiple_alpha_outputs(tmp_path: Path) -
     assert torch.allclose(first["model"]["0.weight"], torch.full((2, 3), 0.1))
     assert torch.allclose(second["action_bias"]["weight"], torch.full((1, 3), 0.25))
     assert first["hidden_size"] == 2
+    assert first["step"].item() == 7
+
+    receipt = tmp_path / "interpolation.receipt.json"
+    value = write_interpolation_receipt(
+        base=base,
+        candidate=candidate,
+        alphas=(0.1, 0.25),
+        outputs=outputs,
+        receipt=receipt,
+    )
+    assert receipt.is_file()
+    assert value["diagnostic_only"] is True
+    assert value["promotion_eligible"] is False
+    assert value["non_floating_source"] == "base"
+    assert value["output_metadata_source"] == "base"
+    assert value["candidate_only_metadata_ignored"] == ["value_training"]
+    assert [row["alpha"] for row in value["outputs"]] == [0.1, 0.25]
+    assert all(row["sha256"].startswith("sha256:") for row in value["outputs"])
+    assert any(
+        row["path"] == "checkpoint.step" and row["floating"] is False
+        for row in value["tensor_schema"]
+    )
 
 
 def test_interpolate_checkpoints_rejects_incompatible_metadata(tmp_path: Path) -> None:
