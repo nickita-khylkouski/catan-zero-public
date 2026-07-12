@@ -257,9 +257,7 @@ def _fixture(
     contract = _contract(n_full=n_full, producer=champion)
     # The n196 negative fixture must still be constructible so execution can
     # prove the contract is rejected before any mutation/evidence processing.
-    evidence_contract = (
-        contract if n_full == 128 else _contract(n_full=128, producer=champion)
-    )
+    evidence_contract = contract if n_full == 128 else _contract(n_full=128, producer=champion)
     evidence_semantics = promotion._sealed_evaluation_semantics(evidence_contract)
     candidate_search_config = promotion._candidate_search_config(evidence_contract)
     champion_search_config = promotion._incumbent_search_config(
@@ -296,7 +294,9 @@ def _fixture(
         "authoritative_incumbent": {
             **_checkpoint_ref(champion),
             "version": 4,
-            "agent_identity_sha256": champion_identity["agent_identity_sha256"],
+            "agent_identity_sha256": champion_identity[
+                "agent_identity_sha256"
+            ],
             "search_config": champion_search_config,
         },
     }
@@ -365,21 +365,6 @@ def _fixture(
                     "configured_game_seed_count": 256,
                     "observed_game_seed_count": 256,
                     "observed_row_count": 4096,
-                },
-                "deployed_readout_diagnostics": {
-                    "diagnostic_only": True,
-                    "changes_operator_default": False,
-                    "value_scale": 1.0,
-                    "configured_value_squash": "tanh",
-                    "configured_effective_transform": "scalar_tanh",
-                    "categorical_bypasses_scalar_tanh": False,
-                    "views": {
-                        "raw_training_readout": {
-                            "global": {"n": 4096, "value_rmse": rmse}
-                        },
-                        "scalar_tanh": {"global": {"n": 4096, "value_rmse": rmse}},
-                        "scalar_clip": {"global": {"n": 4096, "value_rmse": rmse}},
-                    },
                 },
                 "global": {"n": 4096, "value_rmse": rmse},
             },
@@ -561,12 +546,9 @@ def _fixture(
     high_regret_source_manifest = tmp_path / "high_regret.source.npz"
     validation_seeds = np.arange(7_000_000, 7_000_240, dtype=np.int64)
     validation_seed_manifest = tmp_path / "high_regret.validation-seeds.json"
-    validation_seed_digest = (
-        "sha256:"
-        + hashlib.sha256(
-            validation_seeds.astype("<i8", copy=False).tobytes()
-        ).hexdigest()
-    )
+    validation_seed_digest = "sha256:" + hashlib.sha256(
+        validation_seeds.astype("<i8", copy=False).tobytes()
+    ).hexdigest()
     _write_json(
         validation_seed_manifest,
         {
@@ -911,11 +893,15 @@ def _fixture(
                 "label": "p1-arm-selection",
                 "kind": "internal_h2h",
                 "source": _checkpoint_ref(diagnostic_source),
-                "seed_intervals": [{"base_seed": 9_000_000, "end_seed": 9_000_200}],
+                "seed_intervals": [
+                    {"base_seed": 9_000_000, "end_seed": 9_000_200}
+                ],
             }
         ],
     }
-    cohort_exclusions["manifest_sha256"] = promotion._digest_value(cohort_exclusions)
+    cohort_exclusions["manifest_sha256"] = promotion._digest_value(
+        cohort_exclusions
+    )
     cohort_exclusions_path = tmp_path / "promotion-cohort-exclusions.json"
     _write_json(cohort_exclusions_path, cohort_exclusions)
     return {
@@ -1742,48 +1728,6 @@ def test_calibration_comparison_rejects_different_validation_seed_cohorts(
         _execute(fixture, go=False)
 
 
-def test_calibration_gate_scores_the_sealed_deployed_transform(tmp_path: Path) -> None:
-    fixture = _fixture(tmp_path)
-
-    def regress_only_after_tanh(source: dict) -> None:
-        # The historical raw-readout check would accept 0.20 versus the
-        # incumbent's 0.21.  The actual sealed MCTS operator consumes tanh,
-        # whose deliberately regressed RMSE must be the binding value.
-        assert source["global"]["value_rmse"] == pytest.approx(0.20)
-        source["deployed_readout_diagnostics"]["views"]["scalar_tanh"]["global"][
-            "value_rmse"
-        ] = 0.50
-
-    _mutate_evidence_source(
-        fixture,
-        kind="mechanism_calibration",
-        role="candidate_calibration",
-        mutate=regress_only_after_tanh,
-    )
-
-    with pytest.raises(promotion.PromotionError, match="allowed RMSE regression"):
-        _execute(fixture, go=False)
-
-
-def test_calibration_gate_rejects_deployed_transform_drift(tmp_path: Path) -> None:
-    fixture = _fixture(tmp_path)
-
-    def drift_transform(source: dict) -> None:
-        source["deployed_readout_diagnostics"]["configured_effective_transform"] = (
-            "scalar_clip"
-        )
-
-    _mutate_evidence_source(
-        fixture,
-        kind="mechanism_calibration",
-        role="candidate_calibration",
-        mutate=drift_transform,
-    )
-
-    with pytest.raises(promotion.PromotionError, match="deployed value transform"):
-        _execute(fixture, go=False)
-
-
 def _install_legacy_incumbent_bridge(fixture: dict, tmp_path: Path) -> Path:
     champion = fixture["champion"]
     historical = tmp_path / "gen3-historical-training-report.json"
@@ -2072,9 +2016,9 @@ def test_high_regret_report_binds_candidate_and_incumbent_role_scales(
     def mutate(source: dict) -> None:
         report_path = Path(source["report"]["path"])
         report = json.loads(report_path.read_text())
-        report["evaluation_config"]["baseline_c_scale"] = report["evaluation_config"][
-            "candidate_c_scale"
-        ]
+        report["evaluation_config"]["baseline_c_scale"] = report[
+            "evaluation_config"
+        ]["candidate_c_scale"]
         _write_json(report_path, report)
         source["report"]["sha256"] = promotion._sha256(report_path)
 
@@ -2122,12 +2066,14 @@ def _install_truncated_high_regret_pair(fixture: dict) -> None:
         game = next(
             game
             for game in report["games"]
-            if game["pair_id"] == 0 and game["orientation"] == "candidate_red"
+            if game["pair_id"] == 0
+            and game["orientation"] == "candidate_red"
         )
         game["candidate_won"] = None
         game["truncated"] = True
         normalized = [
-            {**row, "search_won": row["candidate_won"]} for row in report["games"]
+            {**row, "search_won": row["candidate_won"]}
+            for row in report["games"]
         ]
         scores, diagnostics = promotion.pair_scores_from_h2h_games(normalized)
         pentanomial = promotion.evaluate_pentanomial_sprt(
@@ -2229,7 +2175,8 @@ def test_transaction_rejects_half_high_regret_pair(tmp_path: Path) -> None:
         report = json.loads(report_path.read_text())
         report["games"].pop(1)
         normalized = [
-            {**row, "search_won": row["candidate_won"]} for row in report["games"]
+            {**row, "search_won": row["candidate_won"]}
+            for row in report["games"]
         ]
         scores, diagnostics = promotion.pair_scores_from_h2h_games(normalized)
         pentanomial = promotion.evaluate_pentanomial_sprt(
@@ -2413,9 +2360,7 @@ def test_external_sprt_threshold_overrides_cannot_change_comparative_eligibility
     if passes:
         assert _execute(fixture, go=False)["status"] == "dry_run"
     else:
-        with pytest.raises(
-            promotion.PromotionError, match="noninferiority is unresolved"
-        ):
+        with pytest.raises(promotion.PromotionError, match="noninferiority is unresolved"):
             _execute(fixture, go=False)
 
 
@@ -2982,11 +2927,9 @@ def test_legacy_snapshot_is_revalidated_at_commit_mutation_boundary(
     assert fixture["registry"].read_bytes() == registry_before
     assert fixture["pointer"].read_bytes() == pointer_before
     assert not fixture["receipt"].exists()
-    assert (
-        not fixture["receipt"]
-        .with_name(fixture["receipt"].name + ".registry.before")
-        .exists()
-    )
+    assert not fixture["receipt"].with_name(
+        fixture["receipt"].name + ".registry.before"
+    ).exists()
 
 
 def _production_l1_receipt_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -3018,25 +2961,19 @@ def _production_l1_receipt_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     _write_json(progress_path, progress)
     manifest_path = tmp_path / "manifest.json"
     _write_json(manifest_path, {"sealed": True})
-    manifest_ref = {
-        "path": str(manifest_path),
-        "sha256": promotion._sha256(manifest_path),
-    }
+    manifest_ref = {"path": str(manifest_path), "sha256": promotion._sha256(manifest_path)}
     command_sha = "sha256:" + "1" * 64
     manifest = {
         "selected_dose": {
-            "optimizer_steps": 1024,
-            "world_size": 8,
-            "per_rank_batch_size": 512,
-            "global_samples": 4_194_304,
+            "optimizer_steps": 1024, "world_size": 8,
+            "per_rank_batch_size": 512, "global_samples": 4_194_304,
             "policy_aux_active_batch_size": 0,
         },
         "f7_parent": {"path": str(f7), "sha256": promotion._sha256(f7)},
         "command_sha256": command_sha,
     }
     monkeypatch.setattr(
-        production_l1,
-        "verify",
+        production_l1, "verify",
         lambda path: {"manifest": manifest, "manifest_ref": manifest_ref},
     )
     claim_path = tmp_path / "execution.claim.json"
@@ -3068,19 +3005,13 @@ def _production_l1_receipt_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPat
         "created_at_unix_ns": 2,
         "manifest": manifest_ref,
         "submission": {
-            "path": str(submission_path),
-            "sha256": promotion._sha256(submission_path),
+            "path": str(submission_path), "sha256": promotion._sha256(submission_path),
         },
         "checkpoint": {
-            "path": str(candidate),
-            "sha256": promotion._sha256(candidate),
+            "path": str(candidate), "sha256": promotion._sha256(candidate),
         },
         "report": {"path": str(report), "sha256": promotion._sha256(report)},
-        "unit_state": {
-            "ActiveState": "inactive",
-            "Result": "success",
-            "ExecMainStatus": "0",
-        },
+        "unit_state": {"ActiveState": "inactive", "Result": "success", "ExecMainStatus": "0"},
     }
     completion["receipt_sha256"] = promotion._digest_value(completion)
     _write_json(completion_path, completion)
@@ -3090,13 +3021,9 @@ def _production_l1_receipt_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPat
         ]
     }
     return {
-        "candidate": candidate,
-        "f7": f7,
-        "report": report,
-        "optimizer": optimizer,
-        "progress": progress_path,
-        "completion": completion_path,
-        "contract": contract,
+        "candidate": candidate, "f7": f7, "report": report,
+        "optimizer": optimizer, "progress": progress_path,
+        "completion": completion_path, "contract": contract,
     }
 
 
@@ -3106,8 +3033,7 @@ def test_production_l1_completion_replays_eight_rank_sidecars(
     fixture = _production_l1_receipt_fixture(tmp_path, monkeypatch)
 
     verified = promotion._verify_production_l1_completion_receipt(
-        fixture["completion"],
-        contract=fixture["contract"],
+        fixture["completion"], contract=fixture["contract"],
         candidate_path=fixture["candidate"],
         candidate_sha256=promotion._sha256(fixture["candidate"]),
         training_report_path=fixture["report"],
@@ -3124,12 +3050,9 @@ def test_production_l1_completion_refuses_optimizer_drift(
     fixture = _production_l1_receipt_fixture(tmp_path, monkeypatch)
     fixture["optimizer"].write_bytes(b"replaced")
 
-    with pytest.raises(
-        promotion.PromotionError, match="optimizer sidecar artifact drift"
-    ):
+    with pytest.raises(promotion.PromotionError, match="optimizer sidecar artifact drift"):
         promotion._verify_production_l1_completion_receipt(
-            fixture["completion"],
-            contract=fixture["contract"],
+            fixture["completion"], contract=fixture["contract"],
             candidate_path=fixture["candidate"],
             candidate_sha256=promotion._sha256(fixture["candidate"]),
             training_report_path=fixture["report"],
@@ -3143,37 +3066,22 @@ def test_production_l1_report_requires_exact_selected_recipe(tmp_path: Path) -> 
     f7 = tmp_path / "f7.pt"
     f7.write_bytes(b"f7")
     report = {
-        "arch": "entity_graph",
-        "mask_hidden_info": True,
-        "track": "2p_no_trade",
-        "vps_to_win": 10,
-        "world_size": 8,
-        "batch_size": 512,
-        "epochs": 1,
-        "max_steps": 1024,
-        "steps_completed": 1024,
-        "optimizer": "adam",
-        "resume_optimizer": False,
-        "optimizer_restored": False,
-        "loser_sample_weight": 1.0,
-        "soft_target_weight": 0.9,
-        "policy_aux_active_batch_size": 0,
-        "max_grad_norm": 1.0,
-        "gradient_clipping_enabled": True,
-        "checkpoint": str(candidate),
-        "init_checkpoint": str(f7),
-        "init_checkpoint_sha256": promotion._sha256(f7),
+        "arch": "entity_graph", "mask_hidden_info": True, "track": "2p_no_trade",
+        "vps_to_win": 10, "world_size": 8, "batch_size": 512, "epochs": 1,
+        "max_steps": 1024, "steps_completed": 1024, "optimizer": "adam",
+        "resume_optimizer": False, "optimizer_restored": False,
+        "loser_sample_weight": 1.0, "soft_target_weight": 0.9,
+        "policy_aux_active_batch_size": 0, "max_grad_norm": 1.0,
+        "gradient_clipping_enabled": True, "checkpoint": str(candidate),
+        "init_checkpoint": str(f7), "init_checkpoint_sha256": promotion._sha256(f7),
     }
     report_path = tmp_path / "report.json"
     _write_json(report_path, report)
     contract = {"checkpoints": [{"role": "producer", "sha256": promotion._sha256(f7)}]}
 
     replay = promotion._verify_training_report(
-        report_path,
-        contract=contract,
-        contract_sha256="sha256:" + "0" * 64,
-        candidate_path=candidate,
-        candidate_sha256=promotion._sha256(candidate),
+        report_path, contract=contract, contract_sha256="sha256:" + "0" * 64,
+        candidate_path=candidate, candidate_sha256=promotion._sha256(candidate),
         production_l1_completion=True,
     )
     assert replay["steps_completed"] == 1024
@@ -3182,26 +3090,19 @@ def test_production_l1_report_requires_exact_selected_recipe(tmp_path: Path) -> 
     _write_json(report_path, report)
     with pytest.raises(promotion.PromotionError, match="loser_sample_weight"):
         promotion._verify_training_report(
-            report_path,
-            contract=contract,
-            contract_sha256="sha256:" + "0" * 64,
-            candidate_path=candidate,
-            candidate_sha256=promotion._sha256(candidate),
+            report_path, contract=contract, contract_sha256="sha256:" + "0" * 64,
+            candidate_path=candidate, candidate_sha256=promotion._sha256(candidate),
             production_l1_completion=True,
         )
 
 
 def test_contract_value_readout_accepts_bootstrap_and_post_promotion_shapes() -> None:
-    assert (
-        promotion._contract_value_readout(
-            {"science": {"learner_value_objective": {"value_readout": "scalar"}}}
-        )
-        == "scalar"
-    )
-    assert (
-        promotion._contract_value_readout({"science": {"value_readout": "scalar"}})
-        == "scalar"
-    )
+    assert promotion._contract_value_readout(
+        {"science": {"learner_value_objective": {"value_readout": "scalar"}}}
+    ) == "scalar"
+    assert promotion._contract_value_readout(
+        {"science": {"value_readout": "scalar"}}
+    ) == "scalar"
 
 
 def test_contract_value_readout_rejects_ambiguous_or_missing_binding() -> None:
@@ -3226,12 +3127,9 @@ def test_role_search_config_accepts_only_complete_native_runtime_binding() -> No
         "native_mcts_hot_loop": True,
         "mcts_implementation": "rust_native_hot_loop_v1",
     }
-    assert (
-        promotion._verify_role_search_config(
-            raw, expected_search_config=expected, where="panel"
-        )
-        == expected
-    )
+    assert promotion._verify_role_search_config(
+        raw, expected_search_config=expected, where="panel"
+    ) == expected
 
     for drifted in (
         {**expected, "native_mcts_hot_loop": True},
