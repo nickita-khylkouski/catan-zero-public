@@ -337,9 +337,7 @@ def _validate_file_ref(
 def _fsync_dir(path: Path) -> None:
     descriptor = os.open(
         path,
-        os.O_RDONLY
-        | getattr(os, "O_DIRECTORY", 0)
-        | getattr(os, "O_NOFOLLOW", 0),
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
     )
     try:
         os.fsync(descriptor)
@@ -371,10 +369,7 @@ def _write_new_bytes(path: Path, data: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor = os.open(
         path,
-        os.O_WRONLY
-        | os.O_CREAT
-        | os.O_EXCL
-        | getattr(os, "O_NOFOLLOW", 0),
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
         0o600,
     )
     try:
@@ -406,18 +401,18 @@ def _exclusive_lock(path: Path) -> Iterator[None]:
     if inherited is not None:
         opened_dev, opened_ino, depth = inherited
         named = absolute_path.stat(follow_symlinks=False)
-        if (
-            not stat.S_ISREG(named.st_mode)
-            or (named.st_dev, named.st_ino) != (opened_dev, opened_ino)
+        if not stat.S_ISREG(named.st_mode) or (named.st_dev, named.st_ino) != (
+            opened_dev,
+            opened_ino,
         ):
             raise PromotionError(f"promotion lock identity drifted: {absolute_path}")
         held[key] = (opened_dev, opened_ino, depth + 1)
         try:
             yield
             named = absolute_path.stat(follow_symlinks=False)
-            if (
-                not stat.S_ISREG(named.st_mode)
-                or (named.st_dev, named.st_ino) != (opened_dev, opened_ino)
+            if not stat.S_ISREG(named.st_mode) or (named.st_dev, named.st_ino) != (
+                opened_dev,
+                opened_ino,
             ):
                 raise PromotionError(
                     f"promotion lock identity drifted: {absolute_path}"
@@ -438,17 +433,12 @@ def _exclusive_lock(path: Path) -> Iterator[None]:
     try:
         descriptor = os.open(
             path,
-            os.O_RDWR
-            | os.O_CREAT
-            | os.O_EXCL
-            | getattr(os, "O_NOFOLLOW", 0),
+            os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
             0o600,
         )
         created = True
     except FileExistsError:
-        descriptor = os.open(
-            path, os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
-        )
+        descriptor = os.open(path, os.O_RDWR | getattr(os, "O_NOFOLLOW", 0))
     try:
         opened = os.fstat(descriptor)
         if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1:
@@ -464,9 +454,9 @@ def _exclusive_lock(path: Path) -> Iterator[None]:
         registered = True
         yield
         named = path.stat(follow_symlinks=False)
-        if (
-            not stat.S_ISREG(named.st_mode)
-            or (named.st_dev, named.st_ino) != (opened.st_dev, opened.st_ino)
+        if not stat.S_ISREG(named.st_mode) or (named.st_dev, named.st_ino) != (
+            opened.st_dev,
+            opened.st_ino,
         ):
             raise PromotionError(f"promotion lock identity drifted: {path}")
     finally:
@@ -528,16 +518,22 @@ def _verify_training_report(
                     f"{report.get(key)!r} != {expected!r}"
                 )
         report_checkpoint = _absolute(report.get("checkpoint"), base=path.parent)
-        if report_checkpoint != candidate_path or _sha256(report_checkpoint) != candidate_sha256:
+        if (
+            report_checkpoint != candidate_path
+            or _sha256(report_checkpoint) != candidate_sha256
+        ):
             raise PromotionError("production L1 report candidate bytes drifted")
         producers = [
-            record for record in contract.get("checkpoints", [])
+            record
+            for record in contract.get("checkpoints", [])
             if isinstance(record, dict) and record.get("role") == "producer"
         ]
-        if len(producers) != 1 or report.get("init_checkpoint_sha256") != producers[0].get(
-            "sha256"
-        ):
-            raise PromotionError("production L1 report parent differs from contract producer")
+        if len(producers) != 1 or report.get("init_checkpoint_sha256") != producers[
+            0
+        ].get("sha256"):
+            raise PromotionError(
+                "production L1 report parent differs from contract producer"
+            )
         init_path = _canonical_existing_file(
             Path(str(report.get("init_checkpoint"))), where="production L1 parent"
         )
@@ -655,10 +651,9 @@ def _verify_training_report(
             Path(str(curriculum_parent["receipt_path"])),
             where="curriculum parent receipt",
         )
-        if (
-            _sha256(parent_path) != init_sha
-            or _sha256(parent_receipt) != curriculum_parent.get("receipt_sha256")
-        ):
+        if _sha256(parent_path) != init_sha or _sha256(
+            parent_receipt
+        ) != curriculum_parent.get("receipt_sha256"):
             raise PromotionError("curriculum parent checkpoint/receipt bytes drifted")
     steps = report.get("steps_completed")
     epochs = report.get("epochs")
@@ -715,13 +710,17 @@ def _verify_one_dose_training_receipt(
         try:
             value = dual_train.verify_receipt(path)
         except dual_train.DualTrainError as error:
-            raise PromotionError(f"dual-arm training receipt refused: {error}") from error
+            raise PromotionError(
+                f"dual-arm training receipt refused: {error}"
+            ) from error
         if value.get("contract_sha256") != contract.get("contract_sha256"):
             raise PromotionError("dual-arm receipt binds a different contract")
         outputs = value.get("outputs")
         inputs = value.get("inputs")
         if not isinstance(outputs, dict) or not isinstance(inputs, dict):
-            raise PromotionError("dual-arm receipt input/output provenance is malformed")
+            raise PromotionError(
+                "dual-arm receipt input/output provenance is malformed"
+            )
         learner_lock_input = inputs.get("learner_lock")
         corpus_meta_input = inputs.get("corpus_meta")
         validation_input = inputs.get("validation")
@@ -753,8 +752,7 @@ def _verify_one_dose_training_receipt(
         report_ref = outputs.get("report")
         optimizer_ref = outputs.get("optimizer")
         if (
-            checkpoint_ref
-            != {"path": str(candidate_path), "sha256": candidate_sha256}
+            checkpoint_ref != {"path": str(candidate_path), "sha256": candidate_sha256}
             or report_ref
             != {"path": str(training_report_path), "sha256": training_report_sha256}
             or not isinstance(optimizer_ref, dict)
@@ -821,7 +819,9 @@ def _verify_one_dose_training_receipt(
             or learner_lock.get("objective")
             != report.get("a1_bound_learner_value_objective")
         ):
-            raise PromotionError("dual learner lock does not authorize candidate report")
+            raise PromotionError(
+                "dual learner lock does not authorize candidate report"
+            )
         return {
             "path": str(path),
             "sha256": _sha256(path),
@@ -838,9 +838,7 @@ def _verify_one_dose_training_receipt(
             or contract_lock != legacy_snapshot.contract_lock.path
         ):
             raise PromotionError("legacy snapshot paths differ from dose verification")
-        value = _verify_receipt_digest(
-            dict(legacy_snapshot.training_receipt.value)
-        )
+        value = _verify_receipt_digest(dict(legacy_snapshot.training_receipt.value))
     expected_keys = {
         "schema_version",
         "status",
@@ -1129,11 +1127,20 @@ def _verify_production_l1_completion_receipt(
 
     value = _load_json(path)
     expected = {
-        "schema_version", "diagnostic_only", "production_eligible",
-        "created_at_unix_ns", "manifest", "submission", "checkpoint",
-        "report", "unit_state", "receipt_sha256",
+        "schema_version",
+        "diagnostic_only",
+        "production_eligible",
+        "created_at_unix_ns",
+        "manifest",
+        "submission",
+        "checkpoint",
+        "report",
+        "unit_state",
+        "receipt_sha256",
     }
-    value = _require_exact_keys(value, expected, where="production L1 completion receipt")
+    value = _require_exact_keys(
+        value, expected, where="production L1 completion receipt"
+    )
     unhashed = dict(value)
     stated = unhashed.pop("receipt_sha256")
     if stated != _digest_value(unhashed):
@@ -1152,7 +1159,9 @@ def _verify_production_l1_completion_receipt(
     try:
         verified_manifest = production_l1.verify(manifest_path)
     except (production_l1.L1Error, OSError, KeyError, ValueError) as error:
-        raise PromotionError(f"production L1 manifest replay refused: {error}") from error
+        raise PromotionError(
+            f"production L1 manifest replay refused: {error}"
+        ) from error
     manifest = verified_manifest["manifest"]
     selected = manifest.get("selected_dose")
     if not isinstance(selected, dict) or {
@@ -1181,7 +1190,9 @@ def _verify_production_l1_completion_receipt(
         or report_path != training_report_path
         or report_ref["sha256"] != training_report_sha256
     ):
-        raise PromotionError("production L1 completion outputs differ from adjudication")
+        raise PromotionError(
+            "production L1 completion outputs differ from adjudication"
+        )
     submission_path, submission_ref = _validate_file_ref(
         value["submission"], base=path.parent, where="production L1 submission"
     )
@@ -1198,7 +1209,8 @@ def _verify_production_l1_completion_receipt(
     ):
         raise PromotionError("production L1 submission receipt drifted")
     claim_path, claim_ref = _validate_file_ref(
-        submission.get("claim"), base=submission_path.parent,
+        submission.get("claim"),
+        base=submission_path.parent,
         where="production L1 one-shot claim",
     )
     claim = _load_json(claim_path)
@@ -1223,11 +1235,13 @@ def _verify_production_l1_completion_receipt(
     if progress_digest != _digest_value(progress_unhashed):
         raise PromotionError("production L1 progress sidecar semantic digest drift")
     progress_checkpoint = _validate_file_ref(
-        progress.get("checkpoint"), base=progress_path.parent,
+        progress.get("checkpoint"),
+        base=progress_path.parent,
         where="production L1 progress checkpoint",
     )[1]
     progress_optimizer_path, progress_optimizer = _validate_file_ref(
-        progress.get("optimizer"), base=progress_path.parent,
+        progress.get("optimizer"),
+        base=progress_path.parent,
         where="production L1 optimizer sidecar",
     )
     if (
@@ -1243,7 +1257,8 @@ def _verify_production_l1_completion_receipt(
     ):
         raise PromotionError("production L1 progress/dose topology drifted")
     producers = [
-        record for record in contract.get("checkpoints", [])
+        record
+        for record in contract.get("checkpoints", [])
         if isinstance(record, dict) and record.get("role") == "producer"
     ]
     if (
@@ -1251,7 +1266,9 @@ def _verify_production_l1_completion_receipt(
         or manifest.get("f7_parent", {}).get("sha256") != producers[0].get("sha256")
         or report.get("init_checkpoint_sha256") != producers[0].get("sha256")
     ):
-        raise PromotionError("production L1 receipt parent differs from contract producer")
+        raise PromotionError(
+            "production L1 receipt parent differs from contract producer"
+        )
     execution_binding = {
         "schema_version": "a1-production-l1-promotion-execution-binding-v1",
         "manifest": manifest_ref,
@@ -1572,9 +1589,9 @@ def _verify_contract_with_snapshot(
             legacy_contract_attestation, contract_lock=path
         )
         lock = legacy_snapshot.contract_lock.value
-        if expected_training_receipt is not None and legacy_value[
-            "training_receipt"
-        ]["path"] != str(expected_training_receipt):
+        if expected_training_receipt is not None and legacy_value["training_receipt"][
+            "path"
+        ] != str(expected_training_receipt):
             raise PromotionError(
                 "legacy contract attestation binds a different training receipt"
             )
@@ -1758,6 +1775,8 @@ def _verify_calibration_source(
     source_path: Path,
     checkpoint: Path,
     expected_readout: str,
+    expected_value_scale: float,
+    expected_value_squash: str,
     where: str,
     contract: dict[str, Any] | None = None,
     allow_legacy_incumbent: bool = False,
@@ -1883,9 +1902,50 @@ def _verify_calibration_source(
     if not isinstance(global_metrics, dict):
         raise PromotionError(f"{where}.global must be an object")
     _positive_int(global_metrics.get("n"), where=f"{where}.global.n")
+    # Training reports score the raw scalar readout, but the playing operator
+    # consumes the sealed post-readout transform (historically tanh).  Using
+    # the top-level raw RMSE here can therefore bless a checkpoint whose
+    # calibration regresses after the exact transform used by MCTS.  The
+    # calibration artifact already computes all transform views; bind and use
+    # the deployed one instead of silently validating a different function.
+    diagnostics = payload.get("deployed_readout_diagnostics")
+    if not isinstance(diagnostics, dict):
+        raise PromotionError(f"{where} has no deployed readout diagnostics")
+    expected_scale = _finite_number(
+        expected_value_scale,
+        where=f"{where}.expected_value_scale",
+        minimum=0.0,
+    )
+    if float(diagnostics.get("value_scale", float("nan"))) != expected_scale:
+        raise PromotionError(
+            f"{where} deployed value scale differs from the sealed operator"
+        )
+    expected_transform = (
+        f"scalar_{expected_value_squash}"
+        if expected_readout == "scalar"
+        else "scalar_clip"
+    )
+    if diagnostics.get("configured_value_squash") != expected_value_squash:
+        raise PromotionError(
+            f"{where} deployed value squash differs from the sealed operator"
+        )
+    if diagnostics.get("configured_effective_transform") != expected_transform:
+        raise PromotionError(
+            f"{where} deployed value transform differs from the sealed operator"
+        )
+    views = diagnostics.get("views")
+    if not isinstance(views, dict) or not isinstance(
+        views.get(expected_transform), dict
+    ):
+        raise PromotionError(f"{where} lacks the sealed deployed readout view")
+    deployed_global = views[expected_transform].get("global")
+    if not isinstance(deployed_global, dict):
+        raise PromotionError(f"{where} deployed readout global metrics are missing")
+    if deployed_global.get("n") != global_metrics.get("n"):
+        raise PromotionError(f"{where} raw/deployed calibration cohort size differs")
     rmse = _finite_number(
-        global_metrics.get("value_rmse"),
-        where=f"{where}.global.value_rmse",
+        deployed_global.get("value_rmse"),
+        where=f"{where}.deployed_readout_diagnostics.views.{expected_transform}.global.value_rmse",
         minimum=0.0,
     )
     shard_dir = payload.get("shard_dir")
@@ -1933,8 +1993,7 @@ def _require_sealed_semantics(
 
 def _is_bootstrap_transition_contract(contract: dict[str, Any]) -> bool:
     return (
-        contract.get("contract_id")
-        == HISTORICAL_MARKERLESS_A1_CONTRACT["contract_id"]
+        contract.get("contract_id") == HISTORICAL_MARKERLESS_A1_CONTRACT["contract_id"]
         and contract.get("contract_sha256")
         == HISTORICAL_MARKERLESS_A1_CONTRACT["contract_sha256"]
     )
@@ -1970,7 +2029,9 @@ def _contract_value_readout(contract: dict[str, Any]) -> str:
     learner = science.get("learner_value_objective")
     nested = learner.get("value_readout") if isinstance(learner, dict) else None
     if direct is not None and nested is not None and direct != nested:
-        raise PromotionError("sealed A1 contract value_readout representations disagree")
+        raise PromotionError(
+            "sealed A1 contract value_readout representations disagree"
+        )
     value = nested if nested is not None else direct
     if value not in {"scalar", "categorical"}:
         raise PromotionError(
@@ -2029,9 +2090,7 @@ def _incumbent_search_config(
                 f"drift: {key}"
             )
     identity_sha = provenance.get("a1_candidate_agent_identity_sha256")
-    _validate_sha256(
-        identity_sha, where="registry incumbent agent identity sha256"
-    )
+    _validate_sha256(identity_sha, where="registry incumbent agent identity sha256")
     _validate_sha256(champion_sha256, where="incumbent checkpoint sha256")
     expected_identity_sha = _agent_identity(
         {"path": str(champion_path), "sha256": champion_sha256}, actual
@@ -2055,12 +2114,16 @@ def _normalize_search_runtime_binding(
     native_runtime_bound = False
     if present_runtime:
         if present_runtime != runtime_keys:
-            raise PromotionError(f"{where} has an incomplete native MCTS runtime binding")
+            raise PromotionError(
+                f"{where} has an incomplete native MCTS runtime binding"
+            )
         if (
             actual.pop("native_mcts_hot_loop") is not True
             or actual.pop("mcts_implementation") != "rust_native_hot_loop_v1"
         ):
-            raise PromotionError(f"{where} has an unsupported native MCTS runtime binding")
+            raise PromotionError(
+                f"{where} has an unsupported native MCTS runtime binding"
+            )
         native_runtime_bound = True
     if (
         actual.get("evaluator_rust_featurize") is True
@@ -2182,7 +2245,9 @@ def _verify_agent_identity(
     if value["checkpoint"]["path"] != str(checkpoint_path):
         raise PromotionError(f"{where}.checkpoint.path must be canonical and absolute")
     actual_search = _require_exact_keys(
-        value["search_config"], set(expected_search_config), where=f"{where}.search_config"
+        value["search_config"],
+        set(expected_search_config),
+        where=f"{where}.search_config",
     )
     _require_sealed_semantics(
         actual_search, expected_search_config, where=f"{where}.search_config"
@@ -2895,9 +2960,7 @@ def _verify_high_regret_source(
             "candidate_n_full_wide_threshold": sealed_semantics[
                 "n_full_wide_threshold"
             ],
-            "baseline_n_full_wide_threshold": sealed_semantics[
-                "n_full_wide_threshold"
-            ],
+            "baseline_n_full_wide_threshold": sealed_semantics["n_full_wide_threshold"],
             "candidate_value_readout": sealed_semantics["value_readout"],
             "baseline_value_readout": sealed_semantics["value_readout"],
         },
@@ -2919,16 +2982,23 @@ def _verify_high_regret_source(
     planned_engine = _require_exact_keys(
         report["planned_engine_identity"],
         {
-            "schema_version", "repo_commit", "native_wheel_sha256",
-            "evaluator_sha256", "replay_sha256",
+            "schema_version",
+            "repo_commit",
+            "native_wheel_sha256",
+            "evaluator_sha256",
+            "replay_sha256",
         },
         where=f"{where}.report.planned_engine_identity",
     )
     actual_engine = _require_exact_keys(
         report["engine_identity"],
         {
-            "schema_version", "repo_commit", "native_wheel_sha256",
-            "evaluator_sha256", "replay_sha256", "native_runtime_sha256",
+            "schema_version",
+            "repo_commit",
+            "native_wheel_sha256",
+            "evaluator_sha256",
+            "replay_sha256",
+            "native_runtime_sha256",
         },
         where=f"{where}.report.engine_identity",
     )
@@ -2936,21 +3006,31 @@ def _verify_high_regret_source(
         raise PromotionError(f"{where}.report has an unknown engine identity schema")
     for key, expected in planned_engine.items():
         if actual_engine.get(key) != expected:
-            raise PromotionError(f"{where}.report runtime engine identity drift at {key}")
+            raise PromotionError(
+                f"{where}.report runtime engine identity drift at {key}"
+            )
     if not isinstance(planned_engine["repo_commit"], str) or not re.fullmatch(
         r"[0-9a-f]{40}", planned_engine["repo_commit"]
     ):
         raise PromotionError(f"{where}.report engine repo commit is invalid")
     for key in (
-        "native_wheel_sha256", "evaluator_sha256", "replay_sha256",
+        "native_wheel_sha256",
+        "evaluator_sha256",
+        "replay_sha256",
         "native_runtime_sha256",
     ):
-        _validate_sha256(actual_engine[key], where=f"{where}.report.engine_identity.{key}")
+        _validate_sha256(
+            actual_engine[key], where=f"{where}.report.engine_identity.{key}"
+        )
     reconstruction = _require_exact_keys(
         report["archived_state_reconstruction"],
         {
-            "schema_version", "constructor", "map_kind", "action_prefix",
-            "chance_stream", "replay_contract",
+            "schema_version",
+            "constructor",
+            "map_kind",
+            "action_prefix",
+            "chance_stream",
+            "replay_contract",
         },
         where=f"{where}.report.archived_state_reconstruction",
     )
@@ -3149,17 +3229,20 @@ def _verify_high_regret_source(
         ):
             raise PromotionError(f"{where}.report.games[{index}] lacks pair identity")
         identity = (pair_id, orientation)
-        game_encoding = "color" if orientation in {"candidate_red", "candidate_blue"} else "legacy"
+        game_encoding = (
+            "color" if orientation in {"candidate_red", "candidate_blue"} else "legacy"
+        )
         if orientation_encoding is not None and game_encoding != orientation_encoding:
             raise PromotionError(f"{where}.report mixes orientation encodings")
         orientation_encoding = game_encoding
         if game_encoding == "color":
             expected_colors = (
-                ("RED", "BLUE")
-                if orientation == "candidate_red"
-                else ("BLUE", "RED")
+                ("RED", "BLUE") if orientation == "candidate_red" else ("BLUE", "RED")
             )
-            if (game.get("candidate_color"), game.get("baseline_color")) != expected_colors:
+            if (
+                game.get("candidate_color"),
+                game.get("baseline_color"),
+            ) != expected_colors:
                 raise PromotionError(
                     f"{where}.report.games[{index}] orientation/color mismatch"
                 )
@@ -3170,9 +3253,7 @@ def _verify_high_regret_source(
                     f"{where}.report.games[{index}] has incomplete legacy colors"
                 )
             expected_colors = (
-                ("RED", "BLUE")
-                if orientation == "candidate_first"
-                else ("BLUE", "RED")
+                ("RED", "BLUE") if orientation == "candidate_first" else ("BLUE", "RED")
             )
             if colors[0] is not None and colors != expected_colors:
                 raise PromotionError(
@@ -3320,27 +3401,34 @@ def _verify_bucket_veto_source(
         ):
             raise PromotionError(f"{where}.report.games[{index}] lacks pair identity")
         identity = (pair_id, orientation)
-        game_encoding = "color" if orientation in {"candidate_red", "candidate_blue"} else "legacy"
+        game_encoding = (
+            "color" if orientation in {"candidate_red", "candidate_blue"} else "legacy"
+        )
         if orientation_encoding is not None and game_encoding != orientation_encoding:
             raise PromotionError(f"{where}.report mixes orientation encodings")
         orientation_encoding = game_encoding
         if game_encoding == "color":
             expected_colors = (
-                ("RED", "BLUE")
-                if orientation == "candidate_red"
-                else ("BLUE", "RED")
+                ("RED", "BLUE") if orientation == "candidate_red" else ("BLUE", "RED")
             )
-            if (game.get("candidate_color"), game.get("baseline_color")) != expected_colors:
+            if (
+                game.get("candidate_color"),
+                game.get("baseline_color"),
+            ) != expected_colors:
                 raise PromotionError(
                     f"{where}.report.games[{index}] orientation/color mismatch"
                 )
-        elif game.get("candidate_color") is not None or game.get("baseline_color") is not None:
+        elif (
+            game.get("candidate_color") is not None
+            or game.get("baseline_color") is not None
+        ):
             expected_colors = (
-                ("RED", "BLUE")
-                if orientation == "candidate_first"
-                else ("BLUE", "RED")
+                ("RED", "BLUE") if orientation == "candidate_first" else ("BLUE", "RED")
             )
-            if (game.get("candidate_color"), game.get("baseline_color")) != expected_colors:
+            if (
+                game.get("candidate_color"),
+                game.get("baseline_color"),
+            ) != expected_colors:
                 raise PromotionError(
                     f"{where}.report.games[{index}] legacy orientation/color mismatch"
                 )
@@ -3512,6 +3600,8 @@ def _verify_promotion_evidence(
             source_path=source_by_role["candidate_calibration"][0],
             checkpoint=candidate_path,
             expected_readout=expected_readout,
+            expected_value_scale=sealed_semantics["value_scale"],
+            expected_value_squash=sealed_semantics["value_squash"],
             where="candidate calibration",
         )
         champion_rmse, champion_cohort = _verify_calibration_source(
@@ -3519,6 +3609,8 @@ def _verify_promotion_evidence(
             source_path=source_by_role["champion_calibration"][0],
             checkpoint=champion_path,
             expected_readout=expected_readout,
+            expected_value_scale=sealed_semantics["value_scale"],
+            expected_value_squash=sealed_semantics["value_squash"],
             where="champion calibration",
             contract=contract,
             allow_legacy_incumbent=True,
@@ -3663,7 +3755,9 @@ def _verify_promotion_evidence(
             paired_external["candidate_win_rate"] != candidate_rate
             or paired_external["champion_win_rate"] != champion_rate
         ):
-            raise PromotionError("external paired comparison does not replay summary rates")
+            raise PromotionError(
+                "external paired comparison does not replay summary rates"
+            )
         if not paired_external["noninferiority"]["passed"]:
             raise PromotionError(
                 "candidate external noninferiority is unresolved at alpha=0.05: "
@@ -3779,12 +3873,8 @@ def _promotion_cohort_intervals(
     return []
 
 
-def _seed_interval(
-    raw: Any, *, where: str, kind: str | None = None
-) -> dict[str, Any]:
-    value = _require_exact_keys(
-        raw, {"base_seed", "end_seed"}, where=where
-    )
+def _seed_interval(raw: Any, *, where: str, kind: str | None = None) -> dict[str, Any]:
+    value = _require_exact_keys(raw, {"base_seed", "end_seed"}, where=where)
     base_seed = value["base_seed"]
     end_seed = value["end_seed"]
     if (
@@ -3795,7 +3885,9 @@ def _seed_interval(
         or not isinstance(end_seed, int)
         or end_seed <= base_seed
     ):
-        raise PromotionError(f"{where} must be a non-empty non-negative half-open range")
+        raise PromotionError(
+            f"{where} must be a non-empty non-negative half-open range"
+        )
     result: dict[str, Any] = {"base_seed": base_seed, "end_seed": end_seed}
     if kind is not None:
         result["kind"] = kind
@@ -4145,9 +4237,7 @@ def _verify_adjudication(
             champion=champion_binding,
         )
         final_cohort_intervals.extend(
-            _promotion_cohort_intervals(
-                evidence_path, evidence_value, kind=kind
-            )
+            _promotion_cohort_intervals(evidence_path, evidence_value, kind=kind)
         )
         evidence_by_kind[kind] = {"kind": kind, **verified}
     missing_evidence = REQUIRED_EVIDENCE_KINDS - set(evidence_by_kind)
@@ -4321,7 +4411,9 @@ def prepare_promotion(
     legacy_attestation_ref: dict[str, str] | None = None
     if legacy_snapshot is not None:
         _revalidate_legacy_snapshot(legacy_snapshot)
-        if legacy_snapshot.attestation is None:  # pragma: no cover - internal invariant.
+        if (
+            legacy_snapshot.attestation is None
+        ):  # pragma: no cover - internal invariant.
             raise PromotionError("legacy promotion snapshot has no attestation bytes")
         legacy_attestation_ref = {
             "path": str(legacy_snapshot.attestation.path),
