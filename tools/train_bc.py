@@ -2533,7 +2533,11 @@ def _validate_dual_arm_corpus_artifacts_and_seeds(
 
     # The dual learner keeps the proven A1 objective/optimizer recipe while
     # changing only topology: 8 ranks x 512 local = the same global batch 4096.
-    from tools.a1_pre_wave_contract import EXPECTED_LEARNER_TRAINING_RECIPE
+    # ``train_bc.py`` is launched by torchrun as a file path, so sys.path[0]
+    # is ``tools/`` rather than the repository root.  Import the sibling
+    # through the tools-directory bootstrap above; a ``tools.*`` import only
+    # works accidentally when callers inject the repository into PYTHONPATH.
+    from a1_pre_wave_contract import EXPECTED_LEARNER_TRAINING_RECIPE
 
     recipe = dict(EXPECTED_LEARNER_TRAINING_RECIPE)
     recipe.update({"batch_size": 512, "world_size": 8, "global_batch_size": 4096})

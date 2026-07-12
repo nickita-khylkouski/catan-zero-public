@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 
@@ -191,6 +193,26 @@ def test_mps_handoff_restores_service_after_failure() -> None:
     assert active is True
     assert ("sudo", "-n", "systemctl", "stop", "nvidia-mps.service") in calls
     assert ("sudo", "-n", "systemctl", "start", "nvidia-mps.service") in calls
+
+
+def test_train_bc_sibling_contract_import_works_without_repo_on_pythonpath() -> None:
+    repo = Path(probe.__file__).resolve().parents[1]
+    tools_dir = repo / "tools"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from a1_pre_wave_contract import EXPECTED_LEARNER_TRAINING_RECIPE; "
+            "assert EXPECTED_LEARNER_TRAINING_RECIPE",
+        ],
+        cwd=tools_dir,
+        env={"PATH": str(Path(sys.executable).parent)},
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 def test_gpu_occupancy_allows_only_mps_server() -> None:
