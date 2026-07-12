@@ -8,6 +8,7 @@ from tools.audit_entity_graph_information_surface import (
     InformationSurfaceError,
     audit_memmap_metadata,
     build_report,
+    enforce_graph_history_contract,
     scan_event_payload,
 )
 
@@ -84,6 +85,15 @@ def test_exact_scan_proves_old_physical_event_columns_are_constant(tmp_path) -> 
     assert scan["reclaimable_constant_bytes"] == sum(
         path.stat().st_size for path in tmp_path.glob("event_*.dat")
     )
+    with pytest.raises(InformationSurfaceError, match="history is absent"):
+        enforce_graph_history_contract(audit, required=True)
+
+
+def test_graph_history_contract_rejects_unverified_v1_metadata() -> None:
+    audit = audit_memmap_metadata({"implicit_zero_columns": []})
+    with pytest.raises(InformationSurfaceError, match="history is unverified"):
+        enforce_graph_history_contract(audit, required=True)
+    enforce_graph_history_contract(audit, required=False)
 
 
 @pytest.mark.parametrize("trunk", ["rrt", "resrgcn"])

@@ -247,6 +247,21 @@ def build_report(config: Any, metadata: Mapping[str, Any] | None = None) -> dict
     }
 
 
+def enforce_graph_history_contract(
+    corpus_audit: Mapping[str, Any], *, required: bool
+) -> None:
+    """Refuse a recipe that declares graph history over absent/unproved data."""
+
+    if not required:
+        return
+    status = corpus_audit.get("event_history_trainable")
+    if status is not True:
+        reason = "absent" if status is False else "unverified"
+        raise InformationSurfaceError(
+            "graph_history_features=true but event history is " + reason
+        )
+
+
 def _load_checkpoint_config(path: Path) -> Any:
     import torch
 
@@ -264,6 +279,11 @@ def main() -> None:
         "--scan-event-payload",
         action="store_true",
         help="exactly scan physical event columns (required to prove old v1 data)",
+    )
+    parser.add_argument(
+        "--require-graph-history",
+        action="store_true",
+        help="fail unless the corpus proves at least one nonzero history value",
     )
     parser.add_argument("--out", type=Path)
     args = parser.parse_args()
@@ -292,6 +312,10 @@ def main() -> None:
         report["safe_for_scale_only_ablation"] = not report[
             "critical_information_bottlenecks"
         ]
+    if args.require_graph_history:
+        if report["corpus"] is None:
+            parser.error("--require-graph-history requires --corpus-meta")
+        enforce_graph_history_contract(report["corpus"], required=True)
     rendered = json.dumps(report, indent=2, sort_keys=True) + "\n"
     if args.out is not None:
         args.out.parent.mkdir(parents=True, exist_ok=True)
