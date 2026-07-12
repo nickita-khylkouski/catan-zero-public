@@ -39,15 +39,16 @@ REPLAY_COMPONENT_ID = "gen3_replay"
 REPLAY_ANCHOR_WEIGHT = 0.0
 # The successful L1 dose consumed 4,194,304 global rows but only about 515K
 # multi-action rows carried policy gradient.  For the new 5:2 current-teacher
-# mixture, exact corpus scans give the active fractions below and an expected
-# 508,121 rows (binomial sigma ~=668).  A 4,100-row band is wider than 6 sigma
+# mixture, exact training-only corpus scans (validation seeds excluded) give
+# the active fractions below and an expected 508,059 rows (binomial sigma
+# ~=668).  A 4,100-row band is wider than 6 sigma
 # while still rejecting roughly 0.8% realized-dose drift.  Auxiliary policy
 # rows remain exactly off until an independently winning dose is found.
 POLICY_BASE_ACTIVE_FRACTIONS = {
-    "n128_current": 0.12115209004114003,
-    "n256_current": 0.12112910679641598,
+    "n128_current": 0.12113176383916897,
+    "n256_current": 0.12112785317546192,
 }
-EXPECTED_POLICY_BASE_ACTIVE_ROWS = 508_121
+EXPECTED_POLICY_BASE_ACTIVE_ROWS = 508_059
 POLICY_BASE_ACTIVE_ROW_TOLERANCE = 4_100
 EXPECTED_POLICY_AUX_ACTIVE_ROWS = 0
 EVENT_HISTORY_COMMAND_CONTRACT_SCHEMA = "a1-event-history-command-contract-v1"

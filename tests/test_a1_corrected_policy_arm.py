@@ -175,7 +175,7 @@ def test_prepares_exact_one_dose_pure_current_policy_arm_without_launch(
     assert manifest["diagnostic_execution_authorized"] is True
     assert manifest["recipe"]["base_value_row_dose"] == 4_194_304
     assert manifest["recipe"]["policy_aux_active_row_dose"] == 0
-    assert manifest["recipe"]["expected_policy_base_active_rows"] == 508_121
+    assert manifest["recipe"]["expected_policy_base_active_rows"] == 508_059
     assert manifest["recipe"]["policy_base_active_row_tolerance"] == 4_100
     assert manifest["recipe"]["expected_policy_aux_active_rows"] == 0
     assert manifest["recipe"]["policy_distillation_component_ids"] == [
@@ -224,15 +224,15 @@ def test_prepares_exact_one_dose_pure_current_policy_arm_without_launch(
     assert manifest["supervision_contract"]["policy_aux_active_batch_size_per_rank"] == 0
     assert manifest["supervision_contract"]["policy_active_row_dose"] == {
         "reference_component_active_fractions": {
-            "n128_current": 0.12115209004114003,
-            "n256_current": 0.12112910679641598,
+            "n128_current": 0.12113176383916897,
+            "n256_current": 0.12112785317546192,
         },
         "component_sampling_ratios": pytest.approx([5 / 7, 2 / 7]),
         "global_row_dose": 4_194_304,
-        "reference_base_active_rows": 508_121,
+        "reference_base_active_rows": 508_059,
         "base_active_rows_tolerance": 4_100,
-        "min_base_active_rows": 504_021,
-        "max_base_active_rows": 512_221,
+        "min_base_active_rows": 503_959,
+        "max_base_active_rows": 512_159,
         "expected_aux_active_rows": 0,
         "accounting": "realized_policy_active_rows_not_global_samples",
     }
