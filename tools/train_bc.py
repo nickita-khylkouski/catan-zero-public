@@ -3943,6 +3943,10 @@ def main(argv: Sequence[str] | None = None) -> None:
     global_step = 0
     cumulative_scalar_training_weight = 0.0
     cumulative_categorical_training_weight = 0.0
+    optimizer_observed_steps = 0
+    optimizer_clipped_steps = 0
+    optimizer_pre_clip_grad_norm_sum = 0.0
+    optimizer_pre_clip_grad_norm_max = 0.0
     total_training_steps = int(args.max_steps) if int(args.max_steps) > 0 else 0
     # C1 gradient accumulation. accum==1 (default) preserves the pre-C1 path
     # exactly: every micro-batch zero-grads, backwards the undivided loss, clips,
@@ -4111,6 +4115,36 @@ def main(argv: Sequence[str] | None = None) -> None:
             )
             loss = float(batch_metrics["loss"])
             accuracy = float(batch_metrics["accuracy"])
+            optimizer_observability = batch_metrics.get("optimizer_observability")
+            if optimizer_observability is not None:
+                optimizer_observed_steps += 1
+                optimizer_clipped_steps += int(optimizer_observability["clipped"])
+                pre_clip_norm = float(
+                    optimizer_observability["pre_clip_total_grad_norm"]
+                )
+                optimizer_pre_clip_grad_norm_sum += pre_clip_norm
+                optimizer_pre_clip_grad_norm_max = max(
+                    optimizer_pre_clip_grad_norm_max, pre_clip_norm
+                )
+                _rank0_print(
+                    json.dumps(
+                        {
+                            "progress": "bc_optimizer_observability",
+                            "arch": args.arch,
+                            "epoch": epoch + 1,
+                            "batch": batch_number,
+                            "optimizer_step": global_step + 1,
+                            **optimizer_observability,
+                            "observed_steps": optimizer_observed_steps,
+                            "clipped_steps": optimizer_clipped_steps,
+                            "clipped_fraction": (
+                                optimizer_clipped_steps / optimizer_observed_steps
+                            ),
+                        },
+                        sort_keys=True,
+                    ),
+                    ddp,
+                )
             if first_batch_profile is None:
                 first_batch_profile = _batch_profile(policy, batch_data, batch)
                 _rank0_print(
@@ -4313,6 +4347,26 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "accuracy_active_count": int(round(active_count_total)),
                 "accuracy": acc_sum / max(active_count_total, 1.0),
                 "top3_accuracy": top3_sum / max(active_count_total, 1.0),
+                **(
+                    {
+                        "optimizer_observability": {
+                            "observed_steps": optimizer_observed_steps,
+                            "clipped_steps": optimizer_clipped_steps,
+                            "clipped_fraction": (
+                                optimizer_clipped_steps / optimizer_observed_steps
+                            ),
+                            "mean_pre_clip_total_grad_norm": (
+                                optimizer_pre_clip_grad_norm_sum
+                                / optimizer_observed_steps
+                            ),
+                            "max_pre_clip_total_grad_norm": (
+                                optimizer_pre_clip_grad_norm_max
+                            ),
+                        }
+                    }
+                    if optimizer_observed_steps
+                    else {}
+                ),
                 "phase_accuracy": _finalize_phase_stats(phase_stats),
                 "phase_accuracy_excluding_forced": _finalize_phase_stats(phase_stats_unforced),
                 "teacher_accuracy": _finalize_phase_stats(teacher_stats),
@@ -5416,9 +5470,20 @@ def _train_xdim_batch(
         _sync_ctx = contextlib.nullcontext()
     with _sync_ctx:
         backward_loss.backward()
+    optimizer_observability = None
     if accum_do_step:
-        _clip_grad_norm(policy, 1.0)
+        observability_state = (
+            _capture_optimizer_observability(policy) if diagnostics else None
+        )
+        pre_clip_total_grad_norm = _clip_grad_norm(policy, 1.0)
         optimizer.step()
+        if observability_state is not None:
+            optimizer_observability = _finish_optimizer_observability(
+                policy,
+                observability_state,
+                pre_clip_total_grad_norm=pre_clip_total_grad_norm,
+                max_grad_norm=1.0,
+            )
     predictions = torch.argmax(outputs["logits"], dim=-1)
     active = policy_weights > 0.0
     active_count = int(active.sum().item())
@@ -5524,6 +5589,11 @@ def _train_xdim_batch(
         "phase_stats": phase_stats,
         "teacher_stats": teacher_stats,
         "phase_stats_unforced": phase_stats_unforced,
+        **(
+            {"optimizer_observability": optimizer_observability}
+            if optimizer_observability is not None
+            else {}
+        ),
     }
 
 
@@ -9555,6 +9625,97 @@ def _params(policy):
         module = getattr(policy, name, None)
         if module is not None:
             yield from module.parameters()
+
+
+def _optimizer_observability_module_name(parameter_name: str) -> str:
+    """Return a stable, compact top-level module label for optimizer telemetry."""
+    name = str(parameter_name)
+    for prefix in ("module.", "_fsdp_wrapped_module."):
+        while name.startswith(prefix):
+            name = name[len(prefix) :]
+    return name.split(".", 1)[0] or "<root>"
+
+
+def _norms_from_squared_sums(squared_sums: dict[str, object]) -> dict[str, float]:
+    import torch
+
+    return {
+        name: float(torch.sqrt(value).detach().cpu().item())
+        for name, value in sorted(squared_sums.items())
+    }
+
+
+def _capture_optimizer_observability(policy) -> dict:
+    """Capture pre-clip module gradient norms and pre-step parameter bytes.
+
+    This helper is called only at the existing opt-in train-diagnostics cadence.
+    The normal/default path therefore performs no parameter clones, device
+    synchronizations, or extra reductions. Under DDP the gradients and parameters
+    are already replicated and synchronized. Under FSDP these per-module values are
+    explicitly rank-local shard diagnostics; the total norm returned by
+    ``_clip_grad_norm`` remains FSDP's authoritative global norm.
+    """
+    model = policy.model
+    module = getattr(model, "module", model)
+    named_parameters = [
+        (name, parameter)
+        for name, parameter in module.named_parameters()
+        if parameter.requires_grad and parameter.grad is not None
+    ]
+    snapshots = [
+        (
+            _optimizer_observability_module_name(name),
+            parameter,
+            parameter.detach().clone(),
+        )
+        for name, parameter in named_parameters
+    ]
+    grad_squared_sums: dict[str, object] = {}
+    for name, parameter in named_parameters:
+        group = _optimizer_observability_module_name(name)
+        squared = parameter.grad.detach().float().square().sum()
+        grad_squared_sums[group] = grad_squared_sums.get(group, 0.0) + squared
+    import torch
+
+    is_fsdp = callable(getattr(model, "clip_grad_norm_", None)) and not isinstance(
+        model, torch.nn.parallel.DistributedDataParallel
+    )
+    return {
+        "snapshots": snapshots,
+        "module_pre_clip_grad_norms": _norms_from_squared_sums(
+            grad_squared_sums
+        ),
+        "module_norm_scope": "rank_local_shard" if is_fsdp else "global_replicated",
+    }
+
+
+def _finish_optimizer_observability(
+    policy,
+    state: dict,
+    *,
+    pre_clip_total_grad_norm,
+    max_grad_norm: float,
+) -> dict:
+    """Measure the actual optimizer update after ``optimizer.step()``."""
+    del policy  # The captured Parameter objects remain live across optimizer.step().
+    delta_squared_sums: dict[str, object] = {}
+    for group, parameter, before in state["snapshots"]:
+        squared = (parameter.detach().float() - before.float()).square().sum()
+        delta_squared_sums[group] = delta_squared_sums.get(group, 0.0) + squared
+    if hasattr(pre_clip_total_grad_norm, "detach"):
+        total_norm = float(pre_clip_total_grad_norm.detach().cpu().item())
+    else:
+        total_norm = float(pre_clip_total_grad_norm)
+    return {
+        "pre_clip_total_grad_norm": total_norm,
+        "max_grad_norm": float(max_grad_norm),
+        "clipped": bool(not math.isfinite(total_norm) or total_norm > max_grad_norm),
+        "module_pre_clip_grad_norms": state["module_pre_clip_grad_norms"],
+        "module_parameter_delta_norms": _norms_from_squared_sums(
+            delta_squared_sums
+        ),
+        "module_norm_scope": state["module_norm_scope"],
+    }
 
 
 def _clip_grad_norm(policy, max_norm: float = 1.0):
