@@ -105,7 +105,9 @@ def test_plan_separates_fixed_step_and_equal_sample_questions(
         assert plan["runtime"]["trainer"] in command
         assert "/repo/tools/train_bc.py" not in command
         assert not any(item.startswith("--a1-") for item in command)
-        assert "--validation-game-seed-manifest" not in command
+        assert command.count("--validation-game-seed-manifest") == 1
+        validation_index = command.index("--validation-game-seed-manifest")
+        assert command[validation_index + 1] == "/data/validation.json"
         assert command[command.index("--train-diagnostics-every-batches") + 1] == "1"
         assert command[command.index("--batch-size") + 1] == str(run["local_batch_size"])
         assert command[command.index("--max-steps") + 1] == str(run["max_steps"])

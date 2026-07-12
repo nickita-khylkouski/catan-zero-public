@@ -38,7 +38,6 @@ WORLD_SIZE = 8
 REFERENCE_LR = 0.00012
 REFERENCE_BATCH = 512
 STRIP_VALUE_FLAGS = {
-    "--validation-game-seed-manifest",
     "--a1-dual-learner-lock",
     "--a1-dual-reviewed-lock-file-sha256",
     "--a1-learner-ablation-id",
@@ -186,6 +185,11 @@ def build_plan(
     midpoint = _authenticated_midpoint(midpoint_receipt)
     runtime = _current_runtime()
     base = _strip_production_authority(list(midpoint["payload"]["command"]))
+    # The held-out game-seed manifest is data-split provenance, not production
+    # authority.  Keeping it makes every batch arm use the exact authenticated
+    # validation cohort and satisfies the fail-closed A1 memmap contract.
+    if base.count("--validation-game-seed-manifest") != 1:
+        raise ProbeError("midpoint command lacks one validation seed manifest")
     _bind_current_trainer(base, runtime)
     output_dir = output_dir.expanduser().resolve()
     if output_dir.exists():
