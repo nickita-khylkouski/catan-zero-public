@@ -8407,17 +8407,37 @@ def sample_weight_quality(data: dict, weights: np.ndarray) -> dict:
             "max": 0.0,
             "effective_sample_size": 0.0,
             "effective_sample_fraction": 0.0,
+            "positive_sample_count": 0,
+            "positive_sample_fraction": 0.0,
+            "positive_effective_sample_size": 0.0,
+            "positive_effective_sample_fraction": 0.0,
             "by_teacher": {},
             "by_phase": {},
         }
     denom = float(np.sum(weights * weights))
     effective = float(np.sum(weights) ** 2 / denom) if denom > 0.0 else 0.0
+    positive = weights[weights > 0.0]
+    positive_denom = float(np.sum(positive * positive))
+    positive_effective = (
+        float(np.sum(positive) ** 2 / positive_denom) if positive_denom > 0.0 else 0.0
+    )
     return {
         "mean": float(np.mean(weights)),
         "min": float(np.min(weights)),
         "max": float(np.max(weights)),
         "effective_sample_size": effective,
         "effective_sample_fraction": effective / float(len(weights)),
+        # Sparse self-play policy supervision deliberately assigns zero weight to
+        # forced and fast-search rows.  The all-row ESS fraction therefore mostly
+        # measures target coverage, not variance among examples that actually
+        # enter the loss.  Report both factors so an n128/n256 run cannot mistake
+        # 12% policy coverage for a 12%-efficient importance-weighting scheme.
+        "positive_sample_count": int(positive.size),
+        "positive_sample_fraction": float(positive.size / len(weights)),
+        "positive_effective_sample_size": positive_effective,
+        "positive_effective_sample_fraction": (
+            positive_effective / float(positive.size) if positive.size else 0.0
+        ),
         "by_teacher": _weight_by_field(data, weights, "teacher_name"),
         "by_phase": _weight_by_field(data, weights, "phase"),
     }
@@ -10366,7 +10386,12 @@ def build_value_sample_weights(
     if "value_weight_multiplier" in data:
         weights *= np.asarray(data["value_weight_multiplier"], dtype=np.float32)
     if float(forced_row_value_weight) != 1.0 and "legal_action_ids" in data:
-        legal_counts = np.sum(np.asarray(data["legal_action_ids"]) >= 0, axis=1)
+        legal_column = data["legal_action_ids"]
+        legal_counts = (
+            legal_column.row_counts()
+            if isinstance(legal_column, _MemmapRaggedColumn)
+            else np.sum(np.asarray(legal_column) >= 0, axis=1)
+        )
         weights[legal_counts == 1] *= float(forced_row_value_weight)
     if per_game_value_weight and len(weights):
         weights = _normalize_weights_per_game(data, weights, mode=per_game_value_weight_mode)

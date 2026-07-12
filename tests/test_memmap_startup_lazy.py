@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from tools import train_bc
 
@@ -58,3 +59,34 @@ def test_default_sample_weights_do_not_decode_inert_winner_labels() -> None:
         vps_to_win=10,
     )
     assert weights.tolist() == [0.25, 2.5, 0.25]
+
+
+def test_forced_value_weights_use_ragged_offsets_without_padding_reconstruction(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    flat_path = tmp_path / "legal.dat"
+    np.asarray([1, 2, 3, 4], dtype=np.int16).tofile(flat_path)
+    flat = np.memmap(flat_path, dtype=np.int16, mode="r", shape=(4,))
+    column = train_bc._MemmapRaggedColumn(  # noqa: SLF001
+        flat,
+        np.asarray([0, 1, 4], dtype=np.int64),
+        3,
+        -1,
+        np.int16,
+        None,
+    )
+    monkeypatch.setattr(
+        column,
+        "_reconstruct",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("full padded legal matrix was reconstructed")
+        ),
+    )
+    weights = train_bc.build_value_sample_weights(
+        {
+            "action_taken": np.asarray([1, 2], dtype=np.int16),
+            "legal_action_ids": column,
+        },
+        forced_row_value_weight=0.1,
+    )
+    assert weights.tolist() == pytest.approx([2.0 / 11.0, 20.0 / 11.0])
