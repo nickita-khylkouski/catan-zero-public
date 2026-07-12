@@ -10,10 +10,15 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import sys
 import time
 from typing import Any, Callable, Sequence
 
-from tools import a1_corrected_policy_arm as prepare
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from tools import a1_corrected_policy_arm as prepare  # noqa: E402
 
 
 RECEIPT_SCHEMA = "a1-corrected-policy-arm-execution-receipt-v1"

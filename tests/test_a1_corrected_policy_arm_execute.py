@@ -3,12 +3,26 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import subprocess
+import sys
 
 import pytest
 
 from tools import a1_corrected_policy_arm as arm
 from tools import a1_corrected_policy_arm_execute as executor
 from test_a1_corrected_policy_arm import _args
+
+
+def test_direct_cli_help_works_outside_repository(tmp_path: Path) -> None:
+    script = Path(executor.__file__).resolve()
+    completed = subprocess.run(
+        (sys.executable, str(script), "--help"),
+        cwd=tmp_path,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert "--manifest" in completed.stdout
 
 
 def _manifest(
