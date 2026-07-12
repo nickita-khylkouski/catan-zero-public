@@ -483,8 +483,15 @@ def summarize(run: dict[str, Any]) -> dict[str, Any]:
     steps = int(report["steps_completed"])
     samples = steps * int(run["global_batch_size"])
     validation = train_bc.objective_matched_validation_metrics(
-        report["metrics"][-1]
+        report["metrics"][-1], require_matched=True
     )
+    component_validation = train_bc.objective_matched_validation_component_metrics(
+        report["metrics"][-1], require_matched=True
+    )
+    component_closures = {
+        component_id: float(metrics["active_policy_teacher_gap_closure"])
+        for component_id, metrics in component_validation.items()
+    }
     closure = float(validation["active_policy_teacher_gap_closure"])
     optimizer = _optimizer_log_summary(run_dir / "train.log")
     return {
@@ -498,6 +505,10 @@ def summarize(run: dict[str, Any]) -> dict[str, Any]:
         "samples_per_second": samples / elapsed,
         "mean_wall_step_sec": elapsed / steps,
         "active_teacher_gap_closure": closure,
+        "active_teacher_gap_closure_by_component": component_closures,
+        "worst_component_active_teacher_gap_closure": min(
+            component_closures.values()
+        ),
         "active_teacher_gap_closure_per_wall_second": closure / elapsed,
         "active_teacher_gap_closure_per_million_samples": closure * 1_000_000 / samples,
         "optimizer_observability": optimizer,

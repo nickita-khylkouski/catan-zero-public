@@ -5,6 +5,7 @@ import pytest
 
 from tools.train_bc import (
     evaluate_composite_validation_measure,
+    objective_matched_validation_component_metrics,
     objective_matched_validation_metrics,
 )
 
@@ -94,6 +95,20 @@ def test_downstream_metric_selector_prefers_matched_and_falls_back_historically(
     ) == {"loss": 2.0}
 
 
+def test_downstream_component_selector_requires_authenticated_wrapper() -> None:
+    epoch = {
+        "validation_objective_matched": {
+            "objective_matched": True,
+            "components": {"replay": {"metrics": {"loss": 3.0}}},
+        }
+    }
+    assert objective_matched_validation_component_metrics(epoch) == {
+        "replay": {"loss": 3.0}
+    }
+    with pytest.raises(ValueError, match="per-component"):
+        objective_matched_validation_component_metrics({}, require_matched=True)
+
+
 def test_downstream_metric_selector_does_not_trust_unmarked_wrapper() -> None:
     epoch = {
         "validation": {"loss": 2.0},
@@ -103,6 +118,8 @@ def test_downstream_metric_selector_does_not_trust_unmarked_wrapper() -> None:
         },
     }
     assert objective_matched_validation_metrics(epoch) == {"loss": 2.0}
+    with pytest.raises(ValueError, match="raw concatenated-row fallback"):
+        objective_matched_validation_metrics(epoch, require_matched=True)
 
 
 def test_objective_measure_aggregates_weight_density_before_dividing() -> None:
@@ -136,3 +153,31 @@ def test_objective_measure_aggregates_weight_density_before_dividing() -> None:
     assert report["metrics"]["policy_loss"] == pytest.approx(11.0 / 3.0)
     assert report["metrics"]["loss"] == pytest.approx(11.0 / 3.0)
     assert report["metrics"]["raw_batch_mean_loss"] == 5.0
+
+
+def test_teacher_gap_closure_uses_aggregate_kl_mass_not_mean_of_game_ratios() -> None:
+    data = _Composite()
+
+    def evaluate(indices: np.ndarray) -> dict:
+        seed = int(data["game_seed"][indices[0]])
+        # Game 11: one active row, prior gap 10, model gap 0 (closure 1).
+        # Game 12: one active row among three, prior/model gap 1 (closure 0).
+        # The correct n128 closure is 1 - (0/1 + 1/3)/(10/1 + 1/3),
+        # not mean(1, 0)=.5.
+        prior = {11: 10.0, 12: 1.0, 21: 2.0}[seed]
+        model = {11: 0.0, 12: 1.0, 21: 1.0}[seed]
+        return {
+            "samples": int(len(indices)),
+            "active_policy_teacher_gap_rows": 1,
+            "active_policy_kl_target_model_mean": model,
+            "active_policy_kl_target_prior_mean": prior,
+            "active_policy_teacher_gap_closure": 1.0 - model / prior,
+        }
+
+    report = evaluate_composite_validation_measure(
+        data, np.arange(6, dtype=np.int64), evaluate
+    )
+
+    assert report["components"]["n128"]["metrics"][
+        "active_policy_teacher_gap_closure"
+    ] == pytest.approx(1.0 - (1.0 / 3.0) / (10.0 + 1.0 / 3.0))

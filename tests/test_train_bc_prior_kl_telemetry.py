@@ -103,6 +103,7 @@ def test_kl_model_prior_is_zero_when_model_equals_prior():
     result = _prior_kl_telemetry(data, batch, logits, torch.device("cpu"))
 
     assert float(result["kl_model_prior"][0]) == pytest.approx(0.0, abs=1e-3)
+    assert float(result["kl_prior_model"][0]) == pytest.approx(0.0, abs=1e-3)
 
 
 def test_unnormalized_prior_or_target_are_renormalized_before_kl():

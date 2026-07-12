@@ -381,7 +381,25 @@ def test_summary_reports_efficiency_and_never_ranks_hbm(tmp_path: Path) -> None:
                             "clipped_fraction": 0.25,
                             "mean_pre_clip_total_grad_norm": 1.2,
                         },
-                        "validation": {"active_policy_teacher_gap_closure": 0.4},
+                            "validation": {"active_policy_teacher_gap_closure": 0.4},
+                            "validation_objective_matched": {
+                                "objective_matched": True,
+                                "metrics": {
+                                    "active_policy_teacher_gap_closure": 0.4
+                                },
+                                "components": {
+                                    "replay": {
+                                        "metrics": {
+                                            "active_policy_teacher_gap_closure": -0.1
+                                        }
+                                    },
+                                    "n128": {
+                                        "metrics": {
+                                            "active_policy_teacher_gap_closure": 0.5
+                                        }
+                                    },
+                                },
+                            },
                     }
                 ],
             }
@@ -424,6 +442,7 @@ def test_summary_reports_efficiency_and_never_ranks_hbm(tmp_path: Path) -> None:
     )
     assert result["samples_per_second"] == 4096
     assert result["active_teacher_gap_closure_per_wall_second"] == 0.2
+    assert result["worst_component_active_teacher_gap_closure"] == -0.1
     assert result["gpu"]["sm_util_mean_pct"] == 80
     assert result["gpu"]["hbm_memory_mean_mib"] == 11000
     assert result["gpu"]["hbm_is_ranking_objective"] is False
