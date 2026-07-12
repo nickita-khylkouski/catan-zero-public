@@ -541,13 +541,46 @@ def _fixture(
         action_taken=np.arange(200, dtype=np.int32),
     )
     high_regret_source_manifest = tmp_path / "high_regret.source.npz"
+    validation_seeds = np.arange(7_000_000, 7_000_200, dtype=np.int64)
+    validation_seed_manifest = tmp_path / "high_regret.validation-seeds.json"
+    validation_seed_digest = "sha256:" + hashlib.sha256(
+        validation_seeds.astype("<i8", copy=False).tobytes()
+    ).hexdigest()
+    _write_json(
+        validation_seed_manifest,
+        {
+            "schema_version": "train-validation-game-seeds-v1",
+            "game_seeds": validation_seeds.tolist(),
+            "validation_game_seed_count": len(validation_seeds),
+            "validation_game_seed_set_sha256": validation_seed_digest,
+        },
+    )
+    validation_binding = {
+        "path": str(validation_seed_manifest.resolve()),
+        "sha256": promotion._sha256(validation_seed_manifest),
+        "schema_version": "train-validation-game-seeds-v1",
+        "game_seed_count": len(validation_seeds),
+        "game_seed_set_sha256": validation_seed_digest,
+    }
     np.savez(
         high_regret_source_manifest,
         shard_paths=np.asarray([str(high_regret_source_shard)]),
         shard_id=np.zeros(200, dtype=np.int32),
         row_index=np.arange(200, dtype=np.int32),
-        game_seed=np.arange(7_000_000, 7_000_200, dtype=np.int64),
+        game_seed=validation_seeds,
         decision_index=np.zeros(200, dtype=np.int32),
+        held_out_only=np.asarray(True),
+        validation_seed_manifest_path=np.asarray(
+            str(validation_seed_manifest.resolve())
+        ),
+        validation_seed_manifest_sha256=np.asarray(validation_binding["sha256"]),
+        validation_seed_manifest_schema_version=np.asarray(
+            validation_binding["schema_version"]
+        ),
+        validation_game_seed_count=np.asarray(
+            validation_binding["game_seed_count"], dtype=np.int64
+        ),
+        validation_game_seed_set_sha256=np.asarray(validation_seed_digest),
     )
     scope_digest, scope_count = scope_inventory_sha256(high_regret_scope)
     high_regret_suite = tmp_path / "high_regret.suite.json"
@@ -556,6 +589,7 @@ def _fixture(
         "suite": "held_out_high_regret",
         "held_out": True,
         "source_manifest": _checkpoint_ref(high_regret_source_manifest),
+        "validation_seed_manifest": validation_binding,
         "selection": {
             "algorithm": "stable-hash-holdout-stratified-regret-v1",
             "holdout_fraction": 0.1,

@@ -44,6 +44,7 @@ from tools.high_regret_suite_contract import (  # noqa: E402
     SUITE_SCHEMA,
     bind_state_to_manifest,
     load_source_manifest,
+    load_source_validation_binding,
     validate_replay_metadata,
     validate_replay_trajectories,
 )
@@ -2852,6 +2853,7 @@ def _verify_high_regret_source(
             "suite",
             "held_out",
             "source_manifest",
+            "validation_seed_manifest",
             "selection",
             "states",
             "suite_sha256",
@@ -2876,6 +2878,17 @@ def _verify_high_regret_source(
         base=suite_path.parent,
         where=f"{where}.suite_manifest.source_manifest",
     )
+    validation_binding = _require_exact_keys(
+        suite["validation_seed_manifest"],
+        {
+            "path",
+            "sha256",
+            "schema_version",
+            "game_seed_count",
+            "game_seed_set_sha256",
+        },
+        where=f"{where}.suite_manifest.validation_seed_manifest",
+    )
     selection = suite["selection"]
     states = suite["states"]
     if (
@@ -2889,8 +2902,15 @@ def _verify_high_regret_source(
     try:
         validate_replay_metadata(selection, states)
         shard_paths, manifest_identities = load_source_manifest(source_manifest_path)
+        held_out_seeds, source_validation_binding = load_source_validation_binding(
+            source_manifest_path
+        )
     except ValueError as error:
         raise PromotionError(f"{where} {error}") from error
+    if validation_binding != source_validation_binding:
+        raise PromotionError(
+            f"{where} suite and source manifest bind different training holdouts"
+        )
     expected_strata = {
         "phase:opening",
         "phase:robber_dev",
@@ -2941,6 +2961,7 @@ def _verify_high_regret_source(
             or pair_id < 0
             or isinstance(game_seed, bool)
             or not isinstance(game_seed, int)
+            or game_seed not in held_out_seeds
             or isinstance(decision_index, bool)
             or not isinstance(decision_index, int)
             or decision_index < 0
