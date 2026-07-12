@@ -81,6 +81,7 @@ def _initialize(tmp_path: Path) -> tuple[Path, dict]:
         training_receipt=tmp_path / "train.receipt.json",
         python=Path(sys.executable),
         gpu=0,
+        bootstrap_history=True,
         verify_fn=lambda **_kwargs: verified,
     )
     return state_path, state
@@ -183,12 +184,211 @@ def test_initialize_preserves_virtualenv_python_path(tmp_path: Path) -> None:
         training_receipt=tmp_path / "training.receipt.json",
         python=python,
         gpu=0,
+        bootstrap_history=True,
         verify_fn=lambda **_kwargs: verified,
     )
 
     assert state["training"]["python"]["path"] == str(python.absolute())
     assert state["training"]["python"]["target_path"] == str(base.resolve())
     assert iteration._dose_argv(state, go=False)[-3] == str(python.absolute())
+
+
+def _fake_turn(tmp_path: Path, verified: dict) -> dict:
+    parent = _write(tmp_path / "next-parent.pt", "parent")
+    handoff = _write(tmp_path / "handoff.json", "handoff")
+    campaign = _write(tmp_path / "campaign.json", "campaign")
+    audit = _write(tmp_path / "audit.json", "audit")
+    value = {
+        "schema_version": iteration.flywheel.SCHEMA,
+        "promotion": {
+            "handoff": iteration._file_ref(handoff, where="test handoff"),
+            "handoff_sha256": "sha256:" + "1" * 64,
+            "receipt": iteration._file_ref(handoff, where="test receipt"),
+            "transaction_id": "turn-1",
+            "dethroned_champion_sha256": "sha256:" + "2" * 64,
+        },
+        "generator": {
+            "checkpoint": iteration._file_ref(parent, where="test parent"),
+            "registry_version": 2,
+            "agent_identity_sha256": "sha256:" + "3" * 64,
+            "search_config_sha256": "sha256:" + "4" * 64,
+        },
+        "generation": {
+            "campaign": iteration._file_ref(campaign, where="test campaign"),
+            "campaign_contract_sha256": verified["contract_sha256"],
+            "audit": iteration._file_ref(audit, where="test audit"),
+            "audit_sha256": "sha256:" + "5" * 64,
+            "shard_inventory_sha256": "sha256:" + "6" * 64,
+            "selected_game_seed_set_sha256": verified["selected_game_seed_set_sha256"],
+        },
+        "corpus": {
+            "meta": iteration._file_ref(
+                tmp_path / "corpus/corpus_meta.json", where="test meta"
+            )
+        },
+        "learner_parent": iteration._file_ref(parent, where="test learner parent"),
+        "evaluation_parent": iteration._file_ref(parent, where="test eval parent"),
+        "initializer": {
+            "mode": "exact_parent",
+            "checkpoint": iteration._file_ref(parent, where="test init"),
+            "receipt": None,
+        },
+    }
+    value["turn_sha256"] = iteration.flywheel._digest(value)  # noqa: SLF001
+    return value
+
+
+def _initialize_next_fake(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, state_name: str = "next.json"
+) -> tuple[Path, dict, dict]:
+    verified, paths = _verified(tmp_path)
+    turn = _fake_turn(tmp_path, verified)
+    monkeypatch.setattr(
+        iteration.flywheel, "verify_turn", lambda _path, *, verified: turn
+    )
+    state_path = tmp_path / state_name
+    state = iteration.initialize_next(
+        state_path=state_path,
+        turn_path=tmp_path / f"{state_name}.turn.json",
+        handoff_path=tmp_path / "handoff.json",
+        campaign_path=tmp_path / "campaign.json",
+        audit_path=tmp_path / "audit.json",
+        lock_path=paths["lock"],
+        data_path=paths["data"],
+        validation_path=paths["validation"],
+        learner_parent=tmp_path / "next-parent.pt",
+        evaluation_parent=tmp_path / "next-parent.pt",
+        initializer=tmp_path / "next-parent.pt",
+        architecture_upgrade_receipt=None,
+        checkpoint=tmp_path / f"{state_name}.candidate.pt",
+        report=tmp_path / f"{state_name}.report.json",
+        training_receipt=tmp_path / f"{state_name}.receipt.json",
+        python=Path(sys.executable),
+        gpu=0,
+        verify_fn=lambda **_kwargs: verified,
+        turn_builder=lambda **_kwargs: turn,
+    )
+    return state_path, state, verified
+
+
+def test_initialize_next_claims_fresh_corpus_once_and_rejects_cross_turn_reuse(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, state, verified = _initialize_next_fake(tmp_path, monkeypatch)
+    assert state["training"]["initialization_mode"] == "next_turn"
+    assert state["history"][0]["action"] == "initialize_next"
+    same = iteration.initialize_next(
+        state_path=tmp_path / "next.json",
+        turn_path=tmp_path / "next.json.turn.json",
+        handoff_path=tmp_path / "handoff.json",
+        campaign_path=tmp_path / "campaign.json",
+        audit_path=tmp_path / "audit.json",
+        lock_path=tmp_path / "contract.lock.json",
+        data_path=tmp_path / "corpus",
+        validation_path=tmp_path / "validation.json",
+        learner_parent=tmp_path / "next-parent.pt",
+        evaluation_parent=tmp_path / "next-parent.pt",
+        initializer=tmp_path / "next-parent.pt",
+        architecture_upgrade_receipt=None,
+        checkpoint=tmp_path / "next.json.candidate.pt",
+        report=tmp_path / "next.json.report.json",
+        training_receipt=tmp_path / "next.json.receipt.json",
+        python=Path(sys.executable),
+        gpu=0,
+        verify_fn=lambda **_kwargs: verified,
+        turn_builder=lambda **_kwargs: _fake_turn(tmp_path, verified),
+    )
+    assert same["iteration_id"] == state["iteration_id"]
+
+    with pytest.raises(iteration.IterationError, match="already consumed"):
+        iteration.initialize_next(
+            state_path=tmp_path / "other-state.json",
+            turn_path=tmp_path / "other-turn.json",
+            handoff_path=tmp_path / "handoff.json",
+            campaign_path=tmp_path / "campaign.json",
+            audit_path=tmp_path / "audit.json",
+            lock_path=tmp_path / "contract.lock.json",
+            data_path=tmp_path / "corpus",
+            validation_path=tmp_path / "validation.json",
+            learner_parent=tmp_path / "next-parent.pt",
+            evaluation_parent=tmp_path / "next-parent.pt",
+            initializer=tmp_path / "next-parent.pt",
+            architecture_upgrade_receipt=None,
+            checkpoint=tmp_path / "other.pt",
+            report=tmp_path / "other.report.json",
+            training_receipt=tmp_path / "other.receipt.json",
+            python=Path(sys.executable),
+            gpu=0,
+            verify_fn=lambda **_kwargs: verified,
+            turn_builder=lambda **_kwargs: _fake_turn(tmp_path, verified),
+        )
+
+
+def test_next_turn_tamper_refuses_before_dose_runner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_path, state, verified = _initialize_next_fake(tmp_path, monkeypatch)
+    turn_path = Path(state["training"]["flywheel_turn"]["path"])
+    turn_path.chmod(0o644)
+    turn_path.write_text("tampered", encoding="utf-8")
+    called = False
+
+    def runner(*_args, **_kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("runner must not launch")
+
+    with pytest.raises(iteration.IterationError, match="hash drift"):
+        iteration.dose_dry_run(
+            state_path=state_path,
+            runner=runner,
+            verify_fn=lambda **_kwargs: verified,
+        )
+    assert called is False
+
+
+def test_next_turn_upgrade_receipt_is_forwarded_to_one_dose(tmp_path: Path) -> None:
+    receipt = _write(tmp_path / "upgrade.receipt.json", "receipt")
+    turn_path = tmp_path / "turn.json"
+    turn_path.write_text(
+        json.dumps({"initializer": {"receipt": {"path": str(receipt)}}}),
+        encoding="utf-8",
+    )
+    state = {
+        "training": {
+            "initialization_mode": "next_turn",
+            "flywheel_turn": {"path": str(turn_path)},
+            "lock": {"path": "lock"},
+            "data": "data",
+            "validation_manifest": {"path": "validation"},
+            "checkpoint": "candidate",
+            "report": "report",
+            "receipt": "training-receipt",
+            "python": {"path": "python"},
+            "gpu": 0,
+        }
+    }
+    argv = iteration._dose_argv(state, go=False)
+    index = argv.index("--architecture-upgrade-receipt")
+    assert argv[index + 1] == str(receipt)
+
+
+def test_bootstrap_initialize_is_explicit(tmp_path: Path) -> None:
+    verified, paths = _verified(tmp_path)
+    with pytest.raises(iteration.IterationError, match="explicit"):
+        iteration.initialize(
+            state_path=tmp_path / "iteration.json",
+            lock_path=paths["lock"],
+            data_path=paths["data"],
+            validation_path=paths["validation"],
+            checkpoint=tmp_path / "candidate.pt",
+            report=tmp_path / "report.json",
+            training_receipt=tmp_path / "receipt.json",
+            python=Path(sys.executable),
+            gpu=0,
+            bootstrap_history=False,
+            verify_fn=lambda **_kwargs: verified,
+        )
 
 
 def test_state_tampering_is_rejected(tmp_path: Path) -> None:

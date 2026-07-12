@@ -36,6 +36,7 @@ if str(_REPO_ROOT) not in sys.path:
 
 from tools import a1_one_dose_train as one_dose  # noqa: E402
 from tools import a1_promotion_transaction as promotion  # noqa: E402
+from tools import a1_flywheel_turn as flywheel  # noqa: E402
 
 
 STATE_SCHEMA = "a1-iteration-state-v1"
@@ -195,6 +196,22 @@ def _verify_state(state: Any) -> dict[str, Any]:
     _verify_executable_ref(training.get("python"), where="training.python")
     if not Path(str(training.get("data"))).resolve(strict=True).is_dir():
         raise IterationError("bound A1 corpus directory is missing")
+    mode = training.get("initialization_mode")
+    if mode not in {"bootstrap_history", "next_turn"}:
+        raise IterationError("iteration has no explicit initialization mode")
+    if mode == "bootstrap_history":
+        if (
+            training.get("flywheel_turn") is not None
+            or training.get("corpus_consumption") is not None
+        ):
+            raise IterationError(
+                "bootstrap/history iteration may not claim a next turn"
+            )
+    else:
+        _verify_ref(training.get("flywheel_turn"), where="training.flywheel_turn")
+        _verify_ref(
+            training.get("corpus_consumption"), where="training.corpus_consumption"
+        )
     return state
 
 
@@ -290,9 +307,19 @@ def initialize(
     training_receipt: Path,
     python: Path,
     gpu: int,
+    bootstrap_history: bool,
     verify_fn: Callable[..., dict[str, Any]] = one_dose.verify_training_inputs,
 ) -> dict[str, Any]:
-    """Verify and bind one immutable corpus and one fresh learner dose."""
+    """Explicitly initialize a bootstrap/historical dose.
+
+    This path cannot represent a post-promotion flywheel turn.  Current turns
+    must use :func:`initialize_next` and carry the immutable lineage binding.
+    """
+
+    if bootstrap_history is not True:
+        raise IterationError(
+            "historical initialize requires explicit bootstrap_history=True"
+        )
 
     if gpu < 0:
         raise IterationError("gpu must be non-negative")
@@ -323,6 +350,9 @@ def initialize(
         "created_unix_ns": now,
         "updated_unix_ns": now,
         "training": {
+            "initialization_mode": "bootstrap_history",
+            "flywheel_turn": None,
+            "corpus_consumption": None,
             "contract_sha256": verified["contract_sha256"],
             "lock": _file_ref(Path(verified["lock_path"]), where="contract lock"),
             "data": str(Path(verified["data_path"]).resolve(strict=True)),
@@ -361,6 +391,231 @@ def initialize(
     }
     _write_state(state_path, state, create=True)
     return _load_state(state_path)
+
+
+def _claim_fresh_turn_corpus(
+    *, meta_path: Path, state_path: Path, turn_path: Path, turn_sha256: str
+) -> dict[str, str]:
+    """Atomically reserve one corpus for exactly one next-turn state."""
+
+    claim_path = meta_path.with_name(".a1-flywheel-corpus-consumption.json")
+    claim = {
+        "schema_version": flywheel.CONSUMPTION_SCHEMA,
+        "corpus_meta": _file_ref(meta_path, where="consumed corpus metadata"),
+        "state_path": str(state_path.expanduser().resolve(strict=False)),
+        "turn": _file_ref(turn_path, where="consuming flywheel turn"),
+        "turn_sha256": turn_sha256,
+    }
+    claim["claim_sha256"] = _value_sha256(claim)
+    payload = json.dumps(claim, indent=2, sort_keys=True).encode("utf-8") + b"\n"
+    try:
+        with claim_path.open("xb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except FileExistsError as error:
+        raise IterationError(
+            f"fresh corpus is already consumed by another flywheel turn: {claim_path}"
+        ) from error
+    _fsync_directory(claim_path.parent)
+    return _file_ref(claim_path, where="corpus consumption claim")
+
+
+def _verify_next_turn_binding(
+    state: dict[str, Any], *, verified: dict[str, Any]
+) -> dict[str, Any]:
+    training = state["training"]
+    if training.get("initialization_mode") != "next_turn":
+        raise IterationError(
+            "next-turn verification requested for bootstrap/history state"
+        )
+    turn_path = _verify_ref(training["flywheel_turn"], where="training.flywheel_turn")
+    claim_path = _verify_ref(
+        training["corpus_consumption"], where="training.corpus_consumption"
+    )
+    try:
+        turn = flywheel.verify_turn(turn_path, verified=verified)
+        claim = json.loads(claim_path.read_text(encoding="utf-8"))
+    except (
+        flywheel.FlywheelTurnError,
+        OSError,
+        UnicodeError,
+        json.JSONDecodeError,
+    ) as error:
+        raise IterationError(f"next-turn replay refused: {error}") from error
+    if not isinstance(claim, dict):
+        raise IterationError("corpus consumption claim is not an object")
+    unhashed = dict(claim)
+    stated = unhashed.pop("claim_sha256", None)
+    expected = {
+        "schema_version": flywheel.CONSUMPTION_SCHEMA,
+        "corpus_meta": training["corpus_meta"],
+        "state_path": str(Path(state["training"]["state_path"]).resolve(strict=False)),
+        "turn": training["flywheel_turn"],
+        "turn_sha256": turn["turn_sha256"],
+    }
+    if stated != _value_sha256(unhashed) or unhashed != expected:
+        raise IterationError("corpus consumption claim differs from this exact turn")
+    return turn
+
+
+def initialize_next(
+    *,
+    state_path: Path,
+    turn_path: Path,
+    handoff_path: Path,
+    campaign_path: Path,
+    audit_path: Path,
+    lock_path: Path,
+    data_path: Path,
+    validation_path: Path,
+    learner_parent: Path,
+    evaluation_parent: Path,
+    initializer: Path,
+    architecture_upgrade_receipt: Path | None,
+    checkpoint: Path,
+    report: Path,
+    training_receipt: Path,
+    python: Path,
+    gpu: int,
+    verify_fn: Callable[..., dict[str, Any]] = one_dose.verify_training_inputs,
+    turn_builder: Callable[..., dict[str, Any]] = flywheel.build_turn,
+) -> dict[str, Any]:
+    """Bind a fresh post-promotion corpus before any learner process can run."""
+
+    if gpu < 0:
+        raise IterationError("gpu must be non-negative")
+    python_ref = _executable_ref(python, where="learner python")
+    try:
+        verified = verify_fn(
+            lock_path=lock_path, data_path=data_path, validation_path=validation_path
+        )
+        one_dose._require_unconsumed_contract(verified)  # noqa: SLF001
+        claim = one_dose._claim_path(verified)  # noqa: SLF001
+        one_dose._require_fresh_outputs(  # noqa: SLF001
+            checkpoint.expanduser().resolve(strict=False),
+            report.expanduser().resolve(strict=False),
+            training_receipt.expanduser().resolve(strict=False),
+            claim=claim,
+        )
+        turn = turn_builder(
+            handoff_path=handoff_path,
+            campaign_path=campaign_path,
+            audit_path=audit_path,
+            verified=verified,
+            learner_parent=learner_parent,
+            evaluation_parent=evaluation_parent,
+            initializer=initializer,
+            architecture_upgrade_receipt=architecture_upgrade_receipt,
+        )
+    except (
+        one_dose.ExecutorError,
+        flywheel.FlywheelTurnError,
+        OSError,
+        KeyError,
+        TypeError,
+    ) as error:
+        raise IterationError(f"next-turn initialization refused: {error}") from error
+
+    if state_path.expanduser().resolve(strict=False).exists():
+        existing = _load_state(state_path)
+        training = existing["training"]
+        expected_paths = {
+            "lock": str(Path(verified["lock_path"]).resolve(strict=True)),
+            "data": str(Path(verified["data_path"]).resolve(strict=True)),
+            "validation": str(Path(verified["validation_path"]).resolve(strict=True)),
+            "checkpoint": str(checkpoint.expanduser().resolve(strict=False)),
+            "report": str(report.expanduser().resolve(strict=False)),
+            "receipt": str(training_receipt.expanduser().resolve(strict=False)),
+            "turn": str(turn_path.expanduser().resolve(strict=False)),
+        }
+        actual_paths = {
+            "lock": training.get("lock", {}).get("path"),
+            "data": training.get("data"),
+            "validation": training.get("validation_manifest", {}).get("path"),
+            "checkpoint": training.get("checkpoint"),
+            "report": training.get("report"),
+            "receipt": training.get("receipt"),
+            "turn": training.get("flywheel_turn", {}).get("path"),
+        }
+        if (
+            training.get("initialization_mode") != "next_turn"
+            or actual_paths != expected_paths
+            or training.get("python") != python_ref
+            or training.get("gpu") != gpu
+        ):
+            raise IterationError(
+                "existing next-turn state differs from requested initialization"
+            )
+        replayed = _verify_next_turn_binding(existing, verified=verified)
+        if replayed != turn:
+            raise IterationError(
+                "existing next-turn state binds a different flywheel turn"
+            )
+        return existing
+
+    flywheel.write_turn(turn_path, turn)
+    turn_ref = _file_ref(turn_path, where="flywheel turn")
+    meta_path = Path(verified["data_path"]) / "corpus_meta.json"
+    state_path = state_path.expanduser().resolve(strict=False)
+    consumption_ref = _claim_fresh_turn_corpus(
+        meta_path=meta_path,
+        state_path=state_path,
+        turn_path=turn_path,
+        turn_sha256=turn["turn_sha256"],
+    )
+    now = time.time_ns()
+    state = {
+        "schema_version": STATE_SCHEMA,
+        "iteration_id": uuid.uuid4().hex,
+        "stage": "corpus_verified",
+        "created_unix_ns": now,
+        "updated_unix_ns": now,
+        "training": {
+            "initialization_mode": "next_turn",
+            "state_path": str(state_path),
+            "flywheel_turn": turn_ref,
+            "corpus_consumption": consumption_ref,
+            "contract_sha256": verified["contract_sha256"],
+            "lock": _file_ref(Path(verified["lock_path"]), where="contract lock"),
+            "data": str(Path(verified["data_path"]).resolve(strict=True)),
+            "corpus_meta": _file_ref(meta_path, where="corpus metadata"),
+            "payload_inventory_sha256": verified["payload_inventory_sha256"],
+            "validation_manifest": _file_ref(
+                Path(verified["validation_path"]), where="validation manifest"
+            ),
+            "selected_game_seed_set_sha256": verified["selected_game_seed_set_sha256"],
+            "training_game_seed_set_sha256": verified["training_game_seed_set_sha256"],
+            "validation_game_seed_set_sha256": verified[
+                "validation_game_seed_set_sha256"
+            ],
+            "corpus_row_count": verified["corpus_row_count"],
+            "training_row_count": verified["training_row_count"],
+            "validation_row_count": verified["validation_row_count"],
+            "checkpoint": _new_path(checkpoint, where="training checkpoint"),
+            "report": _new_path(report, where="training report"),
+            "receipt": _new_path(training_receipt, where="training receipt"),
+            "python": python_ref,
+            "gpu": gpu,
+        },
+        "training_plan": None,
+        "training_outputs": None,
+        "evaluation": None,
+        "promotion": None,
+        "history": [
+            {
+                "action": "initialize_next",
+                "from": None,
+                "to": "corpus_verified",
+                "unix_ns": now,
+            }
+        ],
+        "state_sha256": "",
+    }
+    _write_state(state_path, state, create=True)
+    loaded = _load_state(state_path)
+    _verify_next_turn_binding(loaded, verified=verified)
+    return loaded
 
 
 def adopt_completed_retry(
@@ -405,6 +660,9 @@ def adopt_completed_retry(
     plan = chain["retry_plan"]
     refs = chain["refs"]
     training_binding = {
+        "initialization_mode": "bootstrap_history",
+        "flywheel_turn": None,
+        "corpus_consumption": None,
         "contract_sha256": verified["contract_sha256"],
         "lock": _file_ref(Path(verified["lock_path"]), where="contract lock"),
         "data": str(Path(verified["data_path"]).resolve(strict=True)),
@@ -518,6 +776,19 @@ def _dose_argv(state: dict[str, Any], *, go: bool) -> list[str]:
         "--gpu",
         str(training["gpu"]),
     ]
+    if training.get("initialization_mode") == "next_turn":
+        try:
+            turn = json.loads(
+                Path(training["flywheel_turn"]["path"]).read_text(encoding="utf-8")
+            )
+        except (OSError, UnicodeError, json.JSONDecodeError) as error:
+            raise IterationError(
+                f"cannot load bound flywheel turn command: {error}"
+            ) from error
+        initializer = turn.get("initializer") if isinstance(turn, dict) else None
+        receipt = initializer.get("receipt") if isinstance(initializer, dict) else None
+        if receipt is not None:
+            argv.extend(["--architecture-upgrade-receipt", str(receipt["path"])])
     if go:
         argv.append("--go")
     return argv
@@ -981,6 +1252,7 @@ def dose_dry_run(
     *,
     state_path: Path,
     runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+    verify_fn: Callable[..., dict[str, Any]] = one_dose.verify_training_inputs,
 ) -> dict[str, Any]:
     with _state_lock(state_path):
         state = _load_state(state_path)
@@ -988,6 +1260,20 @@ def dose_dry_run(
             return state
         if state["stage"] != "corpus_verified":
             raise IterationError("dose dry-run cannot skip the verified-corpus stage")
+        if state["training"]["initialization_mode"] == "next_turn":
+            try:
+                verified = verify_fn(
+                    lock_path=Path(state["training"]["lock"]["path"]),
+                    data_path=Path(state["training"]["data"]),
+                    validation_path=Path(
+                        state["training"]["validation_manifest"]["path"]
+                    ),
+                )
+            except (one_dose.ExecutorError, OSError) as error:
+                raise IterationError(
+                    f"next-turn corpus replay refused: {error}"
+                ) from error
+            _verify_next_turn_binding(state, verified=verified)
         plan = _run_json_tool(_dose_argv(state, go=False), runner=runner)
         if (
             plan.get("schema_version") != one_dose.PLAN_SCHEMA
@@ -1078,6 +1364,7 @@ def dose_go(
     *,
     state_path: Path,
     runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+    verify_fn: Callable[..., dict[str, Any]] = one_dose.verify_training_inputs,
 ) -> dict[str, Any]:
     with _state_lock(state_path):
         state = _load_state(state_path)
@@ -1085,6 +1372,20 @@ def dose_go(
             return state
         if state["stage"] != "dose_dry_run":
             raise IterationError("dose execution requires a recorded one-dose dry-run")
+        if state["training"]["initialization_mode"] == "next_turn":
+            try:
+                verified = verify_fn(
+                    lock_path=Path(state["training"]["lock"]["path"]),
+                    data_path=Path(state["training"]["data"]),
+                    validation_path=Path(
+                        state["training"]["validation_manifest"]["path"]
+                    ),
+                )
+            except (one_dose.ExecutorError, OSError) as error:
+                raise IterationError(
+                    f"next-turn pre-launch replay refused: {error}"
+                ) from error
+            _verify_next_turn_binding(state, verified=verified)
         receipt_path = Path(state["training"]["receipt"])
         if not receipt_path.exists():
             # The one-dose process prints the JSON plan before launching
@@ -1332,7 +1633,10 @@ def status(*, state_path: Path) -> dict[str, Any]:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
-    init = sub.add_parser("init", help="verify and bind the sealed A1 corpus")
+    init = sub.add_parser(
+        "init-bootstrap",
+        help="explicit historical/bootstrap initialization (not a next turn)",
+    )
     init.add_argument("--state", required=True, type=Path)
     init.add_argument("--lock", required=True, type=Path)
     init.add_argument("--data", required=True, type=Path)
@@ -1342,6 +1646,26 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--training-receipt", required=True, type=Path)
     init.add_argument("--python", type=Path, default=Path(sys.executable))
     init.add_argument("--gpu", type=int, default=0)
+    next_init = sub.add_parser(
+        "initialize-next", help="bind a fresh post-promotion flywheel turn"
+    )
+    next_init.add_argument("--state", required=True, type=Path)
+    next_init.add_argument("--turn", required=True, type=Path)
+    next_init.add_argument("--post-promotion-handoff", required=True, type=Path)
+    next_init.add_argument("--generation-campaign", required=True, type=Path)
+    next_init.add_argument("--generation-audit", required=True, type=Path)
+    next_init.add_argument("--lock", required=True, type=Path)
+    next_init.add_argument("--data", required=True, type=Path)
+    next_init.add_argument("--validation-manifest", required=True, type=Path)
+    next_init.add_argument("--learner-parent", required=True, type=Path)
+    next_init.add_argument("--evaluation-parent", required=True, type=Path)
+    next_init.add_argument("--initializer", required=True, type=Path)
+    next_init.add_argument("--architecture-upgrade-receipt", type=Path)
+    next_init.add_argument("--checkpoint", required=True, type=Path)
+    next_init.add_argument("--report", required=True, type=Path)
+    next_init.add_argument("--training-receipt", required=True, type=Path)
+    next_init.add_argument("--python", type=Path, default=Path(sys.executable))
+    next_init.add_argument("--gpu", type=int, default=0)
     retry = sub.add_parser(
         "adopt-retry",
         help="adopt the authorized completed v4 retry without rerunning training",
@@ -1374,12 +1698,33 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        if args.command == "init":
+        if args.command == "init-bootstrap":
             result = initialize(
                 state_path=args.state,
                 lock_path=args.lock,
                 data_path=args.data,
                 validation_path=args.validation_manifest,
+                checkpoint=args.checkpoint,
+                report=args.report,
+                training_receipt=args.training_receipt,
+                python=args.python,
+                gpu=args.gpu,
+                bootstrap_history=True,
+            )
+        elif args.command == "initialize-next":
+            result = initialize_next(
+                state_path=args.state,
+                turn_path=args.turn,
+                handoff_path=args.post_promotion_handoff,
+                campaign_path=args.generation_campaign,
+                audit_path=args.generation_audit,
+                lock_path=args.lock,
+                data_path=args.data,
+                validation_path=args.validation_manifest,
+                learner_parent=args.learner_parent,
+                evaluation_parent=args.evaluation_parent,
+                initializer=args.initializer,
+                architecture_upgrade_receipt=args.architecture_upgrade_receipt,
                 checkpoint=args.checkpoint,
                 report=args.report,
                 training_receipt=args.training_receipt,
