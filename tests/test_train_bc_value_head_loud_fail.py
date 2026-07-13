@@ -94,3 +94,7 @@ def test_zero_weight_optional_heads_are_frozen_before_optimizer_construction():
     assert all(not p.requires_grad for p in model.deliberation_halt_head.parameters())
     assert report["active_optional_submodules"] == ["value_uncertainty_head"]
     assert "deliberation_halt_head" in report["frozen_submodules"]
+    assert model._inactive_training_head_modules == frozenset(
+        report["frozen_submodules"]
+    )
+    assert report["zero_weight_skips_forward"] is True
