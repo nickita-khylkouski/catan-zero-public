@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.machinery
 import json
 import sys
 from pathlib import Path
@@ -17,6 +18,7 @@ from catanatron_neutral_harness_match import (  # type: ignore  # noqa: E402
     _create_search,
     _game_semantics,
     _load_game_artifacts,
+    _native_runtime_extension_path,
     _prepare_manifest,
     _run_fingerprint,
     _build_evaluator,
@@ -465,6 +467,34 @@ def test_retry_fingerprint_changes_across_engine_build_identity() -> None:
     second = _game_semantics(args, "checkpoint-md5", "sha256:" + "1" * 64)
     assert first["engine_identity"]["native_runtime_sha256"] == "sha256:" + "d" * 64
     assert _run_fingerprint(first) != _run_fingerprint(second)
+
+
+def test_native_runtime_fingerprint_targets_compiled_extension(
+    tmp_path: Path, monkeypatch
+) -> None:
+    suffix = importlib.machinery.EXTENSION_SUFFIXES[0]
+    extension = tmp_path / f"catanatron_rs{suffix}"
+    extension.write_bytes(b"native-extension")
+    monkeypatch.setattr(
+        "catanatron_neutral_harness_match.importlib.import_module",
+        lambda name: SimpleNamespace(__file__=str(extension)),
+    )
+
+    assert _native_runtime_extension_path() == extension.resolve()
+
+
+def test_native_runtime_fingerprint_refuses_python_package_shim(
+    tmp_path: Path, monkeypatch
+) -> None:
+    shim = tmp_path / "__init__.py"
+    shim.write_text("from .catanatron_rs import *\n", encoding="utf-8")
+    monkeypatch.setattr(
+        "catanatron_neutral_harness_match.importlib.import_module",
+        lambda name: SimpleNamespace(__file__=str(shim)),
+    )
+
+    with pytest.raises(RuntimeError, match="compiled extension"):
+        _native_runtime_extension_path()
 
 
 def test_search_evaluator_receives_explicit_categorical_readout(monkeypatch) -> None:

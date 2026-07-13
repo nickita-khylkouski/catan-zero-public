@@ -462,6 +462,9 @@ def _fixture(
             "games_played": 400,
             "games_with_winner": 400,
             "games_truncated": 0,
+            "candidate_wins": 400,
+            "baseline_wins": 0,
+            "candidate_win_rate": 1.0,
             "errors": [],
             "games": internal_games,
             "pair_diagnostics": pair_diagnostics,
@@ -2248,6 +2251,24 @@ def test_transaction_rejects_forged_high_regret_orientation_color(
     )
 
     with pytest.raises(promotion.PromotionError, match="orientation/color mismatch"):
+        _execute(fixture, go=False)
+
+
+def test_transaction_rejects_internal_candidate_search_outcome_alias_drift(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path)
+
+    def mutate(source: dict) -> None:
+        source["games"][0]["candidate_won"] = False
+
+    _mutate_evidence_source(
+        fixture, kind="internal_h2h", role="internal_h2h", mutate=mutate
+    )
+
+    with pytest.raises(
+        promotion.PromotionError, match="candidate_won/search_won alias drift"
+    ):
         _execute(fixture, go=False)
 
 

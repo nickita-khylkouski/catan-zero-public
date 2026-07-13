@@ -1717,6 +1717,10 @@ def _preflight_command(
         f'test "$(git rev-parse HEAD)" = {shlex.quote(plan["repo_commit"])}',
         "git diff --quiet --exit-code -- .",
         "git diff --cached --quiet --exit-code -- .",
+        # Tracked-diff checks do not see an untracked Python module placed on
+        # PYTHONPATH. Such a file can change evaluator behavior while HEAD and
+        # every sealed tool hash still look correct.
+        'test -z "$(git status --porcelain=v1 --untracked-files=all)"',
         (
             "grep -Fxq "
             + shlex.quote(

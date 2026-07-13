@@ -136,6 +136,15 @@ def _plan(
     return manifest, plan
 
 
+def test_remote_preflight_refuses_untracked_runtime_code(tmp_path: Path) -> None:
+    manifest, plan = _plan(tmp_path)
+    host = manifest["hosts"][0]
+
+    command = fleet._preflight_command(manifest, plan, host)  # noqa: SLF001
+
+    assert 'test -z "$(git status --porcelain=v1 --untracked-files=all)"' in command
+
+
 def _registry(tmp_path: Path, champion: Path, *, c_scale: float = 0.03) -> ChampionRegistry:
     registry = ChampionRegistry(tmp_path / "champion_registry.json")
     search_config = {"c_scale": c_scale}

@@ -225,6 +225,20 @@ def _validate_and_normalize_games(
                 or bool(game.get("engine_divergence", False))
             ):
                 raise PoolError(f"{path}.games[{index}] is not a complete clean game")
+            # ``search_won`` is the legacy field consumed by the pentanomial
+            # helper while every headline win-rate field is computed from
+            # ``candidate_won``.  They are aliases for these candidate-vs-
+            # baseline reports, not two independent observations.  Refuse a
+            # corrupt/mixed producer rather than letting the gate and the
+            # displayed result score different winners.
+            if (
+                not isinstance(game.get("candidate_won"), bool)
+                or not isinstance(game.get("search_won"), bool)
+                or game["candidate_won"] is not game["search_won"]
+            ):
+                raise PoolError(
+                    f"{path}.games[{index}] candidate_won/search_won alias drift"
+                )
             game["source_pair_id"] = source_pair_id
             game["source_report_sha256"] = source_sha
             by_seed.setdefault(seed, []).append(game)

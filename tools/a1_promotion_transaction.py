@@ -3357,6 +3357,30 @@ def _verify_internal_h2h_source(
         raise PromotionError(f"{where} does not retain its complete game evidence")
     if len(games) != int(payload.get("games_with_winner", -1)):
         raise PromotionError(f"{where} has incomplete winner records")
+    outcomes: list[bool] = []
+    for index, game in enumerate(games):
+        if not isinstance(game, dict):
+            raise PromotionError(f"{where}.games[{index}] is not an object")
+        candidate_won = game.get("candidate_won")
+        search_won = game.get("search_won")
+        if (
+            not isinstance(candidate_won, bool)
+            or not isinstance(search_won, bool)
+            or candidate_won is not search_won
+        ):
+            raise PromotionError(
+                f"{where}.games[{index}] candidate_won/search_won alias drift"
+            )
+        outcomes.append(candidate_won)
+    wins = sum(outcomes)
+    if (
+        payload.get("candidate_wins") != wins
+        or payload.get("baseline_wins") != len(outcomes) - wins
+        or payload.get("candidate_win_rate") != wins / len(outcomes)
+    ):
+        raise PromotionError(
+            f"{where} win-rate summary does not replay from raw games"
+        )
     pair_scores, diagnostics = pair_scores_from_h2h_games(games)
     replayed = evaluate_pentanomial_sprt(
         pair_scores, elo0=-10.0, elo1=15.0, alpha=0.05, beta=0.05

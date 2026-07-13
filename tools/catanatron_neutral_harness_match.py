@@ -26,6 +26,8 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib
+import importlib.machinery
 import json
 import multiprocessing
 import os
@@ -397,6 +399,30 @@ def _checkpoint_md5(path: str | Path) -> str:
 
 def _checkpoint_sha256(path: str | Path) -> str:
     return _checkpoint_digests(path)[1]
+
+
+def _native_runtime_extension_path() -> Path:
+    """Return the compiled catanatron_rs extension, never its package shim.
+
+    ``catanatron_rs.__file__`` points at the tiny Python ``__init__.py`` that
+    wildcard-imports the actual extension. Hashing that shim made unrelated
+    native builds look identical in external-panel provenance.
+    """
+
+    native = importlib.import_module("catanatron_rs.catanatron_rs")
+    raw_path = getattr(native, "__file__", None)
+    if not isinstance(raw_path, str) or not raw_path:
+        raise RuntimeError("catanatron_rs native extension has no __file__")
+    path = Path(raw_path).resolve(strict=True)
+    if not any(
+        str(path).endswith(suffix)
+        for suffix in importlib.machinery.EXTENSION_SUFFIXES
+    ):
+        raise RuntimeError(
+            "catanatron_rs native implementation did not resolve to a compiled "
+            f"extension: {path}"
+        )
+    return path
 
 
 def _run_fingerprint(config: dict[str, Any]) -> str:
@@ -1166,11 +1192,9 @@ def main() -> None:
             ):
                 parser.error(f"search mode requires --{name.replace('_', '-')}")
         try:
-            import catanatron_rs
-
-            native_runtime = Path(catanatron_rs.__file__).resolve(strict=True)
+            native_runtime = _native_runtime_extension_path()
             args.native_runtime_sha256 = _checkpoint_sha256(native_runtime)
-        except (ImportError, OSError, TypeError, ValueError) as error:
+        except (ImportError, OSError, RuntimeError, TypeError, ValueError) as error:
             parser.error(f"cannot fingerprint installed native runtime: {error}")
     if args.mode == "search" and int(args.max_player_trade_offers_per_turn) != 0:
         parser.error(

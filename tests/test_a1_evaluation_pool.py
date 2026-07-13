@@ -242,6 +242,28 @@ def test_internal_pool_reindexes_local_pair_ids_and_recomputes_gate(
     ]
 
 
+@pytest.mark.parametrize("kind", ["internal", "neutral"])
+def test_pool_refuses_candidate_search_outcome_alias_drift(
+    tmp_path: Path, kind: str
+) -> None:
+    candidate = _checkpoint(tmp_path, "candidate.pt")
+    champion = _checkpoint(tmp_path, "champion.pt")
+    report = (
+        _internal_report(candidate, champion, 9001)
+        if kind == "internal"
+        else _neutral_report(candidate, 9001)
+    )
+    report["games"][0]["candidate_won"] = False
+    path = tmp_path / f"{kind}.json"
+    _write(path, report)
+
+    with pytest.raises(pool.PoolError, match="candidate_won/search_won alias drift"):
+        if kind == "internal":
+            pool.pool_internal([path], candidate=candidate, champion=champion)
+        else:
+            pool.pool_neutral([path], checkpoint=candidate)
+
+
 def test_internal_pool_refuses_duplicate_seed_across_hosts(tmp_path: Path) -> None:
     candidate = _checkpoint(tmp_path, "candidate.pt")
     champion = _checkpoint(tmp_path, "champion.pt")
