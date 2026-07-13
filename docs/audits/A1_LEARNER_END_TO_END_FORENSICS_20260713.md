@@ -417,31 +417,40 @@ saturation followed by continued representation movement; it is not evidence
 that the short checkpoint is competitively stronger, which still requires the
 matched behavior panel.
 
-This does **not** prove the midpoint plays better: only matched head-to-head
-evaluation can decide that. It does prove that offline distillation saturates
-far earlier than representation movement. Therefore midpoint and full P0 must
-both be evaluated against exact f7 under the same operator. If midpoint is at
-least as strong, future arms should use a short dose/early selection rather than
-assuming one full 4.19M-row dose is optimal.
-
-The first behavior screen now supplies the missing midpoint evidence. Against
+Offline distillation therefore saturates far earlier than representation
+movement. The matched behavior screens now decide whether that extra movement
+buys strength. Against
 exact f7 at the matched deployed operator, the 524,288-row checkpoint scored
 `75-53` over 128 games (`58.59375%`), with 64 complete seat-swapped pairs,
 pentanomial counts `WW=17, split=41, LL=6`, and zero truncations/errors. The
 superiority pentanomial LLR is `1.177`, so this short screen is encouraging but
 correctly remains `continue`, not promotion evidence. Its pooled artifact is
 `/home/ubuntu/experimental_nonpromotable/p0-temp-midpoint-v-f7-screen-20260713-r1/collected/a1-eval-d801f3ef6377fcad/pooled/internal.json`
-on the evaluation controller. The full-dose checkpoint is being evaluated on
-the identical seed cohort; only that paired result selects the Pareto dose.
+on the evaluation controller.
+
+The 4,194,304-row checkpoint then scored only `65-63` over the **same 128
+`(game_seed, orientation)` keys** (`50.78125%`), with 64 complete pairs and zero
+truncations/errors. Pairing the two candidate screens game-for-game gives 41
+games both candidates won, 29 both lost, 34 won only by the midpoint, and 24
+won only by the full-dose candidate: an observed midpoint advantage of 10
+games, or 7.8125 percentage points. The discordant count is not large enough
+to claim a statistically certain negative dose-response; it is, however,
+decisive for the preregistered Pareto rule. The full dose is not more than two
+percentage points stronger--it is not stronger at all in this screen--so there
+is no behavioral return for its 8x samples, 12.41x LR-area, and 3.75x parameter
+drift.
+
+**Selected learner dose: 524,288 global row draws / 128 optimizer steps at
+8x512.** This is an experimental dose selection, not a promotion claim. Every
+next one-axis arm must independently reload exact f7, use the identical sampled
+rows/order and selected dose, and evaluate against exact f7 under the same
+deployed search operator.
 
 ### P2 — highest-information learner arms
 
-Before launching an arm, adjudicate the already-written 524,288-row and
-4,194,304-row checkpoints head-to-head and against exact f7 on common seeds at
-the deployed operator. Select the smallest dose within two percentage points of
-the best paired behavior result. Offline loss cannot authorize continuation to
-the full dose. Then every arm independently reloads f7 and consumes that one
-selected identical dose:
+The matched screen selected the 524,288-row / 128-step dose above. Offline loss
+cannot authorize continuation to the full dose. Every arm independently reloads
+f7 and consumes that one selected identical dose:
 
 1. TEMP baseline reproduction;
 2. zero-init target gather;
