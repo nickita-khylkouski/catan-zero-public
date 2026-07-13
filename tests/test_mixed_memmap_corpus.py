@@ -146,6 +146,8 @@ def test_known_optional_columns_are_synthesized_with_safe_semantics():
             "used_full_search": np.asarray([False, True]),
             "root_value": np.asarray([0.2, 0.4], dtype=np.float32),
             "root_value_mask": np.asarray([True, True]),
+            "aux_subgoal_target_version": np.asarray([1, 1], dtype=np.uint8),
+            "aux_vp_in_n": np.asarray([0.5, 1.5], dtype=np.float32),
         }
     )
     current._columns.update(
@@ -156,6 +158,16 @@ def test_known_optional_columns_are_synthesized_with_safe_semantics():
             "used_full_search": {"kind": "fixed", "dtype": "bool", "inner_shape": []},
             "root_value": {"kind": "fixed", "dtype": "float32", "inner_shape": []},
             "root_value_mask": {"kind": "fixed", "dtype": "bool", "inner_shape": []},
+            "aux_subgoal_target_version": {
+                "kind": "fixed",
+                "dtype": "uint8",
+                "inner_shape": [],
+            },
+            "aux_vp_in_n": {
+                "kind": "fixed",
+                "dtype": "float32",
+                "inner_shape": [],
+            },
         }
     )
     old = _Corpus(2, 2)
@@ -178,8 +190,19 @@ def test_known_optional_columns_are_synthesized_with_safe_semantics():
     assert np.array_equal(mixed["used_full_search"][:], [False, True, False, True])
     assert np.allclose(mixed["root_value"][:], [0.2, 0.4, 0.0, 0.0])
     assert np.array_equal(mixed["root_value_mask"][:], [True, True, False, False])
+    assert np.array_equal(mixed["aux_subgoal_target_version"][:], [1, 1, 0, 0])
+    assert np.array_equal(
+        mixed["aux_vp_in_n"][:], [0.5, 1.5, np.nan, np.nan], equal_nan=True
+    )
     assert mixed.synthesized_columns_by_component == {
-        1: ("is_forced", "root_value", "root_value_mask", "used_full_search")
+        1: (
+            "aux_subgoal_target_version",
+            "aux_vp_in_n",
+            "is_forced",
+            "root_value",
+            "root_value_mask",
+            "used_full_search",
+        )
     }
 
 

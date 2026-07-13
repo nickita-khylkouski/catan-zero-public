@@ -203,6 +203,8 @@ def test_incremental_resume_after_simulated_preemption(tmp_path, monkeypatch):
     progress = gsp._load_worker_progress(out_dir)
     assert progress is not None
     assert progress.run_id == run_id
+    assert progress.aux_subgoal_target_version == gsp.AUX_SUBGOAL_TARGET_VERSION
+    assert progress.aux_subgoal_target_semantic == gsp.AUX_SUBGOAL_TARGET_SEMANTIC
     # Games 0-6 (7 games) had exactly enough rows to fill 7 shards
     # (SHARD_SIZE == DECISIONS_PER_GAME), so all 7 are durably confirmed
     # before game 7 (offset 7, the 8th game) even started.
@@ -291,6 +293,79 @@ def test_resume_is_a_noop_when_no_progress_file_exists(tmp_path, monkeypatch):
     assert seen == [0, 1, 2]
     assert summary["resumed_from_offset"] == 0
     assert summary["games_completed"] == 3
+
+
+def test_resume_replays_from_zero_when_progress_has_legacy_aux_semantics(
+    tmp_path, monkeypatch
+):
+    """Old progress must not bless old aux labels with a current manifest."""
+    out_dir = tmp_path / "worker_000"
+    out_dir.mkdir()
+    legacy_progress = {
+        "run_id": "run-legacy",
+        "base_seed": 700,
+        "game_index_start": 0,
+        "games_requested": 2,
+        "games_completed_local": 1,
+        "shard_count_confirmed": 1,
+        "rows_confirmed": SHARD_SIZE,
+        "games_failed": 0,
+        "games_truncated": 0,
+        "rows": SHARD_SIZE,
+        "decisions_total": DECISIONS_PER_GAME,
+        "forced_decisions_total": 0,
+        "simulations_used_total": DECISIONS_PER_GAME,
+        "wins_by_color": {"RED": 1, "BLUE": 0},
+        # Intentionally no aux_subgoal_target_version/semantic: this is the
+        # exact shape written before strict-future target versioning existed.
+    }
+    malformed_progress = {
+        **legacy_progress,
+        gsp.AUX_SUBGOAL_TARGET_VERSION_KEY: True,
+        "aux_subgoal_target_semantic": gsp.AUX_SUBGOAL_TARGET_SEMANTIC,
+    }
+    (out_dir / gsp.PROGRESS_FILENAME).write_text(
+        json.dumps(malformed_progress), encoding="utf-8"
+    )
+    assert gsp._load_worker_progress(out_dir) is None
+    (out_dir / gsp.PROGRESS_FILENAME).write_text(
+        json.dumps(legacy_progress), encoding="utf-8"
+    )
+    orphan = out_dir / "gumbel_self_play_shard_00005.npz"
+    orphan.write_bytes(b"legacy-shard")
+    assert gsp._load_worker_progress(out_dir) is None
+
+    seen: list[int] = []
+
+    def _stub(mcts, evaluator, *, config, game_seed, game_index, action_size, **_kwargs):
+        seen.append(game_index)
+        return _fake_game_record(game_seed, game_index, config.colors)
+
+    monkeypatch.setattr(gsp, "play_one_game", _stub)
+    monkeypatch.setattr(gcm, "_require_rust_module", lambda: None)
+
+    summary = gsp.run_worker_games(
+        out_dir=out_dir,
+        games=2,
+        game_index_start=0,
+        base_seed=700,
+        worker_seed=1,
+        config=_stub_config(),
+        search_config=GumbelChanceMCTSConfig(),
+        evaluator=_StubEvaluator(),
+        shard_size=SHARD_SIZE,
+        fmt="npz",
+        run_id="run-legacy",
+        resume=True,
+    )
+
+    assert seen == [0, 1]
+    assert summary["resumed_from_offset"] == 0
+    assert not orphan.exists()
+    current = gsp._load_worker_progress(out_dir)
+    assert current is not None
+    assert current.aux_subgoal_target_version == gsp.AUX_SUBGOAL_TARGET_VERSION
+    assert current.aux_subgoal_target_semantic == gsp.AUX_SUBGOAL_TARGET_SEMANTIC
 
 
 def test_seed_formula_is_independent_of_resume(tmp_path, monkeypatch):

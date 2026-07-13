@@ -43,7 +43,12 @@ from typing import Any
 
 import numpy as np
 
-from catan_zero.rl.aux_subgoal_targets import AUX_TARGET_KEYS
+from catan_zero.rl.aux_subgoal_targets import (
+    AUX_SUBGOAL_TARGET_SEMANTIC,
+    AUX_SUBGOAL_TARGET_VERSION,
+    AUX_SUBGOAL_TARGET_VERSION_KEY,
+    AUX_TARGET_KEYS,
+)
 
 _TOOLS_DIR = Path(__file__).resolve().parent
 if str(_TOOLS_DIR) not in sys.path:
@@ -1097,6 +1102,7 @@ LOADER_KEYS: tuple[str, ...] = (
     "is_forced",
     "used_full_search",
     *AUX_TARGET_KEYS,
+    AUX_SUBGOAL_TARGET_VERSION_KEY,
     "hex_tokens",
     "hex_vertex_ids",
     "hex_edge_ids",
@@ -1578,6 +1584,7 @@ def build_memmap_corpus(
         "has_duplicate_legal_rows": False,
         "duplicate_game_seed_count": 0,
         "has_duplicate_game_seeds": False,
+        "aux_subgoal_target_version_counts": {},
     }
     # See _GameSeedRunTracker's docstring for the duplicate-detection contract.
     _seed_tracker = _GameSeedRunTracker()
@@ -1762,6 +1769,17 @@ def build_memmap_corpus(
                 observed_selected_seed_set.update(
                     map(int, np.asarray(norm["game_seed"], dtype=np.int64).tolist())
                 )
+        if AUX_SUBGOAL_TARGET_VERSION_KEY in norm:
+            versions, version_tallies = np.unique(
+                np.asarray(norm[AUX_SUBGOAL_TARGET_VERSION_KEY], dtype=np.uint8),
+                return_counts=True,
+            )
+            version_counts = stats["aux_subgoal_target_version_counts"]
+            for version, count in zip(
+                versions.tolist(), version_tallies.tolist()
+            ):
+                key = str(int(version))
+                version_counts[key] = int(version_counts.get(key, 0)) + int(count)
 
         for name in columns:
             schema = schemas[name]
@@ -1922,6 +1940,20 @@ def build_memmap_corpus(
         ),
         "stats": stats,
         "public_award_feature_provenance": public_award_feature_provenance,
+        "aux_subgoal_target_contract": {
+            "version_key": AUX_SUBGOAL_TARGET_VERSION_KEY,
+            "supported_version": AUX_SUBGOAL_TARGET_VERSION,
+            "semantic": AUX_SUBGOAL_TARGET_SEMANTIC,
+            "version_zero_means_unversioned_ineligible": True,
+            "realized_version_counts": dict(
+                stats["aux_subgoal_target_version_counts"]
+            ),
+            "all_rows_semantically_eligible": bool(
+                row_count > 0
+                and stats["aux_subgoal_target_version_counts"]
+                == {str(AUX_SUBGOAL_TARGET_VERSION): int(row_count)}
+            ),
+        },
         "conversion_seconds": round(time.perf_counter() - started, 2),
     }
     if selected_manifest is not None:

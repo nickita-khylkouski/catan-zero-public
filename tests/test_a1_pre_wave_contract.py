@@ -990,6 +990,16 @@ def test_only_exact_allowlisted_markerless_v2_lock_replays(
 ) -> None:
     _issued_path, lock = _lock(tmp_path)
     lock.pop("promotion_handoff")
+    for section in ("generator_code", "learner_code", "runtime_code_tree"):
+        lock["provenance"][section][0]["path"] = str(
+            tmp_path / f"retired-{section}.py"
+        )
+    lock["provenance"]["learner_code_sha256"] = contract._digest_value(  # noqa: SLF001
+        lock["provenance"]["learner_code"]
+    )
+    lock["provenance"]["runtime_code_tree_sha256"] = contract._digest_value(  # noqa: SLF001
+        lock["provenance"]["runtime_code_tree"]
+    )
     lock.pop("contract_sha256")
     lock["contract_sha256"] = contract._digest_value(lock)  # noqa: SLF001
     markerless = tmp_path / "markerless.lock.json"
@@ -1009,6 +1019,23 @@ def test_only_exact_allowlisted_markerless_v2_lock_replays(
     assert contract.verify_lock(markerless)["contract_sha256"] == lock[
         "contract_sha256"
     ]
+
+    reserialized = tmp_path / "reserialized.lock.json"
+    reserialized.write_text(json.dumps(lock, sort_keys=True) + "\n")
+    with pytest.raises(contract.ContractError, match="promotion handoff"):
+        contract.verify_lock(reserialized)
+
+    altered = json.loads(json.dumps(lock))
+    altered["provenance"]["runtime_code_tree"][0]["sha256"] = "sha256:" + "0" * 64
+    altered["provenance"]["runtime_code_tree_sha256"] = contract._digest_value(  # noqa: SLF001
+        altered["provenance"]["runtime_code_tree"]
+    )
+    altered.pop("contract_sha256")
+    altered["contract_sha256"] = contract._digest_value(altered)  # noqa: SLF001
+    altered_path = tmp_path / "altered-provenance.lock.json"
+    altered_path.write_text(json.dumps(altered, indent=2, sort_keys=True) + "\n")
+    with pytest.raises(contract.ContractError, match="promotion handoff"):
+        contract.verify_lock(altered_path)
 
     substituted = dict(lock)
     substituted["contract_id"] = "substituted-markerless-lock"

@@ -45,6 +45,18 @@ AUX_TARGET_KEYS = (
     "aux_robber_target",
 )
 
+# Versioned semantic contract for the realized-trajectory auxiliary labels.
+#
+# Version 0 is intentionally reserved for historical/unversioned shards.  Those
+# rows remain valid policy/value supervision, but a learner must not consume
+# their auxiliary labels: early CAT-100 producers accidentally included the
+# current row while searching for ``next`` settlement/robber events.  Version 1
+# means both categorical targets are STRICTLY FUTURE relative to the decision
+# row (the scan begins at i + 1).
+AUX_SUBGOAL_TARGET_VERSION_KEY = "aux_subgoal_target_version"
+AUX_SUBGOAL_TARGET_VERSION = 1
+AUX_SUBGOAL_TARGET_SEMANTIC = "strict_future_after_current_row_v1"
+
 # Must match EntityGraphConfig.aux_vp_horizon. This is target provenance, not a
 # training-default switch: production shards always materialize the definition
 # the existing CAT-100 heads already advertise.
@@ -296,9 +308,9 @@ def trajectory_targets(
     passes it so a terminal move's VP/road/army change is not lost merely
     because no next decision exists. When ``trajectory_complete`` is False
     (decision-cap truncation), rows without a fully observed horizon get NaN
-    binary/scalar labels; train_bc's finite mask then excludes them. Positive
-    settlement/robber actions already observed remain valid, while their -1
-    sentinel continues to mean "no usable categorical label".
+    binary/scalar labels; train_bc's finite mask then excludes them. Strictly
+    future settlement/robber actions already observed remain valid, while -1
+    continues to mean "no usable categorical label".
 
     Targets per row (all floats; -1 == ignore for the last two):
       aux_longest_road / aux_largest_army : bonus held by the row's actor at the
@@ -340,7 +352,11 @@ def trajectory_targets(
 
         next_settlement = AUX_IGNORE_INDEX
         next_robber = AUX_IGNORE_INDEX
-        for j in range(i, n):
+        # ``next`` is a strict temporal contract.  Including actions[i] here
+        # turns the sampled current action into a second behavior-cloning loss
+        # (especially damaging for wide initial-settlement/robber choices)
+        # instead of predicting a future subgoal.
+        for j in range(i + 1, n):
             if actor_colors[j] != actor:
                 continue
             if next_settlement == AUX_IGNORE_INDEX:

@@ -15,6 +15,11 @@ if str(_TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(_TOOLS_DIR))
 
 import generate_gumbel_selfplay_data as cli  # type: ignore  # noqa: E402
+from catan_zero.rl.aux_subgoal_targets import (  # noqa: E402
+    AUX_SUBGOAL_TARGET_SEMANTIC,
+    AUX_SUBGOAL_TARGET_VERSION,
+    AUX_SUBGOAL_TARGET_VERSION_KEY,
+)
 from catan_zero.rl.pipeline_configs import GenerateConfig  # noqa: E402
 
 
@@ -58,6 +63,8 @@ def test_search_evidence_is_explicitly_opt_in() -> None:
         [], out_dir=Path("/tmp/evidence-enabled"), elapsed_sec=1.0, args=enabled
     )
     assert summary["search_evidence_schema"] == cli.SEARCH_EVIDENCE_SCHEMA
+    assert summary[AUX_SUBGOAL_TARGET_VERSION_KEY] == AUX_SUBGOAL_TARGET_VERSION
+    assert summary["aux_subgoal_target_semantic"] == AUX_SUBGOAL_TARGET_SEMANTIC
 
 
 # ---------------------------------------------------------------------------

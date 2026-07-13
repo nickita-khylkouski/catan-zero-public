@@ -6,6 +6,10 @@ import numpy as np
 import pytest
 
 from tools import train_bc
+from catan_zero.rl.aux_subgoal_targets import (
+    AUX_SUBGOAL_TARGET_VERSION,
+    AUX_SUBGOAL_TARGET_VERSION_KEY,
+)
 
 torch = pytest.importorskip("torch")
 
@@ -18,6 +22,9 @@ def test_aux_subgoal_returns_one_exact_statistic_pair_per_masked_head() -> None:
     data = {
         "aux_longest_road": np.asarray([0.0, 1.0, np.nan, np.nan]),
         "aux_vp_in_n": np.asarray([1.0, np.nan, 3.0, np.nan]),
+        AUX_SUBGOAL_TARGET_VERSION_KEY: np.full(
+            4, AUX_SUBGOAL_TARGET_VERSION, dtype=np.uint8
+        ),
     }
 
     loss, active, parts = train_bc._aux_subgoal_loss(
@@ -29,13 +36,13 @@ def test_aux_subgoal_returns_one_exact_statistic_pair_per_masked_head() -> None:
     )
 
     assert active == 2
-    assert float(loss) == pytest.approx(math.log(2.0) + 5.0)
-    assert float(parts["aux_longest_road"]["weighted_sum"]) == pytest.approx(
+    assert float(loss.detach()) == pytest.approx(math.log(2.0) + 5.0)
+    assert float(parts["aux_longest_road"]["weighted_sum"].detach()) == pytest.approx(
         2.0 * math.log(2.0)
     )
-    assert float(parts["aux_longest_road"]["weight_sum"]) == 2.0
-    assert float(parts["aux_vp_in_n"]["weighted_sum"]) == 10.0
-    assert float(parts["aux_vp_in_n"]["weight_sum"]) == 2.0
+    assert float(parts["aux_longest_road"]["weight_sum"].detach()) == 2.0
+    assert float(parts["aux_vp_in_n"]["weighted_sum"].detach()) == 10.0
+    assert float(parts["aux_vp_in_n"]["weight_sum"].detach()) == 2.0
 
 
 def test_composite_validation_reconstructs_aux_heads_before_summing() -> None:

@@ -87,6 +87,7 @@ def _descriptor_v2(
     policy_aux_phase_sampling_weights: dict[str, float] | None = None,
     stored_policy_component_temperatures: dict[str, float] | None = None,
     value_training_component_ids: list[str] | None = None,
+    aux_subgoal_component_ids: list[str] | None = None,
 ) -> Path:
     overrides = {
         "per_game_policy_weight": True,
@@ -124,6 +125,8 @@ def _descriptor_v2(
         )
     if value_training_component_ids is not None:
         payload["value_training_component_ids"] = value_training_component_ids
+    if aux_subgoal_component_ids is not None:
+        payload["aux_subgoal_component_ids"] = aux_subgoal_component_ids
     path = tmp_path / "composite-v2.json"
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     return path
@@ -155,6 +158,8 @@ def test_v2_authenticates_three_component_ratios_and_anchor_scope(tmp_path):
     assert verified["policy_distillation_scope_explicit"] is False
     assert verified["value_training_component_ids"] == ["n128", "n256", "gen3"]
     assert verified["value_training_scope_explicit"] is False
+    assert verified["aux_subgoal_component_ids"] == []
+    assert verified["aux_subgoal_scope_explicit"] is False
     assert verified["descriptor_fingerprint"] == train_bc._training_data_fingerprint(
         str(path), "memmap"
     )
@@ -273,6 +278,23 @@ def test_v2_authenticates_value_training_scope_and_refuses_drift(tmp_path):
     with pytest.raises(SystemExit, match="value training.*must follow component order"):
         train_bc._preflight_memmap_composite_descriptor(path)
 
+
+def test_v2_authenticates_aux_subgoal_scope_and_refuses_order_drift(tmp_path):
+    path = _descriptor_v2(
+        tmp_path, aux_subgoal_component_ids=["n128", "n256"]
+    )
+    verified = train_bc._preflight_memmap_composite_descriptor(path)
+    assert verified["aux_subgoal_component_ids"] == ["n128", "n256"]
+    assert verified["aux_subgoal_scope_explicit"] is True
+
+    payload = json.loads(path.read_text())
+    payload["aux_subgoal_component_ids"] = ["n256", "n128"]
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(SystemExit, match="aux-subgoal.*must follow component order"):
+        train_bc._preflight_memmap_composite_descriptor(path)
+
+
+def test_v2_refuses_unknown_anchor_component(tmp_path):
     second = tmp_path / "second"
     second.mkdir()
     path = _descriptor_v2(second)
@@ -774,3 +796,37 @@ def test_prefetch_preserves_authenticated_policy_kl_anchor_scope():
         False,
         True,
     ]
+
+
+def test_prefetch_masks_historical_aux_but_preserves_policy_value_weights():
+    data = train_bc.ConcatMemmapCorpus(
+        [_TinyCorpus([0, 1]), _TinyCorpus([10, 11])]
+    )
+    data.component_ids = ("fresh", "historical_replay")
+    data.aux_subgoal_component_indices = (0,)
+    data.aux_subgoal_scope_authenticated = True
+    historical_rows = np.asarray([2, 3], dtype=np.int64)
+    policy_weights = np.asarray([1.0, 2.0, 3.0, 4.0], dtype=np.float32)
+    value_weights = np.asarray([10.0, 20.0, 30.0, 40.0], dtype=np.float32)
+
+    batches = list(
+        train_bc._iterate_training_batches(
+            data,
+            np.arange(2, dtype=np.int64),
+            historical_rows,
+            2,
+            policy_weights,
+            value_weights,
+            num_workers=1,
+            prefetch=1,
+        )
+    )
+
+    materialized, local, policy_batch, value_batch = batches[0]
+    assert np.array_equal(local, np.arange(2, dtype=np.int64))
+    assert materialized["row"].tolist() == [10, 11]
+    assert materialized["_aux_subgoal_eligible"].tolist() == [False, False]
+    # Scope is objective-specific: old replay remains fully admitted to the
+    # policy/value learner while its pre-v1 aux labels receive zero gradient.
+    assert policy_batch.tolist() == [3.0, 4.0]
+    assert value_batch.tolist() == [30.0, 40.0]

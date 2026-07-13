@@ -92,7 +92,36 @@ def test_trajectory_targets_row0():
     assert r0["aux_longest_road"] == 1.0  # holds_lr(state2, A) True
     assert r0["aux_largest_army"] == 0.0
     assert r0["aux_next_settlement"] == 5.0  # A's next settlement is at row 2
-    assert r0["aux_robber_target"] == 7.0  # A's next robber move is row 0
+    # The robber move on row 0 is the current action, not a future subgoal.
+    assert r0["aux_robber_target"] == float(AUX_IGNORE_INDEX)
+
+
+def test_current_settlement_and_robber_are_excluded_but_later_events_are_kept():
+    actions = ["settle5", "rob7", "settle6", "rob8"]
+    rows = trajectory_targets(
+        states=[0, 1, 2, 3],
+        actor_colors=["A", "A", "A", "A"],
+        actions=actions,
+        horizon=1,
+        victory_points_of=lambda _state, _color: 0,
+        holds_longest_road_at=lambda _state, _color: False,
+        holds_largest_army_at=lambda _state, _color: False,
+        settlement_node_of_action=lambda action: {
+            "settle5": 5,
+            "settle6": 6,
+        }.get(action),
+        robber_hex_of_action=lambda action: {"rob7": 7, "rob8": 8}.get(action),
+    )
+
+    # Row 0's settlement is excluded; the later settlement/robber are targets.
+    assert rows[0]["aux_next_settlement"] == 6.0
+    assert rows[0]["aux_robber_target"] == 7.0
+    # Row 1's robber is excluded; only the later robber remains.
+    assert rows[1]["aux_next_settlement"] == 6.0
+    assert rows[1]["aux_robber_target"] == 8.0
+    # The last robber is never allowed to label its own row.
+    assert rows[3]["aux_next_settlement"] == float(AUX_IGNORE_INDEX)
+    assert rows[3]["aux_robber_target"] == float(AUX_IGNORE_INDEX)
 
 
 def test_trajectory_targets_actor_filtering_and_sentinels():
@@ -102,6 +131,8 @@ def test_trajectory_targets_actor_filtering_and_sentinels():
     assert r1["aux_next_settlement"] == float(AUX_IGNORE_INDEX)
     assert r1["aux_robber_target"] == float(AUX_IGNORE_INDEX)
     assert r1["aux_vp_in_n"] == 0.0  # B has 0 VP throughout
+    # A's row-2 settlement is the current action, and there is no later one.
+    assert rows[2]["aux_next_settlement"] == float(AUX_IGNORE_INDEX)
     # Row 3 (B, last row) horizon clamps to itself.
     r3 = rows[3]
     assert r3["aux_vp_in_n"] == 0.0

@@ -52,6 +52,9 @@ import numpy as np
 
 from catan_zero.rl.action_mask import ActionCatalog
 from catan_zero.rl.aux_subgoal_targets import (
+    AUX_SUBGOAL_TARGET_SEMANTIC,
+    AUX_SUBGOAL_TARGET_VERSION,
+    AUX_SUBGOAL_TARGET_VERSION_KEY,
     AUX_TARGET_KEYS,
     AUX_VP_HORIZON,
     rust_aux_state_from_snapshot,
@@ -199,6 +202,10 @@ EXTRA_KEYS = (
     # every production row; unavailable targets use NaN (binary/scalar) or -1
     # (categorical), matching train_bc's per-head masks.
     *AUX_TARGET_KEYS,
+    # Per-row semantic version.  Historical shards missing this field are
+    # normalized as version 0 and are ineligible for auxiliary loss, while
+    # remaining fully usable for policy/value training.
+    AUX_SUBGOAL_TARGET_VERSION_KEY,
     # Opponent-pool provenance (H2). Only present on rows from a run where
     # --opponent-pool-manifest was set (see `play_one_game`'s `pool_assignment`);
     # absent entirely otherwise, so default (pool-disabled) shard schema is
@@ -778,6 +785,7 @@ def _build_decision_row(
         "aux_vp_in_n": np.float32(np.nan),
         "aux_next_settlement": np.int16(-1),
         "aux_robber_target": np.int16(-1),
+        AUX_SUBGOAL_TARGET_VERSION_KEY: np.uint8(AUX_SUBGOAL_TARGET_VERSION),
     }
     if float(row["policy_weight_multiplier"]) > 0.0:
         # Private, opt-in evidence fields. The default writer filters these
@@ -1098,6 +1106,9 @@ def play_one_game(
                 "aux_vp_in_n": np.float32(targets["aux_vp_in_n"]),
                 "aux_next_settlement": np.int16(targets["aux_next_settlement"]),
                 "aux_robber_target": np.int16(targets["aux_robber_target"]),
+                AUX_SUBGOAL_TARGET_VERSION_KEY: np.uint8(
+                    AUX_SUBGOAL_TARGET_VERSION
+                ),
             }
         )
 
@@ -1452,6 +1463,13 @@ class WorkerProgress:
     """
 
     run_id: str
+    # Resume is only sound when every retained shard was produced under the
+    # same row-label semantics as the code completing the run.  These fields
+    # deliberately make pre-v1 progress markers unreadable by `from_dict` so
+    # a retry replays the worker instead of blessing legacy aux labels with a
+    # v1 manifest.
+    aux_subgoal_target_version: int
+    aux_subgoal_target_semantic: str
     base_seed: int
     game_index_start: int
     games_requested: int
@@ -1471,8 +1489,32 @@ class WorkerProgress:
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "WorkerProgress":
+        raw_aux_subgoal_target_version = payload[AUX_SUBGOAL_TARGET_VERSION_KEY]
+        # JSON booleans are Python ints, but accepting `true` as schema v1
+        # would make a malformed/corrupt marker look authenticated.
+        if isinstance(raw_aux_subgoal_target_version, bool) or not isinstance(
+            raw_aux_subgoal_target_version, int
+        ):
+            raise ValueError(
+                "worker progress aux-subgoal target version must be an integer"
+            )
+        aux_subgoal_target_version = raw_aux_subgoal_target_version
+        aux_subgoal_target_semantic = str(payload["aux_subgoal_target_semantic"])
+        if aux_subgoal_target_version != AUX_SUBGOAL_TARGET_VERSION:
+            raise ValueError(
+                "worker progress aux-subgoal target version mismatch: "
+                f"expected {AUX_SUBGOAL_TARGET_VERSION}, got {aux_subgoal_target_version}"
+            )
+        if aux_subgoal_target_semantic != AUX_SUBGOAL_TARGET_SEMANTIC:
+            raise ValueError(
+                "worker progress aux-subgoal target semantic mismatch: "
+                f"expected {AUX_SUBGOAL_TARGET_SEMANTIC!r}, "
+                f"got {aux_subgoal_target_semantic!r}"
+            )
         return cls(
             run_id=str(payload["run_id"]),
+            aux_subgoal_target_version=aux_subgoal_target_version,
+            aux_subgoal_target_semantic=aux_subgoal_target_semantic,
             base_seed=int(payload["base_seed"]),
             game_index_start=int(payload["game_index_start"]),
             games_requested=int(payload["games_requested"]),
@@ -1492,11 +1534,11 @@ class WorkerProgress:
 def _load_worker_progress(out_dir: Path) -> WorkerProgress | None:
     """Read `<out_dir>/progress.json`, or `None` if absent/unreadable.
 
-    A missing or corrupt (torn write, truncated) progress file is treated
-    identically to "no progress yet" -- resuming then simply replays from
-    game 0, which is always safe (at worst it redoes already-durable work;
-    it can never lose data, since nothing is deleted based on this file
-    alone -- see `_discard_orphan_shards`).
+    A missing, corrupt (torn write, truncated), or semantically stale progress
+    file is treated identically to "no progress yet".  `run_worker_games`
+    then replays from game 0; when a stale progress file exists it also removes
+    the old worker shards first so no legacy row-label semantics can leak into
+    the new manifest.
     """
     path = Path(out_dir) / PROGRESS_FILENAME
     if not path.exists():
@@ -1529,17 +1571,18 @@ def _confirmed_shard_paths(out_dir: Path, *, upto_index: int) -> list[Path]:
 def _discard_orphan_shards(out_dir: Path, *, from_index: int) -> None:
     """Delete any shard files at or beyond `from_index`.
 
-    These can exist ONLY in a narrow race: a shard flush landed on the
+    In the ordinary resume path these can exist in a narrow race: a shard flush landed on the
     volume (via a periodic `volume.commit()`) slightly ahead of the very
     next `progress.json` write for that same shard. Because
     `shard_count_confirmed` is therefore the authoritative floor (never the
     physical file listing), any shard at/after it is, by definition, not
     yet confirmed and is about to be regenerated (deterministically, from
     the same `game_seed`s) and its index reused -- so it must be cleared
-    first rather than silently appended to or shadowed. This is the ONLY
-    deletion in the whole resume path, it is scoped to a single worker's
-    `out_dir`, and it never touches a shard index covered by
-    `shard_count_confirmed` (i.e. never touches confirmed-durable data).
+    first rather than silently appended to or shadowed.  The other caller is
+    the schema-upgrade path: when `progress.json` is present but cannot prove
+    the current row-label semantic, every old shard is invalidated by calling
+    this helper with `from_index=0`.  Both deletions are scoped to one worker's
+    `out_dir`; confirmed current-semantic data is never touched.
     """
     for path in sorted(Path(out_dir).glob("gumbel_self_play_shard_*.npz*")):
         stem = path.name.split(".", 1)[0]
@@ -1668,6 +1711,7 @@ def run_worker_games(
     games_completed_local = 0
 
     if resume:
+        progress_path = out_dir / PROGRESS_FILENAME
         progress = _load_worker_progress(out_dir)
         if progress is not None and (not run_id or progress.run_id == run_id):
             resume_offset = max(0, min(int(progress.games_completed_local), int(games)))
@@ -1683,6 +1727,11 @@ def run_worker_games(
                 wins_by_color[color] = wins_by_color.get(color, 0) + int(count)
             start_shard_index = int(progress.shard_count_confirmed)
             _discard_orphan_shards(out_dir, from_index=start_shard_index)
+        elif progress_path.exists():
+            # A progress marker that cannot be authenticated for this run and
+            # aux-label semantic must not lend its old shards to a new v1
+            # manifest.  Replaying from zero is deterministic and safe.
+            _discard_orphan_shards(out_dir, from_index=0)
 
     writer = GumbelShardWriter(
         out_dir,
@@ -1717,6 +1766,8 @@ def run_worker_games(
             progress_path,
             WorkerProgress(
                 run_id=run_id,
+                aux_subgoal_target_version=AUX_SUBGOAL_TARGET_VERSION,
+                aux_subgoal_target_semantic=AUX_SUBGOAL_TARGET_SEMANTIC,
                 base_seed=int(base_seed),
                 game_index_start=int(game_index_start),
                 games_requested=int(games),
@@ -1960,6 +2011,8 @@ def run_worker_games(
             search_config, native_mcts_hot_loop=bool(native_mcts_hot_loop)
         ),
         "target_information_regime": target_information_regime,
+        AUX_SUBGOAL_TARGET_VERSION_KEY: AUX_SUBGOAL_TARGET_VERSION,
+        "aux_subgoal_target_semantic": AUX_SUBGOAL_TARGET_SEMANTIC,
         "elapsed_sec": elapsed,
         "rows_per_sec": rows / max(elapsed, 1.0e-9),
         "shards": [str(path) for path in writer.paths],

@@ -3201,6 +3201,34 @@ def _verify_artifact_records(records: Iterable[dict[str, Any]]) -> None:
             )
 
 
+def _verify_archived_code_provenance_records(
+    records: Iterable[dict[str, Any]],
+) -> None:
+    """Validate descriptors whose bytes are authenticated by one issued lock.
+
+    The sole markerless v2 lock is identified by its raw file hash before this
+    helper is reachable. Its generator, learner, and transitive-runtime records
+    name a retired checkout, so replay cannot require those mutable paths to
+    exist today. The raw lock bytes still authenticate every path and digest;
+    this helper merely type-checks the sealed descriptors without consulting
+    the current filesystem. Guard, evidence, checkpoint, seed-ledger, job, and
+    science records continue through their ordinary live validators.
+    """
+
+    for record in records:
+        if not isinstance(record, dict):
+            raise ContractError("archived code provenance record is not an object")
+        path = record.get("path")
+        digest = record.get("sha256")
+        if (
+            not isinstance(path, str)
+            or not path
+            or not isinstance(digest, str)
+            or re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None
+        ):
+            raise ContractError("archived code provenance descriptor is malformed")
+
+
 def _issued_arm_lock_fingerprint(path: Path) -> dict[str, str]:
     value = _load_json(path)
     expected_digest = str(value.get("contract_sha256", ""))
@@ -4892,7 +4920,12 @@ def verify_lock(
                     raise ContractError("v3 hard-negative selection evidence is missing")
                 _verify_artifact_records([selection, selection["evaluation_evidence"]])
     _verify_artifact_records([lock["provenance"]["guard_config"]])
-    _verify_artifact_records(lock["provenance"]["generator_code"])
+    verify_code_records = (
+        _verify_archived_code_provenance_records
+        if historical_markerless
+        else _verify_artifact_records
+    )
+    verify_code_records(lock["provenance"]["generator_code"])
     learner_code_records = lock["provenance"].get("learner_code")
     if not isinstance(learner_code_records, list) or not learner_code_records:
         raise ContractError("lock does not bind the learner implementation")
@@ -4900,7 +4933,7 @@ def verify_lock(
         learner_code_records
     ):
         raise ContractError("learner-code provenance digest drift")
-    _verify_artifact_records(learner_code_records)
+    verify_code_records(learner_code_records)
     runtime_code_tree = lock["provenance"].get("runtime_code_tree")
     if not isinstance(runtime_code_tree, list) or not runtime_code_tree:
         raise ContractError("lock does not bind the transitive runtime code tree")
@@ -4908,7 +4941,7 @@ def verify_lock(
         runtime_code_tree
     ):
         raise ContractError("runtime-code-tree provenance digest drift")
-    _verify_artifact_records(runtime_code_tree)
+    verify_code_records(runtime_code_tree)
     search = dict(lock["science"]["search_operator"])
     effective_search = dict(lock["science"]["effective_search_config"])
     evaluator = dict(lock["science"]["evaluator"])

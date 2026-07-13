@@ -15,12 +15,27 @@ from typing import Any, Sequence
 
 import numpy as np
 
+from catan_zero.rl.aux_subgoal_targets import (
+    AUX_SUBGOAL_TARGET_VERSION_KEY,
+    AUX_TARGET_KEYS,
+)
+
 
 # These columns were added after the original gen3 corpus was converted. Their
 # absence has an exact, loss-safe interpretation that can be reconstructed from
 # older required columns. Any other schema gap remains a hard error.
 SYNTHESIZABLE_COLUMNS = frozenset(
-    {"is_forced", "used_full_search", "root_value", "root_value_mask"}
+    {
+        "is_forced",
+        "used_full_search",
+        "root_value",
+        "root_value_mask",
+        *AUX_TARGET_KEYS,
+        # Historical replay predates the strict-future auxiliary-target
+        # contract.  Version 0 means unversioned/ineligible and is synthesized
+        # lazily so those rows stay available for policy/value objectives.
+        AUX_SUBGOAL_TARGET_VERSION_KEY,
+    }
 )
 
 
@@ -267,6 +282,12 @@ def _synthesized_column(corpus: Any, key: str):
         return _ConstantColumn(corpus.row_count, 0.0, np.float32)
     if key == "root_value_mask":
         return _ConstantColumn(corpus.row_count, False, np.bool_)
+    if key == AUX_SUBGOAL_TARGET_VERSION_KEY:
+        return _ConstantColumn(corpus.row_count, 0, np.uint8)
+    if key in {"aux_next_settlement", "aux_robber_target"}:
+        return _ConstantColumn(corpus.row_count, -1, np.int16)
+    if key in set(AUX_TARGET_KEYS):
+        return _ConstantColumn(corpus.row_count, np.nan, np.float32)
     raise KeyError(key)
 
 
@@ -348,6 +369,8 @@ class ConcatMemmapCorpus:
         self.policy_distillation_scope_authenticated = False
         self.policy_aux_phase_sampling_weights: dict[str, float] | None = None
         self.policy_aux_phase_scope_authenticated = False
+        self.aux_subgoal_component_indices: tuple[int, ...] = tuple()
+        self.aux_subgoal_scope_authenticated = False
         self.legal_width = int(first.legal_width)
         self._columns = {
             key: next(

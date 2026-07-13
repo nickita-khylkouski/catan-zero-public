@@ -10,7 +10,12 @@ import numpy as np
 import pytest
 
 from catan_zero.rl.action_mask import ActionCatalog
-from catan_zero.rl.aux_subgoal_targets import AUX_TARGET_KEYS
+from catan_zero.rl.aux_subgoal_targets import (
+    AUX_SUBGOAL_TARGET_SEMANTIC,
+    AUX_SUBGOAL_TARGET_VERSION,
+    AUX_SUBGOAL_TARGET_VERSION_KEY,
+    AUX_TARGET_KEYS,
+)
 from catan_zero.rl.flywheel.opponent_mix import MixCategory, MixCheckpointRef, OpponentMixConfig
 from catan_zero.rl.gumbel_self_play import (
     COLORS,
@@ -379,8 +384,12 @@ def test_play_one_game_materializes_aux_targets_from_full_rust_trajectory(monkey
     assert red0["aux_longest_road"] == np.float32(1.0)
     assert red0["aux_largest_army"] == np.float32(0.0)
     assert red0["aux_vp_in_n"] == np.float32(3.0)
-    assert red0["aux_next_settlement"] == np.int16(5)
+    # Current-row actions are excluded from the strict-future aux contract.
+    assert red0["aux_next_settlement"] == np.int16(-1)
     assert red0["aux_robber_target"] == np.int16(11)
+    assert red0[AUX_SUBGOAL_TARGET_VERSION_KEY] == np.uint8(
+        AUX_SUBGOAL_TARGET_VERSION
+    )
     blue = record.decisions[1].row
     assert blue["aux_largest_army"] == np.float32(1.0)
     assert blue["aux_next_settlement"] == np.int16(-1)
@@ -583,6 +592,12 @@ def test_run_worker_games_writes_valid_shards_that_round_trip_through_train_bc(t
         # unobserved horizon; categorical targets use -1 as ignore_index.
         assert set(AUX_TARGET_KEYS).issubset(raw.files)
         assert set(AUX_TARGET_KEYS).issubset(normalized)
+        assert AUX_SUBGOAL_TARGET_VERSION_KEY in raw.files
+        assert AUX_SUBGOAL_TARGET_VERSION_KEY in normalized
+        assert normalized[AUX_SUBGOAL_TARGET_VERSION_KEY].dtype == np.uint8
+        assert set(normalized[AUX_SUBGOAL_TARGET_VERSION_KEY].tolist()) == {
+            AUX_SUBGOAL_TARGET_VERSION
+        }
         for key in ("aux_longest_road", "aux_largest_army", "aux_vp_in_n"):
             assert normalized[key].dtype == np.float32
         for key, upper in (("aux_next_settlement", 54), ("aux_robber_target", 19)):
@@ -668,6 +683,8 @@ def test_run_worker_games_writes_a_real_manifest_json(tmp_path):
         manifest["target_information_regime"]
         == TARGET_INFORMATION_REGIME_AUTHORITATIVE
     )
+    assert manifest[AUX_SUBGOAL_TARGET_VERSION_KEY] == AUX_SUBGOAL_TARGET_VERSION
+    assert manifest["aux_subgoal_target_semantic"] == AUX_SUBGOAL_TARGET_SEMANTIC
     for shard_path in manifest["shards"]:
         assert Path(shard_path).exists()
         with np.load(shard_path, allow_pickle=False) as shard:

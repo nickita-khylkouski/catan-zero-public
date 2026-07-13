@@ -169,6 +169,14 @@ def _write_training_source(
         "policy_weight_multiplier": np.tile(
             np.asarray([1.0, 0.0], dtype=np.float32), game_count
         ),
+        "aux_longest_road": np.zeros(rows, dtype=np.float32),
+        "aux_largest_army": np.zeros(rows, dtype=np.float32),
+        "aux_vp_in_n": np.ones(rows, dtype=np.float32),
+        "aux_next_settlement": np.full(rows, 5, dtype=np.int16),
+        "aux_robber_target": np.full(rows, 2, dtype=np.int16),
+        builder.AUX_SUBGOAL_TARGET_VERSION_KEY: np.full(
+            rows, builder.AUX_SUBGOAL_TARGET_VERSION, dtype=np.uint8
+        ),
     }
     if version is not None:
         players = np.asarray(
@@ -529,6 +537,19 @@ def test_descriptor_preserves_nested_fresh_mix_and_historical_replay(
                 {"checkpoint_versions": [6] if category == "historical_replay" else [7]}
             )
         )
+        corpus_dir = tmp_path / f"{category}.corpus"
+        corpus_dir.mkdir()
+        corpus_meta = {"row_count": 2}
+        if category != builder.HISTORICAL_REPLAY_CATEGORY:
+            corpus_meta["aux_subgoal_target_contract"] = {
+                "version_key": "aux_subgoal_target_version",
+                "supported_version": 1,
+                "semantic": "strict_future_after_current_row_v1",
+                "version_zero_means_unversioned_ineligible": True,
+                "realized_version_counts": {"1": 2},
+                "all_rows_semantically_eligible": True,
+            }
+        (corpus_dir / "corpus_meta.json").write_text(json.dumps(corpus_meta))
         components.append(
             {
                 "component_id": category,
@@ -547,6 +568,7 @@ def test_descriptor_preserves_nested_fresh_mix_and_historical_replay(
                     "mean_game_policy_active_fraction": 0.5,
                     "mean_game_policy_weight_multiplier": 0.5,
                 },
+                "corpus_dir": str(corpus_dir),
             }
         )
     producer = tmp_path / "producer.pt"
@@ -577,6 +599,36 @@ def test_descriptor_preserves_nested_fresh_mix_and_historical_replay(
         "historical_replay": 0.20,
     }
     assert replay["checkpoint_versions"] == [6, 7]
+    assert descriptor["aux_subgoal_component_ids"] == [
+        "current_producer",
+        "recent_history",
+        "hard_negative",
+    ]
+
+    stale_meta_path = tmp_path / "recent_history.corpus" / "corpus_meta.json"
+    stale_meta = json.loads(stale_meta_path.read_text())
+    stale_meta["aux_subgoal_target_contract"]["realized_version_counts"] = {
+        "0": 2
+    }
+    stale_meta["aux_subgoal_target_contract"][
+        "all_rows_semantically_eligible"
+    ] = False
+    stale_meta_path.write_text(json.dumps(stale_meta))
+    with pytest.raises(
+        builder.CompositeBuildError,
+        match="fresh component aux-subgoal target contract is not uniformly",
+    ):
+        builder._build_descriptor(  # noqa: SLF001
+            components=components,
+            producer_path=producer,
+            producer_sha256=builder._file_sha256(producer),  # noqa: SLF001
+            current_version=7,
+            source_authority={
+                "path": str(authority.resolve()),
+                "file_sha256": builder._file_sha256(authority),  # noqa: SLF001
+                "authority_sha256": builder._digest({}),  # noqa: SLF001
+            },
+        )
 
 
 def test_real_memmap_composite_is_accepted_by_one_dose_trainer(

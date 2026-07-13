@@ -8,6 +8,7 @@ required.
 from __future__ import annotations
 
 import sys
+import json
 from pathlib import Path
 
 import numpy as np
@@ -24,6 +25,10 @@ from build_memmap_corpus import (  # type: ignore  # noqa: E402
     build_memmap_corpus,
 )
 from train_bc import MemmapCorpus, load_teacher_data  # type: ignore  # noqa: E402
+from catan_zero.rl.aux_subgoal_targets import (  # noqa: E402
+    AUX_SUBGOAL_TARGET_VERSION,
+    AUX_SUBGOAL_TARGET_VERSION_KEY,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -173,6 +178,7 @@ def _write_synthetic_shard(
     game_seed: np.ndarray,
     decision_index: np.ndarray | None = None,
     include_aux: bool = True,
+    aux_versioned: bool = True,
 ) -> None:
     n = int(game_seed.shape[0])
     legal_width = 2
@@ -195,6 +201,10 @@ def _write_synthetic_shard(
                 "aux_robber_target": np.arange(n, dtype=np.int16) % 19,
             }
         )
+        if aux_versioned:
+            arrays[AUX_SUBGOAL_TARGET_VERSION_KEY] = np.full(
+                n, AUX_SUBGOAL_TARGET_VERSION, dtype=np.uint8
+            )
     np.savez(path, **arrays)
 
 
@@ -360,6 +370,9 @@ def test_legacy_and_aux_sources_mix_with_aligned_ignore_fills(tmp_path):
     assert np.all(np.isnan(loaded["aux_vp_in_n"][:2]))
     assert np.all(loaded["aux_next_settlement"][:2] == -1)
     np.testing.assert_array_equal(loaded["aux_next_settlement"][2:], np.array([0, 1]))
+    np.testing.assert_array_equal(
+        loaded[AUX_SUBGOAL_TARGET_VERSION_KEY], np.array([0, 0, 1, 1])
+    )
 
     # The production memmap path detects CAT-100 at the per-source level and
     # applies the same fills before enforcing its uniform column schema.
@@ -372,3 +385,29 @@ def test_legacy_and_aux_sources_mix_with_aligned_ignore_fills(tmp_path):
     assert len(corpus["aux_vp_in_n"]) == 4
     assert np.all(np.isnan(corpus["aux_vp_in_n"][:2]))
     assert np.all(corpus["aux_next_settlement"][:2] == -1)
+    np.testing.assert_array_equal(
+        corpus[AUX_SUBGOAL_TARGET_VERSION_KEY][:], np.array([0, 0, 1, 1])
+    )
+    meta = json.loads(
+        (tmp_path / "mixed_corpus" / "corpus_meta.json").read_text()
+    )
+    assert meta["aux_subgoal_target_contract"]["realized_version_counts"] == {
+        "0": 2,
+        "1": 2,
+    }
+    assert meta["aux_subgoal_target_contract"]["all_rows_semantically_eligible"] is False
+
+
+def test_unversioned_aux_shard_is_normalized_to_ineligible_version_zero(tmp_path):
+    teacher = tmp_path / "teacher"
+    teacher.mkdir()
+    _write_synthetic_shard(
+        teacher / "old_aux.npz",
+        game_seed=np.array([21, 21]),
+        include_aux=True,
+        aux_versioned=False,
+    )
+    loaded = load_teacher_data(teacher)
+    np.testing.assert_array_equal(
+        loaded[AUX_SUBGOAL_TARGET_VERSION_KEY], np.zeros(2, dtype=np.uint8)
+    )

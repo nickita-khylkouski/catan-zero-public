@@ -45,6 +45,11 @@ import time
 from pathlib import Path
 from typing import Any, Sequence
 
+from catan_zero.rl.aux_subgoal_targets import (
+    AUX_SUBGOAL_TARGET_SEMANTIC,
+    AUX_SUBGOAL_TARGET_VERSION,
+    AUX_SUBGOAL_TARGET_VERSION_KEY,
+)
 from catan_zero.rl.gumbel_self_play import (
     COLORS,
     GumbelSelfPlayConfig,
@@ -2079,6 +2084,8 @@ def _merge_worker_summaries(
         "forced_decisions_total": int(forced_decisions_total),
         "simulations_used_total": int(simulations_used_total),
         "target_information_regime": target_information_regime,
+        AUX_SUBGOAL_TARGET_VERSION_KEY: AUX_SUBGOAL_TARGET_VERSION,
+        "aux_subgoal_target_semantic": AUX_SUBGOAL_TARGET_SEMANTIC,
         "search_evidence_schema": (
             SEARCH_EVIDENCE_SCHEMA
             if bool(getattr(args, "preserve_search_evidence", False))

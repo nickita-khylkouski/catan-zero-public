@@ -45,6 +45,11 @@ from catan_zero.rl.flywheel.composite_contract import (  # noqa: E402
     canonical_sha256,
     measure_memmap_component,
 )
+from catan_zero.rl.aux_subgoal_targets import (  # noqa: E402
+    AUX_SUBGOAL_TARGET_SEMANTIC,
+    AUX_SUBGOAL_TARGET_VERSION,
+    AUX_SUBGOAL_TARGET_VERSION_KEY,
+)
 from tools import a1_pre_wave_contract as contract  # noqa: E402
 from tools import build_memmap_corpus as memmap_builder  # noqa: E402
 from tools import train_bc  # noqa: E402
@@ -1042,6 +1047,45 @@ def _build_descriptor(
         for component in components
     ]
     sampling_receipt = build_sampling_receipt(components)
+    aux_subgoal_component_ids: list[str] = []
+    for component in components:
+        component_id = str(component["component_id"])
+        # Historical replay remains valid policy/value supervision but cannot
+        # contribute the pre-v1 settlement/robber labels.  Fresh components
+        # enter the authenticated aux scope only when their byte-bound memmap
+        # metadata proves every row carries the strict-future version.
+        if component_id not in FRESH_SOURCE_GAME_RATIOS:
+            continue
+        corpus_dir = component.get("corpus_dir")
+        if not isinstance(corpus_dir, str):
+            continue
+        meta = _load_json(Path(corpus_dir) / "corpus_meta.json")
+        aux_contract = meta.get("aux_subgoal_target_contract")
+        expected_counts = {
+            str(AUX_SUBGOAL_TARGET_VERSION): int(meta.get("row_count", -1))
+        }
+        if (
+            isinstance(aux_contract, dict)
+            and aux_contract.get("version_key")
+            == AUX_SUBGOAL_TARGET_VERSION_KEY
+            and aux_contract.get("supported_version")
+            == AUX_SUBGOAL_TARGET_VERSION
+            and aux_contract.get("semantic") == AUX_SUBGOAL_TARGET_SEMANTIC
+            and aux_contract.get("realized_version_counts") == expected_counts
+            and aux_contract.get("all_rows_semantically_eligible") is True
+        ):
+            aux_subgoal_component_ids.append(component_id)
+    expected_aux_subgoal_component_ids = list(FRESH_SOURCE_GAME_RATIOS)
+    if aux_subgoal_component_ids != expected_aux_subgoal_component_ids:
+        missing = [
+            component_id
+            for component_id in expected_aux_subgoal_component_ids
+            if component_id not in aux_subgoal_component_ids
+        ]
+        raise CompositeBuildError(
+            "fresh component aux-subgoal target contract is not uniformly "
+            f"strict-future v{AUX_SUBGOAL_TARGET_VERSION}; missing={missing}"
+        )
     replay_contract = {
         "schema_version": "flywheel-replay-composite-v2",
         "current_checkpoint_version": int(current_version),
@@ -1069,6 +1113,7 @@ def _build_descriptor(
         "policy_kl_anchor_component_ids": [HISTORICAL_REPLAY_CATEGORY],
         "policy_distillation_component_ids": component_ids,
         "value_training_component_ids": component_ids,
+        "aux_subgoal_component_ids": aux_subgoal_component_ids,
         "flywheel_replay_contract": replay_contract,
         "source_authority_manifest": source_authority["path"],
         "source_authority_manifest_sha256": source_authority["file_sha256"],

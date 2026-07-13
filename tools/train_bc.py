@@ -35,7 +35,12 @@ sys.path.insert(0, str(_REPO_SRC))
 import numpy as np
 
 from catan_zero.rl.config_cli import add_config_flags, apply_config_file, resolve_config
-from catan_zero.rl.aux_subgoal_targets import AUX_TARGET_KEYS
+from catan_zero.rl.aux_subgoal_targets import (
+    AUX_SUBGOAL_TARGET_SEMANTIC,
+    AUX_SUBGOAL_TARGET_VERSION,
+    AUX_SUBGOAL_TARGET_VERSION_KEY,
+    AUX_TARGET_KEYS,
+)
 from catan_zero.rl.pipeline_configs import TrainConfig
 from catan_zero.rl.torch_ppo import build_action_feature_table, create_ppo_policy
 from catan_zero.rl.xdim_lite_policy import (
@@ -2623,6 +2628,7 @@ def _preflight_memmap_composite_descriptor(path: str | Path) -> dict[str, object
             "policy_aux_phase_sampling_weights",
             "stored_policy_component_temperatures",
             "value_training_component_ids",
+            "aux_subgoal_component_ids",
             "flywheel_replay_contract",
             "source_authority_manifest",
             "source_authority_manifest_sha256",
@@ -2933,6 +2939,8 @@ def _preflight_memmap_composite_descriptor(path: str | Path) -> dict[str, object
     stored_policy_component_temperatures: dict[str, float] | None = None
     value_training_component_ids: list[str] = []
     value_training_scope_explicit = False
+    aux_subgoal_component_ids: list[str] = []
+    aux_subgoal_scope_explicit = False
     if schema_version == "memmap_composite_v2":
         if not math.isclose(sum(component_ratios), 1.0, rel_tol=0.0, abs_tol=1e-9):
             raise SystemExit("memmap composite v2 game sampling ratios must sum to 1")
@@ -3061,6 +3069,28 @@ def _preflight_memmap_composite_descriptor(path: str | Path) -> dict[str, object
             )
         value_training_component_ids = list(raw_value_ids)
         value_training_scope_explicit = "value_training_component_ids" in descriptor
+        raw_aux_subgoal_ids = descriptor.get("aux_subgoal_component_ids")
+        if raw_aux_subgoal_ids is not None:
+            if (
+                not isinstance(raw_aux_subgoal_ids, list)
+                or any(not isinstance(value, str) for value in raw_aux_subgoal_ids)
+                or len(set(raw_aux_subgoal_ids)) != len(raw_aux_subgoal_ids)
+                or not set(raw_aux_subgoal_ids).issubset(component_ids)
+            ):
+                raise SystemExit(
+                    "memmap composite v2 aux-subgoal component ids are invalid"
+                )
+            if raw_aux_subgoal_ids != [
+                value
+                for value in component_ids
+                if value in set(raw_aux_subgoal_ids)
+            ]:
+                raise SystemExit(
+                    "memmap composite v2 aux-subgoal component ids must follow "
+                    "component order"
+                )
+            aux_subgoal_component_ids = list(raw_aux_subgoal_ids)
+            aux_subgoal_scope_explicit = True
     flywheel_replay_contract = None
     if is_flywheel_production:
         raw_contract = descriptor.get("flywheel_replay_contract")
@@ -3277,6 +3307,8 @@ def _preflight_memmap_composite_descriptor(path: str | Path) -> dict[str, object
         ),
         "value_training_component_ids": value_training_component_ids,
         "value_training_scope_explicit": value_training_scope_explicit,
+        "aux_subgoal_component_ids": aux_subgoal_component_ids,
+        "aux_subgoal_scope_explicit": aux_subgoal_scope_explicit,
         "flywheel_replay_contract": flywheel_replay_contract,
         "production_mix_contract": flywheel_replay_contract,
         "source_authority": source_authority,
@@ -7430,6 +7462,29 @@ def main(argv: Sequence[str] | None = None) -> None:
             "training split is empty; refusing to save a checkpoint that could "
             "falsely attest a value readout without any optimizer update"
         )
+    aux_subgoal_training_contract = _rank0_authoritative_call(
+        ddp,
+        "aux-subgoal training contract",
+        lambda: _validate_aux_subgoal_training_contract(
+            data,
+            train_indices,
+            loss_weight=float(args.aux_subgoal_loss_weight),
+        ),
+    )
+    training_information_surface = {
+        **(training_information_surface or {}),
+        "aux_subgoal_training_contract": aux_subgoal_training_contract,
+    }
+    _rank0_print(
+        json.dumps(
+            {
+                "progress": "aux_subgoal_training_contract",
+                **aux_subgoal_training_contract,
+            },
+            sort_keys=True,
+        ),
+        ddp,
+    )
     validation_seed_manifest_path: Path | None = None
     validation_seed_set_sha256 = ""
     validation_game_seed_count = 0
@@ -8766,6 +8821,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         "data_quality": data_quality,
         "policy_distillation_scope": policy_distillation_scope_report,
         "value_training_scope": value_training_scope_report,
+        "aux_subgoal_training_contract": aux_subgoal_training_contract,
         "policy_component_active_dose": policy_component_active_dose,
         "policy_aux_phase_sampling_weights": policy_aux_phase_sampling_weights,
         "policy_component_phase_active_dose": policy_component_phase_active_dose,
@@ -9442,6 +9498,32 @@ def _aux_subgoal_loss(
             "--aux-subgoal-loss-weight 0."
         )
 
+    eligible_np = np.ones(len(batch), dtype=np.bool_)
+    if heads_present:
+        if AUX_SUBGOAL_TARGET_VERSION_KEY not in data:
+            raise ValueError(
+                "CAT-105: nonzero aux-subgoal loss requires the per-row "
+                f"{AUX_SUBGOAL_TARGET_VERSION_KEY!r} semantic version; "
+                "unversioned targets are policy/value-only"
+            )
+        versions = np.asarray(data[AUX_SUBGOAL_TARGET_VERSION_KEY][batch])
+        if versions.shape != (len(batch),) or versions.dtype.kind not in {"i", "u"}:
+            raise ValueError("aux-subgoal target version shape/dtype drift")
+        scope = _aux_subgoal_scope_mask(data, batch)
+        if scope is not None:
+            eligible_np = np.asarray(scope, dtype=np.bool_)
+        mismatched = eligible_np & (
+            versions.astype(np.int64, copy=False) != AUX_SUBGOAL_TARGET_VERSION
+        )
+        if bool(np.any(mismatched)):
+            observed = sorted(
+                map(int, np.unique(versions[mismatched]).astype(np.int64).tolist())
+            )
+            raise ValueError(
+                "aux-subgoal semantic version mismatch on eligible rows: "
+                f"expected={AUX_SUBGOAL_TARGET_VERSION} observed={observed}"
+            )
+
     total = torch.zeros((), dtype=torch.float32, device=device)
     active_heads = 0
     sufficient_statistics = {}
@@ -9485,6 +9567,7 @@ def _aux_subgoal_loss(
             per = nn.functional.mse_loss(
                 pred, torch.nan_to_num(target), reduction="none"
             )
+        valid = valid & torch.as_tensor(eligible_np, dtype=torch.bool, device=device)
         weight = valid.to(per.dtype)
         # Use the same global-denominator reduction as the main policy/value
         # objectives.  Averaging rank-local masked means biases the auxiliary
@@ -12612,6 +12695,15 @@ def load_teacher_data_memmap(
                 if component_id in value_ids
             )
             corpus.value_training_scope_authenticated = True
+            aux_subgoal_ids = set(authenticated["aux_subgoal_component_ids"])
+            corpus.aux_subgoal_component_indices = tuple(
+                index
+                for index, component_id in enumerate(corpus.component_ids)
+                if component_id in aux_subgoal_ids
+            )
+            corpus.aux_subgoal_scope_authenticated = bool(
+                authenticated["aux_subgoal_scope_explicit"]
+            )
         corpus.meta.update({
             "schema": authenticated["schema_version"],
             "descriptor_path": authenticated["descriptor_path"],
@@ -12621,6 +12713,9 @@ def load_teacher_data_memmap(
             "promotion_eligible": bool(authenticated["promotion_eligible"]),
             "flywheel_replay_contract": authenticated.get(
                 "flywheel_replay_contract"
+            ),
+            "aux_subgoal_component_ids": authenticated.get(
+                "aux_subgoal_component_ids", []
             ),
         })
     else:
@@ -12703,6 +12798,11 @@ def _iterate_training_batches(
             materialized["_policy_kl_anchor_eligible"] = (
                 policy_kl_anchor_eligible
             )
+        aux_subgoal_eligible = _aux_subgoal_scope_mask(data, batch)
+        if aux_subgoal_eligible is not None:
+            # Preserve the authenticated component scope after global memmap
+            # rows are materialized into a local plain dict.
+            materialized["_aux_subgoal_eligible"] = aux_subgoal_eligible
         local = np.arange(len(batch), dtype=np.int64)
         return materialized, local, policy_sample_weights[batch], value_sample_weights[batch]
 
@@ -12799,6 +12899,7 @@ def load_teacher_data(
         "policy_weight_multiplier",
         "value_weight_multiplier",
         *AUX_TARGET_KEYS,
+        AUX_SUBGOAL_TARGET_VERSION_KEY,
         "hex_tokens",
         "hex_vertex_ids",
         "hex_edge_ids",
@@ -12836,6 +12937,9 @@ def load_teacher_data(
                 arrays[key] = [
                     _aux_subgoal_default_array(key, rows) for rows in prior_row_counts
                 ]
+            arrays[AUX_SUBGOAL_TARGET_VERSION_KEY] = [
+                np.zeros(rows, dtype=np.uint8) for rows in prior_row_counts
+            ]
         shard = _normalize_teacher_shard(
             raw,
             file,
@@ -13498,6 +13602,27 @@ def _normalize_teacher_shard(
                 f"{path} field {key} has shape {value.shape}, expected ({n},)"
             )
         result[key] = value.astype(dtype, copy=False)
+    if include_aux_defaults or AUX_SUBGOAL_TARGET_VERSION_KEY in shard:
+        version = np.asarray(
+            shard[AUX_SUBGOAL_TARGET_VERSION_KEY]
+            if AUX_SUBGOAL_TARGET_VERSION_KEY in shard
+            else np.zeros(n, dtype=np.uint8)
+        )
+        if version.shape != (n,):
+            raise SystemExit(
+                f"{path} field {AUX_SUBGOAL_TARGET_VERSION_KEY} has shape "
+                f"{version.shape}, expected ({n},)"
+            )
+        if version.dtype.kind not in {"i", "u"} or bool(
+            np.any((version.astype(np.int64) < 0) | (version.astype(np.int64) > 255))
+        ):
+            raise SystemExit(
+                f"{path} field {AUX_SUBGOAL_TARGET_VERSION_KEY} must be an "
+                "integer version in [0, 255]"
+            )
+        result[AUX_SUBGOAL_TARGET_VERSION_KEY] = version.astype(
+            np.uint8, copy=False
+        )
     for key, dtype in ENTITY_FIELD_DTYPES.items():
         if key not in shard:
             continue
@@ -15324,6 +15449,180 @@ def _policy_kl_anchor_scope_mask(
         dtype=np.int64,
     )
     return np.isin(component_indices, eligible_components)
+
+
+def _aux_subgoal_scope_mask(
+    data: object,
+    batch: np.ndarray,
+) -> np.ndarray | None:
+    """Resolve the authenticated component mask for auxiliary supervision.
+
+    ``None`` means an ordinary single corpus (all rows are in scope, subject to
+    the per-row semantic version).  An authenticated composite always returns
+    an explicit boolean mask, including all-false batches from historical
+    replay.  This distinction prevents old replay labels from being silently
+    re-enabled by threaded materialization.
+    """
+
+    if isinstance(data, dict) and "_aux_subgoal_eligible" in data:
+        eligible = np.asarray(data["_aux_subgoal_eligible"][batch], dtype=np.bool_)
+        if eligible.shape != (len(batch),):
+            raise ValueError("materialized aux-subgoal scope shape drift")
+        return eligible
+    if not bool(getattr(data, "aux_subgoal_scope_authenticated", False)):
+        return None
+    component_lookup = getattr(data, "component_indices_for_rows", None)
+    if not callable(component_lookup):
+        raise ValueError(
+            "authenticated aux-subgoal scope has no component row lookup"
+        )
+    components = np.asarray(component_lookup(batch), dtype=np.int64)
+    if components.shape != (len(batch),):
+        raise ValueError("authenticated aux-subgoal component shape drift")
+    eligible_components = np.asarray(
+        getattr(data, "aux_subgoal_component_indices", tuple()), dtype=np.int64
+    )
+    return np.isin(components, eligible_components)
+
+
+def _validate_aux_subgoal_training_contract(
+    data: object,
+    train_indices: np.ndarray,
+    *,
+    loss_weight: float,
+) -> dict[str, object]:
+    """Validate semantic/version/scope before the first aux optimizer step.
+
+    Version 0 (missing from historical shards) is deliberately valid storage
+    but invalid auxiliary supervision.  Composite descriptors must explicitly
+    authenticate the components allowed to supply version-1 targets; excluded
+    components remain available to policy/value objectives.
+    """
+
+    weight = float(loss_weight)
+    if weight == 0.0:
+        return {
+            "schema_version": "aux-subgoal-training-contract-v1",
+            "enabled": False,
+            "loss_weight": 0.0,
+        }
+    missing = [key for key in (*AUX_TARGET_KEYS, AUX_SUBGOAL_TARGET_VERSION_KEY) if key not in data]
+    if missing:
+        raise SystemExit(
+            "nonzero aux-subgoal loss requires versioned target columns; missing="
+            + ",".join(missing)
+        )
+    indices = np.asarray(train_indices, dtype=np.int64)
+    if indices.ndim != 1 or indices.size == 0:
+        raise SystemExit("nonzero aux-subgoal loss has no training rows")
+
+    component_ids = tuple(getattr(data, "component_ids", tuple()))
+    component_lookup = getattr(data, "component_indices_for_rows", None)
+    is_composite = bool(component_ids)
+    if is_composite:
+        if not bool(getattr(data, "aux_subgoal_scope_authenticated", False)):
+            raise SystemExit(
+                "nonzero aux-subgoal loss on a composite requires an authenticated "
+                "aux_subgoal_component_ids scope"
+            )
+        eligible_components = tuple(
+            int(value)
+            for value in getattr(data, "aux_subgoal_component_indices", tuple())
+        )
+        if (
+            not callable(component_lookup)
+            or not eligible_components
+            or len(set(eligible_components)) != len(eligible_components)
+            or any(value < 0 or value >= len(component_ids) for value in eligible_components)
+        ):
+            raise SystemExit(
+                "nonzero aux-subgoal loss has an empty/invalid authenticated component scope"
+            )
+    else:
+        component_ids = ("single_corpus",)
+        eligible_components = (0,)
+
+    report_components = {
+        component_id: {
+            "component_index": int(component),
+            "aux_training_enabled": bool(component in eligible_components),
+            "training_rows": 0,
+            "version_counts": {},
+            "valid_target_rows": {key: 0 for key in AUX_TARGET_KEYS},
+        }
+        for component, component_id in enumerate(component_ids)
+    }
+    chunk_size = 1_000_000
+    for start in range(0, int(indices.size), chunk_size):
+        rows = indices[start : start + chunk_size]
+        components = (
+            np.asarray(component_lookup(rows), dtype=np.int64)
+            if is_composite
+            else np.zeros(rows.size, dtype=np.int64)
+        )
+        versions = np.asarray(data[AUX_SUBGOAL_TARGET_VERSION_KEY][rows])
+        if versions.shape != (rows.size,) or versions.dtype.kind not in {"i", "u"}:
+            raise SystemExit("aux-subgoal target version column shape/dtype drift")
+        versions_i64 = versions.astype(np.int64, copy=False)
+        for component in np.unique(components).tolist():
+            if not 0 <= int(component) < len(component_ids):
+                raise SystemExit("aux-subgoal component lookup returned an invalid index")
+            selected = components == int(component)
+            component_id = component_ids[int(component)]
+            row = report_components[component_id]
+            row["training_rows"] = int(row["training_rows"]) + int(selected.sum())
+            unique_versions, version_counts = np.unique(
+                versions_i64[selected], return_counts=True
+            )
+            counts = row["version_counts"]
+            for version, count in zip(unique_versions.tolist(), version_counts.tolist()):
+                key = str(int(version))
+                counts[key] = int(counts.get(key, 0)) + int(count)
+            if int(component) not in eligible_components:
+                continue
+            if bool(np.any(versions_i64[selected] != AUX_SUBGOAL_TARGET_VERSION)):
+                raise SystemExit(
+                    "aux-subgoal semantic version mismatch in authenticated component "
+                    f"{component_id!r}: expected {AUX_SUBGOAL_TARGET_VERSION}, "
+                    f"observed={sorted(map(int, unique_versions.tolist()))}"
+                )
+            selected_rows = rows[selected]
+            valid_counts = row["valid_target_rows"]
+            for key in AUX_TARGET_KEYS:
+                target = np.asarray(data[key][selected_rows])
+                valid = (
+                    target >= 0
+                    if key in {"aux_next_settlement", "aux_robber_target"}
+                    else np.isfinite(target)
+                )
+                valid_counts[key] = int(valid_counts[key]) + int(np.count_nonzero(valid))
+
+    eligible_ids = [component_ids[index] for index in eligible_components]
+    for component_id in eligible_ids:
+        row = report_components[component_id]
+        if int(row["training_rows"]) <= 0:
+            raise SystemExit(
+                f"authenticated aux-subgoal component {component_id!r} has no training rows"
+            )
+        missing_labels = [
+            key
+            for key, count in row["valid_target_rows"].items()
+            if int(count) <= 0
+        ]
+        if missing_labels:
+            raise SystemExit(
+                f"authenticated aux-subgoal component {component_id!r} has no valid "
+                "training labels for " + ",".join(missing_labels)
+            )
+    return {
+        "schema_version": "aux-subgoal-training-contract-v1",
+        "enabled": True,
+        "loss_weight": weight,
+        "target_version": AUX_SUBGOAL_TARGET_VERSION,
+        "target_semantic": AUX_SUBGOAL_TARGET_SEMANTIC,
+        "component_ids": eligible_ids,
+        "components": report_components,
+    }
 
 
 def _weighted_mean_loss(values, weights, *, mask=None):

@@ -21,10 +21,24 @@ if str(_TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(_TOOLS_DIR))
 
 import train_bc  # noqa: E402
+from catan_zero.rl.aux_subgoal_targets import (  # noqa: E402
+    AUX_SUBGOAL_TARGET_VERSION,
+    AUX_SUBGOAL_TARGET_VERSION_KEY,
+)
 
 
 _N = 4
 _DEVICE = torch.device("cpu")
+
+
+def _versioned(data, *, versions=None, eligible=None):
+    data[AUX_SUBGOAL_TARGET_VERSION_KEY] = np.asarray(
+        [AUX_SUBGOAL_TARGET_VERSION] * _N if versions is None else versions,
+        dtype=np.uint8,
+    )
+    if eligible is not None:
+        data["_aux_subgoal_eligible"] = np.asarray(eligible, dtype=np.bool_)
+    return data
 
 
 def _outputs(all_heads=True):
@@ -56,18 +70,28 @@ def test_heads_absent_is_noop():
     data = {}
     loss, active = train_bc._aux_subgoal_loss(out, data, np.arange(_N), _DEVICE)
     assert active == 0
-    assert float(loss) == 0.0
+    assert float(loss.detach()) == 0.0
+
+
+def test_unversioned_aux_targets_fail_closed():
+    with pytest.raises(ValueError, match="unversioned targets"):
+        train_bc._aux_subgoal_loss(
+            _outputs(),
+            {"aux_vp_in_n": np.zeros(_N, dtype=np.float32)},
+            np.arange(_N),
+            _DEVICE,
+        )
 
 
 def test_all_heads_present_counts_five_and_is_differentiable():
     out = _outputs()
-    data = {
+    data = _versioned({
         "aux_longest_road": np.array([0, 1, 1, 0], dtype=np.float32),
         "aux_largest_army": np.array([0, 0, 1, 0], dtype=np.float32),
         "aux_vp_in_n": np.array([0.0, 1.0, 2.0, 0.0], dtype=np.float32),
         "aux_next_settlement": np.array([5, 12, -1, 40], dtype=np.int64),
         "aux_robber_target": np.array([3, -1, -1, 7], dtype=np.int64),
-    }
+    })
     loss, active = train_bc._aux_subgoal_loss(out, data, np.arange(_N), _DEVICE)
     assert active == 5
     assert torch.isfinite(loss)
@@ -79,35 +103,41 @@ def test_all_heads_present_counts_five_and_is_differentiable():
 
 def test_all_ignored_categorical_head_is_zero_but_enters_global_reduction(monkeypatch):
     out = _outputs()
-    data = {
+    data = _versioned({
         "aux_next_settlement": np.array([-1, -1, -1, -1], dtype=np.int64),
-    }
+    })
     calls = []
-    original = train_bc._weighted_mean_loss
 
-    def tracked(values, weights, *, mask=None):
-        calls.append((values.detach().clone(), weights.detach().clone()))
-        return original(values, weights, mask=mask)
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 2)
 
-    monkeypatch.setattr(train_bc, "_weighted_mean_loss", tracked)
+    def tracked_all_reduce(denominator, *, op):
+        assert op == torch.distributed.ReduceOp.SUM
+        calls.append(denominator.detach().clone())
+        # Simulate one peer rank carrying two eligible labels.  This rank's
+        # numerator remains zero, but it must enter the same collective.
+        denominator.fill_(2.0)
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", tracked_all_reduce)
     loss, active = train_bc._aux_subgoal_loss(out, data, np.arange(_N), _DEVICE)
     # A rank-local empty mask still enters the DDP-global denominator helper;
     # another rank may carry valid labels for this same head.
     assert active == 0
-    assert float(loss) == 0.0
+    assert float(loss.detach()) == 0.0
     assert len(calls) == 1
-    assert float(calls[0][1].sum()) == 0.0
+    assert float(calls[0]) == 0.0
 
 
 def test_partial_head_subset_counted():
     out = _outputs()
-    data = {
+    data = _versioned({
         "aux_longest_road": np.array([1, 0, 1, 1], dtype=np.float32),
         "aux_vp_in_n": np.array([0.0, 1.0, 0.0, 2.0], dtype=np.float32),
-    }
+    })
     loss, active = train_bc._aux_subgoal_loss(out, data, np.arange(_N), _DEVICE)
     assert active == 2
-    assert torch.isfinite(loss) and float(loss) > 0.0
+    assert torch.isfinite(loss) and float(loss.detach()) > 0.0
 
 
 def test_spatial_aux_labels_follow_the_exact_sampled_d6_orientation():
@@ -142,10 +172,10 @@ def test_spatial_aux_labels_follow_the_exact_sampled_d6_orientation():
         "aux_next_settlement": settlement_logits,
         "aux_robber_target": robber_logits,
     }
-    data = {
+    data = _versioned({
         "aux_next_settlement": settlement,
         "aux_robber_target": robber,
-    }
+    })
 
     loss, active = train_bc._aux_subgoal_loss(
         outputs,
@@ -156,4 +186,85 @@ def test_spatial_aux_labels_follow_the_exact_sampled_d6_orientation():
         symmetry_ids=g,
     )
     assert active == 2
-    assert float(loss) < 1.0e-6
+    assert float(loss.detach()) < 1.0e-6
+
+
+def test_historical_version_zero_is_ignored_only_outside_authenticated_scope():
+    outputs = {"aux_vp_in_n": torch.zeros(_N, requires_grad=True)}
+    data = _versioned(
+        {"aux_vp_in_n": np.asarray([1.0, 2.0, 100.0, 100.0], dtype=np.float32)},
+        versions=[1, 1, 0, 0],
+        eligible=[True, True, False, False],
+    )
+    loss, active = train_bc._aux_subgoal_loss(
+        outputs, data, np.arange(_N), _DEVICE
+    )
+    assert active == 1
+    # Only version-1 eligible rows enter MSE: mean(1^2, 2^2) = 2.5.
+    assert float(loss.detach()) == pytest.approx(2.5)
+
+    data["_aux_subgoal_eligible"][:] = True
+    with pytest.raises(ValueError, match="version mismatch"):
+        train_bc._aux_subgoal_loss(outputs, data, np.arange(_N), _DEVICE)
+
+
+class _CompositeAuxData(dict):
+    component_ids = ("fresh", "historical_replay")
+    aux_subgoal_scope_authenticated = True
+    aux_subgoal_component_indices = (0,)
+
+    @staticmethod
+    def component_indices_for_rows(rows):
+        return np.where(np.asarray(rows) < 2, 0, 1)
+
+
+def _composite_aux_data():
+    return _CompositeAuxData(
+        {
+            "aux_longest_road": np.asarray([0, 1, 0, 1], dtype=np.float32),
+            "aux_largest_army": np.asarray([0, 0, 1, 0], dtype=np.float32),
+            "aux_vp_in_n": np.asarray([0, 1, 2, 3], dtype=np.float32),
+            "aux_next_settlement": np.asarray([5, 6, 7, 8], dtype=np.int16),
+            "aux_robber_target": np.asarray([1, 2, 3, 4], dtype=np.int16),
+            AUX_SUBGOAL_TARGET_VERSION_KEY: np.asarray(
+                [AUX_SUBGOAL_TARGET_VERSION, AUX_SUBGOAL_TARGET_VERSION, 0, 0],
+                dtype=np.uint8,
+            ),
+        }
+    )
+
+
+def test_aux_contract_keeps_unversioned_replay_policy_value_only():
+    data = _composite_aux_data()
+    report = train_bc._validate_aux_subgoal_training_contract(
+        data, np.arange(_N), loss_weight=0.02
+    )
+    assert report["component_ids"] == ["fresh"]
+    assert report["components"]["fresh"]["version_counts"] == {"1": 2}
+    assert report["components"]["historical_replay"]["version_counts"] == {
+        "0": 2
+    }
+    assert (
+        report["components"]["historical_replay"]["aux_training_enabled"]
+        is False
+    )
+
+
+def test_aux_contract_refuses_including_unversioned_replay():
+    data = _composite_aux_data()
+    data.aux_subgoal_component_indices = (0, 1)
+    with pytest.raises(SystemExit, match="semantic version mismatch"):
+        train_bc._validate_aux_subgoal_training_contract(
+            data, np.arange(_N), loss_weight=0.02
+        )
+
+
+def test_zero_aux_weight_does_not_require_versioned_data():
+    report = train_bc._validate_aux_subgoal_training_contract(
+        {}, np.arange(_N), loss_weight=0.0
+    )
+    assert report == {
+        "schema_version": "aux-subgoal-training-contract-v1",
+        "enabled": False,
+        "loss_weight": 0.0,
+    }
