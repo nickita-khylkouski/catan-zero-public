@@ -9,6 +9,7 @@ from catan_zero.rl._catanatron import import_catanatron_module
 from tools.train_bc import (
     _bounded_count_fraction,
     ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS,
+    ENTITY_GRAPH_VALUE_ONLY_FREEZE_GROUPS,
     _apply_lr_warmup,
     _lr_warmup_multiplier,
     _set_entity_graph_modules_trainable,
@@ -88,6 +89,14 @@ def test_freeze_module_groups_cover_expected_submodules() -> None:
         "value_categorical_head" in ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS["value_heads"]
     )
     assert "final_vp_head" in ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS["value_heads"]
+    assert ENTITY_GRAPH_VALUE_ONLY_FREEZE_GROUPS == {
+        "trunk",
+        "action_encoder",
+        "policy_head",
+        "target_gather",
+        "edge_policy",
+        "action_cross",
+    }
 
 
 def test_set_entity_graph_modules_trainable_freezes_and_restores() -> None:
@@ -228,28 +237,52 @@ def test_set_entity_graph_modules_trainable_rejects_unknown_group() -> None:
         )
 
 
-def test_value_only_smoke_frozen_params_stay_put_value_params_move() -> None:
-    """10-step smoke (per spec): after freezing trunk/action_encoder/policy_head, those
-    params' gradients must be None (never touched) and their values must not move across
-    optimizer steps, while value_head/final_vp_head gradients are non-zero and their values
-    DO move."""
-    import torch
+def test_value_only_smoke_freezes_complete_upgraded_policy_path() -> None:
+    """A value-only repair must also freeze every optional policy adapter."""
+    from dataclasses import replace
 
-    policy = _make_entity_policy()
+    import torch
+    from catan_zero.rl.entity_token_policy import EntityGraphPolicy
+
+    base = _make_entity_policy()
+    policy = EntityGraphPolicy(
+        replace(
+            base.config,
+            action_target_gather=True,
+            edge_policy_head=True,
+            action_cross_attention_layers=1,
+        ),
+        base.static_action_features.detach().cpu().numpy(),
+        device="cpu",
+    )
     _set_entity_graph_modules_trainable(
-        policy.model, ["trunk", "action_encoder", "policy_head"], trainable=False
+        policy.model, ENTITY_GRAPH_VALUE_ONLY_FREEZE_GROUPS, trainable=False
     )
 
     samples = _collect_real_samples(6)
     entity_batch = _pad_entity_batch(policy, samples)
     legal_action_ids, legal_action_context = _pad_legal_action_arrays(policy, samples)
 
-    optimizer = torch.optim.Adam(
-        [p for p in policy.model.parameters() if p.requires_grad], lr=1e-2
+    optimizer = torch.optim.AdamW(
+        [p for p in policy.model.parameters() if p.requires_grad],
+        lr=1e-2,
+        weight_decay=0.1,
     )
 
     frozen_param = next(policy.model.hex_encoder.parameters())
     frozen_before = frozen_param.detach().clone()
+    policy_adapter_params = {
+        name: parameter
+        for name, parameter in policy.model.named_parameters()
+        if name.startswith(
+            ("target_gather_proj.", "edge_policy_mlp.", "action_cross_blocks.")
+        )
+    }
+    assert policy_adapter_params
+    policy_adapter_before = {
+        name: parameter.detach().clone()
+        for name, parameter in policy_adapter_params.items()
+    }
     value_param = next(policy.model.value_head.parameters())
     value_before = value_param.detach().clone()
 
@@ -262,15 +295,26 @@ def test_value_only_smoke_frozen_params_stay_put_value_params_move() -> None:
         outputs = policy.forward_legal_np(
             entity_batch, legal_action_ids, legal_action_context, return_q=False
         )
-        value_loss = torch.nn.functional.mse_loss(outputs["value"], value_targets)
+        # Match the production combined-objective graph: the policy loss can be
+        # present with a zero coefficient. If a policy adapter were still in
+        # the optimizer, that exact-zero gradient would permit AdamW decay.
+        value_loss = torch.nn.functional.mse_loss(
+            outputs["value"], value_targets
+        ) + 0.0 * outputs["logits"].sum()
         optimizer.zero_grad(set_to_none=True)
         value_loss.backward()
         assert frozen_param.grad is None
+        assert all(
+            parameter.grad is None
+            for parameter in policy_adapter_params.values()
+        )
         assert value_param.grad is not None
         assert bool((value_param.grad.abs().sum() > 0).item())
         optimizer.step()
 
     torch.testing.assert_close(frozen_param.detach(), frozen_before)
+    for name, parameter in policy_adapter_params.items():
+        torch.testing.assert_close(parameter.detach(), policy_adapter_before[name])
     assert not torch.allclose(value_param.detach(), value_before)
 
 
