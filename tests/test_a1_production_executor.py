@@ -1160,7 +1160,9 @@ def test_preflight_accepts_only_exact_report(monkeypatch: pytest.MonkeyPatch) ->
         "python": "/venv/bin/python",
         "torch_version": "x",
         "torch_cuda_version": "x",
-        "catanatron_rs_version": "x",
+        "catanatron_rs_version": executor.NATIVE_WHEEL_VERSION,
+        "native_wheel_sha256": executor._native_wheel_release_identity()["sha256"],
+        "native_mcts_capabilities": sorted(executor.NATIVE_REQUIRED_CAPABILITIES),
         "required_nofile_soft": executor.REQUIRED_NOFILE_SOFT,
         "nofile_soft_before": 1024,
         "nofile_soft": executor.REQUIRED_NOFILE_SOFT,
@@ -1179,6 +1181,52 @@ def test_preflight_accepts_only_exact_report(monkeypatch: pytest.MonkeyPatch) ->
     report["mps_unit_sha256"] = "sha256:" + "0" * 64
     with pytest.raises(executor.ExecutorError, match="unit digest drift"):
         executor._preflight_host({"python": "/venv/bin/python"}, "h00", [0, 1, 2, 3])
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("catanatron_rs_version", "0.1.4", "version drift"),
+        ("native_wheel_sha256", "sha256:" + "0" * 64, "wheel digest drift"),
+        ("native_mcts_capabilities", [], "capability drift"),
+        ("native_mcts_capabilities", "not-a-list", "capability drift"),
+    ],
+)
+def test_preflight_fails_closed_on_native_runtime_report(
+    monkeypatch: pytest.MonkeyPatch, field: str, value: object, message: str
+) -> None:
+    report = {
+        "gpu_indices": [0, 1, 2, 3],
+        "compute_apps": "mps_only_or_empty",
+        "mps_active": "active",
+        "mps_enabled": "enabled",
+        "mps_main_pid": 123,
+        "mps_unit_sha256": executor._sha256(executor.MPS_UNIT_PATH),
+        "mps_limit_nofile_soft": executor.REQUIRED_NOFILE_SOFT,
+        "client_environment": dict(executor.CLIENT_ENVIRONMENT),
+        "python": "/venv/bin/python",
+        "torch_version": "x",
+        "torch_cuda_version": "x",
+        "catanatron_rs_version": executor.NATIVE_WHEEL_VERSION,
+        "native_wheel_sha256": executor._native_wheel_release_identity()["sha256"],
+        "native_mcts_capabilities": sorted(executor.NATIVE_REQUIRED_CAPABILITIES),
+        "required_nofile_soft": executor.REQUIRED_NOFILE_SOFT,
+        "nofile_soft_before": 1024,
+        "nofile_soft": executor.REQUIRED_NOFILE_SOFT,
+        "nofile_hard": 1_048_576,
+    }
+    report[field] = value
+    monkeypatch.setattr(
+        executor,
+        "_ssh",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            [], 0, json.dumps(report), ""
+        ),
+    )
+    with pytest.raises(executor.ExecutorError, match=message):
+        executor._preflight_host(
+            {"python": "/venv/bin/python"}, "h00", [0, 1, 2, 3]
+        )
 
 
 @pytest.mark.parametrize(
@@ -1207,7 +1255,9 @@ def test_preflight_fails_closed_on_nofile_report(
         "python": "/venv/bin/python",
         "torch_version": "x",
         "torch_cuda_version": "x",
-        "catanatron_rs_version": "x",
+        "catanatron_rs_version": executor.NATIVE_WHEEL_VERSION,
+        "native_wheel_sha256": executor._native_wheel_release_identity()["sha256"],
+        "native_mcts_capabilities": sorted(executor.NATIVE_REQUIRED_CAPABILITIES),
         "required_nofile_soft": executor.REQUIRED_NOFILE_SOFT,
         "nofile_soft_before": 1024,
         "nofile_soft": executor.REQUIRED_NOFILE_SOFT,

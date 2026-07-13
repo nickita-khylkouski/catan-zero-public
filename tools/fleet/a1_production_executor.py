@@ -40,6 +40,20 @@ SUPERVISOR_ENVIRONMENT = {"PYTHONDONTWRITEBYTECODE": "1"}
 REQUIRED_NOFILE_SOFT = 65_536
 STOP_SSH_TIMEOUT_SECONDS = 45.0
 MPS_UNIT_PATH = _REPO_ROOT / "tools/fleet/systemd/nvidia-mps.service"
+NATIVE_WHEEL_VERSION = "0.1.8"
+NATIVE_WHEEL_NAME = (
+    "catanatron_rs-0.1.8-cp311-cp311-manylinux_2_34_x86_64.whl"
+)
+NATIVE_WHEEL_INVENTORY = _REPO_ROOT / "native/catanatron-rs/WHEEL_SHA256SUMS"
+NATIVE_REQUIRED_CAPABILITIES = frozenset(
+    {
+        "sigma_reference_visits",
+        "belief_target_evidence",
+        "initial_road_d1_scope",
+        "public_award_feature_parity",
+        "policy_temperature_semantics",
+    }
+)
 HISTORICAL_DB1_REPO_ROOT = Path("/home/ubuntu/catan-db1c8b1-campaign")
 HISTORICAL_DB1_CAMPAIGN_PATH = (
     HISTORICAL_DB1_REPO_ROOT
@@ -177,6 +191,38 @@ def _sha256(path: Path) -> str:
         for block in iter(lambda: handle.read(1 << 20), b""):
             digest.update(block)
     return "sha256:" + digest.hexdigest()
+
+
+def _native_wheel_release_identity() -> dict[str, Any]:
+    """Read the one canonical native-wheel identity sealed by this checkout."""
+
+    try:
+        rows = [
+            line.split()
+            for line in NATIVE_WHEEL_INVENTORY.read_text(
+                encoding="utf-8"
+            ).splitlines()
+            if line.strip()
+        ]
+    except OSError as error:
+        raise ExecutorError(
+            f"cannot read native-wheel checksum inventory: {error}"
+        ) from error
+    if (
+        len(rows) != 1
+        or len(rows[0]) != 2
+        or not re.fullmatch(r"[0-9a-f]{64}", rows[0][0])
+        or rows[0][1] != NATIVE_WHEEL_NAME
+    ):
+        raise ExecutorError(
+            "native-wheel checksum inventory is not the one canonical 0.1.8 artifact"
+        )
+    return {
+        "version": NATIVE_WHEEL_VERSION,
+        "filename": NATIVE_WHEEL_NAME,
+        "sha256": "sha256:" + rows[0][0],
+        "required_capabilities": sorted(NATIVE_REQUIRED_CAPABILITIES),
+    }
 
 
 def _load(path: Path) -> dict[str, Any]:
@@ -845,10 +891,12 @@ def _preflight_host(
 ) -> dict[str, Any]:
     """Read-only launch preflight: topology, resources, idle compute plane, MPS."""
     expected_mps_unit_sha256 = _sha256(MPS_UNIT_PATH)
+    expected_native_wheel = _native_wheel_release_identity()
     script = r'''import hashlib,importlib.metadata,json,os,pathlib,resource,subprocess,sys
 expected=json.loads(sys.argv[1])
 required_nofile=int(sys.argv[2])
 expected_mps_unit_sha256=sys.argv[3]
+expected_native_wheel=json.loads(sys.argv[4])
 nofile_soft_before,nofile_hard=resource.getrlimit(resource.RLIMIT_NOFILE)
 unlimited=resource.RLIM_INFINITY
 if nofile_hard!=unlimited and nofile_hard<required_nofile: raise SystemExit(f'hard RLIMIT_NOFILE {nofile_hard} is below required {required_nofile}')
@@ -900,14 +948,39 @@ fragment=pathlib.Path(properties['FragmentPath'])
 if not fragment.is_file(): raise SystemExit('MPS service FragmentPath is not a file: '+str(fragment))
 mps_unit_sha256='sha256:'+hashlib.sha256(fragment.read_bytes()).hexdigest()
 if mps_unit_sha256!=expected_mps_unit_sha256: raise SystemExit(f'MPS service unit digest drift: expected {expected_mps_unit_sha256}, got {mps_unit_sha256}')
-try: rust_version=importlib.metadata.version('catanatron-rs')
-except importlib.metadata.PackageNotFoundError: rust_version='unknown'
-print(json.dumps({'gpu_indices':indices,'compute_apps':'mps_only_or_empty','mps_active':active,'mps_enabled':enabled,'mps_main_pid':main_pid,'mps_unit_sha256':mps_unit_sha256,'mps_limit_nofile_soft':mps_limit_nofile_soft,'client_environment':required,'python':sys.executable,'torch_version':str(torch.__version__),'torch_cuda_version':str(torch.version.cuda),'catanatron_rs_version':rust_version,'required_nofile_soft':required_nofile,'nofile_soft_before':nofile_soft_before,'nofile_soft':nofile_soft,'nofile_hard':nofile_hard},sort_keys=True))'''
+try:
+    rust_distribution=importlib.metadata.distribution('catanatron-rs')
+except importlib.metadata.PackageNotFoundError:
+    raise SystemExit('configured interpreter has no catanatron-rs distribution')
+rust_version=rust_distribution.version
+if rust_version!=expected_native_wheel['version']:
+    raise SystemExit(f"catanatron-rs version drift: expected {expected_native_wheel['version']}, got {rust_version}")
+direct_url_raw=rust_distribution.read_text('direct_url.json')
+if direct_url_raw is None: raise SystemExit('installed catanatron-rs has no PEP 610 direct_url.json')
+try: direct_url=json.loads(direct_url_raw)
+except json.JSONDecodeError as error: raise SystemExit('installed catanatron-rs direct_url.json is invalid: '+repr(error))
+archive=direct_url.get('archive_info') if isinstance(direct_url,dict) else None
+if not isinstance(archive,dict): raise SystemExit('installed catanatron-rs is not bound to a wheel archive')
+stated=set()
+direct_hash=archive.get('hash')
+if isinstance(direct_hash,str): stated.add(direct_hash)
+hashes=archive.get('hashes')
+if isinstance(hashes,dict) and isinstance(hashes.get('sha256'),str): stated.add('sha256='+hashes['sha256'])
+expected_direct='sha256='+expected_native_wheel['sha256'].removeprefix('sha256:')
+if stated!={expected_direct}: raise SystemExit(f'installed catanatron-rs wheel digest mismatch: expected={expected_direct} recorded={sorted(stated)}')
+capability_fn=getattr(catanatron_rs,'gumbel_search_capabilities',None)
+if not callable(capability_fn): raise SystemExit('installed catanatron-rs lacks the native capability contract')
+capabilities=set(capability_fn())
+required_capabilities=set(expected_native_wheel['required_capabilities'])
+missing=sorted(required_capabilities-capabilities)
+if missing: raise SystemExit('installed catanatron-rs lacks required capabilities: '+repr(missing))
+print(json.dumps({'gpu_indices':indices,'compute_apps':'mps_only_or_empty','mps_active':active,'mps_enabled':enabled,'mps_main_pid':main_pid,'mps_unit_sha256':mps_unit_sha256,'mps_limit_nofile_soft':mps_limit_nofile_soft,'client_environment':required,'python':sys.executable,'torch_version':str(torch.__version__),'torch_cuda_version':str(torch.version.cuda),'catanatron_rs_version':rust_version,'native_wheel_sha256':expected_native_wheel['sha256'],'native_mcts_capabilities':sorted(capabilities),'required_nofile_soft':required_nofile,'nofile_soft_before':nofile_soft_before,'nofile_soft':nofile_soft,'nofile_hard':nofile_hard},sort_keys=True))'''
     command = " ".join(
         shlex.quote(value)
         for value in (
             hosts["python"], "-c", script, json.dumps(sorted(expected_gpus)),
             str(REQUIRED_NOFILE_SOFT), expected_mps_unit_sha256,
+            json.dumps(expected_native_wheel, sort_keys=True),
         )
     )
     result = _ssh(hosts, alias, command)
@@ -922,6 +995,17 @@ print(json.dumps({'gpu_indices':indices,'compute_apps':'mps_only_or_empty','mps_
         raise ExecutorError(f"host MPS client environment drift on {alias}")
     if report.get("mps_unit_sha256") != expected_mps_unit_sha256:
         raise ExecutorError(f"host MPS service unit digest drift on {alias}")
+    if report.get("catanatron_rs_version") != expected_native_wheel["version"]:
+        raise ExecutorError(f"host catanatron-rs version drift on {alias}")
+    if report.get("native_wheel_sha256") != expected_native_wheel["sha256"]:
+        raise ExecutorError(f"host catanatron-rs wheel digest drift on {alias}")
+    reported_capabilities = report.get("native_mcts_capabilities")
+    if (
+        not isinstance(reported_capabilities, list)
+        or any(not isinstance(value, str) for value in reported_capabilities)
+        or not NATIVE_REQUIRED_CAPABILITIES <= set(reported_capabilities)
+    ):
+        raise ExecutorError(f"host catanatron-rs capability drift on {alias}")
     mps_limit_nofile_soft = report.get("mps_limit_nofile_soft")
     if type(mps_limit_nofile_soft) is not int:
         raise ExecutorError(f"invalid MPS LimitNOFILESoft report on {alias}")
