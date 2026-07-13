@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -94,6 +95,39 @@ def test_production_next_training_refuses_single_component_without_anchor(tmp_pa
     )
     assert result["ok"] is False
     assert "requires ShardMeta provenance" in result["note"]
+
+
+def test_production_composite_uses_replay_contract_without_a1_sentinel() -> None:
+    args = SimpleNamespace(a1_contract_sha256="")
+    train_bc._bind_composite_validation_provenance(  # noqa: SLF001
+        args,
+        object(),
+        validation_seed_contract=None,
+        composite_meta={
+            "schema_version": "memmap_composite_v2",
+            "diagnostic_only": False,
+            "promotion_eligible": True,
+            "flywheel_replay_contract": {"schema_version": "flywheel-replay-composite-v2"},
+        },
+        ddp={"enabled": False, "world_size": 1, "rank": 0, "local_rank": 0},
+    )
+    assert args.a1_contract_sha256 == ""
+
+
+def test_composite_without_any_validation_authority_fails_closed() -> None:
+    with pytest.raises(SystemExit, match="must carry the exact"):
+        train_bc._bind_composite_validation_provenance(  # noqa: SLF001
+            SimpleNamespace(a1_contract_sha256=""),
+            object(),
+            validation_seed_contract=None,
+            composite_meta={
+                "schema_version": "memmap_composite_v2",
+                "diagnostic_only": True,
+                "promotion_eligible": False,
+                "flywheel_replay_contract": None,
+            },
+            ddp={"enabled": False, "world_size": 1, "rank": 0, "local_rank": 0},
+        )
 
 
 def test_non_dry_train_window_builds_authenticated_production_composite(
