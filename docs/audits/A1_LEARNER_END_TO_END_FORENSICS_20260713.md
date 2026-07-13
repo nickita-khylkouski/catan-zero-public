@@ -139,10 +139,11 @@ a diagnostic, not a champion selector. Search H2H remains mandatory.
 | Sharded-DDP sampler resume | Progress saved only rank 0's NumPy epoch sampler state. With `--ddp-shard-data`, ranks permute different local corpora and can advance their generators differently; resume reset every rank to rank 0's stream. | Fixed: new progress commits gather and restore per-rank NumPy RNG states. Legacy multi-rank sharded checkpoints without them fail closed; shared-global-corpus legacy DDP retains its exact single-stream fallback. P0/TEMP did not use sharded-data resume. |
 | DDP zero-objective step consensus | The zero-signal guard combined a globally synchronized gradient norm with a rank-local scalar loss. At an exact zero-gradient sparse/stationary step, an empty rank could skip while a peer with a nonzero objective advanced Adam/AdamW, immediately diverging optimizer state and decoupled weight decay across replicas. | Fixed: only the rare zero-gradient branch collectively resolves whether any rank has objective mass; all ranks then step or skip together. Nonzero-gradient hot steps add no collective. P0/TEMP have active base objectives and are unaffected. |
 | Advantage weighting | The optional multiplier was normalized per rank; changing DDP geometry changed the objective, and empty-rank early return precluded a safe collective. | Fixed: all ranks participate in a globally weighted normalizer. |
-| Decisive distributed modes | Gradient accumulation, distributed symmetry augmentation, and distributed outcome-value advantage did not yet have a sealed equivalence contract for a promotion-bearing A1 run. | Production execution now refuses these modes unless an explicit diagnostic/nondecisive authority is bound. DDP at accumulation 1 remains the sealed path (`28f42cf`). |
+| Decisive distributed modes | Gradient accumulation and distributed outcome-value advantage still lack a sealed equivalence contract. Distributed symmetry had a separate concrete defect: every rank constructed `default_rng(seed+20260705)`, so the same 512-orientation pattern repeated across all eight local batches, and progress saved only rank 0's augmentation stream. | Symmetry is fixed: its deterministic `SeedSequence` binds `(seed, world_size, rank)`, all rank streams are gathered into a versioned progress envelope, exact rank-local resume is tested, and legacy/malformed multi-rank resumes fail closed (`83ad050`). Composite diagnostics now report the same semantics. Gradient accumulation and distributed advantage remain diagnostic-only; accumulation-1 DDP remains the sealed base path. |
 | Geometry GPU binding | The geometry launcher referenced `WORLD_SIZE` before defining it, so a true `--go` run failed before binding any GPU. | Fixed and covered by launch tests (`b59983b`). |
 | Composite validation cap | A row-count validation cap can split a game and invalidate the signed game-disjoint validation sentinel. The first geometry command mistakenly requested 8,192 rows despite supplying the sentinel. | Planner and trainer now require `--validation-max-samples 0` for authenticated composites; the sentinel is the sole validation bound (`30b669f`). |
 | Validation aggregation | Objective-matched validation now aggregates sufficient statistics; legacy raw `validation.loss` is a row-concatenated diagnostic and not promotion evidence. | Confirmed. |
+| Posthoc composite validation | The standalone teacher-gap probe accepted only one memmap directory, even though the selected A1 learner consumes an authenticated `memmap_composite_v2` descriptor. Pointing it at the real descriptor aborted as “not a memmap corpus”; pointing it at one component would have measured the wrong population. It also omitted authenticated policy/value component scopes, policy-KL direction, belief loss, value-root blend, and the report-bound matmul mode. | Fixed: authenticate and load the exact composite, replay its policy/value scopes and objective arguments, evaluate the raw concatenation only as a compatibility diagnostic, and report teacher-gap closure from the same component→game→row objective measure used by training. Single-corpus behavior remains unchanged. |
 | Head weight decay | Requested zero-weight optional heads previously changed despite no objective. | Fixed (`e81ffb2`). |
 | Composite per-game weighting | Numeric `game_seed` values were treated as globally unique. The same seed in two corpus components was merged into one game for equal/sqrt weighting and quality telemetry. | Fixed: game identity is now `(component, game_seed)` and component offsets are validated (`cf54d5a`). |
 | Adjacent duplicate-game exposure | Pre-wave auditing and corpus conversion treated one maximal run of equal `game_seed` values as one game. They caught a seed that reappeared after another seed, but two byte-for-byte or independently regenerated copies placed directly back-to-back never changed seed and were silently merged. That could double one trajectory's sampling mass while acceptance, ordinary conversion, and selected-manifest conversion reported no duplicate. | Fixed: current pre-wave acceptance and both conversion trackers reject a non-increasing `decision_index` within the same seed, including across shard boundaries; legacy conversion without that field retains the seed-run check. Regressions cover adjacent reset, cross-shard reset, valid monotonic continuation, and the selected-source path. Existing P0/TEMP artifact impact is unproven: their prior attestations did not test this exact adjacency class, so do not retrospectively claim either contamination or absence from the old audit alone. |
@@ -442,6 +443,58 @@ f7 and consumes that one selected identical dose:
 4. categorical value head;
 5. one auxiliary-head bundle only after its requested targets are proven present.
 
+Fresh modules require a commissioning schedule, not the mature TEMP schedule by
+rote. With 100 warmup steps, the selected 128-step run provides only 78.5
+full-LR-equivalent updates; a fresh value head at `value_lr_mult=0.3` receives
+23.55 head-LR equivalents. The target-gather screen therefore preserves the
+same 524,288 rows but uses 8x64/global-512 for 1,024 optimizer steps, freezes
+every mature surface, and trains only the zero-init gather at action LR x4.
+Pure-soft remains an exact 128-step one-axis arm (`0.9 -> 1.0`). Stale launchers
+that coupled fresh heads to the rejected 4.19M-row dose now fail closed; see
+`A1_SHORT_DOSE_MODULE_COMMISSIONING_20260713.md`.
+
+The pure-soft arm has now been behavior-screened on the same 128 keys as the
+selected TEMP midpoint. It scored 72-56 (56.25%; `WW=14`, split=44, `LL=6`,
+zero errors/truncations), below the midpoint's 75-53 (58.59%). Its offline
+closure improved only from 0.102290 to 0.104274 and replay closure regressed
+from 0.193881 to 0.183544. Therefore removing the 10% played-action hard CE is
+rejected as a successor; preserve soft/hard weights 0.9/0.1 in the control.
+
+The two value-localization arms also fail to improve the selected TEMP recipe.
+Removing replay outcomes from the value denominator scored 69-59 (`53.91%`,
+`WW=19`, split=31, `LL=14`); disabling scalar value loss entirely scored 63-65
+(`49.22%`, `WW=13`, split=37, `LL=14`). Both used the same f7 start, row order,
+dose, and behavior keys as the 75-53 TEMP midpoint. Therefore preserve
+`value_loss_weight=0.25` and all-component value scope. The result also refutes
+the tempting explanation that continuing value gradients alone caused the
+midpoint/full behavior reversal: dose remains the supported intervention.
+
+The function-preserving target-gather commissioning arm scored 71-57 against
+f7 (`55.47%`) with every inherited tensor bit-identical and only its four new
+projection tensors trained. This is positive architecture evidence, though it
+does not beat the TEMP midpoint. The next composition test therefore adds the
+same zero-output gather adapter to the independently positive D6 checkpoint,
+freezes every inherited tensor, and consumes exactly the same 524,288-row dose.
+Because this arm must commission four zero-initialized projection tensors, it
+preserves the independently proven gather schedule of 8x64/global-512 for
+1,024 optimizer updates (rather than the mature-model 8x512/128 schedule), with
+action-module LR x4. The batch partition and number of optimizer updates change;
+the row dose, sampled data contract, initializer, and all inherited tensors do
+not. It compares first against that exact D6 parent.
+
+The independently initialized short-dose D6 arm is also positive against the
+binding v5 incumbent: `69-59` over 128 paired games (`53.91%`; `WW=18`,
+split=33, `LL=13`) with zero errors/truncations. It used exact f7, fresh Adam,
+8x512 for 128 updates/524,288 rows, and rank-distinct resumable symmetry RNG;
+candidate SHA-256 is
+`9dd1d261a39d7b04713505a301097faf18e84e8a3508b4abb92a8b964f7ab921`.
+Its objective-matched teacher-gap closure was only `0.086684` (below TEMP's
+`0.102290`) while global drift stayed comparable at `0.7021%`. This is direct
+evidence that offline closure is not a strength selector and supports the
+mechanism of symmetry regularization/denoising at a controlled short dose. The
+screen remains `continue`, not promotion evidence; D6+gather must first beat
+this exact D6 parent rather than merely inherit its gain.
+
 Promote nothing from offline loss. First use a short matched internal panel, then
 the full seat-swapped neutral gate for survivors.
 
@@ -493,6 +546,18 @@ the full seat-swapped neutral gate for survivors.
   mutating the sealed search operator.
 - `03bf5e2` — skip frozen zero-objective head forwards and preserve two-forward
   RNG/main-output parity for optional-head controls.
+- `22c1ad6` — remove dead entity-batch transfers and bind an explicit TF32
+  diagnostic mode without changing the production default.
+- `cea5e3c`, `c89dfee` — parallelize and authenticate the full architecture
+  target audit, including legacy replay full-search equivalence.
+- `ab35ba7` — bind completed topology-gather artifacts, dose, optimizer,
+  systemd result, and exact adapter-only model delta in a replayable receipt.
+- `e09eb37` — preserve identical validation games across descriptor-scope arms
+  and retain trustworthy systemd child-exit evidence.
+- `dfebf5e` — bind value-axis treatment descriptors to their exact learner
+  objective so the trainer can distinguish source and treatment contracts.
+- `83ad050` — make distributed D6 augmentation rank-distinct and exactly
+  resumable, and add the exact selected-dose D6 launcher.
 
 The immediate criterion is simple: preserve the independent TEMP win, select the
 fastest mathematically matched DDP geometry, and spend subsequent B200 time only
