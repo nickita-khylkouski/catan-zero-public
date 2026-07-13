@@ -16,8 +16,8 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from catan_zero.rl.action_features import CONTEXT_ACTION_FEATURE_SIZE
-from catan_zero.rl.entity_token_features import (
+from catan_zero.rl.action_features import CONTEXT_ACTION_FEATURE_SIZE  # noqa: E402
+from catan_zero.rl.entity_token_features import (  # noqa: E402
     EDGE_FEATURE_SIZE,
     EVENT_FEATURE_SIZE,
     GLOBAL_FEATURE_SIZE,
@@ -26,7 +26,7 @@ from catan_zero.rl.entity_token_features import (
     PLAYER_FEATURE_SIZE,
     VERTEX_FEATURE_SIZE,
 )
-from catan_zero.rl.entity_token_policy import EntityGraphConfig, EntityGraphNet
+from catan_zero.rl.entity_token_policy import EntityGraphConfig, EntityGraphNet  # noqa: E402
 
 _TOOLS_DIR = Path(__file__).resolve().parents[1] / "tools"
 if str(_TOOLS_DIR) not in sys.path:
@@ -74,6 +74,14 @@ def _synthetic_batch(batch_size: int = 3, num_actions: int = 5) -> dict:
 def test_parse_flags_supports_edge_and_aux():
     overrides = upgrade_tool._parse_flags("edge,aux")
     assert overrides == {"edge_policy_head": True, "aux_subgoal_heads": True}
+
+
+def test_parse_flags_supports_settlement_pointer_upgrade():
+    overrides = upgrade_tool._parse_flags("aux_settlement_pointer")
+    assert overrides == {
+        "aux_subgoal_heads": True,
+        "aux_settlement_pointer_head": True,
+    }
 
 
 def test_build_upgraded_config_applies_new_heads():
@@ -127,5 +135,28 @@ def test_load_allow_list_covers_new_head_prefixes():
         "aux_vp_in_n_head.",
         "aux_next_settlement_head.",
         "aux_robber_target_head.",
+        "aux_next_settlement_pointer_head.",
     ):
         assert prefix in src, prefix
+
+
+def test_settlement_pointer_upgrade_preserves_main_outputs() -> None:
+    torch.manual_seed(9)
+    champion = EntityGraphNet(_config()).eval()
+    upgraded = EntityGraphNet(
+        _config(aux_subgoal_heads=True, aux_settlement_pointer_head=True)
+    ).eval()
+    missing, unexpected = upgraded.load_state_dict(
+        champion.state_dict(), strict=False
+    )
+    assert unexpected == []
+    assert missing and all(name.startswith("aux_") for name in missing)
+
+    batch = _synthetic_batch()
+    with torch.no_grad():
+        baseline = champion(batch)
+        treatment = upgraded(batch)
+    for key in ("logits", "value", "final_vp"):
+        assert torch.equal(baseline[key], treatment[key])
+    assert treatment["aux_next_settlement"].shape == (3, 54)
+    assert treatment["aux_robber_target"].shape == (3, 19)

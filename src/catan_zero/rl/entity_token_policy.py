@@ -285,6 +285,14 @@ class EntityGraphConfig:
     # pre-mask banked player tokens, but those labels are never model inputs.
     # Appended last for positional pickle compatibility.
     belief_resource_head: bool = False
+    # The legacy next-settlement head classifies an absolute vertex id from the
+    # permutation-invariant CLS token. Vertex tokens carry no id/coordinate, so
+    # CLS cannot bind a class to its board token. This opt-in repair emits one
+    # shared pointer score per post-trunk vertex token. The robber head remains
+    # a dense CLS classifier because hex tokens carry canonical coordinates.
+    # Default OFF preserves historical checkpoints and results exactly.
+    # Appended last for positional pickle compatibility.
+    aux_settlement_pointer_head: bool = False
 
 
 class EntityGraphNet:
@@ -725,6 +733,13 @@ class EntityGraphNet:
                 # Read the pooled state (CLS) token only; emit new outputs that
                 # never feed value/policy, so main outputs stay bit-identical.
                 self.aux_subgoal_heads = bool(getattr(cfg, "aux_subgoal_heads", False))
+                self.aux_settlement_pointer_head_enabled = bool(
+                    getattr(cfg, "aux_settlement_pointer_head", False)
+                )
+                if self.aux_settlement_pointer_head_enabled and not self.aux_subgoal_heads:
+                    raise ValueError(
+                        "aux_settlement_pointer_head requires aux_subgoal_heads"
+                    )
                 if self.aux_subgoal_heads:
 
                     def _scalar_head() -> nn.Module:
@@ -749,9 +764,21 @@ class EntityGraphNet:
                     # 54 intersections / 19 hexes: fixed board sizes, matching the
                     # per-type target-id space verified in _gather_target_tokens and
                     # the shape asserts in _assert_entity_batch_shapes.
-                    self.aux_next_settlement_head = _categorical_head(
-                        AUX_NUM_INTERSECTIONS
-                    )
+                    if self.aux_settlement_pointer_head_enabled:
+                        self.aux_next_settlement_pointer_head = nn.Sequential(
+                            nn.LayerNorm(h),
+                            nn.Linear(h, h),
+                            nn.GELU(),
+                            nn.Dropout(dropout),
+                            nn.Linear(h, 1),
+                        )
+                    else:
+                        # Retained for exact legacy checkpoint compatibility.
+                        self.aux_next_settlement_head = _categorical_head(
+                            AUX_NUM_INTERSECTIONS
+                        )
+                    # Hex tokens include canonical coordinate features, so the
+                    # dense absolute-id classifier is not topology-aliased.
                     self.aux_robber_target_head = _categorical_head(AUX_NUM_HEXES)
 
                 self.belief_resource_head_enabled = bool(
@@ -1082,9 +1109,23 @@ class EntityGraphNet:
                         outputs["aux_vp_in_n"] = self.aux_vp_in_n_head(state).squeeze(
                             -1
                         )
-                    if "aux_next_settlement_head" not in inactive_training_heads:
-                        outputs["aux_next_settlement"] = (
-                            self.aux_next_settlement_head(state)
+                    if self.aux_settlement_pointer_head_enabled:
+                        if (
+                            "aux_next_settlement_pointer_head"
+                            not in inactive_training_heads
+                        ):
+                            vertex_start = _entity_token_start_offsets(batch)[1]
+                            vertex_count = int(batch["vertex_tokens"].shape[1])
+                            vertex_states = tokens[
+                                :, vertex_start : vertex_start + vertex_count
+                            ]
+                            outputs["aux_next_settlement"] = (
+                                self.aux_next_settlement_pointer_head(vertex_states)
+                                .squeeze(-1)
+                            )
+                    elif "aux_next_settlement_head" not in inactive_training_heads:
+                        outputs["aux_next_settlement"] = self.aux_next_settlement_head(
+                            state
                         )
                     if "aux_robber_target_head" not in inactive_training_heads:
                         outputs["aux_robber_target"] = self.aux_robber_target_head(
@@ -1418,6 +1459,7 @@ class EntityGraphPolicy:
         relational_edge_policy_head: bool = True,
         topology_residual_adapter: bool = False,
         belief_resource_head: bool = False,
+        aux_settlement_pointer_head: bool = False,
         entity_feature_adapter_version: str = CURRENT_RUST_ENTITY_ADAPTER_VERSION,
     ) -> EntityGraphPolicy:
         env = ColonistMultiAgentEnv(env_config or ColonistMultiAgentConfig())
@@ -1450,6 +1492,7 @@ class EntityGraphPolicy:
                 relational_edge_policy_head=bool(relational_edge_policy_head),
                 topology_residual_adapter=bool(topology_residual_adapter),
                 belief_resource_head=bool(belief_resource_head),
+                aux_settlement_pointer_head=bool(aux_settlement_pointer_head),
             )
             return cls(
                 config,
@@ -1977,6 +2020,7 @@ class EntityGraphPolicy:
             "aux_vp_in_n_head.",
             "aux_next_settlement_head.",
             "aux_robber_target_head.",
+            "aux_next_settlement_pointer_head.",
             "belief_resource_head.",
         )
         disallowed_missing = [

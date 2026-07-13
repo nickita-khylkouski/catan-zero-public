@@ -1004,8 +1004,11 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "CAT-100: weight on the combined Catan-native auxiliary-subgoal loss "
             "(longest-road / largest-army / VP-in-N / next-settlement / robber-target "
-            "heads; UNREAL-style, arXiv 1611.05397). A small value (0.02-0.1) is "
-            "typical. 0.0 (default) disables it. Pure no-op unless the --arch "
+            "heads; UNREAL-style, arXiv 1611.05397). 0.0 (default) disables it. "
+            "Commission newly initialized heads while inherited tensors are "
+            "frozen, then choose a joint coefficient from measured shared-trunk "
+            "gradient geometry instead of inferring scale from the scalar loss. "
+            "Pure no-op unless the --arch "
             "entity_graph model was built with --aux-subgoal-heads (so the outputs are "
             "present) AND the corpus carries the matching aux target fields "
             "(aux_longest_road/aux_largest_army/aux_vp_in_n/aux_next_settlement/"
@@ -1034,6 +1037,19 @@ def build_parser() -> argparse.ArgumentParser:
             "value/policy outputs are unchanged. Pair with --aux-subgoal-loss-weight "
             "to train them. For warm-starting an existing checkpoint, use "
             "tools/f69_upgrade_checkpoint_config.py --flags aux."
+        ),
+    )
+    parser.add_argument(
+        "--aux-settlement-pointer-head",
+        action="store_true",
+        help=(
+            "Replace only the topology-aliased CAT-100 next-settlement CLS "
+            "classifier with a permutation-equivariant shared scorer over "
+            "post-trunk vertex tokens. Requires --aux-subgoal-heads for a fresh "
+            "model. For a warm start, upgrade the checkpoint with "
+            "f69_upgrade_checkpoint_config.py --flags aux_settlement_pointer. "
+            "The robber head stays dense because hex tokens carry canonical "
+            "coordinates."
         ),
     )
     parser.add_argument(
@@ -1838,8 +1854,19 @@ def _assert_value_heads_present_for_losses(model, args) -> None:
                 "without it the requested objective is silently inert"
             )
     if float(getattr(args, "aux_subgoal_loss_weight", 0.0) or 0.0) != 0.0:
-        required_aux_heads = tuple(
-            f"{field}_head" for field, _kind in _AUX_SUBGOAL_SPECS
+        settlement_pointer = bool(
+            getattr(model, "aux_settlement_pointer_head_enabled", False)
+        )
+        required_aux_heads = (
+            "aux_longest_road_head",
+            "aux_largest_army_head",
+            "aux_vp_in_n_head",
+            (
+                "aux_next_settlement_pointer_head"
+                if settlement_pointer
+                else "aux_next_settlement_head"
+            ),
+            "aux_robber_target_head",
         )
         missing = [
             name for name in required_aux_heads if getattr(model, name, None) is None
@@ -1866,6 +1893,7 @@ _OPTIONAL_TRAINING_HEADS: tuple[tuple[str, str], ...] = (
     ("aux_vp_in_n_head", "aux_subgoal_loss_weight"),
     ("aux_next_settlement_head", "aux_subgoal_loss_weight"),
     ("aux_robber_target_head", "aux_subgoal_loss_weight"),
+    ("aux_next_settlement_pointer_head", "aux_subgoal_loss_weight"),
     ("belief_resource_head", "belief_resource_loss_weight"),
     # The latent-deliberation halt readout is emitted by the model, but the BC
     # learner has no halt target or loss.  Leaving it trainable creates an
@@ -5804,6 +5832,9 @@ def main(argv: Sequence[str] | None = None) -> None:
                     value_categorical_bins=int(args.value_categorical_bins),
                     edge_policy_head=bool(getattr(args, "edge_policy_head", False)),
                     aux_subgoal_heads=bool(getattr(args, "aux_subgoal_heads", False)),
+                    aux_settlement_pointer_head=bool(
+                        getattr(args, "aux_settlement_pointer_head", False)
+                    ),
                     belief_resource_head=bool(
                         getattr(args, "belief_resource_head", False)
                     ),
@@ -7699,6 +7730,9 @@ def main(argv: Sequence[str] | None = None) -> None:
         policy,
         requested_edge_policy_head=bool(getattr(args, "edge_policy_head", False)),
         requested_aux_subgoal_heads=bool(getattr(args, "aux_subgoal_heads", False)),
+        requested_aux_settlement_pointer_head=bool(
+            getattr(args, "aux_settlement_pointer_head", False)
+        ),
         requested_belief_resource_head=bool(
             getattr(args, "belief_resource_head", False)
         ),
@@ -17131,6 +17165,17 @@ def _checkpoint_config_mismatches(
                 "value_categorical_bins "
                 f"checkpoint={categorical_bins} cli={requested_bins}"
             )
+        # Optional-head creation flags are normally one-way for warm starts:
+        # an upgraded checkpoint can carry a head when the CLI default is off.
+        # The inverse is unsafe here. A caller explicitly requesting the pointer
+        # repair must never train the legacy topology-blind settlement head.
+        if bool(getattr(args, "aux_settlement_pointer_head", False)) and not bool(
+            getattr(config, "aux_settlement_pointer_head", False)
+        ):
+            mismatches.append(
+                "aux_settlement_pointer_head checkpoint=False cli=True; upgrade "
+                "the checkpoint with --flags aux_settlement_pointer"
+            )
     return mismatches
 
 
@@ -17405,6 +17450,7 @@ def _effective_entity_graph_architecture_report(
     *,
     requested_edge_policy_head: bool = False,
     requested_aux_subgoal_heads: bool = False,
+    requested_aux_settlement_pointer_head: bool = False,
     requested_belief_resource_head: bool = False,
 ) -> dict[str, object]:
     """Bind learner reports to the architecture that actually ran.
@@ -17427,9 +17473,15 @@ def _effective_entity_graph_architecture_report(
             "action_cross_attention_layers": 0,
             "edge_policy_head": bool(requested_edge_policy_head),
             "aux_subgoal_heads": bool(requested_aux_subgoal_heads),
+            "aux_settlement_pointer_head": bool(
+                requested_aux_settlement_pointer_head
+            ),
             "topology_residual_adapter": False,
             "requested_edge_policy_head": bool(requested_edge_policy_head),
             "requested_aux_subgoal_heads": bool(requested_aux_subgoal_heads),
+            "requested_aux_settlement_pointer_head": bool(
+                requested_aux_settlement_pointer_head
+            ),
             "belief_resource_head": bool(requested_belief_resource_head),
             "requested_belief_resource_head": bool(
                 requested_belief_resource_head
@@ -17444,6 +17496,9 @@ def _effective_entity_graph_architecture_report(
         ),
         "edge_policy_head": bool(getattr(config, "edge_policy_head", False)),
         "aux_subgoal_heads": bool(getattr(config, "aux_subgoal_heads", False)),
+        "aux_settlement_pointer_head": bool(
+            getattr(config, "aux_settlement_pointer_head", False)
+        ),
         "topology_residual_adapter": bool(
             getattr(config, "topology_residual_adapter", False)
         ),
@@ -17462,6 +17517,9 @@ def _effective_entity_graph_architecture_report(
         ),
         "requested_edge_policy_head": bool(requested_edge_policy_head),
         "requested_aux_subgoal_heads": bool(requested_aux_subgoal_heads),
+        "requested_aux_settlement_pointer_head": bool(
+            requested_aux_settlement_pointer_head
+        ),
         "requested_belief_resource_head": bool(requested_belief_resource_head),
     }
 
