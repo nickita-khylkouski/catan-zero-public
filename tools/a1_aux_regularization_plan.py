@@ -62,6 +62,7 @@ def build_plan(
         "validation_game_sentinel_schema": "train-validation-game-sentinel-v1",
         "validation_game_sentinel_target_rows": 262_144,
         "initialization": "same authenticated P1 parent checkpoint bytes",
+        "training_rng_rank_offset": True,
         "q_loss_weight": 0.0,
         "value_target_lambda": 1.0,
     }

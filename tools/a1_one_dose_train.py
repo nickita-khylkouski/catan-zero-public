@@ -979,6 +979,8 @@ def build_train_command(
             "--trust-curated-data-quality",
         ]
     )
+    if bool(recipe.get("training_rng_rank_offset", False)):
+        command.append("--training-rng-rank-offset")
     if bool(recipe["per_game_value_weight"]):
         command.append("--per-game-value-weight")
         # Historical non-ablation recipes locked this switch off and therefore

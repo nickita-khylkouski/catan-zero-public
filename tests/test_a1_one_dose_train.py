@@ -559,6 +559,26 @@ def test_loader_prefetch_is_outside_sealed_recipe_and_runtime_inventory(
     assert "tools/a1_one_dose_train.py" not in contract.REQUIRED_RUNTIME_CODE_SUFFIXES
 
 
+def test_future_rank_offset_rng_recipe_is_command_and_provenance_bound(
+    tmp_path: Path,
+) -> None:
+    verified = _verified(tmp_path)
+    verified["recipe"]["training_rng_rank_offset"] = True
+    command = executor.build_train_command(
+        verified,
+        python=Path(sys.executable),
+        checkpoint=tmp_path / "candidate.pt",
+        report=tmp_path / "report.json",
+    )
+    assert command.count("--training-rng-rank-offset") == 1
+    parsed = executor.train_bc.build_parser().parse_args(command[2:])
+    effective = executor.train_bc._effective_a1_learner_training_recipe(
+        parsed,
+        {"enabled": True, "world_size": 8, "rank": 0, "local_rank": 0},
+    )
+    assert effective["training_rng_rank_offset"] is True
+
+
 def test_learner_python_preserves_virtualenv_symlink(tmp_path: Path) -> None:
     base = tmp_path / "base-python"
     base.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")

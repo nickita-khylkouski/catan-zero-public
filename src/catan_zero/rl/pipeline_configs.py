@@ -220,6 +220,10 @@ class TrainConfig(PipelineConfig):
     )
     crop_authenticated_empty_event_history: bool = False
     seed: int = 1
+    # Historical DDP used an identical PyTorch RNG stream on every rank. Keep
+    # that trajectory as the generic default; sealed future flywheel recipes
+    # opt in so different-rank samples see independent dropout masks.
+    training_rng_rank_offset: bool = False
     validation_seed: int = 17
     validation_fraction: float = 0.05
     validation_max_samples: int = 200_000

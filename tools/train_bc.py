@@ -667,6 +667,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument(
+        "--training-rng-rank-offset",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Opt in to independent PyTorch training RNG streams across DDP/FSDP "
+            "ranks. After every rank has constructed/loaded the same initial model, "
+            "reseed torch with --seed + global rank before the first training "
+            "forward. This diversifies dropout masks without changing initial "
+            "parameters or the shared NumPy epoch-order stream. Disabled by default "
+            "to preserve historical checkpoint trajectories."
+        ),
+    )
+    parser.add_argument(
         "--symmetry-augment",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -3854,6 +3867,11 @@ def _effective_a1_learner_training_recipe(
     )
     if int(getattr(args, "policy_aux_active_batch_size", 0)) > 0:
         effective["policy_aux_active_batch_size"] = int(args.policy_aux_active_batch_size)
+    # Additive provenance: old authenticated recipes remain byte-for-byte valid
+    # when the backward-compatible flag is off, while future rank-offset runs
+    # bind the trajectory-changing opt-in explicitly.
+    if bool(getattr(args, "training_rng_rank_offset", False)):
+        effective["training_rng_rank_offset"] = True
     return effective
 
 
@@ -5163,6 +5181,11 @@ def main(argv: Sequence[str] | None = None) -> None:
                 output_device=ddp["local_rank"],
                 find_unused_parameters=bool(args.ddp_find_unused_parameters),
             )
+        training_rng = _initialize_training_rng(args, ddp)
+        _rank0_print(
+            json.dumps({"progress": "training_rng", **training_rng}, sort_keys=True),
+            ddp,
+        )
         policy.model.train()
         optimizer_params = _build_optimizer_param_groups(
             policy.model,
@@ -15357,6 +15380,37 @@ def _distributed_state() -> dict[str, int | bool]:
         "world_size": world_size,
         "rank": int(os.environ.get("RANK", "0")),
         "local_rank": int(os.environ.get("LOCAL_RANK", "0")),
+    }
+
+
+def _initialize_training_rng(
+    args: argparse.Namespace, ddp: dict[str, int | bool]
+) -> dict[str, object]:
+    """Optionally split only the PyTorch training RNG by global rank.
+
+    Model construction/loading must happen first: all ranks need identical initial
+    parameters for DDP. NumPy is deliberately untouched because ``_epoch_order`` and
+    ``_policy_aux_epoch_order`` draw one deterministic global order and then slice it
+    by rank. Historical runs are an exact no-op when the opt-in flag is false.
+    """
+
+    enabled = bool(getattr(args, "training_rng_rank_offset", False))
+    rank = int(ddp.get("rank", 0))
+    base_seed = int(args.seed)
+    effective_seed: int | None = None
+    if enabled:
+        effective_seed = base_seed + rank
+        import torch
+
+        torch.manual_seed(effective_seed)
+    return {
+        "schema_version": "train-bc-rank-offset-rng-v1",
+        "rank_offset_enabled": enabled,
+        "base_seed": base_seed,
+        "rank": rank,
+        "effective_torch_seed": effective_seed,
+        "numpy_epoch_order_rng_unchanged": True,
+        "initial_parameters_unchanged": True,
     }
 
 

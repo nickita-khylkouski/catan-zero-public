@@ -16,6 +16,7 @@ def test_probe_has_exactly_two_equal_sample_arms():
         and arm["fixed_recipe"]["max_steps"] == plan["max_steps"]
         and arm["fixed_recipe"]["validation_max_samples"] == 0
         and arm["fixed_recipe"]["validation_game_sentinel_target_rows"] == 262_144
+        and arm["fixed_recipe"]["training_rng_rank_offset"] is True
         for arm in plan["arms"]
     )
 
