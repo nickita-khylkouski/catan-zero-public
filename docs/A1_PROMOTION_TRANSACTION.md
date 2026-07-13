@@ -9,11 +9,11 @@ gate, alter `public_champion`, or deploy checkpoint bytes to the fleet.
 - The sealed `a1-pre-wave-contract-lock-v2` verifies with all 120 job claims and
   selects global `n_full=128` with no adaptive alternate budget. Global n64,
   n196, and adaptive/global n256 are refused for this wave.
-- A typed `a1-promotion-adjudication-v1` has `passed=true`,
+- A typed `a1-promotion-adjudication-v2` has `passed=true`,
   `decision="promote"`, a reproducible `adjudication_sha256`, and binds the
   exact contract, candidate, incumbent, training report, and five evidence
   artifacts by SHA-256. Each referenced artifact is itself a sealed
-  `a1-promotion-evidence-v1` envelope binding the contract, candidate, incumbent,
+  `a1-promotion-evidence-v2` envelope binding the contract, candidate, incumbent,
   pass verdict, and role-labelled source artifacts. A digest alone is not a
   verdict: the transaction parses and replays the source report semantics.
 - Its six checks (`provenance`, `mechanism_calibration`, `internal_h2h`,
@@ -131,7 +131,7 @@ Each evidence path above contains an envelope with this exact outer contract:
 
 ```json
 {
-  "schema_version": "a1-promotion-evidence-v1",
+  "schema_version": "a1-promotion-evidence-v2",
   "kind": "internal_h2h",
   "passed": true,
   "verdict": "H1",
@@ -141,7 +141,12 @@ Each evidence path above contains an envelope with this exact outer contract:
   "sources": [
     {"role": "internal_h2h", "path": "/immutable/h2h.raw.json", "sha256": "sha256:..."}
   ],
-  "result": {},
+  "result": {
+    "regression_protection_verdict": "H1",
+    "superiority_verdict": "H1",
+    "superiority_elo0": 0.0,
+    "superiority_elo1": 15.0
+  },
   "evidence_sha256": "sha256 of canonical JSON excluding this field"
 }
 ```
@@ -151,8 +156,12 @@ The mechanism envelope references candidate and incumbent
 semantics. Both reports must bind the identical shard directory, validation
 manifest SHA-256, selection mode/fraction/seed/ranges, observed seed count, and
 observed row count; comparing metrics from different cohorts is refused.
-Internal H2H retains and replays all paired games and the flywheel
-pentanomial GSPRT, requiring global n128, at least 200 complete pairs, and H1.
+Internal H2H retains and replays all paired games and both pentanomial GSPRTs,
+requiring global n128, at least 200 complete pairs, regression-protection
+`[-10,+15]` H1, and positive-Elo superiority `[0,+15]` H1. A regression-band
+H1 with superiority `continue` or H0 is a hard refusal. Evidence-v1 remains
+identifiable only in immutable, already-recorded registry/receipt history; it
+cannot authorize a new transaction.
 External evidence references candidate and incumbent neutral-harness reports,
 replays every raw outcome, and applies the fixed `0.02` maximum win-rate
 regression. Individual absolute SPRT verdicts are diagnostic only (both honest
