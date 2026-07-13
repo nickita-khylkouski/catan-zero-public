@@ -78,6 +78,9 @@ pub struct SearchConfig {
     pub exact_budget_sh_min_n: i32,
     pub c_visit: f64,
     pub c_scale: f64,
+    /// Fixed max-child-visit reference for budget-invariant sigma calibration.
+    /// None preserves the historical realized-max-visits transform.
+    pub sigma_reference_visits: Option<i32>,
     pub temperature: f64,
     pub play_sh_winner: bool,
     pub prior_temperature: f64,
@@ -119,6 +122,7 @@ impl Default for SearchConfig {
             exact_budget_sh_min_n: 0,
             c_visit: 50.0,
             c_scale: 0.1,
+            sigma_reference_visits: None,
             temperature: 0.0,
             play_sh_winner: false,
             prior_temperature: 1.0,
@@ -144,6 +148,17 @@ impl Default for SearchConfig {
             stop_at_root_turn_boundary: false,
         }
     }
+}
+
+#[inline]
+fn calibrated_sigma_scale(
+    c_visit: f64,
+    c_scale: f64,
+    realized_max_visits: i32,
+    reference_visits: Option<i32>,
+) -> f64 {
+    let visits = reference_visits.unwrap_or(realized_max_visits);
+    (c_visit + visits as f64) * c_scale
 }
 
 // ---------------------------------------------------------------------------
@@ -300,6 +315,12 @@ pub struct GumbelMctsEngine {
 
 impl GumbelMctsEngine {
     pub fn new(config: SearchConfig) -> Self {
+        assert!(
+            config
+                .sigma_reference_visits
+                .map_or(true, |visits| visits >= 0),
+            "sigma_reference_visits must be non-negative"
+        );
         let action_space = ActionSpace::new(&config.colors, config.map_kind);
         Self {
             rng: ChaCha8Rng::seed_from_u64(config.seed),
@@ -937,14 +958,21 @@ impl GumbelMctsEngine {
     // Completed-Q / improved policy
     // -----------------------------------------------------------------------
     fn sigma_scale(&self, arena: &Arena, node_idx: usize) -> f64 {
-        let max_visits = arena
-            .get(node_idx)
-            .actions
-            .values()
-            .map(|s| s.visits)
-            .max()
-            .unwrap_or(0);
-        (self.config.c_visit + max_visits as f64) * self.config.c_scale
+        let max_visits = self.config.sigma_reference_visits.unwrap_or_else(|| {
+            arena
+                .get(node_idx)
+                .actions
+                .values()
+                .map(|s| s.visits)
+                .max()
+                .unwrap_or(0)
+        });
+        calibrated_sigma_scale(
+            self.config.c_visit,
+            self.config.c_scale,
+            max_visits,
+            self.config.sigma_reference_visits,
+        )
     }
 
     fn completed_q(
@@ -1427,6 +1455,20 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sigma_reference_visits_is_budget_invariant_and_default_is_legacy() {
+        let close = |actual: f64, expected: f64| {
+            assert!(
+                (actual - expected).abs() < 1.0e-12,
+                "{actual} != {expected}"
+            );
+        };
+        close(calibrated_sigma_scale(50.0, 0.1, 8, None), 5.8);
+        close(calibrated_sigma_scale(50.0, 0.1, 32, None), 8.2);
+        close(calibrated_sigma_scale(50.0, 0.1, 8, Some(12)), 6.2);
+        close(calibrated_sigma_scale(50.0, 0.1, 32, Some(12)), 6.2);
+    }
     use catanatron_rs::{Coordinate, Player};
 
     #[derive(Default)]

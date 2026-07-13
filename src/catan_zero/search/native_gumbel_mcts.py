@@ -37,8 +37,8 @@ class NativeGumbelChanceMCTS(GumbelChanceMCTS):
         allow_python_fallback: bool = False,
     ) -> None:
         super().__init__(config, evaluator)
-        self._validate_native_semantics()
         self.using_native_hot_loop = native_hot_loop_available()
+        self._validate_native_semantics()
         if not self.using_native_hot_loop and not allow_python_fallback:
             raise RuntimeError(
                 "native Gumbel hot loop requested but catanatron_rs.gumbel_search "
@@ -58,6 +58,16 @@ class NativeGumbelChanceMCTS(GumbelChanceMCTS):
             unsupported.append("use_batch_api=False")
         if bool(self.config.uncertainty_backup_weighting):
             unsupported.append("uncertainty_backup_weighting=True")
+        if self.using_native_hot_loop and self.config.sigma_reference_visits is not None:
+            import catanatron_rs  # type: ignore
+
+            capability_fn = getattr(catanatron_rs, "gumbel_search_capabilities", None)
+            capabilities = set(capability_fn()) if callable(capability_fn) else set()
+            if "sigma_reference_visits" not in capabilities:
+                unsupported.append(
+                    "sigma_reference_visits requires a native wheel advertising "
+                    "the matching calibration capability"
+                )
         if unsupported:
             raise ValueError(
                 "native MCTS hot loop does not implement the requested reference "
@@ -77,6 +87,7 @@ class NativeGumbelChanceMCTS(GumbelChanceMCTS):
                 "seed",
                 "c_visit",
                 "c_scale",
+                "sigma_reference_visits",
                 "temperature",
                 "play_sh_winner",
                 "prior_temperature",

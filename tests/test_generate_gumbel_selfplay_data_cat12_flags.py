@@ -31,6 +31,7 @@ def _worker_args(**overrides) -> dict:
         "p_full": 1.0,
         "c_visit": 50.0,
         "c_scale": 0.1,
+        "sigma_reference_visits": None,
         "rescale_noise_floor_c": 0.0,
         "sigma_eval": 0.79,
         "n_full_wide": None,
@@ -109,6 +110,13 @@ def test_rescale_noise_floor_c_and_sigma_eval_thread_through_from_worker_args(mo
 
     assert captured["search_config"].rescale_noise_floor_c == 1.0
     assert captured["search_config"].sigma_eval == 0.5
+
+
+def test_sigma_reference_visits_threads_through_worker_args(monkeypatch) -> None:
+    captured = _capture_configs(monkeypatch)
+    cli._run_worker(_worker_args(sigma_reference_visits=17))
+
+    assert captured["search_config"].sigma_reference_visits == 17
 
 
 # --------------------------------------------------------------------------- D6 root denoising wiring

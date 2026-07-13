@@ -617,6 +617,15 @@ def test_shared_c_scale_is_backward_compatible_role_fallback():
     }
 
 
+def test_sigma_reference_visits_threads_into_both_role_search_configs():
+    worker_args = _base_worker_args(sigma_reference_visits=12)
+    candidate = _build_search_config(worker_args, seed=1)
+    baseline = _build_search_config(worker_args, seed=2)
+
+    assert candidate.sigma_reference_visits == 12
+    assert baseline.sigma_reference_visits == 12
+
+
 def test_role_specific_value_squashes_override_shared_fallback_independently():
     assert _resolve_value_squashes(
         _base_worker_args(

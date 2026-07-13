@@ -617,6 +617,14 @@ class GumbelChanceMCTSConfig:
     determinization_particles: int = 1
     determinization_min_simulations: int = 32
 
+    # Optional budget-invariant sigma calibration. The legacy Gumbel operator
+    # scales completed-Q logits by ``(c_visit + max_child_visits) * c_scale``.
+    # Consequently, increasing only the simulation budget sharpens both
+    # Sequential-Halving re-ranking and the emitted policy target. When set,
+    # use this fixed reference visit count in place of the realized maximum.
+    # None is the exact historical behavior.
+    sigma_reference_visits: int | None = None
+
 
 @dataclass(frozen=True, slots=True)
 class SearchResult:
@@ -773,6 +781,11 @@ class GumbelChanceMCTS:
         evaluator: RustEvaluator | None = None,
     ) -> None:
         self.config = config or GumbelChanceMCTSConfig()
+        if (
+            self.config.sigma_reference_visits is not None
+            and int(self.config.sigma_reference_visits) < 0
+        ):
+            raise ValueError("sigma_reference_visits must be non-negative")
         if bool(self.config.information_set_search) and bool(
             self.config.belief_chance_spectra
         ):
@@ -1359,7 +1372,9 @@ class GumbelChanceMCTS:
     # Completed-Q / improved policy (shared by root output and non-root rule).
     # ------------------------------------------------------------------
     def _sigma_scale(self, node: _GNode) -> float:
-        max_visits = max((stats.visits for stats in node.actions.values()), default=0)
+        max_visits = self.config.sigma_reference_visits
+        if max_visits is None:
+            max_visits = max((stats.visits for stats in node.actions.values()), default=0)
         return (float(self.config.c_visit) + float(max_visits)) * float(self.config.c_scale)
 
     def _completed_q(self, node: _GNode) -> dict[int, float]:

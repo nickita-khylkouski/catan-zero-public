@@ -205,6 +205,17 @@ fn gumbel_search(
     if let Some(v) = config_dict.get_item("c_scale")? {
         config.c_scale = v.extract()?;
     }
+    if let Some(v) = config_dict.get_item("sigma_reference_visits")? {
+        if !v.is_none() {
+            let visits: i32 = v.extract()?;
+            if visits < 0 {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "sigma_reference_visits must be non-negative",
+                ));
+            }
+            config.sigma_reference_visits = Some(visits);
+        }
+    }
     if let Some(v) = config_dict.get_item("temperature")? {
         config.temperature = v.extract()?;
     }
@@ -363,7 +374,13 @@ fn gumbel_search(
 // Module
 // ---------------------------------------------------------------------------
 
+#[pyfunction]
+fn gumbel_search_capabilities() -> Vec<&'static str> {
+    vec!["sigma_reference_visits"]
+}
+
 pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(gumbel_search, module)?)?;
+    module.add_function(wrap_pyfunction!(gumbel_search_capabilities, module)?)?;
     Ok(())
 }

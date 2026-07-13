@@ -174,6 +174,28 @@ def test_native_maps_decoupled_wide_budget_fields() -> None:
 @pytest.mark.skipif(
     not native_hot_loop_available(), reason="native wheel lacks gumbel_search"
 )
+def test_native_config_maps_sigma_reference_visits() -> None:
+    search = NativeGumbelChanceMCTS(
+        GumbelChanceMCTSConfig(sigma_reference_visits=12),
+        _PublicCountingEvaluator(),
+    )
+    assert search._native_config()["sigma_reference_visits"] == 12
+
+
+def test_native_sigma_reference_refuses_unadvertised_old_wheel(monkeypatch) -> None:
+    rust = pytest.importorskip("catanatron_rs")
+    monkeypatch.delattr(rust, "gumbel_search_capabilities", raising=False)
+    search = object.__new__(NativeGumbelChanceMCTS)
+    search.config = GumbelChanceMCTSConfig(sigma_reference_visits=12)
+    search.using_native_hot_loop = True
+
+    with pytest.raises(ValueError, match="advertising the matching calibration"):
+        search._validate_native_semantics()
+
+
+@pytest.mark.skipif(
+    not native_hot_loop_available(), reason="native wheel lacks gumbel_search"
+)
 def test_native_engine_seed_stream_advances_and_is_reproducible(monkeypatch) -> None:
     rust = pytest.importorskip("catanatron_rs")
     recorded: list[int] = []

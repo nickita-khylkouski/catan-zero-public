@@ -12,7 +12,6 @@ from catan_zero.search.gumbel_chance_mcts import (
     GumbelChanceMCTS,
     GumbelChanceMCTSConfig,
     HeuristicRustEvaluator,
-    SearchResult,
     _GAction,
     _GNode,
     _decision_context,
@@ -1258,3 +1257,43 @@ def test_value_sq_sum_accumulates_during_real_search():
         assert stats.q_variance >= 0.0
         # sum of squares must be at least (sum^2 / visits) (Cauchy-Schwarz).
         assert stats.value_sq_sum >= (stats.value_sum * stats.value_sum) / stats.visits - 1.0e-9
+
+
+def test_sigma_reference_visits_makes_policy_sharpening_budget_invariant() -> None:
+    completed_q = {0: -0.2, 1: 0.4}
+
+    def node(max_visits: int) -> _GNode:
+        return _GNode(
+            game=None,
+            root_color="RED",
+            actions={
+                0: _GAction(prior=0.5, visits=max_visits),
+                1: _GAction(prior=0.5, visits=max(1, max_visits // 2)),
+            },
+            action_logits={0: 0.0, 1: 0.0},
+        )
+
+    low_budget = node(8)
+    high_budget = node(32)
+    fixed = _pure_mcts(
+        GumbelChanceMCTSConfig(
+            c_visit=50.0, c_scale=0.1, sigma_reference_visits=12
+        )
+    )
+    assert fixed._sigma_scale(low_budget) == pytest.approx(6.2)
+    assert fixed._sigma_scale(high_budget) == pytest.approx(6.2)
+    assert fixed._improved_policy(low_budget, completed_q) == pytest.approx(
+        fixed._improved_policy(high_budget, completed_q)
+    )
+
+    legacy = _pure_mcts(GumbelChanceMCTSConfig(c_visit=50.0, c_scale=0.1))
+    assert legacy._sigma_scale(low_budget) == pytest.approx(5.8)
+    assert legacy._sigma_scale(high_budget) == pytest.approx(8.2)
+    assert legacy._improved_policy(low_budget, completed_q) != pytest.approx(
+        legacy._improved_policy(high_budget, completed_q)
+    )
+
+
+def test_sigma_reference_visits_rejects_negative_values() -> None:
+    with pytest.raises(ValueError, match="sigma_reference_visits"):
+        GumbelChanceMCTS(GumbelChanceMCTSConfig(sigma_reference_visits=-1))

@@ -887,6 +887,11 @@ def _build_search_config(
             else float(worker_args.get("c_scale", 0.1))
         ),
         c_visit=float(worker_args.get("c_visit", 50.0)),
+        sigma_reference_visits=(
+            int(worker_args["sigma_reference_visits"])
+            if worker_args.get("sigma_reference_visits") is not None
+            else None
+        ),
         rescale_noise_floor_c=float(worker_args.get("rescale_noise_floor_c", 0.0)),
         sigma_eval=float(worker_args.get("sigma_eval", 0.79)),
         max_root_candidates=int(worker_args.get("max_root_candidates", 16)),
@@ -1244,6 +1249,15 @@ def main() -> None:
         type=float,
         default=0.1,
         help="Sigma scale multiplier (matches GumbelChanceMCTSConfig default).",
+    )
+    parser.add_argument(
+        "--sigma-reference-visits",
+        type=int,
+        default=None,
+        help=(
+            "Use a fixed non-negative max-child-visit reference in completed-Q "
+            "sigma for both roles. Default unset preserves realized-visit scaling."
+        ),
     )
     parser.add_argument(
         "--candidate-c-scale",

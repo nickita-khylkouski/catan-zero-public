@@ -254,6 +254,8 @@ def _validate_science_args(
             parser.error(f"--{name.replace('_', '-')} must be finite (got {value!r})")
     if not 0.0 <= float(args.p_full) <= 1.0:
         parser.error(f"--p-full must be in [0, 1] (got {args.p_full!r})")
+    if args.sigma_reference_visits is not None and int(args.sigma_reference_visits) < 0:
+        parser.error("--sigma-reference-visits must be non-negative")
     if args.temperature_move_fraction is not None:
         value = float(args.temperature_move_fraction)
         if not math.isfinite(value) or not 0.0 <= value <= 1.0:
@@ -340,6 +342,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--p-full", type=float, default=0.25)
     parser.add_argument("--c-visit", type=float, default=50.0)
     parser.add_argument("--c-scale", type=float, default=0.1)
+    parser.add_argument(
+        "--sigma-reference-visits",
+        type=int,
+        default=None,
+        help=(
+            "Opt-in budget-invariant completed-Q calibration: replace the "
+            "realized max child visits in sigma with this fixed non-negative "
+            "reference. Default unset preserves legacy search exactly."
+        ),
+    )
     parser.add_argument(
         "--rescale-noise-floor-c",
         type=float,
@@ -1143,6 +1155,11 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "p_full": float(args.p_full),
                 "c_visit": float(args.c_visit),
                 "c_scale": float(args.c_scale),
+                "sigma_reference_visits": (
+                    int(args.sigma_reference_visits)
+                    if args.sigma_reference_visits is not None
+                    else None
+                ),
                 "n_full_wide": (
                     int(args.n_full_wide) if args.n_full_wide is not None else None
                 ),
@@ -1730,6 +1747,11 @@ def _run_worker(
         seed=int(worker_args["worker_seed"]),
         c_visit=float(worker_args["c_visit"]),
         c_scale=float(worker_args["c_scale"]),
+        sigma_reference_visits=(
+            int(worker_args["sigma_reference_visits"])
+            if worker_args.get("sigma_reference_visits") is not None
+            else None
+        ),
         prior_temperature=float(worker_args["prior_temperature"]),
         n_full=int(worker_args["n_full"]),
         n_fast=int(worker_args["n_fast"]),

@@ -370,6 +370,7 @@ class GenerateConfig(PipelineConfig):
     wide_candidates_threshold: int = 24
     c_visit: float = 50.0
     c_scale: float = 0.1
+    sigma_reference_visits: int | None = None
     rescale_noise_floor_c: float = 0.0
     sigma_eval: float = 0.79
     max_decisions: int = 600
@@ -505,6 +506,7 @@ class EvalConfig(PipelineConfig):
     max_decisions: int = 300
     c_visit: float = 50.0
     c_scale: float = 0.1
+    sigma_reference_visits: int | None = None
     # Cross-net H2H resolves these from role-specific flags or the shared
     # c_scale fallback.  Persisting the effective values keeps an
     # independently tuned search-operator comparison distinct from a
