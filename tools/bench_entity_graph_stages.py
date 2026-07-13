@@ -176,6 +176,8 @@ class _StageRecorder:
 
 
 def _host_to_device(policy: Any, entity: dict[str, np.ndarray], legal_ids: np.ndarray, context: np.ndarray, torch: Any):
+    from catan_zero.rl.entity_token_policy import STATIC_ACTION_RESIDUAL_SLICE
+
     needs_targets = bool(
         str(getattr(policy.config, "state_trunk", "transformer")) != "transformer"
         or getattr(policy.config, "action_target_gather", False)
@@ -198,6 +200,24 @@ def _host_to_device(policy: Any, entity: dict[str, np.ndarray], legal_ids: np.nd
         context, dtype=torch.float32, device=policy.device
     )
     action_ids = torch.as_tensor(legal_ids, dtype=torch.long, device=policy.device)
+    if bool(getattr(policy.model, "static_action_residual_enabled", False)):
+        mapped = np.asarray(
+            entity.get("_symmetry_legal_action_ids", legal_ids), dtype=np.int64
+        )
+        valid = mapped >= 0
+        catalog = policy.static_action_features
+        if bool(np.any(mapped[valid] >= int(catalog.shape[0]))):
+            raise ValueError("static action catalog id is outside catalog rows")
+        mapped_t = torch.as_tensor(
+            np.where(valid, mapped, 0), dtype=torch.long, device=policy.device
+        )
+        valid_t = torch.as_tensor(valid, dtype=torch.bool, device=policy.device)
+        static = catalog.index_select(0, mapped_t.reshape(-1)).reshape(
+            *mapped_t.shape, -1
+        )
+        batch["legal_action_static_features"] = static[
+            ..., STATIC_ACTION_RESIDUAL_SLICE
+        ].masked_fill(~valid_t.unsqueeze(-1), 0.0)
     return batch, action_ids
 
 
@@ -319,6 +339,14 @@ def _attributed_forward(
     encoded_actions = recorder.run(
         "action_encoder", lambda: model.action_encoder(action_features)
     )
+    if bool(getattr(model, "static_action_residual_enabled", False)):
+        encoded_actions = recorder.run(
+            "static_action_residual",
+            lambda: encoded_actions
+            + model.static_action_residual_proj(
+                batch["legal_action_static_features"].float()
+            ),
+        )
 
     pooled_targets = None
     if model.action_target_gather or model.edge_policy_head:

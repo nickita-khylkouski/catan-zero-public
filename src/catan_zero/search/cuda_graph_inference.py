@@ -19,7 +19,10 @@ from typing import Any
 
 import numpy as np
 
-from catan_zero.rl.entity_token_policy import _assert_entity_batch_shapes
+from catan_zero.rl.entity_token_policy import (
+    STATIC_ACTION_RESIDUAL_SLICE,
+    _assert_entity_batch_shapes,
+)
 
 
 _STATE_INPUT_KEYS = (
@@ -382,6 +385,51 @@ class CudaGraphInferenceRunner:
             dtype=torch.long,
             device=self.device,
         )
+        if bool(getattr(self.model, "static_action_residual_enabled", False)):
+            static_table = getattr(self.policy, "static_action_features", None)
+            if static_table is None:
+                raise ValueError(
+                    "static-action residual runner requires policy catalog features"
+                )
+            catalog_rows = int(static_table.shape[0])
+            # The state graph is static but the action width remains eager, so
+            # this gather is shared by captured and fallback paths.  Preserve
+            # D6 row alignment by indexing the mapped catalog identity carried
+            # by HexSymmetry instead of the original target-aligned legal id.
+            symmetry_catalog_ids = entity_batch.get("_symmetry_legal_action_ids")
+            if symmetry_catalog_ids is None:
+                legal_ids_np = np.asarray(legal_action_ids)
+                if bool(np.any(legal_ids_np[legal_ids_np >= 0] >= catalog_rows)):
+                    raise ValueError("static action catalog id is outside catalog rows")
+                catalog_valid = action_ids >= 0
+                catalog_ids = torch.where(catalog_valid, action_ids, 0)
+            else:
+                catalog_ids_np = np.asarray(symmetry_catalog_ids, dtype=np.int64)
+                if catalog_ids_np.shape != np.asarray(legal_action_ids).shape:
+                    raise ValueError(
+                        "symmetry/static catalog ids must match legal_action_ids: "
+                        f"{catalog_ids_np.shape} != "
+                        f"{np.asarray(legal_action_ids).shape}"
+                    )
+                catalog_valid_np = catalog_ids_np >= 0
+                if bool(np.any(catalog_ids_np[catalog_valid_np] >= catalog_rows)):
+                    raise ValueError("static action catalog id is outside catalog rows")
+                catalog_ids = torch.as_tensor(
+                    np.where(catalog_valid_np, catalog_ids_np, 0),
+                    dtype=torch.long,
+                    device=self.device,
+                )
+                catalog_valid = torch.as_tensor(
+                    catalog_valid_np,
+                    dtype=torch.bool,
+                    device=self.device,
+                )
+            static_features = static_table.index_select(
+                0, catalog_ids.reshape(-1)
+            ).reshape(*catalog_ids.shape, -1)
+            batch["legal_action_static_features"] = static_features[
+                ..., STATIC_ACTION_RESIDUAL_SLICE
+            ].masked_fill(~catalog_valid.unsqueeze(-1), 0.0)
         return batch, action_ids
 
     def _eager_forward(
