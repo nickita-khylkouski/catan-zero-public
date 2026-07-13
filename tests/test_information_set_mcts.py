@@ -212,6 +212,58 @@ def test_belief_target_uniformly_weights_worlds_not_visits() -> None:
     assert target == pytest.approx({11: 0.5, 12: 0.5})
 
 
+def test_gameplay_aggregation_changes_selection_without_changing_legacy_target() -> None:
+    results = [
+        _belief_result(
+            q_values={11: -1.0, 12: 1.0},
+            visits={11: 4, 12: 4},
+            improved={11: 0.9, 12: 0.1},
+            completed_q={11: -1.0, 12: 1.0},
+        ),
+        _belief_result(
+            q_values={11: -0.5, 12: 0.5},
+            visits={11: 4, 12: 4},
+            improved={11: 0.8, 12: 0.2},
+            completed_q={11: -0.5, 12: 0.5},
+        ),
+    ]
+
+    def aggregate(mode: str) -> SearchResult:
+        mcts = object.__new__(GumbelChanceMCTS)
+        mcts.config = GumbelChanceMCTSConfig(
+            information_set_search=True,
+            information_set_target_aggregation="mean_improved_policy",
+            gameplay_policy_aggregation=mode,
+            sigma_reference_visits=8,
+            c_visit=0.0,
+            c_scale=1.0,
+        )
+        mcts.rng = random.Random(7)
+        return mcts._aggregate_information_set_results(
+            results, legal_actions=(11, 12), used_full_search=True
+        )
+
+    legacy = aggregate("mean_improved_policy")
+    corrected = aggregate("aggregate_q_then_improve")
+    assert legacy.selected_action == 11
+    assert corrected.selected_action == 12
+    # Gameplay is a separate opt-in: emitted learner targets stay exactly on
+    # the historical mean-of-improved operator in both runs.
+    assert corrected.improved_policy == legacy.improved_policy == pytest.approx(
+        {11: 0.85, 12: 0.15}
+    )
+
+
+def test_corrected_gameplay_aggregation_fails_closed_without_fixed_sigma() -> None:
+    with pytest.raises(ValueError, match="gameplay requires sigma_reference_visits"):
+        GumbelChanceMCTS(
+            GumbelChanceMCTSConfig(
+                information_set_search=True,
+                gameplay_policy_aggregation="aggregate_q_then_improve",
+            )
+        )
+
+
 def test_belief_target_one_particle_matches_ordinary_completed_q() -> None:
     mcts = _belief_target_mcts(sigma_reference_visits=4)
     result = _belief_result(

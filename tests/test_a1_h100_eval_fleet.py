@@ -581,6 +581,56 @@ def test_role_specific_value_squash_is_sealed_into_plan_and_internal_jobs(
         assert job["command_hash"] == fleet._digest(argv)  # noqa: SLF001
 
 
+def test_corrected_belief_gameplay_operator_is_sealed_per_role(tmp_path: Path) -> None:
+    manifest, default = _plan(tmp_path)
+    diagnostic = fleet.build_plan(
+        manifest,
+        candidate=Path(default["candidate"]["source"]),
+        champion=Path(default["champion"]["source"]),
+        **_binding_kwargs(default),
+        internal_pairs=600,
+        external_pairs=500,
+        internal_base_seed=6_192_000_000,
+        external_base_seed=6_193_000_000,
+        workers_per_gpu=8,
+        candidate_c_scale=0.03,
+        champion_c_scale=0.03,
+        candidate_gameplay_policy_aggregation="aggregate_q_then_improve",
+        champion_gameplay_policy_aggregation="mean_improved_policy",
+        candidate_rescale_noise_floor_c=1.0,
+        champion_rescale_noise_floor_c=0.0,
+        candidate_sigma_eval=0.98,
+        champion_sigma_eval=0.98,
+        candidate_sigma_reference_visits=8,
+        champion_sigma_reference_visits=None,
+        comparison_mode="historical_comparison",
+        historical_comparison_reason="same-net corrected belief operator diagnostic",
+        repo_commit="a" * 40,
+        tool_hashes=default["tool_hashes"],
+    )
+    roles = diagnostic["role_search_config"]
+    assert roles["candidate"]["gameplay_policy_aggregation"] == (
+        "aggregate_q_then_improve"
+    )
+    assert roles["candidate"]["sigma_reference_visits"] == 8
+    assert roles["candidate"]["rescale_noise_floor_c"] == 1.0
+    assert roles["champion"]["gameplay_policy_aggregation"] == (
+        "mean_improved_policy"
+    )
+    assert roles["champion"]["sigma_reference_visits"] is None
+    internal = next(job for job in diagnostic["jobs"] if job["phase"] == "internal")
+    argv = internal["argv"]
+    assert argv[argv.index("--candidate-gameplay-policy-aggregation") + 1] == (
+        "aggregate_q_then_improve"
+    )
+    assert "--baseline-gameplay-policy-aggregation" in argv
+    assert "--candidate-sigma-reference-visits" in argv
+    assert "--baseline-sigma-reference-visits" not in argv
+    plan_path = tmp_path / "corrected-plan.json"
+    fleet.write_new_readonly(plan_path, diagnostic)
+    assert fleet.load_plan(plan_path, manifest)["plan_hash"] == diagnostic["plan_hash"]
+
+
 def test_same_checkpoint_clip_vs_tanh_plan_is_diagnostic_and_executable(
     tmp_path: Path,
 ) -> None:

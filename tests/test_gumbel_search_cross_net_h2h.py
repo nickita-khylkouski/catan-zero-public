@@ -35,6 +35,7 @@ from gumbel_search_cross_net_h2h import (  # type: ignore  # noqa: E402
     _load_held_out_high_regret_suite,
     _new_search_telemetry,
     _resolve_c_scales,
+    _resolve_role_search_calibration,
     _resolve_value_squashes,
     _resolve_search_budgets,
     play_one_h2h_game,
@@ -626,6 +627,79 @@ def test_sigma_reference_visits_threads_into_both_role_search_configs():
     assert baseline.sigma_reference_visits == 12
 
 
+def test_role_specific_belief_and_d1_calibration_is_isolated():
+    worker_args = _base_worker_args(
+        information_set_search=True,
+        sigma_reference_visits=8,
+        gameplay_policy_aggregation="mean_improved_policy",
+        candidate_gameplay_policy_aggregation="aggregate_q_then_improve",
+        candidate_rescale_noise_floor_c=1.0,
+        baseline_rescale_noise_floor_c=0.0,
+        candidate_sigma_eval=0.98,
+        baseline_sigma_eval=0.79,
+    )
+    resolved = _resolve_role_search_calibration(worker_args)
+    candidate = _build_search_config(worker_args, seed=1, **resolved["candidate"])
+    baseline = _build_search_config(worker_args, seed=1, **resolved["baseline"])
+
+    assert candidate.gameplay_policy_aggregation == "aggregate_q_then_improve"
+    assert candidate.rescale_noise_floor_c == 1.0
+    assert candidate.sigma_eval == 0.98
+    assert candidate.sigma_reference_visits == 8
+    assert baseline.gameplay_policy_aggregation == "mean_improved_policy"
+    assert baseline.rescale_noise_floor_c == 0.0
+    assert baseline.sigma_eval == 0.79
+    assert baseline.sigma_reference_visits == 8
+
+
+def test_legacy_role_search_calibration_is_exact_shared_noop():
+    resolved = _resolve_role_search_calibration(_base_worker_args())
+    assert resolved == {
+        "candidate": {
+            "gameplay_policy_aggregation": "mean_improved_policy",
+            "rescale_noise_floor_c": 0.0,
+            "sigma_eval": 0.79,
+            "sigma_reference_visits": None,
+        },
+        "baseline": {
+            "gameplay_policy_aggregation": "mean_improved_policy",
+            "rescale_noise_floor_c": 0.0,
+            "sigma_eval": 0.79,
+            "sigma_reference_visits": None,
+        },
+    }
+
+
+def test_corrected_gameplay_role_requires_information_set_and_sigma_reference():
+    args = SimpleNamespace(
+        public_observation=False,
+        information_set_search=False,
+        belief_chance_spectra=False,
+        determinization_particles=4,
+        determinization_min_simulations=32,
+        gameplay_policy_aggregation="mean_improved_policy",
+        candidate_gameplay_policy_aggregation="aggregate_q_then_improve",
+        baseline_gameplay_policy_aggregation=None,
+        sigma_reference_visits=None,
+        candidate_sigma_reference_visits=None,
+        baseline_sigma_reference_visits=None,
+        rescale_noise_floor_c=0.0,
+        candidate_rescale_noise_floor_c=None,
+        baseline_rescale_noise_floor_c=None,
+        sigma_eval=0.79,
+        candidate_sigma_eval=None,
+        baseline_sigma_eval=None,
+    )
+    with pytest.raises(ValueError, match="requires --information-set-search"):
+        _validate_information_set_recipe(args)
+    args.information_set_search = True
+    args.public_observation = True
+    with pytest.raises(ValueError, match="requires a role-effective"):
+        _validate_information_set_recipe(args)
+    args.candidate_sigma_reference_visits = 8
+    _validate_information_set_recipe(args)
+
+
 def test_role_specific_value_squashes_override_shared_fallback_independently():
     assert _resolve_value_squashes(
         _base_worker_args(
@@ -699,6 +773,44 @@ def test_worker_constructs_each_role_with_its_effective_c_scale(monkeypatch):
 
     assert result["error"] is None
     assert [config.c_scale for config in built_configs] == [0.1, 0.03]
+
+
+def test_worker_constructs_corrected_candidate_and_legacy_baseline(monkeypatch):
+    built_configs = []
+
+    class FakeEvaluator:
+        def close(self):
+            pass
+
+    class FakeMCTS:
+        def __init__(self, config, evaluator):
+            built_configs.append(config)
+
+    monkeypatch.setattr(h2h, "_build_evaluator", lambda *args, **kwargs: FakeEvaluator())
+    monkeypatch.setattr(h2h, "GumbelChanceMCTS", FakeMCTS)
+    result = h2h._run_worker(
+        {
+            **_base_worker_args(
+                information_set_search=True,
+                sigma_reference_visits=8,
+                candidate_gameplay_policy_aggregation="aggregate_q_then_improve",
+                baseline_gameplay_policy_aggregation="mean_improved_policy",
+                candidate_rescale_noise_floor_c=1.0,
+                baseline_rescale_noise_floor_c=0.0,
+            ),
+            "worker_index": 0,
+            "worker_seed": 7,
+            "candidate_checkpoint": "same.pt",
+            "baseline_checkpoint": "same.pt",
+            "pairs": [],
+        }
+    )
+    assert result["error"] is None
+    candidate, baseline = built_configs
+    assert candidate.gameplay_policy_aggregation == "aggregate_q_then_improve"
+    assert candidate.rescale_noise_floor_c == 1.0
+    assert baseline.gameplay_policy_aggregation == "mean_improved_policy"
+    assert baseline.rescale_noise_floor_c == 0.0
 
 
 def test_build_search_config_threads_d1_noise_floor_calibration():
@@ -822,6 +934,20 @@ def test_eval_config_hash_distinguishes_d1_calibration():
     assert legacy.config_hash() != calibrated.config_hash()
 
 
+def test_eval_config_hash_binds_role_specific_belief_operator_and_d1():
+    shared = EvalConfig(mode="cross_net")
+    corrected = EvalConfig(
+        mode="cross_net",
+        candidate_gameplay_policy_aggregation="aggregate_q_then_improve",
+        baseline_gameplay_policy_aggregation="mean_improved_policy",
+        candidate_rescale_noise_floor_c=1.0,
+        baseline_rescale_noise_floor_c=0.0,
+        candidate_sigma_reference_visits=8,
+        baseline_sigma_reference_visits=8,
+    )
+    assert corrected.config_hash() != shared.config_hash()
+
+
 def test_eval_config_hash_distinguishes_role_specific_c_scales():
     shared = EvalConfig(mode="cross_net", candidate_c_scale=0.03, baseline_c_scale=0.03)
     tuned = EvalConfig(mode="cross_net", candidate_c_scale=0.1, baseline_c_scale=0.03)
@@ -930,8 +1056,24 @@ def test_h2h_summary_records_resolved_adaptive_budget_by_role():
     assert summary["candidate_c_scale"] == 0.1
     assert summary["baseline_c_scale"] == 0.03
     assert summary["search_parameters_by_role"] == {
-        "candidate": {"c_scale": 0.1, "c_visit": 50.0, "value_squash": "tanh"},
-        "baseline": {"c_scale": 0.03, "c_visit": 50.0, "value_squash": "tanh"},
+        "candidate": {
+            "c_scale": 0.1,
+            "c_visit": 50.0,
+            "value_squash": "tanh",
+            "gameplay_policy_aggregation": "mean_improved_policy",
+            "rescale_noise_floor_c": 0.25,
+            "sigma_eval": 0.5,
+            "sigma_reference_visits": None,
+        },
+        "baseline": {
+            "c_scale": 0.03,
+            "c_visit": 50.0,
+            "value_squash": "tanh",
+            "gameplay_policy_aggregation": "mean_improved_policy",
+            "rescale_noise_floor_c": 0.25,
+            "sigma_eval": 0.5,
+            "sigma_reference_visits": None,
+        },
     }
     assert (
         summary["comparison_contract"]

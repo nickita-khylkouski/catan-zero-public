@@ -785,6 +785,56 @@ def _resolve_value_squashes(args: Any) -> dict[str, str]:
     return resolved
 
 
+def _resolve_role_search_calibration(args: Any) -> dict[str, dict[str, Any]]:
+    """Resolve belief aggregation and D1 calibration independently per role."""
+
+    def _get(name: str, default: Any = None) -> Any:
+        if isinstance(args, dict):
+            return args.get(name, default)
+        return getattr(args, name, default)
+
+    shared_aggregation = str(
+        _get("gameplay_policy_aggregation", "mean_improved_policy")
+    )
+    allowed = {"mean_improved_policy", "aggregate_q_then_improve"}
+    result: dict[str, dict[str, Any]] = {}
+    for role in ("candidate", "baseline"):
+        aggregation = _get(f"{role}_gameplay_policy_aggregation")
+        noise_floor = _get(f"{role}_rescale_noise_floor_c")
+        sigma_eval = _get(f"{role}_sigma_eval")
+        sigma_reference = _get(f"{role}_sigma_reference_visits")
+        resolved_aggregation = (
+            str(aggregation) if aggregation is not None else shared_aggregation
+        )
+        if resolved_aggregation not in allowed:
+            raise ValueError(
+                f"{role} gameplay policy aggregation must be one of {sorted(allowed)}"
+            )
+        result[role] = {
+            "gameplay_policy_aggregation": resolved_aggregation,
+            "rescale_noise_floor_c": (
+                float(noise_floor)
+                if noise_floor is not None
+                else float(_get("rescale_noise_floor_c", 0.0))
+            ),
+            "sigma_eval": (
+                float(sigma_eval)
+                if sigma_eval is not None
+                else float(_get("sigma_eval", 0.79))
+            ),
+            "sigma_reference_visits": (
+                int(sigma_reference)
+                if sigma_reference is not None
+                else (
+                    int(_get("sigma_reference_visits"))
+                    if _get("sigma_reference_visits") is not None
+                    else None
+                )
+            ),
+        }
+    return result
+
+
 def _build_evaluator(
     checkpoint: str,
     worker_args: dict[str, Any],
@@ -835,6 +885,10 @@ def _build_search_config(
     n_full_wide: int | None = None,
     n_full_wide_threshold: int | None = None,
     c_scale: float | None = None,
+    gameplay_policy_aggregation: str | None = None,
+    rescale_noise_floor_c: float | None = None,
+    sigma_eval: float | None = None,
+    sigma_reference_visits: int | None = None,
 ) -> GumbelChanceMCTSConfig:
     """`n_full` defaults to `worker_args["n_full"]` when not given explicitly.
 
@@ -888,12 +942,33 @@ def _build_search_config(
         ),
         c_visit=float(worker_args.get("c_visit", 50.0)),
         sigma_reference_visits=(
-            int(worker_args["sigma_reference_visits"])
-            if worker_args.get("sigma_reference_visits") is not None
-            else None
+            int(sigma_reference_visits)
+            if sigma_reference_visits is not None
+            else (
+                int(worker_args["sigma_reference_visits"])
+                if worker_args.get("sigma_reference_visits") is not None
+                else None
+            )
         ),
-        rescale_noise_floor_c=float(worker_args.get("rescale_noise_floor_c", 0.0)),
-        sigma_eval=float(worker_args.get("sigma_eval", 0.79)),
+        rescale_noise_floor_c=(
+            float(rescale_noise_floor_c)
+            if rescale_noise_floor_c is not None
+            else float(worker_args.get("rescale_noise_floor_c", 0.0))
+        ),
+        sigma_eval=(
+            float(sigma_eval)
+            if sigma_eval is not None
+            else float(worker_args.get("sigma_eval", 0.79))
+        ),
+        gameplay_policy_aggregation=(
+            str(gameplay_policy_aggregation)
+            if gameplay_policy_aggregation is not None
+            else str(
+                worker_args.get(
+                    "gameplay_policy_aggregation", "mean_improved_policy"
+                )
+            )
+        ),
         max_root_candidates=int(worker_args.get("max_root_candidates", 16)),
         max_root_candidates_wide=int(worker_args.get("max_root_candidates_wide", 54)),
         wide_candidates_threshold=int(worker_args.get("wide_candidates_threshold", 24)),
@@ -986,6 +1061,7 @@ def _run_worker(worker_args: dict[str, Any]) -> dict[str, Any]:
     worker_seed = int(worker_args["worker_seed"])
     budgets = _resolve_search_budgets(worker_args)
     c_scales = _resolve_c_scales(worker_args)
+    role_search = _resolve_role_search_calibration(worker_args)
     candidate_n_full = int(budgets["candidate_n_full"])
     baseline_n_full = int(budgets["baseline_n_full"])
     candidate_mcts = _create_search(
@@ -996,6 +1072,7 @@ def _run_worker(worker_args: dict[str, Any]) -> dict[str, Any]:
             n_full_wide=budgets["candidate_n_full_wide"],
             n_full_wide_threshold=budgets["candidate_n_full_wide_threshold"],
             c_scale=c_scales["candidate_c_scale"],
+            **role_search["candidate"],
         ),
         candidate_evaluator,
         native_mcts_hot_loop=bool(worker_args.get("native_mcts_hot_loop", False)),
@@ -1008,6 +1085,7 @@ def _run_worker(worker_args: dict[str, Any]) -> dict[str, Any]:
             n_full_wide=budgets["baseline_n_full_wide"],
             n_full_wide_threshold=budgets["baseline_n_full_wide_threshold"],
             c_scale=c_scales["baseline_c_scale"],
+            **role_search["baseline"],
         ),
         baseline_evaluator,
         native_mcts_hot_loop=bool(worker_args.get("native_mcts_hot_loop", False)),
@@ -1145,6 +1223,24 @@ def _validate_information_set_recipe(args: Any) -> None:
         raise ValueError("--determinization-particles must be >= 1")
     if int(args.determinization_min_simulations) < 1:
         raise ValueError("--determinization-min-simulations must be >= 1")
+    roles = _resolve_role_search_calibration(args)
+    for role, resolved in roles.items():
+        if resolved["sigma_reference_visits"] is not None and int(
+            resolved["sigma_reference_visits"]
+        ) < 0:
+            raise ValueError(f"--{role}-sigma-reference-visits must be non-negative")
+        if resolved["gameplay_policy_aggregation"] == "aggregate_q_then_improve":
+            if not information_set:
+                raise ValueError(
+                    f"--{role}-gameplay-policy-aggregation "
+                    "aggregate_q_then_improve requires --information-set-search"
+                )
+            if resolved["sigma_reference_visits"] is None:
+                raise ValueError(
+                    f"--{role}-gameplay-policy-aggregation "
+                    "aggregate_q_then_improve requires a role-effective "
+                    "--sigma-reference-visits"
+                )
 
 
 def main() -> None:
@@ -1260,6 +1356,18 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--candidate-sigma-reference-visits",
+        type=int,
+        default=None,
+        help="Candidate-only fixed sigma visit reference (default: inherit shared).",
+    )
+    parser.add_argument(
+        "--baseline-sigma-reference-visits",
+        type=int,
+        default=None,
+        help="Baseline-only fixed sigma visit reference (default: inherit shared).",
+    )
+    parser.add_argument(
         "--candidate-c-scale",
         type=float,
         default=None,
@@ -1278,10 +1386,34 @@ def main() -> None:
         help="D1 noise-floor rescaling coefficient. Default 0.0 is the exact legacy no-op.",
     )
     parser.add_argument(
+        "--candidate-rescale-noise-floor-c",
+        type=float,
+        default=None,
+        help="Candidate-only D1 coefficient (default: inherit shared).",
+    )
+    parser.add_argument(
+        "--baseline-rescale-noise-floor-c",
+        type=float,
+        default=None,
+        help="Baseline-only D1 coefficient (default: inherit shared).",
+    )
+    parser.add_argument(
         "--sigma-eval",
         type=float,
         default=0.79,
         help="Value-estimate noise stdev used by --rescale-noise-floor-c.",
+    )
+    parser.add_argument(
+        "--candidate-sigma-eval",
+        type=float,
+        default=None,
+        help="Candidate-only D1 value-noise stdev (default: inherit shared).",
+    )
+    parser.add_argument(
+        "--baseline-sigma-eval",
+        type=float,
+        default=None,
+        help="Baseline-only D1 value-noise stdev (default: inherit shared).",
     )
     parser.add_argument(
         "--max-root-candidates",
@@ -1328,6 +1460,24 @@ def main() -> None:
             "--public-observation; masked NN inputs alone leave authoritative hidden "
             "truth available to tree expansion."
         ),
+    )
+    parser.add_argument(
+        "--gameplay-policy-aggregation",
+        choices=("mean_improved_policy", "aggregate_q_then_improve"),
+        default="mean_improved_policy",
+        help="Shared public-belief action-selection operator; legacy default is exact no-op.",
+    )
+    parser.add_argument(
+        "--candidate-gameplay-policy-aggregation",
+        choices=("mean_improved_policy", "aggregate_q_then_improve"),
+        default=None,
+        help="Candidate-only gameplay belief aggregation (default: inherit shared).",
+    )
+    parser.add_argument(
+        "--baseline-gameplay-policy-aggregation",
+        choices=("mean_improved_policy", "aggregate_q_then_improve"),
+        default=None,
+        help="Baseline-only gameplay belief aggregation (default: inherit shared).",
     )
     parser.add_argument("--determinization-particles", type=int, default=1)
     parser.add_argument("--determinization-min-simulations", type=int, default=32)
@@ -1490,6 +1640,7 @@ def main() -> None:
         budgets = _resolve_search_budgets(resolved_args)
         c_scales = _resolve_c_scales(resolved_args)
         squashes = _resolve_value_squashes(resolved_args)
+        role_search = _resolve_role_search_calibration(resolved_args)
         return EvalConfig.from_namespace(
             resolved_args,
             mode="cross_net",
@@ -1509,6 +1660,26 @@ def main() -> None:
             baseline_c_scale=c_scales["baseline_c_scale"],
             candidate_value_squash=squashes["candidate_value_squash"],
             baseline_value_squash=squashes["baseline_value_squash"],
+            candidate_gameplay_policy_aggregation=role_search["candidate"][
+                "gameplay_policy_aggregation"
+            ],
+            baseline_gameplay_policy_aggregation=role_search["baseline"][
+                "gameplay_policy_aggregation"
+            ],
+            candidate_rescale_noise_floor_c=role_search["candidate"][
+                "rescale_noise_floor_c"
+            ],
+            baseline_rescale_noise_floor_c=role_search["baseline"][
+                "rescale_noise_floor_c"
+            ],
+            candidate_sigma_eval=role_search["candidate"]["sigma_eval"],
+            baseline_sigma_eval=role_search["baseline"]["sigma_eval"],
+            candidate_sigma_reference_visits=role_search["candidate"][
+                "sigma_reference_visits"
+            ],
+            baseline_sigma_reference_visits=role_search["baseline"][
+                "sigma_reference_visits"
+            ],
         )
 
     eval_config = resolve_config(
@@ -1523,6 +1694,7 @@ def main() -> None:
     candidate_value_readout, baseline_value_readout = _resolve_value_readouts(args)
     c_scales = _resolve_c_scales(args)
     value_squashes = _resolve_value_squashes(args)
+    role_search = _resolve_role_search_calibration(args)
 
     high_regret_suite_path: Path | None = None
     high_regret_planned_engine: dict[str, str] | None = None
@@ -1612,8 +1784,34 @@ def main() -> None:
             "candidate_c_scale": c_scales["candidate_c_scale"],
             "baseline_c_scale": c_scales["baseline_c_scale"],
             "c_visit": float(args.c_visit),
+            "sigma_reference_visits": (
+                int(args.sigma_reference_visits)
+                if args.sigma_reference_visits is not None
+                else None
+            ),
             "rescale_noise_floor_c": float(args.rescale_noise_floor_c),
             "sigma_eval": float(args.sigma_eval),
+            "gameplay_policy_aggregation": str(args.gameplay_policy_aggregation),
+            "candidate_gameplay_policy_aggregation": role_search["candidate"][
+                "gameplay_policy_aggregation"
+            ],
+            "baseline_gameplay_policy_aggregation": role_search["baseline"][
+                "gameplay_policy_aggregation"
+            ],
+            "candidate_rescale_noise_floor_c": role_search["candidate"][
+                "rescale_noise_floor_c"
+            ],
+            "baseline_rescale_noise_floor_c": role_search["baseline"][
+                "rescale_noise_floor_c"
+            ],
+            "candidate_sigma_eval": role_search["candidate"]["sigma_eval"],
+            "baseline_sigma_eval": role_search["baseline"]["sigma_eval"],
+            "candidate_sigma_reference_visits": role_search["candidate"][
+                "sigma_reference_visits"
+            ],
+            "baseline_sigma_reference_visits": role_search["baseline"][
+                "sigma_reference_visits"
+            ],
             "max_root_candidates": int(args.max_root_candidates),
             "max_root_candidates_wide": int(args.max_root_candidates_wide),
             "wide_candidates_threshold": int(args.wide_candidates_threshold),
@@ -1815,6 +2013,7 @@ def _build_summary(
     candidate_value_readout, baseline_value_readout = _resolve_value_readouts(args)
     c_scales = _resolve_c_scales(args)
     value_squashes = _resolve_value_squashes(args)
+    role_search = _resolve_role_search_calibration(args)
 
     return {
         "candidate_checkpoint": args.candidate,
@@ -1841,11 +2040,13 @@ def _build_summary(
                 "c_scale": c_scales["candidate_c_scale"],
                 "c_visit": float(args.c_visit),
                 "value_squash": value_squashes["candidate_value_squash"],
+                **role_search["candidate"],
             },
             "baseline": {
                 "c_scale": c_scales["baseline_c_scale"],
                 "c_visit": float(args.c_visit),
                 "value_squash": value_squashes["baseline_value_squash"],
+                **role_search["baseline"],
             },
         },
         "comparison_contract": (
@@ -1854,12 +2055,36 @@ def _build_summary(
                 c_scales["candidate_c_scale"] != c_scales["baseline_c_scale"]
                 or value_squashes["candidate_value_squash"]
                 != value_squashes["baseline_value_squash"]
+                or role_search["candidate"] != role_search["baseline"]
             )
             else "paired_same_seed_color_swap_shared_search_operator"
         ),
         "c_visit": float(args.c_visit),
         "rescale_noise_floor_c": float(getattr(args, "rescale_noise_floor_c", 0.0)),
         "sigma_eval": float(getattr(args, "sigma_eval", 0.79)),
+        "gameplay_policy_aggregation": str(
+            getattr(args, "gameplay_policy_aggregation", "mean_improved_policy")
+        ),
+        "candidate_gameplay_policy_aggregation": role_search["candidate"][
+            "gameplay_policy_aggregation"
+        ],
+        "baseline_gameplay_policy_aggregation": role_search["baseline"][
+            "gameplay_policy_aggregation"
+        ],
+        "candidate_rescale_noise_floor_c": role_search["candidate"][
+            "rescale_noise_floor_c"
+        ],
+        "baseline_rescale_noise_floor_c": role_search["baseline"][
+            "rescale_noise_floor_c"
+        ],
+        "candidate_sigma_eval": role_search["candidate"]["sigma_eval"],
+        "baseline_sigma_eval": role_search["baseline"]["sigma_eval"],
+        "candidate_sigma_reference_visits": role_search["candidate"][
+            "sigma_reference_visits"
+        ],
+        "baseline_sigma_reference_visits": role_search["baseline"][
+            "sigma_reference_visits"
+        ],
         "max_root_candidates": int(args.max_root_candidates),
         "max_root_candidates_wide": int(args.max_root_candidates_wide),
         "wide_candidates_threshold": int(

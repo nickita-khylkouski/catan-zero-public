@@ -70,8 +70,12 @@ class NativeGumbelChanceMCTS(GumbelChanceMCTS):
                 )
         if (
             self.using_native_hot_loop
-            and self.config.information_set_target_aggregation
-            == "aggregate_q_then_improve"
+            and (
+                self.config.information_set_target_aggregation
+                == "aggregate_q_then_improve"
+                or self.config.gameplay_policy_aggregation
+                == "aggregate_q_then_improve"
+            )
         ):
             import catanatron_rs  # type: ignore
 
@@ -79,7 +83,7 @@ class NativeGumbelChanceMCTS(GumbelChanceMCTS):
             capabilities = set(capability_fn()) if callable(capability_fn) else set()
             if "belief_target_evidence" not in capabilities:
                 unsupported.append(
-                    "aggregate_q_then_improve requires a native wheel advertising "
+                    "aggregate_q_then_improve belief aggregation requires a native wheel advertising "
                     "belief_target_evidence"
                 )
         if unsupported:

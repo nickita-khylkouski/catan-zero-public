@@ -448,7 +448,15 @@ def _role_search_config(
     champion_c_scale: float,
     candidate_value_squash: str = "tanh",
     champion_value_squash: str = "tanh",
-) -> dict[str, dict[str, float | str]]:
+    candidate_gameplay_policy_aggregation: str = "mean_improved_policy",
+    champion_gameplay_policy_aggregation: str = "mean_improved_policy",
+    candidate_rescale_noise_floor_c: float = 0.0,
+    champion_rescale_noise_floor_c: float = 0.0,
+    candidate_sigma_eval: float = 0.98,
+    champion_sigma_eval: float = 0.98,
+    candidate_sigma_reference_visits: int | None = None,
+    champion_sigma_reference_visits: int | None = None,
+) -> dict[str, dict[str, float | str | int | None]]:
     values = {
         "candidate": float(candidate_c_scale),
         "champion": float(champion_c_scale),
@@ -463,15 +471,71 @@ def _role_search_config(
     for role, value in squashes.items():
         if value not in {"tanh", "clip"}:
             raise FleetError(f"{role}_value_squash must be tanh or clip")
-    return {
-        role: {"c_scale": values[role], "value_squash": squashes[role]}
+    aggregations = {
+        "candidate": str(candidate_gameplay_policy_aggregation),
+        "champion": str(champion_gameplay_policy_aggregation),
+    }
+    allowed_aggregations = {"mean_improved_policy", "aggregate_q_then_improve"}
+    for role, value in aggregations.items():
+        if value not in allowed_aggregations:
+            raise FleetError(f"{role}_gameplay_policy_aggregation is invalid")
+    noise_floors = {
+        "candidate": float(candidate_rescale_noise_floor_c),
+        "champion": float(champion_rescale_noise_floor_c),
+    }
+    sigma_evals = {
+        "candidate": float(candidate_sigma_eval),
+        "champion": float(champion_sigma_eval),
+    }
+    sigma_refs = {
+        "candidate": candidate_sigma_reference_visits,
+        "champion": champion_sigma_reference_visits,
+    }
+    for role in values:
+        if not math.isfinite(noise_floors[role]) or noise_floors[role] < 0.0:
+            raise FleetError(f"{role}_rescale_noise_floor_c must be finite and >= 0")
+        if not math.isfinite(sigma_evals[role]) or sigma_evals[role] < 0.0:
+            raise FleetError(f"{role}_sigma_eval must be finite and >= 0")
+        if sigma_refs[role] is not None and int(sigma_refs[role]) < 0:
+            raise FleetError(f"{role}_sigma_reference_visits must be >= 0")
+        if aggregations[role] == "aggregate_q_then_improve" and sigma_refs[role] is None:
+            raise FleetError(
+                f"{role} aggregate_q_then_improve requires sigma_reference_visits"
+            )
+    result = {
+        role: {
+            "c_scale": values[role],
+            "value_squash": squashes[role],
+        }
         for role in values
     }
+    # Preserve historical plan/run identities byte-for-byte when the new
+    # experiment is not requested. New fields appear only as one complete,
+    # explicit role-operator contract.
+    if any(
+        aggregations[role] != "mean_improved_policy"
+        or noise_floors[role] != 0.0
+        or sigma_evals[role] != 0.98
+        or sigma_refs[role] is not None
+        for role in values
+    ):
+        for role in values:
+            result[role].update(
+                {
+                    "gameplay_policy_aggregation": aggregations[role],
+                    "rescale_noise_floor_c": noise_floors[role],
+                    "sigma_eval": sigma_evals[role],
+                    "sigma_reference_visits": (
+                        int(sigma_refs[role]) if sigma_refs[role] is not None else None
+                    ),
+                }
+            )
+    return result
 
 
 def _plan_role_search_config(
     plan: dict[str, Any],
-) -> dict[str, dict[str, float | str]]:
+) -> dict[str, dict[str, float | str | int | None]]:
     raw = plan.get("role_search_config")
     if raw is None:
         return _role_search_config(candidate_c_scale=0.03, champion_c_scale=0.03)
@@ -483,13 +547,40 @@ def _plan_role_search_config(
             champion_c_scale=raw["champion"]["c_scale"],
             candidate_value_squash=raw["candidate"].get("value_squash", "tanh"),
             champion_value_squash=raw["champion"].get("value_squash", "tanh"),
+            candidate_gameplay_policy_aggregation=raw["candidate"].get(
+                "gameplay_policy_aggregation", "mean_improved_policy"
+            ),
+            champion_gameplay_policy_aggregation=raw["champion"].get(
+                "gameplay_policy_aggregation", "mean_improved_policy"
+            ),
+            candidate_rescale_noise_floor_c=raw["candidate"].get(
+                "rescale_noise_floor_c", 0.0
+            ),
+            champion_rescale_noise_floor_c=raw["champion"].get(
+                "rescale_noise_floor_c", 0.0
+            ),
+            candidate_sigma_eval=raw["candidate"].get("sigma_eval", 0.98),
+            champion_sigma_eval=raw["champion"].get("sigma_eval", 0.98),
+            candidate_sigma_reference_visits=raw["candidate"].get(
+                "sigma_reference_visits"
+            ),
+            champion_sigma_reference_visits=raw["champion"].get(
+                "sigma_reference_visits"
+            ),
         )
     except (KeyError, TypeError, ValueError) as error:
         raise FleetError("evaluation plan role_search_config is malformed") from error
     historical = {
         role: {"c_scale": config[role]["c_scale"]} for role in ("candidate", "champion")
     }
-    if raw != config and raw != historical:
+    previous = {
+        role: {
+            "c_scale": config[role]["c_scale"],
+            "value_squash": config[role]["value_squash"],
+        }
+        for role in ("candidate", "champion")
+    }
+    if raw != config and raw != previous and raw != historical:
         raise FleetError("evaluation plan role_search_config is not canonical")
     return config
 
@@ -520,6 +611,14 @@ def _internal_argv(
     champion_c_scale: float | None = None,
     candidate_value_squash: str | None = None,
     champion_value_squash: str | None = None,
+    candidate_gameplay_policy_aggregation: str | None = None,
+    champion_gameplay_policy_aggregation: str | None = None,
+    candidate_rescale_noise_floor_c: float | None = None,
+    champion_rescale_noise_floor_c: float | None = None,
+    candidate_sigma_eval: float | None = None,
+    champion_sigma_eval: float | None = None,
+    candidate_sigma_reference_visits: int | None = None,
+    champion_sigma_reference_visits: int | None = None,
 ) -> list[str]:
     argv = [
         python,
@@ -570,6 +669,46 @@ def _internal_argv(
             "--baseline-value-squash",
             str(champion_value_squash),
         ]
+    role_values = (
+        candidate_gameplay_policy_aggregation,
+        champion_gameplay_policy_aggregation,
+        candidate_rescale_noise_floor_c,
+        champion_rescale_noise_floor_c,
+        candidate_sigma_eval,
+        champion_sigma_eval,
+    )
+    if any(value is not None for value in role_values):
+        if any(value is None for value in role_values):
+            raise FleetError("all internal role belief/D1 values must be explicit")
+        out_index = argv.index("--out")
+        argv[out_index:out_index] = [
+            "--candidate-gameplay-policy-aggregation",
+            str(candidate_gameplay_policy_aggregation),
+            "--baseline-gameplay-policy-aggregation",
+            str(champion_gameplay_policy_aggregation),
+            "--candidate-rescale-noise-floor-c",
+            str(float(candidate_rescale_noise_floor_c)),
+            "--baseline-rescale-noise-floor-c",
+            str(float(champion_rescale_noise_floor_c)),
+            "--candidate-sigma-eval",
+            str(float(candidate_sigma_eval)),
+            "--baseline-sigma-eval",
+            str(float(champion_sigma_eval)),
+        ]
+    sigma_args: list[str] = []
+    if candidate_sigma_reference_visits is not None:
+        sigma_args += [
+            "--candidate-sigma-reference-visits",
+            str(int(candidate_sigma_reference_visits)),
+        ]
+    if champion_sigma_reference_visits is not None:
+        sigma_args += [
+            "--baseline-sigma-reference-visits",
+            str(int(champion_sigma_reference_visits)),
+        ]
+    if sigma_args:
+        out_index = argv.index("--out")
+        argv[out_index:out_index] = sigma_args
     return argv
 
 
@@ -692,6 +831,14 @@ def build_plan(
     champion_c_scale: float = 0.03,
     candidate_value_squash: str = "tanh",
     champion_value_squash: str = "tanh",
+    candidate_gameplay_policy_aggregation: str = "mean_improved_policy",
+    champion_gameplay_policy_aggregation: str = "mean_improved_policy",
+    candidate_rescale_noise_floor_c: float = 0.0,
+    champion_rescale_noise_floor_c: float = 0.0,
+    candidate_sigma_eval: float = 0.98,
+    champion_sigma_eval: float = 0.98,
+    candidate_sigma_reference_visits: int | None = None,
+    champion_sigma_reference_visits: int | None = None,
     comparison_mode: str = "promotion_parent",
     historical_comparison_reason: str | None = None,
 ) -> dict[str, Any]:
@@ -704,6 +851,14 @@ def build_plan(
         champion_c_scale=champion_c_scale,
         candidate_value_squash=candidate_value_squash,
         champion_value_squash=champion_value_squash,
+        candidate_gameplay_policy_aggregation=candidate_gameplay_policy_aggregation,
+        champion_gameplay_policy_aggregation=champion_gameplay_policy_aggregation,
+        candidate_rescale_noise_floor_c=candidate_rescale_noise_floor_c,
+        champion_rescale_noise_floor_c=champion_rescale_noise_floor_c,
+        candidate_sigma_eval=candidate_sigma_eval,
+        champion_sigma_eval=champion_sigma_eval,
+        candidate_sigma_reference_visits=candidate_sigma_reference_visits,
+        champion_sigma_reference_visits=champion_sigma_reference_visits,
     )
     if candidate_sha == champion_sha:
         if role_search_config["candidate"] == role_search_config["champion"]:
@@ -840,6 +995,26 @@ def build_plan(
             champion_c_scale=role_search_config["champion"]["c_scale"],
             candidate_value_squash=role_search_config["candidate"]["value_squash"],
             champion_value_squash=role_search_config["champion"]["value_squash"],
+            candidate_gameplay_policy_aggregation=role_search_config[
+                "candidate"
+            ].get("gameplay_policy_aggregation"),
+            champion_gameplay_policy_aggregation=role_search_config["champion"].get(
+                "gameplay_policy_aggregation"
+            ),
+            candidate_rescale_noise_floor_c=role_search_config["candidate"].get(
+                "rescale_noise_floor_c"
+            ),
+            champion_rescale_noise_floor_c=role_search_config["champion"].get(
+                "rescale_noise_floor_c"
+            ),
+            candidate_sigma_eval=role_search_config["candidate"].get("sigma_eval"),
+            champion_sigma_eval=role_search_config["champion"].get("sigma_eval"),
+            candidate_sigma_reference_visits=role_search_config["candidate"].get(
+                "sigma_reference_visits"
+            ),
+            champion_sigma_reference_visits=role_search_config["champion"].get(
+                "sigma_reference_visits"
+            ),
         )
         jobs.append(
             {
@@ -1077,6 +1252,11 @@ def _validate_planned_jobs(plan: dict[str, Any], manifest: dict[str, Any]) -> No
     legacy_shared_squash = legacy_shared_search or "value_squash" not in plan[
         "role_search_config"
     ]["candidate"]
+    legacy_role_calibration = (
+        legacy_shared_search
+        or "gameplay_policy_aggregation"
+        not in plan["role_search_config"]["candidate"]
+    )
     for job in jobs:
         if not isinstance(job, dict) or job.get("phase") not in by_phase:
             raise FleetError("evaluation plan contains an invalid job")
@@ -1146,6 +1326,50 @@ def _validate_planned_jobs(plan: dict[str, Any], manifest: dict[str, Any]) -> No
                 None
                 if legacy_shared_squash
                 else str(role_search_config["champion"]["value_squash"])
+            ),
+            candidate_gameplay_policy_aggregation=(
+                None
+                if legacy_role_calibration
+                else str(
+                    role_search_config["candidate"]["gameplay_policy_aggregation"]
+                )
+            ),
+            champion_gameplay_policy_aggregation=(
+                None
+                if legacy_role_calibration
+                else str(
+                    role_search_config["champion"]["gameplay_policy_aggregation"]
+                )
+            ),
+            candidate_rescale_noise_floor_c=(
+                None
+                if legacy_role_calibration
+                else float(role_search_config["candidate"]["rescale_noise_floor_c"])
+            ),
+            champion_rescale_noise_floor_c=(
+                None
+                if legacy_role_calibration
+                else float(role_search_config["champion"]["rescale_noise_floor_c"])
+            ),
+            candidate_sigma_eval=(
+                None
+                if legacy_role_calibration
+                else float(role_search_config["candidate"]["sigma_eval"])
+            ),
+            champion_sigma_eval=(
+                None
+                if legacy_role_calibration
+                else float(role_search_config["champion"]["sigma_eval"])
+            ),
+            candidate_sigma_reference_visits=(
+                None
+                if legacy_role_calibration
+                else role_search_config["candidate"]["sigma_reference_visits"]
+            ),
+            champion_sigma_reference_visits=(
+                None
+                if legacy_role_calibration
+                else role_search_config["champion"]["sigma_reference_visits"]
             ),
         )
         if job["pairs"] != pairs or job["base_seed"] != seed or job["argv"] != expected:
@@ -1997,6 +2221,19 @@ def _parser() -> argparse.ArgumentParser:
         default="tanh",
         help="Champion evaluator value transform (default: tanh).",
     )
+    for role in ("candidate", "champion"):
+        plan.add_argument(
+            f"--{role}-gameplay-policy-aggregation",
+            choices=("mean_improved_policy", "aggregate_q_then_improve"),
+            default="mean_improved_policy",
+        )
+        plan.add_argument(
+            f"--{role}-rescale-noise-floor-c", type=float, default=0.0
+        )
+        plan.add_argument(f"--{role}-sigma-eval", type=float, default=0.98)
+        plan.add_argument(
+            f"--{role}-sigma-reference-visits", type=int, default=None
+        )
     plan.add_argument("--out", type=Path, required=True)
     for name in ("launch", "resume"):
         operation = commands.add_parser(name)
@@ -2048,6 +2285,22 @@ def main(argv: Sequence[str] | None = None) -> int:
                 champion_c_scale=args.champion_c_scale,
                 candidate_value_squash=args.candidate_value_squash,
                 champion_value_squash=args.champion_value_squash,
+                candidate_gameplay_policy_aggregation=(
+                    args.candidate_gameplay_policy_aggregation
+                ),
+                champion_gameplay_policy_aggregation=(
+                    args.champion_gameplay_policy_aggregation
+                ),
+                candidate_rescale_noise_floor_c=args.candidate_rescale_noise_floor_c,
+                champion_rescale_noise_floor_c=args.champion_rescale_noise_floor_c,
+                candidate_sigma_eval=args.candidate_sigma_eval,
+                champion_sigma_eval=args.champion_sigma_eval,
+                candidate_sigma_reference_visits=(
+                    args.candidate_sigma_reference_visits
+                ),
+                champion_sigma_reference_visits=(
+                    args.champion_sigma_reference_visits
+                ),
                 comparison_mode=args.comparison_mode,
                 historical_comparison_reason=args.historical_comparison_reason,
             )

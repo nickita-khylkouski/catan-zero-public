@@ -663,6 +663,13 @@ class GumbelChanceMCTSConfig:
     # attests root-actor Q perspective and exposes completed-Q for every legal
     # action.
     information_set_target_aggregation: str = "mean_improved_policy"
+    # Which public-belief policy SELECTS the live gameplay action.  This is
+    # intentionally separate from the learner-target field above: changing a
+    # target-only experiment must never silently change playing strength.
+    # The legacy default selects from the mean of per-world improved policies.
+    # The opt-in corrected mode selects from one improvement applied after
+    # uniformly aggregating completed-Q evidence across hidden worlds.
+    gameplay_policy_aggregation: str = "mean_improved_policy"
 
 
 @dataclass(frozen=True, slots=True)
@@ -845,6 +852,14 @@ class GumbelChanceMCTS:
                 "information_set_target_aggregation must be "
                 "'mean_improved_policy' or 'aggregate_q_then_improve'"
             )
+        if self.config.gameplay_policy_aggregation not in {
+            "mean_improved_policy",
+            "aggregate_q_then_improve",
+        }:
+            raise ValueError(
+                "gameplay_policy_aggregation must be "
+                "'mean_improved_policy' or 'aggregate_q_then_improve'"
+            )
         if (
             self.config.information_set_target_aggregation
             != "mean_improved_policy"
@@ -854,6 +869,15 @@ class GumbelChanceMCTS:
                 "aggregate_q_then_improve requires information_set_search=True"
             )
         if (
+            self.config.gameplay_policy_aggregation
+            != "mean_improved_policy"
+            and not bool(self.config.information_set_search)
+        ):
+            raise ValueError(
+                "aggregate_q_then_improve gameplay requires "
+                "information_set_search=True"
+            )
+        if (
             self.config.information_set_target_aggregation
             == "aggregate_q_then_improve"
             and self.config.sigma_reference_visits is None
@@ -861,6 +885,16 @@ class GumbelChanceMCTS:
             raise ValueError(
                 "aggregate_q_then_improve requires sigma_reference_visits so "
                 "particle-count/budget changes cannot silently sharpen targets"
+            )
+        if (
+            self.config.gameplay_policy_aggregation
+            == "aggregate_q_then_improve"
+            and self.config.sigma_reference_visits is None
+        ):
+            raise ValueError(
+                "aggregate_q_then_improve gameplay requires "
+                "sigma_reference_visits so particle-count/budget changes cannot "
+                "silently sharpen action selection"
             )
         if bool(self.config.information_set_search) and bool(
             self.config.belief_chance_spectra
@@ -1054,13 +1088,34 @@ class GumbelChanceMCTS:
             )
         }
 
+        belief_improved = improved
+        if (
+            len(legal_actions) > 1
+            and (
+                self.config.information_set_target_aggregation
+                == "aggregate_q_then_improve"
+                or self.config.gameplay_policy_aggregation
+                == "aggregate_q_then_improve"
+            )
+        ):
+            belief_improved = self._belief_level_improved_policy(
+                results,
+                legal_actions=legal_actions,
+                aggregate_priors=priors,
+            )
+        gameplay_policy = (
+            belief_improved
+            if self.config.gameplay_policy_aggregation
+            == "aggregate_q_then_improve"
+            else improved
+        )
         if float(self.config.temperature) > 0.0:
-            selected = self._sample_categorical(improved)
+            selected = self._sample_categorical(gameplay_policy)
         else:
             selected = max(
                 legal_actions,
                 key=lambda action: (
-                    improved.get(action, 0.0),
+                    gameplay_policy.get(action, 0.0),
                     visit_counts.get(action, 0),
                     priors.get(action, 0.0),
                     -int(action),
@@ -1072,11 +1127,7 @@ class GumbelChanceMCTS:
             == "aggregate_q_then_improve"
             and len(legal_actions) > 1
         ):
-            target_policy = self._belief_level_improved_policy(
-                results,
-                legal_actions=legal_actions,
-                aggregate_priors=priors,
-            )
+            target_policy = belief_improved
         training_policy = _prune_policy_target(
             target_policy,
             visit_counts,

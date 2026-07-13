@@ -202,6 +202,15 @@ def test_native_config_maps_sigma_reference_visits() -> None:
     assert search._native_config()["sigma_reference_visits"] == 12
 
 
+def test_native_and_python_share_exact_belief_gameplay_aggregator() -> None:
+    # Native owns only per-particle traversal. Public-belief aggregation and
+    # action selection remain the inherited Python source of truth.
+    assert (
+        NativeGumbelChanceMCTS._aggregate_information_set_results
+        is GumbelChanceMCTS._aggregate_information_set_results
+    )
+
+
 def test_native_sigma_reference_refuses_unadvertised_old_wheel(monkeypatch) -> None:
     rust = pytest.importorskip("catanatron_rs")
     monkeypatch.delattr(rust, "gumbel_search_capabilities", raising=False)
@@ -227,6 +236,28 @@ def test_native_belief_target_refuses_wheel_without_evidence_capability(
     search.config = GumbelChanceMCTSConfig(
         information_set_search=True,
         information_set_target_aggregation="aggregate_q_then_improve",
+        sigma_reference_visits=8,
+    )
+    search.using_native_hot_loop = True
+
+    with pytest.raises(ValueError, match="belief_target_evidence"):
+        search._validate_native_semantics()
+
+
+def test_native_belief_gameplay_refuses_wheel_without_evidence_capability(
+    monkeypatch,
+) -> None:
+    rust = pytest.importorskip("catanatron_rs")
+    monkeypatch.setattr(
+        rust,
+        "gumbel_search_capabilities",
+        lambda: ["sigma_reference_visits"],
+        raising=False,
+    )
+    search = object.__new__(NativeGumbelChanceMCTS)
+    search.config = GumbelChanceMCTSConfig(
+        information_set_search=True,
+        gameplay_policy_aggregation="aggregate_q_then_improve",
         sigma_reference_visits=8,
     )
     search.using_native_hot_loop = True

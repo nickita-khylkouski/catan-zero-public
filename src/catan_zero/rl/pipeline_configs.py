@@ -520,8 +520,17 @@ class EvalConfig(PipelineConfig):
     # checkpoint-only gate in both config hashes and report provenance.
     candidate_c_scale: float | None = None
     baseline_c_scale: float | None = None
+    gameplay_policy_aggregation: str = "mean_improved_policy"
+    candidate_gameplay_policy_aggregation: str | None = None
+    baseline_gameplay_policy_aggregation: str | None = None
     rescale_noise_floor_c: float = 0.0
+    candidate_rescale_noise_floor_c: float | None = None
+    baseline_rescale_noise_floor_c: float | None = None
     sigma_eval: float = 0.79
+    candidate_sigma_eval: float | None = None
+    baseline_sigma_eval: float | None = None
+    candidate_sigma_reference_visits: int | None = None
+    baseline_sigma_reference_visits: int | None = None
     max_root_candidates: int = 16
     max_root_candidates_wide: int = 54
     wide_candidates_threshold: int = 24
