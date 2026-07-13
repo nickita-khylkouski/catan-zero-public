@@ -6,9 +6,21 @@ import pytest
 
 from tools.a1_learner_recovery_plan import (
     ESCALATED_SAMPLES,
+    OBSOLETE_REASON,
+    SCHEMA,
     SENTINEL_SAMPLES,
     build_plan,
 )
+
+
+def test_full_dose_recovery_matrix_is_explicitly_historical_only() -> None:
+    plan = build_plan(world_size=8, local_batch_size=512, grad_accum_steps=1)
+
+    assert plan["schema_version"] == SCHEMA
+    assert plan["historical_only"] is True
+    assert plan["launch_authorized"] is False
+    assert plan["promotion_eligible"] is False
+    assert plan["obsolete_reason"] == OBSOLETE_REASON
 
 
 def test_plan_matches_update_dose_across_measured_batch_topologies():
