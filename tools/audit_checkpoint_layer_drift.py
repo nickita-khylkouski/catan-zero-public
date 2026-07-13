@@ -16,9 +16,24 @@ import json
 import math
 import os
 import re
+import sys
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
+
+
+# A script path does not bind imports to the same checkout.  Without this, a
+# copied audit tool can import an older editable/install of ``catan_zero`` and
+# silently normalize away architecture fields added by the checkout being
+# audited (observed for ``topology_residual_adapter``).  Prefer this checkout
+# before the first project import; _architecture additionally verifies the
+# resolved module path and rejects an already-imported foreign package.
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_REPO_SRC = (_REPO_ROOT / "src").resolve(strict=True)
+sys.path[:] = [
+    entry for entry in sys.path if Path(entry or ".").resolve() != _REPO_SRC
+]
+sys.path.insert(0, str(_REPO_SRC))
 
 
 SCHEMA = "entity-graph-checkpoint-layer-drift-v1"
@@ -41,6 +56,7 @@ _POLICY_PREFIXES = (
     "action_cross_blocks.",
     "edge_policy_mlp.",
 )
+_TOPOLOGY_PREFIXES = ("topology_residual_adapter.",)
 _VALUE_PREFIXES = (
     "value_head.",
     "value_categorical_head.",
@@ -124,7 +140,37 @@ def _architecture(payload: Mapping[str, Any]) -> dict[str, Any]:
     import torch
 
     from catan_zero.rl.config_serialization import config_from_dict, config_to_dict
+    from catan_zero.rl import entity_token_policy
     from catan_zero.rl.entity_token_policy import EntityGraphConfig
+
+    module_path = Path(str(entity_token_policy.__file__)).resolve(strict=True)
+    if _REPO_SRC not in module_path.parents:
+        raise DriftAuditError(
+            "layer-drift audit imported catan_zero outside its checkout: "
+            f"{module_path} not under {_REPO_SRC}"
+        )
+
+    raw_config = payload.get("config")
+    if dataclasses.is_dataclass(raw_config) and not isinstance(raw_config, type):
+        stored_fields = {
+            field.name
+            for field in dataclasses.fields(raw_config)
+            if hasattr(raw_config, field.name)
+        }
+    elif isinstance(raw_config, Mapping):
+        raw_fields = raw_config.get("fields", raw_config)
+        if not isinstance(raw_fields, Mapping):
+            raise DriftAuditError("entity_graph config fields are malformed")
+        stored_fields = {str(name) for name in raw_fields}
+    else:
+        raise DriftAuditError("entity_graph checkpoint has no recognizable config")
+    known_fields = {field.name for field in dataclasses.fields(EntityGraphConfig)}
+    unknown_fields = sorted(stored_fields - known_fields)
+    if unknown_fields:
+        raise DriftAuditError(
+            "entity_graph config contains fields unknown to this checkout: "
+            f"{unknown_fields}"
+        )
 
     static = payload.get("static_action_features")
     static_contract = None
@@ -139,7 +185,7 @@ def _architecture(payload: Mapping[str, Any]) -> dict[str, Any]:
     try:
         effective_config = config_from_dict(
             EntityGraphConfig,
-            payload.get("config"),
+            raw_config,
             warn=lambda _message: None,
         )
     except (TypeError, ValueError) as error:
@@ -152,6 +198,9 @@ def _architecture(payload: Mapping[str, Any]) -> dict[str, Any]:
         "config": _jsonable(config_to_dict(effective_config)),
         "action_mask_version": payload.get("action_mask_version"),
         "mask_hidden_info": bool(payload.get("mask_hidden_info", False)),
+        "public_award_feature_contract": payload.get(
+            "public_award_feature_contract", "legacy_zero_v0"
+        ),
         "static_action_features_sha256": payload.get("static_action_features_sha256"),
         "static_action_features": static_contract,
     }
@@ -226,6 +275,8 @@ def _group_for_tensor(name: str) -> str:
         return f"transformer_block_{int(block.group(1)):03d}"
     if name.startswith(_INPUT_PREFIXES):
         return "input_encoders"
+    if name.startswith(_TOPOLOGY_PREFIXES):
+        return "topology_adapter"
     if name.startswith(_POLICY_PREFIXES):
         return "policy"
     if name.startswith("final_vp_head."):

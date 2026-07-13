@@ -215,6 +215,26 @@ def test_receipt_replays_combined_topology_target_gather_upgrade(tmp_path: Path)
     ] == "identity"
 
 
+@pytest.mark.parametrize("which", ("source", "upgraded"))
+def test_receipt_refuses_config_fields_unknown_to_its_checkout(
+    tmp_path: Path, which: str
+) -> None:
+    source, initializer = _checkpoints(tmp_path)
+    path = source if which == "source" else initializer
+    raw = torch.load(path, map_location="cpu", weights_only=False)
+    raw["config"]["fields"]["future_topology_adapter"] = True
+    torch.save(raw, path)
+    if which == "source":
+        upgraded = torch.load(initializer, map_location="cpu", weights_only=False)
+        upgraded["upgrade_provenance"]["source_checkpoint_sha256"] = upgrade._sha(  # noqa: SLF001
+            source
+        ).removeprefix("sha256:")
+        torch.save(upgraded, initializer)
+
+    with pytest.raises(upgrade.UpgradeError, match="fields unknown to this checkout"):
+        upgrade.inspect_upgrade(source, initializer)
+
+
 def test_receipt_replays_seeded_belief_head_upgrade(tmp_path: Path) -> None:
     source, initializer = _belief_checkpoints(tmp_path)
     receipt = tmp_path / "belief-upgrade.receipt.json"

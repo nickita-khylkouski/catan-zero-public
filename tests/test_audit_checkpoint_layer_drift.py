@@ -26,6 +26,7 @@ def _checkpoint(*, config_width: int = 8, overrides=None):
         "final_vp_head.0.weight": torch.ones(2),
         "q_head.0.weight": torch.ones(2),
         "state_norm.weight": torch.ones(2),
+        "topology_residual_adapter.output_projection.weight": torch.zeros(2),
     }
     for name, value in (overrides or {}).items():
         if value is None:
@@ -75,8 +76,10 @@ def test_audit_attributes_energy_and_reports_provenance(tmp_path: Path) -> None:
     report = audit_checkpoints(baseline_path, candidate_path, top_tensors=3)
 
     assert report["thresholds"] is None
-    assert report["global"]["parameter_count"] == 16
+    assert report["global"]["parameter_count"] == 18
     assert report["global"]["delta_energy"] == pytest.approx(10.0)
+    # The topology output projection is zero at the function-preserving
+    # initializer, so it contributes parameters but no baseline energy.
     assert report["global"]["relative_l2"] == pytest.approx((10.0 / 16.0) ** 0.5)
     assert report["groups"]["transformer_block_000"][
         "delta_energy_share"
@@ -87,6 +90,7 @@ def test_audit_attributes_energy_and_reports_provenance(tmp_path: Path) -> None:
     assert report["groups"]["final_vp"]["parameter_count"] == 2
     assert report["groups"]["q"]["parameter_count"] == 2
     assert report["groups"]["shared"]["parameter_count"] == 2
+    assert report["groups"]["topology_adapter"]["parameter_count"] == 2
     assert (
         report["top_tensor_outliers"]["by_delta_energy"][0]["name"]
         == "action_encoder.0.weight"
@@ -210,6 +214,37 @@ def test_audit_refuses_static_feature_or_policy_type_mismatch(tmp_path: Path) ->
     candidate["policy_type"] = "xdim_graph"
     _save(candidate_path, candidate)
     with pytest.raises(DriftAuditError, match="policy_type='entity_graph'"):
+        audit_checkpoints(baseline_path, candidate_path)
+
+
+def test_audit_refuses_unknown_config_fields_instead_of_normalizing_them_away(
+    tmp_path: Path,
+) -> None:
+    baseline_path = tmp_path / "baseline.pt"
+    candidate_path = tmp_path / "candidate.pt"
+    baseline = _checkpoint()
+    candidate = _checkpoint()
+    candidate["config"]["fields"]["future_topology_adapter"] = True
+    _save(baseline_path, baseline)
+    _save(candidate_path, candidate)
+
+    with pytest.raises(DriftAuditError, match="fields unknown to this checkout"):
+        audit_checkpoints(baseline_path, candidate_path)
+
+
+def test_audit_treats_public_award_feature_contract_as_architecture_metadata(
+    tmp_path: Path,
+) -> None:
+    baseline_path = tmp_path / "baseline.pt"
+    candidate_path = tmp_path / "candidate.pt"
+    baseline = _checkpoint()
+    candidate = _checkpoint()
+    baseline["public_award_feature_contract"] = "legacy_zero_v0"
+    candidate["public_award_feature_contract"] = "authoritative_v1"
+    _save(baseline_path, baseline)
+    _save(candidate_path, candidate)
+
+    with pytest.raises(DriftAuditError, match="architecture metadata differs"):
         audit_checkpoints(baseline_path, candidate_path)
 
 

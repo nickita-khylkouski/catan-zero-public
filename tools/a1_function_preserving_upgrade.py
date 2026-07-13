@@ -357,14 +357,21 @@ def inspect_upgrade(
     from catan_zero.rl.entity_token_policy import EntityGraphConfig
 
     known = {field.name for field in dataclasses.fields(EntityGraphConfig)}
+    unknown_before = sorted(set(before_config) - known)
+    unknown_after = sorted(set(after_config) - known)
+    if unknown_before or unknown_after:
+        raise UpgradeError(
+            "checkpoint config contains fields unknown to this checkout: "
+            f"source={unknown_before} upgraded={unknown_after}"
+        )
     effective_before = dataclasses.asdict(
-        EntityGraphConfig(**{key: value for key, value in before_config.items() if key in known})
+        EntityGraphConfig(**before_config)
     )
     effective_expected = dataclasses.asdict(
-        EntityGraphConfig(**{key: value for key, value in expected_config.items() if key in known})
+        EntityGraphConfig(**expected_config)
     )
     effective_after = dataclasses.asdict(
-        EntityGraphConfig(**{key: value for key, value in after_config.items() if key in known})
+        EntityGraphConfig(**after_config)
     )
     if effective_after != effective_expected:
         raise UpgradeError("effective checkpoint config delta is not allowlisted")
