@@ -528,6 +528,109 @@ def test_zero_weight_final_vp_head_is_not_executed_by_entity_training(tmp_path) 
     assert metrics["final_vp_loss_weight_sum"] == 0.0
 
 
+def test_all_zero_objective_mass_does_not_advance_adamw_or_decay_parameters(
+    tmp_path,
+) -> None:
+    import copy
+    import torch
+
+    data = _write_and_load_shard(tmp_path, _collect_real_samples(3))
+    batch = np.arange(len(data["action_taken"]))
+    zero = np.zeros(len(batch), dtype=np.float32)
+    policy = _make_entity_policy()
+    before = copy.deepcopy(policy.model.state_dict())
+    optimizer = torch.optim.AdamW(
+        policy.model.parameters(), lr=1e-3, weight_decay=0.1
+    )
+
+    metrics = _train_xdim_batch(
+        policy,
+        optimizer,
+        data,
+        batch,
+        zero,
+        zero,
+        soft_target_temperature=1.0,
+        soft_target_weight=0.0,
+        soft_target_source="scores",
+        soft_target_min_legal_coverage=0.0,
+        policy_loss_weight=1.0,
+        value_loss_weight=1.0,
+        final_vp_loss_weight=0.0,
+        q_loss_weight=0.0,
+        q_skip_teacher_prefixes=(),
+        vps_to_win=10,
+        advantage_policy_weighting="none",
+        advantage_temperature=1.0,
+        advantage_weight_cap=5.0,
+        advantage_weight_floor=0.05,
+        amp="none",
+        diagnostics=False,
+    )
+
+    assert metrics["optimizer_step_applied"] is False
+    assert (
+        metrics["optimizer_observability"]["zero_objective_step_skipped"] is True
+    )
+    assert optimizer.state == {}
+    after = policy.model.state_dict()
+    assert all(torch.equal(before[name], after[name]) for name in before)
+
+
+def test_nonfinite_gradient_norm_aborts_before_optimizer_step(
+    tmp_path, monkeypatch
+) -> None:
+    import torch
+    from tools import train_bc
+
+    data = _write_and_load_shard(tmp_path, _collect_real_samples(3))
+    batch = np.arange(len(data["action_taken"]))
+    weights = np.ones(len(batch), dtype=np.float32)
+    policy = _make_entity_policy()
+    optimizer = torch.optim.SGD(policy.model.parameters(), lr=1e-3)
+    steps = 0
+    original_step = optimizer.step
+
+    def counted_step(*args, **kwargs):
+        nonlocal steps
+        steps += 1
+        return original_step(*args, **kwargs)
+
+    optimizer.step = counted_step
+    monkeypatch.setattr(
+        train_bc,
+        "_clip_grad_norm",
+        lambda *_args, **_kwargs: torch.tensor(float("inf")),
+    )
+
+    with pytest.raises(FloatingPointError, match="non-finite BC gradient norm"):
+        _train_xdim_batch(
+            policy,
+            optimizer,
+            data,
+            batch,
+            weights,
+            weights,
+            soft_target_temperature=1.0,
+            soft_target_weight=0.0,
+            soft_target_source="scores",
+            soft_target_min_legal_coverage=0.0,
+            policy_loss_weight=1.0,
+            value_loss_weight=1.0,
+            final_vp_loss_weight=0.0,
+            q_loss_weight=0.0,
+            q_skip_teacher_prefixes=(),
+            vps_to_win=10,
+            advantage_policy_weighting="none",
+            advantage_temperature=1.0,
+            advantage_weight_cap=5.0,
+            advantage_weight_floor=0.05,
+            amp="none",
+            diagnostics=False,
+        )
+    assert steps == 0
+
+
 def test_train_xdim_reports_soft_targets_conditioned_on_policy_active_rows(
     tmp_path, monkeypatch
 ) -> None:
