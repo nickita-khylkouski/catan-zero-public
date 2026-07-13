@@ -34,6 +34,9 @@ WORLD_SIZE = 4
 LOCAL_BATCH = 512
 OPTIMIZER_STEPS = 2048
 GLOBAL_DRAWS = WORLD_SIZE * LOCAL_BATCH * OPTIMIZER_STEPS
+DEFAULT_VISIBLE_DEVICES = (0, 1, 2, 3)
+AUX64_VISIBLE_DEVICES = (4, 5, 6, 7)
+AUTHORIZED_POLICY_AUX_ACTIVE_BATCH_SIZES = frozenset((0, 64))
 BOUND_SOURCE_FILES = (
     "tools/a1_production_gather_retrain.py",
     "tools/a1_production_l1_rerun.py",
@@ -96,7 +99,9 @@ def _source_completion(path: Path) -> tuple[dict[str, Any], dict[str, str], dict
     return value, ref, source_manifest
 
 
-def _validate_geometry(command: list[str]) -> None:
+def _validate_geometry(
+    command: list[str], *, policy_aux_active_batch_size: int = 0
+) -> None:
     exact = {
         "--nproc-per-node": str(WORLD_SIZE),
         "--arch": "entity_graph",
@@ -121,7 +126,7 @@ def _validate_geometry(command: list[str]) -> None:
         "--forced-row-value-weight": "1.0",
         "--winner-sample-weight": "1.0",
         "--loser-sample-weight": "1.0",
-        "--policy-aux-active-batch-size": "0",
+        "--policy-aux-active-batch-size": str(policy_aux_active_batch_size),
         "--action-module-lr-mult": "4.0",
         "--value-lr-mult": "1.0",
         "--freeze-modules": FREEZE_MODULES,
@@ -156,7 +161,21 @@ def prepare(
     output_root: Path,
     manifest_path: Path,
     python: Path,
+    policy_aux_active_batch_size: int = 0,
+    visible_devices: Sequence[int] = DEFAULT_VISIBLE_DEVICES,
 ) -> dict[str, Any]:
+    if policy_aux_active_batch_size not in AUTHORIZED_POLICY_AUX_ACTIVE_BATCH_SIZES:
+        raise GatherRetrainError("unauthorized policy-active auxiliary dose")
+    visible_devices = tuple(visible_devices)
+    expected_devices = (
+        DEFAULT_VISIBLE_DEVICES
+        if policy_aux_active_batch_size == 0
+        else AUX64_VISIBLE_DEVICES
+    )
+    if visible_devices != expected_devices:
+        raise GatherRetrainError(
+            "visible devices do not match the authorized gather dose profile"
+        )
     repo = repo.expanduser().resolve(strict=True)
     commit = base._assert_bound_checkout(repo)  # noqa: SLF001
     completion, completion_ref, source_manifest = _source_completion(source_completion)
@@ -214,7 +233,7 @@ def prepare(
         "--weight-decay": "0.0",
         "--max-grad-norm": "1.0",
         "--seed": "1",
-        "--policy-aux-active-batch-size": "0",
+        "--policy-aux-active-batch-size": str(policy_aux_active_batch_size),
         "--action-module-lr-mult": "4.0",
         "--value-lr-mult": "1.0",
         "--freeze-modules": FREEZE_MODULES,
@@ -224,7 +243,9 @@ def prepare(
         _set(command, flag, value)
     if "--ddp-find-unused-parameters" not in command:
         command.append("--ddp-find-unused-parameters")
-    _validate_geometry(command)
+    _validate_geometry(
+        command, policy_aux_active_batch_size=policy_aux_active_batch_size
+    )
     source_files = {relative: base._ref(repo / relative) for relative in BOUND_SOURCE_FILES}  # noqa: SLF001
     operator = {
         "world_size": WORLD_SIZE,
@@ -244,6 +265,20 @@ def prepare(
         "fresh_optimizer": True,
         "ddp_find_unused_parameters": True,
     }
+    # Keep the historical production operator byte-for-byte unchanged.  The
+    # independently reproducible AUX64 profile adds only its causal dose.
+    if policy_aux_active_batch_size:
+        operator.update(
+            {
+                "policy_aux_active_batch_size_per_rank":
+                    policy_aux_active_batch_size,
+                "global_policy_aux_active_draws": (
+                    WORLD_SIZE
+                    * policy_aux_active_batch_size
+                    * OPTIMIZER_STEPS
+                ),
+            }
+        )
     manifest: dict[str, Any] = {
         "schema_version": MANIFEST_SCHEMA,
         "diagnostic_only": False,
@@ -267,7 +302,7 @@ def prepare(
             "files": source_files,
         },
         "runtime_python": python_binding,
-        "visible_devices": [0, 1, 2, 3],
+        "visible_devices": list(visible_devices),
         "execution_preconditions": {
             "visible_host_gpu_count": 8,
             "selected_device_count": 4,
@@ -327,6 +362,13 @@ def verify(manifest_path: Path) -> dict[str, Any]:
         )
     base._verify_ref(corpus_producer, "corpus producer")  # noqa: SLF001
     operator = manifest.get("operator")
+    if not isinstance(operator, dict):
+        raise GatherRetrainError("target-gather operator is malformed")
+    policy_aux_active_batch_size = int(
+        operator.get("policy_aux_active_batch_size_per_rank", 0)
+    )
+    if policy_aux_active_batch_size not in AUTHORIZED_POLICY_AUX_ACTIVE_BATCH_SIZES:
+        raise GatherRetrainError("unauthorized policy-active auxiliary dose")
     expected_operator = {
         "world_size": 4,
         "per_rank_batch_size": 512,
@@ -345,6 +387,18 @@ def verify(manifest_path: Path) -> dict[str, Any]:
         "fresh_optimizer": True,
         "ddp_find_unused_parameters": True,
     }
+    if policy_aux_active_batch_size:
+        expected_operator.update(
+            {
+                "policy_aux_active_batch_size_per_rank":
+                    policy_aux_active_batch_size,
+                "global_policy_aux_active_draws": (
+                    WORLD_SIZE
+                    * policy_aux_active_batch_size
+                    * OPTIMIZER_STEPS
+                ),
+            }
+        )
     if operator != expected_operator or manifest.get("operator_sha256") != base._digest(operator):  # noqa: SLF001
         raise GatherRetrainError("target-gather operator geometry drifted")
     descriptor = base._verify_ref(manifest.get("source_descriptor"), "descriptor")  # noqa: SLF001
@@ -371,7 +425,18 @@ def verify(manifest_path: Path) -> dict[str, Any]:
         or command[0] != python
     ):
         raise GatherRetrainError("target-gather command/runtime binding drifted")
-    _validate_geometry(command)
+    _validate_geometry(
+        command, policy_aux_active_batch_size=policy_aux_active_batch_size
+    )
+    expected_devices = list(
+        DEFAULT_VISIBLE_DEVICES
+        if policy_aux_active_batch_size == 0
+        else AUX64_VISIBLE_DEVICES
+    )
+    if manifest.get("visible_devices") != expected_devices:
+        raise GatherRetrainError(
+            "visible devices do not match the authorized gather dose profile"
+        )
     exact_paths = {
         "--data": manifest["source_descriptor"]["path"],
         "--validation-game-sentinel-manifest": manifest["validation_sentinel"]["path"],
@@ -397,9 +462,11 @@ def verify(manifest_path: Path) -> dict[str, Any]:
 
 def _execution_binding(verified: dict[str, Any]) -> dict[str, Any]:
     manifest = verified["manifest"]
+    devices = manifest["visible_devices"]
+    device_csv = ",".join(str(device) for device in devices)
     return {
         "schema_version": "a1-production-target-gather-execution-binding-v1",
-        "visible_devices": [0, 1, 2, 3],
+        "visible_devices": devices,
         "world_size": 4,
         "runtime_python": manifest["runtime_python"],
         "repository_commit": manifest["repo_binding"]["public_main_commit"],
@@ -407,7 +474,7 @@ def _execution_binding(verified: dict[str, Any]) -> dict[str, Any]:
         "environment": {
             "HOME": "/home/ubuntu",
             "PYTHONNOUSERSITE": "1",
-            "CUDA_VISIBLE_DEVICES": "0,1,2,3",
+            "CUDA_VISIBLE_DEVICES": device_csv,
         },
     }
 
@@ -415,6 +482,9 @@ def _execution_binding(verified: dict[str, Any]) -> dict[str, Any]:
 def _systemd_command(verified: dict[str, Any], unit: str) -> list[str]:
     root = verified["output_root"]
     stdout, stderr = root / "stdout.log", root / "stderr.log"
+    device_csv = ",".join(
+        str(device) for device in verified["manifest"]["visible_devices"]
+    )
     return [
         "sudo", "-n", "systemd-run", f"--unit={unit}", "--uid=ubuntu",
         "--gid=ubuntu", "--service-type=exec", "--property=LimitNOFILE=65536",
@@ -422,8 +492,59 @@ def _systemd_command(verified: dict[str, Any], unit: str) -> list[str]:
         f"--property=StandardOutput=append:{stdout}",
         f"--property=StandardError=append:{stderr}",
         "--setenv=HOME=/home/ubuntu", "--setenv=PYTHONNOUSERSITE=1",
-        "--setenv=CUDA_VISIBLE_DEVICES=0,1,2,3", "--", *verified["command"],
+        f"--setenv=CUDA_VISIBLE_DEVICES={device_csv}", "--", *verified["command"],
     ]
+
+
+def _idle_selected_b200s(
+    devices: Sequence[int],
+    runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+) -> list[str]:
+    """Return non-MPS compute processes on the selected physical B200s."""
+
+    try:
+        topology = runner(
+            [
+                "nvidia-smi", "--query-gpu=index,uuid,name",
+                "--format=csv,noheader",
+            ],
+            check=True, text=True, capture_output=True,
+        )
+        compute = runner(
+            [
+                "nvidia-smi", "--query-compute-apps=gpu_uuid,pid,process_name",
+                "--format=csv,noheader",
+            ],
+            check=True, text=True, capture_output=True,
+        )
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise GatherRetrainError(
+            f"cannot prove selected B200 execution precondition: {error}"
+        ) from error
+    uuid_to_index: dict[str, int] = {}
+    names: list[str] = []
+    for row in topology.stdout.splitlines():
+        if not row.strip():
+            continue
+        index, uuid, name = (value.strip() for value in row.split(",", 2))
+        uuid_to_index[uuid] = int(index)
+        names.append(name)
+    if len(names) != 8 or any("B200" not in name for name in names):
+        raise GatherRetrainError(
+            f"requires exactly eight visible B200s, found {names}"
+        )
+    selected = set(devices)
+    conflicts: list[str] = []
+    for row in compute.stdout.splitlines():
+        if not row.strip():
+            continue
+        uuid, pid, process = (value.strip() for value in row.split(",", 2))
+        if (
+            uuid_to_index.get(uuid) in selected
+            and "nvidia-cuda-mps" not in process.lower()
+        ):
+            conflicts.append(f"gpu={uuid_to_index[uuid]},pid={pid},process={process}")
+    return conflicts
 
 
 def execute(
@@ -431,12 +552,18 @@ def execute(
     *,
     unit: str,
     runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
-    idle_probe: Callable[[], list[str]] = base._idle_b200s,  # noqa: SLF001
+    idle_probe: Callable[[], list[str]] | None = None,
 ) -> dict[str, Any]:
     if base.SAFE_UNIT.fullmatch(unit) is None:
         raise GatherRetrainError("systemd unit name is invalid")
     verified = verify(manifest_path)
-    conflicts = idle_probe()
+    if idle_probe is not None:
+        conflicts = idle_probe()
+    elif verified["manifest"]["visible_devices"] == list(DEFAULT_VISIBLE_DEVICES):
+        # Preserve the original production profile's all-host-idle precondition.
+        conflicts = base._idle_b200s()  # noqa: SLF001
+    else:
+        conflicts = _idle_selected_b200s(verified["manifest"]["visible_devices"])
     if conflicts:
         raise GatherRetrainError(f"B200 compute is not idle: {conflicts}")
     root = verified["output_root"]
@@ -629,6 +756,28 @@ def finalize(
         "max_grad_norm": 1.0,
         "seed": 1,
     }
+    policy_aux_active_batch_size = int(
+        verified["manifest"]["operator"].get(
+            "policy_aux_active_batch_size_per_rank", 0
+        )
+    )
+    if policy_aux_active_batch_size:
+        expected.update(
+            {
+                "policy_aux_active_batch_size": policy_aux_active_batch_size,
+                "policy_aux_training_row_draws": (
+                    WORLD_SIZE
+                    * policy_aux_active_batch_size
+                    * OPTIMIZER_STEPS
+                ),
+                "total_training_row_draws": (
+                    GLOBAL_DRAWS
+                    + WORLD_SIZE
+                    * policy_aux_active_batch_size
+                    * OPTIMIZER_STEPS
+                ),
+            }
+        )
     drift = {key: {"expected": value, "actual": payload.get(key)} for key, value in expected.items() if payload.get(key) != value}
     surface = payload.get("training_information_surface", {}).get(
         "required_trainable_surface"
@@ -700,6 +849,16 @@ def build_parser() -> argparse.ArgumentParser:
     prep.add_argument("--output-root", required=True, type=Path)
     prep.add_argument("--manifest", required=True, type=Path)
     prep.add_argument("--python", required=True, type=Path)
+    prep.add_argument(
+        "--policy-aux-active-batch-size",
+        type=int,
+        choices=sorted(AUTHORIZED_POLICY_AUX_ACTIVE_BATCH_SIZES),
+        default=0,
+    )
+    prep.add_argument(
+        "--visible-devices",
+        default=",".join(str(device) for device in DEFAULT_VISIBLE_DEVICES),
+    )
     run = sub.add_parser("execute")
     run.add_argument("--manifest", required=True, type=Path)
     run.add_argument("--unit", default="a1-production-target-gather")
@@ -721,6 +880,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 output_root=args.output_root,
                 manifest_path=args.manifest,
                 python=args.python,
+                policy_aux_active_batch_size=args.policy_aux_active_batch_size,
+                visible_devices=tuple(
+                    int(value) for value in args.visible_devices.split(",")
+                ),
             )
         elif args.action == "execute" and args.go:
             value = execute(args.manifest, unit=args.unit)

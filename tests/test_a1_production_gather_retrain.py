@@ -12,7 +12,13 @@ def _ref(path: Path) -> dict[str, str]:
     return gather.base._ref(path)  # noqa: SLF001
 
 
-def _fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[dict, Path]:
+def _fixture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    policy_aux_active_batch_size: int = 0,
+    visible_devices: tuple[int, ...] = gather.DEFAULT_VISIBLE_DEVICES,
+) -> tuple[dict, Path]:
     repo = tmp_path / "repo"
     for relative in gather.BOUND_SOURCE_FILES:
         path = repo / relative
@@ -103,6 +109,8 @@ def _fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[dict, Pat
         output_root=output,
         manifest_path=manifest_path,
         python=python,
+        policy_aux_active_batch_size=policy_aux_active_batch_size,
+        visible_devices=visible_devices,
     )
     return manifest, manifest_path
 
@@ -130,6 +138,75 @@ def test_prepares_and_replays_exact_four_rank_adapter_operator(
         manifest["command"], "--require-only-trainable-prefixes"
     ) == "target_gather_proj"
     assert gather.verify(path)["manifest"]["operator"] == manifest["operator"]
+
+
+def test_default_profile_remains_structurally_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manifest, _ = _fixture(tmp_path, monkeypatch)
+    assert manifest["visible_devices"] == [0, 1, 2, 3]
+    assert "policy_aux_active_batch_size_per_rank" not in manifest["operator"]
+    assert "global_policy_aux_active_draws" not in manifest["operator"]
+    assert gather.base._option(  # noqa: SLF001
+        manifest["command"], "--policy-aux-active-batch-size"
+    ) == "0"
+
+
+def test_prepares_and_replays_sealed_aux64_profile_on_disjoint_devices(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manifest, path = _fixture(
+        tmp_path,
+        monkeypatch,
+        policy_aux_active_batch_size=64,
+        visible_devices=gather.AUX64_VISIBLE_DEVICES,
+    )
+    assert manifest["visible_devices"] == [4, 5, 6, 7]
+    assert manifest["operator"]["global_base_draws"] == 4_194_304
+    assert manifest["operator"]["policy_aux_active_batch_size_per_rank"] == 64
+    assert manifest["operator"]["global_policy_aux_active_draws"] == 524_288
+    assert gather.base._option(  # noqa: SLF001
+        manifest["command"], "--policy-aux-active-batch-size"
+    ) == "64"
+    verified = gather.verify(path)
+    binding = gather._execution_binding(verified)  # noqa: SLF001
+    assert binding["environment"]["CUDA_VISIBLE_DEVICES"] == "4,5,6,7"
+    assert "--setenv=CUDA_VISIBLE_DEVICES=4,5,6,7" in gather._systemd_command(  # noqa: SLF001
+        verified, "a1-aux64-reproduction"
+    )
+
+
+def test_rejects_aux64_profile_on_wrong_devices(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with pytest.raises(gather.GatherRetrainError, match="visible devices"):
+        _fixture(
+            tmp_path,
+            monkeypatch,
+            policy_aux_active_batch_size=64,
+            visible_devices=gather.DEFAULT_VISIBLE_DEVICES,
+        )
+
+
+def test_selected_idle_probe_ignores_nonselected_gpu_processes() -> None:
+    import subprocess
+
+    outputs = iter(
+        (
+            "\n".join(
+                f"{index}, uuid-{index}, NVIDIA B200"
+                for index in range(8)
+            ),
+            "uuid-1, 101, fixed-root.py\nuuid-5, 505, train_bc.py\n",
+        )
+    )
+
+    def runner(*_args, **_kwargs):
+        return subprocess.CompletedProcess([], 0, stdout=next(outputs), stderr="")
+
+    assert gather._idle_selected_b200s((4, 5, 6, 7), runner=runner) == [  # noqa: SLF001
+        "gpu=5,pid=505,process=train_bc.py"
+    ]
 
 
 def test_rejects_semantically_rehashed_geometry_command_and_identity_tampering(
@@ -218,6 +295,17 @@ def _completion_outputs(manifest: dict, path: Path, *, unit: str) -> Path:
             }
         },
     }
+    policy_aux_active_batch_size = manifest["operator"].get(
+        "policy_aux_active_batch_size_per_rank", 0
+    )
+    if policy_aux_active_batch_size:
+        report.update(
+            {
+                "policy_aux_active_batch_size": policy_aux_active_batch_size,
+                "policy_aux_training_row_draws": 524_288,
+                "total_training_row_draws": 4_718_592,
+            }
+        )
     (root / "train.report.json").write_text(json.dumps(report), encoding="utf-8")
     progress = {
         # train_bc intentionally records colocated outputs lexically relative
@@ -284,6 +372,32 @@ def test_finalize_binds_exact_progress_rng_and_fresh_optimizer(
     assert completion["operator_sha256"] == manifest["operator_sha256"]
     assert completion["progress"] == _ref(progress_path)
     assert completion["optimizer"]["path"].endswith("candidate.pt.optimizer.pt")
+
+
+def test_finalize_binds_aux64_dose(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manifest, path = _fixture(
+        tmp_path,
+        monkeypatch,
+        policy_aux_active_batch_size=64,
+        visible_devices=gather.AUX64_VISIBLE_DEVICES,
+    )
+    unit = "a1-gather-aux64-test"
+    _completion_outputs(manifest, path, unit=unit)
+    monkeypatch.setattr(
+        gather,
+        "_verify_adapter_only_model_delta",
+        lambda *_args: {"inherited_parameters_bit_identical": True},
+    )
+    completion = gather.finalize(
+        path,
+        unit=unit,
+        state_reader=lambda *_args, **_kwargs: (
+            "ActiveState=inactive\nResult=success\nExecMainStatus=0\n"
+        ),
+    )
+    assert completion["operator_sha256"] == manifest["operator_sha256"]
 
 
 def test_finalize_rejects_rehashed_progress_geometry_tamper(

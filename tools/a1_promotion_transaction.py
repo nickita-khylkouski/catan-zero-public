@@ -1588,6 +1588,11 @@ def _verify_production_target_gather_completion_receipt(
     if verified["manifest_ref"] != manifest_ref:
         raise PromotionError("production target-gather manifest reference drifted")
     operator = manifest.get("operator")
+    policy_aux_active_batch_size = (
+        operator.get("policy_aux_active_batch_size_per_rank", 0)
+        if isinstance(operator, dict)
+        else None
+    )
     exact_operator = {
         "world_size": 4,
         "per_rank_batch_size": 512,
@@ -1606,6 +1611,15 @@ def _verify_production_target_gather_completion_receipt(
         "fresh_optimizer": True,
         "ddp_find_unused_parameters": True,
     }
+    if policy_aux_active_batch_size == 64:
+        exact_operator.update(
+            {
+                "policy_aux_active_batch_size_per_rank": 64,
+                "global_policy_aux_active_draws": 524_288,
+            }
+        )
+    elif policy_aux_active_batch_size != 0:
+        raise PromotionError("production target-gather auxiliary dose drifted")
     if (
         operator != exact_operator
         or value["operator_sha256"] != manifest.get("operator_sha256")
@@ -1753,12 +1767,22 @@ def _verify_production_target_gather_completion_receipt(
             "production target-gather corpus producer differs from contract producer"
         )
     report = _load_json(report_path)
+    report_dose_matches = report.get("policy_aux_active_batch_size") == (
+        policy_aux_active_batch_size
+    )
+    if policy_aux_active_batch_size == 64:
+        report_dose_matches = (
+            report_dose_matches
+            and report.get("policy_aux_training_row_draws") == 524_288
+            and report.get("total_training_row_draws") == 4_718_592
+        )
     if (
         report.get("init_checkpoint") != str(init_path)
         or report.get("init_checkpoint_sha256") != init_ref["sha256"]
         or report.get("resume_optimizer") is not False
         or report.get("optimizer_restored") is not False
         or report.get("training_row_draws") != 4_194_304
+        or not report_dose_matches
         or report.get("require_only_trainable_prefixes") != "target_gather_proj"
     ):
         raise PromotionError(

@@ -3316,7 +3316,10 @@ def test_production_l1_completion_refuses_optimizer_drift(
 
 
 def _production_gather_receipt_fixture(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    policy_aux_active_batch_size: int = 0,
 ):
     import torch
 
@@ -3360,9 +3363,7 @@ def _production_gather_receipt_fixture(
         lambda path: upgrade,
     )
     report = tmp_path / "train.report.json"
-    _write_json(
-        report,
-        {
+    report_payload = {
             "arch": "entity_graph", "mask_hidden_info": True,
             "track": "2p_no_trade", "vps_to_win": 10,
             "world_size": 4, "batch_size": 512,
@@ -3371,7 +3372,8 @@ def _production_gather_receipt_fixture(
             "training_row_draws": 4_194_304, "optimizer": "adam",
             "resume_optimizer": False, "optimizer_restored": False,
             "soft_target_weight": 0.9, "value_loss_weight": 0.25,
-            "loser_sample_weight": 1.0, "policy_aux_active_batch_size": 0,
+            "loser_sample_weight": 1.0,
+            "policy_aux_active_batch_size": policy_aux_active_batch_size,
             "action_module_lr_mult": 4.0, "value_lr_mult": 1.0,
             "freeze_modules": "trunk,action_encoder,policy_head,value_heads",
             "require_only_trainable_prefixes": "target_gather_proj",
@@ -3383,8 +3385,15 @@ def _production_gather_receipt_fixture(
             "max_grad_norm": 1.0, "gradient_clipping_enabled": True,
             "checkpoint": str(candidate), "init_checkpoint": str(init),
             "init_checkpoint_sha256": promotion._sha256(init),
-        },
-    )
+        }
+    if policy_aux_active_batch_size:
+        report_payload.update(
+            {
+                "policy_aux_training_row_draws": 524_288,
+                "total_training_row_draws": 4_718_592,
+            }
+        )
+    _write_json(report, report_payload)
     optimizer = tmp_path / "candidate.pt.optimizer.pt"
     optimizer.write_bytes(b"fresh optimizer")
     progress_path = tmp_path / "candidate.pt.training-progress.json"
@@ -3413,6 +3422,14 @@ def _production_gather_receipt_fixture(
         "fresh_optimizer": True,
         "ddp_find_unused_parameters": True,
     }
+    if policy_aux_active_batch_size:
+        operator.update(
+            {
+                "policy_aux_active_batch_size_per_rank":
+                    policy_aux_active_batch_size,
+                "global_policy_aux_active_draws": 524_288,
+            }
+        )
     manifest = {
         "operator": operator,
         "operator_sha256": promotion._digest_value(operator),
@@ -3422,6 +3439,11 @@ def _production_gather_receipt_fixture(
         "learner_source_incumbent": upgrade["source"],
         "corpus_producer": {"path": str(f7), "sha256": promotion._sha256(f7)},
         "function_preserving_upgrade": upgrade,
+        "visible_devices": list(
+            production_gather.AUX64_VISIBLE_DEVICES
+            if policy_aux_active_batch_size
+            else production_gather.DEFAULT_VISIBLE_DEVICES
+        ),
     }
     verified_manifest = {
         "manifest": manifest, "manifest_ref": manifest_ref,
@@ -3501,6 +3523,25 @@ def test_production_target_gather_completion_binds_r3_not_corpus_f7(
 
     assert verified["evaluation_parent_sha256"] == promotion._sha256(fixture["source"])
     assert verified["evaluation_parent_sha256"] != promotion._sha256(fixture["f7"])
+
+
+def test_production_target_gather_completion_accepts_sealed_aux64_dose(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = _production_gather_receipt_fixture(
+        tmp_path, monkeypatch, policy_aux_active_batch_size=64
+    )
+    verified = promotion._verify_production_target_gather_completion_receipt(
+        fixture["completion"],
+        contract=fixture["contract"],
+        candidate_path=fixture["candidate"],
+        candidate_sha256=promotion._sha256(fixture["candidate"]),
+        training_report_path=fixture["report"],
+        training_report_sha256=promotion._sha256(fixture["report"]),
+    )
+    assert verified["evaluation_parent_sha256"] == promotion._sha256(
+        fixture["source"]
+    )
 
 
 def test_production_target_gather_completion_refuses_inherited_tensor_change(
