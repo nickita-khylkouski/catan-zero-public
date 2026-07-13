@@ -433,13 +433,23 @@ def _attributed_forward(
         outputs.update(recorder.run("value_categorical_head", categorical_heads))
     if model.aux_subgoal_heads:
         def aux_heads():
-            return {
+            result = {
                 "aux_longest_road": model.aux_longest_road_head(state).squeeze(-1),
                 "aux_largest_army": model.aux_largest_army_head(state).squeeze(-1),
                 "aux_vp_in_n": model.aux_vp_in_n_head(state).squeeze(-1),
-                "aux_next_settlement": model.aux_next_settlement_head(state),
                 "aux_robber_target": model.aux_robber_target_head(state),
             }
+            if bool(getattr(model, "aux_settlement_pointer_head_enabled", False)):
+                vertex_count = int(batch["vertex_tokens"].shape[1])
+                vertex_start = 1 + int(batch["hex_tokens"].shape[1])
+                result["aux_next_settlement"] = (
+                    model.aux_next_settlement_pointer_head(
+                        tokens[:, vertex_start : vertex_start + vertex_count]
+                    ).squeeze(-1)
+                )
+            else:
+                result["aux_next_settlement"] = model.aux_next_settlement_head(state)
+            return result
         outputs.update(recorder.run("aux_subgoal_heads", aux_heads))
     if return_q:
         q_features = recorder.run(

@@ -128,6 +128,8 @@ a diagnostic, not a champion selector. Search H2H remains mandatory.
 | Zero-signal batches | AdamW could decay parameters or advance old momentum when the entire configured objective and global gradient were exactly zero. | Fixed: skip only exact zero-objective + zero-gradient groups (`6e952b1`, `1c6efe4`). |
 | Non-finite gradients | `clip_grad_norm_` defaults to `error_if_nonfinite=False`; a finite loss followed by NaN/Inf gradients could corrupt Adam moments/checkpoints. | Fixed in both dense and entity trainers: abort before `optimizer.step` (`6e952b1`). |
 | Optional heads | Zero-weight heads stayed trainable and were subject to AdamW decay. The first fix froze them, but enabled frozen aux heads still executed Dropout and advanced the RNG, so an aux-ON/zero-loss control diverged from aux-OFF on the second main forward. | Fixed: fail-closed preflight/freeze plus a nonpersistent inactive-output gate skips those forwards; active/inference outputs are unchanged and two-forward RNG parity is tested (`e81ffb2`, `03bf5e2`). Baseline f7/TEMP configs had these heads absent, so this invalidated optional-head controls but did not cause the baseline failure. |
+| Settlement auxiliary semantics | CAT-100 predicted an absolute 54-way next-settlement vertex id from permutation-invariant CLS, but vertex tokens carry no canonical id or coordinate. A vertex-row relabel leaves the legacy logits fixed although the target class must relabel, so the head cannot bind its prediction to the target vertex. This argument does **not** apply to the dense robber head: hex tokens carry canonical coordinates. | Fixed behind the backward-compatible `aux_settlement_pointer_head` flag: only next-settlement uses a shared scorer over post-trunk vertex tokens and is exactly permutation-equivariant. The coordinate-supported robber classifier remains dense. Legacy defaults/checkpoints remain compatible, but the information-surface audit rejects an enabled legacy settlement head as `settlement_aux_target_aliasing`. Strength remains an ablation. |
+| Auxiliary objective scale | `_aux_subgoal_loss` sums five conditional head means, making scalar loss magnitude look dominated by the two categorical heads. Five exact-ratio 512-row batches from the 47.62M-row AUX2 composite show that coefficient `0.02` contributes only 3.36--4.51% (mean 3.90%) of the primary policy+value shared-trunk gradient at random-head initialization, not an overwhelming update. After the historical 4.19M-sample AUX2 run the range is 3.04--7.04% (mean 4.61%). | Equal-head summation at `0.02` is not independently indicted by gradient scale, so it is not silently changed with the pointer repair. New heads require a two-stage contract: frozen-inherited head-only warmup, then fresh joint optimizer and a short bound dose; select the coefficient from measured trunk norm/cosine rather than inheriting `0.02`. Evidence SHA-256 `89ad515dcb3f971a3a31dee477e99d2d789b2f2659443b41dfd03bc8aaad6593`. |
 | Value-only policy surface | `--train-value-only` froze the legacy trunk/action-encoder/policy-head groups but left upgraded target-gather, edge-policy, and action cross-attention adapters optimizer-visible. A nominal value-only arm could therefore alter policy behavior; under AdamW, graph-reachable exact-zero policy gradients can still trigger decoupled decay. | Fixed: the shortcut now freezes the complete named policy surface, and an upgraded-architecture optimizer smoke proves every adapter remains unchanged while value readouts move. Historical f7/P0/TEMP did not contain these adapters, so their weights are unaffected; upgraded value-only arms from the old code are not causally isolated. |
 | Target-aware batch padding | The PPO/entity batcher padded `legal_action_target_ids` with zero. Zero is a valid local entity id, not the no-target sentinel, so any variable-legal-width batch presented to target-gather, edge-policy, or relational target-aware models failed pre-forward with `padded legal action carries a target id`. | Fixed: padding now uses `-1`, matching feature extraction, inference batching, and the model contract. A mixed-width upgraded-architecture value-only smoke reaches the real forward and optimizer step. Legacy f7/P0/TEMP did not consume action target ids and are unaffected; upgraded learner paths were nonfunctional on ordinary mixed-width batches. |
 | Halt head | `deliberation_halt_head` had no BC objective but remained trainable. | Fixed/frozen (`e81ffb2`). |
@@ -181,6 +183,56 @@ a diagnostic, not a champion selector. Search H2H remains mandatory.
 | Representation audit classification | The information-surface audit reported a gather-only Transformer as having no critical spatial bottleneck and therefore `safe_for_scale_only_ablation=true`. Gather binds policy actions to target tokens, but it does not make the CLS/value state readout consume graph connectivity; the executable alias regression already proves the value remains invariant under within-type board permutations. The converse topology-only arm still lacks an action-target join. | Fixed in audit schema v2: gather-only reports `spatial_state_topology_aliasing`, topology-only reports `action_target_aliasing`, and only a representation with both state topology and action binding clears the spatial critical gate. This changes experiment admission, not model weights. |
 
 ## Layer/architecture audit
+
+### CAT-100 settlement readout and commissioning
+
+The historical auxiliary arm was not a valid test of entity-local settlement
+supervision. `aux_next_settlement_head` classified an absolute vertex id from
+CLS. Vertex tokens contain no id or coordinate, and the incumbent Transformer's
+state output is invariant to a vertex-row permutation. An executable regression
+now relabels all 54 vertex rows: legacy settlement logits remain unchanged even
+though the target class must relabel. The repaired pointer head scores each
+post-trunk vertex token with shared weights, so its logits follow the exact
+permutation while policy/value/final-VP remain unchanged at upgrade.
+
+Do not extend this proof to `aux_robber_target_head`. Hex token features include
+canonical coordinates, so reordering coordinate-bearing rows does not relabel
+the absolute hex class. The dense robber classifier remains in place unless a
+separate valid D6-equivariance test demonstrates a real defect.
+
+This is not merely a sparse-label issue. The exact AUX2 composite contains
+47,620,447 rows. Longest-road, largest-army, and VP-in-N have 100% label
+coverage; next settlement has 33,450,737 labels (70.24%); robber target has
+42,805,473 (89.89%). The full-corpus marginal entropies are 3.813 nats over 54
+settlement classes and 2.658 nats over 19 robber classes. After 4.19M samples,
+the settlement CLS loss remains 3.717 nats on five matched sampled batches. The
+robber loss (2.599) is retained only as scale telemetry, not evidence of aliasing.
+
+The raw summed loss is visually misleading but the configured trunk gradient
+is measurable. Across five independently sampled 512-row batches drawn at the
+exact `n128:n256:replay = 0.5714:0.2286:0.20` objective ratio, the historical
+`0.02` coefficient produced 3.36--4.51% (mean 3.90%) of the primary shared-trunk
+gradient norm at f7 plus randomly initialized heads. Its cosine with the primary
+gradient ranged from -0.018 to +0.113. After the old AUX2 dose, the corresponding
+norm ratio was 3.04--7.04% (mean 4.61%). This rules out the claim that the five-
+head sum necessarily overwhelmed the trunk, but it does not make step-1 random
+head gradients desirable.
+
+Commission the repaired arm in two stages:
+
+1. Upgrade f7 with `aux_settlement_pointer`; freeze every inherited trunk, policy, action,
+   and value module; train only the five auxiliary readouts until their held-out
+   losses stabilize. Prove the trainable prefix set is exactly the new heads.
+2. Discard the warmup optimizer. Start a fresh joint optimizer from those model
+   bytes for a separately bound short dose. Re-measure primary/aux shared-trunk
+   norms and cosines, selecting a coefficient that remains a modest regularizer
+   rather than assuming the historical `0.02` transfers to the corrected heads.
+
+The pointer flag stays off by default, old checkpoint structure is retained,
+and a requested pointer CLI treatment now fails before training if its warm-start
+checkpoint still carries the legacy settlement CLS head. The exact five-batch evidence summary
+is `/home/ubuntu/experimental_nonpromotable/a1-aux-subgoal-f7-dose4194304-20260712-r1/aux-gradient-geometry-summary-v1.json`, SHA-256
+`89ad515dcb3f971a3a31dee477e99d2d789b2f2659443b41dfd03bc8aaad6593`.
 
 ### Operational cost of topology + target gather
 

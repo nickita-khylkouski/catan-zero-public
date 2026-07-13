@@ -65,6 +65,7 @@ NEW_PARAM_PREFIXES = (
     "aux_vp_in_n_head.",
     "aux_next_settlement_head.",
     "aux_robber_target_head.",
+    "aux_next_settlement_pointer_head.",
     "belief_resource_head.",
     "value_categorical_head.",
     "topology_residual_adapter.",
@@ -107,6 +108,12 @@ def _parse_flags(raw: str) -> dict[str, object]:
             overrides["edge_policy_head"] = True
         elif entry in ("aux", "aux_subgoal_heads"):
             overrides["aux_subgoal_heads"] = True
+        elif entry in (
+            "aux_settlement_pointer",
+            "aux_settlement_pointer_head",
+        ):
+            overrides["aux_subgoal_heads"] = True
+            overrides["aux_settlement_pointer_head"] = True
         elif entry in ("topology", "topology_residual_adapter"):
             overrides["topology_residual_adapter"] = True
         elif entry in ("belief", "belief_resource_head"):

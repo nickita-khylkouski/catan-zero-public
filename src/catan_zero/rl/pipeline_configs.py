@@ -311,6 +311,7 @@ class TrainConfig(PipelineConfig):
     value_root_blend_phases: str = ""
     value_root_blend_global_compat: bool = False
     aux_subgoal_heads: bool = False
+    aux_settlement_pointer_head: bool = False
     aux_subgoal_loss_weight: float = 0.0
     belief_resource_head: bool = False
     belief_resource_loss_weight: float = 0.0

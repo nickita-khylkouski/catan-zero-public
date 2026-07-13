@@ -63,6 +63,14 @@ def audit_architecture_config(config: Any) -> dict[str, Any]:
         relational and bool(_config_value(config, "relational_edge_policy_head", True))
     ) or bool(_config_value(config, "edge_policy_head", False))
     value_pool = bool(_config_value(config, "value_attention_pool", False))
+    aux_subgoal_heads = bool(_config_value(config, "aux_subgoal_heads", False))
+    aux_settlement_pointer_head = bool(
+        _config_value(config, "aux_settlement_pointer_head", False)
+    )
+    if aux_settlement_pointer_head and not aux_subgoal_heads:
+        raise InformationSurfaceError(
+            "aux_settlement_pointer_head requires aux_subgoal_heads"
+        )
     target_bound = gather or cross_layers > 0 or edge_head
     topology_consumed = relational or topology_adapter
 
@@ -79,6 +87,12 @@ def audit_architecture_config(config: Any) -> dict[str, Any]:
         )
     if not value_pool:
         limitations.append("value reads only the single CLS state token")
+    if aux_subgoal_heads and not aux_settlement_pointer_head:
+        limitations.append(
+            "next-settlement logits classify an absolute vertex id from "
+            "permutation-invariant CLS even though vertex tokens carry no "
+            "canonical id or coordinate"
+        )
 
     return {
         "state_trunk": trunk,
@@ -89,6 +103,8 @@ def audit_architecture_config(config: Any) -> dict[str, Any]:
         "edge_policy_head": edge_head,
         "action_target_bound": target_bound,
         "value_attention_pool": value_pool,
+        "aux_subgoal_heads": aux_subgoal_heads,
+        "aux_settlement_pointer_head": aux_settlement_pointer_head,
         "limitations": limitations,
     }
 
@@ -291,6 +307,11 @@ def build_report(
         # Conversely, topology-aware state tokens do not give the legacy
         # action head a direct semantic target lookup.
         critical.append("action_target_aliasing")
+    if (
+        architecture["aux_subgoal_heads"]
+        and not architecture["aux_settlement_pointer_head"]
+    ):
+        critical.append("settlement_aux_target_aliasing")
     if corpus is not None and corpus["event_history_trainable"] is False:
         critical.append("public_history_absent")
     elif corpus is not None and corpus["event_history_trainable"] is None:
