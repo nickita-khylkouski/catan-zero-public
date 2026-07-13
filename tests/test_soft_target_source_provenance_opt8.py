@@ -81,6 +81,7 @@ def test_distributed_checkpoint_writer_records_soft_target_source(tmp_path):
     data = _load_raw(path)
     assert data["soft_target_source"] == "policy"
     assert data["mask_hidden_info"] is True
+    assert data["public_award_feature_contract"] == "legacy_zero_v0"
 
 
 def test_all_entity_checkpoint_writers_record_information_surface(tmp_path):

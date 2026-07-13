@@ -17016,6 +17016,13 @@ def _write_entity_checkpoint(
     import torch
 
     from catan_zero.rl.config_serialization import config_to_dict
+    from catan_zero.rl.entity_token_policy import (
+        _validate_public_award_feature_contract,
+    )
+
+    award_contract = _validate_public_award_feature_contract(
+        getattr(policy, "public_award_feature_contract", "legacy_zero_v0")
+    )
 
     output = Path(path)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -17026,6 +17033,7 @@ def _write_entity_checkpoint(
                 "config": config_to_dict(policy.config),
                 "action_mask_version": str(getattr(policy.config, "action_mask_version", "")),
                 "mask_hidden_info": bool(mask_hidden_info),
+                "public_award_feature_contract": award_contract,
                 # OPT-8 provenance (mirrors EntityGraphPolicy.save).
                 "soft_target_source": str(soft_target_source) if soft_target_source is not None else "",
                 "static_action_features_sha256": _array_sha256(

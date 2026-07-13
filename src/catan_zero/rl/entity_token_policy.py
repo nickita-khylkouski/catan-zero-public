@@ -33,6 +33,65 @@ from catan_zero.rl.xdim_lite_policy import (
 
 ENTITY_POLICY_SCHEMA_VERSION = "entity_graph_policy_v1"
 
+# Player-token slot 12 was accidentally constant zero in every historical
+# Python and native corpus through catanatron_rs 0.1.7.  Consequently the
+# corresponding input column in all legacy entity-graph checkpoints is still
+# its random initializer (it received no gradient).  Feeding the authoritative
+# longest-road bit to such a checkpoint changes its function out of
+# distribution.  The contract is checkpoint-owned: old/missing metadata keeps
+# the historical zero input, while a model trained on corrected features may
+# explicitly attest authoritative_v1.
+PUBLIC_AWARD_FEATURE_CONTRACT_LEGACY_ZERO = "legacy_zero_v0"
+PUBLIC_AWARD_FEATURE_CONTRACT_AUTHORITATIVE = "authoritative_v1"
+PUBLIC_AWARD_FEATURE_CONTRACTS = frozenset(
+    {
+        PUBLIC_AWARD_FEATURE_CONTRACT_LEGACY_ZERO,
+        PUBLIC_AWARD_FEATURE_CONTRACT_AUTHORITATIVE,
+    }
+)
+PLAYER_LONGEST_ROAD_SLOT = 12
+
+
+def _validate_public_award_feature_contract(contract: object) -> str:
+    resolved = str(contract or "")
+    if resolved not in PUBLIC_AWARD_FEATURE_CONTRACTS:
+        raise ValueError(
+            "unsupported public_award_feature_contract "
+            f"{resolved!r}; expected one of {sorted(PUBLIC_AWARD_FEATURE_CONTRACTS)}"
+        )
+    return resolved
+
+
+def _apply_public_award_feature_contract(
+    entity_batch: dict[str, np.ndarray], contract: str
+) -> dict[str, np.ndarray]:
+    """Return a function-compatible batch for the checkpoint's award contract.
+
+    The legacy bridge deliberately changes only player-token slot 12 and never
+    mutates the caller's batch.  Largest-army (slot 11), road length (slot 14),
+    hidden-information masks, and every other entity tensor remain untouched.
+    """
+
+    resolved = _validate_public_award_feature_contract(contract)
+    if resolved == PUBLIC_AWARD_FEATURE_CONTRACT_AUTHORITATIVE:
+        return entity_batch
+    if "player_tokens" not in entity_batch:
+        return entity_batch
+    player_tokens = np.asarray(entity_batch["player_tokens"])
+    if player_tokens.ndim != 3 or player_tokens.shape[-1] <= PLAYER_LONGEST_ROAD_SLOT:
+        raise ValueError(
+            "player_tokens must be a batched (B, P, F) tensor with longest-road "
+            f"slot {PLAYER_LONGEST_ROAD_SLOT}; got {player_tokens.shape}"
+        )
+    # Avoid an allocation for the overwhelmingly common legacy-corpus case.
+    if not np.any(player_tokens[..., PLAYER_LONGEST_ROAD_SLOT]):
+        return entity_batch
+    bridged = dict(entity_batch)
+    bridged_players = np.array(player_tokens, copy=True)
+    bridged_players[..., PLAYER_LONGEST_ROAD_SLOT] = 0
+    bridged["player_tokens"] = bridged_players
+    return bridged
+
 # Fixed board sizes on the standard Catan map: 54 intersections (settlement/city
 # nodes, catanatron node_id 0-53) and 19 hexes (robber targets, hex id 0-18).
 # These match the per-type target-id space in EntityGraphNet._gather_target_tokens
@@ -1233,6 +1292,13 @@ class EntityGraphPolicy:
         # checkpoint's own recorded metadata; freshly constructed policies
         # (train_bc.py's own training loop, before its first save) default False.
         self.trained_with_masked_hidden_info: bool = False
+        # Fail closed for new/legacy callers until a corrected-feature training
+        # transaction explicitly attests authoritative_v1.  In particular, an
+        # old checkpoint loaded and re-saved must not silently opt into a random
+        # player_encoder input column merely because the runtime wheel is newer.
+        self.public_award_feature_contract = (
+            PUBLIC_AWARD_FEATURE_CONTRACT_LEGACY_ZERO
+        )
         self.action_size = int(config.action_size)
         self.context_action_feature_size = int(config.context_action_feature_size)
         self.device = _resolve_device(device)
@@ -1319,6 +1385,9 @@ class EntityGraphPolicy:
     ):
         import torch
 
+        entity_batch = _apply_public_award_feature_contract(
+            entity_batch, self.public_award_feature_contract
+        )
         _assert_entity_batch_shapes(
             entity_batch,
             legal_action_ids,
@@ -1521,6 +1590,10 @@ class EntityGraphPolicy:
         output.parent.mkdir(parents=True, exist_ok=True)
         from catan_zero.rl.config_serialization import config_to_dict
 
+        award_contract = _validate_public_award_feature_contract(
+            self.public_award_feature_contract
+        )
+
         payload = {
                 "policy_type": self.policy_type,
                 # Durable name-keyed form (task #74): never pickle the frozen+slots
@@ -1536,6 +1609,7 @@ class EntityGraphPolicy:
                 # untrained-with-masking, the safe default -- see
                 # EntityGraphRustEvaluator.__init__'s public_observation guard).
                 "mask_hidden_info": bool(mask_hidden_info),
+                "public_award_feature_contract": award_contract,
                 # OPT-8 provenance: which soft policy target this run trained
                 # against ("policy" = Gumbel visit counts; "prefer_scores" was the
                 # degenerate-target footgun). Empty string on checkpoints predating
@@ -1653,6 +1727,20 @@ class EntityGraphPolicy:
         # for it, so an old/legacy checkpoint correctly fails closed rather than
         # silently running mismatched.
         policy.trained_with_masked_hidden_info = bool(data.get("mask_hidden_info", False))
+        award_contract = str(
+            data.get(
+                "public_award_feature_contract",
+                PUBLIC_AWARD_FEATURE_CONTRACT_LEGACY_ZERO,
+            )
+            or ""
+        )
+        try:
+            award_contract = _validate_public_award_feature_contract(
+                award_contract
+            )
+        except ValueError as error:
+            raise ValueError(f"{checkpoint} has {error}") from error
+        policy.public_award_feature_contract = award_contract
         value_training = data.get("value_training")
         policy.value_training = (
             dict(value_training) if isinstance(value_training, dict) else None
