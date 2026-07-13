@@ -177,13 +177,23 @@ fn temperature_scale_policy(
     if !temperature.is_finite() || temperature <= 0.0 {
         return Err("policy sampling temperature must be finite and > 0".into());
     }
-    if temperature == 1.0 || policy.is_empty() {
+    let mut positive_mass = 0.0;
+    for &(_, probability) in policy {
+        if !probability.is_finite() || probability < 0.0 {
+            return Err("policy sampling probabilities must be finite and non-negative".into());
+        }
+        positive_mass += probability;
+    }
+    if !positive_mass.is_finite() || positive_mass <= 0.0 {
+        return Err("policy sampling distribution has no positive finite mass".into());
+    }
+    if temperature == 1.0 {
         return Ok(policy.to_vec());
     }
     let mut log_weights = Vec::with_capacity(policy.len());
     let mut max_log_weight = f64::NEG_INFINITY;
     for &(action, probability) in policy {
-        let log_weight = if probability.is_finite() && probability > 0.0 {
+        let log_weight = if probability > 0.0 {
             probability.ln() / temperature
         } else {
             f64::NEG_INFINITY
@@ -1583,6 +1593,15 @@ mod tests {
 
         assert!(temperature_scale_policy(&policy, 0.0).is_err());
         assert!(temperature_scale_policy(&policy, f64::NAN).is_err());
+
+        for temperature in [0.5, 1.0, 2.0] {
+            for invalid in [-0.1, f64::NAN, f64::INFINITY] {
+                let invalid_policy = vec![(3, 0.8), (7, invalid)];
+                assert!(temperature_scale_policy(&invalid_policy, temperature).is_err());
+            }
+            let zero_mass = vec![(3, 0.0), (7, 0.0)];
+            assert!(temperature_scale_policy(&zero_mass, temperature).is_err());
+        }
     }
 
     #[test]
