@@ -45,6 +45,7 @@ def _report() -> dict:
         "vp_margin_weight": 0.4,
         "vps_to_win": 10,
         "mask_hidden_info": True,
+        "effective_float32_matmul_precision": "highest",
         "batch_size": 512,
         "soft_target_temperature": 0.7,
         "soft_target_weight": 0.9,
@@ -63,13 +64,19 @@ def _report() -> dict:
         "amp": "bf16",
         "truncated_vp_margin_value_weight": 0.25,
         "policy_kl_anchor_weight": 0.0,
+        "policy_kl_anchor_direction": "forward",
         "value_uncertainty_loss_weight": 0.0,
         "aux_subgoal_loss_weight": 0.0,
+        "belief_resource_loss_weight": 0.0,
         "moe_balance_loss_weight": 0.01,
         "value_categorical_loss_weight": 0.0,
         "resolved_categorical_value_loss_weight": 0.0,
         "value_hlgauss_sigma_ratio": 0.75,
         "value_target_lambda": 1.0,
+        "value_root_blend_regime": {
+            "mode": "disabled",
+            "phases": [],
+        },
     }
 
 
@@ -106,6 +113,14 @@ class _FakeTrainBC:
     def build_value_sample_weights(self, data, **kwargs):
         self.calls["value_weights"] = kwargs
         return np.asarray([5, 4, 3, 2, 1], dtype=np.float32)
+
+    def _apply_authenticated_policy_distillation_scope(self, data, weights):
+        self.calls["policy_scope"] = data
+        return weights
+
+    def _apply_authenticated_value_training_scope(self, data, weights):
+        self.calls["value_scope"] = data
+        return weights
 
     def evaluate_bc_batches(self, *args, **kwargs):
         self.calls["evaluate"] = (args, kwargs)
@@ -182,6 +197,10 @@ def test_reconstructs_exact_weights_holdout_and_evaluation_recipe(
     assert args[10:14] == (1.0, 0.25, 0.0, 0.0)
     assert kwargs["truncated_vp_margin_value_weight"] == 0.25
     assert kwargs["moe_balance_loss_weight"] == 0.01
+    assert kwargs["policy_kl_anchor_direction"] == "forward"
+    assert kwargs["belief_resource_loss_weight"] == 0.0
+    assert kwargs["value_root_blend_phases"] == ()
+    assert kwargs["value_root_blend_global_compat"] is False
     assert result["teacher_gap"] == {
         "active_policy_teacher_gap_rows": 2,
         "active_policy_kl_target_model_mean": 0.2,
@@ -289,3 +308,78 @@ def test_modern_report_binds_emitted_holdout_not_input_sentinel(tmp_path, monkey
             validation_manifest_path=other,
             device="cpu",
         )
+
+
+def test_composite_descriptor_uses_authenticated_loader_scopes_and_objective_measure(
+    tmp_path, monkeypatch
+):
+    module = _module()
+    report = _report()
+    report_path = tmp_path / "report.json"
+    checkpoint = tmp_path / "candidate.pt"
+    descriptor = tmp_path / "composite.json"
+    manifest = tmp_path / "validation.json"
+    checkpoint.write_bytes(b"checkpoint")
+    descriptor.write_text("{}\n", encoding="utf-8")
+    report["validation_game_seed_manifest"] = str(manifest)
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    emitted = {
+        "schema_version": "train-validation-game-seeds-v1",
+        "data": str(descriptor),
+        "data_fingerprint": "sha256:data",
+        "validation_fraction": 0.05,
+        "validation_seed": 17,
+        "validation_max_samples": 0,
+        "validation_game_seed_ranges": [],
+        "validation_game_seed_count": 2,
+        "validation_game_seed_set_sha256": "sha256:seeds",
+        "game_seeds": [101, 103],
+    }
+    manifest.write_text(json.dumps(emitted), encoding="utf-8")
+
+    fake = _FakeTrainBC()
+    corpus = {"action_taken": np.arange(5), "game_seed": np.arange(5)}
+    fake._preflight_memmap_composite_descriptor = lambda path: {
+        "schema_version": "memmap_composite_v2",
+        "payload_inventory_sha256": "sha256:inventory",
+    }
+
+    def load(path, *, composite_meta):
+        fake.calls["composite_load"] = (path, composite_meta)
+        return corpus
+
+    fake.load_teacher_data_memmap = load
+    fake._game_seed_set_sha256 = lambda value: (
+        "sha256:seeds"
+        if np.array_equal(value, np.asarray([101, 103], dtype=np.int64))
+        else "sha256:wrong"
+    )
+    fake._canonical_json_sha256 = lambda value: "sha256:manifest-semantic"
+
+    def objective(data, indices, evaluate):
+        raw = evaluate(indices)
+        assert raw["active_policy_teacher_gap_closure"] == 0.6
+        matched = dict(raw)
+        matched["active_policy_teacher_gap_closure"] = 0.7
+        return {"objective_matched": True, "metrics": matched}
+
+    fake.evaluate_composite_validation_measure = objective
+    monkeypatch.setattr(module, "_load_train_bc", lambda: fake)
+    monkeypatch.setattr(module, "_load_policy", lambda *args: SimpleNamespace())
+
+    result = module.run_probe(
+        report_path=report_path,
+        checkpoint_path=checkpoint,
+        data_path=descriptor,
+        validation_manifest_path=manifest,
+        device="cpu",
+    )
+
+    assert fake.calls["composite_load"][0] == descriptor
+    assert fake.calls["policy_scope"] is corpus
+    assert fake.calls["value_scope"] is corpus
+    assert result["raw_row_concat_metrics"][
+        "active_policy_teacher_gap_closure"
+    ] == 0.6
+    assert result["teacher_gap"]["active_policy_teacher_gap_closure"] == 0.7
+    assert result["objective_matched_validation"]["objective_matched"] is True
