@@ -3888,7 +3888,7 @@ def _effective_a1_learner_training_recipe(
     belief_resource_loss_weight = float(
         getattr(args, "belief_resource_loss_weight", 0.0)
     )
-    if belief_resource_loss_weight != 0.0:
+    if belief_resource_loss_weight > 0.0:
         effective["belief_resource_loss_weight"] = belief_resource_loss_weight
     world_size = int(ddp["world_size"])
     effective["world_size"] = world_size
