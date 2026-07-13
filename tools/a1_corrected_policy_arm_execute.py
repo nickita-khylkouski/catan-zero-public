@@ -12,7 +12,7 @@ import re
 import subprocess
 import sys
 import time
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 import numpy as np
 
@@ -559,6 +559,52 @@ def execute(
     )
 
 
+def _systemd_command(
+    verified: Mapping[str, Any],
+    *,
+    unit: str,
+    retain_exit_status: bool = True,
+) -> list[str]:
+    """Build the transient-unit command with durable child-exit evidence.
+
+    ``systemd-run --collect`` removes a completed transient unit.  Querying the
+    now-missing name with ``systemctl show`` returns synthetic defaults such as
+    ``Result=success`` and ``ExecMainStatus=0`` even when torchrun failed.  A
+    retained ``RemainAfterExit`` unit instead has an unambiguous terminal state:
+    successful jobs are loaded/active/exited, while failures are loaded/failed
+    with the real child exit status.  The legacy mode exists only so historical
+    submission receipts can still be replayed from their bound checkout.
+    """
+
+    output_root = Path(verified["output_root"])
+    command = [
+        "sudo",
+        "-n",
+        "systemd-run",
+        f"--unit={unit}",
+        "--uid=ubuntu",
+        "--gid=ubuntu",
+        "--service-type=exec",
+    ]
+    if retain_exit_status:
+        command.append("--property=RemainAfterExit=yes")
+    else:
+        command.append("--collect")
+    command.extend(
+        (
+            "--property=LimitNOFILE=65536",
+            f"--property=WorkingDirectory={verified['repo']}",
+            f"--property=StandardOutput=append:{output_root / 'stdout.log'}",
+            f"--property=StandardError=append:{output_root / 'stderr.log'}",
+            "--setenv=HOME=/home/ubuntu",
+            "--setenv=PYTHONNOUSERSITE=1",
+            "--",
+            *verified["command"],
+        )
+    )
+    return command
+
+
 def _submit_verified(
     verified: dict[str, Any],
     *,
@@ -598,18 +644,7 @@ def _submit_verified(
         "schema_version": status_schema, "event": "authorized",
         "created_at_unix_ns": now, "claim_sha256": claim["claim_sha256"],
     })
-    stdout = output_root / "stdout.log"
-    stderr = output_root / "stderr.log"
-    systemd_command = [
-        "sudo", "-n", "systemd-run", f"--unit={unit}", "--uid=ubuntu", "--gid=ubuntu",
-        "--service-type=exec", "--collect",
-        "--property=LimitNOFILE=65536",
-        f"--property=WorkingDirectory={verified['repo']}",
-        f"--property=StandardOutput=append:{stdout}",
-        f"--property=StandardError=append:{stderr}",
-        "--setenv=HOME=/home/ubuntu", "--setenv=PYTHONNOUSERSITE=1",
-        "--", *verified["command"],
-    ]
+    systemd_command = _systemd_command(verified, unit=unit)
     try:
         result = runner(systemd_command, check=True, text=True, capture_output=True)
     except (OSError, subprocess.CalledProcessError) as error:

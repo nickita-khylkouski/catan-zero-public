@@ -57,6 +57,7 @@ def _verified(tmp_path: Path, *, arm_id: str) -> dict:
         "output_root": root,
         "data_path": data.resolve(),
         "data_ref": completion._compact_ref(data),  # noqa: SLF001
+        "validation_sentinel_path": sentinel.resolve(),
         "treatment_meta": {
             "policy_distillation_component_ids": list(
                 value_axis.EXPECTED_COMPONENT_IDS
@@ -84,9 +85,9 @@ def _write_report(verified: dict) -> None:
         "init_checkpoint": verified["source"]["initialization"]["path"],
         "init_checkpoint_sha256": verified["source"]["initialization"]["sha256"],
         "data": str(verified["data_path"]),
-        "input_validation_game_sentinel_manifest": verified["source"][
-            "validation_sentinel"
-        ]["path"],
+        "input_validation_game_sentinel_manifest": str(
+            verified["validation_sentinel_path"]
+        ),
         "checkout_runtime_binding": {
             "trainer": str(verified["selected_trainer"]),
             "trainer_sha256": completion.value_axis.bridge.corrected._file_sha(  # noqa: SLF001
@@ -174,11 +175,34 @@ def test_completion_receipt_replays_all_artifacts(
     _write_submission(verified)
     monkeypatch.setattr(completion, "verify_manifest", lambda _path: verified)
     payload = completion.build_completion(
-        Path(verified["manifest_ref"]["path"]), created_at_unix_ns=99
+        Path(verified["manifest_ref"]["path"]),
+        unit_state={
+            "LoadState": "loaded",
+            "ActiveState": "active",
+            "SubState": "exited",
+            "Result": "success",
+            "ExecMainStatus": "0",
+            "ExecMainCode": "1",
+        },
+        created_at_unix_ns=99,
     )
     receipt = verified["output_root"] / completion.COMPLETION_NAME
     completion._write_exclusive(receipt, payload)  # noqa: SLF001
     assert completion.verify_completion(receipt) == payload
+
+
+def test_completion_refuses_missing_unit_synthetic_success() -> None:
+    with pytest.raises(completion.CompletionError, match="not complete"):
+        completion._verify_unit_state(  # noqa: SLF001
+            {
+                "LoadState": "not-found",
+                "ActiveState": "inactive",
+                "SubState": "dead",
+                "Result": "success",
+                "ExecMainStatus": "0",
+                "ExecMainCode": "0",
+            }
+        )
 
 
 def test_pure_soft_manifest_can_be_verified_after_outputs_exist(
