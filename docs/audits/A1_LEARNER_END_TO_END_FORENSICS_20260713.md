@@ -301,10 +301,18 @@ the replayed completion receipt digest is
 `sha256:38c91e64d91a073ba393804000c32d6c60e5a8af0fa7a9cb254dc9874d791843`.
 Objective-matched closure moved from the short-D6 parent's `0.086684` to
 `0.090129`; this is a diagnostic, not a strength claim. The required next
-measurement is the same-key exact-parent H2H. A matched topology+gather sibling
-is now scientifically valid as the fourth cell of a 2x2 factorial only because
-both single-addition cells exist independently; it must still initialize from
-short-D6 rather than either trained child.
+measurement was the same-key exact-parent H2H. It scored `125-131` over 256
+games (`48.828%`, `WW=22`, split `81`, `LL=25`) with zero errors and zero
+truncations; both paired and superiority SPRTs remained `continue`. More
+damagingly, matched search cost rose from `0.2067` to `0.3138` seconds per call,
+a `1.518x` latency ratio at essentially the same simulation count. Topology-only
+is therefore rejected: it established neither strength nor an acceptable
+speed/strength trade. A matched topology+gather sibling remains scientifically
+valid as the fourth cell of a 2x2 factorial only because both single-addition
+cells exist independently; it must still initialize from short-D6 rather than
+either trained child. It is the final test of whether action-local binding is
+needed to make relational state useful, not permission to deploy this slow
+one-hop implementation by itself.
 
 ### Value readout
 
