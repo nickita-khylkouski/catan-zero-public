@@ -367,6 +367,7 @@ class Runner:
                       "--init-checkpoint", init_ckpt, "--checkpoint", str(ckpt),
                       "--report", str(report),           # REQUIRED flag (was missing)
                       "--batch-size", str(self.cfg.train_batch_size),  # must match reuse math
+                      "--training-rng-rank-offset",
                       "--mask-hidden-info", "--amp", "bf16",
                       "--max-steps", str(steps)]         # bounded continuous update
         train_cmd += self.cfg.resolve_learner_argv()

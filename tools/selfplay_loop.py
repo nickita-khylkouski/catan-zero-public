@@ -161,6 +161,7 @@ def run_training(gen_dir: Path, data_dir: str, init_checkpoint: str, args: argpa
             "--init-checkpoint", init_checkpoint,
             "--checkpoint", str(ckpt_dir / "checkpoint.pt"),
             "--report", str(ckpt_dir / "report.json"),
+            "--training-rng-rank-offset",
             "--soft-target-source", "policy",
             "--soft-target-weight", "0.9",
             "--value-loss-weight", "1.0",
@@ -293,7 +294,8 @@ def main() -> int:
         record["generation"]["wall_sec"] = round(time.time() - t0, 1)
         if not record["generation"]["ok"]:
             record["decision"] = "abort_generation_failed"
-            state["generations"].append(record); save_state(loop_dir, state)
+            state["generations"].append(record)
+            save_state(loop_dir, state)
             print(f"[gen {gen_index}] GENERATION FAILED — stopping loop for operator attention.", flush=True)
             return 1
 
@@ -305,7 +307,8 @@ def main() -> int:
         record["merge"]["wall_sec"] = round(time.time() - t0, 1)
         if not record["merge"]["ok"]:
             record["decision"] = "abort_merge_failed"
-            state["generations"].append(record); save_state(loop_dir, state)
+            state["generations"].append(record)
+            save_state(loop_dir, state)
             return 1
 
         t0 = time.time()
@@ -313,7 +316,8 @@ def main() -> int:
         record["train"]["wall_sec"] = round(time.time() - t0, 1)
         if not record["train"]["ok"]:
             record["decision"] = "abort_train_failed"
-            state["generations"].append(record); save_state(loop_dir, state)
+            state["generations"].append(record)
+            save_state(loop_dir, state)
             return 1
         candidate = record["train"]["checkpoint"]
 
@@ -328,7 +332,8 @@ def main() -> int:
             if decision == "reject":
                 # Confirmed regression: rollback (champion unchanged), flag for operator.
                 record["decision"] = "rollback_regression"
-                state["generations"].append(record); save_state(loop_dir, state)
+                state["generations"].append(record)
+                save_state(loop_dir, state)
                 print(f"[gen {gen_index}] SAFETY NET TRIPPED — candidate rejected, champion unchanged. "
                       f"Stopping for operator review (config change needed, not another identical run).", flush=True)
                 return 2

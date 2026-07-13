@@ -732,6 +732,7 @@ exec "$PY" -m torch.distributed.run --standalone --nproc_per_node="$NGPU" --tee=
   --checkpoint "$OUT/model.pt" --report "$OUT/report.json" \
   --grow-from-checkpoint "$GROW_FROM" --graph-layers 6 --hidden-size 640 \
   --attention-heads 8 --graph-dropout 0.05 --require-35m-model \
+  --training-rng-rank-offset \
   --mask-hidden-info --soft-target-source policy \
   --skip-teacher-quality-gate --trust-curated-data-quality \
   --amp bf16 --fused-optimizer --lr 3e-5 --lr-warmup-steps 100 \
