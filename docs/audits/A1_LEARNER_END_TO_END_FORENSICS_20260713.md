@@ -579,6 +579,20 @@ Its objective-matched closure was `0.081679`; as above, only matched H2H can
 select it. The independent 256-update sibling starts from the original
 function-preserving initializer rather than chaining from this checkpoint.
 
+The exact-parent behavior ladder is now complete. The original 1,024-update
+composition scored `127-129`; the 128-update child scored exactly `128-128`;
+and the independently initialized 256-update child scored `134-122`
+(`52.34375%`, `WW=26`, split `82`, `LL=20`). All three panels completed 256
+games with zero errors and zero truncations. The 256-update point's superiority
+SPRT remained `continue`, so none of the three doses establishes that gather is
+stronger than the exact short-D6 parent. Gather is therefore rejected as the
+next parent rather than chained into another candidate. The next causal arm
+starts again from the exact short-D6 checkpoint, appends only the
+function-preserving topology residual, freezes every inherited tensor, and
+uses the already selected 524,288-row / 128-update geometry. This distinguishes
+whether the representation alias itself is the bottleneck without conflating
+it with gather or another oversized dose.
+
 The independently initialized short-dose D6 arm's first 128-pair screen was
 `69-59` against the binding v5 incumbent, but the fresh 256-pair confirmation
 was neutral at `127-129`. It is therefore not evidence of a v5 improvement.
