@@ -225,6 +225,11 @@ class HexSymmetry:
             # entries are the BASE board actions in pi_act; later trade/control
             # extensions are non-spatial and remain fixed under D6.
             mapped = np.where(spatial, mapped_spatial, ids)
+            # The opt-in static-action residual indexes the checkpoint catalog
+            # by integer action id. Carry the same remapped identity used by the
+            # scalar token below without reordering legal rows or mutating the
+            # caller's target-aligned id array.
+            out["_symmetry_legal_action_ids"] = mapped.astype(ids.dtype, copy=False)
             action_tokens = np.asarray(entity["legal_action_tokens"]).copy()
             action_tokens[:, :, _LEGAL_ACTION_ID_DIM] = np.where(
                 valid,

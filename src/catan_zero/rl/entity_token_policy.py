@@ -133,6 +133,13 @@ _RELATIONAL_TOPOLOGY_KEYS = frozenset(
     {"hex_vertex_ids", "hex_edge_ids", "edge_vertex_ids", "event_target_ids"}
 )
 
+# The serialized 45-column action table was historically dead in EntityGraphNet.
+# Columns 19:41 are the genuinely missing surface: numeric board arguments,
+# resource-flow identities, and target-player identity. The remaining columns
+# duplicate legal/context tokens, so the repair intentionally excludes them.
+STATIC_ACTION_RESIDUAL_SLICE = slice(19, 41)
+STATIC_ACTION_RESIDUAL_FEATURE_SIZE = 22
+
 
 @dataclass(frozen=True, slots=True)
 class EntityGraphConfig:
@@ -285,6 +292,11 @@ class EntityGraphConfig:
     # pre-mask banked player tokens, but those labels are never model inputs.
     # Appended last for positional pickle compatibility.
     belief_resource_head: bool = False
+    # Function-preserving repair for the historically dead static action table.
+    # A zero-output projection consumes only the nonredundant catalog columns.
+    # Default OFF preserves legacy checkpoint structure and behavior exactly.
+    # Appended last for positional pickle compatibility.
+    static_action_residual: bool = False
 
 
 class EntityGraphNet:
@@ -563,6 +575,27 @@ class EntityGraphNet:
                 )
                 self.action_bias = nn.Linear(action_in, 1)
                 self.logit_scale = nn.Parameter(torch.tensor(math.log(1.0)))
+                self.static_action_residual_enabled = bool(
+                    getattr(cfg, "static_action_residual", False)
+                )
+                if self.static_action_residual_enabled:
+                    if int(cfg.static_action_feature_size) < int(
+                        STATIC_ACTION_RESIDUAL_SLICE.stop
+                    ):
+                        raise ValueError(
+                            "static_action_residual requires at least "
+                            f"{STATIC_ACTION_RESIDUAL_SLICE.stop} static-action "
+                            f"columns, got {cfg.static_action_feature_size}"
+                        )
+                    # Do not normalize this sparse catalog vector. For several
+                    # high-value board actions, absolute node/edge identity is
+                    # carried by the magnitude of a single numeric argument;
+                    # LayerNorm would make those vectors almost collinear.
+                    self.static_action_residual_proj = nn.Linear(
+                        STATIC_ACTION_RESIDUAL_FEATURE_SIZE, h
+                    )
+                    nn.init.zeros_(self.static_action_residual_proj.weight)
+                    nn.init.zeros_(self.static_action_residual_proj.bias)
                 self.value_head = nn.Sequential(
                     nn.Linear(h, h),
                     nn.GELU(),
@@ -960,6 +993,26 @@ class EntityGraphNet:
                     dim=-1,
                 )
                 encoded_actions = self.action_encoder(action_features)
+                if self.static_action_residual_enabled:
+                    static_features = batch.get("legal_action_static_features")
+                    if static_features is None:
+                        raise ValueError(
+                            "static_action_residual requires "
+                            "legal_action_static_features"
+                        )
+                    if (
+                        static_features.ndim != 3
+                        or static_features.shape[:2] != encoded_actions.shape[:2]
+                        or int(static_features.shape[2])
+                        != STATIC_ACTION_RESIDUAL_FEATURE_SIZE
+                    ):
+                        raise ValueError(
+                            "legal_action_static_features shape must be [B,A,22], "
+                            f"got {tuple(static_features.shape)}"
+                        )
+                    encoded_actions = encoded_actions + self.static_action_residual_proj(
+                        static_features.float()
+                    )
                 # Post-trunk target-entity tokens per action, mean-pooled ([B,A,h]).
                 # Shared by action_target_gather (modulates the CLIP embedding) and
                 # the CAT-97 edge_policy_head (emits a direct logit); computed once.
@@ -1387,6 +1440,25 @@ class EntityGraphPolicy:
             dtype=torch.float32,
             device=self.device,
         )
+        if bool(getattr(config, "static_action_residual", False)):
+            if self.static_action_features.ndim != 2:
+                raise ValueError(
+                    "static_action_residual requires a rank-2 action catalog, "
+                    f"got {tuple(self.static_action_features.shape)}"
+                )
+            if int(self.static_action_features.shape[0]) < self.action_size:
+                raise ValueError(
+                    "static action catalog has fewer rows than action_size: "
+                    f"{self.static_action_features.shape[0]} < {self.action_size}"
+                )
+            if int(self.static_action_features.shape[1]) < int(
+                STATIC_ACTION_RESIDUAL_SLICE.stop
+            ):
+                raise ValueError(
+                    "static_action_residual requires at least "
+                    f"{STATIC_ACTION_RESIDUAL_SLICE.stop} catalog columns, got "
+                    f"{self.static_action_features.shape[1]}"
+                )
         self.model = EntityGraphNet(config).to(self.device)
 
     @classmethod
@@ -1418,6 +1490,7 @@ class EntityGraphPolicy:
         relational_edge_policy_head: bool = True,
         topology_residual_adapter: bool = False,
         belief_resource_head: bool = False,
+        static_action_residual: bool = False,
         entity_feature_adapter_version: str = CURRENT_RUST_ENTITY_ADAPTER_VERSION,
     ) -> EntityGraphPolicy:
         env = ColonistMultiAgentEnv(env_config or ColonistMultiAgentConfig())
@@ -1450,6 +1523,7 @@ class EntityGraphPolicy:
                 relational_edge_policy_head=bool(relational_edge_policy_head),
                 topology_residual_adapter=bool(topology_residual_adapter),
                 belief_resource_head=bool(belief_resource_head),
+                static_action_residual=bool(static_action_residual),
             )
             return cls(
                 config,
@@ -1503,7 +1577,10 @@ class EntityGraphPolicy:
             key: torch.as_tensor(value, device=self.device)
             for key, value in entity_batch.items()
             if (
-                key not in _NON_MODEL_ENTITY_KEYS
+                (
+                    key not in _NON_MODEL_ENTITY_KEYS
+                    and key != "_symmetry_legal_action_ids"
+                )
                 or (needs_topology and key in _RELATIONAL_TOPOLOGY_KEYS)
             )
             and (key != "legal_action_target_ids" or needs_action_targets)
@@ -1516,6 +1593,50 @@ class EntityGraphPolicy:
         action_ids = torch.as_tensor(
             legal_action_ids, dtype=torch.long, device=self.device
         )
+        valid = action_ids >= 0
+        if bool(getattr(self.config, "static_action_residual", False)):
+            catalog_rows = int(self.static_action_features.shape[0])
+            symmetry_catalog_ids = entity_batch.get("_symmetry_legal_action_ids")
+            if symmetry_catalog_ids is None:
+                # Production no-symmetry fast path: reuse the already-resident
+                # ids and validity mask. Do not issue a second NumPy->CUDA copy.
+                legal_ids_np = np.asarray(legal_action_ids)
+                if bool(np.any(legal_ids_np[legal_ids_np >= 0] >= catalog_rows)):
+                    raise ValueError("static action catalog id is outside catalog rows")
+                catalog_ids = torch.where(valid, action_ids, 0)
+                catalog_valid = valid
+            else:
+                # D6 changes catalog identity without changing candidate-row
+                # order. Only this path needs a distinct mapped-id transfer.
+                catalog_ids_np = np.asarray(symmetry_catalog_ids, dtype=np.int64)
+                legal_shape = np.asarray(legal_action_ids).shape
+                if catalog_ids_np.shape != legal_shape:
+                    raise ValueError(
+                        "symmetry/static catalog ids must match legal_action_ids: "
+                        f"{catalog_ids_np.shape} != {legal_shape}"
+                    )
+                catalog_valid_np = catalog_ids_np >= 0
+                if bool(
+                    np.any(catalog_ids_np[catalog_valid_np] >= catalog_rows)
+                ):
+                    raise ValueError("static action catalog id is outside catalog rows")
+                catalog_ids = torch.as_tensor(
+                    np.where(catalog_valid_np, catalog_ids_np, 0),
+                    dtype=torch.long,
+                    device=self.device,
+                )
+                catalog_valid = torch.as_tensor(
+                    catalog_valid_np, dtype=torch.bool, device=self.device
+                )
+            static_features = self.static_action_features.index_select(
+                0, catalog_ids.reshape(-1)
+            ).reshape(*catalog_ids.shape, -1)
+            static_features = static_features[..., STATIC_ACTION_RESIDUAL_SLICE]
+            static_features = static_features.masked_fill(
+                ~catalog_valid.unsqueeze(-1),
+                0.0,
+            )
+            batch["legal_action_static_features"] = static_features
         model_kwargs = {
             "return_q": return_q,
             "return_final_vp": return_final_vp,
@@ -1525,7 +1646,6 @@ class EntityGraphPolicy:
                 value_trunk_grad_scale
             )
         outputs = self.model(batch, **model_kwargs)
-        valid = action_ids >= 0
         outputs["logits"] = outputs["logits"].masked_fill(~valid, -1.0e9)
         return outputs
 
@@ -1978,6 +2098,7 @@ class EntityGraphPolicy:
             "aux_next_settlement_head.",
             "aux_robber_target_head.",
             "belief_resource_head.",
+            "static_action_residual_proj.",
         )
         disallowed_missing = [
             key for key in missing if not key.startswith(allowed_missing_prefixes)
