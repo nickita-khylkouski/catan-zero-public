@@ -990,6 +990,32 @@ def test_only_exact_allowlisted_markerless_v2_lock_replays(
 ) -> None:
     _issued_path, lock = _lock(tmp_path)
     lock.pop("promotion_handoff")
+    for key in (
+        "gameplay_policy_aggregation",
+        "information_set_target_aggregation",
+        "rescale_noise_floor_initial_road_only",
+        "sigma_reference_visits",
+    ):
+        lock["science"]["effective_search_config"].pop(key)
+    lock["science"]["effective_search_config_sha256"] = contract._digest_value(  # noqa: SLF001
+        lock["science"]["effective_search_config"]
+    )
+    recipe = lock["science"]["learner_training_recipe"]
+    recipe.pop("trunk_lr_mult")
+    recipe["loser_sample_weight"] = 0.3
+    lock["science"]["learner_training_recipe_sha256"] = contract._digest_value(  # noqa: SLF001
+        recipe
+    )
+    lock["generation"].pop("native_mcts_hot_loop")
+    guard_path = Path(lock["provenance"]["guard_config"]["path"])
+    guard_payload = json.loads(guard_path.read_text())
+    guard_args = guard_payload["guards"][0]["args"]
+    guard_args["critical_flags"].remove("--native-mcts-hot-loop")
+    guard_args["expected_values"].pop("--native-mcts-hot-loop")
+    guard_path.write_text(json.dumps(guard_payload, indent=2, sort_keys=True) + "\n")
+    lock["provenance"]["guard_config"]["sha256"] = contract._sha256(  # noqa: SLF001
+        guard_path
+    )
     for section in ("generator_code", "learner_code", "runtime_code_tree"):
         lock["provenance"][section][0]["path"] = str(
             tmp_path / f"retired-{section}.py"
@@ -1016,6 +1042,14 @@ def test_only_exact_allowlisted_markerless_v2_lock_replays(
         },
     )
 
+    with pytest.raises(contract.ContractError, match="missing critical flags"):
+        contract._validate_guard_payload(  # noqa: SLF001
+            guard_payload,
+            path=guard_path,
+            search=lock["science"]["search_operator"],
+            evaluator=lock["science"]["evaluator"],
+            generation=lock["generation"],
+        )
     assert contract.verify_lock(markerless)["contract_sha256"] == lock[
         "contract_sha256"
     ]
@@ -1163,6 +1197,17 @@ def test_learner_training_recipe_rejects_missing_or_extra_fields() -> None:
     extra = {**contract.EXPECTED_LEARNER_TRAINING_RECIPE, "unsealed_knob": 1}
     with pytest.raises(contract.ContractError, match="fields mismatch"):
         contract._validate_learner_training_recipe(extra)
+
+
+def test_current_learner_recipe_still_requires_explicit_trunk_lr_multiplier() -> None:
+    current = dict(contract.CURRENT_LEARNER_TRAINING_RECIPE)
+    current.pop("trunk_lr_mult")
+
+    with pytest.raises(contract.ContractError, match="fields mismatch"):
+        contract._validate_learner_training_recipe(
+            current,
+            expected_recipe=contract.CURRENT_LEARNER_TRAINING_RECIPE,
+        )
 
 
 def test_seal_rejects_seed_ledger_collision(tmp_path: Path) -> None:

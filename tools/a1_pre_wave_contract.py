@@ -199,6 +199,62 @@ EXPECTED_LEARNER_TRAINING_RECIPE: dict[str, Any] = {
     "value_phase_weights": "",
     "ddp_shard_data": False,
 }
+# The sole issued markerless v2 lock predates ``trunk_lr_mult`` and used the
+# earlier loser-row weight. Its raw lock hash authenticates this exact recipe;
+# no newly sealed v2/v3 lock may inherit these archival values.
+HISTORICAL_MARKERLESS_LEARNER_TRAINING_RECIPE: dict[str, Any] = {
+    "track": "2p_no_trade",
+    "vps_to_win": 10,
+    "graph_history_features": True,
+    "seed": 1,
+    "epochs": 1,
+    "max_steps": 0,
+    "batch_size": 4096,
+    "grad_accum_steps": 1,
+    "world_size": 1,
+    "global_batch_size": 4096,
+    "optimizer": "adam",
+    "resume_optimizer": False,
+    "lr": 3e-5,
+    "lr_warmup_steps": 100,
+    "lr_schedule": "flat",
+    "weight_decay": 0.0,
+    "fused_optimizer": False,
+    "value_lr_mult": 0.3,
+    "action_module_lr_mult": 1.0,
+    "policy_loss_weight": 1.0,
+    "soft_target_source": "policy",
+    "soft_target_weight": 0.9,
+    "soft_target_temperature": 0.7,
+    "soft_target_min_legal_coverage": 0.5,
+    "value_loss_weight": 0.25,
+    "value_target_lambda": 1.0,
+    "value_categorical_loss_weight": 0.0,
+    "hlgauss_scalar_aux_loss_weight": 0.0,
+    "final_vp_loss_weight": 0.0,
+    "q_loss_weight": 0.0,
+    "policy_kl_anchor_weight": 0.0,
+    "value_uncertainty_loss_weight": 0.0,
+    "aux_subgoal_loss_weight": 0.0,
+    "train_value_only": False,
+    "freeze_modules": "",
+    "policy_surprise_weight": 0.0,
+    "advantage_policy_weighting": "none",
+    "per_game_value_weight": False,
+    "vp_margin_weight": 0.0,
+    "truncated_vp_margin_value_weight": 0.25,
+    "amp": "bf16",
+    "mask_hidden_info": True,
+    "symmetry_augment": False,
+    "forced_action_weight": 0.1,
+    "forced_row_value_weight": 1.0,
+    "winner_sample_weight": 1.0,
+    "loser_sample_weight": 0.3,
+    "teacher_weights": "",
+    "phase_weights": "",
+    "value_phase_weights": "",
+    "ddp_shard_data": False,
+}
 # Current post-promotion v3 learner semantics. Keep the historical constant
 # above untouched so issued v2 locks reconstruct exactly.
 CURRENT_LEARNER_TRAINING_RECIPE: dict[str, Any] = {
@@ -412,6 +468,36 @@ _SEARCH_INPUT_KEYS = {
     "rescale_noise_floor_c",
     "sigma_eval",
 }
+# Frozen explicit-operator shape in the sole issued markerless v2 lock. Keep
+# this independent of the expanding current dataclass/input schema.
+HISTORICAL_MARKERLESS_SEARCH_INPUT_KEYS = frozenset(
+    {
+        "max_depth",
+        "c_visit",
+        "c_scale",
+        "prior_temperature",
+        "n_full",
+        "n_fast",
+        "p_full",
+        "n_full_wide",
+        "n_full_wide_threshold",
+        "wide_roots_always_full",
+        "raw_policy_above_width",
+        "symmetry_averaged_eval",
+        "symmetry_averaged_eval_threshold",
+        "wide_candidates_threshold",
+        "correct_rust_chance_spectra",
+        "lazy_interior_chance",
+        "exact_budget_sh",
+        "exact_budget_sh_min_n",
+        "belief_chance_spectra",
+        "information_set_search",
+        "determinization_particles",
+        "determinization_min_simulations",
+        "rescale_noise_floor_c",
+        "sigma_eval",
+    }
+)
 _EVALUATOR_INPUT_KEYS = {
     "value_scale",
     "prior_temperature",
@@ -1200,8 +1286,12 @@ def _checkpoint_metadata(
     return record
 
 
-def _effective_search(raw: dict[str, Any]) -> dict[str, Any]:
-    _require_exact_keys(raw, _SEARCH_INPUT_KEYS, where="science.search")
+def _validate_search_operator_fields(
+    raw: dict[str, Any], *, expected_keys: set[str] | frozenset[str] = _SEARCH_INPUT_KEYS
+) -> None:
+    """Validate explicit operator fields without expanding runtime defaults."""
+
+    _require_exact_keys(raw, set(expected_keys), where="science.search")
     bool_keys = {
         "wide_roots_always_full",
         "symmetry_averaged_eval",
@@ -1246,6 +1336,10 @@ def _effective_search(raw: dict[str, Any]) -> dict[str, Any]:
     for key in numeric_keys:
         if isinstance(raw[key], bool) or not isinstance(raw[key], (int, float)):
             raise ContractError(f"science.search.{key} must be numeric")
+
+
+def _effective_search(raw: dict[str, Any]) -> dict[str, Any]:
+    _validate_search_operator_fields(raw)
     config = GumbelChanceMCTSConfig(colors=("RED", "BLUE"), seed=0, **raw)
     effective = dataclasses.asdict(config)
     effective.pop("seed")
@@ -1419,6 +1513,7 @@ def _validate_guard(
     evaluator: dict[str, Any],
     generation: dict[str, Any],
     s1_evidence: dict[str, Any] | None = None,
+    archived_markerless: bool = False,
 ) -> None:
     _validate_guard_payload(
         _load_json(path),
@@ -1427,6 +1522,7 @@ def _validate_guard(
         evaluator=evaluator,
         generation=generation,
         s1_evidence=s1_evidence,
+        archived_markerless=archived_markerless,
     )
 
 
@@ -1438,12 +1534,14 @@ def _validate_guard_payload(
     evaluator: dict[str, Any],
     generation: dict[str, Any],
     s1_evidence: dict[str, Any] | None = None,
+    archived_markerless: bool = False,
 ) -> None:
     """Validate prospective or on-disk guard bytes with identical semantics."""
 
     args = _guard_cli_flag_lint(payload, path=path)
     expected = dict(args.get("expected_values", {}))
     critical = set(args.get("critical_flags", []))
+    native_flag = "--native-mcts-hot-loop"
     required_critical = {
         "--c-scale",
         "--c-visit",
@@ -1457,10 +1555,21 @@ def _validate_guard_payload(
         "--symmetry-averaged-eval-threshold",
         "--belief-chance-spectra",
         "--information-set-search",
-        "--native-mcts-hot-loop",
         "--determinization-particles",
         "--determinization-min-simulations",
     }
+    if archived_markerless:
+        if (
+            "native_mcts_hot_loop" in generation
+            or native_flag in critical
+            or native_flag in expected
+        ):
+            raise ContractError(
+                "archived markerless guard must preserve the omitted native-MCTS "
+                "flag and its legacy false runtime default"
+            )
+    else:
+        required_critical.add(native_flag)
     if not required_critical.issubset(critical):
         raise ContractError(
             f"guard {path} is missing critical flags {sorted(required_critical - critical)}"
@@ -1481,12 +1590,13 @@ def _validate_guard_payload(
         ],
         "--belief-chance-spectra": search["belief_chance_spectra"],
         "--information-set-search": search["information_set_search"],
-        "--native-mcts-hot-loop": generation["native_mcts_hot_loop"],
         "--determinization-particles": search["determinization_particles"],
         "--determinization-min-simulations": search[
             "determinization_min_simulations"
         ],
     }
+    if not archived_markerless:
+        comparisons[native_flag] = generation["native_mcts_hot_loop"]
     for flag, contract_value in comparisons.items():
         if flag not in expected or expected[flag] != contract_value:
             raise ContractError(
@@ -4952,11 +5062,20 @@ def verify_lock(
         != lock["science"]["effective_search_config_sha256"]
     ):
         raise ContractError("effective search-config digest mismatch")
-    reconstructed_effective = _effective_search(search)
-    if _digest_value(reconstructed_effective) != _digest_value(effective_search):
-        raise ContractError(
-            "effective search config does not reconstruct from selected operator"
+    if historical_markerless:
+        # The sealed effective config predates several dataclass defaults and
+        # serialized colors as a list. Validate every explicit operator field
+        # above, but never reinterpret its authenticated historical effective
+        # bytes through today's expanding runtime dataclass.
+        _validate_search_operator_fields(
+            search, expected_keys=HISTORICAL_MARKERLESS_SEARCH_INPUT_KEYS
         )
+    else:
+        reconstructed_effective = _effective_search(search)
+        if _digest_value(reconstructed_effective) != _digest_value(effective_search):
+            raise ContractError(
+                "effective search config does not reconstruct from selected operator"
+            )
     if _digest_value(evaluator) != lock["science"]["evaluator_sha256"]:
         raise ContractError("evaluator digest mismatch")
     if evaluator["value_readout"] != lock["science"]["value_readout"]:
@@ -4975,9 +5094,13 @@ def verify_lock(
     _validate_learner_training_recipe(
         learner_training_recipe,
         expected_recipe=(
-            EXPECTED_LEARNER_TRAINING_RECIPE
-            if lock_schema == LEGACY_LOCK_SCHEMA
-            else CURRENT_LEARNER_TRAINING_RECIPE
+            HISTORICAL_MARKERLESS_LEARNER_TRAINING_RECIPE
+            if historical_markerless
+            else (
+                EXPECTED_LEARNER_TRAINING_RECIPE
+                if lock_schema == LEGACY_LOCK_SCHEMA
+                else CURRENT_LEARNER_TRAINING_RECIPE
+            )
         ),
     )
     if (
@@ -5070,6 +5193,7 @@ def verify_lock(
         s1_evidence=next(
             record for record in lock["science"]["evidence"] if record["kind"] == "s1"
         ),
+        archived_markerless=historical_markerless,
     )
     _validate_post_wave(dict(lock["post_wave_acceptance"]))
     if not historical_markerless:
