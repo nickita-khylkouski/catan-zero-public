@@ -2047,6 +2047,43 @@ def test_raw_game_seed_runs_allow_adjacent_split_but_reject_reappearance() -> No
         )
 
 
+def test_raw_game_decisions_reject_adjacent_duplicate_reset() -> None:
+    with pytest.raises(contract.ContractError, match="adjacent duplicate game"):
+        contract._advance_game_decision_run(
+            np.asarray([17, 17, 17, 17], dtype=np.int64),
+            np.asarray([0, 1, 0, 1], dtype=np.int32),
+            active_seed=None,
+            active_decision_index=None,
+            where="shard-0",
+        )
+
+
+def test_raw_game_decisions_track_monotonic_cross_shard_continuation() -> None:
+    last_decision = contract._advance_game_decision_run(
+        np.asarray([17, 17], dtype=np.int64),
+        np.asarray([0, 3], dtype=np.int32),
+        active_seed=None,
+        active_decision_index=None,
+        where="shard-0",
+    )
+    last_decision = contract._advance_game_decision_run(
+        np.asarray([17, 17], dtype=np.int64),
+        np.asarray([5, 8], dtype=np.int32),
+        active_seed=17,
+        active_decision_index=last_decision,
+        where="shard-1",
+    )
+    assert last_decision == 8
+    with pytest.raises(contract.ContractError, match="shard boundary"):
+        contract._advance_game_decision_run(
+            np.asarray([17], dtype=np.int64),
+            np.asarray([0], dtype=np.int32),
+            active_seed=17,
+            active_decision_index=last_decision,
+            where="shard-2",
+        )
+
+
 def _valid_selected_telemetry() -> dict[str, np.ndarray]:
     return {
         "is_forced": np.asarray([False, True, False]),

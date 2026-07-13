@@ -1170,8 +1170,12 @@ def _classify(name: str, array: np.ndarray) -> dict:
 class _GameSeedRunTracker:
     """Tracks maximal contiguous runs of equal ``game_seed`` values across the
     whole corpus (all shards, in order), flagging a value as duplicated the
-    moment a genuinely NEW, non-contiguous run starts with a value that has
-    already started a run before.
+    moment a genuinely NEW run starts with a value that has already started a
+    run before.  A new run is identified either by an intervening seed or, for
+    current shards, by ``decision_index`` failing to increase while the seed
+    stays equal.  The latter matters for two copies of a game stored directly
+    back-to-back: seed-only run-length encoding otherwise merges them and
+    silently doubles that trajectory's training weight.
 
     ``game_seed`` is one value per GAME, repeated across every decision row of
     that game -- not a per-row identity. Seeds are globally disjoint by
@@ -1205,6 +1209,7 @@ class _GameSeedRunTracker:
         self._seen: set[int] = set()
         self._duplicates: set[int] = set()
         self._current: int | None = None
+        self._current_decision: int | None = None
 
     def _start_run(self, value: int) -> None:
         if value in self._seen:
@@ -1212,11 +1217,44 @@ class _GameSeedRunTracker:
         else:
             self._seen.add(value)
         self._current = value
+        self._current_decision = None
 
-    def observe_shard(self, seed_column: np.ndarray) -> None:
-        seed_col = np.asarray(seed_column).reshape(-1)
+    def observe_shard(
+        self,
+        seed_column: np.ndarray,
+        decision_index_column: np.ndarray | None = None,
+    ) -> None:
+        seed_col = np.asarray(seed_column, dtype=np.int64).reshape(-1)
         if not seed_col.size:
             return
+        decisions: np.ndarray | None = None
+        if decision_index_column is not None:
+            decisions = np.asarray(decision_index_column, dtype=np.int64).reshape(-1)
+            if decisions.shape != seed_col.shape:
+                raise SystemExit(
+                    "decision_index must be row-aligned with game_seed for duplicate "
+                    f"detection: {decisions.shape} != {seed_col.shape}"
+                )
+
+            # Detect a duplicated game pasted immediately after itself.  A
+            # legitimate game has at most one recorded row per decision and
+            # decision_index therefore increases strictly, even when only one
+            # player's rows are retained.  Negative indices are legacy/unknown
+            # provenance and deliberately do not participate in this stronger
+            # check.
+            if (
+                self._current == int(seed_col[0])
+                and self._current_decision is not None
+                and int(decisions[0]) >= 0
+                and int(decisions[0]) <= self._current_decision
+            ):
+                self._duplicates.add(int(seed_col[0]))
+            if seed_col.size > 1:
+                same_seed = seed_col[1:] == seed_col[:-1]
+                known = (decisions[1:] >= 0) & (decisions[:-1] >= 0)
+                reset = same_seed & known & (decisions[1:] <= decisions[:-1])
+                self._duplicates.update(map(int, seed_col[1:][reset].tolist()))
+
         run_starts = np.concatenate(([0], np.flatnonzero(np.diff(seed_col) != 0) + 1))
         run_values = seed_col[run_starts]
         for value in run_values:
@@ -1224,6 +1262,9 @@ class _GameSeedRunTracker:
             if value == self._current:
                 continue  # merges into the still-open run (shard boundary or not)
             self._start_run(value)
+        if decisions is not None:
+            final_decision = int(decisions[-1])
+            self._current_decision = final_decision if final_decision >= 0 else None
 
     @property
     def duplicate_count(self) -> int:
@@ -1248,16 +1289,47 @@ class _SelectedGameSeedRunTracker:
         self._seen: set[int] = set()
         self._duplicates: set[int] = set()
         self._current: int | None = None
+        self._current_decision: int | None = None
 
-    def observe_shard(self, seed_column: np.ndarray) -> None:
+    def observe_shard(
+        self,
+        seed_column: np.ndarray,
+        decision_index_column: np.ndarray | None = None,
+    ) -> None:
         seed_col = np.asarray(seed_column, dtype=np.int64).reshape(-1)
         if not seed_col.size:
             return
+        decisions: np.ndarray | None = None
+        if decision_index_column is not None:
+            decisions = np.asarray(decision_index_column, dtype=np.int64).reshape(-1)
+            if decisions.shape != seed_col.shape:
+                raise SystemExit(
+                    "decision_index must be row-aligned with game_seed for selected "
+                    f"duplicate detection: {decisions.shape} != {seed_col.shape}"
+                )
+            if (
+                self._current == int(seed_col[0])
+                and int(seed_col[0]) in self._selected
+                and self._current_decision is not None
+                and int(decisions[0]) >= 0
+                and int(decisions[0]) <= self._current_decision
+            ):
+                self._duplicates.add(int(seed_col[0]))
+            if seed_col.size > 1:
+                same_seed = seed_col[1:] == seed_col[:-1]
+                known = (decisions[1:] >= 0) & (decisions[:-1] >= 0)
+                reset = same_seed & known & (decisions[1:] <= decisions[:-1])
+                self._duplicates.update(
+                    int(value)
+                    for value in seed_col[1:][reset].tolist()
+                    if int(value) in self._selected
+                )
         run_starts = np.concatenate(([0], np.flatnonzero(np.diff(seed_col) != 0) + 1))
-        for raw_value in seed_col[run_starts]:
+        for offset, raw_value in zip(run_starts.tolist(), seed_col[run_starts].tolist()):
             value = int(raw_value)
             if value not in self._selected:
                 self._current = None
+                self._current_decision = None
                 continue
             if value == self._current:
                 continue
@@ -1266,6 +1338,12 @@ class _SelectedGameSeedRunTracker:
             else:
                 self._seen.add(value)
             self._current = value
+            if decisions is not None:
+                decision = int(decisions[offset])
+                self._current_decision = decision if decision >= 0 else None
+        if self._current is not None and decisions is not None:
+            final_decision = int(decisions[-1])
+            self._current_decision = final_decision if final_decision >= 0 else None
 
     @property
     def duplicate_count(self) -> int:
@@ -1506,7 +1584,10 @@ def build_memmap_corpus(
                     f"{file}: --selected-game-seed-manifest requires a game_seed column"
                 )
             raw_game_seeds = np.asarray(norm["game_seed"], dtype=np.int64)
-            selected_source_tracker.observe_shard(raw_game_seeds)
+            selected_source_tracker.observe_shard(
+                raw_game_seeds,
+                norm.get("decision_index"),
+            )
             selected_row_mask = np.isin(raw_game_seeds, selected_game_seeds)
             # This is deliberately the first row-level transform.  Reserve,
             # incomplete, and truncated attempts use unselected game seeds and
@@ -1641,7 +1722,10 @@ def build_memmap_corpus(
             if bool(np.any(adjacent_equal)):
                 stats["has_duplicate_legal_rows"] = True
         if "game_seed" in norm:
-            _seed_tracker.observe_shard(norm["game_seed"])
+            _seed_tracker.observe_shard(
+                norm["game_seed"],
+                norm.get("decision_index"),
+            )
             if selected_game_seeds is not None:
                 observed_selected_seed_set.update(
                     map(int, np.asarray(norm["game_seed"], dtype=np.int64).tolist())
@@ -1729,7 +1813,7 @@ def build_memmap_corpus(
     if selected_manifest is not None:
         if selected_source_tracker.duplicate_count:
             raise SystemExit(
-                "selected game_seed starts more than one non-contiguous "
+                "selected game_seed starts more than one distinct "
                 f"raw-source run for {selected_source_tracker.duplicate_count} seed(s)"
             )
         missing = expected_selected_seed_set - observed_selected_seed_set
@@ -1745,7 +1829,8 @@ def build_memmap_corpus(
     if stats["has_duplicate_game_seeds"]:
         message = (
             f"{stats['duplicate_game_seed_count']} game_seed value(s) recur "
-            "as a SEPARATE, non-contiguous game elsewhere in this corpus -- games are "
+            "as a SEPARATE game elsewhere in this corpus (after an intervening seed "
+            "or a decision_index reset) -- games are "
             "supposed to have globally disjoint seeds, so this indicates duplicated "
             "games (the seed-collision class from task #77) silently doubling their "
             "weight in training."

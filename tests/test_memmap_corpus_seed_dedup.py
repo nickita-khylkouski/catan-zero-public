@@ -7,7 +7,6 @@ required.
 """
 from __future__ import annotations
 
-import json
 import sys
 from pathlib import Path
 
@@ -19,7 +18,11 @@ _TOOLS_DIR = _REPO / "tools"
 if str(_TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(_TOOLS_DIR))
 
-from build_memmap_corpus import _GameSeedRunTracker, build_memmap_corpus  # type: ignore  # noqa: E402
+from build_memmap_corpus import (  # type: ignore  # noqa: E402
+    _GameSeedRunTracker,
+    _SelectedGameSeedRunTracker,
+    build_memmap_corpus,
+)
 from train_bc import MemmapCorpus, load_teacher_data  # type: ignore  # noqa: E402
 
 
@@ -84,6 +87,57 @@ def test_tracker_empty_shard_is_noop():
     assert not tracker.has_duplicates
 
 
+def test_tracker_detects_immediately_adjacent_duplicate_from_decision_reset():
+    """A copied game can be adjacent to its source, so game_seed never changes.
+
+    decision_index is the missing game-boundary signal: the second copy resets
+    from decision 2 to decision 0 and must not be merged into the first game.
+    """
+    tracker = _GameSeedRunTracker()
+    tracker.observe_shard(
+        np.asarray([17, 17, 17, 17, 17], dtype=np.int64),
+        np.asarray([0, 1, 2, 0, 1], dtype=np.int32),
+    )
+    assert tracker.has_duplicates
+    assert tracker.duplicate_count == 1
+
+
+def test_tracker_detects_adjacent_duplicate_reset_across_shard_boundary():
+    tracker = _GameSeedRunTracker()
+    tracker.observe_shard(
+        np.asarray([17, 17, 17], dtype=np.int64),
+        np.asarray([0, 1, 2], dtype=np.int32),
+    )
+    tracker.observe_shard(
+        np.asarray([17, 17], dtype=np.int64),
+        np.asarray([0, 1], dtype=np.int32),
+    )
+    assert tracker.has_duplicates
+    assert tracker.duplicate_count == 1
+
+
+def test_tracker_allows_monotonic_game_continuation_across_shard_boundary():
+    tracker = _GameSeedRunTracker()
+    tracker.observe_shard(
+        np.asarray([17, 17, 17], dtype=np.int64),
+        np.asarray([0, 2, 4], dtype=np.int32),
+    )
+    tracker.observe_shard(
+        np.asarray([17, 17], dtype=np.int64),
+        np.asarray([7, 9], dtype=np.int32),
+    )
+    assert not tracker.has_duplicates
+
+
+def test_selected_tracker_detects_adjacent_duplicate_before_row_filtering():
+    tracker = _SelectedGameSeedRunTracker({17})
+    tracker.observe_shard(
+        np.asarray([17, 17, 17, 17, 17, 29], dtype=np.int64),
+        np.asarray([0, 1, 2, 0, 1, 0], dtype=np.int32),
+    )
+    assert tracker.duplicate_count == 1
+
+
 # ---------------------------------------------------------------------------
 # FIX 1b: --abort-on-duplicate-seeds (default on) hard-exits; the escape
 # hatch only warns. Uses tiny synthetic npz shards (minimal required columns).
@@ -94,6 +148,7 @@ def _write_synthetic_shard(
     path: Path,
     *,
     game_seed: np.ndarray,
+    decision_index: np.ndarray | None = None,
     include_aux: bool = True,
 ) -> None:
     n = int(game_seed.shape[0])
@@ -105,6 +160,8 @@ def _write_synthetic_shard(
         "action_taken": np.zeros(n, dtype=np.int16),
         "game_seed": game_seed.astype(np.int64),
     }
+    if decision_index is not None:
+        arrays["decision_index"] = decision_index.astype(np.int32)
     if include_aux:
         arrays.update(
             {
@@ -178,7 +235,6 @@ def test_build_memmap_corpus_no_duplicates_does_not_abort(tmp_path):
     )
     assert meta["stats"]["has_duplicate_game_seeds"] is False
     assert meta["stats"]["duplicate_game_seed_count"] == 0
-
     corpus = MemmapCorpus(tmp_path / "corpus")
     for key in (
         "aux_longest_road",
@@ -189,6 +245,23 @@ def test_build_memmap_corpus_no_duplicates_does_not_abort(tmp_path):
     ):
         assert key in corpus
         assert len(corpus[key]) == len(corpus)
+
+
+def test_build_memmap_corpus_aborts_on_immediately_adjacent_duplicate_game(tmp_path):
+    teacher_dir = tmp_path / "teacher"
+    teacher_dir.mkdir()
+    _write_synthetic_shard(
+        teacher_dir / "shard0.npz",
+        game_seed=np.asarray([17, 17, 17, 17, 17], dtype=np.int64),
+        decision_index=np.asarray([0, 1, 2, 0, 1], dtype=np.int32),
+    )
+    with pytest.raises(SystemExit, match="decision_index reset"):
+        build_memmap_corpus(
+            teacher_dir,
+            tmp_path / "corpus",
+            progress_every=0,
+            abort_on_duplicate_seeds=True,
+        )
 
 
 def test_legacy_and_aux_sources_mix_with_aligned_ignore_fills(tmp_path):
