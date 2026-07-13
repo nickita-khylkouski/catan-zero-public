@@ -1661,6 +1661,100 @@ def _assert_value_heads_present_for_losses(model, args) -> None:
                 "uncertainty loss is silently inert; pass "
                 "--value-uncertainty-loss-weight 0 or add the head."
             )
+    if float(getattr(args, "final_vp_loss_weight", 0.0) or 0.0) != 0.0:
+        if getattr(model, "final_vp_head", None) is None:
+            raise SystemExit(
+                "--final-vp-loss-weight != 0 requires a named final_vp_head; "
+                "without it the requested objective is silently inert"
+            )
+    if float(getattr(args, "aux_subgoal_loss_weight", 0.0) or 0.0) != 0.0:
+        required_aux_heads = tuple(
+            f"{field}_head" for field, _kind in _AUX_SUBGOAL_SPECS
+        )
+        missing = [
+            name for name in required_aux_heads if getattr(model, name, None) is None
+        ]
+        if missing:
+            raise SystemExit(
+                "--aux-subgoal-loss-weight != 0 requires the complete auxiliary "
+                "head set; missing: " + ", ".join(missing)
+            )
+    if float(getattr(args, "belief_resource_loss_weight", 0.0) or 0.0) != 0.0:
+        if getattr(model, "belief_resource_head", None) is None:
+            raise SystemExit(
+                "--belief-resource-loss-weight != 0 requires a named "
+                "belief_resource_head; without it the requested objective is inert"
+            )
+
+
+_OPTIONAL_TRAINING_HEADS: tuple[tuple[str, str], ...] = (
+    ("final_vp_head", "final_vp_loss_weight"),
+    ("value_uncertainty_head", "value_uncertainty_loss_weight"),
+    ("value_categorical_head", "value_categorical_loss_weight"),
+    ("aux_longest_road_head", "aux_subgoal_loss_weight"),
+    ("aux_largest_army_head", "aux_subgoal_loss_weight"),
+    ("aux_vp_in_n_head", "aux_subgoal_loss_weight"),
+    ("aux_next_settlement_head", "aux_subgoal_loss_weight"),
+    ("aux_robber_target_head", "aux_subgoal_loss_weight"),
+    ("belief_resource_head", "belief_resource_loss_weight"),
+    # The latent-deliberation halt readout is emitted by the model, but the BC
+    # learner has no halt target or loss.  Leaving it trainable creates an
+    # unused-parameter surface under DDP and lets AdamW decay an untrained head.
+    ("deliberation_halt_head", "<no_bc_objective>"),
+)
+
+
+def _freeze_inactive_training_heads(
+    model,
+    *,
+    final_vp_loss_weight: float,
+    value_uncertainty_loss_weight: float,
+    value_categorical_loss_weight: float,
+    aux_subgoal_loss_weight: float,
+    belief_resource_loss_weight: float,
+) -> dict[str, object]:
+    """Exclude zero-objective auxiliary heads before DDP/optimizer creation.
+
+    A zero coefficient is not a freeze under AdamW: a parameter reached by the
+    graph can receive a zero gradient and still undergo decoupled decay.  Heads
+    with no learner objective can also become DDP-unused parameters.  This
+    helper makes the actual trainable surface agree with the configured loss
+    surface while leaving every active head unchanged.
+    """
+
+    module = getattr(model, "module", model)
+    weights = {
+        "final_vp_loss_weight": float(final_vp_loss_weight),
+        "value_uncertainty_loss_weight": float(value_uncertainty_loss_weight),
+        "value_categorical_loss_weight": float(value_categorical_loss_weight),
+        "aux_subgoal_loss_weight": float(aux_subgoal_loss_weight),
+        "belief_resource_loss_weight": float(belief_resource_loss_weight),
+        "<no_bc_objective>": 0.0,
+    }
+    frozen_names: list[str] = []
+    frozen_parameters = 0
+    active_names: list[str] = []
+    for module_name, objective_name in _OPTIONAL_TRAINING_HEADS:
+        head = getattr(module, module_name, None)
+        if head is None:
+            continue
+        if weights[objective_name] != 0.0:
+            active_names.append(module_name)
+            continue
+        parameters = list(head.parameters()) if hasattr(head, "parameters") else [head]
+        for parameter in parameters:
+            if parameter.requires_grad:
+                parameter.requires_grad = False
+                frozen_parameters += int(parameter.numel())
+        frozen_names.append(module_name)
+    return {
+        "schema_version": "inactive-training-head-freeze-v1",
+        "frozen_submodules": sorted(frozen_names),
+        "active_optional_submodules": sorted(active_names),
+        "frozen_parameters": int(frozen_parameters),
+        "zero_weight_is_optimizer_exclusion": True,
+        "latent_deliberation_halt_has_bc_objective": False,
+    }
 
 
 def _checkpoint_value_categorical_bins(checkpoint_path: str) -> int:
@@ -5128,6 +5222,32 @@ def main(argv: Sequence[str] | None = None) -> None:
                 ),
                 ddp,
             )
+        inactive_head_freeze = _freeze_inactive_training_heads(
+            policy.model,
+            final_vp_loss_weight=float(args.final_vp_loss_weight),
+            value_uncertainty_loss_weight=float(
+                args.value_uncertainty_loss_weight
+            ),
+            value_categorical_loss_weight=float(
+                resolved_categorical_value_weight
+            ),
+            aux_subgoal_loss_weight=float(args.aux_subgoal_loss_weight),
+            belief_resource_loss_weight=float(args.belief_resource_loss_weight),
+        )
+        training_information_surface = {
+            **(training_information_surface or {}),
+            "inactive_training_head_freeze": inactive_head_freeze,
+        }
+        _rank0_print(
+            json.dumps(
+                {
+                    "progress": "inactive_training_head_freeze",
+                    **inactive_head_freeze,
+                },
+                sort_keys=True,
+            ),
+            ddp,
+        )
         if float(args.q_loss_weight) == 0.0:
             _set_xdim_q_branch_trainable(policy.model, False)
             _rank0_print(
@@ -7385,6 +7505,7 @@ def _forward_legal_np_for_batch(
     legal_action_ids: np.ndarray,
     *,
     return_q: bool,
+    return_final_vp: bool = True,
     symmetry=None,
     symmetry_rng=None,
     symmetry_relabel_events: bool = True,
@@ -7414,6 +7535,7 @@ def _forward_legal_np_for_batch(
             legal_action_ids,
             data["legal_action_context"][batch],
             return_q=return_q,
+            return_final_vp=return_final_vp,
         )
         # Keep the exact sampled orientation with the forward result. Spatial
         # auxiliary labels live outside ``entity`` and must be relabelled by the
@@ -7794,6 +7916,12 @@ def _train_xdim_batch(
             batch,
             legal_action_ids,
             return_q=float(q_loss_weight) != 0.0,
+            # EntityGraph's final-VP head is an auxiliary readout.  Multiplying
+            # its loss by zero still builds and traverses the head's autograd
+            # graph (and consumes its dropout RNG).  Omit it when the objective
+            # is exactly off; XDim legacy policies retain their historical
+            # always-emitted head because their forward API has no selector.
+            return_final_vp=float(final_vp_loss_weight) != 0.0,
             symmetry=symmetry,
             symmetry_rng=symmetry_rng,
             symmetry_relabel_events=symmetry_relabel_events,
@@ -7918,6 +8046,7 @@ def _train_xdim_batch(
                 policy_aux_batch,
                 aux_legal_ids,
                 return_q=False,
+                return_final_vp=False,
                 symmetry=symmetry,
                 symmetry_rng=symmetry_rng,
                 symmetry_relabel_events=symmetry_relabel_events,
