@@ -43,6 +43,12 @@ REQUIRED_ACTION_COLUMNS = {
     "legal_action_tokens",
     "legal_action_target_ids",
 }
+LEGACY_SEARCH_AUTH_COLUMNS = {
+    "policy_weight_multiplier",
+    "target_policy",
+    "target_policy_mask",
+    "teacher_name",
+}
 
 
 class CorpusReader:
@@ -201,6 +207,13 @@ def audit_corpus(root: Path, *, chunk_rows: int = 4096) -> dict[str, Any]:
     policy_active_rows = 0
     search_active_rows = 0
     invalid_legal_ids = 0
+    explicit_full_search = reader.has("used_full_search")
+    legacy_search_contract = (
+        not explicit_full_search
+        and LEGACY_SEARCH_AUTH_COLUMNS <= columns
+    )
+    legacy_search_wrong_teacher_rows = 0
+    legacy_search_missing_policy_rows = 0
     event = {
         "masked_events": 0,
         "events_with_any_target": 0,
@@ -231,8 +244,24 @@ def audit_corpus(root: Path, *, chunk_rows: int = 4096) -> dict[str, Any]:
         policy_weight = _row_values(
             reader, "policy_weight_multiplier", start, stop, 1.0
         ).astype(np.float64)
-        full_search = _row_values(reader, "used_full_search", start, stop, False).astype(bool)
         policy_active = policy_weight > 0.0
+        if explicit_full_search:
+            full_search = reader.rows_slice(
+                "used_full_search", start, stop
+            ).astype(bool)
+        elif legacy_search_contract:
+            # Historical A1 replay predates the redundant ``used_full_search``
+            # column.  The producer contract is nevertheless exact:
+            # gumbel_self_play writes policy_weight_multiplier > 0 only for a
+            # non-forced full-search row.  Authenticate the teacher and stored
+            # distribution below before allowing that equivalence to stand in
+            # for the missing metadata bit.
+            teacher = reader.rows_slice("teacher_name", start, stop).astype(str)
+            wrong_teacher = policy_active & (teacher != "gumbel_self_play")
+            legacy_search_wrong_teacher_rows += int(np.sum(wrong_teacher))
+            full_search = policy_active & ~wrong_teacher
+        else:
+            full_search = np.zeros(row_count, dtype=bool)
         search_active = policy_active & full_search
         policy_active_rows += int(np.sum(policy_active))
         search_active_rows += int(np.sum(search_active))
@@ -263,6 +292,30 @@ def audit_corpus(root: Path, *, chunk_rows: int = 4096) -> dict[str, Any]:
             total_rows_with_target += int(np.sum(row_has_target))
             policy_active_rows_with_target += int(np.sum(row_has_target & policy_active))
             search_active_rows_with_target += int(np.sum(row_has_target & search_active))
+
+            if legacy_search_contract:
+                stored_policy = reader.ragged_flat(
+                    "target_policy", start, stop
+                ).astype(np.float64, copy=False)
+                stored_policy_mask = reader.ragged_flat(
+                    "target_policy_mask", start, stop
+                ).astype(bool, copy=False)
+                if len(stored_policy) != len(row_index) or len(
+                    stored_policy_mask
+                ) != len(row_index):
+                    raise SystemExit(
+                        f"{reader.root}: legacy stored-policy columns are misaligned"
+                    )
+                valid_mass = np.where(
+                    stored_policy_mask & np.isfinite(stored_policy),
+                    np.maximum(stored_policy, 0.0),
+                    0.0,
+                )
+                row_policy_mass = np.zeros(row_count, dtype=np.float64)
+                np.add.at(row_policy_mass, row_index, valid_mass)
+                legacy_search_missing_policy_rows += int(
+                    np.sum(policy_active & (row_policy_mass <= 0.0))
+                )
 
             # The gather branch receives gradients through every legal logit,
             # but coverage of the demonstrated/MCTS-selected action is the
@@ -357,6 +410,8 @@ def audit_corpus(root: Path, *, chunk_rows: int = 4096) -> dict[str, Any]:
         and targeted_count > 0
         and invalid_targets == 0
         and search_active_rows_with_target > 0
+        and legacy_search_wrong_teacher_rows == 0
+        and legacy_search_missing_policy_rows == 0
     )
     cross_runnable = (
         "legal_action_tokens" in columns and action_count > 0 and policy_active_rows > 0
@@ -405,6 +460,28 @@ def audit_corpus(root: Path, *, chunk_rows: int = 4096) -> dict[str, Any]:
             / max(chosen_search_active, 1),
             "chosen_action_missing_from_legal": chosen_action_missing_from_legal,
             "chosen_action_duplicate_in_legal": chosen_action_duplicate_in_legal,
+            "search_activity_contract": {
+                "source": (
+                    "used_full_search"
+                    if explicit_full_search
+                    else "policy_weight_multiplier_legacy_equivalence"
+                    if legacy_search_contract
+                    else "unavailable"
+                ),
+                "legacy_required_columns": sorted(LEGACY_SEARCH_AUTH_COLUMNS),
+                "legacy_wrong_teacher_rows": legacy_search_wrong_teacher_rows,
+                "legacy_missing_stored_policy_rows": (
+                    legacy_search_missing_policy_rows
+                ),
+                "authenticated": bool(
+                    explicit_full_search
+                    or (
+                        legacy_search_contract
+                        and legacy_search_wrong_teacher_rows == 0
+                        and legacy_search_missing_policy_rows == 0
+                    )
+                ),
+            },
             "chosen_by_action_kind": _finalize_groups(chosen_action_groups),
             "chosen_by_phase": _finalize_groups(chosen_phase_groups),
         },

@@ -634,6 +634,7 @@ def _validate_coverage(path: Path, descriptor_path: Path) -> dict[str, Any]:
         legal = row.get("legal_action_targets", {})
         graph = row.get("graph_incidence", {})
         viability = row.get("viability", {})
+        search_contract = legal.get("search_activity_contract", {})
         if not (
             viability.get("action_target_gather") is True
             and graph.get("out_of_range_ids") == 0
@@ -641,6 +642,12 @@ def _validate_coverage(path: Path, descriptor_path: Path) -> dict[str, Any]:
             and legal.get("out_of_range_target_rows") == 0
             and legal.get("search_active_rows_with_any_target", 0) > 0
             and legal.get("actions_with_any_target", 0) > 0
+            and search_contract.get("authenticated") is True
+            and search_contract.get("source")
+            in {
+                "used_full_search",
+                "policy_weight_multiplier_legacy_equivalence",
+            }
         ):
             raise ArmError("TEMP corpus lacks valid, learnable topology target coverage")
         coverage.append({
@@ -651,6 +658,7 @@ def _validate_coverage(path: Path, descriptor_path: Path) -> dict[str, Any]:
             "rows_with_any_target": legal.get("rows_with_any_target"),
             "row_target_coverage": legal.get("row_target_coverage"),
             "search_active_rows_with_any_target": legal["search_active_rows_with_any_target"],
+            "search_activity_contract": search_contract,
             "chosen_actions_with_any_target": legal.get("chosen_actions_with_any_target"),
         })
     return {"artifact": audit_ref, "components": coverage,
