@@ -65,6 +65,7 @@ from catan_zero.rl.entity_token_features_rust import require_rust_feature_path
 from catan_zero.search.gumbel_chance_mcts import (
     GumbelChanceMCTSConfig,
     HeuristicRustEvaluator,
+    information_set_particle_budgets,
 )
 from catan_zero.search.native_gumbel_mcts import native_hot_loop_available
 from catan_zero.rl.config_cli import add_config_flags, apply_config_file, resolve_config
@@ -277,6 +278,27 @@ def _validate_science_args(
             "--information-set-search cannot be combined with "
             "--belief-chance-spectra"
         )
+    if information_set and args.n_full_wide is not None:
+        base_budgets = information_set_particle_budgets(
+            int(args.n_full),
+            int(args.determinization_particles),
+            int(args.determinization_min_simulations),
+        )
+        wide_budgets = information_set_particle_budgets(
+            int(args.n_full_wide),
+            int(args.determinization_particles),
+            int(args.determinization_min_simulations),
+        )
+        per_particle_doses = set(base_budgets + wide_budgets)
+        if len(per_particle_doses) != 1:
+            parser.error(
+                "adaptive information-set search must preserve the per-particle "
+                "simulation dose: base="
+                f"{base_budgets}, wide={wide_budgets}. Increase "
+                "--determinization-particles so extra wide-root compute buys "
+                "additional hidden-world coverage instead of visit-dependent "
+                "target sharpening"
+            )
 
 
 def _guard_argv_with_config_values(

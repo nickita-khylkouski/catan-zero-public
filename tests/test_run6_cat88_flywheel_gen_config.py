@@ -70,7 +70,7 @@ def test_gen_search_config_threads_decoupled_d6_and_adaptive_wide_budget() -> No
         gen_max_depth=80, gen_temperature_decisions=90,
         gen_lazy_interior_chance=True,
         gen_correct_rust_chance_spectra=True,
-        gen_information_set_search=True, gen_determinization_particles=4,
+        gen_information_set_search=True, gen_determinization_particles=8,
         gen_determinization_min_simulations=32,
     ).validate()
     argv = cfg.resolve_gen_search_argv()
@@ -78,6 +78,32 @@ def test_gen_search_config_threads_decoupled_d6_and_adaptive_wide_budget() -> No
     assert argv[argv.index("--n-full-wide-threshold") + 1] == "40"
     assert "--wide-roots-always-full" in argv
     assert argv[argv.index("--symmetry-averaged-eval-threshold") + 1] == "20"
+    assert argv[argv.index("--determinization-particles") + 1] == "8"
+
+
+def test_gen_adaptive_wide_budget_rejects_per_particle_deepening() -> None:
+    with pytest.raises(ValueError, match="preserve per-particle simulation dose"):
+        FlywheelConfig(
+            gen_n_full=128,
+            gen_n_fast=16,
+            gen_p_full=0.25,
+            gen_n_full_wide=256,
+            gen_n_full_wide_threshold=40,
+            gen_wide_roots_always_full=True,
+            gen_symmetry_averaged_eval=True,
+            gen_symmetry_averaged_eval_threshold=20,
+            gen_wide_candidates_threshold=24,
+            gen_c_visit=50.0,
+            gen_c_scale=0.1,
+            gen_max_decisions=600,
+            gen_max_depth=80,
+            gen_temperature_decisions=90,
+            gen_lazy_interior_chance=True,
+            gen_correct_rust_chance_spectra=True,
+            gen_information_set_search=True,
+            gen_determinization_particles=4,
+            gen_determinization_min_simulations=32,
+        ).validate()
 
 
 def test_gen_wide_always_full_requires_wide_budget() -> None:

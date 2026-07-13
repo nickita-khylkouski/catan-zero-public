@@ -183,6 +183,41 @@ def test_adaptive_wide_budget_threshold_and_always_full_thread_through(monkeypat
     assert search.wide_roots_always_full is True
 
 
+def test_science_validation_accepts_adaptive_n256_by_expanding_particles() -> None:
+    parser = cli.build_parser()
+    args = parser.parse_args(
+        [
+            "--out-dir", "/tmp/adaptive-p8",
+            "--n-full", "128",
+            "--n-full-wide", "256",
+            "--wide-roots-always-full",
+            "--public-observation",
+            "--information-set-search",
+            "--determinization-particles", "8",
+            "--determinization-min-simulations", "32",
+        ]
+    )
+    cli._validate_science_args(args, parser)
+
+
+def test_science_validation_rejects_adaptive_n256_that_deepens_each_particle() -> None:
+    parser = cli.build_parser()
+    args = parser.parse_args(
+        [
+            "--out-dir", "/tmp/adaptive-p4",
+            "--n-full", "128",
+            "--n-full-wide", "256",
+            "--wide-roots-always-full",
+            "--public-observation",
+            "--information-set-search",
+            "--determinization-particles", "4",
+            "--determinization-min-simulations", "32",
+        ]
+    )
+    with pytest.raises(SystemExit):
+        cli._validate_science_args(args, parser)
+
+
 # --------------------------------------------------------------------------- late-temperature wiring
 
 

@@ -321,6 +321,10 @@ class FlywheelConfig:
         return FlywheelConfig(**{k: v for k, v in d.items() if k in known})
 
     def validate(self) -> "FlywheelConfig":
+        from catan_zero.search.gumbel_chance_mcts import (
+            information_set_particle_budgets,
+        )
+
         if self.regime not in ("continuous", "discrete"):
             raise ValueError(f"regime must be continuous|discrete, got {self.regime!r}")
         if self.window_c_rows <= 0:
@@ -394,6 +398,30 @@ class FlywheelConfig:
             raise ValueError(
                 "gen_wide_roots_always_full requires gen_n_full_wide"
             )
+        if (
+            self.gen_information_set_search
+            and self.gen_n_full_wide is not None
+            and self.gen_n_full is not None
+            and self.gen_determinization_particles is not None
+            and self.gen_determinization_min_simulations is not None
+        ):
+            base_budgets = information_set_particle_budgets(
+                self.gen_n_full,
+                self.gen_determinization_particles,
+                self.gen_determinization_min_simulations,
+            )
+            wide_budgets = information_set_particle_budgets(
+                self.gen_n_full_wide,
+                self.gen_determinization_particles,
+                self.gen_determinization_min_simulations,
+            )
+            if len(set(base_budgets + wide_budgets)) != 1:
+                raise ValueError(
+                    "adaptive generation must preserve per-particle simulation "
+                    f"dose: base={base_budgets}, wide={wide_budgets}; increase "
+                    "gen_determinization_particles so adaptive compute expands "
+                    "hidden-world coverage"
+                )
         if len(self.anchor_corpora) != len(set(self.anchor_corpora)):
             raise ValueError(f"anchor_corpora must not contain duplicate names: {self.anchor_corpora}")
         # sanity: opponent policy constructs
@@ -412,12 +440,15 @@ if __name__ == "__main__":  # self-test
     assert cfg2 == cfg
 
     # forward-compat: an extra unknown key is ignored, missing keys fill from defaults
-    d2 = dict(d); d2["some_future_knob"] = 123; del d2["gate_games"]
+    d2 = dict(d)
+    d2["some_future_knob"] = 123
+    del d2["gate_games"]
     cfg3 = FlywheelConfig.from_dict(d2)
     assert cfg3.gate_games == FlywheelConfig().gate_games
 
     # wrong schema is a hard error
-    bad = dict(d); bad["schema_version"] = 999
+    bad = dict(d)
+    bad["schema_version"] = 999
     try:
         FlywheelConfig.from_dict(bad)
         raise AssertionError("expected schema mismatch to raise")

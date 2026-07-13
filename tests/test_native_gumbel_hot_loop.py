@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import random
 from types import SimpleNamespace
 import json
 import os
@@ -169,6 +170,26 @@ def test_native_maps_decoupled_wide_budget_fields() -> None:
     assert native["n_full_wide"] == 256
     assert native["n_full_wide_threshold"] == 40
     assert native["wide_roots_always_full"] is True
+
+
+def test_native_particle_override_preserves_exact_per_particle_dose() -> None:
+    search = object.__new__(NativeGumbelChanceMCTS)
+    search.config = GumbelChanceMCTSConfig(
+        n_full=128,
+        n_full_wide=256,
+        n_full_wide_threshold=40,
+        wide_roots_always_full=True,
+    )
+    search.rng = random.Random(7)
+
+    native = search._native_config(n_simulations_override=32)
+
+    assert native["n_full"] == 32
+    assert native["n_fast"] == 32
+    assert native["p_full"] == 1.0
+    assert native["exact_budget_sh"] is True
+    assert native["exact_budget_sh_min_n"] == 0
+    assert "n_full_wide" not in native
 
 
 @pytest.mark.skipif(
