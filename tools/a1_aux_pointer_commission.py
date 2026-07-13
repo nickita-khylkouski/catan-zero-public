@@ -99,6 +99,8 @@ def _derive(
     source: Sequence[str],
     *,
     trainer: Path,
+    descriptor: Path,
+    sentinel: Path,
     initializer: Path,
     checkpoint: Path,
     report: Path,
@@ -114,6 +116,8 @@ def _derive(
         )
     command[trainers[0]] = str(trainer)
     for flag, value in (
+        ("--data", str(descriptor)),
+        ("--validation-game-sentinel-manifest", str(sentinel)),
         ("--init-checkpoint", str(initializer)),
         ("--max-steps", str(STAGE1_STEPS if stage == 1 else STAGE2_STEPS)),
         ("--batch-size", str(LOCAL_BATCH)),
@@ -158,6 +162,60 @@ def _derive(
                 index = command.index(flag)
                 del command[index : index + 2]
     return command
+
+
+def _stage1_data_contract(
+    source_descriptor: Path, source_sentinel: Path, output: Path
+) -> tuple[Path, Path, dict[str, Any]]:
+    """Authenticate head-only overrides without changing data selection/order."""
+
+    descriptor = json.loads(source_descriptor.read_text(encoding="utf-8"))
+    if not isinstance(descriptor, dict) or not (
+        descriptor.get("schema_version") == "memmap_composite_v2"
+        and descriptor.get("diagnostic_only") is True
+        and descriptor.get("promotion_eligible") is False
+    ):
+        raise CommissionError("Stage-1 source must be diagnostic memmap_composite_v2")
+    source_components = descriptor.get("components")
+    overrides = dict(descriptor.get("learner_recipe_overrides", {}))
+    overrides.update({"lr": 3e-4, "value_loss_weight": 0.0})
+    descriptor["learner_recipe_overrides"] = overrides
+    descriptor["learner_recipe_overrides_sha256"] = _digest(overrides)
+    derived_descriptor = output / "stage1-head-only" / "memmap_composite.json"
+    _atomic_json(derived_descriptor, descriptor)
+
+    sentinel = json.loads(source_sentinel.read_text(encoding="utf-8"))
+    if not isinstance(sentinel, dict) or sentinel.get("schema_version") != (
+        "train-validation-game-sentinel-v1"
+    ):
+        raise CommissionError("source validation sentinel schema drift")
+    sentinel["source_composite_descriptor_file_sha256"] = (
+        f"sha256:{_sha256(derived_descriptor)}"
+    )
+    sentinel["source_composite_descriptor_fingerprint"] = (
+        train_bc._training_data_fingerprint(derived_descriptor, "memmap")
+    )
+    derived_sentinel = output / "stage1-head-only" / "validation.sentinel.json"
+    _atomic_json(derived_sentinel, sentinel)
+
+    checked = json.loads(derived_descriptor.read_text(encoding="utf-8"))
+    if checked.get("components") != source_components:
+        raise CommissionError("derived Stage-1 descriptor changed data identity/order")
+    return (
+        derived_descriptor,
+        derived_sentinel,
+        {
+            "source_descriptor_sha256": f"sha256:{_sha256(source_descriptor)}",
+            "derived_descriptor_sha256": f"sha256:{_sha256(derived_descriptor)}",
+            "source_sentinel_sha256": f"sha256:{_sha256(source_sentinel)}",
+            "derived_sentinel_sha256": f"sha256:{_sha256(derived_sentinel)}",
+            "only_recipe_override_delta": {"lr": 3e-4, "value_loss_weight": 0.0},
+            "components_and_sampling_ratios_identical": True,
+            "selected_game_seed_set_sha256": sentinel.get(
+                "selected_game_seed_set_sha256"
+            ),
+        },
+    )
 
 
 def _trainable_surface(checkpoint: Path) -> dict[str, Any]:
@@ -221,9 +279,16 @@ def main() -> None:
     output = args.output_root.resolve()
     stage1_dir = output / "stage1-head-only"
     stage2_dir = output / "stage2-joint-524288"
+    stage1_descriptor, stage1_sentinel, stage1_data_contract = _stage1_data_contract(
+        Path(source["descriptor"]["path"]),
+        Path(source["validation_sentinel"]["path"]),
+        output,
+    )
     stage1 = _derive(
         source["command"],
         trainer=REPO / "tools/train_bc.py",
+        descriptor=stage1_descriptor,
+        sentinel=stage1_sentinel,
         initializer=initializer,
         checkpoint=stage1_dir / "candidate.pt",
         report=stage1_dir / "train.report.json",
@@ -232,6 +297,8 @@ def main() -> None:
     stage2 = _derive(
         source["command"],
         trainer=REPO / "tools/train_bc.py",
+        descriptor=Path(source["descriptor"]["path"]),
+        sentinel=Path(source["validation_sentinel"]["path"]),
         initializer=stage1_dir / "candidate.pt",
         checkpoint=stage2_dir / "candidate.pt",
         report=stage2_dir / "train.report.json",
@@ -268,6 +335,7 @@ def main() -> None:
             "row_dose": WORLD_SIZE * LOCAL_BATCH * STAGE1_STEPS,
             "fresh_adam": True,
             "discard_optimizer_after_admission": True,
+            "data_contract": stage1_data_contract,
             "freeze_groups": FREEZE_GROUPS.split(","),
             "require_only_trainable_prefixes": TRAINABLE_PREFIXES.split(","),
             "trainable_surface": _trainable_surface(initializer),
