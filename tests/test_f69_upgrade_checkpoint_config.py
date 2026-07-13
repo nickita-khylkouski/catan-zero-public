@@ -215,6 +215,19 @@ def test_combined_topology_gather_upgrade_verifies_exact_real_root(
     import torch
     pytest.importorskip("catanatron_rs")
 
+    # Some developer environments retain an older importable wheel that
+    # predates the native MCTS snapshot/copy surface.  That environment cannot
+    # construct the real-root parity fixture, and is equivalent to the binding
+    # being unavailable for this test (the unit/synthetic parity tests still
+    # exercise the upgrade below).  Do not misreport a stale wheel as an
+    # architecture-upgrade failure.
+    from catan_zero.search.rust_mcts import _require_rust_module
+
+    try:
+        _require_rust_module()
+    except RuntimeError as error:
+        pytest.skip(str(error))
+
     from catan_zero.rl.entity_token_policy import EntityGraphPolicy
     from catan_zero.rl.self_play import make_env_config
 
