@@ -8746,8 +8746,8 @@ def _train_xdim_batch(
         ):
             cat_logits = outputs["value_categorical_logits"].float()
             n_out = int(cat_logits.shape[-1])
-            has_trunc_class = n_out > int(policy.model.value_categorical_bins)
-            bins = int(policy.model.value_categorical_bins)
+            bins = _policy_value_categorical_bins(policy)
+            has_trunc_class = n_out > bins
             # Real win/loss target on the continuous axis; truncated rows one-hot
             # on the truncation class (uses the policy-safe raw outcome, NOT the
             # F3 VP-margin-filled value_outcome_targets, per R9).
@@ -10557,7 +10557,7 @@ def _eval_xdim_batch(
                 and outcome_targets is not None
             ):
                 cat_logits = outputs["value_categorical_logits"].float()
-                bins = int(policy.model.value_categorical_bins)
+                bins = _policy_value_categorical_bins(policy)
                 has_trunc_class = int(cat_logits.shape[-1]) > bins
                 cat_targets = _hl_gauss_value_targets(
                     outcome_targets,
@@ -14936,6 +14936,25 @@ def _hl_gauss_value_targets(
             out[tmask] = 0.0
             out[tmask, int(bins)] = 1.0
     return out
+
+
+def _policy_value_categorical_bins(policy: object) -> int:
+    """Read categorical support width through optional DDP wrapping."""
+
+    model = getattr(policy, "model", None)
+    model = getattr(model, "module", model)
+    try:
+        bins = int(getattr(model, "value_categorical_bins"))
+    except (AttributeError, TypeError, ValueError) as error:
+        raise RuntimeError(
+            "categorical value objective requires a model with an integer "
+            "value_categorical_bins attribute"
+        ) from error
+    if bins < 2:
+        raise RuntimeError(
+            "categorical value objective requires value_categorical_bins >= 2"
+        )
+    return bins
 
 
 def _value_targets(
