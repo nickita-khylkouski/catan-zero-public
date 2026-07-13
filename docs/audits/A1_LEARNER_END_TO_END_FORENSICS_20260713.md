@@ -178,6 +178,7 @@ a diagnostic, not a champion selector. Search H2H remains mandatory.
 | Optional-target train coverage | An enabled CAT-100 head could have all-NaN/all-`-1` labels and silently contribute zero loss. The first coverage fix scanned the full corpus, so labels appearing only in held-out validation could still admit a run with no training signal. | Fixed (`e0d1d78`, `6d6d08a`): each enabled head requires finite usable labels on the actual post-split training indices, with chunked DDP-aware counts bound into the report. |
 | Zero effective training objective | A configured policy/Q or value/final-VP objective could have zero positive effective weight mass on the training split and still run as an apparently valid experiment. | Fixed (`6d6d08a`): startup computes and records train-split objective masses and refuses every enabled zero-mass objective before spending a GPU update. |
 | Architecture inference-cost gate | The topology+target-gather receipt used an isolated batch-48 profile with the unused Q head enabled. Production H2H is dominated by batch-1 calls, with chance batches up to 11 and D6 batches of 12, so the receipt reported 1.22x slowdown while the exact H2H measured 1.60x per search call. | Fixed: cost contract v2 requires matched strict-FP32, `return_q=false` batch-1 and batch-12 profiles; batch 48 is optional secondary throughput telemetry. Completion fails closed when either operational profile is missing or shape-drifted. |
+| Representation audit classification | The information-surface audit reported a gather-only Transformer as having no critical spatial bottleneck and therefore `safe_for_scale_only_ablation=true`. Gather binds policy actions to target tokens, but it does not make the CLS/value state readout consume graph connectivity; the executable alias regression already proves the value remains invariant under within-type board permutations. The converse topology-only arm still lacks an action-target join. | Fixed in audit schema v2: gather-only reports `spatial_state_topology_aliasing`, topology-only reports `action_target_aliasing`, and only a representation with both state topology and action binding clears the spatial critical gate. This changes experiment admission, not model weights. |
 
 ## Layer/architecture audit
 
@@ -302,6 +303,15 @@ without changing f7 at initialization, are zero-initialized actor-relative seat
 embeddings and a zero-initialized categorical action-ID residual. These remain
 lower priority than target gather/topology because the current action scalar is
 injective and seat identity has not yet been isolated by matched behavior.
+
+The executable information-surface gate now preserves that distinction. Its
+original v1 classification cleared every critical spatial finding as soon as
+target gather was enabled, even though the state/value topology alias above was
+still exact. Schema v2 reports gather-only as `spatial_state_topology_aliasing`
+and topology-only as `action_target_aliasing`; neither is admitted as a safe
+scale-only architecture. A static action-ID residual cannot repair missing state
+connectivity, and a state-topology adapter alone cannot create an action-target
+join.
 
 The corpus-side commissioning audit is now complete rather than assumed. Across
 31,919,276 n128 rows, 12,773,247 n256 rows, and 2,927,924 replay rows, all target

@@ -20,7 +20,7 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 
 
-SCHEMA = "entity-graph-information-surface-audit-v1"
+SCHEMA = "entity-graph-information-surface-audit-v2"
 TRAINING_CONTRACT_SCHEMA = "a1-training-event-history-contract-v1"
 NATIVE_INFERENCE_CONTRACT_SCHEMA = "native-entity-event-history-v1"
 _SHA256_RE = re.compile(r"sha256:[0-9a-f]{64}")
@@ -282,6 +282,15 @@ def build_report(
         and not architecture["action_target_bound"]
     ):
         critical.append("spatial_state_action_aliasing")
+    elif not architecture["topology_consumed"]:
+        # Target gather repairs only the policy's action-local lookup. The
+        # CLS/value path is still exactly invariant to within-type vertex/edge
+        # permutations and cannot represent board connectivity.
+        critical.append("spatial_state_topology_aliasing")
+    elif not architecture["action_target_bound"]:
+        # Conversely, topology-aware state tokens do not give the legacy
+        # action head a direct semantic target lookup.
+        critical.append("action_target_aliasing")
     if corpus is not None and corpus["event_history_trainable"] is False:
         critical.append("public_history_absent")
     elif corpus is not None and corpus["event_history_trainable"] is None:
