@@ -63,6 +63,7 @@ from tools import search_operator_binding as operator_binding  # noqa: E402
 from tools import a1_post_promotion_handoff as promotion_handoff  # noqa: E402
 from tools.prelaunch_guard import VAL_ONLY_SEED_RANGE, parse_seed_ledger  # noqa: E402
 from tools.seed_fleet_planner import assert_disjoint_seed_blocks  # noqa: E402
+from tools.sprt_gate import evaluate_pentanomial_sprt  # noqa: E402
 
 DRAFT_SCHEMA = "a1-pre-wave-contract-draft-v3"
 LEGACY_DRAFT_SCHEMA = "a1-pre-wave-contract-draft-v2"
@@ -1695,12 +1696,26 @@ def sync_generation_guard(draft_path: Path) -> dict[str, Any]:
         raise ContractError("cannot synchronize generation guard before typed S1 exists")
     s1_path = _absolute_ref(str(s1_items[0]["path"]), base=draft_path.parent)
     s1_payload = _load_json(s1_path)
+    post_promotion_s1_path: Path | None = None
+    allow_post_promotion_s1 = False
+    if (
+        draft.get("schema_version") == DRAFT_SCHEMA
+        and isinstance(draft.get("promotion_handoff"), dict)
+        and draft["promotion_handoff"].get("mode") == POST_PROMOTION_HANDOFF_MODE
+    ):
+        post_promotion_s1_path = _absolute_ref(
+            str(draft["promotion_handoff"].get("path", "")),
+            base=draft_path.parent,
+        )
+        allow_post_promotion_s1 = True
     _validate_search_stage_evidence(
         s1_payload,
         path=s1_path,
         expected_stage="s1",
         final_search=final_s1,
         final_evaluator={},
+        post_promotion_handoff_path=post_promotion_s1_path,
+        allow_post_promotion_s1=allow_post_promotion_s1,
     )
     s1_record = _file_record(s1_path, kind="s1")
 
@@ -2859,6 +2874,36 @@ def _validate_held_out_hard_negative_evidence(
         )
     ):
         raise ContractError("held-out hard-negative win rate is inconsistent")
+    elo_values: dict[str, float] = {}
+    for key in ("elo0", "elo1"):
+        value = config.get(key)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+        ):
+            raise ContractError(
+                f"held-out hard-negative evaluation config has invalid {key}"
+            )
+        elo_values[key] = float(value)
+    replayed_pentanomial = evaluate_pentanomial_sprt(
+        counts=(
+            recomputed_diagnostics["ll_pairs"],
+            recomputed_diagnostics["split_pairs"],
+            recomputed_diagnostics["ww_pairs"],
+        ),
+        elo0=elo_values["elo0"],
+        elo1=elo_values["elo1"],
+        alpha=0.05,
+        beta=0.05,
+    )
+    if (
+        raw["pentanomial_sprt"] != replayed_pentanomial
+        or report.get("pentanomial_sprt") != replayed_pentanomial
+    ):
+        raise ContractError(
+            "held-out hard-negative pentanomial SPRT does not equal replay"
+        )
     return {"artifact": artifact, "suite_manifest": suite_record}
 
 
@@ -2931,6 +2976,55 @@ def _validate_internal_hard_negative_evidence(
         or raw["candidate_wins"] + raw["incumbent_wins"] != raw["games"]
     ):
         raise ContractError("internal hard-negative result counts are inconsistent")
+    diagnostics = report.get("pair_diagnostics")
+    required_diagnostics = {
+        "incomplete_pairs",
+        "ll_pairs",
+        "split_pairs",
+        "ww_pairs",
+    }
+    if not isinstance(diagnostics, dict) or set(diagnostics) != required_diagnostics:
+        raise ContractError("internal hard-negative pair diagnostics are malformed")
+    if any(
+        isinstance(diagnostics[key], bool)
+        or not isinstance(diagnostics[key], int)
+        or diagnostics[key] < 0
+        for key in required_diagnostics
+    ):
+        raise ContractError("internal hard-negative pair diagnostics are malformed")
+    ll_pairs = diagnostics["ll_pairs"]
+    split_pairs = diagnostics["split_pairs"]
+    ww_pairs = diagnostics["ww_pairs"]
+    if (
+        diagnostics["incomplete_pairs"] != 0
+        or ll_pairs + split_pairs + ww_pairs != raw["complete_pairs"]
+        or 2 * ww_pairs + split_pairs != raw["candidate_wins"]
+        or 2 * ll_pairs + split_pairs != raw["incumbent_wins"]
+    ):
+        raise ContractError("internal hard-negative pair diagnostics are inconsistent")
+    counts = (ll_pairs, split_pairs, ww_pairs)
+    replayed_promotion = evaluate_pentanomial_sprt(
+        counts=counts,
+        elo0=-10.0,
+        elo1=15.0,
+        alpha=0.05,
+        beta=0.05,
+    )
+    replayed_superiority = evaluate_pentanomial_sprt(
+        counts=counts,
+        elo0=0.0,
+        elo1=15.0,
+        alpha=0.05,
+        beta=0.05,
+    )
+    if report.get("pentanomial_sprt") != replayed_promotion:
+        raise ContractError(
+            "internal hard-negative promotion SPRT does not equal replay"
+        )
+    if report.get("superiority_pentanomial_sprt") != replayed_superiority:
+        raise ContractError(
+            "internal hard-negative superiority SPRT does not equal replay"
+        )
     candidate_win_rate = raw["candidate_win_rate"]
     if (
         isinstance(candidate_win_rate, bool)
@@ -3850,6 +3944,8 @@ def _validate_operator_binding_evidence(
     expected_stage: str,
     final_search: dict[str, Any],
     final_evaluator: dict[str, Any],
+    post_promotion_handoff_path: Path | None = None,
+    allow_post_promotion_s1: bool = False,
 ) -> dict[str, Any]:
     """Validate the narrow no-S2/no-S3 operator-choice bridge.
 
@@ -3989,6 +4085,8 @@ def _validate_operator_binding_evidence(
         expected_stage="s1",
         final_search=final_search,
         final_evaluator=final_evaluator,
+        post_promotion_handoff_path=post_promotion_handoff_path,
+        allow_post_promotion_s1=allow_post_promotion_s1,
     )
     if (
         payload["source_s1_selected_fields_sha256"]
@@ -4035,6 +4133,8 @@ def _validate_operator_binding_evidence(
             expected_stage="s2",
             final_search=final_search,
             final_evaluator=final_evaluator,
+            post_promotion_handoff_path=post_promotion_handoff_path,
+            allow_post_promotion_s1=allow_post_promotion_s1,
         )
         if s2_payload["source_s1"] != payload["source_s1"]:
             raise ContractError("S3 and S2 operator bindings do not share exact S1 lineage")
@@ -4055,6 +4155,141 @@ def _validate_operator_binding_evidence(
             raise ContractError("S3 operator binding does not equal semantic replay")
         records.append(s2_record)
     return semantic
+
+
+def _validate_post_promotion_s1_operator_binding(
+    payload: dict[str, Any],
+    *,
+    path: Path,
+    expected_stage: str,
+    final_search: dict[str, Any],
+    final_evaluator: dict[str, Any],
+    post_promotion_handoff_path: Path | None,
+    allow_post_promotion_s1: bool,
+) -> dict[str, Any]:
+    """Accept the single c_scale continuity bridge only in a v3 handoff wave."""
+
+    if expected_stage != "s1":
+        raise ContractError("post-promotion S1 operator binding is S1-only")
+    if not allow_post_promotion_s1 or post_promotion_handoff_path is None:
+        raise ContractError(
+            "post-promotion S1 operator binding is accepted only by a v3 "
+            "post-promotion contract"
+        )
+    try:
+        replayed = operator_binding._replay_post_promotion_s1(path)  # noqa: SLF001
+    except operator_binding.BindingError as error:
+        raise ContractError(
+            f"post-promotion S1 operator-binding replay failed: {error}"
+        ) from error
+    if replayed != payload:
+        raise ContractError(
+            "post-promotion S1 operator binding does not equal semantic replay"
+        )
+    selected = payload.get("selected_fields")
+    if not isinstance(selected, dict) or set(selected) != operator_binding.S1_SELECTED_KEYS:
+        raise ContractError("post-promotion S1 selected_fields shape mismatch")
+    mismatches = {
+        key: (selected[key], final_search.get(key))
+        for key in selected
+        if selected[key] != final_search.get(key)
+    }
+    if mismatches:
+        raise ContractError(
+            "post-promotion S1 fields mismatch final contract: " f"{mismatches}"
+        )
+    if payload.get("selected_fields_sha256") != _digest_value(selected):
+        raise ContractError(
+            "post-promotion S1 selected_fields_sha256 mismatch"
+        )
+
+    handoff_ref = payload.get("source_post_promotion_handoff")
+    if not isinstance(handoff_ref, dict) or set(handoff_ref) != {
+        "path",
+        "sha256",
+        "handoff_sha256",
+    }:
+        raise ContractError("post-promotion S1 handoff reference is malformed")
+    bound_handoff_path, handoff_record = _validate_operator_binding_reference(
+        {"path": handoff_ref["path"], "sha256": handoff_ref["sha256"]},
+        owner_path=path,
+        where="post-promotion S1 source handoff",
+    )
+    if bound_handoff_path != post_promotion_handoff_path.resolve(strict=True):
+        raise ContractError(
+            "post-promotion S1 binds a different handoff than the v3 contract"
+        )
+    handoff_payload = _load_json(bound_handoff_path)
+    if handoff_ref["handoff_sha256"] != handoff_payload.get("handoff_sha256"):
+        raise ContractError("post-promotion S1 handoff semantic digest mismatch")
+
+    legacy_path, legacy_record = _validate_operator_binding_reference(
+        payload.get("source_legacy_s1"),
+        owner_path=path,
+        where="post-promotion S1 legacy source",
+    )
+    legacy_search = dict(final_search)
+    legacy_search["c_scale"] = operator_binding.POST_PROMOTION_S1_OVERRIDE[
+        "legacy_value"
+    ]
+    legacy_semantic = _validate_search_stage_evidence(
+        _load_json(legacy_path),
+        path=legacy_path,
+        expected_stage="s1",
+        final_search=legacy_search,
+        final_evaluator=final_evaluator,
+    )
+    if (
+        payload.get("source_legacy_s1_selected_fields_sha256")
+        != legacy_semantic["selected_fields_sha256"]
+    ):
+        raise ContractError(
+            "post-promotion S1 legacy selected-fields digest mismatch"
+        )
+    emitter_path, emitter_record = _validate_operator_binding_reference(
+        payload.get("emitter"),
+        owner_path=path,
+        where="post-promotion S1 emitter",
+    )
+    if not emitter_path.as_posix().endswith("tools/search_operator_binding.py"):
+        raise ContractError("post-promotion S1 binding has an untrusted emitter")
+    checkpoint = payload.get("producer_checkpoint")
+    _require_exact_keys(
+        checkpoint,
+        {"path", "sha256"},
+        where="post-promotion S1 producer checkpoint",
+    )
+    checkpoint_path = _absolute_ref(str(checkpoint["path"]), base=path.parent)
+    checkpoint_record = {
+        "path": str(checkpoint_path),
+        "sha256": _sha256(checkpoint_path),
+    }
+    if checkpoint_record != checkpoint:
+        raise ContractError("post-promotion S1 producer checkpoint hash drift")
+    identity = handoff_payload.get("producer_identity", {})
+    if (
+        checkpoint != identity.get("checkpoint")
+        or payload.get("producer_identity_sha256")
+        != identity.get("agent_identity_sha256")
+        or payload.get("producer_search_config_sha256")
+        != _digest_value(identity.get("search_config"))
+    ):
+        raise ContractError("post-promotion S1 producer identity drift")
+
+    records = [legacy_record, *legacy_semantic["source_artifacts"]]
+    records.extend([handoff_record, emitter_record, checkpoint_record])
+    return {
+        "decision": payload["decision"],
+        "evidence_class": operator_binding.ARTIFACT_KIND,
+        "selected_fields": dict(selected),
+        "selected_fields_sha256": payload["selected_fields_sha256"],
+        "checkpoint": dict(checkpoint),
+        "source_artifacts": records,
+        "artifact_content_sha256": payload["artifact_content_sha256"],
+        "binding_time_utc": payload["binding_time_utc"],
+    }
+
+
 def _validate_search_stage_evidence(
     payload: dict[str, Any],
     *,
@@ -4062,7 +4297,19 @@ def _validate_search_stage_evidence(
     expected_stage: str,
     final_search: dict[str, Any],
     final_evaluator: dict[str, Any],
+    post_promotion_handoff_path: Path | None = None,
+    allow_post_promotion_s1: bool = False,
 ) -> dict[str, Any]:
+    if payload.get("schema_version") == operator_binding.POST_PROMOTION_S1_SCHEMA:
+        return _validate_post_promotion_s1_operator_binding(
+            payload,
+            path=path,
+            expected_stage=expected_stage,
+            final_search=final_search,
+            final_evaluator=final_evaluator,
+            post_promotion_handoff_path=post_promotion_handoff_path,
+            allow_post_promotion_s1=allow_post_promotion_s1,
+        )
     if payload.get("schema_version") == "a1-s3-role-operator-hold-v1":
         # Lazy import avoids the pre-wave -> pool -> promotion -> pre-wave
         # cycle during module initialization.
@@ -4123,6 +4370,8 @@ def _validate_search_stage_evidence(
             expected_stage=expected_stage,
             final_search=final_search,
             final_evaluator=final_evaluator,
+            post_promotion_handoff_path=post_promotion_handoff_path,
+            allow_post_promotion_s1=allow_post_promotion_s1,
         )
     if payload.get("schema_version") != SEARCH_STAGE_EVIDENCE_SCHEMA:
         raise ContractError(
@@ -5653,6 +5902,13 @@ def build_lock(
             f"science.evidence must contain exactly {sorted(REQUIRED_EVIDENCE)}"
         )
     evidence = []
+    post_promotion_s1_path: Path | None = None
+    allow_post_promotion_s1 = False
+    if draft_schema == DRAFT_SCHEMA and handoff_mode == POST_PROMOTION_HANDOFF_MODE:
+        post_promotion_s1_path = _absolute_ref(
+            str(draft["promotion_handoff"].get("path", "")), base=base
+        )
+        allow_post_promotion_s1 = True
     for item in sorted(evidence_raw, key=lambda item: str(item["kind"])):
         if set(item) != {"kind", "path"}:
             continue
@@ -5674,6 +5930,8 @@ def build_lock(
                 expected_stage=str(item["kind"]),
                 final_search=search,
                 final_evaluator=evaluator,
+                post_promotion_handoff_path=post_promotion_s1_path,
+                allow_post_promotion_s1=allow_post_promotion_s1,
             )
         evidence.append(record)
     if len(evidence) != len(evidence_raw):

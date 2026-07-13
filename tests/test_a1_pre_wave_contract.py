@@ -1824,6 +1824,181 @@ def test_seal_rejects_operator_binding_swapped_s1(tmp_path: Path) -> None:
     )
     with pytest.raises(contract.ContractError, match="exact S1 lineage"):
         contract.build_lock(draft)
+
+
+def _post_promotion_s1_chain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> dict[str, object]:
+    draft = _resolved_draft(tmp_path)
+    draft_payload = json.loads(draft.read_text(encoding="utf-8"))
+    legacy_path = _evidence_path(draft_payload, "s1")
+    legacy = json.loads(legacy_path.read_text(encoding="utf-8"))
+    manifest = json.loads(legacy_path.with_name("s1.source.json").read_text())
+    checkpoint = dict(manifest["checkpoint"])
+    search_config = dict(legacy["selected_fields"])
+    search_config["c_scale"] = 0.1
+    identity = {
+        "schema_version": "a1-deployed-agent-search-config-v1",
+        "checkpoint": checkpoint,
+        "search_config": search_config,
+    }
+    identity["agent_identity_sha256"] = contract._digest_value(identity)
+    handoff = {
+        "schema_version": contract.promotion_handoff.HANDOFF_SCHEMA,
+        "promotion_receipt": {"path": str(tmp_path / "promotion.json")},
+        "registry_after": {"checkpoint": checkpoint},
+        "producer_identity": identity,
+    }
+    handoff["handoff_sha256"] = contract._digest_value(handoff)
+    handoff_path = tmp_path / "post-promotion-handoff.json"
+    handoff_path.write_text(json.dumps(handoff) + "\n", encoding="utf-8")
+    monkeypatch.setattr(
+        operator_binding.promotion_handoff,
+        "build_handoff",
+        lambda _receipt: handoff,
+    )
+    s1_path = tmp_path / "s1.post-promotion.binding.json"
+    s2_path = tmp_path / "s2.post-promotion.binding.json"
+    s3_path = tmp_path / "s3.post-promotion.binding.json"
+    operator_binding.write_post_promotion_bindings(
+        legacy_path,
+        handoff_path,
+        s1_path,
+        s2_path,
+        s3_path,
+        binding_time_utc="2026-07-13T20:00:00Z",
+    )
+    raw_search = dict(draft_payload["science"]["search"])
+    raw_search.update(
+        {
+            "c_scale": 0.1,
+            "n_full": 128,
+            "n_fast": 16,
+            "p_full": 0.25,
+            "n_full_wide": None,
+            "n_full_wide_threshold": None,
+            "wide_roots_always_full": False,
+        }
+    )
+    return {
+        "draft": draft,
+        "handoff": handoff,
+        "handoff_path": handoff_path,
+        "legacy_path": legacy_path,
+        "s1_path": s1_path,
+        "s2_path": s2_path,
+        "s3_path": s3_path,
+        "search": contract._search_operator(raw_search),
+        "raw_search": raw_search,
+        "raw_evaluator": draft_payload["science"]["evaluator"],
+        "generation": draft_payload["generation"],
+        "evaluator": contract._effective_evaluator(
+            draft_payload["science"]["evaluator"]
+        ),
+    }
+
+
+def test_v3_post_promotion_s1_bridge_replays_through_s2_s3_and_guard_sync(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = _post_promotion_s1_chain(tmp_path, monkeypatch)
+    semantics = {}
+    for stage in ("s1", "s2", "s3"):
+        path = fixture[f"{stage}_path"]
+        semantics[stage] = contract._validate_search_stage_evidence(
+            json.loads(path.read_text(encoding="utf-8")),
+            path=path,
+            expected_stage=stage,
+            final_search=fixture["search"],
+            final_evaluator=fixture["evaluator"],
+            post_promotion_handoff_path=fixture["handoff_path"],
+            allow_post_promotion_s1=True,
+        )
+    assert semantics["s1"]["checkpoint"] == fixture["handoff"][
+        "producer_identity"
+    ]["checkpoint"]
+    assert semantics["s1"]["selected_fields"]["c_scale"] == 0.1
+    assert semantics["s2"]["selected_fields"] == operator_binding.S2_SELECTED
+    assert semantics["s3"]["selected_fields"] == operator_binding.S3_SELECTED
+
+    guard_path = tmp_path / "generate.guard.json"
+    guard_path.write_bytes(
+        (
+            contract.REPO_ROOT
+            / "configs/guards/generate_gumbel_selfplay_data.json"
+        ).read_bytes()
+    )
+    sync_draft = tmp_path / "post-promotion-sync-draft.json"
+    sync_draft.write_text(
+        json.dumps(
+            {
+                "schema_version": contract.DRAFT_SCHEMA,
+                "promotion_handoff": {
+                    "mode": contract.POST_PROMOTION_HANDOFF_MODE,
+                    "path": str(fixture["handoff_path"]),
+                },
+                "science": {
+                    "search": fixture["raw_search"],
+                    "evaluator": fixture["raw_evaluator"],
+                    "evidence": [{"kind": "s1", "path": str(fixture["s1_path"])}],
+                },
+                "generation": fixture["generation"],
+                "provenance": {"guard_config": str(guard_path)},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    receipt = contract.sync_generation_guard(sync_draft)
+    assert receipt["selected_c_scale"] == 0.1
+    synced = json.loads(guard_path.read_text(encoding="utf-8"))
+    assert synced[contract.GUARD_SYNC_KEY]["source_s1_evidence"] == {
+        "path": str(fixture["s1_path"]),
+        "sha256": contract._sha256(fixture["s1_path"]),
+    }
+
+
+def test_post_promotion_s1_bridge_is_rejected_outside_exact_v3_handoff(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = _post_promotion_s1_chain(tmp_path, monkeypatch)
+    payload = json.loads(fixture["s1_path"].read_text(encoding="utf-8"))
+    with pytest.raises(contract.ContractError, match="only by a v3 post-promotion"):
+        contract._validate_search_stage_evidence(
+            payload,
+            path=fixture["s1_path"],
+            expected_stage="s1",
+            final_search=fixture["search"],
+            final_evaluator=fixture["evaluator"],
+        )
+
+    copied_handoff = tmp_path / "copied-handoff.json"
+    copied_handoff.write_bytes(fixture["handoff_path"].read_bytes())
+    with pytest.raises(contract.ContractError, match="different handoff"):
+        contract._validate_search_stage_evidence(
+            payload,
+            path=fixture["s1_path"],
+            expected_stage="s1",
+            final_search=fixture["search"],
+            final_evaluator=fixture["evaluator"],
+            post_promotion_handoff_path=copied_handoff,
+            allow_post_promotion_s1=True,
+        )
+
+    drifted_search = dict(fixture["search"])
+    drifted_search["sigma_eval"] = 0.77
+    with pytest.raises(contract.ContractError, match="fields mismatch final contract"):
+        contract._validate_search_stage_evidence(
+            payload,
+            path=fixture["s1_path"],
+            expected_stage="s1",
+            final_search=drifted_search,
+            final_evaluator=fixture["evaluator"],
+            post_promotion_handoff_path=fixture["handoff_path"],
+            allow_post_promotion_s1=True,
+        )
+
+
 def test_seal_rejects_stringly_typed_science_booleans(tmp_path: Path) -> None:
     draft = _resolved_draft(tmp_path)
     payload = json.loads(draft.read_text())
@@ -2874,6 +3049,8 @@ def _rich_hard_negative_fixture(tmp_path: Path) -> dict[str, object]:
     evaluation_config = {
         "candidate": str(candidate.resolve()),
         "baseline": str(incumbent.resolve()),
+        "elo0": -10.0,
+        "elo1": 15.0,
         "n_full": 128,
     }
     pair_diagnostics = {
@@ -2882,14 +3059,13 @@ def _rich_hard_negative_fixture(tmp_path: Path) -> dict[str, object]:
         "split_pairs": 1,
         "ww_pairs": 0,
     }
-    pentanomial = {
-        "decision": "continue",
-        "ll_pairs": 0,
-        "mean_pair_score": 0.5,
-        "pairs": 1,
-        "split_pairs": 1,
-        "ww_pairs": 0,
-    }
+    pentanomial = contract.evaluate_pentanomial_sprt(
+        counts=(0, 1, 0),
+        elo0=-10.0,
+        elo1=15.0,
+        alpha=0.05,
+        beta=0.05,
+    )
     held_report = tmp_path / "held-report.json"
     _json_artifact(
         held_report,
@@ -2943,10 +3119,23 @@ def _rich_hard_negative_fixture(tmp_path: Path) -> dict[str, object]:
         "complete_pairs": 1,
         "errors": [],
         "games": 2,
-        "pentanomial_sprt": {"decision": "continue"},
+        "pair_diagnostics": pair_diagnostics,
+        "pentanomial_sprt": contract.evaluate_pentanomial_sprt(
+            counts=(0, 1, 0),
+            elo0=-10.0,
+            elo1=15.0,
+            alpha=0.05,
+            beta=0.05,
+        ),
         "registry_mutation_authorized": False,
         "schema_version": "a1-complete-internal-cohort-receipt-v1",
-        "superiority_pentanomial_sprt": {"decision": "continue"},
+        "superiority_pentanomial_sprt": contract.evaluate_pentanomial_sprt(
+            counts=(0, 1, 0),
+            elo0=0.0,
+            elo1=15.0,
+            alpha=0.05,
+            beta=0.05,
+        ),
         "truncations": 0,
     }
     internal_payload["receipt_sha256"] = contract._digest_value(internal_payload)  # noqa: SLF001
@@ -3331,6 +3520,14 @@ def test_rich_hard_negative_selection_rejects_bundle_drift(
         "suite",
         "held_suite_identity",
         "held_pair_diagnostics",
+        "held_sprt_llr",
+        "held_sprt_decision",
+        "held_sprt_alpha",
+        "internal_pair_diagnostics",
+        "internal_sprt_llr",
+        "internal_sprt_decision",
+        "internal_sprt_alpha",
+        "internal_strict_sprt_decision",
     ],
 )
 def test_rich_hard_negative_selection_rejects_source_identity_drift(
@@ -3428,6 +3625,46 @@ def test_rich_hard_negative_selection_rejects_source_identity_drift(
         _json_artifact(held, payload)
         section["pair_diagnostics"] = payload["pair_diagnostics"]
         section["artifact"] = _sized_ref(held)
+    elif case in {"held_sprt_llr", "held_sprt_decision", "held_sprt_alpha"}:
+        held = fixture["held_report"]
+        section = selection_payload["evidence"]["held_out_high_regret_v5"]
+        payload = json.loads(held.read_text(encoding="utf-8"))
+        if case == "held_sprt_llr":
+            payload["pentanomial_sprt"]["llr"] += 1.0
+        elif case == "held_sprt_decision":
+            payload["pentanomial_sprt"]["decision"] = "H1"
+        else:
+            payload["pentanomial_sprt"]["alpha"] = 0.1
+        _json_artifact(held, payload)
+        section["pentanomial_sprt"] = payload["pentanomial_sprt"]
+        section["artifact"] = _sized_ref(held)
+    elif case in {
+        "internal_pair_diagnostics",
+        "internal_sprt_llr",
+        "internal_sprt_decision",
+        "internal_sprt_alpha",
+        "internal_strict_sprt_decision",
+    }:
+        artifact = fixture["internal_report"]
+        section = selection_payload["evidence"]["matched_internal_v5"]
+        payload = json.loads(artifact.read_text(encoding="utf-8"))
+        if case == "internal_pair_diagnostics":
+            payload["pair_diagnostics"]["ll_pairs"] = 1
+            payload["pair_diagnostics"]["split_pairs"] = 0
+        elif case == "internal_sprt_llr":
+            payload["pentanomial_sprt"]["llr"] += 1.0
+        elif case == "internal_sprt_decision":
+            payload["pentanomial_sprt"]["decision"] = "H1"
+            section["pentanomial_decision"] = "H1"
+        elif case == "internal_sprt_alpha":
+            payload["pentanomial_sprt"]["alpha"] = 0.1
+        else:
+            payload["superiority_pentanomial_sprt"]["decision"] = "H1"
+            section["strict_superiority_decision"] = "H1"
+        payload.pop("receipt_sha256")
+        payload["receipt_sha256"] = contract._digest_value(payload)  # noqa: SLF001
+        _json_artifact(artifact, payload)
+        section["artifact"] = _sized_ref(artifact)
     selection_payload.pop("selection_sha256")
     selection_payload["selection_sha256"] = contract._digest_value(  # noqa: SLF001
         selection_payload

@@ -31,9 +31,11 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from tools import search_teacher_adjudicator as search_adjudicator  # noqa: E402
+from tools import a1_post_promotion_handoff as promotion_handoff  # noqa: E402
 
 
 SCHEMA = "rl-rnd-operator-binding-v1"
+POST_PROMOTION_S1_SCHEMA = "rl-rnd-post-promotion-s1-operator-binding-v1"
 ARTIFACT_KIND = "operator_choice_not_strength_evidence"
 STATEMENT = (
     "This artifact records an explicit operator choice for the current wave; "
@@ -44,6 +46,28 @@ S2_REASON = "operator_directive_bind_global_n128_without_n64_strength_test"
 S3_REASON = "operator_directive_hold_adaptive_n256_without_s3_strength_test"
 S2_OPERATOR = "global_n128"
 S3_OPERATOR = "adaptive_n256_disabled"
+POST_PROMOTION_S1_OPERATOR = "deployed_c_scale_continuity"
+POST_PROMOTION_S1_REASON = (
+    "committed_post_promotion_handoff_requires_c_scale_continuity"
+)
+POST_PROMOTION_S1_STATEMENT = (
+    "This artifact records only the deployed c_scale continuity required by "
+    "the committed post-promotion handoff; it is an operator choice, not "
+    "strength evidence, and changes no other replayed S1 field."
+)
+POST_PROMOTION_S1_OVERRIDE = {
+    "authorization": "committed_post_promotion_handoff_deployed_identity",
+    "deployed_value": 0.1,
+    "field": "c_scale",
+    "legacy_value": 0.03,
+}
+S1_SELECTED_KEYS = {
+    "c_scale",
+    "rescale_noise_floor_c",
+    "sigma_eval",
+    "symmetry_averaged_eval",
+    "symmetry_averaged_eval_threshold",
+}
 S2_SELECTED = {"n_full": 128, "n_fast": 16, "p_full": 0.25}
 S3_SELECTED = {
     "n_full_wide": None,
@@ -110,6 +134,21 @@ def _load_json(path: Path) -> dict[str, Any]:
 def _reference(path: Path) -> dict[str, str]:
     resolved = path.expanduser().resolve(strict=True)
     return {"path": str(resolved), "sha256": _sha256(resolved)}
+
+
+def _resolve_reference(
+    raw: Any, *, owner_path: Path, where: str
+) -> tuple[Path, dict[str, str]]:
+    if not isinstance(raw, dict) or set(raw) != {"path", "sha256"}:
+        raise BindingError(f"{where} must contain exactly path and sha256")
+    candidate = Path(str(raw["path"])).expanduser()
+    if not candidate.is_absolute():
+        candidate = owner_path.parent / candidate
+    candidate = candidate.resolve(strict=True)
+    actual = _sha256(candidate)
+    if actual != raw["sha256"]:
+        raise BindingError(f"{where} hash drift at {candidate}")
+    return candidate, {"path": str(candidate), "sha256": actual}
 
 
 def _parse_utc(raw: str | None) -> str:
@@ -210,6 +249,148 @@ def _replay_s1(path: Path) -> dict[str, Any]:
     return payload
 
 
+def _replay_post_promotion_handoff(path: Path) -> dict[str, Any]:
+    handoff_path = path.expanduser().resolve(strict=True)
+    payload = _load_json(handoff_path)
+    if payload.get("schema_version") != promotion_handoff.HANDOFF_SCHEMA:
+        raise BindingError("post-promotion handoff schema is unsupported")
+    unhashed = dict(payload)
+    declared = unhashed.pop("handoff_sha256", None)
+    if declared != _digest_value(unhashed):
+        raise BindingError("post-promotion handoff semantic digest mismatch")
+    receipt = payload.get("promotion_receipt")
+    if not isinstance(receipt, dict) or not isinstance(receipt.get("path"), str):
+        raise BindingError("post-promotion handoff has no promotion receipt")
+    try:
+        replayed = promotion_handoff.build_handoff(Path(receipt["path"]))
+    except promotion_handoff.HandoffError as error:
+        raise BindingError(f"post-promotion handoff replay failed: {error}") from error
+    if replayed != payload:
+        raise BindingError("post-promotion handoff differs from committed live lineage")
+    return payload
+
+
+def build_post_promotion_s1_binding(
+    legacy_s1_decision_path: Path,
+    post_promotion_handoff_path: Path,
+    *,
+    binding_time_utc: str | None = None,
+    emitter_path: Path | None = None,
+) -> dict[str, Any]:
+    """Project exactly one handoff-authorized c_scale continuity override."""
+
+    legacy = _replay_s1(legacy_s1_decision_path)
+    legacy_selected = legacy.get("selected_fields")
+    if not isinstance(legacy_selected, dict) or set(legacy_selected) != S1_SELECTED_KEYS:
+        raise BindingError("legacy S1 selected_fields have an unsupported shape")
+    if legacy_selected.get("c_scale") != POST_PROMOTION_S1_OVERRIDE["legacy_value"]:
+        raise BindingError("post-promotion S1 bridge requires replayed legacy c_scale=.03")
+
+    handoff_path = post_promotion_handoff_path.expanduser().resolve(strict=True)
+    handoff = _replay_post_promotion_handoff(handoff_path)
+    identity = handoff.get("producer_identity")
+    if not isinstance(identity, dict):
+        raise BindingError("post-promotion handoff has no producer identity")
+    checkpoint = identity.get("checkpoint")
+    search_config = identity.get("search_config")
+    if (
+        not isinstance(checkpoint, dict)
+        or set(checkpoint) != {"path", "sha256"}
+        or not isinstance(search_config, dict)
+    ):
+        raise BindingError("post-promotion producer identity is malformed")
+    checkpoint_path = Path(str(checkpoint["path"])).expanduser().resolve(strict=True)
+    if _sha256(checkpoint_path) != checkpoint["sha256"]:
+        raise BindingError("post-promotion producer checkpoint hash drift")
+    if handoff.get("registry_after", {}).get("checkpoint") != checkpoint:
+        raise BindingError("post-promotion registry and producer checkpoint differ")
+    deployed_c_scale = search_config.get("c_scale")
+    if deployed_c_scale != POST_PROMOTION_S1_OVERRIDE["deployed_value"]:
+        raise BindingError("post-promotion S1 bridge permits only deployed c_scale=.10")
+    for key in S1_SELECTED_KEYS - {"c_scale"}:
+        if search_config.get(key) != legacy_selected[key]:
+            raise BindingError(
+                f"post-promotion producer changes non-continuity S1 field {key}"
+            )
+
+    selected = dict(legacy_selected)
+    selected["c_scale"] = deployed_c_scale
+    timestamp = _parse_utc(binding_time_utc)
+    emitter_ref = _reference(Path(__file__) if emitter_path is None else emitter_path)
+    source_handoff = _reference(handoff_path)
+    source_handoff["handoff_sha256"] = handoff["handoff_sha256"]
+    return _seal_payload(
+        {
+            "schema_version": POST_PROMOTION_S1_SCHEMA,
+            "artifact_kind": ARTIFACT_KIND,
+            "stage": "s1",
+            "operator": POST_PROMOTION_S1_OPERATOR,
+            "passed": True,
+            "decision": "operator_bind",
+            "reason": POST_PROMOTION_S1_REASON,
+            "binding_time_utc": timestamp,
+            "statement": POST_PROMOTION_S1_STATEMENT,
+            "selected_fields": selected,
+            "selected_fields_sha256": _digest_value(selected),
+            "source_legacy_s1": _reference(legacy_s1_decision_path),
+            "source_legacy_s1_selected_fields_sha256": legacy[
+                "selected_fields_sha256"
+            ],
+            "source_post_promotion_handoff": source_handoff,
+            "producer_checkpoint": dict(checkpoint),
+            "producer_identity_sha256": identity.get("agent_identity_sha256"),
+            "producer_search_config_sha256": _digest_value(search_config),
+            "continuity_override": dict(POST_PROMOTION_S1_OVERRIDE),
+            "emitter": emitter_ref,
+        }
+    )
+
+
+def _replay_post_promotion_s1(path: Path) -> dict[str, Any]:
+    binding_path = path.expanduser().resolve(strict=True)
+    payload = _load_json(binding_path)
+    if payload.get("schema_version") != POST_PROMOTION_S1_SCHEMA:
+        raise BindingError("post-promotion S1 operator-binding schema mismatch")
+    legacy_path, _ = _resolve_reference(
+        payload.get("source_legacy_s1"),
+        owner_path=binding_path,
+        where="post-promotion S1 legacy source",
+    )
+    handoff_ref = payload.get("source_post_promotion_handoff")
+    if not isinstance(handoff_ref, dict) or set(handoff_ref) != {
+        "path",
+        "sha256",
+        "handoff_sha256",
+    }:
+        raise BindingError("post-promotion S1 handoff reference is malformed")
+    handoff_path, _ = _resolve_reference(
+        {"path": handoff_ref["path"], "sha256": handoff_ref["sha256"]},
+        owner_path=binding_path,
+        where="post-promotion S1 handoff source",
+    )
+    emitter_path, _ = _resolve_reference(
+        payload.get("emitter"),
+        owner_path=binding_path,
+        where="post-promotion S1 emitter",
+    )
+    replayed = build_post_promotion_s1_binding(
+        legacy_path,
+        handoff_path,
+        binding_time_utc=payload.get("binding_time_utc"),
+        emitter_path=emitter_path,
+    )
+    if replayed != payload:
+        raise BindingError("post-promotion S1 binding does not equal semantic replay")
+    return payload
+
+
+def _replay_source_s1(path: Path) -> dict[str, Any]:
+    payload = _load_json(path.expanduser().resolve(strict=True))
+    if payload.get("schema_version") == POST_PROMOTION_S1_SCHEMA:
+        return _replay_post_promotion_s1(path)
+    return _replay_s1(path)
+
+
 def _seal_payload(payload: dict[str, Any]) -> dict[str, Any]:
     if "artifact_content_sha256" in payload:
         raise BindingError("operator binding payload is already sealed")
@@ -227,7 +408,7 @@ def build_bindings(
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Build both payloads, optionally replaying a hash-validated emitter path."""
 
-    s1_payload = _replay_s1(s1_decision_path)
+    s1_payload = _replay_source_s1(s1_decision_path)
     s1_ref = _reference(s1_decision_path)
     emitter_ref = _reference(Path(__file__) if emitter_path is None else emitter_path)
     timestamp = _parse_utc(binding_time_utc)
@@ -294,6 +475,7 @@ def write_bindings(
     s3_output_path: Path,
     *,
     binding_time_utc: str | None = None,
+    emitter_path: Path | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Create both outputs read-only, refusing any existing destination."""
 
@@ -308,6 +490,7 @@ def write_bindings(
         s1_decision_path,
         s2_output_path=s2_output_path,
         binding_time_utc=binding_time_utc,
+        emitter_path=emitter_path,
     )
     created: list[Path] = []
     try:
@@ -323,9 +506,68 @@ def write_bindings(
     return s2, s3
 
 
+def write_post_promotion_bindings(
+    legacy_s1_decision_path: Path,
+    post_promotion_handoff_path: Path,
+    s1_output_path: Path,
+    s2_output_path: Path,
+    s3_output_path: Path,
+    *,
+    binding_time_utc: str | None = None,
+    emitter_path: Path | None = None,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """Create one S1 continuity binding and fresh S2/S3 descendants atomically."""
+
+    outputs = [
+        path.expanduser().absolute()
+        for path in (s1_output_path, s2_output_path, s3_output_path)
+    ]
+    if len(set(outputs)) != len(outputs):
+        raise BindingError("S1, S2, and S3 output paths must differ")
+    existing = [path for path in outputs if path.exists()]
+    if existing:
+        raise BindingError(f"refusing to overwrite existing output(s): {existing}")
+    timestamp = _parse_utc(binding_time_utc)
+    s1 = build_post_promotion_s1_binding(
+        legacy_s1_decision_path,
+        post_promotion_handoff_path,
+        binding_time_utc=timestamp,
+        emitter_path=emitter_path,
+    )
+    created: list[Path] = []
+    try:
+        _write_read_only_new(outputs[0], s1)
+        created.append(outputs[0])
+        s2, s3 = build_bindings(
+            outputs[0],
+            s2_output_path=outputs[1],
+            binding_time_utc=timestamp,
+            emitter_path=emitter_path,
+        )
+        _write_read_only_new(outputs[1], s2)
+        created.append(outputs[1])
+        _write_read_only_new(outputs[2], s3)
+        created.append(outputs[2])
+    except Exception:
+        for path in reversed(created):
+            path.chmod(0o600)
+            path.unlink(missing_ok=True)
+        raise
+    return s1, s2, s3
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--s1-decision", required=True)
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--s1-decision")
+    source.add_argument("--legacy-s1-decision")
+    parser.add_argument("--post-promotion-handoff")
+    parser.add_argument("--s1-out")
+    parser.add_argument(
+        "--emitter-path",
+        default=None,
+        help="Optional immutable copy of this emitter to bind for future replay.",
+    )
     parser.add_argument("--s2-out", required=True)
     parser.add_argument("--s3-out", required=True)
     parser.add_argument(
@@ -335,29 +577,59 @@ def main() -> int:
     )
     args = parser.parse_args()
     try:
-        s2, s3 = write_bindings(
-            Path(args.s1_decision),
-            Path(args.s2_out),
-            Path(args.s3_out),
-            binding_time_utc=args.binding_time_utc,
-        )
+        if args.legacy_s1_decision is not None:
+            if args.post_promotion_handoff is None or args.s1_out is None:
+                raise BindingError(
+                    "--legacy-s1-decision requires --post-promotion-handoff and --s1-out"
+                )
+            s1, s2, s3 = write_post_promotion_bindings(
+                Path(args.legacy_s1_decision),
+                Path(args.post_promotion_handoff),
+                Path(args.s1_out),
+                Path(args.s2_out),
+                Path(args.s3_out),
+                binding_time_utc=args.binding_time_utc,
+                emitter_path=(
+                    None if args.emitter_path is None else Path(args.emitter_path)
+                ),
+            )
+        else:
+            if args.post_promotion_handoff is not None or args.s1_out is not None:
+                raise BindingError(
+                    "--post-promotion-handoff/--s1-out require --legacy-s1-decision"
+                )
+            s1 = None
+            s2, s3 = write_bindings(
+                Path(args.s1_decision),
+                Path(args.s2_out),
+                Path(args.s3_out),
+                binding_time_utc=args.binding_time_utc,
+                emitter_path=(
+                    None if args.emitter_path is None else Path(args.emitter_path)
+                ),
+            )
     except (BindingError, OSError) as error:
         parser.exit(2, f"operator binding failed: {error}\n")
-    print(
-        json.dumps(
-            {
-                "s2": {
-                    "path": str(Path(args.s2_out).expanduser().absolute()),
-                    "artifact_content_sha256": s2["artifact_content_sha256"],
-                },
-                "s3": {
-                    "path": str(Path(args.s3_out).expanduser().absolute()),
-                    "artifact_content_sha256": s3["artifact_content_sha256"],
-                },
+    outputs: dict[str, Any] = {}
+    if s1 is not None:
+        outputs["s1"] = {
+            "path": str(Path(args.s1_out).expanduser().absolute()),
+            "artifact_content_sha256": s1["artifact_content_sha256"],
+        }
+    outputs.update(
+        {
+            "s2": {
+                "path": str(Path(args.s2_out).expanduser().absolute()),
+                "artifact_content_sha256": s2["artifact_content_sha256"],
             },
-            indent=2,
-            sort_keys=True,
-        )
+            "s3": {
+                "path": str(Path(args.s3_out).expanduser().absolute()),
+                "artifact_content_sha256": s3["artifact_content_sha256"],
+            },
+        }
+    )
+    print(
+        json.dumps(outputs, indent=2, sort_keys=True)
     )
     return 0
 
