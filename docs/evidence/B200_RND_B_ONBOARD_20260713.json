@@ -1,0 +1,51 @@
+{
+  "schema_version": "b200-rnd-host-onboard-v1",
+  "alias": "b200-rnd-b",
+  "role": "independent learner and RL R&D lane",
+  "accelerator": {
+    "count": 8,
+    "model": "NVIDIA B200",
+    "memory_mib_each": 183359,
+    "nvlink_topology": "NV18 full mesh"
+  },
+  "host": {
+    "cpu_threads": 208,
+    "cpu_model": "Intel Xeon 8592+",
+    "numa_domains": 4,
+    "gpu_numa_pairs": [
+      [0, 1],
+      [2, 3],
+      [4, 5],
+      [6, 7]
+    ],
+    "ram_tib": 2.8,
+    "local_disk_free_tib": 22
+  },
+  "nccl_all_reduce": {
+    "tool": "nccl-tests 2.14.1",
+    "nccl": "2.26.2",
+    "gpu_count": 8,
+    "minimum_bytes": 8388608,
+    "maximum_bytes": 1073741824,
+    "iterations": 10,
+    "warmup_iterations": 5,
+    "average_bus_bandwidth_gbps": 485.834,
+    "one_gib_out_of_place_algorithm_bandwidth_gbps": 415.32,
+    "one_gib_out_of_place_bus_bandwidth_gbps": 726.81,
+    "one_gib_in_place_algorithm_bandwidth_gbps": 413.25,
+    "one_gib_in_place_bus_bandwidth_gbps": 723.18,
+    "wrong_values": 0,
+    "command": "LD_LIBRARY_PATH=/usr/mpi/gcc/openmpi-4.1.7rc1/lib all_reduce_perf -b 8M -e 1G -f 2 -g 8 -n 10 -w 5 -c 1"
+  },
+  "data_path": {
+    "transport": "direct host-to-host rsync over SSH",
+    "operator_workstation_in_data_path": false,
+    "corpus": "exact authenticated TEMP n128+n256+replay composite",
+    "checkpoint": "f7 parent"
+  },
+  "acceptance": {
+    "eight_gpu_collective": "pass",
+    "collective_validation": "pass",
+    "eligible_for_eight_rank_ddp_rnd": true
+  }
+}
