@@ -91,6 +91,7 @@ def test_plan_matches_global_batch_warmup_and_total_samples(
     assert [run["grad_accum_steps"] for run in plan["runs"]] == [1, 1]
     assert [run["gpu_ids"] for run in plan["runs"]] == [list(range(8)), list(range(4))]
     assert {run["global_batch_size"] for run in plan["runs"]} == {4096}
+    assert [run["lr"] for run in plan["runs"]] == pytest.approx([3e-5, 3e-5])
     assert {run["warmup_samples"] for run in plan["runs"]} == {409_600}
     assert {run["planned_samples"] for run in plan["runs"]} == {2_097_152}
     assert plan["matched_invariants"]["warmup_samples"] == 409_600

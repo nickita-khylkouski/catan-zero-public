@@ -204,6 +204,10 @@ def build_plan(
                 "world_size": world_size,
                 "gpu_ids": list(gpu_ids),
                 "global_batch_size": global_batch,
+                # `batch_probe.summarize` consumes the per-run LR.  Keeping it
+                # only in matched_invariants lets training finish successfully
+                # and then makes post-processing fail with KeyError("lr").
+                "lr": float(_value(base, "--lr")),
                 "lr_warmup_steps": 100,
                 "warmup_samples": 100 * global_batch,
                 "max_steps": optimizer_steps,
