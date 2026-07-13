@@ -35,8 +35,11 @@ superiority remained just short of its boundary and therefore correctly stayed
 `continue`.  Search seconds per call were matched to 0.1%.  This historical
 comparison is not promotion-eligible because the candidate parent is f7 rather
 than v5, but it proves that the bounded independent n256 learner retained real
-strength even against the newer incumbent.  A predeclared fresh-cohort
-replication is running before any frontier selection.
+strength even against the newer incumbent.  A predeclared second 600-pair
+cohort replicated the result at `658-542` (`54.83%`,
+`WW/split/LL=161/336/103`) and crossed the strict `[0,+15]` pentanomial H1
+boundary. Combined across the two independent cohorts, the candidate scored
+`1298-1102/2400` (`54.08%`, about +28 Elo) with no errors or truncations.
 
 ## Causal reconstruction of the failed lineage
 
