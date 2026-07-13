@@ -833,6 +833,7 @@ def test_role_specific_wide_budget_overrides_only_candidate():
         baseline_n_full=128,
         candidate_n_full_wide=256,
         candidate_n_full_wide_threshold=40,
+        wide_roots_always_full=True,
     )
     budgets = _resolve_search_budgets(worker_args)
 
@@ -854,8 +855,10 @@ def test_role_specific_wide_budget_overrides_only_candidate():
     assert candidate.n_full == baseline.n_full == 128
     assert candidate.n_full_wide == 256
     assert candidate.n_full_wide_threshold == 40
+    assert candidate.wide_roots_always_full is True
     assert baseline.n_full_wide is None
     assert baseline.n_full_wide_threshold is None
+    assert baseline.wide_roots_always_full is True
 
 
 def test_shared_wide_budget_is_backward_compatible_fallback():
@@ -1050,6 +1053,7 @@ def test_h2h_summary_records_resolved_adaptive_budget_by_role():
     assert summary["baseline_n_full_wide"] is None
     assert summary["candidate_n_full_wide_threshold"] == 40
     assert summary["baseline_n_full_wide_threshold"] is None
+    assert summary["wide_roots_always_full"] is False
     assert summary["symmetry_averaged_eval_threshold"] == 20
     assert summary["rescale_noise_floor_c"] == 0.25
     assert summary["sigma_eval"] == 0.5
@@ -1084,11 +1088,13 @@ def test_h2h_summary_records_resolved_adaptive_budget_by_role():
             "n_full": 128,
             "n_full_wide": 256,
             "n_full_wide_threshold": 40,
+            "wide_roots_always_full": False,
         },
         "baseline": {
             "n_full": 128,
             "n_full_wide": None,
             "n_full_wide_threshold": None,
+            "wide_roots_always_full": False,
         },
     }
     telemetry = summary["search_telemetry"]

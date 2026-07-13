@@ -1529,6 +1529,15 @@ def main() -> None:
         "--n-full-wide-threshold).",
     )
     parser.add_argument(
+        "--wide-roots-always-full",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Bypass the p_full coin at roots selected by n_full_wide. This is a "
+            "shared semantic switch: a role with n_full_wide disabled is unchanged."
+        ),
+    )
+    parser.add_argument(
         "--raw-policy-above-width",
         type=int,
         default=None,
@@ -1615,6 +1624,18 @@ def main() -> None:
     parser.add_argument("--out", required=True)
     add_config_flags(parser, default_purpose="gumbel_search_cross_net_h2h")
     args = parser.parse_args()
+    if bool(args.wide_roots_always_full) and all(
+        value is None
+        for value in (
+            args.n_full_wide,
+            args.candidate_n_full_wide,
+            args.baseline_n_full_wide,
+        )
+    ):
+        parser.error(
+            "--wide-roots-always-full requires at least one shared or role-specific "
+            "n_full_wide budget"
+        )
     if bool(args.native_mcts_hot_loop) and not native_hot_loop_available():
         parser.error(
             "--native-mcts-hot-loop requires a matching catanatron_rs wheel "
@@ -1823,6 +1844,7 @@ def main() -> None:
                 if args.n_full_wide_threshold is not None
                 else None
             ),
+            "wide_roots_always_full": bool(args.wide_roots_always_full),
             "raw_policy_above_width": (
                 int(args.raw_policy_above_width)
                 if args.raw_policy_above_width is not None
@@ -2114,16 +2136,25 @@ def _build_summary(
         "baseline_n_full_wide": budgets["baseline_n_full_wide"],
         "candidate_n_full_wide_threshold": budgets["candidate_n_full_wide_threshold"],
         "baseline_n_full_wide_threshold": budgets["baseline_n_full_wide_threshold"],
+        "wide_roots_always_full": bool(
+            getattr(args, "wide_roots_always_full", False)
+        ),
         "search_budgets_by_role": {
             "candidate": {
                 "n_full": resolved_candidate_n_full,
                 "n_full_wide": budgets["candidate_n_full_wide"],
                 "n_full_wide_threshold": budgets["candidate_n_full_wide_threshold"],
+                "wide_roots_always_full": bool(
+                    getattr(args, "wide_roots_always_full", False)
+                ),
             },
             "baseline": {
                 "n_full": resolved_baseline_n_full,
                 "n_full_wide": budgets["baseline_n_full_wide"],
                 "n_full_wide_threshold": budgets["baseline_n_full_wide_threshold"],
+                "wide_roots_always_full": bool(
+                    getattr(args, "wide_roots_always_full", False)
+                ),
             },
         },
         "raw_policy_above_width": (
