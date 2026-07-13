@@ -107,6 +107,35 @@ def test_combined_topology_gather_upgrade_is_bit_identical_at_init():
         assert torch.equal(control[name], treatment[name]), name
 
 
+def test_topology_only_upgrade_preserves_trained_nonzero_gather_outputs():
+    torch.manual_seed(13)
+    gather = EntityGraphNet(_config(action_target_gather=True)).eval()
+    with torch.no_grad():
+        gather.target_gather_proj[1].weight.copy_(
+            torch.eye(gather.config.hidden_size)
+        )
+        gather.target_gather_proj[1].bias.fill_(0.125)
+    assert torch.count_nonzero(gather.target_gather_proj[1].weight).item() > 0
+
+    treatment = EntityGraphNet(
+        _config(topology_residual_adapter=True, action_target_gather=True)
+    ).eval()
+    missing, unexpected = treatment.load_state_dict(gather.state_dict(), strict=False)
+    assert not unexpected
+    assert missing
+    assert all(name.startswith("topology_residual_adapter.") for name in missing)
+    for name, expected in gather.target_gather_proj.state_dict().items():
+        assert torch.equal(treatment.target_gather_proj.state_dict()[name], expected)
+
+    batch = _batch()
+    with torch.no_grad():
+        control = gather(batch, return_q=True)
+        upgraded = treatment(batch, return_q=True)
+    assert control.keys() == upgraded.keys()
+    for name in control:
+        assert torch.equal(control[name], upgraded[name]), name
+
+
 def test_topology_gather_and_belief_head_compose_without_main_output_drift():
     torch.manual_seed(17)
     base = EntityGraphNet(_config()).eval()
