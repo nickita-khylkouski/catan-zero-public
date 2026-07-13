@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
-"""Prepare or explicitly launch the corrected mixed MSE/HL-Gauss probe.
+"""Decode the historical mixed MSE/HL-Gauss probe without launching it.
 
-Preparation is the default. GPU work requires ``--go`` and every generated
-artifact is diagnostic-only and non-promotable.
+This v1 experiment predates the matched-play learner-dose selection.  It changes
+the LR, component scope, forced-row weight, game weighting, and training dose
+alongside the value objective, so it cannot answer whether categorical value is
+better.  Preparation remains available to audit old artifacts; GPU execution is
+fail-closed.  A replacement must derive from the selected TEMP descriptor and
+commission the fresh categorical head before an integrated learner comparison.
 """
 
 from __future__ import annotations
@@ -11,13 +15,17 @@ import argparse
 import hashlib
 import json
 import os
-import subprocess
 import sys
 from pathlib import Path
 from typing import Any, Sequence
 
 
-SCHEMA = "a1-mixed-value-objective-probe-v1"
+SCHEMA = "a1-mixed-value-objective-probe-v2-obsolete"
+OBSOLETE_REASON = (
+    "obsolete confounded operator: non-selected LR, current-only component scope, "
+    "forced_row_value_weight=0.1, per-game/sqrt weighting, and uncapped whole-corpus "
+    "training; rebind to the selected TEMP dose before GPU execution"
+)
 ALLOWED_LRS = {
     "6e-5": 0.00006,
     "1.2e-4": 0.00012,
@@ -222,23 +230,8 @@ def _receipt(arm: dict[str, Any], manifest_path: Path) -> dict[str, Any]:
 
 
 def _launch(manifest: dict[str, Any], manifest_path: Path) -> None:
-    for arm_name in ARMS:
-        arm = manifest["arms"][arm_name]
-        receipt_path = Path(arm["receipt"])
-        if receipt_path.exists():
-            raise SystemExit(f"REFUSED: completed arm already has a receipt: {arm_name}")
-        for output in (arm["checkpoint"], arm["report"]):
-            if Path(output).exists():
-                raise SystemExit(f"REFUSED: partial output exists without receipt: {output}")
-        arm_dir = receipt_path.parent
-        arm_dir.mkdir(parents=True, exist_ok=True)
-        with (arm_dir / "stdout.log").open("x", encoding="utf-8") as stdout, (
-            arm_dir / "stderr.log"
-        ).open("x", encoding="utf-8") as stderr:
-            subprocess.run(arm["command"], check=True, stdout=stdout, stderr=stderr)
-        if not Path(arm["checkpoint"]).is_file() or not Path(arm["report"]).is_file():
-            raise SystemExit(f"REFUSED: {arm_name} completed without checkpoint/report")
-        _write_once_or_match(receipt_path, _receipt(arm, manifest_path))
+    del manifest, manifest_path
+    raise SystemExit(f"REFUSED: {OBSOLETE_REASON}")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -303,6 +296,8 @@ def prepare(args: argparse.Namespace) -> tuple[dict[str, Any], Path]:
         "schema_version": SCHEMA,
         "diagnostic_only": True,
         "promotion_eligible": False,
+        "launch_authorized": False,
+        "obsolete_reason": OBSOLETE_REASON,
         "lr_curve_verdict_selection": args.lr,
         "lr": lr,
         "topology": {

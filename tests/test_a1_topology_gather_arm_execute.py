@@ -25,24 +25,22 @@ def _manifest(
     manifest, path = arm.prepare(_args(tmp_path, monkeypatch))
     repo = Path(arm.__file__).resolve().parents[1]
     executor_path = Path(executor.__file__).resolve()
+    files = {
+        relative: arm.corrected._file_ref(repo / relative)
+        for relative in arm.SOURCE_FILES
+    }
     manifest["source_binding"] = {
         "repository_root": str(repo),
         "git_commit": "topology-test-head",
-        "files": {
-            arm.EXECUTOR_RELATIVE_PATH: arm.corrected._file_ref(executor_path),
-        },
+        "files": files,
+        "files_sha256": arm.corrected._digest(files),
     }
     manifest["diagnostic_executor"] = arm.corrected._file_ref(executor_path)
     _write_manifest(path, manifest)
-    source_repo = tmp_path / "source-checkout"
     monkeypatch.setattr(
         executor.base,
         "_git_head",
-        lambda candidate: (
-            "source-test-head"
-            if Path(candidate).resolve() == source_repo.resolve()
-            else "topology-test-head"
-        ),
+        lambda _candidate: "topology-test-head",
     )
     return path, manifest
 
@@ -69,10 +67,10 @@ def test_verify_binds_executor_source_and_exact_inputs(
     assert arm.corrected._option(verified["command"], "--init-checkpoint") == (
         manifest["initialization_treatment"]["path"]
     )
-    assert verified["repo"] == (tmp_path / "source-checkout").resolve()
+    assert verified["repo"] == (tmp_path / "geometry-checkout").resolve()
 
 
-def test_verify_preserves_bound_source_trainer_instead_of_current_checkout(
+def test_verify_preserves_bound_geometry_trainer_instead_of_current_checkout(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     path, payload = _manifest(tmp_path, monkeypatch)
@@ -85,17 +83,17 @@ def test_verify_preserves_bound_source_trainer_instead_of_current_checkout(
     payload["command"][trainer_index] = str(current_trainer)
     payload["command_sha256"] = arm.corrected._digest(payload["command"])
     _write_manifest(path, payload)
-    with pytest.raises(executor.ExecutionError, match="bound selected-TEMP trainer"):
+    with pytest.raises(executor.ExecutionError, match="bound selected-geometry trainer"):
         executor.verify(path)
 
 
-def test_verify_refuses_bound_source_trainer_byte_drift(
+def test_verify_refuses_bound_geometry_trainer_byte_drift(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     path, _payload = _manifest(tmp_path, monkeypatch)
-    trainer = tmp_path / "source-checkout/tools/train_bc.py"
-    trainer.write_text("# drifted after source manifest\n", encoding="utf-8")
-    with pytest.raises(executor.ExecutionError, match="corrected_source.*bytes drifted"):
+    trainer = tmp_path / "geometry-checkout/tools/train_bc.py"
+    trainer.write_text("# drifted after geometry plan\n", encoding="utf-8")
+    with pytest.raises(executor.ExecutionError, match="selected geometry trainer checkout/bytes drifted"):
         executor.verify(path)
 
 

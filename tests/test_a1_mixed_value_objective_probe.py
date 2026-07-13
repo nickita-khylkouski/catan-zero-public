@@ -81,21 +81,14 @@ def _option(command: list[str], name: str) -> str:
     return command[command.index(name) + 1]
 
 
-def test_prepare_builds_matched_nonpromotable_no_copy_world8_plan(tmp_path, monkeypatch):
-    called = False
-
-    def refuse_launch(*_args, **_kwargs):
-        nonlocal called
-        called = True
-        raise AssertionError("dry preparation launched work")
-
-    monkeypatch.setattr(probe.subprocess, "run", refuse_launch)
+def test_prepare_builds_matched_nonpromotable_no_copy_world8_plan(tmp_path):
     probe.main(_argv(tmp_path))
-    assert called is False
 
     manifest = json.loads((tmp_path / "out/experiment.manifest.json").read_text())
     assert manifest["diagnostic_only"] is True
     assert manifest["promotion_eligible"] is False
+    assert manifest["launch_authorized"] is False
+    assert manifest["obsolete_reason"] == probe.OBSOLETE_REASON
     assert manifest["lr_curve_verdict_selection"] == "1.2e-4"
     assert manifest["lr"] == pytest.approx(0.00012)
     assert manifest["topology"] == {
@@ -196,3 +189,8 @@ def test_existing_prepared_plan_is_idempotent_but_recipe_drift_is_refused(tmp_pa
     descriptor.write_text(json.dumps(payload), encoding="utf-8")
     with pytest.raises(SystemExit, match="prepared artifact drift"):
         probe.prepare(args)
+
+
+def test_gpu_launch_is_fail_closed_even_when_go_is_explicit(tmp_path) -> None:
+    with pytest.raises(SystemExit, match="obsolete confounded operator"):
+        probe.main([*_argv(tmp_path), "--go"])

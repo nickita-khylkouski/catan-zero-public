@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-"""Seal or explicitly launch the matched mixed-data relational architecture A/B."""
+"""Decode the historical mixed-data architecture A/B without launching it.
+
+The v2 operator inherits the obsolete mixed-value probe's non-selected LR,
+two-component data scope, weighting changes, BF16 precision, and arbitrary step
+count.  It is not the selected-dose target-gather experiment and must not spend
+GPU time.  The function-preserving commissioning arm in
+``a1_topology_gather_arm.py`` supersedes it.
+"""
 
 from __future__ import annotations
 
@@ -17,7 +24,11 @@ if str(REPO_ROOT) not in sys.path:
 from tools import a1_mixed_value_objective_probe as common  # noqa: E402
 
 
-SCHEMA = "a1-mixed-gather-architecture-probe-v2"
+SCHEMA = "a1-mixed-gather-architecture-probe-v3-obsolete"
+OBSOLETE_REASON = (
+    "obsolete confounded architecture operator; use the selected-row-dose "
+    "function-preserving gather commissioning arm"
+)
 ARMS = ("baseline", "target_gather")
 SOURCE_PATHS = (
     "tools/a1_mixed_architecture_probe.py",
@@ -307,22 +318,8 @@ def _receipt(arm: dict[str, Any], manifest_path: Path) -> dict[str, Any]:
 
 
 def _launch(manifest: dict[str, Any], manifest_path: Path) -> None:
-    for arm_name in ARMS:
-        arm = manifest["arms"][arm_name]
-        receipt_path = Path(arm["receipt"])
-        if receipt_path.exists():
-            raise SystemExit(f"REFUSED: completed arm already exists: {arm_name}")
-        for output in (arm["checkpoint"], arm["report"]):
-            if Path(output).exists():
-                raise SystemExit(f"REFUSED: partial architecture output exists: {output}")
-        arm_dir = receipt_path.parent
-        with (arm_dir / "stdout.log").open("x", encoding="utf-8") as stdout, (
-            arm_dir / "stderr.log"
-        ).open("x", encoding="utf-8") as stderr:
-            subprocess.run(arm["command"], check=True, stdout=stdout, stderr=stderr)
-        if not Path(arm["checkpoint"]).is_file() or not Path(arm["report"]).is_file():
-            raise SystemExit(f"REFUSED: {arm_name} produced no checkpoint/report")
-        common._write_once_or_match(receipt_path, _receipt(arm, manifest_path))
+    del manifest, manifest_path
+    raise SystemExit(f"REFUSED: {OBSOLETE_REASON}")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -402,6 +399,8 @@ def prepare(args: argparse.Namespace) -> tuple[dict[str, Any], Path]:
         "schema_version": SCHEMA,
         "diagnostic_only": True,
         "promotion_eligible": False,
+        "launch_authorized": False,
+        "obsolete_reason": OBSOLETE_REASON,
         "event_path": {
             "included": False,
             "reason": "audit proves zero masked events and zero event targets in both corpora",

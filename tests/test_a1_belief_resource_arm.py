@@ -303,9 +303,11 @@ def test_prepare_binds_temp_contract_and_only_belief_delta(
     assert manifest["matched_contract"]["topology_or_gather"] is False
     assert manifest["diagnostic_only"] is True
     assert manifest["promotion_eligible"] is False
+    assert manifest["diagnostic_execution_authorized"] is False
+    assert manifest["obsolete_reason"] == arm.OBSOLETE_REASON
 
 
-def test_executor_is_explicit_one_shot_diagnostic(
+def test_legacy_full_dose_executor_is_fail_closed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     root = tmp_path / "belief"
@@ -327,16 +329,12 @@ def test_executor_is_explicit_one_shot_diagnostic(
         return subprocess.CompletedProcess(command, 0, stdout="queued\n", stderr="")
 
     monkeypatch.setattr(execute.arm, "verify", lambda _path: verified)
-    receipt = execute.execute(
-        tmp_path / "manifest.json",
-        unit="belief-test",
-        runner=runner,
-        idle_probe=lambda: [],
-    )
-
-    assert len(submitted) == 1
-    assert submitted[0][:3] == ["sudo", "-n", "systemd-run"]
-    assert receipt["diagnostic_only"] is True
-    assert receipt["promotion_eligible"] is False
-    assert (root / "diagnostic-execution.claim.json").is_file()
-    assert (root / "diagnostic-execution.receipt.json").is_file()
+    with pytest.raises(execute.ExecutionError, match="4,194,304 rows / 1024 steps"):
+        execute.execute(
+            tmp_path / "manifest.json",
+            unit="belief-test",
+            runner=runner,
+            idle_probe=lambda: [],
+        )
+    assert submitted == []
+    assert not root.exists()
