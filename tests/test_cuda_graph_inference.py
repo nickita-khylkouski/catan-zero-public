@@ -44,11 +44,17 @@ def _policy(**overrides):
     )
     values.update(overrides)
     config = EntityGraphConfig(**values)
+    static_action_features = torch.arange(
+        config.action_size * config.static_action_feature_size,
+        dtype=torch.float32,
+    ).reshape(config.action_size, config.static_action_feature_size)
     return SimpleNamespace(
         config=config,
         model=EntityGraphNet(config).eval(),
         device=torch.device("cpu"),
         public_award_feature_contract=PUBLIC_AWARD_FEATURE_CONTRACT_AUTHORITATIVE,
+        action_size=config.action_size,
+        static_action_features=static_action_features,
     )
 
 
@@ -264,6 +270,91 @@ def test_topology_adapter_survives_cuda_graph_eager_fallback_and_event_crop():
 
     assert runner.last_path == "eager_fallback"
     assert "requires a CUDA device" in runner.last_fallback_reason
+    assert outputs["logits"].shape == (2, 4)
+    assert outputs["q_values"].shape == (2, 4)
+
+
+def test_static_action_residual_survives_enabled_eager_fallback():
+    policy = _policy(static_action_residual=True)
+    with torch.no_grad():
+        policy.model.static_action_residual_proj.weight.normal_(std=0.1)
+    entity, legal_ids, context = _batch(batch_size=2, legal_width=4)
+    runner = CudaGraphInferenceRunner(
+        policy,
+        CudaGraphInferenceConfig(enabled=True, event_token_limit=0),
+    )
+
+    outputs = runner.forward_legal_np(entity, legal_ids, context, return_q=True)
+
+    assert runner.last_path == "eager_fallback"
+    assert "requires a CUDA device" in runner.last_fallback_reason
+    assert outputs["logits"].shape == (2, 4)
+    assert outputs["q_values"].shape == (2, 4)
+
+
+def test_cuda_graph_action_batch_gathers_d6_mapped_static_catalog_rows():
+    policy = _policy(static_action_residual=True)
+    entity, legal_ids, context = _batch(batch_size=2, legal_width=4)
+    mapped = legal_ids.copy()
+    mapped[:, :3] = np.asarray((7, 6, 5), dtype=np.int64)
+    entity["_symmetry_legal_action_ids"] = mapped
+    runner = CudaGraphInferenceRunner(policy)
+
+    action_batch, observed_ids = runner._action_batch(
+        entity, legal_ids, context
+    )
+
+    expected = policy.static_action_features[
+        torch.as_tensor(np.where(mapped >= 0, mapped, 0), dtype=torch.long)
+    ][..., 19:41]
+    expected = expected.masked_fill(
+        ~torch.as_tensor(mapped >= 0).unsqueeze(-1), 0.0
+    )
+    assert torch.equal(action_batch["legal_action_static_features"], expected)
+    assert torch.equal(observed_ids, torch.as_tensor(legal_ids))
+    assert torch.count_nonzero(
+        action_batch["legal_action_static_features"][-1, -1]
+    ).item() == 0
+
+
+class _ReplayOnlyGraph:
+    def replay(self) -> None:
+        return None
+
+
+def test_enabled_graph_branch_scores_static_action_residual(monkeypatch):
+    policy = _policy(static_action_residual=True)
+    with torch.no_grad():
+        policy.model.static_action_residual_proj.weight.normal_(std=0.1)
+    entity, legal_ids, context = _batch(
+        batch_size=2, legal_width=4, event_width=0
+    )
+    runner = CudaGraphInferenceRunner(
+        policy,
+        CudaGraphInferenceConfig(
+            enabled=True,
+            batch_buckets=(2,),
+            event_token_limit=0,
+        ),
+    )
+    state_batch = {
+        key: torch.as_tensor(entity[key]) for key in runner._state_input_keys()
+    }
+    with torch.no_grad():
+        encoded_state = policy.model.encode_state(state_batch)
+    signature = runner._graph_signature(entity, 2)
+    runner._graphs[signature] = SimpleNamespace(
+        graph=_ReplayOnlyGraph(),
+        static_inputs=state_batch,
+        encoded_state=encoded_state,
+        capture_stream=None,
+    )
+    monkeypatch.setattr(runner, "_unsupported_reason", lambda _batch_size: None)
+
+    outputs = runner.forward_legal_np(entity, legal_ids, context, return_q=True)
+
+    assert runner.last_path == "cuda_graph"
+    assert runner.last_fallback_reason is None
     assert outputs["logits"].shape == (2, 4)
     assert outputs["q_values"].shape == (2, 4)
 
