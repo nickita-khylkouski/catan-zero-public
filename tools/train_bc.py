@@ -60,6 +60,7 @@ from catan_zero.rl.entity_token_features import (
     PLAYER_FEATURE_SIZE,
     VERTEX_FEATURE_SIZE,
 )
+from catan_zero.search.neural_rust_mcts import RUST_ENTITY_ADAPTER_VERSION
 from catan_zero.rl import optim_state as _checkout_optim_state
 
 
@@ -1063,7 +1064,7 @@ def build_parser() -> argparse.ArgumentParser:
             "readouts and optional value-attention-pool parameters. The three "
             "action-local groups allow causal adapter ablations without retraining "
             "already-learned neighboring adapters. See "
-            "--train-value-only for a shortcut covering the first three groups."
+            "--train-value-only for a shortcut covering the complete policy path."
         ),
     )
     parser.add_argument(
@@ -1079,8 +1080,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--train-value-only",
         action="store_true",
         help=(
-            "Shortcut for --freeze-modules trunk,action_encoder,policy_head (--arch "
-            "entity_graph only): freezes everything except value_head/final_vp_head. "
+            "Shortcut for --freeze-modules trunk,action_encoder,policy_head,"
+            "target_gather,edge_policy,action_cross (--arch entity_graph only): "
+            "freezes the complete policy path while leaving value readouts trainable. "
             "Combine with --policy-loss-weight 0 so the frozen policy backbone also stops "
             "contributing gradient via the policy loss."
         ),
@@ -5807,7 +5809,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             )
         freeze_module_groups = set(_parse_prefixes(args.freeze_modules))
         if bool(args.train_value_only):
-            freeze_module_groups |= {"trunk", "action_encoder", "policy_head"}
+            freeze_module_groups |= ENTITY_GRAPH_VALUE_ONLY_FREEZE_GROUPS
         if freeze_module_groups:
             if args.arch != "entity_graph":
                 raise SystemExit(
@@ -11682,6 +11684,7 @@ def load_teacher_data(
         "phase",
         "decision_index",
         "action_mask_version",
+        "adapter_version",
         "winner",
         "terminated",
         "truncated",
@@ -12253,6 +12256,13 @@ def _normalize_teacher_shard(
             path,
             leading=n,
         ).astype(str),
+        "adapter_version": _field_or_default(
+            shard,
+            "adapter_version",
+            np.full(n, "", dtype="<U1"),
+            path,
+            leading=n,
+        ).astype(str),
         "winner": _field_or_default(
             shard,
             "winner",
@@ -12476,7 +12486,6 @@ def teacher_data_quality(
     teachers = np.asarray(data.get("teacher_name", np.full(n, ""))).astype(str)
     phases = np.asarray(data.get("phase", np.full(n, ""))).astype(str)
     score_sources = np.asarray(data.get("target_score_source", np.full(n, ""))).astype(str)
-    action_mask_versions = np.asarray(data.get("action_mask_version", np.full(n, ""))).astype(str)
     policy_multiplier = np.asarray(
         data.get("policy_weight_multiplier", np.ones(n, dtype=np.float32)),
         dtype=np.float32,
@@ -12613,7 +12622,12 @@ def teacher_data_quality(
         "policy_active_ab_root_score_fraction": (
             float(np.sum(policy_active & ab_root_scores) / max(policy_active_count, 1))
         ),
-        "action_mask_version_counts": _string_counts(action_mask_versions),
+        "action_mask_version_counts": _string_column_counts(
+            data.get("action_mask_version"), rows=n
+        ),
+        "adapter_version_counts": _string_column_counts(
+            data.get("adapter_version"), rows=n
+        ),
         "by_teacher": _quality_by_field(
             data,
             "teacher_name",
@@ -12901,16 +12915,11 @@ def validate_teacher_data_schema(policy, data: dict, data_quality: dict, env_con
             "teacher action must be present in legal_action_ids"
         )
     version_column = data.get("action_mask_version")
-    if isinstance(version_column, _MemmapCategoricalColumn):
-        present_versions = version_column.present_values()
-        nonempty_versions = sorted(version for version in present_versions if version)
-        has_empty_version = "" in present_versions
-    else:
-        versions = np.asarray(
-            np.full(len(actions), "") if version_column is None else version_column
-        ).astype(str)
-        nonempty_versions = sorted({version for version in versions if version})
-        has_empty_version = bool(np.any(versions == ""))
+    present_versions = _string_column_present_values(
+        version_column, rows=len(actions)
+    )
+    nonempty_versions = sorted(version for version in present_versions if version)
+    has_empty_version = "" in present_versions
     if nonempty_versions and has_empty_version:
         problems.append(
             "mixed known and unknown action_mask_version values; regenerate or curate "
@@ -12934,6 +12943,27 @@ def validate_teacher_data_schema(policy, data: dict, data_quality: dict, env_con
         problems.append(
             f"teacher action_mask_version {nonempty_versions} does not match current "
             f"env action_mask_version {expected_version!r}"
+        )
+    adapter_versions = _string_column_present_values(
+        data.get("adapter_version"), rows=len(actions)
+    )
+    nonempty_adapters = sorted(version for version in adapter_versions if version)
+    has_empty_adapter = "" in adapter_versions
+    if nonempty_adapters and has_empty_adapter:
+        problems.append(
+            "mixed known and unknown adapter_version values; regenerate or curate "
+            "legacy shards instead of mixing feature semantics"
+        )
+    if len(nonempty_adapters) > 1:
+        problems.append(f"mixed adapter_version values: {nonempty_adapters}")
+    if (
+        getattr(policy, "policy_type", "") == "entity_graph"
+        and nonempty_adapters
+        and nonempty_adapters != [RUST_ENTITY_ADAPTER_VERSION]
+    ):
+        problems.append(
+            f"teacher adapter_version {nonempty_adapters} does not match current "
+            f"entity adapter {RUST_ENTITY_ADAPTER_VERSION!r}"
         )
     expected_static_hash = _expected_static_action_features_sha256(env_config)
     checkpoint_static_hash = _policy_static_action_features_sha256(policy)
@@ -13272,6 +13302,52 @@ def _string_counts(values: np.ndarray, *, limit: int = 20) -> dict[str, int]:
         str(unique[index]): int(counts[index])
         for index in order[:limit]
     }
+
+
+def _string_column_counts(column, *, rows: int, limit: int = 20) -> dict[str, int]:
+    """Count a string column without decoding a production memmap composite."""
+
+    if column is None:
+        return {"": int(rows)} if rows else {}
+    value_counts = getattr(column, "value_counts", None)
+    if callable(value_counts):
+        counts = {
+            str(value): int(count)
+            for value, count in value_counts().items()
+            if int(count) > 0
+        }
+        return dict(
+            sorted(counts.items(), key=lambda item: (-item[1], item[0]))[:limit]
+        )
+    values = np.asarray(column).astype(str)
+    if values.shape != (int(rows),):
+        raise SystemExit(
+            f"string provenance column must have shape ({int(rows)},), got {values.shape}"
+        )
+    return _string_counts(values, limit=limit)
+
+
+def _string_column_present_values(column, *, rows: int) -> set[str]:
+    """Return present labels while retaining lazy categorical memmap semantics."""
+
+    if column is None:
+        return {""} if rows else set()
+    present_values = getattr(column, "present_values", None)
+    if callable(present_values):
+        return {str(value) for value in present_values()}
+    value_counts = getattr(column, "value_counts", None)
+    if callable(value_counts):
+        return {
+            str(value)
+            for value, count in value_counts().items()
+            if int(count) > 0
+        }
+    values = np.asarray(column).astype(str)
+    if values.shape != (int(rows),):
+        raise SystemExit(
+            f"string provenance column must have shape ({int(rows)},), got {values.shape}"
+        )
+    return set(values.tolist())
 
 
 def _load_npz(path: Path):
@@ -16310,6 +16386,22 @@ ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS: dict[str, tuple[str, ...]] = {
         "value_pool_head",
     ),
 }
+
+# The complete policy-producing surface for a value-only repair. Keep this as
+# named freeze groups rather than raw parameter prefixes so new optional action
+# adapters cannot silently remain optimizer-visible. In particular, a zero
+# policy coefficient is not enough under AdamW: graph-reachable policy tensors
+# can receive exact-zero gradients and still undergo decoupled weight decay.
+ENTITY_GRAPH_VALUE_ONLY_FREEZE_GROUPS: frozenset[str] = frozenset(
+    {
+        "trunk",
+        "action_encoder",
+        "policy_head",
+        "target_gather",
+        "edge_policy",
+        "action_cross",
+    }
+)
 
 
 def _effective_entity_graph_architecture_report(
