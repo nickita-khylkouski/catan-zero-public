@@ -14,6 +14,7 @@ import torch
 
 from catan_zero.rl.entity_token_policy import EntityGraphConfig
 from tools import a1_pre_wave_contract as contract
+from tools import a1_promotion_transaction as promotion
 from tools import generate_gumbel_selfplay_data as generator
 from tools import legacy_scalar_readout_attestation as legacy_scalar
 from tools import search_operator_binding as operator_binding
@@ -1998,6 +1999,135 @@ def test_post_promotion_s1_bridge_is_rejected_outside_exact_v3_handoff(
             allow_post_promotion_s1=True,
         )
 
+
+def _historical_v5_compatibility_fixture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[Path, dict, dict, dict]:
+    checkpoint = tmp_path / "v5-producer.pt"
+    checkpoint.write_bytes(b"v5-producer")
+    deployed = {"c_scale": 0.1, "n_full": 128}
+    expected = {**deployed, **contract.HISTORICAL_V5_HANDOFF_DEFAULTS}
+    identity = {
+        "checkpoint": {
+            "path": str(checkpoint),
+            "sha256": contract._sha256(checkpoint),
+        },
+        "search_config": deployed,
+        "agent_identity_sha256": "sha256:" + "1" * 64,
+    }
+    payload = {
+        "schema_version": contract.promotion_handoff.HANDOFF_SCHEMA,
+        "promotion_receipt": {
+            "path": str(tmp_path / "promotion.json"),
+            "sha256": "sha256:" + "2" * 64,
+            "receipt_sha256": "sha256:" + "3" * 64,
+            "transaction_id": "tx-v5",
+        },
+        "registry_after": {
+            "checkpoint": identity["checkpoint"],
+            "role": contract.promotion_handoff.GENERATOR_ROLE,
+            "version": 5,
+        },
+        "producer_identity": identity,
+    }
+    payload["handoff_sha256"] = contract._digest_value(payload)
+    path = tmp_path / "v5-handoff.json"
+    path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+    fingerprint = {
+        "checkpoint_sha256": identity["checkpoint"]["sha256"],
+        "handoff_file_sha256": contract._sha256(path),
+        "handoff_sha256": payload["handoff_sha256"],
+        "producer_identity_sha256": identity["agent_identity_sha256"],
+        "promotion_receipt_file_sha256": payload["promotion_receipt"]["sha256"],
+        "promotion_receipt_sha256": payload["promotion_receipt"]["receipt_sha256"],
+        "registry_version": 5,
+    }
+    monkeypatch.setattr(
+        contract, "HISTORICAL_V5_HANDOFF_FINGERPRINT", fingerprint
+    )
+    return path, payload, deployed, expected
+
+
+def test_exact_historical_v5_handoff_projects_only_two_runtime_defaults(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path, payload, deployed, expected = _historical_v5_compatibility_fixture(
+        tmp_path, monkeypatch
+    )
+    compatibility = contract._historical_v5_handoff_identity_compatibility(
+        path=path,
+        payload=payload,
+        deployed=deployed,
+        expected=expected,
+    )
+    assert compatibility["omitted_historical_defaults"] == {
+        "gameplay_policy_aggregation": "mean_improved_policy",
+        "sigma_reference_visits": None,
+    }
+    assert compatibility["raw_deployed_search_config_sha256"] == (
+        contract._digest_value(deployed)
+    )
+    assert compatibility["normalized_search_config_sha256"] == (
+        contract._digest_value(expected)
+    )
+
+    monkeypatch.setattr(
+        contract.promotion_handoff, "build_handoff", lambda _receipt: payload
+    )
+    monkeypatch.setattr(
+        promotion, "_sealed_evaluation_semantics", lambda _contract: expected
+    )
+    record = contract._promotion_handoff_record(
+        {"mode": contract.POST_PROMOTION_HANDOFF_MODE, "path": str(path)},
+        base=tmp_path,
+        producer=dict(payload["producer_identity"]["checkpoint"]),
+        effective_search={"c_scale": 0.1},
+        evaluator={},
+        generation={},
+    )
+    assert record["producer_search_config"] == deployed
+    assert record["producer_search_config_sha256"] == contract._digest_value(deployed)
+    assert record["producer_search_identity_compatibility"] == compatibility
+
+
+@pytest.mark.parametrize(
+    ("case", "message"),
+    [
+        ("different_file_hash", "fingerprint mismatch"),
+        ("new_handoff", "fingerprint mismatch"),
+        ("wrong_default", "exact defaults"),
+        ("third_omitted", "compatibility shape drift"),
+        ("shared_field_drift", "compatibility shape drift"),
+    ],
+)
+def test_historical_v5_handoff_compatibility_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+    message: str,
+) -> None:
+    path, payload, deployed, expected = _historical_v5_compatibility_fixture(
+        tmp_path, monkeypatch
+    )
+    if case == "different_file_hash":
+        path.write_text(path.read_text(encoding="utf-8") + " ", encoding="utf-8")
+    elif case == "new_handoff":
+        payload["handoff_sha256"] = "sha256:" + "9" * 64
+        path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+    elif case == "wrong_default":
+        expected["gameplay_policy_aggregation"] = "aggregate_q_then_improve"
+    elif case == "third_omitted":
+        expected["future_identity_field"] = "new-default"
+    else:
+        expected["n_full"] = 64
+
+    with pytest.raises(contract.ContractError, match=message):
+        contract._historical_v5_handoff_identity_compatibility(
+            path=path,
+            payload=payload,
+            deployed=deployed,
+            expected=expected,
+        )
 
 def test_seal_rejects_stringly_typed_science_booleans(tmp_path: Path) -> None:
     draft = _resolved_draft(tmp_path)

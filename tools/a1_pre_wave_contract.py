@@ -272,6 +272,22 @@ CURRENT_LEARNER_TRAINING_RECIPE: dict[str, Any] = {
 REQUIRED_EVIDENCE = {"a0", "s1", "s2", "s3"}
 HISTORICAL_HANDOFF_MODE = "historical_pre_promotion"
 POST_PROMOTION_HANDOFF_MODE = "post_promotion"
+HISTORICAL_V5_HANDOFF_DEFAULTS = {
+    "gameplay_policy_aggregation": "mean_improved_policy",
+    "sigma_reference_visits": None,
+}
+HISTORICAL_V5_HANDOFF_FINGERPRINT = {
+    "checkpoint_sha256": "sha256:6817ab054506f962a758ebf48addce5cc7eb801bf451cf2d02b62fb91f5da39c",
+    "handoff_file_sha256": "sha256:314d86a4860497a90d665a0d05e66a458f91f3a1e54d4315bb61e9014556b52a",
+    "handoff_sha256": "sha256:0e815149264a024ed69aecfcadccea6647d24522c207ee945a4cc2d314ca5b9a",
+    "producer_identity_sha256": "sha256:9ac746cb249706bb0682e8d677e44d93df954b4bbb5510d6f315432baa3b6316",
+    "promotion_receipt_file_sha256": "sha256:ca592a265dea3e045d41d8e63f423b2e413e757d6900aa3ff5a9ea7364ae5083",
+    "promotion_receipt_sha256": "sha256:7c0a3335ac40fd326364beba5f696887cac43f8d6b36ed20d239d310e75b3fca",
+    "registry_version": 5,
+}
+HISTORICAL_V5_HANDOFF_COMPATIBILITY_SCHEMA = (
+    "a1-v5-deployed-search-default-projection-v1"
+)
 GENERATION_CAMPAIGN_SCHEMA = "a1-dual-arm-generation-contract-v1"
 GENERATION_CAMPAIGN_REVISION_SCHEMA = "a1-dual-arm-generation-contract-v2"
 POST_PROMOTION_CAMPAIGN_SCHEMA = "a1-post-promotion-generation-campaign-v1"
@@ -942,6 +958,83 @@ def _file_record(
     return record
 
 
+def _historical_v5_handoff_identity_compatibility(
+    *,
+    path: Path,
+    payload: Mapping[str, Any],
+    deployed: Mapping[str, Any],
+    expected: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Authenticate and normalize the sole issued 48-key v5 identity.
+
+    The committed v5 receipt predates two fields that later became explicit in
+    the promotion identity projection. Both values were already the runtime
+    defaults. This is not a subset comparison: only the exact issued artifact,
+    exact two-key omission, exact defaults, and zero shared-key drift qualify.
+    """
+
+    missing = set(expected) - set(deployed)
+    extra = set(deployed) - set(expected)
+    shared_drift = {
+        key: (deployed[key], expected[key])
+        for key in set(deployed) & set(expected)
+        if deployed[key] != expected[key]
+    }
+    required_missing = set(HISTORICAL_V5_HANDOFF_DEFAULTS)
+    if missing != required_missing or extra or shared_drift:
+        raise ContractError(
+            "promoted deployed search identity compatibility shape drift: "
+            f"missing={sorted(missing)}, extra={sorted(extra)}, "
+            f"shared_drift={shared_drift}"
+        )
+
+    receipt = payload.get("promotion_receipt")
+    identity = payload.get("producer_identity")
+    registry = payload.get("registry_after")
+    if not all(isinstance(value, Mapping) for value in (receipt, identity, registry)):
+        raise ContractError("historical v5 handoff compatibility lineage is malformed")
+    checkpoint = identity.get("checkpoint")
+    if not isinstance(checkpoint, Mapping):
+        raise ContractError("historical v5 handoff checkpoint lineage is malformed")
+    actual_fingerprint = {
+        "checkpoint_sha256": checkpoint.get("sha256"),
+        "handoff_file_sha256": _sha256(path),
+        "handoff_sha256": payload.get("handoff_sha256"),
+        "producer_identity_sha256": identity.get("agent_identity_sha256"),
+        "promotion_receipt_file_sha256": receipt.get("sha256"),
+        "promotion_receipt_sha256": receipt.get("receipt_sha256"),
+        "registry_version": registry.get("version"),
+    }
+    if actual_fingerprint != HISTORICAL_V5_HANDOFF_FINGERPRINT:
+        raise ContractError(
+            "historical v5 handoff compatibility fingerprint mismatch"
+        )
+
+    runtime_defaults = {
+        "gameplay_policy_aggregation": GumbelChanceMCTSConfig().gameplay_policy_aggregation,
+        "sigma_reference_visits": GumbelChanceMCTSConfig().sigma_reference_visits,
+    }
+    if runtime_defaults != HISTORICAL_V5_HANDOFF_DEFAULTS:
+        raise ContractError("historical v5 runtime search defaults drifted")
+    projected_defaults = {key: expected[key] for key in required_missing}
+    if projected_defaults != HISTORICAL_V5_HANDOFF_DEFAULTS:
+        raise ContractError(
+            "historical v5 handoff omitted fields do not resolve to exact defaults"
+        )
+    normalized = {**deployed, **HISTORICAL_V5_HANDOFF_DEFAULTS}
+    if normalized != dict(expected):
+        raise ContractError(
+            "historical v5 handoff compatibility normalization is not exact"
+        )
+    return {
+        "schema_version": HISTORICAL_V5_HANDOFF_COMPATIBILITY_SCHEMA,
+        "authenticated_fingerprint": actual_fingerprint,
+        "omitted_historical_defaults": dict(HISTORICAL_V5_HANDOFF_DEFAULTS),
+        "raw_deployed_search_config_sha256": _digest_value(deployed),
+        "normalized_search_config_sha256": _digest_value(normalized),
+    }
+
+
 def _promotion_handoff_record(
     raw: Any,
     *,
@@ -1035,9 +1128,13 @@ def _promotion_handoff_record(
         raise ContractError(
             "generation c_scale differs from promoted deployed producer identity"
         )
+    identity_compatibility: dict[str, Any] | None = None
     if identity_search != expected_identity_search:
-        raise ContractError(
-            "promoted deployed search identity differs from v3 generation science"
+        identity_compatibility = _historical_v5_handoff_identity_compatibility(
+            path=path,
+            payload=payload,
+            deployed=identity_search,
+            expected=expected_identity_search,
         )
     record = _file_record(path, kind="post_promotion_handoff")
     record.update(
@@ -1056,6 +1153,8 @@ def _promotion_handoff_record(
             "producer_search_config_sha256": _digest_value(identity_search),
         }
     )
+    if identity_compatibility is not None:
+        record["producer_search_identity_compatibility"] = identity_compatibility
     return record
 
 
