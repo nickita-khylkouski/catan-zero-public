@@ -15,10 +15,12 @@ if str(_TOOLS_DIR) not in sys.path:
 
 from phase_sliced_value_calibration import (  # type: ignore  # noqa: E402
     ENTITY_KEYS,
+    ReadoutPredictions,
     build_calibration_summary,
     build_row_selection_provenance,
     collect_rows,
     derive_validation_game_seeds,
+    fit_scalar_tanh_value_scale,
     load_validation_seed_manifest,
     parse_validation_game_seed_ranges,
     _calibration_stats,
@@ -412,6 +414,79 @@ def test_scalar_summary_reports_raw_tanh_and_clip_by_phase() -> None:
     )
     assert clip["global"]["value_rmse"] == pytest.approx(0.0)
     assert set(tanh["by_phase"]) == {"opening_placement", "play_turn"}
+
+
+def test_value_scale_fit_uses_disjoint_games_and_recovers_interior_scale() -> None:
+    # Every game has the same calibrated table: E[z|q=+0.2] = +0.4 and
+    # E[z|q=-0.2] = -0.4. The MSE-optimal tanh scale is
+    # atanh(0.4)/0.2 ~= 2.12, so both game partitions identify the same
+    # interior scale without relying on independent-row leakage.
+    q_per_game = np.asarray([0.2] * 50 + [-0.2] * 50, dtype=np.float32)
+    z_per_game = np.asarray(
+        [1.0] * 35 + [-1.0] * 15 + [1.0] * 15 + [-1.0] * 35,
+        dtype=np.float32,
+    )
+    game_count = 8
+    q = np.tile(q_per_game, game_count)
+    z = np.tile(z_per_game, game_count)
+    game_seed = np.repeat(np.arange(100, 100 + game_count), len(q_per_game))
+    predictions = ReadoutPredictions(
+        q=q,
+        categorical_hlgauss_ce=None,
+        categorical_terminal_nll=None,
+        categorical_truncation_probability=None,
+        provenance=resolve_readout_provenance(
+            _FakeReadoutPolicy(trained_categorical=False), "scalar"
+        ),
+    )
+
+    fit = fit_scalar_tanh_value_scale(
+        predictions,
+        [{"z": z, "game_seed": game_seed}],
+        current_value_scale=1.0,
+        calibration_fraction=0.5,
+        split_seed=7,
+        scale_min=0.5,
+        scale_max=4.0,
+        scale_count=97,
+    )
+
+    assert fit["selected_value_scale"] == pytest.approx(
+        np.arctanh(0.4) / 0.2, rel=0.03
+    )
+    assert fit["selected_at_grid_boundary"] is False
+    assert fit["calibration"]["game_count"] == 4
+    assert fit["evaluation"]["game_count"] == 4
+    assert (
+        fit["calibration"]["game_seed_set_sha256"]
+        != fit["evaluation"]["game_seed_set_sha256"]
+    )
+    assert fit["evaluation_row_weighted_mse_reduction"] > 0.0
+    assert fit["evaluation_game_balanced_mse_reduction"] > 0.0
+    assert fit["promotion_blocked_without_search_h2h"] is True
+
+
+def test_value_scale_fit_fails_closed_without_multiple_game_seeds() -> None:
+    predictions = ReadoutPredictions(
+        q=np.asarray([0.1, -0.1], dtype=np.float32),
+        categorical_hlgauss_ce=None,
+        categorical_terminal_nll=None,
+        categorical_truncation_probability=None,
+        provenance=resolve_readout_provenance(
+            _FakeReadoutPolicy(trained_categorical=False), "scalar"
+        ),
+    )
+    with pytest.raises(ValueError, match="at least two held-out games"):
+        fit_scalar_tanh_value_scale(
+            predictions,
+            [
+                {
+                    "z": np.asarray([1.0, -1.0]),
+                    "game_seed": np.asarray([99, 99]),
+                }
+            ],
+            current_value_scale=1.0,
+        )
 
 
 @pytest.mark.parametrize(
