@@ -4,7 +4,11 @@ from contextlib import contextmanager
 
 import pytest
 
-from tools.train_bc import _accumulation_group_size, _gradient_sync_context
+from tools.train_bc import (
+    _accumulation_group_size,
+    _advance_global_step,
+    _gradient_sync_context,
+)
 
 
 class _SyncRecorder:
@@ -63,3 +67,33 @@ def test_accumulation_group_size_uses_short_tail_divisor(
 def test_accumulation_group_size_rejects_invalid_bounds() -> None:
     with pytest.raises(ValueError, match="invalid gradient accumulation"):
         _accumulation_group_size(configured_size=4, batch_number=11, total_batches=10)
+
+
+def test_skipped_zero_objective_group_does_not_consume_max_step_budget() -> None:
+    global_step = 4
+    max_steps = 5
+
+    global_step = _advance_global_step(
+        global_step,
+        accum_do_step=True,
+        optimizer_step_applied=False,
+    )
+    assert global_step == 4
+    assert global_step < max_steps
+
+    global_step = _advance_global_step(
+        global_step,
+        accum_do_step=True,
+        optimizer_step_applied=True,
+    )
+    assert global_step == max_steps
+    assert global_step >= max_steps
+
+
+def test_nonstepping_microbatch_cannot_claim_an_optimizer_update() -> None:
+    with pytest.raises(ValueError, match="non-stepping microbatch"):
+        _advance_global_step(
+            7,
+            accum_do_step=False,
+            optimizer_step_applied=True,
+        )

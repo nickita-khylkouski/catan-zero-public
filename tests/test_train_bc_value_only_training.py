@@ -577,6 +577,100 @@ def test_all_zero_objective_mass_does_not_advance_adamw_or_decay_parameters(
     assert all(torch.equal(before[name], after[name]) for name in before)
 
 
+def test_zero_objective_last_microbatch_applies_accumulated_nonzero_gradient(
+    tmp_path,
+) -> None:
+    import copy
+    import torch
+
+    data = _write_and_load_shard(tmp_path, _collect_real_samples(3))
+    batch = np.arange(len(data["action_taken"]))
+    active = np.ones(len(batch), dtype=np.float32)
+    zero = np.zeros(len(batch), dtype=np.float32)
+    policy = _make_entity_policy()
+    before = copy.deepcopy(policy.model.state_dict())
+    optimizer = torch.optim.SGD(policy.model.parameters(), lr=1e-3)
+    common = {
+        "soft_target_temperature": 1.0,
+        "soft_target_weight": 0.0,
+        "soft_target_source": "scores",
+        "soft_target_min_legal_coverage": 0.0,
+        "policy_loss_weight": 1.0,
+        "value_loss_weight": 1.0,
+        "final_vp_loss_weight": 0.0,
+        "q_loss_weight": 0.0,
+        "q_skip_teacher_prefixes": (),
+        "vps_to_win": 10,
+        "advantage_policy_weighting": "none",
+        "advantage_temperature": 1.0,
+        "advantage_weight_cap": 5.0,
+        "advantage_weight_floor": 0.05,
+        "amp": "none",
+        "diagnostics": False,
+        "grad_accum_steps": 2,
+    }
+
+    first = _train_xdim_batch(
+        policy,
+        optimizer,
+        data,
+        batch,
+        active,
+        active,
+        accum_do_zero_grad=True,
+        accum_do_step=False,
+        **common,
+    )
+    second = _train_xdim_batch(
+        policy,
+        optimizer,
+        data,
+        batch,
+        zero,
+        zero,
+        accum_do_zero_grad=False,
+        accum_do_step=True,
+        **common,
+    )
+
+    assert first["optimizer_step_applied"] is False
+    assert second["loss"] == 0.0
+    assert second["optimizer_step_applied"] is True
+    assert (
+        second["optimizer_observability"]["zero_objective_step_skipped"] is False
+    )
+    after = policy.model.state_dict()
+    assert any(not torch.equal(before[name], after[name]) for name in before)
+
+
+def test_nonzero_loss_with_exact_zero_gradient_preserves_optimizer_semantics() -> None:
+    from types import SimpleNamespace
+
+    import torch
+    from tools.train_bc import _step_optimizer_fail_closed
+
+    model = torch.nn.Linear(2, 1, bias=False)
+    policy = SimpleNamespace(model=model)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1, weight_decay=0.5)
+    before = model.weight.detach().clone()
+    loss = model.weight.sum() * 0.0 + 1.0
+    loss.backward()
+
+    grad_norm, applied, skipped = _step_optimizer_fail_closed(
+        policy,
+        optimizer,
+        loss=loss,
+        max_grad_norm=1.0,
+    )
+
+    assert float(grad_norm) == 0.0
+    assert applied is True
+    assert skipped is False
+    # SGD weight decay is part of a valid optimizer step even at a stationary
+    # point; the fail-closed guard must not erase that semantic.
+    assert not torch.equal(before, model.weight.detach())
+
+
 def test_nonfinite_gradient_norm_aborts_before_optimizer_step(
     tmp_path, monkeypatch
 ) -> None:

@@ -6395,8 +6395,11 @@ def main(argv: Sequence[str] | None = None) -> None:
             # the clip+step when accum_do_step was True.
             if accum_do_step:
                 micro_in_group = 0
-                if optimizer_step_applied:
-                    global_step += 1
+            global_step = _advance_global_step(
+                global_step,
+                accum_do_step=accum_do_step,
+                optimizer_step_applied=optimizer_step_applied,
+            )
             if args.progress_every_batches and batch_number % int(args.progress_every_batches) == 0:
                 _rank0_print(
                     json.dumps(
@@ -15861,6 +15864,18 @@ def _accumulation_group_size(
     if configured < 1 or batch < 1 or total < batch:
         raise ValueError("invalid gradient accumulation group bounds")
     return min(configured, total - batch + 1)
+
+
+def _advance_global_step(
+    global_step: int,
+    *,
+    accum_do_step: bool,
+    optimizer_step_applied: bool,
+) -> int:
+    """Advance the LR/max-step clock only for an applied optimizer update."""
+    if optimizer_step_applied and not accum_do_step:
+        raise ValueError("an optimizer step cannot occur on a non-stepping microbatch")
+    return int(global_step) + int(bool(accum_do_step and optimizer_step_applied))
 
 
 def _warm_start_grow(policy, checkpoint_path: str, *, device: str) -> dict:
