@@ -242,10 +242,56 @@ def test_non_dry_train_window_builds_authenticated_production_composite(
             assert receipt["aggregate"]["game_count"] == 8
             assert receipt["aggregate"]["row_count"] == 16
             assert receipt["aggregate"]["policy_active_row_count"] == 8
-            Path(command[command.index("--checkpoint") + 1]).write_bytes(
-                b"candidate"
+            checkpoint_path = Path(command[command.index("--checkpoint") + 1])
+            report_path = Path(command[command.index("--report") + 1])
+            initializer_path = Path(command[command.index("--init-checkpoint") + 1])
+            steps = int(command[command.index("--max-steps") + 1])
+            checkpoint_path.write_bytes(b"candidate")
+            Path(str(checkpoint_path) + ".optimizer.pt").write_bytes(b"optimizer")
+            report_path.write_text(
+                json.dumps(
+                    {
+                        "diagnostic_only": False,
+                        "promotion_eligible": True,
+                        "data": str(descriptor.resolve()),
+                        "data_fingerprint": verified["descriptor_fingerprint"],
+                        "data_format": "memmap",
+                        "checkpoint": str(checkpoint_path),
+                        "init_checkpoint": str(initializer_path),
+                        "init_checkpoint_sha256": flywheel._file_sha256(
+                            initializer_path
+                        ),
+                        "max_steps": steps,
+                        "steps_completed": steps,
+                        "total_training_steps": steps,
+                        "resume_optimizer": False,
+                        "optimizer_restored": False,
+                        "mask_hidden_info": True,
+                        "training_rng_rank_offset": True,
+                        "validation_max_samples": 0,
+                        "metrics": [
+                            {
+                                "validation": {
+                                    "schema_version": "composite-validation-measure-v2"
+                                }
+                            }
+                        ],
+                        "memmap_composite": {
+                            "descriptor_path": str(descriptor.resolve()),
+                            "descriptor_file_sha256": verified[
+                                "descriptor_file_sha256"
+                            ],
+                            "descriptor_fingerprint": verified[
+                                "descriptor_fingerprint"
+                            ],
+                            "flywheel_replay_contract": verified[
+                                "flywheel_replay_contract"
+                            ],
+                        },
+                    }
+                ),
+                encoding="utf-8",
             )
-            Path(command[command.index("--report") + 1]).write_text("{}")
             return 0
         raise AssertionError(command)
 
@@ -303,6 +349,23 @@ def test_non_dry_train_window_builds_authenticated_production_composite(
     assert train_command[train_command.index("--data") + 1] == str(descriptor)
     assert "--validation-max-samples" in train_command
     assert "--no-resume-optimizer" in train_command
+    assert int(train_command[train_command.index("--epochs") + 1]) >= result["steps"]
+    assert result["training_receipt"]["steps_completed"] == result["steps"]
+
+    report_path = loop_dir / "corpus" / "round_006" / "report.json"
+    report_payload = json.loads(report_path.read_text())
+    report_payload["steps_completed"] = result["steps"] - 1
+    report_path.write_text(json.dumps(report_payload), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="steps_completed"):
+        flywheel._verify_flywheel_training_report(
+            report_path,
+            checkpoint_path=loop_dir / "corpus" / "round_006" / "candidate.pt",
+            descriptor_path=descriptor,
+            initializer_path=current_checkpoint.resolve(),
+            initializer_sha256=flywheel._file_sha256(current_checkpoint),
+            replay_contract=result["replay_contract"],
+            expected_steps=result["steps"],
+        )
 
     tampered = json.loads(json.dumps(payload))
     tampered_receipt = tampered["flywheel_replay_contract"]["sampling_receipt"]

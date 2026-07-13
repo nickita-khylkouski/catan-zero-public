@@ -148,6 +148,127 @@ def _canonical_sha256(value: object) -> str:
     return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
 
 
+def _verify_flywheel_training_report(
+    report_path: Path,
+    *,
+    checkpoint_path: Path,
+    descriptor_path: Path,
+    initializer_path: Path,
+    initializer_sha256: str,
+    replay_contract: dict[str, object],
+    expected_steps: int,
+) -> dict[str, object]:
+    """Authenticate the child learner receipt before publishing its weights.
+
+    ``train_bc`` may exit successfully after exhausting ``--epochs`` without
+    reaching ``--max-steps``.  It also supports diagnostic composites and
+    optimizer resume modes that are invalid for this production handoff.  The
+    continuous orchestrator therefore treats the report as a required receipt,
+    not optional telemetry.
+    """
+
+    try:
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        descriptor = json.loads(descriptor_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"flywheel training receipt is unreadable: {error}") from error
+    if not isinstance(report, dict) or not isinstance(descriptor, dict):
+        raise RuntimeError("flywheel training receipt/descriptor is not an object")
+    composite = report.get("memmap_composite")
+    if not isinstance(composite, dict):
+        raise RuntimeError("flywheel training report lacks composite provenance")
+
+    try:
+        reported_checkpoint = Path(str(report.get("checkpoint", ""))).expanduser().resolve(
+            strict=False
+        )
+        reported_initializer = Path(
+            str(report.get("init_checkpoint", ""))
+        ).expanduser().resolve(strict=True)
+        expected_checkpoint = checkpoint_path.expanduser().resolve(strict=True)
+        expected_initializer = initializer_path.expanduser().resolve(strict=True)
+        expected_descriptor = descriptor_path.expanduser().resolve(strict=True)
+        reported_descriptor = Path(
+            str(composite.get("descriptor_path", ""))
+        ).expanduser().resolve(strict=True)
+    except OSError as error:
+        raise RuntimeError(f"flywheel training receipt path is invalid: {error}") from error
+
+    expected_descriptor_fingerprint = _canonical_sha256(descriptor)
+    expected_descriptor_file_sha = _file_sha256(expected_descriptor)
+    exact_fields = {
+        "diagnostic_only": False,
+        "promotion_eligible": True,
+        "data": str(expected_descriptor),
+        "data_fingerprint": expected_descriptor_fingerprint,
+        "data_format": "memmap",
+        "init_checkpoint_sha256": initializer_sha256,
+        "max_steps": int(expected_steps),
+        "steps_completed": int(expected_steps),
+        "total_training_steps": int(expected_steps),
+        "resume_optimizer": False,
+        "optimizer_restored": False,
+        "mask_hidden_info": True,
+        "training_rng_rank_offset": True,
+        "validation_max_samples": 0,
+    }
+    drift = {
+        field: {"expected": expected, "actual": report.get(field)}
+        for field, expected in exact_fields.items()
+        if report.get(field) != expected
+    }
+    composite_drift = {
+        "descriptor_path": reported_descriptor != expected_descriptor,
+        "descriptor_file_sha256": composite.get("descriptor_file_sha256")
+        != expected_descriptor_file_sha,
+        "descriptor_fingerprint": composite.get("descriptor_fingerprint")
+        != expected_descriptor_fingerprint,
+        "flywheel_replay_contract": composite.get("flywheel_replay_contract")
+        != replay_contract,
+    }
+    if reported_checkpoint != expected_checkpoint:
+        drift["checkpoint"] = {
+            "expected": str(expected_checkpoint),
+            "actual": str(reported_checkpoint),
+        }
+    if reported_initializer != expected_initializer:
+        drift["init_checkpoint"] = {
+            "expected": str(expected_initializer),
+            "actual": str(reported_initializer),
+        }
+    failed_composite = sorted(key for key, failed in composite_drift.items() if failed)
+    if drift or failed_composite:
+        raise RuntimeError(
+            "flywheel training receipt drift: "
+            f"fields={drift} composite={failed_composite}"
+        )
+    metrics = report.get("metrics")
+    if not isinstance(metrics, list) or not metrics:
+        raise RuntimeError("flywheel training receipt has no completed epoch metrics")
+    validation = metrics[-1].get("validation") if isinstance(metrics[-1], dict) else None
+    if (
+        not isinstance(validation, dict)
+        or validation.get("schema_version") != "composite-validation-measure-v2"
+    ):
+        raise RuntimeError(
+            "flywheel training receipt lacks objective-matched composite validation"
+        )
+    optimizer_path = Path(str(expected_checkpoint) + ".optimizer.pt")
+    if not optimizer_path.is_file() or optimizer_path.stat().st_size <= 0:
+        raise RuntimeError("flywheel training optimizer receipt is missing or empty")
+    return {
+        "schema_version": "flywheel-training-receipt-v1",
+        "checkpoint_sha256": _file_sha256(expected_checkpoint),
+        "optimizer_sidecar_sha256": _file_sha256(optimizer_path),
+        "report_sha256": _file_sha256(report_path),
+        "descriptor_file_sha256": expected_descriptor_file_sha,
+        "descriptor_fingerprint": expected_descriptor_fingerprint,
+        "initializer_checkpoint_sha256": initializer_sha256,
+        "steps_completed": int(expected_steps),
+        "flywheel_replay_contract_sha256": _contract_sha256(replay_contract),
+    }
+
+
 # ------------------------------------------------------------------ journal
 def load_journal(loop_dir: Path) -> dict:
     p = loop_dir / "flywheel_state.json"
@@ -688,6 +809,12 @@ class Runner:
                       "--init-checkpoint", init_ckpt, "--checkpoint", str(ckpt),
                       "--report", str(report),
                       "--batch-size", str(self.cfg.train_batch_size),
+                      # ``train_bc`` treats --max-steps as a cap, not a promise:
+                      # exhausting its default two epochs exits zero early.  One
+                      # epoch always contains at least one optimizer step, so a
+                      # step-count epoch budget guarantees the cap is reachable;
+                      # the receipt below still requires exact completion.
+                      "--epochs", str(max(2, steps)),
                       "--training-rng-rank-offset",
                       "--mask-hidden-info", "--amp", "bf16",
                       "--max-steps", str(steps),
@@ -706,6 +833,23 @@ class Runner:
         if train != 0 or not ckpt.exists():
             return {"ok": False, "note": "train failed",
                     "exit_code": train, "steps": steps}
+        try:
+            training_receipt = _verify_flywheel_training_report(
+                report,
+                checkpoint_path=ckpt,
+                descriptor_path=descriptor_path,
+                initializer_path=init_path,
+                initializer_sha256=init_sha,
+                replay_contract=contract,
+                expected_steps=steps,
+            )
+        except RuntimeError as error:
+            return {
+                "ok": False,
+                "note": f"train receipt refused: {error}",
+                "exit_code": train,
+                "steps": steps,
+            }
         cand = publish_candidate(self.loop_dir, lambda p: shutil.copyfile(ckpt, p), step=steps)
         return {
             "ok": True,
@@ -714,6 +858,7 @@ class Runner:
             "steps": steps,
             "memmap_composite": str(descriptor_path),
             "replay_contract": contract,
+            "training_receipt": training_receipt,
         }
 
     def _gate_seed(self, round_idx: int) -> int:
