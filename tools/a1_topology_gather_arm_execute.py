@@ -50,14 +50,14 @@ def _verify_ref(value: Any, *, label: str) -> Path:
 def _source_trainer_binding(
     source_manifest: Path,
 ) -> tuple[dict[str, Any], Path, Path]:
-    """Authenticate the trainer/runtime checkout selected by corrected K3."""
+    """Authenticate the trainer/runtime checkout selected by the TEMP control."""
 
     try:
         source = json.loads(source_manifest.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
-        raise ExecutionError(f"cannot decode source corrected-K3 manifest: {error}") from error
+        raise ExecutionError(f"cannot decode source selected-TEMP manifest: {error}") from error
     if not isinstance(source, dict):
-        raise ExecutionError("source corrected-K3 manifest is not an object")
+        raise ExecutionError("source selected-TEMP manifest is not an object")
     stated = source.get("manifest_sha256")
     unhashed = {key: value for key, value in source.items() if key != "manifest_sha256"}
     source_command = source.get("command")
@@ -69,19 +69,19 @@ def _source_trainer_binding(
         and source.get("command_sha256")
         == prepare.corrected._digest(source_command)  # noqa: SLF001
     ):
-        raise ExecutionError("source corrected-K3 manifest/command digest drift")
+        raise ExecutionError("source selected-TEMP manifest/command digest drift")
     binding = source.get("source_binding")
     if not isinstance(binding, dict):
-        raise ExecutionError("source corrected-K3 manifest has no checkout binding")
+        raise ExecutionError("source selected-TEMP manifest has no checkout binding")
     try:
         source_repo = Path(str(binding.get("repository_root", ""))).resolve(strict=True)
     except OSError as error:
         raise ExecutionError(f"cannot resolve source trainer checkout: {error}") from error
     if base._git_head(source_repo) != binding.get("git_commit"):  # noqa: SLF001
-        raise ExecutionError("source trainer checkout commit differs from corrected K3")
+        raise ExecutionError("source trainer checkout commit differs from selected TEMP")
     files = binding.get("files")
     if not isinstance(files, dict) or not files:
-        raise ExecutionError("source corrected-K3 checkout binding has no files")
+        raise ExecutionError("source selected-TEMP checkout binding has no files")
     bound_paths: dict[Path, str] = {}
     for relative, ref in files.items():
         path = _verify_ref(ref, label=f"corrected_source.{relative}")
@@ -101,7 +101,7 @@ def _source_trainer_binding(
     ]
     if len(trainers) != 1 or trainers[0] not in bound_paths:
         raise ExecutionError(
-            "source corrected-K3 trainer is not authenticated by its checkout binding"
+            "source selected-TEMP trainer is not authenticated by its checkout binding"
         )
     return source, source_repo, trainers[0]
 
@@ -113,7 +113,7 @@ def verify(manifest_path: Path) -> dict[str, Any]:
         raise ExecutionError("manifest authorizes a different executor path")
 
     source_manifest = _verify_ref(
-        manifest.get("source_corrected_k3_manifest"), label="source_corrected_k3_manifest"
+        manifest.get("source_selected_temp_manifest"), label="source_selected_temp_manifest"
     )
     source, trainer_repo, source_trainer = _source_trainer_binding(source_manifest)
     descriptor = _verify_ref(manifest.get("descriptor"), label="descriptor")
@@ -176,7 +176,7 @@ def verify(manifest_path: Path) -> dict[str, Any]:
     trainer = [Path(value).resolve() for value in command if Path(value).name == "train_bc.py"]
     if trainer != [source_trainer]:
         raise ExecutionError(
-            "topology command trainer differs from bound corrected-K3 trainer"
+            "topology command trainer differs from bound selected-TEMP trainer"
         )
     exact_inputs = {
         "--data": str(descriptor),
@@ -219,7 +219,7 @@ def verify(manifest_path: Path) -> dict[str, Any]:
         manifest.get("only_declared_optimization_delta") == "action_target_gather=true"
         and manifest.get("source_recipe_sha256")
         == prepare.corrected._digest(manifest.get("source_recipe"))  # noqa: SLF001
-        and manifest.get("source_corrected_k3_manifest_sha256")
+        and manifest.get("source_selected_temp_manifest_sha256")
         == source.get("manifest_sha256")
         and source_init == Path(upgrade["source"]["path"])
     ):
@@ -249,7 +249,7 @@ def verify(manifest_path: Path) -> dict[str, Any]:
     return {
         "manifest": manifest,
         "manifest_ref": manifest_ref,
-        # Run from the corrected-K3 checkout as well as invoking its exact
+        # Run from the selected-TEMP checkout as well as invoking its exact
         # trainer bytes. Relative imports/config paths therefore retain the
         # source arm's runtime semantics; the current checkout only supplies
         # the independently authenticated preparer/executor.
@@ -282,7 +282,7 @@ def execute(
 def main(argv: Sequence[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", required=True, type=Path)
-    parser.add_argument("--unit", default="a1-topology-gather-k3")
+    parser.add_argument("--unit", default="a1-selected-temp-gather")
     parser.add_argument("--go", action="store_true")
     args = parser.parse_args(argv)
     if not args.go:

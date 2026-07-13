@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Prepare (never launch) the function-preserving topology-gather K3 arm.
+"""Prepare (never launch) the function-preserving selected-dose gather arm.
 
-This arm is derived from a sealed corrected-anchor-K3 manifest.  Its training
+This arm is derived from the sealed selected-dose TEMP-control manifest. Its training
 command is identical except for the initialization/output identities and the
 diagnostic ablation label.  The initialization must be an exact, gather-only
 upgrade of the same f7 bytes and the bound corpora must prove that topology
@@ -26,7 +26,7 @@ if str(REPO_ROOT) not in sys.path:
 from tools import a1_corrected_policy_arm as corrected  # noqa: E402
 
 
-SCHEMA = "a1-topology-gather-arm-manifest-v1"
+SCHEMA = "a1-topology-gather-arm-manifest-v2"
 SOURCE_SCHEMA = corrected.SCHEMA
 EXECUTOR_RELATIVE_PATH = "tools/a1_topology_gather_arm_execute.py"
 SOURCE_FILES = (
@@ -59,7 +59,7 @@ def _load_source(path: Path) -> tuple[dict[str, Any], dict[str, str]]:
     if payload.get("schema_version") != SOURCE_SCHEMA or stated != corrected._digest(  # noqa: SLF001
         unhashed
     ):
-        raise ArmError("source corrected K3 manifest schema or digest is invalid")
+        raise ArmError("source selected-dose TEMP manifest schema or digest is invalid")
     if not (
         payload.get("diagnostic_only") is True
         and payload.get("promotion_eligible") is False
@@ -68,7 +68,7 @@ def _load_source(path: Path) -> tuple[dict[str, Any], dict[str, str]]:
         and payload.get("launch_interface_present")
         == "tools/a1_corrected_policy_arm_execute.py --go"
     ):
-        raise ArmError("source corrected K3 manifest lacks its exact diagnostic executor")
+        raise ArmError("source selected-dose TEMP manifest lacks its exact diagnostic executor")
     recipe = payload.get("recipe")
     command = payload.get("command")
     if (
@@ -78,32 +78,32 @@ def _load_source(path: Path) -> tuple[dict[str, Any], dict[str, str]]:
         or not all(isinstance(item, str) for item in command)
         or payload.get("command_sha256") != corrected._digest(command)  # noqa: SLF001
     ):
-        raise ArmError("source corrected K3 recipe/command binding is invalid")
+        raise ArmError("source selected-dose TEMP recipe/command binding is invalid")
     required_recipe = {
         "world_size": 8,
         "local_batch_size": 512,
         "global_batch_size": 4096,
-        "steps": 1024,
-        "base_value_row_dose": 4_194_304,
+        "steps": corrected.OPTIMIZER_STEPS,
+        "base_value_row_dose": corrected.GLOBAL_ROW_DOSE,
         "policy_aux_active_batch_size_per_rank": 0,
         "policy_aux_active_row_dose": 0,
-        "replay_supervised_policy": False,
-        "replay_supervised_value": False,
+        "replay_supervised_policy": True,
+        "replay_supervised_value": True,
         "replay_forward_kl_weight": 0.0,
-        "soft_target_weight": 1.0,
+        "soft_target_weight": 0.9,
         "fresh_optimizer": True,
         "independent_f7_initialization": True,
     }
     if any(recipe.get(key) != value for key, value in required_recipe.items()):
-        raise ArmError("source is not the exact corrected anchor-only K3 recipe")
+        raise ArmError("source is not the exact selected-dose TEMP control recipe")
     initialization = payload.get("initialization")
     descriptor = payload.get("descriptor")
     sentinel = payload.get("validation_sentinel")
     if not all(isinstance(value, dict) for value in (initialization, descriptor, sentinel)):
-        raise ArmError("source K3 omits initialization, descriptor, or sentinel identity")
+        raise ArmError("source TEMP control omits initialization, descriptor, or sentinel identity")
     for identity in (initialization, descriptor, sentinel):
         if corrected._file_ref(Path(identity.get("path", ""))) != identity:  # noqa: SLF001
-            raise ArmError("source K3 bound artifact bytes drifted")
+            raise ArmError("source TEMP-control bound artifact bytes drifted")
     if corrected._option(command, "--init-checkpoint") != initialization["path"]:  # noqa: SLF001
         raise ArmError("source command/checkpoint identity mismatch")
     if corrected._option(command, "--data") != descriptor["path"]:  # noqa: SLF001
@@ -111,7 +111,7 @@ def _load_source(path: Path) -> tuple[dict[str, Any], dict[str, str]]:
     if corrected._option(command, "--validation-game-sentinel-manifest") != sentinel["path"]:  # noqa: SLF001
         raise ArmError("source command/validation sentinel identity mismatch")
     if "--validation-game-seed-manifest" in command:
-        raise ArmError("source K3 command mixes validation controls")
+        raise ArmError("source TEMP-control command mixes validation controls")
     return payload, ref
 
 
@@ -262,12 +262,12 @@ def _validate_coverage(path: Path, descriptor_path: Path) -> dict[str, Any]:
     )
     component_by_id = {row.get("component_id"): row for row in components}
     if not supervised_ids or not supervised_ids <= set(component_by_id):
-        raise ArmError("K3 descriptor has an invalid supervised component scope")
-    # Topology targets are consumed only by supervised policy/value rows.  The
-    # replay component in K3 is deliberately KL-anchor-only, so requiring it in
-    # the architecture audit both confuses the causal contract and rejects the
-    # real two-corpus audit.  Bind the audited set by resolved corpus identity;
-    # audit ordering is not semantically meaningful.
+        raise ArmError("TEMP descriptor has an invalid supervised component scope")
+    # The exact TEMP control supervises policy and value on every component,
+    # including predecessor replay.  The gather treatment must therefore prove
+    # valid target bindings for the complete supervised mixture; auditing only
+    # current rows would silently change the effective treatment population.
+    # Bind by resolved corpus identity; audit ordering is not semantic.
     expected_dirs = {
         str(Path(component_by_id[component_id]["corpus_dir"]).resolve())
         for component_id in supervised_ids
@@ -279,7 +279,7 @@ def _validate_coverage(path: Path, descriptor_path: Path) -> dict[str, Any]:
         or len(set(audited_dirs)) != len(audited_dirs)
         or set(audited_dirs) != expected_dirs
     ):
-        raise ArmError("coverage audit does not bind exactly the supervised K3 corpora")
+        raise ArmError("coverage audit does not bind exactly the supervised TEMP corpora")
     coverage = []
     for row in rows:
         legal = row.get("legal_action_targets", {})
@@ -293,7 +293,7 @@ def _validate_coverage(path: Path, descriptor_path: Path) -> dict[str, Any]:
             and legal.get("search_active_rows_with_any_target", 0) > 0
             and legal.get("actions_with_any_target", 0) > 0
         ):
-            raise ArmError("K3 corpus lacks valid, learnable topology target coverage")
+            raise ArmError("TEMP corpus lacks valid, learnable topology target coverage")
         coverage.append({
             "corpus_dir": row["corpus_dir"],
             "actions": legal.get("actions"),
@@ -360,7 +360,7 @@ def prepare(args: argparse.Namespace) -> tuple[dict[str, Any], Path]:
     )
     changes.update(event_history_changes)
     # Everything that affects optimization remains byte-identical because the
-    # derived argv changes only checkpoint/output paths.  Real corrected-K3
+    # derived argv changes only checkpoint/output paths.  Real selected-TEMP
     # receipts are plain diagnostic torchrun commands and intentionally carry
     # no hidden A1 ablation metadata flags; the sealed manifest recipe/hash is
     # the authoritative objective identity.
@@ -376,8 +376,8 @@ def prepare(args: argparse.Namespace) -> tuple[dict[str, Any], Path]:
         "diagnostic_execution_authorized": True,
         "launch_interface_present": f"{EXECUTOR_RELATIVE_PATH} --go",
         "diagnostic_executor": executor_ref,
-        "source_corrected_k3_manifest": source_ref,
-        "source_corrected_k3_manifest_sha256": source["manifest_sha256"],
+        "source_selected_temp_manifest": source_ref,
+        "source_selected_temp_manifest_sha256": source["manifest_sha256"],
         "source_recipe": source["recipe"],
         "source_recipe_sha256": source["recipe_sha256"],
         "descriptor": source["descriptor"],
