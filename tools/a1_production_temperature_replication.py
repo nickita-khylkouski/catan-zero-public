@@ -44,6 +44,84 @@ COMPONENT_TEMPERATURES = {
     "n256_current": 1.11,
     "gen3_replay": 0.52,
 }
+# These are not merely reporting metadata.  Each field changes the function
+# optimized by the selected learner, its numerical trajectory, or the model
+# architecture.  The command receipt is already sealed byte-for-byte; this
+# second binding proves that train_bc actually interpreted that command as the
+# authenticated TEMP recipe instead of silently falling back to a changed
+# default.
+SEALED_REPORT_RECIPE = {
+    "arch": "entity_graph",
+    "hidden_size": 640,
+    "graph_layers": 6,
+    "attention_heads": 8,
+    "graph_dropout": 0.05,
+    "mask_hidden_info": True,
+    "graph_history_features": True,
+    "track": "2p_no_trade",
+    "vps_to_win": 10,
+    "world_size": 8,
+    "ddp_shard_data": False,
+    "batch_size": 512,
+    "grad_accum_steps": 1,
+    "effective_global_batch_size": 4096,
+    "epochs": 1,
+    "max_steps": 1024,
+    "steps_completed": 1024,
+    "base_training_row_draws": 4_194_304,
+    "optimizer": "adam",
+    "resume_optimizer": False,
+    "optimizer_restored": False,
+    "fused_optimizer": False,
+    "amp": "none",
+    "lr": 3e-5,
+    "lr_schedule": "flat",
+    "lr_warmup_steps": 100,
+    "weight_decay": 0.0,
+    "max_grad_norm": 1.0,
+    "gradient_clipping_enabled": True,
+    "value_lr_mult": 0.3,
+    "action_module_lr_mult": 1.0,
+    "policy_loss_weight": 1.0,
+    "soft_target_source": "policy",
+    "soft_target_weight": 0.9,
+    "soft_target_temperature": 0.7,
+    "soft_target_min_legal_coverage": 0.5,
+    "value_loss_weight": 0.25,
+    "value_target_lambda": 1.0,
+    "value_head_type": "mse",
+    "truncated_vp_margin_value_weight": 0.0,
+    "final_vp_loss_weight": 0.0,
+    "vp_margin_weight": 0.0,
+    "q_loss_weight": 0.0,
+    "policy_kl_anchor_weight": 0.0,
+    "policy_kl_anchor_direction": "forward",
+    "forced_action_weight": 0.0,
+    "forced_row_value_weight": 1.0,
+    "winner_sample_weight": 1.0,
+    "loser_sample_weight": 1.0,
+    "per_game_policy_weight": False,
+    "per_game_policy_weight_mode": "equal",
+    "per_game_value_weight": False,
+    "per_game_value_weight_mode": "equal",
+    "phase_weights": {},
+    "value_phase_weights": {},
+    "teacher_weights": {},
+    "advantage_policy_weighting": "none",
+    "policy_surprise_weight": 0.0,
+    "policy_surprise_cap": 4.0,
+    "aux_subgoal_loss_weight": 0.0,
+    "value_uncertainty_loss_weight": 0.0,
+    "validation_max_samples": 0,
+    "seed": 1,
+    "training_rng_rank_offset": True,
+    "symmetry_augment": False,
+    "diagnostic_only": True,
+    "promotion_eligible": False,
+    "init_checkpoint_sha256": F7_SHA256,
+    "data_format": "memmap",
+    "stored_policy_component_temperatures": COMPONENT_TEMPERATURES,
+}
 BOUND_SOURCE_FILES = (
     "tools/a1_production_temperature_replication.py",
     "tools/a1_production_l1_rerun.py",
@@ -111,6 +189,40 @@ def _production_command(
     _set(command, "--checkpoint", str(checkpoint))
     _set(command, "--report", str(report))
     return command
+
+
+def _completed_recipe_drift(report: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Return strength-affecting report fields that differ from the winner."""
+
+    return {
+        key: {"expected": expected, "actual": report.get(key)}
+        for key, expected in SEALED_REPORT_RECIPE.items()
+        if report.get(key) != expected
+    }
+
+
+def _authenticated_objective_validation(report: dict[str, Any]) -> bool:
+    """Whether the report contains the validation measure matching training."""
+
+    metrics = report.get("metrics")
+    validation = (
+        metrics[-1].get("validation_objective_matched")
+        if isinstance(metrics, list) and metrics and isinstance(metrics[-1], dict)
+        else None
+    )
+    return bool(
+        isinstance(validation, dict)
+        and validation.get("schema_version") == "composite-validation-measure-v2"
+        and validation.get("objective_matched") is True
+        and validation.get("measure")
+        == "authenticated_component_then_uniform_game_then_uniform_row_with_objective_weight_density"
+        and validation.get("component_sampling_ratios")
+        == dict(zip(COMPONENT_IDS, COMPONENT_RATIOS, strict=True))
+        and validation.get("policy_distillation_component_ids")
+        == list(COMPONENT_IDS)
+        and int(validation.get("games", 0)) > 0
+        and int(validation.get("samples", 0)) > 0
+    )
 
 
 def _systemd_command(
@@ -682,65 +794,11 @@ def _verify_completed_report(
     descriptor = manifest["source_descriptor"]
     sentinel = manifest["validation_sentinel"]
     root = verified["output_root"]
-    exact = {
-        "arch": "entity_graph",
-        "hidden_size": 640,
-        "mask_hidden_info": True,
-        "graph_history_features": True,
-        "track": "2p_no_trade",
-        "vps_to_win": 10,
-        "world_size": 8,
-        "ddp_shard_data": False,
-        "batch_size": 512,
-        "grad_accum_steps": 1,
-        "effective_global_batch_size": 4096,
-        "epochs": 1,
-        "max_steps": 1024,
-        "steps_completed": 1024,
-        "base_training_row_draws": 4_194_304,
-        "optimizer": "adam",
-        "resume_optimizer": False,
-        "optimizer_restored": False,
-        "fused_optimizer": False,
-        "lr": 3e-5,
-        "lr_schedule": "flat",
-        "lr_warmup_steps": 100,
-        "weight_decay": 0.0,
-        "value_lr_mult": 0.3,
-        "action_module_lr_mult": 1.0,
-        "policy_loss_weight": 1.0,
-        "soft_target_source": "policy",
-        "soft_target_weight": 0.9,
-        "soft_target_min_legal_coverage": 0.5,
-        "value_loss_weight": 0.25,
-        "value_target_lambda": 1.0,
-        "value_head_type": "mse",
-        "truncated_vp_margin_value_weight": 0.0,
-        "final_vp_loss_weight": 0.0,
-        "q_loss_weight": 0.0,
-        "policy_kl_anchor_weight": 0.0,
-        "policy_kl_anchor_direction": "forward",
-        "forced_action_weight": 0.0,
-        "forced_row_value_weight": 1.0,
-        "winner_sample_weight": 1.0,
-        "loser_sample_weight": 1.0,
-        "validation_max_samples": 0,
-        "seed": 1,
-        "training_rng_rank_offset": True,
-        "symmetry_augment": False,
-        "diagnostic_only": True,
-        "promotion_eligible": False,
-        "init_checkpoint_sha256": F7_SHA256,
-        "data_format": "memmap",
-        "stored_policy_component_temperatures": COMPONENT_TEMPERATURES,
-    }
-    drift = {
-        key: {"expected": expected, "actual": report.get(key)}
-        for key, expected in exact.items()
-        if report.get(key) != expected
-    }
+    drift = _completed_recipe_drift(report)
     if drift:
         _fail(f"completed report differs from sealed TEMP recipe: {drift}")
+    if not _authenticated_objective_validation(report):
+        _fail("completed report lacks authenticated objective-matched validation")
     try:
         init_path = Path(str(report["init_checkpoint"])).resolve(strict=True)
         data_path = Path(str(report["data"])).resolve(strict=True)

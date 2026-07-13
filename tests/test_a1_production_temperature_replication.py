@@ -300,6 +300,55 @@ def test_winning_recipe_refuses_causal_drift(
         )
 
 
+@pytest.mark.parametrize(
+    ("field", "drifted"),
+    [
+        ("graph_layers", 5),
+        ("attention_heads", 4),
+        ("graph_dropout", 0.0),
+        ("amp", "bf16"),
+        ("max_grad_norm", 0.0),
+        ("soft_target_temperature", 1.0),
+        ("per_game_policy_weight", True),
+        ("phase_weights", {"setup": 2.0}),
+        ("policy_surprise_weight", 1.0),
+    ],
+)
+def test_completed_recipe_binding_covers_silent_strength_drift(
+    field: str, drifted: object
+) -> None:
+    report = dict(temp.SEALED_REPORT_RECIPE)
+    report[field] = drifted
+    drift = temp._completed_recipe_drift(report)
+    assert drift == {
+        field: {"expected": temp.SEALED_REPORT_RECIPE[field], "actual": drifted}
+    }
+
+
+def test_objective_validation_binding_rejects_raw_compatibility_measure() -> None:
+    objective = {
+        "schema_version": "composite-validation-measure-v2",
+        "objective_matched": True,
+        "measure": (
+            "authenticated_component_then_uniform_game_then_uniform_row_with_"
+            "objective_weight_density"
+        ),
+        "component_sampling_ratios": dict(
+            zip(temp.COMPONENT_IDS, temp.COMPONENT_RATIOS, strict=True)
+        ),
+        "policy_distillation_component_ids": list(temp.COMPONENT_IDS),
+        "games": 1153,
+        "samples": 262132,
+    }
+    report = {"metrics": [{"validation_objective_matched": objective}]}
+    assert temp._authenticated_objective_validation(report) is True
+
+    report["metrics"][-1] = {
+        "validation": {"accuracy": 0.59, "value_loss": 0.62}
+    }
+    assert temp._authenticated_objective_validation(report) is False
+
+
 def test_selection_requires_exact_h1_evidence_and_diagnostic_lineage(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
