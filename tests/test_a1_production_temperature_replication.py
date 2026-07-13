@@ -220,7 +220,7 @@ def test_winning_recipe_accepts_only_exact_fresh_f7_dose(tmp_path: Path) -> None
     )
 
 
-def test_production_command_is_only_an_output_and_runtime_rebinding(
+def test_production_command_adds_only_outputs_runtime_and_proven_empty_crop(
     tmp_path: Path,
 ) -> None:
     trainer = tmp_path / "checkout" / "tools" / "train_bc.py"
@@ -245,7 +245,27 @@ def test_production_command_is_only_an_output_and_runtime_rebinding(
     expected[expected.index("--report") + 1] = str(
         tmp_path / "production" / "report.json"
     )
+    expected.append(temp.base.CROP_FLAG)
     assert production == expected
+    assert production.count(temp.base.CROP_FLAG) == 1
+
+
+def test_production_command_refuses_ambiguous_preexisting_crop(
+    tmp_path: Path,
+) -> None:
+    trainer = tmp_path / "checkout" / "tools" / "train_bc.py"
+    trainer.parent.mkdir(parents=True)
+    trainer.write_text("# bound trainer\n", encoding="utf-8")
+    selected = [*_command(tmp_path), temp.base.CROP_FLAG]
+
+    with pytest.raises(temp.TemperatureReplicationError, match="already contains"):
+        temp._production_command(
+            selected,
+            python="/bound/venv/python",
+            trainer=trainer,
+            checkpoint=tmp_path / "production" / "candidate.pt",
+            report=tmp_path / "production" / "report.json",
+        )
 
 
 def test_production_recipe_validator_alone_does_not_authorize_additive_flags(
