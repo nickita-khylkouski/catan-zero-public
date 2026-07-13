@@ -24,6 +24,7 @@ from train_bc import (  # type: ignore  # noqa: E402
     _training_data_fingerprint,
     _value_training_metadata,
     _validate_a1_corpus_artifacts_and_seeds,
+    _validate_a1_decisive_training_semantics,
     _validate_a1_learner_objective,
     _validate_a1_learner_training_recipe,
     _validate_a1_validation_manifest_corpus_binding,
@@ -527,6 +528,18 @@ def test_a1_artifact_chain_replays_actual_seed_set_and_learner_objective(
     _validate_a1_learner_objective(args, bound)
     ddp = {"world_size": 1, "rank": 0, "local_rank": 0, "enabled": False}
     assert _validate_a1_learner_training_recipe(args, ddp, bound) == recipe
+    assert bound["decisive_training_semantics"] == {
+        "schema_version": "a1-decisive-training-semantics-v1",
+        "decisive": True,
+        "diagnostic_authority_present": False,
+        "world_size": 1,
+        "grad_accum_steps": 1,
+        "gradient_accumulation_contract": "single_microbatch_exact",
+        "symmetry_augmentation": False,
+        "distributed_symmetry_contract": "not_applicable",
+        "advantage_policy_weighting": "none",
+        "distributed_advantage_contract": "not_applicable",
+    }
 
     with pytest.raises(SystemExit, match="unexpected=1"):
         tampered_seeds = seeds.copy()
@@ -598,6 +611,65 @@ def test_a1_artifact_chain_rejects_learner_code_drift_before_training(
         _validate_a1_corpus_artifacts_and_seeds(
             meta, validation_contract, seeds
         )
+
+
+def _decisive_semantics_args(**overrides: object) -> argparse.Namespace:
+    values: dict[str, object] = {
+        "grad_accum_steps": 1,
+        "symmetry_augment": False,
+        "advantage_policy_weighting": "none",
+        "a1_batch_probe_plan": "",
+        "a1_batch_probe_run_id": "",
+        "a1_learner_ablation_id": "",
+        "a1_dual_learner_lock": "",
+    }
+    values.update(overrides)
+    return argparse.Namespace(**values)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"grad_accum_steps": 2}, "union-weighted gradient accumulation"),
+        ({"symmetry_augment": True}, "per-rank RNG"),
+        (
+            {"advantage_policy_weighting": "outcome_value"},
+            "global DDP normalization",
+        ),
+    ],
+)
+def test_decisive_distributed_a1_rejects_unsealed_semantics(
+    overrides: dict[str, object], message: str
+) -> None:
+    with pytest.raises(SystemExit, match=message):
+        _validate_a1_decisive_training_semantics(
+            _decisive_semantics_args(**overrides),
+            {"world_size": 8, "enabled": True},
+            {},
+        )
+
+
+def test_explicit_a1_diagnostic_authority_records_but_does_not_promote_unsafe_knobs(
+) -> None:
+    contract = _validate_a1_decisive_training_semantics(
+        _decisive_semantics_args(
+            grad_accum_steps=2,
+            symmetry_augment=True,
+            advantage_policy_weighting="outcome_value",
+            a1_learner_ablation_id="diagnostic-only",
+        ),
+        {"world_size": 8, "enabled": True},
+        {},
+    )
+    assert contract["decisive"] is False
+    assert contract["diagnostic_authority_present"] is True
+    assert contract["gradient_accumulation_contract"] == (
+        "diagnostic_approximate_microbatch_means"
+    )
+    assert contract["distributed_symmetry_contract"] == "incomplete"
+    assert contract["distributed_advantage_contract"] == (
+        "global_normalization_unsealed_for_a1"
+    )
 
 
 @pytest.mark.parametrize(
