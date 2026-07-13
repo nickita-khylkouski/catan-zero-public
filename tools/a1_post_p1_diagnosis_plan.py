@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """Emit the Pareto post-P1 learner/architecture probe sequence.
 
-The first P1 checkpoint used loser_weight=.3, so it is evidence, not a clean
-control for the independently successful loser_weight=1 learner.  This typed,
-non-launching plan changes one causal axis at a time: restore loser targets,
-restore the winning policy-active dose without increasing value dose, then add
-the zero-init action-target gather that exposes topology already stored in the
-corpus.  Full relational warm-starts and Cartesian sweeps are forbidden.
+The plan reuses completed evidence instead of scheduling it again.  In
+particular, the matched policy-active-dose arm already scored 596-604 over
+1,200 games and is retained as a negative result, not another B200 job.  Every
+new arm changes one causal axis from the selected TEMP/replay-scope control;
+the zero-init target-gather arm therefore does not silently add a policy-active
+auxiliary batch.  Full relational warm-starts and Cartesian sweeps are
+forbidden.
 """
 
 from __future__ import annotations
@@ -19,7 +20,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 
-SCHEMA = "a1-post-p1-optimization-architecture-plan-v2"
+SCHEMA = "a1-post-p1-optimization-architecture-plan-v3"
 SHORT_SAMPLE_DOSE = 524_288
 FULL_SAMPLE_DOSE = 4_194_304
 # Backwards-compatible name for code that refers to the historical full dose.
@@ -244,32 +245,42 @@ def build_plan(
         },
         {
             "arm_id": "L1_POLICY_AUX",
-            "training": "new matched B200 run after replay-scope selection",
+            "training": "reuse completed matched result; no new B200 run",
             "reference_arm": "selected replay-scope control",
             "recipe_delta": {
                 "checkpoint_upgrade": "none",
                 "policy_aux_active_batch_size": 128,
             },
             "purpose": (
-                "restore policy-active exposure while holding the adjudicated "
-                "base/value dose fixed"
+                "retain the completed negative policy-active-dose result so it is "
+                "not accidentally repeated or bundled into an architecture arm"
             ),
+            "completed_evidence": {
+                "candidate_wins": 596,
+                "control_wins": 604,
+                "games": 1200,
+                "candidate_score": 0.496667,
+                "errors": 0,
+                "truncations": 0,
+                "ruling": "no demonstrated improvement; do not repeat",
+                "audit": "docs/audits/A1_POLICY_AUX_REPLICATION_20260712.md",
+            },
         },
         {
-            "arm_id": "L1_AUX_REPLAY_ANCHOR",
+            "arm_id": "L1_REPLAY_ANCHOR",
             "training": "conditional matched B200 run after exact-v2 replay telemetry",
             "reference_arm": "selected replay-scope control",
             "recipe_delta": {
                 "checkpoint_upgrade": "none",
-                "policy_aux_active_batch_size": 128,
+                "policy_aux_active_batch_size": 0,
                 "policy_kl_anchor_scope": "authenticated gen3_replay multi-action rows",
                 "policy_kl_anchor_direction": "forward (KL(stored_prior || model))",
                 "policy_kl_anchor_weight": "choose from exact eligible-mass telemetry",
             },
             "purpose": (
-                "preserve the authenticated incumbent-era replay population without "
-                "confounding value dose or policy-active exposure; never describe "
-                "0.03/0.10 as a global-mass equivalent using replay ratio alone"
+                "test only preservation of the authenticated incumbent-era replay "
+                "population; policy-active dose remains zero so the anchor coefficient "
+                "is the sole treatment"
             ),
         },
         {
@@ -279,10 +290,11 @@ def build_plan(
             "recipe_delta": {
                 "checkpoint_upgrade": "f69_upgrade_checkpoint_config.py --flags gather",
                 "checkpoint_upgrade_forward_max_diff": 0.0,
-                "policy_aux_active_batch_size": 128,
+                "policy_aux_active_batch_size": 0,
             },
             "purpose": (
-                "isolate learned legal-action-to-target binding over L1_POLICY_AUX"
+                "isolate learned legal-action-to-target binding over the selected "
+                "corrected learner without changing policy-active dose"
             ),
         },
     ]
@@ -447,19 +459,20 @@ def build_plan(
             "outcomes were causal"
         ),
         "active_policy_dose": (
-            "L1_POLICY_AUX improves over its selected scope control at equal value dose: policy "
-            "underexposure was causal"
+            "completed L1_POLICY_AUX scored 596-604/1200 (49.67%): additional "
+            "policy-active exposure did not demonstrate improvement and is pruned"
         ),
         "target_semantics": (
             "L1_PURE_SEARCH_TARGET improves over its selected scope control: the 10% played-action "
             "hard label was harmful deterministic re-sharpening"
         ),
         "replay_anchor": (
-            "L1_AUX_REPLAY_ANCHOR improves exact forward replay KL without erasing "
+            "L1_REPLAY_ANCHOR improves exact forward replay KL without erasing "
             "n128/n256 teacher-gap closure: population-behavior drift was causal"
         ),
         "target_binding": (
-            "L1_GATHER improves topology-sensitive buckets over L1_POLICY_AUX: "
+            "L1_GATHER improves topology-sensitive buckets over its selected "
+            "TEMP/replay-scope control: "
             "spatial state-action aliasing was causal"
         ),
         "neither": (
@@ -503,12 +516,15 @@ def build_plan(
             "run CURRENT_POLICY_SCOPE and CURRENT_VALUE_SCOPE sequentially against TEMP_CONTROL",
             "select one replay scope; never combine two unsupported scope changes",
             "run L1_PURE_SEARCH_TARGET after scope selection releases DDP",
-            "run L1_POLICY_AUX after scope selection releases DDP",
+            "reuse completed L1_POLICY_AUX negative evidence; do not launch it again",
             (
-                "run L1_AUX_REPLAY_ANCHOR only if exact-v2 telemetry shows harmful "
-                "authenticated replay forward-KL drift"
+                "run L1_REPLAY_ANCHOR only if exact-v2 telemetry shows harmful "
+                "authenticated replay forward-KL drift; keep policy auxiliary dose zero"
             ),
-            "run L1_GATHER only after selecting the corrected learner objective",
+            (
+                "run L1_GATHER only after selecting the corrected learner objective; "
+                "keep policy auxiliary dose zero"
+            ),
             "evaluate arms in parallel on the H100 fleet; do not consume B200s",
         ],
         "fixed_recipe": fixed,

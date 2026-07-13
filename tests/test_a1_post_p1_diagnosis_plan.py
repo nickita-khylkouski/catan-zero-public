@@ -20,13 +20,25 @@ def test_matrix_reuses_legacy_evidence_and_adds_conditional_anchor() -> None:
         "CURRENT_VALUE_SCOPE",
         "L1_PURE_SEARCH_TARGET",
         "L1_POLICY_AUX",
-        "L1_AUX_REPLAY_ANCHOR",
+        "L1_REPLAY_ANCHOR",
         "L1_GATHER",
     ]
     assert (
         sum(arm["training"].startswith("new matched B200 run") for arm in plan["arms"])
-        == 6
+        == 5
     )
+    policy_aux = next(arm for arm in plan["arms"] if arm["arm_id"] == "L1_POLICY_AUX")
+    assert "no new B200 run" in policy_aux["training"]
+    assert policy_aux["completed_evidence"] == {
+        "candidate_wins": 596,
+        "control_wins": 604,
+        "games": 1200,
+        "candidate_score": 0.496667,
+        "errors": 0,
+        "truncations": 0,
+        "ruling": "no demonstrated improvement; do not repeat",
+        "audit": "docs/audits/A1_POLICY_AUX_REPLICATION_20260712.md",
+    }
     fixed = plan["fixed_recipe"]
     assert fixed["sample_dose"] == "selected_by_dose_adjudication"
     assert fixed["dose_candidates"] == [SHORT_SAMPLE_DOSE, FULL_SAMPLE_DOSE]
@@ -55,10 +67,10 @@ def test_policy_dose_and_gather_arms_are_single_sequential_deltas() -> None:
     assert "policy_distillation_component_ids" not in value_scope["recipe_delta"]
     assert pure_target["recipe_delta"]["soft_target_weight"] == 1.0
     assert aux["recipe_delta"]["policy_aux_active_batch_size"] == 128
-    assert anchor["recipe_delta"]["policy_aux_active_batch_size"] == 128
+    assert anchor["recipe_delta"]["policy_aux_active_batch_size"] == 0
     assert "exact eligible-mass" in anchor["recipe_delta"]["policy_kl_anchor_weight"]
     assert "stored_prior" in anchor["recipe_delta"]["policy_kl_anchor_direction"]
-    assert gather["recipe_delta"]["policy_aux_active_batch_size"] == 128
+    assert gather["recipe_delta"]["policy_aux_active_batch_size"] == 0
     assert control["recipe_delta"]["checkpoint_upgrade"] == "none"
     assert aux["recipe_delta"]["checkpoint_upgrade"] == "none"
     assert "gather" in gather["recipe_delta"]["checkpoint_upgrade"]
@@ -105,6 +117,13 @@ def test_matrix_is_sequential_and_non_launching() -> None:
     assert "dose adjudication" in plan["launch_condition"]
     assert any(
         "CURRENT_POLICY_SCOPE and CURRENT_VALUE_SCOPE" in row
+        for row in plan["gpu_schedule"]
+    )
+    assert any(
+        "do not launch it again" in row for row in plan["gpu_schedule"]
+    )
+    assert any(
+        "L1_GATHER" in row and "policy auxiliary dose zero" in row
         for row in plan["gpu_schedule"]
     )
     assert (
