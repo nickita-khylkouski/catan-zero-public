@@ -456,9 +456,15 @@ REQUIRED_RUNTIME_CODE_SUFFIXES = (
     REQUIRED_GENERATOR_CODE_SUFFIXES
     | REQUIRED_LEARNER_CODE_SUFFIXES
     | {
+        "configs/runtime/a1_production_runtime.json",
         "src/catan_zero/rl/action_features.py",
         "src/catan_zero/rl/action_mask.py",
         "src/catan_zero/search/rust_mcts.py",
+        "vendor/catanatron/catanatron/catanatron/__init__.py",
+        "vendor/catanatron/catanatron/catanatron/models/board.py",
+        "vendor/catanatron/catanatron/catanatron/models/enums.py",
+        "vendor/catanatron/catanatron/catanatron/models/map.py",
+        "vendor/catanatron/catanatron/catanatron/models/player.py",
     }
 )
 
@@ -1227,6 +1233,50 @@ def _promoted_producer_job_identity(
     return identity
 
 
+def _tracked_vendor_catanatron_runtime_paths(
+    repo_root: Path = REPO_ROOT,
+) -> set[Path]:
+    """Return exactly the committed pure-Python engine used by generation.
+
+    The sealed runtime imports Catanatron for the policy action catalog and
+    canonical BASE-map topology even when game transitions and MCTS are native.
+    Globbing is insufficient here: an untracked local module must never acquire
+    launch authority merely because it exists in the operator checkout.
+    """
+
+    relative_root = Path("vendor/catanatron/catanatron/catanatron")
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo_root), "ls-files", "-z", "--", str(relative_root)],
+            check=True,
+            capture_output=True,
+        )
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise ContractError("cannot enumerate tracked vendored Catanatron runtime") from error
+    paths: set[Path] = set()
+    for encoded in result.stdout.split(b"\0"):
+        if not encoded:
+            continue
+        try:
+            relative = Path(encoded.decode("utf-8"))
+        except UnicodeDecodeError as error:
+            raise ContractError("vendored Catanatron path is not UTF-8") from error
+        if relative.suffix != ".py" or not relative.is_relative_to(relative_root):
+            continue
+        candidate = repo_root / relative
+        try:
+            metadata = candidate.lstat()
+            resolved = candidate.resolve(strict=True)
+        except OSError as error:
+            raise ContractError(f"tracked vendored Catanatron file is missing: {relative}") from error
+        if not stat.S_ISREG(metadata.st_mode) or resolved != candidate.absolute():
+            raise ContractError(f"tracked vendored Catanatron file is not canonical: {relative}")
+        paths.add(resolved)
+    if not paths:
+        raise ContractError("tracked vendored Catanatron runtime is empty")
+    return paths
+
+
 def _runtime_code_tree_records() -> list[dict[str, Any]]:
     """Content-address the complete local Python runtime used by gen/A1.
 
@@ -1242,7 +1292,9 @@ def _runtime_code_tree_records() -> list[dict[str, Any]]:
         for path in REPO_ROOT.glob(pattern)
         if path.is_file()
     }
+    paths.update(_tracked_vendor_catanatron_runtime_paths())
     for relative in (
+        "configs/runtime/a1_production_runtime.json",
         "native/catanatron-rs/Cargo.toml",
         "native/catanatron-rs/Cargo.lock",
         "native/catanatron-rs/pyproject.toml",

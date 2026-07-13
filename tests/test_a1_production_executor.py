@@ -25,6 +25,36 @@ def _sha(path: Path) -> str:
     return executor._sha256(path)
 
 
+def _exact_runtime_report() -> dict[str, object]:
+    return {
+        "python_version": executor.PRODUCTION_RUNTIME["python_version"],
+        "torch_version": executor.PRODUCTION_RUNTIME["torch_version"],
+        "torch_cuda_version": executor.PRODUCTION_RUNTIME["torch_cuda_version"],
+        "dependency_versions": {
+            name: executor.PRODUCTION_RUNTIME[f"{name}_version"]
+            for name in (
+                "numpy", "networkx", "gymnasium", "zstandard", "scipy", "whr"
+            )
+        },
+        "nvidia_driver_version": executor.PRODUCTION_RUNTIME[
+            "nvidia_driver_version"
+        ],
+    }
+
+
+def test_native_wheel_inventory_digest_is_owned_by_runtime_contract(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    inventory = tmp_path / "WHEEL_SHA256SUMS"
+    inventory.write_text(
+        f"{'0' * 64}  {executor.NATIVE_WHEEL_NAME}\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(executor, "NATIVE_WHEEL_INVENTORY", inventory)
+
+    with pytest.raises(executor.ExecutorError, match="one canonical 0.1.8 artifact"):
+        executor._native_wheel_release_identity()  # noqa: SLF001
+
+
 def _fixture(
     tmp_path: Path, *, current_v3: bool = False
 ) -> tuple[Path, Path, dict, dict]:
@@ -1158,8 +1188,7 @@ def test_preflight_accepts_only_exact_report(monkeypatch: pytest.MonkeyPatch) ->
         "mps_limit_nofile_soft": executor.REQUIRED_NOFILE_SOFT,
         "client_environment": dict(executor.CLIENT_ENVIRONMENT),
         "python": "/venv/bin/python",
-        "torch_version": "x",
-        "torch_cuda_version": "x",
+        **_exact_runtime_report(),
         "catanatron_rs_version": executor.NATIVE_WHEEL_VERSION,
         "native_wheel_sha256": executor._native_wheel_release_identity()["sha256"],
         "native_mcts_capabilities": sorted(executor.NATIVE_REQUIRED_CAPABILITIES),
@@ -1186,13 +1215,18 @@ def test_preflight_accepts_only_exact_report(monkeypatch: pytest.MonkeyPatch) ->
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [
+        ("python_version", "3.11.14", "Python runtime drift"),
+        ("torch_version", "2.12.0+cu128", "torch runtime drift"),
+        ("torch_cuda_version", "12.9", "torch CUDA runtime drift"),
+        ("dependency_versions", {}, "dependency runtime drift"),
+        ("nvidia_driver_version", "580.999.0", "NVIDIA driver runtime drift"),
         ("catanatron_rs_version", "0.1.4", "version drift"),
         ("native_wheel_sha256", "sha256:" + "0" * 64, "wheel digest drift"),
         ("native_mcts_capabilities", [], "capability drift"),
         ("native_mcts_capabilities", "not-a-list", "capability drift"),
     ],
 )
-def test_preflight_fails_closed_on_native_runtime_report(
+def test_preflight_fails_closed_on_production_runtime_report(
     monkeypatch: pytest.MonkeyPatch, field: str, value: object, message: str
 ) -> None:
     report = {
@@ -1205,8 +1239,7 @@ def test_preflight_fails_closed_on_native_runtime_report(
         "mps_limit_nofile_soft": executor.REQUIRED_NOFILE_SOFT,
         "client_environment": dict(executor.CLIENT_ENVIRONMENT),
         "python": "/venv/bin/python",
-        "torch_version": "x",
-        "torch_cuda_version": "x",
+        **_exact_runtime_report(),
         "catanatron_rs_version": executor.NATIVE_WHEEL_VERSION,
         "native_wheel_sha256": executor._native_wheel_release_identity()["sha256"],
         "native_mcts_capabilities": sorted(executor.NATIVE_REQUIRED_CAPABILITIES),
@@ -1253,8 +1286,7 @@ def test_preflight_fails_closed_on_nofile_report(
         "mps_limit_nofile_soft": executor.REQUIRED_NOFILE_SOFT,
         "client_environment": dict(executor.CLIENT_ENVIRONMENT),
         "python": "/venv/bin/python",
-        "torch_version": "x",
-        "torch_cuda_version": "x",
+        **_exact_runtime_report(),
         "catanatron_rs_version": executor.NATIVE_WHEEL_VERSION,
         "native_wheel_sha256": executor._native_wheel_release_identity()["sha256"],
         "native_mcts_capabilities": sorted(executor.NATIVE_REQUIRED_CAPABILITIES),
@@ -1418,3 +1450,53 @@ def test_staged_repo_is_read_only_bytecode_clean_and_resume_verifiable(
     assert stat.S_IMODE((root / "pkg").stat().st_mode) == 0o555
     clean_resume = subprocess.run(argv, text=True, capture_output=True, check=False)
     assert clean_resume.returncode == 0, clean_resume.stderr
+
+
+def test_staged_catanatron_import_origin_is_inside_content_addressed_repo(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo-deadbeef"
+    rl = root / "src/catan_zero/rl"
+    vendor = root / "vendor/catanatron/catanatron/catanatron"
+    models = vendor / "models"
+    rl.mkdir(parents=True)
+    models.mkdir(parents=True)
+    (rl / "_catanatron.py").write_bytes(
+        (executor._REPO_ROOT / "src/catan_zero/rl/_catanatron.py").read_bytes()
+    )
+    (vendor / "__init__.py").write_text("# sealed package\n", encoding="utf-8")
+    (models / "__init__.py").write_text("# sealed models\n", encoding="utf-8")
+    for name in ("map", "board", "enums", "player"):
+        (models / f"{name}.py").write_text(
+            f"ORIGIN = {name!r}\n", encoding="utf-8"
+        )
+
+    command = executor._staged_catanatron_origin_command(
+        python=sys.executable, repo_dir=str(root)
+    )
+    accepted = subprocess.run(
+        shlex.split(command), text=True, capture_output=True, check=False
+    )
+    assert accepted.returncode == 0, accepted.stderr
+    report = json.loads(accepted.stdout)
+    assert Path(report["vendor_root"]) == vendor.resolve()
+    assert all(
+        Path(origin).is_relative_to(vendor.resolve())
+        for origin in report["origins"].values()
+    )
+
+    escaped = tmp_path / "repo-without-vendor"
+    escaped_rl = escaped / "src/catan_zero/rl"
+    escaped_rl.mkdir(parents=True)
+    (escaped_rl / "_catanatron.py").write_bytes((rl / "_catanatron.py").read_bytes())
+    refused = subprocess.run(
+        shlex.split(
+            executor._staged_catanatron_origin_command(
+                python=sys.executable, repo_dir=str(escaped)
+            )
+        ),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert refused.returncode != 0

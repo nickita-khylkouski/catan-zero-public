@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -23,16 +24,45 @@ def _run(*args: str, cwd: Path) -> subprocess.CompletedProcess[str]:
     )
 
 
-def _release_repo(tmp_path: Path, inventory: str) -> Path:
+def _release_repo(
+    tmp_path: Path,
+    inventory: str,
+    *,
+    contract_wheel_sha256: str | None = None,
+) -> Path:
     repo = tmp_path / "release-repo"
     (repo / "native" / "catanatron-rs").mkdir(parents=True)
     (repo / "tools" / "fleet" / "systemd").mkdir(parents=True)
+    (repo / "configs" / "runtime").mkdir(parents=True)
     (repo / "native" / "catanatron-rs" / "WHEEL_SHA256SUMS").write_text(
         inventory, encoding="utf-8"
     )
     (repo / "tools" / "fleet" / "systemd" / "nvidia-mps.service").write_text(
         "[Service]\nType=simple\nExecStart=/bin/true\n", encoding="utf-8"
     )
+    for relative in (
+        Path("configs/runtime/a1_production_runtime.json"),
+        Path("tools/production_runtime_contract.py"),
+    ):
+        (repo / relative).write_bytes((ROOT / relative).read_bytes())
+    if contract_wheel_sha256 is None:
+        for line in inventory.splitlines():
+            fields = line.split()
+            if (
+                len(fields) == 2
+                and len(fields[0]) == 64
+                and all(character in "0123456789abcdef" for character in fields[0])
+                and fields[1] == WHEEL_NAME
+            ):
+                contract_wheel_sha256 = fields[0]
+                break
+    if contract_wheel_sha256 is not None:
+        contract_path = repo / "configs/runtime/a1_production_runtime.json"
+        payload = json.loads(contract_path.read_text(encoding="utf-8"))
+        payload["catanatron_rs_wheel_sha256"] = contract_wheel_sha256
+        contract_path.write_text(
+            json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
     (repo / ".gitignore").write_text(".venv/\n*.ignored\n", encoding="utf-8")
     _run("git", "init", "-q", "-b", "main", cwd=repo)
     _run("git", "config", "user.email", "installer-test@example.invalid", cwd=repo)
@@ -103,21 +133,24 @@ def test_installer_shell_syntax_and_preflight_order() -> None:
     mutations = (
         text.index('sudo install -m 0644 "$MPS_UNIT_SOURCE"'),
         text.index('"$PY" -m venv .venv'),
-        text.index('python -m pip install "torch>=2.11"'),
+        text.index('"torch==$RUNTIME_TORCH_VERSION" --index-url "$TORCH_INDEX"'),
     )
     assert all(verified < mutation for mutation in mutations)
     assert 'git rev-parse --verify "refs/tags/${CATAN_REF}^{commit}"' in text
     assert "sha256sum -c --strict wheel.sha256" in text
     assert "CATAN_DEST must be an absolute systemd-safe path" in text
-    assert 'assert rs == "0.1.8"' in text
+    assert 'rs == expected["catanatron_rs_version"]' in text
     assert 'getattr(catanatron_rs, "gumbel_search", None)' in text
-    assert 'rust_version != "0.1.8"' in text
+    assert 'rust_version != expected_runtime["catanatron_rs_version"]' in text
     assert "gumbel_search_capabilities" in text
     assert "sigma_reference_visits" in text
     assert "belief_target_evidence" in text
     assert "initial_road_d1_scope" in text
     assert "public_award_feature_parity" in text
     assert "policy_temperature_semantics" in text
+    assert 'uv python install "$RUNTIME_PYTHON_VERSION"' in text
+    assert '"numpy==$RUNTIME_NUMPY_VERSION"' in text
+    assert 'driver_versions == {expected["nvidia_driver_version"]}' in text
 
 
 def test_malformed_inventory_fails_before_any_privileged_mutation(
@@ -168,6 +201,23 @@ def test_wrong_wheel_digest_fails_before_any_privileged_mutation(
     result, sudo_marker, destination = _invoke(tmp_path, repo=repo, wheel=wheel)
     assert result.returncode == 3
     assert "digest mismatch" in result.stdout
+    assert not sudo_marker.exists()
+    assert not (destination / ".venv").exists()
+
+
+def test_inventory_digest_must_match_runtime_contract_before_mutation(
+    tmp_path: Path,
+) -> None:
+    wheel = _wheel(tmp_path)
+    digest = hashlib.sha256(wheel.read_bytes()).hexdigest()
+    repo = _release_repo(
+        tmp_path,
+        f"{digest}  {WHEEL_NAME}\n",
+        contract_wheel_sha256="1" * 64,
+    )
+    result, sudo_marker, destination = _invoke(tmp_path, repo=repo, wheel=wheel)
+    assert result.returncode == 3
+    assert "digest disagrees with the production runtime contract" in result.stdout
     assert not sudo_marker.exists()
     assert not (destination / ".venv").exists()
 
@@ -254,6 +304,9 @@ def test_receipt_is_outside_checkout_and_binds_release_evidence() -> None:
         '"fleet_exporter_dropin_paths"',
         '"fleet_exporter_effective"',
         '"nvidia_mps_limit_nofile_soft"',
+        '"runtime_contract"',
+        '"dependency_versions"',
+        '"nvidia_driver_version"',
     ):
         assert field in text
     assert "handle.flush()" in text

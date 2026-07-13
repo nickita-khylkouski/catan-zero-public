@@ -4,6 +4,7 @@ import json
 import hashlib
 import os
 import stat
+import subprocess
 from collections import Counter
 from pathlib import Path
 from argparse import Namespace
@@ -97,6 +98,40 @@ def _generation_campaign_copy(tmp_path: Path, mutate) -> Path:
     path = tmp_path / "generation-campaign.json"
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
     return path
+
+
+def test_vendored_catanatron_runtime_is_tracked_and_digest_sensitive(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    package = repo / "vendor/catanatron/catanatron/catanatron"
+    models = package / "models"
+    models.mkdir(parents=True)
+    tracked = package / "__init__.py"
+    model = models / "map.py"
+    tracked.write_text("# package\n", encoding="utf-8")
+    model.write_text("VALUE = 1\n", encoding="utf-8")
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "add", "vendor/catanatron/catanatron/catanatron"],
+        check=True,
+    )
+    shadow = models / "untracked_shadow.py"
+    shadow.write_text("VALUE = 999\n", encoding="utf-8")
+
+    before_paths = contract._tracked_vendor_catanatron_runtime_paths(repo)  # noqa: SLF001
+    before = contract._digest_value(  # noqa: SLF001
+        [contract._file_record(path, kind="runtime_code") for path in sorted(before_paths)]
+    )
+    assert before_paths == {tracked.resolve(), model.resolve()}
+
+    model.write_text("VALUE = 2\n", encoding="utf-8")
+    after_paths = contract._tracked_vendor_catanatron_runtime_paths(repo)  # noqa: SLF001
+    after = contract._digest_value(  # noqa: SLF001
+        [contract._file_record(path, kind="runtime_code") for path in sorted(after_paths)]
+    )
+    assert after_paths == before_paths
+    assert after != before
 
 
 def _historical_db1_campaign(tmp_path: Path) -> Path:

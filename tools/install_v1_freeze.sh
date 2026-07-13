@@ -32,9 +32,9 @@ set -euo pipefail
 CATAN_REPO="${CATAN_REPO:-https://github.com/nickita-khylkouski/catan-zero-public}"
 CATAN_REF="${CATAN_REF:-}"
 CATAN_DEST="${CATAN_DEST:-$HOME/catan-zero-v1}"
-CATAN_RS_WHEEL="${CATAN_RS_WHEEL:-$HOME/bundle/catanatron_rs-0.1.8-cp311-cp311-manylinux_2_34_x86_64.whl}"
-RS_WHEEL_NAME="catanatron_rs-0.1.8-cp311-cp311-manylinux_2_34_x86_64.whl"
+CATAN_RS_WHEEL="${CATAN_RS_WHEEL:-}"
 RS_WHEEL_SHA256_FILE_REL="native/catanatron-rs/WHEEL_SHA256SUMS"
+RUNTIME_CONTRACT_REL="configs/runtime/a1_production_runtime.json"
 TORCH_INDEX="${TORCH_INDEX:-https://download.pytorch.org/whl/cu128}"
 PY="${PY:-python3.11}"
 MPS_REQUIRED_LIMIT_NOFILE_SOFT=65536
@@ -153,11 +153,55 @@ if git show-ref --verify --quiet "refs/tags/$CATAN_REF"; then
 fi
 echo "[install] checked out ref_kind=$REF_KIND $(git describe --tags --always) @ $HEAD_COMMIT"
 
+# One checked-in runtime identity controls both installation and the fleet
+# executor's launch admission. Do not duplicate these versions in shell flags:
+# a release checkout with a malformed or incomplete contract is not deployable.
+if ! command -v python3 >/dev/null 2>&1; then
+  die "python3 is required to parse $RUNTIME_CONTRACT_REL before bootstrapping the venv"
+fi
+if ! RUNTIME_CONTRACT_VALUES="$(
+  python3 tools/production_runtime_contract.py \
+    --contract "$RUNTIME_CONTRACT_REL" --format lines
+)"; then
+  die "invalid production runtime contract: $RUNTIME_CONTRACT_REL"
+fi
+mapfile -t RUNTIME_VALUES <<< "$RUNTIME_CONTRACT_VALUES"
+if [ "${#RUNTIME_VALUES[@]}" -ne 13 ]; then
+  die "production runtime contract emitted ${#RUNTIME_VALUES[@]} fields; expected 13"
+fi
+RUNTIME_PYTHON_VERSION="${RUNTIME_VALUES[0]}"
+RUNTIME_TORCH_VERSION="${RUNTIME_VALUES[1]}"
+RUNTIME_TORCH_CUDA_VERSION="${RUNTIME_VALUES[2]}"
+RUNTIME_CATANATRON_RS_VERSION="${RUNTIME_VALUES[3]}"
+RS_WHEEL_NAME="${RUNTIME_VALUES[4]}"
+RUNTIME_CATANATRON_RS_WHEEL_SHA256="${RUNTIME_VALUES[5]}"
+RUNTIME_NUMPY_VERSION="${RUNTIME_VALUES[6]}"
+RUNTIME_NETWORKX_VERSION="${RUNTIME_VALUES[7]}"
+RUNTIME_GYMNASIUM_VERSION="${RUNTIME_VALUES[8]}"
+RUNTIME_ZSTANDARD_VERSION="${RUNTIME_VALUES[9]}"
+RUNTIME_SCIPY_VERSION="${RUNTIME_VALUES[10]}"
+RUNTIME_WHR_VERSION="${RUNTIME_VALUES[11]}"
+RUNTIME_NVIDIA_DRIVER_VERSION="${RUNTIME_VALUES[12]}"
+RUNTIME_CONTRACT_SHA256="$(sha256sum "$RUNTIME_CONTRACT_REL" | awk '{print $1}')"
+if [ -z "$CATAN_RS_WHEEL" ]; then
+  CATAN_RS_WHEEL="$HOME/bundle/$RS_WHEEL_NAME"
+fi
+echo "[install] runtime contract=$RUNTIME_CONTRACT_SHA256 python=$RUNTIME_PYTHON_VERSION torch=$RUNTIME_TORCH_VERSION cuda=$RUNTIME_TORCH_CUDA_VERSION"
+
 # 2. Acquire and verify the exact Rust wheel before *any* sudo, systemd, venv,
 # torch, or pip mutation.  Always install a private verified copy so a staged
 # source wheel cannot change between hashing and pip consumption.
 INSTALL_TMP="$(mktemp -d "${TMPDIR:-/tmp}/catan-zero-install.XXXXXXXX")"
 chmod 0700 "$INSTALL_TMP"
+RUNTIME_CONSTRAINTS="$INSTALL_TMP/runtime-constraints.txt"
+printf '%s\n' \
+  "torch==$RUNTIME_TORCH_VERSION" \
+  "numpy==$RUNTIME_NUMPY_VERSION" \
+  "networkx==$RUNTIME_NETWORKX_VERSION" \
+  "gymnasium==$RUNTIME_GYMNASIUM_VERSION" \
+  "zstandard==$RUNTIME_ZSTANDARD_VERSION" \
+  "scipy==$RUNTIME_SCIPY_VERSION" \
+  "whr==$RUNTIME_WHR_VERSION" > "$RUNTIME_CONSTRAINTS"
 VERIFIED_RS_WHEEL="$INSTALL_TMP/$RS_WHEEL_NAME"
 RS_WHEEL_SHA256_FILE="$CATAN_DEST/$RS_WHEEL_SHA256_FILE_REL"
 if [ ! -f "$RS_WHEEL_SHA256_FILE" ]; then
@@ -184,6 +228,9 @@ while IFS= read -r inventory_line || [ -n "$inventory_line" ]; do
 done < "$RS_WHEEL_SHA256_FILE"
 if [ "$RS_WHEEL_RECORDS" -ne 1 ] || [ "$RS_WHEEL_MATCHES" -ne 1 ]; then
   die "$RS_WHEEL_SHA256_FILE_REL must contain exactly one non-empty record for $RS_WHEEL_NAME (records=$RS_WHEEL_RECORDS matches=$RS_WHEEL_MATCHES)"
+fi
+if [ "$RS_WHEEL_EXPECTED_SHA256" != "$RUNTIME_CATANATRON_RS_WHEEL_SHA256" ]; then
+  die "$RS_WHEEL_SHA256_FILE_REL digest disagrees with the production runtime contract"
 fi
 
 if [ -f "$CATAN_RS_WHEEL" ]; then
@@ -281,14 +328,17 @@ else
     export PATH="$HOME/.local/bin:$PATH"
   fi
   command -v uv >/dev/null 2>&1 || { echo "[install] ERROR: uv install failed; cannot bootstrap Python 3.11"; exit 5; }
-  uv python install 3.11
-  uv venv --seed --python 3.11 .venv
+  uv python install "$RUNTIME_PYTHON_VERSION"
+  uv venv --seed --python "$RUNTIME_PYTHON_VERSION" .venv
 fi
 # shellcheck disable=SC1091
 . .venv/bin/activate
-python - <<'PY'
-import sys
-assert sys.version_info[:2] == (3, 11), f"Python 3.11 required, got {sys.version.split()[0]}"
+RUNTIME_PYTHON_VERSION="$RUNTIME_PYTHON_VERSION" python - <<'PY'
+import os, platform
+expected = os.environ["RUNTIME_PYTHON_VERSION"]
+assert platform.python_version() == expected, (
+    f"Python {expected} required, got {platform.python_version()}"
+)
 PY
 python -m pip install --quiet --upgrade pip
 
@@ -296,20 +346,30 @@ python -m pip install --quiet --upgrade pip
 #    torch (cu128) FIRST so the `rl` extra's torch>=2.0 is already satisfied and
 #    pip never swaps in a CPU wheel; then the editable project + dev/rl extras;
 #    then the local rust wheel (the one dep pip cannot resolve from PyPI); + modal.
-python -m pip install "torch>=2.11" --index-url "$TORCH_INDEX" \
-  || { echo "[install] cu128 index failed; falling back to default torch index"; python -m pip install "torch>=2.11"; }
+python -m pip install -c "$RUNTIME_CONSTRAINTS" \
+  "torch==$RUNTIME_TORCH_VERSION" --index-url "$TORCH_INDEX"
+python -m pip install -c "$RUNTIME_CONSTRAINTS" \
+  "numpy==$RUNTIME_NUMPY_VERSION" \
+  "networkx==$RUNTIME_NETWORKX_VERSION" \
+  "gymnasium==$RUNTIME_GYMNASIUM_VERSION" \
+  "zstandard==$RUNTIME_ZSTANDARD_VERSION" \
+  "scipy==$RUNTIME_SCIPY_VERSION" \
+  "whr==$RUNTIME_WHR_VERSION"
 # catanatron is vendored under vendor/catanatron and is NOT on PyPI in the
 # exact version this repo uses; install it from the local copy before the
 # main package so the editable dependency is available for catan-zero tests.
-python -m pip install -e vendor/catanatron
-python -m pip install -e '.[dev,rl]'
+python -m pip install -c "$RUNTIME_CONSTRAINTS" -e vendor/catanatron
+python -m pip install -c "$RUNTIME_CONSTRAINTS" -e '.[dev,rl]'
 python -m pip install --force-reinstall --no-deps "$CATAN_RS_WHEEL"
 python -m pip install modal
 
 # 5. env-doctor — fail LOUD if the canonical stack is incomplete
 python - <<'PY'
-import importlib, sys
+import importlib, platform, subprocess, sys
 from importlib.metadata import version, PackageNotFoundError
+from tools.production_runtime_contract import load_runtime_contract
+
+expected = load_runtime_contract()
 mods = ("torch","scipy","whr","numpy","networkx","gymnasium","zstandard","catanatron_rs","modal","pytest")
 missing = []
 for m in mods:
@@ -321,7 +381,10 @@ try:
     rs = version("catanatron-rs")
 except PackageNotFoundError:
     rs = version("catanatron_rs")
-assert rs == "0.1.8", f"catanatron_rs must be 0.1.8, got {rs}"
+assert platform.python_version() == expected["python_version"]
+assert rs == expected["catanatron_rs_version"], (
+    f"catanatron_rs must be {expected['catanatron_rs_version']}, got {rs}"
+)
 import catanatron_rs
 assert hasattr(catanatron_rs.Game, "determinize_for_player"), "wheel lacks information-set determinization"
 assert callable(getattr(catanatron_rs, "gumbel_search", None)), "wheel lacks native Gumbel MCTS"
@@ -340,9 +403,27 @@ assert required_capabilities <= capabilities, (
     f"{sorted(required_capabilities - capabilities)}"
 )
 import torch
+assert str(torch.__version__) == expected["torch_version"]
+assert str(torch.version.cuda) == expected["torch_cuda_version"]
+for distribution in ("numpy", "networkx", "gymnasium", "zstandard", "scipy", "whr"):
+    actual = version(distribution)
+    wanted = expected[f"{distribution}_version"]
+    assert actual == wanted, f"{distribution} must be {wanted}, got {actual}"
+driver_versions = {
+    line.strip()
+    for line in subprocess.check_output(
+        [
+            "nvidia-smi",
+            "--query-gpu=driver_version",
+            "--format=csv,noheader,nounits",
+        ],
+        text=True,
+    ).splitlines()
+    if line.strip()
+}
+assert driver_versions == {expected["nvidia_driver_version"]}, driver_versions
 assert torch.cuda.is_available(), "canonical fleet install requires a CUDA-enabled torch build"
-assert torch.version.cuda == "12.8", f"canonical fleet install requires torch cu128, got CUDA {torch.version.cuda}"
-print(f"env-doctor OK: py={sys.version.split()[0]} torch={torch.__version__} "
+print(f"env-doctor OK: py={platform.python_version()} torch={torch.__version__} "
       f"cuda={torch.cuda.is_available()} catanatron_rs={rs}")
 PY
 
@@ -507,6 +588,7 @@ fi
 export CATAN_INSTALL_RECEIPT CATAN_REPO CATAN_REF CATAN_DEST REF_KIND TAG_COMMIT HEAD_COMMIT
 export RS_WHEEL_NAME RS_WHEEL_ACTUAL_SHA256 RS_WHEEL_EXPECTED_SHA256
 export RS_WHEEL_SHA256_FILE_REL RS_WHEEL_INVENTORY_SHA256
+export RUNTIME_CONTRACT_REL RUNTIME_CONTRACT_SHA256
 export CATAN_MPS_ACTIVE="$(systemctl is-active nvidia-mps.service)"
 export CATAN_MPS_ENABLED="$(systemctl is-enabled nvidia-mps.service)"
 export CATAN_MPS_LIMIT_NOFILE_SOFT
@@ -521,10 +603,15 @@ from importlib.metadata import PackageNotFoundError, version
 import json
 import os
 from pathlib import Path
+import platform
+import subprocess
 import sys
 
 import catanatron_rs
 import torch
+from tools.production_runtime_contract import load_runtime_contract
+
+expected_runtime = load_runtime_contract()
 
 try:
     rust_version = version("catanatron-rs")
@@ -542,13 +629,41 @@ required_capabilities = {
     "public_award_feature_parity",
     "policy_temperature_semantics",
 }
+dependency_versions = {
+    distribution: version(distribution)
+    for distribution in (
+        "numpy", "networkx", "gymnasium", "zstandard", "scipy", "whr"
+    )
+}
+expected_dependencies = {
+    distribution: expected_runtime[f"{distribution}_version"]
+    for distribution in dependency_versions
+}
+driver_versions = {
+    line.strip()
+    for line in subprocess.check_output(
+        [
+            "nvidia-smi",
+            "--query-gpu=driver_version",
+            "--format=csv,noheader,nounits",
+        ],
+        text=True,
+    ).splitlines()
+    if line.strip()
+}
 if (
-    rust_version != "0.1.8"
+    platform.python_version() != expected_runtime["python_version"]
+    or str(torch.__version__) != expected_runtime["torch_version"]
+    or str(torch.version.cuda) != expected_runtime["torch_cuda_version"]
+    or dependency_versions != expected_dependencies
+    or driver_versions != {expected_runtime["nvidia_driver_version"]}
+    or rust_version != expected_runtime["catanatron_rs_version"]
+    or not torch.cuda.is_available()
     or not determinize_api
     or not native_mcts_api
     or not required_capabilities <= native_mcts_capabilities
 ):
-    raise SystemExit("refusing to write receipt for an invalid catanatron_rs install")
+    raise SystemExit("refusing to write receipt for an invalid production runtime")
 
 payload = {
     "schema_version": "catan-zero-install-receipt-v2",
@@ -559,6 +674,11 @@ payload = {
     "tag_commit": os.environ.get("TAG_COMMIT") or None,
     "source_commit": os.environ["HEAD_COMMIT"],
     "destination": str(Path(os.environ["CATAN_DEST"]).resolve()),
+    "runtime_contract": {
+        "path": os.environ["RUNTIME_CONTRACT_REL"],
+        "sha256": os.environ["RUNTIME_CONTRACT_SHA256"],
+        "identity": expected_runtime,
+    },
     "wheel": {
         "filename": os.environ["RS_WHEEL_NAME"],
         "sha256": os.environ["RS_WHEEL_ACTUAL_SHA256"],
@@ -567,9 +687,11 @@ payload = {
         "checksum_inventory_sha256": os.environ["RS_WHEEL_INVENTORY_SHA256"],
     },
     "runtime": {
-        "python_version": sys.version.split()[0],
+        "python_version": platform.python_version(),
         "torch_version": str(torch.__version__),
         "torch_cuda_version": str(torch.version.cuda),
+        "dependency_versions": dependency_versions,
+        "nvidia_driver_version": next(iter(driver_versions)),
         "cuda_available": bool(torch.cuda.is_available()),
         "catanatron_rs_version": rust_version,
         "native_mcts_capabilities": sorted(native_mcts_capabilities),

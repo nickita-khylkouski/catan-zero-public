@@ -25,6 +25,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from tools import a1_pre_wave_contract as contract  # noqa: E402
+from tools import production_runtime_contract as runtime_contract  # noqa: E402
 
 HOST_SCHEMA = "a1-production-hosts-v1"
 RECEIPT_SCHEMA = "a1-production-executor-receipt-v1"
@@ -40,11 +41,14 @@ SUPERVISOR_ENVIRONMENT = {"PYTHONDONTWRITEBYTECODE": "1"}
 REQUIRED_NOFILE_SOFT = 65_536
 STOP_SSH_TIMEOUT_SECONDS = 45.0
 MPS_UNIT_PATH = _REPO_ROOT / "tools/fleet/systemd/nvidia-mps.service"
-NATIVE_WHEEL_VERSION = "0.1.8"
-NATIVE_WHEEL_NAME = (
-    "catanatron_rs-0.1.8-cp311-cp311-manylinux_2_34_x86_64.whl"
-)
+PRODUCTION_RUNTIME = runtime_contract.load_runtime_contract()
+PRODUCTION_RUNTIME_CONTRACT_PATH = runtime_contract.DEFAULT_CONTRACT
+NATIVE_WHEEL_VERSION = PRODUCTION_RUNTIME["catanatron_rs_version"]
+NATIVE_WHEEL_NAME = PRODUCTION_RUNTIME["catanatron_rs_wheel_filename"]
 NATIVE_WHEEL_INVENTORY = _REPO_ROOT / "native/catanatron-rs/WHEEL_SHA256SUMS"
+VENDORED_CATANATRON_SENTINEL = (
+    "vendor/catanatron/catanatron/catanatron/models/map.py"
+)
 NATIVE_REQUIRED_CAPABILITIES = frozenset(
     {
         "sigma_reference_visits",
@@ -213,14 +217,16 @@ def _native_wheel_release_identity() -> dict[str, Any]:
         or len(rows[0]) != 2
         or not re.fullmatch(r"[0-9a-f]{64}", rows[0][0])
         or rows[0][1] != NATIVE_WHEEL_NAME
+        or rows[0][0] != PRODUCTION_RUNTIME["catanatron_rs_wheel_sha256"]
     ):
         raise ExecutorError(
-            "native-wheel checksum inventory is not the one canonical 0.1.8 artifact"
+            "native-wheel checksum inventory is not the one canonical "
+            f"{NATIVE_WHEEL_VERSION} artifact"
         )
     return {
         "version": NATIVE_WHEEL_VERSION,
         "filename": NATIVE_WHEEL_NAME,
-        "sha256": "sha256:" + rows[0][0],
+        "sha256": "sha256:" + PRODUCTION_RUNTIME["catanatron_rs_wheel_sha256"],
         "required_capabilities": sorted(NATIVE_REQUIRED_CAPABILITIES),
     }
 
@@ -897,6 +903,7 @@ expected=json.loads(sys.argv[1])
 required_nofile=int(sys.argv[2])
 expected_mps_unit_sha256=sys.argv[3]
 expected_native_wheel=json.loads(sys.argv[4])
+expected_runtime=json.loads(sys.argv[5])
 nofile_soft_before,nofile_hard=resource.getrlimit(resource.RLIMIT_NOFILE)
 unlimited=resource.RLIM_INFINITY
 if nofile_hard!=unlimited and nofile_hard<required_nofile: raise SystemExit(f'hard RLIMIT_NOFILE {nofile_hard} is below required {required_nofile}')
@@ -909,12 +916,27 @@ if nofile_soft!=unlimited and nofile_soft<required_nofile: raise SystemExit(f'so
 try:
     import torch,catanatron_rs
 except Exception as error: raise SystemExit('configured interpreter dependency failure: '+repr(error))
+python_version=sys.version.split()[0]
+if python_version!=expected_runtime['python_version']: raise SystemExit(f"Python runtime drift: expected {expected_runtime['python_version']}, got {python_version}")
+torch_version=str(torch.__version__);torch_cuda_version=str(torch.version.cuda)
+if torch_version!=expected_runtime['torch_version']: raise SystemExit(f"torch runtime drift: expected {expected_runtime['torch_version']}, got {torch_version}")
+if torch_cuda_version!=expected_runtime['torch_cuda_version']: raise SystemExit(f"torch CUDA runtime drift: expected {expected_runtime['torch_cuda_version']}, got {torch_cuda_version}")
+dependency_distributions={'numpy':'numpy_version','networkx':'networkx_version','gymnasium':'gymnasium_version','zstandard':'zstandard_version','scipy':'scipy_version','whr':'whr_version'}
+try: dependency_versions={name:importlib.metadata.version(name) for name in dependency_distributions}
+except importlib.metadata.PackageNotFoundError as error: raise SystemExit('configured interpreter dependency distribution missing: '+str(error))
+expected_dependencies={name:expected_runtime[key] for name,key in dependency_distributions.items()}
+if dependency_versions!=expected_dependencies: raise SystemExit(f'production dependency runtime drift: expected={expected_dependencies!r} got={dependency_versions!r}')
 if not torch.cuda.is_available() or torch.cuda.device_count()!=len(expected): raise SystemExit(f'torch CUDA topology drift: available={torch.cuda.is_available()} count={torch.cuda.device_count()} expected={len(expected)}')
 run=lambda *args:subprocess.run(args,text=True,capture_output=True,check=False)
 gpu=run('nvidia-smi','--query-gpu=index','--format=csv,noheader,nounits')
 if gpu.returncode: raise SystemExit('nvidia-smi gpu query failed: '+gpu.stderr)
 indices=sorted(int(line.strip()) for line in gpu.stdout.splitlines() if line.strip())
 if indices!=expected: raise SystemExit(f'GPU topology drift: expected {expected}, got {indices}')
+driver=run('nvidia-smi','--query-gpu=driver_version','--format=csv,noheader,nounits')
+if driver.returncode: raise SystemExit('nvidia-smi driver query failed: '+driver.stderr)
+driver_versions={line.strip() for line in driver.stdout.splitlines() if line.strip()}
+if driver_versions!={expected_runtime['nvidia_driver_version']}: raise SystemExit(f"NVIDIA driver runtime drift: expected {expected_runtime['nvidia_driver_version']}, got {sorted(driver_versions)!r}")
+nvidia_driver_version=next(iter(driver_versions))
 apps=run('nvidia-smi','--query-compute-apps=pid,process_name','--format=csv,noheader,nounits')
 if apps.returncode not in (0,): raise SystemExit('nvidia-smi compute query failed: '+apps.stderr)
 foreign=[]
@@ -974,13 +996,14 @@ capabilities=set(capability_fn())
 required_capabilities=set(expected_native_wheel['required_capabilities'])
 missing=sorted(required_capabilities-capabilities)
 if missing: raise SystemExit('installed catanatron-rs lacks required capabilities: '+repr(missing))
-print(json.dumps({'gpu_indices':indices,'compute_apps':'mps_only_or_empty','mps_active':active,'mps_enabled':enabled,'mps_main_pid':main_pid,'mps_unit_sha256':mps_unit_sha256,'mps_limit_nofile_soft':mps_limit_nofile_soft,'client_environment':required,'python':sys.executable,'torch_version':str(torch.__version__),'torch_cuda_version':str(torch.version.cuda),'catanatron_rs_version':rust_version,'native_wheel_sha256':expected_native_wheel['sha256'],'native_mcts_capabilities':sorted(capabilities),'required_nofile_soft':required_nofile,'nofile_soft_before':nofile_soft_before,'nofile_soft':nofile_soft,'nofile_hard':nofile_hard},sort_keys=True))'''
+print(json.dumps({'gpu_indices':indices,'compute_apps':'mps_only_or_empty','mps_active':active,'mps_enabled':enabled,'mps_main_pid':main_pid,'mps_unit_sha256':mps_unit_sha256,'mps_limit_nofile_soft':mps_limit_nofile_soft,'client_environment':required,'python':sys.executable,'python_version':python_version,'torch_version':torch_version,'torch_cuda_version':torch_cuda_version,'dependency_versions':dependency_versions,'nvidia_driver_version':nvidia_driver_version,'catanatron_rs_version':rust_version,'native_wheel_sha256':expected_native_wheel['sha256'],'native_mcts_capabilities':sorted(capabilities),'required_nofile_soft':required_nofile,'nofile_soft_before':nofile_soft_before,'nofile_soft':nofile_soft,'nofile_hard':nofile_hard},sort_keys=True))'''
     command = " ".join(
         shlex.quote(value)
         for value in (
             hosts["python"], "-c", script, json.dumps(sorted(expected_gpus)),
             str(REQUIRED_NOFILE_SOFT), expected_mps_unit_sha256,
             json.dumps(expected_native_wheel, sort_keys=True),
+            json.dumps(PRODUCTION_RUNTIME, sort_keys=True),
         )
     )
     result = _ssh(hosts, alias, command)
@@ -993,6 +1016,20 @@ print(json.dumps({'gpu_indices':indices,'compute_apps':'mps_only_or_empty','mps_
         raise ExecutorError(f"host preflight returned invalid JSON on {alias}") from error
     if report.get("client_environment") != CLIENT_ENVIRONMENT:
         raise ExecutorError(f"host MPS client environment drift on {alias}")
+    expected_dependencies = {
+        name: PRODUCTION_RUNTIME[f"{name}_version"]
+        for name in ("numpy", "networkx", "gymnasium", "zstandard", "scipy", "whr")
+    }
+    if report.get("python_version") != PRODUCTION_RUNTIME["python_version"]:
+        raise ExecutorError(f"host Python runtime drift on {alias}")
+    if report.get("torch_version") != PRODUCTION_RUNTIME["torch_version"]:
+        raise ExecutorError(f"host torch runtime drift on {alias}")
+    if report.get("torch_cuda_version") != PRODUCTION_RUNTIME["torch_cuda_version"]:
+        raise ExecutorError(f"host torch CUDA runtime drift on {alias}")
+    if report.get("dependency_versions") != expected_dependencies:
+        raise ExecutorError(f"host production dependency runtime drift on {alias}")
+    if report.get("nvidia_driver_version") != PRODUCTION_RUNTIME["nvidia_driver_version"]:
+        raise ExecutorError(f"host NVIDIA driver runtime drift on {alias}")
     if report.get("mps_unit_sha256") != expected_mps_unit_sha256:
         raise ExecutorError(f"host MPS service unit digest drift on {alias}")
     if report.get("catanatron_rs_version") != expected_native_wheel["version"]:
@@ -1188,6 +1225,35 @@ with tmp.open('x') as f: json.dump(receipt,f,sort_keys=True);f.flush();os.fsync(
 os.replace(tmp,receipt_path)
 if not verify_tree(root): raise SystemExit('installed repo verification failed')'''
 
+_STAGED_CATANATRON_ORIGIN_SCRIPT = r'''import json,pathlib,sys
+from catan_zero.rl._catanatron import import_catanatron_module
+root=pathlib.Path(sys.argv[1]).resolve(strict=True)
+expected=(root/'vendor/catanatron/catanatron/catanatron').resolve(strict=True)
+modules={name:import_catanatron_module(name) for name in ('catanatron','catanatron.models.map','catanatron.models.board','catanatron.models.enums','catanatron.models.player')}
+origins={name:str(pathlib.Path(module.__file__).resolve(strict=True)) for name,module in modules.items()}
+outside={name:path for name,path in origins.items() if not pathlib.Path(path).is_relative_to(expected)}
+if outside: raise SystemExit(f'vendored Catanatron import escaped sealed repo: {outside!r}')
+print(json.dumps({'vendor_root':str(expected),'origins':origins},sort_keys=True))'''
+
+
+def _staged_catanatron_origin_command(*, python: str, repo_dir: str) -> str:
+    """Render an isolated import probe for the sealed pure-Python engine."""
+
+    environment = {
+        **contract.SEALED_RUNTIME_ENVIRONMENT,
+        "PYTHONPATH": f"{repo_dir}/src:{repo_dir}",
+    }
+    invocation = (
+        "/usr/bin/env",
+        "-i",
+        *(f"{key}={value}" for key, value in sorted(environment.items())),
+        python,
+        "-c",
+        _STAGED_CATANATRON_ORIGIN_SCRIPT,
+        repo_dir,
+    )
+    return " ".join(shlex.quote(value) for value in invocation)
+
 
 def _stage_repo(
     hosts: dict[str, Any],
@@ -1235,6 +1301,20 @@ def _stage_repo(
     )
     if result.returncode != 0:
         raise ExecutorError(f"immutable repo stage failed on {alias}: {result.stderr.strip()}")
+    artifact_paths = {str(record["path"]) for record in artifacts}
+    if VENDORED_CATANATRON_SENTINEL in artifact_paths:
+        origin = _ssh(
+            hosts,
+            alias,
+            _staged_catanatron_origin_command(
+                python=hosts["python"], repo_dir=repo_dir
+            ),
+        )
+        if origin.returncode != 0:
+            detail = (origin.stderr or origin.stdout).strip()
+            raise ExecutorError(
+                f"sealed Catanatron import-origin probe failed on {alias}: {detail}"
+            )
 
 
 def _lane_payload(

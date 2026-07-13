@@ -546,6 +546,7 @@ class TestGenerateGumbelSelfplayGuardWiring:
         "--no-belief-chance-spectra",
         "--information-set-search",
         "--native-mcts-hot-loop",
+        "--rust-featurize",
         "--determinization-particles",
         "4",
         "--determinization-min-simulations",
