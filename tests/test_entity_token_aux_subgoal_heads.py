@@ -42,7 +42,12 @@ _AUX_KEYS = (
 )
 
 
-def _config(*, aux_subgoal_heads: bool, dropout: float = 0.0) -> EntityGraphConfig:
+def _config(
+    *,
+    aux_subgoal_heads: bool,
+    dropout: float = 0.0,
+    aux_settlement_pointer_head: bool = False,
+) -> EntityGraphConfig:
     return EntityGraphConfig(
         action_size=64,
         static_action_feature_size=LEGAL_ACTION_FEATURE_SIZE,
@@ -53,6 +58,7 @@ def _config(*, aux_subgoal_heads: bool, dropout: float = 0.0) -> EntityGraphConf
         attention_heads=2,
         dropout=dropout,
         aux_subgoal_heads=aux_subgoal_heads,
+        aux_settlement_pointer_head=aux_settlement_pointer_head,
     )
 
 
@@ -76,12 +82,26 @@ def _synthetic_batch(batch_size: int = 3, num_actions: int = 5) -> dict:
 
 
 def test_default_config_has_no_aux_heads():
-    assert EntityGraphConfig(action_size=1, static_action_feature_size=1).aux_subgoal_heads is False
+    default = EntityGraphConfig(action_size=1, static_action_feature_size=1)
+    assert default.aux_subgoal_heads is False
+    assert default.aux_settlement_pointer_head is False
     model = EntityGraphNet(_config(aux_subgoal_heads=False))
     assert not hasattr(model, "aux_next_settlement_head")
     outputs = model(_synthetic_batch())
     for key in _AUX_KEYS:
         assert key not in outputs
+
+
+def test_settlement_pointer_requires_the_auxiliary_bundle() -> None:
+    with pytest.raises(
+        ValueError, match="aux_settlement_pointer_head requires aux_subgoal_heads"
+    ):
+        EntityGraphNet(
+            _config(
+                aux_subgoal_heads=False,
+                aux_settlement_pointer_head=True,
+            )
+        )
 
 
 def test_enabled_heads_emit_expected_shapes():
@@ -95,6 +115,65 @@ def test_enabled_heads_emit_expected_shapes():
     assert outputs["aux_robber_target"].shape == (3, AUX_NUM_HEXES)
     for key in _AUX_KEYS:
         assert torch.isfinite(outputs[key]).all()
+
+
+def test_settlement_pointer_follows_vertex_rows_but_robber_stays_canonical():
+    """Only the vertex target lacks an identity-bearing input feature.
+
+    Settlement pointer logits must follow a vertex-row relabeling. Hex tokens
+    already carry canonical coordinates, so the dense robber classifier should
+    remain invariant when the coordinate-bearing rows are merely reordered.
+    """
+    torch.manual_seed(7)
+    model = EntityGraphNet(
+        _config(aux_subgoal_heads=True, aux_settlement_pointer_head=True)
+    ).eval()
+    batch = _synthetic_batch(batch_size=2)
+    vertex_permutation = torch.arange(AUX_NUM_INTERSECTIONS - 1, -1, -1)
+    hex_permutation = torch.arange(AUX_NUM_HEXES - 1, -1, -1)
+    permuted = {name: value.clone() for name, value in batch.items()}
+    permuted["vertex_tokens"] = permuted["vertex_tokens"][:, vertex_permutation]
+    permuted["hex_tokens"] = permuted["hex_tokens"][:, hex_permutation]
+
+    with torch.no_grad():
+        original = model(batch)
+        relabeled = model(permuted)
+
+    torch.testing.assert_close(
+        relabeled["aux_next_settlement"],
+        original["aux_next_settlement"][:, vertex_permutation],
+        rtol=1e-6,
+        atol=1e-6,
+    )
+    torch.testing.assert_close(
+        relabeled["aux_robber_target"],
+        original["aux_robber_target"],
+        rtol=1e-6,
+        atol=1e-6,
+    )
+    for key in ("logits", "value", "final_vp"):
+        torch.testing.assert_close(
+            relabeled[key], original[key], rtol=1e-6, atol=1e-6
+        )
+
+
+def test_legacy_settlement_head_exposes_vertex_identity_alias() -> None:
+    torch.manual_seed(8)
+    model = EntityGraphNet(_config(aux_subgoal_heads=True)).eval()
+    batch = _synthetic_batch(batch_size=2)
+    permuted = {name: value.clone() for name, value in batch.items()}
+    permuted["vertex_tokens"] = permuted["vertex_tokens"][:, torch.arange(53, -1, -1)]
+
+    with torch.no_grad():
+        original = model(batch)
+        relabeled = model(permuted)
+
+    torch.testing.assert_close(
+        relabeled["aux_next_settlement"],
+        original["aux_next_settlement"],
+        rtol=1e-6,
+        atol=1e-6,
+    )
 
 
 def test_aux_heads_do_not_change_value_or_policy():

@@ -62,6 +62,33 @@ def test_topology_adapter_and_gather_remove_both_spatial_aliases() -> None:
     assert not any("topology" in item for item in report["architecture"]["limitations"])
 
 
+def test_legacy_settlement_aux_classifier_is_not_alias_safe() -> None:
+    report = build_report(
+        _base(
+            topology_residual_adapter=True,
+            action_target_gather=True,
+            aux_subgoal_heads=True,
+        )
+    )
+    assert report["critical_information_bottlenecks"] == [
+        "settlement_aux_target_aliasing"
+    ]
+    assert report["safe_for_scale_only_ablation"] is False
+
+
+def test_settlement_pointer_clears_only_the_proven_aux_alias() -> None:
+    report = build_report(
+        _base(
+            topology_residual_adapter=True,
+            action_target_gather=True,
+            aux_subgoal_heads=True,
+            aux_settlement_pointer_head=True,
+        )
+    )
+    assert report["critical_information_bottlenecks"] == []
+    assert report["safe_for_scale_only_ablation"] is True
+
+
 def test_physical_v1_event_columns_are_unverified_without_exact_scan() -> None:
     report = build_report(_base(), {"implicit_zero_columns": []})
     assert report["corpus"]["event_history_trainable"] is None
