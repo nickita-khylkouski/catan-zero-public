@@ -73,10 +73,31 @@ def _selected_geometry_trainer_binding(
     return source, source_repo, trainer
 
 
-def verify(manifest_path: Path) -> dict[str, Any]:
+def verify(
+    manifest_path: Path,
+    *,
+    expected_executor: Path | None = None,
+    require_fresh_outputs: bool = True,
+) -> dict[str, Any]:
+    """Replay the immutable gather launch contract.
+
+    Normal launch verification is intentionally one-shot and therefore rejects
+    any pre-existing output.  A post-hoc completion verifier needs the same
+    source/input/command replay *after* those outputs exist.  It also executes
+    from a newer checkout, while the manifest must continue to bind the exact
+    historical executor bytes that submitted the run.  Both exceptions are
+    explicit keyword-only inputs; the launch path retains the old fail-closed
+    defaults.
+    """
+
     manifest, manifest_ref = _read_manifest(manifest_path)
     executor = _verify_ref(manifest.get("diagnostic_executor"), label="diagnostic_executor")
-    if executor != Path(__file__).resolve():
+    bound_executor = (
+        Path(__file__).resolve()
+        if expected_executor is None
+        else expected_executor.expanduser().resolve(strict=True)
+    )
+    if executor != bound_executor:
         raise ExecutionError("manifest authorizes a different executor path")
 
     source_manifest = _verify_ref(
@@ -257,9 +278,10 @@ def verify(manifest_path: Path) -> dict[str, Any]:
         output_root / "stdout.log",
         output_root / "stderr.log",
     )
-    existing = [str(path) for path in forbidden if path.exists()]
-    if existing:
-        raise ExecutionError(f"topology-arm output/claim already exists: {existing}")
+    if require_fresh_outputs:
+        existing = [str(path) for path in forbidden if path.exists()]
+        if existing:
+            raise ExecutionError(f"topology-arm output/claim already exists: {existing}")
     return {
         "manifest": manifest,
         "manifest_ref": manifest_ref,
