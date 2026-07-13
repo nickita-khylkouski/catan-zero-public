@@ -5069,22 +5069,6 @@ def main(argv: Sequence[str] | None = None) -> None:
         ddp,
     )
     aux_subgoal_target_coverage = None
-    if float(args.aux_subgoal_loss_weight) > 0.0:
-        aux_subgoal_target_coverage = _validate_aux_subgoal_target_coverage(
-            data,
-            ddp=ddp,
-            data_sharded=bool(args.ddp_shard_data),
-        )
-        _rank0_print(
-            json.dumps(
-                {
-                    "progress": "aux_subgoal_target_coverage",
-                    **aux_subgoal_target_coverage,
-                },
-                sort_keys=True,
-            ),
-            ddp,
-        )
     belief_resource_coverage = None
     if float(args.belief_resource_loss_weight) > 0.0:
         if bool(args.ddp_shard_data):
@@ -6049,6 +6033,46 @@ def main(argv: Sequence[str] | None = None) -> None:
         raise SystemExit(
             "training split is empty; refusing to save a checkpoint that could "
             "falsely attest a value readout without any optimizer update"
+        )
+    effective_training_weight_mass = _validate_effective_training_weight_mass(
+        policy_weights=policy_sample_weights,
+        value_weights=value_sample_weights,
+        train_indices=train_indices,
+        policy_objective_enabled=(
+            float(args.policy_loss_weight) > 0.0 or float(args.q_loss_weight) > 0.0
+        ),
+        value_objective_enabled=(
+            resolved_scalar_value_weight > 0.0
+            or resolved_categorical_value_weight > 0.0
+            or float(args.final_vp_loss_weight) > 0.0
+            or float(args.value_uncertainty_loss_weight) > 0.0
+        ),
+        ddp=ddp,
+        data_sharded=bool(args.ddp_shard_data),
+    )
+    _rank0_print(
+        json.dumps(
+            {"progress": "effective_training_weight_mass", **effective_training_weight_mass},
+            sort_keys=True,
+        ),
+        ddp,
+    )
+    if float(args.aux_subgoal_loss_weight) > 0.0:
+        aux_subgoal_target_coverage = _validate_aux_subgoal_target_coverage(
+            data,
+            indices=train_indices,
+            ddp=ddp,
+            data_sharded=bool(args.ddp_shard_data),
+        )
+        _rank0_print(
+            json.dumps(
+                {
+                    "progress": "aux_subgoal_target_coverage",
+                    **aux_subgoal_target_coverage,
+                },
+                sort_keys=True,
+            ),
+            ddp,
         )
     validation_seed_manifest_path: Path | None = None
     validation_seed_set_sha256 = ""
@@ -7401,6 +7425,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         "sample_weight_quality": policy_sample_weight_report,
         "policy_sample_weight_quality": policy_sample_weight_report,
         "value_sample_weight_quality": value_sample_weight_report,
+        "effective_training_weight_mass": effective_training_weight_mass,
         "policy_surprise_weight": float(args.policy_surprise_weight),
         "policy_surprise_cap": float(args.policy_surprise_cap),
         "policy_surprise_weight_quality": policy_surprise_weight_report,
@@ -8007,8 +8032,10 @@ _AUX_SUBGOAL_SPECS = (
 def _validate_aux_subgoal_target_coverage(
     data,
     *,
+    indices: np.ndarray | None = None,
     ddp: dict[str, int | bool] | None = None,
     data_sharded: bool = False,
+    chunk_rows: int = 1_000_000,
 ) -> dict[str, object]:
     """Require at least one finite supervised row for every enabled aux head.
 
@@ -8019,30 +8046,52 @@ def _validate_aux_subgoal_target_coverage(
     rank-sharded corpora.
     """
 
-    row_count = int(len(data["action_taken"]))
+    corpus_rows = int(len(data["action_taken"]))
+    selected = (
+        np.arange(corpus_rows, dtype=np.int64)
+        if indices is None
+        else np.asarray(indices, dtype=np.int64)
+    )
+    if selected.ndim != 1 or np.any(selected < 0) or np.any(selected >= corpus_rows):
+        raise SystemExit("aux target coverage indices are malformed")
+    row_count = int(len(selected))
     local_counts: dict[str, int] = {}
     local_errors: list[str] = []
     for field, kind in _AUX_SUBGOAL_SPECS:
         if field not in data:
             local_counts[field] = 0
             continue
-        try:
-            values = np.asarray(data[field], dtype=np.float64)
-        except (TypeError, ValueError) as error:
-            local_errors.append(f"aux target {field!r} is not numeric: {error}")
-            local_counts[field] = 0
-            continue
-        if values.shape != (row_count,):
+        column = data[field]
+        if tuple(getattr(column, "shape", ())) != (corpus_rows,):
             local_errors.append(
-                f"aux target {field!r} must have shape ({row_count},), "
-                f"got {values.shape}"
+                f"aux target {field!r} must have shape ({corpus_rows},), "
+                f"got {getattr(column, 'shape', None)}"
             )
             local_counts[field] = 0
             continue
-        valid = np.isfinite(values)
-        if kind == "categorical":
-            valid &= values >= 0.0
-        local_counts[field] = int(np.count_nonzero(valid))
+        valid_count = 0
+        for start in range(0, row_count, max(1, int(chunk_rows))):
+            batch = selected[start : start + max(1, int(chunk_rows))]
+            try:
+                values = np.asarray(column[batch], dtype=np.float64)
+            except (TypeError, ValueError) as error:
+                local_errors.append(
+                    f"aux target {field!r} is not numeric: {error}"
+                )
+                valid_count = 0
+                break
+            if values.shape != (len(batch),):
+                local_errors.append(
+                    f"aux target {field!r} slice must have shape ({len(batch)},), "
+                    f"got {values.shape}"
+                )
+                valid_count = 0
+                break
+            valid = np.isfinite(values)
+            if kind == "categorical":
+                valid &= values >= 0.0
+            valid_count += int(np.count_nonzero(valid))
+        local_counts[field] = valid_count
 
     counts = local_counts
     total_rows = row_count
@@ -15529,6 +15578,48 @@ def _validate_nonnegative_weight_array(values, *, label: str) -> np.ndarray:
             f"row {first} has {float(array[first])}"
         )
     return array
+
+
+def _validate_effective_training_weight_mass(
+    *,
+    policy_weights: np.ndarray,
+    value_weights: np.ndarray,
+    train_indices: np.ndarray,
+    policy_objective_enabled: bool,
+    value_objective_enabled: bool,
+    ddp: dict[str, int | bool] | None = None,
+    data_sharded: bool = False,
+) -> dict[str, float]:
+    """Refuse configured objectives with no positive training-row mass."""
+
+    indices = np.asarray(train_indices, dtype=np.int64)
+    policy = _validate_nonnegative_weight_array(
+        policy_weights, label="policy training weights"
+    )
+    value = _validate_nonnegative_weight_array(
+        value_weights, label="value training weights"
+    )
+    if np.any(indices < 0) or np.any(indices >= len(policy)) or len(value) != len(policy):
+        raise SystemExit("training weight arrays/indices are misaligned")
+    policy_mass = float(np.asarray(policy[indices], dtype=np.float64).sum())
+    value_mass = float(np.asarray(value[indices], dtype=np.float64).sum())
+    if ddp and bool(ddp.get("enabled", False)) and data_sharded:
+        policy_mass = _reduce_scalar_sum(policy_mass, ddp)
+        value_mass = _reduce_scalar_sum(value_mass, ddp)
+    if policy_objective_enabled and policy_mass <= 0.0:
+        raise SystemExit(
+            "policy/Q objective is enabled but the training split has zero positive "
+            "policy sample-weight mass"
+        )
+    if value_objective_enabled and value_mass <= 0.0:
+        raise SystemExit(
+            "value/final-VP objective is enabled but the training split has zero "
+            "positive value sample-weight mass"
+        )
+    return {
+        "policy_sample_weight_mass": policy_mass,
+        "value_sample_weight_mass": value_mass,
+    }
 
 
 def _optimizer_clip_observability(

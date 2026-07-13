@@ -91,6 +91,17 @@ def test_aux_coverage_preflight_rejects_missing_head_column():
         train_bc._validate_aux_subgoal_target_coverage(data)
 
 
+def test_aux_coverage_preflight_checks_training_split_not_full_corpus():
+    data = _coverage_data(
+        aux_robber_target=np.asarray([-1, -1, -1, 7], dtype=np.int16)
+    )
+
+    with pytest.raises(SystemExit, match="aux_robber_target"):
+        train_bc._validate_aux_subgoal_target_coverage(
+            data, indices=np.asarray([0, 1, 2], dtype=np.int64)
+        )
+
+
 def test_heads_absent_is_noop():
     """Heads-off model (no aux outputs): fn is a pure no-op, never raises."""
     out = {"logits": torch.randn(_N, 5), "value": torch.randn(_N)}
