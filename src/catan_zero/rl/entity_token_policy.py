@@ -22,6 +22,12 @@ from catan_zero.rl.entity_token_features import (
     VERTEX_FEATURE_SIZE,
     build_entity_token_features,
 )
+from catan_zero.rl.entity_feature_adapter import (
+    CURRENT_RUST_ENTITY_ADAPTER_VERSION,
+    checkpoint_entity_feature_adapter_metadata,
+    require_known_entity_feature_adapter,
+    resolve_checkpoint_entity_feature_adapter,
+)
 from catan_zero.rl.multiagent_env import ColonistMultiAgentConfig, ColonistMultiAgentEnv
 from catan_zero.rl.torch_ppo import build_action_feature_table
 from catan_zero.rl.xdim_lite_policy import (
@@ -1347,12 +1353,20 @@ class EntityGraphPolicy:
         *,
         seed: int = 0,
         device: str | None = None,
+        entity_feature_adapter_version: str = CURRENT_RUST_ENTITY_ADAPTER_VERSION,
     ) -> None:
         import torch
 
         torch.manual_seed(seed)
         self.config = config
         self.architecture = self.policy_type
+        # The adapter version is an input-slot semantic contract, not an
+        # architecture/shape field.  Keep it beside (not inside) config and
+        # serialize it independently with the weights.
+        self.entity_feature_adapter_version = require_known_entity_feature_adapter(
+            entity_feature_adapter_version
+        )
+        self.entity_feature_adapter_binding_source = "new_policy_runtime_binding"
         # f72 safety net (task #76): whether this policy's weights were trained
         # with train_bc.py --mask-hidden-info. Overwritten by .load() from the
         # checkpoint's own recorded metadata; freshly constructed policies
@@ -1404,6 +1418,7 @@ class EntityGraphPolicy:
         relational_edge_policy_head: bool = True,
         topology_residual_adapter: bool = False,
         belief_resource_head: bool = False,
+        entity_feature_adapter_version: str = CURRENT_RUST_ENTITY_ADAPTER_VERSION,
     ) -> EntityGraphPolicy:
         env = ColonistMultiAgentEnv(env_config or ColonistMultiAgentConfig())
         try:
@@ -1436,7 +1451,13 @@ class EntityGraphPolicy:
                 topology_residual_adapter=bool(topology_residual_adapter),
                 belief_resource_head=bool(belief_resource_head),
             )
-            return cls(config, static, seed=seed, device=device)
+            return cls(
+                config,
+                static,
+                seed=seed,
+                device=device,
+                entity_feature_adapter_version=entity_feature_adapter_version,
+            )
         finally:
             env.close()
 
@@ -1689,6 +1710,12 @@ class EntityGraphPolicy:
                 "soft_target_source": str(soft_target_source)
                 if soft_target_source is not None
                 else "",
+                # Input tensor shapes do not authenticate their meanings.  This
+                # append-only contract binds weights to the exact entity adapter
+                # semantics used for training/evaluation.
+                "entity_feature_adapter": checkpoint_entity_feature_adapter_metadata(
+                    self.entity_feature_adapter_version
+                ),
                 "static_action_features_sha256": _array_sha256(
                     self.static_action_features.detach().cpu().numpy()
                 ),
@@ -1738,6 +1765,12 @@ class EntityGraphPolicy:
         if hasattr(static, "detach"):
             static = static.detach().cpu().numpy()
         config = data["config"]
+        adapter_version, adapter_binding_source = (
+            resolve_checkpoint_entity_feature_adapter(
+                data.get("entity_feature_adapter"),
+                metadata_present="entity_feature_adapter" in data,
+            )
+        )
         # Task #74: reconstruct the config by field NAME from either serialized
         # form -- the durable name-keyed dict (new checkpoints) or the legacy
         # pickled dataclass (old checkpoints; possibly stale with unset slots,
@@ -1789,7 +1822,13 @@ class EntityGraphPolicy:
                         f"{checkpoint} static_action_features_sha256 mismatch: "
                         f"checkpoint={expected_static_hash} actual={actual_static_hash}"
                     )
-        policy = cls(config, static, device=str(resolved))
+        policy = cls(
+            config,
+            static,
+            device=str(resolved),
+            entity_feature_adapter_version=adapter_version,
+        )
+        policy.entity_feature_adapter_binding_source = adapter_binding_source
         # f72 safety net (task #76): record whether this checkpoint's training run
         # used --mask-hidden-info. Missing on any checkpoint saved before this field
         # existed -- defaults to False (untrained-with-masking), the safe default:

@@ -141,6 +141,10 @@ _REQUIRED_IDENTICAL_KEYS = ("mask_hidden_info", "config", "policy_type", "action
 
 
 def _assert_compatible_metadata(checkpoints: list[dict[str, Any]], paths: list[Path]) -> None:
+    from catan_zero.rl.entity_feature_adapter import (
+        resolve_checkpoint_entity_feature_adapter,
+    )
+
     reference = checkpoints[0]
     ref_path = paths[0]
     for key in _REQUIRED_IDENTICAL_KEYS:
@@ -155,6 +159,21 @@ def _assert_compatible_metadata(checkpoints: list[dict[str, Any]], paths: list[P
                     f"refusing to EMA-average checkpoints with different {key}: "
                     f"{ref_path} has {ref_value!r}, {path} has {value!r}"
                 )
+    ref_adapter, _ = resolve_checkpoint_entity_feature_adapter(
+        reference.get("entity_feature_adapter"),
+        metadata_present="entity_feature_adapter" in reference,
+    )
+    for checkpoint, path in zip(checkpoints[1:], paths[1:]):
+        adapter, _ = resolve_checkpoint_entity_feature_adapter(
+            checkpoint.get("entity_feature_adapter"),
+            metadata_present="entity_feature_adapter" in checkpoint,
+        )
+        if adapter != ref_adapter:
+            raise ValueError(
+                "refusing to EMA-average checkpoints with different entity "
+                f"feature adapters: {ref_path} has {ref_adapter!r}, "
+                f"{path} has {adapter!r}"
+            )
 
 
 def _assert_same_state_dict_structure(

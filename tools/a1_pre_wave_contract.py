@@ -48,6 +48,9 @@ if str(TOOLS) not in sys.path:
 
 from catan_zero.search.gumbel_chance_mcts import GumbelChanceMCTSConfig  # noqa: E402
 from catan_zero.search.neural_rust_mcts import EntityGraphRustEvaluatorConfig  # noqa: E402
+from catan_zero.rl.entity_feature_adapter import (  # noqa: E402
+    resolve_checkpoint_entity_feature_adapter,
+)
 from catan_zero.rl.gumbel_self_play import (  # noqa: E402
     GumbelSelfPlayConfig,
     TARGET_INFORMATION_REGIME_PUBLIC,
@@ -952,6 +955,12 @@ def _checkpoint_metadata(
             f"checkpoint {path} does not attest mask_hidden_info=true; public-observation "
             "generation may not use it"
         )
+    adapter_version, adapter_binding_source = (
+        resolve_checkpoint_entity_feature_adapter(
+            payload.get("entity_feature_adapter"),
+            metadata_present="entity_feature_adapter" in payload,
+        )
+    )
     value_training = payload.get("value_training")
     positive_provenance = (
         isinstance(value_training, dict)
@@ -1025,6 +1034,8 @@ def _checkpoint_metadata(
         }
     record = {
         "mask_hidden_info": True,
+        "entity_feature_adapter_version": adapter_version,
+        "entity_feature_adapter_binding_source": adapter_binding_source,
         "value_training_schema": (
             "value-training-v1"
             if isinstance(value_training, dict)

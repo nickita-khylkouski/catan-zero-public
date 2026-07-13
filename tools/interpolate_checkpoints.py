@@ -192,6 +192,10 @@ def _checkpoint_ref(path: Path) -> dict[str, str]:
 
 
 def _assert_compatible(base: dict[str, Any], candidate: dict[str, Any]) -> None:
+    from catan_zero.rl.entity_feature_adapter import (
+        resolve_checkpoint_entity_feature_adapter,
+    )
+
     structural_keys = {
         "observation_size",
         "action_size",
@@ -206,12 +210,39 @@ def _assert_compatible(base: dict[str, Any], candidate: dict[str, Any]) -> None:
                 f"incompatible checkpoint metadata for {key}: "
                 f"{base.get(key)!r} != {candidate.get(key)!r}"
             )
+    base_adapter, _ = resolve_checkpoint_entity_feature_adapter(
+        base.get("entity_feature_adapter"),
+        metadata_present="entity_feature_adapter" in base,
+    )
+    candidate_adapter, _ = resolve_checkpoint_entity_feature_adapter(
+        candidate.get("entity_feature_adapter"),
+        metadata_present="entity_feature_adapter" in candidate,
+    )
+    if base_adapter != candidate_adapter:
+        raise ValueError(
+            "incompatible checkpoint entity feature adapters: "
+            f"{base_adapter!r} != {candidate_adapter!r}"
+        )
     base_schema = _tensor_schema(base)
     candidate_schema = _tensor_schema(candidate)
     if base_schema != candidate_schema:
         raise ValueError("checkpoint tensor key/schema sets differ")
+    # A pre-contract checkpoint has no literal metadata key, but the explicit
+    # legacy resolver above may prove it is the same v2 semantics.  Compare the
+    # remaining append-only metadata tree without requiring representation-age
+    # equality for this one normalized field.
+    base_mapping = {
+        key: value for key, value in base.items() if key != "entity_feature_adapter"
+    }
+    candidate_mapping = {
+        key: value
+        for key, value in candidate.items()
+        if key != "entity_feature_adapter"
+    }
+    if not _mapping_contains(base_mapping, candidate_mapping):
+        raise ValueError("candidate checkpoint is missing base metadata keys")
     for key, base_value in base.items():
-        if key not in LEARNED_STATE_ROOTS:
+        if key not in LEARNED_STATE_ROOTS and key != "entity_feature_adapter":
             _assert_tensor_values_equal(
                 base_value,
                 candidate.get(key),
@@ -224,6 +255,20 @@ def _assert_compatible(base: dict[str, Any], candidate: dict[str, Any]) -> None:
     # Non-tensor training metadata may legitimately differ.  The structural
     # inference fields above and the complete tensor path/shape/dtype schema
     # are the deployable compatibility boundary.
+
+
+def _mapping_contains(base: Any, candidate: Any) -> bool:
+    if isinstance(base, dict):
+        return isinstance(candidate, dict) and all(
+            key in candidate and _mapping_contains(item, candidate[key])
+            for key, item in base.items()
+        )
+    if isinstance(base, (list, tuple)):
+        return isinstance(candidate, type(base)) and len(candidate) >= len(base) and all(
+            _mapping_contains(left, right)
+            for left, right in zip(base, candidate)
+        )
+    return True
 
 
 def _blend_checkpoint(
