@@ -172,9 +172,31 @@ def _verify_value_axis_descriptor(
         if treatment_payload != expected_payload or treatment_ref != preflight_ref:
             raise CompletionError("current-value descriptor has hidden drift")
     else:
-        if treatment != source_ref:
-            raise CompletionError("value-off diagnostic changed the TEMP descriptor")
-        treatment_meta, treatment_ref = source_meta, source_ref
+        treatment_path = _verify_bound_ref(treatment, label="treatment_descriptor")
+        root = Path(str(manifest["output_root"])).resolve()
+        if treatment_path != (root / "value-loss-off.memmap-composite.json").resolve():
+            raise CompletionError("value-off descriptor escaped output root")
+        try:
+            treatment_payload, treatment_ref = value_axis.bridge.corrected._load_json(  # noqa: SLF001
+                treatment_path
+            )
+            treatment_meta, preflight_ref = value_axis._preflight_descriptor(  # noqa: SLF001
+                treatment_path
+            )
+        except value_axis.bridge.corrected.ArmError as error:
+            raise CompletionError(f"value-off descriptor preflight failed: {error}") from error
+        source_overrides = source_payload.get("learner_recipe_overrides")
+        if not isinstance(source_overrides, Mapping):
+            raise CompletionError("source descriptor lacks learner recipe overrides")
+        expected_overrides = dict(source_overrides)
+        expected_overrides["value_loss_weight"] = 0.0
+        expected_payload = dict(source_payload)
+        expected_payload["learner_recipe_overrides"] = expected_overrides
+        expected_payload["learner_recipe_overrides_sha256"] = (
+            value_axis.bridge.corrected._digest(expected_overrides)  # noqa: SLF001
+        )
+        if treatment_payload != expected_payload or treatment_ref != preflight_ref:
+            raise CompletionError("value-off descriptor has hidden drift")
     expected_policy = list(value_axis.EXPECTED_COMPONENT_IDS)
     expected_value = (
         list(value_axis.CURRENT_COMPONENT_IDS)
@@ -267,14 +289,18 @@ def verify_manifest(manifest_path: Path) -> dict[str, Any]:
         )
         treatment_validation_ref = source["validation_sentinel"]
         expected_validation_semantics = None
-        if arm_id == value_axis.CURRENT_VALUE_SCOPE:
+        if arm_id in value_axis.AXES:
+            sentinel_name = (
+                "current-value-scope.validation-game-sentinel.json"
+                if arm_id == value_axis.CURRENT_VALUE_SCOPE
+                else "value-loss-off.validation-game-sentinel.json"
+            )
             treatment_validation_payload, treatment_validation_ref = (
                 value_axis._write_scope_validation_sentinel(  # noqa: SLF001
                     source["validation_sentinel"],
                     source_descriptor_meta=source_meta,
                     treatment_descriptor_meta=treatment_meta,
-                    destination=root
-                    / "current-value-scope.validation-game-sentinel.json",
+                    destination=root / sentinel_name,
                 )
             )
             expected_validation_semantics = {
