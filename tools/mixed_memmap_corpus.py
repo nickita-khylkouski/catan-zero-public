@@ -20,7 +20,23 @@ import numpy as np
 # absence has an exact, loss-safe interpretation that can be reconstructed from
 # older required columns. Any other schema gap remains a hard error.
 SYNTHESIZABLE_COLUMNS = frozenset(
-    {"is_forced", "used_full_search", "root_value", "root_value_mask"}
+    {
+        "is_forced",
+        "used_full_search",
+        "root_value",
+        "root_value_mask",
+        # Opponent/data-source provenance was historically dropped by the
+        # memmap converter.  Old components remain usable, but their identity
+        # must be represented as explicitly unknown rather than inferred.
+        "is_pool_game",
+        "opponent_version",
+        "opponent_tag",
+        "opponent_checkpoint_md5",
+        "opponent_type",
+        "opponent_provenance_present",
+        "training_source_category",
+        "training_source_category_verified",
+    }
 )
 
 
@@ -235,6 +251,10 @@ class _ConstantColumn:
             return np.asarray(self._value, dtype=self.dtype)
         return np.full(indices.shape, self._value, dtype=self.dtype)
 
+    def value_counts(self, index: Any = None) -> dict[str, int]:
+        count = self._n if index is None else int(np.asarray(index).size)
+        return {str(self._value): count} if count else {}
+
 
 class _DerivedBooleanColumn:
     """Lazy boolean derived from an older corpus' required source column."""
@@ -267,6 +287,21 @@ def _synthesized_column(corpus: Any, key: str):
         return _ConstantColumn(corpus.row_count, 0.0, np.float32)
     if key == "root_value_mask":
         return _ConstantColumn(corpus.row_count, False, np.bool_)
+    if key in {
+        "is_pool_game",
+        "opponent_provenance_present",
+        "training_source_category_verified",
+    }:
+        return _ConstantColumn(corpus.row_count, False, np.bool_)
+    if key == "opponent_version":
+        return _ConstantColumn(corpus.row_count, -1, np.int32)
+    if key in {
+        "opponent_tag",
+        "opponent_checkpoint_md5",
+        "opponent_type",
+        "training_source_category",
+    }:
+        return _ConstantColumn(corpus.row_count, "", "<U1")
     raise KeyError(key)
 
 

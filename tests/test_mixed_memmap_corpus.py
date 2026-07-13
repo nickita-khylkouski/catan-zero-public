@@ -183,6 +183,60 @@ def test_known_optional_columns_are_synthesized_with_safe_semantics():
     }
 
 
+def test_old_component_gets_unknown_opponent_provenance_not_fabricated_identity():
+    module = _module()
+    current = _Corpus(0, 2)
+    current._eager.update(
+        {
+            "is_pool_game": np.asarray([False, True]),
+            "opponent_version": np.asarray([-1, 7], dtype=np.int32),
+            "opponent_tag": np.asarray(["", "recent_history"]),
+            "opponent_checkpoint_md5": np.asarray(["", "deadbeef"]),
+            "opponent_type": np.asarray(["", ""]),
+            "opponent_provenance_present": np.asarray([False, True]),
+            "training_source_category": np.asarray(
+                ["current_producer", "recent_history"]
+            ),
+            "training_source_category_verified": np.asarray([True, True]),
+        }
+    )
+    for name, value in tuple(current._eager.items()):
+        if name not in module.SYNTHESIZABLE_COLUMNS:
+            continue
+        array = np.asarray(value)
+        current._columns[name] = (
+            {"kind": "string", "dtype": "int32", "categories": sorted(set(array.tolist()))}
+            if array.dtype.kind in {"U", "S", "O"}
+            else {"kind": "fixed", "dtype": array.dtype.str, "inner_shape": []}
+        )
+    old = _Corpus(2, 2)
+    mixed = module.ConcatMemmapCorpus([current, old])
+
+    np.testing.assert_array_equal(
+        mixed["training_source_category"][:],
+        ["current_producer", "recent_history", "", ""],
+    )
+    np.testing.assert_array_equal(
+        mixed["training_source_category_verified"][:],
+        [True, True, False, False],
+    )
+    np.testing.assert_array_equal(
+        mixed["opponent_provenance_present"][:],
+        [False, True, False, False],
+    )
+    np.testing.assert_array_equal(mixed["opponent_version"][:], [-1, 7, -1, -1])
+    assert set(mixed.synthesized_columns_by_component[1]) == {
+        "is_pool_game",
+        "opponent_version",
+        "opponent_tag",
+        "opponent_checkpoint_md5",
+        "opponent_type",
+        "opponent_provenance_present",
+        "training_source_category",
+        "training_source_category_verified",
+    }
+
+
 def test_unknown_missing_column_still_fails_closed():
     module = _module()
     left = _Corpus(0, 2)
