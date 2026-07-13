@@ -1923,12 +1923,20 @@ def test_v3_post_promotion_s1_bridge_replays_through_s2_s3_and_guard_sync(
     assert semantics["s3"]["selected_fields"] == operator_binding.S3_SELECTED
 
     guard_path = tmp_path / "generate.guard.json"
-    guard_path.write_bytes(
-        (
-            contract.REPO_ROOT
-            / "configs/guards/generate_gumbel_selfplay_data.json"
-        ).read_bytes()
+    production_guard_path = (
+        contract.REPO_ROOT / "configs/guards/generate_gumbel_selfplay_data.json"
     )
+    pristine_guard = json.loads(production_guard_path.read_text(encoding="utf-8"))
+    assert isinstance(pristine_guard.pop(contract.GUARD_SYNC_KEY), dict)
+    contract._guard_cli_flag_lint(
+        pristine_guard, path=guard_path
+    )["expected_values"]["--c-scale"] = contract.DEFAULT_GENERATION_C_SCALE
+    guard_path.write_text(
+        json.dumps(pristine_guard, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    assert contract.GUARD_SYNC_KEY not in json.loads(guard_path.read_text())
+    pristine_guard_sha256 = contract._sha256(guard_path)
     sync_draft = tmp_path / "post-promotion-sync-draft.json"
     sync_draft.write_text(
         json.dumps(
@@ -1951,6 +1959,8 @@ def test_v3_post_promotion_s1_bridge_replays_through_s2_s3_and_guard_sync(
         encoding="utf-8",
     )
     receipt = contract.sync_generation_guard(sync_draft)
+    assert receipt["changed"] is True
+    assert receipt["before_sha256"] == pristine_guard_sha256
     assert receipt["selected_c_scale"] == 0.1
     synced = json.loads(guard_path.read_text(encoding="utf-8"))
     assert synced[contract.GUARD_SYNC_KEY]["source_s1_evidence"] == {
