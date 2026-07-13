@@ -172,6 +172,18 @@ def test_existing_short_and_full_artifacts_must_select_dose_before_training() ->
 
 def test_evaluation_types_randomized_primary_and_tournament_bridge() -> None:
     plan = build_plan()
+    assert plan["schema_version"] == "a1-post-p1-optimization-architecture-plan-v4"
+    assert plan["evaluation"]["matched_search_operator"] == {
+        "candidate_c_scale": 0.10,
+        "baseline_c_scale": 0.10,
+        "selection_tuning_allowed": False,
+        "reason": (
+            "changing checkpoint ancestry and c_scale in one comparison repeats "
+            "the historical gen3/.03 adjudication confound"
+        ),
+    }
+    assert "same deployed c_scale=0.10" in plan["evaluation"]["checkpoint_identity"]
+    assert "separate crossover" in plan["evaluation"]["checkpoint_identity"]
     assert plan["evaluation"]["internal"]["map_kind"] == "BASE"
     assert plan["evaluation"]["external"]["map_kind"] == "TOURNAMENT"
     assert plan["evaluation"]["direct_tournament_bridge"]["map_kind"] == "TOURNAMENT"
