@@ -37,6 +37,7 @@ if str(_REPO_ROOT) not in sys.path:
 
 from tools import a1_pre_wave_contract as a1_contract  # noqa: E402
 from tools import a1_one_dose_train as one_dose  # noqa: E402
+from tools import a1_learner_dose_contract as learner_dose  # noqa: E402
 from tools import _a1_promotion_lock_state as promotion_lock_state  # noqa: E402
 from tools.a1_external_panel_compare import (  # noqa: E402
     ExternalPanelComparisonError,
@@ -549,12 +550,14 @@ def _verify_training_report(
     production_l1_completion: bool = False,
     production_target_gather_completion: bool = False,
     production_temperature_completion: bool = False,
+    production_learner_dose: learner_dose.LearnerDose | None = None,
 ) -> dict[str, Any]:
     report = _load_json(path)
     if sum((production_l1_completion, production_target_gather_completion,
             production_temperature_completion)) > 1:
         raise PromotionError("training report cannot use multiple production schemas")
     if production_temperature_completion:
+        dose = production_learner_dose or learner_dose.HISTORICAL_FULL_DOSE
         recipe = contract.get("science", {}).get("learner_training_recipe")
         if not isinstance(recipe, dict):
             recipe = {"symmetry_augment": False}
@@ -565,8 +568,11 @@ def _verify_training_report(
             "arch": "entity_graph", "mask_hidden_info": True,
             "track": "2p_no_trade", "vps_to_win": 10, "world_size": 8,
             "batch_size": 512, "effective_global_batch_size": 4096,
-            "epochs": 1, "max_steps": 1024, "steps_completed": 1024,
-            "base_training_row_draws": 4_194_304, "optimizer": "adam",
+            "epochs": 1,
+            "max_steps": dose.optimizer_steps,
+            "steps_completed": dose.optimizer_steps,
+            "base_training_row_draws": dose.global_samples,
+            "optimizer": "adam",
             "resume_optimizer": False, "optimizer_restored": False,
             "lr": 3e-5, "lr_schedule": "flat", "lr_warmup_steps": 100,
             "weight_decay": 0.0, "value_lr_mult": 0.3,
@@ -582,6 +588,11 @@ def _verify_training_report(
                     f"production temperature report drift at {key}: "
                     f"{report.get(key)!r} != {expected!r}"
                 )
+        if production_learner_dose is not None:
+            try:
+                learner_dose.assert_report(report, dose)
+            except learner_dose.LearnerDoseError as error:
+                raise PromotionError(str(error)) from error
         report_checkpoint = _absolute(report.get("checkpoint"), base=path.parent)
         if report_checkpoint != candidate_path or _sha256(report_checkpoint) != candidate_sha256:
             raise PromotionError("production temperature report candidate bytes drifted")
@@ -644,6 +655,7 @@ def _verify_training_report(
             raise PromotionError("production target-gather report candidate bytes drifted")
         return report
     if production_l1_completion:
+        dose = production_learner_dose or learner_dose.HISTORICAL_FULL_DOSE
         recipe = contract.get("science", {}).get("learner_training_recipe")
         if not isinstance(recipe, dict):
             # Historical production-L1 manifests predate a nested learner
@@ -660,8 +672,8 @@ def _verify_training_report(
             "world_size": 8,
             "batch_size": 512,
             "epochs": 1,
-            "max_steps": 1024,
-            "steps_completed": 1024,
+            "max_steps": dose.optimizer_steps,
+            "steps_completed": dose.optimizer_steps,
             "optimizer": "adam",
             "resume_optimizer": False,
             "optimizer_restored": False,
@@ -677,6 +689,11 @@ def _verify_training_report(
                     f"production L1 report drift at {key}: "
                     f"{report.get(key)!r} != {expected!r}"
                 )
+        if production_learner_dose is not None:
+            try:
+                learner_dose.assert_report(report, dose)
+            except learner_dose.LearnerDoseError as error:
+                raise PromotionError(str(error)) from error
         report_checkpoint = _absolute(report.get("checkpoint"), base=path.parent)
         if report_checkpoint != candidate_path or _sha256(report_checkpoint) != candidate_sha256:
             raise PromotionError("production L1 report candidate bytes drifted")
@@ -897,7 +914,10 @@ def _verify_one_dose_training_receipt(
 
     path = _canonical_existing_file(path, where="A1 one-dose training receipt")
     raw_schema = _load_json(path).get("schema_version")
-    if raw_schema == "a1-production-l1-rerun-completion-v1":
+    if raw_schema in {
+        "a1-production-l1-rerun-completion-v1",
+        "a1-production-l1-rerun-completion-v2",
+    }:
         return _verify_production_l1_completion_receipt(
             path,
             contract=contract,
@@ -915,7 +935,10 @@ def _verify_one_dose_training_receipt(
             training_report_path=training_report_path,
             training_report_sha256=training_report_sha256,
         )
-    if raw_schema == "a1-production-temperature-replication-completion-v1":
+    if raw_schema in {
+        "a1-production-temperature-replication-completion-v1",
+        "a1-production-temperature-replication-completion-v2",
+    }:
         return _verify_production_temperature_completion_receipt(
             path,
             contract=contract,
@@ -1400,19 +1423,27 @@ def _verify_production_l1_completion_receipt(
     from tools import a1_production_l1_rerun as production_l1
 
     value = _load_json(path)
+    schema = value.get("schema_version")
+    legacy = schema == production_l1.LEGACY_COMPLETION_SCHEMA
+    if schema not in {
+        production_l1.LEGACY_COMPLETION_SCHEMA,
+        production_l1.COMPLETION_SCHEMA,
+    }:
+        raise PromotionError("production L1 completion schema is unsupported")
     expected = {
         "schema_version", "diagnostic_only", "production_eligible",
         "created_at_unix_ns", "manifest", "submission", "checkpoint",
         "report", "unit_state", "receipt_sha256",
     }
+    if not legacy:
+        expected.add("dose_contract")
     value = _require_exact_keys(value, expected, where="production L1 completion receipt")
     unhashed = dict(value)
     stated = unhashed.pop("receipt_sha256")
     if stated != _digest_value(unhashed):
         raise PromotionError("production L1 completion receipt digest mismatch")
     if (
-        value["schema_version"] != production_l1.COMPLETION_SCHEMA
-        or value["diagnostic_only"] is not False
+        value["diagnostic_only"] is not False
         or value["production_eligible"] is not True
         or value["unit_state"]
         != {"ActiveState": "inactive", "Result": "success", "ExecMainStatus": "0"}
@@ -1426,21 +1457,19 @@ def _verify_production_l1_completion_receipt(
     except (production_l1.L1Error, OSError, KeyError, ValueError) as error:
         raise PromotionError(f"production L1 manifest replay refused: {error}") from error
     manifest = verified_manifest["manifest"]
-    selected = manifest.get("selected_dose")
-    if not isinstance(selected, dict) or {
-        "optimizer_steps": selected.get("optimizer_steps"),
-        "world_size": selected.get("world_size"),
-        "per_rank_batch_size": selected.get("per_rank_batch_size"),
-        "global_samples": selected.get("global_samples"),
-        "policy_aux_active_batch_size": selected.get("policy_aux_active_batch_size"),
-    } != {
-        "optimizer_steps": 1024,
-        "world_size": 8,
-        "per_rank_batch_size": 512,
-        "global_samples": 4_194_304,
-        "policy_aux_active_batch_size": 0,
-    }:
-        raise PromotionError("production L1 manifest selected dose drifted")
+    dose = verified_manifest.get("dose") or (
+        learner_dose.HISTORICAL_FULL_DOSE
+        if legacy
+        else learner_dose.PARETO_SELECTED_DOSE
+    )
+    try:
+        if legacy:
+            learner_dose.assert_legacy_payload(manifest.get("selected_dose"), dose)
+        else:
+            learner_dose.assert_payload(value.get("dose_contract"), dose)
+            learner_dose.assert_payload(manifest.get("selected_dose"), dose)
+    except learner_dose.LearnerDoseError as error:
+        raise PromotionError(str(error)) from error
     checkpoint_path, checkpoint_ref = _validate_file_ref(
         value["checkpoint"], base=path.parent, where="production L1 checkpoint"
     )
@@ -1461,7 +1490,12 @@ def _verify_production_l1_completion_receipt(
     submission_unhashed = dict(submission)
     submission_digest = submission_unhashed.pop("receipt_sha256", None)
     if (
-        submission.get("schema_version") != production_l1.SUBMISSION_SCHEMA
+        submission.get("schema_version")
+        != (
+            production_l1.LEGACY_SUBMISSION_SCHEMA
+            if legacy
+            else production_l1.SUBMISSION_SCHEMA
+        )
         or submission.get("diagnostic_only") is not False
         or submission.get("production_eligible") is not True
         or submission.get("manifest") != manifest_ref
@@ -1477,7 +1511,8 @@ def _verify_production_l1_completion_receipt(
     claim_unhashed = dict(claim)
     claim_digest = claim_unhashed.pop("claim_sha256", None)
     if (
-        claim.get("schema_version") != production_l1.CLAIM_SCHEMA
+        claim.get("schema_version")
+        != (production_l1.LEGACY_CLAIM_SCHEMA if legacy else production_l1.CLAIM_SCHEMA)
         or claim.get("manifest") != manifest_ref
         or claim.get("unit") != submission.get("unit")
         or claim_digest != _digest_value(claim_unhashed)
@@ -1505,15 +1540,20 @@ def _verify_production_l1_completion_receipt(
     if (
         progress_checkpoint != checkpoint_ref
         or progress_optimizer_path != optimizer_path
-        or progress.get("optimizer_step") != 1024
+        or progress.get("optimizer_step") != dose.optimizer_steps
         or progress.get("completed_epochs") != 1
         or not isinstance(progress.get("rank_torch_rng_states"), list)
         or len(progress["rank_torch_rng_states"]) != 8
-        or report.get("steps_completed") != 1024
-        or report.get("world_size") != 8
-        or report.get("batch_size") != 512
+        or report.get("steps_completed") != dose.optimizer_steps
+        or report.get("world_size") != dose.world_size
+        or report.get("batch_size") != dose.per_rank_batch_size
     ):
         raise PromotionError("production L1 progress/dose topology drifted")
+    if not legacy:
+        try:
+            learner_dose.assert_report(report, dose)
+        except learner_dose.LearnerDoseError as error:
+            raise PromotionError(str(error)) from error
     producers = [
         record for record in contract.get("checkpoints", [])
         if isinstance(record, dict) and record.get("role") == "producer"
@@ -1531,7 +1571,8 @@ def _verify_production_l1_completion_receipt(
         "claim": claim_ref,
         "command_sha256": manifest["command_sha256"],
         "unit": submission["unit"],
-        "world_size": 8,
+        "dose_contract": dose.payload(),
+        "world_size": dose.world_size,
         "optimizer": progress_optimizer,
         "progress": {"path": str(progress_path), "sha256": _sha256(progress_path)},
     }
@@ -1595,32 +1636,34 @@ def _verify_production_temperature_completion_receipt(
 
     from tools import a1_production_temperature_replication as temperature
 
+    value = _load_json(path)
+    schema = value.get("schema_version")
+    legacy = schema == temperature.LEGACY_COMPLETION_SCHEMA
+    if schema not in {
+        temperature.LEGACY_COMPLETION_SCHEMA,
+        temperature.COMPLETION_SCHEMA,
+    }:
+        raise PromotionError("production temperature completion schema is unsupported")
+    completion_keys = {
+        "schema_version", "diagnostic_only", "production_eligible",
+        "created_at_unix_ns", "manifest", "submission", "checkpoint",
+        "report", "unit_state", "replication_contract", "receipt_sha256",
+    }
+    if not legacy:
+        completion_keys.add("dose_contract")
     value = _require_exact_keys(
-        _load_json(path),
-        {
-            "schema_version", "diagnostic_only", "production_eligible",
-            "created_at_unix_ns", "manifest", "submission", "checkpoint",
-            "report", "unit_state", "replication_contract", "receipt_sha256",
-        },
+        value,
+        completion_keys,
         where="production temperature completion receipt",
     )
     unhashed = dict(value)
     stated = unhashed.pop("receipt_sha256")
-    expected_contract = {
-        "initializer_sha256": temperature.F7_SHA256,
-        "global_samples": 4_194_304,
-        "optimizer": "fresh_adam",
-        "stored_policy_component_temperatures": temperature.COMPONENT_TEMPERATURES,
-        "diagnostic_selection_artifact_relabelled": False,
-    }
     if (
         stated != _digest_value(unhashed)
-        or value["schema_version"] != temperature.COMPLETION_SCHEMA
         or value["diagnostic_only"] is not False
         or value["production_eligible"] is not True
         or value["unit_state"]
         != {"ActiveState": "inactive", "Result": "success", "ExecMainStatus": "0"}
-        or value["replication_contract"] != expected_contract
     ):
         raise PromotionError("production temperature completion is not eligible")
     manifest_path, manifest_ref = _validate_file_ref(
@@ -1632,6 +1675,25 @@ def _verify_production_temperature_completion_receipt(
         raise PromotionError(f"production temperature manifest replay refused: {error}") from error
     if verified["manifest_ref"] != manifest_ref:
         raise PromotionError("production temperature manifest reference drifted")
+    dose = verified.get("dose") or (
+        learner_dose.HISTORICAL_FULL_DOSE
+        if legacy
+        else learner_dose.PARETO_SELECTED_DOSE
+    )
+    expected_contract = {
+        "initializer_sha256": temperature.F7_SHA256,
+        "global_samples": dose.global_samples,
+        "optimizer": "fresh_adam",
+        "stored_policy_component_temperatures": temperature.COMPONENT_TEMPERATURES,
+        "diagnostic_selection_artifact_relabelled": False,
+    }
+    try:
+        if value.get("replication_contract") != expected_contract:
+            raise PromotionError("production temperature replication contract drifted")
+        if not legacy:
+            learner_dose.assert_payload(value.get("dose_contract"), dose)
+    except learner_dose.LearnerDoseError as error:
+        raise PromotionError(str(error)) from error
     checkpoint_path, checkpoint_ref = _validate_file_ref(
         value["checkpoint"], base=path.parent, where="production temperature checkpoint"
     )
@@ -1661,7 +1723,12 @@ def _verify_production_temperature_completion_receipt(
     manifest = verified["manifest"]
     if (
         set(submission) != expected_submission_keys
-        or submission.get("schema_version") != temperature.SUBMISSION_SCHEMA
+        or submission.get("schema_version")
+        != (
+            temperature.LEGACY_SUBMISSION_SCHEMA
+            if legacy
+            else temperature.SUBMISSION_SCHEMA
+        )
         or submission.get("diagnostic_only") is not False
         or submission.get("production_eligible") is not True
         or submission.get("manifest") != manifest_ref
@@ -1682,7 +1749,8 @@ def _verify_production_temperature_completion_receipt(
             "schema_version", "created_at_unix_ns", "manifest", "unit",
             "claim_sha256",
         }
-        or claim.get("schema_version") != temperature.CLAIM_SCHEMA
+        or claim.get("schema_version")
+        != (temperature.LEGACY_CLAIM_SCHEMA if legacy else temperature.CLAIM_SCHEMA)
         or claim.get("manifest") != manifest_ref
         or claim.get("unit") != submission.get("unit")
         or claim_digest != _digest_value(claim_unhashed)
@@ -1721,7 +1789,8 @@ def _verify_production_temperature_completion_receipt(
         "schema_version": "a1-production-temperature-promotion-execution-binding-v1",
         "manifest": manifest_ref, "submission": submission_ref, "claim": claim_ref,
         "command_sha256": manifest["command_sha256"], "unit": submission["unit"],
-        "world_size": 8,
+        "dose_contract": dose.payload(),
+        "world_size": dose.world_size,
     }
     return {
         "path": str(path), "sha256": _sha256(path), "receipt_sha256": stated,
@@ -4881,7 +4950,11 @@ def _verify_adjudication(
     )
     training_receipt_schema = _load_json(training_receipt).get("schema_version")
     production_l1_completion = (
-        training_receipt_schema == "a1-production-l1-rerun-completion-v1"
+        training_receipt_schema
+        in {
+            "a1-production-l1-rerun-completion-v1",
+            "a1-production-l1-rerun-completion-v2",
+        }
     )
     production_target_gather_completion = (
         training_receipt_schema
@@ -4889,7 +4962,19 @@ def _verify_adjudication(
     )
     production_temperature_completion = (
         training_receipt_schema
-        == "a1-production-temperature-replication-completion-v1"
+        in {
+            "a1-production-temperature-replication-completion-v1",
+            "a1-production-temperature-replication-completion-v2",
+        }
+    )
+    production_learner_dose = (
+        learner_dose.PARETO_SELECTED_DOSE
+        if training_receipt_schema
+        in {
+            "a1-production-l1-rerun-completion-v2",
+            "a1-production-temperature-replication-completion-v2",
+        }
+        else None
     )
     training_report_payload = _verify_training_report(
         training_path,
@@ -4900,6 +4985,7 @@ def _verify_adjudication(
         production_l1_completion=production_l1_completion,
         production_target_gather_completion=production_target_gather_completion,
         production_temperature_completion=production_temperature_completion,
+        production_learner_dose=production_learner_dose,
     )
     training_receipt_ref = _verify_one_dose_training_receipt(
         training_receipt,

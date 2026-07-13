@@ -3233,7 +3233,7 @@ def _production_l1_receipt_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     )
     claim_path = tmp_path / "execution.claim.json"
     claim = {
-        "schema_version": production_l1.CLAIM_SCHEMA,
+        "schema_version": production_l1.LEGACY_CLAIM_SCHEMA,
         "created_at_unix_ns": 1,
         "manifest": manifest_ref,
         "unit": "production-l1",
@@ -3242,7 +3242,7 @@ def _production_l1_receipt_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     _write_json(claim_path, claim)
     submission_path = tmp_path / "submission.receipt.json"
     submission = {
-        "schema_version": production_l1.SUBMISSION_SCHEMA,
+        "schema_version": production_l1.LEGACY_SUBMISSION_SCHEMA,
         "diagnostic_only": False,
         "production_eligible": True,
         "manifest": manifest_ref,
@@ -3254,7 +3254,7 @@ def _production_l1_receipt_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     _write_json(submission_path, submission)
     completion_path = tmp_path / "completion.receipt.json"
     completion = {
-        "schema_version": production_l1.COMPLETION_SCHEMA,
+        "schema_version": production_l1.LEGACY_COMPLETION_SCHEMA,
         "diagnostic_only": False,
         "production_eligible": True,
         "created_at_unix_ns": 2,
@@ -3721,6 +3721,65 @@ def test_production_l1_report_requires_exact_selected_recipe(tmp_path: Path) -> 
             report_path, contract=contract, contract_sha256="sha256:" + "0" * 64,
             candidate_path=candidate, candidate_sha256=promotion._sha256(candidate),
             production_l1_completion=True,
+        )
+
+
+def test_new_production_l1_report_requires_pareto_draw_accounting(
+    tmp_path: Path,
+) -> None:
+    candidate = tmp_path / "candidate.pt"
+    candidate.write_bytes(b"candidate")
+    f7 = tmp_path / "f7.pt"
+    f7.write_bytes(b"f7")
+    selected = promotion.learner_dose.PARETO_SELECTED_DOSE
+    report = {
+        "arch": "entity_graph", "mask_hidden_info": True,
+        "track": "2p_no_trade", "vps_to_win": 10,
+        "world_size": selected.world_size,
+        "batch_size": selected.per_rank_batch_size,
+        "grad_accum_steps": selected.grad_accum_steps,
+        "effective_global_batch_size": selected.effective_global_batch_size,
+        "epochs": 1, "max_steps": selected.optimizer_steps,
+        "steps_completed": selected.optimizer_steps,
+        "training_row_draws": selected.global_samples,
+        "base_training_row_draws": selected.global_samples,
+        "policy_aux_training_row_draws": 0,
+        "total_training_row_draws": selected.global_samples,
+        "optimizer": "adam", "resume_optimizer": False,
+        "optimizer_restored": False, "loser_sample_weight": 1.0,
+        "soft_target_weight": 0.9, "policy_aux_active_batch_size": 0,
+        "max_grad_norm": 1.0, "gradient_clipping_enabled": True,
+        "checkpoint": str(candidate), "init_checkpoint": str(f7),
+        "init_checkpoint_sha256": promotion._sha256(f7),
+    }
+    report_path = tmp_path / "short-report.json"
+    _write_json(report_path, report)
+    contract = {
+        "checkpoints": [{"role": "producer", "sha256": promotion._sha256(f7)}]
+    }
+
+    replay = promotion._verify_training_report(
+        report_path,
+        contract=contract,
+        contract_sha256="unused",
+        candidate_path=candidate,
+        candidate_sha256=promotion._sha256(candidate),
+        production_l1_completion=True,
+        production_learner_dose=selected,
+    )
+    assert replay["training_row_draws"] == 524_288
+
+    report["training_row_draws"] = 4_194_304
+    _write_json(report_path, report)
+    with pytest.raises(promotion.PromotionError, match="training_row_draws"):
+        promotion._verify_training_report(
+            report_path,
+            contract=contract,
+            contract_sha256="unused",
+            candidate_path=candidate,
+            candidate_sha256=promotion._sha256(candidate),
+            production_l1_completion=True,
+            production_learner_dose=selected,
         )
 
 

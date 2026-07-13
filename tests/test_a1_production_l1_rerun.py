@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 import subprocess
 
 import pytest
@@ -33,6 +34,31 @@ def test_latest_main_additions_project_to_exact_historical_l1() -> None:
 
     assert l1._historical_projection(derived, inventories) == historical
     l1._validate_historical_recipe(historical)
+
+
+def test_new_production_recipe_uses_selected_short_dose() -> None:
+    selected = _historical()
+    selected[selected.index("--max-steps") + 1] = "128"
+
+    l1._validate_recipe(selected, l1.learner_dose.PARETO_SELECTED_DOSE)
+    manifest = {
+        "schema_version": l1.MANIFEST_SCHEMA,
+        "selected_dose": l1.learner_dose.PARETO_SELECTED_DOSE.payload(),
+    }
+    assert l1._manifest_dose(manifest) == l1.learner_dose.PARETO_SELECTED_DOSE
+
+
+def test_legacy_full_dose_is_evidence_not_new_launch_authority(monkeypatch) -> None:
+    monkeypatch.setattr(
+        l1,
+        "verify",
+        lambda _path: {
+            "manifest": {"schema_version": l1.LEGACY_MANIFEST_SCHEMA},
+            "dose": l1.learner_dose.HISTORICAL_FULL_DOSE,
+        },
+    )
+    with pytest.raises(l1.L1Error, match="not launch authority"):
+        l1.execute(Path("legacy.json"), unit="legacy")
 
 
 @pytest.mark.parametrize(
