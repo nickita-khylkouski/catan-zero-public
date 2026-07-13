@@ -59,6 +59,13 @@ from catan_zero.rl.entity_token_features import (
 )
 from catan_zero.search.neural_rust_mcts import RUST_ENTITY_ADAPTER_VERSION
 from catan_zero.rl import optim_state as _checkout_optim_state
+from catan_zero.rl.flywheel.composite_contract import (
+    FRESH_SOURCE_GAME_RATIOS,
+    HISTORICAL_REPLAY_CATEGORY,
+    build_sampling_receipt,
+    canonical_sha256 as _contract_sha256,
+    measure_memmap_component,
+)
 
 
 CHECKOUT_RUNTIME_BINDING_SCHEMA = "train-bc-checkout-runtime-v1"
@@ -1985,6 +1992,164 @@ def _training_data_fingerprint(path: str, data_format: str) -> str:
     return ""
 
 
+def _validate_flywheel_component_provenance(
+    path: Path,
+    *,
+    component_id: str,
+    corpus_dir: Path,
+    corpus_meta: dict[str, object],
+) -> dict[str, object]:
+    """Authenticate the exact shards and producer checkpoints in one replay arm."""
+
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise SystemExit(f"cannot load flywheel component provenance {path}: {error}") from error
+    expected = {
+        "schema_version",
+        "component_id",
+        "source_category",
+        "role",
+        "current_checkpoint_version",
+        "checkpoint_versions",
+        "producer_checkpoints",
+        "row_count",
+        "shards",
+        "shard_inventory_sha256",
+        "component_mass",
+    }
+    if not isinstance(payload, dict) or set(payload) != expected:
+        raise SystemExit("flywheel component provenance fields differ from schema")
+    if payload.get("schema_version") != "flywheel-replay-component-v1":
+        raise SystemExit("flywheel component provenance schema is unsupported")
+    if payload.get("component_id") != component_id:
+        raise SystemExit("flywheel component provenance id differs from descriptor")
+    role = payload.get("role")
+    if role not in {"fresh", "replay"}:
+        raise SystemExit("flywheel component provenance role is invalid")
+    current_version = payload.get("current_checkpoint_version")
+    if isinstance(current_version, bool) or not isinstance(current_version, int):
+        raise SystemExit("flywheel current checkpoint version is invalid")
+    versions = payload.get("checkpoint_versions")
+    if (
+        not isinstance(versions, list)
+        or not versions
+        or any(isinstance(value, bool) or not isinstance(value, int) for value in versions)
+        or versions != sorted(set(versions))
+    ):
+        raise SystemExit("flywheel component checkpoint versions are invalid")
+    source_category = payload.get("source_category")
+    if source_category not in {
+        *FRESH_SOURCE_GAME_RATIOS,
+        HISTORICAL_REPLAY_CATEGORY,
+    }:
+        raise SystemExit("flywheel component source category is invalid")
+    if role == "fresh" and (
+        versions != [current_version]
+        or source_category not in FRESH_SOURCE_GAME_RATIOS
+    ):
+        raise SystemExit("flywheel fresh component must bind the initializer version/source")
+    if role == "replay" and source_category != HISTORICAL_REPLAY_CATEGORY:
+        raise SystemExit("flywheel replay component source category is invalid")
+    if role == "replay" and any(value >= current_version for value in versions):
+        raise SystemExit("flywheel replay must come from a strictly older checkpoint generation")
+    producers = payload.get("producer_checkpoints")
+    if not isinstance(producers, list) or len(producers) != len(versions):
+        raise SystemExit("flywheel producer checkpoint inventory is invalid")
+    producer_by_version: dict[int, dict[str, object]] = {}
+    for record in producers:
+        if not isinstance(record, dict) or set(record) != {"version", "path", "sha256"}:
+            raise SystemExit("flywheel producer checkpoint record is malformed")
+        version = record["version"]
+        checkpoint_path = Path(str(record["path"])).expanduser()
+        if (
+            isinstance(version, bool)
+            or not isinstance(version, int)
+            or version in producer_by_version
+            or version not in versions
+            or not checkpoint_path.is_absolute()
+            or not _is_sha256(record["sha256"])
+        ):
+            raise SystemExit("flywheel producer checkpoint record is invalid")
+        # Historical checkpoint files may be archived after generation; their
+        # immutable digest remains authoritative. If the path still exists,
+        # verify it has not drifted.
+        if checkpoint_path.exists() and _sha256_existing_file(checkpoint_path) != record["sha256"]:
+            raise SystemExit("flywheel producer checkpoint bytes changed")
+        producer_by_version[int(version)] = record
+    shards = payload.get("shards")
+    shard_fields = {
+        "path",
+        "rows",
+        "order",
+        "size_bytes",
+        "sha256",
+        "checkpoint_version",
+        "producer_checkpoint_path",
+        "producer_checkpoint_sha256",
+        "source_id",
+        "source_category",
+    }
+    if not isinstance(shards, list) or not shards:
+        raise SystemExit("flywheel component has no authenticated shards")
+    canonical_inventory: list[dict[str, object]] = []
+    seen_paths: set[str] = set()
+    rows = 0
+    for record in shards:
+        if not isinstance(record, dict) or set(record) != shard_fields:
+            raise SystemExit("flywheel shard provenance record is malformed")
+        try:
+            shard_path = Path(str(record["path"])).expanduser().resolve(strict=True)
+        except OSError as error:
+            raise SystemExit(f"flywheel replay shard is missing: {record.get('path')}") from error
+        version = record["checkpoint_version"]
+        if (
+            str(shard_path) != record["path"]
+            or str(shard_path) in seen_paths
+            or isinstance(record["rows"], bool)
+            or not isinstance(record["rows"], int)
+            or int(record["rows"]) <= 0
+            or isinstance(record["order"], bool)
+            or not isinstance(record["order"], int)
+            or isinstance(version, bool)
+            or not isinstance(version, int)
+            or version not in producer_by_version
+            or not isinstance(record["source_id"], str)
+            or not record["source_id"]
+            or record["source_category"] not in FRESH_SOURCE_GAME_RATIOS
+            or (
+                role == "fresh"
+                and record["source_category"] != source_category
+            )
+        ):
+            raise SystemExit("flywheel shard provenance record is invalid")
+        producer = producer_by_version[int(version)]
+        if (
+            record["producer_checkpoint_path"] != producer["path"]
+            or record["producer_checkpoint_sha256"] != producer["sha256"]
+            or record["size_bytes"] != shard_path.stat().st_size
+            or record["sha256"] != _sha256_existing_file(shard_path)
+        ):
+            raise SystemExit("flywheel shard/checkpoint provenance binding drift")
+        seen_paths.add(str(shard_path))
+        rows += int(record["rows"])
+        canonical_inventory.append(record)
+    if payload.get("shard_inventory_sha256") != _canonical_json_sha256(canonical_inventory):
+        raise SystemExit("flywheel shard inventory digest mismatch")
+    if (
+        payload.get("row_count") != rows
+        or int(corpus_meta.get("row_count", -1)) != rows
+    ):
+        raise SystemExit("flywheel component row count differs from authenticated shards")
+    try:
+        actual_mass = measure_memmap_component(corpus_dir, corpus_meta)
+    except ValueError as error:
+        raise SystemExit(f"cannot measure flywheel component sampler mass: {error}") from error
+    if payload.get("component_mass") != actual_mass:
+        raise SystemExit("flywheel component game/row/policy-active mass drift")
+    return payload
+
+
 def _preflight_memmap_composite_descriptor(path: str | Path) -> dict[str, object]:
     """Authenticate an ordered diagnostic-only no-copy descriptor.
 
@@ -2006,6 +2171,11 @@ def _preflight_memmap_composite_descriptor(path: str | Path) -> dict[str, object
         "schema_version", "diagnostic_only", "promotion_eligible", "components",
         "learner_recipe_overrides", "learner_recipe_overrides_sha256",
     }
+    is_flywheel_production = (
+        schema_version == "memmap_composite_v2"
+        and descriptor.get("diagnostic_only") is False
+        and descriptor.get("promotion_eligible") is True
+    )
     if schema_version == "memmap_composite_v1":
         fields_valid = set(descriptor) == common_fields
     else:
@@ -2015,6 +2185,7 @@ def _preflight_memmap_composite_descriptor(path: str | Path) -> dict[str, object
             "policy_aux_phase_sampling_weights",
             "stored_policy_component_temperatures",
             "value_training_component_ids",
+            "flywheel_replay_contract",
         }
         # Optional for backward compatibility: absence preserves the historical
         # all-components objective scopes. Presence is authenticated by the
@@ -2026,7 +2197,7 @@ def _preflight_memmap_composite_descriptor(path: str | Path) -> dict[str, object
         )
     if schema_version not in {"memmap_composite_v1", "memmap_composite_v2"} or not fields_valid:
         raise SystemExit("memmap composite descriptor fields differ from its schema")
-    if (
+    if schema_version == "memmap_composite_v1" and (
         descriptor.get("diagnostic_only") is not True
         or descriptor.get("promotion_eligible") is not False
     ):
@@ -2034,6 +2205,21 @@ def _preflight_memmap_composite_descriptor(path: str | Path) -> dict[str, object
             "memmap composite v1 is diagnostic-only and must declare "
             "diagnostic_only=true, promotion_eligible=false"
         )
+    if schema_version == "memmap_composite_v2" and not (
+        (
+            descriptor.get("diagnostic_only") is True
+            and descriptor.get("promotion_eligible") is False
+        )
+        or is_flywheel_production
+    ):
+        raise SystemExit(
+            "memmap composite v2 must be diagnostic-only or carry the exact "
+            "promotion-eligible flywheel replay contract"
+        )
+    if is_flywheel_production and "flywheel_replay_contract" not in descriptor:
+        raise SystemExit("promotion-eligible composite lacks flywheel replay contract")
+    if not is_flywheel_production and "flywheel_replay_contract" in descriptor:
+        raise SystemExit("diagnostic composite may not claim flywheel replay provenance")
     raw_components = descriptor.get("components")
     if not isinstance(raw_components, list) or (
         len(raw_components) != 2
@@ -2048,9 +2234,14 @@ def _preflight_memmap_composite_descriptor(path: str | Path) -> dict[str, object
     }
     allowed_override_fields = {
         *required_override_fields,
-        "forced_row_value_weight", "hlgauss_scalar_aux_loss_weight", "loser_sample_weight",
+        "forced_action_weight", "forced_row_value_weight",
+        "hlgauss_scalar_aux_loss_weight", "loser_sample_weight",
         "lr", "per_game_value_weight", "per_game_value_weight_mode",
+        "policy_loss_weight",
         "policy_kl_anchor_direction", "policy_kl_anchor_weight",
+        "q_loss_weight", "soft_target_source", "soft_target_temperature",
+        "soft_target_weight", "truncated_vp_margin_value_weight",
+        "value_target_lambda",
         "value_categorical_bins", "value_categorical_loss_weight",
         "value_head_type", "value_hlgauss_sigma_ratio", "value_loss_weight",
         "scalar_value_loss_transform",
@@ -2080,7 +2271,23 @@ def _preflight_memmap_composite_descriptor(path: str | Path) -> dict[str, object
     expected = (
         expected_v1
         if schema_version == "memmap_composite_v1"
-        else expected_v1 | {"component_id", "game_sampling_ratio"}
+        else {
+            "corpus_dir",
+            "corpus_meta_sha256",
+            "payload_inventory_sha256",
+            "component_id",
+            "game_sampling_ratio",
+            *(
+                {"provenance_manifest", "provenance_manifest_sha256"}
+                if is_flywheel_production
+                else {"validation_manifest", "validation_manifest_sha256"}
+            ),
+            *(
+                {"source_category", "component_mass"}
+                if is_flywheel_production
+                else set()
+            ),
+        }
     )
     component_ids: list[str] = []
     component_ratios: list[float] = []
@@ -2104,13 +2311,26 @@ def _preflight_memmap_composite_descriptor(path: str | Path) -> dict[str, object
             component_ratios.append(float(ratio))
         try:
             corpus_dir = Path(str(raw["corpus_dir"])).expanduser().resolve(strict=True)
-            validation_path = Path(str(raw["validation_manifest"])).expanduser().resolve(strict=True)
+            evidence_path = Path(
+                str(
+                    raw[
+                        "provenance_manifest"
+                        if is_flywheel_production
+                        else "validation_manifest"
+                    ]
+                )
+            ).expanduser().resolve(strict=True)
         except OSError as error:
             raise SystemExit(f"cannot resolve memmap composite component {index}: {error}") from error
         if not corpus_dir.is_dir() or str(corpus_dir) != str(raw["corpus_dir"]):
             raise SystemExit(f"memmap composite component {index} corpus_dir is not canonical")
-        if str(validation_path) != str(raw["validation_manifest"]):
-            raise SystemExit(f"memmap composite component {index} validation_manifest is not canonical")
+        evidence_field = (
+            "provenance_manifest" if is_flywheel_production else "validation_manifest"
+        )
+        if str(evidence_path) != str(raw[evidence_field]):
+            raise SystemExit(
+                f"memmap composite component {index} {evidence_field} is not canonical"
+            )
         if str(corpus_dir) in seen_dirs:
             raise SystemExit("memmap composite component corpus directories must be unique")
         seen_dirs.add(str(corpus_dir))
@@ -2124,23 +2344,66 @@ def _preflight_memmap_composite_descriptor(path: str | Path) -> dict[str, object
             raise SystemExit(f"cannot load component {index} corpus metadata {meta_path}: {error}") from error
         if not isinstance(corpus_meta, dict):
             raise SystemExit(f"memmap composite component {index} metadata is not an object")
-        if not isinstance(corpus_meta.get("selected_game_seed_manifest"), dict) or not isinstance(
-            corpus_meta.get("a1_post_wave_audit"), dict
-        ):
+        if is_flywheel_production:
+            if corpus_meta.get("game_seed_present") is not True:
+                raise SystemExit(
+                    f"flywheel composite component {index} lacks game_seed"
+                )
+            bound_provenance = corpus_meta.get("flywheel_component_provenance")
+            if not isinstance(bound_provenance, dict):
+                raise SystemExit(
+                    f"flywheel composite component {index} lacks bound provenance"
+                )
+        elif not isinstance(
+            corpus_meta.get("selected_game_seed_manifest"), dict
+        ) or not isinstance(corpus_meta.get("a1_post_wave_audit"), dict):
             raise SystemExit(f"memmap composite component {index} is not an authenticated A1 corpus")
         actual_inventory_sha = _validate_memmap_payload_inventory(corpus_dir, corpus_meta)
         if not _is_sha256(raw["payload_inventory_sha256"]) or raw[
             "payload_inventory_sha256"
         ] != actual_inventory_sha:
             raise SystemExit(f"memmap composite component {index} payload inventory hash mismatch")
-        actual_validation_sha = _sha256_existing_file(validation_path)
-        if not _is_sha256(raw["validation_manifest_sha256"]) or raw[
-            "validation_manifest_sha256"
-        ] != actual_validation_sha:
-            raise SystemExit(f"memmap composite component {index} validation manifest hash mismatch")
+        evidence_sha_field = (
+            "provenance_manifest_sha256"
+            if is_flywheel_production
+            else "validation_manifest_sha256"
+        )
+        actual_evidence_sha = _sha256_existing_file(evidence_path)
+        if not _is_sha256(raw[evidence_sha_field]) or raw[
+            evidence_sha_field
+        ] != actual_evidence_sha:
+            raise SystemExit(
+                f"memmap composite component {index} "
+                f"{evidence_field.replace('_', ' ')} hash mismatch"
+            )
+        if is_flywheel_production:
+            if bound_provenance != {
+                "path": str(evidence_path),
+                "file_sha256": actual_evidence_sha,
+            }:
+                raise SystemExit(
+                    f"flywheel composite component {index} corpus provenance binding drift"
+                )
+            provenance = _validate_flywheel_component_provenance(
+                evidence_path,
+                component_id=str(raw["component_id"]),
+                corpus_dir=corpus_dir,
+                corpus_meta=corpus_meta,
+            )
+            if (
+                raw["source_category"] != provenance["source_category"]
+                or raw["component_mass"] != provenance["component_mass"]
+            ):
+                raise SystemExit(
+                    f"flywheel composite component {index} sampler provenance drift"
+                )
+        else:
+            provenance = None
         components.append({
             **raw, "corpus_dir": str(corpus_dir),
-            "validation_manifest": str(validation_path), "corpus_meta": corpus_meta,
+            evidence_field: str(evidence_path),
+            "corpus_meta": corpus_meta,
+            "flywheel_provenance": provenance,
         })
         inventory_bindings.append({
             "corpus_meta_sha256": actual_meta_sha,
@@ -2281,9 +2544,191 @@ def _preflight_memmap_composite_descriptor(path: str | Path) -> dict[str, object
             )
         value_training_component_ids = list(raw_value_ids)
         value_training_scope_explicit = "value_training_component_ids" in descriptor
+    flywheel_replay_contract = None
+    if is_flywheel_production:
+        raw_contract = descriptor.get("flywheel_replay_contract")
+        expected_contract_fields = {
+            "schema_version",
+            "current_checkpoint_version",
+            "initializer_checkpoint_path",
+            "initializer_checkpoint_sha256",
+            "fresh_component_ids",
+            "replay_component_ids",
+            "fresh_source_game_ratios",
+            "effective_component_sampling_ratios",
+            "minimum_replay_ratio",
+            "realized_replay_ratio",
+            "checkpoint_versions",
+            "component_provenance_sha256",
+            "sampling_receipt",
+            "sampling_receipt_sha256",
+        }
+        if not isinstance(raw_contract, dict) or set(raw_contract) != expected_contract_fields:
+            raise SystemExit("flywheel replay contract fields differ from schema")
+        if raw_contract.get("schema_version") != "flywheel-replay-composite-v2":
+            raise SystemExit("flywheel replay contract schema is unsupported")
+        fresh_ids = raw_contract.get("fresh_component_ids")
+        replay_ids = raw_contract.get("replay_component_ids")
+        if (
+            not isinstance(fresh_ids, list)
+            or fresh_ids != list(FRESH_SOURCE_GAME_RATIOS)
+            or not isinstance(replay_ids, list)
+            or replay_ids != [HISTORICAL_REPLAY_CATEGORY]
+            or component_ids != fresh_ids + replay_ids
+        ):
+            raise SystemExit("flywheel fresh/replay component identity is invalid")
+        if raw_contract.get("fresh_source_game_ratios") != FRESH_SOURCE_GAME_RATIOS:
+            raise SystemExit("flywheel fresh source game ratios drifted from 80/15/5")
+        provenance_by_id = {
+            str(component["component_id"]): component["flywheel_provenance"]
+            for component in components
+        }
+        if any(
+            provenance_by_id[value].get("role") != "fresh"
+            or provenance_by_id[value].get("source_category") != value
+            for value in fresh_ids
+        ) or any(
+            provenance_by_id[value].get("role") != "replay" for value in replay_ids
+        ):
+            raise SystemExit("flywheel component roles differ from replay contract")
+        current_version = raw_contract.get("current_checkpoint_version")
+        if (
+            isinstance(current_version, bool)
+            or not isinstance(current_version, int)
+            or any(
+                provenance_by_id[value].get("current_checkpoint_version")
+                != current_version
+                for value in component_ids
+            )
+        ):
+            raise SystemExit("flywheel current checkpoint generation binding drift")
+        all_versions = sorted(
+            {
+                int(version)
+                for provenance in provenance_by_id.values()
+                for version in provenance["checkpoint_versions"]
+            }
+        )
+        if raw_contract.get("checkpoint_versions") != all_versions or not any(
+            version < int(current_version) for version in all_versions
+        ):
+            raise SystemExit("flywheel replay does not bind a distinct historical generation")
+        minimum_ratio = raw_contract.get("minimum_replay_ratio")
+        realized_ratio = sum(
+            component_ratios[component_ids.index(value)] for value in replay_ids
+        )
+        if (
+            isinstance(minimum_ratio, bool)
+            or not isinstance(minimum_ratio, (int, float))
+            or not 0.0 < float(minimum_ratio) < 1.0
+            or not math.isclose(
+                float(minimum_ratio), 0.20, rel_tol=0.0, abs_tol=1e-12
+            )
+            or not math.isclose(
+                float(realized_ratio), 0.20, rel_tol=0.0, abs_tol=1e-12
+            )
+            or float(realized_ratio) + 1e-12 < float(minimum_ratio)
+            or not math.isclose(
+                float(raw_contract.get("realized_replay_ratio", -1.0)),
+                float(realized_ratio),
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            )
+        ):
+            raise SystemExit("flywheel replay sampling ratio is below its bound minimum")
+        effective_ratios = {
+            component_id: component_ratios[index]
+            for index, component_id in enumerate(component_ids)
+        }
+        if raw_contract.get("effective_component_sampling_ratios") != effective_ratios:
+            raise SystemExit("flywheel effective source sampling ratios drifted")
+        fresh_mass = 1.0 - realized_ratio
+        for component_id, within_fresh_ratio in FRESH_SOURCE_GAME_RATIOS.items():
+            if not math.isclose(
+                effective_ratios[component_id],
+                fresh_mass * within_fresh_ratio,
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            ):
+                raise SystemExit(
+                    "flywheel fresh 80/15/5 mixture was flattened or reweighted"
+                )
+        initializer_path = Path(
+            str(raw_contract.get("initializer_checkpoint_path", ""))
+        ).expanduser()
+        initializer_sha = raw_contract.get("initializer_checkpoint_sha256")
+        if (
+            not _is_sha256(initializer_sha)
+            or (
+                initializer_path.exists()
+                and _sha256_existing_file(initializer_path) != initializer_sha
+            )
+        ):
+            raise SystemExit("flywheel initializer differs from current producer checkpoint")
+        for component_id in fresh_ids:
+            producers = provenance_by_id[component_id]["producer_checkpoints"]
+            if (
+                len(producers) != 1
+                or producers[0].get("path") != str(initializer_path)
+                or producers[0].get("sha256") != initializer_sha
+            ):
+                raise SystemExit(
+                    "flywheel initializer differs from a fresh producer checkpoint"
+                )
+        provenance_binding = [
+            {
+                "component_id": component_id,
+                "provenance_manifest_sha256": components[index][
+                    "provenance_manifest_sha256"
+                ],
+            }
+            for index, component_id in enumerate(component_ids)
+        ]
+        if raw_contract.get("component_provenance_sha256") != _canonical_json_sha256(
+            provenance_binding
+        ):
+            raise SystemExit("flywheel component provenance digest mismatch")
+        actual_sampling_receipt = build_sampling_receipt(
+            [
+                {
+                    "component_id": component_id,
+                    "source_category": components[index]["source_category"],
+                    "game_sampling_ratio": component_ratios[index],
+                    "component_mass": provenance_by_id[component_id]["component_mass"],
+                }
+                for index, component_id in enumerate(component_ids)
+            ]
+        )
+        if (
+            raw_contract.get("sampling_receipt") != actual_sampling_receipt
+            or raw_contract.get("sampling_receipt_sha256")
+            != _contract_sha256(actual_sampling_receipt)
+        ):
+            raise SystemExit("flywheel source/game/row/policy-active sampling receipt drift")
+        if not (
+            overrides.get("forced_action_weight") == 0.0
+            and overrides.get("forced_row_value_weight") == 1.0
+            and overrides.get("per_game_policy_weight") is True
+            and overrides.get("per_game_policy_weight_mode") == "equal"
+            and overrides.get("per_game_value_weight") is False
+            and overrides.get("loser_sample_weight") == 1.0
+            and overrides.get("soft_target_temperature") == 0.7
+            and overrides.get("soft_target_weight") == 0.9
+            and overrides.get("soft_target_source") == "policy"
+            and overrides.get("truncated_vp_margin_value_weight") == 0.25
+            and overrides.get("value_target_lambda") == 1.0
+            and overrides.get("q_loss_weight") == 0.0
+        ):
+            raise SystemExit(
+                "promotion-eligible flywheel composite requires sampler-aware "
+                "equal policy weighting and no duplicate value game weighting"
+            )
+        flywheel_replay_contract = dict(raw_contract)
     return {
-        "schema_version": schema_version, "diagnostic_only": True,
-        "promotion_eligible": False, "descriptor_path": str(descriptor_path),
+        "schema_version": schema_version,
+        "diagnostic_only": bool(descriptor["diagnostic_only"]),
+        "promotion_eligible": bool(descriptor["promotion_eligible"]),
+        "descriptor_path": str(descriptor_path),
         "descriptor_file_sha256": _sha256_existing_file(descriptor_path),
         "descriptor_fingerprint": _canonical_json_sha256(descriptor),
         "payload_inventory_sha256": _canonical_json_sha256(inventory_bindings),
@@ -2303,6 +2748,8 @@ def _preflight_memmap_composite_descriptor(path: str | Path) -> dict[str, object
         ),
         "value_training_component_ids": value_training_component_ids,
         "value_training_scope_explicit": value_training_scope_explicit,
+        "flywheel_replay_contract": flywheel_replay_contract,
+        "production_mix_contract": flywheel_replay_contract,
     }
 
 
@@ -2313,6 +2760,7 @@ def _validate_composite_learner_recipe_authorization(
     if not isinstance(expected, dict):
         raise SystemExit("memmap composite has no authenticated learner recipe override")
     converters = {
+        "forced_action_weight": float,
         "forced_row_value_weight": float,
         "hlgauss_scalar_aux_loss_weight": float,
         "loser_sample_weight": float,
@@ -2321,8 +2769,15 @@ def _validate_composite_learner_recipe_authorization(
         "per_game_policy_weight_mode": str,
         "per_game_value_weight": bool,
         "per_game_value_weight_mode": str,
+        "policy_loss_weight": float,
         "policy_kl_anchor_direction": str,
         "policy_kl_anchor_weight": float,
+        "q_loss_weight": float,
+        "soft_target_source": str,
+        "soft_target_temperature": float,
+        "soft_target_weight": float,
+        "truncated_vp_margin_value_weight": float,
+        "value_target_lambda": float,
         "value_categorical_bins": int,
         "value_categorical_loss_weight": float,
         "value_head_type": str,
@@ -4889,20 +5344,27 @@ def main(argv: Sequence[str] | None = None) -> None:
         if int(args.validation_max_samples) != 0:
             raise SystemExit(
                 "authenticated composite validation requires --validation-max-samples 0; "
-                "use a whole-game --validation-game-sentinel-manifest instead"
+                "production uses a complete component-aware game split; diagnostic "
+                "runs may use a whole-game --validation-game-sentinel-manifest"
             )
-        validation_seed_contract = _load_composite_validation_contract(
-            a1_preflight_meta,
-            validation_fraction=float(args.validation_fraction),
-            validation_seed=int(args.validation_seed),
-            validation_max_samples=0,
-            validation_game_seed_ranges=validation_game_seed_ranges,
-        )
-        if args.validation_game_sentinel_manifest:
-            validation_seed_contract = _load_composite_validation_sentinel_manifest(
-                args.validation_game_sentinel_manifest,
-                composite_meta=a1_preflight_meta,
-                full_contract=validation_seed_contract,
+        if a1_preflight_meta.get("diagnostic_only") is True:
+            validation_seed_contract = _load_composite_validation_contract(
+                a1_preflight_meta,
+                validation_fraction=float(args.validation_fraction),
+                validation_seed=int(args.validation_seed),
+                validation_max_samples=0,
+                validation_game_seed_ranges=validation_game_seed_ranges,
+            )
+            if args.validation_game_sentinel_manifest:
+                validation_seed_contract = _load_composite_validation_sentinel_manifest(
+                    args.validation_game_sentinel_manifest,
+                    composite_meta=a1_preflight_meta,
+                    full_contract=validation_seed_contract,
+                )
+        elif args.validation_game_sentinel_manifest:
+            raise SystemExit(
+                "promotion-eligible flywheel composites use their component-aware "
+                "whole-game validation split and may not import an A1 sentinel"
             )
     elif args.validation_game_seed_manifest:
         if args.validation_game_sentinel_manifest:
@@ -7697,13 +8159,22 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "value_training_scope_explicit": bool(
                     a1_preflight_meta.get("value_training_scope_explicit", False)
                 ),
-                "component_contract_sha256s": [
-                    contract["a1_contract_sha256"]
-                    for contract in validation_seed_contract["component_contracts"]
-                ],
+                "component_contract_sha256s": (
+                    [
+                        contract["a1_contract_sha256"]
+                        for contract in validation_seed_contract[
+                            "component_contracts"
+                        ]
+                    ]
+                    if validation_seed_contract is not None
+                    else []
+                ),
+                "flywheel_replay_contract": a1_preflight_meta.get(
+                    "flywheel_replay_contract"
+                ),
             },
-            "diagnostic_only": True,
-            "promotion_eligible": False,
+            "diagnostic_only": bool(a1_preflight_meta["diagnostic_only"]),
+            "promotion_eligible": bool(a1_preflight_meta["promotion_eligible"]),
         })
     learner_ablation = (
         None
@@ -11573,8 +12044,11 @@ def load_teacher_data_memmap(
             "descriptor_path": authenticated["descriptor_path"],
             "descriptor_fingerprint": authenticated["descriptor_fingerprint"],
             "payload_inventory_sha256": authenticated["payload_inventory_sha256"],
-            "diagnostic_only": True,
-            "promotion_eligible": False,
+            "diagnostic_only": bool(authenticated["diagnostic_only"]),
+            "promotion_eligible": bool(authenticated["promotion_eligible"]),
+            "flywheel_replay_contract": authenticated.get(
+                "flywheel_replay_contract"
+            ),
         })
     else:
         corpus = MemmapCorpus(path)
@@ -16248,17 +16722,16 @@ def _normalize_weights_per_game(data: dict, weights: np.ndarray, *, mode: str = 
     its square root. This preserves the named game-mass semantics instead of
     double-correcting a sampler that is already game-uniform.
 
-    Unlike ``split_train_validation_indices`` (which falls back to ``np.arange(n)`` -- one row
-    per "game" -- when ``game_seed`` is absent, which is safe there because it only affects
-    the train/validation split), a one-row-per-game fallback here would silently collapse
-    every row's weight to exactly 1.0 (a one-row group trivially holds 100% of its own mass),
-    erasing phase weights, --forced-row-value-weight, and the CAT-45 value_weight_multiplier
-    in the process. So a missing ``game_seed`` column is instead a hard no-op: this ticket's
-    step 1 requires spot-checking that the column is populated before enabling the flag.
+    A one-row-per-game fallback would silently collapse every row's weight to
+    exactly 1.0, erasing phase/forced/CAT-45 weights. A missing ``game_seed``
+    therefore fails closed whenever per-game weighting is explicitly enabled.
     """
 
     if "game_seed" not in data:
-        return weights
+        raise SystemExit(
+            "per-game weighting requires a populated game_seed column; refusing "
+            "the historical silent no-op"
+        )
     seeds = np.asarray(data["game_seed"], dtype=np.int64)
     weights64 = weights.astype(np.float64, copy=False)
     if mode not in {"equal", "sqrt"}:
@@ -16427,6 +16900,54 @@ def split_train_validation_indices(
             "validation": np.asarray([], dtype=np.int64),
         }
     seeds = np.asarray(data.get("game_seed", np.arange(n, dtype=np.int64)), dtype=np.int64)
+    component_offsets = _validated_component_offsets(data, n)
+    component_ratios = tuple(
+        getattr(data, "component_game_sampling_ratios", tuple())
+    )
+    if component_offsets is not None and component_ratios:
+        if len(component_ratios) != len(component_offsets) - 1:
+            raise SystemExit("composite validation component ratio count drift")
+        train_parts: list[np.ndarray] = []
+        validation_parts: list[np.ndarray] = []
+        for component_index, (start, stop) in enumerate(
+            _component_row_ranges(component_offsets, n)
+        ):
+            local_indices = np.arange(start, stop, dtype=np.int64)
+            local_seeds = seeds[start:stop]
+            unique_local = np.unique(local_seeds)
+            if unique_local.size <= 1:
+                raise SystemExit(
+                    "promotion-eligible composite validation requires at least two "
+                    f"games per component; component={component_index}"
+                )
+            rng = np.random.default_rng(validation_seed + component_index)
+            shuffled = rng.permutation(unique_local)
+            target_rows = max(1, int(round(len(local_indices) * fraction)))
+            selected: list[int] = []
+            selected_rows = 0
+            counts = {
+                int(seed): int(np.sum(local_seeds == seed)) for seed in shuffled
+            }
+            for seed in shuffled:
+                selected.append(int(seed))
+                selected_rows += counts[int(seed)]
+                if selected_rows >= target_rows:
+                    break
+            validation_mask = np.isin(
+                local_seeds, np.asarray(selected, dtype=np.int64)
+            )
+            validation_parts.append(local_indices[validation_mask])
+            train_parts.append(local_indices[~validation_mask])
+        train = np.concatenate(train_parts).astype(np.int64, copy=False)
+        validation = np.concatenate(validation_parts).astype(np.int64, copy=False)
+        # Composite training explicitly requires validation_max_samples=0;
+        # retaining this assertion here prevents a future direct caller from
+        # silently row-capping a whole-game split.
+        if validation_max_samples != 0:
+            raise SystemExit(
+                "composite component-aware validation forbids row-level caps"
+            )
+        return {"train": train, "validation": validation}
     unique_seeds = np.unique(seeds)
     if unique_seeds.size <= 1:
         if n >= 1000:

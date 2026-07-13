@@ -34,7 +34,7 @@ from __future__ import annotations
 import json
 import os
 import time
-from dataclasses import dataclass, asdict, field
+from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Iterable
 
@@ -77,6 +77,18 @@ class ShardMeta:
     order: int
     ckpt_version: int = 0
     created_at: float = 0.0
+    # Durable producer identity. A checkpoint version is only a mutable registry
+    # label; the path+digest prove which weights actually generated this shard.
+    # ``source_id`` identifies the generation round/feed attestation that
+    # registered it. Production replay refuses blank legacy values.
+    producer_checkpoint_path: str = ""
+    producer_checkpoint_sha256: str = ""
+    source_id: str = ""
+    # The game-level source stratum. Production learner inputs use the exact
+    # A1 categories (current_producer/recent_history/hard_negative); keeping it
+    # separate from source_id prevents an attestation label from being mistaken
+    # for a sampling stratum after restart.
+    source_category: str = ""
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -89,6 +101,10 @@ class ShardMeta:
             order=int(d["order"]),
             ckpt_version=int(d.get("ckpt_version", 0)),
             created_at=float(d.get("created_at", 0.0)),
+            producer_checkpoint_path=str(d.get("producer_checkpoint_path", "")),
+            producer_checkpoint_sha256=str(d.get("producer_checkpoint_sha256", "")),
+            source_id=str(d.get("source_id", "")),
+            source_category=str(d.get("source_category", "")),
         )
 
 
@@ -167,29 +183,84 @@ class WindowedReplay:
 
     # ------------------------------------------------------------------ mutation
     def register(self, path: str | os.PathLike, rows: int, *, ckpt_version: int = 0,
-                 created_at: float | None = None) -> ShardMeta:
+                 created_at: float | None = None,
+                 producer_checkpoint_path: str = "",
+                 producer_checkpoint_sha256: str = "",
+                 source_id: str = "",
+                 source_category: str = "") -> ShardMeta:
         """Register (or update) one shard. Idempotent on ``path``: a repeat keeps the original
         ``order`` (so a shard never jumps to "newest" on a resume) but refreshes ``rows``."""
         key = str(path)
         if rows < 0:
             raise ValueError(f"rows must be >= 0, got {rows} for {key}")
         existing = self._by_path.get(key)
+        if existing is not None:
+            if int(ckpt_version) != existing.ckpt_version:
+                raise ValueError(
+                    f"refusing to reattribute {key} from checkpoint version "
+                    f"{existing.ckpt_version} to {ckpt_version}"
+                )
+            immutable_bindings = (
+                (
+                    "producer checkpoint path",
+                    str(producer_checkpoint_path),
+                    existing.producer_checkpoint_path,
+                ),
+                (
+                    "producer checkpoint digest",
+                    str(producer_checkpoint_sha256),
+                    existing.producer_checkpoint_sha256,
+                ),
+                ("source id", str(source_id), existing.source_id),
+                ("source category", str(source_category), existing.source_category),
+            )
+            for label, proposed, recorded in immutable_bindings:
+                if proposed and recorded and proposed != recorded:
+                    raise ValueError(
+                        f"refusing to change {label} for registered shard {key}"
+                    )
         order = existing.order if existing else self._next_order
         if existing is None:
             self._next_order += 1
         # Cumulative counter tracks the DELTA so a resume that re-registers the same path (with a
         # possibly-updated row count) adjusts N_total correctly instead of double-counting.
         self._total_rows_ever += int(rows) - (existing.rows if existing else 0)
+        producer_path = (
+            str(producer_checkpoint_path)
+            or (existing.producer_checkpoint_path if existing else "")
+        )
+        producer_sha = (
+            str(producer_checkpoint_sha256)
+            or (existing.producer_checkpoint_sha256 if existing else "")
+        )
+        provenance_source = str(source_id) or (existing.source_id if existing else "")
+        category = str(source_category) or (existing.source_category if existing else "")
         sm = ShardMeta(path=key, rows=int(rows), order=order,
                        ckpt_version=int(ckpt_version),
-                       created_at=float(created_at if created_at is not None else _now()))
+                       created_at=float(created_at if created_at is not None else _now()),
+                       producer_checkpoint_path=producer_path,
+                       producer_checkpoint_sha256=producer_sha,
+                       source_id=provenance_source,
+                       source_category=category)
         self._by_path[key] = sm
         return sm
 
-    def register_many(self, shards: Iterable[tuple[str, int]], *, ckpt_version: int = 0) -> int:
+    def register_many(self, shards: Iterable[tuple[str, int]], *, ckpt_version: int = 0,
+                      producer_checkpoint_path: str = "",
+                      producer_checkpoint_sha256: str = "",
+                      source_id: str = "",
+                      source_category: str = "") -> int:
         n = 0
         for path, rows in shards:
-            self.register(path, rows, ckpt_version=ckpt_version)
+            self.register(
+                path,
+                rows,
+                ckpt_version=ckpt_version,
+                producer_checkpoint_path=producer_checkpoint_path,
+                producer_checkpoint_sha256=producer_checkpoint_sha256,
+                source_id=source_id,
+                source_category=source_category,
+            )
             n += 1
         return n
 

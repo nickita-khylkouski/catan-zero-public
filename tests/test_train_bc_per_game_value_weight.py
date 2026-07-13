@@ -143,21 +143,16 @@ def test_per_game_value_weight_composes_with_forced_row_and_multiplier() -> None
     assert weights[0] < weights[2]
 
 
-def test_per_game_value_weight_missing_game_seed_is_noop() -> None:
-    """No game_seed column is a hard no-op (skips normalization entirely), NOT a fallback to
-    one-row-per-game -- the latter would silently collapse every weight to 1.0 and erase
-    phase weights / forced-row weighting / the CAT-45 multiplier in the process."""
+def test_per_game_value_weight_missing_game_seed_fails_closed() -> None:
     data = {
         "action_taken": np.asarray([1, 2, 3], dtype=np.int16),
         "phase": np.asarray(["robber", "initial_build", "robber"]),
     }
 
-    with_flag = build_value_sample_weights(
-        data, phase_weights={"robber": 4.0}, per_game_value_weight=True
-    )
-    without_flag = build_value_sample_weights(data, phase_weights={"robber": 4.0})
-
-    assert with_flag.tolist() == pytest.approx(without_flag.tolist())
+    with pytest.raises(SystemExit, match="requires a populated game_seed"):
+        build_value_sample_weights(
+            data, phase_weights={"robber": 4.0}, per_game_value_weight=True
+        )
 
 
 def test_per_game_weight_quality_reports_equalization() -> None:

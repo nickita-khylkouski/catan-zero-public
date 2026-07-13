@@ -26,7 +26,8 @@ The authenticated composite-v2 sampler already draws component → game → row,
 so every game has equal expected value-target sampling mass before loss
 weights. A second per-game value normalization would double-correct and favor
 short games, so that transform stays off. Policy targets occur only on a sparse
-subset of rows; their separate sqrt per-game mass correction remains enabled.
+subset of rows; sampler-aware equal policy weighting divides by each game's
+mean active policy mass and preserves the descriptor's exact game mixture.
 
 ## Extracting search information without self-distillation
 
@@ -54,16 +55,21 @@ as an authenticated, matched refreshed-target arm.
 
 ## Default iteration recipe
 
-- authenticated game-uniform current + replay composite; refuse current-only training;
+- authenticated source → game → row composite; refuse current-only training;
+- preserve the fresh wave as separate current/recent/hard components at
+  `0.64/0.12/0.04` effective learner mass, plus `0.20` strictly historical
+  replay; never concatenate the fresh `80/15/5` sources into one row-uniform
+  memmap;
 - forced policy weight `0`;
-- sqrt per-game policy weighting for sparse active rows; no additional per-game
+- sampler-aware equal per-game policy weighting for sparse active rows; no additional per-game
   value loss weighting (the sampler is already game-uniform);
 - loser rows retained at weight `1`;
 - forced value weight `1` pending the `{1,.25}` result;
 - outcome-only scalar value target (`lambda=1`);
 - Q loss off;
-- replay required by default; a positive policy-KL anchor is an explicit
-  alternative rather than an unmeasured constant.
+- replay required by default at an authenticated minimum `0.20` sampling mass,
+  from at least one strictly older checkpoint generation; a positive policy-KL
+  anchor is an explicit alternative rather than an unmeasured constant.
 
 This addresses the proximal failure—large fresh-Adam drift on one correlated
 distribution—without claiming that stale search values are ground truth.

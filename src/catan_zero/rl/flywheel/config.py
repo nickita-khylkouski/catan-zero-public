@@ -44,16 +44,17 @@ class FlywheelConfig:
     # probability is identically one, so including them can only dilute policy
     # accounting. Authenticated memmap_composite_v2 sampling already selects a
     # component, then a game uniformly, then a row uniformly inside that game.
-    # Applying another per-game loss normalization would double-correct that
+    # Applying another per-game VALUE normalization would double-correct that
     # measure and bias optimization toward short games, so production leaves
-    # value-loss transform off. Policy-active rows are sparse within games, so
-    # the separate sqrt policy-mass correction remains enabled.
+    # value-loss transform off. Policy-active density still differs by game;
+    # sampler-aware ``equal`` divides by each game's mean active policy mass and
+    # preserves the descriptor's exact game mixture.
     learner_forced_action_weight: float = 0.0
     # Keep forced-state value mass unchanged until the matched {1.0, 0.25}
     # experiment adjudicates it.
     learner_forced_row_value_weight: float = 1.0
     learner_per_game_policy_weight: bool = True
-    learner_per_game_policy_weight_mode: str = "sqrt"
+    learner_per_game_policy_weight_mode: str = "equal"
     learner_per_game_value_weight: bool = False
     learner_per_game_value_weight_mode: str = "equal"
     learner_loser_sample_weight: float = 1.0
@@ -62,6 +63,21 @@ class FlywheelConfig:
     # a positive KL anchor remains an explicit alternative/ablation rather than
     # an unmeasured global constant.
     learner_replay_required: bool = True
+    # The composite sampler binds this fraction to authenticated shards from at
+    # least one strictly older checkpoint generation. It is the exact canonical
+    # source mass, not an advisory target: descriptor construction and trainer
+    # preflight both fail if realized historical mass differs.
+    learner_min_replay_ratio: float = 0.20
+    # Within the fresh (non-replay) 80%, preserve the generation campaign's
+    # exact source->game->row measure. The effective top-level component masses
+    # are therefore .64/.12/.04 plus .20 authenticated historical replay.
+    learner_fresh_source_game_ratios: dict[str, float] = field(
+        default_factory=lambda: {
+            "current_producer": 0.80,
+            "recent_history": 0.15,
+            "hard_negative": 0.05,
+        }
+    )
     learner_policy_kl_anchor_weight: float = 0.0
     learner_policy_kl_anchor_direction: str = "forward"
     # Do not silently consume stale/bootstrap targets.  Refreshed-root lambda
@@ -206,6 +222,8 @@ class FlywheelConfig:
         "learner_loser_sample_weight",
         "learner_global_shuffle",
         "learner_replay_required",
+        "learner_min_replay_ratio",
+        "learner_fresh_source_game_ratios",
         "learner_policy_kl_anchor_weight",
         "learner_policy_kl_anchor_direction",
         "learner_value_target_lambda",
@@ -344,8 +362,11 @@ class FlywheelConfig:
             raise ValueError(
                 "production composite-v2 learner forbids duplicate per-game value weighting"
             )
-        if self.learner_per_game_policy_weight_mode != "sqrt":
-            raise ValueError("production learner requires sqrt per-game policy weighting")
+        if self.learner_per_game_policy_weight_mode != "equal":
+            raise ValueError(
+                "production composite learner requires sampler-aware equal "
+                "per-game policy weighting"
+            )
         if self.learner_per_game_value_weight_mode != "equal":
             raise ValueError("disabled per-game value weighting must retain equal mode")
         if self.learner_loser_sample_weight != 1.0:
@@ -354,6 +375,23 @@ class FlywheelConfig:
             raise ValueError("production learner requires a global mixed-corpus shuffle")
         if not self.learner_replay_required and self.learner_policy_kl_anchor_weight <= 0.0:
             raise ValueError("production learner requires replay or a positive anti-forgetting KL anchor")
+        if not 0.0 < self.learner_min_replay_ratio < 1.0:
+            raise ValueError("learner_min_replay_ratio must be strictly between 0 and 1")
+        if abs(self.learner_min_replay_ratio - 0.20) > 1e-12:
+            raise ValueError("production learner requires exact historical replay ratio 0.20")
+        expected_fresh_ratios = {
+            "current_producer": 0.80,
+            "recent_history": 0.15,
+            "hard_negative": 0.05,
+        }
+        if set(self.learner_fresh_source_game_ratios) != set(expected_fresh_ratios) or any(
+            abs(float(self.learner_fresh_source_game_ratios[name]) - ratio) > 1e-12
+            for name, ratio in expected_fresh_ratios.items()
+        ):
+            raise ValueError(
+                "production learner requires exact fresh source game ratios "
+                "current/recent/hard=0.80/0.15/0.05"
+            )
         if self.learner_policy_kl_anchor_direction != "forward":
             raise ValueError("production learner requires forward policy-KL distillation")
         if self.learner_value_target_lambda != 1.0:
