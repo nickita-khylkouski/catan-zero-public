@@ -217,6 +217,19 @@ def test_mps_handoff_restores_service_after_failure() -> None:
     assert ("sudo", "-n", "systemctl", "start", "nvidia-mps.service") in calls
 
 
+def test_mps_handoff_is_noop_on_dedicated_host_without_unit() -> None:
+    calls: list[tuple[str, ...]] = []
+
+    def runner(command: list[str], **_kwargs: object):
+        calls.append(tuple(command))
+        return probe.subprocess.CompletedProcess(command, 4, "unknown\n", "")
+
+    with probe._without_mps(runner=runner):  # noqa: SLF001
+        pass
+
+    assert calls == [("systemctl", "is-active", "nvidia-mps.service")]
+
+
 def test_train_bc_sibling_contract_import_works_without_repo_on_pythonpath() -> None:
     repo = Path(probe.__file__).resolve().parents[1]
     tools_dir = repo / "tools"
@@ -458,3 +471,73 @@ def test_summary_reports_efficiency_and_never_ranks_hbm(tmp_path: Path) -> None:
     assert result["optimizer_observability"]["module_parameter_update_norm_mean"][
         "trunk"
     ] == pytest.approx(0.015)
+
+
+def test_summary_uses_cheap_report_telemetry_when_timed_diagnostics_are_off(
+    tmp_path: Path,
+) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "runtime.json").write_text(
+        json.dumps({"started_unix_ns": 0, "finished_unix_ns": 2_000_000_000}),
+        encoding="utf-8",
+    )
+    (run_dir / "train.report.json").write_text(
+        json.dumps(
+            {
+                "steps_completed": 2,
+                "metrics": [
+                    {
+                        "optimizer_observability": {
+                            "observed_steps": 2,
+                            "clipped_fraction": 0.5,
+                            "mean_pre_clip_total_grad_norm": 1.25,
+                            "max_pre_clip_total_grad_norm": 2.0,
+                            "zero_objective_steps_skipped": 0,
+                        },
+                        "validation_objective_matched": {
+                            "objective_matched": True,
+                            "metrics": {
+                                "active_policy_teacher_gap_closure": 0.4
+                            },
+                            "components": {
+                                "replay": {
+                                    "metrics": {
+                                        "active_policy_teacher_gap_closure": 0.4
+                                    }
+                                }
+                            },
+                        },
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (run_dir / "gpu.csv").write_text(
+        "timestamp,index,utilization.gpu [%],power.draw [W],memory.used [MiB]\n"
+        "t,0,90,500,10000\n",
+        encoding="utf-8",
+    )
+    (run_dir / "train.log").write_text("", encoding="utf-8")
+    run = {
+        "run_id": "clean",
+        "run_dir": str(run_dir),
+        "local_batch_size": 1,
+        "global_batch_size": 2,
+        "lr": 3e-5,
+    }
+
+    summary = probe.summarize(run)
+
+    assert summary["optimizer_observability"] == {
+        "observed_steps": 2,
+        "preclip_grad_norm_mean": 1.25,
+        "preclip_grad_norm_max": 2.0,
+        "clipped_fraction": 0.5,
+        "zero_objective_steps_skipped": 0,
+        "module_preclip_grad_norm_mean": {},
+        "module_parameter_update_norm_mean": {},
+        "module_norm_scope": [],
+        "source": "cheap_epoch_aggregate",
+    }

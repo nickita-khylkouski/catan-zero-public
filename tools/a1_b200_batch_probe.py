@@ -386,8 +386,13 @@ def _without_mps(*, runner=subprocess.run):
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
+    # Dedicated research hosts may never install an MPS unit. Occupancy is
+    # checked independently before and inside this context, so an inactive or
+    # absent unit already represents exclusive DDP ownership and needs no
+    # service mutation. Fleet hosts that run MPS retain the stop/restore handoff.
     if status.returncode != 0 or status.stdout.strip() != "active":
-        raise ProbeError("MPS must be active at the DDP ownership handoff")
+        yield
+        return
     runner(["sudo", "-n", "true"], check=True)
     runner(["sudo", "-n", "systemctl", "stop", "nvidia-mps.service"], check=True)
     stopped = runner(
@@ -476,6 +481,32 @@ def _optimizer_log_summary(path: Path) -> dict[str, Any]:
     }
 
 
+def _optimizer_report_summary(report: dict[str, Any]) -> dict[str, Any]:
+    """Use cheap aggregate telemetry when timed runs disable snapshots."""
+    metrics = report.get("metrics")
+    latest = metrics[-1] if isinstance(metrics, list) and metrics else {}
+    aggregate = latest.get("optimizer_observability")
+    if not isinstance(aggregate, dict) or not aggregate:
+        raise ProbeError("training report has no aggregate optimizer observability")
+    return {
+        "observed_steps": int(aggregate.get("observed_steps", 0)),
+        "preclip_grad_norm_mean": float(
+            aggregate.get("mean_pre_clip_total_grad_norm", 0.0)
+        ),
+        "preclip_grad_norm_max": float(
+            aggregate.get("max_pre_clip_total_grad_norm", 0.0)
+        ),
+        "clipped_fraction": float(aggregate.get("clipped_fraction", 0.0)),
+        "zero_objective_steps_skipped": int(
+            aggregate.get("zero_objective_steps_skipped", 0)
+        ),
+        "module_preclip_grad_norm_mean": {},
+        "module_parameter_update_norm_mean": {},
+        "module_norm_scope": [],
+        "source": "cheap_epoch_aggregate",
+    }
+
+
 def summarize(run: dict[str, Any]) -> dict[str, Any]:
     run_dir = Path(run["run_dir"])
     report = json.loads((run_dir / "train.report.json").read_text(encoding="utf-8"))
@@ -494,7 +525,13 @@ def summarize(run: dict[str, Any]) -> dict[str, Any]:
         for component_id, metrics in component_validation.items()
     }
     closure = float(validation["active_policy_teacher_gap_closure"])
-    optimizer = _optimizer_log_summary(run_dir / "train.log")
+    try:
+        optimizer = _optimizer_log_summary(run_dir / "train.log")
+        optimizer["source"] = "heavy_per_step_diagnostics"
+    except ProbeError as error:
+        if "no per-step optimizer observability" not in str(error):
+            raise
+        optimizer = _optimizer_report_summary(report)
     return {
         "run_id": run["run_id"],
         "local_batch_size": run["local_batch_size"],
