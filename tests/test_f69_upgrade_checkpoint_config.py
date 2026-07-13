@@ -165,6 +165,7 @@ def test_upgrade_seed_is_deterministic_and_durably_attested(
     source = tmp_path / "source.pt"
     out_a = tmp_path / "a.pt"
     out_b = tmp_path / "b.pt"
+    out_c = tmp_path / "c.pt"
     policy = EntityGraphPolicy.create(
         env_config=make_env_config(vps_to_win=3),
         hidden_size=16,
@@ -207,6 +208,31 @@ def test_upgrade_seed_is_deterministic_and_durably_attested(
     assert raw_a["upgrade_provenance"]["source_checkpoint_sha256"] == raw_b[
         "upgrade_provenance"
     ]["source_checkpoint_sha256"]
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "f69_upgrade_checkpoint_config.py",
+            "--in-checkpoint",
+            str(source),
+            "--out-checkpoint",
+            str(out_c),
+            "--flags",
+            "catbins:9",
+            "--seed",
+            "74",
+            "--device",
+            "cpu",
+            "--no-verify",
+        ],
+    )
+    upgrade_tool.main()
+    raw_c = torch.load(out_c, map_location="cpu", weights_only=False)
+    assert any(
+        not torch.equal(raw_a["model"][key], raw_c["model"][key])
+        for key in cat_keys
+    )
 
 
 def test_combined_topology_gather_upgrade_verifies_exact_real_root(

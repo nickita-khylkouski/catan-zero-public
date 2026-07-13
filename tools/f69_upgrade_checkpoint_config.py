@@ -247,7 +247,15 @@ def main() -> None:
 
     upgraded_config = _build_upgraded_config(base.config, overrides)
     static = base.static_action_features.detach().cpu().numpy()
-    upgraded = EntityGraphPolicy(upgraded_config, static, device=args.device)
+    # EntityGraphPolicy owns model initialization and resets Torch's RNG from
+    # its ``seed`` argument.  Passing no seed here silently reset every upgrade
+    # to seed 0 even though the CLI/provenance recorded ``--seed``.
+    upgraded = EntityGraphPolicy(
+        upgraded_config,
+        static,
+        seed=int(args.seed),
+        device=args.device,
+    )
     missing, unexpected = upgraded.model.load_state_dict(base.model.state_dict(), strict=False)
     disallowed = [k for k in missing if not k.startswith(NEW_PARAM_PREFIXES + ("q_head.",))]
     if disallowed or unexpected:

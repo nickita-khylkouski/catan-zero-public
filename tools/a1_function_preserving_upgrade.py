@@ -36,6 +36,7 @@ MODULE_TARGET_GATHER = "entity_graph.action_target_gather.v1"
 MODULE_TOPOLOGY_TARGET_GATHER = (
     "entity_graph.topology_residual_adapter+action_target_gather.v1"
 )
+MODULE_BELIEF_RESOURCE_HEAD = "entity_graph.belief_resource_head.v1"
 
 # This is intentionally code, not caller-controlled configuration.  A new
 # architecture exception must be reviewed and tested before it can initialize
@@ -74,6 +75,18 @@ ALLOWLIST: dict[str, dict[str, Any]] = {
             "action_target_gather": True,
             "topology_residual_adapter": True,
         },
+    },
+    MODULE_BELIEF_RESOURCE_HEAD: {
+        "flags": {"belief_resource_head": True},
+        "new_parameter_initialization": {
+            "belief_resource_head.0.bias": "zeros",
+            "belief_resource_head.0.weight": "ones",
+            "belief_resource_head.1.bias": "seeded_torch_default",
+            "belief_resource_head.1.weight": "seeded_torch_default",
+            "belief_resource_head.3.bias": "seeded_torch_default",
+            "belief_resource_head.3.weight": "seeded_torch_default",
+        },
+        "config_delta": {"belief_resource_head": True},
     },
 }
 
@@ -174,6 +187,78 @@ def _equal(left: Any, right: Any) -> bool:
     return bool(left == right)
 
 
+def _reconstruct_seeded_parameters(
+    source: Path,
+    *,
+    seed: int,
+    config_delta: Mapping[str, Any],
+    expected_names: set[str],
+) -> dict[str, Any]:
+    """Rebuild deterministic PyTorch-default additions from the source bytes.
+
+    Merely recording an initialization seed in checkpoint provenance is not
+    evidence: that field could be forged around arbitrary tensors.  Replay the
+    exact warm-start construction used by ``f69_upgrade_checkpoint_config`` and
+    compare the newly initialized tensors byte-for-byte instead.
+    """
+
+    from catan_zero.rl.entity_token_policy import EntityGraphConfig, EntityGraphPolicy
+
+    base = EntityGraphPolicy.load(str(source), device="cpu")
+    values = {
+        field.name: getattr(base.config, field.name)
+        for field in dataclasses.fields(EntityGraphConfig)
+        if hasattr(base.config, field.name)
+    }
+    values.update(config_delta)
+    upgraded = EntityGraphPolicy(
+        EntityGraphConfig(**values),
+        base.static_action_features.detach().cpu().numpy(),
+        seed=seed,
+        device="cpu",
+    )
+    missing, unexpected = upgraded.model.load_state_dict(
+        base.model.state_dict(), strict=False
+    )
+    if unexpected or set(missing) != expected_names:
+        raise UpgradeError(
+            "deterministic upgrade replay parameter delta drift: "
+            f"missing={sorted(missing)} unexpected={sorted(unexpected)}"
+        )
+    state = upgraded.model.state_dict()
+    return {name: state[name].detach().cpu() for name in sorted(expected_names)}
+
+
+def _tensor_sha256(tensor: Any) -> str:
+    value = tensor.detach().cpu().contiguous()
+    metadata = json.dumps(
+        {"dtype": str(value.dtype), "shape": list(value.shape)},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(metadata + b"\0" + value.numpy().tobytes()).hexdigest()
+
+
+def _tensor_equal_exact(left: Any, right: Any) -> bool:
+    """Require identical tensor type metadata as well as numeric values.
+
+    ``torch.equal`` intentionally considers equal-valued tensors with different
+    dtypes equal.  That is insufficient for a receipt which attests that shared
+    checkpoint tensors are bit-identical.
+    """
+
+    import torch
+
+    return bool(
+        torch.is_tensor(left)
+        and torch.is_tensor(right)
+        and left.dtype == right.dtype
+        and left.layout == right.layout
+        and tuple(left.shape) == tuple(right.shape)
+        and torch.equal(left, right)
+    )
+
+
 def inspect_upgrade(
     source: Path, upgraded: Path, *, module: str = MODULE_TARGET_GATHER
 ) -> dict[str, Any]:
@@ -212,9 +297,28 @@ def inspect_upgrade(
     expected_added = sorted(spec["new_parameter_initialization"])
     if removed or added != expected_added:
         raise UpgradeError(f"parameter key delta is not allowlisted: added={added} removed={removed}")
-    changed = [name for name in before_model if not torch.equal(before_model[name], after_model[name])]
+    changed = [
+        name
+        for name in before_model
+        if not _tensor_equal_exact(before_model[name], after_model[name])
+    ]
     if changed:
         raise UpgradeError(f"shared checkpoint parameters changed: {changed[:8]}")
+    seeded_names = {
+        name
+        for name, kind in spec["new_parameter_initialization"].items()
+        if kind == "seeded_torch_default"
+    }
+    seeded_reference = (
+        _reconstruct_seeded_parameters(
+            Path(source_ref["path"]),
+            seed=seed,
+            config_delta=spec["config_delta"],
+            expected_names=set(expected_added),
+        )
+        if seeded_names
+        else {}
+    )
     for name, kind in spec["new_parameter_initialization"].items():
         tensor = after_model[name]
         if kind == "ones":
@@ -227,9 +331,11 @@ def inspect_upgrade(
             expected = torch.eye(
                 tensor.shape[0], dtype=tensor.dtype, device=tensor.device
             )
+        elif kind == "seeded_torch_default":
+            expected = seeded_reference[name]
         else:
             raise UpgradeError(f"unknown allowlisted initialization {kind!r}: {name}")
-        if not torch.equal(tensor, expected):
+        if not _tensor_equal_exact(tensor, expected):
             raise UpgradeError(f"new parameter is not deterministic {kind}: {name}")
 
     before_config, after_config = _config(before.get("config")), _config(after.get("config"))
@@ -253,14 +359,18 @@ def inspect_upgrade(
         raise UpgradeError("effective checkpoint config delta is not allowlisted")
 
     ignored = {"model", "config", "upgrade_provenance"}
+    unexpected_metadata = sorted(set(after) - set(before) - {"upgrade_provenance"})
     drift = [
         key
         for key in before
         if key not in ignored and (key not in after or not _equal(before[key], after[key]))
     ]
-    if drift:
-        raise UpgradeError(f"checkpoint metadata/provenance changed: {drift}")
-    return {
+    if unexpected_metadata or drift:
+        raise UpgradeError(
+            "checkpoint metadata/provenance changed: "
+            f"unexpected={unexpected_metadata} drift={drift}"
+        )
+    evidence = {
         "module": module,
         "source": source_ref,
         "upgraded_initializer": upgraded_ref,
@@ -275,6 +385,11 @@ def inspect_upgrade(
         "effective_source_config_sha256": _digest(effective_before),
         "effective_upgraded_config_sha256": _digest(effective_after),
     }
+    if seeded_names:
+        evidence["seeded_parameter_sha256"] = {
+            name: _tensor_sha256(after_model[name]) for name in sorted(seeded_names)
+        }
+    return evidence
 
 
 def issue_receipt(

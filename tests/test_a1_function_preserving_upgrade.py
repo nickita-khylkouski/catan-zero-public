@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import dataclasses
 import json
 from pathlib import Path
+import sys
 
 import numpy as np
 import pytest
 import torch
 
 from tools import a1_function_preserving_upgrade as upgrade
+from tools import f69_upgrade_checkpoint_config as upgrade_tool
 from tools import a1_lineage_dose as lineage
 from tools import a1_one_dose_train as one_dose
 from tools import a1_promotion_transaction as promotion
@@ -109,6 +112,58 @@ def _topology_checkpoints(tmp_path: Path) -> tuple[Path, Path]:
     return source, upgraded
 
 
+def _belief_checkpoints(tmp_path: Path, *, seed: int = 73) -> tuple[Path, Path]:
+    """Build the real additive belief-head upgrade used by the learner."""
+    from catan_zero.rl.entity_token_policy import EntityGraphConfig, EntityGraphPolicy
+    from catan_zero.rl.self_play import make_env_config
+
+    source = tmp_path / "champion-real.pt"
+    output = tmp_path / "champion-belief.pt"
+    base = EntityGraphPolicy.create(
+        env_config=make_env_config(vps_to_win=3),
+        hidden_size=16,
+        state_layers=1,
+        attention_heads=2,
+        seed=11,
+        device="cpu",
+    )
+    base.save(source, mask_hidden_info=True)
+    values = {
+        field.name: getattr(base.config, field.name)
+        for field in dataclasses.fields(EntityGraphConfig)
+        if hasattr(base.config, field.name)
+    }
+    values["belief_resource_head"] = True
+    belief = EntityGraphPolicy(
+        EntityGraphConfig(**values),
+        base.static_action_features.detach().cpu().numpy(),
+        seed=seed,
+        device="cpu",
+    )
+    missing, unexpected = belief.model.load_state_dict(
+        base.model.state_dict(), strict=False
+    )
+    assert not unexpected
+    assert set(missing) == set(
+        upgrade.ALLOWLIST[upgrade.MODULE_BELIEF_RESOURCE_HEAD][
+            "new_parameter_initialization"
+        ]
+    )
+    belief.save(output, mask_hidden_info=True)
+    raw = torch.load(output, map_location="cpu", weights_only=False)
+    raw["upgrade_provenance"] = {
+        "schema_version": "entity-graph-upgrade-v1",
+        "source_checkpoint_sha256": upgrade._sha(source).removeprefix("sha256:"),  # noqa: SLF001
+        "flags": {"belief_resource_head": True},
+        "initialization_seed": seed,
+        "trained_value_readouts_added": [],
+        "forward_max_diff": 0.0,
+        "forward_identical_at_init": True,
+    }
+    torch.save(raw, output)
+    return source, output
+
+
 def _tamper_and_rehash(path: Path, mutate) -> None:
     value = json.loads(path.read_text(encoding="utf-8"))
     mutate(value)
@@ -150,6 +205,84 @@ def test_receipt_replays_combined_topology_target_gather_upgrade(tmp_path: Path)
     assert evidence["new_parameter_initialization"][
         "topology_residual_adapter.source_projection.weight"
     ] == "identity"
+
+
+def test_receipt_replays_seeded_belief_head_upgrade(tmp_path: Path) -> None:
+    source, initializer = _belief_checkpoints(tmp_path)
+    receipt = tmp_path / "belief-upgrade.receipt.json"
+    payload = upgrade.issue_receipt(
+        source,
+        initializer,
+        receipt,
+        module=upgrade.MODULE_BELIEF_RESOURCE_HEAD,
+    )
+    verified = upgrade.verify_receipt(receipt)
+    expected_seeded = {
+        name
+        for name, kind in upgrade.ALLOWLIST[upgrade.MODULE_BELIEF_RESOURCE_HEAD][
+            "new_parameter_initialization"
+        ].items()
+        if kind == "seeded_torch_default"
+    }
+    assert payload["initialization_seed"] == 73
+    assert set(verified["seeded_parameter_sha256"]) == expected_seeded
+    assert verified["shared_parameters_bit_identical"] is True
+
+
+def test_receipt_accepts_belief_head_from_real_seeded_upgrader(
+    tmp_path: Path, monkeypatch
+) -> None:
+    source, _ = _belief_checkpoints(tmp_path)
+    initializer = tmp_path / "belief-real-upgrader.pt"
+    monkeypatch.setattr(upgrade_tool, "_verify_forward_identical", lambda *_: 0.0)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "f69_upgrade_checkpoint_config.py",
+            "--in-checkpoint",
+            str(source),
+            "--out-checkpoint",
+            str(initializer),
+            "--flags",
+            "belief",
+            "--seed",
+            "73",
+            "--device",
+            "cpu",
+        ],
+    )
+    upgrade_tool.main()
+    evidence = upgrade.inspect_upgrade(
+        source,
+        initializer,
+        module=upgrade.MODULE_BELIEF_RESOURCE_HEAD,
+    )
+    assert evidence["initialization_seed"] == 73
+
+
+def test_belief_receipt_rejects_wrong_seed_or_tampered_random_head(tmp_path: Path) -> None:
+    source, initializer = _belief_checkpoints(tmp_path)
+    raw = torch.load(initializer, map_location="cpu", weights_only=False)
+    raw["upgrade_provenance"]["initialization_seed"] = 72
+    torch.save(raw, initializer)
+    with pytest.raises(upgrade.UpgradeError, match="deterministic seeded_torch_default"):
+        upgrade.inspect_upgrade(
+            source,
+            initializer,
+            module=upgrade.MODULE_BELIEF_RESOURCE_HEAD,
+        )
+
+    source, initializer = _belief_checkpoints(tmp_path)
+    raw = torch.load(initializer, map_location="cpu", weights_only=False)
+    raw["model"]["belief_resource_head.1.weight"][0, 0] += 0.01
+    torch.save(raw, initializer)
+    with pytest.raises(upgrade.UpgradeError, match="deterministic seeded_torch_default"):
+        upgrade.inspect_upgrade(
+            source,
+            initializer,
+            module=upgrade.MODULE_BELIEF_RESOURCE_HEAD,
+        )
 
 
 def test_receipt_digest_normalizes_numpy_config_scalars(tmp_path: Path) -> None:
@@ -205,6 +338,20 @@ def test_checkpoint_parameter_or_metadata_drift_is_rejected(tmp_path: Path) -> N
     source, initializer = _checkpoints(tmp_path)
     raw = torch.load(initializer, map_location="cpu", weights_only=False)
     raw["epoch"] = 8
+    torch.save(raw, initializer)
+    with pytest.raises(upgrade.UpgradeError, match="metadata/provenance changed"):
+        upgrade.inspect_upgrade(source, initializer)
+
+    source, initializer = _checkpoints(tmp_path)
+    raw = torch.load(initializer, map_location="cpu", weights_only=False)
+    raw["model"]["encoder.weight"] = raw["model"]["encoder.weight"].double()
+    torch.save(raw, initializer)
+    with pytest.raises(upgrade.UpgradeError, match="shared checkpoint parameters changed"):
+        upgrade.inspect_upgrade(source, initializer)
+
+    source, initializer = _checkpoints(tmp_path)
+    raw = torch.load(initializer, map_location="cpu", weights_only=False)
+    raw["mask_hidden_info"] = True
     torch.save(raw, initializer)
     with pytest.raises(upgrade.UpgradeError, match="metadata/provenance changed"):
         upgrade.inspect_upgrade(source, initializer)
