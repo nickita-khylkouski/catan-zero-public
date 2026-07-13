@@ -159,6 +159,44 @@ class RowSelectionProvenance(TypedDict):
     observed_row_count: int
 
 
+class ValueScaleSplit(TypedDict):
+    game_count: int
+    row_count: int
+    game_seed_set_sha256: str
+
+
+class ValueScaleFit(TypedDict):
+    """Held-out, game-disjoint diagnostic for the scalar search transform.
+
+    This is deliberately not an operator mutation.  It estimates a positive
+    multiplier for ``tanh(q_raw * value_scale)`` on one subset of held-out
+    games and scores it on another subset.  A later search H2H is still needed
+    before changing the sealed evaluator configuration.
+    """
+
+    schema_version: str
+    diagnostic_only: bool
+    changes_operator_default: bool
+    selection_objective: str
+    current_value_scale: float
+    selected_value_scale: float
+    scale_grid_min: float
+    scale_grid_max: float
+    scale_grid_count: int
+    selected_at_grid_boundary: bool
+    split_seed: int
+    calibration_fraction: float
+    calibration: ValueScaleSplit
+    evaluation: ValueScaleSplit
+    calibration_current: dict[str, Any]
+    calibration_selected: dict[str, Any]
+    evaluation_current: dict[str, Any]
+    evaluation_selected: dict[str, Any]
+    evaluation_row_weighted_mse_reduction: float
+    evaluation_game_balanced_mse_reduction: float
+    promotion_blocked_without_search_h2h: bool
+
+
 @dataclass(frozen=True)
 class ReadoutPredictions:
     """Per-row values needed by every slice, without retaining full logits."""
@@ -744,6 +782,202 @@ def _calibration_stats(
     return stats
 
 
+def _game_seed_set_sha256(game_seeds: np.ndarray) -> str:
+    canonical = np.unique(np.asarray(game_seeds, dtype=np.int64)).astype(
+        "<i8", copy=False
+    )
+    return "sha256:" + hashlib.sha256(canonical.tobytes()).hexdigest()
+
+
+def _tanh_scale_grid_mse(
+    scales: np.ndarray,
+    q: np.ndarray,
+    z: np.ndarray,
+    *,
+    row_chunk_size: int = 65_536,
+    scale_chunk_size: int = 16,
+) -> np.ndarray:
+    """Score a scale grid with bounded memory even for multi-million-row probes."""
+
+    squared_error_sum = np.zeros(len(scales), dtype=np.float64)
+    for row_start in range(0, len(q), row_chunk_size):
+        row_stop = min(row_start + row_chunk_size, len(q))
+        q_chunk = q[row_start:row_stop]
+        z_chunk = z[row_start:row_stop]
+        for scale_start in range(0, len(scales), scale_chunk_size):
+            scale_stop = min(scale_start + scale_chunk_size, len(scales))
+            prediction = np.tanh(
+                scales[scale_start:scale_stop, None] * q_chunk[None, :]
+            )
+            squared_error_sum[scale_start:scale_stop] += np.sum(
+                (prediction - z_chunk[None, :]) ** 2, axis=1
+            )
+    return squared_error_sum / len(q)
+
+
+def fit_scalar_tanh_value_scale(
+    predictions: ReadoutPredictions,
+    groups: list[dict[str, np.ndarray]],
+    *,
+    current_value_scale: float,
+    calibration_fraction: float = 0.5,
+    split_seed: int = 20260713,
+    scale_min: float = 0.125,
+    scale_max: float = 8.0,
+    scale_count: int = 129,
+    reliability_bin_count: int = 10,
+) -> ValueScaleFit:
+    """Fit the deployed scalar tanh multiplier without game leakage.
+
+    ``train_bc`` regresses the raw scalar head against terminal outcomes while
+    search consumes ``tanh(q_raw * value_scale)``.  Ranking checkpoints by raw
+    MSE can therefore disagree with the value function MCTS actually sees.
+    This helper isolates that mismatch: it splits an already-held-out corpus
+    by whole game, chooses one positive scale on the calibration games, and
+    reports both the current and fitted transforms on disjoint evaluation
+    games.  It intentionally cannot alter the evaluator or promotion receipt.
+    """
+
+    if predictions.provenance["requested_readout"] != "scalar":
+        raise ValueError("value-scale fitting is only defined for the scalar readout")
+    numeric = {
+        "current_value_scale": current_value_scale,
+        "scale_min": scale_min,
+        "scale_max": scale_max,
+        "calibration_fraction": calibration_fraction,
+    }
+    if any(not math.isfinite(float(value)) for value in numeric.values()):
+        raise ValueError(f"value-scale fit inputs must be finite: {numeric}")
+    if current_value_scale <= 0.0:
+        raise ValueError("current_value_scale must be > 0")
+    if scale_min <= 0.0 or scale_max <= scale_min:
+        raise ValueError("value-scale grid requires 0 < scale_min < scale_max")
+    if scale_count < 3:
+        raise ValueError("value-scale grid requires at least 3 points")
+    if not 0.0 < calibration_fraction < 1.0:
+        raise ValueError("calibration_fraction must be strictly between 0 and 1")
+
+    q = np.asarray(predictions.q, dtype=np.float64).reshape(-1)
+    z_parts: list[np.ndarray] = []
+    seed_parts: list[np.ndarray] = []
+    for index, group in enumerate(groups):
+        if "game_seed" not in group:
+            raise ValueError(
+                f"value-scale fitting requires game_seed in every group; group {index} lacks it"
+            )
+        z_part = np.asarray(group["z"], dtype=np.float64).reshape(-1)
+        seed_part = np.asarray(group["game_seed"], dtype=np.int64).reshape(-1)
+        if len(z_part) != len(seed_part):
+            raise ValueError(
+                f"group {index} z/game_seed row mismatch: {len(z_part)} != {len(seed_part)}"
+            )
+        z_parts.append(z_part)
+        seed_parts.append(seed_part)
+    z = np.concatenate(z_parts) if z_parts else np.empty(0, dtype=np.float64)
+    game_seed = (
+        np.concatenate(seed_parts) if seed_parts else np.empty(0, dtype=np.int64)
+    )
+    if len(q) != len(z):
+        raise ValueError(f"prediction/label row mismatch: {len(q)} != {len(z)}")
+    if not len(q) or not np.isfinite(q).all() or not np.isfinite(z).all():
+        raise ValueError("value-scale fitting requires non-empty finite q/z rows")
+
+    unique_games = np.unique(game_seed)
+    if len(unique_games) < 2:
+        raise ValueError("value-scale fitting requires at least two held-out games")
+    shuffled = np.random.default_rng(split_seed).permutation(unique_games)
+    calibration_game_count = int(round(len(shuffled) * calibration_fraction))
+    calibration_game_count = min(max(calibration_game_count, 1), len(shuffled) - 1)
+    calibration_games = np.sort(shuffled[:calibration_game_count])
+    evaluation_games = np.sort(shuffled[calibration_game_count:])
+    calibration_mask = np.isin(game_seed, calibration_games)
+    evaluation_mask = ~calibration_mask
+    if not calibration_mask.any() or not evaluation_mask.any():
+        raise ValueError("game-level value-scale split produced an empty row partition")
+
+    # Always score the configured scale even when it is not an exact point on
+    # the geometric grid.  Sorting plus argmin's first-tie behavior selects the
+    # smaller scale on exact ties, a conservative choice near saturation.
+    scales = np.unique(
+        np.concatenate(
+            (
+                np.geomspace(scale_min, scale_max, num=scale_count),
+                np.asarray([current_value_scale], dtype=np.float64),
+            )
+        )
+    )
+    calibration_q = q[calibration_mask]
+    calibration_z = z[calibration_mask]
+    calibration_mse = _tanh_scale_grid_mse(
+        scales, calibration_q, calibration_z
+    )
+    selected_index = int(np.argmin(calibration_mse))
+    selected_scale = float(scales[selected_index])
+
+    current_q = np.tanh(q * current_value_scale)
+    selected_q = np.tanh(q * selected_scale)
+    current_eval_sq = (current_q[evaluation_mask] - z[evaluation_mask]) ** 2
+    selected_eval_sq = (selected_q[evaluation_mask] - z[evaluation_mask]) ** 2
+    per_game_reductions = []
+    for seed in evaluation_games:
+        mask = evaluation_mask & (game_seed == seed)
+        per_game_reductions.append(
+            float(
+                np.mean(
+                    (current_q[mask] - z[mask]) ** 2
+                    - (selected_q[mask] - z[mask]) ** 2
+                )
+            )
+        )
+
+    def _split(game_values: np.ndarray, mask: np.ndarray) -> ValueScaleSplit:
+        return ValueScaleSplit(
+            game_count=int(len(game_values)),
+            row_count=int(mask.sum()),
+            game_seed_set_sha256=_game_seed_set_sha256(game_values),
+        )
+
+    stats_kwargs = {
+        "min_rows": 1,
+        "reliability_bin_count": reliability_bin_count,
+    }
+    return ValueScaleFit(
+        schema_version="scalar-tanh-value-scale-fit-v1",
+        diagnostic_only=True,
+        changes_operator_default=False,
+        selection_objective="row_weighted_terminal_outcome_mse_on_calibration_games",
+        current_value_scale=float(current_value_scale),
+        selected_value_scale=selected_scale,
+        scale_grid_min=float(scale_min),
+        scale_grid_max=float(scale_max),
+        scale_grid_count=int(len(scales)),
+        selected_at_grid_boundary=bool(
+            selected_scale == float(scales[0]) or selected_scale == float(scales[-1])
+        ),
+        split_seed=int(split_seed),
+        calibration_fraction=float(calibration_fraction),
+        calibration=_split(calibration_games, calibration_mask),
+        evaluation=_split(evaluation_games, evaluation_mask),
+        calibration_current=_calibration_stats(
+            current_q[calibration_mask], calibration_z, **stats_kwargs
+        ),
+        calibration_selected=_calibration_stats(
+            selected_q[calibration_mask], calibration_z, **stats_kwargs
+        ),
+        evaluation_current=_calibration_stats(
+            current_q[evaluation_mask], z[evaluation_mask], **stats_kwargs
+        ),
+        evaluation_selected=_calibration_stats(
+            selected_q[evaluation_mask], z[evaluation_mask], **stats_kwargs
+        ),
+        evaluation_row_weighted_mse_reduction=float(
+            current_eval_sq.mean() - selected_eval_sq.mean()
+        ),
+        evaluation_game_balanced_mse_reduction=float(np.mean(per_game_reductions)),
+        promotion_blocked_without_search_h2h=True,
+    )
+
+
 def _slice_by(
     q: np.ndarray,
     z: np.ndarray,
@@ -949,6 +1183,29 @@ def main() -> None:
         default="tanh",
         help="current search transform to mark as configured (does not change it)",
     )
+    parser.add_argument(
+        "--fit-scalar-tanh-value-scale",
+        action="store_true",
+        help=(
+            "diagnostically fit value_scale on one held-out game subset and score "
+            "it on a disjoint held-out subset; never changes the evaluator"
+        ),
+    )
+    parser.add_argument(
+        "--value-scale-fit-fraction",
+        type=float,
+        default=0.5,
+        help="fraction of held-out games used to select the diagnostic scale",
+    )
+    parser.add_argument(
+        "--value-scale-fit-seed",
+        type=int,
+        default=20260713,
+        help="deterministic whole-game calibration/evaluation split seed",
+    )
+    parser.add_argument("--value-scale-fit-min", type=float, default=0.125)
+    parser.add_argument("--value-scale-fit-max", type=float, default=8.0)
+    parser.add_argument("--value-scale-fit-count", type=int, default=129)
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--device", default="cpu")
     parser.add_argument(
@@ -1061,6 +1318,14 @@ def main() -> None:
             "--require-held-out needs --validation-fraction, "
             "--validation-seed-manifest, or --validation-game-seed-ranges"
         )
+    if args.fit_scalar_tanh_value_scale:
+        if args.value_readout != "scalar":
+            parser.error("--fit-scalar-tanh-value-scale requires --value-readout scalar")
+        if selection_mode == "all_natural_terminal_rows":
+            parser.error(
+                "--fit-scalar-tanh-value-scale requires an explicit held-out "
+                "validation game selection"
+            )
 
     groups = collect_rows(
         args.shard_dir,
@@ -1080,6 +1345,18 @@ def main() -> None:
         deployed_value_scale=args.deployed_value_scale,
         deployed_value_squash=args.deployed_value_squash,
     )
+    if args.fit_scalar_tanh_value_scale:
+        summary["scalar_tanh_value_scale_fit"] = fit_scalar_tanh_value_scale(
+            predictions,
+            groups,
+            current_value_scale=args.deployed_value_scale,
+            calibration_fraction=args.value_scale_fit_fraction,
+            split_seed=args.value_scale_fit_seed,
+            scale_min=args.value_scale_fit_min,
+            scale_max=args.value_scale_fit_max,
+            scale_count=args.value_scale_fit_count,
+            reliability_bin_count=args.reliability_bins,
+        )
     summary["checkpoint"] = args.checkpoint
     summary["shard_dir"] = args.shard_dir
     summary["row_selection"] = build_row_selection_provenance(
