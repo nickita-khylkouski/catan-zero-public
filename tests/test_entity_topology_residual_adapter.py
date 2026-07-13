@@ -155,4 +155,3 @@ def test_adapter_output_changes_when_explicit_vertex_edge_incidence_changes():
         left_tokens = model.encode_state(left)[0]
         right_tokens = model.encode_state(right)[0]
     assert not torch.equal(left_tokens, right_tokens)
-
