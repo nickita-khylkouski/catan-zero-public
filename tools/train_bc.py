@@ -588,9 +588,10 @@ def build_parser() -> argparse.ArgumentParser:
         default=0,
         help=(
             "Linearly ramp the learning rate from 0 to --lr over this many batches at the "
-            "start of training, then hold at --lr. Checkpoints do not persist optimizer "
-            "state, so every resume restarts Adam's moment estimates from zero; a short "
-            "ramp (e.g. 500-1000) protects a repair run from that fresh-Adam transient."
+            "start of training, then hold at --lr. A committed model/optimizer/progress "
+            "checkpoint set resumes the exact Adam and schedule state; an explicit "
+            "--no-resume-optimizer warm-start creates fresh moments, where a short ramp "
+            "protects against the fresh-Adam transient."
         ),
     )
     parser.add_argument(
@@ -14826,7 +14827,27 @@ def _step_optimizer_fail_closed(
         if hasattr(loss, "detach")
         else float(loss)
     )
-    zero_objective_step_skipped = loss_value == 0.0 and grad_norm == 0.0
+    any_nonzero_objective = loss_value != 0.0
+    if grad_norm == 0.0:
+        # DDP synchronizes gradients, not the rank-local scalar loss.  At a
+        # stationary/sparse step every rank sees the same zero global gradient,
+        # but one rank can have no eligible objective rows while another has a
+        # nonzero loss.  Letting the empty rank skip while its peer calls
+        # optimizer.step() diverges Adam moments (and AdamW parameters) even
+        # though DDP was otherwise correct.  The zero gradient makes this branch
+        # rare; use one collective only here to reach a rank-consistent decision.
+        import torch
+        import torch.distributed as dist
+
+        if dist.is_available() and dist.is_initialized():
+            objective_present = torch.tensor(
+                int(any_nonzero_objective),
+                dtype=torch.int32,
+                device=(loss.device if hasattr(loss, "device") else None),
+            )
+            dist.all_reduce(objective_present, op=dist.ReduceOp.MAX)
+            any_nonzero_objective = bool(objective_present.item())
+    zero_objective_step_skipped = not any_nonzero_objective and grad_norm == 0.0
     optimizer_step_applied = not zero_objective_step_skipped
     if optimizer_step_applied:
         optimizer.step()
@@ -17349,15 +17370,20 @@ def _training_resume_recipe_identity(
     """Stable identity of the trajectory whose Adam/schedule state may continue.
 
     ``init_checkpoint`` necessarily changes from the original parent to the checkpoint
-    being resumed, so it is normalized out. Everything else in the typed science
-    config remains bound, augmented with optimizer-step topology fields not yet in
-    TrainConfig. This intentionally rejects changing max_steps, warmup/decay, loss
-    recipe, corpus, batch geometry, or world size while reusing moments.
+    being resumed, so it is normalized out. ``grow_from_checkpoint`` is normalized for
+    the same reason: after the first grown checkpoint is saved, continuation must use
+    the mutually-exclusive ``--init-checkpoint`` path rather than grow the architecture
+    a second time. Everything else in the typed science config remains bound, augmented
+    with optimizer-step topology fields for backwards compatibility. This intentionally
+    rejects changing max_steps, warmup/decay, loss recipe, corpus, batch geometry, or
+    world size while reusing moments.
     """
     normalized = dataclasses.replace(
         train_config,
         init_checkpoint="",
         init_checkpoint_sha256="",
+        grow_from_checkpoint="",
+        grow_from_checkpoint_sha256="",
         resume_optimizer=True,
     )
     return {
@@ -17388,7 +17414,29 @@ def _restore_training_progress_state(
         raise SystemExit(
             f"resumed completed_epochs={completed_epochs} exceeds --epochs={epochs}"
         )
-    rng.bit_generator.state = progress["rng_state"]
+    rank_numpy_rng_states = progress.get("rank_numpy_rng_states")
+    if isinstance(rank_numpy_rng_states, list):
+        if len(rank_numpy_rng_states) != int(ddp["world_size"]):
+            raise SystemExit(
+                "resumed checkpoint lacks matching per-rank numpy RNG state"
+            )
+        rng.bit_generator.state = rank_numpy_rng_states[int(ddp["rank"])]
+    else:
+        # Legacy progress stored only rank 0's sampler state. That is exact when
+        # every rank traverses the same global corpus/order, but not when each
+        # rank owns a different shard and can advance NumPy by a different
+        # amount. Fail closed instead of silently changing the resumed order.
+        recipe_identity = progress.get("recipe_identity", {})
+        sharded = bool(
+            recipe_identity.get("ddp_shard_data", False)
+            if isinstance(recipe_identity, dict)
+            else False
+        )
+        if sharded and int(ddp["world_size"]) > 1:
+            raise SystemExit(
+                "legacy sharded-DDP checkpoint lacks per-rank numpy RNG state"
+            )
+        rng.bit_generator.state = progress["rng_state"]
     saved_symmetry_state = progress.get("symmetry_rng_state")
     if symmetry_rng is not None:
         if not isinstance(saved_symmetry_state, dict):
@@ -17464,6 +17512,7 @@ def _save_training_progress_sidecar(
             else None
         ),
     }
+    local_numpy_rng_state = rng.bit_generator.state
     if bool(ddp["enabled"]):
         import torch.distributed as dist
 
@@ -17472,8 +17521,16 @@ def _save_training_progress_sidecar(
         ]
         dist.all_gather_object(rank_rng_states, local_rng)
         gathered_rng_states = [row for row in rank_rng_states if row is not None]
+        rank_numpy_rng_states: list[dict[str, object] | None] = [
+            None for _ in range(int(ddp["world_size"]))
+        ]
+        dist.all_gather_object(rank_numpy_rng_states, local_numpy_rng_state)
+        gathered_numpy_rng_states = [
+            row for row in rank_numpy_rng_states if row is not None
+        ]
     else:
         gathered_rng_states = [local_rng]
+        gathered_numpy_rng_states = [local_numpy_rng_state]
 
     # Non-zero DDP/FSDP ranks participate in optimizer/RNG collectives but never write.
     if int(ddp["rank"]) != 0:
@@ -17490,6 +17547,7 @@ def _save_training_progress_sidecar(
             completed_epochs=int(completed_epochs),
             recipe_identity=recipe_identity,
             rng_state=rng.bit_generator.state,
+            rank_numpy_rng_states=gathered_numpy_rng_states,
             symmetry_rng_state=(
                 None if symmetry_rng is None else symmetry_rng.bit_generator.state
             ),

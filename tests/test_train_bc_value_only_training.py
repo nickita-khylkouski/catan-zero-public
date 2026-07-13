@@ -679,6 +679,78 @@ def test_nonzero_loss_with_exact_zero_gradient_preserves_optimizer_semantics() -
     assert not torch.equal(before, model.weight.detach())
 
 
+def test_ddp_zero_gradient_uses_global_objective_presence_before_skipping(
+    monkeypatch,
+) -> None:
+    """A locally empty sparse rank must step when any peer has an objective.
+
+    Before the fix, the empty rank skipped while its peer applied Adam/AdamW at
+    an exact stationary point, immediately desynchronizing optimizer state and
+    decoupled weight decay across DDP replicas.
+    """
+    from types import SimpleNamespace
+
+    import torch
+    import torch.distributed as dist
+    from tools.train_bc import _step_optimizer_fail_closed
+
+    model = torch.nn.Linear(2, 1, bias=False)
+    policy = SimpleNamespace(model=model)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1, weight_decay=0.5)
+    before = model.weight.detach().clone()
+    local_zero_loss = model.weight.sum() * 0.0
+    local_zero_loss.backward()
+    monkeypatch.setattr(dist, "is_available", lambda: True)
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+
+    def peer_has_objective(flag, op=None):
+        assert op == dist.ReduceOp.MAX
+        flag.fill_(1)
+
+    monkeypatch.setattr(dist, "all_reduce", peer_has_objective)
+
+    grad_norm, applied, skipped = _step_optimizer_fail_closed(
+        policy,
+        optimizer,
+        loss=local_zero_loss,
+        max_grad_norm=1.0,
+    )
+
+    assert float(grad_norm) == 0.0
+    assert applied is True
+    assert skipped is False
+    assert not torch.equal(before, model.weight.detach())
+
+
+def test_ddp_globally_empty_zero_gradient_still_skips(monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    import torch
+    import torch.distributed as dist
+    from tools.train_bc import _step_optimizer_fail_closed
+
+    model = torch.nn.Linear(2, 1, bias=False)
+    policy = SimpleNamespace(model=model)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.1, weight_decay=0.5)
+    before = model.weight.detach().clone()
+    loss = model.weight.sum() * 0.0
+    loss.backward()
+    monkeypatch.setattr(dist, "is_available", lambda: True)
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dist, "all_reduce", lambda flag, op=None: None)
+
+    _, applied, skipped = _step_optimizer_fail_closed(
+        policy,
+        optimizer,
+        loss=loss,
+        max_grad_norm=1.0,
+    )
+
+    assert applied is False
+    assert skipped is True
+    assert torch.equal(before, model.weight.detach())
+
+
 def test_nonfinite_gradient_norm_aborts_before_optimizer_step(
     tmp_path, monkeypatch
 ) -> None:

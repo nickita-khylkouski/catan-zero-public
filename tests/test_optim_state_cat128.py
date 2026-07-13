@@ -14,6 +14,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -94,6 +95,7 @@ def _committed_progress(tmp_path: Path, *, recipe=None):
         completed_epochs=2,
         recipe_identity=identity,
         rng_state=rng.bit_generator.state,
+        rank_numpy_rng_states=[rng.bit_generator.state],
         symmetry_rng_state=None,
         rank_torch_rng_states=[
             {"rank": 0, "cpu": torch.get_rng_state().tolist(), "cuda": None}
@@ -221,3 +223,166 @@ def test_train_bc_restores_schedule_counter_epoch_and_sampler_rng():
     )
     assert restored == (713, 2, 123.5, 44.0)
     assert np.array_equal(resumed_rng.random(4), expected_next)
+
+
+def test_train_bc_restores_rank_local_numpy_sampler_rng() -> None:
+    tb = _load_train_bc()
+    np = __import__("numpy")
+    rank0_rng = np.random.default_rng(10)
+    rank1_rng = np.random.default_rng(20)
+    rank0_rng.random(3)
+    rank1_rng.random(7)
+    rank1_expected = rank1_rng.random(4)
+    rank1_rng = np.random.default_rng(20)
+    rank1_rng.random(7)
+    resumed_rng = np.random.default_rng(999)
+    progress = {
+        "optimizer_step": 7,
+        "completed_epochs": 1,
+        "rng_state": rank0_rng.bit_generator.state,
+        "rank_numpy_rng_states": [
+            rank0_rng.bit_generator.state,
+            rank1_rng.bit_generator.state,
+        ],
+        "symmetry_rng_state": None,
+        "rank_torch_rng_states": [
+            {"rank": 0, "cpu": torch.get_rng_state().tolist(), "cuda": None},
+            {"rank": 1, "cpu": torch.get_rng_state().tolist(), "cuda": None},
+        ],
+        "scalar_training_weight_sum": 0.0,
+        "categorical_training_weight_sum": 0.0,
+        "recipe_identity": {"ddp_shard_data": True},
+    }
+
+    tb._restore_training_progress_state(
+        progress,
+        epochs=2,
+        rng=resumed_rng,
+        symmetry_rng=None,
+        ddp={"enabled": True, "world_size": 2, "rank": 1, "local_rank": 1},
+    )
+
+    assert np.array_equal(resumed_rng.random(4), rank1_expected)
+
+
+def test_legacy_sharded_ddp_resume_without_rank_sampler_state_fails() -> None:
+    tb = _load_train_bc()
+    np = __import__("numpy")
+    rng = np.random.default_rng(1)
+    progress = {
+        "optimizer_step": 7,
+        "completed_epochs": 1,
+        "rng_state": rng.bit_generator.state,
+        "symmetry_rng_state": None,
+        "rank_torch_rng_states": [
+            {"rank": 0, "cpu": torch.get_rng_state().tolist(), "cuda": None},
+            {"rank": 1, "cpu": torch.get_rng_state().tolist(), "cuda": None},
+        ],
+        "scalar_training_weight_sum": 0.0,
+        "categorical_training_weight_sum": 0.0,
+        "recipe_identity": {"ddp_shard_data": True},
+    }
+
+    with pytest.raises(SystemExit, match="per-rank numpy RNG"):
+        tb._restore_training_progress_state(
+            progress,
+            epochs=2,
+            rng=np.random.default_rng(999),
+            symmetry_rng=None,
+            ddp={"enabled": True, "world_size": 2, "rank": 1, "local_rank": 1},
+        )
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("amp", "bf16"),
+        ("fused_optimizer", True),
+        ("graph_history_features", True),
+        ("teacher_weights", "mcts=2.0"),
+        ("phase_weights", "robber=3.0"),
+        ("value_phase_weights", "robber=8.0"),
+        ("q_skip_teacher_prefixes", ""),
+        ("value_root_blend_phases", "PLAY_TURN"),
+        ("value_root_blend_global_compat", True),
+    ],
+)
+def test_resume_identity_rejects_gradient_or_precision_recipe_drift(
+    field: str, value
+) -> None:
+    """Adam/RNG/LR state may continue only under the exact learner objective.
+
+    These fields used to be absent from TrainConfig, so changing any one of
+    them produced the same resume identity and silently mixed two trajectories.
+    """
+    from catan_zero.rl.pipeline_configs import TrainConfig
+
+    tb = _load_train_bc()
+    args = SimpleNamespace(
+        grad_accum_steps=1,
+        ddp_shard_data=False,
+        fsdp=False,
+        policy_aux_active_batch_size=0,
+    )
+    ddp = {"enabled": False, "world_size": 1, "rank": 0, "local_rank": 0}
+    baseline = TrainConfig(init_checkpoint="first.pt", init_checkpoint_sha256="sha256:a")
+    changed = __import__("dataclasses").replace(baseline, **{field: value})
+
+    baseline_identity = tb._training_resume_recipe_identity(baseline, args, ddp)
+    changed_identity = tb._training_resume_recipe_identity(changed, args, ddp)
+
+    assert changed_identity != baseline_identity
+
+
+def test_resume_identity_normalizes_only_the_checkpoint_being_resumed() -> None:
+    """Changing the checkpoint file is expected; changing the recipe is not."""
+    from catan_zero.rl.pipeline_configs import TrainConfig
+
+    tb = _load_train_bc()
+    args = SimpleNamespace(
+        grad_accum_steps=1,
+        ddp_shard_data=False,
+        fsdp=False,
+        policy_aux_active_batch_size=0,
+    )
+    ddp = {"enabled": False, "world_size": 1, "rank": 0, "local_rank": 0}
+    first = TrainConfig(init_checkpoint="epoch1.pt", init_checkpoint_sha256="sha256:a")
+    second = __import__("dataclasses").replace(
+        first, init_checkpoint="epoch2.pt", init_checkpoint_sha256="sha256:b"
+    )
+
+    assert tb._training_resume_recipe_identity(
+        first, args, ddp
+    ) == tb._training_resume_recipe_identity(second, args, ddp)
+
+
+def test_grow_checkpoint_can_resume_through_mutually_exclusive_init_path() -> None:
+    """The first grown epoch and its continuation describe one trajectory.
+
+    A continuation cannot repeat --grow-from-checkpoint because train_bc rejects
+    combining it with the required --init-checkpoint.  The old recipe identity
+    nevertheless retained grow_from_checkpoint, making every such sidecar
+    impossible to resume.
+    """
+    from catan_zero.rl.pipeline_configs import TrainConfig
+
+    tb = _load_train_bc()
+    args = SimpleNamespace(
+        grad_accum_steps=1,
+        ddp_shard_data=False,
+        fsdp=False,
+        policy_aux_active_batch_size=0,
+    )
+    ddp = {"enabled": False, "world_size": 1, "rank": 0, "local_rank": 0}
+    first_epoch = TrainConfig(
+        grow_from_checkpoint="f7.pt",
+        grow_from_checkpoint_sha256="sha256:f7",
+    )
+    resumed_epoch = TrainConfig(
+        init_checkpoint="grown-epoch1.pt",
+        init_checkpoint_sha256="sha256:grown",
+    )
+
+    assert tb._training_resume_recipe_identity(
+        first_epoch, args, ddp
+    ) == tb._training_resume_recipe_identity(resumed_epoch, args, ddp)

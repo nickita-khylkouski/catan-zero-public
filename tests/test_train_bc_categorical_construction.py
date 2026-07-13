@@ -162,6 +162,18 @@ def test_train_config_hash_captures_data_init_grow_and_holdout_identity() -> Non
         TrainConfig(allow_missing_game_seed_validation_split=True),
         TrainConfig(value_categorical_bins=33),
         TrainConfig(action_module_lr_mult=0.3),
+        TrainConfig(amp="bf16"),
+        TrainConfig(fused_optimizer=True),
+        TrainConfig(grad_accum_steps=2),
+        TrainConfig(ddp_shard_data=True),
+        TrainConfig(fsdp=True),
+        TrainConfig(graph_history_features=True),
+        TrainConfig(teacher_weights="mcts=2.0"),
+        TrainConfig(phase_weights="robber=3.0"),
+        TrainConfig(value_phase_weights="robber=8.0"),
+        TrainConfig(q_skip_teacher_prefixes=""),
+        TrainConfig(value_root_blend_phases="PLAY_TURN"),
+        TrainConfig(value_root_blend_global_compat=True),
     )
     assert len({base.config_hash(), *(variant.config_hash() for variant in variants)}) == (
         1 + len(variants)
