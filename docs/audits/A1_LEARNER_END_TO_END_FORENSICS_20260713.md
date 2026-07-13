@@ -177,8 +177,43 @@ a diagnostic, not a champion selector. Search H2H remains mandatory.
 | Teacher-gap weighting | Active teacher-gap telemetry used a boolean positive-weight mask. A repair row with policy weight 100 and an incidental row with weight 1 therefore had equal diagnostic influence, even though the learner objective did not. | Fixed (`e0d1d78`): KL numerators and denominators use the exact post-advantage effective policy weights through batch, DDP, component, and report aggregation; the two-row regression yields `100/101 = 0.990099`, not `0.5`. This changes interpretation, not gradients. |
 | Optional-target train coverage | An enabled CAT-100 head could have all-NaN/all-`-1` labels and silently contribute zero loss. The first coverage fix scanned the full corpus, so labels appearing only in held-out validation could still admit a run with no training signal. | Fixed (`e0d1d78`, `6d6d08a`): each enabled head requires finite usable labels on the actual post-split training indices, with chunked DDP-aware counts bound into the report. |
 | Zero effective training objective | A configured policy/Q or value/final-VP objective could have zero positive effective weight mass on the training split and still run as an apparently valid experiment. | Fixed (`6d6d08a`): startup computes and records train-split objective masses and refuses every enabled zero-mass objective before spending a GPU update. |
+| Architecture inference-cost gate | The topology+target-gather receipt used an isolated batch-48 profile with the unused Q head enabled. Production H2H is dominated by batch-1 calls, with chance batches up to 11 and D6 batches of 12, so the receipt reported 1.22x slowdown while the exact H2H measured 1.60x per search call. | Fixed: cost contract v2 requires matched strict-FP32, `return_q=false` batch-1 and batch-12 profiles; batch 48 is optional secondary throughput telemetry. Completion fails closed when either operational profile is missing or shape-drifted. |
 
 ## Layer/architecture audit
+
+### Operational cost of topology + target gather
+
+The independently initialized 128-step topology+target-gather diagnostic scored
+271 candidate wins to 241 exact-parent wins over 512 n128+D6 games (52.93%),
+but both the pentanomial and superiority decisions remained `continue`.  It is
+not a proven strength gain.  The more decisive result is cost: candidate search
+seconds per call were 0.36081 versus 0.22482 for the parent, a 1.6049x ratio;
+total search time was 1.6208x.  Simulation count, search-call count, and wide
+root count changed by only 0.8%, 1.0%, and 0.5%, respectively, so changed game
+dynamics do not explain the regression.
+
+Matched strict-FP32 B200 profiles with the Q head disabled reproduce the full
+search result as a pure batch-shape effect:
+
+| Forward batch | Parent ms | Topology+gather ms | Ratio |
+|---:|---:|---:|---:|
+| 1 | 2.744 | 4.724 | 1.722x |
+| 4 | 2.775 | 4.988 | 1.797x |
+| 8 | 3.641 | 5.929 | 1.629x |
+| 12 (D6) | 4.289 | 6.545 | 1.526x |
+| 48 | 11.030 | 13.608 | 1.234x |
+
+The generic `build_relation_ids` call contributes about 1.33--1.46 ms almost
+independent of batch size.  It allocates a dense int64 `[B,151,151]` relation
+tensor and fills SELF/HUB/READ_GLOBAL relations even though the residual
+adapter immediately filters those classes and consumes only direct physical
+incidence.  The adapter itself costs another 0.34--0.59 ms and target gather
+about 0.27 ms.  That fixed work is amortized at batch 48 but dominates the
+actual synchronous evaluator.  The current topology+gather treatment is
+therefore rejected on cost-adjusted evidence; optimizing the rejected adapter
+is lower priority than the 14.7k-parameter static action residual.  If topology
+is reconsidered later, it requires a specialized or cached direct-adjacency
+path and must clear the operational batch-1/batch-12 envelope before H2H.
 
 ### Shared trunk
 

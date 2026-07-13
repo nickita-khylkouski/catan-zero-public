@@ -221,27 +221,46 @@ def _load_profile(
     return value, arm._file_ref(path)  # noqa: SLF001
 
 
-def _inference_cost_telemetry(
-    verified: Mapping[str, Any], *, candidate: Mapping[str, Any]
+def _profile_environment(profile: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the exact deployment-shape fields bound by the cost contract."""
+    return {
+        "device": profile.get("device"),
+        "strict_fp32": profile.get("strict_fp32"),
+        "shape": {
+            key: profile.get("shape", {}).get(key)
+            for key in ("batch_size", "legal_width", "event_width", "valid_players")
+        },
+        "warmup": profile.get("warmup"),
+        "iterations": profile.get("iterations"),
+        "return_q": profile.get("return_q"),
+    }
+
+
+def _matched_profile_telemetry(
+    *,
+    root: Path,
+    name: str,
+    shape: Mapping[str, Any],
+    reference_checkpoint: Mapping[str, Any],
+    candidate_checkpoint: Mapping[str, Any],
 ) -> dict[str, Any]:
-    manifest = verified["manifest"]
-    contract = manifest.get("inference_cost_contract")
-    if (
-        not isinstance(contract, Mapping)
-        or contract.get("required_before_completion") is not True
+    reference_filename = shape.get("reference_filename")
+    candidate_filename = shape.get("candidate_filename")
+    if not (
+        isinstance(reference_filename, str)
+        and reference_filename
+        and Path(reference_filename).name == reference_filename
+        and isinstance(candidate_filename, str)
+        and candidate_filename
+        and Path(candidate_filename).name == candidate_filename
     ):
-        raise CompletionError(
-            "combined sibling lacks mandatory inference-cost contract"
-        )
-    root = Path(verified["output_root"])
-    reference_checkpoint = contract["reference_checkpoint"]
+        raise CompletionError(f"inference profile {name} lacks bound filenames")
     reference, reference_ref = _load_profile(
-        root / "reference-inference-profile.json", checkpoint=reference_checkpoint
+        root / reference_filename, checkpoint=reference_checkpoint
     )
     treatment, treatment_ref = _load_profile(
-        root / "candidate-inference-profile.json", checkpoint=candidate
+        root / candidate_filename, checkpoint=candidate_checkpoint
     )
-    expected_shape = contract["matched_shape"]
     exact_environment = {
         "device": reference.get("device"),
         "strict_fp32": {
@@ -251,30 +270,20 @@ def _inference_cost_telemetry(
             "autocast": False,
         },
         "shape": {
-            "batch_size": expected_shape["batch_size"],
-            "legal_width": expected_shape["legal_width"],
-            "event_width": expected_shape["event_width"],
-            "valid_players": expected_shape["valid_players"],
+            "batch_size": shape["batch_size"],
+            "legal_width": shape["legal_width"],
+            "event_width": shape["event_width"],
+            "valid_players": shape["valid_players"],
         },
-        "warmup": expected_shape["warmup"],
-        "iterations": expected_shape["iterations"],
-        "return_q": expected_shape["return_q"],
+        "warmup": shape["warmup"],
+        "iterations": shape["iterations"],
+        "return_q": shape["return_q"],
     }
     for label, profile in (("reference", reference), ("candidate", treatment)):
-        observed = {
-            "device": profile.get("device"),
-            "strict_fp32": profile.get("strict_fp32"),
-            "shape": {
-                key: profile.get("shape", {}).get(key)
-                for key in ("batch_size", "legal_width", "event_width", "valid_players")
-            },
-            "warmup": profile.get("warmup"),
-            "iterations": profile.get("iterations"),
-            "return_q": profile.get("return_q"),
-        }
+        observed = _profile_environment(profile)
         if observed != exact_environment:
             raise CompletionError(
-                f"{label} inference profile environment drift: {observed}"
+                f"{name} {label} inference profile environment drift: {observed}"
             )
     metric_paths = {
         "cuda_mean_ms": ("exact_window", "cuda_ms", "mean"),
@@ -294,17 +303,87 @@ def _inference_cost_telemetry(
         name.removesuffix("_ms") + "_slowdown": candidate_metrics[name] / value
         for name, value in reference_metrics.items()
     }
-    telemetry = {
-        "schema_version": "a1-architecture-inference-cost-telemetry-v1",
-        "contract": dict(contract),
-        "reference_checkpoint": dict(reference_checkpoint),
-        "candidate_checkpoint": dict(candidate),
+    return {
+        "shape_contract": dict(shape),
         "reference_profile": reference_ref,
         "candidate_profile": treatment_ref,
         "matched_environment": exact_environment,
         "reference_metrics": reference_metrics,
         "candidate_metrics": candidate_metrics,
         "candidate_reference_ratios": ratios,
+    }
+
+
+def _inference_cost_telemetry(
+    verified: Mapping[str, Any], *, candidate: Mapping[str, Any]
+) -> dict[str, Any]:
+    manifest = verified["manifest"]
+    contract = manifest.get("inference_cost_contract")
+    if (
+        not isinstance(contract, Mapping)
+        or contract.get("schema_version")
+        != "a1-architecture-inference-cost-contract-v2"
+        or contract.get("required_before_completion") is not True
+    ):
+        raise CompletionError(
+            "architecture arm lacks mandatory operational inference-cost contract"
+        )
+    required = contract.get("required_profiles")
+    optional = contract.get("optional_profiles", {})
+    if not (
+        isinstance(required, Mapping)
+        and set(required) == {"operational_b1", "d6_b12"}
+        and isinstance(optional, Mapping)
+    ):
+        raise CompletionError(
+            "inference-cost contract lacks the required b1/b12 operational envelope"
+        )
+    root = Path(verified["output_root"])
+    reference_checkpoint = contract["reference_checkpoint"]
+    profiles = {
+        name: _matched_profile_telemetry(
+            root=root,
+            name=str(name),
+            shape=shape,
+            reference_checkpoint=reference_checkpoint,
+            candidate_checkpoint=candidate,
+        )
+        for name, shape in required.items()
+        if isinstance(shape, Mapping)
+    }
+    if set(profiles) != set(required):
+        raise CompletionError("inference-cost required profile contract is malformed")
+
+    optional_profiles: dict[str, Any] = {}
+    for name, shape in optional.items():
+        if not isinstance(shape, Mapping):
+            raise CompletionError("optional inference profile contract is malformed")
+        paths = (
+            root / str(shape.get("reference_filename", "")),
+            root / str(shape.get("candidate_filename", "")),
+        )
+        if any(path.exists() for path in paths):
+            if not all(path.exists() for path in paths):
+                raise CompletionError(
+                    f"optional inference profile {name} is only partially present"
+                )
+            optional_profiles[str(name)] = _matched_profile_telemetry(
+                root=root,
+                name=str(name),
+                shape=shape,
+                reference_checkpoint=reference_checkpoint,
+                candidate_checkpoint=candidate,
+            )
+
+    telemetry = {
+        "schema_version": "a1-architecture-inference-cost-telemetry-v2",
+        "contract": dict(contract),
+        "reference_checkpoint": dict(reference_checkpoint),
+        "candidate_checkpoint": dict(candidate),
+        "required_profiles": profiles,
+        "optional_profiles": optional_profiles,
+        "primary_latency_profile": "operational_b1",
+        "d6_profile": "d6_b12",
         "selection_cost_observed": True,
     }
     telemetry["telemetry_sha256"] = arm._digest(telemetry)  # noqa: SLF001

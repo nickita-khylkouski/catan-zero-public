@@ -706,7 +706,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--device", default="cuda:0")
-    parser.add_argument("--batch-size", type=int, default=48)
+    # Search evaluation is latency-shaped: one synchronous search thread feeds
+    # batch 1, and D6 averaging feeds batch 12.  Throughput batch 48 remains an
+    # explicit opt-in so an omitted flag cannot recreate the old cost-gate bug.
+    parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--legal-width", type=int, default=54)
     parser.add_argument("--valid-legal-fraction", type=float, default=0.392)
     parser.add_argument("--event-width", type=int, default=0)
@@ -714,7 +717,9 @@ def main() -> None:
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iterations", type=int, default=100)
     parser.add_argument("--seed", type=int, default=20260710)
-    parser.add_argument("--return-q", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--return-q", action=argparse.BooleanOptionalAction, default=False
+    )
     parser.add_argument("--player-crop-ab", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--output-json", type=Path)
     args = parser.parse_args()

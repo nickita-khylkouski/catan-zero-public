@@ -1,0 +1,82 @@
+{
+  "schema_version": "a1-topology-target-gather-operational-cost-evidence-v1",
+  "diagnostic_only": true,
+  "promotion_eligible": false,
+  "candidate": {
+    "sha256": "sha256:61bf29e1a1045888465939e07f7d2ee0c0289544477bda0224a9b7d0df2ee5cb"
+  },
+  "exact_parent": {
+    "sha256": "sha256:9dd1d261a39d7b04713505a301097faf18e84e8a3508b4abb92a8b964f7ab921"
+  },
+  "h2h": {
+    "run_id": "a1-eval-1ef3c08e3b8459a0",
+    "pooled_report_sha256": "sha256:2e958ceb211b03fdfc82edba0994f1fb758627a5998761c8b02c9f7c9f5d9cbc",
+    "complete_pairs": 256,
+    "games": 512,
+    "candidate_wins": 271,
+    "parent_wins": 241,
+    "candidate_win_rate": 0.529296875,
+    "pair_outcomes": {
+      "candidate_two_wins": 60,
+      "split": 151,
+      "candidate_two_losses": 45
+    },
+    "pentanomial_verdict": "continue",
+    "superiority_verdict": "continue",
+    "search": {
+      "candidate_calls": 57085,
+      "parent_calls": 56524,
+      "candidate_simulations": 3728512,
+      "parent_simulations": 3698816,
+      "candidate_wide_root_calls": 1108,
+      "parent_wide_root_calls": 1102,
+      "candidate_seconds_per_call": 0.3608127456512544,
+      "parent_seconds_per_call": 0.22481828620524258,
+      "candidate_parent_seconds_per_call_ratio": 1.604908353948837,
+      "candidate_parent_total_elapsed_ratio": 1.6208370494864015
+    }
+  },
+  "matched_strict_fp32_no_q_profiles": {
+    "1": {
+      "parent_wall_mean_ms": 2.744,
+      "candidate_wall_mean_ms": 4.7241,
+      "candidate_parent_ratio": 1.7216,
+      "parent_profile_sha256": "sha256:21c3a9e9a3d92876824960f8db27b3b8e36b4b2eecb3c3e128698057f24e9ee2",
+      "candidate_profile_sha256": "sha256:380c00b2873b18df5251fe41290ccd47495645e1db1c75a0f0598e86ed37b91b"
+    },
+    "4": {
+      "parent_wall_mean_ms": 2.775,
+      "candidate_wall_mean_ms": 4.9878,
+      "candidate_parent_ratio": 1.7974,
+      "parent_profile_sha256": "sha256:b7bc00e0a17e955eba1ef05c0a88babba6cf4474008aca59c690a1ddbeddb5f3",
+      "candidate_profile_sha256": "sha256:c713f61df5ca2f23f2ed31428d8e8d34194eff7ece5cca0153addc13b7e941a9"
+    },
+    "8": {
+      "parent_wall_mean_ms": 3.6406,
+      "candidate_wall_mean_ms": 5.929,
+      "candidate_parent_ratio": 1.6286,
+      "parent_profile_sha256": "sha256:2ef04b09636710aeb9f69bb90927424be35462de24740fef9ef735d0a01f20af",
+      "candidate_profile_sha256": "sha256:9da485fcc58435024fc92cc23e1c6e49289872babd59ca9c507edc53bb4c645c"
+    },
+    "12": {
+      "parent_wall_mean_ms": 4.2889,
+      "candidate_wall_mean_ms": 6.5454,
+      "candidate_parent_ratio": 1.5261,
+      "parent_profile_sha256": "sha256:7c07d02fa70252e364383a6ad2d4ecf4385775ede4a36fba5f5e6bc294d58346",
+      "candidate_profile_sha256": "sha256:3faf471a5c37b65e19eb9a84ce3b4198b5c195f2d215b98d6ded5ac1ded5f246"
+    },
+    "48": {
+      "parent_wall_mean_ms": 11.0296,
+      "candidate_wall_mean_ms": 13.6078,
+      "candidate_parent_ratio": 1.2338,
+      "parent_profile_sha256": "sha256:1065c23c4e83eade48b2adf1624145eb68142768e3a305a68e279b417009f79b",
+      "candidate_profile_sha256": "sha256:bf5b108ecc07cf7683c09f9a23b0b10fecd0c7455f0759667f57f22acf4d90a5"
+    }
+  },
+  "causal_interpretation": {
+    "search_shape_drift_explains_cost": false,
+    "dominant_fixed_cost": "dense generic relation construction at each forward",
+    "selection": "reject_current_topology_target_gather_on_cost_adjusted_evidence",
+    "contract_repair": "require operational batch-1 and D6 batch-12 no-Q profiles; retain batch-48 only as optional throughput telemetry"
+  }
+}

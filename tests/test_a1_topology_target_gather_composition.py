@@ -192,7 +192,9 @@ def test_completion_requires_exact_three_optimizer_groups(tmp_path: Path) -> Non
         completion._verify_optimizer_groups(path, optimizer_steps=128)
 
 
-def _inference_profile(checkpoint: Path, *, milliseconds: float) -> dict:
+def _inference_profile(
+    checkpoint: Path, *, milliseconds: float, batch_size: int = 1
+) -> dict:
     summary = {
         "mean": milliseconds,
         "median": milliseconds,
@@ -213,14 +215,14 @@ def _inference_profile(checkpoint: Path, *, milliseconds: float) -> dict:
             "autocast": False,
         },
         "shape": {
-            "batch_size": 48,
+            "batch_size": batch_size,
             "legal_width": 54,
             "event_width": 0,
             "valid_players": 2,
         },
         "warmup": 20,
         "iterations": 100,
-        "return_q": True,
+        "return_q": False,
         "exact_window": {"cuda_ms": summary, "wall_ms": summary},
         "exact_vs_attributed_output_parity": {
             "logits": {"max_abs": 0.0, "mean_abs": 0.0},
@@ -241,14 +243,23 @@ def test_inference_cost_telemetry_is_mandatory_and_matched(tmp_path: Path) -> No
         **arm._file_ref(candidate),
         "size_bytes": candidate.stat().st_size,
     }
-    (tmp_path / "reference-inference-profile.json").write_text(
-        json.dumps(_inference_profile(reference, milliseconds=2.0)),
-        encoding="utf-8",
-    )
-    (tmp_path / "candidate-inference-profile.json").write_text(
-        json.dumps(_inference_profile(candidate, milliseconds=3.0)),
-        encoding="utf-8",
-    )
+    for batch_size in (1, 12):
+        (tmp_path / f"reference-inference-profile.b{batch_size}.json").write_text(
+            json.dumps(
+                _inference_profile(
+                    reference, milliseconds=2.0, batch_size=batch_size
+                )
+            ),
+            encoding="utf-8",
+        )
+        (tmp_path / f"candidate-inference-profile.b{batch_size}.json").write_text(
+            json.dumps(
+                _inference_profile(
+                    candidate, milliseconds=3.0, batch_size=batch_size
+                )
+            ),
+            encoding="utf-8",
+        )
     verified = {
         "output_root": tmp_path,
         "manifest": {
@@ -259,15 +270,63 @@ def test_inference_cost_telemetry_is_mandatory_and_matched(tmp_path: Path) -> No
         },
     }
     telemetry = completion._inference_cost_telemetry(verified, candidate=candidate_ref)
-    assert telemetry["candidate_reference_ratios"]["cuda_mean_slowdown"] == 1.5
+    operational = telemetry["required_profiles"]["operational_b1"]
+    assert operational["candidate_reference_ratios"]["cuda_mean_slowdown"] == 1.5
+    assert set(telemetry["required_profiles"]) == {"operational_b1", "d6_b12"}
+    assert telemetry["optional_profiles"] == {}
     assert telemetry["selection_cost_observed"] is True
 
-    bad = _inference_profile(candidate, milliseconds=3.0)
+    bad = _inference_profile(candidate, milliseconds=3.0, batch_size=12)
     bad["shape"]["batch_size"] = 32
-    (tmp_path / "candidate-inference-profile.json").write_text(
+    (tmp_path / "candidate-inference-profile.b12.json").write_text(
         json.dumps(bad), encoding="utf-8"
     )
     with pytest.raises(completion.CompletionError, match="environment drift"):
+        completion._inference_cost_telemetry(verified, candidate=candidate_ref)
+
+
+def test_inference_cost_telemetry_rejects_missing_operational_envelope(
+    tmp_path: Path,
+) -> None:
+    reference = tmp_path / "parent.pt"
+    candidate = tmp_path / "candidate.pt"
+    reference.write_bytes(b"parent")
+    candidate.write_bytes(b"candidate")
+    reference_ref = arm._file_ref(reference)
+    candidate_ref = {
+        **arm._file_ref(candidate),
+        "size_bytes": candidate.stat().st_size,
+    }
+    # A historically accepted throughput-only b48 profile must not satisfy the
+    # latency-sensitive architecture selection contract.
+    for label, checkpoint in (("reference", reference), ("candidate", candidate)):
+        (tmp_path / f"{label}-inference-profile.b48.json").write_text(
+            json.dumps(
+                _inference_profile(checkpoint, milliseconds=2.0, batch_size=48)
+            ),
+            encoding="utf-8",
+        )
+    verified = {
+        "output_root": tmp_path,
+        "manifest": {
+            "inference_cost_contract": {
+                **arm.INFERENCE_COST_CONTRACT,
+                "reference_checkpoint": reference_ref,
+            }
+        },
+    }
+    with pytest.raises((completion.CompletionError, FileNotFoundError, OSError)):
+        completion._inference_cost_telemetry(verified, candidate=candidate_ref)
+
+    old_contract = {
+        **arm.INFERENCE_COST_CONTRACT,
+        "schema_version": "a1-architecture-inference-cost-contract-v1",
+        "matched_shape": arm.INFERENCE_COST_CONTRACT["required_profiles"][
+            "operational_b1"
+        ],
+    }
+    verified["manifest"]["inference_cost_contract"] = old_contract
+    with pytest.raises(completion.CompletionError, match="operational"):
         completion._inference_cost_telemetry(verified, candidate=candidate_ref)
 
 
