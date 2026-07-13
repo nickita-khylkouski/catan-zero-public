@@ -36,3 +36,8 @@ belief-level completed-Q aggregation: `sigma_reference_visits` calibration,
 root-perspective completed-Q evidence, and the fail-closed
 `gumbel_search_capabilities()` advertisement. Version `0.1.5` wheels must not be
 used for this operator even if they expose the older `gumbel_search` entry point.
+
+Version `0.1.7` adds `initial_road_d1_scope`. Python attests the authoritative
+public root prompt once, the binding carries that immutable prompt into native
+search, and Rust applies D1 only at the `BUILD_INITIAL_ROAD` decision root.
+Interior nodes and every other phase retain the historical min-max operator.

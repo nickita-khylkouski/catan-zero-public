@@ -202,6 +202,21 @@ def test_native_config_maps_sigma_reference_visits() -> None:
     assert search._native_config()["sigma_reference_visits"] == 12
 
 
+def test_native_config_binds_authoritative_initial_road_d1_scope() -> None:
+    search = object.__new__(NativeGumbelChanceMCTS)
+    search.config = GumbelChanceMCTSConfig(
+        rescale_noise_floor_c=8.0,
+        rescale_noise_floor_initial_road_only=True,
+    )
+    search.rng = random.Random(7)
+
+    native = search._native_config(attested_root_phase="BUILD_INITIAL_ROAD")
+    assert native["rescale_noise_floor_initial_road_only"] is True
+    assert native["attested_root_phase"] == "BUILD_INITIAL_ROAD"
+    with pytest.raises(RuntimeError, match="authoritative root-phase attestation"):
+        search._native_config()
+
+
 def test_native_and_python_share_exact_belief_gameplay_aggregator() -> None:
     # Native owns only per-particle traversal. Public-belief aggregation and
     # action selection remain the inherited Python source of truth.
@@ -220,6 +235,72 @@ def test_native_sigma_reference_refuses_unadvertised_old_wheel(monkeypatch) -> N
 
     with pytest.raises(ValueError, match="advertising the matching calibration"):
         search._validate_native_semantics()
+
+
+def test_native_initial_road_d1_refuses_unadvertised_old_wheel(monkeypatch) -> None:
+    rust = pytest.importorskip("catanatron_rs")
+    monkeypatch.setattr(
+        rust,
+        "gumbel_search_capabilities",
+        lambda: ["sigma_reference_visits", "belief_target_evidence"],
+        raising=False,
+    )
+    search = object.__new__(NativeGumbelChanceMCTS)
+    search.config = GumbelChanceMCTSConfig(
+        rescale_noise_floor_c=8.0,
+        rescale_noise_floor_initial_road_only=True,
+    )
+    search.using_native_hot_loop = True
+
+    with pytest.raises(ValueError, match="initial_road_d1_scope"):
+        search._validate_native_semantics()
+
+
+def test_initial_road_d1_is_exact_off_phase_in_python_and_native() -> None:
+    rust = pytest.importorskip("catanatron_rs")
+    capability_fn = getattr(rust, "gumbel_search_capabilities", None)
+    capabilities = set(capability_fn()) if callable(capability_fn) else set()
+    if "initial_road_d1_scope" not in capabilities:
+        pytest.skip("installed wheel lacks initial_road_d1_scope")
+
+    game = rust.Game.simple(["RED", "BLUE"], seed=83)
+    for _ in range(12):
+        prompt = json.loads(game.json_snapshot())["current_prompt"]
+        if prompt == "PLAY_TURN":
+            break
+        legal = game.playable_action_indices(["RED", "BLUE"], None)
+        game.execute_action_index(legal[0], ["RED", "BLUE"], None)
+    else:
+        pytest.fail("did not reach an ordinary PLAY_TURN root")
+
+    plain = GumbelChanceMCTSConfig(
+        seed=89,
+        n_full=32,
+        n_fast=32,
+        p_full=1.0,
+        exact_budget_sh=True,
+        max_depth=4,
+    )
+    scoped = GumbelChanceMCTSConfig(
+        seed=89,
+        n_full=32,
+        n_fast=32,
+        p_full=1.0,
+        exact_budget_sh=True,
+        max_depth=4,
+        rescale_noise_floor_c=8.0,
+        sigma_eval=0.98,
+        rescale_noise_floor_initial_road_only=True,
+    )
+
+    for engine in (GumbelChanceMCTS, NativeGumbelChanceMCTS):
+        reference = engine(plain, _PublicCountingEvaluator()).search(
+            game.copy(), force_full=True
+        )
+        candidate = engine(scoped, _PublicCountingEvaluator()).search(
+            game.copy(), force_full=True
+        )
+        assert candidate == reference
 
 
 def test_native_belief_target_refuses_wheel_without_evidence_capability(

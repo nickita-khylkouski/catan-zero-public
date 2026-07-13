@@ -51,7 +51,7 @@ class _SampledGame:
         return 7
 
     def json_snapshot(self) -> str:
-        return json.dumps({"current_prompt": self.prompt})
+        raise AssertionError("hidden-world particle phase must not be inspected")
 
 
 def _mcts(*, particles: int = 4, n_full: int = 128) -> GumbelChanceMCTS:
@@ -66,6 +66,7 @@ def _mcts(*, particles: int = 4, n_full: int = 128) -> GumbelChanceMCTS:
     )
     mcts.evaluator = SimpleNamespace(config=SimpleNamespace(public_observation=True))
     mcts.rng = random.Random(mcts.config.seed)
+    mcts.attested_root_phases = []
 
     def fetch(_self, _game):
         return (11, 12), {11: ["RED", "A", None], 12: ["RED", "B", None]}, {}
@@ -76,9 +77,11 @@ def _mcts(*, particles: int = 4, n_full: int = 128) -> GumbelChanceMCTS:
         *,
         force_full=None,
         n_simulations_override=None,
+        attested_root_phase=None,
     ):
         assert isinstance(game, _SampledGame)
         assert force_full in {True, False}
+        mcts.attested_root_phases.append(attested_root_phase)
         budget = int(n_simulations_override)
         # Particle-dependent but authoritative-truth-independent evidence.
         p11 = 0.25 + (game.seed % 100) / 1000.0
@@ -142,7 +145,7 @@ def test_information_set_forwards_attested_public_phase_to_belief_aggregation() 
     assert observed == ["BUILD_INITIAL_ROAD"]
 
 
-def test_information_set_fails_closed_if_particle_phase_changes() -> None:
+def test_information_set_never_reads_phase_from_hidden_world_particle() -> None:
     class _BadPhaseGame(_AuthoritativeGame):
         def determinize_for_player(self, observer: str, seed: int) -> _SampledGame:
             assert observer == "RED"
@@ -154,11 +157,11 @@ def test_information_set_fails_closed_if_particle_phase_changes() -> None:
         rescale_noise_floor_c=8.0,
         rescale_noise_floor_initial_road_only=True,
     )
-    with pytest.raises(RuntimeError, match="changed the attested root phase"):
-        mcts.search(
-            _BadPhaseGame("opponent has KNIGHT", "BUILD_INITIAL_ROAD"),
-            force_full=True,
-        )
+    mcts.search(
+        _BadPhaseGame("opponent has KNIGHT", "BUILD_INITIAL_ROAD"),
+        force_full=True,
+    )
+    assert mcts.attested_root_phases == ["BUILD_INITIAL_ROAD"] * 4
 
 
 def test_information_set_particles_share_one_exact_total_budget() -> None:

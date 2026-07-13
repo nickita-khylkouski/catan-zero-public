@@ -208,7 +208,12 @@ class _ParticleSearch(GumbelChanceMCTS):
         return (1, 2), {}, {}
 
     def _search_single_world(
-        self, game, *, force_full=None, n_simulations_override=None
+        self,
+        game,
+        *,
+        force_full=None,
+        n_simulations_override=None,
+        attested_root_phase=None,
     ):
         p = float(game.particle_value)
         simulations = (

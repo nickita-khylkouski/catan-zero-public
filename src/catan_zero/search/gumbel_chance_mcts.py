@@ -90,6 +90,7 @@ DEVELOPMENT_CARDS: tuple[str, ...] = (
 )
 
 _BATCH_API_AVAILABLE: bool | None = None
+_UNATTESTED_ROOT_PHASE = object()
 
 
 def batch_api_available() -> bool:
@@ -955,6 +956,26 @@ class GumbelChanceMCTS:
             )
         return phase
 
+    def _resolve_d1_root_phase(
+        self,
+        game: Any,
+        attested_root_phase: str | None | object,
+    ) -> str | None:
+        """Use an authoritative public-phase attestation when one is supplied.
+
+        Information-set search must not re-read phase from a hidden-world
+        particle. The authoritative root attests once and passes that immutable
+        public value through every particle search. Direct authoritative search
+        retains the historical behavior of attesting its own root here.
+        """
+        if attested_root_phase is _UNATTESTED_ROOT_PHASE:
+            return self._phase_gated_d1_root_phase(game)
+        if attested_root_phase is None:
+            return None
+        if not isinstance(attested_root_phase, str) or not attested_root_phase:
+            raise RuntimeError("attested D1 root phase must be a non-empty string")
+        return attested_root_phase
+
     # ------------------------------------------------------------------
     # Public search entry point.
     # ------------------------------------------------------------------
@@ -1058,12 +1079,6 @@ class GumbelChanceMCTS:
         results: list[SearchResult] = []
         for particle_index, particle_seed in enumerate(particle_seeds):
             sampled = game.determinize_for_player(root_color, int(particle_seed))
-            sampled_phase = self._phase_gated_d1_root_phase(sampled)
-            if sampled_phase != root_phase:
-                raise RuntimeError(
-                    "public-belief determinization changed the attested root phase: "
-                    f"authoritative={root_phase!r} sampled={sampled_phase!r}"
-                )
             sampled_legal, _sampled_actions, _sampled_spectra = self._fetch_legal_actions(
                 sampled
             )
@@ -1078,6 +1093,7 @@ class GumbelChanceMCTS:
                     sampled,
                     force_full=use_full,
                     n_simulations_override=budgets[particle_index],
+                    attested_root_phase=root_phase,
                 )
             )
         return self._aggregate_information_set_results(
@@ -1318,6 +1334,7 @@ class GumbelChanceMCTS:
         *,
         force_full: bool | None = None,
         n_simulations_override: int | None = None,
+        attested_root_phase: str | None | object = _UNATTESTED_ROOT_PHASE,
     ) -> SearchResult:
         root_color = str(game.current_color())
         legal_actions, action_json_by_id, spectrum_by_id = self._fetch_legal_actions(game)
@@ -1361,7 +1378,7 @@ class GumbelChanceMCTS:
         root = _GNode(
             game=game.copy(),
             root_color=root_color,
-            root_phase=self._phase_gated_d1_root_phase(game),
+            root_phase=self._resolve_d1_root_phase(game, attested_root_phase),
         )
         self._expand(root, at_root=True)
         priors = {action_id: stats.prior for action_id, stats in root.actions.items()}

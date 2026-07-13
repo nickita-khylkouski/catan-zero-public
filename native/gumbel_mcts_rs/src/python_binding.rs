@@ -273,6 +273,27 @@ fn gumbel_search(
     if let Some(v) = config_dict.get_item("rescale_noise_floor_c")? {
         config.rescale_noise_floor_c = v.extract()?;
     }
+    if let Some(v) = config_dict.get_item("rescale_noise_floor_initial_road_only")? {
+        config.rescale_noise_floor_initial_road_only = v.extract()?;
+    }
+    if let Some(v) = config_dict.get_item("attested_root_phase")? {
+        if !v.is_none() {
+            let phase: String = v.extract()?;
+            if phase.is_empty() {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "attested_root_phase must be a non-empty string",
+                ));
+            }
+            config.attested_root_phase = Some(phase);
+        }
+    }
+    if config.rescale_noise_floor_initial_road_only
+        && config.attested_root_phase.is_none()
+    {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "initial-road-only D1 requires attested_root_phase",
+        ));
+    }
     if let Some(v) = config_dict.get_item("sigma_eval")? {
         config.sigma_eval = v.extract()?;
     }
@@ -382,7 +403,11 @@ fn gumbel_search(
 
 #[pyfunction]
 fn gumbel_search_capabilities() -> Vec<&'static str> {
-    vec!["sigma_reference_visits", "belief_target_evidence"]
+    vec![
+        "sigma_reference_visits",
+        "belief_target_evidence",
+        "initial_road_d1_scope",
+    ]
 }
 
 pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {

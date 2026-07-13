@@ -95,6 +95,13 @@ pub struct SearchConfig {
     pub root_candidate_cap: Option<usize>,
     pub policy_target_min_visits: i32,
     pub rescale_noise_floor_c: f64,
+    /// Apply D1 only at the attested BUILD_INITIAL_ROAD decision root.
+    /// Interior nodes and every other public root keep historical min-max Q.
+    pub rescale_noise_floor_initial_road_only: bool,
+    /// Public root prompt attested by the authoritative Python orchestration
+    /// layer. Information-set particles must never supply this from their
+    /// sampled hidden-world state.
+    pub attested_root_phase: Option<String>,
     pub sigma_eval: f64,
     pub variance_aware_q: bool,
     pub variance_aware_k: f64,
@@ -137,6 +144,8 @@ impl Default for SearchConfig {
             root_candidate_cap: None,
             policy_target_min_visits: 0,
             rescale_noise_floor_c: 0.0,
+            rescale_noise_floor_initial_road_only: false,
+            attested_root_phase: None,
             sigma_eval: 0.79,
             variance_aware_q: false,
             variance_aware_k: 1.0,
@@ -354,6 +363,18 @@ impl GumbelMctsEngine {
         evaluator: &mut E,
         force_full: Option<bool>,
     ) -> Result<SearchResult, String> {
+        if self.config.rescale_noise_floor_initial_road_only
+            && self
+                .config
+                .attested_root_phase
+                .as_deref()
+                .map_or(true, str::is_empty)
+        {
+            return Err(
+                "initial-road-only D1 requires a non-empty authoritative root-phase attestation"
+                    .into(),
+            );
+        }
         let root_color = game.state.current_color();
         self.root_turn = game.state.num_turns;
         let legal_actions = generate_playable_actions(&game.state);
@@ -1116,6 +1137,12 @@ impl GumbelMctsEngine {
         if c <= 0.0 || rescaled.is_empty() {
             return rescaled.clone();
         }
+        if self.config.rescale_noise_floor_initial_road_only
+            && (node_idx != 0
+                || self.config.attested_root_phase.as_deref() != Some("BUILD_INITIAL_ROAD"))
+        {
+            return rescaled.clone();
+        }
         let values: Vec<f64> = cq.values().copied().collect();
         let raw_spread = values.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b))
             - values.iter().fold(f64::INFINITY, |a, &b| a.min(b));
@@ -1484,6 +1511,67 @@ mod tests {
         close(calibrated_sigma_scale(50.0, 0.1, 32, None), 8.2);
         close(calibrated_sigma_scale(50.0, 0.1, 8, Some(12)), 6.2);
         close(calibrated_sigma_scale(50.0, 0.1, 32, Some(12)), 6.2);
+    }
+
+    #[test]
+    fn initial_road_d1_is_root_only_and_exact_off_phase() {
+        let game = opening(3);
+        let mut node = Node::new(game, Color::Red);
+        let mut first = ActionStats::new(0.5);
+        first.visits = 4;
+        let mut second = ActionStats::new(0.5);
+        second.visits = 4;
+        node.actions.insert(0, first);
+        node.actions.insert(1, second);
+        let mut arena = Arena::new();
+        let root_idx = arena.alloc(node.clone());
+        let interior_idx = arena.alloc(node);
+        assert_eq!(root_idx, 0);
+        assert_eq!(interior_idx, 1);
+        let completed_q = HashMap::from([(0, 0.400004), (1, 0.399996)]);
+
+        let plain =
+            GumbelMctsEngine::new(SearchConfig::default()).rescale_completed_q(&completed_q);
+        let road = GumbelMctsEngine::new(SearchConfig {
+            rescale_noise_floor_c: 8.0,
+            sigma_eval: 0.98,
+            rescale_noise_floor_initial_road_only: true,
+            attested_root_phase: Some("BUILD_INITIAL_ROAD".to_string()),
+            ..Default::default()
+        });
+        let play = GumbelMctsEngine::new(SearchConfig {
+            rescale_noise_floor_c: 8.0,
+            sigma_eval: 0.98,
+            rescale_noise_floor_initial_road_only: true,
+            attested_root_phase: Some("PLAY_TURN".to_string()),
+            ..Default::default()
+        });
+
+        assert_ne!(
+            road.rescaled_completed_q_with_noise(&arena, root_idx, &completed_q),
+            plain
+        );
+        assert_eq!(
+            road.rescaled_completed_q_with_noise(&arena, interior_idx, &completed_q),
+            plain
+        );
+        assert_eq!(
+            play.rescaled_completed_q_with_noise(&arena, root_idx, &completed_q),
+            plain
+        );
+    }
+
+    #[test]
+    fn initial_road_d1_fails_closed_without_authoritative_attestation() {
+        let config = SearchConfig {
+            rescale_noise_floor_c: 8.0,
+            rescale_noise_floor_initial_road_only: true,
+            ..Default::default()
+        };
+        let error = GumbelMctsEngine::new(config)
+            .search(&opening(5), &mut CountingEvaluator::default(), Some(true))
+            .unwrap_err();
+        assert!(error.contains("authoritative root-phase attestation"));
     }
     use catanatron_rs::{Coordinate, Player};
 

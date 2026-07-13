@@ -14,6 +14,7 @@ from catan_zero.search.gumbel_chance_mcts import (
     GumbelChanceMCTS,
     GumbelChanceMCTSConfig,
     SearchResult,
+    _UNATTESTED_ROOT_PHASE,
     _matches_explicit_or_legacy_width_gate,
 )
 
@@ -58,6 +59,19 @@ class NativeGumbelChanceMCTS(GumbelChanceMCTS):
             unsupported.append("use_batch_api=False")
         if bool(self.config.uncertainty_backup_weighting):
             unsupported.append("uncertainty_backup_weighting=True")
+        if (
+            self.using_native_hot_loop
+            and bool(self.config.rescale_noise_floor_initial_road_only)
+        ):
+            import catanatron_rs  # type: ignore
+
+            capability_fn = getattr(catanatron_rs, "gumbel_search_capabilities", None)
+            capabilities = set(capability_fn()) if callable(capability_fn) else set()
+            if "initial_road_d1_scope" not in capabilities:
+                unsupported.append(
+                    "rescale_noise_floor_initial_road_only requires a native wheel "
+                    "advertising initial_road_d1_scope"
+                )
         if self.using_native_hot_loop and self.config.sigma_reference_visits is not None:
             import catanatron_rs  # type: ignore
 
@@ -95,7 +109,10 @@ class NativeGumbelChanceMCTS(GumbelChanceMCTS):
             )
 
     def _native_config(
-        self, *, n_simulations_override: int | None = None
+        self,
+        *,
+        n_simulations_override: int | None = None,
+        attested_root_phase: str | None = None,
     ) -> dict[str, Any]:
         config = self.config
         values = {
@@ -141,6 +158,16 @@ class NativeGumbelChanceMCTS(GumbelChanceMCTS):
             # identically seeded search objects but distinct within one run.
             seed=self.rng.getrandbits(64),
         )
+        values["rescale_noise_floor_initial_road_only"] = bool(
+            config.rescale_noise_floor_initial_road_only
+        )
+        if bool(config.rescale_noise_floor_initial_road_only):
+            if not isinstance(attested_root_phase, str) or not attested_root_phase:
+                raise RuntimeError(
+                    "native initial-road-only D1 requires an authoritative root-phase "
+                    "attestation"
+                )
+            values["attested_root_phase"] = attested_root_phase
         for optional in (
             "n_full_wide",
             "n_full_wide_threshold",
@@ -170,12 +197,14 @@ class NativeGumbelChanceMCTS(GumbelChanceMCTS):
         *,
         force_full: bool | None = None,
         n_simulations_override: int | None = None,
+        attested_root_phase: str | None | object = _UNATTESTED_ROOT_PHASE,
     ) -> SearchResult:
         if not self.using_native_hot_loop:
             return super()._search_single_world(
                 game,
                 force_full=force_full,
                 n_simulations_override=n_simulations_override,
+                attested_root_phase=attested_root_phase,
             )
 
         import catanatron_rs  # type: ignore
@@ -223,10 +252,14 @@ class NativeGumbelChanceMCTS(GumbelChanceMCTS):
                     native_game, tuple(legal), root_color=root_color, colors=colors
                 )
 
+        root_phase = self._resolve_d1_root_phase(game, attested_root_phase)
         raw = catanatron_rs.gumbel_search(
             game,
             evaluate,
-            self._native_config(n_simulations_override=n_simulations_override),
+            self._native_config(
+                n_simulations_override=n_simulations_override,
+                attested_root_phase=root_phase,
+            ),
             evaluator_many=evaluate_many,
             root_evaluator=root_evaluator,
             force_full=force_full,
