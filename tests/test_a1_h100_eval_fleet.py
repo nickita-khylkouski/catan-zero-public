@@ -856,7 +856,9 @@ def test_same_checkpoint_adaptive_n256_s3_plan_is_exact_and_fail_closed(
     assert argv[argv.index("--candidate-n-full-wide") + 1] == "256"
     assert argv[argv.index("--candidate-n-full-wide-threshold") + 1] == "40"
     assert "--baseline-n-full-wide" not in argv
-    assert argv.count("--wide-roots-always-full") == 1
+    assert argv.count("--candidate-wide-roots-always-full") == 1
+    assert "--wide-roots-always-full" not in argv
+    assert "--baseline-wide-roots-always-full" not in argv
 
     plan_path = tmp_path / "s3-plan.json"
     fleet.write_new_readonly(plan_path, diagnostic)

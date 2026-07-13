@@ -833,7 +833,8 @@ def test_role_specific_wide_budget_overrides_only_candidate():
         baseline_n_full=128,
         candidate_n_full_wide=256,
         candidate_n_full_wide_threshold=40,
-        wide_roots_always_full=True,
+        candidate_wide_roots_always_full=True,
+        baseline_wide_roots_always_full=False,
     )
     budgets = _resolve_search_budgets(worker_args)
 
@@ -843,6 +844,7 @@ def test_role_specific_wide_budget_overrides_only_candidate():
         n_full=int(budgets["candidate_n_full"]),
         n_full_wide=budgets["candidate_n_full_wide"],
         n_full_wide_threshold=budgets["candidate_n_full_wide_threshold"],
+        wide_roots_always_full=budgets["candidate_wide_roots_always_full"],
     )
     baseline = _build_search_config(
         worker_args,
@@ -850,6 +852,7 @@ def test_role_specific_wide_budget_overrides_only_candidate():
         n_full=int(budgets["baseline_n_full"]),
         n_full_wide=budgets["baseline_n_full_wide"],
         n_full_wide_threshold=budgets["baseline_n_full_wide_threshold"],
+        wide_roots_always_full=budgets["baseline_wide_roots_always_full"],
     )
 
     assert candidate.n_full == baseline.n_full == 128
@@ -858,7 +861,7 @@ def test_role_specific_wide_budget_overrides_only_candidate():
     assert candidate.wide_roots_always_full is True
     assert baseline.n_full_wide is None
     assert baseline.n_full_wide_threshold is None
-    assert baseline.wide_roots_always_full is True
+    assert baseline.wide_roots_always_full is False
 
 
 def test_shared_wide_budget_is_backward_compatible_fallback():
@@ -870,6 +873,8 @@ def test_shared_wide_budget_is_backward_compatible_fallback():
         "baseline_n_full_wide": 512,
         "candidate_n_full_wide_threshold": None,
         "baseline_n_full_wide_threshold": None,
+        "candidate_wide_roots_always_full": False,
+        "baseline_wide_roots_always_full": False,
     }
 
 
