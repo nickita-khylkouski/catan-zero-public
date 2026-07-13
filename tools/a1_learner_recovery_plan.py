@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Emit the sealed, non-launching A1 learner-recovery experiment matrix.
+"""Decode the obsolete full-dose A1 learner-recovery experiment matrix.
 
 This tool deliberately does not accept ``--go``.  It converts a measured B200
 batch topology into sample-matched optimizer-step counts and records the exact
@@ -16,9 +16,15 @@ import math
 from typing import Any, Sequence
 
 
-SCHEMA = "a1-learner-recovery-plan-v1"
+LEGACY_SCHEMA = "a1-learner-recovery-plan-v1"
+SCHEMA = "a1-learner-recovery-plan-v2-obsolete-dose"
 SENTINEL_SAMPLES = 4_194_304
 ESCALATED_SAMPLES = 8_388_608
+OBSOLETE_REASON = (
+    "historical recovery matrix starts at 4,194,304 rows and changes multiple "
+    "stale recipe axes; it cannot authorize a run after the 524,288-row Pareto "
+    "selection"
+)
 
 
 def _canonical_sha(value: Any) -> str:
@@ -158,6 +164,8 @@ def build_plan(*, world_size: int, local_batch_size: int, grad_accum_steps: int)
         "diagnostic_only": True,
         "promotion_eligible": False,
         "launch_authorized": False,
+        "historical_only": True,
+        "obsolete_reason": OBSOLETE_REASON,
         "topology": common,
         "sample_doses": {
             "sentinel": SENTINEL_SAMPLES,

@@ -124,12 +124,32 @@ def _rewrite(path: Path, mutate) -> None:
     path.write_text(json.dumps(value), encoding="utf-8")
 
 
+def _convert_to_legacy_manifest(path: Path) -> dict:
+    value = json.loads(path.read_text(encoding="utf-8"))
+    value["schema_version"] = gather.LEGACY_MANIFEST_SCHEMA
+    value["diagnostic_only"] = False
+    value["production_eligible"] = True
+    value["launch_authorized"] = True
+    value.pop("historical_only")
+    value.pop("obsolete_reason")
+    value["repo_binding"]["files"].pop("tools/a1_learner_dose_contract.py")
+    value.pop("manifest_sha256")
+    value["manifest_sha256"] = gather.base._digest(value)  # noqa: SLF001
+    path.chmod(0o600)
+    path.write_text(json.dumps(value), encoding="utf-8")
+    return value
+
+
 def test_prepares_and_replays_exact_four_rank_adapter_operator(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     manifest, path = _fixture(tmp_path, monkeypatch)
     assert manifest["operator"]["global_base_draws"] == 4_194_304
     assert manifest["operator"]["optimizer_steps"] == 2048
+    assert manifest["schema_version"] == gather.MANIFEST_SCHEMA
+    assert manifest["historical_only"] is True
+    assert manifest["launch_authorized"] is False
+    assert manifest["production_eligible"] is False
     assert manifest["operator"]["current_fraction"] == 0.8
     assert manifest["operator"]["exact_predecessor_replay_fraction"] == 0.2
     assert manifest["corpus_producer"] != manifest["learner_source_incumbent"]
@@ -207,6 +227,33 @@ def test_selected_idle_probe_ignores_nonselected_gpu_processes() -> None:
     assert gather._idle_selected_b200s((4, 5, 6, 7), runner=runner) == [  # noqa: SLF001
         "gpu=5,pid=505,process=train_bc.py"
     ]
+
+
+def test_historical_full_dose_operator_refuses_new_execution_before_side_effects(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manifest, path = _fixture(tmp_path, monkeypatch)
+    root = Path(manifest["output_root"])
+    calls = {"idle": 0, "runner": 0}
+
+    def idle_probe() -> list[str]:
+        calls["idle"] += 1
+        return []
+
+    def runner(*_args, **_kwargs):
+        calls["runner"] += 1
+        raise AssertionError("systemd submission must not run")
+
+    with pytest.raises(gather.GatherRetrainError, match="superseded 4,194,304-row"):
+        gather.execute(
+            path,
+            unit="historical-gather",
+            idle_probe=idle_probe,
+            runner=runner,
+        )
+
+    assert calls == {"idle": 0, "runner": 0}
+    assert not root.exists()
 
 
 def test_rejects_semantically_rehashed_geometry_command_and_identity_tampering(
@@ -357,7 +404,8 @@ def _completion_outputs(manifest: dict, path: Path, *, unit: str) -> Path:
 def test_finalize_binds_exact_progress_rng_and_fresh_optimizer(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    manifest, path = _fixture(tmp_path, monkeypatch)
+    _, path = _fixture(tmp_path, monkeypatch)
+    manifest = _convert_to_legacy_manifest(path)
     unit = "a1-gather-test"
     progress_path = _completion_outputs(manifest, path, unit=unit)
     monkeypatch.setattr(
@@ -377,12 +425,13 @@ def test_finalize_binds_exact_progress_rng_and_fresh_optimizer(
 def test_finalize_binds_aux64_dose(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    manifest, path = _fixture(
+    _, path = _fixture(
         tmp_path,
         monkeypatch,
         policy_aux_active_batch_size=64,
         visible_devices=gather.AUX64_VISIBLE_DEVICES,
     )
+    manifest = _convert_to_legacy_manifest(path)
     unit = "a1-gather-aux64-test"
     _completion_outputs(manifest, path, unit=unit)
     monkeypatch.setattr(
@@ -403,7 +452,8 @@ def test_finalize_binds_aux64_dose(
 def test_finalize_rejects_rehashed_progress_geometry_tamper(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    manifest, path = _fixture(tmp_path, monkeypatch)
+    _, path = _fixture(tmp_path, monkeypatch)
+    manifest = _convert_to_legacy_manifest(path)
     unit = "a1-gather-test"
     progress_path = _completion_outputs(manifest, path, unit=unit)
     monkeypatch.setattr(
