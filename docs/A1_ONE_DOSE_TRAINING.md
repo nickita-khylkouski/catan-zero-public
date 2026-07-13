@@ -10,13 +10,17 @@ current operator decision is global `n_full=128`; n64 and blanket n196/n256 are
 refused. `p_full` remains whatever the sealed search contract selected—the
 learner does not infer or change it.
 
-The bound learner is one direct process on one selected B200: world size 1,
-global batch 4096, one epoch, scalar MSE, fresh unfused Adam, LR `3e-5`, value
-head LR multiplier `.3`, and no optimizer-state resume. Every other active or
-disabled learner field comes from the exact recipe inside the seal and is
-rechecked independently by `train_bc` before optimizer construction.
+The historical topology is one direct process on one selected B200. The
+current production topology is one eight-B200 host under DDP at local batch
+512 per rank. Both realize global batch 4096, one epoch, scalar MSE, fresh
+unfused Adam, LR `3e-5`, value-head LR multiplier `.3`, and no optimizer-state
+resume. DDP ranks slice one shared weighted global draw; they do not each draw
+a dose and do not shard the memmap. Every other active or disabled learner
+field comes from the exact recipe inside the seal and is rechecked
+independently by `train_bc` before optimizer construction.
 
-First run the default verified dry run:
+Historical ordinary A1 memmaps retain their immutable external validation
+manifest and one-GPU command:
 
 ```bash
 python tools/a1_one_dose_train.py \
@@ -34,6 +38,35 @@ Inspect the printed command and hashes. Add `--go` only on the chosen B200.
 `CUDA_VISIBLE_DEVICES`, raises the child file-descriptor limit, and executes
 without `torchrun`. Output paths must be fresh.
 
+Current promotion composites carry exact 64/12/4/20 source sampling and create
+their own component-aware whole-game validation split, so passing the legacy
+manifest is forbidden. Before rendering an eight-GPU dose, run the tiny
+non-promotable NCCL/sampler canary on the same host and exact checkout:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+  python -m torch.distributed.run --standalone --nproc_per_node=8 \
+  tools/a1_ddp_epoch_canary.py \
+  --out /absolute/fresh/output/ddp-canary.json
+
+python tools/a1_one_dose_train.py \
+  --lock /absolute/path/a1.lock.json \
+  --data /absolute/path/production-composite.json \
+  --checkpoint /absolute/fresh/output/candidate.pt \
+  --report /absolute/fresh/output/report.json \
+  --receipt /absolute/fresh/output/training.receipt.json \
+  --topology b200-8gpu-ddp \
+  --ddp-canary-receipt /absolute/fresh/output/ddp-canary.json \
+  --gpu 0
+```
+
+The executor accepts only an hour-fresh receipt from the same hostname and
+exact canary/`train_bc` bytes. It proves eight distinct B200 identities, NCCL
+CUDA all-reduce, independent rank-offset dropout RNG, and exact interleaving of
+rank slices back into one padded global draw. After review, add `--go`; the
+executor locks and probes all eight physical GPUs, pins all eight in one child
+environment, and uses `torchrun --nproc_per_node=8`.
+
 The dose claim is keyed by the sealed contract SHA-256 at
 `<seed-ledger-dir>/.a1-one-dose-training-claims/<contract-hex>.json`—not by
 `--receipt`. Choosing different output or receipt paths therefore cannot create
@@ -45,12 +78,14 @@ binds the candidate/report hashes and prevents a repeat.
 
 Every claimed attempt also produces one no-clobber atomic receipt when its
 receipt directory remains writable. A successful receipt binds the contract,
-corpus payload inventory and row counts, validation manifest, producer, exact
-command, candidate checkpoint, fresh optimizer sidecar, report, GPU, and exact
-optimizer-step count. The executor rejects reports that do not semantically
-prove the sealed corpus/init/checkpoint and exactly one complete epoch. A
-nonzero or malformed run produces durable `failed` claim evidence and cannot be
-mistaken for a candidate. Never delete or edit a contract claim to retry.
+corpus payload inventory and row counts, whole-game split authority, producer,
+exact command, topology/canary, candidate checkpoint, fresh optimizer sidecar,
+report, GPUs, and exact optimizer-step/draw counts. For a production composite
+it additionally requires finite objective-matched validation at the exact
+component ratios. The executor rejects reports that do not semantically prove
+the sealed corpus/init/checkpoint and exactly one complete epoch. A nonzero or
+malformed run produces durable `failed` claim evidence and cannot be mistaken
+for a candidate. Never delete or edit a contract claim to retry.
 
 There is one narrow, typed exception to issuing a new science contract. If the
 v3 attempt failed before optimizer construction solely because the historical
