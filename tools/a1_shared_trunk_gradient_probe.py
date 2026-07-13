@@ -187,6 +187,10 @@ def build_plan(
     # event N, before the trainer's end-of-epoch validation/checkpoint path.
     _set_option(command, "--max-steps", str(max(steps + 1, 1024)))
     _set_option(command, "--train-diagnostics-every-batches", "1")
+    # Ordinary optimizer diagnostics and the two extra trunk autograd passes are
+    # intentionally separate controls.  The latter is expensive and default-off
+    # in real training, but it is the defining measurement of this bounded probe.
+    _set_option(command, "--objective-gradient-interference-every-batches", "1")
     _set_option(command, "--progress-every-batches", "1")
     ephemeral = output_dir / ".trainer-ephemeral"
     _set_option(command, "--checkpoint", str(ephemeral / "candidate.pt"))
@@ -207,6 +211,7 @@ def build_plan(
         for flag in (
             "--max-steps",
             "--train-diagnostics-every-batches",
+            "--objective-gradient-interference-every-batches",
             "--progress-every-batches",
             "--checkpoint",
             "--report",

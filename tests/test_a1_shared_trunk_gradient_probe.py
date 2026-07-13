@@ -62,6 +62,72 @@ def test_optional_option_distinguishes_omitted_default() -> None:
     assert probe._optional_option(command, "--progress-every-batches") is None  # noqa: SLF001
 
 
+def test_plan_enables_the_dedicated_interference_cadence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    trainer = tmp_path / "repo" / "tools" / "train_bc.py"
+    trainer.parent.mkdir(parents=True)
+    trainer.write_text("# trainer\n", encoding="utf-8")
+    descriptor = tmp_path / "composite.json"
+    parent = tmp_path / "f7.pt"
+    descriptor.write_text("{}", encoding="utf-8")
+    parent.write_bytes(b"f7")
+    command = [
+        sys.executable,
+        "-m",
+        "torch.distributed.run",
+        "--standalone",
+        "--nproc-per-node=8",
+        str(trainer),
+        "--data",
+        str(descriptor),
+        "--init-checkpoint",
+        str(parent),
+        "--max-steps",
+        "1024",
+        "--train-diagnostics-every-batches",
+        "0",
+        "--objective-gradient-interference-every-batches",
+        "0",
+        "--checkpoint",
+        str(tmp_path / "source.pt"),
+        "--report",
+        str(tmp_path / "source.json"),
+        "--no-resume-optimizer",
+    ]
+    source = {
+        "path": tmp_path / "source.receipt.json",
+        "payload": {"command": command},
+    }
+    source["path"].write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(probe, "_load_source_receipt", lambda *_args: source)
+    monkeypatch.setattr(
+        probe,
+        "_runtime_binding",
+        lambda _path: {
+            "repository_root": str(trainer.parents[1]),
+            "repository_commit": "a" * 40,
+            "trainer": str(trainer),
+            "trainer_sha256": probe._file_sha(trainer),  # noqa: SLF001
+        },
+    )
+
+    plan = probe.build_plan(
+        source_receipt=source["path"],
+        output_dir=tmp_path / "probe",
+        expected_parent_sha256="sha256:" + "1" * 64,
+        steps=4,
+    )
+
+    derived = plan["command"]
+    index = derived.index("--objective-gradient-interference-every-batches")
+    assert derived[index + 1] == "1"
+    assert plan["changed_flags"]["--objective-gradient-interference-every-batches"] == {
+        "source": "0",
+        "probe": "1",
+    }
+
+
 def test_aggregate_retains_per_block_conflict_and_actual_update_norms() -> None:
     result = probe._aggregate([_event(1), _event(2)])  # noqa: SLF001
     assert result["trunk_gradient_cosine"]["mean"] == pytest.approx(-0.25)
