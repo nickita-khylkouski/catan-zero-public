@@ -27,7 +27,8 @@ new work there, and drop any lingering A100 entries from your local
 | h100-8b | 8× H100 (NVSwitch) | A1 generation |
 | h100-8c | 8× H100 (NVSwitch) | A1 generation; audited 2026-07-10 |
 | h100-8d | 8× H100 (NVSwitch) | A1 generation; audited 2026-07-10 |
-| b200 | 2× B200 | eval + orchestration hub (gates, Grafana, banking) |
+| b200 | 8× B200 (NVSwitch) | eval + orchestration hub; independent R&D lane A |
+| b200-rnd-b | 8× B200 (NVSwitch) | independent learner/R&D lane B |
 
 The current A1 search decision is uniform across all 56 H100s:
 `n_full=128`, `n_fast=16`, and `p_full=0.25`. There is no n64 production arm
@@ -198,4 +199,4 @@ capacity. TF32 remains rejected after same-seed trajectory divergence;
 5. Launch via `fleet_launch.sh` (§7).
 
 ## 9. Observability
-- Grafana + Prometheus + DCGM on the **b200 hub**: `http://<b200 alias>:3000` (creds in `~/GRAFANA_CREDS.txt` on b200). Adding a box = one service-discovery line (label `gpumodel`, not `gpu`).
+- Grafana + Prometheus + DCGM on the **b200 hub**: `http://<b200 alias>:3000` (creds in `~/GRAFANA_CREDS.txt` on b200). `b200-rnd-b` is a separately allocatable eight-GPU R&D node and must be added to service discovery with label `gpumodel`, not `gpu`.

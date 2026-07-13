@@ -14,6 +14,7 @@ declare -A HOST=(
   [h100-8c]=REPLACE_ME_h100_8c_ip
   [h100-8d]=REPLACE_ME_h100_8d_ip
   [b200]=REPLACE_ME_b200_ip
+  [b200-rnd-b]=REPLACE_ME_b200_rnd_b_ip
 )
 
 # Optional; defaults to ~/.ssh/gpu_access_ed25519 if unset.

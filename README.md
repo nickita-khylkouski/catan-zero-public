@@ -3,8 +3,9 @@
 This repository consolidates the Catan-Zero source, development history,
 planning documents, and external reviews. The original import came from one
 B200 and two now-retired A100 hosts. The production data fleet is 56 H100s:
-six four-GPU nodes plus four eight-GPU nodes. A separate two-B200 host is the
-evaluation/orchestration hub; FLEET.md is the live inventory. Project #1 goal:
+six four-GPU nodes plus four eight-GPU nodes. Two separate eight-B200 nodes
+provide evaluation, orchestration, and independent learner R&D lanes; FLEET.md
+is the live inventory. Project #1 goal:
 build the strongest Catan agent under the benchmark below.
 
 ## Hard rule
