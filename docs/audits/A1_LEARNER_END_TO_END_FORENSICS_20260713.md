@@ -91,6 +91,9 @@ signal. `loser_sample_weight=1` won the controlled comparison.
 | DDP weighted mean | At accumulation 1, loss numerator gradients are scaled by the globally reduced denominator and DDP's gradient average correctly yields the global weighted mean. | Confirmed correct. |
 | LR/max-step clock | A skipped optimizer group does not advance `global_step`; LR scheduling repeats the same step and max-step dose is not consumed. | Fixed/tested (`1c6efe4`). |
 | Advantage weighting | The optional multiplier was normalized per rank; changing DDP geometry changed the objective, and empty-rank early return precluded a safe collective. | Fixed: all ranks participate in a globally weighted normalizer. |
+| Decisive distributed modes | Gradient accumulation, distributed symmetry augmentation, and distributed outcome-value advantage did not yet have a sealed equivalence contract for a promotion-bearing A1 run. | Production execution now refuses these modes unless an explicit diagnostic/nondecisive authority is bound. DDP at accumulation 1 remains the sealed path (`28f42cf`). |
+| Geometry GPU binding | The geometry launcher referenced `WORLD_SIZE` before defining it, so a true `--go` run failed before binding any GPU. | Fixed and covered by launch tests (`b59983b`). |
+| Composite validation cap | A row-count validation cap can split a game and invalidate the signed game-disjoint validation sentinel. The first geometry command mistakenly requested 8,192 rows despite supplying the sentinel. | Planner and trainer now require `--validation-max-samples 0` for authenticated composites; the sentinel is the sole validation bound (`30b669f`). |
 | Validation aggregation | Objective-matched validation now aggregates sufficient statistics; legacy raw `validation.loss` is a row-concatenated diagnostic and not promotion evidence. | Confirmed. |
 | Head weight decay | Requested zero-weight optional heads previously changed despite no objective. | Fixed (`e81ffb2`). |
 
@@ -145,6 +148,21 @@ the event encoder is bad. The learner now crops this dead path for current data.
 A future nonzero event schema must re-enable it and receive a separate feature
 parity/no-op audit.
 
+### Public-award feature contract
+
+Every historical TEMP component has player-token slot 12 (longest-road public
+ownership) identically zero. That makes the absence of this feature part of the
+legacy corpus/checkpoint contract, even though the authoritative game state can
+populate it. Enabling the corrected value shifts f7 outputs and therefore is not
+a no-op feature toggle.
+
+The P0 reproduction below remains explicitly **legacy-corpus / legacy-feature**.
+A future authoritative-v1 run must bind producer and memmap provenance to that
+contract and deterministically zero-initialize the new input column in the f7
+checkpoint before constructing DDP/FSDP or the optimizer. Mixed legacy and
+authoritative payloads must fail closed unless a separately reviewed migration
+operator exists.
+
 ## Distributed-training semantics
 
 ### Safe now
@@ -165,6 +183,10 @@ parity/no-op audit.
   make the separate symmetry RNG rank-independent, and only rank-0 symmetry RNG
   state is saved. Symmetry is off in the winning recipe. Fix/bind its distributed
   stream before enabling it in production.
+- **Outcome-value advantage:** global normalization is now mathematically
+  invariant to empty/nonempty rank partitions, but the corrected objective has
+  not yet been resealed against the A1 baseline. It is allowed for explicitly
+  nondecisive diagnostics and refused for production comparison until resealed.
 
 ## Corrected experimental program (Pareto order)
 
@@ -240,6 +262,10 @@ the full seat-swapped neutral gate for survivors.
 - `1c6efe4` — accumulation-boundary and global-step accounting tests.
 - `f333921` — exact 8x512-vs-4x1024 geometry probe, no accumulation confound.
 - `2ba5ae1` — clean aggregate telemetry and dedicated-host GPU ownership support.
+- `3bcad3c` — globally normalize optional outcome-value advantage across DDP.
+- `b59983b` — define and bind selected geometry-probe GPU ranks before launch.
+- `28f42cf` — fail closed on distributed semantics that lack a decisive A1 seal.
+- `30b669f` — reject row-capped validation for authenticated composites.
 
 The immediate criterion is simple: preserve the independent TEMP win, select the
 fastest mathematically matched DDP geometry, and spend subsequent B200 time only
