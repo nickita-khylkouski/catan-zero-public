@@ -31,6 +31,9 @@ if grep -qE "torchrun|train_bc.py" <<< "$CMDS"; then
 elif grep -q "gumbel_search_cross_net_h2h" <<< "$CMDS"; then ROLE="GATE(cross-net)"
 elif grep -q "gumbel_search_vs_bot_h2h" <<< "$CMDS"; then ROLE="EVAL(vs-bot)"
 elif grep -q "gumbel_search_vs_raw_h2h" <<< "$CMDS"; then ROLE="EVAL(vs-raw)"
+elif grep -q "posthoc_teacher_gap_probe" <<< "$CMDS"; then ROLE="RND(posthoc)"
+elif grep -qE "a1_b200_(batch|microbatch)_probe|a1_b200_microbatch_quality" <<< "$CMDS"; then ROLE="RND(learner-probe)"
+elif grep -q "all_reduce_perf" <<< "$CMDS"; then ROLE="RND(nccl)"
 elif grep -qE "(^|[ /])pytest([ ]|$)|python[^ ]* -m pytest" <<< "$CMDS"; then ROLE="TEST(pytest)"
 elif grep -q "generate_gumbel_selfplay_data" <<< "$CMDS"; then
     if [ "${NF:-0}" -ge 128 ]; then ROLE="GEN-TEACHER(n${NF})"; elif [ -n "${NF:-}" ]; then ROLE="GEN-VOLUME(n${NF})"; else ROLE="GEN"; fi
@@ -41,7 +44,7 @@ MPS="no-mps"
 ps -eo comm=,args= 2>/dev/null \
   | awk '$1 ~ /^nvidia-cuda-mps/ && ($0 ~ /mps-control -d/ || $0 ~ /mps-server/) {found=1} END {exit !found}' \
   && MPS="MPS"
-JOB_PROCS=$(grep -cE "generate_gumbel_selfplay_data|train_bc.py" <<< "$CMDS")
+JOB_PROCS=$(grep -cE "generate_gumbel_selfplay_data|train_bc.py|posthoc_teacher_gap_probe|a1_b200_(batch|microbatch)_probe|a1_b200_microbatch_quality|all_reduce_perf|gumbel_search_(cross_net|vs_bot|vs_raw)_h2h" <<< "$CMDS")
 GEN_PIPELINES=$(grep -c "generate_gumbel_selfplay_data" <<< "$CMDS")
 printf "gpus=%s busy=%s util_avg=%s%% mem_max=%sMiB | role=%s %s | %s | job_procs=%s gen_pipelines=%s\n" \
   "$NG" "$BUSY" "$UTILAVG" "$MEMMAX" "$ROLE" "$DETAIL" "$MPS" "$JOB_PROCS" "$GEN_PIPELINES"

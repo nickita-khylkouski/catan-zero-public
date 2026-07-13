@@ -285,6 +285,15 @@ def test_status_surfaces_live_generator_pipeline_count() -> None:
     assert "gen_pipelines=%s" in source
 
 
+def test_status_surfaces_b200_rnd_workloads() -> None:
+    source = STATUS.read_text(encoding="utf-8")
+    assert 'ROLE="RND(posthoc)"' in source
+    assert 'ROLE="RND(learner-probe)"' in source
+    assert 'ROLE="RND(nccl)"' in source
+    assert "posthoc_teacher_gap_probe" in source
+    assert "a1_b200_microbatch_quality" in source
+
+
 @pytest.mark.parametrize(
     ("args", "message"),
     [
