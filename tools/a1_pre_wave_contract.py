@@ -556,7 +556,10 @@ def _sealed_game_contract_shape(lock: Mapping[str, Any]) -> dict[str, Any]:
     game = lock.get("game_contract")
     fleet = lock.get("fleet")
     if not isinstance(game, dict) or not isinstance(fleet, dict):
-        raise ContractError("sealed lock has no typed game/fleet contract")
+        raise ContractError(
+            "sealed lock has no typed game/fleet contract; historical locks require "
+            "the explicit promotion handoff attestation path"
+        )
     if schema == GENERATION_ARM_LOCK_SCHEMA:
         if (
             game.get("profile") != DUAL_ARM_GAME_CONTRACT_PROFILE
