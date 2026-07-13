@@ -414,9 +414,22 @@ def _claim_fresh_turn_corpus(
             handle.flush()
             os.fsync(handle.fileno())
     except FileExistsError as error:
-        raise IterationError(
-            f"fresh corpus is already consumed by another flywheel turn: {claim_path}"
-        ) from error
+        # A crash may occur after the immutable claim is published but before
+        # the digest-sealed iteration state. Resume only when the existing
+        # claim is byte-semantically the exact claim this call would create;
+        # a different state/turn binding remains permanently refused.
+        try:
+            existing = json.loads(claim_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as read_error:
+            raise IterationError(
+                f"fresh corpus consumption claim is unreadable: {claim_path}"
+            ) from read_error
+        if existing != claim:
+            raise IterationError(
+                "fresh corpus is already consumed by another flywheel turn: "
+                f"{claim_path}"
+            ) from error
+        return _file_ref(claim_path, where="corpus consumption claim")
     _fsync_directory(claim_path.parent)
     return _file_ref(claim_path, where="corpus consumption claim")
 
@@ -554,7 +567,21 @@ def initialize_next(
             )
         return existing
 
-    flywheel.write_turn(turn_path, turn)
+    try:
+        flywheel.write_turn(turn_path, turn)
+    except flywheel.FlywheelTurnError as error:
+        # Same crash window as the consumption claim: an exact immutable turn
+        # is adoptable, but an existing path with any semantic drift is not.
+        try:
+            existing_turn = flywheel.verify_turn(turn_path, verified=verified)
+        except (flywheel.FlywheelTurnError, OSError) as replay_error:
+            raise IterationError(
+                f"existing flywheel turn cannot be resumed: {replay_error}"
+            ) from replay_error
+        if existing_turn != turn:
+            raise IterationError(
+                "existing flywheel turn differs from requested initialization"
+            ) from error
     turn_ref = _file_ref(turn_path, where="flywheel turn")
     meta_path = Path(verified["data_path"]) / "corpus_meta.json"
     state_path = state_path.expanduser().resolve(strict=False)
@@ -1424,6 +1451,7 @@ def verify_evaluation(
     registry_path: Path,
     current_pointer: Path,
     adjudication_path: Path,
+    cohort_exclusions: Path,
     promotion_receipt: Path,
     reason: str,
     promotion_lock: Path | None = None,
@@ -1446,6 +1474,7 @@ def verify_evaluation(
                 contract_lock=Path(state["training"]["lock"]["path"]),
                 adjudication_path=adjudication_path,
                 training_receipt=Path(state["training_outputs"]["receipt"]["path"]),
+                cohort_exclusions=cohort_exclusions,
                 receipt_path=promotion_receipt,
                 reason=reason,
                 lock_path=promotion_lock,
@@ -1486,6 +1515,9 @@ def verify_evaluation(
             ),
             "adjudication": _file_ref(
                 adjudication_path, where="promotion adjudication"
+            ),
+            "cohort_exclusions": _file_ref(
+                cohort_exclusions, where="promotion cohort exclusions"
             ),
             "promotion_receipt": _new_path(
                 promotion_receipt, where="promotion receipt"
@@ -1542,6 +1574,7 @@ def _adopt_committed_promotion(state: dict[str, Any]) -> dict[str, Any]:
         "candidate",
         "champion",
         "evidence",
+        "promotion_cohort_disjointness",
         "promotion_count",
         "nth_confirmation_required",
         "reason",
@@ -1577,6 +1610,9 @@ def promote(
                     contract_lock=Path(state["training"]["lock"]["path"]),
                     adjudication_path=Path(evaluation["adjudication"]["path"]),
                     training_receipt=Path(state["training_outputs"]["receipt"]["path"]),
+                    cohort_exclusions=Path(
+                        evaluation["cohort_exclusions"]["path"]
+                    ),
                     receipt_path=receipt_path,
                     reason=evaluation["reason"],
                     lock_path=(
@@ -1621,6 +1657,10 @@ def status(*, state_path: Path) -> dict[str, Any]:
             )
             _verify_ref(
                 state["evaluation"]["adjudication"], where="evaluation.adjudication"
+            )
+            _verify_ref(
+                state["evaluation"]["cohort_exclusions"],
+                where="evaluation.cohort_exclusions",
             )
         if state["stage"] == "promoted":
             _verify_ref(state["promotion"]["receipt"], where="promotion.receipt")
@@ -1689,6 +1729,7 @@ def build_parser() -> argparse.ArgumentParser:
     evidence.add_argument("--registry", required=True, type=Path)
     evidence.add_argument("--current-pointer", required=True, type=Path)
     evidence.add_argument("--adjudication", required=True, type=Path)
+    evidence.add_argument("--cohort-exclusions", required=True, type=Path)
     evidence.add_argument("--promotion-receipt", required=True, type=Path)
     evidence.add_argument("--reason", required=True)
     evidence.add_argument("--promotion-lock", type=Path, default=None)
@@ -1753,6 +1794,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 registry_path=args.registry,
                 current_pointer=args.current_pointer,
                 adjudication_path=args.adjudication,
+                cohort_exclusions=args.cohort_exclusions,
                 promotion_receipt=args.promotion_receipt,
                 reason=args.reason,
                 promotion_lock=args.promotion_lock,

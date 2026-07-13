@@ -60,6 +60,40 @@ def test_scoreboard_gate_cannot_promote_masked_flywheel(tmp_path: Path) -> None:
     }
 
 
+def test_disabled_gate_holds_instead_of_manufacturing_promotion(
+    tmp_path: Path,
+) -> None:
+    runner = _runner(tmp_path)
+    runner.cfg.gate_enabled = False
+
+    assert runner.gate("candidate.pt", "champion.pt", round_idx=0) == {
+        "ok": True,
+        "pass": False,
+        "verdict": "disabled",
+        "note": "gate disabled; promotion held",
+    }
+
+
+@pytest.mark.parametrize(
+    "gate",
+    [
+        {"ok": True, "pass": True, "verdict": "disabled"},
+        {"ok": True, "pass": True, "verdict": "continue"},
+        {"ok": False, "pass": True, "verdict": "promote"},
+        {"ok": True, "pass": 1, "verdict": "promote"},
+    ],
+)
+def test_truthy_pass_without_typed_positive_verdict_cannot_promote(gate: dict) -> None:
+    assert flywheel._promotion_authorized(gate) is False
+
+
+@pytest.mark.parametrize("verdict", ["promote", "canary_promote"])
+def test_only_typed_positive_verdicts_authorize_promotion(verdict: str) -> None:
+    assert flywheel._promotion_authorized(
+        {"ok": True, "pass": True, "verdict": verdict}
+    ) is True
+
+
 def test_masked_h2h_gate_uses_named_flywheel_policy_and_extends(monkeypatch, tmp_path: Path) -> None:
     runner = _runner(
         tmp_path,

@@ -436,7 +436,15 @@ class Runner:
         self-play round but is explicitly never a public gen-N certification.
         """
         if not self.cfg.gate_enabled:
-            return {"ok": True, "pass": True, "verdict": "disabled", "note": "gate disabled"}
+            # Disabling evidence collection must never manufacture positive
+            # promotion authority. The experimental controller may continue
+            # producing candidates, but it must hold the incumbent.
+            return {
+                "ok": True,
+                "pass": False,
+                "verdict": "disabled",
+                "note": "gate disabled; promotion held",
+            }
         if self.cfg.gate_style == "scoreboard":
             # A warning is not a safety boundary: this branch used to continue
             # into an omniscient scoreboard and could promote a masked model on
@@ -780,6 +788,21 @@ def _run(cmd: list[str], log_path: Path) -> int:
         log.write(f"\n=== {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} $ {shlex.join(cmd)}\n")
         log.flush()
         return subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT, cwd=str(REPO_ROOT)).returncode
+
+
+def _promotion_authorized(gate: dict) -> bool:
+    """Accept only an explicit positive typed gate result.
+
+    A truthy compatibility field is not promotion authority: historical and
+    third-party gate adapters may carry ``pass`` alongside disabled, malformed,
+    or otherwise non-positive verdicts.
+    """
+
+    return (
+        gate.get("ok") is True
+        and gate.get("pass") is True
+        and gate.get("verdict") in {"promote", "canary_promote"}
+    )
 
 
 # ------------------------------------------------------------------ role registry
@@ -1319,7 +1342,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         # reconcile_pending_promotion) instead of silently redoing the round against whatever
         # champion the registry ends up with, with no trace of what happened.
         round_committed = False
-        if g.get("pass"):
+        if _promotion_authorized(g):
             rec["decision"] = "promoting"
             rec["promotion_pending"] = True
             window.save()

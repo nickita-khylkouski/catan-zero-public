@@ -324,6 +324,58 @@ def test_initialize_next_claims_fresh_corpus_once_and_rejects_cross_turn_reuse(
         )
 
 
+def test_initialize_next_resumes_exact_turn_and_claim_after_state_write_crash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    verified, paths = _verified(tmp_path)
+    turn = _fake_turn(tmp_path, verified)
+    state_path = tmp_path / "next.json"
+    turn_path = tmp_path / "next.turn.json"
+    kwargs = {
+        "state_path": state_path,
+        "turn_path": turn_path,
+        "handoff_path": tmp_path / "handoff.json",
+        "campaign_path": tmp_path / "campaign.json",
+        "audit_path": tmp_path / "audit.json",
+        "lock_path": paths["lock"],
+        "data_path": paths["data"],
+        "validation_path": paths["validation"],
+        "learner_parent": tmp_path / "next-parent.pt",
+        "evaluation_parent": tmp_path / "next-parent.pt",
+        "initializer": tmp_path / "next-parent.pt",
+        "architecture_upgrade_receipt": None,
+        "checkpoint": tmp_path / "candidate.pt",
+        "report": tmp_path / "report.json",
+        "training_receipt": tmp_path / "receipt.json",
+        "python": Path(sys.executable),
+        "gpu": 0,
+        "verify_fn": lambda **_kwargs: verified,
+        "turn_builder": lambda **_kwargs: turn,
+    }
+    monkeypatch.setattr(
+        iteration.flywheel, "verify_turn", lambda _path, *, verified: turn
+    )
+    real_write_state = iteration._write_state
+    monkeypatch.setattr(
+        iteration,
+        "_write_state",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("simulated crash")),
+    )
+
+    with pytest.raises(OSError, match="simulated crash"):
+        iteration.initialize_next(**kwargs)
+
+    assert turn_path.is_file()
+    assert (paths["data"] / ".a1-flywheel-corpus-consumption.json").is_file()
+    assert not state_path.exists()
+
+    monkeypatch.setattr(iteration, "_write_state", real_write_state)
+    resumed = iteration.initialize_next(**kwargs)
+
+    assert resumed["stage"] == "corpus_verified"
+    assert resumed["training"]["flywheel_turn"]["path"] == str(turn_path)
+
+
 def test_next_turn_tamper_refuses_before_dose_runner(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -799,6 +851,10 @@ def _promotion_plan(state: dict, adjudication: Path) -> dict:
         },
         "champion": {"path": "/champion.pt", "sha256": "sha256:" + "3" * 64},
         "evidence": [{"kind": "mechanism_calibration"}],
+        "promotion_cohort_disjointness": {
+            "manifest": {"sha256": "sha256:" + "6" * 64},
+            "status": "disjoint",
+        },
         "registry": {"before_sha256": "sha256:" + "4" * 64},
         "current_pointer": {"before_sha256": "sha256:" + "5" * 64},
     }
@@ -811,6 +867,9 @@ def test_evaluation_stage_reuses_promotion_verifier_and_binds_this_candidate(
     registry = _write(tmp_path / "registry.json", "registry")
     pointer = _write(tmp_path / "CURRENT_CHAMPION", "champion\n")
     adjudication = _write(tmp_path / "adjudication.json", "adjudication")
+    cohort_exclusions = _write(
+        tmp_path / "cohort-exclusions.json", "cohort exclusions"
+    )
     promotion_receipt = tmp_path / "promotion.receipt.json"
     plan = _promotion_plan(state, adjudication)
     calls: list[dict] = []
@@ -825,6 +884,7 @@ def test_evaluation_stage_reuses_promotion_verifier_and_binds_this_candidate(
         registry_path=registry,
         current_pointer=pointer,
         adjudication_path=adjudication,
+        cohort_exclusions=cohort_exclusions,
         promotion_receipt=promotion_receipt,
         reason="candidate passed all typed A1 gates",
         promotion_fn=verify,
@@ -832,7 +892,12 @@ def test_evaluation_stage_reuses_promotion_verifier_and_binds_this_candidate(
 
     assert state["stage"] == "evaluation_verified"
     assert len(calls) == 1
+    assert calls[0]["cohort_exclusions"] == cohort_exclusions
     assert state["evaluation"]["dry_run_plan"] == plan
+    assert state["evaluation"]["cohort_exclusions"] == {
+        "path": str(cohort_exclusions.resolve()),
+        "sha256": iteration._file_sha256(cohort_exclusions),
+    }
 
 
 def test_evaluation_refuses_candidate_from_a_different_dose(
@@ -842,6 +907,9 @@ def test_evaluation_refuses_candidate_from_a_different_dose(
     registry = _write(tmp_path / "registry.json", "registry")
     pointer = _write(tmp_path / "CURRENT_CHAMPION", "champion\n")
     adjudication = _write(tmp_path / "adjudication.json", "adjudication")
+    cohort_exclusions = _write(
+        tmp_path / "cohort-exclusions.json", "cohort exclusions"
+    )
     plan = _promotion_plan(state, adjudication)
     plan["candidate"]["sha256"] = "sha256:" + "9" * 64
 
@@ -851,12 +919,85 @@ def test_evaluation_refuses_candidate_from_a_different_dose(
             registry_path=registry,
             current_pointer=pointer,
             adjudication_path=adjudication,
+            cohort_exclusions=cohort_exclusions,
             promotion_receipt=tmp_path / "promotion.receipt.json",
             reason="wrong candidate",
             promotion_fn=lambda **_kwargs: plan,
         )
 
     assert iteration.status(state_path=state_path)["stage"] == "dose_complete"
+
+
+def test_evaluation_stage_refuses_cohort_exclusion_drift(
+    tmp_path: Path, monkeypatch
+) -> None:
+    state_path, state = _advance_to_complete(tmp_path, monkeypatch)
+    registry = _write(tmp_path / "registry.json", "registry")
+    pointer = _write(tmp_path / "CURRENT_CHAMPION", "champion\n")
+    adjudication = _write(tmp_path / "adjudication.json", "adjudication")
+    cohort_exclusions = _write(
+        tmp_path / "cohort-exclusions.json", "cohort exclusions"
+    )
+    state = iteration.verify_evaluation(
+        state_path=state_path,
+        registry_path=registry,
+        current_pointer=pointer,
+        adjudication_path=adjudication,
+        cohort_exclusions=cohort_exclusions,
+        promotion_receipt=tmp_path / "promotion.receipt.json",
+        reason="passed",
+        promotion_fn=lambda **_kwargs: _promotion_plan(state, adjudication),
+    )
+    cohort_exclusions.write_text("drifted", encoding="utf-8")
+
+    with pytest.raises(iteration.IterationError, match="cohort_exclusions hash drift"):
+        iteration.status(state_path=state_path)
+
+
+def test_promotion_go_reuses_exact_preflight_cohort_exclusions(
+    tmp_path: Path, monkeypatch
+) -> None:
+    state_path, state = _advance_to_complete(tmp_path, monkeypatch)
+    registry = _write(tmp_path / "registry.json", "registry")
+    pointer = _write(tmp_path / "CURRENT_CHAMPION", "champion\n")
+    adjudication = _write(tmp_path / "adjudication.json", "adjudication")
+    cohort_exclusions = _write(
+        tmp_path / "cohort-exclusions.json", "cohort exclusions"
+    )
+    promotion_receipt = tmp_path / "promotion.receipt.json"
+    plan = _promotion_plan(state, adjudication)
+    state = iteration.verify_evaluation(
+        state_path=state_path,
+        registry_path=registry,
+        current_pointer=pointer,
+        adjudication_path=adjudication,
+        cohort_exclusions=cohort_exclusions,
+        promotion_receipt=promotion_receipt,
+        reason="passed",
+        promotion_fn=lambda **_kwargs: plan,
+    )
+    calls: list[dict] = []
+
+    def commit(**kwargs):
+        calls.append(kwargs)
+        _write(promotion_receipt, "committed receipt")
+        return {}
+
+    committed = {
+        "transaction_id": "tx-committed",
+        "registry": {"after_sha256": "sha256:" + "6" * 64},
+        "current_pointer": {"after_sha256": "sha256:" + "7" * 64},
+        "promotion_count": 4,
+    }
+    monkeypatch.setattr(
+        iteration, "_adopt_committed_promotion", lambda _state: committed
+    )
+
+    promoted = iteration.promote(state_path=state_path, promotion_fn=commit)
+
+    assert promoted["stage"] == "promoted"
+    assert calls[0]["go"] is True
+    assert calls[0]["cohort_exclusions"] == cohort_exclusions.resolve()
 
 
 def test_promote_adopts_committed_transaction_after_orchestrator_crash(
@@ -866,6 +1007,9 @@ def test_promote_adopts_committed_transaction_after_orchestrator_crash(
     registry = _write(tmp_path / "registry.json", "registry")
     pointer = _write(tmp_path / "CURRENT_CHAMPION", "champion\n")
     adjudication = _write(tmp_path / "adjudication.json", "adjudication")
+    cohort_exclusions = _write(
+        tmp_path / "cohort-exclusions.json", "cohort exclusions"
+    )
     promotion_receipt = tmp_path / "promotion.receipt.json"
     plan = _promotion_plan(state, adjudication)
     state = iteration.verify_evaluation(
@@ -873,6 +1017,7 @@ def test_promote_adopts_committed_transaction_after_orchestrator_crash(
         registry_path=registry,
         current_pointer=pointer,
         adjudication_path=adjudication,
+        cohort_exclusions=cohort_exclusions,
         promotion_receipt=promotion_receipt,
         reason="passed",
         promotion_fn=lambda **_kwargs: plan,
@@ -920,6 +1065,10 @@ def test_committed_promotion_must_match_dry_run_mutation_hashes(
         "candidate": {"sha256": "sha256:" + "c" * 64},
         "champion": {"sha256": "sha256:" + "d" * 64},
         "evidence": [],
+        "promotion_cohort_disjointness": {
+            "manifest": {"sha256": "sha256:" + "e" * 64},
+            "status": "disjoint",
+        },
         "promotion_count": 1,
         "nth_confirmation_required": False,
         "reason": "passed",
@@ -943,4 +1092,49 @@ def test_committed_promotion_must_match_dry_run_mutation_hashes(
     }
 
     with pytest.raises(iteration.IterationError, match="dry-run field 'registry'"):
+        iteration._adopt_committed_promotion(state)
+
+
+def test_committed_promotion_must_match_preflight_cohort_disjointness(
+    tmp_path: Path, monkeypatch
+) -> None:
+    registry = _write(tmp_path / "registry.json", "after-registry")
+    pointer = _write(tmp_path / "CURRENT_CHAMPION", "candidate\n")
+    receipt_path = _write(tmp_path / "promotion.receipt.json", "receipt")
+    expected = {
+        "registry": {"after_sha256": iteration.promotion._sha256(registry)},
+        "current_pointer": {"after_sha256": iteration.promotion._sha256(pointer)},
+        "contract": {},
+        "adjudication": {},
+        "training_receipt": {},
+        "candidate": {},
+        "champion": {},
+        "evidence": [],
+        "promotion_cohort_disjointness": {"status": "disjoint"},
+        "promotion_count": 1,
+        "nth_confirmation_required": False,
+        "reason": "passed",
+        "fleet_ckpt_updated": False,
+    }
+    receipt = {
+        **expected,
+        "status": "committed",
+        "promotion_cohort_disjointness": {"status": "different"},
+    }
+    monkeypatch.setattr(
+        iteration.promotion,
+        "_load_recovery_receipt",
+        lambda _path: (receipt, receipt_path, registry, pointer, registry, pointer),
+    )
+    state = {
+        "evaluation": {
+            "promotion_receipt": str(receipt_path),
+            "dry_run_plan": expected,
+        }
+    }
+
+    with pytest.raises(
+        iteration.IterationError,
+        match="dry-run field 'promotion_cohort_disjointness'",
+    ):
         iteration._adopt_committed_promotion(state)
