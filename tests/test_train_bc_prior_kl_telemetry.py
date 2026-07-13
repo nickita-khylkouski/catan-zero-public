@@ -137,6 +137,7 @@ def _active_teacher_gap(
     soft_targets=None,
     has_soft=None,
     policy_active=None,
+    policy_weights=None,
 ):
     batch = np.arange(len(data["legal_action_ids"]))
     if soft_targets is None:
@@ -153,6 +154,7 @@ def _active_teacher_gap(
         soft_targets=soft_targets,
         has_soft=has_soft,
         policy_active=policy_active,
+        policy_weights=policy_weights,
     )
 
 
@@ -217,6 +219,51 @@ def test_active_teacher_gap_is_zero_closed_when_model_matches_prior():
     assert closure == pytest.approx(0.0, abs=1e-6)
 
 
+def test_active_teacher_gap_uses_effective_objective_weights() -> None:
+    """A high-weight repaired row must dominate a low-weight incidental row."""
+
+    data = _base_data(
+        target_policy=np.asarray(
+            [
+                [0.7, 0.2, 0.1, 0.0],
+                [0.7, 0.2, 0.1, 0.0],
+                [0.6, 0.3, 0.1, 0.0],
+            ],
+            dtype=np.float32,
+        ),
+        prior_policy=np.asarray(
+            [
+                [0.5, 0.3, 0.2, 0.0],
+                [0.5, 0.3, 0.2, 0.0],
+                [0.0, 0.0, 0.0, 0.0],
+            ],
+            dtype=np.float32,
+        ),
+    )
+    logits = torch.full((3, 4), float("-inf"))
+    # Row 0 closes its teacher gap; row 1 stays exactly at its old prior.
+    logits[0, :3] = torch.log(torch.tensor([0.7, 0.2, 0.1]))
+    logits[1, :3] = torch.log(torch.tensor([0.5, 0.3, 0.2]))
+    result = _active_teacher_gap(
+        data,
+        logits,
+        policy_weights=torch.tensor([100.0, 1.0, 0.0]),
+    )
+
+    assert result is not None
+    weights = result["effective_weights"]
+    weighted_model = float((result["kl_target_model"] * weights).sum())
+    weighted_prior = float((result["kl_target_prior"] * weights).sum())
+    weighted_closure = 1.0 - weighted_model / weighted_prior
+    unweighted_model = float(result["kl_target_model"][result["eligible"]].sum())
+    unweighted_prior = float(result["kl_target_prior"][result["eligible"]].sum())
+    unweighted_closure = 1.0 - unweighted_model / unweighted_prior
+
+    assert weights.tolist() == [100.0, 1.0, 0.0]
+    assert weighted_closure == pytest.approx(0.9900989747, rel=1e-5)
+    assert weighted_closure > unweighted_closure
+
+
 def test_active_teacher_gap_is_unavailable_without_soft_targets_or_prior():
     data = _base_data()
     batch = np.arange(3)
@@ -259,3 +306,18 @@ def test_active_teacher_gap_report_uses_additive_sums_and_handles_empty_input():
         "active_policy_kl_target_prior_mean": 0.0,
         "active_policy_teacher_gap_closure": 0.0,
     }
+
+
+def test_active_teacher_gap_report_uses_explicit_weight_mass() -> None:
+    report = _active_policy_teacher_gap_report(
+        rows=2,
+        weight_sum=101.0,
+        kl_target_model_sum=1.0,
+        kl_target_prior_sum=101.0,
+    )
+
+    assert report["active_policy_teacher_gap_rows"] == 2
+    assert report["active_policy_teacher_gap_weight_sum"] == 101.0
+    assert report["active_policy_kl_target_model_mean"] == pytest.approx(1.0 / 101.0)
+    assert report["active_policy_kl_target_prior_mean"] == pytest.approx(1.0)
+    assert report["active_policy_teacher_gap_closure"] == pytest.approx(100.0 / 101.0)
