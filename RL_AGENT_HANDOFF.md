@@ -10,16 +10,16 @@ track do not support a four-player full-trade strength claim.
 
 | Item | State |
 |---|---|
-| Canonical repository | `nickita-khylkouski/catan-zero-public`; deploy one final immutable A1 tag |
-| Production H100 topology | 40 GPUs: `c1`-`c6` (4 each), `h100-8a` and `h100-8b` (8 each) |
+| Canonical repository | `nickita-khylkouski/catan-zero-public`; the wave executor stages the seal's content-addressed runtime tree, not a mutable checkout |
+| Production H100 topology | 64 GPUs: `c1`-`c8` (4 each), `h100-8a`-`h100-8d` (8 each) |
 | A1 search decision | global n128; n_fast 16; p_full .25; adaptive/wide budget disabled |
 | A1 source dose | 9,600 current + 1,800 recent + 600 hard-negative complete games |
-| A1 job/claim count | 120: three category jobs per physical H100 |
-| Private artifacts | Must be staged and hash-verified on every declared consumer before seal/launch |
-| Production seed ledger | One byte-identical append-only ledger across all eight H100 hosts |
+| A1 job/claim count | 192: three category jobs per physical H100 |
+| Private artifacts | The seal binds them; the executor installs exact hash-qualified bytes on every declared consumer |
+| Production seed ledger | One append-only canonical ledger; every one of the 12 H100 hosts must be an exact prefix before executor synchronization |
 | Fleet config | Private `$FLEET_CONF`; aliases only in repository examples |
 | Production launch | Only from a verified sealed contract through the A1 production executor |
-| Training | One sealed scalar-MSE dose on one selected B200 after corpus postflight |
+| Training | One sealed scalar-MSE dose on exactly eight local B200 GPUs under DDP after corpus postflight |
 | Promotion/deployment | Atomic typed transaction only after every required gate and veto passes |
 
 The canary smoke used a synthetic same-shape checkpoint. Its rows certify
@@ -34,7 +34,8 @@ The RL operator owns this sequence:
 2. Allocate non-overlapping seeds under one global allocator.
 3. Launch and monitor generation one box at a time.
 4. Reconcile manifests, run corpus QA, and build a fresh memmap corpus.
-5. Launch the sealed one-dose 35M learner on one selected B200.
+5. Launch the sealed one-dose 35M learner on one eight-GPU B200 host, with an
+   hour-fresh same-host DDP canary and exactly ranks/GPU indices 0-7.
 6. Run searched candidate-versus-incumbent, neutral, tripwire, and population
    evidence required by the approved promotion policy.
 7. Record a promotion transaction and deploy the selected checkpoint only
@@ -62,7 +63,7 @@ Operator workstation
   -> NPZ decision shards plus manifests
   -> manifest reconciliation and Gumbel QA
   -> duplicate-safe memmap corpus
-  -> one sealed one-dose train_bc process on a B200
+  -> one sealed eight-rank train_bc DDP job on B200 GPUs 0-7
   -> candidate checkpoint and report
   -> searched cross-net H2H plus neutral panels
   -> manual registry and CKPT deployment transaction
@@ -86,16 +87,18 @@ Use each source for its declared scope:
 
 1. Live code, manifests, checkpoint metadata, private registry, and canonical
    ledgers for what actually ran.
-2. A dated owner-approved wave record for experiment thresholds and any policy
+2. `docs/operations/A1_V5_64GPU_PRE_WAVE.md` plus the v3 lock/render for the
+   current post-promotion generation and learner handoff.
+3. A dated owner-approved wave record for experiment thresholds and any policy
    decision that supersedes an older plan.
-3. docs/plans/CATAN_ZERO_ROADMAP.md and CATAN_ZERO_MASTER_PLAN.md for the
+4. docs/plans/CATAN_ZERO_ROADMAP.md and CATAN_ZERO_MASTER_PLAN.md for the
    promotion ladder, tripwires, and research program.
-4. RL_AGENT_HANDOFF.md for the end-to-end operator transaction.
-5. FLEET.md and tools/fleet/FLEET_CONTROL.md for inventory, installation,
+5. RL_AGENT_HANDOFF.md for the end-to-end operator transaction.
+6. FLEET.md and tools/fleet/FLEET_CONTROL.md for inventory, installation,
    status, launch, and stop behavior.
-6. docs/plans/H100_EXECUTION_UPDATE_2026-07-09.md for measured H100 evidence
+7. docs/plans/H100_EXECUTION_UPDATE_2026-07-09.md for measured H100 evidence
    and the current role-pure data-engine experiment.
-7. CODEBASE_GUIDE.md for architecture and module ownership.
+8. CODEBASE_GUIDE.md for architecture and module ownership.
 
 Stop and update the documentation when same-scope sources disagree. Do not
 silently let a throughput recipe replace the roadmap's promotion policy.
@@ -125,15 +128,15 @@ teacher/volume box split and no H100 held out for training:
 
 | Field | Sealed A1 value |
 |---|---|
-| H100 topology | six 4-GPU hosts + two 8-GPU hosts = 40 GPUs |
+| H100 topology | eight 4-GPU hosts + four 8-GPU hosts = 64 GPUs |
 | Search budget | `n_full=128`, `n_fast=16`, `p_full=0.25` |
 | Adaptive budget | disabled (`n_full_wide=null`, threshold null, always-full false) |
-| Search calibration | c-visit 50.0, c-scale .03, D1 off, sigma_eval .98 |
+| Search calibration | c-visit 50.0, deployed producer c-scale .10 on all three source categories, D1 off, sigma_eval .98 |
 | Symmetry | D6 averaged evaluation on from legal width 20 |
 | Runtime | one generator/GPU, 16 workers/GPU, systemd-managed MPS, EvalServer off |
 | Precision/masking | strict FP32, public observations, masked checkpoints |
-| Source jobs | 240/45/15 selected games per GPU for current/recent/hard-negative |
-| Attempts | 245/47/16 per GPU; reserve attempts are excluded before training |
+| Source jobs | balanced-prefix quotas: current 150/GPU; recent 29 on first 8 GPUs then 28; hard-negative 10 on first 24 then 9 |
+| Attempts | selected quota plus fixed 5/2/1 reserve per category job; reserves are excluded before training |
 
 All generation also uses corrected Rust chance spectra, lazy interior chance,
 `max_decisions=600`, no local CUDA fallback, and the exact immutable generator
@@ -143,65 +146,42 @@ and adaptive or global n256 are unauthorized for this wave.
 
 The historical 91.85k rows/hour/GPU and 2.20M rows/hour over 24 H100s were
 measurements/projections for a synthetic-checkpoint EvalServer recipe. Preserve
-them as evidence; do not treat them as the capacity model for this 40-H100 A1
+them as evidence; do not treat them as the capacity model for this 64-H100 A1
 runtime.
 
 ## 7. Release and node acceptance
 
-### 7.1 Publish one immutable release
+### 7.1 Provision dependencies; execute content-addressed wave bytes
 
-The maintainer must use the canonical two-commit release transaction:
+An immutable release remains the baseline provisioning mechanism for Python,
+Torch, the native wheel, MPS, and acceptance tests. Follow `FLEET.md` for that
+two-commit wheel transaction. A release tag or the mutable
+`/home/ubuntu/catan-zero-v1` checkout is **not** the current wave-code authority.
 
-1. Finalize clean release-source commit A. Run
-   `tools/build_catanatron_rs_wheel.sh` twice from independent clean build state
-   and require byte-identical wheel SHA-256 values. Preserve both machine-
-   readable build receipts and compare their sealed builder, lockfile,
-   toolchain, environment, filename, and digest fields.
-2. Create commit B by changing only
-   `native/catanatron-rs/WHEEL_SHA256SUMS` to record that digest. Confirm
-   `git diff --name-only A..B` contains exactly the inventory path.
-3. Build clean commit B twice. Its wheels must be byte-identical to each other
-   **and to commit A's wheel**. The builder excludes the inventory from native
-   build inputs, eliminating a checksum/self-reference cycle. The final build
-   receipts must name commit/tree B.
-4. Create a new immutable tag at commit B and attach exactly:
+For every dry-run plan, `tools/fleet/a1_production_executor.py` reconstructs
+the exact runtime file set from the verified lock/render, adds its lane
+supervisor, executor, and stop helper, and binds every path, mode, and SHA-256
+into `repo_artifacts_sha256`. On `--go` it creates a deterministic tar, stages
+it on each declared host, verifies it again, and atomically publishes a
+read-only tree at:
 
 ~~~text
-catanatron_rs-0.1.4-cp311-cp311-manylinux_2_34_x86_64.whl
-catanatron_rs-0.1.4-build-receipt.json
+<remote_root>/repo-<repo_artifacts_sha256>
 ~~~
 
-The attached wheel digest must equal commit B's tracked inventory and receipt.
-Abort on any mismatch; never move an existing tag or rewrite the inventory to
-bless a non-reproducing build. Do not install v1.0-deploy.
+The executor likewise installs the exact lock, render, checkpoint, opponent,
+guard, config-registry, and ledger bytes at their sealed destinations. Existing
+different bytes, symlinks, noncanonical destinations, a divergent ledger, or a
+completed stage receipt whose tree no longer verifies all fail closed. Do not
+manually copy a checkout over this tree or substitute a newer Git tag after the
+plan is reviewed.
 
-On each node:
-
-~~~bash
-set -euo pipefail
-export CATAN_REF=<new-h100-release-tag>
-curl -fsSL \
-  "https://raw.githubusercontent.com/nickita-khylkouski/catan-zero-public/$CATAN_REF/tools/install_v1_freeze.sh" \
-  | CATAN_REF="$CATAN_REF" bash
-
-cd /home/ubuntu/catan-zero-v1
-test "$(git rev-parse HEAD)" = <recorded-release-commit>
-~~~
-
-Stage every source checkpoint on every production H100 that consumes it:
-`c1`-`c6`, `h100-8a`, and `h100-8b`. Stage learner/evaluation inputs on the
-selected B200 separately. The synchronized production ledger belongs on all
-eight production H100 hosts:
-
-~~~text
-/home/ubuntu/bundle/champion_v0.pt
-/home/ubuntu/catan-zero-production/SEED_LEDGER.md
-~~~
-
-Record the release commit, release tag, Rust-wheel SHA-256, checkpoint SHA-256,
-and ledger SHA-256 in the wave record. Compare the checkpoint SHA-256 on every
-consumer before its run and again before accepting its output; manifests record
-a path, not the checkpoint's bytes.
+Historical note: the pre-v5 handoff required a final 0.1.4 release and manually
+staged `/home/ubuntu/catan-zero-v1` plus checkpoint bytes. Those records remain
+valid evidence for the wave that produced them, but they cannot authorize this
+post-promotion v5 wave. Current baseline version/wheel details live only in
+`FLEET.md`; current per-wave code and artifacts come only from the sealed,
+content-addressed executor transaction.
 
 ### 7.2 Pin the remote interpreter
 
@@ -238,7 +218,7 @@ replace it.
 
 ### 7.4 Clear both production-shape canaries
 
-Before the 40-H100 rollout, complete the private fleet configuration in Section
+Before the 64-H100 rollout, complete the private fleet configuration in Section
 8 and exercise the sealed recipe on both host shapes: one four-GPU host and one
 eight-GPU host. Use validation-only seeds and outputs, never production claims,
 unless executing the first real jobs through the executor's exact resume
@@ -291,8 +271,12 @@ declare -A HOST=(
   [c4]=...
   [c5]=...
   [c6]=...
+  [c7]=...
+  [c8]=...
   [h100-8a]=...
   [h100-8b]=...
+  [h100-8c]=...
+  [h100-8d]=...
   [b200]=...
 )
 
@@ -306,27 +290,39 @@ declare -A DIRS=(
   [c4]="/home/ubuntu/gen_out/<c4-claim>"
   [c5]="/home/ubuntu/gen_out/<c5-claim>"
   [c6]="/home/ubuntu/gen_out/<c6-claim>"
+  [c7]="/home/ubuntu/gen_out/<c7-claim>"
+  [c8]="/home/ubuntu/gen_out/<c8-claim>"
   [h100-8a]="/home/ubuntu/gen_out/<h100-8a-claim>"
   [h100-8b]="/home/ubuntu/gen_out/<h100-8b-claim>"
+  [h100-8c]="/home/ubuntu/gen_out/<h100-8c-claim>"
+  [h100-8d]="/home/ubuntu/gen_out/<h100-8d-claim>"
 )
 ~~~
 
 The operator machine needs Bash 4+, timeout, SSH, rsync, and the private key.
 Remote commands use the ubuntu account.
 
+The Bash map supports generic status/transfer helpers. A1 execution separately
+requires a mode-0600 JSON host manifest accepted by
+`a1_production_executor.py`; its aliases and GPU counts must exactly project
+the checked-in `configs/gpu_fleet_64.json` authority (12 hosts, 64 GPUs).
+
 ## 9. Seed-ledger transaction
 
-The launcher appends to each node's local ledger. It does not hold a shared
-cross-host lock. One global operator must allocate every range.
+The v3 contract's `claim` transaction appends every rendered row to the one
+canonical ledger; the executor only extends remote exact-prefix copies. There
+is still no shared cross-host allocator lock, so one global operator must
+allocate every range.
 
-The production-ledger participant set is all eight H100 hosts: `c1`-`c6`,
-`h100-8a`, and `h100-8b`. Freeze all production allocation and launches from
+The production-ledger participant set is all 12 H100 hosts: `c1`-`c8` and
+`h100-8a`-`h100-8d`. Freeze all production allocation and launches from
 the first pull until every redistributed hash matches. Before a wave:
 
 1. Pull the ledger from every production generation node.
 2. Merge the copies.
 3. Inspect every reported overlap.
-4. Atomically distribute one byte-identical canonical ledger to all eight nodes.
+4. Keep one append-only canonical ledger; each remote copy must be an exact
+   prefix that the executor can extend to those canonical bytes.
 5. Allocate all ranges from one next-safe value.
 
 Fail-closed pull, merge, next-safe calculation, and distribution:
@@ -338,7 +334,7 @@ export FLEET_CONF="$HOME/.catan_fleet.conf"
 export LOCAL_PY="$PWD/.venv/bin/python"
 source tools/fleet/fleet_lib.sh
 
-GEN_ALIASES=(c1 c2 c3 c4 c5 c6 h100-8a h100-8b)
+GEN_ALIASES=(c1 c2 c3 c4 c5 c6 c7 c8 h100-8a h100-8b h100-8c h100-8d)
 PRIVATE_STATE=<private-state>
 LEDGER_REMOTE=/home/ubuntu/catan-zero-production/SEED_LEDGER.md
 STAMP=$(date -u +%Y%m%dT%H%M%SZ)
@@ -391,7 +387,7 @@ for start, end, label in rows:
         raise SystemExit(f"open-ended claim blocks allocation: {label}")
     if start < hi and end > lo:
         raise SystemExit(f"production ledger contains VAL-ONLY overlap [{start},{end}): {label}")
-wave_seeds = 40_000
+wave_seeds = 64_000
 next_safe = max(end for _, end, _ in rows)
 if next_safe < hi and next_safe + wave_seeds > lo:
     next_safe = hi
@@ -419,18 +415,28 @@ done
 sync_seed_ledger reports overlaps between different claim IDs but does not fail
 for them. Treat any new overlap as fatal. Quarantine the affected data.
 
-Do not hand-derive per-box ranges. The sealed contract owns 40 disjoint
-1,000-seed worker blocks and render emits the exact three category claims for
-each physical GPU. Append all 120 rendered rows to the canonical prefix, check
-the resulting ledger, and redistribute the same bytes to all eight hosts before
-any `--go` attempt. A claim remains consumed after a guard failure, crash, or
+Do not hand-derive per-box ranges. The sealed v3 contract owns 64 disjoint
+1,000-seed worker blocks and render emits exactly three category claims for
+each physical GPU. Use `a1_pre_wave_contract.py claim` to append all 192 rows
+atomically to the canonical ledger and publish its no-clobber claim receipt.
+
+~~~bash
+"$LOCAL_PY" tools/a1_pre_wave_contract.py claim \
+  --lock <immutable-a1-lock.json> \
+  --render <immutable-a1-render.json> \
+  --receipt <fresh-seed-claim-receipt.json>
+~~~
+
+The executor accepts a remote ledger only when it is an exact append-only
+prefix of those bound live bytes, then synchronizes it; do not manually rewrite
+remote histories. A claim remains consumed after a guard failure, crash, or
 partial wave. Never delete it or reuse its base; resume only through the exact
 executor receipt and lane state.
 
 ## 10. Launch a production wave
 
 Use the A1 executor, not `fleet_launch.sh`. Its host manifest is private and
-must map exactly `c1`-`c6`, `h100-8a`, and `h100-8b` to the production SSH
+must map exactly `c1`-`c8` and `h100-8a`-`h100-8d` to the production SSH
 endpoints and expected remote repository/runtime paths.
 
 ~~~bash
@@ -442,9 +448,10 @@ python tools/fleet/a1_production_executor.py run \
   --receipt <fresh-executor-receipt.json>
 ~~~
 
-The command above is a read-only dry run. Verify the lock, render, host set,
-120 jobs/claims, remote commit/checkpoint/ledger hashes, and both canary-shape
-evidence. Repeat exactly with `--go` to stage and start all 40 lanes. Use
+The command above is a read-only dry run. Verify the lock, render, 12-host set,
+64 lanes, 192 jobs/claims, `repo_artifacts_sha256`, checkpoint/opponent/ledger
+hashes, and both canary-shape evidence. Repeat exactly with `--go` to stage the
+content-addressed tree and start all 64 lanes. Use
 `--resume --go` only for the same lock/render/host set and receipt after an
 interruption; it resumes exact incomplete jobs and never skips guards.
 
@@ -484,14 +491,16 @@ resume transaction.
 
 ## 12. Accept generation before harvest
 
-Run the sealed contract's post-wave audit over all 120 job roots. The audit,
+Run the sealed contract's post-wave audit over all 192 job roots. The audit,
 not a generic teacher/volume profile, is the binding acceptance boundary. It
 must reproduce the lock and runtime-tree hashes, all exact claims, source and
 checkpoint identities, and the global n128/n_fast16/p_full.25 config with
 adaptive budget disabled.
 
-Accept exactly the lowest-seed complete 240/45/15 games per physical GPU for
-current/recent/hard-negative sources: 12,000 complete unique games total.
+Accept exactly the balanced-prefix quota in the v3 lock: 150 current games per
+GPU; 29 recent-history games on the first 8 canonical GPUs and 28 on the other
+56; 10 hard-negative games on the first 24 and 9 on the other 40. This is
+exactly 9,600/1,800/600 = 12,000 complete unique games globally.
 Reserve, truncated, incomplete, and unselected attempts must be absent from
 metrics, holdout, and training. Require zero invalid teacher actions, no
 VAL-ONLY or duplicate seeds, public-observation masking, nonempty rows, all
@@ -615,7 +624,7 @@ $REMOTE_PY tools/corpus_diversity_scan.py \
 
 The diversity scan has no binding threshold and can encode an error in JSON
 while returning zero. Inspect the report. It materializes rows and builds Python
-sets, so do not point it at the full 40-H100 harvest. Aggregate the bounded
+sets, so do not point it at the full 64-H100 harvest. Aggregate the bounded
 report metrics in the wave record; scalable aggregate diversity QA remains a
 known gap.
 
@@ -627,8 +636,37 @@ wave record before training.
 
 For A1, use only `tools/a1_one_dose_train.py` as documented in
 `docs/A1_ONE_DOSE_TRAINING.md`. It verifies the sealed contract, selected-game
-corpus, immutable validation sidecar, and exact one-B200 scalar recipe before
-rendering or executing `train_bc`.
+corpus/composite descriptor, immutable component-aware validation split, and
+exact scalar recipe before rendering or executing `train_bc`. Current
+production must bind topology `b200-8gpu-ddp`: physical GPUs 0-7, eight ranks,
+local batch 512, grad accumulation 1, and global batch 4096. The historical
+single-GPU topology remains replayable for old claims but is not the v5 launch
+recipe.
+
+Run `tools/a1_ddp_epoch_canary.py` first on the same host and exact checkout,
+then pass its hour-fresh receipt to the one-dose dry run. The executor rejects
+anything other than eight distinct B200 identities, NCCL all-reduce, the exact
+shared-sampler/rank-slice reconstruction, and rank-offset training RNG:
+
+~~~bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+  "$REMOTE_PY" -m torch.distributed.run --standalone --nproc_per_node=8 \
+  tools/a1_ddp_epoch_canary.py --out <fresh-ddp-canary.json>
+
+"$REMOTE_PY" tools/a1_one_dose_train.py \
+  --lock <immutable-a1-lock.json> \
+  --data <immutable-production-composite.json> \
+  --checkpoint <fresh-output>/candidate.pt \
+  --report <fresh-output>/report.json \
+  --receipt <fresh-output>/training.receipt.json \
+  --topology b200-8gpu-ddp \
+  --ddp-canary-receipt <fresh-ddp-canary.json> \
+  --gpu 0
+~~~
+
+Inspect this verified dry run, then repeat the identical command with `--go`.
+The one-dose claim is keyed by contract/lineage identity, not the output path;
+changing filenames cannot authorize a second optimizer dose.
 
 ### Historical four-H100 DDP control (not A1)
 
@@ -683,9 +721,17 @@ Keep the incumbent checkpoint untouched.
 
 ## 16. Evaluate the candidate
 
-Run evaluation on the two-B200 `b200` hub, not on the operator workstation.
-Stage the candidate and incumbent under immutable hash-qualified paths, verify
-both hashes after transfer, log in through the alias in `$FLEET_CONF`, and set:
+The current evaluator is `tools/fleet/a1_h100_eval_fleet.py`, documented in
+`docs/A1_H100_DISTRIBUTED_EVAL.md`. Its controller runs on the B200 hub while
+the full plan is sharded over the approved 64-H100 manifest; checkpoint and
+report traffic stays on the provider network. Use role-bound search identities
+(v5 currently 0.10 on both sides), a separate immutable evaluation tree, and
+the controller's dry-run/canary/full-plan transaction.
+
+The direct two-GPU B200 commands retained below are historical recovery
+examples, not the current full evaluation or promotion-evidence path. Stage
+the candidate and incumbent under immutable hash-qualified paths, verify both
+hashes after transfer, log in through the alias in `$FLEET_CONF`, and set:
 
 ~~~bash
 cd /home/ubuntu/catan-zero-v1
@@ -871,6 +917,7 @@ PANEL_OUT="/home/ubuntu/eval_out/$PANEL_ID"
 PANEL_RUNDIR="/home/ubuntu/fleet_runs/$PANEL_ID"
 mkdir -p /home/ubuntu/eval_out
 mkdir "$PANEL_OUT"
+PANEL_C_SCALE=<sealed-role-c-scale>
 
 PANEL_CMD=(
   "$EVAL_PY" tools/gumbel_search_vs_bot_h2h.py
@@ -886,7 +933,7 @@ PANEL_CMD=(
   --value-scale 1.0 \
   --value-squash tanh \
   --c-visit 50.0 \
-  --c-scale 0.03 \
+  --c-scale "$PANEL_C_SCALE" \
   --max-root-candidates 16 \
   --max-root-candidates-wide 54 \
   --correct-rust-chance-spectra \
@@ -903,7 +950,8 @@ PID=$(launch_detached "$PANEL_RUNDIR" "$PANEL_OUT/run.log" 60 -- "${PANEL_CMD[@]
 echo "panel pid=$PID"
 ~~~
 
-Repeat with only candidate and output changed to the incumbent. Reject either
+Repeat with candidate, output, and `PANEL_C_SCALE` changed to the incumbent's
+sealed identity. Reject either
 report with errors, engine divergence, incomplete pairs, or a post-hoc panel
 threshold. `catanatron_ab3` through `ab5` are optional additional panels. This
 lockstep tool uses a fixed tournament board; do not compare its absolute win
@@ -922,6 +970,14 @@ raw policies through a deprecated unmasked path. The native Catanatron harness
 is also raw-policy smoke tooling, not a searched 1,000-game strength panel.
 
 ## 17. Promotion and deployment transaction
+
+The manual registry sequence retained below is historical v2 recovery
+documentation. It is not authorized for a candidate trained from the current
+v3/64-GPU wave: `tools/a1_promotion_transaction.py` currently accepts only the
+issued v2 lock schema. Before the v5 candidate can promote, land a v3-aware
+typed transaction that consumes the exact 192-claim lock, eight-rank learner
+receipt, post-promotion role identities, and required adjudication evidence.
+Until then, evaluation may proceed but registry/deployment mutation is blocked.
 
 Do not create a registry at a new path: `ChampionRegistry.load()` treats a
 missing file as an empty registry and would reset history and the every-third
@@ -1064,7 +1120,8 @@ Create one immutable record per wave with:
 
 ~~~text
 wave name and owner
-release tag and commit
+baseline environment release tag/commit
+sealed `repo_artifacts_sha256`, lock/render SHA-256, and repo-stage receipts
 Rust wheel SHA-256
 champion path, SHA-256, and no-op result
 canonical seed-ledger SHA-256
@@ -1100,7 +1157,8 @@ Neural masking alone is not sufficient: the earlier MCTS implementation cloned
 the authoritative Rust state, so opponent legal moves and materialized chance
 outcomes could condition targets on hidden truth.  The production-safe path now
 requires `--information-set-search --determinization-particles 4
---determinization-min-simulations 32` and wheel 0.1.4.  The engine samples
+--determinization-min-simulations 32` and the current sealed native wheel from
+`FLEET.md` (0.1.8 at this handoff). The engine samples
 complete public-belief worlds, full n128 teacher roots aggregate four particles,
 n16 fast/forced rows use one particle, and traversal stops when control leaves
 the root actor's turn.  Live action resolution still uses authoritative truth.
@@ -1148,7 +1206,7 @@ The RL operator owns manual checks for these gaps until code integrates them:
 1. Seed claims have no shared cross-host lock.
 2. Dynamic generation guards run in detached children; launcher dry-run does not
    execute the complete remote overlap guard.
-3. Information-set MCTS requires the sealed 0.1.4 wheel and the explicit
+3. Information-set MCTS requires the sealed current native wheel and the explicit
    determinization flags; older/unknown target regimes are intentionally
    quarantined from masked soft-target training.
 4. No one Gumbel-specific QA profile backs --trust-curated-data.
@@ -1160,8 +1218,10 @@ The RL operator owns manual checks for these gaps until code integrates them:
    are not implemented.
 9. Population-arena generated matches are not production-config or seed safe,
    and no approved population veto threshold consumes their reports.
-10. ChampionRegistry has no lock and does not update fleet CKPT paths.
-11. Rust licensing remains unresolved in FLEET.md.
+10. The typed promotion transaction currently replays v2 locks only; v3/192-
+    claim candidate promotion is blocked pending its corresponding schema.
+11. ChampionRegistry has no lock and does not update fleet CKPT paths.
+12. Rust licensing remains unresolved in FLEET.md.
 
 Stop when one of these gaps makes the evidence ambiguous.
 
@@ -1171,7 +1231,8 @@ Copy this task into the operating agent:
 
 ~~~text
 You own the CatanZero 2p_no_trade RL fleet workflow. Read
-RL_AGENT_HANDOFF.md, docs/plans/CATAN_ZERO_ROADMAP.md,
+RL_AGENT_HANDOFF.md, docs/operations/A1_V5_64GPU_PRE_WAVE.md,
+docs/plans/CATAN_ZERO_ROADMAP.md,
 docs/plans/CATAN_ZERO_MASTER_PLAN.md, FLEET.md,
 tools/fleet/FLEET_CONTROL.md, and
 docs/plans/H100_EXECUTION_UPDATE_2026-07-09.md before changing state.
@@ -1181,9 +1242,11 @@ hash/no-op result, canonical production and validation ledger hashes/overlaps,
 authoritative ChampionRegistry hash/roles/promotion count, fleet aliases,
 current status, free disk, CUDA/Torch versions, and every unmet prerequisite.
 
-Do not launch until the immutable release, real masked champion, canonical
-ledger, private fleet config, CUDA acceptance, and predeclared corpus/gate
-criteria all pass. Use dry-run commands first and launch one box at a time.
+Do not launch until baseline provisioning, the content-addressed sealed runtime
+plan, real masked champion, canonical ledger, private 64-GPU fleet config,
+CUDA acceptance, and predeclared corpus/gate criteria all pass. Use dry-run
+commands first; production execution may start only from the exact reviewed
+64-lane executor plan.
 Record every claim and output path. Never harvest canary data, reuse seeds,
 trust a zero exit without manifests, bypass duplicate/fill checks, train before
 QA sign-off, pool role-pure controls without approval, or promote on an

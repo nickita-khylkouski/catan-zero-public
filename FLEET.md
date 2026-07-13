@@ -81,6 +81,13 @@ table is not a teacher/volume role split.
   homogeneous **INTEL Xeon**; `NOOP_ATOL=1e-4` is only the safety net for a
   future non-Intel box.
 
+The tag above provisions dependencies; it is not the current A1 wave-code
+authority. `tools/fleet/a1_production_executor.py` reconstructs the exact
+lock-bound runtime file set, hashes its path/mode/byte manifest, and atomically
+stages a read-only tree at `<remote_root>/repo-<repo_artifacts_sha256>` on every
+declared consumer. Production lanes execute that content-addressed tree. Never
+replace it with the mutable provisioning checkout or a newer tag after review.
+
 ### Canonical two-commit wheel release
 
 The native wheel and its checksum inventory are published as a two-commit
@@ -140,13 +147,14 @@ before two clean builds agree.
 
 ## 7. Launch / stop / status (CAT-122 / CAT-123) — one canonical path
 Interpreter is auto-resolved (`$GEN_PY` → `~/venv/bin/python` → `<tree>/.venv/bin/python`); never a bare `torchrun`/`python3` (loads system numpy<2, crashes champion load — CAT-128) and never a hardcoded `.venv` (stranded a GPU — CAT-123). Hosts via `fleet_lib.sh` (§2).
-- **A1 launch:** seal and verify the pre-wave contract, render its exact 120
-  category/GPU jobs, synchronize all 120 ledger claims to every production
-  host, then use `tools/fleet/a1_production_executor.py`. It is dry-run by
+- **A1 launch:** seal and verify the pre-wave contract, render its exact 192
+  category/GPU jobs, atomically append all 192 claims to the canonical ledger,
+  require each remote ledger to be an exact append-only prefix, then use
+  `tools/fleet/a1_production_executor.py`. It is dry-run by
   default; `--go` is the only execution boundary. The executor runs one
   category at a time per GPU under a detached resumable lane supervisor. Do
   not substitute the generic role launcher for A1.
-- **A1 live canary:** before production claims or a 40-lane launch, use
+- **A1 live canary:** before production claims or a 64-lane launch, use
   `tools/fleet/a1_live_canary.py` against the sealed lock/render and private
   host manifest. It selects exactly `c1` GPU0-3 plus `h100-8a` GPU0-7, derives
   36 validation-only jobs with the identical recipe, and writes only a private
@@ -156,7 +164,8 @@ Interpreter is auto-resolved (`$GEN_PY` → `~/venv/bin/python` → `<tree>/.ven
   ledger into production.
 - **A1 runtime:** one generator per physical GPU, 16 workers/GPU,
   systemd-managed MPS, EvalServer off, strict FP32, public-observation masking,
-  `n_full=128`, `n_fast=16`, `p_full=0.25`, `c_scale=0.03`, D1 rescaling off,
+  `n_full=128`, `n_fast=16`, `p_full=0.25`, deployed `c_scale=0.10` on every
+  source category, D1 rescaling off,
   and D6 averaging from legal width 20. `n_full_wide` and its threshold are
   unset and `wide_roots_always_full=false`: adaptive n256 is disabled.
 - **Generic launcher:** `tools/fleet/fleet_launch.sh` remains useful for bounded
@@ -184,7 +193,7 @@ at w128.
 
 These are preserved throughput-only results from the historical 24-H100
 EvalServer experiment with a synthetic same-shape masked 35M checkpoint. They
-are not the 56-H100 A1 runtime recipe and must not be multiplied to claim A1
+are not the 64-H100 A1 runtime recipe and must not be multiplied to claim A1
 capacity. TF32 remains rejected after same-seed trajectory divergence;
 `matmul_precision=highest` is mandatory.
 
@@ -195,7 +204,9 @@ capacity. TF32 remains rejected after same-seed trajectory divergence;
    (CAT-130); env-doctor + Rust parity smoke must pass.
 3. Fleet acceptance: `NOOP_ATOL=1e-4 PY=<venv> bash scripts/gate.sh --only noop` then `PY=<venv> bash scripts/gate.sh --only parity` (§3).
 4. Claim a disjoint seed block in `runs/SEED_LEDGER.md` (§5).
-5. Launch via `fleet_launch.sh` (§7).
+5. For A1, add the node only through a new authoritative fleet manifest and
+   sealed contract, then launch through the production executor (§7). Use
+   `fleet_launch.sh` only for an explicitly bounded non-A1 diagnostic.
 
 ## 9. Observability
 - Grafana + Prometheus + DCGM on the **b200 hub**: `http://<b200 alias>:3000` (creds in `~/GRAFANA_CREDS.txt` on b200). `b200-rnd-b` is a separately allocatable eight-GPU R&D node and must be added to service discovery with label `gpumodel`, not `gpu`.

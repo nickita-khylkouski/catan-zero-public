@@ -1,7 +1,14 @@
-# A1 promotion transaction
+# Historical A1 v2 promotion transaction
 
-`tools/a1_promotion_transaction.py` is the only atomic/recoverable mutation
-boundary for the current A1 generator-champion promotion. It does not run a
+> **Historical, not the post-promotion v5 wave transaction.** This document
+> and `tools/a1_promotion_transaction.py` replay issued
+> `a1-pre-wave-contract-lock-v2` evidence with 120 claims. The current v5 data
+> wave uses a v3 lock, 64 GPU lanes, and 192 claims. Do not use the v2
+> transaction to promote a candidate trained from that wave; a v3-aware typed
+> promotion boundary must be implemented, reviewed, and documented first.
+
+`tools/a1_promotion_transaction.py` is the atomic/recoverable mutation
+boundary for the historical v2 A1 generator-champion promotion. It does not run a
 gate, alter `public_champion`, or deploy checkpoint bytes to the fleet.
 
 ## Preconditions

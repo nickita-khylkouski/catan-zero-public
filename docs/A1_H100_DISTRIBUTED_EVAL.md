@@ -1,15 +1,18 @@
 # A1 distributed H100 evaluation
 
-Training stays on the selected B200. Evaluation runs on the 40-H100 fleet and
-is controlled directly from that B200; checkpoint and report traffic never
+Training stays on the selected eight-GPU B200 host. Evaluation can run on the
+full 64-H100 fleet and is controlled directly from that B200; checkpoint and report traffic never
 passes through an operator laptop.
 
 `tools/fleet/a1_h100_eval_fleet.py` provides a fail-closed SSH backend today and
 can render a Ray cluster specification without installing or starting Ray.
-Capacity is allocated per physical GPU: the two 8-GPU hosts receive twice the
-work of each 4-GPU host. The sealed evaluator recipe is n128, c-scale 0.03,
-sigma 0.98, public-observation information-set search with four
-determinizations, and D6 averaging from width 20.
+Capacity is allocated per physical GPU: each of the four 8-GPU hosts receives
+twice the work of each 4-GPU host. The evaluator base recipe is n128, sigma
+0.98, public-observation information-set search with four determinizations,
+and D6 averaging from width 20. `c_scale` is role-bound: the current v5
+candidate and incumbent identities both use 0.10. The 0.03 default remains
+only for replaying an older sealed identity and must not silently override a
+post-promotion role.
 
 Future plans default to 16 evaluator workers per GPU.  A counterbalanced,
 full-game n128 B200 packing run completed 128/128 games with zero truncations
