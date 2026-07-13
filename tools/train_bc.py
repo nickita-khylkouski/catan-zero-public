@@ -5538,6 +5538,84 @@ def _configure_public_award_feature_training(
     }
 
 
+def _bind_composite_validation_provenance(
+    args: argparse.Namespace,
+    data,
+    *,
+    validation_seed_contract: dict[str, object] | None,
+    composite_meta: dict[str, object],
+    ddp: dict[str, int | bool],
+) -> None:
+    """Bind the validation authority appropriate to one composite schema.
+
+    Historical diagnostic composites carry the sealed A1 component holdout
+    manifests returned by ``_load_composite_validation_contract``.  A
+    promotion-eligible flywheel composite deliberately has no A1 sentinel: its
+    whole-game split is derived component-by-component by
+    :func:`split_train_validation_indices` and its authority is the replay
+    contract authenticated during descriptor preflight.  Keeping these two
+    paths explicit prevents the production path from dereferencing the absent
+    diagnostic contract before the first optimizer step.
+    """
+
+    if validation_seed_contract is None:
+        if not (
+            composite_meta.get("schema_version") == "memmap_composite_v2"
+            and composite_meta.get("diagnostic_only") is False
+            and composite_meta.get("promotion_eligible") is True
+            and isinstance(composite_meta.get("flywheel_replay_contract"), dict)
+        ):
+            raise SystemExit(
+                "composite without an A1 validation contract must carry the exact "
+                "promotion-eligible flywheel replay contract"
+            )
+        # This is not an A1 one-dose corpus, so it must not mint an A1 contract
+        # identity.  The report separately binds ``flywheel_replay_contract``.
+        if getattr(args, "a1_contract_sha256", "") not in {"", None}:
+            raise SystemExit(
+                "promotion-eligible flywheel composite may not inherit an A1 "
+                "validation contract identity"
+            )
+        return
+
+    args.a1_contract_sha256 = validation_seed_contract["a1_contract_sha256"]
+
+    def _validate_composite_seed_binding() -> None:
+        component_seed_sets: list[set[int]] = []
+        for index, (corpus, contract) in enumerate(
+            zip(data.corpora, validation_seed_contract["component_contracts"])
+        ):
+            seeds = np.asarray(corpus["game_seed"], dtype=np.int64)
+            component_seeds = set(map(int, np.unique(seeds)))
+            for prior in component_seed_sets:
+                overlap = prior & component_seeds
+                if overlap:
+                    raise SystemExit(
+                        "memmap composite corpus game seeds overlap across components: "
+                        f"component={index} overlap_count={len(overlap)}"
+                    )
+            component_seed_sets.append(component_seeds)
+            heldout_rows = int(
+                np.isin(
+                    seeds,
+                    np.asarray(contract["game_seeds"], dtype=np.int64),
+                ).sum()
+            )
+            if heldout_rows != int(contract["validation_row_count"]):
+                raise SystemExit(
+                    "memmap composite component holdout row count drift: "
+                    f"component={index} corpus={heldout_rows} "
+                    f"manifest={contract['validation_row_count']}"
+                )
+
+    # Every local DDP rank maps the same immutable corpus.  Repeating two full
+    # game-seed scans and Python set construction eight times delays the first
+    # GPU step without increasing assurance.
+    _rank0_authoritative_call(
+        ddp, "composite game-seed binding", _validate_composite_seed_binding
+    )
+
+
 def main(argv: Sequence[str] | None = None) -> None:
     global _PUBLIC_AWARD_FEATURE_CONTRACT
     checkout_runtime_binding = _assert_checkout_runtime_binding()
@@ -5923,45 +6001,12 @@ def main(argv: Sequence[str] | None = None) -> None:
     )
     a1_training_binding: dict[str, object] | None = None
     if is_memmap_composite:
-        # Existing promotion receipts bind one A1 learner contract. Both
-        # component payloads/holdouts are authenticated, but this mixed run is
-        # diagnostic-only until a contract binds the ordered component set.
-        args.a1_contract_sha256 = validation_seed_contract["a1_contract_sha256"]
-        def _validate_composite_seed_binding() -> None:
-            component_seed_sets: list[set[int]] = []
-            for index, (corpus, contract) in enumerate(
-                zip(data.corpora, validation_seed_contract["component_contracts"])
-            ):
-                seeds = np.asarray(corpus["game_seed"], dtype=np.int64)
-                component_seeds = set(map(int, np.unique(seeds)))
-                for prior in component_seed_sets:
-                    overlap = prior & component_seeds
-                    if overlap:
-                        raise SystemExit(
-                            "memmap composite corpus game seeds overlap across components: "
-                            f"component={index} overlap_count={len(overlap)}"
-                        )
-                component_seed_sets.append(component_seeds)
-                heldout_rows = int(
-                    np.isin(
-                        seeds,
-                        np.asarray(contract["game_seeds"], dtype=np.int64),
-                    ).sum()
-                )
-                if heldout_rows != int(contract["validation_row_count"]):
-                    raise SystemExit(
-                        "memmap composite component holdout row count drift: "
-                        f"component={index} corpus={heldout_rows} "
-                        f"manifest={contract['validation_row_count']}"
-                    )
-
-        # Every local DDP rank maps the same immutable corpus.  Repeating two
-        # full game-seed scans and Python set construction eight times delays
-        # the first GPU step without increasing assurance.  Rank 0 performs
-        # the exact historical validation and broadcasts either success or its
-        # refusal before any rank proceeds.
-        _rank0_authoritative_call(
-            ddp, "composite game-seed binding", _validate_composite_seed_binding
+        _bind_composite_validation_provenance(
+            args,
+            data,
+            validation_seed_contract=validation_seed_contract,
+            composite_meta=a1_preflight_meta,
+            ddp=ddp,
         )
     elif validation_seed_contract is not None:
         _validate_a1_validation_manifest_corpus_binding(
