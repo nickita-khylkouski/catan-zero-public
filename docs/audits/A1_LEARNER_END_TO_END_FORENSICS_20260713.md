@@ -320,6 +320,19 @@ legacy corpus/checkpoint contract, even though the authoritative game state can
 populate it. Enabling the corrected value shifts f7 outputs and therefore is not
 a no-op feature toggle.
 
+The deployed B200 runtime was checked directly: `catanatron-rs==0.1.8` exposes
+authoritative `has_road` and `longest_roads_by_player` in its public JSON
+snapshot. That bridge already benefits the future-horizon auxiliary labels:
+`rust_aux_state_from_snapshot` consumes `has_road`, and all 31,919,276 n128,
+12,773,247 n256, and 2,927,924 replay rows have finite longest-road labels
+(positive rates 19.78%, 19.86%, and 19.97%). It does **not** repair model input.
+`_players_from_rust_snapshot` still writes `has_longest_road=False`, and the
+native feature builder intentionally mirrors it. Across those same corpora,
+player-token slot 12 is zero in all 190,481,788 player rows, while the adjacent
+longest-road-length slot is nonzero in 86,402,274. Thus the wheel provides the
+fact, the auxiliary target pipeline uses it, but adapter v2 deliberately drops
+the fact before neural inference.
+
 The same conclusion applies to the legacy Rust adapter's trade surface. Its v2
 contract also pins the case-sensitive misses in trade action/prompt one-hots,
 zero `offers_remaining`/`current_offer`, legacy maritime list-cardinality totals,
@@ -349,6 +362,15 @@ Those failures still localize first to lineage, dose, target calibration, and
 evaluation binding. A future repair must be a separately named f7-start arm with
 the input-column initialization and topology treatment explicitly bound; it
 must not be silently mixed into the current TEMP control.
+
+The migration boundary is explicit: register an append-only adapter v3 whose
+first semantic delta is authoritative public award ownership; emit v3 in new
+shards; reject mixed v2/v3 training by default; expand the player encoder with a
+function-preserving zero-input-column upgrade; retrain from an exact declared
+parent; and compare against that parent with the same search operator. Existing
+v2 checkpoints and memmaps remain pinned to constant-false. The public award
+cannot be reconstructed safely from old road lengths alone because
+incumbent-aware ties are not identifiable from final lengths.
 
 The P0 reproduction below remains explicitly **legacy-corpus / legacy-feature**.
 A future authoritative-v1 run must bind producer and memmap provenance to that
