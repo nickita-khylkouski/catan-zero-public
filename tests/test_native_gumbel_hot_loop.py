@@ -192,14 +192,13 @@ def test_native_particle_override_preserves_exact_per_particle_dose() -> None:
     assert "n_full_wide" not in native
 
 
-@pytest.mark.skipif(
-    not native_hot_loop_available(), reason="native wheel lacks gumbel_search"
-)
 def test_native_config_maps_sigma_reference_visits() -> None:
-    search = NativeGumbelChanceMCTS(
-        GumbelChanceMCTSConfig(sigma_reference_visits=12),
-        _PublicCountingEvaluator(),
-    )
+    # Mapping is a pure Python boundary contract.  Do not require the installed
+    # wheel to advertise the new capability here: the separate test below
+    # proves that an older wheel fails closed at engine construction time.
+    search = object.__new__(NativeGumbelChanceMCTS)
+    search.config = GumbelChanceMCTSConfig(sigma_reference_visits=12)
+    search.rng = random.Random(7)
     assert search._native_config()["sigma_reference_visits"] == 12
 
 
