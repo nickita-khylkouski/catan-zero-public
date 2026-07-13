@@ -41,6 +41,7 @@ MODULE_TOPOLOGY_TARGET_GATHER = (
     "entity_graph.topology_residual_adapter+action_target_gather.v1"
 )
 MODULE_BELIEF_RESOURCE_HEAD = "entity_graph.belief_resource_head.v1"
+MODULE_STATIC_ACTION_RESIDUAL = "entity_graph.static_action_residual.v1"
 
 # This is intentionally code, not caller-controlled configuration.  A new
 # architecture exception must be reviewed and tested before it can initialize
@@ -110,6 +111,14 @@ ALLOWLIST: dict[str, dict[str, Any]] = {
             "belief_resource_head.3.weight": "seeded_torch_default",
         },
         "config_delta": {"belief_resource_head": True},
+    },
+    MODULE_STATIC_ACTION_RESIDUAL: {
+        "flags": {"static_action_residual": True},
+        "new_parameter_initialization": {
+            "static_action_residual_proj.bias": "zeros",
+            "static_action_residual_proj.weight": "zeros",
+        },
+        "config_delta": {"static_action_residual": True},
     },
 }
 

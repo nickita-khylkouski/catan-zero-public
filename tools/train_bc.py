@@ -16878,6 +16878,7 @@ ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS: dict[str, tuple[str, ...]] = {
     "target_gather": ("target_gather_proj",),
     "edge_policy": ("edge_policy_mlp",),
     "action_cross": ("action_cross_blocks",),
+    "static_action_residual": ("static_action_residual_proj",),
     "value_heads": (
         "value_head",
         "value_categorical_head",
@@ -16904,6 +16905,7 @@ ENTITY_GRAPH_VALUE_ONLY_FREEZE_GROUPS: frozenset[str] = frozenset(
         "target_gather",
         "edge_policy",
         "action_cross",
+        "static_action_residual",
     }
 )
 
@@ -16936,6 +16938,7 @@ def _effective_entity_graph_architecture_report(
             "edge_policy_head": bool(requested_edge_policy_head),
             "aux_subgoal_heads": bool(requested_aux_subgoal_heads),
             "topology_residual_adapter": False,
+            "static_action_residual": False,
             "requested_edge_policy_head": bool(requested_edge_policy_head),
             "requested_aux_subgoal_heads": bool(requested_aux_subgoal_heads),
             "belief_resource_head": bool(requested_belief_resource_head),
@@ -16954,6 +16957,9 @@ def _effective_entity_graph_architecture_report(
         "aux_subgoal_heads": bool(getattr(config, "aux_subgoal_heads", False)),
         "topology_residual_adapter": bool(
             getattr(config, "topology_residual_adapter", False)
+        ),
+        "static_action_residual": bool(
+            getattr(config, "static_action_residual", False)
         ),
         "belief_resource_head": bool(
             getattr(config, "belief_resource_head", False)
@@ -17146,6 +17152,7 @@ ACTION_LOCAL_MODULE_ATTRS: tuple[str, ...] = (
     "target_gather_proj",
     "action_cross_blocks",
     "edge_policy_mlp",
+    "static_action_residual_proj",
 )
 
 
