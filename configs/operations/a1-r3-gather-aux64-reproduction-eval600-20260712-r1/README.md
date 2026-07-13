@@ -47,6 +47,14 @@ exactly 48 GPUs by adding only c7/c8.  It was **not** used by this immutable
 future, separately sealed, disjoint-seed extension after the 48-topology code
 is reviewed, committed, and deployed.
 
+`fleet64.manifest.json` is the separately approved full topology.  It adds
+the onboarded 8-GPU `h100-8c` and `h100-8d` hosts to that exact 48-GPU fleet.
+The controller accepts only the canonical 40-, 48-, or 64-GPU
+alias/address/GPU mappings; partial 56/60-GPU mixtures and address
+substitutions fail closed.  This manifest also was **not** used by the sealed
+40-GPU result above and cannot be substituted into its plan because the
+manifest hash is part of the run identity.
+
 The comparison reproduces the earlier AUX64 evaluation operator exactly:
 paired same-seed/color-swapped BASE games; native Rust information-set search;
 `n_full=128`; P4 with minimum 32 simulations per particle; D6 at width 20;

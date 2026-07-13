@@ -43,22 +43,38 @@ from tools.prelaunch_guard import VAL_ONLY_SEED_RANGE  # noqa: E402
 MANIFEST_SCHEMA = "a1-h100-eval-fleet-manifest-v1"
 PLAN_SCHEMA = "a1-h100-eval-fleet-plan-v1"
 RAY_SCHEMA = "a1-h100-eval-ray-cluster-v1"
-EXPECTED_SHAPES = {
-    "c1": 4,
-    "c2": 4,
-    "c3": 4,
-    "c4": 4,
-    "c5": 4,
-    "c6": 4,
-    "h100-8a": 8,
-    "h100-8b": 8,
+EXPECTED_HOSTS = {
+    "c1": ("192.222.54.251", 4),
+    "c2": ("68.209.75.117", 4),
+    "c3": ("192.222.53.18", 4),
+    "c4": ("68.209.73.252", 4),
+    "c5": ("68.209.74.145", 4),
+    "c6": ("68.209.74.2", 4),
+    "h100-8a": ("192.222.53.119", 8),
+    "h100-8b": ("192.222.55.216", 8),
 }
+EXPANDED_EXPECTED_HOSTS = {
+    **EXPECTED_HOSTS,
+    "c7": ("68.209.74.24", 4),
+    "c8": ("68.209.72.159", 4),
+}
+FULL_EXPECTED_HOSTS = {
+    **EXPANDED_EXPECTED_HOSTS,
+    "h100-8c": ("192.222.54.141", 8),
+    "h100-8d": ("209.20.158.82", 8),
+}
+APPROVED_FLEET_HOSTS = (
+    EXPECTED_HOSTS,
+    EXPANDED_EXPECTED_HOSTS,
+    FULL_EXPECTED_HOSTS,
+)
+EXPECTED_SHAPES = {alias: host[1] for alias, host in EXPECTED_HOSTS.items()}
 EXPANDED_EXPECTED_SHAPES = {
-    **EXPECTED_SHAPES,
-    "c7": 4,
-    "c8": 4,
+    alias: host[1] for alias, host in EXPANDED_EXPECTED_HOSTS.items()
 }
-APPROVED_FLEET_SHAPES = (EXPECTED_SHAPES, EXPANDED_EXPECTED_SHAPES)
+FULL_EXPECTED_SHAPES = {
+    alias: host[1] for alias, host in FULL_EXPECTED_HOSTS.items()
+}
 CANARY_ALIASES = {"c1", "h100-8a"}
 DEFAULT_WORKERS_PER_GPU = 16
 SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
@@ -318,16 +334,24 @@ def load_manifest(
         except (KeyError, TypeError, ValueError) as error:
             raise FleetError(f"invalid gpu_count for {alias}") from error
         hosts.append({"alias": alias, "address": address, "gpu_count": gpu_count})
-    actual = {host["alias"]: host["gpu_count"] for host in hosts}
-    if len(actual) != len(hosts):
+    actual_shapes = {host["alias"]: host["gpu_count"] for host in hosts}
+    actual_hosts = {
+        host["alias"]: (host["address"], host["gpu_count"]) for host in hosts
+    }
+    if len(actual_shapes) != len(hosts):
         raise FleetError("fleet manifest contains duplicate aliases")
-    approved_shapes = (
-        APPROVED_FLEET_SHAPES if expected_shapes is None else (expected_shapes,)
-    )
-    if actual not in approved_shapes:
+    approved_hosts = APPROVED_FLEET_HOSTS
+    if expected_shapes is not None:
+        approved_hosts = tuple(
+            expected
+            for expected in APPROVED_FLEET_HOSTS
+            if {alias: host[1] for alias, host in expected.items()}
+            == expected_shapes
+        )
+    if actual_hosts not in approved_hosts:
         raise FleetError(
-            "A1 eval manifest differs from every exact approved fleet shape: "
-            f"expected one of {approved_shapes}, got {actual}"
+            "A1 eval manifest differs from every exact approved fleet mapping: "
+            f"expected one of {approved_hosts}, got {actual_hosts}"
         )
     manifest["hosts"] = sorted(hosts, key=lambda item: item["alias"])
     manifest["manifest_hash"] = _digest(
