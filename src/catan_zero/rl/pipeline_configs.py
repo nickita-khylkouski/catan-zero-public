@@ -243,6 +243,9 @@ class TrainConfig(PipelineConfig):
     weight_decay: float = 0.0
     fused_optimizer: bool = False
     amp: str = "none"
+    # PyTorch FP32 matmul mode. ``high`` enables TF32 tensor-core kernels on
+    # supported NVIDIA GPUs and changes the numerical training trajectory.
+    float32_matmul_precision: str = "highest"
     lr: float = 2e-4
     # Global gradient-norm clipping. 0 is the explicit no-clip sentinel; the
     # historical/default trajectory remains exactly 1.0.

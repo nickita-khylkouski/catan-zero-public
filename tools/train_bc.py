@@ -1319,6 +1319,18 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--float32-matmul-precision",
+        choices=("highest", "high"),
+        default="highest",
+        help=(
+            "PyTorch float32 matmul precision. 'highest' preserves the historical "
+            "FP32 learner trajectory; 'high' permits TF32 tensor-core matmuls on "
+            "supported NVIDIA GPUs and is a trajectory-changing experiment that "
+            "must be recipe/checkpoint bound. --amp bf16 retains its historical "
+            "effective 'high' setting regardless of this redundant FP32 knob."
+        ),
+    )
+    parser.add_argument(
         "--allow-concurrent-bc",
         action="store_true",
         help=(
@@ -1433,6 +1445,35 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_config_flags(parser, default_purpose="train_bc")
     return parser
+
+
+def _effective_float32_matmul_precision(*, amp: str, requested: str) -> str:
+    """Resolve the actual PyTorch float32 matmul mode without hidden defaults.
+
+    The BF16 path has set ``high`` since mixed precision was introduced. Keep
+    that trajectory stable. Pure-FP32 training defaults to ``highest`` so TF32
+    is an explicit, independently sealable science axis rather than a silent
+    hardware-dependent production change.
+    """
+
+    if requested not in {"highest", "high"}:
+        raise ValueError(f"unsupported float32 matmul precision: {requested!r}")
+    if amp not in {"none", "bf16"}:
+        raise ValueError(f"unsupported AMP mode: {amp!r}")
+    return "high" if amp == "bf16" else requested
+
+
+def _floating_point_execution_contract(args: argparse.Namespace) -> dict[str, str]:
+    """Durable checkpoint/report description of the numerical execution mode."""
+
+    return {
+        "schema_version": "train-bc-floating-point-execution-v1",
+        "amp": str(args.amp),
+        "requested_float32_matmul_precision": str(args.float32_matmul_precision),
+        "effective_float32_matmul_precision": str(
+            args.effective_float32_matmul_precision
+        ),
+    }
 
 
 def _build_guard_specs(
@@ -4028,6 +4069,14 @@ def _effective_a1_learner_training_recipe(
     # bind the trajectory-changing opt-in explicitly.
     if bool(getattr(args, "training_rng_rank_offset", False)):
         effective["training_rng_rank_offset"] = True
+    # Historical seals implicitly used PyTorch's ``highest`` FP32 mode and stay
+    # byte-for-byte valid. Opting into TF32 is trajectory-changing and must
+    # appear in a fresh A1 seal.
+    float32_matmul_precision = str(
+        getattr(args, "float32_matmul_precision", "highest")
+    )
+    if float32_matmul_precision != "highest":
+        effective["float32_matmul_precision"] = float32_matmul_precision
     return effective
 
 
@@ -4908,8 +4957,23 @@ def main(argv: Sequence[str] | None = None) -> None:
         torch.cuda.set_device(ddp["local_rank"])
         dist.init_process_group(backend="nccl")
         args.device = f"cuda:{ddp['local_rank']}"
+    args.effective_float32_matmul_precision = _effective_float32_matmul_precision(
+        amp=str(args.amp), requested=str(args.float32_matmul_precision)
+    )
+    torch.set_float32_matmul_precision(args.effective_float32_matmul_precision)
+    _rank0_print(
+        json.dumps(
+            {
+                "progress": "float32_matmul_precision",
+                "requested": str(args.float32_matmul_precision),
+                "effective": str(args.effective_float32_matmul_precision),
+                "amp": str(args.amp),
+            },
+            sort_keys=True,
+        ),
+        ddp,
+    )
     if args.amp == "bf16":
-        torch.set_float32_matmul_precision("high")
         if str(args.device).startswith("cuda") and not torch.cuda.is_bf16_supported():
             raise SystemExit("--amp bf16 requested but CUDA device lacks BF16 support")
 
@@ -5084,6 +5148,10 @@ def main(argv: Sequence[str] | None = None) -> None:
     training_information_surface = _a1_training_event_history_contract(
         args, a1_preflight_meta, env_config
     )
+    training_information_surface = {
+        **(training_information_surface or {}),
+        "floating_point_execution": _floating_point_execution_contract(args),
+    }
     global _CROP_AUTHENTICATED_EMPTY_EVENT_HISTORY
     if bool(args.crop_authenticated_empty_event_history):
         if (
@@ -6304,6 +6372,13 @@ def main(argv: Sequence[str] | None = None) -> None:
             value_sample_weights,
             num_workers=int(args.data_loader_workers),
             prefetch=int(args.data_loader_prefetch),
+            crop_authenticated_empty_event_history=bool(
+                _CROP_AUTHENTICATED_EMPTY_EVENT_HISTORY
+                and getattr(policy, "policy_type", "") == "entity_graph"
+            ),
+            omit_unused_observation=(
+                getattr(policy, "policy_type", "") == "entity_graph"
+            ),
         )
         for batch_number, (_batch_tuple, _is_last_batch) in enumerate(
             _iter_with_last(batch_iterator), start=1
@@ -7098,6 +7173,10 @@ def main(argv: Sequence[str] | None = None) -> None:
         ),
         **_training_draw_accounting(metrics),
         "amp": args.amp,
+        "float32_matmul_precision": str(args.float32_matmul_precision),
+        "effective_float32_matmul_precision": str(
+            args.effective_float32_matmul_precision
+        ),
         "optimizer": args.optimizer,
         "lr": float(args.lr),
         "max_grad_norm": float(args.max_grad_norm),
@@ -9459,6 +9538,13 @@ def evaluate_bc_batches(
                 value_sample_weights,
                 num_workers=int(data_loader_workers),
                 prefetch=int(data_loader_prefetch),
+                crop_authenticated_empty_event_history=bool(
+                    _CROP_AUTHENTICATED_EMPTY_EVENT_HISTORY
+                    and getattr(policy, "policy_type", "") == "entity_graph"
+                ),
+                omit_unused_observation=(
+                    getattr(policy, "policy_type", "") == "entity_graph"
+                ),
             )
         ):
             batch_metrics = eval_fn(
@@ -11145,6 +11231,8 @@ def _iterate_training_batches(
     *,
     num_workers: int,
     prefetch: int,
+    crop_authenticated_empty_event_history: bool = False,
+    omit_unused_observation: bool = False,
 ):
     """Yield ``(data, batch, policy_weights, value_weights)`` tuples for one epoch.
 
@@ -11155,10 +11243,18 @@ def _iterate_training_batches(
     Prefetch path (MemmapCorpus + num_workers>0): background threads materialise
     each batch's columns into a plain dict while the GPU trains the previous
     batch, overlapping the per-batch ragged reconstruction. train_fn then sees a
-    materialised dict indexed by a local ``arange``, which is element-for-element
-    identical to indexing the corpus with the global batch. Threads (not
-    processes) share the read-only memmaps safely and avoid the fork-duplication
-    pitfall of DataLoader workers.
+    materialised dict indexed by a local ``arange``. Ordinarily that is
+    element-for-element identical to indexing the corpus with the global batch.
+    When ``crop_authenticated_empty_event_history`` is true, the already-audited
+    all-empty event payload is represented directly at its effective zero width
+    instead of first gathering the padded payload from disk only for
+    :func:`_entity_batch` to discard it. The event mask is still gathered and
+    checked, preserving the runtime fail-closed assertion against a live event.
+    ``omit_unused_observation`` similarly avoids gathering the legacy dense
+    observation for an entity-graph learner; its exact source shape is retained
+    as private batch-profile metadata, but the entity forward never consumes the
+    payload. Threads (not processes) share the read-only memmaps safely and avoid
+    the fork-duplication pitfall of DataLoader workers.
     """
     batches = [
         train_indices[order[start : start + batch_size]]
@@ -11174,7 +11270,28 @@ def _iterate_training_batches(
     keys = list(data.keys())
 
     def _materialize(batch: np.ndarray):
-        materialized = {key: data[key][batch] for key in keys}
+        materialized = {}
+        for key in keys:
+            column = data[key]
+            if omit_unused_observation and key == "obs":
+                materialized["_source_obs_inner_shape"] = tuple(
+                    int(dimension) for dimension in column.shape[1:]
+                )
+                continue
+            if (
+                crop_authenticated_empty_event_history
+                and key in {"event_tokens", "event_target_ids"}
+            ):
+                if len(column.shape) != 3:
+                    raise ValueError(
+                        f"{key} must be rank 3 before empty-event cropping; "
+                        f"got shape {column.shape}"
+                    )
+                materialized[key] = np.empty(
+                    (len(batch), 0, int(column.shape[2])), dtype=column.dtype
+                )
+            else:
+                materialized[key] = column[batch]
         stored_policy_temperatures = _stored_policy_temperatures_for_batch(
             data, batch
         )
@@ -16660,9 +16777,17 @@ def _batch_profile(policy, data: dict, batch: np.ndarray) -> dict:
     )
     valid = data["legal_action_ids"][batch]
     legal_counts = np.sum(valid >= 0, axis=1)
+    source_obs_inner_shape = data.get("_source_obs_inner_shape")
+    if source_obs_inner_shape is None:
+        obs_shape = list(data["obs"][batch].shape)
+    else:
+        obs_shape = [
+            int(len(batch)),
+            *(int(dimension) for dimension in source_obs_inner_shape),
+        ]
     profile = {
         "batch_size": int(len(batch)),
-        "obs_shape": list(data["obs"][batch].shape),
+        "obs_shape": obs_shape,
         "legal_action_ids_shape": list(valid.shape),
         "legal_action_context_shape": list(data["legal_action_context"][batch].shape),
         "dense_action_context_shape": [int(len(batch)), action_size, context_size],
