@@ -79,6 +79,9 @@ def _fake_decision(game_seed: int, decision_index: int) -> gsp.DecisionRecord:
         "afterstate_target_mask": np.asarray([True, True]),
         "prior_policy": np.asarray([0.5, 0.5], dtype=np.float16),
         "adapter_version": "v1",
+        gsp.AUX_SUBGOAL_TARGET_VERSION_KEY: np.uint8(
+            gsp.AUX_SUBGOAL_TARGET_VERSION
+        ),
     }
     features = {
         "hex_tokens": np.zeros((3, 2), dtype=np.float16),
@@ -135,7 +138,15 @@ def _stub_config() -> gsp.GumbelSelfPlayConfig:
     return gsp.GumbelSelfPlayConfig(obs_width=4)
 
 
-def _child_run(out_dir: str, games: int, base_seed: int, run_id: str, sentinel: str) -> None:
+def _child_run(
+    out_dir: str,
+    games: int,
+    base_seed: int,
+    run_id: str,
+    sentinel: str,
+    shard_size: int = SHARD_SIZE,
+    pause_game_index: int = 7,
+) -> None:
     """Runs in a separate OS process; killed (SIGKILL) by the parent test
     right after it signals it has started game index 7 (the 8th game).
     """
@@ -144,7 +155,7 @@ def _child_run(out_dir: str, games: int, base_seed: int, run_id: str, sentinel: 
     gc.disable()  # irrelevant to correctness, just avoids GC noise before the kill
 
     def _stub_play_one_game(mcts, evaluator, *, config, game_seed, game_index, action_size, **_kwargs):
-        if game_index == 7:
+        if game_index == pause_game_index:
             Path(sentinel).write_text("started", encoding="utf-8")
             time.sleep(120)  # parent SIGKILLs us long before this returns
         return _fake_game_record(game_seed, game_index, config.colors)
@@ -161,11 +172,60 @@ def _child_run(out_dir: str, games: int, base_seed: int, run_id: str, sentinel: 
         config=_stub_config(),
         search_config=GumbelChanceMCTSConfig(),
         evaluator=_StubEvaluator(),
-        shard_size=SHARD_SIZE,
+        shard_size=shard_size,
         fmt="npz",
         run_id=run_id,
         resume=True,
     )
+
+
+def _child_pause_after_final_close(
+    out_dir: str, games: int, base_seed: int, run_id: str, sentinel: str
+) -> None:
+    """Publish the final partial shard, then pause before progress advances."""
+
+    def _stub_play_one_game(
+        mcts, evaluator, *, config, game_seed, game_index, action_size, **_kwargs
+    ):
+        return _fake_game_record(game_seed, game_index, config.colors)
+
+    original_close = gsp.GumbelShardWriter.close
+
+    def _close_then_pause(writer):
+        original_close(writer)
+        Path(sentinel).write_text("closed", encoding="utf-8")
+        time.sleep(120)
+
+    gsp.play_one_game = _stub_play_one_game
+    gsp.GumbelShardWriter.close = _close_then_pause
+    gcm._require_rust_module = lambda: None
+    gsp.run_worker_games(
+        out_dir=Path(out_dir),
+        games=games,
+        game_index_start=0,
+        base_seed=base_seed,
+        worker_seed=1,
+        config=_stub_config(),
+        search_config=GumbelChanceMCTSConfig(),
+        evaluator=_StubEvaluator(),
+        shard_size=100,
+        fmt="npz",
+        run_id=run_id,
+        resume=True,
+    )
+
+
+def _row_identities(out_dir: Path) -> list[tuple[int, int]]:
+    identities: list[tuple[int, int]] = []
+    for shard_path in sorted(out_dir.glob("gumbel_self_play_shard_*.npz")):
+        with np.load(shard_path) as data:
+            identities.extend(
+                zip(
+                    map(int, data["game_seed"]),
+                    map(int, data["decision_index"]),
+                )
+            )
+    return identities
 
 
 def test_incremental_resume_after_simulated_preemption(tmp_path, monkeypatch):
@@ -264,6 +324,180 @@ def test_incremental_resume_after_simulated_preemption(tmp_path, monkeypatch):
     assert len(manifest["shards"]) == total_games
 
 
+def test_misaligned_shard_size_never_splits_or_duplicates_replayed_game(
+    tmp_path, monkeypatch
+):
+    """Regression: a 6-row target may not split a 4-row game at row 2."""
+
+    out_dir = tmp_path / "worker_000"
+    out_dir.mkdir()
+    base_seed = 2_000_000
+    total_games = 3
+    run_id = "run-misaligned"
+    sentinel = str(tmp_path / "_game2_started")
+    ctx = multiprocessing.get_context("spawn")
+    proc = ctx.Process(
+        target=_child_run,
+        args=(
+            str(out_dir),
+            total_games,
+            base_seed,
+            run_id,
+            sentinel,
+            6,
+            2,
+        ),
+    )
+    proc.start()
+    deadline = time.time() + 20.0
+    while not Path(sentinel).exists():
+        assert proc.is_alive(), "child died before reaching game 2"
+        assert time.time() < deadline, "child never reached game 2"
+        time.sleep(0.02)
+    os.kill(proc.pid, 9)
+    proc.join(timeout=10)
+    assert not proc.is_alive()
+
+    progress = gsp._load_worker_progress(out_dir)
+    assert progress is not None
+    # Two complete four-row games share one game-atomic eight-row shard.  The
+    # old row-wise writer flushed at row six, retaining half of game 1.
+    assert progress.games_completed_local == 2
+    assert progress.games_succeeded == 2
+    assert progress.shard_count_confirmed == 1
+    assert progress.rows_confirmed == 8
+    before = _row_identities(out_dir)
+    assert len(before) == 8
+    assert {seed for seed, _decision in before} == {
+        base_seed,
+        base_seed + 1,
+    }
+
+    seen: list[int] = []
+
+    def _resume_stub(
+        mcts, evaluator, *, config, game_seed, game_index, action_size, **_kwargs
+    ):
+        seen.append(game_index)
+        return _fake_game_record(game_seed, game_index, config.colors)
+
+    monkeypatch.setattr(gsp, "play_one_game", _resume_stub)
+    monkeypatch.setattr(gcm, "_require_rust_module", lambda: None)
+    summary = gsp.run_worker_games(
+        out_dir=out_dir,
+        games=total_games,
+        game_index_start=0,
+        base_seed=base_seed,
+        worker_seed=1,
+        config=_stub_config(),
+        search_config=GumbelChanceMCTSConfig(),
+        evaluator=_StubEvaluator(),
+        shard_size=6,
+        fmt="npz",
+        run_id=run_id,
+        resume=True,
+    )
+
+    assert seen == [2]
+    assert summary["resumed_from_offset"] == 2
+    assert summary["games_completed"] == 3
+    assert summary["games_failed"] == 0
+    assert summary["rows"] == 12
+    identities = _row_identities(out_dir)
+    expected = [
+        (base_seed + game, decision)
+        for game in range(total_games)
+        for decision in range(DECISIONS_PER_GAME)
+    ]
+    assert sorted(identities) == sorted(expected)
+    assert len(identities) == len(set(identities)) == 12
+    # No game identity appears in more than one shard.
+    seed_shards: dict[int, set[str]] = {}
+    for shard_path in sorted(out_dir.glob("gumbel_self_play_shard_*.npz")):
+        with np.load(shard_path) as data:
+            for seed in np.unique(data["game_seed"]):
+                seed_shards.setdefault(int(seed), set()).add(shard_path.name)
+    assert all(len(shards) == 1 for shards in seed_shards.values())
+    final_progress = gsp._load_worker_progress(out_dir)
+    assert final_progress is not None
+    assert final_progress.games_completed_local == 3
+    assert final_progress.games_succeeded == 3
+    assert final_progress.rows_confirmed == 12
+
+
+def test_crash_after_final_close_before_progress_replays_whole_partial_shard(
+    tmp_path, monkeypatch
+):
+    out_dir = tmp_path / "worker_000"
+    out_dir.mkdir()
+    base_seed = 3_000_000
+    total_games = 2
+    run_id = "run-close-boundary"
+    sentinel = str(tmp_path / "_close_finished")
+    ctx = multiprocessing.get_context("spawn")
+    proc = ctx.Process(
+        target=_child_pause_after_final_close,
+        args=(str(out_dir), total_games, base_seed, run_id, sentinel),
+    )
+    proc.start()
+    deadline = time.time() + 20.0
+    while not Path(sentinel).exists():
+        assert proc.is_alive(), "child died before final close completed"
+        assert time.time() < deadline, "child never completed final close"
+        time.sleep(0.02)
+    os.kill(proc.pid, 9)
+    proc.join(timeout=10)
+    assert not proc.is_alive()
+
+    # The shard landed, but the last atomic progress marker still authorizes
+    # zero rows. Resume must delete this orphan and replay both complete games.
+    progress = gsp._load_worker_progress(out_dir)
+    assert progress is not None
+    assert progress.games_completed_local == 0
+    assert progress.rows_confirmed == 0
+    assert len(_row_identities(out_dir)) == total_games * DECISIONS_PER_GAME
+
+    seen: list[int] = []
+
+    def _resume_stub(
+        mcts, evaluator, *, config, game_seed, game_index, action_size, **_kwargs
+    ):
+        seen.append(game_index)
+        return _fake_game_record(game_seed, game_index, config.colors)
+
+    monkeypatch.setattr(gsp, "play_one_game", _resume_stub)
+    monkeypatch.setattr(gcm, "_require_rust_module", lambda: None)
+    summary = gsp.run_worker_games(
+        out_dir=out_dir,
+        games=total_games,
+        game_index_start=0,
+        base_seed=base_seed,
+        worker_seed=1,
+        config=_stub_config(),
+        search_config=GumbelChanceMCTSConfig(),
+        evaluator=_StubEvaluator(),
+        shard_size=100,
+        fmt="npz",
+        run_id=run_id,
+        resume=True,
+    )
+
+    assert seen == [0, 1]
+    assert summary["resumed_from_offset"] == 0
+    assert summary["rows"] == 8
+    identities = _row_identities(out_dir)
+    assert len(identities) == len(set(identities)) == 8
+    manifest = json.loads((out_dir / "manifest.json").read_text())
+    assert manifest["games_completed"] == 2
+    assert manifest["games_failed"] == 0
+    assert manifest["rows"] == 8
+    final_progress = gsp._load_worker_progress(out_dir)
+    assert final_progress is not None
+    assert final_progress.games_completed_local == 2
+    assert final_progress.games_succeeded == 2
+    assert final_progress.rows_confirmed == 8
+
+
 def test_resume_is_a_noop_when_no_progress_file_exists(tmp_path, monkeypatch):
     """resume=True with nothing to resume from behaves exactly like resume=False."""
     out_dir = tmp_path / "worker_000"
@@ -293,6 +527,92 @@ def test_resume_is_a_noop_when_no_progress_file_exists(tmp_path, monkeypatch):
     assert seen == [0, 1, 2]
     assert summary["resumed_from_offset"] == 0
     assert summary["games_completed"] == 3
+
+
+def test_compressed_game_atomic_shards_authenticate_on_resume(tmp_path, monkeypatch):
+    pytest.importorskip("zstandard")
+    out_dir = tmp_path / "worker_000"
+    seen: list[int] = []
+
+    def _stub(mcts, evaluator, *, config, game_seed, game_index, action_size, **_kwargs):
+        seen.append(game_index)
+        return _fake_game_record(game_seed, game_index, config.colors)
+
+    monkeypatch.setattr(gsp, "play_one_game", _stub)
+    monkeypatch.setattr(gcm, "_require_rust_module", lambda: None)
+    kwargs = {
+        "out_dir": out_dir,
+        "games": 2,
+        "game_index_start": 0,
+        "base_seed": 600,
+        "worker_seed": 1,
+        "config": _stub_config(),
+        "search_config": GumbelChanceMCTSConfig(),
+        "evaluator": _StubEvaluator(),
+        "shard_size": 6,
+        "fmt": "npz_zst",
+        "run_id": "run-compressed",
+        "resume": True,
+    }
+    first = gsp.run_worker_games(**kwargs)
+    assert seen == [0, 1]
+    assert first["rows"] == 8
+    assert all(str(path).endswith(".npz.zst") for path in first["shards"])
+
+    seen.clear()
+    resumed = gsp.run_worker_games(**kwargs)
+    assert seen == []
+    assert resumed["resumed_from_offset"] == 2
+    assert resumed["rows"] == 8
+    assert len(resumed["shards"]) == 1
+
+
+def test_resume_restores_only_confirmed_success_failure_and_search_aggregates(
+    tmp_path, monkeypatch
+):
+    out_dir = tmp_path / "worker_000"
+
+    def _stub(mcts, evaluator, *, config, game_seed, game_index, action_size, **_kwargs):
+        if game_index == 1:
+            raise RuntimeError("deterministic failure")
+        return _fake_game_record(game_seed, game_index, config.colors)
+
+    monkeypatch.setattr(gsp, "play_one_game", _stub)
+    monkeypatch.setattr(gcm, "_require_rust_module", lambda: None)
+    kwargs = {
+        "out_dir": out_dir,
+        "games": 3,
+        "game_index_start": 0,
+        "base_seed": 800,
+        "worker_seed": 1,
+        "config": _stub_config(),
+        "search_config": GumbelChanceMCTSConfig(),
+        "evaluator": _StubEvaluator(),
+        "shard_size": 6,
+        "fmt": "npz",
+        "run_id": "run-aggregate",
+        "resume": True,
+    }
+    first = gsp.run_worker_games(**kwargs)
+    assert first["games_completed"] == 2
+    assert first["games_failed"] == 1
+    assert first["rows"] == 8
+    assert first["decisions_total"] == 8
+    assert first["simulations_used_total"] == 8
+    assert first["wins_by_color"]["RED"] == 2
+
+    def _must_not_replay(*_args, **_kwargs):
+        raise AssertionError("complete confirmed offsets must not replay")
+
+    monkeypatch.setattr(gsp, "play_one_game", _must_not_replay)
+    resumed = gsp.run_worker_games(**kwargs)
+    assert resumed["resumed_from_offset"] == 3
+    assert resumed["games_completed"] == 2
+    assert resumed["games_failed"] == 1
+    assert resumed["rows"] == 8
+    assert resumed["decisions_total"] == 8
+    assert resumed["simulations_used_total"] == 8
+    assert resumed["wins_by_color"]["RED"] == 2
 
 
 def test_resume_replays_from_zero_when_progress_has_legacy_aux_semantics(

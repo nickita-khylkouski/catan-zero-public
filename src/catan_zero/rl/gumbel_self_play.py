@@ -38,12 +38,13 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+import io
 import json
 import math
 import os
 import random
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -110,6 +111,7 @@ __all__ = [
 # same-run_id retry after a preemption pick up where it left off instead of
 # replaying (or wiping) already-flushed games.
 PROGRESS_FILENAME = "progress.json"
+WORKER_PROGRESS_RESUME_CONTRACT_VERSION = 2
 
 COLORS = ("RED", "BLUE")
 PLAYER_NAMES = ("BLUE", "RED", "ORANGE", "WHITE")
@@ -1145,6 +1147,7 @@ class GumbelShardWriter:
         shard_size: int = 2048,
         fmt: str = "npz",
         start_index: int = 0,
+        rows_written: int = 0,
         preserve_search_evidence: bool = False,
     ) -> None:
         self.output = Path(output)
@@ -1159,8 +1162,14 @@ class GumbelShardWriter:
         # never collides with (and never re-emits) shards already confirmed
         # durable by a prior session's `WorkerProgress`.
         self.index = int(start_index)
+        # Actual row cardinality of completed shards.  Resume cannot derive
+        # this from index * shard_size once shards are game-atomic and may
+        # exceed the target by up to one game.
+        self.rows_written = int(rows_written)
 
-    def add(self, row: dict[str, Any], features: dict[str, np.ndarray]) -> None:
+    def _payload(
+        self, row: dict[str, Any], features: dict[str, np.ndarray]
+    ) -> dict[str, Any]:
         payload = {key: row[key] for key in BASE_KEYS if key in row}
         for key in EXTRA_KEYS:
             if key in row:
@@ -1176,7 +1185,25 @@ class GumbelShardWriter:
                 payload[key] = row[key]
         for key in ENTITY_KEYS:
             payload[key] = features[key]
+        return payload
+
+    def add(self, row: dict[str, Any], features: dict[str, np.ndarray]) -> None:
+        payload = self._payload(row, features)
         self.rows.append(payload)
+        if len(self.rows) >= self.shard_size:
+            self.flush()
+
+    def add_game(self, decisions: Sequence[DecisionRecord]) -> None:
+        """Append one realized game without permitting a mid-game flush.
+
+        The target shard size is soft by at most one game's rows.  Keeping a
+        game indivisible is required for safe offset-based resume: a confirmed
+        shard may never retain a prefix of the first game that will be replayed.
+        Other writer users retain the historical row-wise :meth:`add` API.
+        """
+
+        payloads = [self._payload(item.row, item.features) for item in decisions]
+        self.rows.extend(payloads)
         if len(self.rows) >= self.shard_size:
             self.flush()
 
@@ -1186,6 +1213,7 @@ class GumbelShardWriter:
     def flush(self) -> None:
         if not self.rows:
             return
+        row_count = len(self.rows)
         arrays = _rows_to_arrays(
             self.rows,
             preserve_search_evidence=self.preserve_search_evidence,
@@ -1202,6 +1230,7 @@ class GumbelShardWriter:
         self.paths.append(path)
         self.rows = []
         self.index += 1
+        self.rows_written += row_count
 
 
 def _compact_search_evidence(rows: list[dict[str, Any]]) -> dict[str, np.ndarray]:
@@ -1433,9 +1462,10 @@ def _try_zstd(path: Path) -> Path:
 class WorkerProgress:
     """Durable, incremental resume marker for one `run_worker_games` call.
 
-    Written to `<out_dir>/progress.json` after EVERY game this worker
-    processes (success or failure) -- cheap (a few dozen bytes of JSON), so
-    the "replay window" after a preemption is at most one game.
+    Written to `<out_dir>/progress.json` after every game this worker
+    processes (success or failure).  Aggregate counters in this structure are
+    deliberately the confirmed-durable snapshot, not speculative live
+    counters for games still buffered in memory.
 
     Why this is safe to trust on resume (the core durability argument):
     a game's rows are only ever handed to the shard writer AFTER
@@ -1449,20 +1479,16 @@ class WorkerProgress:
     to disk every `shard_size` rows (or on `close()`, which never runs on
     a hard kill).
 
-    `games_completed_local` therefore does NOT mean "games played" (that's
-    the separate `games`/`games_failed` manifest counters) -- it means
-    "games whose rows are ALL already inside a completed, on-disk shard
-    file", i.e. bounded by `shard_count_confirmed * shard_size`. Games
-    played after that point still show up in `rows`/`decisions_total`/etc.
-    (so a mid-run `progress.json` read gives an accurate running summary),
-    but are excluded from `games_completed_local` until a later shard
-    flush catches up to them. This is what makes `games_completed_local`
-    safe to resume from: every offset < games_completed_local is
-    guaranteed durable; nothing at or above it is assumed durable, so
-    resuming can only ever REDO work, never SKIP unflushed work.
+    `games_completed_local` therefore means "processed offsets whose rows are
+    all inside completed, on-disk, game-atomic shards" (a failed zero-row game
+    is confirmed by the atomic progress write itself).  Every aggregate below
+    is captured at that same offset.  This is what makes resume safe: every
+    offset below the marker is fully durable and every offset at/above it is
+    wholly absent from the retained shard inventory.
     """
 
     run_id: str
+    resume_contract_version: int
     # Resume is only sound when every retained shard was produced under the
     # same row-label semantics as the code completing the run.  These fields
     # deliberately make pre-v1 progress markers unreadable by `from_dict` so
@@ -1470,10 +1496,13 @@ class WorkerProgress:
     # v1 manifest.
     aux_subgoal_target_version: int
     aux_subgoal_target_semantic: str
+    shard_size: int
+    shard_format: str
     base_seed: int
     game_index_start: int
     games_requested: int
     games_completed_local: int
+    games_succeeded: int
     shard_count_confirmed: int
     rows_confirmed: int
     games_failed: int
@@ -1489,6 +1518,18 @@ class WorkerProgress:
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "WorkerProgress":
+        raw_resume_contract_version = payload["resume_contract_version"]
+        if (
+            isinstance(raw_resume_contract_version, bool)
+            or not isinstance(raw_resume_contract_version, int)
+            or raw_resume_contract_version
+            != WORKER_PROGRESS_RESUME_CONTRACT_VERSION
+        ):
+            raise ValueError(
+                "worker progress resume contract version mismatch: "
+                f"expected {WORKER_PROGRESS_RESUME_CONTRACT_VERSION}, "
+                f"got {raw_resume_contract_version!r}"
+            )
         raw_aux_subgoal_target_version = payload[AUX_SUBGOAL_TARGET_VERSION_KEY]
         # JSON booleans are Python ints, but accepting `true` as schema v1
         # would make a malformed/corrupt marker look authenticated.
@@ -1513,12 +1554,16 @@ class WorkerProgress:
             )
         return cls(
             run_id=str(payload["run_id"]),
+            resume_contract_version=raw_resume_contract_version,
             aux_subgoal_target_version=aux_subgoal_target_version,
             aux_subgoal_target_semantic=aux_subgoal_target_semantic,
+            shard_size=int(payload["shard_size"]),
+            shard_format=str(payload["shard_format"]),
             base_seed=int(payload["base_seed"]),
             game_index_start=int(payload["game_index_start"]),
             games_requested=int(payload["games_requested"]),
             games_completed_local=int(payload["games_completed_local"]),
+            games_succeeded=int(payload["games_succeeded"]),
             shard_count_confirmed=int(payload["shard_count_confirmed"]),
             rows_confirmed=int(payload["rows_confirmed"]),
             games_failed=int(payload["games_failed"]),
@@ -1566,6 +1611,63 @@ def _confirmed_shard_paths(out_dir: Path, *, upto_index: int) -> list[Path]:
         if index < upto_index:
             found.append((index, path))
     return [path for _index, path in sorted(found)]
+
+
+def _resume_shard_row_count(path: Path) -> int:
+    """Authenticate one retained shard and return its exact row count."""
+
+    if path.name.endswith(".zst"):
+        try:
+            import zstandard
+        except ImportError as error:
+            raise ValueError(
+                "zstandard is required to authenticate retained resume shards"
+            ) from error
+        with path.open("rb") as source:
+            with zstandard.ZstdDecompressor().stream_reader(source) as reader:
+                payload = reader.read()
+        archive_context = np.load(io.BytesIO(payload), allow_pickle=False)
+    else:
+        archive_context = np.load(path, allow_pickle=False)
+    with archive_context as archive:
+        if "game_seed" not in archive or AUX_SUBGOAL_TARGET_VERSION_KEY not in archive:
+            raise ValueError(f"retained shard lacks resume authority columns: {path}")
+        seeds = np.asarray(archive["game_seed"])
+        versions = np.asarray(archive[AUX_SUBGOAL_TARGET_VERSION_KEY])
+        if seeds.ndim != 1 or versions.shape != seeds.shape:
+            raise ValueError(f"retained shard row-shape drift: {path}")
+        if versions.dtype.kind not in {"i", "u"} or bool(
+            np.any(versions.astype(np.int64, copy=False) != AUX_SUBGOAL_TARGET_VERSION)
+        ):
+            raise ValueError(f"retained shard aux semantic drift: {path}")
+        return int(seeds.size)
+
+
+def _validated_confirmed_shard_paths(
+    out_dir: Path,
+    *,
+    upto_index: int,
+    expected_rows: int,
+) -> list[Path]:
+    """Require a contiguous, unique retained inventory with exact row mass."""
+
+    paths = _confirmed_shard_paths(out_dir, upto_index=upto_index)
+    indices = [
+        int(path.name.split(".", 1)[0].rsplit("_", 1)[-1])
+        for path in paths
+    ]
+    if indices != list(range(int(upto_index))):
+        raise ValueError(
+            "retained resume shard inventory is not exactly contiguous: "
+            f"expected={list(range(int(upto_index)))} observed={indices}"
+        )
+    rows = sum(_resume_shard_row_count(path) for path in paths)
+    if rows != int(expected_rows):
+        raise ValueError(
+            "retained resume shard row total differs from progress: "
+            f"expected={expected_rows} observed={rows}"
+        )
+    return paths
 
 
 def _discard_orphan_shards(out_dir: Path, *, from_index: int) -> None:
@@ -1622,11 +1724,13 @@ def run_worker_games(
     per-worker `manifest.json` compatible with `tools/train_bc.py`'s loader
     (a top-level `shards` list).
 
-    Incremental resume (`resume=True`): if `<out_dir>/progress.json` exists
-    (and its `run_id` matches, when `run_id` is given), this call skips
-    replaying the games it records as durably flushed and continues the
-    SAME `offset` loop from `games_completed_local` -- NOT from a
-    recomputed `game_index_start`. Seed identity proof: `game_seed =
+    Incremental resume (`resume=True`): a current progress contract must match
+    `run_id`, seed interval, requested games, shard target/format, aux semantic,
+    and an exact contiguous shard inventory/row total.  Only then does this
+    call skip games recorded as durably flushed and continue the SAME `offset`
+    loop from `games_completed_local` -- NOT from a recomputed
+    `game_index_start`.  Shards are game-atomic, so the first replayed game is
+    wholly absent from retained files. Seed identity proof: `game_seed =
     base_seed + game_index_start + offset` is a pure function of `offset`
     with `base_seed`/`game_index_start` both caller-supplied constants that
     a resume never changes (they come from the payload, not from
@@ -1636,7 +1740,9 @@ def run_worker_games(
     it would have gotten in an uninterrupted run. When `resume=False` (the
     default) or no progress file exists, this call behaves exactly as
     before resume support was added, aside from also writing
-    `progress.json` as a side effect.
+    `progress.json` as a side effect.  Missing/stale authority causes a
+    deterministic replay from zero after worker-local orphan shards are
+    removed.
 
     `opponent_pool` (H2, default None = OFF, exact prior behavior): when set,
     each game_index deterministically draws (via `opponent_pool.policy`/
@@ -1709,14 +1815,40 @@ def run_worker_games(
     # floor); advanced during this call as new flushes catch up to
     # previously-played-but-unflushed games (see `pending_boundaries` below).
     games_completed_local = 0
+    confirmed_paths: list[Path] = []
 
     if resume:
         progress_path = out_dir / PROGRESS_FILENAME
         progress = _load_worker_progress(out_dir)
-        if progress is not None and (not run_id or progress.run_id == run_id):
-            resume_offset = max(0, min(int(progress.games_completed_local), int(games)))
+        progress_matches = bool(
+            progress is not None
+            and progress.run_id == run_id
+            and progress.base_seed == int(base_seed)
+            and progress.game_index_start == int(game_index_start)
+            and progress.games_requested == int(games)
+            and progress.shard_size == int(shard_size)
+            and progress.shard_format == str(fmt)
+            and 0 <= progress.games_completed_local <= int(games)
+            and 0 <= progress.games_succeeded <= progress.games_completed_local
+            and progress.shard_count_confirmed >= 0
+            and progress.rows_confirmed >= 0
+            and progress.rows == progress.rows_confirmed
+        )
+        if progress_matches:
+            assert progress is not None
+            try:
+                confirmed_paths = _validated_confirmed_shard_paths(
+                    out_dir,
+                    upto_index=int(progress.shard_count_confirmed),
+                    expected_rows=int(progress.rows_confirmed),
+                )
+            except (OSError, ValueError):
+                progress_matches = False
+        if progress_matches:
+            assert progress is not None
+            resume_offset = int(progress.games_completed_local)
             games_completed_local = resume_offset
-            games_completed = resume_offset
+            games_completed = int(progress.games_succeeded)
             games_failed = int(progress.games_failed)
             games_truncated = int(progress.games_truncated)
             rows = int(progress.rows)
@@ -1727,10 +1859,11 @@ def run_worker_games(
                 wins_by_color[color] = wins_by_color.get(color, 0) + int(count)
             start_shard_index = int(progress.shard_count_confirmed)
             _discard_orphan_shards(out_dir, from_index=start_shard_index)
-        elif progress_path.exists():
+        else:
             # A progress marker that cannot be authenticated for this run and
             # aux-label semantic must not lend its old shards to a new v1
-            # manifest.  Replaying from zero is deterministic and safe.
+            # manifest.  The same applies to shard files with no progress
+            # authority. Replaying from zero is deterministic and safe.
             _discard_orphan_shards(out_dir, from_index=0)
 
     writer = GumbelShardWriter(
@@ -1738,49 +1871,78 @@ def run_worker_games(
         shard_size=shard_size,
         fmt=fmt,
         start_index=start_shard_index,
+        rows_written=rows,
         preserve_search_evidence=preserve_search_evidence,
     )
     if start_shard_index:
         # Seed `writer.paths` with the prior session's already-confirmed
         # shards so the manifest this call eventually writes still lists
         # ALL shards, not just the ones flushed in this (resumed) session.
-        writer.paths.extend(_confirmed_shard_paths(out_dir, upto_index=start_shard_index))
+        writer.paths.extend(confirmed_paths)
     progress_path = out_dir / PROGRESS_FILENAME
     # Absolute (cross-session) cumulative row count already durable, per the
     # last confirmed shard count -- the baseline every new boundary is
     # measured against.
-    absolute_rows = start_shard_index * writer.shard_size
-    # (offset, absolute_row_count_after_this_offset) for offsets played THIS
-    # session that are not yet confirmed durable. Confirmation is monotonic
-    # and FIFO, so a small pending queue (popped from the front) suffices --
-    # no need to re-scan the full game history on every check.
-    pending_boundaries: list[tuple[int, int]] = []
+    absolute_rows = rows
+
+    def _aggregate_snapshot() -> dict[str, Any]:
+        return {
+            "games_succeeded": int(games_completed),
+            "games_failed": int(games_failed),
+            "games_truncated": int(games_truncated),
+            "rows": int(rows),
+            "decisions_total": int(decisions_total),
+            "forced_decisions_total": int(forced_decisions_total),
+            "simulations_used_total": int(simulations_used_total),
+            "wins_by_color": dict(wins_by_color),
+        }
+
+    confirmed_snapshot = _aggregate_snapshot()
+    # (offset, absolute_row_count_after_this_offset, cumulative aggregates)
+    # for offsets played THIS session but not yet confirmed durable.  Since
+    # add_game never splits a game, any completed shard boundary coincides
+    # with one of these snapshots.
+    pending_boundaries: list[tuple[int, int, dict[str, Any]]] = []
 
     def _confirm_and_checkpoint() -> None:
-        nonlocal games_completed_local
-        flushed_rows = writer.index * writer.shard_size
+        nonlocal games_completed_local, confirmed_snapshot
+        flushed_rows = writer.rows_written
         while pending_boundaries and pending_boundaries[0][1] <= flushed_rows:
-            offset_done, _boundary = pending_boundaries.pop(0)
+            offset_done, _boundary, snapshot = pending_boundaries.pop(0)
             games_completed_local = offset_done + 1
+            confirmed_snapshot = snapshot
+        if int(confirmed_snapshot["rows"]) != int(flushed_rows):
+            raise RuntimeError(
+                "resume invariant violated: confirmed aggregate rows differ from "
+                f"written shard rows ({confirmed_snapshot['rows']} != {flushed_rows})"
+            )
         _write_json_atomic(
             progress_path,
             WorkerProgress(
                 run_id=run_id,
+                resume_contract_version=WORKER_PROGRESS_RESUME_CONTRACT_VERSION,
                 aux_subgoal_target_version=AUX_SUBGOAL_TARGET_VERSION,
                 aux_subgoal_target_semantic=AUX_SUBGOAL_TARGET_SEMANTIC,
+                shard_size=int(shard_size),
+                shard_format=str(fmt),
                 base_seed=int(base_seed),
                 game_index_start=int(game_index_start),
                 games_requested=int(games),
                 games_completed_local=games_completed_local,
+                games_succeeded=int(confirmed_snapshot["games_succeeded"]),
                 shard_count_confirmed=writer.index,
                 rows_confirmed=flushed_rows,
-                games_failed=games_failed,
-                games_truncated=games_truncated,
-                rows=rows,
-                decisions_total=decisions_total,
-                forced_decisions_total=forced_decisions_total,
-                simulations_used_total=simulations_used_total,
-                wins_by_color=dict(wins_by_color),
+                games_failed=int(confirmed_snapshot["games_failed"]),
+                games_truncated=int(confirmed_snapshot["games_truncated"]),
+                rows=int(confirmed_snapshot["rows"]),
+                decisions_total=int(confirmed_snapshot["decisions_total"]),
+                forced_decisions_total=int(
+                    confirmed_snapshot["forced_decisions_total"]
+                ),
+                simulations_used_total=int(
+                    confirmed_snapshot["simulations_used_total"]
+                ),
+                wins_by_color=dict(confirmed_snapshot["wins_by_color"]),
             ).to_dict(),
         )
 
@@ -1915,12 +2077,13 @@ def run_worker_games(
                 errors.append(
                     {"game_index": game_index, "game_seed": game_seed, "error": repr(error)}
                 )
-                pending_boundaries.append((offset, absolute_rows))
+                pending_boundaries.append(
+                    (offset, absolute_rows, _aggregate_snapshot())
+                )
                 _confirm_and_checkpoint()
                 continue
 
-            for decision in record.decisions:
-                writer.add(decision.row, decision.features)
+            writer.add_game(record.decisions)
             rows += len(record.decisions)
             absolute_rows += len(record.decisions)
             decisions_total += record.total_decisions
@@ -1973,10 +2136,17 @@ def run_worker_games(
                 if record.terminal and record.winner == pool_assignment.champion_color:
                     stats["champion_wins"] += 1
 
-            pending_boundaries.append((offset, absolute_rows))
+            pending_boundaries.append(
+                (offset, absolute_rows, _aggregate_snapshot())
+            )
             _confirm_and_checkpoint()
     finally:
         writer.close()
+        # `close()` may publish the final partial shard.  The following atomic
+        # progress update either lands and authenticates it, or a crash between
+        # the two operations leaves it above the prior shard floor so resume
+        # deletes and deterministically replays it.
+        _confirm_and_checkpoint()
 
     elapsed = time.perf_counter() - started
     summary: dict[str, Any] = {
