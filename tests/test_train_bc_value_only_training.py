@@ -420,6 +420,66 @@ def test_policy_loss_weight_scales_the_policy_term_in_train_xdim_batch(
     )
 
 
+def test_train_diagnostics_do_not_implicitly_run_two_extra_gradient_traversals(
+    tmp_path, monkeypatch
+) -> None:
+    import torch
+    from tools import train_bc
+
+    data = _write_and_load_shard(tmp_path, _collect_real_samples(3))
+    batch = np.arange(len(data["action_taken"]))
+    weights = np.ones(len(batch), dtype=np.float32)
+    calls = 0
+
+    def interference(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return {"available": True, "sentinel": True}
+
+    monkeypatch.setattr(train_bc, "_objective_gradient_interference", interference)
+
+    def run(*, measure: bool) -> dict:
+        policy = _make_entity_policy()
+        optimizer = torch.optim.SGD(policy.model.parameters(), lr=0.0)
+        return _train_xdim_batch(
+            policy,
+            optimizer,
+            data,
+            batch,
+            weights,
+            weights,
+            soft_target_temperature=1.0,
+            soft_target_weight=0.0,
+            soft_target_source="scores",
+            soft_target_min_legal_coverage=0.0,
+            policy_loss_weight=1.0,
+            value_loss_weight=1.0,
+            final_vp_loss_weight=0.0,
+            q_loss_weight=0.0,
+            q_skip_teacher_prefixes=(),
+            vps_to_win=10,
+            advantage_policy_weighting="none",
+            advantage_temperature=1.0,
+            advantage_weight_cap=5.0,
+            advantage_weight_floor=0.05,
+            amp="none",
+            diagnostics=True,
+            measure_objective_gradient_interference=measure,
+        )
+
+    ordinary = run(measure=False)
+    assert calls == 0
+    assert ordinary["optimizer_observability"][
+        "objective_gradient_interference"
+    ] is None
+
+    explicit = run(measure=True)
+    assert calls == 1
+    assert explicit["optimizer_observability"][
+        "objective_gradient_interference"
+    ] == {"available": True, "sentinel": True}
+
+
 def test_train_xdim_reports_soft_targets_conditioned_on_policy_active_rows(
     tmp_path, monkeypatch
 ) -> None:
