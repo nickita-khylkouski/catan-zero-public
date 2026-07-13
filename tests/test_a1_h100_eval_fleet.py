@@ -854,6 +854,102 @@ def test_same_checkpoint_clip_vs_tanh_plan_is_diagnostic_and_executable(
     assert internal["argv"][internal["argv"].index("--baseline-value-squash") + 1] == "tanh"
 
 
+def test_same_checkpoint_adaptive_n256_s3_plan_is_exact_and_fail_closed(
+    tmp_path: Path,
+) -> None:
+    manifest, default = _plan(tmp_path)
+    checkpoint = Path(default["champion"]["source"])
+    diagnostic = fleet.build_plan(
+        manifest,
+        candidate=checkpoint,
+        champion=checkpoint,
+        candidate_parent=checkpoint,
+        registry=ChampionRegistry.load(
+            Path(default["evaluation_binding"]["registry"]["path"])
+        ),
+        internal_pairs=200,
+        external_pairs=20,
+        internal_base_seed=6_195_000_000,
+        external_base_seed=6_195_001_000,
+        candidate_c_scale=0.03,
+        champion_c_scale=0.03,
+        candidate_n_full_wide=256,
+        candidate_n_full_wide_threshold=40,
+        candidate_wide_roots_always_full=True,
+        comparison_mode="historical_comparison",
+        historical_comparison_reason="same-checkpoint adaptive n256 S3 diagnostic",
+        repo_commit="a" * 40,
+        tool_hashes=default["tool_hashes"],
+    )
+
+    assert diagnostic["evaluation_binding"]["promotion_eligible"] is False
+    assert diagnostic["role_search_config"]["candidate"] == {
+        "c_scale": 0.03,
+        "value_squash": "tanh",
+        "gameplay_policy_aggregation": "mean_improved_policy",
+        "rescale_noise_floor_c": 0.0,
+        "sigma_eval": 0.98,
+        "sigma_reference_visits": None,
+        "n_full_wide": 256,
+        "n_full_wide_threshold": 40,
+        "wide_roots_always_full": True,
+    }
+    assert diagnostic["role_search_config"]["champion"]["n_full_wide"] is None
+    internal = next(job for job in diagnostic["jobs"] if job["phase"] == "internal")
+    argv = internal["argv"]
+    assert argv[argv.index("--n-full") + 1] == "128"
+    assert argv[argv.index("--candidate-n-full-wide") + 1] == "256"
+    assert argv[argv.index("--candidate-n-full-wide-threshold") + 1] == "40"
+    assert "--baseline-n-full-wide" not in argv
+    assert argv.count("--wide-roots-always-full") == 1
+
+    plan_path = tmp_path / "s3-plan.json"
+    fleet.write_new_readonly(plan_path, diagnostic)
+    assert fleet.load_plan(plan_path, manifest)["plan_hash"] == diagnostic["plan_hash"]
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"candidate_n_full_wide": 256}, "requires threshold"),
+        (
+            {
+                "candidate_n_full_wide": 256,
+                "candidate_n_full_wide_threshold": 39,
+                "candidate_wide_roots_always_full": True,
+            },
+            "threshold >= 40",
+        ),
+        (
+            {
+                "candidate_n_full_wide": 128,
+                "candidate_n_full_wide_threshold": 40,
+                "candidate_wide_roots_always_full": True,
+            },
+            "exactly 256",
+        ),
+    ],
+)
+def test_adaptive_wide_plan_rejects_non_s3_recipes(
+    tmp_path: Path, kwargs: dict[str, object], message: str
+) -> None:
+    manifest, default = _plan(tmp_path)
+    with pytest.raises(fleet.FleetError, match=message):
+        fleet.build_plan(
+            manifest,
+            candidate=Path(default["candidate"]["source"]),
+            champion=Path(default["champion"]["source"]),
+            **_binding_kwargs(default),
+            internal_pairs=600,
+            external_pairs=500,
+            internal_base_seed=6_195_000_000,
+            external_base_seed=6_195_001_000,
+            repo_commit="a" * 40,
+            tool_hashes=default["tool_hashes"],
+            **kwargs,
+        )
+
+
 @pytest.mark.parametrize("value", [0.0, -0.1, float("nan"), float("inf")])
 def test_role_specific_search_calibration_rejects_invalid_values(
     tmp_path: Path, value: float

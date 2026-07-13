@@ -491,6 +491,9 @@ def _science_args(
     rescale_noise_floor_c: float = 0.0,
     sigma_eval: float = 0.98,
     sigma_reference_visits: int | None = None,
+    n_full_wide: int | None = None,
+    n_full_wide_threshold: int | None = None,
+    wide_roots_always_full: bool = False,
 ) -> list[str]:
     args = [
         "--n-full",
@@ -541,6 +544,12 @@ def _science_args(
         ]
     if sigma_reference_visits is not None:
         args += ["--sigma-reference-visits", str(int(sigma_reference_visits))]
+    if n_full_wide is not None:
+        args += ["--n-full-wide", str(int(n_full_wide))]
+    if n_full_wide_threshold is not None:
+        args += ["--n-full-wide-threshold", str(int(n_full_wide_threshold))]
+    if wide_roots_always_full:
+        args += ["--wide-roots-always-full"]
     return args
 
 
@@ -558,6 +567,12 @@ def _role_search_config(
     champion_sigma_eval: float = 0.98,
     candidate_sigma_reference_visits: int | None = None,
     champion_sigma_reference_visits: int | None = None,
+    candidate_n_full_wide: int | None = None,
+    champion_n_full_wide: int | None = None,
+    candidate_n_full_wide_threshold: int | None = None,
+    champion_n_full_wide_threshold: int | None = None,
+    candidate_wide_roots_always_full: bool = False,
+    champion_wide_roots_always_full: bool = False,
 ) -> dict[str, dict[str, float | str | int | None]]:
     values = {
         "candidate": float(candidate_c_scale),
@@ -593,6 +608,18 @@ def _role_search_config(
         "candidate": candidate_sigma_reference_visits,
         "champion": champion_sigma_reference_visits,
     }
+    wide_budgets = {
+        "candidate": candidate_n_full_wide,
+        "champion": champion_n_full_wide,
+    }
+    wide_thresholds = {
+        "candidate": candidate_n_full_wide_threshold,
+        "champion": champion_n_full_wide_threshold,
+    }
+    wide_always_full = {
+        "candidate": bool(candidate_wide_roots_always_full),
+        "champion": bool(champion_wide_roots_always_full),
+    }
     for role in values:
         if not math.isfinite(noise_floors[role]) or noise_floors[role] < 0.0:
             raise FleetError(f"{role}_rescale_noise_floor_c must be finite and >= 0")
@@ -604,6 +631,21 @@ def _role_search_config(
             raise FleetError(
                 f"{role} aggregate_q_then_improve requires sigma_reference_visits"
             )
+        if wide_budgets[role] is None:
+            if wide_thresholds[role] is not None or wide_always_full[role]:
+                raise FleetError(
+                    f"{role} disabled adaptive-wide search requires null threshold "
+                    "and wide_roots_always_full=false"
+                )
+        else:
+            if int(wide_budgets[role]) != 256:
+                raise FleetError(f"{role} adaptive-wide budget must be exactly 256")
+            if wide_thresholds[role] is None or int(wide_thresholds[role]) < 40:
+                raise FleetError(f"{role} adaptive n256 requires threshold >= 40")
+            if not wide_always_full[role]:
+                raise FleetError(
+                    f"{role} adaptive n256 requires wide_roots_always_full=true"
+                )
     result = {
         role: {
             "c_scale": values[role],
@@ -619,6 +661,7 @@ def _role_search_config(
         or noise_floors[role] != 0.0
         or sigma_evals[role] != 0.98
         or sigma_refs[role] is not None
+        or wide_budgets[role] is not None
         for role in values
     ):
         for role in values:
@@ -630,6 +673,17 @@ def _role_search_config(
                     "sigma_reference_visits": (
                         int(sigma_refs[role]) if sigma_refs[role] is not None else None
                     ),
+                    "n_full_wide": (
+                        int(wide_budgets[role])
+                        if wide_budgets[role] is not None
+                        else None
+                    ),
+                    "n_full_wide_threshold": (
+                        int(wide_thresholds[role])
+                        if wide_thresholds[role] is not None
+                        else None
+                    ),
+                    "wide_roots_always_full": wide_always_full[role],
                 }
             )
     return result
@@ -668,6 +722,20 @@ def _plan_role_search_config(
             ),
             champion_sigma_reference_visits=raw["champion"].get(
                 "sigma_reference_visits"
+            ),
+            candidate_n_full_wide=raw["candidate"].get("n_full_wide"),
+            champion_n_full_wide=raw["champion"].get("n_full_wide"),
+            candidate_n_full_wide_threshold=raw["candidate"].get(
+                "n_full_wide_threshold"
+            ),
+            champion_n_full_wide_threshold=raw["champion"].get(
+                "n_full_wide_threshold"
+            ),
+            candidate_wide_roots_always_full=raw["candidate"].get(
+                "wide_roots_always_full", False
+            ),
+            champion_wide_roots_always_full=raw["champion"].get(
+                "wide_roots_always_full", False
             ),
         )
     except (KeyError, TypeError, ValueError) as error:
@@ -721,6 +789,11 @@ def _internal_argv(
     champion_sigma_eval: float | None = None,
     candidate_sigma_reference_visits: int | None = None,
     champion_sigma_reference_visits: int | None = None,
+    candidate_n_full_wide: int | None = None,
+    champion_n_full_wide: int | None = None,
+    candidate_n_full_wide_threshold: int | None = None,
+    champion_n_full_wide_threshold: int | None = None,
+    wide_roots_always_full: bool = False,
 ) -> list[str]:
     argv = [
         python,
@@ -811,6 +884,26 @@ def _internal_argv(
     if sigma_args:
         out_index = argv.index("--out")
         argv[out_index:out_index] = sigma_args
+    wide_args: list[str] = []
+    if candidate_n_full_wide is not None:
+        wide_args += ["--candidate-n-full-wide", str(int(candidate_n_full_wide))]
+    if champion_n_full_wide is not None:
+        wide_args += ["--baseline-n-full-wide", str(int(champion_n_full_wide))]
+    if candidate_n_full_wide_threshold is not None:
+        wide_args += [
+            "--candidate-n-full-wide-threshold",
+            str(int(candidate_n_full_wide_threshold)),
+        ]
+    if champion_n_full_wide_threshold is not None:
+        wide_args += [
+            "--baseline-n-full-wide-threshold",
+            str(int(champion_n_full_wide_threshold)),
+        ]
+    if wide_roots_always_full:
+        wide_args += ["--wide-roots-always-full"]
+    if wide_args:
+        out_index = argv.index("--out")
+        argv[out_index:out_index] = wide_args
     return argv
 
 
@@ -828,6 +921,9 @@ def _external_argv(
     rescale_noise_floor_c: float = 0.0,
     sigma_eval: float = 0.98,
     sigma_reference_visits: int | None = None,
+    n_full_wide: int | None = None,
+    n_full_wide_threshold: int | None = None,
+    wide_roots_always_full: bool = False,
     engine_identity: dict[str, str],
 ) -> list[str]:
     return [
@@ -865,6 +961,9 @@ def _external_argv(
             rescale_noise_floor_c=rescale_noise_floor_c,
             sigma_eval=sigma_eval,
             sigma_reference_visits=sigma_reference_visits,
+            n_full_wide=n_full_wide,
+            n_full_wide_threshold=n_full_wide_threshold,
+            wide_roots_always_full=wide_roots_always_full,
         ),
         "--artifact-dir",
         artifact_dir,
@@ -956,6 +1055,12 @@ def build_plan(
     champion_sigma_eval: float = 0.98,
     candidate_sigma_reference_visits: int | None = None,
     champion_sigma_reference_visits: int | None = None,
+    candidate_n_full_wide: int | None = None,
+    champion_n_full_wide: int | None = None,
+    candidate_n_full_wide_threshold: int | None = None,
+    champion_n_full_wide_threshold: int | None = None,
+    candidate_wide_roots_always_full: bool = False,
+    champion_wide_roots_always_full: bool = False,
     comparison_mode: str = "promotion_parent",
     historical_comparison_reason: str | None = None,
 ) -> dict[str, Any]:
@@ -976,6 +1081,12 @@ def build_plan(
         champion_sigma_eval=champion_sigma_eval,
         candidate_sigma_reference_visits=candidate_sigma_reference_visits,
         champion_sigma_reference_visits=champion_sigma_reference_visits,
+        candidate_n_full_wide=candidate_n_full_wide,
+        champion_n_full_wide=champion_n_full_wide,
+        candidate_n_full_wide_threshold=candidate_n_full_wide_threshold,
+        champion_n_full_wide_threshold=champion_n_full_wide_threshold,
+        candidate_wide_roots_always_full=candidate_wide_roots_always_full,
+        champion_wide_roots_always_full=champion_wide_roots_always_full,
     )
     if candidate_sha == champion_sha:
         if role_search_config["candidate"] == role_search_config["champion"]:
@@ -1132,6 +1243,22 @@ def build_plan(
             champion_sigma_reference_visits=role_search_config["champion"].get(
                 "sigma_reference_visits"
             ),
+            candidate_n_full_wide=role_search_config["candidate"].get(
+                "n_full_wide"
+            ),
+            champion_n_full_wide=role_search_config["champion"].get("n_full_wide"),
+            candidate_n_full_wide_threshold=role_search_config["candidate"].get(
+                "n_full_wide_threshold"
+            ),
+            champion_n_full_wide_threshold=role_search_config["champion"].get(
+                "n_full_wide_threshold"
+            ),
+            wide_roots_always_full=bool(
+                role_search_config["candidate"].get("wide_roots_always_full", False)
+                or role_search_config["champion"].get(
+                    "wide_roots_always_full", False
+                )
+            ),
         )
         jobs.append(
             {
@@ -1182,6 +1309,13 @@ def build_plan(
                 sigma_eval=float(role_search_config[role].get("sigma_eval", 0.98)),
                 sigma_reference_visits=role_search_config[role].get(
                     "sigma_reference_visits"
+                ),
+                n_full_wide=role_search_config[role].get("n_full_wide"),
+                n_full_wide_threshold=role_search_config[role].get(
+                    "n_full_wide_threshold"
+                ),
+                wide_roots_always_full=bool(
+                    role_search_config[role].get("wide_roots_always_full", False)
                 ),
                 engine_identity=engine_identity,
             )
@@ -1498,6 +1632,22 @@ def _validate_planned_jobs(plan: dict[str, Any], manifest: dict[str, Any]) -> No
                 if legacy_role_calibration
                 else role_search_config["champion"]["sigma_reference_visits"]
             ),
+            candidate_n_full_wide=role_search_config["candidate"].get(
+                "n_full_wide"
+            ),
+            champion_n_full_wide=role_search_config["champion"].get("n_full_wide"),
+            candidate_n_full_wide_threshold=role_search_config["candidate"].get(
+                "n_full_wide_threshold"
+            ),
+            champion_n_full_wide_threshold=role_search_config["champion"].get(
+                "n_full_wide_threshold"
+            ),
+            wide_roots_always_full=bool(
+                role_search_config["candidate"].get("wide_roots_always_full", False)
+                or role_search_config["champion"].get(
+                    "wide_roots_always_full", False
+                )
+            ),
         )
         if job["pairs"] != pairs or job["base_seed"] != seed or job["argv"] != expected:
             raise FleetError(f"internal shard contract drift: {job['job_id']}")
@@ -1531,6 +1681,13 @@ def _validate_planned_jobs(plan: dict[str, Any], manifest: dict[str, Any]) -> No
                 sigma_eval=float(role_search_config[role].get("sigma_eval", 0.98)),
                 sigma_reference_visits=role_search_config[role].get(
                     "sigma_reference_visits"
+                ),
+                n_full_wide=role_search_config[role].get("n_full_wide"),
+                n_full_wide_threshold=role_search_config[role].get(
+                    "n_full_wide_threshold"
+                ),
+                wide_roots_always_full=bool(
+                    role_search_config[role].get("wide_roots_always_full", False)
                 ),
                 engine_identity=plan["engine_identity"],
             )
@@ -2384,6 +2541,15 @@ def _parser() -> argparse.ArgumentParser:
         plan.add_argument(
             f"--{role}-sigma-reference-visits", type=int, default=None
         )
+        plan.add_argument(f"--{role}-n-full-wide", type=int, default=None)
+        plan.add_argument(
+            f"--{role}-n-full-wide-threshold", type=int, default=None
+        )
+        plan.add_argument(
+            f"--{role}-wide-roots-always-full",
+            action=argparse.BooleanOptionalAction,
+            default=False,
+        )
     plan.add_argument("--out", type=Path, required=True)
     for name in ("launch", "resume"):
         operation = commands.add_parser(name)
@@ -2450,6 +2616,20 @@ def main(argv: Sequence[str] | None = None) -> int:
                 ),
                 champion_sigma_reference_visits=(
                     args.champion_sigma_reference_visits
+                ),
+                candidate_n_full_wide=args.candidate_n_full_wide,
+                champion_n_full_wide=args.champion_n_full_wide,
+                candidate_n_full_wide_threshold=(
+                    args.candidate_n_full_wide_threshold
+                ),
+                champion_n_full_wide_threshold=(
+                    args.champion_n_full_wide_threshold
+                ),
+                candidate_wide_roots_always_full=(
+                    args.candidate_wide_roots_always_full
+                ),
+                champion_wide_roots_always_full=(
+                    args.champion_wide_roots_always_full
                 ),
                 comparison_mode=args.comparison_mode,
                 historical_comparison_reason=args.historical_comparison_reason,
