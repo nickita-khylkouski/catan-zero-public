@@ -191,7 +191,7 @@ def run_probe(
                 f"report={expected_inventory!r} actual={actual_inventory!r}"
             )
     else:
-        data = train_bc.MemmapCorpus(data_path)
+        data = train_bc.load_teacher_data_memmap(data_path)
     split = train_bc.split_train_validation_indices(
         data,
         validation_fraction=float(report["validation_fraction"]),

@@ -227,20 +227,6 @@ def _assert_compatible(base: dict[str, Any], candidate: dict[str, Any]) -> None:
     candidate_schema = _tensor_schema(candidate)
     if base_schema != candidate_schema:
         raise ValueError("checkpoint tensor key/schema sets differ")
-    # A pre-contract checkpoint has no literal metadata key, but the explicit
-    # legacy resolver above may prove it is the same v2 semantics.  Compare the
-    # remaining append-only metadata tree without requiring representation-age
-    # equality for this one normalized field.
-    base_mapping = {
-        key: value for key, value in base.items() if key != "entity_feature_adapter"
-    }
-    candidate_mapping = {
-        key: value
-        for key, value in candidate.items()
-        if key != "entity_feature_adapter"
-    }
-    if not _mapping_contains(base_mapping, candidate_mapping):
-        raise ValueError("candidate checkpoint is missing base metadata keys")
     for key, base_value in base.items():
         if key not in LEARNED_STATE_ROOTS and key != "entity_feature_adapter":
             _assert_tensor_values_equal(
@@ -255,22 +241,6 @@ def _assert_compatible(base: dict[str, Any], candidate: dict[str, Any]) -> None:
     # Non-tensor training metadata may legitimately differ.  The structural
     # inference fields above and the complete tensor path/shape/dtype schema
     # are the deployable compatibility boundary.
-
-
-def _mapping_contains(base: Any, candidate: Any) -> bool:
-    if isinstance(base, dict):
-        return isinstance(candidate, dict) and all(
-            key in candidate and _mapping_contains(item, candidate[key])
-            for key, item in base.items()
-        )
-    if isinstance(base, (list, tuple)):
-        return isinstance(candidate, type(base)) and len(candidate) >= len(base) and all(
-            _mapping_contains(left, right)
-            for left, right in zip(base, candidate)
-        )
-    return True
-
-
 def _blend_checkpoint(
     base: dict[str, Any], candidate: dict[str, Any], alpha: float
 ) -> dict[str, Any]:
