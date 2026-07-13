@@ -117,6 +117,7 @@ def test_installer_shell_syntax_and_preflight_order() -> None:
     assert "belief_target_evidence" in text
     assert "initial_road_d1_scope" in text
     assert "public_award_feature_parity" in text
+    assert "policy_temperature_semantics" in text
 
 
 def test_malformed_inventory_fails_before_any_privileged_mutation(

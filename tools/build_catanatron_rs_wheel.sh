@@ -10,7 +10,7 @@ WHEEL_NAME="catanatron_rs-0.1.8-cp311-cp311-manylinux_2_34_x86_64.whl"
 RECEIPT_NAME="catanatron_rs-0.1.8-build-receipt.json"
 SEALED_SOURCE_DATE_EPOCH="1784073600"
 SEALED_RUSTFLAGS="--remap-path-prefix=/tmp/catan-zero-catanatron-rs-wheel-src=/src/catan-zero-public -C link-arg=-Wl,--build-id=none"
-SEALED_COMPILE_IDENTITY="catanatron-rs-0.1.8-public-award-parity-wheel-v1"
+SEALED_COMPILE_IDENTITY="catanatron-rs-0.1.8-public-award-temperature-wheel-v1"
 
 die() {
   echo "build_catanatron_rs_wheel: $*" >&2
@@ -264,6 +264,7 @@ required = {
     "belief_target_evidence",
     "initial_road_d1_scope",
     "public_award_feature_parity",
+    "policy_temperature_semantics",
 }
 assert required <= capabilities, (required, capabilities)
 PY

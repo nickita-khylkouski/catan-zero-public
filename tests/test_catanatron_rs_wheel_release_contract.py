@@ -139,7 +139,7 @@ def test_source_identity_is_bound_only_after_compilation() -> None:
     assert 'CATAN_RS_SOURCE_TREE="$SEALED_COMPILE_IDENTITY"' in staged_environment
     assert 'CATAN_RS_SOURCE_COMMIT="$SOURCE_COMMIT"' not in staged_environment
     assert 'CATAN_RS_SOURCE_TREE="$SOURCE_TREE"' not in staged_environment
-    assert 'SEALED_COMPILE_IDENTITY="catanatron-rs-0.1.8-public-award-parity-wheel-v1"' in script
+    assert 'SEALED_COMPILE_IDENTITY="catanatron-rs-0.1.8-public-award-temperature-wheel-v1"' in script
     assert 'payload["source_commit"] = sys.argv[2]' in script
     assert 'payload["source_tree"] = sys.argv[3]' in script
     assert '"source_commit": None' in script
@@ -190,3 +190,4 @@ def test_builder_smokes_the_compiled_capability_contract_before_hashing() -> Non
     assert "belief_target_evidence" in script
     assert "initial_road_d1_scope" in script
     assert "public_award_feature_parity" in script
+    assert "policy_temperature_semantics" in script

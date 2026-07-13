@@ -333,6 +333,7 @@ required_capabilities = {
     "belief_target_evidence",
     "initial_road_d1_scope",
     "public_award_feature_parity",
+    "policy_temperature_semantics",
 }
 assert required_capabilities <= capabilities, (
     f"wheel lacks required native Gumbel capabilities: "
@@ -539,6 +540,7 @@ required_capabilities = {
     "belief_target_evidence",
     "initial_road_d1_scope",
     "public_award_feature_parity",
+    "policy_temperature_semantics",
 }
 if (
     rust_version != "0.1.8"

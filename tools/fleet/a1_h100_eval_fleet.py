@@ -87,6 +87,7 @@ NATIVE_REQUIRED_CAPABILITIES = frozenset(
         "belief_target_evidence",
         "initial_road_d1_scope",
         "public_award_feature_parity",
+        "policy_temperature_semantics",
     }
 )
 SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")

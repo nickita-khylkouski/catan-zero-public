@@ -49,7 +49,7 @@ table is not a teacher/volume role split.
 ## 3. Canonical code + environment (CAT-117)
 - Repo: **`github.com/nickita-khylkouski/catan-zero-public`** (**PUBLIC**, no
   auth required). The canonical native-MCTS release is
-  **`v1.5-public-award-parity`**, created only at checksum commit B of the two-commit
+  **`v1.5-native-semantics`**, created only at checksum commit B of the two-commit
   transaction below. All earlier tags predate the `catanatron_rs 0.1.8` native
   search API and must not provision or resume native-MCTS lanes.
 - Env target: **Python 3.11.15**, **torch cu128** (all H100 + B200), **catanatron_rs 0.1.8 cp311**.
@@ -120,7 +120,7 @@ The native-feature source changes make the currently tracked wheel digest stale
 until the two-commit transaction above is completed. The exact items to
 refresh are the `catanatron_rs-0.1.8` CPython 3.11 wheel asset, its build
 receipt, and the single line in `native/catanatron-rs/WHEEL_SHA256SUMS`; the
-inventory intentionally still names the last released 0.1.4 wheel in source
+inventory intentionally still names the last released 0.1.7 wheel in source
 commit A and changes only in checksum commit B. The immutable release tag must
 point at checksum-only commit B. `tools/install_v1_freeze.sh` already downloads
 that exact filename from the selected tag and verifies it against the tracked
@@ -129,7 +129,7 @@ old wheel under a new tag, move an existing tag, or edit the inventory before
 two clean builds agree.
 
 ## 4. Rust engine (CAT-133)
-- `native/catanatron-rs` v0.1.8 is now the canonical wheel source and builds `catanatron_rs-0.1.8-cp311-…manylinux_2_34`; `native/gumbel_mcts_rs` is its linked native-search dependency. `native/catanatron-rs/WHEEL_SHA256SUMS` seals the exact release asset and the installer rejects any byte mismatch. The build receipt seals the source commit/tree, builder and lockfiles, exact toolchain/environment, and wheel digest. Fleet deployment must be uniform 0.1.8 with `sigma_reference_visits`, `belief_target_evidence`, `initial_road_d1_scope`, and `public_award_feature_parity` capabilities before corrected belief-level native MCTS, opening-road-only D1, or Rust entity featurization.
+- `native/catanatron-rs` v0.1.8 is now the canonical wheel source and builds `catanatron_rs-0.1.8-cp311-…manylinux_2_34`; `native/gumbel_mcts_rs` is its linked native-search dependency. `native/catanatron-rs/WHEEL_SHA256SUMS` seals the exact release asset and the installer rejects any byte mismatch. The build receipt seals the source commit/tree, builder and lockfiles, exact toolchain/environment, and wheel digest. Fleet deployment must be uniform 0.1.8 with `sigma_reference_visits`, `belief_target_evidence`, `initial_road_d1_scope`, `public_award_feature_parity`, and `policy_temperature_semantics` capabilities before corrected belief-level native MCTS, opening-road-only D1, Rust entity featurization, or non-unit gameplay temperature.
 - **Licensing posture: pending user decision — see CAT-138.**
 
 ## 5. Seed ledger (CAT-125)
