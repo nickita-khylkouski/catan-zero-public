@@ -117,18 +117,16 @@ def test_v2_sparse_policy_correction_uses_game_uniform_measure(mode: str):
     assert np.all(weights[4:] == 0.0)
 
 
-def test_enabled_without_game_seed_is_noop_and_preserves_zero_rows():
+def test_enabled_without_game_seed_fails_closed():
     data = _data()
     del data["game_seed"]
-    off = build_sample_weights(data, **_base_kwargs())
-    on = build_sample_weights(
-        data,
-        **_base_kwargs(),
-        per_game_policy_weight=True,
-        per_game_policy_weight_mode="equal",
-    )
-    assert off.tobytes() == on.tobytes()
-    assert np.all(on[6:] == 0.0)
+    with pytest.raises(SystemExit, match="requires a populated game_seed"):
+        build_sample_weights(
+            data,
+            **_base_kwargs(),
+            per_game_policy_weight=True,
+            per_game_policy_weight_mode="equal",
+        )
 
 
 def test_unknown_mode_fails_when_enabled():

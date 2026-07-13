@@ -75,6 +75,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import hashlib
 import json
 import os
 import shlex
@@ -91,7 +92,14 @@ sys.path.insert(0, str(REPO_ROOT / "tools"))
 
 from catan_zero.rl.flywheel import (  # noqa: E402
     FlywheelConfig, WindowedReplay, ensure_dirs, seed_champion, read_champion,
-    read_candidate, publish_candidate, promote, list_archive,
+    read_candidate, publish_candidate, promote, list_archive, ShardMeta,
+)
+from catan_zero.rl.flywheel.composite_contract import (  # noqa: E402
+    FRESH_SOURCE_GAME_RATIOS,
+    HISTORICAL_REPLAY_CATEGORY,
+    build_sampling_receipt,
+    canonical_sha256 as _contract_sha256,
+    measure_memmap_component,
 )
 
 import launcher_guards  # noqa: E402
@@ -123,6 +131,21 @@ GATE_SEED_STRIDE = 10_000_103            # distinct prime from SEED_STRIDE
 # certification is a separate policy and pointer; it must never be inferred from
 # this ordinary flywheel gate.
 FLYWHEEL_GATE_CONFIG_NAME = "flywheel"
+
+
+def _file_sha256(path: str | Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return f"sha256:{digest.hexdigest()}"
+
+
+def _canonical_sha256(value: object) -> str:
+    encoded = json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("utf-8")
+    return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
 
 
 # ------------------------------------------------------------------ journal
@@ -297,7 +320,13 @@ class Runner:
                 sp.write_bytes(b"")
                 shards.append({"path": str(sp), "rows": 1024})
             _atomic_json(out_dir / "manifest.json", {"shards": shards, "rows": 2048})
-            return {"ok": True, "out_dir": str(out_dir), "note": "dry-run stub", "rows": 2048}
+            return {
+                "ok": True,
+                "out_dir": str(out_dir),
+                "note": "dry-run stub",
+                "rows": 2048,
+                "source_category": "current_producer",
+            }
         archive = list_archive(self.loop_dir)
         pool_manifest_path = out_dir.parent / f"opponent_pool_r{round_idx:03d}.json"
         pool_manifest_path.parent.mkdir(parents=True, exist_ok=True)
@@ -328,55 +357,364 @@ class Runner:
             cmd += ["--opponent-pool-manifest", str(pool_manifest_path)]
         code = _run(cmd, self.loop_dir / "generation.log")
         man = out_dir / "manifest.json"
-        return {"ok": code == 0 and man.exists(), "out_dir": str(out_dir),
-                "note": "relaunch-mode (H1/H2 pending)", "exit_code": code, "round_seed": round_seed}
+        mixed_pool = bool(archive and self.cfg.opponent_pool_fraction > 0.0)
+        return {
+            "ok": code == 0 and man.exists(),
+            "out_dir": str(out_dir),
+            "note": "relaunch-mode (H1/H2 pending)",
+            "exit_code": code,
+            "round_seed": round_seed,
+            # A mixed shard cannot honestly be assigned one source stratum.
+            # Production training will fail closed until source-pure generation
+            # jobs register all three categories separately.
+            "source_category": "" if mixed_pool else "current_producer",
+        }
 
-    def train_window(self, window_paths: list[str], init_ckpt: str, round_idx: int,
-                     new_rows_this_round: int) -> dict:
-        """Build a windowed corpus over ``window_paths`` and train a bounded number of steps, then
-        publish a candidate. Steps are sized so INCREMENTAL reuse on this round's NEW rows tracks
-        target_reuse (not the whole window — the reuse-math bug the review caught)."""
-        if self.cfg.learner_replay_required and len(window_paths) < 2:
+    def _build_replay_component(
+        self,
+        *,
+        shards: list[ShardMeta],
+        component_id: str,
+        source_category: str,
+        role: str,
+        ratio: float,
+        current_ckpt_version: int,
+        round_root: Path,
+    ) -> dict[str, object]:
+        if not shards:
+            raise ValueError(f"flywheel {role} component is empty")
+        source_root = round_root / f"{component_id}_source"
+        corpus_dir = round_root / component_id
+        source_root.mkdir(parents=True, exist_ok=True)
+        records: list[dict[str, object]] = []
+        producers: dict[int, dict[str, object]] = {}
+        for shard in sorted(shards, key=lambda value: value.order):
+            path = Path(shard.path).expanduser().resolve(strict=True)
+            if shard.rows <= 0:
+                raise ValueError(f"flywheel shard has no rows: {path}")
+            if not shard.source_id:
+                raise ValueError(f"flywheel shard lacks source provenance: {path}")
+            if not shard.source_category:
+                raise ValueError(f"flywheel shard lacks source category: {path}")
+            if role == "fresh" and shard.source_category != source_category:
+                raise ValueError(
+                    f"fresh {source_category} component contains "
+                    f"{shard.source_category} shard: {path}"
+                )
+            if not shard.producer_checkpoint_path or not shard.producer_checkpoint_sha256:
+                raise ValueError(f"flywheel shard lacks producer checkpoint provenance: {path}")
+            checkpoint_path = str(
+                Path(shard.producer_checkpoint_path).expanduser().absolute()
+            )
+            if not shard.producer_checkpoint_sha256.startswith("sha256:"):
+                raise ValueError(f"flywheel shard has invalid producer digest: {path}")
+            producer = {
+                "version": int(shard.ckpt_version),
+                "path": checkpoint_path,
+                "sha256": shard.producer_checkpoint_sha256,
+            }
+            prior = producers.setdefault(int(shard.ckpt_version), producer)
+            if prior != producer:
+                raise ValueError(
+                    "one checkpoint generation maps to multiple producer identities"
+                )
+            records.append(
+                {
+                    "path": str(path),
+                    "rows": int(shard.rows),
+                    "order": int(shard.order),
+                    "size_bytes": path.stat().st_size,
+                    "sha256": _file_sha256(path),
+                    "checkpoint_version": int(shard.ckpt_version),
+                    "producer_checkpoint_path": checkpoint_path,
+                    "producer_checkpoint_sha256": shard.producer_checkpoint_sha256,
+                    "source_id": shard.source_id,
+                    "source_category": shard.source_category,
+                }
+            )
+        versions = sorted(producers)
+        if role == "fresh" and versions != [current_ckpt_version]:
+            raise ValueError("fresh component does not match initializer generation")
+        if role == "replay" and any(
+            version >= current_ckpt_version for version in versions
+        ):
+            raise ValueError("replay component is not strictly historical")
+        provenance = {
+            "schema_version": "flywheel-replay-component-v1",
+            "component_id": component_id,
+            "source_category": source_category,
+            "role": role,
+            "current_checkpoint_version": int(current_ckpt_version),
+            "checkpoint_versions": versions,
+            "producer_checkpoints": [producers[version] for version in versions],
+            "row_count": sum(int(record["rows"]) for record in records),
+            "shards": records,
+            "shard_inventory_sha256": _canonical_sha256(records),
+        }
+        provenance_path = round_root / f"{component_id}.provenance.json"
+        _atomic_json(
+            source_root / "manifest.json",
+            {"shards": [record["path"] for record in records]},
+        )
+        build = _run(
+            [
+                _py(),
+                "tools/build_memmap_corpus.py",
+                "--source",
+                str(source_root),
+                "--out",
+                str(corpus_dir),
+            ],
+            self.loop_dir / "corpus.log",
+        )
+        if build != 0:
+            raise RuntimeError(f"memmap build failed for {component_id}: {build}")
+        meta_path = corpus_dir / "corpus_meta.json"
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        if (
+            meta.get("game_seed_present") is not True
+            or int(meta.get("row_count", -1)) != provenance["row_count"]
+            or not isinstance(meta.get("payload_inventory_sha256"), str)
+        ):
+            raise RuntimeError(
+                f"built {component_id} corpus lacks game_seed or row provenance"
+            )
+        try:
+            component_mass = measure_memmap_component(corpus_dir, meta)
+        except ValueError as error:
+            raise RuntimeError(
+                f"built {component_id} corpus lacks sampler mass provenance: {error}"
+            ) from error
+        # Detect source mutation during the potentially long conversion.
+        for record in records:
+            path = Path(str(record["path"]))
+            if (
+                path.stat().st_size != record["size_bytes"]
+                or _file_sha256(path) != record["sha256"]
+            ):
+                raise RuntimeError(f"source shard changed during corpus build: {path}")
+        provenance["component_mass"] = component_mass
+        _atomic_json(provenance_path, provenance)
+        provenance_ref = {
+            "path": str(provenance_path.resolve(strict=True)),
+            "file_sha256": _file_sha256(provenance_path),
+        }
+        meta["flywheel_component_provenance"] = provenance_ref
+        _atomic_json(meta_path, meta)
+        return {
+            "component_id": component_id,
+            "source_category": source_category,
+            "game_sampling_ratio": float(ratio),
+            "corpus_dir": str(corpus_dir.resolve(strict=True)),
+            "corpus_meta_sha256": _file_sha256(meta_path),
+            "payload_inventory_sha256": meta["payload_inventory_sha256"],
+            "provenance_manifest": provenance_ref["path"],
+            "provenance_manifest_sha256": provenance_ref["file_sha256"],
+            "component_mass": component_mass,
+        }
+
+    def train_window(self, window_shards: list[ShardMeta], init_ckpt: str, round_idx: int,
+                     new_rows_this_round: int, *, current_ckpt_version: int | None = None) -> dict:
+        """Train on an authenticated current+historical game-uniform composite."""
+        if current_ckpt_version is None:
             return {
                 "ok": False,
-                "note": (
-                    "production-next learner requires at least two replay components; "
-                    "seed the window with authenticated prior/current corpora"
-                ),
+                "note": "production replay requires the initializer checkpoint version",
+            }
+        if not window_shards or any(not isinstance(shard, ShardMeta) for shard in window_shards):
+            return {
+                "ok": False,
+                "note": "production replay requires ShardMeta provenance, not bare paths",
             }
         steps = self._planned_steps(new_rows_this_round)
         if self.dry_run:
-            cand = publish_candidate(self.loop_dir, lambda p: Path(p).write_text(f"cand-{round_idx}"),
-                                     step=steps)
-            return {"ok": True, "candidate": cand.path, "version": cand.version, "steps": steps}
-        corpus_dir = self.loop_dir / "corpus" / f"round_{round_idx:03d}"
-        src_root = corpus_dir / "window_src"
-        src_root.mkdir(parents=True, exist_ok=True)
-        # build_memmap takes --source DIRECTORY ROOTS each with a manifest.json (NOT --source-list,
-        # which doesn't exist). Write a synthetic manifest listing the in-window shard paths.
-        _atomic_json(src_root / "manifest.json", {"shards": window_paths, "rows": None})
-        build = _run([_py(), "tools/build_memmap_corpus.py",
-                      "--source", str(src_root), "--out", str(corpus_dir)],
-                     self.loop_dir / "corpus.log")  # NEEDS T4: incremental append/evict (full rebuild today)
-        if build != 0:
-            return {"ok": False, "note": "memmap build failed", "exit_code": build}
-        ckpt = corpus_dir / "candidate.pt"
-        report = corpus_dir / "report.json"
+            cand = publish_candidate(
+                self.loop_dir,
+                lambda path: Path(path).write_text(f"cand-{round_idx}"),
+                step=steps,
+            )
+            return {
+                "ok": True,
+                "candidate": cand.path,
+                "version": cand.version,
+                "steps": steps,
+                "replay_authenticated": False,
+                "note": "dry-run stub; no production replay claim",
+            }
+        future = [shard for shard in window_shards if shard.ckpt_version > current_ckpt_version]
+        fresh = [shard for shard in window_shards if shard.ckpt_version == current_ckpt_version]
+        replay = [shard for shard in window_shards if shard.ckpt_version < current_ckpt_version]
+        if future:
+            return {"ok": False, "note": "window contains future checkpoint data"}
+        if self.cfg.learner_replay_required and (not fresh or not replay):
+            return {
+                "ok": False,
+                "note": (
+                    "production-next learner requires current shards plus a "
+                    "distinct authenticated historical checkpoint generation"
+                ),
+            }
+        round_root = self.loop_dir / "corpus" / f"round_{round_idx:03d}"
+        round_root.mkdir(parents=True, exist_ok=True)
+        replay_ratio = float(self.cfg.learner_min_replay_ratio)
+        fresh_ratio = 1.0 - replay_ratio
+        fresh_by_source = {
+            category: [
+                shard for shard in fresh if shard.source_category == category
+            ]
+            for category in FRESH_SOURCE_GAME_RATIOS
+        }
+        missing_sources = [
+            category for category, shards in fresh_by_source.items() if not shards
+        ]
+        unexpected_sources = sorted(
+            {
+                shard.source_category
+                for shard in fresh
+                if shard.source_category not in FRESH_SOURCE_GAME_RATIOS
+            }
+        )
+        if missing_sources or unexpected_sources:
+            return {
+                "ok": False,
+                "note": (
+                    "fresh wave must preserve separate current/recent/hard sources; "
+                    f"missing={missing_sources} unexpected={unexpected_sources}"
+                ),
+            }
+        try:
+            components = [
+                self._build_replay_component(
+                    shards=fresh_by_source[category],
+                    component_id=category,
+                    source_category=category,
+                    role="fresh",
+                    ratio=float(f"{fresh_ratio * source_ratio:.12g}"),
+                    current_ckpt_version=current_ckpt_version,
+                    round_root=round_root,
+                )
+                for category, source_ratio in FRESH_SOURCE_GAME_RATIOS.items()
+            ]
+            components.append(
+                self._build_replay_component(
+                    shards=replay,
+                    component_id=HISTORICAL_REPLAY_CATEGORY,
+                    source_category=HISTORICAL_REPLAY_CATEGORY,
+                    role="replay",
+                    ratio=replay_ratio,
+                    current_ckpt_version=current_ckpt_version,
+                    round_root=round_root,
+                )
+            )
+        except (OSError, ValueError, RuntimeError, json.JSONDecodeError) as error:
+            return {"ok": False, "note": f"replay composite build refused: {error}"}
+        init_path = Path(init_ckpt).expanduser().absolute()
+        init_sha = _file_sha256(init_path)
+        recipe = {
+            "forced_action_weight": self.cfg.learner_forced_action_weight,
+            "forced_row_value_weight": self.cfg.learner_forced_row_value_weight,
+            "loser_sample_weight": self.cfg.learner_loser_sample_weight,
+            "lr": 3e-5,
+            "per_game_policy_weight": self.cfg.learner_per_game_policy_weight,
+            "per_game_policy_weight_mode": self.cfg.learner_per_game_policy_weight_mode,
+            "per_game_value_weight": self.cfg.learner_per_game_value_weight,
+            "per_game_value_weight_mode": self.cfg.learner_per_game_value_weight_mode,
+            "policy_kl_anchor_direction": self.cfg.learner_policy_kl_anchor_direction,
+            "policy_kl_anchor_weight": self.cfg.learner_policy_kl_anchor_weight,
+            "policy_loss_weight": 1.0,
+            "q_loss_weight": self.cfg.learner_q_loss_weight,
+            "soft_target_source": "policy",
+            "soft_target_temperature": 0.7,
+            "soft_target_weight": 0.9,
+            "truncated_vp_margin_value_weight": 0.25,
+            "value_target_lambda": self.cfg.learner_value_target_lambda,
+        }
+        provenance_binding = [
+            {
+                "component_id": component["component_id"],
+                "provenance_manifest_sha256": component[
+                    "provenance_manifest_sha256"
+                ],
+            }
+            for component in components
+        ]
+        sampling_receipt = build_sampling_receipt(components)
+        fresh_component_ids = list(FRESH_SOURCE_GAME_RATIOS)
+        replay_component_ids = [HISTORICAL_REPLAY_CATEGORY]
+        effective_ratios = {
+            str(component["component_id"]): float(component["game_sampling_ratio"])
+            for component in components
+        }
+        contract = {
+            "schema_version": "flywheel-replay-composite-v2",
+            "current_checkpoint_version": int(current_ckpt_version),
+            "initializer_checkpoint_path": str(init_path),
+            "initializer_checkpoint_sha256": init_sha,
+            "fresh_component_ids": fresh_component_ids,
+            "replay_component_ids": replay_component_ids,
+            "fresh_source_game_ratios": dict(FRESH_SOURCE_GAME_RATIOS),
+            "effective_component_sampling_ratios": effective_ratios,
+            "minimum_replay_ratio": replay_ratio,
+            "realized_replay_ratio": replay_ratio,
+            "checkpoint_versions": sorted(
+                {int(shard.ckpt_version) for shard in window_shards}
+            ),
+            "component_provenance_sha256": _canonical_sha256(provenance_binding),
+            "sampling_receipt": sampling_receipt,
+            "sampling_receipt_sha256": _contract_sha256(sampling_receipt),
+        }
+        descriptor = {
+            "schema_version": "memmap_composite_v2",
+            "diagnostic_only": False,
+            "promotion_eligible": True,
+            "components": components,
+            "learner_recipe_overrides": recipe,
+            "learner_recipe_overrides_sha256": _canonical_sha256(recipe),
+            "policy_kl_anchor_component_ids": replay_component_ids,
+            "policy_distillation_component_ids": [
+                str(component["component_id"]) for component in components
+            ],
+            "value_training_component_ids": [
+                str(component["component_id"]) for component in components
+            ],
+            "flywheel_replay_contract": contract,
+        }
+        descriptor_path = round_root / "memmap_composite.json"
+        _atomic_json(descriptor_path, descriptor)
+        ckpt = round_root / "candidate.pt"
+        report = round_root / "report.json"
         train_cmd = [_py(), "tools/train_bc.py", "--arch", "entity_graph",
-                      "--data-format", "memmap", "--data", str(corpus_dir),
+                      "--data-format", "memmap", "--data", str(descriptor_path),
                       "--init-checkpoint", init_ckpt, "--checkpoint", str(ckpt),
-                      "--report", str(report),           # REQUIRED flag (was missing)
-                      "--batch-size", str(self.cfg.train_batch_size),  # must match reuse math
+                      "--report", str(report),
+                      "--batch-size", str(self.cfg.train_batch_size),
                       "--training-rng-rank-offset",
                       "--mask-hidden-info", "--amp", "bf16",
-                      "--max-steps", str(steps)]         # bounded continuous update
+                      "--max-steps", str(steps),
+                      "--validation-max-samples", "0",
+                      "--optimizer", "adam", "--weight-decay", "0",
+                      "--lr", "3e-5", "--lr-schedule", "flat",
+                      "--truncated-vp-margin-value-weight", "0.25",
+                      "--soft-target-temperature", "0.7",
+                      "--soft-target-weight", "0.9",
+                      "--soft-target-source", "policy",
+                      "--no-resume-optimizer",
+                      "--skip-teacher-quality-gate",
+                      "--trust-curated-data-quality"]
         train_cmd += self.cfg.resolve_learner_argv()
         train = _run(train_cmd, self.loop_dir / "train.log")
         if train != 0 or not ckpt.exists():
-            return {"ok": False, "note": "train failed (or --max-steps unsupported: NEEDS T3)",
+            return {"ok": False, "note": "train failed",
                     "exit_code": train, "steps": steps}
         cand = publish_candidate(self.loop_dir, lambda p: shutil.copyfile(ckpt, p), step=steps)
-        return {"ok": True, "candidate": cand.path, "version": cand.version, "steps": steps}
+        return {
+            "ok": True,
+            "candidate": cand.path,
+            "version": cand.version,
+            "steps": steps,
+            "memmap_composite": str(descriptor_path),
+            "replay_contract": contract,
+        }
 
     def _gate_seed(self, round_idx: int) -> int:
         # Disjoint additive space + a different stride from generation's round_seed (see the
@@ -1281,7 +1619,16 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         new_shards = scan_new_shards(out_dir)
         new_rows = sum(r for _, r in new_shards)
-        window.register_many(new_shards, ckpt_version=champ.version)
+        champion_path = str(Path(champ.path).expanduser().absolute())
+        champion_sha256 = _file_sha256(champion_path)
+        window.register_many(
+            new_shards,
+            ckpt_version=champ.version,
+            producer_checkpoint_path=champion_path,
+            producer_checkpoint_sha256=champion_sha256,
+            source_id=f"continuous_flywheel:round_{round_idx:03d}",
+            source_category=str(gen.get("source_category", "")),
+        )
         sel = window.select()  # compute ONCE, thread everywhere (was 3x per round)
         if cfg.evict_stale_shards:
             window.evict(delete=True, grace_seconds=args.evict_grace_seconds, selection=sel)
@@ -1313,7 +1660,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             continue
         journal["consecutive_zero_rows"] = 0
 
-        tr = runner.train_window([s.path for s in sel.in_window], champ.path, round_idx, new_rows)
+        tr = runner.train_window(
+            sel.in_window,
+            champ.path,
+            round_idx,
+            new_rows,
+            current_ckpt_version=champ.version,
+        )
         rec["train"] = tr
         if not tr.get("ok"):
             rec["decision"] = "abort_train"
