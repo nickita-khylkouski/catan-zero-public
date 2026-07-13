@@ -1,7 +1,19 @@
 {
+  "a1_pre_wave_guard_sync": {
+    "previous_guard_sha256": "sha256:60fba508e928468cebf6a6d79e8436410bfe97e21e9bf4e9cbb67362cd062d9e",
+    "schema_version": "a1-pre-wave-generation-guard-sync-v1",
+    "selected_c_scale": 0.1,
+    "source_s1_evidence": {
+      "path": "/home/ubuntu/catan-zero-production/private/operator_bindings/a1-v5-post-promotion-s1-r1/s1.post-promotion.binding.json",
+      "sha256": "sha256:e8772c575e308bab55e421f7596a4ba056433479dbbd4a58c07e0f76925c6b82"
+    },
+    "synchronizer": {
+      "path": "tools/a1_pre_wave_contract.py",
+      "sha256": "sha256:3e1251ecc34454d217a295af83f3b31be60aaacc2f17c321d9cf8ad3030d930e"
+    }
+  },
   "guards": [
     {
-      "name": "cli_flag_lint",
       "args": {
         "critical_flags": [
           "--c-scale",
@@ -21,42 +33,43 @@
           "--determinization-min-simulations"
         ],
         "expected_values": {
+          "--belief-chance-spectra": false,
           "--c-scale": 0.1,
           "--c-visit": 50.0,
-          "--n-full": 128,
-          "--n-fast": 16,
-          "--p-full": 0.25,
-          "--max-depth": 80,
-          "--temperature-decisions": 90,
-          "--public-observation": true,
+          "--determinization-min-simulations": 32,
+          "--determinization-particles": 4,
+          "--information-set-search": true,
           "--lazy-interior-chance": true,
+          "--max-depth": 80,
+          "--n-fast": 16,
+          "--n-full": 128,
+          "--native-mcts-hot-loop": true,
+          "--p-full": 0.25,
+          "--public-observation": true,
           "--symmetry-averaged-eval": true,
           "--symmetry-averaged-eval-threshold": 20,
-          "--belief-chance-spectra": false,
-          "--information-set-search": true,
-          "--native-mcts-hot-loop": true,
-          "--determinization-particles": 4,
-          "--determinization-min-simulations": 32
+          "--temperature-decisions": 90
         }
-      }
+      },
+      "name": "cli_flag_lint"
     },
     {
-      "name": "seed_ledger",
       "args": {
         "purpose": "generate"
-      }
+      },
+      "name": "seed_ledger"
     },
     {
-      "name": "ledger_overlap",
       "args": {
         "purpose": "generate"
-      }
+      },
+      "name": "ledger_overlap"
     },
     {
-      "name": "fd_limit",
       "args": {
         "minimum": 65536
-      }
+      },
+      "name": "fd_limit"
     }
   ]
 }
