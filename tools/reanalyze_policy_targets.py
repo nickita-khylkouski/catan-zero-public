@@ -30,14 +30,18 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import hashlib
+import hmac
+import importlib.metadata
 import io
 import json
 import os
+import shutil
+import subprocess
 import sys
 import zipfile
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 import numpy as np
 
@@ -75,10 +79,28 @@ PAYLOAD_INVENTORY_SCHEMA = "reanalysis-payload-inventory-v1"
 COLORS = ("RED", "BLUE")
 REWRITTEN_COLUMNS = frozenset(
     {
+        "teacher_name",
         "target_policy",
+        "target_policy_mask",
         "target_scores",
         "target_scores_mask",
         "root_value",
+        "root_value_mask",
+        "prior_policy",
+        "trajectory_producer_checkpoint_sha256",
+        "target_reanalyzer_checkpoint_sha256",
+        "target_reanalysis_search_config_sha256",
+        "target_reanalysis_plan_sha256",
+    }
+)
+SEARCH_PATCH_COLUMNS = frozenset(
+    {
+        "target_policy",
+        "target_policy_mask",
+        "target_scores",
+        "target_scores_mask",
+        "root_value",
+        "root_value_mask",
         "prior_policy",
     }
 )
@@ -106,6 +128,65 @@ RECONSTRUCTION_COLUMNS = frozenset(
 
 class ReanalysisError(RuntimeError):
     """Fail-closed contract violation."""
+
+
+def _runtime_attestation() -> dict[str, Any]:
+    """Bind the exact code and native engine that define the search operator."""
+    repo = _TOOLS_DIR.parent
+    try:
+        commit = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        import catanatron_rs  # type: ignore
+    except (OSError, subprocess.CalledProcessError, ImportError) as error:
+        raise ReanalysisError(f"cannot attest reanalysis runtime: {error}") from error
+    native_path = Path(catanatron_rs.__file__).resolve()
+    source_paths = (
+        Path(__file__).resolve(),
+        _TOOLS_DIR / "reconstruct_state.py",
+        repo / "src/catan_zero/search/gumbel_chance_mcts.py",
+        repo / "src/catan_zero/search/native_gumbel_mcts.py",
+        repo / "src/catan_zero/search/neural_rust_mcts.py",
+        repo / "src/catan_zero/rl/gumbel_self_play.py",
+    )
+    sources = [
+        {"path": str(path.relative_to(repo)), "sha256": _sha256(path)}
+        for path in source_paths
+    ]
+    try:
+        wheel_version = importlib.metadata.version("catanatron-rs")
+    except importlib.metadata.PackageNotFoundError:
+        wheel_version = str(getattr(catanatron_rs, "__version__", "unknown"))
+    value = {
+        "repo_commit": commit,
+        "source_files": sources,
+        "catanatron_rs": {
+            "path": str(native_path),
+            "sha256": _sha256(native_path),
+            "version": wheel_version,
+        },
+    }
+    value["runtime_sha256"] = _value_sha256(value)
+    return value
+
+
+def _claim_hmac(value: Mapping[str, Any], key: bytes) -> str:
+    return (
+        "sha256:" + hmac.new(key, _canonical_bytes(value), hashlib.sha256).hexdigest()
+    )
+
+
+def _load_auth_key(path: Path, expected_sha256: str) -> bytes:
+    key = Path(path).read_bytes()
+    if len(key) < 32 or _sha256(path) != expected_sha256:
+        raise ReanalysisError(
+            "claim authentication key is too short or hash-mismatched"
+        )
+    return key
 
 
 def _sha256(path: Path) -> str:
@@ -194,9 +275,21 @@ def _scalar(shard: Mapping[str, np.ndarray], key: str, row: int, default: Any) -
 
 
 def _is_producer_mirror(shard: Mapping[str, np.ndarray], row: int) -> bool:
-    if bool(_scalar(shard, "is_pool_game", row, False)):
+    required = {
+        "is_pool_game",
+        "opponent_version",
+        "opponent_tag",
+        "opponent_checkpoint_md5",
+    }
+    missing = required - set(shard)
+    if missing:
+        raise ReanalysisError(
+            "source shard lacks explicit producer-mirror provenance: "
+            + ", ".join(sorted(missing))
+        )
+    if bool(_scalar(shard, "is_pool_game", row, True)):
         return False
-    if int(_scalar(shard, "opponent_version", row, -1)) >= 0:
+    if int(_scalar(shard, "opponent_version", row, 0)) != -1:
         return False
     tag = str(_scalar(shard, "opponent_tag", row, ""))
     opponent_md5 = str(_scalar(shard, "opponent_checkpoint_md5", row, ""))
@@ -211,6 +304,8 @@ def _eligible_policy_row(shard: Mapping[str, np.ndarray], row: int) -> bool:
         "used_full_search",
         "is_forced",
         "target_information_regime",
+        "target_policy_mask",
+        "root_value_mask",
     }
     missing = required - set(shard)
     if missing:
@@ -227,6 +322,8 @@ def _eligible_policy_row(shard: Mapping[str, np.ndarray], row: int) -> bool:
         float(_scalar(shard, "policy_weight_multiplier", row, 0.0)) > 0.0
         and bool(_scalar(shard, "used_full_search", row, False))
         and not bool(_scalar(shard, "is_forced", row, True))
+        and bool(_scalar(shard, "root_value_mask", row, False))
+        and bool(np.asarray(shard["target_policy_mask"])[row].any())
         and _is_producer_mirror(shard, row)
     )
 
@@ -330,6 +427,8 @@ def build_plan(
     target_checkpoint: Path,
     chunks: int,
     search_config: Mapping[str, Any],
+    claim_auth_key: Path,
+    runtime_attestation: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     if chunks < 1:
         raise ReanalysisError("chunks must be >= 1")
@@ -410,6 +509,14 @@ def build_plan(
         )
     if config.get("information_set_search") is not True:
         raise ReanalysisError("reanalyzer must enable information_set_search")
+    runtime = dict(runtime_attestation or _runtime_attestation())
+    if runtime.get("runtime_sha256") != _value_sha256(
+        {key: value for key, value in runtime.items() if key != "runtime_sha256"}
+    ):
+        raise ReanalysisError("runtime attestation semantic hash mismatch")
+    key_sha = _sha256(claim_auth_key)
+    if Path(claim_auth_key).stat().st_size < 32:
+        raise ReanalysisError("claim authentication key must contain at least 32 bytes")
     plan = {
         "schema_version": PLAN_SCHEMA,
         "source_manifest": {
@@ -425,6 +532,9 @@ def build_plan(
             "checkpoint_sha256": _sha256(target_checkpoint),
         },
         "target_information_regime": TARGET_INFORMATION_REGIME_PUBLIC,
+        "claim_auth_key_sha256": key_sha,
+        "claim_auth_key_path": str(Path(claim_auth_key).resolve()),
+        "runtime_attestation": runtime,
         "search_config": config,
         "search_config_sha256": _value_sha256(config),
         "source_shards": inventory,
@@ -476,6 +586,13 @@ def _verify_plan(plan: Mapping[str, Any]) -> None:
         or config.get("target_information_regime") != TARGET_INFORMATION_REGIME_PUBLIC
     ):
         raise ReanalysisError("search configuration is not public-conservation PIMC")
+    runtime = plan.get("runtime_attestation")
+    if not isinstance(runtime, dict) or runtime.get("runtime_sha256") != _value_sha256(
+        {key: value for key, value in runtime.items() if key != "runtime_sha256"}
+    ):
+        raise ReanalysisError("runtime attestation hash mismatch")
+    if _runtime_attestation() != runtime:
+        raise ReanalysisError("runtime code/native-engine drift from sealed plan")
     identities = plan.get("eligible_rows")
     if not isinstance(identities, list) or _value_sha256(identities) != plan.get(
         "eligible_rows_sha256"
@@ -570,6 +687,7 @@ def _search_patch(search: Any, game: Any, feature: Mapping[str, Any]) -> dict[st
     if set(result.improved_policy) != set(legal_rust):
         raise ReanalysisError("search result does not cover the exact legal root")
     target = [float(result.improved_policy[action]) for action in legal_rust]
+    target_mask = [value > 0.0 for value in target]
     raw_scores = [
         float(result.q_values.get(action, float("nan"))) for action in legal_rust
     ]
@@ -589,15 +707,17 @@ def _search_patch(search: Any, game: Any, feature: Mapping[str, Any]) -> dict[st
         raise ReanalysisError("search target/prior is not normalized")
     return {
         "target_policy": target,
+        "target_policy_mask": target_mask,
         "target_scores": scores,
         "target_scores_mask": score_mask,
         "root_value": float(result.root_value),
+        "root_value_mask": True,
         "prior_policy": priors,
     }
 
 
-def _search_from_plan(plan: Mapping[str, Any], *, device: str) -> Any:
-    evaluator = EntityGraphRustEvaluator.from_checkpoint(
+def _evaluator_from_plan(plan: Mapping[str, Any], *, device: str) -> Any:
+    return EntityGraphRustEvaluator.from_checkpoint(
         plan["target_reanalyzer"]["checkpoint_path"],
         device=device,
         config=EntityGraphRustEvaluatorConfig(
@@ -607,11 +727,15 @@ def _search_from_plan(plan: Mapping[str, Any], *, device: str) -> Any:
             rust_featurize=True,
         ),
     )
+
+
+def _search_from_plan(plan: Mapping[str, Any], *, evaluator: Any, row_seed: int) -> Any:
     allowed = {field.name for field in dataclasses.fields(GumbelChanceMCTSConfig)}
     kwargs = {
         key: value for key, value in plan["search_config"].items() if key in allowed
     }
     kwargs["colors"] = tuple(kwargs.get("colors", COLORS))
+    kwargs["seed"] = int(row_seed)
     config = GumbelChanceMCTSConfig(**kwargs)
     return create_gumbel_search(config, evaluator, native_hot_loop=False)
 
@@ -621,10 +745,12 @@ def run_chunk(
     plan: Mapping[str, Any],
     chunk_index: int,
     output: Path,
+    claim_auth_key: Path,
     device: str = "cpu",
-    search: Any = None,
+    search_factory: Any = None,
 ) -> dict[str, Any]:
     _verify_plan(plan)
+    auth_key = _load_auth_key(claim_auth_key, str(plan["claim_auth_key_sha256"]))
     chunks = int(plan["chunks"])
     if not 0 <= chunk_index < chunks:
         raise ReanalysisError(f"chunk_index must be in [0,{chunks})")
@@ -641,7 +767,11 @@ def run_chunk(
             for item in plan["source_shards"]
         ]
     )
-    search = search or _search_from_plan(plan, device=device)
+    evaluator = (
+        None
+        if search_factory is not None
+        else _evaluator_from_plan(plan, device=device)
+    )
     patches: list[dict[str, Any]] = []
     for identity in entries:
         shard = loaded[int(identity["shard_index"])]
@@ -650,12 +780,21 @@ def run_chunk(
             raise ReanalysisError("planned row is no longer policy-active/admissible")
         sequence = sequences[int(identity["game_seed"])]
         game, feature = _verify_reconstruction(shard=shard, row=row, sequence=sequence)
+        row_seed = int(
+            str(identity["identity_sha256"]).removeprefix("sha256:")[:16], 16
+        )
+        search = (
+            search_factory(row_seed)
+            if search_factory is not None
+            else _search_from_plan(plan, evaluator=evaluator, row_seed=row_seed)
+        )
         patch = _search_patch(search, game, feature)
         patches.append(
             {
                 "identity_sha256": identity["identity_sha256"],
                 "shard_index": identity["shard_index"],
                 "row_index": identity["row_index"],
+                "search_seed": row_seed,
                 "values": patch,
             }
         )
@@ -670,8 +809,10 @@ def run_chunk(
             "checkpoint_sha256"
         ],
         "target_information_regime": TARGET_INFORMATION_REGIME_PUBLIC,
+        "runtime_attestation_sha256": plan["runtime_attestation"]["runtime_sha256"],
     }
     claim["claim_sha256"] = _value_sha256(claim)
+    claim["claim_hmac_sha256"] = _claim_hmac(claim, auth_key)
     _write_json_atomic(output, claim)
     return claim
 
@@ -699,9 +840,9 @@ def _coerce_row_value(original: np.ndarray, row: int, value: Any) -> np.ndarray 
 def _apply_patch(
     arrays: dict[str, np.ndarray], row: int, values: Mapping[str, Any]
 ) -> None:
-    if set(values) != REWRITTEN_COLUMNS:
+    if set(values) != SEARCH_PATCH_COLUMNS:
         raise ReanalysisError(
-            f"claim attempted wrong columns: got={sorted(values)}, expected={sorted(REWRITTEN_COLUMNS)}"
+            f"claim attempted wrong columns: got={sorted(values)}, expected={sorted(SEARCH_PATCH_COLUMNS)}"
         )
     for key, value in values.items():
         if key not in arrays:
@@ -709,14 +850,73 @@ def _apply_patch(
         arrays[key][row] = _coerce_row_value(arrays[key], row, value)
 
 
-def _verify_claim(claim: Mapping[str, Any], plan: Mapping[str, Any]) -> None:
+def _ensure_reanalysis_provenance_columns(
+    arrays: dict[str, np.ndarray], plan: Mapping[str, Any]
+) -> None:
+    rows = _row_count(arrays)
+    original_teacher = np.asarray(arrays.get("teacher_name", np.full(rows, ""))).astype(
+        "U64"
+    )
+    arrays["teacher_name"] = original_teacher
+    for key in (
+        "trajectory_producer_checkpoint_sha256",
+        "target_reanalyzer_checkpoint_sha256",
+        "target_reanalysis_search_config_sha256",
+        "target_reanalysis_plan_sha256",
+    ):
+        if key in arrays:
+            raise ReanalysisError(
+                f"source shard already contains reserved column {key}"
+            )
+        arrays[key] = np.full(rows, "", dtype="U71")
+
+
+def _stamp_reanalysis_provenance(
+    arrays: dict[str, np.ndarray], row: int, plan: Mapping[str, Any]
+) -> None:
+    arrays["teacher_name"][row] = "policy_target_reanalysis"
+    arrays["trajectory_producer_checkpoint_sha256"][row] = plan["trajectory_producer"][
+        "checkpoint_sha256"
+    ]
+    arrays["target_reanalyzer_checkpoint_sha256"][row] = plan["target_reanalyzer"][
+        "checkpoint_sha256"
+    ]
+    arrays["target_reanalysis_search_config_sha256"][row] = plan["search_config_sha256"]
+    arrays["target_reanalysis_plan_sha256"][row] = plan["plan_sha256"]
+
+
+def _columns_sha256(arrays: Mapping[str, np.ndarray], keys: Iterable[str]) -> str:
+    digest = hashlib.sha256()
+    for key in sorted(keys):
+        value = np.asarray(arrays[key])
+        digest.update(key.encode("utf-8") + b"\0")
+        buffer = io.BytesIO()
+        np.lib.format.write_array(buffer, value, allow_pickle=True)
+        digest.update(buffer.getvalue())
+    return "sha256:" + digest.hexdigest()
+
+
+def _verify_claim(
+    claim: Mapping[str, Any], plan: Mapping[str, Any], *, auth_key: bytes
+) -> None:
     if (
         claim.get("schema_version") != CLAIM_SCHEMA
         or claim.get("plan_sha256") != plan["plan_sha256"]
     ):
         raise ReanalysisError("foreign or unsupported chunk claim")
+    unsigned = {
+        key: value for key, value in claim.items() if key != "claim_hmac_sha256"
+    }
+    if not hmac.compare_digest(
+        str(claim.get("claim_hmac_sha256", "")), _claim_hmac(unsigned, auth_key)
+    ):
+        raise ReanalysisError("chunk claim authentication failed")
     expected = _value_sha256(
-        {key: value for key, value in claim.items() if key != "claim_sha256"}
+        {
+            key: value
+            for key, value in claim.items()
+            if key not in {"claim_sha256", "claim_hmac_sha256"}
+        }
     )
     if claim.get("claim_sha256") != expected:
         raise ReanalysisError("chunk claim hash mismatch")
@@ -729,6 +929,11 @@ def _verify_claim(claim: Mapping[str, Any], plan: Mapping[str, Any]) -> None:
         raise ReanalysisError("chunk target checkpoint mismatch")
     if claim.get("target_information_regime") != TARGET_INFORMATION_REGIME_PUBLIC:
         raise ReanalysisError("chunk target information regime mismatch")
+    if (
+        claim.get("runtime_attestation_sha256")
+        != plan["runtime_attestation"]["runtime_sha256"]
+    ):
+        raise ReanalysisError("chunk runtime attestation mismatch")
     chunk_index = int(claim["chunk_index"])
     expected = {
         row["identity_sha256"]: row
@@ -749,15 +954,25 @@ def _verify_claim(claim: Mapping[str, Any], plan: Mapping[str, Any]) -> None:
             raise ReanalysisError(
                 "chunk row identity points at the wrong source location"
             )
+        row_seed = int(
+            str(identity["identity_sha256"]).removeprefix("sha256:")[:16], 16
+        )
+        if int(patch.get("search_seed", -1)) != row_seed:
+            raise ReanalysisError("chunk row search seed mismatch")
 
 
 def merge_claims(
-    *, plan: Mapping[str, Any], claim_paths: Sequence[Path], output: Path
+    *,
+    plan: Mapping[str, Any],
+    claim_paths: Sequence[Path],
+    output: Path,
+    claim_auth_key: Path,
 ) -> dict[str, Any]:
     _verify_plan(plan)
+    auth_key = _load_auth_key(claim_auth_key, str(plan["claim_auth_key_sha256"]))
     claims = [_load_json(path) for path in claim_paths]
     for claim in claims:
-        _verify_claim(claim, plan)
+        _verify_claim(claim, plan, auth_key=auth_key)
     by_chunk: dict[int, Mapping[str, Any]] = {}
     for claim in claims:
         index = int(claim["chunk_index"])
@@ -788,18 +1003,23 @@ def merge_claims(
         )
 
     output = Path(output)
-    if output.exists() and any(output.iterdir()):
-        raise ReanalysisError(f"merge output must be new or empty: {output}")
-    output.mkdir(parents=True, exist_ok=True)
+    if output.exists():
+        raise ReanalysisError(f"merge output must not already exist: {output}")
+    staging = output.with_name(output.name + f".staging.{os.getpid()}")
+    if staging.exists():
+        shutil.rmtree(staging)
+    staging.mkdir(parents=True)
     by_shard: dict[int, list[Mapping[str, Any]]] = defaultdict(list)
     for patch in patches.values():
         by_shard[int(patch["shard_index"])].append(patch)
     payload_inventory: list[dict[str, Any]] = []
     output_shards: list[str] = []
+    preservation_receipts: list[dict[str, Any]] = []
     for source in plan["source_shards"]:
         shard_index = int(source["index"])
         original = load_shard(Path(source["path"]))
         arrays = {key: value.copy() for key, value in original.items()}
+        _ensure_reanalysis_provenance_columns(arrays, plan)
         before = {
             key: value.copy()
             for key, value in original.items()
@@ -809,10 +1029,21 @@ def merge_claims(
             by_shard.get(shard_index, []), key=lambda value: int(value["row_index"])
         ):
             _apply_patch(arrays, int(patch["row_index"]), patch["values"])
+            _stamp_reanalysis_provenance(arrays, int(patch["row_index"]), plan)
         for key, expected in before.items():
             if not _array_equal(arrays[key], expected):
                 raise ReanalysisError(f"non-target column changed during merge: {key}")
-        destination = output / f"reanalyzed_shard_{shard_index:05d}.npz"
+        preserved_sha = _columns_sha256(original, before)
+        if _columns_sha256(arrays, before) != preserved_sha:
+            raise ReanalysisError("preserved-column semantic digest changed")
+        preservation_receipts.append(
+            {
+                "shard_index": shard_index,
+                "source_sha256": source["sha256"],
+                "preserved_columns_sha256": preserved_sha,
+            }
+        )
+        destination = staging / f"reanalyzed_shard_{shard_index:05d}.npz"
         _write_npz_atomic(destination, arrays)
         record = {
             "path": destination.name,
@@ -822,9 +1053,21 @@ def merge_claims(
         }
         payload_inventory.append(record)
         output_shards.append(record["path"])
+    plan_path = staging / "plan.json"
+    _write_json_atomic(plan_path, plan)
+    row_identities = [
+        {
+            "game_seed": row["game_seed"],
+            "decision_index": row["decision_index"],
+            "shard_index": row["shard_index"],
+            "row_index": row["row_index"],
+        }
+        for row in plan["eligible_rows"]
+    ]
     manifest = {
         "schema_version": MERGE_SCHEMA,
         "plan_sha256": plan["plan_sha256"],
+        "plan": {"path": plan_path.name, "file_sha256": _sha256(plan_path)},
         "trajectory_producer": plan["trajectory_producer"],
         "target_reanalyzer": plan["target_reanalyzer"],
         "target_information_regime": TARGET_INFORMATION_REGIME_PUBLIC,
@@ -836,12 +1079,22 @@ def merge_claims(
         "payload_inventory_schema": PAYLOAD_INVENTORY_SCHEMA,
         "payload_inventory": payload_inventory,
         "payload_inventory_sha256": _value_sha256(payload_inventory),
+        "preservation_receipts": preservation_receipts,
+        "preserved_columns_sha256": _value_sha256(preservation_receipts),
+        "row_identity_sha256": _value_sha256(row_identities),
+        "runtime_attestation": plan["runtime_attestation"],
         "claim_sha256s": [
             by_chunk[index]["claim_sha256"] for index in sorted(by_chunk)
         ],
     }
     manifest["manifest_sha256"] = _value_sha256(manifest)
-    _write_json_atomic(output / "manifest.json", manifest)
+    manifest["manifest_hmac_sha256"] = _claim_hmac(manifest, auth_key)
+    _write_json_atomic(staging / "manifest.json", manifest)
+    try:
+        os.replace(staging, output)
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
     return manifest
 
 
@@ -853,6 +1106,7 @@ def _command_plan(args: argparse.Namespace) -> None:
         target_checkpoint=Path(args.target_checkpoint),
         chunks=args.chunks,
         search_config=config,
+        claim_auth_key=Path(args.claim_auth_key),
     )
     _write_json_atomic(Path(args.output), plan)
     print(json.dumps(plan, indent=2, sort_keys=True))
@@ -863,6 +1117,7 @@ def _command_chunk(args: argparse.Namespace) -> None:
         plan=_load_json(Path(args.plan)),
         chunk_index=args.chunk_index,
         output=Path(args.output),
+        claim_auth_key=Path(args.claim_auth_key),
         device=args.device,
     )
     print(json.dumps(claim, indent=2, sort_keys=True))
@@ -873,6 +1128,7 @@ def _command_merge(args: argparse.Namespace) -> None:
         plan=_load_json(Path(args.plan)),
         claim_paths=[Path(path) for path in args.claim],
         output=Path(args.output),
+        claim_auth_key=Path(args.claim_auth_key),
     )
     print(json.dumps(manifest, indent=2, sort_keys=True))
 
@@ -888,17 +1144,20 @@ def main(argv: Sequence[str] | None = None) -> None:
     plan.add_argument("--n-full", type=int, default=128)
     plan.add_argument("--seed", type=int, default=1)
     plan.add_argument("--output", required=True)
+    plan.add_argument("--claim-auth-key", required=True)
     plan.set_defaults(func=_command_plan)
     chunk = commands.add_parser("run-chunk")
     chunk.add_argument("--plan", required=True)
     chunk.add_argument("--chunk-index", type=int, required=True)
     chunk.add_argument("--device", default="cuda")
     chunk.add_argument("--output", required=True)
+    chunk.add_argument("--claim-auth-key", required=True)
     chunk.set_defaults(func=_command_chunk)
     merge = commands.add_parser("merge")
     merge.add_argument("--plan", required=True)
     merge.add_argument("--claim", action="append", required=True)
     merge.add_argument("--output", required=True)
+    merge.add_argument("--claim-auth-key", required=True)
     merge.set_defaults(func=_command_merge)
     args = parser.parse_args(argv)
     args.func(args)

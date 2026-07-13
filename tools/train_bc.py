@@ -124,6 +124,10 @@ if str(_TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(_TOOLS_DIR))
 
 from factory_common import parse_track, write_json  # noqa: E402
+from policy_target_reanalysis_contract import (  # noqa: E402
+    SCHEMA as _POLICY_TARGET_REANALYSIS_SCHEMA,
+    validate_policy_target_reanalysis_manifest as _validate_policy_target_reanalysis_manifest,
+)
 import launcher_guards  # noqa: E402
 from mixed_memmap_corpus import ConcatMemmapCorpus  # noqa: E402
 
@@ -4550,6 +4554,11 @@ def main(argv: Sequence[str] | None = None) -> None:
     if args.grow_from_checkpoint and args.arch != "entity_graph":
         raise SystemExit("--grow-from-checkpoint currently supports --arch entity_graph only")
     args.value_categorical_bins = _resolve_effective_value_categorical_bins(args)
+    args.policy_target_reanalysis = None
+    if str(args.data_format) != "memmap":
+        reanalysis_manifest = Path(args.data) / "manifest.json"
+        if reanalysis_manifest.is_file():
+            args.policy_target_reanalysis = _validate_policy_target_reanalysis_manifest(reanalysis_manifest)
     args.data_fingerprint = _training_data_fingerprint(args.data, args.data_format)
     args.a1_memmap_payload_inventory_sha256 = (
         None
@@ -6599,6 +6608,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         "data": str(args.data),
         "data_fingerprint": str(args.data_fingerprint),
         "data_format": args.data_format,
+        "policy_target_reanalysis": getattr(args, "policy_target_reanalysis", None),
         "track": args.track,
         "vps_to_win": int(args.vps_to_win),
         "validation_game_seed_ranges": validation_game_seed_ranges or None,
@@ -10532,6 +10542,8 @@ def _entity_partition_manifest_shards(manifests: list[Path]) -> list[Path]:
 
 def _manifest_shard_files(manifest_path: Path) -> list[Path]:
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if manifest.get("schema_version") == _POLICY_TARGET_REANALYSIS_SCHEMA:
+        _validate_policy_target_reanalysis_manifest(manifest_path)
     files = []
     missing = []
     for value in manifest.get("shards", ()):
