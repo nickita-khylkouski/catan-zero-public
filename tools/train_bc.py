@@ -4095,7 +4095,6 @@ def _effective_a1_learner_training_recipe(
         "soft_target_temperature",
         "soft_target_min_legal_coverage",
         "value_loss_weight",
-        "scalar_value_loss_transform",
         "value_target_lambda",
         "value_categorical_loss_weight",
         "hlgauss_scalar_aux_loss_weight",
@@ -4124,6 +4123,17 @@ def _effective_a1_learner_training_recipe(
         "ddp_shard_data",
     )
     effective = {field: getattr(args, field) for field in bound_fields}
+    # Backward-compatible additive objective semantics. Historical sealed A1
+    # recipes predate this field and mean the old/raw scalar loss. Recording
+    # that default unconditionally makes those immutable recipes acquire an
+    # unexpected key and fail replay. The non-default deployed-tanh operator is
+    # trajectory-changing, so it must enter the effective recipe and therefore
+    # requires explicit ablation authority/new sealing.
+    scalar_value_loss_transform = str(
+        getattr(args, "scalar_value_loss_transform", "raw")
+    )
+    if scalar_value_loss_transform != "raw":
+        effective["scalar_value_loss_transform"] = scalar_value_loss_transform
     # Additive opt-in objective: historical sealed recipes and old Namespace
     # fixtures predate this field and must remain byte-for-byte exact when it is
     # absent/off. A nonzero value is trajectory-changing and therefore enters

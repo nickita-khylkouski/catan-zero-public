@@ -541,6 +541,14 @@ def test_a1_artifact_chain_replays_actual_seed_set_and_learner_objective(
         "distributed_advantage_contract": "not_applicable",
     }
 
+    # The historical seal predates this additive operator. Its default/raw
+    # semantics remain replayable, while the trajectory-changing tanh opt-in
+    # enters the effective recipe and is rejected without ablation authority.
+    args.scalar_value_loss_transform = "deployed_tanh"
+    with pytest.raises(SystemExit, match="scalar_value_loss_transform"):
+        _validate_a1_learner_training_recipe(args, ddp, bound)
+    args.scalar_value_loss_transform = "raw"
+
     with pytest.raises(SystemExit, match="unexpected=1"):
         tampered_seeds = seeds.copy()
         tampered_seeds[0] = 999_999
