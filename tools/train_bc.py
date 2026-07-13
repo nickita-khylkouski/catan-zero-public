@@ -4011,6 +4011,81 @@ def _effective_a1_learner_training_recipe(
     return effective
 
 
+def _validate_a1_decisive_training_semantics(
+    args: argparse.Namespace,
+    ddp: dict[str, int | bool],
+    bound: dict[str, object],
+) -> dict[str, object]:
+    """Fail closed on learner operators that are not promotion-safe yet.
+
+    The generic trainer keeps these knobs available for explicitly diagnostic
+    research.  A sealed A1 run without diagnostic authority is decisive,
+    however, and must not silently change its mathematical objective:
+
+    * gradient accumulation currently averages already-normalized microbatch
+      means, not the exact union-weighted numerator/denominator;
+    * distributed symmetry augmentation has no completed per-rank RNG/resume
+      contract; and
+    * outcome-value advantage weighting was historically rank-local under DDP.
+      Its new global normalization still needs a fresh, explicitly reviewed A1
+      seal before it can affect a promotable candidate.
+    """
+
+    diagnostic_authority = bool(
+        getattr(args, "a1_batch_probe_plan", "")
+        or getattr(args, "a1_batch_probe_run_id", "")
+        or getattr(args, "a1_learner_ablation_id", "")
+        or getattr(args, "a1_dual_learner_lock", "")
+        or bound.get("dual_arm") is True
+    )
+    world_size = int(ddp.get("world_size", 1))
+    grad_accum_steps = int(getattr(args, "grad_accum_steps", 1))
+    symmetry_augment = bool(getattr(args, "symmetry_augment", False))
+    advantage_mode = str(getattr(args, "advantage_policy_weighting", "none"))
+    contract: dict[str, object] = {
+        "schema_version": "a1-decisive-training-semantics-v1",
+        "decisive": not diagnostic_authority,
+        "diagnostic_authority_present": diagnostic_authority,
+        "world_size": world_size,
+        "grad_accum_steps": grad_accum_steps,
+        "gradient_accumulation_contract": (
+            "single_microbatch_exact"
+            if grad_accum_steps == 1
+            else "diagnostic_approximate_microbatch_means"
+        ),
+        "symmetry_augmentation": symmetry_augment,
+        "distributed_symmetry_contract": (
+            "not_applicable"
+            if not symmetry_augment or world_size == 1
+            else "incomplete"
+        ),
+        "advantage_policy_weighting": advantage_mode,
+        "distributed_advantage_contract": (
+            "not_applicable"
+            if advantage_mode == "none" or world_size == 1
+            else "global_normalization_unsealed_for_a1"
+        ),
+    }
+    if diagnostic_authority:
+        return contract
+    if grad_accum_steps != 1:
+        raise SystemExit(
+            "decisive A1 training requires --grad-accum-steps 1 until exact "
+            "union-weighted gradient accumulation is implemented and sealed"
+        )
+    if world_size > 1 and symmetry_augment:
+        raise SystemExit(
+            "decisive distributed A1 training rejects --symmetry-augment until "
+            "the per-rank RNG and checkpoint/resume contract is complete"
+        )
+    if world_size > 1 and advantage_mode != "none":
+        raise SystemExit(
+            "decisive distributed A1 training rejects advantage policy weighting "
+            "until its global DDP normalization has a reviewed A1 production seal"
+        )
+    return contract
+
+
 def _validate_a1_batch_probe_authorization(
     args: argparse.Namespace,
     effective: dict[str, object],
@@ -4119,6 +4194,9 @@ def _validate_a1_learner_training_recipe(
     ddp: dict[str, int | bool],
     bound: dict[str, object],
 ) -> dict[str, object]:
+    bound["decisive_training_semantics"] = _validate_a1_decisive_training_semantics(
+        args, ddp, bound
+    )
     if bool(getattr(args, "per_game_policy_weight", False)) or str(
         getattr(args, "per_game_policy_weight_mode", "equal")
     ) != "equal":
@@ -7014,6 +7092,11 @@ def main(argv: Sequence[str] | None = None) -> None:
             None
             if a1_training_binding is None
             else a1_training_binding["learner_training_recipe"]
+        ),
+        "a1_decisive_training_semantics": (
+            None
+            if a1_training_binding is None
+            else a1_training_binding.get("decisive_training_semantics")
         ),
         "a1_learner_training_recipe_sha256": (
             None
