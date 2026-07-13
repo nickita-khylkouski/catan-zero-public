@@ -44,6 +44,10 @@ from catan_zero.rl.xdim_lite_policy import (
     _array_sha256,
     normalize_observations,
 )
+from catan_zero.rl.entity_feature_adapter import (
+    checkpoint_entity_feature_adapter_metadata,
+    policy_entity_feature_adapter_version,
+)
 from catan_zero.rl.entity_token_policy import EntityGraphPolicy
 from catan_zero.rl.entity_token_features import (
     EDGE_FEATURE_SIZE,
@@ -7097,6 +7101,11 @@ def main(argv: Sequence[str] | None = None) -> None:
         "fused_optimizer": bool(args.fused_optimizer),
         "hidden_size": int(args.hidden_size),
         "mask_hidden_info": bool(args.mask_hidden_info),
+        "entity_feature_adapter_version": (
+            policy_entity_feature_adapter_version(policy)
+            if getattr(policy, "policy_type", "") == "entity_graph"
+            else None
+        ),
         "seed": int(args.seed),
         # Promotion receipts must be able to distinguish the historical
         # identical-per-rank dropout stream from the opt-in rank-offset RNG
@@ -12519,6 +12528,13 @@ def validate_teacher_data_schema(policy, data: dict, data_quality: dict, env_con
             f"teacher adapter_version {nonempty_adapters} does not match current "
             f"entity adapter {RUST_ENTITY_ADAPTER_VERSION!r}"
         )
+    if getattr(policy, "policy_type", "") == "entity_graph" and nonempty_adapters:
+        checkpoint_adapter = policy_entity_feature_adapter_version(policy)
+        if nonempty_adapters != [checkpoint_adapter]:
+            problems.append(
+                f"teacher adapter_version {nonempty_adapters} does not match "
+                f"checkpoint entity feature adapter {checkpoint_adapter!r}"
+            )
     expected_static_hash = _expected_static_action_features_sha256(env_config)
     checkpoint_static_hash = _policy_static_action_features_sha256(policy)
     if (
@@ -17765,6 +17781,9 @@ def _write_entity_checkpoint(
                 "mask_hidden_info": bool(mask_hidden_info),
                 # OPT-8 provenance (mirrors EntityGraphPolicy.save).
                 "soft_target_source": str(soft_target_source) if soft_target_source is not None else "",
+                "entity_feature_adapter": checkpoint_entity_feature_adapter_metadata(
+                    policy_entity_feature_adapter_version(policy)
+                ),
                 "static_action_features_sha256": _array_sha256(
                     policy.static_action_features.detach().cpu().numpy()
                 ),

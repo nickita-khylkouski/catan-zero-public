@@ -123,6 +123,9 @@ def _jsonable(value: Any) -> Any:
 def _architecture(payload: Mapping[str, Any]) -> dict[str, Any]:
     import torch
 
+    from catan_zero.rl.entity_feature_adapter import (
+        resolve_checkpoint_entity_feature_adapter,
+    )
     from catan_zero.rl.config_serialization import config_from_dict, config_to_dict
     from catan_zero.rl.entity_token_policy import EntityGraphConfig
 
@@ -144,6 +147,10 @@ def _architecture(payload: Mapping[str, Any]) -> dict[str, Any]:
         )
     except (TypeError, ValueError) as error:
         raise DriftAuditError(f"invalid entity_graph config: {error}") from error
+    adapter_version, _adapter_source = resolve_checkpoint_entity_feature_adapter(
+        payload.get("entity_feature_adapter"),
+        metadata_present="entity_feature_adapter" in payload,
+    )
     return {
         "policy_type": payload.get("policy_type"),
         # Normalize legacy dataclass and durable name-keyed configs through the
@@ -152,6 +159,7 @@ def _architecture(payload: Mapping[str, Any]) -> dict[str, Any]:
         "config": _jsonable(config_to_dict(effective_config)),
         "action_mask_version": payload.get("action_mask_version"),
         "mask_hidden_info": bool(payload.get("mask_hidden_info", False)),
+        "entity_feature_adapter_version": adapter_version,
         "static_action_features_sha256": payload.get("static_action_features_sha256"),
         "static_action_features": static_contract,
     }
@@ -163,6 +171,7 @@ def _provenance(path: Path, payload: Mapping[str, Any]) -> dict[str, Any]:
         "config",
         "action_mask_version",
         "mask_hidden_info",
+        "entity_feature_adapter",
         "soft_target_source",
         "value_training",
         "trained_value_readouts",
