@@ -83,10 +83,11 @@ def test_new_width_controls_are_appended_for_positional_pickle_safety():
         "information_set_search",
         "determinization_particles",
         "determinization_min_simulations",
-            "sigma_reference_visits",
-            "information_set_target_aggregation",
-            "gameplay_policy_aggregation",
-        )
+        "sigma_reference_visits",
+        "information_set_target_aggregation",
+        "gameplay_policy_aggregation",
+        "rescale_noise_floor_initial_road_only",
+    )
 
 
 def test_explicit_width_gate_is_inclusive_but_default_preserves_legacy_exclusive_rule():
