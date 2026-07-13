@@ -167,6 +167,8 @@ def test_reconstructs_exact_weights_holdout_and_evaluation_recipe(
         validation_manifest_path=manifest,
         device="cpu",
         batch_size=64,
+        data_loader_workers=3,
+        data_loader_prefetch=5,
     )
 
     assert fake._MASK_HIDDEN_INFO_PLAYER_TOKENS is True
@@ -201,6 +203,13 @@ def test_reconstructs_exact_weights_holdout_and_evaluation_recipe(
     assert kwargs["belief_resource_loss_weight"] == 0.0
     assert kwargs["value_root_blend_phases"] == ()
     assert kwargs["value_root_blend_global_compat"] is False
+    assert kwargs["data_loader_workers"] == 3
+    assert kwargs["data_loader_prefetch"] == 5
+    assert result["execution"] == {
+        "data_loader_workers": 3,
+        "data_loader_prefetch": 5,
+        "loader_override": True,
+    }
     assert result["teacher_gap"] == {
         "active_policy_teacher_gap_rows": 2,
         "active_policy_kl_target_model_mean": 0.2,
@@ -225,6 +234,28 @@ def test_refuses_wrong_memmap_fingerprint(tmp_path, monkeypatch):
             data_path=paths[2],
             validation_manifest_path=paths[3],
             device="cpu",
+        )
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"data_loader_workers": -1}, "workers must be >= 0"),
+        ({"data_loader_prefetch": 0}, "prefetch must be >= 1"),
+    ],
+)
+def test_refuses_invalid_loader_override(tmp_path, monkeypatch, kwargs, message):
+    module = _module()
+    paths = _paths(tmp_path, _report())
+    monkeypatch.setattr(module, "_load_train_bc", lambda: _FakeTrainBC())
+    with pytest.raises(SystemExit, match=message):
+        module.run_probe(
+            report_path=paths[0],
+            checkpoint_path=paths[1],
+            data_path=paths[2],
+            validation_manifest_path=paths[3],
+            device="cpu",
+            **kwargs,
         )
 
 

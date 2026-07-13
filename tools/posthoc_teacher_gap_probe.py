@@ -72,6 +72,8 @@ def run_probe(
     validation_manifest_path: Path,
     device: str,
     batch_size: int | None = None,
+    data_loader_workers: int | None = None,
+    data_loader_prefetch: int | None = None,
 ) -> dict[str, Any]:
     report_path = report_path.resolve(strict=True)
     checkpoint_path = checkpoint_path.resolve(strict=True)
@@ -82,6 +84,23 @@ def run_probe(
         raise SystemExit("training report must contain a JSON object")
     if report.get("data_format") != "memmap":
         raise SystemExit("posthoc teacher-gap probe requires a memmap training report")
+    eval_batch_size = int(batch_size or _required(report, "batch_size"))
+    if eval_batch_size < 1:
+        raise SystemExit("evaluation batch size must be >= 1")
+    loader_workers = int(
+        report.get("data_loader_workers", 0)
+        if data_loader_workers is None
+        else data_loader_workers
+    )
+    loader_prefetch = int(
+        report.get("data_loader_prefetch", 2)
+        if data_loader_prefetch is None
+        else data_loader_prefetch
+    )
+    if loader_workers < 0:
+        raise SystemExit("data-loader workers must be >= 0")
+    if loader_prefetch < 1:
+        raise SystemExit("data-loader prefetch must be >= 1")
 
     train_bc = _load_train_bc()
     actual_fingerprint = train_bc._training_data_fingerprint(data_path, "memmap")
@@ -248,9 +267,6 @@ def run_probe(
         str(_required(report, "effective_float32_matmul_precision"))
     )
     policy = _load_policy(str(_required(report, "arch")), checkpoint_path, device)
-    eval_batch_size = int(batch_size or _required(report, "batch_size"))
-    if eval_batch_size < 1:
-        raise SystemExit("evaluation batch size must be >= 1")
     scalar_weight = float(
         report.get(
             "resolved_scalar_value_loss_weight", report.get("value_loss_weight", 0.0)
@@ -331,8 +347,8 @@ def run_probe(
             # population objective.  Use the report value when newer reports
             # carry it, otherwise the synchronous path reconstructs identical
             # rows without guessing the historical worker topology.
-            data_loader_workers=int(report.get("data_loader_workers", 0)),
-            data_loader_prefetch=int(report.get("data_loader_prefetch", 2)),
+            data_loader_workers=loader_workers,
+            data_loader_prefetch=loader_prefetch,
         )
 
     raw_metrics = evaluate_indices(validation_indices)
@@ -389,6 +405,13 @@ def run_probe(
         "arch": report["arch"],
         "device": device,
         "batch_size": eval_batch_size,
+        "execution": {
+            "data_loader_workers": loader_workers,
+            "data_loader_prefetch": loader_prefetch,
+            "loader_override": (
+                data_loader_workers is not None or data_loader_prefetch is not None
+            ),
+        },
         "validation_rows": int(validation_indices.size),
         "validation_game_seed_set_sha256": validation_contract[
             "validation_game_seed_set_sha256"
@@ -409,6 +432,8 @@ def main() -> None:
     parser.add_argument("--validation-manifest", type=Path, required=True)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--batch-size", type=int)
+    parser.add_argument("--data-loader-workers", type=int)
+    parser.add_argument("--data-loader-prefetch", type=int)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     result = run_probe(
@@ -418,6 +443,8 @@ def main() -> None:
         validation_manifest_path=args.validation_manifest,
         device=args.device,
         batch_size=args.batch_size,
+        data_loader_workers=args.data_loader_workers,
+        data_loader_prefetch=args.data_loader_prefetch,
     )
     rendered = json.dumps(result, indent=2, sort_keys=True) + "\n"
     args.output.write_text(rendered, encoding="utf-8")
