@@ -883,8 +883,8 @@ def _search_execution_contract(
 def _search_evidence_recalibration_scope(search_config: Any) -> str:
     """Attest when one completed-Q vector can reproduce the target operator.
 
-    A single-world target is reconstructible from completed-Q, visits, the
-    existing prior column, phase, and manifest config. Public-belief
+    A single-world target is reconstructible at the existing stored-prior
+    precision from completed-Q, visits, phase, and manifest config. Public-belief
     ``aggregate_q_then_improve`` has the same property because its emitted
     completed-Q is the particle mean and the manifest records particle count.
     Historical ``mean_improved_policy`` does not: mean(softmax(...)) cannot be

@@ -106,9 +106,15 @@ evidence into a permanent learner I/O cost.
 
 Sufficiency is explicit and fail-closed. A single-world target can be
 recalibrated from completed-Q, visits, the existing prior/phase columns, and
-the manifest search config. Public-belief `aggregate_q_then_improve` is also
-reconstructible from its aggregate completed-Q and the manifest particle
-count. Historical PIMC `mean_improved_policy` is **not** reconstructible from
+the manifest search config. This is target recalibration at the precision of
+the existing raw-NPZ `prior_policy` (float16), not bitwise recovery of the
+original evaluator's float prior. Preserving a duplicate float32 prior would
+add another `4*L = 16,654,944` raw bytes (4.8843 bytes per corpus row) and was
+rejected from this smallest missing-statistics schema; it can be added in a
+future evidence version if bit-exact prior-logit replay becomes a requirement.
+Public-belief `aggregate_q_then_improve` is likewise reconstructible from its
+aggregate completed-Q and the manifest particle count. Historical PIMC
+`mean_improved_policy` is **not** reconstructible from
 only a mean completed-Q because `mean(softmax(x)) != softmax(mean(x))`; the
 writer refuses to attest that combination rather than emitting misleading
 evidence. This payload supports target-operator recalibration (for example
