@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import numpy as np
 import pytest
 import torch
 
@@ -126,6 +127,31 @@ def test_parent_selection_is_explicit_and_replayable(
     forged_path.write_text(json.dumps(forged), encoding="utf-8")
     with pytest.raises(arm.TopologyCompositionError, match="schema/status"):
         arm.verify_parent_selection(forged_path)
+
+
+def test_real_checkpoint_numpy_config_scalars_bind_without_weakening_digest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    checkpoint = tmp_path / "short-d6.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    config = {
+        "state_trunk": "transformer",
+        "action_target_gather": False,
+        "topology_residual_adapter": False,
+        "action_cross_attention_layers": 0,
+        "edge_policy_head": False,
+        "value_attention_pool": False,
+        "action_size": np.int64(607),
+    }
+    monkeypatch.setattr(arm, "_checkpoint_config", lambda _path: config)
+
+    bound = arm._require_parent_architecture(  # noqa: SLF001
+        checkpoint, gather_enabled=False
+    )
+
+    assert bound["effective_config_sha256"] == arm.architecture_upgrade._digest(  # noqa: SLF001
+        config
+    )
 
 
 def _topology_state(*, changed: bool) -> dict[str, torch.Tensor]:

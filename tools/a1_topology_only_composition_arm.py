@@ -147,7 +147,14 @@ def _require_parent_architecture(
         raise TopologyCompositionError(f"selected parent architecture drift: {drift}")
     return {
         **exact,
-        "effective_config_sha256": _digest(config),
+        # Checkpoint configs can retain NumPy scalar values (for example the
+        # action vocabulary size as ``np.int64``).  The architecture-upgrade
+        # digest deliberately normalizes only NumPy scalars to their exact
+        # native JSON value while still rejecting arbitrary objects.  Using
+        # the generic manifest digest here made real selected checkpoints fail
+        # parent selection before launch even though their semantics were
+        # valid.
+        "effective_config_sha256": architecture_upgrade._digest(config),  # noqa: SLF001
     }
 
 
