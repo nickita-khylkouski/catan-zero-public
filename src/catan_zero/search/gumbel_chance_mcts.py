@@ -671,6 +671,17 @@ class GumbelChanceMCTSConfig:
     # uniformly aggregating completed-Q evidence across hidden worlds.
     gameplay_policy_aggregation: str = "mean_improved_policy"
 
+    # Opening-road-only D1 scope.  The global D1 arm above is useful for wide
+    # placement roots, but direct corpus audits found a different and much more
+    # concentrated failure mode at BUILD_INITIAL_ROAD: min-max rescaling turns
+    # raw completed-Q margins at floating-point/noise scale into 70%+ targets.
+    # When this flag is true, ``rescale_noise_floor_c`` is applied only to the
+    # decision root whose public prompt is exactly BUILD_INITIAL_ROAD.  All
+    # other roots and every interior node take the historical plain min-max
+    # path byte-for-byte.  False preserves the pre-existing all-node D1
+    # semantics, including its c==0 exact no-op default.
+    rescale_noise_floor_initial_road_only: bool = False
+
 
 @dataclass(frozen=True, slots=True)
 class SearchResult:
@@ -766,6 +777,12 @@ class _GNode:
     # was used or an action has no chance component.
     action_spectrum: dict[int, tuple[tuple[int, float], ...]] = field(default_factory=dict)
     expanded: bool = False
+    # Populated only for decision roots when the phase-gated D1 experiment is
+    # enabled.  Interior nodes deliberately leave this None, which keeps the
+    # experiment scoped to the emitted/root operator rather than changing
+    # arbitrary same-named prompts encountered during traversal. Appended to
+    # preserve the positional field order of this internal dataclass.
+    root_phase: str | None = None
 
     @property
     def value(self) -> float:
@@ -910,6 +927,29 @@ class GumbelChanceMCTS:
         catanatron_rs = _require_rust_module()
         return catanatron_rs.Game.simple(list(self.config.colors), seed=seed)
 
+    def _phase_gated_d1_root_phase(self, game: Any) -> str | None:
+        """Read the public decision prompt only for the opt-in scoped arm.
+
+        Keeping this behind the new flag is load-bearing for the default's
+        bit-for-bit contract: the historical search does not serialize the
+        game merely to decide whether to rescale Q.  An enabled scoped arm
+        fails closed if the engine cannot attest the prompt instead of
+        silently applying D1 to the wrong phase.
+        """
+        if not bool(self.config.rescale_noise_floor_initial_road_only):
+            return None
+        if game is None or not hasattr(game, "json_snapshot"):
+            raise RuntimeError(
+                "initial-road-only D1 requires a game exposing json_snapshot()"
+            )
+        snapshot = json.loads(game.json_snapshot())
+        phase = str(snapshot.get("current_prompt", ""))
+        if not phase:
+            raise RuntimeError(
+                "initial-road-only D1 requires current_prompt in json_snapshot()"
+            )
+        return phase
+
     # ------------------------------------------------------------------
     # Public search entry point.
     # ------------------------------------------------------------------
@@ -957,6 +997,7 @@ class GumbelChanceMCTS:
             )
 
         root_color = str(game.current_color())
+        root_phase = self._phase_gated_d1_root_phase(game)
         authoritative_legal, _actions, _spectra = self._fetch_legal_actions(game)
         if not authoritative_legal:
             raise RuntimeError("no legal actions at information-set MCTS root")
@@ -1032,6 +1073,7 @@ class GumbelChanceMCTS:
             results,
             legal_actions=tuple(authoritative_legal),
             used_full_search=use_full,
+            root_phase=root_phase,
         )
 
     def _aggregate_information_set_results(
@@ -1040,6 +1082,7 @@ class GumbelChanceMCTS:
         *,
         legal_actions: tuple[int, ...],
         used_full_search: bool,
+        root_phase: str | None = None,
     ) -> SearchResult:
         if not results:
             raise RuntimeError("information-set search produced no particles")
@@ -1102,6 +1145,7 @@ class GumbelChanceMCTS:
                 results,
                 legal_actions=legal_actions,
                 aggregate_priors=priors,
+                root_phase=root_phase,
             )
         gameplay_policy = (
             belief_improved
@@ -1163,6 +1207,7 @@ class GumbelChanceMCTS:
         *,
         legal_actions: tuple[int, ...],
         aggregate_priors: dict[int, float],
+        root_phase: str | None = None,
     ) -> dict[int, float]:
         """Improve once after uniform hidden-world completed-Q aggregation.
 
@@ -1235,6 +1280,7 @@ class GumbelChanceMCTS:
         belief_root = _GNode(
             game=None,
             root_color="__belief_root__",
+            root_phase=root_phase,
             prior_value=0.0,
             actions={
                 action: _GAction(
@@ -1301,7 +1347,11 @@ class GumbelChanceMCTS:
             else max(int(n_full_effective if use_full else self.config.n_fast), 1)
         )
 
-        root = _GNode(game=game.copy(), root_color=root_color)
+        root = _GNode(
+            game=game.copy(),
+            root_color=root_color,
+            root_phase=self._phase_gated_d1_root_phase(game),
+        )
         self._expand(root, at_root=True)
         priors = {action_id: stats.prior for action_id, stats in root.actions.items()}
 
@@ -1793,6 +1843,15 @@ class GumbelChanceMCTS:
         enters selection. Exactly equals `_rescale_completed_q` when
         `config.rescale_noise_floor_c == 0` (attenuation short-circuits)."""
         rescaled = self._rescale_completed_q(completed_q)
+        if (
+            bool(self.config.rescale_noise_floor_initial_road_only)
+            and node.root_phase != "BUILD_INITIAL_ROAD"
+        ):
+            # The scoped arm must be byte-identical outside the one attested
+            # opening-road decision root.  In particular, do not call the D1
+            # helper and then hope alpha happens to round to one: return the
+            # exact historical rescale object here.
+            return rescaled
         return self._apply_noise_floor(
             node,
             completed_q,

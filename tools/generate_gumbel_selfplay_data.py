@@ -402,6 +402,17 @@ def build_parser() -> argparse.ArgumentParser:
         "trusting a noise-floor arm in production.",
     )
     parser.add_argument(
+        "--rescale-noise-floor-initial-road-only",
+        action="store_true",
+        default=False,
+        help=(
+            "Scope --rescale-noise-floor-c to the attested "
+            "BUILD_INITIAL_ROAD decision root. Settlement, ordinary-turn, and "
+            "interior-node completed-Q rescaling remains byte-identical. Default "
+            "off preserves the existing all-node D1 semantics."
+        ),
+    )
+    parser.add_argument(
         "--n-full-wide",
         type=int,
         default=None,
@@ -1234,6 +1245,9 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "late_temperature_move_fraction": args.late_temperature_move_fraction,
                 "late_temperature": float(args.late_temperature),
                 "rescale_noise_floor_c": float(args.rescale_noise_floor_c),
+                "rescale_noise_floor_initial_road_only": bool(
+                    args.rescale_noise_floor_initial_road_only
+                ),
                 "sigma_eval": float(args.sigma_eval),
                 "prior_temperature": float(args.prior_temperature),
                 "value_scale": float(args.value_scale),
@@ -1844,6 +1858,9 @@ def _run_worker(
             )
         ),
         rescale_noise_floor_c=float(worker_args.get("rescale_noise_floor_c", 0.0)),
+        rescale_noise_floor_initial_road_only=bool(
+            worker_args.get("rescale_noise_floor_initial_road_only", False)
+        ),
         sigma_eval=float(worker_args.get("sigma_eval", 0.79)),
     )
     summary = run_worker_games(

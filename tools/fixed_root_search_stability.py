@@ -840,13 +840,38 @@ def _run_one_search(
     result = mcts.search(state.copy(), force_full=True)
     wall_sec = time.perf_counter() - started
     eval_counts = CountingEvaluator.delta(before, evaluator.snapshot())
+    improved = _normalize_policy(
+        {int(action): float(value) for action, value in result.improved_policy.items()}
+    )
+    prior = _normalize_policy(
+        {int(action): float(value) for action, value in result.priors.items()}
+    )
+    q_values = sorted(
+        (float(value) for value in result.completed_q_values.values()), reverse=True
+    )
+
+    def _entropy(policy: dict[int, float]) -> float:
+        return -sum(prob * math.log(prob) for prob in policy.values() if prob > 0.0)
+
     return {
         "search_seed": int(search_seed),
         "selected_action": int(result.selected_action),
-        "improved_policy": {
-            int(action): float(probability)
-            for action, probability in result.improved_policy.items()
-        },
+        "improved_policy": improved,
+        "prior_policy": prior,
+        # Target reliability diagnostics.  These make the opening-road failure
+        # visible directly in the immutable replay report: microscopic raw Q
+        # margins should not coexist with a near-one-hot improved target.
+        "target_top_probability": max(improved.values()),
+        "target_entropy": _entropy(improved),
+        "prior_top_probability": max(prior.values()),
+        "prior_entropy": _entropy(prior),
+        "target_prior_js": jensen_shannon_divergence(improved, prior),
+        "completed_q_range": (
+            q_values[0] - q_values[-1] if len(q_values) >= 2 else 0.0
+        ),
+        "completed_q_top_margin": (
+            q_values[0] - q_values[1] if len(q_values) >= 2 else 0.0
+        ),
         "simulations_used": int(result.simulations_used),
         "wall_sec": float(wall_sec),
         **eval_counts,
@@ -869,6 +894,15 @@ def _aggregate_role(root_records: list[dict[str, Any]], role_name: str) -> dict[
     evaluator_calls = sum(int(run["evaluator_method_calls"]) for run in runs)
     js_values = [float(pair["js_divergence"]) for pair in pairwise]
     agreements = [1.0 if pair["top1_agreement"] else 0.0 for pair in pairwise]
+
+    def _metric_summary(name: str) -> dict[str, float | None]:
+        values = [float(run[name]) for run in runs if run.get(name) is not None]
+        return {
+            "mean": _mean(values),
+            "median": _median(values),
+            "max": max(values) if values else None,
+        }
+
     return {
         "roots": len(root_records),
         "search_runs": len(runs),
@@ -893,6 +927,13 @@ def _aggregate_role(root_records: list[dict[str, Any]], role_name: str) -> dict[
         "cross_seed_js_median": _median(js_values),
         "cross_seed_js_max": max(js_values) if js_values else None,
         "top1_pair_agreement": _mean(agreements),
+        "target_top_probability": _metric_summary("target_top_probability"),
+        "target_entropy": _metric_summary("target_entropy"),
+        "prior_top_probability": _metric_summary("prior_top_probability"),
+        "prior_entropy": _metric_summary("prior_entropy"),
+        "target_prior_js": _metric_summary("target_prior_js"),
+        "completed_q_range": _metric_summary("completed_q_range"),
+        "completed_q_top_margin": _metric_summary("completed_q_top_margin"),
     }
 
 
@@ -911,6 +952,14 @@ def _comparison_slice(
     js_b = b["cross_seed_js_mean"]
     agreement_a = a["top1_pair_agreement"]
     agreement_b = b["top1_pair_agreement"]
+
+    def _mean_delta(metric: str) -> float | None:
+        first = a[metric]["mean"]
+        second = b[metric]["mean"]
+        if first is None or second is None:
+            return None
+        return float(second) - float(first)
+
     return {
         "roots": len(root_records),
         "by_role": {name_a: a, name_b: b},
@@ -939,6 +988,17 @@ def _comparison_slice(
                 float(agreement_b) - float(agreement_a)
                 if agreement_a is not None and agreement_b is not None
                 else None
+            ),
+            "role_b_minus_role_a_target_top_probability": _mean_delta(
+                "target_top_probability"
+            ),
+            "role_b_minus_role_a_target_entropy": _mean_delta("target_entropy"),
+            "role_b_minus_role_a_target_prior_js": _mean_delta("target_prior_js"),
+            "role_b_minus_role_a_completed_q_range": _mean_delta(
+                "completed_q_range"
+            ),
+            "role_b_minus_role_a_completed_q_top_margin": _mean_delta(
+                "completed_q_top_margin"
             ),
         },
     }

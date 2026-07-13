@@ -1049,17 +1049,31 @@ class _FakeColorGame:
     """Minimal stand-in exposing `current_color()` for node-level unit tests
     that never touch the Rust engine."""
 
-    def __init__(self, color: str = "RED") -> None:
+    def __init__(
+        self, color: str = "RED", prompt: str = "PLAY_TURN"
+    ) -> None:
         self._color = color
+        self._prompt = prompt
 
     def current_color(self) -> str:
         return self._color
+
+    def json_snapshot(self) -> str:
+        return json.dumps({"current_prompt": self._prompt})
 
 
 def _node_with(actions: dict[int, _GAction], *, prior_value: float = 0.0) -> _GNode:
     node = _GNode(game=_FakeColorGame("RED"), root_color="RED", prior_value=prior_value)
     node.actions = actions
     node.action_logits = {action_id: 0.0 for action_id in actions}
+    return node
+
+
+def _phase_node_with(
+    actions: dict[int, _GAction], *, phase: str, prior_value: float = 0.0
+) -> _GNode:
+    node = _node_with(actions, prior_value=prior_value)
+    node.root_phase = phase
     return node
 
 
@@ -1168,6 +1182,62 @@ def test_noise_floor_does_not_change_selection_when_disabled():
     assert r_off.selected_action == r_base.selected_action
     assert r_off.visit_counts == r_base.visit_counts
     assert r_off.improved_policy == r_base.improved_policy
+
+
+def test_initial_road_only_noise_floor_deconfidents_near_tie_road_target():
+    """The scoped arm suppresses pseudo-confidence from microscopic road Q."""
+    actions = {
+        0: _GAction(prior=1.0 / 3.0, visits=4, value_sum=0.400004),
+        1: _GAction(prior=1.0 / 3.0, visits=4, value_sum=0.400000),
+        2: _GAction(prior=1.0 / 3.0, visits=4, value_sum=0.399996),
+    }
+    plain = _pure_mcts(GumbelChanceMCTSConfig(seed=0))
+    scoped = _pure_mcts(
+        GumbelChanceMCTSConfig(
+            seed=0,
+            rescale_noise_floor_c=8.0,
+            sigma_eval=0.98,
+            rescale_noise_floor_initial_road_only=True,
+        )
+    )
+    plain_node = _phase_node_with(actions, phase="BUILD_INITIAL_ROAD")
+    scoped_node = _phase_node_with(actions, phase="BUILD_INITIAL_ROAD")
+    completed = scoped._completed_q(scoped_node)
+
+    plain_policy = plain._improved_policy(plain_node, completed)
+    scoped_policy = scoped._improved_policy(scoped_node, completed)
+
+    assert max(plain_policy.values()) > 0.40
+    assert max(scoped_policy.values()) < max(plain_policy.values())
+    assert max(scoped_policy.values()) == pytest.approx(1.0 / 3.0, abs=1.0e-4)
+
+
+def test_initial_road_only_noise_floor_keeps_settlement_target_byte_identical():
+    """An enabled road arm returns the exact historical object off phase."""
+    actions = {
+        0: _GAction(prior=0.4, visits=4, value_sum=0.8),
+        1: _GAction(prior=0.3, visits=4, value_sum=0.0),
+        2: _GAction(prior=0.3, visits=4, value_sum=-0.8),
+    }
+    plain = _pure_mcts(GumbelChanceMCTSConfig(seed=0))
+    scoped = _pure_mcts(
+        GumbelChanceMCTSConfig(
+            seed=0,
+            rescale_noise_floor_c=8.0,
+            sigma_eval=0.98,
+            rescale_noise_floor_initial_road_only=True,
+        )
+    )
+    plain_node = _phase_node_with(actions, phase="BUILD_INITIAL_SETTLEMENT")
+    scoped_node = _phase_node_with(actions, phase="BUILD_INITIAL_SETTLEMENT")
+    completed = scoped._completed_q(scoped_node)
+
+    assert scoped._rescaled_completed_q(scoped_node, completed) == (
+        plain._rescaled_completed_q(plain_node, completed)
+    )
+    assert scoped._improved_policy(scoped_node, completed) == (
+        plain._improved_policy(plain_node, completed)
+    )
 
 
 # ---------------------------------------------------------------------------

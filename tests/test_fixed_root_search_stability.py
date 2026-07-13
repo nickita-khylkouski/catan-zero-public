@@ -93,6 +93,18 @@ def _run(seed: int, policy: dict[int, float], **cost) -> dict:
         "evaluate_calls": cost.get("evaluate_calls", 80),
         "evaluate_many_calls": cost.get("evaluate_many_calls", 9),
         "symmetry_calls": cost.get("symmetry_calls", 1),
+        "target_top_probability": cost.get(
+            "target_top_probability", max(policy.values())
+        ),
+        "target_entropy": cost.get(
+            "target_entropy",
+            -sum(value * math.log(value) for value in policy.values() if value > 0),
+        ),
+        "prior_top_probability": cost.get("prior_top_probability", 0.5),
+        "prior_entropy": cost.get("prior_entropy", math.log(2.0)),
+        "target_prior_js": cost.get("target_prior_js", 0.01),
+        "completed_q_range": cost.get("completed_q_range", 0.02),
+        "completed_q_top_margin": cost.get("completed_q_top_margin", 1.0e-6),
     }
 
 
@@ -692,6 +704,12 @@ def test_aggregate_slices_include_exact_cost_and_ge40_slice():
     comparison = slices["global"]["comparison"]
     assert comparison["role_b_over_role_a_simulations_ratio"] == pytest.approx(2.0)
     assert comparison["role_b_minus_role_a_top1_agreement"] < 0.0
+    assert global_roles["n64"]["target_top_probability"]["mean"] == pytest.approx(
+        0.75
+    )
+    assert global_roles["n64"]["completed_q_top_margin"]["median"] == pytest.approx(
+        1.0e-6
+    )
 
 
 def test_cli_help_is_cpu_only_and_imports_the_local_source_tree():

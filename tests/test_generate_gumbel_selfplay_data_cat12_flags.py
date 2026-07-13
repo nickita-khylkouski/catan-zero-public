@@ -33,6 +33,7 @@ def _worker_args(**overrides) -> dict:
         "c_scale": 0.1,
         "sigma_reference_visits": None,
         "rescale_noise_floor_c": 0.0,
+        "rescale_noise_floor_initial_road_only": False,
         "sigma_eval": 0.79,
         "n_full_wide": None,
         "n_full_wide_threshold": None,
@@ -101,6 +102,7 @@ def test_rescale_noise_floor_c_default_is_the_dataclass_no_op(monkeypatch) -> No
     cli._run_worker(_worker_args())
 
     assert captured["search_config"].rescale_noise_floor_c == 0.0
+    assert captured["search_config"].rescale_noise_floor_initial_road_only is False
     assert captured["search_config"].sigma_eval == 0.79
 
 
@@ -110,6 +112,19 @@ def test_rescale_noise_floor_c_and_sigma_eval_thread_through_from_worker_args(mo
 
     assert captured["search_config"].rescale_noise_floor_c == 1.0
     assert captured["search_config"].sigma_eval == 0.5
+
+
+def test_initial_road_only_noise_floor_threads_through_worker_args(monkeypatch) -> None:
+    captured = _capture_configs(monkeypatch)
+    cli._run_worker(
+        _worker_args(
+            rescale_noise_floor_c=8.0,
+            rescale_noise_floor_initial_road_only=True,
+        )
+    )
+
+    assert captured["search_config"].rescale_noise_floor_c == 8.0
+    assert captured["search_config"].rescale_noise_floor_initial_road_only is True
 
 
 def test_sigma_reference_visits_threads_through_worker_args(monkeypatch) -> None:
