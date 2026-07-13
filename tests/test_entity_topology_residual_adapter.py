@@ -183,6 +183,43 @@ def test_topology_output_projection_learns_on_first_step():
     assert projection.weight.grad.abs().sum().item() > 0.0
 
 
+def test_topology_zero_output_gate_opens_upstream_learning_on_second_step():
+    model = EntityGraphNet(
+        _config(topology_residual_adapter=True, action_target_gather=False)
+    ).train()
+    adapter = model.topology_residual_adapter
+    optimizer = torch.optim.SGD(adapter.parameters(), lr=0.1)
+    labels = torch.tensor([0, 1, 2])
+
+    first = torch.nn.functional.cross_entropy(model(_batch())["logits"], labels)
+    first.backward()
+    assert adapter.output_projection.weight.grad is not None
+    assert adapter.output_projection.weight.grad.abs().sum().item() > 0.0
+    # A zero output projection is the exact function-preserving gate: on the
+    # first backward pass it intentionally blocks gradients into the message
+    # constructor while the output projection learns how to consume it.
+    assert adapter.source_projection.weight.grad is not None
+    assert adapter.source_projection.weight.grad.abs().sum().item() == 0.0
+    optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
+
+    second = torch.nn.functional.cross_entropy(model(_batch())["logits"], labels)
+    second.backward()
+    for name, parameter in adapter.named_parameters():
+        assert parameter.grad is not None, name
+        assert parameter.grad.abs().sum().item() > 0.0, name
+
+
+def test_topology_value_objective_reaches_zero_output_projection():
+    model = EntityGraphNet(_config(topology_residual_adapter=True)).train()
+    value = model(_batch())["value"]
+    torch.nn.functional.mse_loss(value, torch.tensor([0.5, -0.5, 0.25])).backward()
+
+    projection = model.topology_residual_adapter.output_projection
+    assert projection.weight.grad is not None
+    assert projection.weight.grad.abs().sum().item() > 0.0
+
+
 def test_adapter_is_equivariant_to_joint_token_and_topology_relabelling():
     width, length = 8, 9
     adapter = TopologyResidualAdapter(width).eval()
