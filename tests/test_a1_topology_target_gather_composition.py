@@ -202,6 +202,10 @@ def _inference_profile(checkpoint: Path, *, milliseconds: float) -> dict:
     return {
         "device": "NVIDIA B200",
         "checkpoint": str(checkpoint),
+        "checkpoint_ref": {
+            **arm._file_ref(checkpoint),
+            "size_bytes": checkpoint.stat().st_size,
+        },
         "strict_fp32": {
             "matmul_precision": "highest",
             "cuda_allow_tf32": False,
@@ -231,7 +235,12 @@ def test_inference_cost_telemetry_is_mandatory_and_matched(tmp_path: Path) -> No
     reference.write_bytes(b"parent")
     candidate.write_bytes(b"candidate")
     reference_ref = arm._file_ref(reference)
-    candidate_ref = arm._file_ref(candidate)
+    # Real completion refs carry size_bytes whereas manifest refs are compact.
+    # Reproduce that production schema instead of testing only compact mocks.
+    candidate_ref = {
+        **arm._file_ref(candidate),
+        "size_bytes": candidate.stat().st_size,
+    }
     (tmp_path / "reference-inference-profile.json").write_text(
         json.dumps(_inference_profile(reference, milliseconds=2.0)),
         encoding="utf-8",
@@ -260,6 +269,28 @@ def test_inference_cost_telemetry_is_mandatory_and_matched(tmp_path: Path) -> No
     )
     with pytest.raises(completion.CompletionError, match="environment drift"):
         completion._inference_cost_telemetry(verified, candidate=candidate_ref)
+
+
+def test_inference_profile_ref_is_mandatory_and_exact(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "candidate.pt"
+    checkpoint.write_bytes(b"candidate")
+    expected = {
+        **arm._file_ref(checkpoint),
+        "size_bytes": checkpoint.stat().st_size,
+    }
+    profile_path = tmp_path / "candidate-inference-profile.json"
+
+    profile = _inference_profile(checkpoint, milliseconds=3.0)
+    profile.pop("checkpoint_ref")
+    profile_path.write_text(json.dumps(profile), encoding="utf-8")
+    with pytest.raises(completion.CompletionError, match="exact checkpoint bytes"):
+        completion._load_profile(profile_path, checkpoint=expected)
+
+    profile = _inference_profile(checkpoint, milliseconds=3.0)
+    profile["checkpoint_ref"]["sha256"] = "sha256:" + "0" * 64
+    profile_path.write_text(json.dumps(profile), encoding="utf-8")
+    with pytest.raises(completion.CompletionError, match="exact checkpoint bytes"):
+        completion._load_profile(profile_path, checkpoint=expected)
 
 
 def test_completion_cli_dispatches_specialized_finalizer(

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 from collections import defaultdict
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -42,6 +43,25 @@ _NON_MODEL_ENTITY_KEYS = frozenset(
 _RELATIONAL_TOPOLOGY_KEYS = frozenset(
     {"hex_vertex_ids", "hex_edge_ids", "edge_vertex_ids", "event_target_ids"}
 )
+
+
+def _file_ref(path: Path) -> dict[str, Any]:
+    """Bind a benchmark checkpoint to the exact bytes that were profiled."""
+    lexical = path.expanduser()
+    if lexical.is_symlink():
+        raise ValueError(f"checkpoint must be a regular non-symlink file: {path}")
+    resolved = lexical.resolve(strict=True)
+    if not resolved.is_file():
+        raise ValueError(f"checkpoint must be a regular non-symlink file: {path}")
+    digest = hashlib.sha256()
+    with resolved.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return {
+        "path": str(resolved),
+        "sha256": "sha256:" + digest.hexdigest(),
+        "size_bytes": resolved.stat().st_size,
+    }
 
 
 def _synthetic_batch(
@@ -757,9 +777,13 @@ def main() -> None:
         )
 
     properties = torch.cuda.get_device_properties(device)
+    checkpoint_ref = _file_ref(Path(args.checkpoint))
     result = {
         "device": properties.name,
-        "checkpoint": str(args.checkpoint),
+        # Retain the path-only field for existing consumers while making the
+        # exact profiled bytes independently replayable.
+        "checkpoint": checkpoint_ref["path"],
+        "checkpoint_ref": checkpoint_ref,
         "strict_fp32": {
             "matmul_precision": torch.get_float32_matmul_precision(),
             "cuda_allow_tf32": bool(torch.backends.cuda.matmul.allow_tf32),

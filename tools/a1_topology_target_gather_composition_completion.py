@@ -185,9 +185,24 @@ def _load_profile(
         raise CompletionError(
             f"inference profile checkpoint is unavailable: {error}"
         ) from error
-    if observed_checkpoint != expected_checkpoint or arm._file_ref(  # noqa: SLF001
-        observed_checkpoint
-    ) != dict(checkpoint):
+    actual_ref = {
+        **arm._file_ref(observed_checkpoint),  # noqa: SLF001
+        "size_bytes": observed_checkpoint.stat().st_size,
+    }
+    profile_ref = value.get("checkpoint_ref")
+    expected_ref = {
+        "path": str(expected_checkpoint),
+        "sha256": checkpoint.get("sha256"),
+        "size_bytes": checkpoint.get(
+            "size_bytes", expected_checkpoint.stat().st_size
+        ),
+    }
+    if (
+        observed_checkpoint != expected_checkpoint
+        or not isinstance(profile_ref, Mapping)
+        or dict(profile_ref) != actual_ref
+        or expected_ref != actual_ref
+    ):
         raise CompletionError(
             "inference profile does not bind the exact checkpoint bytes"
         )
