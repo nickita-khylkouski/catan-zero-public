@@ -210,6 +210,7 @@ def build_receipt(plan_path: Path, *, run_id: str) -> dict[str, Any]:
             **plan["runtime"],
             "files": completion["source"],
         },
+        "receipt_finalizer": _file_ref(Path(__file__)),
     }
     receipt["receipt_sha256"] = _digest(receipt)
     return receipt
