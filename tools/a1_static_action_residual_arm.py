@@ -105,6 +105,8 @@ SOURCE_FILES = tuple(
             EXECUTOR_RELATIVE_PATH,
             COMPLETION_RELATIVE_PATH,
             "tools/bench_entity_graph_stages.py",
+            "tools/a1_topology_target_gather_composition_arm.py",
+            "tools/a1_topology_target_gather_composition_completion.py",
             "src/catan_zero/search/cuda_graph_inference.py",
         )
     )
