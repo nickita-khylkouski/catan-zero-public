@@ -295,6 +295,73 @@ def _stable_read_immutable_json(
     )
 
 
+def _stable_read_json_artifact(
+    path: Path, *, where: str
+) -> tuple[dict[str, Any], str, tuple[int, int, int, int, int]]:
+    """Read non-coordinator JSON through one inode and reject path replacement.
+
+    Composite descriptors predate the append-only coordinator and do not carry
+    ``state_sha256``.  Their exact file digest is nevertheless sealed by the
+    typed composite.  This reader supplies the same pinned-inode/TOCTOU
+    guarantees without pretending those artifacts use the coordinator schema.
+    """
+
+    lexical = path.expanduser().absolute()
+    try:
+        resolved = path.expanduser().resolve(strict=True)
+    except OSError as error:
+        raise CoordinatorError(f"cannot resolve {where}: {error}") from error
+    if lexical != resolved or resolved.is_symlink() or not resolved.is_file():
+        raise CoordinatorError(f"{where} must be a canonical regular file")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(resolved, flags)
+    except OSError as error:
+        raise CoordinatorError(f"cannot open {where}: {error}") from error
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise CoordinatorError(f"{where} must be a regular file")
+        chunks: list[bytes] = []
+        while chunk := os.read(descriptor, 1 << 20):
+            chunks.append(chunk)
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    identity = (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+    )
+    if identity != (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    ):
+        raise CoordinatorError(f"{where} changed while read")
+    live = resolved.stat(follow_symlinks=False)
+    if identity != (
+        live.st_dev,
+        live.st_ino,
+        live.st_size,
+        live.st_mtime_ns,
+        live.st_ctime_ns,
+    ):
+        raise CoordinatorError(f"{where} was replaced while read")
+    raw = b"".join(chunks)
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as error:
+        raise CoordinatorError(f"cannot parse {where}: {error}") from error
+    if not isinstance(payload, dict):
+        raise CoordinatorError(f"{where} is not an object")
+    return payload, "sha256:" + hashlib.sha256(raw).hexdigest(), identity
+
+
 def _write_once(path: Path, payload: Mapping[str, Any]) -> dict[str, Any]:
     """Create an immutable artifact, or idempotently replay exact bytes."""
 
@@ -447,6 +514,9 @@ def _verify_composite(value: Any) -> dict[str, Any]:
         "truncation_surface_sha256",
         "truncated_rows",
         "complete_game_inputs",
+        "category_semantics",
+        "category_semantics_sha256",
+        "source_authority",
     }
     composite = _require_exact_keys(value, expected_keys, "typed composite authority")
     if (
@@ -461,8 +531,27 @@ def _verify_composite(value: Any) -> dict[str, Any]:
         "component_sampling_ratios",
         "truncated_rows",
         "complete_game_inputs",
+        "category_semantics",
+        "source_authority",
     }:
         _require_sha(composite[key], f"typed composite {key}")
+    semantics = composite["category_semantics"]
+    if not isinstance(semantics, dict) or composite[
+        "category_semantics_sha256"
+    ] != _digest(semantics):
+        raise CoordinatorError("typed composite category semantics digest drift")
+    source_authority = _require_exact_keys(
+        composite["source_authority"],
+        {"path", "file_sha256", "authority_sha256"},
+        "typed composite source authority",
+    )
+    source_path = Path(str(source_authority["path"])).expanduser()
+    if not source_path.is_absolute():
+        raise CoordinatorError("typed composite source authority path is not absolute")
+    _require_sha(source_authority["file_sha256"], "typed composite source file")
+    _require_sha(
+        source_authority["authority_sha256"], "typed composite source authority"
+    )
     if (
         isinstance(composite["truncated_rows"], bool)
         or not isinstance(composite["truncated_rows"], int)
@@ -515,6 +604,9 @@ def _verify_sample_receipt_projection(
             "kl_eligible_evidence_sha256",
             "descriptor_sha256",
             "payload_inventory_sha256",
+            "category_semantics",
+            "category_semantics_sha256",
+            "source_authority",
             "rows_file_sha256",
             "origin_tool_sha256",
             "replay_verified",
@@ -527,7 +619,7 @@ def _verify_sample_receipt_projection(
         "."
     )
     if (
-        receipt["schema_version"] != "a1-authenticated-sample-evidence-v1"
+        receipt["schema_version"] != "a1-authenticated-sample-evidence-v2"
         or receipt["status"] != "complete"
         or receipt["sample_dose"] != SHORT_SAMPLE_DOSE
         or receipt["sampler_seed"] != sampler_seed
@@ -539,6 +631,10 @@ def _verify_sample_receipt_projection(
         or receipt["descriptor_sha256"] != composite["descriptor_sha256"]
         or receipt["payload_inventory_sha256"]
         != composite["payload_inventory_sha256"]
+        or receipt["category_semantics"] != composite["category_semantics"]
+        or receipt["category_semantics_sha256"]
+        != composite["category_semantics_sha256"]
+        or receipt["source_authority"] != composite["source_authority"]
         or receipt["origin_tool_sha256"]
         != _repo_tool_sha256("tools/a1_scientific_evidence.py")
         or receipt["replay_verified"] is not True
@@ -571,6 +667,7 @@ def _verify_sample_receipt_projection(
         "kl_eligible_evidence_sha256",
         "descriptor_sha256",
         "payload_inventory_sha256",
+        "category_semantics_sha256",
         "rows_file_sha256",
         "origin_tool_sha256",
         "state_sha256",
@@ -695,7 +792,9 @@ def verify_p1_recipe_data_authority(value: Any) -> dict[str, Any]:
     if (
         recovery.get("authority_sha256") != parent["recovery_authority_sha256"]
         or authority["recovery_component_semantics"]
-        != recovery_component_semantics(recovery)
+        != recovery_component_semantics(
+            recovery, composite["category_semantics"]
+        )
         or native["learner_admission_state_sha256"] != native_receipt.get("state_sha256")
         or sample["sampler_identity_sha256"] != composite["sampler_identity_sha256"]
         or sample["sample_order_sha256"] != composite["sample_order_sha256"]
@@ -758,24 +857,149 @@ def current_parent_authority_from_recovery(
 
 def recovery_component_semantics(
     recovery_authority: Mapping[str, Any],
+    category_semantics: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Disambiguate storage component IDs from unproven recovery lineage."""
+    """Verify and retain the lock's exact scheduler-to-lineage semantics.
 
+    The stable storage IDs are not semantic aliases.  In a recovery wave the
+    ``current_producer`` lane is still self-play from the recovered generator,
+    while the ``recent_history`` lane is the unproven predecessor recovery
+    reference.  Retaining the original map avoids creating a second vocabulary
+    that can be joined to the wrong recovery receipt.
+    """
+
+    semantics = _require_exact_keys(
+        copy.deepcopy(dict(category_semantics)),
+        {"current_producer", "recent_history", "hard_negative"},
+        "recovery category semantics",
+    )
     recovered = recovery_authority["recovered_generator"]
     safety = recovery_authority["safety_reference_unproven_predecessor"]
-    return {
-        "schema_version": "a1-recovery-component-semantics-v1",
-        "storage_id_to_semantic_role": {
-            "current_producer": "recovery_reference",
-            "recent_history": "safety_reference_unproven_predecessor",
-            "hard_negative": "hard_negative",
-            "historical_replay": "historical_replay",
+
+    def checkpoint(lane: Mapping[str, Any], where: str) -> dict[str, Any]:
+        raw = _require_exact_keys(
+            lane.get("checkpoint") if isinstance(lane, dict) else None,
+            {"id", "path", "sha256", "version"},
+            f"{where} checkpoint",
+        )
+        if (
+            not isinstance(raw["id"], str)
+            or not raw["id"]
+            or not isinstance(raw["path"], str)
+            or not raw["path"]
+            or isinstance(raw["version"], bool)
+            or not isinstance(raw["version"], int)
+            or raw["version"] < 1
+        ):
+            raise CoordinatorError(f"{where} checkpoint identity drift")
+        _require_sha(raw["sha256"], f"{where} checkpoint")
+        return raw
+
+    current = _require_exact_keys(
+        semantics["current_producer"],
+        {"scheduler_category", "semantic", "relation", "checkpoint"},
+        "current-producer category semantic",
+    )
+    recent = _require_exact_keys(
+        semantics["recent_history"],
+        {
+            "scheduler_category",
+            "semantic",
+            "relation",
+            "causal_parent_proven",
+            "promotion_proof_recreated",
+            "checkpoint",
+            "recovery_lineage_id",
         },
-        "current_producer_checkpoint_sha256": recovered["sha256"],
-        "recent_history_checkpoint_sha256": safety["sha256"],
-        "recent_history_causal_parent_proven": False,
-        "recovery_authority_sha256": recovery_authority["authority_sha256"],
+        "recent-history category semantic",
+    )
+    hard = _require_exact_keys(
+        semantics["hard_negative"],
+        {"scheduler_category", "semantic", "relation", "checkpoint"},
+        "hard-negative category semantic",
+    )
+    current_checkpoint = checkpoint(current, "current-producer semantic")
+    recent_checkpoint = checkpoint(recent, "recent-history semantic")
+    checkpoint(hard, "hard-negative semantic")
+    if (
+        current["scheduler_category"] != "current_producer"
+        or current["semantic"] != "current_producer"
+        or current["relation"] != "self_play"
+        or current_checkpoint["path"] != recovered["path"]
+        or current_checkpoint["sha256"] != recovered["sha256"]
+        or current_checkpoint["version"]
+        != recovered["historical_generation_version_claim"]
+        or recent["scheduler_category"] != "recent_history"
+        or recent["semantic"] != "recovery_reference"
+        or recent["relation"] != "safety_reference_unproven_predecessor"
+        or recent["causal_parent_proven"] is not False
+        or recent["promotion_proof_recreated"] is not False
+        or recent["recovery_lineage_id"]
+        != recovery_authority["recovery_lineage_id"]
+        or recent_checkpoint["path"] != safety["path"]
+        or recent_checkpoint["sha256"] != safety["sha256"]
+        or recent_checkpoint["version"]
+        != safety["historical_generation_version_claim"]
+        or hard["scheduler_category"] != "hard_negative"
+        or hard["semantic"] != "hard_negative"
+        or hard["relation"] != "sealed_hard_negative_selection"
+    ):
+        raise CoordinatorError(
+            "typed composite category semantics do not match recovery authority"
+        )
+    return semantics
+
+
+def _verify_composite_recovery_join(
+    composite: Mapping[str, Any],
+    *,
+    descriptor_path: Path,
+    recovery_authority: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Join exact descriptor/source-authority bytes to one recovery receipt."""
+
+    descriptor, descriptor_file_sha, _descriptor_identity = (
+        _stable_read_json_artifact(
+            descriptor_path, where="typed composite descriptor"
+        )
+    )
+    if descriptor_file_sha != composite["descriptor_sha256"]:
+        raise CoordinatorError("typed composite descriptor bytes drift")
+    semantics = recovery_component_semantics(
+        recovery_authority, composite["category_semantics"]
+    )
+    if (
+        descriptor.get("category_semantics") != semantics
+        or _digest(descriptor["category_semantics"])
+        != composite["category_semantics_sha256"]
+    ):
+        raise CoordinatorError(
+            "typed composite descriptor category semantics drift"
+        )
+    descriptor_source = {
+        "path": descriptor.get("source_authority_manifest"),
+        "file_sha256": descriptor.get("source_authority_manifest_sha256"),
+        "authority_sha256": descriptor.get("source_authority_sha256"),
     }
+    if descriptor_source != composite["source_authority"]:
+        raise CoordinatorError("typed composite source-authority reference drift")
+    source_path = Path(str(descriptor_source["path"])).expanduser()
+    source, source_file_sha, _source_identity = _stable_read_json_artifact(
+        source_path, where="typed composite source authority"
+    )
+    if (
+        source_file_sha != descriptor_source["file_sha256"]
+        or source.get("authority_sha256") != descriptor_source["authority_sha256"]
+        or source.get("category_semantics") != semantics
+    ):
+        raise CoordinatorError(
+            "typed composite source authority differs from descriptor/recovery"
+        )
+    unsigned_source = dict(source)
+    stated_authority = unsigned_source.pop("authority_sha256", None)
+    if stated_authority != _digest(unsigned_source):
+        raise CoordinatorError("typed composite source semantic digest drift")
+    return semantics
 
 
 def verify_current_parent_authority(
@@ -2073,6 +2297,12 @@ def prepare_p1_sweep(
 
     lock = verify_p1_final_lock_authority(dict(final_lock_authority))
     data = _verify_composite(dict(composite))
+    recovery = verify_v5_recovery_receipt(v5_recovery_receipt_path)
+    category_semantics = _verify_composite_recovery_join(
+        data,
+        descriptor_path=composite_descriptor_path,
+        recovery_authority=recovery,
+    )
     evidence_origin = _repo_tool_sha256("tools/a1_scientific_evidence.py")
     try:
         sample = scientific_evidence.verify_sample_evidence(
@@ -2096,7 +2326,6 @@ def prepare_p1_sweep(
     ):
         raise CoordinatorError("P1 composite does not bind the replayed physical order")
     eligibility = _kl_authority_from_verified_sample(sample, composite=data)
-    recovery = verify_v5_recovery_receipt(v5_recovery_receipt_path)
     parent = current_parent_authority_from_recovery(recovery)
     native_receipt, native_runtime = _consume_runtime_admission_receipt(
         native_learner_admission_receipt_path
@@ -2148,7 +2377,7 @@ def prepare_p1_sweep(
         "kl_eligibility_authority": eligibility,
         "p1_sample_evidence_receipt": sample,
         "recovery_authority": recovery,
-        "recovery_component_semantics": recovery_component_semantics(recovery),
+        "recovery_component_semantics": category_semantics,
         "current_parent_authority": parent,
         "native_runtime_authority": native_runtime,
         "native_learner_admission_receipt": native_receipt,
@@ -2598,6 +2827,52 @@ def _verify_central_p1_authority(
     return selected
 
 
+_PORTABLE_DERIVED_LOCATION_KEYS = {
+    "descriptor_sha256",
+    "portable_science_identity_sha256",
+    "sampler_identity_sha256",
+    "selection_receipt_sha256",
+    "selection_replay_sha256",
+    "source_p1_recipe_data_authority_sha256",
+    "source_p1_sample_state_sha256",
+    "state_sha256",
+    "sweep_id",
+}
+
+
+def _portable_science_projection(value: Any) -> Any:
+    """Remove only staging locations and their derivative hashes.
+
+    The full exact-path authority remains in the experiment payload and every
+    executor claim.  This projection is used solely for the portable science
+    identity, so copying byte-identical data/authority to another canonical
+    root does not create a new experiment while changing any semantic digest,
+    row order, checkpoint, recipe, or recovery relation still does.
+    """
+
+    if isinstance(value, dict):
+        projected: dict[str, Any] = {}
+        for key, item in value.items():
+            if key in _PORTABLE_DERIVED_LOCATION_KEYS:
+                continue
+            if key == "source_authority":
+                # This ref is replayed in full by the operational authority.
+                # Its path and enclosing JSON hashes are staging-specific; the
+                # category semantics and corpus digests remain independently.
+                continue
+            if key == "path" or key.endswith("_path"):
+                continue
+            projected[key] = _portable_science_projection(item)
+        return projected
+    if isinstance(value, list):
+        return [_portable_science_projection(item) for item in value]
+    return copy.deepcopy(value)
+
+
+def _portable_science_digest(value: Mapping[str, Any]) -> str:
+    return _digest(_portable_science_projection(dict(value)))
+
+
 def prepare_experiment(
     root: Path,
     *,
@@ -2697,7 +2972,9 @@ def prepare_experiment(
         "portable_code_identity_sha256": code_sha,
         "portable_runtime_identity_sha256": runtime_sha,
     }
-    portable_science["portable_science_identity_sha256"] = _digest(portable_science)
+    portable_science["portable_science_identity_sha256"] = _portable_science_digest(
+        portable_science
+    )
     experiment_identity = {
         "schema_version": EXPERIMENT_SCHEMA,
         "portable_science_identity_sha256": portable_science[
@@ -2734,13 +3011,7 @@ def load_experiment(root: Path, experiment_id: str) -> dict[str, Any]:
         payload.get("schema_version") != EXPERIMENT_SCHEMA
         or payload.get("experiment_id") != experiment_id
         or payload.get("portable_science_identity_sha256")
-        != _digest(
-            {
-                key: value
-                for key, value in payload["portable_science_identity"].items()
-                if key != "portable_science_identity_sha256"
-            }
-        )
+        != _portable_science_digest(payload["portable_science_identity"])
         or payload["portable_science_identity"].get("portable_science_identity_sha256")
         != payload.get("portable_science_identity_sha256")
     ):
@@ -3118,13 +3389,7 @@ def issue_pair(root: Path, experiment_id: str) -> dict[str, Any]:
             "selected_aux_coefficient_decimal": selected_decimal,
         }
     )
-    science["portable_science_identity_sha256"] = _digest(
-        {
-            key: value
-            for key, value in science.items()
-            if key != "portable_science_identity_sha256"
-        }
-    )
+    science["portable_science_identity_sha256"] = _portable_science_digest(science)
     joint = {
         "sample_dose": SHORT_SAMPLE_DOSE,
         "optimizer_steps": SHORT_OPTIMIZER_STEPS,

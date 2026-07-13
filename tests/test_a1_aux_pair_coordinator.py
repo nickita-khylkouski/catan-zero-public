@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 from concurrent.futures import ThreadPoolExecutor
+import hashlib
 import json
 from pathlib import Path
 
@@ -65,12 +66,63 @@ def _allocation(host: str, offset: int) -> dict:
     }
 
 
-def _composite() -> dict:
+def _category_semantics() -> dict:
+    recovery = _recovery()
+    return {
+        "current_producer": {
+            "scheduler_category": "current_producer",
+            "semantic": "current_producer",
+            "relation": "self_play",
+            "checkpoint": {
+                "id": "recovered-generator",
+                "path": recovery["recovered_generator"]["path"],
+                "sha256": recovery["recovered_generator"]["sha256"],
+                "version": recovery["recovered_generator"][
+                    "historical_generation_version_claim"
+                ],
+            },
+        },
+        "recent_history": {
+            "scheduler_category": "recent_history",
+            "semantic": "recovery_reference",
+            "relation": "safety_reference_unproven_predecessor",
+            "causal_parent_proven": False,
+            "promotion_proof_recreated": False,
+            "checkpoint": {
+                "id": "f7-safety-reference",
+                "path": recovery["safety_reference_unproven_predecessor"]["path"],
+                "sha256": recovery["safety_reference_unproven_predecessor"]["sha256"],
+                "version": recovery["safety_reference_unproven_predecessor"][
+                    "historical_generation_version_claim"
+                ],
+            },
+            "recovery_lineage_id": recovery["recovery_lineage_id"],
+        },
+        "hard_negative": {
+            "scheduler_category": "hard_negative",
+            "semantic": "hard_negative",
+            "relation": "sealed_hard_negative_selection",
+            "checkpoint": {
+                "id": "hard-negative",
+                "path": "/sealed/hard-negative.pt",
+                "sha256": _sha("7"),
+                "version": 3,
+            },
+        },
+    }
+
+
+def _composite(
+    *,
+    descriptor_sha256: str | None = None,
+    source_authority: dict | None = None,
+) -> dict:
+    semantics = _category_semantics()
     return {
         "schema_version": "a1-typed-64-12-4-20-composite-v1",
         "component_ids": list(coordinator.COMPONENT_IDS),
         "component_sampling_ratios": list(coordinator.COMPONENT_RATIOS),
-        "descriptor_sha256": _sha("a"),
+        "descriptor_sha256": descriptor_sha256 or _sha("a"),
         "data_fingerprint": _sha("b"),
         "payload_inventory_sha256": _sha("c"),
         "production_sampling_receipt_sha256": _sha("d"),
@@ -82,6 +134,14 @@ def _composite() -> dict:
         "truncation_surface_sha256": _sha("3"),
         "truncated_rows": 0,
         "complete_game_inputs": True,
+        "category_semantics": semantics,
+        "category_semantics_sha256": coordinator._digest(semantics),
+        "source_authority": source_authority
+        or {
+            "path": "/sealed/source-authority.json",
+            "file_sha256": _sha("4"),
+            "authority_sha256": _sha("5"),
+        },
     }
 
 
@@ -134,13 +194,14 @@ def _parent() -> dict:
     return coordinator.current_parent_authority_from_recovery(_recovery())
 
 
-def _sample_receipt(*, final: bool = False) -> dict:
+def _sample_receipt(*, final: bool = False, composite: dict | None = None) -> dict:
     dose = coordinator.SHORT_SAMPLE_DOSE
-    prior = _sample_receipt(final=False) if final else None
+    composite = _composite() if composite is None else composite
+    prior = _sample_receipt(final=False, composite=composite) if final else None
     seed = coordinator.FINAL_SAMPLER_SEED if final else coordinator.P1_SAMPLER_SEED
     return coordinator._sealed(
         {
-            "schema_version": "a1-authenticated-sample-evidence-v1",
+            "schema_version": "a1-authenticated-sample-evidence-v2",
             "status": "complete",
             "sample_dose": dose,
             "sampler_seed": seed,
@@ -173,8 +234,13 @@ def _sample_receipt(*, final: bool = False) -> dict:
             "kl_eligible_mass_decimal": "0.5" if not final else "0.25",
             "kl_ordered_evidence_sha256": _sha("1"),
             "kl_eligible_evidence_sha256": _sha("2"),
-            "descriptor_sha256": _composite()["descriptor_sha256"],
-            "payload_inventory_sha256": _composite()["payload_inventory_sha256"],
+            "descriptor_sha256": composite["descriptor_sha256"],
+            "payload_inventory_sha256": composite["payload_inventory_sha256"],
+            "category_semantics": copy.deepcopy(composite["category_semantics"]),
+            "category_semantics_sha256": composite[
+                "category_semantics_sha256"
+            ],
+            "source_authority": copy.deepcopy(composite["source_authority"]),
             "rows_file_sha256": _sha("3") if final else _sha("0"),
             "origin_tool_sha256": coordinator._repo_tool_sha256(
                 "tools/a1_scientific_evidence.py"
@@ -284,40 +350,78 @@ def _isolate_external_evidence_verifiers(monkeypatch) -> None:
     )
 
 
-def _p1_input_paths(root: Path) -> dict[str, Path]:
+def _p1_input_paths(root: Path) -> tuple[dict[str, Path], dict]:
     root.mkdir(parents=True, exist_ok=True)
     descriptor = root / "composite.json"
+    source_authority_path = root / "source-authority.json"
     rows = root / "p1-rows.jsonl"
     recovery = root / "recovery.json"
     runtime = root / "runtime.json"
     sample = root / "p1-sample.json"
-    descriptor.write_text("{}\n", encoding="utf-8")
+    semantics = _category_semantics()
+    source_unsigned = {
+        "schema_version": "a1-portable-composite-authority-v1",
+        "category_semantics": semantics,
+    }
+    source_payload = {
+        **source_unsigned,
+        "authority_sha256": coordinator._digest(source_unsigned),
+    }
+    source_authority_path.write_text(
+        json.dumps(source_payload, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    source_ref = {
+        "path": str(source_authority_path.resolve(strict=True)),
+        "file_sha256": "sha256:"
+        + hashlib.sha256(source_authority_path.read_bytes()).hexdigest(),
+        "authority_sha256": source_payload["authority_sha256"],
+    }
+    descriptor_payload = {
+        "category_semantics": semantics,
+        "source_authority_manifest": source_ref["path"],
+        "source_authority_manifest_sha256": source_ref["file_sha256"],
+        "source_authority_sha256": source_ref["authority_sha256"],
+    }
+    descriptor.write_text(
+        json.dumps(descriptor_payload, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    descriptor_sha = "sha256:" + hashlib.sha256(descriptor.read_bytes()).hexdigest()
+    composite = _composite(
+        descriptor_sha256=descriptor_sha,
+        source_authority=source_ref,
+    )
     rows.write_text("{}\n", encoding="utf-8")
     recovery.write_text("{}\n", encoding="utf-8")
     # _write_once seals; pass the unsigned measured fixtures.
     native_unsigned = _native_admission()
     native_unsigned.pop("state_sha256")
     coordinator._write_once(runtime, native_unsigned)
-    sample_unsigned = _sample_receipt()
+    sample_unsigned = _sample_receipt(composite=composite)
     sample_unsigned.pop("state_sha256")
     coordinator._write_once(sample, sample_unsigned)
-    return {
-        "composite_descriptor_path": descriptor,
-        "p1_sample_receipt_path": sample,
-        "p1_sample_rows_path": rows,
-        "v5_recovery_receipt_path": recovery,
-        "native_learner_admission_receipt_path": runtime,
-    }
+    return (
+        {
+            "composite_descriptor_path": descriptor,
+            "p1_sample_receipt_path": sample,
+            "p1_sample_rows_path": rows,
+            "v5_recovery_receipt_path": recovery,
+            "native_learner_admission_receipt_path": runtime,
+        },
+        composite,
+    )
 
 
 def _issue_p1_sweep(root: Path) -> dict:
+    paths, composite = _p1_input_paths(root)
     return coordinator.prepare_p1_sweep(
         root,
         final_lock_authority=_final_lock(),
-        composite=_composite(),
+        composite=composite,
         portable_code_identity_sha256=_sha("a"),
         allocations=_p1_allocations(),
-        **_p1_input_paths(root),
+        **paths,
     )
 
 
@@ -493,9 +597,9 @@ def _pointer_upgrade() -> dict:
     }
 
 
-def _warmup_recipe() -> dict:
+def _warmup_recipe(composite: dict | None = None) -> dict:
     steps = coordinator.SHORT_OPTIMIZER_STEPS
-    composite = _composite()
+    composite = _composite() if composite is None else composite
     seed = 1
     return {
         "schema_version": coordinator.WARMUP_RECIPE_SCHEMA,
@@ -602,7 +706,7 @@ def _prepare_aux(root: Path) -> tuple[dict, dict]:
         root,
         p1_recipe_data_authority=p1,
         pointer_upgrade_authority=_pointer_upgrade(),
-        warmup_recipe=_warmup_recipe(),
+        warmup_recipe=_warmup_recipe(p1["composite"]),
         selector_rule=_selector_rule(),
         portable_code_identity_sha256=_sha("4"),
         allocations=_aux_allocations(),
@@ -821,7 +925,7 @@ def _final_receipts(root: Path, pair: dict) -> dict[str, Path]:
         },
     )
     sampling_path = root / "final-sampling.json"
-    sample = _sample_receipt(final=True)
+    sample = _sample_receipt(final=True, composite=composite)
     sample.pop("state_sha256")
     coordinator._write_once(sampling_path, sample)
     descriptor_path = root / "composite.json"
@@ -1134,7 +1238,7 @@ def test_p1_sweep_has_fixed_one_axis_arms_and_central_selection(tmp_path: Path) 
 def test_p1_measured_dose_order_seed_drift_refused(
     tmp_path: Path, field: str, value: object
 ) -> None:
-    paths = _p1_input_paths(tmp_path)
+    paths, composite = _p1_input_paths(tmp_path)
     sample = coordinator._load_json(
         paths["p1_sample_receipt_path"], where="test P1 sample"
     )
@@ -1147,7 +1251,60 @@ def test_p1_measured_dose_order_seed_drift_refused(
         coordinator.prepare_p1_sweep(
             tmp_path,
             final_lock_authority=_final_lock(),
-            composite=_composite(),
+            composite=composite,
+            portable_code_identity_sha256=_sha("a"),
+            allocations=_p1_allocations(),
+            **paths,
+        )
+
+
+def test_p1_refuses_cross_recovery_descriptor_join(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths, composite = _p1_input_paths(tmp_path)
+    other = _recovery()
+    other["recovery_lineage_id"] = _sha("d")
+    other["authority_sha256"] = _sha("e")
+    monkeypatch.setattr(
+        coordinator.v5_recovery,
+        "verify_committed_receipt",
+        lambda _path: {"authority": other, "receipt": {"status": "committed"}},
+    )
+    with pytest.raises(coordinator.CoordinatorError, match="recovery authority"):
+        coordinator.prepare_p1_sweep(
+            tmp_path,
+            final_lock_authority=_final_lock(),
+            composite=composite,
+            portable_code_identity_sha256=_sha("a"),
+            allocations=_p1_allocations(),
+            **paths,
+        )
+
+
+@pytest.mark.parametrize("mutation", ("strip", "swap"))
+def test_p1_refuses_laundered_category_semantics(
+    tmp_path: Path, mutation: str
+) -> None:
+    paths, composite = _p1_input_paths(tmp_path)
+    if mutation == "strip":
+        composite.pop("category_semantics")
+    else:
+        composite["category_semantics"] = copy.deepcopy(
+            composite["category_semantics"]
+        )
+        composite["category_semantics"]["recent_history"]["semantic"] = (
+            "recent_history"
+        )
+        composite["category_semantics_sha256"] = coordinator._digest(
+            composite["category_semantics"]
+        )
+    with pytest.raises(
+        coordinator.CoordinatorError, match="shape drift|category semantics"
+    ):
+        coordinator.prepare_p1_sweep(
+            tmp_path,
+            final_lock_authority=_final_lock(),
+            composite=composite,
             portable_code_identity_sha256=_sha("a"),
             allocations=_p1_allocations(),
             **paths,
@@ -1353,7 +1510,7 @@ def test_aux_refuses_fabricated_noncentral_p1_authority(tmp_path: Path) -> None:
         "native_learner_admission_receipt": _native_admission(),
         "p1_sample_evidence_receipt": _sample_receipt(),
         "recovery_component_semantics": coordinator.recovery_component_semantics(
-            _recovery()
+            _recovery(), _category_semantics()
         ),
     }
     with pytest.raises(coordinator.CoordinatorError, match="experiment directory"):
@@ -1565,7 +1722,7 @@ def test_arm_claims_are_fixed_allocation_bound_and_executor_echoes_science(
         assert authority["arm_claim"] == claim
         assert (
             authority["aux_pair_contract"]["portable_science_identity"]["composite"]
-            == _composite()
+            == experiment["portable_science_identity"]["composite"]
         )
         assert authority["arm"]["arm_id"] == arm_id
         coordinator.complete_arm(
@@ -1798,7 +1955,7 @@ def test_portable_identity_is_path_invariant_and_allocation_drift_is_refused(
             tmp_path / "three",
             p1_recipe_data_authority=p1,
             pointer_upgrade_authority=_pointer_upgrade(),
-            warmup_recipe=_warmup_recipe(),
+            warmup_recipe=_warmup_recipe(p1["composite"]),
             selector_rule=_selector_rule(),
             portable_code_identity_sha256=_sha("4"),
             allocations=allocations,
