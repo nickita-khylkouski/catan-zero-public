@@ -13605,9 +13605,34 @@ def _policy_kl_anchor_loss_parts(
     the full batch size.
     """
     import torch
+    import torch.distributed as dist
 
     terms = _prior_kl_telemetry(data, batch, logits, device)
-    if terms is None:
+    # A locally empty anchor batch is not evidence that the GLOBAL DDP batch is
+    # empty. The old local early-return let one rank skip the denominator
+    # all-reduce while a peer with replay/prior rows entered it, deadlocking the
+    # step (or yielding different objectives if collectives were mocked). Make
+    # the presence decision collectively during gradient-enabled training.
+    distributed_training = bool(
+        torch.is_grad_enabled() and dist.is_available() and dist.is_initialized()
+    )
+    if distributed_training:
+        global_has_terms = torch.tensor(
+            int(terms is not None), dtype=torch.int64, device=device
+        )
+        dist.all_reduce(global_has_terms, op=dist.ReduceOp.MAX)
+        if int(global_has_terms.item()) == 0:
+            return None
+        if terms is None:
+            zero = logits.float().sum(dim=-1) * 0.0
+            terms = {
+                "has_prior": torch.zeros(
+                    len(batch), dtype=torch.bool, device=device
+                ),
+                "kl_model_prior": zero,
+                "kl_prior_model": zero,
+            }
+    elif terms is None:
         return None
     # A forced row has a one-element legal simplex, so its KL is identically
     # zero for every model.  Counting those rows in the denominator diluted the
@@ -13624,7 +13649,7 @@ def _policy_kl_anchor_loss_parts(
     if scope_mask is not None:
         eligible = torch.as_tensor(scope_mask, dtype=torch.bool, device=device)
         weights = weights * eligible.to(torch.float32)
-    if float(weights.sum().item()) <= 0.0:
+    if not distributed_training and float(weights.sum().item()) <= 0.0:
         return None
     if direction == "forward":
         values = terms["kl_prior_model"]
@@ -13772,9 +13797,6 @@ def _q_score_loss_parts(
     if np.any(skip_rows):
         finite_np[skip_rows] = False
     row_has_scores_np = np.sum(finite_np, axis=1) >= 2
-    if not np.any(row_has_scores_np):
-        zero = torch.tensor(0.0, dtype=torch.float32, device=device)
-        return zero, zero, zero
 
     mask = torch.as_tensor(finite_np, dtype=torch.bool, device=device)
     row_has_scores = torch.as_tensor(row_has_scores_np, dtype=torch.float32, device=device)
