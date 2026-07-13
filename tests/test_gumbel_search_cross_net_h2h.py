@@ -1045,6 +1045,9 @@ def test_h2h_summary_records_resolved_adaptive_budget_by_role():
     )
     assert summary["candidate_checkpoint_sha256"] == "sha256:" + "1" * 64
     assert summary["baseline_checkpoint_sha256"] == "sha256:" + "2" * 64
+    assert summary["superiority_pentanomial_sprt"]["elo0"] == 0.0
+    assert summary["superiority_pentanomial_sprt"]["elo1"] == 15.0
+    assert summary["superiority_verdict"] == "continue"
 
     assert summary["candidate_n_full_wide"] == 256
     assert summary["baseline_n_full_wide"] is None

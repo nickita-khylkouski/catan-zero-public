@@ -407,7 +407,11 @@ def _fixture(
     pentanomial = promotion.evaluate_pentanomial_sprt(
         pair_scores, elo0=-10.0, elo1=15.0, alpha=0.05, beta=0.05
     )
+    superiority_pentanomial = promotion.evaluate_pentanomial_sprt(
+        pair_scores, elo0=0.0, elo1=15.0, alpha=0.05, beta=0.05
+    )
     assert pentanomial["decision"] == "H1"
+    assert superiority_pentanomial["decision"] == "H1"
     typed_config = {
         "pipeline": "eval",
         "schema_version": 6,
@@ -470,6 +474,8 @@ def _fixture(
             "pair_diagnostics": pair_diagnostics,
             "pentanomial_sprt": pentanomial,
             "verdict": "H1",
+            "superiority_pentanomial_sprt": superiority_pentanomial,
+            "superiority_verdict": "H1",
         },
     )
 
@@ -839,7 +845,11 @@ def _fixture(
             "pass",
             {"value_readout": "scalar", "max_rmse_regression": 0.02},
         ),
-        "internal_h2h": ([("internal_h2h", internal_source)], "H1", {}),
+        "internal_h2h": (
+            [("internal_h2h", internal_source)],
+            "H1",
+            dict(promotion.INTERNAL_STRENGTH_RESULT),
+        ),
         "external_panel": (
             external_sources,
             "pass",
@@ -2269,6 +2279,104 @@ def test_transaction_rejects_internal_candidate_search_outcome_alias_drift(
     with pytest.raises(
         promotion.PromotionError, match="candidate_won/search_won alias drift"
     ):
+        _execute(fixture, go=False)
+
+
+@pytest.mark.parametrize(
+    ("counts", "expected_decision"),
+    [
+        ((19, 150, 31), "continue"),
+        ((2, 292, 6), "H0"),
+    ],
+)
+def test_transaction_rejects_regression_h1_without_superiority_h1(
+    tmp_path: Path,
+    counts: tuple[int, int, int],
+    expected_decision: str,
+) -> None:
+    fixture = _fixture(tmp_path)
+
+    def mutate(source: dict) -> None:
+        games: list[dict] = []
+        pair_id = 0
+        for pair_count, outcomes in zip(
+            counts,
+            ((False, False), (True, False), (True, True)),
+            strict=True,
+        ):
+            for _ in range(pair_count):
+                for orientation, won in zip(
+                    ("candidate_first", "candidate_second"),
+                    outcomes,
+                    strict=True,
+                ):
+                    games.append(
+                        {
+                            "pair_id": pair_id,
+                            "game_seed": 7_000_000 + pair_id,
+                            "orientation": orientation,
+                            "search_won": won,
+                            "candidate_won": won,
+                        }
+                    )
+                pair_id += 1
+        pair_scores, diagnostics = promotion.pair_scores_from_h2h_games(games)
+        regression = promotion.evaluate_pentanomial_sprt(
+            pair_scores, elo0=-10.0, elo1=15.0, alpha=0.05, beta=0.05
+        )
+        superiority = promotion.evaluate_pentanomial_sprt(
+            pair_scores, elo0=0.0, elo1=15.0, alpha=0.05, beta=0.05
+        )
+        assert regression["decision"] == "H1"
+        assert superiority["decision"] == expected_decision
+        wins = sum(game["candidate_won"] for game in games)
+        source.update(
+            {
+                "games": games,
+                "games_played": len(games),
+                "games_with_winner": len(games),
+                "complete_pairs": len(games) // 2,
+                "candidate_wins": wins,
+                "baseline_wins": len(games) - wins,
+                "candidate_win_rate": wins / len(games),
+                "pair_diagnostics": diagnostics,
+                "pentanomial_sprt": regression,
+                "verdict": "H1",
+                "superiority_pentanomial_sprt": superiority,
+                "superiority_verdict": expected_decision,
+            }
+        )
+
+    _mutate_evidence_source(
+        fixture, kind="internal_h2h", role="internal_h2h", mutate=mutate
+    )
+
+    with pytest.raises(
+        promotion.PromotionError, match="does not prove positive-Elo superiority"
+    ):
+        _execute(fixture, go=False)
+
+
+def test_transaction_rejects_legacy_v1_evidence_for_new_promotion(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path)
+    adjudication = json.loads(fixture["adjudication"].read_text())
+    evidence_ref = next(
+        item for item in adjudication["evidence"] if item["kind"] == "internal_h2h"
+    )
+    evidence_path = Path(evidence_ref["path"])
+    envelope = json.loads(evidence_path.read_text())
+    envelope["schema_version"] = promotion.LEGACY_EVIDENCE_SCHEMA
+    envelope.pop("evidence_sha256")
+    envelope["evidence_sha256"] = promotion._digest_value(envelope)
+    _write_json(evidence_path, envelope)
+    evidence_ref["sha256"] = promotion._sha256(evidence_path)
+    adjudication.pop("adjudication_sha256")
+    adjudication["adjudication_sha256"] = promotion._digest_value(adjudication)
+    _write_json(fixture["adjudication"], adjudication)
+
+    with pytest.raises(promotion.PromotionError, match="evidence schema/kind mismatch"):
         _execute(fixture, go=False)
 
 

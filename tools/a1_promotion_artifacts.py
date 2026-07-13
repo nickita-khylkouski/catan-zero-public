@@ -1012,6 +1012,8 @@ def build_evidence_envelope(
             "value_readout": promotion._contract_value_readout(contract),  # noqa: SLF001
             "max_rmse_regression": promotion.MAX_CALIBRATION_RMSE_REGRESSION,
         }
+    elif kind == "internal_h2h":
+        result = dict(promotion.INTERNAL_STRENGTH_RESULT)
     elif kind == "external_panel":
         result = {"max_win_rate_regression": promotion.MAX_EXTERNAL_WIN_RATE_REGRESSION}
     else:

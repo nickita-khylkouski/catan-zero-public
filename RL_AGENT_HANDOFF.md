@@ -698,7 +698,8 @@ nvidia-smi --query-gpu=index,memory.used --format=csv
 H2H tools do not claim or guard seeds. Under one evaluation operator, use a
 private `VAL_ONLY_EVAL_LEDGER.md` that never enters a training corpus. Every
 pair consumes one seed and plays both color orientations. Claim the maximum
-extension before starting: 300 seeds for a 150-to-300-pair flywheel gate, 100
+extension before starting: 2,400 seeds for the 600-to-2,400-pair superiority
+gate, 100
 separate seeds for an every-third n64 confirmation, and a separate panel range.
 Candidate and incumbent bot panels intentionally share one claimed panel range
 so their comparison uses identical seeds.
@@ -710,7 +711,7 @@ ledger and fail on a collision:
 set -euo pipefail
 EVAL_LEDGER=<private-state>/VAL_ONLY_EVAL_LEDGER.md
 EVAL_SEED=<fresh-val-only-base>
-MAX_PAIRS=300
+MAX_PAIRS=2400
 EVAL_CLAIM=<unique-promotion-id>
 test -s "$EVAL_LEDGER"
 
@@ -740,24 +741,28 @@ $EVAL_PY tools/sync_seed_ledger.py "$EVAL_LEDGER" --check
 
 `sync_seed_ledger --check` must pass. If the append makes it noncanonical,
 canonicalize through a temporary output and atomically replace the ledger
-before launching. The 300-pair extension intentionally replays the first 150
-pairs; it is covered by the one maximum-range claim.
+before launching. Every continuation must consume the next unused contiguous
+subrange of this maximum claim and be pooled from retained raw games.
 
 ### 16.2 Run the roadmap flywheel gate
 
-The roadmap's ordinary promotion valve is n16, 150 pairs/300 games, with
-elo0=-10, elo1=+15, alpha=beta=0.05. n128 is a strength panel, not this gate.
-Launch the gate through the teardown-safe detached runner:
+New promotion evidence evaluates the exact deployed n128 operator. Start with
+600 pairs/1,200 games and compute both `[-10,+15]` regression protection and
+`[0,+15]` superiority at alpha=beta=0.05. Launch through the teardown-safe
+detached runner; the role-specific c-scales and every other operator field must
+come from the sealed candidate/incumbent identities:
 
 ~~~bash
 set -euo pipefail
-EVAL_ID="${EVAL_CLAIM}-gate300"
+EVAL_ID="${EVAL_CLAIM}-gate1200"
 EVAL_OUT="/home/ubuntu/eval_out/$EVAL_ID"
 RUNDIR="/home/ubuntu/fleet_runs/$EVAL_ID"
 mkdir -p /home/ubuntu/eval_out
 mkdir "$EVAL_OUT"
 CANDIDATE=/immutable/eval/<candidate-hash>.pt
 INCUMBENT=/immutable/eval/<incumbent-hash>.pt
+CANDIDATE_C_SCALE=<sealed-candidate-c-scale>
+INCUMBENT_C_SCALE=<registry-incumbent-c-scale>
 source tools/fleet/launch_detached.sh
 export PROGRESS_CMD="tail -1 $EVAL_OUT/run.log"
 
@@ -765,29 +770,36 @@ EVAL_CMD=(
   "$EVAL_PY" tools/gumbel_search_cross_net_h2h.py
   --candidate "$CANDIDATE"
   --baseline "$INCUMBENT"
-  --pairs 150 \
+  --pairs 600 \
   --workers 8 \
   --devices cuda:0,cuda:1 \
-  --n-full 16 \
+  --n-full 128 \
   --max-depth 80 \
   --max-decisions 600 \
   --prior-temperature 1.0 \
   --value-scale 1.0 \
   --value-squash tanh \
   --c-visit 50.0 \
-  --c-scale 0.03 \
+  --candidate-c-scale "$CANDIDATE_C_SCALE" \
+  --baseline-c-scale "$INCUMBENT_C_SCALE" \
   --max-root-candidates 16 \
   --max-root-candidates-wide 54 \
   --correct-rust-chance-spectra \
   --lazy-interior-chance \
   --public-observation \
   --no-belief-chance-spectra \
-  --no-symmetry-averaged-eval \
+  --information-set-search \
+  --determinization-particles 4 \
+  --determinization-min-simulations 32 \
+  --symmetry-averaged-eval \
+  --symmetry-averaged-eval-threshold 20 \
+  --native-mcts-hot-loop \
+  --evaluator-rust-featurize \
   --gate-config flywheel \
   --base-seed "$EVAL_SEED" \
   --dump-config "$EVAL_OUT/config.json" \
   --config-hash \
-  --config-purpose flywheel-promotion-300 \
+  --config-purpose flywheel-promotion-superiority-1200 \
   --out "$EVAL_OUT/result.json"
 )
 
@@ -801,16 +813,45 @@ workstation, run `tools/fleet/fleet_status.sh b200` and a dry-run
 group. After `DONE`, retrieve the report/config/log, recheck checkpoint hashes,
 and verify b200 is idle.
 
-Read `pentanomial_sprt.decision`, not the naive SPRT:
+Read both paired decisions, not the naive SPRT:
 
-- H1: eligible for the next panel, subject to vetoes;
+- `pentanomial_sprt.decision == H1`: the candidate clears the
+  `[-10,+15]` regression-protection gate;
+- `superiority_pentanomial_sprt.decision == H1`: the candidate also proves
+  positive-Elo superiority under `[0,+15]` and is eligible for the next panel,
+  subject to vetoes;
 - H0: reject;
 - continue: hold and extend.
 
-The tool does not extend itself. On `continue`, create a new detached run with
-the same base seed and flags, changing only pairs to 300, output/config paths,
-and config-purpose to `flywheel-promotion-600`. This replays all 600 games; it
-does not append only the second half. Do not promote on `continue`.
+Both paired decisions must be H1 for every new promotion transaction. A
+regression-band H1 with superiority `continue` or H0 is not promotable. The
+legacy evidence-v1 schema remains readable only through immutable,
+already-recorded registry/receipt history; it is never accepted to authorize a
+new transaction.
+
+The stricter decision needs more games than the former regression-only valve.
+At the observed roughly 0.62 split-pair rate, a 100,000-trial terminal-power
+simulation of the same regularized pentanomial statistic gives these
+approximate probabilities of superiority H1:
+
+| true direct-H2H Elo | 600 pairs | 1,200 pairs | 2,400 pairs | 4,000 pairs |
+| ---: | ---: | ---: | ---: | ---: |
+| +10 | 0.08 | 0.21 | 0.39 | 0.53 |
+| +15 | 0.20 | 0.50 | 0.80 | 0.94 |
+| +20 | 0.39 | 0.79 | 0.98 | >0.99 |
+| +25 | 0.62 | 0.95 | >0.99 | >0.99 |
+| +30 | 0.81 | 0.99 | >0.99 | >0.99 |
+
+Therefore a 600-pair panel remains a useful first look, but `continue` is an
+expected result for real +10 to +20 improvements, not a failure. Predeclare
+extensions to 1,200 and 2,400 fresh paired seeds and pool their retained raw
+games; never reinterpret the easier regression H1 as a promotion after the
+superiority test times out.
+
+The tool does not extend itself. On `continue`, run the next 600 fresh paired
+seeds and pool the two cohorts to 1,200 pairs; if still unresolved, run 1,200
+more fresh paired seeds and pool to 2,400. Keep every science/operator flag
+byte-identical. Do not promote on `continue`.
 
 Reject an output with errors, missing games, mismatched production flags, or
 insufficient complete pairs.

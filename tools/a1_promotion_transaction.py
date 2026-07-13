@@ -61,7 +61,13 @@ RECEIPT_SCHEMA = "a1-promotion-transaction-receipt-v3"
 PREVIOUS_RECEIPT_SCHEMA = "a1-promotion-transaction-receipt-v2"
 LEGACY_RECEIPT_SCHEMA = "a1-promotion-transaction-receipt-v1"
 COHORT_EXCLUSIONS_SCHEMA = "a1-promotion-cohort-exclusions-v1"
-EVIDENCE_SCHEMA = "a1-promotion-evidence-v1"
+# v2 makes positive-Elo superiority a mandatory part of every newly-created
+# internal promotion envelope.  v1 remains named solely so immutable,
+# already-recorded registry history can be identified by audit/recovery code;
+# `_verify_promotion_evidence` intentionally does not accept it for a new
+# transaction.
+EVIDENCE_SCHEMA = "a1-promotion-evidence-v2"
+LEGACY_EVIDENCE_SCHEMA = "a1-promotion-evidence-v1"
 HIGH_REGRET_SCHEMA = "a1-high-regret-comparison-v1"
 BUCKET_VETO_SCHEMA = "a1-bucket-veto-v1"
 HIGH_REGRET_REPORT_SCHEMA = "a1-held-out-high-regret-report-v1"
@@ -85,6 +91,14 @@ HISTORICAL_MARKERLESS_A1_CONTRACT = {
 }
 MAX_CALIBRATION_RMSE_REGRESSION = 0.02
 MAX_EXTERNAL_WIN_RATE_REGRESSION = 0.02
+SUPERIORITY_ELO0 = 0.0
+SUPERIORITY_ELO1 = 15.0
+INTERNAL_STRENGTH_RESULT = {
+    "regression_protection_verdict": "H1",
+    "superiority_verdict": "H1",
+    "superiority_elo0": SUPERIORITY_ELO0,
+    "superiority_elo1": SUPERIORITY_ELO1,
+}
 # Exact one-time compatibility for the historical pre-promotion lock.  These
 # values are NOT loop defaults: after the first promotion the incumbent
 # operator comes from the authoritative registry agent identity, and a new
@@ -3387,6 +3401,27 @@ def _verify_internal_h2h_source(
     )
     if replayed["decision"] != "H1" or replayed != sprt:
         raise PromotionError(f"{where} pentanomial evidence does not replay exactly")
+    superiority = payload.get("superiority_pentanomial_sprt")
+    replayed_superiority = evaluate_pentanomial_sprt(
+        pair_scores,
+        elo0=SUPERIORITY_ELO0,
+        elo1=SUPERIORITY_ELO1,
+        alpha=0.05,
+        beta=0.05,
+    )
+    if (
+        not isinstance(superiority, dict)
+        or superiority != replayed_superiority
+        or payload.get("superiority_verdict") != replayed_superiority["decision"]
+    ):
+        raise PromotionError(
+            f"{where} superiority pentanomial evidence does not replay exactly"
+        )
+    if replayed_superiority["decision"] != "H1":
+        raise PromotionError(
+            f"{where} does not prove positive-Elo superiority: "
+            f"decision={replayed_superiority['decision']!r}"
+        )
     if diagnostics != payload.get("pair_diagnostics"):
         raise PromotionError(f"{where} pair diagnostics do not replay exactly")
 
@@ -4476,7 +4511,10 @@ def _verify_promotion_evidence(
             candidate_search_config=candidate["search_config"],
             champion_search_config=champion["search_config"],
         )
-        if value["verdict"] != "H1" or result:
+        if (
+            value["verdict"] != "H1"
+            or result != INTERNAL_STRENGTH_RESULT
+        ):
             raise PromotionError("internal H2H envelope verdict/result drift")
     elif kind == "external_panel":
         if set(source_by_role) != {"candidate_panel", "champion_panel"}:

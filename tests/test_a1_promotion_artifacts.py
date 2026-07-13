@@ -1137,7 +1137,11 @@ def _contract() -> dict:
             "pass",
             {"value_readout": "scalar", "max_rmse_regression": 0.02},
         ),
-        ("internal_h2h", "H1", {}),
+        (
+            "internal_h2h",
+            "H1",
+            dict(promotion.INTERNAL_STRENGTH_RESULT),
+        ),
         ("external_panel", "pass", {"max_win_rate_regression": 0.02}),
         ("high_regret", "pass", {}),
         ("bucket_veto", "pass", {}),

@@ -20,9 +20,10 @@ bias, the same paired-seed H2H protocol used by
 tools/gumbel_search_vs_raw_h2h.py and tools/evaluate_scoreboard.py.
 
 Per-game outcomes feed tools/sprt_gate.py's evaluate_sprt /
-evaluate_pentanomial_sprt (elo0=0, elo1=30 -- the >=55%-win-rate promotion
-bar). Truncated games (no winner within --max-decisions) are recorded but
-EXCLUDED from the SPRT input.
+evaluate_pentanomial_sprt.  The named gate remains the regression-protection
+instrument, while every report also records the fixed [0,+15] positive-Elo
+superiority test required by new promotion evidence. Truncated games (no
+winner within --max-decisions) are recorded but EXCLUDED from both tests.
 """
 
 from __future__ import annotations
@@ -1991,6 +1992,9 @@ def _build_summary(
     pentanomial_sprt = evaluate_pentanomial_sprt(
         pair_scores, elo0=float(args.elo0), elo1=float(args.elo1)
     )
+    superiority_pentanomial_sprt = evaluate_pentanomial_sprt(
+        pair_scores, elo0=0.0, elo1=15.0, alpha=0.05, beta=0.05
+    )
 
     complete_pairs = (
         pair_diagnostics["ww_pairs"]
@@ -2154,6 +2158,11 @@ def _build_summary(
         "pentanomial_sprt": pentanomial_sprt,
         # Recommended gate verdict: trinomial GSPRT over all complete pairs.
         "verdict": pentanomial_sprt["decision"],
+        # New promotion transactions require this second decision to be H1.
+        # Keeping it separate preserves the useful -10/+15 regression gate
+        # without mislabeling that gate as proof of positive Elo.
+        "superiority_pentanomial_sprt": superiority_pentanomial_sprt,
+        "superiority_verdict": superiority_pentanomial_sprt["decision"],
         "pair_diagnostics": pair_diagnostics,
         "pairs_decisive": pair_diagnostics["ww_pairs"] + pair_diagnostics["ll_pairs"],
         "pairs_split_excluded": pair_diagnostics["split_pairs"],
