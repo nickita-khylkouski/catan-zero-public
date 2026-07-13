@@ -3861,7 +3861,6 @@ def _effective_a1_learner_training_recipe(
         "policy_kl_anchor_weight",
         "value_uncertainty_loss_weight",
         "aux_subgoal_loss_weight",
-        "belief_resource_loss_weight",
         "train_value_only",
         "freeze_modules",
         "policy_surprise_weight",
@@ -3882,6 +3881,15 @@ def _effective_a1_learner_training_recipe(
         "ddp_shard_data",
     )
     effective = {field: getattr(args, field) for field in bound_fields}
+    # Additive opt-in objective: historical sealed recipes and old Namespace
+    # fixtures predate this field and must remain byte-for-byte exact when it is
+    # absent/off. A nonzero value is trajectory-changing and therefore enters
+    # the effective recipe so an old seal rejects it rather than weakening.
+    belief_resource_loss_weight = float(
+        getattr(args, "belief_resource_loss_weight", 0.0)
+    )
+    if belief_resource_loss_weight != 0.0:
+        effective["belief_resource_loss_weight"] = belief_resource_loss_weight
     world_size = int(ddp["world_size"])
     effective["world_size"] = world_size
     effective["global_batch_size"] = (

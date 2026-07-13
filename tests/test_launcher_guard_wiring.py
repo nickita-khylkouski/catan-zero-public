@@ -168,6 +168,8 @@ GOLDEN_OPTION_STRINGS = {
         ("--aux-subgoal-heads",),
         ("--aux-subgoal-loss-weight",),
         ("--batch-size",),
+        ("--belief-resource-head",),
+        ("--belief-resource-loss-weight",),
         ("--checkpoint",),
         ("--config",),
         ("--config-hash",),

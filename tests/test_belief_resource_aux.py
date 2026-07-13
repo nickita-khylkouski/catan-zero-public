@@ -293,3 +293,18 @@ def test_complete_corpus_coverage_refuses_source_masked_component(
     monkeypatch.setattr(train_bc, "ConcatMemmapCorpus", _FakeComposite)
     with pytest.raises(SystemExit, match="source-masked"):
         train_bc._belief_resource_coverage(_FakeComposite(), chunk_rows=1)
+
+
+def test_a1_effective_recipe_omits_exact_off_belief_for_legacy_seals() -> None:
+    args = train_bc.build_parser().parse_args(
+        ["--data", "data", "--checkpoint", "candidate.pt", "--report", "report.json"]
+    )
+    ddp = {"world_size": 1, "rank": 0, "local_rank": 0, "enabled": False}
+    effective = train_bc._effective_a1_learner_training_recipe(args, ddp)
+    assert "belief_resource_loss_weight" not in effective
+    args.belief_resource_loss_weight = 0.02
+    effective = train_bc._effective_a1_learner_training_recipe(args, ddp)
+    assert effective["belief_resource_loss_weight"] == 0.02
+    del args.belief_resource_loss_weight
+    effective = train_bc._effective_a1_learner_training_recipe(args, ddp)
+    assert "belief_resource_loss_weight" not in effective
