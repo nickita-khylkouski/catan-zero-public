@@ -354,6 +354,7 @@ class GenerateConfig(PipelineConfig):
     information_set_search: bool = False
     determinization_particles: int = 1
     determinization_min_simulations: int = 32
+    information_set_target_aggregation: str = "mean_improved_policy"
     # Seeds.
     base_seed: int = 1
     seed_claim: bool = True
