@@ -866,6 +866,17 @@ class EntityGraphNet:
             ):
                 """Score legal actions and emit value heads from encoded state."""
                 tokens, padding_mask, state = encoded_state[:3]
+                # The BC trainer freezes zero-objective optional heads and sets
+                # this non-persistent module-name gate before DDP/optimizer
+                # construction.  Skipping those forwards is semantically
+                # important even after requires_grad=False: several heads contain
+                # dropout, so executing an unused head would advance torch's RNG
+                # and silently change the trunk dropout masks on the next batch.
+                # Freshly created/inference-loaded models have no gate and retain
+                # the historical full-output API.
+                inactive_training_heads = getattr(
+                    self, "_inactive_training_head_modules", frozenset()
+                )
                 action_features = torch.cat(
                     (
                         batch["legal_action_tokens"].float(),
@@ -909,9 +920,15 @@ class EntityGraphNet:
                     "logits": logits,
                     "value": value,
                 }
-                if return_final_vp:
+                if (
+                    return_final_vp
+                    and "final_vp_head" not in inactive_training_heads
+                ):
                     outputs["final_vp"] = self.final_vp_head(state).squeeze(-1)
-                if self.latent_deliberation_steps > 0:
+                if (
+                    self.latent_deliberation_steps > 0
+                    and "deliberation_halt_head" not in inactive_training_heads
+                ):
                     outputs["deliberation_halt_logit"] = (
                         self.deliberation_halt_head(state).squeeze(-1)
                     )
@@ -919,7 +936,10 @@ class EntityGraphNet:
                     outputs["moe_balance_metric"] = encoded_state[3]
                     outputs["moe_routing_load"] = encoded_state[4]
                     outputs["moe_routing_importance"] = encoded_state[5]
-                if self.value_uncertainty_head is not None:
+                if (
+                    self.value_uncertainty_head is not None
+                    and "value_uncertainty_head" not in inactive_training_heads
+                ):
                     # Stop-gradient (CAT-61): the uncertainty head reads a
                     # DETACHED copy of the trunk state, so its regression loss
                     # trains only the head's own parameters and never flows
@@ -931,7 +951,10 @@ class EntityGraphNet:
                     outputs["value_uncertainty"] = torch.nn.functional.softplus(
                         self.value_uncertainty_head(state.detach()).squeeze(-1)
                     )
-                if self.value_categorical_head is not None:
+                if (
+                    self.value_categorical_head is not None
+                    and "value_categorical_head" not in inactive_training_heads
+                ):
                     cat_logits = self.value_categorical_head(state)
                     outputs["value_categorical_logits"] = cat_logits
                     n_bins = self.value_categorical_bins
@@ -951,18 +974,30 @@ class EntityGraphNet:
                     # CAT-100 auxiliary subgoal predictions. Raw logits/scalars
                     # (loss applies BCE-with-logits / CE / MSE at the train site).
                     # These never feed value/policy, so main outputs are unchanged.
-                    outputs["aux_longest_road"] = self.aux_longest_road_head(
-                        state
-                    ).squeeze(-1)
-                    outputs["aux_largest_army"] = self.aux_largest_army_head(
-                        state
-                    ).squeeze(-1)
-                    outputs["aux_vp_in_n"] = self.aux_vp_in_n_head(state).squeeze(-1)
-                    outputs["aux_next_settlement"] = self.aux_next_settlement_head(
-                        state
-                    )
-                    outputs["aux_robber_target"] = self.aux_robber_target_head(state)
-                if self.belief_resource_head_enabled:
+                    if "aux_longest_road_head" not in inactive_training_heads:
+                        outputs["aux_longest_road"] = self.aux_longest_road_head(
+                            state
+                        ).squeeze(-1)
+                    if "aux_largest_army_head" not in inactive_training_heads:
+                        outputs["aux_largest_army"] = self.aux_largest_army_head(
+                            state
+                        ).squeeze(-1)
+                    if "aux_vp_in_n_head" not in inactive_training_heads:
+                        outputs["aux_vp_in_n"] = self.aux_vp_in_n_head(state).squeeze(
+                            -1
+                        )
+                    if "aux_next_settlement_head" not in inactive_training_heads:
+                        outputs["aux_next_settlement"] = (
+                            self.aux_next_settlement_head(state)
+                        )
+                    if "aux_robber_target_head" not in inactive_training_heads:
+                        outputs["aux_robber_target"] = self.aux_robber_target_head(
+                            state
+                        )
+                if (
+                    self.belief_resource_head_enabled
+                    and "belief_resource_head" not in inactive_training_heads
+                ):
                     player_count = int(batch["player_tokens"].shape[1])
                     player_start = _entity_token_start_offsets(batch)[3]
                     player_states = tokens[

@@ -1719,7 +1719,11 @@ def _freeze_inactive_training_heads(
     graph can receive a zero gradient and still undergo decoupled decay.  Heads
     with no learner objective can also become DDP-unused parameters.  This
     helper makes the actual trainable surface agree with the configured loss
-    surface while leaving every active head unchanged.
+    surface while leaving every active head unchanged.  It also records the
+    inactive modules on the model itself.  EntityGraphNet consumes that
+    trainer-only gate to skip their forwards: merely freezing parameters is
+    insufficient when an inactive head contains dropout, because executing it
+    would still advance the global torch RNG and change later trunk masks.
     """
 
     module = getattr(model, "module", model)
@@ -1747,12 +1751,18 @@ def _freeze_inactive_training_heads(
                 parameter.requires_grad = False
                 frozen_parameters += int(parameter.numel())
         frozen_names.append(module_name)
+    # A plain Python attribute is intentional: it follows the live module
+    # through DDP wrapping and repeated ``model.train()`` calls, but is not a
+    # parameter/buffer and therefore cannot leak a training-only output policy
+    # into checkpoint state_dicts or normal inference loads.
+    module._inactive_training_head_modules = frozenset(frozen_names)
     return {
-        "schema_version": "inactive-training-head-freeze-v1",
+        "schema_version": "inactive-training-head-freeze-v2",
         "frozen_submodules": sorted(frozen_names),
         "active_optional_submodules": sorted(active_names),
         "frozen_parameters": int(frozen_parameters),
         "zero_weight_is_optimizer_exclusion": True,
+        "zero_weight_skips_forward": True,
         "latent_deliberation_halt_has_bc_objective": False,
     }
 
