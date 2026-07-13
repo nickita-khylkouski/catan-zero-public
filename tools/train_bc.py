@@ -49,6 +49,7 @@ from catan_zero.rl.entity_token_policy import (
     PLAYER_LONGEST_ROAD_SLOT,
     PUBLIC_AWARD_FEATURE_CONTRACT_AUTHORITATIVE,
     PUBLIC_AWARD_FEATURE_CONTRACT_LEGACY_ZERO,
+    _apply_public_award_feature_contract,
     _validate_public_award_feature_contract,
 )
 from catan_zero.rl.entity_token_features import (
@@ -151,6 +152,7 @@ from catan_zero.rl.entity_token_features import (  # noqa: E402
 # disk -- one corpus serves both masked and unmasked training regimes.
 _MASK_HIDDEN_INFO_PLAYER_TOKENS = False
 _CROP_AUTHENTICATED_EMPTY_EVENT_HISTORY = False
+_PUBLIC_AWARD_FEATURE_CONTRACT = PUBLIC_AWARD_FEATURE_CONTRACT_LEGACY_ZERO
 
 TARGET_INFORMATION_REGIME_PUBLIC = "public_conservation_pimc_v1"
 TARGET_INFORMATION_REGIME_UNKNOWN = "unknown"
@@ -4919,6 +4921,8 @@ def _configure_public_award_feature_training(
             "effective_contract": requested,
             "corpus_provenance": None,
             "legacy_column_zero_initialized": False,
+            "diagnostic_only": False,
+            "promotion_eligible": True,
         }
     corpus = _validated_public_award_corpus_provenance(data)
     corpus_contract = str(corpus["contract"])
@@ -4943,6 +4947,14 @@ def _configure_public_award_feature_training(
     ):
         raise SystemExit(
             "authoritative_v1 training requires an entirely corrected, authenticated corpus"
+        )
+    if (
+        requested == PUBLIC_AWARD_FEATURE_CONTRACT_LEGACY_ZERO
+        and corpus_contract == PUBLIC_AWARD_FEATURE_CONTRACT_AUTHORITATIVE
+    ):
+        raise SystemExit(
+            "an entirely corrected public-award corpus requires explicit "
+            "--public-award-feature-contract authoritative_v1"
         )
     current = _validate_public_award_feature_contract(
         getattr(
@@ -4985,10 +4997,13 @@ def _configure_public_award_feature_training(
         "corpus_provenance": corpus,
         "mixed_corpus_acknowledged": allow_mixed,
         "legacy_column_zero_initialized": zero_initialized,
+        "diagnostic_only": corpus_contract == PUBLIC_AWARD_FEATURE_CONTRACT_MIXED,
+        "promotion_eligible": corpus_contract != PUBLIC_AWARD_FEATURE_CONTRACT_MIXED,
     }
 
 
 def main(argv: Sequence[str] | None = None) -> None:
+    global _PUBLIC_AWARD_FEATURE_CONTRACT
     checkout_runtime_binding = _assert_checkout_runtime_binding()
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -5572,6 +5587,9 @@ def main(argv: Sequence[str] | None = None) -> None:
         public_award_feature_training = _configure_public_award_feature_training(
             policy, data, args
         )
+        _PUBLIC_AWARD_FEATURE_CONTRACT = str(
+            public_award_feature_training["effective_contract"]
+        )
     else:
         if args.init_checkpoint:
             if args.arch == "entity_graph":
@@ -5659,6 +5677,9 @@ def main(argv: Sequence[str] | None = None) -> None:
             )
         public_award_feature_training = _configure_public_award_feature_training(
             policy, data, args
+        )
+        _PUBLIC_AWARD_FEATURE_CONTRACT = str(
+            public_award_feature_training["effective_contract"]
         )
         _rank0_print(
             json.dumps(
@@ -8018,7 +8039,9 @@ def _entity_batch(data: dict, batch: np.ndarray) -> dict[str, np.ndarray]:
         # Load-time public-observation masking: zero non-actor hidden slots so a
         # model trained here matches the public-observation evaluator (task #72).
         result["player_tokens"] = _mask_player_tokens_public(result["player_tokens"])
-    return result
+    return _apply_public_award_feature_contract(
+        result, _PUBLIC_AWARD_FEATURE_CONTRACT
+    )
 
 
 def _forward_legal_np_for_batch(

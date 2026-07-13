@@ -64,8 +64,11 @@ The software path for this transition is now explicit and fail-closed:
   it deterministically zero-initializes `player_encoder.0.weight[:, 12]` before
   optimizer construction, then stamps the output checkpoint and report.
 - Mixed corpora require `--allow-mixed-public-award-feature-contracts` and may
-  train only under `legacy_zero_v0`; they cannot authorize an authoritative
-  checkpoint.  Omitting both flags preserves the historical legacy function.
+  train only under the batch-level `legacy_zero_v0` bridge; their reports are
+  stamped diagnostic-only and promotion-ineligible. They cannot authorize an
+  authoritative checkpoint. An entirely corrected corpus requires an explicit
+  `authoritative_v1` request. Omitting both flags on legacy data preserves the
+  historical function exactly.
 
 The remaining operational rollout is:
 

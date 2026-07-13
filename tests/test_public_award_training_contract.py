@@ -20,10 +20,13 @@ from tools.build_memmap_corpus import (
     _load_public_award_source_provenance,
 )
 from tools.train_bc import (
+    ENTITY_BATCH_KEYS,
     _canonical_json_sha256,
     _configure_public_award_feature_training,
+    _entity_batch,
     _write_entity_checkpoint,
 )
+import tools.train_bc as train_bc
 
 
 def _policy() -> EntityGraphPolicy:
@@ -161,6 +164,15 @@ def test_authoritative_training_rejects_legacy_or_mixed_corpus() -> None:
         )
 
 
+def test_corrected_corpus_requires_explicit_authoritative_request() -> None:
+    with pytest.raises(SystemExit, match="requires explicit"):
+        _configure_public_award_feature_training(
+            _policy(),
+            _data(PUBLIC_AWARD_FEATURE_CONTRACT_AUTHORITATIVE),
+            _args(PUBLIC_AWARD_FEATURE_CONTRACT_LEGACY_ZERO),
+        )
+
+
 def test_mixed_corpus_requires_explicit_legacy_acknowledgement() -> None:
     policy = _policy()
     with pytest.raises(SystemExit, match="--allow-mixed"):
@@ -175,6 +187,27 @@ def test_mixed_corpus_requires_explicit_legacy_acknowledgement() -> None:
         _args(PUBLIC_AWARD_FEATURE_CONTRACT_LEGACY_ZERO, allow_mixed=True),
     )
     assert report["effective_contract"] == PUBLIC_AWARD_FEATURE_CONTRACT_LEGACY_ZERO
+    assert report["diagnostic_only"] is True
+    assert report["promotion_eligible"] is False
+
+
+def test_legacy_training_batch_bridge_zeroes_corrected_slot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        train_bc,
+        "_PUBLIC_AWARD_FEATURE_CONTRACT",
+        PUBLIC_AWARD_FEATURE_CONTRACT_LEGACY_ZERO,
+    )
+    data = {
+        key: np.zeros((1, 1), dtype=np.float32) for key in ENTITY_BATCH_KEYS
+    }
+    data["player_tokens"] = np.zeros((1, 4, 31), dtype=np.float32)
+    data["player_tokens"][..., PLAYER_LONGEST_ROAD_SLOT] = 1.0
+
+    batch = _entity_batch(data, np.asarray([0], dtype=np.int64))
+
+    assert np.count_nonzero(batch["player_tokens"][..., PLAYER_LONGEST_ROAD_SLOT]) == 0
 
 
 def test_no_flag_legacy_path_is_weight_and_contract_noop() -> None:
