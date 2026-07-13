@@ -10,9 +10,12 @@ and every state at the completed step.
 from __future__ import annotations
 
 from contextlib import contextmanager
+import json
+import math
 from pathlib import Path
 import subprocess
 import sys
+import time
 from typing import Any, Callable, Iterator, Mapping, Sequence
 
 
@@ -148,6 +151,151 @@ def verify_manifest(manifest_path: Path) -> dict[str, Any]:
     return _call("verify_manifest", manifest_path)
 
 
+def _profile_metric(profile: Mapping[str, Any], *keys: str) -> float:
+    value: Any = profile
+    for key in keys:
+        value = value.get(key) if isinstance(value, Mapping) else None
+    if (
+        not isinstance(value, (int, float))
+        or isinstance(value, bool)
+        or not math.isfinite(float(value))
+        or float(value) <= 0.0
+    ):
+        raise CompletionError(f"invalid inference metric {'.'.join(keys)}={value!r}")
+    return float(value)
+
+
+def _load_profile(
+    path: Path, *, checkpoint: Mapping[str, Any]
+) -> tuple[dict[str, Any], dict[str, str]]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise CompletionError(
+            f"cannot load inference profile {path}: {error}"
+        ) from error
+    if not isinstance(value, dict):
+        raise CompletionError("inference profile must be a JSON object")
+    try:
+        observed_checkpoint = Path(str(value.get("checkpoint", ""))).resolve(
+            strict=True
+        )
+        expected_checkpoint = Path(str(checkpoint["path"])).resolve(strict=True)
+    except (OSError, KeyError) as error:
+        raise CompletionError(
+            f"inference profile checkpoint is unavailable: {error}"
+        ) from error
+    if observed_checkpoint != expected_checkpoint or arm._file_ref(  # noqa: SLF001
+        observed_checkpoint
+    ) != dict(checkpoint):
+        raise CompletionError(
+            "inference profile does not bind the exact checkpoint bytes"
+        )
+    parity = value.get("exact_vs_attributed_output_parity")
+    if not (
+        isinstance(parity, Mapping)
+        and parity
+        and all(
+            isinstance(row, Mapping)
+            and row.get("max_abs") == 0.0
+            and row.get("mean_abs") == 0.0
+            for row in parity.values()
+        )
+    ):
+        raise CompletionError("inference profile lacks bit-exact attributed parity")
+    return value, arm._file_ref(path)  # noqa: SLF001
+
+
+def _inference_cost_telemetry(
+    verified: Mapping[str, Any], *, candidate: Mapping[str, Any]
+) -> dict[str, Any]:
+    manifest = verified["manifest"]
+    contract = manifest.get("inference_cost_contract")
+    if (
+        not isinstance(contract, Mapping)
+        or contract.get("required_before_completion") is not True
+    ):
+        raise CompletionError(
+            "combined sibling lacks mandatory inference-cost contract"
+        )
+    root = Path(verified["output_root"])
+    reference_checkpoint = contract["reference_checkpoint"]
+    reference, reference_ref = _load_profile(
+        root / "reference-inference-profile.json", checkpoint=reference_checkpoint
+    )
+    treatment, treatment_ref = _load_profile(
+        root / "candidate-inference-profile.json", checkpoint=candidate
+    )
+    expected_shape = contract["matched_shape"]
+    exact_environment = {
+        "device": reference.get("device"),
+        "strict_fp32": {
+            "matmul_precision": "highest",
+            "cuda_allow_tf32": False,
+            "cudnn_allow_tf32": False,
+            "autocast": False,
+        },
+        "shape": {
+            "batch_size": expected_shape["batch_size"],
+            "legal_width": expected_shape["legal_width"],
+            "event_width": expected_shape["event_width"],
+            "valid_players": expected_shape["valid_players"],
+        },
+        "warmup": expected_shape["warmup"],
+        "iterations": expected_shape["iterations"],
+        "return_q": expected_shape["return_q"],
+    }
+    for label, profile in (("reference", reference), ("candidate", treatment)):
+        observed = {
+            "device": profile.get("device"),
+            "strict_fp32": profile.get("strict_fp32"),
+            "shape": {
+                key: profile.get("shape", {}).get(key)
+                for key in ("batch_size", "legal_width", "event_width", "valid_players")
+            },
+            "warmup": profile.get("warmup"),
+            "iterations": profile.get("iterations"),
+            "return_q": profile.get("return_q"),
+        }
+        if observed != exact_environment:
+            raise CompletionError(
+                f"{label} inference profile environment drift: {observed}"
+            )
+    metric_paths = {
+        "cuda_mean_ms": ("exact_window", "cuda_ms", "mean"),
+        "cuda_median_ms": ("exact_window", "cuda_ms", "median"),
+        "cuda_p95_ms": ("exact_window", "cuda_ms", "p95"),
+        "wall_mean_ms": ("exact_window", "wall_ms", "mean"),
+        "wall_median_ms": ("exact_window", "wall_ms", "median"),
+        "wall_p95_ms": ("exact_window", "wall_ms", "p95"),
+    }
+    reference_metrics = {
+        name: _profile_metric(reference, *path) for name, path in metric_paths.items()
+    }
+    candidate_metrics = {
+        name: _profile_metric(treatment, *path) for name, path in metric_paths.items()
+    }
+    ratios = {
+        name.removesuffix("_ms") + "_slowdown": candidate_metrics[name] / value
+        for name, value in reference_metrics.items()
+    }
+    telemetry = {
+        "schema_version": "a1-architecture-inference-cost-telemetry-v1",
+        "contract": dict(contract),
+        "reference_checkpoint": dict(reference_checkpoint),
+        "candidate_checkpoint": dict(candidate),
+        "reference_profile": reference_ref,
+        "candidate_profile": treatment_ref,
+        "matched_environment": exact_environment,
+        "reference_metrics": reference_metrics,
+        "candidate_metrics": candidate_metrics,
+        "candidate_reference_ratios": ratios,
+        "selection_cost_observed": True,
+    }
+    telemetry["telemetry_sha256"] = arm._digest(telemetry)  # noqa: SLF001
+    return telemetry
+
+
 def build_completion(
     manifest_path: Path,
     *,
@@ -155,13 +303,20 @@ def build_completion(
     unit_state: Mapping[str, Any],
     created_at_unix_ns: int,
 ) -> dict[str, Any]:
-    return _call(
+    payload = _call(
         "build_completion",
         manifest_path,
         expected_checkpoint_sha256=expected_checkpoint_sha256,
         unit_state=unit_state,
         created_at_unix_ns=created_at_unix_ns,
     )
+    payload.pop("receipt_sha256", None)
+    verified = verify_manifest(manifest_path)
+    payload["inference_cost_telemetry"] = _inference_cost_telemetry(
+        verified, candidate=payload["checkpoint"]
+    )
+    payload["receipt_sha256"] = arm._digest(payload)  # noqa: SLF001
+    return payload
 
 
 def finalize(
@@ -170,16 +325,55 @@ def finalize(
     expected_checkpoint_sha256: str,
     state_reader: Callable[..., str] = subprocess.check_output,
 ) -> dict[str, Any]:
-    return _call(
-        "finalize",
+    verified = verify_manifest(manifest_path)
+    unit, _ = _call("_verify_submission", verified)
+    state = _call("_read_live_unit_state", unit, state_reader=state_reader)
+    payload = build_completion(
         manifest_path,
         expected_checkpoint_sha256=expected_checkpoint_sha256,
-        state_reader=state_reader,
+        unit_state=state,
+        created_at_unix_ns=time.time_ns(),
     )
+    path = Path(verified["output_root"]) / COMPLETION_NAME
+    try:
+        arm.executor_base._write_exclusive(path, payload)  # noqa: SLF001
+    except FileExistsError as error:
+        raise CompletionError(f"combined completion already exists: {path}") from error
+    return payload
 
 
 def verify_completion(path: Path) -> dict[str, Any]:
-    return _call("verify_completion", path)
+    path = path.expanduser().resolve(strict=True)
+    try:
+        receipt = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise CompletionError(f"cannot load combined completion: {error}") from error
+    if not isinstance(receipt, dict):
+        raise CompletionError("combined completion is not a JSON object")
+    unhashed = dict(receipt)
+    stated = unhashed.pop("receipt_sha256", None)
+    if not (
+        receipt.get("schema_version") == SCHEMA
+        and receipt.get("status") == STATUS
+        and receipt.get("diagnostic_only") is True
+        and receipt.get("promotion_eligible") is False
+        and stated == arm._digest(unhashed)  # noqa: SLF001
+        and receipt.get("completion_finalizer") == arm._file_ref(Path(__file__))  # noqa: SLF001
+    ):
+        raise CompletionError(
+            "combined completion schema/status/finalizer/digest drift"
+        )
+    replay = build_completion(
+        Path(receipt["manifest"]["path"]),
+        expected_checkpoint_sha256=str(receipt["expected_checkpoint_sha256"]),
+        unit_state=receipt["unit_state"],
+        created_at_unix_ns=int(receipt["created_at_unix_ns"]),
+    )
+    if replay != receipt:
+        raise CompletionError("combined completion replay differs from receipt")
+    if path != Path(replay["checkpoint"]["path"]).parent / COMPLETION_NAME:
+        raise CompletionError("combined completion escaped output root")
+    return receipt
 
 
 def _verify_topology_target_gather_delta(

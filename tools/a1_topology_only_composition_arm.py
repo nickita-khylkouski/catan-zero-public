@@ -94,6 +94,7 @@ TREATMENT_GEOMETRY_NAME = "treatment_topology_commissioning"
 TREATMENT_INTEGRATED_LR_CONTRACT = {
     "trunk_integrated_lr_step_equivalents": TRUNK_LR_MULT,
 }
+INFERENCE_COST_CONTRACT: dict[str, Any] = {}
 
 SOURCE_FILES = tuple(
     dict.fromkeys(
@@ -774,6 +775,10 @@ def prepare(args: argparse.Namespace) -> tuple[dict[str, Any], Path]:
             "comparison": "same-key exact-parent behavior screen after completion",
             "promotion_from_this_diagnostic": False,
         },
+        "inference_cost_contract": {
+            **INFERENCE_COST_CONTRACT,
+            "reference_checkpoint": parent["checkpoint"],
+        },
         "executor_compatibility": {
             "receipt_schema": RECEIPT_SCHEMA,
             "idle_topology": "exactly_8_visible_B200s",
@@ -1023,6 +1028,11 @@ def verify(
             "primary_opponent": parent["checkpoint"],
             "comparison": "same-key exact-parent behavior screen after completion",
             "promotion_from_this_diagnostic": False,
+        }
+        and payload.get("inference_cost_contract")
+        == {
+            **INFERENCE_COST_CONTRACT,
+            "reference_checkpoint": parent["checkpoint"],
         }
     ):
         raise TopologyCompositionError("topology causal/evaluation contract drift")

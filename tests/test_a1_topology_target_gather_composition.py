@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -189,3 +190,73 @@ def test_completion_requires_exact_three_optimizer_groups(tmp_path: Path) -> Non
     torch.save(payload, path)
     with pytest.raises(completion.CompletionError, match="completed dose"):
         completion._verify_optimizer_groups(path, optimizer_steps=128)
+
+
+def _inference_profile(checkpoint: Path, *, milliseconds: float) -> dict:
+    summary = {
+        "mean": milliseconds,
+        "median": milliseconds,
+        "p95": milliseconds * 1.1,
+        "min": milliseconds * 0.9,
+    }
+    return {
+        "device": "NVIDIA B200",
+        "checkpoint": str(checkpoint),
+        "strict_fp32": {
+            "matmul_precision": "highest",
+            "cuda_allow_tf32": False,
+            "cudnn_allow_tf32": False,
+            "autocast": False,
+        },
+        "shape": {
+            "batch_size": 48,
+            "legal_width": 54,
+            "event_width": 0,
+            "valid_players": 2,
+        },
+        "warmup": 20,
+        "iterations": 100,
+        "return_q": True,
+        "exact_window": {"cuda_ms": summary, "wall_ms": summary},
+        "exact_vs_attributed_output_parity": {
+            "logits": {"max_abs": 0.0, "mean_abs": 0.0},
+            "value": {"max_abs": 0.0, "mean_abs": 0.0},
+        },
+    }
+
+
+def test_inference_cost_telemetry_is_mandatory_and_matched(tmp_path: Path) -> None:
+    reference = tmp_path / "parent.pt"
+    candidate = tmp_path / "candidate.pt"
+    reference.write_bytes(b"parent")
+    candidate.write_bytes(b"candidate")
+    reference_ref = arm._file_ref(reference)
+    candidate_ref = arm._file_ref(candidate)
+    (tmp_path / "reference-inference-profile.json").write_text(
+        json.dumps(_inference_profile(reference, milliseconds=2.0)),
+        encoding="utf-8",
+    )
+    (tmp_path / "candidate-inference-profile.json").write_text(
+        json.dumps(_inference_profile(candidate, milliseconds=3.0)),
+        encoding="utf-8",
+    )
+    verified = {
+        "output_root": tmp_path,
+        "manifest": {
+            "inference_cost_contract": {
+                **arm.INFERENCE_COST_CONTRACT,
+                "reference_checkpoint": reference_ref,
+            }
+        },
+    }
+    telemetry = completion._inference_cost_telemetry(verified, candidate=candidate_ref)
+    assert telemetry["candidate_reference_ratios"]["cuda_mean_slowdown"] == 1.5
+    assert telemetry["selection_cost_observed"] is True
+
+    bad = _inference_profile(candidate, milliseconds=3.0)
+    bad["shape"]["batch_size"] = 32
+    (tmp_path / "candidate-inference-profile.json").write_text(
+        json.dumps(bad), encoding="utf-8"
+    )
+    with pytest.raises(completion.CompletionError, match="environment drift"):
+        completion._inference_cost_telemetry(verified, candidate=candidate_ref)

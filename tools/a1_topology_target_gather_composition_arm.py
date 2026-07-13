@@ -75,9 +75,42 @@ TREATMENT_INTEGRATED_LR_CONTRACT = {
     "trunk_integrated_lr_step_equivalents": TRUNK_LR_MULT,
     "action_integrated_lr_step_equivalents": ACTION_MODULE_LR_MULT,
 }
+INFERENCE_COST_CONTRACT = {
+    "schema_version": "a1-architecture-inference-cost-contract-v1",
+    "required_before_completion": True,
+    "benchmark_tool": "tools/bench_entity_graph_stages.py",
+    "measurement_boundary": "forward_legal_np_plus_eval_server_d2h",
+    "strict_fp32": True,
+    "matched_shape": {
+        "batch_size": 48,
+        "legal_width": 54,
+        "event_width": 0,
+        "valid_players": 2,
+        "return_q": True,
+        "warmup": 20,
+        "iterations": 100,
+    },
+    "required_metrics": [
+        "exact_window.cuda_ms.mean",
+        "exact_window.cuda_ms.median",
+        "exact_window.cuda_ms.p95",
+        "exact_window.wall_ms.mean",
+        "exact_window.wall_ms.median",
+        "exact_window.wall_ms.p95",
+    ],
+    "selection_semantics": (
+        "strength must be adjudicated with observed candidate/reference inference "
+        "cost; architecture selection may not ignore a latency regression"
+    ),
+}
 SOURCE_FILES = tuple(
     dict.fromkeys(
-        (*base.SOURCE_FILES, EXECUTOR_RELATIVE_PATH, COMPLETION_RELATIVE_PATH)
+        (
+            *base.SOURCE_FILES,
+            EXECUTOR_RELATIVE_PATH,
+            COMPLETION_RELATIVE_PATH,
+            "tools/bench_entity_graph_stages.py",
+        )
     )
 )
 
@@ -114,6 +147,7 @@ _CONFIG = {
     "EFFECTIVE_TRAINABLE_OBJECTIVE": EFFECTIVE_TRAINABLE_OBJECTIVE,
     "TREATMENT_GEOMETRY_NAME": TREATMENT_GEOMETRY_NAME,
     "TREATMENT_INTEGRATED_LR_CONTRACT": TREATMENT_INTEGRATED_LR_CONTRACT,
+    "INFERENCE_COST_CONTRACT": INFERENCE_COST_CONTRACT,
 }
 
 
