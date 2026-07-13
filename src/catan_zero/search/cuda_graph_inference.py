@@ -19,7 +19,11 @@ from typing import Any
 
 import numpy as np
 
-from catan_zero.rl.entity_token_policy import _assert_entity_batch_shapes
+from catan_zero.rl.entity_token_policy import (
+    PUBLIC_AWARD_FEATURE_CONTRACT_LEGACY_ZERO,
+    _apply_public_award_feature_contract,
+    _assert_entity_batch_shapes,
+)
 
 
 _STATE_INPUT_KEYS = (
@@ -159,6 +163,20 @@ class CudaGraphInferenceRunner:
         """Score a NumPy batch, returning tensors with unpadded output shapes."""
         import torch
 
+        # This runner bypasses EntityGraphPolicy.forward_legal_np and calls the
+        # model's split encode/score methods directly, so it must apply the same
+        # checkpoint-owned legacy slot-12 bridge itself.  Otherwise enabling
+        # CUDA Graphs would silently change old checkpoint outputs.
+        entity_batch = _apply_public_award_feature_contract(
+            entity_batch,
+            str(
+                getattr(
+                    self.policy,
+                    "public_award_feature_contract",
+                    PUBLIC_AWARD_FEATURE_CONTRACT_LEGACY_ZERO,
+                )
+            ),
+        )
         # Preserve EntityGraphPolicy.forward_legal_np's public input contract on
         # every path, including disabled and capture-failure eager fallbacks.
         # Validate before cropping so event masks/tokens are checked against the

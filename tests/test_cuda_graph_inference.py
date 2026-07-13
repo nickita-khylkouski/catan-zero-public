@@ -19,7 +19,12 @@ from catan_zero.rl.entity_token_features import (  # noqa: E402
     PLAYER_FEATURE_SIZE,
     VERTEX_FEATURE_SIZE,
 )
-from catan_zero.rl.entity_token_policy import EntityGraphConfig, EntityGraphNet  # noqa: E402
+from catan_zero.rl.entity_token_policy import (  # noqa: E402
+    PUBLIC_AWARD_FEATURE_CONTRACT_AUTHORITATIVE,
+    PUBLIC_AWARD_FEATURE_CONTRACT_LEGACY_ZERO,
+    EntityGraphConfig,
+    EntityGraphNet,
+)
 from catan_zero.search.cuda_graph_inference import (  # noqa: E402
     CudaGraphInferenceConfig,
     CudaGraphInferenceRunner,
@@ -43,6 +48,7 @@ def _policy(**overrides):
         config=config,
         model=EntityGraphNet(config).eval(),
         device=torch.device("cpu"),
+        public_award_feature_contract=PUBLIC_AWARD_FEATURE_CONTRACT_AUTHORITATIVE,
     )
 
 
@@ -152,6 +158,31 @@ def test_enabled_cpu_path_falls_back_eager_and_trims_outputs():
         )
     for key in outputs:
         torch.testing.assert_close(outputs[key], expected[key], rtol=0.0, atol=0.0)
+
+
+def test_legacy_award_bridge_also_applies_on_cuda_runner_bypass() -> None:
+    policy = _policy()
+    policy.public_award_feature_contract = PUBLIC_AWARD_FEATURE_CONTRACT_LEGACY_ZERO
+    entity, legal_ids, context = _batch()
+    entity["player_tokens"][..., 12] = 1.0
+    original = entity["player_tokens"].copy()
+    runner = CudaGraphInferenceRunner(policy, CudaGraphInferenceConfig(enabled=False))
+
+    actual = runner.forward_legal_np(entity, legal_ids, context)
+
+    manual = dict(entity)
+    manual_players = entity["player_tokens"].copy()
+    manual_players[..., 12] = 0.0
+    manual["player_tokens"] = manual_players
+    policy.public_award_feature_contract = (
+        PUBLIC_AWARD_FEATURE_CONTRACT_AUTHORITATIVE
+    )
+    expected = CudaGraphInferenceRunner(
+        policy, CudaGraphInferenceConfig(enabled=False)
+    ).forward_legal_np(manual, legal_ids, context)
+    for key in actual:
+        torch.testing.assert_close(actual[key], expected[key], rtol=0.0, atol=0.0)
+    np.testing.assert_array_equal(entity["player_tokens"], original)
 
 
 def test_event_token_limit_zero_rejects_live_events_before_fallback():
