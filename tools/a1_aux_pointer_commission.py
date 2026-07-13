@@ -143,6 +143,7 @@ def _derive(
             ("--lr-warmup-steps", "16"),
             ("--policy-loss-weight", "0"),
             ("--value-loss-weight", "0"),
+            ("--value-lr-mult", "1"),
             ("--aux-subgoal-loss-weight", "1"),
             ("--freeze-modules", FREEZE_GROUPS),
             ("--require-only-trainable-prefixes", TRAINABLE_PREFIXES),
