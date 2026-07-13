@@ -97,15 +97,19 @@ These defaults apply to every arm unless the arm names an explicit delta:
   forced value weight 1.0 initially. The composite sampler already samples
   component → uniform game → uniform row; another inverse-length loss
   factor would double-correct game length and over-weight short games;
-- optimizer: Adam, bf16, 100-step warmup, flat LR for a short dose;
+- optimizer: Adam, FP32, 100-step warmup, flat LR for the matched baseline.
+  BF16 remains a separately measured systems treatment; changing precision in
+  a learner arm would violate the one-axis contract;
 - LR: flat `3e-5` for P1. The f7/gen3 topology has no action-local gather or
   cross-attention parameters, so an action-module `2x` multiplier is a fake
   no-op and is rejected. P2 localizes whether shared-trunk updates are the
   source of forgetting before adding any discriminative LR;
 - primary value objective: scalar MSE until the stability recipe is selected;
 - search-value blend: lambda 1.0 until the stability recipe is selected;
-- update dose: first sentinel at 4,194,304 global samples, then 8,388,608 only
-  for Pareto-surviving recipes;
+- update dose: first adjudicate the already-written 524,288- and
+  4,194,304-sample checkpoints on identical paired seeds. Select the smallest
+  dose within two percentage points of the best behavior result; do not infer
+  dose from offline loss or automatically escalate to 8,388,608 samples;
 - validation: a deterministic, game-disjoint 262,144-row sentinel for each
   short arm; the external playing panel is binding, so repeatedly scoring the
   full multi-million-row holdout is wasted latency;
@@ -246,11 +250,13 @@ and teacher-gap metrics jointly worsen, or non-finite/clipping telemetry trips.
 Do not select by validation loss alone: the current LR curve already showed it
 does not predict external playing strength.
 
-Before external evaluation, calibrate each candidate checkpoint internally at
-candidate `c_scale ∈ {0.03, 0.10}` against gen3 at `.03` on common random
-numbers. The selected checkpoint+operator pair is the candidate identity used
-for the external panel; never silently evaluate every new checkpoint under a
-shared `.03` assumption.
+The primary learner comparison fixes both candidate and exact f7 to the same
+deployed `c_scale=0.10` operator on common random numbers. Do not tune a
+candidate-specific `c_scale` against old gen3: that changes checkpoint ancestry
+and search behavior together and recreates the confound that invalidated the
+historical 52--55% labels. A predeclared same-checkpoint `.03`/`.10` operator
+crossover may be run as a separate search experiment, but it cannot select or
+relabel a learner arm.
 
 ## Expected compute order
 

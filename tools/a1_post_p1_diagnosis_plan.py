@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 
-SCHEMA = "a1-post-p1-optimization-architecture-plan-v3"
+SCHEMA = "a1-post-p1-optimization-architecture-plan-v4"
 SHORT_SAMPLE_DOSE = 524_288
 FULL_SAMPLE_DOSE = 4_194_304
 # Backwards-compatible name for code that refers to the historical full dose.
@@ -302,9 +302,19 @@ def build_plan(
         arm["recipe_sha256"] = _digest({"fixed": fixed, "delta": arm["recipe_delta"]})
     evaluation = {
         "checkpoint_identity": (
-            "calibrate candidate c_scale in {0.03,0.10}; bind the selected "
-            "checkpoint-plus-operator identity before panels"
+            "compare candidate and exact f7 with the same deployed c_scale=0.10 "
+            "operator; candidate-specific operator tuning is a separate crossover "
+            "experiment and cannot select or relabel a learner arm"
         ),
+        "matched_search_operator": {
+            "candidate_c_scale": 0.10,
+            "baseline_c_scale": 0.10,
+            "selection_tuning_allowed": False,
+            "reason": (
+                "changing checkpoint ancestry and c_scale in one comparison repeats "
+                "the historical gen3/.03 adjudication confound"
+            ),
+        },
         "internal": {
             "pairs": 300,
             "games": 600,
