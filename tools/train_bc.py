@@ -16477,7 +16477,9 @@ def split_train_validation_indices(
         ):
             local_indices = np.arange(start, stop, dtype=np.int64)
             local_seeds = seeds[start:stop]
-            unique_local = np.unique(local_seeds)
+            unique_local, unique_local_counts = np.unique(
+                local_seeds, return_counts=True
+            )
             if unique_local.size <= 1:
                 raise SystemExit(
                     "promotion-eligible composite validation requires at least two "
@@ -16488,12 +16490,18 @@ def split_train_validation_indices(
             target_rows = max(1, int(round(len(local_indices) * fraction)))
             selected: list[int] = []
             selected_rows = 0
-            counts = {
-                int(seed): int(np.sum(local_seeds == seed)) for seed in shuffled
-            }
-            for seed in shuffled:
+            # ``unique_local`` is sorted, so one search maps the seeded
+            # permutation back to the counts computed by the same O(rows)
+            # pass.  The old dict comprehension rescanned every corpus row for
+            # every game (O(games * rows)); on a production composite that made
+            # validation preflight dominate or appear stalled before the first
+            # optimizer step.
+            shuffled_counts = unique_local_counts[
+                np.searchsorted(unique_local, shuffled)
+            ]
+            for seed, game_rows in zip(shuffled, shuffled_counts, strict=True):
                 selected.append(int(seed))
-                selected_rows += counts[int(seed)]
+                selected_rows += int(game_rows)
                 if selected_rows >= target_rows:
                     break
             validation_mask = np.isin(
@@ -16534,17 +16542,19 @@ def split_train_validation_indices(
         train = np.sort(shuffled[validation_count:])
     else:
         rng = np.random.default_rng(validation_seed)
+        unique_seeds, unique_seed_counts = np.unique(seeds, return_counts=True)
         shuffled_seeds = rng.permutation(unique_seeds)
         target_rows = max(1, int(round(n * fraction)))
         selected: list[int] = []
         selected_rows = 0
-        seed_counts = {
-            int(seed): int(np.sum(seeds == seed))
-            for seed in shuffled_seeds
-        }
-        for seed in shuffled_seeds:
+        shuffled_counts = unique_seed_counts[
+            np.searchsorted(unique_seeds, shuffled_seeds)
+        ]
+        for seed, game_rows in zip(
+            shuffled_seeds, shuffled_counts, strict=True
+        ):
             selected.append(int(seed))
-            selected_rows += seed_counts[int(seed)]
+            selected_rows += int(game_rows)
             if selected_rows >= target_rows:
                 break
         validation_mask = np.isin(seeds, np.asarray(selected, dtype=np.int64))
