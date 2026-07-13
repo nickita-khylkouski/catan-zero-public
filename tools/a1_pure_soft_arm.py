@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
-"""Seal and run the one-axis pure-search-target TEMP learner diagnostic.
+"""Decode the historical full-dose pure-search-target diagnostic.
 
 The source is a verified production TEMP replication manifest.  This arm keeps
 its exact f7 initializer, composite descriptor, per-component temperatures,
 4.19M-row dose, fresh optimizer, RNG, masking, validation, and every auxiliary
 objective.  The sole optimization delta is ``soft_target_weight: 0.9 -> 1.0``;
 therefore the played-action hard CE contributes zero policy mass.
+
+The matched-play dose adjudication subsequently selected 524,288 rows / 128
+steps.  This historical launcher is therefore preparation-only and refuses GPU
+execution; otherwise a nominal one-axis target-semantics test would silently
+reintroduce the rejected 4.19M/1024-step dose.
 """
 
 from __future__ import annotations
@@ -25,7 +30,11 @@ if str(REPO_ROOT) not in sys.path:
 from tools import a1_production_temperature_replication as temperature  # noqa: E402
 
 
-SCHEMA = "a1-pure-soft-calibrated-arm-v1"
+SCHEMA = "a1-pure-soft-calibrated-arm-v2-obsolete-dose"
+OBSOLETE_REASON = (
+    "legacy pure-soft arm is bound to 4,194,304 rows / 1024 steps; derive a new "
+    "arm from the selected 524,288-row TEMP manifest"
+)
 CLAIM_SCHEMA = "a1-pure-soft-arm-execution-claim-v1"
 SUBMISSION_SCHEMA = "a1-pure-soft-arm-execution-receipt-v1"
 COMPLETION_SCHEMA = "a1-pure-soft-arm-completion-v1"
@@ -56,6 +65,7 @@ MANIFEST_FIELDS = {
     "diagnostic_only",
     "promotion_eligible",
     "launch_authorized",
+    "obsolete_reason",
     "source_temperature_manifest",
     "source_temperature_manifest_sha256",
     "f7_parent",
@@ -214,7 +224,8 @@ def prepare(
         "schema_version": SCHEMA,
         "diagnostic_only": True,
         "promotion_eligible": False,
-        "launch_authorized": True,
+        "launch_authorized": False,
+        "obsolete_reason": OBSOLETE_REASON,
         "source_temperature_manifest": source["manifest_ref"],
         "source_temperature_manifest_sha256": source_manifest["manifest_sha256"],
         "f7_parent": source_manifest["f7_parent"],
@@ -276,7 +287,7 @@ def verify(manifest_path: Path, *, require_fresh_output: bool = True) -> dict[st
         manifest.get("schema_version") == SCHEMA
         and manifest.get("diagnostic_only") is True
         and manifest.get("promotion_eligible") is False
-        and manifest.get("launch_authorized") is True
+        and manifest.get("launch_authorized") is False
     ):
         _fail("pure-soft authorization boundary drift")
     source_ref = manifest.get("source_temperature_manifest")
@@ -386,6 +397,9 @@ def execute(
     if temperature.base.SAFE_UNIT.fullmatch(unit) is None:
         _fail("systemd unit name is invalid")
     verified = verify(manifest_path)
+    _fail(OBSOLETE_REASON)
+    # Unreachable historical submission code intentionally remains below only
+    # until old v1 receipts are migrated to a dedicated decoder.
     conflicts = idle_probe()
     if conflicts:
         _fail(f"B200 compute is not idle: {conflicts}")

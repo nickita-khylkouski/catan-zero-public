@@ -145,6 +145,8 @@ def test_prepare_seals_matched_action_only_architecture_ab_without_launch(
     manifest = json.loads((tmp_path / "out/experiment.manifest.json").read_text())
     assert manifest["diagnostic_only"] is True
     assert manifest["promotion_eligible"] is False
+    assert manifest["launch_authorized"] is False
+    assert manifest["obsolete_reason"] == probe.OBSOLETE_REASON
     assert manifest["event_path"]["included"] is False
     assert manifest["only_declared_arm_delta"] == "zero-init action_target_gather"
     assert manifest["topology"] == {
@@ -259,3 +261,8 @@ def test_relational_edge_head_switch_preserves_historical_default():
         ]
     )
     assert parsed.relational_edge_policy_head is False
+
+
+def test_gpu_launch_is_fail_closed_even_when_go_is_explicit(tmp_path) -> None:
+    with pytest.raises(SystemExit, match="obsolete confounded architecture"):
+        probe.main([*_argv(tmp_path), "--go"])

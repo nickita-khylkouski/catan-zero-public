@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Seal, but never implicitly launch, the calibrated belief-resource arm.
+"""Decode, but never launch, the historical full-dose belief-resource arm.
 
 The arm is a one-axis diagnostic derived from a verified production TEMP
 replication manifest.  It changes only the initializer (through a reviewed,
@@ -28,9 +28,13 @@ from tools import a1_function_preserving_upgrade as upgrade  # noqa: E402
 from tools import a1_production_temperature_replication as temperature  # noqa: E402
 
 
-SCHEMA = "a1-belief-resource-calibrated-arm-v1"
+SCHEMA = "a1-belief-resource-calibrated-arm-v2-obsolete-dose"
 EXECUTOR_RELATIVE_PATH = "tools/a1_belief_resource_arm_execute.py"
 LOSS_WEIGHT = 0.01
+OBSOLETE_REASON = (
+    "legacy belief-resource arm is bound to 4,194,304 rows / 1024 steps; "
+    "commission the fresh head from selected-dose TEMP+geometry evidence before execution"
+)
 UPGRADE_EVIDENCE_FIELDS = (
     "module",
     "source",
@@ -74,6 +78,7 @@ MANIFEST_FIELDS = {
     "diagnostic_only",
     "promotion_eligible",
     "launch_authorized",
+    "obsolete_reason",
     "diagnostic_execution_authorized",
     "launch_interface_present",
     "diagnostic_executor",
@@ -324,8 +329,9 @@ def prepare(
         "diagnostic_only": True,
         "promotion_eligible": False,
         "launch_authorized": False,
-        "diagnostic_execution_authorized": True,
-        "launch_interface_present": f"{EXECUTOR_RELATIVE_PATH} --go",
+        "obsolete_reason": OBSOLETE_REASON,
+        "diagnostic_execution_authorized": False,
+        "launch_interface_present": "none: historical full-dose decoder only",
         "diagnostic_executor": executor,
         "source_temperature_manifest": source["manifest_ref"],
         "source_temperature_manifest_sha256": source_manifest["manifest_sha256"],
@@ -393,9 +399,10 @@ def verify(manifest_path: Path, *, require_fresh_output: bool = True) -> dict[st
         and manifest.get("diagnostic_only") is True
         and manifest.get("promotion_eligible") is False
         and manifest.get("launch_authorized") is False
-        and manifest.get("diagnostic_execution_authorized") is True
+        and manifest.get("obsolete_reason") == OBSOLETE_REASON
+        and manifest.get("diagnostic_execution_authorized") is False
         and manifest.get("launch_interface_present")
-        == f"{EXECUTOR_RELATIVE_PATH} --go"
+        == "none: historical full-dose decoder only"
     ):
         _fail("belief manifest authorization boundary drift")
     source_ref = manifest.get("source_temperature_manifest")

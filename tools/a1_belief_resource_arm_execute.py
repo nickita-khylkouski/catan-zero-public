@@ -39,6 +39,9 @@ def execute(
         verified = arm.verify(manifest_path)
     except arm.BeliefArmError as error:
         raise ExecutionError(str(error)) from error
+    raise ExecutionError(arm.OBSOLETE_REASON)
+    # Historical submission implementation remains below as a receipt decoder
+    # reference only. It is unreachable until a selected-dose arm is designed.
     conflicts = idle_probe()
     if conflicts:
         raise ExecutionError(f"B200 compute is not idle: {conflicts}")

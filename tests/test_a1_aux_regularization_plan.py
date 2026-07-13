@@ -4,7 +4,12 @@ import math
 
 import pytest
 
-from tools.a1_aux_regularization_plan import AUX_FIELDS, SAMPLE_DOSE, build_plan
+from tools.a1_aux_regularization_plan import (
+    AUX_FIELDS,
+    OBSOLETE_REASON,
+    SAMPLE_DOSE,
+    build_plan,
+)
 
 
 def test_probe_has_exactly_two_equal_sample_arms():
@@ -39,6 +44,7 @@ def test_probe_cannot_authorize_launch_or_promotion():
     assert plan["diagnostic_only"] is True
     assert plan["launch_authorized"] is False
     assert plan["promotion_eligible"] is False
+    assert plan["obsolete_reason"] == OBSOLETE_REASON
     assert "P1 winner" in plan["prerequisites"][0]
 
 

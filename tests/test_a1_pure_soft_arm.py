@@ -245,7 +245,7 @@ def test_completed_report_rejects_any_non_pure_soft_recipe(
     }
 
 
-def test_execute_is_explicit_one_shot_diagnostic(
+def test_legacy_full_dose_execute_is_fail_closed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     root = tmp_path / "pure-soft"
@@ -267,22 +267,18 @@ def test_execute_is_explicit_one_shot_diagnostic(
         return subprocess.CompletedProcess(command, 0, stdout="queued\n", stderr="")
 
     monkeypatch.setattr(arm, "verify", lambda _path: verified)
-    receipt = arm.execute(
-        tmp_path / "manifest.json",
-        unit="pure-soft-test",
-        runner=runner,
-        idle_probe=lambda: [],
-    )
-
-    assert len(submitted) == 1
-    assert submitted[0][:3] == ["sudo", "-n", "systemd-run"]
-    assert receipt["diagnostic_only"] is True
-    assert receipt["promotion_eligible"] is False
-    assert (root / "diagnostic-execution.claim.json").is_file()
-    assert (root / "diagnostic-execution.receipt.json").is_file()
+    with pytest.raises(arm.PureSoftArmError, match="4,194,304 rows / 1024 steps"):
+        arm.execute(
+            tmp_path / "manifest.json",
+            unit="pure-soft-test",
+            runner=runner,
+            idle_probe=lambda: [],
+        )
+    assert submitted == []
+    assert not root.exists()
 
 
-def test_execute_refuses_busy_b200s(
+def test_legacy_full_dose_refusal_precedes_idle_probe(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(
@@ -296,9 +292,17 @@ def test_execute_refuses_busy_b200s(
             "output_root": tmp_path / "pure-soft",
         },
     )
-    with pytest.raises(arm.PureSoftArmError, match="not idle"):
+    called = False
+
+    def idle_probe():
+        nonlocal called
+        called = True
+        return ["gpu0:python"]
+
+    with pytest.raises(arm.PureSoftArmError, match="4,194,304 rows / 1024 steps"):
         arm.execute(
             tmp_path / "manifest.json",
             unit="pure-soft-test",
-            idle_probe=lambda: ["gpu0:python"],
+            idle_probe=idle_probe,
         )
+    assert called is False

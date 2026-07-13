@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Emit the sealed, non-launching A1 auxiliary-regularization probe.
+"""Decode the historical full-dose A1 auxiliary-regularization probe.
 
 The probe is intentionally downstream of P1: it inherits the selected P1
 learner recipe and changes only whether the existing CAT-100 auxiliary heads
@@ -16,8 +16,12 @@ from pathlib import Path
 from typing import Any, Sequence
 
 
-SCHEMA = "a1-aux-regularization-probe-v1"
+SCHEMA = "a1-aux-regularization-probe-v2-obsolete-dose"
 SAMPLE_DOSE = 4_194_304
+OBSOLETE_REASON = (
+    "historical auxiliary plan hard-codes 4,194,304 rows; rebind control and "
+    "fresh-head commissioning to selected-dose TEMP+geometry evidence"
+)
 AUX_WEIGHT = 0.02
 AUX_FIELDS = (
     "aux_longest_road",
@@ -96,6 +100,7 @@ def build_plan(
         "diagnostic_only": True,
         "promotion_eligible": False,
         "launch_authorized": False,
+        "obsolete_reason": OBSOLETE_REASON,
         "stage": "after P1 anti-forgetting recipe selection",
         "topology": {
             "world_size": world_size,

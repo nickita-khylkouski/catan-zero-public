@@ -18,9 +18,9 @@ from tools import a1_corrected_policy_arm_execute as base  # noqa: E402
 from tools import a1_topology_gather_arm as prepare  # noqa: E402
 
 
-RECEIPT_SCHEMA = "a1-topology-gather-arm-execution-receipt-v1"
-STATUS_SCHEMA = "a1-topology-gather-arm-execution-status-v1"
-CLAIM_SCHEMA = "a1-topology-gather-arm-execution-claim-v1"
+RECEIPT_SCHEMA = "a1-topology-gather-arm-execution-receipt-v3"
+STATUS_SCHEMA = "a1-topology-gather-arm-execution-status-v3"
+CLAIM_SCHEMA = "a1-topology-gather-arm-execution-claim-v3"
 ExecutionError = base.ExecutionError
 
 
@@ -47,63 +47,30 @@ def _verify_ref(value: Any, *, label: str) -> Path:
     return base._verify_ref(value, label=label)  # noqa: SLF001
 
 
-def _source_trainer_binding(
+def _selected_geometry_trainer_binding(
     source_manifest: Path,
+    evidence: Any,
 ) -> tuple[dict[str, Any], Path, Path]:
-    """Authenticate the trainer/runtime checkout selected by the TEMP control."""
+    """Replay the full-TEMP + executed-short-dose provenance bridge."""
 
+    if not isinstance(evidence, dict):
+        raise ExecutionError("manifest lacks selected geometry evidence")
+    plan = _verify_ref(evidence.get("plan"), label="selected_geometry.plan")
+    report = _verify_ref(evidence.get("report"), label="selected_geometry.report")
     try:
-        source = json.loads(source_manifest.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as error:
-        raise ExecutionError(f"cannot decode source selected-TEMP manifest: {error}") from error
-    if not isinstance(source, dict):
-        raise ExecutionError("source selected-TEMP manifest is not an object")
-    stated = source.get("manifest_sha256")
-    unhashed = {key: value for key, value in source.items() if key != "manifest_sha256"}
-    source_command = source.get("command")
-    if not (
-        source.get("schema_version") == prepare.SOURCE_SCHEMA
-        and stated == prepare.corrected._digest(unhashed)  # noqa: SLF001
-        and isinstance(source_command, list)
-        and all(isinstance(value, str) for value in source_command)
-        and source.get("command_sha256")
-        == prepare.corrected._digest(source_command)  # noqa: SLF001
-    ):
-        raise ExecutionError("source selected-TEMP manifest/command digest drift")
-    binding = source.get("source_binding")
-    if not isinstance(binding, dict):
-        raise ExecutionError("source selected-TEMP manifest has no checkout binding")
-    try:
-        source_repo = Path(str(binding.get("repository_root", ""))).resolve(strict=True)
-    except OSError as error:
-        raise ExecutionError(f"cannot resolve source trainer checkout: {error}") from error
-    if base._git_head(source_repo) != binding.get("git_commit"):  # noqa: SLF001
-        raise ExecutionError("source trainer checkout commit differs from selected TEMP")
-    files = binding.get("files")
-    if not isinstance(files, dict) or not files:
-        raise ExecutionError("source selected-TEMP checkout binding has no files")
-    bound_paths: dict[Path, str] = {}
-    for relative, ref in files.items():
-        path = _verify_ref(ref, label=f"corrected_source.{relative}")
-        try:
-            expected = (source_repo / relative).resolve(strict=True)
-        except OSError as error:
-            raise ExecutionError(
-                f"cannot resolve corrected source path {relative}: {error}"
-            ) from error
-        if path != expected:
-            raise ExecutionError(f"corrected source path escaped checkout: {relative}")
-        bound_paths[path] = relative
-    trainers = [
-        Path(value).resolve()
-        for value in source_command
-        if Path(value).name == "train_bc.py"
-    ]
-    if len(trainers) != 1 or trainers[0] not in bound_paths:
-        raise ExecutionError(
-            "source selected-TEMP trainer is not authenticated by its checkout binding"
+        source, _ = prepare._load_source(  # noqa: SLF001
+            source_manifest, plan, report
         )
-    return source, source_repo, trainers[0]
+    except prepare.ArmError as error:
+        raise ExecutionError(f"selected geometry bridge no longer verifies: {error}") from error
+    if source.get("selected_geometry_evidence") != evidence:
+        raise ExecutionError("selected geometry evidence drift")
+    try:
+        source_repo = Path(source["selected_geometry_runtime_repo"]).resolve(strict=True)
+        trainer = Path(source["selected_geometry_trainer"]).resolve(strict=True)
+    except (KeyError, OSError) as error:
+        raise ExecutionError(f"selected geometry trainer is unavailable: {error}") from error
+    return source, source_repo, trainer
 
 
 def verify(manifest_path: Path) -> dict[str, Any]:
@@ -113,9 +80,11 @@ def verify(manifest_path: Path) -> dict[str, Any]:
         raise ExecutionError("manifest authorizes a different executor path")
 
     source_manifest = _verify_ref(
-        manifest.get("source_selected_temp_manifest"), label="source_selected_temp_manifest"
+        manifest.get("source_temperature_manifest"), label="source_temperature_manifest"
     )
-    source, trainer_repo, source_trainer = _source_trainer_binding(source_manifest)
+    source, trainer_repo, source_trainer = _selected_geometry_trainer_binding(
+        source_manifest, manifest.get("selected_geometry_evidence")
+    )
     descriptor = _verify_ref(manifest.get("descriptor"), label="descriptor")
     sentinel = _verify_ref(
         manifest.get("validation_sentinel"), label="validation_sentinel"
@@ -155,8 +124,13 @@ def verify(manifest_path: Path) -> dict[str, Any]:
     if base._git_head(preparer_repo) != source_binding.get("git_commit"):  # noqa: SLF001
         raise ExecutionError("execution checkout commit differs from topology manifest")
     files = source_binding.get("files")
-    if not isinstance(files, dict) or prepare.EXECUTOR_RELATIVE_PATH not in files:
-        raise ExecutionError("source checkout does not bind the topology executor")
+    if (
+        not isinstance(files, dict)
+        or set(files) != set(prepare.SOURCE_FILES)
+        or source_binding.get("files_sha256")
+        != prepare.corrected._digest(files)  # noqa: SLF001
+    ):
+        raise ExecutionError("topology source checkout binding is incomplete")
     for relative, ref in files.items():
         path = _verify_ref(ref, label=f"source.{relative}")
         try:
@@ -176,7 +150,7 @@ def verify(manifest_path: Path) -> dict[str, Any]:
     trainer = [Path(value).resolve() for value in command if Path(value).name == "train_bc.py"]
     if trainer != [source_trainer]:
         raise ExecutionError(
-            "topology command trainer differs from bound selected-TEMP trainer"
+            "topology command trainer differs from bound selected-geometry trainer"
         )
     exact_inputs = {
         "--data": str(descriptor),
@@ -215,15 +189,55 @@ def verify(manifest_path: Path) -> dict[str, Any]:
         raise ExecutionError("topology command lacks authenticated event crop flag")
     if "--validation-game-seed-manifest" in command:
         raise ExecutionError("command contains a second validation control")
+    commissioning = manifest.get("adapter_commissioning_contract")
     if not (
-        manifest.get("only_declared_optimization_delta") == "action_target_gather=true"
+        manifest.get("only_declared_optimization_delta")
+        == "commission function-preserving target_gather_proj only"
         and manifest.get("source_recipe_sha256")
         == prepare.corrected._digest(manifest.get("source_recipe"))  # noqa: SLF001
-        and manifest.get("source_selected_temp_manifest_sha256")
+        and manifest.get("source_temperature_manifest_sha256")
         == source.get("manifest_sha256")
         and source_init == Path(upgrade["source"]["path"])
     ):
         raise ExecutionError("topology source/recipe identity drift")
+    if not isinstance(commissioning, dict) or commissioning != {
+        "reference_checkpoint": manifest["initialization_source"],
+        "candidate_chaining": False,
+        "world_size": prepare.WORLD_SIZE,
+        "local_batch_size": prepare.LOCAL_BATCH_SIZE,
+        "global_batch_size": prepare.GLOBAL_BATCH_SIZE,
+        "optimizer_steps": prepare.OPTIMIZER_STEPS,
+        "global_row_dose": prepare.SELECTED_GLOBAL_ROW_DOSE,
+        "lr_warmup_steps": 100,
+        "integrated_lr_step_equivalents": 974.5,
+        "action_module_lr_mult": prepare.ACTION_MODULE_LR_MULT,
+        "action_integrated_lr_step_equivalents": 3898.0,
+        "freeze_modules": prepare.FREEZE_MODULES.split(","),
+        "required_trainable_prefixes": [prepare.TRAINABLE_PREFIX],
+        "mature_parameters_trainable": False,
+        "interpretation": (
+            "tests whether fixed f7 target-token features contain useful "
+            "action-local signal; it is not a joint learner candidate"
+        ),
+    }:
+        raise ExecutionError("adapter commissioning contract drift")
+    exact_commissioning_options = {
+        "--batch-size": str(prepare.LOCAL_BATCH_SIZE),
+        "--max-steps": str(prepare.OPTIMIZER_STEPS),
+        "--action-module-lr-mult": str(prepare.ACTION_MODULE_LR_MULT),
+        "--value-lr-mult": "1.0",
+        "--freeze-modules": prepare.FREEZE_MODULES,
+        "--require-only-trainable-prefixes": prepare.TRAINABLE_PREFIX,
+    }
+    observed_commissioning_options = {
+        flag: base._option(command, flag)  # noqa: SLF001
+        for flag in exact_commissioning_options
+    }
+    if observed_commissioning_options != exact_commissioning_options:
+        raise ExecutionError(
+            "adapter commissioning command geometry drift: "
+            f"{observed_commissioning_options}"
+        )
 
     output_root = Path(base._option(command, "--checkpoint")).parent.resolve()  # noqa: SLF001
     checkpoint = output_root / "candidate.pt"
@@ -249,10 +263,10 @@ def verify(manifest_path: Path) -> dict[str, Any]:
     return {
         "manifest": manifest,
         "manifest_ref": manifest_ref,
-        # Run from the selected-TEMP checkout as well as invoking its exact
-        # trainer bytes. Relative imports/config paths therefore retain the
-        # source arm's runtime semantics; the current checkout only supplies
-        # the independently authenticated preparer/executor.
+        # Run from the selected-geometry checkout and invoke its exact trainer
+        # bytes.  The historical TEMP execution checkout was cleaned; the
+        # geometry plan/report are the surviving authenticated short-dose
+        # runtime bridge for the same data, f7, and objective.
         "repo": trainer_repo,
         "preparer_repo": preparer_repo,
         "command": command,
@@ -282,7 +296,7 @@ def execute(
 def main(argv: Sequence[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", required=True, type=Path)
-    parser.add_argument("--unit", default="a1-selected-temp-gather")
+    parser.add_argument("--unit", default="a1-selected-dose-gather-commission")
     parser.add_argument("--go", action="store_true")
     args = parser.parse_args(argv)
     if not args.go:
