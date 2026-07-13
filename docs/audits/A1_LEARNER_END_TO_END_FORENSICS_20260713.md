@@ -8,8 +8,9 @@ experiments combined four avoidable learner/evaluation errors:
 
 1. **Candidate chaining:** later candidates initialized from already-updated
    candidates instead of independently reloading f7.
-2. **Oversized dose:** chained lineages consumed about 44.7M sampled rows and
-   10,365 optimizer steps instead of one 4.19M-row dose.
+2. **Oversized dose:** the actual checkpoint/launcher lineage shows each failed
+   chain consumed 42.46M scalar-target examples and 10,365 optimizer steps
+   instead of one 4.19M-row dose.
 3. **Wrong adjudication parent/operator:** apparent 52–55% internal wins were
    measured against old gen3 at `c_scale=0.03`, not against the initializer/f7
    incumbent at deployed `c_scale=0.10`.
@@ -26,10 +27,14 @@ diagnostic arms until they beat this corrected baseline under the same operator.
 ## Causal reconstruction of the failed lineage
 
 ```text
-f7 champion
-  └─ n256 candidate (large dose)
-       └─ combined-196k candidate (another 31.9M sampled rows)
-            └─ corrective n128 candidate (another 31.9M sampled rows)
+gen3
+  └─ f7
+      └─ n256-early (2,962 steps / 12.13M scalar-target examples)
+          └─ combined-196k (+7,403 steps / +30.32M examples)
+
+f7
+  └─ corrective n256 (2,962 steps / 12.13M examples at lr=1.2e-4)
+      └─ corrective n128 (+7,403 steps / +30.32M examples at lr=1.2e-4)
 
 reported comparison: candidate vs old gen3 @ c_scale .03
 required comparison: candidate vs its actual initializer/f7 @ c_scale .10
@@ -37,10 +42,31 @@ required comparison: candidate vs its actual initializer/f7 @ c_scale .10
 
 This is not an independent n128-vs-n256 experiment. It compounds optimizer
 updates, replay exposure, drift, and parent changes. The learner reports show
-roughly 96–98% of update energy in the shared trunk and trunk drift from 8.96%
-to 30.18%, while value-head drift was only about 2–5%. That is consistent with
-over-updating a shared representation, not with a value head that simply needs
-more epochs.
+more than 98% of update energy outside the dedicated value head. Exact tensor
+comparison against f7 gives:
+
+| Checkpoint | Global relative drift | Global cosine | Value-head drift |
+|---|---:|---:|---:|
+| P0 midpoint | 0.691% | 0.999976 | 0.408% |
+| TEMP full | 2.598% | 0.999663 | 1.544% |
+| replay anchor | 2.652% | 0.999648 | 1.628% |
+| n256-early | 5.167% | 0.998668 | 3.304% |
+| combined-196k | 9.763% | 0.995273 | 6.760% |
+| corrective n256 | 15.313% | 0.988578 | 7.189% |
+| corrective n128 | 34.129% | 0.948453 | 13.935% |
+
+The corrective-n256 to corrective-n128 step alone moved 26.09%. Transformer
+block 0 absorbed 36.8% of that step's energy; its attention input projection
+alone absorbed 29.1%, moved 75.2% relative to corrective n256, and grew in norm
+from 36.88 to 59.47. Every tensor remained finite. This is severe shared-trunk
+deformation from the chained high-LR dose, not numerical corruption or a value
+head that merely needs more epochs.
+
+All audited artifacts are exactly compatible 35,041,353-parameter, six-layer,
+width-640 scalar-value models. Their effective policy logit scales range only
+from 4.226 to 5.526 against a clamp of 50, and no fixed-sample output reached
+`abs(tanh(value)) >= 0.95`. Architecture mismatch, policy-logit saturation, and
+value-head explosion are therefore ruled out for this failure.
 
 The independent n256 `lr=1.2e-4` arm did contain real signal: it beat f7
 360–240/600 under the matched `c_scale=0.10` operator. That result rules out the
@@ -72,14 +98,25 @@ signal. `loser_sample_weight=1` won the controlled comparison.
   interpreted on a return-like scale, so enabling q loss would train
   incompatible semantics. Keep q loss off until the head/target contract is
   redesigned.
-- Training optimizes raw scalar MSE, but search consumes `tanh(raw_value)`. A
-  matched tanh-vs-clip calibration probe is still required; offline raw MSE does
-  not adjudicate the deployed value operator. This can reverse a ranking even
-  when both agents later share the same search operator: for target `+1`, raw
+- Training optimizes raw scalar MSE, but search consumes `tanh(raw_value)`. The
+  calibration tool now fits a positive tanh scale on one explicit held-out game
+  subset and scores it on a disjoint held-out subset without mutating the
+  operator. Offline raw MSE still cannot adjudicate playing strength and can
+  reverse a ranking even when both agents later share the same search operator:
+  for target `+1`, raw
   predictions `0.9` and `1.2` have MSE `0.01` and `0.04`, but after tanh their
   squared errors are about `0.0807` and `0.0276`. Dose adjudication therefore
   uses deployed tanh as primary and repeats the same short/full/f7 seeds with
   clip only as an operator-sensitivity diagnostic.
+
+An exploratory identical-row n256 panel (104 games split 52/52 for scale fit
+and evaluation; training-adjacent, not promotion evidence) selected scales
+0.968 for f7, 1.067 for both P0 midpoint and full TEMP, and 1.215 for the damaged
+corrective n128 artifact. The fitted f7 scale regressed held-game RMSE; midpoint
+slightly beat full TEMP on held-game value RMSE/correlation despite using one
+eighth the samples; corrective n128 calibrated best after scaling despite its
+severe trunk damage. This is direct evidence that offline value calibration is
+a diagnostic, not a champion selector. Search H2H remains mandatory.
 
 ## Learner implementation audit
 
@@ -90,7 +127,7 @@ signal. `loser_sample_weight=1` won the controlled comparison.
 | Probe geometry | A purported matched microbatch test used gradient accumulation. Weighted task means were normalized independently per microbatch, so unequal policy/value support made the aggregate only approximate. | Fixed probe: compare 8x512 with 4x1024 at accumulation 1; both are exact global batch 4096 (`f333921`). General exact accumulation remains unresolved. |
 | Zero-signal batches | AdamW could decay parameters or advance old momentum when the entire configured objective and global gradient were exactly zero. | Fixed: skip only exact zero-objective + zero-gradient groups (`6e952b1`, `1c6efe4`). |
 | Non-finite gradients | `clip_grad_norm_` defaults to `error_if_nonfinite=False`; a finite loss followed by NaN/Inf gradients could corrupt Adam moments/checkpoints. | Fixed in both dense and entity trainers: abort before `optimizer.step` (`6e952b1`). |
-| Optional heads | Zero-weight heads stayed trainable and were still subject to AdamW decay; some were forwarded unnecessarily. Requested head losses could silently target absent heads. | Fixed: fail preflight if requested head absent, freeze zero-weight heads, skip unused forwards (`e81ffb2`). |
+| Optional heads | Zero-weight heads stayed trainable and were subject to AdamW decay. The first fix froze them, but enabled frozen aux heads still executed Dropout and advanced the RNG, so an aux-ON/zero-loss control diverged from aux-OFF on the second main forward. | Fixed: fail-closed preflight/freeze plus a nonpersistent inactive-output gate skips those forwards; active/inference outputs are unchanged and two-forward RNG parity is tested (`e81ffb2`, `03bf5e2`). Baseline f7/TEMP configs had these heads absent, so this invalidated optional-head controls but did not cause the baseline failure. |
 | Halt head | `deliberation_halt_head` had no BC objective but remained trainable. | Fixed/frozen (`e81ffb2`). |
 | Empty event history | All three current TEMP components authenticate all-zero event payloads, yet the model paid the full event MLP/memory cost. | Fixed authenticated crop (`aafe236`). This is objective-equivalent, but changes dropout RNG sequence versus historical runs. |
 | DDP weighted mean | At accumulation 1, loss numerator gradients are scaled by the globally reduced denominator and DDP's gradient average correctly yields the global weighted mean. | Confirmed correct. |
@@ -107,8 +144,12 @@ signal. `loser_sample_weight=1` won the controlled comparison.
 | Shared-trunk gradient probe | The probe enabled ordinary diagnostics but had drifted from the separately gated objective-interference cadence, so it could start without emitting its defining measurement. | Fixed: both diagnostic cadences are explicit and tested (`58fb7e6`). |
 | Post-P1 causal-arm planner | Every arm silently inherited the historical 4.19M-row dose despite the matched saturation result, and the planner specified BF16 even though the sealed TEMP baseline and both dose artifacts are FP32. That made a supposed one-axis arm a dose-assumption plus precision change. | Fixed: the existing 0.52M/full checkpoints must select the Pareto dose before any new arm; FP32 and all three component temperatures are now explicit and bound (`a1_post_p1_diagnosis_plan.py`, schema v2). |
 | Objective-matched validation loss | The sufficient-statistic registries omitted `belief_resource_loss`, while every evaluator coefficient map includes it even at zero weight. Exact total-loss reconstruction was therefore never reached: a sparse-policy example reported `5.25` instead of the configured objective `0.3490`. Individual reconstructed policy/value losses and teacher-gap closure remained valid, but aggregate validation loss could mis-rank arms. | Fixed: reconstruct every objective term, then derive total/scalar/primary aliases from the same measure; regression covers the 5.25-to-0.3490 failure. Training gradients/checkpoints were unaffected. |
+| Auxiliary validation measures | Value-uncertainty and optional auxiliary/MoE validation used batch means or fabricated row denominators rather than exact per-head numerators and valid-label counts. Composite/DDP aggregation could therefore change the reported objective and silently rank sparse-head arms incorrectly. | Fixed: every active head now emits exact sufficient statistics; nonzero objectives fail closed when the measure or coefficient is missing/inconsistent; zero-weight non-MoE heads remain exact zero (`f7b2064`). Training gradients/checkpoints were unaffected. |
 | Composite-v2 per-game weighting | V2 already samples `component -> game -> row`. The loss normalizer still divided by summed in-game weight, the formula for uniform-row sampling, so enabling equal/sqrt per-game weighting applied a second inverse-length correction. A 1-row and 4-row game went from 50/50 sampling mass to 80/20 (`equal`) or 67/33 (`sqrt`). | Fixed: v2 normalizes mean in-game weight; v1/ordinary uniform-row behavior stays unchanged. Telemetry now reports sampler-adjusted game mass so raw row totals cannot be mistaken for the optimized measure. P0/TEMP had both flags off and was unaffected. |
 | Replay objective scope | A replay `z` is conditional on the old policy's continuation, while its stored search policy is an older teacher. An initial planner edit removed both at once and mislabeled that two-axis treatment as the TEMP control. The known winning TEMP artifact actually trained policy and value on all three components. | Fixed in the causal plan: `TEMP_CONTROL` exactly preserves all-component policy/value scope; `CURRENT_POLICY_SCOPE` and `CURRENT_VALUE_SCOPE` each change one axis. A both-current interaction is forbidden unless both independent arms survive. |
+| Scalar search-value selection | Validation ranked raw scalar MSE although MCTS consumes `tanh(raw * value_scale)`; these rankings can reverse. | Fixed diagnostic: fit scale only on one explicit held-out game subset, score on a disjoint subset with bounded memory, and never mutate the operator or authorize promotion without matched search H2H (`5838cec`). |
+| Evaluator cache concurrency | `evaluate_many` performed LRU get/touch as separate unlocked operations while async stores could evict the key, producing a deterministic `KeyError` under capacity pressure. | Fixed: atomic lock-scoped LRU get/store across sync, batch, and async evaluators; model forward stays outside the lock; root-perspective and deterministic eviction races are covered (`e1ae5bf`). This affected evaluation reliability, not trained weights. |
+| Historical candidate provenance | P0/TEMP/anchor/combined/corrective checkpoint files have no adjacent report, receipt, or optimizer sidecar on the audited host, and historical payloads omit a standardized initializer hash/recipe/code digest. | Future artifacts must bind initializer, fresh/resumed optimizer state, exact dose and integrated LR area, source/runtime digests, report, receipt, and finalizer. True historical lineage was reconstructed from launchers/checkpoint hashes rather than inferred from filenames. |
 
 ## Layer/architecture audit
 
@@ -177,10 +218,11 @@ under the same search budget, information regime, seats, and `c_scale`.
 ### Auxiliary heads
 
 Auxiliary subgoal/belief/uncertainty heads exist, but old frozen-corpus results
-do not establish a win. They also consume dropout RNG and can change later trunk
-masks even when the shared first forward is identical. Each arm needs an
-independent f7 start and equal dose. Zero-weight heads are now frozen so baseline
-runs no longer pay or drift them.
+do not establish a win. Frozen zero-objective aux heads previously still consumed
+dropout RNG and changed later trunk masks even when the shared first forward was
+identical. They are now skipped by a nonpersistent trainer gate; active heads and
+normal inference retain their full output API. Each arm still needs an independent
+f7 start and equal dose.
 
 ### Event history
 
@@ -380,6 +422,15 @@ the full seat-swapped neutral gate for survivors.
 - `cf54d5a` — namespace composite game identity and repair DDP coverage telemetry.
 - `efcc94b`, `d9bf335` — seal completed diagnostic runs and bind finalizer identity.
 - `58fb7e6` — repair the dedicated shared-trunk gradient-interference probe.
+- `9c98473`, `42ada94` — bind P0 dose saturation, drift, and integrated LR-area
+  exposure into the learner forensics.
+- `d2ddbc4`, `f7b2064` — repair objective-matched scalar/auxiliary validation
+  and sampler-measure semantics.
+- `e1ae5bf` — make evaluator LRU operations atomic across sync/batch/async paths.
+- `5838cec` — fit scalar tanh value scale on disjoint held-out games without
+  mutating the sealed search operator.
+- `03bf5e2` — skip frozen zero-objective head forwards and preserve two-forward
+  RNG/main-output parity for optional-head controls.
 
 The immediate criterion is simple: preserve the independent TEMP win, select the
 fastest mathematically matched DDP geometry, and spend subsequent B200 time only
