@@ -140,6 +140,9 @@ a diagnostic, not a champion selector. Search H2H remains mandatory.
 | DDP zero-objective step consensus | The zero-signal guard combined a globally synchronized gradient norm with a rank-local scalar loss. At an exact zero-gradient sparse/stationary step, an empty rank could skip while a peer with a nonzero objective advanced Adam/AdamW, immediately diverging optimizer state and decoupled weight decay across replicas. | Fixed: only the rare zero-gradient branch collectively resolves whether any rank has objective mass; all ranks then step or skip together. Nonzero-gradient hot steps add no collective. P0/TEMP have active base objectives and are unaffected. |
 | Advantage weighting | The optional multiplier was normalized per rank; changing DDP geometry changed the objective, and empty-rank early return precluded a safe collective. | Fixed: all ranks participate in a globally weighted normalizer. |
 | Decisive distributed modes | Gradient accumulation and distributed outcome-value advantage still lack a sealed equivalence contract. Distributed symmetry had a separate concrete defect: every rank constructed `default_rng(seed+20260705)`, so the same 512-orientation pattern repeated across all eight local batches, and progress saved only rank 0's augmentation stream. | Symmetry is fixed: its deterministic `SeedSequence` binds `(seed, world_size, rank)`, all rank streams are gathered into a versioned progress envelope, exact rank-local resume is tested, and legacy/malformed multi-rank resumes fail closed (`83ad050`). Composite diagnostics now report the same semantics. Gradient accumulation and distributed advantage remain diagnostic-only; accumulation-1 DDP remains the sealed base path. |
+| D6+gather completion RNG contract | The first composition finalizer fixture incorrectly modeled all eight NumPy epoch-order streams as distinct and required eight unique saved digests. The actual arm uses one shared global memmap (`ddp_shard_data=false`): ranks split each global batch, so their epoch-order generators must advance identically. Only torch/dropout and D6 augmentation streams are rank-local. The valid first run was therefore blocked after training despite eight distinct D6 states. | Fixed before evaluation: non-sharded completion now requires one shared NumPy state digest and eight distinct D6 symmetry states; a regression injects one divergent NumPy rank and proves refusal (`3f73134`). The treatment is rerun under a newly bound manifest rather than editing historical execution evidence. |
+| Architecture-upgrade receipt shape binding | Upgrade receipts checked that new deterministic parameters were numerically all-zero/all-one/identity, but built those references with `zeros_like`/`ones_like` on the caller-supplied tensor. A correctly valued tensor with an impossible shape or dtype could therefore receive a valid receipt even though the real model could not load it. | Fixed globally (`83b56d5`): every allowlisted architecture addition is reconstructed through the actual `EntityGraphPolicy` constructor from the exact source bytes and seed, then exact-checked for names, shapes, dtypes, and values. Forged-shape regressions cover gather, combined topology+gather, and topology-only upgrades. |
+| Adapter-dose completion identity | The composition finalizer trusted the JSON progress counter but did not prove that each serialized Adam state reached the same step. It also hard-coded the historical 1,024-update dose after that dose lost to its exact parent. | Fixed (`e15c2cb`): finalization now requires every adapter Adam state to equal the declared completed step, and the arm exposes only an allowlisted 128/256/1,024-step one-axis ladder with exact derived row dose and LR area. Parent, initializer, data order, optimizer, losses, LR, D6, and the four-tensor trainable surface remain fixed. |
 | Geometry GPU binding | The geometry launcher referenced `WORLD_SIZE` before defining it, so a true `--go` run failed before binding any GPU. | Fixed and covered by launch tests (`b59983b`). |
 | Composite validation cap | A row-count validation cap can split a game and invalidate the signed game-disjoint validation sentinel. The first geometry command mistakenly requested 8,192 rows despite supplying the sentinel. | Planner and trainer now require `--validation-max-samples 0` for authenticated composites; the sentinel is the sole validation bound (`30b669f`). |
 | Validation aggregation | Objective-matched validation now aggregates sufficient statistics; legacy raw `validation.loss` is a row-concatenated diagnostic and not promotion evidence. | Confirmed. |
@@ -472,28 +475,40 @@ midpoint/full behavior reversal: dose remains the supported intervention.
 The function-preserving target-gather commissioning arm scored 71-57 against
 f7 (`55.47%`) with every inherited tensor bit-identical and only its four new
 projection tensors trained. This is positive architecture evidence, though it
-does not beat the TEMP midpoint. The next composition test therefore adds the
-same zero-output gather adapter to the independently positive D6 checkpoint,
-freezes every inherited tensor, and consumes exactly the same 524,288-row dose.
-Because this arm must commission four zero-initialized projection tensors, it
-preserves the independently proven gather schedule of 8x64/global-512 for
-1,024 optimizer updates (rather than the mature-model 8x512/128 schedule), with
-action-module LR x4. The batch partition and number of optimizer updates change;
-the row dose, sampled data contract, initializer, and all inherited tensors do
-not. It compares first against that exact D6 parent.
+does not beat the TEMP midpoint. The first exact-parent composition used the
+same 524,288-row gather commissioning dose (8x64/global-512, 1,024 updates,
+action-module LR x4) on the full-dose D6 parent and lost `115-141` over 256
+paired games (`44.92%`). This rejects that composition at that dose, but it does
+not identify whether gather itself or adapter over-correction caused the loss.
+The next diagnostic therefore holds parent, zero-output initializer, data
+order, optimizer, losses, LR, symmetry, and the four-tensor trainable surface
+fixed while testing 128 then 256 updates (65,536 then 131,072 rows). Every arm
+compares first against its exact initializer parent.
 
-The independently initialized short-dose D6 arm is also positive against the
-binding v5 incumbent: `69-59` over 128 paired games (`53.91%`; `WW=18`,
-split=33, `LL=13`) with zero errors/truncations. It used exact f7, fresh Adam,
+The 128-update ladder point completed and replayed cleanly from the exact short
+D6 parent. It consumed 65,536 rows (8,037 policy-active), updated only the four
+gather tensors, serialized all four Adam states at step 128, clipped/skipped no
+step, and left every inherited tensor bit-identical. Candidate SHA-256 is
+`03886c706011ae543f390e1000cbe424a13cd80590b4e5124189c577ae4c6d74`.
+Its objective-matched closure was `0.081679`; as above, only matched H2H can
+select it. The independent 256-update sibling starts from the original
+function-preserving initializer rather than chaining from this checkpoint.
+
+The independently initialized short-dose D6 arm's first 128-pair screen was
+`69-59` against the binding v5 incumbent, but the fresh 256-pair confirmation
+was neutral at `127-129`. It is therefore not evidence of a v5 improvement.
+It did beat the full-dose D6 model `73-55` on the matched panel, directly
+reproducing the dose failure under symmetry augmentation: D6 does not make the
+4.19M-row mature-model dose safe. The short model used exact f7, fresh Adam,
 8x512 for 128 updates/524,288 rows, and rank-distinct resumable symmetry RNG;
 candidate SHA-256 is
 `9dd1d261a39d7b04713505a301097faf18e84e8a3508b4abb92a8b964f7ab921`.
 Its objective-matched teacher-gap closure was only `0.086684` (below TEMP's
-`0.102290`) while global drift stayed comparable at `0.7021%`. This is direct
-evidence that offline closure is not a strength selector and supports the
-mechanism of symmetry regularization/denoising at a controlled short dose. The
-screen remains `continue`, not promotion evidence; D6+gather must first beat
-this exact D6 parent rather than merely inherit its gain.
+`0.102290`) while global drift stayed comparable at `0.7021%`, again proving
+that offline closure is not a strength selector. Consequently the full-D6 to
+gather composition remains a causal adapter test, while the primary candidate
+must add the same function-preserving gather to this selected short-D6 parent
+and train only the four new tensors.
 
 Promote nothing from offline loss. First use a short matched internal panel, then
 the full seat-swapped neutral gate for survivors.
