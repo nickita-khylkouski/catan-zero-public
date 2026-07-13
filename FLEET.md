@@ -8,7 +8,7 @@
 
 ## 1. Box inventory (aliases + stable roles)
 Fleet is consolidated to **H100 + B200 only**. The production data lane has
-**56 H100s across ten boxes**: six four-GPU nodes and four eight-GPU nodes,
+**64 H100s across twelve boxes**: eight four-GPU nodes and four eight-GPU nodes,
 all with NVLink/NVSwitch. The prior A100 pool (`a100a`, `a100b`) and the older
 `a100-legacy` box are **RETIRED** — decommissioned from the active fleet; any
 useful data on them was salvaged separately before retirement. Do not launch
@@ -23,6 +23,8 @@ new work there, and drop any lingering A100 entries from your local
 | c4 | 4× H100 (NVLink) | A1 generation |
 | c5 | 4× H100 (NVLink) | A1 generation |
 | c6 | 4× H100 (NVLink) | A1 generation |
+| c7 | 4× H100 (NVLink) | A1 generation |
+| c8 | 4× H100 (NVLink) | A1 generation |
 | h100-8a | 8× H100 (NVSwitch) | A1 generation; eight-GPU shape canary first |
 | h100-8b | 8× H100 (NVSwitch) | A1 generation |
 | h100-8c | 8× H100 (NVSwitch) | A1 generation; audited 2026-07-10 |
@@ -30,7 +32,7 @@ new work there, and drop any lingering A100 entries from your local
 | b200 | 8× B200 (NVSwitch) | eval + orchestration hub; independent R&D lane A |
 | b200-rnd-b | 8× B200 (NVSwitch) | independent learner/R&D lane B |
 
-The current A1 search decision is uniform across all 56 H100s:
+The current A1 search decision is uniform across all 64 H100s:
 `n_full=128`, `n_fast=16`, and `p_full=0.25`. There is no n64 production arm
 and no adaptive or blanket n196/n256 budget in this wave. Source categories are
 rendered as separate deterministic jobs from the sealed A1 contract; the box

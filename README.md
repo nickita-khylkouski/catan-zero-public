@@ -2,8 +2,8 @@
 
 This repository consolidates the Catan-Zero source, development history,
 planning documents, and external reviews. The original import came from one
-B200 and two now-retired A100 hosts. The production data fleet is 56 H100s:
-six four-GPU nodes plus four eight-GPU nodes. Two separate eight-B200 nodes
+B200 and two now-retired A100 hosts. The production data fleet is 64 H100s:
+eight four-GPU nodes plus four eight-GPU nodes. Two separate eight-B200 nodes
 provide evaluation, orchestration, and independent learner R&D lanes; FLEET.md
 is the live inventory. Project #1 goal:
 build the strongest Catan agent under the benchmark below.
@@ -38,7 +38,7 @@ downstream of it. Land the fix, land the test, then generate.
   they could be lost to reprovisioning, kept on separate `rescue/untracked-*`
   branches rather than merged into `master`; see `rescue/README.md`.
 - Task tracking: Linear workspace, team **Catan**.
-- Production H100 aliases are `c1` through `c6` and `h100-8a` through
+- Production H100 aliases are `c1` through `c8` and `h100-8a` through
   `h100-8d`.
   B200 control-plane aliases are separate. Host IPs live only in the
   uncommitted `$FLEET_CONF`; see FLEET.md. The retired A100 names below
