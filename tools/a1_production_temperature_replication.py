@@ -87,6 +87,44 @@ def _set(command: list[str], flag: str, value: str) -> None:
         command[positions[0] + 1] = value
 
 
+def _production_command(
+    selected: Sequence[str],
+    *,
+    python: str,
+    trainer: Path,
+    checkpoint: Path,
+    report: Path,
+) -> list[str]:
+    """Derive the only allowed production command from the selected receipt."""
+
+    command = list(selected)
+    if not command:
+        _fail("diagnostic command is empty")
+    command[0] = python
+    trainers = [item for item in command if Path(item).name == "train_bc.py"]
+    if len(trainers) != 1:
+        _fail("diagnostic command does not name exactly one trainer")
+    command[command.index(trainers[0])] = str(trainer.resolve(strict=True))
+    _set(command, "--checkpoint", str(checkpoint))
+    _set(command, "--report", str(report))
+    return command
+
+
+def _systemd_command(
+    *, unit: str, repo: Path, root: Path, command: Sequence[str]
+) -> list[str]:
+    return [
+        "sudo", "-n", "systemd-run", f"--unit={unit}",
+        "--uid=ubuntu", "--gid=ubuntu", "--service-type=exec",
+        "--property=LimitNOFILE=65536",
+        f"--property=WorkingDirectory={repo}",
+        f"--property=StandardOutput=append:{root / 'stdout.log'}",
+        f"--property=StandardError=append:{root / 'stderr.log'}",
+        "--setenv=HOME=/home/ubuntu", "--setenv=PYTHONNOUSERSITE=1", "--",
+        *command,
+    ]
+
+
 def _verify_descriptor(
     path: Path,
 ) -> tuple[dict[str, Any], list[str], list[dict[str, Any]]]:
@@ -347,16 +385,13 @@ def prepare(
         python_binding = base._python_binding(python)  # noqa: SLF001
     except base.L1Error as error:
         raise TemperatureReplicationError(str(error)) from error
-    command = list(selected["command"])
-    command[0] = python_binding["lexical_path"]
-    trainers = [item for item in command if Path(item).name == "train_bc.py"]
-    if len(trainers) != 1:
-        _fail("diagnostic command does not name exactly one trainer")
-    command[command.index(trainers[0])] = str(
-        (repo / "tools/train_bc.py").resolve(strict=True)
+    command = _production_command(
+        selected["command"],
+        python=python_binding["lexical_path"],
+        trainer=repo / "tools/train_bc.py",
+        checkpoint=output_root / "candidate.pt",
+        report=output_root / "train.report.json",
     )
-    _set(command, "--checkpoint", str(output_root / "candidate.pt"))
-    _set(command, "--report", str(output_root / "train.report.json"))
     source_files = {
         relative: base._ref(repo / relative) for relative in BOUND_SOURCE_FILES
     }  # noqa: SLF001
@@ -424,6 +459,17 @@ def verify(manifest_path: Path) -> dict[str, Any]:
     stated = unhashed.pop("manifest_sha256", None)
     if stated != base._digest(unhashed):  # noqa: SLF001
         _fail("production temperature manifest semantic digest drift")
+    expected_manifest_keys = {
+        "schema_version", "diagnostic_only", "production_eligible",
+        "launch_authorized", "selection_evidence", "source_descriptor",
+        "validation_sentinel", "f7_parent", "component_bindings",
+        "stored_policy_component_temperatures", "event_history_training_contract",
+        "selected_dose", "repo_binding", "runtime_python",
+        "execution_preconditions", "command", "command_sha256", "output_root",
+        "manifest_sha256",
+    }
+    if set(manifest) != expected_manifest_keys:
+        _fail("production temperature manifest fields differ from schema")
     if (
         manifest.get("schema_version") != MANIFEST_SCHEMA
         or manifest.get("diagnostic_only") is not False
@@ -456,13 +502,49 @@ def verify(manifest_path: Path) -> dict[str, Any]:
     for key in ("completion", "command_receipt", "checkpoint", "evidence"):
         if replayed_selection[key] != selection[key]:
             _fail(f"selection replay reference drift at {key}")
-    _verify_descriptor(Path(manifest["source_descriptor"]["path"]))
+    _, inventories, bindings = _verify_descriptor(
+        Path(manifest["source_descriptor"]["path"])
+    )
+    if (
+        manifest.get("component_bindings") != bindings
+        or manifest.get("stored_policy_component_temperatures")
+        != COMPONENT_TEMPERATURES
+        or manifest.get("event_history_training_contract")
+        != {
+            "public_observation_masked": True,
+            "graph_history_features": True,
+            "payload_inventory_acknowledgements": inventories,
+        }
+        or manifest.get("selected_dose")
+        != {
+            "optimizer_steps": 1024,
+            "world_size": 8,
+            "per_rank_batch_size": 512,
+            "global_samples": 4_194_304,
+            "optimizer": "fresh_adam",
+            "lr": 3e-5,
+            "training_rng_rank_offset": True,
+        }
+        or manifest.get("execution_preconditions")
+        != {
+            "visible_gpu_count": 8,
+            "gpu_model_substring": "B200",
+            "all_compute_idle": True,
+            "one_shot_systemd": True,
+        }
+    ):
+        _fail("production temperature semantic contract drift")
     repo_binding = manifest.get("repo_binding")
     if not isinstance(repo_binding, dict):
         _fail("repository binding is malformed")
     repo = Path(str(repo_binding["repository_root"])).resolve(strict=True)
     base._assert_bound_checkout(repo, str(repo_binding["public_main_commit"]))  # noqa: SLF001
-    for relative, ref in repo_binding.get("files", {}).items():
+    if set(repo_binding) != {"repository_root", "public_main_commit", "files"}:
+        _fail("repository binding fields differ from schema")
+    files = repo_binding.get("files")
+    if not isinstance(files, dict) or set(files) != set(BOUND_SOURCE_FILES):
+        _fail("repository source binding is incomplete")
+    for relative, ref in files.items():
         if base._verify_ref(ref, f"source.{relative}") != (repo / relative).resolve(
             strict=True
         ):  # noqa: SLF001
@@ -483,9 +565,6 @@ def verify(manifest_path: Path) -> dict[str, Any]:
         sentinel=manifest["validation_sentinel"]["path"],
         f7=manifest["f7_parent"]["path"],
     )
-    inventories = manifest["event_history_training_contract"][
-        "payload_inventory_acknowledgements"
-    ]
     positions = [index for index, item in enumerate(command) if item == base.ACK_FLAG]
     if [command[index + 1] for index in positions] != inventories:
         _fail("production command event-history acknowledgement drift")
@@ -499,6 +578,15 @@ def verify(manifest_path: Path) -> dict[str, Any]:
         command, "--report"
     ) != str(root / "train.report.json"):
         _fail("production output paths are not canonical")
+    expected_command = _production_command(
+        replayed_selection["command"],
+        python=lexical_python,
+        trainer=repo / "tools/train_bc.py",
+        checkpoint=root / "candidate.pt",
+        report=root / "train.report.json",
+    )
+    if command != expected_command:
+        _fail("production command is not an exact output-only derivation of selection")
     return {
         "manifest": manifest,
         "manifest_ref": manifest_ref,
@@ -545,23 +633,12 @@ def execute(
     claim["claim_sha256"] = base._digest(claim)  # noqa: SLF001
     claim_path = root / "execution.claim.json"
     base._write_exclusive(claim_path, claim)  # noqa: SLF001
-    systemd_command = [
-        "sudo",
-        "-n",
-        "systemd-run",
-        f"--unit={unit}",
-        "--uid=ubuntu",
-        "--gid=ubuntu",
-        "--service-type=exec",
-        "--property=LimitNOFILE=65536",
-        f"--property=WorkingDirectory={verified['repo']}",
-        f"--property=StandardOutput=append:{root / 'stdout.log'}",
-        f"--property=StandardError=append:{root / 'stderr.log'}",
-        "--setenv=HOME=/home/ubuntu",
-        "--setenv=PYTHONNOUSERSITE=1",
-        "--",
-        *verified["command"],
-    ]
+    systemd_command = _systemd_command(
+        unit=unit,
+        repo=verified["repo"],
+        root=root,
+        command=verified["command"],
+    )
     try:
         result = runner(systemd_command, check=True, text=True, capture_output=True)
     except (OSError, subprocess.CalledProcessError) as error:
@@ -585,20 +662,190 @@ def execute(
     return receipt
 
 
+def _verify_completed_report(
+    report: dict[str, Any],
+    *,
+    verified: dict[str, Any],
+    checkpoint: dict[str, str],
+) -> None:
+    """Bind the emitted report to every causal part of the sealed command."""
+
+    manifest = verified["manifest"]
+    descriptor = manifest["source_descriptor"]
+    sentinel = manifest["validation_sentinel"]
+    root = verified["output_root"]
+    exact = {
+        "arch": "entity_graph",
+        "hidden_size": 640,
+        "mask_hidden_info": True,
+        "graph_history_features": True,
+        "track": "2p_no_trade",
+        "vps_to_win": 10,
+        "world_size": 8,
+        "ddp_shard_data": False,
+        "batch_size": 512,
+        "grad_accum_steps": 1,
+        "effective_global_batch_size": 4096,
+        "epochs": 1,
+        "max_steps": 1024,
+        "steps_completed": 1024,
+        "base_training_row_draws": 4_194_304,
+        "optimizer": "adam",
+        "resume_optimizer": False,
+        "optimizer_restored": False,
+        "fused_optimizer": False,
+        "lr": 3e-5,
+        "lr_schedule": "flat",
+        "lr_warmup_steps": 100,
+        "weight_decay": 0.0,
+        "value_lr_mult": 0.3,
+        "action_module_lr_mult": 1.0,
+        "policy_loss_weight": 1.0,
+        "soft_target_source": "policy",
+        "soft_target_weight": 0.9,
+        "soft_target_min_legal_coverage": 0.5,
+        "value_loss_weight": 0.25,
+        "value_target_lambda": 1.0,
+        "value_head_type": "mse",
+        "truncated_vp_margin_value_weight": 0.0,
+        "final_vp_loss_weight": 0.0,
+        "q_loss_weight": 0.0,
+        "policy_kl_anchor_weight": 0.0,
+        "policy_kl_anchor_direction": "forward",
+        "forced_action_weight": 0.0,
+        "forced_row_value_weight": 1.0,
+        "winner_sample_weight": 1.0,
+        "loser_sample_weight": 1.0,
+        "validation_max_samples": 0,
+        "seed": 1,
+        "training_rng_rank_offset": True,
+        "symmetry_augment": False,
+        "diagnostic_only": True,
+        "promotion_eligible": False,
+        "init_checkpoint_sha256": F7_SHA256,
+        "data_format": "memmap",
+        "stored_policy_component_temperatures": COMPONENT_TEMPERATURES,
+    }
+    drift = {
+        key: {"expected": expected, "actual": report.get(key)}
+        for key, expected in exact.items()
+        if report.get(key) != expected
+    }
+    if drift:
+        _fail(f"completed report differs from sealed TEMP recipe: {drift}")
+    try:
+        init_path = Path(str(report["init_checkpoint"])).resolve(strict=True)
+        data_path = Path(str(report["data"])).resolve(strict=True)
+        report_checkpoint = Path(str(report["checkpoint"])).resolve(strict=True)
+        sentinel_path = Path(
+            str(report["input_validation_game_sentinel_manifest"])
+        ).resolve(strict=True)
+    except OSError as error:
+        raise TemperatureReplicationError(
+            f"completed report path cannot be resolved: {error}"
+        ) from error
+    if (
+        init_path != Path(manifest["f7_parent"]["path"])
+        or data_path != Path(descriptor["path"])
+        or sentinel_path != Path(sentinel["path"])
+        or report_checkpoint != root / "candidate.pt"
+        or checkpoint["path"] != str(report_checkpoint)
+    ):
+        _fail("completed report input/output paths differ from sealed manifest")
+    composite = report.get("memmap_composite")
+    if (
+        not isinstance(composite, dict)
+        or composite.get("descriptor_path") != descriptor["path"]
+        or composite.get("descriptor_file_sha256") != descriptor["sha256"]
+        or composite.get("component_ids") != list(COMPONENT_IDS)
+        or composite.get("component_game_sampling_ratios")
+        != list(COMPONENT_RATIOS)
+        or composite.get("policy_distillation_component_ids")
+        != list(COMPONENT_IDS)
+        or composite.get("value_training_component_ids") != list(COMPONENT_IDS)
+        or composite.get("policy_kl_anchor_component_ids") != ["gen3_replay"]
+    ):
+        _fail("completed report composite-data binding drift")
+    surface = report.get("training_information_surface")
+    inventories = manifest["event_history_training_contract"][
+        "payload_inventory_acknowledgements"
+    ]
+    if (
+        not isinstance(surface, dict)
+        or surface.get("graph_history_observation_schema") is not True
+        or surface.get("event_history_consumer_enabled") is not True
+        or surface.get("empty_payload_inventory_acknowledgements")
+        != sorted(inventories)
+    ):
+        _fail("completed report event-history acknowledgement drift")
+    runtime = report.get("checkout_runtime_binding")
+    trainer_ref = manifest["repo_binding"]["files"]["tools/train_bc.py"]
+    if (
+        not isinstance(runtime, dict)
+        or runtime.get("schema_version") != "train-bc-checkout-runtime-v1"
+        or runtime.get("repo_root") != str(verified["repo"])
+        or runtime.get("trainer") != trainer_ref["path"]
+        or runtime.get("trainer_sha256") != trainer_ref["sha256"]
+    ):
+        _fail("completed report runtime checkout binding drift")
+
+
 def finalize(manifest_path: Path, *, unit: str) -> dict[str, Any]:
+    if base.SAFE_UNIT.fullmatch(unit) is None:
+        _fail("systemd unit name is invalid")
     verified = verify(manifest_path)
     root = verified["output_root"]
     submission_path = root / "submission.receipt.json"
     submission = base._load(submission_path)  # noqa: SLF001
     unhashed = dict(submission)
     submission_hash = unhashed.pop("receipt_sha256", None)
+    expected_submission_keys = {
+        "schema_version", "diagnostic_only", "production_eligible",
+        "created_at_unix_ns", "manifest", "claim", "unit", "command_sha256",
+        "systemd_command_sha256", "systemd_stdout", "receipt_sha256",
+    }
     if (
-        submission.get("schema_version") != SUBMISSION_SCHEMA
+        set(submission) != expected_submission_keys
+        or submission.get("schema_version") != SUBMISSION_SCHEMA
+        or submission.get("diagnostic_only") is not False
+        or submission.get("production_eligible") is not True
         or submission.get("unit") != unit
         or submission.get("manifest") != verified["manifest_ref"]
+        or submission.get("command_sha256")
+        != verified["manifest"]["command_sha256"]
         or submission_hash != base._digest(unhashed)  # noqa: SLF001
     ):
         _fail("submission receipt/unit/manifest binding drift")
+    claim_ref = submission.get("claim")
+    try:
+        claim_path = base._verify_ref(claim_ref, "one-shot claim")  # noqa: SLF001
+        claim = base._load(claim_path)  # noqa: SLF001
+    except base.L1Error as error:
+        raise TemperatureReplicationError(str(error)) from error
+    claim_unhashed = dict(claim)
+    claim_digest = claim_unhashed.pop("claim_sha256", None)
+    if (
+        claim_path != root / "execution.claim.json"
+        or set(claim) != {
+            "schema_version", "created_at_unix_ns", "manifest", "unit",
+            "claim_sha256",
+        }
+        or claim.get("schema_version") != CLAIM_SCHEMA
+        or claim.get("manifest") != verified["manifest_ref"]
+        or claim.get("unit") != unit
+        or claim_digest != base._digest(claim_unhashed)  # noqa: SLF001
+    ):
+        _fail("one-shot claim/unit/manifest binding drift")
+    expected_systemd = _systemd_command(
+        unit=unit,
+        repo=verified["repo"],
+        root=root,
+        command=verified["command"],
+    )
+    if submission.get("systemd_command_sha256") != base._digest(  # noqa: SLF001
+        expected_systemd
+    ):
+        _fail("submission did not bind the sealed systemd command")
     try:
         state = subprocess.check_output(
             ("systemctl", "show", unit, "--property=ActiveState,Result,ExecMainStatus"),
@@ -617,23 +864,15 @@ def finalize(manifest_path: Path, *, unit: str) -> dict[str, Any]:
     if fields != expected_state:
         _fail(f"production temperature replication is not complete: {fields}")
     checkpoint = base._ref(root / "candidate.pt")  # noqa: SLF001
+    if checkpoint["sha256"] in {F7_SHA256, WINNING_DIAGNOSTIC_SHA256}:
+        _fail("production output reused an initializer or diagnostic checkpoint")
     report = base._ref(root / "train.report.json")  # noqa: SLF001
     report_payload = base._load(Path(report["path"]))  # noqa: SLF001
-    if (
-        report_payload.get("init_checkpoint_sha256") != F7_SHA256
-        or report_payload.get("base_training_row_draws") != 4_194_304
-        or report_payload.get("max_steps") != 1024
-        or report_payload.get("batch_size") != 512
-        or report_payload.get("optimizer") != "adam"
-        or report_payload.get("resume_optimizer") is not False
-        or report_payload.get("lr") != 3e-5
-        or report_payload.get("training_rng_rank_offset") is not True
-    ):
-        _fail("completed report does not prove the exact fresh-f7 TEMP replication")
-    # The generic descriptor remains diagnostic by design.  Eligibility comes
-    # exclusively from this independently executed, sealed transaction.
-    if report_payload.get("diagnostic_only") is not True:
-        _fail("generic trainer unexpectedly relabelled the diagnostic descriptor")
+    _verify_completed_report(
+        report_payload,
+        verified=verified,
+        checkpoint=checkpoint,
+    )
     completion = {
         "schema_version": COMPLETION_SCHEMA,
         "diagnostic_only": False,

@@ -1641,6 +1641,8 @@ def _verify_production_temperature_completion_receipt(
     if (
         checkpoint_path != candidate_path
         or checkpoint_ref["sha256"] != candidate_sha256
+        or candidate_sha256
+        in {temperature.F7_SHA256, temperature.WINNING_DIAGNOSTIC_SHA256}
         or report_path != training_report_path
         or report_ref["sha256"] != training_report_sha256
     ):
@@ -1649,11 +1651,17 @@ def _verify_production_temperature_completion_receipt(
         value["submission"], base=path.parent, where="production temperature submission"
     )
     submission = _load_json(submission_path)
+    expected_submission_keys = {
+        "schema_version", "diagnostic_only", "production_eligible",
+        "created_at_unix_ns", "manifest", "claim", "unit", "command_sha256",
+        "systemd_command_sha256", "systemd_stdout", "receipt_sha256",
+    }
     submission_unhashed = dict(submission)
     submission_digest = submission_unhashed.pop("receipt_sha256", None)
     manifest = verified["manifest"]
     if (
-        submission.get("schema_version") != temperature.SUBMISSION_SCHEMA
+        set(submission) != expected_submission_keys
+        or submission.get("schema_version") != temperature.SUBMISSION_SCHEMA
         or submission.get("diagnostic_only") is not False
         or submission.get("production_eligible") is not True
         or submission.get("manifest") != manifest_ref
@@ -1669,17 +1677,40 @@ def _verify_production_temperature_completion_receipt(
     claim_unhashed = dict(claim)
     claim_digest = claim_unhashed.pop("claim_sha256", None)
     if (
-        claim.get("schema_version") != temperature.CLAIM_SCHEMA
+        claim_path != verified["output_root"] / "execution.claim.json"
+        or set(claim) != {
+            "schema_version", "created_at_unix_ns", "manifest", "unit",
+            "claim_sha256",
+        }
+        or claim.get("schema_version") != temperature.CLAIM_SCHEMA
         or claim.get("manifest") != manifest_ref
         or claim.get("unit") != submission.get("unit")
         or claim_digest != _digest_value(claim_unhashed)
     ):
         raise PromotionError("production temperature one-shot claim drifted")
+    expected_systemd = temperature._systemd_command(  # noqa: SLF001
+        unit=str(submission["unit"]),
+        repo=verified["repo"],
+        root=verified["output_root"],
+        command=verified["command"],
+    )
+    if submission.get("systemd_command_sha256") != _digest_value(expected_systemd):
+        raise PromotionError("production temperature systemd command drifted")
     producers = [
         record for record in contract.get("checkpoints", [])
         if isinstance(record, dict) and record.get("role") == "producer"
     ]
     report = _load_json(report_path)
+    try:
+        temperature._verify_completed_report(  # noqa: SLF001
+            report,
+            verified=verified,
+            checkpoint=checkpoint_ref,
+        )
+    except temperature.TemperatureReplicationError as error:
+        raise PromotionError(
+            f"production temperature report replay refused: {error}"
+        ) from error
     if (
         len(producers) != 1
         or manifest.get("f7_parent", {}).get("sha256") != producers[0].get("sha256")

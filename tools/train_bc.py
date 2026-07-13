@@ -6768,6 +6768,11 @@ def main(argv: Sequence[str] | None = None) -> None:
         "hidden_size": int(args.hidden_size),
         "mask_hidden_info": bool(args.mask_hidden_info),
         "seed": int(args.seed),
+        # Promotion receipts must be able to distinguish the historical
+        # identical-per-rank dropout stream from the opt-in rank-offset RNG
+        # trajectory.  The effective A1 recipe already binds this field, but
+        # production replication also needs it in the standalone report.
+        "training_rng_rank_offset": bool(args.training_rng_rank_offset),
         "symmetry_augment": bool(args.symmetry_augment),
         # Record the *effective* event-history transform.  The raw CLI defaults
         # to relabelling events, but that switch is semantically inert while
