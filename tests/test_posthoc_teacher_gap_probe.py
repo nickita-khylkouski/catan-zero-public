@@ -91,7 +91,7 @@ class _FakeTrainBC:
             "manifest_sha256": "sha256:manifest-semantic",
         }
 
-    def MemmapCorpus(self, path):
+    def load_teacher_data_memmap(self, path):
         self.calls["corpus"] = path
         return {"action_taken": np.arange(5), "game_seed": np.arange(5)}
 
@@ -155,6 +155,7 @@ def test_reconstructs_exact_weights_holdout_and_evaluation_recipe(
     )
 
     assert fake._MASK_HIDDEN_INFO_PLAYER_TOKENS is True
+    assert fake.calls["corpus"] == data
     assert fake.calls["policy_weights"] == {
         "teacher_weights": {"teacher": 2.0},
         "phase_weights": {"main": 3.0},

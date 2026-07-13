@@ -10,7 +10,6 @@ bound public-main checkout is clean and exactly eight visible B200s are idle.
 from __future__ import annotations
 
 import argparse
-import fcntl
 import hashlib
 import json
 import os

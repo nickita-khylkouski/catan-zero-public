@@ -71,6 +71,13 @@ def test_interpolate_checkpoints_writes_multiple_alpha_outputs(tmp_path: Path) -
     assert torch.equal(first["action_features"], torch.full((4, 2), 7.0))
     assert first["hidden_size"] == 2
     assert first["step"].item() == 7
+    assert first["checkpoint_interpolation"]["diagnostic_only"] is True
+    assert first["checkpoint_interpolation"]["promotion_eligible"] is False
+    assert first["checkpoint_interpolation"]["alpha"] == pytest.approx(0.1)
+    assert first["checkpoint_interpolation"]["base"]["path"] == str(base.resolve())
+    assert first["checkpoint_interpolation"]["candidate"]["path"] == str(
+        candidate.resolve()
+    )
 
     receipt = tmp_path / "interpolation.receipt.json"
     value = write_interpolation_receipt(
@@ -122,3 +129,31 @@ def test_interpolate_checkpoints_rejects_changed_immutable_tensor(tmp_path: Path
             alphas=(0.1,),
             output_template=str(tmp_path / "blend.pt"),
         )
+
+
+def test_interpolate_checkpoints_allows_asymmetric_nontensor_metadata(
+    tmp_path: Path,
+) -> None:
+    base = tmp_path / "base.pt"
+    candidate = tmp_path / "candidate.pt"
+    _write_checkpoint(base, bias=0.0)
+    _write_checkpoint(candidate, bias=1.0)
+
+    base_value = torch.load(base, map_location="cpu", weights_only=False)
+    base_value["training_information_surface"] = {"event_tensor_width": 41}
+    torch.save(base_value, base)
+    candidate_value = torch.load(candidate, map_location="cpu", weights_only=False)
+    candidate_value["config"] = {"fields": {"belief_resource_head": False}}
+    torch.save(candidate_value, candidate)
+
+    outputs = interpolate_checkpoints(
+        base=base,
+        candidate=candidate,
+        alphas=(0.5,),
+        output_template=str(tmp_path / "blend.pt"),
+    )
+
+    blended = torch.load(outputs[0], map_location="cpu", weights_only=False)
+    assert torch.allclose(blended["model"]["0.weight"], torch.full((2, 3), 0.5))
+    assert blended["training_information_surface"] == {"event_tensor_width": 41}
+    assert "config" not in blended

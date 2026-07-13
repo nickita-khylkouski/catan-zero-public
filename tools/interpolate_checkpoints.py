@@ -99,12 +99,27 @@ def interpolate_checkpoints(
     base_data = _load_checkpoint(base)
     candidate_data = _load_checkpoint(candidate)
     _assert_compatible(base_data, candidate_data)
+    base_ref = _checkpoint_ref(base)
+    candidate_ref = _checkpoint_ref(candidate)
 
     outputs: list[Path] = []
     for alpha in alphas:
         if alpha < 0.0 or alpha > 1.0:
             raise ValueError("alpha must be in [0, 1]")
         blended = _blend_checkpoint(base_data, candidate_data, alpha)
+        # Never let a diagnostic soup inherit the base checkpoint's provenance
+        # and masquerade as an ordinary trained candidate when separated from
+        # its sidecar receipt.  Model loaders ignore this metadata, while every
+        # promotion/provenance consumer can fail closed on the explicit marker.
+        blended["checkpoint_interpolation"] = {
+            "schema_version": "checkpoint-interpolation-v1",
+            "diagnostic_only": True,
+            "promotion_eligible": False,
+            "formula": "learned_state=(1-alpha)*base+alpha*candidate",
+            "alpha": float(alpha),
+            "base": base_ref,
+            "candidate": candidate_ref,
+        }
         output = Path(output_template.format(alpha=_format_alpha(alpha)))
         output.parent.mkdir(parents=True, exist_ok=True)
         torch.save(blended, output)
@@ -171,6 +186,11 @@ def _load_checkpoint(path: Path) -> dict[str, Any]:
     return data
 
 
+def _checkpoint_ref(path: Path) -> dict[str, str]:
+    resolved = path.expanduser().resolve(strict=True)
+    return {"path": str(resolved), "sha256": _sha256(resolved)}
+
+
 def _assert_compatible(base: dict[str, Any], candidate: dict[str, Any]) -> None:
     structural_keys = {
         "observation_size",
@@ -190,13 +210,11 @@ def _assert_compatible(base: dict[str, Any], candidate: dict[str, Any]) -> None:
     candidate_schema = _tensor_schema(candidate)
     if base_schema != candidate_schema:
         raise ValueError("checkpoint tensor key/schema sets differ")
-    if not _mapping_contains(base, candidate):
-        raise ValueError("candidate checkpoint is missing base metadata keys")
     for key, base_value in base.items():
         if key not in LEARNED_STATE_ROOTS:
             _assert_tensor_values_equal(
                 base_value,
-                candidate[key],
+                candidate.get(key),
                 path=f"checkpoint.{key}",
             )
     # Newer trainers may append diagnostic metadata (for example the sealed
@@ -206,20 +224,6 @@ def _assert_compatible(base: dict[str, Any], candidate: dict[str, Any]) -> None:
     # Non-tensor training metadata may legitimately differ.  The structural
     # inference fields above and the complete tensor path/shape/dtype schema
     # are the deployable compatibility boundary.
-
-
-def _mapping_contains(base: Any, candidate: Any) -> bool:
-    if isinstance(base, dict):
-        return isinstance(candidate, dict) and all(
-            key in candidate and _mapping_contains(item, candidate[key])
-            for key, item in base.items()
-        )
-    if isinstance(base, (list, tuple)):
-        return isinstance(candidate, type(base)) and len(candidate) >= len(base) and all(
-            _mapping_contains(left, right)
-            for left, right in zip(base, candidate)
-        )
-    return True
 
 
 def _blend_checkpoint(
@@ -238,14 +242,17 @@ def _assert_tensor_values_equal(base: Any, candidate: Any, *, path: str) -> None
 
     if isinstance(base, dict):
         for key, value in base.items():
-            _assert_tensor_values_equal(value, candidate[key], path=f"{path}.{key}")
+            other = candidate.get(key) if isinstance(candidate, dict) else None
+            _assert_tensor_values_equal(value, other, path=f"{path}.{key}")
     elif isinstance(base, (list, tuple)):
+        other_items = candidate if isinstance(candidate, type(base)) else ()
         for index, value in enumerate(base):
+            other = other_items[index] if index < len(other_items) else None
             _assert_tensor_values_equal(
-                value, candidate[index], path=f"{path}[{index}]"
+                value, other, path=f"{path}[{index}]"
             )
     elif torch.is_tensor(base):
-        if not torch.equal(base, candidate):
+        if not torch.is_tensor(candidate) or not torch.equal(base, candidate):
             raise ValueError(f"immutable checkpoint tensor differs: {path}")
 
 

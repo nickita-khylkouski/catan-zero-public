@@ -169,7 +169,14 @@ def run_probe(
             validation_max_samples=int(_required(report, "validation_max_samples")),
             validation_game_seed_ranges=[tuple(map(int, item)) for item in ranges],
         )
-    data = train_bc.MemmapCorpus(data_path)
+    # Production one-dose learners may consume an authenticated no-copy
+    # memmap_composite descriptor rather than a single corpus directory.  The
+    # direct MemmapCorpus constructor treats that JSON file as a directory and
+    # makes posthoc evaluation impossible for the very checkpoints this tool is
+    # meant to diagnose.  Reuse the trainer's fail-closed loader so component
+    # identity, per-component target temperatures, and objective scopes survive
+    # exactly as they did during training.
+    data = train_bc.load_teacher_data_memmap(data_path)
     split = train_bc.split_train_validation_indices(
         data,
         validation_fraction=float(report["validation_fraction"]),
