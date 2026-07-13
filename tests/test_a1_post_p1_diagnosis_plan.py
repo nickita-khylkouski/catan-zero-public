@@ -40,7 +40,9 @@ def test_matrix_reuses_legacy_evidence_and_adds_conditional_anchor() -> None:
         "audit": "docs/audits/A1_POLICY_AUX_REPLICATION_20260712.md",
     }
     fixed = plan["fixed_recipe"]
-    assert fixed["sample_dose"] == "selected_by_dose_adjudication"
+    assert fixed["sample_dose"] == SHORT_SAMPLE_DOSE
+    assert fixed["max_steps"] == 128
+    assert fixed["dose_selection"] == "matched_behavior_pareto_rule"
     assert fixed["dose_candidates"] == [SHORT_SAMPLE_DOSE, FULL_SAMPLE_DOSE]
     assert fixed["max_steps_by_dose"] == {
         str(SHORT_SAMPLE_DOSE): math.ceil(SHORT_SAMPLE_DOSE / 4096),
@@ -134,11 +136,13 @@ def test_matrix_is_sequential_and_non_launching() -> None:
     assert "do not create a both-current scope" in scope["interaction_rule"]
 
 
-def test_existing_short_and_full_artifacts_must_select_dose_before_training() -> None:
+def test_matched_behavior_selects_short_pareto_dose() -> None:
     plan = build_plan()
     adjudication = plan["dose_adjudication"]
-    assert adjudication["status"] == "required_before_new_training"
-    assert adjudication["launch_blocking"] is True
+    assert adjudication["status"] == "selected"
+    assert adjudication["launch_blocking"] is False
+    assert adjudication["selected_sample_dose"] == SHORT_SAMPLE_DOSE
+    assert adjudication["selected_optimizer_steps"] == 128
     assert set(adjudication["candidates"]) == {
         str(SHORT_SAMPLE_DOSE),
         str(FULL_SAMPLE_DOSE),
@@ -168,11 +172,22 @@ def test_existing_short_and_full_artifacts_must_select_dose_before_training() ->
     assert "old gen3" in adjudication["evaluation"]["parent_panel"]
     assert adjudication["evaluation"]["value_squash"] == "tanh"
     assert "value_squash=clip" in adjudication["evaluation"]["operator_sensitivity"]
+    behavior = adjudication["observed_behavior"]
+    assert behavior["common_seed_orientation_keys"] == 128
+    assert behavior[str(SHORT_SAMPLE_DOSE)]["candidate_wins"] == 75
+    assert behavior[str(FULL_SAMPLE_DOSE)]["candidate_wins"] == 65
+    assert behavior["paired_outcomes"] == {
+        "both_win": 41,
+        "short_only_win": 34,
+        "full_only_win": 24,
+        "both_lose": 29,
+    }
+    assert "7.8125 points lower" in adjudication["selection_rationale"]
 
 
 def test_evaluation_types_randomized_primary_and_tournament_bridge() -> None:
     plan = build_plan()
-    assert plan["schema_version"] == "a1-post-p1-optimization-architecture-plan-v4"
+    assert plan["schema_version"] == "a1-post-p1-optimization-architecture-plan-v5"
     assert plan["evaluation"]["matched_search_operator"] == {
         "candidate_c_scale": 0.10,
         "baseline_c_scale": 0.10,

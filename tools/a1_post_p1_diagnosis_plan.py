@@ -20,13 +20,12 @@ from pathlib import Path
 from typing import Any, Sequence
 
 
-SCHEMA = "a1-post-p1-optimization-architecture-plan-v4"
+SCHEMA = "a1-post-p1-optimization-architecture-plan-v5"
 SHORT_SAMPLE_DOSE = 524_288
 FULL_SAMPLE_DOSE = 4_194_304
-# Backwards-compatible name for code that refers to the historical full dose.
-# It is evidence, not the default for a new arm; ``dose_adjudication`` below
-# must select the dose before any causal arm is launched.
-SAMPLE_DOSE = FULL_SAMPLE_DOSE
+# The matched common-random-number behavior screen selected the short dose.
+# The full dose remains evidence below, never the default for a new arm.
+SAMPLE_DOSE = SHORT_SAMPLE_DOSE
 
 SHORT_CHECKPOINT = {
     "path": (
@@ -98,12 +97,13 @@ def build_plan(
         "initialization": "authenticated f7 producer bytes, independently loaded per arm",
         "data": "exact P1 globally shuffled current-plus-gen3-replay descriptor",
         "sample_order": "same component/game/row sampler seed as P1",
-        # This plan used to hard-code the full dose for every arm.  The matched
-        # short checkpoint already closed 75% of the final teacher gap with
-        # only 27% of the final parameter drift, so doing that again would bake
-        # the proximal failure mechanism into every ablation.  No arm has a
-        # dose until the existing short/full checkpoints are adjudicated.
-        "sample_dose": "selected_by_dose_adjudication",
+        # The matched screens are complete: short scored 75-53 and full scored
+        # 65-63 against exact f7 on the same 128 (seed, orientation) keys.  The
+        # preregistered Pareto rule therefore selects the short dose.  Keep the
+        # full checkpoint as dose-response evidence, not a default continuation.
+        "sample_dose": SAMPLE_DOSE,
+        "max_steps": steps_by_dose[str(SAMPLE_DOSE)],
+        "dose_selection": "matched_behavior_pareto_rule",
         "dose_candidates": [SHORT_SAMPLE_DOSE, FULL_SAMPLE_DOSE],
         "max_steps_by_dose": steps_by_dose,
         "world_size": world_size,
@@ -357,8 +357,8 @@ def build_plan(
     }
     dose_adjudication = {
         "schema_version": "a1-dose-adjudication-v1",
-        "status": "required_before_new_training",
-        "launch_blocking": True,
+        "status": "selected",
+        "launch_blocking": False,
         "reason": (
             "the short run reached 0.102290 teacher-gap closure at 0.6913% global "
             "drift; the full run reached only 0.135757 closure at 2.5954% drift"
@@ -416,6 +416,36 @@ def build_plan(
             "select the smallest dose whose paired win rate is within 2 percentage "
             "points of the best dose and whose f7 panel is within 2 points of the "
             "best f7 delta; otherwise select the statistically superior dose"
+        ),
+        "observed_behavior": {
+            "common_seed_orientation_keys": 128,
+            str(SHORT_SAMPLE_DOSE): {
+                "candidate_wins": 75,
+                "baseline_wins": 53,
+                "win_rate": 0.5859375,
+                "errors": 0,
+                "truncations": 0,
+            },
+            str(FULL_SAMPLE_DOSE): {
+                "candidate_wins": 65,
+                "baseline_wins": 63,
+                "win_rate": 0.5078125,
+                "errors": 0,
+                "truncations": 0,
+            },
+            "paired_outcomes": {
+                "both_win": 41,
+                "short_only_win": 34,
+                "full_only_win": 24,
+                "both_lose": 29,
+            },
+        },
+        "selected_sample_dose": SAMPLE_DOSE,
+        "selected_optimizer_steps": steps_by_dose[str(SAMPLE_DOSE)],
+        "selection_rationale": (
+            "the full dose was not more than two percentage points stronger on "
+            "the matched f7 panel; observed strength was 7.8125 points lower, so "
+            "the smallest dose satisfies the Pareto rule"
         ),
         "failure_rule": (
             "if neither checkpoint clears the predeclared f7 performance floor, "
@@ -500,8 +530,8 @@ def build_plan(
         "promotion_eligible": False,
         "launch_authorized": False,
         "launch_condition": (
-            "existing short/full dose adjudication completes; then run only the next "
-            "predeclared one-axis arm"
+            "dose adjudication is complete; run only the next predeclared one-axis "
+            "arm at 524288 rows / 128 steps from exact f7"
         ),
         "target_semantics_audit": {
             "path": (
