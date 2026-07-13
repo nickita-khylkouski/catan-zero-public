@@ -41,9 +41,11 @@ GLOBAL_ROW_DOSE = 524_288
 GLOBAL_BATCH_SIZE = 8 * 512
 OPTIMIZER_STEPS = GLOBAL_ROW_DOSE // GLOBAL_BATCH_SIZE
 # The expectation is derived from authenticated training-only rows for every
-# concrete descriptor.  This tolerance is wider than six binomial sigmas for
-# the historical winning mix while still rejecting ~0.8% dose drift.
-POLICY_BASE_ACTIVE_ROW_TOLERANCE = 4_100
+# concrete descriptor. At the selected 524,288-row dose the historical active
+# fraction implies a binomial sigma of about 238 rows, so 1,500 is still wider
+# than six sigmas while avoiding the old full-dose tolerance's accidental 6.4%
+# window around the much smaller active-row count.
+POLICY_BASE_ACTIVE_ROW_TOLERANCE = 1_500
 EXPECTED_POLICY_AUX_ACTIVE_ROWS = 0
 EVENT_HISTORY_COMMAND_CONTRACT_SCHEMA = "a1-event-history-command-contract-v1"
 EVENT_HISTORY_ACK_FLAG = (

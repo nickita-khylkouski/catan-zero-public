@@ -273,7 +273,7 @@ def test_prepares_exact_one_dose_winning_operator_control_without_launch(
     assert manifest["recipe"]["base_value_row_dose"] == 524_288
     assert manifest["recipe"]["policy_aux_active_row_dose"] == 0
     assert manifest["recipe"]["expected_policy_base_active_rows"] == 64_443
-    assert manifest["recipe"]["policy_base_active_row_tolerance"] == 4_100
+    assert manifest["recipe"]["policy_base_active_row_tolerance"] == 1_500
     assert manifest["recipe"]["expected_policy_aux_active_rows"] == 0
     assert manifest["recipe"]["policy_distillation_component_ids"] == [
         "n128_current", "n256_current", "gen3_replay"
@@ -342,9 +342,9 @@ def test_prepares_exact_one_dose_winning_operator_control_without_launch(
         "available_training_rows": 15_000_000,
         "expected_active_fraction": pytest.approx(0.1229147619829968),
         "reference_base_active_rows": 64_443,
-        "base_active_rows_tolerance": 4_100,
-        "min_base_active_rows": 60_343,
-        "max_base_active_rows": 68_543,
+        "base_active_rows_tolerance": 1_500,
+        "min_base_active_rows": 62_943,
+        "max_base_active_rows": 65_943,
         "expected_aux_active_rows": 0,
         "accounting": "realized_policy_active_rows_not_global_samples",
     }

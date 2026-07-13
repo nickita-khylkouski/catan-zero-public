@@ -1950,7 +1950,13 @@ def _entity_graph_batch(
                 padded[:legal_count, :] = arr.astype(np.float32, copy=False)
                 arr = padded
             elif key == "legal_action_target_ids":
-                padded_targets = np.zeros((max_legal, arr.shape[1]), dtype=arr.dtype)
+                # -1 is the no-target sentinel in every target namespace. Zero
+                # is a valid hex/vertex/edge/player id, so zero-padding makes a
+                # padded action look targeted and target-aware policies reject
+                # ordinary mixed-legal-width batches before the forward pass.
+                padded_targets = np.full(
+                    (max_legal, arr.shape[1]), -1, dtype=arr.dtype
+                )
                 padded_targets[:legal_count, :] = arr[:legal_count]
                 arr = padded_targets
             elif key == "legal_action_mask":
