@@ -236,9 +236,11 @@ def _verify_report(
     checkpoint = _file_ref(root / "candidate.pt")
     report_ref = _file_ref(root / "train.report.json")
     report = _load_json(Path(report_ref["path"]), label="training report")
+    upgrade_flags = manifest.get("function_preserving_upgrade", {}).get("flags", {})
     parent_gather = bool(
         manifest["selected_parent"]["architecture"]["action_target_gather"]
     )
+    effective_gather = bool(upgrade_flags.get("action_target_gather", parent_gather))
     exact = {
         "init_checkpoint": manifest["initialization_treatment"]["path"],
         "init_checkpoint_sha256": manifest["initialization_treatment"]["sha256"],
@@ -284,7 +286,7 @@ def _verify_report(
         "freeze_modules": arm.FREEZE_MODULES,
         "require_only_trainable_prefixes": arm.TRAINABLE_PREFIX,
         "state_trunk": "transformer",
-        "action_target_gather": parent_gather,
+        "action_target_gather": effective_gather,
         "topology_residual_adapter": True,
         "symmetry_augment": True,
         "symmetry_augment_events": True,
@@ -342,12 +344,10 @@ def _verify_report(
         "required_trainable_surface"
     )
     if surface != {
-        "prefixes": [arm.TRAINABLE_PREFIX],
+        "prefixes": list(arm.TRAINABLE_PREFIXES),
         "parameter_tensors": len(EXPECTED_CHANGED_PARAMETERS),
         "parameters": arm.EXPECTED_TOPOLOGY_PARAMETER_COUNT,
-        "parameters_by_prefix": {
-            arm.TRAINABLE_PREFIX: arm.EXPECTED_TOPOLOGY_PARAMETER_COUNT
-        },
+        "parameters_by_prefix": arm.EXPECTED_PARAMETER_COUNTS,
     }:
         raise CompletionError("topology trainable surface is not exact 8/823040")
     metrics = report.get("metrics")

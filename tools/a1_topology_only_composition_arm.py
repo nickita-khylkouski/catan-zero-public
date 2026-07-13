@@ -74,6 +74,26 @@ EXPECTED_TOPOLOGY_PARAMETERS = tuple(
     )
 )
 EXPECTED_TOPOLOGY_PARAMETER_COUNT = 823_040
+UPGRADE_MODULE = architecture_upgrade.MODULE_TOPOLOGY_RESIDUAL
+TRAINABLE_PREFIXES = (TRAINABLE_PREFIX,)
+EXPECTED_PARAMETER_COUNTS = {
+    TRAINABLE_PREFIX: EXPECTED_TOPOLOGY_PARAMETER_COUNT,
+}
+MANIFEST_NAME = "topology-only-composition.manifest.json"
+ONLY_DECLARED_MODEL_DELTA = (
+    "train function-preserving topology_residual_adapter on frozen exact "
+    "selected parent"
+)
+ADAPTER_LR_CONTRACT = {"topology_lr": 3e-5 * TRUNK_LR_MULT}
+EFFECTIVE_TRAINABLE_OBJECTIVE = {
+    "policy_loss_reaches_topology_adapter": True,
+    "value_loss_reaches_topology_adapter": True,
+    "all_mature_policy_value_tensors_frozen": True,
+}
+TREATMENT_GEOMETRY_NAME = "treatment_topology_commissioning"
+TREATMENT_INTEGRATED_LR_CONTRACT = {
+    "trunk_integrated_lr_step_equivalents": TRUNK_LR_MULT,
+}
 
 SOURCE_FILES = tuple(
     dict.fromkeys(
@@ -571,12 +591,12 @@ def _validate_upgrade_receipt(
             f"topology upgrade receipt does not replay: {error}"
         ) from error
     if not (
-        receipt.get("module") == architecture_upgrade.MODULE_TOPOLOGY_RESIDUAL
+        receipt.get("module") == UPGRADE_MODULE
         and receipt.get("source") == dict(parent_checkpoint)
         and receipt.get("new_parameters") == list(EXPECTED_TOPOLOGY_PARAMETERS)
     ):
         raise TopologyCompositionError(
-            "upgrade is not MODULE_TOPOLOGY_RESIDUAL on the selected parent bytes"
+            f"upgrade is not {UPGRADE_MODULE} on the selected parent bytes"
         )
     return receipt
 
@@ -683,10 +703,7 @@ def prepare(args: argparse.Namespace) -> tuple[dict[str, Any], Path]:
         "corpus_topology_target_coverage": coverage,
         "event_history_training_contract": event_contract,
         "source_binding": binding,
-        "only_declared_model_delta": (
-            "train function-preserving topology_residual_adapter on frozen exact "
-            "selected parent"
-        ),
+        "only_declared_model_delta": ONLY_DECLARED_MODEL_DELTA,
         "matched_contract": {
             "reference_checkpoint": parent["checkpoint"],
             "reference_parent_receipt": parent["completion_receipt"],
@@ -700,16 +717,19 @@ def prepare(args: argparse.Namespace) -> tuple[dict[str, Any], Path]:
             "fresh_adam": True,
             "base_lr": 3e-5,
             "trunk_lr_mult": TRUNK_LR_MULT,
-            "topology_lr": 3e-5 * TRUNK_LR_MULT,
+            **ADAPTER_LR_CONTRACT,
             "action_module_lr_mult": ACTION_MODULE_LR_MULT,
             "value_lr_mult": VALUE_LR_MULT,
             "freeze_modules": FREEZE_MODULES.split(","),
-            "required_trainable_prefixes": [TRAINABLE_PREFIX],
+            "required_trainable_prefixes": list(TRAINABLE_PREFIXES),
             "new_trainable_parameter_names": list(EXPECTED_TOPOLOGY_PARAMETERS),
             "new_trainable_parameter_tensors": len(EXPECTED_TOPOLOGY_PARAMETERS),
             "new_trainable_parameters": EXPECTED_TOPOLOGY_PARAMETER_COUNT,
             "mature_parameters_trainable": False,
-            "trained_gather_frozen": parent["architecture"]["action_target_gather"],
+            "trained_gather_frozen": (
+                parent["architecture"]["action_target_gather"]
+                and "target_gather_proj" not in TRAINABLE_PREFIXES
+            ),
             "amp": "none",
             "float32_matmul_precision": "highest",
             "symmetry_augment": True,
@@ -721,11 +741,7 @@ def prepare(args: argparse.Namespace) -> tuple[dict[str, Any], Path]:
                 "per_rank_seedsequence_checkpoint_resume_v1"
             ),
         },
-        "effective_trainable_objective": {
-            "policy_loss_reaches_topology_adapter": True,
-            "value_loss_reaches_topology_adapter": True,
-            "all_mature_policy_value_tensors_frozen": True,
-        },
+        "effective_trainable_objective": EFFECTIVE_TRAINABLE_OBJECTIVE,
         "optimizer_geometry_contract": {
             "source_selected_TEMP": {
                 "world_size": WORLD_SIZE,
@@ -737,14 +753,15 @@ def prepare(args: argparse.Namespace) -> tuple[dict[str, Any], Path]:
                     * gather_arm.SELECTED_OPTIMIZER_STEPS
                 ),
             },
-            "treatment_topology_commissioning": {
+            TREATMENT_GEOMETRY_NAME: {
                 "world_size": WORLD_SIZE,
                 "local_batch_size": LOCAL_BATCH_SIZE,
                 "global_batch_size": GLOBAL_BATCH_SIZE,
                 **dose,
-                "trunk_integrated_lr_step_equivalents": (
-                    dose["integrated_lr_step_equivalents"] * TRUNK_LR_MULT
-                ),
+                **{
+                    key: dose["integrated_lr_step_equivalents"] * multiplier
+                    for key, multiplier in TREATMENT_INTEGRATED_LR_CONTRACT.items()
+                },
             },
             "allowlisted_optimizer_steps": list(ALLOWED_OPTIMIZER_STEPS),
         },
@@ -765,7 +782,7 @@ def prepare(args: argparse.Namespace) -> tuple[dict[str, Any], Path]:
     }
     manifest["manifest_sha256"] = _digest(manifest)
     output_root.mkdir(parents=True, exist_ok=True)
-    path = output_root / "topology-only-composition.manifest.json"
+    path = output_root / MANIFEST_NAME
     encoded = json.dumps(manifest, indent=2, sort_keys=True) + "\n"
     if path.exists():
         if path.read_text(encoding="utf-8") != encoded:
@@ -950,16 +967,19 @@ def verify(
         "fresh_adam": True,
         "base_lr": 3e-5,
         "trunk_lr_mult": TRUNK_LR_MULT,
-        "topology_lr": 3e-5 * TRUNK_LR_MULT,
+        **ADAPTER_LR_CONTRACT,
         "action_module_lr_mult": ACTION_MODULE_LR_MULT,
         "value_lr_mult": VALUE_LR_MULT,
         "freeze_modules": FREEZE_MODULES.split(","),
-        "required_trainable_prefixes": [TRAINABLE_PREFIX],
+        "required_trainable_prefixes": list(TRAINABLE_PREFIXES),
         "new_trainable_parameter_names": list(EXPECTED_TOPOLOGY_PARAMETERS),
         "new_trainable_parameter_tensors": len(EXPECTED_TOPOLOGY_PARAMETERS),
         "new_trainable_parameters": EXPECTED_TOPOLOGY_PARAMETER_COUNT,
         "mature_parameters_trainable": False,
-        "trained_gather_frozen": parent["architecture"]["action_target_gather"],
+        "trained_gather_frozen": (
+            parent["architecture"]["action_target_gather"]
+            and "target_gather_proj" not in TRAINABLE_PREFIXES
+        ),
         "amp": "none",
         "float32_matmul_precision": "highest",
         "symmetry_augment": True,
@@ -969,11 +989,7 @@ def verify(
         "selected_TEMP_policy_value_losses_unchanged": True,
         "distributed_symmetry_contract": "per_rank_seedsequence_checkpoint_resume_v1",
     }
-    expected_objective = {
-        "policy_loss_reaches_topology_adapter": True,
-        "value_loss_reaches_topology_adapter": True,
-        "all_mature_policy_value_tensors_frozen": True,
-    }
+    expected_objective = EFFECTIVE_TRAINABLE_OBJECTIVE
     expected_geometry = {
         "source_selected_TEMP": {
             "world_size": WORLD_SIZE,
@@ -985,14 +1001,15 @@ def verify(
                 * gather_arm.SELECTED_OPTIMIZER_STEPS
             ),
         },
-        "treatment_topology_commissioning": {
+        TREATMENT_GEOMETRY_NAME: {
             "world_size": WORLD_SIZE,
             "local_batch_size": LOCAL_BATCH_SIZE,
             "global_batch_size": GLOBAL_BATCH_SIZE,
             **dose,
-            "trunk_integrated_lr_step_equivalents": (
-                dose["integrated_lr_step_equivalents"] * TRUNK_LR_MULT
-            ),
+            **{
+                key: dose["integrated_lr_step_equivalents"] * multiplier
+                for key, multiplier in TREATMENT_INTEGRATED_LR_CONTRACT.items()
+            },
         },
         "allowlisted_optimizer_steps": list(ALLOWED_OPTIMIZER_STEPS),
     }
@@ -1000,11 +1017,7 @@ def verify(
         payload.get("matched_contract") == expected_matched
         and payload.get("effective_trainable_objective") == expected_objective
         and payload.get("optimizer_geometry_contract") == expected_geometry
-        and payload.get("only_declared_model_delta")
-        == (
-            "train function-preserving topology_residual_adapter on frozen exact "
-            "selected parent"
-        )
+        and payload.get("only_declared_model_delta") == ONLY_DECLARED_MODEL_DELTA
         and payload.get("evaluation_contract")
         == {
             "primary_opponent": parent["checkpoint"],
