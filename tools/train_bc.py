@@ -5495,6 +5495,23 @@ def main(argv: Sequence[str] | None = None) -> None:
         ),
         ddp,
     )
+    aux_subgoal_target_coverage = None
+    if float(args.aux_subgoal_loss_weight) > 0.0:
+        aux_subgoal_target_coverage = _validate_aux_subgoal_target_coverage(
+            data,
+            ddp=ddp,
+            data_sharded=bool(args.ddp_shard_data),
+        )
+        _rank0_print(
+            json.dumps(
+                {
+                    "progress": "aux_subgoal_target_coverage",
+                    **aux_subgoal_target_coverage,
+                },
+                sort_keys=True,
+            ),
+            ddp,
+        )
     belief_resource_coverage = None
     if float(args.belief_resource_loss_weight) > 0.0:
         if bool(args.ddp_shard_data):
@@ -7878,9 +7895,9 @@ def main(argv: Sequence[str] | None = None) -> None:
         "world_size": ddp["world_size"],
         "ddp_shard_data": bool(args.ddp_shard_data),
         "ddp_find_unused_parameters": bool(args.ddp_find_unused_parameters),
-        "teacher_weights": _parse_weight_map(args.teacher_weights),
-        "phase_weights": _parse_weight_map(args.phase_weights),
-        "value_phase_weights": _parse_weight_map(value_phase_weights_raw),
+        "teacher_weights": teacher_weight_map,
+        "phase_weights": policy_phase_weight_map,
+        "value_phase_weights": value_phase_weight_map,
         "forced_action_weight": args.forced_action_weight,
         "per_game_policy_weight": bool(args.per_game_policy_weight),
         "per_game_policy_weight_mode": str(args.per_game_policy_weight_mode),
@@ -7952,6 +7969,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         ),
         "value_uncertainty_loss_weight": args.value_uncertainty_loss_weight,
         "aux_subgoal_loss_weight": args.aux_subgoal_loss_weight,
+        "aux_subgoal_target_coverage": aux_subgoal_target_coverage,
         "belief_resource_loss_weight": args.belief_resource_loss_weight,
         "belief_resource_coverage": belief_resource_coverage,
         "moe_balance_loss_weight": args.moe_balance_loss_weight,
@@ -8471,6 +8489,100 @@ _AUX_SUBGOAL_SPECS = (
     ("aux_next_settlement", "categorical"),
     ("aux_robber_target", "categorical"),
 )
+
+
+def _validate_aux_subgoal_target_coverage(
+    data,
+    *,
+    ddp: dict[str, int | bool] | None = None,
+    data_sharded: bool = False,
+) -> dict[str, object]:
+    """Require at least one finite supervised row for every enabled aux head.
+
+    The model contract enables the complete five-head bundle.  Merely finding
+    column names is insufficient: a legacy/composite corpus can backfill every
+    value with NaN/-1, making all five objectives exact no-ops while training
+    appears healthy.  Scan once before model/GPU setup and union counts across
+    rank-sharded corpora.
+    """
+
+    row_count = int(len(data["action_taken"]))
+    local_counts: dict[str, int] = {}
+    local_errors: list[str] = []
+    for field, kind in _AUX_SUBGOAL_SPECS:
+        if field not in data:
+            local_counts[field] = 0
+            continue
+        try:
+            values = np.asarray(data[field], dtype=np.float64)
+        except (TypeError, ValueError) as error:
+            local_errors.append(f"aux target {field!r} is not numeric: {error}")
+            local_counts[field] = 0
+            continue
+        if values.shape != (row_count,):
+            local_errors.append(
+                f"aux target {field!r} must have shape ({row_count},), "
+                f"got {values.shape}"
+            )
+            local_counts[field] = 0
+            continue
+        valid = np.isfinite(values)
+        if kind == "categorical":
+            valid &= values >= 0.0
+        local_counts[field] = int(np.count_nonzero(valid))
+
+    counts = local_counts
+    total_rows = row_count
+    if ddp and bool(ddp.get("enabled", False)):
+        import torch.distributed as dist
+
+        gathered: list[tuple[int, dict[str, int], list[str]] | None] = [
+            None for _ in range(int(ddp["world_size"]))
+        ]
+        dist.all_gather_object(gathered, (row_count, local_counts, local_errors))
+        rank_reports = [report for report in gathered if report is not None]
+        distributed_errors = [
+            error
+            for _rows, _rank_counts, errors in rank_reports
+            for error in errors
+        ]
+        if distributed_errors:
+            raise SystemExit(
+                "malformed auxiliary target corpus: "
+                + "; ".join(sorted(set(distributed_errors)))
+            )
+        if data_sharded:
+            total_rows = sum(rows for rows, _rank_counts, _errors in rank_reports)
+            counts = {
+                field: sum(
+                    rank_counts[field]
+                    for _rows, rank_counts, _errors in rank_reports
+                )
+                for field, _kind in _AUX_SUBGOAL_SPECS
+            }
+        elif rank_reports:
+            # Every rank maps the same corpus; retain one exact count rather
+            # than multiplying coverage by world size.
+            total_rows, counts, _errors = rank_reports[0]
+    elif local_errors:
+        raise SystemExit(
+            "malformed auxiliary target corpus: "
+            + "; ".join(sorted(set(local_errors)))
+        )
+
+    empty = [field for field, _kind in _AUX_SUBGOAL_SPECS if counts[field] <= 0]
+    if empty:
+        raise SystemExit(
+            "--aux-subgoal-loss-weight > 0 has zero finite supervised rows for "
+            "enabled head(s): "
+            + ", ".join(empty)
+            + "; regenerate/select labeled data or disable the aux objective"
+        )
+    return {
+        "schema_version": "aux-subgoal-target-coverage-v1",
+        "rows": int(total_rows),
+        "valid_rows_by_head": {field: int(counts[field]) for field, _ in _AUX_SUBGOAL_SPECS},
+    }
 
 
 def _aux_subgoal_loss(
@@ -9707,12 +9819,20 @@ def _objective_measure_validation_aggregate(
     # per-game teacher-gap closure can Simpson-reverse an arm when games differ
     # in active-row density or target/prior gap. Reconstruct the KL densities
     # first, then form the ratio exactly once under the training measure.
+    teacher_gap_denominator = (
+        "active_policy_teacher_gap_weight_sum"
+        if all(
+            "active_policy_teacher_gap_weight_sum" in report
+            for report in reports
+        )
+        else "active_policy_teacher_gap_rows"
+    )
     conditional_metrics = {
         "prior_kl_model_prior_mean": "prior_kl_rows",
         "prior_kl_prior_model_mean": "prior_kl_rows",
         "prior_kl_target_prior_mean": "prior_kl_rows",
-        "active_policy_kl_target_model_mean": "active_policy_teacher_gap_rows",
-        "active_policy_kl_target_prior_mean": "active_policy_teacher_gap_rows",
+        "active_policy_kl_target_model_mean": teacher_gap_denominator,
+        "active_policy_kl_target_prior_mean": teacher_gap_denominator,
     }
     for key, denominator_key in conditional_metrics.items():
         if not all(
@@ -10017,6 +10137,7 @@ def evaluate_bc_batches(
             "prior_kl_prior_model_sum": 0.0,
             "prior_kl_target_prior_sum": 0.0,
             "active_policy_teacher_gap_rows": 0.0,
+            "active_policy_teacher_gap_weight_sum": 0.0,
             "active_policy_kl_target_model_sum": 0.0,
             "active_policy_kl_target_prior_sum": 0.0,
         }
@@ -10185,6 +10306,9 @@ def evaluate_bc_batches(
             )
             extra_sums["active_policy_teacher_gap_rows"] += float(
                 batch_metrics.get("active_policy_teacher_gap_rows", 0.0)
+            )
+            extra_sums["active_policy_teacher_gap_weight_sum"] += float(
+                batch_metrics.get("active_policy_teacher_gap_weight_sum", 0.0)
             )
             extra_sums["active_policy_kl_target_model_sum"] += float(
                 batch_metrics.get("active_policy_kl_target_model_sum", 0.0)
@@ -10374,6 +10498,9 @@ def evaluate_bc_batches(
             # multi-action soft target + a recorded prior.
             **_active_policy_teacher_gap_report(
                 rows=extra_sums["active_policy_teacher_gap_rows"],
+                weight_sum=extra_sums[
+                    "active_policy_teacher_gap_weight_sum"
+                ],
                 kl_target_model_sum=extra_sums[
                     "active_policy_kl_target_model_sum"
                 ],
@@ -10690,12 +10817,6 @@ def _eval_xdim_batch(
                 )
             else:
                 per_sample_loss = hard_loss
-            # Teacher-gap telemetry must follow the rows the POLICY objective can
-            # actually update.  In PCR corpora, fast-search and forced rows still
-            # carry stored target/prior distributions but have zero policy weight;
-            # including them made the historical prior_kl_ratio compare against a
-            # much larger, untrained target population.
-            policy_active_for_teacher_gap = policy_weights > 0.0
             (
                 outcome_targets,
                 vp_targets,
@@ -10761,6 +10882,11 @@ def _eval_xdim_batch(
                 advantage_weight_cap,
                 advantage_weight_floor,
             )
+            # Teacher-gap telemetry follows the exact effective POLICY weights,
+            # including authenticated row multipliers and optional advantage
+            # reweighting.  A boolean active mask would give a weight-100 repair
+            # row and a weight-1 incidental row equal diagnostic influence.
+            policy_active_for_teacher_gap = policy_weights > 0.0
             policy_loss_sum, policy_loss_denominator = _weighted_loss_parts(per_sample_loss, policy_weights)
             policy_loss = policy_loss_sum / torch.clamp(policy_loss_denominator, min=1e-6)
             value_loss = torch.tensor(0.0, dtype=torch.float32, device=policy.device)
@@ -11051,17 +11177,26 @@ def _eval_xdim_batch(
             soft_targets=soft_targets,
             has_soft=has_soft,
             policy_active=policy_active_for_teacher_gap,
+            policy_weights=policy_weights,
         )
         if teacher_gap is not None:
-            teacher_gap_rows = int(teacher_gap["eligible"].sum().item())
+            teacher_gap_eligible = teacher_gap["eligible"]
+            teacher_gap_weights = teacher_gap["effective_weights"]
+            teacher_gap_rows = int(teacher_gap_eligible.sum().item())
+            teacher_gap_weight_sum = float(teacher_gap_weights.sum().item())
             teacher_kl_target_model_sum = float(
-                teacher_gap["kl_target_model"][teacher_gap["eligible"]].sum().item()
+                (
+                    teacher_gap["kl_target_model"] * teacher_gap_weights
+                ).sum().item()
             )
             teacher_kl_target_prior_sum = float(
-                teacher_gap["kl_target_prior"][teacher_gap["eligible"]].sum().item()
+                (
+                    teacher_gap["kl_target_prior"] * teacher_gap_weights
+                ).sum().item()
             )
         else:
             teacher_gap_rows = 0
+            teacher_gap_weight_sum = 0.0
             teacher_kl_target_model_sum = 0.0
             teacher_kl_target_prior_sum = 0.0
         return {
@@ -11186,6 +11321,7 @@ def _eval_xdim_batch(
             "prior_kl_prior_model_sum": kl_prior_model_sum,
             "prior_kl_target_prior_sum": kl_target_prior_sum,
             "active_policy_teacher_gap_rows": teacher_gap_rows,
+            "active_policy_teacher_gap_weight_sum": teacher_gap_weight_sum,
             "active_policy_kl_target_model_sum": teacher_kl_target_model_sum,
             "active_policy_kl_target_prior_sum": teacher_kl_target_prior_sum,
         }
@@ -14343,12 +14479,14 @@ def _active_policy_teacher_gap_telemetry(
     soft_targets,
     has_soft,
     policy_active,
+    policy_weights=None,
 ):
     """Measure how much of the active soft-policy teacher gap was closed.
 
     This intentionally differs from the historical ``_prior_kl_telemetry``:
 
-    * only rows with positive policy loss weight are eligible;
+    * only rows with positive policy loss weight are eligible and each KL is
+      weighted by that exact effective objective weight;
     * only usable multi-action soft targets are eligible; and
     * the primary distance is ``KL(target || model)``, the direction aligned
       with the soft cross-entropy objective.
@@ -14385,12 +14523,31 @@ def _active_policy_teacher_gap_telemetry(
     prior_mass = prior.sum(dim=-1)
     prior = prior / torch.clamp(prior_mass.unsqueeze(-1), min=eps)
 
+    objective_active = policy_active.to(device=device, dtype=torch.bool)
+    if policy_weights is None:
+        effective_weights = objective_active.to(dtype=torch.float32)
+    else:
+        effective_weights = policy_weights.to(
+            device=device, dtype=torch.float32
+        )
+        if effective_weights.shape != objective_active.shape:
+            raise ValueError("teacher-gap policy weights have the wrong shape")
+        if not torch.isfinite(effective_weights).all() or bool(
+            (effective_weights < 0.0).any()
+        ):
+            raise ValueError(
+                "teacher-gap policy weights must be finite and non-negative"
+            )
+        objective_active &= effective_weights > 0.0
     has_multi_action_target = ((target > 0.0) & valid).sum(dim=-1) > 1
     eligible = (
-        policy_active.to(device=device, dtype=torch.bool)
+        objective_active
         & has_soft.to(device=device, dtype=torch.bool)
         & has_multi_action_target
         & (prior_mass > eps)
+    )
+    effective_weights = torch.where(
+        eligible, effective_weights, torch.zeros_like(effective_weights)
     )
 
     log_target = torch.log(torch.clamp(target, min=eps))
@@ -14406,31 +14563,55 @@ def _active_policy_teacher_gap_telemetry(
         target * (log_target - log_prior),
         zeros,
     ).sum(dim=-1).clamp_min(0.0)
+    # Rows outside the admitted objective can carry all-masked logits (and thus
+    # NaN log-softmax values).  Zero them explicitly: IEEE NaN * zero is still
+    # NaN, so relying only on a zero effective weight would poison additive
+    # telemetry reductions.
+    kl_target_model = torch.where(
+        eligible, kl_target_model, torch.zeros_like(kl_target_model)
+    )
+    kl_target_prior = torch.where(
+        eligible, kl_target_prior, torch.zeros_like(kl_target_prior)
+    )
     return {
         "eligible": eligible,
+        "effective_weights": effective_weights,
         "kl_target_model": kl_target_model,
         "kl_target_prior": kl_target_prior,
     }
 
 
 def _active_policy_teacher_gap_report(
-    *, rows: float, kl_target_model_sum: float, kl_target_prior_sum: float
-) -> dict[str, float | int]:
+    *,
+    rows: float,
+    kl_target_model_sum: float,
+    kl_target_prior_sum: float,
+    weight_sum: float | None = None,
+) -> dict[str, object]:
     """Reduce additive teacher-gap statistics into report-level metrics."""
 
     count = max(float(rows), 0.0)
+    denominator = count if weight_sum is None else max(float(weight_sum), 0.0)
     target_model = float(kl_target_model_sum)
     target_prior = float(kl_target_prior_sum)
-    return {
+    report: dict[str, object] = {
         "active_policy_teacher_gap_rows": int(round(count)),
-        "active_policy_kl_target_model_mean": target_model / max(count, 1.0),
-        "active_policy_kl_target_prior_mean": target_prior / max(count, 1.0),
+        "active_policy_kl_target_model_mean": target_model
+        / max(denominator, 1.0e-12),
+        "active_policy_kl_target_prior_mean": target_prior
+        / max(denominator, 1.0e-12),
         "active_policy_teacher_gap_closure": (
             1.0 - target_model / target_prior
-            if count > 0.0 and target_prior > 1.0e-8
+            if denominator > 0.0 and target_prior > 1.0e-8
             else 0.0
         ),
     }
+    if weight_sum is not None:
+        report["active_policy_teacher_gap_weight_sum"] = denominator
+        report["active_policy_teacher_gap_weighting"] = (
+            "effective_policy_objective_weight"
+        )
+    return report
 
 
 def compute_policy_surprise_kl(

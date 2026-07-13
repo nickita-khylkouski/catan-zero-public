@@ -50,6 +50,47 @@ def test_heads_built_but_corpus_lacks_aux_fields_raises_loud():
         train_bc._aux_subgoal_loss(out, data, np.arange(_N), _DEVICE)
 
 
+def _coverage_data(**overrides):
+    data = {
+        "action_taken": np.zeros(_N, dtype=np.int16),
+        "aux_longest_road": np.asarray([0.0, 1.0, np.nan, np.nan]),
+        "aux_largest_army": np.asarray([0.0, 0.0, 1.0, np.nan]),
+        "aux_vp_in_n": np.asarray([0.0, 1.0, 2.0, np.nan]),
+        "aux_next_settlement": np.asarray([5, 12, -1, -1]),
+        "aux_robber_target": np.asarray([3, -1, -1, 7]),
+    }
+    data.update(overrides)
+    return data
+
+
+def test_aux_coverage_preflight_reports_finite_rows_per_enabled_head():
+    report = train_bc._validate_aux_subgoal_target_coverage(_coverage_data())
+
+    assert report["rows"] == _N
+    assert report["valid_rows_by_head"] == {
+        "aux_longest_road": 2,
+        "aux_largest_army": 3,
+        "aux_vp_in_n": 3,
+        "aux_next_settlement": 2,
+        "aux_robber_target": 2,
+    }
+
+
+def test_aux_coverage_preflight_rejects_present_but_all_ignored_head():
+    data = _coverage_data(aux_robber_target=np.full(_N, -1, dtype=np.int16))
+
+    with pytest.raises(SystemExit, match="aux_robber_target"):
+        train_bc._validate_aux_subgoal_target_coverage(data)
+
+
+def test_aux_coverage_preflight_rejects_missing_head_column():
+    data = _coverage_data()
+    del data["aux_vp_in_n"]
+
+    with pytest.raises(SystemExit, match="aux_vp_in_n"):
+        train_bc._validate_aux_subgoal_target_coverage(data)
+
+
 def test_heads_absent_is_noop():
     """Heads-off model (no aux outputs): fn is a pure no-op, never raises."""
     out = {"logits": torch.randn(_N, 5), "value": torch.randn(_N)}

@@ -295,3 +295,33 @@ def test_teacher_gap_closure_uses_aggregate_kl_mass_not_mean_of_game_ratios() ->
     assert report["components"]["n128"]["metrics"][
         "active_policy_teacher_gap_closure"
     ] == pytest.approx(1.0 - (1.0 / 3.0) / (10.0 + 1.0 / 3.0))
+
+
+def test_teacher_gap_closure_aggregates_effective_objective_weight_mass() -> None:
+    metrics, sufficient = _objective_measure_validation_aggregate(
+        [
+            {
+                "samples": 1,
+                "active_policy_teacher_gap_rows": 1,
+                "active_policy_teacher_gap_weight_sum": 100.0,
+                "active_policy_kl_target_model_mean": 0.0,
+                "active_policy_kl_target_prior_mean": 1.0,
+            },
+            {
+                "samples": 1,
+                "active_policy_teacher_gap_rows": 1,
+                "active_policy_teacher_gap_weight_sum": 1.0,
+                "active_policy_kl_target_model_mean": 1.0,
+                "active_policy_kl_target_prior_mean": 1.0,
+            },
+        ],
+        np.asarray([0.5, 0.5]),
+    )
+
+    assert metrics["active_policy_teacher_gap_closure"] == pytest.approx(
+        100.0 / 101.0
+    )
+    assert sufficient is not None
+    assert sufficient["active_policy_kl_target_model_mean"][
+        "weight_per_sample"
+    ] == pytest.approx(50.5)
