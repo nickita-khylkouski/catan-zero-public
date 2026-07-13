@@ -103,6 +103,27 @@ def test_inconsistent_private_composition_is_rejected() -> None:
     assert valid[1, 1]
 
 
+def test_saturation_ambiguous_hidden_hand_is_rejected() -> None:
+    raw = _privileged_players()
+    # The featurizer clips an actual [11, 3, 2, 2, 3] / total=21 hand to this
+    # apparently self-consistent [10, 3, 2, 2, 3] / total=20 representation.
+    # It is not recoverable privileged truth and must not become supervision.
+    raw[0, 1, 6] = 1.0
+    raw[0, 1, 16:21] = np.array([10, 3, 2, 2, 3]) / 10
+    _, _, valid = resource_belief_targets(raw)
+    assert not valid[0, 1]
+    assert valid[1, 1]
+
+
+def test_fractional_hidden_card_encoding_is_rejected_before_rounding() -> None:
+    raw = _privileged_players()
+    raw[0, 1, 16:21] = np.array([1.49, 0.0, 1.0, 0.0, 1.0]) / 10
+    raw[0, 1, 6] = 3 / 20
+    _, _, valid = resource_belief_targets(raw)
+    assert not valid[0, 1]
+    assert valid[1, 1]
+
+
 def test_nonfinite_private_label_is_rejected_without_nan_loss(monkeypatch) -> None:
     raw = _privileged_players()
     raw[0, 1, 16] = np.nan

@@ -29,8 +29,9 @@ def resource_belief_targets(
     stores resource counts divided by 10 and the public total divided by 20.
     A row is valid only when it is a present non-actor player, omniscient labels
     are present, the public total is positive, and the private counts sum to the
-    public total.  The last check prevents malformed provenance from becoming a
-    privileged training signal.
+    public total. Saturated or non-integral banked encodings are rejected too:
+    clipped feature slots cannot prove the exact hidden hand. These checks
+    prevent malformed or lossy provenance from becoming a privileged signal.
     """
 
     tokens = np.asarray(player_tokens)
@@ -52,6 +53,31 @@ def resource_belief_targets(
         & np.isfinite(total_scaled)
         & (composition_scaled >= 0.0).all(axis=-1)
         & (total_scaled >= 0.0)
+    )
+    # The source featurizer clips every resource slot at 10 cards and the
+    # public total at 20.  Once either encoded value reaches its ceiling we
+    # cannot distinguish the exact boundary from a larger, clipped hand.  In
+    # particular, an actual 21-card hand such as [11, 3, 2, 2, 3] is banked as
+    # [10, 3, 2, 2, 3] with total 20 and would otherwise pass the sum check as a
+    # silently incomplete label.  Reject the (rare) ambiguous boundary rather
+    # than train on invented hidden truth.
+    unsaturated = (composition_scaled < 10.0 - 0.01).all(axis=-1) & (
+        total_scaled < 20.0 - 0.01
+    )
+    # Valid feature-bank counts are integer-valued before scaling.  Checking
+    # integrality before rounding prevents malformed fractional encodings from
+    # being silently coerced into plausible privileged labels.  The tolerance
+    # covers float16 storage error (e.g. 0.3 * 10) without admitting a half-card.
+    integral = np.isclose(
+        composition_scaled,
+        np.rint(composition_scaled),
+        rtol=0.0,
+        atol=0.01,
+    ).all(axis=-1) & np.isclose(
+        total_scaled,
+        np.rint(total_scaled),
+        rtol=0.0,
+        atol=0.01,
     )
     composition = np.clip(
         np.rint(
@@ -80,6 +106,8 @@ def resource_belief_targets(
         & ~actor
         & labels_present
         & numeric
+        & unsaturated
+        & integral
         & (public_total > 0.0)
         & totals_match
     )
