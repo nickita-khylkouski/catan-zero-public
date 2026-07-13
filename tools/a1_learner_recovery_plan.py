@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Emit the sealed, non-launching A1 learner-recovery experiment matrix.
+"""Emit the superseded historical A1 learner-recovery experiment matrix.
 
-This tool deliberately does not accept ``--go``.  It converts a measured B200
-batch topology into sample-matched optimizer-step counts and records the exact
-recipe deltas for successive-halving.  A separate reviewed executor may later
-bind real corpus/checkpoint bytes to one selected arm.
+This tool deliberately does not accept ``--go`` and is not selection authority.
+It preserves the old 4.19M/BF16 matrix for forensic replay only; current work is
+governed by ``a1_post_p1_diagnosis_plan:v5`` plus an authenticated current data
+recipe.  No executor may bind a new arm to this schema or its digest.
 """
 
 from __future__ import annotations
@@ -155,6 +155,13 @@ def build_plan(*, world_size: int, local_batch_size: int, grad_accum_steps: int)
     ]
     payload = {
         "schema_version": SCHEMA,
+        # This matrix is retained only to explain the historical recovery
+        # experiments.  Its 4.19M/BF16/component recipe predates the matched
+        # dose adjudication and must never be accepted as authority for a new
+        # learner or auxiliary arm.
+        "status": "superseded_historical",
+        "selection_authority": False,
+        "superseded_by": "a1_post_p1_diagnosis_plan:v5",
         "diagnostic_only": True,
         "promotion_eligible": False,
         "launch_authorized": False,

@@ -29,6 +29,13 @@ def test_plan_matches_update_dose_across_measured_batch_topologies():
         )
 
 
+def test_historical_recovery_matrix_is_not_selection_authority():
+    plan = build_plan(world_size=8, local_batch_size=512, grad_accum_steps=1)
+    assert plan["status"] == "superseded_historical"
+    assert plan["selection_authority"] is False
+    assert plan["superseded_by"] == "a1_post_p1_diagnosis_plan:v5"
+
+
 def test_anchor_sweep_is_single_variable_and_q_stays_disabled():
     plan = build_plan(world_size=8, local_batch_size=1024, grad_accum_steps=1)
     anchors = [arm for arm in plan["arms"] if arm["stage"] == "P1_anchor"]
