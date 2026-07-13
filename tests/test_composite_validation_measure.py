@@ -66,6 +66,28 @@ def test_objective_matched_validation_is_component_then_game_then_row() -> None:
     assert calls == [(0,), (1, 2, 3), (4, 5)]
 
 
+def test_policy_aux_validation_never_claims_base_only_measure_is_matched() -> None:
+    data = _Composite()
+
+    report = evaluate_composite_validation_measure(
+        data,
+        np.arange(6, dtype=np.int64),
+        lambda indices: {"loss": float(len(indices)), "samples": len(indices)},
+        policy_aux_active_batch_size=32,
+    )
+
+    assert report["objective_matched"] is False
+    assert report["policy_aux_validation"] == {
+        "active_batch_size": 32,
+        "conditioned_stream_included": False,
+    }
+    assert "policy auxiliary stream" in report["warning"]
+    with pytest.raises(ValueError, match="raw concatenated-row fallback"):
+        objective_matched_validation_metrics(
+            {"validation_objective_matched": report}, require_matched=True
+        )
+
+
 def test_objective_matched_validation_rejects_missing_component_holdout() -> None:
     data = _Composite()
 

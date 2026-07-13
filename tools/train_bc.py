@@ -1588,20 +1588,20 @@ def _resolve_value_objective_weights(args) -> tuple[float, float]:
         "value_categorical_loss_weight": categorical_override,
         "hlgauss_scalar_aux_loss_weight": scalar_aux,
     }
-    if any(value < 0.0 for value in weights.values()):
+    if any(not math.isfinite(value) or value < 0.0 for value in weights.values()):
         raise SystemExit(
-            "value objective weights must be non-negative: "
+            "value objective weights must be finite and non-negative: "
             + ", ".join(f"{key}={value}" for key, value in weights.items())
         )
     value_target_lambda = float(getattr(args, "value_target_lambda", 1.0))
-    if not 0.0 <= value_target_lambda <= 1.0:
+    if not math.isfinite(value_target_lambda) or not 0.0 <= value_target_lambda <= 1.0:
         raise SystemExit(
             "--value-target-lambda must be in [0, 1]; values outside the convex "
             "range create invalid categorical probability mass and extrapolated "
             f"scalar targets (got {value_target_lambda})"
         )
     sigma_ratio = float(getattr(args, "value_hlgauss_sigma_ratio", 0.75))
-    if sigma_ratio <= 0.0:
+    if not math.isfinite(sigma_ratio) or sigma_ratio <= 0.0:
         raise SystemExit(
             "--value-hlgauss-sigma-ratio must be > 0 so the HL-Gauss target is "
             f"well-defined (got {sigma_ratio})"
@@ -5128,6 +5128,17 @@ def main(argv: Sequence[str] | None = None) -> None:
         argv=raw_argv,
         expected_pipeline=TrainConfig.PIPELINE,
     )
+    _validate_training_weight_arguments(args)
+    teacher_weight_map = _parse_weight_map(
+        args.teacher_weights, option="--teacher-weights"
+    )
+    policy_phase_weight_map = _parse_weight_map(
+        args.phase_weights, option="--phase-weights"
+    )
+    value_phase_weights_raw = args.value_phase_weights or args.phase_weights
+    value_phase_weight_map = _parse_weight_map(
+        value_phase_weights_raw, option="--value-phase-weights"
+    )
     args.max_grad_norm = _validate_max_grad_norm(args.max_grad_norm)
     if float(args.belief_resource_loss_weight) < 0.0:
         raise SystemExit("--belief-resource-loss-weight must be >= 0")
@@ -5470,6 +5481,20 @@ def main(argv: Sequence[str] | None = None) -> None:
                 float(args.belief_resource_loss_weight) > 0.0
             ),
         )
+    weight_map_admission = _validate_weight_map_keys(
+        data,
+        teacher_weights=teacher_weight_map,
+        policy_phase_weights=policy_phase_weight_map,
+        value_phase_weights=value_phase_weight_map,
+        ddp=ddp,
+    )
+    _rank0_print(
+        json.dumps(
+            {"progress": "weight_map_admission", **weight_map_admission},
+            sort_keys=True,
+        ),
+        ddp,
+    )
     belief_resource_coverage = None
     if float(args.belief_resource_loss_weight) > 0.0:
         if bool(args.ddp_shard_data):
@@ -6237,10 +6262,6 @@ def main(argv: Sequence[str] | None = None) -> None:
     start = time.perf_counter()
     metrics = []
     n = len(data["action_taken"])
-    teacher_weight_map = _parse_weight_map(args.teacher_weights)
-    policy_phase_weight_map = _parse_weight_map(args.phase_weights)
-    value_phase_weights_raw = args.value_phase_weights or args.phase_weights
-    value_phase_weight_map = _parse_weight_map(value_phase_weights_raw)
 
     def _build_derived_training_arrays() -> dict[str, np.ndarray]:
         """Build deterministic O(rows) learner arrays once per host."""
@@ -7456,6 +7477,9 @@ def main(argv: Sequence[str] | None = None) -> None:
                     data,
                     validation_indices,
                     _evaluate_validation_indices,
+                    policy_aux_active_batch_size=int(
+                        args.policy_aux_active_batch_size
+                    ),
                 )
             )
         _rank0_print(
@@ -9772,6 +9796,8 @@ def evaluate_composite_validation_measure(
     data,
     validation_indices: np.ndarray,
     evaluate_indices,
+    *,
+    policy_aux_active_batch_size: int = 0,
 ) -> dict[str, object]:
     """Evaluate a composite under its authenticated training distribution.
 
@@ -9868,13 +9894,34 @@ def evaluate_composite_validation_measure(
     aggregate, aggregate_sufficient = _objective_measure_validation_aggregate(
         all_game_reports, np.asarray(all_game_weights, dtype=np.float64)
     )
+    policy_aux_active_batch_size = int(policy_aux_active_batch_size)
+    policy_aux_omitted = policy_aux_active_batch_size > 0
     return {
         "schema_version": "composite-validation-measure-v2",
         "measure": (
             "authenticated_component_then_uniform_game_then_uniform_row_"
             "with_objective_weight_density"
+            + (
+                "_base_stream_only_policy_aux_omitted"
+                if policy_aux_omitted
+                else ""
+            )
         ),
-        "objective_matched": True,
+        "objective_matched": not policy_aux_omitted,
+        "policy_aux_validation": {
+            "active_batch_size": policy_aux_active_batch_size,
+            "conditioned_stream_included": False,
+        },
+        **(
+            {
+                "warning": (
+                    "base-stream validation excludes the active-row-conditioned "
+                    "policy auxiliary stream and is not objective-matched"
+                )
+            }
+            if policy_aux_omitted
+            else {}
+        ),
         "samples": int(indices.size),
         "games": int(
             sum(int(report["games"]) for report in component_reports.values())
@@ -11909,8 +11956,11 @@ def load_teacher_data(
         "truncated",
         "final_public_vps",
         "has_final_public_vps",
+        "has_final_public_vps_snapshot",
         "final_actual_vps",
         "has_final_actual_vps",
+        "has_final_actual_vps_snapshot",
+        "has_truncated_vp_snapshot",
         "policy_weight_multiplier",
         "value_weight_multiplier",
         *OPPONENT_PROVENANCE_KEYS,
@@ -12519,6 +12569,13 @@ def _normalize_teacher_shard(
             path,
             leading=n,
         ).astype(np.bool_, copy=False),
+        "has_final_public_vps_snapshot": _field_or_default(
+            shard,
+            "has_final_public_vps_snapshot",
+            np.full(n, False, dtype=np.bool_),
+            path,
+            leading=n,
+        ).astype(np.bool_, copy=False),
         "final_actual_vps": _field_or_default(
             shard,
             "final_actual_vps",
@@ -12530,6 +12587,20 @@ def _normalize_teacher_shard(
             shard,
             "has_final_actual_vps",
             np.full(n, shard_has_final_actual_vps, dtype=np.bool_),
+            path,
+            leading=n,
+        ).astype(np.bool_, copy=False),
+        "has_final_actual_vps_snapshot": _field_or_default(
+            shard,
+            "has_final_actual_vps_snapshot",
+            np.full(n, False, dtype=np.bool_),
+            path,
+            leading=n,
+        ).astype(np.bool_, copy=False),
+        "has_truncated_vp_snapshot": _field_or_default(
+            shard,
+            "has_truncated_vp_snapshot",
+            np.full(n, False, dtype=np.bool_),
             path,
             leading=n,
         ).astype(np.bool_, copy=False),
@@ -14746,12 +14817,14 @@ def _truncated_vp_margin_outcome(
     *,
     public_information_only: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """FIX F3: derive a soft value label for TRUNCATED rows from the VP margin at the
-    point of truncation. final_actual_vps/final_public_vps + seat are populated in every
-    row regardless of whether the game actually ended -- only the has_final_*_vps flag is
-    gated on termination (see gumbel_self_play.py's _game_outcome_fields, which always
-    snapshots the live state). Without this, the value head only ever learns from the
-    9-19% of games that finish naturally, starving it of signal from the majority.
+    """Derive a soft value label for truncated rows with an authenticated VP snapshot.
+
+    Current Gumbel shards snapshot live VP on truncated games while the historical
+    ``has_final_*_vps`` flags describe terminal outcomes, not snapshot presence.
+    Older/fallback shards can omit the VP column entirely; the loader then supplies
+    all-zero padding.  Treating that padding as a real 0-0 score created a synthetic
+    target=0 at nonzero confidence.  Accept a row only when an explicit snapshot flag,
+    a terminal-value flag, or a nonzero legacy snapshot proves that data was present.
 
     margin = clip((my_vp - opponent_vp) / vps_to_win, -1, 1). Since this is always a
     2-seated game, opponent_vp = sum(all 4 PLAYER_NAMES slots) - my_vp (the other two
@@ -14781,7 +14854,38 @@ def _truncated_vp_margin_outcome(
         if not remaining.any():
             continue
         vps = np.asarray(data[vp_key][batch], dtype=np.float32)
-        valid = remaining & (seats < vps.shape[1])
+        if vps.ndim != 2 or vps.shape[0] != n:
+            continue
+        terminal_presence = _batch_array_or_fill(
+            data,
+            f"has_{vp_key}",
+            batch,
+            False,
+            dtype=np.bool_,
+        )
+        explicit_snapshot_presence = _batch_array_or_fill(
+            data,
+            f"has_{vp_key}_snapshot",
+            batch,
+            False,
+            dtype=np.bool_,
+        )
+        shared_snapshot_presence = _batch_array_or_fill(
+            data,
+            "has_truncated_vp_snapshot",
+            batch,
+            False,
+            dtype=np.bool_,
+        )
+        legacy_nonzero_snapshot = np.any(np.abs(vps) > 0.0, axis=1)
+        finite_snapshot = np.isfinite(vps).all(axis=1)
+        snapshot_present = (
+            terminal_presence
+            | explicit_snapshot_presence
+            | shared_snapshot_presence
+            | legacy_nonzero_snapshot
+        ) & finite_snapshot
+        valid = remaining & snapshot_present & (seats < vps.shape[1])
         if not valid.any():
             continue
         my_vp = vps[rows[valid], seats[valid]]
@@ -15623,6 +15727,121 @@ def _validate_max_grad_norm(value: float) -> float:
     return value
 
 
+_NONNEGATIVE_TRAINING_WEIGHT_FIELDS = (
+    "policy_loss_weight",
+    "value_loss_weight",
+    "value_categorical_loss_weight",
+    "hlgauss_scalar_aux_loss_weight",
+    "final_vp_loss_weight",
+    "q_loss_weight",
+    "policy_kl_anchor_weight",
+    "value_uncertainty_loss_weight",
+    "aux_subgoal_loss_weight",
+    "belief_resource_loss_weight",
+    "moe_balance_loss_weight",
+    "truncated_vp_margin_value_weight",
+    "forced_action_weight",
+    "forced_row_value_weight",
+    "winner_sample_weight",
+    "loser_sample_weight",
+    "vp_margin_weight",
+    "policy_surprise_weight",
+    "policy_surprise_cap",
+    "weight_decay",
+    "value_lr_mult",
+    "action_module_lr_mult",
+    "trunk_lr_mult",
+)
+
+
+def _cli_option(field: str) -> str:
+    return "--" + field.replace("_", "-")
+
+
+def _validate_training_weight_arguments(args: argparse.Namespace) -> None:
+    """Reject invalid learner coefficients before data or CUDA setup.
+
+    These values eventually multiply either per-row loss mass or an objective
+    term.  Letting NaN/Inf through poisons the optimizer; letting a negative
+    value through can turn minimisation into maximisation and, with a nearly
+    cancelling denominator, produce arbitrarily large negative losses.
+    """
+
+    for field in _NONNEGATIVE_TRAINING_WEIGHT_FIELDS:
+        value = float(getattr(args, field))
+        if not math.isfinite(value) or value < 0.0:
+            raise SystemExit(
+                f"{_cli_option(field)} must be finite and non-negative; got {value}"
+            )
+
+    unit_interval_fields = (
+        "soft_target_weight",
+        "soft_target_min_legal_coverage",
+        "value_target_lambda",
+    )
+    for field in unit_interval_fields:
+        value = float(getattr(args, field))
+        if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+            raise SystemExit(
+                f"{_cli_option(field)} must be finite and in [0, 1]; got {value}"
+            )
+
+    positive_fields = (
+        "lr",
+        "soft_target_temperature",
+        "value_hlgauss_sigma_ratio",
+        "advantage_temperature",
+        "advantage_weight_cap",
+        "advantage_weight_floor",
+    )
+    for field in positive_fields:
+        value = float(getattr(args, field))
+        if not math.isfinite(value) or value <= 0.0:
+            raise SystemExit(
+                f"{_cli_option(field)} must be finite and > 0; got {value}"
+            )
+
+    floor = float(args.advantage_weight_floor)
+    cap = float(args.advantage_weight_cap)
+    if floor > cap:
+        raise SystemExit(
+            "--advantage-weight-floor must be <= --advantage-weight-cap; "
+            f"got floor={floor} cap={cap}"
+        )
+    if float(args.policy_surprise_weight) > 0.0 and float(args.policy_surprise_cap) <= 0.0:
+        raise SystemExit(
+            "positive --policy-surprise-weight requires --policy-surprise-cap > 0"
+        )
+
+
+def _validate_nonnegative_weight_mapping(
+    mapping: dict[str, float], *, option: str
+) -> None:
+    for name, raw_value in mapping.items():
+        value = float(raw_value)
+        if not name:
+            raise SystemExit(f"{option} contains an empty key")
+        if not math.isfinite(value) or value < 0.0:
+            raise SystemExit(
+                f"{option} values must be finite and non-negative; "
+                f"got {name}={value}"
+            )
+
+
+def _validate_nonnegative_weight_array(values, *, label: str) -> np.ndarray:
+    array = np.asarray(values, dtype=np.float32)
+    if array.ndim != 1:
+        raise SystemExit(f"{label} must be a one-dimensional per-row weight array")
+    invalid = ~np.isfinite(array) | (array < 0.0)
+    if np.any(invalid):
+        first = int(np.flatnonzero(invalid)[0])
+        raise SystemExit(
+            f"{label} must contain only finite non-negative weights; "
+            f"row {first} has {float(array[first])}"
+        )
+    return array
+
+
 def _optimizer_clip_observability(
     pre_clip_total_grad_norm,
     *,
@@ -15761,6 +15980,19 @@ def build_sample_weights(
     per_game_policy_weight: bool = False,
     per_game_policy_weight_mode: str = "equal",
 ) -> np.ndarray:
+    _validate_nonnegative_weight_mapping(
+        teacher_weights, option="teacher_weights"
+    )
+    _validate_nonnegative_weight_mapping(phase_weights, option="phase_weights")
+    for label, value in (
+        ("forced_action_weight", forced_action_weight),
+        ("winner_sample_weight", winner_sample_weight),
+        ("loser_sample_weight", loser_sample_weight),
+        ("vp_margin_weight", vp_margin_weight),
+    ):
+        numeric = float(value)
+        if not math.isfinite(numeric) or numeric < 0.0:
+            raise SystemExit(f"{label} must be finite and non-negative; got {numeric}")
     n = len(data["action_taken"])
     weights = np.ones(n, dtype=np.float32)
     if teacher_weights and "teacher_name" in data:
@@ -15827,8 +16059,18 @@ def build_sample_weights(
         weights *= multiplier
     mean = float(np.mean(weights)) if len(weights) else 1.0
     if "policy_weight_multiplier" in data:
-        weights *= np.asarray(data["policy_weight_multiplier"], dtype=np.float32)
+        multiplier = _validate_nonnegative_weight_array(
+            data["policy_weight_multiplier"], label="policy_weight_multiplier"
+        )
+        if len(multiplier) != n:
+            raise SystemExit(
+                "policy_weight_multiplier row count does not match action_taken"
+            )
+        weights *= multiplier
         mean = float(np.mean(weights)) if len(weights) else 1.0
+    weights = _validate_nonnegative_weight_array(
+        weights, label="effective policy sample weights"
+    )
     if per_game_policy_weight and len(weights):
         # Only rows that already carry policy loss are redistributed. In
         # particular, fast/filtered rows with policy_weight_multiplier=0 stay
@@ -15844,7 +16086,9 @@ def build_sample_weights(
         mean = float(np.mean(weights)) if len(weights) else 1.0
     if mean > 0:
         weights = weights / mean
-    return weights.astype(np.float32, copy=False)
+    return _validate_nonnegative_weight_array(
+        weights, label="normalized policy sample weights"
+    ).astype(np.float32, copy=False)
 
 
 def _apply_authenticated_policy_distillation_scope(
@@ -16010,13 +16254,31 @@ def build_value_sample_weights(
     property from step 4).
     """
 
-    weights = np.ones(len(data["action_taken"]), dtype=np.float32)
+    phase_weights = phase_weights or {}
+    _validate_nonnegative_weight_mapping(
+        phase_weights, option="value phase_weights"
+    )
+    forced_weight = float(forced_row_value_weight)
+    if not math.isfinite(forced_weight) or forced_weight < 0.0:
+        raise SystemExit(
+            "forced_row_value_weight must be finite and non-negative; "
+            f"got {forced_weight}"
+        )
+    n = len(data["action_taken"])
+    weights = np.ones(n, dtype=np.float32)
     if phase_weights and "phase" in data:
         phases = np.asarray(data["phase"]).astype(str)
         for phase, weight in phase_weights.items():
             weights[phases == phase] *= float(weight)
     if "value_weight_multiplier" in data:
-        weights *= np.asarray(data["value_weight_multiplier"], dtype=np.float32)
+        multiplier = _validate_nonnegative_weight_array(
+            data["value_weight_multiplier"], label="value_weight_multiplier"
+        )
+        if len(multiplier) != n:
+            raise SystemExit(
+                "value_weight_multiplier row count does not match action_taken"
+            )
+        weights *= multiplier
     if float(forced_row_value_weight) != 1.0 and "legal_action_ids" in data:
         legal_column = data["legal_action_ids"]
         legal_counts = (
@@ -16025,12 +16287,17 @@ def build_value_sample_weights(
             else np.sum(np.asarray(legal_column) >= 0, axis=1)
         )
         weights[legal_counts == 1] *= float(forced_row_value_weight)
+    weights = _validate_nonnegative_weight_array(
+        weights, label="effective value sample weights"
+    )
     if per_game_value_weight and len(weights):
         weights = _normalize_weights_per_game(data, weights, mode=per_game_value_weight_mode)
     mean = float(np.mean(weights)) if len(weights) else 1.0
     if mean > 0.0:
         weights = weights / mean
-    return weights.astype(np.float32, copy=False)
+    return _validate_nonnegative_weight_array(
+        weights, label="normalized value sample weights"
+    ).astype(np.float32, copy=False)
 
 
 def _validated_component_offsets(data: dict, n: int) -> np.ndarray | None:
@@ -16332,17 +16599,99 @@ def _restore_policy_training(policy, modes: list[tuple[object, bool]]) -> None:
             module.train(was_training)
 
 
-def _parse_weight_map(raw: str) -> dict[str, float]:
+def _parse_weight_map(
+    raw: str, *, option: str = "--teacher-weights"
+) -> dict[str, float]:
     weights: dict[str, float] = {}
     for part in raw.split(","):
         item = part.strip()
         if not item:
             continue
         if "=" not in item:
-            raise SystemExit(f"invalid --teacher-weights entry: {item}")
+            raise SystemExit(f"invalid {option} entry: {item}")
         name, value = item.split("=", 1)
-        weights[name.strip()] = float(value)
+        name = name.strip()
+        if not name:
+            raise SystemExit(f"{option} contains an empty key")
+        if name in weights:
+            raise SystemExit(f"{option} contains duplicate key {name!r}")
+        try:
+            weights[name] = float(value)
+        except ValueError as error:
+            raise SystemExit(
+                f"invalid {option} value for {name!r}: {value.strip()!r}"
+            ) from error
+    _validate_nonnegative_weight_mapping(weights, option=option)
     return weights
+
+
+def _validate_weight_map_keys(
+    data,
+    *,
+    teacher_weights: dict[str, float],
+    policy_phase_weights: dict[str, float],
+    value_phase_weights: dict[str, float],
+    ddp: dict[str, int | bool] | None = None,
+) -> dict[str, object]:
+    """Refuse mapped weights whose keys match no learner row.
+
+    A misspelled teacher or phase previously trained the exact control recipe
+    while the report still recorded the intended treatment string.  In a
+    shard-per-rank DDP load, union the small unique-key sets across ranks before
+    deciding so a key present only on a peer is not rejected locally.
+    """
+
+    specifications = (
+        ("--teacher-weights", "teacher_name", teacher_weights),
+        ("--phase-weights", "phase", policy_phase_weights),
+        ("--value-phase-weights", "phase", value_phase_weights),
+    )
+    requested_fields = {
+        field for _option, field, mapping in specifications if mapping
+    }
+    local_observed: dict[str, set[str]] = {}
+    for field in requested_fields:
+        if field not in data:
+            local_observed[field] = set()
+            continue
+        local_observed[field] = set(np.asarray(data[field]).astype(str).tolist())
+
+    observed = local_observed
+    if ddp and bool(ddp.get("enabled", False)):
+        import torch.distributed as dist
+
+        gathered: list[dict[str, set[str]] | None] = [
+            None for _ in range(int(ddp["world_size"]))
+        ]
+        dist.all_gather_object(gathered, local_observed)
+        observed = {field: set() for field in requested_fields}
+        for rank_values in gathered:
+            if rank_values is None:
+                continue
+            for field, values in rank_values.items():
+                observed[field].update(values)
+
+    report: dict[str, object] = {"validated": True, "maps": {}}
+    map_report = report["maps"]
+    assert isinstance(map_report, dict)
+    for option, field, mapping in specifications:
+        if not mapping:
+            map_report[option] = {"requested_keys": [], "observed_keys": []}
+            continue
+        field_values = observed.get(field, set())
+        unknown = sorted(set(mapping) - field_values)
+        if unknown:
+            preview = ", ".join(repr(value) for value in sorted(field_values)[:20])
+            raise SystemExit(
+                f"{option} contains key(s) absent from corpus field {field!r}: "
+                + ", ".join(repr(value) for value in unknown)
+                + f"; observed keys: {preview or '<none>'}"
+            )
+        map_report[option] = {
+            "requested_keys": sorted(mapping),
+            "observed_keys": sorted(field_values),
+        }
+    return report
 
 
 def _parse_prefixes(raw: str) -> tuple[str, ...]:
