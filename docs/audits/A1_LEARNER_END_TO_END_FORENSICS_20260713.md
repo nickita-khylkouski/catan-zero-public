@@ -147,6 +147,7 @@ a diagnostic, not a champion selector. Search H2H remains mandatory.
 | Composite per-game weighting | Numeric `game_seed` values were treated as globally unique. The same seed in two corpus components was merged into one game for equal/sqrt weighting and quality telemetry. | Fixed: game identity is now `(component, game_seed)` and component offsets are validated (`cf54d5a`). |
 | Adjacent duplicate-game exposure | Pre-wave auditing and corpus conversion treated one maximal run of equal `game_seed` values as one game. They caught a seed that reappeared after another seed, but two byte-for-byte or independently regenerated copies placed directly back-to-back never changed seed and were silently merged. That could double one trajectory's sampling mass while acceptance, ordinary conversion, and selected-manifest conversion reported no duplicate. | Fixed: current pre-wave acceptance and both conversion trackers reject a non-increasing `decision_index` within the same seed, including across shard boundaries; legacy conversion without that field retains the seed-run check. Regressions cover adjacent reset, cross-shard reset, valid monotonic continuation, and the selected-source path. Existing P0/TEMP artifact impact is unproven: their prior attestations did not test this exact adjacency class, so do not retrospectively claim either contamination or absence from the old audit alone. |
 | Entity-adapter provenance | Rust generation and entity conversion wrote `adapter_version`, but NPZ normalization omitted it and memmap conversion therefore dropped it. Same-shaped rows from different feature semantics could be mixed without learner admission seeing the mismatch; the data-quality report also could not expose the loss. Checkpoints also authenticated only shapes/config, so a same-shaped runtime adapter change could silently alter input meanings. | Fixed end-to-end: normalization, in-memory loading, memmap conversion, lazy quality counts, and schema admission preserve the row field; checkpoints now append an independent `entity_feature_adapter` semantic contract; single/DDP/FSDP save paths agree; EMA/interpolation normalize the one explicit legacy mapping; and Rust evaluator construction requires exact checkpoint/runtime agreement. Mixed known/unknown rows, multiple known versions, malformed/unknown checkpoint metadata, and runtime mismatch fail closed. All-missing legacy corpora remain admissible. Pre-metadata checkpoints (including deployed f7/gen3, verified directly) map explicitly to pinned historical v2 rather than whatever a future current default becomes. |
+| Opponent-mixture provenance | Self-play NPZ shards emitted `is_pool_game`, opponent version/tag/checkpoint, and exploiter type, but both the in-memory learner key list and memmap converter omitted them. After conversion, the 80/15/5 current/history/hard-negative mixture could not be diagnosed, calibrated, or weighted by source at row level. | Fixed end-to-end (`9377778`): all opponent fields round-trip; an explicit presence bit distinguishes a real self-play value from legacy unknown; sealed A1 selected-game manifests stamp a verified source category by game seed (never by path inference); curated-data startup reports bounded-memory per-source counts; and old/new replay components synthesize unknown defaults rather than fabricating identity. Existing already-converted memmaps retain valid tensors and manifest-level quotas but cannot recover erased row identity without rebuilding from retained NPZ/hardlinks. |
 | DDP active-fraction telemetry | The active numerator was globally reduced but divided by a rank-local denominator, producing impossible fractions such as `7.95` in an eight-rank report. This did not alter gradients, but it corrupted experimental interpretation. | Fixed: numerator and denominator now share global scope and bounded fractions fail closed (`cf54d5a`). |
 | Diagnostic run receipts | Completed non-promotable runs could retain a launch plan without a final identity binding for checkpoint, report, runtime, optimizer, source code, and finalizer. | Fixed: deterministic finalization/replay receipt binds all run artifacts and the finalizer itself (`efcc94b`, `d9bf335`). |
 | Shared-trunk gradient probe | The probe enabled ordinary diagnostics but had drifted from the separately gated objective-interference cadence, so it could start without emitting its defining measurement. | Fixed: both diagnostic cadences are explicit and tested (`58fb7e6`). |
@@ -471,6 +472,16 @@ f7 and consumes that one selected identical dose:
 4. categorical value head;
 5. one auxiliary-head bundle only after its requested targets are proven present.
 
+Fresh modules require a commissioning schedule, not the mature TEMP schedule by
+rote. With 100 warmup steps, the selected 128-step run provides only 78.5
+full-LR-equivalent updates; a fresh value head at `value_lr_mult=0.3` receives
+23.55 head-LR equivalents. The target-gather screen therefore preserves the
+same 524,288 rows but uses 8x64/global-512 for 1,024 optimizer steps, freezes
+every mature surface, and trains only the zero-init gather at action LR x4.
+Pure-soft remains an exact 128-step one-axis arm (`0.9 -> 1.0`). Stale launchers
+that coupled fresh heads to the rejected 4.19M-row dose now fail closed; see
+`A1_SHORT_DOSE_MODULE_COMMISSIONING_20260713.md`.
+
 Promote nothing from offline loss. First use a short matched internal panel, then
 the full seat-swapped neutral gate for survivors.
 
@@ -518,6 +529,12 @@ the full seat-swapped neutral gate for survivors.
 - `d2ddbc4`, `f7b2064` — repair objective-matched scalar/auxiliary validation
   and sampler-measure semantics.
 - `e1ae5bf` — make evaluator LRU operations atomic across sync/batch/async paths.
+- `9377778` — preserve opponent/source provenance through raw, memmap, mixed
+  replay, and learner-quality paths.
+- `03179b0` — bind production learner/promotion surfaces to the selected typed
+  524,288-row dose while retaining historical full-dose verification.
+- `33b45ab` — commission fresh learner modules at a fair fixed-row schedule and
+  add the runnable selected-dose pure-soft arm.
 - `5838cec` — fit scalar tanh value scale on disjoint held-out games without
   mutating the sealed search operator.
 - `03bf5e2` — skip frozen zero-objective head forwards and preserve two-forward
