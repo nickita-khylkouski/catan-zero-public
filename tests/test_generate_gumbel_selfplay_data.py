@@ -45,6 +45,21 @@ def _base_args(**overrides):
     return args
 
 
+def test_search_evidence_is_explicitly_opt_in() -> None:
+    parser = cli.build_parser()
+    default = parser.parse_args(["--out-dir", "/tmp/evidence-default"])
+    enabled = parser.parse_args(
+        ["--out-dir", "/tmp/evidence-enabled", "--preserve-search-evidence"]
+    )
+
+    assert default.preserve_search_evidence is False
+    assert enabled.preserve_search_evidence is True
+    summary = cli._merge_worker_summaries(
+        [], out_dir=Path("/tmp/evidence-enabled"), elapsed_sec=1.0, args=enabled
+    )
+    assert summary["search_evidence_schema"] == cli.SEARCH_EVIDENCE_SCHEMA
+
+
 # ---------------------------------------------------------------------------
 # _worker_entry must never let an exception escape to pool.map -- one worker
 # crashing (OOM, bad checkpoint, etc.) must not abort every other worker's

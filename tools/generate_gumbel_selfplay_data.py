@@ -50,6 +50,7 @@ from catan_zero.rl.gumbel_self_play import (
     GumbelSelfPlayConfig,
     MixRuntime,
     OpponentPoolRuntime,
+    SEARCH_EVIDENCE_SCHEMA,
     TARGET_INFORMATION_REGIME_AUTHORITATIVE,
     read_opponent_pool_manifest,
     run_worker_games,
@@ -855,6 +856,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--format", choices=("npz", "npz_zst"), default="npz")
     parser.add_argument(
+        "--preserve-search-evidence",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Opt-in compact completed-Q/visit-count evidence on policy-active "
+            "rows for offline target recalibration. Default off preserves the "
+            "historical shard schema; the learner ignores the optional payload."
+        ),
+    )
+    parser.add_argument(
         "--resume",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -1259,6 +1270,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "worker_seed": int(args.base_seed) + 0x9E3779B9 * (worker_index + 1),
                 "shard_size": int(args.shard_size),
                 "format": args.format,
+                "preserve_search_evidence": bool(args.preserve_search_evidence),
                 "score_actions": bool(args.score_actions),
                 "correct_rust_chance_spectra": bool(args.correct_rust_chance_spectra),
                 "lazy_interior_chance": bool(args.lazy_interior_chance),
@@ -1874,6 +1886,9 @@ def _run_worker(
         evaluator=evaluator,
         shard_size=int(worker_args["shard_size"]),
         fmt=str(worker_args["format"]),
+        preserve_search_evidence=bool(
+            worker_args.get("preserve_search_evidence", False)
+        ),
         resume=bool(worker_args.get("resume", False)),
         run_id=str(worker_args.get("run_id", "")),
         opponent_pool=opponent_pool,
@@ -2051,6 +2066,11 @@ def _merge_worker_summaries(
         "forced_decisions_total": int(forced_decisions_total),
         "simulations_used_total": int(simulations_used_total),
         "target_information_regime": target_information_regime,
+        "search_evidence_schema": (
+            SEARCH_EVIDENCE_SCHEMA
+            if bool(getattr(args, "preserve_search_evidence", False))
+            else None
+        ),
         "workers": len(results),
         "n_full": int(args.n_full),
         "n_fast": int(args.n_fast),

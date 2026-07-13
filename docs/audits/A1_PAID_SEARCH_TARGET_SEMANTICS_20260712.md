@@ -61,6 +61,61 @@ not contain `afterstate_target` or `simulations_used`; original NPZ shards do.
 Commit `145dd03` makes future NPZ and memmap loads retain them. This is a schema
 recovery, not evidence that either target improves play.
 
+## Optional completed-Q/visit evidence: measured storage decision
+
+Historical shards retain the improved policy, visited-action Q, prior, root
+value, and total simulations, but not the two root statistics needed to
+recompute a different Gumbel target after generation: the all-legal-action
+completed-Q vector and per-action visit counts. The smallest safe addition is
+therefore an **opt-in raw-NPZ payload**, not another always-materialized memmap
+column:
+
+- active rows are inferred from the already-mandatory
+  `policy_weight_multiplier > 0` column (no duplicated row IDs);
+- `search_evidence_offsets`: uint32 offsets for active rows;
+- `search_visit_counts_flat`: uint16, with a fail-closed 65,535 upper bound;
+- `search_completed_q_flat`: float32, never float16 (observed opening-road
+  completed-Q margins reach roughly `1e-7`);
+- a uint8 schema version.
+
+On the authenticated n64 control corpus at
+`memmap_gen5_n64_control_20260709_s1`, the measured counts are:
+
+- `N = 3,409,920` total rows across `S = 1,665` shards;
+- `A = 418,553` policy-active rows (12.2746%);
+- `L = 4,163,736` active legal-action entries (9.9479 per active row).
+
+The exact raw-array cost over a sharded corpus is
+`4*A + 6*L + 5*S`: four bytes per active-row offset, six bytes per legal entry,
+and one version byte plus one terminal offset per shard. For these measured
+counts that is **26,664,953 bytes = 7.8198 bytes per corpus row**. A direct
+`numpy.savez` incremental-size measurement under both NumPy 1.21.5 (B200) and
+2.2.6 (local) adds exactly 1,114 bytes of NPY/ZIP headers per shard for the four
+new arrays, yielding **28,519,763 bytes = 8.3638 bytes per row on disk** before
+optional outer zstd compression. This is 0.0604% of the existing 47,215,544,261
+byte memmap corpus. A naive width-54 padded `(float32 Q, uint16 visits)` pair
+would cost 324 bytes per row, or 1,104,814,080 bytes on the same corpus.
+
+The CLI flag `--preserve-search-evidence` enables this payload. Default-off
+generation still drops the private transient arrays before buffering rows, so
+the historical shard schema and learner input are unchanged. The learner
+ignores the four optional arrays; posthoc tooling reads them from raw NPZ. They
+are deliberately not copied into the training memmap: current prefetch code
+would materialize every registered column per batch, turning audit-only
+evidence into a permanent learner I/O cost.
+
+Sufficiency is explicit and fail-closed. A single-world target can be
+recalibrated from completed-Q, visits, the existing prior/phase columns, and
+the manifest search config. Public-belief `aggregate_q_then_improve` is also
+reconstructible from its aggregate completed-Q and the manifest particle
+count. Historical PIMC `mean_improved_policy` is **not** reconstructible from
+only a mean completed-Q because `mean(softmax(x)) != softmax(mean(x))`; the
+writer refuses to attest that combination rather than emitting misleading
+evidence. This payload supports target-operator recalibration (for example
+`c_scale`, fixed sigma visits, D1 attenuation, or pruning), not replaying MCTS,
+changing pre-completion uncertainty shrinkage, or recovering per-particle
+statistics that were never stored.
+
 ## Why the other columns are not defaults yet
 
 ### Stored root value
