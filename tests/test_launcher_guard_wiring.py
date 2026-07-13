@@ -525,7 +525,7 @@ class TestGenerateGumbelSelfplayGuardWiring:
     # intentionally to test a guard failure).
     _GEN_RECIPE_FLAGS = [
         "--c-scale",
-        "0.03",
+        "0.1",
         "--c-visit",
         "50.0",
         "--n-full",

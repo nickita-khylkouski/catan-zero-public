@@ -21,7 +21,7 @@
           "--determinization-min-simulations"
         ],
         "expected_values": {
-          "--c-scale": 0.03,
+          "--c-scale": 0.1,
           "--c-visit": 50.0,
           "--n-full": 128,
           "--n-fast": 16,
