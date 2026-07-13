@@ -7610,21 +7610,38 @@ def _advantage_reweighted_policy_weights(
     if floor > cap:
         floor = cap
     with torch.no_grad():
+        import torch.distributed as dist
+
         values = outputs["value"].detach().float()
         targets = outcome_targets.detach().float()
         has = has_outcome.bool() if has_outcome is not None else torch.ones_like(targets, dtype=torch.bool)
         active = (policy_weights > 0.0) & has & torch.isfinite(targets) & torch.isfinite(values)
-        if not bool(active.any().item()):
-            return policy_weights, stats
         advantages = targets - values
         raw = torch.exp(torch.clamp(advantages / temperature, min=-20.0, max=20.0))
         raw = raw.clamp(min=floor, max=cap)
         active_weights = policy_weights[active]
         raw_active = raw[active]
-        mean_multiplier = (active_weights * raw_active).sum() / active_weights.sum().clamp_min(1.0e-6)
+        normalization = torch.stack(
+            (
+                (active_weights * raw_active).sum(),
+                active_weights.sum(),
+            )
+        )
+        if dist.is_available() and dist.is_initialized():
+            # Every rank participates, including ranks with zero eligible rows.
+            # A rank-local normalizer makes the effective objective depend on
+            # DDP world size and shard composition; an early return on an empty
+            # rank would deadlock this collective.
+            dist.all_reduce(normalization, op=dist.ReduceOp.SUM)
+        global_weight = normalization[1]
+        if float(global_weight.item()) <= 0.0:
+            return policy_weights, stats
+        mean_multiplier = normalization[0] / global_weight.clamp_min(1.0e-6)
         multiplier = torch.ones_like(policy_weights)
         multiplier[active] = raw[active] / mean_multiplier.clamp_min(1.0e-6)
         updated = policy_weights * multiplier
+        if not bool(active.any().item()):
+            return updated, stats
         stats = {
             "advantage_weight_rows": int(active.sum().item()),
             "advantage_mean": float(advantages[active].mean().item()),

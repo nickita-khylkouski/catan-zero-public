@@ -90,6 +90,7 @@ signal. `loser_sample_weight=1` won the controlled comparison.
 | Empty event history | All three current TEMP components authenticate all-zero event payloads, yet the model paid the full event MLP/memory cost. | Fixed authenticated crop (`aafe236`). This is objective-equivalent, but changes dropout RNG sequence versus historical runs. |
 | DDP weighted mean | At accumulation 1, loss numerator gradients are scaled by the globally reduced denominator and DDP's gradient average correctly yields the global weighted mean. | Confirmed correct. |
 | LR/max-step clock | A skipped optimizer group does not advance `global_step`; LR scheduling repeats the same step and max-step dose is not consumed. | Fixed/tested (`1c6efe4`). |
+| Advantage weighting | The optional multiplier was normalized per rank; changing DDP geometry changed the objective, and empty-rank early return precluded a safe collective. | Fixed: all ranks participate in a globally weighted normalizer. |
 | Validation aggregation | Objective-matched validation now aggregates sufficient statistics; legacy raw `validation.loss` is a row-concatenated diagnostic and not promotion evidence. | Confirmed. |
 | Head weight decay | Requested zero-weight optional heads previously changed despite no objective. | Fixed (`e81ffb2`). |
 
@@ -160,9 +161,6 @@ parity/no-op audit.
   result is a mean of means, not the union mean. Do not use it for a decisive
   learner arm until raw per-objective numerators/denominators are accumulated
   exactly.
-- **Advantage policy reweighting:** its normalization is rank/batch local, so
-  enabling it changes the effective objective with DDP geometry. It is off in
-  the winning recipe; keep it off until normalized globally.
 - **Symmetry augmentation:** the rank-offset torch RNG does not automatically
   make the separate symmetry RNG rank-independent, and only rank-0 symmetry RNG
   state is saved. Symmetry is off in the winning recipe. Fix/bind its distributed
