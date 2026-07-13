@@ -191,7 +191,6 @@ GOLDEN_OPTION_STRINGS = {
         ("--entity-state-trunk",),
         ("--epochs",),
         ("--final-vp-loss-weight",),
-        ("--float32-matmul-precision",),
         ("--forced-action-weight",),
         ("--forced-row-value-weight",),
         ("--freeze-modules",),
