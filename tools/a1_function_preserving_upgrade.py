@@ -27,8 +27,11 @@ from typing import Any, Mapping, Sequence
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+REPO_SRC = (REPO_ROOT / "src").resolve(strict=True)
+sys.path[:] = [entry for entry in sys.path if Path(entry or ".").resolve() != REPO_SRC]
+sys.path.insert(0, str(REPO_SRC))
 if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
+    sys.path.insert(1, str(REPO_ROOT))
 
 
 SCHEMA = "a1-function-preserving-architecture-upgrade-v1"
@@ -203,6 +206,14 @@ def _reconstruct_seeded_parameters(
     """
 
     from catan_zero.rl.entity_token_policy import EntityGraphConfig, EntityGraphPolicy
+
+    module = sys.modules[EntityGraphPolicy.__module__]
+    module_path = Path(str(module.__file__)).resolve(strict=True)
+    if REPO_SRC not in module_path.parents:
+        raise UpgradeError(
+            "receipt replayer imported catan_zero outside its checkout: "
+            f"{module_path}"
+        )
 
     base = EntityGraphPolicy.load(str(source), device="cpu")
     values = {

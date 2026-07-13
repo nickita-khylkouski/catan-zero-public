@@ -16,6 +16,14 @@ from tools import a1_one_dose_train as one_dose
 from tools import a1_promotion_transaction as promotion
 
 
+def test_upgrade_tools_bind_project_imports_to_their_checkout() -> None:
+    module = sys.modules[upgrade_tool.EntityGraphPolicy.__module__]
+    module_path = Path(str(module.__file__)).resolve(strict=True)
+
+    assert upgrade.REPO_SRC in module_path.parents
+    assert upgrade_tool._REPO_SRC in module_path.parents  # noqa: SLF001
+
+
 def _checkpoints(tmp_path: Path) -> tuple[Path, Path]:
     source = tmp_path / "champion.pt"
     upgraded = tmp_path / "champion-gather.pt"

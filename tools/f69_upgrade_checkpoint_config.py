@@ -30,6 +30,11 @@ from pathlib import Path
 import numpy as np
 
 _TOOLS_DIR = Path(__file__).resolve().parent
+_REPO_SRC = (_TOOLS_DIR.parent / "src").resolve(strict=True)
+sys.path[:] = [
+    entry for entry in sys.path if Path(entry or ".").resolve() != _REPO_SRC
+]
+sys.path.insert(0, str(_REPO_SRC))
 if str(_TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(_TOOLS_DIR))
 
@@ -37,6 +42,14 @@ from catan_zero.rl.entity_token_policy import (  # noqa: E402
     EntityGraphConfig,
     EntityGraphPolicy,
 )
+
+_ENTITY_POLICY_MODULE = sys.modules[EntityGraphPolicy.__module__]
+_ENTITY_POLICY_PATH = Path(str(_ENTITY_POLICY_MODULE.__file__)).resolve(strict=True)
+if _REPO_SRC not in _ENTITY_POLICY_PATH.parents:
+    raise RuntimeError(
+        "checkpoint upgrader imported catan_zero outside its checkout: "
+        f"{_ENTITY_POLICY_PATH}"
+    )
 
 # The exact param prefixes introduced by the three upgrades (see
 # entity_token_policy.EntityGraphNet). Must equal the load() allow-list.
