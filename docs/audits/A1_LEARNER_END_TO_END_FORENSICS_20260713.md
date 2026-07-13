@@ -218,6 +218,24 @@ LR trajectory, objective, and initializer. Heavy diagnostics are disabled in the
 timed arms. This chooses throughput/CPU-I/O geometry; it is not a model-quality
 sweep.
 
+The 128-step B200 comparison selected **8x512**:
+
+| geometry | rows | elapsed | rows/s | active teacher-gap closure | worst component closure | preclip mean/max | clipped steps |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 8x512 | 524,288 | 198.347 s | 2,643.28 | 0.102290 | 0.076152 | 0.6203 / 1.0077 | 1/128 |
+| 4x1024 | 524,288 | 268.385 s | 1,953.49 | 0.102206 | 0.075848 | 0.6221 / 0.9966 | 0/128 |
+
+The four-rank arm delivered 73.90% of the eight-rank throughput while its
+equal-dose closure differed by only -0.000161 per million samples. Higher HBM
+occupancy therefore did not buy learning or wall-clock efficiency. The full P0
+reproduction uses 8x512, global batch 4,096, accumulation 1.
+
+The live rehearsal also found three fail-fast tooling defects before the full
+dose: an undefined GPU-binding constant (`b59983b`), an invalid row-capped
+authenticated validation plan (`30b669f`), and a post-run plan schema that
+omitted the per-run LR consumed by the summarizer (`84c12e9`). Both geometry
+trainers completed successfully; the last defect affected postprocessing only.
+
 ### P2 — highest-information learner arms
 
 Every arm independently reloads f7 and consumes one identical dose:
@@ -266,6 +284,7 @@ the full seat-swapped neutral gate for survivors.
 - `b59983b` — define and bind selected geometry-probe GPU ranks before launch.
 - `28f42cf` — fail closed on distributed semantics that lack a decisive A1 seal.
 - `30b669f` — reject row-capped validation for authenticated composites.
+- `84c12e9` — bind matched LR into every geometry run and its summary.
 
 The immediate criterion is simple: preserve the independent TEMP win, select the
 fastest mathematically matched DDP geometry, and spend subsequent B200 time only
