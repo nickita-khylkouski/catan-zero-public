@@ -77,6 +77,8 @@ def _make_entity_policy():
 def test_freeze_module_groups_cover_expected_submodules() -> None:
     assert set(ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS) == {
         "trunk",
+        "trunk_base",
+        "topology_adapter",
         "action_encoder",
         "policy_head",
         "value_heads",
@@ -84,6 +86,14 @@ def test_freeze_module_groups_cover_expected_submodules() -> None:
         "edge_policy",
         "action_cross",
     }
+    assert ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS["trunk"] == (
+        ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS["trunk_base"]
+        + ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS["topology_adapter"]
+    )
+    assert not (
+        set(ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS["trunk_base"])
+        & set(ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS["topology_adapter"])
+    )
     assert "value_head" in ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS["value_heads"]
     assert (
         "value_categorical_head" in ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS["value_heads"]

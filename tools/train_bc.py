@@ -1062,8 +1062,12 @@ def build_parser() -> argparse.ArgumentParser:
         default="",
         help=(
             "Comma-separated --arch entity_graph module groups to freeze "
-            "(requires_grad=False): trunk,action_encoder,policy_head,value_heads,"
-            "target_gather,edge_policy,action_cross. "
+            "(requires_grad=False): trunk,trunk_base,topology_adapter,"
+            "action_encoder,policy_head,value_heads,target_gather,edge_policy,"
+            "action_cross. trunk retains its historical meaning and is exactly "
+            "the union of trunk_base and topology_adapter; the split groups let "
+            "a function-preserving topology adapter train without moving the "
+            "mature transformer trunk. "
             "The value_heads group includes scalar/categorical/final-VP/uncertainty "
             "readouts and optional value-attention-pool parameters. The three "
             "action-local groups allow causal adapter ablations without retraining "
@@ -16703,25 +16707,40 @@ def _set_scalar_value_head_trainable(model, trainable: bool) -> None:
 # freeze. ``value_heads`` is opt-in: value-repair runs leave it trainable, while the
 # later action-local policy warmup can freeze every value-specific parameter cleanly
 # instead of relying on a zero loss coefficient (which is not an AdamW freeze).
+ENTITY_GRAPH_TRUNK_BASE_MODULE_ATTRS: tuple[str, ...] = (
+    "hex_encoder",
+    "vertex_encoder",
+    "edge_encoder",
+    "player_encoder",
+    "global_encoder",
+    "event_encoder",
+    "type_embedding",
+    "cls_token",
+    "blocks",
+    "state_norm",
+    "deliberation_slots",
+    "deliberation_block",
+    "deliberation_fusion_norm",
+    "deliberation_fusion",
+    "deliberation_halt_head",
+)
+ENTITY_GRAPH_TOPOLOGY_ADAPTER_MODULE_ATTRS: tuple[str, ...] = (
+    "topology_residual_adapter",
+)
+
+
 ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS: dict[str, tuple[str, ...]] = {
+    # Backward compatibility is a semantic requirement: every historical
+    # ``--freeze-modules trunk`` invocation must still freeze the optional
+    # topology adapter as well as the mature transformer trunk.  The two
+    # narrower names only add the ability to commission that adapter in
+    # isolation; they do not redefine the old group.
     "trunk": (
-        "hex_encoder",
-        "vertex_encoder",
-        "edge_encoder",
-        "player_encoder",
-        "global_encoder",
-        "event_encoder",
-        "type_embedding",
-        "cls_token",
-        "blocks",
-        "state_norm",
-        "deliberation_slots",
-        "deliberation_block",
-        "deliberation_fusion_norm",
-        "deliberation_fusion",
-        "deliberation_halt_head",
-        "topology_residual_adapter",
+        ENTITY_GRAPH_TRUNK_BASE_MODULE_ATTRS
+        + ENTITY_GRAPH_TOPOLOGY_ADAPTER_MODULE_ATTRS
     ),
+    "trunk_base": ENTITY_GRAPH_TRUNK_BASE_MODULE_ATTRS,
+    "topology_adapter": ENTITY_GRAPH_TOPOLOGY_ADAPTER_MODULE_ATTRS,
     "action_encoder": ("action_encoder",),
     "policy_head": ("action_bias", "logit_scale"),
     # Keep optional action-local adapters independently freezable.  Grouping

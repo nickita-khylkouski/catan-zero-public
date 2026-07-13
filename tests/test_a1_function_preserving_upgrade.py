@@ -25,49 +25,49 @@ def test_upgrade_tools_bind_project_imports_to_their_checkout() -> None:
 
 
 def _checkpoints(tmp_path: Path) -> tuple[Path, Path]:
+    from catan_zero.rl.entity_token_policy import EntityGraphPolicy
+    from catan_zero.rl.self_play import make_env_config
+
     source = tmp_path / "champion.pt"
     upgraded = tmp_path / "champion-gather.pt"
-    base_config = {
-        "state_trunk": "transformer",
-        "action_size": 567,
-        "static_action_feature_size": 1,
+    base = EntityGraphPolicy.create(
+        env_config=make_env_config(vps_to_win=3),
+        hidden_size=16,
+        state_layers=1,
+        attention_heads=2,
+        seed=7,
+        device="cpu",
+    )
+    base.save(source, mask_hidden_info=True)
+    gather = EntityGraphPolicy(
+        dataclasses.replace(base.config, action_target_gather=True),
+        base.static_action_features.detach().cpu().numpy(),
+        seed=1,
+        device="cpu",
+    )
+    missing, unexpected = gather.model.load_state_dict(
+        base.model.state_dict(), strict=False
+    )
+    assert not unexpected
+    assert set(missing) == set(
+        upgrade.ALLOWLIST[upgrade.MODULE_TARGET_GATHER][
+            "new_parameter_initialization"
+        ]
+    )
+    gather.save(upgraded, mask_hidden_info=True)
+    raw = torch.load(upgraded, map_location="cpu", weights_only=False)
+    raw["upgrade_provenance"] = {
+        "schema_version": "entity-graph-upgrade-v1",
+        "source_checkpoint_sha256": upgrade._sha(source).removeprefix(  # noqa: SLF001
+            "sha256:"
+        ),
+        "flags": {"action_target_gather": True},
+        "initialization_seed": 1,
+        "trained_value_readouts_added": [],
+        "forward_max_diff": 0.0,
+        "forward_identical_at_init": True,
     }
-    base_model = {
-        "encoder.weight": torch.arange(6, dtype=torch.float32).reshape(2, 3),
-        "policy.weight": torch.ones(2, 2),
-    }
-    torch.save(
-        {"config": {"fields": base_config}, "model": base_model, "epoch": 7},
-        source,
-    )
-    model = dict(base_model)
-    model.update(
-        {
-            "target_gather_proj.0.bias": torch.zeros(3),
-            "target_gather_proj.0.weight": torch.ones(3),
-            "target_gather_proj.1.bias": torch.zeros(3),
-            "target_gather_proj.1.weight": torch.zeros(3, 3),
-        }
-    )
-    torch.save(
-        {
-            "config": {"fields": {**base_config, "action_target_gather": True}},
-            "model": model,
-            "epoch": 7,
-            "upgrade_provenance": {
-                "schema_version": "entity-graph-upgrade-v1",
-                "source_checkpoint_sha256": upgrade._sha(source).removeprefix(  # noqa: SLF001
-                    "sha256:"
-                ),
-                "flags": {"action_target_gather": True},
-                "initialization_seed": 1,
-                "trained_value_readouts_added": [],
-                "forward_max_diff": 0.0,
-                "forward_identical_at_init": True,
-            },
-        },
-        upgraded,
-    )
+    torch.save(raw, upgraded)
     return source, upgraded
 
 
@@ -79,38 +79,98 @@ def _issued(tmp_path: Path) -> tuple[Path, dict]:
 
 
 def _topology_checkpoints(tmp_path: Path) -> tuple[Path, Path]:
+    from catan_zero.rl.entity_token_policy import EntityGraphPolicy
+
     source, _gather = _checkpoints(tmp_path)
     upgraded = tmp_path / "champion-topology-gather.pt"
-    raw = torch.load(source, map_location="cpu", weights_only=False)
-    model = dict(raw["model"])
-    width = 3
-    spec = upgrade.ALLOWLIST[upgrade.MODULE_TOPOLOGY_TARGET_GATHER]
-    for name, kind in spec["new_parameter_initialization"].items():
-        if name.endswith(".weight") and (
-            "norm." not in name and "target_gather_proj.0" not in name
-        ):
-            shape = (width, width)
-        else:
-            shape = (width,)
-        if kind == "ones":
-            tensor = torch.ones(shape)
-        elif kind == "zeros":
-            tensor = torch.zeros(shape)
-        elif kind == "identity":
-            tensor = torch.eye(width)
-        else:  # pragma: no cover - the allowlist itself is closed above
-            raise AssertionError(kind)
-        model[name] = tensor
+    base = EntityGraphPolicy.load(source, device="cpu")
     flags = {
         "action_target_gather": True,
         "topology_residual_adapter": True,
     }
-    raw["model"] = model
-    raw["config"] = {"fields": {**raw["config"]["fields"], **flags}}
+    treatment = EntityGraphPolicy(
+        dataclasses.replace(base.config, **flags),
+        base.static_action_features.detach().cpu().numpy(),
+        seed=1,
+        device="cpu",
+    )
+    missing, unexpected = treatment.model.load_state_dict(
+        base.model.state_dict(), strict=False
+    )
+    assert not unexpected
+    assert set(missing) == set(
+        upgrade.ALLOWLIST[upgrade.MODULE_TOPOLOGY_TARGET_GATHER][
+            "new_parameter_initialization"
+        ]
+    )
+    treatment.save(upgraded, mask_hidden_info=True)
+    raw = torch.load(upgraded, map_location="cpu", weights_only=False)
     raw["upgrade_provenance"] = {
         "schema_version": "entity-graph-upgrade-v1",
         "source_checkpoint_sha256": upgrade._sha(source).removeprefix("sha256:"),  # noqa: SLF001
         "flags": flags,
+        "initialization_seed": 1,
+        "trained_value_readouts_added": [],
+        "forward_max_diff": 0.0,
+        "forward_identical_at_init": True,
+    }
+    torch.save(raw, upgraded)
+    return source, upgraded
+
+
+def _topology_on_trained_gather_checkpoints(tmp_path: Path) -> tuple[Path, Path]:
+    """Append topology while preserving an already-nonzero gather exactly."""
+
+    from catan_zero.rl.entity_token_policy import EntityGraphPolicy
+    from catan_zero.rl.self_play import make_env_config
+
+    source = tmp_path / "trained-gather.pt"
+    upgraded = tmp_path / "trained-gather-plus-topology.pt"
+    base = EntityGraphPolicy.create(
+        env_config=make_env_config(vps_to_win=3),
+        hidden_size=16,
+        state_layers=1,
+        attention_heads=2,
+        seed=7,
+        device="cpu",
+    )
+    gather = EntityGraphPolicy(
+        dataclasses.replace(base.config, action_target_gather=True),
+        base.static_action_features.detach().cpu().numpy(),
+        seed=11,
+        device="cpu",
+    )
+    gather.model.load_state_dict(base.model.state_dict(), strict=False)
+    with torch.no_grad():
+        gather.model.target_gather_proj[1].weight.copy_(
+            torch.eye(gather.config.hidden_size)
+        )
+        gather.model.target_gather_proj[1].bias.fill_(0.25)
+    gather.save(source, mask_hidden_info=True)
+
+    treatment = EntityGraphPolicy(
+        dataclasses.replace(gather.config, topology_residual_adapter=True),
+        gather.static_action_features.detach().cpu().numpy(),
+        seed=1,
+        device="cpu",
+    )
+    missing, unexpected = treatment.model.load_state_dict(
+        gather.model.state_dict(), strict=False
+    )
+    assert not unexpected
+    assert set(missing) == set(
+        upgrade.ALLOWLIST[upgrade.MODULE_TOPOLOGY_RESIDUAL][
+            "new_parameter_initialization"
+        ]
+    )
+    treatment.save(upgraded, mask_hidden_info=True)
+    raw = torch.load(upgraded, map_location="cpu", weights_only=False)
+    raw["upgrade_provenance"] = {
+        "schema_version": "entity-graph-upgrade-v1",
+        "source_checkpoint_sha256": upgrade._sha(source).removeprefix(  # noqa: SLF001
+            "sha256:"
+        ),
+        "flags": {"topology_residual_adapter": True},
         "initialization_seed": 1,
         "trained_value_readouts_added": [],
         "forward_max_diff": 0.0,
@@ -235,6 +295,93 @@ def test_receipt_refuses_config_fields_unknown_to_its_checkout(
         upgrade.inspect_upgrade(source, initializer)
 
 
+def test_receipt_appends_topology_to_trained_nonzero_gather_without_drift(
+    tmp_path: Path,
+) -> None:
+    source, initializer = _topology_on_trained_gather_checkpoints(tmp_path)
+    receipt = tmp_path / "topology-only-upgrade.receipt.json"
+
+    payload = upgrade.issue_receipt(
+        source,
+        initializer,
+        receipt,
+        module=upgrade.MODULE_TOPOLOGY_RESIDUAL,
+    )
+    verified = upgrade.verify_receipt(receipt)
+    source_raw = torch.load(source, map_location="cpu", weights_only=False)
+    upgraded_raw = torch.load(initializer, map_location="cpu", weights_only=False)
+
+    assert payload["module"] == upgrade.MODULE_TOPOLOGY_RESIDUAL
+    assert payload["flags"] == {"topology_residual_adapter": True}
+    assert len(payload["new_parameters"]) == 8
+    assert verified["shared_parameters_bit_identical"] is True
+    assert torch.equal(
+        source_raw["model"]["target_gather_proj.1.weight"],
+        upgraded_raw["model"]["target_gather_proj.1.weight"],
+    )
+    assert torch.count_nonzero(
+        upgraded_raw["model"]["target_gather_proj.1.weight"]
+    ).item() > 0
+
+
+def test_topology_only_receipt_rejects_drift_in_trained_gather(tmp_path: Path) -> None:
+    source, initializer = _topology_on_trained_gather_checkpoints(tmp_path)
+    raw = torch.load(initializer, map_location="cpu", weights_only=False)
+    raw["model"]["target_gather_proj.1.weight"][0, 0] += 1.0
+    torch.save(raw, initializer)
+
+    with pytest.raises(
+        upgrade.UpgradeError, match="shared checkpoint parameters changed"
+    ):
+        upgrade.inspect_upgrade(
+            source,
+            initializer,
+            module=upgrade.MODULE_TOPOLOGY_RESIDUAL,
+        )
+
+
+def test_topology_only_receipt_rejects_zero_tensor_with_wrong_model_shape(
+    tmp_path: Path,
+) -> None:
+    source, initializer = _topology_on_trained_gather_checkpoints(tmp_path)
+    raw = torch.load(initializer, map_location="cpu", weights_only=False)
+    raw["model"]["topology_residual_adapter.output_projection.weight"] = (
+        torch.zeros(3, 3)
+    )
+    torch.save(raw, initializer)
+
+    with pytest.raises(upgrade.UpgradeError, match="not deterministic zeros"):
+        upgrade.inspect_upgrade(
+            source,
+            initializer,
+            module=upgrade.MODULE_TOPOLOGY_RESIDUAL,
+        )
+
+
+@pytest.mark.parametrize(
+    ("variant", "module"),
+    (
+        ("target_gather", upgrade.MODULE_TARGET_GATHER),
+        ("combined", upgrade.MODULE_TOPOLOGY_TARGET_GATHER),
+    ),
+)
+def test_legacy_additive_receipts_reject_correct_value_with_wrong_shape(
+    tmp_path: Path,
+    variant: str,
+    module: str,
+) -> None:
+    if variant == "target_gather":
+        source, initializer = _checkpoints(tmp_path)
+    else:
+        source, initializer = _topology_checkpoints(tmp_path)
+    raw = torch.load(initializer, map_location="cpu", weights_only=False)
+    raw["model"]["target_gather_proj.1.weight"] = torch.zeros(3, 3)
+    torch.save(raw, initializer)
+
+    with pytest.raises(upgrade.UpgradeError, match="not deterministic zeros"):
+        upgrade.inspect_upgrade(source, initializer, module=module)
+
+
 def test_receipt_replays_seeded_belief_head_upgrade(tmp_path: Path) -> None:
     source, initializer = _belief_checkpoints(tmp_path)
     receipt = tmp_path / "belief-upgrade.receipt.json"
@@ -317,7 +464,7 @@ def test_receipt_digest_normalizes_numpy_config_scalars(tmp_path: Path) -> None:
     source, initializer = _checkpoints(tmp_path)
     for path in (source, initializer):
         raw = torch.load(path, map_location="cpu", weights_only=False)
-        raw["config"]["fields"]["action_size"] = np.int64(567)
+        raw["config"]["fields"]["hidden_size"] = np.int64(16)
         torch.save(raw, path)
     raw = torch.load(initializer, map_location="cpu", weights_only=False)
     raw["upgrade_provenance"]["source_checkpoint_sha256"] = upgrade._sha(  # noqa: SLF001
@@ -372,14 +519,16 @@ def test_checkpoint_parameter_or_metadata_drift_is_rejected(tmp_path: Path) -> N
 
     source, initializer = _checkpoints(tmp_path)
     raw = torch.load(initializer, map_location="cpu", weights_only=False)
-    raw["model"]["encoder.weight"] = raw["model"]["encoder.weight"].double()
+    raw["model"]["hex_encoder.0.weight"] = raw["model"][
+        "hex_encoder.0.weight"
+    ].double()
     torch.save(raw, initializer)
     with pytest.raises(upgrade.UpgradeError, match="shared checkpoint parameters changed"):
         upgrade.inspect_upgrade(source, initializer)
 
     source, initializer = _checkpoints(tmp_path)
     raw = torch.load(initializer, map_location="cpu", weights_only=False)
-    raw["mask_hidden_info"] = True
+    raw["mask_hidden_info"] = False
     torch.save(raw, initializer)
     with pytest.raises(upgrade.UpgradeError, match="metadata/provenance changed"):
         upgrade.inspect_upgrade(source, initializer)

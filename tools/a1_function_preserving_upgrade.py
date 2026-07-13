@@ -36,6 +36,7 @@ if str(REPO_ROOT) not in sys.path:
 
 SCHEMA = "a1-function-preserving-architecture-upgrade-v1"
 MODULE_TARGET_GATHER = "entity_graph.action_target_gather.v1"
+MODULE_TOPOLOGY_RESIDUAL = "entity_graph.topology_residual_adapter.v1"
 MODULE_TOPOLOGY_TARGET_GATHER = (
     "entity_graph.topology_residual_adapter+action_target_gather.v1"
 )
@@ -54,6 +55,25 @@ ALLOWLIST: dict[str, dict[str, Any]] = {
             "target_gather_proj.1.weight": "zeros",
         },
         "config_delta": {"action_target_gather": True},
+    },
+    # Commission topology after a gather arm has already learned nonzero
+    # weights.  This is deliberately separate from the combined initializer:
+    # the source checkpoint may contain any already-trained shared tensors
+    # (including target_gather_proj), and the receipt proves they survive
+    # byte-for-byte while only the zero-output topology adapter is appended.
+    MODULE_TOPOLOGY_RESIDUAL: {
+        "flags": {"topology_residual_adapter": True},
+        "new_parameter_initialization": {
+            "topology_residual_adapter.message_norm.bias": "zeros",
+            "topology_residual_adapter.message_norm.weight": "ones",
+            "topology_residual_adapter.output_projection.bias": "zeros",
+            "topology_residual_adapter.output_projection.weight": "zeros",
+            "topology_residual_adapter.source_norm.bias": "zeros",
+            "topology_residual_adapter.source_norm.weight": "ones",
+            "topology_residual_adapter.source_projection.bias": "zeros",
+            "topology_residual_adapter.source_projection.weight": "identity",
+        },
+        "config_delta": {"topology_residual_adapter": True},
     },
     MODULE_TOPOLOGY_TARGET_GATHER: {
         "flags": {
@@ -190,19 +210,22 @@ def _equal(left: Any, right: Any) -> bool:
     return bool(left == right)
 
 
-def _reconstruct_seeded_parameters(
+def _reconstruct_added_parameters(
     source: Path,
     *,
     seed: int,
     config_delta: Mapping[str, Any],
     expected_names: set[str],
 ) -> dict[str, Any]:
-    """Rebuild deterministic PyTorch-default additions from the source bytes.
+    """Rebuild the upgraded model's additions from the source bytes.
 
     Merely recording an initialization seed in checkpoint provenance is not
     evidence: that field could be forged around arbitrary tensors.  Replay the
     exact warm-start construction used by ``f69_upgrade_checkpoint_config`` and
-    compare the newly initialized tensors byte-for-byte instead.
+    compare the newly initialized tensors byte-for-byte instead.  This also
+    binds deterministic zero/one/identity adapters to the actual model-required
+    shape and dtype rather than accepting any same-valued tensor supplied by a
+    caller.
     """
 
     from catan_zero.rl.entity_token_policy import EntityGraphConfig, EntityGraphPolicy
@@ -274,8 +297,6 @@ def inspect_upgrade(
     source: Path, upgraded: Path, *, module: str = MODULE_TARGET_GATHER
 ) -> dict[str, Any]:
     """Replay the checkpoint delta and return its typed semantic evidence."""
-    import torch
-
     spec = ALLOWLIST.get(module)
     if spec is None:
         raise UpgradeError(f"architecture module is not allowlisted: {module!r}")
@@ -320,32 +341,21 @@ def inspect_upgrade(
         for name, kind in spec["new_parameter_initialization"].items()
         if kind == "seeded_torch_default"
     }
-    seeded_reference = (
-        _reconstruct_seeded_parameters(
-            Path(source_ref["path"]),
-            seed=seed,
-            config_delta=spec["config_delta"],
-            expected_names=set(expected_added),
-        )
-        if seeded_names
-        else {}
+    # Every allowlisted additive architecture delta is replayed through the
+    # real model constructor.  Checking only "all zeros"/"all ones" admits
+    # tensors with arbitrary shapes or dtypes, so a receipt could otherwise
+    # attest an initializer that EntityGraphPolicy cannot even load.
+    replay_reference = _reconstruct_added_parameters(
+        Path(source_ref["path"]),
+        seed=seed,
+        config_delta=spec["config_delta"],
+        expected_names=set(expected_added),
     )
     for name, kind in spec["new_parameter_initialization"].items():
         tensor = after_model[name]
-        if kind == "ones":
-            expected = torch.ones_like(tensor)
-        elif kind == "zeros":
-            expected = torch.zeros_like(tensor)
-        elif kind == "identity":
-            if tensor.ndim != 2 or tensor.shape[0] != tensor.shape[1]:
-                raise UpgradeError(f"identity parameter is not square: {name}")
-            expected = torch.eye(
-                tensor.shape[0], dtype=tensor.dtype, device=tensor.device
-            )
-        elif kind == "seeded_torch_default":
-            expected = seeded_reference[name]
-        else:
+        if kind not in {"ones", "zeros", "identity", "seeded_torch_default"}:
             raise UpgradeError(f"unknown allowlisted initialization {kind!r}: {name}")
+        expected = replay_reference[name]
         if not _tensor_equal_exact(tensor, expected):
             raise UpgradeError(f"new parameter is not deterministic {kind}: {name}")
 
