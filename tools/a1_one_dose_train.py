@@ -1124,6 +1124,7 @@ def _verify_production_composite_inputs(
             trainer_validation_game_seed_set_sha256
         ),
         "production_mix_contract": contract,
+        "source_authority": meta.get("source_authority"),
         "source_authority_ref": meta.get("source_authority_ref"),
         "production_sampling_receipt_sha256": contract["sampling_receipt_sha256"],
         "validation_split_receipt": split_receipt,

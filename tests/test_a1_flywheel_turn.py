@@ -163,3 +163,43 @@ def test_turn_rejects_corpus_to_audit_cross_binding(
     meta_path.write_text(json.dumps(meta), encoding="utf-8")
     with pytest.raises(turn.FlywheelTurnError, match="does not bind"):
         turn.build_turn(**kwargs)
+
+
+def test_turn_binds_production_composite_through_sealed_source_authority(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    kwargs = _fixture(tmp_path, monkeypatch)
+    descriptor = _write(tmp_path / "production-composite.json", "{}")
+    audit_ref = turn._ref(  # noqa: SLF001
+        kwargs["audit_path"], where="fixture production audit"
+    )
+    verified = {
+        **kwargs["verified"],
+        "data_path": descriptor,
+        "data_kind": "production_composite_v2",
+        "source_authority": {
+            "post_wave_audit": {
+                "file_sha256": audit_ref["sha256"],
+                "audit_sha256": "sha256:" + "e" * 64,
+                "shard_inventory_sha256": "sha256:" + "f" * 64,
+            }
+        },
+    }
+
+    value = turn.build_turn(**{**kwargs, "verified": verified})
+
+    assert value["corpus"]["meta"] == turn._ref(  # noqa: SLF001
+        descriptor, where="fixture production descriptor"
+    )
+
+    tampered = {
+        **verified,
+        "source_authority": {
+            "post_wave_audit": {
+                **verified["source_authority"]["post_wave_audit"],
+                "audit_sha256": "sha256:" + "9" * 64,
+            }
+        },
+    }
+    with pytest.raises(turn.FlywheelTurnError, match="does not bind"):
+        turn.build_turn(**{**kwargs, "verified": tampered})

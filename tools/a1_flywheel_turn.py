@@ -291,14 +291,29 @@ def build_turn(
         producer_sha256=producer_sha,
     )
 
-    meta_path = Path(str(verified["data_path"])) / "corpus_meta.json"
-    meta, meta_ref = _load(meta_path, where="corpus metadata")
-    audit_binding = meta.get("a1_post_wave_audit")
+    is_composite = verified.get("data_kind") == "production_composite_v2"
+    if is_composite:
+        meta_path = Path(str(verified["data_path"]))
+        _descriptor, meta_ref = _load(meta_path, where="composite descriptor")
+        authority = verified.get("source_authority")
+        audit_binding = (
+            authority.get("post_wave_audit")
+            if isinstance(authority, Mapping)
+            else None
+        )
+    else:
+        meta_path = Path(str(verified["data_path"])) / "corpus_meta.json"
+        meta, meta_ref = _load(meta_path, where="corpus metadata")
+        audit_binding = meta.get("a1_post_wave_audit")
     if (
         not isinstance(audit_binding, Mapping)
         or audit_binding.get("file_sha256") != audit_ref["sha256"]
         or audit_binding.get("audit_sha256") != audit.get("audit_sha256")
-        or audit_binding.get("contract_sha256") != verified.get("contract_sha256")
+        or (
+            not is_composite
+            and audit_binding.get("contract_sha256")
+            != verified.get("contract_sha256")
+        )
         or audit_binding.get("shard_inventory_sha256")
         != audit.get("shard_inventory_sha256")
     ):
