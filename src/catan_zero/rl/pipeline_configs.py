@@ -90,7 +90,7 @@ _T = TypeVar("_T", bound="PipelineConfig")
 
 # Bump when the *set* of fields on any pipeline config changes so that hashes
 # from before/after the change are never mistaken for equal regimes.
-CONFIG_SCHEMA_VERSION = 10
+CONFIG_SCHEMA_VERSION = 11
 
 # Length (hex chars) of the short hash embedded in artifacts. 16 hex chars =
 # 64 bits; collision probability is negligible for the run counts here and the
@@ -211,10 +211,17 @@ class TrainConfig(PipelineConfig):
     grow_from_checkpoint_sha256: str = ""
     resume_optimizer: bool = True
     data_format: str = "npz"
+    # Distributed execution can change the optimizer trajectory.  Keep these in
+    # the typed identity in addition to train_bc's resume-only topology fields so
+    # standalone config hashes never collapse distinct learner geometries.
+    grad_accum_steps: int = 1
+    ddp_shard_data: bool = False
+    fsdp: bool = False
     track: str = "2p_no_trade"
     vps_to_win: int = 10
     # Masking / regime -- the field that is otherwise impossible to grep.
     mask_hidden_info: bool = False
+    graph_history_features: bool = False
     acknowledge_empty_event_history_payload_inventory_sha256: list[str] = (
         dataclasses.field(default_factory=list)
     )
@@ -234,6 +241,8 @@ class TrainConfig(PipelineConfig):
     batch_size: int = 65536
     optimizer: str = "adam"
     weight_decay: float = 0.0
+    fused_optimizer: bool = False
+    amp: str = "none"
     lr: float = 2e-4
     # Global gradient-norm clipping. 0 is the explicit no-clip sentinel; the
     # historical/default trajectory remains exactly 1.0.
@@ -274,6 +283,7 @@ class TrainConfig(PipelineConfig):
     value_loss_weight: float = 0.10
     final_vp_loss_weight: float = 0.05
     q_loss_weight: float = 0.0
+    q_skip_teacher_prefixes: str = "catanatron_ab"
     policy_kl_anchor_weight: float = 0.0
     policy_kl_anchor_direction: str = "forward"
     value_uncertainty_loss_weight: float = 0.0
@@ -294,6 +304,8 @@ class TrainConfig(PipelineConfig):
     hlgauss_scalar_aux_loss_weight: float = 0.0
     value_hlgauss_sigma_ratio: float = 0.75
     value_target_lambda: float = 1.0
+    value_root_blend_phases: str = ""
+    value_root_blend_global_compat: bool = False
     aux_subgoal_heads: bool = False
     aux_subgoal_loss_weight: float = 0.0
     belief_resource_head: bool = False
@@ -302,6 +314,9 @@ class TrainConfig(PipelineConfig):
     truncated_vp_margin_value_weight: float = 0.25
     freeze_modules: str = ""
     train_value_only: bool = False
+    teacher_weights: str = ""
+    phase_weights: str = ""
+    value_phase_weights: str = ""
     winner_sample_weight: float = 1.0
     # Search targets remain supervised signal even when later stochastic play
     # loses the game. Outcome-conditioned downweighting is diagnostic-only.

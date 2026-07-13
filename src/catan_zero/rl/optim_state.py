@@ -100,6 +100,7 @@ def save_training_progress(
     completed_epochs: int,
     recipe_identity: dict[str, Any],
     rng_state: dict[str, Any],
+    rank_numpy_rng_states: list[dict[str, Any]],
     symmetry_rng_state: dict[str, Any] | None,
     rank_torch_rng_states: list[dict[str, Any]],
     scalar_training_weight_sum: float,
@@ -137,6 +138,7 @@ def save_training_progress(
         "recipe_identity": recipe_identity,
         "recipe_identity_sha256": _canonical_sha256(recipe_identity),
         "rng_state": rng_state,
+        "rank_numpy_rng_states": rank_numpy_rng_states,
         "symmetry_rng_state": symmetry_rng_state,
         "rank_torch_rng_states": rank_torch_rng_states,
         "scalar_training_weight_sum": float(scalar_training_weight_sum),
@@ -197,8 +199,17 @@ def load_training_progress(
             raise TrainingProgressError(f"invalid training progress field {field}")
     if not isinstance(payload.get("rng_state"), dict):
         raise TrainingProgressError("training progress lacks numpy RNG state")
-    rank_rng = payload.get("rank_torch_rng_states")
     expected_world_size = expected_recipe_identity.get("world_size")
+    rank_numpy_rng = payload.get("rank_numpy_rng_states")
+    if rank_numpy_rng is not None and (
+        not isinstance(rank_numpy_rng, list)
+        or len(rank_numpy_rng) != expected_world_size
+        or any(not isinstance(row, dict) for row in rank_numpy_rng)
+    ):
+        raise TrainingProgressError(
+            "training progress has invalid per-rank numpy RNG state"
+        )
+    rank_rng = payload.get("rank_torch_rng_states")
     if (
         not isinstance(rank_rng, list)
         or isinstance(expected_world_size, bool)
