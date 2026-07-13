@@ -4253,8 +4253,8 @@ def _validate_a1_decisive_training_semantics(
 
     * gradient accumulation currently averages already-normalized microbatch
       means, not the exact union-weighted numerator/denominator;
-    * distributed symmetry augmentation has no completed per-rank RNG/resume
-      contract; and
+    * distributed symmetry augmentation must use rank-distinct deterministic
+      streams whose complete state is committed and restored per rank; and
     * outcome-value advantage weighting was historically rank-local under DDP.
       Its new global normalization still needs a fresh, explicitly reviewed A1
       seal before it can affect a promotable candidate.
@@ -4266,13 +4266,17 @@ def _validate_a1_decisive_training_semantics(
         or getattr(args, "a1_learner_ablation_id", "")
         or getattr(args, "a1_dual_learner_lock", "")
         or bound.get("dual_arm") is True
+        or (
+            bound.get("diagnostic_only") is True
+            and bound.get("promotion_eligible") is False
+        )
     )
     world_size = int(ddp.get("world_size", 1))
     grad_accum_steps = int(getattr(args, "grad_accum_steps", 1))
     symmetry_augment = bool(getattr(args, "symmetry_augment", False))
     advantage_mode = str(getattr(args, "advantage_policy_weighting", "none"))
     contract: dict[str, object] = {
-        "schema_version": "a1-decisive-training-semantics-v1",
+        "schema_version": "a1-decisive-training-semantics-v2",
         "decisive": not diagnostic_authority,
         "diagnostic_authority_present": diagnostic_authority,
         "world_size": world_size,
@@ -4286,7 +4290,7 @@ def _validate_a1_decisive_training_semantics(
         "distributed_symmetry_contract": (
             "not_applicable"
             if not symmetry_augment or world_size == 1
-            else "incomplete"
+            else "per_rank_seedsequence_checkpoint_resume_v1"
         ),
         "advantage_policy_weighting": advantage_mode,
         "distributed_advantage_contract": (
@@ -4301,11 +4305,6 @@ def _validate_a1_decisive_training_semantics(
         raise SystemExit(
             "decisive A1 training requires --grad-accum-steps 1 until exact "
             "union-weighted gradient accumulation is implemented and sealed"
-        )
-    if world_size > 1 and symmetry_augment:
-        raise SystemExit(
-            "decisive distributed A1 training rejects --symmetry-augment until "
-            "the per-rank RNG and checkpoint/resume contract is complete"
         )
     if world_size > 1 and advantage_mode != "none":
         raise SystemExit(
@@ -5209,8 +5208,20 @@ def main(argv: Sequence[str] | None = None) -> None:
             args, a1_preflight_meta=a1_preflight_meta
         )
     )
+    composite_decisive_training_semantics = None
     if is_memmap_composite:
         _validate_composite_learner_recipe_authorization(args, a1_preflight_meta)
+        # Composite descriptors are deliberately diagnostic-only, but they
+        # still need an explicit record of trajectory-critical distributed
+        # semantics.  In particular, a symmetry arm must attest the same
+        # per-rank RNG/checkpoint contract as a single-corpus A1 run rather
+        # than disappearing from the report because this path has no one-dose
+        # learner contract.
+        composite_decisive_training_semantics = (
+            _validate_a1_decisive_training_semantics(
+                args, ddp, a1_preflight_meta
+            )
+        )
         if int(args.validation_max_samples) != 0:
             raise SystemExit(
                 "authenticated composite validation requires --validation-max-samples 0; "
@@ -6203,13 +6214,16 @@ def main(argv: Sequence[str] | None = None) -> None:
         from catan_zero.rl.hex_symmetry import build_hex_symmetry
 
         symmetry = build_hex_symmetry()
-        symmetry_rng = np.random.default_rng(int(args.seed) + 20260705)
+        symmetry_rng = _initialize_symmetry_rng(int(args.seed), ddp)
         _rank0_print(
             json.dumps(
                 {
                     "progress": "symmetry_augment",
                     "n_symmetries": int(symmetry.fwd_hex.shape[0]),
                     "relabel_events": bool(args.symmetry_augment_events),
+                    "distributed_rng_contract": (
+                        "per_rank_seedsequence_checkpoint_resume_v1"
+                    ),
                 },
                 sort_keys=True,
             ),
@@ -7754,7 +7768,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             else a1_training_binding["learner_training_recipe"]
         ),
         "a1_decisive_training_semantics": (
-            None
+            composite_decisive_training_semantics
             if a1_training_binding is None
             else a1_training_binding.get("decisive_training_semantics")
         ),
@@ -17594,6 +17608,56 @@ def _initialize_training_rng(
     }
 
 
+_SYMMETRY_RNG_PROGRESS_SCHEMA = "train-bc-rank-symmetry-rng-v1"
+
+
+def _initialize_symmetry_rng(
+    seed: int, ddp: dict[str, int | bool]
+) -> np.random.Generator:
+    """Return this rank's deterministic, topology-bound augmentation stream.
+
+    Symmetry draws are local to a rank after the global batch is partitioned.
+    Reusing one seed on every rank therefore repeats the same transform pattern
+    in every local batch.  Both world size and global rank enter ``spawn_key``:
+    streams are decorrelated for a fixed topology, and changing topology cannot
+    accidentally look like an exact continuation of the old trajectory.
+    """
+
+    world_size = int(ddp.get("world_size", 1))
+    rank = int(ddp.get("rank", 0))
+    if world_size < 1 or rank < 0 or rank >= world_size:
+        raise SystemExit(
+            "invalid distributed topology for symmetry RNG: "
+            f"world_size={world_size} rank={rank}"
+        )
+    seed_sequence = np.random.SeedSequence(
+        entropy=[int(seed), 20260705],
+        spawn_key=(world_size, rank),
+    )
+    return np.random.default_rng(seed_sequence)
+
+
+def _rank_symmetry_rng_progress_payload(
+    states: list[dict[str, object]], *, world_size: int
+) -> dict[str, object]:
+    """Version and validate the all-rank symmetry state committed on rank 0."""
+
+    if (
+        isinstance(world_size, bool)
+        or int(world_size) < 1
+        or len(states) != int(world_size)
+        or any(not isinstance(state, dict) for state in states)
+    ):
+        raise RuntimeError(
+            "cannot commit resumable symmetry RNG state for every distributed rank"
+        )
+    return {
+        "schema_version": _SYMMETRY_RNG_PROGRESS_SCHEMA,
+        "world_size": int(world_size),
+        "rank_states": states,
+    }
+
+
 def _rank0_authoritative_call(
     ddp: dict[str, int | bool],
     label: str,
@@ -18333,7 +18397,36 @@ def _restore_training_progress_state(
             raise SystemExit(
                 "resumed symmetry-augmentation recipe lacks symmetry RNG state"
             )
-        symmetry_rng.bit_generator.state = saved_symmetry_state
+        world_size = int(ddp["world_size"])
+        if saved_symmetry_state.get("schema_version") == (
+            _SYMMETRY_RNG_PROGRESS_SCHEMA
+        ):
+            saved_world_size = saved_symmetry_state.get("world_size")
+            rank_states = saved_symmetry_state.get("rank_states")
+            if (
+                isinstance(saved_world_size, bool)
+                or saved_world_size != world_size
+                or not isinstance(rank_states, list)
+                or len(rank_states) != world_size
+                or any(not isinstance(state, dict) for state in rank_states)
+            ):
+                raise SystemExit(
+                    "resumed checkpoint lacks matching per-rank symmetry RNG state"
+                )
+            state = rank_states[int(ddp["rank"])]
+        else:
+            # Historical progress committed only rank 0's augmentation stream.
+            # It remains exact for one rank, but replaying it on every DDP rank
+            # would correlate transforms and change every non-zero-rank stream.
+            if world_size > 1:
+                raise SystemExit(
+                    "legacy distributed symmetry checkpoint lacks per-rank RNG state"
+                )
+            state = saved_symmetry_state
+        try:
+            symmetry_rng.bit_generator.state = state
+        except (TypeError, ValueError, KeyError) as error:
+            raise SystemExit("invalid resumed symmetry RNG state") from error
     elif saved_symmetry_state is not None:
         raise SystemExit(
             "training progress has symmetry RNG state but current recipe disables it"
@@ -18403,6 +18496,9 @@ def _save_training_progress_sidecar(
         ),
     }
     local_numpy_rng_state = rng.bit_generator.state
+    local_symmetry_rng_state = (
+        None if symmetry_rng is None else symmetry_rng.bit_generator.state
+    )
     if bool(ddp["enabled"]):
         import torch.distributed as dist
 
@@ -18418,9 +18514,30 @@ def _save_training_progress_sidecar(
         gathered_numpy_rng_states = [
             row for row in rank_numpy_rng_states if row is not None
         ]
+        if local_symmetry_rng_state is not None:
+            rank_symmetry_rng_states: list[dict[str, object] | None] = [
+                None for _ in range(int(ddp["world_size"]))
+            ]
+            dist.all_gather_object(
+                rank_symmetry_rng_states, local_symmetry_rng_state
+            )
+            if any(state is None for state in rank_symmetry_rng_states):
+                raise RuntimeError(
+                    "distributed symmetry RNG gather returned an incomplete rank set"
+                )
+            gathered_symmetry_rng_states = [
+                state for state in rank_symmetry_rng_states if state is not None
+            ]
+        else:
+            gathered_symmetry_rng_states = None
     else:
         gathered_rng_states = [local_rng]
         gathered_numpy_rng_states = [local_numpy_rng_state]
+        gathered_symmetry_rng_states = (
+            None
+            if local_symmetry_rng_state is None
+            else [local_symmetry_rng_state]
+        )
 
     # Non-zero DDP/FSDP ranks participate in optimizer/RNG collectives but never write.
     if int(ddp["rank"]) != 0:
@@ -18439,7 +18556,12 @@ def _save_training_progress_sidecar(
             rng_state=rng.bit_generator.state,
             rank_numpy_rng_states=gathered_numpy_rng_states,
             symmetry_rng_state=(
-                None if symmetry_rng is None else symmetry_rng.bit_generator.state
+                None
+                if gathered_symmetry_rng_states is None
+                else _rank_symmetry_rng_progress_payload(
+                    gathered_symmetry_rng_states,
+                    world_size=int(ddp["world_size"]),
+                )
             ),
             rank_torch_rng_states=gathered_rng_states,
             scalar_training_weight_sum=float(scalar_training_weight_sum),

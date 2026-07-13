@@ -556,7 +556,7 @@ def test_a1_artifact_chain_replays_actual_seed_set_and_learner_objective(
     ddp = {"world_size": 1, "rank": 0, "local_rank": 0, "enabled": False}
     assert _validate_a1_learner_training_recipe(args, ddp, bound) == recipe
     assert bound["decisive_training_semantics"] == {
-        "schema_version": "a1-decisive-training-semantics-v1",
+        "schema_version": "a1-decisive-training-semantics-v2",
         "decisive": True,
         "diagnostic_authority_present": False,
         "world_size": 1,
@@ -658,7 +658,6 @@ def _decisive_semantics_args(**overrides: object) -> argparse.Namespace:
     ("overrides", "message"),
     [
         ({"grad_accum_steps": 2}, "union-weighted gradient accumulation"),
-        ({"symmetry_augment": True}, "per-rank RNG"),
         (
             {"advantage_policy_weighting": "outcome_value"},
             "global DDP normalization",
@@ -693,9 +692,38 @@ def test_explicit_a1_diagnostic_authority_records_but_does_not_promote_unsafe_kn
     assert contract["gradient_accumulation_contract"] == (
         "diagnostic_approximate_microbatch_means"
     )
-    assert contract["distributed_symmetry_contract"] == "incomplete"
+    assert contract["distributed_symmetry_contract"] == (
+        "per_rank_seedsequence_checkpoint_resume_v1"
+    )
     assert contract["distributed_advantage_contract"] == (
         "global_normalization_unsealed_for_a1"
+    )
+
+
+def test_decisive_distributed_a1_accepts_sealed_symmetry_rng_contract() -> None:
+    contract = _validate_a1_decisive_training_semantics(
+        _decisive_semantics_args(symmetry_augment=True),
+        {"world_size": 8, "enabled": True},
+        {},
+    )
+
+    assert contract["decisive"] is True
+    assert contract["distributed_symmetry_contract"] == (
+        "per_rank_seedsequence_checkpoint_resume_v1"
+    )
+
+
+def test_diagnostic_composite_records_distributed_symmetry_contract() -> None:
+    contract = _validate_a1_decisive_training_semantics(
+        _decisive_semantics_args(symmetry_augment=True),
+        {"world_size": 8, "enabled": True},
+        {"diagnostic_only": True, "promotion_eligible": False},
+    )
+
+    assert contract["decisive"] is False
+    assert contract["diagnostic_authority_present"] is True
+    assert contract["distributed_symmetry_contract"] == (
+        "per_rank_seedsequence_checkpoint_resume_v1"
     )
 
 
