@@ -168,6 +168,23 @@ def test_c7_c8_allocate_only_at_their_audited_commit(tmp_path):
     assert [row["alias"] for row in plan["assignments"]] == ["c7", "c8"]
 
 
+def test_exact64_new_hosts_allocate_only_at_their_deployed_commit(tmp_path):
+    manifest = fleet.load_manifest(_REPO_ROOT / "configs" / "gpu_fleet_64.json")
+    jobs = _jobset(
+        tmp_path,
+        [
+            {"job_id": "h100-8c-job", "host": "h100-8c", "gpus": 8, "argv": ["true"]},
+            {"job_id": "h100-8d-job", "host": "h100-8d", "gpus": 8, "argv": ["true"]},
+        ],
+    )
+    plan = fleet.build_plan(
+        manifest,
+        jobs,
+        repo_commit="c540ac097a5c02d5572204db8c0bed2cf90f4fed",
+    )
+    assert [row["alias"] for row in plan["assignments"]] == ["h100-8c", "h100-8d"]
+
+
 @pytest.mark.parametrize(
     ("mutation", "message"),
     [
