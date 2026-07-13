@@ -90,6 +90,10 @@ EFFECTIVE_TRAINABLE_OBJECTIVE = {
     "value_loss_reaches_topology_adapter": True,
     "all_mature_policy_value_tensors_frozen": True,
 }
+# Architecture fields that the completion report must prove. Thin additive
+# siblings override this under their scoped configuration; the default retains
+# the topology-only contract exactly.
+REPORT_ARCHITECTURE_DELTA = {"topology_residual_adapter": True}
 TREATMENT_GEOMETRY_NAME = "treatment_topology_commissioning"
 TREATMENT_INTEGRATED_LR_CONTRACT = {
     "trunk_integrated_lr_step_equivalents": TRUNK_LR_MULT,

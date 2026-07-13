@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Seal a matched topology-residual + target-gather commissioning sibling.
+"""Seal the exact-parent static-action dead-input commissioning arm.
 
-This is a deliberately thin specialization of the reviewed topology-only arm.
-It changes only the allowlisted additive architecture module and its exact
-trainable/optimizer surface.  Configuration is scoped to each call so importing
-this module cannot mutate topology-only verification in another test or process.
+This is a thin, scoped specialization of the reviewed selected-dose additive
+architecture runner. It changes only the function-preserving static catalog
+residual, freezes every inherited tensor, and trains the two new action-local
+tensors for the authenticated 128-step/524,288-draw D6 geometry.
 """
 
 from __future__ import annotations
@@ -24,56 +24,50 @@ from tools import a1_function_preserving_upgrade as architecture_upgrade  # noqa
 from tools import a1_topology_only_composition_arm as base  # noqa: E402
 
 
-SCHEMA = "a1-topology-target-gather-composition-arm-v1"
-RECEIPT_SCHEMA = "a1-topology-target-gather-execution-receipt-v1"
-STATUS_SCHEMA = "a1-topology-target-gather-execution-status-v1"
-CLAIM_SCHEMA = "a1-topology-target-gather-execution-claim-v1"
-EXECUTOR_RELATIVE_PATH = "tools/a1_topology_target_gather_composition_arm.py"
-COMPLETION_RELATIVE_PATH = "tools/a1_topology_target_gather_composition_completion.py"
-MANIFEST_NAME = "topology-target-gather-composition.manifest.json"
+SCHEMA = "a1-static-action-residual-arm-v1"
+RECEIPT_SCHEMA = "a1-static-action-residual-execution-receipt-v1"
+STATUS_SCHEMA = "a1-static-action-residual-execution-status-v1"
+CLAIM_SCHEMA = "a1-static-action-residual-execution-claim-v1"
+EXECUTOR_RELATIVE_PATH = "tools/a1_static_action_residual_arm.py"
+COMPLETION_RELATIVE_PATH = "tools/a1_static_action_residual_completion.py"
+MANIFEST_NAME = "static-action-residual.manifest.json"
 
 WORLD_SIZE = base.WORLD_SIZE
 LOCAL_BATCH_SIZE = base.LOCAL_BATCH_SIZE
 GLOBAL_BATCH_SIZE = base.GLOBAL_BATCH_SIZE
 ALLOWED_OPTIMIZER_STEPS = base.ALLOWED_OPTIMIZER_STEPS
 OPTIMIZER_STEPS = base.OPTIMIZER_STEPS
-TRUNK_LR_MULT = 4.0
+TRUNK_LR_MULT = 1.0
 ACTION_MODULE_LR_MULT = 4.0
 VALUE_LR_MULT = 1.0
 FREEZE_MODULES = (
-    "trunk_base,action_encoder,policy_head,value_heads,edge_policy,action_cross"
+    "trunk,action_encoder,policy_head,value_heads,target_gather,"
+    "edge_policy,action_cross"
 )
-TRAINABLE_PREFIXES = ("topology_residual_adapter", "target_gather_proj")
-TRAINABLE_PREFIX = ",".join(TRAINABLE_PREFIXES)
-UPGRADE_MODULE = architecture_upgrade.MODULE_TOPOLOGY_TARGET_GATHER
+TRAINABLE_PREFIXES = ("static_action_residual_proj",)
+TRAINABLE_PREFIX = TRAINABLE_PREFIXES[0]
+UPGRADE_MODULE = architecture_upgrade.MODULE_STATIC_ACTION_RESIDUAL
 EXPECTED_TOPOLOGY_PARAMETERS = tuple(
-    sorted(
-        architecture_upgrade.ALLOWLIST[UPGRADE_MODULE]["new_parameter_initialization"]
-    )
+    sorted(architecture_upgrade.ALLOWLIST[UPGRADE_MODULE]["new_parameter_initialization"])
 )
-EXPECTED_TOPOLOGY_PARAMETER_COUNT = 1_234_560
-EXPECTED_PARAMETER_COUNTS = {
-    "topology_residual_adapter": 823_040,
-    "target_gather_proj": 411_520,
-}
+EXPECTED_TOPOLOGY_PARAMETER_COUNT = 14_720
+EXPECTED_PARAMETER_COUNTS = {TRAINABLE_PREFIX: EXPECTED_TOPOLOGY_PARAMETER_COUNT}
 ONLY_DECLARED_MODEL_DELTA = (
-    "train function-preserving topology_residual_adapter and target_gather_proj "
-    "on a frozen exact selected parent"
+    "train function-preserving static_action_residual_proj on frozen exact "
+    "selected parent"
 )
-ADAPTER_LR_CONTRACT = {
-    "topology_lr": 3e-5 * TRUNK_LR_MULT,
-    "target_gather_lr": 3e-5 * ACTION_MODULE_LR_MULT,
-}
+ADAPTER_LR_CONTRACT = {"static_action_residual_lr": 3e-5 * ACTION_MODULE_LR_MULT}
 EFFECTIVE_TRAINABLE_OBJECTIVE = {
-    "policy_loss_reaches_topology_adapter": True,
-    "value_loss_reaches_topology_adapter": True,
-    "policy_loss_reaches_target_gather": True,
+    "policy_loss_reaches_static_action_residual": True,
+    "value_loss_reaches_static_action_residual": False,
     "all_inherited_policy_value_tensors_frozen": True,
 }
-REPORT_ARCHITECTURE_DELTA = base.REPORT_ARCHITECTURE_DELTA
-TREATMENT_GEOMETRY_NAME = "treatment_topology_target_gather_commissioning"
+REPORT_ARCHITECTURE_DELTA = {
+    "topology_residual_adapter": False,
+    "static_action_residual": True,
+}
+TREATMENT_GEOMETRY_NAME = "treatment_static_action_residual_commissioning"
 TREATMENT_INTEGRATED_LR_CONTRACT = {
-    "trunk_integrated_lr_step_equivalents": TRUNK_LR_MULT,
     "action_integrated_lr_step_equivalents": ACTION_MODULE_LR_MULT,
 }
 INFERENCE_COST_CONTRACT = {
@@ -100,8 +94,8 @@ INFERENCE_COST_CONTRACT = {
         "exact_window.wall_ms.p95",
     ],
     "selection_semantics": (
-        "strength must be adjudicated with observed candidate/reference inference "
-        "cost; architecture selection may not ignore a latency regression"
+        "strength is adjudicated with candidate/reference inference cost; "
+        "architecture selection may not ignore latency"
     ),
 }
 SOURCE_FILES = tuple(
@@ -111,6 +105,7 @@ SOURCE_FILES = tuple(
             EXECUTOR_RELATIVE_PATH,
             COMPLETION_RELATIVE_PATH,
             "tools/bench_entity_graph_stages.py",
+            "src/catan_zero/search/cuda_graph_inference.py",
         )
     )
 )
@@ -160,8 +155,6 @@ def _configured() -> Iterator[None]:
     try:
         for name, value in _CONFIG.items():
             setattr(base, name, value)
-        # Parent-selection issuer and default executor identity are part of the
-        # immutable artifact, so they must name this specialization.
         base.__file__ = __file__
         yield
     finally:

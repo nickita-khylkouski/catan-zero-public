@@ -287,7 +287,7 @@ def _verify_report(
         "require_only_trainable_prefixes": arm.TRAINABLE_PREFIX,
         "state_trunk": "transformer",
         "action_target_gather": effective_gather,
-        "topology_residual_adapter": True,
+        **arm.REPORT_ARCHITECTURE_DELTA,
         "symmetry_augment": True,
         "symmetry_augment_events": True,
         "ddp_find_unused_parameters": False,
