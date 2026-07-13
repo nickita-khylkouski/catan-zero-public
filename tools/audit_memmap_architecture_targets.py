@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ProcessPoolExecutor
 import json
 from pathlib import Path
 from typing import Any, Sequence
@@ -526,17 +527,54 @@ def combined_verdict(audits: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _audit_worker(payload: tuple[Path, int]) -> dict[str, Any]:
+    path, chunk_rows = payload
+    return audit_corpus(path, chunk_rows=chunk_rows)
+
+
+def audit_corpora(
+    corpora: Sequence[Path], *, chunk_rows: int, workers: int = 1
+) -> list[dict[str, Any]]:
+    """Audit independent corpora in stable input order.
+
+    The payloads are hundreds of GiB but the readers are mmap-backed and
+    independent.  A process per corpus lets high-I/O, many-core learner hosts
+    scan n128/n256/replay concurrently without materializing any whole column.
+    ``executor.map`` preserves input order, so the resulting JSON is identical
+    to the serial contract apart from wall time.
+    """
+
+    paths = list(corpora)
+    if isinstance(workers, bool) or int(workers) < 1:
+        raise ValueError("workers must be a positive integer")
+    if int(workers) == 1 or len(paths) <= 1:
+        return [audit_corpus(path, chunk_rows=chunk_rows) for path in paths]
+    process_count = min(int(workers), len(paths))
+    with ProcessPoolExecutor(max_workers=process_count) as executor:
+        return list(
+            executor.map(
+                _audit_worker,
+                ((path, int(chunk_rows)) for path in paths),
+            )
+        )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("corpus", nargs="+", type=Path)
     parser.add_argument("--chunk-rows", type=int, default=512)
+    parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--out", type=Path)
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
-    audits = [audit_corpus(path, chunk_rows=args.chunk_rows) for path in args.corpus]
+    audits = audit_corpora(
+        args.corpus,
+        chunk_rows=args.chunk_rows,
+        workers=args.workers,
+    )
     payload = {
         "schema_version": "memmap-architecture-target-audit-bundle-v1",
         "audits": audits,
