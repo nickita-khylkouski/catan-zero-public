@@ -1,19 +1,19 @@
 {
-  "schema_version": "a1-pre-wave-contract-draft-v2",
-  "contract_id": "a1-infoset-n128-p4-12000games",
+  "schema_version": "a1-pre-wave-contract-draft-v3",
+  "contract_id": "a1-v5-infoset-n128-p4-12000games-64gpu",
   "promotion_handoff": {
-    "mode": "historical_pre_promotion",
-    "reason": "initial A1 wave predates the A1 promotion transaction"
+    "mode": "post_promotion",
+    "path": "__UNRESOLVED__"
   },
   "science": {
     "search": {
       "max_depth": 80,
       "c_visit": 50.0,
-      "c_scale": "__UNRESOLVED__",
+      "c_scale": 0.1,
       "prior_temperature": 1.0,
-      "n_full": "__UNRESOLVED__",
+      "n_full": 128,
       "n_fast": 16,
-      "p_full": "__UNRESOLVED__",
+      "p_full": 0.4,
       "n_full_wide": "__UNRESOLVED__",
       "n_full_wide_threshold": "__UNRESOLVED__",
       "wide_roots_always_full": "__UNRESOLVED__",
@@ -143,8 +143,8 @@
     {
       "id": "winning_teacher",
       "role": "producer",
-      "path": "__UNRESOLVED__",
-      "legacy_scalar_readout_attestation": "__UNRESOLVED__"
+      "path": "/home/ubuntu/catan-zero-production/runs/learner/a1-production-l1-one-dose-20260712-r3/candidate.pt",
+      "legacy_scalar_readout_attestation": null
     },
     {
       "id": "recent_champion",
@@ -154,7 +154,9 @@
     {
       "id": "hard_negative",
       "role": "hard_negative",
-      "path": "__UNRESOLVED__"
+      "path": "__UNRESOLVED__",
+      "version": "__UNRESOLVED__",
+      "selection_evidence": "__UNRESOLVED__"
     }
   ],
   "source_categories": [
@@ -179,53 +181,8 @@
     }
   ],
   "fleet": {
-    "workers": [
-      {"id": "c1_gpu0", "host_alias": "c1", "gpu": 0},
-      {"id": "c1_gpu1", "host_alias": "c1", "gpu": 1},
-      {"id": "c1_gpu2", "host_alias": "c1", "gpu": 2},
-      {"id": "c1_gpu3", "host_alias": "c1", "gpu": 3},
-      {"id": "c2_gpu0", "host_alias": "c2", "gpu": 0},
-      {"id": "c2_gpu1", "host_alias": "c2", "gpu": 1},
-      {"id": "c2_gpu2", "host_alias": "c2", "gpu": 2},
-      {"id": "c2_gpu3", "host_alias": "c2", "gpu": 3},
-      {"id": "c3_gpu0", "host_alias": "c3", "gpu": 0},
-      {"id": "c3_gpu1", "host_alias": "c3", "gpu": 1},
-      {"id": "c3_gpu2", "host_alias": "c3", "gpu": 2},
-      {"id": "c3_gpu3", "host_alias": "c3", "gpu": 3},
-      {"id": "c4_gpu0", "host_alias": "c4", "gpu": 0},
-      {"id": "c4_gpu1", "host_alias": "c4", "gpu": 1},
-      {"id": "c4_gpu2", "host_alias": "c4", "gpu": 2},
-      {"id": "c4_gpu3", "host_alias": "c4", "gpu": 3},
-      {"id": "c5_gpu0", "host_alias": "c5", "gpu": 0},
-      {"id": "c5_gpu1", "host_alias": "c5", "gpu": 1},
-      {"id": "c5_gpu2", "host_alias": "c5", "gpu": 2},
-      {"id": "c5_gpu3", "host_alias": "c5", "gpu": 3},
-      {"id": "c6_gpu0", "host_alias": "c6", "gpu": 0},
-      {"id": "c6_gpu1", "host_alias": "c6", "gpu": 1},
-      {"id": "c6_gpu2", "host_alias": "c6", "gpu": 2},
-      {"id": "c6_gpu3", "host_alias": "c6", "gpu": 3},
-      {"id": "h8a_gpu0", "host_alias": "h100-8a", "gpu": 0},
-      {"id": "h8a_gpu1", "host_alias": "h100-8a", "gpu": 1},
-      {"id": "h8a_gpu2", "host_alias": "h100-8a", "gpu": 2},
-      {"id": "h8a_gpu3", "host_alias": "h100-8a", "gpu": 3},
-      {"id": "h8a_gpu4", "host_alias": "h100-8a", "gpu": 4},
-      {"id": "h8a_gpu5", "host_alias": "h100-8a", "gpu": 5},
-      {"id": "h8a_gpu6", "host_alias": "h100-8a", "gpu": 6},
-      {"id": "h8a_gpu7", "host_alias": "h100-8a", "gpu": 7},
-      {"id": "h8b_gpu0", "host_alias": "h100-8b", "gpu": 0},
-      {"id": "h8b_gpu1", "host_alias": "h100-8b", "gpu": 1},
-      {"id": "h8b_gpu2", "host_alias": "h100-8b", "gpu": 2},
-      {"id": "h8b_gpu3", "host_alias": "h100-8b", "gpu": 3},
-      {"id": "h8b_gpu4", "host_alias": "h100-8b", "gpu": 4},
-      {"id": "h8b_gpu5", "host_alias": "h100-8b", "gpu": 5},
-      {"id": "h8b_gpu6", "host_alias": "h100-8b", "gpu": 6},
-      {"id": "h8b_gpu7", "host_alias": "h100-8b", "gpu": 7}
-    ],
-    "per_worker_games": {
-      "current_producer": 240,
-      "recent_history": 45,
-      "hard_negative": 15
-    },
+    "fleet_manifest": "../gpu_fleet_64.json",
+    "quota_policy": "balanced_prefix_v1",
     "seed_base": "__UNRESOLVED__",
     "seed_block_size": 1000,
     "seed_ledger": "__UNRESOLVED__",

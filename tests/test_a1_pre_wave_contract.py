@@ -26,6 +26,12 @@ TEMPLATE = (
     / "experiments"
     / "a1_pre_wave_contract.template.json"
 )
+HISTORICAL_DRAFT = (
+    Path(__file__).resolve().parents[1]
+    / "configs"
+    / "experiments"
+    / "a1_pre_wave_contract.rnd_draft.json"
+)
 GENERATION_CAMPAIGN = (
     Path(__file__).resolve().parents[1]
     / "configs"
@@ -547,7 +553,10 @@ def _legacy_scalar_pair(
 
 
 def _resolved_draft(tmp_path: Path) -> Path:
-    payload = json.loads(TEMPLATE.read_text(encoding="utf-8"))
+    # The large replay suite intentionally exercises immutable v2 behavior.
+    # TEMPLATE is the current v3/64-GPU operator template and has dedicated
+    # topology/provenance tests below.
+    payload = json.loads(HISTORICAL_DRAFT.read_text(encoding="utf-8"))
     search = payload["science"]["search"]
     search.update(
         {
@@ -707,6 +716,7 @@ def _resolved_draft(tmp_path: Path) -> Path:
     payload["generation"]["late_temperature_decisions"] = 180
     payload["generation"]["late_temperature"] = 0.25
     payload["generation"]["workers_per_gpu"] = 1
+    payload["generation"]["native_mcts_hot_loop"] = True
     payload["fleet"]["seed_base"] = 86_000_000_000
     ledger = tmp_path / "SEED_LEDGER.md"
     ledger.write_text(
@@ -839,12 +849,76 @@ def test_legacy_job_attestation_remains_exact_but_is_not_new_identity(
 def test_checked_in_template_is_intentionally_unresolved_and_refuses_seal() -> None:
     payload = json.loads(TEMPLATE.read_text(encoding="utf-8"))
     unresolved = contract._find_unresolved(payload)
-    assert "$.science.search.n_full" in unresolved
+    assert payload["science"]["search"]["n_full"] == 128
+    assert payload["science"]["search"]["p_full"] == 0.4
+    assert payload["science"]["search"]["c_scale"] == 0.1
+    assert "$.promotion_handoff.path" in unresolved
+    assert "$.science.search.n_full_wide" in unresolved
     assert "$.science.evaluator.value_readout" in unresolved
-    assert "$.checkpoints[0].legacy_scalar_readout_attestation" in unresolved
+    assert "$.checkpoints[1].path" in unresolved
+    assert "$.checkpoints[2].selection_evidence" in unresolved
     assert "$.fleet.seed_base" in unresolved
     with pytest.raises(contract.ContractError, match="finish A0/S1-S3"):
         contract.build_lock(TEMPLATE)
+
+
+def test_v3_authoritative_fleet_balances_exact_64_gpu_quotas() -> None:
+    workers, record = contract._canonical_workers_from_fleet_manifest(  # noqa: SLF001
+        contract.CURRENT_FLEET_MANIFEST
+    )
+    quotas = contract._balanced_worker_quotas(workers)  # noqa: SLF001
+
+    assert len(workers) == 64
+    assert record["sha256"] == contract._sha256(  # noqa: SLF001
+        contract.CURRENT_FLEET_MANIFEST
+    )
+    assert {category: sum(q[category] for q in quotas.values()) for category in contract.EXPECTED_GAMES} == contract.EXPECTED_GAMES
+    ordered = [quotas[worker["id"]] for worker in workers]
+    assert {quota["current_producer"] for quota in ordered} == {150}
+    assert [quota["recent_history"] for quota in ordered].count(29) == 8
+    assert [quota["recent_history"] for quota in ordered].count(28) == 56
+    assert [quota["hard_negative"] for quota in ordered].count(10) == 24
+    assert [quota["hard_negative"] for quota in ordered].count(9) == 40
+
+
+def test_v3_balanced_jobs_have_exact_selected_and_bounded_attempt_totals(
+    tmp_path: Path,
+) -> None:
+    workers, _ = contract._canonical_workers_from_fleet_manifest(  # noqa: SLF001
+        contract.CURRENT_FLEET_MANIFEST
+    )
+    jobs, quotas = contract._build_balanced_jobs(  # noqa: SLF001
+        workers,
+        seed_base=90_000_000_000,
+        block_size=1_000,
+        output_root=str(tmp_path),
+        contract_id="v3-test",
+    )
+
+    assert len(jobs) == 192
+    assert Counter(
+        {
+            category: sum(job["games"] for job in jobs if job["category"] == category)
+            for category in contract.EXPECTED_GAMES
+        }
+    ) == Counter(contract.EXPECTED_GAMES)
+    assert {
+        category: sum(job["attempts"] for job in jobs if job["category"] == category)
+        for category in contract.EXPECTED_GAMES
+    } == {
+        category: total + 64 * contract.ATTEMPT_RESERVE_PER_JOB[category]
+        for category, total in contract.EXPECTED_GAMES.items()
+    }
+    assert quotas["c1_gpu0"] == {
+        "current_producer": 150,
+        "recent_history": 29,
+        "hard_negative": 10,
+    }
+    assert quotas["h100-8d_gpu7"] == {
+        "current_producer": 150,
+        "recent_history": 28,
+        "hard_negative": 9,
+    }
 
 
 def test_checked_in_relative_provenance_paths_canonicalize_to_required_files() -> None:

@@ -7,12 +7,13 @@ the data-production lane.  There is no subprocess/exec path: every legacy or
 dual-arm wave remains an explicit operator boundary.
 
 The contract uses category-specific jobs rather than a probabilistic opponent
-mix.  Each of 40 workers attempts 245 current, 47 history, and 16 hard-negative
-games, then the postflight deterministically selects the lowest-seed complete
-240/45/15 per job.  This gives exactly 9,600/1,800/600 selected games before
-row expansion while tolerating only the bounded, predeclared reserve.  The
-audit rejects an insufficient complete quota, duplicate or VAL-ONLY seeds,
-invalid selected actions, config drift, and missing shard provenance.
+mix. Historical v2 locks retain their original 40-worker 240/45/15 layout.
+Current v3 locks bind the canonical 64-GPU fleet and distribute the same exact
+9,600/1,800/600 science totals with deterministic balanced-prefix quotas.
+Every job receives a bounded category-specific reserve, and postflight selects
+the lowest-seed complete games before row expansion. The audit rejects an
+insufficient complete quota, duplicate or VAL-ONLY seeds, invalid selected
+actions, config drift, and missing shard provenance.
 """
 
 from __future__ import annotations
@@ -99,6 +100,8 @@ EXPECTED_GAMES = {
     "recent_history": 1_800,
     "hard_negative": 600,
 }
+# Historical v2 constants. They are intentionally immutable so an issued 40-GPU
+# draft/lock can still reconstruct byte-for-byte.
 EXPECTED_WORKER_COUNT = 40
 EXPECTED_PER_WORKER = {
     "current_producer": 240,
@@ -116,6 +119,21 @@ EXPECTED_ATTEMPTS_PER_WORKER = {
 EXPECTED_ATTEMPTS = {
     category: attempts * EXPECTED_WORKER_COUNT
     for category, attempts in EXPECTED_ATTEMPTS_PER_WORKER.items()
+}
+
+# New v3 waves use the checked-in authoritative topology rather than copying a
+# mutable worker list into an operator draft.  Quota remainders go to the first
+# workers in the manifest's canonical host/GPU order; hashing the full manifest
+# makes even an order-only edit a contract change.
+CURRENT_FLEET_MANIFEST = REPO_ROOT / "configs" / "gpu_fleet_64.json"
+CURRENT_FLEET_SCHEMA = "catan-gpu-fleet-v2"
+CURRENT_FLEET_AUTHORITY = "catan-h100-exact64-v1"
+CURRENT_WORKER_COUNT = 64
+BALANCED_PREFIX_QUOTA_POLICY = "balanced_prefix_v1"
+ATTEMPT_RESERVE_PER_JOB = {
+    "current_producer": 5,
+    "recent_history": 2,
+    "hard_negative": 1,
 }
 
 # One deliberately short, single-B200 learner dose.  A search/data contract is
@@ -1674,6 +1692,155 @@ def _validate_post_wave(value: dict[str, Any]) -> None:
         )
 
 
+def _canonical_workers_from_fleet_manifest(
+    manifest_path: Path,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Load the exact current topology and derive its ordered GPU lanes.
+
+    The worker id is a pure projection of ``alias`` and the physical GPU index.
+    A draft may echo this list for operator readability, but it cannot select a
+    different order, omit a GPU, or invent a placement.
+    """
+
+    manifest_path = manifest_path.expanduser().resolve(strict=True)
+    payload = _load_json(manifest_path)
+    if payload.get("schema_version") != CURRENT_FLEET_SCHEMA:
+        raise ContractError(
+            f"fleet manifest schema must be {CURRENT_FLEET_SCHEMA!r}"
+        )
+    if payload.get("fleet_authority") != CURRENT_FLEET_AUTHORITY:
+        raise ContractError(
+            f"fleet manifest authority must be {CURRENT_FLEET_AUTHORITY!r}"
+        )
+    hosts = payload.get("hosts")
+    if not isinstance(hosts, list) or not hosts:
+        raise ContractError("fleet manifest must contain an ordered non-empty hosts list")
+    workers: list[dict[str, Any]] = []
+    aliases: set[str] = set()
+    addresses: set[str] = set()
+    for index, host in enumerate(hosts):
+        if not isinstance(host, dict):
+            raise ContractError(f"fleet manifest host {index} is not an object")
+        alias = host.get("alias")
+        address = host.get("address")
+        gpu_count = host.get("gpu_count")
+        if (
+            not isinstance(alias, str)
+            or not alias
+            or not isinstance(address, str)
+            or not address
+            or isinstance(gpu_count, bool)
+            or not isinstance(gpu_count, int)
+            or gpu_count < 1
+        ):
+            raise ContractError(f"fleet manifest host {index} identity is invalid")
+        if alias in aliases or address in addresses:
+            raise ContractError("fleet manifest contains duplicate host alias/address")
+        aliases.add(alias)
+        addresses.add(address)
+        workers.extend(
+            {
+                "id": f"{alias}_gpu{gpu}",
+                "host_alias": alias,
+                "gpu": gpu,
+            }
+            for gpu in range(gpu_count)
+        )
+    if len(workers) != CURRENT_WORKER_COUNT:
+        raise ContractError(
+            "current fleet manifest must project exactly "
+            f"{CURRENT_WORKER_COUNT} GPU workers, got {len(workers)}"
+        )
+    return workers, _file_record(manifest_path, kind="fleet_manifest")
+
+
+def _balanced_worker_quotas(
+    workers: Sequence[Mapping[str, Any]],
+) -> dict[str, dict[str, int]]:
+    """Return exact category quotas in canonical balanced-prefix order."""
+
+    if len(workers) != CURRENT_WORKER_COUNT:
+        raise ContractError(
+            f"balanced v3 quota policy requires {CURRENT_WORKER_COUNT} workers"
+        )
+    worker_ids = [str(worker["id"]) for worker in workers]
+    if len(set(worker_ids)) != len(worker_ids):
+        raise ContractError("balanced v3 quota policy received duplicate worker ids")
+    quotas = {worker_id: {} for worker_id in worker_ids}
+    for category, total in EXPECTED_GAMES.items():
+        base, extra = divmod(int(total), len(worker_ids))
+        for index, worker_id in enumerate(worker_ids):
+            quotas[worker_id][category] = base + int(index < extra)
+    if {
+        category: sum(worker[category] for worker in quotas.values())
+        for category in EXPECTED_GAMES
+    } != EXPECTED_GAMES:
+        raise AssertionError("balanced quota construction lost exact science totals")
+    return quotas
+
+
+def _build_balanced_jobs(
+    workers: list[dict[str, Any]],
+    *,
+    seed_base: int,
+    block_size: int,
+    output_root: str,
+    contract_id: str,
+) -> tuple[list[dict[str, Any]], dict[str, dict[str, int]]]:
+    quotas = _balanced_worker_quotas(workers)
+    max_attempts_per_worker = max(
+        sum(
+            int(quotas[worker_id][category])
+            + int(ATTEMPT_RESERVE_PER_JOB[category])
+            for category in EXPECTED_GAMES
+        )
+        for worker_id in quotas
+    )
+    if block_size < max_attempts_per_worker:
+        raise ContractError(
+            f"seed block_size={block_size} is smaller than "
+            f"the v3 maximum {max_attempts_per_worker} attempts/worker"
+        )
+    jobs: list[dict[str, Any]] = []
+    for worker_index, worker in enumerate(workers):
+        cursor = seed_base + worker_index * block_size
+        worker_id = str(worker["id"])
+        for category in EXPECTED_GAMES:
+            games = int(quotas[worker_id][category])
+            attempts = games + int(ATTEMPT_RESERVE_PER_JOB[category])
+            job_id = f"{worker_id}__{category}"
+            jobs.append(
+                {
+                    "job_id": job_id,
+                    "worker_id": worker_id,
+                    "host_alias": str(worker["host_alias"]),
+                    "gpu": int(worker["gpu"]),
+                    "category": category,
+                    "base_seed": cursor,
+                    "games": games,
+                    "attempts": attempts,
+                    "seed_end": cursor + attempts,
+                    "output_dir": str(Path(output_root) / contract_id / job_id),
+                    "claim_label": f"{contract_id}:{job_id}",
+                }
+            )
+            cursor += attempts
+    assert_disjoint_seed_blocks(
+        [
+            (job["job_id"], int(job["base_seed"]), int(job["attempts"]))
+            for job in jobs
+        ]
+    )
+    for job in jobs:
+        interval = (int(job["base_seed"]), int(job["seed_end"]))
+        if _ranges_overlap(interval, VAL_ONLY_SEED_RANGE):
+            raise ContractError(
+                f"job {job['job_id']} seed range {interval} overlaps "
+                f"VAL-ONLY {VAL_ONLY_SEED_RANGE}"
+            )
+    return jobs, quotas
+
+
 def _build_jobs(
     workers: list[dict[str, Any]],
     *,
@@ -1938,8 +2105,57 @@ def _verify_live_seed_ledger(
             )
 
 
+def _hard_negative_selection_record(
+    path: Path, *, checkpoint: Path, checkpoint_sha256: str
+) -> dict[str, Any]:
+    payload = _load_json(path)
+    required = {
+        "schema_version",
+        "checkpoint",
+        "selection_reason",
+        "evaluation_evidence",
+        "selection_sha256",
+    }
+    _require_exact_keys(payload, required, where="hard-negative selection evidence")
+    if payload["schema_version"] != "a1-hard-negative-selection-v1":
+        raise ContractError("hard-negative selection evidence schema is unsupported")
+    unhashed = dict(payload)
+    declared = unhashed.pop("selection_sha256")
+    if declared != _digest_value(unhashed):
+        raise ContractError("hard-negative selection evidence digest mismatch")
+    if payload["checkpoint"] != {
+        "path": str(checkpoint),
+        "sha256": checkpoint_sha256,
+    }:
+        raise ContractError("hard-negative selection evidence binds different bytes")
+    reason = payload["selection_reason"]
+    if not isinstance(reason, str) or not reason.strip():
+        raise ContractError("hard-negative selection reason must be non-empty")
+    evidence = payload["evaluation_evidence"]
+    if not isinstance(evidence, dict) or set(evidence) != {"path", "sha256"}:
+        raise ContractError("hard-negative evaluation evidence binding is malformed")
+    evidence_path = Path(str(evidence["path"])).expanduser().resolve(strict=True)
+    if _sha256(evidence_path) != evidence["sha256"]:
+        raise ContractError("hard-negative evaluation evidence hash drift")
+    record = _file_record(path, kind="hard_negative_selection")
+    record.update(
+        {
+            "selection_sha256": declared,
+            "evaluation_evidence": {
+                "path": str(evidence_path),
+                "sha256": evidence["sha256"],
+            },
+        }
+    )
+    return record
+
+
 def _checkpoint_records(
-    raw: list[dict[str, Any]], *, base: Path, value_readout: str
+    raw: list[dict[str, Any]],
+    *,
+    base: Path,
+    value_readout: str,
+    draft_schema: str,
 ) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     ids: set[str] = set()
@@ -1949,6 +2165,8 @@ def _checkpoint_records(
         expected_fields = {"id", "role", "path"}
         if role == "producer":
             expected_fields.add("legacy_scalar_readout_attestation")
+        elif draft_schema == DRAFT_SCHEMA and role == "hard_negative":
+            expected_fields.update({"version", "selection_evidence"})
         if set(entry) != expected_fields:
             raise ContractError(
                 f"checkpoint role={role!r} fields mismatch; expected {sorted(expected_fields)}"
@@ -1961,6 +2179,17 @@ def _checkpoint_records(
         record = _file_record(path, kind="checkpoint", artifact_id=artifact_id)
         record["role"] = role
         record["md5"] = _md5(path)
+        if draft_schema == DRAFT_SCHEMA and role == "hard_negative":
+            version = entry["version"]
+            if isinstance(version, bool) or not isinstance(version, int) or version < 0:
+                raise ContractError("hard-negative checkpoint version must be >= 0")
+            record["version"] = version
+            selection_path = _absolute_ref(str(entry["selection_evidence"]), base=base)
+            record["selection_evidence"] = _hard_negative_selection_record(
+                selection_path,
+                checkpoint=path,
+                checkpoint_sha256=str(record["sha256"]),
+            )
         raw_attestation = entry.get("legacy_scalar_readout_attestation")
         attestation_path = (
             _absolute_ref(str(raw_attestation), base=base)
@@ -1991,6 +2220,59 @@ def _checkpoint_records(
     if len(producers) != 1:
         raise ContractError("checkpoints must contain exactly one role=producer")
     return records
+
+
+def _bind_v3_checkpoint_lineage(
+    records: list[dict[str, Any]], handoff_record: dict[str, Any]
+) -> None:
+    """Bind producer/history versions to the committed promotion transaction."""
+
+    producer = next(record for record in records if record["role"] == "producer")
+    history = [record for record in records if record["role"] == "history"]
+    hard = [record for record in records if record["role"] == "hard_negative"]
+    if len(history) != 1 or len(hard) != 1:
+        raise ContractError(
+            "v3 source mix requires exactly one recent-history and one hard-negative checkpoint"
+        )
+    producer["version"] = int(handoff_record["registry_version"])
+    handoff_payload = _load_json(Path(str(handoff_record["path"])))
+    receipt_ref = handoff_payload.get("promotion_receipt")
+    if not isinstance(receipt_ref, dict):
+        raise ContractError("post-promotion handoff has no promotion receipt binding")
+    receipt_path = Path(str(receipt_ref.get("path", ""))).expanduser().resolve(
+        strict=True
+    )
+    if _sha256(receipt_path) != receipt_ref.get("sha256"):
+        raise ContractError("promotion receipt bytes drifted while binding recent history")
+    receipt = _load_json(receipt_path)
+    displaced = receipt.get("champion")
+    if not isinstance(displaced, dict):
+        raise ContractError("promotion receipt has no displaced incumbent checkpoint")
+    history_record = history[0]
+    try:
+        displaced_path = Path(str(displaced["path"])).expanduser().resolve(strict=True)
+        displaced_version = displaced["version"]
+    except (KeyError, OSError) as error:
+        raise ContractError(f"promotion receipt incumbent is malformed: {error}") from error
+    if (
+        displaced_path != Path(str(history_record["path"])).resolve(strict=True)
+        or displaced.get("sha256") != history_record["sha256"]
+        or isinstance(displaced_version, bool)
+        or not isinstance(displaced_version, int)
+        or displaced_version < 1
+    ):
+        raise ContractError(
+            "recent_history must be the exact incumbent displaced by the producer promotion"
+        )
+    history_record["version"] = int(displaced_version)
+    history_record["lineage"] = {
+        "relation": "immediate_displaced_incumbent",
+        "promotion_receipt": {
+            "path": str(receipt_path),
+            "sha256": receipt_ref["sha256"],
+            "transaction_id": receipt_ref["transaction_id"],
+        },
+    }
 
 
 def _verify_declared_source_artifacts(
@@ -4043,6 +4325,7 @@ def build_lock(
         list(draft["checkpoints"]),
         base=base,
         value_readout=str(evaluator["value_readout"]),
+        draft_schema=str(draft_schema),
     )
     evidence_by_kind = {str(record["kind"]): record for record in evidence}
     for stage, predecessors in {"s2": ("s1",), "s3": ("s1", "s2")}.items():
@@ -4071,6 +4354,8 @@ def build_lock(
         evaluator=evaluator,
         generation=generation,
     )
+    if draft_schema == DRAFT_SCHEMA:
+        _bind_v3_checkpoint_lineage(checkpoint_records, handoff_record)
     for stage in ("s1", "s2", "s3"):
         stage_checkpoint = evidence_by_kind[stage]["semantic_decision"]["checkpoint"]
         if (
@@ -4087,29 +4372,75 @@ def build_lock(
     )
 
     fleet = dict(draft["fleet"])
-    if set(fleet) != {
-        "workers",
-        "per_worker_games",
-        "seed_base",
-        "seed_block_size",
-        "seed_ledger",
-        "output_root",
-    }:
-        raise ContractError("fleet fields are not the exact pre-wave schema")
+    fleet_manifest_record: dict[str, Any] | None = None
+    worker_quotas: dict[str, dict[str, int]] | None = None
+    if draft_schema == LEGACY_DRAFT_SCHEMA:
+        expected_fleet_fields = {
+            "workers",
+            "per_worker_games",
+            "seed_base",
+            "seed_block_size",
+            "seed_ledger",
+            "output_root",
+        }
+    else:
+        expected_fleet_fields = {
+            "fleet_manifest",
+            "quota_policy",
+            "seed_base",
+            "seed_block_size",
+            "seed_ledger",
+            "output_root",
+        }
+    if set(fleet) != expected_fleet_fields:
+        raise ContractError(
+            "fleet fields are not the exact "
+            f"{'historical v2' if draft_schema == LEGACY_DRAFT_SCHEMA else 'current v3'} "
+            "pre-wave schema"
+        )
     ledger_path = _absolute_ref(str(fleet["seed_ledger"]), base=base)
     output_root = Path(str(fleet["output_root"])).expanduser()
     if not output_root.is_absolute():
         raise ContractError(
             "fleet.output_root must be an absolute path shared by the data lane"
         )
-    jobs = _build_jobs(
-        list(fleet["workers"]),
-        seed_base=int(fleet["seed_base"]),
-        block_size=int(fleet["seed_block_size"]),
-        per_worker={str(k): int(v) for k, v in dict(fleet["per_worker_games"]).items()},
-        output_root=str(output_root),
-        contract_id=contract_id,
-    )
+    if draft_schema == LEGACY_DRAFT_SCHEMA:
+        workers = list(fleet["workers"])
+        jobs = _build_jobs(
+            workers,
+            seed_base=int(fleet["seed_base"]),
+            block_size=int(fleet["seed_block_size"]),
+            per_worker={
+                str(k): int(v)
+                for k, v in dict(fleet["per_worker_games"]).items()
+            },
+            output_root=str(output_root),
+            contract_id=contract_id,
+        )
+    else:
+        if fleet["quota_policy"] != BALANCED_PREFIX_QUOTA_POLICY:
+            raise ContractError(
+                "v3 fleet.quota_policy must be exactly "
+                f"{BALANCED_PREFIX_QUOTA_POLICY!r}"
+            )
+        fleet_manifest_path = _absolute_ref(
+            str(fleet["fleet_manifest"]), base=base
+        )
+        if fleet_manifest_path != CURRENT_FLEET_MANIFEST.resolve(strict=True):
+            raise ContractError(
+                "v3 fleet_manifest must bind the checked-in authoritative "
+                f"{CURRENT_FLEET_MANIFEST.relative_to(REPO_ROOT)}"
+            )
+        workers, fleet_manifest_record = _canonical_workers_from_fleet_manifest(
+            fleet_manifest_path
+        )
+        jobs, worker_quotas = _build_balanced_jobs(
+            workers,
+            seed_base=int(fleet["seed_base"]),
+            block_size=int(fleet["seed_block_size"]),
+            output_root=str(output_root),
+            contract_id=contract_id,
+        )
     if seed_ledger_snapshot is None:
         _validate_against_ledger(jobs, ledger_path)
         ledger_record = _seed_ledger_snapshot(ledger_path)
@@ -4187,6 +4518,37 @@ def build_lock(
     runtime_code_tree = _runtime_code_tree_records()
     _validate_post_wave(dict(draft["post_wave_acceptance"]))
 
+    category_attempts = {
+        category: sum(
+            int(job["attempts"])
+            for job in jobs
+            if job["category"] == category
+        )
+        for category in EXPECTED_GAMES
+    }
+    lock_fleet: dict[str, Any] = {
+        "workers": workers,
+        "seed_base": int(fleet["seed_base"]),
+        "seed_block_size": int(fleet["seed_block_size"]),
+        "seed_ledger": ledger_record,
+        "val_only_range": list(VAL_ONLY_SEED_RANGE),
+        "output_root": str(output_root),
+        "jobs": jobs,
+        "seed_plan_sha256": _digest_value(jobs),
+    }
+    if draft_schema == LEGACY_DRAFT_SCHEMA:
+        lock_fleet["per_worker_games"] = dict(EXPECTED_PER_WORKER)
+    else:
+        assert fleet_manifest_record is not None and worker_quotas is not None
+        lock_fleet.update(
+            {
+                "fleet_manifest": fleet_manifest_record,
+                "quota_policy": BALANCED_PREFIX_QUOTA_POLICY,
+                "worker_quotas": worker_quotas,
+                "worker_quotas_sha256": _digest_value(worker_quotas),
+            }
+        )
+
     lock: dict[str, Any] = {
         "schema_version": (
             LEGACY_LOCK_SCHEMA if draft_schema == LEGACY_DRAFT_SCHEMA else LOCK_SCHEMA
@@ -4216,22 +4578,12 @@ def build_lock(
         "game_contract": {
             "total_complete_games": sum(EXPECTED_GAMES.values()),
             "category_games": dict(EXPECTED_GAMES),
-            "total_attempts": sum(EXPECTED_ATTEMPTS.values()),
-            "category_attempts": dict(EXPECTED_ATTEMPTS),
+            "total_attempts": sum(category_attempts.values()),
+            "category_attempts": category_attempts,
             "selection_rule": "lowest_seed_complete_per_job",
             "selection_before_row_expansion": True,
         },
-        "fleet": {
-            "workers": list(fleet["workers"]),
-            "per_worker_games": dict(EXPECTED_PER_WORKER),
-            "seed_base": int(fleet["seed_base"]),
-            "seed_block_size": int(fleet["seed_block_size"]),
-            "seed_ledger": ledger_record,
-            "val_only_range": list(VAL_ONLY_SEED_RANGE),
-            "output_root": str(output_root),
-            "jobs": jobs,
-            "seed_plan_sha256": _digest_value(jobs),
-        },
+        "fleet": lock_fleet,
         "provenance": {
             "guard_config": guard_record,
             "generator_code": code_records,
@@ -4291,6 +4643,27 @@ def verify_lock(
     for evidence in lock["science"]["evidence"]:
         _verify_artifact_records(evidence["semantic_decision"]["source_artifacts"])
     _verify_artifact_records(lock["checkpoints"])
+    if lock_schema == LOCK_SCHEMA:
+        for record in lock["checkpoints"]:
+            version = record.get("version")
+            if isinstance(version, bool) or not isinstance(version, int) or version < 0:
+                raise ContractError(
+                    f"v3 checkpoint {record.get('id')} has no authenticated version"
+                )
+            if record.get("role") == "history":
+                lineage = record.get("lineage")
+                if (
+                    not isinstance(lineage, dict)
+                    or lineage.get("relation") != "immediate_displaced_incumbent"
+                    or not isinstance(lineage.get("promotion_receipt"), dict)
+                ):
+                    raise ContractError("v3 recent-history lineage binding drift")
+                _verify_artifact_records([lineage["promotion_receipt"]])
+            elif record.get("role") == "hard_negative":
+                selection = record.get("selection_evidence")
+                if not isinstance(selection, dict):
+                    raise ContractError("v3 hard-negative selection evidence is missing")
+                _verify_artifact_records([selection, selection["evaluation_evidence"]])
     _verify_artifact_records([lock["provenance"]["guard_config"]])
     _verify_artifact_records(lock["provenance"]["generator_code"])
     learner_code_records = lock["provenance"].get("learner_code")
@@ -4345,6 +4718,30 @@ def verify_lock(
         != lock["science"]["learner_training_recipe_sha256"]
     ):
         raise ContractError("learner training-recipe digest mismatch")
+    if lock_schema == LOCK_SCHEMA:
+        fleet_manifest = lock["fleet"].get("fleet_manifest")
+        if not isinstance(fleet_manifest, dict):
+            raise ContractError("v3 lock does not bind its authoritative fleet manifest")
+        _verify_artifact_records([fleet_manifest])
+        manifest_path = Path(str(fleet_manifest.get("path", ""))).resolve(strict=True)
+        if manifest_path != CURRENT_FLEET_MANIFEST.resolve(strict=True):
+            raise ContractError("v3 lock fleet manifest path is not authoritative")
+        canonical_workers, canonical_manifest_record = (
+            _canonical_workers_from_fleet_manifest(manifest_path)
+        )
+        if canonical_manifest_record != fleet_manifest:
+            raise ContractError("v3 lock fleet manifest record drift")
+        if lock["fleet"].get("workers") != canonical_workers:
+            raise ContractError("v3 lock worker topology/order drift")
+        if lock["fleet"].get("quota_policy") != BALANCED_PREFIX_QUOTA_POLICY:
+            raise ContractError("v3 lock quota policy drift")
+        expected_quotas = _balanced_worker_quotas(canonical_workers)
+        if (
+            lock["fleet"].get("worker_quotas") != expected_quotas
+            or lock["fleet"].get("worker_quotas_sha256")
+            != _digest_value(expected_quotas)
+        ):
+            raise ContractError("v3 lock balanced worker quotas drift")
     jobs = list(lock["fleet"]["jobs"])
     if _digest_value(jobs) != lock["fleet"]["seed_plan_sha256"]:
         raise ContractError("seed plan digest mismatch")
@@ -4361,15 +4758,29 @@ def verify_lock(
         }
     ) != Counter(EXPECTED_GAMES):
         raise ContractError("job category totals drifted from 9600/1800/600")
-    if Counter(
-        {
-            category: sum(
-                int(j["attempts"]) for j in jobs if j["category"] == category
-            )
-            for category in EXPECTED_ATTEMPTS
+    observed_attempts = {
+        category: sum(
+            int(j["attempts"]) for j in jobs if j["category"] == category
+        )
+        for category in EXPECTED_GAMES
+    }
+    expected_attempts = (
+        EXPECTED_ATTEMPTS
+        if lock_schema == LEGACY_LOCK_SCHEMA
+        else {
+            category: int(EXPECTED_GAMES[category])
+            + CURRENT_WORKER_COUNT * int(ATTEMPT_RESERVE_PER_JOB[category])
+            for category in EXPECTED_GAMES
         }
-    ) != Counter(EXPECTED_ATTEMPTS):
+    )
+    if Counter(observed_attempts) != Counter(expected_attempts):
         raise ContractError("job attempt totals drifted from the bounded reserve")
+    if (
+        lock["game_contract"].get("category_attempts") != expected_attempts
+        or lock["game_contract"].get("total_attempts")
+        != sum(expected_attempts.values())
+    ):
+        raise ContractError("game-contract attempt totals drifted")
     for job in jobs:
         if _ranges_overlap(
             (int(job["base_seed"]), int(job["seed_end"])),
@@ -4686,8 +5097,18 @@ def _render_mix_manifest(lock: dict[str, Any], category: str) -> dict[str, Any]:
                 "checkpoints": [
                     {
                         "path": by_id[checkpoint_id]["path"],
-                        "version": -1,
+                        "version": int(by_id[checkpoint_id].get("version", -1)),
                         "md5": by_id[checkpoint_id]["md5"],
+                        # The runtime parser intentionally consumes the legacy
+                        # path/version/md5 triple. Keep SHA-256 alongside it in
+                        # the sealed manifest so render/attestation verification
+                        # can authenticate the stronger identity without
+                        # weakening older readers.
+                        **(
+                            {"sha256": by_id[checkpoint_id]["sha256"]}
+                            if lock.get("schema_version") == LOCK_SCHEMA
+                            else {}
+                        ),
                     }
                     for checkpoint_id in spec["checkpoint_ids"]
                 ],
