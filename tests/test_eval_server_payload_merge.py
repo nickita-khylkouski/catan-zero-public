@@ -160,6 +160,9 @@ def test_premerge_event_crop_matches_postmerge_crop() -> None:
         ).reshape(rows, 5, 4)
         payload["entity"]["event_mask"] = np.zeros((rows, 5), dtype=np.bool_)
         payload["entity"]["event_mask"][:, : index + 1] = True
+        payload["entity"]["event_target_ids"] = np.arange(
+            rows * 5 * 4, dtype=np.int16
+        ).reshape(rows, 5, 4)
 
     post_payloads = [
         {
@@ -200,6 +203,21 @@ def test_premerge_event_crop_validates_entire_window_before_mutating() -> None:
         _crop_payload_event_tails_before_merge(payloads, 2)
 
     assert [payload["entity"]["event_tokens"].shape for payload in payloads] == original_shapes
+
+
+def test_premerge_event_crop_validates_targets_before_mutating() -> None:
+    payloads = [_payload(marker=0, rows=1, legal_width=1)]
+    entity = payloads[0]["entity"]
+    entity["event_tokens"] = np.zeros((1, 4, 2), dtype=np.float16)
+    entity["event_mask"] = np.zeros((1, 4), dtype=np.bool_)
+    entity["event_target_ids"] = np.zeros((1, 3, 4), dtype=np.int16)
+
+    with pytest.raises(ValueError, match="event target/mask shape mismatch"):
+        _crop_payload_event_tails_before_merge(payloads, 2)
+
+    assert entity["event_tokens"].shape == (1, 4, 2)
+    assert entity["event_mask"].shape == (1, 4)
+    assert entity["event_target_ids"].shape == (1, 3, 4)
 
 
 @pytest.mark.parametrize(

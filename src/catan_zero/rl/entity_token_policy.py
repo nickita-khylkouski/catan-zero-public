@@ -1930,3 +1930,31 @@ def _assert_entity_batch_shapes(
             value = np.asarray(entity_batch[key])
             if value.shape != expected_shape:
                 raise ValueError(f"{key} shape {value.shape} != {expected_shape}")
+            if not np.issubdtype(value.dtype, np.integer):
+                raise ValueError(f"{key} must contain integer per-namespace ids")
+
+        topology_widths: dict[str, np.ndarray] = {
+            "hex_vertex_ids": np.asarray((54,), dtype=np.int64),
+            "hex_edge_ids": np.asarray((72,), dtype=np.int64),
+            "edge_vertex_ids": np.asarray((54,), dtype=np.int64),
+            "event_target_ids": np.asarray(
+                (
+                    19,
+                    54,
+                    72,
+                    int(np.asarray(entity_batch["player_tokens"]).shape[1]),
+                ),
+                dtype=np.int64,
+            ),
+        }
+        for key, widths in topology_widths.items():
+            value = np.asarray(entity_batch[key])
+            bound = widths.reshape((1,) * (value.ndim - 1) + (-1,))
+            invalid = (value < -1) | (value >= bound)
+            if bool(np.any(invalid)):
+                index = tuple(int(part) for part in np.argwhere(invalid)[0])
+                namespace = index[-1] if widths.size > 1 else 0
+                raise ValueError(
+                    f"{key} contains an out-of-range local id: index={index} "
+                    f"value={int(value[index])} namespace_width={int(widths[namespace])}"
+                )

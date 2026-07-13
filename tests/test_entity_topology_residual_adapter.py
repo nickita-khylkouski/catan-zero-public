@@ -107,6 +107,39 @@ def test_combined_topology_gather_upgrade_is_bit_identical_at_init():
         assert torch.equal(control[name], treatment[name]), name
 
 
+def test_topology_gather_and_belief_head_compose_without_main_output_drift():
+    torch.manual_seed(17)
+    base = EntityGraphNet(_config()).eval()
+    upgraded = EntityGraphNet(
+        _config(
+            topology_residual_adapter=True,
+            action_target_gather=True,
+            belief_resource_head=True,
+        )
+    ).eval()
+    missing, unexpected = upgraded.load_state_dict(base.state_dict(), strict=False)
+    assert not unexpected
+    assert missing
+    assert all(
+        name.startswith(
+            (
+                "topology_residual_adapter.",
+                "target_gather_proj.",
+                "belief_resource_head.",
+            )
+        )
+        for name in missing
+    )
+
+    batch = _batch()
+    with torch.no_grad():
+        control = base(batch, return_q=True)
+        treatment = upgraded(batch, return_q=True)
+    assert treatment["belief_resource_logits"].shape == (3, 4, 5)
+    for name, expected in control.items():
+        assert torch.equal(expected, treatment[name]), name
+
+
 def test_topology_output_projection_learns_on_first_step():
     model = EntityGraphNet(
         _config(topology_residual_adapter=True, action_target_gather=True)
@@ -155,3 +188,27 @@ def test_adapter_output_changes_when_explicit_vertex_edge_incidence_changes():
         left_tokens = model.encode_state(left)[0]
         right_tokens = model.encode_state(right)[0]
     assert not torch.equal(left_tokens, right_tokens)
+
+
+def test_adapter_does_not_update_isolated_or_padded_tokens_after_training():
+    width, length = 8, 5
+    adapter = TopologyResidualAdapter(width).eval()
+    with torch.no_grad():
+        # Exercise the post-training case where both normalization and output
+        # biases are nonzero.  Those biases must still not create a residual
+        # on destinations outside the direct-incidence information surface.
+        adapter.message_norm.bias.fill_(0.7)
+        adapter.output_projection.weight.copy_(torch.eye(width))
+        adapter.output_projection.bias.fill_(0.3)
+    tokens = torch.randn(
+        1, length, width, generator=torch.Generator().manual_seed(101)
+    )
+    relations = torch.zeros(1, length, length, dtype=torch.long)
+    relations[:, 0, 1] = REL_EDGE_TO_VERTEX
+    relations[:, 1, 0] = REL_VERTEX_TO_EDGE
+    padding = torch.tensor([[False, False, False, False, True]])
+
+    output = adapter(tokens, relations, key_padding_mask=padding)
+
+    assert not torch.equal(output[:, :2], tokens[:, :2])
+    torch.testing.assert_close(output[:, 2:], tokens[:, 2:], rtol=0.0, atol=0.0)

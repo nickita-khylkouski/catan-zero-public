@@ -76,6 +76,22 @@ def _batch(batch_size=3, legal_width=5, event_width=8, live_events=0):
     legal_ids[-1, -1] = -1
     entity["legal_action_target_ids"][legal_ids < 0] = -1
     entity["legal_action_mask"] = legal_ids >= 0
+    entity["hex_vertex_ids"] = np.broadcast_to(
+        np.arange(19 * 6, dtype=np.int16).reshape(1, 19, 6) % 54,
+        (batch_size, 19, 6),
+    ).copy()
+    entity["hex_edge_ids"] = np.broadcast_to(
+        np.arange(19 * 6, dtype=np.int16).reshape(1, 19, 6) % 72,
+        (batch_size, 19, 6),
+    ).copy()
+    edges = np.arange(72, dtype=np.int16).reshape(1, 72, 1)
+    edge_vertices = np.concatenate((edges % 54, (edges + 1) % 54), axis=2)
+    entity["edge_vertex_ids"] = np.broadcast_to(
+        edge_vertices, (batch_size, 72, 2)
+    ).copy()
+    entity["event_target_ids"] = np.full(
+        (batch_size, event_width, 4), -1, dtype=np.int16
+    )
     context = rng.normal(
         size=(batch_size, legal_width, CONTEXT_ACTION_FEATURE_SIZE)
     ).astype(np.float32)
@@ -200,6 +216,51 @@ def test_runner_preserves_policy_metadata_and_target_aware_action_head():
     assert runner.action_size == policy.action_size
     assert runner.runner_config.enabled is False
     assert outputs["logits"].shape == (2, 4)
+
+
+def test_topology_adapter_survives_cuda_graph_eager_fallback_and_event_crop():
+    policy = _policy(topology_residual_adapter=True, action_target_gather=True)
+    entity, legal_ids, context = _batch(
+        batch_size=2, legal_width=4, event_width=8, live_events=2
+    )
+    entity["event_target_ids"][:, 0, 1] = 3
+    runner = CudaGraphInferenceRunner(
+        policy,
+        CudaGraphInferenceConfig(enabled=True, event_token_limit=2),
+    )
+
+    outputs = runner.forward_legal_np(entity, legal_ids, context, return_q=True)
+
+    assert runner.last_path == "eager_fallback"
+    assert "requires a CUDA device" in runner.last_fallback_reason
+    assert outputs["logits"].shape == (2, 4)
+    assert outputs["q_values"].shape == (2, 4)
+
+
+@pytest.mark.parametrize(
+    ("key", "index", "bad_value", "width"),
+    (
+        ("hex_vertex_ids", (0, 0, 0), 54, 54),
+        ("hex_edge_ids", (0, 0, 0), 72, 72),
+        ("edge_vertex_ids", (0, 0, 0), -2, 54),
+        ("event_target_ids", (0, 0, 2), 72, 72),
+    ),
+)
+def test_topology_runner_rejects_out_of_range_incidence_ids(
+    key, index, bad_value, width
+):
+    entity, legal_ids, context = _batch(batch_size=1, legal_width=2)
+    entity[key][index] = bad_value
+    runner = CudaGraphInferenceRunner(
+        _policy(topology_residual_adapter=True),
+        CudaGraphInferenceConfig(enabled=True),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=rf"{key}.*namespace_width={width}",
+    ):
+        runner.forward_legal_np(entity, legal_ids, context)
 
 
 def test_configuration_rejects_unsafe_or_ambiguous_buckets():

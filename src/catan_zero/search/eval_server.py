@@ -347,10 +347,20 @@ def _crop_masked_event_tail(
     event_mask, event_tokens, required_width, limit = _event_tail_info(
         entity, event_token_limit
     )
+    event_targets = entity.get("event_target_ids")
+    if event_targets is not None:
+        event_targets = np.asarray(event_targets)
+        if event_targets.ndim != 3 or event_targets.shape[:2] != event_mask.shape:
+            raise ValueError(
+                "event target/mask shape mismatch: "
+                f"targets={event_targets.shape} mask={event_mask.shape}"
+            )
     if limit is None:
         return required_width
     entity["event_mask"] = event_mask[:, :limit]
     entity["event_tokens"] = event_tokens[:, :limit]
+    if event_targets is not None:
+        entity["event_target_ids"] = event_targets[:, :limit]
     return required_width
 
 
@@ -374,7 +384,7 @@ def _crop_payload_event_tails_before_merge(
         limit = operator.index(event_token_limit)
     except TypeError as error:
         raise TypeError("event_token_limit must be an integer") from error
-    event_arrays: list[tuple[np.ndarray, np.ndarray]] = []
+    event_arrays: list[tuple[np.ndarray, np.ndarray, np.ndarray | None]] = []
     for payload in payloads:
         event_mask = np.asarray(payload["entity"]["event_mask"], dtype=np.bool_)
         event_tokens = np.asarray(payload["entity"]["event_tokens"])
@@ -387,26 +397,36 @@ def _crop_payload_event_tails_before_merge(
                 "event token/mask shape mismatch: "
                 f"tokens={event_tokens.shape} mask={event_mask.shape}"
             )
+        event_targets = payload["entity"].get("event_target_ids")
+        if event_targets is not None:
+            event_targets = np.asarray(event_targets)
+            if event_targets.ndim != 3 or event_targets.shape[:2] != event_mask.shape:
+                raise ValueError(
+                    "event target/mask shape mismatch: "
+                    f"targets={event_targets.shape} mask={event_mask.shape}"
+                )
         padded_width = int(event_mask.shape[1])
         if not 0 <= limit <= padded_width:
             raise ValueError(
                 f"event_token_limit {event_token_limit!r} is outside "
                 f"[0, {padded_width}]"
             )
-        event_arrays.append((event_mask, event_tokens))
+        event_arrays.append((event_mask, event_tokens, event_targets))
     # One C-level concatenate + reduction is materially cheaper than one NumPy
     # reduction per request at 36-128 requests/window. Widths are normally
     # identical; retain a correct fallback for mixed-width diagnostic clients.
-    widths = {int(event_mask.shape[1]) for event_mask, _tokens in event_arrays}
+    widths = {
+        int(event_mask.shape[1]) for event_mask, _tokens, _targets in event_arrays
+    }
     if len(widths) <= 1:
         merged_mask = np.concatenate(
-            [event_mask for event_mask, _tokens in event_arrays], axis=0
+            [event_mask for event_mask, _tokens, _targets in event_arrays], axis=0
         )
         active_columns = np.flatnonzero(np.any(merged_mask, axis=0))
         required_width = int(active_columns[-1] + 1) if active_columns.size else 0
     else:
         required_width = 0
-        for event_mask, _tokens in event_arrays:
+        for event_mask, _tokens, _targets in event_arrays:
             active_columns = np.flatnonzero(np.any(event_mask, axis=0))
             if active_columns.size:
                 required_width = max(required_width, int(active_columns[-1] + 1))
@@ -415,9 +435,13 @@ def _crop_payload_event_tails_before_merge(
             "event_token_limit would remove an unmasked event token: "
             f"required={required_width} limit={limit}"
         )
-    for payload, (event_mask, event_tokens) in zip(payloads, event_arrays):
+    for payload, (event_mask, event_tokens, event_targets) in zip(
+        payloads, event_arrays
+    ):
         payload["entity"]["event_mask"] = event_mask[:, :limit]
         payload["entity"]["event_tokens"] = event_tokens[:, :limit]
+        if event_targets is not None:
+            payload["entity"]["event_target_ids"] = event_targets[:, :limit]
     return required_width
 
 

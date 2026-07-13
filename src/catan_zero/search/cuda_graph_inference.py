@@ -35,6 +35,12 @@ _STATE_INPUT_KEYS = (
     "event_tokens",
     "event_mask",
 )
+_TOPOLOGY_STATE_INPUT_KEYS = (
+    "hex_vertex_ids",
+    "hex_edge_ids",
+    "edge_vertex_ids",
+    "event_target_ids",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -310,7 +316,7 @@ class CudaGraphInferenceRunner:
         import torch
 
         inputs = {}
-        for key in _STATE_INPUT_KEYS:
+        for key in self._state_input_keys():
             source = torch.as_tensor(entity_batch[key])
             inputs[key] = torch.zeros(
                 (bucket, *source.shape[1:]),
@@ -357,8 +363,8 @@ class CudaGraphInferenceRunner:
             ),
         }
         needs_targets = bool(
-            getattr(self.config, "action_target_gather", False)
-            or getattr(self.config, "edge_policy_head", False)
+            getattr(self.model, "action_target_gather", False)
+            or getattr(self.model, "edge_policy_head", False)
         )
         if needs_targets:
             # _gather_target_tokens derives the fixed sequence offsets from
@@ -397,7 +403,7 @@ class CudaGraphInferenceRunner:
             state_batch = {
                 key: torch.as_tensor(value, device=self.device)
                 for key, value in entity_batch.items()
-                if key in _STATE_INPUT_KEYS
+                if key in self._state_input_keys()
             }
             encoded_state = self.model.encode_state(state_batch)
             action_batch, action_ids = self._action_batch(
@@ -428,6 +434,11 @@ class CudaGraphInferenceRunner:
             raise ValueError("event_mask/tokens must have ranks 2 and 3")
         if event_tokens.shape[:2] != event_mask.shape:
             raise ValueError("event_mask and event_tokens shapes do not match")
+        event_targets = entity_batch.get("event_target_ids")
+        if event_targets is not None:
+            event_targets = _as_numpy(event_targets)
+            if event_targets.ndim != 3 or event_targets.shape[:2] != event_mask.shape:
+                raise ValueError("event_mask and event_target_ids shapes do not match")
         if limit > event_mask.shape[1]:
             raise ValueError(
                 f"event_token_limit {limit} exceeds event width {event_mask.shape[1]}"
@@ -439,6 +450,8 @@ class CudaGraphInferenceRunner:
         cropped = dict(entity_batch)
         cropped["event_mask"] = event_mask[:, :limit]
         cropped["event_tokens"] = event_tokens[:, :limit]
+        if event_targets is not None:
+            cropped["event_target_ids"] = event_targets[:, :limit]
         return cropped
 
     def _graph_signature(
@@ -447,7 +460,7 @@ class CudaGraphInferenceRunner:
         bucket: int,
     ) -> tuple[Any, ...]:
         fields = []
-        for key in _STATE_INPUT_KEYS:
+        for key in self._state_input_keys():
             value = _as_numpy(entity_batch[key])
             fields.append((key, value.dtype.str, tuple(value.shape[1:])))
         return (bucket, tuple(fields))
@@ -462,15 +475,15 @@ class CudaGraphInferenceRunner:
         parameter = next(policy.model.parameters(), None)
         return parameter.device if parameter is not None else torch.device("cpu")
 
-    @staticmethod
     def _validate_batch(
+        self,
         entity_batch: dict[str, np.ndarray],
         legal_action_ids: np.ndarray,
         legal_action_context: np.ndarray,
     ) -> int:
         missing = [
             key
-            for key in (*_STATE_INPUT_KEYS, "legal_action_tokens")
+            for key in (*self._state_input_keys(), "legal_action_tokens")
             if key not in entity_batch
         ]
         if missing:
@@ -492,10 +505,19 @@ class CudaGraphInferenceRunner:
             raise ValueError("legal action arrays must agree on batch and width")
         if legal_ids_shape[0] != batch_size:
             raise ValueError("legal action batch size does not match state batch")
-        for key in _STATE_INPUT_KEYS:
+        for key in self._state_input_keys():
             if int(np.shape(entity_batch[key])[0]) != batch_size:
                 raise ValueError(f"{key} batch size does not match hex_tokens")
         return batch_size
+
+    def _state_input_keys(self) -> tuple[str, ...]:
+        """State tensors consumed by the loaded trunk, including opt-in topology."""
+
+        needs_topology = bool(
+            str(getattr(self.config, "state_trunk", "transformer")) != "transformer"
+            or getattr(self.config, "topology_residual_adapter", False)
+        )
+        return _STATE_INPUT_KEYS + (_TOPOLOGY_STATE_INPUT_KEYS if needs_topology else ())
 
 
 def _as_numpy(value: Any) -> np.ndarray:

@@ -164,6 +164,7 @@ def test_event_tail_crop_is_fail_closed_and_supports_zero_width() -> None:
             [[True, True, False, False], [True, False, False, False]],
             dtype=np.bool_,
         ),
+        "event_target_ids": np.full((2, 4, 4), -1, dtype=np.int16),
     }
 
     assert eval_server._crop_masked_event_tail(entity, None) == 2
@@ -171,6 +172,7 @@ def test_event_tail_crop_is_fail_closed_and_supports_zero_width() -> None:
     assert eval_server._crop_masked_event_tail(entity, 2) == 2
     assert entity["event_tokens"].shape == (2, 2, 3)
     assert entity["event_mask"].shape == (2, 2)
+    assert entity["event_target_ids"].shape == (2, 2, 4)
 
     with pytest.raises(ValueError, match="remove an unmasked"):
         eval_server._crop_masked_event_tail(entity, 1)

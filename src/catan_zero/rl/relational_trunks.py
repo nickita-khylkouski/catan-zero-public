@@ -91,12 +91,21 @@ class TopologyResidualAdapter:
                     live = ~key_padding_mask.bool()
                     direct = direct & live.unsqueeze(1) & live.unsqueeze(2)
                 adjacency = direct.to(dtype=tokens.dtype)
-                degree = adjacency.sum(dim=-1, keepdim=True).clamp_min(1.0)
+                raw_degree = adjacency.sum(dim=-1, keepdim=True)
+                has_direct_neighbor = raw_degree > 0
+                degree = raw_degree.clamp_min(1.0)
                 source = self.source_projection(self.source_norm(tokens))
                 message = torch.bmm(adjacency, source) / degree
                 update = self.output_projection(
                     torch.nn.functional.gelu(self.message_norm(message))
                 )
+                # LayerNorm/output biases must not turn zero-degree CLS,
+                # player, global, or untargeted-event tokens into a generic
+                # learned residual path.  Only destinations with a live direct
+                # incidence edge are in this adapter's reviewed information
+                # surface; the incumbent Transformer propagates their updated
+                # board representation globally afterwards.
+                update = update.masked_fill(~has_direct_neighbor, 0.0)
                 if key_padding_mask is not None:
                     update = update.masked_fill(key_padding_mask.unsqueeze(-1), 0.0)
                 return tokens + update
