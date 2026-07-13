@@ -175,8 +175,23 @@ def run_probe(
     # makes posthoc evaluation impossible for the very checkpoints this tool is
     # meant to diagnose.  Reuse the trainer's fail-closed loader so component
     # identity, per-component target temperatures, and objective scopes survive
-    # exactly as they did during training.
-    data = train_bc.load_teacher_data_memmap(data_path)
+    # exactly as they did during training. Authenticate the composite once and
+    # bind its payload inventory to the training report before reusing it.
+    composite_meta = None
+    if data_path.is_file():
+        composite_meta = train_bc._preflight_memmap_composite_descriptor(data_path)
+        data = train_bc.load_teacher_data_memmap(
+            data_path, composite_meta=composite_meta
+        )
+        expected_inventory = report.get("a1_memmap_payload_inventory_sha256")
+        actual_inventory = composite_meta.get("payload_inventory_sha256")
+        if expected_inventory and actual_inventory != expected_inventory:
+            raise SystemExit(
+                "composite payload inventory differs from training report: "
+                f"report={expected_inventory!r} actual={actual_inventory!r}"
+            )
+    else:
+        data = train_bc.MemmapCorpus(data_path)
     split = train_bc.split_train_validation_indices(
         data,
         validation_fraction=float(report["validation_fraction"]),
@@ -217,6 +232,9 @@ def run_probe(
             report.get("per_game_policy_weight_mode", "equal")
         ),
     )
+    policy_weights = train_bc._apply_authenticated_policy_distillation_scope(
+        data, policy_weights
+    )
     value_weights = train_bc.build_value_sample_weights(
         data,
         phase_weights=_weight_map(
@@ -226,8 +244,16 @@ def run_probe(
         per_game_value_weight=bool(_required(report, "per_game_value_weight")),
         per_game_value_weight_mode=str(_required(report, "per_game_value_weight_mode")),
     )
+    value_weights = train_bc._apply_authenticated_value_training_scope(
+        data, value_weights
+    )
     train_bc._MASK_HIDDEN_INFO_PLAYER_TOKENS = bool(
         _required(report, "mask_hidden_info")
+    )
+    import torch
+
+    torch.set_float32_matmul_precision(
+        str(_required(report, "effective_float32_matmul_precision"))
     )
     policy = _load_policy(str(_required(report, "arch")), checkpoint_path, device)
     eval_batch_size = int(batch_size or _required(report, "batch_size"))
@@ -244,42 +270,85 @@ def run_probe(
             report.get("value_categorical_loss_weight", 0.0),
         )
     )
-    metrics = train_bc.evaluate_bc_batches(
-        policy,
-        data,
-        validation_indices,
-        policy_weights,
-        value_weights,
-        eval_batch_size,
-        float(_required(report, "soft_target_temperature")),
-        float(_required(report, "soft_target_weight")),
-        str(_required(report, "soft_target_source")),
-        float(_required(report, "soft_target_min_legal_coverage")),
-        float(_required(report, "policy_loss_weight")),
-        scalar_weight,
-        float(_required(report, "final_vp_loss_weight")),
-        float(_required(report, "q_loss_weight")),
-        tuple(str(item) for item in _required(report, "q_skip_teacher_prefixes")),
-        int(report["vps_to_win"]),
-        str(_required(report, "advantage_policy_weighting")),
-        float(_required(report, "advantage_temperature")),
-        float(_required(report, "advantage_weight_cap")),
-        float(_required(report, "advantage_weight_floor")),
-        {"enabled": False, "world_size": 1, "rank": 0, "local_rank": 0},
-        str(_required(report, "amp")),
-        truncated_vp_margin_value_weight=float(
-            _required(report, "truncated_vp_margin_value_weight")
-        ),
-        policy_kl_anchor_weight=float(_required(report, "policy_kl_anchor_weight")),
-        value_uncertainty_loss_weight=float(
-            _required(report, "value_uncertainty_loss_weight")
-        ),
-        aux_subgoal_loss_weight=float(_required(report, "aux_subgoal_loss_weight")),
-        moe_balance_loss_weight=float(_required(report, "moe_balance_loss_weight")),
-        value_categorical_loss_weight=categorical_weight,
-        value_hlgauss_sigma_ratio=float(_required(report, "value_hlgauss_sigma_ratio")),
-        value_target_lambda=float(_required(report, "value_target_lambda")),
-    )
+    root_blend = _required(report, "value_root_blend_regime")
+    if not isinstance(root_blend, dict):
+        raise SystemExit("training report 'value_root_blend_regime' must be an object")
+    root_blend_mode = str(root_blend.get("mode", ""))
+    root_blend_phases = root_blend.get("phases")
+    if root_blend_mode not in {"disabled", "phase_scoped", "global_compat"} or not isinstance(
+        root_blend_phases, list
+    ):
+        raise SystemExit("training report value-root blend regime is malformed")
+
+    def evaluate_indices(indices: np.ndarray) -> dict[str, Any]:
+        return train_bc.evaluate_bc_batches(
+            policy,
+            data,
+            indices,
+            policy_weights,
+            value_weights,
+            eval_batch_size,
+            float(_required(report, "soft_target_temperature")),
+            float(_required(report, "soft_target_weight")),
+            str(_required(report, "soft_target_source")),
+            float(_required(report, "soft_target_min_legal_coverage")),
+            float(_required(report, "policy_loss_weight")),
+            scalar_weight,
+            float(_required(report, "final_vp_loss_weight")),
+            float(_required(report, "q_loss_weight")),
+            tuple(str(item) for item in _required(report, "q_skip_teacher_prefixes")),
+            int(report["vps_to_win"]),
+            str(_required(report, "advantage_policy_weighting")),
+            float(_required(report, "advantage_temperature")),
+            float(_required(report, "advantage_weight_cap")),
+            float(_required(report, "advantage_weight_floor")),
+            {"enabled": False, "world_size": 1, "rank": 0, "local_rank": 0},
+            str(_required(report, "amp")),
+            truncated_vp_margin_value_weight=float(
+                _required(report, "truncated_vp_margin_value_weight")
+            ),
+            policy_kl_anchor_weight=float(
+                _required(report, "policy_kl_anchor_weight")
+            ),
+            policy_kl_anchor_direction=str(
+                _required(report, "policy_kl_anchor_direction")
+            ),
+            value_uncertainty_loss_weight=float(
+                _required(report, "value_uncertainty_loss_weight")
+            ),
+            aux_subgoal_loss_weight=float(
+                _required(report, "aux_subgoal_loss_weight")
+            ),
+            belief_resource_loss_weight=float(
+                _required(report, "belief_resource_loss_weight")
+            ),
+            moe_balance_loss_weight=float(
+                _required(report, "moe_balance_loss_weight")
+            ),
+            value_categorical_loss_weight=categorical_weight,
+            value_hlgauss_sigma_ratio=float(
+                _required(report, "value_hlgauss_sigma_ratio")
+            ),
+            value_target_lambda=float(_required(report, "value_target_lambda")),
+            value_root_blend_phases=tuple(str(item) for item in root_blend_phases),
+            value_root_blend_global_compat=root_blend_mode == "global_compat",
+            # Loader parallelism is an execution choice, not part of the
+            # population objective.  Use the report value when newer reports
+            # carry it, otherwise the synchronous path reconstructs identical
+            # rows without guessing the historical worker topology.
+            data_loader_workers=int(report.get("data_loader_workers", 0)),
+            data_loader_prefetch=int(report.get("data_loader_prefetch", 2)),
+        )
+
+    raw_metrics = evaluate_indices(validation_indices)
+    objective_matched = None
+    if composite_meta is not None:
+        objective_matched = train_bc.evaluate_composite_validation_measure(
+            data, validation_indices, evaluate_indices
+        )
+        metrics = objective_matched["metrics"]
+    else:
+        metrics = raw_metrics
     gap_fields = {
         key: metrics[key]
         for key in (
@@ -332,6 +401,8 @@ def run_probe(
         "teacher_gap": gap_fields,
         "legacy_prior_kl": legacy_fields,
         "metrics": metrics,
+        "raw_row_concat_metrics": raw_metrics,
+        "objective_matched_validation": objective_matched,
     }
 
 
