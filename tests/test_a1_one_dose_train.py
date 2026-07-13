@@ -464,6 +464,22 @@ def test_b200_8gpu_topology_preserves_global_batch_and_renders_torchrun(
     assert executor._expected_optimizer_steps(bound) == 2
 
 
+def test_topology_wrapper_refuses_nested_torchrun(tmp_path: Path) -> None:
+    verified = _verified(tmp_path)
+    direct = executor._build_direct_train_command(
+        verified,
+        python=Path(sys.executable),
+        checkpoint=tmp_path / "candidate.pt",
+        report=tmp_path / "report.json",
+    )
+    distributed = executor._topologize_train_command(direct, world_size=8)
+
+    assert distributed.count("torch.distributed.run") == 1
+    assert sum(Path(value).name == "train_bc.py" for value in distributed) == 1
+    with pytest.raises(executor.ExecutorError, match="unwrapped direct"):
+        executor._topologize_train_command(distributed, world_size=8)
+
+
 def test_b200_8gpu_topology_requires_same_host_canary_receipt(
     tmp_path: Path,
 ) -> None:

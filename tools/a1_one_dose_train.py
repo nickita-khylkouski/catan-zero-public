@@ -1395,14 +1395,20 @@ def bind_learner_ablation(
     return result
 
 
-def build_train_command(
+def _build_direct_train_command(
     verified: dict[str, Any],
     *,
     python: Path,
     checkpoint: Path,
     report: Path,
 ) -> list[str]:
-    """Render every effective learner field bound by the sealed recipe."""
+    """Render the direct ``python train_bc.py`` argv without a launcher.
+
+    Topology owners must wrap this exactly once with
+    :func:`_topologize_train_command`. Keeping the semantic argv separate from
+    the launcher prevents downstream sealed executors from accidentally
+    nesting torchrun around an already-distributed command.
+    """
 
     recipe = verified["recipe"]
     initializer = verified.get("architecture_initializer", verified["producer"])
@@ -1418,20 +1424,7 @@ def build_train_command(
             if len(candidates) != 1:
                 raise ExecutorError("sealed A1 contract binds multiple train_bc entrypoints")
             trainer_path = candidates[0].expanduser().resolve(strict=True)
-    world_size = int(recipe["world_size"])
-    if world_size == 1:
-        command = [str(python), str(trainer_path)]
-    elif world_size == 8:
-        command = [
-            str(python),
-            "-m",
-            "torch.distributed.run",
-            "--standalone",
-            "--nproc_per_node=8",
-            str(trainer_path),
-        ]
-    else:
-        raise ExecutorError(f"unsupported sealed learner world_size={world_size}")
+    command = [str(python), str(trainer_path)]
     command.extend(["--arch", "entity_graph"])
     for flag, value in SEALED_A1_MODEL_CLI.items():
         command.extend((flag, value))
@@ -1632,6 +1625,65 @@ def build_train_command(
     if "--ddp-shard-data" in command:
         raise ExecutorError("sealed memmap learner may not shard corpus data by rank")
     return command
+
+
+def _topologize_train_command(
+    direct_command: Sequence[str], *, world_size: int
+) -> list[str]:
+    """Wrap one direct trainer argv in at most one local torchrun launcher."""
+
+    command = list(direct_command)
+    if (
+        len(command) < 2
+        or Path(command[1]).name != "train_bc.py"
+        or "torch.distributed.run" in command
+        or any(
+            token.startswith("--nproc_per_node")
+            or token.startswith("--nproc-per-node")
+            for token in command
+        )
+    ):
+        raise ExecutorError(
+            "topology wrapper requires one unwrapped direct train_bc command"
+        )
+    if (
+        isinstance(world_size, bool)
+        or not isinstance(world_size, int)
+        or world_size < 1
+    ):
+        raise ExecutorError("training launcher world_size must be a positive integer")
+    if world_size == 1:
+        return command
+    return [
+        command[0],
+        "-m",
+        "torch.distributed.run",
+        "--standalone",
+        f"--nproc_per_node={world_size}",
+        command[1],
+        *command[2:],
+    ]
+
+
+def build_train_command(
+    verified: dict[str, Any],
+    *,
+    python: Path,
+    checkpoint: Path,
+    report: Path,
+) -> list[str]:
+    """Render every effective learner field and its authorized topology."""
+
+    world_size = int(verified["recipe"]["world_size"])
+    if world_size not in {1, 8}:
+        raise ExecutorError(f"unsupported sealed learner world_size={world_size}")
+    direct = _build_direct_train_command(
+        verified,
+        python=python,
+        checkpoint=checkpoint,
+        report=report,
+    )
+    return _topologize_train_command(direct, world_size=world_size)
 
 
 def bind_function_preserving_upgrade(

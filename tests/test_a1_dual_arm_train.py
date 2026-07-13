@@ -125,6 +125,8 @@ def test_dry_run_command_is_direct_eight_rank_memmap_ddp(tmp_path: Path) -> None
         "/venv/bin/python", "-m", "torch.distributed.run", "--standalone",
         "--nproc_per_node=8",
     ]
+    assert command.count("torch.distributed.run") == 1
+    assert sum(Path(value).name == "train_bc.py" for value in command) == 1
     assert command[command.index("--data-format") + 1] == "memmap"
     assert command[command.index("--batch-size") + 1] == "512"
     assert "--ddp-shard-data" not in command
@@ -314,6 +316,8 @@ def test_two_b200_fallback_preserves_global_batch_4096(tmp_path: Path) -> None:
         checkpoint=tmp_path / "candidate.pt", report=tmp_path / "report.json",
     )
     assert "--nproc_per_node=2" in command
+    assert command.count("torch.distributed.run") == 1
+    assert sum(Path(value).name == "train_bc.py" for value in command) == 1
     assert command[command.index("--grad-accum-steps") + 1] == "4"
     binding = dual._execution_binding(command, verified)  # noqa: SLF001
     assert binding["gpu_ids"] == [0, 1]

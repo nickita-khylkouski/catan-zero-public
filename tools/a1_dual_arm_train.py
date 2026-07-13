@@ -360,7 +360,7 @@ def bind_learner_ablation(
 def build_command(
     verified: dict[str, Any], *, python: Path, checkpoint: Path, report: Path
 ) -> list[str]:
-    base = one_dose.build_train_command(
+    base = one_dose._build_direct_train_command(  # noqa: SLF001
         {
             "recipe": verified["recipe"],
             "producer": verified["producer"],
@@ -377,20 +377,18 @@ def build_command(
         checkpoint=checkpoint,
         report=report,
     )
-    trainer = base[1]
-    command = [
-        str(python),
-        "-m",
-        "torch.distributed.run",
-        "--standalone",
-        f"--nproc_per_node={verified['topology']['world_size']}",
-        trainer,
-        *base[2:],
-        "--a1-dual-learner-lock",
-        verified["learner_lock"]["path"],
-        "--a1-dual-reviewed-lock-file-sha256",
-        verified["reviewed_lock_file_sha256"],
-    ]
+    command = one_dose._topologize_train_command(  # noqa: SLF001
+        base,
+        world_size=int(verified["topology"]["world_size"]),
+    )
+    command.extend(
+        [
+            "--a1-dual-learner-lock",
+            verified["learner_lock"]["path"],
+            "--a1-dual-reviewed-lock-file-sha256",
+            verified["reviewed_lock_file_sha256"],
+        ]
+    )
     if int(verified["recipe"].get("epochs", 1)) > 1:
         # Epoch-curve diagnostics must be one uninterrupted optimizer trajectory.
         # Persist every integer exposure with its exact Adam state, and sample the
