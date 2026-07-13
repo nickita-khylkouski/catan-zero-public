@@ -49,7 +49,10 @@ def test_target_gather_removes_action_alias_but_not_state_topology_alias() -> No
     report = build_report(_base(action_target_gather=True))
     assert report["architecture"]["action_target_bound"] is True
     assert report["architecture"]["topology_consumed"] is False
-    assert report["critical_information_bottlenecks"] == []
+    assert report["critical_information_bottlenecks"] == [
+        "spatial_state_topology_aliasing"
+    ]
+    assert report["safe_for_scale_only_ablation"] is False
 
 
 def test_topology_adapter_and_gather_remove_both_spatial_aliases() -> None:
