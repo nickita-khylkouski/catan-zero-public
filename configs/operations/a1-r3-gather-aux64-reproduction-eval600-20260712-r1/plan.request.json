@@ -1,0 +1,51 @@
+{
+  "schema_version": "a1-h100-eval-plan-request-v1",
+  "status": "authenticated_candidate_finalized",
+  "controller": {
+    "repo": "/home/ubuntu/catan-eval-ab3618c",
+    "repo_commit": "ab3618c5f911b50d5b7e047750038f79478686fd",
+    "tool": "tools/fleet/a1_h100_eval_fleet.py",
+    "manifest": "/home/ubuntu/a1-eval-40-ad9b894.manifest.json",
+    "manifest_hash": "sha256:b3f8809e9091be726a3a3d166f16191dd2e7a1b9b14f4a9a52b2b7fe24efd02e"
+  },
+  "candidate": {
+    "path": "/home/ubuntu/catan-zero-production/runs/learner/a1-production-r3-target-gather-aux64-reproduction-20260712-r1/candidate.pt",
+    "sha256": "sha256:4bf1187f6211975dbb7d07eb4c564d08352b91a1067a3d6d25cfaceddf9923f0",
+    "completion_receipt": "/home/ubuntu/catan-zero-production/runs/learner/a1-production-r3-target-gather-aux64-reproduction-20260712-r1/completion.receipt.json",
+    "training_manifest": {
+      "path": "/home/ubuntu/catan-zero-production/private/manifests/a1-production-r3-target-gather-aux64-reproduction-20260712-r1.manifest.json",
+      "sha256": "sha256:e3e6dc2225ca02e32fd5983bb0d5f709c860e059739e2992b81053b03a89cb6"
+    }
+  },
+  "champion": {
+    "path": "/home/ubuntu/catan-zero-production/runs/learner/a1-production-l1-one-dose-20260712-r3/candidate.pt",
+    "sha256": "sha256:6817ab054506f962a758ebf48addce5cc7eb801bf451cf2d02b62fb91f5da39c"
+  },
+  "evaluation": {
+    "comparison_mode": "historical_comparison",
+    "historical_comparison_reason": "sealed_aux64_adapter_reproduction",
+    "internal_pairs": 600,
+    "internal_base_seed": 6198340000,
+    "external_pairs_required_by_full_plan": 20,
+    "external_base_seed": 6198350000,
+    "iteration_id": "r3-gather-aux64-reproduction-eval600",
+    "seed_cohort_id": "r3-gather-aux64-reproduction-eval600",
+    "scope": "full",
+    "workers_per_gpu": 16,
+    "candidate_c_scale": 0.1,
+    "champion_c_scale": 0.1,
+    "candidate_value_squash": "tanh",
+    "champion_value_squash": "tanh",
+    "expected_science_config_hash": "sha256:7c3d8f4a19806285c445e6994b9e1efd3cf122769a4d97f100baccb876b96982"
+  },
+  "output": {
+    "root": "/home/ubuntu/experimental_nonpromotable/r3-gather-aux64-reproduction-eval600-20260712-r1",
+    "plan": "/home/ubuntu/experimental_nonpromotable/r3-gather-aux64-reproduction-eval600-20260712-r1/plan.json"
+  },
+  "preparation_evidence": {
+    "validation_ledger": "/home/ubuntu/catan-zero-production/private/VAL_ONLY_EVAL_LEDGER.jsonl",
+    "validation_ledger_sha256_at_preparation": "sha256:b3294e6f6d38c6092aefc229fc114df582388751c7a1a25b7d9f99fb36306607",
+    "proposed_intervals_disjoint_at_preparation": true,
+    "fleet_read_only_snapshot": "all 40 H100 GPUs idle except persistent 78-80 MiB MPS servers; no generation, evaluation, or training process observed"
+  }
+}

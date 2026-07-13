@@ -77,10 +77,13 @@ def test_remote_transport_retries_transient_failure_but_local_commands_do_not(
     assert len(calls) == 1
 
 
-def _manifest_file(tmp_path: Path) -> Path:
+def _manifest_file(
+    tmp_path: Path, *, shapes: dict[str, int] | None = None
+) -> Path:
+    selected_shapes = fleet.EXPECTED_SHAPES if shapes is None else shapes
     hosts = [
         {"alias": alias, "address": f"10.0.0.{index + 10}", "gpu_count": count}
-        for index, (alias, count) in enumerate(fleet.EXPECTED_SHAPES.items())
+        for index, (alias, count) in enumerate(selected_shapes.items())
     ]
     value = {
         "schema_version": fleet.MANIFEST_SCHEMA,
@@ -99,8 +102,10 @@ def _manifest_file(tmp_path: Path) -> Path:
     return path
 
 
-def _plan(tmp_path: Path) -> tuple[dict, dict]:
-    manifest = fleet.load_manifest(_manifest_file(tmp_path))
+def _plan(
+    tmp_path: Path, *, shapes: dict[str, int] | None = None
+) -> tuple[dict, dict]:
+    manifest = fleet.load_manifest(_manifest_file(tmp_path, shapes=shapes))
     candidate = tmp_path / "candidate.pt"
     champion = tmp_path / "champion.pt"
     candidate.write_bytes(b"candidate")
@@ -160,13 +165,70 @@ def _binding_kwargs(plan: dict) -> dict:
     }
 
 
-def test_manifest_requires_exact_approved_six_four_and_two_eight_gpu_hosts(
+def test_manifest_requires_an_exact_approved_fleet_shape(
     tmp_path: Path,
 ) -> None:
     path = _manifest_file(tmp_path)
     value = json.loads(path.read_text())
     value["hosts"][-1]["gpu_count"] = 4
     path.write_text(json.dumps(value))
+    with pytest.raises(fleet.FleetError, match="exact approved fleet shape"):
+        fleet.load_manifest(path)
+
+
+def test_legacy_40_gpu_manifest_remains_hash_identical(tmp_path: Path) -> None:
+    # The default loader's backward-compatible topology dispatch must not alter
+    # the normalized payload or manifest hash of any existing sealed plan.
+    path = _manifest_file(tmp_path)
+    default = fleet.load_manifest(path)
+    explicit_legacy = fleet.load_manifest(
+        path, expected_shapes=fleet.EXPECTED_SHAPES
+    )
+    assert default == explicit_legacy
+    assert len(fleet.gpu_slots(default)) == 40
+
+
+def test_expanded_48_gpu_manifest_allocates_every_pair_exactly_once(
+    tmp_path: Path,
+) -> None:
+    manifest, plan = _plan(tmp_path, shapes=fleet.EXPANDED_EXPECTED_SHAPES)
+    assert [host["alias"] for host in manifest["hosts"]] == [
+        "c1",
+        "c2",
+        "c3",
+        "c4",
+        "c5",
+        "c6",
+        "c7",
+        "c8",
+        "h100-8a",
+        "h100-8b",
+    ]
+    internal = [job for job in plan["jobs"] if job["phase"] == "internal"]
+    assert len(internal) == 48
+    assert sum(job["pairs"] for job in internal) == 600
+    assert [job["pairs"] for job in internal].count(13) == 24
+    assert [job["pairs"] for job in internal].count(12) == 24
+    intervals = sorted(
+        (job["base_seed"], job["base_seed"] + job["pairs"])
+        for job in internal
+    )
+    assert intervals[0][0] == 6_190_000_000
+    assert intervals[-1][1] == 6_190_000_600
+    assert all(left[1] == right[0] for left, right in zip(intervals, intervals[1:]))
+
+
+@pytest.mark.parametrize("bad_aliases", [("c7",), ("h100-8c", "h100-8d")])
+def test_partial_or_forbidden_expanded_topology_is_rejected(
+    tmp_path: Path, bad_aliases: tuple[str, ...]
+) -> None:
+    value = json.loads(_manifest_file(tmp_path).read_text())
+    for index, alias in enumerate(bad_aliases):
+        value["hosts"].append(
+            {"alias": alias, "address": f"10.9.0.{index + 1}", "gpu_count": 4}
+        )
+    path = tmp_path / "bad-expanded.json"
+    path.write_text(json.dumps(value), encoding="utf-8")
     with pytest.raises(fleet.FleetError, match="exact approved fleet shape"):
         fleet.load_manifest(path)
 

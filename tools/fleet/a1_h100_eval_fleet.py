@@ -53,6 +53,12 @@ EXPECTED_SHAPES = {
     "h100-8a": 8,
     "h100-8b": 8,
 }
+EXPANDED_EXPECTED_SHAPES = {
+    **EXPECTED_SHAPES,
+    "c7": 4,
+    "c8": 4,
+}
+APPROVED_FLEET_SHAPES = (EXPECTED_SHAPES, EXPANDED_EXPECTED_SHAPES)
 CANARY_ALIASES = {"c1", "h100-8a"}
 DEFAULT_WORKERS_PER_GPU = 16
 SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
@@ -315,11 +321,13 @@ def load_manifest(
     actual = {host["alias"]: host["gpu_count"] for host in hosts}
     if len(actual) != len(hosts):
         raise FleetError("fleet manifest contains duplicate aliases")
-    approved_shapes = EXPECTED_SHAPES if expected_shapes is None else expected_shapes
-    if actual != approved_shapes:
+    approved_shapes = (
+        APPROVED_FLEET_SHAPES if expected_shapes is None else (expected_shapes,)
+    )
+    if actual not in approved_shapes:
         raise FleetError(
-            "A1 eval manifest differs from its exact approved fleet shape: "
-            f"expected {approved_shapes}, got {actual}"
+            "A1 eval manifest differs from every exact approved fleet shape: "
+            f"expected one of {approved_shapes}, got {actual}"
         )
     manifest["hosts"] = sorted(hosts, key=lambda item: item["alias"])
     manifest["manifest_hash"] = _digest(
