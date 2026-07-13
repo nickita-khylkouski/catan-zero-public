@@ -43,6 +43,7 @@ def _args(
     def preflight(path: Path):
         meta, _ = base_preflight(path)
         meta = copy.deepcopy(meta)
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
         meta["component_ids"] = list(arm.EXPECTED_COMPONENT_IDS)
         meta["component_game_sampling_ratios"] = [0.5714286, 0.2285714, 0.2]
         meta["policy_distillation_component_ids"] = list(
@@ -57,11 +58,10 @@ def _args(
         meta["stored_policy_component_temperatures"] = (
             arm.bridge.production_temp.COMPONENT_TEMPERATURES
         )
-        meta["learner_recipe_overrides"] = {
-            "per_game_policy_weight": False,
-            "per_game_policy_weight_mode": "equal",
-        }
-        meta["learner_recipe_overrides_sha256"] = "sha256:" + "a" * 64
+        meta["learner_recipe_overrides"] = payload["learner_recipe_overrides"]
+        meta["learner_recipe_overrides_sha256"] = payload[
+            "learner_recipe_overrides_sha256"
+        ]
         return meta, arm.bridge.corrected._file_ref(Path(path))  # noqa: SLF001
 
     monkeypatch.setattr(arm, "_preflight_descriptor", preflight)
@@ -244,20 +244,48 @@ def test_value_loss_off_is_separate_one_axis(
     assert manifest["only_declared_causal_delta"] == {
         "value_loss_weight": {"source": 0.25, "treatment": 0.0}
     }
-    assert manifest["source_descriptor"] == manifest["treatment_descriptor"]
+    assert manifest["source_descriptor"] != manifest["treatment_descriptor"]
     assert manifest["treatment_descriptor_semantics"][
         "value_training_component_ids"
     ] == list(arm.EXPECTED_COMPONENT_IDS)
     command = manifest["command"]
     assert arm.bridge.corrected._option(command, "--value-loss-weight") == "0.0"  # noqa: SLF001
     assert arm.bridge.corrected._option(command, "--data") == manifest[  # noqa: SLF001
-        "source_descriptor"
+        "treatment_descriptor"
     ]["path"]
     assert set(manifest["allowlisted_command_changes"]) == {
+        "--data",
+        "--validation-game-sentinel-manifest",
         "--value-loss-weight",
         "--checkpoint",
         "--report",
     }
+    descriptor = json.loads(
+        Path(manifest["treatment_descriptor"]["path"]).read_text(encoding="utf-8")
+    )
+    assert descriptor["learner_recipe_overrides"]["value_loss_weight"] == 0.0
+    runtime_args = type(
+        "RuntimeArgs", (), descriptor["learner_recipe_overrides"]
+    )()
+    train_bc._validate_composite_learner_recipe_authorization(  # noqa: SLF001
+        runtime_args,
+        {"learner_recipe_overrides": descriptor["learner_recipe_overrides"]},
+    )
+    source_descriptor = json.loads(
+        Path(manifest["source_descriptor"]["path"]).read_text(encoding="utf-8")
+    )
+    with pytest.raises(SystemExit, match="command differs"):
+        train_bc._validate_composite_learner_recipe_authorization(  # noqa: SLF001
+            runtime_args,
+            {
+                "learner_recipe_overrides": source_descriptor[
+                    "learner_recipe_overrides"
+                ]
+            },
+        )
+    assert manifest["source_validation_sentinel"] != manifest[
+        "treatment_validation_sentinel"
+    ]
 
 
 def test_derivation_refuses_nonselected_value_or_dose(tmp_path: Path) -> None:

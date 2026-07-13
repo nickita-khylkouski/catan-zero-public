@@ -280,7 +280,29 @@ def _args(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(
         arm.production_temp, "F7_SHA256", arm.corrected._file_sha(source)
     )
-    descriptor = _write_json(tmp_path / "descriptor.json", {"schema_version": "memmap_composite_v2"})
+    learner_overrides = {
+        "forced_row_value_weight": 1.0,
+        "loser_sample_weight": 1.0,
+        "lr": 3e-05,
+        "per_game_policy_weight": False,
+        "per_game_policy_weight_mode": "equal",
+        "per_game_value_weight": False,
+        "per_game_value_weight_mode": "equal",
+        "policy_kl_anchor_direction": "forward",
+        "policy_kl_anchor_weight": 0.0,
+        "value_head_type": "mse",
+        "value_loss_weight": 0.25,
+    }
+    descriptor = _write_json(
+        tmp_path / "descriptor.json",
+        {
+            "schema_version": "memmap_composite_v2",
+            "learner_recipe_overrides": learner_overrides,
+            "learner_recipe_overrides_sha256": arm.corrected._digest(
+                learner_overrides
+            ),
+        },
+    )
     validation = _write_json(tmp_path / "validation.json", {"schema_version": "validation-v1"})
     corpora = [tmp_path / name for name in ("n128", "n256", "replay")]
     for corpus in corpora:

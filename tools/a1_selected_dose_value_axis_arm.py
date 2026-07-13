@@ -35,10 +35,10 @@ from tools import a1_corrected_policy_arm_execute as executor_base  # noqa: E402
 from tools import a1_topology_gather_arm as bridge  # noqa: E402
 
 
-SCHEMA = "a1-selected-dose-value-axis-arm-v2"
-RECEIPT_SCHEMA = "a1-selected-dose-value-axis-execution-receipt-v2"
-STATUS_SCHEMA = "a1-selected-dose-value-axis-execution-status-v2"
-CLAIM_SCHEMA = "a1-selected-dose-value-axis-execution-claim-v2"
+SCHEMA = "a1-selected-dose-value-axis-arm-v3"
+RECEIPT_SCHEMA = "a1-selected-dose-value-axis-execution-receipt-v3"
+STATUS_SCHEMA = "a1-selected-dose-value-axis-execution-status-v3"
+CLAIM_SCHEMA = "a1-selected-dose-value-axis-execution-claim-v3"
 EXECUTOR_RELATIVE_PATH = "tools/a1_selected_dose_value_axis_arm.py"
 CURRENT_VALUE_SCOPE = "CURRENT_VALUE_SCOPE"
 VALUE_LOSS_OFF = "VALUE_LOSS_OFF"
@@ -195,6 +195,89 @@ def _write_scope_descriptor(
     return derived_meta, derived_ref
 
 
+def _write_value_loss_descriptor(
+    source_payload: Mapping[str, Any],
+    source_meta: Mapping[str, Any],
+    destination: Path,
+) -> tuple[dict[str, Any], dict[str, str]]:
+    """Bind the value-off command to an equally authenticated descriptor.
+
+    The composite descriptor authenticates learner recipe overrides.  Changing
+    only the CLI while reusing the source descriptor is not a valid one-axis
+    experiment: the trainer must (and does) reject that mismatch.  This
+    derivation updates the descriptor's value-loss override and its digest,
+    while proving that every payload, sampler, supervision scope, temperature,
+    and other learner override remains identical.
+    """
+
+    payload = dict(source_payload)
+    source_overrides = source_payload.get("learner_recipe_overrides")
+    if not isinstance(source_overrides, Mapping):
+        raise ValueAxisError("selected TEMP descriptor lacks learner recipe overrides")
+    overrides = dict(source_overrides)
+    if float(overrides.get("value_loss_weight", -1.0)) != 0.25:
+        raise ValueAxisError("selected TEMP descriptor value loss is not 0.25")
+    overrides["value_loss_weight"] = 0.0
+    payload["learner_recipe_overrides"] = overrides
+    payload["learner_recipe_overrides_sha256"] = bridge.corrected._digest(  # noqa: SLF001
+        overrides
+    )
+
+    expected_payload = dict(source_payload)
+    expected_payload["learner_recipe_overrides"] = overrides
+    expected_payload["learner_recipe_overrides_sha256"] = payload[
+        "learner_recipe_overrides_sha256"
+    ]
+    if payload != expected_payload:
+        raise ValueAxisError("value-off descriptor contains an undeclared mutation")
+
+    encoded = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.exists():
+        if destination.read_text(encoding="utf-8") != encoded:
+            raise ValueAxisError(f"value-off descriptor drift: {destination}")
+    else:
+        temporary = destination.with_name(f".{destination.name}.tmp.{os.getpid()}")
+        temporary.write_text(encoded, encoding="utf-8")
+        os.chmod(temporary, 0o444)
+        os.replace(temporary, destination)
+    try:
+        derived_meta, derived_ref = _preflight_descriptor(destination)
+    except bridge.corrected.ArmError as error:
+        raise ValueAxisError(f"value-off descriptor preflight failed: {error}") from error
+
+    stable_fields = (
+        "component_ids",
+        "component_game_sampling_ratios",
+        "policy_kl_anchor_component_ids",
+        "policy_distillation_component_ids",
+        "value_training_component_ids",
+        "stored_policy_component_temperatures",
+    )
+    drift = {
+        field: {"source": source_meta.get(field), "treatment": derived_meta.get(field)}
+        for field in stable_fields
+        if source_meta.get(field) != derived_meta.get(field)
+    }
+    if drift:
+        raise ValueAxisError(f"value-off descriptor changed a matched field: {drift}")
+    derived_overrides = derived_meta.get("learner_recipe_overrides")
+    if not isinstance(derived_overrides, Mapping):
+        raise ValueAxisError("value-off descriptor lost learner recipe overrides")
+    changed_overrides = {
+        key: {"source": source_overrides.get(key), "treatment": derived_overrides.get(key)}
+        for key in set(source_overrides) | set(derived_overrides)
+        if source_overrides.get(key) != derived_overrides.get(key)
+    }
+    if changed_overrides != {
+        "value_loss_weight": {"source": 0.25, "treatment": 0.0}
+    }:
+        raise ValueAxisError(
+            f"value-off descriptor changed noncausal learner overrides: {changed_overrides}"
+        )
+    return derived_meta, derived_ref
+
+
 def _write_scope_validation_sentinel(
     source_reference: Mapping[str, Any],
     *,
@@ -341,6 +424,14 @@ def _derive_command(
             "treatment": str(treatment_validation_sentinel),
         }
     else:
+        changes["--data"] = {
+            "source": str(source_descriptor),
+            "treatment": str(treatment_descriptor),
+        }
+        changes["--validation-game-sentinel-manifest"] = {
+            "source": str(source_validation_sentinel),
+            "treatment": str(treatment_validation_sentinel),
+        }
         changes["--value-loss-weight"] = {
             "source": "0.25",
             "treatment": "0.0",
@@ -441,13 +532,24 @@ def prepare(args: argparse.Namespace) -> tuple[dict[str, Any], Path]:
             source_meta,
             output_root / "current-value-scope.memmap-composite.json",
         )
+    else:
+        descriptor_meta, descriptor_ref = _write_value_loss_descriptor(
+            source_payload,
+            source_meta,
+            output_root / "value-loss-off.memmap-composite.json",
+        )
+    if descriptor_ref != source_descriptor_ref:
+        sentinel_name = (
+            "current-value-scope.validation-game-sentinel.json"
+            if axis == CURRENT_VALUE_SCOPE
+            else "value-loss-off.validation-game-sentinel.json"
+        )
         treatment_validation_payload, treatment_validation_ref = (
             _write_scope_validation_sentinel(
                 source_validation_ref,
                 source_descriptor_meta=source_meta,
                 treatment_descriptor_meta=descriptor_meta,
-                destination=output_root
-                / "current-value-scope.validation-game-sentinel.json",
+                destination=output_root / sentinel_name,
             )
         )
     treatment_descriptor = Path(descriptor_ref["path"])
@@ -523,6 +625,12 @@ def prepare(args: argparse.Namespace) -> tuple[dict[str, Any], Path]:
             ),
             "stored_policy_component_temperatures": descriptor_meta.get(
                 "stored_policy_component_temperatures"
+            ),
+            "learner_recipe_overrides": descriptor_meta.get(
+                "learner_recipe_overrides"
+            ),
+            "learner_recipe_overrides_sha256": descriptor_meta.get(
+                "learner_recipe_overrides_sha256"
             ),
         },
         "validation_sentinel": source["validation_sentinel"],
@@ -641,20 +749,28 @@ def verify(manifest_path: Path) -> dict[str, Any]:
             source_payload, source_meta, expected_path
         )
     else:
-        expected_meta, expected_ref = source_meta, source_descriptor_ref
-        if treatment_ref != source_descriptor_ref:
-            raise ValueAxisError("value-off arm changed the source descriptor")
+        treatment_path = _verify_ref(treatment_ref, label="treatment_descriptor")
+        expected_path = (root / "value-loss-off.memmap-composite.json").resolve()
+        if treatment_path != expected_path:
+            raise ValueAxisError("value-off descriptor escaped the output root")
+        expected_meta, expected_ref = _write_value_loss_descriptor(
+            source_payload, source_meta, expected_path
+        )
     source_validation_ref = source["validation_sentinel"]
     expected_validation_ref = source_validation_ref
     expected_validation_semantics = None
-    if axis == CURRENT_VALUE_SCOPE:
+    if axis in AXES:
+        sentinel_name = (
+            "current-value-scope.validation-game-sentinel.json"
+            if axis == CURRENT_VALUE_SCOPE
+            else "value-loss-off.validation-game-sentinel.json"
+        )
         expected_validation_payload, expected_validation_ref = (
             _write_scope_validation_sentinel(
                 source_validation_ref,
                 source_descriptor_meta=source_meta,
                 treatment_descriptor_meta=expected_meta,
-                destination=root
-                / "current-value-scope.validation-game-sentinel.json",
+                destination=root / sentinel_name,
             )
         )
         expected_validation_semantics = {
@@ -688,6 +804,10 @@ def verify(manifest_path: Path) -> dict[str, Any]:
         ),
         "stored_policy_component_temperatures": expected_meta.get(
             "stored_policy_component_temperatures"
+        ),
+        "learner_recipe_overrides": expected_meta.get("learner_recipe_overrides"),
+        "learner_recipe_overrides_sha256": expected_meta.get(
+            "learner_recipe_overrides_sha256"
         ),
     }
     if not (
