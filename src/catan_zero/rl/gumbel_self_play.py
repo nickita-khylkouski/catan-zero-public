@@ -39,9 +39,11 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+import math
 import os
 import random
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -86,6 +88,9 @@ __all__ = [
     "DecisionRecord",
     "GameRecord",
     "GumbelShardWriter",
+    "SEARCH_EVIDENCE_SCHEMA",
+    "SEARCH_EVIDENCE_VERSION",
+    "search_evidence_for_row",
     "WorkerProgress",
     "PROGRESS_FILENAME",
     "PoolGameAssignment",
@@ -108,6 +113,8 @@ PLAYER_NAMES = ("BLUE", "RED", "ORANGE", "WHITE")
 ACTION_MASK_VERSION = "colonist-multiagent-v1"
 TEACHER_NAME = "gumbel_self_play"
 TARGET_SCORE_SOURCE = "gumbel_mcts_visit_q"
+SEARCH_EVIDENCE_SCHEMA = "gumbel_root_search_evidence_v1"
+SEARCH_EVIDENCE_VERSION = 1
 # Search targets need provenance that is independent from observation masking.
 # ``public_observation=True`` only constrains neural-network features; it does
 # not prove that the planner's cloned world state was information-safe.
@@ -772,6 +779,23 @@ def _build_decision_row(
         "aux_next_settlement": np.int16(-1),
         "aux_robber_target": np.int16(-1),
     }
+    if float(row["policy_weight_multiplier"]) > 0.0:
+        # Private, opt-in evidence fields. The default writer filters these
+        # out, preserving the historical shard schema byte-for-byte. Only
+        # policy-active rows allocate them; fast/forced rows are value-only.
+        # completed-Q stays fp32 because measured near-flat root margins can
+        # be ~1e-7; visits are range-checked before compact uint16 encoding.
+        row["_search_visit_counts"] = np.asarray(
+            [int(result.visit_counts.get(int(action), 0)) for action in legal_rust],
+            dtype=np.int64,
+        )
+        row["_search_completed_q"] = np.asarray(
+            [
+                float(result.completed_q_values.get(int(action), np.nan))
+                for action in legal_rust
+            ],
+            dtype=np.float32,
+        )
     # Opponent-pool provenance (H2): only stamped when the caller is running
     # with a pool assignment at all (`is_pool_game`/`opponent_version` passed
     # as non-None) -- omitted entirely otherwise so pool-disabled runs keep
@@ -854,6 +878,36 @@ def _search_execution_contract(
         "information_set_particle_subbudgets_exact": information_set,
         "native_mcts_hot_loop": bool(native_mcts_hot_loop),
     }
+
+
+def _search_evidence_recalibration_scope(search_config: Any) -> str:
+    """Attest when one completed-Q vector can reproduce the target operator.
+
+    A single-world target is reconstructible from completed-Q, visits, the
+    existing prior column, phase, and manifest config. Public-belief
+    ``aggregate_q_then_improve`` has the same property because its emitted
+    completed-Q is the particle mean and the manifest records particle count.
+    Historical ``mean_improved_policy`` does not: mean(softmax(...)) cannot be
+    recovered from only the mean completed-Q. Refuse that combination rather
+    than writing evidence that merely looks sufficient.
+    """
+
+    if not bool(getattr(search_config, "information_set_search", False)):
+        return "single_world_root_v1"
+    aggregation = str(
+        getattr(
+            search_config,
+            "information_set_target_aggregation",
+            "mean_improved_policy",
+        )
+    )
+    if aggregation != "aggregate_q_then_improve":
+        raise ValueError(
+            "preserve_search_evidence cannot attest posthoc recalibration for "
+            "information-set mean_improved_policy; use aggregate_q_then_improve "
+            "or preserve per-particle evidence"
+        )
+    return "information_set_aggregate_q_then_improve_v1"
 
 
 def play_one_game(
@@ -1080,11 +1134,13 @@ class GumbelShardWriter:
         shard_size: int = 2048,
         fmt: str = "npz",
         start_index: int = 0,
+        preserve_search_evidence: bool = False,
     ) -> None:
         self.output = Path(output)
         self.output.mkdir(parents=True, exist_ok=True)
         self.shard_size = max(1, int(shard_size))
         self.format = fmt
+        self.preserve_search_evidence = bool(preserve_search_evidence)
         self.rows: list[dict[str, Any]] = []
         self.paths: list[Path] = []
         # Resume support (`run_worker_games(resume=True)`): the writer
@@ -1098,6 +1154,15 @@ class GumbelShardWriter:
         for key in EXTRA_KEYS:
             if key in row:
                 payload[key] = row[key]
+        if self.preserve_search_evidence and float(
+            row.get("policy_weight_multiplier", 0.0)
+        ) > 0.0:
+            for key in ("_search_visit_counts", "_search_completed_q"):
+                if key not in row:
+                    raise ValueError(
+                        f"preserve_search_evidence requires row field {key!r}"
+                    )
+                payload[key] = row[key]
         for key in ENTITY_KEYS:
             payload[key] = features[key]
         self.rows.append(payload)
@@ -1110,7 +1175,10 @@ class GumbelShardWriter:
     def flush(self) -> None:
         if not self.rows:
             return
-        arrays = _rows_to_arrays(self.rows)
+        arrays = _rows_to_arrays(
+            self.rows,
+            preserve_search_evidence=self.preserve_search_evidence,
+        )
         path = self.output / f"gumbel_self_play_shard_{self.index:05d}.npz"
         tmp = path.with_name(path.name + ".tmp")
         with tmp.open("wb") as handle:
@@ -1125,7 +1193,134 @@ class GumbelShardWriter:
         self.index += 1
 
 
-def _rows_to_arrays(rows: list[dict[str, Any]]) -> dict[str, np.ndarray]:
+def _compact_search_evidence(rows: list[dict[str, Any]]) -> dict[str, np.ndarray]:
+    """Encode policy-active root evidence without width-54 shard padding.
+
+    Active rows are already identified by the shard's mandatory
+    ``policy_weight_multiplier`` column, so only their uint32 offsets plus
+    fp32 completed-Q and uint16 visits are stored. Fast and forced rows remain
+    value-only and consume no evidence payload.
+    """
+
+    offsets = [0]
+    visit_chunks: list[np.ndarray] = []
+    completed_q_chunks: list[np.ndarray] = []
+    for row in rows:
+        policy_weight = float(row.get("policy_weight_multiplier", 0.0))
+        if not math.isfinite(policy_weight) or policy_weight < 0.0:
+            raise ValueError(
+                "search evidence requires a finite non-negative policy weight"
+            )
+        if policy_weight == 0.0:
+            continue
+        legal_count = int(np.asarray(row["legal_action_ids"]).shape[0])
+        visits = np.asarray(row.get("_search_visit_counts"), dtype=np.int64)
+        completed_q = np.asarray(row.get("_search_completed_q"), dtype=np.float32)
+        if visits.shape != (legal_count,) or completed_q.shape != (legal_count,):
+            raise ValueError(
+                "search evidence must align exactly with the row's legal-action axis"
+            )
+        if bool(np.any(visits < 0)) or bool(
+            np.any(visits > np.iinfo(np.uint16).max)
+        ):
+            raise ValueError("search visit counts exceed uint16 evidence schema")
+        if not bool(np.all(np.isfinite(completed_q))):
+            raise ValueError("policy-active search evidence has non-finite completed-Q")
+        expected_simulations = int(row.get("simulations_used", int(visits.sum())))
+        if int(visits.sum()) != expected_simulations:
+            raise ValueError(
+                "search evidence visit sum differs from simulations_used: "
+                f"{int(visits.sum())} != {expected_simulations}"
+            )
+        visit_chunks.append(visits.astype(np.uint16, copy=False))
+        completed_q_chunks.append(completed_q)
+        offsets.append(offsets[-1] + legal_count)
+
+    if (
+        len(offsets) - 1 > np.iinfo(np.uint32).max
+        or offsets[-1] > np.iinfo(np.uint32).max
+    ):
+        raise ValueError("search evidence shard exceeds uint32 index schema")
+    visits_flat = (
+        np.concatenate(visit_chunks)
+        if visit_chunks
+        else np.asarray([], dtype=np.uint16)
+    )
+    completed_q_flat = (
+        np.concatenate(completed_q_chunks)
+        if completed_q_chunks
+        else np.asarray([], dtype=np.float32)
+    )
+    return {
+        "search_evidence_version": np.asarray(
+            SEARCH_EVIDENCE_VERSION, dtype=np.uint8
+        ),
+        "search_evidence_offsets": np.asarray(offsets, dtype=np.uint32),
+        "search_visit_counts_flat": visits_flat,
+        "search_completed_q_flat": completed_q_flat,
+    }
+
+
+def search_evidence_for_row(
+    shard: Mapping[str, Any], row_index: int
+) -> dict[str, np.ndarray] | None:
+    """Decode one optional compact evidence row, or return None when absent."""
+
+    evidence_keys = {
+        "search_evidence_version",
+        "search_evidence_offsets",
+        "search_visit_counts_flat",
+        "search_completed_q_flat",
+    }
+    present = evidence_keys.intersection(shard.keys())
+    if not present:
+        return None
+    required = evidence_keys | {"legal_action_ids", "policy_weight_multiplier"}
+    present = required.intersection(shard.keys())
+    if present != required:
+        raise ValueError(
+            f"incomplete search evidence payload; missing={sorted(required - present)}"
+        )
+    version = int(np.asarray(shard["search_evidence_version"]).item())
+    if version != SEARCH_EVIDENCE_VERSION:
+        raise ValueError(f"unsupported search evidence version {version!r}")
+    offsets = np.asarray(shard["search_evidence_offsets"], dtype=np.uint32)
+    policy_weights = np.asarray(shard["policy_weight_multiplier"], dtype=np.float32)
+    if policy_weights.ndim != 1:
+        raise ValueError("malformed policy_weight_multiplier column")
+    active = policy_weights > 0.0
+    if offsets.shape != (int(active.sum()) + 1,) or int(offsets[0]) != 0:
+        raise ValueError("malformed search evidence offsets")
+    if offsets.size > 1 and bool(np.any(offsets[1:] < offsets[:-1])):
+        raise ValueError("search evidence offsets must be non-decreasing")
+    if row_index < 0 or row_index >= policy_weights.size:
+        raise IndexError(f"search evidence row index out of range: {row_index}")
+    if not bool(active[int(row_index)]):
+        return None
+    position = int(np.count_nonzero(active[: int(row_index)]))
+    start, stop = int(offsets[position]), int(offsets[position + 1])
+    visits = np.asarray(shard["search_visit_counts_flat"], dtype=np.uint16)
+    completed_q = np.asarray(shard["search_completed_q_flat"], dtype=np.float32)
+    if (
+        visits.ndim != 1
+        or visits.shape != completed_q.shape
+        or int(offsets[-1]) != visits.size
+    ):
+        raise ValueError("malformed flat search evidence payload")
+    legal = np.asarray(shard["legal_action_ids"])[int(row_index)]
+    legal = np.asarray(legal[legal >= 0], dtype=np.int16)
+    if stop - start != legal.size:
+        raise ValueError("search evidence width differs from legal-action count")
+    return {
+        "legal_action_ids": legal.copy(),
+        "visit_counts": visits[start:stop].copy(),
+        "completed_q": completed_q[start:stop].copy(),
+    }
+
+
+def _rows_to_arrays(
+    rows: list[dict[str, Any]], *, preserve_search_evidence: bool = False
+) -> dict[str, np.ndarray]:
     out: dict[str, np.ndarray] = {}
     legal_width = max(int(np.asarray(row["legal_action_ids"]).shape[0]) for row in rows)
     for key in (*BASE_KEYS, *EXTRA_KEYS):
@@ -1188,6 +1383,8 @@ def _rows_to_arrays(rows: list[dict[str, Any]]) -> dict[str, np.ndarray]:
                 ).astype(np.bool_, copy=False)
         else:
             out[key] = np.stack(values, axis=0)
+    if preserve_search_evidence:
+        out.update(_compact_search_evidence(rows))
     return out
 
 
@@ -1366,6 +1563,7 @@ def run_worker_games(
     evaluator: RustEvaluator,
     shard_size: int = 2048,
     fmt: str = "npz",
+    preserve_search_evidence: bool = False,
     run_id: str = "",
     resume: bool = False,
     opponent_pool: OpponentPoolRuntime | None = None,
@@ -1429,6 +1627,11 @@ def run_worker_games(
             "run_worker_games got both opponent_pool and opponent_mix -- pass at most one "
             "(they both resolve the same PoolGameAssignment; running both is ambiguous)"
         )
+    search_evidence_scope = (
+        _search_evidence_recalibration_scope(search_config)
+        if preserve_search_evidence
+        else None
+    )
     out_dir = Path(out_dir)
     action_size = action_size_for_evaluator(evaluator, config.colors)
     engine_supports_determinization = False
@@ -1480,7 +1683,13 @@ def run_worker_games(
             start_shard_index = int(progress.shard_count_confirmed)
             _discard_orphan_shards(out_dir, from_index=start_shard_index)
 
-    writer = GumbelShardWriter(out_dir, shard_size=shard_size, fmt=fmt, start_index=start_shard_index)
+    writer = GumbelShardWriter(
+        out_dir,
+        shard_size=shard_size,
+        fmt=fmt,
+        start_index=start_shard_index,
+        preserve_search_evidence=preserve_search_evidence,
+    )
     if start_shard_index:
         # Seed `writer.paths` with the prior session's already-confirmed
         # shards so the manifest this call eventually writes still lists
@@ -1732,6 +1941,10 @@ def run_worker_games(
         "decisions_total": int(decisions_total),
         "forced_decisions_total": int(forced_decisions_total),
         "simulations_used_total": int(simulations_used_total),
+        "search_evidence_schema": (
+            SEARCH_EVIDENCE_SCHEMA if preserve_search_evidence else None
+        ),
+        "search_evidence_recalibration_scope": search_evidence_scope,
         "worker_seed": int(worker_seed),
         "base_seed": int(base_seed),
         "game_index_start": int(game_index_start),
