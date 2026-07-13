@@ -218,7 +218,8 @@ def test_python_enabled_rust_test_resolves_relocated_uv_libpython() -> None:
     assert 'sysconfig.get_config_var("LDLIBRARY")' in prefix
     assert 'sysconfig.get_config_var("LIBDIR")' in prefix
     assert 'pathlib.Path(sys.base_prefix) / "lib"' in prefix
-    assert 'LD_LIBRARY_PATH="$PYTHON_TEST_LIBDIR" cargo test' in prefix
+    assert 'LD_LIBRARY_PATH="$PYTHON_TEST_LIBDIR"' in prefix
+    assert 'RUSTFLAGS="$RUSTFLAGS -L native=$PYTHON_TEST_LIBDIR"' in prefix
     # The shared-library workaround is scoped to the Python-enabled test.  It
     # must not become an ambient release compiler input.
     assert 'export LD_LIBRARY_PATH=' not in script

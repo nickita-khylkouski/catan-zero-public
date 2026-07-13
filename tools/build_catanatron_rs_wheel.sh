@@ -195,7 +195,9 @@ cargo test \
   --lib
 # Capability names are not evidence of semantics.  Run the exact source tests
 # for every corrected 0.1.8 behavior before compiling and hashing the wheel.
-LD_LIBRARY_PATH="$PYTHON_TEST_LIBDIR" cargo test \
+LD_LIBRARY_PATH="$PYTHON_TEST_LIBDIR" \
+RUSTFLAGS="$RUSTFLAGS -L native=$PYTHON_TEST_LIBDIR" \
+cargo test \
   --locked \
   --manifest-path "$ROOT/native/catanatron-rs/Cargo.toml" \
   --features python \
