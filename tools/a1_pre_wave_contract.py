@@ -51,7 +51,9 @@ from catan_zero.search.gumbel_chance_mcts import GumbelChanceMCTSConfig  # noqa:
 from catan_zero.search.neural_rust_mcts import EntityGraphRustEvaluatorConfig  # noqa: E402
 from catan_zero.rl.gumbel_self_play import (  # noqa: E402
     GumbelSelfPlayConfig,
+    PLAYER_NAMES,
     TARGET_INFORMATION_REGIME_PUBLIC,
+    _pool_champion_plays_first_seat,
 )
 from catan_zero.rl.pipeline_configs import GenerateConfig  # noqa: E402
 from tools import legacy_scalar_readout_attestation as legacy_scalar  # noqa: E402
@@ -1151,6 +1153,11 @@ def _realized_search_identity(
 def _job_search_identity(
     lock: Mapping[str, Any], job: Mapping[str, Any]
 ) -> dict[str, Any]:
+    # This call is intentionally a validation boundary, not dead descriptive
+    # metadata.  A post-promotion opponent job still records the promoted
+    # producer's seat, and therefore must execute the c_scale that is part of
+    # that producer's deployed agent identity.
+    _promoted_producer_job_identity(lock, job)
     search = dict(lock["science"]["search_operator"])
     return _realized_search_identity(
         search, c_scale=job.get("c_scale", search["c_scale"])
@@ -3264,8 +3271,10 @@ def _post_promotion_campaign_payload(
         raise ContractError("post-promotion producer has no deployed c_scale identity")
     common_recipe = dict(value["common_recipe"])
     common_recipe["c_scale"] = float(producer_search["c_scale"])
-    category_c_scale = dict(common_recipe["category_c_scale"])
-    category_c_scale["current_producer"] = float(producer_search["c_scale"])
+    category_c_scale = {
+        category: float(producer_search["c_scale"])
+        for category in common_recipe["category_c_scale"]
+    }
     common_recipe["category_c_scale"] = category_c_scale
     value.update(
         {
@@ -4101,6 +4110,10 @@ def materialize_generation_campaign(
             },
             "post_wave_acceptance": _campaign_post_wave_acceptance(),
         }
+        # Fail before sealing if any category would search the promoted
+        # producer's retained seat with a different deployed c_scale.
+        for job in jobs:
+            _job_search_identity(lock, job)
         lock["contract_sha256"] = _digest_value(lock)
         target = out_dir / f"{arm_id}.lock.json"
         _create_readonly(target, lock)
@@ -4618,6 +4631,11 @@ def build_lock(
         },
         "post_wave_acceptance": dict(draft["post_wave_acceptance"]),
     }
+    # Make the promoted checkpoint/operator join a seal-time invariant.  It is
+    # not sufficient for render/audit to discover the mismatch after a lock
+    # has already been issued.
+    for job in jobs:
+        _job_search_identity(lock, job)
     lock["contract_sha256"] = _digest_value(lock)
     return lock
 
@@ -4776,6 +4794,8 @@ def verify_lock(
     jobs = list(lock["fleet"]["jobs"])
     if _digest_value(jobs) != lock["fleet"]["seed_plan_sha256"]:
         raise ContractError("seed plan digest mismatch")
+    for job in jobs:
+        _job_search_identity(lock, job)
     assert_disjoint_seed_blocks(
         [
             (job["job_id"], int(job["base_seed"]), int(job["attempts"]))
@@ -4963,6 +4983,8 @@ def _verify_generation_arm_lock(
     jobs = list(lock["fleet"]["jobs"])
     if len(jobs) != 84 or _digest_value(jobs) != lock["fleet"]["seed_plan_sha256"]:
         raise ContractError("generation arm job plan drift")
+    for job in jobs:
+        _job_search_identity(lock, job)
     if any(
         job.get("arm_id") != arm_id
         or float(job.get("c_scale", -1.0))
@@ -5292,6 +5314,7 @@ def _job_environment(lock: dict[str, Any], job: dict[str, Any]) -> dict[str, str
 
 def _job_attestation(lock: dict[str, Any], job: dict[str, Any]) -> dict[str, Any]:
     search_identity = _job_search_identity(lock, job)
+    promoted_identity = _promoted_producer_job_identity(lock, job)
     return {
         "schema_version": GENERATION_JOB_ATTESTATION_SCHEMA,
         **({} if "arm_id" not in job else {"arm_id": job["arm_id"]}),
@@ -5306,6 +5329,15 @@ def _job_attestation(lock: dict[str, Any], job: dict[str, Any]) -> dict[str, Any
         "attempts": job["attempts"],
         "seed_end": job["seed_end"],
         "producer_checkpoint_sha256": _producer(lock)["sha256"],
+        **(
+            {}
+            if promoted_identity is None
+            else {
+                "producer_checkpoint_search_identity_sha256": promoted_identity[
+                    "checkpoint_search_identity_sha256"
+                ]
+            }
+        ),
         "opponent_checkpoint_sha256": _category_opponent_sha256(
             lock, job["category"]
         ),
@@ -6241,6 +6273,86 @@ def _expected_selfplay_config(lock: dict[str, Any]) -> dict[str, Any]:
     return json.loads(json.dumps(effective))
 
 
+def _validate_selected_opponent_rows(
+    payload: Any,
+    *,
+    selected_mask: np.ndarray,
+    game_seeds: np.ndarray,
+    job: Mapping[str, Any],
+    allowed_versions: set[int],
+    colors: Sequence[str],
+) -> None:
+    """Prove an opponent shard contains only current-producer decisions.
+
+    Opponent games deliberately advance both seats through one shared game,
+    but only the promoted producer's deterministic seat is a policy teacher.
+    A category tag/checkpoint hash alone cannot prove that filtering happened:
+    an unfiltered shard would carry the same game-level opponent identity.  Bind
+    the selected rows to the runtime's deterministic seat assignment and to the
+    exact sealed opponent version before they are admitted to training.
+    """
+
+    required = {"is_pool_game", "opponent_version", "player", "seat"}
+    missing = sorted(required.difference(payload.files))
+    if missing:
+        raise ContractError(
+            "selected opponent rows lack producer-seat provenance columns: "
+            f"{missing}"
+        )
+    if len(colors) != 2 or any(color not in PLAYER_NAMES for color in colors):
+        raise ContractError("sealed opponent rows have invalid two-player color order")
+    pool_raw = np.asarray(payload["is_pool_game"])
+    version_raw = np.asarray(payload["opponent_version"])
+    player_raw = np.asarray(payload["player"])
+    seat_raw = np.asarray(payload["seat"])
+    if not (
+        pool_raw.shape
+        == version_raw.shape
+        == player_raw.shape
+        == seat_raw.shape
+        == game_seeds.shape
+    ):
+        raise ContractError("opponent producer-seat provenance arrays are not row-aligned")
+    if pool_raw.dtype.kind != "b" or not np.all(pool_raw[selected_mask]):
+        raise ContractError("selected opponent rows are not all authenticated pool games")
+    if version_raw.dtype.kind not in {"i", "u"} or not allowed_versions:
+        raise ContractError("selected opponent version provenance is invalid")
+    selected_versions = set(
+        map(int, np.asarray(version_raw[selected_mask], dtype=np.int64).tolist())
+    )
+    if not selected_versions.issubset(allowed_versions):
+        raise ContractError(
+            "selected opponent rows bind an unsealed opponent version: "
+            f"observed={sorted(selected_versions)} allowed={sorted(allowed_versions)}"
+        )
+    selected_seeds = np.asarray(game_seeds[selected_mask], dtype=np.int64)
+    expected_players = np.asarray(
+        [
+            colors[0]
+            if _pool_champion_plays_first_seat(
+                int(seed) - int(job["base_seed"])
+            )
+            else colors[1]
+            for seed in selected_seeds
+        ]
+    )
+    selected_players = np.asarray(player_raw[selected_mask]).astype(str)
+    if not np.array_equal(selected_players, expected_players):
+        raise ContractError(
+            "selected opponent rows include non-producer-seat policy targets"
+        )
+    if seat_raw.dtype.kind not in {"i", "u"}:
+        raise ContractError("selected opponent seat provenance is not integral")
+    expected_seats = np.asarray(
+        [PLAYER_NAMES.index(str(player)) for player in expected_players],
+        dtype=np.int64,
+    )
+    if not np.array_equal(
+        np.asarray(seat_raw[selected_mask], dtype=np.int64), expected_seats
+    ):
+        raise ContractError("selected opponent player/seat provenance disagrees")
+
+
 def audit_outputs(
     lock_path: Path,
     out_path: Path,
@@ -6293,6 +6405,7 @@ def audit_outputs(
     producer = _producer(lock)
     checkpoint_by_id = {record["id"]: record for record in lock["checkpoints"]}
     category_specs = {item["name"]: item for item in lock["source_categories"]}
+    selfplay_colors = tuple(_expected_selfplay_config(lock)["colors"])
     for job in lock["fleet"]["jobs"]:
         attestation_source = Path(job["output_dir"]) / "a1_contract.json"
         attestation_path = (
@@ -6738,6 +6851,20 @@ def audit_outputs(
                             )
                             target_entropy_count += 1
                     if job["category"] != "current_producer":
+                        allowed_versions = {
+                            int(checkpoint_by_id[checkpoint_id].get("version", -1))
+                            for checkpoint_id in category_specs[job["category"]][
+                                "checkpoint_ids"
+                            ]
+                        }
+                        _validate_selected_opponent_rows(
+                            payload,
+                            selected_mask=selected_mask,
+                            game_seeds=game_seeds,
+                            job=job,
+                            allowed_versions=allowed_versions,
+                            colors=selfplay_colors,
+                        )
                         tags = np.asarray(
                             payload.get(
                                 "opponent_tag", np.full(game_seeds.size, "")

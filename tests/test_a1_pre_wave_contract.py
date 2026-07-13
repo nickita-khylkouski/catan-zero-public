@@ -2235,6 +2235,63 @@ def test_post_wave_audit_fails_closed_when_manifests_are_missing(
     assert any("missing manifest" in error for error in payload["errors"])
 
 
+def test_selected_opponent_rows_require_only_deterministic_producer_seat(
+    tmp_path: Path,
+) -> None:
+    seeds = np.asarray([100, 100, 101, 101], dtype=np.int64)
+    expected_players = np.asarray(
+        [
+            "RED"
+            if contract._pool_champion_plays_first_seat(int(seed) - 100)  # noqa: SLF001
+            else "BLUE"
+            for seed in seeds
+        ],
+        dtype="U8",
+    )
+    arrays = {
+        "game_seed": seeds,
+        "is_pool_game": np.ones(seeds.size, dtype=bool),
+        "opponent_version": np.full(seeds.size, 6, dtype=np.int32),
+        "player": expected_players,
+        "seat": np.asarray(
+            [contract.PLAYER_NAMES.index(str(value)) for value in expected_players],
+            dtype=np.int8,
+        ),
+    }
+    good = tmp_path / "good.npz"
+    np.savez(good, **arrays)
+    with np.load(good, allow_pickle=False) as payload:
+        contract._validate_selected_opponent_rows(  # noqa: SLF001
+            payload,
+            selected_mask=np.ones(seeds.size, dtype=bool),
+            game_seeds=seeds,
+            job={"base_seed": 100},
+            allowed_versions={6},
+            colors=("RED", "BLUE"),
+        )
+
+    # Simulate the exact ingestion bug this guard closes: rows from both seats
+    # carry the same game-level opponent tag/hash, so only player/seat proves
+    # the archived opponent's decisions were excluded from policy targets.
+    bad = dict(arrays)
+    bad["player"] = expected_players.copy()
+    bad["player"][0] = "BLUE" if expected_players[0] == "RED" else "RED"
+    bad_path = tmp_path / "unfiltered.npz"
+    np.savez(bad_path, **bad)
+    with np.load(bad_path, allow_pickle=False) as payload:
+        with pytest.raises(
+            contract.ContractError, match="non-producer-seat policy targets"
+        ):
+            contract._validate_selected_opponent_rows(  # noqa: SLF001
+                payload,
+                selected_mask=np.ones(seeds.size, dtype=bool),
+                game_seeds=seeds,
+                job={"base_seed": 100},
+                allowed_versions={6},
+                colors=("RED", "BLUE"),
+            )
+
+
 def test_create_or_verify_readonly_reuses_only_exact_bytes(tmp_path: Path) -> None:
     path = tmp_path / "sidecar.json"
     payload = {"schema_version": "fixture-v1", "value": 7}
@@ -2326,6 +2383,24 @@ def test_post_wave_audit_accepts_exact_complete_category_corpus(
             opponent = checkpoint_by_id[spec["checkpoint_ids"][0]]
             arrays["opponent_tag"] = np.full(n, job["category"], dtype="U32")
             arrays["opponent_checkpoint_md5"] = np.full(n, opponent["md5"], dtype="U32")
+            arrays["is_pool_game"] = np.ones(n, dtype=bool)
+            arrays["opponent_version"] = np.full(
+                n, int(opponent.get("version", -1)), dtype=np.int32
+            )
+            players = np.asarray(
+                [
+                    "RED"
+                    if contract._pool_champion_plays_first_seat(index)  # noqa: SLF001
+                    else "BLUE"
+                    for index in range(n)
+                ],
+                dtype="U8",
+            )
+            arrays["player"] = players
+            arrays["seat"] = np.asarray(
+                [contract.PLAYER_NAMES.index(str(player)) for player in players],
+                dtype=np.int8,
+            )
         np.savez(shard, **arrays)
 
         cli = contract._expected_cli_fields(lock, job)

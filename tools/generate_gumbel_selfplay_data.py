@@ -1790,6 +1790,7 @@ def _run_worker(
             value_readout=str(worker_args.get("value_readout", "scalar")),
             public_observation=bool(worker_args["public_observation"]),
             cache_size=int(worker_args.get("eval_cache_size", 100_000)),
+            rust_featurize=bool(worker_args["rust_featurize"]),
         )
         mix_device = worker_args["device"]
 

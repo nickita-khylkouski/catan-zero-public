@@ -140,7 +140,11 @@ def test_rebases_next_campaign_to_committed_producer_and_prior_history(
         **payload["producer_identity"]["checkpoint"],
     }
     assert campaign["common_recipe"]["c_scale"] == 0.1
-    assert campaign["common_recipe"]["category_c_scale"]["current_producer"] == 0.1
+    assert campaign["common_recipe"]["category_c_scale"] == {
+        "current_producer": 0.1,
+        "recent_history": 0.1,
+        "hard_negative": 0.1,
+    }
     prior = next(row for row in campaign["checkpoints"] if row["id"] == "prior_generator")
     assert prior["role"] == "history"
     assert campaign["rebase"]["builder"] == {
@@ -202,6 +206,44 @@ def test_rebases_next_campaign_to_committed_producer_and_prior_history(
     placement_path = tmp_path / "next-placement.json"
     placement = contract.seal_generation_placement(out, assignments, placement_path)
     assert placement["campaign_sha256"] == campaign["contract_sha256"]
+
+
+def test_post_promotion_attestation_rejects_opponent_job_c_scale_drift() -> None:
+    """Render/attestation must execute the promoted producer identity check.
+
+    This deliberately uses only the fields needed to reach that fail-closed
+    boundary.  If the check becomes dead code again, construction proceeds to
+    unrelated search-schema validation and this regression test fails.
+    """
+
+    checkpoint = {
+        "id": "a1_producer",
+        "role": "producer",
+        "path": "/immutable/producer.pt",
+        "sha256": "sha256:" + "a" * 64,
+    }
+    lock = {
+        "promotion_handoff": {
+            "mode": contract.POST_PROMOTION_HANDOFF_MODE,
+            "document_schema": handoff.HANDOFF_SCHEMA,
+            "producer_checkpoint": {
+                "path": checkpoint["path"],
+                "sha256": checkpoint["sha256"],
+            },
+            "producer_search_config": {"c_scale": 0.1},
+            "producer_identity_sha256": "sha256:" + "b" * 64,
+            "producer_search_config_sha256": "sha256:" + "c" * 64,
+        },
+        "checkpoints": [checkpoint],
+        "science": {"search_operator": {"c_scale": 0.1}},
+    }
+    with pytest.raises(
+        contract.ContractError, match="promoted producer search identity mismatch"
+    ):
+        contract._job_attestation(  # noqa: SLF001
+            lock,
+            {"job_id": "lane__recent_history", "c_scale": 0.03},
+        )
 
 
 def test_refuses_uncommitted_dry_run_receipt(

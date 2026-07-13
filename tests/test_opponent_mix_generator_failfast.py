@@ -66,15 +66,24 @@ def test_worker_uses_main_process_resolved_config_without_registry_reresolution(
     class _StopAfterMix(RuntimeError):
         pass
 
+    evaluator_configs = []
+
     class _FakeEvaluator:
         @classmethod
-        def from_checkpoint(cls, *_args, **_kwargs):
+        def from_checkpoint(cls, *_args, **kwargs):
+            evaluator_configs.append(kwargs["config"])
             return object()
 
     class _FakeMixRuntime:
         def __init__(self, *, config, evaluator_factory):
             assert config is resolved
             assert callable(evaluator_factory)
+            # Construct one mixed-opponent evaluator now so this wiring test
+            # proves it receives the same Rust featurizer setting as the
+            # producer evaluator rather than stopping at a merely callable
+            # closure.
+            evaluator_factory("opponent.pt")
+            assert evaluator_configs[-1].rust_featurize is True
             raise _StopAfterMix
 
     monkeypatch.setattr(cli, "BatchedEntityGraphRustEvaluator", _FakeEvaluator)
@@ -86,7 +95,7 @@ def test_worker_uses_main_process_resolved_config_without_registry_reresolution(
         "prior_temperature": 1.0,
         "value_readout": "scalar",
         "public_observation": True,
-        "rust_featurize": False,
+        "rust_featurize": True,
         "eval_cache_size": 1,
         "score_actions": False,
         "opponent_pool_manifest": None,
