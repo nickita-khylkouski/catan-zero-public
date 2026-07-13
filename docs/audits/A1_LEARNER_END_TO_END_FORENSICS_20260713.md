@@ -365,6 +365,16 @@ both be evaluated against exact f7 under the same operator. If midpoint is at
 least as strong, future arms should use a short dose/early selection rather than
 assuming one full 4.19M-row dose is optimal.
 
+The first behavior screen now supplies the missing midpoint evidence. Against
+exact f7 at the matched deployed operator, the 524,288-row checkpoint scored
+`75-53` over 128 games (`58.59375%`), with 64 complete seat-swapped pairs,
+pentanomial counts `WW=17, split=41, LL=6`, and zero truncations/errors. The
+superiority pentanomial LLR is `1.177`, so this short screen is encouraging but
+correctly remains `continue`, not promotion evidence. Its pooled artifact is
+`/home/ubuntu/experimental_nonpromotable/p0-temp-midpoint-v-f7-screen-20260713-r1/collected/a1-eval-d801f3ef6377fcad/pooled/internal.json`
+on the evaluation controller. The full-dose checkpoint is being evaluated on
+the identical seed cohort; only that paired result selects the Pareto dose.
+
 ### P2 — highest-information learner arms
 
 Before launching an arm, adjudicate the already-written 524,288-row and
