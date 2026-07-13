@@ -31,13 +31,15 @@ if str(REPO_ROOT) not in sys.path:
 from tools import train_bc  # noqa: E402
 
 
-SCHEMA = "a1-next-production-learner-manifest-v3"
+SCHEMA = "a1-next-production-learner-manifest-v4"
 SUPERVISION_CONTRACT_SCHEMA = "a1-next-learner-supervision-contract-v2"
 CURRENT_TEACHER_COMPONENT_IDS = ("n128_current", "n256_current")
 REPLAY_COMPONENT_ID = "gen3_replay"
 REPLAY_ANCHOR_WEIGHT = 0.0
 WINNING_COMPONENT_RATIOS = (4.0 / 7.0, 8.0 / 35.0, 1.0 / 5.0)
-GLOBAL_ROW_DOSE = 4_194_304
+GLOBAL_ROW_DOSE = 524_288
+GLOBAL_BATCH_SIZE = 8 * 512
+OPTIMIZER_STEPS = GLOBAL_ROW_DOSE // GLOBAL_BATCH_SIZE
 # The expectation is derived from authenticated training-only rows for every
 # concrete descriptor.  This tolerance is wider than six binomial sigmas for
 # the historical winning mix while still rejecting ~0.8% dose drift.
@@ -711,8 +713,9 @@ def _rebind_a1_metadata(command: list[str], repo: Path) -> dict[str, Any]:
     if not isinstance(effective, dict) or not isinstance(prior_binding, dict):
         raise ArmError("source A1 metadata is not object-valued")
     recipe_updates: dict[str, Any] = {
-        "batch_size": 512, "grad_accum_steps": 1, "global_batch_size": 4096,
-        "world_size": 8, "max_steps": 1024, "epochs": 1,
+        "batch_size": 512, "grad_accum_steps": 1,
+        "global_batch_size": GLOBAL_BATCH_SIZE,
+        "world_size": 8, "max_steps": OPTIMIZER_STEPS, "epochs": 1,
         "loser_sample_weight": 1.0, "winner_sample_weight": 1.0,
         "forced_action_weight": 0.0, "forced_row_value_weight": 1.0,
         "policy_loss_weight": 1.0, "soft_target_source": "policy",
@@ -798,7 +801,7 @@ def _derive_command(
         "--report": str(output_root / "train.report.json"),
         "--batch-size": "512",
         "--grad-accum-steps": "1",
-        "--max-steps": "1024",
+        "--max-steps": str(OPTIMIZER_STEPS),
         "--epochs": "1",
         "--loser-sample-weight": "1.0",
         "--winner-sample-weight": "1.0",
@@ -1016,8 +1019,9 @@ def prepare(args: argparse.Namespace) -> tuple[dict[str, Any], Path]:
         policy_active_dose["reference_base_active_rows"]
     )
     recipe = {
-        "world_size": 8, "local_batch_size": 512, "global_batch_size": 4096,
-        "steps": 1024, "base_value_row_dose": GLOBAL_ROW_DOSE,
+        "world_size": 8, "local_batch_size": 512,
+        "global_batch_size": GLOBAL_BATCH_SIZE,
+        "steps": OPTIMIZER_STEPS, "base_value_row_dose": GLOBAL_ROW_DOSE,
         "policy_aux_active_batch_size_per_rank": 0,
         "policy_aux_active_row_dose": 0,
         "expected_policy_base_active_rows": expected_policy_base_active_rows,
@@ -1069,8 +1073,8 @@ def prepare(args: argparse.Namespace) -> tuple[dict[str, Any], Path]:
             "current_teacher_prior_is_initializer": True,
             "teacher_gap_closure_is_search_improvement_over_initializer": True,
             "reason": (
-                "preserve the realized r3 supervision operator before changing one "
-                "causal axis at a time"
+                "preserve the realized r3 supervision operator at the matched-play "
+                "Pareto dose before changing one causal axis at a time"
             ),
         },
         "diagnostic_ablations": [

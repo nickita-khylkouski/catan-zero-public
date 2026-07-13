@@ -57,7 +57,7 @@ def _source_manifest(tmp_path: Path, source: Path, descriptor: Path,
     source_repo = tmp_path / "source-checkout"
     trainer = source_repo / "tools/train_bc.py"
     trainer.parent.mkdir(parents=True)
-    trainer.write_text("# exact source K3 trainer\n", encoding="utf-8")
+    trainer.write_text("# exact selected-dose TEMP trainer\n", encoding="utf-8")
     command = [
         "python", "-m", "torch.distributed.run", "--standalone",
         "--nproc-per-node=8", str(trainer.resolve()),
@@ -70,11 +70,12 @@ def _source_manifest(tmp_path: Path, source: Path, descriptor: Path,
     ]
     recipe = {
         "world_size": 8, "local_batch_size": 512, "global_batch_size": 4096,
-        "steps": 1024, "base_value_row_dose": 4_194_304,
+        "steps": arm.corrected.OPTIMIZER_STEPS,
+        "base_value_row_dose": arm.corrected.GLOBAL_ROW_DOSE,
         "policy_aux_active_batch_size_per_rank": 0,
         "policy_aux_active_row_dose": 0,
-        "replay_supervised_policy": False, "replay_supervised_value": False,
-        "replay_forward_kl_weight": 0.0, "soft_target_weight": 1.0,
+        "replay_supervised_policy": True, "replay_supervised_value": True,
+        "replay_forward_kl_weight": 0.0, "soft_target_weight": 0.9,
         "fresh_optimizer": True, "independent_f7_initialization": True,
     }
     payload = {
@@ -139,11 +140,15 @@ def _args(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
                 "payload_inventory_sha256": "sha256:" + str(index) * 64,
             }
             for index, (component_id, path) in enumerate(zip(
-                ("n128_current", "n256_current"), corpora[:2]
+                ("n128_current", "n256_current", "gen3_replay"), corpora
             ), start=1)
         ],
-        "policy_distillation_component_ids": ["n128_current", "n256_current"],
-        "value_training_component_ids": ["n128_current", "n256_current"],
+        "policy_distillation_component_ids": [
+            "n128_current", "n256_current", "gen3_replay"
+        ],
+        "value_training_component_ids": [
+            "n128_current", "n256_current", "gen3_replay"
+        ],
     }, arm.corrected._file_ref(descriptor)))
     executor = tmp_path / arm.EXECUTOR_RELATIVE_PATH
     executor.parent.mkdir(exist_ok=True)
@@ -157,15 +162,15 @@ def _args(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     return type("Args", (), {
         "source_manifest": manifest,
         "gather_checkpoint": gather,
-        # The production audit predates the K3 descriptor and records only the
-        # two current supervised corpora, in a different (valid) order.
-        "architecture_audit": _audit(tmp_path, list(reversed(corpora[:2]))),
+        # Ordering is not semantic, but every TEMP-supervised component must be
+        # represented, including predecessor replay.
+        "architecture_audit": _audit(tmp_path, list(reversed(corpora))),
         "output_root": tmp_path / "out",
         "repo": tmp_path,
     })()
 
 
-def test_prepares_one_axis_gather_k3_without_launch(tmp_path, monkeypatch):
+def test_prepares_one_axis_gather_from_selected_temp_without_launch(tmp_path, monkeypatch):
     manifest, path = arm.prepare(_args(tmp_path, monkeypatch))
     assert path.is_file()
     assert manifest["launch_authorized"] is False
@@ -183,11 +188,11 @@ def test_prepares_one_axis_gather_k3_without_launch(tmp_path, monkeypatch):
     assert manifest["function_preserving_upgrade"]["new_parameters"] == list(
         arm.EXPECTED_NEW_PARAMETERS
     )
-    assert len(manifest["corpus_topology_target_coverage"]["components"]) == 2
+    assert len(manifest["corpus_topology_target_coverage"]["components"]) == 3
     assert manifest["executor_compatibility"]["compatible_now"] is True
     assert manifest["executor_compatibility"]["one_shot"] is True
     command = manifest["command"]
-    assert command.count(arm.corrected.EVENT_HISTORY_ACK_FLAG) == 2
+    assert command.count(arm.corrected.EVENT_HISTORY_ACK_FLAG) == 3
     assert command.count(arm.corrected.EVENT_HISTORY_CROP_FLAG) == 1
     assert manifest["event_history_training_contract"][
         "crop_authenticated_empty_event_history"
@@ -245,12 +250,12 @@ def test_coverage_refuses_zero_search_active_topology_rows(tmp_path, monkeypatch
         arm.prepare(args)
 
 
-def test_coverage_refuses_anchor_or_duplicate_audit_rows(tmp_path, monkeypatch):
+def test_coverage_refuses_missing_or_duplicate_supervised_audit_rows(tmp_path, monkeypatch):
     args = _args(tmp_path, monkeypatch)
     payload = json.loads(args.architecture_audit.read_text())
     payload["audits"].append(dict(payload["audits"][0]))
     args.architecture_audit.write_text(json.dumps(payload), encoding="utf-8")
-    with pytest.raises(arm.ArmError, match="exactly the supervised K3 corpora"):
+    with pytest.raises(arm.ArmError, match="exactly the supervised TEMP corpora"):
         arm.prepare(args)
 
 
@@ -263,7 +268,7 @@ def test_source_manifest_refuses_recipe_drift(tmp_path, monkeypatch):
         {key: value for key, value in payload.items() if key != "manifest_sha256"}
     )
     args.source_manifest.write_text(json.dumps(payload), encoding="utf-8")
-    with pytest.raises(arm.ArmError, match="exact corrected anchor-only K3"):
+    with pytest.raises(arm.ArmError, match="exact selected-dose TEMP control"):
         arm.prepare(args)
 
 

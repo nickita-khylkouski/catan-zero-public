@@ -85,7 +85,7 @@ def test_verify_preserves_bound_source_trainer_instead_of_current_checkout(
     payload["command"][trainer_index] = str(current_trainer)
     payload["command_sha256"] = arm.corrected._digest(payload["command"])
     _write_manifest(path, payload)
-    with pytest.raises(executor.ExecutionError, match="bound corrected-K3 trainer"):
+    with pytest.raises(executor.ExecutionError, match="bound selected-TEMP trainer"):
         executor.verify(path)
 
 

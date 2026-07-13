@@ -270,9 +270,9 @@ def test_prepares_exact_one_dose_winning_operator_control_without_launch(
     assert path.is_file()
     assert manifest["launch_authorized"] is False
     assert manifest["diagnostic_execution_authorized"] is True
-    assert manifest["recipe"]["base_value_row_dose"] == 4_194_304
+    assert manifest["recipe"]["base_value_row_dose"] == 524_288
     assert manifest["recipe"]["policy_aux_active_row_dose"] == 0
-    assert manifest["recipe"]["expected_policy_base_active_rows"] == 515_542
+    assert manifest["recipe"]["expected_policy_base_active_rows"] == 64_443
     assert manifest["recipe"]["policy_base_active_row_tolerance"] == 4_100
     assert manifest["recipe"]["expected_policy_aux_active_rows"] == 0
     assert manifest["recipe"]["policy_distillation_component_ids"] == [
@@ -321,7 +321,7 @@ def test_prepares_exact_one_dose_winning_operator_control_without_launch(
     assert arm._option(command, "--policy-kl-anchor-weight") == "0.0"
     assert arm._option(command, "--policy-kl-anchor-direction") == "forward"
     assert arm._option(command, "--loser-sample-weight") == "1.0"
-    assert arm._option(command, "--max-steps") == "1024"
+    assert arm._option(command, "--max-steps") == "128"
     assert command.count("--validation-game-sentinel-manifest") == 1
     assert command.count(arm.EVENT_HISTORY_ACK_FLAG) == 3
     assert command.count(arm.EVENT_HISTORY_CROP_FLAG) == 1
@@ -338,13 +338,13 @@ def test_prepares_exact_one_dose_winning_operator_control_without_launch(
         "derivation": "authenticated_game_uniform_activity_weighted_by_component_sampling_ratio",
         "component_statistics": active_dose["component_statistics"],
         "component_sampling_ratios": pytest.approx([4 / 7, 8 / 35, 1 / 5]),
-        "global_row_dose": 4_194_304,
+        "global_row_dose": 524_288,
         "available_training_rows": 15_000_000,
         "expected_active_fraction": pytest.approx(0.1229147619829968),
-        "reference_base_active_rows": 515_542,
+        "reference_base_active_rows": 64_443,
         "base_active_rows_tolerance": 4_100,
-        "min_base_active_rows": 511_442,
-        "max_base_active_rows": 519_642,
+        "min_base_active_rows": 60_343,
+        "max_base_active_rows": 68_543,
         "expected_aux_active_rows": 0,
         "accounting": "realized_policy_active_rows_not_global_samples",
     }
@@ -444,7 +444,7 @@ def test_active_dose_refuses_corpus_that_cannot_reach_one_dose(
         "_component_training_policy_activity",
         lambda component: {
             "component_id": component["component_id"],
-            "training_rows": 1_000_000,
+                "training_rows": 200_000,
             "game_uniform_policy_active_fraction": 0.1,
         },
     )
@@ -666,6 +666,7 @@ def test_rebinds_full_tracked_runtime_closure_and_effective_recipe(
     result = arm._rebind_a1_metadata(command, tmp_path)
     assert result["effective_recipe"]["policy_aux_active_batch_size"] == 0
     assert result["effective_recipe"]["soft_target_weight"] == 0.9
+    assert result["effective_recipe"]["max_steps"] == 128
     assert arm._option(command, "--a1-learner-ablation-id") == (
         "next-winning-operator-control"
     )
