@@ -5,8 +5,10 @@ because of fragile `pkill -f` patterns. All read the box registry from `$FLEET_C
 (default `~/.catan_fleet.conf`, an alias→ip bash file; copy `fleet_conf.example` and fill it —
 the filled file is gitignored so no IPs land in the repo), use `ssh -i $GPU_SSH_KEY`
 (default `~/.ssh/gpu_access_ed25519`, BatchMode), and are safe to run while the fleet is frozen.
-Use `fleet_launch.sh` for every generation/training start. The full operator
-transaction is documented in `RL_AGENT_HANDOFF.md`.
+Use `fleet_launch.sh` for legacy homogeneous generation/training starts. A
+sealed post-promotion A1 wave must use `a1_production_executor.py`, whose job
+attestations bind the deployed producer identity across every source category.
+The full operator transaction is documented in `RL_AGENT_HANDOFF.md`.
 
 Generation pins the validated H100 inference path explicitly: `mp_queue`
 transport, zero event tokens (the live/public event tail is empty), and the

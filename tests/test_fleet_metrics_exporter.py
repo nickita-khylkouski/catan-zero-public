@@ -271,6 +271,88 @@ def test_nested_dual_arm_layout_is_discovered_with_category_recipe(
     assert snapshots[0].recipe_safe is True
 
 
+@pytest.mark.parametrize(
+    "category", ("current_producer", "recent_history", "hard_negative")
+)
+def test_post_promotion_categories_require_deployed_producer_c_scale(
+    tmp_path: Path, category: str
+) -> None:
+    now = 16_550.0
+    root = tmp_path / "runs" / "selfplay"
+    output = root / "campaign-v5" / "n128" / f"n128_gpu00__{category}"
+    config = _config(n_full=128)
+    config["fields"]["c_scale"] = 0.1
+    _write_json(output / "config.json", config, mtime=now - 2)
+    _write_json(
+        output / "a1_contract.json",
+        {
+            "schema_version": "a1-generation-job-attestation-v3",
+            "producer_checkpoint_search_identity_sha256": "sha256:" + "a" * 64,
+        },
+        mtime=now - 1,
+    )
+
+    snapshot = exporter.snapshot_run(
+        output,
+        host="fleet-host",
+        processes={str(output.resolve()): {123}},
+        now=now,
+        stale_after_seconds=60,
+    )
+
+    assert snapshot is not None
+    assert snapshot.c_scale == 0.1
+    assert snapshot.recipe_safe is True
+
+    config["fields"]["c_scale"] = 0.03
+    _write_json(output / "config.json", config, mtime=now)
+    drifted = exporter.snapshot_run(
+        output,
+        host="fleet-host",
+        processes={str(output.resolve()): {123}},
+        now=now,
+        stale_after_seconds=60,
+    )
+    assert drifted is not None
+    assert drifted.recipe_safe is False
+
+
+def test_malformed_promotion_identity_cannot_reclassify_historical_recipe(
+    tmp_path: Path,
+) -> None:
+    now = 16_575.0
+    output = (
+        tmp_path
+        / "runs"
+        / "selfplay"
+        / "historical"
+        / "n128"
+        / "n128_gpu00__recent_history"
+    )
+    config = _config(n_full=128)
+    _write_json(output / "config.json", config, mtime=now - 2)
+    _write_json(
+        output / "a1_contract.json",
+        {
+            "schema_version": "a1-generation-job-attestation-v3",
+            "producer_checkpoint_search_identity_sha256": "not-a-digest",
+        },
+        mtime=now - 1,
+    )
+
+    snapshot = exporter.snapshot_run(
+        output,
+        host="fleet-host",
+        processes={str(output.resolve()): {123}},
+        now=now,
+        stale_after_seconds=60,
+    )
+
+    assert snapshot is not None
+    assert snapshot.c_scale == 0.03
+    assert snapshot.recipe_safe is True
+
+
 def test_nested_dual_arm_recipe_rejects_cross_arm_budget(tmp_path: Path) -> None:
     now = 16_600.0
     root = tmp_path / "runs" / "selfplay"

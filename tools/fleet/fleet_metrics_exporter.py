@@ -37,7 +37,7 @@ A1_GPU_DIR_RE = re.compile(
 # generate_gumbel_selfplay_data guard.
 PUBLIC_TARGET_INFORMATION_REGIME = "public_conservation_pimc_v1"
 UNKNOWN_TARGET_INFORMATION_REGIME = "unknown"
-EXPECTED_A1_RECIPE: dict[str, Any] = {
+EXPECTED_LEGACY_A1_RECIPE: dict[str, Any] = {
     "public_observation": True,
     "information_set_search": True,
     "determinization_particles": 4,
@@ -56,23 +56,57 @@ EXPECTED_A1_RECIPE: dict[str, Any] = {
 }
 
 
-def _expected_recipe(*, run: str, category: str) -> dict[str, Any]:
-    """Return the exact safe recipe for legacy or sealed dual-arm output.
+def _is_post_promotion_attestation(
+    attestation: Mapping[str, Any] | None,
+) -> bool:
+    """Recognize the lineage-bound job sidecar emitted after promotion.
 
-    The dual-arm wave nests outputs below ``.../<campaign>/<arm>/<job>`` and
-    intentionally uses c_scale=.10 for the current producer, while history and
-    hard-negative jobs retain c_scale=.03.  Legacy runs keep the pre-wave
-    n128/.03 expectation.
+    Historical v2 jobs and pre-promotion v3 jobs do not bind a promoted
+    checkpoint's deployed search identity. Current post-promotion jobs do,
+    for every source category. Requiring both the v3 schema and a canonical
+    digest avoids classifying a partially written or hand-authored sidecar as
+    current merely because it contains a similarly named field.
     """
 
-    expected = dict(EXPECTED_A1_RECIPE)
+    if attestation is None or attestation.get("schema_version") != (
+        "a1-generation-job-attestation-v3"
+    ):
+        return False
+    identity = attestation.get("producer_checkpoint_search_identity_sha256")
+    return isinstance(identity, str) and re.fullmatch(
+        r"sha256:[0-9a-f]{64}", identity
+    ) is not None
+
+
+def _expected_recipe(
+    *, run: str, category: str, post_promotion: bool = False
+) -> dict[str, Any]:
+    """Return the exact safe recipe for historical or current A1 output.
+
+    The immutable pre-promotion dual-arm wave nests outputs below
+    ``.../<campaign>/<arm>/<job>`` and used c_scale=.10 for current-producer
+    jobs but .03 for its history and hard-negative jobs. A post-promotion job
+    is distinguished by its lineage-bound v3 attestation; all three categories
+    search the retained producer seat with the deployed v5 c_scale=.10.
+    Legacy runs keep the pre-wave n128/.03 expectation.
+    """
+
+    expected = dict(EXPECTED_LEGACY_A1_RECIPE)
     if run in {"n128", "n256"} and category in {
         "current_producer",
         "recent_history",
         "hard_negative",
     }:
         expected["n_full"] = int(run.removeprefix("n"))
-        expected["c_scale"] = 0.1 if category == "current_producer" else 0.03
+        expected["c_scale"] = (
+            0.1 if post_promotion or category == "current_producer" else 0.03
+        )
+    elif post_promotion and category in {
+        "current_producer",
+        "recent_history",
+        "hard_negative",
+    }:
+        expected["c_scale"] = 0.1
     return expected
 
 
@@ -524,6 +558,7 @@ def snapshot_run(
     recipe_safe = effective_recipe == _expected_recipe(
         run=run,
         category=(a1_match.group("category") if a1_match is not None else "legacy"),
+        post_promotion=_is_post_promotion_attestation(a1_contract),
     )
     seed_end = seed_start + games_requested
     if a1_contract is not None:

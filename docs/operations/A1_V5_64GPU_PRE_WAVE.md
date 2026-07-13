@@ -13,6 +13,11 @@ not authorize a launch.
 - Deployed generation identity: global n128/n_fast16, `p_full=0.25`,
   determinization P4, `c_scale=0.10`. The registry's `p_full=1` is an
   evaluation-only override and is not a generation recipe.
+- Every post-promotion source category executes that same deployed producer
+  search identity. `recent_history` and `hard_negative` change the opponent,
+  not the retained producer seat: their jobs must also use `c_scale=0.10`.
+  The `.03` opponent-category values in the immutable pre-promotion dual-arm
+  campaign remain historical evidence and are not a recipe for this wave.
 - Adaptive wide n256 is disabled. The final S3 r3 panel completed 400 games
   (202-198), remained at strict-SPRT `continue`, and cost +6.9% simulations /
   +8.8% search time. Its pooled evidence SHA-256 is
