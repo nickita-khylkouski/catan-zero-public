@@ -73,6 +73,11 @@ SELECTED_GLOBAL_BATCH_SIZE = WORLD_SIZE * SELECTED_LOCAL_BATCH_SIZE
 SELECTED_OPTIMIZER_STEPS = 128
 LOCAL_BATCH_SIZE = 64
 GLOBAL_BATCH_SIZE = WORLD_SIZE * LOCAL_BATCH_SIZE
+# The historical arm used the full selected-TEMP row dose at a smaller local
+# batch, which implied 1,024 adapter updates.  The exact-parent loss showed that
+# this may over-correct a four-tensor residual, so the diagnostic now supports a
+# tiny, explicit dose ladder while keeping every other axis fixed.
+ALLOWED_OPTIMIZER_STEPS = (128, 256, 1024)
 OPTIMIZER_STEPS = 1024
 GLOBAL_ROW_DOSE = GLOBAL_BATCH_SIZE * OPTIMIZER_STEPS
 ACTION_MODULE_LR_MULT = 4.0
@@ -104,6 +109,35 @@ SOURCE_FILES = (
 
 class CompositionArmError(RuntimeError):
     """The request is not the exact selected-dose D6+gather diagnostic."""
+
+
+def _dose_geometry(optimizer_steps: int) -> dict[str, Any]:
+    if (
+        isinstance(optimizer_steps, bool)
+        or not isinstance(optimizer_steps, int)
+        or optimizer_steps not in ALLOWED_OPTIMIZER_STEPS
+    ):
+        raise CompositionArmError(
+            "D6+gather optimizer steps must be one of "
+            f"{ALLOWED_OPTIMIZER_STEPS}, got {optimizer_steps!r}"
+        )
+    warmup_steps = 100
+    # train_bc applies (step + 1) / warmup_steps through step 99, then 1.0.
+    warmup_area = min(optimizer_steps, warmup_steps)
+    integrated = (
+        warmup_area * (warmup_area + 1) / (2.0 * warmup_steps)
+        + max(0, optimizer_steps - warmup_steps)
+    )
+    global_row_dose = GLOBAL_BATCH_SIZE * optimizer_steps
+    return {
+        "optimizer_steps": optimizer_steps,
+        "global_row_dose": global_row_dose,
+        "lr_warmup_steps": warmup_steps,
+        "integrated_lr_step_equivalents": integrated,
+        "action_integrated_lr_step_equivalents": (
+            integrated * ACTION_MODULE_LR_MULT
+        ),
+    }
 
 
 def _d6_parent_profiles() -> dict[str, dict[str, Any]]:
@@ -350,7 +384,9 @@ def _derive_command(
     trainer: Path,
     gather_checkpoint: Path,
     output_root: Path,
+    optimizer_steps: int = OPTIMIZER_STEPS,
 ) -> tuple[list[str], dict[str, Any]]:
+    dose = _dose_geometry(optimizer_steps)
     command = list(source)
     expected = {
         "--max-steps": str(SELECTED_OPTIMIZER_STEPS),
@@ -395,7 +431,7 @@ def _derive_command(
         "--checkpoint": str(output_root / "candidate.pt"),
         "--report": str(output_root / "train.report.json"),
         "--batch-size": str(LOCAL_BATCH_SIZE),
-        "--max-steps": str(OPTIMIZER_STEPS),
+        "--max-steps": str(dose["optimizer_steps"]),
         "--action-module-lr-mult": str(ACTION_MODULE_LR_MULT),
         "--value-lr-mult": str(VALUE_LR_MULT),
         "--freeze-modules": FREEZE_MODULES,
@@ -443,6 +479,7 @@ def prepare(args: argparse.Namespace) -> tuple[dict[str, Any], Path]:
     if existing:
         raise CompositionArmError(f"D6+gather output already exists: {existing}")
     d6_parent = _load_d6_parent(args.d6_checkpoint, args.d6_report, args.d6_progress)
+    dose = _dose_geometry(getattr(args, "optimizer_steps", OPTIMIZER_STEPS))
     gather_checkpoint = args.gather_checkpoint.expanduser().resolve(strict=True)
     try:
         upgrade = gather._validate_upgrade(  # noqa: SLF001
@@ -476,6 +513,7 @@ def prepare(args: argparse.Namespace) -> tuple[dict[str, Any], Path]:
         trainer=Path(str(trainer_ref["path"])),
         gather_checkpoint=gather_checkpoint,
         output_root=output_root,
+        optimizer_steps=dose["optimizer_steps"],
     )
     descriptor_meta, _ = gather.corrected._preflight_descriptor(  # noqa: SLF001
         Path(source["descriptor"]["path"])
@@ -522,8 +560,8 @@ def prepare(args: argparse.Namespace) -> tuple[dict[str, Any], Path]:
             "world_size": WORLD_SIZE,
             "local_batch_size": LOCAL_BATCH_SIZE,
             "global_batch_size": GLOBAL_BATCH_SIZE,
-            "optimizer_steps": OPTIMIZER_STEPS,
-            "global_row_dose": GLOBAL_ROW_DOSE,
+            "optimizer_steps": dose["optimizer_steps"],
+            "global_row_dose": dose["global_row_dose"],
             "fresh_adam": True,
             "action_module_lr_mult": ACTION_MODULE_LR_MULT,
             "value_lr_mult": VALUE_LR_MULT,
@@ -556,23 +594,26 @@ def prepare(args: argparse.Namespace) -> tuple[dict[str, Any], Path]:
                 "local_batch_size": SELECTED_LOCAL_BATCH_SIZE,
                 "global_batch_size": SELECTED_GLOBAL_BATCH_SIZE,
                 "optimizer_steps": SELECTED_OPTIMIZER_STEPS,
-                "global_row_dose": GLOBAL_ROW_DOSE,
+                "global_row_dose": (
+                    SELECTED_GLOBAL_BATCH_SIZE * SELECTED_OPTIMIZER_STEPS
+                ),
             },
             "treatment_adapter_commissioning": {
                 "world_size": WORLD_SIZE,
                 "local_batch_size": LOCAL_BATCH_SIZE,
                 "global_batch_size": GLOBAL_BATCH_SIZE,
-                "optimizer_steps": OPTIMIZER_STEPS,
-                "global_row_dose": GLOBAL_ROW_DOSE,
-                "lr_warmup_steps": 100,
-                "integrated_lr_step_equivalents": 974.5,
-                "action_integrated_lr_step_equivalents": 3898.0,
+                **dose,
             },
-            "optimizer_update_count_multiplier": 8.0,
-            "row_dose_unchanged": True,
+            "optimizer_update_count_multiplier": (
+                dose["optimizer_steps"] / SELECTED_OPTIMIZER_STEPS
+            ),
+            "row_dose_unchanged": (
+                dose["global_row_dose"]
+                == SELECTED_GLOBAL_BATCH_SIZE * SELECTED_OPTIMIZER_STEPS
+            ),
             "reason": (
-                "the zero-output gather residual needs the proven 1024-update "
-                "commissioning geometry; this is not the 128-update D6-short arm"
+                "one-axis gather dose ladder: exact parent, initializer, data order, "
+                "optimizer, losses, LR, and trainable surface remain fixed"
             ),
         },
         "allowlisted_command_changes": changes,
@@ -741,12 +782,17 @@ def verify(
         raise CompositionArmError("topology coverage replay drift")
 
     root = Path(str(payload.get("output_root", ""))).resolve()
+    matched_payload = payload.get("matched_contract")
+    if not isinstance(matched_payload, Mapping):
+        raise CompositionArmError("manifest lacks matched D6+gather contract")
+    dose = _dose_geometry(matched_payload.get("optimizer_steps"))
     trainer = _verify_ref(files["tools/train_bc.py"], label="current trainer")
     expected_command, changes = _derive_command(
         source["command"],
         trainer=trainer,
         gather_checkpoint=treatment,
         output_root=root,
+        optimizer_steps=dose["optimizer_steps"],
     )
     descriptor_meta, _ = gather.corrected._preflight_descriptor(  # noqa: SLF001
         Path(source["descriptor"]["path"])
@@ -779,8 +825,8 @@ def verify(
         "world_size": WORLD_SIZE,
         "local_batch_size": LOCAL_BATCH_SIZE,
         "global_batch_size": GLOBAL_BATCH_SIZE,
-        "optimizer_steps": OPTIMIZER_STEPS,
-        "global_row_dose": GLOBAL_ROW_DOSE,
+        "optimizer_steps": dose["optimizer_steps"],
+        "global_row_dose": dose["global_row_dose"],
         "fresh_adam": True,
         "action_module_lr_mult": ACTION_MODULE_LR_MULT,
         "value_lr_mult": VALUE_LR_MULT,
@@ -813,23 +859,26 @@ def verify(
             "local_batch_size": SELECTED_LOCAL_BATCH_SIZE,
             "global_batch_size": SELECTED_GLOBAL_BATCH_SIZE,
             "optimizer_steps": SELECTED_OPTIMIZER_STEPS,
-            "global_row_dose": GLOBAL_ROW_DOSE,
+            "global_row_dose": (
+                SELECTED_GLOBAL_BATCH_SIZE * SELECTED_OPTIMIZER_STEPS
+            ),
         },
         "treatment_adapter_commissioning": {
             "world_size": WORLD_SIZE,
             "local_batch_size": LOCAL_BATCH_SIZE,
             "global_batch_size": GLOBAL_BATCH_SIZE,
-            "optimizer_steps": OPTIMIZER_STEPS,
-            "global_row_dose": GLOBAL_ROW_DOSE,
-            "lr_warmup_steps": 100,
-            "integrated_lr_step_equivalents": 974.5,
-            "action_integrated_lr_step_equivalents": 3898.0,
+            **dose,
         },
-        "optimizer_update_count_multiplier": 8.0,
-        "row_dose_unchanged": True,
+        "optimizer_update_count_multiplier": (
+            dose["optimizer_steps"] / SELECTED_OPTIMIZER_STEPS
+        ),
+        "row_dose_unchanged": (
+            dose["global_row_dose"]
+            == SELECTED_GLOBAL_BATCH_SIZE * SELECTED_OPTIMIZER_STEPS
+        ),
         "reason": (
-            "the zero-output gather residual needs the proven 1024-update "
-            "commissioning geometry; this is not the 128-update D6-short arm"
+            "one-axis gather dose ladder: exact parent, initializer, data order, "
+            "optimizer, losses, LR, and trainable surface remain fixed"
         ),
     }
     if not (
@@ -895,6 +944,13 @@ def build_parser() -> argparse.ArgumentParser:
     prep.add_argument("--gather-checkpoint", required=True, type=Path)
     prep.add_argument("--architecture-audit", required=True, type=Path)
     prep.add_argument("--output-root", required=True, type=Path)
+    prep.add_argument(
+        "--optimizer-steps",
+        type=int,
+        choices=ALLOWED_OPTIMIZER_STEPS,
+        default=OPTIMIZER_STEPS,
+        help="Exact one-axis gather dose; all other treatment axes remain fixed.",
+    )
     prep.add_argument("--repo", default=REPO_ROOT, type=Path)
     check = sub.add_parser("verify")
     check.add_argument("--manifest", required=True, type=Path)

@@ -264,8 +264,8 @@ def test_prepares_and_replays_exact_selected_dose_d6_gather_contract(
         "optimizer_update_count_multiplier": 8.0,
         "row_dose_unchanged": True,
         "reason": (
-            "the zero-output gather residual needs the proven 1024-update "
-            "commissioning geometry; this is not the 128-update D6-short arm"
+            "one-axis gather dose ladder: exact parent, initializer, data order, "
+            "optimizer, losses, LR, and trainable surface remain fixed"
         ),
     }
     command = manifest["command"]
@@ -292,6 +292,46 @@ def test_prepares_and_replays_exact_selected_dose_d6_gather_contract(
     verified = arm.verify(path, expected_executor=args.bound_executor)
     assert verified["command"] == command
     assert verified["output_root"] == args.output_root.resolve()
+
+
+@pytest.mark.parametrize(
+    ("optimizer_steps", "row_dose", "integrated_lr", "action_integrated_lr"),
+    [
+        (128, 65_536, 78.5, 314.0),
+        (256, 131_072, 206.5, 826.0),
+    ],
+)
+def test_prepares_and_replays_exact_short_gather_dose_ladder(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    optimizer_steps: int,
+    row_dose: int,
+    integrated_lr: float,
+    action_integrated_lr: float,
+) -> None:
+    args = _composition_args(tmp_path, monkeypatch)
+    args.optimizer_steps = optimizer_steps
+    manifest, path = arm.prepare(args)
+
+    assert manifest["matched_contract"]["optimizer_steps"] == optimizer_steps
+    assert manifest["matched_contract"]["global_row_dose"] == row_dose
+    treatment = manifest["optimizer_geometry_contract"][
+        "treatment_adapter_commissioning"
+    ]
+    assert treatment["optimizer_steps"] == optimizer_steps
+    assert treatment["global_row_dose"] == row_dose
+    assert treatment["integrated_lr_step_equivalents"] == integrated_lr
+    assert (
+        treatment["action_integrated_lr_step_equivalents"]
+        == action_integrated_lr
+    )
+    assert manifest["optimizer_geometry_contract"]["row_dose_unchanged"] is False
+    assert arm.gather.corrected._option(manifest["command"], "--max-steps") == str(
+        optimizer_steps
+    )
+    assert arm.verify(path, expected_executor=args.bound_executor)["command"] == (
+        manifest["command"]
+    )
 
 
 def test_selected_short_d6_is_an_independent_exact_parent_profile(

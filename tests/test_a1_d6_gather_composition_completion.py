@@ -40,9 +40,13 @@ def _submit(manifest_path: Path, *, executor: Path) -> None:
 
 
 def _complete_run(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    optimizer_steps: int = 1024,
 ) -> tuple[Path, Path, object]:
     args = _composition_args(tmp_path, monkeypatch)
+    args.optimizer_steps = optimizer_steps
     manifest, manifest_path = arm.prepare(args)
     fake_finalizer = Path(
         manifest["source_binding"]["files"][arm.COMPLETION_RELATIVE_PATH]["path"]
@@ -64,7 +68,10 @@ def _complete_run(
         {
             "format": "plain",
             "optimizer": {
-                "state": {index: {"step": torch.tensor(1024)} for index in action_ids},
+            "state": {
+                index: {"step": torch.tensor(optimizer_steps)}
+                for index in action_ids
+            },
                 "param_groups": [
                     {"lr": 3e-5, "base_lr": 3e-5, "params": []},
                     {"lr": 1.2e-4, "base_lr": 1.2e-4, "params": action_ids},
@@ -93,11 +100,11 @@ def _complete_run(
         "world_size": 8,
         "batch_size": 64,
         "effective_global_batch_size": 512,
-        "max_steps": 1024,
-        "steps_completed": 1024,
-        "training_row_draws": 524_288,
-        "base_training_row_draws": 524_288,
-        "total_training_row_draws": 524_288,
+        "max_steps": optimizer_steps,
+        "steps_completed": optimizer_steps,
+        "training_row_draws": optimizer_steps * 512,
+        "base_training_row_draws": optimizer_steps * 512,
+        "total_training_row_draws": optimizer_steps * 512,
         "optimizer": "adam",
         "resume_optimizer": False,
         "optimizer_restored": False,
@@ -171,10 +178,10 @@ def _complete_run(
         },
         "metrics": [
             {
-                "samples": 524_288,
-                "policy_total_active_rows": 64_309,
+                "samples": optimizer_steps * 512,
+                "policy_total_active_rows": max(1, optimizer_steps * 63),
                 "optimizer_observability": {
-                    "observed_steps": 1024,
+                    "observed_steps": optimizer_steps,
                     "zero_objective_steps_skipped": 0,
                 },
                 "validation_objective_matched": {
@@ -195,7 +202,7 @@ def _complete_run(
         "status": "complete",
         "checkpoint": completion._compact_ref(checkpoint),  # noqa: SLF001
         "optimizer": completion._compact_ref(optimizer),  # noqa: SLF001
-        "optimizer_step": 1024,
+        "optimizer_step": optimizer_steps,
         "completed_epochs": 1,
         "recipe_identity": {
             "schema_version": "train-bc-resume-recipe-v1",
@@ -247,6 +254,7 @@ def test_completion_proves_exact_geometry_rng_optimizer_and_model_delta(
         "action_group_parameter_tensors": 4,
         "action_group_lr": 1.2e-4,
         "optimizer_state_tensors": 4,
+        "optimizer_state_step": 1024,
     }
     assert receipt["rng_summary"] == {
         "rank_torch_rng_states": 8,
@@ -262,11 +270,34 @@ def test_completion_proves_exact_geometry_rng_optimizer_and_model_delta(
     assert receipt["model_delta"]["changed_parameter_tensors"] == list(
         completion.EXPECTED_CHANGED_PARAMETERS
     )
-    assert receipt["report_summary"]["policy_active_rows"] == 64_309
+    assert receipt["report_summary"]["policy_active_rows"] == 64_512
     assert (
         completion.verify_completion(manifest.parent / completion.COMPLETION_NAME)
         == receipt
     )
+
+
+def test_completion_proves_short_128_step_dose_end_to_end(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manifest, checkpoint, _args = _complete_run(
+        tmp_path, monkeypatch, optimizer_steps=128
+    )
+    receipt = completion.finalize(
+        manifest,
+        expected_checkpoint_sha256=completion._file_ref(checkpoint)[  # noqa: SLF001
+            "sha256"
+        ],
+        state_reader=_state_reader,
+    )
+
+    assert receipt["verified_recipe"]["optimizer_steps"] == 128
+    assert receipt["verified_recipe"]["global_row_dose"] == 65_536
+    assert receipt["optimizer_groups"]["optimizer_state_step"] == 128
+    assert receipt["report_summary"]["total_row_dose"] == 65_536
+    assert completion.verify_completion(
+        manifest.parent / completion.COMPLETION_NAME
+    ) == receipt
 
 
 @pytest.mark.parametrize(
