@@ -119,6 +119,20 @@ def test_sigma_reference_visits_threads_through_worker_args(monkeypatch) -> None
     assert captured["search_config"].sigma_reference_visits == 17
 
 
+def test_belief_target_aggregation_threads_through_worker_args(monkeypatch) -> None:
+    captured = _capture_configs(monkeypatch)
+    cli._run_worker(
+        _worker_args(
+            information_set_search=True,
+            information_set_target_aggregation="aggregate_q_then_improve",
+            sigma_reference_visits=8,
+        )
+    )
+    config = captured["search_config"]
+    assert config.information_set_target_aggregation == "aggregate_q_then_improve"
+    assert config.sigma_reference_visits == 8
+
+
 # --------------------------------------------------------------------------- D6 root denoising wiring
 
 

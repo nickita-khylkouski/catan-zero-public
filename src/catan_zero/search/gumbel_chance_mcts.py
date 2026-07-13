@@ -652,6 +652,18 @@ class GumbelChanceMCTSConfig:
     # None is the exact historical behavior.
     sigma_reference_visits: int | None = None
 
+    # How public-belief particles are combined into the emitted POLICY target.
+    # ``mean_improved_policy`` is the historical operator:
+    # E_world[softmax(log(prior_world) + sigma(minmax(completed_q_world)))].
+    # ``aggregate_q_then_improve`` is an experimental target-only operator:
+    # uniformly aggregate action-aligned completed-Q evidence first, then apply
+    # one min-max/sigma improvement.  Gameplay selection is
+    # deliberately left on the historical mean policy so this arm isolates the
+    # learner target.  The experimental mode fails closed unless every particle
+    # attests root-actor Q perspective and exposes completed-Q for every legal
+    # action.
+    information_set_target_aggregation: str = "mean_improved_policy"
+
 
 @dataclass(frozen=True, slots=True)
 class SearchResult:
@@ -664,6 +676,18 @@ class SearchResult:
     used_full_search: bool
     simulations_used: int
     afterstate_values: dict[int, float] = field(default_factory=dict)
+    # Evidence required to construct a belief-level completed-Q target.  These
+    # append-only defaults preserve every existing SearchResult constructor.
+    # Every root action is present: unvisited actions already carry mctx's
+    # per-world v_mix completion.  Aggregating this evidence uniformly avoids
+    # conditioning an action's value on only the worlds where SH visited it.
+    completed_q_values: dict[int, float] = field(default_factory=dict)
+    # q_values/completed_q_values are only safe to combine across
+    # determinizations when both are expressed from the root actor's
+    # perspective. Real Python/native searches attest that shared contract;
+    # synthetic/old-wheel results default false and experimental aggregation
+    # refuses them.
+    q_values_root_perspective: bool = False
 
 
 @dataclass(slots=True)
@@ -813,6 +837,31 @@ class GumbelChanceMCTS:
             and int(self.config.sigma_reference_visits) < 0
         ):
             raise ValueError("sigma_reference_visits must be non-negative")
+        if self.config.information_set_target_aggregation not in {
+            "mean_improved_policy",
+            "aggregate_q_then_improve",
+        }:
+            raise ValueError(
+                "information_set_target_aggregation must be "
+                "'mean_improved_policy' or 'aggregate_q_then_improve'"
+            )
+        if (
+            self.config.information_set_target_aggregation
+            != "mean_improved_policy"
+            and not bool(self.config.information_set_search)
+        ):
+            raise ValueError(
+                "aggregate_q_then_improve requires information_set_search=True"
+            )
+        if (
+            self.config.information_set_target_aggregation
+            == "aggregate_q_then_improve"
+            and self.config.sigma_reference_visits is None
+        ):
+            raise ValueError(
+                "aggregate_q_then_improve requires sigma_reference_visits so "
+                "particle-count/budget changes cannot silently sharpen targets"
+            )
         if bool(self.config.information_set_search) and bool(
             self.config.belief_chance_spectra
         ):
@@ -1017,8 +1066,19 @@ class GumbelChanceMCTS:
                     -int(action),
                 ),
             )
+        target_policy = improved
+        if (
+            self.config.information_set_target_aggregation
+            == "aggregate_q_then_improve"
+            and len(legal_actions) > 1
+        ):
+            target_policy = self._belief_level_improved_policy(
+                results,
+                legal_actions=legal_actions,
+                aggregate_priors=priors,
+            )
         training_policy = _prune_policy_target(
-            improved,
+            target_policy,
             visit_counts,
             min_visits=int(self.config.policy_target_min_visits),
         )
@@ -1032,7 +1092,117 @@ class GumbelChanceMCTS:
             used_full_search=bool(used_full_search),
             simulations_used=sum(result.simulations_used for result in results),
             afterstate_values=afterstate_values,
+            completed_q_values={
+                action: sum(
+                    float(result.completed_q_values[action])
+                    for result in results
+                )
+                / count
+                for action in legal_actions
+                if all(action in result.completed_q_values for result in results)
+            },
+            q_values_root_perspective=all(
+                result.q_values_root_perspective for result in results
+            ),
         )
+
+    def _belief_level_improved_policy(
+        self,
+        results: list[SearchResult],
+        *,
+        legal_actions: tuple[int, ...],
+        aggregate_priors: dict[int, float],
+    ) -> dict[int, float]:
+        """Improve once after uniform hidden-world completed-Q aggregation.
+
+        Each particle first applies the existing mctx completion in its own
+        hidden world: visited actions retain root-actor Q and unvisited actions
+        receive that world's prior-weighted ``v_mix``.  Uniformly averaging the
+        full action vectors avoids conditioning an action's value on only worlds
+        where Sequential Halving happened to visit it.  One minmax/noise-floor/
+        fixed-sigma transform is applied after averaging.  Mean per-particle
+        visits are carried only for the optional D1 noise-floor calculation.
+        """
+        if not results:
+            raise RuntimeError("belief target aggregation requires particles")
+
+        legal = set(legal_actions)
+        particle_count = len(results)
+        for index, result in enumerate(results):
+            if not result.q_values_root_perspective:
+                raise RuntimeError(
+                    f"particle {index} does not attest root-actor Q perspective"
+                )
+            if set(result.priors) != legal:
+                raise RuntimeError(
+                    f"particle {index} prior support does not match root actions"
+                )
+            if not set(result.q_values).issubset(legal):
+                raise RuntimeError(f"particle {index} Q support is not root-aligned")
+            if set(result.completed_q_values) != legal:
+                raise RuntimeError(
+                    f"particle {index} completed-Q support does not match root actions"
+                )
+            if not all(
+                math.isfinite(float(value))
+                for value in result.completed_q_values.values()
+            ):
+                raise RuntimeError(
+                    f"particle {index} contains non-finite completed-Q evidence"
+                )
+            for action in legal_actions:
+                visits = int(result.visit_counts.get(action, 0))
+                has_q = action in result.q_values
+                if has_q != (visits > 0):
+                    raise RuntimeError(
+                        f"particle {index} action {action} has incompatible "
+                        "Q/visit coverage"
+                    )
+                if has_q and not math.isfinite(float(result.q_values[action])):
+                    raise RuntimeError(
+                        f"particle {index} action {action} has non-finite Q"
+                    )
+
+        completed_q = {
+            action: sum(
+                float(result.completed_q_values[action]) for result in results
+            )
+            / float(particle_count)
+            for action in legal_actions
+        }
+        # Reuse the exact existing minmax/noise-floor/sigma implementation on a
+        # synthetic belief root. Its action visits, priors, and logits are
+        # uniform particle means, so duplicating particles is invariant.
+        belief_root = _GNode(
+            game=None,
+            root_color="__belief_root__",
+            prior_value=0.0,
+            actions={
+                action: _GAction(
+                    prior=float(aggregate_priors[action]),
+                    visits=max(
+                        int(
+                            round(
+                                sum(
+                                    result.visit_counts.get(action, 0)
+                                    for result in results
+                                )
+                                / float(particle_count)
+                            )
+                        ),
+                        0,
+                    ),
+                )
+                for action in legal_actions
+            },
+            action_logits={
+                action: math.log(max(float(aggregate_priors[action]), 1.0e-8))
+                / max(float(self.config.prior_temperature), 1.0e-6)
+                for action in legal_actions
+            },
+            expanded=True,
+        )
+        return self._improved_policy(belief_root, completed_q)
 
     def _search_single_world(
         self,
@@ -1149,6 +1319,10 @@ class GumbelChanceMCTS:
             used_full_search=use_full,
             simulations_used=used,
             afterstate_values=afterstate_values,
+            completed_q_values={
+                int(action): float(value) for action, value in completed_q.items()
+            },
+            q_values_root_perspective=True,
         )
 
     def _raw_policy_root_result(self, game: Any, root_color: str) -> SearchResult:
@@ -1177,6 +1351,10 @@ class GumbelChanceMCTS:
             root_value=root.value,
             used_full_search=False,
             simulations_used=0,
+            completed_q_values={
+                action: float(root.prior_value) for action in priors
+            },
+            q_values_root_perspective=True,
         )
 
     def _forced_single_action_result(
@@ -1222,6 +1400,10 @@ class GumbelChanceMCTS:
                 root_value=float(max(min(value, 1.0), -1.0)),
                 used_full_search=True,
                 simulations_used=0,
+                completed_q_values={
+                    action: float(max(min(value, 1.0), -1.0))
+                },
+                q_values_root_perspective=True,
             )
 
         cached_spectrum = spectrum_by_id.get(action) if spectrum_by_id else None
@@ -1245,6 +1427,8 @@ class GumbelChanceMCTS:
             used_full_search=True,
             simulations_used=0,
             afterstate_values={action: afterstate_value},
+            completed_q_values={action: float(root_value)},
+            q_values_root_perspective=True,
         )
 
     # ------------------------------------------------------------------

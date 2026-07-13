@@ -213,6 +213,28 @@ def test_native_sigma_reference_refuses_unadvertised_old_wheel(monkeypatch) -> N
         search._validate_native_semantics()
 
 
+def test_native_belief_target_refuses_wheel_without_evidence_capability(
+    monkeypatch,
+) -> None:
+    rust = pytest.importorskip("catanatron_rs")
+    monkeypatch.setattr(
+        rust,
+        "gumbel_search_capabilities",
+        lambda: ["sigma_reference_visits"],
+        raising=False,
+    )
+    search = object.__new__(NativeGumbelChanceMCTS)
+    search.config = GumbelChanceMCTSConfig(
+        information_set_search=True,
+        information_set_target_aggregation="aggregate_q_then_improve",
+        sigma_reference_visits=8,
+    )
+    search.using_native_hot_loop = True
+
+    with pytest.raises(ValueError, match="belief_target_evidence"):
+        search._validate_native_semantics()
+
+
 @pytest.mark.skipif(
     not native_hot_loop_available(), reason="native wheel lacks gumbel_search"
 )

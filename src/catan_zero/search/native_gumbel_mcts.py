@@ -68,6 +68,20 @@ class NativeGumbelChanceMCTS(GumbelChanceMCTS):
                     "sigma_reference_visits requires a native wheel advertising "
                     "the matching calibration capability"
                 )
+        if (
+            self.using_native_hot_loop
+            and self.config.information_set_target_aggregation
+            == "aggregate_q_then_improve"
+        ):
+            import catanatron_rs  # type: ignore
+
+            capability_fn = getattr(catanatron_rs, "gumbel_search_capabilities", None)
+            capabilities = set(capability_fn()) if callable(capability_fn) else set()
+            if "belief_target_evidence" not in capabilities:
+                unsupported.append(
+                    "aggregate_q_then_improve requires a native wheel advertising "
+                    "belief_target_evidence"
+                )
         if unsupported:
             raise ValueError(
                 "native MCTS hot loop does not implement the requested reference "
@@ -230,6 +244,13 @@ class NativeGumbelChanceMCTS(GumbelChanceMCTS):
                 int(key): float(value)
                 for key, value in raw["afterstate_values"].items()
             },
+            completed_q_values={
+                int(key): float(value)
+                for key, value in raw.get("completed_q_values", {}).items()
+            },
+            q_values_root_perspective=bool(
+                raw.get("q_values_root_perspective", False)
+            ),
         )
 
 

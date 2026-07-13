@@ -295,6 +295,9 @@ pub struct SearchResult {
     pub q_values: Vec<(usize, f64)>,
     pub priors: Vec<(usize, f64)>,
     pub root_value: f64,
+    /// Root-actor completed-Q for every legal root action.  Unvisited actions
+    /// carry the ordinary per-world mctx mixed-value completion.
+    pub completed_q_values: Vec<(usize, f64)>,
     pub used_full_search: bool,
     pub simulations_used: i32,
     pub afterstate_values: Vec<(usize, f64)>,
@@ -430,6 +433,10 @@ impl GumbelMctsEngine {
             .iter()
             .map(|(&i, s)| Ok((to_global(i)?, s.prior)))
             .collect::<Result<_, String>>()?;
+        let mut completed_q_values: Vec<_> = completed_q
+            .iter()
+            .map(|(&local, value)| Ok((to_global(local)?, *value)))
+            .collect::<Result<_, String>>()?;
         let mut afterstate_values: Vec<_> = root
             .actions
             .iter()
@@ -479,6 +486,7 @@ impl GumbelMctsEngine {
         visit_counts.sort_unstable_by_key(|(action, _)| *action);
         q_values.sort_unstable_by_key(|(action, _)| *action);
         priors.sort_unstable_by_key(|(action, _)| *action);
+        completed_q_values.sort_unstable_by_key(|(action, _)| *action);
         afterstate_values.sort_unstable_by_key(|(action, _)| *action);
         training_policy.sort_unstable_by_key(|(action, _)| *action);
         Ok(SearchResult {
@@ -488,6 +496,7 @@ impl GumbelMctsEngine {
             q_values,
             priors,
             root_value: root.value(),
+            completed_q_values,
             used_full_search: use_full,
             simulations_used: used,
             afterstate_values,
@@ -1297,6 +1306,7 @@ impl GumbelMctsEngine {
                 q_values: vec![],
                 priors: vec![(action_id, 1.0)],
                 root_value: value.clamp(-1.0, 1.0),
+                completed_q_values: vec![(action_id, value.clamp(-1.0, 1.0))],
                 used_full_search: true,
                 simulations_used: 0,
                 afterstate_values: vec![],
@@ -1335,6 +1345,7 @@ impl GumbelMctsEngine {
             q_values: vec![],
             priors: vec![(action_id, 1.0)],
             root_value,
+            completed_q_values: vec![(action_id, root_value)],
             used_full_search: true,
             simulations_used: 0,
             afterstate_values: vec![(action_id, root_value)],
@@ -1374,6 +1385,10 @@ impl GumbelMctsEngine {
             })
             .map(|(i, _)| *i)
             .unwrap_or(0);
+        let completed_q_values = priors_vec
+            .iter()
+            .map(|(action, _)| (*action, arena.get(root_idx).prior_value))
+            .collect();
         Ok(SearchResult {
             selected_action: selected,
             improved_policy: priors_vec.clone(),
@@ -1381,6 +1396,7 @@ impl GumbelMctsEngine {
             q_values: vec![],
             priors: priors_vec,
             root_value: arena.get(root_idx).value(),
+            completed_q_values,
             used_full_search: false,
             simulations_used: 0,
             afterstate_values: vec![],

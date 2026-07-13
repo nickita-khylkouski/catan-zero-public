@@ -360,6 +360,12 @@ fn gumbel_search(
     }
     out.set_item("priors", priors_dict)?;
     out.set_item("root_value", result.root_value)?;
+    let completed_q_dict = PyDict::new(py);
+    for (aid, q) in &result.completed_q_values {
+        completed_q_dict.set_item(aid, *q)?;
+    }
+    out.set_item("completed_q_values", completed_q_dict)?;
+    out.set_item("q_values_root_perspective", true)?;
     out.set_item("used_full_search", result.used_full_search)?;
     out.set_item("simulations_used", result.simulations_used)?;
     let asv_dict = PyDict::new(py);
@@ -376,7 +382,7 @@ fn gumbel_search(
 
 #[pyfunction]
 fn gumbel_search_capabilities() -> Vec<&'static str> {
-    vec!["sigma_reference_visits"]
+    vec!["sigma_reference_visits", "belief_target_evidence"]
 }
 
 pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {

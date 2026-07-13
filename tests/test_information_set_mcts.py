@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import math
 import random
+from dataclasses import replace
 from types import MethodType, SimpleNamespace
 
 import pytest
@@ -152,6 +154,163 @@ def test_information_set_search_fails_closed_without_native_determinizer() -> No
     game = SimpleNamespace(current_color=lambda: "RED")
     with pytest.raises(RuntimeError, match="determinize_for_player"):
         _mcts().search(game, force_full=True)
+
+
+def _belief_result(
+    *,
+    q_values: dict[int, float],
+    visits: dict[int, int],
+    improved: dict[int, float] | None = None,
+    completed_q: dict[int, float] | None = None,
+) -> SearchResult:
+    return SearchResult(
+        selected_action=11,
+        improved_policy=improved or {11: 0.5, 12: 0.5},
+        visit_counts=visits,
+        q_values=q_values,
+        priors={11: 0.5, 12: 0.5},
+        root_value=0.0,
+        used_full_search=True,
+        simulations_used=sum(visits.values()),
+        completed_q_values=completed_q or {11: 0.0, 12: 0.0},
+        q_values_root_perspective=True,
+    )
+
+
+def _belief_target_mcts(*, sigma_reference_visits: int = 8) -> GumbelChanceMCTS:
+    mcts = object.__new__(GumbelChanceMCTS)
+    mcts.config = GumbelChanceMCTSConfig(
+        information_set_search=True,
+        information_set_target_aggregation="aggregate_q_then_improve",
+        sigma_reference_visits=sigma_reference_visits,
+        c_visit=0.0,
+        c_scale=1.0,
+    )
+    mcts.rng = random.Random(7)
+    return mcts
+
+
+def test_belief_target_uniformly_weights_worlds_not_visits() -> None:
+    mcts = _belief_target_mcts()
+    results = [
+        _belief_result(
+            q_values={11: 1.0, 12: 0.0},
+            visits={11: 100, 12: 1},
+            completed_q={11: 1.0, 12: 0.0},
+        ),
+        _belief_result(
+            q_values={11: -1.0, 12: 0.0},
+            visits={11: 1, 12: 100},
+            completed_q={11: -1.0, 12: 0.0},
+        ),
+    ]
+    target = mcts._belief_level_improved_policy(
+        results,
+        legal_actions=(11, 12),
+        aggregate_priors={11: 0.5, 12: 0.5},
+    )
+    assert target == pytest.approx({11: 0.5, 12: 0.5})
+
+
+def test_belief_target_one_particle_matches_ordinary_completed_q() -> None:
+    mcts = _belief_target_mcts(sigma_reference_visits=4)
+    result = _belief_result(
+        q_values={11: 0.75},
+        visits={11: 4, 12: 0},
+        completed_q={11: 0.75, 12: 0.64},
+    )
+    target = mcts._belief_level_improved_policy(
+        [result],
+        legal_actions=(11, 12),
+        aggregate_priors={11: 0.5, 12: 0.5},
+    )
+    root = _GNode(
+        game=SimpleNamespace(current_color=lambda: "RED"),
+        root_color="RED",
+        prior_value=0.2,
+        actions={
+            11: _GAction(prior=0.5, visits=4, value_sum=3.0),
+            12: _GAction(prior=0.5),
+        },
+        action_logits={11: math.log(0.5), 12: math.log(0.5)},
+    )
+    expected = mcts._improved_policy(root, mcts._completed_q(root))
+    assert target == pytest.approx(expected)
+
+
+def test_fixed_sigma_makes_p4_and_duplicated_p8_target_equivalent() -> None:
+    mcts = _belief_target_mcts(sigma_reference_visits=8)
+    p4 = [
+        _belief_result(
+            q_values={11: 0.1}, visits={11: 8, 12: 0}, completed_q={11: 0.1, 12: 0.05}
+        ),
+        _belief_result(
+            q_values={12: -0.3}, visits={11: 0, 12: 8}, completed_q={11: -0.1, 12: -0.3}
+        ),
+        _belief_result(
+            q_values={11: -0.2, 12: 0.2},
+            visits={11: 4, 12: 4},
+            completed_q={11: -0.2, 12: 0.2},
+        ),
+        _belief_result(
+            q_values={11: 0.4, 12: -0.4},
+            visits={11: 4, 12: 4},
+            completed_q={11: 0.4, 12: -0.4},
+        ),
+    ]
+
+    def target(results: list[SearchResult]) -> dict[int, float]:
+        return mcts._belief_level_improved_policy(
+            results,
+            legal_actions=(11, 12),
+            aggregate_priors={11: 0.5, 12: 0.5},
+        )
+
+    assert target(p4) == pytest.approx(target(p4 + p4), abs=1.0e-12)
+
+
+def test_belief_target_changes_training_target_not_selected_action() -> None:
+    mcts = _belief_target_mcts()
+    results = [
+        _belief_result(
+            q_values={11: -0.5, 12: 0.5},
+            visits={11: 4, 12: 4},
+            improved={11: 0.9, 12: 0.1},
+            completed_q={11: -0.5, 12: 0.5},
+        )
+    ]
+    aggregated = mcts._aggregate_information_set_results(
+        results, legal_actions=(11, 12), used_full_search=True
+    )
+    assert aggregated.selected_action == 11
+    assert aggregated.improved_policy[12] > aggregated.improved_policy[11]
+
+
+def test_belief_target_fails_closed_without_q_perspective_attestation() -> None:
+    mcts = _belief_target_mcts()
+    result = _belief_result(
+        q_values={11: 0.2},
+        visits={11: 1, 12: 0},
+        completed_q={11: 0.2, 12: 0.0},
+    )
+    result = replace(result, q_values_root_perspective=False)
+    with pytest.raises(RuntimeError, match="root-actor Q perspective"):
+        mcts._belief_level_improved_policy(
+            [result],
+            legal_actions=(11, 12),
+            aggregate_priors={11: 0.5, 12: 0.5},
+        )
+
+
+def test_belief_target_requires_fixed_sigma_reference() -> None:
+    with pytest.raises(ValueError, match="requires sigma_reference_visits"):
+        GumbelChanceMCTS(
+            GumbelChanceMCTSConfig(
+                information_set_search=True,
+                information_set_target_aggregation="aggregate_q_then_improve",
+            ),
+            SimpleNamespace(),
+        )
 
 
 def test_actor_turn_boundary_stops_on_opponent_or_new_turn() -> None:

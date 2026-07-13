@@ -255,7 +255,8 @@ def _validate_science_args(
             parser.error(f"--{name.replace('_', '-')} must be finite (got {value!r})")
     if not 0.0 <= float(args.p_full) <= 1.0:
         parser.error(f"--p-full must be in [0, 1] (got {args.p_full!r})")
-    if args.sigma_reference_visits is not None and int(args.sigma_reference_visits) < 0:
+    sigma_reference_visits = getattr(args, "sigma_reference_visits", None)
+    if sigma_reference_visits is not None and int(sigma_reference_visits) < 0:
         parser.error("--sigma-reference-visits must be non-negative")
     if args.temperature_move_fraction is not None:
         value = float(args.temperature_move_fraction)
@@ -278,16 +279,17 @@ def _validate_science_args(
             "--information-set-search cannot be combined with "
             "--belief-chance-spectra"
         )
-    if information_set and args.n_full_wide is not None:
+    n_full_wide = getattr(args, "n_full_wide", None)
+    if information_set and n_full_wide is not None:
         base_budgets = information_set_particle_budgets(
             int(args.n_full),
-            int(args.determinization_particles),
-            int(args.determinization_min_simulations),
+            int(getattr(args, "determinization_particles", 1)),
+            int(getattr(args, "determinization_min_simulations", 32)),
         )
         wide_budgets = information_set_particle_budgets(
-            int(args.n_full_wide),
-            int(args.determinization_particles),
-            int(args.determinization_min_simulations),
+            int(n_full_wide),
+            int(getattr(args, "determinization_particles", 1)),
+            int(getattr(args, "determinization_min_simulations", 32)),
         )
         per_particle_doses = set(base_budgets + wide_budgets)
         if len(per_particle_doses) != 1:
@@ -773,6 +775,16 @@ def build_parser() -> argparse.ArgumentParser:
         "n128 use four particles and n16 use one.",
     )
     parser.add_argument(
+        "--information-set-target-aggregation",
+        choices=("mean_improved_policy", "aggregate_q_then_improve"),
+        default="mean_improved_policy",
+        help="Opt-in PIMC learner-target operator. Legacy mean_improved_policy "
+        "averages per-world improved policies. aggregate_q_then_improve "
+        "uniformly aggregates root Q/coverage first and improves once; gameplay "
+        "selection remains legacy. Requires --information-set-search and an "
+        "explicit --sigma-reference-visits.",
+    )
+    parser.add_argument(
         "--opponent-pool-manifest",
         default=None,
         help="Archived-opponent pool (anti-forgetting, H2): JSON manifest "
@@ -1008,6 +1020,17 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "--information-set-search requires a catanatron_rs wheel exposing "
                 "Game.determinize_for_player"
             )
+    if str(args.information_set_target_aggregation) == "aggregate_q_then_improve":
+        if not bool(args.information_set_search):
+            parser.error(
+                "--information-set-target-aggregation aggregate_q_then_improve "
+                "requires --information-set-search"
+            )
+        if args.sigma_reference_visits is None:
+            parser.error(
+                "--information-set-target-aggregation aggregate_q_then_improve "
+                "requires --sigma-reference-visits"
+            )
 
     # CAT-126 #4: auto-scale shard size by n-full unless the caller pinned it.
     if not _shard_size_was_explicit(_raw_argv) and "shard_size" not in config_filled:
@@ -1237,6 +1260,9 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "determinization_particles": int(args.determinization_particles),
                 "determinization_min_simulations": int(
                     args.determinization_min_simulations
+                ),
+                "information_set_target_aggregation": str(
+                    args.information_set_target_aggregation
                 ),
                 "opponent_pool_manifest": args.opponent_pool_manifest,
                 "opponent_mix_manifest": args.opponent_mix_manifest,
@@ -1811,6 +1837,11 @@ def _run_worker(
         determinization_particles=int(worker_args.get("determinization_particles", 1)),
         determinization_min_simulations=int(
             worker_args.get("determinization_min_simulations", 32)
+        ),
+        information_set_target_aggregation=str(
+            worker_args.get(
+                "information_set_target_aggregation", "mean_improved_policy"
+            )
         ),
         rescale_noise_floor_c=float(worker_args.get("rescale_noise_floor_c", 0.0)),
         sigma_eval=float(worker_args.get("sigma_eval", 0.79)),
