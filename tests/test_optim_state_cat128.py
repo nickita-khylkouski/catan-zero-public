@@ -265,6 +265,194 @@ def test_train_bc_restores_rank_local_numpy_sampler_rng() -> None:
     assert np.array_equal(resumed_rng.random(4), rank1_expected)
 
 
+def test_symmetry_rng_is_deterministic_rank_distinct_and_topology_bound() -> None:
+    tb = _load_train_bc()
+    np = __import__("numpy")
+
+    streams = [
+        tb._initialize_symmetry_rng(
+            17,
+            {"enabled": True, "world_size": 4, "rank": rank, "local_rank": rank},
+        )
+        for rank in range(4)
+    ]
+    draws = [stream.integers(0, 12, size=64) for stream in streams]
+
+    assert all(not np.array_equal(draws[0], other) for other in draws[1:])
+    replay = tb._initialize_symmetry_rng(
+        17, {"enabled": True, "world_size": 4, "rank": 0, "local_rank": 0}
+    )
+    assert np.array_equal(draws[0], replay.integers(0, 12, size=64))
+    different_topology = tb._initialize_symmetry_rng(
+        17, {"enabled": True, "world_size": 8, "rank": 0, "local_rank": 0}
+    )
+    assert not np.array_equal(
+        draws[0], different_topology.integers(0, 12, size=64)
+    )
+
+
+def test_train_bc_restores_exact_rank_local_symmetry_rng() -> None:
+    tb = _load_train_bc()
+    np = __import__("numpy")
+    rank_rngs = [
+        tb._initialize_symmetry_rng(
+            23,
+            {"enabled": True, "world_size": 2, "rank": rank, "local_rank": rank},
+        )
+        for rank in range(2)
+    ]
+    rank_rngs[0].integers(0, 12, size=3)
+    rank_rngs[1].integers(0, 12, size=9)
+    states = [rng.bit_generator.state for rng in rank_rngs]
+    expected_rank1 = rank_rngs[1].integers(0, 12, size=8)
+    restored_symmetry_rng = np.random.default_rng(999)
+    sampler_rng = np.random.default_rng(1)
+    torch_state = torch.get_rng_state().tolist()
+    progress = {
+        "optimizer_step": 7,
+        "completed_epochs": 1,
+        "rng_state": sampler_rng.bit_generator.state,
+        "rank_numpy_rng_states": [
+            sampler_rng.bit_generator.state,
+            sampler_rng.bit_generator.state,
+        ],
+        "symmetry_rng_state": tb._rank_symmetry_rng_progress_payload(
+            states, world_size=2
+        ),
+        "rank_torch_rng_states": [
+            {"rank": 0, "cpu": torch_state, "cuda": None},
+            {"rank": 1, "cpu": torch_state, "cuda": None},
+        ],
+        "scalar_training_weight_sum": 0.0,
+        "categorical_training_weight_sum": 0.0,
+    }
+
+    tb._restore_training_progress_state(
+        progress,
+        epochs=2,
+        rng=sampler_rng,
+        symmetry_rng=restored_symmetry_rng,
+        ddp={"enabled": True, "world_size": 2, "rank": 1, "local_rank": 1},
+    )
+
+    assert np.array_equal(
+        restored_symmetry_rng.integers(0, 12, size=8), expected_rank1
+    )
+
+
+def test_train_bc_checkpoint_gathers_every_rank_symmetry_rng(monkeypatch) -> None:
+    tb = _load_train_bc()
+    np = __import__("numpy")
+    import catan_zero.rl.optim_state as optim_state
+    import torch.distributed as dist
+
+    sampler_rng = np.random.default_rng(31)
+    rank0_symmetry_rng = tb._initialize_symmetry_rng(
+        41, {"enabled": True, "world_size": 2, "rank": 0, "local_rank": 0}
+    )
+    rank1_symmetry_rng = tb._initialize_symmetry_rng(
+        41, {"enabled": True, "world_size": 2, "rank": 1, "local_rank": 1}
+    )
+    rank0_symmetry_rng.integers(0, 12, size=2)
+    rank1_symmetry_rng.integers(0, 12, size=7)
+    expected_rank_states = [
+        rank0_symmetry_rng.bit_generator.state,
+        rank1_symmetry_rng.bit_generator.state,
+    ]
+    gather_calls = 0
+
+    def fake_all_gather_object(outputs, local) -> None:
+        nonlocal gather_calls
+        if gather_calls == 0:
+            outputs[0] = local
+            outputs[1] = {**local, "rank": 1}
+        elif gather_calls == 1:
+            outputs[0] = local
+            outputs[1] = local
+        elif gather_calls == 2:
+            outputs[:] = expected_rank_states
+        else:  # pragma: no cover - catches accidental extra collectives
+            raise AssertionError("unexpected RNG collective")
+        gather_calls += 1
+
+    captured: dict[str, object] = {}
+
+    def fake_save_training_progress(_checkpoint_path, **kwargs):
+        captured.update(kwargs)
+        return None
+
+    monkeypatch.setattr(dist, "all_gather_object", fake_all_gather_object)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(
+        optim_state, "save_training_progress", fake_save_training_progress
+    )
+
+    tb._save_training_progress_sidecar(
+        "candidate.pt",
+        optimizer_saved=Path("candidate.pt.optimizer.pt"),
+        optimizer_step=11,
+        completed_epochs=1,
+        recipe_identity={"world_size": 2},
+        rng=sampler_rng,
+        symmetry_rng=rank0_symmetry_rng,
+        scalar_training_weight_sum=2.0,
+        categorical_training_weight_sum=0.0,
+        ddp={"enabled": True, "world_size": 2, "rank": 0, "local_rank": 0},
+    )
+
+    assert gather_calls == 3
+    assert captured["symmetry_rng_state"] == {
+        "schema_version": "train-bc-rank-symmetry-rng-v1",
+        "world_size": 2,
+        "rank_states": expected_rank_states,
+    }
+
+
+@pytest.mark.parametrize("failure", ["legacy", "world_size", "missing_rank"])
+def test_distributed_symmetry_resume_fails_closed(failure: str) -> None:
+    tb = _load_train_bc()
+    np = __import__("numpy")
+    source = np.random.default_rng(7)
+    states = [source.bit_generator.state, source.bit_generator.state]
+    if failure == "legacy":
+        saved_symmetry_state = states[0]
+    else:
+        saved_symmetry_state = tb._rank_symmetry_rng_progress_payload(
+            states, world_size=2
+        )
+        if failure == "world_size":
+            saved_symmetry_state["world_size"] = 3
+        else:
+            saved_symmetry_state["rank_states"] = states[:1]
+    sampler_rng = np.random.default_rng(1)
+    torch_state = torch.get_rng_state().tolist()
+    progress = {
+        "optimizer_step": 7,
+        "completed_epochs": 1,
+        "rng_state": sampler_rng.bit_generator.state,
+        "rank_numpy_rng_states": [
+            sampler_rng.bit_generator.state,
+            sampler_rng.bit_generator.state,
+        ],
+        "symmetry_rng_state": saved_symmetry_state,
+        "rank_torch_rng_states": [
+            {"rank": 0, "cpu": torch_state, "cuda": None},
+            {"rank": 1, "cpu": torch_state, "cuda": None},
+        ],
+        "scalar_training_weight_sum": 0.0,
+        "categorical_training_weight_sum": 0.0,
+    }
+
+    with pytest.raises(SystemExit, match="per-rank RNG|per-rank symmetry RNG"):
+        tb._restore_training_progress_state(
+            progress,
+            epochs=2,
+            rng=sampler_rng,
+            symmetry_rng=np.random.default_rng(9),
+            ddp={"enabled": True, "world_size": 2, "rank": 1, "local_rank": 1},
+        )
+
+
 def test_legacy_sharded_ddp_resume_without_rank_sampler_state_fails() -> None:
     tb = _load_train_bc()
     np = __import__("numpy")
