@@ -310,6 +310,55 @@ def _build(inputs: dict) -> dict:
     )
 
 
+def test_authenticated_probe_module_loads_only_lock_bound_archived_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "archived-repo"
+    probe_path = repo / "tools" / "a0_gen2b_probe.py"
+    probe_path.parent.mkdir(parents=True)
+    probe_path.write_text('MARKER = "authenticated-archive"\n', encoding="utf-8")
+    probe_sha = binding.a0._sha256(probe_path)
+    manifest_sha = "a" * 64
+    lock_path = tmp_path / "issued.lock.json"
+    lock_path.write_text(
+        json.dumps(
+            {
+                "manifest_sha256": manifest_sha,
+                "repo_root_at_seal": str(repo),
+                "code_inventory": [
+                    {
+                        "path": "tools/a0_gen2b_probe.py",
+                        "sha256": probe_sha,
+                        "size": probe_path.stat().st_size,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(binding, "_HISTORICAL_A0_LOCK_SHA256", binding.a0._sha256(lock_path))
+    monkeypatch.setattr(binding, "_HISTORICAL_A0_MANIFEST_SHA256", manifest_sha)
+    monkeypatch.setattr(binding, "_HISTORICAL_A0_PROBE_SHA256", probe_sha)
+
+    loaded = binding.authenticated_probe_module(lock_path)
+    assert loaded.MARKER == "authenticated-archive"
+    assert Path(loaded.__file__).resolve() == probe_path.resolve()
+
+    probe_path.write_text('MARKER = "substituted"\n', encoding="utf-8")
+    with pytest.raises(binding.a0.ContractError, match="bytes are unavailable"):
+        binding.authenticated_probe_module(lock_path)
+
+
+def test_nonallowlisted_lock_uses_current_probe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lock_path = tmp_path / "current.lock.json"
+    lock_path.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(binding, "_HISTORICAL_A0_LOCK_SHA256", "f" * 64)
+
+    assert binding.authenticated_probe_module(lock_path) is binding.a0
+
+
 def test_binding_verdict_passes_only_with_all_sealed_evidence(sealed_inputs: dict) -> None:
     verdict = _build(sealed_inputs)
     assert verdict["a0_binding_pass"] is True

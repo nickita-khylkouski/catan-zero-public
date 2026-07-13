@@ -30,11 +30,13 @@ experiment rather than adjudicate the sealed A0 protocol.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import math
 import sys
 from collections.abc import Mapping
 from pathlib import Path
+from types import ModuleType
 from typing import Any
 
 import numpy as np
@@ -54,6 +56,65 @@ GLOBAL_REGRESSION_LIMIT = 0.02
 CRITICAL_SLICE_REGRESSION_LIMIT = 0.05
 POLICY_DRIFT_LIMIT = 0.02
 _CALIBRATION_METRICS = ("brier", "value_rmse")
+
+# The sole issued A0 result predates the diagnostic-only acknowledgement added
+# to ``a0_gen2b_probe.py``.  Replaying that immutable result through today's
+# expanded manifest/argv semantics is not a scientific verification: it changes
+# the experiment after issuance.  The lock, manifest, and archived probe bytes
+# are all content-addressed, so admit exactly that one historical implementation
+# and no caller-selected compatibility mode.
+_HISTORICAL_A0_LOCK_SHA256 = (
+    "f912f29cf470abd9c29948ecbe067894c04aef05fc7bba59799747976dbb217b"
+)
+_HISTORICAL_A0_MANIFEST_SHA256 = (
+    "67355635e98e5ca7c22cad1ec310ead2dbcd0d714310e0f44121e5e1f9fb47f0"
+)
+_HISTORICAL_A0_PROBE_SHA256 = (
+    "2e1852d03c58bcfa661aead72e49de1cc7fa6868b0b3f8743665d32695412361"
+)
+_HISTORICAL_A0_PROBE_PATH = "tools/a0_gen2b_probe.py"
+
+
+def authenticated_probe_module(lock_path: Path) -> ModuleType:
+    """Return the implementation authenticated by ``lock_path``.
+
+    Current locks always use the checked-in module.  The one allowlisted issued
+    lock is replayed with the archived source file whose path, size, and SHA are
+    committed inside that exact lock.  No unsealed path or digest is executed.
+    """
+
+    lock_path = lock_path.expanduser().resolve(strict=True)
+    if a0._sha256(lock_path) != _HISTORICAL_A0_LOCK_SHA256:
+        return a0
+
+    lock = _load_json(lock_path, "historical A0 lock")
+    if lock.get("manifest_sha256") != _HISTORICAL_A0_MANIFEST_SHA256:
+        raise a0.ContractError("allowlisted historical A0 manifest hash drift")
+    inventory = {
+        str(row.get("path")): row
+        for row in lock.get("code_inventory", [])
+        if isinstance(row, Mapping)
+    }
+    probe_record = inventory.get(_HISTORICAL_A0_PROBE_PATH)
+    if not isinstance(probe_record, Mapping):
+        raise a0.ContractError("allowlisted historical A0 lock lacks probe provenance")
+    if str(probe_record.get("sha256")) != _HISTORICAL_A0_PROBE_SHA256:
+        raise a0.ContractError("allowlisted historical A0 probe hash drift")
+
+    repo_root = Path(str(lock.get("repo_root_at_seal", ""))).expanduser()
+    probe_path = (repo_root / _HISTORICAL_A0_PROBE_PATH).resolve(strict=True)
+    if a0._sha256(probe_path) != _HISTORICAL_A0_PROBE_SHA256:
+        raise a0.ContractError("archived historical A0 probe bytes are unavailable")
+    if int(probe_record.get("size", -1)) != probe_path.stat().st_size:
+        raise a0.ContractError("archived historical A0 probe size drift")
+
+    module_name = "_catan_zero_authenticated_historical_a0_probe"
+    spec = importlib.util.spec_from_file_location(module_name, probe_path)
+    if spec is None or spec.loader is None:
+        raise a0.ContractError("cannot load authenticated historical A0 probe")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def _load_json(path: Path, label: str) -> dict[str, Any]:
@@ -493,14 +554,18 @@ def build_binding_verdict(
     policy_drift_path: Path | None,
     repo_root: Path,
 ) -> dict[str, Any]:
-    lock = a0._load_and_verify_lock(lock_path, repo_root)
+    # Implementation selection is part of the verifier, never caller policy.
+    # This keeps the CLI, direct callers, and the pre-wave consumer identical
+    # and prevents dependency injection from redefining sealed semantics.
+    probe = authenticated_probe_module(lock_path)
+    lock = probe._load_and_verify_lock(lock_path, repo_root)
     result = _load_json(result_path, "A0 training result")
-    recomputed = a0._postflight(lock, repo_root)
+    recomputed = probe._postflight(lock, repo_root)
     if result != recomputed:
         raise a0.ContractError(
             "A0 result does not exactly match the sealed, recomputed postflight"
         )
-    if result.get("schema_version") != a0.RESULT_SCHEMA:
+    if result.get("schema_version") != probe.RESULT_SCHEMA:
         raise a0.ContractError("unsupported A0 training-result schema")
     if result.get("a0_interpretable") is not True or result.get(
         "scalar_reproduces_historical_failure"
