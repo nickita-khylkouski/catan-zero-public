@@ -161,6 +161,7 @@ def test_verify_refuses_preexisting_output(
     checkpoint.write_bytes(b"existing")
     with pytest.raises(executor.ExecutionError, match="output/claim already exists"):
         executor.verify(path)
+    assert executor.verify(path, require_fresh_outputs=False)["manifest"] == payload
 
 
 def test_idle_probe_requires_exactly_eight_b200s_and_no_compute() -> None:
