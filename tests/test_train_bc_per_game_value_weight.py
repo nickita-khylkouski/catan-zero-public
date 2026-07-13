@@ -175,3 +175,38 @@ def test_per_game_weight_quality_reports_equalization() -> None:
     assert report_off["total_weight_per_game"]["std"] > 0.0
     # On: per-game normalization drives the spread to ~0.
     assert report_on["total_weight_per_game"]["std"] == pytest.approx(0.0, abs=1e-6)
+
+
+def test_composite_reused_seed_is_two_independent_games() -> None:
+    """A seed is namespaced by component in a mixed learner corpus."""
+
+    class _Composite(dict):
+        component_offsets = (0, 2, 5)
+
+    data = _Composite(
+        action_taken=np.zeros(5, dtype=np.int16),
+        # Both components legitimately use seed 7, but they contain different
+        # games with two and three rows respectively.
+        game_seed=np.asarray([7, 7, 7, 7, 7], dtype=np.int64),
+    )
+
+    weights = build_value_sample_weights(data, per_game_value_weight=True)
+
+    assert float(weights[:2].sum()) == pytest.approx(float(weights[2:].sum()))
+    quality = per_game_weight_quality(data, weights)
+    assert quality["n_games"] == 2
+    assert quality["rows_per_game"] == {"min": 2, "max": 3, "mean": 2.5}
+    assert quality["total_weight_per_game"]["std"] == pytest.approx(0.0, abs=1e-6)
+
+
+def test_invalid_composite_offsets_fail_closed() -> None:
+    class _Composite(dict):
+        component_offsets = (0, 4, 3)
+
+    data = _Composite(
+        action_taken=np.zeros(3, dtype=np.int16),
+        game_seed=np.asarray([1, 1, 2], dtype=np.int64),
+    )
+
+    with pytest.raises(ValueError, match="component_offsets"):
+        build_value_sample_weights(data, per_game_value_weight=True)
