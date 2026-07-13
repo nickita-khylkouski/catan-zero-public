@@ -626,6 +626,26 @@ def test_corrected_belief_gameplay_operator_is_sealed_per_role(tmp_path: Path) -
     assert "--baseline-gameplay-policy-aggregation" in argv
     assert "--candidate-sigma-reference-visits" in argv
     assert "--baseline-sigma-reference-visits" not in argv
+    external_candidate = next(
+        job
+        for job in diagnostic["jobs"]
+        if job["phase"] == "external" and job["role"] == "candidate"
+    )
+    external_champion = next(
+        job
+        for job in diagnostic["jobs"]
+        if job["phase"] == "external" and job["role"] == "champion"
+    )
+    candidate_argv = external_candidate["argv"]
+    champion_argv = external_champion["argv"]
+    assert candidate_argv[
+        candidate_argv.index("--gameplay-policy-aggregation") + 1
+    ] == "aggregate_q_then_improve"
+    assert candidate_argv[candidate_argv.index("--sigma-reference-visits") + 1] == "8"
+    assert champion_argv[
+        champion_argv.index("--gameplay-policy-aggregation") + 1
+    ] == "mean_improved_policy"
+    assert "--sigma-reference-visits" not in champion_argv
     plan_path = tmp_path / "corrected-plan.json"
     fleet.write_new_readonly(plan_path, diagnostic)
     assert fleet.load_plan(plan_path, manifest)["plan_hash"] == diagnostic["plan_hash"]

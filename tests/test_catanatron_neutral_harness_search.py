@@ -307,6 +307,8 @@ def test_parser_preserves_raw_smoke_default_and_exposes_search_recipe() -> None:
     assert args.c_scale == 0.03
     assert args.rescale_noise_floor_c == 0.0
     assert args.sigma_eval == 0.98
+    assert args.gameplay_policy_aggregation == "mean_improved_policy"
+    assert args.sigma_reference_visits is None
     assert args.lazy_interior_chance is True
     assert args.public_observation is True
     assert args.information_set_search is True
@@ -392,6 +394,49 @@ def test_neutral_search_runtime_and_fingerprint_share_d6_adaptive_recipe() -> No
     )
     assert _run_fingerprint(semantics) != _run_fingerprint(
         _game_semantics(default_args, "checkpoint-md5", "sha256:" + "1" * 64)
+    )
+
+
+def test_neutral_search_seals_corrected_belief_gameplay_operator() -> None:
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "--checkpoint",
+            "checkpoint.pt",
+            "--opponent",
+            "random",
+            "--mode",
+            "search",
+            "--out",
+            "out.json",
+            "--gameplay-policy-aggregation",
+            "aggregate_q_then_improve",
+            "--sigma-reference-visits",
+            "8",
+            "--rescale-noise-floor-c",
+            "1.0",
+        ]
+    )
+    recipe = _search_recipe(args)
+    config = _search_config(recipe, ("BLUE", "RED"), seed=7)
+    assert config.gameplay_policy_aggregation == "aggregate_q_then_improve"
+    assert config.sigma_reference_visits == 8
+    assert config.rescale_noise_floor_c == 1.0
+    semantics = _game_semantics(args, "checkpoint-md5", "sha256:" + "1" * 64)
+    legacy = parser.parse_args(
+        [
+            "--checkpoint",
+            "checkpoint.pt",
+            "--opponent",
+            "random",
+            "--mode",
+            "search",
+            "--out",
+            "out.json",
+        ]
+    )
+    assert _run_fingerprint(semantics) != _run_fingerprint(
+        _game_semantics(legacy, "checkpoint-md5", "sha256:" + "1" * 64)
     )
 
 

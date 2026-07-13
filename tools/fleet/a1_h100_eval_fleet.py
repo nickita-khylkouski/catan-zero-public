@@ -396,16 +396,23 @@ def _split_ranges(total: int, lanes: int, base_seed: int) -> list[tuple[int, int
     return result
 
 
-def _science_args(*, c_scale: float | None = 0.03) -> list[str]:
+def _science_args(
+    *,
+    c_scale: float | None = 0.03,
+    gameplay_policy_aggregation: str | None = None,
+    rescale_noise_floor_c: float = 0.0,
+    sigma_eval: float = 0.98,
+    sigma_reference_visits: int | None = None,
+) -> list[str]:
     args = [
         "--n-full",
         "128",
         "--c-visit",
         "50.0",
         "--sigma-eval",
-        "0.98",
+        str(float(sigma_eval)),
         "--rescale-noise-floor-c",
-        "0.0",
+        str(float(rescale_noise_floor_c)),
         "--lazy-interior-chance",
         "--correct-rust-chance-spectra",
         "--public-observation",
@@ -439,6 +446,13 @@ def _science_args(*, c_scale: float | None = 0.03) -> list[str]:
     ]
     if c_scale is not None:
         args[2:2] = ["--c-scale", str(float(c_scale))]
+    if gameplay_policy_aggregation is not None:
+        args += [
+            "--gameplay-policy-aggregation",
+            str(gameplay_policy_aggregation),
+        ]
+    if sigma_reference_visits is not None:
+        args += ["--sigma-reference-visits", str(int(sigma_reference_visits))]
     return args
 
 
@@ -722,6 +736,10 @@ def _external_argv(
     artifact_dir: str,
     out: str,
     c_scale: float = 0.03,
+    gameplay_policy_aggregation: str | None = None,
+    rescale_noise_floor_c: float = 0.0,
+    sigma_eval: float = 0.98,
+    sigma_reference_visits: int | None = None,
     engine_identity: dict[str, str],
 ) -> list[str]:
     return [
@@ -753,7 +771,13 @@ def _external_argv(
         "1",
         "--device",
         "cuda",
-        *_science_args(c_scale=c_scale),
+        *_science_args(
+            c_scale=c_scale,
+            gameplay_policy_aggregation=gameplay_policy_aggregation,
+            rescale_noise_floor_c=rescale_noise_floor_c,
+            sigma_eval=sigma_eval,
+            sigma_reference_visits=sigma_reference_visits,
+        ),
         "--artifact-dir",
         artifact_dir,
         "--resume",
@@ -1056,6 +1080,16 @@ def build_plan(
                 artifact_dir=f"{job_dir}/games",
                 out=f"{job_dir}/report.json",
                 c_scale=role_search_config[role]["c_scale"],
+                gameplay_policy_aggregation=role_search_config[role].get(
+                    "gameplay_policy_aggregation"
+                ),
+                rescale_noise_floor_c=float(
+                    role_search_config[role].get("rescale_noise_floor_c", 0.0)
+                ),
+                sigma_eval=float(role_search_config[role].get("sigma_eval", 0.98)),
+                sigma_reference_visits=role_search_config[role].get(
+                    "sigma_reference_visits"
+                ),
                 engine_identity=engine_identity,
             )
             jobs.append(
@@ -1393,10 +1427,20 @@ def _validate_planned_jobs(plan: dict[str, Any], manifest: dict[str, Any]) -> No
                 seed=seed,
                 workers=int(plan["workers_per_gpu"]),
                 artifact_dir=f"{job['job_dir']}/games",
-                    out=job["report"],
-                    c_scale=role_search_config[role]["c_scale"],
-                    engine_identity=plan["engine_identity"],
-                )
+                out=job["report"],
+                c_scale=role_search_config[role]["c_scale"],
+                gameplay_policy_aggregation=role_search_config[role].get(
+                    "gameplay_policy_aggregation"
+                ),
+                rescale_noise_floor_c=float(
+                    role_search_config[role].get("rescale_noise_floor_c", 0.0)
+                ),
+                sigma_eval=float(role_search_config[role].get("sigma_eval", 0.98)),
+                sigma_reference_visits=role_search_config[role].get(
+                    "sigma_reference_visits"
+                ),
+                engine_identity=plan["engine_identity"],
+            )
             if (
                 job["role"] != role
                 or job["cohort_id"] != f"cohort-{cohort:02d}"

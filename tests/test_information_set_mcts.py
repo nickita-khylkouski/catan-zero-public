@@ -321,6 +321,49 @@ def test_fixed_sigma_makes_p4_and_duplicated_p8_target_equivalent() -> None:
     assert target(p4) == pytest.approx(target(p4 + p4), abs=1.0e-12)
 
 
+def test_belief_d1_uses_fractional_particle_mean_visits_at_sparse_root() -> None:
+    mcts = _belief_target_mcts(sigma_reference_visits=8)
+    mcts.config = replace(
+        mcts.config,
+        rescale_noise_floor_c=1.0,
+        sigma_eval=1.0,
+    )
+    particles = [
+        _belief_result(
+            q_values={11: 1.0},
+            visits={11: 1, 12: 0},
+            completed_q={11: 1.0, 12: -1.0},
+        ),
+        _belief_result(
+            q_values={12: -1.0},
+            visits={11: 0, 12: 1},
+            completed_q={11: 1.0, 12: -1.0},
+        ),
+        _belief_result(
+            q_values={},
+            visits={11: 0, 12: 0},
+            completed_q={11: 1.0, 12: -1.0},
+        ),
+        _belief_result(
+            q_values={},
+            visits={11: 0, 12: 0},
+            completed_q={11: 1.0, 12: -1.0},
+        ),
+    ]
+
+    policy = mcts._belief_level_improved_policy(
+        particles,
+        legal_actions=(11, 12),
+        aggregate_priors={11: 0.5, 12: 0.5},
+    )
+
+    # The exact mean is 2 visits / (4 particles * 2 actions) = 0.25.
+    # Rounding each per-action particle mean first made both synthetic visit
+    # counts zero, forcing D1 alpha=0 and returning an incorrect 50/50 policy.
+    assert policy[11] > 0.5
+    assert policy[12] < 0.5
+
+
 def test_belief_target_changes_training_target_not_selected_action() -> None:
     mcts = _belief_target_mcts()
     results = [

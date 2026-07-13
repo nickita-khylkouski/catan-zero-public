@@ -1222,8 +1222,16 @@ class GumbelChanceMCTS:
             for action in legal_actions
         }
         # Reuse the exact existing minmax/noise-floor/sigma implementation on a
-        # synthetic belief root. Its action visits, priors, and logits are
-        # uniform particle means, so duplicating particles is invariant.
+        # synthetic belief root. D1 needs the *fractional* mean number of visits
+        # per action and particle. Rounding each action's particle mean first is
+        # not equivalent: at sparse wide roots every positive mean can be below
+        # 0.5, which would make the synthetic root look entirely unvisited and
+        # incorrectly collapse all belief Q evidence to the neutral policy.
+        mean_visits = sum(
+            int(result.visit_counts.get(action, 0))
+            for result in results
+            for action in legal_actions
+        ) / float(particle_count * len(legal_actions))
         belief_root = _GNode(
             game=None,
             root_color="__belief_root__",
@@ -1231,18 +1239,6 @@ class GumbelChanceMCTS:
             actions={
                 action: _GAction(
                     prior=float(aggregate_priors[action]),
-                    visits=max(
-                        int(
-                            round(
-                                sum(
-                                    result.visit_counts.get(action, 0)
-                                    for result in results
-                                )
-                                / float(particle_count)
-                            )
-                        ),
-                        0,
-                    ),
                 )
                 for action in legal_actions
             },
@@ -1253,7 +1249,11 @@ class GumbelChanceMCTS:
             },
             expanded=True,
         )
-        return self._improved_policy(belief_root, completed_q)
+        return self._improved_policy(
+            belief_root,
+            completed_q,
+            mean_visits_override=mean_visits,
+        )
 
     def _search_single_world(
         self,
@@ -1780,7 +1780,11 @@ class GumbelChanceMCTS:
         return {action_id: (value - min_q) / denom for action_id, value in completed_q.items()}
 
     def _rescaled_completed_q(
-        self, node: _GNode, completed_q: dict[int, float]
+        self,
+        node: _GNode,
+        completed_q: dict[int, float],
+        *,
+        mean_visits_override: float | None = None,
     ) -> dict[int, float]:
         """Min-max rescale (`_rescale_completed_q`) followed by the D1
         noise-floor attenuation (`_apply_noise_floor`). This is the single
@@ -1789,10 +1793,20 @@ class GumbelChanceMCTS:
         enters selection. Exactly equals `_rescale_completed_q` when
         `config.rescale_noise_floor_c == 0` (attenuation short-circuits)."""
         rescaled = self._rescale_completed_q(completed_q)
-        return self._apply_noise_floor(node, completed_q, rescaled)
+        return self._apply_noise_floor(
+            node,
+            completed_q,
+            rescaled,
+            mean_visits_override=mean_visits_override,
+        )
 
     def _apply_noise_floor(
-        self, node: _GNode, completed_q: dict[int, float], rescaled: dict[int, float]
+        self,
+        node: _GNode,
+        completed_q: dict[int, float],
+        rescaled: dict[int, float],
+        *,
+        mean_visits_override: float | None = None,
     ) -> dict[int, float]:
         """D1: blend rescaled completed-Q toward the neutral 0.5 when the raw
         completed-Q spread is small relative to the per-candidate evaluation
@@ -1811,8 +1825,13 @@ class GumbelChanceMCTS:
             return rescaled
         values = completed_q.values()
         raw_spread = max(values) - min(values)
-        visits = [stats.visits for stats in node.actions.values()]
-        mean_visits = (sum(visits) / len(visits)) if visits else 0.0
+        if mean_visits_override is None:
+            visits = [stats.visits for stats in node.actions.values()]
+            mean_visits = (sum(visits) / len(visits)) if visits else 0.0
+        else:
+            mean_visits = float(mean_visits_override)
+            if not math.isfinite(mean_visits) or mean_visits < 0.0:
+                raise ValueError("mean_visits_override must be finite and >= 0")
         if mean_visits <= 0.0:
             noise_floor = float("inf")
         else:
@@ -1824,9 +1843,19 @@ class GumbelChanceMCTS:
             alpha = raw_spread / denom
         return {action_id: 0.5 + alpha * (value - 0.5) for action_id, value in rescaled.items()}
 
-    def _improved_policy(self, node: _GNode, completed_q: dict[int, float]) -> dict[int, float]:
+    def _improved_policy(
+        self,
+        node: _GNode,
+        completed_q: dict[int, float],
+        *,
+        mean_visits_override: float | None = None,
+    ) -> dict[int, float]:
         scale = self._sigma_scale(node)
-        rescaled_q = self._rescaled_completed_q(node, completed_q)
+        rescaled_q = self._rescaled_completed_q(
+            node,
+            completed_q,
+            mean_visits_override=mean_visits_override,
+        )
         logits = node.action_logits
         scores = {
             action_id: logits.get(action_id, 0.0) + scale * rescaled_q.get(action_id, 0.0)

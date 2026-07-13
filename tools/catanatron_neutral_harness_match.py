@@ -226,6 +226,16 @@ def _search_config(
             search_kwargs.get("determinization_min_simulations", 32)
         ),
         belief_chance_spectra=bool(search_kwargs.get("belief_chance_spectra", False)),
+        gameplay_policy_aggregation=str(
+            search_kwargs.get(
+                "gameplay_policy_aggregation", "mean_improved_policy"
+            )
+        ),
+        sigma_reference_visits=(
+            int(search_kwargs["sigma_reference_visits"])
+            if search_kwargs.get("sigma_reference_visits") is not None
+            else None
+        ),
         rescale_noise_floor_c=float(search_kwargs.get("rescale_noise_floor_c", 0.0)),
         sigma_eval=float(search_kwargs.get("sigma_eval", 0.79)),
         raw_policy_above_width=search_kwargs.get("raw_policy_above_width"),
@@ -448,6 +458,14 @@ def _search_recipe(args: Any) -> dict[str, Any]:
         "temperature": 0.0,
         "play_sh_winner": False,
         "belief_chance_spectra": bool(getattr(args, "belief_chance_spectra", False)),
+        "gameplay_policy_aggregation": str(
+            getattr(args, "gameplay_policy_aggregation", "mean_improved_policy")
+        ),
+        "sigma_reference_visits": (
+            int(args.sigma_reference_visits)
+            if getattr(args, "sigma_reference_visits", None) is not None
+            else None
+        ),
         "rescale_noise_floor_c": float(getattr(args, "rescale_noise_floor_c", 0.0)),
         "sigma_eval": float(getattr(args, "sigma_eval", 0.98)),
         "raw_policy_above_width": None,
@@ -990,6 +1008,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Value-noise estimate used by completed-Q attenuation.",
     )
     parser.add_argument(
+        "--gameplay-policy-aggregation",
+        choices=("mean_improved_policy", "aggregate_q_then_improve"),
+        default="mean_improved_policy",
+        help="Public-belief action-selection operator (legacy default unchanged).",
+    )
+    parser.add_argument(
+        "--sigma-reference-visits",
+        type=int,
+        default=None,
+        help="Fixed completed-Q sigma visit reference required by corrected belief gameplay.",
+    )
+    parser.add_argument(
         "--lazy-interior-chance", action=argparse.BooleanOptionalAction, default=True
     )
     parser.add_argument(
@@ -1181,6 +1211,18 @@ def main() -> None:
             parser.error("--determinization-particles must be >= 1")
         if int(args.determinization_min_simulations) < 1:
             parser.error("--determinization-min-simulations must be >= 1")
+        if args.sigma_reference_visits is not None and int(
+            args.sigma_reference_visits
+        ) < 0:
+            parser.error("--sigma-reference-visits must be non-negative")
+        if (
+            str(args.gameplay_policy_aggregation) == "aggregate_q_then_improve"
+            and args.sigma_reference_visits is None
+        ):
+            parser.error(
+                "--gameplay-policy-aggregation aggregate_q_then_improve requires "
+                "--sigma-reference-visits"
+            )
         for flag, value in (
             ("--n-full", args.n_full),
             ("--max-depth", args.max_depth),
