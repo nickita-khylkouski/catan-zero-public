@@ -1496,6 +1496,21 @@ def _adjudicate_s3(
         raise AdjudicationError("S3 H2H candidate must use adaptive n256 at >=40")
     if h2h.get("baseline_n_full_wide") is not None:
         raise AdjudicationError("S3 H2H baseline must not use adaptive n256")
+    if h2h.get("candidate_wide_roots_always_full") is not True:
+        raise AdjudicationError("S3 H2H candidate must bind always-full wide roots")
+    if h2h.get("baseline_wide_roots_always_full") is not False:
+        raise AdjudicationError("S3 H2H baseline must bind always-full=false")
+    budgets_by_role = h2h.get("search_budgets_by_role")
+    if not isinstance(budgets_by_role, dict) or set(budgets_by_role) != {
+        "candidate",
+        "baseline",
+    }:
+        raise AdjudicationError("S3 H2H lacks typed role-specific search budgets")
+    if (
+        budgets_by_role["candidate"].get("wide_roots_always_full") is not True
+        or budgets_by_role["baseline"].get("wide_roots_always_full") is not False
+    ):
+        raise AdjudicationError("S3 H2H role budget report contradicts always-full split")
     overhead = _number(
         h2h.get("search_telemetry", {}).get("candidate_over_baseline_elapsed_ratio"),
         where="S3 whole-game role-attributable overhead ratio",

@@ -706,6 +706,9 @@ def _resolve_search_budgets(args: Any) -> dict[str, int | None]:
     baseline_n_full_wide_raw = _get("baseline_n_full_wide")
     candidate_n_full_wide_threshold_raw = _get("candidate_n_full_wide_threshold")
     baseline_n_full_wide_threshold_raw = _get("baseline_n_full_wide_threshold")
+    shared_wide_always_full = bool(_get("wide_roots_always_full", False))
+    candidate_wide_always_full_raw = _get("candidate_wide_roots_always_full")
+    baseline_wide_always_full_raw = _get("baseline_wide_roots_always_full")
 
     return {
         "candidate_n_full": (
@@ -737,6 +740,16 @@ def _resolve_search_budgets(args: Any) -> dict[str, int | None]:
             int(baseline_n_full_wide_threshold_raw)
             if baseline_n_full_wide_threshold_raw is not None
             else shared_n_full_wide_threshold
+        ),
+        "candidate_wide_roots_always_full": (
+            bool(candidate_wide_always_full_raw)
+            if candidate_wide_always_full_raw is not None
+            else shared_wide_always_full
+        ),
+        "baseline_wide_roots_always_full": (
+            bool(baseline_wide_always_full_raw)
+            if baseline_wide_always_full_raw is not None
+            else shared_wide_always_full
         ),
     }
 
@@ -885,6 +898,7 @@ def _build_search_config(
     n_full: int | None = None,
     n_full_wide: int | None = None,
     n_full_wide_threshold: int | None = None,
+    wide_roots_always_full: bool | None = None,
     c_scale: float | None = None,
     gameplay_policy_aggregation: str | None = None,
     rescale_noise_floor_c: float | None = None,
@@ -986,7 +1000,11 @@ def _build_search_config(
             if worker_args.get("symmetry_averaged_eval_threshold") is not None
             else None
         ),
-        wide_roots_always_full=bool(worker_args.get("wide_roots_always_full", False)),
+        wide_roots_always_full=(
+            bool(wide_roots_always_full)
+            if wide_roots_always_full is not None
+            else bool(worker_args.get("wide_roots_always_full", False))
+        ),
         exact_budget_sh=bool(worker_args.get("exact_budget_sh", False)),
         exact_budget_sh_min_n=int(worker_args.get("exact_budget_sh_min_n", 0)),
         root_wave_batching=bool(worker_args.get("root_wave_batching", False)),
@@ -1072,6 +1090,9 @@ def _run_worker(worker_args: dict[str, Any]) -> dict[str, Any]:
             n_full=candidate_n_full,
             n_full_wide=budgets["candidate_n_full_wide"],
             n_full_wide_threshold=budgets["candidate_n_full_wide_threshold"],
+            wide_roots_always_full=budgets[
+                "candidate_wide_roots_always_full"
+            ],
             c_scale=c_scales["candidate_c_scale"],
             **role_search["candidate"],
         ),
@@ -1085,6 +1106,9 @@ def _run_worker(worker_args: dict[str, Any]) -> dict[str, Any]:
             n_full=baseline_n_full,
             n_full_wide=budgets["baseline_n_full_wide"],
             n_full_wide_threshold=budgets["baseline_n_full_wide_threshold"],
+            wide_roots_always_full=budgets[
+                "baseline_wide_roots_always_full"
+            ],
             c_scale=c_scales["baseline_c_scale"],
             **role_search["baseline"],
         ),
@@ -1539,6 +1563,18 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--candidate-wide-roots-always-full",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Candidate-only override for --wide-roots-always-full.",
+    )
+    parser.add_argument(
+        "--baseline-wide-roots-always-full",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Baseline-only override for --wide-roots-always-full.",
+    )
+    parser.add_argument(
         "--raw-policy-above-width",
         type=int,
         default=None,
@@ -1625,18 +1661,16 @@ def main() -> None:
     parser.add_argument("--out", required=True)
     add_config_flags(parser, default_purpose="gumbel_search_cross_net_h2h")
     args = parser.parse_args()
-    if bool(args.wide_roots_always_full) and all(
-        value is None
-        for value in (
-            args.n_full_wide,
-            args.candidate_n_full_wide,
-            args.baseline_n_full_wide,
-        )
-    ):
-        parser.error(
-            "--wide-roots-always-full requires at least one shared or role-specific "
-            "n_full_wide budget"
-        )
+    resolved_budgets = _resolve_search_budgets(args)
+    for role in ("candidate", "baseline"):
+        if (
+            resolved_budgets[f"{role}_wide_roots_always_full"]
+            and resolved_budgets[f"{role}_n_full_wide"] is None
+        ):
+            parser.error(
+                f"effective {role} wide_roots_always_full requires that role's "
+                "n_full_wide budget"
+            )
     if bool(args.native_mcts_hot_loop) and not native_hot_loop_available():
         parser.error(
             "--native-mcts-hot-loop requires a matching catanatron_rs wheel "
@@ -1678,6 +1712,12 @@ def main() -> None:
             baseline_n_full_wide=budgets["baseline_n_full_wide"],
             candidate_n_full_wide_threshold=budgets["candidate_n_full_wide_threshold"],
             baseline_n_full_wide_threshold=budgets["baseline_n_full_wide_threshold"],
+            candidate_wide_roots_always_full=budgets[
+                "candidate_wide_roots_always_full"
+            ],
+            baseline_wide_roots_always_full=budgets[
+                "baseline_wide_roots_always_full"
+            ],
             candidate_c_scale=c_scales["candidate_c_scale"],
             baseline_c_scale=c_scales["baseline_c_scale"],
             candidate_value_squash=squashes["candidate_value_squash"],
@@ -1879,6 +1919,14 @@ def main() -> None:
         if args.baseline_n_full_wide_threshold is not None:
             args_dict["baseline_n_full_wide_threshold"] = int(
                 args.baseline_n_full_wide_threshold
+            )
+        if args.candidate_wide_roots_always_full is not None:
+            args_dict["candidate_wide_roots_always_full"] = bool(
+                args.candidate_wide_roots_always_full
+            )
+        if args.baseline_wide_roots_always_full is not None:
+            args_dict["baseline_wide_roots_always_full"] = bool(
+                args.baseline_wide_roots_always_full
             )
         worker_args.append(args_dict)
 
@@ -2143,22 +2191,28 @@ def _build_summary(
         "wide_roots_always_full": bool(
             getattr(args, "wide_roots_always_full", False)
         ),
+        "candidate_wide_roots_always_full": budgets[
+            "candidate_wide_roots_always_full"
+        ],
+        "baseline_wide_roots_always_full": budgets[
+            "baseline_wide_roots_always_full"
+        ],
         "search_budgets_by_role": {
             "candidate": {
                 "n_full": resolved_candidate_n_full,
                 "n_full_wide": budgets["candidate_n_full_wide"],
                 "n_full_wide_threshold": budgets["candidate_n_full_wide_threshold"],
-                "wide_roots_always_full": bool(
-                    getattr(args, "wide_roots_always_full", False)
-                ),
+                "wide_roots_always_full": budgets[
+                    "candidate_wide_roots_always_full"
+                ],
             },
             "baseline": {
                 "n_full": resolved_baseline_n_full,
                 "n_full_wide": budgets["baseline_n_full_wide"],
                 "n_full_wide_threshold": budgets["baseline_n_full_wide_threshold"],
-                "wide_roots_always_full": bool(
-                    getattr(args, "wide_roots_always_full", False)
-                ),
+                "wide_roots_always_full": budgets[
+                    "baseline_wide_roots_always_full"
+                ],
             },
         },
         "raw_policy_above_width": (

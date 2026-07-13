@@ -793,7 +793,8 @@ def _internal_argv(
     champion_n_full_wide: int | None = None,
     candidate_n_full_wide_threshold: int | None = None,
     champion_n_full_wide_threshold: int | None = None,
-    wide_roots_always_full: bool = False,
+    candidate_wide_roots_always_full: bool = False,
+    champion_wide_roots_always_full: bool = False,
 ) -> list[str]:
     argv = [
         python,
@@ -899,8 +900,10 @@ def _internal_argv(
             "--baseline-n-full-wide-threshold",
             str(int(champion_n_full_wide_threshold)),
         ]
-    if wide_roots_always_full:
-        wide_args += ["--wide-roots-always-full"]
+    if candidate_wide_roots_always_full:
+        wide_args += ["--candidate-wide-roots-always-full"]
+    if champion_wide_roots_always_full:
+        wide_args += ["--baseline-wide-roots-always-full"]
     if wide_args:
         out_index = argv.index("--out")
         argv[out_index:out_index] = wide_args
@@ -1253,11 +1256,11 @@ def build_plan(
             champion_n_full_wide_threshold=role_search_config["champion"].get(
                 "n_full_wide_threshold"
             ),
-            wide_roots_always_full=bool(
+            candidate_wide_roots_always_full=bool(
                 role_search_config["candidate"].get("wide_roots_always_full", False)
-                or role_search_config["champion"].get(
-                    "wide_roots_always_full", False
-                )
+            ),
+            champion_wide_roots_always_full=bool(
+                role_search_config["champion"].get("wide_roots_always_full", False)
             ),
         )
         jobs.append(
@@ -1642,11 +1645,11 @@ def _validate_planned_jobs(plan: dict[str, Any], manifest: dict[str, Any]) -> No
             champion_n_full_wide_threshold=role_search_config["champion"].get(
                 "n_full_wide_threshold"
             ),
-            wide_roots_always_full=bool(
+            candidate_wide_roots_always_full=bool(
                 role_search_config["candidate"].get("wide_roots_always_full", False)
-                or role_search_config["champion"].get(
-                    "wide_roots_always_full", False
-                )
+            ),
+            champion_wide_roots_always_full=bool(
+                role_search_config["champion"].get("wide_roots_always_full", False)
             ),
         )
         if job["pairs"] != pairs or job["base_seed"] != seed or job["argv"] != expected:

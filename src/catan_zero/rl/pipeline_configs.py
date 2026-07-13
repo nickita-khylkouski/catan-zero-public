@@ -547,6 +547,8 @@ class EvalConfig(PipelineConfig):
     n_full_wide_threshold: int | None = None
     candidate_n_full_wide_threshold: int | None = None
     baseline_n_full_wide_threshold: int | None = None
+    candidate_wide_roots_always_full: bool | None = None
+    baseline_wide_roots_always_full: bool | None = None
     raw_policy_above_width: int | None = None
     max_depth: int = 80
     max_decisions: int = 300

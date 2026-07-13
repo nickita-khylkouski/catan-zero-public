@@ -345,6 +345,8 @@ def _h2h(
         "n_full_wide_threshold": None,
         "candidate_n_full_wide_threshold": candidate_wide_threshold,
         "baseline_n_full_wide_threshold": None,
+        "candidate_wide_roots_always_full": candidate_wide is not None,
+        "baseline_wide_roots_always_full": False,
         "raw_policy_above_width": None,
         "max_depth": 80,
         "max_decisions": 600,
@@ -410,6 +412,22 @@ def _h2h(
             "candidate_n_full_wide_threshold": candidate_wide_threshold,
             "baseline_n_full_wide": baseline_wide,
             "baseline_n_full_wide_threshold": None,
+            "candidate_wide_roots_always_full": candidate_wide is not None,
+            "baseline_wide_roots_always_full": False,
+            "search_budgets_by_role": {
+                "candidate": {
+                    "n_full": candidate_n,
+                    "n_full_wide": candidate_wide,
+                    "n_full_wide_threshold": candidate_wide_threshold,
+                    "wide_roots_always_full": candidate_wide is not None,
+                },
+                "baseline": {
+                    "n_full": base_n,
+                    "n_full_wide": baseline_wide,
+                    "n_full_wide_threshold": None,
+                    "wide_roots_always_full": False,
+                },
+            },
             "errors": [],
             "games_truncated": 0,
             "pairs_requested": pairs,
@@ -906,6 +924,20 @@ def test_s3_non_worse_top1_is_binding_and_global_n256_is_forbidden(
     payload["candidate_search_operator"]["n_full"] = 256
     _write(manifest, payload)
     with pytest.raises(adjudicator.AdjudicationError, match="global n256"):
+        adjudicator.adjudicate(manifest)
+
+
+def test_s3_rejects_shared_or_mislabeled_always_full_operator(tmp_path: Path) -> None:
+    manifest = _s3_manifest(tmp_path)
+    payload = json.loads(manifest.read_text())
+    h2h_path = Path(payload["evidence"]["h2h"]["path"])
+    h2h = json.loads(h2h_path.read_text())
+    h2h["baseline_wide_roots_always_full"] = True
+    h2h["search_budgets_by_role"]["baseline"]["wide_roots_always_full"] = True
+    _write(h2h_path, h2h)
+    payload["evidence"]["h2h"] = _ref(h2h_path)
+    _write(manifest, payload)
+    with pytest.raises(adjudicator.AdjudicationError, match="baseline.*false"):
         adjudicator.adjudicate(manifest)
 
 
