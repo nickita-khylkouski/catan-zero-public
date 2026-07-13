@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import argparse
 import json
 import sys
 from pathlib import Path
@@ -73,6 +72,37 @@ def test_ablation_reuses_existing_weighting_knobs_and_binds_exact_drift() -> Non
     assert ablation["promotion_eligible"] is False
     assert ablation["code_tree_sha256"].startswith("sha256:")
     assert result["claim_identity_sha256"] != result["contract_sha256"]
+
+
+def test_value_trunk_gradient_ablation_is_typed_bound_and_rendered() -> None:
+    result = _bind(value_trunk_grad_scale=0.0)
+    ablation = result["learner_ablation"]
+    assert result["recipe"]["value_trunk_grad_scale"] == pytest.approx(0.0)
+    assert ablation["recipe_drift"]["value_trunk_grad_scale"] == {
+        "contract": 1.0,
+        "effective": 0.0,
+    }
+    command = executor.build_train_command(
+        result,
+        python=Path(sys.executable),
+        checkpoint=Path("/tmp/value-stop.pt"),
+        report=Path("/tmp/value-stop.json"),
+    )
+    assert command[command.index("--value-trunk-grad-scale") + 1] == "0.0"
+    args = train_bc.build_parser().parse_args(command[2:])
+    bound = {
+        "learner_training_recipe": dict(contract.EXPECTED_LEARNER_TRAINING_RECIPE),
+        "learner_training_recipe_sha256": executor._value_sha256(
+            contract.EXPECTED_LEARNER_TRAINING_RECIPE
+        ),
+    }
+    effective = train_bc._validate_a1_learner_training_recipe(
+        args,
+        {"world_size": 1, "rank": 0, "local_rank": 0, "enabled": False},
+        bound,
+    )
+    assert effective == result["recipe"]
+    assert bound["learner_ablation"]["recipe_drift"] == ablation["recipe_drift"]
 
 
 @pytest.mark.parametrize(

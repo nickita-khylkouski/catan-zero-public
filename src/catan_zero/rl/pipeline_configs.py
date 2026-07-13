@@ -281,6 +281,10 @@ class TrainConfig(PipelineConfig):
     value_lr_mult: float = 1.0
     action_module_lr_mult: float = 1.0
     trunk_lr_mult: float = 1.0
+    # Training-only causal intervention: scale the scalar value objective's
+    # gradient at the shared-state boundary without changing its forward value
+    # or the value-head parameter gradient.
+    value_trunk_grad_scale: float = 1.0
     value_head_type: str = "mse"
     # ``None`` is the raw argparse/default sentinel. train_bc resolves it to the
     # effective fresh/checkpoint/grow integer before constructing a live config;

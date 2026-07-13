@@ -130,6 +130,7 @@ A1_LEARNER_ABLATION_FIELDS = frozenset(
         "lr_warmup_steps",
         "lr_schedule",
         "value_lr_mult",
+        "value_trunk_grad_scale",
         "policy_loss_weight",
         "policy_aux_active_batch_size",
         "soft_target_source",
@@ -675,6 +676,8 @@ def bind_learner_ablation(
     # derived recipe so enabling the existing CAT-60 path can never silently
     # mean equal when an operator intended sqrt (or vice versa).
     effective["per_game_value_weight_mode"] = "equal"
+    if "value_trunk_grad_scale" in overrides:
+        effective["value_trunk_grad_scale"] = 1.0
     for key, value in overrides.items():
         if key == "per_game_value_weight_mode":
             if value not in {"equal", "sqrt"}:
@@ -684,7 +687,11 @@ def bind_learner_ablation(
             effective[key] = value
             continue
         expected_type = (
-            int if key == "policy_aux_active_batch_size" else type(bound[key])
+            int
+            if key == "policy_aux_active_batch_size"
+            else float
+            if key == "value_trunk_grad_scale"
+            else type(bound[key])
         )
         if type(value) is not expected_type:
             raise ExecutorError(
@@ -697,6 +704,7 @@ def bind_learner_ablation(
         "lr": (0.0, None, False),
         "lr_warmup_steps": (0.0, None, True),
         "value_lr_mult": (0.0, None, False),
+        "value_trunk_grad_scale": (0.0, 1.0, True),
         "policy_loss_weight": (0.0, None, True),
         "policy_aux_active_batch_size": (0.0, None, True),
         "soft_target_weight": (0.0, 1.0, True),
@@ -782,6 +790,11 @@ def bind_learner_ablation(
         drift["policy_aux_active_batch_size"] = {
             "contract": "0 (implicit historical train_bc default)",
             "effective": effective["policy_aux_active_batch_size"],
+        }
+    if effective.get("value_trunk_grad_scale", 1.0) != 1.0:
+        drift["value_trunk_grad_scale"] = {
+            "contract": 1.0,
+            "effective": effective["value_trunk_grad_scale"],
         }
     if not drift:
         raise ExecutorError("A1 learner ablation is a no-op")
@@ -981,6 +994,10 @@ def build_train_command(
     )
     if bool(recipe.get("training_rng_rank_offset", False)):
         command.append("--training-rng-rank-offset")
+    if "value_trunk_grad_scale" in recipe:
+        command.extend(
+            ("--value-trunk-grad-scale", str(recipe["value_trunk_grad_scale"]))
+        )
     if bool(recipe["per_game_value_weight"]):
         command.append("--per-game-value-weight")
         # Historical non-ablation recipes locked this switch off and therefore

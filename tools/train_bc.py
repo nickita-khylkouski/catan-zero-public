@@ -654,6 +654,20 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--value-trunk-grad-scale",
+        type=float,
+        default=1.0,
+        help=(
+            "Training-only scalar-value gradient routing. 1.0 preserves the "
+            "historical graph exactly. 0.0 keeps the scalar value forward and "
+            "value-head parameter gradient unchanged, but stops that objective's "
+            "gradient at the shared EntityGraph state/trunk boundary; intermediate "
+            "values scale only that upstream gradient. Requires --arch entity_graph "
+            "and a scalar-MSE objective. Value-attention pooling is refused because "
+            "it has an additional token-to-value path outside this boundary."
+        ),
+    )
+    parser.add_argument(
         "--weight-decay",
         type=float,
         default=0.0,
@@ -1525,6 +1539,66 @@ def _resolve_value_objective_weights(args) -> tuple[float, float]:
     raise SystemExit(f"unknown --value-head-type={mode!r}")
 
 
+def _value_trunk_gradient_routing(
+    args,
+    *,
+    scalar_weight: float,
+    model=None,
+) -> dict[str, object]:
+    """Validate and describe scalar-value gradient routing at the trunk boundary.
+
+    This is deliberately narrower than ``--trunk-lr-mult``.  The latter scales
+    the optimizer update produced by *all* objectives in trunk parameters.  This
+    intervention leaves the policy gradient, forward outputs, optimizer groups,
+    and value-head parameter gradient untouched and changes only the derivative
+    from ``value_head(state)`` into ``state``.
+    """
+
+    scale = float(getattr(args, "value_trunk_grad_scale", 1.0))
+    if not math.isfinite(scale) or not 0.0 <= scale <= 1.0:
+        raise SystemExit("--value-trunk-grad-scale must be finite and in [0, 1]")
+    active = scale != 1.0
+    if active and str(getattr(args, "arch", "")) != "entity_graph":
+        raise SystemExit(
+            "--value-trunk-grad-scale != 1 requires --arch entity_graph"
+        )
+    if active and float(scalar_weight) <= 0.0:
+        raise SystemExit(
+            "--value-trunk-grad-scale != 1 requires an active scalar-MSE value "
+            "objective; it cannot affect a categorical-only or value-disabled run"
+        )
+    if active and str(getattr(args, "value_head_type", "mse")) not in {
+        "mse",
+        "scalar",
+    }:
+        raise SystemExit(
+            "--value-trunk-grad-scale != 1 is sealed only for scalar-MSE value "
+            "training"
+        )
+    if active and model is not None and bool(
+        getattr(model, "value_attention_pool", False)
+    ):
+        raise SystemExit(
+            "--value-trunk-grad-scale != 1 refuses value-attention pooling: its "
+            "second token-to-value path would bypass the declared shared-state "
+            "gradient boundary"
+        )
+    return {
+        "schema_version": "scalar-value-trunk-gradient-routing-v1",
+        "scalar_value_trunk_grad_scale": scale,
+        "active": active,
+        "forward_value_identity": True,
+        "value_head_parameter_gradient_scale": 1.0,
+        "shared_state_upstream_gradient_scale": scale,
+        "scope": "scalar_value_head_state_input_only",
+        "policy_gradient_unchanged": True,
+        "optimizer_parameter_groups_unchanged": True,
+        "ddp_semantics": (
+            "rank_local_boundary_scale_before_standard_ddp_gradient_allreduce"
+        ),
+    }
+
+
 def _value_training_metadata(
     args,
     *,
@@ -1561,6 +1635,11 @@ def _value_training_metadata(
         and float(categorical_training_weight_sum) > 0.0
     ):
         trained_readouts.append("categorical")
+    value_gradient_routing = getattr(args, "value_gradient_routing", None)
+    if value_gradient_routing is None:
+        value_gradient_routing = _value_trunk_gradient_routing(
+            args, scalar_weight=scalar_weight
+        )
     metadata = {
         "schema_version": "value-training-v1",
         "primary_readout": primary_readout,
@@ -1577,6 +1656,7 @@ def _value_training_metadata(
         "value_target_lambda": float(getattr(args, "value_target_lambda", 1.0)),
         "value_root_blend_regime": _resolve_value_root_blend_regime(args),
         "value_root_blend_audit": getattr(args, "value_root_blend_audit", None),
+        "value_gradient_routing": value_gradient_routing,
         "truncated_vp_margin_value_weight": float(
             getattr(args, "truncated_vp_margin_value_weight", 0.0)
         ),
@@ -3996,6 +4076,14 @@ def _effective_a1_learner_training_recipe(
     )
     if belief_resource_loss_weight > 0.0:
         effective["belief_resource_loss_weight"] = belief_resource_loss_weight
+    # Additive diagnostic axis. Historical contracts predate it and retain an
+    # identical recipe shape at the default; a non-unit intervention must be
+    # explicitly authorized as learner-ablation drift.
+    value_trunk_grad_scale = float(
+        getattr(args, "value_trunk_grad_scale", 1.0)
+    )
+    if value_trunk_grad_scale != 1.0:
+        effective["value_trunk_grad_scale"] = value_trunk_grad_scale
     world_size = int(ddp["world_size"])
     effective["world_size"] = world_size
     effective["global_batch_size"] = (
@@ -4398,6 +4486,8 @@ def _validate_a1_learner_training_recipe(
     authorized_extra_fields = {"per_game_value_weight_mode"}
     if int(getattr(args, "policy_aux_active_batch_size", 0)) > 0:
         authorized_extra_fields.add("policy_aux_active_batch_size")
+    if float(getattr(args, "value_trunk_grad_scale", 1.0)) != 1.0:
+        authorized_extra_fields.add("value_trunk_grad_scale")
     missing = set(expected) - set(effective)
     extra = set(effective) - (set(expected) | authorized_extra_fields)
     drift = {
@@ -4414,6 +4504,11 @@ def _validate_a1_learner_training_recipe(
         drift["policy_aux_active_batch_size"] = {
             "contract": 0,
             "effective": int(effective["policy_aux_active_batch_size"]),
+        }
+    if "value_trunk_grad_scale" in effective:
+        drift["value_trunk_grad_scale"] = {
+            "contract": 1.0,
+            "effective": float(effective["value_trunk_grad_scale"]),
         }
     if not declared_json or not _is_sha256(declared_sha):
         raise SystemExit(
@@ -5153,6 +5248,9 @@ def main(argv: Sequence[str] | None = None) -> None:
         resolved_scalar_value_weight,
         resolved_categorical_value_weight,
     ) = _resolve_value_objective_weights(args)
+    args.value_gradient_routing = _value_trunk_gradient_routing(
+        args, scalar_weight=resolved_scalar_value_weight
+    )
     value_root_blend_regime = _resolve_value_root_blend_regime(args)
     _rank0_print(
         json.dumps(
@@ -5284,6 +5382,21 @@ def main(argv: Sequence[str] | None = None) -> None:
             )
         _enforce_35m_model_size(policy, args)
         _assert_value_heads_present_for_losses(policy.model, args)
+        args.value_gradient_routing = _value_trunk_gradient_routing(
+            args,
+            scalar_weight=resolved_scalar_value_weight,
+            model=policy.model,
+        )
+        _rank0_print(
+            json.dumps(
+                {
+                    "progress": "value_trunk_gradient_routing",
+                    **args.value_gradient_routing,
+                },
+                sort_keys=True,
+            ),
+            ddp,
+        )
         if (
             resolved_categorical_value_weight > 0.0
             and resolved_scalar_value_weight == 0.0
@@ -6227,6 +6340,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                     value_root_blend_regime["mode"] == "global_compat"
                 ),
                 "moe_balance_loss_weight": float(args.moe_balance_loss_weight),
+                "value_trunk_grad_scale": float(args.value_trunk_grad_scale),
             }
         batch_iterator = _iterate_training_batches(
             data,
@@ -7223,6 +7337,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         "value_lr_mult": args.value_lr_mult,
         "action_module_lr_mult": args.action_module_lr_mult,
         "trunk_lr_mult": args.trunk_lr_mult,
+        "value_trunk_grad_scale": args.value_trunk_grad_scale,
+        "value_gradient_routing": args.value_gradient_routing,
         "resolved_scalar_value_loss_weight": resolved_scalar_value_weight,
         "truncated_vp_margin_value_weight": float(args.truncated_vp_margin_value_weight),
         "final_vp_loss_weight": args.final_vp_loss_weight,
@@ -7617,6 +7733,7 @@ def _forward_legal_np_for_batch(
     *,
     return_q: bool,
     return_final_vp: bool = True,
+    value_trunk_grad_scale: float = 1.0,
     symmetry=None,
     symmetry_rng=None,
     symmetry_relabel_events: bool = True,
@@ -7641,12 +7758,19 @@ def _forward_legal_np_for_batch(
                 legal_action_ids=legal_action_ids,
                 action_size=int(policy.action_size),
             )
+        forward_kwargs = {
+            "return_q": return_q,
+            "return_final_vp": return_final_vp,
+        }
+        if float(value_trunk_grad_scale) != 1.0:
+            forward_kwargs["value_trunk_grad_scale"] = float(
+                value_trunk_grad_scale
+            )
         outputs = policy.forward_legal_np(
             entity,
             legal_action_ids,
             data["legal_action_context"][batch],
-            return_q=return_q,
-            return_final_vp=return_final_vp,
+            **forward_kwargs,
         )
         # Keep the exact sampled orientation with the forward result. Spatial
         # auxiliary labels live outside ``entity`` and must be relabelled by the
@@ -8019,6 +8143,7 @@ def _train_xdim_batch(
     policy_aux_batch: np.ndarray | None = None,
     policy_aux_sample_weights: np.ndarray | None = None,
     measure_objective_gradient_interference: bool = False,
+    value_trunk_grad_scale: float = 1.0,
 ) -> dict:
     import torch
     from torch import nn
@@ -8050,6 +8175,7 @@ def _train_xdim_batch(
             # is exactly off; XDim legacy policies retain their historical
             # always-emitted head because their forward API has no selector.
             return_final_vp=float(final_vp_loss_weight) != 0.0,
+            value_trunk_grad_scale=value_trunk_grad_scale,
             symmetry=symmetry,
             symmetry_rng=symmetry_rng,
             symmetry_relabel_events=symmetry_relabel_events,
@@ -8487,6 +8613,7 @@ def _train_xdim_batch(
                 policy,
                 policy_objective=policy_objective,
                 value_objective=value_objective,
+                value_trunk_grad_scale=value_trunk_grad_scale,
             )
     # C1 gradient accumulation. At grad_accum_steps==1 (accum_do_zero_grad and
     # accum_do_step both True) this is byte-identical to the pre-C1 path:
@@ -14014,6 +14141,7 @@ def _objective_gradient_interference(
     *,
     policy_objective,
     value_objective,
+    value_trunk_grad_scale: float = 1.0,
 ) -> dict[str, object]:
     """Measure weighted policy/value gradient interaction in the shared trunk.
 
@@ -14128,6 +14256,7 @@ def _objective_gradient_interference(
             else "single_process_microbatch"
         ),
         "value_lr_mult_scales_shared_trunk": False,
+        "scalar_value_trunk_grad_scale": float(value_trunk_grad_scale),
         "policy_objective": _float(policy_objective.detach()),
         "value_objective": _float(value_objective.detach()),
         "policy_trunk_grad_norm": _float(policy_norm),

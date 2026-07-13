@@ -20,6 +20,8 @@ REQUIRED_REPORT_KEYS = (
     "validation_game_seed_ranges",
     "truncated_vp_margin_value_weight",
     "value_lr_mult",
+    "value_trunk_grad_scale",
+    "value_gradient_routing",
 )
 
 

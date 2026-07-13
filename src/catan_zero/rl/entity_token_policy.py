@@ -765,6 +765,7 @@ class EntityGraphNet:
                 *,
                 return_q: bool = False,
                 return_final_vp: bool = True,
+                value_trunk_grad_scale: float = 1.0,
                 event_token_limit: int | None = None,
             ):
                 """Encode a state and score its legal actions.
@@ -787,6 +788,7 @@ class EntityGraphNet:
                     batch,
                     return_q=return_q,
                     return_final_vp=return_final_vp,
+                    value_trunk_grad_scale=value_trunk_grad_scale,
                 )
 
             def parameter_accounting(self) -> dict[str, int]:
@@ -922,8 +924,16 @@ class EntityGraphNet:
                 *,
                 return_q: bool = False,
                 return_final_vp: bool = True,
+                value_trunk_grad_scale: float = 1.0,
             ):
-                """Score legal actions and emit value heads from encoded state."""
+                """Score legal actions and emit value heads from encoded state.
+
+                ``value_trunk_grad_scale`` is a training-only causal probe.  It
+                changes no forward value and leaves the value-head parameter
+                gradient untouched; it scales only the scalar value loss's
+                gradient at the shared state boundary.  The default takes the
+                historical path without adding an operation to the graph.
+                """
                 tokens, padding_mask, state = encoded_state[:3]
                 action_features = torch.cat(
                     (
@@ -961,7 +971,28 @@ class EntityGraphNet:
                     # AlphaGateau per-move readout: a direct logit from each
                     # action's pooled target-entity token. Zero-init -> +0 at init.
                     logits = logits + self.edge_policy_mlp(pooled_targets).squeeze(-1)
-                value = self.value_head(state).squeeze(-1)
+                value_trunk_grad_scale = float(value_trunk_grad_scale)
+                if not math.isfinite(value_trunk_grad_scale) or not (
+                    0.0 <= value_trunk_grad_scale <= 1.0
+                ):
+                    raise ValueError(
+                        "value_trunk_grad_scale must be finite and in [0, 1], got "
+                        f"{value_trunk_grad_scale}"
+                    )
+                if value_trunk_grad_scale == 1.0:
+                    value_state = state
+                elif value_trunk_grad_scale == 0.0:
+                    # Forward identity with an exact stop-gradient at the shared
+                    # boundary.  The value head still receives normal gradients.
+                    value_state = state.detach()
+                else:
+                    # ``state - state.detach()`` is exactly zero in the forward
+                    # pass and has derivative one.  This therefore preserves the
+                    # value tensor while scaling only its upstream derivative.
+                    value_state = state.detach() + value_trunk_grad_scale * (
+                        state - state.detach()
+                    )
+                value = self.value_head(value_state).squeeze(-1)
                 if self.value_attention_pool:
                     value = value + self._value_pool(state, tokens, padding_mask)
                 outputs = {
@@ -1382,6 +1413,7 @@ class EntityGraphPolicy:
         *,
         return_q: bool = False,
         return_final_vp: bool = True,
+        value_trunk_grad_scale: float = 1.0,
     ):
         import torch
 
@@ -1428,11 +1460,15 @@ class EntityGraphPolicy:
         action_ids = torch.as_tensor(
             legal_action_ids, dtype=torch.long, device=self.device
         )
-        outputs = self.model(
-            batch,
-            return_q=return_q,
-            return_final_vp=return_final_vp,
-        )
+        model_kwargs = {
+            "return_q": return_q,
+            "return_final_vp": return_final_vp,
+        }
+        if float(value_trunk_grad_scale) != 1.0:
+            model_kwargs["value_trunk_grad_scale"] = float(
+                value_trunk_grad_scale
+            )
+        outputs = self.model(batch, **model_kwargs)
         valid = action_ids >= 0
         outputs["logits"] = outputs["logits"].masked_fill(~valid, -1.0e9)
         return outputs
