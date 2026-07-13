@@ -40,7 +40,7 @@
       "value_squash": "tanh",
       "value_readout": "__UNRESOLVED__",
       "public_observation": true,
-      "rust_featurize": false,
+      "rust_featurize": true,
       "emit_uncertainty": false
     },
     "learner_value_objective": {

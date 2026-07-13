@@ -24,6 +24,10 @@ not authorize a launch.
   `1ccc3484ced10df0b2f122e805d585895a6b8f5c0f9bf234359e1e1428622573`.
   Seal must replay the signed S3 adjudication selecting `n_full_wide=null`,
   `n_full_wide_threshold=null`, and `wide_roots_always_full=false`.
+- New v3 waves require the capability-sealed native MCTS hot loop and the
+  parity-certified Rust featurizer. The latter is bit-parity-gated by the
+  canonical `catanatron_rs` 0.1.8 wheel; archived v2 locks retain their omitted
+  flags and historical Python-feature path.
 
 The v3 draft does not trust these prose values. Seal replays a committed
 post-promotion handoff and refuses a different checkpoint or search identity.

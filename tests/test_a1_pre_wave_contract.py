@@ -862,6 +862,8 @@ def test_checked_in_template_is_intentionally_unresolved_and_refuses_seal() -> N
     assert payload["science"]["search"]["n_full"] == 128
     assert payload["science"]["search"]["p_full"] == 0.25
     assert payload["science"]["search"]["c_scale"] == 0.1
+    assert payload["science"]["evaluator"]["rust_featurize"] is True
+    assert payload["generation"]["native_mcts_hot_loop"] is True
     recipe = payload["science"]["learner_training_recipe"]
     assert recipe["amp"] == "none"
     assert recipe["max_steps"] == 128
@@ -882,6 +884,91 @@ def test_checked_in_template_is_intentionally_unresolved_and_refuses_seal() -> N
     assert "$.fleet.seed_base" in unresolved
     with pytest.raises(contract.ContractError, match="finish A0/S1-S3"):
         contract.build_lock(TEMPLATE)
+
+    guard_path = contract.REPO_ROOT / "configs/guards/generate_gumbel_selfplay_data.json"
+    guard = json.loads(guard_path.read_text(encoding="utf-8"))
+    assert guard[contract.GUARD_SYNC_KEY]["synchronizer"] == {
+        "path": contract.GUARD_SYNC_TOOL,
+        "sha256": contract._sha256(  # noqa: SLF001
+            (contract.REPO_ROOT / contract.GUARD_SYNC_TOOL).resolve(strict=True)
+        ),
+    }
+
+
+@pytest.mark.parametrize(
+    ("field", "message"),
+    [
+        ("rust_featurize", "Rust featurizer"),
+        ("native_mcts_hot_loop", "native MCTS hot loop"),
+    ],
+)
+def test_v3_runtime_execution_refuses_slow_or_unsealed_paths(
+    field: str, message: str
+) -> None:
+    evaluator = {"rust_featurize": True}
+    generation = {"native_mcts_hot_loop": True}
+    (evaluator if field == "rust_featurize" else generation)[field] = False
+
+    with pytest.raises(contract.ContractError, match=message):
+        contract._validate_current_runtime_execution(  # noqa: SLF001
+            contract.DRAFT_SCHEMA,
+            evaluator=evaluator,
+            generation=generation,
+        )
+
+    # Immutable v2 locks retain their historical Python feature path.
+    contract._validate_current_runtime_execution(  # noqa: SLF001
+        contract.LEGACY_DRAFT_SCHEMA,
+        evaluator={"rust_featurize": False},
+        generation={"native_mcts_hot_loop": False},
+    )
+
+
+@pytest.mark.parametrize("mutation", ["missing", "wrong"])
+def test_current_guard_refuses_rust_featurizer_drift(mutation: str) -> None:
+    guard_path = contract.REPO_ROOT / "configs/guards/generate_gumbel_selfplay_data.json"
+    payload = json.loads(guard_path.read_text(encoding="utf-8"))
+    payload.pop(contract.GUARD_SYNC_KEY)
+    args = contract._guard_cli_flag_lint(payload, path=guard_path)  # noqa: SLF001
+    args["expected_values"]["--c-scale"] = contract.DEFAULT_GENERATION_C_SCALE
+    if mutation == "missing":
+        args["critical_flags"].remove("--rust-featurize")
+        args["expected_values"].pop("--rust-featurize")
+        message = "missing critical flags"
+    else:
+        args["expected_values"]["--rust-featurize"] = False
+        message = "guard drift"
+    expected = args["expected_values"]
+    search = {
+        "c_scale": expected["--c-scale"],
+        "c_visit": expected["--c-visit"],
+        "n_full": expected["--n-full"],
+        "n_fast": expected["--n-fast"],
+        "p_full": expected["--p-full"],
+        "max_depth": expected["--max-depth"],
+        "lazy_interior_chance": expected["--lazy-interior-chance"],
+        "symmetry_averaged_eval": expected["--symmetry-averaged-eval"],
+        "symmetry_averaged_eval_threshold": expected[
+            "--symmetry-averaged-eval-threshold"
+        ],
+        "belief_chance_spectra": expected["--belief-chance-spectra"],
+        "information_set_search": expected["--information-set-search"],
+        "determinization_particles": expected["--determinization-particles"],
+        "determinization_min_simulations": expected[
+            "--determinization-min-simulations"
+        ],
+    }
+    with pytest.raises(contract.ContractError, match=message):
+        contract._validate_guard_payload(  # noqa: SLF001
+            payload,
+            path=guard_path,
+            search=search,
+            evaluator={"public_observation": True, "rust_featurize": True},
+            generation={
+                "temperature_decisions": expected["--temperature-decisions"],
+                "native_mcts_hot_loop": True,
+            },
+        )
 
 
 def test_v3_authoritative_fleet_balances_exact_64_gpu_quotas() -> None:
@@ -1359,6 +1446,42 @@ def test_sync_generation_guard_embeds_typed_s1_receipt_for_nondefault_selection(
     )
 
 
+def test_sync_generation_guard_refreshes_only_stale_synchronizer_identity(
+    tmp_path: Path,
+) -> None:
+    draft = _resolved_draft(tmp_path)
+    payload, _ = _select_s1_c_scale(draft, 0.1)
+    _rebind_downstream_search_evidence(payload, 0.1)
+    guard_path = Path(payload["provenance"]["guard_config"])
+    contract.sync_generation_guard(draft)
+    guard = json.loads(guard_path.read_text(encoding="utf-8"))
+    receipt = guard[contract.GUARD_SYNC_KEY]
+    stable_receipt = {
+        key: value for key, value in receipt.items() if key != "synchronizer"
+    }
+    receipt["synchronizer"]["sha256"] = "sha256:" + "0" * 64
+    guard_path.write_text(json.dumps(guard) + "\n", encoding="utf-8")
+    before_sha256 = contract._sha256(guard_path)
+
+    refreshed = contract.sync_generation_guard(draft)
+
+    assert refreshed["status"] == "provenance_refreshed"
+    assert refreshed["changed"] is True
+    assert refreshed["before_sha256"] == before_sha256
+    after = json.loads(guard_path.read_text(encoding="utf-8"))[
+        contract.GUARD_SYNC_KEY
+    ]
+    assert {key: value for key, value in after.items() if key != "synchronizer"} == (
+        stable_receipt
+    )
+    assert after["synchronizer"] == {
+        "path": contract.GUARD_SYNC_TOOL,
+        "sha256": contract._sha256(
+            (contract.REPO_ROOT / contract.GUARD_SYNC_TOOL).resolve(strict=True)
+        ),
+    }
+
+
 def test_sync_generation_guard_rejects_manual_nondefault_edit_without_receipt(
     tmp_path: Path,
 ) -> None:
@@ -1833,6 +1956,9 @@ def _post_promotion_s1_chain(
 ) -> dict[str, object]:
     draft = _resolved_draft(tmp_path)
     draft_payload = json.loads(draft.read_text(encoding="utf-8"))
+    # This helper exercises the current v3 post-promotion bridge, whose
+    # capability-sealed evaluator uses the parity-certified Rust feature path.
+    draft_payload["science"]["evaluator"]["rust_featurize"] = True
     legacy_path = _evidence_path(draft_payload, "s1")
     legacy = json.loads(legacy_path.read_text(encoding="utf-8"))
     manifest = json.loads(legacy_path.with_name("s1.source.json").read_text())

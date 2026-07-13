@@ -1556,7 +1556,8 @@ def _validate_guard_sync_provenance(
     path: Path,
     selected_c_scale: float,
     s1_evidence: dict[str, Any] | None,
-) -> None:
+    allow_stale_synchronizer: bool = False,
+) -> bool:
     """Require a self-contained receipt when S1 moves the static guard.
 
     The default ``.03`` selection intentionally leaves the checked-in guard
@@ -1572,7 +1573,7 @@ def _validate_guard_sync_provenance(
                 f"guard {path} carries stale {GUARD_SYNC_KEY} metadata for the "
                 "default c_scale=0.03 selection"
             )
-        return
+        return False
     if not isinstance(receipt, dict):
         raise ContractError(
             f"guard {path} selects non-default c_scale={selected_c_scale!r} without "
@@ -1608,8 +1609,10 @@ def _validate_guard_sync_provenance(
     if synchronizer["path"] != GUARD_SYNC_TOOL:
         raise ContractError(f"guard {path} was synchronized by an unexpected tool")
     synchronizer_path = (REPO_ROOT / GUARD_SYNC_TOOL).resolve(strict=True)
-    if synchronizer["sha256"] != _sha256(synchronizer_path):
+    synchronizer_stale = synchronizer["sha256"] != _sha256(synchronizer_path)
+    if synchronizer_stale and not allow_stale_synchronizer:
         raise ContractError(f"guard {path} synchronizer implementation drift")
+    return synchronizer_stale
 
 
 def _validate_guard(
@@ -1648,6 +1651,7 @@ def _validate_guard_payload(
     expected = dict(args.get("expected_values", {}))
     critical = set(args.get("critical_flags", []))
     native_flag = "--native-mcts-hot-loop"
+    rust_featurize_flag = "--rust-featurize"
     required_critical = {
         "--c-scale",
         "--c-visit",
@@ -1669,13 +1673,21 @@ def _validate_guard_payload(
             "native_mcts_hot_loop" in generation
             or native_flag in critical
             or native_flag in expected
+            or rust_featurize_flag in critical
+            or rust_featurize_flag in expected
         ):
             raise ContractError(
                 "archived markerless guard must preserve the omitted native-MCTS "
-                "flag and its legacy false runtime default"
+                "and Rust-featurizer flags and their legacy false runtime defaults"
             )
     else:
         required_critical.add(native_flag)
+        if evaluator["rust_featurize"] is True:
+            required_critical.add(rust_featurize_flag)
+        elif rust_featurize_flag in critical or rust_featurize_flag in expected:
+            raise ContractError(
+                "guard advertises the Rust featurizer for a Python-feature contract"
+            )
     if not required_critical.issubset(critical):
         raise ContractError(
             f"guard {path} is missing critical flags {sorted(required_critical - critical)}"
@@ -1703,6 +1715,8 @@ def _validate_guard_payload(
     }
     if not archived_markerless:
         comparisons[native_flag] = generation["native_mcts_hot_loop"]
+        if evaluator["rust_featurize"] is True:
+            comparisons[rust_featurize_flag] = True
     for flag, contract_value in comparisons.items():
         if flag not in expected or expected[flag] != contract_value:
             raise ContractError(
@@ -1849,7 +1863,10 @@ def sync_generation_guard(draft_path: Path) -> dict[str, Any]:
     generation = draft.get("generation")
     if not isinstance(evaluator, dict) or not isinstance(generation, dict):
         raise ContractError("draft evaluator/generation objects are missing")
-    guard_evaluator = {"public_observation": evaluator.get("public_observation")}
+    guard_evaluator = {
+        "public_observation": evaluator.get("public_observation"),
+        "rust_featurize": evaluator.get("rust_featurize"),
+    }
     guard_generation = {
         "temperature_decisions": generation.get("temperature_decisions"),
         "native_mcts_hot_loop": generation.get("native_mcts_hot_loop"),
@@ -1880,6 +1897,44 @@ def sync_generation_guard(draft_path: Path) -> dict[str, Any]:
         }
 
     if current_c_scale == selected_c_scale:
+        synchronizer_stale = _validate_guard_sync_provenance(
+            guard_payload,
+            path=guard_path,
+            selected_c_scale=selected_c_scale,
+            s1_evidence=s1_record,
+            allow_stale_synchronizer=True,
+        )
+        if synchronizer_stale:
+            refreshed_payload = json.loads(json.dumps(guard_payload))
+            refreshed_payload[GUARD_SYNC_KEY]["synchronizer"]["sha256"] = _sha256(
+                (REPO_ROOT / GUARD_SYNC_TOOL).resolve(strict=True)
+            )
+            _validate_guard_payload(
+                refreshed_payload,
+                path=guard_path,
+                search=guard_search,
+                evaluator=guard_evaluator,
+                generation=guard_generation,
+                s1_evidence=s1_record,
+            )
+            if _sha256(guard_path) != before_sha256:
+                raise ContractError(
+                    f"guard {guard_path} changed concurrently during synchronization"
+                )
+            _atomic_replace_json(guard_path, refreshed_payload)
+            after_sha256 = _sha256(guard_path)
+            return {
+                "status": "provenance_refreshed",
+                "changed": True,
+                "selected_c_scale": selected_c_scale,
+                "guard": str(guard_path),
+                "before_sha256": before_sha256,
+                "after_sha256": after_sha256,
+                "s1_evidence": {
+                    "path": str(s1_path),
+                    "sha256": s1_record["sha256"],
+                },
+            }
         _validate_guard(
             guard_path,
             search=guard_search,
@@ -2006,6 +2061,26 @@ def _validate_generation(generation: dict[str, Any]) -> None:
         )
     if int(generation["workers_per_gpu"]) <= 0 or int(generation["shard_size"]) <= 0:
         raise ContractError("workers_per_gpu and shard_size must be positive")
+
+
+def _validate_current_runtime_execution(
+    draft_schema: str,
+    *,
+    evaluator: Mapping[str, Any],
+    generation: Mapping[str, Any],
+) -> None:
+    """Keep historical locks replayable while new waves use the fast sealed path."""
+
+    if draft_schema != DRAFT_SCHEMA:
+        return
+    if evaluator.get("rust_featurize") is not True:
+        raise ContractError(
+            "current v3 waves require the parity-certified Rust featurizer"
+        )
+    if generation.get("native_mcts_hot_loop") is not True:
+        raise ContractError(
+            "current v3 waves require the capability-sealed native MCTS hot loop"
+        )
 
 
 def _validate_post_wave(value: dict[str, Any]) -> None:
@@ -6044,6 +6119,9 @@ def build_lock(
 
     generation = dict(draft["generation"])
     _validate_generation(generation)
+    _validate_current_runtime_execution(
+        str(draft_schema), evaluator=evaluator, generation=generation
+    )
     if (
         learner_training_recipe["track"] != generation["track"]
         or learner_training_recipe["vps_to_win"] != generation["vps_to_win"]

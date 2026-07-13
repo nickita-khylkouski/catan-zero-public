@@ -9,7 +9,7 @@
     },
     "synchronizer": {
       "path": "tools/a1_pre_wave_contract.py",
-      "sha256": "sha256:3e1251ecc34454d217a295af83f3b31be60aaacc2f17c321d9cf8ad3030d930e"
+      "sha256": "sha256:ba7173adf834f5ca83974f81b74e3c62d5ce558cab6a23ac2d1d1b7cc4a552af"
     }
   },
   "guards": [
@@ -29,6 +29,7 @@
           "--belief-chance-spectra",
           "--information-set-search",
           "--native-mcts-hot-loop",
+          "--rust-featurize",
           "--determinization-particles",
           "--determinization-min-simulations"
         ],
@@ -44,6 +45,7 @@
           "--n-fast": 16,
           "--n-full": 128,
           "--native-mcts-hot-loop": true,
+          "--rust-featurize": true,
           "--p-full": 0.25,
           "--public-observation": true,
           "--symmetry-averaged-eval": true,
