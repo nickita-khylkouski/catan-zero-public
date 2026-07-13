@@ -8,15 +8,10 @@ code uses give LRU order, (3) no FIFO regression in the source.
 """
 from __future__ import annotations
 
-import sys
 from collections import OrderedDict
 from pathlib import Path
 
 import numpy as np
-
-_TOOLS = Path(__file__).resolve().parents[1] / "tools"
-if str(_TOOLS) not in sys.path:
-    sys.path.insert(0, str(_TOOLS))
 
 from catan_zero.rl.entity_token_policy import EntityGraphConfig, EntityGraphPolicy
 from catan_zero.search.neural_rust_mcts import (
@@ -72,5 +67,9 @@ def test_lru_eviction_and_touch_semantics():
 def test_no_fifo_regression_in_source():
     src = Path(nrm.__file__).read_text()
     assert "pop(next(iter(self._cache)))" not in src   # old FIFO gone
-    assert src.count("popitem(last=False)") >= 3        # LRU evict at all 3 sites
-    assert src.count("move_to_end(cache_key)") >= 3     # LRU touch at all 3 sites
+    # Cache mutation is centralized so sync, evaluate_many, and async paths
+    # cannot diverge on locking or eviction semantics.
+    assert "def _cache_get(" in src
+    assert "def _cache_store(" in src
+    assert src.count("self._cache.popitem(last=False)") == 1
+    assert src.count("self._cache.move_to_end(cache_key)") == 2

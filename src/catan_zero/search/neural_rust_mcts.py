@@ -299,7 +299,16 @@ class EntityGraphRustEvaluator:
         # popitem(last=False) on evict) instead of FIFO. Bit-identical outputs
         # (a hit returns the same deterministic value); only WHICH entry is
         # evicted changes, improving hit rate for revisited MCTS positions.
-        self._cache: OrderedDict[tuple[str, str, tuple[str, ...], tuple[int, ...]], tuple[dict[int, float], float]] = OrderedDict()
+        self._cache: OrderedDict[
+            tuple[str, str, tuple[str, ...], tuple[int, ...]],
+            tuple[dict[int, float], float] | tuple[dict[int, float], float, float],
+        ] = OrderedDict()
+        # ``BatchedEntityGraphRustEvaluator`` shares this cache between caller
+        # threads running inherited ``evaluate_many`` and its background batch
+        # worker.  One lock in the base class lets every path make LRU
+        # get+touch and evict+store atomic.  The lock is deliberately never held
+        # across featurization or a model forward.
+        self._cache_lock = threading.RLock()
         # Task #81 phase 2 (config.rust_featurize): board topology, computed
         # lazily ONCE per evaluator lifetime on the first Rust-featurized leaf
         # and reused for every subsequent one (see the config field's comment
@@ -458,6 +467,40 @@ class EntityGraphRustEvaluator:
             return dict(priors), value, max(0.0, float(uncertainty))
         return dict(priors), value
 
+    def _cache_get(
+        self,
+        cache_key: tuple[str, str, tuple[str, ...], tuple[int, ...]] | None,
+    ) -> tuple[dict[int, float], float] | tuple[dict[int, float], float, float] | None:
+        """Return and LRU-touch one entry atomically across evaluator paths."""
+        if cache_key is None or int(self.config.cache_size) <= 0:
+            return None
+        with self._cache_lock:
+            cached = self._cache.get(cache_key)
+            if cached is not None:
+                self._cache.move_to_end(cache_key)
+            return cached
+
+    def _cache_store(
+        self,
+        cache_key: tuple[str, str, tuple[str, ...], tuple[int, ...]] | None,
+        priors: dict[int, float],
+        value: float,
+        uncertainty: float,
+    ) -> None:
+        """Atomically replace/touch or evict+insert one completed evaluation."""
+        capacity = int(self.config.cache_size)
+        if cache_key is None or capacity <= 0:
+            return
+        entry = self._cache_entry(priors, value, uncertainty)
+        with self._cache_lock:
+            if cache_key in self._cache:
+                self._cache[cache_key] = entry
+                self._cache.move_to_end(cache_key)
+                return
+            if len(self._cache) >= capacity:
+                self._cache.popitem(last=False)
+            self._cache[cache_key] = entry
+
     def evaluate(
         self,
         game: Any,
@@ -504,9 +547,8 @@ class EntityGraphRustEvaluator:
                 tuple(str(color) for color in colors),
                 tuple(int(action) for action in policy_action_ids),
             )
-            cached = self._cache.get(cache_key)
+            cached = self._cache_get(cache_key)
             if cached is not None:
-                self._cache.move_to_end(cache_key)  # CAT-126 #15: LRU touch
                 # CAT-61: cache entries are (priors, value) or (priors, value,
                 # uncertainty); tolerate both so a mixed-format cache is safe.
                 uncertainty = cached[2] if len(cached) > 2 else 0.0
@@ -604,9 +646,7 @@ class EntityGraphRustEvaluator:
         value = float(np.clip(value, -1.0, 1.0))
         uncertainty = _uncertainty_from_outputs(outputs, 0)
         if cache_enabled:
-            if len(self._cache) >= int(self.config.cache_size):
-                self._cache.popitem(last=False)  # CAT-126 #15: LRU (evict least-recently-used)
-            self._cache[cache_key] = self._cache_entry(priors, value, uncertainty)
+            self._cache_store(cache_key, priors, value, uncertainty)
         return self._eval_result(priors, value, uncertainty)
 
     def evaluate_symmetry_averaged(
@@ -822,9 +862,8 @@ class EntityGraphRustEvaluator:
                     tuple(str(color) for color in colors),
                     tuple(int(action) for action in policy_action_ids),
                 )
-                cached = self._cache.get(cache_key)
+                cached = self._cache_get(cache_key)
                 if cached is not None:
-                    self._cache.move_to_end(cache_key)  # CAT-126 #15: LRU touch
                     # CAT-61: tolerate (priors, value) and (priors, value, unc).
                     uncertainty = cached[2] if len(cached) > 2 else 0.0
                     results[request_index] = self._eval_result(
@@ -937,10 +976,8 @@ class EntityGraphRustEvaluator:
                 value = float(np.clip(value, -1.0, 1.0))
                 uncertainty = _uncertainty_from_outputs(outputs, batch_row)
                 if int(self.config.cache_size) > 0:
-                    if len(self._cache) >= int(self.config.cache_size):
-                        self._cache.popitem(last=False)  # CAT-126 #15: LRU (evict least-recently-used)
-                    self._cache[batch_request.cache_key] = self._cache_entry(
-                        priors, value, uncertainty
+                    self._cache_store(
+                        batch_request.cache_key, priors, value, uncertainty
                     )
                 results[request_index] = self._eval_result(priors, value, uncertainty)
 
@@ -989,7 +1026,6 @@ class BatchedEntityGraphRustEvaluator(EntityGraphRustEvaluator):
         self.max_batch_size = max(1, int(max_batch_size))
         self.max_wait_ms = max(0.0, float(max_wait_ms))
         self._requests: queue.Queue[_BatchedEvalRequest | None] = queue.Queue()
-        self._cache_lock = threading.Lock()
         self._closed = threading.Event()
         self._worker = threading.Thread(
             target=self._batch_loop,
@@ -1049,10 +1085,7 @@ class BatchedEntityGraphRustEvaluator(EntityGraphRustEvaluator):
                 tuple(str(color) for color in colors),
                 tuple(int(action) for action in policy_action_ids),
             )
-            with self._cache_lock:
-                cached = self._cache.get(cache_key)
-                if cached is not None:
-                    self._cache.move_to_end(cache_key)  # CAT-126 #15: LRU touch (under lock)
+            cached = self._cache_get(cache_key)
             if cached is not None:
                 # CAT-61: tolerate (priors, value) and (priors, value, unc).
                 uncertainty = cached[2] if len(cached) > 2 else 0.0
@@ -1227,12 +1260,7 @@ class BatchedEntityGraphRustEvaluator(EntityGraphRustEvaluator):
                 value = float(np.clip(value, -1.0, 1.0))
                 uncertainty = _uncertainty_from_outputs(outputs, index)
                 if int(self.config.cache_size) > 0:
-                    with self._cache_lock:
-                        if len(self._cache) >= int(self.config.cache_size):
-                            self._cache.popitem(last=False)  # CAT-126 #15: LRU (evict least-recently-used)
-                        self._cache[request.cache_key] = self._cache_entry(
-                            priors, value, uncertainty
-                        )
+                    self._cache_store(request.cache_key, priors, value, uncertainty)
                 request.result = self._eval_result(priors, value, uncertainty)
                 request.done.set()
         except BaseException as error:  # pragma: no cover - exercised in remote runtime.
@@ -1250,7 +1278,7 @@ class _BatchedEvalRequest:
     acting_color: str
     root_color: str
     colors: tuple[str, ...]
-    cache_key: tuple[str, str, tuple[str, ...], tuple[int, ...]]
+    cache_key: tuple[str, str, tuple[str, ...], tuple[int, ...]] | None
     done: threading.Event = field(init=False)
     result: tuple[dict[int, float], float] | tuple[dict[int, float], float, float] | None = None
     error: BaseException | None = None
