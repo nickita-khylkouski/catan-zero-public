@@ -292,6 +292,8 @@ class TrainConfig(PipelineConfig):
     value_target_lambda: float = 1.0
     aux_subgoal_heads: bool = False
     aux_subgoal_loss_weight: float = 0.0
+    belief_resource_head: bool = False
+    belief_resource_loss_weight: float = 0.0
     edge_policy_head: bool = False
     truncated_vp_margin_value_weight: float = 0.25
     freeze_modules: str = ""

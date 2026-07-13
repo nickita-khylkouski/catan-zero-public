@@ -52,6 +52,7 @@ NEW_PARAM_PREFIXES = (
     "aux_vp_in_n_head.",
     "aux_next_settlement_head.",
     "aux_robber_target_head.",
+    "belief_resource_head.",
     "value_categorical_head.",
     "topology_residual_adapter.",
 )
@@ -94,6 +95,8 @@ def _parse_flags(raw: str) -> dict[str, object]:
             overrides["aux_subgoal_heads"] = True
         elif entry in ("topology", "topology_residual_adapter"):
             overrides["topology_residual_adapter"] = True
+        elif entry in ("belief", "belief_resource_head"):
+            overrides["belief_resource_head"] = True
         elif entry.startswith("catbins"):
             # CAT-39: build the HL-Gauss categorical value head with N win-loss
             # bins (plus the truncation class, which the config enables by

@@ -41,6 +41,20 @@ ENTITY_POLICY_SCHEMA_VERSION = "entity_graph_policy_v1"
 AUX_NUM_INTERSECTIONS = 54
 AUX_NUM_HEXES = 19
 
+
+def _entity_token_start_offsets(batch: dict[str, Any]) -> tuple[int, int, int, int]:
+    """Starts of hex/vertex/edge/player spans in the live CLS-prefixed layout."""
+
+    n_hex = int(batch["hex_tokens"].shape[1])
+    n_vertex = int(batch["vertex_tokens"].shape[1])
+    n_edge = int(batch["edge_tokens"].shape[1])
+    return (
+        1,
+        1 + n_hex,
+        1 + n_hex + n_vertex,
+        1 + n_hex + n_vertex + n_edge,
+    )
+
 _NON_MODEL_ENTITY_KEYS = frozenset(
     {
         "hex_vertex_ids",
@@ -200,6 +214,12 @@ class EntityGraphConfig:
     # blocks. Default OFF preserves old checkpoint structure exactly. Appended
     # last because this frozen+slots dataclass pickles positionally.
     topology_residual_adapter: bool = False
+    # Training-only privileged-label belief auxiliary (default OFF).  The head
+    # reads each post-trunk *public-masked* player token and predicts a
+    # five-resource composition simplex.  Its labels may be extracted from the
+    # pre-mask banked player tokens, but those labels are never model inputs.
+    # Appended last for positional pickle compatibility.
+    belief_resource_head: bool = False
 
 
 class EntityGraphNet:
@@ -669,6 +689,17 @@ class EntityGraphNet:
                     )
                     self.aux_robber_target_head = _categorical_head(AUX_NUM_HEXES)
 
+                self.belief_resource_head_enabled = bool(
+                    getattr(cfg, "belief_resource_head", False)
+                )
+                if self.belief_resource_head_enabled:
+                    self.belief_resource_head = nn.Sequential(
+                        nn.LayerNorm(h),
+                        nn.Linear(h, h),
+                        nn.GELU(),
+                        nn.Linear(h, 5),
+                    )
+
             def forward(
                 self,
                 batch: dict[str, Any],
@@ -931,6 +962,15 @@ class EntityGraphNet:
                         state
                     )
                     outputs["aux_robber_target"] = self.aux_robber_target_head(state)
+                if self.belief_resource_head_enabled:
+                    player_count = int(batch["player_tokens"].shape[1])
+                    player_start = _entity_token_start_offsets(batch)[3]
+                    player_states = tokens[
+                        :, player_start : player_start + player_count
+                    ]
+                    outputs["belief_resource_logits"] = self.belief_resource_head(
+                        player_states
+                    )
                 if return_q:
                     state_expanded = state.unsqueeze(1).expand_as(encoded_actions)
                     q_features = torch.cat(
@@ -1063,18 +1103,10 @@ class EntityGraphNet:
                 import torch
 
                 target_ids = batch["legal_action_target_ids"].long()  # [B, A, 4]
-                n_hex = int(batch["hex_tokens"].shape[1])
-                n_vertex = int(batch["vertex_tokens"].shape[1])
-                n_edge = int(batch["edge_tokens"].shape[1])
                 # Start index of each targeted type in the concatenated
                 # sequence (CLS occupies index 0).
                 offsets = torch.tensor(
-                    [
-                        1,  # hex
-                        1 + n_hex,  # vertex
-                        1 + n_hex + n_vertex,  # edge
-                        1 + n_hex + n_vertex + n_edge,  # player
-                    ],
+                    _entity_token_start_offsets(batch),
                     dtype=torch.long,
                     device=target_ids.device,
                 )
@@ -1239,6 +1271,7 @@ class EntityGraphPolicy:
         moe_expert_ff_size: int = 0,
         relational_edge_policy_head: bool = True,
         topology_residual_adapter: bool = False,
+        belief_resource_head: bool = False,
     ) -> EntityGraphPolicy:
         env = ColonistMultiAgentEnv(env_config or ColonistMultiAgentConfig())
         try:
@@ -1269,6 +1302,7 @@ class EntityGraphPolicy:
                 moe_expert_ff_size=int(moe_expert_ff_size),
                 relational_edge_policy_head=bool(relational_edge_policy_head),
                 topology_residual_adapter=bool(topology_residual_adapter),
+                belief_resource_head=bool(belief_resource_head),
             )
             return cls(config, static, seed=seed, device=device)
         finally:
@@ -1745,6 +1779,7 @@ class EntityGraphPolicy:
             "aux_vp_in_n_head.",
             "aux_next_settlement_head.",
             "aux_robber_target_head.",
+            "belief_resource_head.",
         )
         disallowed_missing = [
             key for key in missing if not key.startswith(allowed_missing_prefixes)

@@ -982,6 +982,27 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--belief-resource-loss-weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Opt-in opponent-resource belief auxiliary loss. Labels are extracted "
+            "from pre-mask banked player_tokens, while the model receives only "
+            "--mask-hidden-info inputs. Requires an entity_graph checkpoint built "
+            "with --belief-resource-head. 0.0 preserves the legacy objective."
+        ),
+    )
+    parser.add_argument(
+        "--belief-resource-head",
+        action="store_true",
+        help=(
+            "Build the entity_graph opponent-resource belief head. The head emits "
+            "training-only five-resource logits per public-masked player token and "
+            "does not alter policy/value outputs. Warm-start an existing checkpoint "
+            "with tools/f69_upgrade_checkpoint_config.py --flags belief."
+        ),
+    )
+    parser.add_argument(
         "--freeze-modules",
         default="",
         help=(
@@ -3840,6 +3861,7 @@ def _effective_a1_learner_training_recipe(
         "policy_kl_anchor_weight",
         "value_uncertainty_loss_weight",
         "aux_subgoal_loss_weight",
+        "belief_resource_loss_weight",
         "train_value_only",
         "freeze_modules",
         "policy_surprise_weight",
@@ -4423,6 +4445,24 @@ def main(argv: Sequence[str] | None = None) -> None:
         expected_pipeline=TrainConfig.PIPELINE,
     )
     args.max_grad_norm = _validate_max_grad_norm(args.max_grad_norm)
+    if float(args.belief_resource_loss_weight) < 0.0:
+        raise SystemExit("--belief-resource-loss-weight must be >= 0")
+    if float(args.belief_resource_loss_weight) > 0.0:
+        if args.arch != "entity_graph":
+            raise SystemExit(
+                "--belief-resource-loss-weight requires --arch entity_graph"
+            )
+        if not bool(args.mask_hidden_info):
+            raise SystemExit(
+                "--belief-resource-loss-weight requires --mask-hidden-info so the "
+                "privileged label cannot enter the model input"
+            )
+        if not bool(args.training_rng_rank_offset):
+            raise SystemExit(
+                "--belief-resource-loss-weight requires --training-rng-rank-offset "
+                "to reset training RNG after the optional head is constructed and "
+                "keep shared-trunk dropout streams rank-distinct/reproducible"
+            )
     ddp = _distributed_state()
     # Authenticate diagnostic batch/topology drift before the expensive A1
     # memmap preflight.  The same authorization is replayed again when the
@@ -4703,7 +4743,38 @@ def main(argv: Sequence[str] | None = None) -> None:
             composite_meta=(a1_preflight_meta if is_memmap_composite else None),
         )
     else:
-        data = load_teacher_data(Path(args.data), ddp=ddp, shard_data=bool(args.ddp_shard_data), mask_hidden_info=bool(getattr(args, "mask_hidden_info", False)))
+        data = load_teacher_data(
+            Path(args.data),
+            ddp=ddp,
+            shard_data=bool(args.ddp_shard_data),
+            mask_hidden_info=bool(getattr(args, "mask_hidden_info", False)),
+            preserve_belief_resource_targets=(
+                float(args.belief_resource_loss_weight) > 0.0
+            ),
+        )
+    belief_resource_coverage = None
+    if float(args.belief_resource_loss_weight) > 0.0:
+        if bool(args.ddp_shard_data):
+            raise SystemExit(
+                "belief resource coverage preflight currently requires the shared "
+                "memmap/non-sharded corpus view; --ddp-shard-data would let rank 0 "
+                "inspect only a subset of intended shards"
+            )
+        belief_resource_coverage = _rank0_authoritative_call(
+            ddp,
+            "belief resource coverage",
+            lambda: _belief_resource_coverage(data),
+        )
+        _rank0_print(
+            json.dumps(
+                {
+                    "progress": "belief_resource_coverage",
+                    **belief_resource_coverage,
+                },
+                sort_keys=True,
+            ),
+            ddp,
+        )
     target_information_admission = _rank0_authoritative_call(
         ddp,
         "target-information admission",
@@ -4968,6 +5039,9 @@ def main(argv: Sequence[str] | None = None) -> None:
                     value_categorical_bins=int(args.value_categorical_bins),
                     edge_policy_head=bool(getattr(args, "edge_policy_head", False)),
                     aux_subgoal_heads=bool(getattr(args, "aux_subgoal_heads", False)),
+                    belief_resource_head=bool(
+                        getattr(args, "belief_resource_head", False)
+                    ),
                     state_trunk=str(args.entity_state_trunk),
                     relational_block_pattern=str(args.relational_block_pattern),
                     relational_ff_size=int(args.relational_ff_size),
@@ -5854,6 +5928,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             "policy_kl_anchor_loss": 0.0,
             "value_uncertainty_loss": 0.0,
             "aux_subgoal_loss": 0.0,
+            "belief_resource_loss": 0.0,
             "moe_balance_loss": 0.0,
             "value_categorical_loss": 0.0,
             "value_categorical_clean_loss": 0.0,
@@ -5873,6 +5948,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             "policy_kl_anchor_loss": 0.0,
             "value_uncertainty_loss": 0.0,
             "aux_subgoal_loss": 0.0,
+            "belief_resource_loss": 0.0,
             "moe_balance_loss": 0.0,
             "value_categorical_loss": 0.0,
             "value_categorical_clean_loss": 0.0,
@@ -5919,6 +5995,9 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "policy_kl_anchor_direction": str(args.policy_kl_anchor_direction),
                 "value_uncertainty_loss_weight": float(args.value_uncertainty_loss_weight),
                 "aux_subgoal_loss_weight": float(args.aux_subgoal_loss_weight),
+                "belief_resource_loss_weight": float(
+                    args.belief_resource_loss_weight
+                ),
                 "value_categorical_loss_weight": resolved_categorical_value_weight,
                 "value_hlgauss_sigma_ratio": float(args.value_hlgauss_sigma_ratio),
                 "value_target_lambda": float(args.value_target_lambda),
@@ -6114,6 +6193,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "policy_kl_anchor_loss",
                 "value_uncertainty_loss",
                 "aux_subgoal_loss",
+                "belief_resource_loss",
                 "moe_balance_loss",
                 "value_categorical_loss",
                 "value_categorical_clean_loss",
@@ -6277,6 +6357,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "policy_kl_anchor_loss",
                 "value_uncertainty_loss",
                 "aux_subgoal_loss",
+                "belief_resource_loss",
                 "moe_balance_loss",
                 "value_categorical_loss",
             )
@@ -6306,6 +6387,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             * auxiliary_loss_epochs["value_uncertainty_loss"]
             + float(args.aux_subgoal_loss_weight)
             * auxiliary_loss_epochs["aux_subgoal_loss"]
+            + float(args.belief_resource_loss_weight)
+            * auxiliary_loss_epochs["belief_resource_loss"]
             + float(args.moe_balance_loss_weight)
             * auxiliary_loss_epochs["moe_balance_loss"]
             + resolved_categorical_value_weight
@@ -6431,6 +6514,9 @@ def main(argv: Sequence[str] | None = None) -> None:
                 policy_kl_anchor_direction=str(args.policy_kl_anchor_direction),
                 value_uncertainty_loss_weight=float(args.value_uncertainty_loss_weight),
                 aux_subgoal_loss_weight=float(args.aux_subgoal_loss_weight),
+                belief_resource_loss_weight=float(
+                    args.belief_resource_loss_weight
+                ),
                 moe_balance_loss_weight=float(args.moe_balance_loss_weight),
                 value_categorical_loss_weight=resolved_categorical_value_weight,
                 value_hlgauss_sigma_ratio=float(args.value_hlgauss_sigma_ratio),
@@ -6639,6 +6725,9 @@ def main(argv: Sequence[str] | None = None) -> None:
         policy,
         requested_edge_policy_head=bool(getattr(args, "edge_policy_head", False)),
         requested_aux_subgoal_heads=bool(getattr(args, "aux_subgoal_heads", False)),
+        requested_belief_resource_head=bool(
+            getattr(args, "belief_resource_head", False)
+        ),
     )
     report = {
         "checkout_runtime_binding": checkout_runtime_binding,
@@ -6892,6 +6981,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         ),
         "value_uncertainty_loss_weight": args.value_uncertainty_loss_weight,
         "aux_subgoal_loss_weight": args.aux_subgoal_loss_weight,
+        "belief_resource_loss_weight": args.belief_resource_loss_weight,
+        "belief_resource_coverage": belief_resource_coverage,
         "moe_balance_loss_weight": args.moe_balance_loss_weight,
         "value_head_type": args.value_head_type,
         "value_categorical_bins": int(args.value_categorical_bins),
@@ -7463,6 +7554,134 @@ def _aux_subgoal_loss(
     return total, active_heads
 
 
+def _belief_resource_loss(outputs: dict, data: dict, batch: np.ndarray, device):
+    """Public-input, privileged-label opponent resource-composition loss.
+
+    The five-way softmax is a composition simplex.  At inference its expected
+    counts are ``public_total * softmax(logits)`` and therefore sum exactly to
+    the public hand total.  Targets are read from the raw banked player tokens;
+    the forward path independently masks those tokens in ``_entity_batch``.
+    """
+
+    import torch
+
+    from catan_zero.rl.belief_aux_targets import resource_belief_targets
+
+    logits = outputs.get("belief_resource_logits")
+    if logits is None:
+        raise ValueError(
+            "--belief-resource-loss-weight > 0 but the model has no belief "
+            "resource head; upgrade it with --flags belief"
+        )
+    if not _MASK_HIDDEN_INFO_PLAYER_TOKENS:
+        raise ValueError(
+            "belief resource supervision requires --mask-hidden-info; otherwise "
+            "the head can copy the privileged opponent hand from its input"
+        )
+    derived_keys = (
+        "belief_resource_composition",
+        "belief_resource_total",
+        "belief_resource_valid",
+    )
+    if all(key in data for key in derived_keys):
+        composition_np = np.asarray(data[derived_keys[0]][batch])
+        totals_np = np.asarray(data[derived_keys[1]][batch])
+        valid_np = np.asarray(data[derived_keys[2]][batch])
+    else:
+        composition_np, totals_np, valid_np = resource_belief_targets(
+            np.asarray(data["player_tokens"][batch])
+        )
+    composition = torch.as_tensor(composition_np, dtype=torch.float32, device=device)
+    totals = torch.as_tensor(totals_np, dtype=torch.float32, device=device)
+    valid = torch.as_tensor(valid_np, dtype=torch.bool, device=device)
+    target_probs = composition / totals.clamp_min(1.0).unsqueeze(-1)
+    per_player = -(target_probs * torch.log_softmax(logits.float(), dim=-1)).sum(
+        dim=-1
+    )
+    # Multinomial composition CE, normalized per hidden card across the global
+    # DDP batch.  Weighting the normalized composition CE by the known total is
+    # equivalent to ``-sum_r count_r * log p_r`` without its target-only
+    # combinatorial constant. Always enter the collective on an empty rank.
+    weights = valid.to(torch.float32) * totals
+    weighted_sum, denominator = _weighted_loss_parts(per_player, weights)
+    loss = _weighted_mean_from_parts(weighted_sum, denominator)
+    return loss, int(valid.sum().item()), weighted_sum, denominator
+
+
+def _belief_resource_coverage(data, *, chunk_rows: int = 262_144) -> dict:
+    """Scan every intended corpus component for usable privileged labels.
+
+    This is a launch preflight, not a batch-local assertion: a source-masked
+    corpus legitimately has public player tokens but no hidden truth, and a
+    clamped zero denominator would otherwise make the requested auxiliary a
+    silent no-op for the entire run.
+    """
+
+    from catan_zero.rl.belief_aux_targets import resource_belief_targets
+
+    components = (
+        tuple(zip(data.component_ids, data.corpora, strict=True))
+        if isinstance(data, ConcatMemmapCorpus)
+        else (("corpus", data),)
+    )
+    reports: dict[str, dict[str, int | float]] = {}
+    for component_id, component in components:
+        rows = int(len(component["action_taken"]))
+        eligible_players = 0
+        eligible_cards = 0
+        eligible_rows = 0
+        for start in range(0, rows, max(1, int(chunk_rows))):
+            stop = min(rows, start + max(1, int(chunk_rows)))
+            index = np.arange(start, stop, dtype=np.int64)
+            if all(
+                key in component
+                for key in (
+                    "belief_resource_composition",
+                    "belief_resource_total",
+                    "belief_resource_valid",
+                )
+            ):
+                totals = np.asarray(component["belief_resource_total"][index])
+                valid = np.asarray(component["belief_resource_valid"][index])
+            else:
+                _, totals, valid = resource_belief_targets(
+                    np.asarray(component["player_tokens"][index])
+                )
+            valid = np.asarray(valid, dtype=np.bool_)
+            totals = np.asarray(totals, dtype=np.float32)
+            eligible_players += int(valid.sum())
+            eligible_cards += int(np.rint(totals[valid]).sum())
+            eligible_rows += int(np.any(valid, axis=-1).sum())
+        reports[str(component_id)] = {
+            "rows": rows,
+            "eligible_rows": eligible_rows,
+            "eligible_players": eligible_players,
+            "eligible_cards": eligible_cards,
+            "eligible_row_fraction": eligible_rows / max(rows, 1),
+        }
+    empty = [
+        component_id
+        for component_id, report in reports.items()
+        if int(report["eligible_cards"]) <= 0
+    ]
+    if empty:
+        raise SystemExit(
+            "belief resource objective has zero privileged opponent-card labels "
+            f"in intended component(s) {empty}; the corpus may already be "
+            "source-masked. Refusing a silent no-op run."
+        )
+    return {
+        "schema_version": "belief-resource-coverage-v1",
+        "components": reports,
+        "eligible_players": sum(
+            int(report["eligible_players"]) for report in reports.values()
+        ),
+        "eligible_cards": sum(
+            int(report["eligible_cards"]) for report in reports.values()
+        ),
+    }
+
+
 def _train_xdim_batch(
     policy,
     optimizer,
@@ -7493,6 +7712,7 @@ def _train_xdim_batch(
     policy_kl_anchor_direction: str = "forward",
     value_uncertainty_loss_weight: float = 0.0,
     aux_subgoal_loss_weight: float = 0.0,
+    belief_resource_loss_weight: float = 0.0,
     moe_balance_loss_weight: float = 0.0,
     value_categorical_loss_weight: float = 0.0,
     value_hlgauss_sigma_ratio: float = 0.75,
@@ -7907,6 +8127,23 @@ def _train_xdim_batch(
                 symmetry=symmetry,
                 symmetry_ids=outputs.get("_symmetry_ids"),
             )
+        belief_resource_loss = torch.tensor(
+            0.0, dtype=torch.float32, device=policy.device
+        )
+        belief_resource_active_players = 0
+        if float(belief_resource_loss_weight) != 0.0:
+            (
+                belief_resource_loss,
+                belief_resource_active_players,
+                belief_resource_loss_sum,
+                belief_resource_loss_denominator,
+            ) = (
+                _belief_resource_loss(outputs, data, batch, policy.device)
+            )
+        else:
+            belief_resource_loss_sum, belief_resource_loss_denominator = (
+                _zero_loss_parts(policy.device)
+            )
         moe_balance_loss = outputs.get("moe_balance_metric")
         if moe_balance_loss is None:
             moe_balance_loss = torch.tensor(
@@ -7928,6 +8165,7 @@ def _train_xdim_batch(
             + float(value_uncertainty_loss_weight) * value_uncertainty_loss
             + float(value_categorical_loss_weight) * value_categorical_loss
             + float(aux_subgoal_loss_weight) * aux_subgoal_loss
+            + float(belief_resource_loss_weight) * belief_resource_loss
             + float(moe_balance_loss_weight) * moe_balance_loss
         )
         objective_gradient_interference = None
@@ -7945,6 +8183,7 @@ def _train_xdim_batch(
                 + float(value_uncertainty_loss_weight) * value_uncertainty_loss
                 + float(value_categorical_loss_weight) * value_categorical_loss
                 + float(aux_subgoal_loss_weight) * aux_subgoal_loss
+                + float(belief_resource_loss_weight) * belief_resource_loss
             )
             objective_gradient_interference = _objective_gradient_interference(
                 policy,
@@ -8047,8 +8286,16 @@ def _train_xdim_batch(
         "policy_kl_anchor_eligible_rows": int(kl_anchor_loss_denominator.item()),
         "value_uncertainty_loss": float(value_uncertainty_loss.item()),
         "aux_subgoal_loss": float(aux_subgoal_loss.item()),
+        "belief_resource_loss": float(belief_resource_loss.item()),
+        "belief_resource_loss_weighted_sum": float(
+            belief_resource_loss_sum.item()
+        ),
+        "belief_resource_loss_weight_sum": float(
+            belief_resource_loss_denominator.item()
+        ),
         "moe_balance_loss": float(moe_balance_loss.item()),
         "aux_subgoal_active_heads": int(aux_subgoal_active_heads),
+        "belief_resource_active_players": int(belief_resource_active_players),
         "value_categorical_loss": float(value_categorical_loss.item()),
         "primary_value_loss": float(
             value_categorical_loss.item()
@@ -8509,6 +8756,7 @@ def evaluate_bc_batches(
     policy_kl_anchor_direction: str = "forward",
     value_uncertainty_loss_weight: float = 0.0,
     aux_subgoal_loss_weight: float = 0.0,
+    belief_resource_loss_weight: float = 0.0,
     moe_balance_loss_weight: float = 0.0,
     value_categorical_loss_weight: float = 0.0,
     value_hlgauss_sigma_ratio: float = 0.75,
@@ -8534,6 +8782,7 @@ def evaluate_bc_batches(
             "policy_kl_anchor_loss": 0.0,
             "value_uncertainty_loss": 0.0,
             "aux_subgoal_loss": 0.0,
+            "belief_resource_loss": 0.0,
             "moe_balance_loss": 0.0,
             "value_categorical_loss": 0.0,
             "value_categorical_clean_loss": 0.0,
@@ -8560,6 +8809,7 @@ def evaluate_bc_batches(
             "policy_kl_anchor_loss": 0.0,
             "value_uncertainty_loss": 0.0,
             "aux_subgoal_loss": 0.0,
+            "belief_resource_loss": 0.0,
             "moe_balance_loss": 0.0,
             "value_categorical_loss": 0.0,
             "value_categorical_clean_loss": 0.0,
@@ -8580,6 +8830,9 @@ def evaluate_bc_batches(
                 "policy_kl_anchor_direction": str(policy_kl_anchor_direction),
                 "value_uncertainty_loss_weight": float(value_uncertainty_loss_weight),
                 "aux_subgoal_loss_weight": float(aux_subgoal_loss_weight),
+                "belief_resource_loss_weight": float(
+                    belief_resource_loss_weight
+                ),
                 "moe_balance_loss_weight": float(moe_balance_loss_weight),
                 "value_categorical_loss_weight": float(value_categorical_loss_weight),
                 "value_hlgauss_sigma_ratio": float(value_hlgauss_sigma_ratio),
@@ -8642,6 +8895,7 @@ def evaluate_bc_batches(
                 "policy_kl_anchor_loss",
                 "value_uncertainty_loss",
                 "aux_subgoal_loss",
+                "belief_resource_loss",
                 "moe_balance_loss",
                 "value_categorical_loss",
                 "value_categorical_clean_loss",
@@ -8733,6 +8987,7 @@ def evaluate_bc_batches(
                 "policy_kl_anchor_loss",
                 "value_uncertainty_loss",
                 "aux_subgoal_loss",
+                "belief_resource_loss",
                 "moe_balance_loss",
                 "value_categorical_loss",
             )
@@ -8757,6 +9012,8 @@ def evaluate_bc_batches(
             + float(value_uncertainty_loss_weight)
             * auxiliary_loss_eval["value_uncertainty_loss"]
             + float(aux_subgoal_loss_weight) * auxiliary_loss_eval["aux_subgoal_loss"]
+            + float(belief_resource_loss_weight)
+            * auxiliary_loss_eval["belief_resource_loss"]
             + float(moe_balance_loss_weight)
             * auxiliary_loss_eval["moe_balance_loss"]
             + float(value_categorical_loss_weight)
@@ -8793,6 +9050,7 @@ def evaluate_bc_batches(
                 "policy_kl_anchor_loss": float(policy_kl_anchor_weight),
                 "value_uncertainty_loss": float(value_uncertainty_loss_weight),
                 "aux_subgoal_loss": float(aux_subgoal_loss_weight),
+                "belief_resource_loss": float(belief_resource_loss_weight),
                 "moe_balance_loss": float(moe_balance_loss_weight),
                 "value_categorical_loss": float(value_categorical_loss_weight),
             },
@@ -9107,6 +9365,7 @@ def _eval_xdim_batch(
     policy_kl_anchor_direction: str = "forward",
     value_uncertainty_loss_weight: float = 0.0,
     aux_subgoal_loss_weight: float = 0.0,
+    belief_resource_loss_weight: float = 0.0,
     moe_balance_loss_weight: float = 0.0,
     value_categorical_loss_weight: float = 0.0,
     value_hlgauss_sigma_ratio: float = 0.75,
@@ -9415,6 +9674,20 @@ def _eval_xdim_batch(
                 aux_subgoal_loss, aux_subgoal_active_heads = _aux_subgoal_loss(
                     outputs, data, batch, policy.device
                 )
+            belief_resource_loss = torch.tensor(
+                0.0, dtype=torch.float32, device=policy.device
+            )
+            belief_resource_active_players = 0
+            belief_resource_loss_sum, belief_resource_loss_denominator = (
+                _zero_loss_parts(policy.device)
+            )
+            if float(belief_resource_loss_weight) != 0.0:
+                (
+                    belief_resource_loss,
+                    belief_resource_active_players,
+                    belief_resource_loss_sum,
+                    belief_resource_loss_denominator,
+                ) = _belief_resource_loss(outputs, data, batch, policy.device)
             moe_balance_loss = outputs.get("moe_balance_metric")
             if moe_balance_loss is None:
                 moe_balance_loss = torch.tensor(
@@ -9436,6 +9709,7 @@ def _eval_xdim_batch(
                 + float(value_uncertainty_loss_weight)
                 * value_uncertainty_loss
                 + float(aux_subgoal_loss_weight) * aux_subgoal_loss
+                + float(belief_resource_loss_weight) * belief_resource_loss
                 + float(moe_balance_loss_weight) * moe_balance_loss
                 + float(value_categorical_loss_weight)
                 * value_categorical_loss
@@ -9507,8 +9781,18 @@ def _eval_xdim_batch(
             ),
             "value_uncertainty_loss": float(value_uncertainty_loss.item()),
             "aux_subgoal_loss": float(aux_subgoal_loss.item()),
+            "belief_resource_loss": float(belief_resource_loss.item()),
+            "belief_resource_loss_weighted_sum": float(
+                belief_resource_loss_sum.item()
+            ),
+            "belief_resource_loss_weight_sum": float(
+                belief_resource_loss_denominator.item()
+            ),
             "moe_balance_loss": float(moe_balance_loss.item()),
             "aux_subgoal_active_heads": int(aux_subgoal_active_heads),
+            "belief_resource_active_players": int(
+                belief_resource_active_players
+            ),
             "value_categorical_loss": float(value_categorical_loss.item()),
             "primary_value_loss": float(
                 value_categorical_loss.item()
@@ -10220,6 +10504,7 @@ def load_teacher_data(
     ddp: dict[str, int | bool] | None = None,
     shard_data: bool = False,
     mask_hidden_info: bool = False,
+    preserve_belief_resource_targets: bool = False,
 ) -> dict:
     files = _teacher_shard_files(path)
     if not files:
@@ -10297,6 +10582,9 @@ def load_teacher_data(
         "edge_tokens",
         "edge_vertex_ids",
         "player_tokens",
+        "belief_resource_composition",
+        "belief_resource_total",
+        "belief_resource_valid",
         "global_tokens",
         "legal_action_tokens",
         "legal_action_target_ids",
@@ -10331,6 +10619,17 @@ def load_teacher_data(
         )
         prior_row_counts.append(int(len(shard["action_taken"])))
         if mask_hidden_info and "player_tokens" in shard:
+            if preserve_belief_resource_targets:
+                from catan_zero.rl.belief_aux_targets import (
+                    resource_belief_targets,
+                )
+
+                composition, total, valid = resource_belief_targets(
+                    shard["player_tokens"]
+                )
+                shard["belief_resource_composition"] = composition
+                shard["belief_resource_total"] = total
+                shard["belief_resource_valid"] = valid
             # f72 public-observation training: strip opponent hidden slots from the
             # banked (omniscient) tokens so this corpus trains a public-only model.
             shard["player_tokens"] = mask_player_tokens_public(shard["player_tokens"])
@@ -14655,6 +14954,7 @@ def _effective_entity_graph_architecture_report(
     *,
     requested_edge_policy_head: bool = False,
     requested_aux_subgoal_heads: bool = False,
+    requested_belief_resource_head: bool = False,
 ) -> dict[str, object]:
     """Bind learner reports to the architecture that actually ran.
 
@@ -14679,6 +14979,10 @@ def _effective_entity_graph_architecture_report(
             "topology_residual_adapter": False,
             "requested_edge_policy_head": bool(requested_edge_policy_head),
             "requested_aux_subgoal_heads": bool(requested_aux_subgoal_heads),
+            "belief_resource_head": bool(requested_belief_resource_head),
+            "requested_belief_resource_head": bool(
+                requested_belief_resource_head
+            ),
         }
     return {
         "action_target_gather": bool(
@@ -14692,6 +14996,9 @@ def _effective_entity_graph_architecture_report(
         "topology_residual_adapter": bool(
             getattr(config, "topology_residual_adapter", False)
         ),
+        "belief_resource_head": bool(
+            getattr(config, "belief_resource_head", False)
+        ),
         "state_trunk": str(getattr(config, "state_trunk", "transformer")),
         "relational_block_pattern": str(
             getattr(config, "relational_block_pattern", "") or ""
@@ -14704,6 +15011,7 @@ def _effective_entity_graph_architecture_report(
         ),
         "requested_edge_policy_head": bool(requested_edge_policy_head),
         "requested_aux_subgoal_heads": bool(requested_aux_subgoal_heads),
+        "requested_belief_resource_head": bool(requested_belief_resource_head),
     }
 
 
