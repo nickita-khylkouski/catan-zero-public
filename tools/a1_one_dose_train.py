@@ -882,7 +882,7 @@ def _verify_production_composite_inputs(
     validation_indices = np.asarray(split["validation"], dtype=np.int64)
     if train_indices.size == 0 or validation_indices.size == 0:
         raise ExecutorError("production composite whole-game split is empty")
-    offsets = list(map(int, corpus.offsets))
+    offsets = list(map(int, corpus.component_offsets))
     component_split_records: list[dict[str, Any]] = []
     selected_seed_sets: list[np.ndarray] = []
     training_seed_sets: list[np.ndarray] = []
