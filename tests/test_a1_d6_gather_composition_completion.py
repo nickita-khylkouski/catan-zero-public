@@ -320,6 +320,10 @@ def test_completion_proves_short_128_step_dose_end_to_end(
             "does not isolate four LR=1.2e-4 tensors",
         ),
         (
+            lambda root: _mutate_optimizer_step(root),
+            "optimizer state step does not match completed dose",
+        ),
+        (
             lambda root: _mutate_inherited_tensor(root),
             "outside/excluding gather adapter",
         ),
@@ -375,6 +379,19 @@ def _mutate_optimizer_lr(root: Path) -> None:
     payload = torch.load(path, map_location="cpu", weights_only=False)
     payload["optimizer"]["param_groups"][1]["lr"] = 6e-5
     torch.save(payload, path)
+    _rebind_optimizer_progress(root, path)
+
+
+def _mutate_optimizer_step(root: Path) -> None:
+    path = root / "candidate.pt.optimizer.pt"
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    first = next(iter(payload["optimizer"]["state"].values()))
+    first["step"] = torch.tensor(17)
+    torch.save(payload, path)
+    _rebind_optimizer_progress(root, path)
+
+
+def _rebind_optimizer_progress(root: Path, path: Path) -> None:
     progress_path = root / "candidate.pt.training-progress.json"
     progress = json.loads(progress_path.read_text(encoding="utf-8"))
     progress["optimizer"]["sha256"] = completion._compact_ref(path)[  # noqa: SLF001
