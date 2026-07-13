@@ -132,6 +132,12 @@ def test_d6_static_catalog_gather_uses_mapped_not_original_action_ids():
     )
     entity["legal_action_mask"] = legal_ids >= 0
     entity["legal_action_target_ids"][0, 2] = -1
+    # The proven d1 evaluator contract requires explicit incidence tables in
+    # every entity batch.  This identity-only adversarial fixture does not use
+    # their values, but it must still model the runtime shape faithfully.
+    entity["hex_vertex_ids"] = np.full((1, 19, 6), -1, dtype=np.int16)
+    entity["hex_edge_ids"] = np.full((1, 19, 6), -1, dtype=np.int16)
+    entity["edge_vertex_ids"] = np.full((1, 72, 2), -1, dtype=np.int16)
     rotated = symmetry.permute_entity_batch(
         entity,
         np.asarray([orientation]),
