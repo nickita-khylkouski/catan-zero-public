@@ -39,6 +39,9 @@ _NON_MODEL_ENTITY_KEYS = frozenset(
         "legal_action_mask",
     }
 )
+_RELATIONAL_TOPOLOGY_KEYS = frozenset(
+    {"hex_vertex_ids", "hex_edge_ids", "edge_vertex_ids", "event_target_ids"}
+)
 
 
 def _synthetic_batch(
@@ -106,7 +109,28 @@ def _synthetic_batch(
     legal_ids = np.full((batch_size, legal_width), -1, dtype=np.int64)
     for row, count in enumerate(live_counts):
         legal_ids[row, : int(count)] = np.arange(int(count), dtype=np.int64)
+        # Exercise the trained gather rather than an all-zero no-target corner.
+        entity["legal_action_target_ids"][row, : int(count), 1] = (
+            np.arange(int(count), dtype=np.int16) % 54
+        )
     entity["legal_action_mask"] = legal_ids >= 0
+    # Deterministic, valid production-shape standard-board incidence.
+    entity["hex_vertex_ids"] = np.broadcast_to(
+        np.arange(19 * 6, dtype=np.int16).reshape(1, 19, 6) % 54,
+        (batch_size, 19, 6),
+    ).copy()
+    entity["hex_edge_ids"] = np.broadcast_to(
+        np.arange(19 * 6, dtype=np.int16).reshape(1, 19, 6) % 72,
+        (batch_size, 19, 6),
+    ).copy()
+    edges = np.arange(72, dtype=np.int16).reshape(1, 72, 1)
+    edge_vertices = np.concatenate((edges % 54, (edges + 1) % 54), axis=2)
+    entity["edge_vertex_ids"] = np.broadcast_to(
+        edge_vertices, (batch_size, 72, 2)
+    ).copy()
+    entity["event_target_ids"] = np.full(
+        (batch_size, event_width, 4), -1, dtype=np.int16
+    )
     return entity, legal_ids, context
 
 
@@ -153,13 +177,21 @@ class _StageRecorder:
 
 def _host_to_device(policy: Any, entity: dict[str, np.ndarray], legal_ids: np.ndarray, context: np.ndarray, torch: Any):
     needs_targets = bool(
-        getattr(policy.config, "action_target_gather", False)
+        str(getattr(policy.config, "state_trunk", "transformer")) != "transformer"
+        or getattr(policy.config, "action_target_gather", False)
         or getattr(policy.config, "edge_policy_head", False)
+    )
+    needs_topology = bool(
+        str(getattr(policy.config, "state_trunk", "transformer")) != "transformer"
+        or getattr(policy.config, "topology_residual_adapter", False)
     )
     batch = {
         key: torch.as_tensor(value, device=policy.device)
         for key, value in entity.items()
-        if key not in _NON_MODEL_ENTITY_KEYS
+        if (
+            key not in _NON_MODEL_ENTITY_KEYS
+            or (needs_topology and key in _RELATIONAL_TOPOLOGY_KEYS)
+        )
         and (key != "legal_action_target_ids" or needs_targets)
     }
     batch["legal_action_context"] = torch.as_tensor(
@@ -234,6 +266,19 @@ def _attributed_forward(
         return tokens, torch.cat(masks, dim=1)
 
     tokens, padding_mask = recorder.run("sequence_and_mask_assembly", assemble_state)
+    if bool(getattr(model, "topology_residual_adapter_enabled", False)):
+        from catan_zero.rl.relational_trunks import build_relation_ids
+
+        relation_ids = recorder.run(
+            "topology_relation_construction",
+            lambda: build_relation_ids(batch, sequence_length=int(tokens.shape[1])),
+        )
+        tokens = recorder.run(
+            "topology_residual_adapter",
+            lambda: model.topology_residual_adapter(
+                tokens, relation_ids, key_padding_mask=padding_mask
+            ),
+        )
     # Expand _Block.forward exactly, rather than treating each transformer as
     # an opaque 2-ms box.  The final exact-vs-attributed bit-parity assertion
     # protects this internal attribution against implementation drift.
@@ -473,6 +518,8 @@ def _stage_family_totals(stages: dict[str, Any]) -> dict[str, float]:
         value = stage["cuda_ms"]["mean"]
         if name.startswith("transformer_"):
             family = "transformer_blocks"
+        elif name.startswith("topology_"):
+            family = "topology_adapter"
         elif name.startswith("project_") or name.startswith("add_") or name == "expand_cls":
             family = "entity_projection_and_type"
         elif name.startswith("action_") or name.startswith("policy_"):
@@ -511,8 +558,12 @@ def _preloaded_forward(model: Any, batch: dict[str, Any], action_ids: Any, *, re
 
 
 def _ab_player_crop(policy: Any, entity: dict[str, np.ndarray], legal_ids: np.ndarray, context: np.ndarray, *, return_q: bool, warmup: int, iterations: int, torch: Any) -> dict[str, Any]:
-    if bool(getattr(policy.config, "action_target_gather", False) or getattr(policy.config, "edge_policy_head", False)):
-        return {"skipped": "target-aware action heads require a separate offset audit"}
+    if bool(
+        getattr(policy.config, "action_target_gather", False)
+        or getattr(policy.config, "edge_policy_head", False)
+        or getattr(policy.config, "topology_residual_adapter", False)
+    ):
+        return {"skipped": "target/topology-aware checkpoint requires separate crop audit"}
     batch, action_ids = _host_to_device(policy, entity, legal_ids, context, torch)
     if entity["event_tokens"].shape[1] != 0:
         return {"skipped": "A/B requires event_width=0"}
