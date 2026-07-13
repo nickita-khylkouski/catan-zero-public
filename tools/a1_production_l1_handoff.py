@@ -17,8 +17,15 @@ from pathlib import Path
 import sys
 from typing import Any, Sequence
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
-SCHEMA = "a1-production-l1-promotion-handoff-v1"
+from tools import a1_learner_dose_contract as learner_dose  # noqa: E402
+from tools import a1_production_l1_rerun as production_l1  # noqa: E402
+
+LEGACY_SCHEMA = "a1-production-l1-promotion-handoff-v1"
+SCHEMA = "a1-production-l1-promotion-handoff-v2"
 
 
 class HandoffError(RuntimeError):
@@ -71,26 +78,77 @@ def _checkpoint_sha(payload: dict[str, Any], label: str) -> str:
     return value
 
 
-def prepare(args: argparse.Namespace) -> dict[str, Any]:
-    candidate = _ref(args.candidate)
-    report = _ref(args.report)
-    completion = _ref(args.completion)
+def _verify_selected_completion(
+    *,
+    candidate: dict[str, str],
+    report: dict[str, str],
+    completion: dict[str, str],
+    f7_sha256: str,
+) -> str:
     report_payload = _load(Path(report["path"]))
     completion_payload = _load(Path(completion["path"]))
+    expected_completion_keys = {
+        "schema_version",
+        "diagnostic_only",
+        "production_eligible",
+        "created_at_unix_ns",
+        "manifest",
+        "submission",
+        "checkpoint",
+        "report",
+        "unit_state",
+        "dose_contract",
+        "receipt_sha256",
+    }
+    if set(completion_payload) != expected_completion_keys:
+        raise HandoffError("completion receipt fields differ from selected-dose schema")
     completion_unhashed = dict(completion_payload)
     stated_completion = completion_unhashed.pop("receipt_sha256", None)
     if stated_completion != _digest(completion_unhashed):
         raise HandoffError("completion receipt semantic digest drift")
+    try:
+        learner_dose.assert_payload(
+            completion_payload.get("dose_contract"),
+            learner_dose.PARETO_SELECTED_DOSE,
+        )
+        learner_dose.assert_report(report_payload, learner_dose.PARETO_SELECTED_DOSE)
+    except learner_dose.LearnerDoseError as error:
+        raise HandoffError(str(error)) from error
     if (
-        completion_payload.get("production_eligible") is not True
+        completion_payload.get("schema_version") != production_l1.COMPLETION_SCHEMA
+        or completion_payload.get("diagnostic_only") is not False
+        or completion_payload.get("production_eligible") is not True
         or completion_payload.get("checkpoint") != candidate
         or completion_payload.get("report") != report
-        or report_payload.get("steps_completed") != 1024
-        or report_payload.get("world_size") != 8
-        or report_payload.get("batch_size") != 512
-        or report_payload.get("init_checkpoint_sha256") != args.f7_sha256
+        or completion_payload.get("unit_state")
+        != {"ActiveState": "inactive", "Result": "success", "ExecMainStatus": "0"}
+        or report_payload.get("init_checkpoint_sha256") != f7_sha256
     ):
         raise HandoffError("finalized learner lineage/selected dose drift")
+    manifest_path = _verify_ref(completion_payload.get("manifest"), "learner manifest")
+    _verify_ref(completion_payload.get("submission"), "learner submission")
+    try:
+        verified = production_l1.verify(manifest_path)
+    except (production_l1.L1Error, OSError, KeyError, ValueError) as error:
+        raise HandoffError(f"learner manifest replay refused: {error}") from error
+    if (
+        verified.get("manifest_ref") != completion_payload.get("manifest")
+        or verified.get("dose") != learner_dose.PARETO_SELECTED_DOSE
+    ):
+        raise HandoffError("completion manifest does not carry selected-dose authority")
+    return str(stated_completion)
+
+
+def prepare(args: argparse.Namespace) -> dict[str, Any]:
+    candidate = _ref(args.candidate)
+    report = _ref(args.report)
+    completion = _ref(args.completion)
+    stated_completion = _verify_selected_completion(
+        candidate=candidate,
+        report=report,
+        completion=completion,
+        f7_sha256=args.f7_sha256,
+    )
 
     stage1 = _ref(args.stage1)
     stage1_payload = _load(Path(stage1["path"]))
@@ -190,12 +248,7 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
             "report": report,
             "completion_receipt": completion,
             "completion_receipt_sha256": stated_completion,
-            "selected_dose": {
-                "optimizer_steps": 1024,
-                "world_size": 8,
-                "per_rank_batch_size": 512,
-                "global_samples": 4_194_304,
-            },
+            "selected_dose": learner_dose.PARETO_SELECTED_DOSE.payload(),
             "f7_parent_sha256": args.f7_sha256,
         },
         "evidence": {
@@ -247,15 +300,35 @@ def verify(path: Path) -> dict[str, Any]:
     value = _load(path.resolve(strict=True))
     stated = value.get("bundle_sha256")
     unhashed = {key: item for key, item in value.items() if key != "bundle_sha256"}
-    if value.get("schema_version") != SCHEMA or stated != _digest(unhashed):
+    if value.get("schema_version") not in {SCHEMA, LEGACY_SCHEMA} or stated != _digest(unhashed):
         raise HandoffError("handoff bundle digest/schema drift")
     if value.get("promotion_ready") is not False or value.get(
         "pointer_mutation_authorized"
     ) is not False:
         raise HandoffError("pending handoff unexpectedly authorizes promotion")
     learner = value["learner"]
+    try:
+        if value.get("schema_version") == SCHEMA:
+            learner_dose.assert_payload(
+                learner.get("selected_dose"), learner_dose.PARETO_SELECTED_DOSE
+            )
+        else:
+            learner_dose.assert_legacy_payload(
+                learner.get("selected_dose"), learner_dose.HISTORICAL_FULL_DOSE
+            )
+    except learner_dose.LearnerDoseError as error:
+        raise HandoffError(str(error)) from error
     for key in ("candidate", "report", "completion_receipt"):
         _verify_ref(learner[key], f"learner.{key}")
+    if value.get("schema_version") == SCHEMA:
+        replayed_completion_sha = _verify_selected_completion(
+            candidate=learner["candidate"],
+            report=learner["report"],
+            completion=learner["completion_receipt"],
+            f7_sha256=str(learner["f7_parent_sha256"]),
+        )
+        if replayed_completion_sha != learner.get("completion_receipt_sha256"):
+            raise HandoffError("learner completion semantic digest drifted from bundle")
     evidence = value["evidence"]
     _verify_ref(evidence["stage1_vs_historical_l1"]["artifact"], "stage1")
     for key in ("candidate", "champion", "comparison"):

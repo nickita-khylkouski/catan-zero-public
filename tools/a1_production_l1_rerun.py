@@ -20,21 +20,34 @@ import sys
 import time
 from typing import Any, Callable, Sequence
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
-MANIFEST_SCHEMA = "a1-production-l1-rerun-v1"
-CLAIM_SCHEMA = "a1-production-l1-rerun-claim-v1"
-SUBMISSION_SCHEMA = "a1-production-l1-rerun-submission-v1"
-COMPLETION_SCHEMA = "a1-production-l1-rerun-completion-v1"
+from tools import a1_learner_dose_contract as learner_dose  # noqa: E402
+
+LEGACY_MANIFEST_SCHEMA = "a1-production-l1-rerun-v1"
+MANIFEST_SCHEMA = "a1-production-l1-rerun-v2"
+LEGACY_CLAIM_SCHEMA = "a1-production-l1-rerun-claim-v1"
+CLAIM_SCHEMA = "a1-production-l1-rerun-claim-v2"
+LEGACY_SUBMISSION_SCHEMA = "a1-production-l1-rerun-submission-v1"
+SUBMISSION_SCHEMA = "a1-production-l1-rerun-submission-v2"
+LEGACY_COMPLETION_SCHEMA = "a1-production-l1-rerun-completion-v1"
+COMPLETION_SCHEMA = "a1-production-l1-rerun-completion-v2"
 SOURCE_SCHEMA = "a1-p2-independent-loser1-control-v1"
 ACK_FLAG = "--acknowledge-empty-event-history-payload-inventory-sha256"
 CROP_FLAG = "--crop-authenticated-empty-event-history"
 BOUND_SOURCE_FILES = (
     "tools/a1_production_l1_rerun.py",
+    "tools/a1_learner_dose_contract.py",
     "tools/train_bc.py",
     "tools/mixed_memmap_corpus.py",
     "tools/audit_entity_graph_information_surface.py",
     "src/catan_zero/rl/entity_token_policy.py",
     "src/catan_zero/rl/entity_token_features.py",
+)
+LEGACY_BOUND_SOURCE_FILES = tuple(
+    path for path in BOUND_SOURCE_FILES if path != "tools/a1_learner_dose_contract.py"
 )
 SAFE_UNIT = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.@-]{0,79}")
 
@@ -217,7 +230,9 @@ def _replace_option(command: list[str], flag: str, value: str) -> None:
     command[index + 1] = value
 
 
-def _validate_historical_recipe(command: list[str]) -> None:
+def _validate_recipe(
+    command: list[str], dose: learner_dose.LearnerDose, *, label: str = "L1 recipe"
+) -> None:
     exact = {
         "--nproc-per-node": "8",
         "--arch": "entity_graph",
@@ -225,7 +240,7 @@ def _validate_historical_recipe(command: list[str]) -> None:
         "--graph-layers": "6",
         "--attention-heads": "8",
         "--epochs": "1",
-        "--max-steps": "1024",
+        "--max-steps": str(dose.optimizer_steps),
         "--batch-size": "512",
         "--grad-accum-steps": "1",
         "--optimizer": "adam",
@@ -238,7 +253,7 @@ def _validate_historical_recipe(command: list[str]) -> None:
     }
     for flag, expected in exact.items():
         if _option(command, flag) != expected:
-            raise L1Error(f"historical L1 drift at {flag}: expected {expected}")
+            raise L1Error(f"{label} drift at {flag}: expected {expected}")
     required = {
         "--no-resume-optimizer", "--no-fused-optimizer", "--mask-hidden-info",
         "--graph-history-features", "--trust-curated-data-quality",
@@ -247,7 +262,33 @@ def _validate_historical_recipe(command: list[str]) -> None:
     if missing:
         raise L1Error(f"historical L1 command lacks required flags: {missing}")
     if ACK_FLAG in command or CROP_FLAG in command or "--max-grad-norm" in command:
-        raise L1Error("historical receipt unexpectedly contains latest-main additions")
+        raise L1Error("projected L1 recipe unexpectedly contains latest-main additions")
+
+
+def _validate_historical_recipe(command: list[str]) -> None:
+    """Replay the immutable full-dose evidence used to select this recipe."""
+
+    _validate_recipe(
+        command, learner_dose.HISTORICAL_FULL_DOSE, label="historical L1"
+    )
+
+
+def _manifest_dose(manifest: dict[str, Any]) -> learner_dose.LearnerDose:
+    schema = manifest.get("schema_version")
+    try:
+        if schema == MANIFEST_SCHEMA:
+            learner_dose.assert_payload(
+                manifest.get("selected_dose"), learner_dose.PARETO_SELECTED_DOSE
+            )
+            return learner_dose.PARETO_SELECTED_DOSE
+        if schema == LEGACY_MANIFEST_SCHEMA:
+            learner_dose.assert_legacy_payload(
+                manifest.get("selected_dose"), learner_dose.HISTORICAL_FULL_DOSE
+            )
+            return learner_dose.HISTORICAL_FULL_DOSE
+    except learner_dose.LearnerDoseError as error:
+        raise L1Error(str(error)) from error
+    raise L1Error("production L1 manifest schema is unsupported")
 
 
 def _historical_projection(command: list[str], inventories: Sequence[str]) -> list[str]:
@@ -367,6 +408,13 @@ def prepare(
     _replace_option(command, "--init-checkpoint", parent["path"])
     _replace_option(command, "--checkpoint", str(output_root / "candidate.pt"))
     _replace_option(command, "--report", str(output_root / "train.report.json"))
+    # The source receipt is historical evidence, not a production-dose
+    # template.  New candidates use the independently selected Pareto dose.
+    _replace_option(
+        command,
+        "--max-steps",
+        str(learner_dose.PARETO_SELECTED_DOSE.optimizer_steps),
+    )
     command.extend(["--max-grad-norm", "1.0", "--policy-aux-active-batch-size", "0"])
     for inventory in inventories:
         command.extend([ACK_FLAG, inventory])
@@ -377,14 +425,7 @@ def prepare(
         "diagnostic_only": False,
         "production_eligible": True,
         "launch_authorized": True,
-        "selected_dose": {
-            "optimizer_steps": 1024,
-            "world_size": 8,
-            "per_rank_batch_size": 512,
-            "global_samples": 4_194_304,
-            "policy_aux_active_batch_size": 0,
-            "selection": "exact independently successful L1 dose",
-        },
+        "selected_dose": learner_dose.PARETO_SELECTED_DOSE.payload(),
         "source_receipt": receipt_ref,
         "source_descriptor": descriptor,
         "validation_sentinel": sentinel,
@@ -431,7 +472,7 @@ def prepare(
             # The DDP reducer raises at the start of forward two, so iteration
             # one may have updated only ephemeral in-memory weights.  There is
             # no checkpoint/optimizer/report to resume; r3 reloads exact f7 and
-            # constructs fresh Adam for the full selected dose.
+            # constructs fresh Adam for the selected Pareto dose.
             in_memory_optimizer_steps = 1
         else:
             raise L1Error("failed retry lineage is not an authorized launch failure")
@@ -447,7 +488,10 @@ def prepare(
             ),
             "in_memory_optimizer_steps_before_failure": in_memory_optimizer_steps,
             "persisted_outputs": None,
-            "restart": "exact f7 parent plus fresh Adam for full 1024-step dose",
+            "restart": (
+                "exact f7 parent plus fresh Adam for Pareto-selected "
+                "128-step dose"
+            ),
             "manifest": _ref(failed_manifest),
             "claim": claim,
             "submission": _ref(failed_root / "submission.receipt.json"),
@@ -474,12 +518,13 @@ def verify(manifest_path: Path) -> dict[str, Any]:
     if stated != _digest(unhashed):
         raise L1Error("manifest semantic digest drift")
     if (
-        manifest.get("schema_version") != MANIFEST_SCHEMA
+        manifest.get("schema_version") not in {MANIFEST_SCHEMA, LEGACY_MANIFEST_SCHEMA}
         or manifest.get("diagnostic_only") is not False
         or manifest.get("production_eligible") is not True
         or manifest.get("launch_authorized") is not True
     ):
         raise L1Error("manifest does not authorize the production L1 rerun")
+    dose = _manifest_dose(manifest)
     for field in ("source_receipt", "source_descriptor", "validation_sentinel", "f7_parent"):
         _verify_ref(manifest.get(field), field)
     lexical_python = _verify_python_binding(manifest.get("runtime_python"))
@@ -490,7 +535,11 @@ def verify(manifest_path: Path) -> dict[str, Any]:
             or lineage.get("in_memory_optimizer_steps_before_failure") not in {0, 1}
             or lineage.get("persisted_outputs") is not None
             or lineage.get("restart")
-            != "exact f7 parent plus fresh Adam for full 1024-step dose"
+            != (
+                "exact f7 parent plus fresh Adam for Pareto-selected 128-step dose"
+                if dose == learner_dose.PARETO_SELECTED_DOSE
+                else "exact f7 parent plus fresh Adam for full 1024-step dose"
+            )
         ):
             raise L1Error("pre-training retry lineage is malformed")
         for field in ("manifest", "claim", "submission", "stderr"):
@@ -503,6 +552,13 @@ def verify(manifest_path: Path) -> dict[str, Any]:
         raise L1Error("repo binding is malformed")
     repo = Path(str(repo_binding["repository_root"])).resolve(strict=True)
     _assert_bound_checkout(repo, str(repo_binding["public_main_commit"]))
+    expected_source_files = (
+        BOUND_SOURCE_FILES
+        if manifest.get("schema_version") == MANIFEST_SCHEMA
+        else LEGACY_BOUND_SOURCE_FILES
+    )
+    if set(repo_binding.get("files", {})) != set(expected_source_files):
+        raise L1Error("repository source binding is incomplete for manifest schema")
     for relative, ref in repo_binding.get("files", {}).items():
         if _verify_ref(ref, f"source.{relative}") != (repo / relative).resolve(strict=True):
             raise L1Error(f"source binding escaped checkout: {relative}")
@@ -516,7 +572,7 @@ def verify(manifest_path: Path) -> dict[str, Any]:
     inventories = manifest["event_history_training_contract"][
         "payload_inventory_acknowledgements"
     ]
-    _validate_historical_recipe(_historical_projection(command, inventories))
+    _validate_recipe(_historical_projection(command, inventories), dose)
     if _option(command, "--max-grad-norm") != "1.0":
         raise L1Error("max gradient norm is not explicitly 1.0")
     if _option(command, "--policy-aux-active-batch-size") != "0":
@@ -538,8 +594,14 @@ def verify(manifest_path: Path) -> dict[str, Any]:
         command, "--report"
     ) != str(output_root / "train.report.json"):
         raise L1Error("command output paths are not canonical")
-    return {"manifest": manifest, "manifest_ref": manifest_ref, "repo": repo,
-            "command": command, "output_root": output_root}
+    return {
+        "manifest": manifest,
+        "manifest_ref": manifest_ref,
+        "repo": repo,
+        "command": command,
+        "output_root": output_root,
+        "dose": dose,
+    }
 
 
 def _idle_b200s(
@@ -582,6 +644,10 @@ def execute(
     if SAFE_UNIT.fullmatch(unit) is None:
         raise L1Error("systemd unit name is invalid")
     verified = verify(manifest_path)
+    if verified["manifest"]["schema_version"] != MANIFEST_SCHEMA:
+        raise L1Error(
+            "historical full-dose manifests are replayable evidence, not launch authority"
+        )
     conflicts = idle_probe()
     if conflicts:
         raise L1Error(f"B200 compute is not idle: {conflicts}")
@@ -640,7 +706,14 @@ def finalize(manifest_path: Path, *, unit: str) -> dict[str, Any]:
     root = verified["output_root"]
     submission_path = root / "submission.receipt.json"
     submission = _load(submission_path)
-    if submission.get("schema_version") != SUBMISSION_SCHEMA or submission.get("unit") != unit:
+    legacy = verified["manifest"]["schema_version"] == LEGACY_MANIFEST_SCHEMA
+    expected_submission_schema = (
+        LEGACY_SUBMISSION_SCHEMA if legacy else SUBMISSION_SCHEMA
+    )
+    if (
+        submission.get("schema_version") != expected_submission_schema
+        or submission.get("unit") != unit
+    ):
         raise L1Error("submission receipt/unit does not match")
     try:
         state = subprocess.check_output(
@@ -664,8 +737,12 @@ def finalize(manifest_path: Path, *, unit: str) -> dict[str, Any]:
             "payload_inventory_acknowledgements"
         ],
     )
+    try:
+        learner_dose.assert_report(report_payload, verified["dose"])
+    except learner_dose.LearnerDoseError as error:
+        raise L1Error(str(error)) from error
     completion = {
-        "schema_version": COMPLETION_SCHEMA,
+        "schema_version": LEGACY_COMPLETION_SCHEMA if legacy else COMPLETION_SCHEMA,
         "diagnostic_only": False,
         "production_eligible": True,
         "created_at_unix_ns": time.time_ns(),
@@ -675,6 +752,8 @@ def finalize(manifest_path: Path, *, unit: str) -> dict[str, Any]:
         "report": report_ref,
         "unit_state": fields,
     }
+    if not legacy:
+        completion["dose_contract"] = verified["dose"].payload()
     completion["receipt_sha256"] = _digest(completion)
     _write_exclusive(root / "completion.receipt.json", completion)
     return completion

@@ -24,10 +24,14 @@ if str(REPO_ROOT) not in sys.path:
 from tools import a1_production_l1_rerun as base  # noqa: E402
 
 
-MANIFEST_SCHEMA = "a1-production-temperature-replication-v2"
-CLAIM_SCHEMA = "a1-production-temperature-replication-claim-v1"
-SUBMISSION_SCHEMA = "a1-production-temperature-replication-submission-v1"
-COMPLETION_SCHEMA = "a1-production-temperature-replication-completion-v1"
+LEGACY_MANIFEST_SCHEMA = "a1-production-temperature-replication-v2"
+MANIFEST_SCHEMA = "a1-production-temperature-replication-v3"
+LEGACY_CLAIM_SCHEMA = "a1-production-temperature-replication-claim-v1"
+CLAIM_SCHEMA = "a1-production-temperature-replication-claim-v2"
+LEGACY_SUBMISSION_SCHEMA = "a1-production-temperature-replication-submission-v1"
+SUBMISSION_SCHEMA = "a1-production-temperature-replication-submission-v2"
+LEGACY_COMPLETION_SCHEMA = "a1-production-temperature-replication-completion-v1"
+COMPLETION_SCHEMA = "a1-production-temperature-replication-completion-v2"
 DIAGNOSTIC_COMMAND_SCHEMA = "n256-temperature-arm-command-v1"
 DIAGNOSTIC_COMPLETION_SCHEMA = "n256-temperature-arm-completion-v1"
 F7_SHA256 = "sha256:f7e93dfb8cdb713d647b3e142c949d59083de9f719b6688b6faa6c918ce3eed4"
@@ -66,9 +70,9 @@ SEALED_REPORT_RECIPE = {
     "grad_accum_steps": 1,
     "effective_global_batch_size": 4096,
     "epochs": 1,
-    "max_steps": 1024,
-    "steps_completed": 1024,
-    "base_training_row_draws": 4_194_304,
+    "max_steps": base.learner_dose.PARETO_SELECTED_DOSE.optimizer_steps,
+    "steps_completed": base.learner_dose.PARETO_SELECTED_DOSE.optimizer_steps,
+    "base_training_row_draws": base.learner_dose.PARETO_SELECTED_DOSE.global_samples,
     "optimizer": "adam",
     "resume_optimizer": False,
     "optimizer_restored": False,
@@ -125,10 +129,14 @@ SEALED_REPORT_RECIPE = {
 BOUND_SOURCE_FILES = (
     "tools/a1_production_temperature_replication.py",
     "tools/a1_production_l1_rerun.py",
+    "tools/a1_learner_dose_contract.py",
     "tools/train_bc.py",
     "tools/mixed_memmap_corpus.py",
     "src/catan_zero/rl/entity_token_policy.py",
     "src/catan_zero/rl/entity_token_features.py",
+)
+LEGACY_BOUND_SOURCE_FILES = tuple(
+    path for path in BOUND_SOURCE_FILES if path != "tools/a1_learner_dose_contract.py"
 )
 
 
@@ -138,6 +146,42 @@ class TemperatureReplicationError(RuntimeError):
 
 def _fail(message: str) -> None:
     raise TemperatureReplicationError(message)
+
+
+def _manifest_dose(manifest: dict[str, Any]) -> base.learner_dose.LearnerDose:
+    schema = manifest.get("schema_version")
+    selected = manifest.get("selected_dose")
+    try:
+        if schema == MANIFEST_SCHEMA:
+            base.learner_dose.assert_payload(
+                selected,
+                base.learner_dose.PARETO_SELECTED_DOSE,
+                allow_extra=True,
+            )
+            expected_extras = {
+                "optimizer": "fresh_adam",
+                "lr": 3e-5,
+                "training_rng_rank_offset": True,
+            }
+            if (
+                set(selected)
+                != set(base.learner_dose.PARETO_SELECTED_DOSE.payload())
+                | set(expected_extras)
+                or any(
+                    selected.get(key) != value
+                    for key, value in expected_extras.items()
+                )
+            ):
+                _fail("production temperature optimizer contract drift")
+            return base.learner_dose.PARETO_SELECTED_DOSE
+        if schema == LEGACY_MANIFEST_SCHEMA:
+            base.learner_dose.assert_legacy_payload(
+                selected, base.learner_dose.HISTORICAL_FULL_DOSE
+            )
+            return base.learner_dose.HISTORICAL_FULL_DOSE
+    except base.learner_dose.LearnerDoseError as error:
+        raise TemperatureReplicationError(str(error)) from error
+    _fail("production temperature manifest schema is unsupported")
 
 
 def _load_ref(path: Path, label: str) -> tuple[dict[str, Any], dict[str, str]]:
@@ -175,6 +219,7 @@ def _production_command(
     trainer: Path,
     checkpoint: Path,
     report: Path,
+    dose: base.learner_dose.LearnerDose = base.learner_dose.PARETO_SELECTED_DOSE,
 ) -> list[str]:
     """Derive the production command plus the proven-empty event fast path.
 
@@ -194,18 +239,40 @@ def _production_command(
     command[command.index(trainers[0])] = str(trainer.resolve(strict=True))
     _set(command, "--checkpoint", str(checkpoint))
     _set(command, "--report", str(report))
+    _set(
+        command,
+        "--max-steps",
+        str(dose.optimizer_steps),
+    )
     if base.CROP_FLAG in command:
         _fail("diagnostic command unexpectedly already contains the production crop")
     command.append(base.CROP_FLAG)
     return command
 
 
-def _completed_recipe_drift(report: dict[str, Any]) -> dict[str, dict[str, Any]]:
+def _sealed_report_recipe(
+    dose: base.learner_dose.LearnerDose,
+) -> dict[str, Any]:
+    recipe = dict(SEALED_REPORT_RECIPE)
+    recipe.update(
+        {
+            "max_steps": dose.optimizer_steps,
+            "steps_completed": dose.optimizer_steps,
+            "base_training_row_draws": dose.global_samples,
+        }
+    )
+    return recipe
+
+
+def _completed_recipe_drift(
+    report: dict[str, Any],
+    dose: base.learner_dose.LearnerDose = base.learner_dose.PARETO_SELECTED_DOSE,
+) -> dict[str, dict[str, Any]]:
     """Return strength-affecting report fields that differ from the winner."""
 
     return {
         key: {"expected": expected, "actual": report.get(key)}
-        for key, expected in SEALED_REPORT_RECIPE.items()
+        for key, expected in _sealed_report_recipe(dose).items()
         if report.get(key) != expected
     }
 
@@ -377,7 +444,12 @@ def _verify_diagnostic_selection(
 
 
 def _validate_recipe(
-    command: list[str], *, descriptor: str, sentinel: str, f7: str
+    command: list[str],
+    *,
+    descriptor: str,
+    sentinel: str,
+    f7: str,
+    dose: base.learner_dose.LearnerDose = base.learner_dose.HISTORICAL_FULL_DOSE,
 ) -> None:
     exact = {
         "--nproc-per-node": "8",
@@ -393,7 +465,7 @@ def _validate_recipe(
         "--track": "2p_no_trade",
         "--vps-to-win": "10",
         "--epochs": "1",
-        "--max-steps": "1024",
+        "--max-steps": str(dose.optimizer_steps),
         "--batch-size": "512",
         "--grad-accum-steps": "1",
         "--seed": "1",
@@ -550,10 +622,7 @@ def prepare(
             "payload_inventory_acknowledgements": inventories,
         },
         "selected_dose": {
-            "optimizer_steps": 1024,
-            "world_size": 8,
-            "per_rank_batch_size": 512,
-            "global_samples": 4_194_304,
+            **base.learner_dose.PARETO_SELECTED_DOSE.payload(),
             "optimizer": "fresh_adam",
             "lr": 3e-5,
             "training_rng_rank_offset": True,
@@ -602,12 +671,13 @@ def verify(manifest_path: Path) -> dict[str, Any]:
     if set(manifest) != expected_manifest_keys:
         _fail("production temperature manifest fields differ from schema")
     if (
-        manifest.get("schema_version") != MANIFEST_SCHEMA
+        manifest.get("schema_version") not in {MANIFEST_SCHEMA, LEGACY_MANIFEST_SCHEMA}
         or manifest.get("diagnostic_only") is not False
         or manifest.get("production_eligible") is not True
         or manifest.get("launch_authorized") is not True
     ):
         _fail("manifest does not authorize production temperature replication")
+    dose = _manifest_dose(manifest)
     selection = manifest.get("selection_evidence")
     if (
         not isinstance(selection, dict)
@@ -648,16 +718,6 @@ def verify(manifest_path: Path) -> dict[str, Any]:
             "crop_authenticated_empty_event_history": True,
             "payload_inventory_acknowledgements": inventories,
         }
-        or manifest.get("selected_dose")
-        != {
-            "optimizer_steps": 1024,
-            "world_size": 8,
-            "per_rank_batch_size": 512,
-            "global_samples": 4_194_304,
-            "optimizer": "fresh_adam",
-            "lr": 3e-5,
-            "training_rng_rank_offset": True,
-        }
         or manifest.get("execution_preconditions")
         != {
             "visible_gpu_count": 8,
@@ -675,7 +735,12 @@ def verify(manifest_path: Path) -> dict[str, Any]:
     if set(repo_binding) != {"repository_root", "public_main_commit", "files"}:
         _fail("repository binding fields differ from schema")
     files = repo_binding.get("files")
-    if not isinstance(files, dict) or set(files) != set(BOUND_SOURCE_FILES):
+    expected_source_files = (
+        BOUND_SOURCE_FILES
+        if manifest.get("schema_version") == MANIFEST_SCHEMA
+        else LEGACY_BOUND_SOURCE_FILES
+    )
+    if not isinstance(files, dict) or set(files) != set(expected_source_files):
         _fail("repository source binding is incomplete")
     for relative, ref in files.items():
         if base._verify_ref(ref, f"source.{relative}") != (repo / relative).resolve(
@@ -697,6 +762,7 @@ def verify(manifest_path: Path) -> dict[str, Any]:
         descriptor=manifest["source_descriptor"]["path"],
         sentinel=manifest["validation_sentinel"]["path"],
         f7=manifest["f7_parent"]["path"],
+        dose=dose,
     )
     positions = [index for index, item in enumerate(command) if item == base.ACK_FLAG]
     if [command[index + 1] for index in positions] != inventories:
@@ -719,6 +785,7 @@ def verify(manifest_path: Path) -> dict[str, Any]:
         trainer=repo / "tools/train_bc.py",
         checkpoint=root / "candidate.pt",
         report=root / "train.report.json",
+        dose=dose,
     )
     if command != expected_command:
         _fail("production command is not the exact sealed production derivation")
@@ -728,6 +795,7 @@ def verify(manifest_path: Path) -> dict[str, Any]:
         "repo": repo,
         "command": command,
         "output_root": root,
+        "dose": dose,
     }
 
 
@@ -741,6 +809,10 @@ def execute(
     if base.SAFE_UNIT.fullmatch(unit) is None:
         _fail("systemd unit name is invalid")
     verified = verify(manifest_path)
+    if verified["manifest"]["schema_version"] != MANIFEST_SCHEMA:
+        _fail(
+            "historical full-dose manifests are replayable evidence, not launch authority"
+        )
     conflicts = idle_probe()
     if conflicts:
         _fail(f"B200 compute is not idle: {conflicts}")
@@ -809,9 +881,14 @@ def _verify_completed_report(
     descriptor = manifest["source_descriptor"]
     sentinel = manifest["validation_sentinel"]
     root = verified["output_root"]
-    drift = _completed_recipe_drift(report)
+    drift = _completed_recipe_drift(report, verified["dose"])
     if drift:
         _fail(f"completed report differs from sealed TEMP recipe: {drift}")
+    if manifest.get("schema_version") == MANIFEST_SCHEMA:
+        try:
+            base.learner_dose.assert_report(report, verified["dose"])
+        except base.learner_dose.LearnerDoseError as error:
+            raise TemperatureReplicationError(str(error)) from error
     if not _authenticated_objective_validation(report):
         _fail("completed report lacks authenticated objective-matched validation")
     try:
@@ -870,6 +947,7 @@ def finalize(manifest_path: Path, *, unit: str) -> dict[str, Any]:
     if base.SAFE_UNIT.fullmatch(unit) is None:
         _fail("systemd unit name is invalid")
     verified = verify(manifest_path)
+    legacy = verified["manifest"]["schema_version"] == LEGACY_MANIFEST_SCHEMA
     root = verified["output_root"]
     submission_path = root / "submission.receipt.json"
     submission = base._load(submission_path)  # noqa: SLF001
@@ -882,7 +960,8 @@ def finalize(manifest_path: Path, *, unit: str) -> dict[str, Any]:
     }
     if (
         set(submission) != expected_submission_keys
-        or submission.get("schema_version") != SUBMISSION_SCHEMA
+        or submission.get("schema_version")
+        != (LEGACY_SUBMISSION_SCHEMA if legacy else SUBMISSION_SCHEMA)
         or submission.get("diagnostic_only") is not False
         or submission.get("production_eligible") is not True
         or submission.get("unit") != unit
@@ -906,7 +985,8 @@ def finalize(manifest_path: Path, *, unit: str) -> dict[str, Any]:
             "schema_version", "created_at_unix_ns", "manifest", "unit",
             "claim_sha256",
         }
-        or claim.get("schema_version") != CLAIM_SCHEMA
+        or claim.get("schema_version")
+        != (LEGACY_CLAIM_SCHEMA if legacy else CLAIM_SCHEMA)
         or claim.get("manifest") != verified["manifest_ref"]
         or claim.get("unit") != unit
         or claim_digest != base._digest(claim_unhashed)  # noqa: SLF001
@@ -950,7 +1030,7 @@ def finalize(manifest_path: Path, *, unit: str) -> dict[str, Any]:
         checkpoint=checkpoint,
     )
     completion = {
-        "schema_version": COMPLETION_SCHEMA,
+        "schema_version": LEGACY_COMPLETION_SCHEMA if legacy else COMPLETION_SCHEMA,
         "diagnostic_only": False,
         "production_eligible": True,
         "created_at_unix_ns": time.time_ns(),
@@ -964,12 +1044,14 @@ def finalize(manifest_path: Path, *, unit: str) -> dict[str, Any]:
         "unit_state": fields,
         "replication_contract": {
             "initializer_sha256": F7_SHA256,
-            "global_samples": 4_194_304,
+            "global_samples": verified["dose"].global_samples,
             "optimizer": "fresh_adam",
             "stored_policy_component_temperatures": COMPONENT_TEMPERATURES,
             "diagnostic_selection_artifact_relabelled": False,
         },
     }
+    if not legacy:
+        completion["dose_contract"] = verified["dose"].payload()
     completion["receipt_sha256"] = base._digest(completion)  # noqa: SLF001
     base._write_exclusive(root / "completion.receipt.json", completion)  # noqa: SLF001
     return completion

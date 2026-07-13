@@ -245,9 +245,24 @@ def test_production_command_adds_only_outputs_runtime_and_proven_empty_crop(
     expected[expected.index("--report") + 1] = str(
         tmp_path / "production" / "report.json"
     )
+    expected[expected.index("--max-steps") + 1] = "128"
     expected.append(temp.base.CROP_FLAG)
     assert production == expected
     assert production.count(temp.base.CROP_FLAG) == 1
+
+
+def test_new_production_dose_is_typed_short_while_diagnostic_stays_full() -> None:
+    selected = {
+        **temp.base.learner_dose.PARETO_SELECTED_DOSE.payload(),
+        "optimizer": "fresh_adam",
+        "lr": 3e-5,
+        "training_rng_rank_offset": True,
+    }
+    manifest = {"schema_version": temp.MANIFEST_SCHEMA, "selected_dose": selected}
+
+    assert temp._manifest_dose(manifest) == temp.base.learner_dose.PARETO_SELECTED_DOSE
+    assert temp.SEALED_REPORT_RECIPE["max_steps"] == 128
+    assert temp.SEALED_REPORT_RECIPE["base_training_row_draws"] == 524_288
 
 
 def test_production_command_refuses_ambiguous_preexisting_crop(
