@@ -420,6 +420,8 @@ def test_explicit_execute_submits_exact_command_and_writes_append_only_evidence(
     assert len(calls) == 1
     submitted = calls[0]
     assert submitted[:3] == ["sudo", "-n", "systemd-run"]
+    assert "--property=RemainAfterExit=yes" in submitted
+    assert "--collect" not in submitted
     assert "--property=LimitNOFILE=65536" in submitted
     separator = submitted.index("--")
     assert submitted[separator + 1 :] == payload["command"]

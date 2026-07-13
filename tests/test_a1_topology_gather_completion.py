@@ -151,7 +151,21 @@ def _complete_run(
 
 
 def _state_reader(*_args, **_kwargs) -> str:
-    return "ActiveState=inactive\nResult=success\nExecMainStatus=0\n"
+    return (
+        "LoadState=loaded\nActiveState=active\nSubState=exited\n"
+        "Result=success\nExecMainStatus=0\nExecMainCode=1\n"
+    )
+
+
+def _complete_unit_state() -> dict[str, str]:
+    return {
+        "LoadState": "loaded",
+        "ActiveState": "active",
+        "SubState": "exited",
+        "Result": "success",
+        "ExecMainStatus": "0",
+        "ExecMainCode": "1",
+    }
 
 
 def test_completion_replays_exact_dose_and_adapter_only_delta(
@@ -180,11 +194,7 @@ def test_completion_refuses_wrong_expected_checkpoint(
         completion.build_completion(
             manifest_path,
             expected_checkpoint_sha256="sha256:" + "0" * 64,
-            unit_state={
-                "ActiveState": "inactive",
-                "Result": "success",
-                "ExecMainStatus": "0",
-            },
+            unit_state=_complete_unit_state(),
             created_at_unix_ns=1,
         )
 
@@ -208,11 +218,7 @@ def test_completion_refuses_mature_parameter_change(
         completion.build_completion(
             manifest_path,
             expected_checkpoint_sha256=completion._file_ref(checkpoint)["sha256"],  # noqa: SLF001
-            unit_state={
-                "ActiveState": "inactive",
-                "Result": "success",
-                "ExecMainStatus": "0",
-            },
+            unit_state=_complete_unit_state(),
             created_at_unix_ns=1,
         )
 
@@ -231,10 +237,6 @@ def test_completion_refuses_optimizer_step_drift(
         completion.build_completion(
             manifest_path,
             expected_checkpoint_sha256=completion._file_ref(checkpoint)["sha256"],  # noqa: SLF001
-            unit_state={
-                "ActiveState": "inactive",
-                "Result": "success",
-                "ExecMainStatus": "0",
-            },
+            unit_state=_complete_unit_state(),
             created_at_unix_ns=1,
         )

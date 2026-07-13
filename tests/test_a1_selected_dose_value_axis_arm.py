@@ -5,9 +5,11 @@ import json
 from pathlib import Path
 import subprocess
 
+import numpy as np
 import pytest
 
 from tools import a1_selected_dose_value_axis_arm as arm
+from tools import train_bc
 from test_a1_topology_gather_arm import _args as topology_args
 
 
@@ -63,6 +65,25 @@ def _args(
         return meta, arm.bridge.corrected._file_ref(Path(path))  # noqa: SLF001
 
     monkeypatch.setattr(arm, "_preflight_descriptor", preflight)
+
+    def scope_sentinel(
+        _source_reference,
+        *,
+        source_descriptor_meta,
+        treatment_descriptor_meta,
+        destination,
+    ):
+        del source_descriptor_meta, treatment_descriptor_meta
+        payload = {
+            "schema_version": "train-validation-game-sentinel-v1",
+            "selected_game_seed_set_sha256": "sha256:" + "1" * 64,
+            "excluded_game_seed_set_sha256": "sha256:" + "2" * 64,
+            "game_seeds": [1, 2],
+        }
+        destination.write_text(json.dumps(payload), encoding="utf-8")
+        return payload, arm.bridge.corrected._file_ref(destination)  # noqa: SLF001
+
+    monkeypatch.setattr(arm, "_write_scope_validation_sentinel", scope_sentinel)
     return type(
         "Args",
         (),
@@ -111,15 +132,109 @@ def test_current_value_scope_is_one_axis_and_retains_replay_policy(
     assert arm.bridge.corrected._option(command, "--max-steps") == "128"  # noqa: SLF001
     assert set(manifest["allowlisted_command_changes"]) == {
         "--data",
+        "--validation-game-sentinel-manifest",
         "--checkpoint",
         "--report",
     }
+    assert manifest["source_validation_sentinel"] != manifest[
+        "treatment_validation_sentinel"
+    ]
+    assert arm.bridge.corrected._option(  # noqa: SLF001
+        command, "--validation-game-sentinel-manifest"
+    ) == manifest["treatment_validation_sentinel"]["path"]
     descriptor = json.loads(
         Path(manifest["treatment_descriptor"]["path"]).read_text(encoding="utf-8")
     )
     assert descriptor["value_training_component_ids"] == list(
         arm.CURRENT_COMPONENT_IDS
     )
+
+
+def test_scope_sentinel_rebinds_only_descriptor_identity(tmp_path: Path) -> None:
+    source_meta = {
+        "descriptor_file_sha256": "sha256:" + "a" * 64,
+        "descriptor_fingerprint": "sha256:" + "b" * 64,
+    }
+    treatment_meta = {
+        "descriptor_file_sha256": "sha256:" + "c" * 64,
+        "descriptor_fingerprint": "sha256:" + "d" * 64,
+    }
+    contracts = [
+        {
+            "file_sha256": "sha256:" + "1" * 64,
+            "manifest_sha256": "sha256:" + "2" * 64,
+            "validation_game_seed_set_sha256": "sha256:" + "3" * 64,
+        }
+    ]
+    selected = np.asarray([10, 20], dtype=np.int64)
+    excluded = np.asarray([10, 11, 20, 21], dtype=np.int64)
+    source = {
+        "schema_version": "train-validation-game-sentinel-v1",
+        "source_composite_descriptor_file_sha256": source_meta[
+            "descriptor_file_sha256"
+        ],
+        "source_composite_descriptor_fingerprint": source_meta[
+            "descriptor_fingerprint"
+        ],
+        "source_validation_bindings": [
+            {
+                "component_index": 0,
+                "validation_manifest_file_sha256": contracts[0]["file_sha256"],
+                "validation_manifest_sha256": contracts[0]["manifest_sha256"],
+                "validation_game_seed_set_sha256": contracts[0][
+                    "validation_game_seed_set_sha256"
+                ],
+            }
+        ],
+        "selection_seed": 7,
+        "target_row_count": 100,
+        "selected_row_count": 99,
+        "selected_game_seed_count": 2,
+        "selected_game_seed_set_sha256": train_bc._game_seed_set_sha256(selected),  # noqa: SLF001
+        "excluded_game_seed_count": 4,
+        "excluded_game_seed_set_sha256": train_bc._game_seed_set_sha256(excluded),  # noqa: SLF001
+        "game_seeds": [10, 20],
+    }
+    source_path = tmp_path / "source-sentinel.json"
+    source_path.write_text(json.dumps(source), encoding="utf-8")
+    payload, reference = arm._write_scope_validation_sentinel(  # noqa: SLF001
+        arm.bridge.corrected._file_ref(source_path),  # noqa: SLF001
+        source_descriptor_meta=source_meta,
+        treatment_descriptor_meta=treatment_meta,
+        destination=tmp_path / "treatment-sentinel.json",
+    )
+    assert payload["source_composite_descriptor_file_sha256"] == treatment_meta[
+        "descriptor_file_sha256"
+    ]
+    assert payload["source_composite_descriptor_fingerprint"] == treatment_meta[
+        "descriptor_fingerprint"
+    ]
+    for key in set(source) - {
+        "source_composite_descriptor_file_sha256",
+        "source_composite_descriptor_fingerprint",
+    }:
+        assert payload[key] == source[key]
+    assert reference["path"].endswith("treatment-sentinel.json")
+    full_contract = {
+        "validation_row_count": 4,
+        "validation_game_seed_set_sha256": source[
+            "excluded_game_seed_set_sha256"
+        ],
+        "game_seeds": excluded,
+        "component_contracts": contracts,
+    }
+    with pytest.raises(SystemExit, match="source composite binding drift"):
+        train_bc._load_composite_validation_sentinel_manifest(  # noqa: SLF001
+            source_path,
+            composite_meta=treatment_meta,
+            full_contract=full_contract,
+        )
+    accepted = train_bc._load_composite_validation_sentinel_manifest(  # noqa: SLF001
+        Path(reference["path"]),
+        composite_meta=treatment_meta,
+        full_contract=full_contract,
+    )
+    np.testing.assert_array_equal(accepted["game_seeds"], selected)
 
 
 def test_value_loss_off_is_separate_one_axis(
@@ -170,6 +285,8 @@ def test_derivation_refuses_nonselected_value_or_dose(tmp_path: Path) -> None:
         "0.25",
         "--value-target-lambda",
         "1.0",
+        "--validation-game-sentinel-manifest",
+        str(tmp_path / "source-sentinel.json"),
         "--checkpoint",
         "old.pt",
         "--report",
@@ -181,6 +298,8 @@ def test_derivation_refuses_nonselected_value_or_dose(tmp_path: Path) -> None:
         axis=arm.VALUE_LOSS_OFF,
         source_descriptor=source_descriptor,
         treatment_descriptor=treatment,
+        source_validation_sentinel=tmp_path / "source-sentinel.json",
+        treatment_validation_sentinel=tmp_path / "treatment-sentinel.json",
         output_root=tmp_path / "out",
     )
     assert arm.bridge.corrected._option(command, "--value-loss-weight") == "0.0"  # noqa: SLF001
@@ -193,6 +312,8 @@ def test_derivation_refuses_nonselected_value_or_dose(tmp_path: Path) -> None:
                 axis=arm.VALUE_LOSS_OFF,
                 source_descriptor=source_descriptor,
                 treatment_descriptor=treatment,
+                source_validation_sentinel=tmp_path / "source-sentinel.json",
+                treatment_validation_sentinel=tmp_path / "treatment-sentinel.json",
                 output_root=tmp_path / "bad",
             )
 

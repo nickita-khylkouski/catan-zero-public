@@ -35,10 +35,10 @@ from tools import a1_corrected_policy_arm_execute as executor_base  # noqa: E402
 from tools import a1_topology_gather_arm as bridge  # noqa: E402
 
 
-SCHEMA = "a1-selected-dose-value-axis-arm-v1"
-RECEIPT_SCHEMA = "a1-selected-dose-value-axis-execution-receipt-v1"
-STATUS_SCHEMA = "a1-selected-dose-value-axis-execution-status-v1"
-CLAIM_SCHEMA = "a1-selected-dose-value-axis-execution-claim-v1"
+SCHEMA = "a1-selected-dose-value-axis-arm-v2"
+RECEIPT_SCHEMA = "a1-selected-dose-value-axis-execution-receipt-v2"
+STATUS_SCHEMA = "a1-selected-dose-value-axis-execution-status-v2"
+CLAIM_SCHEMA = "a1-selected-dose-value-axis-execution-claim-v2"
 EXECUTOR_RELATIVE_PATH = "tools/a1_selected_dose_value_axis_arm.py"
 CURRENT_VALUE_SCOPE = "CURRENT_VALUE_SCOPE"
 VALUE_LOSS_OFF = "VALUE_LOSS_OFF"
@@ -195,6 +195,91 @@ def _write_scope_descriptor(
     return derived_meta, derived_ref
 
 
+def _write_scope_validation_sentinel(
+    source_reference: Mapping[str, Any],
+    *,
+    source_descriptor_meta: Mapping[str, Any],
+    treatment_descriptor_meta: Mapping[str, Any],
+    destination: Path,
+) -> tuple[dict[str, Any], dict[str, str]]:
+    """Rebind the identical held-out games to the one-axis descriptor bytes.
+
+    A validation sentinel authenticates the complete composite descriptor, not
+    only its component holdouts.  Changing the value-training component scope
+    therefore changes the descriptor fingerprint even though component paths,
+    validation manifests, and selected game seeds stay identical.  Reusing the
+    old sentinel makes the trainer correctly refuse the run.  This derivation
+    changes only the two descriptor-binding fields and proves every selection
+    and component-validation field stayed byte-for-byte equal.
+    """
+
+    if not isinstance(source_reference, Mapping):
+        raise ValueAxisError("selected TEMP validation sentinel reference is malformed")
+    source_path = Path(str(source_reference.get("path", ""))).resolve(strict=True)
+    source_payload, observed_ref = bridge.corrected._load_json(source_path)  # noqa: SLF001
+    if observed_ref != dict(source_reference):
+        raise ValueAxisError("selected TEMP validation sentinel bytes drifted")
+    if not (
+        source_payload.get("schema_version") == "train-validation-game-sentinel-v1"
+        and source_payload.get("source_composite_descriptor_file_sha256")
+        == source_descriptor_meta.get("descriptor_file_sha256")
+        and source_payload.get("source_composite_descriptor_fingerprint")
+        == source_descriptor_meta.get("descriptor_fingerprint")
+    ):
+        raise ValueAxisError(
+            "selected TEMP validation sentinel is not bound to its source descriptor"
+        )
+    payload = dict(source_payload)
+    payload["source_composite_descriptor_file_sha256"] = treatment_descriptor_meta.get(
+        "descriptor_file_sha256"
+    )
+    payload["source_composite_descriptor_fingerprint"] = treatment_descriptor_meta.get(
+        "descriptor_fingerprint"
+    )
+    if not all(
+        isinstance(payload.get(field), str)
+        for field in (
+            "source_composite_descriptor_file_sha256",
+            "source_composite_descriptor_fingerprint",
+        )
+    ):
+        raise ValueAxisError("treatment descriptor lacks validation-binding digests")
+    unchanged = {
+        key: value
+        for key, value in payload.items()
+        if key
+        not in {
+            "source_composite_descriptor_file_sha256",
+            "source_composite_descriptor_fingerprint",
+        }
+    }
+    source_unchanged = {
+        key: value
+        for key, value in source_payload.items()
+        if key
+        not in {
+            "source_composite_descriptor_file_sha256",
+            "source_composite_descriptor_fingerprint",
+        }
+    }
+    if unchanged != source_unchanged:
+        raise ValueAxisError("scope sentinel changed held-out games or validation bindings")
+    encoded = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.exists():
+        if destination.read_text(encoding="utf-8") != encoded:
+            raise ValueAxisError(f"current-value validation sentinel drift: {destination}")
+    else:
+        temporary = destination.with_name(f".{destination.name}.tmp.{os.getpid()}")
+        temporary.write_text(encoded, encoding="utf-8")
+        os.chmod(temporary, 0o444)
+        os.replace(temporary, destination)
+    treatment_payload, treatment_ref = bridge.corrected._load_json(destination)  # noqa: SLF001
+    if treatment_payload != payload:
+        raise ValueAxisError("current-value validation sentinel write drift")
+    return treatment_payload, treatment_ref
+
+
 def _assert_selected_source_command(
     command: Sequence[str], *, source_descriptor: Path
 ) -> None:
@@ -224,12 +309,18 @@ def _derive_command(
     axis: str,
     source_descriptor: Path,
     treatment_descriptor: Path,
+    source_validation_sentinel: Path,
+    treatment_validation_sentinel: Path,
     output_root: Path,
 ) -> tuple[list[str], dict[str, Any]]:
     if axis not in AXES:
         raise ValueAxisError(f"unsupported value axis: {axis!r}")
     command = list(source)
     _assert_selected_source_command(command, source_descriptor=source_descriptor)
+    if bridge.corrected._option(  # noqa: SLF001
+        command, "--validation-game-sentinel-manifest"
+    ) != str(source_validation_sentinel):
+        raise ValueAxisError("source command is not bound to the selected TEMP sentinel")
     changes: dict[str, dict[str, str]] = {
         "--checkpoint": {
             "source": bridge.corrected._option(command, "--checkpoint"),  # noqa: SLF001
@@ -244,6 +335,10 @@ def _derive_command(
         changes["--data"] = {
             "source": str(source_descriptor),
             "treatment": str(treatment_descriptor),
+        }
+        changes["--validation-game-sentinel-manifest"] = {
+            "source": str(source_validation_sentinel),
+            "treatment": str(treatment_validation_sentinel),
         }
     else:
         changes["--value-loss-weight"] = {
@@ -337,13 +432,27 @@ def prepare(args: argparse.Namespace) -> tuple[dict[str, Any], Path]:
     output_root.mkdir(parents=True, exist_ok=True)
     descriptor_meta = source_meta
     descriptor_ref = source_descriptor_ref
+    source_validation_ref = source["validation_sentinel"]
+    treatment_validation_ref = source_validation_ref
+    treatment_validation_payload: dict[str, Any] | None = None
     if axis == CURRENT_VALUE_SCOPE:
         descriptor_meta, descriptor_ref = _write_scope_descriptor(
             source_payload,
             source_meta,
             output_root / "current-value-scope.memmap-composite.json",
         )
+        treatment_validation_payload, treatment_validation_ref = (
+            _write_scope_validation_sentinel(
+                source_validation_ref,
+                source_descriptor_meta=source_meta,
+                treatment_descriptor_meta=descriptor_meta,
+                destination=output_root
+                / "current-value-scope.validation-game-sentinel.json",
+            )
+        )
     treatment_descriptor = Path(descriptor_ref["path"])
+    source_validation_sentinel = Path(source_validation_ref["path"])
+    treatment_validation_sentinel = Path(treatment_validation_ref["path"])
     binding = _source_binding(args.repo)
     executor_ref = binding["files"].get(EXECUTOR_RELATIVE_PATH)
     if not isinstance(executor_ref, dict):
@@ -353,6 +462,8 @@ def prepare(args: argparse.Namespace) -> tuple[dict[str, Any], Path]:
         axis=axis,
         source_descriptor=source_descriptor,
         treatment_descriptor=treatment_descriptor,
+        source_validation_sentinel=source_validation_sentinel,
+        treatment_validation_sentinel=treatment_validation_sentinel,
         output_root=output_root,
     )
     manifest: dict[str, Any] = {
@@ -375,6 +486,31 @@ def prepare(args: argparse.Namespace) -> tuple[dict[str, Any], Path]:
         "initialization": source["initialization"],
         "source_descriptor": source_descriptor_ref,
         "treatment_descriptor": descriptor_ref,
+        "source_validation_sentinel": source_validation_ref,
+        "treatment_validation_sentinel": treatment_validation_ref,
+        "treatment_validation_sentinel_semantics": (
+            {
+                "unchanged_fields_sha256": bridge.corrected._digest(  # noqa: SLF001
+                    {
+                        key: value
+                        for key, value in treatment_validation_payload.items()
+                        if key
+                        not in {
+                            "source_composite_descriptor_file_sha256",
+                            "source_composite_descriptor_fingerprint",
+                        }
+                    }
+                ),
+                "selected_game_seed_set_sha256": treatment_validation_payload[
+                    "selected_game_seed_set_sha256"
+                ],
+                "excluded_game_seed_set_sha256": treatment_validation_payload[
+                    "excluded_game_seed_set_sha256"
+                ],
+            }
+            if treatment_validation_payload is not None
+            else None
+        ),
         "treatment_descriptor_semantics": {
             "policy_distillation_component_ids": descriptor_meta.get(
                 "policy_distillation_component_ids"
@@ -508,6 +644,38 @@ def verify(manifest_path: Path) -> dict[str, Any]:
         expected_meta, expected_ref = source_meta, source_descriptor_ref
         if treatment_ref != source_descriptor_ref:
             raise ValueAxisError("value-off arm changed the source descriptor")
+    source_validation_ref = source["validation_sentinel"]
+    expected_validation_ref = source_validation_ref
+    expected_validation_semantics = None
+    if axis == CURRENT_VALUE_SCOPE:
+        expected_validation_payload, expected_validation_ref = (
+            _write_scope_validation_sentinel(
+                source_validation_ref,
+                source_descriptor_meta=source_meta,
+                treatment_descriptor_meta=expected_meta,
+                destination=root
+                / "current-value-scope.validation-game-sentinel.json",
+            )
+        )
+        expected_validation_semantics = {
+            "unchanged_fields_sha256": bridge.corrected._digest(  # noqa: SLF001
+                {
+                    key: value
+                    for key, value in expected_validation_payload.items()
+                    if key
+                    not in {
+                        "source_composite_descriptor_file_sha256",
+                        "source_composite_descriptor_fingerprint",
+                    }
+                }
+            ),
+            "selected_game_seed_set_sha256": expected_validation_payload[
+                "selected_game_seed_set_sha256"
+            ],
+            "excluded_game_seed_set_sha256": expected_validation_payload[
+                "excluded_game_seed_set_sha256"
+            ],
+        }
     semantics = {
         "policy_distillation_component_ids": expected_meta.get(
             "policy_distillation_component_ids"
@@ -524,6 +692,11 @@ def verify(manifest_path: Path) -> dict[str, Any]:
     }
     if not (
         treatment_ref == expected_ref
+        and payload.get("source_validation_sentinel") == source_validation_ref
+        and payload.get("treatment_validation_sentinel")
+        == expected_validation_ref
+        and payload.get("treatment_validation_sentinel_semantics")
+        == expected_validation_semantics
         and payload.get("treatment_descriptor_semantics") == semantics
         and payload.get("only_declared_causal_delta") == _axis_delta(str(axis))
         and payload.get("matched_contract") == _matched_contract(str(axis))
@@ -531,11 +704,15 @@ def verify(manifest_path: Path) -> dict[str, Any]:
         raise ValueAxisError("value-axis descriptor/delta contract drift")
     source_descriptor = Path(source_descriptor_ref["path"])
     treatment_descriptor = Path(expected_ref["path"])
+    source_validation_sentinel = Path(source_validation_ref["path"])
+    treatment_validation_sentinel = Path(expected_validation_ref["path"])
     expected_command, changes = _derive_command(
         source["command"],
         axis=str(axis),
         source_descriptor=source_descriptor,
         treatment_descriptor=treatment_descriptor,
+        source_validation_sentinel=source_validation_sentinel,
+        treatment_validation_sentinel=treatment_validation_sentinel,
         output_root=root,
     )
     command = payload.get("command")

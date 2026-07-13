@@ -25,15 +25,16 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import subprocess
 import time
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from tools import a1_corrected_policy_arm_execute as executor_base
 from tools import a1_selected_dose_pure_soft_arm as pure_soft
 from tools import a1_selected_dose_value_axis_arm as value_axis
 
 
-SCHEMA = "a1-selected-dose-diagnostic-completion-v1"
+SCHEMA = "a1-selected-dose-diagnostic-completion-v2"
 STATUS = "complete_nonpromotable"
 COMPLETION_NAME = "diagnostic-completion.receipt.json"
 
@@ -234,6 +235,9 @@ def verify_manifest(manifest_path: Path) -> dict[str, Any]:
     source = _load_selected_source(manifest)
     root = Path(str(manifest.get("output_root", ""))).resolve(strict=True)
     source_descriptor = Path(str(source["descriptor"]["path"])).resolve(strict=True)
+    validation_sentinel_path = Path(
+        str(source["validation_sentinel"]["path"])
+    ).resolve(strict=True)
     if kind == "PURE_SEARCH_TARGET":
         if not (
             manifest.get("descriptor") == source["descriptor"]
@@ -258,11 +262,59 @@ def verify_manifest(manifest_path: Path) -> dict[str, Any]:
             manifest, source, arm_id=arm_id
         )
         data_path = Path(treatment_ref["path"])
+        _source_payload, source_meta, _source_ref = (
+            value_axis._source_descriptor_contract(source)  # noqa: SLF001
+        )
+        treatment_validation_ref = source["validation_sentinel"]
+        expected_validation_semantics = None
+        if arm_id == value_axis.CURRENT_VALUE_SCOPE:
+            treatment_validation_payload, treatment_validation_ref = (
+                value_axis._write_scope_validation_sentinel(  # noqa: SLF001
+                    source["validation_sentinel"],
+                    source_descriptor_meta=source_meta,
+                    treatment_descriptor_meta=treatment_meta,
+                    destination=root
+                    / "current-value-scope.validation-game-sentinel.json",
+                )
+            )
+            expected_validation_semantics = {
+                "unchanged_fields_sha256": value_axis.bridge.corrected._digest(  # noqa: SLF001
+                    {
+                        key: value
+                        for key, value in treatment_validation_payload.items()
+                        if key
+                        not in {
+                            "source_composite_descriptor_file_sha256",
+                            "source_composite_descriptor_fingerprint",
+                        }
+                    }
+                ),
+                "selected_game_seed_set_sha256": treatment_validation_payload[
+                    "selected_game_seed_set_sha256"
+                ],
+                "excluded_game_seed_set_sha256": treatment_validation_payload[
+                    "excluded_game_seed_set_sha256"
+                ],
+            }
+        if not (
+            manifest.get("source_validation_sentinel")
+            == source["validation_sentinel"]
+            and manifest.get("treatment_validation_sentinel")
+            == treatment_validation_ref
+            and manifest.get("treatment_validation_sentinel_semantics")
+            == expected_validation_semantics
+        ):
+            raise CompletionError("value-axis validation sentinel contract drift")
+        validation_sentinel_path = Path(treatment_validation_ref["path"])
         expected_command, changes = value_axis._derive_command(  # noqa: SLF001
             source["command"],
             axis=arm_id,
             source_descriptor=source_descriptor,
             treatment_descriptor=data_path,
+            source_validation_sentinel=Path(
+                source["validation_sentinel"]["path"]
+            ),
+            treatment_validation_sentinel=validation_sentinel_path,
             output_root=root,
         )
         if not (
@@ -295,6 +347,7 @@ def verify_manifest(manifest_path: Path) -> dict[str, Any]:
         "output_root": root,
         "data_path": data_path,
         "data_ref": _compact_ref(data_path),
+        "validation_sentinel_path": validation_sentinel_path,
         "treatment_meta": treatment_meta,
         "command": command,
         "selected_trainer": selected_trainer,
@@ -302,25 +355,14 @@ def verify_manifest(manifest_path: Path) -> dict[str, Any]:
 
 
 def _systemd_command(verified: Mapping[str, Any], *, unit: str) -> list[str]:
-    root = verified["output_root"]
-    return [
-        "sudo",
-        "-n",
-        "systemd-run",
-        f"--unit={unit}",
-        "--uid=ubuntu",
-        "--gid=ubuntu",
-        "--service-type=exec",
-        "--collect",
-        "--property=LimitNOFILE=65536",
-        f"--property=WorkingDirectory={verified['source']['selected_geometry_runtime_repo']}",
-        f"--property=StandardOutput=append:{root / 'stdout.log'}",
-        f"--property=StandardError=append:{root / 'stderr.log'}",
-        "--setenv=HOME=/home/ubuntu",
-        "--setenv=PYTHONNOUSERSITE=1",
-        "--",
-        *verified["command"],
-    ]
+    return executor_base._systemd_command(  # noqa: SLF001
+        {
+            "output_root": verified["output_root"],
+            "repo": verified["source"]["selected_geometry_runtime_repo"],
+            "command": verified["command"],
+        },
+        unit=unit,
+    )
 
 
 def _verify_submission(verified: Mapping[str, Any]) -> dict[str, Any]:
@@ -387,6 +429,42 @@ def _verify_submission(verified: Mapping[str, Any]) -> dict[str, Any]:
         "claim": _file_ref(claim_path),
         "submission": _file_ref(receipt_path),
     }
+
+
+def _verify_unit_state(value: Mapping[str, Any]) -> dict[str, str]:
+    expected = {
+        "LoadState": "loaded",
+        "ActiveState": "active",
+        "SubState": "exited",
+        "Result": "success",
+        "ExecMainStatus": "0",
+        "ExecMainCode": "1",
+    }
+    observed = {str(key): str(item) for key, item in value.items()}
+    if observed != expected:
+        raise CompletionError(f"selected-dose systemd unit is not complete: {observed}")
+    return observed
+
+
+def _read_live_unit_state(
+    unit: str,
+    *,
+    state_reader: Callable[..., str] = subprocess.check_output,
+) -> dict[str, str]:
+    try:
+        raw = state_reader(
+            (
+                "systemctl",
+                "show",
+                unit,
+                "--property=LoadState,ActiveState,SubState,Result,ExecMainStatus,ExecMainCode",
+            ),
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise CompletionError(f"cannot read selected-dose systemd state: {error}") from error
+    fields = dict(row.split("=", 1) for row in raw.splitlines() if "=" in row)
+    return _verify_unit_state(fields)
 
 
 def _report_expected(verified: Mapping[str, Any]) -> dict[str, Any]:
@@ -464,7 +542,7 @@ def _verify_report(verified: Mapping[str, Any]) -> tuple[dict[str, Any], dict[st
         and report.get("init_checkpoint_sha256")
         == source["initialization"]["sha256"]
         and data == verified["data_path"]
-        and sentinel == Path(source["validation_sentinel"]["path"])
+        and sentinel == verified["validation_sentinel_path"]
         and checkpoint["sha256"] != source["initialization"]["sha256"]
     ):
         raise CompletionError("training report input/output lineage drift")
@@ -555,6 +633,7 @@ def _artifact_inventory(root: Path) -> dict[str, dict[str, Any]]:
 def build_completion(
     manifest_path: Path,
     *,
+    unit_state: Mapping[str, Any],
     expected_checkpoint_sha256: str = "",
     created_at_unix_ns: int | None = None,
 ) -> dict[str, Any]:
@@ -588,6 +667,7 @@ def build_completion(
         "initialization": verified["source"]["initialization"],
         "data": verified["data_ref"],
         "submission": submission,
+        "unit_state": _verify_unit_state(unit_state),
         "checkpoint": checkpoint,
         "report": report,
         "artifacts": artifacts,
@@ -624,6 +704,22 @@ def _write_exclusive(path: Path, payload: Mapping[str, Any]) -> None:
         os.close(directory)
 
 
+def finalize(
+    manifest_path: Path,
+    *,
+    expected_checkpoint_sha256: str = "",
+    state_reader: Callable[..., str] = subprocess.check_output,
+) -> dict[str, Any]:
+    verified = verify_manifest(manifest_path)
+    submission = _verify_submission(verified)
+    state = _read_live_unit_state(submission["unit"], state_reader=state_reader)
+    return build_completion(
+        manifest_path,
+        unit_state=state,
+        expected_checkpoint_sha256=expected_checkpoint_sha256,
+    )
+
+
 def verify_completion(path: Path) -> dict[str, Any]:
     receipt_path = path.expanduser().resolve(strict=True)
     receipt = _load_json(receipt_path, label="completion receipt")
@@ -641,6 +737,7 @@ def verify_completion(path: Path) -> dict[str, Any]:
         raise CompletionError("completion finalizer bytes drifted")
     replay = build_completion(
         Path(receipt["manifest"]["path"]),
+        unit_state=receipt["unit_state"],
         expected_checkpoint_sha256=str(
             receipt.get("expected_checkpoint_sha256") or ""
         ),
@@ -668,7 +765,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if args.action == "finalize":
             manifest = args.manifest.expanduser().resolve(strict=True)
-            payload = build_completion(
+            payload = finalize(
                 manifest,
                 expected_checkpoint_sha256=args.expected_checkpoint_sha256,
             )

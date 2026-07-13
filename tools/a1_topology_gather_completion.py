@@ -28,7 +28,7 @@ from tools import a1_topology_gather_arm as prepare  # noqa: E402
 from tools import a1_topology_gather_arm_execute as launch  # noqa: E402
 
 
-SCHEMA = "a1-selected-dose-topology-gather-completion-v1"
+SCHEMA = "a1-selected-dose-topology-gather-completion-v2"
 STATUS = "complete_nonpromotable"
 COMPLETION_NAME = "diagnostic-completion.receipt.json"
 EXPECTED_CHANGED_PARAMETERS = tuple(sorted(prepare.EXPECTED_NEW_PARAMETERS))
@@ -101,25 +101,7 @@ def verify_manifest(manifest_path: Path) -> dict[str, Any]:
 
 
 def _systemd_command(verified: Mapping[str, Any], *, unit: str) -> list[str]:
-    root = Path(verified["output_root"])
-    return [
-        "sudo",
-        "-n",
-        "systemd-run",
-        f"--unit={unit}",
-        "--uid=ubuntu",
-        "--gid=ubuntu",
-        "--service-type=exec",
-        "--collect",
-        "--property=LimitNOFILE=65536",
-        f"--property=WorkingDirectory={verified['repo']}",
-        f"--property=StandardOutput=append:{root / 'stdout.log'}",
-        f"--property=StandardError=append:{root / 'stderr.log'}",
-        "--setenv=HOME=/home/ubuntu",
-        "--setenv=PYTHONNOUSERSITE=1",
-        "--",
-        *verified["command"],
-    ]
+    return launch.base._systemd_command(verified, unit=unit)  # noqa: SLF001
 
 
 def _verify_submission(verified: Mapping[str, Any]) -> tuple[str, dict[str, Any]]:
@@ -197,7 +179,14 @@ def _verify_submission(verified: Mapping[str, Any]) -> tuple[str, dict[str, Any]
 
 
 def _verify_unit_state(value: Mapping[str, Any]) -> dict[str, str]:
-    expected = {"ActiveState": "inactive", "Result": "success", "ExecMainStatus": "0"}
+    expected = {
+        "LoadState": "loaded",
+        "ActiveState": "active",
+        "SubState": "exited",
+        "Result": "success",
+        "ExecMainStatus": "0",
+        "ExecMainCode": "1",
+    }
     observed = {str(key): str(item) for key, item in value.items()}
     if observed != expected:
         raise CompletionError(f"gather systemd unit is not complete: {observed}")
@@ -215,7 +204,7 @@ def _read_live_unit_state(
                 "systemctl",
                 "show",
                 unit,
-                "--property=ActiveState,Result,ExecMainStatus",
+                "--property=LoadState,ActiveState,SubState,Result,ExecMainStatus,ExecMainCode",
             ),
             text=True,
         )
