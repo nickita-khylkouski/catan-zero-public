@@ -85,6 +85,7 @@ def _descriptor_v2(
     *,
     policy_distillation_component_ids: list[str] | None = None,
     policy_aux_phase_sampling_weights: dict[str, float] | None = None,
+    stored_policy_component_temperatures: dict[str, float] | None = None,
     value_training_component_ids: list[str] | None = None,
 ) -> Path:
     overrides = {
@@ -116,6 +117,10 @@ def _descriptor_v2(
     if policy_aux_phase_sampling_weights is not None:
         payload["policy_aux_phase_sampling_weights"] = (
             policy_aux_phase_sampling_weights
+        )
+    if stored_policy_component_temperatures is not None:
+        payload["stored_policy_component_temperatures"] = (
+            stored_policy_component_temperatures
         )
     if value_training_component_ids is not None:
         payload["value_training_component_ids"] = value_training_component_ids
@@ -191,6 +196,38 @@ def test_v2_authenticates_policy_aux_phase_allocation(tmp_path):
     assert verified["descriptor_fingerprint"] == train_bc._training_data_fingerprint(
         str(path), "memmap"
     )
+
+
+def test_v2_authenticates_stored_policy_component_temperatures(tmp_path):
+    temperatures = {"n128": 1.0, "n256": 1.15, "gen3": 0.85}
+    path = _descriptor_v2(
+        tmp_path, stored_policy_component_temperatures=temperatures
+    )
+    verified = train_bc._preflight_memmap_composite_descriptor(path)
+    assert verified["stored_policy_component_temperatures"] == temperatures
+
+    corpus = train_bc.load_teacher_data_memmap(path, composite_meta=verified)
+    assert corpus.stored_policy_component_temperatures == temperatures
+
+
+@pytest.mark.parametrize(
+    "temperatures",
+    [
+        {"n128": 1.0, "n256": 1.0},
+        {"n128": 1.0, "n256": 1.0, "gen3": 0.0},
+        {"n128": 1.0, "n256": float("inf"), "gen3": 1.0},
+        {"n128": True, "n256": 1.0, "gen3": 1.0},
+    ],
+)
+def test_v2_refuses_invalid_stored_policy_component_temperatures(
+    tmp_path, temperatures
+):
+    path = _descriptor_v2(tmp_path)
+    payload = json.loads(path.read_text())
+    payload["stored_policy_component_temperatures"] = temperatures
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(SystemExit, match="stored-policy temperature"):
+        train_bc._preflight_memmap_composite_descriptor(path)
 
 
 @pytest.mark.parametrize(
@@ -578,6 +615,65 @@ def test_authenticated_policy_scope_fails_closed_when_empty() -> None:
         )
 
 
+def test_stored_policy_temperature_one_is_exact_noop_and_preserves_support() -> None:
+    policy = np.asarray(
+        [[0.8, 0.2, 0.0], [0.8, 0.2, 0.0], [0.8, 0.2, 0.0]],
+        dtype=np.float32,
+    )
+    support = np.asarray(
+        [[True, True, False], [True, True, False], [True, True, False]],
+        dtype=np.bool_,
+    )
+    unchanged = train_bc._temperature_scale_stored_policy(
+        policy, support, np.ones(3, dtype=np.float64)
+    )
+    assert unchanged is policy
+    assert np.array_equal(unchanged, policy)
+
+    calibrated = train_bc._temperature_scale_stored_policy(
+        policy, support, np.asarray([2.0, 0.5, 1.0], dtype=np.float64)
+    )
+    def entropy(row):
+        positive = row[row > 0]
+        return float(-np.sum(positive * np.log(positive)))
+
+    assert entropy(calibrated[0]) > entropy(policy[0])
+    assert entropy(calibrated[1]) < entropy(policy[1])
+    assert np.array_equal(calibrated[2], policy[2])
+    assert np.all(calibrated[:, 2] == 0.0)
+    assert np.sum(calibrated, axis=1) == pytest.approx([1.0, 1.0, 1.0])
+
+
+class _SourceBoundPolicyData(dict):
+    component_ids = ("n128", "n256", "replay")
+    stored_policy_component_temperatures = {
+        "n128": 1.0,
+        "n256": 2.0,
+        "replay": 0.5,
+    }
+
+    @staticmethod
+    def component_indices_for_rows(rows):
+        return np.asarray(rows, dtype=np.int64)
+
+
+def test_soft_target_array_calibrates_by_authenticated_component_identity() -> None:
+    data = _SourceBoundPolicyData(
+        legal_action_ids=np.asarray([[10, 11], [10, 11], [10, 11]]),
+        target_policy=np.asarray(
+            [[0.8, 0.2], [0.8, 0.2], [0.8, 0.2]], dtype=np.float32
+        ),
+        target_policy_mask=np.ones((3, 2), dtype=np.bool_),
+    )
+    target, support = train_bc._soft_target_array(
+        data, np.arange(3, dtype=np.int64), 0.7, "policy"
+    )
+    assert np.array_equal(support, np.ones((3, 2), dtype=np.bool_))
+    assert np.array_equal(target[0], np.asarray([0.8, 0.2], dtype=np.float32))
+    assert target[1, 0] < target[0, 0]  # n256 T=2 softens.
+    assert target[2, 0] > target[0, 0]  # replay T=.5 sharpens.
+
+
 def test_policy_aux_order_is_exact_and_ddp_rank_sliced() -> None:
     weights = np.asarray([0.0, 0.25, 0.0, 0.75], dtype=np.float64)
     orders = []
@@ -618,3 +714,32 @@ def test_global_epoch_shuffle_interleaves_component_rows_with_prefetch():
     )
     observed = [data_part["row"][batch].tolist() for data_part, batch, _, _ in batches]
     assert observed == [[0, 10], [1, 11], [2, 12]]
+
+
+def test_prefetch_preserves_source_bound_stored_policy_temperatures():
+    data = train_bc.ConcatMemmapCorpus(
+        [_TinyCorpus([0, 1]), _TinyCorpus([10, 11])]
+    )
+    data.component_ids = ("n128", "n256")
+    data.stored_policy_component_temperatures = {"n128": 1.0, "n256": 1.2}
+    rows = np.asarray([0, 2, 1, 3], dtype=np.int64)
+    batches = list(
+        train_bc._iterate_training_batches(
+            data,
+            np.arange(4, dtype=np.int64),
+            rows,
+            4,
+            np.ones(4, dtype=np.float32),
+            np.ones(4, dtype=np.float32),
+            num_workers=1,
+            prefetch=1,
+        )
+    )
+    materialized, local, _policy_weights, _value_weights = batches[0]
+    assert np.array_equal(local, np.arange(4, dtype=np.int64))
+    assert materialized["_stored_policy_temperature"].tolist() == [
+        1.0,
+        1.2,
+        1.0,
+        1.2,
+    ]
