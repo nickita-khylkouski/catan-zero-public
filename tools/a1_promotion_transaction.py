@@ -57,6 +57,8 @@ from tools.sprt_gate import evaluate_pentanomial_sprt, pair_scores_from_h2h_game
 
 ADJUDICATION_SCHEMA = "a1-promotion-adjudication-v2"
 PREVIOUS_ADJUDICATION_SCHEMA = "a1-promotion-adjudication-v1"
+BRANCH_CHALLENGE_ADJUDICATION_SCHEMA = "a1-branch-challenge-adjudication-v1"
+BRANCH_CHALLENGE_LINEAGE_SCHEMA = "a1-branch-challenge-lineage-v1"
 RECEIPT_SCHEMA = "a1-promotion-transaction-receipt-v3"
 PREVIOUS_RECEIPT_SCHEMA = "a1-promotion-transaction-receipt-v2"
 LEGACY_RECEIPT_SCHEMA = "a1-promotion-transaction-receipt-v1"
@@ -2991,6 +2993,9 @@ def _verify_evaluation_baseline_binding(
     champion_search_config: dict[str, Any],
     base: Path,
     where: str,
+    comparison_mode: str = "promotion_parent",
+    candidate_parent_path: Path | None = None,
+    candidate_parent_sha256: str | None = None,
 ) -> dict[str, Any]:
     value = _require_exact_keys(
         raw,
@@ -3006,21 +3011,57 @@ def _verify_evaluation_baseline_binding(
         },
         where=where,
     )
-    if (
-        value["schema_version"] != "a1-evaluation-baseline-binding-v1"
-        or value["comparison_mode"] != "promotion_parent"
-        or value["promotion_eligible"] is not True
-        or value["historical_comparison_reason"] is not None
-    ):
-        raise PromotionError(f"{where} is not a promotion-parent evaluation binding")
-    for label in ("candidate_parent", "baseline"):
-        _verify_bound_checkpoint(
-            value[label],
-            expected_path=champion_path,
-            expected_sha256=champion_sha256,
-            where=f"{where}.{label}",
-            base=base,
-        )
+    if comparison_mode == "promotion_parent":
+        if (
+            value["schema_version"] != "a1-evaluation-baseline-binding-v1"
+            or value["comparison_mode"] != "promotion_parent"
+            or value["promotion_eligible"] is not True
+            or value["historical_comparison_reason"] is not None
+        ):
+            raise PromotionError(
+                f"{where} is not a promotion-parent evaluation binding"
+            )
+        expected_parent_path = champion_path
+        expected_parent_sha256 = champion_sha256
+    elif comparison_mode == "branch_challenge":
+        if candidate_parent_path is None or candidate_parent_sha256 is None:
+            raise PromotionError(
+                f"{where} branch challenge has no authenticated initializer"
+            )
+        if (
+            value["schema_version"] != "a1-evaluation-baseline-binding-v2"
+            or value["comparison_mode"] != "branch_challenge"
+            or value["promotion_eligible"] is not True
+            or value["historical_comparison_reason"] is not None
+        ):
+            raise PromotionError(
+                f"{where} is not a promotion-eligible branch-challenge binding"
+            )
+        expected_parent_path = candidate_parent_path
+        expected_parent_sha256 = candidate_parent_sha256
+        if (
+            expected_parent_path == champion_path
+            or expected_parent_sha256 == champion_sha256
+        ):
+            raise PromotionError(
+                f"{where} branch initializer must differ from displaced incumbent"
+            )
+    else:
+        raise PromotionError(f"{where} has unsupported promotion comparison mode")
+    _verify_bound_checkpoint(
+        value["candidate_parent"],
+        expected_path=expected_parent_path,
+        expected_sha256=expected_parent_sha256,
+        where=f"{where}.candidate_parent",
+        base=base,
+    )
+    _verify_bound_checkpoint(
+        value["baseline"],
+        expected_path=champion_path,
+        expected_sha256=champion_sha256,
+        where=f"{where}.baseline",
+        base=base,
+    )
     _validate_file_ref(value["registry"], base=base, where=f"{where}.registry")
     incumbent = _require_exact_keys(
         value["authoritative_incumbent"],
@@ -3161,6 +3202,10 @@ def _verify_internal_h2h_source(
     candidate_search_config: dict[str, Any],
     champion_search_config: dict[str, Any],
     required_n_full: int = 128,
+    comparison_mode: str = "promotion_parent",
+    candidate_parent_path: Path | None = None,
+    candidate_parent_sha256: str | None = None,
+    require_strict_superiority: bool = False,
 ) -> None:
     _verify_evaluation_baseline_binding(
         payload.get("evaluation_binding"),
@@ -3169,6 +3214,9 @@ def _verify_internal_h2h_source(
         champion_search_config=champion_search_config,
         base=champion.parent,
         where=f"{where}.evaluation_binding",
+        comparison_mode=comparison_mode,
+        candidate_parent_path=candidate_parent_path,
+        candidate_parent_sha256=candidate_parent_sha256,
     )
     if (
         _absolute(payload.get("candidate_checkpoint"), base=candidate.parent)
@@ -3424,6 +3472,20 @@ def _verify_internal_h2h_source(
         )
     if diagnostics != payload.get("pair_diagnostics"):
         raise PromotionError(f"{where} pair diagnostics do not replay exactly")
+    if require_strict_superiority:
+        strict_sprt = payload.get("superiority_pentanomial_sprt")
+        strict_replayed = evaluate_pentanomial_sprt(
+            pair_scores, elo0=0.0, elo1=15.0, alpha=0.05, beta=0.05
+        )
+        if (
+            payload.get("superiority_verdict") != "H1"
+            or not isinstance(strict_sprt, dict)
+            or strict_sprt != strict_replayed
+            or strict_replayed["decision"] != "H1"
+        ):
+            raise PromotionError(
+                f"{where} does not establish strict [0,+15] superiority"
+            )
 
 
 def _verify_internal_h2h_cohort(payload: dict[str, Any], *, where: str) -> None:
@@ -3493,6 +3555,8 @@ def _verify_n64_confirmation(
     contract: dict[str, Any],
     candidate: dict[str, Any],
     champion: dict[str, Any],
+    promotion_mode: str = "promotion_parent",
+    candidate_parent: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     ref = _require_exact_keys(raw, {"path", "sha256"}, where="nth_confirmation")
     path, verified = _validate_file_ref(ref, base=base, where="nth_confirmation")
@@ -3506,6 +3570,15 @@ def _verify_n64_confirmation(
         candidate_search_config=candidate["search_config"],
         champion_search_config=champion["search_config"],
         required_n_full=64,
+        comparison_mode=promotion_mode,
+        candidate_parent_path=(
+            None
+            if candidate_parent is None
+            else Path(str(candidate_parent["path"]))
+        ),
+        candidate_parent_sha256=(
+            None if candidate_parent is None else str(candidate_parent["sha256"])
+        ),
     )
     _verify_internal_h2h_cohort(payload, where="nth_confirmation")
     intervals = _contiguous_seed_intervals(
@@ -4382,6 +4455,8 @@ def _verify_promotion_evidence(
     expected_readout: str = "scalar",
     candidate: dict[str, Any],
     champion: dict[str, Any],
+    promotion_mode: str = "promotion_parent",
+    candidate_parent: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     contract_sha256 = contract["contract_sha256"]
     sealed_semantics = _sealed_evaluation_semantics(contract)
@@ -4500,22 +4575,79 @@ def _verify_promotion_evidence(
         if value["verdict"] != "pass":
             raise PromotionError("mechanism calibration verdict is not pass")
     elif kind == "internal_h2h":
-        if set(source_by_role) != {"internal_h2h"}:
-            raise PromotionError("internal H2H source roles mismatch")
-        _verify_internal_h2h_source(
-            source_by_role["internal_h2h"][1],
-            candidate=candidate_path,
-            champion=champion_path,
-            where="internal H2H",
-            sealed_semantics=sealed_semantics,
-            candidate_search_config=candidate["search_config"],
-            champion_search_config=champion["search_config"],
-        )
-        if (
-            value["verdict"] != "H1"
-            or result != INTERNAL_STRENGTH_RESULT
-        ):
-            raise PromotionError("internal H2H envelope verdict/result drift")
+        if promotion_mode == "promotion_parent":
+            if set(source_by_role) != {"internal_h2h"}:
+                raise PromotionError("internal H2H source roles mismatch")
+            _verify_internal_h2h_source(
+                source_by_role["internal_h2h"][1],
+                candidate=candidate_path,
+                champion=champion_path,
+                where="internal H2H",
+                sealed_semantics=sealed_semantics,
+                candidate_search_config=candidate["search_config"],
+                champion_search_config=champion["search_config"],
+            )
+            if value["verdict"] != "H1" or result != INTERNAL_STRENGTH_RESULT:
+                raise PromotionError("internal H2H envelope verdict/result drift")
+        elif promotion_mode == "branch_challenge":
+            expected_roles = {"internal_h2h_cohort_1", "internal_h2h_cohort_2"}
+            if set(source_by_role) != expected_roles:
+                raise PromotionError(
+                    "branch challenge requires exactly two internal H2H cohorts"
+                )
+            result = _require_exact_keys(
+                result,
+                {
+                    *INTERNAL_STRENGTH_RESULT,
+                    "required_fresh_cohorts",
+                    "strict_superiority",
+                },
+                where="branch internal H2H evidence.result",
+            )
+            if (
+                any(
+                    result[key] != expected
+                    for key, expected in INTERNAL_STRENGTH_RESULT.items()
+                )
+                or result["required_fresh_cohorts"] != 2
+                or result["strict_superiority"] is not True
+                or value["verdict"] != "H1"
+            ):
+                raise PromotionError("branch internal H2H envelope policy drift")
+            if candidate_parent is None:
+                raise PromotionError(
+                    "branch internal H2H has no authenticated candidate initializer"
+                )
+            cohort_seed_sets: list[set[int]] = []
+            for role in sorted(expected_roles):
+                payload = source_by_role[role][1]
+                _verify_internal_h2h_source(
+                    payload,
+                    candidate=candidate_path,
+                    champion=champion_path,
+                    where=f"branch internal H2H {role}",
+                    sealed_semantics=sealed_semantics,
+                    candidate_search_config=candidate["search_config"],
+                    champion_search_config=champion["search_config"],
+                    comparison_mode="branch_challenge",
+                    candidate_parent_path=Path(str(candidate_parent["path"])),
+                    candidate_parent_sha256=str(candidate_parent["sha256"]),
+                    require_strict_superiority=True,
+                )
+                _verify_internal_h2h_cohort(
+                    payload, where=f"branch internal H2H {role}"
+                )
+                cohort_seed_sets.append(
+                    _explicit_game_seeds(
+                        payload, where=f"branch internal H2H {role}"
+                    )
+                )
+            if cohort_seed_sets[0] & cohort_seed_sets[1]:
+                raise PromotionError(
+                    "branch challenge internal H2H cohorts reuse validation seeds"
+                )
+        else:
+            raise PromotionError("internal H2H uses unsupported promotion mode")
     elif kind == "external_panel":
         if set(source_by_role) != {"candidate_panel", "champion_panel"}:
             raise PromotionError("external panel source roles mismatch")
@@ -4532,6 +4664,15 @@ def _verify_promotion_evidence(
                 champion_search_config=champion["search_config"],
                 base=champion_path.parent,
                 where=f"{panel_name}.evaluation_binding",
+                comparison_mode=promotion_mode,
+                candidate_parent_path=(
+                    None
+                    if candidate_parent is None
+                    else Path(str(candidate_parent["path"]))
+                ),
+                candidate_parent_sha256=(
+                    None if candidate_parent is None else candidate_parent["sha256"]
+                ),
             )
             planned_engine = _require_exact_keys(
                 panel.get("planned_engine_identity"),
@@ -4727,12 +4868,27 @@ def _promotion_cohort_intervals(
         for item in evidence["sources"]
     }
     if kind == "internal_h2h":
-        payload = _load_json(sources["internal_h2h"])
-        return _contiguous_seed_intervals(
-            _explicit_game_seeds(payload, where="internal H2H"),
-            kind=kind,
-            where="internal H2H",
-        )
+        if set(sources) == {"internal_h2h"}:
+            payload = _load_json(sources["internal_h2h"])
+            return _contiguous_seed_intervals(
+                _explicit_game_seeds(payload, where="internal H2H"),
+                kind=kind,
+                where="internal H2H",
+            )
+        branch_roles = {"internal_h2h_cohort_1", "internal_h2h_cohort_2"}
+        if set(sources) == branch_roles:
+            intervals: list[dict[str, Any]] = []
+            for role in sorted(branch_roles):
+                payload = _load_json(sources[role])
+                intervals.extend(
+                    _contiguous_seed_intervals(
+                        _explicit_game_seeds(payload, where=role),
+                        kind=kind,
+                        where=role,
+                    )
+                )
+            return intervals
+        raise PromotionError("internal H2H evidence has unsupported source roles")
     if kind == "external_panel":
         candidate_payload = _load_json(sources["candidate_panel"])
         champion_payload = _load_json(sources["champion_panel"])
@@ -4894,6 +5050,88 @@ def _verify_cohort_exclusions(
     }
 
 
+def _verify_branch_challenge_lineage(
+    raw: Any,
+    *,
+    training_report: dict[str, Any],
+    training_report_path: Path,
+    training_receipt: dict[str, Any],
+    champion_path: Path,
+    champion_sha256: str,
+    champion_version: int,
+    champion_agent_identity_sha256: str,
+    base: Path,
+) -> dict[str, Any]:
+    """Authenticate the older initializer and the incumbent being displaced."""
+
+    value = _require_exact_keys(
+        raw,
+        {"schema_version", "initializer", "displaced_incumbent"},
+        where="candidate_lineage",
+    )
+    if value["schema_version"] != BRANCH_CHALLENGE_LINEAGE_SCHEMA:
+        raise PromotionError("candidate_lineage schema drift")
+    init_path_raw = training_report.get("init_checkpoint")
+    init_sha = training_report.get("init_checkpoint_sha256")
+    if not isinstance(init_path_raw, str) or not init_path_raw or not isinstance(
+        init_sha, str
+    ):
+        raise PromotionError(
+            "branch challenge training report has no authenticated initializer"
+        )
+    _validate_sha256(init_sha, where="training report init_checkpoint_sha256")
+    init_path = _canonical_existing_file(
+        _absolute(init_path_raw, base=training_report_path.parent),
+        where="branch challenge initializer",
+    )
+    if _sha256(init_path) != init_sha:
+        raise PromotionError("branch challenge initializer bytes drifted")
+    receipt_parent = training_receipt.get("evaluation_parent_sha256")
+    if receipt_parent is not None and receipt_parent != init_sha:
+        raise PromotionError(
+            "branch challenge training receipt parent differs from initializer"
+        )
+    _verify_bound_checkpoint(
+        value["initializer"],
+        expected_path=init_path,
+        expected_sha256=init_sha,
+        where="candidate_lineage.initializer",
+        base=base,
+    )
+    displaced = _require_exact_keys(
+        value["displaced_incumbent"],
+        {"path", "sha256", "version", "agent_identity_sha256"},
+        where="candidate_lineage.displaced_incumbent",
+    )
+    _verify_bound_checkpoint(
+        {"path": displaced["path"], "sha256": displaced["sha256"]},
+        expected_path=champion_path,
+        expected_sha256=champion_sha256,
+        where="candidate_lineage.displaced_incumbent",
+        base=base,
+    )
+    if displaced["version"] != champion_version:
+        raise PromotionError("candidate_lineage displaced incumbent version drift")
+    if displaced["agent_identity_sha256"] != champion_agent_identity_sha256:
+        raise PromotionError(
+            "candidate_lineage displaced incumbent agent identity drift"
+        )
+    if init_path == champion_path or init_sha == champion_sha256:
+        raise PromotionError(
+            "branch challenge initializer must differ from displaced incumbent"
+        )
+    return {
+        "schema_version": BRANCH_CHALLENGE_LINEAGE_SCHEMA,
+        "initializer": {"path": str(init_path), "sha256": init_sha},
+        "displaced_incumbent": {
+            "path": str(champion_path),
+            "sha256": champion_sha256,
+            "version": champion_version,
+            "agent_identity_sha256": champion_agent_identity_sha256,
+        },
+    }
+
+
 def _verify_adjudication(
     path: Path,
     *,
@@ -4918,17 +5156,28 @@ def _verify_adjudication(
         "adjudication_sha256",
     }
     schema_version = raw.get("schema_version")
-    if schema_version == ADJUDICATION_SCHEMA:
+    if schema_version == BRANCH_CHALLENGE_ADJUDICATION_SCHEMA:
+        expected_keys = common_keys | {
+            "nth_confirmation",
+            "promotion_mode",
+            "candidate_lineage",
+        }
+    elif schema_version == ADJUDICATION_SCHEMA:
         expected_keys = common_keys | {"nth_confirmation"}
     elif schema_version == PREVIOUS_ADJUDICATION_SCHEMA:
         expected_keys = common_keys | {"nth_confirmation_passed"}
     else:
         raise PromotionError(
             "adjudication schema must be "
-            f"{ADJUDICATION_SCHEMA!r} (or historical {PREVIOUS_ADJUDICATION_SCHEMA!r})"
+            f"{BRANCH_CHALLENGE_ADJUDICATION_SCHEMA!r}, {ADJUDICATION_SCHEMA!r} "
+            f"(or historical {PREVIOUS_ADJUDICATION_SCHEMA!r})"
         )
     value = _require_exact_keys(raw, expected_keys, where="adjudication")
     legacy_v1 = schema_version == PREVIOUS_ADJUDICATION_SCHEMA
+    branch_challenge = schema_version == BRANCH_CHALLENGE_ADJUDICATION_SCHEMA
+    if branch_challenge:
+        if value["promotion_mode"] != "branch_challenge":
+            raise PromotionError("branch adjudication promotion_mode drift")
     declared_digest = _validate_sha256(
         value["adjudication_sha256"], where="adjudication.adjudication_sha256"
     )
@@ -5014,7 +5263,20 @@ def _verify_adjudication(
             if isinstance(function_upgrade, dict)
             else training_report_payload.get("init_checkpoint_sha256")
         )
-    if evaluation_parent_sha != champion_ref["sha256"]:
+    if branch_challenge:
+        report_initializer_sha = training_report_payload.get("init_checkpoint_sha256")
+        if (
+            not isinstance(report_initializer_sha, str)
+            or evaluation_parent_sha != report_initializer_sha
+        ):
+            raise PromotionError(
+                "branch challenge training receipt does not bind its initializer"
+            )
+        if report_initializer_sha == champion_ref["sha256"]:
+            raise PromotionError(
+                "branch challenge initializer must differ from displaced incumbent"
+            )
+    elif evaluation_parent_sha != champion_ref["sha256"]:
         raise PromotionError(
             "candidate training parent/init checkpoint differs from adjudicated "
             "promotion baseline"
@@ -5023,7 +5285,12 @@ def _verify_adjudication(
     # legitimately warm-start from an intermediate dose, while their sealed
     # generation producer remains the promotion parent checked above.
     init_path = training_report_payload.get("init_checkpoint")
-    if curriculum_parent is None and function_upgrade is None and init_path is not None:
+    if (
+        not branch_challenge
+        and curriculum_parent is None
+        and function_upgrade is None
+        and init_path is not None
+    ):
         if _absolute(init_path, base=training_path.parent) != champion_path:
             raise PromotionError(
                 "candidate training init path differs from adjudicated promotion baseline"
@@ -5104,6 +5371,21 @@ def _verify_adjudication(
     candidate_binding["search_config"] = candidate_identity["search_config"]
     champion_binding["agent_identity"] = champion_identity
     champion_binding["search_config"] = champion_identity["search_config"]
+    branch_lineage: dict[str, Any] | None = None
+    if branch_challenge:
+        branch_lineage = _verify_branch_challenge_lineage(
+            value["candidate_lineage"],
+            training_report=training_report_payload,
+            training_report_path=training_path,
+            training_receipt=training_receipt_ref,
+            champion_path=champion_path,
+            champion_sha256=champion_ref["sha256"],
+            champion_version=champion_raw["version"],
+            champion_agent_identity_sha256=champion_identity[
+                "agent_identity_sha256"
+            ],
+            base=base,
+        )
 
     checks = _require_exact_keys(value["checks"], REQUIRED_CHECKS, where="checks")
     failed_checks = sorted(
@@ -5141,6 +5423,12 @@ def _verify_adjudication(
             contract=contract,
             candidate=candidate_binding,
             champion=champion_binding,
+            promotion_mode=(
+                "branch_challenge" if branch_challenge else "promotion_parent"
+            ),
+            candidate_parent=(
+                None if branch_lineage is None else branch_lineage["initializer"]
+            ),
         )
     elif value["nth_confirmation"] is not None:
         raise PromotionError("non-required nth confirmation must be null")
@@ -5169,6 +5457,12 @@ def _verify_adjudication(
             expected_readout=_contract_value_readout(contract),
             candidate=candidate_binding,
             champion=champion_binding,
+            promotion_mode=(
+                "branch_challenge" if branch_challenge else "promotion_parent"
+            ),
+            candidate_parent=(
+                None if branch_lineage is None else branch_lineage["initializer"]
+            ),
         )
         final_cohort_intervals.extend(
             _promotion_cohort_intervals(
@@ -5185,6 +5479,10 @@ def _verify_adjudication(
         )
 
     return {
+        "promotion_mode": (
+            "branch_challenge" if branch_challenge else "promotion_parent"
+        ),
+        "candidate_lineage": branch_lineage,
         "candidate": {
             **candidate_ref,
             "version": candidate_raw["version"],
@@ -5244,7 +5542,15 @@ def _stage_registry(
             ],
             "a1_champion_search_config": champion["agent_identity"]["search_config"],
             "fleet_ckpt_updated": False,
+            "a1_promotion_mode": verified["promotion_mode"],
         }
+        if verified["candidate_lineage"] is not None:
+            provenance["a1_branch_initializer"] = verified["candidate_lineage"][
+                "initializer"
+            ]
+            provenance["a1_displaced_incumbent"] = verified[
+                "candidate_lineage"
+            ]["displaced_incumbent"]
         registry.append_pool(
             champion["path"],
             expected_md5=champion["md5"],

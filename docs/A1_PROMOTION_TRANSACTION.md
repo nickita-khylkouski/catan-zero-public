@@ -62,6 +62,26 @@ immutable diagnostic/adjudication result; intervals are half-open:
 }
 ```
 
+### Historical branch challenges
+
+An independently trained candidate may have an authenticated initializer older
+than the current registry incumbent. It must not pretend to be a direct child
+of that incumbent. Plan its evaluation with
+`--comparison-mode branch_challenge`, pass the true older
+`--candidate-parent`, and keep the current registry incumbent as `--champion`.
+The resulting v2 evaluation binding is promotion-eligible only when that
+baseline still equals the authoritative registry bytes and agent identity.
+
+A branch adjudication uses
+`a1-branch-challenge-adjudication-v1`, records both the authenticated
+`initializer` and `displaced_incumbent`, and requires exactly two fresh,
+seed-disjoint internal cohorts. Each cohort must independently reach strict
+pentanomial H1 for `[0,+15]`, not merely the ordinary `[-10,+15]`
+noninferiority gate. The paired external panel retains the same fixed 2%
+noninferiority veto as direct-child promotion. Historical/diagnostic bindings,
+an initializer rebound to the incumbent, a stale registry, or a baseline other
+than the current incumbent all fail closed.
+
 ## One-time A1 registry bootstrap
 
 If no pre-A1 registry was ever persisted, create the A1 lineage only through

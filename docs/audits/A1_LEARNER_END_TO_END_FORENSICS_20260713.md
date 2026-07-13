@@ -521,6 +521,44 @@ f7 and consumes that one selected identical dose:
 Promote nothing from offline loss. First use a short matched internal panel, then
 the full seat-swapped neutral gate for survivors.
 
+### Independent n256 specialist: real internal gain, real external regression
+
+The historical n256 checkpoint was reconstructed as a clean independent f7
+child rather than another chained candidate: fresh Adam, flat `1.2e-4`, 2,962
+updates, and 12.13M authenticated n256 draws. Two fresh global-n128/D6 internal
+cohorts both favored it over v5: `640-560` and `658-542`, or `1298-1102`
+combined (`54.083%`, about +28 Elo). The gain is therefore reproducible and not
+an evaluator accident.
+
+It nevertheless failed the matched neutral external panel decisively. On the
+same 32 seeds and both seat orientations against `catanatron_value`, n256 went
+`18-46` while v5 went `33-31`. The paired delta was -23.44 percentage points,
+95% CI `[-39.89,-6.98]`, with McNemar `p=.00592`; there were no errors,
+truncations, or engine divergences. This establishes a specialist/generalist
+failure: narrow high-dose n256 distillation can improve self-play strength while
+destroying behavior needed against an out-of-distribution opponent. Internal
+H2H alone is not a promotion criterion.
+
+Historical branches are now represented explicitly as `branch_challenge`.
+Their initializer is authenticated separately from the current registry
+incumbent, the incumbent must be the evaluation baseline, two fresh disjoint
+internal cohorts must each establish strict `[0,+15]` superiority, and the
+existing paired 2% external-noninferiority veto remains mandatory. Historical
+diagnostics and stale/nonincumbent bindings cannot be laundered into promotion.
+
+### Categorical value was tested with the wrong effective gradient budget
+
+The exact 33-bin HL-Gauss arm completed 128 updates / 524,288 draws from f7,
+but its nominal `0.25` value coefficient was not comparable to scalar MSE.
+Scalar clipped only `1/128` updates (mean pre-clip norm `0.6203`); HL-Gauss
+clipped `96/128` (mean `1.1098`). The shared-trunk overload coincided with worse
+held-out policy loss (`1.27321 -> 1.29307`) and categorical-expectation value
+MSE (`0.57437 -> 0.80126`). This arm rejects that coefficient, not categorical
+value itself. The next valid probe must measure first-batch per-objective trunk
+gradient norms, scale CE to an equal effective budget (analytic starting point
+`0.25/log(33)=0.0715`), and preferably commission the fresh categorical head
+head-only before unfreezing its trunk gradient.
+
 ### P3 — only after the proximal mechanisms are exhausted
 
 - grow depth/width from the same f7 checkpoint with a function-preserving warm
