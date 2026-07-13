@@ -83,19 +83,40 @@ def test_plan_matches_global_batch_warmup_and_total_samples(
     )
     assert plan["diagnostic_only"] is True
     assert plan["promotion_eligible"] is False
-    assert plan["only_intended_drift"] == ["batch_size", "grad_accum_steps"]
+    assert plan["only_intended_drift"] == ["world_size", "batch_size", "gpu_ids"]
     assert [run["local_batch_size"] for run in plan["runs"]] == [512, 1024]
-    assert [run["grad_accum_steps"] for run in plan["runs"]] == [2, 1]
-    assert {run["global_batch_size"] for run in plan["runs"]} == {8192}
-    assert {run["warmup_samples"] for run in plan["runs"]} == {819_200}
-    assert {run["planned_samples"] for run in plan["runs"]} == {4_194_304}
-    assert plan["matched_invariants"]["warmup_samples"] == 819_200
+    assert [run["world_size"] for run in plan["runs"]] == [8, 4]
+    assert [run["grad_accum_steps"] for run in plan["runs"]] == [1, 1]
+    assert [run["gpu_ids"] for run in plan["runs"]] == [list(range(8)), list(range(4))]
+    assert {run["global_batch_size"] for run in plan["runs"]} == {4096}
+    assert {run["warmup_samples"] for run in plan["runs"]} == {409_600}
+    assert {run["planned_samples"] for run in plan["runs"]} == {2_097_152}
+    assert plan["matched_invariants"]["warmup_samples"] == 409_600
+    assert plan["measurement_contract"] == {
+        "train_diagnostics_every_batches": 0,
+        "objective_gradient_interference_every_batches": 0,
+        "timed_arms_run_sequentially": True,
+        "reason": (
+            "parameter snapshots, extra autograd probes, and concurrent host I/O "
+            "would contaminate systems throughput"
+        ),
+    }
     for run in plan["runs"]:
         command = run["command"]
         assert command[command.index("--max-steps") + 1] == "512"
         assert command[command.index("--lr-warmup-steps") + 1] == "100"
         assert command[command.index("--lr") + 1] == "3e-5"
         assert command[command.index("--seed") + 1] == "1"
+        assert command[command.index("--train-diagnostics-every-batches") + 1] == "0"
+        assert (
+            command[
+                command.index("--objective-gradient-interference-every-batches")
+                + 1
+            ]
+            == "0"
+        )
+    assert "--nproc-per-node=8" in plan["runs"][0]["command"]
+    assert "--nproc-per-node=4" in plan["runs"][1]["command"]
 
 
 def test_plan_refuses_incomplete_warmup(
