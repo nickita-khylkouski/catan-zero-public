@@ -1140,6 +1140,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     # after derived values have been resolved.
     generate_config = resolve_config(args, GenerateConfig.from_namespace)
     generate_config_hash = generate_config.config_hash()
+    generate_config_full_hash = generate_config.full_config_hash()
     if bool(args.wide_roots_always_full) and args.n_full_wide is None:
         parser.error("--wide-roots-always-full requires --n-full-wide")
     if str(args.value_readout) == "categorical" and not args.checkpoint:
@@ -1227,6 +1228,11 @@ def main(argv: Sequence[str] | None = None) -> None:
                 # a prefix of the next unconfirmed game.
                 "resume": False,
                 "run_id": generate_config_hash,
+                # Exact producer bytes are already inside GenerateConfig's
+                # digest. run_worker_games combines this caller authority with
+                # its fully realized config/search/opponent dataclasses before
+                # allowing any future incremental resume.
+                "resume_semantics_sha256": generate_config_full_hash,
                 "checkpoint": runtime_checkpoint,
                 "device": args.device,
                 "n_full": int(args.n_full),
@@ -1361,6 +1367,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         opponent_mix_exploiter_fraction=opponent_mix_exploiter_fraction,
     )
     summary["config_hash"] = generate_config_hash
+    summary["full_config_hash"] = generate_config_full_hash
     summary["public_award_feature_provenance"] = public_award_feature_provenance
     summary["producer_checkpoint_sha256"] = args.producer_checkpoint_sha256
     summary["producer_checkpoint_staged_path"] = runtime_checkpoint
@@ -1906,6 +1913,7 @@ def _run_worker(
         ),
         resume=bool(worker_args.get("resume", False)),
         run_id=str(worker_args.get("run_id", "")),
+        resume_semantics_sha256=worker_args.get("resume_semantics_sha256"),
         opponent_pool=opponent_pool,
         opponent_mix=opponent_mix,
         native_mcts_hot_loop=bool(worker_args.get("native_mcts_hot_loop", False)),

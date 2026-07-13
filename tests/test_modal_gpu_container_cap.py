@@ -50,3 +50,10 @@ def test_tools_modal_shadow_package_stays_deleted():
     assert not shadow.exists(), (
         f"{shadow} re-introduces the Modal-SDK-shadowing package removed in CAT-134"
     )
+
+
+def test_gpu_factory_resume_contract_binds_checkpoint_bytes_and_recipe():
+    src = _GPU_FACTORY.read_text(encoding="utf-8")
+    assert 'science_payload["producer_checkpoint_sha256"] = _file_sha256(checkpoint)' in src
+    assert '"resume_semantics_sha256": _resume_semantics_sha256(' in src
+    assert 'resume_semantics_sha256=str(worker_args["resume_semantics_sha256"])' in src

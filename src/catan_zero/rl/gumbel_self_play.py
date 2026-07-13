@@ -36,6 +36,7 @@ exclusive, and `play_one_game` itself needs no changes to support either. Defaul
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 import hashlib
 import io
@@ -111,7 +112,7 @@ __all__ = [
 # same-run_id retry after a preemption pick up where it left off instead of
 # replaying (or wiping) already-flushed games.
 PROGRESS_FILENAME = "progress.json"
-WORKER_PROGRESS_RESUME_CONTRACT_VERSION = 2
+WORKER_PROGRESS_RESUME_CONTRACT_VERSION = 3
 
 COLORS = ("RED", "BLUE")
 PLAYER_NAMES = ("BLUE", "RED", "ORANGE", "WHITE")
@@ -405,7 +406,9 @@ def read_opponent_pool_manifest(
             key=lambda ref: ref.version,
         )
     )
-    champion = ChampionRef(version=max(ref.version for ref in archive) + 1, path="", promoted_at=0.0)
+    champion = ChampionRef(
+        version=max(ref.version for ref in archive) + 1, path="", promoted_at=0.0
+    )
     policy = OpponentPolicy(pool_fraction=float(data.get("pool_fraction", 0.0)))
     return policy, champion, archive
 
@@ -468,12 +471,18 @@ def _temperature_for_decision(
 ) -> float:
     if eval_override:
         return float(config.temperature_low)
-    cutoff = max(1, round(float(config.max_decisions) * float(config.temperature_move_fraction)))
+    cutoff = max(
+        1, round(float(config.max_decisions) * float(config.temperature_move_fraction))
+    )
     if decision_index < cutoff:
         return float(config.temperature_high)
     if config.late_temperature_move_fraction is not None:
         late_cutoff = max(
-            cutoff, round(float(config.max_decisions) * float(config.late_temperature_move_fraction))
+            cutoff,
+            round(
+                float(config.max_decisions)
+                * float(config.late_temperature_move_fraction)
+            ),
         )
         if decision_index < late_cutoff:
             return float(config.late_temperature)
@@ -503,7 +512,9 @@ def _apply_selected_action(
     the search itself now reasons about these chance nodes correctly.
     """
     if action_json is None:
-        ids = [int(action) for action in game.playable_action_indices(list(colors), None)]
+        ids = [
+            int(action) for action in game.playable_action_indices(list(colors), None)
+        ]
         actions = json.loads(game.playable_actions_json())
         action_by_id = {action_id: action for action_id, action in zip(ids, actions)}
         action_json = action_by_id.get(int(action_index))
@@ -520,7 +531,9 @@ def _apply_selected_action(
         candidates = move_robber_victim_outcome_weights(game, action_json)
         if candidates:
             total = sum(weight for _index, weight, _game in candidates)
-            outcomes = tuple((index, weight / total) for index, weight, _game in candidates)
+            outcomes = tuple(
+                (index, weight / total) for index, weight, _game in candidates
+            )
             chosen_index = _sample_from_outcomes(rng, outcomes)
             return next(
                 candidate_game
@@ -528,12 +541,16 @@ def _apply_selected_action(
                 if index == chosen_index
             )
 
-    if correct_rust_chance_spectra and _action_type_of(action_json) == "BUY_DEVELOPMENT_CARD":
+    if (
+        correct_rust_chance_spectra
+        and _action_type_of(action_json) == "BUY_DEVELOPMENT_CARD"
+    ):
         real_candidates = buy_development_card_real_outcomes(game, action_json)
         if real_candidates:
             total = sum(probability for _index, probability, _game in real_candidates)
             normalized = tuple(
-                (index, probability / total) for index, probability, _game in real_candidates
+                (index, probability / total)
+                for index, probability, _game in real_candidates
             )
             chosen_index = _sample_from_outcomes(rng, normalized)
             return next(
@@ -563,7 +580,9 @@ def _action_type_of(action_json: Any) -> str:
     return ""
 
 
-def _sample_from_outcomes(rng: random.Random, outcomes: tuple[tuple[int, float], ...]) -> int:
+def _sample_from_outcomes(
+    rng: random.Random, outcomes: tuple[tuple[int, float], ...]
+) -> int:
     if len(outcomes) == 1:
         return outcomes[0][0]
     draw = rng.random()
@@ -577,11 +596,14 @@ def _sample_from_outcomes(rng: random.Random, outcomes: tuple[tuple[int, float],
 
 def _actual_victory_points(player_state: dict[str, Any]) -> int:
     return int(
-        player_state.get("actual_victory_points", player_state.get("victory_points", 0)) or 0
+        player_state.get("actual_victory_points", player_state.get("victory_points", 0))
+        or 0
     )
 
 
-def _game_outcome_fields(game: Any, *, terminal: bool, colors: tuple[str, ...]) -> dict[str, Any]:
+def _game_outcome_fields(
+    game: Any, *, terminal: bool, colors: tuple[str, ...]
+) -> dict[str, Any]:
     winner = game.winning_color()
     public_vps: dict[str, int] = {}
     actual_vps: dict[str, int] = {}
@@ -647,9 +669,13 @@ def _build_decision_row(
     if snapshot is None:
         snapshot = json.loads(game.json_snapshot())
     if action_by_id is None:
-        action_ids = [int(action) for action in game.playable_action_indices(list(colors), None)]
+        action_ids = [
+            int(action) for action in game.playable_action_indices(list(colors), None)
+        ]
         raw_actions = json.loads(game.playable_actions_json())
-        action_by_id = {action_id: raw for action_id, raw in zip(action_ids, raw_actions)}
+        action_by_id = {
+            action_id: raw for action_id, raw in zip(action_ids, raw_actions)
+        }
     entity = rust_game_to_entity_batch(
         game,
         legal_rust,
@@ -706,7 +732,10 @@ def _build_decision_row(
     )
     target_scores_mask = np.isfinite(target_scores)
     afterstate_target = np.asarray(
-        [float(result.afterstate_values.get(int(action), np.nan)) for action in legal_rust],
+        [
+            float(result.afterstate_values.get(int(action), np.nan))
+            for action in legal_rust
+        ],
         dtype=np.float32,
     )
     afterstate_target_mask = np.isfinite(afterstate_target)
@@ -769,7 +798,11 @@ def _build_decision_row(
         # is not a teacher target (REANALYZE_VALUE_TARGETS_DESIGN).
         "root_value": np.float32(
             result.root_value
-            if (not is_forced and result.used_full_search and np.isfinite(result.root_value))
+            if (
+                not is_forced
+                and result.used_full_search
+                and np.isfinite(result.root_value)
+            )
             else np.nan
         ),
         "root_value_mask": np.bool_(
@@ -957,10 +990,10 @@ def play_one_game(
     (ROLL/discard). They carry `policy_weight_multiplier=0` (no search signal
     to imitate) but `value_weight_multiplier=1` (still a real value target).
 
-    Both seats are driven by the same `mcts` (reused across the whole game --
-    and typically across a whole worker's lifetime -- so its internal RNG
-    stream advances naturally rather than being reseeded identically per
-    decision). The live game's own chance outcomes (dice, robber steals, dev
+    Both seats are driven by the same `mcts`. Its RNG advances naturally across
+    decisions inside this game; `run_worker_games` assigns each absolute game a
+    deterministic worker-seed-derived stream so resume/failure history cannot
+    perturb later games. The live game's own chance outcomes (dice, robber steals, dev
     card draws) are sampled from a game_seed-derived RNG, independent of the
     search's internal RNG, so a game's board/chance trajectory is
     reproducible from `game_seed` alone given the same sequence of chosen
@@ -992,7 +1025,9 @@ def play_one_game(
             break
         legal_rust = tuple(
             int(action)
-            for action in game.playable_action_indices(list(config.colors), config.map_kind)
+            for action in game.playable_action_indices(
+                list(config.colors), config.map_kind
+            )
         )
         if not legal_rust:
             break
@@ -1054,11 +1089,17 @@ def play_one_game(
                 decision_index=decision_index,
                 obs_width=config.obs_width,
                 target_information_regime=target_information_regime,
-                is_pool_game=(pool_assignment.is_pool if pool_assignment is not None else None),
-                opponent_version=(
-                    pool_assignment.opponent_version if pool_assignment is not None else None
+                is_pool_game=(
+                    pool_assignment.is_pool if pool_assignment is not None else None
                 ),
-                opponent_tag=(pool_assignment.tag if pool_assignment is not None else ""),
+                opponent_version=(
+                    pool_assignment.opponent_version
+                    if pool_assignment is not None
+                    else None
+                ),
+                opponent_tag=(
+                    pool_assignment.tag if pool_assignment is not None else ""
+                ),
                 opponent_checkpoint_md5=(
                     pool_assignment.opponent_md5 if pool_assignment is not None else ""
                 ),
@@ -1108,9 +1149,7 @@ def play_one_game(
                 "aux_vp_in_n": np.float32(targets["aux_vp_in_n"]),
                 "aux_next_settlement": np.int16(targets["aux_next_settlement"]),
                 "aux_robber_target": np.int16(targets["aux_robber_target"]),
-                AUX_SUBGOAL_TARGET_VERSION_KEY: np.uint8(
-                    AUX_SUBGOAL_TARGET_VERSION
-                ),
+                AUX_SUBGOAL_TARGET_VERSION_KEY: np.uint8(AUX_SUBGOAL_TARGET_VERSION),
             }
         )
 
@@ -1174,9 +1213,10 @@ class GumbelShardWriter:
         for key in EXTRA_KEYS:
             if key in row:
                 payload[key] = row[key]
-        if self.preserve_search_evidence and float(
-            row.get("policy_weight_multiplier", 0.0)
-        ) > 0.0:
+        if (
+            self.preserve_search_evidence
+            and float(row.get("policy_weight_multiplier", 0.0)) > 0.0
+        ):
             for key in ("_search_visit_counts", "_search_completed_q"):
                 if key not in row:
                     raise ValueError(
@@ -1225,6 +1265,7 @@ class GumbelShardWriter:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(tmp, path)
+        _fsync_directory(path.parent)
         if self.format == "npz_zst":
             path = _try_zstd(path)
         self.paths.append(path)
@@ -1260,9 +1301,7 @@ def _compact_search_evidence(rows: list[dict[str, Any]]) -> dict[str, np.ndarray
             raise ValueError(
                 "search evidence must align exactly with the row's legal-action axis"
             )
-        if bool(np.any(visits < 0)) or bool(
-            np.any(visits > np.iinfo(np.uint16).max)
-        ):
+        if bool(np.any(visits < 0)) or bool(np.any(visits > np.iinfo(np.uint16).max)):
             raise ValueError("search visit counts exceed uint16 evidence schema")
         if not bool(np.all(np.isfinite(completed_q))):
             raise ValueError("policy-active search evidence has non-finite completed-Q")
@@ -1292,9 +1331,7 @@ def _compact_search_evidence(rows: list[dict[str, Any]]) -> dict[str, np.ndarray
         else np.asarray([], dtype=np.float32)
     )
     return {
-        "search_evidence_version": np.asarray(
-            SEARCH_EVIDENCE_VERSION, dtype=np.uint8
-        ),
+        "search_evidence_version": np.asarray(SEARCH_EVIDENCE_VERSION, dtype=np.uint8),
         "search_evidence_offsets": np.asarray(offsets, dtype=np.uint32),
         "search_visit_counts_flat": visits_flat,
         "search_completed_q_flat": completed_q_flat,
@@ -1385,40 +1422,66 @@ def _rows_to_arrays(
                 else 0.0
             )
             out[key] = np.stack(
-                [_pad_1d(np.asarray(value), legal_width, fill=fill) for value in values], axis=0
+                [
+                    _pad_1d(np.asarray(value), legal_width, fill=fill)
+                    for value in values
+                ],
+                axis=0,
             )
         elif key in {"afterstate_target", "afterstate_target_mask"}:
             fill = np.nan if key == "afterstate_target" else False
             out[key] = np.stack(
-                [_pad_1d(np.asarray(value), legal_width, fill=fill) for value in values], axis=0
+                [
+                    _pad_1d(np.asarray(value), legal_width, fill=fill)
+                    for value in values
+                ],
+                axis=0,
             )
         elif key == "legal_action_context":
             feature_size = int(np.asarray(values[0]).shape[1])
             out[key] = np.stack(
-                [_pad_2d(np.asarray(value), legal_width, feature_size, fill=0.0) for value in values],
+                [
+                    _pad_2d(np.asarray(value), legal_width, feature_size, fill=0.0)
+                    for value in values
+                ],
                 axis=0,
             )
         else:
             out[key] = np.asarray(values)
     for key in ENTITY_KEYS:
         values = [row[key] for row in rows]
-        if key in {"legal_action_tokens", "legal_action_target_ids", "legal_action_mask"}:
+        if key in {
+            "legal_action_tokens",
+            "legal_action_target_ids",
+            "legal_action_mask",
+        }:
             if key == "legal_action_tokens":
                 out[key] = np.stack(
                     [
-                        _pad_2d(np.asarray(value), legal_width, np.asarray(value).shape[1], fill=0.0)
+                        _pad_2d(
+                            np.asarray(value),
+                            legal_width,
+                            np.asarray(value).shape[1],
+                            fill=0.0,
+                        )
                         for value in values
                     ],
                     axis=0,
                 ).astype(np.float16, copy=False)
             elif key == "legal_action_target_ids":
                 out[key] = np.stack(
-                    [_pad_2d(np.asarray(value), legal_width, 4, fill=-1) for value in values],
+                    [
+                        _pad_2d(np.asarray(value), legal_width, 4, fill=-1)
+                        for value in values
+                    ],
                     axis=0,
                 ).astype(np.int16, copy=False)
             else:
                 out[key] = np.stack(
-                    [_pad_1d(np.asarray(value), legal_width, fill=False) for value in values],
+                    [
+                        _pad_1d(np.asarray(value), legal_width, fill=False)
+                        for value in values
+                    ],
                     axis=0,
                 ).astype(np.bool_, copy=False)
         else:
@@ -1436,7 +1499,9 @@ def _pad_1d(value: np.ndarray, width: int, *, fill: Any) -> np.ndarray:
     return out
 
 
-def _pad_2d(value: np.ndarray, width: int, feature_size: int, *, fill: Any) -> np.ndarray:
+def _pad_2d(
+    value: np.ndarray, width: int, feature_size: int, *, fill: Any
+) -> np.ndarray:
     value = np.asarray(value)
     out = np.full((int(width), int(feature_size)), fill, dtype=value.dtype)
     rows = min(int(width), int(value.shape[0]))
@@ -1451,11 +1516,30 @@ def _try_zstd(path: Path) -> Path:
     except ImportError:
         return path
     compressed = path.with_name(path.name + ".zst")
+    tmp = compressed.with_name(f".{compressed.name}.tmp.{os.getpid()}.{time.time_ns()}")
     compressor = zstandard.ZstdCompressor(level=12)
-    with path.open("rb") as source, compressed.open("wb") as target:
-        compressor.copy_stream(source, target)
-    path.unlink()
+    try:
+        with path.open("rb") as source, tmp.open("xb") as target:
+            compressor.copy_stream(source, target)
+            target.flush()
+            os.fsync(target.fileno())
+        os.replace(tmp, compressed)
+        _fsync_directory(compressed.parent)
+        path.unlink()
+        _fsync_directory(compressed.parent)
+    finally:
+        tmp.unlink(missing_ok=True)
     return compressed
+
+
+def _fsync_directory(path: Path) -> None:
+    """Persist a file create/replace/unlink in its containing directory."""
+
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 @dataclass(slots=True)
@@ -1489,6 +1573,7 @@ class WorkerProgress:
 
     run_id: str
     resume_contract_version: int
+    generation_semantics_sha256: str
     # Resume is only sound when every retained shard was produced under the
     # same row-label semantics as the code completing the run.  These fields
     # deliberately make pre-v1 progress markers unreadable by `from_dict` so
@@ -1505,6 +1590,7 @@ class WorkerProgress:
     games_succeeded: int
     shard_count_confirmed: int
     rows_confirmed: int
+    confirmed_shards: list[dict[str, Any]]
     games_failed: int
     games_truncated: int
     rows: int
@@ -1512,18 +1598,122 @@ class WorkerProgress:
     forced_decisions_total: int
     simulations_used_total: int
     wins_by_color: dict[str, int]
+    errors: list[dict[str, Any]]
+    opponent_pool_games: int
+    opponent_pool_per_version_stats: dict[str, dict[str, int]]
+    opponent_mix_pool_games: int
+    opponent_mix_per_tag_stats: dict[str, dict[str, int]]
+    exploiter_games: int
+    exploiter_per_engine_stats: dict[str, dict[str, int]]
+    exploiter_divergence_topics: dict[str, int]
 
     def to_dict(self) -> dict[str, Any]:
         return dataclasses.asdict(self)
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "WorkerProgress":
+        def _nonnegative_int(value: Any, field: str) -> int:
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(
+                    f"worker progress {field} must be a non-negative integer"
+                )
+            return value
+
+        def _stats(
+            value: Any, *, field: str, keys: tuple[str, ...]
+        ) -> dict[str, dict[str, int]]:
+            if not isinstance(value, dict):
+                raise ValueError(f"worker progress {field} must be an object")
+            parsed: dict[str, dict[str, int]] = {}
+            for raw_name, raw_stats in value.items():
+                name = str(raw_name)
+                if (
+                    not name
+                    or not isinstance(raw_stats, dict)
+                    or set(raw_stats) != set(keys)
+                ):
+                    raise ValueError(
+                        f"worker progress {field} has malformed entry {raw_name!r}"
+                    )
+                parsed[name] = {
+                    key: _nonnegative_int(raw_stats[key], f"{field}.{name}.{key}")
+                    for key in keys
+                }
+                if parsed[name].get("champion_wins", 0) > parsed[name].get("games", 0):
+                    raise ValueError(f"worker progress {field}.{name} has wins > games")
+            return parsed
+
+        def _confirmed_inventory(value: Any) -> list[dict[str, Any]]:
+            if not isinstance(value, list):
+                raise ValueError("worker progress confirmed_shards must be a list")
+            records: list[dict[str, Any]] = []
+            expected_keys = {
+                "index",
+                "filename",
+                "rows",
+                "size_bytes",
+                "sha256",
+                "game_seed_sha256",
+                "game_seed_min",
+                "game_seed_max",
+                "unique_game_seeds",
+            }
+            for offset, raw in enumerate(value):
+                if not isinstance(raw, dict) or set(raw) != expected_keys:
+                    raise ValueError(
+                        "worker progress confirmed shard record is malformed"
+                    )
+                index = _nonnegative_int(
+                    raw["index"], f"confirmed_shards[{offset}].index"
+                )
+                rows = _nonnegative_int(raw["rows"], f"confirmed_shards[{offset}].rows")
+                size_bytes = _nonnegative_int(
+                    raw["size_bytes"], f"confirmed_shards[{offset}].size_bytes"
+                )
+                unique = _nonnegative_int(
+                    raw["unique_game_seeds"],
+                    f"confirmed_shards[{offset}].unique_game_seeds",
+                )
+                filename = raw["filename"]
+                sha256 = raw["sha256"]
+                seed_sha256 = raw["game_seed_sha256"]
+                seed_min = raw["game_seed_min"]
+                seed_max = raw["game_seed_max"]
+                expected_filename = f"gumbel_self_play_shard_{index:05d}.npz" + (
+                    ".zst" if payload.get("shard_format") == "npz_zst" else ""
+                )
+                if (
+                    index != offset
+                    or not isinstance(filename, str)
+                    or filename != expected_filename
+                    or not isinstance(sha256, str)
+                    or len(sha256) != 64
+                    or any(character not in "0123456789abcdef" for character in sha256)
+                    or not isinstance(seed_sha256, str)
+                    or len(seed_sha256) != 64
+                    or any(
+                        character not in "0123456789abcdef" for character in seed_sha256
+                    )
+                    or isinstance(seed_min, bool)
+                    or not isinstance(seed_min, int)
+                    or isinstance(seed_max, bool)
+                    or not isinstance(seed_max, int)
+                    or rows <= 0
+                    or size_bytes <= 0
+                    or unique <= 0
+                    or seed_min > seed_max
+                ):
+                    raise ValueError(
+                        "worker progress confirmed shard identity is invalid"
+                    )
+                records.append(dict(raw))
+            return records
+
         raw_resume_contract_version = payload["resume_contract_version"]
         if (
             isinstance(raw_resume_contract_version, bool)
             or not isinstance(raw_resume_contract_version, int)
-            or raw_resume_contract_version
-            != WORKER_PROGRESS_RESUME_CONTRACT_VERSION
+            or raw_resume_contract_version != WORKER_PROGRESS_RESUME_CONTRACT_VERSION
         ):
             raise ValueError(
                 "worker progress resume contract version mismatch: "
@@ -1552,28 +1742,148 @@ class WorkerProgress:
                 f"expected {AUX_SUBGOAL_TARGET_SEMANTIC!r}, "
                 f"got {aux_subgoal_target_semantic!r}"
             )
-        return cls(
+        generation_semantics_sha256 = str(payload["generation_semantics_sha256"])
+        if (
+            not generation_semantics_sha256.startswith("sha256:")
+            or len(generation_semantics_sha256) != 71
+            or any(
+                character not in "0123456789abcdef"
+                for character in generation_semantics_sha256.removeprefix("sha256:")
+            )
+        ):
+            raise ValueError("worker progress generation semantics digest is invalid")
+        confirmed_shards = _confirmed_inventory(payload["confirmed_shards"])
+        pool_stats = _stats(
+            payload["opponent_pool_per_version_stats"],
+            field="opponent_pool_per_version_stats",
+            keys=("games", "champion_wins"),
+        )
+        if any(
+            version != str(int(version)) or int(version) < 0
+            for version in pool_stats
+        ):
+            raise ValueError(
+                "worker progress opponent-pool versions must be canonical non-negative integers"
+            )
+        mix_stats = _stats(
+            payload["opponent_mix_per_tag_stats"],
+            field="opponent_mix_per_tag_stats",
+            keys=("games", "champion_wins"),
+        )
+        exploiter_stats = _stats(
+            payload["exploiter_per_engine_stats"],
+            field="exploiter_per_engine_stats",
+            keys=("games", "champion_wins", "divergences"),
+        )
+        raw_topics = payload["exploiter_divergence_topics"]
+        if not isinstance(raw_topics, dict):
+            raise ValueError(
+                "worker progress exploiter_divergence_topics must be an object"
+            )
+        topics = {
+            str(topic): _nonnegative_int(count, f"exploiter_divergence_topics.{topic}")
+            for topic, count in raw_topics.items()
+        }
+        raw_errors = payload["errors"]
+        if not isinstance(raw_errors, list) or any(
+            not isinstance(error, dict)
+            or set(error) != {"game_index", "game_seed", "error"}
+            or isinstance(error["game_index"], bool)
+            or not isinstance(error["game_index"], int)
+            or isinstance(error["game_seed"], bool)
+            or not isinstance(error["game_seed"], int)
+            or not isinstance(error["error"], str)
+            for error in raw_errors
+        ):
+            raise ValueError("worker progress errors are malformed")
+
+        result = cls(
             run_id=str(payload["run_id"]),
             resume_contract_version=raw_resume_contract_version,
+            generation_semantics_sha256=generation_semantics_sha256,
             aux_subgoal_target_version=aux_subgoal_target_version,
             aux_subgoal_target_semantic=aux_subgoal_target_semantic,
-            shard_size=int(payload["shard_size"]),
+            shard_size=_nonnegative_int(payload["shard_size"], "shard_size"),
             shard_format=str(payload["shard_format"]),
-            base_seed=int(payload["base_seed"]),
-            game_index_start=int(payload["game_index_start"]),
-            games_requested=int(payload["games_requested"]),
-            games_completed_local=int(payload["games_completed_local"]),
-            games_succeeded=int(payload["games_succeeded"]),
-            shard_count_confirmed=int(payload["shard_count_confirmed"]),
-            rows_confirmed=int(payload["rows_confirmed"]),
-            games_failed=int(payload["games_failed"]),
-            games_truncated=int(payload["games_truncated"]),
-            rows=int(payload["rows"]),
-            decisions_total=int(payload["decisions_total"]),
-            forced_decisions_total=int(payload["forced_decisions_total"]),
-            simulations_used_total=int(payload["simulations_used_total"]),
-            wins_by_color={str(k): int(v) for k, v in dict(payload["wins_by_color"]).items()},
+            base_seed=_nonnegative_int(payload["base_seed"], "base_seed"),
+            game_index_start=_nonnegative_int(
+                payload["game_index_start"], "game_index_start"
+            ),
+            games_requested=_nonnegative_int(
+                payload["games_requested"], "games_requested"
+            ),
+            games_completed_local=_nonnegative_int(
+                payload["games_completed_local"], "games_completed_local"
+            ),
+            games_succeeded=_nonnegative_int(
+                payload["games_succeeded"], "games_succeeded"
+            ),
+            shard_count_confirmed=_nonnegative_int(
+                payload["shard_count_confirmed"], "shard_count_confirmed"
+            ),
+            rows_confirmed=_nonnegative_int(
+                payload["rows_confirmed"], "rows_confirmed"
+            ),
+            confirmed_shards=confirmed_shards,
+            games_failed=_nonnegative_int(payload["games_failed"], "games_failed"),
+            games_truncated=_nonnegative_int(
+                payload["games_truncated"], "games_truncated"
+            ),
+            rows=_nonnegative_int(payload["rows"], "rows"),
+            decisions_total=_nonnegative_int(
+                payload["decisions_total"], "decisions_total"
+            ),
+            forced_decisions_total=_nonnegative_int(
+                payload["forced_decisions_total"], "forced_decisions_total"
+            ),
+            simulations_used_total=_nonnegative_int(
+                payload["simulations_used_total"], "simulations_used_total"
+            ),
+            wins_by_color={
+                str(k): _nonnegative_int(v, f"wins_by_color.{k}")
+                for k, v in dict(payload["wins_by_color"]).items()
+            },
+            errors=[dict(error) for error in raw_errors],
+            opponent_pool_games=_nonnegative_int(
+                payload["opponent_pool_games"], "opponent_pool_games"
+            ),
+            opponent_pool_per_version_stats=pool_stats,
+            opponent_mix_pool_games=_nonnegative_int(
+                payload["opponent_mix_pool_games"], "opponent_mix_pool_games"
+            ),
+            opponent_mix_per_tag_stats=mix_stats,
+            exploiter_games=_nonnegative_int(
+                payload["exploiter_games"], "exploiter_games"
+            ),
+            exploiter_per_engine_stats=exploiter_stats,
+            exploiter_divergence_topics=topics,
         )
+        if (
+            not result.run_id
+            or result.shard_size <= 0
+            or result.shard_format not in {"npz", "npz_zst"}
+            or result.games_completed_local > result.games_requested
+            or result.games_succeeded + result.games_failed
+            != result.games_completed_local
+            or result.games_truncated > result.games_succeeded
+            or result.rows != result.rows_confirmed
+            or result.forced_decisions_total > result.decisions_total
+            or sum(result.wins_by_color.values()) > result.games_succeeded
+            or len(result.confirmed_shards) != result.shard_count_confirmed
+            or sum(record["rows"] for record in result.confirmed_shards)
+            != result.rows_confirmed
+            or len(result.errors) != result.games_failed
+            or sum(stats["games"] for stats in pool_stats.values())
+            != result.opponent_pool_games
+            or result.opponent_mix_pool_games
+            > sum(stats["games"] for stats in mix_stats.values())
+            or sum(stats["games"] for stats in exploiter_stats.values())
+            != result.exploiter_games
+            or sum(stats["divergences"] for stats in exploiter_stats.values())
+            != sum(topics.values())
+        ):
+            raise ValueError("worker progress aggregate coherence failed")
+        return result
 
 
 def _load_worker_progress(out_dir: Path) -> WorkerProgress | None:
@@ -1613,34 +1923,67 @@ def _confirmed_shard_paths(out_dir: Path, *, upto_index: int) -> list[Path]:
     return [path for _index, path in sorted(found)]
 
 
-def _resume_shard_row_count(path: Path) -> int:
-    """Authenticate one retained shard and return its exact row count."""
+def _resume_shard_evidence(path: Path, *, index: int) -> dict[str, Any]:
+    """Authenticate one retained shard and bind its exact on-disk identity."""
 
-    if path.name.endswith(".zst"):
-        try:
-            import zstandard
-        except ImportError as error:
-            raise ValueError(
-                "zstandard is required to authenticate retained resume shards"
-            ) from error
-        with path.open("rb") as source:
-            with zstandard.ZstdDecompressor().stream_reader(source) as reader:
-                payload = reader.read()
-        archive_context = np.load(io.BytesIO(payload), allow_pickle=False)
-    else:
-        archive_context = np.load(path, allow_pickle=False)
-    with archive_context as archive:
-        if "game_seed" not in archive or AUX_SUBGOAL_TARGET_VERSION_KEY not in archive:
-            raise ValueError(f"retained shard lacks resume authority columns: {path}")
-        seeds = np.asarray(archive["game_seed"])
-        versions = np.asarray(archive[AUX_SUBGOAL_TARGET_VERSION_KEY])
-        if seeds.ndim != 1 or versions.shape != seeds.shape:
-            raise ValueError(f"retained shard row-shape drift: {path}")
-        if versions.dtype.kind not in {"i", "u"} or bool(
-            np.any(versions.astype(np.int64, copy=False) != AUX_SUBGOAL_TARGET_VERSION)
-        ):
-            raise ValueError(f"retained shard aux semantic drift: {path}")
-        return int(seeds.size)
+    try:
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        if path.name.endswith(".zst"):
+            try:
+                import zstandard
+            except ImportError as error:
+                raise ValueError(
+                    "zstandard is required to authenticate retained resume shards"
+                ) from error
+            with path.open("rb") as source:
+                with zstandard.ZstdDecompressor().stream_reader(source) as reader:
+                    payload = reader.read()
+            archive_context = np.load(io.BytesIO(payload), allow_pickle=False)
+        else:
+            archive_context = np.load(path, allow_pickle=False)
+        with archive_context as archive:
+            if (
+                "game_seed" not in archive
+                or AUX_SUBGOAL_TARGET_VERSION_KEY not in archive
+            ):
+                raise ValueError(
+                    f"retained shard lacks resume authority columns: {path}"
+                )
+            seeds = np.asarray(archive["game_seed"])
+            versions = np.asarray(archive[AUX_SUBGOAL_TARGET_VERSION_KEY])
+            if seeds.ndim != 1 or versions.shape != seeds.shape or seeds.size <= 0:
+                raise ValueError(f"retained shard row-shape drift: {path}")
+            if seeds.dtype.kind not in {"i", "u"}:
+                raise ValueError(f"retained shard game-seed dtype drift: {path}")
+            if versions.dtype.kind not in {"i", "u"} or bool(
+                np.any(
+                    versions.astype(np.int64, copy=False) != AUX_SUBGOAL_TARGET_VERSION
+                )
+            ):
+                raise ValueError(f"retained shard aux semantic drift: {path}")
+            canonical_seeds = seeds.astype("<i8", copy=False)
+            return {
+                "index": int(index),
+                "filename": path.name,
+                "rows": int(seeds.size),
+                "size_bytes": int(path.stat().st_size),
+                "sha256": digest.hexdigest(),
+                "game_seed_sha256": hashlib.sha256(
+                    canonical_seeds.tobytes(order="C")
+                ).hexdigest(),
+                "game_seed_min": int(canonical_seeds.min()),
+                "game_seed_max": int(canonical_seeds.max()),
+                "unique_game_seeds": int(np.unique(canonical_seeds).size),
+            }
+    except ValueError:
+        raise
+    except Exception as error:  # noqa: BLE001 - any unreadable shard loses resume authority.
+        raise ValueError(
+            f"cannot authenticate retained resume shard {path}: {error}"
+        ) from error
 
 
 def _validated_confirmed_shard_paths(
@@ -1648,26 +1991,29 @@ def _validated_confirmed_shard_paths(
     *,
     upto_index: int,
     expected_rows: int,
-) -> list[Path]:
+    expected_inventory: Sequence[Mapping[str, Any]],
+) -> tuple[list[Path], list[dict[str, Any]]]:
     """Require a contiguous, unique retained inventory with exact row mass."""
 
     paths = _confirmed_shard_paths(out_dir, upto_index=upto_index)
-    indices = [
-        int(path.name.split(".", 1)[0].rsplit("_", 1)[-1])
-        for path in paths
-    ]
+    indices = [int(path.name.split(".", 1)[0].rsplit("_", 1)[-1]) for path in paths]
     if indices != list(range(int(upto_index))):
         raise ValueError(
             "retained resume shard inventory is not exactly contiguous: "
             f"expected={list(range(int(upto_index)))} observed={indices}"
         )
-    rows = sum(_resume_shard_row_count(path) for path in paths)
+    observed_inventory = [
+        _resume_shard_evidence(path, index=index) for index, path in enumerate(paths)
+    ]
+    rows = sum(record["rows"] for record in observed_inventory)
     if rows != int(expected_rows):
         raise ValueError(
             "retained resume shard row total differs from progress: "
             f"expected={expected_rows} observed={rows}"
         )
-    return paths
+    if observed_inventory != [dict(record) for record in expected_inventory]:
+        raise ValueError("retained resume shard identity differs from progress")
+    return paths, observed_inventory
 
 
 def _discard_orphan_shards(out_dir: Path, *, from_index: int) -> None:
@@ -1696,6 +2042,101 @@ def _discard_orphan_shards(out_dir: Path, *, from_index: int) -> None:
             path.unlink()
 
 
+def _game_search_seed(*, worker_seed: int, game_index: int) -> int:
+    """Derive one stable, independent MCTS RNG stream per absolute game."""
+
+    payload = (
+        f"gumbel-self-play-game-search-v1:{int(worker_seed)}:{int(game_index)}"
+    ).encode("ascii")
+    return int.from_bytes(hashlib.sha256(payload).digest()[:8], "big")
+
+
+def _generation_resume_semantics_sha256(
+    *,
+    caller_contract_sha256: str | None,
+    worker_seed: int,
+    config: GumbelSelfPlayConfig,
+    search_config: GumbelChanceMCTSConfig,
+    preserve_search_evidence: bool,
+    native_mcts_hot_loop: bool,
+    target_information_regime: str,
+    opponent_pool: OpponentPoolRuntime | None,
+    opponent_mix: MixRuntime | None,
+    public_award_feature_provenance: Mapping[str, Any] | None,
+) -> str:
+    """Bind every in-function science knob plus caller-authenticated model bytes."""
+
+    if caller_contract_sha256 is not None and (
+        not caller_contract_sha256.startswith("sha256:")
+        or len(caller_contract_sha256) != 71
+        or any(
+            character not in "0123456789abcdef"
+            for character in caller_contract_sha256.removeprefix("sha256:")
+        )
+    ):
+        raise ValueError(
+            "resume_semantics_sha256 must be a lowercase sha256:<64 hex> digest"
+        )
+    if opponent_pool is not None:
+        archive_records: list[dict[str, Any]] = []
+        for item in opponent_pool.archive:
+            record = dataclasses.asdict(item)
+            if caller_contract_sha256 is not None:
+                checkpoint = Path(item.path)
+                if checkpoint.is_symlink() or not checkpoint.is_file():
+                    raise ValueError(
+                        "resume-authorized opponent-pool checkpoint must be a "
+                        f"regular non-symlink file: {checkpoint}"
+                    )
+                checkpoint_digest = hashlib.sha256()
+                with checkpoint.open("rb") as handle:
+                    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                        checkpoint_digest.update(chunk)
+                record["checkpoint_sha256"] = (
+                    "sha256:" + checkpoint_digest.hexdigest()
+                )
+                record["checkpoint_size_bytes"] = checkpoint.stat().st_size
+            archive_records.append(record)
+        opponent_descriptor: dict[str, Any] = {
+            "mode": "pool",
+            "policy": dataclasses.asdict(opponent_pool.policy),
+            "champion": dataclasses.asdict(opponent_pool.champion),
+            "archive": archive_records,
+        }
+    elif opponent_mix is not None:
+        opponent_descriptor = {
+            "mode": "mix",
+            "config": dataclasses.asdict(opponent_mix.config),
+        }
+    else:
+        opponent_descriptor = {"mode": "self_play"}
+    semantics = {
+        "schema_version": "gumbel-worker-resume-semantics-v1",
+        "caller_contract_sha256": caller_contract_sha256,
+        "worker_seed": int(worker_seed),
+        "game_search_seed_derivation": "sha256(worker_seed,absolute_game_index)-u64-v1",
+        "selfplay_config": dataclasses.asdict(config),
+        "search_config": dataclasses.asdict(search_config),
+        "preserve_search_evidence": bool(preserve_search_evidence),
+        "native_mcts_hot_loop": bool(native_mcts_hot_loop),
+        "target_information_regime": str(target_information_regime),
+        "opponent": opponent_descriptor,
+        "public_award_feature_provenance": (
+            None
+            if public_award_feature_provenance is None
+            else dict(public_award_feature_provenance)
+        ),
+    }
+    encoded = json.dumps(
+        semantics,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode("ascii")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
 def run_worker_games(
     *,
     out_dir: Path,
@@ -1711,6 +2152,7 @@ def run_worker_games(
     preserve_search_evidence: bool = False,
     run_id: str = "",
     resume: bool = False,
+    resume_semantics_sha256: str | None = None,
     opponent_pool: OpponentPoolRuntime | None = None,
     opponent_mix: MixRuntime | None = None,
     native_mcts_hot_loop: bool = False,
@@ -1718,15 +2160,21 @@ def run_worker_games(
 ) -> dict[str, Any]:
     """Play `games` self-play games in this process, writing shards to `out_dir`.
 
-    Constructs exactly one `GumbelChanceMCTS` (seeded with `worker_seed`) that
-    is reused across every game this call plays, per-game exception isolation
+    Constructs exactly one `GumbelChanceMCTS`, reuses it across the worker, and
+    resets its RNG at each game boundary from a stable hash of
+    `(worker_seed, absolute game_index)`. This preserves an advancing stream
+    within each game while making failures/preemptions in earlier games unable
+    to perturb later targets. It also provides per-game exception isolation
     (one bad game is recorded and skipped, not fatal to the worker), and a
     per-worker `manifest.json` compatible with `tools/train_bc.py`'s loader
     (a top-level `shards` list).
 
     Incremental resume (`resume=True`): a current progress contract must match
     `run_id`, seed interval, requested games, shard target/format, aux semantic,
-    and an exact contiguous shard inventory/row total.  Only then does this
+    an exact contiguous shard inventory/row total, and a caller-authenticated
+    generation-semantics digest. The caller digest must bind immutable producer
+    and opponent bytes; this function folds it together with every inspectable
+    self-play/search/opponent knob. Only then does this
     call skip games recorded as durably flushed and continue the SAME `offset`
     loop from `games_completed_local` -- NOT from a recomputed
     `game_index_start`.  Shards are game-atomic, so the first replayed game is
@@ -1777,6 +2225,11 @@ def run_worker_games(
             "run_worker_games got both opponent_pool and opponent_mix -- pass at most one "
             "(they both resolve the same PoolGameAssignment; running both is ambiguous)"
         )
+    if resume and resume_semantics_sha256 is None:
+        raise ValueError(
+            "resume=True requires resume_semantics_sha256 binding immutable "
+            "producer/opponent bytes and the caller's generation contract"
+        )
     search_evidence_scope = (
         _search_evidence_recalibration_scope(search_config)
         if preserve_search_evidence
@@ -1793,6 +2246,18 @@ def run_worker_games(
     target_information_regime = _target_information_regime_for_search(
         search_config,
         engine_supports_determinization=engine_supports_determinization,
+    )
+    generation_semantics_sha256 = _generation_resume_semantics_sha256(
+        caller_contract_sha256=resume_semantics_sha256,
+        worker_seed=int(worker_seed),
+        config=config,
+        search_config=search_config,
+        preserve_search_evidence=bool(preserve_search_evidence),
+        native_mcts_hot_loop=bool(native_mcts_hot_loop),
+        target_information_regime=target_information_regime,
+        opponent_pool=opponent_pool,
+        opponent_mix=opponent_mix,
+        public_award_feature_provenance=public_award_feature_provenance,
     )
     mcts = create_gumbel_search(
         search_config,
@@ -1816,6 +2281,19 @@ def run_worker_games(
     # previously-played-but-unflushed games (see `pending_boundaries` below).
     games_completed_local = 0
     confirmed_paths: list[Path] = []
+    confirmed_shard_records: list[dict[str, Any]] = []
+
+    # Every scientific telemetry aggregate is part of the same confirmed
+    # snapshot as rows/games.  Initializing these before resume lets a
+    # preempted opponent-mix run restore its full history instead of emitting
+    # a final manifest that describes only the post-resume suffix.
+    pool_games_completed = 0
+    pool_version_stats: dict[int, dict[str, int]] = {}
+    mix_games_completed = 0
+    mix_tag_stats: dict[str, dict[str, int]] = {}
+    exploiter_games_completed = 0
+    exploiter_engine_stats: dict[str, dict[str, int]] = {}
+    exploiter_divergence_topics: dict[str, int] = {}
 
     if resume:
         progress_path = out_dir / PROGRESS_FILENAME
@@ -1823,6 +2301,8 @@ def run_worker_games(
         progress_matches = bool(
             progress is not None
             and progress.run_id == run_id
+            and progress.generation_semantics_sha256
+            == generation_semantics_sha256
             and progress.base_seed == int(base_seed)
             and progress.game_index_start == int(game_index_start)
             and progress.games_requested == int(games)
@@ -1833,16 +2313,20 @@ def run_worker_games(
             and progress.shard_count_confirmed >= 0
             and progress.rows_confirmed >= 0
             and progress.rows == progress.rows_confirmed
+            and set(progress.wins_by_color) == set(config.colors)
         )
         if progress_matches:
             assert progress is not None
             try:
-                confirmed_paths = _validated_confirmed_shard_paths(
-                    out_dir,
-                    upto_index=int(progress.shard_count_confirmed),
-                    expected_rows=int(progress.rows_confirmed),
+                confirmed_paths, confirmed_shard_records = (
+                    _validated_confirmed_shard_paths(
+                        out_dir,
+                        upto_index=int(progress.shard_count_confirmed),
+                        expected_rows=int(progress.rows_confirmed),
+                        expected_inventory=progress.confirmed_shards,
+                    )
                 )
-            except (OSError, ValueError):
+            except Exception:  # noqa: BLE001 - any corrupt retained shard replays safely.
                 progress_matches = False
         if progress_matches:
             assert progress is not None
@@ -1857,6 +2341,23 @@ def run_worker_games(
             simulations_used_total = int(progress.simulations_used_total)
             for color, count in progress.wins_by_color.items():
                 wins_by_color[color] = wins_by_color.get(color, 0) + int(count)
+            errors = [dict(error) for error in progress.errors]
+            pool_games_completed = int(progress.opponent_pool_games)
+            pool_version_stats = {
+                int(version): dict(stats)
+                for version, stats in progress.opponent_pool_per_version_stats.items()
+            }
+            mix_games_completed = int(progress.opponent_mix_pool_games)
+            mix_tag_stats = {
+                str(tag): dict(stats)
+                for tag, stats in progress.opponent_mix_per_tag_stats.items()
+            }
+            exploiter_games_completed = int(progress.exploiter_games)
+            exploiter_engine_stats = {
+                str(engine): dict(stats)
+                for engine, stats in progress.exploiter_per_engine_stats.items()
+            }
+            exploiter_divergence_topics = dict(progress.exploiter_divergence_topics)
             start_shard_index = int(progress.shard_count_confirmed)
             _discard_orphan_shards(out_dir, from_index=start_shard_index)
         else:
@@ -1865,6 +2366,7 @@ def run_worker_games(
             # manifest.  The same applies to shard files with no progress
             # authority. Replaying from zero is deterministic and safe.
             _discard_orphan_shards(out_dir, from_index=0)
+            confirmed_shard_records = []
 
     writer = GumbelShardWriter(
         out_dir,
@@ -1895,6 +2397,14 @@ def run_worker_games(
             "forced_decisions_total": int(forced_decisions_total),
             "simulations_used_total": int(simulations_used_total),
             "wins_by_color": dict(wins_by_color),
+            "errors": copy.deepcopy(errors),
+            "opponent_pool_games": int(pool_games_completed),
+            "opponent_pool_per_version_stats": copy.deepcopy(pool_version_stats),
+            "opponent_mix_pool_games": int(mix_games_completed),
+            "opponent_mix_per_tag_stats": copy.deepcopy(mix_tag_stats),
+            "exploiter_games": int(exploiter_games_completed),
+            "exploiter_per_engine_stats": copy.deepcopy(exploiter_engine_stats),
+            "exploiter_divergence_topics": dict(exploiter_divergence_topics),
         }
 
     confirmed_snapshot = _aggregate_snapshot()
@@ -1905,7 +2415,7 @@ def run_worker_games(
     pending_boundaries: list[tuple[int, int, dict[str, Any]]] = []
 
     def _confirm_and_checkpoint() -> None:
-        nonlocal games_completed_local, confirmed_snapshot
+        nonlocal games_completed_local, confirmed_snapshot, confirmed_shard_records
         flushed_rows = writer.rows_written
         while pending_boundaries and pending_boundaries[0][1] <= flushed_rows:
             offset_done, _boundary, snapshot = pending_boundaries.pop(0)
@@ -1916,11 +2426,24 @@ def run_worker_games(
                 "resume invariant violated: confirmed aggregate rows differ from "
                 f"written shard rows ({confirmed_snapshot['rows']} != {flushed_rows})"
             )
+        if len(writer.paths) != writer.index:
+            raise RuntimeError(
+                "resume invariant violated: writer path inventory differs from shard index"
+            )
+        if len(confirmed_shard_records) > writer.index:
+            raise RuntimeError(
+                "resume invariant violated: confirmed shard inventory regressed"
+            )
+        for index in range(len(confirmed_shard_records), writer.index):
+            confirmed_shard_records.append(
+                _resume_shard_evidence(writer.paths[index], index=index)
+            )
         _write_json_atomic(
             progress_path,
             WorkerProgress(
                 run_id=run_id,
                 resume_contract_version=WORKER_PROGRESS_RESUME_CONTRACT_VERSION,
+                generation_semantics_sha256=generation_semantics_sha256,
                 aux_subgoal_target_version=AUX_SUBGOAL_TARGET_VERSION,
                 aux_subgoal_target_semantic=AUX_SUBGOAL_TARGET_SEMANTIC,
                 shard_size=int(shard_size),
@@ -1932,6 +2455,7 @@ def run_worker_games(
                 games_succeeded=int(confirmed_snapshot["games_succeeded"]),
                 shard_count_confirmed=writer.index,
                 rows_confirmed=flushed_rows,
+                confirmed_shards=copy.deepcopy(confirmed_shard_records),
                 games_failed=int(confirmed_snapshot["games_failed"]),
                 games_truncated=int(confirmed_snapshot["games_truncated"]),
                 rows=int(confirmed_snapshot["rows"]),
@@ -1943,34 +2467,50 @@ def run_worker_games(
                     confirmed_snapshot["simulations_used_total"]
                 ),
                 wins_by_color=dict(confirmed_snapshot["wins_by_color"]),
+                errors=copy.deepcopy(confirmed_snapshot["errors"]),
+                opponent_pool_games=int(confirmed_snapshot["opponent_pool_games"]),
+                opponent_pool_per_version_stats={
+                    str(version): dict(stats)
+                    for version, stats in confirmed_snapshot[
+                        "opponent_pool_per_version_stats"
+                    ].items()
+                },
+                opponent_mix_pool_games=int(
+                    confirmed_snapshot["opponent_mix_pool_games"]
+                ),
+                opponent_mix_per_tag_stats=copy.deepcopy(
+                    confirmed_snapshot["opponent_mix_per_tag_stats"]
+                ),
+                exploiter_games=int(confirmed_snapshot["exploiter_games"]),
+                exploiter_per_engine_stats=copy.deepcopy(
+                    confirmed_snapshot["exploiter_per_engine_stats"]
+                ),
+                exploiter_divergence_topics=dict(
+                    confirmed_snapshot["exploiter_divergence_topics"]
+                ),
             ).to_dict(),
         )
 
-    pool_games_completed = 0
     pool_evaluator_cache: dict[str, RustEvaluator] = {}
-    pool_version_stats: dict[int, dict[str, int]] = {}
-
-    mix_games_completed = 0
     mix_evaluator_cache: dict[str, RustEvaluator] = {}
     # Keyed by category tag (not version): telemetry is "tracked separately
     # per opponent" per the ticket, and a tag can span several checkpoint
     # versions (e.g. "older_champion" sampling across many archived nets).
-    mix_tag_stats: dict[str, dict[str, int]] = {}
-
-    # Exploiter lane (CAT-56): games played in cross-engine lockstep vs an
-    # external Catanatron bot. Tracked per ENGINE (catanatron_value/ab3/...)
-    # separately from the neural pool/self-play telemetry above; `divergences`
-    # counts games dropped for engine rules-mismatch (should be the known
-    # longest-road/buildable-edge class), by classified topic.
-    exploiter_games_completed = 0
-    exploiter_engine_stats: dict[str, dict[str, int]] = {}
-    exploiter_divergence_topics: dict[str, int] = {}
 
     started = time.perf_counter()
     try:
         for offset in range(resume_offset, int(games)):
             game_index = int(game_index_start) + offset
             game_seed = int(base_seed) + game_index
+            # A game's search randomness is independent of every earlier
+            # game's draw count/failure history. Resume can therefore jump to
+            # any confirmed offset without resetting the suffix's Gumbel or
+            # chance-sampling stream relative to an uninterrupted worker.
+            mcts.rng.seed(
+                _game_search_seed(
+                    worker_seed=int(worker_seed), game_index=int(game_index)
+                )
+            )
 
             pool_assignment: PoolGameAssignment | None = None
             # CAT-56: set to (engine_name, champion_first, tag) when this game is
@@ -1979,15 +2519,24 @@ def run_worker_games(
             exploiter_spec: tuple[str, bool, str] | None = None
             if opponent_pool is not None:
                 choice = choose_opponent(
-                    game_index, opponent_pool.champion, opponent_pool.archive, opponent_pool.policy
+                    game_index,
+                    opponent_pool.champion,
+                    opponent_pool.archive,
+                    opponent_pool.policy,
                 )
                 champion_first = _pool_champion_plays_first_seat(game_index)
-                champion_color = config.colors[0] if champion_first else config.colors[1]
+                champion_color = (
+                    config.colors[0] if champion_first else config.colors[1]
+                )
                 if choice.is_pool:
-                    opponent_color = config.colors[1] if champion_first else config.colors[0]
+                    opponent_color = (
+                        config.colors[1] if champion_first else config.colors[0]
+                    )
                     opponent_evaluator = pool_evaluator_cache.get(choice.path)
                     if opponent_evaluator is None:
-                        opponent_evaluator = opponent_pool.evaluator_factory(choice.path)
+                        opponent_evaluator = opponent_pool.evaluator_factory(
+                            choice.path
+                        )
                         pool_evaluator_cache[choice.path] = opponent_evaluator
                     pool_assignment = PoolGameAssignment(
                         is_pool=True,
@@ -2009,9 +2558,13 @@ def run_worker_games(
                 # bit as the H2 binary path above (`_pool_champion_plays_first_seat`
                 # uses its own salt, unaffected by which policy chose the
                 # opponent), so mix assignment is equally resume-safe.
-                mix_choice = choose_mix_opponent(game_index, opponent_mix.config.categories)
+                mix_choice = choose_mix_opponent(
+                    game_index, opponent_mix.config.categories
+                )
                 champion_first = _pool_champion_plays_first_seat(game_index)
-                champion_color = config.colors[0] if champion_first else config.colors[1]
+                champion_color = (
+                    config.colors[0] if champion_first else config.colors[1]
+                )
                 if mix_choice.is_external:
                     # Exploiter lane: no checkpoint to load; the external bot
                     # plays the opponent seat in cross-engine lockstep. Defer the
@@ -2019,10 +2572,14 @@ def run_worker_games(
                     # stays None (that path builds its own seat routing).
                     exploiter_spec = (mix_choice.engine, champion_first, mix_choice.tag)
                 elif mix_choice.is_pool:
-                    opponent_color = config.colors[1] if champion_first else config.colors[0]
+                    opponent_color = (
+                        config.colors[1] if champion_first else config.colors[0]
+                    )
                     opponent_evaluator = mix_evaluator_cache.get(mix_choice.path)
                     if opponent_evaluator is None:
-                        opponent_evaluator = opponent_mix.evaluator_factory(mix_choice.path)
+                        opponent_evaluator = opponent_mix.evaluator_factory(
+                            mix_choice.path
+                        )
                         mix_evaluator_cache[mix_choice.path] = opponent_evaluator
                     pool_assignment = PoolGameAssignment(
                         is_pool=True,
@@ -2075,7 +2632,11 @@ def run_worker_games(
             except Exception as error:  # noqa: BLE001 - isolate one bad game from the worker.
                 games_failed += 1
                 errors.append(
-                    {"game_index": game_index, "game_seed": game_seed, "error": repr(error)}
+                    {
+                        "game_index": game_index,
+                        "game_seed": game_seed,
+                        "error": repr(error),
+                    }
                 )
                 pending_boundaries.append(
                     (offset, absolute_rows, _aggregate_snapshot())
@@ -2100,10 +2661,14 @@ def run_worker_games(
                 # divergence-dropped game (engine_divergence, no rows) is counted
                 # under `divergences`/its topic, NOT as a graded game.
                 engine_name, champion_first, _tag = exploiter_spec
-                champion_color = config.colors[0] if champion_first else config.colors[1]
+                champion_color = (
+                    config.colors[0] if champion_first else config.colors[1]
+                )
                 if record.engine_divergence:
                     topic = record.divergence_topic or "unclassified"
-                    exploiter_divergence_topics[topic] = exploiter_divergence_topics.get(topic, 0) + 1
+                    exploiter_divergence_topics[topic] = (
+                        exploiter_divergence_topics.get(topic, 0) + 1
+                    )
                     stats = exploiter_engine_stats.setdefault(
                         engine_name, {"games": 0, "champion_wins": 0, "divergences": 0}
                     )
@@ -2116,7 +2681,11 @@ def run_worker_games(
                     stats["games"] += 1
                     if record.terminal and record.winner == champion_color:
                         stats["champion_wins"] += 1
-            elif opponent_pool is not None and pool_assignment is not None and pool_assignment.is_pool:
+            elif (
+                opponent_pool is not None
+                and pool_assignment is not None
+                and pool_assignment.is_pool
+            ):
                 pool_games_completed += 1
                 stats = pool_version_stats.setdefault(
                     pool_assignment.opponent_version, {"games": 0, "champion_wins": 0}
@@ -2131,14 +2700,14 @@ def run_worker_games(
                 # per opponent" across the whole mix, not just the pool slice.
                 if pool_assignment.is_pool:
                     mix_games_completed += 1
-                stats = mix_tag_stats.setdefault(pool_assignment.tag, {"games": 0, "champion_wins": 0})
+                stats = mix_tag_stats.setdefault(
+                    pool_assignment.tag, {"games": 0, "champion_wins": 0}
+                )
                 stats["games"] += 1
                 if record.terminal and record.winner == pool_assignment.champion_color:
                     stats["champion_wins"] += 1
 
-            pending_boundaries.append(
-                (offset, absolute_rows, _aggregate_snapshot())
-            )
+            pending_boundaries.append((offset, absolute_rows, _aggregate_snapshot()))
             _confirm_and_checkpoint()
     finally:
         writer.close()
@@ -2180,6 +2749,12 @@ def run_worker_games(
         "search_execution_contract": _search_execution_contract(
             search_config, native_mcts_hot_loop=bool(native_mcts_hot_loop)
         ),
+        "search_rng_contract": {
+            "schema_version": "gumbel-game-search-rng-v1",
+            "worker_seed": int(worker_seed),
+            "derivation": "sha256(worker_seed,absolute_game_index)-u64-v1",
+            "resume_invariant": True,
+        },
         "target_information_regime": target_information_regime,
         AUX_SUBGOAL_TARGET_VERSION_KEY: AUX_SUBGOAL_TARGET_VERSION,
         "aux_subgoal_target_semantic": AUX_SUBGOAL_TARGET_SEMANTIC,
@@ -2188,6 +2763,7 @@ def run_worker_games(
         "shards": [str(path) for path in writer.paths],
         "errors": errors,
         "resumed_from_offset": int(resume_offset),
+        "generation_resume_semantics_sha256": generation_semantics_sha256,
     }
     if public_award_feature_provenance is not None:
         summary["public_award_feature_provenance"] = dict(
@@ -2195,7 +2771,9 @@ def run_worker_games(
         )
     if opponent_pool is not None:
         summary["opponent_pool_enabled"] = True
-        summary["opponent_pool_fraction_configured"] = float(opponent_pool.policy.pool_fraction)
+        summary["opponent_pool_fraction_configured"] = float(
+            opponent_pool.policy.pool_fraction
+        )
         summary["opponent_pool_games"] = int(pool_games_completed)
         summary["opponent_pool_fraction_realized"] = (
             pool_games_completed / games_completed if games_completed else 0.0
@@ -2206,13 +2784,16 @@ def run_worker_games(
         # averaging per-worker ratios (which would silently mis-weight workers
         # that drew different numbers of pool games per opponent version).
         summary["opponent_pool_per_version_stats"] = {
-            str(version): dict(stats) for version, stats in sorted(pool_version_stats.items())
+            str(version): dict(stats)
+            for version, stats in sorted(pool_version_stats.items())
         }
     else:
         summary["opponent_pool_enabled"] = False
     if opponent_mix is not None:
         summary["opponent_mix_enabled"] = True
-        summary["opponent_mix_effective_weights"] = opponent_mix.config.effective_weights()
+        summary["opponent_mix_effective_weights"] = (
+            opponent_mix.config.effective_weights()
+        )
         summary["opponent_mix_pool_games"] = int(mix_games_completed)
         summary["opponent_mix_pool_fraction_realized"] = (
             mix_games_completed / games_completed if games_completed else 0.0
@@ -2232,9 +2813,12 @@ def run_worker_games(
         summary["exploiter_enabled"] = bool(exploiter_engine_stats)
         summary["exploiter_games"] = int(exploiter_games_completed)
         summary["exploiter_per_engine_stats"] = {
-            engine: dict(stats) for engine, stats in sorted(exploiter_engine_stats.items())
+            engine: dict(stats)
+            for engine, stats in sorted(exploiter_engine_stats.items())
         }
-        summary["exploiter_divergence_topics"] = dict(sorted(exploiter_divergence_topics.items()))
+        summary["exploiter_divergence_topics"] = dict(
+            sorted(exploiter_divergence_topics.items())
+        )
     else:
         summary["opponent_mix_enabled"] = False
     _write_json_atomic(Path(out_dir) / "manifest.json", summary)
@@ -2244,5 +2828,9 @@ def run_worker_games(
 def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True, default=str) + "\n", encoding="utf-8")
+    with tmp.open("w", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, indent=2, sort_keys=True, default=str) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
     os.replace(tmp, path)
+    _fsync_directory(path.parent)

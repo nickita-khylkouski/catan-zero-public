@@ -57,6 +57,7 @@ run from a checkout that has src/tools/vendor + the cp311 wheel at
 from __future__ import annotations
 
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+import hashlib
 import json
 import multiprocessing
 import os
@@ -68,6 +69,32 @@ from typing import Any
 import uuid
 
 import modal
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return "sha256:" + digest.hexdigest()
+
+
+def _resume_semantics_sha256(payload: dict[str, Any], checkpoint: Path) -> str:
+    """Bind retry semantics to immutable model bytes and all science fields."""
+
+    operational = {"run_name", "run_id", "part_index", "commit_secs", "resume"}
+    science_payload = {
+        key: value for key, value in payload.items() if key not in operational
+    }
+    science_payload["producer_checkpoint_sha256"] = _file_sha256(checkpoint)
+    encoded = json.dumps(
+        science_payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode("ascii")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
 
 
 APP_NAME = "catan-zero-gumbel-factory-gpu"
@@ -216,6 +243,7 @@ def _run_gpu_worker(worker_args: dict[str, Any]) -> dict[str, Any]:
             fmt=str(worker_args["fmt"]),
             run_id=str(worker_args.get("run_id", "")),
             resume=bool(worker_args.get("resume", False)),
+            resume_semantics_sha256=str(worker_args["resume_semantics_sha256"]),
         )
         summary["worker_index"] = worker_index
         summary["evaluator_mode"] = "torch_fp32_cuda"
@@ -354,6 +382,9 @@ def gpu_part_worker(payload: dict[str, Any]) -> dict[str, Any]:
         "shard_size": int(payload["shard_size"]),
         "fmt": str(payload["fmt"]),
         "run_id": run_id,
+        "resume_semantics_sha256": _resume_semantics_sha256(
+            payload, local_checkpoint
+        ),
         # Always ask `run_worker_games` to attempt an incremental resume: if
         # `<out_dir>/progress.json` doesn't exist (first launch of this
         # part, or a "wipe_and_restart" that just cleared it), this is a

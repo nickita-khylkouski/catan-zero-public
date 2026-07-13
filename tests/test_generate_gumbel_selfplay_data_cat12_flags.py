@@ -77,6 +77,9 @@ def _capture_configs(monkeypatch):
     def _fake_run_worker_games(**kwargs):
         captured["config"] = kwargs["config"]
         captured["search_config"] = kwargs["search_config"]
+        captured["resume_semantics_sha256"] = kwargs.get(
+            "resume_semantics_sha256"
+        )
         return {
             "games_completed": 0,
             "games_failed": 0,
@@ -92,6 +95,18 @@ def _capture_configs(monkeypatch):
 
     monkeypatch.setattr(cli, "run_worker_games", _fake_run_worker_games)
     return captured
+
+
+def test_worker_forwards_full_resume_semantics_digest(monkeypatch) -> None:
+    captured = _capture_configs(monkeypatch)
+    full_digest = "sha256:" + "d" * 64
+    cli._run_worker(
+        _worker_args(
+            run_id="sha256:" + "1" * 16,
+            resume_semantics_sha256=full_digest,
+        )
+    )
+    assert captured["resume_semantics_sha256"] == full_digest
 
 
 def test_public_award_provenance_attests_python_producer() -> None:

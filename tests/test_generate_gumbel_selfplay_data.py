@@ -311,6 +311,8 @@ def test_manifest_and_config_hash_bind_checkpoint_bytes(tmp_path):
         checkpoint=str(checkpoint), games=0, producer_checkpoint_sha256=expected_sha
     )
     assert manifest["config_hash"] == expected_config.config_hash()
+    assert manifest["full_config_hash"] == expected_config.full_config_hash()
+    assert len(manifest["full_config_hash"]) == len("sha256:") + 64
 
 
 def test_staged_checkpoint_closes_source_path_toctou(tmp_path):
