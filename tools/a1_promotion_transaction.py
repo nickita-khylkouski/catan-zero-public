@@ -2924,6 +2924,44 @@ def _verify_role_search_pair(
     return candidate, champion
 
 
+def _role_search_config_from_runtime(
+    runtime: dict[str, Any],
+    *,
+    role: str,
+    shared: dict[str, Any],
+) -> dict[str, Any]:
+    """Project the effective evaluator role into a deployed search identity.
+
+    Cross-net diagnostics may override a growing set of search/evaluator knobs
+    independently per role.  Promotion must compare the operator that actually
+    played, not reconstruct both roles from the shared production defaults.
+    """
+
+    if role not in {"candidate", "baseline"}:
+        raise PromotionError(f"unsupported evaluation role {role!r}")
+    result = dict(shared)
+    for key in (
+        "n_full",
+        "n_full_wide",
+        "n_full_wide_threshold",
+        "wide_roots_always_full",
+        "c_scale",
+        "gameplay_policy_aggregation",
+        "rescale_noise_floor_c",
+        "sigma_eval",
+        "sigma_reference_visits",
+        "value_squash",
+        "value_readout",
+    ):
+        role_key = f"{role}_{key}"
+        if role_key not in runtime:
+            raise PromotionError(
+                f"evaluation runtime omits role-effective field {role_key!r}"
+            )
+        result[key] = runtime[role_key]
+    return result
+
+
 def _agent_identity(
     checkpoint: dict[str, Any], search_config: dict[str, Any]
 ) -> dict[str, Any]:
@@ -3158,6 +3196,12 @@ def _sealed_evaluation_semantics(contract: dict[str, Any]) -> dict[str, Any]:
         "c_scale": search_value("c_scale"),
         "rescale_noise_floor_c": search_value("rescale_noise_floor_c"),
         "sigma_eval": search_value("sigma_eval"),
+        # These are evaluator semantics, not scheduling defaults.  Historical
+        # A1 locks predate explicit fields for them, so bind the one deployed
+        # production operator rather than inheriting whatever a newer CLI
+        # happens to default to.
+        "sigma_reference_visits": None,
+        "gameplay_policy_aggregation": "mean_improved_policy",
         "max_root_candidates": search_value("max_root_candidates"),
         "max_root_candidates_wide": search_value("max_root_candidates_wide"),
         "wide_candidates_threshold": search_value("wide_candidates_threshold"),
@@ -3277,6 +3321,32 @@ def _verify_internal_h2h_source(
                 "n_full_wide_threshold"
             ],
             "baseline_n_full_wide_threshold": sealed_semantics["n_full_wide_threshold"],
+            "candidate_wide_roots_always_full": sealed_semantics[
+                "wide_roots_always_full"
+            ],
+            "baseline_wide_roots_always_full": sealed_semantics[
+                "wide_roots_always_full"
+            ],
+            "candidate_gameplay_policy_aggregation": sealed_semantics[
+                "gameplay_policy_aggregation"
+            ],
+            "baseline_gameplay_policy_aggregation": sealed_semantics[
+                "gameplay_policy_aggregation"
+            ],
+            "candidate_rescale_noise_floor_c": sealed_semantics[
+                "rescale_noise_floor_c"
+            ],
+            "baseline_rescale_noise_floor_c": sealed_semantics[
+                "rescale_noise_floor_c"
+            ],
+            "candidate_sigma_eval": sealed_semantics["sigma_eval"],
+            "baseline_sigma_eval": sealed_semantics["sigma_eval"],
+            "candidate_sigma_reference_visits": sealed_semantics[
+                "sigma_reference_visits"
+            ],
+            "baseline_sigma_reference_visits": sealed_semantics[
+                "sigma_reference_visits"
+            ],
             "candidate_value_readout": sealed_semantics["value_readout"],
             "baseline_value_readout": sealed_semantics["value_readout"],
             "candidate_value_squash": sealed_semantics["value_squash"],
@@ -3296,6 +3366,20 @@ def _verify_internal_h2h_source(
     runtime_fields.setdefault(
         "baseline_value_squash", runtime_fields.get("value_squash")
     )
+    # Normalize only the exact legacy omission shape.  Once a role-specific
+    # field is present it is authenticated below and cannot disagree with the
+    # shared production operator.
+    for role in ("candidate", "baseline"):
+        for suffix in (
+            "wide_roots_always_full",
+            "gameplay_policy_aggregation",
+            "rescale_noise_floor_c",
+            "sigma_eval",
+            "sigma_reference_visits",
+        ):
+            runtime_fields.setdefault(
+                f"{role}_{suffix}", runtime_fields.get(suffix)
+            )
     if (
         pooled
         and runtime_fields.get("native_mcts_hot_loop") is True
@@ -3329,14 +3413,16 @@ def _verify_internal_h2h_source(
     champion_evaluation_config["n_full"] = int(required_n_full)
     champion_evaluation_config["n_fast"] = int(required_n_full)
     _verify_role_search_pair(
-        {
-            **{key: normalized_fields[key] for key in candidate_search_config},
-            "c_scale": normalized_fields["candidate_c_scale"],
-        },
-        {
-            **{key: normalized_fields[key] for key in champion_search_config},
-            "c_scale": normalized_fields["baseline_c_scale"],
-        },
+        _role_search_config_from_runtime(
+            normalized_fields,
+            role="candidate",
+            shared=candidate_evaluation_config,
+        ),
+        _role_search_config_from_runtime(
+            normalized_fields,
+            role="baseline",
+            shared=champion_evaluation_config,
+        ),
         candidate_search_config=candidate_evaluation_config,
         champion_search_config=champion_evaluation_config,
         where=f"{where} deployed search",
@@ -3393,11 +3479,22 @@ def _verify_internal_h2h_source(
         "n_full": int(required_n_full),
         "n_full_wide": None,
         "n_full_wide_threshold": None,
+        "wide_roots_always_full": False,
     }
+    normalized_budgets: dict[str, Any] = {}
+    if isinstance(budgets, dict):
+        for role in ("candidate", "baseline"):
+            raw_budget = budgets.get(role)
+            if isinstance(raw_budget, dict):
+                normalized_budget = dict(raw_budget)
+                normalized_budget.setdefault(
+                    "wide_roots_always_full",
+                    normalized_fields[f"{role}_wide_roots_always_full"],
+                )
+                normalized_budgets[role] = normalized_budget
     if (
-        not isinstance(budgets, dict)
-        or budgets.get("candidate") != expected_budget
-        or budgets.get("baseline") != expected_budget
+        normalized_budgets.get("candidate") != expected_budget
+        or normalized_budgets.get("baseline") != expected_budget
     ):
         raise PromotionError(f"{where} does not use the sealed global n128 budget")
     sprt = payload.get("pentanomial_sprt")
@@ -3894,6 +3991,23 @@ def _verify_high_regret_source(
     if not isinstance(evaluation_config, dict):
         raise PromotionError(f"{where}.report has no evaluation_config")
     normalized_evaluation_config = dict(evaluation_config)
+    normalized_evaluation_config.setdefault(
+        "candidate_value_squash", normalized_evaluation_config.get("value_squash")
+    )
+    normalized_evaluation_config.setdefault(
+        "baseline_value_squash", normalized_evaluation_config.get("value_squash")
+    )
+    for role in ("candidate", "baseline"):
+        for suffix in (
+            "wide_roots_always_full",
+            "gameplay_policy_aggregation",
+            "rescale_noise_floor_c",
+            "sigma_eval",
+            "sigma_reference_visits",
+        ):
+            normalized_evaluation_config.setdefault(
+                f"{role}_{suffix}", normalized_evaluation_config.get(suffix)
+            )
     if (
         normalized_evaluation_config.get("evaluator_rust_featurize") is True
         and sealed_semantics.get("evaluator_rust_featurize") is False
@@ -3924,20 +4038,50 @@ def _verify_high_regret_source(
             "baseline_n_full_wide_threshold": sealed_semantics[
                 "n_full_wide_threshold"
             ],
+            "candidate_wide_roots_always_full": sealed_semantics[
+                "wide_roots_always_full"
+            ],
+            "baseline_wide_roots_always_full": sealed_semantics[
+                "wide_roots_always_full"
+            ],
+            "candidate_gameplay_policy_aggregation": sealed_semantics[
+                "gameplay_policy_aggregation"
+            ],
+            "baseline_gameplay_policy_aggregation": sealed_semantics[
+                "gameplay_policy_aggregation"
+            ],
+            "candidate_rescale_noise_floor_c": sealed_semantics[
+                "rescale_noise_floor_c"
+            ],
+            "baseline_rescale_noise_floor_c": sealed_semantics[
+                "rescale_noise_floor_c"
+            ],
+            "candidate_sigma_eval": sealed_semantics["sigma_eval"],
+            "baseline_sigma_eval": sealed_semantics["sigma_eval"],
+            "candidate_sigma_reference_visits": sealed_semantics[
+                "sigma_reference_visits"
+            ],
+            "baseline_sigma_reference_visits": sealed_semantics[
+                "sigma_reference_visits"
+            ],
+            "candidate_value_squash": sealed_semantics["value_squash"],
+            "baseline_value_squash": sealed_semantics["value_squash"],
             "candidate_value_readout": sealed_semantics["value_readout"],
             "baseline_value_readout": sealed_semantics["value_readout"],
         },
         where=f"{where}.report.evaluation_config",
     )
     _verify_role_search_pair(
-        {
-            **candidate_search_config,
-            "c_scale": evaluation_config["candidate_c_scale"],
-        },
-        {
-            **champion_search_config,
-            "c_scale": evaluation_config["baseline_c_scale"],
-        },
+        _role_search_config_from_runtime(
+            normalized_evaluation_config,
+            role="candidate",
+            shared=candidate_search_config,
+        ),
+        _role_search_config_from_runtime(
+            normalized_evaluation_config,
+            role="baseline",
+            shared=champion_search_config,
+        ),
         candidate_search_config=candidate_search_config,
         champion_search_config=champion_search_config,
         where=f"{where}.report deployed search",

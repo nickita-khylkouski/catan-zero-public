@@ -1677,6 +1677,45 @@ def test_role_specific_value_squash_diagnostic_cannot_be_promotion_evidence(
         _execute(fixture, go=False)
 
 
+@pytest.mark.parametrize(
+    ("field", "diagnostic_value"),
+    (
+        ("candidate_wide_roots_always_full", True),
+        (
+            "candidate_gameplay_policy_aggregation",
+            "aggregate_q_then_improve",
+        ),
+        ("candidate_rescale_noise_floor_c", 0.25),
+        ("candidate_sigma_eval", 0.5),
+        ("candidate_sigma_reference_visits", 8),
+    ),
+)
+def test_role_specific_search_diagnostic_cannot_be_promotion_evidence(
+    tmp_path: Path,
+    field: str,
+    diagnostic_value: object,
+) -> None:
+    fixture = _fixture(tmp_path)
+
+    def mutate(source: dict) -> None:
+        source["typed_config"]["fields"][field] = diagnostic_value
+        digest = hashlib.sha256(
+            promotion._canonical_bytes(source["typed_config"])
+        ).hexdigest()
+        source["config_hash"] = "sha256:" + digest[:16]
+        source["full_config_hash"] = "sha256:" + digest
+
+    _mutate_evidence_source(
+        fixture,
+        kind="internal_h2h",
+        role="internal_h2h",
+        mutate=mutate,
+    )
+
+    with pytest.raises(promotion.PromotionError, match=field):
+        _execute(fixture, go=False)
+
+
 def test_dry_run_is_read_only_and_attests_global_n128(tmp_path: Path) -> None:
     fixture = _fixture(tmp_path)
     before_registry = fixture["registry"].read_bytes()
@@ -2410,6 +2449,42 @@ def test_high_regret_report_rejects_forged_candidate_role_scale(
     )
 
     with pytest.raises(promotion.PromotionError, match="candidate_c_scale"):
+        _execute(fixture, go=False)
+
+
+@pytest.mark.parametrize(
+    ("field", "diagnostic_value"),
+    (
+        ("candidate_wide_roots_always_full", True),
+        (
+            "candidate_gameplay_policy_aggregation",
+            "aggregate_q_then_improve",
+        ),
+        ("candidate_rescale_noise_floor_c", 0.25),
+        ("candidate_sigma_eval", 0.5),
+        ("candidate_sigma_reference_visits", 8),
+        ("candidate_value_squash", "clip"),
+    ),
+)
+def test_high_regret_report_rejects_role_specific_diagnostic_operator(
+    tmp_path: Path,
+    field: str,
+    diagnostic_value: object,
+) -> None:
+    fixture = _fixture(tmp_path)
+
+    def mutate(source: dict) -> None:
+        report_path = Path(source["report"]["path"])
+        report = json.loads(report_path.read_text())
+        report["evaluation_config"][field] = diagnostic_value
+        _write_json(report_path, report)
+        source["report"]["sha256"] = promotion._sha256(report_path)
+
+    _mutate_evidence_source(
+        fixture, kind="high_regret", role="high_regret", mutate=mutate
+    )
+
+    with pytest.raises(promotion.PromotionError, match=field):
         _execute(fixture, go=False)
 
 

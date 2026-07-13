@@ -2802,6 +2802,59 @@ def _validate_search_stage_evidence(
     final_search: dict[str, Any],
     final_evaluator: dict[str, Any],
 ) -> dict[str, Any]:
+    if payload.get("schema_version") == "a1-s3-role-operator-hold-v1":
+        # Lazy import avoids the pre-wave -> pool -> promotion -> pre-wave
+        # cycle during module initialization.
+        from tools import s3_role_operator_hold as s3_operator_hold
+
+        if expected_stage != "s3":
+            raise ContractError("same-checkpoint role-operator HOLD is S3-only")
+        refs: dict[str, tuple[Path, dict[str, str]]] = {}
+        for key in ("source_pooled", "source_s1", "source_s2", "emitter"):
+            refs[key] = _validate_operator_binding_reference(
+                payload.get(key),
+                owner_path=path,
+                where=f"S3 role-operator HOLD {key}",
+            )
+        emitter_path = refs["emitter"][0]
+        if not emitter_path.as_posix().endswith("tools/s3_role_operator_hold.py"):
+            raise ContractError("S3 role-operator HOLD has an untrusted emitter")
+        try:
+            replayed = s3_operator_hold.build_hold(
+                refs["source_pooled"][0],
+                source_s1=refs["source_s1"][0],
+                source_s2=refs["source_s2"][0],
+                decision_time_utc=payload.get("decision_time_utc"),
+                emitter_path=emitter_path,
+            )
+        except s3_operator_hold.HoldError as error:
+            raise ContractError(f"S3 role-operator HOLD replay failed: {error}") from error
+        if payload != replayed:
+            raise ContractError("S3 role-operator HOLD does not equal semantic replay")
+        selected = dict(payload.get("selected_fields", {}))
+        mismatches = {
+            key: (value, final_search.get(key))
+            for key, value in selected.items()
+            if value != final_search.get(key)
+        }
+        if selected != s3_operator_hold.SELECTED_FIELDS or mismatches:
+            raise ContractError(
+                "S3 role-operator HOLD differs from final no-adaptive search: "
+                f"{mismatches}"
+            )
+        source_records = [
+            refs[key][1]
+            for key in ("source_pooled", "emitter", "source_s1", "source_s2")
+        ]
+        return {
+            "decision": "hold",
+            "evidence_class": s3_operator_hold.ARTIFACT_KIND,
+            "selected_fields": selected,
+            "selected_fields_sha256": payload["selected_fields_sha256"],
+            "checkpoint": dict(payload["checkpoint"]),
+            "source_artifacts": source_records,
+            "artifact_content_sha256": payload["artifact_content_sha256"],
+        }
     if payload.get("schema_version") == operator_binding.SCHEMA:
         return _validate_operator_binding_evidence(
             payload,
