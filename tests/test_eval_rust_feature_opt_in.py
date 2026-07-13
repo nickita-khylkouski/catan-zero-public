@@ -19,6 +19,7 @@ def test_complete_native_feature_api_is_required(monkeypatch: pytest.MonkeyPatch
     incomplete = SimpleNamespace(
         EntityTopology=lambda *args: None,
         build_entity_features_flat=lambda *args: None,
+        gumbel_search_capabilities=lambda: ["public_award_feature_parity"],
     )
     monkeypatch.setitem(sys.modules, "catanatron_rs", incomplete)
 
@@ -34,11 +35,28 @@ def test_complete_native_feature_api_passes_preflight(
         EntityTopology=lambda *args: None,
         build_entity_features_flat=lambda *args: None,
         build_action_context_flat=lambda *args: None,
+        gumbel_search_capabilities=lambda: ["public_award_feature_parity"],
     )
     monkeypatch.setitem(sys.modules, "catanatron_rs", complete)
 
     assert feature_path.rust_feature_path_available() is True
     feature_path.require_rust_feature_path()
+
+
+def test_native_feature_path_rejects_stale_public_award_semantics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stale = SimpleNamespace(
+        EntityTopology=lambda *args: None,
+        build_entity_features_flat=lambda *args: None,
+        build_action_context_flat=lambda *args: None,
+        gumbel_search_capabilities=lambda: ["initial_road_d1_scope"],
+    )
+    monkeypatch.setitem(sys.modules, "catanatron_rs", stale)
+
+    assert feature_path.rust_feature_path_available() is False
+    with pytest.raises(RuntimeError, match="stale public-award semantics"):
+        feature_path.require_rust_feature_path()
 
 
 def test_eval_config_hash_seals_native_feature_choice() -> None:
