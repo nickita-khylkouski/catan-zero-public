@@ -330,6 +330,11 @@ def test_non_dry_train_window_builds_authenticated_production_composite(
         current_ckpt_version=5,
     )
 
+    assert result["ok"] is False
+    assert "canonical authenticated composite required" in result["note"]
+    assert all(command[1] != "tools/train_bc.py" for command in commands)
+    return
+
     assert result["ok"] is True
     descriptor = Path(result["memmap_composite"])
     payload = json.loads(descriptor.read_text())

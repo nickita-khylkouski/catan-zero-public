@@ -721,6 +721,33 @@ class Runner:
                     f"missing={missing_sources} unexpected={unexpected_sources}"
                 ),
             }
+        missing_producer = [
+            shard.path
+            for shard in window_shards
+            if not shard.producer_checkpoint_path
+            or not shard.producer_checkpoint_sha256
+        ]
+        if missing_producer:
+            return {
+                "ok": False,
+                "note": (
+                    "flywheel shard lacks producer checkpoint provenance: "
+                    f"{missing_producer[0]}"
+                ),
+            }
+        # This prototype used to build a second, self-attested production
+        # descriptor directly from ShardMeta.  That bypassed the sealed
+        # lock -> selected-games -> post-wave-audit -> source-authority chain.
+        # Durable control remains here, but production learner construction is
+        # delegated to a1_build_post_wave_composite + a1_iteration_orchestrator.
+        return {
+            "ok": False,
+            "note": (
+                "canonical authenticated composite required; build with "
+                "tools/a1_build_post_wave_composite.py and execute through "
+                "tools/a1_iteration_orchestrator.py"
+            ),
+        }
         try:
             components = [
                 self._build_replay_component(
