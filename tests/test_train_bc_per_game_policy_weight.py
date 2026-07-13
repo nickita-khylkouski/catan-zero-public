@@ -87,6 +87,36 @@ def test_sqrt_mode_retains_sqrt_original_positive_game_mass_ratio():
     assert np.all(weights[6:] == 0.0)
 
 
+@pytest.mark.parametrize("mode", ["equal", "sqrt"])
+def test_v2_sparse_policy_correction_uses_game_uniform_measure(mode: str):
+    class _CompositeV2(dict):
+        component_offsets = (0, 2, 6)
+        component_game_sampling_ratios = (0.5, 0.5)
+
+    # Both games have the same 50% active-policy density but different lengths.
+    # V2 gives each game half the sampling mass, so a per-game correction must
+    # not turn that into inverse-length or inverse-sqrt-length weighting.
+    data = _CompositeV2(
+        action_taken=np.arange(6, dtype=np.int16),
+        game_seed=np.asarray([7, 7, 7, 7, 7, 7], dtype=np.int64),
+        legal_action_ids=np.tile(np.asarray([[1, 2]], dtype=np.int16), (6, 1)),
+        policy_weight_multiplier=np.asarray(
+            [1.0, 0.0, 1.0, 1.0, 0.0, 0.0], dtype=np.float32
+        ),
+    )
+    weights = build_sample_weights(
+        data,
+        **_base_kwargs(),
+        per_game_policy_weight=True,
+        per_game_policy_weight_mode=mode,
+    )
+    short_mass = 0.5 * float(np.mean(weights[:2]))
+    long_mass = 0.5 * float(np.mean(weights[2:]))
+    assert short_mass == pytest.approx(long_mass)
+    assert weights[1] == 0.0
+    assert np.all(weights[4:] == 0.0)
+
+
 def test_enabled_without_game_seed_is_noop_and_preserves_zero_rows():
     data = _data()
     del data["game_seed"]
