@@ -236,12 +236,12 @@ class _FakeCompositeCorpus:
             {"game_seed": np.asarray(seeds, dtype=np.int64)}
             for seeds in component_seed_rows
         ]
-        self.offsets = np.cumsum(
+        self.component_offsets = np.cumsum(
             [0, *(len(seeds) for seeds in component_seed_rows)], dtype=np.int64
         )
 
     def __len__(self) -> int:
-        return int(self.offsets[-1])
+        return int(self.component_offsets[-1])
 
 
 def _production_composite_meta(tmp_path: Path, producer_sha256: str) -> dict:
