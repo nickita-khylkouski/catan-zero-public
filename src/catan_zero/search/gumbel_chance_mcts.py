@@ -64,6 +64,7 @@ __all__ = [
     "RustEvaluator",
     "sequential_halving_schedule",
     "exact_budget_sh_phases",
+    "information_set_particle_budgets",
     "_root_candidate_count",
     "_prune_policy_target",
     "RESOURCES",
@@ -211,6 +212,32 @@ def exact_budget_sh_phases(m: int, n_simulations: int) -> list[tuple[int, int]]:
             break
         considered = max(2, considered // 2)
     return phases
+
+
+def information_set_particle_budgets(
+    total_budget: int,
+    requested_particles: int,
+    min_simulations_per_particle: int,
+) -> tuple[int, ...]:
+    """Return the exact PIMC sub-budget assigned to each hidden-world particle.
+
+    Keeping this calculation public and pure lets launchers validate adaptive
+    search recipes against the same arithmetic used at runtime.  In particular,
+    an n128/P4/min32 root resolves to ``(32, 32, 32, 32)`` while an
+    n256/P8/min32 root resolves to eight 32-simulation particles.  That spends
+    extra compute on belief-world coverage without silently doubling each
+    particle's visit-dependent sigma sharpening.
+    """
+    total = max(int(total_budget), 1)
+    requested = int(requested_particles)
+    minimum = int(min_simulations_per_particle)
+    if requested < 1:
+        raise ValueError("requested_particles must be >= 1")
+    if minimum < 1:
+        raise ValueError("min_simulations_per_particle must be >= 1")
+    count = min(requested, max(1, total // minimum))
+    base, remainder = divmod(total, count)
+    return tuple(base + int(index < remainder) for index in range(count))
 
 
 def _root_candidate_count(num_legal: int, config: "GumbelChanceMCTSConfig") -> int:
@@ -869,12 +896,14 @@ class GumbelChanceMCTS:
             # the A1 settings this realizes p4 for n128 full rows and p1 for n16
             # fast rows.  Forced rows below are also p1 because they carry no
             # policy target.
-            particle_count = min(
-                requested_particles,
-                max(1, total_budget // min_per_particle),
+            budgets = list(
+                information_set_particle_budgets(
+                    total_budget,
+                    requested_particles,
+                    min_per_particle,
+                )
             )
-            base, remainder = divmod(total_budget, particle_count)
-            budgets = [base + int(index < remainder) for index in range(particle_count)]
+            particle_count = len(budgets)
         else:
             use_full = bool(force_full) if force_full is not None else False
             particle_count = 1

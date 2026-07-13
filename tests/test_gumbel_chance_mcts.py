@@ -17,6 +17,7 @@ from catan_zero.search.gumbel_chance_mcts import (
     _GNode,
     _decision_context,
     batch_api_available,
+    information_set_particle_budgets,
     sequential_halving_schedule,
 )
 from catan_zero.search.rust_mcts import (
@@ -826,6 +827,16 @@ def test_improved_policy_rescales_completed_q_before_sigma_bounding_sharpening()
 # ---------------------------------------------------------------------------
 # Sequential Halving budget accounting.
 # ---------------------------------------------------------------------------
+
+
+def test_information_set_particle_budgets_preserve_adaptive_per_particle_dose():
+    assert information_set_particle_budgets(128, 8, 32) == (32, 32, 32, 32)
+    assert information_set_particle_budgets(256, 8, 32) == (32,) * 8
+
+
+def test_information_set_particle_budgets_expose_global_n256_sharpening():
+    assert information_set_particle_budgets(128, 4, 32) == (32,) * 4
+    assert information_set_particle_budgets(256, 4, 32) == (64,) * 4
 
 
 def test_sequential_halving_schedule_matches_exact_totals_when_well_provisioned():
