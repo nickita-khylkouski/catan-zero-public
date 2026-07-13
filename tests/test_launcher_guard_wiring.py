@@ -194,6 +194,7 @@ GOLDEN_OPTION_STRINGS = {
         ("--forced-row-value-weight",),
         ("--freeze-modules",),
         ("--fsdp",),
+        ("--float32-matmul-precision",),
         ("--fused-optimizer", "--no-fused-optimizer"),
         ("--grad-accum-steps",),
         ("--graph-dropout",),
