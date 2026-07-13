@@ -89,7 +89,7 @@ def _training_report(
     verified: dict, checkpoint: Path, *, steps_completed: int = 2
 ) -> dict:
     recipe = verified["recipe"]
-    return {
+    payload = {
         "arch": "entity_graph",
         **executor.SEALED_A1_MODEL_REPORT,
         "a1_contract_sha256": verified["contract_sha256"],
@@ -155,6 +155,10 @@ def _training_report(
                 "loss": 1.0,
                 "policy_loss": 0.8,
                 "value_loss": 0.2,
+                "loss_denominators": {
+                    "value_loss": float(steps_completed * recipe["batch_size"]),
+                    "policy_kl_anchor_loss": 0.0,
+                },
                 "validation": {
                     "samples": verified["validation_row_count"],
                     "loss": 1.1,
@@ -162,6 +166,27 @@ def _training_report(
             }
         ],
     }
+    if "policy_aux_active_batch_size" in recipe:
+        base_draws = steps_completed * recipe["batch_size"]
+        aux_draws = steps_completed * recipe["policy_aux_active_batch_size"]
+        policy_base = min(base_draws, 1_000)
+        payload.update(
+            {
+                "policy_aux_active_batch_size": recipe[
+                    "policy_aux_active_batch_size"
+                ],
+                "training_row_draws": base_draws,
+                "base_training_row_draws": base_draws,
+                "policy_aux_training_row_draws": aux_draws,
+                "total_training_row_draws": base_draws + aux_draws,
+                "policy_base_active_rows": policy_base,
+                "policy_aux_active_rows": aux_draws,
+                "policy_total_active_rows": policy_base + aux_draws,
+                "value_active_rows": base_draws,
+                "policy_kl_anchor_eligible_rows": 0,
+            }
+        )
+    return payload
 
 
 def _option(command: list[str], flag: str) -> str:
@@ -309,6 +334,99 @@ def test_latest_main_ablation_command_binds_inventory_ack_and_crop(tmp_path: Pat
         "payload_inventory_sha256"
     ]
     assert command.count(executor.EVENT_HISTORY_CROP_FLAG) == 1
+
+
+def test_policy_aux_active_dose_is_typed_and_command_bound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    verified = _verified(tmp_path)
+    verified["reviewed_lock_file_sha256"] = verified["lock_file_sha256"]
+    code_sha = "sha256:" + "7" * 64
+    monkeypatch.setattr(
+        executor,
+        "_current_ablation_code_binding",
+        lambda lock: {"code_tree_sha256": code_sha, "records": []},
+    )
+    derived = executor.bind_learner_ablation(
+        verified,
+        ablation_id="policy-aux-128",
+        overrides_json='{"policy_aux_active_batch_size":128}',
+        reviewed_code_tree_sha256=code_sha,
+    )
+
+    assert derived["recipe"]["policy_aux_active_batch_size"] == 128
+    assert derived["learner_ablation"]["recipe_drift"][
+        "policy_aux_active_batch_size"
+    ] == {
+        "contract": "0 (implicit historical train_bc default)",
+        "effective": 128,
+    }
+    command = executor.build_train_command(
+        derived,
+        python=Path(sys.executable),
+        checkpoint=tmp_path / "candidate.pt",
+        report=tmp_path / "report.json",
+    )
+    assert _option(command, "--policy-aux-active-batch-size") == "128"
+    parsed = executor.train_bc.build_parser().parse_args(command[2:])
+    assert executor.train_bc.TrainConfig.from_namespace(
+        parsed
+    ).policy_aux_active_batch_size == 128
+
+
+def test_report_binding_seals_exact_base_value_and_policy_doses(
+    tmp_path: Path,
+) -> None:
+    verified = _verified(tmp_path)
+    verified["recipe"]["policy_aux_active_batch_size"] = 128
+    checkpoint = tmp_path / "candidate.pt"
+    report = tmp_path / "report.json"
+    report.write_text(json.dumps(_training_report(verified, checkpoint)))
+    binding = executor._execution_binding(
+        command=[sys.executable, "train_bc.py"],
+        environment=executor._child_environment(0),
+    )
+
+    executor._bind_training_report(
+        report,
+        verified=verified,
+        execution_binding=binding,
+    )
+
+    dose = json.loads(report.read_text())["a1_lineage_dose"]
+    exposure = dose["objective_exposure"]
+    assert exposure == {
+        "measurement_status": "bound_exactly",
+        "measurement_scope": "current_dose",
+        "base_sampled_rows": 8_192,
+        "policy_base_active_sampled_rows": 1_000,
+        "policy_aux_active_sampled_rows": 256,
+        "policy_active_sampled_rows": 1_256,
+        "value_active_sampled_rows": 8_192,
+        "anchor_eligible_sampled_rows": 0,
+    }
+    assert dose["current_sampled_rows"] == 8_192
+
+
+def test_exact_policy_dose_binding_refuses_counter_drift(tmp_path: Path) -> None:
+    verified = _verified(tmp_path)
+    verified["recipe"]["policy_aux_active_batch_size"] = 128
+    checkpoint = tmp_path / "candidate.pt"
+    payload = _training_report(verified, checkpoint)
+    payload["policy_total_active_rows"] += 1
+    report = tmp_path / "report.json"
+    report.write_text(json.dumps(payload))
+    binding = executor._execution_binding(
+        command=[sys.executable, "train_bc.py"],
+        environment=executor._child_environment(0),
+    )
+
+    with pytest.raises(executor.ExecutorError, match="objective-dose arithmetic drift"):
+        executor._bind_training_report(
+            report,
+            verified=verified,
+            execution_binding=binding,
+        )
 
 
 def test_real_gen3_architecture_cannot_fall_back_to_cli_defaults(
@@ -1279,8 +1397,8 @@ def test_output_report_must_semantically_prove_the_sealed_dose(
     )
     executor._bind_training_report(
         report,
+        verified=verified,
         execution_binding=execution_binding,
-        lineage_dose=executor._direct_lineage_dose(verified),  # noqa: SLF001
     )
 
     with pytest.raises(executor.ExecutorError, match="report invariant drift"):
@@ -1312,15 +1430,15 @@ def test_report_binding_rejects_child_spoof_and_verifier_rejects_drift(
     with pytest.raises(executor.ExecutorError, match="pre-populated"):
         executor._bind_training_report(
             report,
+            verified=verified,
             execution_binding=binding,
-            lineage_dose=executor._direct_lineage_dose(verified),  # noqa: SLF001
         )
 
     report.write_text(json.dumps(_training_report(verified, checkpoint)))
     executor._bind_training_report(
         report,
+        verified=verified,
         execution_binding=binding,
-        lineage_dose=executor._direct_lineage_dose(verified),  # noqa: SLF001
     )
     drifted = dict(binding)
     drifted["command_sha256"] = "sha256:" + "0" * 64

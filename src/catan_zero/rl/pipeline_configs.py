@@ -261,6 +261,11 @@ class TrainConfig(PipelineConfig):
     soft_target_min_legal_coverage: float = 0.5
     # Value-head weights -- the group the "flag-flips" work verifies.
     policy_loss_weight: float = 1.0
+    # Additional policy-active rows drawn per local optimizer step.  This is a
+    # science-critical sampling knob: it changes the effective policy batch
+    # without changing the base/value row dose, so it must participate in the
+    # typed config hash even when its backward-compatible default is zero.
+    policy_aux_active_batch_size: int = 0
     # RUN-6/EXP3: default aligned with train_bc --value-loss-weight (0.10, was 0.25).
     value_loss_weight: float = 0.10
     final_vp_loss_weight: float = 0.05

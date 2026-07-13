@@ -131,6 +131,7 @@ A1_LEARNER_ABLATION_FIELDS = frozenset(
         "lr_schedule",
         "value_lr_mult",
         "policy_loss_weight",
+        "policy_aux_active_batch_size",
         "soft_target_source",
         "soft_target_weight",
         "soft_target_temperature",
@@ -682,7 +683,9 @@ def bind_learner_ablation(
                 )
             effective[key] = value
             continue
-        expected_type = type(bound[key])
+        expected_type = (
+            int if key == "policy_aux_active_batch_size" else type(bound[key])
+        )
         if type(value) is not expected_type:
             raise ExecutorError(
                 f"A1 learner ablation {key!r} must preserve JSON type "
@@ -695,6 +698,7 @@ def bind_learner_ablation(
         "lr_warmup_steps": (0.0, None, True),
         "value_lr_mult": (0.0, None, False),
         "policy_loss_weight": (0.0, None, True),
+        "policy_aux_active_batch_size": (0.0, None, True),
         "soft_target_weight": (0.0, 1.0, True),
         "soft_target_temperature": (0.0, None, False),
         "soft_target_min_legal_coverage": (0.0, 1.0, True),
@@ -773,6 +777,11 @@ def bind_learner_ablation(
         drift["per_game_value_weight_mode"] = {
             "contract": "equal (implicit train_bc default; weighting locked off)",
             "effective": effective["per_game_value_weight_mode"],
+        }
+    if effective.get("policy_aux_active_batch_size", 0) != 0:
+        drift["policy_aux_active_batch_size"] = {
+            "contract": "0 (implicit historical train_bc default)",
+            "effective": effective["policy_aux_active_batch_size"],
         }
     if not drift:
         raise ExecutorError("A1 learner ablation is a no-op")
@@ -972,6 +981,13 @@ def build_train_command(
     )
     if bool(recipe["per_game_value_weight"]):
         command.append("--per-game-value-weight")
+    if "policy_aux_active_batch_size" in recipe:
+        command.extend(
+            [
+                "--policy-aux-active-batch-size",
+                str(recipe["policy_aux_active_batch_size"]),
+            ]
+        )
     learner_ablation = verified.get("learner_ablation")
     if learner_ablation is not None:
         command.extend(
@@ -1772,7 +1788,60 @@ def _write_receipt_no_clobber(path: Path, payload: dict[str, Any]) -> dict[str, 
     return payload
 
 
-def _direct_lineage_dose(verified: dict[str, Any]) -> dict[str, Any]:
+def _exact_objective_exposure(report_payload: dict[str, Any]) -> dict[str, Any]:
+    """Reconstruct exact current-dose objective exposure from trainer counters."""
+
+    integer_fields = (
+        "base_training_row_draws",
+        "policy_aux_training_row_draws",
+        "policy_base_active_rows",
+        "policy_aux_active_rows",
+        "policy_total_active_rows",
+        "value_active_rows",
+        "policy_kl_anchor_eligible_rows",
+    )
+    values: dict[str, int] = {}
+    for field in integer_fields:
+        value = report_payload.get(field)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ExecutorError(
+                f"A1 training report has invalid exact-dose counter {field!r}"
+            )
+        values[field] = value
+    if (
+        values["policy_aux_training_row_draws"]
+        != values["policy_aux_active_rows"]
+        or values["policy_total_active_rows"]
+        != values["policy_base_active_rows"]
+        + values["policy_aux_active_rows"]
+        or report_payload.get("total_training_row_draws")
+        != values["base_training_row_draws"]
+        + values["policy_aux_training_row_draws"]
+    ):
+        raise ExecutorError("A1 training report objective-dose arithmetic drift")
+    if values["value_active_rows"] > values["base_training_row_draws"]:
+        raise ExecutorError("A1 exact value-active dose exceeds the base draw dose")
+    if values["policy_kl_anchor_eligible_rows"] > values["base_training_row_draws"]:
+        raise ExecutorError("A1 exact anchor-eligible dose exceeds the base draw dose")
+    return {
+        "measurement_status": "bound_exactly",
+        "measurement_scope": "current_dose",
+        "base_sampled_rows": values["base_training_row_draws"],
+        "policy_base_active_sampled_rows": values["policy_base_active_rows"],
+        "policy_aux_active_sampled_rows": values["policy_aux_active_rows"],
+        "policy_active_sampled_rows": values["policy_total_active_rows"],
+        "value_active_sampled_rows": values["value_active_rows"],
+        "anchor_eligible_sampled_rows": values[
+            "policy_kl_anchor_eligible_rows"
+        ],
+    }
+
+
+def _direct_lineage_dose(
+    verified: dict[str, Any],
+    *,
+    report_payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     recipe = verified["recipe"]
     if recipe.get("resume_optimizer") is not False:
         raise ExecutorError(
@@ -1784,6 +1853,14 @@ def _direct_lineage_dose(verified: dict[str, Any]) -> dict[str, Any]:
     )
     if int(recipe["max_steps"]) > 0:
         steps = min(steps, int(recipe["max_steps"]))
+    objective_exposure = None
+    sampled_rows = int(verified["training_row_count"])
+    # Historical sealed recipes and reports predate exact objective counters.
+    # A derived recipe carrying the typed policy-aux field must use the current
+    # trainer and therefore fails closed unless all exact counters are present.
+    if report_payload is not None and "policy_aux_active_batch_size" in recipe:
+        objective_exposure = _exact_objective_exposure(report_payload)
+        sampled_rows = int(objective_exposure["base_sampled_rows"])
     try:
         return lineage.direct_lineage_dose(
             declared_producer_sha256=verified["producer"]["sha256"],
@@ -1793,8 +1870,9 @@ def _direct_lineage_dose(verified: dict[str, Any]) -> dict[str, Any]:
             function_preserving_upgrade=verified.get(
                 "function_preserving_upgrade_lineage"
             ),
-            current_sampled_rows=int(verified["training_row_count"]),
+            current_sampled_rows=sampled_rows,
             current_optimizer_steps=steps,
+            objective_exposure=objective_exposure,
         )
     except lineage.LineageDoseError as error:
         raise ExecutorError(f"invalid one-dose learner lineage: {error}") from error
@@ -1803,8 +1881,8 @@ def _direct_lineage_dose(verified: dict[str, Any]) -> dict[str, Any]:
 def _bind_training_report(
     report: Path,
     *,
+    verified: dict[str, Any],
     execution_binding: dict[str, Any],
-    lineage_dose: dict[str, Any],
 ) -> None:
     """Atomically bind the trainer report to the exact executor environment.
 
@@ -1828,7 +1906,9 @@ def _bind_training_report(
         )
     _validate_execution_binding(execution_binding)
     payload[REPORT_EXECUTION_BINDING_FIELD] = execution_binding
-    payload["a1_lineage_dose"] = lineage.validate_lineage_dose(lineage_dose)
+    payload["a1_lineage_dose"] = _direct_lineage_dose(
+        verified, report_payload=payload
+    )
     tmp = report.with_name(f".{report.name}.tmp.{os.getpid()}.{time.time_ns()}")
     try:
         with tmp.open("xb") as handle:
@@ -1870,7 +1950,7 @@ def _verify_training_outputs(
     )
     if int(recipe["max_steps"]) > 0:
         expected_steps = min(expected_steps, int(recipe["max_steps"]))
-    lineage_dose = _direct_lineage_dose(verified)
+    lineage_dose = _direct_lineage_dose(verified, report_payload=report_payload)
     expected = {
         "arch": "entity_graph",
         **SEALED_A1_MODEL_REPORT,
@@ -1926,6 +2006,29 @@ def _verify_training_outputs(
     }
     if drift:
         raise ExecutorError(f"A1 training report invariant drift: {drift}")
+    if "policy_aux_active_batch_size" in recipe:
+        exposure = lineage_dose["objective_exposure"]
+        expected_draws = {
+            "policy_aux_active_batch_size": int(recipe["policy_aux_active_batch_size"]),
+            "base_training_row_draws": int(exposure["base_sampled_rows"]),
+            "policy_aux_training_row_draws": int(
+                exposure["policy_aux_active_sampled_rows"]
+            ),
+            "policy_base_active_rows": int(
+                exposure["policy_base_active_sampled_rows"]
+            ),
+            "policy_aux_active_rows": int(
+                exposure["policy_aux_active_sampled_rows"]
+            ),
+            "policy_total_active_rows": int(exposure["policy_active_sampled_rows"]),
+        }
+        draw_drift = {
+            key: {"expected": value, "actual": report_payload.get(key)}
+            for key, value in expected_draws.items()
+            if report_payload.get(key) != value
+        }
+        if draw_drift:
+            raise ExecutorError(f"A1 objective-dose report drift: {draw_drift}")
     if report_payload.get("a1_bound_learner_training_recipe") != bound_recipe:
         raise ExecutorError("A1 training report does not echo the exact sealed recipe")
     if report_payload.get("a1_bound_learner_value_objective") != verified["objective"]:
@@ -2134,8 +2237,8 @@ def _execute_locked(
             raise ExecutorError(f"train_bc exited nonzero: {returncode}")
         _bind_training_report(
             report,
+            verified=verified,
             execution_binding=execution_binding,
-            lineage_dose=_direct_lineage_dose(verified),
         )
         output_artifacts = _verify_training_outputs(
             checkpoint=checkpoint,

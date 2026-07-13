@@ -66,6 +66,15 @@ def test_round_trip_preserves_non_default_values() -> None:
     assert rebuilt.value_loss_weight == 1.0
 
 
+def test_policy_aux_active_batch_size_changes_typed_train_hash() -> None:
+    baseline = TrainConfig()
+    policy_aux = TrainConfig(policy_aux_active_batch_size=128)
+
+    assert baseline.policy_aux_active_batch_size == 0
+    assert policy_aux.config_hash() != baseline.config_hash()
+    assert config_from_payload(policy_aux.canonical_payload()) == policy_aux
+
+
 def test_config_from_payload_rejects_unknown_pipeline() -> None:
     with pytest.raises(ValueError, match="unknown pipeline"):
         config_from_payload({"pipeline": "nonsense", "fields": {}})

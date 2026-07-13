@@ -27,27 +27,70 @@ def validate_lineage_dose(value: Any) -> dict[str, Any]:
     if value.get("optimizer_state_continuity") != "fresh_optimizer_per_dose":
         raise LineageDoseError("lineage optimizer-state continuity drift")
     objective = value.get("objective_exposure")
-    if (
-        not isinstance(objective, Mapping)
-        or objective.get("measurement_status") != "not_yet_bound_exactly"
-        or set(objective)
-        != {
+    if not isinstance(objective, Mapping):
+        raise LineageDoseError("lineage objective-specific exposure schema drift")
+    measurement_status = objective.get("measurement_status")
+    if measurement_status == "not_yet_bound_exactly":
+        if (
+            set(objective)
+            != {
+                "measurement_status",
+                "policy_active_sampled_rows",
+                "value_active_sampled_rows",
+                "anchor_eligible_sampled_rows",
+            }
+            or any(
+                objective[field] is not None
+                for field in (
+                    "policy_active_sampled_rows",
+                    "value_active_sampled_rows",
+                    "anchor_eligible_sampled_rows",
+                )
+            )
+        ):
+            raise LineageDoseError("lineage objective-specific exposure schema drift")
+    elif measurement_status == "bound_exactly":
+        exact_fields = {
             "measurement_status",
+            "measurement_scope",
+            "base_sampled_rows",
+            "policy_base_active_sampled_rows",
+            "policy_aux_active_sampled_rows",
             "policy_active_sampled_rows",
             "value_active_sampled_rows",
             "anchor_eligible_sampled_rows",
         }
-        or any(
-            objective[field] is not None
-            for field in (
-                "policy_active_sampled_rows",
-                "value_active_sampled_rows",
-                "anchor_eligible_sampled_rows",
-            )
-        )
-    ):
+        if set(objective) != exact_fields or objective.get("measurement_scope") != "current_dose":
+            raise LineageDoseError("lineage exact objective exposure schema drift")
+        numeric_fields = exact_fields - {"measurement_status", "measurement_scope"}
+        if any(
+            isinstance(objective[field], bool)
+            or not isinstance(objective[field], int)
+            or objective[field] < 0
+            for field in numeric_fields
+        ):
+            raise LineageDoseError("lineage exact objective exposure must be non-negative integers")
+        if (
+            objective["base_sampled_rows"] <= 0
+            or objective["value_active_sampled_rows"] > objective["base_sampled_rows"]
+            or objective["anchor_eligible_sampled_rows"]
+            > objective["base_sampled_rows"]
+            or objective["policy_base_active_sampled_rows"] > objective["base_sampled_rows"]
+            or objective["policy_active_sampled_rows"]
+            != objective["policy_base_active_sampled_rows"]
+            + objective["policy_aux_active_sampled_rows"]
+        ):
+            raise LineageDoseError("lineage exact objective exposure arithmetic drift")
+    else:
         raise LineageDoseError("lineage objective-specific exposure schema drift")
     current_rows = _positive_int(value.get("current_sampled_rows"), "current_sampled_rows")
+    if (
+        measurement_status == "bound_exactly"
+        and objective["base_sampled_rows"] != current_rows
+    ):
+        raise LineageDoseError(
+            "lineage exact base exposure does not match current sampled rows"
+        )
     current_steps = _positive_int(value.get("current_optimizer_steps"), "current_optimizer_steps")
     cumulative_rows = _positive_int(value.get("cumulative_sampled_rows"), "cumulative_sampled_rows")
     cumulative_steps = _positive_int(value.get("cumulative_optimizer_steps"), "cumulative_optimizer_steps")
@@ -119,6 +162,7 @@ def direct_lineage_dose(
     *, declared_producer_sha256: str, init_checkpoint_sha256: str,
     current_sampled_rows: int, current_optimizer_steps: int,
     function_preserving_upgrade: Mapping[str, Any] | None = None,
+    objective_exposure: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     if init_checkpoint_sha256 != declared_producer_sha256 and function_preserving_upgrade is None:
         raise LineageDoseError(
@@ -134,12 +178,16 @@ def direct_lineage_dose(
         ),
         "parent_receipt_sha256": None,
         "optimizer_state_continuity": "fresh_optimizer_per_dose",
-        "objective_exposure": {
-            "measurement_status": "not_yet_bound_exactly",
-            "policy_active_sampled_rows": None,
-            "value_active_sampled_rows": None,
-            "anchor_eligible_sampled_rows": None,
-        },
+        "objective_exposure": (
+            {
+                "measurement_status": "not_yet_bound_exactly",
+                "policy_active_sampled_rows": None,
+                "value_active_sampled_rows": None,
+                "anchor_eligible_sampled_rows": None,
+            }
+            if objective_exposure is None
+            else dict(objective_exposure)
+        ),
         "prior_sampled_rows": 0,
         "prior_optimizer_steps": 0,
         "current_sampled_rows": current_sampled_rows,

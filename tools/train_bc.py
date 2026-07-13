@@ -5827,6 +5827,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         epoch_count = 0
         epoch_active_count = 0.0
         epoch_aux_active_count = 0.0
+        epoch_value_active_count = 0.0
+        epoch_anchor_eligible_count = 0.0
         phase_stats = _empty_phase_stats()
         phase_stats_unforced = _empty_phase_stats()
         teacher_stats = _empty_phase_stats()
@@ -6042,6 +6044,12 @@ def main(argv: Sequence[str] | None = None) -> None:
             epoch_aux_active_count += float(
                 batch_metrics.get("policy_aux_active_count", 0)
             )
+            epoch_value_active_count += float(
+                batch_metrics.get("value_active_count", 0)
+            )
+            epoch_anchor_eligible_count += float(
+                batch_metrics.get("policy_kl_anchor_eligible_rows", 0)
+            )
             for key in (
                 "policy_loss",
                 "value_loss",
@@ -6134,6 +6142,12 @@ def main(argv: Sequence[str] | None = None) -> None:
         )
         active_count_total = _reduce_scalar_sum(float(epoch_active_count), ddp)
         aux_active_count_total = _reduce_scalar_sum(float(epoch_aux_active_count), ddp)
+        value_active_count_total = _reduce_scalar_sum(
+            float(epoch_value_active_count), ddp
+        )
+        anchor_eligible_count_total = _reduce_scalar_sum(
+            float(epoch_anchor_eligible_count), ddp
+        )
         epoch_policy_component_dose = _reduce_named_sums(
             epoch_policy_component_dose, ddp
         )
@@ -6253,6 +6267,10 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "policy_aux_active_rows": int(aux_active_count_total),
                 "policy_total_active_rows": int(
                     active_count_total + aux_active_count_total
+                ),
+                "value_active_rows": int(value_active_count_total),
+                "policy_kl_anchor_eligible_rows": int(
+                    anchor_eligible_count_total
                 ),
                 "policy_component_active_dose": policy_component_active_dose,
                 "policy_component_phase_active_dose": (
@@ -6784,6 +6802,15 @@ def main(argv: Sequence[str] | None = None) -> None:
                 for metric in metrics
             )
         ),
+        "value_active_rows": int(
+            sum(int(metric.get("value_active_rows", 0)) for metric in metrics)
+        ),
+        "policy_kl_anchor_eligible_rows": int(
+            sum(
+                int(metric.get("policy_kl_anchor_eligible_rows", 0))
+                for metric in metrics
+            )
+        ),
         "value_loss_weight": args.value_loss_weight,
         # Science-critical optimizer provenance: this multiplier changes the
         # value-head update by up to an order of magnitude while leaving the
@@ -7037,8 +7064,14 @@ def _train_candidate_batch(
             value_weights * outcome_confidence,
             mask=has_outcome,
         )
+        value_active_count = int(
+            (has_outcome & ((value_weights * outcome_confidence) > 0.0))
+            .sum()
+            .item()
+        )
     else:
         value_loss_sum, value_loss_denominator = _zero_loss_parts(policy.device)
+        value_active_count = 0
     loss = float(policy_loss_weight) * policy_loss + float(value_loss_weight) * value_loss
     if not torch.isfinite(loss):
         raise FloatingPointError(f"non-finite BC loss: {float(loss.detach().cpu())}")
@@ -7108,6 +7141,7 @@ def _train_candidate_batch(
             int((has_soft & active).sum().item()) if soft_targets is not None else 0
         ),
         "active_count": active_count,
+        "value_active_count": int(value_active_count),
         "accuracy": float(accuracy.item()),
         "top3_accuracy": float(top3_accuracy.item()),
         "phase_stats": phase_stats,
@@ -7614,8 +7648,15 @@ def _train_xdim_batch(
                 value_weights * outcome_confidence,
                 mask=value_has_outcome,
             )
+            value_active_count = int(
+                (
+                    value_has_outcome
+                    & ((value_weights * outcome_confidence) > 0.0)
+                ).sum().item()
+            )
         else:
             value_loss_sum, value_loss_denominator = _zero_loss_parts(policy.device)
+            value_active_count = 0
         if vp_targets is not None and "final_vp" in outputs:
             vp_error = nn.functional.mse_loss(outputs["final_vp"], vp_targets, reduction="none")
             final_vp_loss = _weighted_mean_loss(
@@ -8000,6 +8041,7 @@ def _train_xdim_batch(
         ),
         "active_count": active_count,
         "policy_aux_active_count": int(policy_aux_active_count),
+        "value_active_count": int(value_active_count),
         "accuracy": float(accuracy.item()),
         "top3_accuracy": float(top3_accuracy.item()),
         "phase_stats": phase_stats,
@@ -15732,6 +15774,12 @@ def _training_draw_accounting(metrics: list[dict]) -> dict[str, int | str | None
     policy_aux = sum(
         int(metric.get("policy_aux_active_rows", 0)) for metric in metrics
     )
+    policy_base = sum(
+        int(metric.get("policy_base_active_rows", 0)) for metric in metrics
+    )
+    value_active = sum(
+        int(metric.get("value_active_rows", 0)) for metric in metrics
+    )
     return {
         "training_row_draws": int(base),
         "training_row_draws_semantics": (
@@ -15739,6 +15787,9 @@ def _training_draw_accounting(metrics: list[dict]) -> dict[str, int | str | None
         ),
         "base_training_row_draws": int(base),
         "policy_aux_training_row_draws": int(policy_aux),
+        "policy_base_active_training_row_draws": int(policy_base),
+        "policy_active_training_row_draws": int(policy_base + policy_aux),
+        "value_active_training_row_draws": int(value_active),
         "total_training_row_draws": int(base + policy_aux),
         "unique_training_rows_drawn": None,
     }

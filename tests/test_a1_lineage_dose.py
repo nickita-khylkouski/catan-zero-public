@@ -59,3 +59,69 @@ def test_validator_rejects_forged_cumulative_arithmetic() -> None:
     dose["cumulative_sampled_rows"] = 101
     with pytest.raises(lineage.LineageDoseError, match="arithmetic drift"):
         lineage.validate_lineage_dose(dose)
+
+
+def test_direct_dose_binds_exact_objective_exposure() -> None:
+    exposure = {
+        "measurement_status": "bound_exactly",
+        "measurement_scope": "current_dose",
+        "base_sampled_rows": 4_194_304,
+        "policy_base_active_sampled_rows": 515_337,
+        "policy_aux_active_sampled_rows": 1_048_576,
+        "policy_active_sampled_rows": 1_563_913,
+        "value_active_sampled_rows": 4_194_304,
+        "anchor_eligible_sampled_rows": 0,
+    }
+    dose = lineage.direct_lineage_dose(
+        declared_producer_sha256=PRODUCER,
+        init_checkpoint_sha256=PRODUCER,
+        current_sampled_rows=4_194_304,
+        current_optimizer_steps=1_024,
+        objective_exposure=exposure,
+    )
+
+    assert dose["objective_exposure"] == exposure
+
+
+def test_exact_objective_exposure_rejects_policy_arithmetic_drift() -> None:
+    exposure = {
+        "measurement_status": "bound_exactly",
+        "measurement_scope": "current_dose",
+        "base_sampled_rows": 100,
+        "policy_base_active_sampled_rows": 20,
+        "policy_aux_active_sampled_rows": 10,
+        "policy_active_sampled_rows": 29,
+        "value_active_sampled_rows": 100,
+        "anchor_eligible_sampled_rows": 0,
+    }
+    with pytest.raises(lineage.LineageDoseError, match="exposure arithmetic drift"):
+        lineage.direct_lineage_dose(
+            declared_producer_sha256=PRODUCER,
+            init_checkpoint_sha256=PRODUCER,
+            current_sampled_rows=100,
+            current_optimizer_steps=1,
+            objective_exposure=exposure,
+        )
+
+
+def test_exact_objective_exposure_must_match_current_dose() -> None:
+    exposure = {
+        "measurement_status": "bound_exactly",
+        "measurement_scope": "current_dose",
+        "base_sampled_rows": 99,
+        "policy_base_active_sampled_rows": 20,
+        "policy_aux_active_sampled_rows": 10,
+        "policy_active_sampled_rows": 30,
+        "value_active_sampled_rows": 99,
+        "anchor_eligible_sampled_rows": 0,
+    }
+    with pytest.raises(
+        lineage.LineageDoseError, match="does not match current sampled rows"
+    ):
+        lineage.direct_lineage_dose(
+            declared_producer_sha256=PRODUCER,
+            init_checkpoint_sha256=PRODUCER,
+            current_sampled_rows=100,
+            current_optimizer_steps=1,
+            objective_exposure=exposure,
+        )
