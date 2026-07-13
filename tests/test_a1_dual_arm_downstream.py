@@ -164,21 +164,63 @@ def _full_audit(tmp_path: Path, manifest: Path) -> Path:
 
 def test_dual_shape_preserves_historical_and_requires_exact_quotas() -> None:
     assert {"is_forced", "used_full_search"}.issubset(corpus.LOADER_KEYS)
-    historical = harvest._contract_shape({})  # noqa: SLF001
+
+    def typed_lock(
+        *, schema: str, lane_count: int, game_contract: dict
+    ) -> dict:
+        jobs = []
+        for lane in range(lane_count):
+            if lane_count == 40 and lane >= 24:
+                host_alias = f"h{6 + (lane - 24) // 8}"
+                gpu = (lane - 24) % 8
+            else:
+                host_alias = f"h{lane // 4}"
+                gpu = lane % 4
+            for category in harvest.contract.EXPECTED_GAMES:
+                jobs.append(
+                    {
+                        "job_id": f"lane{lane}__{category}",
+                        "worker_id": f"lane{lane}",
+                        "host_alias": host_alias,
+                        "gpu": gpu,
+                    }
+                )
+        return {
+            "schema_version": schema,
+            "game_contract": game_contract,
+            "fleet": {"jobs": jobs},
+        }
+
+    historical_lock = typed_lock(
+        schema=harvest.contract.LEGACY_LOCK_SCHEMA,
+        lane_count=40,
+        game_contract={
+            "category_games": dict(harvest.contract.EXPECTED_GAMES),
+            "category_attempts": dict(harvest.contract.EXPECTED_ATTEMPTS),
+            "total_complete_games": sum(harvest.contract.EXPECTED_GAMES.values()),
+            "total_attempts": sum(harvest.contract.EXPECTED_ATTEMPTS.values()),
+        },
+    )
+    historical = harvest._contract_shape(historical_lock)  # noqa: SLF001
     assert historical["job_count"] == 120 and historical["arm_id"] is None
-    dual = harvest._contract_shape(  # noqa: SLF001
-        {"game_contract": {
-            "profile": harvest.DUAL_ARM_PROFILE, "arm_id": "n128",
+
+    dual_lock = typed_lock(
+        schema=harvest.contract.GENERATION_ARM_LOCK_SCHEMA,
+        lane_count=28,
+        game_contract={
+            "profile": harvest.contract.DUAL_ARM_GAME_CONTRACT_PROFILE,
+            "arm_id": "n128",
+            "worker_count": 28,
+            "job_count": 84,
             "category_games": {"current_producer": 112000, "recent_history": 21000, "hard_negative": 7000},
             "category_attempts": {"current_producer": 114240, "recent_history": 21420, "hard_negative": 7140},
             "total_complete_games": 140000, "total_attempts": 142800,
-        }}
+        },
     )
+    dual = harvest._contract_shape(dual_lock)  # noqa: SLF001
     assert dual["job_count"] == 84 and dual["arm_id"] == "n128"
-    bad = {"game_contract": {**{key: value for key, value in {
-        "profile": harvest.DUAL_ARM_PROFILE, "arm_id": "n128",
-        "category_games": dual["category_games"], "category_attempts": dual["category_attempts"],
-        "total_complete_games": 1, "total_attempts": 142800}.items()}}}
+    bad = json.loads(json.dumps(dual_lock))
+    bad["game_contract"]["total_complete_games"] = 1
     with pytest.raises(harvest.HarvestError, match="quotas"):
         harvest._contract_shape(bad)  # noqa: SLF001
 
