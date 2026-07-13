@@ -1022,6 +1022,27 @@ def test_only_exact_allowlisted_markerless_v2_lock_replays(
         contract.verify_lock(other)
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("worker_id", []),
+        ("host_alias", {}),
+        ("gpu", []),
+        ("gpu", True),
+        ("gpu", -1),
+    ],
+)
+def test_sealed_topology_rejects_malformed_placement_fields(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    draft = _resolved_draft(tmp_path)
+    lock = contract.build_lock(draft)
+    lock["fleet"]["jobs"][0][field] = value
+
+    with pytest.raises(contract.ContractError, match="placement fields are malformed"):
+        contract._sealed_game_contract_shape(lock)  # noqa: SLF001
+
+
 def test_seal_expands_exact_category_jobs_and_binds_science_hashes(
     tmp_path: Path,
 ) -> None:

@@ -492,17 +492,28 @@ def _sealed_game_contract_shape(lock: Mapping[str, Any]) -> dict[str, Any]:
     jobs = fleet.get("jobs")
     if not isinstance(jobs, list) or len(jobs) != job_count:
         raise ContractError("sealed job count differs from game contract")
-    worker_ids = {
-        str(job.get("worker_id", "")) for job in jobs if isinstance(job, dict)
-    }
-    placements = {
-        (str(job.get("host_alias", "")), job.get("gpu"))
-        for job in jobs
-        if isinstance(job, dict)
-    }
+    worker_ids: set[str] = set()
+    placements: set[tuple[str, int]] = set()
+    for job in jobs:
+        if not isinstance(job, dict):
+            raise ContractError("sealed job topology entry is not an object")
+        worker_id = job.get("worker_id")
+        host_alias = job.get("host_alias")
+        gpu = job.get("gpu")
+        if (
+            not isinstance(worker_id, str)
+            or not worker_id
+            or not isinstance(host_alias, str)
+            or not host_alias
+            or isinstance(gpu, bool)
+            or not isinstance(gpu, int)
+            or gpu < 0
+        ):
+            raise ContractError("sealed job placement fields are malformed")
+        worker_ids.add(worker_id)
+        placements.add((host_alias, gpu))
     if (
         len(worker_ids) != worker_count
-        or "" in worker_ids
         or len(placements) != worker_count
     ):
         raise ContractError("sealed physical lane count differs from game contract")
