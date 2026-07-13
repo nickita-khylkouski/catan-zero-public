@@ -231,6 +231,69 @@ LR trajectory, objective, and initializer. Heavy diagnostics are disabled in the
 timed arms. This chooses throughput/CPU-I/O geometry; it is not a model-quality
 sweep.
 
+The 128-step B200 comparison selected **8x512**:
+
+| geometry | rows | elapsed | rows/s | active teacher-gap closure | worst component closure | preclip mean/max | clipped steps |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 8x512 | 524,288 | 198.347 s | 2,643.28 | 0.102290 | 0.076152 | 0.6203 / 1.0077 | 1/128 |
+| 4x1024 | 524,288 | 268.385 s | 1,953.49 | 0.102206 | 0.075848 | 0.6221 / 0.9966 | 0/128 |
+
+The four-rank arm delivered 73.90% of the eight-rank throughput while its
+equal-dose closure differed by only -0.000161 per million samples. Higher HBM
+occupancy therefore did not buy learning or wall-clock efficiency. The full P0
+reproduction uses 8x512, global batch 4,096, accumulation 1.
+
+The live rehearsal also found three fail-fast tooling defects before the full
+dose: an undefined GPU-binding constant (`b59983b`), an invalid row-capped
+authenticated validation plan (`30b669f`), and a post-run plan schema that
+omitted the per-run LR consumed by the summarizer (`84c12e9`). Both geometry
+trainers completed successfully; the last defect affected postprocessing only.
+
+### Full P0 reproduction and dose saturation
+
+The full independent TEMP reproduction completed on one eight-B200 NVLink host.
+It reloaded the authenticated f7 checkpoint, created fresh Adam state, used
+8x512/global-batch 4096, and consumed exactly 1,024 optimizer steps / 4,194,304
+row draws. The sealed run produced:
+
+- checkpoint SHA-256
+  `ce29663fe519b88537d54afec3dfa4e0033f79a649f8b04d364baead48c462f4`;
+- report SHA-256
+  `4dbfa0b28156d482eae9f01e3a80bf450e0fb6d71f1e2dc4495293658d8779de`;
+- receipt file SHA-256
+  `2333caed6178450a27bdd9cffafd98f9ea1dbca5c16a973e3692458a23eb225b`;
+- semantic receipt digest
+  `sha256:2adc5973e2dae15d2208bfd031aeeb82d0699c44bb6c110a13f9600e56f25d38`;
+- 586.87 seconds trainer time, 44/1,024 clipped steps, no zero-objective
+  steps, and no non-finite failure;
+- objective-matched validation teacher-gap closure 0.135757, with component
+  closures replay=0.212590, n128=0.123271, and n256=0.108810;
+- global relative parameter drift 2.5954% and cosine 0.999663; the six trunk
+  blocks drifted from 2.49% to 3.32%, while the value head drifted 1.54%.
+
+The matched 128-step checkpoint is not merely a systems rehearsal; it reveals a
+strong dose-saturation mechanism. At 524,288 row draws it already reached
+teacher-gap closure 0.102290 with global relative drift 0.6913%. The full run
+used 8x more samples but gained only 0.03347 absolute closure (1.33x total)
+while parameter drift grew 3.75x. Closure per million samples collapsed from
+0.1951 to 0.03237, roughly 6x.
+
+The optimizer exposure contrast is stronger than the row-count contrast. With
+the trainer's 100-step linear warmup, the 128-step run integrated only 78.5
+full-LR-equivalent steps, whereas the 1,024-step run integrated 974.5. The full
+run therefore received about **12.41x** the LR-area exposure yet achieved only
+1.33x the teacher-gap closure. This is direct evidence of early policy-target
+saturation followed by continued representation movement; it is not evidence
+that the short checkpoint is competitively stronger, which still requires the
+matched behavior panel.
+
+This does **not** prove the midpoint plays better: only matched head-to-head
+evaluation can decide that. It does prove that offline distillation saturates
+far earlier than representation movement. Therefore midpoint and full P0 must
+both be evaluated against exact f7 under the same operator. If midpoint is at
+least as strong, future arms should use a short dose/early selection rather than
+assuming one full 4.19M-row dose is optimal.
+
 ### P2 — highest-information learner arms
 
 Before launching an arm, adjudicate the already-written 524,288-row and
