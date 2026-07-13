@@ -9,10 +9,20 @@ import time
 
 import pytest
 
+from tools.fleet import build_a1_neutral_panel_jobset as historical_panel
 from tools.fleet import gpu_fleet as fleet
 
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_historical_panel_snapshot_cannot_impersonate_generic_authority(tmp_path):
+    raw = historical_panel.manifest(ssh_key="/tmp/key")
+    assert raw["schema_version"] == historical_panel.HISTORICAL_MANIFEST_SCHEMA
+    path = tmp_path / "historical-panel.json"
+    path.write_text(json.dumps(raw))
+    with pytest.raises(fleet.FleetError, match="unsupported fleet manifest schema"):
+        fleet.load_manifest(path)
 
 
 def _manifest(tmp_path: Path, commits: dict[str, str] | None = None):
@@ -33,6 +43,7 @@ def _manifest(tmp_path: Path, commits: dict[str, str] | None = None):
         json.dumps(
             {
                 "schema_version": fleet.MANIFEST_SCHEMA,
+                "fleet_authority": fleet.FLEET_AUTHORITY,
                 "ssh_user": "ubuntu",
                 "ssh_key": None,
                 "remote_repo": "/opt/catan",
@@ -54,14 +65,30 @@ def _jobset(tmp_path: Path, jobs):
     return fleet.load_jobset(path)
 
 
-def test_committed_manifest_is_the_canonical_56_gpu_shape():
+def test_committed_legacy_manifest_retains_exact_56_gpu_authority():
     manifest = fleet.load_manifest(_REPO_ROOT / "configs" / "gpu_fleet_56.json")
+    assert fleet.fleet_authority(manifest) == fleet.LEGACY_FLEET_AUTHORITY
+    assert manifest["manifest_hash"] == (
+        "sha256:8d7713a5ec68528d13de3f92bbdc5fa24d218d70627dd85a61ffadf147e8b2d9"
+    )
     assert len(manifest["hosts"]) == 10
     assert sum(host["gpu_count"] for host in manifest["hosts"]) == 56
     assert [(host["alias"], host["gpu_count"]) for host in manifest["hosts"][-2:]] == [
         ("h100-8c", 8),
         ("h100-8d", 8),
     ]
+
+
+def test_committed_manifest_is_the_canonical_exact_64_gpu_authority():
+    manifest = fleet.load_manifest(_REPO_ROOT / "configs" / "gpu_fleet_64.json")
+    assert manifest["fleet_authority"] == fleet.FLEET_AUTHORITY
+    assert fleet.fleet_authority(manifest) == fleet.FLEET_AUTHORITY
+    assert len(manifest["hosts"]) == 12
+    assert sum(host["gpu_count"] for host in manifest["hosts"]) == 64
+    assert [(host["alias"], host["gpu_count"]) for host in manifest["hosts"]] == [
+        (alias, count) for alias, count in fleet.EXPECTED_SHAPES.items()
+    ]
+    assert manifest["ssh_key"] == "/home/ubuntu/.ssh/catan_fleet_ed25519"
 
 
 def test_new_eight_gpu_hosts_are_allocatable_only_at_their_audited_commit(tmp_path):
@@ -81,9 +108,9 @@ def test_new_eight_gpu_hosts_are_allocatable_only_at_their_audited_commit(tmp_pa
     assert [row["alias"] for row in plan["assignments"]] == ["h100-8c", "h100-8d"]
 
 
-def test_manifest_is_exactly_the_canonical_56_gpu_shape(tmp_path):
+def test_manifest_is_exactly_the_canonical_64_gpu_shape(tmp_path):
     manifest = _manifest(tmp_path)
-    assert sum(host["gpu_count"] for host in manifest["hosts"]) == 56
+    assert sum(host["gpu_count"] for host in manifest["hosts"]) == 64
     manifest["hosts"].append(
         {
             "alias": "h100-8e",
@@ -99,6 +126,46 @@ def test_manifest_is_exactly_the_canonical_56_gpu_shape(tmp_path):
     )
     with pytest.raises(fleet.FleetError, match="mapping drift"):
         fleet.load_manifest(path)
+
+
+def test_v2_manifest_refuses_missing_or_legacy_authority(tmp_path):
+    manifest = _manifest(tmp_path)
+    raw = {key: value for key, value in manifest.items() if key != "manifest_hash"}
+    for authority in (None, fleet.LEGACY_FLEET_AUTHORITY):
+        if authority is None:
+            raw.pop("fleet_authority", None)
+        else:
+            raw["fleet_authority"] = authority
+        path = tmp_path / f"wrong-authority-{authority}.json"
+        path.write_text(json.dumps(raw))
+        with pytest.raises(fleet.FleetError, match="fleet_authority"):
+            fleet.load_manifest(path)
+
+
+def test_v1_manifest_cannot_smuggle_exact64_authority(tmp_path):
+    raw = json.loads((_REPO_ROOT / "configs" / "gpu_fleet_56.json").read_text())
+    raw["fleet_authority"] = fleet.FLEET_AUTHORITY
+    path = tmp_path / "v1-smuggled-authority.json"
+    path.write_text(json.dumps(raw))
+    with pytest.raises(fleet.FleetError, match="must not declare"):
+        fleet.load_manifest(path)
+
+
+def test_c7_c8_allocate_only_at_their_audited_commit(tmp_path):
+    manifest = fleet.load_manifest(_REPO_ROOT / "configs" / "gpu_fleet_64.json")
+    jobs = _jobset(
+        tmp_path,
+        [
+            {"job_id": "c7-job", "host": "c7", "gpus": 4, "argv": ["true"]},
+            {"job_id": "c8-job", "host": "c8", "gpus": 4, "argv": ["true"]},
+        ],
+    )
+    plan = fleet.build_plan(
+        manifest,
+        jobs,
+        repo_commit="27e41d95898dfa2c3033a459ff0e389325275bb7",
+    )
+    assert [row["alias"] for row in plan["assignments"]] == ["c7", "c8"]
 
 
 @pytest.mark.parametrize(
@@ -361,7 +428,8 @@ def test_inventory_validates_shape_commit_and_busy_state(tmp_path):
     # The fake response has four GPUs for every host, so 8-GPU declarations fail.
     result = fleet.inventory(manifest, runner=runner)
     assert result["valid"] is False
-    assert result["gpu_capacity"] == 56
+    assert result["fleet_authority"] == fleet.FLEET_AUTHORITY
+    assert result["gpu_capacity"] == 64
 
 
 def _local_status_runner(argv):

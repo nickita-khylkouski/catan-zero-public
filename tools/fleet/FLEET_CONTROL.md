@@ -75,15 +75,29 @@ Three two-operator collisions on 2026-07-09 (crossed c6 conversion, shared-pgid 
 c6 relaunch). Route all fleet changes through the single box owner; always post-verify a single clean
 gen set after any conversion (`fleet_status.sh <box>` + `fleet_stop.sh <box>` dry-run).
 
-## Generic 56-GPU scheduler
+## Generic exact-64 GPU scheduler
 
-`gpu_fleet.py` is the daemonless scheduler for the canonical six 4×H100 plus
-four 8×H100 fleet. The committed `configs/gpu_fleet_56.json` is deliberately
-exact: every alias is bound to its literal IP, GPU count, and
+`gpu_fleet.py` is the daemonless scheduler for the canonical eight 4×H100 plus
+four 8×H100 fleet. The committed `configs/gpu_fleet_64.json` declares the
+`catan-h100-exact64-v1` authority and is deliberately exact: every alias is
+bound to its literal IP, GPU count, and
 `NVIDIA H100 80GB HBM3` name; duplicate, extra, replacement, or unmapped hosts
 fail closed. It allocates physical GPU IDs deterministically in
 manifest order, filters by the declared deployed Git commit, and refuses a
 selected GPU with an existing non-MPS CUDA client.
+
+The historical `configs/gpu_fleet_56.json` remains byte-unchanged and readable
+only as the implicit `catan-h100-exact56-v1` v1 authority, because issued A1
+contracts bind its bytes and manifest hash. A v1 manifest cannot claim the new
+authority, and a v2 manifest cannot omit or substitute its authority. New work
+must use the exact-64 v2 manifest. The exact-64 manifest is B200-origin and pins
+`/home/ubuntu/.ssh/catan_fleet_ed25519`; it does not distribute east-west keys.
+
+The dedicated A1 evaluation controller independently accepts its sealed
+exact-40, expanded exact-48, and full exact-64 topologies. Historical one-off
+builders and the exact-56 opponent-recovery tool do not inherit generic v2
+authority: the former has a distinct snapshot schema, while the latter rejects
+v2 because its recovery plan contains exactly 56 immutable lanes.
 
 Jobs are argv arrays, not shell fragments. Plans and per-host receipts are
 hash-bound, launches use the canonical detached heartbeat helper, repeat
@@ -104,12 +118,12 @@ receipt and validates PID=SID=PGID, non-zombie state, `/proc/PID/cmdline` hash,
 and the PID-bound fresh heartbeat.
 
 ```bash
-python tools/fleet/gpu_fleet.py --manifest configs/gpu_fleet_56.json inventory
-python tools/fleet/gpu_fleet.py --manifest configs/gpu_fleet_56.json plan \
+python tools/fleet/gpu_fleet.py --manifest configs/gpu_fleet_64.json inventory
+python tools/fleet/gpu_fleet.py --manifest configs/gpu_fleet_64.json plan \
   --jobset jobs.json --repo-commit "$(git rev-parse HEAD)" --out plan.json
-python tools/fleet/gpu_fleet.py --manifest configs/gpu_fleet_56.json submit --plan plan.json
-python tools/fleet/gpu_fleet.py --manifest configs/gpu_fleet_56.json submit --plan plan.json --go
-python tools/fleet/gpu_fleet.py --manifest configs/gpu_fleet_56.json status --plan plan.json
+python tools/fleet/gpu_fleet.py --manifest configs/gpu_fleet_64.json submit --plan plan.json
+python tools/fleet/gpu_fleet.py --manifest configs/gpu_fleet_64.json submit --plan plan.json --go
+python tools/fleet/gpu_fleet.py --manifest configs/gpu_fleet_64.json status --plan plan.json
 ```
 
 Jobset schema:
