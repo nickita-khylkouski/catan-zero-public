@@ -31,7 +31,7 @@ class _AuthoritativeGame:
         self.seeds.append(seed)
         # Deliberately ignore authoritative hidden_truth: this is the engine
         # contract the orchestration layer relies on.
-        return _SampledGame(seed)
+        return _SampledGame(seed, self.prompt)
 
     def json_snapshot(self) -> str:
         return json.dumps(
@@ -40,14 +40,18 @@ class _AuthoritativeGame:
 
 
 class _SampledGame:
-    def __init__(self, seed: int) -> None:
+    def __init__(self, seed: int, prompt: str = "BUILD_INITIAL_ROAD") -> None:
         self.seed = seed
+        self.prompt = prompt
 
     def current_color(self) -> str:
         return "RED"
 
     def num_turns(self) -> int:
         return 7
+
+    def json_snapshot(self) -> str:
+        return json.dumps({"current_prompt": self.prompt})
 
 
 def _mcts(*, particles: int = 4, n_full: int = 128) -> GumbelChanceMCTS:
@@ -136,6 +140,25 @@ def test_information_set_forwards_attested_public_phase_to_belief_aggregation() 
         force_full=True,
     )
     assert observed == ["BUILD_INITIAL_ROAD"]
+
+
+def test_information_set_fails_closed_if_particle_phase_changes() -> None:
+    class _BadPhaseGame(_AuthoritativeGame):
+        def determinize_for_player(self, observer: str, seed: int) -> _SampledGame:
+            assert observer == "RED"
+            return _SampledGame(seed, "BUILD_INITIAL_SETTLEMENT")
+
+    mcts = _mcts()
+    mcts.config = replace(
+        mcts.config,
+        rescale_noise_floor_c=8.0,
+        rescale_noise_floor_initial_road_only=True,
+    )
+    with pytest.raises(RuntimeError, match="changed the attested root phase"):
+        mcts.search(
+            _BadPhaseGame("opponent has KNIGHT", "BUILD_INITIAL_ROAD"),
+            force_full=True,
+        )
 
 
 def test_information_set_particles_share_one_exact_total_budget() -> None:

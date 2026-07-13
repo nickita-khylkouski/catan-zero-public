@@ -1058,6 +1058,12 @@ class GumbelChanceMCTS:
         results: list[SearchResult] = []
         for particle_index, particle_seed in enumerate(particle_seeds):
             sampled = game.determinize_for_player(root_color, int(particle_seed))
+            sampled_phase = self._phase_gated_d1_root_phase(sampled)
+            if sampled_phase != root_phase:
+                raise RuntimeError(
+                    "public-belief determinization changed the attested root phase: "
+                    f"authoritative={root_phase!r} sampled={sampled_phase!r}"
+                )
             sampled_legal, _sampled_actions, _sampled_spectra = self._fetch_legal_actions(
                 sampled
             )
