@@ -171,6 +171,12 @@ a diagnostic, not a champion selector. Search H2H remains mandatory.
 | Scalar search-value selection | Validation ranked raw scalar MSE although MCTS consumes `tanh(raw * value_scale)`; these rankings can reverse. | Fixed diagnostic: fit scale only on one explicit held-out game subset, score on a disjoint subset with bounded memory, and never mutate the operator or authorize promotion without matched search H2H (`5838cec`). |
 | Evaluator cache concurrency | `evaluate_many` performed LRU get/touch as separate unlocked operations while async stores could evict the key, producing a deterministic `KeyError` under capacity pressure. | Fixed: atomic lock-scoped LRU get/store across sync, batch, and async evaluators; model forward stays outside the lock; root-perspective and deterministic eviction races are covered (`e1ae5bf`). This affected evaluation reliability, not trained weights. |
 | Historical candidate provenance | P0/TEMP/anchor/combined/corrective checkpoint files have no adjacent report, receipt, or optimizer sidecar on the audited host, and historical payloads omit a standardized initializer hash/recipe/code digest. | Future artifacts must bind initializer, fresh/resumed optimizer state, exact dose and integrated LR area, source/runtime digests, report, receipt, and finalizer. True historical lineage was reconstructed from launchers/checkpoint hashes rather than inferred from filenames. |
+| Supervision-weight admission | Scalar and mapped row weights accepted negative or non-finite values; a negative forced-row weight could drive a nonsensical negative million-scale loss. Unknown teacher/phase map keys silently became no-ops. | Fixed (`cb15b6a`): every scalar/map value is finite and in its allowed range, duplicate/empty entries fail, and requested map keys must occur in the distributed corpus. Corrupt arrays fail before optimization. Historical P0/TEMP used finite unit/default weights, so this closes unsafe future arms rather than explaining their weights. |
+| Truncated VP padding | Legacy truncated rows without VP snapshots were padded with zero arrays; the proxy then interpreted that padding as a low-confidence zero-margin target. | Fixed (`cb15b6a`): snapshot presence is explicit and missing snapshots cannot manufacture a target. |
+| Validation objective identity | `policy_aux` executed an additional conditioned draw stream during training, but validation omitted it while reporting `objective_matched=true`. | Fixed (`cb15b6a`): such validation is explicitly unmatched until its exact sufficient statistics exist; it cannot rank or promote an arm as if it measured the training objective. |
+| Teacher-gap weighting | Active teacher-gap telemetry used a boolean positive-weight mask. A repair row with policy weight 100 and an incidental row with weight 1 therefore had equal diagnostic influence, even though the learner objective did not. | Fixed (`e0d1d78`): KL numerators and denominators use the exact post-advantage effective policy weights through batch, DDP, component, and report aggregation; the two-row regression yields `100/101 = 0.990099`, not `0.5`. This changes interpretation, not gradients. |
+| Optional-target train coverage | An enabled CAT-100 head could have all-NaN/all-`-1` labels and silently contribute zero loss. The first coverage fix scanned the full corpus, so labels appearing only in held-out validation could still admit a run with no training signal. | Fixed (`e0d1d78`, `6d6d08a`): each enabled head requires finite usable labels on the actual post-split training indices, with chunked DDP-aware counts bound into the report. |
+| Zero effective training objective | A configured policy/Q or value/final-VP objective could have zero positive effective weight mass on the training split and still run as an apparently valid experiment. | Fixed (`6d6d08a`): startup computes and records train-split objective masses and refuses every enabled zero-mass objective before spending a GPU update. |
 
 ## Layer/architecture audit
 
@@ -281,6 +287,24 @@ the replayed completion receipt digest is
 `sha256:6dc1c728d23ac9f186e7e254eb7dc7f397300cf7ce256ba90d30cfbfd2c62d77`.
 Offline closure does not decide whether the join improves play; the matched f7
 behavior screen is the next and only selection step.
+
+The independently initialized topology-only arm has now completed directly
+from the exact short-D6 parent. It used eight B200s, 8x512/global-4096, 128
+updates and 524,288 rows, fresh Adam, FP32, and the same rank-distinct D6/event
+augmentation. Exactly eight `topology_residual_adapter` tensors (823,040
+parameters) trained at `1.2e-4`; all 139 inherited tensors remained
+bit-identical, all eight Adam states reached step 128, and no step clipped or
+skipped. Training took 108.71 seconds and consumed 64,309 policy-active rows.
+Checkpoint SHA-256 is
+`65881a212e60c1c392ac55cb8c5eead3c34d02c91e1fd4a1cb13a0b8d54b6f4f`;
+the replayed completion receipt digest is
+`sha256:38c91e64d91a073ba393804000c32d6c60e5a8af0fa7a9cb254dc9874d791843`.
+Objective-matched closure moved from the short-D6 parent's `0.086684` to
+`0.090129`; this is a diagnostic, not a strength claim. The required next
+measurement is the same-key exact-parent H2H. A matched topology+gather sibling
+is now scientifically valid as the fourth cell of a 2x2 factorial only because
+both single-addition cells exist independently; it must still initialize from
+short-D6 rather than either trained child.
 
 ### Value readout
 
