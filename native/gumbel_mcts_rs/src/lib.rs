@@ -170,6 +170,50 @@ fn calibrated_sigma_scale(
     (c_visit + visits as f64) * c_scale
 }
 
+fn temperature_scale_policy(
+    policy: &[(usize, f64)],
+    temperature: f64,
+) -> Result<Vec<(usize, f64)>, String> {
+    if !temperature.is_finite() || temperature <= 0.0 {
+        return Err("policy sampling temperature must be finite and > 0".into());
+    }
+    if temperature == 1.0 || policy.is_empty() {
+        return Ok(policy.to_vec());
+    }
+    let mut log_weights = Vec::with_capacity(policy.len());
+    let mut max_log_weight = f64::NEG_INFINITY;
+    for &(action, probability) in policy {
+        let log_weight = if probability.is_finite() && probability > 0.0 {
+            probability.ln() / temperature
+        } else {
+            f64::NEG_INFINITY
+        };
+        max_log_weight = max_log_weight.max(log_weight);
+        log_weights.push((action, log_weight));
+    }
+    if !max_log_weight.is_finite() {
+        return Err("policy sampling distribution has no positive finite mass".into());
+    }
+    let mut scaled = Vec::with_capacity(policy.len());
+    let mut total = 0.0;
+    for (action, log_weight) in log_weights {
+        let weight = if log_weight.is_finite() {
+            (log_weight - max_log_weight).exp()
+        } else {
+            0.0
+        };
+        total += weight;
+        scaled.push((action, weight));
+    }
+    if !total.is_finite() || total <= 0.0 {
+        return Err("policy sampling temperature normalization failed".into());
+    }
+    for (_, probability) in &mut scaled {
+        *probability /= total;
+    }
+    Ok(scaled)
+}
+
 // ---------------------------------------------------------------------------
 // Tree nodes
 // ---------------------------------------------------------------------------
@@ -327,6 +371,7 @@ pub struct GumbelMctsEngine {
 
 impl GumbelMctsEngine {
     pub fn new(config: SearchConfig) -> Self {
+        assert!(config.temperature.is_finite(), "temperature must be finite");
         assert!(
             config
                 .sigma_reference_visits
@@ -467,7 +512,9 @@ impl GumbelMctsEngine {
         let selected = if self.config.play_sh_winner {
             sh_winner
         } else if self.config.temperature > 0.0 {
-            self.sample_categorical(&improved_policy)
+            let sampling_policy =
+                temperature_scale_policy(&improved_policy, self.config.temperature)?;
+            self.sample_categorical(&sampling_policy)
         } else {
             improved_policy
                 .iter()
@@ -1511,6 +1558,72 @@ mod tests {
         close(calibrated_sigma_scale(50.0, 0.1, 32, None), 8.2);
         close(calibrated_sigma_scale(50.0, 0.1, 8, Some(12)), 6.2);
         close(calibrated_sigma_scale(50.0, 0.1, 32, Some(12)), 6.2);
+    }
+
+    #[test]
+    fn gameplay_temperature_scales_policy_without_changing_t1() {
+        let close = |actual: f64, expected: f64| {
+            assert!(
+                (actual - expected).abs() < 1.0e-12,
+                "{actual} != {expected}"
+            );
+        };
+        let policy = vec![(3, 0.8), (7, 0.2), (11, 0.0)];
+        assert_eq!(temperature_scale_policy(&policy, 1.0).unwrap(), policy);
+
+        let sharp = temperature_scale_policy(&policy, 0.5).unwrap();
+        close(sharp[0].1, 16.0 / 17.0);
+        close(sharp[1].1, 1.0 / 17.0);
+        close(sharp[2].1, 0.0);
+
+        let soft = temperature_scale_policy(&policy, 2.0).unwrap();
+        close(soft[0].1, 2.0 / 3.0);
+        close(soft[1].1, 1.0 / 3.0);
+        close(soft[2].1, 0.0);
+
+        assert!(temperature_scale_policy(&policy, 0.0).is_err());
+        assert!(temperature_scale_policy(&policy, f64::NAN).is_err());
+    }
+
+    #[test]
+    fn zero_gameplay_temperature_keeps_deterministic_argmax_selection() {
+        let game = opening(3);
+        let config = SearchConfig {
+            temperature: 0.0,
+            n_full: 8,
+            n_fast: 8,
+            p_full: 1.0,
+            max_depth: 3,
+            ..Default::default()
+        };
+        let first = GumbelMctsEngine::new(config.clone())
+            .search(&game, &mut CountingEvaluator::default(), Some(true))
+            .unwrap();
+        let second = GumbelMctsEngine::new(config)
+            .search(&game, &mut CountingEvaluator::default(), Some(true))
+            .unwrap();
+        assert_eq!(first.selected_action, second.selected_action);
+
+        let visits = first
+            .visit_counts
+            .iter()
+            .copied()
+            .collect::<HashMap<_, _>>();
+        let priors = first.priors.iter().copied().collect::<HashMap<_, _>>();
+        let selected_policy = first
+            .improved_policy
+            .iter()
+            .find(|(action, _)| *action == first.selected_action)
+            .unwrap()
+            .1;
+        let selected_visits = visits[&first.selected_action];
+        let selected_prior = priors[&first.selected_action];
+        assert!(first.improved_policy.iter().all(|(action, probability)| {
+            selected_policy > *probability
+                || (selected_policy == *probability
+                    && (selected_visits > visits[action]
+                        || (selected_visits == visits[action] && selected_prior >= priors[action])))
+        }));
     }
 
     #[test]

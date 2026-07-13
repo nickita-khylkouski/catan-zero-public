@@ -84,6 +84,20 @@ class NativeGumbelChanceMCTS(GumbelChanceMCTS):
                 )
         if (
             self.using_native_hot_loop
+            and float(self.config.temperature) > 0.0
+            and float(self.config.temperature) != 1.0
+        ):
+            import catanatron_rs  # type: ignore
+
+            capability_fn = getattr(catanatron_rs, "gumbel_search_capabilities", None)
+            capabilities = set(capability_fn()) if callable(capability_fn) else set()
+            if "policy_temperature_semantics" not in capabilities:
+                unsupported.append(
+                    "non-unit gameplay temperature requires a native wheel "
+                    "advertising policy_temperature_semantics"
+                )
+        if (
+            self.using_native_hot_loop
             and (
                 self.config.information_set_target_aggregation
                 == "aggregate_q_then_improve"
