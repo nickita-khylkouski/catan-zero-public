@@ -17,8 +17,13 @@ from catan_zero.rl.entity_token_features import (
 from catan_zero.rl.entity_token_policy import EntityGraphConfig, EntityGraphNet
 from catan_zero.rl.relational_trunks import (
     REL_EDGE_TO_VERTEX,
+    REL_EVENT_TO_TARGET,
+    REL_HEX_TO_VERTEX,
+    REL_TARGET_TO_EVENT,
     REL_VERTEX_TO_EDGE,
     TopologyResidualAdapter,
+    build_direct_adjacency,
+    build_relation_ids,
 )
 
 
@@ -239,6 +244,48 @@ def test_adapter_is_equivariant_to_joint_token_and_topology_relabelling():
         relations[:, permutation][:, :, permutation],
     )
     torch.testing.assert_close(relabelled, expected, rtol=1e-6, atol=1e-6)
+
+
+def test_direct_adjacency_is_exactly_the_relation_surface_adapter_consumes():
+    batch = _batch(batch_size=3, event_width=2)
+    length = 153
+    relation_ids = build_relation_ids(batch, sequence_length=length)
+    expected = (
+        (
+            (relation_ids >= REL_HEX_TO_VERTEX)
+            & (relation_ids <= REL_VERTEX_TO_EDGE)
+        )
+        | (relation_ids == REL_EVENT_TO_TARGET)
+        | (relation_ids == REL_TARGET_TO_EVENT)
+    )
+    actual = build_direct_adjacency(batch, sequence_length=length)
+    assert actual.dtype == torch.bool
+    assert torch.equal(actual, expected)
+
+
+def test_direct_adjacency_adapter_path_is_bit_identical_to_relation_ids():
+    width, length = 16, 153
+    adapter = TopologyResidualAdapter(width).eval()
+    with torch.no_grad():
+        adapter.output_projection.weight.normal_(std=0.1)
+        adapter.output_projection.bias.normal_(std=0.1)
+    batch = _batch(batch_size=2, event_width=2)
+    relation_ids = build_relation_ids(batch, sequence_length=length)
+    direct = build_direct_adjacency(batch, sequence_length=length)
+    tokens = torch.randn(
+        2, length, width, generator=torch.Generator().manual_seed(37)
+    )
+    padding = torch.zeros(2, length, dtype=torch.bool)
+    padding[1, -1] = True
+
+    with torch.no_grad():
+        legacy = adapter(tokens, relation_ids, key_padding_mask=padding)
+        specialized = adapter(
+            tokens,
+            key_padding_mask=padding,
+            direct_adjacency=direct,
+        )
+    assert torch.equal(specialized, legacy)
 
 
 def test_adapter_output_changes_when_explicit_vertex_edge_incidence_changes():

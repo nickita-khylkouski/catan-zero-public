@@ -77,16 +77,38 @@ class TopologyResidualAdapter:
                 nn.init.zeros_(self.output_projection.weight)
                 nn.init.zeros_(self.output_projection.bias)
 
-            def forward(self, tokens, relation_ids, key_padding_mask=None):
+            def forward(
+                self,
+                tokens,
+                relation_ids=None,
+                key_padding_mask=None,
+                *,
+                direct_adjacency=None,
+            ):
                 # Direct physical/dynamic incidence only.  Excluding SELF,
                 # HUB_READS and READ_GLOBAL prevents this adapter from becoming
                 # a second unstructured global-attention layer.
-                direct = (
-                    ((relation_ids >= REL_HEX_TO_VERTEX)
-                     & (relation_ids <= REL_VERTEX_TO_EDGE))
-                    | (relation_ids == REL_EVENT_TO_TARGET)
-                    | (relation_ids == REL_TARGET_TO_EVENT)
-                )
+                if (relation_ids is None) == (direct_adjacency is None):
+                    raise ValueError(
+                        "provide exactly one of relation_ids or direct_adjacency"
+                    )
+                if direct_adjacency is None:
+                    direct = (
+                        (
+                            (relation_ids >= REL_HEX_TO_VERTEX)
+                            & (relation_ids <= REL_VERTEX_TO_EDGE)
+                        )
+                        | (relation_ids == REL_EVENT_TO_TARGET)
+                        | (relation_ids == REL_TARGET_TO_EVENT)
+                    )
+                else:
+                    direct = direct_adjacency.bool()
+                    expected = tokens.shape[:2] + tokens.shape[1:2]
+                    if tuple(direct.shape) != tuple(expected):
+                        raise ValueError(
+                            "direct_adjacency shape must be [B, tokens, tokens]: "
+                            f"{tuple(direct.shape)} != {tuple(expected)}"
+                        )
                 if key_padding_mask is not None:
                     live = ~key_padding_mask.bool()
                     direct = direct & live.unsqueeze(1) & live.unsqueeze(2)
@@ -111,6 +133,116 @@ class TopologyResidualAdapter:
                 return tokens + update
 
         return _Module()
+
+
+def build_direct_adjacency(batch: dict[str, Any], *, sequence_length: int):
+    """Build only the physical incidence mask consumed by the warm-start adapter.
+
+    ``build_relation_ids`` constructs a dense int64 relation tensor and fills
+    SELF/HUB/READ_GLOBAL classes for the relational trunks.  The topology
+    residual adapter immediately filters all of those classes out.  This
+    specialized boolean builder preserves its exact physical/event edge set
+    without paying for unused relation classes.
+    """
+    import torch
+
+    required = ("hex_vertex_ids", "hex_edge_ids", "edge_vertex_ids")
+    missing = [key for key in required if key not in batch]
+    if missing:
+        raise ValueError(
+            "topology residual adapter requires topology fields: "
+            + ", ".join(missing)
+        )
+
+    reference = batch["hex_vertex_ids"]
+    device = reference.device
+    batch_size = int(reference.shape[0])
+    length = int(sequence_length)
+    adjacency = torch.zeros(
+        (batch_size, length, length), dtype=torch.bool, device=device
+    )
+
+    hex_offset = 1
+    vertex_offset = 20
+    edge_offset = 74
+    player_offset = 146
+    event_offset = 151
+
+    def _link(
+        ids,
+        *,
+        row_count: int,
+        destination_offset: int,
+        source_offset: int,
+    ) -> None:
+        ids = ids.long().reshape(batch_size, -1)
+        fanout = int(ids.shape[1] // row_count)
+        rows = (
+            torch.arange(row_count, device=device)
+            .view(1, row_count, 1)
+            .expand(batch_size, row_count, fanout)
+            .reshape(batch_size, -1)
+        )
+        valid = ids >= 0
+        batches = (
+            torch.arange(batch_size, device=device).view(-1, 1).expand_as(ids)
+        )
+        adjacency[
+            batches[valid],
+            rows[valid] + int(destination_offset),
+            ids[valid] + int(source_offset),
+        ] = True
+        adjacency[
+            batches[valid],
+            ids[valid] + int(source_offset),
+            rows[valid] + int(destination_offset),
+        ] = True
+
+    _link(
+        batch["hex_vertex_ids"],
+        row_count=19,
+        destination_offset=hex_offset,
+        source_offset=vertex_offset,
+    )
+    _link(
+        batch["hex_edge_ids"],
+        row_count=19,
+        destination_offset=hex_offset,
+        source_offset=edge_offset,
+    )
+    _link(
+        batch["edge_vertex_ids"],
+        row_count=72,
+        destination_offset=edge_offset,
+        source_offset=vertex_offset,
+    )
+
+    if length > event_offset and "event_target_ids" in batch:
+        targets = batch["event_target_ids"].long()
+        event_count = min(int(targets.shape[1]), length - event_offset)
+        targets = targets[:, :event_count, :]
+        offsets = torch.tensor(
+            (hex_offset, vertex_offset, edge_offset, player_offset),
+            dtype=torch.long,
+            device=device,
+        )
+        valid = targets >= 0
+        batches = (
+            torch.arange(batch_size, device=device)
+            .view(-1, 1, 1)
+            .expand_as(targets)
+        )
+        events = (
+            torch.arange(event_count, device=device)
+            .view(1, -1, 1)
+            .expand_as(targets)
+            + event_offset
+        )
+        target_tokens = targets + offsets.view(1, 1, 4)
+        adjacency[batches[valid], events[valid], target_tokens[valid]] = True
+        adjacency[batches[valid], target_tokens[valid], events[valid]] = True
+
+    return adjacency
 
 
 def build_relation_ids(batch: dict[str, Any], *, sequence_length: int):

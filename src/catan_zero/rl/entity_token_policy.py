@@ -849,7 +849,9 @@ class EntityGraphNet:
                     event_token_limit=event_token_limit,
                 )
                 if self.topology_residual_adapter_enabled:
-                    from catan_zero.rl.relational_trunks import build_relation_ids
+                    from catan_zero.rl.relational_trunks import (
+                        build_direct_adjacency,
+                    )
 
                     relation_batch = batch
                     if event_token_limit is not None and "event_target_ids" in batch:
@@ -857,12 +859,14 @@ class EntityGraphNet:
                         relation_batch["event_target_ids"] = batch["event_target_ids"][
                             :, :event_token_limit
                         ]
-                    relation_ids = build_relation_ids(
+                    direct_adjacency = build_direct_adjacency(
                         relation_batch,
                         sequence_length=int(tokens.shape[1]),
                     )
                     tokens = self.topology_residual_adapter(
-                        tokens, relation_ids, key_padding_mask=padding_mask
+                        tokens,
+                        key_padding_mask=padding_mask,
+                        direct_adjacency=direct_adjacency,
                     )
                 if self.uses_relational_topology:
                     from catan_zero.rl.relational_trunks import build_relation_ids

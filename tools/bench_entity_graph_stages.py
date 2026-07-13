@@ -307,16 +307,20 @@ def _attributed_forward(
 
     tokens, padding_mask = recorder.run("sequence_and_mask_assembly", assemble_state)
     if bool(getattr(model, "topology_residual_adapter_enabled", False)):
-        from catan_zero.rl.relational_trunks import build_relation_ids
+        from catan_zero.rl.relational_trunks import build_direct_adjacency
 
-        relation_ids = recorder.run(
-            "topology_relation_construction",
-            lambda: build_relation_ids(batch, sequence_length=int(tokens.shape[1])),
+        direct_adjacency = recorder.run(
+            "topology_direct_adjacency_construction",
+            lambda: build_direct_adjacency(
+                batch, sequence_length=int(tokens.shape[1])
+            ),
         )
         tokens = recorder.run(
             "topology_residual_adapter",
             lambda: model.topology_residual_adapter(
-                tokens, relation_ids, key_padding_mask=padding_mask
+                tokens,
+                key_padding_mask=padding_mask,
+                direct_adjacency=direct_adjacency,
             ),
         )
     # Expand _Block.forward exactly, rather than treating each transformer as
