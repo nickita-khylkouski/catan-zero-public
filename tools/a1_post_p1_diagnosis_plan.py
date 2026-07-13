@@ -19,8 +19,40 @@ from pathlib import Path
 from typing import Any, Sequence
 
 
-SCHEMA = "a1-post-p1-optimization-architecture-plan-v1"
-SAMPLE_DOSE = 4_194_304
+SCHEMA = "a1-post-p1-optimization-architecture-plan-v2"
+SHORT_SAMPLE_DOSE = 524_288
+FULL_SAMPLE_DOSE = 4_194_304
+# Backwards-compatible name for code that refers to the historical full dose.
+# It is evidence, not the default for a new arm; ``dose_adjudication`` below
+# must select the dose before any causal arm is launched.
+SAMPLE_DOSE = FULL_SAMPLE_DOSE
+
+SHORT_CHECKPOINT = {
+    "path": (
+        "/home/ubuntu/experimental_nonpromotable/learner-forensics-2ba5ae1/"
+        "geometry-probe-128step-r4/ddp8-b512/candidate.pt"
+    ),
+    "sha256": "sha256:91a4b63ee5b74da0ec7123557d36e084d7ab91963c65bab9848838123e8e86de",
+    "report_sha256": (
+        "sha256:c28bb2a6992562947db635611150641d124074c5d6c8f08ee399a17ea9bff758"
+    ),
+    "layer_drift_sha256": (
+        "sha256:5fbe47e3746b1c1a17ba07cfeb68e9edd9b605b0167b21b2d2e1817d56d1f936"
+    ),
+}
+FULL_CHECKPOINT = {
+    "path": (
+        "/home/ubuntu/experimental_nonpromotable/learner-forensics-84c12e9/"
+        "p0-temp-f7-dose4194304-r1/ddp8-b512/candidate.pt"
+    ),
+    "sha256": "sha256:ce29663fe519b88537d54afec3dfa4e0033f79a649f8b04d364baead48c462f4",
+    "report_sha256": (
+        "sha256:4dbfa0b28156d482eae9f01e3a80bf450e0fb6d71f1e2dc4495293658d8779de"
+    ),
+    "layer_drift_sha256": (
+        "sha256:de680388c594731b9218d7f67b1f53cec54d3758f1cb568b07cc158b2d68f237"
+    ),
+}
 
 
 def _digest(value: Any) -> str:
@@ -33,16 +65,30 @@ def build_plan(
 ) -> dict[str, Any]:
     if world_size != 8:
         raise ValueError("post-P1 diagnosis is bound to all eight B200 GPUs")
-    if local_batch_size <= 0 or grad_accum_steps <= 0:
-        raise ValueError("batch and accumulation must be positive")
+    if local_batch_size != 512:
+        raise ValueError("post-P1 diagnosis is bound to selected local batch 512")
+    if grad_accum_steps != 1:
+        raise ValueError(
+            "post-P1 diagnosis requires exact DDP accumulation 1; mean-of-means "
+            "accumulation is not promotion-safe"
+        )
     global_batch = world_size * local_batch_size * grad_accum_steps
-    steps = math.ceil(SAMPLE_DOSE / global_batch)
+    steps_by_dose = {
+        str(dose): math.ceil(dose / global_batch)
+        for dose in (SHORT_SAMPLE_DOSE, FULL_SAMPLE_DOSE)
+    }
     fixed = {
         "initialization": "authenticated f7 producer bytes, independently loaded per arm",
         "data": "exact P1 globally shuffled current-plus-gen3-replay descriptor",
         "sample_order": "same component/game/row sampler seed as P1",
-        "sample_dose": SAMPLE_DOSE,
-        "max_steps": steps,
+        # This plan used to hard-code the full dose for every arm.  The matched
+        # short checkpoint already closed 75% of the final teacher gap with
+        # only 27% of the final parameter drift, so doing that again would bake
+        # the proximal failure mechanism into every ablation.  No arm has a
+        # dose until the existing short/full checkpoints are adjudicated.
+        "sample_dose": "selected_by_dose_adjudication",
+        "dose_candidates": [SHORT_SAMPLE_DOSE, FULL_SAMPLE_DOSE],
+        "max_steps_by_dose": steps_by_dose,
         "world_size": world_size,
         "local_batch_size": local_batch_size,
         "global_batch_size": global_batch,
@@ -53,19 +99,39 @@ def build_plan(
         "lr_schedule": "flat",
         "trunk_lr_mult": 1.0,
         "weight_decay": 0.0,
-        "amp": "bf16",
+        # The sealed winning TEMP learner and both dose artifacts are FP32.
+        # BF16 here was a stale P1-plan value and would make every purported
+        # one-axis learner arm a precision-plus-treatment experiment.
+        "amp": "none",
         "policy_kl_anchor_weight": 0.0,
         "policy_kl_anchor_direction": "forward",
-        "policy_distillation_component_ids": ["n128_current", "n256_current"],
+        # Exact winning TEMP/P0 scope. Current-only replay scope is plausible,
+        # but it is an ablation—not the control—and policy CE versus stale-z are
+        # two independent hypotheses.
+        "policy_distillation_component_ids": [
+            "n128_current",
+            "n256_current",
+            "gen3_replay",
+        ],
+        "value_training_component_ids": [
+            "n128_current",
+            "n256_current",
+            "gen3_replay",
+        ],
         "gen3_replay_policy_objective": (
-            "zero search-target CE; value rehearsal plus optional authenticated "
-            "stored-prior forward KL only"
+            "exact TEMP control: stored search-target CE plus old-policy Monte-Carlo "
+            "outcome; no KL anchor"
         ),
         "policy_loss_weight": 1.0,
         "soft_target_source": "policy",
         "soft_target_weight": 0.9,
         "soft_target_temperature": 0.7,
         "soft_target_min_legal_coverage": 0.5,
+        "stored_policy_component_temperatures": {
+            "n128_current": 1.0,
+            "n256_current": 1.11,
+            "gen3_replay": 0.52,
+        },
         "forced_policy_effective_weight": 0.0,
         "forced_action_weight": 0.0,
         "forced_row_value_weight": 1.0,
@@ -108,17 +174,48 @@ def build_plan(
             ),
         },
         {
-            "arm_id": "L1_CONTROL",
+            "arm_id": "TEMP_CONTROL",
             "training": "new matched B200 run",
             "recipe_delta": {
                 "checkpoint_upgrade": "none",
                 "policy_aux_active_batch_size": 0,
             },
-            "purpose": "replicate the winning a73 loser-policy objective at one dose",
+            "purpose": "replicate the exact winning TEMP objective at the selected dose",
+        },
+        {
+            "arm_id": "CURRENT_POLICY_SCOPE",
+            "training": "new matched B200 run after TEMP_CONTROL",
+            "reference_arm": "TEMP_CONTROL",
+            "recipe_delta": {
+                "policy_distillation_component_ids": [
+                    "n128_current",
+                    "n256_current",
+                ]
+            },
+            "purpose": (
+                "test only removal of the older replay search-policy teacher; retain "
+                "the exact TEMP value scope"
+            ),
+        },
+        {
+            "arm_id": "CURRENT_VALUE_SCOPE",
+            "training": "new matched B200 run after TEMP_CONTROL",
+            "reference_arm": "TEMP_CONTROL",
+            "recipe_delta": {
+                "value_training_component_ids": [
+                    "n128_current",
+                    "n256_current",
+                ]
+            },
+            "purpose": (
+                "test only removal of old-policy Monte-Carlo outcomes; retain the "
+                "exact TEMP policy-distillation scope"
+            ),
         },
         {
             "arm_id": "L1_PURE_SEARCH_TARGET",
-            "training": "new matched B200 run after L1_CONTROL",
+            "training": "new matched B200 run after replay-scope selection",
+            "reference_arm": "selected replay-scope control",
             "recipe_delta": {
                 "checkpoint_upgrade": "none",
                 "policy_aux_active_batch_size": 0,
@@ -131,19 +228,21 @@ def build_plan(
         },
         {
             "arm_id": "L1_POLICY_AUX",
-            "training": "new matched B200 run",
+            "training": "new matched B200 run after replay-scope selection",
+            "reference_arm": "selected replay-scope control",
             "recipe_delta": {
                 "checkpoint_upgrade": "none",
                 "policy_aux_active_batch_size": 128,
             },
             "purpose": (
-                "match a73's ~1.55M active-policy exposures while holding value "
-                "dose at 4.19M rows"
+                "restore policy-active exposure while holding the adjudicated "
+                "base/value dose fixed"
             ),
         },
         {
             "arm_id": "L1_AUX_REPLAY_ANCHOR",
             "training": "conditional matched B200 run after exact-v2 replay telemetry",
+            "reference_arm": "selected replay-scope control",
             "recipe_delta": {
                 "checkpoint_upgrade": "none",
                 "policy_aux_active_batch_size": 128,
@@ -160,6 +259,7 @@ def build_plan(
         {
             "arm_id": "L1_GATHER",
             "training": "new matched B200 run",
+            "reference_arm": "selected corrected learner arm",
             "recipe_delta": {
                 "checkpoint_upgrade": "f69_upgrade_checkpoint_config.py --flags gather",
                 "checkpoint_upgrade_forward_max_diff": 0.0,
@@ -217,17 +317,114 @@ def build_plan(
             "gradient clipping and non-finite telemetry",
         ],
     }
+    dose_adjudication = {
+        "schema_version": "a1-dose-adjudication-v1",
+        "status": "required_before_new_training",
+        "launch_blocking": True,
+        "reason": (
+            "the short run reached 0.102290 teacher-gap closure at 0.6913% global "
+            "drift; the full run reached only 0.135757 closure at 2.5954% drift"
+        ),
+        "common_contract": {
+            "initializer": "exact authenticated f7 producer bytes",
+            "optimizer": "fresh Adam",
+            "global_batch_size": 4096,
+            "lr": 3e-5,
+            "lr_warmup_steps": 100,
+            "lr_schedule": "flat",
+            "amp": "none",
+            "sample_order_prefix": "identical authenticated P1 sampler seed",
+        },
+        "candidates": {
+            str(SHORT_SAMPLE_DOSE): {
+                "optimizer_steps": steps_by_dose[str(SHORT_SAMPLE_DOSE)],
+                "teacher_gap_closure": 0.102290,
+                "global_relative_parameter_drift": 0.0069134,
+                "artifact": SHORT_CHECKPOINT,
+            },
+            str(FULL_SAMPLE_DOSE): {
+                "optimizer_steps": steps_by_dose[str(FULL_SAMPLE_DOSE)],
+                "teacher_gap_closure": 0.135757,
+                "global_relative_parameter_drift": 0.025954,
+                "artifact": FULL_CHECKPOINT,
+            },
+        },
+        "evaluation": {
+            "primary": (
+                "short versus full, seat-swapped with common random numbers under "
+                "the exact deployed f7 tanh search operator"
+            ),
+            "parent_panel": (
+                "short and full versus exact f7 on the same seed cohort; never use "
+                "old gen3 or c_scale=0.03"
+            ),
+            "pairs": 300,
+            "map_kind": "BASE",
+            "c_scale": 0.10,
+            "value_squash": "tanh",
+            "operator_sensitivity": (
+                "repeat short/full/f7 on the identical seed cohort with value_squash=clip; "
+                "diagnostic only, never mix tanh and clip inside one match"
+            ),
+            "heldout_value_calibration": ["raw", "tanh", "clip"],
+        },
+        "selection_rule": (
+            "select the smallest dose whose paired win rate is within 2 percentage "
+            "points of the best dose and whose f7 panel is within 2 points of the "
+            "best f7 delta; otherwise select the statistically superior dose"
+        ),
+        "failure_rule": (
+            "if neither checkpoint clears the predeclared f7 performance floor, "
+            "do not infer that more dose is beneficial from offline loss"
+        ),
+    }
+    replay_scope_adjudication = {
+        "schema_version": "a1-replay-scope-adjudication-v1",
+        "baseline": "TEMP_CONTROL",
+        "baseline_contract": {
+            "policy_distillation_component_ids": [
+                "n128_current",
+                "n256_current",
+                "gen3_replay",
+            ],
+            "value_training_component_ids": [
+                "n128_current",
+                "n256_current",
+                "gen3_replay",
+            ],
+        },
+        "one_axis_arms": {
+            "CURRENT_POLICY_SCOPE": "policy scope only; value scope stays exact TEMP",
+            "CURRENT_VALUE_SCOPE": "value scope only; policy scope stays exact TEMP",
+        },
+        "selection_rule": (
+            "compare each arm directly with TEMP_CONTROL at the selected dose and "
+            "deployed operator; retain TEMP scope for every unsupported axis"
+        ),
+        "interaction_rule": (
+            "do not create a both-current scope by composition unless both one-axis "
+            "arms independently survive and a separately named interaction arm is bound"
+        ),
+    }
     decision = {
         "loser_targets": (
-            "L1_CONTROL repairs replay teacher-gap versus LEGACY_L03: suppressing "
+            "TEMP_CONTROL repairs replay teacher-gap versus LEGACY_L03: suppressing "
             "loser search targets was causal"
         ),
+        "replay_policy_scope": (
+            "CURRENT_POLICY_SCOPE improves over TEMP_CONTROL: obsolete replay policy "
+            "distillation was causal"
+        ),
+        "replay_value_scope": (
+            "CURRENT_VALUE_SCOPE improves over TEMP_CONTROL: old-policy continuation "
+            "outcomes were causal"
+        ),
         "active_policy_dose": (
-            "L1_POLICY_AUX improves over L1_CONTROL at equal value dose: policy "
+            "L1_POLICY_AUX improves over its selected scope control at equal value dose: policy "
             "underexposure was causal"
         ),
         "target_semantics": (
-            "L1_PURE_SEARCH_TARGET improves over L1_CONTROL: the 10% played-action "
+            "L1_PURE_SEARCH_TARGET improves over its selected scope control: the 10% played-action "
             "hard label was harmful deterministic re-sharpening"
         ),
         "replay_anchor": (
@@ -239,7 +436,7 @@ def build_plan(
             "spatial state-action aliasing was causal"
         ),
         "neither": (
-            "L1_CONTROL and L1_POLICY_AUX fail: inspect objective-specific trunk "
+            "TEMP_CONTROL and L1_POLICY_AUX fail: inspect objective-specific trunk "
             "gradients and deployed value squash before architecture escalation"
         ),
         "escalation": (
@@ -252,7 +449,10 @@ def build_plan(
         "diagnostic_only": True,
         "promotion_eligible": False,
         "launch_authorized": False,
-        "launch_condition": "P1 training and checkpoint write have completed",
+        "launch_condition": (
+            "existing short/full dose adjudication completes; then run only the next "
+            "predeclared one-axis arm"
+        ),
         "target_semantics_audit": {
             "path": (
                 "/home/ubuntu/experimental_nonpromotable/"
@@ -266,14 +466,17 @@ def build_plan(
             "audit_code_commit": "6e59f5e",
             "conclusion": (
                 "gen3 replay is an older, materially softer policy teacher; "
-                "exclude its search-target CE and retain value/prior rehearsal only"
+                "test exclusion of its search-target CE independently; policy-conditional "
+                "replay outcomes require a separate value-scope arm"
             ),
         },
         "gpu_schedule": [
             "reuse LEGACY_L03 without B200 compute",
-            "run L1_CONTROL on all 8 B200s",
-            "run L1_PURE_SEARCH_TARGET after L1_CONTROL releases DDP",
-            "run L1_POLICY_AUX only after L1_CONTROL releases DDP",
+            "run exact TEMP_CONTROL on all 8 B200s at the selected dose",
+            "run CURRENT_POLICY_SCOPE and CURRENT_VALUE_SCOPE sequentially against TEMP_CONTROL",
+            "select one replay scope; never combine two unsupported scope changes",
+            "run L1_PURE_SEARCH_TARGET after scope selection releases DDP",
+            "run L1_POLICY_AUX after scope selection releases DDP",
             (
                 "run L1_AUX_REPLAY_ANCHOR only if exact-v2 telemetry shows harmful "
                 "authenticated replay forward-KL drift"
@@ -282,6 +485,8 @@ def build_plan(
             "evaluate arms in parallel on the H100 fleet; do not consume B200s",
         ],
         "fixed_recipe": fixed,
+        "dose_adjudication": dose_adjudication,
+        "replay_scope_adjudication": replay_scope_adjudication,
         "historical_feature_audit": {
             "trunk_lr_multiplier": (
                 "implemented as --trunk-lr-mult for the exact canonical entity-graph "
@@ -320,9 +525,8 @@ def build_plan(
                 "or pathological parameter-update evidence"
             ),
             (
-                "at the 2,097,152-sample midpoint, stop an arm only when both "
-                "active teacher-gap and held-out loss are worse than FULL_CONTROL "
-                "at the matched dose and its behavior drift is larger"
+                "evaluate at the selected dose; no arm may silently continue from "
+                "the short dose to the full dose on offline loss alone"
             ),
         ],
         "prelaunch_gradient_probe": {
@@ -373,6 +577,10 @@ def build_plan(
         },
         "value_readout_probe": {
             "mismatch": "learner fits raw value while deployed search consumes tanh(raw)",
+            "ranking_reversal_example": (
+                "for z=+1, raw predictions .9 and 1.2 have MSE .01 and .04, but "
+                "after tanh their squared errors are .0807 and .0276"
+            ),
             "calibration": ["raw", "tanh", "clip"],
             "operator_panel": "matched tanh versus clip, same squash for both agents",
             "default_change_authorized": False,

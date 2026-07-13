@@ -1209,7 +1209,9 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "How --per-game-policy-weight scales positive per-game policy mass: "
             "'equal' gives every game equal total mass; 'sqrt' retains total mass "
-            "proportional to sqrt(the game's original positive policy mass)."
+            "proportional to sqrt(the game's original positive policy mass). "
+            "For composite-v2, mass is measured under its authenticated "
+            "component->game->row sampler rather than uniform-row counting."
         ),
     )
     parser.add_argument(
@@ -1249,7 +1251,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "CAT-60: normalize VALUE-loss weights so every game (grouped by game_seed) "
-            "contributes equal total loss mass regardless of its row count, addressing "
+            "contributes equal loss mass under the active sampler, addressing "
             "'16k games = 16k independent outcomes, not 3.6M labels'. Applied after "
             "phase weights, the CAT-45 value_weight_multiplier field, and "
             "--forced-row-value-weight -- see build_value_sample_weights' docstring for "
@@ -1261,13 +1263,11 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("equal", "sqrt"),
         default="equal",
         help=(
-            "EXP3: how --per-game-value-weight distributes per-game mass. 'equal' (default, "
-            "CAT-60 behavior): every game contributes EQUAL total value-loss mass (row weight "
-            "divided by the game's summed weight -> long games heavily downweighted per row). "
-            "'sqrt': row weight divided by SQRT of the game's summed weight, so a game of n "
-            "value rows contributes ~sqrt(n) mass -- the effective-sample-size middle ground "
-            "between row-level (mass n) and equal (mass 1), treating n correlated in-game rows "
-            "as ~sqrt(n) independent value samples. No-op unless --per-game-value-weight is set."
+            "EXP3: how --per-game-value-weight distributes per-game mass. Under an ordinary "
+            "uniform-row corpus, 'equal' divides by summed in-game weight and 'sqrt' by its "
+            "square root. Under composite-v2's game-uniform sampler the corresponding "
+            "normalizers use mean in-game weight, preventing a second inverse-length bias. "
+            "No-op unless --per-game-value-weight is set."
         ),
     )
     # Internal A1 executor binding. These flags do not enable an ablation on
@@ -9134,6 +9134,7 @@ _OBJECTIVE_MATCHED_VALIDATION_MEANS = (
     "policy_kl_anchor_loss",
     "value_uncertainty_loss",
     "aux_subgoal_loss",
+    "belief_resource_loss",
     "moe_balance_loss",
     "value_categorical_loss",
     "value_categorical_clean_loss",
@@ -9236,6 +9237,7 @@ _TRAINING_OBJECTIVE_METRIC_KEYS = (
     "policy_kl_anchor_loss",
     "value_uncertainty_loss",
     "aux_subgoal_loss",
+    "belief_resource_loss",
     "moe_balance_loss",
     "value_categorical_loss",
 )
@@ -9344,6 +9346,19 @@ def _objective_measure_validation_aggregate(
             if target_prior_legacy > 1.0e-8
             else 0.0
         )
+    # These are aliases of reconstructed objective terms, not independently
+    # normalized game means. Leaving the weighted game-average values in place
+    # made the report internally inconsistent after exact sufficient-statistic
+    # aggregation and could steer value-arm selection with a different measure.
+    if "value_loss" in metrics:
+        metrics["scalar_value_mse_diagnostic"] = metrics["value_loss"]
+    if coefficients:
+        categorical_active = float(
+            coefficients.get("value_categorical_loss", 0.0)
+        ) > 0.0
+        primary_key = "value_categorical_loss" if categorical_active else "value_loss"
+        if primary_key in metrics:
+            metrics["primary_value_loss"] = metrics[primary_key]
     if coefficients and all(key in metrics for key in coefficients):
         exact_loss = sum(
             float(coefficients[key]) * float(metrics[key]) for key in coefficients
@@ -12334,14 +12349,16 @@ def sample_weight_quality(data: dict, weights: np.ndarray) -> dict:
 
 
 def per_game_weight_quality(data: dict, weights: np.ndarray) -> dict:
-    """CAT-60 verification: log the actual per-game total weight mass directly (not just
-    trust the per-game normalization formula) so a smoke train can confirm games of very
-    different lengths end up with roughly equal total value-loss mass when
-    --per-game-value-weight is on -- and, for comparison, how unequal it is when off."""
+    """Report raw and sampler-adjusted per-game loss-weight mass."""
 
     n = len(weights)
     if n == 0:
-        return {"n_games": 0, "rows_per_game": {}, "total_weight_per_game": {}}
+        return {
+            "n_games": 0,
+            "rows_per_game": {},
+            "total_weight_per_game": {},
+            "sampler_adjusted_weight_per_game": {},
+        }
     seeds = np.asarray(data.get("game_seed", np.arange(n, dtype=np.int64)), dtype=np.int64)
     weight_array = np.asarray(weights)
     # Production memmaps are written game-by-game, so every game's rows form
@@ -12396,8 +12413,21 @@ def per_game_weight_quality(data: dict, weights: np.ndarray) -> dict:
         counts = np.concatenate(counts_parts)
         totals = np.concatenate(totals_parts)
         unique_seed_count = len(counts)
+    game_uniform_sampler = bool(
+        tuple(getattr(data, "component_game_sampling_ratios", tuple()))
+    )
+    # With uniform-row sampling, summed weight is the game's objective mass.
+    # Composite-v2 first samples a game and then a row, so mean in-game weight
+    # is the corresponding mass. Reporting only totals previously made a
+    # correct flag-off v2 run look length-biased and invited double correction.
+    adjusted = totals / counts if game_uniform_sampler else totals
     return {
         "n_games": int(unique_seed_count),
+        "sampling_measure": (
+            "component_then_uniform_game_then_uniform_row"
+            if game_uniform_sampler
+            else "uniform_row"
+        ),
         "rows_per_game": {
             "min": int(counts.min()),
             "max": int(counts.max()),
@@ -12408,6 +12438,12 @@ def per_game_weight_quality(data: dict, weights: np.ndarray) -> dict:
             "max": float(totals.max()),
             "mean": float(totals.mean()),
             "std": float(totals.std()),
+        },
+        "sampler_adjusted_weight_per_game": {
+            "min": float(adjusted.min()),
+            "max": float(adjusted.max()),
+            "mean": float(adjusted.mean()),
+            "std": float(adjusted.std()),
         },
     }
 
@@ -15100,25 +15136,22 @@ def build_value_sample_weights(
     construction. This mirrors ``build_sample_weights``'s phase-weight application (per-phase
     multiplier, then renormalize to mean 1) so the value head can be repaired the same way.
 
-    CAT-60: ``forced_row_value_weight`` and ``per_game_value_weight`` address "16k games = 16k
-    independent outcomes, not 3.6M labels" -- naive per-row value MSE overweights games with
-    many recorded decisions relative to short games, and wastes weight on near-zero-information
-    forced-decision rows (states with exactly one legal action). Combination rule, applied in
-    this exact order, since every factor here is multiplicative and the final mean-renormalize
-    makes the order of scalar factors irrelevant except for ``per_game_value_weight``, which
-    must go LAST:
+    CAT-60: ``forced_row_value_weight`` and ``per_game_value_weight`` address
+    repeated correlated labels and low-information forced-decision rows. For an
+    ordinary uniform-row corpus, naive value MSE overweights long games. A v2
+    composite already samples games uniformly, so its sampler-aware normalizer
+    operates on mean rather than summed in-game weight. Combination rule,
+    applied in this exact order, since every factor here is multiplicative and
+    the final mean-renormalize makes the order of scalar factors irrelevant
+    except for ``per_game_value_weight``, which must go LAST:
 
       1. ``phase_weights`` multiplier (this function, existing).
       2. ``value_weight_multiplier`` (CAT-45's per-row sampling-weight field, already stored on
          the corpus -- existing).
       3. ``forced_row_value_weight`` multiplier on rows with exactly one legal action (new).
-      4. ``per_game_value_weight`` normalization (new): divides every row's weight (as
-         accumulated by steps 1-3) by the total weight its game already accumulated, so every
-         game contributes EXACTLY the same total value-loss mass regardless of (a) its row
-         count and (b) how steps 1-3 happen to be distributed within it. This equalizes GAMES
-         against each other; it does not undo forced-row downweighting *within* a game -- a
-         game that is mostly forced moves still has its low-information rows suppressed by
-         step 3, it just doesn't lose overall game-level mass for being long.
+      4. ``per_game_value_weight`` normalization: divides by summed game weight
+         for uniform-row corpora or mean game weight for game-uniform v2
+         composites. It does not undo forced-row downweighting within a game.
 
     Finally the whole array is renormalized to global mean 1, as with every other weight
     builder in this module (a uniform scalar rescale, so it preserves the equal-per-game-mass
@@ -15178,7 +15211,16 @@ def _component_row_ranges(
 
 
 def _normalize_weights_per_game(data: dict, weights: np.ndarray, *, mode: str = "equal") -> np.ndarray:
-    """Rescale ``weights`` so each component-local ``game_seed`` has equal mass.
+    """Rescale weights under the corpus's actual row-sampling measure.
+
+    Ordinary corpora are sampled uniformly by row, so ``equal`` divides by a
+    game's summed weight and ``sqrt`` by its square root. Authenticated
+    composite-v2 corpora already sample ``component -> game -> row``. Under
+    that measure a game's contribution is its *mean* row weight, not its sum;
+    dividing by the sum again biases the objective toward short games. For
+    those corpora, ``equal`` therefore divides by mean weight and ``sqrt`` by
+    its square root. This preserves the named game-mass semantics instead of
+    double-correcting a sampler that is already game-uniform.
 
     Unlike ``split_train_validation_indices`` (which falls back to ``np.arange(n)`` -- one row
     per "game" -- when ``game_seed`` is absent, which is safe there because it only affects
@@ -15197,21 +15239,25 @@ def _normalize_weights_per_game(data: dict, weights: np.ndarray, *, mode: str = 
         raise ValueError(f"unknown per_game_value_weight_mode {mode!r}")
     normalized = np.empty_like(weights64)
     component_offsets = _validated_component_offsets(data, len(weights64))
+    game_uniform_sampler = bool(
+        tuple(getattr(data, "component_game_sampling_ratios", tuple()))
+    )
     for start, stop in _component_row_ranges(component_offsets, len(weights64)):
-        _unique_seeds, inverse = np.unique(
-            seeds[start:stop], return_inverse=True
+        _unique_seeds, inverse, game_row_counts = np.unique(
+            seeds[start:stop], return_inverse=True, return_counts=True
         )
         game_totals = np.zeros(len(_unique_seeds), dtype=np.float64)
         np.add.at(game_totals, inverse, weights64[start:stop])
-        safe_totals = np.where(game_totals > 0.0, game_totals, 1.0)
+        game_mass = (
+            game_totals / game_row_counts.astype(np.float64)
+            if game_uniform_sampler
+            else game_totals
+        )
+        safe_mass = np.where(game_mass > 0.0, game_mass, 1.0)
         if mode == "sqrt":
-            # EXP3: divide by sqrt(game_total) -> a game of summed-weight W
-            # contributes sqrt(W) total mass (with unit base weights, W ==
-            # n_value_rows), the effective-sample-size correction for correlated
-            # in-game value labels.
-            denominator = np.sqrt(safe_totals)
+            denominator = np.sqrt(safe_mass)
         else:
-            denominator = safe_totals
+            denominator = safe_mass
         normalized[start:stop] = weights64[start:stop] / denominator[inverse]
     return normalized.astype(np.float32, copy=False)
 

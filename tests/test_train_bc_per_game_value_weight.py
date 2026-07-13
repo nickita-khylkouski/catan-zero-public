@@ -123,7 +123,9 @@ def test_per_game_value_weight_composes_with_forced_row_and_multiplier() -> None
     data = {
         "action_taken": np.zeros(5, dtype=np.int16),
         "game_seed": game_seed,
-        "value_weight_multiplier": np.asarray([1.0, 0.5, 2.0, 1.0, 1.0], dtype=np.float32),
+        "value_weight_multiplier": np.asarray(
+            [1.0, 0.5, 2.0, 1.0, 1.0], dtype=np.float32
+        ),
         "legal_action_ids": _legal_action_ids([1, 3, 2, 3, 1]),
     }
 
@@ -197,6 +199,39 @@ def test_composite_reused_seed_is_two_independent_games() -> None:
     assert quality["n_games"] == 2
     assert quality["rows_per_game"] == {"min": 2, "max": 3, "mean": 2.5}
     assert quality["total_weight_per_game"]["std"] == pytest.approx(0.0, abs=1e-6)
+
+
+@pytest.mark.parametrize("mode", ["equal", "sqrt"])
+def test_v2_game_uniform_sampler_is_not_double_corrected_for_length(mode: str) -> None:
+    """V2 already selects games uniformly before selecting an in-game row."""
+
+    class _CompositeV2(dict):
+        component_offsets = (0, 1, 5)
+        component_game_sampling_ratios = (0.5, 0.5)
+
+    data = _CompositeV2(
+        action_taken=np.zeros(5, dtype=np.int16),
+        # One one-row game and one four-row game in distinct components.
+        game_seed=np.asarray([7, 7, 7, 7, 7], dtype=np.int64),
+    )
+    weights = build_value_sample_weights(
+        data,
+        per_game_value_weight=True,
+        per_game_value_weight_mode=mode,
+    )
+    # Effective mass is sampler probability times loss weight. With uniform
+    # base weights, neither correction mode should invent a length bias.
+    short_mass = 0.5 * float(weights[0])
+    long_mass = 0.5 * float(np.mean(weights[1:]))
+    assert short_mass == pytest.approx(long_mass)
+    quality = per_game_weight_quality(data, weights)
+    assert quality["sampling_measure"] == (
+        "component_then_uniform_game_then_uniform_row"
+    )
+    assert quality["total_weight_per_game"]["std"] > 0.0
+    assert quality["sampler_adjusted_weight_per_game"]["std"] == pytest.approx(
+        0.0, abs=1e-6
+    )
 
 
 def test_invalid_composite_offsets_fail_closed() -> None:

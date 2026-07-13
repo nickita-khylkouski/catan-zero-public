@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 
 from tools.train_bc import (
+    _objective_measure_validation_aggregate,
     evaluate_composite_validation_measure,
     objective_matched_validation_component_metrics,
     objective_matched_validation_metrics,
@@ -27,9 +28,9 @@ class _Composite:
         return self._game_seed
 
     def component_indices_for_rows(self, rows) -> np.ndarray:
-        return np.searchsorted(
-            self.component_offsets, np.asarray(rows), side="right"
-        ) - 1
+        return (
+            np.searchsorted(self.component_offsets, np.asarray(rows), side="right") - 1
+        )
 
 
 def test_objective_matched_validation_is_component_then_game_then_row() -> None:
@@ -81,7 +82,9 @@ def test_objective_matched_validation_rejects_missing_component_holdout() -> Non
         raise AssertionError("missing authenticated validation component was accepted")
 
 
-def test_downstream_metric_selector_prefers_matched_and_falls_back_historically() -> None:
+def test_downstream_metric_selector_prefers_matched_and_falls_back_historically() -> (
+    None
+):
     epoch = {
         "validation": {"loss": 99.0},
         "validation_objective_matched": {
@@ -90,9 +93,9 @@ def test_downstream_metric_selector_prefers_matched_and_falls_back_historically(
         },
     }
     assert objective_matched_validation_metrics(epoch) == {"loss": 4.0}
-    assert objective_matched_validation_metrics(
-        {"validation": {"loss": 2.0}}
-    ) == {"loss": 2.0}
+    assert objective_matched_validation_metrics({"validation": {"loss": 2.0}}) == {
+        "loss": 2.0
+    }
 
 
 def test_downstream_component_selector_requires_authenticated_wrapper() -> None:
@@ -155,6 +158,68 @@ def test_objective_measure_aggregates_weight_density_before_dividing() -> None:
     assert report["metrics"]["raw_batch_mean_loss"] == 5.0
 
 
+def test_exact_total_loss_reconstruction_includes_zero_weight_belief_term() -> None:
+    """An always-reported zero-weight term must not disable reconstruction.
+
+    Both reports contain 100 rows.  The first game has one active policy row at
+    loss 10; the second has 100 active rows at loss 0.  Averaging their already
+    normalised total losses gives 5.25, while the configured population
+    objective is 10 / 101 + 0.25 = 0.3490099.
+    """
+
+    coefficient_keys = (
+        "policy_loss",
+        "value_loss",
+        "final_vp_loss",
+        "q_loss",
+        "policy_kl_anchor_loss",
+        "value_uncertainty_loss",
+        "aux_subgoal_loss",
+        "belief_resource_loss",
+        "moe_balance_loss",
+        "value_categorical_loss",
+    )
+    coefficients = {key: 0.0 for key in coefficient_keys}
+    coefficients.update({"policy_loss": 1.0, "value_loss": 0.25})
+
+    def report(*, policy_loss: float, policy_rows: float) -> dict:
+        losses = {key: 0.0 for key in coefficient_keys}
+        losses.update({"policy_loss": policy_loss, "value_loss": 1.0})
+        denominators = {key: 0.0 for key in coefficient_keys}
+        denominators.update({"policy_loss": policy_rows, "value_loss": 100.0})
+        return {
+            "samples": 100,
+            "loss": policy_loss + 0.25,
+            "raw_batch_mean_loss": policy_loss + 0.25,
+            "component_reconstructed_loss": policy_loss + 0.25,
+            "scalar_value_mse_diagnostic": 1.0,
+            "primary_value_loss": 1.0,
+            "loss_denominators": denominators,
+            "objective_coefficients": coefficients,
+            **losses,
+        }
+
+    metrics, sufficient = _objective_measure_validation_aggregate(
+        [
+            report(policy_loss=10.0, policy_rows=1.0),
+            report(policy_loss=0.0, policy_rows=100.0),
+        ],
+        np.asarray([0.5, 0.5]),
+    )
+
+    expected_policy = 10.0 / 101.0
+    expected_total = expected_policy + 0.25
+    assert metrics["raw_batch_mean_loss"] == pytest.approx(5.25)
+    assert metrics["policy_loss"] == pytest.approx(expected_policy)
+    assert metrics["value_loss"] == pytest.approx(1.0)
+    assert metrics["scalar_value_mse_diagnostic"] == pytest.approx(1.0)
+    assert metrics["primary_value_loss"] == pytest.approx(1.0)
+    assert metrics["component_reconstructed_loss"] == pytest.approx(expected_total)
+    assert metrics["loss"] == pytest.approx(expected_total)
+    assert sufficient is not None
+    assert "belief_resource_loss" in sufficient
+
+
 def test_objective_matched_validation_excludes_value_only_replay_policy_ce() -> None:
     data = _Composite()
     data.policy_distillation_scope_authenticated = True
@@ -166,7 +231,9 @@ def test_objective_matched_validation_excludes_value_only_replay_policy_ce() -> 
             "samples": int(len(indices)),
             "loss": 0.0 if replay else 2.0,
             "policy_loss": 0.0 if replay else 2.0,
-            "loss_denominators": {"policy_loss": 0.0 if replay else float(len(indices))},
+            "loss_denominators": {
+                "policy_loss": 0.0 if replay else float(len(indices))
+            },
             "objective_coefficients": {"policy_loss": 1.0},
         }
 

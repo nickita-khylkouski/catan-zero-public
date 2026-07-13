@@ -74,7 +74,12 @@ signal. `loser_sample_weight=1` won the controlled comparison.
   redesigned.
 - Training optimizes raw scalar MSE, but search consumes `tanh(raw_value)`. A
   matched tanh-vs-clip calibration probe is still required; offline raw MSE does
-  not adjudicate the deployed value operator.
+  not adjudicate the deployed value operator. This can reverse a ranking even
+  when both agents later share the same search operator: for target `+1`, raw
+  predictions `0.9` and `1.2` have MSE `0.01` and `0.04`, but after tanh their
+  squared errors are about `0.0807` and `0.0276`. Dose adjudication therefore
+  uses deployed tanh as primary and repeats the same short/full/f7 seeds with
+  clip only as an operator-sensitivity diagnostic.
 
 ## Learner implementation audit
 
@@ -96,6 +101,14 @@ signal. `loser_sample_weight=1` won the controlled comparison.
 | Composite validation cap | A row-count validation cap can split a game and invalidate the signed game-disjoint validation sentinel. The first geometry command mistakenly requested 8,192 rows despite supplying the sentinel. | Planner and trainer now require `--validation-max-samples 0` for authenticated composites; the sentinel is the sole validation bound (`30b669f`). |
 | Validation aggregation | Objective-matched validation now aggregates sufficient statistics; legacy raw `validation.loss` is a row-concatenated diagnostic and not promotion evidence. | Confirmed. |
 | Head weight decay | Requested zero-weight optional heads previously changed despite no objective. | Fixed (`e81ffb2`). |
+| Composite per-game weighting | Numeric `game_seed` values were treated as globally unique. The same seed in two corpus components was merged into one game for equal/sqrt weighting and quality telemetry. | Fixed: game identity is now `(component, game_seed)` and component offsets are validated (`cf54d5a`). |
+| DDP active-fraction telemetry | The active numerator was globally reduced but divided by a rank-local denominator, producing impossible fractions such as `7.95` in an eight-rank report. This did not alter gradients, but it corrupted experimental interpretation. | Fixed: numerator and denominator now share global scope and bounded fractions fail closed (`cf54d5a`). |
+| Diagnostic run receipts | Completed non-promotable runs could retain a launch plan without a final identity binding for checkpoint, report, runtime, optimizer, source code, and finalizer. | Fixed: deterministic finalization/replay receipt binds all run artifacts and the finalizer itself (`efcc94b`, `d9bf335`). |
+| Shared-trunk gradient probe | The probe enabled ordinary diagnostics but had drifted from the separately gated objective-interference cadence, so it could start without emitting its defining measurement. | Fixed: both diagnostic cadences are explicit and tested (`58fb7e6`). |
+| Post-P1 causal-arm planner | Every arm silently inherited the historical 4.19M-row dose despite the matched saturation result, and the planner specified BF16 even though the sealed TEMP baseline and both dose artifacts are FP32. That made a supposed one-axis arm a dose-assumption plus precision change. | Fixed: the existing 0.52M/full checkpoints must select the Pareto dose before any new arm; FP32 and all three component temperatures are now explicit and bound (`a1_post_p1_diagnosis_plan.py`, schema v2). |
+| Objective-matched validation loss | The sufficient-statistic registries omitted `belief_resource_loss`, while every evaluator coefficient map includes it even at zero weight. Exact total-loss reconstruction was therefore never reached: a sparse-policy example reported `5.25` instead of the configured objective `0.3490`. Individual reconstructed policy/value losses and teacher-gap closure remained valid, but aggregate validation loss could mis-rank arms. | Fixed: reconstruct every objective term, then derive total/scalar/primary aliases from the same measure; regression covers the 5.25-to-0.3490 failure. Training gradients/checkpoints were unaffected. |
+| Composite-v2 per-game weighting | V2 already samples `component -> game -> row`. The loss normalizer still divided by summed in-game weight, the formula for uniform-row sampling, so enabling equal/sqrt per-game weighting applied a second inverse-length correction. A 1-row and 4-row game went from 50/50 sampling mass to 80/20 (`equal`) or 67/33 (`sqrt`). | Fixed: v2 normalizes mean in-game weight; v1/ordinary uniform-row behavior stays unchanged. Telemetry now reports sampler-adjusted game mass so raw row totals cannot be mistaken for the optimized measure. P0/TEMP had both flags off and was unaffected. |
+| Replay objective scope | A replay `z` is conditional on the old policy's continuation, while its stored search policy is an older teacher. An initial planner edit removed both at once and mislabeled that two-axis treatment as the TEMP control. The known winning TEMP artifact actually trained policy and value on all three components. | Fixed in the causal plan: `TEMP_CONTROL` exactly preserves all-component policy/value scope; `CURRENT_POLICY_SCOPE` and `CURRENT_VALUE_SCOPE` each change one axis. A both-current interaction is forbidden unless both independent arms survive. |
 
 ## Layer/architecture audit
 
@@ -220,7 +233,12 @@ sweep.
 
 ### P2 — highest-information learner arms
 
-Every arm independently reloads f7 and consumes one identical dose:
+Before launching an arm, adjudicate the already-written 524,288-row and
+4,194,304-row checkpoints head-to-head and against exact f7 on common seeds at
+the deployed operator. Select the smallest dose within two percentage points of
+the best paired behavior result. Offline loss cannot authorize continuation to
+the full dose. Then every arm independently reloads f7 and consumes that one
+selected identical dose:
 
 1. TEMP baseline reproduction;
 2. zero-init target gather;
