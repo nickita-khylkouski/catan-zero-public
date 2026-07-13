@@ -38,8 +38,9 @@ def _corpus(
     invalid_target: bool = False,
     event_targets: bool = True,
     teacher_name: str = "gumbel_self_play",
+    name: str = "corpus",
 ) -> Path:
-    root = tmp_path / "corpus"
+    root = tmp_path / name
     root.mkdir()
     counts = np.asarray([2, 1, 2, 1], dtype=np.int64)
     offsets = np.concatenate(([0], np.cumsum(counts))).astype(np.int64)
@@ -236,3 +237,17 @@ def test_reader_requests_only_bounded_chunks(tmp_path, monkeypatch):
     monkeypatch.setattr(audit.CorpusReader, "rows_slice", track)
     audit.audit_corpus(root, chunk_rows=2)
     assert maximum == 2
+
+
+def test_parallel_corpus_audit_preserves_input_order_and_serial_payload(tmp_path):
+    first = _corpus(tmp_path, name="first")
+    second = _corpus(tmp_path, event_targets=False, name="second")
+
+    serial = audit.audit_corpora([first, second], chunk_rows=2, workers=1)
+    parallel = audit.audit_corpora([first, second], chunk_rows=2, workers=2)
+
+    assert parallel == serial
+    assert [row["corpus_dir"] for row in parallel] == [
+        str(first.resolve()),
+        str(second.resolve()),
+    ]
