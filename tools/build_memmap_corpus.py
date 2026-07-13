@@ -975,6 +975,7 @@ LOADER_KEYS: tuple[str, ...] = (
     "phase",
     "decision_index",
     "action_mask_version",
+    "adapter_version",
     "winner",
     "terminated",
     "truncated",
