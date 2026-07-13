@@ -433,6 +433,10 @@ def test_schema_boundary_allows_history_only_on_legacy_v2(tmp_path: Path) -> Non
     )
     payload = json.loads(template.read_text())
     payload["schema_version"] = contract.DRAFT_SCHEMA
+    payload["promotion_handoff"] = {
+        "mode": "historical_pre_promotion",
+        "reason": "schema-boundary fixture",
+    }
     draft = tmp_path / "new-wave.json"
     draft.write_text(json.dumps(payload))
     with pytest.raises(contract.ContractError, match="v3 waves require"):
