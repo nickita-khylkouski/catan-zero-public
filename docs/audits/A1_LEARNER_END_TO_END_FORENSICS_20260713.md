@@ -164,14 +164,45 @@ arms are mandatory before interpreting any architecture result.
 
 The f7 policy scores a global state representation against an action embedding,
 but it lacks a direct gather of the target vertex/edge state into the action
-query. This is a plausible spatial-binding ceiling: two actions with similar
-static encodings can require different board-local evidence, and the head asks
-the shared CLS token to preserve all of it.
+query. This is an exact information alias, not merely a capacity suspicion:
+
+- vertex tokens contain no vertex ID or coordinate;
+- edge tokens contain no edge ID or endpoint IDs;
+- the incumbent Transformer adds only a shared type embedding and consumes none
+  of `hex_vertex_ids`, `hex_edge_ids`, or `edge_vertex_ids`;
+- legal actions carry their identity only as one normalized fp16 scalar plus
+  semantic one-hots and 18 handcrafted context values. All 607 scalar IDs are
+  distinct, so this is a poor one-dimensional inductive bias rather than a
+  literal ID collision, but it does not bind an action to its board token.
+
+Consequently, arbitrary within-type permutations of the 54 vertex rows and 72
+edge rows leave f7 logits and value unchanged (apart from approximately `1e-7`
+attention-reduction roundoff) when legal target IDs remain fixed. Connected and
+disconnected road layouts or spatially distinct occupancy states can therefore
+map to the same representation. The executable regression is
+`tests/test_entity_graph_representation_aliasing.py`.
+
+There is a second exact join failure in the player surface. Player tokens carry
+actor/current flags but no absolute or actor-relative seat identity. The global
+token knows the actor/current color and board tokens use fixed-color ownership,
+but the trunk cannot bind each non-actor player's remaining stats to that
+player's board pieces. Permuting the three non-actor/non-current player rows is
+also function-invariant. This matters for relative turn order, opponent strength,
+and trade/robber decisions; it is not repaired by simply widening the same
+set-Transformer.
 
 The correct architecture arm is a **zero-initialized, function-preserving target
 gather**, independently initialized from f7 and trained for the same TEMP dose.
 It must not be chained after another candidate. A gather win would show a binding
 bottleneck; a loss would reject the mechanism without contaminating the baseline.
+The regression proves that a learned nonzero gather breaks the action-local
+vertex/edge alias while leaving the CLS/value alias intact. A separate zero-output
+topology residual is therefore the function-preserving state-side treatment; do
+not bundle it into the gather causal arm. Follow-up identity treatments, also
+without changing f7 at initialization, are zero-initialized actor-relative seat
+embeddings and a zero-initialized categorical action-ID residual. These remain
+lower priority than target gather/topology because the current action scalar is
+injective and seat identity has not yet been isolated by matched behavior.
 
 ### Value readout
 
