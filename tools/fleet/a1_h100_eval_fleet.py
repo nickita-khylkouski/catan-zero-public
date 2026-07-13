@@ -202,12 +202,19 @@ def _evaluation_binding(
 ) -> dict[str, Any]:
     """Bind the causal parent, comparison baseline, and registry incumbent.
 
-    Promotion-grade evaluation is deliberately strict: the candidate's parent,
-    the internal baseline, and the authoritative generator champion must be the
-    same checkpoint.  A different historical baseline is diagnostic-only and
-    requires an explicit typed mode plus a nonempty reason.
+    Ordinary promotion evaluation is deliberately strict: the candidate's
+    parent, the internal baseline, and the authoritative generator champion
+    must be the same checkpoint.  ``branch_challenge`` is the only promotion-
+    eligible exception: it preserves the candidate's older authenticated
+    initializer while requiring the comparison baseline to be the *current*
+    registry incumbent.  A different historical baseline remains diagnostic-
+    only and requires an explicit typed mode plus a nonempty reason.
     """
-    if comparison_mode not in {"promotion_parent", "historical_comparison"}:
+    if comparison_mode not in {
+        "promotion_parent",
+        "branch_challenge",
+        "historical_comparison",
+    }:
         raise FleetError(f"unknown evaluation comparison mode {comparison_mode!r}")
     parent_ref = _checkpoint_ref(candidate_parent)
     baseline_ref = _checkpoint_ref(baseline)
@@ -257,14 +264,40 @@ def _evaluation_binding(
                 "explicit champion c_scale differs from registry incumbent identity"
             )
         promotion_eligible = True
+        binding_schema = "a1-evaluation-baseline-binding-v1"
+    elif comparison_mode == "branch_challenge":
+        if historical_comparison_reason is not None:
+            raise FleetError("branch challenge cannot carry a historical reason")
+        if parent_ref == baseline_ref:
+            raise FleetError(
+                "branch challenge parent must differ from the current incumbent; "
+                "use promotion_parent for a direct child"
+            )
+        if baseline_ref != incumbent_ref:
+            raise FleetError(
+                "branch challenge baseline differs from authoritative registry incumbent"
+            )
+        try:
+            incumbent_c_scale = float(search_config["c_scale"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise FleetError("registry incumbent has no valid c_scale") from error
+        if incumbent_c_scale != float(champion_c_scale):
+            raise FleetError(
+                "explicit champion c_scale differs from registry incumbent identity"
+            )
+        promotion_eligible = True
+        # The schema bump prevents old promotion-parent consumers from silently
+        # interpreting a split parent/baseline binding as an ordinary child.
+        binding_schema = "a1-evaluation-baseline-binding-v2"
     else:
         if not isinstance(historical_comparison_reason, str) or not historical_comparison_reason.strip():
             raise FleetError(
                 "historical comparison requires an explicit nonempty reason"
             )
         promotion_eligible = False
+        binding_schema = "a1-evaluation-baseline-binding-v1"
     return {
-        "schema_version": "a1-evaluation-baseline-binding-v1",
+        "schema_version": binding_schema,
         "comparison_mode": comparison_mode,
         "promotion_eligible": promotion_eligible,
         "historical_comparison_reason": historical_comparison_reason,
@@ -2233,7 +2266,7 @@ def _parser() -> argparse.ArgumentParser:
     plan.add_argument("--registry", type=Path, required=True)
     plan.add_argument(
         "--comparison-mode",
-        choices=("promotion_parent", "historical_comparison"),
+        choices=("promotion_parent", "branch_challenge", "historical_comparison"),
         default="promotion_parent",
     )
     plan.add_argument("--historical-comparison-reason")

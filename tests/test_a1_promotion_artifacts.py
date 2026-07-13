@@ -1206,6 +1206,43 @@ def test_evidence_prewrite_replays_transaction_validator(
     assert not called[0].exists()
 
 
+def test_branch_evidence_builder_requires_two_strict_internal_cohorts(
+    tmp_path: Path,
+) -> None:
+    candidate, champion = _checkpoints(tmp_path)
+    cohort_1 = tmp_path / "cohort-1.json"
+    cohort_2 = tmp_path / "cohort-2.json"
+    _json(cohort_1, {"cohort": 1})
+    _json(cohort_2, {"cohort": 2})
+
+    value = artifacts.build_evidence_envelope(
+        kind="internal_h2h",
+        contract=_contract(),
+        candidate=candidate,
+        champion=champion,
+        sources=[
+            ("internal_h2h_cohort_1", cohort_1),
+            ("internal_h2h_cohort_2", cohort_2),
+        ],
+        promotion_mode="branch_challenge",
+    )
+
+    assert value["verdict"] == "H1"
+    assert value["result"] == {
+        "required_fresh_cohorts": 2,
+        "strict_superiority": True,
+    }
+    with pytest.raises(artifacts.ArtifactBuildError, match="two fresh"):
+        artifacts.build_evidence_envelope(
+            kind="internal_h2h",
+            contract=_contract(),
+            candidate=candidate,
+            champion=champion,
+            sources=[("internal_h2h", cohort_1)],
+            promotion_mode="branch_challenge",
+        )
+
+
 def test_adjudication_builder_derives_every_third_requirement(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1259,6 +1296,64 @@ def test_adjudication_builder_derives_every_third_requirement(
     assert value["champion"]["agent_identity"]["search_config"]["c_scale"] == 0.03
     digest = value.pop("adjudication_sha256")
     assert digest == promotion._digest_value(value)
+
+
+def test_branch_adjudication_builder_records_initializer_and_displaced_incumbent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        promotion, "_candidate_search_config", lambda _contract: {"c_scale": 0.10}
+    )
+    monkeypatch.setattr(
+        promotion,
+        "_incumbent_search_config",
+        lambda _contract, **_kwargs: {"c_scale": 0.10},
+    )
+    candidate, champion = _checkpoints(tmp_path)
+    parent = tmp_path / "f7-parent.pt"
+    parent.write_bytes(b"older initializer")
+    report = tmp_path / "training.json"
+    _json(
+        report,
+        {
+            "init_checkpoint": str(parent),
+            "init_checkpoint_sha256": promotion._sha256(parent),
+        },
+    )
+    receipt = tmp_path / "receipt.json"
+    _json(receipt, {"receipt": True})
+    pointer = tmp_path / "CURRENT_CHAMPION"
+    pointer.write_text(str(champion.resolve()) + "\n", encoding="utf-8")
+    evidence = []
+    for kind in sorted(promotion.REQUIRED_EVIDENCE_KINDS):
+        path = tmp_path / f"{kind}.json"
+        _json(path, {"kind": kind})
+        evidence.append((kind, path))
+
+    value = artifacts.build_adjudication(
+        contract=_contract(),
+        contract_lock=tmp_path / "contract.json",
+        training_receipt=receipt,
+        registry=ChampionRegistry(tmp_path / "registry.json"),
+        current_pointer=pointer,
+        candidate=candidate,
+        candidate_version=6,
+        training_report=report,
+        champion=champion,
+        champion_version=5,
+        evidence=evidence,
+        nth_confirmation=None,
+        promotion_mode="branch_challenge",
+    )
+
+    assert value["schema_version"] == promotion.BRANCH_CHALLENGE_ADJUDICATION_SCHEMA
+    assert value["promotion_mode"] == "branch_challenge"
+    assert value["candidate_lineage"]["initializer"] == artifacts._checkpoint_ref(
+        parent
+    )
+    assert value["candidate_lineage"]["displaced_incumbent"]["sha256"] == (
+        promotion._sha256(champion)
+    )
 
 
 def test_adjudication_builder_refuses_missing_evidence(tmp_path: Path) -> None:

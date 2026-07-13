@@ -227,12 +227,17 @@ def _fixture(
     promotion_count: int = 0,
     n_full: int = 128,
     champion: Path | None = None,
+    branch_parent: Path | None = None,
 ) -> dict:
     champion = champion or tmp_path / "champion.pt"
     candidate = tmp_path / "candidate.pt"
     champion.parent.mkdir(parents=True, exist_ok=True)
     champion.write_bytes(b"incumbent checkpoint")
     candidate.write_bytes(b"candidate checkpoint")
+    if branch_parent is not None:
+        branch_parent.parent.mkdir(parents=True, exist_ok=True)
+        if not branch_parent.exists():
+            branch_parent.write_bytes(b"older authenticated initializer")
     registry_path = tmp_path / "registry.json"
     registry = ChampionRegistry(registry_path)
     registry.set_role(
@@ -256,12 +261,36 @@ def _fixture(
     pointer.write_text(str(champion.resolve()) + "\n", encoding="utf-8")
     contract_path = tmp_path / "contract.lock.json"
     contract_path.write_text("{}\n", encoding="utf-8")
-    contract = _contract(n_full=n_full, producer=champion)
+    producer = branch_parent or champion
+    promotion_mode = "branch_challenge" if branch_parent is not None else "promotion_parent"
+    contract = _contract(n_full=n_full, producer=producer)
     # The n196 negative fixture must still be constructible so execution can
     # prove the contract is rejected before any mutation/evidence processing.
-    evidence_contract = contract if n_full == 128 else _contract(n_full=128, producer=champion)
+    evidence_contract = (
+        contract if n_full == 128 else _contract(n_full=128, producer=producer)
+    )
     evidence_semantics = promotion._sealed_evaluation_semantics(evidence_contract)
     candidate_search_config = promotion._candidate_search_config(evidence_contract)
+    if branch_parent is not None:
+        seeded_incumbent_config = dict(evidence_semantics)
+        seeded_incumbent_config["c_scale"] = candidate_search_config["c_scale"]
+        seeded_incumbent_identity = promotion._agent_identity(
+            _checkpoint_ref(champion), seeded_incumbent_config
+        )
+        registry.set_role(
+            "generator_champion",
+            champion,
+            expected_md5=promotion._md5(champion),
+            version=4,
+            provenance={
+                "a1_candidate_agent_identity_sha256": seeded_incumbent_identity[
+                    "agent_identity_sha256"
+                ],
+                "a1_candidate_search_config": seeded_incumbent_config,
+            },
+            reason="fixture branch incumbent identity",
+        )
+        registry.save()
     champion_search_config = promotion._incumbent_search_config(
         evidence_contract,
         registry=registry,
@@ -286,11 +315,15 @@ def _fixture(
     )
     registry.save()
     evaluation_binding = {
-        "schema_version": "a1-evaluation-baseline-binding-v1",
-        "comparison_mode": "promotion_parent",
+        "schema_version": (
+            "a1-evaluation-baseline-binding-v2"
+            if branch_parent is not None
+            else "a1-evaluation-baseline-binding-v1"
+        ),
+        "comparison_mode": promotion_mode,
         "promotion_eligible": True,
         "historical_comparison_reason": None,
-        "candidate_parent": _checkpoint_ref(champion),
+        "candidate_parent": _checkpoint_ref(producer),
         "baseline": _checkpoint_ref(champion),
         "registry": _checkpoint_ref(registry_path),
         "authoritative_incumbent": {
@@ -326,6 +359,7 @@ def _fixture(
             "epochs": 1,
             "max_steps": 0,
             "checkpoint": str(candidate),
+            "init_checkpoint": str(producer),
             "init_checkpoint_sha256": contract["checkpoints"][0]["sha256"],
             one_dose.REPORT_EXECUTION_BINDING_FIELD: execution_binding,
         },
@@ -467,8 +501,33 @@ def _fixture(
             "pair_diagnostics": pair_diagnostics,
             "pentanomial_sprt": pentanomial,
             "verdict": "H1",
+            **(
+                {
+                    "superiority_pentanomial_sprt": promotion.evaluate_pentanomial_sprt(
+                        pair_scores,
+                        elo0=0.0,
+                        elo1=15.0,
+                        alpha=0.05,
+                        beta=0.05,
+                    ),
+                    "superiority_verdict": "H1",
+                }
+                if branch_parent is not None
+                else {}
+            ),
         },
     )
+    branch_internal_sources: list[tuple[str, Path]] | None = None
+    if branch_parent is not None:
+        second_internal_source = tmp_path / "internal_h2h.cohort2.raw.json"
+        second_payload = json.loads(internal_source.read_text(encoding="utf-8"))
+        for game in second_payload["games"]:
+            game["game_seed"] += 10_000
+        _write_json(second_internal_source, second_payload)
+        branch_internal_sources = [
+            ("internal_h2h_cohort_1", internal_source),
+            ("internal_h2h_cohort_2", second_internal_source),
+        ]
 
     external_sources = []
     planned_engine_identity = {
@@ -836,7 +895,19 @@ def _fixture(
             "pass",
             {"value_readout": "scalar", "max_rmse_regression": 0.02},
         ),
-        "internal_h2h": ([("internal_h2h", internal_source)], "H1", {}),
+        "internal_h2h": (
+            (
+                [("internal_h2h", internal_source)]
+                if branch_internal_sources is None
+                else branch_internal_sources
+            ),
+            "H1",
+            (
+                {}
+                if branch_parent is None
+                else {"required_fresh_cohorts": 2, "strict_superiority": True}
+            ),
+        ),
         "external_panel": (
             external_sources,
             "pass",
@@ -888,7 +959,11 @@ def _fixture(
             "sha256": promotion._sha256(nth_source),
         }
     adjudication = {
-        "schema_version": promotion.ADJUDICATION_SCHEMA,
+        "schema_version": (
+            promotion.BRANCH_CHALLENGE_ADJUDICATION_SCHEMA
+            if branch_parent is not None
+            else promotion.ADJUDICATION_SCHEMA
+        ),
         "passed": True,
         "decision": "promote",
         "contract_sha256": contract["contract_sha256"],
@@ -917,6 +992,19 @@ def _fixture(
         "nth_confirmation": nth_confirmation,
         "evidence": evidence,
     }
+    if branch_parent is not None:
+        adjudication["promotion_mode"] = "branch_challenge"
+        adjudication["candidate_lineage"] = {
+            "schema_version": promotion.BRANCH_CHALLENGE_LINEAGE_SCHEMA,
+            "initializer": _checkpoint_ref(branch_parent),
+            "displaced_incumbent": {
+                **_checkpoint_ref(champion),
+                "version": 4,
+                "agent_identity_sha256": champion_identity[
+                    "agent_identity_sha256"
+                ],
+            },
+        }
     adjudication["adjudication_sha256"] = promotion._digest_value(adjudication)
     adjudication_path = tmp_path / "adjudication.json"
     _write_json(adjudication_path, adjudication)
@@ -955,6 +1043,7 @@ def _fixture(
         "adjudication": adjudication_path,
         "report": report_path,
         "training_receipt": training_receipt,
+        "branch_parent": branch_parent,
         "cohort_exclusions": cohort_exclusions_path,
         "receipt": tmp_path / "promotion.receipt.json",
         "lock": registry_path.with_suffix(registry_path.suffix + ".a1.lock"),
@@ -1395,6 +1484,173 @@ def test_historical_comparison_cannot_be_used_as_promotion_baseline(
         promotion.PromotionError, match="not a promotion-parent evaluation binding"
     ):
         _execute(fixture, go=False)
+
+
+def test_branch_challenge_dry_run_authenticates_older_parent_and_incumbent(
+    tmp_path: Path,
+) -> None:
+    parent = tmp_path / "f7-parent.pt"
+    fixture = _fixture(tmp_path, branch_parent=parent)
+
+    plan = _execute(fixture, go=False)
+
+    assert plan["status"] == "dry_run"
+    adjudication = json.loads(fixture["adjudication"].read_text(encoding="utf-8"))
+    assert adjudication["promotion_mode"] == "branch_challenge"
+    assert adjudication["candidate_lineage"]["initializer"] == _checkpoint_ref(parent)
+    assert adjudication["candidate_lineage"]["displaced_incumbent"]["sha256"] == (
+        promotion._sha256(fixture["champion"])
+    )
+
+
+def test_branch_challenge_rejects_unbound_initializer(tmp_path: Path) -> None:
+    parent = tmp_path / "f7-parent.pt"
+    fixture = _fixture(tmp_path, branch_parent=parent)
+    unrelated = tmp_path / "unrelated.pt"
+    unrelated.write_bytes(b"not the candidate initializer")
+    adjudication = json.loads(fixture["adjudication"].read_text(encoding="utf-8"))
+    adjudication["candidate_lineage"]["initializer"] = _checkpoint_ref(unrelated)
+    adjudication.pop("adjudication_sha256")
+    adjudication["adjudication_sha256"] = promotion._digest_value(adjudication)
+    _write_json(fixture["adjudication"], adjudication)
+
+    with pytest.raises(
+        promotion.PromotionError,
+        match="candidate_lineage.initializer does not bind",
+    ):
+        _execute(fixture, go=False)
+
+
+def test_branch_challenge_rejects_historical_evaluation_binding(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path, branch_parent=tmp_path / "f7-parent.pt")
+
+    def make_historical(source: dict) -> None:
+        binding = source["evaluation_binding"]
+        binding["schema_version"] = "a1-evaluation-baseline-binding-v1"
+        binding["comparison_mode"] = "historical_comparison"
+        binding["promotion_eligible"] = False
+        binding["historical_comparison_reason"] = "diagnostic only"
+
+    _mutate_evidence_source(
+        fixture,
+        kind="internal_h2h",
+        role="internal_h2h_cohort_1",
+        mutate=make_historical,
+    )
+    with pytest.raises(
+        promotion.PromotionError,
+        match="not a promotion-eligible branch-challenge binding",
+    ):
+        _execute(fixture, go=False)
+
+
+def test_branch_challenge_rejects_baseline_other_than_current_incumbent(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path, branch_parent=tmp_path / "f7-parent.pt")
+
+    def rebind_baseline_to_parent(source: dict) -> None:
+        source["evaluation_binding"]["baseline"] = _checkpoint_ref(
+            fixture["branch_parent"]
+        )
+
+    _mutate_evidence_source(
+        fixture,
+        kind="internal_h2h",
+        role="internal_h2h_cohort_1",
+        mutate=rebind_baseline_to_parent,
+    )
+    with pytest.raises(
+        promotion.PromotionError,
+        match="evaluation_binding.baseline does not bind",
+    ):
+        _execute(fixture, go=False)
+
+
+def test_branch_challenge_rejects_registry_bytes_changed_after_evaluation(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path, branch_parent=tmp_path / "f7-parent.pt")
+    fixture["registry"].write_text(
+        fixture["registry"].read_text(encoding="utf-8") + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(promotion.PromotionError, match="artifact drift"):
+        _execute(fixture, go=False)
+
+
+def test_branch_challenge_external_regression_is_a_hard_veto(tmp_path: Path) -> None:
+    fixture = _fixture(tmp_path, branch_parent=tmp_path / "f7-parent.pt")
+    _set_external_panel_outcomes(fixture, role="candidate_panel", wins=390)
+    _set_external_panel_outcomes(fixture, role="champion_panel", wins=420)
+
+    with pytest.raises(promotion.PromotionError, match="noninferiority is unresolved"):
+        _execute(fixture, go=False)
+
+
+def test_branch_challenge_rejects_unpaired_external_panel(tmp_path: Path) -> None:
+    fixture = _fixture(tmp_path, branch_parent=tmp_path / "f7-parent.pt")
+
+    def change_one_matched_seed(source: dict) -> None:
+        for game in source["games"]:
+            if game["pair_id"] == 0:
+                game["game_seed"] += 999_999
+
+    _mutate_evidence_source(
+        fixture,
+        kind="external_panel",
+        role="candidate_panel",
+        mutate=change_one_matched_seed,
+    )
+    with pytest.raises(
+        promotion.PromotionError, match="different cohorts/configs"
+    ):
+        _execute(fixture, go=False)
+
+
+def test_branch_challenge_rejects_missing_or_tampered_external_panel(
+    tmp_path: Path,
+) -> None:
+    missing = _fixture(tmp_path / "missing", branch_parent=tmp_path / "missing/f7.pt")
+    adjudication = json.loads(missing["adjudication"].read_text(encoding="utf-8"))
+    evidence_ref = next(
+        item for item in adjudication["evidence"] if item["kind"] == "external_panel"
+    )
+    envelope_path = Path(evidence_ref["path"])
+    envelope = json.loads(envelope_path.read_text(encoding="utf-8"))
+    envelope["sources"] = [
+        source for source in envelope["sources"] if source["role"] != "candidate_panel"
+    ]
+    envelope.pop("evidence_sha256")
+    envelope["evidence_sha256"] = promotion._digest_value(envelope)
+    _write_json(envelope_path, envelope)
+    evidence_ref["sha256"] = promotion._sha256(envelope_path)
+    adjudication.pop("adjudication_sha256")
+    adjudication["adjudication_sha256"] = promotion._digest_value(adjudication)
+    _write_json(missing["adjudication"], adjudication)
+    with pytest.raises(promotion.PromotionError, match="source roles mismatch"):
+        _execute(missing, go=False)
+
+    tampered_root = tmp_path / "tampered"
+    tampered = _fixture(tampered_root, branch_parent=tampered_root / "f7.pt")
+    adjudication = json.loads(tampered["adjudication"].read_text(encoding="utf-8"))
+    evidence_ref = next(
+        item for item in adjudication["evidence"] if item["kind"] == "external_panel"
+    )
+    envelope = json.loads(Path(evidence_ref["path"]).read_text(encoding="utf-8"))
+    candidate_source = Path(
+        next(
+            source
+            for source in envelope["sources"]
+            if source["role"] == "candidate_panel"
+        )["path"]
+    )
+    candidate_source.write_text("tampered\n", encoding="utf-8")
+    with pytest.raises(promotion.PromotionError, match="artifact drift"):
+        _execute(tampered, go=False)
 
 
 def test_role_specific_value_squash_diagnostic_cannot_be_promotion_evidence(

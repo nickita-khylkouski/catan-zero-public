@@ -424,6 +424,123 @@ def test_n256_initialized_from_f7_cannot_default_to_gen3_baseline(
     }
 
 
+def test_branch_challenge_binds_older_initializer_and_current_incumbent(
+    tmp_path: Path,
+) -> None:
+    manifest = fleet.load_manifest(_manifest_file(tmp_path))
+    candidate = tmp_path / "n256-candidate.pt"
+    f7_parent = tmp_path / "f7.pt"
+    v5_incumbent = tmp_path / "v5.pt"
+    candidate.write_bytes(b"n256")
+    f7_parent.write_bytes(b"f7")
+    v5_incumbent.write_bytes(b"v5")
+    registry = _registry(tmp_path, v5_incumbent, c_scale=0.10)
+
+    plan = fleet.build_plan(
+        manifest,
+        candidate=candidate,
+        champion=v5_incumbent,
+        candidate_parent=f7_parent,
+        registry=registry,
+        comparison_mode="branch_challenge",
+        internal_pairs=600,
+        external_pairs=500,
+        internal_base_seed=6_193_000_000,
+        external_base_seed=6_193_001_000,
+        candidate_c_scale=0.10,
+        champion_c_scale=0.10,
+        repo_commit="a" * 40,
+        tool_hashes={},
+    )
+    binding = plan["evaluation_binding"]
+    assert binding["schema_version"] == "a1-evaluation-baseline-binding-v2"
+    assert binding["comparison_mode"] == "branch_challenge"
+    assert binding["promotion_eligible"] is True
+    assert binding["historical_comparison_reason"] is None
+    assert binding["candidate_parent"] == fleet._checkpoint_ref(f7_parent)  # noqa: SLF001
+    assert binding["baseline"] == fleet._checkpoint_ref(v5_incumbent)  # noqa: SLF001
+    assert binding["authoritative_incumbent"]["sha256"] == fleet._sha256(  # noqa: SLF001
+        v5_incumbent
+    )
+
+
+def test_branch_challenge_rejects_nonincumbent_baseline(tmp_path: Path) -> None:
+    manifest = fleet.load_manifest(_manifest_file(tmp_path))
+    candidate = tmp_path / "candidate.pt"
+    f7_parent = tmp_path / "f7.pt"
+    stale_baseline = tmp_path / "v4.pt"
+    v5_incumbent = tmp_path / "v5.pt"
+    for path, payload in (
+        (candidate, b"candidate"),
+        (f7_parent, b"f7"),
+        (stale_baseline, b"v4"),
+        (v5_incumbent, b"v5"),
+    ):
+        path.write_bytes(payload)
+    registry = _registry(tmp_path, v5_incumbent, c_scale=0.10)
+    with pytest.raises(
+        fleet.FleetError,
+        match="branch challenge baseline differs from authoritative registry incumbent",
+    ):
+        fleet.build_plan(
+            manifest,
+            candidate=candidate,
+            champion=stale_baseline,
+            candidate_parent=f7_parent,
+            registry=registry,
+            comparison_mode="branch_challenge",
+            internal_pairs=600,
+            external_pairs=500,
+            internal_base_seed=6_194_000_000,
+            external_base_seed=6_194_001_000,
+            candidate_c_scale=0.10,
+            champion_c_scale=0.10,
+            repo_commit="a" * 40,
+            tool_hashes={},
+        )
+
+
+def test_branch_challenge_plan_rejects_registry_drift_after_sealing(
+    tmp_path: Path,
+) -> None:
+    manifest_path = _manifest_file(tmp_path)
+    manifest = fleet.load_manifest(manifest_path)
+    candidate = tmp_path / "candidate.pt"
+    f7_parent = tmp_path / "f7.pt"
+    v5_incumbent = tmp_path / "v5.pt"
+    for path, payload in (
+        (candidate, b"candidate"),
+        (f7_parent, b"f7"),
+        (v5_incumbent, b"v5"),
+    ):
+        path.write_bytes(payload)
+    registry = _registry(tmp_path, v5_incumbent, c_scale=0.10)
+    plan = fleet.build_plan(
+        manifest,
+        candidate=candidate,
+        champion=v5_incumbent,
+        candidate_parent=f7_parent,
+        registry=registry,
+        comparison_mode="branch_challenge",
+        internal_pairs=600,
+        external_pairs=500,
+        internal_base_seed=6_195_000_000,
+        external_base_seed=6_195_001_000,
+        candidate_c_scale=0.10,
+        champion_c_scale=0.10,
+        repo_commit=fleet._git_commit(fleet._REPO_ROOT),  # noqa: SLF001
+        tool_hashes=fleet._tool_hashes(fleet._REPO_ROOT),  # noqa: SLF001
+    )
+    plan_path = tmp_path / "branch.plan.json"
+    plan["plan_hash"] = fleet._digest(  # noqa: SLF001
+        {key: value for key, value in plan.items() if key != "plan_hash"}
+    )
+    plan_path.write_text(json.dumps(plan), encoding="utf-8")
+    registry.path.write_text(registry.path.read_text() + "\n", encoding="utf-8")
+    with pytest.raises(fleet.FleetError, match="registry bytes drifted"):
+        fleet.load_plan(plan_path, manifest)
+
+
 def test_canary_scope_uses_every_gpu_on_one_four_and_one_eight_gpu_host(
     tmp_path: Path,
 ) -> None:

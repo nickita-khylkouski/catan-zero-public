@@ -999,12 +999,15 @@ def build_evidence_envelope(
     candidate: Path,
     champion: Path,
     sources: Sequence[tuple[str, Path]],
+    promotion_mode: str = "promotion_parent",
 ) -> dict[str, Any]:
     if kind not in promotion.REQUIRED_EVIDENCE_KINDS:
         raise ArtifactBuildError(f"unsupported evidence kind {kind!r}")
     roles = [role for role, _path in sources]
     if len(set(roles)) != len(roles):
         raise ArtifactBuildError("evidence source roles must be unique")
+    if promotion_mode not in {"promotion_parent", "branch_challenge"}:
+        raise ArtifactBuildError(f"unsupported promotion mode {promotion_mode!r}")
     verdict = "H1" if kind == "internal_h2h" else "pass"
     result: dict[str, Any]
     if kind == "mechanism_calibration":
@@ -1014,6 +1017,12 @@ def build_evidence_envelope(
         }
     elif kind == "external_panel":
         result = {"max_win_rate_regression": promotion.MAX_EXTERNAL_WIN_RATE_REGRESSION}
+    elif kind == "internal_h2h" and promotion_mode == "branch_challenge":
+        if set(roles) != {"internal_h2h_cohort_1", "internal_h2h_cohort_2"}:
+            raise ArtifactBuildError(
+                "branch challenge requires two fresh internal H2H cohort roles"
+            )
+        result = {"required_fresh_cohorts": 2, "strict_superiority": True}
     else:
         result = {}
     value = {
@@ -1040,6 +1049,8 @@ def _validate_envelope_before_write(
     candidate: Path,
     champion: Path,
     registry: ChampionRegistry,
+    promotion_mode: str = "promotion_parent",
+    candidate_parent: Path | None = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(
@@ -1073,6 +1084,12 @@ def _validate_envelope_before_write(
                 "md5": promotion._md5(champion),  # noqa: SLF001
                 "search_config": champion_search_config,
             },
+            promotion_mode=promotion_mode,
+            candidate_parent=(
+                None
+                if candidate_parent is None
+                else _checkpoint_ref(candidate_parent)
+            ),
         )
     except promotion.PromotionError as error:
         raise ArtifactBuildError(
@@ -1096,7 +1113,10 @@ def build_adjudication(
     champion_version: int,
     evidence: Sequence[tuple[str, Path]],
     nth_confirmation: Path | None,
+    promotion_mode: str = "promotion_parent",
 ) -> dict[str, Any]:
+    if promotion_mode not in {"promotion_parent", "branch_challenge"}:
+        raise ArtifactBuildError(f"unsupported promotion mode {promotion_mode!r}")
     by_kind = dict(evidence)
     if (
         len(by_kind) != len(evidence)
@@ -1125,7 +1145,11 @@ def build_adjudication(
     candidate_ref = _checkpoint_ref(candidate)
     champion_ref = _checkpoint_ref(champion)
     value = {
-        "schema_version": promotion.ADJUDICATION_SCHEMA,
+        "schema_version": (
+            promotion.BRANCH_CHALLENGE_ADJUDICATION_SCHEMA
+            if promotion_mode == "branch_challenge"
+            else promotion.ADJUDICATION_SCHEMA
+        ),
         "passed": True,
         "decision": "promote",
         "contract_sha256": contract["contract_sha256"],
@@ -1168,6 +1192,39 @@ def build_adjudication(
             for kind in sorted(by_kind)
         ],
     }
+    if promotion_mode == "branch_challenge":
+        report_path = training_report.expanduser().resolve()
+        report = _load_json(report_path)
+        init_path_raw = report.get("init_checkpoint")
+        init_sha = report.get("init_checkpoint_sha256")
+        if not isinstance(init_path_raw, str) or not init_path_raw:
+            raise ArtifactBuildError(
+                "branch challenge training report has no initializer path"
+            )
+        init_path = Path(init_path_raw).expanduser()
+        if not init_path.is_absolute():
+            init_path = report_path.parent / init_path
+        init_ref = _checkpoint_ref(init_path)
+        if init_ref["sha256"] != init_sha:
+            raise ArtifactBuildError(
+                "branch challenge training report initializer hash drift"
+            )
+        if init_ref["sha256"] == champion_ref["sha256"]:
+            raise ArtifactBuildError(
+                "branch challenge initializer must differ from displaced incumbent"
+            )
+        value["promotion_mode"] = "branch_challenge"
+        value["candidate_lineage"] = {
+            "schema_version": promotion.BRANCH_CHALLENGE_LINEAGE_SCHEMA,
+            "initializer": init_ref,
+            "displaced_incumbent": {
+                **champion_ref,
+                "version": champion_version,
+                "agent_identity_sha256": value["champion"]["agent_identity"][
+                    "agent_identity_sha256"
+                ],
+            },
+        }
     value["adjudication_sha256"] = promotion._digest_value(value)  # noqa: SLF001
     return value
 
@@ -1345,6 +1402,16 @@ def _parser() -> argparse.ArgumentParser:
     evidence.add_argument("--legacy-contract-attestation", type=Path)
     evidence.add_argument("--candidate", type=Path, required=True)
     evidence.add_argument("--champion", type=Path, required=True)
+    evidence.add_argument(
+        "--promotion-mode",
+        choices=("promotion_parent", "branch_challenge"),
+        default="promotion_parent",
+    )
+    evidence.add_argument(
+        "--candidate-parent",
+        type=Path,
+        help="authenticated older initializer for branch_challenge evidence",
+    )
     evidence.add_argument("--registry", type=Path, required=True)
     evidence.add_argument("--source", action="append", default=[], metavar="ROLE=PATH")
     evidence.add_argument("--out", type=Path, required=True)
@@ -1374,6 +1441,11 @@ def _parser() -> argparse.ArgumentParser:
     adjudicate.add_argument("--training-report", type=Path, required=True)
     adjudicate.add_argument("--champion", type=Path, required=True)
     adjudicate.add_argument("--champion-version", type=int, required=True)
+    adjudicate.add_argument(
+        "--promotion-mode",
+        choices=("promotion_parent", "branch_challenge"),
+        default="promotion_parent",
+    )
     adjudicate.add_argument(
         "--evidence", action="append", default=[], metavar="KIND=PATH"
     )
@@ -1434,7 +1506,22 @@ def main(argv: Sequence[str] | None = None) -> int:
                 candidate=args.candidate,
                 champion=args.champion,
                 sources=sources,
+                promotion_mode=args.promotion_mode,
             )
+            if (
+                args.promotion_mode == "branch_challenge"
+                and args.candidate_parent is None
+            ):
+                raise ArtifactBuildError(
+                    "branch_challenge evidence requires --candidate-parent"
+                )
+            if (
+                args.promotion_mode == "promotion_parent"
+                and args.candidate_parent is not None
+            ):
+                raise ArtifactBuildError(
+                    "--candidate-parent is only valid for branch_challenge"
+                )
             _validate_envelope_before_write(
                 args.out,
                 value=value,
@@ -1443,6 +1530,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 candidate=args.candidate,
                 champion=args.champion,
                 registry=ChampionRegistry.load(args.registry),
+                promotion_mode=args.promotion_mode,
+                candidate_parent=args.candidate_parent,
             )
         elif args.command == "cohort-exclusions":
             value = build_cohort_exclusions(
@@ -1470,6 +1559,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 champion_version=args.champion_version,
                 evidence=_parse_role_paths(args.evidence, option="--evidence"),
                 nth_confirmation=args.nth_confirmation,
+                promotion_mode=args.promotion_mode,
             )
             # Transaction replay is the final authority.  Use a temporary file
             # because the verifier deliberately consumes a path.
