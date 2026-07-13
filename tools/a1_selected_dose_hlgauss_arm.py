@@ -52,7 +52,7 @@ TREATMENT_RUNTIME_DIFF_FILES = (
     "tools/train_bc.py",
 )
 TREATMENT_RUNTIME_DIFF_SHA256 = (
-    "sha256:151adf4e237e5c2e8b6985551fb55acd5df4d397fd8273ac1b3c672a43785fe1"
+    "sha256:dcea590bc1a409491186f49fd905a3dde1f395ea162cc2a08a4b2a799c0cf54a"
 )
 SOURCE_FILES = tuple(dict.fromkeys(
     (EXECUTOR_RELATIVE_PATH,)
