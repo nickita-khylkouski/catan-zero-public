@@ -136,6 +136,9 @@ def test_cropped_entity_batch_skips_event_payload_and_refuses_live_mask(
         key: np.zeros((2, 1), dtype=np.float32)
         for key in train_bc.ENTITY_BATCH_KEYS
     }
+    # The public-award compatibility bridge validates the real player-token
+    # rank/feature contract even when this test is focused on event cropping.
+    data["player_tokens"] = np.zeros((2, 4, 31), dtype=np.float32)
     data["event_tokens"] = RefusingEventTokens()
     data["event_target_ids"] = np.full((2, 64, 4), -1, dtype=np.int16)
     data["event_mask"] = np.zeros((2, 64), dtype=np.bool_)

@@ -1814,8 +1814,8 @@ def build_memmap_corpus(
     if selected_manifest is not None:
         if selected_source_tracker.duplicate_count:
             raise SystemExit(
-                "selected game_seed starts more than one distinct "
-                f"raw-source run for {selected_source_tracker.duplicate_count} seed(s)"
+                "selected game_seed starts more than one non-contiguous raw-source run "
+                f"for {selected_source_tracker.duplicate_count} seed(s)"
             )
         missing = expected_selected_seed_set - observed_selected_seed_set
         unexpected = observed_selected_seed_set - expected_selected_seed_set
