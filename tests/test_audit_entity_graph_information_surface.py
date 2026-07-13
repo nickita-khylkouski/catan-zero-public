@@ -52,6 +52,16 @@ def test_target_gather_removes_action_alias_but_not_state_topology_alias() -> No
     assert report["critical_information_bottlenecks"] == []
 
 
+def test_topology_adapter_and_gather_remove_both_spatial_aliases() -> None:
+    report = build_report(
+        _base(topology_residual_adapter=True, action_target_gather=True)
+    )
+    assert report["architecture"]["topology_consumed"] is True
+    assert report["architecture"]["topology_residual_adapter"] is True
+    assert report["architecture"]["action_target_bound"] is True
+    assert not any("topology" in item for item in report["architecture"]["limitations"])
+
+
 def test_physical_v1_event_columns_are_unverified_without_exact_scan() -> None:
     report = build_report(_base(), {"implicit_zero_columns": []})
     assert report["corpus"]["event_history_trainable"] is None

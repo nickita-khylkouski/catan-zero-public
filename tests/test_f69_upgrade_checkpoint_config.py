@@ -30,6 +30,7 @@ _LATER_FIELDS = (
     "action_target_gather",
     "action_cross_attention_layers",
     "value_attention_pool",
+    "topology_residual_adapter",
 )
 _OVERRIDES = {
     "action_target_gather": True,
@@ -85,6 +86,19 @@ def test_build_upgraded_config_preserves_a_full_config():
     assert upgraded.hidden_size == 512
     assert upgraded.action_cross_attention_layers == 2
     assert dataclasses.replace(base, **_OVERRIDES) == upgraded
+
+
+def test_topology_upgrade_flag_is_explicit_and_default_off():
+    base = EntityGraphConfig(action_size=607, static_action_feature_size=1)
+    assert base.topology_residual_adapter is False
+    overrides = upgrade_tool._parse_flags("gather,topology")
+    assert overrides == {
+        "action_target_gather": True,
+        "topology_residual_adapter": True,
+    }
+    upgraded = upgrade_tool._build_upgraded_config(base, overrides)
+    assert upgraded.action_target_gather is True
+    assert upgraded.topology_residual_adapter is True
 
 
 def test_preserve_source_top_level_keys_restores_mask_hidden_info(tmp_path):
@@ -193,3 +207,50 @@ def test_upgrade_seed_is_deterministic_and_durably_attested(
     assert raw_a["upgrade_provenance"]["source_checkpoint_sha256"] == raw_b[
         "upgrade_provenance"
     ]["source_checkpoint_sha256"]
+
+
+def test_combined_topology_gather_upgrade_verifies_exact_real_root(
+    tmp_path, monkeypatch
+) -> None:
+    import torch
+    pytest.importorskip("catanatron_rs")
+
+    from catan_zero.rl.entity_token_policy import EntityGraphPolicy
+    from catan_zero.rl.self_play import make_env_config
+
+    source = tmp_path / "source.pt"
+    output = tmp_path / "topology-gather.pt"
+    policy = EntityGraphPolicy.create(
+        env_config=make_env_config(vps_to_win=3),
+        hidden_size=16,
+        state_layers=1,
+        attention_heads=2,
+        seed=0,
+    )
+    policy.save(source)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "f69_upgrade_checkpoint_config.py",
+            "--in-checkpoint",
+            str(source),
+            "--out-checkpoint",
+            str(output),
+            "--flags",
+            "gather,topology",
+            "--seed",
+            "73",
+            "--device",
+            "cpu",
+        ],
+    )
+    upgrade_tool.main()
+
+    raw = torch.load(output, map_location="cpu", weights_only=False)
+    assert raw["upgrade_provenance"]["flags"] == {
+        "action_target_gather": True,
+        "topology_residual_adapter": True,
+    }
+    assert raw["upgrade_provenance"]["forward_max_diff"] == 0.0
+    assert raw["upgrade_provenance"]["forward_identical_at_init"] is True

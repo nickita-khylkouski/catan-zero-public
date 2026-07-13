@@ -46,6 +46,64 @@ REL_EVENT_TO_TARGET = 10
 REL_TARGET_TO_EVENT = 11
 
 
+class TopologyResidualAdapter:
+    """Zero-output, permutation-equivariant incidence adapter.
+
+    This is deliberately smaller than replacing the incumbent Transformer with
+    an RRT/ResRGCN trunk.  It performs one directed message-passing step over
+    *only* physical board/event incidence edges, then adds a zero-initialised
+    projection to the token stream.  Consequently an upgraded checkpoint is
+    bit-identical at initialisation, while the projection learns on the first
+    optimiser step and opens a topology-aware residual path thereafter.
+
+    The adapter has no absolute entity-id parameters.  Relabelling token rows
+    and the accompanying incidence tensors therefore relabels its output in
+    exactly the same way (the D6 augmentation contract).
+    """
+
+    def __new__(cls, width: int):
+        import torch
+        from torch import nn
+
+        class _Module(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.source_norm = nn.LayerNorm(int(width))
+                self.source_projection = nn.Linear(int(width), int(width))
+                self.message_norm = nn.LayerNorm(int(width))
+                self.output_projection = nn.Linear(int(width), int(width))
+                nn.init.eye_(self.source_projection.weight)
+                nn.init.zeros_(self.source_projection.bias)
+                nn.init.zeros_(self.output_projection.weight)
+                nn.init.zeros_(self.output_projection.bias)
+
+            def forward(self, tokens, relation_ids, key_padding_mask=None):
+                # Direct physical/dynamic incidence only.  Excluding SELF,
+                # HUB_READS and READ_GLOBAL prevents this adapter from becoming
+                # a second unstructured global-attention layer.
+                direct = (
+                    ((relation_ids >= REL_HEX_TO_VERTEX)
+                     & (relation_ids <= REL_VERTEX_TO_EDGE))
+                    | (relation_ids == REL_EVENT_TO_TARGET)
+                    | (relation_ids == REL_TARGET_TO_EVENT)
+                )
+                if key_padding_mask is not None:
+                    live = ~key_padding_mask.bool()
+                    direct = direct & live.unsqueeze(1) & live.unsqueeze(2)
+                adjacency = direct.to(dtype=tokens.dtype)
+                degree = adjacency.sum(dim=-1, keepdim=True).clamp_min(1.0)
+                source = self.source_projection(self.source_norm(tokens))
+                message = torch.bmm(adjacency, source) / degree
+                update = self.output_projection(
+                    torch.nn.functional.gelu(self.message_norm(message))
+                )
+                if key_padding_mask is not None:
+                    update = update.masked_fill(key_padding_mask.unsqueeze(-1), 0.0)
+                return tokens + update
+
+        return _Module()
+
+
 def build_relation_ids(batch: dict[str, Any], *, sequence_length: int):
     """Build ``[B, destination, source]`` directed relation ids.
 

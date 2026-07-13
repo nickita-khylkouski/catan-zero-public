@@ -33,6 +33,9 @@ if str(REPO_ROOT) not in sys.path:
 
 SCHEMA = "a1-function-preserving-architecture-upgrade-v1"
 MODULE_TARGET_GATHER = "entity_graph.action_target_gather.v1"
+MODULE_TOPOLOGY_TARGET_GATHER = (
+    "entity_graph.topology_residual_adapter+action_target_gather.v1"
+)
 
 # This is intentionally code, not caller-controlled configuration.  A new
 # architecture exception must be reviewed and tested before it can initialize
@@ -47,6 +50,30 @@ ALLOWLIST: dict[str, dict[str, Any]] = {
             "target_gather_proj.1.weight": "zeros",
         },
         "config_delta": {"action_target_gather": True},
+    },
+    MODULE_TOPOLOGY_TARGET_GATHER: {
+        "flags": {
+            "action_target_gather": True,
+            "topology_residual_adapter": True,
+        },
+        "new_parameter_initialization": {
+            "target_gather_proj.0.bias": "zeros",
+            "target_gather_proj.0.weight": "ones",
+            "target_gather_proj.1.bias": "zeros",
+            "target_gather_proj.1.weight": "zeros",
+            "topology_residual_adapter.message_norm.bias": "zeros",
+            "topology_residual_adapter.message_norm.weight": "ones",
+            "topology_residual_adapter.output_projection.bias": "zeros",
+            "topology_residual_adapter.output_projection.weight": "zeros",
+            "topology_residual_adapter.source_norm.bias": "zeros",
+            "topology_residual_adapter.source_norm.weight": "ones",
+            "topology_residual_adapter.source_projection.bias": "zeros",
+            "topology_residual_adapter.source_projection.weight": "identity",
+        },
+        "config_delta": {
+            "action_target_gather": True,
+            "topology_residual_adapter": True,
+        },
     },
 }
 
@@ -190,7 +217,18 @@ def inspect_upgrade(
         raise UpgradeError(f"shared checkpoint parameters changed: {changed[:8]}")
     for name, kind in spec["new_parameter_initialization"].items():
         tensor = after_model[name]
-        expected = torch.ones_like(tensor) if kind == "ones" else torch.zeros_like(tensor)
+        if kind == "ones":
+            expected = torch.ones_like(tensor)
+        elif kind == "zeros":
+            expected = torch.zeros_like(tensor)
+        elif kind == "identity":
+            if tensor.ndim != 2 or tensor.shape[0] != tensor.shape[1]:
+                raise UpgradeError(f"identity parameter is not square: {name}")
+            expected = torch.eye(
+                tensor.shape[0], dtype=tensor.dtype, device=tensor.device
+            )
+        else:
+            raise UpgradeError(f"unknown allowlisted initialization {kind!r}: {name}")
         if not torch.equal(tensor, expected):
             raise UpgradeError(f"new parameter is not deterministic {kind}: {name}")
 

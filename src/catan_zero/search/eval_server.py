@@ -821,11 +821,14 @@ def _policy_needs_action_targets(policy: Any) -> bool:
 
 
 def _policy_needs_relational_topology(policy: Any) -> bool:
-    """Whether this policy's state trunk consumes immutable board topology."""
+    """Whether this policy consumes immutable board topology tensors."""
     policy_config = getattr(policy, "config", None)
     if policy_config is None:
         return True
-    return str(getattr(policy_config, "state_trunk", "transformer")) != "transformer"
+    return bool(
+        str(getattr(policy_config, "state_trunk", "transformer")) != "transformer"
+        or getattr(policy_config, "topology_residual_adapter", False)
+    )
 
 
 def _make_forward_policy(policy: Any, config: EvalServerConfig) -> Any:

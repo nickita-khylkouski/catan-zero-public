@@ -14626,6 +14626,7 @@ ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS: dict[str, tuple[str, ...]] = {
         "deliberation_fusion_norm",
         "deliberation_fusion",
         "deliberation_halt_head",
+        "topology_residual_adapter",
     ),
     "action_encoder": ("action_encoder",),
     "policy_head": ("action_bias", "logit_scale"),
@@ -14675,6 +14676,7 @@ def _effective_entity_graph_architecture_report(
             "action_cross_attention_layers": 0,
             "edge_policy_head": bool(requested_edge_policy_head),
             "aux_subgoal_heads": bool(requested_aux_subgoal_heads),
+            "topology_residual_adapter": False,
             "requested_edge_policy_head": bool(requested_edge_policy_head),
             "requested_aux_subgoal_heads": bool(requested_aux_subgoal_heads),
         }
@@ -14687,6 +14689,9 @@ def _effective_entity_graph_architecture_report(
         ),
         "edge_policy_head": bool(getattr(config, "edge_policy_head", False)),
         "aux_subgoal_heads": bool(getattr(config, "aux_subgoal_heads", False)),
+        "topology_residual_adapter": bool(
+            getattr(config, "topology_residual_adapter", False)
+        ),
         "state_trunk": str(getattr(config, "state_trunk", "transformer")),
         "relational_block_pattern": str(
             getattr(config, "relational_block_pattern", "") or ""

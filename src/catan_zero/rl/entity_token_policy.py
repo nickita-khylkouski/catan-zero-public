@@ -194,6 +194,12 @@ class EntityGraphConfig:
     # policy logit. Keep that behavior by default, but allow a causal
     # relational/gather/cross-attention probe to exclude the extra head.
     relational_edge_policy_head: bool = True
+    # Minimal function-preserving topology warm-start. Unlike state_trunk=rrt,
+    # this retains every incumbent Transformer parameter and inserts one
+    # zero-output incidence message-passing residual before the historical
+    # blocks. Default OFF preserves old checkpoint structure exactly. Appended
+    # last because this frozen+slots dataclass pickles positionally.
+    topology_residual_adapter: bool = False
 
 
 class EntityGraphNet:
@@ -305,6 +311,14 @@ class EntityGraphNet:
                         f"{self.state_trunk!r}"
                     )
                 self.uses_relational_topology = self.state_trunk != "transformer"
+                self.topology_residual_adapter_enabled = bool(
+                    getattr(cfg, "topology_residual_adapter", False)
+                )
+                if self.uses_relational_topology and self.topology_residual_adapter_enabled:
+                    raise ValueError(
+                        "topology_residual_adapter is a warm-start for the transformer "
+                        "trunk and cannot be combined with an already-relational trunk"
+                    )
                 self.latent_deliberation_steps = int(
                     getattr(cfg, "latent_deliberation_steps", 0) or 0
                 )
@@ -346,6 +360,10 @@ class EntityGraphNet:
                         for _ in range(max(1, int(cfg.state_layers)))
                     )
                     self.relational_block_pattern = ""
+                    if self.topology_residual_adapter_enabled:
+                        from catan_zero.rl.relational_trunks import TopologyResidualAdapter
+
+                        self.topology_residual_adapter = TopologyResidualAdapter(h)
                 else:
                     from catan_zero.rl.relational_trunks import (
                         RelationalTransformerBlock,
@@ -733,6 +751,22 @@ class EntityGraphNet:
                     batch,
                     event_token_limit=event_token_limit,
                 )
+                if self.topology_residual_adapter_enabled:
+                    from catan_zero.rl.relational_trunks import build_relation_ids
+
+                    relation_batch = batch
+                    if event_token_limit is not None and "event_target_ids" in batch:
+                        relation_batch = dict(batch)
+                        relation_batch["event_target_ids"] = batch["event_target_ids"][
+                            :, :event_token_limit
+                        ]
+                    relation_ids = build_relation_ids(
+                        relation_batch,
+                        sequence_length=int(tokens.shape[1]),
+                    )
+                    tokens = self.topology_residual_adapter(
+                        tokens, relation_ids, key_padding_mask=padding_mask
+                    )
                 if self.uses_relational_topology:
                     from catan_zero.rl.relational_trunks import build_relation_ids
 
@@ -1204,6 +1238,7 @@ class EntityGraphPolicy:
         moe_top_k: int = 2,
         moe_expert_ff_size: int = 0,
         relational_edge_policy_head: bool = True,
+        topology_residual_adapter: bool = False,
     ) -> EntityGraphPolicy:
         env = ColonistMultiAgentEnv(env_config or ColonistMultiAgentConfig())
         try:
@@ -1233,6 +1268,7 @@ class EntityGraphPolicy:
                 moe_top_k=int(moe_top_k),
                 moe_expert_ff_size=int(moe_expert_ff_size),
                 relational_edge_policy_head=bool(relational_edge_policy_head),
+                topology_residual_adapter=bool(topology_residual_adapter),
             )
             return cls(config, static, seed=seed, device=device)
         finally:
@@ -1270,6 +1306,7 @@ class EntityGraphPolicy:
         needs_topology = (
             str(getattr(self.config, "state_trunk", "transformer"))
             != "transformer"
+            or bool(getattr(self.config, "topology_residual_adapter", False))
         )
         batch = {
             key: torch.as_tensor(value, device=self.device)
@@ -1836,7 +1873,10 @@ def _assert_entity_batch_shapes(
                 f"row={int(row)} action={int(action)} column={int(column)}"
             )
 
-    if str(getattr(config, "state_trunk", "transformer")) != "transformer":
+    if (
+        str(getattr(config, "state_trunk", "transformer")) != "transformer"
+        or bool(getattr(config, "topology_residual_adapter", False))
+    ):
         topology_shapes = {
             "hex_vertex_ids": (batch_size, 19, 6),
             "hex_edge_ids": (batch_size, 19, 6),

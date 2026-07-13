@@ -50,6 +50,9 @@ def audit_architecture_config(config: Any) -> dict[str, Any]:
     if trunk not in {"transformer", "rrt", "resrgcn"}:
         raise InformationSurfaceError(f"unknown state_trunk {trunk!r}")
     relational = trunk != "transformer"
+    topology_adapter = bool(
+        _config_value(config, "topology_residual_adapter", False)
+    )
     gather = relational or bool(_config_value(config, "action_target_gather", False))
     cross_layers = (
         int(_config_value(config, "relational_action_cross_layers", 1))
@@ -61,7 +64,7 @@ def audit_architecture_config(config: Any) -> dict[str, Any]:
     ) or bool(_config_value(config, "edge_policy_head", False))
     value_pool = bool(_config_value(config, "value_attention_pool", False))
     target_bound = gather or cross_layers > 0 or edge_head
-    topology_consumed = relational
+    topology_consumed = relational or topology_adapter
 
     limitations: list[str] = []
     if not topology_consumed:
@@ -80,6 +83,7 @@ def audit_architecture_config(config: Any) -> dict[str, Any]:
     return {
         "state_trunk": trunk,
         "topology_consumed": topology_consumed,
+        "topology_residual_adapter": topology_adapter,
         "action_target_gather": gather,
         "action_cross_attention_layers": cross_layers,
         "edge_policy_head": edge_head,

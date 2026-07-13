@@ -229,6 +229,12 @@ def test_policy_target_requirement_handshake_is_safe(config, expected: bool) -> 
     [
         (None, True),
         (types.SimpleNamespace(state_trunk="transformer"), False),
+        (
+            types.SimpleNamespace(
+                state_trunk="transformer", topology_residual_adapter=True
+            ),
+            True,
+        ),
         (types.SimpleNamespace(state_trunk="rrt"), True),
         (types.SimpleNamespace(state_trunk="resrgcn"), True),
     ],

@@ -67,6 +67,48 @@ def _issued(tmp_path: Path) -> tuple[Path, dict]:
     return receipt, payload
 
 
+def _topology_checkpoints(tmp_path: Path) -> tuple[Path, Path]:
+    source, _gather = _checkpoints(tmp_path)
+    upgraded = tmp_path / "champion-topology-gather.pt"
+    raw = torch.load(source, map_location="cpu", weights_only=False)
+    model = dict(raw["model"])
+    width = 3
+    spec = upgrade.ALLOWLIST[upgrade.MODULE_TOPOLOGY_TARGET_GATHER]
+    for name, kind in spec["new_parameter_initialization"].items():
+        if name.endswith(".weight") and (
+            "norm." not in name and "target_gather_proj.0" not in name
+        ):
+            shape = (width, width)
+        else:
+            shape = (width,)
+        if kind == "ones":
+            tensor = torch.ones(shape)
+        elif kind == "zeros":
+            tensor = torch.zeros(shape)
+        elif kind == "identity":
+            tensor = torch.eye(width)
+        else:  # pragma: no cover - the allowlist itself is closed above
+            raise AssertionError(kind)
+        model[name] = tensor
+    flags = {
+        "action_target_gather": True,
+        "topology_residual_adapter": True,
+    }
+    raw["model"] = model
+    raw["config"] = {"fields": {**raw["config"]["fields"], **flags}}
+    raw["upgrade_provenance"] = {
+        "schema_version": "entity-graph-upgrade-v1",
+        "source_checkpoint_sha256": upgrade._sha(source).removeprefix("sha256:"),  # noqa: SLF001
+        "flags": flags,
+        "initialization_seed": 1,
+        "trained_value_readouts_added": [],
+        "forward_max_diff": 0.0,
+        "forward_identical_at_init": True,
+    }
+    torch.save(raw, upgraded)
+    return source, upgraded
+
+
 def _tamper_and_rehash(path: Path, mutate) -> None:
     value = json.loads(path.read_text(encoding="utf-8"))
     mutate(value)
@@ -92,6 +134,22 @@ def test_receipt_replays_exact_allowlisted_zero_diff_upgrade(tmp_path: Path) -> 
             Path(payload["upgraded_initializer"]["path"]),
             receipt,
         )
+
+
+def test_receipt_replays_combined_topology_target_gather_upgrade(tmp_path: Path) -> None:
+    source, initializer = _topology_checkpoints(tmp_path)
+    evidence = upgrade.inspect_upgrade(
+        source,
+        initializer,
+        module=upgrade.MODULE_TOPOLOGY_TARGET_GATHER,
+    )
+    assert evidence["flags"] == {
+        "action_target_gather": True,
+        "topology_residual_adapter": True,
+    }
+    assert evidence["new_parameter_initialization"][
+        "topology_residual_adapter.source_projection.weight"
+    ] == "identity"
 
 
 def test_receipt_digest_normalizes_numpy_config_scalars(tmp_path: Path) -> None:
