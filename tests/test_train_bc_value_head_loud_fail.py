@@ -51,3 +51,46 @@ def test_uncertainty_loss_with_head_ok():
 def test_scalar_defaults_are_noop():
     model = types.SimpleNamespace(value_categorical_bins=0, value_uncertainty_head=None)
     _assert(model, _args())  # neither objective requested -> no raise
+
+
+def test_requested_auxiliary_loss_without_heads_fails_before_first_batch():
+    model = types.SimpleNamespace(value_categorical_bins=0, value_uncertainty_head=None)
+    with pytest.raises(SystemExit, match="complete auxiliary head set"):
+        _assert(model, _args(aux_subgoal_loss_weight=0.1))
+
+
+def test_requested_final_vp_and_belief_losses_require_named_heads():
+    model = types.SimpleNamespace(value_categorical_bins=0, value_uncertainty_head=None)
+    with pytest.raises(SystemExit, match="final_vp_head"):
+        _assert(model, _args(final_vp_loss_weight=0.1))
+    with pytest.raises(SystemExit, match="belief_resource_head"):
+        _assert(model, _args(belief_resource_loss_weight=0.1))
+
+
+def test_zero_weight_optional_heads_are_frozen_before_optimizer_construction():
+    torch = pytest.importorskip("torch")
+    model = torch.nn.Module()
+    model.final_vp_head = torch.nn.Linear(4, 1)
+    model.value_uncertainty_head = torch.nn.Linear(4, 1)
+    model.value_categorical_head = torch.nn.Linear(4, 7)
+    model.aux_longest_road_head = torch.nn.Linear(4, 1)
+    model.belief_resource_head = torch.nn.Linear(4, 5)
+    model.deliberation_halt_head = torch.nn.Linear(4, 1)
+
+    report = train_bc._freeze_inactive_training_heads(
+        model,
+        final_vp_loss_weight=0.0,
+        value_uncertainty_loss_weight=0.5,
+        value_categorical_loss_weight=0.0,
+        aux_subgoal_loss_weight=0.0,
+        belief_resource_loss_weight=0.0,
+    )
+
+    assert all(not p.requires_grad for p in model.final_vp_head.parameters())
+    assert all(p.requires_grad for p in model.value_uncertainty_head.parameters())
+    assert all(not p.requires_grad for p in model.value_categorical_head.parameters())
+    assert all(not p.requires_grad for p in model.aux_longest_road_head.parameters())
+    assert all(not p.requires_grad for p in model.belief_resource_head.parameters())
+    assert all(not p.requires_grad for p in model.deliberation_halt_head.parameters())
+    assert report["active_optional_submodules"] == ["value_uncertainty_head"]
+    assert "deliberation_halt_head" in report["frozen_submodules"]
