@@ -314,6 +314,22 @@ def test_command_is_direct_one_b200_fresh_unfused_adam(tmp_path: Path) -> None:
         assert _option(command, flag) == value
 
 
+def test_future_production_per_game_value_mode_is_explicit(tmp_path: Path) -> None:
+    verified = _verified(tmp_path)
+    verified["recipe"]["per_game_value_weight"] = True
+    verified["recipe"]["per_game_value_weight_mode"] = "sqrt"
+
+    command = executor.build_train_command(
+        verified,
+        python=Path(sys.executable),
+        checkpoint=tmp_path / "candidate.pt",
+        report=tmp_path / "report.json",
+    )
+
+    assert "--per-game-value-weight" in command
+    assert _option(command, "--per-game-value-weight-mode") == "sqrt"
+
+
 def test_latest_main_ablation_command_binds_inventory_ack_and_crop(tmp_path: Path) -> None:
     verified = _verified(tmp_path)
     verified["recipe"]["per_game_value_weight_mode"] = "equal"

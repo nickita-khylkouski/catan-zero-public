@@ -19,10 +19,14 @@ zero to both the policy-loss numerator and denominator.  `forced_action_weight`
 was already redundant for these corpora, but the new launcher pins it to zero so
 the intended invariant is explicit.
 
-Forced rows are still useful state/value observations.  They currently receive
+Forced rows are still useful state/value observations. They currently receive
 value loss, but the production default does **not** guess a new forced-value
-coefficient.  It uses `1.0` while applying sqrt per-game value normalization;
-`{1.0, 0.25}` is a matched follow-up experiment.
+coefficient. It uses `1.0`; `{1.0, 0.25}` is a matched follow-up experiment.
+The authenticated composite-v2 sampler already draws component → game → row,
+so every game has equal expected value-target sampling mass before loss
+weights. A second per-game value normalization would double-correct and favor
+short games, so that transform stays off. Policy targets occur only on a sparse
+subset of rows; their separate sqrt per-game mass correction remains enabled.
 
 ## Extracting search information without self-distillation
 
@@ -50,9 +54,10 @@ as an authenticated, matched refreshed-target arm.
 
 ## Default iteration recipe
 
-- globally shuffled current + replay corpora; refuse current-only training;
+- authenticated game-uniform current + replay composite; refuse current-only training;
 - forced policy weight `0`;
-- sqrt per-game policy and value weighting;
+- sqrt per-game policy weighting for sparse active rows; no additional per-game
+  value loss weighting (the sampler is already game-uniform);
 - loser rows retained at weight `1`;
 - forced value weight `1` pending the `{1,.25}` result;
 - outcome-only scalar value target (`lambda=1`);

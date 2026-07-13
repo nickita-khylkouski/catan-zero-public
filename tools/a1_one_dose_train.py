@@ -981,6 +981,19 @@ def build_train_command(
     )
     if bool(recipe["per_game_value_weight"]):
         command.append("--per-game-value-weight")
+        # Historical non-ablation recipes locked this switch off and therefore
+        # had no typed mode.  If a future sealed production recipe enables it,
+        # bind the requested operator instead of silently inheriting
+        # train_bc's `equal` default.  Latest-main ablations already append the
+        # mode inside their existing command-hash block below; keep that
+        # ordering unchanged for reproducibility.
+        if verified.get("learner_ablation") is None:
+            command.extend(
+                [
+                    "--per-game-value-weight-mode",
+                    str(recipe.get("per_game_value_weight_mode", "equal")),
+                ]
+            )
     if "policy_aux_active_batch_size" in recipe:
         command.extend(
             [

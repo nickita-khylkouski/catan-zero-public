@@ -46,8 +46,8 @@ def test_production_next_recipe_is_explicit_and_keeps_unproven_bootstraps_off() 
     assert value("--forced-row-value-weight") == "1.0"
     assert "--per-game-policy-weight" in argv
     assert value("--per-game-policy-weight-mode") == "sqrt"
-    assert "--per-game-value-weight" in argv
-    assert value("--per-game-value-weight-mode") == "sqrt"
+    assert "--no-per-game-value-weight" in argv
+    assert value("--per-game-value-weight-mode") == "equal"
     assert value("--loser-sample-weight") == "1.0"
     assert value("--policy-kl-anchor-weight") == "0.0"
     assert value("--policy-kl-anchor-direction") == "forward"
@@ -60,6 +60,11 @@ def test_v2_config_refuses_omitted_production_learner_fields() -> None:
     del payload["learner_per_game_value_weight"]
     with pytest.raises(ValueError, match="missing production learner recipe"):
         FlywheelConfig.from_dict(payload)
+
+
+def test_production_refuses_duplicate_value_game_length_correction() -> None:
+    with pytest.raises(ValueError, match="duplicate per-game value weighting"):
+        FlywheelConfig(learner_per_game_value_weight=True).validate()
 
 
 def test_production_next_training_refuses_single_component_without_anchor(tmp_path) -> None:

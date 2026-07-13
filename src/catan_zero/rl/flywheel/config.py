@@ -42,19 +42,20 @@ class FlywheelConfig:
     # --- production-next learner objective (schema v2) ---
     # Forced actions have zero policy information: after legal masking their
     # probability is identically one, so including them can only dilute policy
-    # accounting.  They still carry state/value information, but at low weight
-    # because rows from one game are strongly correlated.  The per-game sqrt
-    # correction retains more effective sample size than exact equalization
-    # while preventing long games from dominating the scalar value objective.
+    # accounting. Authenticated memmap_composite_v2 sampling already selects a
+    # component, then a game uniformly, then a row uniformly inside that game.
+    # Applying another per-game loss normalization would double-correct that
+    # measure and bias optimization toward short games, so production leaves
+    # value-loss transform off. Policy-active rows are sparse within games, so
+    # the separate sqrt policy-mass correction remains enabled.
     learner_forced_action_weight: float = 0.0
     # Keep forced-state value mass unchanged until the matched {1.0, 0.25}
-    # experiment adjudicates it.  Per-game normalization below already removes
-    # the much larger long-game replication bias.
+    # experiment adjudicates it.
     learner_forced_row_value_weight: float = 1.0
     learner_per_game_policy_weight: bool = True
     learner_per_game_policy_weight_mode: str = "sqrt"
-    learner_per_game_value_weight: bool = True
-    learner_per_game_value_weight_mode: str = "sqrt"
+    learner_per_game_value_weight: bool = False
+    learner_per_game_value_weight_mode: str = "equal"
     learner_loser_sample_weight: float = 1.0
     learner_global_shuffle: bool = True
     # Catastrophic-forgetting control is mandatory.  Replay is the default;
@@ -339,12 +340,14 @@ class FlywheelConfig:
             raise ValueError("learner_forced_row_value_weight must be in [0,1]")
         if not self.learner_per_game_policy_weight:
             raise ValueError("production learner requires per-game policy weighting")
-        if not self.learner_per_game_value_weight:
-            raise ValueError("production learner requires per-game value weighting")
+        if self.learner_per_game_value_weight:
+            raise ValueError(
+                "production composite-v2 learner forbids duplicate per-game value weighting"
+            )
         if self.learner_per_game_policy_weight_mode != "sqrt":
             raise ValueError("production learner requires sqrt per-game policy weighting")
-        if self.learner_per_game_value_weight_mode != "sqrt":
-            raise ValueError("production learner requires sqrt per-game value weighting")
+        if self.learner_per_game_value_weight_mode != "equal":
+            raise ValueError("disabled per-game value weighting must retain equal mode")
         if self.learner_loser_sample_weight != 1.0:
             raise ValueError("production learner requires loser_sample_weight=1")
         if not self.learner_global_shuffle:
