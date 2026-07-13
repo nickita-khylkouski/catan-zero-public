@@ -82,6 +82,42 @@ from seed_fleet_planner import assert_disjoint_seed_blocks
 import launcher_guards
 
 
+PUBLIC_AWARD_FEATURE_PROVENANCE_SCHEMA = "public-award-feature-provenance-v1"
+PUBLIC_AWARD_FEATURE_CONTRACT_AUTHORITATIVE = "authoritative_v1"
+
+
+def _public_award_feature_provenance(*, rust_featurize: bool) -> dict[str, Any]:
+    """Attest which corrected public-award producer emitted this shard set.
+
+    Presence of this exact record, rather than a post-hoc scan for nonzero
+    values, is the durable authorization a downstream corpus builder uses.
+    The native path additionally proves that the installed wheel advertises
+    the matching feature semantics before any worker can write data.
+    """
+
+    producer = "python_snapshot_public_award_v1"
+    native_capability = None
+    if rust_featurize:
+        import catanatron_rs  # type: ignore
+
+        capability_fn = getattr(catanatron_rs, "gumbel_search_capabilities", None)
+        capabilities = set(capability_fn()) if callable(capability_fn) else set()
+        native_capability = "public_award_feature_parity"
+        if native_capability not in capabilities:
+            raise RuntimeError(
+                "--rust-featurize requires a native wheel advertising "
+                "public_award_feature_parity before corrected public-award "
+                "provenance may be emitted"
+            )
+        producer = "catanatron_rs_public_award_v1"
+    return {
+        "schema_version": PUBLIC_AWARD_FEATURE_PROVENANCE_SCHEMA,
+        "contract": PUBLIC_AWARD_FEATURE_CONTRACT_AUTHORITATIVE,
+        "feature_producer": producer,
+        "native_capability": native_capability,
+    }
+
+
 def _resolve_mix_with_exploiter(
     manifest_path: str,
     exploiter_fraction: float | None,
@@ -1200,6 +1236,9 @@ def main(argv: Sequence[str] | None = None) -> None:
     ]
 
     worker_args = []
+    public_award_feature_provenance = _public_award_feature_provenance(
+        rust_featurize=bool(args.rust_featurize)
+    )
     game_index_start = 0
     for worker_index, worker_games in enumerate(games_per_worker):
         if worker_games <= 0:
@@ -1280,6 +1319,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "native_mcts_hot_loop": bool(args.native_mcts_hot_loop),
                 "public_observation": bool(args.public_observation),
                 "rust_featurize": bool(args.rust_featurize),
+                "public_award_feature_provenance": public_award_feature_provenance,
                 "eval_cache_size": int(args.eval_cache_size),
                 "belief_chance_spectra": bool(args.belief_chance_spectra),
                 "information_set_search": bool(args.information_set_search),
@@ -1348,6 +1388,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         opponent_mix_exploiter_fraction=opponent_mix_exploiter_fraction,
     )
     summary["config_hash"] = generate_config_hash
+    summary["public_award_feature_provenance"] = public_award_feature_provenance
     summary["producer_checkpoint_sha256"] = args.producer_checkpoint_sha256
     summary["producer_checkpoint_staged_path"] = runtime_checkpoint
     if fatal_execution_error is not None:
@@ -1894,6 +1935,9 @@ def _run_worker(
         opponent_pool=opponent_pool,
         opponent_mix=opponent_mix,
         native_mcts_hot_loop=bool(worker_args.get("native_mcts_hot_loop", False)),
+        public_award_feature_provenance=worker_args.get(
+            "public_award_feature_provenance"
+        ),
     )
     summary["worker_index"] = int(worker_args["worker_index"])
     return summary

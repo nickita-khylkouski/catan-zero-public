@@ -66,6 +66,11 @@ MEMMAP_CORPUS_IMPLICIT_SCHEMA = "memmap_corpus_v2"
 # constant-looking columns may have different fill semantics.
 IMPLICIT_ZERO_EVENT_COLUMNS = frozenset({"event_tokens", "event_mask"})
 MEMMAP_PAYLOAD_INVENTORY_SCHEMA = "memmap-payload-inventory-v1"
+PUBLIC_AWARD_FEATURE_PROVENANCE_SCHEMA = "public-award-feature-provenance-v1"
+PUBLIC_AWARD_CORPUS_PROVENANCE_SCHEMA = "public-award-corpus-provenance-v1"
+PUBLIC_AWARD_FEATURE_CONTRACT_LEGACY = "legacy_zero_v0"
+PUBLIC_AWARD_FEATURE_CONTRACT_AUTHORITATIVE = "authoritative_v1"
+PUBLIC_AWARD_FEATURE_CONTRACT_MIXED = "mixed_v0"
 A1_SELECTED_GAMES_SCHEMA = "a1-selected-training-games-v1"
 DUAL_ARM_SELECTED_GAMES_SCHEMA = "a1-dual-arm-selected-training-games-v1"
 DUAL_ARM_AUDIT_SCHEMA = "a1-dual-arm-post-wave-audit-v1"
@@ -127,6 +132,110 @@ def _file_sha256(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1 << 20), b""):
             digest.update(chunk)
     return "sha256:" + digest.hexdigest()
+
+
+def _load_public_award_source_provenance(
+    sources: Sequence[Path | str],
+) -> dict[str, Any]:
+    """Bind each source to its generation-time public-award attestation.
+
+    Missing provenance is deliberately classified as legacy, never inferred
+    from observed feature values.  A corrected source must carry the exact
+    producer record written before generation and is bound here by the source
+    manifest's file hash.  Mixed corpora remain visibly mixed so the learner
+    can require an explicit policy rather than silently upgrading them.
+    """
+
+    bindings: list[dict[str, Any]] = []
+    contracts: set[str] = set()
+    expected_fields = {
+        "schema_version",
+        "contract",
+        "feature_producer",
+        "native_capability",
+    }
+    for source in sources:
+        source_path = Path(source).expanduser().resolve()
+        manifest_path = (
+            source_path
+            if source_path.is_file() and source_path.name == "manifest.json"
+            else source_path / "manifest.json"
+        )
+        if not manifest_path.is_file():
+            contract = PUBLIC_AWARD_FEATURE_CONTRACT_LEGACY
+            bindings.append(
+                {
+                    "source": str(source_path),
+                    "manifest": None,
+                    "manifest_file_sha256": None,
+                    "contract": contract,
+                    "producer_provenance": None,
+                }
+            )
+            contracts.add(contract)
+            continue
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as error:
+            raise SystemExit(
+                f"cannot load generation manifest {manifest_path}: {error}"
+            ) from error
+        if not isinstance(manifest, dict):
+            raise SystemExit(f"generation manifest {manifest_path} must be an object")
+        producer = manifest.get("public_award_feature_provenance")
+        if producer is None:
+            contract = PUBLIC_AWARD_FEATURE_CONTRACT_LEGACY
+        else:
+            if not isinstance(producer, dict) or set(producer) != expected_fields:
+                raise SystemExit(
+                    f"generation manifest {manifest_path} has malformed public-award provenance"
+                )
+            if (
+                producer["schema_version"] != PUBLIC_AWARD_FEATURE_PROVENANCE_SCHEMA
+                or producer["contract"]
+                != PUBLIC_AWARD_FEATURE_CONTRACT_AUTHORITATIVE
+                or (
+                    producer["feature_producer"]
+                    == "python_snapshot_public_award_v1"
+                    and producer["native_capability"] is not None
+                )
+                or (
+                    producer["feature_producer"]
+                    == "catanatron_rs_public_award_v1"
+                    and producer["native_capability"]
+                    != "public_award_feature_parity"
+                )
+                or producer["feature_producer"]
+                not in {
+                    "python_snapshot_public_award_v1",
+                    "catanatron_rs_public_award_v1",
+                }
+            ):
+                raise SystemExit(
+                    f"generation manifest {manifest_path} has unsupported public-award provenance"
+                )
+            contract = PUBLIC_AWARD_FEATURE_CONTRACT_AUTHORITATIVE
+        bindings.append(
+            {
+                "source": str(source_path),
+                "manifest": str(manifest_path.resolve(strict=True)),
+                "manifest_file_sha256": _file_sha256(manifest_path),
+                "contract": contract,
+                "producer_provenance": producer,
+            }
+        )
+        contracts.add(contract)
+    contract = (
+        next(iter(contracts))
+        if len(contracts) == 1
+        else PUBLIC_AWARD_FEATURE_CONTRACT_MIXED
+    )
+    return {
+        "schema_version": PUBLIC_AWARD_CORPUS_PROVENANCE_SCHEMA,
+        "contract": contract,
+        "source_manifest_bindings": bindings,
+        "source_manifest_bindings_sha256": _value_sha256(bindings),
+    }
 
 
 def _load_direct_a1_source_attestations(
@@ -1194,6 +1303,7 @@ def build_memmap_corpus(
     is present.
     """
     sources = [source] if isinstance(source, (str, Path)) else list(source)
+    public_award_feature_provenance = _load_public_award_source_provenance(sources)
     source_attestations = _load_direct_a1_source_attestations(sources)
     selected_manifest = (
         None
@@ -1694,6 +1804,7 @@ def build_memmap_corpus(
             )
         ),
         "stats": stats,
+        "public_award_feature_provenance": public_award_feature_provenance,
         "conversion_seconds": round(time.perf_counter() - started, 2),
     }
     if selected_manifest is not None:

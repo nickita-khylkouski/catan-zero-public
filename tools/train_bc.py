@@ -44,7 +44,13 @@ from catan_zero.rl.xdim_lite_policy import (
     _array_sha256,
     normalize_observations,
 )
-from catan_zero.rl.entity_token_policy import EntityGraphPolicy
+from catan_zero.rl.entity_token_policy import (
+    EntityGraphPolicy,
+    PLAYER_LONGEST_ROAD_SLOT,
+    PUBLIC_AWARD_FEATURE_CONTRACT_AUTHORITATIVE,
+    PUBLIC_AWARD_FEATURE_CONTRACT_LEGACY_ZERO,
+    _validate_public_award_feature_contract,
+)
 from catan_zero.rl.entity_token_features import (
     EDGE_FEATURE_SIZE,
     EVENT_FEATURE_SIZE,
@@ -153,6 +159,9 @@ MEMMAP_PAYLOAD_INVENTORY_SCHEMA = "memmap-payload-inventory-v1"
 MEMMAP_PAYLOAD_AUTH_CACHE_SCHEMA = "memmap-payload-auth-cache-v1"
 # Bump whenever the inventory validation semantics or cache identity changes.
 MEMMAP_PAYLOAD_AUTH_VALIDATOR_VERSION = 1
+PUBLIC_AWARD_CORPUS_PROVENANCE_SCHEMA = "public-award-corpus-provenance-v1"
+PUBLIC_AWARD_FEATURE_PROVENANCE_SCHEMA = "public-award-feature-provenance-v1"
+PUBLIC_AWARD_FEATURE_CONTRACT_MIXED = "mixed_v0"
 A1_REQUIRED_LEARNER_CODE_SUFFIXES = {
     "configs/guards/train_bc.json",
     "tools/factory_common.py",
@@ -324,6 +333,30 @@ def build_parser() -> argparse.ArgumentParser:
             "public counts/VP and the actor's own hand. Makes the banked (omniscient) "
             "corpus trainable on public-only inputs WITHOUT regeneration; pair with "
             "EntityGraphRustEvaluatorConfig.public_observation=True at inference."
+        ),
+    )
+    parser.add_argument(
+        "--public-award-feature-contract",
+        choices=(
+            PUBLIC_AWARD_FEATURE_CONTRACT_LEGACY_ZERO,
+            PUBLIC_AWARD_FEATURE_CONTRACT_AUTHORITATIVE,
+        ),
+        default=PUBLIC_AWARD_FEATURE_CONTRACT_LEGACY_ZERO,
+        help=(
+            "Checkpoint input contract for player-token longest-road slot 12. "
+            "The default legacy_zero_v0 preserves every historical model by "
+            "zeroing the slot. authoritative_v1 is an explicit training "
+            "transition and requires a memmap corpus whose source manifests "
+            "authenticate corrected feature production."
+        ),
+    )
+    parser.add_argument(
+        "--allow-mixed-public-award-feature-contracts",
+        action="store_true",
+        help=(
+            "Acknowledge a corpus assembled from legacy and corrected sources. "
+            "Mixed data may only train under legacy_zero_v0 (slot 12 remains "
+            "zero); it is never sufficient to stamp authoritative_v1."
         ),
     )
     parser.add_argument("--track", default="2p_no_trade")
@@ -4715,6 +4748,246 @@ def _validate_outcome_conditioned_policy_distillation(
     }
 
 
+def _validated_public_award_corpus_provenance(data: Any) -> dict[str, object]:
+    """Resolve and authenticate public-award provenance for loaded data."""
+
+    corpora = tuple(getattr(data, "corpora", ())) or (data,)
+    components: list[dict[str, object]] = []
+    contracts: set[str] = set()
+    for index, corpus in enumerate(corpora):
+        meta = getattr(corpus, "meta", None)
+        provenance = meta.get("public_award_feature_provenance") if isinstance(meta, dict) else None
+        if provenance is None:
+            contract = PUBLIC_AWARD_FEATURE_CONTRACT_LEGACY_ZERO
+            components.append(
+                {
+                    "component_index": index,
+                    "contract": contract,
+                    "provenance_authenticated": False,
+                    "source_manifest_bindings_sha256": None,
+                }
+            )
+            contracts.add(contract)
+            continue
+        if not isinstance(provenance, dict):
+            raise SystemExit(
+                f"memmap component {index} public-award provenance must be an object"
+            )
+        if provenance.get("schema_version") != PUBLIC_AWARD_CORPUS_PROVENANCE_SCHEMA:
+            raise SystemExit(
+                f"memmap component {index} public-award provenance schema is unsupported"
+            )
+        contract = str(provenance.get("contract", ""))
+        if contract not in {
+            PUBLIC_AWARD_FEATURE_CONTRACT_LEGACY_ZERO,
+            PUBLIC_AWARD_FEATURE_CONTRACT_AUTHORITATIVE,
+            PUBLIC_AWARD_FEATURE_CONTRACT_MIXED,
+        }:
+            raise SystemExit(
+                f"memmap component {index} public-award contract is unsupported: {contract!r}"
+            )
+        bindings = provenance.get("source_manifest_bindings")
+        binding_sha = provenance.get("source_manifest_bindings_sha256")
+        if not isinstance(bindings, list) or not bindings:
+            raise SystemExit(
+                f"memmap component {index} public-award source bindings are missing"
+            )
+        if binding_sha != _canonical_json_sha256(bindings):
+            raise SystemExit(
+                f"memmap component {index} public-award source binding digest mismatch"
+            )
+        binding_contracts = {
+            str(record.get("contract", ""))
+            for record in bindings
+            if isinstance(record, dict)
+        }
+        if (
+            len(bindings)
+            != sum(isinstance(record, dict) for record in bindings)
+            or not binding_contracts
+            or not binding_contracts
+            <= {
+                PUBLIC_AWARD_FEATURE_CONTRACT_LEGACY_ZERO,
+                PUBLIC_AWARD_FEATURE_CONTRACT_AUTHORITATIVE,
+            }
+        ):
+            raise SystemExit(
+                f"memmap component {index} public-award source bindings are malformed"
+            )
+        expected_contract = (
+            next(iter(binding_contracts))
+            if len(binding_contracts) == 1
+            else PUBLIC_AWARD_FEATURE_CONTRACT_MIXED
+        )
+        if expected_contract != contract:
+            raise SystemExit(
+                f"memmap component {index} public-award aggregate contract drift"
+            )
+        if contract == PUBLIC_AWARD_FEATURE_CONTRACT_AUTHORITATIVE:
+            for record in bindings:
+                producer = (
+                    record.get("producer_provenance")
+                    if isinstance(record, dict)
+                    else None
+                )
+                if (
+                    not isinstance(record, dict)
+                    or record.get("contract")
+                    != PUBLIC_AWARD_FEATURE_CONTRACT_AUTHORITATIVE
+                    or not isinstance(record.get("manifest_file_sha256"), str)
+                    or not re.fullmatch(
+                        r"sha256:[0-9a-f]{64}",
+                        str(record.get("manifest_file_sha256")),
+                    )
+                    or not isinstance(producer, dict)
+                    or set(producer)
+                    != {
+                        "schema_version",
+                        "contract",
+                        "feature_producer",
+                        "native_capability",
+                    }
+                    or producer.get("schema_version")
+                    != PUBLIC_AWARD_FEATURE_PROVENANCE_SCHEMA
+                    or producer.get("contract")
+                    != PUBLIC_AWARD_FEATURE_CONTRACT_AUTHORITATIVE
+                    or producer.get("feature_producer")
+                    not in {
+                        "python_snapshot_public_award_v1",
+                        "catanatron_rs_public_award_v1",
+                    }
+                    or producer.get("native_capability")
+                    not in {None, "public_award_feature_parity"}
+                    or (
+                        producer.get("feature_producer")
+                        == "python_snapshot_public_award_v1"
+                        and producer.get("native_capability") is not None
+                    )
+                    or (
+                        producer.get("feature_producer")
+                        == "catanatron_rs_public_award_v1"
+                        and producer.get("native_capability")
+                        != "public_award_feature_parity"
+                    )
+                ):
+                    raise SystemExit(
+                        f"memmap component {index} lacks authenticated corrected public-award provenance"
+                    )
+        components.append(
+            {
+                "component_index": index,
+                "contract": contract,
+                "provenance_authenticated": True,
+                "source_manifest_bindings_sha256": binding_sha,
+            }
+        )
+        contracts.add(contract)
+    aggregate = (
+        next(iter(contracts))
+        if len(contracts) == 1
+        else PUBLIC_AWARD_FEATURE_CONTRACT_MIXED
+    )
+    return {
+        "schema_version": PUBLIC_AWARD_CORPUS_PROVENANCE_SCHEMA,
+        "contract": aggregate,
+        "components": components,
+        "components_sha256": _canonical_json_sha256(components),
+    }
+
+
+def _configure_public_award_feature_training(
+    policy: Any,
+    data: Any,
+    args: argparse.Namespace,
+) -> dict[str, object]:
+    """Apply the explicit legacy->authoritative learner transition."""
+
+    requested = _validate_public_award_feature_contract(
+        getattr(
+            args,
+            "public_award_feature_contract",
+            PUBLIC_AWARD_FEATURE_CONTRACT_LEGACY_ZERO,
+        )
+    )
+    if getattr(policy, "policy_type", None) != "entity_graph":
+        if requested != PUBLIC_AWARD_FEATURE_CONTRACT_LEGACY_ZERO:
+            raise SystemExit(
+                "--public-award-feature-contract authoritative_v1 requires --arch entity_graph"
+            )
+        return {
+            "requested_contract": requested,
+            "effective_contract": requested,
+            "corpus_provenance": None,
+            "legacy_column_zero_initialized": False,
+        }
+    corpus = _validated_public_award_corpus_provenance(data)
+    corpus_contract = str(corpus["contract"])
+    allow_mixed = bool(
+        getattr(args, "allow_mixed_public_award_feature_contracts", False)
+    )
+    if corpus_contract == PUBLIC_AWARD_FEATURE_CONTRACT_MIXED and not allow_mixed:
+        raise SystemExit(
+            "mixed legacy/corrected public-award corpus requires "
+            "--allow-mixed-public-award-feature-contracts"
+        )
+    if (
+        corpus_contract == PUBLIC_AWARD_FEATURE_CONTRACT_MIXED
+        and requested == PUBLIC_AWARD_FEATURE_CONTRACT_AUTHORITATIVE
+    ):
+        raise SystemExit(
+            "mixed legacy/corrected public-award corpus cannot authorize authoritative_v1"
+        )
+    if (
+        requested == PUBLIC_AWARD_FEATURE_CONTRACT_AUTHORITATIVE
+        and corpus_contract != PUBLIC_AWARD_FEATURE_CONTRACT_AUTHORITATIVE
+    ):
+        raise SystemExit(
+            "authoritative_v1 training requires an entirely corrected, authenticated corpus"
+        )
+    current = _validate_public_award_feature_contract(
+        getattr(
+            policy,
+            "public_award_feature_contract",
+            PUBLIC_AWARD_FEATURE_CONTRACT_LEGACY_ZERO,
+        )
+    )
+    if (
+        current == PUBLIC_AWARD_FEATURE_CONTRACT_AUTHORITATIVE
+        and requested == PUBLIC_AWARD_FEATURE_CONTRACT_LEGACY_ZERO
+    ):
+        raise SystemExit(
+            "refusing to silently downgrade an authoritative_v1 initializer; request its contract explicitly"
+        )
+    zero_initialized = False
+    if (
+        current == PUBLIC_AWARD_FEATURE_CONTRACT_LEGACY_ZERO
+        and requested == PUBLIC_AWARD_FEATURE_CONTRACT_AUTHORITATIVE
+    ):
+        import torch
+
+        encoder = getattr(policy.model, "player_encoder", None)
+        first = encoder[0] if encoder is not None else None
+        weight = getattr(first, "weight", None)
+        if weight is None or weight.ndim != 2 or weight.shape[1] <= PLAYER_LONGEST_ROAD_SLOT:
+            raise SystemExit(
+                "entity_graph player encoder cannot initialize longest-road input column"
+            )
+        with torch.no_grad():
+            weight[:, PLAYER_LONGEST_ROAD_SLOT].zero_()
+        if bool(torch.count_nonzero(weight[:, PLAYER_LONGEST_ROAD_SLOT]).item()):
+            raise RuntimeError("failed to zero-initialize longest-road input column")
+        zero_initialized = True
+    policy.public_award_feature_contract = requested
+    return {
+        "requested_contract": requested,
+        "initializer_contract": current,
+        "effective_contract": requested,
+        "corpus_provenance": corpus,
+        "mixed_corpus_acknowledged": allow_mixed,
+        "legacy_column_zero_initialized": zero_initialized,
+    }
+
+
 def main(argv: Sequence[str] | None = None) -> None:
     checkout_runtime_binding = _assert_checkout_runtime_binding()
     parser = build_parser()
@@ -5268,6 +5541,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         ),
         ddp,
     )
+    public_award_feature_training: dict[str, object]
     if args.arch == "candidate":
         policy = create_ppo_policy(
             config=env_config,
@@ -5295,6 +5569,9 @@ def main(argv: Sequence[str] | None = None) -> None:
                 params.extend(module.parameters())
         optimizer = _make_optimizer(params, args, getattr(policy, "device", args.device))
         train_fn = _train_candidate_batch
+        public_award_feature_training = _configure_public_award_feature_training(
+            policy, data, args
+        )
     else:
         if args.init_checkpoint:
             if args.arch == "entity_graph":
@@ -5380,6 +5657,19 @@ def main(argv: Sequence[str] | None = None) -> None:
                 json.dumps({"progress": "warm_start_grow", **grow_report}, sort_keys=True),
                 ddp,
             )
+        public_award_feature_training = _configure_public_award_feature_training(
+            policy, data, args
+        )
+        _rank0_print(
+            json.dumps(
+                {
+                    "progress": "public_award_feature_training",
+                    **public_award_feature_training,
+                },
+                sort_keys=True,
+            ),
+            ddp,
+        )
         _enforce_35m_model_size(policy, args)
         _assert_value_heads_present_for_losses(policy.model, args)
         args.value_gradient_routing = _value_trunk_gradient_routing(
@@ -7119,6 +7409,12 @@ def main(argv: Sequence[str] | None = None) -> None:
         "fused_optimizer": bool(args.fused_optimizer),
         "hidden_size": int(args.hidden_size),
         "mask_hidden_info": bool(args.mask_hidden_info),
+        "public_award_feature_contract": str(
+            policy.public_award_feature_contract
+        )
+        if getattr(policy, "policy_type", None) == "entity_graph"
+        else PUBLIC_AWARD_FEATURE_CONTRACT_LEGACY_ZERO,
+        "public_award_feature_training": public_award_feature_training,
         "seed": int(args.seed),
         # Promotion receipts must be able to distinguish the historical
         # identical-per-rank dropout stream from the opt-in rank-offset RNG

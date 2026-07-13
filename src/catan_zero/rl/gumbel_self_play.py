@@ -1569,6 +1569,7 @@ def run_worker_games(
     opponent_pool: OpponentPoolRuntime | None = None,
     opponent_mix: MixRuntime | None = None,
     native_mcts_hot_loop: bool = False,
+    public_award_feature_provenance: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Play `games` self-play games in this process, writing shards to `out_dir`.
 
@@ -1965,6 +1966,10 @@ def run_worker_games(
         "errors": errors,
         "resumed_from_offset": int(resume_offset),
     }
+    if public_award_feature_provenance is not None:
+        summary["public_award_feature_provenance"] = dict(
+            public_award_feature_provenance
+        )
     if opponent_pool is not None:
         summary["opponent_pool_enabled"] = True
         summary["opponent_pool_fraction_configured"] = float(opponent_pool.policy.pool_fraction)

@@ -94,6 +94,27 @@ def _capture_configs(monkeypatch):
     return captured
 
 
+def test_public_award_provenance_attests_python_producer() -> None:
+    assert cli._public_award_feature_provenance(rust_featurize=False) == {
+        "schema_version": "public-award-feature-provenance-v1",
+        "contract": "authoritative_v1",
+        "feature_producer": "python_snapshot_public_award_v1",
+        "native_capability": None,
+    }
+
+
+def test_public_award_provenance_rejects_stale_native_wheel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(
+        sys.modules,
+        "catanatron_rs",
+        type("StaleWheel", (), {"gumbel_search_capabilities": staticmethod(lambda: [])}),
+    )
+    with pytest.raises(RuntimeError, match="public_award_feature_parity"):
+        cli._public_award_feature_provenance(rust_featurize=True)
+
+
 # --------------------------------------------------------------------------- D1 noise-floor wiring
 
 

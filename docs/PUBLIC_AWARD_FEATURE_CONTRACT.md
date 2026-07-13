@@ -50,8 +50,27 @@ batch.
 
 ## Rollout gate
 
-1. Build fresh shards with 0.1.8 and record `authoritative_v1` in shard and
-   corpus metadata.
+The software path for this transition is now explicit and fail-closed:
+
+- New generation manifests carry `public-award-feature-provenance-v1`.  The
+  native producer refuses to attest unless the installed wheel advertises
+  `public_award_feature_parity`.
+- `build_memmap_corpus.py` binds every source manifest hash into
+  `public-award-corpus-provenance-v1`; absent producer metadata is legacy and
+  old+corrected input is labelled `mixed_v0`, never guessed from observed
+  feature values.
+- `train_bc.py --public-award-feature-contract authoritative_v1` accepts only
+  an entirely corrected, authenticated memmap corpus.  On a legacy initializer
+  it deterministically zero-initializes `player_encoder.0.weight[:, 12]` before
+  optimizer construction, then stamps the output checkpoint and report.
+- Mixed corpora require `--allow-mixed-public-award-feature-contracts` and may
+  train only under `legacy_zero_v0`; they cannot authorize an authoritative
+  checkpoint.  Omitting both flags preserves the historical legacy function.
+
+The remaining operational rollout is:
+
+1. Build fresh shards with 0.1.8 and retain the emitted `authoritative_v1`
+   shard/corpus provenance.
 2. Assert the corrected corpus contains plausible nonzero slot-12 rows and
    that slot 12 remains public under masked and unmasked feature paths.
 3. Train from f7 with the learner consuming corrected rows.  Stamp the output
