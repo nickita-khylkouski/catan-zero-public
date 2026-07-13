@@ -191,11 +191,22 @@ def _verify_state(state: Any) -> dict[str, Any]:
     training = state["training"]
     if not isinstance(training, dict):
         raise IterationError("iteration training binding is not an object")
-    for key in ("lock", "corpus_meta", "validation_manifest"):
+    for key in ("lock", "corpus_meta"):
         _verify_ref(training.get(key), where=f"training.{key}")
+    validation_ref = training.get("validation_manifest")
+    composite_ref = training.get("composite_build_receipt")
+    if (validation_ref is None) == (composite_ref is None):
+        raise IterationError(
+            "training must bind exactly one validation manifest or composite receipt"
+        )
+    if validation_ref is not None:
+        _verify_ref(validation_ref, where="training.validation_manifest")
+    else:
+        _verify_ref(composite_ref, where="training.composite_build_receipt")
     _verify_executable_ref(training.get("python"), where="training.python")
-    if not Path(str(training.get("data"))).resolve(strict=True).is_dir():
-        raise IterationError("bound A1 corpus directory is missing")
+    data = Path(str(training.get("data"))).resolve(strict=True)
+    if not (data.is_dir() or data.is_file()):
+        raise IterationError("bound A1 corpus/descriptor is missing")
     mode = training.get("initialization_mode")
     if mode not in {"bootstrap_history", "next_turn"}:
         raise IterationError("iteration has no explicit initialization mode")
@@ -296,18 +307,56 @@ def _transition(
     return result
 
 
+def _verified_evidence_path(verified: dict[str, Any]) -> Path:
+    data = Path(verified["data_path"])
+    return data if data.is_file() else data / "corpus_meta.json"
+
+
+def _verify_training_binding(
+    verify_fn: Callable[..., dict[str, Any]],
+    *,
+    lock_path: Path,
+    data_path: Path,
+    validation_path: Path | None,
+    composite_build_receipt: Path | None,
+) -> dict[str, Any]:
+    return verify_fn(
+        lock_path=lock_path,
+        data_path=data_path,
+        validation_path=validation_path,
+        composite_build_receipt=composite_build_receipt,
+    )
+
+
+def _training_input_refs(
+    verified: dict[str, Any],
+) -> tuple[dict[str, str] | None, dict[str, str] | None]:
+    if verified.get("data_kind") == "production_composite_v2":
+        receipt = verified.get("composite_build_receipt")
+        if not isinstance(receipt, dict):
+            raise IterationError("verified production composite has no build receipt")
+        return None, _file_ref(
+            Path(str(receipt["path"])), where="composite build receipt"
+        )
+    return (
+        _file_ref(Path(verified["validation_path"]), where="validation manifest"),
+        None,
+    )
+
+
 def initialize(
     *,
     state_path: Path,
     lock_path: Path,
     data_path: Path,
-    validation_path: Path,
+    validation_path: Path | None,
     checkpoint: Path,
     report: Path,
     training_receipt: Path,
     python: Path,
     gpu: int,
     bootstrap_history: bool,
+    composite_build_receipt: Path | None = None,
     verify_fn: Callable[..., dict[str, Any]] = one_dose.verify_training_inputs,
 ) -> dict[str, Any]:
     """Explicitly initialize a bootstrap/historical dose.
@@ -325,8 +374,12 @@ def initialize(
         raise IterationError("gpu must be non-negative")
     python_ref = _executable_ref(python, where="learner python")
     try:
-        verified = verify_fn(
-            lock_path=lock_path, data_path=data_path, validation_path=validation_path
+        verified = _verify_training_binding(
+            verify_fn,
+            lock_path=lock_path,
+            data_path=data_path,
+            validation_path=validation_path,
+            composite_build_receipt=composite_build_receipt,
         )
         checkpoint_path = checkpoint.expanduser().resolve(strict=False)
         report_path = report.expanduser().resolve(strict=False)
@@ -341,7 +394,8 @@ def initialize(
             f"A1 corpus/dose initialization refused: {error}"
         ) from error
 
-    meta_path = Path(verified["data_path"]) / "corpus_meta.json"
+    meta_path = _verified_evidence_path(verified)
+    validation_ref, composite_ref = _training_input_refs(verified)
     now = time.time_ns()
     state = {
         "schema_version": STATE_SCHEMA,
@@ -358,9 +412,8 @@ def initialize(
             "data": str(Path(verified["data_path"]).resolve(strict=True)),
             "corpus_meta": _file_ref(meta_path, where="corpus metadata"),
             "payload_inventory_sha256": verified["payload_inventory_sha256"],
-            "validation_manifest": _file_ref(
-                Path(verified["validation_path"]), where="validation manifest"
-            ),
+            "validation_manifest": validation_ref,
+            "composite_build_receipt": composite_ref,
             "selected_game_seed_set_sha256": verified["selected_game_seed_set_sha256"],
             "training_game_seed_set_sha256": verified["training_game_seed_set_sha256"],
             "validation_game_seed_set_sha256": verified[
@@ -481,7 +534,7 @@ def initialize_next(
     audit_path: Path,
     lock_path: Path,
     data_path: Path,
-    validation_path: Path,
+    validation_path: Path | None,
     learner_parent: Path,
     evaluation_parent: Path,
     initializer: Path,
@@ -491,6 +544,7 @@ def initialize_next(
     training_receipt: Path,
     python: Path,
     gpu: int,
+    composite_build_receipt: Path | None = None,
     verify_fn: Callable[..., dict[str, Any]] = one_dose.verify_training_inputs,
     turn_builder: Callable[..., dict[str, Any]] = flywheel.build_turn,
 ) -> dict[str, Any]:
@@ -500,8 +554,12 @@ def initialize_next(
         raise IterationError("gpu must be non-negative")
     python_ref = _executable_ref(python, where="learner python")
     try:
-        verified = verify_fn(
-            lock_path=lock_path, data_path=data_path, validation_path=validation_path
+        verified = _verify_training_binding(
+            verify_fn,
+            lock_path=lock_path,
+            data_path=data_path,
+            validation_path=validation_path,
+            composite_build_receipt=composite_build_receipt,
         )
         one_dose._require_unconsumed_contract(verified)  # noqa: SLF001
         claim = one_dose._claim_path(verified)  # noqa: SLF001
@@ -536,7 +594,16 @@ def initialize_next(
         expected_paths = {
             "lock": str(Path(verified["lock_path"]).resolve(strict=True)),
             "data": str(Path(verified["data_path"]).resolve(strict=True)),
-            "validation": str(Path(verified["validation_path"]).resolve(strict=True)),
+            "validation": (
+                None
+                if verified.get("validation_path") is None
+                else str(Path(verified["validation_path"]).resolve(strict=True))
+            ),
+            "composite_receipt": (
+                verified.get("composite_build_receipt", {}).get("path")
+                if isinstance(verified.get("composite_build_receipt"), dict)
+                else None
+            ),
             "checkpoint": str(checkpoint.expanduser().resolve(strict=False)),
             "report": str(report.expanduser().resolve(strict=False)),
             "receipt": str(training_receipt.expanduser().resolve(strict=False)),
@@ -545,7 +612,16 @@ def initialize_next(
         actual_paths = {
             "lock": training.get("lock", {}).get("path"),
             "data": training.get("data"),
-            "validation": training.get("validation_manifest", {}).get("path"),
+            "validation": (
+                training["validation_manifest"].get("path")
+                if isinstance(training.get("validation_manifest"), dict)
+                else None
+            ),
+            "composite_receipt": (
+                training["composite_build_receipt"].get("path")
+                if isinstance(training.get("composite_build_receipt"), dict)
+                else None
+            ),
             "checkpoint": training.get("checkpoint"),
             "report": training.get("report"),
             "receipt": training.get("receipt"),
@@ -583,7 +659,8 @@ def initialize_next(
                 "existing flywheel turn differs from requested initialization"
             ) from error
     turn_ref = _file_ref(turn_path, where="flywheel turn")
-    meta_path = Path(verified["data_path"]) / "corpus_meta.json"
+    meta_path = _verified_evidence_path(verified)
+    validation_ref, composite_ref = _training_input_refs(verified)
     state_path = state_path.expanduser().resolve(strict=False)
     consumption_ref = _claim_fresh_turn_corpus(
         meta_path=meta_path,
@@ -608,9 +685,8 @@ def initialize_next(
             "data": str(Path(verified["data_path"]).resolve(strict=True)),
             "corpus_meta": _file_ref(meta_path, where="corpus metadata"),
             "payload_inventory_sha256": verified["payload_inventory_sha256"],
-            "validation_manifest": _file_ref(
-                Path(verified["validation_path"]), where="validation manifest"
-            ),
+            "validation_manifest": validation_ref,
+            "composite_build_receipt": composite_ref,
             "selected_game_seed_set_sha256": verified["selected_game_seed_set_sha256"],
             "training_game_seed_set_sha256": verified["training_game_seed_set_sha256"],
             "validation_game_seed_set_sha256": verified[
@@ -790,8 +866,20 @@ def _dose_argv(state: dict[str, Any], *, go: bool) -> list[str]:
         training["lock"]["path"],
         "--data",
         training["data"],
-        "--validation-manifest",
-        training["validation_manifest"]["path"],
+    ]
+    if isinstance(training.get("composite_build_receipt"), dict):
+        argv.extend(
+            [
+                "--composite-build-receipt",
+                training["composite_build_receipt"]["path"],
+            ]
+        )
+    else:
+        argv.extend(
+            ["--validation-manifest", training["validation_manifest"]["path"]]
+        )
+    argv.extend(
+        [
         "--checkpoint",
         training["checkpoint"],
         "--report",
@@ -802,7 +890,8 @@ def _dose_argv(state: dict[str, Any], *, go: bool) -> list[str]:
         training["python"]["path"],
         "--gpu",
         str(training["gpu"]),
-    ]
+        ]
+    )
     if training.get("initialization_mode") == "next_turn":
         try:
             turn = json.loads(
@@ -819,6 +908,27 @@ def _dose_argv(state: dict[str, Any], *, go: bool) -> list[str]:
     if go:
         argv.append("--go")
     return argv
+
+
+def _reverify_state_training(
+    state: dict[str, Any],
+    *,
+    verify_fn: Callable[..., dict[str, Any]] = one_dose.verify_training_inputs,
+) -> dict[str, Any]:
+    training = state["training"]
+    validation = training.get("validation_manifest")
+    composite = training.get("composite_build_receipt")
+    return _verify_training_binding(
+        verify_fn,
+        lock_path=Path(training["lock"]["path"]),
+        data_path=Path(training["data"]),
+        validation_path=(
+            Path(validation["path"]) if isinstance(validation, dict) else None
+        ),
+        composite_build_receipt=(
+            Path(composite["path"]) if isinstance(composite, dict) else None
+        ),
+    )
 
 
 def _run_tool(
@@ -1289,13 +1399,7 @@ def dose_dry_run(
             raise IterationError("dose dry-run cannot skip the verified-corpus stage")
         if state["training"]["initialization_mode"] == "next_turn":
             try:
-                verified = verify_fn(
-                    lock_path=Path(state["training"]["lock"]["path"]),
-                    data_path=Path(state["training"]["data"]),
-                    validation_path=Path(
-                        state["training"]["validation_manifest"]["path"]
-                    ),
-                )
+                verified = _reverify_state_training(state, verify_fn=verify_fn)
             except (one_dose.ExecutorError, OSError) as error:
                 raise IterationError(
                     f"next-turn corpus replay refused: {error}"
@@ -1356,11 +1460,7 @@ def _load_complete_training_receipt(state: dict[str, Any]) -> dict[str, Any]:
             "A1 training receipt environment/command differs from the dry-run"
         )
     try:
-        verified = one_dose.verify_training_inputs(
-            lock_path=Path(training["lock"]["path"]),
-            data_path=Path(training["data"]),
-            validation_path=Path(training["validation_manifest"]["path"]),
-        )
+        verified = _reverify_state_training(state)
         actual_outputs = one_dose._verify_training_outputs(  # noqa: SLF001
             checkpoint=Path(training["checkpoint"]),
             report=Path(training["report"]),
@@ -1401,13 +1501,7 @@ def dose_go(
             raise IterationError("dose execution requires a recorded one-dose dry-run")
         if state["training"]["initialization_mode"] == "next_turn":
             try:
-                verified = verify_fn(
-                    lock_path=Path(state["training"]["lock"]["path"]),
-                    data_path=Path(state["training"]["data"]),
-                    validation_path=Path(
-                        state["training"]["validation_manifest"]["path"]
-                    ),
-                )
+                verified = _reverify_state_training(state, verify_fn=verify_fn)
             except (one_dose.ExecutorError, OSError) as error:
                 raise IterationError(
                     f"next-turn pre-launch replay refused: {error}"
@@ -1680,7 +1774,8 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--state", required=True, type=Path)
     init.add_argument("--lock", required=True, type=Path)
     init.add_argument("--data", required=True, type=Path)
-    init.add_argument("--validation-manifest", required=True, type=Path)
+    init.add_argument("--validation-manifest", type=Path)
+    init.add_argument("--composite-build-receipt", type=Path)
     init.add_argument("--checkpoint", required=True, type=Path)
     init.add_argument("--report", required=True, type=Path)
     init.add_argument("--training-receipt", required=True, type=Path)
@@ -1696,7 +1791,8 @@ def build_parser() -> argparse.ArgumentParser:
     next_init.add_argument("--generation-audit", required=True, type=Path)
     next_init.add_argument("--lock", required=True, type=Path)
     next_init.add_argument("--data", required=True, type=Path)
-    next_init.add_argument("--validation-manifest", required=True, type=Path)
+    next_init.add_argument("--validation-manifest", type=Path)
+    next_init.add_argument("--composite-build-receipt", type=Path)
     next_init.add_argument("--learner-parent", required=True, type=Path)
     next_init.add_argument("--evaluation-parent", required=True, type=Path)
     next_init.add_argument("--initializer", required=True, type=Path)
@@ -1745,6 +1841,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 lock_path=args.lock,
                 data_path=args.data,
                 validation_path=args.validation_manifest,
+                composite_build_receipt=args.composite_build_receipt,
                 checkpoint=args.checkpoint,
                 report=args.report,
                 training_receipt=args.training_receipt,
@@ -1762,6 +1859,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 lock_path=args.lock,
                 data_path=args.data,
                 validation_path=args.validation_manifest,
+                composite_build_receipt=args.composite_build_receipt,
                 learner_parent=args.learner_parent,
                 evaluation_parent=args.evaluation_parent,
                 initializer=args.initializer,

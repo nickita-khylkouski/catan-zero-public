@@ -8,6 +8,10 @@ expansion.  It then attaches an already authenticated historical-replay
 component and emits the promotion-eligible .64/.12/.04/.20 descriptor consumed
 by ``train_bc``.
 
+The resulting tree is host-portable at an identical canonical install path.
+Absolute paths are deliberately authenticated; transfer tooling must rsync the
+whole tree to the same path on each learner rather than silently rebasing it.
+
 This is intentionally a builder only.  It never launches generation or a
 learner and it refuses an existing/non-empty output root.
 """
@@ -18,6 +22,7 @@ import argparse
 import hashlib
 import json
 import os
+import shutil
 import sys
 import uuid
 from collections import Counter, defaultdict
@@ -46,6 +51,8 @@ from tools import train_bc  # noqa: E402
 
 
 HISTORICAL_COMPONENT_REF_SCHEMA = "a1-historical-replay-component-ref-v1"
+HISTORICAL_AUTHORITY_SCHEMA = "a1-historical-replay-authority-v1"
+SOURCE_AUTHORITY_SCHEMA = "a1-post-wave-composite-source-authority-v1"
 BUILD_RECEIPT_SCHEMA = "a1-post-wave-composite-build-v1"
 EFFECTIVE_COMPONENT_RATIOS = {
     "current_producer": 0.64,
@@ -95,6 +102,17 @@ def _file_sha256(path: Path) -> str:
     return f"sha256:{digest.hexdigest()}"
 
 
+def _artifact_ref(path: Path) -> dict[str, str]:
+    resolved = path.expanduser().resolve(strict=True)
+    if not resolved.is_file():
+        raise CompositeBuildError(f"authority artifact is not a file: {resolved}")
+    return {"path": str(resolved), "file_sha256": _file_sha256(resolved)}
+
+
+def _binding_source_id(binding: Mapping[str, Any]) -> str:
+    return _digest(dict(binding))
+
+
 def _fsync_parent(path: Path) -> None:
     descriptor = os.open(path.parent, os.O_RDONLY)
     try:
@@ -124,6 +142,25 @@ def _atomic_json(path: Path, value: object) -> None:
             os.fsync(handle.fileno())
         os.replace(temporary, path)
         _fsync_parent(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _atomic_copy(source: Path, destination: Path) -> None:
+    """Durably copy one immutable authority artifact without partial visibility."""
+
+    source = source.expanduser().resolve(strict=True)
+    if not source.is_file():
+        raise CompositeBuildError(f"authority artifact is not a file: {source}")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.parent / f".{destination.name}.{uuid.uuid4().hex}.tmp"
+    try:
+        with source.open("rb") as reader, temporary.open("xb") as writer:
+            shutil.copyfileobj(reader, writer, length=1 << 20)
+            writer.flush()
+            os.fsync(writer.fileno())
+        os.replace(temporary, destination)
+        _fsync_parent(destination)
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -226,6 +263,86 @@ def _selection_by_job(
             f"expected={dict(expected_games)}"
         )
     return dict(selections), owners, normalized
+
+
+_SOURCE_BINDING_FIELDS = {
+    "source_id",
+    "contract_sha256",
+    "audit_file_sha256",
+    "audit_sha256",
+    "selected_manifest_file_sha256",
+    "selected_records_sha256",
+    "job_id",
+    "category",
+    "source_path",
+    "source_sha256",
+    "generation_manifest_path",
+    "generation_manifest_sha256",
+}
+
+
+def _validate_source_bindings(
+    bindings: Any,
+    *,
+    lock: Mapping[str, Any],
+    selected_file_sha256: str,
+    selected_records_sha256: str,
+    audit_file_sha256: str,
+    audit_sha256: str,
+) -> list[dict[str, Any]]:
+    if not isinstance(bindings, list) or not bindings:
+        raise CompositeBuildError("source authority has no source bindings")
+    jobs = {str(job["job_id"]): job for job in lock["fleet"]["jobs"]}
+    normalized: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for index, raw in enumerate(bindings):
+        if not isinstance(raw, dict) or set(raw) != _SOURCE_BINDING_FIELDS:
+            raise CompositeBuildError(
+                f"source authority binding {index} fields differ from schema"
+            )
+        value = dict(raw)
+        source_id = value.pop("source_id")
+        job_id = str(value.get("job_id", ""))
+        category = str(value.get("category", ""))
+        job = jobs.get(job_id)
+        if (
+            not isinstance(source_id, str)
+            or source_id in seen_ids
+            or source_id != _binding_source_id(value)
+            or job is None
+            or category != job.get("category")
+            or value.get("contract_sha256") != lock.get("contract_sha256")
+            or value.get("selected_manifest_file_sha256")
+            != selected_file_sha256
+            or value.get("selected_records_sha256") != selected_records_sha256
+            or value.get("audit_file_sha256") != audit_file_sha256
+            or value.get("audit_sha256") != audit_sha256
+        ):
+            raise CompositeBuildError(
+                f"source authority binding {index} identity/digest drift"
+            )
+        try:
+            source = Path(str(value["source_path"])).expanduser().resolve(strict=True)
+            generation_manifest = Path(
+                str(value["generation_manifest_path"])
+            ).expanduser().resolve(strict=True)
+        except OSError as error:
+            raise CompositeBuildError(
+                f"source authority binding {index} artifact is missing: {error}"
+            ) from error
+        if (
+            str(source) != value["source_path"]
+            or str(generation_manifest) != value["generation_manifest_path"]
+            or _file_sha256(source) != value["source_sha256"]
+            or _file_sha256(generation_manifest)
+            != value["generation_manifest_sha256"]
+        ):
+            raise CompositeBuildError(
+                f"source authority binding {index} artifact bytes drifted"
+            )
+        seen_ids.add(source_id)
+        normalized.append({"source_id": source_id, **value})
+    return normalized
 
 
 def _filter_wave_shards(
@@ -470,6 +587,7 @@ def _build_fresh_component(
     producer: Mapping[str, Any],
     output_root: Path,
     expected_games: int,
+    source_authority: Mapping[str, str],
     build_memmap_fn: Callable[..., dict[str, Any]],
 ) -> dict[str, Any]:
     if not records:
@@ -487,7 +605,7 @@ def _build_fresh_component(
         )
     version = int(producer["version"])
     provenance = {
-        "schema_version": "flywheel-replay-component-v1",
+        "schema_version": "flywheel-replay-component-v2",
         "component_id": category,
         "source_category": category,
         "role": "fresh",
@@ -504,6 +622,7 @@ def _build_fresh_component(
         "shards": records,
         "shard_inventory_sha256": canonical_sha256(records),
         "component_mass": mass,
+        "source_authority_manifest": dict(source_authority),
     }
     provenance_path = output_root / "provenance" / f"{category}.json"
     _atomic_json(provenance_path, provenance)
@@ -526,14 +645,18 @@ def _build_fresh_component(
         "provenance_manifest": str(provenance_path),
         "provenance_manifest_sha256": provenance_ref["file_sha256"],
         "component_mass": mass,
+        "source_authority_manifest": source_authority["path"],
+        "source_authority_manifest_sha256": source_authority["file_sha256"],
     }
 
 
-def _load_historical_component(path: Path, *, current_version: int) -> dict[str, Any]:
+def _load_historical_component(
+    path: Path, *, current_version: int
+) -> tuple[dict[str, Any], dict[str, Any]]:
     reference_path = path.expanduser().resolve(strict=True)
     wrapper = _load_json(reference_path)
     if (
-        set(wrapper) != {"schema_version", "component"}
+        set(wrapper) != {"schema_version", "component", "authority"}
         or wrapper.get("schema_version") != HISTORICAL_COMPONENT_REF_SCHEMA
     ):
         raise CompositeBuildError(
@@ -575,12 +698,7 @@ def _load_historical_component(path: Path, *, current_version: int) -> dict[str,
             != component["payload_inventory_sha256"]
         ):
             raise CompositeBuildError("historical component byte binding drift")
-        provenance = train_bc._validate_flywheel_component_provenance(  # noqa: SLF001
-            provenance_path,
-            component_id=HISTORICAL_REPLAY_CATEGORY,
-            corpus_dir=corpus_dir,
-            corpus_meta=meta,
-        )
+        provenance = _load_json(provenance_path)
     except (OSError, SystemExit, ValueError) as error:
         raise CompositeBuildError(
             f"historical replay verification failed: {error}"
@@ -591,7 +709,296 @@ def _load_historical_component(path: Path, *, current_version: int) -> dict[str,
         or component["component_mass"] != provenance["component_mass"]
     ):
         raise CompositeBuildError("historical replay generation/mass drift")
-    return dict(component)
+
+    authority = wrapper.get("authority")
+    authority_fields = {
+        "schema_version",
+        "source_contract",
+        "selected_game_manifest",
+        "post_wave_audit",
+        "source_bindings",
+        "source_bindings_sha256",
+        "component_provenance_sha256",
+        "component_payload_inventory_sha256",
+        "authority_sha256",
+    }
+    if (
+        not isinstance(authority, dict)
+        or set(authority) != authority_fields
+        or authority.get("schema_version") != HISTORICAL_AUTHORITY_SCHEMA
+    ):
+        raise CompositeBuildError(
+            "historical replay lacks a sealed prior lock/audit/selection authority"
+        )
+    unhashed_authority = dict(authority)
+    declared_authority_sha = unhashed_authority.pop("authority_sha256", None)
+    if declared_authority_sha != _digest(unhashed_authority):
+        raise CompositeBuildError("historical replay authority digest drift")
+
+    try:
+        contract_ref = dict(authority["source_contract"])
+        selected_ref = dict(authority["selected_game_manifest"])
+        audit_ref = dict(authority["post_wave_audit"])
+    except (TypeError, ValueError) as error:
+        raise CompositeBuildError("historical replay authority references are malformed") from error
+    if set(contract_ref) != {"path", "file_sha256", "contract_sha256"}:
+        raise CompositeBuildError("historical source-contract authority fields drift")
+    if set(selected_ref) != {
+        "path",
+        "file_sha256",
+        "manifest_sha256",
+        "records_sha256",
+        "selected_game_seed_set_sha256",
+    }:
+        raise CompositeBuildError("historical selected-game authority fields drift")
+    if set(audit_ref) != {
+        "path",
+        "file_sha256",
+        "audit_sha256",
+        "shard_inventory_sha256",
+    }:
+        raise CompositeBuildError("historical post-wave authority fields drift")
+    try:
+        prior_lock_path = Path(str(contract_ref["path"])).expanduser().resolve(
+            strict=True
+        )
+        selected_path = Path(str(selected_ref["path"])).expanduser().resolve(
+            strict=True
+        )
+        audit_path = Path(str(audit_ref["path"])).expanduser().resolve(strict=True)
+        prior_lock = contract.verify_lock(prior_lock_path, require_all_job_claims=False)
+        selected = memmap_builder._load_a1_selected_game_manifest(selected_path)  # noqa: SLF001
+        audit = memmap_builder._load_a1_post_wave_audit(audit_path, selected)  # noqa: SLF001
+    except (OSError, SystemExit, contract.ContractError) as error:
+        raise CompositeBuildError(
+            f"historical replay authority verification failed: {error}"
+        ) from error
+    if (
+        str(prior_lock_path) != contract_ref["path"]
+        or _file_sha256(prior_lock_path) != contract_ref["file_sha256"]
+        or prior_lock.get("contract_sha256") != contract_ref["contract_sha256"]
+        or selected.get("a1_contract_sha256") != prior_lock.get("contract_sha256")
+        or str(selected["path"]) != selected_ref["path"]
+        or selected["file_sha256"] != selected_ref["file_sha256"]
+        or selected["manifest_sha256"] != selected_ref["manifest_sha256"]
+        or selected["records_sha256"] != selected_ref["records_sha256"]
+        or selected["selected_game_seed_set_sha256"]
+        != selected_ref["selected_game_seed_set_sha256"]
+        or audit.get("contract_sha256") != prior_lock.get("contract_sha256")
+        or str(audit["path"]) != audit_ref["path"]
+        or audit["file_sha256"] != audit_ref["file_sha256"]
+        or audit["audit_sha256"] != audit_ref["audit_sha256"]
+        or audit["shard_inventory_sha256"] != audit_ref["shard_inventory_sha256"]
+    ):
+        raise CompositeBuildError("historical replay prior authority binding drift")
+    bindings = _validate_source_bindings(
+        authority["source_bindings"],
+        lock=prior_lock,
+        selected_file_sha256=selected["file_sha256"],
+        selected_records_sha256=selected["records_sha256"],
+        audit_file_sha256=audit["file_sha256"],
+        audit_sha256=audit["audit_sha256"],
+    )
+    if authority["source_bindings_sha256"] != canonical_sha256(bindings):
+        raise CompositeBuildError("historical replay source-binding digest drift")
+    binding_ids = {str(value["source_id"]) for value in bindings}
+    try:
+        provenance = train_bc._validate_flywheel_component_provenance(  # noqa: SLF001
+            provenance_path,
+            component_id=HISTORICAL_REPLAY_CATEGORY,
+            corpus_dir=corpus_dir,
+            corpus_meta=meta,
+            allowed_source_ids=binding_ids,
+        )
+    except SystemExit as error:
+        raise CompositeBuildError(
+            f"historical replay provenance verification failed: {error}"
+        ) from error
+    provenance_ids = {str(value["source_id"]) for value in provenance["shards"]}
+    if not provenance_ids or not provenance_ids.issubset(binding_ids):
+        raise CompositeBuildError(
+            "historical replay shards are not authorized by the prior wave sources"
+        )
+    if (
+        authority["component_provenance_sha256"]
+        != component["provenance_manifest_sha256"]
+        or authority["component_payload_inventory_sha256"]
+        != component["payload_inventory_sha256"]
+    ):
+        raise CompositeBuildError("historical replay authority/component bytes drift")
+    return dict(component), dict(authority)
+
+
+def _build_source_authority(
+    *,
+    lock_path: Path,
+    lock: Mapping[str, Any],
+    selected: Mapping[str, Any],
+    audit: Mapping[str, Any],
+    source_bindings: list[dict[str, Any]],
+    historical_component: Mapping[str, Any],
+    historical_authority: Mapping[str, Any],
+    output_root: Path,
+) -> dict[str, str]:
+    """Materialize the complete, portable authority before the descriptor.
+
+    Raw generation shards are verified while filtering/sealing, but are much
+    larger than the learner input and deliberately are not copied.  Their
+    immutable path/hash preimages remain in ``source_bindings``.  Every small
+    semantic artifact needed to interpret those preimages is copied into the
+    composite root, so a second B200 never has to re-open an unstaged source
+    path merely to authenticate the already-filtered learner corpus.
+    """
+
+    normalized_bindings = _validate_source_bindings(
+        source_bindings,
+        lock=lock,
+        selected_file_sha256=str(selected["file_sha256"]),
+        selected_records_sha256=str(selected["records_sha256"]),
+        audit_file_sha256=str(audit["file_sha256"]),
+        audit_sha256=str(audit["audit_sha256"]),
+    )
+    authority_root = output_root / "authority"
+
+    def staged_ref(source: Path, relative: str) -> dict[str, str]:
+        destination = authority_root / relative
+        _atomic_copy(source, destination)
+        return _artifact_ref(destination)
+
+    def staged_manifests(
+        bindings: Sequence[Mapping[str, Any]], *, namespace: str
+    ) -> list[dict[str, Any]]:
+        unique: dict[tuple[str, str, str], dict[str, Any]] = {}
+        for binding in bindings:
+            identity = (
+                str(binding["job_id"]),
+                str(binding["generation_manifest_path"]),
+                str(binding["generation_manifest_sha256"]),
+            )
+            unique.setdefault(identity, dict(binding))
+        records: list[dict[str, Any]] = []
+        for index, (identity, binding) in enumerate(sorted(unique.items())):
+            job_id, original_path, original_sha256 = identity
+            safe_job = "".join(
+                value if value.isalnum() or value in "._-" else "_"
+                for value in job_id
+            )
+            artifact = staged_ref(
+                Path(original_path),
+                f"{namespace}/generation_manifests/{index:05d}-{safe_job}.json",
+            )
+            if artifact["file_sha256"] != original_sha256:
+                raise CompositeBuildError(
+                    f"staged generation manifest changed bytes for {job_id}"
+                )
+            records.append(
+                {
+                    "job_id": job_id,
+                    "category": binding["category"],
+                    "original_path": original_path,
+                    "original_file_sha256": original_sha256,
+                    "artifact": artifact,
+                }
+            )
+        return records
+
+    lock_ref = staged_ref(lock_path, "current/contract.lock.json")
+    selected_ref = staged_ref(
+        Path(str(selected["path"])), "current/selected_games.json"
+    )
+    audit_ref = staged_ref(Path(str(audit["path"])), "current/post_wave_audit.json")
+    current_manifests = staged_manifests(normalized_bindings, namespace="current")
+
+    historical_contract_source = Path(
+        str(historical_authority["source_contract"]["path"])
+    )
+    historical_selected_source = Path(
+        str(historical_authority["selected_game_manifest"]["path"])
+    )
+    historical_audit_source = Path(
+        str(historical_authority["post_wave_audit"]["path"])
+    )
+    historical_contract_ref = {
+        **staged_ref(historical_contract_source, "historical/contract.lock.json"),
+        "contract_sha256": historical_authority["source_contract"][
+            "contract_sha256"
+        ],
+    }
+    historical_selected_ref = {
+        **staged_ref(historical_selected_source, "historical/selected_games.json"),
+        **{
+            key: historical_authority["selected_game_manifest"][key]
+            for key in (
+                "manifest_sha256",
+                "records_sha256",
+                "selected_game_seed_set_sha256",
+            )
+        },
+    }
+    historical_audit_ref = {
+        **staged_ref(historical_audit_source, "historical/post_wave_audit.json"),
+        **{
+            key: historical_authority["post_wave_audit"][key]
+            for key in ("audit_sha256", "shard_inventory_sha256")
+        },
+    }
+    historical_bindings = list(historical_authority["source_bindings"])
+    historical_manifests = staged_manifests(
+        historical_bindings, namespace="historical"
+    )
+    historical_projection: dict[str, Any] = {
+        "schema_version": HISTORICAL_AUTHORITY_SCHEMA,
+        "source_contract": historical_contract_ref,
+        "selected_game_manifest": historical_selected_ref,
+        "post_wave_audit": historical_audit_ref,
+        "source_bindings": historical_bindings,
+        "source_bindings_sha256": historical_authority[
+            "source_bindings_sha256"
+        ],
+        "generation_manifests": historical_manifests,
+        "generation_manifests_sha256": canonical_sha256(historical_manifests),
+        "component_provenance_sha256": historical_component[
+            "provenance_manifest_sha256"
+        ],
+        "component_payload_inventory_sha256": historical_component[
+            "payload_inventory_sha256"
+        ],
+    }
+    historical_projection["authority_sha256"] = _digest(historical_projection)
+    payload: dict[str, Any] = {
+        "schema_version": SOURCE_AUTHORITY_SCHEMA,
+        "canonical_composite_root": str(output_root.resolve(strict=True)),
+        "current_contract": {
+            **lock_ref,
+            "contract_sha256": lock["contract_sha256"],
+        },
+        "selected_game_manifest": {
+            **selected_ref,
+            "manifest_sha256": selected["manifest_sha256"],
+            "records_sha256": selected["records_sha256"],
+            "selected_game_seed_set_sha256": selected[
+                "selected_game_seed_set_sha256"
+            ],
+        },
+        "post_wave_audit": {
+            **audit_ref,
+            "audit_sha256": audit["audit_sha256"],
+            "shard_inventory_sha256": audit["shard_inventory_sha256"],
+        },
+        "fresh_source_bindings": normalized_bindings,
+        "fresh_source_bindings_sha256": canonical_sha256(normalized_bindings),
+        "fresh_generation_manifests": current_manifests,
+        "fresh_generation_manifests_sha256": canonical_sha256(current_manifests),
+        "historical_replay": historical_projection,
+    }
+    payload["authority_sha256"] = _digest(payload)
+    path = output_root / "source_authority.json"
+    _atomic_json(path, payload)
+    return {
+        "path": str(path.resolve(strict=True)),
+        "file_sha256": _file_sha256(path),
+        "authority_sha256": payload["authority_sha256"],
+    }
 
 
 def _build_descriptor(
@@ -600,6 +1007,7 @@ def _build_descriptor(
     producer_path: Path,
     producer_sha256: str,
     current_version: int,
+    source_authority: Mapping[str, str],
 ) -> dict[str, Any]:
     component_ids = [str(component["component_id"]) for component in components]
     expected_ids = [*FRESH_SOURCE_GAME_RATIOS, HISTORICAL_REPLAY_CATEGORY]
@@ -662,6 +1070,9 @@ def _build_descriptor(
         "policy_distillation_component_ids": component_ids,
         "value_training_component_ids": component_ids,
         "flywheel_replay_contract": replay_contract,
+        "source_authority_manifest": source_authority["path"],
+        "source_authority_manifest_sha256": source_authority["file_sha256"],
+        "source_authority_sha256": source_authority["authority_sha256"],
     }
 
 
@@ -703,6 +1114,19 @@ def build_post_wave_composite(
         output_root=root,
         expected_games=expected_games,
     )
+    historical, historical_authority = _load_historical_component(
+        historical_component_path, current_version=int(producer["version"])
+    )
+    source_authority = _build_source_authority(
+        lock_path=lock_path,
+        lock=lock,
+        selected=selected,
+        audit=audit,
+        source_bindings=source_bindings,
+        historical_component=historical,
+        historical_authority=historical_authority,
+        output_root=root,
+    )
     components = [
         _build_fresh_component(
             category=category,
@@ -710,12 +1134,16 @@ def build_post_wave_composite(
             producer=producer,
             output_root=root,
             expected_games=int(expected_games[category]),
+            source_authority=source_authority,
             build_memmap_fn=build_memmap_fn,
         )
         for category in FRESH_SOURCE_GAME_RATIOS
     ]
-    historical = _load_historical_component(
-        historical_component_path, current_version=int(producer["version"])
+    historical.update(
+        {
+            "source_authority_manifest": source_authority["path"],
+            "source_authority_manifest_sha256": source_authority["file_sha256"],
+        }
     )
     components.append(historical)
     descriptor = _build_descriptor(
@@ -723,6 +1151,7 @@ def build_post_wave_composite(
         producer_path=producer_path,
         producer_sha256=str(producer["sha256"]),
         current_version=int(producer["version"]),
+        source_authority=source_authority,
     )
     descriptor_path = root / "memmap_composite.json"
     _atomic_json(descriptor_path, descriptor)
@@ -736,6 +1165,7 @@ def build_post_wave_composite(
         "schema_version": BUILD_RECEIPT_SCHEMA,
         "contract": {
             "path": str(lock_path.expanduser().resolve(strict=True)),
+            "file_sha256": _file_sha256(lock_path.expanduser().resolve(strict=True)),
             "contract_sha256": lock["contract_sha256"],
         },
         "selected_game_manifest": {
@@ -758,6 +1188,7 @@ def build_post_wave_composite(
         },
         "source_bindings": source_bindings,
         "source_bindings_sha256": canonical_sha256(source_bindings),
+        "source_authority": source_authority,
         "descriptor": {
             "path": str(descriptor_path.resolve(strict=True)),
             "file_sha256": _file_sha256(descriptor_path),

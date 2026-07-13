@@ -193,6 +193,48 @@ def test_initialize_preserves_virtualenv_python_path(tmp_path: Path) -> None:
     assert iteration._dose_argv(state, go=False)[-3] == str(python.absolute())
 
 
+def test_orchestrator_binds_production_composite_receipt_without_validation(
+    tmp_path: Path,
+) -> None:
+    verified, paths = _verified(tmp_path)
+    descriptor = _write(tmp_path / "memmap_composite.json", "{}")
+    build_receipt = _write(tmp_path / "build_receipt.json", "{}")
+    verified.update(
+        {
+            "data_path": descriptor,
+            "data_kind": "production_composite_v2",
+            "validation_path": None,
+            "composite_build_receipt": {
+                "path": str(build_receipt.resolve()),
+                "file_sha256": iteration._file_sha256(build_receipt),
+                "receipt_sha256": "sha256:" + "9" * 64,
+            },
+        }
+    )
+    state = iteration.initialize(
+        state_path=tmp_path / "composite-iteration.json",
+        lock_path=paths["lock"],
+        data_path=descriptor,
+        validation_path=None,
+        composite_build_receipt=build_receipt,
+        checkpoint=tmp_path / "candidate.pt",
+        report=tmp_path / "report.json",
+        training_receipt=tmp_path / "training.receipt.json",
+        python=Path(sys.executable),
+        gpu=0,
+        bootstrap_history=True,
+        verify_fn=lambda **_kwargs: verified,
+    )
+
+    argv = iteration._dose_argv(state, go=False)
+    assert "--composite-build-receipt" in argv
+    assert "--validation-manifest" not in argv
+    assert state["training"]["validation_manifest"] is None
+    assert state["training"]["composite_build_receipt"]["path"] == str(
+        build_receipt.resolve()
+    )
+
+
 def _fake_turn(tmp_path: Path, verified: dict) -> dict:
     parent = _write(tmp_path / "next-parent.pt", "parent")
     handoff = _write(tmp_path / "handoff.json", "handoff")

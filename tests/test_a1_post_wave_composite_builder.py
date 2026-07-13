@@ -9,6 +9,7 @@ import pytest
 from tools import a1_build_post_wave_composite as builder
 from tools import a1_one_dose_train
 from tools import a1_pre_wave_contract as contract
+from tools import a1_seal_historical_replay_component as historical_sealer
 
 
 def _lock(tmp_path: Path) -> dict:
@@ -202,6 +203,7 @@ def _historical_reference(
     *,
     current_version: int,
     base_seed: int,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> Path:
     checkpoint = tmp_path / "historical.pt"
     checkpoint.write_bytes(b"historical")
@@ -222,70 +224,130 @@ def _historical_reference(
     meta = builder.memmap_builder.build_memmap_corpus(
         source, corpus_dir, progress_every=0
     )
-    mass = builder.measure_memmap_component(corpus_dir, meta)
-    shard_record = {
-        "path": str(shard.resolve()),
-        "rows": 4,
-        "order": 0,
-        "size_bytes": shard.stat().st_size,
-        "sha256": builder._file_sha256(shard),  # noqa: SLF001
-        "checkpoint_version": current_version - 1,
-        "producer_checkpoint_path": str(checkpoint.resolve()),
-        "producer_checkpoint_sha256": checkpoint_sha,
-        "source_id": "historical-generation",
-        "source_category": "current_producer",
-    }
-    provenance = {
-        "schema_version": "flywheel-replay-component-v1",
-        "component_id": "historical_replay",
-        "source_category": "historical_replay",
-        "role": "replay",
-        "current_checkpoint_version": current_version,
-        "checkpoint_versions": [current_version - 1],
-        "producer_checkpoints": [
-            {
-                "version": current_version - 1,
-                "path": str(checkpoint.resolve()),
-                "sha256": checkpoint_sha,
-            }
-        ],
-        "row_count": 4,
-        "shards": [shard_record],
-        "shard_inventory_sha256": builder.canonical_sha256([shard_record]),
-        "component_mass": mass,
-    }
-    provenance_path = tmp_path / "historical.provenance.json"
-    provenance_path.write_text(json.dumps(provenance), encoding="utf-8")
     meta_path = corpus_dir / "corpus_meta.json"
     meta = json.loads(meta_path.read_text(encoding="utf-8"))
-    meta["flywheel_component_provenance"] = {
-        "path": str(provenance_path.resolve()),
-        "file_sha256": builder._file_sha256(provenance_path),  # noqa: SLF001
-    }
-    meta_path.write_text(json.dumps(meta), encoding="utf-8")
-    component = {
-        "component_id": "historical_replay",
-        "source_category": "historical_replay",
-        "game_sampling_ratio": 0.20,
-        "corpus_dir": str(corpus_dir.resolve()),
-        "corpus_meta_sha256": builder._file_sha256(meta_path),  # noqa: SLF001
-        "payload_inventory_sha256": meta["payload_inventory_sha256"],
-        "provenance_manifest": str(provenance_path.resolve()),
-        "provenance_manifest_sha256": builder._file_sha256(  # noqa: SLF001
-            provenance_path
-        ),
-        "component_mass": mass,
-    }
-    reference = tmp_path / "historical.component.json"
-    reference.write_text(
-        json.dumps(
+    prior_lock = {
+        "checkpoints": [
             {
-                "schema_version": builder.HISTORICAL_COMPONENT_REF_SCHEMA,
-                "component": component,
+                "id": "producer",
+                "role": "producer",
+                "path": str(checkpoint.resolve()),
+                "sha256": checkpoint_sha,
+                "version": current_version - 1,
             }
-        ),
-        encoding="utf-8",
+        ],
+        "source_categories": [
+            {"name": "current_producer", "checkpoint_ids": []}
+        ],
+        "generation": {},
+        "science": {},
+        "fleet": {
+            "jobs": [
+                {
+                    "job_id": "historical_gpu0__current_producer",
+                    "worker_id": "historical_gpu0",
+                    "category": "current_producer",
+                    "base_seed": base_seed,
+                    "seed_end": base_seed + 2,
+                }
+            ]
+        },
+    }
+    prior_lock["contract_sha256"] = builder._digest(prior_lock)  # noqa: SLF001
+    prior_lock_path = tmp_path / "historical.contract.lock.json"
+    prior_lock_path.write_text(json.dumps(prior_lock), encoding="utf-8")
+    selected_payload = {
+        "a1_contract_sha256": prior_lock["contract_sha256"],
+        "category_game_counts": {"current_producer": 2},
+        "selected_game_seed_set_sha256": builder._digest([base_seed, base_seed + 1]),  # noqa: SLF001
+        "records": [
+            {
+                "game_seed": base_seed + offset,
+                "job_id": "historical_gpu0__current_producer",
+                "worker_id": "historical_gpu0",
+                "category": "current_producer",
+                "producer_checkpoint_sha256": checkpoint_sha,
+                "opponent_checkpoint_sha256": [checkpoint_sha],
+                "split": "train" if offset == 0 else "validation",
+            }
+            for offset in range(2)
+        ],
+    }
+    selected_payload["records_sha256"] = builder._digest(selected_payload["records"])  # noqa: SLF001
+    selected_path = tmp_path / "historical.selected.json"
+    selected_path.write_text(json.dumps(selected_payload), encoding="utf-8")
+    generation_manifest = tmp_path / "historical.generation.json"
+    generation_manifest.write_text(json.dumps({"generation": "historical"}))
+    audit_shards = [
+        {
+            "kind": "generation_manifest",
+            "path": str(generation_manifest.resolve()),
+            "sha256": builder._file_sha256(generation_manifest),  # noqa: SLF001
+            "job_id": "historical_gpu0__current_producer",
+            "category": "current_producer",
+        },
+        {
+            "kind": "data_shard",
+            "path": str(shard.resolve()),
+            "sha256": builder._file_sha256(shard),  # noqa: SLF001
+            "job_id": "historical_gpu0__current_producer",
+            "category": "current_producer",
+        },
+    ]
+    audit_payload = {
+        "contract_sha256": prior_lock["contract_sha256"],
+        "shard_inventory_sha256": builder._digest(audit_shards),  # noqa: SLF001
+        "shards": audit_shards,
+    }
+    audit_payload["audit_sha256"] = builder._digest(audit_payload)  # noqa: SLF001
+    audit_path = tmp_path / "historical.audit.json"
+    audit_path.write_text(json.dumps(audit_payload), encoding="utf-8")
+    selected = {
+        "path": selected_path.resolve(),
+        "file_sha256": builder._file_sha256(selected_path),  # noqa: SLF001
+        "manifest_sha256": builder._digest(selected_payload),  # noqa: SLF001
+        "records_sha256": selected_payload["records_sha256"],
+        "selected_game_seed_set_sha256": selected_payload[
+            "selected_game_seed_set_sha256"
+        ],
+        "a1_contract_sha256": prior_lock["contract_sha256"],
+    }
+    audit = {
+        "path": audit_path.resolve(),
+        "file_sha256": builder._file_sha256(audit_path),  # noqa: SLF001
+        "audit_sha256": audit_payload["audit_sha256"],
+        "shard_inventory_sha256": audit_payload["shard_inventory_sha256"],
+        "contract_sha256": prior_lock["contract_sha256"],
+        "data_shards": [audit_shards[1]],
+    }
+    meta["selected_game_seed_manifest"] = {
+        "file_sha256": selected["file_sha256"]
+    }
+    meta["a1_post_wave_audit"] = {"file_sha256": audit["file_sha256"]}
+    meta_path.write_text(json.dumps(meta), encoding="utf-8")
+    corpus_hash_before = builder._file_sha256(meta_path)  # noqa: SLF001
+    monkeypatch.setattr(historical_sealer.contract, "verify_lock", lambda *_a, **_k: prior_lock)
+    monkeypatch.setattr(
+        historical_sealer.memmap_builder,
+        "_load_a1_selected_game_manifest",
+        lambda *_a, **_k: selected,
     )
+    monkeypatch.setattr(
+        historical_sealer.memmap_builder,
+        "_load_a1_post_wave_audit",
+        lambda *_a, **_k: audit,
+    )
+    reference = tmp_path / "historical.component.json"
+    historical_sealer.seal_historical_replay_component(
+        lock_path=prior_lock_path,
+        selected_path=selected_path,
+        audit_path=audit_path,
+        corpus_dir=corpus_dir,
+        producer_version=current_version - 1,
+        current_version=current_version,
+        output_path=reference,
+    )
+    assert builder._file_sha256(meta_path) == corpus_hash_before  # noqa: SLF001
     return reference
 
 
@@ -314,13 +376,30 @@ def _audit_fixture(tmp_path: Path, lock: dict, data_shards: list[dict]) -> dict:
                 "category": job["category"],
             }
         )
+    raw_records.extend(
+        {
+            "kind": "data_shard",
+            "path": str(Path(record["path"]).resolve()),
+            "sha256": record["sha256"],
+            "job_id": record["job_id"],
+            "category": record["category"],
+        }
+        for record in data_shards
+    )
+    raw_audit = {
+        "contract_sha256": lock["contract_sha256"],
+        "shard_inventory_sha256": builder._digest(raw_records),  # noqa: SLF001
+        "shards": raw_records,
+    }
+    raw_audit["audit_sha256"] = builder._digest(raw_audit)  # noqa: SLF001
     audit_path = tmp_path / "audit.json"
-    audit_path.write_text(json.dumps({"shards": raw_records}))
+    audit_path.write_text(json.dumps(raw_audit))
     return {
         "path": audit_path,
-        "file_sha256": "sha256:" + "d" * 64,
-        "audit_sha256": "sha256:" + "e" * 64,
-        "shard_inventory_sha256": "sha256:" + "f" * 64,
+        "file_sha256": builder._file_sha256(audit_path),  # noqa: SLF001
+        "audit_sha256": raw_audit["audit_sha256"],
+        "shard_inventory_sha256": raw_audit["shard_inventory_sha256"],
+        "contract_sha256": lock["contract_sha256"],
         "data_shards": data_shards,
     }
 
@@ -472,11 +551,18 @@ def test_descriptor_preserves_nested_fresh_mix_and_historical_replay(
         )
     producer = tmp_path / "producer.pt"
     producer.write_bytes(b"producer")
+    authority = tmp_path / "authority.json"
+    authority.write_text("{}", encoding="utf-8")
     descriptor = builder._build_descriptor(  # noqa: SLF001
         components=components,
         producer_path=producer,
         producer_sha256=builder._file_sha256(producer),  # noqa: SLF001
         current_version=7,
+        source_authority={
+            "path": str(authority.resolve()),
+            "file_sha256": builder._file_sha256(authority),  # noqa: SLF001
+            "authority_sha256": builder._digest({}),  # noqa: SLF001
+        },
     )
     replay = descriptor["flywheel_replay_contract"]
     assert replay["fresh_source_game_ratios"] == {
@@ -502,6 +588,8 @@ def test_real_memmap_composite_is_accepted_by_one_dose_trainer(
     lock = _lock(tmp_path)
     for job in lock["fleet"]["jobs"]:
         job["seed_end"] = int(job["base_seed"]) + 3
+    lock.pop("contract_sha256")
+    lock["contract_sha256"] = builder._digest(lock)  # noqa: SLF001
     producer = contract._producer(lock)  # noqa: SLF001
     opponent = {
         category["name"]: contract._category_opponent_sha256(  # noqa: SLF001
@@ -510,6 +598,8 @@ def test_real_memmap_composite_is_accepted_by_one_dose_trainer(
         for category in lock["source_categories"]
     }
     raw_selected = {
+        "a1_contract_sha256": lock["contract_sha256"],
+        "selected_game_seed_set_sha256": "sha256:" + "9" * 64,
         "records": [
             {
                 "game_seed": int(job["base_seed"]) + offset,
@@ -524,6 +614,7 @@ def test_real_memmap_composite_is_accepted_by_one_dose_trainer(
             for offset in (0, 1)
         ]
     }
+    raw_selected["records_sha256"] = builder._digest(raw_selected["records"])  # noqa: SLF001
     versions = {"current_producer": None, "recent_history": 6, "hard_negative": 5}
     data_shards = []
     for job in lock["fleet"]["jobs"]:
@@ -552,7 +643,11 @@ def test_real_memmap_composite_is_accepted_by_one_dose_trainer(
     selected = {
         "path": selected_path.resolve(),
         "file_sha256": builder._file_sha256(selected_path),  # noqa: SLF001
-        "records_sha256": "sha256:" + "c" * 64,
+        "manifest_sha256": builder._digest(raw_selected),  # noqa: SLF001
+        "records_sha256": raw_selected["records_sha256"],
+        "selected_game_seed_set_sha256": raw_selected[
+            "selected_game_seed_set_sha256"
+        ],
         "a1_contract_sha256": lock["contract_sha256"],
     }
     audit = _audit_fixture(tmp_path, lock, data_shards)
@@ -560,6 +655,7 @@ def test_real_memmap_composite_is_accepted_by_one_dose_trainer(
         tmp_path,
         current_version=int(producer["version"]),
         base_seed=400,
+        monkeypatch=monkeypatch,
     )
     lock_path = tmp_path / "contract.lock.json"
     lock_path.write_text(json.dumps(lock), encoding="utf-8")
@@ -578,6 +674,16 @@ def test_real_memmap_composite_is_accepted_by_one_dose_trainer(
         expected_games=expected_games,
     )
     descriptor_path = Path(str(receipt["descriptor"]["path"]))
+    # A learner B200 receives the filtered composite and authority bundle, not
+    # the multi-gigabyte raw generation tree.  Removing every original data
+    # shard/manifest must not weaken or break preflight.
+    for record in data_shards:
+        Path(record["path"]).unlink()
+    for record in json.loads(Path(audit["path"]).read_text())["shards"]:
+        if record.get("kind") == "generation_manifest":
+            Path(record["path"]).unlink()
+    (tmp_path / "historical.npz").unlink()
+    (tmp_path / "historical.generation.json").unlink()
     meta = builder.train_bc._preflight_memmap_composite_descriptor(  # noqa: SLF001
         descriptor_path
     )
@@ -591,6 +697,7 @@ def test_real_memmap_composite_is_accepted_by_one_dose_trainer(
         data_path=descriptor_path,
         meta=meta,
         validation_path=None,
+        build_receipt_path=output / "build_receipt.json",
     )
 
     assert verified["data_kind"] == "production_composite_v2"
@@ -601,3 +708,40 @@ def test_real_memmap_composite_is_accepted_by_one_dose_trainer(
     assert verified["corpus_row_count"] == 16
     assert verified["training_row_count"] + verified["validation_row_count"] == 16
     assert verified["validation_split_receipt"]["aggregate"]["selected_game_count"] == 8
+
+    authority_path = Path(receipt["source_authority"]["path"])
+    tampered = json.loads(authority_path.read_text(encoding="utf-8"))
+    tampered["canonical_composite_root"] = str(tmp_path.resolve())
+    binding = tampered["fresh_source_bindings"][0]
+    binding["source_path"] = str(tmp_path / "never-audited.npz")
+    preimage = dict(binding)
+    preimage.pop("source_id")
+    binding["source_id"] = builder._digest(preimage)  # noqa: SLF001
+    tampered["fresh_source_bindings_sha256"] = builder._digest(  # noqa: SLF001
+        tampered["fresh_source_bindings"]
+    )
+    tampered.pop("authority_sha256")
+    tampered["authority_sha256"] = builder._digest(tampered)  # noqa: SLF001
+    tampered_path = tmp_path / "tampered-source-authority.json"
+    tampered_path.write_text(json.dumps(tampered), encoding="utf-8")
+    with pytest.raises(SystemExit, match="evidence drift"):
+        builder.train_bc._validate_flywheel_source_authority(tampered_path)  # noqa: SLF001
+
+    staged_selected = Path(
+        json.loads(authority_path.read_text(encoding="utf-8"))[
+            "selected_game_manifest"
+        ]["path"]
+    )
+    original_selected = staged_selected.read_bytes()
+    staged_selected.write_bytes(original_selected + b"\n")
+    with pytest.raises(SystemExit, match="byte binding drift"):
+        builder.train_bc._validate_flywheel_source_authority(authority_path)  # noqa: SLF001
+    staged_selected.write_bytes(original_selected)
+
+    descriptor = json.loads(descriptor_path.read_text(encoding="utf-8"))
+    fresh_provenance = json.loads(
+        Path(descriptor["components"][0]["provenance_manifest"]).read_text()
+    )
+    Path(fresh_provenance["shards"][0]["path"]).unlink()
+    with pytest.raises(SystemExit, match="fresh shard is missing"):
+        builder.train_bc._preflight_memmap_composite_descriptor(descriptor_path)  # noqa: SLF001

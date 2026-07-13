@@ -2017,12 +2017,388 @@ def _training_data_fingerprint(path: str, data_format: str) -> str:
     return ""
 
 
+def _validate_flywheel_source_authority(path: Path) -> dict[str, object]:
+    """Validate the portable pre-descriptor wave authority.
+
+    Large raw shards are authenticated while the composite is built and remain
+    represented by immutable source-id preimages.  Training intentionally does
+    not require those original paths: all small semantic evidence needed to
+    interpret the preimages is copied into the composite authority bundle.
+    """
+
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise SystemExit(f"cannot load flywheel source authority {path}: {error}") from error
+    expected = {
+        "schema_version",
+        "canonical_composite_root",
+        "current_contract",
+        "selected_game_manifest",
+        "post_wave_audit",
+        "fresh_source_bindings",
+        "fresh_source_bindings_sha256",
+        "fresh_generation_manifests",
+        "fresh_generation_manifests_sha256",
+        "historical_replay",
+        "authority_sha256",
+    }
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != expected
+        or payload.get("schema_version")
+        != "a1-post-wave-composite-source-authority-v1"
+    ):
+        raise SystemExit("flywheel source authority fields/schema drift")
+    try:
+        canonical_root = Path(
+            str(payload["canonical_composite_root"])
+        ).expanduser().resolve(strict=True)
+    except OSError as error:
+        raise SystemExit(f"flywheel canonical composite root is missing: {error}") from error
+    if (
+        not canonical_root.is_dir()
+        or str(canonical_root) != payload["canonical_composite_root"]
+        or path.resolve(strict=True).parent != canonical_root
+    ):
+        raise SystemExit("flywheel authority is not at its canonical install root")
+    unhashed = dict(payload)
+    declared = unhashed.pop("authority_sha256", None)
+    if declared != _canonical_json_sha256(unhashed):
+        raise SystemExit("flywheel source authority digest mismatch")
+
+    def verified_json_ref(
+        raw: object, *, fields: set[str], kind: str
+    ) -> tuple[Path, dict[str, object]]:
+        if not isinstance(raw, dict) or set(raw) != fields:
+            raise SystemExit("flywheel source authority artifact fields drift")
+        try:
+            artifact = Path(str(raw["path"])).expanduser().resolve(strict=True)
+            value = json.loads(artifact.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as error:
+            raise SystemExit(
+                f"cannot load flywheel source authority artifact: {error}"
+            ) from error
+        if (
+            not isinstance(value, dict)
+            or str(artifact) != raw["path"]
+            or _sha256_existing_file(artifact) != raw["file_sha256"]
+        ):
+            raise SystemExit("flywheel source authority artifact byte binding drift")
+        if kind == "contract":
+            semantic = dict(value)
+            stated = semantic.pop("contract_sha256", None)
+            actual = _canonical_json_sha256(semantic)
+            referenced = raw.get("contract_sha256")
+        elif kind == "audit":
+            semantic = {key: item for key, item in value.items() if key != "audit_sha256"}
+            stated = value.get("audit_sha256")
+            actual = _canonical_json_sha256(semantic)
+            referenced = raw.get("audit_sha256")
+        else:
+            stated = value.get("records_sha256")
+            actual = _canonical_json_sha256(value.get("records"))
+            referenced = raw.get("records_sha256")
+        if stated != actual or referenced != actual:
+            raise SystemExit("flywheel source authority semantic digest drift")
+        if kind == "selected" and (
+            raw.get("manifest_sha256") != _canonical_json_sha256(value)
+            or raw.get("selected_game_seed_set_sha256")
+            != value.get("selected_game_seed_set_sha256")
+        ):
+            raise SystemExit("flywheel selected-game authority digest drift")
+        if kind == "audit" and raw.get("shard_inventory_sha256") != value.get(
+            "shard_inventory_sha256"
+        ):
+            raise SystemExit("flywheel post-wave shard inventory drift")
+        return artifact, value
+
+    contract_fields = {"path", "file_sha256", "contract_sha256"}
+    selected_fields = {
+        "path",
+        "file_sha256",
+        "manifest_sha256",
+        "records_sha256",
+        "selected_game_seed_set_sha256",
+    }
+    audit_fields = {
+        "path",
+        "file_sha256",
+        "audit_sha256",
+        "shard_inventory_sha256",
+    }
+    _contract_path, current_contract = verified_json_ref(
+        payload["current_contract"],
+        fields=contract_fields,
+        kind="contract",
+    )
+    _selected_path, selected = verified_json_ref(
+        payload["selected_game_manifest"],
+        fields=selected_fields,
+        kind="selected",
+    )
+    _audit_path, audit = verified_json_ref(
+        payload["post_wave_audit"],
+        fields=audit_fields,
+        kind="audit",
+    )
+    if (
+        selected.get("a1_contract_sha256")
+        != current_contract.get("contract_sha256")
+        or audit.get("contract_sha256") != current_contract.get("contract_sha256")
+        or payload["selected_game_manifest"].get("manifest_sha256")
+        != _canonical_json_sha256(selected)
+        or payload["selected_game_manifest"].get("selected_game_seed_set_sha256")
+        != selected.get("selected_game_seed_set_sha256")
+        or payload["post_wave_audit"].get("shard_inventory_sha256")
+        != audit.get("shard_inventory_sha256")
+    ):
+        raise SystemExit("flywheel current wave authority chain drift")
+
+    binding_fields = {
+        "source_id",
+        "contract_sha256",
+        "audit_file_sha256",
+        "audit_sha256",
+        "selected_manifest_file_sha256",
+        "selected_records_sha256",
+        "job_id",
+        "category",
+        "source_path",
+        "source_sha256",
+        "generation_manifest_path",
+        "generation_manifest_sha256",
+    }
+
+    manifest_fields = {
+        "job_id",
+        "category",
+        "original_path",
+        "original_file_sha256",
+        "artifact",
+    }
+
+    def verified_manifests(
+        raw: object, *, digest: object
+    ) -> dict[tuple[str, str, str], dict[str, object]]:
+        if not isinstance(raw, list) or not raw or digest != _canonical_json_sha256(raw):
+            raise SystemExit("flywheel generation-manifest inventory digest drift")
+        verified: dict[tuple[str, str, str], dict[str, object]] = {}
+        for index, record in enumerate(raw):
+            if not isinstance(record, dict) or set(record) != manifest_fields:
+                raise SystemExit(
+                    f"flywheel staged generation manifest {index} fields drift"
+                )
+            artifact = record["artifact"]
+            if not isinstance(artifact, dict) or set(artifact) != {
+                "path",
+                "file_sha256",
+            }:
+                raise SystemExit("flywheel staged generation-manifest ref drift")
+            try:
+                artifact_path = Path(str(artifact["path"])).expanduser().resolve(
+                    strict=True
+                )
+            except OSError as error:
+                raise SystemExit(
+                    f"flywheel staged generation manifest is missing: {error}"
+                ) from error
+            identity = (
+                str(record["job_id"]),
+                str(record["original_path"]),
+                str(record["original_file_sha256"]),
+            )
+            if (
+                identity in verified
+                or not artifact_path.is_file()
+                or str(artifact_path) != artifact["path"]
+                or _sha256_existing_file(artifact_path) != artifact["file_sha256"]
+                or artifact["file_sha256"] != record["original_file_sha256"]
+            ):
+                raise SystemExit("flywheel staged generation-manifest bytes drift")
+            verified[identity] = record
+        return verified
+
+    def verified_bindings(
+        raw: object,
+        *,
+        digest: object,
+        contract_sha256: object,
+        selected_ref: dict[str, object],
+        audit_ref: dict[str, object],
+        audit_payload: dict[str, object],
+        manifests: dict[tuple[str, str, str], dict[str, object]],
+    ) -> tuple[list[dict[str, object]], set[str]]:
+        if not isinstance(raw, list) or not raw or digest != _canonical_json_sha256(raw):
+            raise SystemExit("flywheel source-binding inventory digest drift")
+        seen: set[str] = set()
+        normalized: list[dict[str, object]] = []
+        raw_audit_records = audit_payload.get("shards")
+        if not isinstance(raw_audit_records, list):
+            raise SystemExit("flywheel staged audit has no shard inventory")
+        audited_sources = {
+            (
+                str(value.get("job_id", "")),
+                str(value.get("category", "")),
+                str(value.get("path", "")),
+                str(value.get("sha256", "")),
+            )
+            for value in raw_audit_records
+            if isinstance(value, dict) and value.get("kind") == "data_shard"
+        }
+        audited_manifests = {
+            (
+                str(value.get("job_id", "")),
+                str(value.get("category", "")),
+                str(value.get("path", "")),
+                str(value.get("sha256", "")),
+            )
+            for value in raw_audit_records
+            if isinstance(value, dict)
+            and value.get("kind") == "generation_manifest"
+        }
+        if not audited_sources or not audited_manifests:
+            raise SystemExit("flywheel staged audit omits source/manifest evidence")
+        for index, record in enumerate(raw):
+            if not isinstance(record, dict) or set(record) != binding_fields:
+                raise SystemExit(f"flywheel source binding {index} fields drift")
+            preimage = dict(record)
+            source_id = preimage.pop("source_id")
+            if (
+                not isinstance(source_id, str)
+                or source_id in seen
+                or source_id != _canonical_json_sha256(preimage)
+                or record.get("contract_sha256") != contract_sha256
+                or record.get("selected_manifest_file_sha256")
+                != selected_ref.get("file_sha256")
+                or record.get("selected_records_sha256")
+                != selected_ref.get("records_sha256")
+                or record.get("audit_file_sha256") != audit_ref.get("file_sha256")
+                or record.get("audit_sha256") != audit_ref.get("audit_sha256")
+            ):
+                raise SystemExit(f"flywheel source binding {index} identity drift")
+            if (
+                not Path(str(record["source_path"])).is_absolute()
+                or not Path(str(record["generation_manifest_path"])).is_absolute()
+                or not _is_sha256(record["source_sha256"])
+                or (
+                    str(record["job_id"]),
+                    str(record["generation_manifest_path"]),
+                    str(record["generation_manifest_sha256"]),
+                )
+                not in manifests
+                or (
+                    str(record["job_id"]),
+                    str(record["category"]),
+                    str(record["source_path"]),
+                    str(record["source_sha256"]),
+                )
+                not in audited_sources
+                or (
+                    str(record["job_id"]),
+                    str(record["category"]),
+                    str(record["generation_manifest_path"]),
+                    str(record["generation_manifest_sha256"]),
+                )
+                not in audited_manifests
+            ):
+                raise SystemExit(f"flywheel source binding {index} evidence drift")
+            seen.add(source_id)
+            normalized.append(record)
+        return normalized, seen
+
+    fresh_manifests = verified_manifests(
+        payload["fresh_generation_manifests"],
+        digest=payload["fresh_generation_manifests_sha256"],
+    )
+    fresh_bindings, fresh_ids = verified_bindings(
+        payload["fresh_source_bindings"],
+        digest=payload["fresh_source_bindings_sha256"],
+        contract_sha256=current_contract["contract_sha256"],
+        selected_ref=payload["selected_game_manifest"],
+        audit_ref=payload["post_wave_audit"],
+        audit_payload=audit,
+        manifests=fresh_manifests,
+    )
+
+    historical_authority = payload["historical_replay"]
+    historical_fields = {
+        "schema_version",
+        "source_contract",
+        "selected_game_manifest",
+        "post_wave_audit",
+        "source_bindings",
+        "source_bindings_sha256",
+        "generation_manifests",
+        "generation_manifests_sha256",
+        "component_provenance_sha256",
+        "component_payload_inventory_sha256",
+        "authority_sha256",
+    }
+    if (
+        not isinstance(historical_authority, dict)
+        or set(historical_authority) != historical_fields
+        or historical_authority.get("schema_version")
+        != "a1-historical-replay-authority-v1"
+    ):
+        raise SystemExit("historical replay authority reference fields drift")
+    historical_unhashed = dict(historical_authority)
+    historical_declared = historical_unhashed.pop("authority_sha256", None)
+    if (
+        historical_declared != _canonical_json_sha256(historical_unhashed)
+    ):
+        raise SystemExit("historical replay authority digest drift")
+    _prior_path, prior_contract = verified_json_ref(
+        historical_authority.get("source_contract"),
+        fields=contract_fields,
+        kind="contract",
+    )
+    _prior_selected_path, prior_selected = verified_json_ref(
+        historical_authority.get("selected_game_manifest"),
+        fields=selected_fields,
+        kind="selected",
+    )
+    _prior_audit_path, prior_audit = verified_json_ref(
+        historical_authority.get("post_wave_audit"),
+        fields=audit_fields,
+        kind="audit",
+    )
+    if (
+        prior_selected.get("a1_contract_sha256")
+        != prior_contract.get("contract_sha256")
+        or prior_audit.get("contract_sha256") != prior_contract.get("contract_sha256")
+    ):
+        raise SystemExit("historical replay prior authority chain drift")
+    historical_manifests = verified_manifests(
+        historical_authority.get("generation_manifests"),
+        digest=historical_authority.get("generation_manifests_sha256"),
+    )
+    historical_bindings, historical_ids = verified_bindings(
+        historical_authority.get("source_bindings"),
+        digest=historical_authority.get("source_bindings_sha256"),
+        contract_sha256=prior_contract["contract_sha256"],
+        selected_ref=historical_authority["selected_game_manifest"],
+        audit_ref=historical_authority["post_wave_audit"],
+        audit_payload=prior_audit,
+        manifests=historical_manifests,
+    )
+    return {
+        **payload,
+        "fresh_source_bindings": fresh_bindings,
+        "fresh_source_ids": fresh_ids,
+        "historical_source_bindings": historical_bindings,
+        "historical_source_ids": historical_ids,
+    }
+
+
 def _validate_flywheel_component_provenance(
     path: Path,
     *,
     component_id: str,
     corpus_dir: Path,
     corpus_meta: dict[str, object],
+    source_authority_ref: dict[str, str] | None = None,
+    allowed_source_ids: set[str] | None = None,
 ) -> dict[str, object]:
     """Authenticate the exact shards and producer checkpoints in one replay arm."""
 
@@ -2043,9 +2419,15 @@ def _validate_flywheel_component_provenance(
         "shard_inventory_sha256",
         "component_mass",
     }
+    schema_version = payload.get("schema_version") if isinstance(payload, dict) else None
+    if schema_version == "flywheel-replay-component-v2":
+        expected.add("source_authority_manifest")
     if not isinstance(payload, dict) or set(payload) != expected:
         raise SystemExit("flywheel component provenance fields differ from schema")
-    if payload.get("schema_version") != "flywheel-replay-component-v1":
+    if schema_version not in {
+        "flywheel-replay-component-v1",
+        "flywheel-replay-component-v2",
+    }:
         raise SystemExit("flywheel component provenance schema is unsupported")
     if payload.get("component_id") != component_id:
         raise SystemExit("flywheel component provenance id differs from descriptor")
@@ -2072,6 +2454,8 @@ def _validate_flywheel_component_provenance(
     if role == "fresh" and (
         versions != [current_version]
         or source_category not in FRESH_SOURCE_GAME_RATIOS
+        or schema_version != "flywheel-replay-component-v2"
+        or payload.get("source_authority_manifest") != source_authority_ref
     ):
         raise SystemExit("flywheel fresh component must bind the initializer version/source")
     if role == "replay" and source_category != HISTORICAL_REPLAY_CATEGORY:
@@ -2119,17 +2503,15 @@ def _validate_flywheel_component_provenance(
         raise SystemExit("flywheel component has no authenticated shards")
     canonical_inventory: list[dict[str, object]] = []
     seen_paths: set[str] = set()
+    seen_source_ids: set[str] = set()
     rows = 0
     for record in shards:
         if not isinstance(record, dict) or set(record) != shard_fields:
             raise SystemExit("flywheel shard provenance record is malformed")
-        try:
-            shard_path = Path(str(record["path"])).expanduser().resolve(strict=True)
-        except OSError as error:
-            raise SystemExit(f"flywheel replay shard is missing: {record.get('path')}") from error
+        shard_path = Path(str(record["path"])).expanduser()
         version = record["checkpoint_version"]
         if (
-            str(shard_path) != record["path"]
+            not shard_path.is_absolute()
             or str(shard_path) in seen_paths
             or isinstance(record["rows"], bool)
             or not isinstance(record["rows"], int)
@@ -2141,6 +2523,10 @@ def _validate_flywheel_component_provenance(
             or version not in producer_by_version
             or not isinstance(record["source_id"], str)
             or not record["source_id"]
+            or isinstance(record["size_bytes"], bool)
+            or not isinstance(record["size_bytes"], int)
+            or int(record["size_bytes"]) <= 0
+            or not _is_sha256(record["sha256"])
             or record["source_category"] not in FRESH_SOURCE_GAME_RATIOS
             or (
                 role == "fresh"
@@ -2152,11 +2538,32 @@ def _validate_flywheel_component_provenance(
         if (
             record["producer_checkpoint_path"] != producer["path"]
             or record["producer_checkpoint_sha256"] != producer["sha256"]
-            or record["size_bytes"] != shard_path.stat().st_size
-            or record["sha256"] != _sha256_existing_file(shard_path)
         ):
             raise SystemExit("flywheel shard/checkpoint provenance binding drift")
+        # Fresh filtered shards are the learner input and must always be present.
+        # Replay raw shards were fully verified by the historical sealer; after
+        # transfer only their authenticated preimages and the replay memmap are
+        # required.  If an archived raw shard is present, still reject byte drift.
+        if role == "fresh":
+            try:
+                resolved_shard = shard_path.resolve(strict=True)
+            except OSError as error:
+                raise SystemExit(
+                    f"flywheel fresh shard is missing: {record.get('path')}"
+                ) from error
+            if (
+                str(resolved_shard) != record["path"]
+                or record["size_bytes"] != resolved_shard.stat().st_size
+                or record["sha256"] != _sha256_existing_file(resolved_shard)
+            ):
+                raise SystemExit("flywheel fresh shard bytes drift")
+        elif shard_path.exists() and (
+            record["size_bytes"] != shard_path.stat().st_size
+            or record["sha256"] != _sha256_existing_file(shard_path)
+        ):
+            raise SystemExit("flywheel archived replay shard bytes drift")
         seen_paths.add(str(shard_path))
+        seen_source_ids.add(str(record["source_id"]))
         rows += int(record["rows"])
         canonical_inventory.append(record)
     if payload.get("shard_inventory_sha256") != _canonical_json_sha256(canonical_inventory):
@@ -2172,6 +2579,12 @@ def _validate_flywheel_component_provenance(
         raise SystemExit(f"cannot measure flywheel component sampler mass: {error}") from error
     if payload.get("component_mass") != actual_mass:
         raise SystemExit("flywheel component game/row/policy-active mass drift")
+    if (
+        allowed_source_ids is None
+        or not seen_source_ids
+        or not seen_source_ids.issubset(allowed_source_ids)
+    ):
+        raise SystemExit("flywheel component shards lack authenticated source preimages")
     return payload
 
 
@@ -2211,6 +2624,9 @@ def _preflight_memmap_composite_descriptor(path: str | Path) -> dict[str, object
             "stored_policy_component_temperatures",
             "value_training_component_ids",
             "flywheel_replay_contract",
+            "source_authority_manifest",
+            "source_authority_manifest_sha256",
+            "source_authority_sha256",
         }
         # Optional for backward compatibility: absence preserves the historical
         # all-components objective scopes. Presence is authenticated by the
@@ -2245,6 +2661,42 @@ def _preflight_memmap_composite_descriptor(path: str | Path) -> dict[str, object
         raise SystemExit("promotion-eligible composite lacks flywheel replay contract")
     if not is_flywheel_production and "flywheel_replay_contract" in descriptor:
         raise SystemExit("diagnostic composite may not claim flywheel replay provenance")
+    source_authority: dict[str, object] | None = None
+    source_authority_ref: dict[str, str] | None = None
+    authority_fields = {
+        "source_authority_manifest",
+        "source_authority_manifest_sha256",
+        "source_authority_sha256",
+    }
+    if is_flywheel_production:
+        if not authority_fields.issubset(descriptor):
+            raise SystemExit("promotion-eligible composite lacks source authority")
+        try:
+            source_authority_path = Path(
+                str(descriptor["source_authority_manifest"])
+            ).expanduser().resolve(strict=True)
+        except OSError as error:
+            raise SystemExit(f"cannot resolve flywheel source authority: {error}") from error
+        if (
+            str(source_authority_path) != descriptor["source_authority_manifest"]
+            or _sha256_existing_file(source_authority_path)
+            != descriptor["source_authority_manifest_sha256"]
+        ):
+            raise SystemExit("flywheel source-authority byte binding drift")
+        source_authority = _validate_flywheel_source_authority(
+            source_authority_path
+        )
+        if source_authority.get("authority_sha256") != descriptor[
+            "source_authority_sha256"
+        ]:
+            raise SystemExit("flywheel source-authority semantic binding drift")
+        source_authority_ref = {
+            "path": str(source_authority_path),
+            "file_sha256": str(descriptor["source_authority_manifest_sha256"]),
+            "authority_sha256": str(descriptor["source_authority_sha256"]),
+        }
+    elif authority_fields.intersection(descriptor):
+        raise SystemExit("diagnostic composite may not claim source authority")
     raw_components = descriptor.get("components")
     if not isinstance(raw_components, list) or (
         len(raw_components) != 2
@@ -2311,6 +2763,14 @@ def _preflight_memmap_composite_descriptor(path: str | Path) -> dict[str, object
                 if is_flywheel_production
                 else set()
             ),
+            *(
+                {
+                    "source_authority_manifest",
+                    "source_authority_manifest_sha256",
+                }
+                if is_flywheel_production
+                else set()
+            ),
         }
     )
     component_ids: list[str] = []
@@ -2374,7 +2834,17 @@ def _preflight_memmap_composite_descriptor(path: str | Path) -> dict[str, object
                     f"flywheel composite component {index} lacks game_seed"
                 )
             bound_provenance = corpus_meta.get("flywheel_component_provenance")
-            if not isinstance(bound_provenance, dict):
+            is_historical_replay = (
+                raw.get("component_id") == HISTORICAL_REPLAY_CATEGORY
+            )
+            if (
+                not is_historical_replay
+                and not isinstance(bound_provenance, dict)
+            ) or (
+                is_historical_replay
+                and bound_provenance is not None
+                and not isinstance(bound_provenance, dict)
+            ):
                 raise SystemExit(
                     f"flywheel composite component {index} lacks bound provenance"
                 )
@@ -2401,10 +2871,27 @@ def _preflight_memmap_composite_descriptor(path: str | Path) -> dict[str, object
                 f"{evidence_field.replace('_', ' ')} hash mismatch"
             )
         if is_flywheel_production:
-            if bound_provenance != {
+            if (
+                raw["source_authority_manifest"]
+                != descriptor["source_authority_manifest"]
+                or raw["source_authority_manifest_sha256"]
+                != descriptor["source_authority_manifest_sha256"]
+            ):
+                raise SystemExit(
+                    f"flywheel composite component {index} source authority drift"
+                )
+            expected_bound_provenance = {
                 "path": str(evidence_path),
                 "file_sha256": actual_evidence_sha,
-            }:
+            }
+            if (
+                raw["component_id"] != HISTORICAL_REPLAY_CATEGORY
+                and bound_provenance != expected_bound_provenance
+            ) or (
+                raw["component_id"] == HISTORICAL_REPLAY_CATEGORY
+                and bound_provenance is not None
+                and bound_provenance != expected_bound_provenance
+            ):
                 raise SystemExit(
                     f"flywheel composite component {index} corpus provenance binding drift"
                 )
@@ -2413,6 +2900,12 @@ def _preflight_memmap_composite_descriptor(path: str | Path) -> dict[str, object
                 component_id=str(raw["component_id"]),
                 corpus_dir=corpus_dir,
                 corpus_meta=corpus_meta,
+                source_authority_ref=source_authority_ref,
+                allowed_source_ids=(
+                    set(source_authority["fresh_source_ids"])
+                    if raw["component_id"] in FRESH_SOURCE_GAME_RATIOS
+                    else set(source_authority["historical_source_ids"])
+                ),
             )
             if (
                 raw["source_category"] != provenance["source_category"]
@@ -2615,6 +3108,18 @@ def _preflight_memmap_composite_descriptor(path: str | Path) -> dict[str, object
             provenance_by_id[value].get("role") != "replay" for value in replay_ids
         ):
             raise SystemExit("flywheel component roles differ from replay contract")
+        if source_authority is None or source_authority_ref is None:
+            raise SystemExit("flywheel production composite has no verified authority")
+        replay_authority = source_authority.get("historical_replay")
+        replay_component = components[component_ids.index(HISTORICAL_REPLAY_CATEGORY)]
+        if (
+            not isinstance(replay_authority, dict)
+            or replay_authority.get("component_provenance_sha256")
+            != replay_component.get("provenance_manifest_sha256")
+            or replay_authority.get("component_payload_inventory_sha256")
+            != replay_component.get("payload_inventory_sha256")
+        ):
+            raise SystemExit("historical source authority differs from replay component")
         current_version = raw_contract.get("current_checkpoint_version")
         if (
             isinstance(current_version, bool)
@@ -2774,6 +3279,8 @@ def _preflight_memmap_composite_descriptor(path: str | Path) -> dict[str, object
         "value_training_scope_explicit": value_training_scope_explicit,
         "flywheel_replay_contract": flywheel_replay_contract,
         "production_mix_contract": flywheel_replay_contract,
+        "source_authority": source_authority,
+        "source_authority_ref": source_authority_ref,
     }
 
 

@@ -458,6 +458,8 @@ def _input_binding(verified: dict[str, Any]) -> dict[str, Any]:
                 "validation_split_receipt_sha256": verified[
                     "validation_split_receipt_sha256"
                 ],
+                "composite_build_receipt": verified["composite_build_receipt"],
+                "source_authority": verified.get("source_authority_ref"),
             }
         )
     else:
@@ -675,6 +677,7 @@ def verify_training_inputs(
     lock_path: Path,
     data_path: Path,
     validation_path: Path | None,
+    composite_build_receipt: Path | None = None,
     reviewed_lock_file_sha256: str | None = None,
 ) -> dict[str, Any]:
     """Replay the sealed lock and complete audit→memmap→holdout chain."""
@@ -686,6 +689,11 @@ def verify_training_inputs(
             None
             if validation_path is None
             else validation_path.expanduser().resolve(strict=True)
+        )
+        composite_build_receipt = (
+            None
+            if composite_build_receipt is None
+            else composite_build_receipt.expanduser().resolve(strict=True)
         )
     except OSError as error:
         raise ExecutorError(f"cannot resolve A1 training input: {error}") from error
@@ -713,6 +721,11 @@ def verify_training_inputs(
                 data_path=data_path,
                 meta=meta,
                 validation_path=validation_path,
+                build_receipt_path=composite_build_receipt,
+            )
+        if composite_build_receipt is not None:
+            raise ExecutorError(
+                "--composite-build-receipt is valid only for a production composite"
             )
         if validation_path is None:
             raise ExecutorError("ordinary A1 memmap input requires a validation manifest")
@@ -793,6 +806,95 @@ def _component_game_identity_sha256(
     return _value_sha256(records)
 
 
+def _validate_production_composite_build_receipt(
+    *,
+    path: Path,
+    lock: dict[str, Any],
+    lock_path: Path,
+    data_path: Path,
+    meta: dict[str, Any],
+) -> dict[str, Any]:
+    """Bind the learner to the builder's final atomic commit record."""
+
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ExecutorError(f"cannot load composite build receipt: {error}") from error
+    expected = {
+        "schema_version",
+        "contract",
+        "selected_game_manifest",
+        "post_wave_audit",
+        "historical_component_reference",
+        "source_bindings",
+        "source_bindings_sha256",
+        "source_authority",
+        "descriptor",
+        "sampling_receipt",
+        "verified_descriptor_fingerprint",
+        "receipt_sha256",
+    }
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != expected
+        or payload.get("schema_version") != "a1-post-wave-composite-build-v1"
+    ):
+        raise ExecutorError("composite build receipt fields/schema drift")
+    unhashed = dict(payload)
+    stated = unhashed.pop("receipt_sha256", None)
+    if stated != _value_sha256(unhashed):
+        raise ExecutorError("composite build receipt semantic digest drift")
+    contract_ref = payload["contract"]
+    descriptor_ref = payload["descriptor"]
+    authority_ref = payload["source_authority"]
+    if (
+        not isinstance(contract_ref, dict)
+        or set(contract_ref) != {"path", "file_sha256", "contract_sha256"}
+        or not Path(str(contract_ref["path"])).is_absolute()
+        or contract_ref["file_sha256"] != _file_sha256(lock_path)
+        or contract_ref["contract_sha256"] != lock["contract_sha256"]
+    ):
+        raise ExecutorError("composite build receipt binds a different A1 lock")
+    if (
+        not isinstance(descriptor_ref, dict)
+        or set(descriptor_ref) != {"path", "file_sha256", "fingerprint"}
+        or descriptor_ref["path"] != str(data_path)
+        or descriptor_ref["file_sha256"] != meta.get("descriptor_file_sha256")
+        or descriptor_ref["fingerprint"] != meta.get("descriptor_fingerprint")
+        or payload["verified_descriptor_fingerprint"]
+        != meta.get("descriptor_fingerprint")
+    ):
+        raise ExecutorError("composite build receipt descriptor binding drift")
+    expected_authority = meta.get("source_authority_ref")
+    if (
+        not isinstance(authority_ref, dict)
+        or authority_ref != expected_authority
+        or not isinstance(meta.get("source_authority"), dict)
+    ):
+        raise ExecutorError("composite build receipt source-authority binding drift")
+    current_contract = meta["source_authority"].get("current_contract")
+    if (
+        not isinstance(current_contract, dict)
+        or current_contract.get("file_sha256") != _file_sha256(lock_path)
+        or current_contract.get("contract_sha256") != lock["contract_sha256"]
+    ):
+        raise ExecutorError("composite source authority binds a different A1 lock")
+    bindings = payload["source_bindings"]
+    if (
+        not isinstance(bindings, list)
+        or payload["source_bindings_sha256"] != _value_sha256(bindings)
+        or bindings != meta["source_authority"].get("fresh_source_bindings")
+        or payload["sampling_receipt"]
+        != meta.get("production_mix_contract", {}).get("sampling_receipt")
+    ):
+        raise ExecutorError("composite build receipt input/sampling binding drift")
+    return {
+        "path": str(path),
+        "file_sha256": _file_sha256(path),
+        "receipt_sha256": stated,
+    }
+
+
 def _verify_production_composite_inputs(
     *,
     lock: dict[str, Any],
@@ -804,6 +906,7 @@ def _verify_production_composite_inputs(
     data_path: Path,
     meta: dict[str, Any],
     validation_path: Path | None,
+    build_receipt_path: Path | None,
 ) -> dict[str, Any]:
     """Authenticate the promotion-eligible 64/12/4/20 replay descriptor.
 
@@ -817,6 +920,10 @@ def _verify_production_composite_inputs(
         raise ExecutorError(
             "production composite binds its deterministic component-aware split; "
             "do not pass a separate validation manifest"
+        )
+    if build_receipt_path is None:
+        raise ExecutorError(
+            "production composite requires its atomic --composite-build-receipt"
         )
     expected_ids = [
         "current_producer",
@@ -855,6 +962,13 @@ def _verify_production_composite_inputs(
         raise ExecutorError("production composite is not exact 64/12/4/20 replay")
     if contract.get("initializer_checkpoint_sha256") != producer.get("sha256"):
         raise ExecutorError("production composite initializer differs from sealed producer")
+    build_receipt = _validate_production_composite_build_receipt(
+        path=build_receipt_path,
+        lock=lock,
+        lock_path=lock_path,
+        data_path=data_path,
+        meta=meta,
+    )
     receipt = contract.get("sampling_receipt")
     if (
         not isinstance(receipt, dict)
@@ -1010,9 +1124,11 @@ def _verify_production_composite_inputs(
             trainer_validation_game_seed_set_sha256
         ),
         "production_mix_contract": contract,
+        "source_authority_ref": meta.get("source_authority_ref"),
         "production_sampling_receipt_sha256": contract["sampling_receipt_sha256"],
         "validation_split_receipt": split_receipt,
         "validation_split_receipt_sha256": split_receipt_sha256,
+        "composite_build_receipt": build_receipt,
     }
 
 
@@ -3316,6 +3432,15 @@ def build_parser() -> argparse.ArgumentParser:
             "flywheel composite, which binds its own whole-game split"
         ),
     )
+    parser.add_argument(
+        "--composite-build-receipt",
+        type=Path,
+        default=None,
+        help=(
+            "required atomic builder receipt for a promotion-eligible flywheel "
+            "composite; forbidden for ordinary A1 memmaps"
+        ),
+    )
     parser.add_argument("--checkpoint", required=True, type=Path)
     parser.add_argument("--report", required=True, type=Path)
     parser.add_argument("--receipt", required=True, type=Path)
@@ -3408,6 +3533,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             lock_path=args.lock,
             data_path=args.data,
             validation_path=args.validation_manifest,
+            composite_build_receipt=args.composite_build_receipt,
             reviewed_lock_file_sha256=(
                 args.reviewed_lock_file_sha256 if all(ablation_values) else None
             ),
@@ -3484,6 +3610,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             "validation_split_receipt_sha256": verified.get(
                 "validation_split_receipt_sha256"
             ),
+            "composite_build_receipt": verified.get("composite_build_receipt"),
+            "source_authority": verified.get("source_authority_ref"),
             "command": command,
             "command_sha256": _value_sha256(command),
             "execution_binding": execution_binding,

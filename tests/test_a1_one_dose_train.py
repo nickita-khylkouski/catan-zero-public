@@ -298,6 +298,53 @@ def _production_composite_meta(tmp_path: Path, producer_sha256: str) -> dict:
     }
 
 
+def _production_composite_build_receipt(
+    tmp_path: Path,
+    *,
+    verified: dict,
+    descriptor: Path,
+    meta: dict,
+) -> Path:
+    authority_ref = {
+        "path": str((tmp_path / "source-authority.json").resolve()),
+        "file_sha256": "sha256:" + "7" * 64,
+        "authority_sha256": "sha256:" + "8" * 64,
+    }
+    meta["source_authority_ref"] = authority_ref
+    meta["source_authority"] = {
+        "current_contract": {
+            "file_sha256": executor._file_sha256(verified["lock_path"]),
+            "contract_sha256": verified["contract_sha256"],
+        },
+        "fresh_source_bindings": [],
+    }
+    payload = {
+        "schema_version": "a1-post-wave-composite-build-v1",
+        "contract": {
+            "path": str(verified["lock_path"]),
+            "file_sha256": executor._file_sha256(verified["lock_path"]),
+            "contract_sha256": verified["contract_sha256"],
+        },
+        "selected_game_manifest": {},
+        "post_wave_audit": {},
+        "historical_component_reference": {},
+        "source_bindings": [],
+        "source_bindings_sha256": executor._value_sha256([]),
+        "source_authority": authority_ref,
+        "descriptor": {
+            "path": str(descriptor.resolve()),
+            "file_sha256": meta["descriptor_file_sha256"],
+            "fingerprint": meta["descriptor_fingerprint"],
+        },
+        "sampling_receipt": meta["production_mix_contract"]["sampling_receipt"],
+        "verified_descriptor_fingerprint": meta["descriptor_fingerprint"],
+    }
+    payload["receipt_sha256"] = executor._value_sha256(payload)
+    path = tmp_path / "build-receipt.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
+
+
 def _failed_architecture_attempt(tmp_path: Path) -> tuple[dict, Path, list[str]]:
     torch = pytest.importorskip("torch")
 
@@ -644,6 +691,9 @@ def test_production_composite_receipts_component_whole_game_split(
         lambda *_args, **_kwargs: "sha256:" + "6" * 64,
     )
     meta = _production_composite_meta(tmp_path, producer["sha256"])
+    build_receipt = _production_composite_build_receipt(
+        tmp_path, verified=verified, descriptor=descriptor, meta=meta
+    )
 
     result = executor._verify_production_composite_inputs(
         lock=verified["lock"],
@@ -655,6 +705,7 @@ def test_production_composite_receipts_component_whole_game_split(
         data_path=descriptor,
         meta=meta,
         validation_path=None,
+        build_receipt_path=build_receipt,
     )
 
     split = result["validation_split_receipt"]
@@ -674,6 +725,55 @@ def test_production_composite_receipts_component_whole_game_split(
     ]
     assert result["training_row_count"] == 8
     assert result["validation_row_count"] == 8
+
+
+def test_production_composite_requires_atomic_build_receipt(tmp_path: Path) -> None:
+    verified = _verified(tmp_path)
+    descriptor = tmp_path / "production-composite.json"
+    descriptor.write_text("{}", encoding="utf-8")
+
+    with pytest.raises(executor.ExecutorError, match="requires its atomic"):
+        executor._verify_production_composite_inputs(
+            lock=verified["lock"],
+            lock_path=verified["lock_path"],
+            reviewed_lock_file_sha256=None,
+            recipe=verified["recipe"],
+            objective=verified["objective"],
+            producer=verified["producer"],
+            data_path=descriptor,
+            meta=_production_composite_meta(
+                tmp_path, verified["producer"]["sha256"]
+            ),
+            validation_path=None,
+            build_receipt_path=None,
+        )
+
+
+def test_production_composite_rejects_tampered_build_receipt(tmp_path: Path) -> None:
+    verified = _verified(tmp_path)
+    descriptor = tmp_path / "production-composite.json"
+    descriptor.write_text("{}", encoding="utf-8")
+    meta = _production_composite_meta(tmp_path, verified["producer"]["sha256"])
+    receipt = _production_composite_build_receipt(
+        tmp_path, verified=verified, descriptor=descriptor, meta=meta
+    )
+    payload = json.loads(receipt.read_text(encoding="utf-8"))
+    payload["source_bindings_sha256"] = "sha256:" + "0" * 64
+    receipt.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(executor.ExecutorError, match="semantic digest drift"):
+        executor._verify_production_composite_inputs(
+            lock=verified["lock"],
+            lock_path=verified["lock_path"],
+            reviewed_lock_file_sha256=None,
+            recipe=verified["recipe"],
+            objective=verified["objective"],
+            producer=verified["producer"],
+            data_path=descriptor,
+            meta=meta,
+            validation_path=None,
+            build_receipt_path=receipt,
+        )
 
 
 def test_production_composite_rejects_cross_component_game_seed_reuse(
@@ -708,6 +808,10 @@ def test_production_composite_rejects_cross_component_game_seed_reuse(
         },
     )
 
+    meta = _production_composite_meta(tmp_path, producer["sha256"])
+    build_receipt = _production_composite_build_receipt(
+        tmp_path, verified=verified, descriptor=descriptor, meta=meta
+    )
     with pytest.raises(executor.ExecutorError, match="reuses game seeds"):
         executor._verify_production_composite_inputs(
             lock=verified["lock"],
@@ -717,8 +821,9 @@ def test_production_composite_rejects_cross_component_game_seed_reuse(
             objective=verified["objective"],
             producer=producer,
             data_path=descriptor,
-            meta=_production_composite_meta(tmp_path, producer["sha256"]),
+            meta=meta,
             validation_path=None,
+            build_receipt_path=build_receipt,
         )
 
 
