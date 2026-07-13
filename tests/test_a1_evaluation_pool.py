@@ -210,6 +210,21 @@ def test_internal_pool_reindexes_local_pair_ids_and_recomputes_gate(
     assert result["pentanomial_sprt"] == evaluate_pentanomial_sprt(
         scores, elo0=-10.0, elo1=15.0, alpha=0.05, beta=0.05
     )
+    assert result["superiority_pentanomial_sprt"] == evaluate_pentanomial_sprt(
+        scores, elo0=0.0, elo1=15.0, alpha=0.05, beta=0.05
+    )
+    assert result["superiority_verdict"] == result[
+        "superiority_pentanomial_sprt"
+    ]["decision"]
+    assert result["gate_interpretation"] == {
+        "schema_version": "a1-gate-interpretation-v1",
+        "promotion_gate_semantics": "regression_protection",
+        "promotion_elo0": -10.0,
+        "promotion_elo1": 15.0,
+        "h1_proves_positive_elo": False,
+        "superiority_elo0": 0.0,
+        "superiority_elo1": 15.0,
+    }
     assert len(result["fleet_merge"]["sources"]) == 2
     assert "typed_config" not in result
     assert "config_hash" not in result
@@ -375,6 +390,11 @@ def test_neutral_pool_recomputes_stats_and_preserves_games(tmp_path: Path) -> No
     )
     assert result["candidate_checkpoint"] == str(checkpoint.resolve())
     assert result["effective_search_config"] == result["search_config"]
+    assert result["gate_interpretation"]["h1_proves_positive_elo"] is False
+    scores, _ = pair_scores_from_h2h_games(result["games"])
+    assert result["superiority_pentanomial_sprt"] == evaluate_pentanomial_sprt(
+        scores, elo0=0.0, elo1=15.0, alpha=0.05, beta=0.05
+    )
 
 
 def test_neutral_pool_refuses_checkpoint_hash_drift(tmp_path: Path) -> None:

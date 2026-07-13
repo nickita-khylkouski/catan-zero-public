@@ -362,6 +362,9 @@ def pool_internal(
     pentanomial = evaluate_pentanomial_sprt(
         pair_scores, elo0=-10.0, elo1=15.0, alpha=0.05, beta=0.05
     )
+    superiority = evaluate_pentanomial_sprt(
+        pair_scores, elo0=0.0, elo1=15.0, alpha=0.05, beta=0.05
+    )
     complete_pairs = len(games) // 2
     result = copy.deepcopy(loaded[0][1])
     result.pop("config_hash", None)
@@ -386,6 +389,19 @@ def pool_internal(
             "pair_sprt": evaluate_sprt(outcomes=concordant, elo0=-10.0, elo1=15.0),
             "pentanomial_sprt": pentanomial,
             "verdict": pentanomial["decision"],
+            # The flywheel gate is a regression-protection indifference band.
+            # Its H1 is not a confidence claim that true Elo is positive.
+            "gate_interpretation": {
+                "schema_version": "a1-gate-interpretation-v1",
+                "promotion_gate_semantics": "regression_protection",
+                "promotion_elo0": -10.0,
+                "promotion_elo1": 15.0,
+                "h1_proves_positive_elo": False,
+                "superiority_elo0": 0.0,
+                "superiority_elo1": 15.0,
+            },
+            "superiority_pentanomial_sprt": superiority,
+            "superiority_verdict": superiority["decision"],
             "pair_diagnostics": diagnostics,
             "pairs_decisive": diagnostics["ww_pairs"] + diagnostics["ll_pairs"],
             "pairs_split_excluded": diagnostics["split_pairs"],
@@ -489,6 +505,9 @@ def pool_neutral(paths: Sequence[Path], *, checkpoint: Path) -> dict[str, Any]:
     pentanomial = evaluate_pentanomial_sprt(
         scores, elo0=-10.0, elo1=15.0, alpha=0.05, beta=0.05
     )
+    superiority = evaluate_pentanomial_sprt(
+        scores, elo0=0.0, elo1=15.0, alpha=0.05, beta=0.05
+    )
     pairs = len(games) // 2
     result = copy.deepcopy(loaded[0][1])
     result.update(
@@ -522,6 +541,17 @@ def pool_neutral(paths: Sequence[Path], *, checkpoint: Path) -> dict[str, Any]:
             "sprt": evaluate_sprt(outcomes=outcomes, elo0=-10.0, elo1=15.0),
             "pentanomial_sprt": pentanomial,
             "verdict": pentanomial["decision"],
+            "gate_interpretation": {
+                "schema_version": "a1-gate-interpretation-v1",
+                "promotion_gate_semantics": "regression_protection",
+                "promotion_elo0": -10.0,
+                "promotion_elo1": 15.0,
+                "h1_proves_positive_elo": False,
+                "superiority_elo0": 0.0,
+                "superiority_elo1": 15.0,
+            },
+            "superiority_pentanomial_sprt": superiority,
+            "superiority_verdict": superiority["decision"],
             "pair_diagnostics": diagnostics,
             "workers": sum(int(report.get("workers", 0)) for _, report in loaded),
             "run_fingerprint": promotion._digest_value(

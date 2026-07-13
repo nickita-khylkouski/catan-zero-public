@@ -16,6 +16,31 @@ and run ID is `a1-eval-8106b08c1e81af75`.  The launch atomically claimed
 launched exactly 15 pairs on each of the established 40 H100s; launch status
 was 40 active with zero failed, missing, stale, or unsafe jobs.
 
+The internal phase subsequently completed and collected all 600 pairs / 1,200
+games with no failed, missing, stale, or unsafe jobs and zero truncations.  The
+tensor-identical reproduction scored 591-609 games (49.25%), pentanomial LLR
+`-2.263827184220417` from counts `(LL, split, WW) = (131, 347, 122)`,
+verdict `continue`.  Its pooled report is:
+
+```
+/home/ubuntu/experimental_nonpromotable/r3-gather-aux64-reproduction-eval600-20260712-r1/collected/a1-eval-8106b08c1e81af75/pooled/internal.json
+```
+
+with SHA-256 `b264841eea1dc82ce53f1e93b2ddd742f8024a61b7d5382941c9e8175f156e26`.
+This fresh result does not reproduce the original AUX64 cohort's 52.5% raw
+600-pair aggregate.  Keep the cohorts separate: checkpoint container hashes
+differ, and the pooling tool correctly refuses to erase that provenance even
+though the authenticated model tensors are bit-identical.
+
+The configured `elo0=-10`, `elo1=15` GSPRT is a regression-protection
+indifference band.  Its `H1` decision must not be reported as proof that true
+Elo is positive.  Replaying this fresh cohort with a superiority null
+(`elo0=0`, `elo1=15`) gives LLR `-2.240792498749374`, still `continue`.
+Replaying all 1,200 tensor-identical pairs together gives 50.875% and
+superiority LLR `-0.5255305237692693`, also `continue`.  The earlier AUX64 H1
+was therefore a permissible non-regression decision that was over-described
+as a demonstrated strength gain.
+
 `fleet48.manifest.json` is separately approved by the controller and resolves
 exactly 48 GPUs by adding only c7/c8.  It was **not** used by this immutable
 40-GPU plan and must not be substituted into it.  It is available only for a

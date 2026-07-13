@@ -1,6 +1,6 @@
 {
   "schema_version": "a1-h100-eval-plan-request-v1",
-  "status": "authenticated_candidate_finalized",
+  "status": "internal_evaluation_collected",
   "controller": {
     "repo": "/home/ubuntu/catan-eval-ab3618c",
     "repo_commit": "ab3618c5f911b50d5b7e047750038f79478686fd",
@@ -40,7 +40,30 @@
   },
   "output": {
     "root": "/home/ubuntu/experimental_nonpromotable/r3-gather-aux64-reproduction-eval600-20260712-r1",
-    "plan": "/home/ubuntu/experimental_nonpromotable/r3-gather-aux64-reproduction-eval600-20260712-r1/plan.json"
+    "plan": "/home/ubuntu/experimental_nonpromotable/r3-gather-aux64-reproduction-eval600-20260712-r1/plan.json",
+    "pooled_internal": {
+      "path": "/home/ubuntu/experimental_nonpromotable/r3-gather-aux64-reproduction-eval600-20260712-r1/collected/a1-eval-8106b08c1e81af75/pooled/internal.json",
+      "sha256": "sha256:b264841eea1dc82ce53f1e93b2ddd742f8024a61b7d5382941c9e8175f156e26",
+      "complete_pairs": 600,
+      "games_played": 1200,
+      "candidate_wins": 591,
+      "baseline_wins": 609,
+      "candidate_win_rate": 0.4925,
+      "pentanomial_counts": {
+        "loss_loss": 131,
+        "split": 347,
+        "win_win": 122
+      },
+      "pentanomial_llr": -2.263827184220417,
+      "verdict": "continue",
+      "verdict_semantics": "regression_protection_elo_minus10_vs_plus15",
+      "superiority_pentanomial": {
+        "elo0": 0.0,
+        "elo1": 15.0,
+        "llr": -2.240792498749374,
+        "verdict": "continue"
+      }
+    }
   },
   "preparation_evidence": {
     "validation_ledger": "/home/ubuntu/catan-zero-production/private/VAL_ONLY_EVAL_LEDGER.jsonl",
