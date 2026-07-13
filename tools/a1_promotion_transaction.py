@@ -548,10 +548,44 @@ def _verify_training_report(
     candidate_sha256: str,
     production_l1_completion: bool = False,
     production_target_gather_completion: bool = False,
+    production_temperature_completion: bool = False,
 ) -> dict[str, Any]:
     report = _load_json(path)
-    if production_l1_completion and production_target_gather_completion:
-        raise PromotionError("training report cannot use two production schemas")
+    if sum((production_l1_completion, production_target_gather_completion,
+            production_temperature_completion)) > 1:
+        raise PromotionError("training report cannot use multiple production schemas")
+    if production_temperature_completion:
+        recipe = contract.get("science", {}).get("learner_training_recipe")
+        if not isinstance(recipe, dict):
+            recipe = {"symmetry_augment": False}
+        _verify_symmetry_training_provenance(
+            report, recipe, where="production temperature report"
+        )
+        required = {
+            "arch": "entity_graph", "mask_hidden_info": True,
+            "track": "2p_no_trade", "vps_to_win": 10, "world_size": 8,
+            "batch_size": 512, "effective_global_batch_size": 4096,
+            "epochs": 1, "max_steps": 1024, "steps_completed": 1024,
+            "base_training_row_draws": 4_194_304, "optimizer": "adam",
+            "resume_optimizer": False, "optimizer_restored": False,
+            "lr": 3e-5, "lr_schedule": "flat", "lr_warmup_steps": 100,
+            "weight_decay": 0.0, "value_lr_mult": 0.3,
+            "action_module_lr_mult": 1.0, "soft_target_weight": 0.9,
+            "value_loss_weight": 0.25, "value_target_lambda": 1.0,
+            "forced_action_weight": 0.0, "forced_row_value_weight": 1.0,
+            "winner_sample_weight": 1.0, "loser_sample_weight": 1.0,
+            "training_rng_rank_offset": True, "ddp_shard_data": False,
+        }
+        for key, expected in required.items():
+            if report.get(key) != expected:
+                raise PromotionError(
+                    f"production temperature report drift at {key}: "
+                    f"{report.get(key)!r} != {expected!r}"
+                )
+        report_checkpoint = _absolute(report.get("checkpoint"), base=path.parent)
+        if report_checkpoint != candidate_path or _sha256(report_checkpoint) != candidate_sha256:
+            raise PromotionError("production temperature report candidate bytes drifted")
+        return report
     if production_target_gather_completion:
         recipe = contract.get("science", {}).get("learner_training_recipe")
         if not isinstance(recipe, dict):
@@ -874,6 +908,15 @@ def _verify_one_dose_training_receipt(
         )
     if raw_schema == "a1-production-target-gather-retrain-completion-v1":
         return _verify_production_target_gather_completion_receipt(
+            path,
+            contract=contract,
+            candidate_path=candidate_path,
+            candidate_sha256=candidate_sha256,
+            training_report_path=training_report_path,
+            training_report_sha256=training_report_sha256,
+        )
+    if raw_schema == "a1-production-temperature-replication-completion-v1":
+        return _verify_production_temperature_completion_receipt(
             path,
             contract=contract,
             candidate_path=candidate_path,
@@ -1537,6 +1580,123 @@ def _verify_architecture_retrain_tensor_invariant(
             "architecture-retrain inherited shared tensors changed: "
             f"{changed[:8]}"
         )
+
+
+def _verify_production_temperature_completion_receipt(
+    path: Path,
+    *,
+    contract: dict[str, Any],
+    candidate_path: Path,
+    candidate_sha256: str,
+    training_report_path: Path,
+    training_report_sha256: str,
+) -> dict[str, Any]:
+    """Replay the sealed winning-TEMP production replication."""
+
+    from tools import a1_production_temperature_replication as temperature
+
+    value = _require_exact_keys(
+        _load_json(path),
+        {
+            "schema_version", "diagnostic_only", "production_eligible",
+            "created_at_unix_ns", "manifest", "submission", "checkpoint",
+            "report", "unit_state", "replication_contract", "receipt_sha256",
+        },
+        where="production temperature completion receipt",
+    )
+    unhashed = dict(value)
+    stated = unhashed.pop("receipt_sha256")
+    expected_contract = {
+        "initializer_sha256": temperature.F7_SHA256,
+        "global_samples": 4_194_304,
+        "optimizer": "fresh_adam",
+        "stored_policy_component_temperatures": temperature.COMPONENT_TEMPERATURES,
+        "diagnostic_selection_artifact_relabelled": False,
+    }
+    if (
+        stated != _digest_value(unhashed)
+        or value["schema_version"] != temperature.COMPLETION_SCHEMA
+        or value["diagnostic_only"] is not False
+        or value["production_eligible"] is not True
+        or value["unit_state"]
+        != {"ActiveState": "inactive", "Result": "success", "ExecMainStatus": "0"}
+        or value["replication_contract"] != expected_contract
+    ):
+        raise PromotionError("production temperature completion is not eligible")
+    manifest_path, manifest_ref = _validate_file_ref(
+        value["manifest"], base=path.parent, where="production temperature manifest"
+    )
+    try:
+        verified = temperature.verify(manifest_path)
+    except (temperature.TemperatureReplicationError, OSError, KeyError, ValueError) as error:
+        raise PromotionError(f"production temperature manifest replay refused: {error}") from error
+    if verified["manifest_ref"] != manifest_ref:
+        raise PromotionError("production temperature manifest reference drifted")
+    checkpoint_path, checkpoint_ref = _validate_file_ref(
+        value["checkpoint"], base=path.parent, where="production temperature checkpoint"
+    )
+    report_path, report_ref = _validate_file_ref(
+        value["report"], base=path.parent, where="production temperature report"
+    )
+    if (
+        checkpoint_path != candidate_path
+        or checkpoint_ref["sha256"] != candidate_sha256
+        or report_path != training_report_path
+        or report_ref["sha256"] != training_report_sha256
+    ):
+        raise PromotionError("production temperature outputs differ from adjudication")
+    submission_path, submission_ref = _validate_file_ref(
+        value["submission"], base=path.parent, where="production temperature submission"
+    )
+    submission = _load_json(submission_path)
+    submission_unhashed = dict(submission)
+    submission_digest = submission_unhashed.pop("receipt_sha256", None)
+    manifest = verified["manifest"]
+    if (
+        submission.get("schema_version") != temperature.SUBMISSION_SCHEMA
+        or submission.get("diagnostic_only") is not False
+        or submission.get("production_eligible") is not True
+        or submission.get("manifest") != manifest_ref
+        or submission.get("command_sha256") != manifest.get("command_sha256")
+        or submission_digest != _digest_value(submission_unhashed)
+    ):
+        raise PromotionError("production temperature submission receipt drifted")
+    claim_path, claim_ref = _validate_file_ref(
+        submission.get("claim"), base=submission_path.parent,
+        where="production temperature one-shot claim",
+    )
+    claim = _load_json(claim_path)
+    claim_unhashed = dict(claim)
+    claim_digest = claim_unhashed.pop("claim_sha256", None)
+    if (
+        claim.get("schema_version") != temperature.CLAIM_SCHEMA
+        or claim.get("manifest") != manifest_ref
+        or claim.get("unit") != submission.get("unit")
+        or claim_digest != _digest_value(claim_unhashed)
+    ):
+        raise PromotionError("production temperature one-shot claim drifted")
+    producers = [
+        record for record in contract.get("checkpoints", [])
+        if isinstance(record, dict) and record.get("role") == "producer"
+    ]
+    report = _load_json(report_path)
+    if (
+        len(producers) != 1
+        or manifest.get("f7_parent", {}).get("sha256") != producers[0].get("sha256")
+        or report.get("init_checkpoint_sha256") != producers[0].get("sha256")
+    ):
+        raise PromotionError("production temperature parent differs from contract producer")
+    execution_binding = {
+        "schema_version": "a1-production-temperature-promotion-execution-binding-v1",
+        "manifest": manifest_ref, "submission": submission_ref, "claim": claim_ref,
+        "command_sha256": manifest["command_sha256"], "unit": submission["unit"],
+        "world_size": 8,
+    }
+    return {
+        "path": str(path), "sha256": _sha256(path), "receipt_sha256": stated,
+        "claim": str(claim_path), "claim_state_sha256": claim_digest,
+        "execution_binding_sha256": _digest_value(execution_binding),
+    }
 
 
 def _verify_production_target_gather_completion_receipt(
@@ -4696,6 +4856,10 @@ def _verify_adjudication(
         training_receipt_schema
         == "a1-production-target-gather-retrain-completion-v1"
     )
+    production_temperature_completion = (
+        training_receipt_schema
+        == "a1-production-temperature-replication-completion-v1"
+    )
     training_report_payload = _verify_training_report(
         training_path,
         contract=contract,
@@ -4704,6 +4868,7 @@ def _verify_adjudication(
         candidate_sha256=candidate_ref["sha256"],
         production_l1_completion=production_l1_completion,
         production_target_gather_completion=production_target_gather_completion,
+        production_temperature_completion=production_temperature_completion,
     )
     training_receipt_ref = _verify_one_dose_training_receipt(
         training_receipt,
