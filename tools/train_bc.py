@@ -1739,6 +1739,7 @@ def _preflight_memmap_composite_descriptor(path: str | Path) -> dict[str, object
         optional_v2_fields = {
             "policy_distillation_component_ids",
             "policy_aux_phase_sampling_weights",
+            "stored_policy_component_temperatures",
             "value_training_component_ids",
         }
         # Optional for backward compatibility: absence preserves the historical
@@ -1874,6 +1875,7 @@ def _preflight_memmap_composite_descriptor(path: str | Path) -> dict[str, object
     distillation_component_ids: list[str] = []
     distillation_scope_explicit = False
     policy_aux_phase_sampling_weights: dict[str, float] | None = None
+    stored_policy_component_temperatures: dict[str, float] | None = None
     value_training_component_ids: list[str] = []
     value_training_scope_explicit = False
     if schema_version == "memmap_composite_v2":
@@ -1956,6 +1958,34 @@ def _preflight_memmap_composite_descriptor(path: str | Path) -> dict[str, object
                     "memmap composite v2 policy auxiliary phase sampling weights "
                     "must sum to 1"
                 )
+        raw_policy_temperatures = descriptor.get(
+            "stored_policy_component_temperatures"
+        )
+        if raw_policy_temperatures is not None:
+            if (
+                not isinstance(raw_policy_temperatures, dict)
+                or set(raw_policy_temperatures) != set(component_ids)
+            ):
+                raise SystemExit(
+                    "memmap composite v2 stored-policy temperatures must bind "
+                    "every component id exactly"
+                )
+            stored_policy_component_temperatures = {}
+            for component_id in component_ids:
+                raw_temperature = raw_policy_temperatures[component_id]
+                if (
+                    isinstance(raw_temperature, bool)
+                    or not isinstance(raw_temperature, (int, float))
+                    or not math.isfinite(float(raw_temperature))
+                    or float(raw_temperature) <= 0.0
+                ):
+                    raise SystemExit(
+                        "memmap composite v2 stored-policy temperature is invalid "
+                        f"for {component_id!r}"
+                    )
+                stored_policy_component_temperatures[component_id] = float(
+                    raw_temperature
+                )
         raw_value_ids = descriptor.get("value_training_component_ids", component_ids)
         if (
             not isinstance(raw_value_ids, list)
@@ -1993,6 +2023,9 @@ def _preflight_memmap_composite_descriptor(path: str | Path) -> dict[str, object
         "policy_distillation_component_ids": distillation_component_ids,
         "policy_distillation_scope_explicit": distillation_scope_explicit,
         "policy_aux_phase_sampling_weights": policy_aux_phase_sampling_weights,
+        "stored_policy_component_temperatures": (
+            stored_policy_component_temperatures
+        ),
         "value_training_component_ids": value_training_component_ids,
         "value_training_scope_explicit": value_training_scope_explicit,
     }
@@ -6784,6 +6817,9 @@ def main(argv: Sequence[str] | None = None) -> None:
         "advantage_weight_cap": args.advantage_weight_cap,
         "advantage_weight_floor": args.advantage_weight_floor,
         "soft_target_temperature": args.soft_target_temperature,
+        "stored_policy_component_temperatures": getattr(
+            data, "stored_policy_component_temperatures", None
+        ),
         "soft_target_weight": args.soft_target_weight,
         "soft_target_source": args.soft_target_source,
         "soft_target_min_legal_coverage": args.soft_target_min_legal_coverage,
@@ -10042,6 +10078,17 @@ def load_teacher_data_memmap(
             corpus.policy_aux_phase_scope_authenticated = (
                 raw_aux_phase_weights is not None
             )
+            raw_policy_temperatures = authenticated.get(
+                "stored_policy_component_temperatures"
+            )
+            corpus.stored_policy_component_temperatures = (
+                None
+                if raw_policy_temperatures is None
+                else {
+                    str(component_id): float(temperature)
+                    for component_id, temperature in raw_policy_temperatures.items()
+                }
+            )
             value_ids = set(authenticated["value_training_component_ids"])
             corpus.value_training_component_indices = tuple(
                 index
@@ -10070,6 +10117,10 @@ def load_teacher_data_memmap(
         load_event.update({
             "progress": "bc_memmap_composite_load",
             "component_count": len(corpus.corpora),
+            "component_ids": list(getattr(corpus, "component_ids", tuple())),
+            "stored_policy_component_temperatures": getattr(
+                corpus, "stored_policy_component_temperatures", None
+            ),
         })
     print(json.dumps(load_event, sort_keys=True), flush=True)
     return corpus
@@ -10115,6 +10166,13 @@ def _iterate_training_batches(
 
     def _materialize(batch: np.ndarray):
         materialized = {key: data[key][batch] for key in keys}
+        stored_policy_temperatures = _stored_policy_temperatures_for_batch(
+            data, batch
+        )
+        if stored_policy_temperatures is not None:
+            materialized["_stored_policy_temperature"] = (
+                stored_policy_temperatures
+            )
         local = np.arange(len(batch), dtype=np.int64)
         return materialized, local, policy_sample_weights[batch], value_sample_weights[batch]
 
@@ -11945,6 +12003,103 @@ def _batch_array_or_fill(
     return np.full(len(batch), fill_value, dtype=dtype)
 
 
+def _stored_policy_temperatures_for_batch(
+    data: object,
+    batch: np.ndarray,
+) -> np.ndarray | None:
+    """Resolve authenticated per-component temperatures for stored policies.
+
+    Component identity survives a no-copy memmap composite through
+    ``component_indices_for_rows``.  Keeping calibration on that identity is
+    important: n128, n256, and replay can all use the same ``teacher_name``
+    while carrying materially different target entropies.  Ordinary corpora
+    and v2 descriptors without this opt-in return ``None`` and preserve the
+    historical path exactly.
+    """
+
+    if isinstance(data, dict) and "_stored_policy_temperature" in data:
+        materialized = np.asarray(
+            data["_stored_policy_temperature"][batch], dtype=np.float64
+        )
+        if materialized.shape != (len(batch),):
+            raise ValueError("materialized stored-policy temperature shape drift")
+        if not np.isfinite(materialized).all() or np.any(materialized <= 0.0):
+            raise ValueError(
+                "materialized stored-policy temperatures must be finite and > 0"
+            )
+        return materialized
+
+    configured = getattr(data, "stored_policy_component_temperatures", None)
+    if configured is None:
+        return None
+    component_ids = tuple(getattr(data, "component_ids", ()))
+    component_lookup = getattr(data, "component_indices_for_rows", None)
+    if (
+        not component_ids
+        or not callable(component_lookup)
+        or not isinstance(configured, dict)
+        or set(configured) != set(component_ids)
+    ):
+        raise ValueError("stored-policy component temperature binding is invalid")
+    ordered = np.asarray(
+        [float(configured[component_id]) for component_id in component_ids],
+        dtype=np.float64,
+    )
+    if not np.isfinite(ordered).all() or np.any(ordered <= 0.0):
+        raise ValueError("stored-policy component temperatures must be finite and > 0")
+    components = np.asarray(component_lookup(batch), dtype=np.int64)
+    if components.shape != (len(batch),) or np.any(components < 0) or np.any(
+        components >= len(component_ids)
+    ):
+        raise ValueError("stored-policy component row identity is invalid")
+    return ordered[components]
+
+
+def _temperature_scale_stored_policy(
+    policy: np.ndarray,
+    support: np.ndarray,
+    temperatures: np.ndarray | None,
+) -> np.ndarray:
+    """Temperature-scale normalized stored probabilities on their support.
+
+    ``T > 1`` softens and ``T < 1`` sharpens. Unsupported and exact-zero
+    entries stay exact zero.  ``temperatures is None`` and an all-ones vector
+    are strict no-ops so legacy descriptors and explicit T=1 controls retain
+    the already-normalized bytes produced by the historical path.
+    """
+
+    if temperatures is None:
+        return policy
+    values = np.asarray(policy, dtype=np.float32)
+    mask = np.asarray(support, dtype=np.bool_)
+    row_temperatures = np.asarray(temperatures, dtype=np.float64)
+    if values.ndim != 2 or mask.shape != values.shape:
+        raise ValueError("stored-policy value/support shape drift")
+    if row_temperatures.shape != (values.shape[0],):
+        raise ValueError("stored-policy temperature row shape drift")
+    if not np.isfinite(row_temperatures).all() or np.any(row_temperatures <= 0.0):
+        raise ValueError("stored-policy temperatures must be finite and > 0")
+    if np.all(row_temperatures == 1.0):
+        return policy
+
+    calibrated = values.copy()
+    for row in np.flatnonzero(row_temperatures != 1.0):
+        active = mask[row] & np.isfinite(values[row]) & (values[row] > 0.0)
+        if not np.any(active):
+            continue
+        logits = np.log(values[row, active].astype(np.float64)) / float(
+            row_temperatures[row]
+        )
+        logits -= float(np.max(logits))
+        weights = np.exp(logits)
+        total = float(np.sum(weights))
+        if not math.isfinite(total) or total <= 0.0:
+            raise ValueError("stored-policy temperature normalization failed")
+        calibrated[row] = 0.0
+        calibrated[row, active] = (weights / total).astype(np.float32)
+    return calibrated
+
+
 def _soft_target_array(
     data: dict,
     batch: np.ndarray,
@@ -11966,6 +12121,11 @@ def _soft_target_array(
         has_policy = sums[:, 0] > 0.0
         if np.any(has_policy):
             policy[has_policy] = policy[has_policy] / sums[has_policy]
+        policy = _temperature_scale_stored_policy(
+            policy,
+            policy_support,
+            _stored_policy_temperatures_for_batch(data, batch),
+        )
     score_target = np.zeros_like(policy, dtype=np.float32)
     score_support = np.zeros_like(policy, dtype=np.bool_)
     has_scores = np.zeros(policy.shape[0], dtype=bool)
