@@ -1346,8 +1346,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--require-35m-model",
         action="store_true",
         help=(
-            "Fail unless --arch xdim_graph builds a model in the expected 35M "
-            "parameter range. Implied by --require-production-35m-teacher."
+            "Fail unless --arch xdim_graph/entity_graph has a TOTAL serialized "
+            "checkpoint parameter count in the expected 35M range. This "
+            "compatibility contract intentionally includes frozen or "
+            "forward-skipped heads; trainable and forward-active counts are "
+            "reported separately. Implied by --require-production-35m-teacher."
         ),
     )
     parser.add_argument(
@@ -5180,6 +5183,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         ),
         ddp,
     )
+    model_parameter_accounting: dict[str, object] | None = None
     if args.arch == "candidate":
         policy = create_ppo_policy(
             config=env_config,
@@ -5206,6 +5210,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             if module is not None:
                 params.extend(module.parameters())
         optimizer = _make_optimizer(params, args, getattr(policy, "device", args.device))
+        model_parameter_accounting = _parameter_accounting(policy)
         train_fn = _train_candidate_batch
     else:
         if args.init_checkpoint:
@@ -5336,8 +5341,17 @@ def main(argv: Sequence[str] | None = None) -> None:
             ),
             ddp,
         )
+        forward_inactive_module_names = set(
+            inactive_head_freeze["frozen_submodules"]
+        )
         if float(args.q_loss_weight) == 0.0:
             _set_xdim_q_branch_trainable(policy.model, False)
+            unwrapped_model = getattr(policy.model, "module", policy.model)
+            forward_inactive_module_names.update(
+                name
+                for name in ("q_state", "q_action", "q_bias", "q_head")
+                if getattr(unwrapped_model, name, None) is not None
+            )
             _rank0_print(
                 json.dumps(
                     {
@@ -5351,6 +5365,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             )
         if _CROP_AUTHENTICATED_EMPTY_EVENT_HISTORY:
             event_freeze = _freeze_authenticated_empty_event_encoder(policy.model)
+            forward_inactive_module_names.add("event_encoder")
             training_information_surface = {
                 **(training_information_surface or {}),
                 "event_encoder_freeze": event_freeze,
@@ -5404,6 +5419,30 @@ def main(argv: Sequence[str] | None = None) -> None:
                 ),
                 ddp,
             )
+        # Bind observability to the actual training forward before DDP/FSDP can
+        # flatten or shard parameter storage. Frozen-but-executed modules remain
+        # forward-active; only branches that this learner explicitly omits are
+        # excluded. The plain attribute survives wrappers and is absent from
+        # state_dict/checkpoint serialization.
+        unwrapped_model = getattr(policy.model, "module", policy.model)
+        unwrapped_model._forward_inactive_parameter_modules = frozenset(
+            forward_inactive_module_names
+        )
+        model_parameter_accounting = _parameter_accounting(policy)
+        training_information_surface = {
+            **(training_information_surface or {}),
+            "model_parameter_accounting": model_parameter_accounting,
+        }
+        _rank0_print(
+            json.dumps(
+                {
+                    "progress": "model_parameter_accounting",
+                    **model_parameter_accounting,
+                },
+                sort_keys=True,
+            ),
+            ddp,
+        )
         if bool(args.fsdp):
             # C1 minimal FSDP: FULL_SHARD across ranks, transformer blocks
             # auto-wrapped by module type. use_orig_params=True so
@@ -7211,7 +7250,18 @@ def main(argv: Sequence[str] | None = None) -> None:
         "policy_surprise_cap": float(args.policy_surprise_cap),
         "policy_surprise_weight_quality": policy_surprise_weight_report,
         "first_batch_profile": first_batch_profile,
-        "parameter_count": int(_parameter_count(policy)),
+        # Backward-compatible headline: ``parameter_count`` remains the TOTAL
+        # serialized/checkpoint-compatible architecture size. Never interpret
+        # it as optimizer or live-forward capacity; the explicit fields below
+        # carry those two distinct quantities.
+        "parameter_count": int(model_parameter_accounting["total_parameters"]),
+        "trainable_parameter_count": int(
+            model_parameter_accounting["trainable_parameters"]
+        ),
+        "forward_active_parameter_count": int(
+            model_parameter_accounting["forward_active_parameters"]
+        ),
+        "model_parameter_accounting": model_parameter_accounting,
         "world_size": ddp["world_size"],
         "ddp_shard_data": bool(args.ddp_shard_data),
         "ddp_find_unused_parameters": bool(args.ddp_find_unused_parameters),
@@ -15538,6 +15588,14 @@ def _assert_init_config_matches(policy, args: argparse.Namespace) -> None:
 
 
 def _enforce_35m_model_size(policy, args: argparse.Namespace) -> None:
+    """Enforce checkpoint-shape compatibility, not active learner capacity.
+
+    Historical 35M checkpoints include optional heads even when a particular
+    learner recipe freezes or omits their forward. Changing this guard to the
+    trainable/live count would reject compatible warm starts and silently
+    redefine the architecture contract. Reports expose those counts separately.
+    """
+
     if not bool(getattr(args, "require_35m_model", False)):
         return
     if str(args.arch) not in {"xdim_graph", "entity_graph"}:
@@ -15547,7 +15605,8 @@ def _enforce_35m_model_size(policy, args: argparse.Namespace) -> None:
     upper = int(args.max_35m_params)
     if count < lower or count > upper:
         raise SystemExit(
-            f"{args.arch} parameter count is outside the required 35M range: "
+            f"{args.arch} total checkpoint parameter count is outside the required "
+            "35M range: "
             f"count={count} expected=[{lower}, {upper}]. Check --hidden-size, "
             "--graph-tokens, and --graph-layers before launching a production BC run."
         )
@@ -16270,6 +16329,56 @@ def _batch_profile(policy, data: dict, batch: np.ndarray) -> dict:
 
 def _parameter_count(policy) -> int:
     return int(sum(parameter.numel() for parameter in _params(policy)))
+
+
+def _parameter_accounting(policy) -> dict[str, object]:
+    """Separate serialized size, optimizer surface, and live training forward.
+
+    ``requires_grad`` answers whether a parameter may be optimized, not whether
+    its module executes. Conversely, a zero-objective head can be present in a
+    checkpoint yet intentionally skipped by the learner. The trainer records
+    those exact top-level model attributes in
+    ``_forward_inactive_parameter_modules`` before distributed wrapping.
+    """
+
+    parameters = list(_params(policy))
+    total = int(sum(parameter.numel() for parameter in parameters))
+    trainable = int(
+        sum(parameter.numel() for parameter in parameters if parameter.requires_grad)
+    )
+
+    wrapped_model = getattr(policy, "model", None)
+    model = getattr(wrapped_model, "module", wrapped_model)
+    inactive_names = tuple(
+        sorted(getattr(model, "_forward_inactive_parameter_modules", ()))
+    )
+    inactive_parameter_ids: set[int] = set()
+    observed_names: list[str] = []
+    if model is not None:
+        for name in inactive_names:
+            submodule = getattr(model, name, None)
+            if submodule is None or not hasattr(submodule, "parameters"):
+                continue
+            observed_names.append(name)
+            inactive_parameter_ids.update(id(parameter) for parameter in submodule.parameters())
+    forward_inactive = int(
+        sum(
+            parameter.numel()
+            for parameter in parameters
+            if id(parameter) in inactive_parameter_ids
+        )
+    )
+    return {
+        "schema_version": "model-parameter-accounting-v1",
+        "total_parameters": total,
+        "trainable_parameters": trainable,
+        "forward_active_parameters": int(total - forward_inactive),
+        "forward_inactive_parameters": forward_inactive,
+        "forward_inactive_submodules": observed_names,
+        "total_parameter_contract": (
+            "serialized_checkpoint_structure_including_frozen_or_skipped_heads"
+        ),
+    }
 
 
 def _cuda_memory(policy) -> dict:
