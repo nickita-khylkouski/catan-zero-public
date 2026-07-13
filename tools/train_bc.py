@@ -6173,6 +6173,12 @@ def main(argv: Sequence[str] | None = None) -> None:
             "value_categorical_clean_loss": 0.0,
             "value_categorical_truncated_loss": 0.0,
         }
+        epoch_aux_subgoal_sums = {
+            field: 0.0 for field, _ in _AUX_SUBGOAL_SPECS
+        }
+        epoch_aux_subgoal_denominators = {
+            field: 0.0 for field, _ in _AUX_SUBGOAL_SPECS
+        }
         epoch_acc = []
         epoch_top3 = []
         epoch_count = 0
@@ -6446,6 +6452,13 @@ def main(argv: Sequence[str] | None = None) -> None:
                 else:
                     epoch_extra_sums[key] += float(batch_metrics.get(key, 0.0)) * len(batch)
                     epoch_extra_denominators[key] += float(len(batch))
+            for field, parts in batch_metrics.get(
+                "aux_subgoal_loss_parts", {}
+            ).items():
+                epoch_aux_subgoal_sums[field] += float(parts["weighted_sum"])
+                epoch_aux_subgoal_denominators[field] += float(
+                    parts["weight_sum"]
+                )
             epoch_extra_sums["q_score_rows_ge2"] += float(batch_metrics.get("q_score_rows_ge2", 0.0))
             epoch_extra_sums["soft_distillation_rows"] += float(
                 batch_metrics.get("soft_distillation_rows", 0.0)
@@ -6506,6 +6519,12 @@ def main(argv: Sequence[str] | None = None) -> None:
         top3_sum = float(np.sum(epoch_top3)) if epoch_top3 else 0.0
         epoch_extra_sums = _reduce_named_sums(epoch_extra_sums, ddp)
         epoch_extra_denominators = _reduce_named_sums(epoch_extra_denominators, ddp)
+        epoch_aux_subgoal_sums = _reduce_named_sums(
+            epoch_aux_subgoal_sums, ddp
+        )
+        epoch_aux_subgoal_denominators = _reduce_named_sums(
+            epoch_aux_subgoal_denominators, ddp
+        )
         cumulative_scalar_training_weight += float(
             epoch_extra_denominators["value_loss"]
         )
@@ -6605,6 +6624,13 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "value_categorical_loss",
             )
         }
+        auxiliary_loss_epochs["aux_subgoal_loss"] = sum(
+            _metric_from_sum_denominator(
+                epoch_aux_subgoal_sums[field],
+                epoch_aux_subgoal_denominators[field],
+            )
+            for field, _ in _AUX_SUBGOAL_SPECS
+        )
         categorical_breakdown_epochs = {
             key: _metric_from_sum_denominator(
                 epoch_extra_sums[key], epoch_extra_denominators[key]
@@ -6674,7 +6700,18 @@ def main(argv: Sequence[str] | None = None) -> None:
                     if resolved_categorical_value_weight > 0.0
                     else "scalar_mse"
                 ),
-                "loss_denominators": dict(epoch_extra_denominators),
+                "loss_denominators": {
+                    key: value
+                    for key, value in epoch_extra_denominators.items()
+                    if key not in {"aux_subgoal_loss", "moe_balance_loss"}
+                },
+                "aux_subgoal_loss_parts": {
+                    field: {
+                        "weighted_sum": epoch_aux_subgoal_sums[field],
+                        "weight_sum": epoch_aux_subgoal_denominators[field],
+                    }
+                    for field, _ in _AUX_SUBGOAL_SPECS
+                },
                 "q_score_rows_ge2": int(round(epoch_extra_sums["q_score_rows_ge2"])),
                 "q_score_rows_ge2_fraction": epoch_extra_sums["q_score_rows_ge2"] / max(total_count, 1.0),
                 "soft_distillation_rows": int(round(epoch_extra_sums["soft_distillation_rows"])),
@@ -7759,9 +7796,14 @@ def _aux_subgoal_loss(
     *,
     symmetry=None,
     symmetry_ids: np.ndarray | None = None,
+    return_sufficient_statistics: bool = False,
 ) -> tuple:
     """Combined CAT-100 auxiliary-subgoal loss over head/target pairs present in
     BOTH the model outputs and the corpus. Returns (loss_tensor, active_heads).
+    When ``return_sufficient_statistics`` is true, also returns one local
+    weighted numerator and denominator per head.  A single shared denominator
+    is invalid here because this objective is a *sum of conditional head
+    means*, and each head can have a different valid-label mask.
 
     A no-op (returns 0.0, 0) only when no aux head is built (a heads-off model is
     unaffected). Each head contributes its own masked mean; the shared
@@ -7795,6 +7837,7 @@ def _aux_subgoal_loss(
 
     total = torch.zeros((), dtype=torch.float32, device=device)
     active_heads = 0
+    sufficient_statistics = {}
     for field, kind in _AUX_SUBGOAL_SPECS:
         if field not in outputs or field not in data:
             continue
@@ -7842,8 +7885,18 @@ def _aux_subgoal_loss(
         # rank must enter this helper even when its local mask is empty, or a
         # rank with no categorical labels would skip the collective and hang
         # its peers.
+        numerator, denominator = _weighted_loss_parts(per, weight)
+        # Keep the established DDP-normalized objective path intact.  The
+        # independently returned local parts are telemetry/sufficient stats;
+        # they must not replace or alter the reduction that produces gradients.
         total = total + _weighted_mean_loss(per, weight)
+        sufficient_statistics[field] = {
+            "weighted_sum": numerator,
+            "weight_sum": denominator,
+        }
         active_heads += int(bool(valid.any().item()))
+    if return_sufficient_statistics:
+        return total, active_heads, sufficient_statistics
     return total, active_heads
 
 
@@ -8285,6 +8338,9 @@ def _train_xdim_batch(
         # Huber loss because the target is already a squared quantity). No-op unless
         # the head is present in outputs and the weight is nonzero.
         value_uncertainty_loss = torch.tensor(0.0, dtype=torch.float32, device=policy.device)
+        value_uncertainty_loss_sum, value_uncertainty_loss_denominator = (
+            _zero_loss_parts(policy.device)
+        )
         if (
             float(value_uncertainty_loss_weight) != 0.0
             and "value_uncertainty" in outputs
@@ -8295,10 +8351,17 @@ def _train_xdim_batch(
             uncertainty_error = nn.functional.smooth_l1_loss(
                 outputs["value_uncertainty"], uncertainty_target, reduction="none"
             )
-            value_uncertainty_loss = _weighted_mean_loss(
+            (
+                value_uncertainty_loss_sum,
+                value_uncertainty_loss_denominator,
+            ) = _weighted_loss_parts(
                 uncertainty_error,
                 value_weights * outcome_confidence,
                 mask=value_has_outcome,
+            )
+            value_uncertainty_loss = _weighted_mean_from_parts(
+                value_uncertainty_loss_sum,
+                value_uncertainty_loss_denominator,
             )
         # HL-Gauss categorical value head (CAT-39): cross-entropy against a
         # Gaussian-smeared win-loss target, with truncated rows routed to the
@@ -8419,14 +8482,20 @@ def _train_xdim_batch(
         # the model has the heads AND the corpus has the target fields.
         aux_subgoal_loss = torch.tensor(0.0, dtype=torch.float32, device=policy.device)
         aux_subgoal_active_heads = 0
+        aux_subgoal_loss_parts = {}
         if float(aux_subgoal_loss_weight) != 0.0:
-            aux_subgoal_loss, aux_subgoal_active_heads = _aux_subgoal_loss(
+            (
+                aux_subgoal_loss,
+                aux_subgoal_active_heads,
+                aux_subgoal_loss_parts,
+            ) = _aux_subgoal_loss(
                 outputs,
                 data,
                 batch,
                 policy.device,
                 symmetry=symmetry,
                 symmetry_ids=outputs.get("_symmetry_ids"),
+                return_sufficient_statistics=True,
             )
         belief_resource_loss = torch.tensor(
             0.0, dtype=torch.float32, device=policy.device
@@ -8446,6 +8515,15 @@ def _train_xdim_batch(
                 _zero_loss_parts(policy.device)
             )
         moe_balance_loss = outputs.get("moe_balance_metric")
+        moe_balance_loss_exact_zero = (
+            moe_balance_loss is None
+            and int(
+                getattr(
+                    getattr(policy, "config", None), "moe_routed_experts", 0
+                )
+            )
+            <= 0
+        )
         if moe_balance_loss is None:
             moe_balance_loss = torch.tensor(
                 0.0, dtype=torch.float32, device=policy.device
@@ -8599,7 +8677,20 @@ def _train_xdim_batch(
         ),
         "policy_kl_anchor_eligible_rows": int(kl_anchor_loss_denominator.item()),
         "value_uncertainty_loss": float(value_uncertainty_loss.item()),
+        "value_uncertainty_loss_weighted_sum": float(
+            value_uncertainty_loss_sum.item()
+        ),
+        "value_uncertainty_loss_weight_sum": float(
+            value_uncertainty_loss_denominator.item()
+        ),
         "aux_subgoal_loss": float(aux_subgoal_loss.item()),
+        "aux_subgoal_loss_parts": {
+            field: {
+                "weighted_sum": float(parts["weighted_sum"].item()),
+                "weight_sum": float(parts["weight_sum"].item()),
+            }
+            for field, parts in aux_subgoal_loss_parts.items()
+        },
         "belief_resource_loss": float(belief_resource_loss.item()),
         "belief_resource_loss_weighted_sum": float(
             belief_resource_loss_sum.item()
@@ -8608,6 +8699,9 @@ def _train_xdim_batch(
             belief_resource_loss_denominator.item()
         ),
         "moe_balance_loss": float(moe_balance_loss.item()),
+        "objective_exact_zero_terms": (
+            ["moe_balance_loss"] if moe_balance_loss_exact_zero else []
+        ),
         "aux_subgoal_active_heads": int(aux_subgoal_active_heads),
         "belief_resource_active_players": int(belief_resource_active_players),
         "value_categorical_loss": float(value_categorical_loss.item()),
@@ -8790,16 +8884,14 @@ _TRAINING_OBJECTIVE_METRIC_KEYS = (
     "q_loss",
     "policy_kl_anchor_loss",
     "value_uncertainty_loss",
-    "aux_subgoal_loss",
     "belief_resource_loss",
-    "moe_balance_loss",
     "value_categorical_loss",
 )
 
 
 def _objective_measure_validation_aggregate(
     reports: list[dict], weights: np.ndarray
-) -> tuple[dict[str, float], dict[str, dict[str, float]] | None]:
+) -> tuple[dict[str, float], dict[str, object] | None]:
     """Aggregate validation under a row-sampling measure before normalization.
 
     A training loss is ``E_p[w * loss] / E_p[w]``. Averaging one normalized
@@ -8820,8 +8912,13 @@ def _objective_measure_validation_aggregate(
         isinstance(row, dict) and row == coefficient_rows[0]
         for row in coefficient_rows
     )
+    if any(row is not None for row in coefficient_rows) and not has_objective_coefficients:
+        raise SystemExit(
+            "objective-matched validation reports have missing or inconsistent "
+            "objective coefficients"
+        )
     coefficients = coefficient_rows[0] if has_objective_coefficients else {}
-    sufficient: dict[str, dict[str, float]] = {}
+    sufficient: dict[str, object] = {}
     for key in _TRAINING_OBJECTIVE_METRIC_KEYS:
         if not all(
             key in report
@@ -8849,6 +8946,75 @@ def _objective_measure_validation_aggregate(
             "weighted_numerator_per_sample": numerator_density,
             "weight_per_sample": denominator_density,
         }
+    # CAT-100 is a sum of separately normalized masked-head objectives.  A
+    # synthetic row denominator for their already-summed batch mean is not a
+    # sufficient statistic: label density differs by head and by game.  Carry
+    # and combine each head's numerator/denominator independently, then sum the
+    # reconstructed conditional means exactly once.
+    if all(
+        isinstance(report.get("aux_subgoal_loss_parts"), dict)
+        and int(report.get("samples", 0)) > 0
+        for report in reports
+    ):
+        head_fields = sorted(
+            set().union(
+                *(
+                    set(report["aux_subgoal_loss_parts"])
+                    for report in reports
+                )
+            )
+        )
+        complete = all(
+            all(
+                isinstance(report["aux_subgoal_loss_parts"].get(field), dict)
+                and "weighted_sum"
+                in report["aux_subgoal_loss_parts"][field]
+                and "weight_sum" in report["aux_subgoal_loss_parts"][field]
+                for field in head_fields
+            )
+            for report in reports
+        )
+        if complete:
+            aux_loss = 0.0
+            aux_heads: dict[str, dict[str, float]] = {}
+            for field in head_fields:
+                numerator_density = 0.0
+                denominator_density = 0.0
+                for probability, report in zip(normalized, reports, strict=True):
+                    samples = float(report["samples"])
+                    parts = report["aux_subgoal_loss_parts"][field]
+                    numerator_density += (
+                        float(probability)
+                        * float(parts["weighted_sum"])
+                        / samples
+                    )
+                    denominator_density += (
+                        float(probability)
+                        * float(parts["weight_sum"])
+                        / samples
+                    )
+                head_loss = (
+                    numerator_density / denominator_density
+                    if denominator_density > 0.0
+                    else 0.0
+                )
+                aux_loss += head_loss
+                aux_heads[field] = {
+                    "weighted_numerator_per_sample": numerator_density,
+                    "weight_per_sample": denominator_density,
+                    "loss": head_loss,
+                }
+            metrics["aux_subgoal_loss"] = aux_loss
+            sufficient["aux_subgoal_loss"] = {"heads": aux_heads}
+    exact_zero_sets = [
+        set(report.get("objective_exact_zero_terms", [])) for report in reports
+    ]
+    exact_zero_terms = (
+        set.intersection(*exact_zero_sets) if exact_zero_sets else set()
+    )
+    for key in exact_zero_terms:
+        metrics[key] = 0.0
+        sufficient[key] = {"exact_zero": True}
     # These diagnostics are also conditional means.  In particular, averaging
     # per-game teacher-gap closure can Simpson-reverse an arm when games differ
     # in active-row density or target/prior gap. Reconstruct the KL densities
@@ -8913,9 +9079,21 @@ def _objective_measure_validation_aggregate(
         primary_key = "value_categorical_loss" if categorical_active else "value_loss"
         if primary_key in metrics:
             metrics["primary_value_loss"] = metrics[primary_key]
-    if coefficients and all(key in metrics for key in coefficients):
+    if coefficients:
+        missing_exact = sorted(
+            key
+            for key, coefficient in coefficients.items()
+            if float(coefficient) != 0.0 and key not in sufficient
+        )
+        if missing_exact:
+            raise SystemExit(
+                "objective-matched validation cannot reconstruct nonzero "
+                "objective term(s) exactly: "
+                + ", ".join(missing_exact)
+            )
         exact_loss = sum(
-            float(coefficients[key]) * float(metrics[key]) for key in coefficients
+            float(coefficient) * float(metrics.get(key, 0.0))
+            for key, coefficient in coefficients.items()
         )
         # Promotion-facing loss is now the exact configured population objective.
         # Preserve the historical batch/game-normalized statistic under its honest
@@ -9145,6 +9323,20 @@ def evaluate_bc_batches(
             "value_categorical_clean_loss": 0.0,
             "value_categorical_truncated_loss": 0.0,
         }
+        aux_subgoal_sums = {field: 0.0 for field, _ in _AUX_SUBGOAL_SPECS}
+        aux_subgoal_denominators = {
+            field: 0.0 for field, _ in _AUX_SUBGOAL_SPECS
+        }
+        objective_exact_zero_terms = (
+            {"moe_balance_loss"}
+            if int(
+                getattr(
+                    getattr(policy, "config", None), "moe_routed_experts", 0
+                )
+            )
+            <= 0
+            else set()
+        )
         acc_sum = 0.0
         top3_sum = 0.0
         count = 0.0
@@ -9239,6 +9431,15 @@ def evaluate_bc_batches(
                 else:
                     extra_sums[key] += float(batch_metrics.get(key, 0.0)) * len(batch)
                     extra_denominators[key] += float(len(batch))
+            for field, parts in batch_metrics.get(
+                "aux_subgoal_loss_parts", {}
+            ).items():
+                aux_subgoal_sums[field] += float(parts["weighted_sum"])
+                aux_subgoal_denominators[field] += float(parts["weight_sum"])
+            if "objective_exact_zero_terms" in batch_metrics:
+                objective_exact_zero_terms.intersection_update(
+                    batch_metrics["objective_exact_zero_terms"]
+                )
             extra_sums["q_score_rows_ge2"] += float(batch_metrics.get("q_score_rows_ge2", 0.0))
             extra_sums["soft_distillation_rows"] += float(
                 batch_metrics.get("soft_distillation_rows", 0.0)
@@ -9286,6 +9487,10 @@ def evaluate_bc_batches(
             _merge_phase_stats(teacher_stats, batch_metrics["teacher_stats"])
         extra_sums = _reduce_named_sums(extra_sums, ddp)
         extra_denominators = _reduce_named_sums(extra_denominators, ddp)
+        aux_subgoal_sums = _reduce_named_sums(aux_subgoal_sums, ddp)
+        aux_subgoal_denominators = _reduce_named_sums(
+            aux_subgoal_denominators, ddp
+        )
         loss_sum, acc_sum, top3_sum, total_count = _reduce_epoch_metrics(
             loss_sum,
             acc_sum,
@@ -9322,6 +9527,12 @@ def evaluate_bc_batches(
                 "value_categorical_loss",
             )
         }
+        auxiliary_loss_eval["aux_subgoal_loss"] = sum(
+            _metric_from_sum_denominator(
+                aux_subgoal_sums[field], aux_subgoal_denominators[field]
+            )
+            for field, _ in _AUX_SUBGOAL_SPECS
+        )
         categorical_breakdown_eval = {
             key: _metric_from_sum_denominator(
                 extra_sums[key], extra_denominators[key]
@@ -9371,7 +9582,19 @@ def evaluate_bc_batches(
                 if float(value_categorical_loss_weight) > 0.0
                 else "scalar_mse"
             ),
-            "loss_denominators": dict(extra_denominators),
+            "loss_denominators": {
+                key: value
+                for key, value in extra_denominators.items()
+                if key not in {"aux_subgoal_loss", "moe_balance_loss"}
+            },
+            "aux_subgoal_loss_parts": {
+                field: {
+                    "weighted_sum": aux_subgoal_sums[field],
+                    "weight_sum": aux_subgoal_denominators[field],
+                }
+                for field, _ in _AUX_SUBGOAL_SPECS
+            },
+            "objective_exact_zero_terms": sorted(objective_exact_zero_terms),
             "objective_coefficients": {
                 "policy_loss": float(policy_loss_weight),
                 "value_loss": float(value_loss_weight),
@@ -9882,6 +10105,9 @@ def _eval_xdim_batch(
             value_uncertainty_loss = torch.tensor(
                 0.0, dtype=torch.float32, device=policy.device
             )
+            value_uncertainty_loss_sum, value_uncertainty_loss_denominator = (
+                _zero_loss_parts(policy.device)
+            )
             if (
                 float(value_uncertainty_loss_weight) != 0.0
                 and "value_uncertainty" in outputs
@@ -9896,10 +10122,17 @@ def _eval_xdim_batch(
                     uncertainty_target,
                     reduction="none",
                 )
-                value_uncertainty_loss = _weighted_mean_loss(
+                (
+                    value_uncertainty_loss_sum,
+                    value_uncertainty_loss_denominator,
+                ) = _weighted_loss_parts(
                     uncertainty_error,
                     value_weights * outcome_confidence,
                     mask=value_has_outcome,
+                )
+                value_uncertainty_loss = _weighted_mean_from_parts(
+                    value_uncertainty_loss_sum,
+                    value_uncertainty_loss_denominator,
                 )
             value_categorical_loss = torch.tensor(
                 0.0, dtype=torch.float32, device=policy.device
@@ -10000,9 +10233,18 @@ def _eval_xdim_batch(
                 0.0, dtype=torch.float32, device=policy.device
             )
             aux_subgoal_active_heads = 0
+            aux_subgoal_loss_parts = {}
             if float(aux_subgoal_loss_weight) != 0.0:
-                aux_subgoal_loss, aux_subgoal_active_heads = _aux_subgoal_loss(
-                    outputs, data, batch, policy.device
+                (
+                    aux_subgoal_loss,
+                    aux_subgoal_active_heads,
+                    aux_subgoal_loss_parts,
+                ) = _aux_subgoal_loss(
+                    outputs,
+                    data,
+                    batch,
+                    policy.device,
+                    return_sufficient_statistics=True,
                 )
             belief_resource_loss = torch.tensor(
                 0.0, dtype=torch.float32, device=policy.device
@@ -10019,6 +10261,17 @@ def _eval_xdim_batch(
                     belief_resource_loss_denominator,
                 ) = _belief_resource_loss(outputs, data, batch, policy.device)
             moe_balance_loss = outputs.get("moe_balance_metric")
+            moe_balance_loss_exact_zero = (
+                moe_balance_loss is None
+                and int(
+                    getattr(
+                        getattr(policy, "config", None),
+                        "moe_routed_experts",
+                        0,
+                    )
+                )
+                <= 0
+            )
             if moe_balance_loss is None:
                 moe_balance_loss = torch.tensor(
                     0.0, dtype=torch.float32, device=policy.device
@@ -10110,7 +10363,20 @@ def _eval_xdim_batch(
                 kl_anchor_loss_denominator.item()
             ),
             "value_uncertainty_loss": float(value_uncertainty_loss.item()),
+            "value_uncertainty_loss_weighted_sum": float(
+                value_uncertainty_loss_sum.item()
+            ),
+            "value_uncertainty_loss_weight_sum": float(
+                value_uncertainty_loss_denominator.item()
+            ),
             "aux_subgoal_loss": float(aux_subgoal_loss.item()),
+            "aux_subgoal_loss_parts": {
+                field: {
+                    "weighted_sum": float(parts["weighted_sum"].item()),
+                    "weight_sum": float(parts["weight_sum"].item()),
+                }
+                for field, parts in aux_subgoal_loss_parts.items()
+            },
             "belief_resource_loss": float(belief_resource_loss.item()),
             "belief_resource_loss_weighted_sum": float(
                 belief_resource_loss_sum.item()
@@ -10119,6 +10385,9 @@ def _eval_xdim_batch(
                 belief_resource_loss_denominator.item()
             ),
             "moe_balance_loss": float(moe_balance_loss.item()),
+            "objective_exact_zero_terms": (
+                ["moe_balance_loss"] if moe_balance_loss_exact_zero else []
+            ),
             "aux_subgoal_active_heads": int(aux_subgoal_active_heads),
             "belief_resource_active_players": int(
                 belief_resource_active_players
