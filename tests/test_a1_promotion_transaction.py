@@ -2272,6 +2272,25 @@ def test_transaction_rejects_internal_candidate_search_outcome_alias_drift(
         _execute(fixture, go=False)
 
 
+def test_transaction_rejects_mismatched_external_panel_engine_identities(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path)
+
+    def mutate(source: dict) -> None:
+        source["planned_engine_identity"]["repo_commit"] = "f" * 40
+        source["engine_identity"]["repo_commit"] = "f" * 40
+
+    _mutate_evidence_source(
+        fixture, kind="external_panel", role="champion_panel", mutate=mutate
+    )
+
+    with pytest.raises(
+        promotion.PromotionError, match="different engine identities"
+    ):
+        _execute(fixture, go=False)
+
+
 def test_transaction_rejects_mixed_high_regret_orientation_encodings(
     tmp_path: Path,
 ) -> None:

@@ -4525,6 +4525,21 @@ def _verify_promotion_evidence(
                 actual_engine["native_runtime_sha256"],
                 where=f"{panel_name}.engine_identity.native_runtime_sha256",
             )
+        # A matched common-opponent comparison is meaningful only when both
+        # roles ran under the same referee and native engine bytes.  Each
+        # panel already proves that its runtime matches its own plan; also
+        # bind the two plans/runtimes to one another so two internally valid
+        # but different engine builds cannot be compared as one cohort.
+        if (
+            candidate_panel["planned_engine_identity"]
+            != champion_panel["planned_engine_identity"]
+            or candidate_panel["engine_identity"]
+            != champion_panel["engine_identity"]
+        ):
+            raise PromotionError(
+                "candidate and champion external panels use different engine "
+                "identities"
+            )
         if (
             candidate_panel.get("baseline_bot") != "catanatron_value"
             or champion_panel.get("baseline_bot") != "catanatron_value"
