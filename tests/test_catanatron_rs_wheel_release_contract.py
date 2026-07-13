@@ -206,3 +206,22 @@ def test_builder_runs_semantic_tests_for_advertised_corrected_capabilities() -> 
     assert temperature < build
     assert "--features python" in script[public_award - 180 : public_award]
     assert "temperature \\\n  --lib" in script[temperature : build]
+
+
+def test_python_enabled_rust_test_resolves_relocated_uv_libpython() -> None:
+    script = _script()
+    public_award = script.index(
+        "entity_player_tokens_preserve_public_awards_when_hidden_hands_are_masked"
+    )
+    prefix = script[:public_award]
+
+    assert 'sysconfig.get_config_var("LDLIBRARY")' in prefix
+    assert 'sysconfig.get_config_var("LIBDIR")' in prefix
+    assert 'pathlib.Path(sys.base_prefix) / "lib"' in prefix
+    assert 'LD_LIBRARY_PATH="$PYTHON_TEST_LIBDIR" cargo test' in prefix
+    # The shared-library workaround is scoped to the Python-enabled test.  It
+    # must not become an ambient release compiler input.
+    assert 'export LD_LIBRARY_PATH=' not in script
+    assert prefix.rindex('LD_LIBRARY_PATH="$PYTHON_TEST_LIBDIR"') > prefix.rindex(
+        "public_belief_determinization_tests"
+    )

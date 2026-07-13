@@ -159,6 +159,35 @@ echo "$STRIP_VERSION"
 mkdir -p "$OUT_DIR"
 rm -f "$OUT_DIR"/catanatron_rs-0.1.8-*.whl
 rm -f "$OUT_DIR/$RECEIPT_NAME"
+
+# PyO3's Python-enabled Rust tests link libpython, unlike the final extension
+# module.  uv-managed CPython installations can be relocated under a stable
+# minor-version directory while sysconfig retains the original patch-version
+# prefix.  Resolve the first real shared-library directory from the active
+# interpreter instead of trusting that stale prefix, then scope it to the one
+# test process that needs it.  This is test-runtime plumbing only: it is not
+# exported to maturin or the release compilation.
+PYTHON_TEST_LIBDIR="$($PYTHON_BIN - <<'PY'
+import pathlib
+import sys
+import sysconfig
+
+library = sysconfig.get_config_var("LDLIBRARY") or "libpython3.11.so"
+candidates = []
+configured = sysconfig.get_config_var("LIBDIR")
+if configured:
+    candidates.append(pathlib.Path(configured))
+candidates.append(pathlib.Path(sys.base_prefix) / "lib")
+for candidate in candidates:
+    if candidate.is_absolute() and (candidate / library).is_file():
+        print(candidate.resolve())
+        break
+else:
+    raise SystemExit(f"cannot locate {library} for Python-enabled Rust tests")
+PY
+)"
+[ -n "$PYTHON_TEST_LIBDIR" ] \
+  || die "Python-enabled Rust test library directory resolved empty"
 cargo test \
   --locked \
   --manifest-path "$ROOT/native/catanatron-rs/Cargo.toml" \
@@ -166,7 +195,7 @@ cargo test \
   --lib
 # Capability names are not evidence of semantics.  Run the exact source tests
 # for every corrected 0.1.8 behavior before compiling and hashing the wheel.
-cargo test \
+LD_LIBRARY_PATH="$PYTHON_TEST_LIBDIR" cargo test \
   --locked \
   --manifest-path "$ROOT/native/catanatron-rs/Cargo.toml" \
   --features python \
