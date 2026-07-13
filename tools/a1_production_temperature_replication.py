@@ -24,7 +24,7 @@ if str(REPO_ROOT) not in sys.path:
 from tools import a1_production_l1_rerun as base  # noqa: E402
 
 
-MANIFEST_SCHEMA = "a1-production-temperature-replication-v1"
+MANIFEST_SCHEMA = "a1-production-temperature-replication-v2"
 CLAIM_SCHEMA = "a1-production-temperature-replication-claim-v1"
 SUBMISSION_SCHEMA = "a1-production-temperature-replication-submission-v1"
 COMPLETION_SCHEMA = "a1-production-temperature-replication-completion-v1"
@@ -176,7 +176,13 @@ def _production_command(
     checkpoint: Path,
     report: Path,
 ) -> list[str]:
-    """Derive the only allowed production command from the selected receipt."""
+    """Derive the production command plus the proven-empty event fast path.
+
+    The crop is objective-preserving because preparation authenticates all
+    three payload inventories as empty and ``train_bc`` scans every event mask
+    before enabling it.  Unlike an output-path rebind, it materially removes
+    wasted tensor transfer/activation work, so it is explicit and sealed here.
+    """
 
     command = list(selected)
     if not command:
@@ -188,6 +194,9 @@ def _production_command(
     command[command.index(trainers[0])] = str(trainer.resolve(strict=True))
     _set(command, "--checkpoint", str(checkpoint))
     _set(command, "--report", str(report))
+    if base.CROP_FLAG in command:
+        _fail("diagnostic command unexpectedly already contains the production crop")
+    command.append(base.CROP_FLAG)
     return command
 
 
@@ -536,6 +545,8 @@ def prepare(
         "event_history_training_contract": {
             "public_observation_masked": True,
             "graph_history_features": True,
+            "authenticated_empty": True,
+            "crop_authenticated_empty_event_history": True,
             "payload_inventory_acknowledgements": inventories,
         },
         "selected_dose": {
@@ -633,6 +644,8 @@ def verify(manifest_path: Path) -> dict[str, Any]:
         != {
             "public_observation_masked": True,
             "graph_history_features": True,
+            "authenticated_empty": True,
+            "crop_authenticated_empty_event_history": True,
             "payload_inventory_acknowledgements": inventories,
         }
         or manifest.get("selected_dose")
@@ -688,6 +701,8 @@ def verify(manifest_path: Path) -> dict[str, Any]:
     positions = [index for index, item in enumerate(command) if item == base.ACK_FLAG]
     if [command[index + 1] for index in positions] != inventories:
         _fail("production command event-history acknowledgement drift")
+    if command.count(base.CROP_FLAG) != 1:
+        _fail("production command lacks the authenticated empty-event crop")
     trainers = [
         Path(item).resolve() for item in command if Path(item).name == "train_bc.py"
     ]
@@ -706,7 +721,7 @@ def verify(manifest_path: Path) -> dict[str, Any]:
         report=root / "train.report.json",
     )
     if command != expected_command:
-        _fail("production command is not an exact output-only derivation of selection")
+        _fail("production command is not the exact sealed production derivation")
     return {
         "manifest": manifest,
         "manifest_ref": manifest_ref,
@@ -832,18 +847,13 @@ def _verify_completed_report(
         or composite.get("policy_kl_anchor_component_ids") != ["gen3_replay"]
     ):
         _fail("completed report composite-data binding drift")
-    surface = report.get("training_information_surface")
     inventories = manifest["event_history_training_contract"][
         "payload_inventory_acknowledgements"
     ]
-    if (
-        not isinstance(surface, dict)
-        or surface.get("graph_history_observation_schema") is not True
-        or surface.get("event_history_consumer_enabled") is not True
-        or surface.get("empty_payload_inventory_acknowledgements")
-        != sorted(inventories)
-    ):
-        _fail("completed report event-history acknowledgement drift")
+    try:
+        base._verify_authenticated_empty_event_report(report, inventories)  # noqa: SLF001
+    except base.L1Error as error:
+        raise TemperatureReplicationError(str(error)) from error
     runtime = report.get("checkout_runtime_binding")
     trainer_ref = manifest["repo_binding"]["files"]["tools/train_bc.py"]
     if (

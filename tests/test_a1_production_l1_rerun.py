@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import subprocess
 
 import pytest
@@ -100,3 +101,65 @@ def test_python_binding_preserves_lexical_venv_symlink(tmp_path) -> None:
     assert binding["lexical_path"] == str(lexical)
     assert binding["resolved_path"] == str(real)
     assert l1._verify_python_binding(binding) == str(lexical)
+
+
+def _empty_event_surface(inventories: list[str]) -> dict[str, object]:
+    scan: dict[str, object] = {
+        "schema": "training-empty-event-mask-scan-v1",
+        "row_count": 47_620_447,
+        "padded_event_width": 64,
+        "nonzero_event_mask_count": 0,
+    }
+    scan["scan_sha256"] = l1._digest(scan)
+    return {
+        "schema": "a1-training-event-history-contract-v1",
+        "status": "empty_payloads_acknowledged",
+        "graph_history_observation_schema": True,
+        "event_history_consumer_enabled": True,
+        "training_event_history_trainable": False,
+        "event_history_end_to_end_usable": False,
+        "training_event_tensor_width": 0,
+        "empty_payload_inventory_acknowledgements": sorted(inventories),
+        "empty_event_mask_scan": scan,
+    }
+
+
+def test_completed_report_proves_authenticated_empty_event_fast_path() -> None:
+    inventories = ["sha256:" + char * 64 for char in "abc"]
+    report = {"training_information_surface": _empty_event_surface(inventories)}
+
+    l1._verify_authenticated_empty_event_report(report, inventories)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("training_event_tensor_width", 64),
+        ("training_event_history_trainable", True),
+        ("event_history_end_to_end_usable", True),
+    ],
+)
+def test_completed_report_rejects_empty_event_fast_path_drift(
+    field: str, value: object
+) -> None:
+    inventories = ["sha256:" + char * 64 for char in "abc"]
+    surface = _empty_event_surface(inventories)
+    surface[field] = value
+
+    with pytest.raises(l1.L1Error, match="fast-path drift"):
+        l1._verify_authenticated_empty_event_report(
+            {"training_information_surface": surface}, inventories
+        )
+
+
+def test_completed_report_rejects_forged_empty_event_scan() -> None:
+    inventories = ["sha256:" + char * 64 for char in "abc"]
+    surface = _empty_event_surface(inventories)
+    scan = json.loads(json.dumps(surface["empty_event_mask_scan"]))
+    scan["row_count"] = 1
+    surface["empty_event_mask_scan"] = scan
+
+    with pytest.raises(l1.L1Error, match="scan is malformed or drifted"):
+        l1._verify_authenticated_empty_event_report(
+            {"training_information_surface": surface}, inventories
+        )

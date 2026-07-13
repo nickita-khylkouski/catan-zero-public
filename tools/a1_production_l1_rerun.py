@@ -70,6 +70,66 @@ def _load(path: Path) -> dict[str, Any]:
     return value
 
 
+def _verify_authenticated_empty_event_report(
+    report: dict[str, Any], inventories: Sequence[str]
+) -> None:
+    """Prove that the sealed empty-history fast path actually ran.
+
+    Merely acknowledging legacy empty payload inventories is not enough.  A
+    launcher can carry those acknowledgements while still sending the padded
+    ``[batch, 64, 41]`` zero tensor through the event encoder on every step.
+    The trainer emits an exact full-corpus scan and the operational tensor
+    width only when ``--crop-authenticated-empty-event-history`` is active;
+    bind both receipts here so a successful process exit cannot masquerade as
+    the intended memory/throughput path.
+    """
+
+    surface = report.get("training_information_surface")
+    if not isinstance(surface, dict):
+        raise L1Error("training report lacks the event-history information surface")
+    expected_surface = {
+        "schema": "a1-training-event-history-contract-v1",
+        "status": "empty_payloads_acknowledged",
+        "graph_history_observation_schema": True,
+        "event_history_consumer_enabled": True,
+        "training_event_history_trainable": False,
+        "event_history_end_to_end_usable": False,
+        "training_event_tensor_width": 0,
+        "empty_payload_inventory_acknowledgements": sorted(inventories),
+    }
+    drift = {
+        key: {"expected": expected, "actual": surface.get(key)}
+        for key, expected in expected_surface.items()
+        if surface.get(key) != expected
+    }
+    if drift:
+        raise L1Error(f"training report empty-event fast-path drift: {drift}")
+
+    scan = surface.get("empty_event_mask_scan")
+    if not isinstance(scan, dict):
+        raise L1Error("training report lacks the authoritative empty-event scan")
+    unhashed_scan = dict(scan)
+    stated_scan_sha = unhashed_scan.pop("scan_sha256", None)
+    if (
+        set(scan)
+        != {
+            "schema",
+            "row_count",
+            "padded_event_width",
+            "nonzero_event_mask_count",
+            "scan_sha256",
+        }
+        or scan.get("schema") != "training-empty-event-mask-scan-v1"
+        or not isinstance(scan.get("row_count"), int)
+        or int(scan["row_count"]) <= 0
+        or not isinstance(scan.get("padded_event_width"), int)
+        or int(scan["padded_event_width"]) <= 0
+        or scan.get("nonzero_event_mask_count") != 0
+        or stated_scan_sha != _digest(unhashed_scan)
+    ):
+        raise L1Error("training report empty-event scan is malformed or drifted")
+
+
 def _ref(path: Path) -> dict[str, str]:
     try:
         resolved = path.expanduser().resolve(strict=True)
@@ -599,6 +659,12 @@ def finalize(manifest_path: Path, *, unit: str) -> dict[str, Any]:
     report_payload = _load(report)
     if report_payload.get("init_checkpoint") != verified["manifest"]["f7_parent"]["path"]:
         raise L1Error("training report parent checkpoint drift")
+    _verify_authenticated_empty_event_report(
+        report_payload,
+        verified["manifest"]["event_history_training_contract"][
+            "payload_inventory_acknowledgements"
+        ],
+    )
     completion = {
         "schema_version": COMPLETION_SCHEMA,
         "diagnostic_only": False,
