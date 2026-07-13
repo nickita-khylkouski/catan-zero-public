@@ -5968,6 +5968,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     )
     optimizer_observed_steps = 0
     optimizer_clipped_steps = 0
+    optimizer_zero_objective_steps = 0
     optimizer_pre_clip_grad_norm_sum = 0.0
     optimizer_pre_clip_grad_norm_max = 0.0
     total_training_steps = int(args.max_steps) if int(args.max_steps) > 0 else 0
@@ -6275,9 +6276,17 @@ def main(argv: Sequence[str] | None = None) -> None:
             loss = float(batch_metrics["loss"])
             accuracy = float(batch_metrics["accuracy"])
             optimizer_observability = batch_metrics.get("optimizer_observability")
+            optimizer_step_applied = bool(
+                batch_metrics.get("optimizer_step_applied", accum_do_step)
+            )
             if optimizer_observability is not None:
                 optimizer_observed_steps += 1
                 optimizer_clipped_steps += int(optimizer_observability["clipped"])
+                optimizer_zero_objective_steps += int(
+                    optimizer_observability.get(
+                        "zero_objective_step_skipped", False
+                    )
+                )
                 pre_clip_norm = float(
                     optimizer_observability["pre_clip_total_grad_norm"]
                 )
@@ -6386,7 +6395,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             # the clip+step when accum_do_step was True.
             if accum_do_step:
                 micro_in_group = 0
-                global_step += 1
+                if optimizer_step_applied:
+                    global_step += 1
             if args.progress_every_batches and batch_number % int(args.progress_every_batches) == 0:
                 _rank0_print(
                     json.dumps(
@@ -6618,6 +6628,9 @@ def main(argv: Sequence[str] | None = None) -> None:
                             "clipped_steps": optimizer_clipped_steps,
                             "clipped_fraction": (
                                 optimizer_clipped_steps / optimizer_observed_steps
+                            ),
+                            "zero_objective_steps_skipped": (
+                                optimizer_zero_objective_steps
                             ),
                             "mean_pre_clip_total_grad_norm": (
                                 optimizer_pre_clip_grad_norm_sum
@@ -7387,11 +7400,23 @@ def _train_candidate_batch(
         raise FloatingPointError(f"non-finite BC loss: {float(loss.detach().cpu())}")
     optimizer.zero_grad(set_to_none=True)
     loss.backward()
-    pre_clip_total_grad_norm = _clip_grad_norm(policy, max_grad_norm)
-    optimizer.step()
+    (
+        pre_clip_total_grad_norm,
+        optimizer_step_applied,
+        zero_objective_step_skipped,
+    ) = _step_optimizer_fail_closed(
+        policy,
+        optimizer,
+        loss=loss,
+        max_grad_norm=max_grad_norm,
+    )
     optimizer_observability = _optimizer_clip_observability(
         pre_clip_total_grad_norm,
         max_grad_norm=max_grad_norm,
+    )
+    optimizer_observability["optimizer_step_applied"] = optimizer_step_applied
+    optimizer_observability["zero_objective_step_skipped"] = (
+        zero_objective_step_skipped
     )
     predictions = torch.argmax(masked, dim=-1)
     active = policy_weights > 0.0
@@ -8373,15 +8398,28 @@ def _train_xdim_batch(
     backward_loss = loss / float(grad_accum_steps) if int(grad_accum_steps) > 1 else loss
     backward_loss.backward()
     optimizer_observability = None
+    optimizer_step_applied = False
     if accum_do_step:
         observability_state = (
             _capture_optimizer_observability(policy) if diagnostics else None
         )
-        pre_clip_total_grad_norm = _clip_grad_norm(policy, max_grad_norm)
-        optimizer.step()
+        (
+            pre_clip_total_grad_norm,
+            optimizer_step_applied,
+            zero_objective_step_skipped,
+        ) = _step_optimizer_fail_closed(
+            policy,
+            optimizer,
+            loss=loss,
+            max_grad_norm=max_grad_norm,
+        )
         optimizer_observability = _optimizer_clip_observability(
             pre_clip_total_grad_norm,
             max_grad_norm=max_grad_norm,
+        )
+        optimizer_observability["optimizer_step_applied"] = optimizer_step_applied
+        optimizer_observability["zero_objective_step_skipped"] = (
+            zero_objective_step_skipped
         )
         if observability_state is not None:
             optimizer_observability.update(
@@ -8528,6 +8566,7 @@ def _train_xdim_batch(
             if optimizer_observability is not None
             else {}
         ),
+        "optimizer_step_applied": bool(optimizer_step_applied),
     }
 
 
@@ -14165,6 +14204,51 @@ def _clip_grad_norm(policy, max_norm: float = 1.0):
     # ``model`` rather than inside it. `_params` is the historical authoritative
     # parameter set there; entity/DDP policies yield only ``model.parameters()``.
     return torch.nn.utils.clip_grad_norm_(list(_params(policy)), effective_max_norm)
+
+
+def _step_optimizer_fail_closed(
+    policy,
+    optimizer,
+    *,
+    loss,
+    max_grad_norm: float,
+):
+    """Clip and apply one optimizer step without committing corrupt/no-op state.
+
+    ``clip_grad_norm_`` defaults to ``error_if_nonfinite=False``. A NaN/Inf
+    gradient can therefore survive a finite scalar-loss check and be committed
+    to Adam's moments unless the returned global norm is checked explicitly.
+
+    An exactly zero objective *and* global gradient is not a learning step:
+    calling AdamW would decay parameters and advance old momentum even though
+    the batch carried no configured signal. We do not skip merely because the
+    gradient norm is zero; at a valid stationary point with nonzero loss,
+    optimizer momentum/decay semantics still apply.
+    """
+    pre_clip_total_grad_norm = _clip_grad_norm(policy, max_grad_norm)
+    grad_norm = (
+        float(pre_clip_total_grad_norm.detach().cpu().item())
+        if hasattr(pre_clip_total_grad_norm, "detach")
+        else float(pre_clip_total_grad_norm)
+    )
+    if not math.isfinite(grad_norm):
+        raise FloatingPointError(
+            f"non-finite BC gradient norm before optimizer step: {grad_norm}"
+        )
+    loss_value = (
+        float(loss.detach().cpu().item())
+        if hasattr(loss, "detach")
+        else float(loss)
+    )
+    zero_objective_step_skipped = loss_value == 0.0 and grad_norm == 0.0
+    optimizer_step_applied = not zero_objective_step_skipped
+    if optimizer_step_applied:
+        optimizer.step()
+    return (
+        pre_clip_total_grad_norm,
+        optimizer_step_applied,
+        zero_objective_step_skipped,
+    )
 
 
 def _torch_ppo_masked_logits(logits, valid_actions, action_size):
