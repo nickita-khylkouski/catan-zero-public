@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -82,6 +83,17 @@ def test_arm_is_scoped_and_changes_only_static_action_surface(tmp_path: Path) ->
         "static_action_residual_proj.weight",
     )
     assert arm.EXPECTED_TOPOLOGY_PARAMETER_COUNT == 14_720
+    assert arm.INFERENCE_COST_CONTRACT["schema_version"] == (
+        "a1-architecture-inference-cost-contract-v2"
+    )
+    assert set(arm.INFERENCE_COST_CONTRACT["required_profiles"]) == {
+        "operational_b1",
+        "d6_b12",
+    }
+    assert all(
+        profile["return_q"] is False
+        for profile in arm.INFERENCE_COST_CONTRACT["required_profiles"].values()
+    )
     assert (
         base.SCHEMA,
         base.ACTION_MODULE_LR_MULT,
@@ -178,3 +190,49 @@ def test_completion_requires_exact_action_local_optimizer_group(tmp_path: Path) 
     torch.save(payload, path)
     with pytest.raises(completion.CompletionError, match="completed dose"):
         completion._verify_optimizer_groups(path, optimizer_steps=128)
+
+
+def test_completion_replays_rich_finalizer_reference(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    finalizer = tmp_path / "static_completion.py"
+    finalizer.write_text("# exact finalizer bytes\n", encoding="utf-8")
+    candidate = tmp_path / "candidate.pt"
+    candidate.write_bytes(b"candidate")
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text("{}\n", encoding="utf-8")
+    monkeypatch.setattr(completion, "__file__", str(finalizer))
+
+    receipt = {
+        "schema_version": completion.SCHEMA,
+        "status": completion.STATUS,
+        "diagnostic_only": True,
+        "promotion_eligible": False,
+        "completion_finalizer": {
+            **arm._file_ref(finalizer),
+            "size_bytes": finalizer.stat().st_size,
+        },
+        "manifest": {"path": str(manifest)},
+        "checkpoint": {"path": str(candidate)},
+        "expected_checkpoint_sha256": "sha256:candidate",
+        "unit_state": {"Result": "success"},
+        "created_at_unix_ns": 1,
+    }
+    receipt["receipt_sha256"] = arm._digest(receipt)
+    receipt_path = tmp_path / completion.COMPLETION_NAME
+    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+    monkeypatch.setattr(
+        completion,
+        "build_completion",
+        lambda *_args, **_kwargs: dict(receipt),
+    )
+
+    assert completion.verify_completion(receipt_path) == receipt
+
+    incomplete = dict(receipt)
+    incomplete["completion_finalizer"] = arm._file_ref(finalizer)
+    incomplete.pop("receipt_sha256")
+    incomplete["receipt_sha256"] = arm._digest(incomplete)
+    receipt_path.write_text(json.dumps(incomplete), encoding="utf-8")
+    with pytest.raises(completion.CompletionError, match="finalizer/digest drift"):
+        completion.verify_completion(receipt_path)

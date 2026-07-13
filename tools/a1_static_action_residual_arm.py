@@ -71,19 +71,47 @@ TREATMENT_INTEGRATED_LR_CONTRACT = {
     "action_integrated_lr_step_equivalents": ACTION_MODULE_LR_MULT,
 }
 INFERENCE_COST_CONTRACT = {
-    "schema_version": "a1-architecture-inference-cost-contract-v1",
+    "schema_version": "a1-architecture-inference-cost-contract-v2",
     "required_before_completion": True,
     "benchmark_tool": "tools/bench_entity_graph_stages.py",
     "measurement_boundary": "forward_legal_np_plus_eval_server_d2h",
     "strict_fp32": True,
-    "matched_shape": {
-        "batch_size": 48,
-        "legal_width": 54,
-        "event_width": 0,
-        "valid_players": 2,
-        "return_q": True,
-        "warmup": 20,
-        "iterations": 100,
+    "required_profiles": {
+        "operational_b1": {
+            "reference_filename": "reference-inference-profile.b1.json",
+            "candidate_filename": "candidate-inference-profile.b1.json",
+            "batch_size": 1,
+            "legal_width": 54,
+            "event_width": 0,
+            "valid_players": 2,
+            "return_q": False,
+            "warmup": 20,
+            "iterations": 100,
+        },
+        "d6_b12": {
+            "reference_filename": "reference-inference-profile.b12.json",
+            "candidate_filename": "candidate-inference-profile.b12.json",
+            "batch_size": 12,
+            "legal_width": 54,
+            "event_width": 0,
+            "valid_players": 2,
+            "return_q": False,
+            "warmup": 20,
+            "iterations": 100,
+        },
+    },
+    "optional_profiles": {
+        "throughput_b48": {
+            "reference_filename": "reference-inference-profile.b48.json",
+            "candidate_filename": "candidate-inference-profile.b48.json",
+            "batch_size": 48,
+            "legal_width": 54,
+            "event_width": 0,
+            "valid_players": 2,
+            "return_q": False,
+            "warmup": 20,
+            "iterations": 100,
+        }
     },
     "required_metrics": [
         "exact_window.cuda_ms.mean",
@@ -94,8 +122,9 @@ INFERENCE_COST_CONTRACT = {
         "exact_window.wall_ms.p95",
     ],
     "selection_semantics": (
-        "strength is adjudicated with candidate/reference inference cost; "
-        "architecture selection may not ignore latency"
+        "strength must be adjudicated with operational batch-1 and D6 batch-12 "
+        "candidate/reference inference cost; architecture selection may not infer "
+        "latency from a throughput-only batch-48 profile"
     ),
 }
 SOURCE_FILES = tuple(

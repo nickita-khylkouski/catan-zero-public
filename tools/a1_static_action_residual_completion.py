@@ -137,6 +137,15 @@ def _call(name: str, *args: Any, **kwargs: Any) -> Any:
         return getattr(base, name)(*args, **kwargs)
 
 
+def _rich_file_ref(path: Path) -> dict[str, Any]:
+    """Match the size-bound file-reference schema emitted by the base finalizer."""
+    resolved = path.expanduser().resolve(strict=True)
+    return {
+        **arm._file_ref(resolved),  # noqa: SLF001
+        "size_bytes": resolved.stat().st_size,
+    }
+
+
 def verify_manifest(manifest_path: Path) -> dict[str, Any]:
     return _call("verify_manifest", manifest_path)
 
@@ -210,7 +219,7 @@ def verify_completion(path: Path) -> dict[str, Any]:
         and receipt.get("diagnostic_only") is True
         and receipt.get("promotion_eligible") is False
         and stated == arm._digest(unhashed)  # noqa: SLF001
-        and receipt.get("completion_finalizer") == arm._file_ref(Path(__file__))  # noqa: SLF001
+        and receipt.get("completion_finalizer") == _rich_file_ref(Path(__file__))
     ):
         raise CompletionError(
             "static-action completion schema/status/finalizer/digest drift"
