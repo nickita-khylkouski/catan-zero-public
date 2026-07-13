@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from tools import a1_combined_candidate_handoff as handoff
+from tools import a1_lineage_dose as lineage
 
 
 def _file(tmp_path: Path, name: str, body: bytes = b"x") -> Path:
@@ -286,6 +287,7 @@ def test_promotion_report_accepts_only_exact_authenticated_curriculum_parent(
         "grad_accum_steps": 1,
         "global_batch_size": 4096,
         "ddp_shard_data": False,
+        "symmetry_augment": False,
     }
     report = tmp_path / "report.json"
     payload = {
@@ -303,9 +305,18 @@ def test_promotion_report_accepts_only_exact_authenticated_curriculum_parent(
         "init_checkpoint_sha256": parent_binding["parent_checkpoint"]["sha256"],
         "a1_curriculum_parent": parent_binding,
         "a1_curriculum_declaration": curriculum_declaration,
+        "a1_lineage_dose": lineage.curriculum_lineage_dose(
+            declared_producer_sha256=producer_sha,
+            init_checkpoint_sha256=parent_binding["parent_checkpoint"]["sha256"],
+            parent_receipt_sha256=parent_binding["receipt_sha256"],
+            parent_lineage_dose=curriculum_declaration["parent_lineage_dose"],
+            current_sampled_rows=140_000,
+            current_optimizer_steps=10,
+        ),
         "steps_completed": 10,
         "epochs": 1,
         "max_steps": 0,
+        "symmetry_augment": False,
     }
     report.write_text(json.dumps(payload))
     verified = handoff.promotion._verify_training_report(  # noqa: SLF001

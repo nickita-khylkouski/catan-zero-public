@@ -33,18 +33,7 @@ ARM_SPECS = {
     "lr120u": (0.00012, "all-196k-corrective-lr120u-loser1"),
     "lr240u": (0.00024, "n256-lr-response-lr240u-loser1"),
 }
-APPROVED_SHAPES = {
-    "c1": 4,
-    "c2": 4,
-    "c3": 4,
-    "c4": 4,
-    "c5": 4,
-    "c6": 4,
-    "h100-8a": 8,
-    "h100-8b": 8,
-    "h100-8c": 8,
-    "h100-8d": 8,
-}
+APPROVED_SHAPES = dict(fleet.FULL_EXPECTED_SHAPES)
 SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 
 

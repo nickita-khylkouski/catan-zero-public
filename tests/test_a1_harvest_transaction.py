@@ -15,6 +15,39 @@ from tools.fleet import a1_harvest_transaction as harvest
 CATEGORIES = ("current_producer", "recent_history", "hard_negative")
 
 
+def _current_search_operator() -> dict:
+    """Build the fixture operator through the current production validator."""
+
+    return contract._search_operator(  # noqa: SLF001
+        {
+            "c_scale": 0.03,
+            "c_visit": 50.0,
+            "n_fast": 16,
+            "n_full": 128,
+            "p_full": 0.4,
+            "max_depth": 600,
+            "lazy_interior_chance": True,
+            "correct_rust_chance_spectra": True,
+            "belief_chance_spectra": True,
+            "information_set_search": True,
+            "determinization_particles": 4,
+            "determinization_min_simulations": 1,
+            "rescale_noise_floor_c": 1.0,
+            "sigma_eval": 0.98,
+            "prior_temperature": 1.0,
+            "symmetry_averaged_eval": True,
+            "symmetry_averaged_eval_threshold": 20,
+            "exact_budget_sh": True,
+            "exact_budget_sh_min_n": 48,
+            "n_full_wide": 256,
+            "n_full_wide_threshold": 40,
+            "wide_roots_always_full": True,
+            "wide_candidates_threshold": 40,
+            "raw_policy_above_width": 80,
+        }
+    )
+
+
 def test_bounded_fetch_uses_multiple_direct_host_streams(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -85,6 +118,7 @@ def _fixture_contract(tmp_path: Path) -> tuple[dict, dict, Path, Path, Path]:
                     "output_dir": output,
                 }
             )
+    search_operator = _current_search_operator()
     lock = {
         "contract_sha256": "sha256:" + "1" * 64,
         "fleet": {
@@ -102,7 +136,8 @@ def _fixture_contract(tmp_path: Path) -> tuple[dict, dict, Path, Path, Path]:
             {"name": "hard_negative", "checkpoint_ids": ["hard"]},
         ],
         "science": {
-            "search_operator_sha256": "sha256:" + "6" * 64,
+            "search_operator": search_operator,
+            "search_operator_sha256": contract._digest_value(search_operator),
             "effective_search_config_sha256": "sha256:" + "7" * 64,
             "evaluator_sha256": "sha256:" + "8" * 64,
             "value_readout": "scalar",
