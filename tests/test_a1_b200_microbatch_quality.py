@@ -64,6 +64,8 @@ def _base(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
         "flat",
         "--seed",
         "1",
+        "--validation-max-samples",
+        "0",
         "--checkpoint",
         "/old/candidate.pt",
         "--report",
@@ -140,6 +142,20 @@ def test_plan_refuses_non_diagnostic_composite(
     payload["promotion_eligible"] = True
     descriptor.write_text(json.dumps(payload), encoding="utf-8")
     with pytest.raises(quality.QualityProbeError, match="diagnostic-only"):
+        quality.build_plan(
+            base_command_json=base,
+            output_dir=tmp_path / "probe",
+        )
+
+
+def test_plan_refuses_composite_validation_row_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    base = _base(tmp_path, monkeypatch)
+    command = json.loads(base.read_text(encoding="utf-8"))
+    command[command.index("--validation-max-samples") + 1] = "8192"
+    base.write_text(json.dumps(command), encoding="utf-8")
+    with pytest.raises(quality.QualityProbeError, match="whole-game sentinel"):
         quality.build_plan(
             base_command_json=base,
             output_dir=tmp_path / "probe",
