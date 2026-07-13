@@ -850,10 +850,21 @@ def test_checked_in_template_is_intentionally_unresolved_and_refuses_seal() -> N
     payload = json.loads(TEMPLATE.read_text(encoding="utf-8"))
     unresolved = contract._find_unresolved(payload)
     assert payload["science"]["search"]["n_full"] == 128
-    assert payload["science"]["search"]["p_full"] == 0.4
+    assert payload["science"]["search"]["p_full"] == 0.25
     assert payload["science"]["search"]["c_scale"] == 0.1
+    recipe = payload["science"]["learner_training_recipe"]
+    assert recipe["amp"] == "none"
+    assert recipe["forced_action_weight"] == 0.0
+    assert recipe["forced_row_value_weight"] == 1.0
+    assert recipe["per_game_policy_weight"] is True
+    assert recipe["per_game_policy_weight_mode"] == "equal"
+    assert recipe["training_rng_rank_offset"] is True
+    assert recipe["per_game_value_weight"] is False
     assert "$.promotion_handoff.path" in unresolved
-    assert "$.science.search.n_full_wide" in unresolved
+    assert payload["science"]["search"]["n_full_wide"] is None
+    assert payload["science"]["search"]["n_full_wide_threshold"] is None
+    assert payload["science"]["search"]["wide_roots_always_full"] is False
+    assert "$.science.search.n_full_wide" not in unresolved
     assert "$.science.evaluator.value_readout" in unresolved
     assert "$.checkpoints[1].path" in unresolved
     assert "$.checkpoints[2].selection_evidence" in unresolved

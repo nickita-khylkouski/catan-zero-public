@@ -107,10 +107,16 @@ def _training_report(
         "epochs": 1,
         "max_steps": 0,
         "batch_size": recipe["batch_size"],
+        "grad_accum_steps": recipe["grad_accum_steps"],
+        "effective_global_batch_size": recipe["global_batch_size"],
+        "ddp_shard_data": False,
         "amp": recipe["amp"],
         "lr": recipe["lr"],
         "weight_decay": recipe["weight_decay"],
         "seed": recipe["seed"],
+        "training_rng_rank_offset": bool(
+            recipe.get("training_rng_rank_offset", False)
+        ),
         "mask_hidden_info": True,
         "symmetry_augment": False,
         "data": str(verified["data_path"]),
@@ -130,6 +136,19 @@ def _training_report(
             "validation_file_sha256"
         ],
         "validation_game_seed_set_sha256": verified["validation_game_seed_set_sha256"],
+        "forced_action_weight": float(recipe["forced_action_weight"]),
+        "forced_row_value_weight": float(recipe["forced_row_value_weight"]),
+        "per_game_policy_weight": bool(
+            recipe.get("per_game_policy_weight", False)
+        ),
+        "per_game_policy_weight_mode": str(
+            recipe.get("per_game_policy_weight_mode", "equal")
+        ),
+        "per_game_value_weight": bool(recipe["per_game_value_weight"]),
+        "value_loss_weight": float(recipe["value_loss_weight"]),
+        "truncated_vp_margin_value_weight": float(
+            recipe["truncated_vp_margin_value_weight"]
+        ),
         "steps_completed": steps_completed,
         "total_training_steps": steps_completed,
         "require_35m_model": True,
@@ -167,7 +186,12 @@ def _training_report(
         ],
     }
     if "policy_aux_active_batch_size" in recipe:
-        base_draws = steps_completed * recipe["batch_size"]
+        # The legacy single-rank iterator keeps its final partial batch instead
+        # of padding it.  Report the rows actually consumed, not nominal
+        # optimizer_steps * batch_size capacity.  (The 8-rank DDP topology has
+        # an authenticated padding receipt and therefore reports padded global
+        # draw events.)
+        base_draws = verified["training_row_count"]
         aux_draws = steps_completed * recipe["policy_aux_active_batch_size"]
         policy_base = min(base_draws, 1_000)
         payload.update(
@@ -204,6 +228,74 @@ def _remove_option(command: list[str], flag: str) -> list[str]:
     index = changed.index(flag)
     del changed[index : index + 2]
     return changed
+
+
+class _FakeCompositeCorpus:
+    def __init__(self, component_seed_rows: list[list[int]]) -> None:
+        self.corpora = [
+            {"game_seed": np.asarray(seeds, dtype=np.int64)}
+            for seeds in component_seed_rows
+        ]
+        self.offsets = np.cumsum(
+            [0, *(len(seeds) for seeds in component_seed_rows)], dtype=np.int64
+        )
+
+    def __len__(self) -> int:
+        return int(self.offsets[-1])
+
+
+def _production_composite_meta(tmp_path: Path, producer_sha256: str) -> dict:
+    component_ids = [
+        "current_producer",
+        "recent_history",
+        "hard_negative",
+        "historical_replay",
+    ]
+    ratios = {
+        "current_producer": 0.64,
+        "recent_history": 0.12,
+        "hard_negative": 0.04,
+        "historical_replay": 0.20,
+    }
+    sampling_receipt = {"effective_component_sampling_ratios": ratios}
+    contract_payload = {
+        "schema_version": "flywheel-replay-composite-v2",
+        "fresh_component_ids": component_ids[:3],
+        "replay_component_ids": component_ids[3:],
+        "fresh_source_game_ratios": {
+            "current_producer": 0.8,
+            "recent_history": 0.15,
+            "hard_negative": 0.05,
+        },
+        "effective_component_sampling_ratios": ratios,
+        "realized_replay_ratio": 0.20,
+        "initializer_checkpoint_sha256": producer_sha256,
+        "sampling_receipt": sampling_receipt,
+        "sampling_receipt_sha256": executor._value_sha256(sampling_receipt),
+    }
+    return {
+        "schema_version": "memmap_composite_v2",
+        "diagnostic_only": False,
+        "promotion_eligible": True,
+        "component_ids": component_ids,
+        "component_game_sampling_ratios": list(ratios.values()),
+        "production_mix_contract": contract_payload,
+        "components": [
+            {
+                "source_category": component_id,
+                "corpus_dir": str(tmp_path / component_id),
+            }
+            for component_id in component_ids
+        ],
+        "descriptor_file_sha256": "sha256:" + "2" * 64,
+        "descriptor_fingerprint": "sha256:" + "3" * 64,
+        "learner_recipe_overrides": {
+            "per_game_policy_weight": True,
+            "per_game_policy_weight_mode": "equal",
+        },
+        "learner_recipe_overrides_sha256": "sha256:" + "4" * 64,
+        "payload_inventory_sha256": "sha256:" + "5" * 64,
+    }
 
 
 def _failed_architecture_attempt(tmp_path: Path) -> tuple[dict, Path, list[str]]:
@@ -314,6 +406,306 @@ def test_command_is_direct_one_b200_fresh_unfused_adam(tmp_path: Path) -> None:
         assert _option(command, flag) == value
 
 
+def test_b200_8gpu_topology_preserves_global_batch_and_renders_torchrun(
+    tmp_path: Path,
+) -> None:
+    verified = _verified(tmp_path)
+    verified["recipe"].update(
+        {
+            "training_rng_rank_offset": True,
+            "per_game_policy_weight": True,
+            "per_game_policy_weight_mode": "equal",
+        }
+    )
+    bound = executor.bind_training_topology(
+        verified,
+        topology=executor.B200_8GPU_DDP_TOPOLOGY,
+        gpu=0,
+    )
+    bound["data_kind"] = "production_composite_v2"
+
+    command = executor.build_train_command(
+        bound,
+        python=Path(sys.executable),
+        checkpoint=tmp_path / "candidate.pt",
+        report=tmp_path / "report.json",
+    )
+
+    assert command[:7] == [
+        sys.executable,
+        "-m",
+        "torch.distributed.run",
+        "--standalone",
+        "--nproc_per_node=8",
+        str(executor._REPO_ROOT / "tools" / "train_bc.py"),
+        "--arch",
+    ]
+    assert bound["training_topology"] == {
+        "schema_version": "a1-one-dose-training-topology-v1",
+        "name": executor.B200_8GPU_DDP_TOPOLOGY,
+        "world_size": 8,
+        "physical_gpus": list(range(8)),
+        "local_batch_size": 512,
+        "grad_accum_steps": 1,
+        "global_batch_size": 4096,
+        "dose_preserving": True,
+    }
+    assert _option(command, "--batch-size") == "512"
+    assert _option(command, "--grad-accum-steps") == "1"
+    assert "--ddp-shard-data" not in command
+    assert "--training-rng-rank-offset" in command
+    assert "--per-game-policy-weight" in command
+    assert _option(command, "--per-game-policy-weight-mode") == "equal"
+    assert "--validation-game-seed-manifest" not in command
+    assert executor._child_environment(range(8))["CUDA_VISIBLE_DEVICES"] == (
+        "0,1,2,3,4,5,6,7"
+    )
+    assert executor._effective_global_batch_size(bound["recipe"]) == 4096
+    assert executor._expected_optimizer_steps(bound) == 2
+
+
+def test_b200_8gpu_topology_requires_same_host_canary_receipt(
+    tmp_path: Path,
+) -> None:
+    bound = executor.bind_training_topology(
+        _verified(tmp_path),
+        topology=executor.B200_8GPU_DDP_TOPOLOGY,
+        gpu=0,
+    )
+
+    with pytest.raises(
+        executor.ExecutorError,
+        match="requires --ddp-canary-receipt",
+    ):
+        executor.bind_ddp_canary(bound, None)
+
+
+def _ddp_canary_payload(*, created_unix_ns: int) -> dict:
+    identities = [
+        {
+            "physical_index": rank,
+            "uuid": f"GPU-{rank:02d}",
+            "pci_bus_id": f"00000000:{rank:02x}:00.0",
+            "name": "NVIDIA B200",
+        }
+        for rank in range(8)
+    ]
+    payload = {
+        "schema_version": executor.ddp_canary.SCHEMA,
+        "passed": True,
+        "diagnostic_only": True,
+        "promotion_eligible": False,
+        "hostname": executor.socket.gethostname(),
+        "created_unix_ns": created_unix_ns,
+        "world_size": 8,
+        "local_batch_size": 512,
+        "global_batch_size": 4096,
+        "ddp_shard_data": False,
+        "training_rng_rank_offset": True,
+        "training_rng_contracts": [
+            {
+                "effective_torch_seed": executor.ddp_canary.SEED + rank,
+                "rank_offset_enabled": True,
+            }
+            for rank in range(8)
+        ],
+        "dropout_probe_sha256_by_rank": [
+            "sha256:" + f"{rank + 1:064x}" for rank in range(8)
+        ],
+        "distributed_backend": "nccl",
+        "cuda_collective": {
+            "operation": "all_reduce_sum",
+            "expected": 36.0,
+            "actual_by_rank": [36.0] * 8,
+            "passed": True,
+        },
+        "padded_global_draws": 12_288,
+        "local_draws_per_rank": 1_536,
+        "gpu_names": ["NVIDIA B200"] * 8,
+        "gpu_identities": identities,
+        "global_draw_sha256": "sha256:" + "a" * 64,
+        "rank_slice_sha256": ["sha256:" + f"{rank + 9:064x}" for rank in range(8)],
+        "tool": {
+            "path": str(Path(executor.ddp_canary.__file__).resolve()),
+            "sha256": executor._file_sha256(
+                Path(executor.ddp_canary.__file__).resolve()
+            ),
+        },
+        "train_bc": {
+            "path": str(Path(executor.train_bc.__file__).resolve()),
+            "sha256": executor._file_sha256(Path(executor.train_bc.__file__).resolve()),
+        },
+    }
+    payload["receipt_sha256"] = executor._value_sha256(payload)
+    return payload
+
+
+def test_b200_8gpu_topology_accepts_exact_local_canary_receipt(
+    tmp_path: Path,
+) -> None:
+    bound = executor.bind_training_topology(
+        _verified(tmp_path),
+        topology=executor.B200_8GPU_DDP_TOPOLOGY,
+        gpu=0,
+    )
+    payload = _ddp_canary_payload(created_unix_ns=executor.time.time_ns())
+    receipt = tmp_path / "ddp-canary.json"
+    receipt.write_text(json.dumps(payload), encoding="utf-8")
+
+    result = executor.bind_ddp_canary(bound, receipt)
+
+    assert result["ddp_canary"]["receipt_sha256"] == payload["receipt_sha256"]
+    assert result["ddp_canary"]["global_draw_sha256"] == payload[
+        "global_draw_sha256"
+    ]
+
+
+def test_b200_8gpu_topology_rejects_stale_canary_receipt(
+    tmp_path: Path,
+) -> None:
+    bound = executor.bind_training_topology(
+        _verified(tmp_path),
+        topology=executor.B200_8GPU_DDP_TOPOLOGY,
+        gpu=0,
+    )
+    payload = _ddp_canary_payload(
+        created_unix_ns=(
+            executor.time.time_ns() - executor.MAX_DDP_CANARY_AGE_NS - 1
+        )
+    )
+    receipt = tmp_path / "stale-canary.json"
+    receipt.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(executor.ExecutorError, match="exact B200 DDP topology"):
+        executor.bind_ddp_canary(bound, receipt)
+
+
+def test_legacy_topology_rejects_ddp_canary_receipt(tmp_path: Path) -> None:
+    bound = executor.bind_training_topology(
+        _verified(tmp_path),
+        topology=executor.LEGACY_SINGLE_GPU_TOPOLOGY,
+        gpu=3,
+    )
+
+    with pytest.raises(executor.ExecutorError, match="valid only for 8-GPU"):
+        executor.bind_ddp_canary(bound, tmp_path / "canary.json")
+
+
+def test_production_composite_receipts_component_whole_game_split(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    verified = _verified(tmp_path)
+    producer = verified["producer"]
+    descriptor = tmp_path / "production-composite.json"
+    descriptor.write_text("{}", encoding="utf-8")
+    corpus = _FakeCompositeCorpus(
+        [
+            [100, 100, 101, 101],
+            [200, 200, 201, 201],
+            [300, 300, 301, 301],
+            [400, 400, 401, 401],
+        ]
+    )
+    monkeypatch.setattr(
+        executor.train_bc,
+        "load_teacher_data_memmap",
+        lambda *_args, **_kwargs: corpus,
+    )
+    monkeypatch.setattr(
+        executor.train_bc,
+        "split_train_validation_indices",
+        lambda *_args, **_kwargs: {
+            "train": np.asarray([0, 1, 4, 5, 8, 9, 12, 13], dtype=np.int64),
+            "validation": np.asarray(
+                [2, 3, 6, 7, 10, 11, 14, 15], dtype=np.int64
+            ),
+        },
+    )
+    monkeypatch.setattr(
+        executor.train_bc,
+        "_training_data_fingerprint",
+        lambda *_args, **_kwargs: "sha256:" + "6" * 64,
+    )
+    meta = _production_composite_meta(tmp_path, producer["sha256"])
+
+    result = executor._verify_production_composite_inputs(
+        lock=verified["lock"],
+        lock_path=verified["lock_path"],
+        reviewed_lock_file_sha256=None,
+        recipe=verified["recipe"],
+        objective=verified["objective"],
+        producer=producer,
+        data_path=descriptor,
+        meta=meta,
+        validation_path=None,
+    )
+
+    split = result["validation_split_receipt"]
+    assert split["aggregate"] == {
+        "selected_game_count": 8,
+        "training_game_count": 4,
+        "validation_game_count": 4,
+        "row_count": 16,
+        "training_row_count": 8,
+        "validation_row_count": 8,
+    }
+    assert [row["component_id"] for row in split["components"]] == [
+        "current_producer",
+        "recent_history",
+        "hard_negative",
+        "historical_replay",
+    ]
+    assert result["training_row_count"] == 8
+    assert result["validation_row_count"] == 8
+
+
+def test_production_composite_rejects_cross_component_game_seed_reuse(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    verified = _verified(tmp_path)
+    producer = verified["producer"]
+    descriptor = tmp_path / "production-composite.json"
+    descriptor.write_text("{}", encoding="utf-8")
+    corpus = _FakeCompositeCorpus(
+        [
+            [100, 100, 101, 101],
+            [100, 100, 201, 201],
+            [300, 300, 301, 301],
+            [400, 400, 401, 401],
+        ]
+    )
+    monkeypatch.setattr(
+        executor.train_bc,
+        "load_teacher_data_memmap",
+        lambda *_args, **_kwargs: corpus,
+    )
+    monkeypatch.setattr(
+        executor.train_bc,
+        "split_train_validation_indices",
+        lambda *_args, **_kwargs: {
+            "train": np.asarray([0, 1, 4, 5, 8, 9, 12, 13], dtype=np.int64),
+            "validation": np.asarray(
+                [2, 3, 6, 7, 10, 11, 14, 15], dtype=np.int64
+            ),
+        },
+    )
+
+    with pytest.raises(executor.ExecutorError, match="reuses game seeds"):
+        executor._verify_production_composite_inputs(
+            lock=verified["lock"],
+            lock_path=verified["lock_path"],
+            reviewed_lock_file_sha256=None,
+            recipe=verified["recipe"],
+            objective=verified["objective"],
+            producer=producer,
+            data_path=descriptor,
+            meta=_production_composite_meta(tmp_path, producer["sha256"]),
+            validation_path=None,
+        )
+
+
 def test_future_production_per_game_value_mode_is_explicit(tmp_path: Path) -> None:
     verified = _verified(tmp_path)
     verified["recipe"]["per_game_value_weight"] = True
@@ -414,14 +806,14 @@ def test_report_binding_seals_exact_base_value_and_policy_doses(
     assert exposure == {
         "measurement_status": "bound_exactly",
         "measurement_scope": "current_dose",
-        "base_sampled_rows": 8_192,
+        "base_sampled_rows": 4_097,
         "policy_base_active_sampled_rows": 1_000,
         "policy_aux_active_sampled_rows": 256,
         "policy_active_sampled_rows": 1_256,
-        "value_active_sampled_rows": 8_192,
+        "value_active_sampled_rows": 4_097,
         "anchor_eligible_sampled_rows": 0,
     }
-    assert dose["current_sampled_rows"] == 8_192
+    assert dose["current_sampled_rows"] == 4_097
 
 
 def test_exact_policy_dose_binding_refuses_counter_drift(tmp_path: Path) -> None:

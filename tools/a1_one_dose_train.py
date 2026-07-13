@@ -3,15 +3,18 @@
 
 This is the only production A1 training entry point.  It consumes a sealed
 ``a1-pre-wave-contract-lock-v2`` plus the audited memmap/validation sidecar,
-replays their byte and seed bindings, and then constructs the exact single-B200
-``train_bc`` invocation bound by the lock.  The default is a read-only dry run;
-``--go`` is required to probe the selected B200 and start training.
+replays their byte and seed bindings, and then constructs the exact B200
+``train_bc`` invocation bound by the lock. The historical one-GPU topology is
+replayable; current production may select one exact 8-GPU B200 DDP topology
+with the same global batch and optimizer/sample dose. The default is a
+read-only dry run; ``--go`` is required to probe every selected B200 and start
+training.
 """
 
 from __future__ import annotations
 
 import argparse
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 import errno
 import fcntl
 import hashlib
@@ -26,6 +29,7 @@ import stat
 import subprocess
 import sys
 import time
+import socket
 from typing import Any, Callable, Sequence
 
 import numpy as np
@@ -41,6 +45,7 @@ from tools import a1_pre_wave_contract as a1_contract  # noqa: E402
 from tools import train_bc  # noqa: E402
 from tools import a1_lineage_dose as lineage  # noqa: E402
 from tools import a1_function_preserving_upgrade as architecture_upgrade  # noqa: E402
+from tools import a1_ddp_epoch_canary as ddp_canary  # noqa: E402
 
 
 RECEIPT_SCHEMA = "a1-one-dose-training-receipt-v3"
@@ -50,6 +55,8 @@ RETRY_CLAIM_SCHEMA = "a1-one-dose-training-claim-v4"
 PLAN_SCHEMA = "a1-one-dose-training-plan-v2"
 REPORT_EXECUTION_BINDING_SCHEMA = "a1-one-dose-execution-binding-v1"
 REPORT_EXECUTION_BINDING_FIELD = "a1_one_dose_execution_binding"
+REPORT_INPUT_BINDING_SCHEMA = "a1-one-dose-input-binding-v1"
+REPORT_INPUT_BINDING_FIELD = "a1_one_dose_input_binding"
 RETRY_CONTRACT_SCHEMA = "a1-one-dose-learner-retry-contract-v1"
 RETRY_IDENTITY_SCHEMA = "a1-one-dose-learner-retry-identity-v1"
 RETRY_REPAIR_KIND = "entity_graph_graph_layers_default_4_to_checkpoint_6"
@@ -60,8 +67,26 @@ UPGRADE_CLAIM_SCHEMA = "a1-architecture-upgrade-training-claim-v1"
 CLAIM_DIRECTORY = ".a1-one-dose-training-claims"
 MIN_NOFILE = 65_536
 MAX_IDLE_GPU_MEMORY_MIB = 64
+MAX_DDP_CANARY_AGE_NS = 60 * 60 * 1_000_000_000
 DATA_LOADER_WORKERS = 2
 DATA_LOADER_PREFETCH = 2
+LEGACY_SINGLE_GPU_TOPOLOGY = "legacy-single-gpu"
+B200_8GPU_DDP_TOPOLOGY = "b200-8gpu-ddp"
+B200_8GPU_DDP_GPUS = tuple(range(8))
+TRAINING_TOPOLOGIES: dict[str, dict[str, Any]] = {
+    LEGACY_SINGLE_GPU_TOPOLOGY: {
+        "world_size": 1,
+        "local_batch_size": 4096,
+        "grad_accum_steps": 1,
+        "global_batch_size": 4096,
+    },
+    B200_8GPU_DDP_TOPOLOGY: {
+        "world_size": 8,
+        "local_batch_size": 512,
+        "grad_accum_steps": 1,
+        "global_batch_size": 4096,
+    },
+}
 EVENT_HISTORY_ACK_FLAG = (
     "--acknowledge-empty-event-history-payload-inventory-sha256"
 )
@@ -309,7 +334,24 @@ def _with_digest(payload: dict[str, Any], field: str) -> dict[str, Any]:
     return result
 
 
-def _child_environment(gpu: int) -> dict[str, str]:
+def _selected_gpus(verified: dict[str, Any], *, fallback_gpu: int) -> tuple[int, ...]:
+    topology = verified.get("training_topology")
+    raw = [fallback_gpu] if topology is None else topology.get("physical_gpus")
+    if (
+        not isinstance(raw, list)
+        or not raw
+        or any(isinstance(gpu, bool) or not isinstance(gpu, int) or gpu < 0 for gpu in raw)
+        or len(set(raw)) != len(raw)
+    ):
+        raise ExecutorError("training topology has invalid physical GPU ownership")
+    gpus = tuple(raw)
+    world_size = int(verified.get("recipe", {}).get("world_size", len(gpus)))
+    if len(gpus) != world_size:
+        raise ExecutorError("training topology GPU count differs from learner world size")
+    return gpus
+
+
+def _child_environment(gpu: int | Sequence[int]) -> dict[str, str]:
     """Return the complete, secret-free environment for the learner child.
 
     Do not start from ``os.environ``: an operator shell may contain distributed,
@@ -318,15 +360,23 @@ def _child_environment(gpu: int) -> dict[str, str]:
     not the ambient HOME variable, and every other entry is an explicit value.
     """
 
-    if isinstance(gpu, bool) or not isinstance(gpu, int) or gpu < 0:
-        raise ExecutorError("child environment GPU must be a non-negative integer")
+    raw_gpus = [gpu] if isinstance(gpu, int) and not isinstance(gpu, bool) else list(gpu)
+    if (
+        not raw_gpus
+        or any(
+            isinstance(value, bool) or not isinstance(value, int) or value < 0
+            for value in raw_gpus
+        )
+        or len(set(raw_gpus)) != len(raw_gpus)
+    ):
+        raise ExecutorError("child environment GPUs must be unique non-negative integers")
     try:
         account_home = pwd.getpwuid(os.getuid()).pw_dir
     except (KeyError, OSError) as error:
         raise ExecutorError("cannot resolve the learner account home") from error
     environment = {
         "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
-        "CUDA_VISIBLE_DEVICES": str(gpu),
+        "CUDA_VISIBLE_DEVICES": ",".join(map(str, raw_gpus)),
         "HOME": str(account_home),
         "LANG": "C.UTF-8",
         "LC_ALL": "C.UTF-8",
@@ -360,6 +410,76 @@ def _execution_binding(
         "environment": dict(environment),
         "environment_sha256": _value_sha256(environment),
     }
+
+
+def _input_binding(verified: dict[str, Any]) -> dict[str, Any]:
+    """Bind the executor's authenticated data, split, and topology authority."""
+
+    recipe = verified["recipe"]
+    topology = verified.get("training_topology")
+    if topology is None:
+        topology = {
+            "schema_version": "a1-one-dose-training-topology-v1",
+            "name": LEGACY_SINGLE_GPU_TOPOLOGY,
+            "world_size": int(recipe["world_size"]),
+            "physical_gpus": [0],
+            "local_batch_size": int(recipe["batch_size"]),
+            "grad_accum_steps": int(recipe["grad_accum_steps"]),
+            "global_batch_size": int(recipe["global_batch_size"]),
+            "dose_preserving": True,
+        }
+    payload: dict[str, Any] = {
+        "schema_version": REPORT_INPUT_BINDING_SCHEMA,
+        "contract_sha256": verified["contract_sha256"],
+        "data": str(verified["data_path"]),
+        "data_kind": verified.get("data_kind", "a1_memmap_v1"),
+        "data_fingerprint": verified["data_fingerprint"],
+        "payload_inventory_sha256": verified["payload_inventory_sha256"],
+        "corpus_row_count": int(verified["corpus_row_count"]),
+        "training_row_count": int(verified["training_row_count"]),
+        "validation_row_count": int(verified["validation_row_count"]),
+        "sealed_learner_recipe_sha256": _value_sha256(
+            verified.get("bound_recipe", recipe)
+        ),
+        "effective_learner_recipe_sha256": _value_sha256(recipe),
+        "training_topology": topology,
+        "ddp_canary": verified.get("ddp_canary"),
+    }
+    if verified.get("data_kind") == "production_composite_v2":
+        payload.update(
+            {
+                "production_mix_contract_sha256": _value_sha256(
+                    verified["production_mix_contract"]
+                ),
+                "production_sampling_receipt_sha256": verified[
+                    "production_sampling_receipt_sha256"
+                ],
+                "validation_split_receipt": verified["validation_split_receipt"],
+                "validation_split_receipt_sha256": verified[
+                    "validation_split_receipt_sha256"
+                ],
+            }
+        )
+    else:
+        payload.update(
+            {
+                "validation_manifest": str(verified["validation_path"]),
+                "validation_manifest_file_sha256": verified[
+                    "validation_file_sha256"
+                ],
+                "selected_game_seed_set_sha256": verified[
+                    "selected_game_seed_set_sha256"
+                ],
+                "training_game_seed_set_sha256": verified[
+                    "training_game_seed_set_sha256"
+                ],
+                "validation_game_seed_set_sha256": verified[
+                    "validation_game_seed_set_sha256"
+                ],
+            }
+        )
+    payload["binding_sha256"] = _value_sha256(payload)
+    return payload
 
 
 def _validate_execution_binding(binding: dict[str, Any]) -> None:
@@ -521,7 +641,10 @@ def _require_a1_science(lock: dict[str, Any]) -> tuple[dict[str, Any], dict[str,
             "n64 and global n196/n256 are not authorized"
         )
     recipe = science.get("learner_training_recipe")
-    if recipe != a1_contract.EXPECTED_LEARNER_TRAINING_RECIPE:
+    if recipe not in (
+        a1_contract.EXPECTED_LEARNER_TRAINING_RECIPE,
+        a1_contract.CURRENT_LEARNER_TRAINING_RECIPE,
+    ):
         raise ExecutorError(
             "sealed A1 learner recipe differs from the exact one-dose recipe"
         )
@@ -551,7 +674,7 @@ def verify_training_inputs(
     *,
     lock_path: Path,
     data_path: Path,
-    validation_path: Path,
+    validation_path: Path | None,
     reviewed_lock_file_sha256: str | None = None,
 ) -> dict[str, Any]:
     """Replay the sealed lock and complete audit→memmap→holdout chain."""
@@ -559,11 +682,15 @@ def verify_training_inputs(
     try:
         lock_path = lock_path.expanduser().resolve(strict=True)
         data_path = data_path.expanduser().resolve(strict=True)
-        validation_path = validation_path.expanduser().resolve(strict=True)
+        validation_path = (
+            None
+            if validation_path is None
+            else validation_path.expanduser().resolve(strict=True)
+        )
     except OSError as error:
         raise ExecutorError(f"cannot resolve A1 training input: {error}") from error
-    if not data_path.is_dir():
-        raise ExecutorError(f"A1 data path is not a directory: {data_path}")
+    if not (data_path.is_dir() or data_path.is_file()):
+        raise ExecutorError(f"A1 data path is not a corpus directory/descriptor: {data_path}")
 
     try:
         lock = _verify_lock_with_sealed_runtime(
@@ -575,6 +702,20 @@ def verify_training_inputs(
         )
         if meta is None:
             raise ExecutorError("data is not an audited A1 memmap corpus")
+        if data_path.is_file():
+            return _verify_production_composite_inputs(
+                lock=lock,
+                lock_path=lock_path,
+                reviewed_lock_file_sha256=reviewed_lock_file_sha256,
+                recipe=recipe,
+                objective=objective,
+                producer=_producer(lock),
+                data_path=data_path,
+                meta=meta,
+                validation_path=validation_path,
+            )
+        if validation_path is None:
+            raise ExecutorError("ordinary A1 memmap input requires a validation manifest")
         validation = train_bc._load_validation_game_seed_manifest_for_training(  # noqa: SLF001
             validation_path,
             validation_fraction=0.05,
@@ -639,6 +780,423 @@ def verify_training_inputs(
             "validation_game_seed_set_sha256"
         ],
     }
+
+
+def _component_game_identity_sha256(
+    component_ids: Sequence[str], component_seed_sets: Sequence[np.ndarray]
+) -> str:
+    records = [
+        {"component_id": component_id, "game_seed": int(seed)}
+        for component_id, seeds in zip(component_ids, component_seed_sets, strict=True)
+        for seed in sorted(set(map(int, np.asarray(seeds, dtype=np.int64).tolist())))
+    ]
+    return _value_sha256(records)
+
+
+def _verify_production_composite_inputs(
+    *,
+    lock: dict[str, Any],
+    lock_path: Path,
+    reviewed_lock_file_sha256: str | None,
+    recipe: dict[str, Any],
+    objective: dict[str, Any],
+    producer: dict[str, Any],
+    data_path: Path,
+    meta: dict[str, Any],
+    validation_path: Path | None,
+) -> dict[str, Any]:
+    """Authenticate the promotion-eligible 64/12/4/20 replay descriptor.
+
+    The flywheel receipt describes the pre-split physical corpus. This executor
+    independently replays train_bc's deterministic component-aware whole-game
+    split and binds the realized train/validation mass before constructing an
+    optimizer command.
+    """
+
+    if validation_path is not None:
+        raise ExecutorError(
+            "production composite binds its deterministic component-aware split; "
+            "do not pass a separate validation manifest"
+        )
+    expected_ids = [
+        "current_producer",
+        "recent_history",
+        "hard_negative",
+        "historical_replay",
+    ]
+    expected_ratios = {
+        "current_producer": 0.64,
+        "recent_history": 0.12,
+        "hard_negative": 0.04,
+        "historical_replay": 0.20,
+    }
+    contract = meta.get("production_mix_contract")
+    if (
+        meta.get("schema_version") != "memmap_composite_v2"
+        or meta.get("diagnostic_only") is not False
+        or meta.get("promotion_eligible") is not True
+        or not isinstance(contract, dict)
+        or contract.get("schema_version") != "flywheel-replay-composite-v2"
+        or meta.get("component_ids") != expected_ids
+        or contract.get("fresh_component_ids") != expected_ids[:3]
+        or contract.get("replay_component_ids") != expected_ids[3:]
+        or contract.get("fresh_source_game_ratios")
+        != {"current_producer": 0.8, "recent_history": 0.15, "hard_negative": 0.05}
+        or contract.get("effective_component_sampling_ratios") != expected_ratios
+        or meta.get("component_game_sampling_ratios")
+        != [expected_ratios[value] for value in expected_ids]
+        or not math.isclose(
+            float(contract.get("realized_replay_ratio", -1.0)),
+            0.20,
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        )
+    ):
+        raise ExecutorError("production composite is not exact 64/12/4/20 replay")
+    if contract.get("initializer_checkpoint_sha256") != producer.get("sha256"):
+        raise ExecutorError("production composite initializer differs from sealed producer")
+    receipt = contract.get("sampling_receipt")
+    if (
+        not isinstance(receipt, dict)
+        or contract.get("sampling_receipt_sha256") != _value_sha256(receipt)
+        or receipt.get("effective_component_sampling_ratios") != expected_ratios
+    ):
+        raise ExecutorError("production composite sampling receipt is invalid")
+    components = meta.get("components")
+    if not isinstance(components, list) or len(components) != 4:
+        raise ExecutorError("production composite must have exactly four components")
+    if [component.get("source_category") for component in components] != expected_ids:
+        raise ExecutorError("production composite source categories/order drift")
+    component_dirs = [Path(str(component["corpus_dir"])) for component in components]
+    if len(set(component_dirs)) != 4:
+        raise ExecutorError("production composite component corpora are not distinct")
+
+    corpus = train_bc.load_teacher_data_memmap(data_path, composite_meta=meta)
+    split = train_bc.split_train_validation_indices(
+        corpus,
+        validation_fraction=0.05,
+        validation_seed=17,
+        validation_max_samples=0,
+    )
+    train_indices = np.asarray(split["train"], dtype=np.int64)
+    validation_indices = np.asarray(split["validation"], dtype=np.int64)
+    if train_indices.size == 0 or validation_indices.size == 0:
+        raise ExecutorError("production composite whole-game split is empty")
+    offsets = list(map(int, corpus.offsets))
+    component_split_records: list[dict[str, Any]] = []
+    selected_seed_sets: list[np.ndarray] = []
+    training_seed_sets: list[np.ndarray] = []
+    validation_seed_sets: list[np.ndarray] = []
+    globally_seen_game_seeds: set[int] = set()
+    for index, (component_id, component) in enumerate(
+        zip(expected_ids, corpus.corpora, strict=True)
+    ):
+        start, stop = offsets[index], offsets[index + 1]
+        seeds = np.asarray(component["game_seed"], dtype=np.int64)
+        local_train = train_indices[(train_indices >= start) & (train_indices < stop)] - start
+        local_validation = (
+            validation_indices[
+                (validation_indices >= start) & (validation_indices < stop)
+            ]
+            - start
+        )
+        all_games = np.unique(seeds)
+        component_game_seeds = set(map(int, all_games))
+        overlapping_game_seeds = globally_seen_game_seeds.intersection(
+            component_game_seeds
+        )
+        if overlapping_game_seeds:
+            raise ExecutorError(
+                "production composite reuses game seeds across components: "
+                f"component={component_id} examples={sorted(overlapping_game_seeds)[:8]}"
+            )
+        globally_seen_game_seeds.update(component_game_seeds)
+        train_games = np.unique(seeds[local_train])
+        validation_games = np.unique(seeds[local_validation])
+        if (
+            set(map(int, train_games)).intersection(map(int, validation_games))
+            or len(train_games) + len(validation_games) != len(all_games)
+        ):
+            raise ExecutorError(
+                f"component {component_id} validation is not a whole-game partition"
+            )
+        selected_seed_sets.append(all_games)
+        training_seed_sets.append(train_games)
+        validation_seed_sets.append(validation_games)
+        component_split_records.append(
+            {
+                "component_id": component_id,
+                "game_sampling_ratio": expected_ratios[component_id],
+                "selected_game_count": int(len(all_games)),
+                "training_game_count": int(len(train_games)),
+                "validation_game_count": int(len(validation_games)),
+                "row_count": int(stop - start),
+                "training_row_count": int(local_train.size),
+                "validation_row_count": int(local_validation.size),
+                "selected_game_identity_sha256": _component_game_identity_sha256(
+                    [component_id], [all_games]
+                ),
+                "training_game_identity_sha256": _component_game_identity_sha256(
+                    [component_id], [train_games]
+                ),
+                "validation_game_identity_sha256": _component_game_identity_sha256(
+                    [component_id], [validation_games]
+                ),
+            }
+        )
+    split_receipt = {
+        "schema_version": "a1-production-composite-whole-game-split-v1",
+        "validation_fraction": 0.05,
+        "validation_seed": 17,
+        "validation_max_samples": 0,
+        "component_sampling_ratios": expected_ratios,
+        "components": component_split_records,
+        "aggregate": {
+            "selected_game_count": sum(
+                record["selected_game_count"] for record in component_split_records
+            ),
+            "training_game_count": sum(
+                record["training_game_count"] for record in component_split_records
+            ),
+            "validation_game_count": sum(
+                record["validation_game_count"] for record in component_split_records
+            ),
+            "row_count": int(len(corpus)),
+            "training_row_count": int(train_indices.size),
+            "validation_row_count": int(validation_indices.size),
+        },
+    }
+    split_receipt_sha256 = _value_sha256(split_receipt)
+    trainer_validation_game_seed_set_sha256 = train_bc._game_seed_set_sha256(  # noqa: SLF001
+        np.concatenate(validation_seed_sets)
+    )
+    descriptor_sha = str(meta["descriptor_file_sha256"])
+    return {
+        "lock": lock,
+        "lock_path": lock_path,
+        "lock_file_sha256": _file_sha256(lock_path),
+        "reviewed_lock_file_sha256": reviewed_lock_file_sha256,
+        "contract_sha256": str(lock["contract_sha256"]),
+        "recipe": recipe,
+        "objective": objective,
+        "producer": producer,
+        "data_path": data_path,
+        "data_kind": "production_composite_v2",
+        "corpus_meta_file_sha256": descriptor_sha,
+        "descriptor_fingerprint": meta["descriptor_fingerprint"],
+        "learner_recipe_overrides": meta["learner_recipe_overrides"],
+        "learner_recipe_overrides_sha256": meta[
+            "learner_recipe_overrides_sha256"
+        ],
+        "payload_inventory_sha256": meta["payload_inventory_sha256"],
+        "data_fingerprint": train_bc._training_data_fingerprint(  # noqa: SLF001
+            str(data_path), "memmap"
+        ),
+        "corpus_row_count": int(len(corpus)),
+        "training_row_count": int(train_indices.size),
+        "validation_row_count": int(validation_indices.size),
+        "selected_game_seed_set_sha256": _component_game_identity_sha256(
+            expected_ids, selected_seed_sets
+        ),
+        "training_game_seed_set_sha256": _component_game_identity_sha256(
+            expected_ids, training_seed_sets
+        ),
+        "validation_path": data_path,
+        "validation_file_sha256": descriptor_sha,
+        "validation_game_seed_set_sha256": _component_game_identity_sha256(
+            expected_ids, validation_seed_sets
+        ),
+        "trainer_validation_game_seed_set_sha256": (
+            trainer_validation_game_seed_set_sha256
+        ),
+        "production_mix_contract": contract,
+        "production_sampling_receipt_sha256": contract["sampling_receipt_sha256"],
+        "validation_split_receipt": split_receipt,
+        "validation_split_receipt_sha256": split_receipt_sha256,
+    }
+
+
+def bind_training_topology(
+    verified: dict[str, Any], *, topology: str, gpu: int
+) -> dict[str, Any]:
+    """Bind one authorized physical topology without changing the dose.
+
+    DDP changes only local batch and world size. The global batch, number of
+    epochs, max steps, optimizer freshness, learning rate, and data identity
+    remain exactly those of the sealed one-dose recipe.
+    """
+
+    spec = TRAINING_TOPOLOGIES.get(topology)
+    if spec is None:
+        raise ExecutorError(f"unsupported training topology {topology!r}")
+    if isinstance(gpu, bool) or not isinstance(gpu, int) or gpu < 0:
+        raise ExecutorError("training topology GPU must be a non-negative integer")
+    if topology == B200_8GPU_DDP_TOPOLOGY:
+        if gpu != 0:
+            raise ExecutorError("8-GPU B200 DDP topology must own physical GPUs 0-7")
+        gpus = B200_8GPU_DDP_GPUS
+    else:
+        gpus = (gpu,)
+    bound = dict(verified.get("bound_recipe", verified["recipe"]))
+    effective = dict(verified["recipe"])
+    if (
+        int(bound["global_batch_size"]) != 4096
+        or int(bound["world_size"]) != 1
+        or int(bound["batch_size"]) != 4096
+        or int(bound["grad_accum_steps"]) != 1
+    ):
+        raise ExecutorError("sealed recipe is not the exact legacy 4096-global dose")
+    effective.update(
+        {
+            "world_size": int(spec["world_size"]),
+            "batch_size": int(spec["local_batch_size"]),
+            "grad_accum_steps": int(spec["grad_accum_steps"]),
+            "global_batch_size": int(spec["global_batch_size"]),
+        }
+    )
+    realized_global = (
+        int(effective["batch_size"])
+        * int(effective["grad_accum_steps"])
+        * int(effective["world_size"])
+    )
+    if realized_global != int(bound["global_batch_size"]):
+        raise ExecutorError("training topology changes the sealed global batch/dose")
+    result = dict(verified)
+    result.update(
+        {
+            "bound_recipe": bound,
+            "recipe": effective,
+            "training_topology": {
+                "schema_version": "a1-one-dose-training-topology-v1",
+                "name": topology,
+                "world_size": int(effective["world_size"]),
+                "physical_gpus": list(gpus),
+                "local_batch_size": int(effective["batch_size"]),
+                "grad_accum_steps": int(effective["grad_accum_steps"]),
+                "global_batch_size": realized_global,
+                "dose_preserving": True,
+            },
+        }
+    )
+    return result
+
+
+def bind_ddp_canary(
+    verified: dict[str, Any], receipt_path: Path | None
+) -> dict[str, Any]:
+    topology = verified.get("training_topology", {})
+    if topology.get("name") != B200_8GPU_DDP_TOPOLOGY:
+        if receipt_path is not None:
+            raise ExecutorError("DDP canary receipt is valid only for 8-GPU topology")
+        return verified
+    if receipt_path is None:
+        raise ExecutorError("8-GPU production topology requires --ddp-canary-receipt")
+    try:
+        path = receipt_path.expanduser().resolve(strict=True)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ExecutorError(f"cannot load 8-GPU canary receipt: {error}") from error
+    if not isinstance(payload, dict):
+        raise ExecutorError("8-GPU canary receipt is not an object")
+    stated = payload.get("receipt_sha256")
+    unhashed = dict(payload)
+    unhashed.pop("receipt_sha256", None)
+    if stated != _value_sha256(unhashed):
+        raise ExecutorError("8-GPU canary receipt semantic digest drift")
+    created_unix_ns = payload.get("created_unix_ns")
+    now_ns = time.time_ns()
+    if (
+        payload.get("schema_version") != ddp_canary.SCHEMA
+        or payload.get("passed") is not True
+        or payload.get("diagnostic_only") is not True
+        or payload.get("promotion_eligible") is not False
+        or payload.get("hostname") != socket.gethostname()
+        or isinstance(created_unix_ns, bool)
+        or not isinstance(created_unix_ns, int)
+        or created_unix_ns > now_ns
+        or now_ns - created_unix_ns > MAX_DDP_CANARY_AGE_NS
+        or payload.get("world_size") != 8
+        or payload.get("local_batch_size") != 512
+        or payload.get("global_batch_size") != 4096
+        or payload.get("ddp_shard_data") is not False
+        or payload.get("training_rng_rank_offset") is not True
+        or not isinstance(payload.get("training_rng_contracts"), list)
+        or len(payload["training_rng_contracts"]) != 8
+        or any(
+            not isinstance(contract, dict)
+            for contract in payload["training_rng_contracts"]
+        )
+        or [
+            contract.get("effective_torch_seed")
+            for contract in payload["training_rng_contracts"]
+        ]
+        != [ddp_canary.SEED + rank for rank in range(8)]
+        or any(
+            contract.get("rank_offset_enabled") is not True
+            for contract in payload["training_rng_contracts"]
+        )
+        or not isinstance(payload.get("dropout_probe_sha256_by_rank"), list)
+        or any(
+            not isinstance(value, str)
+            or re.fullmatch(r"sha256:[0-9a-f]{64}", value) is None
+            for value in payload.get("dropout_probe_sha256_by_rank", [])
+        )
+        or len(set(payload["dropout_probe_sha256_by_rank"])) != 8
+        or re.fullmatch(
+            r"sha256:[0-9a-f]{64}", str(payload.get("global_draw_sha256", ""))
+        )
+        is None
+        or not isinstance(payload.get("rank_slice_sha256"), list)
+        or len(payload["rank_slice_sha256"]) != 8
+        or any(
+            not isinstance(value, str)
+            or re.fullmatch(r"sha256:[0-9a-f]{64}", value) is None
+            for value in payload["rank_slice_sha256"]
+        )
+        or payload.get("distributed_backend") != "nccl"
+        or not isinstance(payload.get("cuda_collective"), dict)
+        or payload["cuda_collective"].get("operation") != "all_reduce_sum"
+        or payload["cuda_collective"].get("expected") != 36.0
+        or payload["cuda_collective"].get("actual_by_rank") != [36.0] * 8
+        or payload["cuda_collective"].get("passed") is not True
+        or payload.get("padded_global_draws")
+        != payload.get("local_draws_per_rank", -1) * 8
+        or not isinstance(payload.get("gpu_names"), list)
+        or len(payload["gpu_names"]) != 8
+        or any("B200" not in str(name).upper() for name in payload["gpu_names"])
+        or not isinstance(payload.get("gpu_identities"), list)
+        or len(payload["gpu_identities"]) != 8
+        or any(not isinstance(record, dict) for record in payload["gpu_identities"])
+        or [record.get("physical_index") for record in payload["gpu_identities"]]
+        != list(range(8))
+        or len({record.get("uuid") for record in payload["gpu_identities"]}) != 8
+        or len({record.get("pci_bus_id") for record in payload["gpu_identities"]})
+        != 8
+        or [record.get("name") for record in payload["gpu_identities"]]
+        != payload["gpu_names"]
+    ):
+        raise ExecutorError("8-GPU canary did not prove the exact B200 DDP topology")
+    expected_files = {
+        "tool": Path(ddp_canary.__file__).resolve(),
+        "train_bc": Path(train_bc.__file__).resolve(),
+    }
+    for field, expected_path in expected_files.items():
+        record = payload.get(field)
+        if (
+            not isinstance(record, dict)
+            or record.get("path") != str(expected_path)
+            or record.get("sha256") != _file_sha256(expected_path)
+        ):
+            raise ExecutorError(f"8-GPU canary {field} implementation drift")
+    result = dict(verified)
+    result["ddp_canary"] = {
+        "path": str(path),
+        "file_sha256": _file_sha256(path),
+        "receipt_sha256": stated,
+        "global_draw_sha256": payload["global_draw_sha256"],
+        "rank_slice_sha256": payload["rank_slice_sha256"],
+    }
+    return result
 
 
 def bind_learner_ablation(
@@ -860,12 +1418,21 @@ def build_train_command(
             if len(candidates) != 1:
                 raise ExecutorError("sealed A1 contract binds multiple train_bc entrypoints")
             trainer_path = candidates[0].expanduser().resolve(strict=True)
-    command = [
-        str(python),
-        str(trainer_path),
-        "--arch",
-        "entity_graph",
-    ]
+    world_size = int(recipe["world_size"])
+    if world_size == 1:
+        command = [str(python), str(trainer_path)]
+    elif world_size == 8:
+        command = [
+            str(python),
+            "-m",
+            "torch.distributed.run",
+            "--standalone",
+            "--nproc_per_node=8",
+            str(trainer_path),
+        ]
+    else:
+        raise ExecutorError(f"unsupported sealed learner world_size={world_size}")
+    command.extend(["--arch", "entity_graph"])
     for flag, value in SEALED_A1_MODEL_CLI.items():
         command.extend((flag, value))
     command.extend(
@@ -979,8 +1546,6 @@ def build_train_command(
             "17",
             "--validation-max-samples",
             "0",
-            "--validation-game-seed-manifest",
-            str(verified["validation_path"]),
             "--init-checkpoint",
             str(initializer["path"]),
             "--checkpoint",
@@ -992,6 +1557,13 @@ def build_train_command(
             "--trust-curated-data-quality",
         ]
     )
+    if verified.get("data_kind") != "production_composite_v2":
+        command.extend(
+            [
+                "--validation-game-seed-manifest",
+                str(verified["validation_path"]),
+            ]
+        )
     if bool(recipe.get("training_rng_rank_offset", False)):
         command.append("--training-rng-rank-offset")
     if "value_trunk_grad_scale" in recipe:
@@ -1013,6 +1585,14 @@ def build_train_command(
                     str(recipe.get("per_game_value_weight_mode", "equal")),
                 ]
             )
+    if bool(recipe.get("per_game_policy_weight", False)):
+        command.extend(
+            [
+                "--per-game-policy-weight",
+                "--per-game-policy-weight-mode",
+                str(recipe.get("per_game_policy_weight_mode", "equal")),
+            ]
+        )
     if "policy_aux_active_batch_size" in recipe:
         command.extend(
             [
@@ -1049,6 +1629,8 @@ def build_train_command(
                 str(learner_ablation["reviewed_lock_file_sha256"]),
             ]
         )
+    if "--ddp-shard-data" in command:
+        raise ExecutorError("sealed memmap learner may not shard corpus data by rank")
     return command
 
 
@@ -1415,14 +1997,19 @@ def _write_terminal_claim(
 
 
 def _train_command_namespace(command: list[str]) -> argparse.Namespace:
-    if len(command) < 3 or Path(command[1]).resolve(strict=False) != (
-        _REPO_ROOT / "tools" / "train_bc.py"
-    ).resolve(strict=False):
+    canonical = (_REPO_ROOT / "tools" / "train_bc.py").resolve(strict=False)
+    trainer_indices = [
+        index
+        for index, value in enumerate(command)
+        if Path(value).resolve(strict=False) == canonical
+    ]
+    if len(trainer_indices) != 1:
         raise ExecutorError(
             "retry proof command is not the canonical train_bc entry point"
         )
+    trainer_index = trainer_indices[0]
     try:
-        args = train_bc.build_parser().parse_args(command[2:])
+        args = train_bc.build_parser().parse_args(command[trainer_index + 1 :])
     except SystemExit as error:
         raise ExecutorError(
             "retry proof command cannot be parsed by train_bc"
@@ -1529,6 +2116,12 @@ def authorize_failed_before_optimizer_retry(
     fresh durable claim path.  The failed parent claim and receipt are only read
     and hashed; neither is edited, removed, or reused.
     """
+
+    if verified.get("data_kind") == "production_composite_v2":
+        raise ExecutorError(
+            "historical graph-layer retry authority does not apply to a flywheel "
+            "production composite"
+        )
 
     live_bindings = {
         Path(verified["lock_path"]): verified["lock_file_sha256"],
@@ -1869,6 +2462,32 @@ def _exact_objective_exposure(report_payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _effective_global_batch_size(recipe: dict[str, Any]) -> int:
+    realized = (
+        int(recipe["batch_size"])
+        * int(recipe["grad_accum_steps"])
+        * int(recipe["world_size"])
+    )
+    if realized <= 0 or realized != int(recipe["global_batch_size"]):
+        raise ExecutorError(
+            "learner topology does not realize its declared global batch size"
+        )
+    return realized
+
+
+def _expected_optimizer_steps(
+    verified: dict[str, Any], *, recipe: dict[str, Any] | None = None
+) -> int:
+    effective = verified["recipe"] if recipe is None else recipe
+    steps = math.ceil(
+        int(verified["training_row_count"])
+        / _effective_global_batch_size(effective)
+    )
+    if int(effective["max_steps"]) > 0:
+        steps = min(steps, int(effective["max_steps"]))
+    return int(steps)
+
+
 def _direct_lineage_dose(
     verified: dict[str, Any],
     *,
@@ -1879,20 +2498,37 @@ def _direct_lineage_dose(
         raise ExecutorError(
             "canonical one-dose lineage requires a fresh optimizer per dose"
         )
-    steps = math.ceil(
-        int(verified["training_row_count"])
-        / (int(recipe["batch_size"]) * int(recipe["grad_accum_steps"]))
-    )
-    if int(recipe["max_steps"]) > 0:
-        steps = min(steps, int(recipe["max_steps"]))
+    steps = _expected_optimizer_steps(verified, recipe=recipe)
     objective_exposure = None
-    sampled_rows = int(verified["training_row_count"])
+    global_batch_size = _effective_global_batch_size(recipe)
+    sampled_rows = (
+        min(int(verified["training_row_count"]), steps * global_batch_size)
+        if int(recipe["world_size"]) == 1
+        else steps * global_batch_size
+    )
     # Historical sealed recipes and reports predate exact objective counters.
     # A derived recipe carrying the typed policy-aux field must use the current
     # trainer and therefore fails closed unless all exact counters are present.
     if report_payload is not None and "policy_aux_active_batch_size" in recipe:
         objective_exposure = _exact_objective_exposure(report_payload)
+        if int(objective_exposure["base_sampled_rows"]) != sampled_rows:
+            raise ExecutorError(
+                "A1 objective counters differ from the topology-derived base dose"
+            )
         sampled_rows = int(objective_exposure["base_sampled_rows"])
+    elif report_payload is not None:
+        reported_draws = report_payload.get("base_training_row_draws")
+        if reported_draws is not None:
+            if (
+                isinstance(reported_draws, bool)
+                or not isinstance(reported_draws, int)
+                or reported_draws != sampled_rows
+            ):
+                raise ExecutorError(
+                    "A1 base sampler dose differs from the topology-derived dose: "
+                    f"expected={sampled_rows} actual={reported_draws!r}"
+                )
+            sampled_rows = reported_draws
     try:
         return lineage.direct_lineage_dose(
             declared_producer_sha256=verified["producer"]["sha256"],
@@ -1932,12 +2568,17 @@ def _bind_training_report(
         raise ExecutorError(f"cannot parse A1 training report: {error}") from error
     if not isinstance(payload, dict):
         raise ExecutorError("A1 training report must be a JSON object")
-    if REPORT_EXECUTION_BINDING_FIELD in payload or "a1_lineage_dose" in payload:
+    if (
+        REPORT_EXECUTION_BINDING_FIELD in payload
+        or REPORT_INPUT_BINDING_FIELD in payload
+        or "a1_lineage_dose" in payload
+    ):
         raise ExecutorError(
             "A1 training child pre-populated executor-owned provenance"
         )
     _validate_execution_binding(execution_binding)
     payload[REPORT_EXECUTION_BINDING_FIELD] = execution_binding
+    payload[REPORT_INPUT_BINDING_FIELD] = _input_binding(verified)
     payload["a1_lineage_dose"] = _direct_lineage_dose(
         verified, report_payload=payload
     )
@@ -1953,6 +2594,22 @@ def _bind_training_report(
     finally:
         tmp.unlink(missing_ok=True)
         _fsync_directory(report.parent)
+
+
+def _require_finite_metric_tree(value: Any, *, where: str) -> None:
+    if isinstance(value, bool) or value is None or isinstance(value, str):
+        return
+    if isinstance(value, (int, float)):
+        if not math.isfinite(float(value)):
+            raise ExecutorError(f"{where} contains a non-finite metric")
+        return
+    if isinstance(value, dict):
+        for key, child in value.items():
+            _require_finite_metric_tree(child, where=f"{where}.{key}")
+        return
+    if isinstance(value, list):
+        for index, child in enumerate(value):
+            _require_finite_metric_tree(child, where=f"{where}[{index}]")
 
 
 def _verify_training_outputs(
@@ -1974,20 +2631,16 @@ def _verify_training_outputs(
     recipe = verified["recipe"]
     bound_recipe = verified.get("bound_recipe", recipe)
     learner_ablation = verified.get("learner_ablation")
-    expected_steps = int(
-        math.ceil(
-            int(verified["training_row_count"])
-            / (int(recipe["batch_size"]) * int(recipe["grad_accum_steps"]))
-        )
+    is_production_composite = (
+        verified.get("data_kind") == "production_composite_v2"
     )
-    if int(recipe["max_steps"]) > 0:
-        expected_steps = min(expected_steps, int(recipe["max_steps"]))
+    expected_steps = _expected_optimizer_steps(verified, recipe=recipe)
+    effective_global_batch_size = _effective_global_batch_size(recipe)
     lineage_dose = _direct_lineage_dose(verified, report_payload=report_payload)
     expected = {
         "arch": "entity_graph",
         **SEALED_A1_MODEL_REPORT,
-        "a1_contract_sha256": verified["contract_sha256"],
-        "world_size": 1,
+        "world_size": int(recipe["world_size"]),
         "optimizer": "adam",
         "resume_optimizer": False,
         "optimizer_restored": False,
@@ -1995,10 +2648,16 @@ def _verify_training_outputs(
         "epochs": 1,
         "max_steps": 0,
         "batch_size": int(recipe["batch_size"]),
+        "grad_accum_steps": int(recipe["grad_accum_steps"]),
+        "effective_global_batch_size": effective_global_batch_size,
+        "ddp_shard_data": False,
         "amp": recipe["amp"],
         "lr": float(recipe["lr"]),
         "weight_decay": float(recipe["weight_decay"]),
         "seed": int(recipe["seed"]),
+        "training_rng_rank_offset": bool(
+            recipe.get("training_rng_rank_offset", False)
+        ),
         "mask_hidden_info": True,
         "symmetry_augment": False,
         "data": str(verified["data_path"]),
@@ -2018,19 +2677,63 @@ def _verify_training_outputs(
             "architecture_initializer", verified["producer"]
         )["sha256"],
         "a1_lineage_dose": lineage_dose,
-        "input_validation_game_seed_manifest": str(verified["validation_path"]),
-        "input_validation_game_seed_manifest_sha256": verified[
-            "validation_file_sha256"
-        ],
-        "validation_game_seed_set_sha256": verified["validation_game_seed_set_sha256"],
-        "a1_selected_game_seed_set_sha256": verified["selected_game_seed_set_sha256"],
-        "a1_training_game_seed_set_sha256": verified["training_game_seed_set_sha256"],
-        "a1_memmap_payload_inventory_sha256": verified["payload_inventory_sha256"],
-        "a1_learner_training_recipe_sha256": _value_sha256(bound_recipe),
+        "forced_action_weight": float(recipe["forced_action_weight"]),
+        "forced_row_value_weight": float(recipe["forced_row_value_weight"]),
+        "per_game_policy_weight": bool(
+            recipe.get("per_game_policy_weight", False)
+        ),
+        "per_game_policy_weight_mode": str(
+            recipe.get("per_game_policy_weight_mode", "equal")
+        ),
+        "per_game_value_weight": bool(recipe["per_game_value_weight"]),
+        "value_loss_weight": float(recipe["value_loss_weight"]),
+        "truncated_vp_margin_value_weight": float(
+            recipe["truncated_vp_margin_value_weight"]
+        ),
         "require_35m_model": True,
         "steps_completed": expected_steps,
         "total_training_steps": expected_steps,
     }
+    if is_production_composite:
+        expected.update(
+            {
+                "a1_contract_sha256": None,
+                "input_validation_game_seed_manifest": None,
+                "input_validation_game_seed_manifest_sha256": None,
+                "validation_game_seed_set_sha256": verified[
+                    "trainer_validation_game_seed_set_sha256"
+                ],
+                "a1_selected_game_seed_set_sha256": None,
+                "a1_training_game_seed_set_sha256": None,
+                "a1_memmap_payload_inventory_sha256": None,
+                "a1_learner_training_recipe_sha256": None,
+            }
+        )
+    else:
+        expected.update(
+            {
+                "a1_contract_sha256": verified["contract_sha256"],
+                "input_validation_game_seed_manifest": str(
+                    verified["validation_path"]
+                ),
+                "input_validation_game_seed_manifest_sha256": verified[
+                    "validation_file_sha256"
+                ],
+                "validation_game_seed_set_sha256": verified[
+                    "validation_game_seed_set_sha256"
+                ],
+                "a1_selected_game_seed_set_sha256": verified[
+                    "selected_game_seed_set_sha256"
+                ],
+                "a1_training_game_seed_set_sha256": verified[
+                    "training_game_seed_set_sha256"
+                ],
+                "a1_memmap_payload_inventory_sha256": verified[
+                    "payload_inventory_sha256"
+                ],
+                "a1_learner_training_recipe_sha256": _value_sha256(bound_recipe),
+            }
+        )
     drift = {
         key: {"expected": value, "actual": report_payload.get(key)}
         for key, value in expected.items()
@@ -2061,15 +2764,66 @@ def _verify_training_outputs(
         }
         if draw_drift:
             raise ExecutorError(f"A1 objective-dose report drift: {draw_drift}")
-    if report_payload.get("a1_bound_learner_training_recipe") != bound_recipe:
-        raise ExecutorError("A1 training report does not echo the exact sealed recipe")
-    if report_payload.get("a1_bound_learner_value_objective") != verified["objective"]:
-        raise ExecutorError(
-            "A1 training report does not echo the sealed value objective"
-        )
+    if is_production_composite:
+        if (
+            report_payload.get("a1_bound_learner_training_recipe") is not None
+            or report_payload.get("a1_bound_learner_value_objective") is not None
+        ):
+            raise ExecutorError(
+                "flywheel composite incorrectly inherited an A1 validation identity"
+            )
+        composite = report_payload.get("memmap_composite")
+        expected_composite = {
+            "schema_version": "memmap_composite_v2",
+            "descriptor_path": str(verified["data_path"]),
+            "descriptor_file_sha256": verified["corpus_meta_file_sha256"],
+            "descriptor_fingerprint": verified["descriptor_fingerprint"],
+            "payload_inventory_sha256": verified["payload_inventory_sha256"],
+            "learner_recipe_overrides": verified["learner_recipe_overrides"],
+            "learner_recipe_overrides_sha256": verified[
+                "learner_recipe_overrides_sha256"
+            ],
+            "component_count": 4,
+            "component_ids": [
+                "current_producer",
+                "recent_history",
+                "hard_negative",
+                "historical_replay",
+            ],
+            "component_game_sampling_ratios": [0.64, 0.12, 0.04, 0.20],
+            "flywheel_replay_contract": verified["production_mix_contract"],
+        }
+        if (
+            not isinstance(composite, dict)
+            or any(
+                composite.get(key) != value
+                for key, value in expected_composite.items()
+            )
+            or report_payload.get("diagnostic_only") is not False
+            or report_payload.get("promotion_eligible") is not True
+        ):
+            raise ExecutorError(
+                "training report does not bind the exact promotion replay composite"
+            )
+    else:
+        if report_payload.get("a1_bound_learner_training_recipe") != bound_recipe:
+            raise ExecutorError(
+                "A1 training report does not echo the exact sealed recipe"
+            )
+        if (
+            report_payload.get("a1_bound_learner_value_objective")
+            != verified["objective"]
+        ):
+            raise ExecutorError(
+                "A1 training report does not echo the sealed value objective"
+            )
     if report_payload.get(REPORT_EXECUTION_BINDING_FIELD) != execution_binding:
         raise ExecutorError(
             "A1 training report does not bind the exact child environment/command"
+        )
+    if report_payload.get(REPORT_INPUT_BINDING_FIELD) != _input_binding(verified):
+        raise ExecutorError(
+            "A1 training report does not bind the authenticated input/split/topology"
         )
     metrics = report_payload.get("metrics")
     if (
@@ -2102,6 +2856,70 @@ def _verify_training_outputs(
         raise ExecutorError(
             "A1 training report has invalid validation coverage/metrics"
         )
+    if is_production_composite:
+        matched = metrics[0].get("validation_objective_matched")
+        ratios = {
+            "current_producer": 0.64,
+            "recent_history": 0.12,
+            "hard_negative": 0.04,
+            "historical_replay": 0.20,
+        }
+        split_components = {
+            record["component_id"]: record
+            for record in verified["validation_split_receipt"]["components"]
+        }
+        matched_components = (
+            matched.get("components") if isinstance(matched, dict) else None
+        )
+        matched_metrics = (
+            matched.get("metrics") if isinstance(matched, dict) else None
+        )
+        if (
+            not isinstance(matched, dict)
+            or matched.get("schema_version") != "composite-validation-measure-v2"
+            or matched.get("objective_matched") is not True
+            or matched.get("samples") != int(verified["validation_row_count"])
+            or matched.get("games")
+            != int(
+                verified["validation_split_receipt"]["aggregate"][
+                    "validation_game_count"
+                ]
+            )
+            or matched.get("component_sampling_ratios") != ratios
+            or not isinstance(matched_components, dict)
+            or set(matched_components) != set(ratios)
+            or not isinstance(matched_metrics, dict)
+            or any(
+                key not in matched_metrics
+                for key in ("loss", "policy_loss", "value_loss")
+            )
+        ):
+            raise ExecutorError(
+                "production acceptance requires objective-matched composite validation"
+            )
+        for component_id, ratio in ratios.items():
+            report_component = matched_components[component_id]
+            split_component = split_components[component_id]
+            if (
+                not isinstance(report_component, dict)
+                or report_component.get("authenticated_sampling_ratio") != ratio
+                or report_component.get("games")
+                != split_component["validation_game_count"]
+                or report_component.get("rows")
+                != split_component["validation_row_count"]
+                or not isinstance(report_component.get("metrics"), dict)
+            ):
+                raise ExecutorError(
+                    "objective-matched validation component coverage differs from "
+                    f"the authenticated split: {component_id}"
+                )
+        _require_finite_metric_tree(
+            matched_metrics, where="validation_objective_matched.metrics"
+        )
+        _require_finite_metric_tree(
+            matched_components,
+            where="validation_objective_matched.components",
+        )
     parameter_count = report_payload.get("parameter_count")
     if (
         isinstance(parameter_count, bool)
@@ -2110,16 +2928,27 @@ def _verify_training_outputs(
     ):
         raise ExecutorError("A1 training report does not prove the required 35M model")
     value_training = report_payload.get("value_training")
-    expected_value_training = {
+    expected_value_training: dict[str, Any] = {
         "primary_readout": "scalar",
         "optimizer_steps": expected_steps,
         "completed_epochs": 1,
-        "a1_contract_sha256": verified["contract_sha256"],
-        "a1_selected_game_seed_set_sha256": verified["selected_game_seed_set_sha256"],
-        "a1_training_game_seed_set_sha256": verified["training_game_seed_set_sha256"],
-        "a1_learner_training_recipe_sha256": _value_sha256(bound_recipe),
-        "a1_memmap_payload_inventory_sha256": verified["payload_inventory_sha256"],
     }
+    if not is_production_composite:
+        expected_value_training.update(
+            {
+                "a1_contract_sha256": verified["contract_sha256"],
+                "a1_selected_game_seed_set_sha256": verified[
+                    "selected_game_seed_set_sha256"
+                ],
+                "a1_training_game_seed_set_sha256": verified[
+                    "training_game_seed_set_sha256"
+                ],
+                "a1_learner_training_recipe_sha256": _value_sha256(bound_recipe),
+                "a1_memmap_payload_inventory_sha256": verified[
+                    "payload_inventory_sha256"
+                ],
+            }
+        )
     if not isinstance(value_training, dict) or any(
         value_training.get(key) != value
         for key, value in expected_value_training.items()
@@ -2152,12 +2981,21 @@ def _verify_training_outputs(
         "report": str(report),
         "report_sha256": _file_sha256(report),
         "execution_binding_sha256": _value_sha256(execution_binding),
+        "input_binding_sha256": _input_binding(verified)["binding_sha256"],
         "steps_completed": expected_steps,
+        "unique_training_rows": int(verified["training_row_count"]),
+        "sampler_draw_events": lineage_dose["current_sampled_rows"],
         "sampled_rows": lineage_dose["current_sampled_rows"],
         "lineage_dose": lineage_dose,
         "corpus_row_count": int(verified["corpus_row_count"]),
         "training_row_count": int(verified["training_row_count"]),
         "validation_row_count": int(verified["validation_row_count"]),
+        "production_sampling_receipt_sha256": verified.get(
+            "production_sampling_receipt_sha256"
+        ),
+        "validation_split_receipt_sha256": verified.get(
+            "validation_split_receipt_sha256"
+        ),
     }
 
 
@@ -2200,11 +3038,13 @@ def _execute_locked(
     _require_fresh_outputs(checkpoint, report, receipt, claim=claim)
     # Hardware refusal must precede the durable one-dose claim. Occupancy or an
     # MPS daemon is an operational precondition failure, not a consumed dose.
-    gpu_name = probe(gpu)
-    child_environment = _child_environment(gpu)
+    selected_gpus = _selected_gpus(verified, fallback_gpu=gpu)
+    gpu_names = [probe(selected_gpu) for selected_gpu in selected_gpus]
+    child_environment = _child_environment(selected_gpus)
     execution_binding = _execution_binding(
         command=command, environment=child_environment
     )
+    input_binding = _input_binding(verified)
     started_ns = time.time_ns()
     claim_identity = str(
         verified.get("claim_identity_sha256", verified["contract_sha256"])
@@ -2237,6 +3077,7 @@ def _execute_locked(
         "contract_sha256": verified["contract_sha256"],
         "command_sha256": _value_sha256(command),
         "execution_binding": execution_binding,
+        "input_binding": input_binding,
         "started_unix_ns": started_ns,
     }
     if is_retry or is_ablation or is_upgrade:
@@ -2308,9 +3149,20 @@ def _execute_locked(
         "command": command,
         "command_sha256": _value_sha256(command),
         "execution_binding": execution_binding,
-        "world_size": 1,
+        "input_binding": input_binding,
+        "world_size": int(verified["recipe"]["world_size"]),
         "gpu": gpu,
-        "gpu_name": gpu_name,
+        "gpus": list(selected_gpus),
+        "gpu_name": gpu_names[0],
+        "gpu_names": gpu_names,
+        "training_topology": verified.get("training_topology"),
+        "ddp_canary": verified.get("ddp_canary"),
+        "production_sampling_receipt_sha256": verified.get(
+            "production_sampling_receipt_sha256"
+        ),
+        "validation_split_receipt_sha256": verified.get(
+            "validation_split_receipt_sha256"
+        ),
         "started_unix_ns": started_ns,
         "finished_unix_ns": finished_ns,
         "returncode": returncode,
@@ -2380,7 +3232,7 @@ def execute(
     runner: Callable[..., subprocess.CompletedProcess[Any]] = subprocess.run,
     probe: Callable[[int], str] = _probe_b200,
 ) -> dict[str, Any]:
-    """Execute one dose; ablations additionally own a physical-GPU flock."""
+    """Execute one dose while owning every physical GPU in its topology."""
 
     kwargs = {
         "verified": verified,
@@ -2392,9 +3244,10 @@ def execute(
         "runner": runner,
         "probe": probe,
     }
-    if verified.get("learner_ablation") is None:
-        return _execute_locked(**kwargs)
-    with _physical_gpu_lock(gpu):
+    selected_gpus = _selected_gpus(verified, fallback_gpu=gpu)
+    with ExitStack() as locks:
+        for selected_gpu in selected_gpus:
+            locks.enter_context(_physical_gpu_lock(selected_gpu))
         return _execute_locked(**kwargs)
 
 
@@ -2402,7 +3255,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--lock", required=True, type=Path)
     parser.add_argument("--data", required=True, type=Path)
-    parser.add_argument("--validation-manifest", required=True, type=Path)
+    parser.add_argument(
+        "--validation-manifest",
+        type=Path,
+        default=None,
+        help=(
+            "required for an ordinary A1 memmap; forbidden for a promotion-eligible "
+            "flywheel composite, which binds its own whole-game split"
+        ),
+    )
     parser.add_argument("--checkpoint", required=True, type=Path)
     parser.add_argument("--report", required=True, type=Path)
     parser.add_argument("--receipt", required=True, type=Path)
@@ -2416,7 +3277,24 @@ def build_parser() -> argparse.ArgumentParser:
             "bytes remain the default"
         ),
     )
-    parser.add_argument("--gpu", type=int, default=0, help="one physical B200 index")
+    parser.add_argument(
+        "--gpu",
+        type=int,
+        default=0,
+        help="physical B200 index (8-GPU topology requires 0 and owns GPUs 0-7)",
+    )
+    parser.add_argument(
+        "--topology",
+        choices=sorted(TRAINING_TOPOLOGIES),
+        default=LEGACY_SINGLE_GPU_TOPOLOGY,
+        help="dose-preserving learner process topology",
+    )
+    parser.add_argument(
+        "--ddp-canary-receipt",
+        type=Path,
+        default=None,
+        help="required same-host NCCL/sampler canary receipt for 8-GPU DDP",
+    )
     parser.add_argument(
         "--ablation-id",
         default="",
@@ -2493,6 +3371,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             verified = bind_function_preserving_upgrade(
                 verified, args.architecture_upgrade_receipt
             )
+        verified = bind_training_topology(
+            verified, topology=args.topology, gpu=args.gpu
+        )
+        verified = bind_ddp_canary(verified, args.ddp_canary_receipt)
         checkpoint = args.checkpoint.expanduser().resolve(strict=False)
         report = args.report.expanduser().resolve(strict=False)
         receipt = args.receipt.expanduser().resolve(strict=False)
@@ -2522,7 +3404,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         claim = _claim_path(verified)
         _require_fresh_outputs(checkpoint, report, receipt, claim=claim)
         _require_unconsumed_contract(verified)
-        child_environment = _child_environment(args.gpu)
+        selected_gpus = _selected_gpus(verified, fallback_gpu=args.gpu)
+        child_environment = _child_environment(selected_gpus)
         execution_binding = _execution_binding(
             command=command, environment=child_environment
         )
@@ -2537,8 +3420,18 @@ def main(argv: Sequence[str] | None = None) -> int:
                 verified.get("retry_contract") if "retry_contract" in verified else None
             ),
             "global_n_full": 128,
-            "world_size": 1,
+            "world_size": int(verified["recipe"]["world_size"]),
             "gpu": args.gpu,
+            "gpus": list(selected_gpus),
+            "training_topology": verified.get("training_topology"),
+            "ddp_canary": verified.get("ddp_canary"),
+            "data_kind": verified.get("data_kind", "a1_memmap_v1"),
+            "production_sampling_receipt_sha256": verified.get(
+                "production_sampling_receipt_sha256"
+            ),
+            "validation_split_receipt_sha256": verified.get(
+                "validation_split_receipt_sha256"
+            ),
             "command": command,
             "command_sha256": _value_sha256(command),
             "execution_binding": execution_binding,

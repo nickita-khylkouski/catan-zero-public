@@ -195,6 +195,19 @@ EXPECTED_LEARNER_TRAINING_RECIPE: dict[str, Any] = {
     "value_phase_weights": "",
     "ddp_shard_data": False,
 }
+# Current post-promotion v3 learner semantics. Keep the historical constant
+# above untouched so issued v2 locks reconstruct exactly.
+CURRENT_LEARNER_TRAINING_RECIPE: dict[str, Any] = {
+    **EXPECTED_LEARNER_TRAINING_RECIPE,
+    "amp": "none",
+    "forced_action_weight": 0.0,
+    "forced_row_value_weight": 1.0,
+    "per_game_policy_weight": True,
+    "per_game_policy_weight_mode": "equal",
+    # DDP ranks must share one NumPy epoch order but use independent PyTorch
+    # dropout streams after identical model construction/loading.
+    "training_rng_rank_offset": True,
+}
 REQUIRED_EVIDENCE = {"a0", "s1", "s2", "s3"}
 HISTORICAL_HANDOFF_MODE = "historical_pre_promotion"
 POST_PROMOTION_HANDOFF_MODE = "post_promotion"
@@ -2331,15 +2344,19 @@ def _validate_learner_objective(value: dict[str, Any]) -> None:
         raise ContractError("learner objective must be 'hlgauss' or 'mse'")
 
 
-def _validate_learner_training_recipe(value: dict[str, Any]) -> None:
+def _validate_learner_training_recipe(
+    value: dict[str, Any],
+    *,
+    expected_recipe: Mapping[str, Any] = EXPECTED_LEARNER_TRAINING_RECIPE,
+) -> None:
     """Require the exact effective one-dose recipe, including JSON types."""
 
     _require_exact_keys(
         value,
-        set(EXPECTED_LEARNER_TRAINING_RECIPE),
+        set(expected_recipe),
         where="science.learner_training_recipe",
     )
-    for key, expected in EXPECTED_LEARNER_TRAINING_RECIPE.items():
+    for key, expected in expected_recipe.items():
         actual = value[key]
         if type(actual) is not type(expected):
             raise ContractError(
@@ -4182,7 +4199,14 @@ def build_lock(
     learner_objective = dict(science["learner_value_objective"])
     _validate_learner_objective(learner_objective)
     learner_training_recipe = dict(science["learner_training_recipe"])
-    _validate_learner_training_recipe(learner_training_recipe)
+    _validate_learner_training_recipe(
+        learner_training_recipe,
+        expected_recipe=(
+            EXPECTED_LEARNER_TRAINING_RECIPE
+            if draft_schema == LEGACY_DRAFT_SCHEMA
+            else CURRENT_LEARNER_TRAINING_RECIPE
+        ),
+    )
     if evaluator["public_observation"] is not True:
         raise ContractError("science.evaluator.public_observation must be true")
     if search["information_set_search"] is not True:
@@ -4712,7 +4736,14 @@ def verify_lock(
     ):
         raise ContractError("learner value-objective digest mismatch")
     learner_training_recipe = dict(lock["science"]["learner_training_recipe"])
-    _validate_learner_training_recipe(learner_training_recipe)
+    _validate_learner_training_recipe(
+        learner_training_recipe,
+        expected_recipe=(
+            EXPECTED_LEARNER_TRAINING_RECIPE
+            if lock_schema == LEGACY_LOCK_SCHEMA
+            else CURRENT_LEARNER_TRAINING_RECIPE
+        ),
+    )
     if (
         _digest_value(learner_training_recipe)
         != lock["science"]["learner_training_recipe_sha256"]
