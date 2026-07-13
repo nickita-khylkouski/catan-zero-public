@@ -106,6 +106,15 @@ landed. More epochs or a higher LR therefore increases representation drift long
 before it proves that the value head needs capacity. Fresh-optimizer, fixed-dose
 arms are mandatory before interpreting any architecture result.
 
+`value_lr_mult=0.3` scales only the dedicated value-head parameter group. It
+does **not** scale value-objective gradients flowing through the shared trunk;
+the trainer now reports this explicitly in the objective-interference probe.
+Consequently this knob cannot protect the representation from noisy terminal
+value gradients and is consistent with the observed large trunk drift plus
+small value-head drift. Do not alter the P0 reproduction. The highest-information
+follow-up is an independent f7-started trunk-frozen localization arm; only a
+strength recovery there justifies a matched `trunk_lr_mult` sweep.
+
 ### Policy/action binding
 
 The f7 policy scores a global state representation against an action embedding,
