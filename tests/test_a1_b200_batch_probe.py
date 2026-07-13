@@ -139,6 +139,13 @@ def test_plan_separates_fixed_step_and_equal_sample_questions(
             assert command.count(flag) == 1
             assert command[command.index(flag) + 1] == value
         assert command[command.index("--train-diagnostics-every-batches") + 1] == "1"
+        assert (
+            command[
+                command.index("--objective-gradient-interference-every-batches")
+                + 1
+            ]
+            == "0"
+        )
         assert command[command.index("--batch-size") + 1] == str(run["local_batch_size"])
         assert command[command.index("--max-steps") + 1] == str(run["max_steps"])
     assert plan["ranking_policy"]["diagnostic_only"] == ["hbm_memory_mib"]

@@ -1280,6 +1280,18 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--objective-gradient-interference-every-batches",
+        type=int,
+        default=0,
+        help=(
+            "Run the two extra shared-trunk autograd traversals used to measure "
+            "policy/value gradient cosine every N batches. This is intentionally "
+            "separate from --train-diagnostics-every-batches: optimizer/module "
+            "telemetry must not silently triple the backward work in throughput "
+            "probes. 0 disables the interference probe."
+        ),
+    )
+    parser.add_argument(
         "--ddp-find-unused-parameters",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -6083,6 +6095,17 @@ def main(argv: Sequence[str] | None = None) -> None:
             # forward leaves reducer hooks armed and silently synchronizes every
             # micro-batch, defeating gradient accumulation's communication win.
             with _gradient_sync_context(policy.model, accum_do_step=accum_do_step):
+                objective_interference_kwargs: dict[str, object] = {}
+                if train_fn is _train_xdim_batch:
+                    interference_cadence = int(
+                        args.objective_gradient_interference_every_batches
+                    )
+                    objective_interference_kwargs[
+                        "measure_objective_gradient_interference"
+                    ] = bool(
+                        interference_cadence > 0
+                        and batch_number % interference_cadence == 0
+                    )
                 batch_metrics = train_fn(
                     policy,
                     optimizer,
@@ -6118,6 +6141,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                     ),
                     **train_fn_extra_kwargs,
                     **accum_kwargs,
+                    **objective_interference_kwargs,
                     **(
                         {
                             "policy_aux_data": data,
@@ -7035,6 +7059,9 @@ def main(argv: Sequence[str] | None = None) -> None:
         "graph_dropout": args.graph_dropout if args.arch in ("xdim_graph", "entity_graph") else None,
         "progress_every_batches": args.progress_every_batches,
         "train_diagnostics_every_batches": args.train_diagnostics_every_batches,
+        "objective_gradient_interference_every_batches": (
+            args.objective_gradient_interference_every_batches
+        ),
         "elapsed_sec": time.perf_counter() - start,
     }
     if is_memmap_composite:
@@ -7741,6 +7768,7 @@ def _train_xdim_batch(
     policy_aux_data=None,
     policy_aux_batch: np.ndarray | None = None,
     policy_aux_sample_weights: np.ndarray | None = None,
+    measure_objective_gradient_interference: bool = False,
 ) -> dict:
     import torch
     from torch import nn
@@ -8182,7 +8210,7 @@ def _train_xdim_batch(
             + float(moe_balance_loss_weight) * moe_balance_loss
         )
         objective_gradient_interference = None
-        if diagnostics and accum_do_step:
+        if measure_objective_gradient_interference and accum_do_step:
             # Exact configured task objectives. Value-head LR groups cannot scale
             # either objective's gradient through the shared transformer.
             policy_objective = (

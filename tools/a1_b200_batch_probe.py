@@ -233,6 +233,7 @@ def build_plan(
                 ("--epochs", "1"),
                 ("--lr", repr(_scaled_lr(batch, lr_policy))),
                 ("--train-diagnostics-every-batches", "1"),
+                ("--objective-gradient-interference-every-batches", "0"),
                 ("--checkpoint", str(run_dir / "candidate.pt")),
                 ("--report", str(run_dir / "train.report.json")),
                 ("--a1-batch-probe-plan", str(output_dir / "plan.json")),
