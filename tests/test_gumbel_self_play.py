@@ -19,6 +19,7 @@ from catan_zero.rl.gumbel_self_play import (
     TARGET_INFORMATION_REGIME_AUTHORITATIVE,
     TARGET_INFORMATION_REGIME_PUBLIC,
     _apply_selected_action,
+    _search_execution_contract,
     _target_information_regime_for_search,
     action_size_for_evaluator,
     play_one_game,
@@ -707,6 +708,28 @@ def test_target_information_regime_requires_explicit_search_and_native_support()
             ),
             engine_supports_determinization=True,
         )
+
+
+def test_search_execution_contract_attests_effective_particle_budget_semantics():
+    pimc = SimpleNamespace(information_set_search=True, exact_budget_sh=False)
+    assert _search_execution_contract(pimc, native_mcts_hot_loop=True) == {
+        "budget_scope": "total_before_determinization_division",
+        "configured_exact_budget_sh": False,
+        "information_set_particle_subbudgets_exact": True,
+        "native_mcts_hot_loop": True,
+    }
+
+    single_world = SimpleNamespace(
+        information_set_search=False, exact_budget_sh=False
+    )
+    assert _search_execution_contract(
+        single_world, native_mcts_hot_loop=False
+    ) == {
+        "budget_scope": "single_world",
+        "configured_exact_budget_sh": False,
+        "information_set_particle_subbudgets_exact": False,
+        "native_mcts_hot_loop": False,
+    }
 
 
 def test_run_worker_games_isolates_one_bad_game_from_the_worker(tmp_path, monkeypatch):

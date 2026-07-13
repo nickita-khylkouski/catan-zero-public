@@ -825,6 +825,37 @@ def _target_information_regime_for_search(
     return TARGET_INFORMATION_REGIME_AUTHORITATIVE
 
 
+def _search_execution_contract(
+    search_config: Any, *, native_mcts_hot_loop: bool
+) -> dict[str, Any]:
+    """Describe effective budget semantics that are not visible in the dataclass.
+
+    Information-set search treats ``n_full``/``n_fast`` as one TOTAL budget,
+    divides it across determinizations, and executes every particle sub-budget
+    exactly.  Both the Python reference path and the native hot loop deliberately
+    override the legacy Sequential-Halving rounding rule for those sub-searches.
+    Recording only ``dataclasses.asdict(search_config)`` is therefore ambiguous:
+    it can say ``exact_budget_sh=False`` even though every PIMC particle used an
+    exact budget.  Keep that configured value, but attest the effective contract
+    separately so generation audits never infer nominal compute from the wrong
+    scheduler.
+    """
+
+    information_set = bool(getattr(search_config, "information_set_search", False))
+    return {
+        "budget_scope": (
+            "total_before_determinization_division"
+            if information_set
+            else "single_world"
+        ),
+        "configured_exact_budget_sh": bool(
+            getattr(search_config, "exact_budget_sh", False)
+        ),
+        "information_set_particle_subbudgets_exact": information_set,
+        "native_mcts_hot_loop": bool(native_mcts_hot_loop),
+    }
+
+
 def play_one_game(
     mcts: GumbelChanceMCTS,
     evaluator: RustEvaluator,
@@ -1711,6 +1742,9 @@ def run_worker_games(
         # c_scale 1.0-vs-0.1 near-miss (commit 376c146).
         "selfplay_config": dataclasses.asdict(config),
         "search_config": dataclasses.asdict(search_config),
+        "search_execution_contract": _search_execution_contract(
+            search_config, native_mcts_hot_loop=bool(native_mcts_hot_loop)
+        ),
         "target_information_regime": target_information_regime,
         "elapsed_sec": elapsed,
         "rows_per_sec": rows / max(elapsed, 1.0e-9),
