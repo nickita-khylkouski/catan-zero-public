@@ -26,11 +26,27 @@ if str(TOOLS_DIR) not in sys.path:
 
 import generate_gumbel_selfplay_data as generate_cli  # type: ignore  # noqa: E402
 import gumbel_search_cross_net_h2h as cross_net_cli  # type: ignore  # noqa: E402
+import train_bc  # type: ignore  # noqa: E402
 
 
 class _FakeGame:
     def current_color(self) -> str:
         return "RED"
+
+
+def test_categorical_training_support_width_unwraps_ddp_model() -> None:
+    policy = SimpleNamespace(
+        model=SimpleNamespace(module=SimpleNamespace(value_categorical_bins=33))
+    )
+    assert train_bc._policy_value_categorical_bins(policy) == 33  # noqa: SLF001
+    with pytest.raises(RuntimeError, match="value_categorical_bins >= 2"):
+        train_bc._policy_value_categorical_bins(  # noqa: SLF001
+            SimpleNamespace(
+                model=SimpleNamespace(
+                    module=SimpleNamespace(value_categorical_bins=0)
+                )
+            )
+        )
 
 
 class _SplitValuePolicy:
