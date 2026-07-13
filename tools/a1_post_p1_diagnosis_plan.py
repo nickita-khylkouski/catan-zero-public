@@ -60,6 +60,18 @@ def _digest(value: Any) -> str:
     return "sha256:" + hashlib.sha256(raw).hexdigest()
 
 
+def _integrated_lr_step_equivalents(*, steps: int, warmup_steps: int) -> float:
+    """Area under the trainer's linear-warmup learning-rate multiplier."""
+
+    if steps < 0 or warmup_steps < 0:
+        raise ValueError("steps and warmup_steps must be non-negative")
+    if warmup_steps == 0:
+        return float(steps)
+    return float(
+        sum(min(float(step + 1) / float(warmup_steps), 1.0) for step in range(steps))
+    )
+
+
 def build_plan(
     *, world_size: int = 8, local_batch_size: int = 512, grad_accum_steps: int = 1
 ) -> dict[str, Any]:
@@ -76,6 +88,10 @@ def build_plan(
     steps_by_dose = {
         str(dose): math.ceil(dose / global_batch)
         for dose in (SHORT_SAMPLE_DOSE, FULL_SAMPLE_DOSE)
+    }
+    lr_equivalents_by_dose = {
+        dose: _integrated_lr_step_equivalents(steps=steps, warmup_steps=100)
+        for dose, steps in steps_by_dose.items()
     }
     fixed = {
         "initialization": "authenticated f7 producer bytes, independently loaded per arm",
@@ -338,12 +354,18 @@ def build_plan(
         "candidates": {
             str(SHORT_SAMPLE_DOSE): {
                 "optimizer_steps": steps_by_dose[str(SHORT_SAMPLE_DOSE)],
+                "integrated_lr_step_equivalents": lr_equivalents_by_dose[
+                    str(SHORT_SAMPLE_DOSE)
+                ],
                 "teacher_gap_closure": 0.102290,
                 "global_relative_parameter_drift": 0.0069134,
                 "artifact": SHORT_CHECKPOINT,
             },
             str(FULL_SAMPLE_DOSE): {
                 "optimizer_steps": steps_by_dose[str(FULL_SAMPLE_DOSE)],
+                "integrated_lr_step_equivalents": lr_equivalents_by_dose[
+                    str(FULL_SAMPLE_DOSE)
+                ],
                 "teacher_gap_closure": 0.135757,
                 "global_relative_parameter_drift": 0.025954,
                 "artifact": FULL_CHECKPOINT,
@@ -376,6 +398,11 @@ def build_plan(
         "failure_rule": (
             "if neither checkpoint clears the predeclared f7 performance floor, "
             "do not infer that more dose is beneficial from offline loss"
+        ),
+        "lr_exposure_interpretation": (
+            "the full run has about 12.41x the integrated LR exposure of the short "
+            "run (974.5 versus 78.5 full-LR-equivalent steps), not merely 8x the "
+            "row draws; behavior must adjudicate whether that extra exposure helps"
         ),
     }
     replay_scope_adjudication = {

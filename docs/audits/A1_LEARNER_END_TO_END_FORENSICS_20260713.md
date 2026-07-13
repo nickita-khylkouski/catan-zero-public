@@ -307,6 +307,15 @@ used 8x more samples but gained only 0.03347 absolute closure (1.33x total)
 while parameter drift grew 3.75x. Closure per million samples collapsed from
 0.1951 to 0.03237, roughly 6x.
 
+The optimizer exposure contrast is stronger than the row-count contrast. With
+the trainer's 100-step linear warmup, the 128-step run integrated only 78.5
+full-LR-equivalent steps, whereas the 1,024-step run integrated 974.5. The full
+run therefore received about **12.41x** the LR-area exposure yet achieved only
+1.33x the teacher-gap closure. This is direct evidence of early policy-target
+saturation followed by continued representation movement; it is not evidence
+that the short checkpoint is competitively stronger, which still requires the
+matched behavior panel.
+
 This does **not** prove the midpoint plays better: only matched head-to-head
 evaluation can decide that. It does prove that offline distillation saturates
 far earlier than representation movement. Therefore midpoint and full P0 must

@@ -133,6 +133,19 @@ def test_existing_short_and_full_artifacts_must_select_dose_before_training() ->
         == "sha256:ce29663fe519b88537d54afec3dfa4e0033f79a649f8b04d364baead48c462f4"
     )
     assert "smallest dose" in adjudication["selection_rule"]
+    assert (
+        adjudication["candidates"][str(SHORT_SAMPLE_DOSE)][
+            "integrated_lr_step_equivalents"
+        ]
+        == 78.5
+    )
+    assert (
+        adjudication["candidates"][str(FULL_SAMPLE_DOSE)][
+            "integrated_lr_step_equivalents"
+        ]
+        == 974.5
+    )
+    assert "12.41x" in adjudication["lr_exposure_interpretation"]
     assert "old gen3" in adjudication["evaluation"]["parent_panel"]
     assert adjudication["evaluation"]["value_squash"] == "tanh"
     assert "value_squash=clip" in adjudication["evaluation"]["operator_sensitivity"]
