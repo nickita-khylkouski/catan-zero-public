@@ -167,6 +167,11 @@ def build_plan(
         raise QualityProbeError("matched comparison is sealed to a 100-step warmup")
     if _value(base, "--lr-schedule") != "flat":
         raise QualityProbeError("matched comparison is sealed to the flat LR schedule")
+    if int(_value(base, "--validation-max-samples")) != 0:
+        raise QualityProbeError(
+            "authenticated composite probes require --validation-max-samples 0; "
+            "bind a signed whole-game sentinel to cap validation"
+        )
     inputs = _input_binding(base)
     output_dir = output_dir.expanduser().resolve()
     if output_dir.exists():
