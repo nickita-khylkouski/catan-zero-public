@@ -55,7 +55,7 @@
       "graph_history_features": true,
       "seed": 1,
       "epochs": 1,
-      "max_steps": 0,
+      "max_steps": 128,
       "batch_size": 4096,
       "grad_accum_steps": 1,
       "world_size": 1,

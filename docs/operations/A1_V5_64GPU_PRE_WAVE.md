@@ -69,8 +69,9 @@ seal a new post-promotion wave.
 
 ## Learner handoff (no training authorized here)
 
-The current v3 learner recipe is strict FP32, fresh Adam, one epoch, LR
-`3e-5`, global batch 4096, zero forced-action policy mass, full forced-row
+The current v3 learner recipe is strict FP32, fresh Adam, exactly 128 optimizer
+steps / 524,288 global row draws, LR `3e-5`, global batch 4096, zero
+forced-action policy mass, full forced-row
 value mass, equal per-game policy weighting, scalar-MSE value weight 0.25, and
 rank-offset PyTorch RNG. The exact production replay mix is 64% current, 12%
 recent history, 4% hard negative, and 20% historical replay. Validation is a

@@ -260,6 +260,9 @@ HISTORICAL_MARKERLESS_LEARNER_TRAINING_RECIPE: dict[str, Any] = {
 # above untouched so issued v2 locks reconstruct exactly.
 CURRENT_LEARNER_TRAINING_RECIPE: dict[str, Any] = {
     **EXPECTED_LEARNER_TRAINING_RECIPE,
+    # The matched B200 dose adjudication selected 128 global-batch updates;
+    # issued v2 locks retain their historical uncapped one-epoch recipe above.
+    "max_steps": 128,
     "amp": "none",
     "forced_action_weight": 0.0,
     "forced_row_value_weight": 1.0,

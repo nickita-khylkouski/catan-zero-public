@@ -864,6 +864,7 @@ def test_checked_in_template_is_intentionally_unresolved_and_refuses_seal() -> N
     assert payload["science"]["search"]["c_scale"] == 0.1
     recipe = payload["science"]["learner_training_recipe"]
     assert recipe["amp"] == "none"
+    assert recipe["max_steps"] == 128
     assert recipe["forced_action_weight"] == 0.0
     assert recipe["forced_row_value_weight"] == 1.0
     assert recipe["per_game_policy_weight"] is True
