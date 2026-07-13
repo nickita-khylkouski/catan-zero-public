@@ -150,6 +150,11 @@ a diagnostic, not a champion selector. Search H2H remains mandatory.
 | Opponent-mixture provenance | Self-play NPZ shards emitted `is_pool_game`, opponent version/tag/checkpoint, and exploiter type, but both the in-memory learner key list and memmap converter omitted them. After conversion, the 80/15/5 current/history/hard-negative mixture could not be diagnosed, calibrated, or weighted by source at row level. | Fixed end-to-end (`9377778`): all opponent fields round-trip; an explicit presence bit distinguishes a real self-play value from legacy unknown; sealed A1 selected-game manifests stamp a verified source category by game seed (never by path inference); curated-data startup reports bounded-memory per-source counts; and old/new replay components synthesize unknown defaults rather than fabricating identity. Existing already-converted memmaps retain valid tensors and manifest-level quotas but cannot recover erased row identity without rebuilding from retained NPZ/hardlinks. |
 | DDP active-fraction telemetry | The active numerator was globally reduced but divided by a rank-local denominator, producing impossible fractions such as `7.95` in an eight-rank report. This did not alter gradients, but it corrupted experimental interpretation. | Fixed: numerator and denominator now share global scope and bounded fractions fail closed (`cf54d5a`). |
 | Diagnostic run receipts | Completed non-promotable runs could retain a launch plan without a final identity binding for checkpoint, report, runtime, optimizer, source code, and finalizer. | Fixed: deterministic finalization/replay receipt binds all run artifacts and the finalizer itself (`efcc94b`, `d9bf335`). |
+| Gather-arm completion | The selected topology-gather launcher authenticated submission but had no post-run proof of exact dose, fresh optimizer sidecar, completed systemd state, or adapter-only parameter delta. | Fixed (`ab35ba7`): post-hoc replay binds the historical executor and command, every output hash, 1,024-step progress/RNG state, and an exact four-tensor gather delta while requiring all inherited tensors to remain bit-identical. The real B200 receipt replayed successfully. |
+| Value-scope validation identity | The `CURRENT_VALUE_SCOPE` arm changed the composite descriptor's value-component scope but reused the validation sentinel cryptographically bound to the source descriptor bytes. The real eight-B200 launch correctly failed before training with `validation sentinel source composite binding drift`. | Fixed (`e09eb37`): derive a treatment sentinel that changes only descriptor file/fingerprint bindings while preserving every selected/excluded game and component validation binding. The source sentinel is proven to fail against treatment metadata and the rebound sentinel is accepted with the identical game set. |
+| Transient unit exit status | Diagnostic launchers used `systemd-run --collect`. After completion the unit disappeared; `systemctl show` on that missing name returned synthetic defaults (`Result=success`, `ExecMainStatus=0`), allowing a failed torchrun to look successful to a naive completion check. | Fixed (`e09eb37`): retain transient units with `RemainAfterExit=yes`; success must be loaded/active/exited with child status 0, while failure remains loaded/failed with its real child code. Completion finalizers reject `LoadState=not-found`. |
+| Entity input materialization | Threaded prefetch copied authenticated all-zero event tensors and an unused dense observation into every entity batch. | Fixed (`22c1ad6`): the entity path avoids 7,372 bytes/row, about 3.60 GiB per selected 524,288-row dose, while retaining fail-closed empty-event checks. |
+| Float32 matmul mode | B200 FP32 training always used `highest`; the materially faster TF32-backed `high` mode was neither explicit nor recipe-bound, so changing it informally would create hidden numerical drift. | Fixed (`22c1ad6`): `highest` remains the production default, while requested/effective precision is bound into config, resume, A1 seal, checkpoint, and report. A same-batch one-step probe measured 2.85x throughput with loss delta `1.04e-5`, gradient-norm delta `1.79e-7`, and max parameter delta `6e-5`; this authorizes a separate arm, not a silent production flip. |
 | Shared-trunk gradient probe | The probe enabled ordinary diagnostics but had drifted from the separately gated objective-interference cadence, so it could start without emitting its defining measurement. | Fixed: both diagnostic cadences are explicit and tested (`58fb7e6`). |
 | Post-P1 causal-arm planner | Every arm silently inherited the historical 4.19M-row dose despite the matched saturation result, and the planner specified BF16 even though the sealed TEMP baseline and both dose artifacts are FP32. That made a supposed one-axis arm a dose-assumption plus precision change. | Fixed: the existing 0.52M/full checkpoints must select the Pareto dose before any new arm; FP32 and all three component temperatures are now explicit and bound (`a1_post_p1_diagnosis_plan.py`, schema v2). |
 | Learner/operator adjudication | The post-P1 planner still proposed tuning each candidate at `c_scale in {0.03, 0.10}` before the external panel. That repeats the historical failure mode: checkpoint ancestry and search operator change together, and old gen3 can make an updated checkpoint look improved relative to its actual f7 parent. | Fixed in planner schema v4: every learner arm is compared with exact f7 at the same deployed `c_scale=0.10`; candidate-specific operator tuning is forbidden for selection and moved to a separate same-checkpoint crossover diagnostic. The older recovery prose is aligned with the FP32 and dose-selection contracts. |
@@ -171,6 +176,14 @@ The six-layer, width-640 transformer is where nearly all learner update energy
 landed. More epochs or a higher LR therefore increases representation drift long
 before it proves that the value head needs capacity. Fresh-optimizer, fixed-dose
 arms are mandatory before interpreting any architecture result.
+
+The exact f7 parameter distribution supports the same conclusion: 29,541,120
+parameters (84.3%) live in the six Transformer blocks, versus 865,920 in the
+action encoder and 410,881 in the value head. In the pure-soft selected-dose
+delta, the blocks absorbed about 84.6% of update energy and block 5 alone
+absorbed 18.67%; the value head absorbed only 0.22%. Widening or training the
+same permutation-invariant trunk longer is therefore not the proximal repair
+for a missing action-to-board join.
 
 `value_lr_mult=0.3` scales only the dedicated value-head parameter group. It
 does **not** scale value-objective gradients flowing through the shared trunk;
@@ -244,6 +257,26 @@ without changing f7 at initialization, are zero-initialized actor-relative seat
 embeddings and a zero-initialized categorical action-ID residual. These remain
 lower priority than target gather/topology because the current action scalar is
 injective and seat identity has not yet been isolated by matched behavior.
+
+The corpus-side commissioning audit is now complete rather than assumed. Across
+31,919,276 n128 rows, 12,773,247 n256 rows, and 2,927,924 replay rows, all target
+IDs and graph incidences were valid. Respectively 43.02%, 42.92%, and 41.47% of
+search-active policy rows had an action-local topology target. Current corpora
+were authenticated by `used_full_search`; replay was authenticated through the
+legacy policy-weight/stored-policy/gumbel-teacher equivalence. That is sufficient
+to make the target-gather arm runnable without regenerating data.
+
+The commissioned gather-only arm then completed on eight B200s in 73.48 seconds:
+1,024 steps, 524,288 rows, fresh Adam, global batch 512, and exactly 411,520
+trainable parameters. Its objective-matched teacher-gap closure was 0.054323
+(replay 0.231376, n128 0.016597, n256 0.012306). Exactly the four
+`target_gather_proj` tensors changed; all 139 inherited tensors were
+bit-identical. Checkpoint SHA-256 is
+`f4ef23313fcb45891ed8747c24274b626d38d0f64351134ee513bf66c089c6a6`;
+the replayed completion receipt digest is
+`sha256:6dc1c728d23ac9f186e7e254eb7dc7f397300cf7ce256ba90d30cfbfd2c62d77`.
+Offline closure does not decide whether the join improves play; the matched f7
+behavior screen is the next and only selection step.
 
 ### Value readout
 
@@ -482,6 +515,13 @@ Pure-soft remains an exact 128-step one-axis arm (`0.9 -> 1.0`). Stale launchers
 that coupled fresh heads to the rejected 4.19M-row dose now fail closed; see
 `A1_SHORT_DOSE_MODULE_COMMISSIONING_20260713.md`.
 
+The pure-soft arm has now been behavior-screened on the same 128 keys as the
+selected TEMP midpoint. It scored 72-56 (56.25%; `WW=14`, split=44, `LL=6`,
+zero errors/truncations), below the midpoint's 75-53 (58.59%). Its offline
+closure improved only from 0.102290 to 0.104274 and replay closure regressed
+from 0.193881 to 0.183544. Therefore removing the 10% played-action hard CE is
+rejected as a successor; preserve soft/hard weights 0.9/0.1 in the control.
+
 Promote nothing from offline loss. First use a short matched internal panel, then
 the full seat-swapped neutral gate for survivors.
 
@@ -539,6 +579,14 @@ the full seat-swapped neutral gate for survivors.
   mutating the sealed search operator.
 - `03bf5e2` — skip frozen zero-objective head forwards and preserve two-forward
   RNG/main-output parity for optional-head controls.
+- `22c1ad6` — remove dead entity-batch transfers and bind an explicit TF32
+  diagnostic mode without changing the production default.
+- `cea5e3c`, `c89dfee` — parallelize and authenticate the full architecture
+  target audit, including legacy replay full-search equivalence.
+- `ab35ba7` — bind completed topology-gather artifacts, dose, optimizer,
+  systemd result, and exact adapter-only model delta in a replayable receipt.
+- `e09eb37` — preserve identical validation games across descriptor-scope arms
+  and retain trustworthy systemd child-exit evidence.
 
 The immediate criterion is simple: preserve the independent TEMP win, select the
 fastest mathematically matched DDP geometry, and spend subsequent B200 time only
