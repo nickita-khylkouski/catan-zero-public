@@ -20,6 +20,7 @@ Execution is diagnostic-only, one-shot, and requires an idle eight-B200 host.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -45,6 +46,13 @@ RUNTIME_FILES = (
     "tools/train_bc.py",
     "tools/f69_upgrade_checkpoint_config.py",
     "src/catan_zero/rl/entity_token_policy.py",
+)
+TREATMENT_RUNTIME_DIFF_FILES = (
+    "tests/test_categorical_value_readout.py",
+    "tools/train_bc.py",
+)
+TREATMENT_RUNTIME_DIFF_SHA256 = (
+    "sha256:151adf4e237e5c2e8b6985551fb55acd5df4d397fd8273ac1b3c672a43785fe1"
 )
 SOURCE_FILES = tuple(dict.fromkeys(
     (EXECUTOR_RELATIVE_PATH,)
@@ -172,6 +180,59 @@ def _runtime_binding(source: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "repository_root": str(repo),
         "git_commit": commit,
+        "files": files,
+        "files_sha256": bridge.corrected._digest(files),  # noqa: SLF001
+    }
+
+
+def _treatment_runtime_binding(
+    source: Mapping[str, Any], treatment_repo: Path
+) -> dict[str, Any]:
+    """Bind the one-commit DDP categorical repair atop selected runtime."""
+
+    repo = treatment_repo.expanduser().resolve(strict=True)
+    source_commit = str(
+        source["selected_geometry_evidence"]["runtime"]["repository_commit"]
+    )
+    commit = executor_base._git_head(repo)  # noqa: SLF001
+    try:
+        parent = subprocess.check_output(
+            ("git", "rev-parse", "HEAD^"), cwd=repo, text=True
+        ).strip()
+        changed = tuple(subprocess.check_output(
+            ("git", "diff", "--name-only", f"{parent}..{commit}"),
+            cwd=repo,
+            text=True,
+        ).splitlines())
+        patch = subprocess.check_output(
+            ("git", "diff", "--binary", f"{parent}..{commit}"), cwd=repo
+        )
+        subprocess.run(
+            ("git", "diff", "--quiet", "HEAD", "--", *RUNTIME_FILES),
+            cwd=repo,
+            check=True,
+        )
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise HLGaussArmError("cannot authenticate treatment runtime") from error
+    patch_sha = "sha256:" + hashlib.sha256(patch).hexdigest()
+    if not (
+        parent == source_commit
+        and changed == TREATMENT_RUNTIME_DIFF_FILES
+        and patch_sha == TREATMENT_RUNTIME_DIFF_SHA256
+    ):
+        raise HLGaussArmError(
+            "treatment runtime is not the reviewed one-commit DDP categorical repair"
+        )
+    files = {
+        relative: bridge.corrected._file_ref(repo / relative)  # noqa: SLF001
+        for relative in RUNTIME_FILES
+    }
+    return {
+        "repository_root": str(repo),
+        "git_commit": commit,
+        "parent_commit": parent,
+        "changed_files": list(changed),
+        "diff_sha256": patch_sha,
         "files": files,
         "files_sha256": bridge.corrected._digest(files),  # noqa: SLF001
     }
@@ -359,6 +420,7 @@ def _derive_command(
     treatment_sentinel: Path,
     source_init: Path,
     treatment_init: Path,
+    treatment_trainer: Path,
     output_root: Path,
 ) -> tuple[list[str], dict[str, Any]]:
     command = list(source)
@@ -372,7 +434,17 @@ def _derive_command(
         raise HLGaussArmError("source command is not bound to exact f7")
     if option(command, "--value-head-type") != "mse":
         raise HLGaussArmError("source command primary value objective is not MSE")
+    trainer_positions = [
+        index for index, value in enumerate(command) if Path(value).name == "train_bc.py"
+    ]
+    if len(trainer_positions) != 1:
+        raise HLGaussArmError("source command does not name exactly one trainer")
+    trainer_index = trainer_positions[0]
     changes = {
+        "trainer": {
+            "source": command[trainer_index],
+            "treatment": str(treatment_trainer.resolve(strict=True)),
+        },
         "--data": {"source": str(source_descriptor), "treatment": str(treatment_descriptor)},
         "--validation-game-sentinel-manifest": {
             "source": str(source_sentinel), "treatment": str(treatment_sentinel)
@@ -382,7 +454,10 @@ def _derive_command(
         "--checkpoint": {"source": option(command, "--checkpoint"), "treatment": str(output_root / "candidate.pt")},
         "--report": {"source": option(command, "--report"), "treatment": str(output_root / "train.report.json")},
     }
+    command[trainer_index] = changes["trainer"]["treatment"]
     for flag, row in changes.items():
+        if flag == "trainer":
+            continue
         bridge.corrected._set_option(command, flag, row["treatment"])  # noqa: SLF001
     return command, changes
 
@@ -415,13 +490,18 @@ def prepare(args: argparse.Namespace) -> tuple[dict[str, Any], Path]:
         raise HLGaussArmError(f"HL-Gauss output/claim already exists: {existing}")
     output_root.mkdir(parents=True, exist_ok=True)
     runtime = _runtime_binding(source)
+    treatment_runtime = _treatment_runtime_binding(
+        source, args.treatment_runtime_repo
+    )
     source_init = Path(source["initialization"]["path"])
     # Keep the lexical venv entry point. Resolving the symlink to /usr/bin/python
     # silently drops the venv's site-packages and is a real remote-launch footgun.
     python = Path(os.path.abspath(os.fspath(Path(source["command"][0]).expanduser())))
     if not python.is_file() or not os.access(python, os.X_OK):
         raise HLGaussArmError(f"selected training Python is not executable: {python}")
-    upgrader = Path(runtime["files"]["tools/f69_upgrade_checkpoint_config.py"]["path"])
+    upgrader = Path(
+        treatment_runtime["files"]["tools/f69_upgrade_checkpoint_config.py"]["path"]
+    )
     init_contract, commissioning_ref = _commission_initializer(
         source=source_init,
         output=output_root / "f7-catbins33-init.pt",
@@ -449,6 +529,9 @@ def prepare(args: argparse.Namespace) -> tuple[dict[str, Any], Path]:
         treatment_sentinel=Path(sentinel_ref["path"]),
         source_init=source_init,
         treatment_init=Path(init_contract["initializer"]["path"]),
+        treatment_trainer=Path(
+            treatment_runtime["files"]["tools/train_bc.py"]["path"]
+        ),
         output_root=output_root,
     )
     binding = _source_binding(args.repo)
@@ -478,6 +561,13 @@ def prepare(args: argparse.Namespace) -> tuple[dict[str, Any], Path]:
         }),
         "source_binding": binding,
         "selected_runtime_binding": runtime,
+        "treatment_runtime_binding": treatment_runtime,
+        "runtime_contract_delta": {
+            "source_commit": runtime["git_commit"],
+            "treatment_commit": treatment_runtime["git_commit"],
+            "diff_sha256": TREATMENT_RUNTIME_DIFF_SHA256,
+            "only_runtime_fix": "unwrap DDP model for categorical support width",
+        },
         "only_declared_causal_delta": _causal_delta(),
         "resolved_hlgauss_contract": _resolved_contract(),
         "matched_contract": _matched_contract(),
@@ -564,6 +654,23 @@ def verify(manifest_path: Path) -> dict[str, Any]:
     runtime = _runtime_binding(source)
     if payload.get("selected_runtime_binding") != runtime:
         raise HLGaussArmError("selected runtime binding drift")
+    treatment_binding_raw = payload.get("treatment_runtime_binding")
+    if not isinstance(treatment_binding_raw, Mapping):
+        raise HLGaussArmError("manifest lacks treatment runtime binding")
+    treatment_runtime = _treatment_runtime_binding(
+        source, Path(str(treatment_binding_raw.get("repository_root", "")))
+    )
+    if not (
+        treatment_binding_raw == treatment_runtime
+        and payload.get("runtime_contract_delta")
+        == {
+            "source_commit": runtime["git_commit"],
+            "treatment_commit": treatment_runtime["git_commit"],
+            "diff_sha256": TREATMENT_RUNTIME_DIFF_SHA256,
+            "only_runtime_fix": "unwrap DDP model for categorical support width",
+        }
+    ):
+        raise HLGaussArmError("treatment runtime delta drift")
     source_payload, source_meta, source_descriptor_ref = value_axis._source_descriptor_contract(source)  # noqa: SLF001
     root = Path(str(payload.get("output_root", ""))).resolve()
     descriptor_meta, descriptor_ref = _write_hlgauss_descriptor(
@@ -605,6 +712,9 @@ def verify(manifest_path: Path) -> dict[str, Any]:
         treatment_sentinel=Path(sentinel_ref["path"]),
         source_init=Path(source["initialization"]["path"]),
         treatment_init=Path(initializer["initializer"]["path"]),
+        treatment_trainer=Path(
+            treatment_runtime["files"]["tools/train_bc.py"]["path"]
+        ),
         output_root=root,
     )
     command = payload.get("command")
@@ -615,7 +725,9 @@ def verify(manifest_path: Path) -> dict[str, Any]:
     ):
         raise HLGaussArmError("command is not the exact HL-Gauss derivation")
     trainers = [Path(value).resolve() for value in command if Path(value).name == "train_bc.py"]
-    trainer = Path(source["selected_geometry_trainer"]).resolve(strict=True)
+    trainer = Path(
+        treatment_runtime["files"]["tools/train_bc.py"]["path"]
+    ).resolve(strict=True)
     if trainers != [trainer]:
         raise HLGaussArmError("HL-Gauss command escaped selected trainer")
     existing = [str(path) for path in _forbidden_outputs(root) if path.exists()]
@@ -624,7 +736,7 @@ def verify(manifest_path: Path) -> dict[str, Any]:
     return {
         "manifest": payload,
         "manifest_ref": manifest_ref,
-        "repo": Path(source["selected_geometry_runtime_repo"]).resolve(strict=True),
+        "repo": Path(treatment_runtime["repository_root"]).resolve(strict=True),
         "preparer_repo": repo,
         "command": command,
         "output_root": root,
@@ -662,6 +774,7 @@ def build_parser() -> argparse.ArgumentParser:
     prep.add_argument("--selected-dose-report", required=True, type=Path)
     prep.add_argument("--output-root", required=True, type=Path)
     prep.add_argument("--repo", default=REPO_ROOT, type=Path)
+    prep.add_argument("--treatment-runtime-repo", required=True, type=Path)
     run = sub.add_parser("execute")
     run.add_argument("--manifest", required=True, type=Path)
     run.add_argument("--unit", default="a1-selected-dose-hlgauss33")

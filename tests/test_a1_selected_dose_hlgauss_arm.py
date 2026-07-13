@@ -3,12 +3,14 @@ from __future__ import annotations
 import dataclasses
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
 
 from catan_zero.rl.entity_token_policy import EntityGraphConfig
 from tools import a1_selected_dose_hlgauss_arm as arm
+from tools import train_bc
 
 
 def _source_overrides() -> dict[str, object]:
@@ -85,7 +87,12 @@ def _source_command(tmp_path: Path) -> list[str]:
         "--checkpoint": str(tmp_path / "old.pt"),
         "--report": str(tmp_path / "old.report.json"),
     }
-    command = ["/venv/bin/python", "-m", "torch.distributed.run", "trainer.py"]
+    command = [
+        "/venv/bin/python",
+        "-m",
+        "torch.distributed.run",
+        str(tmp_path / "source/tools/train_bc.py"),
+    ]
     for flag, value in values.items():
         command.extend((flag, value))
     return command
@@ -93,6 +100,9 @@ def _source_command(tmp_path: Path) -> list[str]:
 
 def test_command_delta_is_exact_selected_dose_hlgauss_axis(tmp_path: Path) -> None:
     source = _source_command(tmp_path)
+    treatment_trainer = tmp_path / "runtime/tools/train_bc.py"
+    treatment_trainer.parent.mkdir(parents=True)
+    treatment_trainer.write_text("# repaired trainer\n", encoding="utf-8")
     command, changes = arm._derive_command(  # noqa: SLF001
         source,
         source_descriptor=tmp_path / "source.json",
@@ -101,6 +111,7 @@ def test_command_delta_is_exact_selected_dose_hlgauss_axis(tmp_path: Path) -> No
         treatment_sentinel=tmp_path / "hl.sentinel.json",
         source_init=tmp_path / "f7.pt",
         treatment_init=tmp_path / "f7-catbins33.pt",
+        treatment_trainer=treatment_trainer,
         output_root=tmp_path / "out",
     )
     assert set(changes) == {
@@ -110,6 +121,7 @@ def test_command_delta_is_exact_selected_dose_hlgauss_axis(tmp_path: Path) -> No
         "--value-head-type",
         "--checkpoint",
         "--report",
+        "trainer",
     }
     option = arm.bridge.corrected._option  # noqa: SLF001
     assert option(command, "--value-head-type") == "hlgauss"
@@ -200,3 +212,18 @@ def test_declared_contract_keeps_shared_trunk_lr_semantics_explicit() -> None:
         "value_lr_mult": 0.3,
         "shared_trunk_uses_base_lr": True,
     }
+
+
+def test_categorical_bin_width_unwraps_ddp_model() -> None:
+    policy = SimpleNamespace(
+        model=SimpleNamespace(module=SimpleNamespace(value_categorical_bins=33))
+    )
+    assert train_bc._policy_value_categorical_bins(policy) == 33  # noqa: SLF001
+    with pytest.raises(RuntimeError, match="value_categorical_bins >= 2"):
+        train_bc._policy_value_categorical_bins(  # noqa: SLF001
+            SimpleNamespace(
+                model=SimpleNamespace(
+                    module=SimpleNamespace(value_categorical_bins=0)
+                )
+            )
+        )
