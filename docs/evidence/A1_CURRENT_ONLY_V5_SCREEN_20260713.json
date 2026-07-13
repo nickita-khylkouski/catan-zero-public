@@ -1,0 +1,48 @@
+{
+  "schema_version": "a1-historical-screen-summary-v1",
+  "created_utc": "2026-07-13T06:34:00Z",
+  "decision": "INCONCLUSIVE_TIE",
+  "promotion_eligible": false,
+  "question": "Does removing replay from the one-dose learner materially change playing strength versus registry v5?",
+  "comparison": {
+    "candidate": {
+      "label": "current-only one-dose",
+      "sha256": "sha256:a2c80f666368276822121c6c2ebcf648b6396aa6a2412a49c4101ff98c24867c"
+    },
+    "baseline": {
+      "label": "registry v5",
+      "sha256": "sha256:6817ab054506f962a758ebf48addce5cc7eb801bf451cf2d02b62fb91f5da39c"
+    },
+    "candidate_parent": {
+      "label": "f7",
+      "sha256": "sha256:f7e93dfb8cdb713d647b3e142c949d59083de9f719b6688b6faa6c918ce3eed4"
+    }
+  },
+  "execution": {
+    "controller_commit": "d1a1308219c09441794cada6cd679c25b8610228",
+    "native_wheel_sha256": "sha256:b6b9d1bed4e06a75eb0ee9338b2614b41db94600a04758310889bc427763b8c4",
+    "plan_hash": "sha256:06e865463708b5cb6374476618ab421184af0180379b6dad371d5af510f37165",
+    "pooled_run_id": "a1-eval-340427a2739b40ec",
+    "base_seed": 6199651000,
+    "comparison_contract": "paired_same_seed_color_swap_shared_search_operator",
+    "n_full": 128,
+    "c_scale": 0.1,
+    "temperature": 0.0,
+    "information_set_search": true,
+    "symmetry_averaged_eval": true,
+    "native_mcts_hot_loop": true,
+    "h100_gpus": 64
+  },
+  "result": {
+    "complete_pairs": 128,
+    "games_with_winner": 256,
+    "candidate_wins": 130,
+    "baseline_wins": 126,
+    "candidate_win_rate": 0.5078125,
+    "decisive_pairs": 60,
+    "split_pairs_excluded": 68,
+    "truncated_pairs_excluded": 0,
+    "elapsed_sec": 12092.002581320034
+  },
+  "interpretation": "The four-game margin is noise at this sample size. Replay anchoring is not proven necessary or unnecessary; this screen is diagnostic only and must not be used for promotion."
+}
