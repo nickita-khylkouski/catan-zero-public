@@ -7377,30 +7377,30 @@ def _aux_subgoal_loss(
         if kind == "categorical":
             target = torch.as_tensor(raw.astype(np.int64), device=device)
             valid = target >= 0
-            if not bool(valid.any().item()):
-                continue
             per = nn.functional.cross_entropy(
                 pred, target.clamp_min(0), reduction="none"
             )
         elif kind == "binary":
             target = torch.as_tensor(raw.astype(np.float32), device=device)
             valid = torch.isfinite(target)
-            if not bool(valid.any().item()):
-                continue
             per = nn.functional.binary_cross_entropy_with_logits(
                 pred, torch.nan_to_num(target), reduction="none"
             )
         else:  # scalar (vp_in_n): plain regression.
             target = torch.as_tensor(raw.astype(np.float32), device=device)
             valid = torch.isfinite(target)
-            if not bool(valid.any().item()):
-                continue
             per = nn.functional.mse_loss(
                 pred, torch.nan_to_num(target), reduction="none"
             )
         weight = valid.to(per.dtype)
-        total = total + (per * weight).sum() / weight.sum().clamp_min(1.0)
-        active_heads += 1
+        # Use the same global-denominator reduction as the main policy/value
+        # objectives.  Averaging rank-local masked means biases the auxiliary
+        # gradient whenever valid-label counts differ across DDP ranks.  Every
+        # rank must enter this helper even when its local mask is empty, or a
+        # rank with no categorical labels would skip the collective and hang
+        # its peers.
+        total = total + _weighted_mean_loss(per, weight)
+        active_heads += int(bool(valid.any().item()))
     return total, active_heads
 
 

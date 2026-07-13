@@ -77,15 +77,26 @@ def test_all_heads_present_counts_five_and_is_differentiable():
     assert out["aux_next_settlement"].grad.abs().sum().item() > 0.0
 
 
-def test_all_ignored_categorical_head_is_skipped():
+def test_all_ignored_categorical_head_is_zero_but_enters_global_reduction(monkeypatch):
     out = _outputs()
     data = {
         "aux_next_settlement": np.array([-1, -1, -1, -1], dtype=np.int64),
     }
+    calls = []
+    original = train_bc._weighted_mean_loss
+
+    def tracked(values, weights, *, mask=None):
+        calls.append((values.detach().clone(), weights.detach().clone()))
+        return original(values, weights, mask=mask)
+
+    monkeypatch.setattr(train_bc, "_weighted_mean_loss", tracked)
     loss, active = train_bc._aux_subgoal_loss(out, data, np.arange(_N), _DEVICE)
-    # The head's targets are entirely ignore rows -> no active head, no loss.
+    # A rank-local empty mask still enters the DDP-global denominator helper;
+    # another rank may carry valid labels for this same head.
     assert active == 0
     assert float(loss) == 0.0
+    assert len(calls) == 1
+    assert float(calls[0][1].sum()) == 0.0
 
 
 def test_partial_head_subset_counted():
