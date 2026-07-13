@@ -271,6 +271,26 @@ legacy corpus/checkpoint contract, even though the authoritative game state can
 populate it. Enabling the corrected value shifts f7 outputs and therefore is not
 a no-op feature toggle.
 
+This creates a **double-blind longest-road surface**, not merely one missing
+boolean. `entity_token_features._edge_tokens` records road owner and whether the
+owner is the actor, but records no edge endpoints. The legacy Transformer does
+not consume `edge_vertex_ids`, and the permutation regression above proves that
+rearranging all edge rows leaves its function unchanged. It can count an
+owner's road tokens, but it cannot distinguish one connected chain from the same
+roads split across components. With slot 12 also constant-zero, it has neither
+the authoritative public award bit nor enough topology to reconstruct the award
+or reason exactly about a road action stealing/defending its two VP. Public VP
+totals may provide a lossy correlate; they do not restore road connectivity or
+the action-local counterfactual.
+
+This is a representation/data ceiling for the next authoritative-feature arm,
+not an explanation for the recent same-representation regressions: f7, TEMP,
+combined-196k, and the corrective candidates all shared the same blind surface.
+Those failures still localize first to lineage, dose, target calibration, and
+evaluation binding. A future repair must be a separately named f7-start arm with
+the input-column initialization and topology treatment explicitly bound; it
+must not be silently mixed into the current TEMP control.
+
 The P0 reproduction below remains explicitly **legacy-corpus / legacy-feature**.
 A future authoritative-v1 run must bind producer and memmap provenance to that
 contract and deterministically zero-initialize the new input column in the f7
