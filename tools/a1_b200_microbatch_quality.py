@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
-"""Seal and run a sample-matched 8-B200 microbatch-quality comparison.
+"""Seal and run a sample-matched B200 DDP-geometry comparison.
 
-The historical batch probe compared local batches at equal row exposure but
-left ``lr_warmup_steps`` fixed.  Because its global batch changed, the larger
-batch traversed twice as many warmup *rows* per optimizer step.  This tool
-removes that confound without changing the learner: local 512 with two
-gradient-accumulation microsteps is compared with local 1024 with one.  Both
-arms therefore have global batch 8192, the same optimizer steps, LR schedule,
-warmup row dose, and total row dose.
+The historical batch probe changed global batch and warmup row dose.  The first
+attempt to repair that used gradient accumulation, but weighted learner
+objectives normalize each microbatch independently; when policy/value support
+differs between microbatches, averaging those means is not the exact mean over
+their union.  This tool instead compares 8x512 with 4x1024, both at global batch
+4096 and accumulation 1.  They therefore share optimizer steps, LR trajectory,
+warmup row dose, total row dose, and exact weighted-loss semantics.
+
+Throughput telemetry is deliberately split from heavyweight learner
+diagnostics.  Both timed arms disable parameter snapshots and objective-gradient
+interference; gradient clipping and aggregate loss telemetry remain available
+on the normal training path.
 
 The input is an already-reviewed diagnostic training command, normally the
 production-next K0 composite command.  Planning binds the current Git/trainer
@@ -35,11 +40,10 @@ from tools import a1_b200_batch_probe as batch_probe  # noqa: E402
 
 SCHEMA = "a1-b200-microbatch-quality-plan-v1"
 RUN_SCHEMA = "a1-b200-microbatch-quality-run-v1"
-WORLD_SIZE = 8
 DEFAULT_OPTIMIZER_STEPS = 512
 ARMS = (
-    ("micro512-accum2", 512, 2),
-    ("micro1024-accum1", 1024, 1),
+    ("ddp8-b512", 8, 512, tuple(range(8))),
+    ("ddp4-b1024", 4, 1024, tuple(range(4))),
 )
 
 
@@ -62,6 +66,28 @@ def _set(command: list[str], flag: str, value: str) -> None:
         command[positions[0] + 1] = value
     else:
         command.extend([flag, value])
+
+
+def _set_nproc_per_node(command: list[str], world_size: int) -> None:
+    split_positions = [
+        index for index, item in enumerate(command) if item == "--nproc-per-node"
+    ]
+    equals_positions = [
+        index
+        for index, item in enumerate(command)
+        if item.startswith("--nproc-per-node=")
+    ]
+    if len(split_positions) + len(equals_positions) != 1:
+        raise QualityProbeError(
+            "base command must contain exactly one --nproc-per-node binding"
+        )
+    if split_positions:
+        index = split_positions[0]
+        if index + 1 >= len(command):
+            raise QualityProbeError("base command has valueless --nproc-per-node")
+        command[index + 1] = str(int(world_size))
+    else:
+        command[equals_positions[0]] = f"--nproc-per-node={int(world_size)}"
 
 
 def _runtime() -> dict[str, str]:
@@ -148,27 +174,30 @@ def build_plan(
 
     runs: list[dict[str, Any]] = []
     global_batches: set[int] = set()
-    for run_id, local_batch, accumulation in ARMS:
+    for run_id, world_size, local_batch, gpu_ids in ARMS:
         command = list(base)
         run_dir = output_dir / run_id
+        _set_nproc_per_node(command, world_size)
         for flag, value in (
             ("--batch-size", str(local_batch)),
-            ("--grad-accum-steps", str(accumulation)),
+            ("--grad-accum-steps", "1"),
             ("--max-steps", str(optimizer_steps)),
             ("--epochs", "1"),
-            ("--train-diagnostics-every-batches", "1"),
+            ("--train-diagnostics-every-batches", "0"),
+            ("--objective-gradient-interference-every-batches", "0"),
             ("--checkpoint", str(run_dir / "candidate.pt")),
             ("--report", str(run_dir / "train.report.json")),
         ):
             _set(command, flag, value)
-        global_batch = WORLD_SIZE * local_batch * accumulation
+        global_batch = world_size * local_batch
         global_batches.add(global_batch)
         runs.append(
             {
                 "run_id": run_id,
                 "local_batch_size": local_batch,
-                "grad_accum_steps": accumulation,
-                "world_size": WORLD_SIZE,
+                "grad_accum_steps": 1,
+                "world_size": world_size,
+                "gpu_ids": list(gpu_ids),
                 "global_batch_size": global_batch,
                 "lr_warmup_steps": 100,
                 "warmup_samples": 100 * global_batch,
@@ -179,30 +208,40 @@ def build_plan(
                 "command_sha256": batch_probe._digest(command),  # noqa: SLF001
             }
         )
-    if global_batches != {8192}:
-        raise AssertionError("microbatch arms do not have identical global batch")
+    if global_batches != {4096}:
+        raise AssertionError("DDP geometry arms do not have identical global batch")
     plan: dict[str, Any] = {
         "schema_version": SCHEMA,
         "diagnostic_only": True,
         "promotion_eligible": False,
         "launch_authorized": True,
         "purpose": (
-            "Choose the per-GPU microbatch systems knee without changing global "
-            "batch, LR trajectory, optimizer steps, warmup samples, or total samples."
+            "Measure 8-rank versus 4-rank DDP geometry without changing global "
+            "batch, weighted-objective semantics, LR trajectory, optimizer steps, "
+            "warmup samples, or total samples."
         ),
         "runtime": runtime,
         "inputs": inputs,
         "matched_invariants": {
-            "global_batch_size": 8192,
+            "global_batch_size": 4096,
             "lr": float(_value(base, "--lr")),
             "lr_schedule": "flat",
             "lr_warmup_steps": 100,
-            "warmup_samples": 819_200,
+            "warmup_samples": 409_600,
             "optimizer_steps": optimizer_steps,
-            "planned_samples": optimizer_steps * 8192,
+            "planned_samples": optimizer_steps * 4096,
             "seed": int(_value(base, "--seed")),
         },
-        "only_intended_drift": ["batch_size", "grad_accum_steps"],
+        "only_intended_drift": ["world_size", "batch_size", "gpu_ids"],
+        "measurement_contract": {
+            "train_diagnostics_every_batches": 0,
+            "objective_gradient_interference_every_batches": 0,
+            "timed_arms_run_sequentially": True,
+            "reason": (
+                "parameter snapshots, extra autograd probes, and concurrent host "
+                "I/O would contaminate systems throughput"
+            ),
+        },
         "adjudication": {
             "primary": [
                 "samples_per_second",
@@ -294,10 +333,15 @@ def run_one(plan_path: Path, run_id: str, *, go: bool) -> dict[str, Any]:
         started = time.time_ns()
         completed: subprocess.CompletedProcess[str]
         try:
+            environment = os.environ.copy()
+            environment["CUDA_VISIBLE_DEVICES"] = ",".join(
+                str(gpu_id) for gpu_id in run["gpu_ids"]
+            )
             with (run_dir / "train.log").open("w", encoding="utf-8") as log:
                 completed = subprocess.run(
                     run["command"],
                     cwd=Path(plan["runtime"]["repository_root"]),
+                    env=environment,
                     check=False,
                     text=True,
                     stdout=log,
@@ -316,6 +360,8 @@ def run_one(plan_path: Path, run_id: str, *, go: bool) -> dict[str, Any]:
         "started_unix_ns": started,
         "finished_unix_ns": finished,
         "returncode": completed.returncode,
+        "gpu_ids": run["gpu_ids"],
+        "cuda_visible_devices": ",".join(str(value) for value in run["gpu_ids"]),
     }
     (Path(run["run_dir"]) / "runtime.json").write_text(
         json.dumps(runtime, indent=2, sort_keys=True) + "\n", encoding="utf-8"
