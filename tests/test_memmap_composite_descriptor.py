@@ -743,3 +743,34 @@ def test_prefetch_preserves_source_bound_stored_policy_temperatures():
         1.0,
         1.2,
     ]
+
+
+def test_prefetch_preserves_authenticated_policy_kl_anchor_scope():
+    data = train_bc.ConcatMemmapCorpus(
+        [_TinyCorpus([0, 1]), _TinyCorpus([10, 11])]
+    )
+    data.policy_kl_anchor_component_indices = (1,)
+    data.policy_kl_anchor_scope_authenticated = True
+    rows = np.asarray([0, 2, 1, 3], dtype=np.int64)
+
+    batches = list(
+        train_bc._iterate_training_batches(
+            data,
+            np.arange(4, dtype=np.int64),
+            rows,
+            4,
+            np.ones(4, dtype=np.float32),
+            np.ones(4, dtype=np.float32),
+            num_workers=1,
+            prefetch=1,
+        )
+    )
+
+    materialized, local, _policy_weights, _value_weights = batches[0]
+    assert np.array_equal(local, np.arange(4, dtype=np.int64))
+    assert materialized["_policy_kl_anchor_eligible"].tolist() == [
+        False,
+        True,
+        False,
+        True,
+    ]

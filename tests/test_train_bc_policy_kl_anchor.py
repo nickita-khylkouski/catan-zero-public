@@ -186,6 +186,24 @@ def test_composite_anchor_scope_excludes_current_producer_priors():
     assert torch.allclose(scoped, gen3_only, atol=1e-6)
 
 
+def test_materialized_anchor_scope_excludes_ineligible_components():
+    data = _base_data()
+    data["_policy_kl_anchor_eligible"] = np.asarray(
+        [False, True, False], dtype=np.bool_
+    )
+    logits = _logits()
+
+    scoped = _policy_kl_anchor_loss(
+        data, np.asarray([0, 1, 2]), logits, torch.device("cpu")
+    )
+    eligible_only = _policy_kl_anchor_loss(
+        _base_data(), np.asarray([1]), logits[1:2], torch.device("cpu")
+    )
+
+    assert scoped is not None and eligible_only is not None
+    assert torch.allclose(scoped, eligible_only, atol=1e-6)
+
+
 def test_unknown_anchor_direction_is_rejected():
     with pytest.raises(ValueError, match="unknown policy KL anchor direction"):
         _policy_kl_anchor_loss(

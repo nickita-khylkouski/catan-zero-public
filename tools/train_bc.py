@@ -11139,6 +11139,17 @@ def _iterate_training_batches(
             materialized["_stored_policy_temperature"] = (
                 stored_policy_temperatures
             )
+        policy_kl_anchor_eligible = _policy_kl_anchor_scope_mask(data, batch)
+        if policy_kl_anchor_eligible is not None:
+            # A materialised batch is a plain dict, so authenticated composite
+            # attributes (and component_indices_for_rows) no longer exist by
+            # the time the loss runs. Carry the resolved row mask explicitly;
+            # otherwise threaded prefetch silently broadens a replay-only KL
+            # anchor to every corpus component while the synchronous path stays
+            # correctly scoped.
+            materialized["_policy_kl_anchor_eligible"] = (
+                policy_kl_anchor_eligible
+            )
         local = np.arange(len(batch), dtype=np.int64)
         return materialized, local, policy_sample_weights[batch], value_sample_weights[batch]
 
@@ -13609,14 +13620,9 @@ def _policy_kl_anchor_loss_parts(
         device=device,
     )
     weights = (terms["has_prior"] & non_forced).to(torch.float32)
-    eligible_components = getattr(data, "policy_kl_anchor_component_indices", tuple())
-    if bool(getattr(data, "policy_kl_anchor_scope_authenticated", False)):
-        component_indices = data.component_indices_for_rows(batch)
-        eligible = torch.as_tensor(
-            np.isin(component_indices, np.asarray(eligible_components, dtype=np.int64)),
-            dtype=torch.bool,
-            device=device,
-        )
+    scope_mask = _policy_kl_anchor_scope_mask(data, batch)
+    if scope_mask is not None:
+        eligible = torch.as_tensor(scope_mask, dtype=torch.bool, device=device)
         weights = weights * eligible.to(torch.float32)
     if float(weights.sum().item()) <= 0.0:
         return None
@@ -13628,6 +13634,44 @@ def _policy_kl_anchor_loss_parts(
         raise ValueError(f"unknown policy KL anchor direction {direction!r}")
     weighted_sum, denominator = _weighted_loss_parts(values, weights)
     return _weighted_mean_loss(values, weights), weighted_sum, denominator
+
+
+def _policy_kl_anchor_scope_mask(
+    data: object,
+    batch: np.ndarray,
+) -> np.ndarray | None:
+    """Resolve the authenticated anchor-component mask for one batch.
+
+    The private materialized column is produced only by
+    :func:`_iterate_training_batches`; ordinary dictionaries retain the legacy
+    unscoped behavior. Returning ``None`` therefore means "no authenticated
+    scope", while an all-false array faithfully represents an authenticated
+    scope with no eligible rows in this particular batch.
+    """
+
+    if isinstance(data, dict) and "_policy_kl_anchor_eligible" in data:
+        eligible = np.asarray(
+            data["_policy_kl_anchor_eligible"][batch], dtype=np.bool_
+        )
+        if eligible.shape != (len(batch),):
+            raise ValueError("materialized policy-KL anchor scope shape drift")
+        return eligible
+
+    if not bool(getattr(data, "policy_kl_anchor_scope_authenticated", False)):
+        return None
+    component_lookup = getattr(data, "component_indices_for_rows", None)
+    if not callable(component_lookup):
+        raise ValueError(
+            "authenticated policy-KL anchor scope has no component row lookup"
+        )
+    component_indices = np.asarray(component_lookup(batch), dtype=np.int64)
+    if component_indices.shape != (len(batch),):
+        raise ValueError("authenticated policy-KL anchor component shape drift")
+    eligible_components = np.asarray(
+        getattr(data, "policy_kl_anchor_component_indices", tuple()),
+        dtype=np.int64,
+    )
+    return np.isin(component_indices, eligible_components)
 
 
 def _weighted_mean_loss(values, weights, *, mask=None):
