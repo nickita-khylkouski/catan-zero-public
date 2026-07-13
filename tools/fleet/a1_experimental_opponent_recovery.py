@@ -6,6 +6,10 @@ It consumes the immutable r1 locks/renders and failure receipts read-only,
 selects only recent-history and hard-negative jobs, and relocates their outputs
 into a fresh experimental namespace while retaining the original unused seed
 ranges, claim labels, quotas, opponents, and search science.
+
+The recovery plan has 56 immutable lanes bound to the historical ten-host
+``catan-h100-exact56-v1`` authority. It intentionally rejects the canonical
+exact-64 v2 fleet; widening this one-off recovery would change its sealed plan.
 """
 
 from __future__ import annotations
@@ -621,7 +625,9 @@ def _fleet(path: Path) -> dict[str, Any]:
     if value.get("schema_version") != "catan-gpu-fleet-v1" or not isinstance(
         hosts, list
     ):
-        raise RecoveryError("unsupported fleet manifest")
+        raise RecoveryError(
+            "recovery requires the catan-gpu-fleet-v1 exact56 legacy authority"
+        )
     result = {str(host["alias"]): str(host["address"]) for host in hosts}
     if len(result) != 10:
         raise RecoveryError("recovery requires the canonical ten-host fleet")

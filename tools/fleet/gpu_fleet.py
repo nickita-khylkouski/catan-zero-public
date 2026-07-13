@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Daemonless, fail-closed scheduler for the canonical 56-H100 fleet."""
+"""Daemonless, fail-closed scheduler for the canonical exact-64 H100 fleet.
+
+The historical v1 manifest remains readable only as the immutable exact-56
+authority that produced the issued A1 campaign. New manifests use v2 and must
+declare the exact-64 authority explicitly; topology is never inferred from a
+filename or accepted as an arbitrary superset.
+"""
 
 from __future__ import annotations
 
@@ -17,11 +23,14 @@ import sys
 from typing import Any, Callable, Iterable, Sequence
 
 
-MANIFEST_SCHEMA = "catan-gpu-fleet-v1"
+LEGACY_MANIFEST_SCHEMA = "catan-gpu-fleet-v1"
+MANIFEST_SCHEMA = "catan-gpu-fleet-v2"
+LEGACY_FLEET_AUTHORITY = "catan-h100-exact56-v1"
+FLEET_AUTHORITY = "catan-h100-exact64-v1"
 JOBSET_SCHEMA = "catan-gpu-jobset-v1"
 PLAN_SCHEMA = "catan-gpu-plan-v1"
 RECEIPT_SCHEMA = "catan-gpu-job-receipt-v1"
-EXPECTED_HOSTS = {
+LEGACY_EXPECTED_HOSTS = {
     "c1": ("192.222.54.251", 4),
     "c2": ("68.209.75.117", 4),
     "c3": ("192.222.53.18", 4),
@@ -32,6 +41,23 @@ EXPECTED_HOSTS = {
     "h100-8b": ("192.222.55.216", 8),
     "h100-8c": ("192.222.54.141", 8),
     "h100-8d": ("209.20.158.82", 8),
+}
+EXPECTED_HOSTS = {
+    "c1": ("192.222.54.251", 4),
+    "c2": ("68.209.75.117", 4),
+    "c3": ("192.222.53.18", 4),
+    "c4": ("68.209.73.252", 4),
+    "c5": ("68.209.74.145", 4),
+    "c6": ("68.209.74.2", 4),
+    "c7": ("68.209.74.24", 4),
+    "c8": ("68.209.72.159", 4),
+    "h100-8a": ("192.222.53.119", 8),
+    "h100-8b": ("192.222.55.216", 8),
+    "h100-8c": ("192.222.54.141", 8),
+    "h100-8d": ("209.20.158.82", 8),
+}
+LEGACY_EXPECTED_SHAPES = {
+    alias: shape[1] for alias, shape in LEGACY_EXPECTED_HOSTS.items()
 }
 EXPECTED_SHAPES = {alias: shape[1] for alias, shape in EXPECTED_HOSTS.items()}
 EXPECTED_ACCELERATOR = "NVIDIA H100 80GB HBM3"
@@ -64,7 +90,20 @@ def _read(path: Path) -> dict[str, Any]:
 
 def load_manifest(path: Path) -> dict[str, Any]:
     value = _read(path)
-    if value.get("schema_version") != MANIFEST_SCHEMA:
+    schema = value.get("schema_version")
+    if schema == LEGACY_MANIFEST_SCHEMA:
+        if "fleet_authority" in value:
+            raise FleetError("legacy v1 manifest must not declare fleet_authority")
+        authority = LEGACY_FLEET_AUTHORITY
+        expected_hosts = LEGACY_EXPECTED_HOSTS
+    elif schema == MANIFEST_SCHEMA:
+        authority = str(value.get("fleet_authority", ""))
+        if authority != FLEET_AUTHORITY:
+            raise FleetError(
+                f"v2 fleet_authority must be exactly {FLEET_AUTHORITY!r}"
+            )
+        expected_hosts = EXPECTED_HOSTS
+    else:
         raise FleetError("unsupported fleet manifest schema")
     for field in ("ssh_user", "remote_repo", "remote_root", "hosts"):
         if field not in value:
@@ -120,10 +159,10 @@ def load_manifest(path: Path) -> dict[str, Any]:
         seen.add(alias)
         seen_addresses.add(address)
     actual = {host["alias"]: (host["address"], host["gpu_count"]) for host in hosts}
-    if actual != EXPECTED_HOSTS:
+    if actual != expected_hosts:
         raise FleetError(
-            "canonical fleet alias/address/GPU mapping drift: "
-            f"expected {EXPECTED_HOSTS}, got {actual}"
+            f"{authority} alias/address/GPU mapping drift: "
+            f"expected {expected_hosts}, got {actual}"
         )
     # Manifest order is allocation policy; do not sort it.
     value["hosts"] = hosts
@@ -131,6 +170,18 @@ def load_manifest(path: Path) -> dict[str, Any]:
         {key: item for key, item in value.items() if key != "manifest_hash"}
     )
     return value
+
+
+def fleet_authority(manifest: dict[str, Any]) -> str:
+    """Return the already-validated authority without mutating manifest hashes."""
+    if manifest.get("schema_version") == LEGACY_MANIFEST_SCHEMA:
+        return LEGACY_FLEET_AUTHORITY
+    if (
+        manifest.get("schema_version") == MANIFEST_SCHEMA
+        and manifest.get("fleet_authority") == FLEET_AUTHORITY
+    ):
+        return FLEET_AUTHORITY
+    raise FleetError("manifest has not been validated against a known fleet authority")
 
 
 def _normalize_jobset(value: dict[str, Any]) -> dict[str, Any]:
@@ -369,6 +420,7 @@ printf 'repo_commit='; git -C "$HOME_REPO" rev-parse HEAD 2>/dev/null || echo mi
 
     hosts = sorted(_parallel(manifest["hosts"], inspect), key=lambda row: row["alias"])
     return {
+        "fleet_authority": fleet_authority(manifest),
         "manifest_hash": manifest["manifest_hash"],
         "valid": all(host["valid"] for host in hosts),
         "gpu_capacity": sum(host["expected_gpus"] for host in hosts),

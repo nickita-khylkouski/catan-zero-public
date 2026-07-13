@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Build the immutable 20+20 GPU jobset for the A1 neutral-panel rerun."""
+"""Build the immutable 20+20 GPU jobset for the A1 neutral-panel rerun.
+
+This is a frozen historical artifact, not an input to the canonical generic
+fleet scheduler. Its eight-host snapshot predates both exact-56 and exact-64;
+using a distinct schema prevents it from impersonating either fleet authority.
+"""
 
 from __future__ import annotations
 
@@ -11,6 +16,7 @@ from typing import Any
 
 
 SCHEMA = "catan-gpu-jobset-v1"
+HISTORICAL_MANIFEST_SCHEMA = "a1-neutral-panel-fleet-snapshot-v1"
 RUN_ID = "a1-neutral-python-panel-n128-20260710-v2"
 REPO = "/home/ubuntu/catan-zero-v1"
 REMOTE_ROOT = "/home/ubuntu/catan-fleet-jobs"
@@ -49,7 +55,7 @@ def _write_new(path: Path, value: Any) -> None:
 
 def manifest(*, ssh_key: str) -> dict[str, Any]:
     return {
-        "schema_version": "catan-gpu-fleet-v1",
+        "schema_version": HISTORICAL_MANIFEST_SCHEMA,
         "ssh_user": "ubuntu",
         "ssh_key": ssh_key,
         "strict_host_key_checking": "accept-new",

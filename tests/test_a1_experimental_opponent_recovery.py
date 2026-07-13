@@ -398,6 +398,20 @@ def test_launch_without_go_is_read_only(tmp_path: Path) -> None:
     assert not (tmp_path / "recovery").exists()
 
 
+def test_recovery_rejects_canonical_exact64_manifest(tmp_path: Path) -> None:
+    fleet = tmp_path / "fleet-v2.json"
+    _json(
+        fleet,
+        {
+            "schema_version": "catan-gpu-fleet-v2",
+            "fleet_authority": "catan-h100-exact64-v1",
+            "hosts": [],
+        },
+    )
+    with pytest.raises(recovery.RecoveryError, match="exact56 legacy authority"):
+        recovery._fleet(fleet)  # noqa: SLF001
+
+
 def test_atomic_plan_refuses_different_existing_bytes(tmp_path: Path) -> None:
     path = tmp_path / "value.json"
     recovery._atomic_exact(path, {"a": 1})  # noqa: SLF001
