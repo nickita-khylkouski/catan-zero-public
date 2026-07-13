@@ -585,10 +585,16 @@ def _training_report(verified: dict, checkpoint: Path) -> dict:
         "epochs": 1,
         "max_steps": 0,
         "batch_size": recipe["batch_size"],
+        "grad_accum_steps": recipe["grad_accum_steps"],
+        "effective_global_batch_size": recipe["global_batch_size"],
+        "ddp_shard_data": False,
         "amp": recipe["amp"],
         "lr": recipe["lr"],
         "weight_decay": recipe["weight_decay"],
         "seed": recipe["seed"],
+        "training_rng_rank_offset": bool(
+            recipe.get("training_rng_rank_offset", False)
+        ),
         "mask_hidden_info": True,
         "symmetry_augment": False,
         "data": str(verified["data_path"]),
@@ -608,6 +614,19 @@ def _training_report(verified: dict, checkpoint: Path) -> dict:
             "validation_file_sha256"
         ],
         "validation_game_seed_set_sha256": verified["validation_game_seed_set_sha256"],
+        "forced_action_weight": float(recipe["forced_action_weight"]),
+        "forced_row_value_weight": float(recipe["forced_row_value_weight"]),
+        "per_game_policy_weight": bool(
+            recipe.get("per_game_policy_weight", False)
+        ),
+        "per_game_policy_weight_mode": str(
+            recipe.get("per_game_policy_weight_mode", "equal")
+        ),
+        "per_game_value_weight": bool(recipe["per_game_value_weight"]),
+        "value_loss_weight": float(recipe["value_loss_weight"]),
+        "truncated_vp_margin_value_weight": float(
+            recipe["truncated_vp_margin_value_weight"]
+        ),
         "steps_completed": 1,
         "total_training_steps": 1,
         "require_35m_model": True,
