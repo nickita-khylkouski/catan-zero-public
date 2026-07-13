@@ -41,3 +41,9 @@ Version `0.1.7` adds `initial_road_d1_scope`. Python attests the authoritative
 public root prompt once, the binding carries that immutable prompt into native
 search, and Rust applies D1 only at the `BUILD_INITIAL_ROAD` decision root.
 Interior nodes and every other phase retain the historical min-max operator.
+
+Version `0.1.8` adds `public_award_feature_parity`. Both the Python snapshot
+adapter and the direct Rust entity featurizer now preserve authoritative,
+public longest-road ownership in player-token slot 12, including for masked
+opponents. Callers requesting the Rust feature path fail closed on older wheels
+whose native featurizer silently emitted zero for that public award.

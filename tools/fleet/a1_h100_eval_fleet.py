@@ -77,15 +77,16 @@ FULL_EXPECTED_SHAPES = {
 }
 CANARY_ALIASES = {"c1", "h100-8a"}
 DEFAULT_WORKERS_PER_GPU = 16
-NATIVE_WHEEL_VERSION = "0.1.7"
+NATIVE_WHEEL_VERSION = "0.1.8"
 NATIVE_WHEEL_NAME = (
-    "catanatron_rs-0.1.7-cp311-cp311-manylinux_2_34_x86_64.whl"
+    "catanatron_rs-0.1.8-cp311-cp311-manylinux_2_34_x86_64.whl"
 )
 NATIVE_REQUIRED_CAPABILITIES = frozenset(
     {
         "sigma_reference_visits",
         "belief_target_evidence",
         "initial_road_d1_scope",
+        "public_award_feature_parity",
     }
 )
 SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")

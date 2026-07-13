@@ -15,7 +15,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 BUILDER = REPO_ROOT / "tools" / "build_catanatron_rs_wheel.sh"
 CHECKSUM_INVENTORY = "native/catanatron-rs/WHEEL_SHA256SUMS"
-RECEIPT_NAME = "catanatron_rs-0.1.7-build-receipt.json"
+RECEIPT_NAME = "catanatron_rs-0.1.8-build-receipt.json"
 RECEIPT_SCHEMA = "catanatron-rs-wheel-build-receipt-v2"
 
 
@@ -89,8 +89,8 @@ def test_all_cargo_resolution_is_locked() -> None:
     assert "native/gumbel_mcts_rs/Cargo.lock" in _script()
 
 
-def test_native_mcts_wheel_has_one_unique_017_package_identity() -> None:
-    expected = "0.1.7"
+def test_native_mcts_wheel_has_one_unique_018_package_identity() -> None:
+    expected = "0.1.8"
     manifests = (
         REPO_ROOT / "native/catanatron-rs/Cargo.toml",
         REPO_ROOT / "native/catanatron-rs/python/Cargo.toml",
@@ -102,8 +102,8 @@ def test_native_mcts_wheel_has_one_unique_017_package_identity() -> None:
         assert match.group(1) == expected
 
     script = _script()
-    assert "catanatron_rs-0.1.7-cp311-cp311-manylinux_2_34_x86_64.whl" in script
-    assert "catanatron_rs-0.1.7-build-receipt.json" in script
+    assert "catanatron_rs-0.1.8-cp311-cp311-manylinux_2_34_x86_64.whl" in script
+    assert "catanatron_rs-0.1.8-build-receipt.json" in script
     assert "catanatron_rs-0.1.4-cp311" not in script
 
 
@@ -111,7 +111,7 @@ def test_release_environment_and_toolchain_are_sealed() -> None:
     script = _script()
 
     assert "env -i" in script
-    assert "1783987200" in script
+    assert "1784073600" in script
     assert "--remap-path-prefix=" in script
     assert "-C link-arg=-Wl,--build-id=none" in script
     assert re.search(r"CARGO_BUILD_JOBS=(?:['\"]?1['\"]?)", script)
@@ -139,7 +139,7 @@ def test_source_identity_is_bound_only_after_compilation() -> None:
     assert 'CATAN_RS_SOURCE_TREE="$SEALED_COMPILE_IDENTITY"' in staged_environment
     assert 'CATAN_RS_SOURCE_COMMIT="$SOURCE_COMMIT"' not in staged_environment
     assert 'CATAN_RS_SOURCE_TREE="$SOURCE_TREE"' not in staged_environment
-    assert 'SEALED_COMPILE_IDENTITY="catanatron-rs-0.1.7-initial-road-d1-wheel-v1"' in script
+    assert 'SEALED_COMPILE_IDENTITY="catanatron-rs-0.1.8-public-award-parity-wheel-v1"' in script
     assert 'payload["source_commit"] = sys.argv[2]' in script
     assert 'payload["source_tree"] = sys.argv[3]' in script
     assert '"source_commit": None' in script
@@ -184,8 +184,9 @@ def test_builder_smokes_the_compiled_capability_contract_before_hashing() -> Non
     digest = script.index('WHEEL_SHA256="$(sha256sum "$WHEEL_PATH"')
 
     assert smoke < digest
-    assert 'version("catanatron-rs") == "0.1.7"' in script
+    assert 'version("catanatron-rs") == "0.1.8"' in script
     assert "gumbel_search_capabilities" in script
     assert "sigma_reference_visits" in script
     assert "belief_target_evidence" in script
     assert "initial_road_d1_scope" in script
+    assert "public_award_feature_parity" in script
