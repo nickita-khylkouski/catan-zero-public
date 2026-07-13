@@ -18,6 +18,7 @@ def test_matrix_reuses_legacy_evidence_and_adds_conditional_anchor() -> None:
         "TEMP_CONTROL",
         "CURRENT_POLICY_SCOPE",
         "CURRENT_VALUE_SCOPE",
+        "L1_VALUE_OFF",
         "L1_PURE_SEARCH_TARGET",
         "L1_POLICY_AUX",
         "L1_REPLAY_ANCHOR",
@@ -53,9 +54,16 @@ def test_matrix_reuses_legacy_evidence_and_adds_conditional_anchor() -> None:
 def test_policy_dose_and_gather_arms_are_single_sequential_deltas() -> None:
     plan = build_plan()
     fixed = plan["fixed_recipe"]
-    control, policy_scope, value_scope, pure_target, aux, anchor, gather = plan[
-        "arms"
-    ][1:]
+    (
+        control,
+        policy_scope,
+        value_scope,
+        value_off,
+        pure_target,
+        aux,
+        anchor,
+        gather,
+    ) = plan["arms"][1:]
     assert control["recipe_delta"]["policy_aux_active_batch_size"] == 0
     assert policy_scope["recipe_delta"]["policy_distillation_component_ids"] == [
         "n128_current",
@@ -67,6 +75,10 @@ def test_policy_dose_and_gather_arms_are_single_sequential_deltas() -> None:
         "n256_current",
     ]
     assert "policy_distillation_component_ids" not in value_scope["recipe_delta"]
+    assert value_scope["executor"].endswith("--axis CURRENT_VALUE_SCOPE")
+    assert value_off["recipe_delta"] == {"value_loss_weight": 0.0}
+    assert value_off["executor"].endswith("--axis VALUE_LOSS_OFF")
+    assert value_off["reference_arm"] == "TEMP_CONTROL"
     assert pure_target["recipe_delta"]["soft_target_weight"] == 1.0
     assert aux["recipe_delta"]["policy_aux_active_batch_size"] == 128
     assert anchor["recipe_delta"]["policy_aux_active_batch_size"] == 0
@@ -122,6 +134,10 @@ def test_matrix_is_sequential_and_non_launching() -> None:
         for row in plan["gpu_schedule"]
     )
     assert any(
+        "L1_VALUE_OFF" in row and "never bundle" in row
+        for row in plan["gpu_schedule"]
+    )
+    assert any(
         "do not launch it again" in row for row in plan["gpu_schedule"]
     )
     assert any(
@@ -134,6 +150,19 @@ def test_matrix_is_sequential_and_non_launching() -> None:
     scope = plan["replay_scope_adjudication"]
     assert scope["baseline"] == "TEMP_CONTROL"
     assert "do not create a both-current scope" in scope["interaction_rule"]
+    assert plan["sealed_diagnostic_executors"] == {
+        "CURRENT_VALUE_SCOPE": (
+            "tools/a1_selected_dose_value_axis_arm.py prepare "
+            "--axis CURRENT_VALUE_SCOPE"
+        ),
+        "L1_VALUE_OFF": (
+            "tools/a1_selected_dose_value_axis_arm.py prepare "
+            "--axis VALUE_LOSS_OFF"
+        ),
+    }
+    assert plan["diagnostic_completion_finalizer"].endswith(
+        "finalize --manifest"
+    )
 
 
 def test_matched_behavior_selects_short_pareto_dose() -> None:
@@ -187,7 +216,7 @@ def test_matched_behavior_selects_short_pareto_dose() -> None:
 
 def test_evaluation_types_randomized_primary_and_tournament_bridge() -> None:
     plan = build_plan()
-    assert plan["schema_version"] == "a1-post-p1-optimization-architecture-plan-v5"
+    assert plan["schema_version"] == "a1-post-p1-optimization-architecture-plan-v6"
     assert plan["evaluation"]["matched_search_operator"] == {
         "candidate_c_scale": 0.10,
         "baseline_c_scale": 0.10,

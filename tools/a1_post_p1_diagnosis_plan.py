@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 
-SCHEMA = "a1-post-p1-optimization-architecture-plan-v5"
+SCHEMA = "a1-post-p1-optimization-architecture-plan-v6"
 SHORT_SAMPLE_DOSE = 524_288
 FULL_SAMPLE_DOSE = 4_194_304
 # The matched common-random-number behavior screen selected the short dose.
@@ -218,6 +218,10 @@ def build_plan(
             "arm_id": "CURRENT_VALUE_SCOPE",
             "training": "new matched B200 run after TEMP_CONTROL",
             "reference_arm": "TEMP_CONTROL",
+            "executor": (
+                "tools/a1_selected_dose_value_axis_arm.py prepare "
+                "--axis CURRENT_VALUE_SCOPE"
+            ),
             "recipe_delta": {
                 "value_training_component_ids": [
                     "n128_current",
@@ -227,6 +231,23 @@ def build_plan(
             "purpose": (
                 "test only removal of old-policy Monte-Carlo outcomes; retain the "
                 "exact TEMP policy-distillation scope"
+            ),
+        },
+        {
+            "arm_id": "L1_VALUE_OFF",
+            "training": (
+                "conditional matched B200 run after CURRENT_VALUE_SCOPE adjudication"
+            ),
+            "reference_arm": "TEMP_CONTROL",
+            "executor": (
+                "tools/a1_selected_dose_value_axis_arm.py prepare "
+                "--axis VALUE_LOSS_OFF"
+            ),
+            "recipe_delta": {"value_loss_weight": 0.0},
+            "purpose": (
+                "localize whether the smaller near-orthogonal value gradient keeps "
+                "moving the shared trunk after policy-target closure; retain exact "
+                "TEMP data, policy, replay scopes, and selected dose"
             ),
         },
         {
@@ -498,6 +519,11 @@ def build_plan(
             "CURRENT_VALUE_SCOPE improves over TEMP_CONTROL: old-policy continuation "
             "outcomes were causal"
         ),
+        "value_gradient_localization": (
+            "L1_VALUE_OFF improves over TEMP_CONTROL after CURRENT_VALUE_SCOPE fails: "
+            "the value objective itself, rather than replay outcome scope alone, "
+            "caused continuing shared-trunk drift"
+        ),
         "active_policy_dose": (
             "completed L1_POLICY_AUX scored 596-604/1200 (49.67%): additional "
             "policy-active exposure did not demonstrate improvement and is pruned"
@@ -555,6 +581,10 @@ def build_plan(
             "run exact TEMP_CONTROL on all 8 B200s at the selected dose",
             "run CURRENT_POLICY_SCOPE and CURRENT_VALUE_SCOPE sequentially against TEMP_CONTROL",
             "select one replay scope; never combine two unsupported scope changes",
+            (
+                "run L1_VALUE_OFF only as a separate TEMP_CONTROL-relative localization "
+                "arm; never bundle it with CURRENT_VALUE_SCOPE"
+            ),
             "run L1_PURE_SEARCH_TARGET after scope selection releases DDP",
             "reuse completed L1_POLICY_AUX negative evidence; do not launch it again",
             (
@@ -568,6 +598,19 @@ def build_plan(
             "evaluate arms in parallel on the H100 fleet; do not consume B200s",
         ],
         "fixed_recipe": fixed,
+        "sealed_diagnostic_executors": {
+            "CURRENT_VALUE_SCOPE": (
+                "tools/a1_selected_dose_value_axis_arm.py prepare "
+                "--axis CURRENT_VALUE_SCOPE"
+            ),
+            "L1_VALUE_OFF": (
+                "tools/a1_selected_dose_value_axis_arm.py prepare "
+                "--axis VALUE_LOSS_OFF"
+            ),
+        },
+        "diagnostic_completion_finalizer": (
+            "tools/a1_selected_dose_diagnostic_completion.py finalize --manifest"
+        ),
         "dose_adjudication": dose_adjudication,
         "replay_scope_adjudication": replay_scope_adjudication,
         "historical_feature_audit": {
