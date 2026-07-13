@@ -16,6 +16,9 @@ from catan_zero.search.native_gumbel_mcts import NativeGumbelChanceMCTS
 
 
 def test_gameplay_temperature_scaling_is_identity_noop_at_one_and_preserves_zeros() -> None:
+    # Shared Python/Rust golden contract (the Rust unit test uses the same
+    # support and exact fractions): legal support never changes and a legal
+    # zero-probability action remains zero.
     policy = {3: 0.8, 7: 0.2, 11: 0.0}
 
     assert _temperature_scale_policy(policy, 1.0) is policy
@@ -25,6 +28,9 @@ def test_gameplay_temperature_scaling_is_identity_noop_at_one_and_preserves_zero
     assert _temperature_scale_policy(policy, 2.0) == pytest.approx(
         {3: 2.0 / 3.0, 7: 1.0 / 3.0, 11: 0.0}
     )
+
+    # A forced legal move is invariant at every positive temperature.
+    assert _temperature_scale_policy({29: 1.0}, 0.3) == {29: 1.0}
 
 
 @pytest.mark.parametrize("temperature", [0.0, -0.1, float("nan"), float("inf")])

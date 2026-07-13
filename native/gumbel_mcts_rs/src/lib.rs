@@ -1591,6 +1591,9 @@ mod tests {
         close(soft[1].1, 1.0 / 3.0);
         close(soft[2].1, 0.0);
 
+        let forced = vec![(29, 1.0)];
+        assert_eq!(temperature_scale_policy(&forced, 0.3).unwrap(), forced);
+
         assert!(temperature_scale_policy(&policy, 0.0).is_err());
         assert!(temperature_scale_policy(&policy, f64::NAN).is_err());
 
@@ -1602,6 +1605,33 @@ mod tests {
             let zero_mass = vec![(3, 0.0), (7, 0.0)];
             assert!(temperature_scale_policy(&zero_mass, temperature).is_err());
         }
+    }
+
+    #[test]
+    fn gameplay_temperature_never_tempers_the_native_training_target() {
+        let game = opening(3);
+        let base = SearchConfig {
+            temperature: 0.0,
+            n_full: 8,
+            n_fast: 8,
+            p_full: 1.0,
+            max_depth: 3,
+            seed: 19,
+            ..Default::default()
+        };
+        let deterministic = GumbelMctsEngine::new(base.clone())
+            .search(&game, &mut CountingEvaluator::default(), Some(true))
+            .unwrap();
+        let sampled = GumbelMctsEngine::new(SearchConfig {
+            temperature: 0.3,
+            ..base
+        })
+        .search(&game, &mut CountingEvaluator::default(), Some(true))
+        .unwrap();
+
+        assert_eq!(sampled.improved_policy, deterministic.improved_policy);
+        assert_eq!(sampled.visit_counts, deterministic.visit_counts);
+        assert_eq!(sampled.completed_q_values, deterministic.completed_q_values);
     }
 
     #[test]
