@@ -24,6 +24,20 @@ The working recipe is therefore an **independent f7-started, fresh-Adam,
 one-dose TEMP learner**, not a chained curriculum. Architecture changes remain
 diagnostic arms until they beat this corrected baseline under the same operator.
 
+A fresh 64-H100 frontier comparison now strengthens that causal conclusion.
+The independently f7-started n256 arm (`lr=1.2e-4`, fresh Adam, 2,962 steps /
+12.13M row draws) beat the authoritative v5 TEMP checkpoint `640-560` over 600
+fresh paired seeds / 1,200 games at the identical deployed n128+D6,
+`c_scale=0.10`, tanh search operator.  Pair outcomes were
+`WW/split/LL=152/336/112`, with zero errors and zero truncations.  Both the
+ordinary and pentanomial `[-10,+15]` SPRTs selected H1; strict `[0,+15]`
+superiority remained just short of its boundary and therefore correctly stayed
+`continue`.  Search seconds per call were matched to 0.1%.  This historical
+comparison is not promotion-eligible because the candidate parent is f7 rather
+than v5, but it proves that the bounded independent n256 learner retained real
+strength even against the newer incumbent.  A predeclared fresh-cohort
+replication is running before any frontier selection.
+
 ## Causal reconstruction of the failed lineage
 
 ```text
@@ -68,10 +82,11 @@ from 4.226 to 5.526 against a clamp of 50, and no fixed-sample output reached
 `abs(tanh(value)) >= 0.95`. Architecture mismatch, policy-logit saturation, and
 value-head explosion are therefore ruled out for this failure.
 
-The independent n256 `lr=1.2e-4` arm did contain real signal: it beat f7
-360–240/600 under the matched `c_scale=0.10` operator. That result rules out the
-blanket claim that n256 data is harmful. The larger chained doses are what are
-unsupported.
+The independent n256 `lr=1.2e-4` arm did contain real signal: it first beat f7
+360–240/600 under the matched `c_scale=0.10` operator, then beat authoritative
+v5 `640-560/1200` under the same deployed operator on fresh seeds. These results
+rule out the blanket claim that n256 data is harmful. The larger chained doses
+are what are unsupported.
 
 ## What each stored row actually teaches
 
