@@ -130,7 +130,7 @@ def test_composite_without_any_validation_authority_fails_closed() -> None:
         )
 
 
-def test_non_dry_train_window_builds_authenticated_production_composite(
+def test_non_dry_train_window_delegates_canonical_composite_construction(
     tmp_path, monkeypatch
 ) -> None:
     loop_dir = tmp_path / "loop"
@@ -333,77 +333,6 @@ def test_non_dry_train_window_builds_authenticated_production_composite(
     assert result["ok"] is False
     assert "canonical authenticated composite required" in result["note"]
     assert all(command[1] != "tools/train_bc.py" for command in commands)
-    return
-
-    assert result["ok"] is True
-    descriptor = Path(result["memmap_composite"])
-    payload = json.loads(descriptor.read_text())
-    assert payload["diagnostic_only"] is False
-    assert payload["promotion_eligible"] is True
-    assert payload["flywheel_replay_contract"]["minimum_replay_ratio"] == 0.2
-    assert payload["flywheel_replay_contract"][
-        "effective_component_sampling_ratios"
-    ] == {
-        "current_producer": 0.64,
-        "recent_history": 0.12,
-        "hard_negative": 0.04,
-        "historical_replay": 0.2,
-    }
-    assert payload["learner_recipe_overrides"] == {
-        "forced_action_weight": 0.0,
-        "forced_row_value_weight": 1.0,
-        "loser_sample_weight": 1.0,
-        "lr": 3e-5,
-        "per_game_policy_weight": True,
-        "per_game_policy_weight_mode": "equal",
-        "per_game_value_weight": False,
-        "per_game_value_weight_mode": "equal",
-        "policy_kl_anchor_direction": "forward",
-        "policy_kl_anchor_weight": 0.0,
-        "policy_loss_weight": 1.0,
-        "q_loss_weight": 0.0,
-        "soft_target_source": "policy",
-        "soft_target_temperature": 0.7,
-        "soft_target_weight": 0.9,
-        "truncated_vp_margin_value_weight": 0.25,
-        "value_target_lambda": 1.0,
-    }
-    train_command = commands[-1]
-    assert train_command[train_command.index("--data") + 1] == str(descriptor)
-    assert "--validation-max-samples" in train_command
-    assert "--no-resume-optimizer" in train_command
-    assert int(train_command[train_command.index("--epochs") + 1]) >= result["steps"]
-    assert result["training_receipt"]["steps_completed"] == result["steps"]
-
-    report_path = loop_dir / "corpus" / "round_006" / "report.json"
-    report_payload = json.loads(report_path.read_text())
-    report_payload["steps_completed"] = result["steps"] - 1
-    report_path.write_text(json.dumps(report_payload), encoding="utf-8")
-    with pytest.raises(RuntimeError, match="steps_completed"):
-        flywheel._verify_flywheel_training_report(
-            report_path,
-            checkpoint_path=loop_dir / "corpus" / "round_006" / "candidate.pt",
-            descriptor_path=descriptor,
-            initializer_path=current_checkpoint.resolve(),
-            initializer_sha256=flywheel._file_sha256(current_checkpoint),
-            replay_contract=result["replay_contract"],
-            expected_steps=result["steps"],
-        )
-
-    tampered = json.loads(json.dumps(payload))
-    tampered_receipt = tampered["flywheel_replay_contract"]["sampling_receipt"]
-    tampered_receipt["aggregate"]["policy_active_row_count"] -= 1
-    tampered["flywheel_replay_contract"][
-        "sampling_receipt_sha256"
-    ] = train_bc._contract_sha256(tampered_receipt)
-    descriptor.write_text(json.dumps(tampered), encoding="utf-8")
-    with pytest.raises(SystemExit, match="sampling receipt drift"):
-        train_bc._preflight_memmap_composite_descriptor(descriptor)
-
-    payload["flywheel_replay_contract"]["minimum_replay_ratio"] = 0.25
-    descriptor.write_text(json.dumps(payload), encoding="utf-8")
-    with pytest.raises(SystemExit, match="below its bound minimum"):
-        train_bc._preflight_memmap_composite_descriptor(descriptor)
 
 
 def test_replay_guard_rejects_two_shards_from_same_generation(tmp_path) -> None:
