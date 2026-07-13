@@ -324,6 +324,9 @@ def run_probe(
             value_target_lambda=float(_required(report, "value_target_lambda")),
             value_root_blend_phases=tuple(str(item) for item in root_blend_phases),
             value_root_blend_global_compat=root_blend_mode == "global_compat",
+            scalar_value_loss_transform=str(
+                report.get("scalar_value_loss_transform", "raw")
+            ),
             # Loader parallelism is an execution choice, not part of the
             # population objective.  Use the report value when newer reports
             # carry it, otherwise the synchronous path reconstructs identical

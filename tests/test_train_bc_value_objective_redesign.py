@@ -13,6 +13,7 @@ from tools import train_bc
 from tools.train_bc import (
     _hl_gauss_value_targets,
     _resolve_value_objective_weights,
+    _scalar_value_loss_prediction,
     _train_xdim_batch,
     _value_training_metadata,
     _weighted_mean_loss,
@@ -153,6 +154,30 @@ def test_scalar_aux_round_trips_and_changes_typed_config_hash() -> None:
     assert hybrid.config_hash() != baseline.config_hash()
 
 
+def test_scalar_value_loss_transform_round_trips_and_changes_typed_config_hash() -> None:
+    baseline = TrainConfig()
+    matched = TrainConfig(scalar_value_loss_transform="deployed_tanh")
+
+    rebuilt = config_from_payload(json.loads(matched.canonical_json()))
+
+    assert rebuilt == matched
+    assert rebuilt.scalar_value_loss_transform == "deployed_tanh"
+    assert matched.config_hash() != baseline.config_hash()
+
+
+def test_scalar_value_loss_prediction_matches_sealed_deployed_operator() -> None:
+    torch = pytest.importorskip("torch")
+    raw = torch.tensor([-2.0, -0.5, 0.0, 0.5, 2.0], requires_grad=True)
+
+    historical = _scalar_value_loss_prediction(raw, "raw")
+    deployed = _scalar_value_loss_prediction(raw, "deployed_tanh")
+
+    assert historical is raw
+    torch.testing.assert_close(deployed, torch.tanh(raw))
+    with pytest.raises(ValueError, match="unknown scalar value loss transform"):
+        _scalar_value_loss_prediction(raw, "invented")
+
+
 def test_value_training_metadata_marks_only_optimized_readouts() -> None:
     mse = _value_training_metadata(
         _args("mse"),
@@ -177,6 +202,8 @@ def test_value_training_metadata_marks_only_optimized_readouts() -> None:
 
     assert mse["primary_readout"] == "scalar"
     assert mse["trained_value_readouts"] == ["scalar"]
+    assert mse["scalar_value_loss_transform"] == "raw"
+    assert mse["scalar_value_loss_formula"] == "mse(raw_value, target)"
     assert hl["primary_readout"] == "categorical"
     assert hl["trained_value_readouts"] == ["categorical"]
     assert hl["hlgauss_bins"] == 33
@@ -235,6 +262,7 @@ def test_report_records_requested_and_resolved_value_objective_weights() -> None
     assert {
         "value_head_type",
         "value_loss_weight",
+        "scalar_value_loss_transform",
         "resolved_scalar_value_loss_weight",
         "value_categorical_loss_weight",
         "resolved_categorical_value_loss_weight",
@@ -303,6 +331,7 @@ def _evaluate(
     truncation_weight: float = 0.25,
     data_loader_workers: int = 0,
     data_loader_prefetch: int = 2,
+    scalar_value_loss_transform: str = "raw",
 ) -> dict:
     n = len(data["action_taken"])
     if value_weights is None:
@@ -336,6 +365,7 @@ def _evaluate(
         # These tests exercise the superseded corpus-global operator. Production
         # CLI runs now have to request it explicitly.
         value_root_blend_global_compat=(target_lambda != 1.0),
+        scalar_value_loss_transform=scalar_value_loss_transform,
         data_loader_workers=data_loader_workers,
         data_loader_prefetch=data_loader_prefetch,
     )
@@ -387,6 +417,34 @@ def test_xdim_validation_default_mse_objective_and_telemetry() -> None:
     assert metrics["loss"] == pytest.approx(0.25)
     assert metrics["component_reconstructed_loss"] == pytest.approx(metrics["loss"])
     assert policy.model.training is True  # validation restores the caller's mode
+
+
+def test_xdim_validation_can_match_the_deployed_scalar_tanh_operator() -> None:
+    torch = pytest.importorskip("torch")
+    policy, data = _validation_fixture()
+    with torch.no_grad():
+        policy.model.marker.fill_(0.8)
+
+    historical = _evaluate(
+        policy,
+        data,
+        scalar_weight=1.0,
+        categorical_weight=0.0,
+        scalar_value_loss_transform="raw",
+    )
+    matched = _evaluate(
+        policy,
+        data,
+        scalar_weight=1.0,
+        categorical_weight=0.0,
+        scalar_value_loss_transform="deployed_tanh",
+    )
+
+    # The fixture has balanced +/-1 outcomes. A constant prediction p therefore
+    # has mean squared error 1+p^2 under either transform.
+    assert historical["value_loss"] == pytest.approx(1.0 + 0.8**2)
+    assert matched["value_loss"] == pytest.approx(1.0 + np.tanh(0.8) ** 2)
+    assert matched["value_loss"] < historical["value_loss"]
 
 
 def test_xdim_validation_hlgauss_is_categorical_primary_not_double_weighted() -> None:

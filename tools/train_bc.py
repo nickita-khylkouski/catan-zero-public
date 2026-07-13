@@ -780,6 +780,17 @@ def build_parser() -> argparse.ArgumentParser:
     # value-loss-weight 0.10 was strictly better than 0.25 under multi-epoch reuse
     # (same policy loss, lower value overfit). RUN-6 adopts 0.10 as the default.
     parser.add_argument("--value-loss-weight", type=float, default=0.10)
+    parser.add_argument(
+        "--scalar-value-loss-transform",
+        choices=("raw", "deployed_tanh"),
+        default="raw",
+        help=(
+            "Scalar prediction used by value MSE. 'raw' preserves the historical "
+            "learner exactly. 'deployed_tanh' compares tanh(raw_value) with the "
+            "target, matching the sealed scalar/tanh/value_scale=1 MCTS operator. "
+            "This changes the training objective only; it does not change search."
+        ),
+    )
     parser.add_argument("--final-vp-loss-weight", type=float, default=0.05)
     parser.add_argument(
         "--q-loss-weight",
@@ -1580,6 +1591,27 @@ def _resolve_value_objective_weights(args) -> tuple[float, float]:
     raise SystemExit(f"unknown --value-head-type={mode!r}")
 
 
+def _scalar_value_loss_prediction(raw_value, transform: str):
+    """Return the scalar prediction that the configured learner fits.
+
+    The deployed A1 evaluator consumes ``tanh(raw_value * value_scale)`` with
+    a sealed ``value_scale=1``.  Historical training instead minimized MSE on
+    ``raw_value`` itself.  Keep that old trajectory as the exact default while
+    making the operator-matched prediction an explicit, testable one-axis arm.
+    ``Tensor.tanh`` avoids a module-level torch dependency in train_bc.
+    """
+
+    transform = str(transform)
+    if transform == "raw":
+        return raw_value
+    if transform == "deployed_tanh":
+        return raw_value.tanh()
+    raise ValueError(
+        "unknown scalar value loss transform "
+        f"{transform!r} (expected 'raw' or 'deployed_tanh')"
+    )
+
+
 def _value_training_metadata(
     args,
     *,
@@ -1621,6 +1653,15 @@ def _value_training_metadata(
         "primary_readout": primary_readout,
         "trained_value_readouts": trained_readouts,
         "resolved_scalar_mse_weight": float(scalar_weight),
+        "scalar_value_loss_transform": str(
+            getattr(args, "scalar_value_loss_transform", "raw")
+        ),
+        "scalar_value_loss_formula": (
+            "mse(raw_value, target)"
+            if str(getattr(args, "scalar_value_loss_transform", "raw")) == "raw"
+            else "mse(tanh(raw_value * 1.0), target)"
+        ),
+        "scalar_value_loss_deployed_value_scale": 1.0,
         "resolved_categorical_ce_weight": float(categorical_weight),
         "hlgauss_scalar_aux_loss_weight": float(
             getattr(args, "hlgauss_scalar_aux_loss_weight", 0.0)
@@ -1984,6 +2025,7 @@ def _preflight_memmap_composite_descriptor(path: str | Path) -> dict[str, object
         "policy_kl_anchor_direction", "policy_kl_anchor_weight",
         "value_categorical_bins", "value_categorical_loss_weight",
         "value_head_type", "value_hlgauss_sigma_ratio", "value_loss_weight",
+        "scalar_value_loss_transform",
     }
     if (
         not isinstance(overrides, dict)
@@ -2258,6 +2300,7 @@ def _validate_composite_learner_recipe_authorization(
         "value_head_type": str,
         "value_hlgauss_sigma_ratio": float,
         "value_loss_weight": float,
+        "scalar_value_loss_transform": str,
     }
     actual = {
         key: converters[key](getattr(args, key))
@@ -4024,6 +4067,7 @@ def _effective_a1_learner_training_recipe(
         "soft_target_temperature",
         "soft_target_min_legal_coverage",
         "value_loss_weight",
+        "scalar_value_loss_transform",
         "value_target_lambda",
         "value_categorical_loss_weight",
         "hlgauss_scalar_aux_loss_weight",
@@ -5294,6 +5338,14 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "progress": "value_objective",
                 "value_head_type": str(args.value_head_type),
                 "primary_value_loss_weight": float(args.value_loss_weight),
+                "scalar_value_loss_transform": str(
+                    args.scalar_value_loss_transform
+                ),
+                "scalar_value_loss_formula": (
+                    "mse(raw_value, target)"
+                    if str(args.scalar_value_loss_transform) == "raw"
+                    else "mse(tanh(raw_value * 1.0), target)"
+                ),
                 "resolved_scalar_mse_weight": resolved_scalar_value_weight,
                 "resolved_categorical_ce_weight": resolved_categorical_value_weight,
                 "hlgauss_scalar_aux_loss_weight": float(
@@ -6422,9 +6474,13 @@ def main(argv: Sequence[str] | None = None) -> None:
         # The policy-KL anchor and value-uncertainty auxiliary loss are entity_graph
         # (_train_xdim_batch) features -- the legacy dense _train_candidate_batch path
         # does not accept them, so only forward them when the xdim trainer is active.
-        train_fn_extra_kwargs: dict[str, object] = {}
+        train_fn_extra_kwargs: dict[str, object] = {
+            "scalar_value_loss_transform": str(
+                args.scalar_value_loss_transform
+            ),
+        }
         if train_fn is _train_xdim_batch:
-            train_fn_extra_kwargs = {
+            train_fn_extra_kwargs.update({
                 "policy_kl_anchor_weight": float(args.policy_kl_anchor_weight),
                 "policy_kl_anchor_direction": str(args.policy_kl_anchor_direction),
                 "value_uncertainty_loss_weight": float(args.value_uncertainty_loss_weight),
@@ -6442,7 +6498,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                     value_root_blend_regime["mode"] == "global_compat"
                 ),
                 "moe_balance_loss_weight": float(args.moe_balance_loss_weight),
-            }
+            })
         batch_iterator = _iterate_training_batches(
             data,
             order,
@@ -7029,6 +7085,9 @@ def main(argv: Sequence[str] | None = None) -> None:
                 value_root_blend_global_compat=(
                     value_root_blend_regime["mode"] == "global_compat"
                 ),
+                scalar_value_loss_transform=str(
+                    args.scalar_value_loss_transform
+                ),
                 data_loader_workers=int(args.data_loader_workers),
                 data_loader_prefetch=int(args.data_loader_prefetch),
             )
@@ -7496,6 +7555,9 @@ def main(argv: Sequence[str] | None = None) -> None:
             )
         ),
         "value_loss_weight": args.value_loss_weight,
+        "scalar_value_loss_transform": str(
+            args.scalar_value_loss_transform
+        ),
         # Science-critical optimizer provenance: this multiplier changes the
         # value-head update by up to an order of magnitude while leaving the
         # shared ``lr`` unchanged. Omitting it made a report claim only
@@ -7684,6 +7746,7 @@ def _train_candidate_batch(
     max_grad_norm: float = 1.0,
     diagnostics: bool = True,
     truncated_vp_margin_value_weight: float = 0.0,
+    scalar_value_loss_transform: str = "raw",
 ) -> dict:
     del q_skip_teacher_prefixes, amp
     del advantage_policy_weighting, advantage_temperature, advantage_weight_cap, advantage_weight_floor
@@ -7743,7 +7806,12 @@ def _train_candidate_batch(
     )
     value_loss = torch.tensor(0.0, dtype=torch.float32, device=policy.device)
     if outcome_targets is not None:
-        value_error = nn.functional.mse_loss(values, outcome_targets, reduction="none")
+        value_prediction = _scalar_value_loss_prediction(
+            values, scalar_value_loss_transform
+        )
+        value_error = nn.functional.mse_loss(
+            value_prediction, outcome_targets, reduction="none"
+        )
         value_loss = _weighted_mean_loss(
             value_error,
             value_weights * outcome_confidence,
@@ -8424,6 +8492,7 @@ def _train_xdim_batch(
     value_target_lambda: float = 1.0,
     value_root_blend_phases: tuple[str, ...] = (),
     value_root_blend_global_compat: bool = False,
+    scalar_value_loss_transform: str = "raw",
     symmetry=None,
     symmetry_rng=None,
     symmetry_relabel_events: bool = True,
@@ -8627,8 +8696,11 @@ def _train_xdim_batch(
         final_vp_loss = torch.tensor(0.0, dtype=torch.float32, device=policy.device)
         q_loss = torch.tensor(0.0, dtype=torch.float32, device=policy.device)
         if value_outcome_targets is not None and "value" in outputs:
+            value_prediction = _scalar_value_loss_prediction(
+                outputs["value"], scalar_value_loss_transform
+            )
             value_error = nn.functional.mse_loss(
-                outputs["value"], value_outcome_targets, reduction="none"
+                value_prediction, value_outcome_targets, reduction="none"
             )
             value_loss = _weighted_mean_loss(
                 value_error,
@@ -8706,7 +8778,12 @@ def _train_xdim_batch(
             and value_outcome_targets is not None
             and "value" in outputs
         ):
-            uncertainty_target = (value_outcome_targets - outputs["value"].detach()) ** 2
+            uncertainty_prediction = _scalar_value_loss_prediction(
+                outputs["value"].detach(), scalar_value_loss_transform
+            )
+            uncertainty_target = (
+                value_outcome_targets - uncertainty_prediction
+            ) ** 2
             uncertainty_error = nn.functional.smooth_l1_loss(
                 outputs["value_uncertainty"], uncertainty_target, reduction="none"
             )
@@ -9661,6 +9738,7 @@ def evaluate_bc_batches(
     value_target_lambda: float = 1.0,
     value_root_blend_phases: tuple[str, ...] = (),
     value_root_blend_global_compat: bool = False,
+    scalar_value_loss_transform: str = "raw",
     data_loader_workers: int = 0,
     data_loader_prefetch: int = 2,
 ) -> dict:
@@ -9736,9 +9814,11 @@ def evaluate_bc_batches(
         phase_stats_unforced = _empty_phase_stats()
         teacher_stats = _empty_phase_stats()
         eval_fn = _eval_xdim_batch if hasattr(policy, "forward_legal_np") else _eval_candidate_batch
-        eval_fn_extra_kwargs: dict[str, object] = {}
+        eval_fn_extra_kwargs: dict[str, object] = {
+            "scalar_value_loss_transform": str(scalar_value_loss_transform),
+        }
         if eval_fn is _eval_xdim_batch:
-            eval_fn_extra_kwargs = {
+            eval_fn_extra_kwargs.update({
                 "policy_kl_anchor_weight": float(policy_kl_anchor_weight),
                 "policy_kl_anchor_direction": str(policy_kl_anchor_direction),
                 "value_uncertainty_loss_weight": float(value_uncertainty_loss_weight),
@@ -9754,7 +9834,7 @@ def evaluate_bc_batches(
                 "value_root_blend_global_compat": bool(
                     value_root_blend_global_compat
                 ),
-            }
+            })
         # Validation used to bypass the streaming loader and synchronously
         # reconstruct every ragged memmap batch on the rank's main thread. On a
         # large validation sentinel that leaves the GPU idle while one CPU is
@@ -10166,6 +10246,7 @@ def _eval_candidate_batch(
     amp: str = "none",
     *,
     truncated_vp_margin_value_weight: float = 0.0,
+    scalar_value_loss_transform: str = "raw",
 ) -> dict:
     del final_vp_loss_weight, q_loss_weight, amp
     del q_skip_teacher_prefixes
@@ -10227,7 +10308,12 @@ def _eval_candidate_batch(
         )
         value_loss = torch.tensor(0.0, dtype=torch.float32, device=policy.device)
         if outcome_targets is not None:
-            value_error = nn.functional.mse_loss(values, outcome_targets, reduction="none")
+            value_prediction = _scalar_value_loss_prediction(
+                values, scalar_value_loss_transform
+            )
+            value_error = nn.functional.mse_loss(
+                value_prediction, outcome_targets, reduction="none"
+            )
             value_loss_sum, value_loss_denominator = _weighted_loss_parts(
                 value_error,
                 value_weights * outcome_confidence,
@@ -10329,6 +10415,7 @@ def _eval_xdim_batch(
     value_target_lambda: float = 1.0,
     value_root_blend_phases: tuple[str, ...] = (),
     value_root_blend_global_compat: bool = False,
+    scalar_value_loss_transform: str = "raw",
 ) -> dict:
     import torch
     from torch import nn
@@ -10452,8 +10539,11 @@ def _eval_xdim_batch(
             final_vp_loss = torch.tensor(0.0, dtype=torch.float32, device=policy.device)
             q_loss = torch.tensor(0.0, dtype=torch.float32, device=policy.device)
             if value_outcome_targets is not None and "value" in outputs:
+                value_prediction = _scalar_value_loss_prediction(
+                    outputs["value"], scalar_value_loss_transform
+                )
                 value_error = nn.functional.mse_loss(
-                    outputs["value"], value_outcome_targets, reduction="none"
+                    value_prediction, value_outcome_targets, reduction="none"
                 )
                 value_loss_sum, value_loss_denominator = _weighted_loss_parts(
                     value_error,
@@ -10517,8 +10607,11 @@ def _eval_xdim_batch(
                 and value_outcome_targets is not None
                 and "value" in outputs
             ):
+                uncertainty_prediction = _scalar_value_loss_prediction(
+                    outputs["value"].detach(), scalar_value_loss_transform
+                )
                 uncertainty_target = (
-                    value_outcome_targets - outputs["value"].detach()
+                    value_outcome_targets - uncertainty_prediction
                 ) ** 2
                 uncertainty_error = nn.functional.smooth_l1_loss(
                     outputs["value_uncertainty"],

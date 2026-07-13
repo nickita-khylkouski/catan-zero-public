@@ -284,6 +284,11 @@ class TrainConfig(PipelineConfig):
     policy_aux_active_batch_size: int = 0
     # RUN-6/EXP3: default aligned with train_bc --value-loss-weight (0.10, was 0.25).
     value_loss_weight: float = 0.10
+    # Which scalar is compared with the value target. ``raw`` preserves every
+    # historical learner trajectory. ``deployed_tanh`` applies the exact
+    # scalar/tanh/value_scale=1 transform consumed by the sealed A1 search
+    # operator before computing MSE, eliminating a train/deploy mismatch.
+    scalar_value_loss_transform: str = "raw"
     final_vp_loss_weight: float = 0.05
     q_loss_weight: float = 0.0
     q_skip_teacher_prefixes: str = "catanatron_ab"

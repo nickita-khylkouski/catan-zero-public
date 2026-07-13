@@ -282,6 +282,9 @@ def run_rescore(
             value_target_lambda=float(_required(report, "value_target_lambda")),
             value_root_blend_phases=blend_phases,
             value_root_blend_global_compat=blend_global,
+            scalar_value_loss_transform=str(
+                report.get("scalar_value_loss_transform", "raw")
+            ),
         )
 
     exact = train_bc.evaluate_composite_validation_measure(

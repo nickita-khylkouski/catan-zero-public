@@ -85,6 +85,7 @@ def test_freeze_module_groups_cover_expected_submodules() -> None:
         "target_gather",
         "edge_policy",
         "action_cross",
+        "static_action_residual",
     }
     assert ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS["trunk"] == (
         ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS["trunk_base"]
@@ -106,6 +107,7 @@ def test_freeze_module_groups_cover_expected_submodules() -> None:
         "target_gather",
         "edge_policy",
         "action_cross",
+        "static_action_residual",
     }
 
 
