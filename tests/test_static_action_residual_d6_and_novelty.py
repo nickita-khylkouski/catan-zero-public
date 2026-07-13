@@ -18,6 +18,28 @@ from catan_zero.rl.torch_ppo import build_action_feature_table
 from tools.bench_entity_graph_stages import _synthetic_batch
 
 
+def _add_topology_arrays(entity: dict[str, np.ndarray]) -> None:
+    """Add valid-shaped incidence arrays required by HexSymmetry."""
+    batch_size = int(entity["hex_tokens"].shape[0])
+    entity["hex_vertex_ids"] = np.broadcast_to(
+        np.arange(19 * 6, dtype=np.int16).reshape(1, 19, 6) % 54,
+        (batch_size, 19, 6),
+    ).copy()
+    entity["hex_edge_ids"] = np.broadcast_to(
+        np.arange(19 * 6, dtype=np.int16).reshape(1, 19, 6) % 72,
+        (batch_size, 19, 6),
+    ).copy()
+    edges = np.arange(72, dtype=np.int16).reshape(1, 72, 1)
+    entity["edge_vertex_ids"] = np.broadcast_to(
+        np.concatenate((edges % 54, (edges + 1) % 54), axis=2),
+        (batch_size, 72, 2),
+    ).copy()
+    event_width = int(entity["event_tokens"].shape[1])
+    entity["event_target_ids"] = np.full(
+        (batch_size, event_width, 4), -1, dtype=np.int16
+    )
+
+
 def _rank(value: np.ndarray) -> int:
     return int(np.linalg.matrix_rank(np.asarray(value, dtype=np.float64), tol=1e-8))
 
@@ -130,6 +152,7 @@ def test_d6_static_catalog_gather_uses_mapped_not_original_action_ids():
         valid_players=2,
         seed=17,
     )
+    _add_topology_arrays(entity)
     entity["legal_action_mask"] = legal_ids >= 0
     entity["legal_action_target_ids"][0, 2] = -1
     rotated = symmetry.permute_entity_batch(

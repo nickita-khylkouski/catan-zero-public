@@ -19,6 +19,7 @@ from catan_zero.rl.entity_token_features import (
     VERTEX_FEATURE_SIZE,
 )
 from catan_zero.rl.entity_token_policy import (
+    PUBLIC_AWARD_FEATURE_CONTRACT_AUTHORITATIVE,
     STATIC_ACTION_RESIDUAL_FEATURE_SIZE,
     STATIC_ACTION_RESIDUAL_SLICE,
     EntityGraphConfig,
@@ -223,6 +224,9 @@ def _capture_policy(static_table: np.ndarray) -> tuple[EntityGraphPolicy, _Captu
     policy.config = _config(static_action_residual=True)
     policy.action_size = 607
     policy.device = "cpu"
+    policy.public_award_feature_contract = (
+        PUBLIC_AWARD_FEATURE_CONTRACT_AUTHORITATIVE
+    )
     policy.static_action_features = torch.as_tensor(static_table, dtype=torch.float32)
     capture = _CaptureModel()
     policy.model = capture
