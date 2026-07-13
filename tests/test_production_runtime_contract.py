@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import stat
 
 import pytest
 
@@ -73,3 +74,31 @@ def test_installer_line_protocol_has_fixed_complete_order(capsys) -> None:
         "2.2.0",
         "580.105.08",
     ]
+
+
+def _fake_python(path: Path, *, version: str, stderr: str = "") -> Path:
+    path.write_text(
+        "#!/bin/sh\n"
+        f"printf '%s\\n' {version!r}\n"
+        + (f"printf '%s\\n' {stderr!r} >&2\n" if stderr else ""),
+        encoding="utf-8",
+    )
+    path.chmod(path.stat().st_mode | stat.S_IXUSR)
+    return path
+
+
+def test_python_selector_accepts_only_exact_contracted_patch(
+    tmp_path: Path, capsys
+) -> None:
+    exact = _fake_python(tmp_path / "python-exact", version="3.11.15")
+    drifted = _fake_python(tmp_path / "python-drifted", version="3.11.14")
+    noisy = _fake_python(
+        tmp_path / "python-noisy", version="3.11.15", stderr="unexpected"
+    )
+
+    assert runtime.interpreter_version(str(exact)) == "3.11.15"
+    assert runtime.main(["--check-python", str(exact)]) == 0
+    assert "Python runtime exact: 3.11.15" in capsys.readouterr().out
+    for executable in (drifted, noisy, tmp_path / "missing"):
+        assert runtime.main(["--check-python", str(executable)]) == 3
+        assert "REFUSED: Python patch drift" in capsys.readouterr().out

@@ -149,6 +149,9 @@ def test_installer_shell_syntax_and_preflight_order() -> None:
     assert "public_award_feature_parity" in text
     assert "policy_temperature_semantics" in text
     assert 'uv python install "$RUNTIME_PYTHON_VERSION"' in text
+    assert '--contract "$RUNTIME_CONTRACT_REL" --check-python "$PY"' in text
+    assert 'if [ "$SYSTEM_PYTHON_EXACT" -eq 1 ]' in text
+    assert 'uv venv --seed --python "$RUNTIME_PYTHON_VERSION" .venv' in text
     assert '"numpy==$RUNTIME_NUMPY_VERSION"' in text
     assert 'driver_versions == {expected["nvidia_driver_version"]}' in text
 

@@ -7,6 +7,7 @@ import argparse
 import json
 from pathlib import Path
 import re
+import subprocess
 from typing import Any, Sequence
 
 
@@ -75,6 +76,36 @@ def load_runtime_contract(path: Path = DEFAULT_CONTRACT) -> dict[str, str]:
     return {str(key): str(value) for key, value in payload.items()}
 
 
+def interpreter_version(executable: str) -> str | None:
+    """Return an isolated interpreter's exact patch version, or ``None``.
+
+    The installer must not treat an arbitrary ``python3.11`` as the contracted
+    3.11.15 runtime.  Probe the executable itself before allowing it to create
+    the production venv; any execution error, extra output, or timeout selects
+    the exact ``uv`` bootstrap path instead.
+    """
+
+    try:
+        result = subprocess.run(
+            [
+                executable,
+                "-I",
+                "-c",
+                "import platform; print(platform.python_version())",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    lines = result.stdout.splitlines()
+    if result.returncode != 0 or result.stderr or len(lines) != 1:
+        return None
+    return lines[0]
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--contract", type=Path, default=DEFAULT_CONTRACT)
@@ -83,6 +114,11 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("json", "lines"),
         default="json",
         help="lines emits the installer-safe fixed field order",
+    )
+    parser.add_argument(
+        "--check-python",
+        metavar="EXECUTABLE",
+        help="succeed only when EXECUTABLE is the contracted Python patch",
     )
     return parser
 
@@ -94,6 +130,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     except RuntimeContractError as error:
         print(f"REFUSED: {error}")
         return 2
+    if args.check_python is not None:
+        actual = interpreter_version(args.check_python)
+        expected = payload["python_version"]
+        if actual != expected:
+            print(
+                f"REFUSED: Python patch drift: expected {expected}, got "
+                f"{actual or 'unavailable'}"
+            )
+            return 3
+        print(f"Python runtime exact: {actual}")
+        return 0
     if args.format == "lines":
         for key in (
             "python_version",

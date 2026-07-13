@@ -314,20 +314,27 @@ if [[ ! "$CATAN_MPS_LIMIT_NOFILE_SOFT" =~ ^[0-9]+$ ]] \
 fi
 echo "[install] nvidia-mps.service active+enabled LimitNOFILESoft=$CATAN_MPS_LIMIT_NOFILE_SOFT"
 
-# 3. venv — Python 3.11 is REQUIRED (cp311 rust wheel; matches B200/H100 ~/venv).
-#    Bootstrap 3.11 via `uv` when $PY is absent (H100 canaries ship python3.10
-#    only); boxes that already have python3.11 keep the plain venv path.
-if command -v "$PY" >/dev/null 2>&1; then
+# 3. venv — the exact contracted Python patch is REQUIRED.  A command named
+#    python3.11 may still be 3.11.x with a different patch; probe the executable
+#    itself before it can create the production venv.  Missing or mismatched
+#    interpreters take the exact `uv` bootstrap path.
+SYSTEM_PYTHON_EXACT=0
+if command -v "$PY" >/dev/null 2>&1 \
+  && python3 tools/production_runtime_contract.py \
+    --contract "$RUNTIME_CONTRACT_REL" --check-python "$PY"; then
+  SYSTEM_PYTHON_EXACT=1
+fi
+if [ "$SYSTEM_PYTHON_EXACT" -eq 1 ]; then
   "$PY" -m venv .venv
 else
-  echo "[install] $PY not found on PATH; bootstrapping Python 3.11 via uv"
+  echo "[install] $PY is absent or not Python $RUNTIME_PYTHON_VERSION; bootstrapping exact runtime via uv"
   if ! command -v uv >/dev/null 2>&1; then
     curl -LsSf https://astral.sh/uv/install.sh | sh
     # shellcheck disable=SC1091
     [ -f "$HOME/.local/bin/env" ] && . "$HOME/.local/bin/env"
     export PATH="$HOME/.local/bin:$PATH"
   fi
-  command -v uv >/dev/null 2>&1 || { echo "[install] ERROR: uv install failed; cannot bootstrap Python 3.11"; exit 5; }
+  command -v uv >/dev/null 2>&1 || { echo "[install] ERROR: uv install failed; cannot bootstrap Python $RUNTIME_PYTHON_VERSION"; exit 5; }
   uv python install "$RUNTIME_PYTHON_VERSION"
   uv venv --seed --python "$RUNTIME_PYTHON_VERSION" .venv
 fi
