@@ -154,6 +154,87 @@ def test_cropped_entity_batch_skips_event_payload_and_refuses_live_mask(
         train_bc._entity_batch(data, np.asarray([0, 1], dtype=np.int64))
 
 
+def test_prefetch_cropped_event_history_never_reads_padded_payload() -> None:
+    class RefusingEventPayload:
+        def __init__(self, rows: int, width: int, features: int, dtype) -> None:
+            self.shape = (rows, width, features)
+            self.dtype = np.dtype(dtype)
+
+        def __getitem__(self, _index):
+            raise AssertionError("padded empty-event payload must not be read")
+
+    class RefusingObservation:
+        def __init__(self, rows: int, features: int) -> None:
+            self.shape = (rows, features)
+            self.dtype = np.dtype(np.float16)
+
+        def __getitem__(self, _index):
+            raise AssertionError("unused dense observation must not be read")
+
+    rows = 7
+    corpus = object.__new__(train_bc.MemmapCorpus)
+    corpus.row_count = rows
+    corpus._eager = {
+        "event_mask": np.zeros((rows, 64), dtype=np.bool_),
+        "marker": np.arange(rows, dtype=np.int64),
+    }
+    corpus._lazy = {
+        "obs": RefusingObservation(rows, 806),
+        "event_tokens": RefusingEventPayload(rows, 64, 41, np.float16),
+        "event_target_ids": RefusingEventPayload(rows, 64, 4, np.int16),
+    }
+    order = np.asarray([6, 2, 4, 0, 5, 1, 3], dtype=np.int64)
+    train_indices = np.arange(rows, dtype=np.int64)
+    weights = np.ones(rows, dtype=np.float32)
+
+    batches = list(
+        train_bc._iterate_training_batches(
+            corpus,
+            order,
+            train_indices,
+            3,
+            weights,
+            weights,
+            num_workers=2,
+            prefetch=2,
+            crop_authenticated_empty_event_history=True,
+            omit_unused_observation=True,
+        )
+    )
+
+    assert len(batches) == 3
+    recovered_markers = []
+    for materialized, local, _, _ in batches:
+        assert materialized["event_tokens"].shape == (len(local), 0, 41)
+        assert materialized["event_tokens"].dtype == np.float16
+        assert materialized["event_target_ids"].shape == (len(local), 0, 4)
+        assert materialized["event_target_ids"].dtype == np.int16
+        assert materialized["event_mask"].shape == (len(local), 64)
+        assert not bool(np.any(materialized["event_mask"]))
+        assert "obs" not in materialized
+        assert materialized["_source_obs_inner_shape"] == (806,)
+        recovered_markers.extend(materialized["marker"][local].tolist())
+    assert recovered_markers == order.tolist()
+
+
+def test_batch_profile_preserves_omitted_observation_shape() -> None:
+    data = {
+        "_source_obs_inner_shape": (806,),
+        "legal_action_ids": np.asarray([[1, 2, -1], [3, -1, -1]], dtype=np.int16),
+        "legal_action_context": np.zeros((2, 3, 5), dtype=np.float16),
+    }
+    policy = SimpleNamespace(
+        policy_type="entity_graph",
+        action_size=100,
+        context_action_feature_size=5,
+    )
+
+    profile = train_bc._batch_profile(policy, data, np.arange(2, dtype=np.int64))
+
+    assert profile["obs_shape"] == [2, 806]
+    assert profile["legal_action_ids_shape"] == [2, 3]
+
+
 @pytest.mark.parametrize(
     ("augment", "relabel_events", "expected"),
     [
