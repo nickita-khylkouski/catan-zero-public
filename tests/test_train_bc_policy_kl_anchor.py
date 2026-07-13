@@ -8,6 +8,8 @@ exist so a caller adds nothing to the loss.
 
 from __future__ import annotations
 
+import multiprocessing as mp
+
 import numpy as np
 import pytest
 import torch
@@ -16,6 +18,7 @@ from tools.train_bc import (
     _policy_kl_anchor_loss,
     _policy_kl_anchor_loss_parts,
     _prior_kl_telemetry,
+    _q_score_loss_parts,
 )
 
 
@@ -59,6 +62,59 @@ def _logits(n=3, width=4, requires_grad=False):
         masked = base + torch.tensor([[0.0, 0.0, 0.0, float("-inf")]])
         return base, masked
     return logits
+
+
+def _sparse_ddp_anchor_worker(rank: int, rendezvous: str, output) -> None:
+    torch.distributed.init_process_group(
+        "gloo",
+        init_method=f"file://{rendezvous}",
+        rank=rank,
+        world_size=2,
+    )
+    try:
+        data = _base_data()
+        row = np.asarray([2 if rank == 0 else 0], dtype=np.int64)
+        base, masked = _logits(n=1, requires_grad=True)
+        parts = _policy_kl_anchor_loss_parts(
+            data, row, masked, torch.device("cpu")
+        )
+        if parts is None:
+            raise AssertionError("global DDP anchor unexpectedly has no terms")
+        loss, _weighted_sum, denominator = parts
+        loss.backward()
+        q_values = torch.zeros((1, 3), dtype=torch.float32, requires_grad=True)
+        q_data = {
+            "action_taken": np.asarray([5], dtype=np.int16),
+            "legal_action_ids": np.asarray([[5, 6, 7]], dtype=np.int16),
+            "target_scores": np.asarray(
+                [[np.nan, np.nan, np.nan] if rank == 0 else [0.0, 1.0, 2.0]],
+                dtype=np.float32,
+            ),
+            "teacher_name": np.asarray(["value_rollout_search"]),
+            "target_score_source": np.asarray(["value_rollout_search"]),
+        }
+        q_loss, _q_sum, q_denominator = _q_score_loss_parts(
+            q_values,
+            q_data,
+            np.asarray([0], dtype=np.int64),
+            torch.ones(1, dtype=torch.float32),
+            torch.device("cpu"),
+            q_skip_teacher_prefixes=(),
+        )
+        q_loss.backward()
+        output.put(
+            {
+                "rank": rank,
+                "denominator": float(denominator.item()),
+                "gradient_l1": float(base.grad.abs().sum().item()),
+                "q_denominator": float(q_denominator.item()),
+                "q_gradient_l1": float(q_values.grad.abs().sum().item()),
+            }
+        )
+    except BaseException as error:  # pragma: no cover - surfaced in parent
+        output.put({"rank": rank, "error": repr(error)})
+    finally:
+        torch.distributed.destroy_process_group()
 
 
 def test_returns_none_without_prior_rows():
@@ -114,6 +170,42 @@ def test_is_differentiable_through_logits():
     assert torch.isfinite(base.grad).all()
     # Gradient must be nonzero somewhere (the anchor actually pulls the policy).
     assert base.grad.abs().sum().item() > 0.0
+
+
+def test_sparse_ddp_objective_batches_use_one_collective_path(tmp_path):
+    """Locally empty anchor/Q rows must not skip peers' DDP collectives."""
+
+    if not torch.distributed.is_available():
+        pytest.skip("torch.distributed unavailable")
+    context = mp.get_context("spawn")
+    output = context.Queue()
+    rendezvous = str(tmp_path / "policy-kl-anchor-rendezvous")
+    processes = [
+        context.Process(
+            target=_sparse_ddp_anchor_worker,
+            args=(rank, rendezvous, output),
+        )
+        for rank in range(2)
+    ]
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(timeout=20)
+    hung = [process for process in processes if process.is_alive()]
+    for process in hung:
+        process.terminate()
+        process.join(timeout=5)
+    assert not hung, "rank-local sparse-objective early return deadlocked DDP"
+    assert [process.exitcode for process in processes] == [0, 0]
+
+    observed = sorted((output.get(timeout=5) for _ in range(2)), key=lambda row: row["rank"])
+    assert all("error" not in row for row in observed)
+    assert [row["denominator"] for row in observed] == [0.0, 1.0]
+    assert observed[0]["gradient_l1"] == pytest.approx(0.0)
+    assert observed[1]["gradient_l1"] > 0.0
+    assert [row["q_denominator"] for row in observed] == [0.0, 1.0]
+    assert observed[0]["q_gradient_l1"] == pytest.approx(0.0)
+    assert observed[1]["q_gradient_l1"] > 0.0
 
 
 def test_is_near_zero_when_model_equals_prior():
