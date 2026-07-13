@@ -1711,7 +1711,12 @@ def _players_from_rust_snapshot(
             "settlements_left": int(state.get("settlements_available", 0) or 0),
             "cities_left": int(state.get("cities_available", 0) or 0),
             "has_largest_army": bool(state.get("has_army", False)),
-            "has_longest_road": False,
+            # Longest-road ownership is public information and is already
+            # maintained authoritatively by the Rust engine.  Preserve it in
+            # the Python adapter just like largest-army ownership; hardcoding
+            # this to False made native inference disagree with the training
+            # feature surface after the award changed hands.
+            "has_longest_road": bool(state.get("has_road", False)),
             "has_rolled": bool(state.get("has_rolled", False)),
             "longest_road_length": int(
                 state.get("longest_road_length", longest.get(color, 0)) or 0

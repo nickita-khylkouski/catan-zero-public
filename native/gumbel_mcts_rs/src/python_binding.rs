@@ -407,6 +407,7 @@ fn gumbel_search_capabilities() -> Vec<&'static str> {
         "sigma_reference_visits",
         "belief_target_evidence",
         "initial_road_d1_scope",
+        "public_award_feature_parity",
     ]
 }
 

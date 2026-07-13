@@ -12,6 +12,7 @@ alone is not enough to skip cleanly there; see
 
 from __future__ import annotations
 
+import json
 import random
 
 import numpy as np
@@ -142,7 +143,13 @@ def test_bit_exact_parity_across_diverse_states(states, public_observation):
     assert len(states) >= 200, f"need >=200 states for the parity gate, got {len(states)}"
 
     mismatches: list[str] = []
+    longest_road_award_states = 0
     for (game,) in states:
+        if any(
+            bool(json.loads(game.player_state_json(color))["has_road"])
+            for color in COLORS
+        ):
+            longest_road_award_states += 1
         actor = game.current_color()
         legal_action_ids = tuple(int(a) for a in game.playable_action_indices(list(COLORS), None))
         if not legal_action_ids:
@@ -179,6 +186,9 @@ def test_bit_exact_parity_across_diverse_states(states, public_observation):
                 )
 
     assert not mismatches, "bit-exact parity FAILED for:\n" + "\n".join(mismatches[:40])
+    assert longest_road_award_states > 0, (
+        "parity corpus did not exercise public longest-road ownership"
+    )
 
 
 @pytest.mark.parametrize("public_observation", [False, True])

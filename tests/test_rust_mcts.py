@@ -6,6 +6,7 @@ import pytest
 
 from catan_zero.search.neural_rust_mcts import (
     _entity_payload_from_rust_snapshot,
+    _players_from_rust_snapshot,
     _structured_action,
 )
 from catan_zero.search.rust_mcts import RustMCTS, RustMCTSConfig, _require_rust_module
@@ -125,3 +126,35 @@ def test_rust_entity_adapter_parses_maritime_trade_tuple():
 
     assert structured["args"]["give"] == ["sheep", "sheep"]
     assert structured["args"]["want"] == ["brick"]
+
+
+def test_rust_player_adapter_preserves_public_award_ownership() -> None:
+    """Public awards must not disappear at the Python/native feature seam."""
+
+    states = {
+        "BLUE": {
+            "victory_points": 6,
+            "actual_victory_points": 7,
+            "has_army": True,
+            "has_road": True,
+            "longest_road_length": 6,
+        },
+        "RED": {
+            "victory_points": 3,
+            "actual_victory_points": 4,
+            "has_army": False,
+            "has_road": False,
+            "longest_road_length": 4,
+        },
+    }
+
+    players = _players_from_rust_snapshot(
+        {"longest_roads_by_player": {"BLUE": 6, "RED": 4}},
+        ("BLUE", "RED"),
+        states,
+    )
+
+    assert players["BLUE"]["has_largest_army"] is True
+    assert players["BLUE"]["has_longest_road"] is True
+    assert players["RED"]["has_largest_army"] is False
+    assert players["RED"]["has_longest_road"] is False

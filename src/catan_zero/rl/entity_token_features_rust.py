@@ -54,6 +54,14 @@ _REQUIRED_NATIVE_FEATURE_APIS = (
     "build_entity_features_flat",
     "build_action_context_flat",
 )
+_REQUIRED_NATIVE_FEATURE_CAPABILITY = "public_award_feature_parity"
+
+
+def _has_required_feature_capability(module: Any) -> bool:
+    capability_fn = getattr(module, "gumbel_search_capabilities", None)
+    if not callable(capability_fn):
+        return False
+    return _REQUIRED_NATIVE_FEATURE_CAPABILITY in set(capability_fn())
 
 
 def rust_feature_path_available() -> bool:
@@ -65,7 +73,7 @@ def rust_feature_path_available() -> bool:
     return all(
         callable(getattr(catanatron_rs, name, None))
         for name in _REQUIRED_NATIVE_FEATURE_APIS
-    )
+    ) and _has_required_feature_capability(catanatron_rs)
 
 
 def require_rust_feature_path() -> None:
@@ -85,6 +93,12 @@ def require_rust_feature_path() -> None:
         raise RuntimeError(
             "Rust feature path requested but the installed catanatron_rs wheel "
             f"is missing {', '.join(missing)}; refusing Python fallback"
+        )
+    if not _has_required_feature_capability(catanatron_rs):
+        raise RuntimeError(
+            "Rust feature path requested but the installed catanatron_rs wheel "
+            f"does not advertise {_REQUIRED_NATIVE_FEATURE_CAPABILITY}; "
+            "refusing a native featurizer with stale public-award semantics"
         )
 
 

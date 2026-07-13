@@ -8602,13 +8602,10 @@ pub mod python_bindings {
     // `event_log` is always `[]`, so event tokens/masks are always-zero here
     // too -- no event-log logic to port for this call site).
     //
-    // Two known, INTENTIONAL, pre-existing quirks of the Python reference this
-    // function reproduces verbatim (do not "fix" here without also fixing the
-    // Python reference + re-running the parity suite):
-    //   1. `has_longest_road` is always emitted as `false` regardless of the
-    //      true holder (`_players_from_rust_snapshot` hardcodes it) -- see the
-    //      `player_tokens` slot 12 assignment below.
-    //   2. The trade-action one-hot slots of `legal_action_tokens` (cols 2..20,
+    // One known, pre-existing quirk of the Python reference this function
+    // reproduces verbatim (do not fix here without also fixing the Python
+    // reference + re-running the parity suite): the trade-action one-hot slots
+    // of `legal_action_tokens` (cols 2..20,
     //      the ACTION_TYPES index) never fire for OFFER_TRADE/ACCEPT_TRADE/
     //      REJECT_TRADE/CANCEL_TRADE/CONFIRM_TRADE: Python's `ACTION_TYPES`
     //      tuple spells these lowercase ("offer_trade", ...) while the actual
@@ -8996,9 +8993,8 @@ pub mod python_bindings {
             player_tokens[base + 9] = entity_scale(ps.settlements_available as i64, 5.0);
             player_tokens[base + 10] = entity_scale(ps.cities_available as i64, 4.0);
             player_tokens[base + 11] = if ps.has_army { 1.0 } else { 0.0 };
-            // Slot 12 (has_longest_road): the Python reference hardcodes this
-            // `False` regardless of `ps.has_road` -- see the module-level doc
-            // comment above. Left at 0.0 for bit-exact parity.
+            // Longest-road ownership is public and authoritative in PlayerState.
+            player_tokens[base + 12] = if ps.has_road { 1.0 } else { 0.0 };
             player_tokens[base + 13] = if ps.has_rolled { 1.0 } else { 0.0 };
             player_tokens[base + 14] = entity_scale(ps.longest_road_length as i64, 15.0);
             if !masked {
@@ -9935,6 +9931,55 @@ pub mod python_bindings {
                 .unwrap();
                 assert!(action_space.contains("MOVE_ROBBER"));
             });
+        }
+
+        #[test]
+        fn entity_player_tokens_preserve_public_awards_when_hidden_hands_are_masked() {
+            let mut py_game =
+                PyGame::simple(Some(vec!["RED".to_string(), "BLUE".to_string()]), Some(31))
+                    .unwrap();
+            let actor = py_game.game.state.current_color();
+            let opponent = py_game
+                .game
+                .state
+                .colors
+                .iter()
+                .copied()
+                .find(|color| *color != actor)
+                .unwrap();
+            py_game.game.state.player_state_mut(actor).has_army = true;
+            py_game.game.state.player_state_mut(opponent).has_road = true;
+
+            // Player award slots do not depend on topology, but the shared
+            // builder validates/visits its fixed-size topology arrays while
+            // constructing the other feature families.
+            let topology = PyEntityTopology {
+                hex_vertex_ids: vec![vec![-1; 6]; 19],
+                hex_edge_ids: vec![vec![-1; 6]; 19],
+                edge_vertex_ids: vec![vec![-1; 2]; 72],
+                port_base_nodes: vec![vec![-1; 2]; 16],
+            };
+            let colors = py_game.game.state.colors.clone();
+            let policy_action_ids = vec![0; py_game.game.playable_actions.len()];
+            let arrays = build_entity_feature_arrays(
+                &py_game.game,
+                &colors,
+                &policy_action_ids,
+                400,
+                &topology,
+                true,
+            )
+            .unwrap();
+            let actor_base =
+                entity_player_index(color_name(actor)).unwrap() * ENTITY_PLAYER_FEATURE_SIZE;
+            let opponent_base =
+                entity_player_index(color_name(opponent)).unwrap() * ENTITY_PLAYER_FEATURE_SIZE;
+
+            assert_eq!(arrays.player_tokens[actor_base + 11], 1.0);
+            assert_eq!(arrays.player_tokens[opponent_base + 12], 1.0);
+            assert_eq!(arrays.player_tokens[opponent_base + 4], 0.0);
+            assert_eq!(arrays.player_tokens[opponent_base + 15], 0.0);
+            assert_eq!(arrays.player_tokens[opponent_base + 21], 0.0);
         }
 
         #[test]
