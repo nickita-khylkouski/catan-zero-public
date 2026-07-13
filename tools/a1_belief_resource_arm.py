@@ -216,9 +216,28 @@ def _effective_config(checkpoint: Path) -> dict[str, Any]:
     else:
         _fail("upgraded initializer has no entity-graph config")
     known = {field.name for field in dataclasses.fields(EntityGraphConfig)}
-    return dataclasses.asdict(
+    effective = dataclasses.asdict(
         EntityGraphConfig(**{key: value for key, value in values.items() if key in known})
     )
+    return _json_config(effective)
+
+
+def _json_config(value: Any) -> Any:
+    """Normalize checkpoint config scalars without weakening manifest hashing."""
+
+    if value is None or isinstance(value, (str, bool, int, float)):
+        return value
+    if isinstance(value, Mapping):
+        return {str(key): _json_config(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_config(item) for item in value]
+    # PyTorch checkpoint metadata can preserve NumPy scalar classes. Their
+    # ``item`` value is the exact native scalar represented by the checkpoint.
+    if type(value).__module__.startswith("numpy") and callable(
+        getattr(value, "item", None)
+    ):
+        return _json_config(value.item())
+    _fail(f"belief initializer config contains non-JSON value: {type(value)!r}")
 
 
 def _validate_upgrade_contract(

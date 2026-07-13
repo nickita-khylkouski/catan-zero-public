@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import subprocess
 
+import numpy as np
 import pytest
 
 from tools import a1_belief_resource_arm as arm
@@ -151,6 +153,26 @@ def test_upgrade_contract_requires_exact_f7_and_belief_only(
                 "sha256": arm.temperature.F7_SHA256,
             },
         )
+
+
+def test_checkpoint_config_numpy_scalars_are_canonical_json_values() -> None:
+    normalized = arm._json_config(
+        {
+            "layers": np.int64(6),
+            "dropout": np.float32(0.05),
+            "flags": (np.bool_(True),),
+        }
+    )
+
+    assert normalized == {
+        "layers": 6,
+        "dropout": pytest.approx(0.05),
+        "flags": [True],
+    }
+    assert type(normalized["layers"]) is int
+    assert type(normalized["dropout"]) is float
+    assert type(normalized["flags"][0]) is bool
+    json.dumps(normalized, sort_keys=True)
 
 
 def test_upgrade_contract_rejects_topology_or_gather(
