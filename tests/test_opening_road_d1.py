@@ -90,3 +90,71 @@ def test_scoped_d1_phase_attestation_is_opt_in_and_fail_closed() -> None:
     assert scoped._phase_gated_d1_root_phase(_Game()) == "BUILD_INITIAL_ROAD"
     with pytest.raises(RuntimeError, match="json_snapshot"):
         scoped._phase_gated_d1_root_phase(object())
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [[], None, {"current_prompt": None}, {"current_prompt": 7}, {}],
+)
+def test_scoped_d1_phase_attestation_rejects_malformed_public_prompt(payload) -> None:
+    class _Game:
+        def json_snapshot(self) -> str:
+            return json.dumps(payload)
+
+    scoped = _mcts(
+        GumbelChanceMCTSConfig(rescale_noise_floor_initial_road_only=True)
+    )
+    with pytest.raises(RuntimeError, match="initial-road-only D1 requires"):
+        scoped._phase_gated_d1_root_phase(_Game())
+
+
+def test_scoped_d1_phase_attestation_ignores_hidden_truth_fields() -> None:
+    class _Game:
+        def __init__(self, hidden_hand: list[int]) -> None:
+            self.hidden_hand = hidden_hand
+
+        def json_snapshot(self) -> str:
+            return json.dumps(
+                {
+                    "current_prompt": "BUILD_INITIAL_ROAD",
+                    "hidden_hand": self.hidden_hand,
+                }
+            )
+
+    scoped = _mcts(
+        GumbelChanceMCTSConfig(rescale_noise_floor_initial_road_only=True)
+    )
+    first = scoped._phase_gated_d1_root_phase(_Game([1, 2]))
+    second = scoped._phase_gated_d1_root_phase(_Game([9, 9]))
+    assert first == second == "BUILD_INITIAL_ROAD"
+
+
+@pytest.mark.parametrize(
+    "phase",
+    [
+        "BUILD_INITIAL_SETTLEMENT",
+        "PLAY_TURN",
+        "ROLL",
+        "DISCARD",
+        "MOVE_ROBBER",
+        None,
+    ],
+)
+def test_scoped_d1_keeps_every_non_road_root_and_interior_node_exact(phase) -> None:
+    control = _mcts(GumbelChanceMCTSConfig())
+    scoped = _mcts(
+        GumbelChanceMCTSConfig(
+            rescale_noise_floor_c=8.0,
+            sigma_eval=0.98,
+            rescale_noise_floor_initial_road_only=True,
+        )
+    )
+    node = _near_tie_node(phase)
+    completed = scoped._completed_q(node)
+
+    assert scoped._rescaled_completed_q(node, completed) == (
+        control._rescaled_completed_q(node, completed)
+    )
+    assert scoped._improved_policy(node, completed) == (
+        control._improved_policy(node, completed)
+    )

@@ -379,6 +379,10 @@ class GenerateConfig(PipelineConfig):
     c_scale: float = 0.1
     sigma_reference_visits: int | None = None
     rescale_noise_floor_c: float = 0.0
+    # Science-bearing scope for D1. Without this field an all-node D1 run and
+    # an opening-road-only D1 run can share the same generation config hash,
+    # allowing semantically different targets to be merged under one run id.
+    rescale_noise_floor_initial_road_only: bool = False
     sigma_eval: float = 0.79
     max_decisions: int = 600
     max_depth: int = 80

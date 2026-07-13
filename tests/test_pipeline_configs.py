@@ -133,6 +133,19 @@ def test_generate_native_hot_loop_changes_science_hash() -> None:
     assert native.config_hash() != reference.config_hash()
 
 
+def test_initial_road_d1_scope_changes_generation_config_hash() -> None:
+    global_d1 = GenerateConfig(rescale_noise_floor_c=8.0)
+    road_only_d1 = GenerateConfig(
+        rescale_noise_floor_c=8.0,
+        rescale_noise_floor_initial_road_only=True,
+    )
+
+    assert global_d1.config_hash() != road_only_d1.config_hash()
+    assert road_only_d1.field_values()[
+        "rescale_noise_floor_initial_road_only"
+    ] is True
+
+
 def test_hash_is_field_order_independent() -> None:
     # sort_keys in canonical_json means declaration order never affects the hash.
     payload = TrainConfig(seed=5).canonical_payload()

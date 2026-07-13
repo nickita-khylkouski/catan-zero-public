@@ -943,10 +943,15 @@ class GumbelChanceMCTS:
                 "initial-road-only D1 requires a game exposing json_snapshot()"
             )
         snapshot = json.loads(game.json_snapshot())
-        phase = str(snapshot.get("current_prompt", ""))
-        if not phase:
+        if not isinstance(snapshot, dict):
             raise RuntimeError(
-                "initial-road-only D1 requires current_prompt in json_snapshot()"
+                "initial-road-only D1 requires json_snapshot() to return an object"
+            )
+        phase = snapshot.get("current_prompt")
+        if not isinstance(phase, str) or not phase:
+            raise RuntimeError(
+                "initial-road-only D1 requires a non-empty string current_prompt "
+                "in json_snapshot()"
             )
         return phase
 

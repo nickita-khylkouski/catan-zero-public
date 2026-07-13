@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 import random
 from dataclasses import replace
@@ -17,8 +18,9 @@ from catan_zero.search.gumbel_chance_mcts import (
 
 
 class _AuthoritativeGame:
-    def __init__(self, hidden_truth: str) -> None:
+    def __init__(self, hidden_truth: str, prompt: str = "BUILD_INITIAL_ROAD") -> None:
         self.hidden_truth = hidden_truth
+        self.prompt = prompt
         self.seeds: list[int] = []
 
     def current_color(self) -> str:
@@ -30,6 +32,11 @@ class _AuthoritativeGame:
         # Deliberately ignore authoritative hidden_truth: this is the engine
         # contract the orchestration layer relies on.
         return _SampledGame(seed)
+
+    def json_snapshot(self) -> str:
+        return json.dumps(
+            {"current_prompt": self.prompt, "hidden_truth": self.hidden_truth}
+        )
 
 
 class _SampledGame:
@@ -95,6 +102,40 @@ def test_information_set_result_is_invariant_to_authoritative_hidden_truth() -> 
     second = _mcts().search(second_game, force_full=True)
     assert first == second
     assert first_game.seeds == second_game.seeds
+
+
+def test_information_set_forwards_attested_public_phase_to_belief_aggregation() -> None:
+    observed: list[str | None] = []
+    mcts = _mcts()
+    mcts.config = replace(
+        mcts.config,
+        rescale_noise_floor_c=8.0,
+        rescale_noise_floor_initial_road_only=True,
+    )
+    original = mcts._aggregate_information_set_results
+
+    def aggregate(
+        _self,
+        results,
+        *,
+        legal_actions,
+        used_full_search,
+        root_phase=None,
+    ):
+        observed.append(root_phase)
+        return original(
+            results,
+            legal_actions=legal_actions,
+            used_full_search=used_full_search,
+            root_phase=root_phase,
+        )
+
+    mcts._aggregate_information_set_results = MethodType(aggregate, mcts)
+    mcts.search(
+        _AuthoritativeGame("opponent has KNIGHT", "BUILD_INITIAL_ROAD"),
+        force_full=True,
+    )
+    assert observed == ["BUILD_INITIAL_ROAD"]
 
 
 def test_information_set_particles_share_one_exact_total_budget() -> None:
@@ -362,6 +403,45 @@ def test_belief_d1_uses_fractional_particle_mean_visits_at_sparse_root() -> None
     # counts zero, forcing D1 alpha=0 and returning an incorrect 50/50 policy.
     assert policy[11] > 0.5
     assert policy[12] < 0.5
+
+
+def test_belief_level_d1_is_exact_off_phase_and_active_at_road_root() -> None:
+    control = _belief_target_mcts(sigma_reference_visits=8)
+    scoped = _belief_target_mcts(sigma_reference_visits=8)
+    scoped.config = replace(
+        scoped.config,
+        rescale_noise_floor_c=8.0,
+        sigma_eval=0.98,
+        rescale_noise_floor_initial_road_only=True,
+    )
+    particles = [
+        _belief_result(
+            q_values={11: 0.400004, 12: 0.400000},
+            visits={11: 4, 12: 4},
+            completed_q={11: 0.400004, 12: 0.400000},
+        ),
+        _belief_result(
+            q_values={11: 0.400000, 12: 0.399996},
+            visits={11: 4, 12: 4},
+            completed_q={11: 0.400000, 12: 0.399996},
+        ),
+    ]
+
+    def target(mcts, phase):
+        return mcts._belief_level_improved_policy(
+            particles,
+            legal_actions=(11, 12),
+            aggregate_priors={11: 0.5, 12: 0.5},
+            root_phase=phase,
+        )
+
+    assert target(scoped, "BUILD_INITIAL_SETTLEMENT") == target(
+        control, "BUILD_INITIAL_SETTLEMENT"
+    )
+    assert target(scoped, "PLAY_TURN") == target(control, "PLAY_TURN")
+    assert target(scoped, "BUILD_INITIAL_ROAD")[11] < target(
+        control, "BUILD_INITIAL_ROAD"
+    )[11]
 
 
 def test_belief_target_changes_training_target_not_selected_action() -> None:
