@@ -5614,6 +5614,59 @@ def _advance_game_seed_runs(
     return current
 
 
+def _advance_game_decision_run(
+    game_seeds: np.ndarray,
+    decision_indices: np.ndarray,
+    *,
+    active_seed: int | None,
+    active_decision_index: int | None,
+    where: str,
+) -> int | None:
+    """Reject an adjacent second copy of a game that seed runs cannot see.
+
+    Current generation emits at most one selected row per game decision, in
+    chronological order.  Thus ``decision_index`` increases strictly within a
+    seed even when only one player's rows are retained.  A non-increase while
+    the seed remains equal is a new/copy game boundary, not a continuation.
+    Negative indices are legacy/unknown provenance and are not used for this
+    stronger check.
+    """
+
+    seeds = np.asarray(game_seeds, dtype=np.int64).reshape(-1)
+    decisions = np.asarray(decision_indices, dtype=np.int64).reshape(-1)
+    if decisions.shape != seeds.shape:
+        raise ContractError(
+            f"{where}: decision_index is not row-aligned with game_seed"
+        )
+    if not seeds.size:
+        return active_decision_index
+    if (
+        active_seed == int(seeds[0])
+        and active_decision_index is not None
+        and int(decisions[0]) >= 0
+        and int(decisions[0]) <= active_decision_index
+    ):
+        raise ContractError(
+            f"{where}: game_seed {int(seeds[0])} decision_index resets across "
+            "a shard boundary; adjacent duplicate game"
+        )
+    if seeds.size > 1:
+        same_seed = seeds[1:] == seeds[:-1]
+        known = (decisions[1:] >= 0) & (decisions[:-1] >= 0)
+        reset_offsets = np.flatnonzero(
+            same_seed & known & (decisions[1:] <= decisions[:-1])
+        )
+        if reset_offsets.size:
+            offset = int(reset_offsets[0] + 1)
+            raise ContractError(
+                f"{where}: game_seed {int(seeds[offset])} decision_index "
+                f"non-increase {int(decisions[offset - 1])}->{int(decisions[offset])}; "
+                "adjacent duplicate game"
+            )
+    final = int(decisions[-1])
+    return final if final >= 0 else None
+
+
 def _expected_cli_fields(lock: dict[str, Any], job: dict[str, Any]) -> dict[str, Any]:
     search = lock["science"]["search_operator"]
     evaluator = lock["science"]["evaluator"]
@@ -6006,6 +6059,7 @@ def audit_outputs(
         job_shards: list[Path] = []
         seed_status: dict[int, tuple[bool, bool]] = {}
         active_seed_run: int | None = None
+        active_decision_run: int | None = None
         closed_seed_runs: set[int] = set()
         for raw_shard in manifest.get("shards", []):
             try:
@@ -6042,6 +6096,9 @@ def audit_outputs(
                 )
                 with np.load(canonical_shard, allow_pickle=False) as payload:
                     game_seeds = np.asarray(payload["game_seed"], dtype=np.int64)
+                    decision_indices = np.asarray(
+                        payload["decision_index"], dtype=np.int64
+                    )
                     regimes = np.asarray(payload["target_information_regime"]).astype(str)
                     terminated = np.asarray(payload["terminated"], dtype=bool)
                     truncated = np.asarray(payload["truncated"], dtype=bool)
@@ -6049,10 +6106,12 @@ def audit_outputs(
                         regimes.shape
                         == terminated.shape
                         == truncated.shape
+                        == decision_indices.shape
                         == game_seeds.shape
                     ):
                         raise ContractError(
-                            "game status/target-information arrays are not row-aligned"
+                            "game status/target-information/decision arrays are not "
+                            "row-aligned"
                         )
                     target_information_regimes.update(regimes.tolist())
                     if np.any(regimes != required_target_information_regime):
@@ -6061,6 +6120,13 @@ def audit_outputs(
                             f"{job['job_id']}: shard target_information_regime values "
                             f"{actual}, expected only {required_target_information_regime!r}"
                         )
+                    active_decision_run = _advance_game_decision_run(
+                        game_seeds,
+                        decision_indices,
+                        active_seed=active_seed_run,
+                        active_decision_index=active_decision_run,
+                        where=job["job_id"],
+                    )
                     active_seed_run = _advance_game_seed_runs(
                         game_seeds,
                         active_seed=active_seed_run,
