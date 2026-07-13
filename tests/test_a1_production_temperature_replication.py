@@ -178,6 +178,14 @@ def test_descriptor_preserves_diagnostic_boundary_and_exact_temperature_map(
     assert len(inventories) == len(bindings) == 3
 
 
+def test_component_ratios_match_authenticated_descriptor_encoding() -> None:
+    assert list(temp.COMPONENT_RATIOS) == [
+        0.5714285714285715,
+        0.22857142857142856,
+        0.2,
+    ]
+
+
 @pytest.mark.parametrize(
     ("field", "value", "match"),
     [

@@ -35,7 +35,10 @@ WINNING_DIAGNOSTIC_SHA256 = (
     "sha256:fefba044df58b9508de751d76d09bedeb630a2e832f6db46b70d95b5d4c77394"
 )
 COMPONENT_IDS = ("n128_current", "n256_current", "gen3_replay")
-COMPONENT_RATIOS = (4.0 / 7.0, 1.6 / 7.0, 0.2)
+# Preserve the exact JSON float encoding emitted by the authenticated winning
+# descriptor. Reconstructing these mathematically equivalent ratios through
+# different binary operations made the completion check reject a correct run.
+COMPONENT_RATIOS = (0.5714285714285715, 0.22857142857142856, 0.2)
 COMPONENT_TEMPERATURES = {
     "n128_current": 1.0,
     "n256_current": 1.11,
