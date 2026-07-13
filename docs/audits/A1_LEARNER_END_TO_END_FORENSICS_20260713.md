@@ -96,6 +96,10 @@ signal. `loser_sample_weight=1` won the controlled comparison.
 | Composite validation cap | A row-count validation cap can split a game and invalidate the signed game-disjoint validation sentinel. The first geometry command mistakenly requested 8,192 rows despite supplying the sentinel. | Planner and trainer now require `--validation-max-samples 0` for authenticated composites; the sentinel is the sole validation bound (`30b669f`). |
 | Validation aggregation | Objective-matched validation now aggregates sufficient statistics; legacy raw `validation.loss` is a row-concatenated diagnostic and not promotion evidence. | Confirmed. |
 | Head weight decay | Requested zero-weight optional heads previously changed despite no objective. | Fixed (`e81ffb2`). |
+| Composite per-game weighting | Numeric `game_seed` values were treated as globally unique. The same seed in two corpus components was merged into one game for equal/sqrt weighting and quality telemetry. | Fixed: game identity is now `(component, game_seed)` and component offsets are validated (`cf54d5a`). |
+| DDP active-fraction telemetry | The active numerator was globally reduced but divided by a rank-local denominator, producing impossible fractions such as `7.95` in an eight-rank report. This did not alter gradients, but it corrupted experimental interpretation. | Fixed: numerator and denominator now share global scope and bounded fractions fail closed (`cf54d5a`). |
+| Diagnostic run receipts | Completed non-promotable runs could retain a launch plan without a final identity binding for checkpoint, report, runtime, optimizer, source code, and finalizer. | Fixed: deterministic finalization/replay receipt binds all run artifacts and the finalizer itself (`efcc94b`, `d9bf335`). |
+| Shared-trunk gradient probe | The probe enabled ordinary diagnostics but had drifted from the separately gated objective-interference cadence, so it could start without emitting its defining measurement. | Fixed: both diagnostic cadences are explicit and tested (`58fb7e6`). |
 
 ## Layer/architecture audit
 
@@ -111,9 +115,29 @@ does **not** scale value-objective gradients flowing through the shared trunk;
 the trainer now reports this explicitly in the objective-interference probe.
 Consequently this knob cannot protect the representation from noisy terminal
 value gradients and is consistent with the observed large trunk drift plus
-small value-head drift. Do not alter the P0 reproduction. The highest-information
-follow-up is an independent f7-started trunk-frozen localization arm; only a
-strength recovery there justifies a matched `trunk_lr_mult` sweep.
+small value-head drift. Do not alter the P0 reproduction. After the matched
+midpoint/full strength comparison, the highest-information objective follow-up
+is an independent f7-started trunk-frozen localization arm; only a strength
+recovery there justifies a matched `trunk_lr_mult` sweep.
+
+The repaired 32-step f7-started probe refines that hypothesis. With configured
+loss coefficients already applied, mean policy/value trunk gradient norms were
+1.16368/0.32654 (value-to-policy ratio 0.29081). Their mean cosine was +0.02709,
+median +0.02845, and only 10/32 batches were negative; 49.89% of jointly nonzero
+coordinates opposed. This is near-orthogonality, not value dominance or a
+consistently adversarial gradient. The largest relative value pressure was in
+the vertex encoder (0.523x policy), followed by edge (0.435x) and hex (0.405x).
+
+Therefore the first intervention should not be generic gradient surgery. The
+better-supported mechanism is that useful policy distillation saturates early
+while a smaller, mostly unrelated value gradient keeps moving shared features.
+Evaluate the matched midpoint before changing the objective; conditional arms
+then localize value to its head/trunk or shorten its dose. The probe's 100%
+single-GPU clipping fraction is not comparable to P0's 8-rank/global-batch
+clipping rate because the diagnostic intentionally observes rank-local batch
+512 gradients. Its bounded result file SHA-256 is
+`5fb141ebb6d8c443384c91e8b2e25326a0d83a756111bbc8eab8473ab1fd642a`;
+it emitted no candidate or promotion artifact.
 
 ### Policy/action binding
 
@@ -245,6 +269,42 @@ authenticated validation plan (`30b669f`), and a post-run plan schema that
 omitted the per-run LR consumed by the summarizer (`84c12e9`). Both geometry
 trainers completed successfully; the last defect affected postprocessing only.
 
+### Full P0 reproduction and dose saturation
+
+The full independent TEMP reproduction completed on one eight-B200 NVLink host.
+It reloaded the authenticated f7 checkpoint, created fresh Adam state, used
+8x512/global-batch 4096, and consumed exactly 1,024 optimizer steps / 4,194,304
+row draws. The sealed run produced:
+
+- checkpoint SHA-256
+  `ce29663fe519b88537d54afec3dfa4e0033f79a649f8b04d364baead48c462f4`;
+- report SHA-256
+  `4dbfa0b28156d482eae9f01e3a80bf450e0fb6d71f1e2dc4495293658d8779de`;
+- receipt file SHA-256
+  `2333caed6178450a27bdd9cffafd98f9ea1dbca5c16a973e3692458a23eb225b`;
+- semantic receipt digest
+  `sha256:2adc5973e2dae15d2208bfd031aeeb82d0699c44bb6c110a13f9600e56f25d38`;
+- 586.87 seconds trainer time, 44/1,024 clipped steps, no zero-objective
+  steps, and no non-finite failure;
+- objective-matched validation teacher-gap closure 0.135757, with component
+  closures replay=0.212590, n128=0.123271, and n256=0.108810;
+- global relative parameter drift 2.5954% and cosine 0.999663; the six trunk
+  blocks drifted from 2.49% to 3.32%, while the value head drifted 1.54%.
+
+The matched 128-step checkpoint is not merely a systems rehearsal; it reveals a
+strong dose-saturation mechanism. At 524,288 row draws it already reached
+teacher-gap closure 0.102290 with global relative drift 0.6913%. The full run
+used 8x more samples but gained only 0.03347 absolute closure (1.33x total)
+while parameter drift grew 3.75x. Closure per million samples collapsed from
+0.1951 to 0.03237, roughly 6x.
+
+This does **not** prove the midpoint plays better: only matched head-to-head
+evaluation can decide that. It does prove that offline distillation saturates
+far earlier than representation movement. Therefore midpoint and full P0 must
+both be evaluated against exact f7 under the same operator. If midpoint is at
+least as strong, future arms should use a short dose/early selection rather than
+assuming one full 4.19M-row dose is optimal.
+
 ### P2 — highest-information learner arms
 
 Every arm independently reloads f7 and consumes one identical dose:
@@ -294,6 +354,9 @@ the full seat-swapped neutral gate for survivors.
 - `28f42cf` — fail closed on distributed semantics that lack a decisive A1 seal.
 - `30b669f` — reject row-capped validation for authenticated composites.
 - `84c12e9` — bind matched LR into every geometry run and its summary.
+- `cf54d5a` — namespace composite game identity and repair DDP coverage telemetry.
+- `efcc94b`, `d9bf335` — seal completed diagnostic runs and bind finalizer identity.
+- `58fb7e6` — repair the dedicated shared-trunk gradient-interference probe.
 
 The immediate criterion is simple: preserve the independent TEMP win, select the
 fastest mathematically matched DDP geometry, and spend subsequent B200 time only
