@@ -330,7 +330,7 @@ def test_selection_requires_exact_h1_evidence_and_diagnostic_lineage(
             "optimizer_steps": 1024,
             "world_size": 8,
             "batch_size_per_rank": 512,
-            "command_sha256": command_doc["argv_sha256"],
+            "command_sha256": temp.base._file_sha(command_path),
         },
     )
     evidence_path = _write(
@@ -375,6 +375,27 @@ def test_selection_requires_exact_h1_evidence_and_diagnostic_lineage(
         evidence_path=evidence_path,
     )
     assert selected["checkpoint"]["sha256"] == temp.WINNING_DIAGNOSTIC_SHA256
+
+    # Rewriting the command receipt and updating its internal argv digest is
+    # still forbidden: the completed launch binds the original receipt bytes.
+    rewritten = json.loads(command_path.read_text(encoding="utf-8"))
+    rewritten["argv"][rewritten["argv"].index("--lr") + 1] = "0.0001"
+    rewritten["argv_sha256"] = temp.base._digest(rewritten["argv"])
+    _write(command_path, rewritten)
+    with pytest.raises(
+        temp.TemperatureReplicationError,
+        match="command-receipt file binding drift",
+    ):
+        temp._verify_diagnostic_selection(
+            completion_path=completion_path,
+            command_path=command_path,
+            descriptor_path=descriptor,
+            sentinel_path=sentinel,
+            f7_path=f7,
+            checkpoint_path=checkpoint,
+            evidence_path=evidence_path,
+        )
+    _write(command_path, command_doc)
 
     evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
     evidence["superiority_pentanomial_sprt"]["decision"] = "continue"

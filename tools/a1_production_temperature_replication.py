@@ -210,8 +210,13 @@ def _verify_diagnostic_selection(
         or command_doc.get("argv_sha256") != base._digest(command)  # noqa: SLF001
     ):
         _fail("diagnostic command receipt is malformed or drifted")
-    if completion.get("command_sha256") != command_doc.get("argv_sha256"):
-        _fail("diagnostic completion/command binding drift")
+    # Historical temperature-arm launch/completion receipts bind the immutable
+    # command receipt file, while the command receipt independently binds its
+    # semantic argv payload.  These are deliberately two different digests:
+    # checking both prevents either the container document or its executable
+    # command from being rewritten after the completed run.
+    if completion.get("command_sha256") != command_ref["sha256"]:
+        _fail("diagnostic completion/command-receipt file binding drift")
     exact_evidence = {
         "candidate_checkpoint_sha256": WINNING_DIAGNOSTIC_SHA256,
         "baseline_checkpoint_sha256": F7_SHA256,
