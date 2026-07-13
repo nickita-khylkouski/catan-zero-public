@@ -275,6 +275,9 @@ CURRENT_LEARNER_TRAINING_RECIPE: dict[str, Any] = {
 REQUIRED_EVIDENCE = {"a0", "s1", "s2", "s3"}
 HISTORICAL_HANDOFF_MODE = "historical_pre_promotion"
 POST_PROMOTION_HANDOFF_MODE = "post_promotion"
+DISASTER_RECOVERY_HANDOFF_MODE = "disaster_recovery"
+RECOVERY_REFERENCE_SEMANTIC = "recovery_reference"
+RECOVERY_REFERENCE_RELATION = "safety_reference_unproven_predecessor"
 HISTORICAL_V5_HANDOFF_DEFAULTS = {
     "gameplay_policy_aggregation": "mean_improved_policy",
     "sigma_reference_visits": None,
@@ -1069,10 +1072,102 @@ def _promotion_handoff_record(
                 "historical pre-promotion contracts require a non-empty reason"
             )
         return {"mode": HISTORICAL_HANDOFF_MODE, "reason": reason}
+    if mode == DISASTER_RECOVERY_HANDOFF_MODE:
+        _require_exact_keys(raw, {"mode", "path"}, where="promotion_handoff")
+        path = _absolute_ref(str(raw.get("path", "")), base=base)
+        from tools import a1_v5_disaster_recovery as recovery
+
+        try:
+            verified = recovery.verify_committed_receipt(path)
+        except recovery.RecoveryError as error:
+            raise ContractError(f"disaster-recovery receipt replay failed: {error}") from error
+        authority = verified["authority"]
+        receipt = verified["receipt"]
+        recovered = authority.get("recovered_generator")
+        identity = authority.get("producer_identity")
+        safety = authority.get(RECOVERY_REFERENCE_RELATION)
+        if not all(isinstance(item, dict) for item in (recovered, identity, safety)):
+            raise ContractError("disaster-recovery authority lineage is malformed")
+        if (
+            recovered.get("path") != producer.get("path")
+            or recovered.get("sha256") != producer.get("sha256")
+            or identity.get("checkpoint")
+            != {"path": producer.get("path"), "sha256": producer.get("sha256")}
+        ):
+            raise ContractError("draft producer is not the exact recovered generator")
+        if (
+            authority.get("promotion_proof_recreated") is not False
+            or authority.get("wave_lineage_mode") != RECOVERY_REFERENCE_SEMANTIC
+            or safety.get("relationship") != RECOVERY_REFERENCE_RELATION
+            or safety.get("causal_parent_proven") is not False
+        ):
+            raise ContractError("disaster-recovery authority weakens evidence-loss policy")
+        if effective_search is None or evaluator is None or generation is None:
+            raise ContractError("disaster recovery requires complete generation science")
+        identity_search = identity.get("search_config")
+        if not isinstance(identity_search, dict):
+            raise ContractError("recovered producer has no typed search config")
+        try:
+            from tools import a1_promotion_transaction as promotion
+
+            expected_identity_search = promotion._sealed_evaluation_semantics(  # noqa: SLF001
+                {
+                    "science": {
+                        "effective_search_config": effective_search,
+                        "evaluator": evaluator,
+                    },
+                    "generation": generation,
+                }
+            )
+        except promotion.PromotionError as error:
+            raise ContractError(
+                f"cannot project recovered producer identity: {error}"
+            ) from error
+        if effective_search.get("c_scale") != identity_search.get("c_scale"):
+            raise ContractError(
+                "generation c_scale differs from recovered deployed producer identity"
+            )
+        identity_compatibility: dict[str, Any] | None = None
+        if identity_search != expected_identity_search:
+            surviving_path = Path(
+                str(receipt.get("surviving_handoff", {}).get("path", ""))
+            ).resolve(strict=True)
+            identity_compatibility = _historical_v5_handoff_identity_compatibility(
+                path=surviving_path,
+                payload=_load_json(surviving_path),
+                deployed=identity_search,
+                expected=expected_identity_search,
+            )
+        record = _file_record(path, kind="disaster_recovery_receipt")
+        record.update(
+            {
+                "mode": DISASTER_RECOVERY_HANDOFF_MODE,
+                "document_schema": recovery.RECOVERY_SCHEMA,
+                "recovery_receipt_sha256": receipt["recovery_receipt_sha256"],
+                "recovery_lineage_id": authority["recovery_lineage_id"],
+                "registry_role": recovery.RECOVERED_GENERATOR_ROLE,
+                "registry_version": int(
+                    recovered["historical_generation_version_claim"]
+                ),
+                "producer_checkpoint": {
+                    "path": recovered["path"],
+                    "sha256": recovered["sha256"],
+                },
+                "producer_identity_sha256": identity["agent_identity_sha256"],
+                "producer_search_config": dict(identity_search),
+                "producer_search_config_sha256": _digest_value(identity_search),
+                "safety_reference": dict(safety),
+                "wave_lineage_mode": RECOVERY_REFERENCE_SEMANTIC,
+                "promotion_proof_recreated": False,
+            }
+        )
+        if identity_compatibility is not None:
+            record["producer_search_identity_compatibility"] = identity_compatibility
+        return record
     if mode != POST_PROMOTION_HANDOFF_MODE:
         raise ContractError(
             "promotion_handoff must explicitly select historical_pre_promotion "
-            "or post_promotion"
+            "post_promotion, or disaster_recovery"
         )
     _require_exact_keys(raw, {"mode", "path"}, where="promotion_handoff")
     path = _absolute_ref(str(raw.get("path", "")), base=base)
@@ -1188,10 +1283,19 @@ def _promoted_producer_job_identity(
     """
 
     handoff = lock.get("promotion_handoff")
-    if not isinstance(handoff, Mapping) or handoff.get("mode") != POST_PROMOTION_HANDOFF_MODE:
+    if not isinstance(handoff, Mapping) or handoff.get("mode") not in {
+        POST_PROMOTION_HANDOFF_MODE,
+        DISASTER_RECOVERY_HANDOFF_MODE,
+    }:
         return None
-    if handoff.get("document_schema") != promotion_handoff.HANDOFF_SCHEMA:
-        raise ContractError("promoted producer job handoff schema drift")
+    if handoff.get("mode") == POST_PROMOTION_HANDOFF_MODE:
+        if handoff.get("document_schema") != promotion_handoff.HANDOFF_SCHEMA:
+            raise ContractError("promoted producer job handoff schema drift")
+    else:
+        from tools import a1_v5_disaster_recovery as recovery
+
+        if handoff.get("document_schema") != recovery.RECOVERY_SCHEMA:
+            raise ContractError("recovered producer job receipt schema drift")
     producer = _producer(dict(lock))
     bound_checkpoint = handoff.get("producer_checkpoint")
     if bound_checkpoint != {
@@ -1869,6 +1973,8 @@ def sync_generation_guard(draft_path: Path) -> dict[str, Any]:
     s1_payload = _load_json(s1_path)
     post_promotion_s1_path: Path | None = None
     allow_post_promotion_s1 = False
+    recovery_s1_path: Path | None = None
+    allow_recovery_s1 = False
     if (
         draft.get("schema_version") == DRAFT_SCHEMA
         and isinstance(draft.get("promotion_handoff"), dict)
@@ -1879,6 +1985,17 @@ def sync_generation_guard(draft_path: Path) -> dict[str, Any]:
             base=draft_path.parent,
         )
         allow_post_promotion_s1 = True
+    elif (
+        draft.get("schema_version") == DRAFT_SCHEMA
+        and isinstance(draft.get("promotion_handoff"), dict)
+        and draft["promotion_handoff"].get("mode")
+        == DISASTER_RECOVERY_HANDOFF_MODE
+    ):
+        recovery_s1_path = _absolute_ref(
+            str(draft["promotion_handoff"].get("path", "")),
+            base=draft_path.parent,
+        )
+        allow_recovery_s1 = True
     _validate_search_stage_evidence(
         s1_payload,
         path=s1_path,
@@ -1887,6 +2004,8 @@ def sync_generation_guard(draft_path: Path) -> dict[str, Any]:
         final_evaluator={},
         post_promotion_handoff_path=post_promotion_s1_path,
         allow_post_promotion_s1=allow_post_promotion_s1,
+        recovery_receipt_path=recovery_s1_path,
+        allow_recovery_s1=allow_recovery_s1,
     )
     s1_record = _file_record(s1_path, kind="s1")
 
@@ -3841,6 +3960,46 @@ def _bind_v3_checkpoint_lineage(
             "v3 source mix requires exactly one recent-history and one hard-negative checkpoint"
         )
     producer["version"] = int(handoff_record["registry_version"])
+    history_record = history[0]
+    if handoff_record.get("mode") == DISASTER_RECOVERY_HANDOFF_MODE:
+        safety = handoff_record.get("safety_reference")
+        if not isinstance(safety, dict):
+            raise ContractError("recovery handoff has no safety reference")
+        try:
+            safety_path = Path(str(safety["path"])).resolve(strict=True)
+            safety_version = safety["version"]
+        except (KeyError, OSError) as error:
+            raise ContractError(f"recovery safety reference is malformed: {error}") from error
+        if (
+            safety_path != Path(str(history_record["path"])).resolve(strict=True)
+            or safety.get("sha256") != history_record["sha256"]
+            or safety.get("relationship") != RECOVERY_REFERENCE_RELATION
+            or safety.get("causal_parent_proven") is not False
+            or isinstance(safety_version, bool)
+            or not isinstance(safety_version, int)
+            or safety_version < 1
+        ):
+            raise ContractError(
+                "recent_history scheduler lane must be exact authenticated f7 "
+                "recovery reference"
+            )
+        history_record["version"] = int(safety_version)
+        history_record["lineage"] = {
+            "relation": RECOVERY_REFERENCE_RELATION,
+            "semantic": RECOVERY_REFERENCE_SEMANTIC,
+            "causal_parent_proven": False,
+            "promotion_proof_recreated": False,
+            "recovery_receipt": {
+                "path": str(handoff_record["path"]),
+                "sha256": handoff_record["sha256"],
+                "recovery_receipt_sha256": handoff_record[
+                    "recovery_receipt_sha256"
+                ],
+                "recovery_lineage_id": handoff_record["recovery_lineage_id"],
+            },
+        }
+        _bind_hard_negative_incumbent_to_producer(records)
+        return
     handoff_payload = _load_json(Path(str(handoff_record["path"])))
     receipt_ref = handoff_payload.get("promotion_receipt")
     if not isinstance(receipt_ref, dict):
@@ -3854,7 +4013,6 @@ def _bind_v3_checkpoint_lineage(
     displaced = receipt.get("champion")
     if not isinstance(displaced, dict):
         raise ContractError("promotion receipt has no displaced incumbent checkpoint")
-    history_record = history[0]
     try:
         displaced_path = Path(str(displaced["path"])).expanduser().resolve(strict=True)
         displaced_version = displaced["version"]
@@ -3880,6 +4038,62 @@ def _bind_v3_checkpoint_lineage(
         },
     }
     _bind_hard_negative_incumbent_to_producer(records)
+
+
+def _category_semantics(
+    records: list[dict[str, Any]], handoff_record: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Separate stable scheduler IDs from their authenticated lineage meaning."""
+
+    by_role = {record["role"]: record for record in records}
+    history = by_role["history"]
+    hard = by_role["hard_negative"]
+    producer = by_role["producer"]
+    history_lineage = history.get("lineage")
+    if not isinstance(history_lineage, dict):
+        raise ContractError("recent-history scheduler lane has no sealed semantics")
+    recovery_mode = handoff_record.get("mode") == DISASTER_RECOVERY_HANDOFF_MODE
+    if recovery_mode:
+        recent = {
+            "scheduler_category": "recent_history",
+            "semantic": RECOVERY_REFERENCE_SEMANTIC,
+            "relation": RECOVERY_REFERENCE_RELATION,
+            "causal_parent_proven": False,
+            "promotion_proof_recreated": False,
+            "checkpoint": {
+                key: history[key] for key in ("id", "path", "sha256", "version")
+            },
+            "recovery_lineage_id": handoff_record["recovery_lineage_id"],
+        }
+    else:
+        recent = {
+            "scheduler_category": "recent_history",
+            "semantic": "recent_history",
+            "relation": "immediate_displaced_incumbent",
+            "causal_parent_proven": True,
+            "checkpoint": {
+                key: history[key] for key in ("id", "path", "sha256", "version")
+            },
+        }
+    return {
+        "current_producer": {
+            "scheduler_category": "current_producer",
+            "semantic": "current_producer",
+            "relation": "self_play",
+            "checkpoint": {
+                key: producer[key] for key in ("id", "path", "sha256", "version")
+            },
+        },
+        "recent_history": recent,
+        "hard_negative": {
+            "scheduler_category": "hard_negative",
+            "semantic": "hard_negative",
+            "relation": "sealed_hard_negative_selection",
+            "checkpoint": {
+                key: hard[key] for key in ("id", "path", "sha256", "version")
+            },
+        },
+    }
 
 
 def _verify_declared_source_artifacts(
@@ -4522,6 +4736,123 @@ def _validate_post_promotion_s1_operator_binding(
     }
 
 
+def _validate_recovery_s1_operator_binding(
+    payload: dict[str, Any],
+    *,
+    path: Path,
+    expected_stage: str,
+    final_search: dict[str, Any],
+    final_evaluator: dict[str, Any],
+    recovery_receipt_path: Path | None,
+    allow_recovery_s1: bool,
+) -> dict[str, Any]:
+    """Replay the recovery-only c_scale bridge without promotion laundering."""
+
+    if expected_stage != "s1" or not allow_recovery_s1 or recovery_receipt_path is None:
+        raise ContractError(
+            "recovery S1 is accepted only by a v3 disaster-recovery contract"
+        )
+    try:
+        replayed = operator_binding._replay_recovery_s1(path)  # noqa: SLF001
+    except operator_binding.BindingError as error:
+        raise ContractError(f"recovery S1 replay failed: {error}") from error
+    if replayed != payload or payload.get("promotion_proof_recreated") is not False:
+        raise ContractError("recovery S1 semantic replay/evidence-loss policy drift")
+    selected = payload.get("selected_fields")
+    if not isinstance(selected, dict) or set(selected) != operator_binding.S1_SELECTED_KEYS:
+        raise ContractError("recovery S1 selected_fields shape mismatch")
+    mismatches = {
+        key: (selected[key], final_search.get(key))
+        for key in selected
+        if selected[key] != final_search.get(key)
+    }
+    if mismatches or payload.get("selected_fields_sha256") != _digest_value(selected):
+        raise ContractError(f"recovery S1 fields mismatch final contract: {mismatches}")
+    receipt_ref = payload.get("source_recovery_receipt")
+    if not isinstance(receipt_ref, dict) or set(receipt_ref) != {
+        "path",
+        "sha256",
+        "recovery_receipt_sha256",
+        "recovery_lineage_id",
+    }:
+        raise ContractError("recovery S1 receipt reference is malformed")
+    bound_receipt, receipt_record = _validate_operator_binding_reference(
+        {"path": receipt_ref["path"], "sha256": receipt_ref["sha256"]},
+        owner_path=path,
+        where="recovery S1 source receipt",
+    )
+    if bound_receipt != recovery_receipt_path.resolve(strict=True):
+        raise ContractError("recovery S1 binds a different recovery receipt")
+    from tools import a1_v5_disaster_recovery as recovery
+
+    try:
+        verified = recovery.verify_committed_receipt(bound_receipt)
+    except recovery.RecoveryError as error:
+        raise ContractError(f"recovery S1 receipt replay failed: {error}") from error
+    authority = verified["authority"]
+    receipt = verified["receipt"]
+    if (
+        receipt_ref["recovery_receipt_sha256"]
+        != receipt["recovery_receipt_sha256"]
+        or receipt_ref["recovery_lineage_id"] != authority["recovery_lineage_id"]
+    ):
+        raise ContractError("recovery S1 receipt semantic identity drift")
+    legacy_path, legacy_record = _validate_operator_binding_reference(
+        payload.get("source_legacy_s1"),
+        owner_path=path,
+        where="recovery S1 legacy source",
+    )
+    legacy_search = dict(final_search)
+    legacy_search["c_scale"] = operator_binding.RECOVERY_S1_OVERRIDE[
+        "legacy_value"
+    ]
+    legacy_semantic = _validate_search_stage_evidence(
+        _load_json(legacy_path),
+        path=legacy_path,
+        expected_stage="s1",
+        final_search=legacy_search,
+        final_evaluator=final_evaluator,
+    )
+    if (
+        payload.get("source_legacy_s1_selected_fields_sha256")
+        != legacy_semantic["selected_fields_sha256"]
+    ):
+        raise ContractError("recovery S1 legacy selected-fields digest mismatch")
+    emitter_path, emitter_record = _validate_operator_binding_reference(
+        payload.get("emitter"), owner_path=path, where="recovery S1 emitter"
+    )
+    if not emitter_path.as_posix().endswith("tools/search_operator_binding.py"):
+        raise ContractError("recovery S1 binding has an untrusted emitter")
+    checkpoint = payload.get("producer_checkpoint")
+    _require_exact_keys(
+        checkpoint, {"path", "sha256"}, where="recovery S1 producer checkpoint"
+    )
+    checkpoint_path = _absolute_ref(str(checkpoint["path"]), base=path.parent)
+    checkpoint_record = {"path": str(checkpoint_path), "sha256": _sha256(checkpoint_path)}
+    identity = authority["producer_identity"]
+    if (
+        checkpoint_record != checkpoint
+        or checkpoint != identity.get("checkpoint")
+        or payload.get("producer_identity_sha256")
+        != identity.get("agent_identity_sha256")
+        or payload.get("producer_search_config_sha256")
+        != _digest_value(identity.get("search_config"))
+    ):
+        raise ContractError("recovery S1 producer identity drift")
+    records = [legacy_record, *legacy_semantic["source_artifacts"]]
+    records.extend([receipt_record, emitter_record, checkpoint_record])
+    return {
+        "decision": payload["decision"],
+        "evidence_class": operator_binding.ARTIFACT_KIND,
+        "selected_fields": dict(selected),
+        "selected_fields_sha256": payload["selected_fields_sha256"],
+        "checkpoint": dict(checkpoint),
+        "source_artifacts": records,
+        "artifact_content_sha256": payload["artifact_content_sha256"],
+        "binding_time_utc": payload["binding_time_utc"],
+    }
+
+
 def _validate_search_stage_evidence(
     payload: dict[str, Any],
     *,
@@ -4531,6 +4862,8 @@ def _validate_search_stage_evidence(
     final_evaluator: dict[str, Any],
     post_promotion_handoff_path: Path | None = None,
     allow_post_promotion_s1: bool = False,
+    recovery_receipt_path: Path | None = None,
+    allow_recovery_s1: bool = False,
 ) -> dict[str, Any]:
     if payload.get("schema_version") == operator_binding.POST_PROMOTION_S1_SCHEMA:
         return _validate_post_promotion_s1_operator_binding(
@@ -4541,6 +4874,16 @@ def _validate_search_stage_evidence(
             final_evaluator=final_evaluator,
             post_promotion_handoff_path=post_promotion_handoff_path,
             allow_post_promotion_s1=allow_post_promotion_s1,
+        )
+    if payload.get("schema_version") == operator_binding.RECOVERY_S1_SCHEMA:
+        return _validate_recovery_s1_operator_binding(
+            payload,
+            path=path,
+            expected_stage=expected_stage,
+            final_search=final_search,
+            final_evaluator=final_evaluator,
+            recovery_receipt_path=recovery_receipt_path,
+            allow_recovery_s1=allow_recovery_s1,
         )
     if payload.get("schema_version") == "a1-s3-role-operator-hold-v1":
         # Lazy import avoids the pre-wave -> pool -> promotion -> pre-wave
@@ -6003,8 +6346,14 @@ def build_lock(
         raise ContractError(
             "legacy v2 drafts are accepted only as explicitly historical pre-promotion contracts"
         )
-    if draft_schema == DRAFT_SCHEMA and handoff_mode != POST_PROMOTION_HANDOFF_MODE:
-        raise ContractError("new v3 waves require a committed post-promotion handoff")
+    if draft_schema == DRAFT_SCHEMA and handoff_mode not in {
+        POST_PROMOTION_HANDOFF_MODE,
+        DISASTER_RECOVERY_HANDOFF_MODE,
+    }:
+        raise ContractError(
+            "new v3 waves require a committed promotion handoff or the one "
+            "authenticated disaster-recovery receipt"
+        )
     _assert_no_unresolved(draft)
     contract_id = str(draft["contract_id"])
     if not re.fullmatch(r"[a-z0-9][a-z0-9_.-]+", contract_id):
@@ -6136,11 +6485,21 @@ def build_lock(
     evidence = []
     post_promotion_s1_path: Path | None = None
     allow_post_promotion_s1 = False
+    recovery_s1_path: Path | None = None
+    allow_recovery_s1 = False
     if draft_schema == DRAFT_SCHEMA and handoff_mode == POST_PROMOTION_HANDOFF_MODE:
         post_promotion_s1_path = _absolute_ref(
             str(draft["promotion_handoff"].get("path", "")), base=base
         )
         allow_post_promotion_s1 = True
+    elif (
+        draft_schema == DRAFT_SCHEMA
+        and handoff_mode == DISASTER_RECOVERY_HANDOFF_MODE
+    ):
+        recovery_s1_path = _absolute_ref(
+            str(draft["promotion_handoff"].get("path", "")), base=base
+        )
+        allow_recovery_s1 = True
     for item in sorted(evidence_raw, key=lambda item: str(item["kind"])):
         if set(item) != {"kind", "path"}:
             continue
@@ -6164,6 +6523,8 @@ def build_lock(
                 final_evaluator=evaluator,
                 post_promotion_handoff_path=post_promotion_s1_path,
                 allow_post_promotion_s1=allow_post_promotion_s1,
+                recovery_receipt_path=recovery_s1_path,
+                allow_recovery_s1=allow_recovery_s1,
             )
         evidence.append(record)
     if len(evidence) != len(evidence_raw):
@@ -6442,6 +6803,15 @@ def build_lock(
         "generation": generation,
         "checkpoints": checkpoint_records,
         "source_categories": categories,
+        **(
+            {}
+            if draft_schema == LEGACY_DRAFT_SCHEMA
+            else {
+                "category_semantics": _category_semantics(
+                    checkpoint_records, handoff_record
+                )
+            }
+        ),
         "game_contract": {
             **(
                 {}
@@ -6513,6 +6883,16 @@ def verify_lock(
         if lock_schema != LOCK_SCHEMA:
             raise ContractError("post-promotion handoffs require the v3 lock schema")
         _verify_artifact_records([handoff_record])
+    elif handoff_record.get("mode") == DISASTER_RECOVERY_HANDOFF_MODE:
+        if lock_schema != LOCK_SCHEMA:
+            raise ContractError("disaster recovery requires the v3 lock schema")
+        _verify_artifact_records([handoff_record])
+        if (
+            handoff_record.get("wave_lineage_mode")
+            != RECOVERY_REFERENCE_SEMANTIC
+            or handoff_record.get("promotion_proof_recreated") is not False
+        ):
+            raise ContractError("disaster-recovery handoff policy drift")
     elif handoff_record.get("mode") != HISTORICAL_HANDOFF_MODE:
         raise ContractError("lock promotion handoff mode is invalid")
     elif lock_schema != LEGACY_LOCK_SCHEMA:
@@ -6529,6 +6909,16 @@ def verify_lock(
         _verify_artifact_records(evidence["semantic_decision"]["source_artifacts"])
     _verify_artifact_records(lock["checkpoints"])
     if lock_schema == LOCK_SCHEMA:
+        category_semantics = lock.get("category_semantics")
+        if category_semantics is None:
+            if handoff_record.get("mode") == DISASTER_RECOVERY_HANDOFF_MODE:
+                raise ContractError(
+                    "recovery lock cannot omit category semantics"
+                )
+        elif category_semantics != _category_semantics(
+            lock["checkpoints"], handoff_record
+        ):
+            raise ContractError("sealed source-category semantics drift")
         for record in lock["checkpoints"]:
             version = record.get("version")
             if isinstance(version, bool) or not isinstance(version, int) or version < 0:
@@ -6537,13 +6927,29 @@ def verify_lock(
                 )
             if record.get("role") == "history":
                 lineage = record.get("lineage")
-                if (
-                    not isinstance(lineage, dict)
-                    or lineage.get("relation") != "immediate_displaced_incumbent"
-                    or not isinstance(lineage.get("promotion_receipt"), dict)
-                ):
-                    raise ContractError("v3 recent-history lineage binding drift")
-                _verify_artifact_records([lineage["promotion_receipt"]])
+                if handoff_record.get("mode") == DISASTER_RECOVERY_HANDOFF_MODE:
+                    if (
+                        not isinstance(lineage, dict)
+                        or lineage.get("relation") != RECOVERY_REFERENCE_RELATION
+                        or lineage.get("semantic") != RECOVERY_REFERENCE_SEMANTIC
+                        or lineage.get("causal_parent_proven") is not False
+                        or lineage.get("promotion_proof_recreated") is not False
+                        or not isinstance(lineage.get("recovery_receipt"), dict)
+                        or "promotion_receipt" in lineage
+                    ):
+                        raise ContractError(
+                            "v3 recovery-reference lineage binding drift"
+                        )
+                    _verify_artifact_records([lineage["recovery_receipt"]])
+                else:
+                    if (
+                        not isinstance(lineage, dict)
+                        or lineage.get("relation")
+                        != "immediate_displaced_incumbent"
+                        or not isinstance(lineage.get("promotion_receipt"), dict)
+                    ):
+                        raise ContractError("v3 recent-history lineage binding drift")
+                    _verify_artifact_records([lineage["promotion_receipt"]])
             elif record.get("role") == "hard_negative":
                 selection = record.get("selection_evidence")
                 if not isinstance(selection, dict):
@@ -7029,13 +7435,42 @@ def _category_opponent_sha256(lock: dict[str, Any], name: str) -> list[str]:
     )
 
 
+def _sealed_category_semantic(
+    lock: Mapping[str, Any], category: str
+) -> dict[str, Any] | None:
+    """Return the optional v3 scheduler-lane meaning without inventing one.
+
+    Issued pre-recovery locks did not carry this field, so their byte-level
+    attestations remain valid.  New locks seal it and every downstream artifact
+    must copy it exactly; in particular, the stable ``recent_history`` scheduler
+    identifier cannot launder a recovery safety reference into a causal-parent
+    claim.
+    """
+
+    semantics = lock.get("category_semantics")
+    if semantics is None:
+        return None
+    if not isinstance(semantics, Mapping):
+        raise ContractError("source-category semantics are malformed")
+    value = semantics.get(category)
+    if not isinstance(value, Mapping):
+        raise ContractError(f"source-category semantic is missing for {category}")
+    return dict(value)
+
+
 def _render_mix_manifest(lock: dict[str, Any], category: str) -> dict[str, Any]:
     spec = _category_by_name(lock, category)
     by_id = {record["id"]: record for record in lock["checkpoints"]}
+    category_semantic = _sealed_category_semantic(lock, category)
     return {
         "_a1_contract": {
             "contract_sha256": lock["contract_sha256"],
             "category": category,
+            **(
+                {}
+                if category_semantic is None
+                else {"category_semantic": category_semantic}
+            ),
         },
         "categories": [
             {
@@ -7212,6 +7647,7 @@ def _job_environment(lock: dict[str, Any], job: dict[str, Any]) -> dict[str, str
 def _job_attestation(lock: dict[str, Any], job: dict[str, Any]) -> dict[str, Any]:
     search_identity = _job_search_identity(lock, job)
     promoted_identity = _promoted_producer_job_identity(lock, job)
+    category_semantic = _sealed_category_semantic(lock, str(job["category"]))
     return {
         "schema_version": GENERATION_JOB_ATTESTATION_SCHEMA,
         **({} if "arm_id" not in job else {"arm_id": job["arm_id"]}),
@@ -7221,6 +7657,11 @@ def _job_attestation(lock: dict[str, Any], job: dict[str, Any]) -> dict[str, Any
         "job_id": job["job_id"],
         "worker_id": job["worker_id"],
         "category": job["category"],
+        **(
+            {}
+            if category_semantic is None
+            else {"category_semantic": category_semantic}
+        ),
         "base_seed": job["base_seed"],
         "games": job["games"],
         "attempts": job["attempts"],
@@ -8506,10 +8947,19 @@ def audit_outputs(
                 )
                 mix_manifest = _load_json(mix_manifest_path)
                 attestation = dict(mix_manifest.get("_a1_contract", {}))
-                if attestation != {
+                category_semantic = _sealed_category_semantic(
+                    lock, str(job["category"])
+                )
+                expected_mix_attestation = {
                     "contract_sha256": lock["contract_sha256"],
                     "category": job["category"],
-                }:
+                    **(
+                        {}
+                        if category_semantic is None
+                        else {"category_semantic": category_semantic}
+                    ),
+                }
+                if attestation != expected_mix_attestation:
                     errors.append(
                         f"{job['job_id']}: opponent-mix contract attestation drift"
                     )
@@ -8653,12 +9103,18 @@ def audit_outputs(
                 f"selected quota {job['games']}"
             )
         category_seeds[job["category"]].update(selected)
+        category_semantic = _sealed_category_semantic(lock, str(job["category"]))
         selected_game_records.extend(
             {
                 "game_seed": int(seed),
                 "job_id": job["job_id"],
                 "worker_id": job["worker_id"],
                 "category": job["category"],
+                **(
+                    {}
+                    if category_semantic is None
+                    else {"category_semantic": category_semantic}
+                ),
                 "producer_checkpoint_sha256": producer["sha256"],
                 "opponent_checkpoint_sha256": _category_opponent_sha256(
                     lock, job["category"]
@@ -8670,6 +9126,11 @@ def audit_outputs(
             {
                 "job_id": job["job_id"],
                 "category": job["category"],
+                **(
+                    {}
+                    if category_semantic is None
+                    else {"category_semantic": category_semantic}
+                ),
                 "attempts": int(job["attempts"]),
                 "complete_attempts": len(complete),
                 "truncated_attempts": observed_truncated,
@@ -8960,6 +9421,15 @@ def audit_outputs(
         "shard_inventory_sha256": _digest_value(shard_records),
         "source_provenance": {
             category: {
+                **(
+                    {}
+                    if _sealed_category_semantic(lock, category) is None
+                    else {
+                        "category_semantic": _sealed_category_semantic(
+                            lock, category
+                        )
+                    }
+                ),
                 "producer_checkpoint_sha256": producer["sha256"],
                 "opponent_checkpoint_sha256": _category_opponent_sha256(
                     lock, category
@@ -8974,6 +9444,11 @@ def audit_outputs(
             }
             for category in expected_games
         },
+        **(
+            {}
+            if lock.get("category_semantics") is None
+            else {"category_semantics": lock["category_semantics"]}
+        ),
         **(
             {}
             if relocation is None

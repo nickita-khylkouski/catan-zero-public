@@ -29,7 +29,7 @@ import time
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Callable, Iterator, Sequence
+from typing import Any, Callable, Iterator, Mapping, Sequence
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
@@ -3034,6 +3034,7 @@ def _verify_evaluation_baseline_binding(
     comparison_mode: str = "promotion_parent",
     candidate_parent_path: Path | None = None,
     candidate_parent_sha256: str | None = None,
+    candidate_parent_search_config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     value = _require_exact_keys(
         raw,
@@ -3084,8 +3085,46 @@ def _verify_evaluation_baseline_binding(
             raise PromotionError(
                 f"{where} branch initializer must differ from displaced incumbent"
             )
+        expected_incumbent_path = champion_path
+        expected_incumbent_sha256 = champion_sha256
+        expected_incumbent_search_config = champion_search_config
+    elif comparison_mode == "recovery_safety_reference":
+        if (
+            candidate_parent_path is None
+            or candidate_parent_sha256 is None
+            or candidate_parent_search_config is None
+        ):
+            raise PromotionError(
+                f"{where} recovery safety comparison has no recovered incumbent identity"
+            )
+        if (
+            value["schema_version"] != "a1-evaluation-baseline-binding-v3"
+            or value["comparison_mode"] != "recovery_safety_reference"
+            or value["promotion_eligible"] is not True
+            or value["historical_comparison_reason"]
+            != "disaster_recovery_f7_non_regression_veto"
+        ):
+            raise PromotionError(
+                f"{where} is not the exact recovery safety-reference binding"
+            )
+        expected_parent_path = candidate_parent_path
+        expected_parent_sha256 = candidate_parent_sha256
+        expected_incumbent_path = candidate_parent_path
+        expected_incumbent_sha256 = candidate_parent_sha256
+        expected_incumbent_search_config = candidate_parent_search_config
+        if (
+            expected_parent_path == champion_path
+            or expected_parent_sha256 == champion_sha256
+        ):
+            raise PromotionError(
+                f"{where} recovery safety reference must differ from recovered incumbent"
+            )
     else:
         raise PromotionError(f"{where} has unsupported promotion comparison mode")
+    if comparison_mode == "promotion_parent":
+        expected_incumbent_path = champion_path
+        expected_incumbent_sha256 = champion_sha256
+        expected_incumbent_search_config = champion_search_config
     _verify_bound_checkpoint(
         value["candidate_parent"],
         expected_path=expected_parent_path,
@@ -3114,19 +3153,22 @@ def _verify_evaluation_baseline_binding(
     )
     _verify_bound_checkpoint(
         {"path": incumbent["path"], "sha256": incumbent["sha256"]},
-        expected_path=champion_path,
-        expected_sha256=champion_sha256,
+        expected_path=expected_incumbent_path,
+        expected_sha256=expected_incumbent_sha256,
         where=f"{where}.authoritative_incumbent",
         base=base,
     )
     _verify_role_search_config(
         incumbent["search_config"],
-        expected_search_config=champion_search_config,
+        expected_search_config=expected_incumbent_search_config,
         where=f"{where}.authoritative_incumbent.search_config",
     )
     expected_identity = _agent_identity(
-        {"path": str(champion_path), "sha256": champion_sha256},
-        champion_search_config,
+        {
+            "path": str(expected_incumbent_path),
+            "sha256": expected_incumbent_sha256,
+        },
+        expected_incumbent_search_config,
     )["agent_identity_sha256"]
     if incumbent["agent_identity_sha256"] != expected_identity:
         raise PromotionError(
@@ -3249,8 +3291,16 @@ def _verify_internal_h2h_source(
     comparison_mode: str = "promotion_parent",
     candidate_parent_path: Path | None = None,
     candidate_parent_sha256: str | None = None,
+    candidate_parent_search_config: dict[str, Any] | None = None,
     require_strict_superiority: bool = False,
+    verdict_policy: str = "strict_h1",
 ) -> None:
+    if verdict_policy not in {"strict_h1", "non_regression_veto"}:
+        raise PromotionError(f"{where} has unsupported verdict policy")
+    if require_strict_superiority and verdict_policy != "strict_h1":
+        raise PromotionError(
+            f"{where} strict superiority cannot be combined with a non-regression veto"
+        )
     _verify_evaluation_baseline_binding(
         payload.get("evaluation_binding"),
         champion_path=champion,
@@ -3261,6 +3311,7 @@ def _verify_internal_h2h_source(
         comparison_mode=comparison_mode,
         candidate_parent_path=candidate_parent_path,
         candidate_parent_sha256=candidate_parent_sha256,
+        candidate_parent_search_config=candidate_parent_search_config,
     )
     if (
         _absolute(payload.get("candidate_checkpoint"), base=candidate.parent)
@@ -3459,8 +3510,13 @@ def _verify_internal_h2h_source(
             raise PromotionError(
                 f"{where} typed config enables forbidden wide budget {key}"
             )
-    if payload.get("verdict") != "H1":
-        raise PromotionError(f"{where} verdict is not H1")
+    allowed_decisions = (
+        {"H1"} if verdict_policy == "strict_h1" else {"H1", "continue"}
+    )
+    if payload.get("verdict") not in allowed_decisions:
+        raise PromotionError(
+            f"{where} verdict fails {verdict_policy}: {payload.get('verdict')!r}"
+        )
     if (
         payload.get("candidate_value_readout") != "scalar"
         or payload.get("baseline_value_readout") != "scalar"
@@ -3498,8 +3554,10 @@ def _verify_internal_h2h_source(
     ):
         raise PromotionError(f"{where} does not use the sealed global n128 budget")
     sprt = payload.get("pentanomial_sprt")
-    if not isinstance(sprt, dict) or sprt.get("decision") != "H1":
-        raise PromotionError(f"{where} pentanomial verdict is not H1")
+    if not isinstance(sprt, dict) or sprt.get("decision") not in allowed_decisions:
+        raise PromotionError(
+            f"{where} pentanomial verdict fails {verdict_policy}"
+        )
     complete_pairs = _positive_int(
         payload.get("complete_pairs"), where=f"{where}.complete_pairs"
     )
@@ -3544,7 +3602,7 @@ def _verify_internal_h2h_source(
     replayed = evaluate_pentanomial_sprt(
         pair_scores, elo0=-10.0, elo1=15.0, alpha=0.05, beta=0.05
     )
-    if replayed["decision"] != "H1" or replayed != sprt:
+    if replayed["decision"] not in allowed_decisions or replayed != sprt:
         raise PromotionError(f"{where} pentanomial evidence does not replay exactly")
     superiority = payload.get("superiority_pentanomial_sprt")
     replayed_superiority = evaluate_pentanomial_sprt(
@@ -3562,7 +3620,7 @@ def _verify_internal_h2h_source(
         raise PromotionError(
             f"{where} superiority pentanomial evidence does not replay exactly"
         )
-    if replayed_superiority["decision"] != "H1":
+    if verdict_policy == "strict_h1" and replayed_superiority["decision"] != "H1":
         raise PromotionError(
             f"{where} does not prove positive-Elo superiority: "
             f"decision={replayed_superiority['decision']!r}"
@@ -5276,6 +5334,84 @@ def _verify_branch_challenge_lineage(
     }
 
 
+def _verify_recovery_incumbent_authority(
+    *,
+    incumbent: Any,
+    recovery_authority: Mapping[str, Any] | None,
+    champion_path: Path,
+    champion_sha256: str,
+    branch_challenge: bool,
+) -> bool:
+    """Authenticate the quarantined recovery parent before any promotion use."""
+
+    incumbent_provenance = (
+        incumbent.provenance if isinstance(incumbent.provenance, dict) else {}
+    )
+    recovery_incumbent = (
+        incumbent_provenance.get("recovery_schema")
+        == "a1-v5-disaster-recovery-bootstrap-v1"
+    )
+    if recovery_incumbent and recovery_authority is None:
+        raise PromotionError(
+            "ordinary promotion mode cannot consume a disaster-recovery incumbent; "
+            "use the canonical recovery gate verifier"
+        )
+    if not recovery_incumbent and recovery_authority is not None:
+        raise PromotionError(
+            "recovery gate authority cannot be applied to an ordinary incumbent"
+        )
+    if not recovery_incumbent:
+        return False
+    if branch_challenge:
+        raise PromotionError(
+            "a disaster-recovery incumbent requires strict H1 over its exact bytes; "
+            "branch-challenge fallback is forbidden"
+        )
+    recovery = _require_exact_keys(
+        recovery_authority,
+        {
+            "schema_version",
+            "recovery_receipt",
+            "recovery_lineage_id",
+            "recovered_generator",
+            "safety_reference_unproven_predecessor",
+            "producer_identity",
+            "promotion_proof_recreated",
+            "dual_baseline_fresh_gate_required",
+            "promotion_eligible",
+            "training_proof",
+            "wave_lineage_mode",
+            "authority_sha256",
+        },
+        where="v5 recovery authority",
+    )
+    recovery_unsigned = dict(recovery)
+    recovery_digest = recovery_unsigned.pop("authority_sha256")
+    if (
+        recovery["schema_version"] != "a1-v5-disaster-recovery-authority-v1"
+        or recovery_digest != _digest_value(recovery_unsigned)
+        or recovery["promotion_proof_recreated"] is not False
+        or recovery["dual_baseline_fresh_gate_required"] is not True
+        or recovery["promotion_eligible"] is not False
+        or recovery["training_proof"] is not False
+        or recovery["wave_lineage_mode"] != "recovery_reference"
+    ):
+        raise PromotionError("v5 recovery authority policy/digest drift")
+    recovered = recovery["recovered_generator"]
+    if (
+        not isinstance(recovered, dict)
+        or recovered.get("path") != str(champion_path)
+        or recovered.get("sha256") != champion_sha256
+        or recovered.get("md5") != _md5(champion_path)
+        or incumbent_provenance.get("recovery_lineage_id")
+        != recovery["recovery_lineage_id"]
+    ):
+        raise PromotionError(
+            "v5 recovery authority differs from authoritative recovered incumbent"
+        )
+    return True
+
+
 def _verify_adjudication(
     path: Path,
     *,
@@ -5285,6 +5421,7 @@ def _verify_adjudication(
     registry: ChampionRegistry,
     current_pointer: Path,
     legacy_snapshot: _LegacyPromotionSnapshot | None = None,
+    recovery_authority: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     raw = _load_json(path)
     common_keys = {
@@ -5462,6 +5599,13 @@ def _verify_adjudication(
     incumbent = registry.get_role("generator_champion")
     if incumbent is None:
         raise PromotionError("authoritative registry has no generator_champion")
+    recovery_incumbent = _verify_recovery_incumbent_authority(
+        incumbent=incumbent,
+        recovery_authority=recovery_authority,
+        champion_path=champion_path,
+        champion_sha256=champion_ref["sha256"],
+        branch_challenge=branch_challenge,
+    )
     if str(Path(incumbent.checkpoint_path).expanduser().resolve()) != str(
         champion_path
     ):
@@ -5624,7 +5768,11 @@ def _verify_adjudication(
 
     return {
         "promotion_mode": (
-            "branch_challenge" if branch_challenge else "promotion_parent"
+            "branch_challenge"
+            if branch_challenge
+            else "disaster_recovery_parent"
+            if recovery_incumbent
+            else "promotion_parent"
         ),
         "candidate_lineage": branch_lineage,
         "candidate": {

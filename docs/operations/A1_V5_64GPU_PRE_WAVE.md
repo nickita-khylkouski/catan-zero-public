@@ -29,8 +29,11 @@ not authorize a launch.
   canonical `catanatron_rs` 0.1.8 wheel; archived v2 locks retain their omitted
   flags and historical Python-feature path.
 
-The v3 draft does not trust these prose values. Seal replays a committed
-post-promotion handoff and refuses a different checkpoint or search identity.
+The v3 draft does not trust these prose values. In an ordinary clean-lineage
+wave, seal replays a committed post-promotion handoff and refuses a different
+checkpoint or search identity. The one documented disaster-recovery wave may
+instead replay the exact allowlisted recovery receipt described in
+`docs/A1_V5_DISASTER_RECOVERY.md`; that receipt does not recreate a promotion.
 
 ## Exact 64-GPU quotas
 
@@ -58,9 +61,17 @@ Per host this yields:
 
 ## Opponent refresh requirements
 
-- `recent_history` must be the exact incumbent displaced by the v5 promotion.
-  Seal derives and verifies it from the committed promotion receipt; a
-  hand-written "recent" path is refused.
+- In ordinary clean-lineage waves, `recent_history` must be the exact incumbent
+  displaced by the promotion. Seal derives and verifies it from the committed
+  promotion receipt; a hand-written "recent" path is refused.
+- In the one v5 disaster-recovery wave, `recent_history` remains only the
+  scheduler/storage lane ID. Its sealed semantic is `recovery_reference`, its
+  exact checkpoint is authenticated f7, and its relationship is
+  `safety_reference_unproven_predecessor` with `causal_parent_proven=false` and
+  `promotion_proof_recreated=false`. Job, audit, composite, and learner
+  provenance must carry that meaning unchanged. It must never be described as
+  the displaced v5 incumbent. Future ordinary waves retain the clean-lineage
+  rule above.
 - `hard_negative` must bind an `a1-hard-negative-selection-v1` record. That
   record authenticates the checkpoint bytes, version, selection reason, and
   immutable evaluation evidence used to choose it.

@@ -260,6 +260,7 @@ def _evaluation_binding(
         "promotion_parent",
         "branch_challenge",
         "historical_comparison",
+        "recovery_safety_reference",
     }:
         raise FleetError(f"unknown evaluation comparison mode {comparison_mode!r}")
     parent_ref = _checkpoint_ref(candidate_parent)
@@ -335,13 +336,36 @@ def _evaluation_binding(
         # The schema bump prevents old promotion-parent consumers from silently
         # interpreting a split parent/baseline binding as an ordinary child.
         binding_schema = "a1-evaluation-baseline-binding-v2"
-    else:
+    elif comparison_mode == "historical_comparison":
         if not isinstance(historical_comparison_reason, str) or not historical_comparison_reason.strip():
             raise FleetError(
-                "historical comparison requires an explicit nonempty reason"
+            "historical comparison requires an explicit nonempty reason"
             )
         promotion_eligible = False
         binding_schema = "a1-evaluation-baseline-binding-v1"
+    else:
+        if (
+            historical_comparison_reason
+            != "disaster_recovery_f7_non_regression_veto"
+        ):
+            raise FleetError(
+                "recovery safety-reference evaluation requires the exact "
+                "disaster-recovery reason"
+            )
+        if parent_ref != incumbent_ref:
+            raise FleetError(
+                "recovery safety-reference candidate parent differs from the "
+                "authoritative recovered incumbent"
+            )
+        if baseline_ref == incumbent_ref:
+            raise FleetError(
+                "recovery safety reference must differ from the recovered incumbent"
+            )
+        # This report is promotion-eligible only as the conjunctive f7 veto in
+        # the canonical recovery gate.  Ordinary promotion verification rejects
+        # both the recovery registry and this v3 binding.
+        promotion_eligible = True
+        binding_schema = "a1-evaluation-baseline-binding-v3"
     return {
         "schema_version": binding_schema,
         "comparison_mode": comparison_mode,
@@ -2480,7 +2504,12 @@ def _parser() -> argparse.ArgumentParser:
     plan.add_argument("--registry", type=Path, required=True)
     plan.add_argument(
         "--comparison-mode",
-        choices=("promotion_parent", "branch_challenge", "historical_comparison"),
+        choices=(
+            "promotion_parent",
+            "branch_challenge",
+            "historical_comparison",
+            "recovery_safety_reference",
+        ),
         default="promotion_parent",
     )
     plan.add_argument("--historical-comparison-reason")

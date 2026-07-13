@@ -242,9 +242,20 @@ def _selection_by_job(
         category = str(record.get("category", ""))
         seed = record.get("game_seed")
         job = jobs.get(job_id)
+        expected_semantic = (
+            None
+            if job is None or category != job.get("category")
+            else contract._sealed_category_semantic(lock, category)  # noqa: SLF001
+        )
+        semantic_matches = (
+            "category_semantic" not in record
+            if expected_semantic is None
+            else record.get("category_semantic") == expected_semantic
+        )
         if (
             job is None
             or category != job.get("category")
+            or not semantic_matches
             or record.get("worker_id") != job.get("worker_id")
             or isinstance(seed, bool)
             or not isinstance(seed, int)
@@ -301,7 +312,22 @@ def _validate_source_bindings(
     normalized: list[dict[str, Any]] = []
     seen_ids: set[str] = set()
     for index, raw in enumerate(bindings):
-        if not isinstance(raw, dict) or set(raw) != _SOURCE_BINDING_FIELDS:
+        if not isinstance(raw, dict):
+            raise CompositeBuildError(
+                f"source authority binding {index} fields differ from schema"
+            )
+        category = str(raw.get("category", ""))
+        job_id = str(raw.get("job_id", ""))
+        job = jobs.get(job_id)
+        expected_semantic = (
+            None
+            if job is None or category != job.get("category")
+            else contract._sealed_category_semantic(lock, category)  # noqa: SLF001
+        )
+        expected_fields = set(_SOURCE_BINDING_FIELDS)
+        if expected_semantic is not None:
+            expected_fields.add("category_semantic")
+        if set(raw) != expected_fields:
             raise CompositeBuildError(
                 f"source authority binding {index} fields differ from schema"
             )
@@ -316,6 +342,11 @@ def _validate_source_bindings(
             or source_id != _binding_source_id(value)
             or job is None
             or category != job.get("category")
+            or (
+                value.get("category_semantic") != expected_semantic
+                if expected_semantic is not None
+                else "category_semantic" in value
+            )
             or value.get("contract_sha256") != lock.get("contract_sha256")
             or value.get("selected_manifest_file_sha256")
             != selected_file_sha256
@@ -538,6 +569,18 @@ def _filter_wave_shards(
                 "selected_records_sha256": selected["records_sha256"],
                 "job_id": job_id,
                 "category": category,
+                **(
+                    {}
+                    if contract._sealed_category_semantic(  # noqa: SLF001
+                        lock, category
+                    )
+                    is None
+                    else {
+                        "category_semantic": contract._sealed_category_semantic(  # noqa: SLF001
+                            lock, category
+                        )
+                    }
+                ),
                 "source_path": str(source),
                 "source_sha256": before_sha,
                 "generation_manifest_path": generation_manifest_by_job[job_id]["path"],
@@ -973,6 +1016,11 @@ def _build_source_authority(
     payload: dict[str, Any] = {
         "schema_version": SOURCE_AUTHORITY_SCHEMA,
         "canonical_composite_root": str(output_root.resolve(strict=True)),
+        **(
+            {}
+            if lock.get("category_semantics") is None
+            else {"category_semantics": lock["category_semantics"]}
+        ),
         "current_contract": {
             **lock_ref,
             "contract_sha256": lock["contract_sha256"],
@@ -1013,6 +1061,7 @@ def _build_descriptor(
     producer_sha256: str,
     current_version: int,
     source_authority: Mapping[str, str],
+    category_semantics: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     component_ids = [str(component["component_id"]) for component in components]
     expected_ids = [*FRESH_SOURCE_GAME_RATIOS, HISTORICAL_REPLAY_CATEGORY]
@@ -1107,6 +1156,11 @@ def _build_descriptor(
         "schema_version": "memmap_composite_v2",
         "diagnostic_only": False,
         "promotion_eligible": True,
+        **(
+            {}
+            if category_semantics is None
+            else {"category_semantics": dict(category_semantics)}
+        ),
         "components": components,
         "learner_recipe_overrides": recipe,
         "learner_recipe_overrides_sha256": canonical_sha256(recipe),
@@ -1197,6 +1251,7 @@ def build_post_wave_composite(
         producer_sha256=str(producer["sha256"]),
         current_version=int(producer["version"]),
         source_authority=source_authority,
+        category_semantics=lock.get("category_semantics"),
     )
     descriptor_path = root / "memmap_composite.json"
     _atomic_json(descriptor_path, descriptor)

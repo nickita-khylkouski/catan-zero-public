@@ -36,6 +36,7 @@ from tools import a1_post_promotion_handoff as promotion_handoff  # noqa: E402
 
 SCHEMA = "rl-rnd-operator-binding-v1"
 POST_PROMOTION_S1_SCHEMA = "rl-rnd-post-promotion-s1-operator-binding-v1"
+RECOVERY_S1_SCHEMA = "rl-rnd-recovery-s1-operator-binding-v1"
 ARTIFACT_KIND = "operator_choice_not_strength_evidence"
 STATEMENT = (
     "This artifact records an explicit operator choice for the current wave; "
@@ -57,6 +58,12 @@ POST_PROMOTION_S1_STATEMENT = (
 )
 POST_PROMOTION_S1_OVERRIDE = {
     "authorization": "committed_post_promotion_handoff_deployed_identity",
+    "deployed_value": 0.1,
+    "field": "c_scale",
+    "legacy_value": 0.03,
+}
+RECOVERY_S1_OVERRIDE = {
+    "authorization": "authenticated_disaster_recovery_deployed_identity",
     "deployed_value": 0.1,
     "field": "c_scale",
     "legacy_value": 0.03,
@@ -270,6 +277,23 @@ def _replay_post_promotion_handoff(path: Path) -> dict[str, Any]:
     return payload
 
 
+def _replay_recovery_receipt(path: Path) -> dict[str, Any]:
+    # Lazy import avoids search_operator_binding -> recovery -> pre_wave ->
+    # search_operator_binding during module initialization.
+    from tools import a1_v5_disaster_recovery as recovery
+
+    receipt_path = path.expanduser().resolve(strict=True)
+    try:
+        verified = recovery.verify_committed_receipt(receipt_path)
+    except recovery.RecoveryError as error:
+        raise BindingError(f"disaster-recovery receipt replay failed: {error}") from error
+    authority = verified.get("authority")
+    receipt = verified.get("receipt")
+    if not isinstance(authority, dict) or not isinstance(receipt, dict):
+        raise BindingError("disaster-recovery verifier returned malformed authority")
+    return {"authority": authority, "receipt": receipt}
+
+
 def build_post_promotion_s1_binding(
     legacy_s1_decision_path: Path,
     post_promotion_handoff_path: Path,
@@ -384,10 +408,134 @@ def _replay_post_promotion_s1(path: Path) -> dict[str, Any]:
     return payload
 
 
+def build_recovery_s1_binding(
+    legacy_s1_decision_path: Path,
+    recovery_receipt_path: Path,
+    *,
+    binding_time_utc: str | None = None,
+    emitter_path: Path | None = None,
+) -> dict[str, Any]:
+    """Bind c_scale continuity from authenticated recovery, without promotion claims."""
+
+    legacy = _replay_s1(legacy_s1_decision_path)
+    legacy_selected = legacy.get("selected_fields")
+    if not isinstance(legacy_selected, dict) or set(legacy_selected) != S1_SELECTED_KEYS:
+        raise BindingError("legacy S1 selected_fields have an unsupported shape")
+    if legacy_selected.get("c_scale") != RECOVERY_S1_OVERRIDE["legacy_value"]:
+        raise BindingError("recovery S1 bridge requires replayed legacy c_scale=.03")
+    receipt_path = recovery_receipt_path.expanduser().resolve(strict=True)
+    verified = _replay_recovery_receipt(receipt_path)
+    authority = verified["authority"]
+    receipt = verified["receipt"]
+    identity = authority.get("producer_identity")
+    checkpoint = authority.get("recovered_generator")
+    if not isinstance(identity, dict) or not isinstance(checkpoint, dict):
+        raise BindingError("recovery authority has no producer identity")
+    search_config = identity.get("search_config")
+    checkpoint_ref = {
+        "path": checkpoint.get("path"),
+        "sha256": checkpoint.get("sha256"),
+    }
+    if (
+        not isinstance(search_config, dict)
+        or set(checkpoint_ref) != {"path", "sha256"}
+        or identity.get("checkpoint") != checkpoint_ref
+    ):
+        raise BindingError("recovery producer identity is malformed")
+    checkpoint_path = Path(str(checkpoint_ref["path"])).expanduser().resolve(
+        strict=True
+    )
+    if _sha256(checkpoint_path) != checkpoint_ref["sha256"]:
+        raise BindingError("recovery producer checkpoint hash drift")
+    deployed_c_scale = search_config.get("c_scale")
+    if deployed_c_scale != RECOVERY_S1_OVERRIDE["deployed_value"]:
+        raise BindingError("recovery S1 bridge permits only deployed c_scale=.10")
+    for key in S1_SELECTED_KEYS - {"c_scale"}:
+        if search_config.get(key) != legacy_selected[key]:
+            raise BindingError(f"recovery producer changes non-continuity S1 field {key}")
+    selected = dict(legacy_selected)
+    selected["c_scale"] = deployed_c_scale
+    source_receipt = _reference(receipt_path)
+    source_receipt.update(
+        {
+            "recovery_receipt_sha256": receipt["recovery_receipt_sha256"],
+            "recovery_lineage_id": authority["recovery_lineage_id"],
+        }
+    )
+    return _seal_payload(
+        {
+            "schema_version": RECOVERY_S1_SCHEMA,
+            "artifact_kind": ARTIFACT_KIND,
+            "stage": "s1",
+            "operator": POST_PROMOTION_S1_OPERATOR,
+            "passed": True,
+            "decision": "operator_bind",
+            "reason": "authenticated_disaster_recovery_requires_c_scale_continuity",
+            "binding_time_utc": _parse_utc(binding_time_utc),
+            "statement": (
+                "This artifact binds only the recovered deployed c_scale. It does "
+                "not recreate promotion evidence or claim f7 was the causal parent."
+            ),
+            "selected_fields": selected,
+            "selected_fields_sha256": _digest_value(selected),
+            "source_legacy_s1": _reference(legacy_s1_decision_path),
+            "source_legacy_s1_selected_fields_sha256": legacy[
+                "selected_fields_sha256"
+            ],
+            "source_recovery_receipt": source_receipt,
+            "producer_checkpoint": checkpoint_ref,
+            "producer_identity_sha256": identity.get("agent_identity_sha256"),
+            "producer_search_config_sha256": _digest_value(search_config),
+            "continuity_override": dict(RECOVERY_S1_OVERRIDE),
+            "promotion_proof_recreated": False,
+            "emitter": _reference(Path(__file__) if emitter_path is None else emitter_path),
+        }
+    )
+
+
+def _replay_recovery_s1(path: Path) -> dict[str, Any]:
+    binding_path = path.expanduser().resolve(strict=True)
+    payload = _load_json(binding_path)
+    if payload.get("schema_version") != RECOVERY_S1_SCHEMA:
+        raise BindingError("recovery S1 operator-binding schema mismatch")
+    legacy_path, _ = _resolve_reference(
+        payload.get("source_legacy_s1"),
+        owner_path=binding_path,
+        where="recovery S1 legacy source",
+    )
+    receipt_ref = payload.get("source_recovery_receipt")
+    if not isinstance(receipt_ref, dict) or set(receipt_ref) != {
+        "path",
+        "sha256",
+        "recovery_receipt_sha256",
+        "recovery_lineage_id",
+    }:
+        raise BindingError("recovery S1 receipt reference is malformed")
+    receipt_path, _ = _resolve_reference(
+        {"path": receipt_ref["path"], "sha256": receipt_ref["sha256"]},
+        owner_path=binding_path,
+        where="recovery S1 receipt source",
+    )
+    emitter_path, _ = _resolve_reference(
+        payload.get("emitter"), owner_path=binding_path, where="recovery S1 emitter"
+    )
+    replayed = build_recovery_s1_binding(
+        legacy_path,
+        receipt_path,
+        binding_time_utc=payload.get("binding_time_utc"),
+        emitter_path=emitter_path,
+    )
+    if replayed != payload:
+        raise BindingError("recovery S1 binding does not equal semantic replay")
+    return payload
+
+
 def _replay_source_s1(path: Path) -> dict[str, Any]:
     payload = _load_json(path.expanduser().resolve(strict=True))
     if payload.get("schema_version") == POST_PROMOTION_S1_SCHEMA:
         return _replay_post_promotion_s1(path)
+    if payload.get("schema_version") == RECOVERY_S1_SCHEMA:
+        return _replay_recovery_s1(path)
     return _replay_s1(path)
 
 
@@ -556,12 +704,58 @@ def write_post_promotion_bindings(
     return s1, s2, s3
 
 
+def write_recovery_bindings(
+    legacy_s1_decision_path: Path,
+    recovery_receipt_path: Path,
+    s1_output_path: Path,
+    s2_output_path: Path,
+    s3_output_path: Path,
+    *,
+    binding_time_utc: str | None = None,
+    emitter_path: Path | None = None,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    outputs = [
+        path.expanduser().absolute()
+        for path in (s1_output_path, s2_output_path, s3_output_path)
+    ]
+    if len(set(outputs)) != len(outputs) or any(path.exists() for path in outputs):
+        raise BindingError("recovery S1/S2/S3 outputs must be distinct and fresh")
+    timestamp = _parse_utc(binding_time_utc)
+    s1 = build_recovery_s1_binding(
+        legacy_s1_decision_path,
+        recovery_receipt_path,
+        binding_time_utc=timestamp,
+        emitter_path=emitter_path,
+    )
+    created: list[Path] = []
+    try:
+        _write_read_only_new(outputs[0], s1)
+        created.append(outputs[0])
+        s2, s3 = build_bindings(
+            outputs[0],
+            s2_output_path=outputs[1],
+            binding_time_utc=timestamp,
+            emitter_path=emitter_path,
+        )
+        _write_read_only_new(outputs[1], s2)
+        created.append(outputs[1])
+        _write_read_only_new(outputs[2], s3)
+        created.append(outputs[2])
+    except Exception:
+        for path in reversed(created):
+            path.chmod(0o600)
+            path.unlink(missing_ok=True)
+        raise
+    return s1, s2, s3
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--s1-decision")
     source.add_argument("--legacy-s1-decision")
     parser.add_argument("--post-promotion-handoff")
+    parser.add_argument("--recovery-receipt")
     parser.add_argument("--s1-out")
     parser.add_argument(
         "--emitter-path",
@@ -578,23 +772,32 @@ def main() -> int:
     args = parser.parse_args()
     try:
         if args.legacy_s1_decision is not None:
-            if args.post_promotion_handoff is None or args.s1_out is None:
+            if (
+                (args.post_promotion_handoff is None)
+                == (args.recovery_receipt is None)
+                or args.s1_out is None
+            ):
                 raise BindingError(
-                    "--legacy-s1-decision requires --post-promotion-handoff and --s1-out"
+                    "--legacy-s1-decision requires exactly one lineage source and --s1-out"
                 )
-            s1, s2, s3 = write_post_promotion_bindings(
-                Path(args.legacy_s1_decision),
-                Path(args.post_promotion_handoff),
-                Path(args.s1_out),
-                Path(args.s2_out),
-                Path(args.s3_out),
+            writer = (
+                write_post_promotion_bindings
+                if args.post_promotion_handoff is not None
+                else write_recovery_bindings
+            )
+            lineage_source = args.post_promotion_handoff or args.recovery_receipt
+            s1, s2, s3 = writer(
+                Path(args.legacy_s1_decision), Path(str(lineage_source)),
+                Path(args.s1_out), Path(args.s2_out), Path(args.s3_out),
                 binding_time_utc=args.binding_time_utc,
-                emitter_path=(
-                    None if args.emitter_path is None else Path(args.emitter_path)
-                ),
+                emitter_path=None if args.emitter_path is None else Path(args.emitter_path),
             )
         else:
-            if args.post_promotion_handoff is not None or args.s1_out is not None:
+            if (
+                args.post_promotion_handoff is not None
+                or args.recovery_receipt is not None
+                or args.s1_out is not None
+            ):
                 raise BindingError(
                     "--post-promotion-handoff/--s1-out require --legacy-s1-decision"
                 )
