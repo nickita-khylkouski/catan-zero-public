@@ -272,7 +272,25 @@ def test_non_dry_train_window_builds_authenticated_production_composite(
                         "metrics": [
                             {
                                 "validation": {
-                                    "schema_version": "composite-validation-measure-v2"
+                                    "schema_version": "raw-row-compatibility-metric",
+                                    "objective_matched": False,
+                                },
+                                "validation_objective_matched": {
+                                    "schema_version": "composite-validation-measure-v2",
+                                    "objective_matched": True,
+                                    "component_sampling_ratios": verified[
+                                        "flywheel_replay_contract"
+                                    ]["effective_component_sampling_ratios"],
+                                    "components": {
+                                        component_id: {
+                                            "authenticated_sampling_ratio": ratio
+                                        }
+                                        for component_id, ratio in verified[
+                                            "flywheel_replay_contract"
+                                        ][
+                                            "effective_component_sampling_ratios"
+                                        ].items()
+                                    },
                                 }
                             }
                         ],

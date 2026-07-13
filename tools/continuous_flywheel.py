@@ -245,10 +245,28 @@ def _verify_flywheel_training_report(
     metrics = report.get("metrics")
     if not isinstance(metrics, list) or not metrics:
         raise RuntimeError("flywheel training receipt has no completed epoch metrics")
-    validation = metrics[-1].get("validation") if isinstance(metrics[-1], dict) else None
+    validation = (
+        metrics[-1].get("validation_objective_matched")
+        if isinstance(metrics[-1], dict)
+        else None
+    )
+    effective_ratios = replay_contract.get("effective_component_sampling_ratios")
     if (
         not isinstance(validation, dict)
         or validation.get("schema_version") != "composite-validation-measure-v2"
+        or validation.get("objective_matched") is not True
+        or not isinstance(effective_ratios, dict)
+        or validation.get("component_sampling_ratios") != effective_ratios
+        or not isinstance(validation.get("components"), dict)
+        or set(validation["components"]) != set(effective_ratios)
+        or any(
+            not isinstance(validation["components"].get(component_id), dict)
+            or validation["components"][component_id].get(
+                "authenticated_sampling_ratio"
+            )
+            != ratio
+            for component_id, ratio in effective_ratios.items()
+        )
     ):
         raise RuntimeError(
             "flywheel training receipt lacks objective-matched composite validation"
