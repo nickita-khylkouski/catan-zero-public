@@ -157,6 +157,57 @@ def test_truncated_vp_margin_skips_rows_with_no_seat_field():
     assert confidence.tolist() == pytest.approx([1.0, 0.0, 0.0, 1.0])
 
 
+def test_truncated_vp_margin_rejects_loader_default_zero_snapshot() -> None:
+    """Missing legacy VP columns normalize to zeros and must not become labels."""
+
+    data = _base_data(
+        final_actual_vps=np.zeros((4, 4), dtype=np.int16),
+        has_final_actual_vps=np.zeros(4, dtype=np.bool_),
+        final_public_vps=np.zeros((4, 4), dtype=np.int16),
+        has_final_public_vps=np.zeros(4, dtype=np.bool_),
+    )
+
+    _, _, _, _, value_outcome, value_has_outcome, confidence = _value_targets(
+        data,
+        np.arange(4),
+        torch.device("cpu"),
+        vps_to_win=10,
+        truncated_vp_margin_value_weight=0.25,
+        public_information_only=False,
+    )
+
+    assert value_has_outcome.tolist() == [True, False, False, True]
+    assert confidence.tolist() == pytest.approx([1.0, 0.0, 0.0, 1.0])
+    assert float(value_outcome[1]) == 0.0
+    assert float(value_outcome[2]) == 0.0
+
+
+def test_explicit_snapshot_presence_can_authenticate_a_real_zero_margin() -> None:
+    """A future producer can distinguish a genuine 0-0 snapshot from padding."""
+
+    data = _base_data(
+        final_actual_vps=np.zeros((4, 4), dtype=np.int16),
+        has_final_actual_vps=np.zeros(4, dtype=np.bool_),
+        has_final_actual_vps_snapshot=np.asarray([False, True, True, False]),
+        final_public_vps=np.zeros((4, 4), dtype=np.int16),
+        has_final_public_vps=np.zeros(4, dtype=np.bool_),
+    )
+
+    _, _, _, _, value_outcome, value_has_outcome, confidence = _value_targets(
+        data,
+        np.arange(4),
+        torch.device("cpu"),
+        vps_to_win=10,
+        truncated_vp_margin_value_weight=0.25,
+        public_information_only=False,
+    )
+
+    assert value_has_outcome.tolist() == [True, True, True, True]
+    assert confidence.tolist() == pytest.approx([1.0, 0.25, 0.25, 1.0])
+    assert float(value_outcome[1]) == 0.0
+    assert float(value_outcome[2]) == 0.0
+
+
 def test_public_regime_truncated_margin_never_uses_opponent_hidden_actual_vp():
     data = _base_data(
         final_actual_vps=np.asarray(
