@@ -2,10 +2,10 @@
 """Finalize and replay one completed D6 -> target-gather composition run.
 
 The launcher proves authorization and immutable inputs.  This transaction proves
-the realized run: successful systemd exit, exact 1,024-update/524,288-row
-commissioning geometry, current rank-distinct D6 RNG state, fresh Adam, exact
-trainable surface, policy-active dose, and a checkpoint delta confined to the
-four gather tensors.  It remains diagnostic and non-promotable.
+the realized run: successful systemd exit, an allowlisted one-axis adapter dose,
+current rank-distinct D6 RNG state, fresh Adam, exact trainable surface,
+policy-active dose, and a checkpoint delta confined to the four gather tensors.
+It remains diagnostic and non-promotable.
 """
 
 from __future__ import annotations
@@ -214,11 +214,22 @@ def _finite_number(value: Any) -> bool:
     )
 
 
+def _manifest_dose(verified: Mapping[str, Any]) -> dict[str, Any]:
+    matched = verified.get("manifest", {}).get("matched_contract")
+    if not isinstance(matched, Mapping):
+        raise CompletionError("D6+gather manifest lacks matched dose contract")
+    try:
+        return arm._dose_geometry(matched.get("optimizer_steps"))  # noqa: SLF001
+    except arm.CompositionArmError as error:
+        raise CompletionError(str(error)) from error
+
+
 def _verify_report(
     verified: Mapping[str, Any],
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     root = Path(verified["output_root"])
     manifest = verified["manifest"]
+    dose = _manifest_dose(verified)
     checkpoint = _file_ref(root / "candidate.pt")
     report_ref = _file_ref(root / "train.report.json")
     report = _load_json(Path(report_ref["path"]), label="training report")
@@ -233,11 +244,11 @@ def _verify_report(
         "world_size": arm.WORLD_SIZE,
         "batch_size": arm.LOCAL_BATCH_SIZE,
         "effective_global_batch_size": arm.GLOBAL_BATCH_SIZE,
-        "max_steps": arm.OPTIMIZER_STEPS,
-        "steps_completed": arm.OPTIMIZER_STEPS,
-        "training_row_draws": arm.GLOBAL_ROW_DOSE,
-        "base_training_row_draws": arm.GLOBAL_ROW_DOSE,
-        "total_training_row_draws": arm.GLOBAL_ROW_DOSE,
+        "max_steps": dose["optimizer_steps"],
+        "steps_completed": dose["optimizer_steps"],
+        "training_row_draws": dose["global_row_dose"],
+        "base_training_row_draws": dose["global_row_dose"],
+        "total_training_row_draws": dose["global_row_dose"],
         "optimizer": "adam",
         "resume_optimizer": False,
         "optimizer_restored": False,
@@ -351,11 +362,12 @@ def _verify_report(
         and _finite_number(
             matched.get("metrics", {}).get("active_policy_teacher_gap_closure")
         )
-        and epoch.get("samples") == arm.GLOBAL_ROW_DOSE
+        and epoch.get("samples") == dose["global_row_dose"]
         and isinstance(epoch.get("policy_total_active_rows"), int)
-        and 0 < epoch["policy_total_active_rows"] < arm.GLOBAL_ROW_DOSE
+        and 0 < epoch["policy_total_active_rows"] < dose["global_row_dose"]
         and isinstance(optimizer_observability, Mapping)
-        and optimizer_observability.get("observed_steps") == arm.OPTIMIZER_STEPS
+        and optimizer_observability.get("observed_steps")
+        == dose["optimizer_steps"]
         and optimizer_observability.get("zero_objective_steps_skipped") == 0
         and _finite_number(report.get("elapsed_sec"))
         and float(report["elapsed_sec"]) > 0.0
@@ -363,10 +375,10 @@ def _verify_report(
         raise CompletionError("D6+gather objective/optimizer telemetry drift")
     summary = {
         "elapsed_sec": float(report["elapsed_sec"]),
-        "total_row_dose": arm.GLOBAL_ROW_DOSE,
+        "total_row_dose": dose["global_row_dose"],
         "policy_active_rows": int(epoch["policy_total_active_rows"]),
         "policy_active_fraction": float(epoch["policy_total_active_rows"])
-        / arm.GLOBAL_ROW_DOSE,
+        / dose["global_row_dose"],
         "effective_trainable_objective": manifest["effective_trainable_objective"],
         "objective_matched_teacher_gap_closure": float(
             matched["metrics"]["active_policy_teacher_gap_closure"]
@@ -397,7 +409,7 @@ def _resolve_progress_output(
 
 
 def _verify_progress(
-    root: Path, *, checkpoint: Mapping[str, Any]
+    root: Path, *, checkpoint: Mapping[str, Any], optimizer_steps: int
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     progress_path = root / "candidate.pt.training-progress.json"
     progress = _load_json(progress_path, label="training progress")
@@ -438,7 +450,7 @@ def _verify_progress(
     if not (
         progress.get("schema_version") == "train-bc-progress-v1"
         and progress.get("status") == "complete"
-        and progress.get("optimizer_step") == arm.OPTIMIZER_STEPS
+        and progress.get("optimizer_step") == optimizer_steps
         and progress.get("completed_epochs") == 1
         and isinstance(recipe, Mapping)
         and recipe.get("schema_version") == "train-bc-resume-recipe-v1"
@@ -489,7 +501,7 @@ def _verify_adapter_only_delta(initializer: Path, candidate: Path) -> dict[str, 
         raise CompletionError(str(error)) from error
 
 
-def _verify_optimizer_groups(path: Path) -> dict[str, Any]:
+def _verify_optimizer_groups(path: Path, *, optimizer_steps: int) -> dict[str, Any]:
     try:
         import torch
 
@@ -523,6 +535,22 @@ def _verify_optimizer_groups(path: Path) -> dict[str, Any]:
         raise CompletionError(
             "D6+gather optimizer does not isolate four LR=1.2e-4 tensors"
         )
+    observed_steps: list[int] = []
+    for parameter_id in action_parameters:
+        parameter_state = state.get(parameter_id)
+        raw_step = parameter_state.get("step") if isinstance(parameter_state, Mapping) else None
+        try:
+            step = int(raw_step.item()) if hasattr(raw_step, "item") else int(raw_step)
+        except (TypeError, ValueError, RuntimeError) as error:
+            raise CompletionError(
+                "D6+gather optimizer state lacks a scalar step"
+            ) from error
+        observed_steps.append(step)
+    if observed_steps != [optimizer_steps] * len(action_parameters):
+        raise CompletionError(
+            "D6+gather optimizer state step does not match completed dose: "
+            f"expected={optimizer_steps} observed={observed_steps}"
+        )
     return {
         "format": "plain",
         "base_group_parameter_tensors": 0,
@@ -530,6 +558,7 @@ def _verify_optimizer_groups(path: Path) -> dict[str, Any]:
         "action_group_parameter_tensors": len(action_parameters),
         "action_group_lr": 1.2e-4,
         "optimizer_state_tensors": len(state),
+        "optimizer_state_step": optimizer_steps,
     }
 
 
@@ -557,6 +586,7 @@ def build_completion(
     created_at_unix_ns: int,
 ) -> dict[str, Any]:
     verified = verify_manifest(manifest_path)
+    dose = _manifest_dose(verified)
     root = Path(verified["output_root"])
     unit, submission = _verify_submission(verified)
     checkpoint, report, report_summary = _verify_report(verified)
@@ -564,8 +594,15 @@ def build_completion(
         raise CompletionError(
             "D6+gather checkpoint differs from explicitly expected completed bytes"
         )
-    progress, optimizer, rng_summary = _verify_progress(root, checkpoint=checkpoint)
-    optimizer_groups = _verify_optimizer_groups(Path(optimizer["path"]))
+    progress, optimizer, rng_summary = _verify_progress(
+        root,
+        checkpoint=checkpoint,
+        optimizer_steps=dose["optimizer_steps"],
+    )
+    optimizer_groups = _verify_optimizer_groups(
+        Path(optimizer["path"]),
+        optimizer_steps=dose["optimizer_steps"],
+    )
     model_delta = _verify_adapter_only_delta(
         Path(verified["manifest"]["initialization_treatment"]["path"]),
         Path(checkpoint["path"]),
