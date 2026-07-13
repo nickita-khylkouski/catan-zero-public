@@ -176,17 +176,6 @@ def test_issued_r1_replays_versioned_guard_snapshots_after_live_guard_revision(
             raise AssertionError(f"historical validation read mutable guard: {relative}")
         return real_load(path)
 
-    # Capture the real history function before replacing it so the wrapper can
-    # continue validating the other immutable r1 provenance records.
-    real_history = contract._tracked_history_contains_file_digest  # noqa: SLF001
-    no_history_for_revised_guards = lambda relative_path, digest: (  # noqa: E731
-        False
-        if relative_path in guard_paths
-        else real_history(relative_path, digest)
-    )
-    monkeypatch.setattr(
-        contract, "_tracked_history_contains_file_digest", no_history_for_revised_guards
-    )
     monkeypatch.setattr(contract, "_load_json", reject_mutable_guard_read)
 
     payload = contract.validate_generation_campaign(SOURCE)
@@ -204,12 +193,71 @@ def test_issued_r1_rejects_mutated_guard_snapshot(
     snapshots = dict(contract.GENERATION_CAMPAIGN_R1_GUARD_SNAPSHOTS)
     snapshots[(relative, digest)] = bad_snapshot
     monkeypatch.setattr(contract, "GENERATION_CAMPAIGN_R1_GUARD_SNAPSHOTS", snapshots)
-    real_history = contract._tracked_history_contains_file_digest  # noqa: SLF001
+
+    with pytest.raises(contract.ContractError, match="immutable snapshot drift"):
+        contract.validate_generation_campaign(SOURCE)
+
+
+def test_issued_r1_never_hashes_live_generator_bytes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A checkout advance cannot retroactively change immutable r1 identity."""
+
+    generator = contract.REPO_ROOT / "tools/generate_gumbel_selfplay_data.py"
+    real_sha256 = contract._sha256  # noqa: SLF001
+
+    def reject_live_generator(path: Path) -> str:
+        if path.resolve() == generator.resolve():
+            raise AssertionError("historical validation hashed the live generator")
+        return real_sha256(path)
+
+    monkeypatch.setattr(contract, "_sha256", reject_live_generator)
+    payload = contract.validate_generation_campaign(SOURCE)
+    assert payload["contract_sha256"] == contract.GENERATION_CAMPAIGN_CONTRACT_SHA256
+
+
+@pytest.mark.parametrize("mode", ["missing", "tampered"])
+def test_issued_r1_fails_closed_when_implementation_blob_is_unavailable_or_tampered(
+    monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    real_blob = contract._git_blob  # noqa: SLF001
+
+    def broken_blob(commit: str, path: str) -> bytes:
+        if path == "tools/generate_gumbel_selfplay_data.py":
+            if mode == "missing":
+                raise contract.ContractError("historical implementation blob missing")
+            return real_blob(commit, path) + b"tampered"
+        return real_blob(commit, path)
+
+    monkeypatch.setattr(contract, "_git_blob", broken_blob)
+    expected = "blob missing" if mode == "missing" else "implementation blob drift"
+    with pytest.raises(contract.ContractError, match=expected):
+        contract.validate_generation_campaign(SOURCE)
+
+
+def test_fresh_campaign_provenance_uses_live_current_bytes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = json.loads(
+        contract.GENERATION_CAMPAIGN_R2_CONTRACT_PATH.read_text(encoding="utf-8")
+    )["provenance"]
     monkeypatch.setattr(
         contract,
-        "_tracked_history_contains_file_digest",
-        lambda path, sha: False if path == relative else real_history(path, sha),
+        "_git_blob",
+        lambda *_args: (_ for _ in ()).throw(
+            AssertionError("fresh provenance consulted historical Git")
+        ),
     )
 
-    with pytest.raises(contract.ContractError, match="immutable file drift"):
-        contract.validate_generation_campaign(SOURCE)
+    refreshed = contract._refresh_campaign_provenance(source)  # noqa: SLF001
+    records = [
+        *refreshed["arm_guards"],
+        *refreshed["generator_code"],
+        refreshed["executor"],
+        refreshed["harvest"],
+        refreshed["fleet_manifest"],
+    ]
+    for record in records:
+        assert record["sha256"] == contract._sha256(  # noqa: SLF001
+            contract.REPO_ROOT / record["path"]
+        )

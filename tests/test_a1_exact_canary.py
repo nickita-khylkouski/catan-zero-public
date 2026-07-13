@@ -60,20 +60,24 @@ def _command(alias: str, gpu: int, category: str, seed: int) -> dict:
     }
 
 
-def _fixture() -> tuple[dict, dict]:
+def _fixture(*, current_v3: bool = False) -> tuple[dict, dict]:
     commands = []
     seed = 300_000_000_000
     shapes = {
-        **{f"c{i}": 4 for i in range(1, 7)},
-        "h100-8a": 8,
-        "h100-8b": 8,
+        **{f"c{i}": 4 for i in range(1, 9 if current_v3 else 7)},
+        **{
+            f"h100-8{letter}": 8
+            for letter in ("a", "b", "c", "d")[: 4 if current_v3 else 2]
+        },
     }
     for alias, count in shapes.items():
         for gpu in range(count):
             for category in canary.CATEGORY_ORDER:
                 commands.append(_command(alias, gpu, category, seed))
                 seed += 10
-    assert len(commands) == 120
+    lane_count = sum(shapes.values())
+    assert lane_count == (64 if current_v3 else 40)
+    assert len(commands) == lane_count * len(canary.CATEGORY_ORDER)
     rendered = {
         "schema_version": contract.RENDER_SCHEMA,
         "contract_sha256": "sha256:" + "a" * 64,
@@ -100,8 +104,8 @@ def _fixture() -> tuple[dict, dict]:
         "contract_sha256": rendered["contract_sha256"],
         "render_sha256": rendered["render_sha256"],
         "client_environment": dict(canary.EXPECTED_MPS_ENVIRONMENT),
-        "lane_count": 40,
-        "job_count": 120,
+        "lane_count": lane_count,
+        "job_count": len(commands),
         "lanes": lanes,
     }
     plan["plan_sha256"] = contract._digest_value(plan)
@@ -138,8 +142,22 @@ def test_exact_canary_proves_four_and_eight_gpu_shapes() -> None:
     }
     assert report["cohorts"]["c1"]["job_count"] == 12
     assert report["cohorts"]["h100-8a"]["job_count"] == 24
+    assert report["lane_count"] == 40
+    assert report["job_count"] == 120
     assert report["unique_output_count"] == 120
     assert report["disjoint_seed_range_count"] == 120
+
+
+def test_exact_canary_accepts_current_v3_64_lane_192_job_topology() -> None:
+    rendered, plan = _fixture(current_v3=True)
+    report = canary.validate_exact_canary(
+        rendered, plan, {"c1": 4, "h100-8a": 8}
+    )
+
+    assert report["lane_count"] == 64
+    assert report["job_count"] == 192
+    assert report["unique_output_count"] == 192
+    assert report["disjoint_seed_range_count"] == 192
 
 
 def test_canary_mps_contract_matches_executor_and_lane_supervisor() -> None:
@@ -202,3 +220,14 @@ def test_exact_canary_rejects_shape_or_executor_lane_drift() -> None:
 
     with pytest.raises(canary.CanaryError, match="exact GPU lanes"):
         canary.validate_exact_canary(rendered, plan, {"c1": 8, "h100-8a": 4})
+
+
+def test_exact_canary_rejects_declared_topology_count_drift() -> None:
+    rendered, plan = _fixture(current_v3=True)
+    plan["lane_count"] = 40
+    plan["job_count"] = 120
+    plan.pop("plan_sha256")
+    plan["plan_sha256"] = contract._digest_value(plan)
+
+    with pytest.raises(canary.CanaryError, match="three jobs per lane"):
+        canary.validate_exact_canary(rendered, plan, {"c1": 4, "h100-8a": 8})

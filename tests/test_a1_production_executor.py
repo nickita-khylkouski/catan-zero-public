@@ -25,7 +25,9 @@ def _sha(path: Path) -> str:
     return executor._sha256(path)
 
 
-def _fixture(tmp_path: Path) -> tuple[Path, Path, dict, dict]:
+def _fixture(
+    tmp_path: Path, *, current_v3: bool = False
+) -> tuple[Path, Path, dict, dict]:
     ledger = tmp_path / "seed-ledger.md"
     ledger.write_text("# ledger\n", encoding="utf-8")
     checkpoint = tmp_path / "champion.pt"
@@ -64,6 +66,9 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, dict, dict]:
         "symmetry_averaged_eval_threshold": 20,
     }
     lock = {
+        "schema_version": (
+            contract.LOCK_SCHEMA if current_v3 else contract.LEGACY_LOCK_SCHEMA
+        ),
         "contract_sha256": "sha256:" + "a" * 64,
         "science": {
             "search_operator": search,
@@ -96,10 +101,43 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, dict, dict]:
             {"id": "producer", "role": "producer", "path": str(checkpoint), "sha256": _sha(checkpoint)}
         ],
         "fleet": {"seed_ledger": {"path": str(ledger)}, "jobs": []},
+        "game_contract": {
+            **(
+                {
+                    "profile": contract.CURRENT_GAME_CONTRACT_PROFILE,
+                    "worker_count": 64,
+                    "job_count": 192,
+                }
+                if current_v3
+                else {}
+            ),
+            "total_complete_games": 12_000,
+            "category_games": {
+                "current_producer": 9_600,
+                "recent_history": 1_800,
+                "hard_negative": 600,
+            },
+            "total_attempts": 12_512 if current_v3 else 12_320,
+            "category_attempts": (
+                {
+                    "current_producer": 9_920,
+                    "recent_history": 1_928,
+                    "hard_negative": 664,
+                }
+                if current_v3
+                else {
+                    "current_producer": 9_800,
+                    "recent_history": 1_880,
+                    "hard_negative": 640,
+                }
+            ),
+            "selection_rule": "lowest_seed_complete_per_job",
+            "selection_before_row_expansion": True,
+        },
     }
     commands = []
     categories = executor.CATEGORY_ORDER
-    for lane_index in range(40):
+    for lane_index in range(64 if current_v3 else 40):
         alias = f"h{lane_index // 4:02d}"
         gpu = lane_index % 4
         worker_id = f"{alias}_gpu{gpu}"
@@ -474,6 +512,25 @@ def test_dry_plan_is_exact_40_lane_120_job_n128_mps_contract(
     )
     assert all(command["argv"][command["argv"].index("--n-full") + 1] == "128" for command in rendered["commands"])
     assert not any(flag in command["argv"] for command in rendered["commands"] for flag in executor.FORBIDDEN_ADAPTIVE_ARGV)
+
+
+def test_current_v3_dry_plan_is_exact_64_lane_192_job_contract(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lock_path, render_path, lock, rendered = _fixture(tmp_path, current_v3=True)
+    hosts = _hosts(tmp_path, rendered)
+    monkeypatch.setattr(executor, "_repo_artifacts", lambda _rendered, **_kwargs: [])
+
+    plan = executor.build_plan(
+        lock_path=lock_path,
+        render_path=render_path,
+        hosts_path=hosts,
+        receipt_path=tmp_path / "receipt.json",
+        verify_lock_fn=_verifier(lock),
+    )
+
+    assert plan["lane_count"] == 64
+    assert plan["job_count"] == plan["claim_count"] == 192
 
 
 def test_dual_arm_n256_profile_is_exact_28_lane_84_job_contract(

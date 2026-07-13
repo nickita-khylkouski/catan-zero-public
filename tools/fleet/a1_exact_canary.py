@@ -127,6 +127,38 @@ def _parse_shapes(raw: Sequence[str]) -> dict[str, int]:
     return shapes
 
 
+def _bound_lock(
+    rendered: dict[str, Any], plan: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Replay the sealed topology when validating a real executor plan.
+
+    Small unit fixtures predate the path fields and are validated from their
+    internally authenticated render/plan shape. Production render and dry-run
+    payloads carry both paths; those must resolve to one verified v2/v3 lock.
+    """
+
+    render_path = rendered.get("contract_path")
+    plan_path = plan.get("lock")
+    if render_path is None and plan_path is None:
+        return None
+    if not isinstance(render_path, str) or not isinstance(plan_path, str):
+        raise CanaryError("production render/plan must both bind the sealed lock path")
+    try:
+        rendered_lock_path = Path(render_path).expanduser().resolve(strict=True)
+        planned_lock_path = Path(plan_path).expanduser().resolve(strict=True)
+    except OSError as error:
+        raise CanaryError(f"cannot resolve sealed canary lock: {error}") from error
+    if rendered_lock_path != planned_lock_path:
+        raise CanaryError("executor plan and render bind different lock paths")
+    try:
+        lock = contract.verify_lock(rendered_lock_path)
+    except Exception as error:
+        raise CanaryError(f"sealed canary lock replay failed: {error}") from error
+    if lock.get("contract_sha256") != rendered.get("contract_sha256"):
+        raise CanaryError("sealed canary lock identity differs from render/plan")
+    return lock
+
+
 def validate_exact_canary(
     rendered: dict[str, Any], plan: dict[str, Any], host_shapes: dict[str, int]
 ) -> dict[str, Any]:
@@ -145,11 +177,43 @@ def validate_exact_canary(
             "executor MPS client environment must exactly bind the managed host pipe/log"
         )
 
+    bound_lock = _bound_lock(rendered, plan)
     commands = rendered.get("commands")
-    if not isinstance(commands, list) or len(commands) != 120:
-        raise CanaryError("A1 production render must contain exactly 120 commands")
-    if plan.get("lane_count") != 40 or plan.get("job_count") != 120:
-        raise CanaryError("executor plan must contain exactly 40 lanes and 120 jobs")
+    declared_lanes = plan.get("lane_count")
+    declared_jobs = plan.get("job_count")
+    if (
+        not isinstance(commands, list)
+        or not commands
+        or isinstance(declared_lanes, bool)
+        or not isinstance(declared_lanes, int)
+        or declared_lanes <= 0
+        or isinstance(declared_jobs, bool)
+        or not isinstance(declared_jobs, int)
+        or declared_jobs <= 0
+        or len(commands) != declared_jobs
+        or declared_jobs != declared_lanes * len(CATEGORY_ORDER)
+    ):
+        raise CanaryError(
+            "A1 render/plan must bind a positive lane count and exactly three jobs per lane"
+        )
+    bound_jobs: dict[str, dict[str, Any]] | None = None
+    if bound_lock is not None:
+        try:
+            topology = contract._sealed_game_contract_shape(bound_lock)  # noqa: SLF001
+        except contract.ContractError as error:
+            raise CanaryError(f"sealed canary topology is invalid: {error}") from error
+        if (
+            topology["worker_count"] != declared_lanes
+            or topology["job_count"] != declared_jobs
+        ):
+            raise CanaryError(
+                "executor topology differs from the sealed v2/v3 game contract"
+            )
+        bound_jobs = {
+            str(job["job_id"]): job for job in bound_lock["fleet"]["jobs"]
+        }
+        if len(bound_jobs) != declared_jobs:
+            raise CanaryError("sealed canary lock job inventory is not exact")
 
     commands_by_job: dict[str, dict[str, Any]] = {}
     outputs: set[str] = set()
@@ -161,6 +225,8 @@ def validate_exact_canary(
         job_id = str(command.get("job_id", ""))
         if not job_id or job_id in commands_by_job:
             raise CanaryError(f"blank/duplicate job id {job_id!r}")
+        if bound_jobs is not None and job_id not in bound_jobs:
+            raise CanaryError(f"render contains unsealed job id {job_id!r}")
         commands_by_job[job_id] = command
         argv = command.get("argv")
         if command.get("argv_sha256") != contract._digest_value(argv):
@@ -200,6 +266,9 @@ def validate_exact_canary(
         seed_ranges.append((start, start + attempts, job_id))
         lanes.setdefault((alias, gpu), []).append(command)
 
+    if bound_jobs is not None and set(commands_by_job) != set(bound_jobs):
+        raise CanaryError("render does not exactly cover the sealed job inventory")
+
     seed_ranges.sort()
     for previous, current in zip(seed_ranges, seed_ranges[1:]):
         if current[0] < previous[1]:
@@ -209,8 +278,10 @@ def validate_exact_canary(
             )
 
     plan_lanes = plan.get("lanes")
-    if not isinstance(plan_lanes, list) or len(plan_lanes) != 40:
-        raise CanaryError("executor plan lanes must be a 40-item list")
+    if not isinstance(plan_lanes, list) or len(plan_lanes) != declared_lanes:
+        raise CanaryError(
+            f"executor plan lanes must be an exact {declared_lanes}-item list"
+        )
     plan_by_placement: dict[tuple[str, int], dict[str, Any]] = {}
     for lane in plan_lanes:
         if not isinstance(lane, dict):
@@ -221,6 +292,16 @@ def validate_exact_canary(
         plan_by_placement[placement] = lane
     if set(plan_by_placement) != set(lanes):
         raise CanaryError("executor lanes do not exactly cover rendered physical lanes")
+    if len(lanes) != declared_lanes:
+        raise CanaryError(
+            f"render must contain exactly {declared_lanes} independent physical lanes"
+        )
+    if bound_jobs is not None:
+        sealed_placements = {
+            (str(job["host_alias"]), int(job["gpu"])) for job in bound_jobs.values()
+        }
+        if set(lanes) != sealed_placements:
+            raise CanaryError("render physical lanes differ from the sealed lock")
 
     for placement, lane_commands in lanes.items():
         ordered = sorted(lane_commands, key=lambda item: CATEGORY_ORDER.index(item["category"]))
@@ -267,6 +348,8 @@ def validate_exact_canary(
             "workers_per_gpu": 16,
         },
         "mps_client_environment": EXPECTED_MPS_ENVIRONMENT,
+        "lane_count": len(lanes),
+        "job_count": len(commands_by_job),
         "unique_output_count": len(outputs),
         "disjoint_seed_range_count": len(seed_ranges),
         "cohorts": cohorts,

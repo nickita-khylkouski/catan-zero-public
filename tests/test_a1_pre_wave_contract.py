@@ -391,6 +391,15 @@ def test_dual_arm_materializes_renders_and_replays_in_production_executor(
     monkeypatch.setattr(
         contract, "validate_generation_campaign", lambda _path, **_kwargs: campaign
     )
+    if campaign_path == GENERATION_CAMPAIGN_R2:
+        # This synthetic mechanics test deliberately replaces the immutable r2
+        # provenance with today's live bytes.  Exact historical-commit replay
+        # has dedicated tests; treat this fabricated campaign as current here.
+        monkeypatch.setattr(
+            contract,
+            "_campaign_historical_implementation_commit",
+            lambda *_args, **_kwargs: None,
+        )
     if campaign_path == GENERATION_CAMPAIGN:
         monkeypatch.setattr(contract, "_runtime_code_tree_records", lambda: [])
     monkeypatch.setattr(contract, "_validate_against_ledger", lambda *_args: None)
@@ -976,6 +985,43 @@ def test_verify_lock_refuses_malformed_historical_marker(
         contract.verify_lock(mutated)
 
 
+def test_only_exact_allowlisted_markerless_v2_lock_replays(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _issued_path, lock = _lock(tmp_path)
+    lock.pop("promotion_handoff")
+    lock.pop("contract_sha256")
+    lock["contract_sha256"] = contract._digest_value(lock)  # noqa: SLF001
+    markerless = tmp_path / "markerless.lock.json"
+    markerless.write_text(json.dumps(lock, indent=2, sort_keys=True) + "\n")
+    source = lock["source_draft"]
+    monkeypatch.setattr(
+        contract,
+        "HISTORICAL_MARKERLESS_A1_LOCK",
+        {
+            "contract_id": lock["contract_id"],
+            "contract_sha256": lock["contract_sha256"],
+            "lock_file_sha256": contract._sha256(markerless),  # noqa: SLF001
+            "source_draft_sha256": source["sha256"],
+        },
+    )
+
+    assert contract.verify_lock(markerless)["contract_sha256"] == lock[
+        "contract_sha256"
+    ]
+
+    substituted = dict(lock)
+    substituted["contract_id"] = "substituted-markerless-lock"
+    substituted.pop("contract_sha256")
+    substituted["contract_sha256"] = contract._digest_value(  # noqa: SLF001
+        substituted
+    )
+    other = tmp_path / "other.lock.json"
+    other.write_text(json.dumps(substituted, indent=2, sort_keys=True) + "\n")
+    with pytest.raises(contract.ContractError, match="promotion handoff"):
+        contract.verify_lock(other)
+
+
 def test_seal_expands_exact_category_jobs_and_binds_science_hashes(
     tmp_path: Path,
 ) -> None:
@@ -984,6 +1030,16 @@ def test_seal_expands_exact_category_jobs_and_binds_science_hashes(
 
     jobs = lock["fleet"]["jobs"]
     assert len(jobs) == 120
+    assert all(
+        field not in lock["game_contract"]
+        for field in ("profile", "worker_count", "job_count", "arm_id")
+    )
+    assert contract._sealed_game_contract_shape(lock) == {  # noqa: SLF001
+        "profile": "historical_pre_wave_v2",
+        "arm_id": None,
+        "worker_count": 40,
+        "job_count": 120,
+    }
     assert Counter(
         {
             category: sum(job["games"] for job in jobs if job["category"] == category)

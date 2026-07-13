@@ -31,6 +31,9 @@ from train_bc import (  # type: ignore  # noqa: E402
     _validate_a1_validation_manifest_corpus_binding,
     split_train_validation_indices,
 )
+from a1_pre_wave_contract import (  # type: ignore  # noqa: E402
+    EXPECTED_LEARNER_TRAINING_RECIPE,
+)
 
 
 _CONTRACT_SHA = "sha256:" + "a" * 64
@@ -123,11 +126,10 @@ def _load(path: Path) -> dict[str, object]:
 
 def _write_a1_chain(tmp_path: Path) -> tuple[dict, dict[str, object], np.ndarray]:
     producer_sha = "sha256:" + "e" * 64
-    learner_training_recipe = json.loads(
-        (_ROOT / "configs/experiments/a1_pre_wave_contract.template.json").read_text(
-            encoding="utf-8"
-        )
-    )["science"]["learner_training_recipe"]
+    # This fixture deliberately constructs a historical v2 lock.  Do not read
+    # the live v3 template here: current waves bind per-game policy weighting
+    # and rank-offset RNG semantics that the immutable v2 learner never had.
+    learner_training_recipe = dict(EXPECTED_LEARNER_TRAINING_RECIPE)
     learner_objective = {
         "objective": "mse",
         "value_readout": "scalar",

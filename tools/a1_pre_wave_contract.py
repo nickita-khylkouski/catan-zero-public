@@ -132,6 +132,8 @@ CURRENT_FLEET_SCHEMA = "catan-gpu-fleet-v2"
 CURRENT_FLEET_AUTHORITY = "catan-h100-exact64-v1"
 CURRENT_WORKER_COUNT = 64
 BALANCED_PREFIX_QUOTA_POLICY = "balanced_prefix_v1"
+CURRENT_GAME_CONTRACT_PROFILE = "pre_wave_generation_v3"
+DUAL_ARM_GAME_CONTRACT_PROFILE = "dual_arm_generation_v1"
 ATTEMPT_RESERVE_PER_JOB = {
     "current_producer": 5,
     "recent_history": 2,
@@ -224,6 +226,16 @@ GENERATION_CAMPAIGN_CONTRACT_SHA256 = (
 GENERATION_CAMPAIGN_CONTRACT_PATH = (
     REPO_ROOT / "configs/operations/a1-dual-arm-56gpu-20260710/contract.json"
 )
+# Immutable v1 campaign schemas predate an in-payload implementation_commit.
+# These commits are therefore part of the validator's canonical identity for
+# the two exact historical byte streams below.  Never replace them with HEAD:
+# replay must read the files the campaign actually bound, not today's tools.
+GENERATION_CAMPAIGN_R1_IMPLEMENTATION_COMMIT = (
+    "fb8088bd6e161eeebdd24da2b47875b02f191ffa"
+)
+HISTORICAL_DB1_IMPLEMENTATION_COMMIT = (
+    "db1c8b158fb89fd2421d85fcaf1f44f398eaa364"
+)
 # The issued r1 campaign predates the native-hot-loop guard revision.  Its
 # contract cannot be rewritten, and its guard records deliberately continue to
 # name the production paths that were live when it was issued.  Keep exact
@@ -288,6 +300,15 @@ HISTORICAL_DB1_CAMPAIGN_FILE_SHA256 = (
 HISTORICAL_DB1_EXECUTOR_SHA256 = (
     "sha256:fb92619ce98b2381267ba83a4d32c77236c54444c17d5d3258f3bac6b6a27db3"
 )
+# Sole issued pre-promotion lock created before promotion_handoff was added.
+# Compatibility is raw-file and semantic-identity bound; no other markerless
+# v2 lock can acquire generation/training authority by copying its shape.
+HISTORICAL_MARKERLESS_A1_LOCK = {
+    "contract_id": "a1-infoset-n128-p4-12000games-20260710-r1",
+    "contract_sha256": "sha256:c88cec355237f4526159650befb209ea3a8c2d095a32dd645fe04bd01d1c59c4",
+    "lock_file_sha256": "sha256:8301c7547e1745812c69ca04934424755c7116eb5e221688abc58c1bcb7a3122",
+    "source_draft_sha256": "sha256:ae4af7ba7df732137bca201198bdbef73a2500bebe42bc8cda118cfb082d10fe",
+}
 A0_EVIDENCE_SCHEMA = "a0-binding-verdict-v1"
 SEARCH_STAGE_EVIDENCE_SCHEMA = "rl-rnd-stage-decision-v1"
 REQUIRED_REPORTS = {
@@ -425,6 +446,74 @@ class ContractError(ValueError):
     """A fail-closed contract validation error."""
 
 
+def _sealed_game_contract_shape(lock: Mapping[str, Any]) -> dict[str, Any]:
+    """Return topology only when the lock schema binds it unambiguously."""
+
+    schema = lock.get("schema_version")
+    game = lock.get("game_contract")
+    fleet = lock.get("fleet")
+    if not isinstance(game, dict) or not isinstance(fleet, dict):
+        raise ContractError("sealed lock has no typed game/fleet contract")
+    if schema == GENERATION_ARM_LOCK_SCHEMA:
+        if (
+            game.get("profile") != DUAL_ARM_GAME_CONTRACT_PROFILE
+            or game.get("arm_id") not in {"n128", "n256"}
+            or game.get("worker_count") != 28
+            or game.get("job_count") != 84
+        ):
+            raise ContractError("dual-arm sealed topology drift")
+        profile = DUAL_ARM_GAME_CONTRACT_PROFILE
+        arm_id: str | None = str(game["arm_id"])
+        worker_count = 28
+        job_count = 84
+    elif schema == LOCK_SCHEMA:
+        if (
+            game.get("profile") != CURRENT_GAME_CONTRACT_PROFILE
+            or game.get("worker_count") != CURRENT_WORKER_COUNT
+            or game.get("job_count")
+            != CURRENT_WORKER_COUNT * len(EXPECTED_GAMES)
+            or "arm_id" in game
+        ):
+            raise ContractError("current v3 sealed topology drift")
+        profile = CURRENT_GAME_CONTRACT_PROFILE
+        arm_id = None
+        worker_count = CURRENT_WORKER_COUNT
+        job_count = CURRENT_WORKER_COUNT * len(EXPECTED_GAMES)
+    elif schema == LEGACY_LOCK_SCHEMA:
+        if any(key in game for key in ("profile", "arm_id", "worker_count", "job_count")):
+            raise ContractError("historical v2 topology fields drift")
+        profile = "historical_pre_wave_v2"
+        arm_id = None
+        worker_count = EXPECTED_WORKER_COUNT
+        job_count = EXPECTED_WORKER_COUNT * len(EXPECTED_GAMES)
+    else:
+        raise ContractError("lock schema has no authorized game topology")
+
+    jobs = fleet.get("jobs")
+    if not isinstance(jobs, list) or len(jobs) != job_count:
+        raise ContractError("sealed job count differs from game contract")
+    worker_ids = {
+        str(job.get("worker_id", "")) for job in jobs if isinstance(job, dict)
+    }
+    placements = {
+        (str(job.get("host_alias", "")), job.get("gpu"))
+        for job in jobs
+        if isinstance(job, dict)
+    }
+    if (
+        len(worker_ids) != worker_count
+        or "" in worker_ids
+        or len(placements) != worker_count
+    ):
+        raise ContractError("sealed physical lane count differs from game contract")
+    return {
+        "profile": profile,
+        "arm_id": arm_id,
+        "worker_count": worker_count,
+        "job_count": job_count,
+    }
+
+
 def _canonical_bytes(value: Any) -> bytes:
     return json.dumps(
         value, sort_keys=True, separators=(",", ":"), ensure_ascii=True
@@ -447,55 +536,21 @@ def _sha256_bytes(payload: bytes) -> str:
     return "sha256:" + hashlib.sha256(payload).hexdigest()
 
 
-def _tracked_history_contains_file_digest(relative_path: str, digest: str) -> bool:
-    """Verify an immutable provenance record after the checkout advances.
-
-    A sealed campaign binds file bytes, not the mutable worktree's latest
-    version.  Requiring every historical record to equal today's checkout
-    makes an honest code change retroactively invalidate already-running data.
-    When current bytes differ, accept only exact bytes for the same path that
-    are still recoverable from this repository's tracked commit history.
-    Unknown paths, malformed paths, git failures, and unknown digests fail
-    closed.  This does not rewrite or weaken the sealed record.
-    """
-
-    relative = PurePath(relative_path)
-    if relative.is_absolute() or ".." in relative.parts or not relative.parts:
-        return False
-    try:
-        history = subprocess.run(
-            [
-                "git",
-                "-C",
-                str(REPO_ROOT),
-                "log",
-                "--format=%H",
-                "--all",
-                "--",
-                relative_path,
-            ],
-            check=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            timeout=10,
-        ).stdout.splitlines()
-        # Campaign records are recent. A finite bound prevents a corrupt or
-        # adversarial repository from turning verification into an unbounded
-        # history walk.
-        for commit in history[:256]:
-            blob = subprocess.run(
-                ["git", "-C", str(REPO_ROOT), "show", f"{commit}:{relative_path}"],
-                check=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                timeout=10,
-            ).stdout
-            if _sha256_bytes(blob) == digest:
-                return True
-    except (OSError, subprocess.SubprocessError):
-        return False
-    return False
+def _is_historical_markerless_a1_lock(path: Path, lock: Mapping[str, Any]) -> bool:
+    source = lock.get("source_draft")
+    return bool(
+        lock.get("schema_version") == LEGACY_LOCK_SCHEMA
+        and "promotion_handoff" not in lock
+        and lock.get("contract_id")
+        == HISTORICAL_MARKERLESS_A1_LOCK["contract_id"]
+        and lock.get("contract_sha256")
+        == HISTORICAL_MARKERLESS_A1_LOCK["contract_sha256"]
+        and path.is_file()
+        and _sha256(path) == HISTORICAL_MARKERLESS_A1_LOCK["lock_file_sha256"]
+        and isinstance(source, dict)
+        and source.get("sha256")
+        == HISTORICAL_MARKERLESS_A1_LOCK["source_draft_sha256"]
+    )
 
 
 def _issued_r1_guard_snapshot(relative_path: str, digest: str) -> Path | None:
@@ -532,6 +587,64 @@ def _git_blob(commit: str, relative_path: str) -> bytes:
         raise ContractError(
             f"cannot recover {relative_path} from implementation commit {commit}"
         ) from error
+
+
+def _historical_campaign_provenance_bytes(
+    commit: str, relative_path: str, digest: str
+) -> bytes:
+    """Return one historical campaign blob from its sole sealed authority.
+
+    The two revised r1 guards have checked-in, digest-keyed snapshots because
+    their semantics must remain parseable even in a source archive.  Every
+    other record must exist at the campaign's exact implementation commit.
+    Searching arbitrary history is intentionally forbidden: an unrelated old
+    blob with the same path is not authority for this campaign.
+    """
+
+    snapshot_key = (relative_path, digest)
+    if snapshot_key in GENERATION_CAMPAIGN_R1_GUARD_SNAPSHOTS:
+        snapshot = _issued_r1_guard_snapshot(relative_path, digest)
+        if snapshot is None:
+            raise ContractError(
+                "generation campaign immutable snapshot drift: "
+                f"{relative_path}"
+            )
+        payload = snapshot.read_bytes()
+    else:
+        payload = _git_blob(commit, relative_path)
+    if _sha256_bytes(payload) != digest:
+        raise ContractError(
+            "generation campaign implementation blob drift: "
+            f"{commit}:{relative_path}"
+        )
+    return payload
+
+
+def _campaign_historical_implementation_commit(
+    path: Path,
+    value: Mapping[str, Any],
+    *,
+    historical_lock_source: bool = False,
+) -> str | None:
+    """Resolve the exact source authority for an immutable campaign."""
+
+    schema = value.get("schema_version")
+    if schema == GENERATION_CAMPAIGN_REVISION_SCHEMA:
+        commit = str(value.get("implementation_commit", ""))
+        if not re.fullmatch(r"[0-9a-f]{40}", commit):
+            raise ContractError("generation revision implementation commit is malformed")
+        return commit
+    if schema != GENERATION_CAMPAIGN_SCHEMA:
+        return None
+    if historical_lock_source:
+        return HISTORICAL_DB1_IMPLEMENTATION_COMMIT
+    if (
+        path.resolve() == GENERATION_CAMPAIGN_CONTRACT_PATH.resolve()
+        and value.get("contract_id") == GENERATION_CAMPAIGN_CONTRACT_ID
+        and value.get("contract_sha256") == GENERATION_CAMPAIGN_CONTRACT_SHA256
+    ):
+        return GENERATION_CAMPAIGN_R1_IMPLEMENTATION_COMMIT
+    return None
 
 
 def _generation_revision_provenance(commit: str) -> dict[str, Any]:
@@ -3512,9 +3625,9 @@ def validate_generation_campaign(
     if declared != _digest_value(unhashed):
         raise ContractError("generation campaign semantic digest mismatch")
     # The already-issued campaign and the one explicit historical DB1 lock
-    # source may verify their sealed file bytes from tracked git history after
-    # this checkout advances. No copied/recomputed/new contract gets that
-    # privilege: it must bind the current source bytes.
+    # source verify from their one canonical implementation commit (plus the
+    # two digest-keyed guard snapshots). No copied/recomputed/new contract gets
+    # that privilege: it must bind the current source bytes.
     canonical_archived_provenance = bool(
         path.resolve() == GENERATION_CAMPAIGN_CONTRACT_PATH.resolve()
         and value.get("contract_id") == GENERATION_CAMPAIGN_CONTRACT_ID
@@ -3523,6 +3636,13 @@ def validate_generation_campaign(
     allow_archived_provenance = (
         historical_lock_source or canonical_archived_provenance
     )
+    historical_implementation_commit = _campaign_historical_implementation_commit(
+        path,
+        value,
+        historical_lock_source=historical_lock_source,
+    )
+    if allow_archived_provenance != (historical_implementation_commit is not None):
+        raise ContractError("generation campaign historical source authority drift")
     if value["status"] != GENERATION_CAMPAIGN_PENDING:
         raise ContractError("generation campaign must remain explicitly pending")
     handoff = dict(value["promotion_handoff"])
@@ -3772,31 +3892,21 @@ def validate_generation_campaign(
         "configs/guards/a1_generation_n128_legacy.json",
     }:
         raise ContractError("generation campaign arm guard bindings drift")
+    historical_provenance: dict[str, bytes] = {}
     for record in records:
         _require_exact_keys(record, {"path", "sha256"}, where="generation campaign file")
-        if historical_lock_source and record == {
-            "path": "tools/fleet/a1_production_executor.py",
-            "sha256": HISTORICAL_DB1_EXECUTOR_SHA256,
-        }:
-            continue
         relative_path = str(record["path"])
-        source = REPO_ROOT / relative_path
-        current_matches = source.is_file() and _sha256(source) == record["sha256"]
-        guard_snapshot = (
-            _issued_r1_guard_snapshot(relative_path, str(record["sha256"]))
-            if allow_archived_provenance
-            else None
-        )
-        archived_matches = bool(
-            allow_archived_provenance
-            and (
-                guard_snapshot is not None
-                or _tracked_history_contains_file_digest(
-                    relative_path, str(record["sha256"])
+        if historical_implementation_commit is not None:
+            historical_provenance[relative_path] = (
+                _historical_campaign_provenance_bytes(
+                    historical_implementation_commit,
+                    relative_path,
+                    str(record["sha256"]),
                 )
             )
-        )
-        if not current_matches and not archived_matches:
+            continue
+        source = REPO_ROOT / relative_path
+        if not source.is_file() or _sha256(source) != record["sha256"]:
             raise ContractError(f"generation campaign immutable file drift: {source}")
     for record in provenance["arm_guards"]:
         name = Path(str(record["path"])).stem
@@ -3805,18 +3915,16 @@ def validate_generation_campaign(
             raise ContractError(f"generation campaign has unknown arm guard {name}")
         relative_path = str(record["path"])
         live_guard = REPO_ROOT / relative_path
-        guard_source = (
-            live_guard
-            if live_guard.is_file() and _sha256(live_guard) == record["sha256"]
-            else _issued_r1_guard_snapshot(relative_path, str(record["sha256"]))
-            if allow_archived_provenance
-            else None
-        )
-        if guard_source is None:
-            raise ContractError(
-                f"generation campaign immutable guard bytes unavailable: {live_guard}"
-            )
-        payload = _load_json(guard_source)
+        if historical_implementation_commit is not None:
+            try:
+                payload = json.loads(historical_provenance[relative_path])
+            except (KeyError, UnicodeError, json.JSONDecodeError) as error:
+                raise ContractError(
+                    "generation campaign immutable guard bytes are invalid: "
+                    f"{relative_path}"
+                ) from error
+        else:
+            payload = _load_json(live_guard)
         guards = list(payload.get("guards", []))
         lint = next(
             (item for item in guards if item.get("name") == "cli_flag_lint"), None
@@ -4127,7 +4235,7 @@ def materialize_generation_campaign(
             "checkpoints": checkpoints,
             "source_categories": list(campaign["source_categories"]),
             "game_contract": {
-                "profile": "dual_arm_generation_v1",
+                "profile": DUAL_ARM_GAME_CONTRACT_PROFILE,
                 "arm_id": arm_id,
                 "worker_count": 28,
                 "job_count": 84,
@@ -4666,6 +4774,15 @@ def build_lock(
         "checkpoints": checkpoint_records,
         "source_categories": categories,
         "game_contract": {
+            **(
+                {}
+                if draft_schema == LEGACY_DRAFT_SCHEMA
+                else {
+                    "profile": CURRENT_GAME_CONTRACT_PROFILE,
+                    "worker_count": CURRENT_WORKER_COUNT,
+                    "job_count": CURRENT_WORKER_COUNT * len(EXPECTED_GAMES),
+                }
+            ),
             "total_complete_games": sum(EXPECTED_GAMES.values()),
             "category_games": dict(EXPECTED_GAMES),
             "total_attempts": sum(category_attempts.values()),
@@ -4715,11 +4832,15 @@ def verify_lock(
         raise ContractError(
             f"contract digest mismatch: expected {expected_digest or '<missing>'}, got {actual_digest}"
         )
+    _sealed_game_contract_shape(lock)
+    historical_markerless = _is_historical_markerless_a1_lock(lock_path, lock)
     _verify_artifact_records([lock["source_draft"]])
     handoff_record = lock.get("promotion_handoff")
-    if not isinstance(handoff_record, dict):
+    if handoff_record is None and historical_markerless:
+        pass
+    elif not isinstance(handoff_record, dict):
         raise ContractError("lock does not bind an explicit promotion handoff mode")
-    if handoff_record.get("mode") == POST_PROMOTION_HANDOFF_MODE:
+    elif handoff_record.get("mode") == POST_PROMOTION_HANDOFF_MODE:
         if lock_schema != LOCK_SCHEMA:
             raise ContractError("post-promotion handoffs require the v3 lock schema")
         _verify_artifact_records([handoff_record])
@@ -4907,15 +5028,16 @@ def verify_lock(
         ),
     )
     _validate_post_wave(dict(lock["post_wave_acceptance"]))
-    rebuilt = build_lock(
-        Path(str(lock["source_draft"]["path"])),
-        seed_ledger_snapshot=dict(lock["fleet"]["seed_ledger"]),
-        seed_ledger_contract_sha256=expected_digest,
-    )
-    if _digest_value(rebuilt) != _digest_value(lock):
-        raise ContractError(
-            "lock does not exactly reconstruct from its immutable source draft"
+    if not historical_markerless:
+        rebuilt = build_lock(
+            Path(str(lock["source_draft"]["path"])),
+            seed_ledger_snapshot=dict(lock["fleet"]["seed_ledger"]),
+            seed_ledger_contract_sha256=expected_digest,
         )
+        if _digest_value(rebuilt) != _digest_value(lock):
+            raise ContractError(
+                "lock does not exactly reconstruct from its immutable source draft"
+            )
     return lock
 
 
@@ -4927,6 +5049,7 @@ def _verify_generation_arm_lock(
     unhashed.pop("contract_sha256", None)
     if expected_digest != _digest_value(unhashed):
         raise ContractError("generation arm lock semantic digest mismatch")
+    _sealed_game_contract_shape(lock)
     game = dict(lock.get("game_contract", {}))
     _require_exact_keys(
         game,
@@ -4946,7 +5069,7 @@ def _verify_generation_arm_lock(
     )
     arm_id = str(game.get("arm_id"))
     if (
-        game.get("profile") != "dual_arm_generation_v1"
+        game.get("profile") != DUAL_ARM_GAME_CONTRACT_PROFILE
         or arm_id not in {"n256", "n128"}
         or int(game.get("worker_count", -1)) != 28
         or int(game.get("job_count", -1)) != 84
@@ -4960,9 +5083,18 @@ def _verify_generation_arm_lock(
     _verify_artifact_records(
         [lock["source_campaign"], lock["source_placement"], lock["promotion_handoff"]]
     )
+    campaign_path = Path(str(lock["source_campaign"]["path"]))
     campaign = validate_generation_campaign(
-        Path(str(lock["source_campaign"]["path"])),
+        campaign_path,
         _allow_historical_lock_source=True,
+    )
+    historical_lock_source = (
+        campaign["contract_sha256"] == HISTORICAL_DB1_CAMPAIGN_SHA256
+    )
+    historical_implementation_commit = _campaign_historical_implementation_commit(
+        campaign_path,
+        campaign,
+        historical_lock_source=historical_lock_source,
     )
     placements = _campaign_placements(
         Path(str(lock["source_placement"]["path"])), campaign
@@ -5112,34 +5244,48 @@ def _verify_generation_arm_lock(
         lock["provenance"]["harvest"],
         *lock["provenance"]["runtime_code_tree"],
     ]
+    campaign_provenance = dict(campaign["provenance"])
+    campaign_bound_records = [
+        *map(dict, campaign_provenance["arm_guards"]),
+        *map(dict, campaign_provenance["generator_code"]),
+        dict(campaign_provenance["executor"]),
+        dict(campaign_provenance["harvest"]),
+        dict(campaign_provenance["fleet_manifest"]),
+    ]
+    campaign_bound_identities = {
+        (str(record["path"]), str(record["sha256"]))
+        for record in campaign_bound_records
+    }
     historical_repo_root: Path | None = None
-    if campaign["contract_sha256"] == HISTORICAL_DB1_CAMPAIGN_SHA256:
+    if historical_lock_source:
         campaign_source = Path(str(lock["source_campaign"]["path"]))
         if len(campaign_source.parents) >= 4:
             historical_repo_root = campaign_source.parents[3]
     for record in records:
+        relative_path = str(record["path"])
+        digest = str(record["sha256"])
         if (
-            campaign["contract_sha256"] == HISTORICAL_DB1_CAMPAIGN_SHA256
-            and record
-            == {
-                "kind": "executor",
-                "path": "tools/fleet/a1_production_executor.py",
-                "sha256": HISTORICAL_DB1_EXECUTOR_SHA256,
-            }
+            historical_implementation_commit is not None
+            and (relative_path, digest) in campaign_bound_identities
         ):
+            _historical_campaign_provenance_bytes(
+                historical_implementation_commit,
+                relative_path,
+                digest,
+            )
             continue
-        raw_path = Path(str(record["path"]))
+        raw_path = Path(relative_path)
         source = raw_path if raw_path.is_absolute() else REPO_ROOT / raw_path
         historical_source = (
             historical_repo_root / raw_path
             if historical_repo_root is not None and not raw_path.is_absolute()
             else None
         )
-        current_matches = source.is_file() and _sha256(source) == record["sha256"]
+        current_matches = source.is_file() and _sha256(source) == digest
         historical_matches = bool(
             historical_source is not None
             and historical_source.is_file()
-            and _sha256(historical_source) == record["sha256"]
+            and _sha256(historical_source) == digest
         )
         if not current_matches and not historical_matches:
             raise ContractError(f"generation arm provenance drift: {source}")
@@ -5441,7 +5587,7 @@ def _validate_claim_render(
         raise ContractError("render binds a different sealed contract")
     commands = rendered.get("commands")
     jobs = {str(job["job_id"]): job for job in lock["fleet"]["jobs"]}
-    expected_jobs = int(lock.get("game_contract", {}).get("job_count", 120))
+    expected_jobs = int(_sealed_game_contract_shape(lock)["job_count"])
     if (
         not isinstance(commands, list)
         or len(commands) != len(jobs)

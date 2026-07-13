@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run an exact, validation-only 4-GPU + 8-GPU A1 canary transaction.
 
-The production render remains immutable.  This tool verifies all 40 production
+The production render remains immutable.  This tool verifies all 64 production
 lanes, selects only c1/gpu0-3 and h100-8a/gpu0-7, then derives a separately
 hashed transaction by changing only job identity, output directory, game count,
 seed range, and ledger-claim identity.  Every science flag, checkpoint,

@@ -1,4 +1,10 @@
-# A1 pre-wave R&D draft
+# A1 pre-wave R&D draft — archived v2 evidence
+
+> **HISTORICAL ONLY — NOT CURRENT OPERATOR INSTRUCTIONS.** The adjacent JSON
+> is immutable pre-promotion/v2 evidence retained for replay tests. Do not use
+> it to seal, render, launch, or train a new wave. Current work starts from
+> `a1_pre_wave_contract.template.json` (v3) and the current operator runbook.
+> The historical values below intentionally remain unchanged.
 
 Status: **fully resolved and deliberately unsealed**. This file materializes only
 choices already supported by the local plans and immutable evidence. It does

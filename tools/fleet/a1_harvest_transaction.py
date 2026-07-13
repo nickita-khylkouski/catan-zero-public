@@ -44,7 +44,6 @@ RECEIPT_SCHEMA = "a1-fleet-harvest-receipt-v1"
 STATE_SCHEMA = "a1-fleet-harvest-job-state-v1"
 EXPECTED_JOBS = 120
 EXPECTED_HOSTS = 8
-DUAL_ARM_PROFILE = "dual_arm_generation_v1"
 _HOST_RE = re.compile(r"[A-Za-z0-9_.@-]+\Z")
 _INCOMING_RE = re.compile(
     r"(?P<host>[A-Za-z0-9_.@-]+)\.(?P<token>[0-9a-f]{32})"
@@ -61,20 +60,17 @@ class HarvestError(RuntimeError):
 
 def _contract_shape(lock: Mapping[str, Any]) -> dict[str, Any]:
     game_contract = lock.get("game_contract")
-    if not isinstance(game_contract, dict) or game_contract.get("profile") != DUAL_ARM_PROFILE:
-        return {
-            "arm_id": None,
-            "job_count": EXPECTED_JOBS,
-            "host_count": EXPECTED_HOSTS,
-            "category_games": dict(contract.EXPECTED_GAMES),
-            "category_attempts": dict(contract.EXPECTED_ATTEMPTS),
-        }
-    arm_id = game_contract.get("arm_id")
+    try:
+        topology = contract._sealed_game_contract_shape(lock)  # noqa: SLF001
+    except contract.ContractError as error:
+        raise HarvestError(f"sealed harvest topology is invalid: {error}") from error
+    if not isinstance(game_contract, dict):
+        raise HarvestError("sealed harvest game_contract is missing")
+    arm_id = topology["arm_id"]
     category_games = game_contract.get("category_games")
     category_attempts = game_contract.get("category_attempts")
     if (
-        arm_id not in {"n128", "n256"}
-        or not isinstance(category_games, dict)
+        not isinstance(category_games, dict)
         or not isinstance(category_attempts, dict)
         or set(category_games) != set(contract.EXPECTED_GAMES)
         or set(category_attempts) != set(contract.EXPECTED_GAMES)
@@ -83,11 +79,27 @@ def _contract_shape(lock: Mapping[str, Any]) -> dict[str, Any]:
         or game_contract.get("total_complete_games") != sum(category_games.values())
         or game_contract.get("total_attempts") != sum(category_attempts.values())
     ):
-        raise HarvestError("dual-arm game_contract quotas are malformed")
+        raise HarvestError("sealed game_contract quotas are malformed")
+    profile = topology["profile"]
+    if profile == "historical_pre_wave_v2":
+        host_count: int | None = EXPECTED_HOSTS
+    elif profile == contract.CURRENT_GAME_CONTRACT_PROFILE:
+        jobs = lock.get("fleet", {}).get("jobs", [])
+        host_count = len(
+            {
+                str(job["host_alias"])
+                for job in jobs
+                if isinstance(job, dict) and "host_alias" in job
+            }
+        )
+        if host_count <= 0:
+            raise HarvestError("current v3 host topology is empty")
+    else:
+        host_count = None
     return {
         "arm_id": arm_id,
-        "job_count": 84,
-        "host_count": None,
+        "job_count": topology["job_count"],
+        "host_count": host_count,
         "category_games": dict(category_games),
         "category_attempts": dict(category_attempts),
     }
@@ -862,7 +874,7 @@ def _harvest_locked(
     ssh_command: Sequence[str] = ("ssh",),
     fetch_workers: int = 1,
 ) -> dict[str, Any]:
-    """Collect and atomically publish the exact sealed 120-job output set."""
+    """Collect and atomically publish the exact schema-bound output set."""
 
     lock, rendered, jobs = _validate_inputs(snapshot_lock_path, snapshot_render_path)
     if transaction_guard is not None:

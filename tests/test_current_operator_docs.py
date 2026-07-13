@@ -23,6 +23,12 @@ def test_current_operator_docs_match_executable_a1_v5_contract() -> None:
     eval_doc = (ROOT / "docs/A1_H100_DISTRIBUTED_EVAL.md").read_text(
         encoding="utf-8"
     )
+    fleet_control = (ROOT / "tools/fleet/FLEET_CONTROL.md").read_text(
+        encoding="utf-8"
+    )
+    eval_controller = (ROOT / "tools/fleet/a1_h100_eval_fleet.py").read_text(
+        encoding="utf-8"
+    )
     template = json.loads(
         (ROOT / "configs/experiments/a1_pre_wave_contract.template.json").read_text(
             encoding="utf-8"
@@ -76,6 +82,9 @@ def test_current_operator_docs_match_executable_a1_v5_contract() -> None:
     assert "deployed `c_scale=0.10` on every" in fleet_launch
     assert "full 64-H100 fleet" in eval_doc
     assert "both use 0.10" in eval_doc
+    assert "current\nv3 is exactly 192 jobs on 64 GPU lanes across 12 hosts" in fleet_control
+    assert "sixty-four equal\nevaluator lanes" in eval_controller
+    assert "forty-lane evidence, but are not the current fleet" in eval_controller
 
     for stale in (
         "40 GPUs:",
@@ -102,3 +111,24 @@ def test_current_eval_example_enumerates_the_full_authoritative_fleet() -> None:
     }
     actual = {host["alias"]: int(host["gpu_count"]) for host in example["hosts"]}
     assert actual == expected
+
+
+def test_rnd_draft_is_explicitly_archived_v2_evidence() -> None:
+    historical_path = (
+        ROOT / "configs/experiments/a1_pre_wave_contract.rnd_draft.json"
+    )
+    historical = json.loads(historical_path.read_text(encoding="utf-8"))
+    readme = historical_path.with_suffix(".README.md").read_text(encoding="utf-8")
+    current = json.loads(
+        (ROOT / "configs/experiments/a1_pre_wave_contract.template.json").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    assert historical["schema_version"] == pre_wave.LEGACY_DRAFT_SCHEMA
+    assert historical["promotion_handoff"]["mode"] == pre_wave.HISTORICAL_HANDOFF_MODE
+    assert current["schema_version"] == pre_wave.DRAFT_SCHEMA
+    assert current["promotion_handoff"]["mode"] == pre_wave.POST_PROMOTION_HANDOFF_MODE
+    assert "HISTORICAL ONLY — NOT CURRENT OPERATOR INSTRUCTIONS" in readme
+    assert "Do not use" in readme
+    assert "a1_pre_wave_contract.template.json" in readme

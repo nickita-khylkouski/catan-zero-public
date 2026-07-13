@@ -261,10 +261,13 @@ def verify_render(
         raise ExecutorError("render semantic digest mismatch")
     if rendered.get("contract_sha256") != lock["contract_sha256"]:
         raise ExecutorError("render binds a different contract")
-    game_contract = dict(lock.get("game_contract", {}))
-    arm_id = game_contract.get("arm_id")
-    expected_jobs = int(game_contract.get("job_count", 120))
-    expected_lanes = int(game_contract.get("worker_count", 40))
+    try:
+        topology = contract._sealed_game_contract_shape(lock)  # noqa: SLF001
+    except contract.ContractError as error:
+        raise ExecutorError(f"sealed production topology is invalid: {error}") from error
+    arm_id = topology["arm_id"]
+    expected_jobs = int(topology["job_count"])
+    expected_lanes = int(topology["worker_count"])
     commands = rendered.get("commands")
     if not isinstance(commands, list) or len(commands) != expected_jobs:
         raise ExecutorError(

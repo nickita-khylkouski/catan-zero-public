@@ -120,7 +120,16 @@ def _fixture_contract(tmp_path: Path) -> tuple[dict, dict, Path, Path, Path]:
             )
     search_operator = _current_search_operator()
     lock = {
+        "schema_version": contract.LEGACY_LOCK_SCHEMA,
         "contract_sha256": "sha256:" + "1" * 64,
+        "game_contract": {
+            "total_complete_games": 12_000,
+            "category_games": dict(contract.EXPECTED_GAMES),
+            "total_attempts": sum(contract.EXPECTED_ATTEMPTS.values()),
+            "category_attempts": dict(contract.EXPECTED_ATTEMPTS),
+            "selection_rule": "lowest_seed_complete_per_job",
+            "selection_before_row_expansion": True,
+        },
         "fleet": {
             "seed_plan_sha256": "sha256:" + "2" * 64,
             "jobs": jobs,
@@ -231,6 +240,79 @@ with tarfile.open(fileobj=sys.stdout.buffer, mode="w|") as bundle:
     )
     script.chmod(0o755)
     return script
+
+
+def _topology_jobs(workers: list[dict]) -> list[dict]:
+    return [
+        {
+            "job_id": f"{worker['id']}__{category}",
+            "worker_id": worker["id"],
+            "host_alias": worker["host_alias"],
+            "gpu": worker["gpu"],
+            "category": category,
+        }
+        for worker in workers
+        for category in CATEGORIES
+    ]
+
+
+def test_contract_shape_is_schema_bound_for_legacy_current_and_dual_arm(
+    tmp_path: Path,
+) -> None:
+    legacy, *_ = _fixture_contract(tmp_path / "legacy")
+    assert harvest._contract_shape(legacy) == {  # noqa: SLF001
+        "arm_id": None,
+        "job_count": 120,
+        "host_count": 8,
+        "category_games": dict(contract.EXPECTED_GAMES),
+        "category_attempts": dict(contract.EXPECTED_ATTEMPTS),
+    }
+
+    workers, _record = contract._canonical_workers_from_fleet_manifest(  # noqa: SLF001
+        contract.CURRENT_FLEET_MANIFEST
+    )
+    current_attempts = {
+        category: games
+        + contract.CURRENT_WORKER_COUNT * contract.ATTEMPT_RESERVE_PER_JOB[category]
+        for category, games in contract.EXPECTED_GAMES.items()
+    }
+    current = {
+        "schema_version": contract.LOCK_SCHEMA,
+        "game_contract": {
+            "profile": contract.CURRENT_GAME_CONTRACT_PROFILE,
+            "worker_count": 64,
+            "job_count": 192,
+            "total_complete_games": sum(contract.EXPECTED_GAMES.values()),
+            "category_games": dict(contract.EXPECTED_GAMES),
+            "total_attempts": sum(current_attempts.values()),
+            "category_attempts": current_attempts,
+        },
+        "fleet": {"jobs": _topology_jobs(workers)},
+    }
+    assert harvest._contract_shape(current)["job_count"] == 192  # noqa: SLF001
+    assert harvest._contract_shape(current)["host_count"] == 12  # noqa: SLF001
+
+    dual_workers = workers[:28]
+    dual = {
+        "schema_version": contract.GENERATION_ARM_LOCK_SCHEMA,
+        "game_contract": {
+            "profile": contract.DUAL_ARM_GAME_CONTRACT_PROFILE,
+            "arm_id": "n128",
+            "worker_count": 28,
+            "job_count": 84,
+            "total_complete_games": sum(contract.EXPECTED_GAMES.values()),
+            "category_games": dict(contract.EXPECTED_GAMES),
+            "total_attempts": sum(contract.EXPECTED_ATTEMPTS.values()),
+            "category_attempts": dict(contract.EXPECTED_ATTEMPTS),
+        },
+        "fleet": {"jobs": _topology_jobs(dual_workers)},
+    }
+    assert harvest._contract_shape(dual)["job_count"] == 84  # noqa: SLF001
+    assert harvest._contract_shape(dual)["host_count"] is None  # noqa: SLF001
+
+    current["game_contract"].pop("job_count")
+    with pytest.raises(harvest.HarvestError, match="current v3 sealed topology"):
+        harvest._contract_shape(current)  # noqa: SLF001
 
 
 @pytest.fixture

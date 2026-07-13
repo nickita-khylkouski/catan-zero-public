@@ -6,10 +6,12 @@ does not require a scheduler daemon on the eight H100 hosts, and every mutable
 operation is gated by ``--go``.  A Ray cluster specification can be rendered
 for a later daemon-managed backend without installing or starting Ray.
 
-The unit of capacity is a physical GPU, never a host.  Six four-GPU hosts and
-two eight-GPU hosts therefore yield forty equal evaluator lanes.  Internal H2H
-uses one shard per lane.  External candidate/incumbent panels pair adjacent
-lanes and assign both sides the exact same seed interval.
+The unit of capacity is a physical GPU, never a host.  The current authority
+has eight four-GPU hosts plus four eight-GPU hosts, yielding sixty-four equal
+evaluator lanes. Historical manifests with six four-GPU plus two eight-GPU
+hosts remain replayable as forty-lane evidence, but are not the current fleet.
+Internal H2H uses one shard per lane. External candidate/incumbent panels pair
+adjacent lanes and assign both sides the exact same seed interval.
 """
 
 from __future__ import annotations

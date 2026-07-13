@@ -140,7 +140,10 @@ Jobset schema:
 ## A1 sealed-output harvest
 
 `a1_harvest_transaction.py` is the read-only collector for the exact A1
-pre-wave lock/render pair. It requires the sealed 120-job/8-host topology,
+pre-wave lock/render pair. Topology comes from the verified lock schema: current
+v3 is exactly 192 jobs on 64 GPU lanes across 12 hosts; immutable v2 replay is
+exactly 120 jobs on 40 lanes across 8 hosts; dual-arm locks are 84 jobs on 28
+lanes. The collector never guesses a historical default. It
 opens one tar stream per host, rejects links/special files/traversal/duplicate
 members, hashes every output byte, and atomically publishes a canonical
 `jobs/<job_id>/...` tree plus a typed relocation map. A failed run leaves no
