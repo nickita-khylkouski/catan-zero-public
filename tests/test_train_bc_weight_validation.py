@@ -5,6 +5,7 @@ import pytest
 
 from tools.train_bc import (
     _parse_weight_map,
+    _validate_effective_training_weight_mass,
     _validate_training_weight_arguments,
     _validate_weight_map_keys,
     build_parser,
@@ -103,3 +104,37 @@ def test_value_weight_builder_rejects_nonfinite_corpus_multiplier() -> None:
     }
     with pytest.raises(SystemExit, match="value_weight_multiplier"):
         build_value_sample_weights(data)
+
+
+def test_enabled_objective_requires_positive_training_split_weight_mass() -> None:
+    with pytest.raises(SystemExit, match="policy/Q objective"):
+        _validate_effective_training_weight_mass(
+            policy_weights=np.asarray([0.0, 0.0, 1.0]),
+            value_weights=np.ones(3),
+            train_indices=np.asarray([0, 1]),
+            policy_objective_enabled=True,
+            value_objective_enabled=True,
+        )
+
+    with pytest.raises(SystemExit, match="value/final-VP objective"):
+        _validate_effective_training_weight_mass(
+            policy_weights=np.ones(3),
+            value_weights=np.asarray([0.0, 0.0, 1.0]),
+            train_indices=np.asarray([0, 1]),
+            policy_objective_enabled=True,
+            value_objective_enabled=True,
+        )
+
+
+def test_disabled_objective_allows_zero_weight_mass() -> None:
+    report = _validate_effective_training_weight_mass(
+        policy_weights=np.zeros(2),
+        value_weights=np.zeros(2),
+        train_indices=np.arange(2),
+        policy_objective_enabled=False,
+        value_objective_enabled=False,
+    )
+    assert report == {
+        "policy_sample_weight_mass": 0.0,
+        "value_sample_weight_mass": 0.0,
+    }
