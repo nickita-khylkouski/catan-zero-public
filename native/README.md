@@ -30,3 +30,9 @@ history, so artifacts must not label it a full Bayesian information-set posterio
 Version `0.1.5` adds the fail-closed `gumbel_search` Python binding used by the
 native MCTS hot loop. The distinct version is intentional: wheels without that
 required API must never share the new release artifact name or package identity.
+
+Version `0.1.6` adds the native-search capability contract required by
+belief-level completed-Q aggregation: `sigma_reference_visits` calibration,
+root-perspective completed-Q evidence, and the fail-closed
+`gumbel_search_capabilities()` advertisement. Version `0.1.5` wheels must not be
+used for this operator even if they expose the older `gumbel_search` entry point.

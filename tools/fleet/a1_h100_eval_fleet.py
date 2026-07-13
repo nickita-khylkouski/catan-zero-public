@@ -77,6 +77,13 @@ FULL_EXPECTED_SHAPES = {
 }
 CANARY_ALIASES = {"c1", "h100-8a"}
 DEFAULT_WORKERS_PER_GPU = 16
+NATIVE_WHEEL_VERSION = "0.1.6"
+NATIVE_WHEEL_NAME = (
+    "catanatron_rs-0.1.6-cp311-cp311-manylinux_2_34_x86_64.whl"
+)
+NATIVE_REQUIRED_CAPABILITIES = frozenset(
+    {"sigma_reference_visits", "belief_target_evidence"}
+)
 SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 SAFE_ADDRESS = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.:-]*$")
 
@@ -812,6 +819,11 @@ def _engine_identity(repo_root: Path, repo_commit: str) -> dict[str, str]:
     rows = [line.split() for line in inventory.read_text(encoding="utf-8").splitlines() if line.strip()]
     if len(rows) != 1 or len(rows[0]) != 2 or not re.fullmatch(r"[0-9a-f]{64}", rows[0][0]):
         raise FleetError("native wheel checksum inventory is not one sealed wheel")
+    if rows[0][1] != NATIVE_WHEEL_NAME:
+        raise FleetError(
+            "native wheel checksum inventory does not name the capability-sealed "
+            f"{NATIVE_WHEEL_NAME} artifact"
+        )
     referee_root = repo_root / "vendor/catanatron/catanatron"
     referee_files = sorted(path for path in referee_root.rglob("*.py") if path.is_file())
     if not referee_files:
@@ -1686,9 +1698,14 @@ def _preflight_command(
     repo = shlex.quote(manifest["remote_repo"])
     pythonpath = manifest["remote_repo"] + "/src:" + manifest["remote_repo"]
     import_probe = (
-        "from pathlib import Path; import catan_zero; "
+        "from importlib.metadata import version; from pathlib import Path; "
+        "import catan_zero, catanatron_rs; "
         "assert Path(catan_zero.__file__).resolve().is_relative_to("
-        f"Path({manifest['remote_repo']!r}) / 'src')"
+        f"Path({manifest['remote_repo']!r}) / 'src'); "
+        f"assert version('catanatron-rs') == {NATIVE_WHEEL_VERSION!r}; "
+        "capability_fn=getattr(catanatron_rs,'gumbel_search_capabilities',None); "
+        "assert callable(capability_fn); "
+        f"assert set({tuple(sorted(NATIVE_REQUIRED_CAPABILITIES))!r}) <= set(capability_fn())"
     )
     lines = [
         "set -euo pipefail",
@@ -1702,7 +1719,7 @@ def _preflight_command(
                 plan["engine_identity"]["native_wheel_sha256"].removeprefix(
                     "sha256:"
                 )
-                + "  catanatron_rs-0.1.5-cp311-cp311-manylinux_2_34_x86_64.whl"
+                + "  " + NATIVE_WHEEL_NAME
             )
             + " native/catanatron-rs/WHEEL_SHA256SUMS"
         ),
