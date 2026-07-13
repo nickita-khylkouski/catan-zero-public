@@ -212,6 +212,53 @@ def test_winning_recipe_accepts_only_exact_fresh_f7_dose(tmp_path: Path) -> None
     )
 
 
+def test_production_command_is_only_an_output_and_runtime_rebinding(
+    tmp_path: Path,
+) -> None:
+    trainer = tmp_path / "checkout" / "tools" / "train_bc.py"
+    trainer.parent.mkdir(parents=True)
+    trainer.write_text("# bound trainer\n", encoding="utf-8")
+    selected = _command(tmp_path)
+
+    production = temp._production_command(
+        selected,
+        python="/bound/venv/python",
+        trainer=trainer,
+        checkpoint=tmp_path / "production" / "candidate.pt",
+        report=tmp_path / "production" / "report.json",
+    )
+
+    expected = list(selected)
+    expected[0] = "/bound/venv/python"
+    expected[expected.index("/repo/tools/train_bc.py")] = str(trainer.resolve())
+    expected[expected.index("--checkpoint") + 1] = str(
+        tmp_path / "production" / "candidate.pt"
+    )
+    expected[expected.index("--report") + 1] = str(
+        tmp_path / "production" / "report.json"
+    )
+    assert production == expected
+
+
+def test_production_recipe_validator_alone_does_not_authorize_additive_flags(
+    tmp_path: Path,
+) -> None:
+    """Document why verify must compare the complete derived command."""
+
+    command = _command(tmp_path)
+    command.append("--symmetry-augment")
+    # Pointwise flag validation intentionally permits future unrelated flags;
+    # the sealed transaction's complete-command equality is the fail-closed
+    # layer that rejects this causal addition.
+    temp._validate_recipe(
+        command,
+        descriptor=str(tmp_path / "descriptor.json"),
+        sentinel=str(tmp_path / "sentinel.json"),
+        f7=str(tmp_path / "f7.pt"),
+    )
+    assert command != _command(tmp_path)
+
+
 @pytest.mark.parametrize(
     ("mutation", "match"),
     [

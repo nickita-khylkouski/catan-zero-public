@@ -3861,7 +3861,6 @@ def _effective_a1_learner_training_recipe(
         "policy_kl_anchor_weight",
         "value_uncertainty_loss_weight",
         "aux_subgoal_loss_weight",
-        "belief_resource_loss_weight",
         "train_value_only",
         "freeze_modules",
         "policy_surprise_weight",
@@ -3889,6 +3888,11 @@ def _effective_a1_learner_training_recipe(
     )
     if int(getattr(args, "policy_aux_active_batch_size", 0)) > 0:
         effective["policy_aux_active_batch_size"] = int(args.policy_aux_active_batch_size)
+    # Additive provenance keeps historical flag-off recipes byte-identical.
+    if float(getattr(args, "belief_resource_loss_weight", 0.0)) > 0.0:
+        effective["belief_resource_loss_weight"] = float(
+            args.belief_resource_loss_weight
+        )
     # Additive provenance: old authenticated recipes remain byte-for-byte valid
     # when the backward-compatible flag is off, while future rank-offset runs
     # bind the trajectory-changing opt-in explicitly.
@@ -6760,6 +6764,11 @@ def main(argv: Sequence[str] | None = None) -> None:
         "hidden_size": int(args.hidden_size),
         "mask_hidden_info": bool(args.mask_hidden_info),
         "seed": int(args.seed),
+        # Promotion receipts must be able to distinguish the historical
+        # identical-per-rank dropout stream from the opt-in rank-offset RNG
+        # trajectory.  The effective A1 recipe already binds this field, but
+        # production replication also needs it in the standalone report.
+        "training_rng_rank_offset": bool(args.training_rng_rank_offset),
         "symmetry_augment": bool(args.symmetry_augment),
         # Record the *effective* event-history transform.  The raw CLI defaults
         # to relabelling events, but that switch is semantically inert while
