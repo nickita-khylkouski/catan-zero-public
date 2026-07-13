@@ -6683,8 +6683,11 @@ def main(argv: Sequence[str] | None = None) -> None:
                     round(epoch_extra_sums["soft_distillation_active_rows"])
                 ),
                 "soft_distillation_active_fraction": (
-                    epoch_extra_sums["soft_distillation_active_rows"]
-                    / max(epoch_active_count, 1.0)
+                    _bounded_count_fraction(
+                        epoch_extra_sums["soft_distillation_active_rows"],
+                        active_count_total,
+                        label="soft_distillation_active_fraction",
+                    )
                 ),
                 "advantage_weight_rows": int(round(epoch_extra_sums["advantage_weight_rows"])),
                 "advantage_mean": (
@@ -11904,9 +11907,24 @@ def per_game_weight_quality(data: dict, weights: np.ndarray) -> dict:
     # ordering.  A repeated non-contiguous seed is detected and takes the old
     # path, so this is not an assumption hidden in the report.
     boundaries = np.flatnonzero(seeds[1:] != seeds[:-1]) + 1
+    component_offsets = _validated_component_offsets(data, n)
+    if component_offsets is not None:
+        # A seed identifies a game only inside one composite component.  Different
+        # generation arms may intentionally reuse the same numeric seed; treating
+        # those rows as one game corrupts both this diagnostic and the normalization
+        # performed by _normalize_weights_per_game.  Component boundaries are
+        # already contiguous, so add them without materialising a per-row component
+        # id array (hundreds of MiB at A1 scale).
+        boundaries = np.union1d(boundaries, component_offsets[1:-1])
     starts = np.concatenate((np.asarray([0], dtype=np.int64), boundaries))
     run_seeds = seeds[starts]
-    if len(np.unique(run_seeds)) == len(run_seeds):
+    run_components = (
+        np.searchsorted(component_offsets[1:], starts, side="right")
+        if component_offsets is not None
+        else np.zeros(len(starts), dtype=np.int64)
+    )
+    run_keys = np.rec.fromarrays((run_components, run_seeds), names=("component", "seed"))
+    if len(np.unique(run_keys)) == len(run_keys):
         counts = np.diff(
             np.concatenate((starts, np.asarray([n], dtype=np.int64)))
         )
@@ -11915,12 +11933,23 @@ def per_game_weight_quality(data: dict, weights: np.ndarray) -> dict:
         totals = np.add.reduceat(weight_array, starts, dtype=np.float64)
         unique_seed_count = len(run_seeds)
     else:
-        unique_seeds, inverse, counts = np.unique(
-            seeds, return_inverse=True, return_counts=True
-        )
-        totals = np.zeros(len(unique_seeds), dtype=np.float64)
-        np.add.at(totals, inverse, np.asarray(weight_array, dtype=np.float64))
-        unique_seed_count = len(unique_seeds)
+        counts_parts: list[np.ndarray] = []
+        totals_parts: list[np.ndarray] = []
+        for start, stop in _component_row_ranges(component_offsets, n):
+            _unique, inverse, component_counts = np.unique(
+                seeds[start:stop], return_inverse=True, return_counts=True
+            )
+            component_totals = np.zeros(len(_unique), dtype=np.float64)
+            np.add.at(
+                component_totals,
+                inverse,
+                np.asarray(weight_array[start:stop], dtype=np.float64),
+            )
+            counts_parts.append(component_counts)
+            totals_parts.append(component_totals)
+        counts = np.concatenate(counts_parts)
+        totals = np.concatenate(totals_parts)
+        unique_seed_count = len(counts)
     return {
         "n_games": int(unique_seed_count),
         "rows_per_game": {
@@ -13286,6 +13315,29 @@ def _metric_from_sum_denominator(weighted_sum: float, denominator: float) -> flo
     return float(weighted_sum) / float(denominator)
 
 
+def _bounded_count_fraction(numerator: float, denominator: float, *, label: str) -> float:
+    """Form a [0, 1] count fraction and reject mixed reduction scopes.
+
+    This is intentionally stricter than a generic ratio.  DDP telemetry once
+    all-reduced ``soft_distillation_active_rows`` but divided it by rank-local
+    ``epoch_active_count``, producing an impossible 7.95 fraction on eight GPUs.
+    Count fractions should fail closed if a future caller mixes global and local
+    quantities again.
+    """
+
+    numerator = float(numerator)
+    denominator = float(denominator)
+    tolerance = 1.0e-6 * max(1.0, abs(denominator))
+    if numerator < -tolerance or denominator < 0.0 or numerator > denominator + tolerance:
+        raise RuntimeError(
+            f"{label} has incompatible count scopes: numerator={numerator} "
+            f"denominator={denominator}"
+        )
+    if denominator == 0.0:
+        return 0.0
+    return min(1.0, max(0.0, numerator / denominator))
+
+
 def _q_score_loss_parts(
     q_values,
     data: dict,
@@ -14648,8 +14700,37 @@ def build_value_sample_weights(
     return weights.astype(np.float32, copy=False)
 
 
+def _validated_component_offsets(data: dict, n: int) -> np.ndarray | None:
+    """Return trusted composite row offsets, or ``None`` for an ordinary corpus."""
+
+    raw = getattr(data, "component_offsets", None)
+    if raw is None:
+        return None
+    offsets = np.asarray(raw, dtype=np.int64)
+    if (
+        offsets.ndim != 1
+        or offsets.size < 2
+        or int(offsets[0]) != 0
+        or int(offsets[-1]) != int(n)
+        or np.any(offsets[1:] <= offsets[:-1])
+    ):
+        raise ValueError("composite component_offsets do not partition learner rows")
+    return offsets
+
+
+def _component_row_ranges(
+    component_offsets: np.ndarray | None, n: int
+) -> tuple[tuple[int, int], ...]:
+    if component_offsets is None:
+        return ((0, int(n)),)
+    return tuple(
+        (int(start), int(stop))
+        for start, stop in zip(component_offsets[:-1], component_offsets[1:], strict=True)
+    )
+
+
 def _normalize_weights_per_game(data: dict, weights: np.ndarray, *, mode: str = "equal") -> np.ndarray:
-    """Rescale ``weights`` so every game (grouped by ``game_seed``) contributes an equal total.
+    """Rescale ``weights`` so each component-local ``game_seed`` has equal mass.
 
     Unlike ``split_train_validation_indices`` (which falls back to ``np.arange(n)`` -- one row
     per "game" -- when ``game_seed`` is absent, which is safe there because it only affects
@@ -14664,20 +14745,26 @@ def _normalize_weights_per_game(data: dict, weights: np.ndarray, *, mode: str = 
         return weights
     seeds = np.asarray(data["game_seed"], dtype=np.int64)
     weights64 = weights.astype(np.float64, copy=False)
-    unique_seeds, inverse = np.unique(seeds, return_inverse=True)
-    game_totals = np.zeros(len(unique_seeds), dtype=np.float64)
-    np.add.at(game_totals, inverse, weights64)
-    safe_totals = np.where(game_totals > 0.0, game_totals, 1.0)
-    if mode == "sqrt":
-        # EXP3: divide by sqrt(game_total) -> a game of summed-weight W contributes
-        # sqrt(W) total mass (with unit base weights, W == n_value_rows, so ~sqrt(n)),
-        # the effective-sample-size correction for n correlated in-game value labels.
-        denom = np.sqrt(safe_totals)
-    elif mode == "equal":
-        denom = safe_totals
-    else:
+    if mode not in {"equal", "sqrt"}:
         raise ValueError(f"unknown per_game_value_weight_mode {mode!r}")
-    normalized = weights64 / denom[inverse]
+    normalized = np.empty_like(weights64)
+    component_offsets = _validated_component_offsets(data, len(weights64))
+    for start, stop in _component_row_ranges(component_offsets, len(weights64)):
+        _unique_seeds, inverse = np.unique(
+            seeds[start:stop], return_inverse=True
+        )
+        game_totals = np.zeros(len(_unique_seeds), dtype=np.float64)
+        np.add.at(game_totals, inverse, weights64[start:stop])
+        safe_totals = np.where(game_totals > 0.0, game_totals, 1.0)
+        if mode == "sqrt":
+            # EXP3: divide by sqrt(game_total) -> a game of summed-weight W
+            # contributes sqrt(W) total mass (with unit base weights, W ==
+            # n_value_rows), the effective-sample-size correction for correlated
+            # in-game value labels.
+            denominator = np.sqrt(safe_totals)
+        else:
+            denominator = safe_totals
+        normalized[start:stop] = weights64[start:stop] / denominator[inverse]
     return normalized.astype(np.float32, copy=False)
 
 

@@ -7,6 +7,7 @@ import pytest
 
 from catan_zero.rl._catanatron import import_catanatron_module
 from tools.train_bc import (
+    _bounded_count_fraction,
     ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS,
     _apply_lr_warmup,
     _lr_warmup_multiplier,
@@ -14,6 +15,13 @@ from tools.train_bc import (
     _train_xdim_batch,
     load_teacher_data,
 )
+
+
+def test_bounded_count_fraction_rejects_mixed_ddp_scopes() -> None:
+    assert _bounded_count_fraction(5, 10, label="coverage") == pytest.approx(0.5)
+    assert _bounded_count_fraction(0, 0, label="coverage") == 0.0
+    with pytest.raises(RuntimeError, match="incompatible count scopes"):
+        _bounded_count_fraction(80, 10, label="coverage")
 
 
 # --------------------------------------------------------------------------- lr warmup
