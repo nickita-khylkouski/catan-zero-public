@@ -23,6 +23,18 @@ def test_real_d6_composition_artifact_identities_are_pinned() -> None:
     assert arm.D6_GATHER_INIT_SHA256 == (
         "sha256:015be3463b424d5694fd459c819d677fb1f7a2b1aaf590101bdc403e2411858d"
     )
+    assert arm.D6_SHORT_PARENT_SHA256 == (
+        "sha256:9dd1d261a39d7b04713505a301097faf18e84e8a3508b4abb92a8b964f7ab921"
+    )
+    assert arm.D6_SHORT_REPORT_SHA256 == (
+        "sha256:42b8f620b2d22edffd4e0d223052f0e5873c48de4b3cf8f037c53af0b08cdae5"
+    )
+    assert arm.D6_SHORT_PROGRESS_SHA256 == (
+        "sha256:9e2019557268281144bc7b06cece2831fe3e3abe5fdf9aea3ab6d0ee32b72492"
+    )
+    assert arm.D6_SHORT_GATHER_INIT_SHA256 == (
+        "sha256:14f0a8634d61afccea8eade03f4bb40304ed5e68729d1fda85bb28d2ab1708ef"
+    )
     assert arm.D6_PARENT_SHA256 != arm.D6_F7_PARENT_SHA256
 
 
@@ -280,6 +292,63 @@ def test_prepares_and_replays_exact_selected_dose_d6_gather_contract(
     verified = arm.verify(path, expected_executor=args.bound_executor)
     assert verified["command"] == command
     assert verified["output_root"] == args.output_root.resolve()
+
+
+def test_selected_short_d6_is_an_independent_exact_parent_profile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    args = _composition_args(tmp_path, monkeypatch)
+    checkpoint_sha = arm.gather.corrected._file_sha(args.d6_checkpoint)
+
+    report = json.loads(args.d6_report.read_text(encoding="utf-8"))
+    report.update(
+        {
+            "max_steps": 128,
+            "steps_completed": 128,
+            "training_row_draws": 524_288,
+            "symmetry_augment_events": True,
+        }
+    )
+    args.d6_report.write_text(json.dumps(report), encoding="utf-8")
+
+    progress = json.loads(args.d6_progress.read_text(encoding="utf-8"))
+    progress["optimizer_step"] = 128
+    progress["symmetry_rng_state"] = {
+        "schema_version": "train-bc-rank-symmetry-rng-v1",
+        "world_size": 8,
+        "rank_states": [{"state": rank} for rank in range(8)],
+    }
+    progress["progress_sha256"] = arm.gather.corrected._digest(
+        {key: value for key, value in progress.items() if key != "progress_sha256"}
+    )
+    args.d6_progress.write_text(json.dumps(progress), encoding="utf-8")
+
+    monkeypatch.setattr(arm, "D6_SHORT_PARENT_SHA256", checkpoint_sha)
+    monkeypatch.setattr(
+        arm, "D6_SHORT_REPORT_SHA256", arm.gather.corrected._file_sha(args.d6_report)
+    )
+    monkeypatch.setattr(
+        arm,
+        "D6_SHORT_PROGRESS_SHA256",
+        arm.gather.corrected._file_sha(args.d6_progress),
+    )
+    monkeypatch.setattr(
+        arm,
+        "D6_SHORT_GATHER_INIT_SHA256",
+        arm.gather.corrected._file_sha(args.gather_checkpoint),
+    )
+
+    manifest, path = arm.prepare(args)
+    assert manifest["d6_parent"]["parent_profile"] == "selected_short_d6"
+    assert manifest["d6_parent"]["checkpoint"]["sha256"] == checkpoint_sha
+    assert manifest["d6_parent"]["training_contract"]["max_steps"] == 128
+    assert manifest["d6_parent"]["training_contract"]["training_row_draws"] == 524_288
+    assert manifest["d6_parent"]["symmetry_rng_provenance"] == (
+        "per_rank_seedsequence_checkpoint_resume_v1"
+    )
+    assert (
+        arm.verify(path, expected_executor=args.bound_executor)["manifest"] == manifest
+    )
 
 
 def test_refuses_d6_parent_that_did_not_complete_symmetry_training(

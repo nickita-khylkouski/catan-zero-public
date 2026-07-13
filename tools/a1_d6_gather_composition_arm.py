@@ -51,6 +51,18 @@ D6_PROGRESS_SHA256 = (
 D6_GATHER_INIT_SHA256 = (
     "sha256:015be3463b424d5694fd459c819d677fb1f7a2b1aaf590101bdc403e2411858d"
 )
+D6_SHORT_PARENT_SHA256 = (
+    "sha256:9dd1d261a39d7b04713505a301097faf18e84e8a3508b4abb92a8b964f7ab921"
+)
+D6_SHORT_REPORT_SHA256 = (
+    "sha256:42b8f620b2d22edffd4e0d223052f0e5873c48de4b3cf8f037c53af0b08cdae5"
+)
+D6_SHORT_PROGRESS_SHA256 = (
+    "sha256:9e2019557268281144bc7b06cece2831fe3e3abe5fdf9aea3ab6d0ee32b72492"
+)
+D6_SHORT_GATHER_INIT_SHA256 = (
+    "sha256:14f0a8634d61afccea8eade03f4bb40304ed5e68729d1fda85bb28d2ab1708ef"
+)
 D6_F7_PARENT_SHA256 = (
     "sha256:f7e93dfb8cdb713d647b3e142c949d59083de9f719b6688b6faa6c918ce3eed4"
 )
@@ -92,6 +104,44 @@ SOURCE_FILES = (
 
 class CompositionArmError(RuntimeError):
     """The request is not the exact selected-dose D6+gather diagnostic."""
+
+
+def _d6_parent_profiles() -> dict[str, dict[str, Any]]:
+    """Return the immutable, evidence-bearing D6 parents allowed by this arm.
+
+    The full historical D6 model was the first composition parent.  The later
+    matched panel showed that the independently initialized short-dose D6 model
+    beat it 73-55, so inheriting the full-dose parent would preserve a known
+    over-training confound.  Both profiles remain replayable, but an input is
+    selected only by its exact checkpoint/report/progress bytes; callers cannot
+    describe an arbitrary model as "D6" with a flag.
+    """
+
+    return {
+        D6_PARENT_SHA256: {
+            "parent_profile": "historical_full_d6",
+            "report_sha256": D6_REPORT_SHA256,
+            "progress_sha256": D6_PROGRESS_SHA256,
+            "gather_init_sha256": D6_GATHER_INIT_SHA256,
+            "optimizer_steps": 1024,
+            "training_row_draws": 4_194_304,
+            "symmetry_rng_provenance": (
+                "historical_single_stream_receipt; treatment must use current "
+                "rank-distinct SeedSequence streams"
+            ),
+            "rank_distinct_symmetry_progress": False,
+        },
+        D6_SHORT_PARENT_SHA256: {
+            "parent_profile": "selected_short_d6",
+            "report_sha256": D6_SHORT_REPORT_SHA256,
+            "progress_sha256": D6_SHORT_PROGRESS_SHA256,
+            "gather_init_sha256": D6_SHORT_GATHER_INIT_SHA256,
+            "optimizer_steps": 128,
+            "training_row_draws": 524_288,
+            "symmetry_rng_provenance": ("per_rank_seedsequence_checkpoint_resume_v1"),
+            "rank_distinct_symmetry_progress": True,
+        },
+    }
 
 
 def _source_binding(repo: Path) -> dict[str, Any]:
@@ -160,18 +210,23 @@ def _load_d6_parent(
     checkpoint = gather.corrected._file_ref(checkpoint_path)  # noqa: SLF001
     report, report_ref = _load_json_ref(report_path, label="D6 report")
     progress, progress_ref = _load_json_ref(progress_path, label="D6 progress")
-    _require_ref_sha(checkpoint, D6_PARENT_SHA256, label="D6 checkpoint")
-    _require_ref_sha(report_ref, D6_REPORT_SHA256, label="D6 report")
-    _require_ref_sha(progress_ref, D6_PROGRESS_SHA256, label="D6 progress")
+    profile = _d6_parent_profiles().get(checkpoint["sha256"])
+    if profile is None:
+        raise CompositionArmError(
+            "D6 checkpoint is not an authenticated completed parent: "
+            f"{checkpoint['sha256']}"
+        )
+    _require_ref_sha(report_ref, profile["report_sha256"], label="D6 report")
+    _require_ref_sha(progress_ref, profile["progress_sha256"], label="D6 progress")
 
     expected_report = {
         "init_checkpoint_sha256": D6_F7_PARENT_SHA256,
         "world_size": WORLD_SIZE,
         "batch_size": SELECTED_LOCAL_BATCH_SIZE,
         "effective_global_batch_size": SELECTED_GLOBAL_BATCH_SIZE,
-        "max_steps": 1024,
-        "steps_completed": 1024,
-        "training_row_draws": 4_194_304,
+        "max_steps": profile["optimizer_steps"],
+        "steps_completed": profile["optimizer_steps"],
+        "training_row_draws": profile["training_row_draws"],
         "optimizer": "adam",
         "resume_optimizer": False,
         "optimizer_restored": False,
@@ -207,12 +262,39 @@ def _load_d6_parent(
     checkpoint_binding = progress.get("checkpoint")
     recipe = progress.get("recipe_identity")
     rank_states = progress.get("rank_torch_rng_states")
+    symmetry = progress.get("symmetry_rng_state")
+    rank_distinct_symmetry = bool(profile["rank_distinct_symmetry_progress"])
+    if rank_distinct_symmetry:
+        symmetry_states = (
+            symmetry.get("rank_states") if isinstance(symmetry, Mapping) else None
+        )
+        symmetry_ok = bool(
+            isinstance(symmetry, Mapping)
+            and symmetry.get("schema_version") == "train-bc-rank-symmetry-rng-v1"
+            and symmetry.get("world_size") == WORLD_SIZE
+            and isinstance(symmetry_states, list)
+            and len(symmetry_states) == WORLD_SIZE
+            and all(isinstance(state, Mapping) for state in symmetry_states)
+            and len(
+                {
+                    gather.corrected._digest(state)  # noqa: SLF001
+                    for state in symmetry_states
+                }
+            )
+            == WORLD_SIZE
+        )
+    else:
+        symmetry_ok = bool(
+            isinstance(symmetry, Mapping)
+            and symmetry.get("schema_version") is None
+            and symmetry.get("bit_generator") == "PCG64"
+        )
     if not (
         progress.get("schema_version") == "train-bc-progress-v1"
         and progress.get("status") == "complete"
-        and progress.get("optimizer_step") == 1024
+        and progress.get("optimizer_step") == profile["optimizer_steps"]
         and isinstance(checkpoint_binding, Mapping)
-        and checkpoint_binding.get("sha256") == D6_PARENT_SHA256
+        and checkpoint_binding.get("sha256") == checkpoint["sha256"]
         and isinstance(recipe, Mapping)
         and recipe.get("schema_version") == "train-bc-resume-recipe-v1"
         and recipe.get("world_size") == WORLD_SIZE
@@ -221,9 +303,7 @@ def _load_d6_parent(
         and recipe.get("fsdp") is False
         and isinstance(rank_states, list)
         and len(rank_states) == WORLD_SIZE
-        and isinstance(progress.get("symmetry_rng_state"), Mapping)
-        and progress["symmetry_rng_state"].get("schema_version") is None
-        and progress["symmetry_rng_state"].get("bit_generator") == "PCG64"
+        and symmetry_ok
     ):
         raise CompositionArmError(
             "D6 progress does not prove complete 8-rank D6 training"
@@ -234,15 +314,14 @@ def _load_d6_parent(
         raise CompositionArmError("D6 progress lacks one RNG state per rank")
 
     evidence = {
+        "parent_profile": profile["parent_profile"],
         "checkpoint": checkpoint,
         "report": report_ref,
         "progress": progress_ref,
+        "gather_init_sha256": profile["gather_init_sha256"],
         "training_contract": expected_report,
         "progress_semantic_sha256": stated_progress_digest,
-        "symmetry_rng_provenance": (
-            "historical_single_stream_receipt; treatment must use current "
-            "rank-distinct SeedSequence streams"
-        ),
+        "symmetry_rng_provenance": profile["symmetry_rng_provenance"],
         "evaluation_reference": "exact_D6_parent",
     }
     evidence["evidence_sha256"] = gather.corrected._digest(evidence)  # noqa: SLF001
@@ -375,7 +454,9 @@ def prepare(args: argparse.Namespace) -> tuple[dict[str, Any], Path]:
     except gather.ArmError as error:
         raise CompositionArmError(str(error)) from error
     _require_ref_sha(
-        upgrade["upgraded"], D6_GATHER_INIT_SHA256, label="D6 gather initialization"
+        upgrade["upgraded"],
+        d6_parent["gather_init_sha256"],
+        label="D6 gather initialization",
     )
 
     binding = _source_binding(args.repo)
@@ -642,7 +723,9 @@ def verify(
     if upgrade != payload.get("function_preserving_upgrade"):
         raise CompositionArmError("function-preserving gather upgrade replay drift")
     _require_ref_sha(
-        upgrade["upgraded"], D6_GATHER_INIT_SHA256, label="D6 gather initialization"
+        upgrade["upgraded"],
+        parent["gather_init_sha256"],
+        label="D6 gather initialization",
     )
     coverage = payload.get("corpus_topology_target_coverage")
     if not isinstance(coverage, Mapping):
