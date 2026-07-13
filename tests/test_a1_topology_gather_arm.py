@@ -254,6 +254,16 @@ def _audit(tmp_path: Path, corpora: list[Path]) -> Path:
                 "search_active_rows_with_any_target": 150 * index,
                 "chosen_actions_with_any_target": 100 * index,
                 "invalid_legal_action_ids": 0, "out_of_range_target_rows": 0,
+                "search_activity_contract": {
+                    "source": (
+                        "policy_weight_multiplier_legacy_equivalence"
+                        if index == len(corpora)
+                        else "used_full_search"
+                    ),
+                    "authenticated": True,
+                    "legacy_wrong_teacher_rows": 0,
+                    "legacy_missing_stored_policy_rows": 0,
+                },
             },
             "graph_incidence": {"out_of_range_ids": 0},
             "viability": {"action_target_gather": True},
@@ -436,6 +446,19 @@ def test_coverage_refuses_zero_search_active_topology_rows(tmp_path, monkeypatch
     args = _args(tmp_path, monkeypatch)
     payload = json.loads(args.architecture_audit.read_text())
     payload["audits"][1]["legal_action_targets"]["search_active_rows_with_any_target"] = 0
+    args.architecture_audit.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(arm.ArmError, match="learnable topology target coverage"):
+        arm.prepare(args)
+
+
+def test_coverage_refuses_unauthenticated_legacy_search_equivalence(
+    tmp_path, monkeypatch
+):
+    args = _args(tmp_path, monkeypatch)
+    payload = json.loads(args.architecture_audit.read_text())
+    payload["audits"][2]["legal_action_targets"]["search_activity_contract"][
+        "authenticated"
+    ] = False
     args.architecture_audit.write_text(json.dumps(payload), encoding="utf-8")
     with pytest.raises(arm.ArmError, match="learnable topology target coverage"):
         arm.prepare(args)

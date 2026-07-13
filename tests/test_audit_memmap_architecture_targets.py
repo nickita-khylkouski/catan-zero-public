@@ -32,7 +32,13 @@ def _ragged(root: Path, columns: dict, name: str, values: np.ndarray) -> None:
         }
 
 
-def _corpus(tmp_path: Path, *, invalid_target: bool = False, event_targets: bool = True) -> Path:
+def _corpus(
+    tmp_path: Path,
+    *,
+    invalid_target: bool = False,
+    event_targets: bool = True,
+    teacher_name: str = "gumbel_self_play",
+) -> Path:
     root = tmp_path / "corpus"
     root.mkdir()
     counts = np.asarray([2, 1, 2, 1], dtype=np.int64)
@@ -59,6 +65,25 @@ def _corpus(tmp_path: Path, *, invalid_target: bool = False, event_targets: bool
     if invalid_target:
         targets[4, 1] = 54
     _ragged(root, columns, "legal_action_target_ids", targets)
+    _ragged(
+        root,
+        columns,
+        "target_policy",
+        np.asarray([0.6, 0.4, 1.0, 0.8, 0.2, 1.0], dtype=np.float32),
+    )
+    _ragged(
+        root,
+        columns,
+        "target_policy_mask",
+        np.ones(6, dtype=np.bool_),
+    )
+    (root / "teacher_name.codes.dat").write_bytes(
+        np.zeros(4, dtype=np.int32).tobytes()
+    )
+    columns["teacher_name"] = {
+        "kind": "string",
+        "categories": [teacher_name],
+    }
     phase_categories = ["main", "roll", "robber"]
     phase_codes = np.asarray([0, 1, 2, 0], dtype=np.int32)
     (root / "phase.codes.dat").write_bytes(phase_codes.tobytes())
@@ -157,6 +182,45 @@ def test_empty_event_targets_do_not_block_action_architecture(tmp_path):
         result["viability"]["event_target_generator_change_required_for_event_relations"]
         is True
     )
+
+
+def test_legacy_policy_weight_authenticates_missing_full_search_column(tmp_path):
+    root = _corpus(tmp_path)
+    meta_path = root / "corpus_meta.json"
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    del meta["columns"]["used_full_search"]
+    meta_path.write_text(json.dumps(meta), encoding="utf-8")
+    (root / "used_full_search.dat").unlink()
+
+    result = audit.audit_corpus(root, chunk_rows=2)
+
+    legal = result["legal_action_targets"]
+    assert legal["search_active_rows"] == legal["policy_active_rows"] == 3
+    assert legal["search_active_rows_with_any_target"] == 2
+    assert legal["search_activity_contract"] == {
+        "source": "policy_weight_multiplier_legacy_equivalence",
+        "legacy_required_columns": sorted(audit.LEGACY_SEARCH_AUTH_COLUMNS),
+        "legacy_wrong_teacher_rows": 0,
+        "legacy_missing_stored_policy_rows": 0,
+        "authenticated": True,
+    }
+    assert result["viability"]["action_target_gather"] is True
+
+
+def test_legacy_search_inference_rejects_non_gumbel_policy_rows(tmp_path):
+    root = _corpus(tmp_path, teacher_name="unknown_teacher")
+    meta_path = root / "corpus_meta.json"
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    del meta["columns"]["used_full_search"]
+    meta_path.write_text(json.dumps(meta), encoding="utf-8")
+    (root / "used_full_search.dat").unlink()
+
+    result = audit.audit_corpus(root, chunk_rows=2)
+
+    contract = result["legal_action_targets"]["search_activity_contract"]
+    assert contract["legacy_wrong_teacher_rows"] == 3
+    assert contract["authenticated"] is False
+    assert result["viability"]["action_target_gather"] is False
 
 
 def test_reader_requests_only_bounded_chunks(tmp_path, monkeypatch):
