@@ -296,6 +296,9 @@ def test_from_namespace_reproduces_direct_construction() -> None:
         seed=7,
         value_loss_weight=1.0,
         optimizer="adamw",
+        validation_contract_file_sha256="sha256:contract",
+        validation_game_seed_set_sha256="sha256:validation",
+        training_excluded_game_seed_set_sha256="sha256:excluded",
     )
     got = TrainConfig.from_namespace(ns)
     # Only the attrs present on the namespace override defaults.
@@ -305,6 +308,9 @@ def test_from_namespace_reproduces_direct_construction() -> None:
         seed=7,
         value_loss_weight=1.0,
         optimizer="adamw",
+        validation_contract_file_sha256="sha256:contract",
+        validation_game_seed_set_sha256="sha256:validation",
+        training_excluded_game_seed_set_sha256="sha256:excluded",
     )
 
 

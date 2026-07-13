@@ -27,6 +27,7 @@ points at fixture paths a real guard would correctly refuse).
 """
 from __future__ import annotations
 
+import argparse
 import json
 import sys
 from pathlib import Path
@@ -40,6 +41,55 @@ import prelaunch_guard  # type: ignore  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 GUARD_CONFIG_DIR = REPO_ROOT / "configs" / "guards"
+
+
+def argv_with_config_values(
+    args: argparse.Namespace,
+    parser: argparse.ArgumentParser,
+    raw_argv: Sequence[str],
+    config_filled: Sequence[str],
+) -> list[str]:
+    """Represent config-filled values as explicit inputs to CLI guards.
+
+    The guard rejects silent parser defaults, but a validated typed config is
+    also explicit operator input.  Synthesize only fields that
+    ``apply_config_file`` actually filled, then let argparse re-parse them for
+    the guard's exact-value checks.
+    """
+
+    effective = list(raw_argv)
+    actions_by_dest = {action.dest: action for action in parser._actions}  # noqa: SLF001
+    for dest in config_filled:
+        action = actions_by_dest.get(dest)
+        if action is None or not action.option_strings:
+            continue
+        value = getattr(args, dest)
+        if value is None:
+            continue
+        if isinstance(action, argparse.BooleanOptionalAction):
+            prefix = "--no-" if not bool(value) else "--"
+            option = next(
+                (item for item in action.option_strings if item.startswith(prefix)),
+                action.option_strings[0],
+            )
+            effective.append(option)
+        elif isinstance(action, argparse._StoreTrueAction):  # noqa: SLF001
+            if bool(value):
+                effective.append(action.option_strings[0])
+        elif isinstance(action, argparse._StoreFalseAction):  # noqa: SLF001
+            if not bool(value):
+                effective.append(action.option_strings[0])
+        elif isinstance(action, argparse._AppendAction):  # noqa: SLF001
+            for item in value:
+                effective.extend((action.option_strings[0], str(item)))
+        elif isinstance(value, (list, tuple)):
+            if not value:
+                continue
+            effective.append(action.option_strings[0])
+            effective.extend(str(item) for item in value)
+        else:
+            effective.extend((action.option_strings[0], str(value)))
+    return effective
 
 
 def load_static_guard_specs(

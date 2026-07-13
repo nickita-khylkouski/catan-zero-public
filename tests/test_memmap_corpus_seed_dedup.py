@@ -129,6 +129,29 @@ def test_tracker_allows_monotonic_game_continuation_across_shard_boundary():
     assert not tracker.has_duplicates
 
 
+def test_tracker_rejects_same_seed_at_independent_source_boundary_without_decisions():
+    tracker = _GameSeedRunTracker()
+    tracker.observe_shard(np.asarray([17, 17], dtype=np.int64))
+    tracker.start_source()
+    tracker.observe_shard(np.asarray([17, 17], dtype=np.int64))
+    assert tracker.has_duplicates
+    assert tracker.duplicate_count == 1
+
+
+def test_selected_tracker_rejects_same_seed_at_independent_source_boundary():
+    tracker = _SelectedGameSeedRunTracker({17})
+    tracker.observe_shard(
+        np.asarray([17, 17], dtype=np.int64),
+        np.asarray([0, 1], dtype=np.int32),
+    )
+    tracker.start_source()
+    tracker.observe_shard(
+        np.asarray([17, 17], dtype=np.int64),
+        np.asarray([2, 3], dtype=np.int32),
+    )
+    assert tracker.duplicate_count == 1
+
+
 def test_selected_tracker_detects_adjacent_duplicate_before_row_filtering():
     tracker = _SelectedGameSeedRunTracker({17})
     tracker.observe_shard(
@@ -261,6 +284,44 @@ def test_build_memmap_corpus_aborts_on_immediately_adjacent_duplicate_game(tmp_p
             tmp_path / "corpus",
             progress_every=0,
             abort_on_duplicate_seeds=True,
+        )
+
+
+def test_build_memmap_corpus_aborts_on_duplicate_at_source_boundary(tmp_path):
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    _write_synthetic_shard(
+        first / "shard0.npz",
+        game_seed=np.asarray([17, 17], dtype=np.int64),
+    )
+    _write_synthetic_shard(
+        second / "shard0.npz",
+        game_seed=np.asarray([17, 17], dtype=np.int64),
+    )
+
+    with pytest.raises(SystemExit, match="ABORTING"):
+        build_memmap_corpus(
+            [first, second],
+            tmp_path / "corpus",
+            progress_every=0,
+        )
+
+
+def test_build_memmap_corpus_aborts_when_sources_repeat_the_same_shard(tmp_path):
+    teacher = tmp_path / "teacher"
+    teacher.mkdir()
+    _write_synthetic_shard(
+        teacher / "shard0.npz",
+        game_seed=np.asarray([17, 17], dtype=np.int64),
+    )
+
+    with pytest.raises(SystemExit, match="repeat canonical data shard path"):
+        build_memmap_corpus(
+            [teacher, teacher],
+            tmp_path / "corpus",
+            progress_every=0,
         )
 
 

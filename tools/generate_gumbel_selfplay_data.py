@@ -346,43 +346,11 @@ def _guard_argv_with_config_values(
     raw_argv: Sequence[str],
     config_filled: Sequence[str],
 ) -> list[str]:
-    """Represent config-filled values as explicit inputs to prelaunch guards.
+    """Backward-compatible wrapper around the shared launcher helper."""
 
-    The CLI lint intentionally refuses critical parser defaults. A typed config
-    is also explicit input, so values it supplied must be checked exactly as if
-    their corresponding flags appeared in argv.
-    """
-    effective = list(raw_argv)
-    actions_by_dest = {action.dest: action for action in parser._actions}  # noqa: SLF001
-    for dest in config_filled:
-        action = actions_by_dest.get(dest)
-        if action is None or not action.option_strings:
-            continue
-        value = getattr(args, dest)
-        # ``None`` is represented by absence for these optional flags. It is
-        # never a critical production value and argparse generally cannot parse
-        # the string "None" back through an int/float action.
-        if value is None:
-            continue
-        if isinstance(action, argparse.BooleanOptionalAction):
-            prefix = "--no-" if not bool(value) else "--"
-            option = next(
-                (item for item in action.option_strings if item.startswith(prefix)),
-                action.option_strings[0],
-            )
-            effective.append(option)
-        elif isinstance(action, argparse._StoreTrueAction):  # noqa: SLF001
-            if bool(value):
-                effective.append(action.option_strings[0])
-        elif isinstance(action, argparse._StoreFalseAction):  # noqa: SLF001
-            if not bool(value):
-                effective.append(action.option_strings[0])
-        elif isinstance(value, (list, tuple)):
-            effective.append(action.option_strings[0])
-            effective.extend(str(item) for item in value)
-        else:
-            effective.extend((action.option_strings[0], str(value)))
-    return effective
+    return launcher_guards.argv_with_config_values(
+        args, parser, raw_argv, config_filled
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:

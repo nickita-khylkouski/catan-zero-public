@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import importlib.metadata
 import inspect
 import json
 import subprocess
@@ -143,6 +144,39 @@ def test_remote_preflight_refuses_untracked_runtime_code(tmp_path: Path) -> None
     command = fleet._preflight_command(manifest, plan, host)  # noqa: SLF001
 
     assert 'test -z "$(git status --porcelain=v1 --untracked-files=all)"' in command
+    assert "_assert_installed_native_wheel_sha256" in command
+    assert plan["engine_identity"]["native_wheel_sha256"] in command
+
+
+def test_installed_native_wheel_digest_mismatch_is_refused(monkeypatch) -> None:
+    expected = "sha256:" + "a" * 64
+
+    class FakeDistribution:
+        def __init__(self, digest: str):
+            self.digest = digest
+
+        def read_text(self, name: str) -> str | None:
+            assert name == "direct_url.json"
+            return json.dumps(
+                {
+                    "archive_info": {
+                        "hash": "sha256=" + self.digest,
+                        "hashes": {"sha256": self.digest},
+                    },
+                    "url": "file:///tmp/catanatron_rs.whl",
+                }
+            )
+
+    monkeypatch.setattr(
+        importlib.metadata, "distribution", lambda _name: FakeDistribution("a" * 64)
+    )
+    assert fleet._assert_installed_native_wheel_sha256(expected) == expected
+
+    monkeypatch.setattr(
+        importlib.metadata, "distribution", lambda _name: FakeDistribution("b" * 64)
+    )
+    with pytest.raises(fleet.FleetError, match="wheel digest mismatch"):
+        fleet._assert_installed_native_wheel_sha256(expected)
 
 
 def _registry(tmp_path: Path, champion: Path, *, c_scale: float = 0.03) -> ChampionRegistry:

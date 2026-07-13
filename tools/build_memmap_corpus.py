@@ -1220,6 +1220,20 @@ class _GameSeedRunTracker:
         self._current = value
         self._current_decision = None
 
+    def start_source(self) -> None:
+        """Close any shard-spanning run at a raw-source boundary.
+
+        Adjacent shards inside one source may split a single game, but two
+        separately supplied source roots are independent generation runs.  A
+        seed repeated exactly at that boundary is therefore a collision even
+        when legacy data has no ``decision_index`` reset with which to prove
+        it.  Keep ``_seen`` intact so the first run in the new source is
+        compared with every earlier source.
+        """
+
+        self._current = None
+        self._current_decision = None
+
     def observe_shard(
         self,
         seed_column: np.ndarray,
@@ -1346,6 +1360,12 @@ class _SelectedGameSeedRunTracker:
             final_decision = int(decisions[-1])
             self._current_decision = final_decision if final_decision >= 0 else None
 
+    def start_source(self) -> None:
+        """Close a selected run when the converter enters another source."""
+
+        self._current = None
+        self._current_decision = None
+
     @property
     def duplicate_count(self) -> int:
         return len(self._duplicates)
@@ -1442,25 +1462,29 @@ def build_memmap_corpus(
         else _SelectedGameSeedRunTracker(expected_selected_seed_set)
     )
 
-    files: list[Path] = []
+    file_records: list[tuple[Path, int]] = []
     source_first_files: list[Path] = []
-    for src in sources:
+    for source_index, src in enumerate(sources):
         src_files = _teacher_shard_files(Path(src))
         if not src_files:
             raise SystemExit(f"no teacher shards found in {src}")
         source_first_files.append(src_files[0])
-        files.extend(src_files)
+        file_records.extend((file, source_index) for file in src_files)
     if max_shards is not None:
-        files = files[:max_shards]
+        file_records = file_records[:max_shards]
+    canonical_input_files: set[Path] = set()
+    for file, _source_index in file_records:
+        canonical = file.expanduser().resolve(strict=True)
+        if canonical in canonical_input_files:
+            raise SystemExit(
+                f"input sources repeat canonical data shard path {canonical}"
+            )
+        canonical_input_files.add(canonical)
     if post_wave_audit is not None:
-        actual_by_path: dict[Path, Path] = {}
-        for file in files:
+        actual_by_path: dict[Path, tuple[Path, int]] = {}
+        for file, source_index in file_records:
             canonical = file.expanduser().resolve(strict=True)
-            if canonical in actual_by_path:
-                raise SystemExit(
-                    f"input sources repeat canonical data shard path {canonical}"
-                )
-            actual_by_path[canonical] = file
+            actual_by_path[canonical] = (file, source_index)
         audited_paths = [
             Path(record["path"]) for record in post_wave_audit["data_shards"]
         ]
@@ -1475,7 +1499,8 @@ def build_memmap_corpus(
         # The audit's inventory order is authoritative.  This preserves a
         # game that legitimately spans adjacent shards while preventing an
         # alternate same-seed file from being substituted or reordered.
-        files = [actual_by_path[path] for path in audited_paths]
+        file_records = [actual_by_path[path] for path in audited_paths]
+    files = [file for file, _source_index in file_records]
     out_dir.mkdir(parents=True, exist_ok=True)
 
     started = time.perf_counter()
@@ -1558,7 +1583,13 @@ def build_memmap_corpus(
     _seed_tracker = _GameSeedRunTracker()
 
     dropped_fast_rows = 0
-    for shard_index, file in enumerate(files):
+    prior_source_index: int | None = None
+    for shard_index, (file, source_index) in enumerate(file_records):
+        if prior_source_index is not None and source_index != prior_source_index:
+            _seed_tracker.start_source()
+            if selected_source_tracker is not None:
+                selected_source_tracker.start_source()
+        prior_source_index = source_index
         raw = _load_npz(file)
         norm = _normalize_teacher_shard(
             raw,

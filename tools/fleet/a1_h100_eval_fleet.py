@@ -132,6 +132,48 @@ class FleetError(RuntimeError):
     """The requested fleet operation could not be proved safe."""
 
 
+def _assert_installed_native_wheel_sha256(expected_sha256: str) -> str:
+    """Prove the installed native distribution came from the sealed wheel.
+
+    Version strings and capability names are self-reported by the extension
+    and therefore cannot establish artifact identity.  A local-wheel pip
+    install records the archive digest in PEP 610 ``direct_url.json``; require
+    that digest to equal the release inventory before any evaluator starts.
+    """
+
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", expected_sha256):
+        raise FleetError("expected native wheel digest is not canonical SHA-256")
+    try:
+        from importlib.metadata import distribution
+
+        metadata = distribution("catanatron-rs")
+        raw = metadata.read_text("direct_url.json")
+        payload = json.loads(raw) if raw is not None else None
+    except Exception as error:
+        raise FleetError(
+            f"cannot read installed catanatron-rs direct_url.json: {error}"
+        ) from error
+    if not isinstance(payload, dict):
+        raise FleetError("installed catanatron-rs has no PEP 610 direct_url.json")
+    archive = payload.get("archive_info")
+    if not isinstance(archive, dict):
+        raise FleetError("installed catanatron-rs is not bound to a wheel archive")
+    stated: set[str] = set()
+    direct_hash = archive.get("hash")
+    if isinstance(direct_hash, str):
+        stated.add(direct_hash)
+    hashes = archive.get("hashes")
+    if isinstance(hashes, dict) and isinstance(hashes.get("sha256"), str):
+        stated.add(f"sha256={hashes['sha256']}")
+    expected_direct = "sha256=" + expected_sha256.removeprefix("sha256:")
+    if stated != {expected_direct}:
+        raise FleetError(
+            "installed catanatron-rs wheel digest mismatch: "
+            f"expected={expected_direct} recorded={sorted(stated)}"
+        )
+    return expected_sha256
+
+
 def _canonical(value: Any) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
@@ -1703,11 +1745,15 @@ def _preflight_command(
 ) -> str:
     repo = shlex.quote(manifest["remote_repo"])
     pythonpath = manifest["remote_repo"] + "/src:" + manifest["remote_repo"]
+    expected_wheel_sha256 = plan["engine_identity"]["native_wheel_sha256"]
     import_probe = (
         "from importlib.metadata import version; from pathlib import Path; "
+        "from tools.fleet.a1_h100_eval_fleet import "
+        "_assert_installed_native_wheel_sha256; "
         "import catan_zero, catanatron_rs; "
         "assert Path(catan_zero.__file__).resolve().is_relative_to("
         f"Path({manifest['remote_repo']!r}) / 'src'); "
+        f"_assert_installed_native_wheel_sha256({expected_wheel_sha256!r}); "
         f"assert version('catanatron-rs') == {NATIVE_WHEEL_VERSION!r}; "
         "capability_fn=getattr(catanatron_rs,'gumbel_search_capabilities',None); "
         "assert callable(capability_fn); "

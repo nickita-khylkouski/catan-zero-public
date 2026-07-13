@@ -116,17 +116,14 @@ the checksum update into the source commit.
 Any byte mismatch aborts the release. Diagnose it on the build host; never
 paper over it by updating the inventory to whichever build ran last.
 
-The native-feature source changes make the currently tracked wheel digest stale
-until the two-commit transaction above is completed. The exact items to
-refresh are the `catanatron_rs-0.1.8` CPython 3.11 wheel asset, its build
-receipt, and the single line in `native/catanatron-rs/WHEEL_SHA256SUMS`; the
-inventory intentionally still names the last released 0.1.7 wheel in source
-commit A and changes only in checksum commit B. The immutable release tag must
-point at checksum-only commit B. `tools/install_v1_freeze.sh` already downloads
-that exact filename from the selected tag and verifies it against the tracked
-inventory before any privileged or environment mutation. Do not publish an
-old wheel under a new tag, move an existing tag, or edit the inventory before
-two clean builds agree.
+The 0.1.8 two-commit transaction is complete: checksum-only commit `09f2384`
+seals `catanatron_rs-0.1.8-cp311-cp311-manylinux_2_34_x86_64.whl` in
+`native/catanatron-rs/WHEEL_SHA256SUMS`. `tools/install_v1_freeze.sh` downloads
+that exact filename from the selected immutable tag and verifies it against
+the tracked inventory before any privileged or environment mutation. Any
+future native source change must repeat the transaction above; do not publish
+an old wheel under a new tag, move an existing tag, or edit the inventory
+before two clean builds agree.
 
 ## 4. Rust engine (CAT-133)
 - `native/catanatron-rs` v0.1.8 is now the canonical wheel source and builds `catanatron_rs-0.1.8-cp311-…manylinux_2_34`; `native/gumbel_mcts_rs` is its linked native-search dependency. `native/catanatron-rs/WHEEL_SHA256SUMS` seals the exact release asset and the installer rejects any byte mismatch. The build receipt seals the source commit/tree, builder and lockfiles, exact toolchain/environment, and wheel digest. Fleet deployment must be uniform 0.1.8 with `sigma_reference_visits`, `belief_target_evidence`, `initial_road_d1_scope`, `public_award_feature_parity`, and `policy_temperature_semantics` capabilities before corrected belief-level native MCTS, opening-road-only D1, Rust entity featurization, or non-unit gameplay temperature.

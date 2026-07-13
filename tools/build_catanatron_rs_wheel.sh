@@ -164,6 +164,19 @@ cargo test \
   --manifest-path "$ROOT/native/catanatron-rs/Cargo.toml" \
   public_belief_determinization_tests \
   --lib
+# Capability names are not evidence of semantics.  Run the exact source tests
+# for every corrected 0.1.8 behavior before compiling and hashing the wheel.
+cargo test \
+  --locked \
+  --manifest-path "$ROOT/native/catanatron-rs/Cargo.toml" \
+  --features python \
+  entity_player_tokens_preserve_public_awards_when_hidden_hands_are_masked \
+  --lib
+cargo test \
+  --locked \
+  --manifest-path "$ROOT/native/gumbel_mcts_rs/Cargo.toml" \
+  temperature \
+  --lib
 maturin build \
   --locked \
   --release \

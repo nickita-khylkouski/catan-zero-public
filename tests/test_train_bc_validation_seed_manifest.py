@@ -22,6 +22,7 @@ from train_bc import (  # type: ignore  # noqa: E402
     _load_validation_game_seed_manifest_for_training,
     _preflight_a1_memmap_metadata,
     _training_data_fingerprint,
+    _validation_contract_config_identity,
     _value_training_metadata,
     _validate_a1_corpus_artifacts_and_seeds,
     _validate_a1_decisive_training_semantics,
@@ -33,6 +34,32 @@ from train_bc import (  # type: ignore  # noqa: E402
 
 
 _CONTRACT_SHA = "sha256:" + "a" * 64
+
+
+def test_validation_contract_identity_binds_metric_and_excluded_game_sets() -> None:
+    selected = np.asarray([11, 13], dtype=np.int64)
+    excluded = np.asarray([11, 13, 17], dtype=np.int64)
+    identity = _validation_contract_config_identity(
+        {
+            "file_sha256": "sha256:sentinel",
+            "game_seeds": selected,
+            "excluded_game_seeds": excluded,
+        }
+    )
+
+    assert identity == {
+        "validation_contract_file_sha256": "sha256:sentinel",
+        "validation_game_seed_set_sha256": _game_seed_set_sha256(selected),
+        "training_excluded_game_seed_set_sha256": _game_seed_set_sha256(excluded),
+    }
+
+
+def test_missing_validation_contract_has_empty_config_identity() -> None:
+    assert _validation_contract_config_identity(None) == {
+        "validation_contract_file_sha256": "",
+        "validation_game_seed_set_sha256": "",
+        "training_excluded_game_seed_set_sha256": "",
+    }
 
 
 def test_composite_contract_value_metadata_allows_no_single_corpus_binding() -> None:

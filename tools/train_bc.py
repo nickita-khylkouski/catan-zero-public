@@ -2884,6 +2884,43 @@ def _game_seed_set_sha256(seeds: np.ndarray) -> str:
     return f"sha256:{hashlib.sha256(canonical.tobytes()).hexdigest()}"
 
 
+def _validation_contract_config_identity(
+    validation_seed_contract: dict[str, object] | None,
+) -> dict[str, str]:
+    """Return the holdout fields that must bind config/resume identity.
+
+    A sentinel can narrow metric evaluation while the full authenticated
+    holdout remains excluded from training.  Bind both sets, plus the source
+    contract bytes, so Adam/RNG state cannot resume after either surface
+    changes.
+    """
+
+    if validation_seed_contract is None:
+        return {
+            "validation_contract_file_sha256": "",
+            "validation_game_seed_set_sha256": "",
+            "training_excluded_game_seed_set_sha256": "",
+        }
+    validation_seeds = np.asarray(
+        validation_seed_contract["game_seeds"], dtype=np.int64
+    )
+    excluded_seeds = np.asarray(
+        validation_seed_contract.get("excluded_game_seeds", validation_seeds),
+        dtype=np.int64,
+    )
+    return {
+        "validation_contract_file_sha256": str(
+            validation_seed_contract.get("file_sha256", "")
+        ),
+        "validation_game_seed_set_sha256": _game_seed_set_sha256(
+            validation_seeds
+        ),
+        "training_excluded_game_seed_set_sha256": _game_seed_set_sha256(
+            excluded_seeds
+        ),
+    }
+
+
 def _is_sha256(value: object) -> bool:
     return (
         isinstance(value, str)
@@ -5029,7 +5066,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     # checkpoint inheritance. ``resolve_config`` calls this again later, which
     # is idempotent; doing it here prevents a config's categorical-bin/width
     # value from being mistaken for an omitted flag after we resolve sentinels.
-    apply_config_file(
+    config_filled = apply_config_file(
         args,
         parser,
         argv=raw_argv,
@@ -5066,8 +5103,11 @@ def main(argv: Sequence[str] | None = None) -> None:
     # Fail cheap launch/host checks before authenticating a potentially
     # hundreds-of-gigabytes memmap payload. A missing explicit CLI value or a
     # low file-descriptor limit must not be reported only after the byte scan.
+    guard_argv = launcher_guards.argv_with_config_values(
+        args, parser, raw_argv, config_filled
+    )
     launcher_guards.run_or_refuse(
-        _build_guard_specs(args, raw_argv, parser),
+        _build_guard_specs(args, guard_argv, parser),
         launcher="train_bc",
         skip=bool(args.skip_guards),
     )
@@ -5242,6 +5282,10 @@ def main(argv: Sequence[str] | None = None) -> None:
         if reanalysis_manifest.is_file():
             args.policy_target_reanalysis = _validate_policy_target_reanalysis_manifest(reanalysis_manifest)
     args.data_fingerprint = _training_data_fingerprint(args.data, args.data_format)
+    for field, value in _validation_contract_config_identity(
+        validation_seed_contract
+    ).items():
+        setattr(args, field, value)
     args.a1_memmap_payload_inventory_sha256 = (
         None
         if a1_preflight_meta is None

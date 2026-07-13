@@ -1005,6 +1005,55 @@ def test_train_bc_guards_run_before_expensive_memmap_preflight(monkeypatch):
     assert preflight_calls == []
 
 
+def test_train_bc_config_values_count_as_explicit_guard_inputs(tmp_path):
+    from catan_zero.rl.config_cli import apply_config_file
+    from catan_zero.rl.pipeline_configs import TrainConfig
+
+    config = TrainConfig(
+        optimizer="adamw",
+        weight_decay=0.01,
+        truncated_vp_margin_value_weight=0.5,
+        lr_schedule="cosine",
+        mask_hidden_info=True,
+        acknowledge_empty_event_history_payload_inventory_sha256=[
+            "sha256:first",
+            "sha256:second",
+        ],
+    )
+    config_path = tmp_path / "train.json"
+    config_path.write_text(config.canonical_json(), encoding="utf-8")
+    raw_argv = [
+        "--data",
+        "/unused",
+        "--checkpoint",
+        "/unused.pt",
+        "--report",
+        "/unused.json",
+        "--config",
+        str(config_path),
+    ]
+    parser = train_bc.build_parser()
+    args = parser.parse_args(raw_argv)
+    filled = apply_config_file(
+        args,
+        parser,
+        argv=raw_argv,
+        expected_pipeline=TrainConfig.PIPELINE,
+    )
+    guard_argv = launcher_guards.argv_with_config_values(
+        args, parser, raw_argv, filled
+    )
+    assert guard_argv.count(
+        "--acknowledge-empty-event-history-payload-inventory-sha256"
+    ) == 2
+    specs = train_bc._build_guard_specs(args, guard_argv, parser)
+    cli_spec = next(spec for spec in specs if spec["name"] == "cli_flag_lint")
+
+    result = prelaunch_guard.guard_cli_flag_lint(**cli_spec["args"])
+
+    assert result.passed, result.reason
+
+
 def test_train_bc_checkpoint_topology_runs_before_memmap_preflight(monkeypatch):
     """A warm-start topology mismatch must not first hash the data payload."""
 

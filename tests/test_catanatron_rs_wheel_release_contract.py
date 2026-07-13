@@ -191,3 +191,18 @@ def test_builder_smokes_the_compiled_capability_contract_before_hashing() -> Non
     assert "initial_road_d1_scope" in script
     assert "public_award_feature_parity" in script
     assert "policy_temperature_semantics" in script
+
+
+def test_builder_runs_semantic_tests_for_advertised_corrected_capabilities() -> None:
+    script = _script()
+    build = script.index("maturin build")
+
+    public_award = script.index(
+        "entity_player_tokens_preserve_public_awards_when_hidden_hands_are_masked"
+    )
+    temperature = script.index("native/gumbel_mcts_rs/Cargo.toml")
+
+    assert public_award < build
+    assert temperature < build
+    assert "--features python" in script[public_award - 180 : public_award]
+    assert "temperature \\\n  --lib" in script[temperature : build]

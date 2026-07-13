@@ -90,7 +90,7 @@ _T = TypeVar("_T", bound="PipelineConfig")
 
 # Bump when the *set* of fields on any pipeline config changes so that hashes
 # from before/after the change are never mistaken for equal regimes.
-CONFIG_SCHEMA_VERSION = 11
+CONFIG_SCHEMA_VERSION = 12
 
 # Length (hex chars) of the short hash embedded in artifacts. 16 hex chars =
 # 64 bits; collision probability is negligible for the run counts here and the
@@ -221,6 +221,14 @@ class TrainConfig(PipelineConfig):
     vps_to_win: int = 10
     # Masking / regime -- the field that is otherwise impossible to grep.
     mask_hidden_info: bool = False
+    # Checkpoint-owned interpretation of player-token longest-road slot 12.
+    # This changes the learner's actual input tensor and therefore must be in
+    # both the experiment hash and optimizer-resume identity.
+    public_award_feature_contract: str = "legacy_zero_v0"
+    # This is an explicit diagnostic authorization.  It does not change the
+    # legacy bridge numerics, but it changes promotion eligibility and must not
+    # disappear from a sealed run identity.
+    allow_mixed_public_award_feature_contracts: bool = False
     graph_history_features: bool = False
     acknowledge_empty_event_history_payload_inventory_sha256: list[str] = (
         dataclasses.field(default_factory=list)
@@ -235,6 +243,13 @@ class TrainConfig(PipelineConfig):
     validation_fraction: float = 0.05
     validation_max_samples: int = 200_000
     validation_game_seed_ranges: str = ""
+    # Effective immutable holdout identity.  These are populated by train_bc
+    # after authenticating an A1/composite validation contract and before the
+    # typed config is sealed.  They bind both the evaluated sentinel and the
+    # complete game set excluded from optimizer updates.
+    validation_contract_file_sha256: str = ""
+    validation_game_seed_set_sha256: str = ""
+    training_excluded_game_seed_set_sha256: str = ""
     allow_missing_game_seed_validation_split: bool = False
     epochs: int = 2
     max_steps: int = 0
