@@ -351,15 +351,26 @@ def _temperature_scale_policy(
     value = float(temperature)
     if not math.isfinite(value) or value <= 0.0:
         raise ValueError("policy sampling temperature must be finite and > 0")
-    if value == 1.0 or not policy:
-        return policy
-    positive = {
-        int(action): float(probability)
-        for action, probability in policy.items()
-        if math.isfinite(float(probability)) and float(probability) > 0.0
+    probabilities = {
+        int(action): float(probability) for action, probability in policy.items()
     }
-    if not positive:
+    if any(
+        not math.isfinite(probability) or probability < 0.0
+        for probability in probabilities.values()
+    ):
+        raise ValueError(
+            "policy sampling probabilities must be finite and non-negative"
+        )
+    positive = {
+        action: probability
+        for action, probability in probabilities.items()
+        if probability > 0.0
+    }
+    positive_mass = sum(positive.values())
+    if not positive or not math.isfinite(positive_mass):
         raise ValueError("policy sampling distribution has no positive finite mass")
+    if value == 1.0:
+        return policy
     log_weights = {
         action: math.log(probability) / value
         for action, probability in positive.items()

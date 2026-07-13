@@ -35,6 +35,23 @@ def test_gameplay_temperature_scaling_rejects_invalid_values(
         _temperature_scale_policy({3: 1.0}, temperature)
 
 
+@pytest.mark.parametrize("temperature", [0.5, 1.0, 2.0])
+@pytest.mark.parametrize("probability", [-0.1, float("nan"), float("inf")])
+def test_gameplay_temperature_scaling_rejects_any_invalid_probability(
+    temperature: float, probability: float
+) -> None:
+    with pytest.raises(ValueError, match="finite and non-negative"):
+        _temperature_scale_policy({3: 0.8, 7: probability}, temperature)
+
+
+@pytest.mark.parametrize("temperature", [0.5, 1.0, 2.0])
+def test_gameplay_temperature_scaling_rejects_zero_mass(
+    temperature: float,
+) -> None:
+    with pytest.raises(ValueError, match="positive finite mass"):
+        _temperature_scale_policy({3: 0.0, 7: 0.0}, temperature)
+
+
 def test_information_set_gameplay_temperature_does_not_mutate_training_target(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
