@@ -204,7 +204,10 @@ def _complete_run(
             "ddp_shard_data": False,
         },
         "rank_torch_rng_states": [{"rank": rank} for rank in range(8)],
-        "rank_numpy_rng_states": [{"state": rank} for rank in range(8)],
+        # Non-sharded memmap DDP uses one shared global epoch order.  All ranks
+        # must checkpoint the same NumPy sampler state, while torch/dropout and
+        # D6 augmentation retain rank-local streams.
+        "rank_numpy_rng_states": [{"state": 17} for _rank in range(8)],
         "symmetry_rng_state": {
             "schema_version": "train-bc-rank-symmetry-rng-v1",
             "world_size": 8,
@@ -249,7 +252,7 @@ def test_completion_proves_exact_geometry_rng_optimizer_and_model_delta(
         "rank_torch_rng_states": 8,
         "rank_torch_rng_set": list(range(8)),
         "rank_numpy_rng_states": 8,
-        "rank_numpy_state_digests_unique": True,
+        "rank_numpy_state_digests_shared": True,
         "symmetry_rng_schema": "train-bc-rank-symmetry-rng-v1",
         "rank_symmetry_rng_states": 8,
         "rank_symmetry_state_digests_unique": True,
@@ -275,6 +278,10 @@ def test_completion_proves_exact_geometry_rng_optimizer_and_model_delta(
         ),
         (
             lambda root: _mutate_progress_symmetry(root),
+            "progress/RNG/optimizer dose drift",
+        ),
+        (
+            lambda root: _mutate_progress_numpy_rank(root),
             "progress/RNG/optimizer dose drift",
         ),
         (
@@ -316,6 +323,16 @@ def _mutate_progress_symmetry(root: Path) -> None:
     path = root / "candidate.pt.training-progress.json"
     payload = json.loads(path.read_text(encoding="utf-8"))
     payload["symmetry_rng_state"]["rank_states"].pop()
+    payload["progress_sha256"] = arm.gather.corrected._digest(
+        {key: value for key, value in payload.items() if key != "progress_sha256"}
+    )
+    _write_json(path, payload)
+
+
+def _mutate_progress_numpy_rank(root: Path) -> None:
+    path = root / "candidate.pt.training-progress.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["rank_numpy_rng_states"][3] = {"state": 18}
     payload["progress_sha256"] = arm.gather.corrected._digest(
         {key: value for key, value in payload.items() if key != "progress_sha256"}
     )

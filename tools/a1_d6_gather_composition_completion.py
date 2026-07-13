@@ -450,7 +450,12 @@ def _verify_progress(
         and torch_ranks == list(range(arm.WORLD_SIZE))
         and isinstance(numpy_states, list)
         and len(numpy_states) == arm.WORLD_SIZE
-        and len(set(numpy_state_digests)) == arm.WORLD_SIZE
+        # This arm consumes one shared global memmap and lets DDP split each
+        # global batch by rank.  Every rank must therefore advance the same
+        # epoch-order generator to the same state.  Rank-distinct NumPy states
+        # are only expected for ``ddp_shard_data=True`` corpora; accepting them
+        # here would make an exact resume reorder the shared global corpus.
+        and len(set(numpy_state_digests)) == 1
         and isinstance(symmetry, Mapping)
         and symmetry.get("schema_version") == "train-bc-rank-symmetry-rng-v1"
         and symmetry.get("world_size") == arm.WORLD_SIZE
@@ -468,7 +473,7 @@ def _verify_progress(
         "rank_torch_rng_states": len(torch_states),
         "rank_torch_rng_set": torch_ranks,
         "rank_numpy_rng_states": len(numpy_states),
-        "rank_numpy_state_digests_unique": True,
+        "rank_numpy_state_digests_shared": True,
         "symmetry_rng_schema": symmetry["schema_version"],
         "rank_symmetry_rng_states": len(symmetry_states),
         "rank_symmetry_state_digests_unique": True,
