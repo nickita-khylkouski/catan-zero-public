@@ -295,6 +295,38 @@ def _verify(plan: dict[str, Any], run: dict[str, Any]) -> None:
             raise QualityProbeError(f"quality-probe {path_key} bytes drifted")
 
 
+def _selected_b200_names(names: Sequence[str], run: dict[str, Any]) -> list[str]:
+    """Validate the physical GPUs selected by one geometry arm.
+
+    The host inventory is deliberately larger than the four-rank arm.  Checking
+    the total inventory against the run's world size would therefore reject the
+    valid 4x1024 arm; checking a deleted module constant previously crashed both
+    arms before launch.  Bind the preflight to the sealed ``gpu_ids`` instead.
+    """
+
+    try:
+        world_size = int(run["world_size"])
+        gpu_ids = [int(value) for value in run["gpu_ids"]]
+    except (KeyError, TypeError, ValueError) as error:
+        raise QualityProbeError("run has invalid world-size/GPU binding") from error
+    if (
+        world_size <= 0
+        or len(gpu_ids) != world_size
+        or len(set(gpu_ids)) != len(gpu_ids)
+        or any(gpu_id < 0 or gpu_id >= len(names) for gpu_id in gpu_ids)
+    ):
+        raise QualityProbeError(
+            f"run GPU binding does not select {world_size} unique host GPUs: "
+            f"gpu_ids={gpu_ids}, host_gpu_count={len(names)}"
+        )
+    selected = [str(names[gpu_id]) for gpu_id in gpu_ids]
+    if any("B200" not in name.upper() for name in selected):
+        raise QualityProbeError(
+            f"--go requires selected GPUs to be B200s, got {selected}"
+        )
+    return selected
+
+
 def run_one(plan_path: Path, run_id: str, *, go: bool) -> dict[str, Any]:
     plan = _read_plan(plan_path)
     matches = [run for run in plan["runs"] if run["run_id"] == run_id]
@@ -310,8 +342,7 @@ def run_one(plan_path: Path, run_id: str, *, go: bool) -> dict[str, Any]:
         text=True,
         stdout=subprocess.PIPE,
     ).stdout.splitlines()
-    if len(names) != WORLD_SIZE or any("B200" not in name.upper() for name in names):
-        raise QualityProbeError(f"--go requires exactly 8 B200 GPUs, got {names}")
+    _selected_b200_names(names, run)
     batch_probe._require_no_non_mps_compute()  # noqa: SLF001
     with batch_probe._without_mps():  # noqa: SLF001
         batch_probe._require_no_non_mps_compute()  # noqa: SLF001
