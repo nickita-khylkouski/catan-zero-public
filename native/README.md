@@ -42,8 +42,12 @@ public root prompt once, the binding carries that immutable prompt into native
 search, and Rust applies D1 only at the `BUILD_INITIAL_ROAD` decision root.
 Interior nodes and every other phase retain the historical min-max operator.
 
-Version `0.1.8` adds `public_award_feature_parity`. Both the Python snapshot
-adapter and the direct Rust entity featurizer now preserve authoritative,
-public longest-road ownership in player-token slot 12, including for masked
-opponents. Callers requesting the Rust feature path fail closed on older wheels
-whose native featurizer silently emitted zero for that public award.
+Version `0.1.8` adds `public_award_feature_parity` and
+`policy_temperature_semantics`. Both the Python snapshot adapter and the direct
+Rust entity featurizer preserve authoritative, public longest-road ownership in
+player-token slot 12, including for masked opponents. Native gameplay selection
+also applies the configured temperature as `softmax(log(policy) / T)`; `T=1`
+is an exact no-op and `T=0` retains deterministic argmax selection. Callers
+requesting these semantics fail closed on older wheel digests that either
+silently emitted zero for the public award or treated every positive gameplay
+temperature as `T=1`.

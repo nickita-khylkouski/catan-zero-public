@@ -67,6 +67,7 @@ __all__ = [
     "information_set_particle_budgets",
     "_root_candidate_count",
     "_prune_policy_target",
+    "_temperature_scale_policy",
     "RESOURCES",
     "DEVELOPMENT_CARDS",
     "is_move_robber_with_victim",
@@ -330,6 +331,57 @@ def _prune_policy_target(
     }
 
 
+def _temperature_scale_policy(
+    policy: dict[int, float], temperature: float
+) -> dict[int, float]:
+    """Return ``policy`` rescaled by the gameplay sampling temperature.
+
+    ``T=1`` is an exact no-op, ``0<T<1`` sharpens, and ``T>1`` softens.  Zero
+    probability actions remain zero.  The previous selector only checked
+    ``temperature > 0`` and then sampled the *unscaled* policy, making every
+    positive value (including the intended gentle late-game ``T=0.3``) behave
+    exactly like ``T=1``.
+
+    This helper changes only the distribution used to choose the live action;
+    the returned ``SearchResult.improved_policy`` remains the untempered search
+    target.  That separation is the usual AlphaZero contract: exploration
+    temperature controls trajectories, not the policy-improvement label.
+    """
+
+    value = float(temperature)
+    if not math.isfinite(value) or value <= 0.0:
+        raise ValueError("policy sampling temperature must be finite and > 0")
+    if value == 1.0 or not policy:
+        return policy
+    positive = {
+        int(action): float(probability)
+        for action, probability in policy.items()
+        if math.isfinite(float(probability)) and float(probability) > 0.0
+    }
+    if not positive:
+        raise ValueError("policy sampling distribution has no positive finite mass")
+    log_weights = {
+        action: math.log(probability) / value
+        for action, probability in positive.items()
+    }
+    max_log_weight = max(log_weights.values())
+    weights = {
+        action: math.exp(log_weight - max_log_weight)
+        for action, log_weight in log_weights.items()
+    }
+    total = sum(weights.values())
+    if not math.isfinite(total) or total <= 0.0:
+        raise ValueError("policy sampling temperature normalization failed")
+    return {
+        int(action): (
+            weights.get(int(action), 0.0) / total
+            if float(probability) > 0.0
+            else 0.0
+        )
+        for action, probability in policy.items()
+    }
+
+
 @dataclass(frozen=True, slots=True)
 class GumbelChanceMCTSConfig:
     colors: tuple[str, ...] = ("RED", "BLUE")
@@ -380,7 +432,9 @@ class GumbelChanceMCTSConfig:
     c_visit: float = 50.0
     c_scale: float = 0.1
     # Final action selection: argmax(improved_policy) when temperature<=0,
-    # otherwise sample from improved_policy for self-play diversity. Set
+    # otherwise sample from softmax(log(improved_policy) / temperature) for
+    # self-play diversity (T=1 samples improved_policy unchanged, T<1 sharpens,
+    # T>1 softens). Set
     # play_sh_winner=True to instead play the raw Sequential Halving winner
     # (what the paper's reference algorithm plays) -- kept as an A/B knob;
     # the policy-improvement guarantee this module relies on is for
@@ -857,6 +911,8 @@ class GumbelChanceMCTS:
         evaluator: RustEvaluator | None = None,
     ) -> None:
         self.config = config or GumbelChanceMCTSConfig()
+        if not math.isfinite(float(self.config.temperature)):
+            raise ValueError("temperature must be finite")
         if (
             self.config.sigma_reference_visits is not None
             and int(self.config.sigma_reference_visits) < 0
@@ -1181,7 +1237,11 @@ class GumbelChanceMCTS:
             else improved
         )
         if float(self.config.temperature) > 0.0:
-            selected = self._sample_categorical(gameplay_policy)
+            selected = self._sample_categorical(
+                _temperature_scale_policy(
+                    gameplay_policy, float(self.config.temperature)
+                )
+            )
         else:
             selected = max(
                 legal_actions,
@@ -1419,7 +1479,11 @@ class GumbelChanceMCTS:
         if bool(self.config.play_sh_winner):
             selected = int(sh_winner_action)
         elif float(self.config.temperature) > 0.0:
-            selected = self._sample_categorical(improved_policy)
+            selected = self._sample_categorical(
+                _temperature_scale_policy(
+                    improved_policy, float(self.config.temperature)
+                )
+            )
         else:
             selected = max(
                 improved_policy,
