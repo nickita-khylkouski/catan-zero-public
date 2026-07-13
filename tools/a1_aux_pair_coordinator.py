@@ -4000,9 +4000,11 @@ def complete_final_replication(
         or result["candidate_slot12_finite"]
         != delta_receipt["candidate_slot12_finite"]
         or type(result["candidate_slot12_nonzero_count"]) is not int
-        or result["candidate_slot12_nonzero_count"] < 0
+        or result["candidate_slot12_nonzero_count"] <= 0
         or result["candidate_slot12_nonzero_count"]
         != delta_receipt["candidate_slot12_nonzero_count"]
+        or result["learned_signal_observed"] is not True
+        or delta_receipt["learned_signal_observed"] is not True
         or result["learned_signal_observed"]
         != delta_receipt["learned_signal_observed"]
         or result["component_routing_state_sha256"]

@@ -842,8 +842,13 @@ def _final_receipts(root: Path, pair: dict) -> dict[str, Path]:
 
 
 def _slot12_evidence(
-    root: Path, final: dict, *, candidate_sha256: str = _sha("f")
+    root: Path,
+    final: dict,
+    *,
+    candidate_sha256: str = _sha("f"),
+    learned_signal: bool = True,
 ) -> dict[str, object]:
+    root.mkdir(parents=True, exist_ok=True)
     treatment = final["selected_aux_decision"] == "AUXT"
     initializer_sha = (
         final["initializer_authority"]["reference_warmup_terminal"]["result"][
@@ -881,12 +886,12 @@ def _slot12_evidence(
         "model_slot12_parameter_set_sha256": _sha("a"),
         "model_slot12_parameter_count": 256,
         "initializer_slot12_max_abs_decimal": "0",
-        "candidate_slot12_max_abs_decimal": "0.125",
-        "slot12_delta_max_abs_decimal": "0.125",
-        "slot12_delta_l2_decimal": "0.5",
-        "candidate_slot12_nonzero_count": 128,
+        "candidate_slot12_max_abs_decimal": "0.125" if learned_signal else "0",
+        "slot12_delta_max_abs_decimal": "0.125" if learned_signal else "0",
+        "slot12_delta_l2_decimal": "0.5" if learned_signal else "0",
+        "candidate_slot12_nonzero_count": 128 if learned_signal else 0,
         "candidate_slot12_finite": True,
-        "learned_signal_observed": True,
+        "learned_signal_observed": learned_signal,
         "slot12_delta_evidence_sha256": _sha("c"),
         "origin_tool_sha256": coordinator._repo_tool_sha256(
             "tools/a1_scientific_evidence.py"
@@ -1714,6 +1719,23 @@ def test_only_independent_final_replication_can_enter_full_gate(
             experiment["experiment_id"],
             result=bad_result,
             **evidence_paths,
+        )
+    zero_signal_evidence = _slot12_evidence(
+        tmp_path / "zero-signal-slot12",
+        final,
+        learned_signal=False,
+    )
+    zero_signal_paths = {
+        key: value
+        for key, value in zero_signal_evidence.items()
+        if key.endswith("_path")
+    }
+    with pytest.raises(coordinator.CoordinatorError, match="promotion-safe"):
+        coordinator.complete_final_replication(
+            tmp_path,
+            experiment["experiment_id"],
+            result=_final_result(final, zero_signal_evidence),
+            **zero_signal_paths,
         )
     terminal = coordinator.complete_final_replication(
         tmp_path,
