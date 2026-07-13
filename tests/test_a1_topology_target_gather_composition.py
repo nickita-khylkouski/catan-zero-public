@@ -260,3 +260,36 @@ def test_inference_cost_telemetry_is_mandatory_and_matched(tmp_path: Path) -> No
     )
     with pytest.raises(completion.CompletionError, match="environment drift"):
         completion._inference_cost_telemetry(verified, candidate=candidate_ref)
+
+
+def test_completion_cli_dispatches_specialized_finalizer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    manifest = tmp_path / "manifest.json"
+    observed: dict[str, object] = {}
+
+    def specialized_finalize(
+        manifest_path: Path, *, expected_checkpoint_sha256: str
+    ) -> dict[str, object]:
+        observed["manifest"] = manifest_path
+        observed["sha256"] = expected_checkpoint_sha256
+        return {"inference_cost_telemetry": {"selection_cost_observed": True}}
+
+    monkeypatch.setattr(completion, "finalize", specialized_finalize)
+    completion.main(
+        [
+            "finalize",
+            "--manifest",
+            str(manifest),
+            "--expected-checkpoint-sha256",
+            "sha256:candidate",
+        ]
+    )
+
+    assert observed == {
+        "manifest": manifest,
+        "sha256": "sha256:candidate",
+    }
+    assert json.loads(capsys.readouterr().out) == {
+        "inference_cost_telemetry": {"selection_cost_observed": True}
+    }

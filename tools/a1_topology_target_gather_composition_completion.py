@@ -382,9 +382,28 @@ def _verify_topology_target_gather_delta(
     return _call("_verify_topology_only_delta", initializer, candidate)
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def main(argv: Sequence[str] | None = None) -> None:
+    """Dispatch through this specialization, not the topology-only sibling.
+
+    Calling ``base.main`` here is subtly wrong: the parser is reusable, but the
+    function globals resolved by ``base.main`` are the topology-only
+    ``finalize`` and ``verify_completion`` functions.  That bypasses this
+    module's mandatory inference-cost telemetry while still producing a
+    superficially valid topology-only receipt.
+    """
     with _configured():
-        return base.main(argv)
+        args = base.build_parser().parse_args(argv)
+        try:
+            if args.action == "finalize":
+                value = finalize(
+                    args.manifest,
+                    expected_checkpoint_sha256=args.expected_checkpoint_sha256,
+                )
+            else:
+                value = verify_completion(args.receipt)
+        except (CompletionError, OSError, ValueError) as error:
+            raise SystemExit(str(error)) from error
+    print(json.dumps(value, indent=2, sort_keys=True))
 
 
 if __name__ == "__main__":
