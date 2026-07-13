@@ -2359,18 +2359,167 @@ def _verify_live_seed_ledger(
             )
 
 
-def _hard_negative_selection_record(
-    path: Path, *, checkpoint: Path, checkpoint_sha256: str
+LEGACY_HARD_NEGATIVE_SELECTION_FIELDS = {
+    "schema_version",
+    "checkpoint",
+    "selection_reason",
+    "evaluation_evidence",
+    "selection_sha256",
+}
+RICH_HARD_NEGATIVE_SELECTION_FIELDS = {
+    "authoritative_incumbent",
+    "candidate",
+    "candidate_bundle",
+    "evidence",
+    "limitations",
+    "opponent_pool_mutation_performed",
+    "promotion_decision",
+    "promotion_eligible",
+    "registry_mutation_authorized",
+    "schema_version",
+    "selection_basis",
+    "selection_role",
+    "selection_sha256",
+    "status",
+}
+
+
+def _verified_sized_artifact_ref(
+    raw: Any,
+    *,
+    where: str,
+    kind: str,
+    relative_to: Path | None = None,
 ) -> dict[str, Any]:
-    payload = _load_json(path)
-    required = {
-        "schema_version",
-        "checkpoint",
-        "selection_reason",
-        "evaluation_evidence",
-        "selection_sha256",
+    """Resolve one explicit path/hash/size binding without filesystem search."""
+
+    if not isinstance(raw, dict):
+        raise ContractError(f"{where} must be an object")
+    _require_exact_keys(raw, {"path", "sha256", "bytes"}, where=where)
+    raw_path = raw["path"]
+    if not isinstance(raw_path, str) or not raw_path:
+        raise ContractError(f"{where}.path must be a non-empty string")
+    unresolved = Path(raw_path).expanduser()
+    if relative_to is None:
+        if not unresolved.is_absolute():
+            raise ContractError(f"{where}.path must be absolute")
+        candidate = unresolved
+    else:
+        if unresolved.is_absolute() or ".." in PurePath(raw_path).parts:
+            raise ContractError(
+                f"{where}.path must be a bundle-relative path without traversal"
+            )
+        candidate = relative_to / unresolved
+    try:
+        path = candidate.resolve(strict=True)
+    except OSError as error:
+        raise ContractError(f"cannot resolve {where} at {candidate}: {error}") from error
+    if relative_to is not None:
+        try:
+            path.relative_to(relative_to.resolve(strict=True))
+        except (OSError, ValueError) as error:
+            raise ContractError(f"{where}.path escapes its artifact bundle") from error
+    if not path.is_file():
+        raise ContractError(f"{where} is missing or not a file: {path}")
+    declared_bytes = raw["bytes"]
+    if (
+        isinstance(declared_bytes, bool)
+        or not isinstance(declared_bytes, int)
+        or declared_bytes < 0
+    ):
+        raise ContractError(f"{where}.bytes must be a non-negative integer")
+    actual_bytes = path.stat().st_size
+    if declared_bytes != actual_bytes:
+        raise ContractError(
+            f"{where} byte count drift: declared {declared_bytes}, actual {actual_bytes}"
+        )
+    actual_sha256 = _sha256(path)
+    if raw["sha256"] != actual_sha256:
+        raise ContractError(
+            f"{where} hash drift: declared {raw['sha256']!r}, actual {actual_sha256}"
+        )
+    return {
+        "kind": kind,
+        "path": str(path),
+        "sha256": actual_sha256,
+        "bytes": actual_bytes,
     }
-    _require_exact_keys(payload, required, where="hard-negative selection evidence")
+
+
+def _verified_artifact_ref(raw: Any, *, where: str, kind: str) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        raise ContractError(f"{where} must be an object")
+    _require_exact_keys(raw, {"path", "sha256"}, where=where)
+    raw_path = raw["path"]
+    if not isinstance(raw_path, str) or not raw_path or not Path(raw_path).is_absolute():
+        raise ContractError(f"{where}.path must be an absolute non-empty string")
+    try:
+        path = Path(raw_path).expanduser().resolve(strict=True)
+    except OSError as error:
+        raise ContractError(f"cannot resolve {where} at {raw_path}: {error}") from error
+    if not path.is_file():
+        raise ContractError(f"{where} is missing or not a file: {path}")
+    actual_sha256 = _sha256(path)
+    if raw["sha256"] != actual_sha256:
+        raise ContractError(
+            f"{where} hash drift: declared {raw['sha256']!r}, actual {actual_sha256}"
+        )
+    return {"kind": kind, "path": str(path), "sha256": actual_sha256}
+
+
+def _artifact_identity(record: Mapping[str, Any]) -> dict[str, str]:
+    return {"path": str(record["path"]), "sha256": str(record["sha256"])}
+
+
+def _require_artifact_identity(
+    raw: Any,
+    expected: Mapping[str, Any],
+    *,
+    where: str,
+    allow_extra: bool = False,
+) -> None:
+    if not isinstance(raw, dict):
+        raise ContractError(f"{where} must be an object")
+    if allow_extra:
+        if not {"path", "sha256"}.issubset(raw):
+            raise ContractError(f"{where} must bind path and sha256")
+    else:
+        _require_exact_keys(raw, {"path", "sha256"}, where=where)
+    try:
+        actual_path = Path(str(raw["path"])).expanduser().resolve(strict=True)
+        expected_path = Path(str(expected["path"])).expanduser().resolve(strict=True)
+    except OSError as error:
+        raise ContractError(f"cannot resolve {where}: {error}") from error
+    if actual_path != expected_path or raw["sha256"] != expected["sha256"]:
+        raise ContractError(f"{where} binds different checkpoint bytes")
+
+
+def _require_checkpoint_path(
+    raw: Any, expected: Mapping[str, Any], *, where: str
+) -> None:
+    if not isinstance(raw, str) or not raw:
+        raise ContractError(f"{where} must be a non-empty absolute path")
+    try:
+        actual = Path(raw).expanduser().resolve(strict=True)
+        wanted = Path(str(expected["path"])).expanduser().resolve(strict=True)
+    except OSError as error:
+        raise ContractError(f"cannot resolve {where}: {error}") from error
+    if actual != wanted:
+        raise ContractError(f"{where} binds a different checkpoint")
+
+
+def _legacy_hard_negative_selection_record(
+    path: Path,
+    payload: dict[str, Any],
+    *,
+    checkpoint: Path,
+    checkpoint_sha256: str,
+) -> dict[str, Any]:
+    _require_exact_keys(
+        payload,
+        LEGACY_HARD_NEGATIVE_SELECTION_FIELDS,
+        where="hard-negative selection evidence",
+    )
     if payload["schema_version"] != "a1-hard-negative-selection-v1":
         raise ContractError("hard-negative selection evidence schema is unsupported")
     unhashed = dict(payload)
@@ -2402,6 +2551,883 @@ def _hard_negative_selection_record(
         }
     )
     return record
+
+
+def _validate_hard_negative_bundle(
+    bundle_record: Mapping[str, Any],
+    *,
+    candidate: Mapping[str, Any],
+    incumbent: Mapping[str, Any],
+) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
+    bundle_path = Path(str(bundle_record["path"]))
+    payload = _load_json(bundle_path)
+    _require_exact_keys(
+        payload,
+        {
+            "artifacts",
+            "candidate_role",
+            "code_commits",
+            "evaluation",
+            "files",
+            "registry_mutation_authorized",
+            "schema_version",
+        },
+        where="hard-negative candidate bundle",
+    )
+    if payload["schema_version"] != "aux-pointer-candidate-bundle-v1":
+        raise ContractError("hard-negative candidate bundle schema is unsupported")
+    if payload["candidate_role"] != "experimental_nonpromotable":
+        raise ContractError("hard-negative candidate bundle role is promotion-capable")
+    if payload["registry_mutation_authorized"] is not False:
+        raise ContractError("hard-negative candidate bundle authorizes registry mutation")
+    artifacts = payload["artifacts"]
+    if not isinstance(artifacts, dict):
+        raise ContractError("hard-negative candidate bundle artifacts must be an object")
+    _require_exact_keys(
+        artifacts,
+        {"authoritative_v5", "candidate", "exact_parent"},
+        where="hard-negative candidate bundle artifacts",
+    )
+    artifact_records = {
+        name: _verified_sized_artifact_ref(
+            artifacts[name],
+            where=f"hard-negative candidate bundle artifacts.{name}",
+            kind=f"hard_negative_bundle_{name}",
+        )
+        for name in sorted(artifacts)
+    }
+    if _artifact_identity(artifact_records["candidate"]) != _artifact_identity(
+        candidate
+    ):
+        raise ContractError("hard-negative candidate bundle binds a different candidate")
+    if _artifact_identity(
+        artifact_records["authoritative_v5"]
+    ) != _artifact_identity(incumbent):
+        raise ContractError("hard-negative candidate bundle binds a different incumbent")
+    raw_files = payload["files"]
+    if not isinstance(raw_files, list) or not raw_files:
+        raise ContractError("hard-negative candidate bundle files must be non-empty")
+    file_records: list[dict[str, Any]] = []
+    seen_paths: set[str] = set()
+    for index, raw in enumerate(raw_files):
+        record = _verified_sized_artifact_ref(
+            raw,
+            where=f"hard-negative candidate bundle files[{index}]",
+            kind="hard_negative_bundle_file",
+            relative_to=bundle_path.parent,
+        )
+        if record["path"] in seen_paths:
+            raise ContractError("hard-negative candidate bundle repeats a file path")
+        seen_paths.add(str(record["path"]))
+        file_records.append(record)
+    return artifact_records, file_records
+
+
+def _validate_held_out_hard_negative_evidence(
+    raw: Any,
+    *,
+    candidate: Mapping[str, Any],
+    incumbent: Mapping[str, Any],
+) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        raise ContractError("held-out hard-negative evidence must be an object")
+    required = {
+        "artifact",
+        "complete_candidate_win_rate",
+        "complete_candidate_wins",
+        "complete_incumbent_wins",
+        "complete_pairs",
+        "engine_identity",
+        "evaluation_config",
+        "incomplete_pairs",
+        "pair_diagnostics",
+        "pentanomial_sprt",
+        "suite_manifest",
+        "suite_pairs",
+    }
+    _require_exact_keys(raw, required, where="held-out hard-negative evidence")
+    artifact = _verified_sized_artifact_ref(
+        raw["artifact"],
+        where="held-out hard-negative evidence artifact",
+        kind="hard_negative_held_out_report",
+    )
+    suite_record = _verified_artifact_ref(
+        raw["suite_manifest"],
+        where="held-out hard-negative suite manifest",
+        kind="hard_negative_held_out_suite",
+    )
+    report = _load_json(Path(str(artifact["path"])))
+    if report.get("schema_version") != "a1-held-out-high-regret-report-v1":
+        raise ContractError("held-out hard-negative report schema is unsupported")
+    if report.get("held_out") is not True or report.get("suite") != "held_out_high_regret":
+        raise ContractError("held-out hard-negative report is not an isolated suite")
+    if report.get("errors") != []:
+        raise ContractError("held-out hard-negative report contains evaluation errors")
+    _require_artifact_identity(report.get("candidate"), candidate, where="held-out candidate")
+    _require_artifact_identity(report.get("champion"), incumbent, where="held-out incumbent")
+    _require_artifact_identity(
+        report.get("suite_manifest"), suite_record, where="held-out suite manifest"
+    )
+    planned_engine = report.get("planned_engine_identity")
+    if (
+        report.get("engine_identity") != raw["engine_identity"]
+        or not isinstance(planned_engine, dict)
+        or any(raw["engine_identity"].get(key) != value for key, value in planned_engine.items())
+    ):
+        raise ContractError("held-out hard-negative engine identity drift")
+    if report.get("evaluation_config") != raw["evaluation_config"]:
+        raise ContractError("held-out hard-negative evaluation config drift")
+    config = raw["evaluation_config"]
+    if not isinstance(config, dict):
+        raise ContractError("held-out hard-negative evaluation config is malformed")
+    _require_checkpoint_path(
+        config.get("candidate"), candidate, where="held-out config candidate"
+    )
+    _require_checkpoint_path(
+        config.get("baseline"), incumbent, where="held-out config incumbent"
+    )
+    if report.get("pair_diagnostics") != raw["pair_diagnostics"]:
+        raise ContractError("held-out hard-negative pair diagnostics drift")
+    if report.get("pentanomial_sprt") != raw["pentanomial_sprt"]:
+        raise ContractError("held-out hard-negative SPRT drift")
+    if not isinstance(raw["pair_diagnostics"], dict) or not isinstance(
+        raw["pentanomial_sprt"], dict
+    ):
+        raise ContractError("held-out hard-negative result summaries are malformed")
+    complete_pairs = raw["complete_pairs"]
+    incomplete_pairs = raw["incomplete_pairs"]
+    suite_pairs = raw["suite_pairs"]
+    declared_candidate_wins = raw["complete_candidate_wins"]
+    declared_incumbent_wins = raw["complete_incumbent_wins"]
+    if (
+        isinstance(complete_pairs, bool)
+        or not isinstance(complete_pairs, int)
+        or complete_pairs <= 0
+        or isinstance(incomplete_pairs, bool)
+        or not isinstance(incomplete_pairs, int)
+        or incomplete_pairs < 0
+        or isinstance(suite_pairs, bool)
+        or not isinstance(suite_pairs, int)
+        or suite_pairs != complete_pairs + incomplete_pairs
+        or isinstance(declared_candidate_wins, bool)
+        or not isinstance(declared_candidate_wins, int)
+        or isinstance(declared_incumbent_wins, bool)
+        or not isinstance(declared_incumbent_wins, int)
+    ):
+        raise ContractError("held-out hard-negative result counts are inconsistent")
+    suite = _load_json(Path(str(suite_record["path"])))
+    _require_exact_keys(
+        suite,
+        {
+            "held_out",
+            "schema_version",
+            "selection",
+            "source_manifest",
+            "states",
+            "suite",
+            "suite_sha256",
+            "validation_seed_manifest",
+        },
+        where="held-out hard-negative suite",
+    )
+    suite_unhashed = dict(suite)
+    suite_digest = suite_unhashed.pop("suite_sha256")
+    if (
+        suite["schema_version"] != "a1-held-out-high-regret-suite-v4"
+        or suite["held_out"] is not True
+        or suite["suite"] != "held_out_high_regret"
+        or suite_digest != _digest_value(suite_unhashed)
+        or not isinstance(suite["states"], list)
+        or len(suite["states"]) != suite_pairs
+        or not isinstance(suite["selection"], dict)
+        or suite["selection"].get("selected_pairs") != suite_pairs
+    ):
+        raise ContractError("held-out hard-negative suite manifest is inconsistent")
+    states_by_pair: dict[int, tuple[int, int]] = {}
+    for index, state in enumerate(suite["states"]):
+        if not isinstance(state, dict):
+            raise ContractError(f"held-out suite state[{index}] is not an object")
+        pair_id = state.get("pair_id")
+        game_seed = state.get("game_seed")
+        decision_index = state.get("decision_index")
+        if (
+            isinstance(pair_id, bool)
+            or not isinstance(pair_id, int)
+            or isinstance(game_seed, bool)
+            or not isinstance(game_seed, int)
+            or isinstance(decision_index, bool)
+            or not isinstance(decision_index, int)
+            or pair_id in states_by_pair
+        ):
+            raise ContractError("held-out suite state identity is malformed or repeated")
+        states_by_pair[pair_id] = (game_seed, decision_index)
+    games = report.get("games")
+    if not isinstance(games, list):
+        raise ContractError("held-out hard-negative report games are malformed")
+    by_pair: dict[int, list[dict[str, Any]]] = {}
+    for index, game in enumerate(games):
+        if not isinstance(game, dict):
+            raise ContractError(f"held-out hard-negative game[{index}] is not an object")
+        pair_id = game.get("pair_id")
+        if isinstance(pair_id, bool) or not isinstance(pair_id, int):
+            raise ContractError("held-out hard-negative game has no integer pair identity")
+        by_pair.setdefault(pair_id, []).append(game)
+    if set(by_pair) != set(states_by_pair):
+        raise ContractError("held-out report games do not bind the exact suite pair set")
+    complete: list[dict[str, Any]] = []
+    recomputed_diagnostics = {
+        "incomplete_pairs": 0,
+        "ll_pairs": 0,
+        "split_pairs": 0,
+        "ww_pairs": 0,
+    }
+    for pair_id, pair in by_pair.items():
+        archived_identity = states_by_pair[pair_id]
+        if (
+            len(pair) != 2
+            or {game.get("orientation") for game in pair}
+            != {"candidate_red", "candidate_blue"}
+        ):
+            raise ContractError(
+                "held-out hard-negative pair lacks exact candidate orientations"
+            )
+        for game in pair:
+            if (
+                (game.get("archived_game_seed"), game.get("archived_decision_index"))
+                != archived_identity
+                or game.get("game_seed") != archived_identity[0]
+            ):
+                raise ContractError(
+                    "held-out report game does not bind its suite state identity"
+                )
+        pair_complete = all(
+            game.get("terminated") is True
+            and game.get("truncated") is False
+            and isinstance(game.get("candidate_won"), bool)
+            for game in pair
+        )
+        if not pair_complete:
+            if any(
+                not (
+                    (
+                        game.get("terminated") is True
+                        and game.get("truncated") is False
+                        and isinstance(game.get("candidate_won"), bool)
+                    )
+                    or (
+                        game.get("terminated") is False
+                        and game.get("truncated") is True
+                        and game.get("candidate_won") is None
+                    )
+                )
+                for game in pair
+            ):
+                raise ContractError("held-out hard-negative incomplete pair is malformed")
+            recomputed_diagnostics["incomplete_pairs"] += 1
+            continue
+        complete.extend(pair)
+        pair_wins = sum(game["candidate_won"] is True for game in pair)
+        bucket = "ww_pairs" if pair_wins == 2 else "ll_pairs" if pair_wins == 0 else "split_pairs"
+        recomputed_diagnostics[bucket] += 1
+    candidate_wins = sum(game["candidate_won"] is True for game in complete)
+    incumbent_wins = sum(game["candidate_won"] is False for game in complete)
+    if (
+        len(complete) != 2 * complete_pairs
+        or recomputed_diagnostics != raw["pair_diagnostics"]
+        or candidate_wins != declared_candidate_wins
+        or incumbent_wins != declared_incumbent_wins
+        or candidate_wins + incumbent_wins != 2 * complete_pairs
+        or raw["pentanomial_sprt"].get("pairs") != complete_pairs
+        or any(
+            raw["pentanomial_sprt"].get(key) != value
+            for key, value in recomputed_diagnostics.items()
+            if key != "incomplete_pairs"
+        )
+    ):
+        raise ContractError("held-out hard-negative result counts are inconsistent")
+    win_rate = candidate_wins / (candidate_wins + incumbent_wins)
+    declared_win_rate = raw["complete_candidate_win_rate"]
+    if (
+        isinstance(declared_win_rate, bool)
+        or not isinstance(declared_win_rate, (int, float))
+        or not math.isfinite(float(declared_win_rate))
+        or not math.isclose(
+            float(declared_win_rate),
+            win_rate,
+            rel_tol=0.0,
+            abs_tol=1e-15,
+        )
+    ):
+        raise ContractError("held-out hard-negative win rate is inconsistent")
+    return {"artifact": artifact, "suite_manifest": suite_record}
+
+
+def _validate_internal_hard_negative_evidence(
+    raw: Any,
+    *,
+    candidate: Mapping[str, Any],
+    incumbent: Mapping[str, Any],
+) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        raise ContractError("internal hard-negative evidence must be an object")
+    required = {
+        "artifact",
+        "candidate_win_rate",
+        "candidate_wins",
+        "complete_pairs",
+        "games",
+        "incumbent_wins",
+        "pentanomial_decision",
+        "strict_superiority_decision",
+    }
+    _require_exact_keys(raw, required, where="internal hard-negative evidence")
+    artifact = _verified_sized_artifact_ref(
+        raw["artifact"],
+        where="internal hard-negative evidence artifact",
+        kind="hard_negative_internal_report",
+    )
+    report = _load_json(Path(str(artifact["path"])))
+    if report.get("schema_version") != "a1-complete-internal-cohort-receipt-v1":
+        raise ContractError("internal hard-negative report schema is unsupported")
+    if report.get("registry_mutation_authorized") is not False:
+        raise ContractError("internal hard-negative report authorizes registry mutation")
+    if report.get("errors") != [] or report.get("truncations") != 0:
+        raise ContractError("internal hard-negative report is incomplete or errored")
+    receipt_unhashed = dict(report)
+    receipt_digest = receipt_unhashed.pop("receipt_sha256", None)
+    if receipt_digest != _digest_value(receipt_unhashed):
+        raise ContractError("internal hard-negative receipt digest mismatch")
+    _require_artifact_identity(report.get("candidate"), candidate, where="internal candidate")
+    _require_artifact_identity(report.get("baseline"), incumbent, where="internal incumbent")
+    comparisons = {
+        "candidate_win_rate": report.get("candidate_win_rate"),
+        "candidate_wins": report.get("candidate_wins"),
+        "complete_pairs": report.get("complete_pairs"),
+        "games": report.get("games"),
+        "incumbent_wins": report.get("baseline_wins"),
+        "pentanomial_decision": (
+            report.get("pentanomial_sprt", {}).get("decision")
+            if isinstance(report.get("pentanomial_sprt"), dict)
+            else None
+        ),
+        "strict_superiority_decision": (
+            report.get("superiority_pentanomial_sprt", {}).get("decision")
+            if isinstance(report.get("superiority_pentanomial_sprt"), dict)
+            else None
+        ),
+    }
+    if any(raw[key] != value for key, value in comparisons.items()):
+        raise ContractError("internal hard-negative summary drifts from its receipt")
+    integer_fields = ("candidate_wins", "complete_pairs", "games", "incumbent_wins")
+    if (
+        any(
+            isinstance(raw[field], bool) or not isinstance(raw[field], int)
+            for field in integer_fields
+        )
+        or raw["complete_pairs"] <= 0
+        or raw["candidate_wins"] < 0
+        or raw["incumbent_wins"] < 0
+        or raw["games"] != 2 * raw["complete_pairs"]
+        or raw["candidate_wins"] + raw["incumbent_wins"] != raw["games"]
+    ):
+        raise ContractError("internal hard-negative result counts are inconsistent")
+    candidate_win_rate = raw["candidate_win_rate"]
+    if (
+        isinstance(candidate_win_rate, bool)
+        or not isinstance(candidate_win_rate, (int, float))
+        or not math.isclose(
+            float(candidate_win_rate),
+            raw["candidate_wins"] / raw["games"],
+            rel_tol=0.0,
+            abs_tol=1e-15,
+        )
+    ):
+        raise ContractError("internal hard-negative win rate is inconsistent")
+    return {"artifact": artifact}
+
+
+def _validate_external_report_identity(
+    report: dict[str, Any],
+    *,
+    checkpoint: Mapping[str, Any],
+    incumbent: Mapping[str, Any],
+    where: str,
+) -> dict[str, Any]:
+    _require_checkpoint_path(
+        report.get("candidate_checkpoint"), checkpoint, where=f"{where} checkpoint"
+    )
+    if report.get("candidate_checkpoint_sha256") != checkpoint["sha256"]:
+        raise ContractError(f"{where} checkpoint hash drift")
+    if report.get("baseline_bot") != "catanatron_value":
+        raise ContractError(f"{where} is not the matched external panel")
+    if (
+        report.get("errors") != []
+        or report.get("worker_errors") != []
+        or report.get("games_errored") != 0
+        or report.get("games_truncated") != 0
+    ):
+        raise ContractError(f"{where} is incomplete or errored")
+    binding = report.get("evaluation_binding")
+    if not isinstance(binding, dict) or binding.get("schema_version") != (
+        "a1-evaluation-baseline-binding-v2"
+    ):
+        raise ContractError(f"{where} evaluation binding is malformed")
+    _require_artifact_identity(
+        binding.get("authoritative_incumbent"),
+        incumbent,
+        where=f"{where} authoritative incumbent",
+        allow_extra=True,
+    )
+    _require_artifact_identity(
+        binding.get("baseline"), incumbent, where=f"{where} baseline"
+    )
+    fleet_merge = report.get("fleet_merge")
+    if not isinstance(fleet_merge, dict) or fleet_merge.get("schema_version") != (
+        "a1-fleet-evaluation-pool-v1"
+    ):
+        raise ContractError(f"{where} fleet merge is malformed")
+    _require_artifact_identity(
+        fleet_merge.get("checkpoint"), checkpoint, where=f"{where} pooled checkpoint"
+    )
+    effective_search = report.get("effective_search_config")
+    if not isinstance(effective_search, dict) or not effective_search:
+        raise ContractError(f"{where} has no effective search config")
+    search_sha256 = _digest_value(effective_search)
+    if (
+        report.get("search_config") != effective_search
+        or fleet_merge.get("effective_search_config_sha256") != search_sha256
+    ):
+        raise ContractError(f"{where} effective search identity drift")
+    games = report.get("games")
+    games_played = report.get("games_played")
+    complete_pairs = report.get("complete_pairs")
+    if (
+        not isinstance(games, list)
+        or isinstance(games_played, bool)
+        or not isinstance(games_played, int)
+        or isinstance(complete_pairs, bool)
+        or not isinstance(complete_pairs, int)
+        or games_played != len(games)
+        or games_played != 2 * complete_pairs
+        or complete_pairs <= 0
+    ):
+        raise ContractError(f"{where} game cohort is malformed")
+    outcomes: dict[tuple[int, str, int], bool] = {}
+    pair_orientations: dict[tuple[int, int], set[str]] = {}
+    for index, game in enumerate(games):
+        if not isinstance(game, dict):
+            raise ContractError(f"{where} game[{index}] is not an object")
+        seed = game.get("game_seed")
+        orientation = game.get("orientation")
+        pair_id = game.get("source_pair_id")
+        won = game.get("candidate_won")
+        if (
+            isinstance(seed, bool)
+            or not isinstance(seed, int)
+            or orientation not in {"candidate_first", "candidate_second"}
+            or isinstance(pair_id, bool)
+            or not isinstance(pair_id, int)
+            or not isinstance(won, bool)
+            or game.get("error") is not None
+            or game.get("terminated") is not True
+            or game.get("truncated") is not False
+            or game.get("engine_divergence") is not False
+        ):
+            raise ContractError(f"{where} game[{index}] is incomplete or malformed")
+        key = (seed, orientation, pair_id)
+        if key in outcomes:
+            raise ContractError(f"{where} repeats matched game identity {key}")
+        outcomes[key] = won
+        pair_orientations.setdefault((seed, pair_id), set()).add(orientation)
+    if (
+        len(pair_orientations) != complete_pairs
+        or any(
+            orientations != {"candidate_first", "candidate_second"}
+            for orientations in pair_orientations.values()
+        )
+    ):
+        raise ContractError(f"{where} does not contain exact paired orientations")
+    wins = sum(outcomes.values())
+    losses = games_played - wins
+    reported_rate = report.get("candidate_win_rate")
+    if (
+        report.get("candidate_wins") != wins
+        or report.get("baseline_wins") != losses
+        or isinstance(reported_rate, bool)
+        or not isinstance(reported_rate, (int, float))
+        or not math.isclose(
+            float(reported_rate), wins / games_played, rel_tol=0.0, abs_tol=1e-15
+        )
+    ):
+        raise ContractError(f"{where} win summary is inconsistent with its games")
+    return {
+        "outcomes": outcomes,
+        "search_sha256": search_sha256,
+    }
+
+
+def _validate_external_hard_negative_evidence(
+    raw: Any,
+    *,
+    candidate: Mapping[str, Any],
+    incumbent: Mapping[str, Any],
+) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        raise ContractError("external hard-negative evidence must be an object")
+    required = {
+        "candidate_artifact",
+        "candidate_win_rate",
+        "delta",
+        "differential_artifact",
+        "incumbent_artifact",
+        "incumbent_win_rate",
+        "matched_games",
+        "matched_pairs",
+        "mcnemar_exact_two_sided_p",
+    }
+    _require_exact_keys(raw, required, where="external hard-negative evidence")
+    candidate_artifact = _verified_sized_artifact_ref(
+        raw["candidate_artifact"],
+        where="external hard-negative candidate artifact",
+        kind="hard_negative_external_candidate_report",
+    )
+    incumbent_artifact = _verified_sized_artifact_ref(
+        raw["incumbent_artifact"],
+        where="external hard-negative incumbent artifact",
+        kind="hard_negative_external_incumbent_report",
+    )
+    differential_artifact = _verified_sized_artifact_ref(
+        raw["differential_artifact"],
+        where="external hard-negative differential artifact",
+        kind="hard_negative_external_differential",
+    )
+    candidate_report = _load_json(Path(str(candidate_artifact["path"])))
+    incumbent_report = _load_json(Path(str(incumbent_artifact["path"])))
+    differential = _load_json(Path(str(differential_artifact["path"])))
+    candidate_cohort = _validate_external_report_identity(
+        candidate_report,
+        checkpoint=candidate,
+        incumbent=incumbent,
+        where="external hard-negative candidate report",
+    )
+    incumbent_cohort = _validate_external_report_identity(
+        incumbent_report,
+        checkpoint=incumbent,
+        incumbent=incumbent,
+        where="external hard-negative incumbent report",
+    )
+    _require_exact_keys(
+        differential,
+        {
+            "both_lose",
+            "both_win",
+            "candidate_only_wins",
+            "candidate_win_rate",
+            "champion_only_wins",
+            "champion_win_rate",
+            "delta",
+            "matched_games",
+            "matched_pairs",
+            "mcnemar_exact_two_sided_p",
+            "paired_seed_delta_bootstrap_95ci",
+            "schema_version",
+        },
+        where="external hard-negative differential",
+    )
+    if differential["schema_version"] != "a1-matched-external-differential-v1":
+        raise ContractError("external hard-negative differential schema is unsupported")
+    if candidate_cohort["search_sha256"] != incumbent_cohort["search_sha256"]:
+        raise ContractError("external hard-negative panels used different search recipes")
+    candidate_outcomes = candidate_cohort["outcomes"]
+    incumbent_outcomes = incumbent_cohort["outcomes"]
+    if set(candidate_outcomes) != set(incumbent_outcomes):
+        raise ContractError("external hard-negative panels are not the same matched cohort")
+    both_win = sum(
+        candidate_outcomes[key] and incumbent_outcomes[key]
+        for key in candidate_outcomes
+    )
+    both_lose = sum(
+        not candidate_outcomes[key] and not incumbent_outcomes[key]
+        for key in candidate_outcomes
+    )
+    candidate_only = sum(
+        candidate_outcomes[key] and not incumbent_outcomes[key]
+        for key in candidate_outcomes
+    )
+    incumbent_only = sum(
+        not candidate_outcomes[key] and incumbent_outcomes[key]
+        for key in candidate_outcomes
+    )
+    discordant = candidate_only + incumbent_only
+    mcnemar_p = (
+        1.0
+        if discordant == 0
+        else min(
+            1.0,
+            2.0
+            * sum(
+                math.comb(discordant, k)
+                for k in range(min(candidate_only, incumbent_only) + 1)
+            )
+            / (2**discordant),
+        )
+    )
+    recomputed_differential = {
+        "both_lose": both_lose,
+        "both_win": both_win,
+        "candidate_only_wins": candidate_only,
+        "champion_only_wins": incumbent_only,
+        "matched_games": len(candidate_outcomes),
+        "matched_pairs": len(candidate_outcomes) // 2,
+    }
+    if any(
+        differential[key] != value
+        for key, value in recomputed_differential.items()
+    ) or not math.isclose(
+        float(differential["delta"]),
+        float(differential["candidate_win_rate"])
+        - float(differential["champion_win_rate"]),
+        rel_tol=0.0,
+        abs_tol=1e-15,
+    ) or not math.isclose(
+        float(differential["mcnemar_exact_two_sided_p"]),
+        mcnemar_p,
+        rel_tol=0.0,
+        abs_tol=1e-15,
+    ):
+        raise ContractError(
+            "external hard-negative differential does not match paired game outcomes"
+        )
+    comparisons = {
+        "candidate_win_rate": differential["candidate_win_rate"],
+        "delta": differential["delta"],
+        "incumbent_win_rate": differential["champion_win_rate"],
+        "matched_games": differential["matched_games"],
+        "matched_pairs": differential["matched_pairs"],
+        "mcnemar_exact_two_sided_p": differential["mcnemar_exact_two_sided_p"],
+    }
+    if any(raw[key] != value for key, value in comparisons.items()):
+        raise ContractError("external hard-negative summary drifts from its differential")
+    if (
+        isinstance(raw["matched_games"], bool)
+        or not isinstance(raw["matched_games"], int)
+        or isinstance(raw["matched_pairs"], bool)
+        or not isinstance(raw["matched_pairs"], int)
+        or raw["matched_pairs"] <= 0
+    ):
+        raise ContractError("external hard-negative cohort counts are malformed")
+    if (
+        candidate_report.get("candidate_win_rate") != raw["candidate_win_rate"]
+        or incumbent_report.get("candidate_win_rate") != raw["incumbent_win_rate"]
+        or candidate_report.get("complete_pairs") != raw["matched_pairs"]
+        or incumbent_report.get("complete_pairs") != raw["matched_pairs"]
+        or candidate_report.get("games_played") != raw["matched_games"]
+        or incumbent_report.get("games_played") != raw["matched_games"]
+        or raw["matched_games"] != 2 * raw["matched_pairs"]
+    ):
+        raise ContractError("external hard-negative cohort counts are inconsistent")
+    return {
+        "candidate_artifact": candidate_artifact,
+        "incumbent_artifact": incumbent_artifact,
+        "differential_artifact": differential_artifact,
+    }
+
+
+def _rich_hard_negative_selection_record(
+    path: Path,
+    payload: dict[str, Any],
+    *,
+    checkpoint: Path,
+    checkpoint_sha256: str,
+) -> dict[str, Any]:
+    _require_exact_keys(
+        payload,
+        RICH_HARD_NEGATIVE_SELECTION_FIELDS,
+        where="rich hard-negative selection evidence",
+    )
+    if payload["schema_version"] != "a1-hard-negative-selection-v1":
+        raise ContractError("hard-negative selection evidence schema is unsupported")
+    unhashed = dict(payload)
+    declared = unhashed.pop("selection_sha256")
+    if declared != _digest_value(unhashed):
+        raise ContractError("hard-negative selection evidence digest mismatch")
+    if (
+        payload["status"] != "selected"
+        or payload["selection_role"] != "hard_negative"
+        or payload["promotion_eligible"] is not False
+        or payload["promotion_decision"] != "not_authorized_nonparent_diagnostic"
+        or payload["registry_mutation_authorized"] is not False
+        or payload["opponent_pool_mutation_performed"] is not False
+    ):
+        raise ContractError("rich hard-negative selection is promotion-capable or inactive")
+    basis = payload["selection_basis"]
+    if not isinstance(basis, dict):
+        raise ContractError("rich hard-negative selection basis must be an object")
+    _require_exact_keys(
+        basis,
+        {"kind", "not_a_strength_promotion", "rationale"},
+        where="rich hard-negative selection basis",
+    )
+    if (
+        basis["kind"] != "architecture_diverse_near_peer"
+        or basis["not_a_strength_promotion"] is not True
+        or not isinstance(basis["rationale"], list)
+        or not basis["rationale"]
+        or any(not isinstance(item, str) or not item.strip() for item in basis["rationale"])
+    ):
+        raise ContractError("rich hard-negative selection basis is invalid")
+    limitations = payload["limitations"]
+    if (
+        not isinstance(limitations, list)
+        or not limitations
+        or any(not isinstance(item, str) or not item.strip() for item in limitations)
+    ):
+        raise ContractError("rich hard-negative limitations must be non-empty strings")
+    candidate = _verified_sized_artifact_ref(
+        payload["candidate"],
+        where="rich hard-negative candidate",
+        kind="hard_negative_candidate",
+    )
+    expected_checkpoint = checkpoint.expanduser().resolve(strict=True)
+    if (
+        Path(str(candidate["path"])) != expected_checkpoint
+        or candidate["sha256"] != checkpoint_sha256
+    ):
+        raise ContractError("hard-negative selection evidence binds different bytes")
+    incumbent = _verified_sized_artifact_ref(
+        payload["authoritative_incumbent"],
+        where="rich hard-negative authoritative incumbent",
+        kind="hard_negative_authoritative_incumbent",
+    )
+    bundle = _verified_sized_artifact_ref(
+        payload["candidate_bundle"],
+        where="rich hard-negative candidate bundle",
+        kind="hard_negative_candidate_bundle",
+    )
+    bundle_artifacts, bundle_files = _validate_hard_negative_bundle(
+        bundle, candidate=candidate, incumbent=incumbent
+    )
+    evidence = payload["evidence"]
+    if not isinstance(evidence, dict):
+        raise ContractError("rich hard-negative evidence must be an object")
+    _require_exact_keys(
+        evidence,
+        {"held_out_high_regret_v5", "matched_external_v5", "matched_internal_v5"},
+        where="rich hard-negative evidence",
+    )
+    held_out = _validate_held_out_hard_negative_evidence(
+        evidence["held_out_high_regret_v5"],
+        candidate=candidate,
+        incumbent=incumbent,
+    )
+    matched_external = _validate_external_hard_negative_evidence(
+        evidence["matched_external_v5"],
+        candidate=candidate,
+        incumbent=incumbent,
+    )
+    matched_internal = _validate_internal_hard_negative_evidence(
+        evidence["matched_internal_v5"],
+        candidate=candidate,
+        incumbent=incumbent,
+    )
+    record = _file_record(path, kind="hard_negative_selection")
+    record.update(
+        {
+            "selection_format": "rich-v1",
+            "selection_sha256": declared,
+            "candidate": candidate,
+            "authoritative_incumbent": incumbent,
+            "candidate_bundle": bundle,
+            "candidate_bundle_artifacts": bundle_artifacts,
+            "candidate_bundle_files": bundle_files,
+            "evidence": {
+                "held_out_high_regret_v5": held_out,
+                "matched_external_v5": matched_external,
+                "matched_internal_v5": matched_internal,
+            },
+        }
+    )
+    return record
+
+
+def _hard_negative_selection_record(
+    path: Path, *, checkpoint: Path, checkpoint_sha256: str
+) -> dict[str, Any]:
+    payload = _load_json(path)
+    rich_only = RICH_HARD_NEGATIVE_SELECTION_FIELDS - (
+        LEGACY_HARD_NEGATIVE_SELECTION_FIELDS | {"schema_version", "selection_sha256"}
+    )
+    if set(payload) & rich_only:
+        return _rich_hard_negative_selection_record(
+            path,
+            payload,
+            checkpoint=checkpoint,
+            checkpoint_sha256=checkpoint_sha256,
+        )
+    return _legacy_hard_negative_selection_record(
+        path,
+        payload,
+        checkpoint=checkpoint,
+        checkpoint_sha256=checkpoint_sha256,
+    )
+
+
+def _hard_negative_selection_artifacts(
+    selection: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    records = [dict(selection)]
+    if selection.get("selection_format") != "rich-v1":
+        evidence = selection.get("evaluation_evidence")
+        if not isinstance(evidence, dict):
+            raise ContractError("legacy hard-negative evaluation evidence is missing")
+        records.append(evidence)
+        return records
+    for key in ("candidate", "authoritative_incumbent", "candidate_bundle"):
+        record = selection.get(key)
+        if not isinstance(record, dict):
+            raise ContractError(f"rich hard-negative {key} binding is missing")
+        records.append(record)
+    artifacts = selection.get("candidate_bundle_artifacts")
+    files = selection.get("candidate_bundle_files")
+    evidence = selection.get("evidence")
+    if not isinstance(artifacts, dict) or not isinstance(files, list) or not isinstance(
+        evidence, dict
+    ):
+        raise ContractError("rich hard-negative sealed artifact graph is malformed")
+    records.extend(artifacts.values())
+    records.extend(files)
+    for section in evidence.values():
+        if not isinstance(section, dict):
+            raise ContractError("rich hard-negative sealed evidence section is malformed")
+        records.extend(section.values())
+    if any(not isinstance(record, dict) for record in records):
+        raise ContractError("rich hard-negative sealed artifact record is malformed")
+    return records
+
+
+def _bind_hard_negative_incumbent_to_producer(
+    records: Sequence[Mapping[str, Any]],
+) -> None:
+    producers = [record for record in records if record.get("role") == "producer"]
+    hard_negatives = [
+        record for record in records if record.get("role") == "hard_negative"
+    ]
+    if len(producers) != 1 or len(hard_negatives) != 1:
+        raise ContractError(
+            "rich hard-negative lineage requires one producer and one hard negative"
+        )
+    producer = producers[0]
+    hard = hard_negatives[0]
+    selection = hard.get("selection_evidence")
+    if not isinstance(selection, dict) or selection.get("selection_format") != "rich-v1":
+        return
+    incumbent = selection.get("authoritative_incumbent")
+    if not isinstance(incumbent, dict) or _artifact_identity(
+        incumbent
+    ) != _artifact_identity(producer):
+        raise ContractError(
+            "rich hard-negative authoritative incumbent is not the current producer"
+        )
 
 
 def _checkpoint_records(
@@ -2527,6 +3553,7 @@ def _bind_v3_checkpoint_lineage(
             "transaction_id": receipt_ref["transaction_id"],
         },
     }
+    _bind_hard_negative_incumbent_to_producer(records)
 
 
 def _verify_declared_source_artifacts(
@@ -5028,7 +6055,17 @@ def verify_lock(
                 selection = record.get("selection_evidence")
                 if not isinstance(selection, dict):
                     raise ContractError("v3 hard-negative selection evidence is missing")
-                _verify_artifact_records([selection, selection["evaluation_evidence"]])
+                rebuilt = _hard_negative_selection_record(
+                    Path(str(selection["path"])),
+                    checkpoint=Path(str(record["path"])),
+                    checkpoint_sha256=str(record["sha256"]),
+                )
+                if rebuilt != selection:
+                    raise ContractError("v3 hard-negative sealed evidence record drift")
+                _verify_artifact_records(
+                    _hard_negative_selection_artifacts(selection)
+                )
+        _bind_hard_negative_incumbent_to_producer(lock["checkpoints"])
     _verify_artifact_records([lock["provenance"]["guard_config"]])
     verify_code_records = (
         _verify_archived_code_provenance_records

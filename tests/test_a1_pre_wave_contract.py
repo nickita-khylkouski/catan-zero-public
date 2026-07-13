@@ -2817,3 +2817,651 @@ def test_promoted_producer_job_refuses_deployed_c_scale_mismatch() -> None:
         match=r"executes c_scale=0\.03.*deployed at c_scale=0\.1",
     ):
         contract._promoted_producer_job_identity(lock, job)
+
+
+def _json_artifact(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+
+
+def _sized_ref(path: Path) -> dict[str, object]:
+    return {
+        "path": str(path.resolve()),
+        "sha256": contract._sha256(path),  # noqa: SLF001
+        "bytes": path.stat().st_size,
+    }
+
+
+def _identity(path: Path) -> dict[str, str]:
+    return {
+        "path": str(path.resolve()),
+        "sha256": contract._sha256(path),  # noqa: SLF001
+    }
+
+
+def _rich_hard_negative_fixture(tmp_path: Path) -> dict[str, object]:
+    candidate = tmp_path / "candidate.pt"
+    incumbent = tmp_path / "incumbent.pt"
+    parent = tmp_path / "parent.pt"
+    candidate.write_bytes(b"candidate-checkpoint")
+    incumbent.write_bytes(b"incumbent-checkpoint")
+    parent.write_bytes(b"parent-checkpoint")
+    candidate_ref = _sized_ref(candidate)
+    incumbent_ref = _sized_ref(incumbent)
+
+    suite = tmp_path / "suite.json"
+    suite_payload = {
+        "held_out": True,
+        "schema_version": "a1-held-out-high-regret-suite-v4",
+        "selection": {"selected_pairs": 1},
+        "source_manifest": {"path": "/sealed/source.npz", "sha256": "sha256:source"},
+        "states": [{"decision_index": 5, "game_seed": 200, "pair_id": 0}],
+        "suite": "held_out_high_regret",
+        "validation_seed_manifest": {
+            "path": "/sealed/validation.json",
+            "sha256": "sha256:validation",
+        },
+    }
+    suite_payload["suite_sha256"] = contract._digest_value(suite_payload)  # noqa: SLF001
+    _json_artifact(suite, suite_payload)
+
+    engine_identity = {
+        "schema_version": "a1-high-regret-engine-identity-v1",
+        "repo_commit": "a" * 40,
+    }
+    evaluation_config = {
+        "candidate": str(candidate.resolve()),
+        "baseline": str(incumbent.resolve()),
+        "n_full": 128,
+    }
+    pair_diagnostics = {
+        "incomplete_pairs": 0,
+        "ll_pairs": 0,
+        "split_pairs": 1,
+        "ww_pairs": 0,
+    }
+    pentanomial = {
+        "decision": "continue",
+        "ll_pairs": 0,
+        "mean_pair_score": 0.5,
+        "pairs": 1,
+        "split_pairs": 1,
+        "ww_pairs": 0,
+    }
+    held_report = tmp_path / "held-report.json"
+    _json_artifact(
+        held_report,
+        {
+            "candidate": _identity(candidate),
+            "champion": _identity(incumbent),
+            "engine_identity": engine_identity,
+            "errors": [],
+            "evaluation_config": evaluation_config,
+            "games": [
+                {
+                    "archived_decision_index": 5,
+                    "archived_game_seed": 200,
+                    "candidate_won": True,
+                    "error": None,
+                    "game_seed": 200,
+                    "orientation": "candidate_red",
+                    "pair_id": 0,
+                    "terminated": True,
+                    "truncated": False,
+                },
+                {
+                    "archived_decision_index": 5,
+                    "archived_game_seed": 200,
+                    "candidate_won": False,
+                    "error": None,
+                    "game_seed": 200,
+                    "orientation": "candidate_blue",
+                    "pair_id": 0,
+                    "terminated": True,
+                    "truncated": False,
+                },
+            ],
+            "held_out": True,
+            "pair_diagnostics": pair_diagnostics,
+            "pentanomial_sprt": pentanomial,
+            "planned_engine_identity": engine_identity,
+            "schema_version": "a1-held-out-high-regret-report-v1",
+            "suite": "held_out_high_regret",
+            "suite_manifest": _identity(suite),
+        },
+    )
+
+    internal_report = tmp_path / "internal-report.json"
+    internal_payload = {
+        "baseline": _identity(incumbent),
+        "baseline_wins": 1,
+        "candidate": _identity(candidate),
+        "candidate_win_rate": 0.5,
+        "candidate_wins": 1,
+        "complete_pairs": 1,
+        "errors": [],
+        "games": 2,
+        "pentanomial_sprt": {"decision": "continue"},
+        "registry_mutation_authorized": False,
+        "schema_version": "a1-complete-internal-cohort-receipt-v1",
+        "superiority_pentanomial_sprt": {"decision": "continue"},
+        "truncations": 0,
+    }
+    internal_payload["receipt_sha256"] = contract._digest_value(internal_payload)  # noqa: SLF001
+    _json_artifact(internal_report, internal_payload)
+
+    external_search = {"n_full": 128, "public_observation": True}
+
+    def external_report(
+        checkpoint: Path, outcomes: list[bool]
+    ) -> dict:
+        wins = sum(outcomes)
+        games = [
+            {
+                "candidate_won": won,
+                "engine_divergence": False,
+                "error": None,
+                "game_seed": 100 + index // 2,
+                "orientation": (
+                    "candidate_first" if index % 2 == 0 else "candidate_second"
+                ),
+                "source_pair_id": index // 2,
+                "terminated": True,
+                "truncated": False,
+            }
+            for index, won in enumerate(outcomes)
+        ]
+        return {
+            "base_seed": 100,
+            "baseline_bot": "catanatron_value",
+            "baseline_wins": len(games) - wins,
+            "candidate_checkpoint": str(checkpoint.resolve()),
+            "candidate_checkpoint_sha256": contract._sha256(checkpoint),  # noqa: SLF001
+            "candidate_win_rate": wins / len(games),
+            "candidate_wins": wins,
+            "complete_pairs": len(games) // 2,
+            "effective_search_config": external_search,
+            "errors": [],
+            "evaluation_binding": {
+                "authoritative_incumbent": {
+                    **_identity(incumbent),
+                    "version": 5,
+                },
+                "baseline": _identity(incumbent),
+                "schema_version": "a1-evaluation-baseline-binding-v2",
+            },
+            "fleet_merge": {
+                "checkpoint": _identity(checkpoint),
+                "effective_search_config_sha256": contract._digest_value(  # noqa: SLF001
+                    external_search
+                ),
+                "schema_version": "a1-fleet-evaluation-pool-v1",
+            },
+            "games": games,
+            "games_errored": 0,
+            "games_played": len(games),
+            "games_truncated": 0,
+            "search_config": external_search,
+            "worker_errors": [],
+        }
+
+    external_candidate = tmp_path / "external-candidate.json"
+    external_incumbent = tmp_path / "external-incumbent.json"
+    _json_artifact(
+        external_candidate,
+        external_report(candidate, [True] * 12 + [False] * 8),
+    )
+    _json_artifact(
+        external_incumbent,
+        external_report(incumbent, [True] * 11 + [False] * 9),
+    )
+    differential = tmp_path / "external-differential.json"
+    _json_artifact(
+        differential,
+        {
+            "both_lose": 8,
+            "both_win": 11,
+            "candidate_only_wins": 1,
+            "candidate_win_rate": 0.6,
+            "champion_only_wins": 0,
+            "champion_win_rate": 0.55,
+            "delta": 0.05,
+            "matched_games": 20,
+            "matched_pairs": 10,
+            "mcnemar_exact_two_sided_p": 1.0,
+            "paired_seed_delta_bootstrap_95ci": [-0.1, 0.2],
+            "schema_version": "a1-matched-external-differential-v1",
+        },
+    )
+
+    bundle_dir = tmp_path / "bundle"
+    bundle_file = bundle_dir / "training" / "plan.json"
+    bundle_file.parent.mkdir(parents=True)
+    bundle_file.write_text('{"plan":"sealed"}\n', encoding="utf-8")
+    bundle = bundle_dir / "MANIFEST.json"
+    _json_artifact(
+        bundle,
+        {
+            "artifacts": {
+                "authoritative_v5": incumbent_ref,
+                "candidate": candidate_ref,
+                "exact_parent": _sized_ref(parent),
+            },
+            "candidate_role": "experimental_nonpromotable",
+            "code_commits": {"branch_binding": "b" * 40},
+            "evaluation": {"snapshot": "informational_only"},
+            "files": [
+                {
+                    "path": "training/plan.json",
+                    "sha256": contract._sha256(bundle_file),  # noqa: SLF001
+                    "bytes": bundle_file.stat().st_size,
+                }
+            ],
+            "registry_mutation_authorized": False,
+            "schema_version": "aux-pointer-candidate-bundle-v1",
+        },
+    )
+
+    selection = tmp_path / "selection.json"
+    selection_payload = {
+        "authoritative_incumbent": incumbent_ref,
+        "candidate": candidate_ref,
+        "candidate_bundle": _sized_ref(bundle),
+        "evidence": {
+            "held_out_high_regret_v5": {
+                "artifact": _sized_ref(held_report),
+                "complete_candidate_win_rate": 0.5,
+                "complete_candidate_wins": 1,
+                "complete_incumbent_wins": 1,
+                "complete_pairs": 1,
+                "engine_identity": engine_identity,
+                "evaluation_config": evaluation_config,
+                "incomplete_pairs": 0,
+                "pair_diagnostics": pair_diagnostics,
+                "pentanomial_sprt": pentanomial,
+                "suite_manifest": _identity(suite),
+                "suite_pairs": 1,
+            },
+            "matched_external_v5": {
+                "candidate_artifact": _sized_ref(external_candidate),
+                "candidate_win_rate": 0.6,
+                "delta": 0.05,
+                "differential_artifact": _sized_ref(differential),
+                "incumbent_artifact": _sized_ref(external_incumbent),
+                "incumbent_win_rate": 0.55,
+                "matched_games": 20,
+                "matched_pairs": 10,
+                "mcnemar_exact_two_sided_p": 1.0,
+            },
+            "matched_internal_v5": {
+                "artifact": _sized_ref(internal_report),
+                "candidate_win_rate": 0.5,
+                "candidate_wins": 1,
+                "complete_pairs": 1,
+                "games": 2,
+                "incumbent_wins": 1,
+                "pentanomial_decision": "continue",
+                "strict_superiority_decision": "continue",
+            },
+        },
+        "limitations": ["selection authorizes no champion or registry mutation"],
+        "opponent_pool_mutation_performed": False,
+        "promotion_decision": "not_authorized_nonparent_diagnostic",
+        "promotion_eligible": False,
+        "registry_mutation_authorized": False,
+        "schema_version": "a1-hard-negative-selection-v1",
+        "selection_basis": {
+            "kind": "architecture_diverse_near_peer",
+            "not_a_strength_promotion": True,
+            "rationale": ["independent near-peer training pressure"],
+        },
+        "selection_role": "hard_negative",
+        "status": "selected",
+    }
+    selection_payload["selection_sha256"] = contract._digest_value(selection_payload)  # noqa: SLF001
+    _json_artifact(selection, selection_payload)
+    return {
+        "bundle": bundle,
+        "candidate": candidate,
+        "differential": differential,
+        "external_candidate": external_candidate,
+        "external_incumbent": external_incumbent,
+        "held_report": held_report,
+        "incumbent": incumbent,
+        "internal_report": internal_report,
+        "selection": selection,
+        "suite": suite,
+    }
+
+
+def _parse_rich_hard_negative(fixture: dict[str, object]) -> dict:
+    candidate = fixture["candidate"]
+    assert isinstance(candidate, Path)
+    selection = fixture["selection"]
+    assert isinstance(selection, Path)
+    return contract._hard_negative_selection_record(  # noqa: SLF001
+        selection,
+        checkpoint=candidate,
+        checkpoint_sha256=contract._sha256(candidate),  # noqa: SLF001
+    )
+
+
+def test_rich_hard_negative_selection_binds_complete_evidence_graph(
+    tmp_path: Path,
+) -> None:
+    fixture = _rich_hard_negative_fixture(tmp_path)
+    record = _parse_rich_hard_negative(fixture)
+
+    assert record["selection_format"] == "rich-v1"
+    assert len(record["candidate_bundle_files"]) == 1
+    assert len(contract._hard_negative_selection_artifacts(record)) == 14  # noqa: SLF001
+    producer = {
+        "role": "producer",
+        **_identity(fixture["incumbent"]),
+    }
+    hard_negative = {"role": "hard_negative", "selection_evidence": record}
+    contract._bind_hard_negative_incumbent_to_producer(  # noqa: SLF001
+        [producer, hard_negative]
+    )
+
+
+def test_legacy_hard_negative_selection_remains_exact(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "legacy.pt"
+    checkpoint.write_bytes(b"legacy-checkpoint")
+    evidence = tmp_path / "legacy-evidence.json"
+    _json_artifact(evidence, {"result": "near_peer"})
+    selection = tmp_path / "legacy-selection.json"
+    payload = {
+        "schema_version": "a1-hard-negative-selection-v1",
+        "checkpoint": _identity(checkpoint),
+        "selection_reason": "independent near peer",
+        "evaluation_evidence": _identity(evidence),
+    }
+    payload["selection_sha256"] = contract._digest_value(payload)  # noqa: SLF001
+    _json_artifact(selection, payload)
+
+    record = contract._hard_negative_selection_record(  # noqa: SLF001
+        selection,
+        checkpoint=checkpoint,
+        checkpoint_sha256=contract._sha256(checkpoint),  # noqa: SLF001
+    )
+    assert "selection_format" not in record
+    payload["unchecked"] = True
+    payload["selection_sha256"] = contract._digest_value(  # noqa: SLF001
+        {key: value for key, value in payload.items() if key != "selection_sha256"}
+    )
+    _json_artifact(selection, payload)
+    with pytest.raises(contract.ContractError, match="fields mismatch"):
+        contract._hard_negative_selection_record(  # noqa: SLF001
+            selection,
+            checkpoint=checkpoint,
+            checkpoint_sha256=contract._sha256(checkpoint),  # noqa: SLF001
+        )
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "root_extra",
+        "root_missing",
+        "evidence_extra",
+        "evidence_missing",
+        "inactive",
+        "wrong_role",
+        "promotion_eligible",
+        "registry_mutation",
+        "pool_mutation",
+        "promotion_decision",
+        "strength_promotion",
+        "wrong_basis",
+        "empty_limitations",
+        "candidate_bytes",
+        "candidate_hash",
+        "candidate_checkpoint",
+    ],
+)
+def test_rich_hard_negative_selection_rejects_root_semantic_drift(
+    tmp_path: Path, case: str
+) -> None:
+    fixture = _rich_hard_negative_fixture(tmp_path)
+    selection = fixture["selection"]
+    assert isinstance(selection, Path)
+    payload = json.loads(selection.read_text(encoding="utf-8"))
+    if case == "root_extra":
+        payload["unchecked"] = True
+    elif case == "root_missing":
+        payload.pop("limitations")
+    elif case == "evidence_extra":
+        payload["evidence"]["unchecked"] = {}
+    elif case == "evidence_missing":
+        payload["evidence"].pop("matched_internal_v5")
+    elif case == "inactive":
+        payload["status"] = "queued"
+    elif case == "wrong_role":
+        payload["selection_role"] = "history"
+    elif case == "promotion_eligible":
+        payload["promotion_eligible"] = True
+    elif case == "registry_mutation":
+        payload["registry_mutation_authorized"] = True
+    elif case == "pool_mutation":
+        payload["opponent_pool_mutation_performed"] = True
+    elif case == "promotion_decision":
+        payload["promotion_decision"] = "promote"
+    elif case == "strength_promotion":
+        payload["selection_basis"]["not_a_strength_promotion"] = False
+    elif case == "wrong_basis":
+        payload["selection_basis"]["kind"] = "highest_win_rate"
+    elif case == "empty_limitations":
+        payload["limitations"] = []
+    elif case == "candidate_bytes":
+        payload["candidate"]["bytes"] += 1
+    elif case == "candidate_hash":
+        payload["candidate"]["sha256"] = "sha256:" + "0" * 64
+    elif case == "candidate_checkpoint":
+        payload["candidate"] = _sized_ref(fixture["incumbent"])
+    payload.pop("selection_sha256")
+    payload["selection_sha256"] = contract._digest_value(payload)  # noqa: SLF001
+    _json_artifact(selection, payload)
+
+    with pytest.raises(contract.ContractError):
+        _parse_rich_hard_negative(fixture)
+
+
+def test_rich_hard_negative_selection_rejects_semantic_digest_drift(
+    tmp_path: Path,
+) -> None:
+    fixture = _rich_hard_negative_fixture(tmp_path)
+    selection = fixture["selection"]
+    assert isinstance(selection, Path)
+    payload = json.loads(selection.read_text(encoding="utf-8"))
+    payload["limitations"].append("unhashed mutation")
+    _json_artifact(selection, payload)
+
+    with pytest.raises(contract.ContractError, match="digest mismatch"):
+        _parse_rich_hard_negative(fixture)
+
+
+@pytest.mark.parametrize(
+    "case", ["schema", "role", "registry_mutation", "candidate", "incumbent"]
+)
+def test_rich_hard_negative_selection_rejects_bundle_drift(
+    tmp_path: Path, case: str
+) -> None:
+    fixture = _rich_hard_negative_fixture(tmp_path)
+    bundle = fixture["bundle"]
+    selection = fixture["selection"]
+    assert isinstance(bundle, Path) and isinstance(selection, Path)
+    payload = json.loads(bundle.read_text(encoding="utf-8"))
+    if case == "schema":
+        payload["schema_version"] = "unknown"
+    elif case == "role":
+        payload["candidate_role"] = "promotion_candidate"
+    elif case == "registry_mutation":
+        payload["registry_mutation_authorized"] = True
+    elif case == "candidate":
+        payload["artifacts"]["candidate"] = _sized_ref(fixture["incumbent"])
+    elif case == "incumbent":
+        payload["artifacts"]["authoritative_v5"] = _sized_ref(fixture["candidate"])
+    _json_artifact(bundle, payload)
+    selection_payload = json.loads(selection.read_text(encoding="utf-8"))
+    selection_payload["candidate_bundle"] = _sized_ref(bundle)
+    selection_payload.pop("selection_sha256")
+    selection_payload["selection_sha256"] = contract._digest_value(  # noqa: SLF001
+        selection_payload
+    )
+    _json_artifact(selection, selection_payload)
+
+    with pytest.raises(contract.ContractError):
+        _parse_rich_hard_negative(fixture)
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "held_candidate",
+        "internal_incumbent",
+        "internal_rate",
+        "external_candidate",
+        "external_incumbent",
+        "external_cohort",
+        "external_search",
+        "differential",
+        "suite",
+        "held_suite_identity",
+        "held_pair_diagnostics",
+    ],
+)
+def test_rich_hard_negative_selection_rejects_source_identity_drift(
+    tmp_path: Path, case: str
+) -> None:
+    fixture = _rich_hard_negative_fixture(tmp_path)
+    selection = fixture["selection"]
+    assert isinstance(selection, Path)
+    selection_payload = json.loads(selection.read_text(encoding="utf-8"))
+    if case == "held_candidate":
+        artifact = fixture["held_report"]
+        section = selection_payload["evidence"]["held_out_high_regret_v5"]
+        payload = json.loads(artifact.read_text(encoding="utf-8"))
+        payload["candidate"] = _identity(fixture["incumbent"])
+        _json_artifact(artifact, payload)
+        section["artifact"] = _sized_ref(artifact)
+    elif case == "internal_incumbent":
+        artifact = fixture["internal_report"]
+        section = selection_payload["evidence"]["matched_internal_v5"]
+        payload = json.loads(artifact.read_text(encoding="utf-8"))
+        payload["baseline"] = _identity(fixture["candidate"])
+        payload.pop("receipt_sha256")
+        payload["receipt_sha256"] = contract._digest_value(payload)  # noqa: SLF001
+        _json_artifact(artifact, payload)
+        section["artifact"] = _sized_ref(artifact)
+    elif case == "internal_rate":
+        artifact = fixture["internal_report"]
+        section = selection_payload["evidence"]["matched_internal_v5"]
+        payload = json.loads(artifact.read_text(encoding="utf-8"))
+        payload["candidate_win_rate"] = 0.75
+        payload.pop("receipt_sha256")
+        payload["receipt_sha256"] = contract._digest_value(payload)  # noqa: SLF001
+        _json_artifact(artifact, payload)
+        section["candidate_win_rate"] = 0.75
+        section["artifact"] = _sized_ref(artifact)
+    elif case in {"external_candidate", "external_incumbent"}:
+        key = case
+        artifact = fixture[key]
+        section = selection_payload["evidence"]["matched_external_v5"]
+        payload = json.loads(artifact.read_text(encoding="utf-8"))
+        wrong = fixture["incumbent"] if case == "external_candidate" else fixture["candidate"]
+        payload["candidate_checkpoint"] = str(wrong.resolve())
+        payload["candidate_checkpoint_sha256"] = contract._sha256(wrong)  # noqa: SLF001
+        payload["fleet_merge"]["checkpoint"] = _identity(wrong)
+        _json_artifact(artifact, payload)
+        section[f"{key.removeprefix('external_')}_artifact"] = _sized_ref(artifact)
+    elif case == "external_cohort":
+        artifact = fixture["external_incumbent"]
+        section = selection_payload["evidence"]["matched_external_v5"]
+        payload = json.loads(artifact.read_text(encoding="utf-8"))
+        payload["games"][0]["game_seed"] += 1_000
+        _json_artifact(artifact, payload)
+        section["incumbent_artifact"] = _sized_ref(artifact)
+    elif case == "external_search":
+        artifact = fixture["external_incumbent"]
+        section = selection_payload["evidence"]["matched_external_v5"]
+        payload = json.loads(artifact.read_text(encoding="utf-8"))
+        payload["effective_search_config"]["n_full"] = 256
+        payload["search_config"] = payload["effective_search_config"]
+        payload["fleet_merge"]["effective_search_config_sha256"] = (
+            contract._digest_value(payload["effective_search_config"])  # noqa: SLF001
+        )
+        _json_artifact(artifact, payload)
+        section["incumbent_artifact"] = _sized_ref(artifact)
+    elif case == "differential":
+        artifact = fixture["differential"]
+        section = selection_payload["evidence"]["matched_external_v5"]
+        payload = json.loads(artifact.read_text(encoding="utf-8"))
+        payload["delta"] = 0.9
+        _json_artifact(artifact, payload)
+        section["differential_artifact"] = _sized_ref(artifact)
+    elif case in {"suite", "held_suite_identity"}:
+        suite = fixture["suite"]
+        payload = json.loads(suite.read_text(encoding="utf-8"))
+        if case == "suite":
+            payload["held_out"] = False
+        else:
+            payload["states"][0]["game_seed"] += 1
+        payload.pop("suite_sha256")
+        payload["suite_sha256"] = contract._digest_value(payload)  # noqa: SLF001
+        _json_artifact(suite, payload)
+        held = fixture["held_report"]
+        held_payload = json.loads(held.read_text(encoding="utf-8"))
+        held_payload["suite_manifest"] = _identity(suite)
+        _json_artifact(held, held_payload)
+        section = selection_payload["evidence"]["held_out_high_regret_v5"]
+        section["suite_manifest"] = _identity(suite)
+        section["artifact"] = _sized_ref(held)
+    elif case == "held_pair_diagnostics":
+        held = fixture["held_report"]
+        section = selection_payload["evidence"]["held_out_high_regret_v5"]
+        payload = json.loads(held.read_text(encoding="utf-8"))
+        payload["pair_diagnostics"]["split_pairs"] = 0
+        payload["pair_diagnostics"]["ww_pairs"] = 1
+        _json_artifact(held, payload)
+        section["pair_diagnostics"] = payload["pair_diagnostics"]
+        section["artifact"] = _sized_ref(held)
+    selection_payload.pop("selection_sha256")
+    selection_payload["selection_sha256"] = contract._digest_value(  # noqa: SLF001
+        selection_payload
+    )
+    _json_artifact(selection, selection_payload)
+
+    with pytest.raises(contract.ContractError):
+        _parse_rich_hard_negative(fixture)
+
+
+def test_rich_hard_negative_incumbent_must_match_current_producer(
+    tmp_path: Path,
+) -> None:
+    fixture = _rich_hard_negative_fixture(tmp_path)
+    record = _parse_rich_hard_negative(fixture)
+    producer = {"role": "producer", **_identity(fixture["candidate"])}
+    hard_negative = {"role": "hard_negative", "selection_evidence": record}
+
+    with pytest.raises(contract.ContractError, match="current producer"):
+        contract._bind_hard_negative_incumbent_to_producer(  # noqa: SLF001
+            [producer, hard_negative]
+        )
+
+
+def test_rich_hard_negative_replay_detects_later_artifact_drift(
+    tmp_path: Path,
+) -> None:
+    fixture = _rich_hard_negative_fixture(tmp_path)
+    record = _parse_rich_hard_negative(fixture)
+    differential = fixture["differential"]
+    assert isinstance(differential, Path)
+    differential.write_text('{"tampered":true}\n', encoding="utf-8")
+
+    with pytest.raises(contract.ContractError, match="artifact drift"):
+        contract._verify_artifact_records(  # noqa: SLF001
+            contract._hard_negative_selection_artifacts(record)  # noqa: SLF001
+        )
