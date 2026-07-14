@@ -117,6 +117,23 @@ def test_enabled_heads_emit_expected_shapes():
         assert torch.isfinite(outputs[key]).all()
 
 
+def test_inference_can_skip_training_only_auxiliary_readouts_bit_exactly():
+    """Search may omit CAT-100 work without changing consumed outputs."""
+
+    torch.manual_seed(17)
+    model = EntityGraphNet(
+        _config(aux_subgoal_heads=True, aux_settlement_pointer_head=True)
+    ).eval()
+    batch = _synthetic_batch(batch_size=2)
+    with torch.no_grad():
+        full = model(batch, return_aux_subgoals=True)
+        search = model(batch, return_aux_subgoals=False)
+    assert all(key in full for key in _AUX_KEYS)
+    assert all(key not in search for key in _AUX_KEYS)
+    for key in ("logits", "value", "final_vp"):
+        assert torch.equal(full[key], search[key]), key
+
+
 def test_settlement_pointer_follows_vertex_rows_but_robber_stays_canonical():
     """Only the vertex target lacks an identity-bearing input feature.
 
@@ -230,6 +247,83 @@ def test_aux_head_gradients_flow():
     ):
         grads = [p.grad for p in head.parameters() if p.grad is not None]
         assert grads and any(g.abs().sum().item() > 0.0 for g in grads)
+
+
+def test_active_aux_heads_do_not_perturb_common_training_rng():
+    """AUX2 may add gradients, but not change later shared-trunk dropout masks."""
+
+    torch.manual_seed(0)
+    control = EntityGraphNet(_config(aux_subgoal_heads=False, dropout=0.25))
+    torch.manual_seed(0)
+    treatment = EntityGraphNet(_config(aux_subgoal_heads=True, dropout=0.25))
+    missing, unexpected = treatment.load_state_dict(control.state_dict(), strict=False)
+    assert unexpected == []
+    assert missing and all(name.startswith("aux_") for name in missing)
+    for model, aux_weight in ((control, 0.0), (treatment, 0.02)):
+        train_bc._freeze_inactive_training_heads(
+            model,
+            final_vp_loss_weight=0.1,
+            value_uncertainty_loss_weight=0.0,
+            value_categorical_loss_weight=0.0,
+            aux_subgoal_loss_weight=aux_weight,
+            belief_resource_loss_weight=0.0,
+        )
+        model.train()
+    batch = _synthetic_batch(batch_size=2)
+
+    def trajectory(model):
+        torch.manual_seed(12345)
+        first = model(batch)
+        second = model(batch)
+        return first, second, torch.random.get_rng_state()
+
+    control_first, control_second, control_rng = trajectory(control)
+    treatment_first, treatment_second, treatment_rng = trajectory(treatment)
+    for key in ("logits", "value", "final_vp"):
+        assert torch.equal(control_first[key], treatment_first[key]), key
+        assert torch.equal(control_second[key], treatment_second[key]), key
+    assert torch.equal(control_rng, treatment_rng)
+
+
+def test_heads_present_aux0_preserves_shared_adamw_update() -> None:
+    """Freezing AUX0 changes no shared parameter update versus heads absent."""
+
+    torch.manual_seed(0)
+    absent = EntityGraphNet(_config(aux_subgoal_heads=False, dropout=0.25))
+    torch.manual_seed(0)
+    present = EntityGraphNet(_config(aux_subgoal_heads=True, dropout=0.25))
+    missing, unexpected = present.load_state_dict(absent.state_dict(), strict=False)
+    assert unexpected == []
+    assert missing and all(name.startswith("aux_") for name in missing)
+    for model in (absent, present):
+        train_bc._freeze_inactive_training_heads(
+            model,
+            final_vp_loss_weight=0.1,
+            value_uncertainty_loss_weight=0.0,
+            value_categorical_loss_weight=0.0,
+            aux_subgoal_loss_weight=0.0,
+            belief_resource_loss_weight=0.0,
+        )
+        model.train()
+    batch = _synthetic_batch(batch_size=2)
+
+    def step(model):
+        optimizer = torch.optim.AdamW(
+            (parameter for parameter in model.parameters() if parameter.requires_grad),
+            lr=3e-5,
+            weight_decay=0.1,
+        )
+        torch.manual_seed(991)
+        outputs = model(batch)
+        (outputs["logits"].sum() + outputs["value"].sum()).backward()
+        optimizer.step()
+
+    step(absent)
+    step(present)
+    absent_state = absent.state_dict()
+    present_state = present.state_dict()
+    for name in absent_state:
+        assert torch.equal(absent_state[name], present_state[name]), name
 
 
 def test_inactive_aux_heads_do_not_perturb_main_training_rng():

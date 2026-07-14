@@ -8,6 +8,9 @@ corpus carries none of the aux target columns (requested-but-inert footgun).
 
 from __future__ import annotations
 
+import copy
+import json
+import random
 import sys
 from pathlib import Path
 
@@ -268,3 +271,181 @@ def test_zero_aux_weight_does_not_require_versioned_data():
         "enabled": False,
         "loss_weight": 0.0,
     }
+
+
+class _GeometryPolicy:
+    def __init__(self) -> None:
+        self.model = torch.nn.Module()
+        self.model.hex_encoder = torch.nn.Linear(2, 1, bias=False)
+
+
+def _ddp_geometry_worker(rank: int, world_size: int, init_file: str, out_dir: str) -> None:
+    import torch.distributed as dist
+
+    dist.init_process_group(
+        "gloo",
+        rank=rank,
+        world_size=world_size,
+        init_method=f"file://{init_file}",
+    )
+    try:
+        policy = _GeometryPolicy()
+        policy.model = torch.nn.parallel.DistributedDataParallel(policy.model)
+        weight = policy.model.module.hex_encoder.weight[0]
+        # The two rank-local objectives have deliberately different directions.
+        # The helper must reconstruct the global gradient by all-reducing the
+        # autograd.grad results (DDP does not do that for us).
+        if rank == 0:
+            main = 2.0 * weight[0]
+            aux = 2.0 * weight[0]
+        else:
+            main = 2.0 * weight[1]
+            aux = -2.0 * weight[1]
+        result = train_bc._aux_shared_trunk_gradient_geometry(
+            policy,
+            main_objective=main,
+            unit_aux_objective=aux,
+        )
+        Path(out_dir, f"rank-{rank}.json").write_text(
+            json.dumps(result, sort_keys=True), encoding="utf-8"
+        )
+    finally:
+        dist.destroy_process_group()
+
+
+def test_aux_geometry_is_exact_no_update_on_authenticated_trunk_surface():
+    policy = _GeometryPolicy()
+    weight = policy.model.hex_encoder.weight[0]
+    main = 3.0 * weight[0] + 4.0 * weight[1]
+    aux = -4.0 * weight[0] + 3.0 * weight[1]
+
+    result = train_bc._aux_shared_trunk_gradient_geometry(
+        policy,
+        main_objective=main,
+        unit_aux_objective=aux,
+    )
+
+    assert result["schema_version"] == "a1-aux-global-gradient-geometry-batch-v1"
+    assert result["updates_weights"] is False
+    assert result["same_forward"] is True
+    assert result["world_size"] == 1
+    assert result["main_gradient_norm"] == pytest.approx(5.0)
+    assert result["unit_aux_gradient_norm"] == pytest.approx(5.0)
+    assert result["main_gradient_sq_sum"] == pytest.approx(25.0)
+    assert result["unit_aux_gradient_sq_sum"] == pytest.approx(25.0)
+    assert result["gradient_dot_product"] == pytest.approx(0.0)
+    assert result["gradient_cosine"] == pytest.approx(0.0)
+    assert result["opposing_coordinate_fraction"] == pytest.approx(0.5)
+    assert result["parameter_surface"] == [
+        {
+            "name": "hex_encoder.weight",
+            "shape": [1, 2],
+            "dtype": "torch.float32",
+        }
+    ]
+    assert result["parameter_surface_sha256"].startswith("sha256:")
+    assert policy.model.hex_encoder.weight.grad is None
+
+
+def test_aux_geometry_refuses_preexisting_gradients():
+    policy = _GeometryPolicy()
+    weight = policy.model.hex_encoder.weight[0]
+    weight.sum().backward()
+
+    with pytest.raises(RuntimeError, match="empty Parameter.grad"):
+        train_bc._aux_shared_trunk_gradient_geometry(
+            policy,
+            main_objective=weight.sum(),
+            unit_aux_objective=weight.square().sum(),
+        )
+
+
+def test_aux_geometry_manually_reconstructs_global_ddp_gradient(tmp_path: Path):
+    import torch.multiprocessing as mp
+
+    init_file = tmp_path / "gloo-init"
+    mp.spawn(
+        _ddp_geometry_worker,
+        args=(2, str(init_file), str(tmp_path)),
+        nprocs=2,
+        join=True,
+    )
+    results = [
+        json.loads((tmp_path / f"rank-{rank}.json").read_text(encoding="utf-8"))
+        for rank in range(2)
+    ]
+    assert results[0] == results[1]
+    result = results[0]
+    assert result["world_size"] == 2
+    assert result["aggregation"] == (
+        "manual_all_reduce_then_world_average_of_ddp_scaled_gradients"
+    )
+    assert result["main_gradient_sq_sum"] == pytest.approx(2.0)
+    assert result["unit_aux_gradient_sq_sum"] == pytest.approx(2.0)
+    assert result["gradient_dot_product"] == pytest.approx(0.0)
+    assert result["gradient_cosine"] == pytest.approx(0.0)
+
+
+def test_five_batch_geometry_rng_transaction_restores_all_streams_exactly():
+    numpy_rng = np.random.default_rng(424242)
+    random.seed(37)
+    torch.manual_seed(91)
+
+    python_before = random.getstate()
+    numpy_before = json.loads(json.dumps(numpy_rng.bit_generator.state))
+    torch_before = torch.get_rng_state().clone()
+    observed_batches = []
+    with train_bc._isolated_aux_geometry_rng_transaction(
+        numpy_generators={"probe_order": numpy_rng}
+    ) as evidence:
+        for batch_index in range(5):
+            observed_batches.append(
+                (
+                    batch_index,
+                    random.random(),
+                    numpy_rng.integers(0, 2**31, size=8).tolist(),
+                    torch.rand(8).tolist(),
+                )
+            )
+
+    assert len({tuple(row[2]) for row in observed_batches}) == 5
+    assert len({tuple(row[3]) for row in observed_batches}) == 5
+    assert random.getstate() == python_before
+    assert numpy_rng.bit_generator.state == numpy_before
+    assert torch.equal(torch.get_rng_state(), torch_before)
+    assert evidence["scope"] == "one_complete_ordered_five_batch_probe"
+    assert evidence["restore_frequency"] == "once_after_all_five_batches"
+    assert evidence["restored_exactly"] is True
+    assert (
+        evidence["before"]["state_sha256"]
+        != evidence["after_probe"]["state_sha256"]
+    )
+    assert (
+        evidence["before"]["state_sha256"]
+        == evidence["after_restore"]["state_sha256"]
+    )
+
+
+def test_geometry_rng_transaction_restores_after_probe_exception():
+    numpy_rng = np.random.Generator(np.random.MT19937(123))
+    random.seed(17)
+    torch.manual_seed(29)
+    python_before = random.getstate()
+    numpy_before = copy.deepcopy(numpy_rng.bit_generator.state)
+    torch_before = torch.get_rng_state().clone()
+
+    with pytest.raises(ValueError, match="synthetic probe failure"):
+        with train_bc._isolated_aux_geometry_rng_transaction(
+            numpy_generators={"mt19937": numpy_rng}
+        ):
+            random.random()
+            numpy_rng.random(16)
+            torch.rand(16)
+            raise ValueError("synthetic probe failure")
+
+    assert random.getstate() == python_before
+    assert np.array_equal(
+        numpy_rng.bit_generator.state["state"]["key"],
+        numpy_before["state"]["key"],
+    )
+    assert torch.equal(torch.get_rng_state(), torch_before)

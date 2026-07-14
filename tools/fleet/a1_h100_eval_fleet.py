@@ -17,7 +17,9 @@ adjacent lanes and assign both sides the exact same seed interval.
 from __future__ import annotations
 
 import argparse
+import copy
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import dataclasses
 import fcntl
 import hashlib
 import json
@@ -38,6 +40,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from tools import a1_evaluation_pool as evaluation_pool  # noqa: E402
+from catan_zero.rl.pipeline_configs import EvalConfig  # noqa: E402
 from tools.champion_registry import ChampionRegistry  # noqa: E402
 from tools.prelaunch_guard import VAL_ONLY_SEED_RANGE  # noqa: E402
 
@@ -2023,11 +2026,87 @@ def _preflight_command(
     return "\n".join(lines)
 
 
+def _report_validation_command(job: dict[str, Any]) -> str:
+    """Render a stdlib-only semantic completion check for one remote lane."""
+
+    phase = str(job["phase"])
+    if phase not in {"internal", "external"}:
+        raise FleetError(f"unknown evaluation job phase {phase!r}")
+    pairs = int(job["pairs"])
+    if pairs <= 0:
+        raise FleetError("evaluation job pairs must be positive")
+    orientations = (
+        ("candidate_red", "candidate_blue")
+        if phase == "internal"
+        else ("candidate_first", "candidate_second")
+    )
+    report = str(job["report"])
+    python = str(job["argv"][0])
+    program = f"""import json, sys
+try:
+    with open({report!r}, encoding="utf-8") as handle:
+        report = json.load(handle)
+    games = report.get("games")
+    pairs = {pairs!r}
+    expected_games = 2 * pairs
+    exact = lambda name, value: type(report.get(name)) is int and report[name] == value
+    ok = isinstance(report, dict) and isinstance(games, list)
+    ok = ok and type(report.get("pairs_requested")) is int and report["pairs_requested"] == pairs
+    ok = ok and len(games) == expected_games
+    ok = ok and exact("games_played", expected_games)
+    ok = ok and exact("games_with_winner", expected_games)
+    ok = ok and exact("complete_pairs", pairs)
+    if {phase!r} == "external":
+        ok = ok and exact("games_requested", expected_games)
+    ok = ok and report.get("errors") == []
+    ok = ok and all(report.get(name, []) == [] for name in ("worker_errors", "pair_errors"))
+    ok = ok and exact("games_truncated", 0)
+    ok = ok and all(type(report.get(name, 0)) is int and report.get(name, 0) == 0 for name in ("games_errored", "games_engine_divergence", "total_illegal_policy_picks"))
+    base = report.get("base_seed")
+    ok = ok and type(base) is int
+    expected_orientations = set({orientations!r})
+    identities = set()
+    wins = 0
+    if ok:
+        for game in games:
+            clean = isinstance(game, dict)
+            clean = clean and type(game.get("game_seed")) is int
+            clean = clean and game.get("orientation") in expected_orientations
+            clean = clean and type(game.get("candidate_won")) is bool
+            clean = clean and type(game.get("search_won")) is bool
+            clean = clean and game.get("candidate_won") == game.get("search_won")
+            clean = clean and game.get("terminated") is True
+            clean = clean and game.get("truncated") is False
+            clean = clean and game.get("error") in (None, "")
+            clean = clean and not bool(game.get("engine_divergence", False))
+            if not clean:
+                ok = False
+                break
+            identities.add((game["game_seed"], game["orientation"]))
+            wins += int(game["candidate_won"])
+    expected_identities = {{(seed, orientation) for seed in range(base, base + pairs) for orientation in expected_orientations}} if type(base) is int else set()
+    ok = ok and identities == expected_identities
+    ok = ok and exact("candidate_wins", wins)
+    ok = ok and exact("baseline_wins", expected_games - wins)
+    diagnostics = report.get("pair_diagnostics")
+    ok = ok and isinstance(diagnostics, dict)
+    if ok:
+        counts = [diagnostics.get(name) for name in ("ww_pairs", "split_pairs", "ll_pairs", "incomplete_pairs")]
+        ok = all(type(value) is int and value >= 0 for value in counts)
+        ok = ok and counts[3] == 0 and sum(counts) == pairs
+except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
+    ok = False
+raise SystemExit(0 if ok else 86)
+"""
+    return f"{shlex.quote(python)} -c {shlex.quote(program)}"
+
+
 def _launch_job_command(manifest: dict[str, Any], job: dict[str, Any]) -> str:
     job_dir = str(job["job_dir"])
     report = str(job["report"])
     log = f"{job_dir}/run.log"
     command = " ".join(shlex.quote(part) for part in job["argv"])
+    validate_report = _report_validation_command(job)
     inner = (
         "set +e; "
         f"cd {shlex.quote(manifest['remote_repo'])}; "
@@ -2036,12 +2115,14 @@ def _launch_job_command(manifest: dict[str, Any], job: dict[str, Any]) -> str:
         "CUDA_MPS_LOG_DIRECTORY=/tmp/mps_log_host "
         f"PYTHONPATH={shlex.quote(manifest['remote_repo'] + '/src:' + manifest['remote_repo'])} "
         f"PYTHONUNBUFFERED=1 {command}; rc=$?; "
-        f"printf '%s\\n' \"$rc\" > {shlex.quote(job_dir + '/.rc.tmp')}; "
-        f"mv -f {shlex.quote(job_dir + '/.rc.tmp')} {shlex.quote(job_dir + '/.rc')}; "
-        f'if [ "$rc" -eq 0 ] && [ -s {shlex.quote(report)} ]; then '
+        f'if [ "$rc" -eq 0 ] && [ -s {shlex.quote(report)} ] && {validate_report}; then '
+        "final_rc=0; "
         f"rm -f {shlex.quote(job_dir + '/.failed')}; touch {shlex.quote(job_dir + '/.done')}; "
-        f"else rm -f {shlex.quote(job_dir + '/.done')}; touch {shlex.quote(job_dir + '/.failed')}; fi; "
-        'exit "$rc"'
+        "else final_rc=$rc; [ \"$final_rc\" -ne 0 ] || final_rc=86; "
+        f"rm -f {shlex.quote(job_dir + '/.done')}; touch {shlex.quote(job_dir + '/.failed')}; fi; "
+        f"printf '%s\\n' \"$final_rc\" > {shlex.quote(job_dir + '/.rc.tmp')}; "
+        f"mv -f {shlex.quote(job_dir + '/.rc.tmp')} {shlex.quote(job_dir + '/.rc')}; "
+        'exit "$final_rc"'
     )
     detached = [
         manifest["remote_repo"].rstrip("/") + "/tools/fleet/launch_detached.sh",
@@ -2083,10 +2164,10 @@ def _launch_job_command(manifest: dict[str, Any], job: dict[str, Any]) -> str:
             f"test -d {quoted_job_dir}",
             f"test \"$(readlink -f {quoted_job_dir})\" = {quoted_job_dir}",
             *(f"test ! -L {shlex.quote(path)}" for path in protected_paths),
-            f"if [ -f {shlex.quote(job_dir + '/.done')} ]; then echo {shlex.quote(job['job_id'] + ':done')};",
+            f"if [ -f {shlex.quote(job_dir + '/.done')} ] && {validate_report}; then echo {shlex.quote(job['job_id'] + ':done')};",
             f'elif [ -s {shlex.quote(job_dir + "/.pid")} ] && kill -0 "$(cat {shlex.quote(job_dir + "/.pid")})" 2>/dev/null; then echo {shlex.quote(job["job_id"] + ":active")};',
             "else",
-            f"rm -f {shlex.quote(job_dir + '/.failed')} {shlex.quote(job_dir + '/.rc')};",
+            f"rm -f {shlex.quote(job_dir + '/.done')} {shlex.quote(job_dir + '/.failed')} {shlex.quote(job_dir + '/.rc')};",
             " ".join(shlex.quote(part) for part in detached),
             "fi",
         ]
@@ -2271,6 +2352,7 @@ def _status_command(jobs: Sequence[dict[str, Any]]) -> str:
     for job in jobs:
         directory = shlex.quote(str(job["job_dir"]))
         job_id = shlex.quote(str(job["job_id"]))
+        validate_report = _report_validation_command(job)
         lines.extend(
             [
                 f"d={directory}; state=missing; pid='';",
@@ -2278,7 +2360,7 @@ def _status_command(jobs: Sequence[dict[str, Any]]) -> str:
                 '|| [ -L "$d" ] || [ -L "$d/.done" ] || [ -L "$d/.failed" ] '
                 '|| [ -L "$d/.pid" ] || [ -L "$d/.rc" ] '
                 '|| [ -L "$d/report.json" ] || [ -L "$d/run.log" ]; then state=unsafe; '
-                'elif [ -f "$d/.done" ]; then state=done; '
+                f'elif [ -f "$d/.done" ]; then if {validate_report}; then state=done; else state=failed; fi; '
                 'elif [ -f "$d/.failed" ]; then state=failed; '
                 'elif [ -s "$d/.pid" ]; then pid=$(cat "$d/.pid"); '
                 'if kill -0 "$pid" 2>/dev/null; then state=active; else state=stale; fi; fi;',
@@ -2488,6 +2570,614 @@ def ray_cluster_spec(manifest: dict[str, Any], plan: dict[str, Any]) -> dict[str
     }
 
 
+def _load_fixed_panel_pooled_report(path: Path) -> tuple[Path, dict[str, Any], str]:
+    lexical = path.expanduser().absolute()
+    resolved = path.expanduser().resolve(strict=True)
+    if lexical != resolved or resolved.is_symlink() or not resolved.is_file():
+        raise FleetError("fixed-panel pooled report must be a canonical regular file")
+    before = _sha256(resolved)
+    try:
+        payload = json.loads(resolved.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise FleetError(f"cannot load fixed-panel pooled report: {error}") from error
+    if not isinstance(payload, dict) or _sha256(resolved) != before:
+        raise FleetError("fixed-panel pooled report changed while read")
+    return resolved, payload, before
+
+
+def _fixed_panel_outcomes(
+    report_path: Path,
+    report: dict[str, Any],
+    *,
+    panel_kind: str,
+    base_seed: int,
+    pairs: int,
+) -> list[dict[str, Any]]:
+    kind = "internal" if panel_kind == "internal" else "neutral"
+    try:
+        games = evaluation_pool._validate_and_normalize_games(  # noqa: SLF001
+            [(report_path, report)], kind=kind
+        )
+        interval = evaluation_pool._seed_interval(  # noqa: SLF001
+            report, where=str(report_path)
+        )
+    except evaluation_pool.PoolError as error:
+        raise FleetError(f"fixed-panel raw-game replay refused: {error}") from error
+    if interval != (base_seed, base_seed + pairs) or len(games) != pairs * 2:
+        raise FleetError("fixed-panel report does not cover the exact fixed cohort")
+    expected_orientations = (
+        {"candidate_red", "candidate_blue"}
+        if panel_kind == "internal"
+        else {"candidate_first", "candidate_second"}
+    )
+    outcomes: list[dict[str, Any]] = []
+    for game in sorted(
+        games, key=lambda item: (int(item["game_seed"]), str(item["orientation"]))
+    ):
+        if (
+            type(game.get("candidate_won")) is not bool
+            or type(game.get("search_won")) is not bool
+            or game["candidate_won"] is not game["search_won"]
+            or game.get("terminated") is not True
+            or game.get("truncated") is not False
+            or game.get("error") not in {None, ""}
+            or bool(game.get("engine_divergence", False))
+            or game.get("orientation") not in expected_orientations
+        ):
+            raise FleetError("fixed-panel report contains a non-clean game")
+        outcomes.append(
+            {
+                "game_seed": int(game["game_seed"]),
+                "pair_id": int(game["pair_id"]),
+                "orientation": str(game["orientation"]),
+                "candidate_won": bool(game["candidate_won"]),
+            }
+        )
+    return outcomes
+
+
+def _fixed_panel_points(
+    outcomes: Sequence[dict[str, Any]], *, panel_kind: str
+) -> list[int]:
+    if panel_kind == "external":
+        return [1000 if outcome["candidate_won"] else 0 for outcome in outcomes]
+    by_seed: dict[int, int] = {}
+    for outcome in outcomes:
+        seed = int(outcome["game_seed"])
+        by_seed[seed] = by_seed.get(seed, 0) + (
+            1000 if outcome["candidate_won"] else 0
+        )
+    return [by_seed[seed] for seed in sorted(by_seed)]
+
+
+def _fixed_panel_expected_search_fields(
+    *, panel_kind: str, canonical_operator: dict[str, Any]
+) -> dict[str, Any]:
+    """Project the documented operator onto each evaluator's resolved schema.
+
+    Internal H2H persists :class:`EvalConfig` fields, while the neutral
+    harness persists ``_search_recipe``.  Checking suffixes in a recursively
+    flattened object is unsafe: it can accept a correct-looking decoy field
+    while the field actually consumed by one role has drifted.  This explicit
+    projection names every search/evaluator choice that can change game play.
+    """
+
+    common = {
+        "public_observation": True,
+        "belief_chance_spectra": False,
+        "information_set_search": True,
+        "native_mcts_hot_loop": True,
+        "determinization_particles": canonical_operator["particle_count"],
+        "determinization_min_simulations": canonical_operator[
+            "minimum_simulations_per_particle"
+        ],
+        "n_full": canonical_operator["n_full"],
+        "n_full_wide": None,
+        "n_full_wide_threshold": None,
+        "wide_roots_always_full": False,
+        "raw_policy_above_width": None,
+        "max_depth": SCIENCE_CONFIG["max_depth"],
+        "max_decisions": SCIENCE_CONFIG["max_decisions"],
+        "c_visit": canonical_operator["c_visit"],
+        "c_scale": canonical_operator["candidate_c_scale"],
+        "sigma_reference_visits": None,
+        "gameplay_policy_aggregation": "mean_improved_policy",
+        "rescale_noise_floor_c": 0.0,
+        "sigma_eval": canonical_operator["sigma_eval"],
+        "max_root_candidates": canonical_operator["root_candidate_cap_narrow"],
+        "max_root_candidates_wide": canonical_operator[
+            "root_candidate_cap_wide"
+        ],
+        "wide_candidates_threshold": canonical_operator[
+            "root_candidate_cap_width_threshold"
+        ],
+        "symmetry_averaged_eval": canonical_operator["d6_root_averaging"],
+        "symmetry_averaged_eval_threshold": canonical_operator[
+            "d6_minimum_legal_width"
+        ],
+        "correct_rust_chance_spectra": True,
+        "lazy_interior_chance": True,
+        "prior_temperature": 1.0,
+        "value_scale": 1.0,
+        "value_squash": "tanh",
+        "value_readout": "scalar",
+        "n_fast": canonical_operator["n_full"],
+        "p_full": 1.0,
+        "force_full_every_decision": True,
+        "temperature": 0.0,
+        "play_sh_winner": False,
+        "exact_budget_sh": False,
+        "exact_budget_sh_min_n": 0,
+        "root_wave_batching": False,
+        "use_batch_api": True,
+        "policy_target_min_visits": 0,
+        "uncertainty_backup_weighting": False,
+        "uncertainty_backup_a": 0.25,
+        "uncertainty_backup_exp": 1.0,
+        "uncertainty_backup_cap": 1.0,
+        "variance_aware_q": False,
+        "variance_aware_k": 1.0,
+        "variance_aware_closed_form_js": False,
+        "evaluator_context_fill": 0.0,
+        "evaluator_cache_size": 0,
+        "evaluator_rust_featurize": True,
+        "evaluator_emit_uncertainty": False,
+    }
+    if panel_kind == "external":
+        return {**common, "mcts_implementation": "rust_native_hot_loop_v1"}
+    if panel_kind != "internal":
+        raise FleetError("fixed-panel kind must be internal or external")
+    expected = dataclasses.asdict(
+        EvalConfig(
+            mode="cross_net",
+            map_kind="BASE",
+            public_observation=True,
+            belief_chance_spectra=False,
+            information_set_search=True,
+            native_mcts_hot_loop=True,
+            determinization_particles=canonical_operator["particle_count"],
+            determinization_min_simulations=canonical_operator[
+                "minimum_simulations_per_particle"
+            ],
+            n_full=canonical_operator["n_full"],
+            candidate_n_full=canonical_operator["n_full"],
+            baseline_n_full=canonical_operator["n_full"],
+            candidate_wide_roots_always_full=False,
+            baseline_wide_roots_always_full=False,
+            max_depth=SCIENCE_CONFIG["max_depth"],
+            max_decisions=SCIENCE_CONFIG["max_decisions"],
+            c_visit=canonical_operator["c_visit"],
+            c_scale=canonical_operator["candidate_c_scale"],
+            candidate_c_scale=canonical_operator["candidate_c_scale"],
+            baseline_c_scale=canonical_operator["baseline_c_scale"],
+            gameplay_policy_aggregation="mean_improved_policy",
+            candidate_gameplay_policy_aggregation="mean_improved_policy",
+            baseline_gameplay_policy_aggregation="mean_improved_policy",
+            rescale_noise_floor_c=0.0,
+            candidate_rescale_noise_floor_c=0.0,
+            baseline_rescale_noise_floor_c=0.0,
+            sigma_eval=canonical_operator["sigma_eval"],
+            candidate_sigma_eval=canonical_operator["sigma_eval"],
+            baseline_sigma_eval=canonical_operator["sigma_eval"],
+            max_root_candidates=canonical_operator["root_candidate_cap_narrow"],
+            max_root_candidates_wide=canonical_operator[
+                "root_candidate_cap_wide"
+            ],
+            wide_candidates_threshold=canonical_operator[
+                "root_candidate_cap_width_threshold"
+            ],
+            symmetry_averaged_eval=canonical_operator["d6_root_averaging"],
+            symmetry_averaged_eval_threshold=canonical_operator[
+                "d6_minimum_legal_width"
+            ],
+            correct_rust_chance_spectra=True,
+            lazy_interior_chance=True,
+            candidate_value_squash="tanh",
+            baseline_value_squash="tanh",
+            candidate_value_readout="scalar",
+            baseline_value_readout="scalar",
+            elo0=-10.0,
+            elo1=15.0,
+            n_fast=canonical_operator["n_full"],
+            p_full=1.0,
+            force_full_every_decision=True,
+            evaluator_rust_featurize=True,
+        )
+    )
+    for identity_field in ("candidate", "baseline", "base_seed", "pairs"):
+        expected.pop(identity_field)
+    return expected
+
+
+def _verify_fixed_panel_search_config(
+    value: dict[str, Any], *, panel_kind: str, canonical_operator: dict[str, Any]
+) -> str:
+    expected = _fixed_panel_expected_search_fields(
+        panel_kind=panel_kind, canonical_operator=canonical_operator
+    )
+    if set(value) != set(expected):
+        raise FleetError(
+            "fixed-panel effective search config schema drift: "
+            f"missing={sorted(set(expected) - set(value))} "
+            f"extra={sorted(set(value) - set(expected))}"
+        )
+    for field, required in expected.items():
+        if field not in value or value[field] != required:
+            raise FleetError(
+                f"fixed-panel effective search config drift for {field}: "
+                f"expected={required!r} observed={value.get(field)!r}"
+            )
+    return _digest(value)
+
+
+def _verify_fixed_panel_evaluation_binding(
+    value: Any,
+    *,
+    baseline_checkpoint_sha256: str,
+    champion_c_scale: float,
+) -> str:
+    if not isinstance(value, dict):
+        raise FleetError("fixed-panel report has no typed evaluation binding")
+    if (
+        value.get("schema_version") != "a1-evaluation-baseline-binding-v1"
+        or value.get("comparison_mode") != "promotion_parent"
+        or value.get("promotion_eligible") is not True
+        or value.get("historical_comparison_reason") is not None
+    ):
+        raise FleetError(
+            "fixed-panel selection requires the canonical promotion-parent binding"
+        )
+    baseline = value.get("baseline")
+    parent = value.get("candidate_parent")
+    registry = value.get("registry")
+    incumbent = value.get("authoritative_incumbent")
+    if not all(
+        isinstance(item, dict) for item in (baseline, parent, registry, incumbent)
+    ):
+        raise FleetError("fixed-panel evaluation binding is malformed")
+    try:
+        baseline_path = Path(str(baseline["path"])).expanduser().resolve(strict=True)
+        parent_path = Path(str(parent["path"])).expanduser().resolve(strict=True)
+        registry_path = Path(str(registry["path"])).expanduser().resolve(strict=True)
+    except (KeyError, OSError) as error:
+        raise FleetError("fixed-panel evaluation binding path is invalid") from error
+    if (
+        baseline.get("sha256") != baseline_checkpoint_sha256
+        or parent.get("sha256") != baseline_checkpoint_sha256
+        or incumbent.get("sha256") != baseline_checkpoint_sha256
+        or _sha256(baseline_path) != baseline_checkpoint_sha256
+        or parent.get("sha256") != _sha256(parent_path)
+        or registry.get("sha256") != _sha256(registry_path)
+    ):
+        raise FleetError("fixed-panel evaluation binding bytes drifted")
+    expected = _evaluation_binding(
+        candidate_parent=parent_path,
+        baseline=baseline_path,
+        registry=ChampionRegistry.load(registry_path),
+        comparison_mode=str(value.get("comparison_mode")),
+        historical_comparison_reason=value.get("historical_comparison_reason"),
+        champion_c_scale=champion_c_scale,
+    )
+    if _canonical(value) != _canonical(expected):
+        raise FleetError("fixed-panel evaluation binding does not replay")
+    return _digest(value)
+
+
+def _verify_fixed_panel_engine_identity(
+    value: Any, *, observed_runtime: Any, panel_kind: str
+) -> str:
+    expected_keys = {
+        "schema_version",
+        "repo_commit",
+        "native_wheel_sha256",
+        "python_referee_sha256",
+    }
+    if not isinstance(value, dict) or set(value) != expected_keys:
+        raise FleetError("fixed-panel planned engine identity is malformed")
+    if (
+        value.get("schema_version") != "a1-neutral-engine-identity-v1"
+        or not re.fullmatch(r"[0-9a-f]{40}", str(value.get("repo_commit", "")))
+        or not re.fullmatch(
+            r"sha256:[0-9a-f]{64}", str(value.get("native_wheel_sha256", ""))
+        )
+        or not re.fullmatch(
+            r"sha256:[0-9a-f]{64}", str(value.get("python_referee_sha256", ""))
+        )
+    ):
+        raise FleetError("fixed-panel planned engine identity is invalid")
+    expected = _engine_identity(_REPO_ROOT, _git_commit(_REPO_ROOT))
+    if value != expected:
+        raise FleetError("fixed-panel planned engine differs from canonical source")
+    runtime_sha256: str | None = None
+    if panel_kind == "external":
+        if not isinstance(observed_runtime, dict):
+            raise FleetError("fixed-panel external report has no runtime engine identity")
+        for field in expected_keys:
+            if observed_runtime.get(field) != value[field]:
+                raise FleetError(
+                    f"fixed-panel runtime engine identity drift for {field}"
+                )
+        runtime_sha256 = str(observed_runtime.get("native_runtime_sha256", ""))
+        if not re.fullmatch(
+            r"sha256:[0-9a-f]{64}",
+            runtime_sha256,
+        ):
+            raise FleetError("fixed-panel external runtime has no native binary digest")
+    return _digest(
+        {
+            "planned_engine_identity": value,
+            "native_runtime_sha256": runtime_sha256,
+        }
+    )
+
+
+def build_fixed_panel_receipt(
+    *,
+    family: str,
+    panel_kind: str,
+    authority_id: str,
+    arm_reports: dict[str, Path],
+    arm_checkpoint_sha256: dict[str, str],
+    baseline_checkpoint_sha256: str,
+    cohort_sha256: str,
+    search_operator_sha256: str,
+) -> dict[str, Any]:
+    """Adapt already-pooled fleet reports into replayable coordinator evidence."""
+
+    # Imported lazily to keep the evaluator usable independently and avoid an
+    # import cycle while the coordinator hashes this exact source file.
+    from tools import a1_aux_pair_coordinator as coordinator
+
+    if family == "P1":
+        arms = coordinator.P1_ARMS
+        plan = coordinator.canonical_p1_evaluation_plan(
+            baseline_checkpoint_sha256=baseline_checkpoint_sha256
+        )
+    elif family == "AUX":
+        arms = coordinator.ARMS
+        plan = coordinator.canonical_aux_evaluation_plan(
+            baseline_checkpoint_sha256=baseline_checkpoint_sha256
+        )
+    else:
+        raise FleetError("fixed-panel family must be P1 or AUX")
+    if panel_kind not in {"internal", "external"}:
+        raise FleetError("fixed-panel kind must be internal or external")
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", baseline_checkpoint_sha256):
+        raise FleetError("fixed-panel baseline digest is invalid")
+    if set(arm_reports) != set(arms) or set(arm_checkpoint_sha256) != set(arms):
+        raise FleetError("fixed-panel reports/checkpoints must name every arm exactly")
+    cohort = plan[f"{panel_kind}_cohort"]
+    if (
+        cohort_sha256 != plan[f"{panel_kind}_cohort_sha256"]
+        or search_operator_sha256 != plan["search_operator_sha256"]
+    ):
+        raise FleetError("fixed-panel cohort/search authority drift")
+    source_reports: dict[str, dict[str, Any]] = {}
+    game_outcomes: dict[str, list[dict[str, Any]]] = {}
+    points_milli: dict[str, list[int]] = {}
+    common_game_identity: list[tuple[int, int, str]] | None = None
+    effective_search_hash: str | None = None
+    evaluation_binding_hash: str | None = None
+    planned_engine_identity_hash: str | None = None
+    for arm in arms:
+        expected_checkpoint = arm_checkpoint_sha256[arm]
+        if not re.fullmatch(r"sha256:[0-9a-f]{64}", expected_checkpoint):
+            raise FleetError(f"fixed-panel checkpoint digest invalid for {arm}")
+        path, report, file_sha = _load_fixed_panel_pooled_report(arm_reports[arm])
+        checkpoint_path = Path(str(report.get("candidate_checkpoint", ""))).expanduser()
+        if (
+            report.get("candidate_checkpoint_sha256") != expected_checkpoint
+            or not checkpoint_path.is_absolute()
+            or not checkpoint_path.is_file()
+            or _sha256(checkpoint_path.resolve(strict=True)) != expected_checkpoint
+            or report.get("errors") != []
+            or int(report.get("games_truncated", -1)) != 0
+        ):
+            raise FleetError(f"fixed-panel pooled report/checkpoint drift for {arm}")
+        merge = report.get("fleet_merge")
+        sources = merge.get("sources") if isinstance(merge, dict) else None
+        if not isinstance(sources, list) or not sources:
+            raise FleetError(f"fixed-panel pooled report has no shard sources for {arm}")
+        source_paths: list[Path] = []
+        for source in sources:
+            if (
+                not isinstance(source, dict)
+                or set(source) != {"path", "sha256"}
+                or not isinstance(source["path"], str)
+                or not isinstance(source["sha256"], str)
+            ):
+                raise FleetError("fixed-panel pooled shard reference malformed")
+            source_path = Path(source["path"]).expanduser().resolve(strict=True)
+            if _sha256(source_path) != source["sha256"]:
+                raise FleetError("fixed-panel pooled shard bytes drifted")
+            source_paths.append(source_path)
+        try:
+            if panel_kind == "internal":
+                baseline_path = Path(
+                    str(report.get("baseline_checkpoint", ""))
+                ).expanduser().resolve(strict=True)
+                if (
+                    report.get("baseline_checkpoint_sha256")
+                    != baseline_checkpoint_sha256
+                    or _sha256(baseline_path) != baseline_checkpoint_sha256
+                ):
+                    raise FleetError("fixed-panel internal baseline bytes drifted")
+                replayed_report = evaluation_pool.pool_internal(
+                    source_paths,
+                    candidate=checkpoint_path,
+                    champion=baseline_path,
+                )
+            else:
+                replayed_report = evaluation_pool.pool_neutral(
+                    source_paths, checkpoint=checkpoint_path
+                )
+        except evaluation_pool.PoolError as error:
+            raise FleetError(f"fixed-panel shard pooling refused: {error}") from error
+        observed_replay = copy.deepcopy(report)
+        observed_replay.pop("evaluation_binding", None)
+        observed_replay.pop("planned_engine_identity", None)
+        if _canonical(observed_replay) != _canonical(replayed_report):
+            raise FleetError("fixed-panel pooled report does not replay from shards")
+        expected_map_kind = "BASE" if panel_kind == "internal" else "TOURNAMENT"
+        if (
+            report.get("map_kind") != expected_map_kind
+            or report.get("gate_config") != "flywheel"
+        ):
+            raise FleetError("fixed-panel map/gate operator drift")
+        if panel_kind == "external" and (
+            report.get("stratum") != "neutral-harness"
+            or report.get("harness") != "catanatron_native_engine"
+            or report.get("referee_engine") != "vendored_python_catanatron"
+            or report.get("baseline_bot") != "catanatron_value"
+            or report.get("mode") != "search"
+            or report.get("vps_to_win") != 10
+            or report.get("max_player_trade_offers_per_turn") != 0
+            or report.get("trained_value_readouts") != ["scalar"]
+        ):
+            raise FleetError("fixed-panel neutral evaluator identity drift")
+        binding_hash = _verify_fixed_panel_evaluation_binding(
+            report.get("evaluation_binding"),
+            baseline_checkpoint_sha256=baseline_checkpoint_sha256,
+            champion_c_scale=float(plan["search_operator"]["baseline_c_scale"]),
+        )
+        if evaluation_binding_hash is None:
+            evaluation_binding_hash = binding_hash
+        elif binding_hash != evaluation_binding_hash:
+            raise FleetError("fixed-panel evaluation binding differs across arms")
+        engine_hash = _verify_fixed_panel_engine_identity(
+            report.get("planned_engine_identity"),
+            observed_runtime=report.get("engine_identity"),
+            panel_kind=panel_kind,
+        )
+        if planned_engine_identity_hash is None:
+            planned_engine_identity_hash = engine_hash
+        elif engine_hash != planned_engine_identity_hash:
+            raise FleetError("fixed-panel planned engine differs across arms")
+        outcomes = _fixed_panel_outcomes(
+            path,
+            report,
+            panel_kind=panel_kind,
+            base_seed=int(cohort["base_seed"]),
+            pairs=int(cohort["pairs"]),
+        )
+        identity = [
+            (row["game_seed"], row["pair_id"], row["orientation"])
+            for row in outcomes
+        ]
+        if common_game_identity is None:
+            common_game_identity = identity
+        elif identity != common_game_identity:
+            raise FleetError("fixed-panel arms do not share exact random numbers")
+        search = report.get("effective_search_config")
+        if not isinstance(search, dict) or not search:
+            raise FleetError(f"fixed-panel report lacks effective search config for {arm}")
+        search_hash = _verify_fixed_panel_search_config(
+            search,
+            panel_kind=panel_kind,
+            canonical_operator=plan["search_operator"],
+        )
+        if effective_search_hash is None:
+            effective_search_hash = search_hash
+        elif search_hash != effective_search_hash:
+            raise FleetError("fixed-panel effective search config differs across arms")
+        game_outcomes[arm] = outcomes
+        points_milli[arm] = _fixed_panel_points(outcomes, panel_kind=panel_kind)
+        source_reports[arm] = {
+            "path": str(path),
+            "file_sha256": file_sha,
+            "candidate_checkpoint_path": str(checkpoint_path.resolve(strict=True)),
+            "candidate_checkpoint_sha256": expected_checkpoint,
+            "effective_search_config_sha256": search_hash,
+            "evaluation_binding_sha256": binding_hash,
+            "planned_engine_identity_sha256": engine_hash,
+            "game_outcomes_sha256": _digest(outcomes),
+        }
+    result = {
+        "schema_version": "a1-fixed-panel-receipt-v2",
+        "family": family,
+        "panel_kind": panel_kind,
+        "authority_id": authority_id,
+        "arms": list(arms),
+        "arm_checkpoint_sha256": dict(arm_checkpoint_sha256),
+        "baseline_checkpoint_sha256": baseline_checkpoint_sha256,
+        "cohort_sha256": cohort_sha256,
+        "search_operator_sha256": search_operator_sha256,
+        "effective_search_config_sha256": effective_search_hash,
+        "evaluation_binding_sha256": evaluation_binding_hash,
+        "planned_engine_identity_sha256": planned_engine_identity_hash,
+        "orientation_vocabulary": (
+            ["candidate_blue", "candidate_red"]
+            if panel_kind == "internal"
+            else ["candidate_first", "candidate_second"]
+        ),
+        "common_random_numbers": True,
+        "seat_swapped": True,
+        "source_reports": source_reports,
+        "game_outcomes": game_outcomes,
+        "game_outcomes_sha256": _digest(game_outcomes),
+        "points_milli": points_milli,
+        "points_milli_sha256": _digest(points_milli),
+        "origin_tool_sha256": _sha256(Path(__file__).resolve(strict=True)),
+    }
+    result["state_sha256"] = _digest(result)
+    return result
+
+
+def verify_fixed_panel_receipt(
+    path: Path,
+    *,
+    family: str,
+    panel_kind: str,
+    authority_id: str,
+    arms: Sequence[str],
+    arm_checkpoint_sha256: dict[str, str],
+    baseline_checkpoint_sha256: str,
+    cohort_sha256: str,
+    search_operator_sha256: str,
+) -> dict[str, Any]:
+    resolved, payload, _file_sha = _load_fixed_panel_pooled_report(path)
+    if payload.get("schema_version") != "a1-fixed-panel-receipt-v2":
+        raise FleetError("fixed-panel receipt schema drift")
+    unsigned = dict(payload)
+    stated = unsigned.pop("state_sha256", None)
+    if stated != _digest(unsigned):
+        raise FleetError("fixed-panel receipt state digest drift")
+    source_reports = payload.get("source_reports")
+    if not isinstance(source_reports, dict) or set(source_reports) != set(arms):
+        raise FleetError("fixed-panel receipt source report set drift")
+    arm_reports: dict[str, Path] = {}
+    for arm in arms:
+        source = source_reports[arm]
+        if not isinstance(source, dict) or not isinstance(source.get("path"), str):
+            raise FleetError("fixed-panel source report reference malformed")
+        arm_reports[arm] = Path(source["path"])
+    replay = build_fixed_panel_receipt(
+        family=family,
+        panel_kind=panel_kind,
+        authority_id=authority_id,
+        arm_reports=arm_reports,
+        arm_checkpoint_sha256=arm_checkpoint_sha256,
+        baseline_checkpoint_sha256=baseline_checkpoint_sha256,
+        cohort_sha256=cohort_sha256,
+        search_operator_sha256=search_operator_sha256,
+    )
+    if payload != replay or _sha256(resolved) != _file_sha:
+        raise FleetError("fixed-panel receipt failed raw-game/source replay")
+    return payload
+
+
+def _parse_fixed_panel_assignments(
+    values: Sequence[str], *, paths: bool
+) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for raw in values:
+        arm, separator, value = raw.partition("=")
+        if not separator or not SAFE_NAME.fullmatch(arm) or not value or arm in result:
+            raise FleetError("fixed-panel assignments must be unique ARM=VALUE pairs")
+        result[arm] = Path(value) if paths else value
+    return result
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", type=Path, required=True)
@@ -2604,6 +3294,18 @@ def _parser() -> argparse.ArgumentParser:
     ray = commands.add_parser("ray-config")
     ray.add_argument("--plan", type=Path, required=True)
     ray.add_argument("--out", type=Path, required=True)
+    fixed = commands.add_parser("fixed-panel")
+    fixed.add_argument("--family", choices=("P1", "AUX"), required=True)
+    fixed.add_argument(
+        "--panel-kind", choices=("internal", "external"), required=True
+    )
+    fixed.add_argument("--authority-id", required=True)
+    fixed.add_argument("--arm-report", action="append", required=True)
+    fixed.add_argument("--arm-checkpoint", action="append", required=True)
+    fixed.add_argument("--baseline-checkpoint-sha256", required=True)
+    fixed.add_argument("--cohort-sha256", required=True)
+    fixed.add_argument("--search-operator-sha256", required=True)
+    fixed.add_argument("--out", type=Path, required=True)
     return parser
 
 
@@ -2611,7 +3313,27 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
         manifest = load_manifest(args.manifest)
-        if args.command == "plan":
+        if args.command == "fixed-panel":
+            value = build_fixed_panel_receipt(
+                family=args.family,
+                panel_kind=args.panel_kind,
+                authority_id=args.authority_id,
+                arm_reports=_parse_fixed_panel_assignments(
+                    args.arm_report, paths=True
+                ),
+                arm_checkpoint_sha256=_parse_fixed_panel_assignments(
+                    args.arm_checkpoint, paths=False
+                ),
+                baseline_checkpoint_sha256=args.baseline_checkpoint_sha256,
+                cohort_sha256=args.cohort_sha256,
+                search_operator_sha256=args.search_operator_sha256,
+            )
+            write_new_readonly(args.out, value)
+            result = {
+                "fixed_panel_receipt": str(args.out.resolve(strict=True)),
+                "state_sha256": value["state_sha256"],
+            }
+        elif args.command == "plan":
             value = build_plan(
                 manifest,
                 candidate=args.candidate,

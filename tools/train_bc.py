@@ -4,6 +4,8 @@ from __future__ import annotations
 import argparse
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
+import copy
 import dataclasses
 from datetime import timedelta
 import hashlib
@@ -13,13 +15,14 @@ import math
 import operator
 import os
 from pathlib import Path
+import random
 import re
 import stat
 import subprocess
 import sys
 import tempfile
 import time
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 # A script path does not bind Python imports to the same checkout.  In particular,
 # ``python /new/checkout/tools/train_bc.py`` can otherwise import ``catan_zero``
@@ -65,7 +68,10 @@ from catan_zero.rl.entity_token_features import (
     PLAYER_FEATURE_SIZE,
     VERTEX_FEATURE_SIZE,
 )
-from catan_zero.search.neural_rust_mcts import RUST_ENTITY_ADAPTER_VERSION
+from catan_zero.rl.entity_feature_adapter import (
+    checkpoint_entity_feature_adapter_metadata,
+    policy_entity_feature_adapter_version,
+)
 from catan_zero.rl import optim_state as _checkout_optim_state
 from catan_zero.rl.flywheel.composite_contract import (
     FRESH_SOURCE_GAME_RATIOS,
@@ -166,6 +172,24 @@ from catan_zero.rl.entity_token_features import (  # noqa: E402
 _MASK_HIDDEN_INFO_PLAYER_TOKENS = False
 _CROP_AUTHENTICATED_EMPTY_EVENT_HISTORY = False
 _PUBLIC_AWARD_FEATURE_CONTRACT = PUBLIC_AWARD_FEATURE_CONTRACT_LEGACY_ZERO
+
+# The only mixed-corpus transition that can produce an authoritative checkpoint.
+# Each component remains semantically homogeneous; routing is derived from the
+# authenticated composite descriptor rather than inferred from feature values.
+_MIXED_AWARD_COMPONENT_IDS = (
+    "current_producer",
+    "recent_history",
+    "hard_negative",
+    "historical_replay",
+)
+_MIXED_AWARD_COMPONENT_RATIOS = (0.64, 0.12, 0.04, 0.20)
+_MIXED_AWARD_COMPONENT_CONTRACTS = (
+    PUBLIC_AWARD_FEATURE_CONTRACT_AUTHORITATIVE,
+    PUBLIC_AWARD_FEATURE_CONTRACT_AUTHORITATIVE,
+    PUBLIC_AWARD_FEATURE_CONTRACT_AUTHORITATIVE,
+    PUBLIC_AWARD_FEATURE_CONTRACT_LEGACY_ZERO,
+)
+_MIXED_AWARD_TRANSITION_SCHEMA = "mixed-authoritative-transition-v1"
 
 TARGET_INFORMATION_REGIME_PUBLIC = "public_conservation_pimc_v1"
 TARGET_INFORMATION_REGIME_UNKNOWN = "unknown"
@@ -370,8 +394,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "Acknowledge a corpus assembled from legacy and corrected sources. "
-            "Mixed data may only train under legacy_zero_v0 (slot 12 remains "
-            "zero); it is never sufficient to stamp authoritative_v1."
+            "Under legacy_zero_v0, slot 12 remains zero and the result is "
+            "diagnostic-only. Under authoritative_v1, only the exact authenticated "
+            "64/12/4/20 production composite is accepted: corrected components pass "
+            "slot 12, legacy replay rows are proven/stayed zero, and the inherited "
+            "input column is zero-initialized before training."
         ),
     )
     parser.add_argument("--track", default="2p_no_trade")
@@ -729,6 +756,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Use PyTorch's fused CUDA optimizer implementation when available.",
     )
     parser.add_argument("--seed", type=int, default=1)
+    parser.add_argument(
+        "--sampler-seed",
+        type=int,
+        default=None,
+        help=(
+            "Independent NumPy data-trajectory seed for epoch order, policy-aux "
+            "draws, and stochastic symmetry/data transforms. The legacy default "
+            "inherits --seed exactly. Central experiments must set this explicitly "
+            "so model/dropout RNG and sample identity cannot be accidentally coupled."
+        ),
+    )
     parser.add_argument(
         "--training-rng-rank-offset",
         action=argparse.BooleanOptionalAction,
@@ -1314,6 +1352,37 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--a1-ablation-code-binding-json", default="", help=argparse.SUPPRESS)
     parser.add_argument("--a1-ablation-code-tree-sha256", default="", help=argparse.SUPPRESS)
     parser.add_argument("--a1-reviewed-lock-file-sha256", default="", help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--a1-aux-regularization-binding-json",
+        default="",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--a1-central-learner-binding-json",
+        default="",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--a1-central-executor-authority",
+        default="",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--a1-central-executor-authority-sha256",
+        default="",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--a1-aux-stage-binding-json", default="", help=argparse.SUPPRESS
+    )
+    parser.add_argument(
+        "--a1-aux-stage-executor-authority", default="", help=argparse.SUPPRESS
+    )
+    parser.add_argument(
+        "--a1-aux-stage-executor-authority-sha256",
+        default="",
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument("--a1-dual-learner-lock", default="", help=argparse.SUPPRESS)
     parser.add_argument(
         "--a1-dual-reviewed-lock-file-sha256", default="", help=argparse.SUPPRESS
@@ -1389,6 +1458,15 @@ def build_parser() -> argparse.ArgumentParser:
             "Mixed precision mode for XDim BC forward/loss. Use bf16 on B200/A100 "
             "to reduce activation memory and use tensor cores; reductions and "
             "reported metrics stay in float32."
+        ),
+    )
+    parser.add_argument(
+        "--float32-matmul-precision",
+        choices=("highest", "high", "medium"),
+        default=None,
+        help=(
+            "Explicit PyTorch float32 matmul policy. Omit to preserve the runtime "
+            "default (except bf16, which retains the historical 'high' setting)."
         ),
     )
     parser.add_argument(
@@ -1962,11 +2040,427 @@ def _sha256_existing_file(path: str | Path) -> str:
     return f"sha256:{digest.hexdigest()}"
 
 
+def _stable_canonical_regular_file(
+    value: str | Path, *, where: str
+) -> tuple[Path, str, bytes]:
+    """Stable-read one canonical regular file without symlink ambiguity.
+
+    Hashing and parsing separate opens leaves a small but real authority race:
+    the path can be replaced after its digest is checked but before its JSON is
+    consumed.  Read through one descriptor, then prove that both the descriptor
+    and the path still name the same inode before returning the authenticated
+    bytes.
+    """
+
+    lexical = Path(value).expanduser()
+    try:
+        resolved = lexical.resolve(strict=True)
+        lexical_absolute = lexical.absolute()
+        before = resolved.stat()
+    except OSError as error:
+        raise SystemExit(f"cannot inspect {where}: {error}") from error
+    if (
+        str(resolved) != str(value)
+        or lexical_absolute != resolved
+        or lexical.is_symlink()
+        or not stat.S_ISREG(before.st_mode)
+    ):
+        raise SystemExit(f"{where} must be one canonical regular-file path")
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(resolved, flags)
+    try:
+        opened_before = os.fstat(descriptor)
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(descriptor, 1 << 20)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        opened_after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    payload = b"".join(chunks)
+    after = resolved.stat()
+    before_identity = (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+    )
+    after_identity = (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    )
+    opened_before_identity = (
+        opened_before.st_dev,
+        opened_before.st_ino,
+        opened_before.st_size,
+        opened_before.st_mtime_ns,
+        opened_before.st_ctime_ns,
+    )
+    opened_after_identity = (
+        opened_after.st_dev,
+        opened_after.st_ino,
+        opened_after.st_size,
+        opened_after.st_mtime_ns,
+        opened_after.st_ctime_ns,
+    )
+    if (
+        before_identity != after_identity
+        or before_identity != opened_before_identity
+        or opened_before_identity != opened_after_identity
+    ):
+        raise SystemExit(f"{where} changed while it was authenticated")
+    return resolved, f"sha256:{hashlib.sha256(payload).hexdigest()}", payload
+
+
 def _canonical_json_sha256(value: object) -> str:
     payload = json.dumps(
         value, sort_keys=True, separators=(",", ":"), ensure_ascii=True
     ).encode("utf-8")
     return f"sha256:{hashlib.sha256(payload).hexdigest()}"
+
+
+def _a1_sample_binding_projection(sample: dict[str, object]) -> dict[str, object]:
+    fields = (
+        "state_sha256",
+        "descriptor_sha256",
+        "payload_inventory_sha256",
+        "category_semantics",
+        "category_semantics_sha256",
+        "source_authority",
+        "sampler_identity_sha256",
+        "sample_order_sha256",
+        "row_set_sha256",
+        "unique_row_count",
+        "rows_file_sha256",
+        "sample_dose",
+        "sampler_seed",
+        "prior_rows_file_sha256",
+        "prior_row_set_sha256",
+        "kl_eligible_rows",
+        "kl_eligible_mass_decimal",
+        "kl_ordered_evidence_sha256",
+        "kl_eligible_evidence_sha256",
+    )
+    result = {
+        "schema_version": "a1-central-sample-binding-v2",
+        "sample_receipt_state_sha256": sample.get("state_sha256"),
+    }
+    result.update({field: sample.get(field) for field in fields[1:]})
+    return result
+
+
+def _validate_a1_published_executor_authority(
+    args: argparse.Namespace, central: dict[str, object]
+) -> dict[str, object]:
+    """Replay the coordinator DAG; inline JSON is only a derived projection."""
+
+    path_value = str(getattr(args, "a1_central_executor_authority", "") or "")
+    expected_file_sha = str(
+        getattr(args, "a1_central_executor_authority_sha256", "") or ""
+    )
+    if not path_value or not _is_sha256(expected_file_sha):
+        raise SystemExit(
+            "central learner requires canonical executor-authority path and SHA"
+        )
+    authority_path, file_sha, authority_bytes = _stable_canonical_regular_file(
+        path_value, where="A1 central executor authority"
+    )
+    if (
+        file_sha != expected_file_sha
+        or str(authority_path) != central.get("executor_authority_path")
+        or file_sha != central.get("executor_authority_file_sha256")
+    ):
+        raise SystemExit("A1 central executor authority path/file digest drift")
+    try:
+        stable_authority = json.loads(authority_bytes.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as error:
+        raise SystemExit(
+            f"cannot parse A1 central executor authority: {error}"
+        ) from error
+    try:
+        from tools import a1_aux_pair_coordinator as coordinator
+    except ImportError as error:
+        raise SystemExit(
+            f"cannot import A1 central coordinator verifier: {error}"
+        ) from error
+    try:
+        published = coordinator.verify_published_executor_authority(authority_path)
+    except coordinator.CoordinatorError as error:
+        raise SystemExit(
+            f"A1 central executor authority replay refused: {error}"
+        ) from error
+    authority = published.get("authority")
+    if (
+        published.get("path") != str(authority_path)
+        or published.get("file_sha256") != file_sha
+        or authority != stable_authority
+        or not isinstance(authority, dict)
+        or authority.get("schema_version") != central.get("central_authority_schema")
+        or authority.get("authority_sha256")
+        != central.get("central_authority_sha256")
+        or authority.get("state_sha256")
+        != central.get("executor_authority_state_sha256")
+    ):
+        raise SystemExit("A1 central executor authority replay/projection drift")
+
+    stage = central.get("stage")
+    selected_aux = central.get("selected_aux_decision")
+    try:
+        if stage == "P1":
+            authority_recipe = authority["arm"]["effective_recipe"]
+            authority_sample = authority["p1_sample_evidence_receipt"]
+            authority_initializer = authority["current_parent_authority"][
+                "checkpoint_sha256"
+            ]
+            authority_selected_aux = None
+        elif stage in {"AUX0", "AUXT"}:
+            pair = authority["aux_pair_contract"]
+            p1 = pair["portable_science_identity"]["p1_recipe_data_authority"]
+            authority_recipe = copy.deepcopy(pair["joint"]["effective_recipe"])
+            authority_recipe["aux_subgoal_loss_weight"] = authority["arm"][
+                "aux_subgoal_loss_weight"
+            ]
+            authority_sample = p1["p1_sample_evidence_receipt"]
+            authority_initializer = pair["joint"]["initializer_sha256"]
+            authority_selected_aux = authority["arm"]["arm_id"]
+        elif stage == "FINAL":
+            final = authority["final_replication_authority"]
+            authority_recipe = {
+                key: value
+                for key, value in final["effective_recipe"].items()
+                if key not in {"aux_subgoal_heads", "aux_settlement_pointer_head"}
+            }
+            authority_sample = final["sampling_receipt"]
+            authority_selected_aux = final["selected_aux_decision"]
+            initializer_authority = final["initializer_authority"]
+            raw_parent = initializer_authority[
+                "exact_current_parent_authority"
+            ]
+            transition = coordinator.verify_public_award_transition_authority(
+                initializer_authority["public_award_transition_authority"],
+                expected_parent=raw_parent,
+            )
+            if authority_selected_aux == "AUXT":
+                pointer = coordinator.verify_pointer_upgrade_authority(
+                    initializer_authority["pointer_upgrade_authority"],
+                    expected_parent_sha256=transition[
+                        "transitioned_checkpoint"
+                    ]["sha256"],
+                )
+                warmup = initializer_authority[
+                    "reference_warmup_terminal"
+                ]
+                if (
+                    warmup["result"]["input_initializer_sha256"]
+                    != pointer["upgraded_initializer_sha256"]
+                    or warmup["result"]["optimizer_sidecar_discarded_for_joint"]
+                    is not True
+                ):
+                    raise SystemExit(
+                        "A1 FINAL AUXT warmup does not continue the exact "
+                        "transition/pointer initializer chain"
+                    )
+                authority_initializer = initializer_authority[
+                    "reference_warmup_terminal"
+                ]["result"]["warmed_checkpoint_sha256"]
+            else:
+                if (
+                    initializer_authority.get("pointer_upgrade_authority") is not None
+                    or initializer_authority.get("reference_warmup_terminal")
+                    is not None
+                ):
+                    raise SystemExit(
+                        "A1 FINAL AUX0 must use only the public-award transition"
+                    )
+                authority_initializer = transition["transitioned_checkpoint"][
+                    "sha256"
+                ]
+        else:
+            raise KeyError("stage")
+    except (KeyError, TypeError, coordinator.CoordinatorError) as error:
+        raise SystemExit(
+            f"A1 central executor authority lacks canonical projection: {error}"
+        ) from error
+    if (
+        authority_recipe != central.get("effective_recipe")
+        or _a1_sample_binding_projection(authority_sample)
+        != central.get("sample_binding")
+        or authority_initializer != central.get("initializer_sha256")
+        or authority_selected_aux != selected_aux
+    ):
+        raise SystemExit("A1 central inline projection differs from coordinator DAG")
+    return published
+
+
+def _validate_a1_aux_stage_authority(
+    args: argparse.Namespace,
+    *,
+    composite_meta: Mapping[str, object] | None,
+    ddp: Mapping[str, int | bool],
+) -> dict[str, object] | None:
+    """Replay the WARMUP/GEOMETRY authority before optimizer construction."""
+
+    raw = str(getattr(args, "a1_aux_stage_binding_json", "") or "")
+    authority_value = str(
+        getattr(args, "a1_aux_stage_executor_authority", "") or ""
+    )
+    authority_sha = str(
+        getattr(args, "a1_aux_stage_executor_authority_sha256", "") or ""
+    )
+    if not any((raw, authority_value, authority_sha)):
+        return None
+    if not all((raw, authority_value, authority_sha)) or not _is_sha256(authority_sha):
+        raise SystemExit(
+            "A1 AUX stage binding and executor-authority path/SHA are inseparable"
+        )
+    try:
+        binding = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise SystemExit(f"cannot parse A1 AUX stage binding: {error}") from error
+    expected_fields = {
+        "schema_version",
+        "stage",
+        "experiment_id",
+        "executor_authority_path",
+        "executor_authority_file_sha256",
+        "executor_authority_state_sha256",
+        "descriptor_path",
+        "descriptor_sha256",
+        "payload_inventory_sha256",
+        "initializer_path",
+        "initializer_sha256",
+        "output_report",
+        "output_checkpoint",
+        "probe_manifest",
+    }
+    if (
+        not isinstance(binding, dict)
+        or set(binding) != expected_fields
+        or binding.get("schema_version") != "a1-aux-stage-training-binding-v1"
+        or binding.get("stage") not in {"WARMUP", "GEOMETRY"}
+    ):
+        raise SystemExit("A1 AUX stage training binding shape drift")
+    authority_path, file_sha, raw_authority = _stable_canonical_regular_file(
+        authority_value, where="A1 AUX stage executor authority"
+    )
+    if (
+        str(authority_path) != binding["executor_authority_path"]
+        or file_sha != authority_sha
+        or file_sha != binding["executor_authority_file_sha256"]
+    ):
+        raise SystemExit("A1 AUX stage executor authority path/file drift")
+    try:
+        stable_authority = json.loads(raw_authority.decode("utf-8"))
+        from tools import a1_aux_pair_coordinator as coordinator
+
+        published = coordinator.verify_published_executor_authority(authority_path)
+    except (UnicodeError, json.JSONDecodeError, ImportError) as error:
+        raise SystemExit(f"cannot replay A1 AUX stage authority: {error}") from error
+    except coordinator.CoordinatorError as error:
+        raise SystemExit(f"A1 AUX stage authority replay refused: {error}") from error
+    authority = published.get("authority")
+    stage = binding["stage"]
+    expected_schema = f"a1-aux-{str(stage).lower()}-executor-authority-v1"
+    if (
+        authority != stable_authority
+        or not isinstance(authority, dict)
+        or authority.get("schema_version") != expected_schema
+        or authority.get("stage") != stage
+        or authority.get("experiment_id") != binding["experiment_id"]
+        or authority.get("state_sha256")
+        != binding["executor_authority_state_sha256"]
+    ):
+        raise SystemExit("A1 AUX stage authority projection drift")
+    if composite_meta is None or composite_meta.get("schema_version") != "memmap_composite_v2":
+        raise SystemExit("A1 AUX stage requires the authenticated production composite")
+    science = authority.get("portable_science_identity")
+    composite = science.get("composite") if isinstance(science, dict) else None
+    if not isinstance(composite, dict):
+        raise SystemExit("A1 AUX stage authority lacks typed composite")
+    if (
+        binding["descriptor_path"] != str(Path(args.data).expanduser().resolve(strict=True))
+        or binding["descriptor_sha256"] != composite_meta.get("descriptor_file_sha256")
+        or binding["descriptor_sha256"] != composite.get("descriptor_sha256")
+        or binding["payload_inventory_sha256"]
+        != composite_meta.get("payload_inventory_sha256")
+        or binding["payload_inventory_sha256"]
+        != composite.get("payload_inventory_sha256")
+        or binding["initializer_path"]
+        != str(Path(args.init_checkpoint).expanduser().resolve(strict=True))
+        or binding["initializer_sha256"] != _sha256_existing_file(args.init_checkpoint)
+        or binding["output_report"]
+        != str(Path(args.report).expanduser().resolve(strict=False))
+        or binding["output_checkpoint"]
+        != str(Path(args.checkpoint).expanduser().resolve(strict=False))
+        or int(ddp.get("world_size", 0)) != 8
+        or int(args.batch_size) != 512
+        or int(args.grad_accum_steps) != 1
+        or str(args.arch) != "entity_graph"
+        or str(args.amp) != "none"
+        or not bool(args.training_rng_rank_offset)
+        or bool(args.symmetry_augment)
+        or not bool(args.mask_hidden_info)
+        or not bool(args.aux_subgoal_heads)
+        or not bool(args.aux_settlement_pointer_head)
+    ):
+        raise SystemExit("A1 AUX stage data/model/topology binding drift")
+    effective = _effective_a1_learner_training_recipe(args, dict(ddp))
+    if stage == "WARMUP":
+        warmup = science.get("warmup_recipe")
+        pointer = science.get("pointer_upgrade_authority")
+        if not isinstance(warmup, dict) or not isinstance(pointer, dict):
+            raise SystemExit("A1 AUX WARMUP authority is incomplete")
+        exact_cli = {
+            "max_steps": warmup["max_steps"],
+            "lr": warmup["lr"],
+            "lr_warmup_steps": warmup["lr_warmup_steps"],
+            "lr_schedule": warmup["lr_schedule"],
+            "weight_decay": warmup["weight_decay"],
+            "seed": warmup["seed"],
+            "sampler_seed": warmup["sampler_seed"],
+            "aux_subgoal_loss_weight": warmup["aux_subgoal_loss_weight"],
+            **warmup["main_objective_coefficients"],
+        }
+        if (
+            binding["initializer_sha256"]
+            != pointer.get("upgraded_initializer_sha256")
+            or binding["probe_manifest"] is not None
+            or int(args.epochs) != 1
+            or str(args.optimizer) != "adam"
+            or bool(args.resume_optimizer)
+            or bool(args.fused_optimizer)
+            or float(args.max_grad_norm) != float(warmup["max_grad_norm"])
+            or _parse_prefixes(args.require_only_trainable_prefixes)
+            != tuple(warmup["trainable_prefixes"])
+            or any(effective.get(key) != value for key, value in exact_cli.items())
+        ):
+            raise SystemExit("A1 AUX WARMUP recipe/initializer drift")
+    else:
+        rule = science.get("selector_rule")
+        warmup_terminal = authority.get("warmup_terminal")
+        expected_recipe = copy.deepcopy(science.get("effective_recipe"))
+        if not isinstance(rule, dict) or not isinstance(warmup_terminal, dict) or not isinstance(expected_recipe, dict):
+            raise SystemExit("A1 AUX GEOMETRY authority is incomplete")
+        expected_recipe["aux_subgoal_loss_weight"] = 1.0
+        if (
+            binding["initializer_sha256"]
+            != warmup_terminal.get("result", {}).get("warmed_checkpoint_sha256")
+            or not isinstance(binding["probe_manifest"], dict)
+            or any(effective.get(key) != value for key, value in expected_recipe.items())
+        ):
+            raise SystemExit("A1 AUX GEOMETRY recipe/initializer drift")
+    result = copy.deepcopy(binding)
+    result["authority"] = copy.deepcopy(authority)
+    result["published_executor_authority"] = copy.deepcopy(published)
+    return result
 
 
 def _training_data_fingerprint(path: str, data_format: str) -> str:
@@ -2022,6 +2516,147 @@ def _training_data_fingerprint(path: str, data_format: str) -> str:
     return ""
 
 
+_FLYWHEEL_FRESH_CATEGORY_IDS = (
+    "current_producer",
+    "recent_history",
+    "hard_negative",
+)
+
+
+def _validate_flywheel_category_semantics(
+    raw: object, *, where: str
+) -> dict[str, object]:
+    """Validate scheduler-lane meaning without renaming the lanes.
+
+    The recovery contract deliberately keeps the historical scheduler key
+    ``recent_history`` even when the checkpoint is only an unproven safety
+    reference.  Every downstream artifact must therefore copy this object
+    byte-for-byte; reducing it to a locally invented role map would permit the
+    exact lineage laundering this field exists to prevent.
+    """
+
+    if not isinstance(raw, dict) or set(raw) != set(_FLYWHEEL_FRESH_CATEGORY_IDS):
+        raise SystemExit(f"{where} category semantics fields drift")
+    result = {key: dict(raw[key]) for key in _FLYWHEEL_FRESH_CATEGORY_IDS}
+    fixed = {
+        "current_producer": ("current_producer", "self_play"),
+        "hard_negative": ("hard_negative", "sealed_hard_negative_selection"),
+    }
+    for category, value in result.items():
+        if not isinstance(raw[category], dict):
+            raise SystemExit(f"{where} category semantic {category} is malformed")
+        checkpoint = value.get("checkpoint")
+        if (
+            not isinstance(checkpoint, dict)
+            or set(checkpoint) != {"id", "path", "sha256", "version"}
+            or not isinstance(checkpoint.get("id"), str)
+            or not isinstance(checkpoint.get("path"), str)
+            or not Path(str(checkpoint["path"])).is_absolute()
+            or not _is_sha256(checkpoint.get("sha256"))
+            or isinstance(checkpoint.get("version"), bool)
+            or not isinstance(checkpoint.get("version"), int)
+            or value.get("scheduler_category") != category
+        ):
+            raise SystemExit(f"{where} category semantic {category} checkpoint drift")
+        if category in fixed:
+            semantic, relation = fixed[category]
+            if (
+                set(value) != {"scheduler_category", "semantic", "relation", "checkpoint"}
+                or value.get("semantic") != semantic
+                or value.get("relation") != relation
+            ):
+                raise SystemExit(f"{where} category semantic {category} relation drift")
+    recent = result["recent_history"]
+    recovery_fields = {
+        "scheduler_category",
+        "semantic",
+        "relation",
+        "causal_parent_proven",
+        "promotion_proof_recreated",
+        "checkpoint",
+        "recovery_lineage_id",
+    }
+    promoted_fields = {
+        "scheduler_category",
+        "semantic",
+        "relation",
+        "causal_parent_proven",
+        "checkpoint",
+    }
+    is_recovery = set(recent) == recovery_fields
+    is_promoted_history = set(recent) == promoted_fields
+    if is_recovery:
+        valid_recent = (
+            recent.get("semantic") == "recovery_reference"
+            and recent.get("relation") == "safety_reference_unproven_predecessor"
+            and recent.get("causal_parent_proven") is False
+            and recent.get("promotion_proof_recreated") is False
+            and isinstance(recent.get("recovery_lineage_id"), str)
+            and bool(recent.get("recovery_lineage_id"))
+        )
+    else:
+        valid_recent = (
+            is_promoted_history
+            and recent.get("semantic") == "recent_history"
+            and recent.get("relation") == "immediate_displaced_incumbent"
+            and recent.get("causal_parent_proven") is True
+        )
+    if not valid_recent:
+        raise SystemExit(f"{where} recent-history semantic relation drift")
+    return result
+
+
+def _require_exact_flywheel_category_semantics(
+    *,
+    authority: Mapping[str, object],
+    contract: Mapping[str, object],
+    selected: Mapping[str, object],
+    audit: Mapping[str, object],
+) -> dict[str, object] | None:
+    """Join all semantic surfaces, preserving absence for old contracts."""
+
+    surfaces = {
+        "source authority": authority.get("category_semantics"),
+        "current contract": contract.get("category_semantics"),
+        "selected-game manifest": selected.get("category_semantics"),
+        "post-wave audit": audit.get("category_semantics"),
+    }
+    if all(value is None for value in surfaces.values()):
+        return None
+    if any(value is None for value in surfaces.values()):
+        raise SystemExit("flywheel category semantics were stripped from one authority surface")
+    canonical: dict[str, object] | None = None
+    for where, value in surfaces.items():
+        checked = _validate_flywheel_category_semantics(value, where=where)
+        if canonical is None:
+            canonical = checked
+        elif checked != canonical:
+            raise SystemExit("flywheel category semantics differ across authority surfaces")
+    assert canonical is not None
+    selected_records = selected.get("records")
+    if not isinstance(selected_records, list) or not selected_records:
+        raise SystemExit("selected-game manifest has no semantic record evidence")
+    for index, record in enumerate(selected_records):
+        category = record.get("category") if isinstance(record, dict) else None
+        if (
+            category not in canonical
+            or record.get("category_semantic") != canonical[category]
+        ):
+            raise SystemExit(
+                f"selected-game record {index} category semantic was stripped or swapped"
+            )
+    source_provenance = audit.get("source_provenance")
+    if not isinstance(source_provenance, dict):
+        raise SystemExit("post-wave audit has no category semantic provenance")
+    for category, semantic in canonical.items():
+        record = source_provenance.get(category)
+        if not isinstance(record, dict) or record.get("category_semantic") != semantic:
+            raise SystemExit(
+                f"post-wave audit category semantic was stripped or swapped: {category}"
+            )
+    return canonical
+
+
 def _validate_flywheel_source_authority(path: Path) -> dict[str, object]:
     """Validate the portable pre-descriptor wave authority.
 
@@ -2048,6 +2683,8 @@ def _validate_flywheel_source_authority(path: Path) -> dict[str, object]:
         "historical_replay",
         "authority_sha256",
     }
+    if isinstance(payload, dict) and "category_semantics" in payload:
+        expected.add("category_semantics")
     if (
         not isinstance(payload, dict)
         or set(payload) != expected
@@ -2160,6 +2797,13 @@ def _validate_flywheel_source_authority(path: Path) -> dict[str, object]:
     ):
         raise SystemExit("flywheel current wave authority chain drift")
 
+    category_semantics = _require_exact_flywheel_category_semantics(
+        authority=payload,
+        contract=current_contract,
+        selected=selected,
+        audit=audit,
+    )
+
     binding_fields = {
         "source_id",
         "contract_sha256",
@@ -2233,6 +2877,7 @@ def _validate_flywheel_source_authority(path: Path) -> dict[str, object]:
         audit_ref: dict[str, object],
         audit_payload: dict[str, object],
         manifests: dict[tuple[str, str, str], dict[str, object]],
+        category_semantics: dict[str, object] | None,
     ) -> tuple[list[dict[str, object]], set[str]]:
         if not isinstance(raw, list) or not raw or digest != _canonical_json_sha256(raw):
             raise SystemExit("flywheel source-binding inventory digest drift")
@@ -2265,7 +2910,11 @@ def _validate_flywheel_source_authority(path: Path) -> dict[str, object]:
         if not audited_sources or not audited_manifests:
             raise SystemExit("flywheel staged audit omits source/manifest evidence")
         for index, record in enumerate(raw):
-            if not isinstance(record, dict) or set(record) != binding_fields:
+            category = record.get("category") if isinstance(record, dict) else None
+            expected_binding_fields = set(binding_fields)
+            if category_semantics is not None and category in category_semantics:
+                expected_binding_fields.add("category_semantic")
+            if not isinstance(record, dict) or set(record) != expected_binding_fields:
                 raise SystemExit(f"flywheel source binding {index} fields drift")
             preimage = dict(record)
             source_id = preimage.pop("source_id")
@@ -2280,6 +2929,12 @@ def _validate_flywheel_source_authority(path: Path) -> dict[str, object]:
                 != selected_ref.get("records_sha256")
                 or record.get("audit_file_sha256") != audit_ref.get("file_sha256")
                 or record.get("audit_sha256") != audit_ref.get("audit_sha256")
+                or (
+                    record.get("category_semantic")
+                    != category_semantics.get(str(record.get("category")))
+                    if category_semantics is not None
+                    else "category_semantic" in record
+                )
             ):
                 raise SystemExit(f"flywheel source binding {index} identity drift")
             if (
@@ -2324,6 +2979,7 @@ def _validate_flywheel_source_authority(path: Path) -> dict[str, object]:
         audit_ref=payload["post_wave_audit"],
         audit_payload=audit,
         manifests=fresh_manifests,
+        category_semantics=category_semantics,
     )
 
     historical_authority = payload["historical_replay"]
@@ -2378,6 +3034,23 @@ def _validate_flywheel_source_authority(path: Path) -> dict[str, object]:
         historical_authority.get("generation_manifests"),
         digest=historical_authority.get("generation_manifests_sha256"),
     )
+    prior_semantic_surfaces = (
+        prior_contract.get("category_semantics"),
+        prior_selected.get("category_semantics"),
+        prior_audit.get("category_semantics"),
+    )
+    if all(value is None for value in prior_semantic_surfaces):
+        prior_category_semantics = None
+    elif any(value is None for value in prior_semantic_surfaces):
+        raise SystemExit("historical replay category semantics were stripped")
+    else:
+        checked_prior = [
+            _validate_flywheel_category_semantics(value, where="historical replay")
+            for value in prior_semantic_surfaces
+        ]
+        if checked_prior[1:] != checked_prior[:-1]:
+            raise SystemExit("historical replay category semantics differ")
+        prior_category_semantics = checked_prior[0]
     historical_bindings, historical_ids = verified_bindings(
         historical_authority.get("source_bindings"),
         digest=historical_authority.get("source_bindings_sha256"),
@@ -2386,6 +3059,7 @@ def _validate_flywheel_source_authority(path: Path) -> dict[str, object]:
         audit_ref=historical_authority["post_wave_audit"],
         audit_payload=prior_audit,
         manifests=historical_manifests,
+        category_semantics=prior_category_semantics,
     )
     return {
         **payload,
@@ -2393,6 +3067,7 @@ def _validate_flywheel_source_authority(path: Path) -> dict[str, object]:
         "fresh_source_ids": fresh_ids,
         "historical_source_bindings": historical_bindings,
         "historical_source_ids": historical_ids,
+        "category_semantics": category_semantics,
     }
 
 
@@ -2624,6 +3299,7 @@ def _preflight_memmap_composite_descriptor(path: str | Path) -> dict[str, object
     else:
         required_v2_fields = common_fields | {"policy_kl_anchor_component_ids"}
         optional_v2_fields = {
+            "category_semantics",
             "policy_distillation_component_ids",
             "policy_aux_phase_sampling_weights",
             "stored_policy_component_temperatures",
@@ -2701,8 +3377,26 @@ def _preflight_memmap_composite_descriptor(path: str | Path) -> dict[str, object
             "file_sha256": str(descriptor["source_authority_manifest_sha256"]),
             "authority_sha256": str(descriptor["source_authority_sha256"]),
         }
+        descriptor_semantics = descriptor.get("category_semantics")
+        authority_semantics = source_authority.get("category_semantics")
+        if (descriptor_semantics is None) != (authority_semantics is None):
+            raise SystemExit(
+                "flywheel category semantics were stripped from descriptor or authority"
+            )
+        if descriptor_semantics is not None:
+            checked_descriptor_semantics = _validate_flywheel_category_semantics(
+                descriptor_semantics, where="memmap composite descriptor"
+            )
+            if checked_descriptor_semantics != authority_semantics:
+                raise SystemExit(
+                    "flywheel descriptor category semantics differ from source authority"
+                )
     elif authority_fields.intersection(descriptor):
         raise SystemExit("diagnostic composite may not claim source authority")
+    elif "category_semantics" in descriptor:
+        raise SystemExit(
+            "diagnostic composite may not claim unauthenticated category semantics"
+        )
     raw_components = descriptor.get("components")
     if not isinstance(raw_components, list) or (
         len(raw_components) != 2
@@ -3313,6 +4007,227 @@ def _preflight_memmap_composite_descriptor(path: str | Path) -> dict[str, object
         "production_mix_contract": flywheel_replay_contract,
         "source_authority": source_authority,
         "source_authority_ref": source_authority_ref,
+        "category_semantics": (
+            None
+            if descriptor.get("category_semantics") is None
+            else dict(descriptor["category_semantics"])
+        ),
+        "category_semantics_sha256": (
+            None
+            if descriptor.get("category_semantics") is None
+            else _canonical_json_sha256(descriptor["category_semantics"])
+        ),
+        **_portable_composite_semantic_digests(
+            components=components,
+            component_ids=component_ids,
+            aux_subgoal_component_ids=aux_subgoal_component_ids,
+            source_authority=source_authority,
+            learner_recipe_overrides_sha256=str(
+                descriptor["learner_recipe_overrides_sha256"]
+            ),
+        ),
+    }
+
+
+def _portable_composite_semantic_digests(
+    *,
+    components: Sequence[Mapping[str, object]],
+    component_ids: Sequence[str],
+    aux_subgoal_component_ids: Sequence[str],
+    source_authority: Mapping[str, object] | None,
+    learner_recipe_overrides_sha256: str,
+) -> dict[str, object]:
+    """Bind path-independent learner semantics omitted by payload hashes.
+
+    Payload inventories prove bytes, not what the learner is allowed to do
+    with those bytes.  These explicit projections prevent a copied composite
+    from retaining the same portable experiment identity after its objective
+    scope, auxiliary-label contract, or legacy->authoritative feature
+    transition changes.  Absolute staging paths and hashes whose preimages
+    include those paths are deliberately excluded.
+    """
+
+    if list(component_ids) != [
+        str(component.get("component_id", "")) for component in components
+    ]:
+        raise SystemExit("composite semantic projection component order drift")
+    if not _is_sha256(learner_recipe_overrides_sha256):
+        raise SystemExit("composite learner override semantic digest is malformed")
+
+    aux_scope = set(aux_subgoal_component_ids)
+    aux_components: list[dict[str, object]] = []
+    award_components: list[dict[str, object]] = []
+    for component_id, component in zip(component_ids, components, strict=True):
+        meta = component.get("corpus_meta")
+        if not isinstance(meta, Mapping):
+            raise SystemExit(
+                f"composite component {component_id!r} lacks authenticated metadata"
+            )
+        if component_id in aux_scope:
+            contract = meta.get("aux_subgoal_target_contract")
+            expected_counts = {
+                str(AUX_SUBGOAL_TARGET_VERSION): int(meta.get("row_count", -1))
+            }
+            expected_contract_fields = {
+                "version_key",
+                "supported_version",
+                "semantic",
+                "version_zero_means_unversioned_ineligible",
+                "realized_version_counts",
+                "all_rows_semantically_eligible",
+            }
+            if (
+                not isinstance(contract, Mapping)
+                or set(contract) != expected_contract_fields
+                or contract.get("version_key") != AUX_SUBGOAL_TARGET_VERSION_KEY
+                or contract.get("supported_version") != AUX_SUBGOAL_TARGET_VERSION
+                or contract.get("semantic") != AUX_SUBGOAL_TARGET_SEMANTIC
+                or contract.get("version_zero_means_unversioned_ineligible") is not True
+                or contract.get("realized_version_counts") != expected_counts
+                or contract.get("all_rows_semantically_eligible") is not True
+            ):
+                raise SystemExit(
+                    "aux-subgoal component scope names data without the exact "
+                    f"strict-future target contract: {component_id}"
+                )
+            aux_components.append(
+                {
+                    "component_id": component_id,
+                    "target_contract": copy.deepcopy(dict(contract)),
+                }
+            )
+
+        provenance = meta.get("public_award_feature_provenance")
+        if provenance is None:
+            award_components.append(
+                {
+                    "component_id": component_id,
+                    "contract": PUBLIC_AWARD_FEATURE_CONTRACT_LEGACY_ZERO,
+                    "producer_semantics": [],
+                }
+            )
+            continue
+        if not isinstance(provenance, Mapping):
+            raise SystemExit(
+                f"component {component_id!r} public-award provenance is malformed"
+            )
+        contract = str(provenance.get("contract", ""))
+        bindings = provenance.get("source_manifest_bindings")
+        if contract not in {
+            PUBLIC_AWARD_FEATURE_CONTRACT_LEGACY_ZERO,
+            PUBLIC_AWARD_FEATURE_CONTRACT_AUTHORITATIVE,
+            PUBLIC_AWARD_FEATURE_CONTRACT_MIXED,
+        } or not isinstance(bindings, list):
+            raise SystemExit(
+                f"component {component_id!r} public-award semantic contract is invalid"
+            )
+        producer_semantics: list[dict[str, object]] = []
+        for index, binding in enumerate(bindings):
+            if not isinstance(binding, Mapping):
+                raise SystemExit(
+                    f"component {component_id!r} public-award binding {index} is invalid"
+                )
+            binding_contract = str(binding.get("contract", ""))
+            producer = binding.get("producer_provenance")
+            if binding_contract not in {
+                PUBLIC_AWARD_FEATURE_CONTRACT_LEGACY_ZERO,
+                PUBLIC_AWARD_FEATURE_CONTRACT_AUTHORITATIVE,
+            } or (producer is not None and not isinstance(producer, Mapping)):
+                raise SystemExit(
+                    f"component {component_id!r} public-award producer semantics drift"
+                )
+            producer_semantics.append(
+                {
+                    "contract": binding_contract,
+                    "producer_provenance": (
+                        None if producer is None else copy.deepcopy(dict(producer))
+                    ),
+                }
+            )
+        award_components.append(
+            {
+                "component_id": component_id,
+                "contract": contract,
+                "producer_semantics": producer_semantics,
+            }
+        )
+
+    aux_projection = {
+        "schema_version": "a1-aux-subgoal-target-contract-projection-v1",
+        "scope_component_ids": list(aux_subgoal_component_ids),
+        "components": aux_components,
+    }
+    award_projection = {
+        "schema_version": "a1-public-award-feature-transition-contract-v1",
+        "components": award_components,
+        "effective_checkpoint_contract": (
+            PUBLIC_AWARD_FEATURE_CONTRACT_AUTHORITATIVE
+        ),
+        "mixed_row_routing_authority": (
+            "authenticated_component_identity_not_feature_values"
+        ),
+        "legacy_initializer_transition": {
+            "parameter_suffix": "player_encoder.0.weight",
+            "input_column_index": PLAYER_LONGEST_ROAD_SLOT,
+            "operation": "exact_zero_before_optimizer",
+        },
+    }
+
+    source_projection = None
+    if source_authority is not None:
+        current = source_authority.get("current_contract")
+        selected = source_authority.get("selected_game_manifest")
+        audit = source_authority.get("post_wave_audit")
+        historical = source_authority.get("historical_replay")
+        if not all(
+            isinstance(value, Mapping)
+            for value in (current, selected, audit, historical)
+        ):
+            raise SystemExit("source authority semantic projection is incomplete")
+        source_projection = {
+            "schema_version": source_authority.get("schema_version"),
+            "current_contract_sha256": current.get("contract_sha256"),
+            "selected_records_sha256": selected.get("records_sha256"),
+            "selected_game_seed_set_sha256": selected.get(
+                "selected_game_seed_set_sha256"
+            ),
+            "post_wave_audit_sha256": audit.get("audit_sha256"),
+            "post_wave_shard_inventory_sha256": audit.get(
+                "shard_inventory_sha256"
+            ),
+            "fresh_source_bindings_sha256": source_authority.get(
+                "fresh_source_bindings_sha256"
+            ),
+            "fresh_generation_manifests_sha256": source_authority.get(
+                "fresh_generation_manifests_sha256"
+            ),
+            "historical_replay_authority_sha256": historical.get(
+                "authority_sha256"
+            ),
+            "category_semantics_sha256": _canonical_json_sha256(
+                source_authority.get("category_semantics")
+            ),
+        }
+        if any(
+            not _is_sha256(value)
+            for key, value in source_projection.items()
+            if key != "schema_version"
+        ):
+            raise SystemExit("source authority semantic digest field is malformed")
+
+    return {
+        "learner_recipe_overrides_sha256": learner_recipe_overrides_sha256,
+        "aux_subgoal_target_contract_sha256": _canonical_json_sha256(
+            aux_projection
+        ),
+        "public_award_feature_transition_contract_sha256": (
+            _canonical_json_sha256(award_projection)
+        ),
+        "source_authority_semantic_sha256": (
+            None
+            if source_projection is None
+            else _canonical_json_sha256(source_projection)
+        ),
     }
 
 
@@ -5177,6 +6092,21 @@ def _effective_a1_learner_training_recipe(
         "ddp_shard_data",
     )
     effective = {field: getattr(args, field) for field in bound_fields}
+    if getattr(args, "sampler_seed", None) is not None:
+        # Historical A1 recipes keep their exact shape when this additive flag
+        # is omitted. An explicit independent sampler stream changes the
+        # trajectory and must therefore be centrally authorized.
+        effective["sampler_seed"] = int(args.sampler_seed)
+    if bool(getattr(args, "per_game_policy_weight", False)) or str(
+        getattr(args, "per_game_policy_weight_mode", "equal")
+    ) != "equal":
+        # The post-promotion v3 learner makes game-uniform policy mass part of
+        # its sealed objective. Historical v2 recipes omit both fields at the
+        # backward-compatible false/equal defaults.
+        effective["per_game_policy_weight"] = bool(args.per_game_policy_weight)
+        effective["per_game_policy_weight_mode"] = str(
+            args.per_game_policy_weight_mode
+        )
     # Additive opt-in objective: historical sealed recipes and old Namespace
     # fixtures predate this field and must remain byte-for-byte exact when it is
     # absent/off. A nonzero value is trajectory-changing and therefore enters
@@ -5387,6 +6317,172 @@ def _validate_a1_batch_probe_authorization(
     }
 
 
+def _validate_a1_aux_regularization_binding(
+    args: argparse.Namespace,
+    *,
+    recipe_drift: dict[str, dict[str, object]] | None,
+) -> dict[str, object] | None:
+    """Authenticate the centrally commissioned pointer AUX0/AUXT experiment.
+
+    The outer one-dose executor replays the full function-preserving upgrade.
+    The trainer independently binds the immutable receipt and initializer bytes
+    it was handed, and rejects every recipe delta except activation at the
+    geometry-selected coefficient. AUX0 is the sole reviewed no-op arm: its
+    purpose is to keep the identical auxiliary architecture present but frozen.
+    """
+
+    raw = str(getattr(args, "a1_aux_regularization_binding_json", "") or "")
+    if not raw:
+        if recipe_drift is not None and "aux_subgoal_loss_weight" in recipe_drift:
+            raise SystemExit(
+                "aux_subgoal_loss_weight drift requires the matched aux "
+                "regularization receipt/initializer binding"
+            )
+        return None
+    try:
+        binding = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise SystemExit(
+            f"invalid A1 aux regularization binding JSON: {error}"
+        ) from error
+    required = {
+        "schema_version",
+        "arm_id",
+        "aux_subgoal_loss_weight",
+        "selected_aux_coefficient_decimal",
+        "upgrade_module",
+        "upgrade_receipt",
+        "upgrade_receipt_file_sha256",
+        "upgrade_receipt_digest",
+        "upgrade_initializer",
+        "upgrade_initializer_sha256",
+        "initializer",
+        "initializer_sha256",
+        "aux_pair_authority_sha256",
+        "shared_identity",
+        "shared_identity_sha256",
+    }
+    if not isinstance(binding, dict) or set(binding) != required:
+        raise SystemExit("A1 aux regularization binding shape drift")
+    if (
+        binding.get("schema_version") != "a1-matched-aux-pointer-arm-v1"
+        or binding.get("upgrade_module")
+        != "entity_graph.aux_subgoal_pointer_heads.v1"
+        or not _is_sha256(binding.get("upgrade_receipt_file_sha256"))
+        or not _is_sha256(binding.get("upgrade_receipt_digest"))
+        or not _is_sha256(binding.get("upgrade_initializer_sha256"))
+        or not _is_sha256(binding.get("initializer_sha256"))
+        or not _is_sha256(binding.get("aux_pair_authority_sha256"))
+        or not _is_sha256(binding.get("shared_identity_sha256"))
+        or not isinstance(binding.get("shared_identity"), dict)
+        or _canonical_json_sha256(binding["shared_identity"])
+        != binding["shared_identity_sha256"]
+    ):
+        raise SystemExit("A1 aux regularization binding schema/digest drift")
+    weight = binding.get("aux_subgoal_loss_weight")
+    if isinstance(weight, bool) or not isinstance(weight, (int, float)):
+        raise SystemExit("A1 aux regularization weight is not numeric")
+    shared = binding["shared_identity"]
+    selected_decimal = binding.get("selected_aux_coefficient_decimal")
+    try:
+        selected = float(selected_decimal)
+    except (TypeError, ValueError) as error:
+        raise SystemExit("A1 aux selected coefficient is not canonical numeric") from error
+    expected_arm = (
+        "AUX0"
+        if float(weight) == 0.0
+        else "AUXT"
+        if float(weight) == selected and 0.001 <= selected <= 0.05
+        else None
+    )
+    if (
+        expected_arm is None
+        or binding.get("arm_id") != expected_arm
+        or float(getattr(args, "aux_subgoal_loss_weight", -1.0)) != float(weight)
+        or not bool(getattr(args, "aux_subgoal_heads", False))
+        or not bool(getattr(args, "aux_settlement_pointer_head", False))
+        or shared.get("selected_aux_coefficient_decimal") != selected_decimal
+    ):
+        raise SystemExit("A1 aux regularization arm/weight/architecture drift")
+    receipt_path, receipt_file_sha, receipt_bytes = (
+        _stable_canonical_regular_file(
+            str(binding["upgrade_receipt"]),
+            where="A1 aux upgrade receipt",
+        )
+    )
+    upgrade_initializer_path, upgrade_initializer_sha, _ = (
+        _stable_canonical_regular_file(
+            str(binding["upgrade_initializer"]),
+            where="A1 aux upgrade initializer",
+        )
+    )
+    initializer_path, initializer_sha, _ = _stable_canonical_regular_file(
+        str(binding["initializer"]),
+        where="A1 aux training initializer",
+    )
+    if (
+        receipt_file_sha != binding["upgrade_receipt_file_sha256"]
+        or upgrade_initializer_sha != binding["upgrade_initializer_sha256"]
+        or initializer_sha != binding["initializer_sha256"]
+        or str(args.init_checkpoint) != str(initializer_path)
+        or getattr(args, "init_checkpoint_sha256", "")
+        != binding["initializer_sha256"]
+    ):
+        raise SystemExit("A1 aux regularization receipt/initializer byte drift")
+    try:
+        receipt = json.loads(receipt_bytes.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as error:
+        raise SystemExit(f"cannot load A1 aux upgrade receipt: {error}") from error
+    if not isinstance(receipt, dict):
+        raise SystemExit("A1 aux upgrade receipt is not an object")
+    unsigned_receipt = dict(receipt)
+    receipt_digest = unsigned_receipt.pop("receipt_sha256", None)
+    if (
+        receipt.get("schema_version")
+        != "a1-function-preserving-architecture-upgrade-v1"
+        or receipt.get("module")
+        != "entity_graph.aux_subgoal_pointer_heads.v1"
+        or receipt_digest != binding["upgrade_receipt_digest"]
+        or _canonical_json_sha256(unsigned_receipt) != receipt_digest
+        or receipt.get("upgraded_initializer")
+        != {
+            "path": str(upgrade_initializer_path),
+            "sha256": binding["upgrade_initializer_sha256"],
+        }
+    ):
+        raise SystemExit("A1 aux upgrade receipt semantic drift")
+    if (
+        shared.get("upgrade_module") != binding["upgrade_module"]
+        or shared.get("upgrade_receipt_file_sha256")
+        != binding["upgrade_receipt_file_sha256"]
+        or shared.get("upgrade_receipt_digest")
+        != binding["upgrade_receipt_digest"]
+        or shared.get("initializer_sha256") != binding["initializer_sha256"]
+        or not _is_sha256(shared.get("pair_contract_state_sha256"))
+        or not _is_sha256(shared.get("p1_selection_authority_sha256"))
+        or not _is_sha256(shared.get("warmup_terminal_sha256"))
+        or not _is_sha256(shared.get("gradient_geometry_terminal_sha256"))
+        or not _is_sha256(shared.get("selector_rule_sha256"))
+    ):
+        raise SystemExit("A1 aux shared-pair identity drift")
+    if recipe_drift is not None:
+        expected_drift = (
+            {}
+            if expected_arm == "AUX0"
+            else {
+                "aux_subgoal_loss_weight": {
+                    "contract": 0.0,
+                    "effective": selected,
+                }
+            }
+        )
+        if recipe_drift != expected_drift:
+            raise SystemExit(
+                "matched aux arms may differ only by geometry-selected auxiliary loss"
+            )
+    return binding
+
+
 def _validate_a1_learner_training_recipe(
     args: argparse.Namespace,
     ddp: dict[str, int | bool],
@@ -5395,9 +6491,29 @@ def _validate_a1_learner_training_recipe(
     bound["decisive_training_semantics"] = _validate_a1_decisive_training_semantics(
         args, ddp, bound
     )
-    if bool(getattr(args, "per_game_policy_weight", False)) or str(
+    central_binding_raw = str(
+        getattr(args, "a1_central_learner_binding_json", "") or ""
+    )
+    central_authority_path = str(
+        getattr(args, "a1_central_executor_authority", "") or ""
+    )
+    central_authority_sha = str(
+        getattr(args, "a1_central_executor_authority_sha256", "") or ""
+    )
+    if bool(central_authority_path) != bool(central_authority_sha) or bool(
+        central_binding_raw
+    ) != bool(central_authority_path):
+        raise SystemExit(
+            "central learner projection and executor-authority path/SHA must be "
+            "supplied together"
+        )
+    if not central_binding_raw and (
+        bool(getattr(args, "per_game_policy_weight", False))
+        or str(
         getattr(args, "per_game_policy_weight_mode", "equal")
-    ) != "equal":
+        )
+        != "equal"
+    ):
         raise SystemExit(
             "A1 single-contract learner does not bind per-game policy weighting; "
             "use an explicitly authorized diagnostic recipe"
@@ -5411,6 +6527,273 @@ def _validate_a1_learner_training_recipe(
     if batch_probe is not None:
         bound["learner_ablation"] = batch_probe
         bound["batch_probe_authorization"] = batch_probe
+        return effective
+    if central_binding_raw:
+        if any(
+            str(getattr(args, name, "") or "")
+            for name in (
+                "a1_learner_ablation_id",
+                "a1_effective_learner_recipe_json",
+                "a1_effective_learner_recipe_sha256",
+                "a1_ablation_code_binding_json",
+                "a1_ablation_code_tree_sha256",
+                "a1_reviewed_lock_file_sha256",
+            )
+        ):
+            raise SystemExit(
+                "central learner authority is mutually exclusive with generic A1 "
+                "ablation/AUX metadata"
+            )
+        try:
+            central = json.loads(central_binding_raw)
+        except json.JSONDecodeError as error:
+            raise SystemExit(
+                f"invalid A1 central learner binding JSON: {error}"
+            ) from error
+        expected_keys = {
+            "schema_version",
+            "stage",
+            "central_authority_schema",
+            "central_authority_sha256",
+            "executor_authority_path",
+            "executor_authority_file_sha256",
+            "executor_authority_state_sha256",
+            "selected_aux_decision",
+            "diagnostic_only",
+            "promotion_eligible",
+            "eligible_for_full_gate",
+            "full_gate_required",
+            "immutable_contract_recipe",
+            "immutable_contract_recipe_sha256",
+            "effective_recipe",
+            "effective_recipe_sha256",
+            "initializer_sha256",
+            "sample_binding",
+            "code_binding",
+            "code_tree_sha256",
+            "reviewed_lock_file_sha256",
+        }
+        if not isinstance(central, dict) or set(central) != expected_keys:
+            raise SystemExit("A1 central learner binding shape drift")
+        stage = central.get("stage")
+        selected_aux = central.get("selected_aux_decision")
+        if (
+            central.get("schema_version") != "a1-central-learner-binding-v3"
+            or stage not in {"P1", "AUX0", "AUXT", "FINAL"}
+            or not _is_sha256(central.get("central_authority_sha256"))
+            or not isinstance(central.get("central_authority_schema"), str)
+            or not central["central_authority_schema"]
+            or not _is_sha256(central.get("executor_authority_file_sha256"))
+            or not _is_sha256(central.get("executor_authority_state_sha256"))
+            or not isinstance(central.get("executor_authority_path"), str)
+            or not central["executor_authority_path"]
+            or central.get("immutable_contract_recipe_sha256")
+            != _canonical_json_sha256(expected)
+            or central.get("immutable_contract_recipe") != expected
+            or central.get("effective_recipe") != effective
+            or central.get("effective_recipe_sha256")
+            != _canonical_json_sha256(effective)
+            or not _is_sha256(central.get("reviewed_lock_file_sha256"))
+            or central.get("initializer_sha256")
+            != getattr(args, "init_checkpoint_sha256", "")
+        ):
+            raise SystemExit("A1 central learner authority/recipe binding drift")
+        published_executor_authority = _validate_a1_published_executor_authority(
+            args, central
+        )
+        sample_binding = central.get("sample_binding")
+        sample_keys = {
+            "schema_version",
+            "sample_receipt_state_sha256",
+            "descriptor_sha256",
+            "payload_inventory_sha256",
+            "category_semantics",
+            "category_semantics_sha256",
+            "source_authority",
+            "sampler_identity_sha256",
+            "sample_order_sha256",
+            "row_set_sha256",
+            "unique_row_count",
+            "rows_file_sha256",
+            "sample_dose",
+            "sampler_seed",
+            "prior_rows_file_sha256",
+            "prior_row_set_sha256",
+            "kl_eligible_rows",
+            "kl_eligible_mass_decimal",
+            "kl_ordered_evidence_sha256",
+            "kl_eligible_evidence_sha256",
+        }
+        if (
+            not isinstance(sample_binding, dict)
+            or set(sample_binding) != sample_keys
+            or sample_binding.get("schema_version")
+            != "a1-central-sample-binding-v2"
+            or any(
+                not _is_sha256(sample_binding.get(field))
+                for field in (
+                    "sample_receipt_state_sha256",
+                    "descriptor_sha256",
+                    "payload_inventory_sha256",
+                    "category_semantics_sha256",
+                    "sampler_identity_sha256",
+                    "sample_order_sha256",
+                    "row_set_sha256",
+                    "rows_file_sha256",
+                    "kl_ordered_evidence_sha256",
+                    "kl_eligible_evidence_sha256",
+                )
+            )
+            or sample_binding.get("category_semantics_sha256")
+            != _canonical_json_sha256(sample_binding.get("category_semantics"))
+            or not isinstance(sample_binding.get("source_authority"), dict)
+            or set(sample_binding["source_authority"])
+            != {"path", "file_sha256", "authority_sha256"}
+            or not _is_sha256(
+                sample_binding["source_authority"].get("file_sha256")
+            )
+            or not _is_sha256(
+                sample_binding["source_authority"].get("authority_sha256")
+            )
+            or sample_binding.get("sample_dose") != 524_288
+            or type(sample_binding.get("unique_row_count")) is not int
+            or not 0 < sample_binding["unique_row_count"] <= 524_288
+            or type(sample_binding.get("kl_eligible_rows")) is not int
+            or not 0 < sample_binding["kl_eligible_rows"] <= 524_288
+            or not isinstance(
+                sample_binding.get("kl_eligible_mass_decimal"), str
+            )
+            or sample_binding.get("sampler_seed")
+            != (424243 if stage == "FINAL" else 424242)
+            or (
+                stage == "FINAL"
+                and (
+                    not _is_sha256(sample_binding.get("prior_rows_file_sha256"))
+                    or not _is_sha256(sample_binding.get("prior_row_set_sha256"))
+                )
+            )
+            or (
+                stage != "FINAL"
+                and (
+                    sample_binding.get("prior_rows_file_sha256") is not None
+                    or sample_binding.get("prior_row_set_sha256") is not None
+                )
+            )
+        ):
+            raise SystemExit("A1 central learner sample binding drift")
+        expected_aux = (
+            None
+            if stage == "P1"
+            else stage
+            if stage in {"AUX0", "AUXT"}
+            else selected_aux
+        )
+        if (
+            selected_aux != expected_aux
+            or (stage == "FINAL" and selected_aux not in {"AUX0", "AUXT"})
+            or (stage != "FINAL" and central.get("full_gate_required") is not False)
+            or (stage == "FINAL" and central.get("full_gate_required") is not True)
+            or central.get("diagnostic_only") is (stage == "FINAL")
+            or central.get("promotion_eligible") is not False
+            or central.get("eligible_for_full_gate") is not (stage == "FINAL")
+        ):
+            raise SystemExit("A1 central learner scientific-role drift")
+        from a1_pre_wave_contract import CURRENT_LEARNER_TRAINING_RECIPE
+
+        authorized = dict(CURRENT_LEARNER_TRAINING_RECIPE)
+        authorized.update(
+            {
+                "world_size": 8,
+                "batch_size": 512,
+                "global_batch_size": 4096,
+                "grad_accum_steps": 1,
+                "policy_kl_anchor_weight": effective.get(
+                    "policy_kl_anchor_weight"
+                ),
+                "sampler_seed": 424243 if stage == "FINAL" else 424242,
+                "aux_subgoal_loss_weight": effective.get(
+                    "aux_subgoal_loss_weight"
+                ),
+            }
+        )
+        aux_weight = effective.get("aux_subgoal_loss_weight")
+        if (
+            effective != authorized
+            or sample_binding["sample_dose"]
+            != int(effective["max_steps"])
+            * int(effective["global_batch_size"])
+            * int(effective["grad_accum_steps"])
+            or sample_binding["sampler_seed"] != effective["sampler_seed"]
+            or not isinstance(aux_weight, (int, float))
+            or isinstance(aux_weight, bool)
+            or not math.isfinite(float(aux_weight))
+            or (selected_aux in {None, "AUX0"} and float(aux_weight) != 0.0)
+            or (
+                selected_aux == "AUXT"
+                and not 0.001 <= float(aux_weight) <= 0.05
+            )
+        ):
+            raise SystemExit("A1 central learner differs from the final v3 recipe")
+        aux_binding_raw = str(
+            getattr(args, "a1_aux_regularization_binding_json", "") or ""
+        )
+        if stage in {"AUX0", "AUXT"}:
+            expected_aux_drift = (
+                {}
+                if stage == "AUX0"
+                else {
+                    "aux_subgoal_loss_weight": {
+                        "contract": 0.0,
+                        "effective": float(aux_weight),
+                    }
+                }
+            )
+            aux_binding = _validate_a1_aux_regularization_binding(
+                args, recipe_drift=expected_aux_drift
+            )
+            if aux_binding is None or aux_binding.get("arm_id") != stage:
+                raise SystemExit(
+                    "central AUX learner lacks its exact commissioned pointer binding"
+                )
+            bound["central_aux_regularization"] = aux_binding
+        elif aux_binding_raw:
+            raise SystemExit(
+                "non-AUX central learner may not consume a diagnostic AUX binding"
+            )
+        code_binding = central.get("code_binding")
+        if not isinstance(code_binding, dict):
+            raise SystemExit("A1 central learner code binding is malformed")
+        unhashed_code = dict(code_binding)
+        embedded_code_sha = unhashed_code.pop("code_tree_sha256", None)
+        if (
+            embedded_code_sha != central.get("code_tree_sha256")
+            or _canonical_json_sha256(unhashed_code)
+            != central.get("code_tree_sha256")
+        ):
+            raise SystemExit("A1 central learner code-tree digest drift")
+        records = code_binding.get("records")
+        if not isinstance(records, list) or not records:
+            raise SystemExit("A1 central learner code binding has no records")
+        seen_paths: set[str] = set()
+        for record in records:
+            if not isinstance(record, dict) or set(record) != {
+                "kind",
+                "relative_path",
+                "path",
+                "sha256",
+            }:
+                raise SystemExit("A1 central learner code record is malformed")
+            path = Path(str(record["path"])).expanduser().resolve(strict=True)
+            if str(path) != record["path"] or str(path) in seen_paths:
+                raise SystemExit("A1 central learner code path drift/duplication")
+            seen_paths.add(str(path))
+            if _sha256_existing_file(str(path)) != record["sha256"]:
+                raise SystemExit(f"A1 central learner code file drift: {path}")
+        bound["learner_ablation"] = None
+        bound["central_learner_binding"] = central
+        bound["central_published_executor_authority"] = (
+            published_executor_authority
+        )
         return effective
     missing = set(expected) - set(effective)
     extra = set(effective) - set(expected)
@@ -5620,6 +7003,9 @@ def _validate_a1_learner_training_recipe(
             "contract": 1.0,
             "effective": float(effective["value_trunk_grad_scale"]),
         }
+    aux_regularization = _validate_a1_aux_regularization_binding(
+        args, recipe_drift=drift
+    )
     if not declared_json or not _is_sha256(declared_sha):
         raise SystemExit(
             "A1 learner ablation requires canonical effective recipe JSON and sha256"
@@ -5645,7 +7031,10 @@ def _validate_a1_learner_training_recipe(
         raise SystemExit(
             f"A1 effective recipe shape drift: missing={sorted(missing)} extra={sorted(extra)}"
         )
-    if not drift:
+    if not drift and (
+        aux_regularization is None
+        or aux_regularization.get("arm_id") != "AUX0"
+    ):
         raise SystemExit("A1 learner ablation must change at least one recipe field")
     if dual_topology_authorization is not None:
         allowed_dual_drift = {"epochs", "lr", "loser_sample_weight"}
@@ -5717,6 +7106,11 @@ def _validate_a1_learner_training_recipe(
         "code_binding": code_binding,
         "code_tree_sha256": declared_code_sha,
         "reviewed_lock_file_sha256": reviewed_lock_sha,
+        **(
+            {"matched_aux_regularization": aux_regularization}
+            if aux_regularization is not None
+            else {}
+        ),
     }
     if dual_topology_authorization is not None:
         dual_topology_authorization = dict(dual_topology_authorization)
@@ -5950,9 +7344,16 @@ def _validated_public_award_corpus_provenance(data: Any) -> dict[str, object]:
                     raise SystemExit(
                         f"memmap component {index} lacks authenticated corrected public-award provenance"
                     )
+        component_ids = tuple(getattr(data, "component_ids", tuple()))
         components.append(
             {
                 "component_index": index,
+                "component_id": (
+                    component_ids[index]
+                    if index < len(component_ids)
+                    else f"component_{index}"
+                ),
+                "row_count": int(len(corpus)) if hasattr(corpus, "__len__") else None,
                 "contract": contract,
                 "provenance_authenticated": True,
                 "source_manifest_bindings_sha256": binding_sha,
@@ -5970,6 +7371,188 @@ def _validated_public_award_corpus_provenance(data: Any) -> dict[str, object]:
         "components": components,
         "components_sha256": _canonical_json_sha256(components),
     }
+
+
+def _audit_public_award_component_column(
+    corpus: Any,
+    *,
+    component_id: str,
+    contract: str,
+    chunk_rows: int = 65_536,
+) -> dict[str, object]:
+    """Prove the slot-12 payload semantics of one homogeneous component."""
+
+    if "player_tokens" not in corpus:
+        raise SystemExit(
+            f"public-award component {component_id} lacks player_tokens"
+        )
+    column = corpus["player_tokens"]
+    shape = tuple(int(value) for value in getattr(column, "shape", ()))
+    if len(shape) != 3 or shape[-1] <= PLAYER_LONGEST_ROAD_SLOT:
+        raise SystemExit(
+            f"public-award component {component_id} has invalid player_tokens shape {shape}"
+        )
+    rows = int(len(corpus))
+    rows_with_award = 0
+    award_values = 0
+    block_rows = max(1, int(chunk_rows))
+    for start in range(0, rows, block_rows):
+        stop = min(start + block_rows, rows)
+        tokens = np.asarray(column[start:stop])
+        slot = np.asarray(tokens[..., PLAYER_LONGEST_ROAD_SLOT])
+        if not np.isfinite(slot).all() or bool(np.any((slot != 0) & (slot != 1))):
+            raise SystemExit(
+                f"public-award component {component_id} slot12 is not a finite binary feature"
+            )
+        active = slot != 0
+        rows_with_award += int(np.count_nonzero(np.any(active, axis=1)))
+        award_values += int(np.count_nonzero(active))
+    if (
+        contract == PUBLIC_AWARD_FEATURE_CONTRACT_LEGACY_ZERO
+        and award_values != 0
+    ):
+        raise SystemExit(
+            f"legacy public-award component {component_id} contains nonzero slot12 values"
+        )
+    if (
+        contract == PUBLIC_AWARD_FEATURE_CONTRACT_AUTHORITATIVE
+        and rows_with_award <= 0
+    ):
+        raise SystemExit(
+            f"corrected public-award component {component_id} has no positive slot12 support"
+        )
+    result: dict[str, object] = {
+        "component_id": component_id,
+        "contract": contract,
+        "rows": rows,
+        "rows_with_award": rows_with_award,
+        "nonzero_award_values": award_values,
+        "legacy_slot12_all_zero": (
+            award_values == 0
+            if contract == PUBLIC_AWARD_FEATURE_CONTRACT_LEGACY_ZERO
+            else None
+        ),
+        "corrected_positive_support": (
+            rows_with_award > 0
+            if contract == PUBLIC_AWARD_FEATURE_CONTRACT_AUTHORITATIVE
+            else None
+        ),
+    }
+    result["audit_sha256"] = _canonical_json_sha256(result)
+    return result
+
+
+def _authorize_mixed_public_award_transition(data: Any) -> dict[str, object]:
+    """Authorize the one exact 64/12/4/20 row-routed feature transition."""
+
+    corpora = tuple(getattr(data, "corpora", tuple()))
+    component_ids = tuple(getattr(data, "component_ids", tuple()))
+    ratios = tuple(getattr(data, "component_game_sampling_ratios", tuple()))
+    if (
+        component_ids != _MIXED_AWARD_COMPONENT_IDS
+        or len(corpora) != len(_MIXED_AWARD_COMPONENT_IDS)
+        or len(ratios) != len(_MIXED_AWARD_COMPONENT_RATIOS)
+        or any(
+            not math.isclose(
+                float(observed), float(expected), rel_tol=0.0, abs_tol=1.0e-12
+            )
+            for observed, expected in zip(
+                ratios, _MIXED_AWARD_COMPONENT_RATIOS, strict=True
+            )
+        )
+    ):
+        raise SystemExit(
+            "mixed authoritative public-award transition requires the exact "
+            "64/12/4/20 production composite descriptor"
+        )
+    component_contracts = tuple(
+        str(
+            _validated_public_award_corpus_provenance(corpus)["contract"]
+        )
+        for corpus in corpora
+    )
+    if component_contracts != _MIXED_AWARD_COMPONENT_CONTRACTS:
+        raise SystemExit(
+            "mixed authoritative public-award transition requires three corrected "
+            "components and one homogeneous legacy replay component"
+        )
+    def _scan_components() -> list[dict[str, object]]:
+        return [
+            _audit_public_award_component_column(
+                corpus,
+                component_id=component_id,
+                contract=contract,
+            )
+            for corpus, component_id, contract in zip(
+                corpora, component_ids, component_contracts, strict=True
+            )
+        ]
+
+    # Every DDP rank maps the same immutable payload. Scan gigabytes of player
+    # tokens once, then broadcast the exact authenticated result. The helper
+    # also broadcasts rank-0 refusal as data so peers cannot hang in a later
+    # collective if the legacy-zero/corrected-support proof fails.
+    try:
+        import torch.distributed as dist
+
+        distributed = dist.is_available() and dist.is_initialized()
+    except ImportError:
+        distributed = False
+    if distributed:
+        audits = _rank0_authoritative_call(
+            {
+                "enabled": True,
+                "world_size": int(dist.get_world_size()),
+                "rank": int(dist.get_rank()),
+                "local_rank": int(os.environ.get("LOCAL_RANK", "0")),
+            },
+            "mixed public-award slot12 component audit",
+            _scan_components,
+        )
+    else:
+        audits = _scan_components()
+    # This authenticated component contract is the only runtime row router.
+    # Never infer corrected-vs-legacy from the feature values themselves.
+    data.public_award_component_contracts = component_contracts
+    corrected_rows = sum(
+        int(row["rows"])
+        for row in audits
+        if row["contract"] == PUBLIC_AWARD_FEATURE_CONTRACT_AUTHORITATIVE
+    )
+    legacy_rows = sum(
+        int(row["rows"])
+        for row in audits
+        if row["contract"] == PUBLIC_AWARD_FEATURE_CONTRACT_LEGACY_ZERO
+    )
+    result: dict[str, object] = {
+        "schema_version": _MIXED_AWARD_TRANSITION_SCHEMA,
+        "routing_authority": "authenticated_component_identity_not_feature_values",
+        "component_ids": list(component_ids),
+        "component_sampling_ratios": [float(value) for value in ratios],
+        "component_contracts": list(component_contracts),
+        "component_audits": audits,
+        "corrected_corpus_rows": corrected_rows,
+        "legacy_corpus_rows": legacy_rows,
+        "corrected_sampler_mass": float(
+            sum(
+                ratio
+                for ratio, contract in zip(ratios, component_contracts, strict=True)
+                if contract == PUBLIC_AWARD_FEATURE_CONTRACT_AUTHORITATIVE
+            )
+        ),
+        "legacy_sampler_mass": float(
+            sum(
+                ratio
+                for ratio, contract in zip(ratios, component_contracts, strict=True)
+                if contract == PUBLIC_AWARD_FEATURE_CONTRACT_LEGACY_ZERO
+            )
+        ),
+        "legacy_rows_zero_slot12": True,
+        "corrected_rows_pass_slot12": True,
+        "checkpoint_contract": PUBLIC_AWARD_FEATURE_CONTRACT_AUTHORITATIVE,
+    }
+    result["transition_sha256"] = _canonical_json_sha256(result)
+    return result
 
 
 def _configure_public_award_feature_training(
@@ -6009,16 +7592,16 @@ def _configure_public_award_feature_training(
             "mixed legacy/corrected public-award corpus requires "
             "--allow-mixed-public-award-feature-contracts"
         )
+    mixed_transition = None
     if (
         corpus_contract == PUBLIC_AWARD_FEATURE_CONTRACT_MIXED
         and requested == PUBLIC_AWARD_FEATURE_CONTRACT_AUTHORITATIVE
     ):
-        raise SystemExit(
-            "mixed legacy/corrected public-award corpus cannot authorize authoritative_v1"
-        )
+        mixed_transition = _authorize_mixed_public_award_transition(data)
     if (
         requested == PUBLIC_AWARD_FEATURE_CONTRACT_AUTHORITATIVE
         and corpus_contract != PUBLIC_AWARD_FEATURE_CONTRACT_AUTHORITATIVE
+        and mixed_transition is None
     ):
         raise SystemExit(
             "authoritative_v1 training requires an entirely corrected, authenticated corpus"
@@ -6071,9 +7654,16 @@ def _configure_public_award_feature_training(
         "effective_contract": requested,
         "corpus_provenance": corpus,
         "mixed_corpus_acknowledged": allow_mixed,
+        "mixed_authoritative_transition": mixed_transition,
         "legacy_column_zero_initialized": zero_initialized,
-        "diagnostic_only": corpus_contract == PUBLIC_AWARD_FEATURE_CONTRACT_MIXED,
-        "promotion_eligible": corpus_contract != PUBLIC_AWARD_FEATURE_CONTRACT_MIXED,
+        "diagnostic_only": (
+            corpus_contract == PUBLIC_AWARD_FEATURE_CONTRACT_MIXED
+            and mixed_transition is None
+        ),
+        "promotion_eligible": (
+            corpus_contract != PUBLIC_AWARD_FEATURE_CONTRACT_MIXED
+            or mixed_transition is not None
+        ),
     }
 
 
@@ -6251,13 +7841,20 @@ def main(argv: Sequence[str] | None = None) -> None:
             "memmap_composite_v1", "memmap_composite_v2"
         }
     )
+    a1_aux_stage_binding = _validate_a1_aux_stage_authority(
+        args,
+        composite_meta=a1_preflight_meta,
+        ddp=ddp,
+    )
+    args.a1_aux_stage_binding = a1_aux_stage_binding
     outcome_conditioned_policy_distillation = (
         _validate_outcome_conditioned_policy_distillation(
             args, a1_preflight_meta=a1_preflight_meta
         )
     )
     if is_memmap_composite:
-        _validate_composite_learner_recipe_authorization(args, a1_preflight_meta)
+        if a1_aux_stage_binding is None:
+            _validate_composite_learner_recipe_authorization(args, a1_preflight_meta)
         if int(args.validation_max_samples) != 0:
             raise SystemExit(
                 "authenticated composite validation requires --validation-max-samples 0; "
@@ -6402,6 +7999,9 @@ def main(argv: Sequence[str] | None = None) -> None:
     args.grow_from_checkpoint_sha256 = _sha256_existing_file(
         args.grow_from_checkpoint
     )
+    args.a1_aux_regularization_binding = (
+        _validate_a1_aux_regularization_binding(args, recipe_drift=None)
+    )
     # CAT-66 typed config + config-hash. Built after --hidden-size resolution so
     # the recorded width is the effective one; registered only on rank 0 to avoid
     # duplicate JSONL writes under DDP. A pure no-op to the run when no --config*
@@ -6438,8 +8038,11 @@ def main(argv: Sequence[str] | None = None) -> None:
         torch.cuda.set_device(ddp["local_rank"])
         dist.init_process_group(backend="nccl")
         args.device = f"cuda:{ddp['local_rank']}"
-    if args.amp == "bf16":
+    if args.float32_matmul_precision is not None:
+        torch.set_float32_matmul_precision(args.float32_matmul_precision)
+    elif args.amp == "bf16":
         torch.set_float32_matmul_precision("high")
+    if args.amp == "bf16":
         if str(args.device).startswith("cuda") and not torch.cuda.is_bf16_supported():
             raise SystemExit("--amp bf16 requested but CUDA device lacks BF16 support")
 
@@ -6472,7 +8075,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         raise SystemExit("--mask-hidden-info requires --arch entity_graph (masks player_tokens)")
     _MASK_HIDDEN_INFO_PLAYER_TOKENS = bool(args.mask_hidden_info)
 
-    rng = np.random.default_rng(args.seed)
+    sampler_seed = _resolved_sampler_seed(args)
+    rng = np.random.default_rng(sampler_seed)
     if args.data_format == "memmap":
         if bool(args.ddp_shard_data):
             raise SystemExit(
@@ -6539,6 +8143,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         ddp,
     )
     a1_training_binding: dict[str, object] | None = None
+    central_composite_binding: dict[str, object] | None = None
+    central_published_executor_authority: dict[str, object] | None = None
     if is_memmap_composite:
         _bind_composite_validation_provenance(
             args,
@@ -6547,6 +8153,62 @@ def main(argv: Sequence[str] | None = None) -> None:
             composite_meta=a1_preflight_meta,
             ddp=ddp,
         )
+        central_raw = str(
+            getattr(args, "a1_central_learner_binding_json", "") or ""
+        )
+        if central_raw:
+            try:
+                unverified_central = json.loads(central_raw)
+            except json.JSONDecodeError as error:
+                raise SystemExit(
+                    f"invalid A1 central learner binding JSON: {error}"
+                ) from error
+            immutable_recipe = (
+                unverified_central.get("immutable_contract_recipe")
+                if isinstance(unverified_central, dict)
+                else None
+            )
+            if not isinstance(immutable_recipe, dict):
+                raise SystemExit(
+                    "production composite central learner lacks its immutable recipe"
+                )
+            central_bound = {
+                "learner_training_recipe": copy.deepcopy(immutable_recipe),
+                "learner_training_recipe_sha256": _canonical_json_sha256(
+                    immutable_recipe
+                ),
+            }
+            central_bound["effective_learner_training_recipe"] = (
+                _validate_a1_learner_training_recipe(args, ddp, central_bound)
+            )
+            central_composite_binding = central_bound.get(
+                "central_learner_binding"
+            )
+            central_published_executor_authority = central_bound.get(
+                "central_published_executor_authority"
+            )
+            if not isinstance(central_composite_binding, dict):
+                raise SystemExit("central learner validation returned no binding")
+            if not isinstance(central_published_executor_authority, dict):
+                raise SystemExit(
+                    "central learner validation returned no published authority replay"
+                )
+            sample_binding = central_composite_binding["sample_binding"]
+            if (
+                sample_binding["descriptor_sha256"]
+                != a1_preflight_meta["descriptor_file_sha256"]
+                or sample_binding["payload_inventory_sha256"]
+                != a1_preflight_meta["payload_inventory_sha256"]
+                or sample_binding["category_semantics"]
+                != a1_preflight_meta.get("category_semantics")
+                or sample_binding["category_semantics_sha256"]
+                != a1_preflight_meta.get("category_semantics_sha256")
+                or sample_binding["source_authority"]
+                != a1_preflight_meta.get("source_authority_ref")
+            ):
+                raise SystemExit(
+                    "central learner sample authority differs from composite bytes"
+                )
     elif validation_seed_contract is not None:
         _validate_a1_validation_manifest_corpus_binding(
             getattr(data, "meta", None), validation_seed_contract
@@ -6952,6 +8614,21 @@ def main(argv: Sequence[str] | None = None) -> None:
                 ddp,
             )
         trainable_prefixes = _parse_prefixes(args.require_only_trainable_prefixes)
+        if (
+            isinstance(getattr(args, "a1_aux_stage_binding", None), dict)
+            and args.a1_aux_stage_binding.get("stage") == "WARMUP"
+        ):
+            if not trainable_prefixes:
+                raise SystemExit("A1 AUX WARMUP requires an exact trainable prefix set")
+            unwrapped_for_warmup = getattr(policy.model, "module", policy.model)
+            for parameter_name, parameter in unwrapped_for_warmup.named_parameters():
+                normalized_name = parameter_name.removeprefix("module.")
+                parameter.requires_grad_(
+                    any(
+                        normalized_name.startswith(prefix)
+                        for prefix in trainable_prefixes
+                    )
+                )
         if trainable_prefixes:
             trainable_surface = _require_only_trainable_prefixes(
                 policy.model, trainable_prefixes
@@ -7070,37 +8747,64 @@ def main(argv: Sequence[str] | None = None) -> None:
                 output_device=ddp["local_rank"],
                 find_unused_parameters=bool(args.ddp_find_unused_parameters),
             )
-        training_rng = _initialize_training_rng(args, ddp)
+        training_rng = _initialize_training_rng(
+            args,
+            ddp,
+            checkpoint_loaded=bool(args.init_checkpoint),
+        )
+        training_information_surface = {
+            **(training_information_surface or {}),
+            "randomness_contract": training_rng,
+        }
         _rank0_print(
             json.dumps({"progress": "training_rng", **training_rng}, sort_keys=True),
             ddp,
         )
         policy.model.train()
-        optimizer_params = _build_optimizer_param_groups(
-            policy.model,
-            base_lr=float(args.lr),
-            value_lr_mult=float(args.value_lr_mult),
-            action_module_lr_mult=float(args.action_module_lr_mult),
-            trunk_lr_mult=float(args.trunk_lr_mult),
-            architecture=str(args.arch),
+        geometry_only = (
+            isinstance(getattr(args, "a1_aux_stage_binding", None), dict)
+            and args.a1_aux_stage_binding.get("stage") == "GEOMETRY"
         )
-        _rank0_print(
-            json.dumps(
-                {
-                    "progress": "optimizer_param_groups",
-                    "groups": _optimizer_param_group_report(
-                        optimizer_params, base_lr=float(args.lr)
-                    ),
-                },
-                sort_keys=True,
-            ),
-            ddp,
-        )
-        optimizer = _make_optimizer(
-            optimizer_params,
-            args,
-            getattr(policy, "device", args.device),
-        )
+        if geometry_only:
+            # The selector is a no-step/no-state probe.  Do not even construct
+            # Adam: this makes accidental moment mutation impossible by design.
+            optimizer = None
+            _rank0_print(
+                json.dumps(
+                    {
+                        "progress": "a1_aux_geometry_optimizer",
+                        "constructed": False,
+                    },
+                    sort_keys=True,
+                ),
+                ddp,
+            )
+        else:
+            optimizer_params = _build_optimizer_param_groups(
+                policy.model,
+                base_lr=float(args.lr),
+                value_lr_mult=float(args.value_lr_mult),
+                action_module_lr_mult=float(args.action_module_lr_mult),
+                trunk_lr_mult=float(args.trunk_lr_mult),
+                architecture=str(args.arch),
+            )
+            _rank0_print(
+                json.dumps(
+                    {
+                        "progress": "optimizer_param_groups",
+                        "groups": _optimizer_param_group_report(
+                            optimizer_params, base_lr=float(args.lr)
+                        ),
+                    },
+                    sort_keys=True,
+                ),
+                ddp,
+            )
+            optimizer = _make_optimizer(
+                optimizer_params,
+                args,
+                getattr(policy, "device", args.device),
+            )
         train_fn = _train_xdim_batch
 
     _rank0_authoritative_call(
@@ -7119,7 +8823,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     # fine-tune behaviour; the win is on resuming a run this code started.
     optimizer_restored = False
     resume_progress = None
-    if args.init_checkpoint and bool(args.resume_optimizer):
+    if optimizer is not None and args.init_checkpoint and bool(args.resume_optimizer):
         from catan_zero.rl.optim_state import (
             TrainingProgressError,
             load_optimizer_state,
@@ -7203,7 +8907,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         from catan_zero.rl.hex_symmetry import build_hex_symmetry
 
         symmetry = build_hex_symmetry()
-        symmetry_rng = np.random.default_rng(int(args.seed) + 20260705)
+        symmetry_rng = np.random.default_rng(sampler_seed + 20260705)
         _rank0_print(
             json.dumps(
                 {
@@ -7651,6 +9355,176 @@ def main(argv: Sequence[str] | None = None) -> None:
         ),
         ddp,
     )
+    if (
+        isinstance(a1_aux_stage_binding, dict)
+        and a1_aux_stage_binding.get("stage") == "GEOMETRY"
+    ):
+        authority = a1_aux_stage_binding["authority"]
+        science = authority["portable_science_identity"]
+        rule = science["selector_rule"]
+        manifest, global_positions = _a1_load_aux_geometry_manifest(
+            a1_aux_stage_binding,
+            rule=rule,
+            data=data,
+            train_indices=np.asarray(train_indices, dtype=np.int64),
+            validation_indices=np.asarray(validation_indices, dtype=np.int64),
+            composite_meta=a1_preflight_meta,
+        )
+        local_positions = global_positions[int(ddp["rank"]) :: int(ddp["world_size"])]
+        expected_local_rows = int(rule["probe_batches"]) * int(
+            rule["probe_batch_size"]
+        )
+        if local_positions.size != expected_local_rows or optimizer is not None:
+            raise SystemExit("A1 AUX GEOMETRY local dose/optimizer construction drift")
+        state_before = (
+            _a1_model_tensor_state_sha256(policy.model)
+            if int(ddp["rank"]) == 0
+            else None
+        )
+        per_batch: list[dict[str, object]] = []
+        geometry_numpy_generators = {"sampler": rng}
+        if symmetry_rng is not None:
+            geometry_numpy_generators["symmetry"] = symmetry_rng
+        geometry_cuda_device = (
+            int(ddp["local_rank"])
+            if str(args.device).startswith("cuda")
+            else None
+        )
+        with _isolated_aux_geometry_rng_transaction(
+            numpy_generators=geometry_numpy_generators,
+            cuda_device=geometry_cuda_device,
+        ) as rng_transaction:
+            # This transaction intentionally encloses the complete ordered
+            # five-batch pass. Restoring per batch would replay one dropout
+            # mask five times and corrupt the selector's measured geometry.
+            for batch_index in range(int(rule["probe_batches"])):
+                start_index = batch_index * int(rule["probe_batch_size"])
+                stop_index = start_index + int(rule["probe_batch_size"])
+                physical_batch = np.asarray(
+                    train_indices[local_positions[start_index:stop_index]],
+                    dtype=np.int64,
+                )
+                measured = _train_xdim_batch(
+                    policy,
+                    None,
+                    data,
+                    physical_batch,
+                    policy_sample_weights,
+                    value_sample_weights,
+                    args.soft_target_temperature,
+                    args.soft_target_weight,
+                    args.soft_target_source,
+                    args.soft_target_min_legal_coverage,
+                    args.policy_loss_weight,
+                    resolved_scalar_value_weight,
+                    args.final_vp_loss_weight,
+                    args.q_loss_weight,
+                    _parse_prefixes(args.q_skip_teacher_prefixes),
+                    args.vps_to_win,
+                    args.advantage_policy_weighting,
+                    args.advantage_temperature,
+                    args.advantage_weight_cap,
+                    args.advantage_weight_floor,
+                    args.amp,
+                    max_grad_norm=float(args.max_grad_norm),
+                    diagnostics=False,
+                    truncated_vp_margin_value_weight=float(
+                        args.truncated_vp_margin_value_weight
+                    ),
+                    policy_kl_anchor_weight=float(args.policy_kl_anchor_weight),
+                    policy_kl_anchor_direction=str(
+                        args.policy_kl_anchor_direction
+                    ),
+                    value_uncertainty_loss_weight=float(
+                        args.value_uncertainty_loss_weight
+                    ),
+                    aux_subgoal_loss_weight=1.0,
+                    belief_resource_loss_weight=float(
+                        args.belief_resource_loss_weight
+                    ),
+                    moe_balance_loss_weight=float(args.moe_balance_loss_weight),
+                    value_categorical_loss_weight=float(
+                        resolved_categorical_value_weight
+                    ),
+                    value_hlgauss_sigma_ratio=float(
+                        args.value_hlgauss_sigma_ratio
+                    ),
+                    value_target_lambda=float(args.value_target_lambda),
+                    value_root_blend_phases=tuple(
+                        value_root_blend_regime["phases"]
+                    ),
+                    value_root_blend_global_compat=(
+                        value_root_blend_regime["mode"] == "global_compat"
+                    ),
+                    measure_aux_gradient_geometry_only=True,
+                    value_trunk_grad_scale=float(args.value_trunk_grad_scale),
+                )
+                geometry = measured.get("aux_gradient_geometry")
+                if (
+                    not isinstance(geometry, dict)
+                    or geometry.get("updates_weights") is not False
+                    or geometry.get("same_forward") is not True
+                    or geometry.get("world_size") != 8
+                    or geometry.get("parameter_surface_sha256")
+                    != rule["shared_parameter_set_sha256"]
+                ):
+                    raise SystemExit("A1 AUX GEOMETRY measured surface drift")
+                per_batch.append(
+                    {
+                        "batch_index": batch_index,
+                        "shared_parameter_set_sha256": geometry[
+                            "parameter_surface_sha256"
+                        ],
+                        "main_squared_norm_decimal": format(
+                            float(geometry["main_gradient_sq_sum"]), ".17g"
+                        ),
+                        "unit_aux_squared_norm_decimal": format(
+                            float(geometry["unit_aux_gradient_sq_sum"]), ".17g"
+                        ),
+                        "gradient_dot_decimal": format(
+                            float(geometry["gradient_dot_product"]), ".17g"
+                        ),
+                    }
+                )
+        if bool(ddp["enabled"]):
+            import torch.distributed as dist
+
+            rng_transactions_by_rank: list[dict[str, object] | None] = [
+                None
+            ] * int(ddp["world_size"])
+            dist.all_gather_object(
+                rng_transactions_by_rank,
+                rng_transaction,
+            )
+        else:
+            rng_transactions_by_rank = [copy.deepcopy(rng_transaction)]
+        state_after = (
+            _a1_model_tensor_state_sha256(policy.model)
+            if int(ddp["rank"]) == 0
+            else None
+        )
+        if int(ddp["rank"]) == 0:
+            if state_after != state_before:
+                raise SystemExit("A1 AUX GEOMETRY mutated model tensor state")
+            geometry_report = {
+                "schema_version": "a1-aux-gradient-geometry-child-report-v1",
+                "stage_binding": a1_aux_stage_binding,
+                "probe_manifest": manifest,
+                "model_state_before_sha256": state_before,
+                "model_state_after_sha256": state_after,
+                "per_batch_geometry": per_batch,
+                "rng_transactions_by_rank": rng_transactions_by_rank,
+                "optimizer_constructed": False,
+                "optimizer_steps": 0,
+                "persistent_state_mutated": False,
+            }
+            write_json(Path(args.report), geometry_report)
+        if bool(ddp["enabled"]):
+            import torch.distributed as dist
+
+            dist.barrier()
+            dist.destroy_process_group()
+        return
     first_batch_profile = None
     (
         global_step,
@@ -7674,6 +9548,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     # exactly: every micro-batch zero-grads, backwards the undivided loss, clips,
     # and steps, and global_step (== optimizer steps) advances once per batch.
     accum = max(1, int(args.grad_accum_steps))
+    central_realized_sample_evidence: dict[str, object] | None = None
+    aux_stage_realized_sample_evidence: dict[str, object] | None = None
     for epoch in range(start_epoch, args.epochs):
         remaining_order_samples = None
         if int(args.max_steps) > 0 and epoch_sample_weights is not None:
@@ -7689,6 +9565,71 @@ def main(argv: Sequence[str] | None = None) -> None:
                 * int(args.batch_size)
                 * (int(ddp["world_size"]) if ddp["enabled"] else 1)
             )
+        central_payload: list[dict[str, object] | None] = [None]
+        central_global_order: np.ndarray | None = None
+        global_order_observer = None
+        aux_warmup_binding = (
+            a1_aux_stage_binding
+            if isinstance(a1_aux_stage_binding, dict)
+            and a1_aux_stage_binding.get("stage") == "WARMUP"
+            else None
+        )
+        observed_sample_binding: dict[str, object] | None = None
+        if central_composite_binding is not None:
+            observed_sample_binding = central_composite_binding["sample_binding"]
+        elif aux_warmup_binding is not None:
+            warmup_recipe = aux_warmup_binding["authority"][
+                "portable_science_identity"
+            ]["warmup_recipe"]
+            observed_sample_binding = {
+                "sample_dose": warmup_recipe["sample_dose"],
+                "sample_order_sha256": warmup_recipe["sample_order_sha256"],
+                "descriptor_sha256": warmup_recipe["descriptor_sha256"],
+                "payload_inventory_sha256": warmup_recipe[
+                    "payload_inventory_sha256"
+                ],
+            }
+        if observed_sample_binding is not None:
+            sample_binding = observed_sample_binding
+            expected_dose = int(sample_binding["sample_dose"])
+            exact_global_batch = (
+                int(args.batch_size)
+                * int(args.grad_accum_steps)
+                * int(ddp["world_size"])
+            )
+            if (
+                epoch != 0
+                or start_epoch != 0
+                or global_step != 0
+                or int(args.epochs) != 1
+                or expected_dose % exact_global_batch != 0
+                or remaining_order_samples != expected_dose
+            ):
+                raise SystemExit(
+                    "authenticated learner stage requires one fresh, unpadded exact dose"
+                )
+            if int(ddp["rank"]) == 0:
+
+                def _observe_central_order(global_order) -> None:
+                    nonlocal central_global_order
+                    central_global_order = np.asarray(
+                        global_order, dtype=np.int64
+                    ).copy()
+                    try:
+                        central_payload[0] = {
+                            "evidence": _a1_central_sample_order_evidence(
+                                data,
+                                train_indices=train_indices,
+                                validation_indices=validation_indices,
+                                global_order_positions=central_global_order,
+                                composite_meta=a1_preflight_meta,
+                                expected_sample_dose=expected_dose,
+                            )
+                        }
+                    except Exception as error:  # broadcast refusal; never strand peers
+                        central_payload[0] = {"error": str(error)}
+
+                global_order_observer = _observe_central_order
         order = _epoch_order(
             rng,
             len(train_indices),
@@ -7697,13 +9638,121 @@ def main(argv: Sequence[str] | None = None) -> None:
             data_sharded=bool(args.ddp_shard_data),
             sample_weights=epoch_sample_weights,
             max_samples=remaining_order_samples,
+            global_order_observer=global_order_observer,
         )
+        if observed_sample_binding is not None:
+            import torch.distributed as dist
+
+            if not bool(ddp["enabled"]) or not dist.is_initialized():
+                raise SystemExit("authenticated learner stage requires initialized 8-rank DDP")
+            local_order_tensor = torch.as_tensor(
+                np.asarray(order, dtype=np.int64),
+                dtype=torch.int64,
+                device=args.device,
+            )
+            local_length = torch.tensor(
+                [int(local_order_tensor.numel())],
+                dtype=torch.int64,
+                device=args.device,
+            )
+            gathered_lengths = [
+                torch.empty_like(local_length) for _ in range(int(ddp["world_size"]))
+            ]
+            dist.all_gather(gathered_lengths, local_length)
+            lengths = [int(value.item()) for value in gathered_lengths]
+            if len(set(lengths)) != 1:
+                raise SystemExit(
+                    f"authenticated learner rank order lengths drift: {lengths}"
+                )
+            gathered_orders = [
+                torch.empty_like(local_order_tensor)
+                for _ in range(int(ddp["world_size"]))
+            ]
+            dist.all_gather(gathered_orders, local_order_tensor)
+            if int(ddp["rank"]) == 0 and "error" not in (central_payload[0] or {}):
+                try:
+                    reconstructed = _a1_reinterleave_rank_stride_orders(
+                        [value.detach().cpu().numpy() for value in gathered_orders],
+                        expected_global_size=int(
+                            observed_sample_binding["sample_dose"]
+                        ),
+                    )
+                    if central_global_order is None or not np.array_equal(
+                        reconstructed, central_global_order
+                    ):
+                        raise RuntimeError(
+                            "rank-stride re-interleaving differs from sampled global order"
+                        )
+                except Exception as error:
+                    central_payload[0] = {"error": str(error)}
+            dist.broadcast_object_list(central_payload, src=0)
+            observed = central_payload[0]
+            if not isinstance(observed, dict):
+                raise SystemExit("authenticated learner sample observer returned no evidence")
+            if "error" in observed:
+                raise SystemExit(
+                    f"authenticated learner sample-order preflight refused: {observed['error']}"
+                )
+            if central_composite_binding is not None:
+                try:
+                    central_realized_sample_evidence = (
+                        _a1_verify_realized_central_sample_order(
+                            observed["evidence"],
+                            central_composite_binding["sample_binding"],
+                        )
+                    )
+                except RuntimeError as error:
+                    raise SystemExit(str(error)) from error
+            else:
+                realized = observed["evidence"]
+                warmup_drift = {
+                    field: {
+                        "expected": observed_sample_binding[field],
+                        "actual": realized.get(actual_field),
+                    }
+                    for field, actual_field in {
+                        "sample_order_sha256": "sample_order_sha256",
+                        "descriptor_sha256": "descriptor_sha256",
+                        "payload_inventory_sha256": "payload_inventory_sha256",
+                        "sample_dose": "sample_dose",
+                    }.items()
+                    if realized.get(actual_field) != observed_sample_binding[field]
+                }
+                if warmup_drift:
+                    raise SystemExit(
+                        f"A1 AUX WARMUP realized sample-order drift: {warmup_drift}"
+                    )
+                aux_stage_realized_sample_evidence = dict(realized)
+            try:
+                printable_evidence = (
+                    central_realized_sample_evidence
+                    if central_composite_binding is not None
+                    else aux_stage_realized_sample_evidence
+                )
+                if printable_evidence is None:
+                    raise RuntimeError("authenticated sample evidence was not retained")
+            except RuntimeError as error:
+                raise SystemExit(str(error)) from error
+            _rank0_print(
+                json.dumps(
+                    {
+                        "progress": (
+                            "a1_central_realized_sample_order"
+                            if central_composite_binding is not None
+                            else "a1_aux_warmup_realized_sample_order"
+                        ),
+                        **printable_evidence,
+                    },
+                    sort_keys=True,
+                ),
+                ddp,
+            )
         aux_order = None
         if policy_aux_sampling_weights is not None:
             # Stateless per-epoch seed preserves exact resume behavior without
             # perturbing or extending the historical persisted base RNG state.
             policy_aux_rng = np.random.default_rng(
-                np.random.SeedSequence([int(args.seed), 0xA17C1E, int(epoch)])
+                np.random.SeedSequence([sampler_seed, 0xA17C1E, int(epoch)])
             )
             local_aux_draws = (
                 int(np.ceil(len(order) / max(1, int(args.batch_size))))
@@ -8641,6 +10690,22 @@ def main(argv: Sequence[str] | None = None) -> None:
     )
     report = {
         "checkout_runtime_binding": checkout_runtime_binding,
+        "training_resume_recipe_identity": resume_recipe_identity,
+        "training_resume_recipe_identity_sha256": _canonical_json_sha256(
+            resume_recipe_identity
+        ),
+        "a1_central_learner_binding": central_composite_binding,
+        "a1_central_published_executor_authority": (
+            central_published_executor_authority
+        ),
+        "a1_realized_central_sample_order": central_realized_sample_evidence,
+        "a1_aux_stage_binding": a1_aux_stage_binding,
+        "a1_realized_aux_stage_sample_order": (
+            aux_stage_realized_sample_evidence
+        ),
+        "a1_aux_regularization_binding": getattr(
+            args, "a1_aux_regularization_binding", None
+        ),
         "arch": args.arch,
         "config_hash": train_config_hash,
         "samples": int(n),
@@ -8674,8 +10739,15 @@ def main(argv: Sequence[str] | None = None) -> None:
         )
         if getattr(policy, "policy_type", None) == "entity_graph"
         else PUBLIC_AWARD_FEATURE_CONTRACT_LEGACY_ZERO,
+        "entity_feature_adapter_version": (
+            policy_entity_feature_adapter_version(policy)
+            if getattr(policy, "policy_type", "") == "entity_graph"
+            else None
+        ),
         "public_award_feature_training": public_award_feature_training,
         "seed": int(args.seed),
+        "sampler_seed": int(sampler_seed),
+        "sampler_seed_explicit": getattr(args, "sampler_seed", None) is not None,
         # Promotion receipts must be able to distinguish the historical
         # identical-per-rank dropout stream from the opt-in rank-offset RNG
         # trajectory.  The effective A1 recipe already binds this field, but
@@ -8975,12 +11047,29 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "descriptor_file_sha256": a1_preflight_meta["descriptor_file_sha256"],
                 "descriptor_fingerprint": a1_preflight_meta["descriptor_fingerprint"],
                 "payload_inventory_sha256": a1_preflight_meta["payload_inventory_sha256"],
+                "category_semantics": a1_preflight_meta.get(
+                    "category_semantics"
+                ),
+                "category_semantics_sha256": a1_preflight_meta.get(
+                    "category_semantics_sha256"
+                ),
                 "learner_recipe_overrides": a1_preflight_meta[
                     "learner_recipe_overrides"
                 ],
                 "learner_recipe_overrides_sha256": a1_preflight_meta[
                     "learner_recipe_overrides_sha256"
                 ],
+                "aux_subgoal_target_contract_sha256": a1_preflight_meta[
+                    "aux_subgoal_target_contract_sha256"
+                ],
+                "public_award_feature_transition_contract_sha256": (
+                    a1_preflight_meta[
+                        "public_award_feature_transition_contract_sha256"
+                    ]
+                ),
+                "source_authority_semantic_sha256": a1_preflight_meta.get(
+                    "source_authority_semantic_sha256"
+                ),
                 "component_count": len(a1_preflight_meta["components"]),
                 "component_ids": a1_preflight_meta.get("component_ids", []),
                 "component_game_sampling_ratios": a1_preflight_meta.get(
@@ -9026,6 +11115,26 @@ def main(argv: Sequence[str] | None = None) -> None:
         if a1_training_binding is None
         else a1_training_binding.get("learner_ablation")
     )
+    if central_composite_binding is not None:
+        report.update(
+            {
+                "a1_effective_learner_training_recipe": (
+                    central_composite_binding["effective_recipe"]
+                ),
+                "a1_effective_learner_training_recipe_sha256": (
+                    central_composite_binding["effective_recipe_sha256"]
+                ),
+                "diagnostic_only": bool(
+                    central_composite_binding["diagnostic_only"]
+                ),
+                "promotion_eligible": bool(
+                    central_composite_binding["promotion_eligible"]
+                ),
+                "eligible_for_full_gate": bool(
+                    central_composite_binding["eligible_for_full_gate"]
+                ),
+            }
+        )
     if learner_ablation is not None:
         report.update(
             {
@@ -9265,6 +11374,67 @@ def _train_candidate_batch(
     }
 
 
+def _public_award_authoritative_row_mask(
+    data: Any, batch: np.ndarray
+) -> np.ndarray | None:
+    """Resolve mixed-transition rows from authenticated component identity."""
+
+    explicit = data.get("_public_award_authoritative_row_mask")
+    if explicit is not None:
+        mask = np.asarray(explicit[batch], dtype=np.bool_)
+        if mask.shape != (len(batch),):
+            raise RuntimeError("materialized public-award row mask shape drift")
+        return mask
+    contracts = tuple(
+        getattr(data, "public_award_component_contracts", tuple())
+    )
+    if not contracts:
+        return None
+    component_lookup = getattr(data, "component_indices_for_rows", None)
+    if not callable(component_lookup):
+        raise RuntimeError("public-award component router lost row identity")
+    components = np.asarray(component_lookup(batch), dtype=np.int64)
+    if components.shape != (len(batch),) or bool(
+        np.any((components < 0) | (components >= len(contracts)))
+    ):
+        raise RuntimeError("public-award component row mapping drift")
+    contract_array = np.asarray(contracts, dtype=object)
+    resolved = contract_array[components]
+    if bool(
+        np.any(
+            ~np.isin(
+                resolved,
+                [
+                    PUBLIC_AWARD_FEATURE_CONTRACT_LEGACY_ZERO,
+                    PUBLIC_AWARD_FEATURE_CONTRACT_AUTHORITATIVE,
+                ],
+            )
+        )
+    ):
+        raise RuntimeError("public-award row router observed unsupported contract")
+    return resolved == PUBLIC_AWARD_FEATURE_CONTRACT_AUTHORITATIVE
+
+
+def _route_mixed_public_award_batch(
+    entity_batch: dict[str, np.ndarray], authoritative_rows: np.ndarray | None
+) -> dict[str, np.ndarray]:
+    """Zero slot12 only for authenticated legacy rows of an authoritative model."""
+
+    if authoritative_rows is None or bool(np.all(authoritative_rows)):
+        return entity_batch
+    player_tokens = np.asarray(entity_batch["player_tokens"])
+    mask = np.asarray(authoritative_rows, dtype=np.bool_)
+    if player_tokens.ndim != 3 or mask.shape != (player_tokens.shape[0],):
+        raise RuntimeError("mixed public-award batch/mask alignment drift")
+    routed = dict(entity_batch)
+    routed_players = np.array(player_tokens, copy=True)
+    routed_players[
+        ~mask, :, PLAYER_LONGEST_ROAD_SLOT
+    ] = 0
+    routed["player_tokens"] = routed_players
+    return routed
+
+
 def _entity_batch(data: dict, batch: np.ndarray) -> dict[str, np.ndarray]:
     missing = [key for key in ENTITY_BATCH_KEYS if key not in data]
     if missing:
@@ -9299,9 +11469,15 @@ def _entity_batch(data: dict, batch: np.ndarray) -> dict[str, np.ndarray]:
         # Load-time public-observation masking: zero non-actor hidden slots so a
         # model trained here matches the public-observation evaluator (task #72).
         result["player_tokens"] = _mask_player_tokens_public(result["player_tokens"])
-    return _apply_public_award_feature_contract(
+    result = _apply_public_award_feature_contract(
         result, _PUBLIC_AWARD_FEATURE_CONTRACT
     )
+    if _PUBLIC_AWARD_FEATURE_CONTRACT == PUBLIC_AWARD_FEATURE_CONTRACT_AUTHORITATIVE:
+        result = _route_mixed_public_award_batch(
+            result,
+            _public_award_authoritative_row_mask(data, batch),
+        )
+    return result
 
 
 def _forward_legal_np_for_batch(
@@ -9312,6 +11488,7 @@ def _forward_legal_np_for_batch(
     *,
     return_q: bool,
     return_final_vp: bool = True,
+    return_aux_subgoals: bool = False,
     value_trunk_grad_scale: float = 1.0,
     symmetry=None,
     symmetry_rng=None,
@@ -9340,6 +11517,7 @@ def _forward_legal_np_for_batch(
         forward_kwargs = {
             "return_q": return_q,
             "return_final_vp": return_final_vp,
+            "return_aux_subgoals": return_aux_subgoals,
         }
         if float(value_trunk_grad_scale) != 1.0:
             forward_kwargs["value_trunk_grad_scale"] = float(
@@ -9765,6 +11943,7 @@ def _train_xdim_batch(
     policy_aux_batch: np.ndarray | None = None,
     policy_aux_sample_weights: np.ndarray | None = None,
     measure_objective_gradient_interference: bool = False,
+    measure_aux_gradient_geometry_only: bool = False,
     value_trunk_grad_scale: float = 1.0,
 ) -> dict:
     import torch
@@ -9797,6 +11976,7 @@ def _train_xdim_batch(
             # is exactly off; XDim legacy policies retain their historical
             # always-emitted head because their forward API has no selector.
             return_final_vp=float(final_vp_loss_weight) != 0.0,
+            return_aux_subgoals=float(aux_subgoal_loss_weight) != 0.0,
             value_trunk_grad_scale=value_trunk_grad_scale,
             symmetry=symmetry,
             symmetry_rng=symmetry_rng,
@@ -10262,6 +12442,49 @@ def _train_xdim_batch(
                 value_objective=value_objective,
                 value_trunk_grad_scale=value_trunk_grad_scale,
             )
+        aux_gradient_geometry = None
+        if measure_aux_gradient_geometry_only:
+            if amp != "none" or symmetry is not None or symmetry_rng is not None:
+                raise ValueError(
+                    "commissioned AUX gradient geometry requires FP32 and no "
+                    "symmetry augmentation"
+                )
+            if float(aux_subgoal_loss_weight) <= 0.0:
+                raise ValueError(
+                    "commissioned AUX gradient geometry requires active pointer labels"
+                )
+            main_objective = (
+                float(policy_loss_weight) * policy_loss
+                + float(value_loss_weight) * value_loss
+                + float(final_vp_loss_weight) * final_vp_loss
+                + float(q_loss_weight) * q_loss
+                + float(policy_kl_anchor_weight) * kl_anchor_loss
+                + float(value_uncertainty_loss_weight) * value_uncertainty_loss
+                + float(value_categorical_loss_weight) * value_categorical_loss
+                + float(belief_resource_loss_weight) * belief_resource_loss
+                + float(moe_balance_loss_weight) * moe_balance_loss
+            )
+            aux_gradient_geometry = _aux_shared_trunk_gradient_geometry(
+                policy,
+                main_objective=main_objective,
+                unit_aux_objective=aux_subgoal_loss,
+            )
+    if measure_aux_gradient_geometry_only:
+        # This path is intentionally terminal before zero_grad/backward/clip/
+        # step.  The dedicated stage executor collects exactly five such
+        # records and must never emit a candidate checkpoint.
+        return {
+            "aux_gradient_geometry": aux_gradient_geometry,
+            "aux_subgoal_active_heads": int(aux_subgoal_active_heads),
+            "aux_subgoal_loss_parts": {
+                field: {
+                    "weighted_sum": float(parts["weighted_sum"].item()),
+                    "weight_sum": float(parts["weight_sum"].item()),
+                }
+                for field, parts in aux_subgoal_loss_parts.items()
+            },
+            "optimizer_step_applied": False,
+        }
     # C1 gradient accumulation. At grad_accum_steps==1 (accum_do_zero_grad and
     # accum_do_step both True) this is byte-identical to the pre-C1 path:
     # zero_grad, backward on the undivided loss, clip, step. For N>1 the loss is
@@ -11644,6 +13867,7 @@ def _eval_xdim_batch(
                 batch,
                 legal_action_ids,
                 return_q=float(q_loss_weight) != 0.0,
+                return_aux_subgoals=float(aux_subgoal_loss_weight) != 0.0,
             )
             hard_loss = nn.functional.cross_entropy(outputs["logits"], target, reduction="none")
             soft_targets, has_soft, soft_support = _soft_targets_legal(
@@ -12803,6 +15027,17 @@ def _iterate_training_batches(
             # Preserve the authenticated component scope after global memmap
             # rows are materialized into a local plain dict.
             materialized["_aux_subgoal_eligible"] = aux_subgoal_eligible
+        public_award_authoritative = _public_award_authoritative_row_mask(
+            data, batch
+        )
+        if public_award_authoritative is not None:
+            # Threaded prefetch replaces the authenticated composite object with
+            # a local dict. Carry the already-resolved per-row contract so the
+            # worker path cannot accidentally turn mixed routing into all-on or
+            # all-zero slot12 behavior.
+            materialized["_public_award_authoritative_row_mask"] = (
+                public_award_authoritative
+            )
         local = np.arange(len(batch), dtype=np.int64)
         return materialized, local, policy_sample_weights[batch], value_sample_weights[batch]
 
@@ -14185,14 +16420,19 @@ def validate_teacher_data_schema(policy, data: dict, data_quality: dict, env_con
         )
     if len(nonempty_adapters) > 1:
         problems.append(f"mixed adapter_version values: {nonempty_adapters}")
+    checkpoint_adapter_version = (
+        policy_entity_feature_adapter_version(policy)
+        if getattr(policy, "policy_type", "") == "entity_graph"
+        else ""
+    )
     if (
-        getattr(policy, "policy_type", "") == "entity_graph"
+        checkpoint_adapter_version
         and nonempty_adapters
-        and nonempty_adapters != [RUST_ENTITY_ADAPTER_VERSION]
+        and nonempty_adapters != [checkpoint_adapter_version]
     ):
         problems.append(
-            f"teacher adapter_version {nonempty_adapters} does not match current "
-            f"entity adapter {RUST_ENTITY_ADAPTER_VERSION!r}"
+            f"teacher adapter_version {nonempty_adapters} does not match checkpoint "
+            f"entity adapter {checkpoint_adapter_version!r}"
         )
     expected_static_hash = _expected_static_action_features_sha256(env_config)
     checkpoint_static_hash = _policy_static_action_features_sha256(policy)
@@ -15542,6 +17782,31 @@ def _validate_aux_subgoal_training_contract(
         component_ids = ("single_corpus",)
         eligible_components = (0,)
 
+    coverage_floors = {
+        "aux_longest_road": 0.999,
+        "aux_largest_army": 0.999,
+        "aux_vp_in_n": 0.999,
+        "aux_next_settlement": 0.69,
+        "aux_robber_target": 0.89,
+    }
+    target_domains = {
+        "aux_longest_road": {"kind": "binary", "values": [0.0, 1.0]},
+        "aux_largest_army": {"kind": "binary", "values": [0.0, 1.0]},
+        # Buildings/development VPs cannot be lost; only the two 2-VP awards
+        # can be lost (-4).  The physical maximum actual score is 18
+        # (9 building + 4 awards + 5 development VPs).
+        "aux_vp_in_n": {"kind": "scalar", "minimum": -4.0, "maximum": 18.0},
+        "aux_next_settlement": {
+            "kind": "categorical",
+            "ignore_index": -1,
+            "classes": 54,
+        },
+        "aux_robber_target": {
+            "kind": "categorical",
+            "ignore_index": -1,
+            "classes": 19,
+        },
+    }
     report_components = {
         component_id: {
             "component_index": int(component),
@@ -15549,6 +17814,7 @@ def _validate_aux_subgoal_training_contract(
             "training_rows": 0,
             "version_counts": {},
             "valid_target_rows": {key: 0 for key in AUX_TARGET_KEYS},
+            "valid_target_fraction": {key: 0.0 for key in AUX_TARGET_KEYS},
         }
         for component, component_id in enumerate(component_ids)
     }
@@ -15590,11 +17856,44 @@ def _validate_aux_subgoal_training_contract(
             valid_counts = row["valid_target_rows"]
             for key in AUX_TARGET_KEYS:
                 target = np.asarray(data[key][selected_rows])
-                valid = (
-                    target >= 0
-                    if key in {"aux_next_settlement", "aux_robber_target"}
-                    else np.isfinite(target)
-                )
+                domain = target_domains[key]
+                if domain["kind"] == "categorical":
+                    if target.dtype.kind not in {"i", "u"}:
+                        raise SystemExit(
+                            f"aux-subgoal categorical target {key} is not integer"
+                        )
+                    values = target.astype(np.int64, copy=False)
+                    if bool(
+                        np.any(
+                            (values < int(domain["ignore_index"]))
+                            | (values >= int(domain["classes"]))
+                        )
+                    ):
+                        raise SystemExit(
+                            f"aux-subgoal categorical target {key} is outside "
+                            f"[-1,{int(domain['classes']) - 1}]"
+                        )
+                    valid = values >= 0
+                else:
+                    values = target.astype(np.float64, copy=False)
+                    valid = np.isfinite(values)
+                    finite_values = values[valid]
+                    if domain["kind"] == "binary" and bool(
+                        np.any((finite_values != 0.0) & (finite_values != 1.0))
+                    ):
+                        raise SystemExit(
+                            f"aux-subgoal binary target {key} is not exactly 0/1"
+                        )
+                    if domain["kind"] == "scalar" and bool(
+                        np.any(
+                            (finite_values < float(domain["minimum"]))
+                            | (finite_values > float(domain["maximum"]))
+                        )
+                    ):
+                        raise SystemExit(
+                            f"aux-subgoal scalar target {key} is outside "
+                            f"[{domain['minimum']},{domain['maximum']}]"
+                        )
                 valid_counts[key] = int(valid_counts[key]) + int(np.count_nonzero(valid))
 
     eligible_ids = [component_ids[index] for index in eligible_components]
@@ -15614,12 +17913,29 @@ def _validate_aux_subgoal_training_contract(
                 f"authenticated aux-subgoal component {component_id!r} has no valid "
                 "training labels for " + ",".join(missing_labels)
             )
+        training_rows = int(row["training_rows"])
+        fractions = row["valid_target_fraction"]
+        below_floor: list[str] = []
+        for key, count in row["valid_target_rows"].items():
+            fraction = float(int(count) / training_rows)
+            fractions[key] = fraction
+            if fraction < coverage_floors[key]:
+                below_floor.append(
+                    f"{key}={fraction:.9f}<{coverage_floors[key]:.9f}"
+                )
+        if below_floor:
+            raise SystemExit(
+                f"authenticated aux-subgoal component {component_id!r} is below "
+                "declared coverage floors: " + ",".join(below_floor)
+            )
     return {
         "schema_version": "aux-subgoal-training-contract-v1",
         "enabled": True,
         "loss_weight": weight,
         "target_version": AUX_SUBGOAL_TARGET_VERSION,
         "target_semantic": AUX_SUBGOAL_TARGET_SEMANTIC,
+        "coverage_floors": coverage_floors,
+        "target_domains": target_domains,
         "component_ids": eligible_ids,
         "components": report_components,
     }
@@ -16580,6 +18896,381 @@ def _objective_gradient_interference(
         "combined_trunk_grad_norm": _float(torch.sqrt(combined_sq.clamp_min(0.0))),
         "modules": modules,
     }
+
+
+def _aux_shared_trunk_gradient_geometry(
+    policy,
+    *,
+    main_objective,
+    unit_aux_objective,
+) -> dict[str, object]:
+    """Measure the exact global main/AUX gradient geometry without an update.
+
+    Both objectives must come from one forward pass.  Unlike the historical
+    policy-vs-value diagnostic, this routine manually all-reduces each logical
+    trunk gradient because ``autograd.grad`` does not trigger DDP's reducer.
+    The losses produced by :func:`_weighted_mean_from_parts` are already scaled
+    by ``world_size / global_denominator``; averaging the rank gradients here
+    therefore reconstructs the gradient of the global objective exactly.
+
+    ``Parameter.grad`` must be empty on entry and remains empty.  This makes the
+    result suitable for the commissioned five-batch, no-update AUX selector and
+    prevents a probe from contaminating a subsequent optimizer step.
+    """
+
+    import torch
+    import torch.distributed as dist
+
+    model = policy.model
+    is_fsdp = "FullyShardedDataParallel" in type(model).__name__ or (
+        callable(getattr(model, "clip_grad_norm_", None))
+        and not isinstance(model, torch.nn.parallel.DistributedDataParallel)
+    )
+    if is_fsdp:
+        raise RuntimeError(
+            "AUX gradient geometry requires logical DDP parameters; FSDP flattens "
+            "the authenticated inherited-trunk surface"
+        )
+    named = _shared_trunk_named_parameters(policy)
+    if not named:
+        raise RuntimeError("AUX gradient geometry found no inherited trunk parameters")
+    if any(parameter.grad is not None for _, parameter in named):
+        raise RuntimeError("AUX gradient geometry requires empty Parameter.grad state")
+    if any(
+        not bool(getattr(objective, "requires_grad", False))
+        for objective in (main_objective, unit_aux_objective)
+    ):
+        raise RuntimeError("AUX gradient geometry objectives are inactive")
+
+    surface = [
+        {
+            "name": name,
+            "shape": [int(value) for value in parameter.shape],
+            "dtype": str(parameter.dtype),
+        }
+        for name, parameter in named
+    ]
+    parameters = [parameter for _, parameter in named]
+    main_gradients = torch.autograd.grad(
+        main_objective,
+        parameters,
+        retain_graph=True,
+        allow_unused=True,
+    )
+    aux_gradients = torch.autograd.grad(
+        unit_aux_objective,
+        parameters,
+        retain_graph=False,
+        allow_unused=True,
+    )
+    distributed = dist.is_available() and dist.is_initialized()
+    world_size = int(dist.get_world_size()) if distributed else 1
+    main_objective_metric = main_objective.detach().double().clone()
+    aux_objective_metric = unit_aux_objective.detach().double().clone()
+    if distributed:
+        # The DDP-correct weighted objectives are world-size-scaled local
+        # numerator contributions. Their rank average is the global scalar,
+        # matching the globally reconstructed gradients below.
+        dist.all_reduce(main_objective_metric, op=dist.ReduceOp.SUM)
+        dist.all_reduce(aux_objective_metric, op=dist.ReduceOp.SUM)
+        main_objective_metric.div_(world_size)
+        aux_objective_metric.div_(world_size)
+    zero = torch.zeros((), dtype=torch.float64, device=parameters[0].device)
+    main_sq = zero.clone()
+    aux_sq = zero.clone()
+    dot = zero.clone()
+    opposing = zero.clone()
+    jointly_nonzero = zero.clone()
+    by_module: dict[str, dict[str, object]] = {}
+    for (name, parameter), main_gradient, aux_gradient in zip(
+        named, main_gradients, aux_gradients, strict=True
+    ):
+        main = (
+            torch.zeros_like(parameter)
+            if main_gradient is None
+            else main_gradient.detach().clone()
+        )
+        aux = (
+            torch.zeros_like(parameter)
+            if aux_gradient is None
+            else aux_gradient.detach().clone()
+        )
+        if distributed:
+            dist.all_reduce(main, op=dist.ReduceOp.SUM)
+            dist.all_reduce(aux, op=dist.ReduceOp.SUM)
+            main.div_(world_size)
+            aux.div_(world_size)
+        main64 = main.double()
+        aux64 = aux.double()
+        parameter_main_sq = main64.square().sum()
+        parameter_aux_sq = aux64.square().sum()
+        parameter_dot = (main64 * aux64).sum()
+        joint = (main64 != 0) & (aux64 != 0)
+        main_sq += parameter_main_sq
+        aux_sq += parameter_aux_sq
+        dot += parameter_dot
+        jointly_nonzero += joint.sum(dtype=torch.float64)
+        opposing += (joint & ((main64 * aux64) < 0)).sum(dtype=torch.float64)
+        module_name = _objective_gradient_module_name(name)
+        row = by_module.setdefault(
+            module_name,
+            {"main_sq": zero.clone(), "aux_sq": zero.clone(), "dot": zero.clone()},
+        )
+        row["main_sq"] += parameter_main_sq
+        row["aux_sq"] += parameter_aux_sq
+        row["dot"] += parameter_dot
+
+    if any(parameter.grad is not None for _, parameter in named):
+        raise RuntimeError("AUX gradient geometry mutated Parameter.grad state")
+    epsilon = torch.finfo(torch.float64).eps
+    main_norm = torch.sqrt(main_sq)
+    aux_norm = torch.sqrt(aux_sq)
+    denominator = main_norm * aux_norm
+
+    def _number(value) -> float:
+        return float(value.detach().cpu().item())
+
+    modules: dict[str, dict[str, float | None]] = {}
+    for module_name, row in sorted(by_module.items()):
+        module_main = torch.sqrt(row["main_sq"])
+        module_aux = torch.sqrt(row["aux_sq"])
+        module_denominator = module_main * module_aux
+        modules[module_name] = {
+            "main_gradient_norm": _number(module_main),
+            "unit_aux_gradient_norm": _number(module_aux),
+            "gradient_dot_product": _number(row["dot"]),
+            "gradient_cosine": (
+                _number(row["dot"] / module_denominator.clamp_min(epsilon))
+                if _number(module_denominator) > 0.0
+                else None
+            ),
+        }
+    return {
+        "schema_version": "a1-aux-global-gradient-geometry-batch-v1",
+        "updates_weights": False,
+        "same_forward": True,
+        "aggregation": (
+            "manual_all_reduce_then_world_average_of_ddp_scaled_gradients"
+            if distributed
+            else "single_process_exact_gradient"
+        ),
+        "world_size": world_size,
+        "parameter_surface": surface,
+        "parameter_surface_sha256": _canonical_json_sha256(surface),
+        "main_objective": _number(main_objective_metric),
+        "unit_aux_objective": _number(aux_objective_metric),
+        # These additive sufficient statistics are the canonical cross-batch
+        # evidence.  The commissioned selector concatenates five ordered probe
+        # batches by summing them, then derives both norms and cosine itself.
+        # Averaging per-batch cosines would answer a different question and can
+        # hide cancellation.
+        "main_gradient_sq_sum": _number(main_sq),
+        "unit_aux_gradient_sq_sum": _number(aux_sq),
+        "main_gradient_norm": _number(main_norm),
+        "unit_aux_gradient_norm": _number(aux_norm),
+        "gradient_dot_product": _number(dot),
+        "gradient_cosine": (
+            _number(dot / denominator.clamp_min(epsilon))
+            if _number(denominator) > 0.0
+            else None
+        ),
+        "opposing_coordinate_fraction": (
+            _number(opposing / jointly_nonzero)
+            if _number(jointly_nonzero) > 0.0
+            else None
+        ),
+        "modules": modules,
+    }
+
+
+def _rng_json_value(value):
+    """Project Python/NumPy RNG state into one canonical JSON value.
+
+    NumPy bit generators do not all use the same state representation: PCG64
+    uses Python integers while MT19937 includes ndarrays.  A geometry receipt
+    must therefore hash the *actual* state without assuming one generator
+    family.  This helper is intentionally private to the no-update probe; the
+    normal checkpoint/resume format remains unchanged.
+    """
+
+    if value is None or isinstance(value, (bool, int, str)):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("RNG state contains a non-finite float")
+        return value
+    if isinstance(value, np.generic):
+        return _rng_json_value(value.item())
+    if isinstance(value, np.ndarray):
+        return {
+            "dtype": str(value.dtype),
+            "shape": [int(size) for size in value.shape],
+            "values": _rng_json_value(value.tolist()),
+        }
+    if isinstance(value, (list, tuple)):
+        return [_rng_json_value(item) for item in value]
+    if isinstance(value, dict):
+        if any(not isinstance(key, str) for key in value):
+            raise ValueError("RNG state mappings must use string keys")
+        return {
+            key: _rng_json_value(item) for key, item in sorted(value.items())
+        }
+    raise TypeError(f"unsupported RNG state value {type(value).__name__}")
+
+
+def _torch_rng_state_sha256(state) -> str:
+    """Hash an exact uint8 torch RNG state without tensor serialization noise."""
+
+    import torch
+
+    if not isinstance(state, torch.Tensor) or state.dtype != torch.uint8:
+        raise TypeError("torch RNG state must be a uint8 Tensor")
+    raw = state.detach().cpu().contiguous().numpy().tobytes(order="C")
+    return f"sha256:{hashlib.sha256(raw).hexdigest()}"
+
+
+def _capture_aux_geometry_rng_state(
+    *,
+    numpy_generators: dict[str, np.random.Generator],
+    cuda_device: int | None = None,
+) -> dict[str, object]:
+    """Capture every process-local RNG stream used by the five-batch probe."""
+
+    import torch
+
+    if not isinstance(numpy_generators, dict) or any(
+        not isinstance(name, str)
+        or not name
+        or not isinstance(generator, np.random.Generator)
+        for name, generator in numpy_generators.items()
+    ):
+        raise TypeError("numpy_generators must map non-empty names to Generators")
+    resolved_cuda_device: int | None = None
+    cuda_state = None
+    if cuda_device is not None:
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA RNG capture requested without CUDA")
+        resolved_cuda_device = int(cuda_device)
+        cuda_state = torch.cuda.get_rng_state(resolved_cuda_device).clone()
+    return {
+        "python_random": copy.deepcopy(random.getstate()),
+        "numpy": {
+            name: copy.deepcopy(generator.bit_generator.state)
+            for name, generator in sorted(numpy_generators.items())
+        },
+        "torch_cpu": torch.get_rng_state().clone(),
+        "cuda_device": resolved_cuda_device,
+        "torch_cuda": cuda_state,
+    }
+
+
+def _aux_geometry_rng_state_identity(snapshot: dict[str, object]) -> dict[str, object]:
+    """Return a compact, portable identity for one opaque RNG snapshot."""
+
+    python_state = _rng_json_value(snapshot["python_random"])
+    numpy_states = {
+        str(name): _rng_json_value(state)
+        for name, state in sorted(dict(snapshot["numpy"]).items())
+    }
+    python_sha = _canonical_json_sha256(python_state)
+    numpy_sha = {
+        name: _canonical_json_sha256(state)
+        for name, state in numpy_states.items()
+    }
+    torch_cpu_sha = _torch_rng_state_sha256(snapshot["torch_cpu"])
+    torch_cuda = snapshot["torch_cuda"]
+    torch_cuda_sha = (
+        None if torch_cuda is None else _torch_rng_state_sha256(torch_cuda)
+    )
+    identity: dict[str, object] = {
+        "schema_version": "a1-aux-geometry-rng-state-v1",
+        "python_random_sha256": python_sha,
+        "numpy_generator_sha256": numpy_sha,
+        "torch_cpu_sha256": torch_cpu_sha,
+        "cuda_device": snapshot["cuda_device"],
+        "torch_cuda_sha256": torch_cuda_sha,
+    }
+    identity["state_sha256"] = _canonical_json_sha256(identity)
+    return identity
+
+
+def _restore_aux_geometry_rng_state(
+    snapshot: dict[str, object],
+    *,
+    numpy_generators: dict[str, np.random.Generator],
+) -> None:
+    """Restore a process-local probe snapshot exactly."""
+
+    import torch
+
+    saved_numpy = dict(snapshot["numpy"])
+    if set(saved_numpy) != set(numpy_generators):
+        raise RuntimeError("AUX geometry NumPy generator set changed during probe")
+    random.setstate(copy.deepcopy(snapshot["python_random"]))
+    for name, generator in numpy_generators.items():
+        generator.bit_generator.state = copy.deepcopy(saved_numpy[name])
+    torch.set_rng_state(snapshot["torch_cpu"].clone())
+    cuda_device = snapshot["cuda_device"]
+    cuda_state = snapshot["torch_cuda"]
+    if cuda_device is not None:
+        if not torch.cuda.is_available() or cuda_state is None:
+            raise RuntimeError("cannot restore captured CUDA RNG state")
+        torch.cuda.set_rng_state(cuda_state.clone(), int(cuda_device))
+
+
+@contextmanager
+def _isolated_aux_geometry_rng_transaction(
+    *,
+    numpy_generators: dict[str, np.random.Generator],
+    cuda_device: int | None = None,
+):
+    """Consume five probe batches without persistently advancing any RNG.
+
+    The caller must wrap the *whole* ordered five-batch geometry pass in this
+    transaction.  Restoring after each batch would replay one dropout mask five
+    times and invalidate the selector.  The mutable evidence object is filled
+    only after restoration, including on exceptional exit.
+    """
+
+    snapshot = _capture_aux_geometry_rng_state(
+        numpy_generators=numpy_generators,
+        cuda_device=cuda_device,
+    )
+    before = _aux_geometry_rng_state_identity(snapshot)
+    evidence: dict[str, object] = {
+        "schema_version": "a1-aux-geometry-rng-transaction-v1",
+        "scope": "one_complete_ordered_five_batch_probe",
+        "restore_frequency": "once_after_all_five_batches",
+        "before": before,
+        "after_probe": None,
+        "after_restore": None,
+        "restored_exactly": False,
+    }
+    try:
+        yield evidence
+    finally:
+        after_probe_snapshot = _capture_aux_geometry_rng_state(
+            numpy_generators=numpy_generators,
+            cuda_device=cuda_device,
+        )
+        evidence["after_probe"] = _aux_geometry_rng_state_identity(
+            after_probe_snapshot
+        )
+        _restore_aux_geometry_rng_state(
+            snapshot,
+            numpy_generators=numpy_generators,
+        )
+        restored = _capture_aux_geometry_rng_state(
+            numpy_generators=numpy_generators,
+            cuda_device=cuda_device,
+        )
+        after = _aux_geometry_rng_state_identity(restored)
+        evidence["after_restore"] = after
+        evidence["restored_exactly"] = (
+            before["state_sha256"] == after["state_sha256"]
+        )
+        if evidence["restored_exactly"] is not True:
+            raise RuntimeError("AUX geometry probe failed to restore RNG state exactly")
 
 
 def _norms_from_squared_sums(squared_sums: dict[str, object]) -> dict[str, float]:
@@ -17864,6 +20555,7 @@ ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS: dict[str, tuple[str, ...]] = {
     "target_gather": ("target_gather_proj",),
     "edge_policy": ("edge_policy_mlp",),
     "action_cross": ("action_cross_blocks",),
+    "static_action_residual": ("static_action_residual_proj",),
     "value_heads": (
         "value_head",
         "value_categorical_head",
@@ -17890,6 +20582,7 @@ ENTITY_GRAPH_VALUE_ONLY_FREEZE_GROUPS: frozenset[str] = frozenset(
         "target_gather",
         "edge_policy",
         "action_cross",
+        "static_action_residual",
     }
 )
 
@@ -17926,6 +20619,7 @@ def _effective_entity_graph_architecture_report(
                 requested_aux_settlement_pointer_head
             ),
             "topology_residual_adapter": False,
+            "static_action_residual": False,
             "requested_edge_policy_head": bool(requested_edge_policy_head),
             "requested_aux_subgoal_heads": bool(requested_aux_subgoal_heads),
             "requested_aux_settlement_pointer_head": bool(
@@ -17950,6 +20644,9 @@ def _effective_entity_graph_architecture_report(
         ),
         "topology_residual_adapter": bool(
             getattr(config, "topology_residual_adapter", False)
+        ),
+        "static_action_residual": bool(
+            getattr(config, "static_action_residual", False)
         ),
         "belief_resource_head": bool(
             getattr(config, "belief_resource_head", False)
@@ -18145,6 +20842,7 @@ ACTION_LOCAL_MODULE_ATTRS: tuple[str, ...] = (
     "target_gather_proj",
     "action_cross_blocks",
     "edge_policy_mlp",
+    "static_action_residual_proj",
 )
 
 
@@ -18716,23 +21414,42 @@ def _distributed_state() -> dict[str, int | bool]:
     }
 
 
+def _resolved_sampler_seed(args: argparse.Namespace) -> int:
+    """Return the independent data-trajectory seed with a legacy exact default."""
+
+    value = getattr(args, "sampler_seed", None)
+    return int(args.seed if value is None else value)
+
+
 def _initialize_training_rng(
-    args: argparse.Namespace, ddp: dict[str, int | bool]
+    args: argparse.Namespace,
+    ddp: dict[str, int | bool],
+    *,
+    checkpoint_loaded: bool = False,
 ) -> dict[str, object]:
-    """Optionally split only the PyTorch training RNG by global rank.
+    """Bind the PyTorch training RNG after model construction/loading.
 
     Model construction/loading must happen first: all ranks need identical initial
     parameters for DDP. NumPy is deliberately untouched because ``_epoch_order`` and
     ``_policy_aux_epoch_order`` draw one deterministic global order and then slice it
-    by rank. Historical runs are an exact no-op when the opt-in flag is false.
+    by rank. Historical fresh-start runs are an exact no-op when the rank-offset flag
+    is false.
+
+    A checkpoint load is different: policy loaders construct a model before applying
+    the serialized state and that constructor historically calls ``torch.manual_seed``
+    with its default seed. Without an explicit post-load reset, dropout and every
+    other training-time torch draw therefore used the loader's implementation detail
+    (usually seed 0), not ``--seed``. Always rebind a loaded model to the configured
+    base seed; opt-in distributed runs retain their existing ``base_seed + rank``
+    trajectory exactly.
     """
 
     enabled = bool(getattr(args, "training_rng_rank_offset", False))
     rank = int(ddp.get("rank", 0))
     base_seed = int(args.seed)
     effective_seed: int | None = None
-    if enabled:
-        effective_seed = base_seed + rank
+    if enabled or checkpoint_loaded:
+        effective_seed = base_seed + rank if enabled else base_seed
         import torch
 
         torch.manual_seed(effective_seed)
@@ -18742,6 +21459,15 @@ def _initialize_training_rng(
         "base_seed": base_seed,
         "rank": rank,
         "effective_torch_seed": effective_seed,
+        "checkpoint_loaded": bool(checkpoint_loaded),
+        "post_load_reseeded": bool(checkpoint_loaded),
+        "sampler_seed": _resolved_sampler_seed(args),
+        "sampler_seed_explicit": getattr(args, "sampler_seed", None) is not None,
+        "numpy_data_trajectory_scope": [
+            "epoch_order",
+            "policy_aux_order",
+            "symmetry_and_data_transforms",
+        ],
         "numpy_epoch_order_rng_unchanged": True,
         "initial_parameters_unchanged": True,
     }
@@ -19200,6 +21926,339 @@ def _policy_aux_epoch_order(
     return np.asarray(global_order[rank::world], dtype=np.int64)
 
 
+def _a1_canonical_sample_row_identity(
+    *,
+    payload_member_sha256: str,
+    row_offset: int,
+    component_id: str,
+    prior_policy_present: bool,
+    legal_action_count: int,
+) -> str:
+    """Reproduce the scientific producer's physical-row identity exactly."""
+
+    return _canonical_json_sha256(
+        {
+            "schema_version": "a1-p1-kl-row-identity-v1",
+            "payload_member_sha256": payload_member_sha256,
+            "row_offset": int(row_offset),
+            "component_id": component_id,
+            "prior_policy_present": bool(prior_policy_present),
+            "legal_action_count": int(legal_action_count),
+        }
+    )
+
+
+def _a1_order_digest_update(
+    digest, *, index: int, row_identity_sha256: str
+) -> None:
+    digest.update(str(int(index)).encode("ascii"))
+    digest.update(b"\0")
+    digest.update(row_identity_sha256.encode("ascii"))
+    digest.update(b"\n")
+
+
+def _a1_row_set_sha256(row_identities) -> str:
+    digest = hashlib.sha256()
+    for identity in sorted(set(row_identities)):
+        digest.update(str(identity).encode("ascii"))
+        digest.update(b"\n")
+    return "sha256:" + digest.hexdigest()
+
+
+def _a1_central_sample_order_evidence(
+    data,
+    *,
+    train_indices: np.ndarray,
+    validation_indices: np.ndarray,
+    global_order_positions: np.ndarray,
+    composite_meta: dict[str, object],
+    expected_sample_dose: int,
+    chunk_rows: int = 16_384,
+) -> dict[str, object]:
+    """Bind the *physical* rows actually drawn by the central learner.
+
+    ``_epoch_order`` samples positions in ``train_indices``.  Hashing those
+    positions would be ambiguous across split changes, so this projection first
+    maps them to physical composite rows and then recreates the authenticated
+    component/payload/local-offset identity used by the independent producer.
+    It runs on rank 0 before the first optimizer step.
+    """
+
+    positions = np.asarray(global_order_positions, dtype=np.int64)
+    train = np.asarray(train_indices, dtype=np.int64)
+    validation = np.asarray(validation_indices, dtype=np.int64)
+    if positions.ndim != 1 or positions.size != int(expected_sample_dose):
+        raise RuntimeError(
+            "central learner global sample dose drift: "
+            f"expected={expected_sample_dose} actual={positions.size}"
+        )
+    if train.ndim != 1 or train.size < int(expected_sample_dose):
+        raise RuntimeError(
+            "central learner training split is smaller than the sealed dose"
+        )
+    if positions.size and (
+        int(positions.min()) < 0 or int(positions.max()) >= int(train.size)
+    ):
+        raise RuntimeError("central learner order contains a non-training position")
+    physical_rows = train[positions]
+    if validation.size and np.isin(physical_rows, validation).any():
+        raise RuntimeError("central learner sampled a validation-excluded physical row")
+    component_ids = tuple(getattr(data, "component_ids", tuple()))
+    component_offsets = np.asarray(
+        getattr(data, "component_offsets", tuple()), dtype=np.int64
+    )
+    raw_components = composite_meta.get("components")
+    if (
+        len(component_ids) != 4
+        or component_offsets.shape != (len(component_ids) + 1,)
+        or not isinstance(raw_components, list)
+        or len(raw_components) != len(component_ids)
+    ):
+        raise RuntimeError("central learner composite identity surface drift")
+    inventory = {}
+    for expected_id, raw in zip(component_ids, raw_components, strict=True):
+        if (
+            not isinstance(raw, dict)
+            or raw.get("component_id") != expected_id
+            or not _is_sha256(raw.get("payload_inventory_sha256"))
+        ):
+            raise RuntimeError("central learner component inventory drift")
+        inventory[expected_id] = str(raw["payload_inventory_sha256"])
+    component_indices = np.asarray(
+        data.component_indices_for_rows(physical_rows), dtype=np.int64
+    )
+    if component_indices.shape != positions.shape or (
+        component_indices.size
+        and (
+            int(component_indices.min()) < 0
+            or int(component_indices.max()) >= len(component_ids)
+        )
+    ):
+        raise RuntimeError("central learner physical-row component routing drift")
+    order_digest = hashlib.sha256()
+    eligible_digest = hashlib.sha256()
+    evidence_digest = hashlib.sha256()
+    identities: list[str] = []
+    eligible = 0
+    for start in range(0, int(positions.size), max(1, int(chunk_rows))):
+        stop = min(int(positions.size), start + max(1, int(chunk_rows)))
+        rows = physical_rows[start:stop]
+        components = component_indices[start:stop]
+        legal = np.asarray(data["legal_action_ids"][rows])
+        prior = np.asarray(data["prior_policy"][rows], dtype=np.float32)
+        valid = legal >= 0
+        legal_counts = valid.sum(axis=1)
+        has_prior = (prior * valid).sum(axis=1) > 1.0e-6
+        for local_index in range(stop - start):
+            draw_index = start + local_index
+            component_index = int(components[local_index])
+            component_id = component_ids[component_index]
+            row_offset = int(rows[local_index] - component_offsets[component_index])
+            identity = _a1_canonical_sample_row_identity(
+                payload_member_sha256=inventory[component_id],
+                row_offset=row_offset,
+                component_id=component_id,
+                prior_policy_present=bool(has_prior[local_index]),
+                legal_action_count=int(legal_counts[local_index]),
+            )
+            identities.append(identity)
+            _a1_order_digest_update(
+                order_digest,
+                index=draw_index,
+                row_identity_sha256=identity,
+            )
+            row_evidence = {
+                "draw_index": draw_index,
+                "row_identity_sha256": identity,
+                "payload_member_sha256": inventory[component_id],
+                "row_offset": row_offset,
+                "component_id": component_id,
+                "prior_policy_present": bool(has_prior[local_index]),
+                "legal_action_count": int(legal_counts[local_index]),
+            }
+            encoded = json.dumps(
+                row_evidence,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8") + b"\n"
+            evidence_digest.update(encoded)
+            if (
+                component_id == "historical_replay"
+                and bool(has_prior[local_index])
+                and int(legal_counts[local_index]) > 1
+            ):
+                eligible += 1
+                eligible_digest.update(encoded)
+    return {
+        "schema_version": "a1-realized-central-sample-order-v1",
+        "sample_dose": int(positions.size),
+        "sample_order_sha256": "sha256:" + order_digest.hexdigest(),
+        "row_set_sha256": _a1_row_set_sha256(identities),
+        "unique_row_count": len(set(identities)),
+        "kl_eligible_rows": int(eligible),
+        "kl_eligible_mass_decimal": format(
+            eligible / max(1, int(positions.size)), ".12f"
+        ).rstrip("0").rstrip("."),
+        "kl_ordered_evidence_sha256": "sha256:" + evidence_digest.hexdigest(),
+        "kl_eligible_evidence_sha256": "sha256:" + eligible_digest.hexdigest(),
+        "physical_row_identity": True,
+        "validation_rows_excluded": True,
+    }
+
+
+def _a1_reinterleave_rank_stride_orders(
+    rank_orders: list[np.ndarray], *, expected_global_size: int
+) -> np.ndarray:
+    """Invert ``order[rank::world_size]`` and reject padding/shape drift."""
+
+    if not rank_orders:
+        raise RuntimeError("central learner has no DDP rank orders")
+    arrays = [np.asarray(value, dtype=np.int64) for value in rank_orders]
+    if any(value.ndim != 1 for value in arrays):
+        raise RuntimeError("central learner rank order is not one-dimensional")
+    lengths = {int(value.size) for value in arrays}
+    if len(lengths) != 1:
+        raise RuntimeError("central learner rank-stride orders have unequal lengths")
+    reconstructed = np.stack(arrays, axis=1).reshape(-1)
+    if reconstructed.size != int(expected_global_size):
+        raise RuntimeError(
+            "central learner DDP order required padding or changed dose: "
+            f"expected={expected_global_size} actual={reconstructed.size}"
+        )
+    return reconstructed
+
+
+def _a1_verify_realized_central_sample_order(
+    realized: dict[str, object], sample_binding: dict[str, object]
+) -> dict[str, object]:
+    """Reject metadata echo: compare measurements from physical optimizer rows."""
+
+    comparisons = {
+        "sample_dose": "sample_dose",
+        "sample_order_sha256": "sample_order_sha256",
+        "row_set_sha256": "row_set_sha256",
+        "unique_row_count": "unique_row_count",
+        "kl_eligible_rows": "kl_eligible_rows",
+        "kl_eligible_mass_decimal": "kl_eligible_mass_decimal",
+        "kl_ordered_evidence_sha256": "kl_ordered_evidence_sha256",
+        "kl_eligible_evidence_sha256": "kl_eligible_evidence_sha256",
+    }
+    drift = {
+        field: {
+            "authority": sample_binding.get(binding_field),
+            "realized": realized.get(field),
+        }
+        for field, binding_field in comparisons.items()
+        if realized.get(field) != sample_binding.get(binding_field)
+    }
+    if (
+        realized.get("schema_version")
+        != "a1-realized-central-sample-order-v1"
+        or realized.get("physical_row_identity") is not True
+        or realized.get("validation_rows_excluded") is not True
+        or drift
+    ):
+        raise RuntimeError(f"central learner realized sample order drift: {drift}")
+    return dict(realized)
+
+
+def _a1_load_aux_geometry_manifest(
+    binding: Mapping[str, object],
+    *,
+    rule: Mapping[str, object],
+    data,
+    train_indices: np.ndarray,
+    validation_indices: np.ndarray,
+    composite_meta: Mapping[str, object],
+) -> tuple[dict[str, object], np.ndarray]:
+    """Stable-read and physically replay the preregistered five-batch probe."""
+
+    ref = binding.get("probe_manifest")
+    if not isinstance(ref, dict) or set(ref) != {"path", "file_sha256"}:
+        raise SystemExit("A1 AUX GEOMETRY probe-manifest reference drift")
+    path, file_sha, payload = _stable_canonical_regular_file(
+        str(ref["path"]), where="A1 AUX GEOMETRY probe manifest"
+    )
+    if file_sha != ref["file_sha256"] or file_sha != rule.get("probe_manifest_sha256"):
+        raise SystemExit("A1 AUX GEOMETRY probe-manifest file digest drift")
+    try:
+        manifest = json.loads(payload.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as error:
+        raise SystemExit(f"cannot parse A1 AUX GEOMETRY probe manifest: {error}") from error
+    expected_fields = {
+        "schema_version",
+        "descriptor_sha256",
+        "payload_inventory_sha256",
+        "sampler_seed",
+        "world_size",
+        "local_batch_size",
+        "probe_batches",
+        "global_train_positions",
+        "probe_row_order_sha256",
+    }
+    if not isinstance(manifest, dict) or set(manifest) != expected_fields:
+        raise SystemExit("A1 AUX GEOMETRY probe-manifest shape drift")
+    positions = np.asarray(manifest["global_train_positions"], dtype=np.int64)
+    expected_rows = (
+        int(rule["probe_batches"])
+        * int(rule["probe_batch_size"])
+        * int(manifest["world_size"])
+    )
+    if (
+        manifest["schema_version"] != "a1-aux-gradient-probe-manifest-v1"
+        or manifest["descriptor_sha256"] != composite_meta.get("descriptor_file_sha256")
+        or manifest["payload_inventory_sha256"]
+        != composite_meta.get("payload_inventory_sha256")
+        or manifest["sampler_seed"] != rule.get("probe_sampler_seed")
+        or manifest["world_size"] != 8
+        or manifest["local_batch_size"] != rule.get("probe_batch_size")
+        or manifest["probe_batches"] != rule.get("probe_batches")
+        or positions.ndim != 1
+        or positions.size != expected_rows
+        or np.any(positions < 0)
+        or np.any(positions >= len(train_indices))
+    ):
+        raise SystemExit("A1 AUX GEOMETRY probe-manifest recipe/order drift")
+    realized = _a1_central_sample_order_evidence(
+        data,
+        train_indices=np.asarray(train_indices, dtype=np.int64),
+        validation_indices=np.asarray(validation_indices, dtype=np.int64),
+        global_order_positions=positions,
+        composite_meta=dict(composite_meta),
+        expected_sample_dose=expected_rows,
+    )
+    if (
+        manifest["probe_row_order_sha256"] != realized["sample_order_sha256"]
+        or manifest["probe_row_order_sha256"] != rule.get("probe_row_order_sha256")
+    ):
+        raise SystemExit("A1 AUX GEOMETRY physical probe row order drift")
+    return manifest, positions
+
+
+def _a1_model_tensor_state_sha256(model) -> str:
+    """Digest exact tensor bytes, names, shapes, and dtypes for no-mutation proof."""
+
+    unwrapped = getattr(model, "module", model)
+    digest = hashlib.sha256()
+    for name, tensor in sorted(unwrapped.state_dict().items()):
+        value = tensor.detach().cpu().contiguous()
+        metadata = json.dumps(
+            {
+                "name": name,
+                "dtype": str(value.dtype),
+                "shape": [int(item) for item in value.shape],
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        digest.update(metadata)
+        digest.update(b"\0")
+        digest.update(value.numpy().tobytes())
+        digest.update(b"\0")
+    return "sha256:" + digest.hexdigest()
+
+
 def _epoch_order(
     rng: np.random.Generator,
     n: int,
@@ -19209,6 +22268,7 @@ def _epoch_order(
     data_sharded: bool = False,
     sample_weights: np.ndarray | None = None,
     max_samples: int | None = None,
+    global_order_observer=None,
 ) -> np.ndarray:
     """Per-epoch traversal order over ``train_indices`` positions ``0..n-1``.
 
@@ -19256,6 +22316,8 @@ def _epoch_order(
                 raise ValueError("max_samples must be non-negative")
             draw_count = min(n, int(max_samples))
         order = rng.choice(n, size=draw_count, replace=True, p=weights / total)
+    if global_order_observer is not None:
+        global_order_observer(np.asarray(order, dtype=np.int64))
     if not ddp["enabled"]:
         return order
     if data_sharded:
@@ -19429,7 +22491,7 @@ def _training_resume_recipe_identity(
         grow_from_checkpoint_sha256="",
         resume_optimizer=True,
     )
-    return {
+    identity: dict[str, object] = {
         "schema_version": "train-bc-resume-recipe-v1",
         "normalized_train_config_sha256": normalized.full_config_hash(),
         "grad_accum_steps": int(args.grad_accum_steps),
@@ -19438,6 +22500,18 @@ def _training_resume_recipe_identity(
         "fsdp": bool(args.fsdp),
         "policy_aux_active_batch_size": int(args.policy_aux_active_batch_size),
     }
+    if getattr(args, "sampler_seed", None) is not None:
+        # Omitted is the historical identity: the typed TrainConfig already
+        # binds --seed, and the sampler inherited it. Only the new decoupled
+        # trajectory needs additive identity fields, preserving old resumes.
+        identity.update(
+            {
+                "model_and_torch_seed": int(args.seed),
+                "sampler_seed": _resolved_sampler_seed(args),
+                "sampler_seed_explicit": True,
+            }
+        )
+    return identity
 
 
 def _restore_training_progress_state(
@@ -19721,6 +22795,11 @@ def _write_entity_checkpoint(
                 "config": config_to_dict(policy.config),
                 "action_mask_version": str(getattr(policy.config, "action_mask_version", "")),
                 "mask_hidden_info": bool(mask_hidden_info),
+                "entity_feature_adapter": (
+                    checkpoint_entity_feature_adapter_metadata(
+                        policy_entity_feature_adapter_version(policy)
+                    )
+                ),
                 "public_award_feature_contract": award_contract,
                 # OPT-8 provenance (mirrors EntityGraphPolicy.save).
                 "soft_target_source": str(soft_target_source) if soft_target_source is not None else "",

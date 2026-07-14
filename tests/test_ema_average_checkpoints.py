@@ -5,6 +5,11 @@ from pathlib import Path
 import pytest
 import torch
 
+from catan_zero.rl.entity_feature_adapter import (
+    CURRENT_RUST_ENTITY_ADAPTER_VERSION,
+    ENTITY_FEATURE_ADAPTER_CHECKPOINT_SCHEMA,
+    checkpoint_entity_feature_adapter_metadata,
+)
 from tools.ema_average_checkpoints import (
     compute_ema_weights,
     ema_average_checkpoints,
@@ -168,6 +173,111 @@ def test_ema_average_checkpoints_refuses_arch_config_mismatch(tmp_path: Path) ->
 
     with pytest.raises(ValueError, match="config"):
         ema_average_checkpoints(checkpoints=paths, decay=0.5)
+
+
+@pytest.mark.parametrize(
+    ("key", "left", "right"),
+    [
+        (
+            "entity_feature_adapter",
+            checkpoint_entity_feature_adapter_metadata(
+                CURRENT_RUST_ENTITY_ADAPTER_VERSION
+            ),
+            {
+                "schema_version": ENTITY_FEATURE_ADAPTER_CHECKPOINT_SCHEMA,
+                "version": "obsolete-v1",
+            },
+        ),
+        ("public_award_feature_contract", "legacy_zero_v0", "authoritative_v1"),
+        ("static_action_features_sha256", "catalog-a", "catalog-b"),
+        ("soft_target_source", "policy", "prefer_scores"),
+        ("trained_value_readouts", ["scalar"], ["scalar", "categorical"]),
+        (
+            "training_information_surface",
+            {"event_history_end_to_end_usable": False},
+            {"event_history_end_to_end_usable": True},
+        ),
+    ],
+)
+def test_ema_average_refuses_inference_semantic_mismatch(
+    tmp_path: Path,
+    key: str,
+    left: object,
+    right: object,
+) -> None:
+    a = _checkpoint(bias=0.0, step=0)
+    b = _checkpoint(bias=1.0, step=1)
+    a[key] = left
+    b[key] = right
+    torch.save(a, tmp_path / "a.pt")
+    torch.save(b, tmp_path / "b.pt")
+
+    error_pattern = (
+        "entity feature adapter" if key == "entity_feature_adapter" else key
+    )
+    with pytest.raises(ValueError, match=error_pattern):
+        ema_average_checkpoints(
+            checkpoints=[tmp_path / "a.pt", tmp_path / "b.pt"],
+            decay=0.5,
+        )
+
+
+def test_ema_accepts_missing_legacy_and_explicit_v2_adapter_metadata(
+    tmp_path: Path,
+) -> None:
+    a = _checkpoint(bias=0.0, step=0)
+    b = _checkpoint(bias=1.0, step=1)
+    b["entity_feature_adapter"] = checkpoint_entity_feature_adapter_metadata(
+        CURRENT_RUST_ENTITY_ADAPTER_VERSION
+    )
+    torch.save(a, tmp_path / "a.pt")
+    torch.save(b, tmp_path / "b.pt")
+
+    result = ema_average_checkpoints(
+        checkpoints=[tmp_path / "a.pt", tmp_path / "b.pt"],
+        decay=0.5,
+    )
+
+    assert result["entity_feature_adapter"] == b["entity_feature_adapter"]
+
+
+def test_ema_allows_value_training_dose_growth_but_not_objective_drift(
+    tmp_path: Path,
+) -> None:
+    a = _checkpoint(bias=0.0, step=0)
+    b = _checkpoint(bias=1.0, step=1)
+    base_training = {
+        "schema_version": "value-training-v1",
+        "primary_readout": "scalar",
+        "trained_value_readouts": ["scalar"],
+        "resolved_scalar_mse_weight": 1.0,
+        "resolved_categorical_ce_weight": 0.0,
+        "optimizer_steps": 10,
+        "completed_epochs": 1,
+        "scalar_training_weight_sum": 100.0,
+        "categorical_training_weight_sum": 0.0,
+    }
+    a["trained_value_readouts"] = ["scalar"]
+    b["trained_value_readouts"] = ["scalar"]
+    a["value_training"] = dict(base_training)
+    b["value_training"] = {
+        **base_training,
+        "optimizer_steps": 20,
+        "completed_epochs": 2,
+        "scalar_training_weight_sum": 200.0,
+    }
+    torch.save(a, tmp_path / "a.pt")
+    torch.save(b, tmp_path / "b.pt")
+    ema_average_checkpoints(
+        checkpoints=[tmp_path / "a.pt", tmp_path / "b.pt"], decay=0.5
+    )
+
+    b["value_training"]["resolved_scalar_mse_weight"] = 0.25
+    torch.save(b, tmp_path / "b.pt")
+    with pytest.raises(ValueError, match="value_training_semantics"):
+        ema_average_checkpoints(
+            checkpoints=[tmp_path / "a.pt", tmp_path / "b.pt"], decay=0.5
+        )
 
 
 def test_ema_average_checkpoints_refuses_state_dict_key_mismatch(tmp_path: Path) -> None:

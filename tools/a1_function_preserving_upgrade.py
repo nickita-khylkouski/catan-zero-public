@@ -40,6 +40,10 @@ MODULE_TOPOLOGY_TARGET_GATHER = (
     "entity_graph.topology_residual_adapter+action_target_gather.v1"
 )
 MODULE_BELIEF_RESOURCE_HEAD = "entity_graph.belief_resource_head.v1"
+MODULE_AUX_SUBGOAL_HEADS = "entity_graph.aux_subgoal_heads.v1"
+MODULE_AUX_SUBGOAL_POINTER_HEADS = "entity_graph.aux_subgoal_pointer_heads.v1"
+MODULE_STATIC_ACTION_RESIDUAL = "entity_graph.static_action_residual.v1"
+MODULE_ACTION_CROSS_ATTENTION_1 = "entity_graph.action_cross_attention.1.v1"
 
 # This is intentionally code, not caller-controlled configuration.  A new
 # architecture exception must be reviewed and tested before it can initialize
@@ -90,6 +94,94 @@ ALLOWLIST: dict[str, dict[str, Any]] = {
             "belief_resource_head.3.weight": "seeded_torch_default",
         },
         "config_delta": {"belief_resource_head": True},
+    },
+    MODULE_AUX_SUBGOAL_HEADS: {
+        "flags": {"aux_subgoal_heads": True},
+        "new_parameter_initialization": {
+            "aux_largest_army_head.0.bias": "seeded_torch_default",
+            "aux_largest_army_head.0.weight": "seeded_torch_default",
+            "aux_largest_army_head.3.bias": "seeded_torch_default",
+            "aux_largest_army_head.3.weight": "seeded_torch_default",
+            "aux_longest_road_head.0.bias": "seeded_torch_default",
+            "aux_longest_road_head.0.weight": "seeded_torch_default",
+            "aux_longest_road_head.3.bias": "seeded_torch_default",
+            "aux_longest_road_head.3.weight": "seeded_torch_default",
+            "aux_next_settlement_head.0.bias": "seeded_torch_default",
+            "aux_next_settlement_head.0.weight": "seeded_torch_default",
+            "aux_next_settlement_head.3.bias": "seeded_torch_default",
+            "aux_next_settlement_head.3.weight": "seeded_torch_default",
+            "aux_robber_target_head.0.bias": "seeded_torch_default",
+            "aux_robber_target_head.0.weight": "seeded_torch_default",
+            "aux_robber_target_head.3.bias": "seeded_torch_default",
+            "aux_robber_target_head.3.weight": "seeded_torch_default",
+            "aux_vp_in_n_head.0.bias": "seeded_torch_default",
+            "aux_vp_in_n_head.0.weight": "seeded_torch_default",
+            "aux_vp_in_n_head.3.bias": "seeded_torch_default",
+            "aux_vp_in_n_head.3.weight": "seeded_torch_default",
+        },
+        "config_delta": {"aux_subgoal_heads": True},
+    },
+    MODULE_AUX_SUBGOAL_POINTER_HEADS: {
+        "flags": {
+            "aux_subgoal_heads": True,
+            "aux_settlement_pointer_head": True,
+        },
+        "new_parameter_initialization": {
+            "aux_largest_army_head.0.bias": "seeded_torch_default",
+            "aux_largest_army_head.0.weight": "seeded_torch_default",
+            "aux_largest_army_head.3.bias": "seeded_torch_default",
+            "aux_largest_army_head.3.weight": "seeded_torch_default",
+            "aux_longest_road_head.0.bias": "seeded_torch_default",
+            "aux_longest_road_head.0.weight": "seeded_torch_default",
+            "aux_longest_road_head.3.bias": "seeded_torch_default",
+            "aux_longest_road_head.3.weight": "seeded_torch_default",
+            "aux_next_settlement_pointer_head.0.bias": "zeros",
+            "aux_next_settlement_pointer_head.0.weight": "ones",
+            "aux_next_settlement_pointer_head.1.bias": "seeded_torch_default",
+            "aux_next_settlement_pointer_head.1.weight": "seeded_torch_default",
+            "aux_next_settlement_pointer_head.4.bias": "seeded_torch_default",
+            "aux_next_settlement_pointer_head.4.weight": "seeded_torch_default",
+            "aux_robber_target_head.0.bias": "seeded_torch_default",
+            "aux_robber_target_head.0.weight": "seeded_torch_default",
+            "aux_robber_target_head.3.bias": "seeded_torch_default",
+            "aux_robber_target_head.3.weight": "seeded_torch_default",
+            "aux_vp_in_n_head.0.bias": "seeded_torch_default",
+            "aux_vp_in_n_head.0.weight": "seeded_torch_default",
+            "aux_vp_in_n_head.3.bias": "seeded_torch_default",
+            "aux_vp_in_n_head.3.weight": "seeded_torch_default",
+        },
+        "config_delta": {
+            "aux_subgoal_heads": True,
+            "aux_settlement_pointer_head": True,
+        },
+    },
+    MODULE_STATIC_ACTION_RESIDUAL: {
+        "flags": {"static_action_residual": True},
+        "new_parameter_initialization": {
+            "static_action_residual_proj.bias": "zeros",
+            "static_action_residual_proj.weight": "zeros",
+        },
+        "config_delta": {"static_action_residual": True},
+    },
+    MODULE_ACTION_CROSS_ATTENTION_1: {
+        "flags": {"action_cross_attention_layers": 1},
+        "new_parameter_initialization": {
+            "action_cross_blocks.0.attn.in_proj_bias": "zeros",
+            "action_cross_blocks.0.attn.in_proj_weight": "seeded_torch_default",
+            "action_cross_blocks.0.attn.out_proj.bias": "zeros",
+            "action_cross_blocks.0.attn.out_proj.weight": "zeros",
+            "action_cross_blocks.0.ff.0.bias": "seeded_torch_default",
+            "action_cross_blocks.0.ff.0.weight": "seeded_torch_default",
+            "action_cross_blocks.0.ff.3.bias": "zeros",
+            "action_cross_blocks.0.ff.3.weight": "zeros",
+            "action_cross_blocks.0.norm_ff.bias": "zeros",
+            "action_cross_blocks.0.norm_ff.weight": "ones",
+            "action_cross_blocks.0.norm_kv.bias": "zeros",
+            "action_cross_blocks.0.norm_kv.weight": "ones",
+            "action_cross_blocks.0.norm_q.bias": "zeros",
+            "action_cross_blocks.0.norm_q.weight": "ones",
+        },
+        "config_delta": {"action_cross_attention_layers": 1},
     },
 }
 

@@ -5,6 +5,11 @@ from pathlib import Path
 import pytest
 import torch
 
+from catan_zero.rl.entity_feature_adapter import (
+    CURRENT_RUST_ENTITY_ADAPTER_VERSION,
+    ENTITY_FEATURE_ADAPTER_CHECKPOINT_SCHEMA,
+    checkpoint_entity_feature_adapter_metadata,
+)
 from tools.interpolate_checkpoints import (
     interpolate_checkpoints,
     write_interpolation_receipt,
@@ -157,3 +162,98 @@ def test_interpolate_checkpoints_allows_asymmetric_nontensor_metadata(
     assert torch.allclose(blended["model"]["0.weight"], torch.full((2, 3), 0.5))
     assert blended["training_information_surface"] == {"event_tensor_width": 41}
     assert "config" not in blended
+
+
+@pytest.mark.parametrize(
+    ("key", "left", "right"),
+    [
+        ("mask_hidden_info", True, False),
+        (
+            "entity_feature_adapter",
+            checkpoint_entity_feature_adapter_metadata(
+                CURRENT_RUST_ENTITY_ADAPTER_VERSION
+            ),
+            {
+                "schema_version": ENTITY_FEATURE_ADAPTER_CHECKPOINT_SCHEMA,
+                "version": "obsolete-v1",
+            },
+        ),
+        ("public_award_feature_contract", "legacy_zero_v0", "authoritative_v1"),
+        ("static_action_features_sha256", "catalog-a", "catalog-b"),
+    ],
+)
+def test_entity_graph_interpolation_refuses_semantic_mismatch(
+    tmp_path: Path,
+    key: str,
+    left: object,
+    right: object,
+) -> None:
+    base = tmp_path / "base.pt"
+    candidate = tmp_path / "candidate.pt"
+    _write_checkpoint(base, bias=0.0)
+    _write_checkpoint(candidate, bias=1.0)
+    base_value = torch.load(base, map_location="cpu", weights_only=False)
+    candidate_value = torch.load(candidate, map_location="cpu", weights_only=False)
+    shared_config = {"fields": {"action_target_gather": False}}
+    for value, semantic in ((base_value, left), (candidate_value, right)):
+        value["policy_type"] = "entity_graph"
+        value["config"] = shared_config
+        value["action_mask_version"] = "mask-v1"
+        value.setdefault("mask_hidden_info", True)
+        value.setdefault(
+            "entity_feature_adapter",
+            checkpoint_entity_feature_adapter_metadata(
+                CURRENT_RUST_ENTITY_ADAPTER_VERSION
+            ),
+        )
+        value.setdefault("public_award_feature_contract", "legacy_zero_v0")
+        value.setdefault("static_action_features_sha256", "catalog-a")
+        value[key] = semantic
+    torch.save(base_value, base)
+    torch.save(candidate_value, candidate)
+
+    error_pattern = (
+        "entity feature adapter" if key == "entity_feature_adapter" else key
+    )
+    with pytest.raises(ValueError, match=error_pattern):
+        interpolate_checkpoints(
+            base=base,
+            candidate=candidate,
+            alphas=(0.5,),
+            output_template=str(tmp_path / "blend.pt"),
+        )
+
+
+def test_entity_graph_interpolation_accepts_missing_legacy_and_explicit_v2(
+    tmp_path: Path,
+) -> None:
+    base = tmp_path / "base.pt"
+    candidate = tmp_path / "candidate.pt"
+    _write_checkpoint(base, bias=0.0)
+    _write_checkpoint(candidate, bias=1.0)
+    base_value = torch.load(base, map_location="cpu", weights_only=False)
+    candidate_value = torch.load(candidate, map_location="cpu", weights_only=False)
+    for value in (base_value, candidate_value):
+        value["policy_type"] = "entity_graph"
+        value["config"] = {"fields": {"action_target_gather": False}}
+        value["action_mask_version"] = "mask-v1"
+        value["mask_hidden_info"] = True
+        value["public_award_feature_contract"] = "legacy_zero_v0"
+        value["static_action_features_sha256"] = "catalog-a"
+    candidate_value["entity_feature_adapter"] = (
+        checkpoint_entity_feature_adapter_metadata(
+            CURRENT_RUST_ENTITY_ADAPTER_VERSION
+        )
+    )
+    torch.save(base_value, base)
+    torch.save(candidate_value, candidate)
+
+    outputs = interpolate_checkpoints(
+        base=base,
+        candidate=candidate,
+        alphas=(0.5,),
+        output_template=str(tmp_path / "blend.pt"),
+    )
+
+    blended = torch.load(outputs[0], map_location="cpu", weights_only=False)
+    assert "entity_feature_adapter" not in blended

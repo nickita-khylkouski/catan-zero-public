@@ -149,6 +149,136 @@ def _seed_interval(report: dict[str, Any], *, where: str) -> tuple[int, int]:
     return base, base + pairs
 
 
+def validate_complete_report(
+    report: dict[str, Any],
+    *,
+    kind: str,
+    expected_pairs: int | None = None,
+    where: str = "report",
+) -> dict[str, Any]:
+    """Prove that one evaluator lane produced its entire clean assignment.
+
+    Evaluators intentionally retain worker failures in a JSON report and can
+    exit zero so that diagnostics are not lost.  That behavior is useful, but
+    it means process success and a nonempty file are not completion signals.
+    This validator is the shared semantic boundary used by launch/status and
+    pooling: every requested seed must have both orientations, all headline
+    counts must replay from the raw games, and every error counter/list must be
+    empty.
+    """
+
+    if kind not in ORIENTATIONS:
+        raise PoolError(f"{where} has unsupported report kind {kind!r}")
+    if not isinstance(report, dict):
+        raise PoolError(f"{where} is not a JSON object")
+    games = report.get("games")
+    if not isinstance(games, list):
+        raise PoolError(f"{where} has no retained games")
+
+    # Preserve the most informative error when the two legacy outcome aliases
+    # disagree, before validating their aggregate counters.
+    for index, game in enumerate(games):
+        if not isinstance(game, dict):
+            raise PoolError(f"{where}.games[{index}] is not an object")
+        if type(game.get("candidate_won")) is not bool or type(  # noqa: E721
+            game.get("search_won")
+        ) is not bool:
+            raise PoolError(f"{where}.games[{index}] has no boolean outcome")
+        if game["candidate_won"] != game["search_won"]:
+            raise PoolError(
+                f"{where}.games[{index}] candidate_won/search_won alias drift"
+            )
+
+    base, end = _seed_interval(report, where=where)
+    pairs = report.get("pairs_requested")
+    if type(pairs) is not int or pairs <= 0:  # noqa: E721
+        raise PoolError(f"{where} pairs_requested must be a positive integer")
+    if expected_pairs is not None and pairs != int(expected_pairs):
+        raise PoolError(
+            f"{where} pairs_requested={pairs} differs from planned {expected_pairs}"
+        )
+    expected_games = 2 * pairs
+    if len(games) != expected_games:
+        raise PoolError(
+            f"{where} retained {len(games)} games, expected {expected_games}"
+        )
+
+    def require_count(name: str, expected: int) -> None:
+        value = report.get(name)
+        if type(value) is not int or value != expected:  # noqa: E721
+            raise PoolError(
+                f"{where} {name}={value!r} does not reconcile to {expected}"
+            )
+
+    require_count("games_played", expected_games)
+    require_count("games_with_winner", expected_games)
+    require_count("complete_pairs", pairs)
+    if kind == "neutral":
+        require_count("games_requested", expected_games)
+
+    for name in ("errors", "worker_errors", "pair_errors"):
+        if name == "errors" or name in report:
+            value = report.get(name)
+            if not isinstance(value, list) or value:
+                raise PoolError(f"{where} {name} must be an empty list")
+    for name in (
+        "games_truncated",
+        "games_errored",
+        "games_engine_divergence",
+        "total_illegal_policy_picks",
+    ):
+        if name == "games_truncated" or name in report:
+            require_count(name, 0)
+
+    expected_orientations = ORIENTATIONS[kind]
+    orientations_by_seed: dict[int, set[str]] = {}
+    wins = 0
+    for index, game in enumerate(games):
+        seed = int(game["game_seed"])
+        orientation = str(game.get("orientation"))
+        orientations_by_seed.setdefault(seed, set()).add(orientation)
+        wins += int(game["candidate_won"])
+        if (
+            orientation not in expected_orientations
+            or game.get("terminated") is not True
+            or game.get("truncated") is not False
+            or game.get("error") not in {None, ""}
+            or bool(game.get("engine_divergence", False))
+        ):
+            raise PoolError(f"{where}.games[{index}] is not a complete clean game")
+    for seed in range(base, end):
+        if orientations_by_seed.get(seed) != expected_orientations:
+            raise PoolError(
+                f"{where} seed {seed} does not contain both required orientations"
+            )
+
+    require_count("candidate_wins", wins)
+    require_count("baseline_wins", expected_games - wins)
+    diagnostics = report.get("pair_diagnostics")
+    if not isinstance(diagnostics, dict):
+        raise PoolError(f"{where} has no pair_diagnostics")
+    diagnostic_counts: dict[str, int] = {}
+    for name in ("ww_pairs", "split_pairs", "ll_pairs", "incomplete_pairs"):
+        value = diagnostics.get(name)
+        if type(value) is not int or value < 0:  # noqa: E721
+            raise PoolError(f"{where} pair_diagnostics.{name} is invalid")
+        diagnostic_counts[name] = value
+    if diagnostic_counts["incomplete_pairs"] != 0 or sum(
+        diagnostic_counts.values()
+    ) != pairs:
+        raise PoolError(f"{where} pair_diagnostics do not cover all planned pairs")
+    return report
+
+
+def validate_complete_report_path(
+    path: Path, *, kind: str, expected_pairs: int | None = None
+) -> dict[str, Any]:
+    path = path.expanduser().resolve(strict=True)
+    return validate_complete_report(
+        _load(path), kind=kind, expected_pairs=expected_pairs, where=str(path)
+    )
+
+
 def _contiguous_intervals(
     reports: Sequence[tuple[Path, dict[str, Any]]],
     *,
@@ -327,6 +457,7 @@ def pool_internal(
     champion_sha256 = promotion._sha256(champion)  # noqa: SLF001
     effective_config: dict[str, Any] | None = None
     for path, report in loaded:
+        validate_complete_report(report, kind="internal", where=str(path))
         _validate_checkpoint_sha256(
             report,
             key="candidate_checkpoint_sha256",
@@ -424,7 +555,16 @@ def pool_internal(
             "split_rate": diagnostics["split_pairs"] / complete_pairs,
             "decisive_pair_yield": (diagnostics["ww_pairs"] + diagnostics["ll_pairs"])
             / complete_pairs,
-            "elapsed_sec": sum(
+            # Fleet shards execute concurrently.  Summing their durations reports
+            # aggregate lane-seconds, not wall time, and inflated prior throughput
+            # denominators by the number of lanes.  The slowest shard is the best
+            # wall-clock approximation available in the shard schema; preserve the
+            # useful summed quantity under an explicit name.
+            "elapsed_sec": max(
+                (float(report.get("elapsed_sec", 0.0)) for _, report in loaded),
+                default=0.0,
+            ),
+            "aggregate_compute_sec": sum(
                 float(report.get("elapsed_sec", 0.0)) for _, report in loaded
             ),
             "workers": sum(int(report.get("workers", 0)) for _, report in loaded),
@@ -467,7 +607,12 @@ def _wilson(wins: int, games: int, z: float = 1.96) -> list[float]:
     ]
 
 
-def pool_neutral(paths: Sequence[Path], *, checkpoint: Path) -> dict[str, Any]:
+def pool_neutral(
+    paths: Sequence[Path],
+    *,
+    checkpoint: Path,
+    allow_disjoint_cohorts: bool = False,
+) -> dict[str, Any]:
     if not paths:
         raise PoolError("at least one neutral-harness report is required")
     loaded = [(path.resolve(), _load(path.resolve())) for path in paths]
@@ -476,6 +621,7 @@ def pool_neutral(paths: Sequence[Path], *, checkpoint: Path) -> dict[str, Any]:
     checkpoint_sha256 = promotion._sha256(checkpoint)  # noqa: SLF001
     effective_config: dict[str, Any] | None = None
     for path, report in loaded:
+        validate_complete_report(report, kind="neutral", where=str(path))
         if report.get("candidate_checkpoint_md5") != checkpoint_md5:
             raise PoolError(f"{path} checkpoint MD5 drift")
         _validate_checkpoint_sha256(
@@ -511,7 +657,7 @@ def pool_neutral(paths: Sequence[Path], *, checkpoint: Path) -> dict[str, Any]:
             "pair_diagnostics"
         ):
             raise PoolError(f"{path} gate statistics do not replay")
-    intervals = _contiguous_intervals(loaded)
+    intervals = _contiguous_intervals(loaded, allow_gaps=allow_disjoint_cohorts)
     games = _validate_and_normalize_games(loaded, kind="neutral")
     outcomes = [bool(game["candidate_won"]) for game in games]
     wins = sum(outcomes)
@@ -577,7 +723,11 @@ def pool_neutral(paths: Sequence[Path], *, checkpoint: Path) -> dict[str, Any]:
                 "games_resumed": 0,
                 "games_run_this_invocation": len(games),
             },
-            "elapsed_sec": sum(
+            "elapsed_sec": max(
+                (float(report.get("elapsed_sec", 0.0)) for _, report in loaded),
+                default=0.0,
+            ),
+            "aggregate_compute_sec": sum(
                 float(report.get("elapsed_sec", 0.0)) for _, report in loaded
             ),
             "worker_errors": [],
@@ -589,6 +739,7 @@ def pool_neutral(paths: Sequence[Path], *, checkpoint: Path) -> dict[str, Any]:
                 "checkpoint": artifacts._checkpoint_ref(checkpoint),  # noqa: SLF001
                 "sources": _source_refs([path for path, _ in loaded]),
                 "seed_intervals": intervals,
+                "disjoint_cohorts": bool(allow_disjoint_cohorts),
                 "effective_search_config_sha256": promotion._digest_value(  # noqa: SLF001
                     effective_config["search_config"]
                 ),
@@ -617,6 +768,14 @@ def _parser() -> argparse.ArgumentParser:
     neutral = subparsers.add_parser("neutral", help="pool neutral-harness reports")
     neutral.add_argument("--report", action="append", type=Path, required=True)
     neutral.add_argument("--checkpoint", type=Path, required=True)
+    neutral.add_argument(
+        "--allow-disjoint-cohorts",
+        action="store_true",
+        help=(
+            "Pool non-overlapping replicated external cohorts. Default remains one "
+            "contiguous cohort; overlaps are always refused."
+        ),
+    )
     neutral.add_argument("--out", type=Path, required=True)
     return parser
 
@@ -632,7 +791,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 allow_disjoint_cohorts=bool(args.allow_disjoint_cohorts),
             )
             if args.command == "internal"
-            else pool_neutral(args.report, checkpoint=args.checkpoint)
+            else pool_neutral(
+                args.report,
+                checkpoint=args.checkpoint,
+                allow_disjoint_cohorts=bool(args.allow_disjoint_cohorts),
+            )
         )
         artifacts._write_new_readonly(args.out, value)  # noqa: SLF001
         print(

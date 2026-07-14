@@ -5,6 +5,10 @@ import json
 from pathlib import Path
 from typing import Any
 
+from catan_zero.rl.entity_token_policy import (
+    PUBLIC_AWARD_FEATURE_CONTRACT_LEGACY_ZERO,
+)
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(
@@ -137,19 +141,88 @@ def _load_checkpoint(path: Path) -> dict[str, Any]:
 # mismatches here mean the checkpoints were trained under different observability
 # regimes or architectures, and averaging their weights would silently produce a
 # nonsensical model.
-_REQUIRED_IDENTICAL_KEYS = ("mask_hidden_info", "config", "policy_type", "action_mask_version")
+_REQUIRED_IDENTICAL_KEYS = (
+    "mask_hidden_info",
+    "config",
+    "policy_type",
+    "action_mask_version",
+    "public_award_feature_contract",
+    "static_action_features_sha256",
+    "soft_target_source",
+    "trained_value_readouts",
+    "training_information_surface",
+    "value_training_semantics",
+)
+
+
+def _semantic_metadata_value(checkpoint: dict[str, Any], key: str) -> Any:
+    if key == "mask_hidden_info":
+        return bool(checkpoint.get(key, False))
+    if key == "public_award_feature_contract":
+        return str(
+            checkpoint.get(key, PUBLIC_AWARD_FEATURE_CONTRACT_LEGACY_ZERO)
+            or PUBLIC_AWARD_FEATURE_CONTRACT_LEGACY_ZERO
+        )
+    if key == "soft_target_source":
+        return str(checkpoint.get(key, "") or "")
+    if key == "trained_value_readouts":
+        raw = checkpoint.get(key)
+        if not isinstance(raw, (list, tuple)):
+            return ("scalar",)
+        return tuple(sorted(str(value) for value in raw))
+    if key == "training_information_surface":
+        surface = checkpoint.get(key)
+        return dict(surface) if isinstance(surface, dict) else None
+    if key == "value_training_semantics":
+        training = checkpoint.get("value_training")
+        if not isinstance(training, dict):
+            return None
+        # Snapshot dose grows over a run and therefore must differ. Everything
+        # else describes the objective/information regime and must match before
+        # its tensors can be meaningfully averaged.
+        mutable_dose_fields = {
+            "optimizer_steps",
+            "completed_epochs",
+            "scalar_training_weight_sum",
+            "categorical_training_weight_sum",
+        }
+        return {
+            name: value
+            for name, value in training.items()
+            if name not in mutable_dose_fields
+        }
+    return checkpoint.get(key)
 
 
 def _assert_compatible_metadata(checkpoints: list[dict[str, Any]], paths: list[Path]) -> None:
+    from catan_zero.rl.entity_feature_adapter import (
+        resolve_checkpoint_entity_feature_adapter,
+    )
+
     reference = checkpoints[0]
     ref_path = paths[0]
+    ref_adapter_version, _ref_adapter_source = (
+        resolve_checkpoint_entity_feature_adapter(
+            reference.get("entity_feature_adapter"),
+            metadata_present="entity_feature_adapter" in reference,
+        )
+    )
+    for checkpoint, path in zip(checkpoints[1:], paths[1:]):
+        adapter_version, _adapter_source = resolve_checkpoint_entity_feature_adapter(
+            checkpoint.get("entity_feature_adapter"),
+            metadata_present="entity_feature_adapter" in checkpoint,
+        )
+        if adapter_version != ref_adapter_version:
+            raise ValueError(
+                "refusing to EMA-average checkpoints with different "
+                "entity_feature_adapter versions: "
+                f"{ref_path} has {ref_adapter_version!r}, "
+                f"{path} has {adapter_version!r}"
+            )
     for key in _REQUIRED_IDENTICAL_KEYS:
-        # mask_hidden_info defaults to False on legacy checkpoints that predate the
-        # field (see EntityGraphPolicy.save's identical comment) -- normalize via
-        # .get() rather than requiring the key to be literally present.
-        ref_value = reference.get(key) if key != "mask_hidden_info" else bool(reference.get(key, False))
+        ref_value = _semantic_metadata_value(reference, key)
         for checkpoint, path in zip(checkpoints[1:], paths[1:]):
-            value = checkpoint.get(key) if key != "mask_hidden_info" else bool(checkpoint.get(key, False))
+            value = _semantic_metadata_value(checkpoint, key)
             if not _deep_equal(ref_value, value):
                 raise ValueError(
                     f"refusing to EMA-average checkpoints with different {key}: "

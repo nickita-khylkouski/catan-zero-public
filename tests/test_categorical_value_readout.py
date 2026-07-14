@@ -11,6 +11,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+from catan_zero.rl.entity_feature_adapter import CURRENT_RUST_ENTITY_ADAPTER_VERSION
 from catan_zero.rl.pipeline_configs import EvalConfig, GenerateConfig
 from catan_zero.search.neural_rust_mcts import (
     BatchedEntityGraphRustEvaluator,
@@ -324,6 +325,7 @@ def test_remote_eval_client_carries_categorical_head_metadata() -> None:
             0,
             action_size=16,
             trained_with_masked_hidden_info=False,
+            entity_feature_adapter=CURRENT_RUST_ENTITY_ADAPTER_VERSION,
             config=EntityGraphRustEvaluatorConfig(value_readout="categorical"),
         )
     client = RemoteEvalClient(
@@ -332,6 +334,7 @@ def test_remote_eval_client_carries_categorical_head_metadata() -> None:
         0,
         action_size=16,
         trained_with_masked_hidden_info=False,
+        entity_feature_adapter=CURRENT_RUST_ENTITY_ADAPTER_VERSION,
         value_categorical_bins=9,
         value_categorical_head_available=True,
         config=EntityGraphRustEvaluatorConfig(value_readout="categorical"),

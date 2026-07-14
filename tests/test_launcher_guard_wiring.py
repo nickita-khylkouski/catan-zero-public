@@ -144,6 +144,8 @@ GOLDEN_OPTION_STRINGS = {
     "train_bc": {
         ("--a1-ablation-code-binding-json",),
         ("--a1-ablation-code-tree-sha256",),
+        ("--a1-aux-regularization-binding-json",),
+        ("--a1-central-learner-binding-json",),
         ("--a1-batch-probe-plan",),
         ("--a1-batch-probe-run-id",),
         ("--a1-curriculum-parent-receipt",),
@@ -253,6 +255,7 @@ GOLDEN_OPTION_STRINGS = {
         ("--require-production-35m-teacher",),
         ("--require-strict-35m-teacher",),
         ("--save-each-epoch",),
+        ("--sampler-seed",),
         ("--seed",),
         ("--no-training-rng-rank-offset", "--training-rng-rank-offset"),
         ("--skip-guards",),

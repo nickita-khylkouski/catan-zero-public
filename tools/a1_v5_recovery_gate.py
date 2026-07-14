@@ -39,7 +39,10 @@ from tools.champion_registry import ChampionRegistry  # noqa: E402
 
 
 AUTHORITY_SCHEMA = "a1-v5-recovery-full-gate-authority-v1"
-F7_VETO_BASE_SEED = 6_199_700_000
+# This cohort must remain disjoint from every prior VAL-only claim.  The former
+# 6_199_700_000 base was already partially occupied by a sealed 192-pair panel,
+# which made the required 300-pair recovery veto impossible to claim.
+F7_VETO_BASE_SEED = 6_199_100_000
 F7_VETO_COMPLETE_PAIRS = 300
 F7_COMPARISON_MODE = "recovery_safety_reference"
 F7_COMPARISON_REASON = "disaster_recovery_f7_non_regression_veto"

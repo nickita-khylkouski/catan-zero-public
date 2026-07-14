@@ -294,6 +294,17 @@ HISTORICAL_V5_HANDOFF_FINGERPRINT = {
 HISTORICAL_V5_HANDOFF_COMPATIBILITY_SCHEMA = (
     "a1-v5-deployed-search-default-projection-v1"
 )
+HISTORICAL_V5_RUST_FEATURIZER_COMPATIBILITY_SCHEMA = (
+    "a1-v5-rust-featurizer-parity-compatibility-v1"
+)
+RUST_FEATURIZER_PARITY_EVIDENCE_SCHEMA = "eval-rust-feature-b200-evidence-v1"
+RUST_FEATURIZER_PARITY_EVIDENCE_PATH = (
+    REPO_ROOT / "docs/evidence/EVAL_RUST_FEATURE_B200_20260711.json"
+)
+RUST_FEATURIZER_PARITY_EVIDENCE_SHA256 = (
+    "sha256:a5619e4601acc90793ba708e6ab7a1316dbdad7b6de72b1114bb1dde947d7ff3"
+)
+RUST_FEATURIZER_PARITY_TESTED_COMMIT = "6cb878e"
 GENERATION_CAMPAIGN_SCHEMA = "a1-dual-arm-generation-contract-v1"
 GENERATION_CAMPAIGN_REVISION_SCHEMA = "a1-dual-arm-generation-contract-v2"
 POST_PROMOTION_CAMPAIGN_SCHEMA = "a1-post-promotion-generation-campaign-v1"
@@ -935,6 +946,72 @@ def _require_exact_keys(
         )
 
 
+def _authenticated_rust_featurizer_parity_evidence() -> dict[str, Any]:
+    """Replay the sole checked-in Python/Rust feature-equivalence receipt.
+
+    Rust featurization is execution machinery, but the historical v5 agent
+    identity recorded the old Python implementation as a boolean field.  A
+    new v3 wave may cross that implementation boundary only through the exact
+    B200 parity receipt checked into this repository.  Pinning its bytes and
+    replaying its proof projection prevents a similarly named, hand-authored,
+    or partially passing JSON file from authorizing the transition.
+    """
+
+    path = RUST_FEATURIZER_PARITY_EVIDENCE_PATH.expanduser().absolute()
+    try:
+        metadata = path.lstat()
+        canonical = path.resolve(strict=True)
+    except OSError as error:
+        raise ContractError(
+            f"Rust-featurizer parity evidence is unavailable: {error}"
+        ) from error
+    if not stat.S_ISREG(metadata.st_mode) or canonical != path:
+        raise ContractError(
+            "Rust-featurizer parity evidence must be a canonical regular file"
+        )
+    record = _file_record(path, kind="rust_featurizer_parity_evidence")
+    if record["sha256"] != RUST_FEATURIZER_PARITY_EVIDENCE_SHA256:
+        raise ContractError("Rust-featurizer parity evidence fingerprint mismatch")
+    payload = _load_json(path)
+    parity = payload.get("parity")
+    output = payload.get("real_checkpoint_output_parity")
+    if (
+        payload.get("schema") != RUST_FEATURIZER_PARITY_EVIDENCE_SCHEMA
+        or payload.get("commit") != RUST_FEATURIZER_PARITY_TESTED_COMMIT
+        or not isinstance(parity, dict)
+        or parity.get("passed") != 26
+        or parity.get("failed") != 0
+        or parity.get("skipped") != 0
+        or not isinstance(parity.get("coverage"), str)
+        or "public-observation and omniscient modes" not in parity["coverage"]
+        or not isinstance(output, dict)
+        or output.get("states") != 128
+        or output.get("exact_output_states") != 128
+        or output.get("max_abs_prior_diff") != 0.0
+        or output.get("max_abs_value_diff") != 0.0
+    ):
+        raise ContractError("Rust-featurizer parity evidence semantic replay failed")
+    record.update(
+        {
+            "document_schema": payload["schema"],
+            "document_digest": _digest_value(payload),
+            "tested_commit": payload["commit"],
+            "tensor_parity_tests": {
+                "passed": parity["passed"],
+                "failed": parity["failed"],
+                "skipped": parity["skipped"],
+            },
+            "real_checkpoint_output_parity": {
+                "states": output["states"],
+                "exact_output_states": output["exact_output_states"],
+                "max_abs_prior_diff": output["max_abs_prior_diff"],
+                "max_abs_value_diff": output["max_abs_value_diff"],
+            },
+        }
+    )
+    return record
+
+
 def _find_unresolved(value: Any, *, path: str = "$") -> list[str]:
     found: list[str] = []
     if value == UNRESOLVED:
@@ -984,8 +1061,10 @@ def _historical_v5_handoff_identity_compatibility(
 
     The committed v5 receipt predates two fields that later became explicit in
     the promotion identity projection. Both values were already the runtime
-    defaults. This is not a subset comparison: only the exact issued artifact,
-    exact two-key omission, exact defaults, and zero shared-key drift qualify.
+    defaults. The one parity-certified Python-to-Rust featurizer transition is
+    implementation-only and is authenticated separately below. This is not a
+    subset comparison: only the exact issued artifact, exact two-key omission,
+    exact defaults, and that one evidence-bound implementation change qualify.
     """
 
     missing = set(expected) - set(deployed)
@@ -995,8 +1074,17 @@ def _historical_v5_handoff_identity_compatibility(
         for key in set(deployed) & set(expected)
         if deployed[key] != expected[key]
     }
+    rust_featurizer_transition = bool(
+        set(shared_drift) == {"evaluator_rust_featurize"}
+        and deployed.get("evaluator_rust_featurize") is False
+        and expected.get("evaluator_rust_featurize") is True
+    )
     required_missing = set(HISTORICAL_V5_HANDOFF_DEFAULTS)
-    if missing != required_missing or extra or shared_drift:
+    if (
+        missing != required_missing
+        or extra
+        or (shared_drift and not rust_featurizer_transition)
+    ):
         raise ContractError(
             "promoted deployed search identity compatibility shape drift: "
             f"missing={sorted(missing)}, extra={sorted(extra)}, "
@@ -1037,17 +1125,33 @@ def _historical_v5_handoff_identity_compatibility(
             "historical v5 handoff omitted fields do not resolve to exact defaults"
         )
     normalized = {**deployed, **HISTORICAL_V5_HANDOFF_DEFAULTS}
+    parity_evidence: dict[str, Any] | None = None
+    if rust_featurizer_transition:
+        parity_evidence = _authenticated_rust_featurizer_parity_evidence()
+        normalized["evaluator_rust_featurize"] = True
     if normalized != dict(expected):
         raise ContractError(
             "historical v5 handoff compatibility normalization is not exact"
         )
-    return {
-        "schema_version": HISTORICAL_V5_HANDOFF_COMPATIBILITY_SCHEMA,
+    compatibility = {
+        "schema_version": (
+            HISTORICAL_V5_RUST_FEATURIZER_COMPATIBILITY_SCHEMA
+            if parity_evidence is not None
+            else HISTORICAL_V5_HANDOFF_COMPATIBILITY_SCHEMA
+        ),
         "authenticated_fingerprint": actual_fingerprint,
         "omitted_historical_defaults": dict(HISTORICAL_V5_HANDOFF_DEFAULTS),
         "raw_deployed_search_config_sha256": _digest_value(deployed),
         "normalized_search_config_sha256": _digest_value(normalized),
     }
+    if parity_evidence is not None:
+        compatibility["rust_featurizer_implementation_transition"] = {
+            "from": "python_entity_features_v1",
+            "to": "rust_entity_features_parity_v1",
+            "semantic_identity_changed": False,
+            "parity_evidence": parity_evidence,
+        }
+    return compatibility
 
 
 def _promotion_handoff_record(

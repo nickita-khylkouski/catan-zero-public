@@ -6,6 +6,12 @@ from typing import Any, Mapping
 
 LINEAGE_DOSE_SCHEMA = "a1-lineage-dose-v1"
 CURRICULUM_DECLARATION_SCHEMA = "a1-curriculum-declaration-v1"
+INITIALIZER_TRANSITION_SCHEMA = "a1-initializer-transition-v1"
+INITIALIZER_TRANSITION_KINDS = (
+    "public_award_zero_initialization",
+    "function_preserving_pointer_upgrade",
+    "head_only_auxiliary_warmup",
+)
 
 
 class LineageDoseError(ValueError):
@@ -18,11 +24,145 @@ def _positive_int(value: Any, field: str) -> int:
     return value
 
 
+def _typed_sha256(value: Any, field: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not value.startswith("sha256:")
+        or len(value) != 71
+    ):
+        raise LineageDoseError(f"{field} is not a typed SHA-256")
+    try:
+        int(value.removeprefix("sha256:"), 16)
+    except ValueError as error:
+        raise LineageDoseError(f"{field} is not a typed SHA-256") from error
+    return value
+
+
+def _validate_initializer_transition_chain(
+    value: Any,
+    *,
+    declared_producer_sha256: str,
+    init_checkpoint_sha256: str,
+) -> tuple[list[dict[str, Any]], int, int]:
+    """Validate one exact, contiguous initializer-preparation lineage.
+
+    These transitions are not candidate chaining.  The first two are
+    zero-optimizer, function-preserving schema/architecture transforms; the
+    optional third is the measured head-only commissioning dose whose inherited
+    policy/value/trunk bytes remain unchanged.  Keeping that warmup dose in the
+    cumulative lineage prevents it from becoming invisible training.
+    """
+
+    if not isinstance(value, list) or not value:
+        raise LineageDoseError("initializer transition chain must be non-empty")
+    expected_kinds = list(INITIALIZER_TRANSITION_KINDS[: len(value)])
+    observed_kinds = [row.get("kind") if isinstance(row, Mapping) else None for row in value]
+    if len(value) > len(INITIALIZER_TRANSITION_KINDS) or observed_kinds != expected_kinds:
+        raise LineageDoseError(
+            "initializer transition order must be public-award, pointer, then warmup"
+        )
+    required = {
+        "schema_version",
+        "kind",
+        "role",
+        "source_checkpoint_sha256",
+        "output_checkpoint_sha256",
+        "sampled_rows",
+        "optimizer_steps",
+        "optimizer_state_terminal",
+        "receipt_path",
+        "receipt_file_sha256",
+        "receipt_state_sha256",
+        "inherited_parameters_bit_identical",
+        "main_output_max_abs_diff_decimal",
+    }
+    normalized: list[dict[str, Any]] = []
+    previous = declared_producer_sha256
+    prior_rows = 0
+    prior_steps = 0
+    for index, raw in enumerate(value):
+        if not isinstance(raw, Mapping) or set(raw) != required:
+            raise LineageDoseError(
+                f"initializer transition {index} field set drift"
+            )
+        row = dict(raw)
+        kind = row["kind"]
+        source = _typed_sha256(
+            row["source_checkpoint_sha256"],
+            f"initializer transition {index} source",
+        )
+        output = _typed_sha256(
+            row["output_checkpoint_sha256"],
+            f"initializer transition {index} output",
+        )
+        _typed_sha256(
+            row["receipt_file_sha256"],
+            f"initializer transition {index} receipt file",
+        )
+        _typed_sha256(
+            row["receipt_state_sha256"],
+            f"initializer transition {index} receipt state",
+        )
+        rows = row["sampled_rows"]
+        steps = row["optimizer_steps"]
+        if (
+            row["schema_version"] != INITIALIZER_TRANSITION_SCHEMA
+            or source != previous
+            or output == source
+            or not isinstance(row["receipt_path"], str)
+            or not row["receipt_path"]
+            or row["inherited_parameters_bit_identical"] is not True
+            or row["main_output_max_abs_diff_decimal"] != "0"
+            or isinstance(rows, bool)
+            or not isinstance(rows, int)
+            or rows < 0
+            or isinstance(steps, bool)
+            or not isinstance(steps, int)
+            or steps < 0
+        ):
+            raise LineageDoseError(
+                f"initializer transition {index} semantic drift"
+            )
+        if kind == "public_award_zero_initialization":
+            expected_role = "feature_schema_zero_initialization"
+            expected_terminal = "not_constructed"
+            expected_dose = (0, 0)
+        elif kind == "function_preserving_pointer_upgrade":
+            expected_role = "architecture_zero_diff_upgrade"
+            expected_terminal = "not_constructed"
+            expected_dose = (0, 0)
+        else:
+            expected_role = "head_only_auxiliary_commissioning"
+            expected_terminal = "discarded_before_joint_training"
+            expected_dose = (524_288, 128)
+        if (
+            row["role"] != expected_role
+            or row["optimizer_state_terminal"] != expected_terminal
+            or (rows, steps) != expected_dose
+        ):
+            raise LineageDoseError(
+                f"initializer transition {index} role/dose drift"
+            )
+        previous = output
+        prior_rows += rows
+        prior_steps += steps
+        normalized.append(row)
+    if previous != init_checkpoint_sha256:
+        raise LineageDoseError(
+            "initializer transition chain does not terminate at the actual initializer"
+        )
+    return normalized, prior_rows, prior_steps
+
+
 def validate_lineage_dose(value: Any) -> dict[str, Any]:
     if not isinstance(value, Mapping) or value.get("schema_version") != LINEAGE_DOSE_SCHEMA:
         raise LineageDoseError("lineage dose schema drift")
     mode = value.get("mode")
-    if mode not in {"direct_from_declared_producer", "typed_curriculum"}:
+    if mode not in {
+        "direct_from_declared_producer",
+        "direct_with_typed_initializer_chain",
+        "typed_curriculum",
+    }:
         raise LineageDoseError("lineage dose mode drift")
     if value.get("optimizer_state_continuity") != "fresh_optimizer_per_dose":
         raise LineageDoseError("lineage optimizer-state continuity drift")
@@ -107,26 +247,58 @@ def validate_lineage_dose(value: Any) -> dict[str, Any]:
         or cumulative_steps != prior_steps + current_steps
     ):
         raise LineageDoseError("lineage cumulative dose arithmetic drift")
-    if mode == "direct_from_declared_producer" and (prior_rows or prior_steps):
+    if mode in {
+        "direct_from_declared_producer",
+        "direct_with_typed_initializer_chain",
+    } and (prior_rows or prior_steps):
         raise LineageDoseError("direct lineage cannot carry a prior dose")
     if mode == "typed_curriculum" and (prior_rows <= 0 or prior_steps <= 0):
         raise LineageDoseError("curriculum lineage must carry a positive prior dose")
     for field in ("declared_producer_sha256", "init_checkpoint_sha256"):
-        raw = value.get(field)
-        if not isinstance(raw, str) or not raw.startswith("sha256:") or len(raw) != 71:
-            raise LineageDoseError(f"{field} is not a typed SHA-256")
+        _typed_sha256(value.get(field), field)
     upgrade = value.get("function_preserving_upgrade")
+    transition_chain = value.get("initializer_transition_chain")
+    preparation = value.get("initializer_preparation_exposure")
     if mode == "typed_curriculum":
-        if upgrade is not None:
+        if upgrade is not None or transition_chain is not None or preparation is not None:
             raise LineageDoseError(
-                "curriculum lineage cannot also claim an architecture upgrade"
+                "curriculum lineage cannot also claim an initializer transform"
             )
-    elif value["init_checkpoint_sha256"] == value["declared_producer_sha256"]:
+    elif mode == "direct_with_typed_initializer_chain":
         if upgrade is not None:
             raise LineageDoseError(
-                "function-preserving upgrade is forbidden for an exact-parent init"
+                "typed initializer chain cannot also claim a legacy single upgrade"
+            )
+        chain, chain_rows, chain_steps = _validate_initializer_transition_chain(
+            transition_chain,
+            declared_producer_sha256=value["declared_producer_sha256"],
+            init_checkpoint_sha256=value["init_checkpoint_sha256"],
+        )
+        expected_preparation = {
+            "schema_version": "a1-initializer-preparation-exposure-v1",
+            "measurement_scope": "initializer_preparation_only",
+            "sampled_rows": chain_rows,
+            "optimizer_steps": chain_steps,
+            "active_parameter_surface": (
+                "new_auxiliary_heads_only" if chain_steps else "no_optimizer_surface"
+            ),
+            "policy_active_sampled_rows": 0,
+            "value_active_sampled_rows": 0,
+            "shared_trunk_active_sampled_rows": 0,
+            "auxiliary_head_active_sampled_rows": chain_rows,
+        }
+        if chain != transition_chain or preparation != expected_preparation:
+            raise LineageDoseError("initializer preparation exposure drift")
+    elif value["init_checkpoint_sha256"] == value["declared_producer_sha256"]:
+        if upgrade is not None or transition_chain is not None or preparation is not None:
+            raise LineageDoseError(
+                "initializer transform is forbidden for an exact-parent init"
             )
     else:
+        if transition_chain is not None or preparation is not None:
+            raise LineageDoseError(
+                "legacy single-upgrade lineage cannot carry a transition chain"
+            )
         if (
             not isinstance(upgrade, Mapping)
             or set(upgrade) != {
@@ -150,9 +322,7 @@ def validate_lineage_dose(value: Any) -> dict[str, Any]:
                 "non-parent init requires an exact typed function-preserving upgrade"
             )
         for field in ("receipt_sha256",):
-            raw = upgrade.get(field)
-            if not isinstance(raw, str) or not raw.startswith("sha256:") or len(raw) != 71:
-                raise LineageDoseError(f"upgrade {field} is not a typed SHA-256")
+            _typed_sha256(upgrade.get(field), f"upgrade {field}")
         if not isinstance(upgrade.get("receipt"), str) or not upgrade["receipt"]:
             raise LineageDoseError("upgrade receipt path is missing")
     return dict(value)
@@ -162,20 +332,58 @@ def direct_lineage_dose(
     *, declared_producer_sha256: str, init_checkpoint_sha256: str,
     current_sampled_rows: int, current_optimizer_steps: int,
     function_preserving_upgrade: Mapping[str, Any] | None = None,
+    initializer_transition_chain: list[Mapping[str, Any]] | None = None,
     objective_exposure: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    if init_checkpoint_sha256 != declared_producer_sha256 and function_preserving_upgrade is None:
+    if (
+        init_checkpoint_sha256 != declared_producer_sha256
+        and function_preserving_upgrade is None
+        and initializer_transition_chain is None
+    ):
         raise LineageDoseError(
             "untyped checkpoint chaining: init SHA differs from declared producer SHA"
         )
+    if function_preserving_upgrade is not None and initializer_transition_chain is not None:
+        raise LineageDoseError(
+            "initializer cannot use both legacy upgrade and typed transition chain"
+        )
+    normalized_chain = None
+    preparation_exposure = None
+    if initializer_transition_chain is not None:
+        normalized_chain, preparation_rows, preparation_steps = _validate_initializer_transition_chain(
+            list(initializer_transition_chain),
+            declared_producer_sha256=declared_producer_sha256,
+            init_checkpoint_sha256=init_checkpoint_sha256,
+        )
+        preparation_exposure = {
+            "schema_version": "a1-initializer-preparation-exposure-v1",
+            "measurement_scope": "initializer_preparation_only",
+            "sampled_rows": preparation_rows,
+            "optimizer_steps": preparation_steps,
+            "active_parameter_surface": (
+                "new_auxiliary_heads_only"
+                if preparation_steps
+                else "no_optimizer_surface"
+            ),
+            "policy_active_sampled_rows": 0,
+            "value_active_sampled_rows": 0,
+            "shared_trunk_active_sampled_rows": 0,
+            "auxiliary_head_active_sampled_rows": preparation_rows,
+        }
     return validate_lineage_dose({
         "schema_version": LINEAGE_DOSE_SCHEMA,
-        "mode": "direct_from_declared_producer",
+        "mode": (
+            "direct_with_typed_initializer_chain"
+            if normalized_chain is not None
+            else "direct_from_declared_producer"
+        ),
         "declared_producer_sha256": declared_producer_sha256,
         "init_checkpoint_sha256": init_checkpoint_sha256,
         "function_preserving_upgrade": (
             None if function_preserving_upgrade is None else dict(function_preserving_upgrade)
         ),
+        "initializer_transition_chain": normalized_chain,
+        "initializer_preparation_exposure": preparation_exposure,
         "parent_receipt_sha256": None,
         "optimizer_state_continuity": "fresh_optimizer_per_dose",
         "objective_exposure": (
@@ -211,6 +419,9 @@ def curriculum_lineage_dose(
         "declared_producer_sha256": declared_producer_sha256,
         "init_checkpoint_sha256": init_checkpoint_sha256,
         "parent_receipt_sha256": parent_receipt_sha256,
+        "function_preserving_upgrade": None,
+        "initializer_transition_chain": None,
+        "initializer_preparation_exposure": None,
         "optimizer_state_continuity": "fresh_optimizer_per_dose",
         "objective_exposure": {
             "measurement_status": "not_yet_bound_exactly",

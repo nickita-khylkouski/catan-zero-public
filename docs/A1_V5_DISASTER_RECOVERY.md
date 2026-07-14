@@ -87,7 +87,7 @@ No recovered-wave candidate is auto-promoted. The gate is conjunctive:
 
 1. the normal full training/calibration/external/high-regret/bucket gate and a
    strict H1 result against the recovered v5 generator parent;
-2. a separate, fresh, fixed 300-pair f7 panel at base seed `6_199_700_000`;
+2. a separate, fresh, fixed 300-pair f7 panel at base seed `6_199_100_000`;
    f7 H0 vetoes promotion, while H1 or `continue` passes the veto.
 
 The two cohorts must be exact, fresh, and disjoint. Build the replayable gate

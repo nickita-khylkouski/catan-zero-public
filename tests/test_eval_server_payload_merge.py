@@ -8,6 +8,7 @@ import types
 import numpy as np
 import pytest
 
+from catan_zero.rl.entity_feature_adapter import CURRENT_RUST_ENTITY_ADAPTER_VERSION
 from catan_zero.search.eval_server import (
     RemoteEvalClient,
     _crop_masked_event_tail,
@@ -295,6 +296,7 @@ def test_remote_client_transports_target_ids_only_when_policy_needs_them(
         0,
         action_size=332,
         trained_with_masked_hidden_info=False,
+        entity_feature_adapter=CURRENT_RUST_ENTITY_ADAPTER_VERSION,
         needs_action_targets=needs_action_targets,
         config=EntityGraphRustEvaluatorConfig(),
     )
@@ -351,6 +353,7 @@ def test_remote_client_transports_topology_for_relational_trunks() -> None:
         0,
         action_size=332,
         trained_with_masked_hidden_info=False,
+        entity_feature_adapter=CURRENT_RUST_ENTITY_ADAPTER_VERSION,
         needs_relational_topology=True,
         config=EntityGraphRustEvaluatorConfig(),
     )
@@ -400,6 +403,7 @@ def test_remote_client_event_limit_validates_and_crops_before_queue_put() -> Non
         0,
         action_size=332,
         trained_with_masked_hidden_info=False,
+        entity_feature_adapter=CURRENT_RUST_ENTITY_ADAPTER_VERSION,
         event_token_limit=0,
         config=EntityGraphRustEvaluatorConfig(),
     )
@@ -448,6 +452,7 @@ def test_no_fallback_client_latches_first_terminal_transport_failure() -> None:
         4,
         action_size=332,
         trained_with_masked_hidden_info=False,
+        entity_feature_adapter=CURRENT_RUST_ENTITY_ADAPTER_VERSION,
         config=EntityGraphRustEvaluatorConfig(),
         client_timeout_ms=1.0,
     )

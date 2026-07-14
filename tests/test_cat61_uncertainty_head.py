@@ -214,7 +214,11 @@ def test_evaluator_rejects_checkpoint_with_deleted_uncertainty_weights(tmp_path)
         del payload["model"][key]
     torch.save(payload, checkpoint)
 
-    loaded = EntityGraphPolicy.load(checkpoint, device="cpu")
+    loaded = EntityGraphPolicy.load(
+        checkpoint,
+        device="cpu",
+        allow_missing_optional_parameters=True,
+    )
     assert loaded.model.value_uncertainty_head is not None
     assert set(removed) <= set(loaded._checkpoint_missing_state_keys)
 

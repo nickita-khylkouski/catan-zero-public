@@ -48,6 +48,7 @@ from tools import a1_pre_wave_contract as pre_wave
 from tools import a1_scientific_evidence as scientific_evidence
 from tools import a1_v5_disaster_recovery as v5_recovery
 from tools import a1_v5_recovery_gate as v5_recovery_gate
+from tools.fleet import a1_h100_eval_fleet as h100_eval_fleet
 from tools.fleet import a1_production_executor as production_executor
 
 
@@ -62,6 +63,9 @@ P1_EVALUATION_PLAN_SCHEMA = "a1-p1-fixed-evaluation-plan-v1"
 AUX_EVALUATION_PLAN_SCHEMA = "a1-aux-fixed-evaluation-plan-v1"
 HANDOFF_PARENT_AUTHORITY_SCHEMA = "a1-current-recovered-parent-authority-v1"
 POINTER_UPGRADE_AUTHORITY_SCHEMA = "a1-aux-pointer-upgrade-authority-v1"
+PUBLIC_AWARD_TRANSITION_AUTHORITY_SCHEMA = (
+    "a1-public-award-transition-authority-v1"
+)
 EXPERIMENT_SCHEMA = "a1-aux-two-stage-experiment-v1"
 ALLOCATION_SCHEMA = "a1-exact-b200-allocation-v1"
 WARMUP_RECIPE_SCHEMA = "a1-aux-pointer-warmup-recipe-v1"
@@ -75,6 +79,7 @@ FINAL_EXECUTOR_AUTHORITY_SCHEMA = "a1-final-replication-executor-authority-v1"
 FINAL_GATE_PLAN_SCHEMA = "a1-final-full-gate-plan-v1"
 FINAL_GATE_ENTRY_SCHEMA = "a1-final-full-gate-entry-authority-v1"
 PUBLISHED_EXECUTOR_AUTHORITY_SCHEMA = "a1-published-executor-authority-v1"
+CENTRAL_EXECUTION_COMMITMENT_SCHEMA = "a1-central-learner-execution-commitment-v1"
 
 SHORT_SAMPLE_DOSE = 524_288
 SHORT_OPTIMIZER_STEPS = 128
@@ -362,6 +367,58 @@ def _stable_read_json_artifact(
     return payload, "sha256:" + hashlib.sha256(raw).hexdigest(), identity
 
 
+def _stable_immutable_file_sha256(path: Path, *, where: str) -> str:
+    """Hash one canonical immutable regular file through a pinned inode."""
+
+    lexical = Path(os.path.abspath(os.fspath(path.expanduser())))
+    try:
+        resolved = lexical.resolve(strict=True)
+    except OSError as error:
+        raise CoordinatorError(f"cannot resolve {where}: {error}") from error
+    if resolved != lexical or resolved.is_symlink() or not resolved.is_file():
+        raise CoordinatorError(f"{where} must be a canonical regular file")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(resolved, flags)
+    except OSError as error:
+        raise CoordinatorError(f"cannot open {where}: {error}") from error
+    digest = hashlib.sha256()
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or stat.S_IMODE(before.st_mode) != 0o444:
+            raise CoordinatorError(f"{where} must be immutable mode 0444")
+        while chunk := os.read(descriptor, 1 << 20):
+            digest.update(chunk)
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    identity = (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+    )
+    if identity != (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    ):
+        raise CoordinatorError(f"{where} changed while hashed")
+    live = resolved.stat(follow_symlinks=False)
+    if identity != (
+        live.st_dev,
+        live.st_ino,
+        live.st_size,
+        live.st_mtime_ns,
+        live.st_ctime_ns,
+    ):
+        raise CoordinatorError(f"{where} was replaced while hashed")
+    return "sha256:" + digest.hexdigest()
+
+
 def _write_once(path: Path, payload: Mapping[str, Any]) -> dict[str, Any]:
     """Create an immutable artifact, or idempotently replay exact bytes."""
 
@@ -517,6 +574,10 @@ def _verify_composite(value: Any) -> dict[str, Any]:
         "category_semantics",
         "category_semantics_sha256",
         "source_authority",
+        "learner_recipe_overrides_sha256",
+        "aux_subgoal_target_contract_sha256",
+        "public_award_feature_transition_contract_sha256",
+        "source_authority_semantic_sha256",
     }
     composite = _require_exact_keys(value, expected_keys, "typed composite authority")
     if (
@@ -1052,6 +1113,162 @@ def verify_pointer_upgrade_authority(
         "new_parameter_set_sha256",
     ):
         _require_sha(authority[field], f"pointer upgrade {field}")
+    return copy.deepcopy(authority)
+
+
+def _immutable_binary_identity(path_value: Any, *, where: str) -> tuple[Path, tuple]:
+    if not isinstance(path_value, str) or not path_value:
+        raise CoordinatorError(f"{where} path is missing")
+    lexical = Path(os.path.abspath(os.fspath(Path(path_value).expanduser())))
+    try:
+        resolved = lexical.resolve(strict=True)
+    except OSError as error:
+        raise CoordinatorError(f"cannot resolve {where}: {error}") from error
+    if lexical != resolved or resolved.is_symlink():
+        raise CoordinatorError(f"{where} must be one canonical non-symlink path")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(resolved, flags)
+    except OSError as error:
+        raise CoordinatorError(f"cannot open {where}: {error}") from error
+    try:
+        observed = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    if not stat.S_ISREG(observed.st_mode) or observed.st_mode & 0o222:
+        raise CoordinatorError(f"{where} must be an immutable regular file")
+    identity = (
+        observed.st_dev,
+        observed.st_ino,
+        observed.st_size,
+        observed.st_mtime_ns,
+        observed.st_ctime_ns,
+    )
+    live = resolved.stat(follow_symlinks=False)
+    if identity != (
+        live.st_dev,
+        live.st_ino,
+        live.st_size,
+        live.st_mtime_ns,
+        live.st_ctime_ns,
+    ):
+        raise CoordinatorError(f"{where} changed while authenticated")
+    return resolved, identity
+
+
+def verify_public_award_transition_authority(
+    value: Any, *, expected_parent: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Replay the exact legacy->authoritative checkpoint transition.
+
+    The legacy recovered checkpoint remains the causal lineage parent.  This
+    transition is a zero-optimizer, exact slot-12-zero initializer transform,
+    not a trained candidate and not a new promotion parent.
+    """
+
+    authority = _require_exact_keys(
+        value,
+        {
+            "schema_version",
+            "source_checkpoint",
+            "transitioned_checkpoint",
+            "receipt",
+        },
+        "public-award transition authority",
+    )
+    source = _require_exact_keys(
+        authority["source_checkpoint"],
+        {"path", "sha256"},
+        "public-award transition source",
+    )
+    transitioned = _require_exact_keys(
+        authority["transitioned_checkpoint"],
+        {"path", "sha256"},
+        "public-award transitioned checkpoint",
+    )
+    receipt_ref = _require_exact_keys(
+        authority["receipt"],
+        {"path", "file_sha256", "evidence"},
+        "public-award transition receipt reference",
+    )
+    if (
+        authority["schema_version"] != PUBLIC_AWARD_TRANSITION_AUTHORITY_SCHEMA
+        or source
+        != {
+            "path": expected_parent["checkpoint_path"],
+            "sha256": expected_parent["checkpoint_sha256"],
+        }
+        or transitioned["sha256"] == source["sha256"]
+    ):
+        raise CoordinatorError("public-award transition lost its causal parent")
+    for reference, label in (
+        (source, "source checkpoint"),
+        (transitioned, "transitioned checkpoint"),
+    ):
+        _require_sha(reference["sha256"], f"public-award {label}")
+    _require_sha(receipt_ref["file_sha256"], "public-award receipt file")
+
+    source_path, source_before = _immutable_binary_identity(
+        source["path"], where="public-award source checkpoint"
+    )
+    transitioned_path, transitioned_before = _immutable_binary_identity(
+        transitioned["path"], where="public-award transitioned checkpoint"
+    )
+    receipt_path = Path(str(receipt_ref["path"])).expanduser()
+    receipt_before, receipt_file_sha, receipt_identity = (
+        _stable_read_immutable_json(
+            receipt_path, where="public-award transition receipt"
+        )
+    )
+    expected_origin = _repo_tool_sha256("tools/a1_scientific_evidence.py")
+    try:
+        replay = scientific_evidence.verify_public_award_transition_receipt(
+            receipt_path,
+            source_checkpoint=source_path,
+            transitioned_checkpoint=transitioned_path,
+            expected_origin_tool_sha256=expected_origin,
+        )
+    except (scientific_evidence.EvidenceError, OSError, ValueError) as error:
+        raise CoordinatorError(
+            f"public-award transition receipt replay failed: {error}"
+        ) from error
+    source_after_path, source_after = _immutable_binary_identity(
+        source["path"], where="public-award source checkpoint replay"
+    )
+    transitioned_after_path, transitioned_after = _immutable_binary_identity(
+        transitioned["path"], where="public-award transitioned checkpoint replay"
+    )
+    receipt_after, receipt_file_sha_after, receipt_identity_after = (
+        _stable_read_immutable_json(
+            receipt_path, where="public-award transition receipt replay"
+        )
+    )
+    if (
+        source_path != source_after_path
+        or transitioned_path != transitioned_after_path
+        or source_before != source_after
+        or transitioned_before != transitioned_after
+        or receipt_before != receipt_after
+        or receipt_file_sha != receipt_file_sha_after
+        or receipt_identity != receipt_identity_after
+        or receipt_file_sha != receipt_ref["file_sha256"]
+        or receipt_before != receipt_ref["evidence"]
+        or replay != receipt_before
+        or replay.get("source_checkpoint_sha256") != source["sha256"]
+        or replay.get("transitioned_checkpoint_sha256")
+        != transitioned["sha256"]
+        or replay.get("source_public_award_feature_contract") != "legacy_zero_v0"
+        or replay.get("transitioned_public_award_feature_contract")
+        != "authoritative_v1"
+        or replay.get("changed_input_column_index") != 12
+        or replay.get("transitioned_slot12_max_abs_decimal") != "0"
+        or replay.get("unchanged_parameters_bit_identical") is not True
+        or replay.get("unrelated_metadata_bit_identical") is not True
+        or replay.get("legacy_zero_input_function_preserving") is not True
+        or replay.get("optimizer_steps") != 0
+        or replay.get("origin_tool_sha256") != expected_origin
+    ):
+        raise CoordinatorError("public-award transition authority/replay drift")
     return copy.deepcopy(authority)
 
 
@@ -1984,7 +2201,11 @@ def _canonical_cohort(
             "pair_index_start": 0,
             "pair_index_stop_exclusive": pairs,
         },
-        "orientation_schedule": ["candidate_first", "candidate_second"],
+        "orientation_schedule": (
+            ["candidate_red", "candidate_blue"]
+            if panel_kind == "internal"
+            else ["candidate_first", "candidate_second"]
+        ),
         "map_kind": map_kind,
         "opponent": opponent,
         "common_random_numbers": True,
@@ -2211,40 +2432,36 @@ def _load_panel_receipt(
     authority_id: str,
     arms: tuple[str, ...],
     arm_checkpoint_sha256: Mapping[str, str],
+    baseline_checkpoint_sha256: str,
     cohort_sha256: str,
     search_operator_sha256: str,
     origin_tool_sha256: str,
 ) -> dict[str, Any]:
-    receipt = _load_json(
-        path.expanduser().resolve(strict=True),
-        where=f"{family} {panel_kind} panel receipt",
-    )
-    _require_exact_keys(
-        receipt,
-        {
-            "schema_version",
-            "family",
-            "panel_kind",
-            "authority_id",
-            "arms",
-            "arm_checkpoint_sha256",
-            "cohort_sha256",
-            "search_operator_sha256",
-            "common_random_numbers",
-            "seat_swapped",
-            "points_milli",
-            "origin_tool_sha256",
-            "state_sha256",
-        },
-        f"{family} {panel_kind} panel receipt",
-    )
+    try:
+        receipt = h100_eval_fleet.verify_fixed_panel_receipt(
+            path.expanduser().resolve(strict=True),
+            family=family,
+            panel_kind=panel_kind,
+            authority_id=authority_id,
+            arms=arms,
+            arm_checkpoint_sha256=dict(arm_checkpoint_sha256),
+            baseline_checkpoint_sha256=baseline_checkpoint_sha256,
+            cohort_sha256=cohort_sha256,
+            search_operator_sha256=search_operator_sha256,
+        )
+    except (h100_eval_fleet.FleetError, OSError, ValueError, KeyError) as error:
+        raise CoordinatorError(
+            f"{family} {panel_kind} panel raw-game replay refused: {error}"
+        ) from error
     if (
-        receipt["schema_version"] != "a1-fixed-panel-receipt-v1"
+        receipt["schema_version"] != "a1-fixed-panel-receipt-v2"
         or receipt["family"] != family
         or receipt["panel_kind"] != panel_kind
         or receipt["authority_id"] != authority_id
         or receipt["arms"] != list(arms)
         or receipt["arm_checkpoint_sha256"] != dict(arm_checkpoint_sha256)
+        or receipt["baseline_checkpoint_sha256"]
+        != baseline_checkpoint_sha256
         or receipt["cohort_sha256"] != cohort_sha256
         or receipt["search_operator_sha256"] != search_operator_sha256
         or receipt["common_random_numbers"] is not True
@@ -2530,6 +2747,7 @@ def complete_p1_arm(
     *,
     arm_id: str,
     result: Mapping[str, Any],
+    execution_evidence: Mapping[str, Any],
 ) -> dict[str, Any]:
     if arm_id not in P1_ARMS:
         raise CoordinatorError("P1 sweep permits only K0/K3/K10")
@@ -2601,11 +2819,19 @@ def complete_p1_arm(
         "origin_tool_sha256",
     ):
         _require_sha(result[field], f"P1 {arm_id} {field}")
+    commitment = _verify_central_terminal_execution_evidence(
+        root,
+        sweep_id,
+        stage="P1",
+        evidence=execution_evidence,
+        result=result,
+    )
     payload = {
         "schema_version": "a1-p1-central-arm-terminal-v1",
         "sweep_id": sweep_id,
         "arm_id": arm_id,
-        "prior_authority_sha256": claim["state_sha256"],
+        "prior_authority_sha256": commitment["state_sha256"],
+        "execution_evidence": copy.deepcopy(dict(execution_evidence)),
         "result": copy.deepcopy(result),
     }
     directory = _artifact_dir(root, sweep_id, create=False)
@@ -2676,6 +2902,7 @@ def complete_p1_evaluation(
         authority_id=sweep_id,
         arms=P1_ARMS,
         arm_checkpoint_sha256=expected_checkpoints,
+        baseline_checkpoint_sha256=plan["baseline_checkpoint_sha256"],
         cohort_sha256=plan["internal_cohort_sha256"],
         search_operator_sha256=plan["search_operator_sha256"],
         origin_tool_sha256=plan["panel_origin_tool_sha256"],
@@ -2687,6 +2914,7 @@ def complete_p1_evaluation(
         authority_id=sweep_id,
         arms=P1_ARMS,
         arm_checkpoint_sha256=expected_checkpoints,
+        baseline_checkpoint_sha256=plan["baseline_checkpoint_sha256"],
         cohort_sha256=plan["external_cohort_sha256"],
         search_operator_sha256=plan["search_operator_sha256"],
         origin_tool_sha256=plan["panel_origin_tool_sha256"],
@@ -2827,56 +3055,242 @@ def _verify_central_p1_authority(
     return selected
 
 
-_PORTABLE_DERIVED_LOCATION_KEYS = {
-    "descriptor_sha256",
-    "portable_science_identity_sha256",
-    "sampler_identity_sha256",
-    "selection_receipt_sha256",
-    "selection_replay_sha256",
-    "source_p1_recipe_data_authority_sha256",
-    "source_p1_sample_state_sha256",
-    "state_sha256",
-    "sweep_id",
-}
+def _portable_composite_projection(value: Mapping[str, Any]) -> dict[str, Any]:
+    composite = _verify_composite(dict(value))
+    # descriptor_sha256, data_fingerprint, and source_authority intentionally
+    # stay in the operational authority.  They include absolute staging paths.
+    # Every path-independent fact that affects training is listed explicitly.
+    fields = (
+        "schema_version",
+        "component_ids",
+        "component_sampling_ratios",
+        "payload_inventory_sha256",
+        "production_sampling_receipt_sha256",
+        "validation_split_receipt_sha256",
+        "sample_order_sha256",
+        "training_game_seed_set_sha256",
+        "validation_game_seed_set_sha256",
+        "truncation_surface_sha256",
+        "truncated_rows",
+        "complete_game_inputs",
+        "category_semantics",
+        "category_semantics_sha256",
+        "learner_recipe_overrides_sha256",
+        "aux_subgoal_target_contract_sha256",
+        "public_award_feature_transition_contract_sha256",
+        "source_authority_semantic_sha256",
+    )
+    return {key: copy.deepcopy(composite[key]) for key in fields}
 
 
-def _portable_science_projection(value: Any) -> Any:
-    """Remove only staging locations and their derivative hashes.
+def _portable_sample_projection(value: Mapping[str, Any]) -> dict[str, Any]:
+    # This function receives only receipts already replayed by the coordinator.
+    # Location-derived descriptor/sampler/state seals are omitted; physical row
+    # order, row set, KL mask evidence, and outcome-overlap facts remain.
+    fields = (
+        "schema_version",
+        "status",
+        "sample_dose",
+        "sampler_seed",
+        "sampler_algorithm",
+        "sample_order_sha256",
+        "row_set_sha256",
+        "unique_row_count",
+        "prior_rows_file_sha256",
+        "prior_row_set_sha256",
+        "prior_unique_row_count",
+        "observed_unique_overlap_count",
+        "analytic_expected_unique_overlap_decimal",
+        "overlap_excess_bound_decimal",
+        "overlap_alpha_decimal",
+        "overlap_within_independent_bound",
+        "component_overlap",
+        "kl_eligible_rows",
+        "kl_eligible_mass_decimal",
+        "kl_ordered_evidence_sha256",
+        "kl_eligible_evidence_sha256",
+        "payload_inventory_sha256",
+        "category_semantics",
+        "category_semantics_sha256",
+        "rows_file_sha256",
+        "origin_tool_sha256",
+        "replay_verified",
+    )
+    return {key: copy.deepcopy(value[key]) for key in fields}
 
-    The full exact-path authority remains in the experiment payload and every
-    executor claim.  This projection is used solely for the portable science
-    identity, so copying byte-identical data/authority to another canonical
-    root does not create a new experiment while changing any semantic digest,
-    row order, checkpoint, recipe, or recovery relation still does.
-    """
 
-    if isinstance(value, dict):
-        projected: dict[str, Any] = {}
-        for key, item in value.items():
-            if key in _PORTABLE_DERIVED_LOCATION_KEYS:
-                continue
-            if key == "source_authority":
-                # This ref is replayed in full by the operational authority.
-                # Its path and enclosing JSON hashes are staging-specific; the
-                # category semantics and corpus digests remain independently.
-                continue
-            if key == "path" or key.endswith("_path"):
-                continue
-            projected[key] = _portable_science_projection(item)
-        return projected
-    if isinstance(value, list):
-        return [_portable_science_projection(item) for item in value]
-    return copy.deepcopy(value)
+def _portable_recovery_projection(value: Mapping[str, Any]) -> dict[str, Any]:
+    recovered = value["recovered_generator"]
+    safety = value["safety_reference_unproven_predecessor"]
+    producer = value["producer_identity"]
+    producer_checkpoint = producer["checkpoint"]
+    return {
+        "schema_version": value["schema_version"],
+        "recovery_lineage_id": value["recovery_lineage_id"],
+        "recovered_generator": {
+            key: recovered[key]
+            for key in (
+                "sha256",
+                "md5",
+                "historical_generation_version_claim",
+            )
+        },
+        "safety_reference_unproven_predecessor": {
+            key: safety[key]
+            for key in (
+                "sha256",
+                "md5",
+                "historical_generation_version_claim",
+                "relation",
+                "causal_parent_proven",
+            )
+        },
+        "producer_identity": {
+            "schema_version": producer["schema_version"],
+            "checkpoint_sha256": producer_checkpoint["sha256"],
+            "search_config": copy.deepcopy(producer["search_config"]),
+        },
+        "promotion_proof_recreated": value["promotion_proof_recreated"],
+        "dual_baseline_fresh_gate_required": value[
+            "dual_baseline_fresh_gate_required"
+        ],
+        "promotion_eligible": value["promotion_eligible"],
+        "training_proof": value["training_proof"],
+        "wave_lineage_mode": value["wave_lineage_mode"],
+    }
+
+
+def _portable_parent_projection(value: Mapping[str, Any]) -> dict[str, Any]:
+    fields = (
+        "schema_version",
+        "role",
+        "checkpoint_sha256",
+        "checkpoint_md5",
+        "historical_generation_version_claim",
+        "recovery_lineage_id",
+        "promotion_proof_recreated",
+        "independent_reload_per_arm",
+        "unpromoted_candidate_forbidden",
+    )
+    return {key: copy.deepcopy(value[key]) for key in fields}
+
+
+def _portable_warmup_projection(value: Mapping[str, Any]) -> dict[str, Any]:
+    operational = {"descriptor_sha256", "data_fingerprint", "sampler_identity_sha256"}
+    return {
+        key: copy.deepcopy(item)
+        for key, item in value.items()
+        if key not in operational
+    }
+
+
+def _portable_public_award_transition_projection(
+    value: Mapping[str, Any]
+) -> dict[str, Any]:
+    return {
+        "schema_version": value["schema_version"],
+        "source_checkpoint_sha256": value["source_checkpoint"]["sha256"],
+        "transitioned_checkpoint_sha256": value["transitioned_checkpoint"][
+            "sha256"
+        ],
+        "receipt_evidence": copy.deepcopy(value["receipt"]["evidence"]),
+    }
+
+
+def _portable_science_projection(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Build an explicit path-independent scientific identity."""
+
+    science = dict(value)
+    p1 = science["p1_recipe_data_authority"]
+    geometry = science["geometry_dose_authority"]
+    projection: dict[str, Any] = {
+        "schema_version": science["schema_version"],
+        "p1_selection": {
+            "selected_arm": p1["selected_arm"],
+            "replay_verified": p1["replay_verified"],
+            "scientific_role": p1["scientific_role"],
+            "diagnostic_only": p1["diagnostic_only"],
+            "promotion_eligible": p1["promotion_eligible"],
+            "requires_independent_final_replication": p1[
+                "requires_independent_final_replication"
+            ],
+            "effective_recipe": copy.deepcopy(p1["effective_recipe"]),
+            "effective_recipe_sha256": p1["effective_recipe_sha256"],
+        },
+        "geometry_dose": {
+            key: copy.deepcopy(geometry[key])
+            for key in (
+                "schema_version",
+                "source_p1_sample_order_sha256",
+                "source_p1_rows_file_sha256",
+                "source_effective_recipe_sha256",
+                "sample_dose",
+                "optimizer_steps",
+                "world_size",
+                "local_batch_size",
+                "global_batch_size",
+                "grad_accum_steps",
+                "amp",
+                "measured_sample_replay_verified",
+                "current_central_authority",
+            )
+        },
+        "effective_recipe": copy.deepcopy(science["effective_recipe"]),
+        "effective_recipe_sha256": science["effective_recipe_sha256"],
+        "composite": _portable_composite_projection(science["composite"]),
+        "current_parent": _portable_parent_projection(
+            science["current_parent_authority"]
+        ),
+        "recovery": _portable_recovery_projection(science["recovery_authority"]),
+        "recovery_component_semantics": copy.deepcopy(
+            science["recovery_component_semantics"]
+        ),
+        "native_runtime_authority": copy.deepcopy(
+            science["native_runtime_authority"]
+        ),
+        "p1_sample": _portable_sample_projection(
+            science["p1_sample_evidence_receipt"]
+        ),
+        "public_award_transition_authority": (
+            _portable_public_award_transition_projection(
+                science["public_award_transition_authority"]
+            )
+        ),
+        "pointer_upgrade_authority": copy.deepcopy(
+            science["pointer_upgrade_authority"]
+        ),
+        "warmup_recipe": _portable_warmup_projection(science["warmup_recipe"]),
+        "selector_rule": copy.deepcopy(science["selector_rule"]),
+        "evaluation_plan": copy.deepcopy(science["evaluation_plan"]),
+        "portable_code_identity_sha256": science[
+            "portable_code_identity_sha256"
+        ],
+        "portable_runtime_identity_sha256": science[
+            "portable_runtime_identity_sha256"
+        ],
+    }
+    for key in (
+        "warmup_terminal_sha256",
+        "warmed_checkpoint_sha256",
+        "inherited_parameter_identity_sha256",
+        "gradient_geometry_terminal_sha256",
+        "gradient_selector_evidence_sha256",
+        "selected_aux_coefficient_decimal",
+    ):
+        if key in science:
+            projection[key] = copy.deepcopy(science[key])
+    return projection
 
 
 def _portable_science_digest(value: Mapping[str, Any]) -> str:
-    return _digest(_portable_science_projection(dict(value)))
+    return _digest(_portable_science_projection(value))
 
 
 def prepare_experiment(
     root: Path,
     *,
     p1_recipe_data_authority: Mapping[str, Any],
+    public_award_transition_authority: Mapping[str, Any],
     pointer_upgrade_authority: Mapping[str, Any],
     warmup_recipe: Mapping[str, Any],
     selector_rule: Mapping[str, Any],
@@ -2896,9 +3310,14 @@ def prepare_experiment(
         native_receipt
     ):
         raise CoordinatorError("AUX retained native runtime projection drift")
+    public_award_transition = verify_public_award_transition_authority(
+        dict(public_award_transition_authority), expected_parent=parent
+    )
     pointer = verify_pointer_upgrade_authority(
         dict(pointer_upgrade_authority),
-        expected_parent_sha256=parent["checkpoint_sha256"],
+        expected_parent_sha256=public_award_transition["transitioned_checkpoint"][
+            "sha256"
+        ],
     )
     warmup = verify_warmup_recipe(dict(warmup_recipe))
     selector = verify_selector_rule(dict(selector_rule))
@@ -2965,6 +3384,7 @@ def prepare_experiment(
         "p1_sample_evidence_receipt": copy.deepcopy(
             p1["p1_sample_evidence_receipt"]
         ),
+        "public_award_transition_authority": public_award_transition,
         "pointer_upgrade_authority": pointer,
         "warmup_recipe": warmup,
         "selector_rule": selector,
@@ -3136,12 +3556,666 @@ def load_geometry_executor_authority(
     )
 
 
+def canonical_stage_command_intent(command: list[str]) -> dict[str, Any]:
+    """Normalize only the authority fields that are self-referential."""
+
+    intent_argv = list(command)
+    placeholders = {
+        "--a1-aux-stage-executor-authority": "<EXECUTOR_AUTHORITY_PATH>",
+        "--a1-aux-stage-executor-authority-sha256": (
+            "<EXECUTOR_AUTHORITY_FILE_SHA256>"
+        ),
+    }
+    for flag, placeholder in placeholders.items():
+        indices = [index for index, token in enumerate(intent_argv) if token == flag]
+        if len(indices) != 1 or indices[0] + 1 >= len(intent_argv):
+            raise CoordinatorError(f"stage command intent has no unique {flag}")
+        intent_argv[indices[0] + 1] = placeholder
+    binding_flag = "--a1-aux-stage-binding-json"
+    binding_indices = [
+        index for index, token in enumerate(intent_argv) if token == binding_flag
+    ]
+    if len(binding_indices) != 1 or binding_indices[0] + 1 >= len(intent_argv):
+        raise CoordinatorError("stage command intent has no unique binding JSON")
+    try:
+        intent_binding = json.loads(intent_argv[binding_indices[0] + 1])
+    except (TypeError, json.JSONDecodeError) as error:
+        raise CoordinatorError("stage command binding JSON is malformed") from error
+    if not isinstance(intent_binding, dict):
+        raise CoordinatorError("stage command binding JSON is not an object")
+    for field, placeholder in (
+        ("executor_authority_path", "<EXECUTOR_AUTHORITY_PATH>"),
+        (
+            "executor_authority_file_sha256",
+            "<EXECUTOR_AUTHORITY_FILE_SHA256>",
+        ),
+        ("executor_authority_state_sha256", "<EXECUTOR_AUTHORITY_STATE_SHA256>"),
+    ):
+        if field not in intent_binding:
+            raise CoordinatorError(f"stage command binding omitted {field}")
+        intent_binding[field] = placeholder
+    intent_argv[binding_indices[0] + 1] = json.dumps(
+        intent_binding, sort_keys=True, separators=(",", ":")
+    )
+    return {
+        "schema_version": "a1-stage-preauthority-command-intent-v1",
+        "argv": intent_argv,
+    }
+
+
+def commit_stage_execution(
+    root: Path,
+    experiment_id: str,
+    *,
+    stage: str,
+    command: list[str],
+    environment: Mapping[str, str],
+    output_namespace: Mapping[str, str],
+    training_binding: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Seal the exact executable process after authority publication.
+
+    The executor-authority file digest cannot be embedded into a claim that is
+    itself a predecessor of that file.  This append-only post-authority
+    commitment breaks that cycle: the claim binds environment/output intent,
+    then this artifact binds the exact rendered argv plus the published
+    authority file/state before any child process starts.
+    """
+
+    if stage not in {"WARMUP", "GEOMETRY"}:
+        raise CoordinatorError("execution commitment stage drift")
+    if (
+        not isinstance(command, list)
+        or not command
+        or any(not isinstance(token, str) or not token for token in command)
+        or not isinstance(environment, Mapping)
+        or any(
+            not isinstance(key, str)
+            or not key
+            or not isinstance(value, str)
+            for key, value in environment.items()
+        )
+    ):
+        raise CoordinatorError("execution commitment command/environment malformed")
+    outputs = _require_exact_keys(
+        dict(output_namespace),
+        {"checkpoint", "report", "optimizer_sidecar"},
+        "stage output namespace",
+    )
+    if any(
+        not isinstance(path, str) or not Path(path).is_absolute()
+        for path in outputs.values()
+    ) or len(set(outputs.values())) != 3:
+        raise CoordinatorError("stage output namespace is not three absolute paths")
+    claim_filename = (
+        "10-warmup-claim.json" if stage == "WARMUP" else "30-geometry-claim.json"
+    )
+    authority_filename = (
+        "15-warmup-executor-authority.json"
+        if stage == "WARMUP"
+        else "35-geometry-executor-authority.json"
+    )
+    commitment_filename = (
+        "17-warmup-execution-commitment.json"
+        if stage == "WARMUP"
+        else "37-geometry-execution-commitment.json"
+    )
+    claim = _artifact(root, experiment_id, claim_filename)
+    assert claim is not None
+    directory = _artifact_dir(root, experiment_id, create=False)
+    authority_path = directory / authority_filename
+    authority, authority_file_sha, _identity = _stable_read_immutable_json(
+        authority_path, where=f"{stage} executor authority commitment"
+    )
+    binding = dict(training_binding)
+    if (
+        authority.get("stage") != stage
+        or authority.get("stage_claim") != claim
+        or authority.get("allocation") != claim.get("allocation")
+        or binding.get("stage") != stage
+        or binding.get("experiment_id") != experiment_id
+        or binding.get("executor_authority_path") != str(authority_path)
+        or binding.get("executor_authority_file_sha256") != authority_file_sha
+        or binding.get("executor_authority_state_sha256")
+        != authority.get("state_sha256")
+        or binding.get("output_checkpoint") != outputs["checkpoint"]
+        or binding.get("output_report") != outputs["report"]
+    ):
+        raise CoordinatorError("stage execution commitment lost authority/binding")
+    intent_projection = canonical_stage_command_intent(command)
+    command_intent_sha = _digest(intent_projection)
+    environment_value = dict(environment)
+    command_sha = _digest(command)
+    environment_sha = _digest(environment_value)
+    output_sha = _digest(outputs)
+    if (
+        claim["execution"]["command_sha256"] != command_intent_sha
+        or claim["execution"]["environment_sha256"] != environment_sha
+        or claim["execution"]["output_namespace_sha256"] != output_sha
+    ):
+        raise CoordinatorError(
+            "stage claim environment/output intent differs from realized execution"
+        )
+    payload = {
+        "schema_version": "a1-stage-execution-commitment-v1",
+        "experiment_id": experiment_id,
+        "stage": stage,
+        "prior_authority_sha256": authority["state_sha256"],
+        "executor_authority_path": str(authority_path),
+        "executor_authority_file_sha256": authority_file_sha,
+        "executor_authority_state_sha256": authority["state_sha256"],
+        "claim_state_sha256": claim["state_sha256"],
+        "preauthority_command_intent": intent_projection,
+        "preauthority_command_intent_sha256": command_intent_sha,
+        "command_sha256": command_sha,
+        "environment": environment_value,
+        "environment_sha256": environment_sha,
+        "output_namespace": outputs,
+        "output_namespace_sha256": output_sha,
+        "training_binding_sha256": _digest(binding),
+    }
+    return _write_once(directory / commitment_filename, payload)
+
+
+def canonical_central_command_intent(command: list[str]) -> dict[str, Any]:
+    """Normalize only the published-authority fields that form a claim cycle."""
+
+    if not isinstance(command, list) or not command or any(
+        not isinstance(token, str) or not token for token in command
+    ):
+        raise CoordinatorError("central command intent is malformed")
+    intent_argv = list(command)
+    replacements = {
+        "--a1-central-executor-authority": "<EXECUTOR_AUTHORITY_PATH>",
+        "--a1-central-executor-authority-sha256": (
+            "<EXECUTOR_AUTHORITY_FILE_SHA256>"
+        ),
+    }
+    for flag, placeholder in replacements.items():
+        indices = [index for index, token in enumerate(intent_argv) if token == flag]
+        if len(indices) != 1 or indices[0] + 1 >= len(intent_argv):
+            raise CoordinatorError(f"central command intent has no unique {flag}")
+        intent_argv[indices[0] + 1] = placeholder
+    binding_flag = "--a1-central-learner-binding-json"
+    binding_indices = [
+        index for index, token in enumerate(intent_argv) if token == binding_flag
+    ]
+    if len(binding_indices) != 1 or binding_indices[0] + 1 >= len(intent_argv):
+        raise CoordinatorError("central command intent lacks its binding JSON")
+    try:
+        binding = json.loads(intent_argv[binding_indices[0] + 1])
+    except (TypeError, json.JSONDecodeError) as error:
+        raise CoordinatorError("central command binding JSON is malformed") from error
+    if not isinstance(binding, dict):
+        raise CoordinatorError("central command binding JSON is not an object")
+    for field, placeholder in (
+        ("central_authority_sha256", "<CENTRAL_AUTHORITY_SHA256>"),
+        ("executor_authority_path", "<EXECUTOR_AUTHORITY_PATH>"),
+        ("executor_authority_file_sha256", "<EXECUTOR_AUTHORITY_FILE_SHA256>"),
+        ("executor_authority_state_sha256", "<EXECUTOR_AUTHORITY_STATE_SHA256>"),
+    ):
+        if field not in binding:
+            raise CoordinatorError(f"central command binding omitted {field}")
+        binding[field] = placeholder
+    intent_argv[binding_indices[0] + 1] = json.dumps(
+        binding, sort_keys=True, separators=(",", ":")
+    )
+    aux_flag = "--a1-aux-regularization-binding-json"
+    aux_indices = [index for index, token in enumerate(intent_argv) if token == aux_flag]
+    stage = binding.get("stage")
+    if stage in ARMS:
+        if len(aux_indices) != 1 or aux_indices[0] + 1 >= len(intent_argv):
+            raise CoordinatorError("central AUX command intent lacks AUX binding JSON")
+        try:
+            aux_binding = json.loads(intent_argv[aux_indices[0] + 1])
+        except (TypeError, json.JSONDecodeError) as error:
+            raise CoordinatorError("central AUX command binding JSON is malformed") from error
+        if not isinstance(aux_binding, dict) or "aux_pair_authority_sha256" not in aux_binding:
+            raise CoordinatorError("central AUX command binding lacks authority digest")
+        aux_binding["aux_pair_authority_sha256"] = "<AUX_PAIR_AUTHORITY_SHA256>"
+        intent_argv[aux_indices[0] + 1] = json.dumps(
+            aux_binding, sort_keys=True, separators=(",", ":")
+        )
+    elif aux_indices:
+        raise CoordinatorError("non-AUX central command unexpectedly has AUX binding")
+    return {
+        "schema_version": "a1-central-preauthority-command-intent-v1",
+        "argv": intent_argv,
+    }
+
+
+def canonical_central_output_namespace_intent(
+    output_namespace: Mapping[str, str],
+) -> dict[str, Any]:
+    """Normalize the authority-derived one-dose claim path before issuance."""
+
+    outputs = _require_exact_keys(
+        dict(output_namespace),
+        {
+            "checkpoint",
+            "optimizer_sidecar",
+            "training_progress",
+            "report",
+            "receipt",
+            "one_dose_claim",
+        },
+        "central learner output namespace intent",
+    )
+    if any(not isinstance(value, str) or not value for value in outputs.values()):
+        raise CoordinatorError("central learner output namespace intent is malformed")
+    outputs["one_dose_claim"] = "<ONE_DOSE_CLAIM_PATH>"
+    return {
+        "schema_version": "a1-central-preauthority-output-namespace-intent-v1",
+        "outputs": outputs,
+    }
+
+
+def _central_execution_coordinates(
+    authority: Mapping[str, Any],
+) -> tuple[str, str, str, str, str]:
+    """Return stage, experiment id, claim, authority, and commitment filenames."""
+
+    schema = authority.get("schema_version")
+    if schema == "a1-p1-arm-executor-authority-v1":
+        arm_id = str(authority.get("arm_id"))
+        return (
+            "P1",
+            str(authority.get("sweep_id")),
+            f"p1-10-{arm_id.lower()}-claim.json",
+            f"p1-15-{arm_id.lower()}-executor-authority.json",
+            f"p1-17-{arm_id.lower()}-learner-execution-commitment.json",
+        )
+    if schema == EXECUTOR_AUTHORITY_SCHEMA:
+        pair = authority.get("aux_pair_contract")
+        arm = authority.get("arm")
+        if not isinstance(pair, dict) or not isinstance(arm, dict):
+            raise CoordinatorError("central AUX authority shape drift")
+        arm_id = str(arm.get("arm_id"))
+        if arm_id not in ARMS:
+            raise CoordinatorError("central AUX authority arm drift")
+        return (
+            arm_id,
+            str(pair.get("experiment_id")),
+            f"60-{arm_id.lower()}-claim.json",
+            f"65-{arm_id.lower()}-executor-authority.json",
+            f"67-{arm_id.lower()}-learner-execution-commitment.json",
+        )
+    if schema == FINAL_EXECUTOR_AUTHORITY_SCHEMA:
+        final = authority.get("final_replication_authority")
+        if not isinstance(final, dict):
+            raise CoordinatorError("central FINAL authority shape drift")
+        return (
+            "FINAL",
+            str(final.get("experiment_id")),
+            "92-final-claim.json",
+            "93-final-executor-authority.json",
+            "94-final-learner-execution-commitment.json",
+        )
+    raise CoordinatorError("unsupported central learner executor authority")
+
+
+def commit_central_learner_execution(
+    *,
+    published_executor_authority: Mapping[str, Any],
+    command: list[str],
+    environment: Mapping[str, str],
+    output_namespace: Mapping[str, str],
+    central_binding: Mapping[str, Any],
+    input_binding: Mapping[str, Any],
+    one_dose_claim_identity_sha256: str,
+    aux_regularization_binding: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Seal exact P1/AUX/FINAL process bytes after authority publication."""
+
+    published = dict(published_executor_authority)
+    path_value = published.get("path")
+    if not isinstance(path_value, str):
+        raise CoordinatorError("central published authority path is missing")
+    replayed = verify_published_executor_authority(Path(path_value))
+    if replayed != published:
+        raise CoordinatorError("central published authority wrapper drift")
+    authority = replayed["authority"]
+    stage, experiment_id, claim_name, authority_name, commitment_name = (
+        _central_execution_coordinates(authority)
+    )
+    authority_path = Path(replayed["path"])
+    if authority_path.name != authority_name:
+        raise CoordinatorError("central executor authority filename drift")
+    directory = authority_path.parent
+    claim = _artifact(directory.parent, experiment_id, claim_name)
+    assert claim is not None
+    outputs = _require_exact_keys(
+        dict(output_namespace),
+        {
+            "checkpoint",
+            "optimizer_sidecar",
+            "training_progress",
+            "report",
+            "receipt",
+            "one_dose_claim",
+        },
+        "central learner output namespace",
+    )
+    if any(
+        not isinstance(value, str) or not Path(value).is_absolute()
+        for value in outputs.values()
+    ) or len(set(outputs.values())) != len(outputs):
+        raise CoordinatorError("central learner output namespace is not unique/absolute")
+    environment_value = dict(environment)
+    if any(
+        not isinstance(key, str)
+        or not key
+        or not isinstance(value, str)
+        for key, value in environment_value.items()
+    ):
+        raise CoordinatorError("central learner environment is malformed")
+    binding = dict(central_binding)
+    input_value = dict(input_binding)
+    if (
+        binding.get("stage") != stage
+        or binding.get("executor_authority_path") != replayed["path"]
+        or binding.get("executor_authority_file_sha256") != replayed["file_sha256"]
+        or binding.get("executor_authority_state_sha256")
+        != authority.get("state_sha256")
+    ):
+        raise CoordinatorError("central learner binding lost published authority")
+    def one_command_value(flag: str) -> str:
+        indices = [index for index, token in enumerate(command) if token == flag]
+        if len(indices) != 1 or indices[0] + 1 >= len(command):
+            raise CoordinatorError(f"central realized command has no unique {flag}")
+        return command[indices[0] + 1]
+
+    try:
+        command_binding = json.loads(
+            one_command_value("--a1-central-learner-binding-json")
+        )
+    except (TypeError, json.JSONDecodeError) as error:
+        raise CoordinatorError("central realized command binding JSON is malformed") from error
+    if (
+        command_binding != binding
+        or one_command_value("--a1-central-executor-authority")
+        != replayed["path"]
+        or one_command_value("--a1-central-executor-authority-sha256")
+        != replayed["file_sha256"]
+    ):
+        raise CoordinatorError("central realized argv differs from published authority")
+    aux_binding_value = (
+        dict(aux_regularization_binding)
+        if isinstance(aux_regularization_binding, Mapping)
+        else None
+    )
+    if stage in ARMS:
+        try:
+            command_aux_binding = json.loads(
+                one_command_value("--a1-aux-regularization-binding-json")
+            )
+        except (TypeError, json.JSONDecodeError) as error:
+            raise CoordinatorError("central AUX realized binding JSON is malformed") from error
+        if (
+            aux_binding_value is None
+            or command_aux_binding != aux_binding_value
+            or aux_binding_value.get("aux_pair_authority_sha256")
+            != authority.get("authority_sha256")
+        ):
+            raise CoordinatorError("central AUX realized binding differs from authority")
+    elif aux_binding_value is not None:
+        raise CoordinatorError("non-AUX central execution has an AUX binding")
+    _require_sha(one_dose_claim_identity_sha256, "one-dose claim identity")
+    intent = canonical_central_command_intent(command)
+    intent_sha = _digest(intent)
+    environment_sha = _digest(environment_value)
+    outputs_sha = _digest(outputs)
+    output_intent = canonical_central_output_namespace_intent(outputs)
+    output_intent_sha = _digest(output_intent)
+    if (
+        claim.get("execution", {}).get("command_sha256") != intent_sha
+        or claim.get("execution", {}).get("environment_sha256") != environment_sha
+        or claim.get("execution", {}).get("output_namespace_sha256")
+        != output_intent_sha
+    ):
+        raise CoordinatorError(
+            "central claim environment/output intent differs from realized execution: "
+            f"command={claim.get('execution', {}).get('command_sha256')}!= {intent_sha}; "
+            f"environment={claim.get('execution', {}).get('environment_sha256')}!= {environment_sha}; "
+            f"outputs={claim.get('execution', {}).get('output_namespace_sha256')}!= {output_intent_sha}"
+        )
+    payload = {
+        "schema_version": CENTRAL_EXECUTION_COMMITMENT_SCHEMA,
+        "experiment_id": experiment_id,
+        "stage": stage,
+        "prior_authority_sha256": authority["state_sha256"],
+        "executor_authority_path": replayed["path"],
+        "executor_authority_file_sha256": replayed["file_sha256"],
+        "executor_authority_state_sha256": authority["state_sha256"],
+        "coordinator_claim_state_sha256": claim["state_sha256"],
+        "preauthority_command_intent": intent,
+        "preauthority_command_intent_sha256": intent_sha,
+        "command": list(command),
+        "command_sha256": _digest(command),
+        "environment": environment_value,
+        "environment_sha256": environment_sha,
+        "output_namespace": outputs,
+        "output_namespace_sha256": outputs_sha,
+        "preauthority_output_namespace_intent": output_intent,
+        "preauthority_output_namespace_intent_sha256": output_intent_sha,
+        "central_binding_sha256": _digest(binding),
+        "input_binding_sha256": _digest(input_value),
+        "aux_regularization_binding_sha256": (
+            _digest(aux_binding_value) if aux_binding_value is not None else None
+        ),
+        "one_dose_claim_identity_sha256": one_dose_claim_identity_sha256,
+    }
+    commitment_path = directory / commitment_name
+    commitment = _write_once(commitment_path, payload)
+    replayed_commitment, file_sha256, _identity = _stable_read_immutable_json(
+        commitment_path, where="central learner execution commitment"
+    )
+    if replayed_commitment != commitment:
+        raise CoordinatorError("central learner execution commitment replay drift")
+    return {
+        "schema_version": "a1-central-execution-commitment-reference-v1",
+        "path": str(commitment_path),
+        "file_sha256": file_sha256,
+        "commitment": commitment,
+    }
+
+
+def central_terminal_execution_evidence(
+    commitment_reference: Mapping[str, Any], receipt_path: Path
+) -> dict[str, Any]:
+    """Build the narrow path/digest evidence consumed by terminal transitions."""
+
+    reference = dict(commitment_reference)
+    commitment = reference.get("commitment")
+    if not isinstance(commitment, dict):
+        raise CoordinatorError("central commitment reference has no commitment")
+    receipt, receipt_file_sha, _identity = _stable_read_json_artifact(
+        receipt_path, where="central one-dose receipt evidence"
+    )
+    claim_path = Path(str(receipt.get("claim", "")))
+    claim, _claim_file_sha, _claim_identity = _stable_read_immutable_json(
+        claim_path, where="central one-dose terminal claim evidence"
+    )
+    return {
+        "schema_version": "a1-central-terminal-execution-evidence-v1",
+        "commitment_path": reference.get("path"),
+        "commitment_file_sha256": reference.get("file_sha256"),
+        "commitment_state_sha256": commitment.get("state_sha256"),
+        "receipt_path": str(receipt_path.expanduser().resolve(strict=True)),
+        "receipt_file_sha256": receipt_file_sha,
+        "receipt_sha256": receipt.get("receipt_sha256"),
+        "one_dose_claim_path": str(claim_path.expanduser().resolve(strict=True)),
+        "one_dose_claim_state_sha256": claim.get("state_sha256"),
+    }
+
+
+def _verify_central_terminal_execution_evidence(
+    root: Path,
+    experiment_id: str,
+    *,
+    stage: str,
+    evidence: Mapping[str, Any],
+    result: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Prove a terminal is causally downstream of exact learner artifacts."""
+
+    value = _require_exact_keys(
+        dict(evidence),
+        {
+            "schema_version",
+            "commitment_path",
+            "commitment_file_sha256",
+            "commitment_state_sha256",
+            "receipt_path",
+            "receipt_file_sha256",
+            "receipt_sha256",
+            "one_dose_claim_path",
+            "one_dose_claim_state_sha256",
+        },
+        "central terminal execution evidence",
+    )
+    if value["schema_version"] != "a1-central-terminal-execution-evidence-v1":
+        raise CoordinatorError("central terminal execution evidence schema drift")
+    commitment_path = Path(str(value["commitment_path"]))
+    commitment, commitment_file_sha, _identity = _stable_read_immutable_json(
+        commitment_path, where="central learner execution commitment terminal"
+    )
+    if (
+        commitment.get("schema_version") != CENTRAL_EXECUTION_COMMITMENT_SCHEMA
+        or commitment.get("experiment_id") != experiment_id
+        or commitment.get("stage") != stage
+        or commitment_file_sha != value["commitment_file_sha256"]
+        or commitment.get("state_sha256") != value["commitment_state_sha256"]
+    ):
+        raise CoordinatorError("central terminal commitment identity drift")
+    published = verify_published_executor_authority(
+        Path(str(commitment.get("executor_authority_path", "")))
+    )
+    if (
+        published["file_sha256"] != commitment["executor_authority_file_sha256"]
+        or published["authority"]["state_sha256"]
+        != commitment["executor_authority_state_sha256"]
+    ):
+        raise CoordinatorError("central terminal published authority drift")
+    expected_stage, expected_id, claim_name, _authority_name, commitment_name = (
+        _central_execution_coordinates(published["authority"])
+    )
+    if (
+        expected_stage != stage
+        or expected_id != experiment_id
+        or commitment_path.name != commitment_name
+    ):
+        raise CoordinatorError("central terminal commitment coordinates drift")
+    coordinator_claim = _artifact(root, experiment_id, claim_name)
+    assert coordinator_claim is not None
+    if commitment["coordinator_claim_state_sha256"] != coordinator_claim["state_sha256"]:
+        raise CoordinatorError("central terminal lost coordinator claim")
+
+    receipt_path = Path(str(value["receipt_path"]))
+    receipt, receipt_file_sha, _receipt_identity = _stable_read_json_artifact(
+        receipt_path, where="central terminal one-dose receipt"
+    )
+    if receipt_path.stat().st_mode & 0o222:
+        raise CoordinatorError("central terminal one-dose receipt is mutable")
+    unsigned_receipt = dict(receipt)
+    stated_receipt_sha = unsigned_receipt.pop("receipt_sha256", None)
+    if (
+        receipt_file_sha != value["receipt_file_sha256"]
+        or stated_receipt_sha != value["receipt_sha256"]
+        or stated_receipt_sha != _digest(unsigned_receipt)
+        or receipt.get("status") != "complete"
+        or receipt.get("returncode") != 0
+        or receipt.get("failure") is not None
+    ):
+        raise CoordinatorError("central terminal one-dose receipt identity/status drift")
+    commitment_reference = receipt.get("central_execution_commitment")
+    if (
+        not isinstance(commitment_reference, dict)
+        or commitment_reference.get("path") != str(commitment_path)
+        or commitment_reference.get("file_sha256") != commitment_file_sha
+        or commitment_reference.get("commitment") != commitment
+    ):
+        raise CoordinatorError("one-dose receipt lost central execution commitment")
+    namespace = commitment.get("output_namespace")
+    outputs = receipt.get("outputs")
+    if not isinstance(namespace, dict) or not isinstance(outputs, dict):
+        raise CoordinatorError("central terminal output namespace is missing")
+    claim_path = Path(str(value["one_dose_claim_path"]))
+    claim, _claim_file_sha, _claim_identity = _stable_read_immutable_json(
+        claim_path, where="central terminal one-dose claim"
+    )
+    if (
+        str(receipt_path) != namespace.get("receipt")
+        or str(claim_path) != namespace.get("one_dose_claim")
+        or receipt.get("claim") != str(claim_path)
+        or receipt.get("claim_state_sha256") != claim.get("state_sha256")
+        or claim.get("state_sha256") != value["one_dose_claim_state_sha256"]
+        or claim.get("receipt_target") != str(receipt_path)
+        or claim.get("status") != "complete"
+        or claim.get("claim_identity_sha256")
+        != commitment.get("one_dose_claim_identity_sha256")
+        or claim.get("central_execution_commitment") != commitment_reference
+    ):
+        raise CoordinatorError("central one-dose claim/receipt/namespace drift")
+    claim_projection = dict(claim)
+    claim_projection.pop("state_sha256", None)
+    claim_projection.pop("receipt_target", None)
+    claim_projection["schema_version"] = receipt.get("schema_version")
+    receipt_projection = dict(receipt)
+    for field in ("receipt_sha256", "claim", "claim_state_sha256"):
+        receipt_projection.pop(field, None)
+    if claim_projection != receipt_projection:
+        raise CoordinatorError("central one-dose terminal claim differs from receipt")
+    if (
+        outputs.get("checkpoint") != namespace.get("checkpoint")
+        or outputs.get("optimizer_sidecar") != namespace.get("optimizer_sidecar")
+        or outputs.get("training_progress") != namespace.get("training_progress")
+        or outputs.get("report") != namespace.get("report")
+        or receipt.get("command") != commitment.get("command")
+        or receipt.get("command_sha256") != commitment.get("command_sha256")
+        or receipt.get("execution_binding", {}).get("environment_sha256")
+        != commitment.get("environment_sha256")
+        or _digest(receipt.get("input_binding", {}))
+        != commitment.get("input_binding_sha256")
+        or result.get("checkpoint_sha256") != outputs.get("checkpoint_sha256")
+        or result.get("optimizer_sidecar_sha256")
+        != outputs.get("optimizer_sidecar_sha256")
+        or result.get("report_sha256") != outputs.get("report_sha256")
+    ):
+        raise CoordinatorError("central terminal realized process/output drift")
+    realized_files = {
+        "checkpoint_sha256": ("checkpoint", "central learner checkpoint"),
+        "optimizer_sidecar_sha256": (
+            "optimizer_sidecar",
+            "central learner optimizer sidecar",
+        ),
+        "training_progress_sha256": (
+            "training_progress",
+            "central learner training progress",
+        ),
+        "report_sha256": ("report", "central learner report"),
+    }
+    for digest_field, (path_field, where) in realized_files.items():
+        path_value = outputs.get(path_field)
+        expected_digest = outputs.get(digest_field)
+        if not isinstance(path_value, str) or not isinstance(expected_digest, str):
+            raise CoordinatorError(f"{where} path/digest is missing")
+        if _stable_immutable_file_sha256(Path(path_value), where=where) != expected_digest:
+            raise CoordinatorError(f"{where} digest drift")
+    return commitment
+
+
 def complete_warmup(
     root: Path, experiment_id: str, *, result: Mapping[str, Any]
 ) -> dict[str, Any]:
     experiment = load_experiment(root, experiment_id)
     claim = _artifact(root, experiment_id, "10-warmup-claim.json")
-    assert claim is not None
+    commitment = _artifact(
+        root, experiment_id, "17-warmup-execution-commitment.json"
+    )
+    assert claim is not None and commitment is not None
+    if commitment["claim_state_sha256"] != claim["state_sha256"]:
+        raise CoordinatorError("warmup completion lost execution commitment")
     warmup = experiment["portable_science_identity"]["warmup_recipe"]
     pointer = experiment["portable_science_identity"]["pointer_upgrade_authority"]
     result = _require_exact_keys(
@@ -3189,7 +4263,7 @@ def complete_warmup(
     payload = {
         "schema_version": "a1-aux-pointer-warmup-terminal-v1",
         "experiment_id": experiment_id,
-        "prior_authority_sha256": claim["state_sha256"],
+        "prior_authority_sha256": commitment["state_sha256"],
         "result": copy.deepcopy(result),
     }
     directory = _artifact_dir(root, experiment_id, create=False)
@@ -3249,13 +4323,98 @@ def _select_coefficient(
     return _canonical_decimal(raw), _canonical_decimal(selected)
 
 
+def _verify_geometry_rng_transaction(value: Any) -> dict[str, Any]:
+    transaction = _require_exact_keys(
+        value,
+        {
+            "schema_version",
+            "scope",
+            "restore_frequency",
+            "before",
+            "after_probe",
+            "after_restore",
+            "restored_exactly",
+        },
+        "gradient geometry RNG transaction",
+    )
+
+    def _verify_state(raw: Any, where: str) -> dict[str, Any]:
+        state = _require_exact_keys(
+            raw,
+            {
+                "schema_version",
+                "python_random_sha256",
+                "numpy_generator_sha256",
+                "torch_cpu_sha256",
+                "cuda_device",
+                "torch_cuda_sha256",
+                "state_sha256",
+            },
+            where,
+        )
+        numpy_states = state["numpy_generator_sha256"]
+        if (
+            state["schema_version"] != "a1-aux-geometry-rng-state-v1"
+            or not isinstance(numpy_states, dict)
+            or "sampler" not in numpy_states
+            or any(not isinstance(name, str) or not name for name in numpy_states)
+            or (
+                state["cuda_device"] is not None
+                and (
+                    not isinstance(state["cuda_device"], int)
+                    or isinstance(state["cuda_device"], bool)
+                    or state["cuda_device"] < 0
+                )
+            )
+            or (state["cuda_device"] is None)
+            != (state["torch_cuda_sha256"] is None)
+        ):
+            raise CoordinatorError(f"{where} identity drift")
+        _require_sha(state["python_random_sha256"], f"{where} Python RNG")
+        _require_sha(state["torch_cpu_sha256"], f"{where} torch CPU RNG")
+        if state["torch_cuda_sha256"] is not None:
+            _require_sha(state["torch_cuda_sha256"], f"{where} torch CUDA RNG")
+        for name, digest in sorted(numpy_states.items()):
+            _require_sha(digest, f"{where} NumPy RNG {name}")
+        expected_state_sha = _digest(
+            {key: item for key, item in state.items() if key != "state_sha256"}
+        )
+        if state["state_sha256"] != expected_state_sha:
+            raise CoordinatorError(f"{where} state digest drift")
+        return state
+
+    before = _verify_state(transaction["before"], "geometry RNG before")
+    after_probe = _verify_state(
+        transaction["after_probe"], "geometry RNG after probe"
+    )
+    after = _verify_state(
+        transaction["after_restore"], "geometry RNG after restore"
+    )
+    if (
+        transaction["schema_version"]
+        != "a1-aux-geometry-rng-transaction-v1"
+        or transaction["scope"] != "one_complete_ordered_five_batch_probe"
+        or transaction["restore_frequency"] != "once_after_all_five_batches"
+        or transaction["restored_exactly"] is not True
+        or before["state_sha256"] == after_probe["state_sha256"]
+        or before["state_sha256"] != after["state_sha256"]
+    ):
+        raise CoordinatorError("gradient geometry RNG transaction was not isolated")
+    return transaction
+
+
 def complete_geometry(
     root: Path, experiment_id: str, *, evidence: Mapping[str, Any]
 ) -> dict[str, Any]:
     experiment = load_experiment(root, experiment_id)
     warmup = _artifact(root, experiment_id, "20-warmup-terminal.json")
     claim = _artifact(root, experiment_id, "30-geometry-claim.json")
-    assert warmup is not None and claim is not None
+    commitment = _artifact(
+        root, experiment_id, "37-geometry-execution-commitment.json"
+    )
+    assert warmup is not None and claim is not None and commitment is not None
+    if commitment["claim_state_sha256"] != claim["state_sha256"]:
+        raise CoordinatorError("geometry completion lost execution commitment")
     rule = experiment["portable_science_identity"]["selector_rule"]
     evidence = _require_exact_keys(
         dict(evidence),
@@ -3275,6 +4434,7 @@ def complete_geometry(
             "global_ddp_aggregation",
             "optimizer_steps",
             "persistent_state_mutated",
+            "rng_transactions_by_rank",
             "report_sha256",
             "origin_tool_sha256",
         },
@@ -3321,7 +4481,24 @@ def complete_geometry(
         dot += batch_dot
     main_norm = main_squared.sqrt()
     aux_norm = aux_squared.sqrt()
-    cosine = dot / (main_norm * aux_norm)
+    # Derive the cosine denominator from the product of the additive squared
+    # norms in one Decimal square root. Multiplying two independently rounded
+    # square roots makes a perfectly aligned aggregate report a value just
+    # below one and can move a coefficient across a quantization boundary.
+    cosine = dot / (main_squared * aux_squared).sqrt()
+    rng_transactions = evidence["rng_transactions_by_rank"]
+    if not isinstance(rng_transactions, list) or len(rng_transactions) != WORLD_SIZE:
+        raise CoordinatorError(
+            "gradient geometry requires one RNG transaction per DDP rank"
+        )
+    for rank, transaction in enumerate(rng_transactions):
+        verified_transaction = _verify_geometry_rng_transaction(transaction)
+        if (
+            verified_transaction["before"]["cuda_device"] != rank
+            or verified_transaction["after_probe"]["cuda_device"] != rank
+            or verified_transaction["after_restore"]["cuda_device"] != rank
+        ):
+            raise CoordinatorError("gradient geometry RNG rank/device binding drift")
     if (
         evidence["schema_version"] != "a1-aux-gradient-geometry-evidence-v1"
         or evidence["status"] != "complete"
@@ -3351,7 +4528,7 @@ def complete_geometry(
     payload = {
         "schema_version": "a1-aux-gradient-selector-terminal-v1",
         "experiment_id": experiment_id,
-        "prior_authority_sha256": claim["state_sha256"],
+        "prior_authority_sha256": commitment["state_sha256"],
         "selector_rule_sha256": _digest(rule),
         "evidence": copy.deepcopy(evidence),
         "evidence_sha256": _digest(evidence),
@@ -3540,6 +4717,7 @@ def complete_arm(
     *,
     arm_id: str,
     result: Mapping[str, Any],
+    execution_evidence: Mapping[str, Any],
 ) -> dict[str, Any]:
     if arm_id not in ARMS:
         raise CoordinatorError("AUX pair permits only AUX0 and AUXT")
@@ -3602,12 +4780,20 @@ def complete_arm(
         "origin_tool_sha256",
     ):
         _require_sha(result[field], f"{arm_id} result {field}")
+    commitment = _verify_central_terminal_execution_evidence(
+        root,
+        experiment_id,
+        stage=arm_id,
+        evidence=execution_evidence,
+        result=result,
+    )
     payload = {
         "schema_version": "a1-aux-joint-arm-terminal-v1",
         "experiment_id": experiment_id,
         "pair_id": pair["pair_id"],
         "arm_id": arm_id,
-        "prior_authority_sha256": claim["state_sha256"],
+        "prior_authority_sha256": commitment["state_sha256"],
+        "execution_evidence": copy.deepcopy(dict(execution_evidence)),
         "result": copy.deepcopy(result),
     }
     directory = _artifact_dir(root, experiment_id, create=False)
@@ -3667,6 +4853,7 @@ def complete_pair_evaluation(
         authority_id=pair["pair_id"],
         arms=ARMS,
         arm_checkpoint_sha256=expected_checkpoints,
+        baseline_checkpoint_sha256=plan["baseline_checkpoint_sha256"],
         cohort_sha256=plan["internal_cohort_sha256"],
         search_operator_sha256=plan["search_operator_sha256"],
         origin_tool_sha256=plan["panel_origin_tool_sha256"],
@@ -3678,6 +4865,7 @@ def complete_pair_evaluation(
         authority_id=pair["pair_id"],
         arms=ARMS,
         arm_checkpoint_sha256=expected_checkpoints,
+        baseline_checkpoint_sha256=plan["baseline_checkpoint_sha256"],
         cohort_sha256=plan["external_cohort_sha256"],
         search_operator_sha256=plan["search_operator_sha256"],
         origin_tool_sha256=plan["panel_origin_tool_sha256"],
@@ -3819,6 +5007,9 @@ def issue_final_replication(
     initializer = {
         "exact_current_parent_authority": copy.deepcopy(
             science["current_parent_authority"]
+        ),
+        "public_award_transition_authority": copy.deepcopy(
+            science["public_award_transition_authority"]
         ),
         "diagnostic_arm_checkpoint_forbidden": True,
         "base_parent_lineage_reloaded": True,
@@ -4154,6 +5345,7 @@ def complete_final_replication(
     candidate_checkpoint_path: Path,
     initializer_slot12_zero_receipt_path: Path,
     trained_slot12_delta_receipt_path: Path,
+    execution_evidence: Mapping[str, Any],
 ) -> dict[str, Any]:
     final = _artifact(root, experiment_id, "90-final-issued.json")
     claim = _artifact(root, experiment_id, "92-final-claim.json")
@@ -4228,7 +5420,12 @@ def complete_final_replication(
         )
     except (scientific_evidence.EvidenceError, OSError, ValueError) as error:
         raise CoordinatorError(f"FINAL model slot12 evidence refused: {error}") from error
-    expected_initializer_sha = expected_warmup if treatment else parent_sha
+    transitioned_parent_sha = initializer["public_award_transition_authority"][
+        "transitioned_checkpoint"
+    ]["sha256"]
+    expected_initializer_sha = (
+        expected_warmup if treatment else transitioned_parent_sha
+    )
     if (
         result["schema_version"] != "a1-final-replication-result-v1"
         or result["status"] != "complete"
@@ -4302,6 +5499,13 @@ def complete_final_replication(
         "trained_slot12_delta_receipt_state_sha256",
     ):
         _require_sha(result[field], f"FINAL result {field}")
+    commitment = _verify_central_terminal_execution_evidence(
+        root,
+        experiment_id,
+        stage="FINAL",
+        evidence=execution_evidence,
+        result=result,
+    )
     forbidden_checkpoints = {parent_sha}
     pair = _artifact(root, experiment_id, "50-pair-issued.json")
     assert pair is not None
@@ -4320,7 +5524,8 @@ def complete_final_replication(
         "schema_version": "a1-final-replication-terminal-v1",
         "experiment_id": experiment_id,
         "final_replication_id": final["final_replication_id"],
-        "prior_authority_sha256": claim["state_sha256"],
+        "prior_authority_sha256": commitment["state_sha256"],
+        "execution_evidence": copy.deepcopy(dict(execution_evidence)),
         "result": copy.deepcopy(result),
         "initializer_slot12_zero_receipt": copy.deepcopy(zero_receipt),
         "trained_slot12_delta_receipt": copy.deepcopy(delta_receipt),
@@ -4493,6 +5698,7 @@ __all__ = [
     "build_native_runtime_authority",
     "build_p1_kl_eligibility_authority",
     "canonical_aux_evaluation_plan",
+    "canonical_stage_command_intent",
     "current_parent_authority_from_recovery",
     "recovery_component_semantics",
     "canonical_geometry_dose_authority",
@@ -4514,6 +5720,7 @@ __all__ = [
     "complete_pair_evaluation",
     "complete_final_replication",
     "complete_warmup",
+    "commit_stage_execution",
     "finalize_pair",
     "inspect_state",
     "issue_final_replication",

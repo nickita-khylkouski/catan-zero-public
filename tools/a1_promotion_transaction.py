@@ -555,6 +555,219 @@ def _verify_symmetry_training_provenance(
         )
 
 
+def _verify_final_initializer_transition_chain(
+    report: Mapping[str, Any],
+    *,
+    producer: Mapping[str, Any],
+    lineage_dose: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    """Replay FINAL's typed initializer transforms without changing its parent.
+
+    The raw recovered producer remains the promotion baseline.  Public-award
+    initialization, the pointer upgrade, and head-only warmup are typed
+    initializer preparation, not candidate lineage and not prior policy/value
+    learner doses.
+    """
+
+    chain = lineage_dose.get("initializer_transition_chain")
+    central = report.get("a1_central_learner_binding")
+    if not isinstance(chain, list) or not isinstance(central, Mapping):
+        raise PromotionError(
+            "typed initializer chain requires a central FINAL learner binding"
+        )
+    selected_aux = central.get("selected_aux_decision")
+    expected_kinds = (
+        ["public_award_zero_initialization"]
+        if selected_aux == "AUX0"
+        else list(one_dose.lineage.INITIALIZER_TRANSITION_KINDS)
+        if selected_aux == "AUXT"
+        else None
+    )
+    if (
+        central.get("stage") != "FINAL"
+        or central.get("diagnostic_only") is not False
+        or central.get("promotion_eligible") is not False
+        or central.get("eligible_for_full_gate") is not True
+        or central.get("full_gate_required") is not True
+        or expected_kinds is None
+        or [row.get("kind") for row in chain if isinstance(row, Mapping)]
+        != expected_kinds
+    ):
+        raise PromotionError(
+            "typed initializer chain is not an independent gate-eligible FINAL"
+        )
+    producer_sha = _validate_sha256(
+        producer.get("sha256"), where="typed initializer raw producer sha256"
+    )
+    if chain[0].get("source_checkpoint_sha256") != producer_sha:
+        raise PromotionError("typed initializer chain does not start at raw producer")
+    init_sha = _validate_sha256(
+        report.get("init_checkpoint_sha256"),
+        where="typed initializer final checkpoint sha256",
+    )
+    if chain[-1].get("output_checkpoint_sha256") != init_sha:
+        raise PromotionError("typed initializer chain does not end at report initializer")
+    init_path = _canonical_existing_file(
+        Path(str(report.get("init_checkpoint"))),
+        where="typed FINAL initializer",
+    )
+    if _sha256(init_path) != init_sha:
+        raise PromotionError("typed FINAL initializer bytes drifted")
+    producer_path = _canonical_existing_file(
+        Path(str(producer.get("path"))), where="typed initializer raw producer"
+    )
+    if _sha256(producer_path) != producer_sha:
+        raise PromotionError("typed initializer raw producer bytes drifted")
+
+    try:
+        from tools import a1_aux_pair_coordinator as coordinator
+        from tools import a1_scientific_evidence as scientific_evidence
+    except ImportError as error:  # pragma: no cover - repository invariant
+        raise PromotionError(f"cannot import typed initializer verifiers: {error}") from error
+
+    pointer_upgrade: Mapping[str, Any] | None = None
+    if selected_aux == "AUXT":
+        pointer_row = chain[1]
+        pointer_receipt = _canonical_existing_file(
+            Path(str(pointer_row["receipt_path"])),
+            where="typed pointer-upgrade receipt",
+        )
+        try:
+            pointer_upgrade = one_dose.architecture_upgrade.verify_receipt(
+                pointer_receipt
+            )
+        except one_dose.architecture_upgrade.UpgradeError as error:
+            raise PromotionError(f"typed pointer-upgrade receipt refused: {error}") from error
+        if (
+            _sha256(pointer_receipt) != pointer_row["receipt_file_sha256"]
+            or pointer_upgrade["receipt"]["sha256"]
+            != pointer_row["receipt_file_sha256"]
+            or pointer_upgrade["receipt_sha256"]
+            != pointer_row["receipt_state_sha256"]
+            or pointer_upgrade["module"]
+            != one_dose.AUX_REGULARIZATION_MODULE
+            or pointer_upgrade["source"]["sha256"]
+            != pointer_row["source_checkpoint_sha256"]
+            or pointer_upgrade["upgraded_initializer"]["sha256"]
+            != pointer_row["output_checkpoint_sha256"]
+        ):
+            raise PromotionError("typed pointer-upgrade receipt/edge drifted")
+
+    transition_row = chain[0]
+    transition_receipt = _canonical_existing_file(
+        Path(str(transition_row["receipt_path"])),
+        where="typed public-award transition receipt",
+    )
+    transitioned_path = (
+        init_path
+        if pointer_upgrade is None
+        else _canonical_existing_file(
+            Path(str(pointer_upgrade["source"]["path"])),
+            where="typed public-award transitioned checkpoint",
+        )
+    )
+    try:
+        transition = scientific_evidence.verify_public_award_transition_receipt(
+            transition_receipt,
+            source_checkpoint=producer_path,
+            transitioned_checkpoint=transitioned_path,
+            expected_origin_tool_sha256=scientific_evidence.origin_tool_sha256(),
+        )
+    except (scientific_evidence.EvidenceError, OSError, ValueError) as error:
+        raise PromotionError(
+            f"typed public-award transition receipt refused: {error}"
+        ) from error
+    if (
+        _sha256(transition_receipt) != transition_row["receipt_file_sha256"]
+        or transition.get("state_sha256")
+        != transition_row["receipt_state_sha256"]
+        or transition.get("source_checkpoint_sha256")
+        != transition_row["source_checkpoint_sha256"]
+        or transition.get("transitioned_checkpoint_sha256")
+        != transition_row["output_checkpoint_sha256"]
+        or transition.get("optimizer_steps") != 0
+        or transition.get("legacy_zero_input_function_preserving") is not True
+    ):
+        raise PromotionError("typed public-award transition receipt/edge drifted")
+
+    if selected_aux == "AUXT":
+        warmup_row = chain[2]
+        warmup_path = Path(str(warmup_row["receipt_path"]))
+        try:
+            warmup, warmup_file_sha, _identity = (
+                coordinator._stable_read_immutable_json(  # noqa: SLF001
+                    warmup_path, where="typed head-only warmup terminal"
+                )
+            )
+            coordinator._verify_sealed(  # noqa: SLF001
+                warmup, "typed head-only warmup terminal"
+            )
+        except (coordinator.CoordinatorError, OSError, ValueError) as error:
+            raise PromotionError(f"typed warmup terminal refused: {error}") from error
+        warmup_result = warmup.get("result")
+        if (
+            warmup_file_sha != warmup_row["receipt_file_sha256"]
+            or warmup.get("state_sha256") != warmup_row["receipt_state_sha256"]
+            or not isinstance(warmup_result, Mapping)
+            or warmup_result.get("input_initializer_sha256")
+            != warmup_row["source_checkpoint_sha256"]
+            or warmup_result.get("warmed_checkpoint_sha256")
+            != warmup_row["output_checkpoint_sha256"]
+            or warmup_result.get("sampled_rows") != 524_288
+            or warmup_result.get("optimizer_steps") != 128
+            or warmup_result.get("optimizer_sidecar_discarded_for_joint") is not True
+            or warmup_result.get("inherited_parameters_bit_identical") is not True
+            or warmup_result.get("main_output_max_diff") != 0.0
+        ):
+            raise PromotionError("typed head-only warmup terminal/edge drifted")
+    return [dict(row) for row in chain]
+
+
+def _training_evaluation_parent_sha256(
+    report: Mapping[str, Any], training_receipt: Mapping[str, Any]
+) -> str | None:
+    """Return the causal learner parent, never an initializer transform."""
+
+    curriculum_parent = report.get("a1_curriculum_parent")
+    lineage_value = report.get("a1_lineage_dose")
+    function_upgrade = (
+        lineage_value.get("function_preserving_upgrade")
+        if isinstance(lineage_value, Mapping)
+        else None
+    )
+    transition_chain = (
+        lineage_value.get("initializer_transition_chain")
+        if isinstance(lineage_value, Mapping)
+        else None
+    )
+    typed_chain_parent = (
+        transition_chain[0].get("source_checkpoint_sha256")
+        if isinstance(transition_chain, list)
+        and transition_chain
+        and isinstance(transition_chain[0], Mapping)
+        else None
+    )
+    explicit = training_receipt.get("evaluation_parent_sha256")
+    if typed_chain_parent is not None:
+        typed_chain_parent = _validate_sha256(
+            typed_chain_parent, where="typed initializer evaluation parent"
+        )
+        if explicit is not None and explicit != typed_chain_parent:
+            raise PromotionError(
+                "training receipt evaluation parent differs from typed chain source"
+            )
+        return typed_chain_parent
+    if explicit is not None:
+        return _validate_sha256(explicit, where="training receipt evaluation parent")
+    return (
+        curriculum_parent.get("generation_producer_sha256")
+        if isinstance(curriculum_parent, Mapping)
+        else function_upgrade.get("source_checkpoint_sha256")
+        if isinstance(function_upgrade, Mapping)
+        else report.get("init_checkpoint_sha256")
+    )
+
+
 def _verify_training_report(
     path: Path,
     *,
@@ -710,6 +923,21 @@ def _verify_training_report(
         if _sha256(init_path) != report["init_checkpoint_sha256"]:
             raise PromotionError("production L1 parent bytes drifted")
         return report
+    central_binding = report.get("a1_central_learner_binding")
+    is_central_final = (
+        isinstance(central_binding, Mapping)
+        and central_binding.get("stage") == "FINAL"
+    )
+    if (
+        isinstance(central_binding, Mapping)
+        and not is_central_final
+        and isinstance(report.get("a1_lineage_dose"), Mapping)
+        and report["a1_lineage_dose"].get("initializer_transition_chain")
+        is not None
+    ):
+        raise PromotionError(
+            "typed initializer chain is not an independent gate-eligible FINAL"
+        )
     is_dual = report.get("a1_dual_arm_execution_binding") is not None
     if is_dual:
         recipe = report.get("a1_bound_learner_training_recipe")
@@ -737,6 +965,21 @@ def _verify_training_report(
             or effective.get("ddp_shard_data") is not False
         ):
             raise PromotionError("dual-arm training report topology drift")
+    elif is_central_final:
+        recipe = central_binding.get("immutable_contract_recipe")
+        if (
+            not isinstance(recipe, dict)
+            or recipe != contract["science"]["learner_training_recipe"]
+            or central_binding.get("immutable_contract_recipe_sha256")
+            != _digest_value(recipe)
+        ):
+            raise PromotionError(
+                "central FINAL report lost its immutable contract recipe"
+            )
+        # Promotion-eligible composites deliberately do not inherit the old
+        # memmap validation identity into train_bc's top-level A1 fields.  The
+        # central binding and receipt carry the contract/recipe authority.
+        recipe_sha = None
     else:
         recipe = contract["science"]["learner_training_recipe"]
         recipe_sha = contract["science"]["learner_training_recipe_sha256"]
@@ -744,9 +987,9 @@ def _verify_training_report(
         report, recipe, where="candidate training report"
     )
     required = {
-        "a1_contract_sha256": contract_sha256,
+        "a1_contract_sha256": None if is_central_final else contract_sha256,
         "a1_learner_training_recipe_sha256": recipe_sha,
-        "a1_bound_learner_training_recipe": recipe,
+        "a1_bound_learner_training_recipe": None if is_central_final else recipe,
         "arch": "entity_graph",
         "mask_hidden_info": True,
         "track": "2p_no_trade",
@@ -787,10 +1030,21 @@ def _verify_training_report(
             lineage_value = one_dose.lineage.validate_lineage_dose(lineage_value)
         except one_dose.lineage.LineageDoseError as error:
             raise PromotionError(f"candidate initialization lineage refused: {error}") from error
+        raw_transition_chain = lineage_value.get("initializer_transition_chain")
         architecture_upgrade_binding = lineage_value.get(
             "function_preserving_upgrade"
         )
-        if architecture_upgrade_binding is not None:
+        if raw_transition_chain is not None:
+            _verify_final_initializer_transition_chain(
+                report,
+                producer=producers[0],
+                lineage_dose=lineage_value,
+            )
+            if architecture_upgrade_binding is not None or curriculum_parent is not None:
+                raise PromotionError(
+                    "typed FINAL initializer chain cannot also claim legacy upgrade/curriculum"
+                )
+        elif architecture_upgrade_binding is not None:
             receipt_path = _canonical_existing_file(
                 Path(str(architecture_upgrade_binding["receipt"])),
                 where="function-preserving architecture upgrade receipt",
@@ -874,6 +1128,8 @@ def _verify_training_report(
                 or _sha256(parent_receipt) != curriculum_parent.get("receipt_sha256")
             ):
                 raise PromotionError("curriculum parent checkpoint/receipt bytes drifted")
+    elif report.get("a1_lineage_dose", {}).get("initializer_transition_chain") is not None:
+        raise PromotionError("exact-parent report cannot claim an initializer transition")
     steps = report.get("steps_completed")
     epochs = report.get("epochs")
     if isinstance(steps, bool) or not isinstance(steps, int) or steps <= 0:
@@ -889,6 +1145,400 @@ def _verify_training_report(
             "candidate training report max_steps differs from sealed recipe"
         )
     return report
+
+
+def _reconstruct_completed_central_final(
+    receipt: Mapping[str, Any],
+    *,
+    contract_lock: Path,
+    contract: Mapping[str, Any],
+) -> tuple[dict[str, Any], Path, str]:
+    """Rebuild the exact FINAL executor input from immutable authorities.
+
+    Central FINAL is not a larger legacy one-dose run.  Its initializer, sample
+    order, eight-rank topology, and command are all derived from a published
+    coordinator authority.  Reconstruct that derivation instead of trusting the
+    convenient copies embedded in the training receipt.
+    """
+
+    try:
+        from tools import a1_aux_pair_coordinator as coordinator
+    except ImportError as error:  # pragma: no cover - repository invariant.
+        raise PromotionError(f"cannot import FINAL coordinator: {error}") from error
+
+    central = receipt.get("central_learner_binding")
+    published = receipt.get("central_published_executor_authority")
+    input_binding = receipt.get("input_binding")
+    outputs = receipt.get("outputs")
+    if not all(
+        isinstance(value, Mapping)
+        for value in (central, published, input_binding, outputs)
+    ):
+        raise PromotionError("central FINAL receipt lacks typed authority/input/output")
+    assert isinstance(central, Mapping)
+    assert isinstance(published, Mapping)
+    assert isinstance(input_binding, Mapping)
+    assert isinstance(outputs, Mapping)
+    if (
+        central.get("stage") != "FINAL"
+        or central.get("diagnostic_only") is not False
+        or central.get("promotion_eligible") is not False
+        or central.get("eligible_for_full_gate") is not True
+        or central.get("full_gate_required") is not True
+    ):
+        raise PromotionError("central receipt is not an independent gate-eligible FINAL")
+    published_path_raw = published.get("path")
+    if not isinstance(published_path_raw, str):
+        raise PromotionError("central FINAL published authority has no path")
+    published_path = _canonical_existing_file(
+        Path(published_path_raw), where="central FINAL published executor authority"
+    )
+    try:
+        replayed_published = coordinator.verify_published_executor_authority(
+            published_path
+        )
+    except coordinator.CoordinatorError as error:
+        raise PromotionError(
+            f"central FINAL published authority replay refused: {error}"
+        ) from error
+    if replayed_published != published:
+        raise PromotionError("central FINAL published authority wrapper drifted")
+    authority = replayed_published.get("authority")
+    final = (
+        authority.get("final_replication_authority")
+        if isinstance(authority, Mapping)
+        else None
+    )
+    experiment_id = final.get("experiment_id") if isinstance(final, Mapping) else None
+    if (
+        not isinstance(authority, dict)
+        or authority.get("schema_version")
+        != coordinator.FINAL_EXECUTOR_AUTHORITY_SCHEMA
+        or not isinstance(final, Mapping)
+        or not isinstance(experiment_id, str)
+        or not experiment_id.startswith("sha256:")
+    ):
+        raise PromotionError("central published authority is not FINAL")
+    coordinator_root = published_path.parent.parent
+    expected_authority_path = (
+        coordinator_root
+        / experiment_id.removeprefix("sha256:")
+        / "93-final-executor-authority.json"
+    )
+    if published_path != expected_authority_path:
+        raise PromotionError("central FINAL authority is outside its coordinator tree")
+    try:
+        experiment = coordinator.load_experiment(coordinator_root, experiment_id)
+    except coordinator.CoordinatorError as error:
+        raise PromotionError(f"central FINAL experiment replay refused: {error}") from error
+
+    lock_path = _canonical_existing_file(
+        Path(str(receipt.get("lock", ""))), where="central FINAL reviewed lock"
+    )
+    if lock_path != contract_lock or receipt.get("lock_file_sha256") != _sha256(
+        contract_lock
+    ):
+        raise PromotionError("central FINAL receipt binds a different reviewed lock")
+    data_path = Path(str(receipt.get("corpus", "")))
+    data_kind = input_binding.get("data_kind")
+    if data_kind == "production_composite_v2":
+        build_ref = input_binding.get("composite_build_receipt")
+        build_path = build_ref.get("path") if isinstance(build_ref, Mapping) else None
+        if not isinstance(build_path, str):
+            raise PromotionError("central FINAL composite has no atomic build receipt")
+        validation_path = None
+        composite_build_receipt = Path(build_path)
+    else:
+        validation_raw = input_binding.get("validation_manifest")
+        if not isinstance(validation_raw, str):
+            raise PromotionError("central FINAL corpus has no validation manifest")
+        validation_path = Path(validation_raw)
+        composite_build_receipt = None
+    reviewed_lock_sha = central.get("reviewed_lock_file_sha256")
+    reviewed_code_sha = central.get("code_tree_sha256")
+    if not isinstance(reviewed_lock_sha, str) or not isinstance(
+        reviewed_code_sha, str
+    ):
+        raise PromotionError("central FINAL lacks reviewed lock/code identities")
+    try:
+        verified = one_dose.verify_training_inputs(
+            lock_path=lock_path,
+            data_path=data_path,
+            validation_path=validation_path,
+            composite_build_receipt=composite_build_receipt,
+            reviewed_lock_file_sha256=reviewed_lock_sha,
+        )
+        if verified.get("lock") != contract:
+            raise PromotionError("central FINAL reconstructed a different contract")
+        selected_aux = central.get("selected_aux_decision")
+        if selected_aux == "AUXT":
+            raw_upgrade = receipt.get("function_preserving_upgrade")
+            upgrade_receipt = (
+                raw_upgrade.get("receipt") if isinstance(raw_upgrade, Mapping) else None
+            )
+            upgrade_path = (
+                upgrade_receipt.get("path")
+                if isinstance(upgrade_receipt, Mapping)
+                else None
+            )
+            if not isinstance(upgrade_path, str):
+                raise PromotionError("central FINAL AUXT lacks pointer-upgrade receipt")
+            verified = one_dose.bind_function_preserving_upgrade(
+                verified,
+                Path(upgrade_path),
+                allow_public_award_transition_source=True,
+            )
+            if verified.get("function_preserving_upgrade") != raw_upgrade:
+                raise PromotionError("central FINAL pointer-upgrade evidence drifted")
+            report_path = Path(str(outputs.get("report", "")))
+            report = _load_json(report_path)
+            warmed_initializer = Path(str(report.get("init_checkpoint", "")))
+        elif selected_aux == "AUX0":
+            if receipt.get("function_preserving_upgrade") is not None:
+                raise PromotionError("central FINAL AUX0 may not carry pointer upgrade")
+            warmed_initializer = None
+        else:
+            raise PromotionError("central FINAL selected AUX decision is invalid")
+        verified = one_dose.bind_final_replication(
+            verified,
+            authority=authority,
+            published_executor_authority=dict(replayed_published),
+            experiment=experiment,
+            final_warmed_initializer=warmed_initializer,
+            reviewed_code_tree_sha256=reviewed_code_sha,
+        )
+        verified = one_dose.bind_training_topology(
+            verified, topology=one_dose.B200_8GPU_DDP_TOPOLOGY, gpu=0
+        )
+        canary = receipt.get("ddp_canary")
+        canary_path = canary.get("path") if isinstance(canary, Mapping) else None
+        started_ns = receipt.get("started_unix_ns")
+        if not isinstance(canary_path, str) or type(started_ns) is not int:
+            raise PromotionError("central FINAL lacks canary/start authority")
+        replayed_canary = one_dose._verify_ddp_canary_receipt(  # noqa: SLF001
+            Path(canary_path), reference_time_ns=started_ns
+        )
+        if replayed_canary != canary:
+            raise PromotionError("central FINAL DDP canary drifted")
+        verified = one_dose._bind_verified_ddp_canary(  # noqa: SLF001
+            verified, replayed_canary
+        )
+        verified = one_dose.bind_aux_subgoal_preclaim_contract(verified)
+    except PromotionError:
+        raise
+    except (one_dose.ExecutorError, OSError, KeyError, TypeError, ValueError) as error:
+        raise PromotionError(f"central FINAL canonical replay refused: {error}") from error
+
+    if (
+        verified.get("central_learner_binding") != central
+        or verified.get("central_published_executor_authority") != published
+        or verified.get("training_topology") != receipt.get("training_topology")
+        or verified.get("ddp_canary") != receipt.get("ddp_canary")
+        or verified.get("claim_identity_sha256")
+        != receipt.get("claim_identity_sha256")
+        or one_dose._input_binding(verified) != input_binding  # noqa: SLF001
+    ):
+        raise PromotionError("central FINAL derived authority/input binding drifted")
+    return verified, coordinator_root, experiment_id
+
+
+def _verify_central_final_training_receipt(
+    path: Path,
+    *,
+    value: dict[str, Any],
+    contract_lock: Path,
+    contract: dict[str, Any],
+    candidate_path: Path,
+    candidate_sha256: str,
+    training_report_path: Path,
+    training_report_sha256: str,
+    legacy_snapshot: _LegacyPromotionSnapshot | None,
+) -> dict[str, Any]:
+    """Authenticate an 8-rank central FINAL through its coordinator terminal."""
+
+    if legacy_snapshot is not None:
+        raise PromotionError("central FINAL cannot use historical receipt compatibility")
+    central_keys = {
+        "schema_version",
+        "status",
+        "contract_sha256",
+        "lock",
+        "lock_file_sha256",
+        "corpus",
+        "corpus_meta_file_sha256",
+        "payload_inventory_sha256",
+        "validation_manifest",
+        "validation_manifest_file_sha256",
+        "producer_checkpoint_sha256",
+        "learner_training_recipe_sha256",
+        "command",
+        "command_sha256",
+        "execution_binding",
+        "input_binding",
+        "world_size",
+        "gpu",
+        "gpus",
+        "gpu_name",
+        "gpu_names",
+        "training_topology",
+        "ddp_canary",
+        "production_sampling_receipt_sha256",
+        "validation_split_receipt_sha256",
+        "started_unix_ns",
+        "finished_unix_ns",
+        "returncode",
+        "outputs",
+        "lineage_dose",
+        "failure",
+        "claim_identity_sha256",
+        "central_learner_binding",
+        "central_published_executor_authority",
+        "central_execution_commitment",
+        "claim",
+        "claim_state_sha256",
+        "receipt_sha256",
+    }
+    central = value.get("central_learner_binding")
+    selected_aux = central.get("selected_aux_decision") if isinstance(central, Mapping) else None
+    if selected_aux == "AUXT":
+        central_keys.add("function_preserving_upgrade")
+    value = _require_exact_keys(value, central_keys, where="central FINAL receipt")
+    if (
+        value["schema_version"] != one_dose.CENTRAL_RECEIPT_SCHEMA
+        or value["status"] != "complete"
+        or value["returncode"] != 0
+        or value["failure"] is not None
+        or value["world_size"] != 8
+        or value["gpu"] != 0
+        or value["gpus"] != list(range(8))
+        or not isinstance(value["gpu_names"], list)
+        or len(value["gpu_names"]) != 8
+        or any(
+            not isinstance(name, str) or "B200" not in name.upper()
+            for name in value["gpu_names"]
+        )
+        or value["gpu_name"] != value["gpu_names"][0]
+    ):
+        raise PromotionError("central FINAL receipt is not a successful 8xB200 dose")
+    started = value["started_unix_ns"]
+    finished = value["finished_unix_ns"]
+    if (
+        type(started) is not int
+        or type(finished) is not int
+        or started <= 0
+        or finished < started
+    ):
+        raise PromotionError("central FINAL receipt timestamps are invalid")
+    if value["contract_sha256"] != contract.get("contract_sha256"):
+        raise PromotionError("central FINAL receipt binds a different contract")
+    producers = [
+        row
+        for row in contract.get("checkpoints", [])
+        if isinstance(row, Mapping) and row.get("role") == "producer"
+    ]
+    if (
+        len(producers) != 1
+        or value["producer_checkpoint_sha256"] != producers[0].get("sha256")
+    ):
+        raise PromotionError("central FINAL producer drifted")
+    verified, coordinator_root, experiment_id = _reconstruct_completed_central_final(
+        value, contract_lock=contract_lock, contract=contract
+    )
+    receipt_recipe = verified.get("bound_recipe")
+    if receipt_recipe is None:
+        receipt_recipe = verified.get("recipe")
+    if not isinstance(receipt_recipe, dict) or value[
+        "learner_training_recipe_sha256"
+    ] != one_dose._value_sha256(receipt_recipe):  # noqa: SLF001
+        raise PromotionError("central FINAL learner recipe drifted")
+    from tools import a1_aux_pair_coordinator as coordinator
+    from tools import a1_central_learner_completion as central_completion
+    try:
+        authenticated = central_completion.authenticate_completed_receipt(
+            path, verified=verified
+        )
+    except (central_completion.CompletionError, coordinator.CoordinatorError) as error:
+        raise PromotionError(f"central FINAL receipt replay refused: {error}") from error
+    if authenticated != value:
+        raise PromotionError("central FINAL authenticated receipt bytes drifted")
+    outputs = authenticated["outputs"]
+    if (
+        Path(str(outputs.get("checkpoint"))) != candidate_path
+        or outputs.get("checkpoint_sha256") != candidate_sha256
+        or _sha256(candidate_path) != candidate_sha256
+        or Path(str(outputs.get("report"))) != training_report_path
+        or outputs.get("report_sha256") != training_report_sha256
+        or _sha256(training_report_path) != training_report_sha256
+        or outputs.get("lineage_dose") != authenticated.get("lineage_dose")
+    ):
+        raise PromotionError("central FINAL output/report/lineage differs from adjudication")
+
+    terminal_path = (
+        coordinator_root
+        / experiment_id.removeprefix("sha256:")
+        / "95-final-terminal.json"
+    )
+    try:
+        terminal, terminal_file_sha, _identity = (
+            coordinator._stable_read_immutable_json(  # noqa: SLF001
+                terminal_path, where="central FINAL 95 terminal"
+            )
+        )
+        coordinator._verify_sealed(terminal, "central FINAL 95 terminal")  # noqa: SLF001
+        result = terminal.get("result")
+        execution_evidence = terminal.get("execution_evidence")
+        if not isinstance(result, Mapping) or not isinstance(
+            execution_evidence, Mapping
+        ):
+            raise PromotionError("central FINAL terminal lacks result/execution evidence")
+        coordinator._verify_central_terminal_execution_evidence(  # noqa: SLF001
+            coordinator_root,
+            experiment_id,
+            stage="FINAL",
+            evidence=execution_evidence,
+            result=result,
+        )
+    except PromotionError:
+        raise
+    except (coordinator.CoordinatorError, OSError, ValueError) as error:
+        raise PromotionError(f"central FINAL terminal replay refused: {error}") from error
+    if (
+        terminal.get("schema_version") != "a1-final-replication-terminal-v1"
+        or terminal.get("diagnostic_only") is not False
+        or terminal.get("promotion_eligible") is not False
+        or terminal.get("eligible_for_full_gate") is not True
+        or terminal.get("full_gate_required") is not True
+        or terminal.get("auto_promotion") is not False
+        or result.get("status") != "complete"
+        or result.get("checkpoint_sha256") != candidate_sha256
+        or result.get("full_gate_entry_eligible") is not True
+        or execution_evidence.get("receipt_path") != str(path)
+    ):
+        raise PromotionError("central FINAL 95 terminal is not gate-entry eligible")
+    execution_binding = authenticated["execution_binding"]
+    return {
+        "path": str(path),
+        "sha256": _sha256(path),
+        "receipt_sha256": authenticated["receipt_sha256"],
+        "claim": authenticated["claim"],
+        "claim_state_sha256": authenticated["claim_state_sha256"],
+        "execution_binding_sha256": outputs["execution_binding_sha256"],
+        "evaluation_parent_sha256": producers[0]["sha256"],
+        "central_final": {
+            "coordinator_root": str(coordinator_root),
+            "experiment_id": experiment_id,
+            "terminal": {
+                "path": str(terminal_path),
+                "sha256": terminal_file_sha,
+                "state_sha256": terminal["state_sha256"],
+            },
+            "published_executor_authority": authenticated[
+                "central_published_executor_authority"
+            ],
+        },
+        "world_size": 8,
+        "execution_binding": execution_binding,
+    }
 
 
 def _verify_one_dose_training_receipt(
@@ -1072,6 +1722,18 @@ def _verify_one_dose_training_receipt(
             raise PromotionError("legacy snapshot paths differ from dose verification")
         value = _verify_receipt_digest(
             dict(legacy_snapshot.training_receipt.value)
+        )
+    if value.get("schema_version") == one_dose.CENTRAL_RECEIPT_SCHEMA:
+        return _verify_central_final_training_receipt(
+            path,
+            value=value,
+            contract_lock=contract_lock,
+            contract=contract,
+            candidate_path=candidate_path,
+            candidate_sha256=candidate_sha256,
+            training_report_path=training_report_path,
+            training_report_sha256=training_report_sha256,
+            legacy_snapshot=legacy_snapshot,
         )
     expected_keys = {
         "schema_version",
@@ -5535,15 +6197,14 @@ def _verify_adjudication(
         if isinstance(lineage_value, dict)
         else None
     )
-    evaluation_parent_sha = training_receipt_ref.get("evaluation_parent_sha256")
-    if evaluation_parent_sha is None:
-        evaluation_parent_sha = (
-            curriculum_parent.get("generation_producer_sha256")
-            if isinstance(curriculum_parent, dict)
-            else function_upgrade.get("source_checkpoint_sha256")
-            if isinstance(function_upgrade, dict)
-            else training_report_payload.get("init_checkpoint_sha256")
-        )
+    initializer_transition_chain = (
+        lineage_value.get("initializer_transition_chain")
+        if isinstance(lineage_value, dict)
+        else None
+    )
+    evaluation_parent_sha = _training_evaluation_parent_sha256(
+        training_report_payload, training_receipt_ref
+    )
     if branch_challenge:
         report_initializer_sha = training_report_payload.get("init_checkpoint_sha256")
         if (
@@ -5570,6 +6231,7 @@ def _verify_adjudication(
         not branch_challenge
         and curriculum_parent is None
         and function_upgrade is None
+        and initializer_transition_chain is None
         and init_path is not None
     ):
         if _absolute(init_path, base=training_path.parent) != champion_path:

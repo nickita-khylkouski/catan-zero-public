@@ -98,6 +98,7 @@ def _worker(
             response_queue,
             action_size,
             trained_masked,
+            entity_feature_adapter,
             needs_targets,
             needs_relational_topology,
             event_token_limit,
@@ -108,6 +109,7 @@ def _worker(
             wid,
             action_size=action_size,
             trained_with_masked_hidden_info=trained_masked,
+            entity_feature_adapter=entity_feature_adapter,
             needs_action_targets=needs_targets,
             needs_relational_topology=bool(needs_relational_topology),
             event_token_limit=event_token_limit,
@@ -256,6 +258,7 @@ def _run_arm(mode: str, a: dict[str, Any]) -> dict[str, Any]:
                     server.response_queues[wid],
                     int(meta["action_size"]),
                     bool(meta["trained_with_masked_hidden_info"]),
+                    str(meta["entity_feature_adapter"]),
                     bool(meta.get("needs_action_targets", True)),
                     bool(meta.get("needs_relational_topology", False)),
                     meta.get("event_token_limit"),
@@ -455,6 +458,7 @@ def _parity(a: dict[str, Any]) -> dict[str, Any]:
             trained_with_masked_hidden_info=bool(
                 meta["trained_with_masked_hidden_info"]
             ),
+            entity_feature_adapter=str(meta["entity_feature_adapter"]),
             needs_action_targets=bool(meta.get("needs_action_targets", True)),
             needs_relational_topology=bool(
                 meta.get("needs_relational_topology", False)

@@ -50,6 +50,11 @@ from typing import Any
 
 import numpy as np
 
+from catan_zero.rl.entity_feature_adapter import (
+    CURRENT_RUST_ENTITY_ADAPTER_VERSION,
+    policy_entity_feature_adapter_version,
+    require_known_entity_feature_adapter,
+)
 from catan_zero.search.neural_rust_mcts import (
     EntityGraphRustEvaluator,
     EntityGraphRustEvaluatorConfig,
@@ -66,6 +71,18 @@ _NON_FORWARD_ENTITY_KEYS = frozenset(
 _LEGAL_PADDED_ENTITY_KEYS = frozenset(
     {"legal_action_tokens", "legal_action_target_ids", "legal_action_mask"}
 )
+
+
+def _require_implemented_entity_feature_adapter(
+    version: object, *, context: str
+) -> str:
+    resolved = require_known_entity_feature_adapter(version)
+    if resolved != CURRENT_RUST_ENTITY_ADAPTER_VERSION:
+        raise ValueError(
+            f"{context} does not implement entity feature adapter {resolved!r}; "
+            f"implemented={CURRENT_RUST_ENTITY_ADAPTER_VERSION!r}"
+        )
+    return resolved
 
 
 @dataclass(frozen=True, slots=True)
@@ -922,7 +939,12 @@ def _server_main(
         raise ValueError(f"invalid EvalServer matmul_precision={precision!r}")
     torch.set_float32_matmul_precision(precision)
     policy = EntityGraphPolicy.load(checkpoint, device=config.device)
+    adapter_contract = _require_implemented_entity_feature_adapter(
+        policy_entity_feature_adapter_version(policy),
+        context="EvalServer",
+    )
     handshake["action_size"] = int(policy.action_size)
+    handshake["entity_feature_adapter"] = adapter_contract
     handshake["trained_with_masked_hidden_info"] = bool(
         getattr(policy, "trained_with_masked_hidden_info", False)
     )
@@ -1398,6 +1420,9 @@ class EvalServer:
                 raise TimeoutError("eval server did not become ready")
         return {
             "action_size": int(self._handshake["action_size"]),
+            "entity_feature_adapter": str(
+                self._handshake["entity_feature_adapter"]
+            ),
             "trained_with_masked_hidden_info": bool(
                 self._handshake["trained_with_masked_hidden_info"]
             ),
@@ -1498,12 +1523,20 @@ class _RemoteForwardProxy:
         action_size: int,
         trained_masked: bool,
         *,
+        entity_feature_adapter: str,
         value_categorical_bins: int = 0,
         value_categorical_head_available: bool = False,
     ) -> None:
         self._client = client
         self.action_size = int(action_size)
         self.trained_with_masked_hidden_info = bool(trained_masked)
+        self.entity_feature_adapter_version = (
+            _require_implemented_entity_feature_adapter(
+                entity_feature_adapter,
+                context="RemoteEvalClient handshake",
+            )
+        )
+        self.entity_feature_adapter_binding_source = "eval_server_handshake"
         self.trained_value_readouts = (
             ("scalar", "categorical")
             if value_categorical_head_available
@@ -1549,6 +1582,7 @@ class RemoteEvalClient(EntityGraphRustEvaluator):
         *,
         action_size: int,
         trained_with_masked_hidden_info: bool,
+        entity_feature_adapter: str,
         needs_action_targets: bool = True,
         needs_relational_topology: bool = False,
         event_token_limit: int | None = None,
@@ -1563,6 +1597,7 @@ class RemoteEvalClient(EntityGraphRustEvaluator):
             self,
             action_size,
             trained_with_masked_hidden_info,
+            entity_feature_adapter=entity_feature_adapter,
             value_categorical_bins=value_categorical_bins,
             value_categorical_head_available=value_categorical_head_available,
         )
@@ -1597,6 +1632,10 @@ class RemoteEvalClient(EntityGraphRustEvaluator):
 
             self._local_policy = EntityGraphPolicy.load(
                 self._fallback_checkpoint, device=self._fallback_device
+            )
+            _require_implemented_entity_feature_adapter(
+                policy_entity_feature_adapter_version(self._local_policy),
+                context="RemoteEvalClient local fallback",
             )
         return self._local_policy
 

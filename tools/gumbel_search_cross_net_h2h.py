@@ -86,6 +86,7 @@ from tools.high_regret_suite_contract import (  # noqa: E402
 
 HIGH_REGRET_ENGINE_IDENTITY_SCHEMA = "a1-high-regret-engine-identity-v1"
 ARCHIVED_STATE_RECONSTRUCTION_SCHEMA = "a1-archived-state-reconstruction-v1"
+H2H_SEARCH_RNG_DERIVATION = "sha256(game_seed,seat_color)-u64-v1"
 
 
 def _held_out_engine_identity(args: Any) -> tuple[dict[str, str], dict[str, str]]:
@@ -1036,6 +1037,44 @@ def _create_search(
     return create_gumbel_search(config, evaluator, native_hot_loop=True)
 
 
+def _game_search_seed(*, game_seed: int, seat_color: str) -> int:
+    """Derive a stable MCTS stream from the paired game, not worker history.
+
+    The old evaluator seeded one search object per worker and then reused it
+    across both orientations and every later pair.  A game's search randomness
+    therefore depended on how many random draws all earlier games happened to
+    consume, making results sensitive to worker count, sharding, and failures.
+    Seat-keying preserves the paired color-swap contract: RED receives the same
+    search stream in both orientations, regardless of which checkpoint occupies
+    that seat.
+    """
+
+    color = str(seat_color).upper()
+    if color not in COLORS:
+        raise ValueError(f"unsupported H2H seat color: {seat_color!r}")
+    payload = f"gumbel-search-cross-net-h2h-v1:{int(game_seed)}:{color}".encode(
+        "ascii"
+    )
+    return int.from_bytes(hashlib.sha256(payload).digest()[:8], "big")
+
+
+def _reset_game_search_rngs(
+    mcts_by_role: dict[str, GumbelChanceMCTS],
+    *,
+    role_by_color: dict[str, str],
+    game_seed: int,
+) -> dict[str, int]:
+    """Reset both role searches to independent, schedule-invariant streams."""
+
+    seeds_by_role: dict[str, int] = {}
+    for color in COLORS:
+        role = str(role_by_color[color])
+        seed = _game_search_seed(game_seed=int(game_seed), seat_color=color)
+        mcts_by_role[role].rng.seed(seed)
+        seeds_by_role[role] = seed
+    return seeds_by_role
+
+
 def _write_worker_progress(
     progress_dir: str, worker_index: int, games_done: int, wins: int
 ) -> None:
@@ -1134,6 +1173,11 @@ def _run_worker(worker_args: dict[str, Any]) -> dict[str, Any]:
                     ("candidate_red", {"RED": "candidate", "BLUE": "baseline"}),
                     ("candidate_blue", {"RED": "baseline", "BLUE": "candidate"}),
                 ):
+                    search_seeds_by_role = _reset_game_search_rngs(
+                        mcts_by_role,
+                        role_by_color=role_by_color,
+                        game_seed=game_seed,
+                    )
                     archived = pair.get("archived_state")
                     initial: dict[str, Any] = {}
                     if archived is not None:
@@ -1195,6 +1239,7 @@ def _run_worker(worker_args: dict[str, Any]) -> dict[str, Any]:
                     )
                     record["orientation"] = orientation
                     record["pair_id"] = int(pair["pair_id"])
+                    record["search_seeds_by_role"] = search_seeds_by_role
                     pair_games.append(record)
             except Exception as error:  # noqa: BLE001 - keep the worker's other pairs.
                 pair_errors.append(
@@ -2133,6 +2178,12 @@ def _build_summary(
             )
             else "paired_same_seed_color_swap_shared_search_operator"
         ),
+        "search_rng_contract": {
+            "derivation": H2H_SEARCH_RNG_DERIVATION,
+            "reset_scope": "each_game_orientation",
+            "stream_key": ["game_seed", "seat_color"],
+            "worker_schedule_independent": True,
+        },
         "c_visit": float(args.c_visit),
         "rescale_noise_floor_c": float(getattr(args, "rescale_noise_floor_c", 0.0)),
         "sigma_eval": float(getattr(args, "sigma_eval", 0.79)),

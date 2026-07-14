@@ -7,6 +7,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from catan_zero.rl.entity_feature_adapter import CURRENT_RUST_ENTITY_ADAPTER_VERSION
+
 import pytest
 
 from catan_zero.search import eval_server
@@ -104,6 +106,7 @@ class _Server:
         return {
             "action_size": 332,
             "trained_with_masked_hidden_info": False,
+            "entity_feature_adapter": CURRENT_RUST_ENTITY_ADAPTER_VERSION,
             "needs_action_targets": False,
         }
 

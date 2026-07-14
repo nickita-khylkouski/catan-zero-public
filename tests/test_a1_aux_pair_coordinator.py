@@ -11,8 +11,46 @@ import pytest
 from tools import a1_aux_pair_coordinator as coordinator
 
 
+_REAL_VERIFY_PUBLIC_AWARD_TRANSITION_AUTHORITY = (
+    coordinator.verify_public_award_transition_authority
+)
+_REAL_VERIFY_PUBLIC_AWARD_TRANSITION_RECEIPT = (
+    coordinator.scientific_evidence.verify_public_award_transition_receipt
+)
+
+
 def _sha(character: str) -> str:
     return "sha256:" + character * 64
+
+
+def _geometry_rng_transaction(cuda_device: int = 0) -> dict:
+    state = {
+        "schema_version": "a1-aux-geometry-rng-state-v1",
+        "python_random_sha256": _sha("1"),
+        "numpy_generator_sha256": {"sampler": _sha("2")},
+        "torch_cpu_sha256": _sha("3"),
+        "cuda_device": cuda_device,
+        "torch_cuda_sha256": _sha("4"),
+    }
+    state["state_sha256"] = coordinator._digest(state)
+    after_probe = copy.deepcopy(state)
+    after_probe["torch_cuda_sha256"] = _sha("5")
+    after_probe["state_sha256"] = coordinator._digest(
+        {
+            key: value
+            for key, value in after_probe.items()
+            if key != "state_sha256"
+        }
+    )
+    return {
+        "schema_version": "a1-aux-geometry-rng-transaction-v1",
+        "scope": "one_complete_ordered_five_batch_probe",
+        "restore_frequency": "once_after_all_five_batches",
+        "before": copy.deepcopy(state),
+        "after_probe": after_probe,
+        "after_restore": copy.deepcopy(state),
+        "restored_exactly": True,
+    }
 
 
 _P1_PAYLOAD_SHA = _sha("0")
@@ -46,6 +84,293 @@ def _execution(character: str) -> dict:
         "environment_sha256": _sha(chr(ord(character) + 1)),
         "output_namespace_sha256": _sha(chr(ord(character) + 2)),
     }
+
+
+def _stage_execution_material(
+    root: Path, experiment_id: str, stage: str
+) -> tuple[dict, list[str], dict[str, str], dict[str, str], dict]:
+    directory = root.resolve() / experiment_id.removeprefix("sha256:")
+    authority_name = (
+        "15-warmup-executor-authority.json"
+        if stage == "WARMUP"
+        else "35-geometry-executor-authority.json"
+    )
+    authority_path = directory / authority_name
+    if authority_path.exists():
+        authority, authority_file_sha, _identity = (
+            coordinator._stable_read_immutable_json(  # noqa: SLF001
+                authority_path, where="test stage authority"
+            )
+        )
+        authority_state_sha = authority["state_sha256"]
+    else:
+        authority_file_sha = _sha("d")
+        authority_state_sha = _sha("e")
+    outputs = {
+        "checkpoint": f"/tmp/a1-{experiment_id[-8:]}-{stage.lower()}.pt",
+        "report": f"/tmp/a1-{experiment_id[-8:]}-{stage.lower()}.json",
+        "optimizer_sidecar": (
+            f"/tmp/a1-{experiment_id[-8:]}-{stage.lower()}.pt.optimizer.pt"
+        ),
+    }
+    binding = {
+        "schema_version": "a1-aux-stage-training-binding-v1",
+        "stage": stage,
+        "experiment_id": experiment_id,
+        "executor_authority_path": str(authority_path),
+        "executor_authority_file_sha256": authority_file_sha,
+        "executor_authority_state_sha256": authority_state_sha,
+        "output_checkpoint": outputs["checkpoint"],
+        "output_report": outputs["report"],
+    }
+    command = [
+        "python",
+        "train_bc.py",
+        "--a1-aux-stage-binding-json",
+        json.dumps(binding, sort_keys=True, separators=(",", ":")),
+        "--a1-aux-stage-executor-authority",
+        str(authority_path),
+        "--a1-aux-stage-executor-authority-sha256",
+        authority_file_sha,
+    ]
+    environment = {"TEST_A1_STAGE": stage}
+    execution = {
+        "schema_version": coordinator.EXECUTION_SCHEMA,
+        "command_sha256": coordinator._digest(
+            coordinator.canonical_stage_command_intent(command)
+        ),
+        "environment_sha256": coordinator._digest(environment),
+        "output_namespace_sha256": coordinator._digest(outputs),
+    }
+    return execution, command, environment, outputs, binding
+
+
+def _commit_test_stage(root: Path, experiment_id: str, stage: str) -> dict:
+    experiment = coordinator.load_experiment(root, experiment_id)
+    if stage == "WARMUP":
+        coordinator.load_warmup_executor_authority(
+            root,
+            experiment_id,
+            observed_allocation=experiment["allocations"]["WARMUP"],
+        )
+    else:
+        coordinator.load_geometry_executor_authority(
+            root,
+            experiment_id,
+            observed_allocation=experiment["allocations"]["GEOMETRY"],
+        )
+    _execution_value, command, environment, outputs, binding = (
+        _stage_execution_material(root, experiment_id, stage)
+    )
+    return coordinator.commit_stage_execution(
+        root,
+        experiment_id,
+        stage=stage,
+        command=command,
+        environment=environment,
+        output_namespace=outputs,
+        training_binding=binding,
+    )
+
+
+def _central_execution_material(
+    root: Path,
+    experiment_id: str,
+    stage: str,
+    *,
+    arm_id: str | None = None,
+    checkpoint_path: Path | None = None,
+) -> tuple[dict, dict]:
+    directory = root.resolve() / experiment_id.removeprefix("sha256:")
+    label = (arm_id or stage).lower()
+    if stage == "P1":
+        if arm_id not in coordinator.P1_ARMS:
+            raise AssertionError("P1 test material requires an arm")
+        authority_name = f"p1-15-{arm_id.lower()}-executor-authority.json"
+    elif stage in coordinator.ARMS:
+        authority_name = f"65-{label}-executor-authority.json"
+    else:
+        authority_name = "93-final-executor-authority.json"
+    authority_path = directory / authority_name
+    stem = f"central-{experiment_id[-8:]}-{label}"
+    checkpoint = checkpoint_path or (root.resolve() / f"{stem}.pt")
+    outputs = {
+        "checkpoint": str(checkpoint.resolve(strict=False)),
+        "optimizer_sidecar": str(Path(str(checkpoint.resolve(strict=False)) + ".optimizer.pt")),
+        "training_progress": str(Path(str(checkpoint.resolve(strict=False)) + ".training-progress.json")),
+        "report": str(root.resolve() / f"{stem}-report.json"),
+        "receipt": str(root.resolve() / f"{stem}-receipt.json"),
+        "one_dose_claim": str(root.resolve() / f"{stem}-claim.json"),
+    }
+    central_binding = {
+        "stage": stage,
+        "central_authority_sha256": _sha("1"),
+        "executor_authority_path": str(authority_path),
+        "executor_authority_file_sha256": _sha("2"),
+        "executor_authority_state_sha256": _sha("3"),
+    }
+    command = [
+        "python",
+        "train_bc.py",
+        "--a1-central-learner-binding-json",
+        json.dumps(central_binding, sort_keys=True, separators=(",", ":")),
+        "--a1-central-executor-authority",
+        str(authority_path),
+        "--a1-central-executor-authority-sha256",
+        _sha("2"),
+    ]
+    if stage in coordinator.ARMS:
+        command.extend(
+            [
+                "--a1-aux-regularization-binding-json",
+                json.dumps(
+                    {"aux_pair_authority_sha256": _sha("4")},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            ]
+        )
+    environment = {"CUDA_VISIBLE_DEVICES": "0,1,2,3,4,5,6,7"}
+    execution = {
+        "schema_version": coordinator.EXECUTION_SCHEMA,
+        "command_sha256": coordinator._digest(
+            coordinator.canonical_central_command_intent(command)
+        ),
+        "environment_sha256": coordinator._digest(environment),
+        "output_namespace_sha256": coordinator._digest(
+            coordinator.canonical_central_output_namespace_intent(outputs)
+        ),
+    }
+    return execution, {
+        "authority_path": authority_path,
+        "central_binding": central_binding,
+        "command": command,
+        "environment": environment,
+        "outputs": outputs,
+        "claim_identity_sha256": _sha("9"),
+    }
+
+
+def _publish_central_execution_evidence(
+    root: Path,
+    *,
+    stage: str,
+    material: dict,
+    result: dict,
+) -> dict:
+    published = coordinator.verify_published_executor_authority(
+        material["authority_path"]
+    )
+    binding = dict(material["central_binding"])
+    binding.update(
+        {
+            "central_authority_sha256": published["authority"]["authority_sha256"],
+            "executor_authority_path": published["path"],
+            "executor_authority_file_sha256": published["file_sha256"],
+            "executor_authority_state_sha256": published["authority"]["state_sha256"],
+        }
+    )
+    command = list(material["command"])
+    binding_index = command.index("--a1-central-learner-binding-json") + 1
+    command[binding_index] = json.dumps(
+        binding, sort_keys=True, separators=(",", ":")
+    )
+    authority_index = command.index("--a1-central-executor-authority") + 1
+    command[authority_index] = published["path"]
+    authority_sha_index = (
+        command.index("--a1-central-executor-authority-sha256") + 1
+    )
+    command[authority_sha_index] = published["file_sha256"]
+    if stage in coordinator.ARMS:
+        aux_index = command.index("--a1-aux-regularization-binding-json") + 1
+        command[aux_index] = json.dumps(
+            {
+                "aux_pair_authority_sha256": published["authority"][
+                    "authority_sha256"
+                ]
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        aux_binding = json.loads(command[aux_index])
+    else:
+        aux_binding = None
+    reference = coordinator.commit_central_learner_execution(
+        published_executor_authority=published,
+        command=command,
+        environment=material["environment"],
+        output_namespace=material["outputs"],
+        central_binding=binding,
+        input_binding={},
+        one_dose_claim_identity_sha256=material["claim_identity_sha256"],
+        aux_regularization_binding=aux_binding,
+    )
+    realized = {
+        "checkpoint_sha256": material["outputs"]["checkpoint"],
+        "optimizer_sidecar_sha256": material["outputs"]["optimizer_sidecar"],
+        "training_progress_sha256": material["outputs"]["training_progress"],
+        "report_sha256": material["outputs"]["report"],
+    }
+    for field, path_value in realized.items():
+        path = Path(path_value)
+        if path.exists():
+            raw = path.read_bytes()
+        else:
+            raw = f"{stage}:{field}:{path.name}\n".encode("utf-8")
+            path.write_bytes(raw)
+        path.chmod(0o444)
+        digest = "sha256:" + hashlib.sha256(raw).hexdigest()
+        if field in result:
+            result[field] = digest
+    outputs = {
+        "checkpoint": material["outputs"]["checkpoint"],
+        "optimizer_sidecar": material["outputs"]["optimizer_sidecar"],
+        "training_progress": material["outputs"]["training_progress"],
+        "report": material["outputs"]["report"],
+        "checkpoint_sha256": result["checkpoint_sha256"],
+        "optimizer_sidecar_sha256": result["optimizer_sidecar_sha256"],
+        "report_sha256": result["report_sha256"],
+        "training_progress_sha256": "sha256:"
+        + hashlib.sha256(
+            Path(material["outputs"]["training_progress"]).read_bytes()
+        ).hexdigest(),
+    }
+    common = {
+        "status": "complete",
+        "claim_identity_sha256": material["claim_identity_sha256"],
+        "command": command,
+        "command_sha256": coordinator._digest(command),
+        "execution_binding": {
+            "environment_sha256": coordinator._digest(material["environment"])
+        },
+        "input_binding": {},
+        "central_execution_commitment": reference,
+        "returncode": 0,
+        "failure": None,
+        "outputs": outputs,
+    }
+    claim_payload = {
+        "schema_version": "a1-central-learner-training-claim-v1",
+        **common,
+        "receipt_target": material["outputs"]["receipt"],
+    }
+    claim = coordinator._write_once(
+        Path(material["outputs"]["one_dose_claim"]), claim_payload
+    )
+    receipt_payload = {
+        "schema_version": "a1-central-learner-training-receipt-v1",
+        **common,
+        "claim": material["outputs"]["one_dose_claim"],
+        "claim_state_sha256": claim["state_sha256"],
+    }
+    receipt_payload["receipt_sha256"] = coordinator._digest(receipt_payload)
+    receipt_path = Path(material["outputs"]["receipt"])
+    receipt_path.write_text(
+        json.dumps(receipt_payload, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    receipt_path.chmod(0o444)
+    return coordinator.central_terminal_execution_evidence(reference, receipt_path)
 
 
 def _allocation(host: str, offset: int) -> dict:
@@ -142,6 +467,10 @@ def _composite(
             "file_sha256": _sha("4"),
             "authority_sha256": _sha("5"),
         },
+        "learner_recipe_overrides_sha256": _sha("6"),
+        "aux_subgoal_target_contract_sha256": _sha("7"),
+        "public_award_feature_transition_contract_sha256": _sha("8"),
+        "source_authority_semantic_sha256": _sha("9"),
     }
 
 
@@ -180,7 +509,17 @@ def _recovery() -> dict:
             "relation": "unproven_predecessor_safety_reference",
             "causal_parent_proven": False,
         },
-        "producer_identity": {"tool_sha256": _sha("b")},
+        "producer_identity": {
+            "schema_version": "a1-surviving-producer-identity-v1",
+            "checkpoint": {
+                "path": "/sealed/checkpoint-6817.pt",
+                "sha256": (
+                    "sha256:6817ab054506f962a758ebf48addce5cc7eb801bf451cf2d02b62fb91f5da39c"
+                ),
+            },
+            "search_config": {"n_full": 128, "c_scale": 0.1},
+            "agent_identity_sha256": _sha("b"),
+        },
         "promotion_proof_recreated": False,
         "dual_baseline_fresh_gate_required": True,
         "promotion_eligible": False,
@@ -343,10 +682,32 @@ def _isolate_external_evidence_verifiers(monkeypatch) -> None:
         "verify_trained_slot12_delta_receipt",
         lambda path, **_kwargs: coordinator._load_json(path, where="test delta"),
     )
+    def _verify_test_transition(value, *, expected_parent):
+        if value["source_checkpoint"] != {
+            "path": expected_parent["checkpoint_path"],
+            "sha256": expected_parent["checkpoint_sha256"],
+        }:
+            raise coordinator.CoordinatorError(
+                "test transition lost its causal parent"
+            )
+        return copy.deepcopy(value)
+
+    monkeypatch.setattr(
+        coordinator,
+        "verify_public_award_transition_authority",
+        _verify_test_transition,
+    )
     monkeypatch.setattr(
         coordinator.v5_recovery_gate,
         "verify_recovery_gate_authority",
         lambda path: json.loads(path.read_text(encoding="utf-8")),
+    )
+    monkeypatch.setattr(
+        coordinator.h100_eval_fleet,
+        "verify_fixed_panel_receipt",
+        lambda path, **_kwargs: coordinator._load_json(
+            path, where="test fixed panel"
+        ),
     )
 
 
@@ -482,6 +843,7 @@ def _write_panel_receipt(
     authority_id: str,
     arms: tuple[str, ...],
     checkpoints: dict,
+    baseline_checkpoint_sha256: str,
     cohort_sha256: str,
     search_operator_sha256: str,
     origin_tool_sha256: str,
@@ -491,12 +853,13 @@ def _write_panel_receipt(
     coordinator._write_once(
         path,
         {
-            "schema_version": "a1-fixed-panel-receipt-v1",
+            "schema_version": "a1-fixed-panel-receipt-v2",
             "family": family,
             "panel_kind": panel_kind,
             "authority_id": authority_id,
             "arms": list(arms),
             "arm_checkpoint_sha256": checkpoints,
+            "baseline_checkpoint_sha256": baseline_checkpoint_sha256,
             "cohort_sha256": cohort_sha256,
             "search_operator_sha256": search_operator_sha256,
             "common_random_numbers": True,
@@ -518,14 +881,19 @@ def _p1_panel_receipts(root: Path, sweep: dict, selected_arm: str) -> tuple[Path
         arm: [500] * plan["external_games_per_arm"] for arm in coordinator.P1_ARMS
     }
     checkpoints = {
-        arm: _p1_result(sweep, arm, chr(ord("d") + index * 4))["checkpoint_sha256"]
-        for index, arm in enumerate(coordinator.P1_ARMS)
+        arm: coordinator._artifact(  # noqa: SLF001
+            root,
+            sweep["sweep_id"],
+            f"p1-20-{arm.lower()}-terminal.json",
+        )["result"]["checkpoint_sha256"]
+        for arm in coordinator.P1_ARMS
     }
     shared = {
         "family": "P1",
         "authority_id": sweep["sweep_id"],
         "arms": coordinator.P1_ARMS,
         "checkpoints": checkpoints,
+        "baseline_checkpoint_sha256": plan["baseline_checkpoint_sha256"],
         "search_operator_sha256": plan["search_operator_sha256"],
         "origin_tool_sha256": plan["panel_origin_tool_sha256"],
     }
@@ -550,18 +918,32 @@ def _p1_panel_receipts(root: Path, sweep: dict, selected_arm: str) -> tuple[Path
 def _complete_p1(root: Path, *, selected_arm: str = "K3") -> tuple[dict, dict]:
     sweep = _issue_p1_sweep(root)
     for index, arm_id in enumerate(coordinator.P1_ARMS):
+        result = _p1_result(sweep, arm_id, chr(ord("d") + index * 4))
+        execution, material = _central_execution_material(
+            root, sweep["sweep_id"], "P1", arm_id=arm_id
+        )
         coordinator.claim_p1_arm(
             root,
             sweep["sweep_id"],
             arm_id=arm_id,
             observed_allocation=sweep["allocations"][arm_id],
-            execution=_execution(str(index + 1)),
+            execution=execution,
+        )
+        coordinator.load_p1_arm_executor_authority(
+            root,
+            sweep["sweep_id"],
+            arm_id=arm_id,
+            observed_allocation=sweep["allocations"][arm_id],
+        )
+        evidence = _publish_central_execution_evidence(
+            root, stage="P1", material=material, result=result
         )
         coordinator.complete_p1_arm(
             root,
             sweep["sweep_id"],
             arm_id=arm_id,
-            result=_p1_result(sweep, arm_id, chr(ord("d") + index * 4)),
+            result=result,
+            execution_evidence=evidence,
         )
     coordinator.claim_p1_evaluation(root, sweep["sweep_id"], execution=_execution("7"))
     internal_panel, external_panel = _p1_panel_receipts(root, sweep, selected_arm)
@@ -586,7 +968,7 @@ def _pointer_upgrade() -> dict:
     return {
         "schema_version": coordinator.POINTER_UPGRADE_AUTHORITY_SCHEMA,
         "module": coordinator.POINTER_MODULE,
-        "source_checkpoint_sha256": _parent()["checkpoint_sha256"],
+        "source_checkpoint_sha256": _sha("9"),
         "upgraded_initializer_sha256": _sha("a"),
         "receipt_sha256": _sha("b"),
         "receipt_replay_sha256": _sha("c"),
@@ -594,6 +976,49 @@ def _pointer_upgrade() -> dict:
         "new_parameter_set_sha256": _sha("d"),
         "main_output_max_diff": 0.0,
         "shared_parameters_bit_identical": True,
+    }
+
+
+def _public_award_transition() -> dict:
+    evidence = coordinator._sealed(
+        {
+            "schema_version": "a1-public-award-initializer-transition-evidence-v1",
+            "status": "complete",
+            "source_checkpoint_sha256": _parent()["checkpoint_sha256"],
+            "transitioned_checkpoint_sha256": _sha("9"),
+            "source_public_award_feature_contract": "legacy_zero_v0",
+            "transitioned_public_award_feature_contract": "authoritative_v1",
+            "changed_parameter_name": "player_encoder.0.weight",
+            "changed_input_column_index": 12,
+            "source_slot12_column_sha256": _sha("1"),
+            "transitioned_slot12_column_sha256": _sha("2"),
+            "transitioned_slot12_max_abs_decimal": "0",
+            "unchanged_parameter_count": 127,
+            "unchanged_parameter_identity_sha256": _sha("3"),
+            "unchanged_parameters_bit_identical": True,
+            "unrelated_metadata_bit_identical": True,
+            "legacy_zero_input_function_preserving": True,
+            "optimizer_steps": 0,
+            "origin_tool_sha256": coordinator._repo_tool_sha256(
+                "tools/a1_scientific_evidence.py"
+            ),
+        }
+    )
+    return {
+        "schema_version": coordinator.PUBLIC_AWARD_TRANSITION_AUTHORITY_SCHEMA,
+        "source_checkpoint": {
+            "path": _parent()["checkpoint_path"],
+            "sha256": _parent()["checkpoint_sha256"],
+        },
+        "transitioned_checkpoint": {
+            "path": "/sealed/checkpoint-6817-authoritative-v1.pt",
+            "sha256": _sha("9"),
+        },
+        "receipt": {
+            "path": "/sealed/public-award-transition.json",
+            "file_sha256": _sha("8"),
+            "evidence": evidence,
+        },
     }
 
 
@@ -705,6 +1130,7 @@ def _prepare_aux(root: Path) -> tuple[dict, dict]:
     experiment = coordinator.prepare_experiment(
         root,
         p1_recipe_data_authority=p1,
+        public_award_transition_authority=_public_award_transition(),
         pointer_upgrade_authority=_pointer_upgrade(),
         warmup_recipe=_warmup_recipe(p1["composite"]),
         selector_rule=_selector_rule(),
@@ -766,6 +1192,9 @@ def _geometry_evidence(experiment: dict) -> dict:
         "global_ddp_aggregation": True,
         "optimizer_steps": 0,
         "persistent_state_mutated": False,
+        "rng_transactions_by_rank": [
+            _geometry_rng_transaction(rank) for rank in range(8)
+        ],
         "report_sha256": _sha("b"),
         "origin_tool_sha256": _sha("c"),
     }
@@ -778,19 +1207,42 @@ def _issue_aux_pair(root: Path) -> tuple[dict, dict]:
         root,
         experiment_id,
         observed_allocation=experiment["allocations"]["WARMUP"],
-        execution=_execution("3"),
+        execution=_stage_execution_material(root, experiment_id, "WARMUP")[0],
     )
+    _commit_test_stage(root, experiment_id, "WARMUP")
     coordinator.complete_warmup(root, experiment_id, result=_warmup_result(experiment))
     coordinator.claim_geometry(
         root,
         experiment_id,
         observed_allocation=experiment["allocations"]["GEOMETRY"],
-        execution=_execution("4"),
+        execution=_stage_execution_material(root, experiment_id, "GEOMETRY")[0],
     )
+    _commit_test_stage(root, experiment_id, "GEOMETRY")
     coordinator.complete_geometry(
         root, experiment_id, evidence=_geometry_evidence(experiment)
     )
     return experiment, coordinator.issue_pair(root, experiment_id)
+
+
+def _claim_geometry_for_test(root: Path, experiment: dict) -> None:
+    experiment_id = experiment["experiment_id"]
+    coordinator.claim_warmup(
+        root,
+        experiment_id,
+        observed_allocation=experiment["allocations"]["WARMUP"],
+        execution=_stage_execution_material(root, experiment_id, "WARMUP")[0],
+    )
+    _commit_test_stage(root, experiment_id, "WARMUP")
+    coordinator.complete_warmup(
+        root, experiment_id, result=_warmup_result(experiment)
+    )
+    coordinator.claim_geometry(
+        root,
+        experiment_id,
+        observed_allocation=experiment["allocations"]["GEOMETRY"],
+        execution=_stage_execution_material(root, experiment_id, "GEOMETRY")[0],
+    )
+    _commit_test_stage(root, experiment_id, "GEOMETRY")
 
 
 def _arm_result(pair: dict, arm_id: str, character: str) -> dict:
@@ -838,9 +1290,14 @@ def _aux_panel_receipts(
         "authority_id": pair["pair_id"],
         "arms": coordinator.ARMS,
         "checkpoints": {
-            "AUX0": _arm_result(pair, "AUX0", "d")["checkpoint_sha256"],
-            "AUXT": _arm_result(pair, "AUXT", "h")["checkpoint_sha256"],
+            arm: coordinator._artifact(  # noqa: SLF001
+                root,
+                pair["experiment_id"],
+                f"70-{arm.lower()}-terminal.json",
+            )["result"]["checkpoint_sha256"]
+            for arm in coordinator.ARMS
         },
+        "baseline_checkpoint_sha256": plan["baseline_checkpoint_sha256"],
         "search_operator_sha256": plan["search_operator_sha256"],
         "origin_tool_sha256": plan["panel_origin_tool_sha256"],
     }
@@ -866,18 +1323,32 @@ def _complete_aux_pair(root: Path, *, passed: bool = True) -> tuple[dict, dict, 
     experiment, pair = _issue_aux_pair(root)
     experiment_id = experiment["experiment_id"]
     for index, arm_id in enumerate(coordinator.ARMS):
+        result = _arm_result(pair, arm_id, "d" if arm_id == "AUX0" else "h")
+        execution, material = _central_execution_material(
+            root, experiment_id, arm_id
+        )
         coordinator.claim_arm(
             root,
             experiment_id,
             arm_id=arm_id,
             observed_allocation=pair["allocations"][arm_id],
-            execution=_execution(str(index + 5)),
+            execution=execution,
+        )
+        coordinator.load_aux_pair_executor_authority(
+            root,
+            experiment_id,
+            arm_id=arm_id,
+            observed_allocation=pair["allocations"][arm_id],
+        )
+        evidence = _publish_central_execution_evidence(
+            root, stage=arm_id, material=material, result=result
         )
         coordinator.complete_arm(
             root,
             experiment_id,
             arm_id=arm_id,
-            result=_arm_result(pair, arm_id, "d" if arm_id == "AUX0" else "h"),
+            result=result,
+            execution_evidence=evidence,
         )
     coordinator.claim_pair_evaluation(root, experiment_id, execution=_execution("7"))
     internal, external = _aux_panel_receipts(root, pair, passed=passed)
@@ -959,12 +1430,17 @@ def _slot12_evidence(
             "warmed_checkpoint_sha256"
         ]
         if treatment
-        else _parent()["checkpoint_sha256"]
+        else final["initializer_authority"]["public_award_transition_authority"][
+            "transitioned_checkpoint"
+        ]["sha256"]
     )
     initializer_path = root / f"initializer-{candidate_sha256[-8:]}.pt"
     candidate_path = root / f"candidate-{candidate_sha256[-8:]}.pt"
     initializer_path.write_bytes(b"initializer")
     candidate_path.write_bytes(b"candidate")
+    candidate_sha256 = "sha256:" + hashlib.sha256(b"candidate").hexdigest()
+    initializer_path.chmod(0o444)
+    candidate_path.chmod(0o444)
     zero_path = root / f"slot12-zero-{candidate_sha256[-8:]}.json"
     zero = {
         "schema_version": "a1-initializer-slot12-zero-evidence-v1",
@@ -1021,7 +1497,13 @@ def _recovery_gate_path(
         "inputs": {},
         "recovery_authority": recovery,
         "contract": {},
-        "candidate": {"sha256": _sha("f")},
+        "candidate": {
+            "sha256": coordinator._artifact(  # noqa: SLF001
+                root,
+                final["experiment_id"],
+                "95-final-terminal.json",
+            )["result"]["checkpoint_sha256"]
+        },
         "strict_h1_parent_gate": {
             "passed": True,
             "baseline": recovery["recovered_generator"],
@@ -1148,14 +1630,89 @@ def test_current_promoted_parent_is_required_and_candidate_chaining_refused() ->
                 drift, recovery_authority=_recovery()
             )
     coordinator.verify_pointer_upgrade_authority(
-        _pointer_upgrade(), expected_parent_sha256=parent["checkpoint_sha256"]
+        _pointer_upgrade(),
+        expected_parent_sha256=_public_award_transition()[
+            "transitioned_checkpoint"
+        ]["sha256"],
     )
     wrong_upgrade = _pointer_upgrade()
     wrong_upgrade["source_checkpoint_sha256"] = _sha("d")
     with pytest.raises(coordinator.CoordinatorError, match="legacy/aliased"):
         coordinator.verify_pointer_upgrade_authority(
-            wrong_upgrade, expected_parent_sha256=parent["checkpoint_sha256"]
+            wrong_upgrade,
+            expected_parent_sha256=_public_award_transition()[
+                "transitioned_checkpoint"
+            ]["sha256"],
         )
+
+
+def test_public_award_transition_authority_replays_exact_checkpoint_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import torch
+
+    source = (tmp_path / "legacy.pt").resolve()
+    transitioned = (tmp_path / "authoritative.pt").resolve()
+    receipt_path = (tmp_path / "transition.json").resolve()
+    torch.save(
+        {
+            "model": {
+                "entity_graph.player_encoder.0.weight": torch.arange(
+                    64, dtype=torch.float32
+                ).reshape(4, 16),
+                "entity_graph.trunk.weight": torch.eye(4),
+            },
+            "public_award_feature_contract": "legacy_zero_v0",
+            "optimizer_steps": 17,
+        },
+        source,
+    )
+    source.chmod(0o444)
+    transition_evidence = (
+        coordinator.scientific_evidence.build_public_award_transition_initializer(
+            source, transitioned
+        )
+    )
+    coordinator.scientific_evidence._atomic_write(  # noqa: SLF001
+        receipt_path, transition_evidence
+    )
+    source_sha = coordinator.scientific_evidence._file_sha256(source)  # noqa: SLF001
+    transitioned_sha = coordinator.scientific_evidence._file_sha256(  # noqa: SLF001
+        transitioned
+    )
+    authority = {
+        "schema_version": coordinator.PUBLIC_AWARD_TRANSITION_AUTHORITY_SCHEMA,
+        "source_checkpoint": {"path": str(source), "sha256": source_sha},
+        "transitioned_checkpoint": {
+            "path": str(transitioned),
+            "sha256": transitioned_sha,
+        },
+        "receipt": {
+            "path": str(receipt_path),
+            "file_sha256": coordinator.scientific_evidence._file_sha256(  # noqa: SLF001
+                receipt_path
+            ),
+            "evidence": transition_evidence,
+        },
+    }
+    monkeypatch.setattr(
+        coordinator.scientific_evidence,
+        "verify_public_award_transition_receipt",
+        _REAL_VERIFY_PUBLIC_AWARD_TRANSITION_RECEIPT,
+    )
+    verified = _REAL_VERIFY_PUBLIC_AWARD_TRANSITION_AUTHORITY(
+        authority,
+        expected_parent={
+            "checkpoint_path": str(source),
+            "checkpoint_sha256": source_sha,
+        },
+    )
+    assert verified == authority
+    assert (
+        verified["receipt"]["evidence"]["legacy_zero_input_function_preserving"]
+        is True
+    )
+    assert verified["receipt"]["evidence"]["optimizer_steps"] == 0
 
 
 def test_evaluation_design_is_canonical_and_has_no_operator_knobs() -> None:
@@ -1517,6 +2074,7 @@ def test_aux_refuses_fabricated_noncentral_p1_authority(tmp_path: Path) -> None:
         coordinator.prepare_experiment(
             tmp_path,
             p1_recipe_data_authority=fake,
+            public_award_transition_authority=_public_award_transition(),
             pointer_upgrade_authority=_pointer_upgrade(),
             warmup_recipe=_warmup_recipe(),
             selector_rule=_selector_rule(),
@@ -1530,7 +2088,10 @@ def test_legacy_cls_upgrade_and_adaptive_warmup_are_refused(tmp_path: Path) -> N
     pointer["module"] = "entity_graph.aux_subgoal_heads.v1"
     with pytest.raises(coordinator.CoordinatorError, match="legacy/aliased"):
         coordinator.verify_pointer_upgrade_authority(
-            pointer, expected_parent_sha256=_parent()["checkpoint_sha256"]
+            pointer,
+            expected_parent_sha256=_public_award_transition()[
+                "transitioned_checkpoint"
+            ]["sha256"],
         )
     warmup = _warmup_recipe()
     warmup["checkpoint_selection"]["adaptive_best_checkpoint"] = True
@@ -1545,7 +2106,9 @@ def test_aux_warmup_crash_resume_is_exact_and_mutation_refused(tmp_path: Path) -
         tmp_path,
         experiment_id,
         observed_allocation=experiment["allocations"]["WARMUP"],
-        execution=_execution("3"),
+        execution=_stage_execution_material(
+            tmp_path, experiment_id, "WARMUP"
+        )[0],
     )
     state = coordinator.inspect_state(tmp_path, experiment_id)
     assert state["warmup_claimed"] is True
@@ -1555,7 +2118,9 @@ def test_aux_warmup_crash_resume_is_exact_and_mutation_refused(tmp_path: Path) -
             tmp_path,
             experiment_id,
             observed_allocation=experiment["allocations"]["WARMUP"],
-            execution=_execution("3"),
+            execution=_stage_execution_material(
+                tmp_path, experiment_id, "WARMUP"
+            )[0],
         )
         == claim
     )
@@ -1575,8 +2140,11 @@ def test_warmup_terminal_proves_only_pointer_heads_changed(tmp_path: Path) -> No
         tmp_path,
         experiment_id,
         observed_allocation=experiment["allocations"]["WARMUP"],
-        execution=_execution("3"),
+        execution=_stage_execution_material(
+            tmp_path, experiment_id, "WARMUP"
+        )[0],
     )
+    _commit_test_stage(tmp_path, experiment_id, "WARMUP")
     bad = _warmup_result(experiment)
     bad["inherited_parameters_bit_identical"] = False
     with pytest.raises(coordinator.CoordinatorError, match="head-only"):
@@ -1620,21 +2188,7 @@ def test_gradient_geometry_mutations_refuse_before_pair(
 ) -> None:
     experiment, _p1 = _prepare_aux(tmp_path)
     experiment_id = experiment["experiment_id"]
-    coordinator.claim_warmup(
-        tmp_path,
-        experiment_id,
-        observed_allocation=experiment["allocations"]["WARMUP"],
-        execution=_execution("3"),
-    )
-    coordinator.complete_warmup(
-        tmp_path, experiment_id, result=_warmup_result(experiment)
-    )
-    coordinator.claim_geometry(
-        tmp_path,
-        experiment_id,
-        observed_allocation=experiment["allocations"]["GEOMETRY"],
-        execution=_execution("4"),
-    )
+    _claim_geometry_for_test(tmp_path, experiment)
     evidence = _geometry_evidence(experiment)
     evidence[field] = value
     with pytest.raises(coordinator.CoordinatorError, match="preregistered probe"):
@@ -1644,21 +2198,7 @@ def test_gradient_geometry_mutations_refuse_before_pair(
 def test_gradient_selector_refuses_below_minimum(tmp_path: Path) -> None:
     experiment, _p1 = _prepare_aux(tmp_path)
     experiment_id = experiment["experiment_id"]
-    coordinator.claim_warmup(
-        tmp_path,
-        experiment_id,
-        observed_allocation=experiment["allocations"]["WARMUP"],
-        execution=_execution("3"),
-    )
-    coordinator.complete_warmup(
-        tmp_path, experiment_id, result=_warmup_result(experiment)
-    )
-    coordinator.claim_geometry(
-        tmp_path,
-        experiment_id,
-        observed_allocation=experiment["allocations"]["GEOMETRY"],
-        execution=_execution("4"),
-    )
+    _claim_geometry_for_test(tmp_path, experiment)
     evidence = _geometry_evidence(experiment)
     for batch in evidence["per_batch_geometry"]:
         batch["unit_aux_squared_norm_decimal"] = "200000000000"
@@ -1671,25 +2211,64 @@ def test_gradient_geometry_derives_cosine_and_refuses_impossible_dot(
 ) -> None:
     experiment, _p1 = _prepare_aux(tmp_path)
     experiment_id = experiment["experiment_id"]
-    coordinator.claim_warmup(
-        tmp_path,
-        experiment_id,
-        observed_allocation=experiment["allocations"]["WARMUP"],
-        execution=_execution("3"),
-    )
-    coordinator.complete_warmup(
-        tmp_path, experiment_id, result=_warmup_result(experiment)
-    )
-    coordinator.claim_geometry(
-        tmp_path,
-        experiment_id,
-        observed_allocation=experiment["allocations"]["GEOMETRY"],
-        execution=_execution("4"),
-    )
+    _claim_geometry_for_test(tmp_path, experiment)
     evidence = _geometry_evidence(experiment)
     evidence["per_batch_geometry"][0]["gradient_dot_decimal"] = "1000000"
     with pytest.raises(coordinator.CoordinatorError, match="preregistered probe"):
         coordinator.complete_geometry(tmp_path, experiment_id, evidence=evidence)
+
+
+@pytest.mark.parametrize("mutation", ("not_restored", "different_after_state"))
+def test_gradient_geometry_refuses_unrestored_rng_transaction(
+    tmp_path: Path, mutation: str
+) -> None:
+    experiment, _p1 = _prepare_aux(tmp_path)
+    experiment_id = experiment["experiment_id"]
+    _claim_geometry_for_test(tmp_path, experiment)
+    evidence = _geometry_evidence(experiment)
+    transaction = evidence["rng_transactions_by_rank"][3]
+    if mutation == "not_restored":
+        transaction["restored_exactly"] = False
+    else:
+        after = transaction["after_restore"]
+        after["torch_cpu_sha256"] = _sha("9")
+        after["state_sha256"] = coordinator._digest(
+            {key: value for key, value in after.items() if key != "state_sha256"}
+        )
+    with pytest.raises(coordinator.CoordinatorError, match="not isolated"):
+        coordinator.complete_geometry(tmp_path, experiment_id, evidence=evidence)
+
+
+@pytest.mark.parametrize(
+    ("name", "batch_dot", "expected_cosine", "expected_coefficient"),
+    (
+        ("aligned", "1", "1", "0.05"),
+        ("orthogonal", "0", "0", "0.05"),
+    ),
+)
+def test_gradient_geometry_exact_aggregate_cosine_and_coefficient(
+    tmp_path: Path,
+    name: str,
+    batch_dot: str,
+    expected_cosine: str,
+    expected_coefficient: str,
+) -> None:
+    root = tmp_path / name
+    root.mkdir()
+    experiment, _p1 = _prepare_aux(root)
+    experiment_id = experiment["experiment_id"]
+    _claim_geometry_for_test(root, experiment)
+    evidence = _geometry_evidence(experiment)
+    for batch in evidence["per_batch_geometry"]:
+        batch["main_squared_norm_decimal"] = "1"
+        batch["unit_aux_squared_norm_decimal"] = "1"
+        batch["gradient_dot_decimal"] = batch_dot
+    terminal = coordinator.complete_geometry(root, experiment_id, evidence=evidence)
+    assert terminal["derived_geometry"]["main_gradient_norm_decimal"] == "2.236067977499789696409173669"
+    assert terminal["derived_geometry"]["unit_aux_gradient_norm_decimal"] == "2.236067977499789696409173669"
+    assert terminal["derived_geometry"]["gradient_cosine_decimal"] == expected_cosine
+    assert terminal["raw_coefficient_decimal"] == expected_coefficient
+    assert terminal["selected_coefficient_decimal"] == expected_coefficient
 
 
 def test_arm_claims_are_fixed_allocation_bound_and_executor_echoes_science(
@@ -1706,12 +2285,16 @@ def test_arm_claims_are_fixed_allocation_bound_and_executor_echoes_science(
             execution=_execution("6"),
         )
     for index, arm_id in enumerate(coordinator.ARMS):
+        result = _arm_result(pair, arm_id, "d" if arm_id == "AUX0" else "h")
+        execution, material = _central_execution_material(
+            tmp_path, experiment_id, arm_id
+        )
         claim = coordinator.claim_arm(
             tmp_path,
             experiment_id,
             arm_id=arm_id,
             observed_allocation=pair["allocations"][arm_id],
-            execution=_execution(str(index + 5)),
+            execution=execution,
         )
         authority = coordinator.load_aux_pair_executor_authority(
             tmp_path,
@@ -1725,11 +2308,15 @@ def test_arm_claims_are_fixed_allocation_bound_and_executor_echoes_science(
             == experiment["portable_science_identity"]["composite"]
         )
         assert authority["arm"]["arm_id"] == arm_id
+        execution_evidence = _publish_central_execution_evidence(
+            tmp_path, stage=arm_id, material=material, result=result
+        )
         coordinator.complete_arm(
             tmp_path,
             experiment_id,
             arm_id=arm_id,
-            result=_arm_result(pair, arm_id, "d" if arm_id == "AUX0" else "h"),
+            result=result,
+            execution_evidence=execution_evidence,
         )
     with pytest.raises(coordinator.CoordinatorError, match="AUX0 and AUXT"):
         coordinator.claim_arm(
@@ -1753,29 +2340,65 @@ def test_arm_claims_are_fixed_allocation_bound_and_executor_echoes_science(
 def test_pair_terminal_requires_both_exact_fresh_adam_doses(tmp_path: Path) -> None:
     experiment, pair = _issue_aux_pair(tmp_path)
     experiment_id = experiment["experiment_id"]
+    control_result = _arm_result(pair, "AUX0", "d")
+    control_execution, control_material = _central_execution_material(
+        tmp_path, experiment_id, "AUX0"
+    )
     coordinator.claim_arm(
         tmp_path,
         experiment_id,
         arm_id="AUX0",
         observed_allocation=pair["allocations"]["AUX0"],
-        execution=_execution("5"),
+        execution=control_execution,
     )
-    bad = _arm_result(pair, "AUX0", "d")
+    coordinator.load_aux_pair_executor_authority(
+        tmp_path,
+        experiment_id,
+        arm_id="AUX0",
+        observed_allocation=pair["allocations"]["AUX0"],
+    )
+    control_evidence = _publish_central_execution_evidence(
+        tmp_path, stage="AUX0", material=control_material, result=control_result
+    )
+    bad = copy.deepcopy(control_result)
     bad["optimizer_restored"] = True
     with pytest.raises(coordinator.CoordinatorError, match="terminal drifted"):
-        coordinator.complete_arm(tmp_path, experiment_id, arm_id="AUX0", result=bad)
+        coordinator.complete_arm(
+            tmp_path,
+            experiment_id,
+            arm_id="AUX0",
+            result=bad,
+            execution_evidence=control_evidence,
+        )
     control = coordinator.complete_arm(
         tmp_path,
         experiment_id,
         arm_id="AUX0",
-        result=_arm_result(pair, "AUX0", "d"),
+        result=control_result,
+        execution_evidence=control_evidence,
+    )
+    treatment_result = _arm_result(pair, "AUXT", "h")
+    treatment_execution, treatment_material = _central_execution_material(
+        tmp_path, experiment_id, "AUXT"
     )
     coordinator.claim_arm(
         tmp_path,
         experiment_id,
         arm_id="AUXT",
         observed_allocation=pair["allocations"]["AUXT"],
-        execution=_execution("6"),
+        execution=treatment_execution,
+    )
+    coordinator.load_aux_pair_executor_authority(
+        tmp_path,
+        experiment_id,
+        arm_id="AUXT",
+        observed_allocation=pair["allocations"]["AUXT"],
+    )
+    treatment_evidence = _publish_central_execution_evidence(
+        tmp_path,
+        stage="AUXT",
+        material=treatment_material,
+        result=treatment_result,
     )
     with pytest.raises(coordinator.CoordinatorError):
         coordinator.finalize_pair(tmp_path, experiment_id)
@@ -1783,7 +2406,8 @@ def test_pair_terminal_requires_both_exact_fresh_adam_doses(tmp_path: Path) -> N
         tmp_path,
         experiment_id,
         arm_id="AUXT",
-        result=_arm_result(pair, "AUXT", "h"),
+        result=treatment_result,
+        execution_evidence=treatment_evidence,
     )
     coordinator.claim_pair_evaluation(
         tmp_path, experiment_id, execution=_execution("7")
@@ -1847,11 +2471,19 @@ def test_only_independent_final_replication_can_enter_full_gate(
     assert final["final_policy_kl_anchor_weight_decimal"] == "0.0075"
     assert final["effective_recipe"]["policy_kl_anchor_weight"] == 0.0075
     assert final["diagnostic_only"] is False
+    evidence = _slot12_evidence(tmp_path, final)
+    good_result = _final_result(final, evidence)
+    final_execution, final_material = _central_execution_material(
+        tmp_path,
+        experiment["experiment_id"],
+        "FINAL",
+        checkpoint_path=evidence["candidate_checkpoint_path"],
+    )
     coordinator.claim_final_replication(
         tmp_path,
         experiment["experiment_id"],
         observed_allocation=final["allocation"],
-        execution=_execution("7"),
+        execution=final_execution,
     )
     executor = coordinator.load_final_replication_executor_authority(
         tmp_path,
@@ -1859,22 +2491,29 @@ def test_only_independent_final_replication_can_enter_full_gate(
         observed_allocation=final["allocation"],
     )
     assert executor["final_replication_authority"] == final
-
-    evidence = _slot12_evidence(tmp_path, final)
+    final_execution_evidence = _publish_central_execution_evidence(
+        tmp_path,
+        stage="FINAL",
+        material=final_material,
+        result=good_result,
+    )
     evidence_paths = {
         key: value
         for key, value in evidence.items()
         if key.endswith("_path")
     }
-    bad_result = _final_result(final, evidence)
-    bad_result["checkpoint_sha256"] = _arm_result(pair, "AUXT", "h")[
-        "checkpoint_sha256"
-    ]
+    bad_result = copy.deepcopy(good_result)
+    bad_result["checkpoint_sha256"] = coordinator._artifact(  # noqa: SLF001
+        tmp_path,
+        experiment["experiment_id"],
+        "70-auxt-terminal.json",
+    )["result"]["checkpoint_sha256"]
     with pytest.raises(coordinator.CoordinatorError, match="promotion-safe"):
         coordinator.complete_final_replication(
             tmp_path,
             experiment["experiment_id"],
             result=bad_result,
+            execution_evidence=final_execution_evidence,
             **evidence_paths,
         )
     zero_signal_evidence = _slot12_evidence(
@@ -1892,12 +2531,14 @@ def test_only_independent_final_replication_can_enter_full_gate(
             tmp_path,
             experiment["experiment_id"],
             result=_final_result(final, zero_signal_evidence),
+            execution_evidence=final_execution_evidence,
             **zero_signal_paths,
         )
     terminal = coordinator.complete_final_replication(
         tmp_path,
         experiment["experiment_id"],
-        result=_final_result(final, evidence),
+        result=good_result,
+        execution_evidence=final_execution_evidence,
         **evidence_paths,
     )
     assert terminal["promotion_eligible"] is False
@@ -1931,6 +2572,11 @@ def test_failed_aux_selects_control_for_independent_final(tmp_path: Path) -> Non
     )
     assert final["selected_aux_coefficient_decimal"] == "0"
     assert final["initializer_authority"]["pointer_upgrade_authority"] is None
+    assert final["initializer_authority"]["public_award_transition_authority"] == (
+        experiment["portable_science_identity"][
+            "public_award_transition_authority"
+        ]
+    )
     assert final["effective_recipe"]["aux_subgoal_heads"] is False
 
 
@@ -1954,12 +2600,93 @@ def test_portable_identity_is_path_invariant_and_allocation_drift_is_refused(
         coordinator.prepare_experiment(
             tmp_path / "three",
             p1_recipe_data_authority=p1,
+            public_award_transition_authority=_public_award_transition(),
             pointer_upgrade_authority=_pointer_upgrade(),
             warmup_recipe=_warmup_recipe(p1["composite"]),
             selector_rule=_selector_rule(),
             portable_code_identity_sha256=_sha("4"),
             allocations=allocations,
         )
+
+
+def test_portable_projection_ignores_locations_but_binds_science(
+    tmp_path: Path,
+) -> None:
+    experiment, _p1 = _prepare_aux(tmp_path)
+    science = experiment["portable_science_identity"]
+    expected = coordinator._portable_science_digest(science)
+
+    relocated = copy.deepcopy(science)
+    for composite in (
+        relocated["composite"],
+        relocated["p1_recipe_data_authority"]["composite"],
+    ):
+        composite["descriptor_sha256"] = _sha("0")
+        composite["data_fingerprint"] = _sha("1")
+        composite["source_authority"] = {
+            "path": "/different/canonical/root/source-authority.json",
+            "file_sha256": _sha("2"),
+            "authority_sha256": _sha("3"),
+        }
+    for sample in (
+        relocated["p1_sample_evidence_receipt"],
+        relocated["p1_recipe_data_authority"]["p1_sample_evidence_receipt"],
+    ):
+        sample["descriptor_sha256"] = _sha("0")
+        sample["sampler_identity_sha256"] = _sha("4")
+        sample["source_authority"] = copy.deepcopy(
+            relocated["composite"]["source_authority"]
+        )
+        sample["state_sha256"] = _sha("5")
+    relocated["p1_recipe_data_authority"]["sweep_id"] = _sha("6")
+    relocated["p1_recipe_data_authority"]["selection_receipt_sha256"] = _sha("7")
+    relocated["p1_recipe_data_authority"]["selection_replay_sha256"] = _sha("8")
+    relocated["geometry_dose_authority"][
+        "source_p1_recipe_data_authority_sha256"
+    ] = _sha("9")
+    relocated["geometry_dose_authority"]["source_p1_sample_state_sha256"] = _sha(
+        "a"
+    )
+    relocated["warmup_recipe"]["descriptor_sha256"] = _sha("0")
+    relocated["warmup_recipe"]["data_fingerprint"] = _sha("1")
+    relocated["warmup_recipe"]["sampler_identity_sha256"] = _sha("4")
+    relocated["recovery_authority"]["recovered_generator"]["path"] = (
+        "/different/checkpoints/recovered.pt"
+    )
+    relocated["recovery_authority"][
+        "safety_reference_unproven_predecessor"
+    ]["path"] = "/different/checkpoints/safety.pt"
+    relocated["recovery_authority"]["producer_identity"]["checkpoint"]["path"] = (
+        "/different/checkpoints/producer.pt"
+    )
+    assert coordinator._portable_science_digest(relocated) == expected
+
+    semantic_mutations = []
+    payload = copy.deepcopy(science)
+    payload["composite"]["payload_inventory_sha256"] = _sha("0")
+    semantic_mutations.append(payload)
+    for field in (
+        "learner_recipe_overrides_sha256",
+        "aux_subgoal_target_contract_sha256",
+        "public_award_feature_transition_contract_sha256",
+        "source_authority_semantic_sha256",
+    ):
+        contract = copy.deepcopy(science)
+        contract["composite"][field] = _sha("0")
+        semantic_mutations.append(contract)
+    order = copy.deepcopy(science)
+    order["p1_sample_evidence_receipt"]["sample_order_sha256"] = _sha("0")
+    semantic_mutations.append(order)
+    relation = copy.deepcopy(science)
+    relation["recovery_component_semantics"]["recent_history"]["semantic"] = (
+        "recent_history"
+    )
+    semantic_mutations.append(relation)
+    recipe = copy.deepcopy(science)
+    recipe["effective_recipe"]["lr"] = 9.0e-4
+    semantic_mutations.append(recipe)
+    for mutation in semantic_mutations:
+        assert coordinator._portable_science_digest(mutation) != expected
 
 
 def test_hash_chain_corruption_is_detected(tmp_path: Path) -> None:
@@ -1969,7 +2696,9 @@ def test_hash_chain_corruption_is_detected(tmp_path: Path) -> None:
         tmp_path,
         experiment_id,
         observed_allocation=experiment["allocations"]["WARMUP"],
-        execution=_execution("3"),
+        execution=_stage_execution_material(
+            tmp_path, experiment_id, "WARMUP"
+        )[0],
     )
     directory = tmp_path / experiment_id.removeprefix("sha256:")
     claim = directory / "10-warmup-claim.json"

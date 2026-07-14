@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import platform
 import socket
 import subprocess
 import sys
@@ -48,6 +49,63 @@ def _file_sha256(path: Path) -> str:
         for block in iter(lambda: handle.read(1 << 20), b""):
             digest.update(block)
     return f"sha256:{digest.hexdigest()}"
+
+
+def _runtime_identity(torch_module: object) -> dict[str, object]:
+    """Return the path-independent learner runtime used by this canary.
+
+    Version strings alone are not enough: two environments can report the
+    same Python version while invoking different interpreter bytes.  The
+    executable digest closes that gap without making the matched-arm identity
+    depend on a host-local absolute path.
+    """
+
+    try:
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=driver_version",
+                "--format=csv,noheader,nounits",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise CanaryError(f"cannot bind NVIDIA driver version: {error}") from error
+    driver_versions = sorted(
+        {line.strip() for line in result.stdout.splitlines() if line.strip()}
+    )
+    if len(driver_versions) != 1:
+        raise CanaryError("B200 canary GPUs do not share one NVIDIA driver version")
+    executable = Path(sys.executable).resolve(strict=True)
+    torch_version = getattr(torch_module, "__version__", None)
+    cuda_version = getattr(getattr(torch_module, "version", None), "cuda", None)
+    cudnn_version = torch_module.backends.cudnn.version()  # type: ignore[attr-defined]
+    if (
+        not isinstance(torch_version, str)
+        or not torch_version
+        or not isinstance(cuda_version, str)
+        or not cuda_version
+        or isinstance(cudnn_version, bool)
+        or not isinstance(cudnn_version, int)
+        or cudnn_version <= 0
+    ):
+        raise CanaryError("learner CUDA runtime identity is incomplete")
+    return {
+        "schema_version": "a1-b200-learner-runtime-identity-v1",
+        "python": {
+            "implementation": platform.python_implementation(),
+            "version": platform.python_version(),
+            "executable_sha256": _file_sha256(executable),
+        },
+        "torch_version": torch_version,
+        "torch_cuda_version": cuda_version,
+        "cudnn_version": cudnn_version,
+        "numpy_version": np.__version__,
+        "nvidia_driver_version": driver_versions[0],
+    }
 
 
 def _atomic_new_json(path: Path, value: dict[str, object]) -> None:
@@ -292,6 +350,7 @@ def run(out: Path) -> dict[str, object] | None:
             ],
             "gpu_names": [str(record["device_name"]) for record in records],
             "gpu_identities": gathered_identities,
+            "runtime_identity": _runtime_identity(torch),
             "tool": {
                 "path": str(Path(__file__).resolve()),
                 "sha256": _file_sha256(Path(__file__).resolve()),

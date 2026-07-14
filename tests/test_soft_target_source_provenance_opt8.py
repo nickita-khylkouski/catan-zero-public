@@ -104,3 +104,43 @@ def test_all_entity_checkpoint_writers_record_information_surface(tmp_path):
         training_information_surface=contract,
     )
     assert _load_raw(distributed)["training_information_surface"] == contract
+
+
+def test_plain_load_save_preserves_training_regime_provenance(tmp_path):
+    source = tmp_path / "source.pt"
+    resaved = tmp_path / "resaved.pt"
+    value_training = {
+        "schema_version": "value-training-v1",
+        "trained_value_readouts": ["scalar"],
+        "optimizer_steps": 1,
+        "completed_epochs": 1,
+        "resolved_scalar_mse_weight": 1.0,
+        "resolved_categorical_ce_weight": 0.0,
+        "scalar_training_weight_sum": 8.0,
+        "categorical_training_weight_sum": 0.0,
+        "hlgauss_bins": 0,
+    }
+    information_surface = {
+        "schema": "a1-training-event-history-contract-v1",
+        "training_event_history_trainable": False,
+        "event_history_end_to_end_usable": False,
+    }
+    _tiny_policy().save(
+        source,
+        mask_hidden_info=True,
+        soft_target_source="policy",
+        value_training=value_training,
+        training_information_surface=information_surface,
+    )
+
+    EntityGraphPolicy.load(source, device="cpu").save(resaved)
+    before = _load_raw(source)
+    after = _load_raw(resaved)
+    for key in (
+        "mask_hidden_info",
+        "soft_target_source",
+        "value_training",
+        "trained_value_readouts",
+        "training_information_surface",
+    ):
+        assert after[key] == before[key]

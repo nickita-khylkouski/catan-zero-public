@@ -4245,3 +4245,438 @@ def test_role_search_config_accepts_only_complete_native_runtime_binding() -> No
             promotion._verify_role_search_config(
                 drifted, expected_search_config=expected, where="panel"
             )
+
+
+def _typed_final_training_report(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    selected_aux: str,
+) -> tuple[Path, Path, dict]:
+    raw = tmp_path / f"{selected_aux}-raw.pt"
+    transitioned = tmp_path / f"{selected_aux}-transitioned.pt"
+    pointer = tmp_path / f"{selected_aux}-pointer.pt"
+    warmed = tmp_path / f"{selected_aux}-warmed.pt"
+    candidate = tmp_path / f"{selected_aux}-candidate.pt"
+    for path, payload in (
+        (raw, b"raw producer"),
+        (transitioned, b"public award transitioned"),
+        (pointer, b"pointer initializer"),
+        (warmed, b"warmed pointer initializer"),
+        (candidate, b"trained final candidate"),
+    ):
+        path.write_bytes(payload)
+    transition_receipt = tmp_path / f"{selected_aux}-transition.json"
+    transition_receipt.write_text("{}", encoding="utf-8")
+    transition_state = "sha256:" + "a" * 64
+    transition_evidence = {
+        "state_sha256": transition_state,
+        "source_checkpoint_sha256": promotion._sha256(raw),
+        "transitioned_checkpoint_sha256": promotion._sha256(transitioned),
+        "optimizer_steps": 0,
+        "legacy_zero_input_function_preserving": True,
+    }
+    transition_row = one_dose._initializer_transition_record(  # noqa: SLF001
+        kind="public_award_zero_initialization",
+        role="feature_schema_zero_initialization",
+        source_checkpoint_sha256=promotion._sha256(raw),
+        output_checkpoint_sha256=promotion._sha256(transitioned),
+        sampled_rows=0,
+        optimizer_steps=0,
+        optimizer_state_terminal="not_constructed",
+        receipt_path=str(transition_receipt),
+        receipt_file_sha256=promotion._sha256(transition_receipt),
+        receipt_state_sha256=transition_state,
+    )
+    chain = [transition_row]
+    pointer_receipt = tmp_path / f"{selected_aux}-pointer.json"
+    pointer_receipt.write_text("{}", encoding="utf-8")
+    pointer_state = "sha256:" + "b" * 64
+    pointer_evidence = {
+        "module": one_dose.AUX_REGULARIZATION_MODULE,
+        "source": {
+            "path": str(transitioned),
+            "sha256": promotion._sha256(transitioned),
+        },
+        "upgraded_initializer": {
+            "path": str(pointer),
+            "sha256": promotion._sha256(pointer),
+        },
+        "receipt": {
+            "path": str(pointer_receipt),
+            "sha256": promotion._sha256(pointer_receipt),
+        },
+        "receipt_sha256": pointer_state,
+    }
+    warmup_path = tmp_path / f"{selected_aux}-warmup-terminal.json"
+    if selected_aux == "AUXT":
+        pointer_row = one_dose._initializer_transition_record(  # noqa: SLF001
+            kind="function_preserving_pointer_upgrade",
+            role="architecture_zero_diff_upgrade",
+            source_checkpoint_sha256=promotion._sha256(transitioned),
+            output_checkpoint_sha256=promotion._sha256(pointer),
+            sampled_rows=0,
+            optimizer_steps=0,
+            optimizer_state_terminal="not_constructed",
+            receipt_path=str(pointer_receipt),
+            receipt_file_sha256=promotion._sha256(pointer_receipt),
+            receipt_state_sha256=pointer_state,
+        )
+        warmup = {
+            "schema_version": "a1-aux-pointer-warmup-terminal-v1",
+            "result": {
+                "status": "complete",
+                "input_initializer_sha256": promotion._sha256(pointer),
+                "warmed_checkpoint_sha256": promotion._sha256(warmed),
+                "sampled_rows": 524_288,
+                "optimizer_steps": 128,
+                "optimizer_sidecar_discarded_for_joint": True,
+                "inherited_parameters_bit_identical": True,
+                "main_output_max_diff": 0.0,
+            },
+        }
+        warmup["state_sha256"] = promotion._digest_value(warmup)
+        _write_json(warmup_path, warmup)
+        warmup_path.chmod(0o444)
+        warmup_row = one_dose._initializer_transition_record(  # noqa: SLF001
+            kind="head_only_auxiliary_warmup",
+            role="head_only_auxiliary_commissioning",
+            source_checkpoint_sha256=promotion._sha256(pointer),
+            output_checkpoint_sha256=promotion._sha256(warmed),
+            sampled_rows=524_288,
+            optimizer_steps=128,
+            optimizer_state_terminal="discarded_before_joint_training",
+            receipt_path=str(warmup_path),
+            receipt_file_sha256=promotion._sha256(warmup_path),
+            receipt_state_sha256=warmup["state_sha256"],
+        )
+        chain.extend([pointer_row, warmup_row])
+    init = warmed if selected_aux == "AUXT" else transitioned
+    lineage_dose = one_dose.lineage.direct_lineage_dose(
+        declared_producer_sha256=promotion._sha256(raw),
+        init_checkpoint_sha256=promotion._sha256(init),
+        initializer_transition_chain=chain,
+        current_sampled_rows=524_288,
+        current_optimizer_steps=128,
+    )
+    contract = _contract(producer=raw)
+    report = {
+        "a1_contract_sha256": None,
+        "a1_learner_training_recipe_sha256": None,
+        "a1_bound_learner_training_recipe": None,
+        "arch": "entity_graph",
+        "mask_hidden_info": True,
+        "symmetry_augment": False,
+        "track": "2p_no_trade",
+        "vps_to_win": 10,
+        "steps_completed": 128,
+        "epochs": 1,
+        "max_steps": 0,
+        "checkpoint": str(candidate),
+        "init_checkpoint": str(init),
+        "init_checkpoint_sha256": promotion._sha256(init),
+        "a1_lineage_dose": lineage_dose,
+        "a1_central_learner_binding": {
+            "stage": "FINAL",
+            "selected_aux_decision": selected_aux,
+            "diagnostic_only": False,
+            "promotion_eligible": False,
+            "eligible_for_full_gate": True,
+            "full_gate_required": True,
+            "immutable_contract_recipe": contract["science"][
+                "learner_training_recipe"
+            ],
+            "immutable_contract_recipe_sha256": promotion._digest_value(
+                contract["science"]["learner_training_recipe"]
+            ),
+        },
+    }
+    report_path = tmp_path / f"{selected_aux}-report.json"
+    _write_json(report_path, report)
+
+    def verify_transition(
+        path: Path,
+        *,
+        source_checkpoint: Path,
+        transitioned_checkpoint: Path,
+        expected_origin_tool_sha256: str,
+    ):
+        assert path == transition_receipt
+        assert source_checkpoint == raw
+        assert transitioned_checkpoint == transitioned
+        assert expected_origin_tool_sha256
+        return transition_evidence
+
+    monkeypatch.setattr(
+        one_dose.aux_coordinator.scientific_evidence,
+        "verify_public_award_transition_receipt",
+        verify_transition,
+    )
+    monkeypatch.setattr(
+        one_dose.architecture_upgrade,
+        "verify_receipt",
+        lambda path: pointer_evidence,
+    )
+    return report_path, candidate, contract
+
+
+@pytest.mark.parametrize("selected_aux", ["AUX0", "AUXT"])
+def test_promotion_training_report_accepts_only_independent_final_typed_chain(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    selected_aux: str,
+) -> None:
+    report, candidate, contract = _typed_final_training_report(
+        tmp_path, monkeypatch, selected_aux=selected_aux
+    )
+    verified = promotion._verify_training_report(
+        report,
+        contract=contract,
+        contract_sha256=contract["contract_sha256"],
+        candidate_path=candidate,
+        candidate_sha256=promotion._sha256(candidate),
+    )
+    chain = verified["a1_lineage_dose"]["initializer_transition_chain"]
+    assert chain[0]["source_checkpoint_sha256"] == contract["checkpoints"][0][
+        "sha256"
+    ]
+    assert chain[-1]["output_checkpoint_sha256"] == verified[
+        "init_checkpoint_sha256"
+    ]
+    raw_parent_sha = contract["checkpoints"][0]["sha256"]
+    assert promotion._training_evaluation_parent_sha256(verified, {}) == (  # noqa: SLF001
+        raw_parent_sha
+    )
+    with pytest.raises(promotion.PromotionError, match="typed chain source"):
+        promotion._training_evaluation_parent_sha256(  # noqa: SLF001
+            verified, {"evaluation_parent_sha256": verified["init_checkpoint_sha256"]}
+        )
+
+    verified["a1_central_learner_binding"]["stage"] = selected_aux
+    _write_json(report, verified)
+    with pytest.raises(promotion.PromotionError, match="gate-eligible FINAL"):
+        promotion._verify_training_report(
+            report,
+            contract=contract,
+            contract_sha256=contract["contract_sha256"],
+            candidate_path=candidate,
+            candidate_sha256=promotion._sha256(candidate),
+        )
+
+
+def _central_final_receipt_fixture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    selected_aux: str,
+) -> dict:
+    report, candidate, contract = _typed_final_training_report(
+        tmp_path, monkeypatch, selected_aux=selected_aux
+    )
+    report_payload = json.loads(report.read_text(encoding="utf-8"))
+    lineage = report_payload["a1_lineage_dose"]
+    contract_path = tmp_path / f"{selected_aux}-contract.lock.json"
+    _write_json(contract_path, contract)
+    optimizer = Path(str(candidate) + ".optimizer.pt")
+    optimizer.write_bytes(b"fresh central optimizer")
+    progress = Path(str(candidate) + ".training-progress.json")
+    progress.write_text("{}\n", encoding="utf-8")
+    command = ["/usr/bin/python3", "-m", "torch.distributed.run", "--nproc-per-node=8"]
+    execution_binding = one_dose._execution_binding(  # noqa: SLF001
+        command=command, environment=one_dose._child_environment(list(range(8)))  # noqa: SLF001
+    )
+    outputs = {
+        "checkpoint": str(candidate),
+        "checkpoint_sha256": promotion._sha256(candidate),
+        "optimizer_sidecar": str(optimizer),
+        "optimizer_sidecar_sha256": promotion._sha256(optimizer),
+        "training_progress": str(progress),
+        "training_progress_sha256": promotion._sha256(progress),
+        "training_progress_payload_sha256": "sha256:" + "1" * 64,
+        "report": str(report),
+        "report_sha256": promotion._sha256(report),
+        "sample_receipt_state_sha256": "sha256:" + "2" * 64,
+        "sample_order_sha256": "sha256:" + "3" * 64,
+        "row_set_sha256": "sha256:" + "4" * 64,
+        "realized_sample_evidence_sha256": "sha256:" + "5" * 64,
+        "execution_binding_sha256": promotion._digest_value(execution_binding),
+        "input_binding_sha256": "sha256:" + "6" * 64,
+        "steps_completed": 128,
+        "unique_training_rows": None,
+        "base_sampler_draw_events": 524_288,
+        "sampler_draw_events": 524_288,
+        "sampled_rows": 524_288,
+        "lineage_dose": lineage,
+        "corpus_row_count": 1_000_000,
+        "training_row_count": 950_000,
+        "validation_row_count": 50_000,
+        "production_sampling_receipt_sha256": "sha256:" + "7" * 64,
+        "validation_split_receipt_sha256": "sha256:" + "8" * 64,
+    }
+    experiment_id = "sha256:" + "9" * 64
+    root = tmp_path / f"{selected_aux}-coordinator"
+    experiment_dir = root / experiment_id.removeprefix("sha256:")
+    experiment_dir.mkdir(parents=True)
+    published_path = experiment_dir / "93-final-executor-authority.json"
+    published_path.write_text("{}\n", encoding="utf-8")
+    central = {
+        **report_payload["a1_central_learner_binding"],
+        "reviewed_lock_file_sha256": promotion._sha256(contract_path),
+        "code_tree_sha256": "sha256:" + "a" * 64,
+    }
+    published = {
+        "schema_version": "a1-published-executor-authority-v1",
+        "path": str(published_path),
+        "file_sha256": promotion._sha256(published_path),
+        "authority": {"schema_version": "a1-final-replication-executor-authority-v1"},
+    }
+    value = {
+        "schema_version": one_dose.CENTRAL_RECEIPT_SCHEMA,
+        "status": "complete",
+        "contract_sha256": contract["contract_sha256"],
+        "lock": str(contract_path),
+        "lock_file_sha256": promotion._sha256(contract_path),
+        "corpus": str(tmp_path / "composite.json"),
+        "corpus_meta_file_sha256": "sha256:" + "b" * 64,
+        "payload_inventory_sha256": "sha256:" + "c" * 64,
+        "validation_manifest": str(tmp_path / "composite.json"),
+        "validation_manifest_file_sha256": "sha256:" + "d" * 64,
+        "producer_checkpoint_sha256": contract["checkpoints"][0]["sha256"],
+        "learner_training_recipe_sha256": contract["science"][
+            "learner_training_recipe_sha256"
+        ],
+        "command": command,
+        "command_sha256": promotion._digest_value(command),
+        "execution_binding": execution_binding,
+        "input_binding": {"data_kind": "production_composite_v2"},
+        "world_size": 8,
+        "gpu": 0,
+        "gpus": list(range(8)),
+        "gpu_name": "NVIDIA B200",
+        "gpu_names": ["NVIDIA B200"] * 8,
+        "training_topology": {"world_size": 8, "physical_gpus": list(range(8))},
+        "ddp_canary": {"path": str(tmp_path / "ddp-canary.json")},
+        "production_sampling_receipt_sha256": "sha256:" + "7" * 64,
+        "validation_split_receipt_sha256": "sha256:" + "8" * 64,
+        "started_unix_ns": 10,
+        "finished_unix_ns": 20,
+        "returncode": 0,
+        "outputs": outputs,
+        "lineage_dose": lineage,
+        "failure": None,
+        "claim_identity_sha256": "sha256:" + "e" * 64,
+        "central_learner_binding": central,
+        "central_published_executor_authority": published,
+        "central_execution_commitment": {"path": str(tmp_path / "commitment.json")},
+        "claim": str(tmp_path / "central.claim.json"),
+        "claim_state_sha256": "sha256:" + "f" * 64,
+    }
+    if selected_aux == "AUXT":
+        value["function_preserving_upgrade"] = {"receipt": {"path": "upgrade.json"}}
+    receipt_path = tmp_path / f"{selected_aux}-central.receipt.json"
+    value["receipt_sha256"] = promotion._digest_value(value)
+    _write_json(receipt_path, value)
+    receipt_path.chmod(0o444)
+
+    terminal = {
+        "schema_version": "a1-final-replication-terminal-v1",
+        "execution_evidence": {"receipt_path": str(receipt_path)},
+        "result": {
+            "status": "complete",
+            "checkpoint_sha256": promotion._sha256(candidate),
+            "full_gate_entry_eligible": True,
+        },
+        "diagnostic_only": False,
+        "promotion_eligible": False,
+        "eligible_for_full_gate": True,
+        "full_gate_required": True,
+        "auto_promotion": False,
+    }
+    terminal["state_sha256"] = promotion._digest_value(terminal)
+    terminal_path = experiment_dir / "95-final-terminal.json"
+    _write_json(terminal_path, terminal)
+    terminal_path.chmod(0o444)
+
+    monkeypatch.setattr(
+        promotion,
+        "_reconstruct_completed_central_final",
+        lambda *_args, **_kwargs: (
+            {"bound_recipe": contract["science"]["learner_training_recipe"]},
+            root,
+            experiment_id,
+        ),
+    )
+    from tools import a1_central_learner_completion as central_completion
+    from tools import a1_aux_pair_coordinator as coordinator
+
+    monkeypatch.setattr(
+        central_completion,
+        "authenticate_completed_receipt",
+        lambda path, *, verified: json.loads(path.read_text(encoding="utf-8")),
+    )
+    monkeypatch.setattr(
+        coordinator,
+        "_verify_central_terminal_execution_evidence",
+        lambda *_args, **_kwargs: {"state_sha256": "sha256:" + "0" * 64},
+    )
+    return {
+        "receipt": receipt_path,
+        "contract_path": contract_path,
+        "contract": contract,
+        "candidate": candidate,
+        "report": report,
+        "terminal": terminal_path,
+    }
+
+
+@pytest.mark.parametrize("selected_aux", ["AUX0", "AUXT"])
+def test_central_final_receipt_reaches_promotion_preflight_with_raw_parent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    selected_aux: str,
+) -> None:
+    fixture = _central_final_receipt_fixture(
+        tmp_path, monkeypatch, selected_aux=selected_aux
+    )
+    verified = promotion._verify_one_dose_training_receipt(
+        fixture["receipt"],
+        contract_lock=fixture["contract_path"],
+        contract=fixture["contract"],
+        candidate_path=fixture["candidate"],
+        candidate_sha256=promotion._sha256(fixture["candidate"]),
+        training_report_path=fixture["report"],
+        training_report_sha256=promotion._sha256(fixture["report"]),
+    )
+    assert verified["world_size"] == 8
+    assert verified["evaluation_parent_sha256"] == fixture["contract"][
+        "checkpoints"
+    ][0]["sha256"]
+    assert verified["central_final"]["terminal"]["path"] == str(
+        fixture["terminal"]
+    )
+
+
+def test_central_final_receipt_refuses_nonfinal_or_single_gpu_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = _central_final_receipt_fixture(
+        tmp_path, monkeypatch, selected_aux="AUX0"
+    )
+    value = json.loads(fixture["receipt"].read_text(encoding="utf-8"))
+    value["world_size"] = 1
+    value["receipt_sha256"] = promotion._digest_value(
+        {key: item for key, item in value.items() if key != "receipt_sha256"}
+    )
+    fixture["receipt"].chmod(0o644)
+    _write_json(fixture["receipt"], value)
+    fixture["receipt"].chmod(0o444)
+    with pytest.raises(promotion.PromotionError, match="successful 8xB200"):
+        promotion._verify_one_dose_training_receipt(
+            fixture["receipt"],
+            contract_lock=fixture["contract_path"],
+            contract=fixture["contract"],
+            candidate_path=fixture["candidate"],
+            candidate_sha256=promotion._sha256(fixture["candidate"]),
+            training_report_path=fixture["report"],
+            training_report_sha256=promotion._sha256(fixture["report"]),
+        )

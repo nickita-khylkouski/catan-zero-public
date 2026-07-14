@@ -12,6 +12,12 @@ from catan_zero.rl.action_features import (
     CONTEXT_ACTION_FEATURE_SIZE,
     build_action_context_feature_table,
 )
+from catan_zero.rl.entity_feature_adapter import (
+    CURRENT_RUST_ENTITY_ADAPTER_VERSION,
+    checkpoint_entity_feature_adapter_metadata,
+    require_known_entity_feature_adapter,
+    resolve_checkpoint_entity_feature_adapter,
+)
 from catan_zero.rl.entity_token_features import (
     EDGE_FEATURE_SIZE,
     EVENT_FEATURE_SIZE,
@@ -126,6 +132,13 @@ _NON_MODEL_ENTITY_KEYS = frozenset(
 _RELATIONAL_TOPOLOGY_KEYS = frozenset(
     {"hex_vertex_ids", "hex_edge_ids", "edge_vertex_ids", "event_target_ids"}
 )
+
+# The serialized 45-column action table was historically dead in EntityGraphNet.
+# Columns 19:41 are the genuinely missing surface: numeric board arguments,
+# resource-flow identities, and target-player identity. The remaining columns
+# duplicate legal/context tokens, so the repair intentionally excludes them.
+STATIC_ACTION_RESIDUAL_SLICE = slice(19, 41)
+STATIC_ACTION_RESIDUAL_FEATURE_SIZE = 22
 
 
 @dataclass(frozen=True, slots=True)
@@ -287,6 +300,10 @@ class EntityGraphConfig:
     # Default OFF preserves historical checkpoints and results exactly.
     # Appended last for positional pickle compatibility.
     aux_settlement_pointer_head: bool = False
+    # Function-preserving repair for the historically dead static action table.
+    # A zero-output projection consumes only the nonredundant catalog columns.
+    # Default OFF preserves legacy checkpoint structure and behavior exactly.
+    static_action_residual: bool = False
 
 
 class EntityGraphNet:
@@ -565,6 +582,26 @@ class EntityGraphNet:
                 )
                 self.action_bias = nn.Linear(action_in, 1)
                 self.logit_scale = nn.Parameter(torch.tensor(math.log(1.0)))
+                self.static_action_residual_enabled = bool(
+                    getattr(cfg, "static_action_residual", False)
+                )
+                if self.static_action_residual_enabled:
+                    if int(cfg.static_action_feature_size) < int(
+                        STATIC_ACTION_RESIDUAL_SLICE.stop
+                    ):
+                        raise ValueError(
+                            "static_action_residual requires at least "
+                            f"{STATIC_ACTION_RESIDUAL_SLICE.stop} static-action "
+                            f"columns, got {cfg.static_action_feature_size}"
+                        )
+                    # Preserve absolute sparse catalog magnitudes. LayerNorm
+                    # makes the numeric node/edge argument vectors nearly
+                    # collinear and destroys the signal this branch repairs.
+                    self.static_action_residual_proj = nn.Linear(
+                        STATIC_ACTION_RESIDUAL_FEATURE_SIZE, h
+                    )
+                    nn.init.zeros_(self.static_action_residual_proj.weight)
+                    nn.init.zeros_(self.static_action_residual_proj.bias)
                 self.value_head = nn.Sequential(
                     nn.Linear(h, h),
                     nn.GELU(),
@@ -740,7 +777,14 @@ class EntityGraphNet:
                         return nn.Sequential(
                             nn.Linear(h, h),
                             nn.GELU(),
-                            nn.Dropout(dropout),
+                            # Keep auxiliary readouts off the process-global
+                            # dropout stream.  A matched AUX0/AUXT experiment
+                            # must not change the next batch's shared-trunk
+                            # dropout masks merely because AUXT evaluated an
+                            # extra head.  The heads are already regularized by
+                            # the stochastic shared trunk; another dropout here
+                            # is both redundant and a causal-confound footgun.
+                            nn.Identity(),
                             nn.Linear(h, 1),
                         )
 
@@ -748,7 +792,7 @@ class EntityGraphNet:
                         return nn.Sequential(
                             nn.Linear(h, h),
                             nn.GELU(),
-                            nn.Dropout(dropout),
+                            nn.Identity(),
                             nn.Linear(h, int(num_classes)),
                         )
 
@@ -763,7 +807,7 @@ class EntityGraphNet:
                             nn.LayerNorm(h),
                             nn.Linear(h, h),
                             nn.GELU(),
-                            nn.Dropout(dropout),
+                            nn.Identity(),
                             nn.Linear(h, 1),
                         )
                     else:
@@ -792,6 +836,7 @@ class EntityGraphNet:
                 *,
                 return_q: bool = False,
                 return_final_vp: bool = True,
+                return_aux_subgoals: bool = True,
                 value_trunk_grad_scale: float = 1.0,
                 event_token_limit: int | None = None,
             ):
@@ -815,6 +860,7 @@ class EntityGraphNet:
                     batch,
                     return_q=return_q,
                     return_final_vp=return_final_vp,
+                    return_aux_subgoals=return_aux_subgoals,
                     value_trunk_grad_scale=value_trunk_grad_scale,
                 )
 
@@ -951,6 +997,7 @@ class EntityGraphNet:
                 *,
                 return_q: bool = False,
                 return_final_vp: bool = True,
+                return_aux_subgoals: bool = True,
                 value_trunk_grad_scale: float = 1.0,
             ):
                 """Score legal actions and emit value heads from encoded state.
@@ -981,6 +1028,26 @@ class EntityGraphNet:
                     dim=-1,
                 )
                 encoded_actions = self.action_encoder(action_features)
+                if self.static_action_residual_enabled:
+                    static_features = batch.get("legal_action_static_features")
+                    if static_features is None:
+                        raise ValueError(
+                            "static_action_residual requires "
+                            "legal_action_static_features"
+                        )
+                    if (
+                        static_features.ndim != 3
+                        or static_features.shape[:2] != encoded_actions.shape[:2]
+                        or int(static_features.shape[2])
+                        != STATIC_ACTION_RESIDUAL_FEATURE_SIZE
+                    ):
+                        raise ValueError(
+                            "legal_action_static_features shape must be [B,A,22], "
+                            f"got {tuple(static_features.shape)}"
+                        )
+                    encoded_actions = encoded_actions + self.static_action_residual_proj(
+                        static_features.float()
+                    )
                 # Post-trunk target-entity tokens per action, mean-pooled ([B,A,h]).
                 # Shared by action_target_gather (modulates the CLIP embedding) and
                 # the CAT-97 edge_policy_head (emits a direct logit); computed once.
@@ -1087,7 +1154,7 @@ class EntityGraphNet:
                     ).sum(dim=-1)
                     if self.value_categorical_truncation_class:
                         outputs["value_categorical_truncation_prob"] = probs[..., -1]
-                if self.aux_subgoal_heads:
+                if self.aux_subgoal_heads and return_aux_subgoals:
                     # CAT-100 auxiliary subgoal predictions. Raw logits/scalars
                     # (loss applies BCE-with-logits / CE / MSE at the train site).
                     # These never feed value/policy, so main outputs are unchanged.
@@ -1388,6 +1455,7 @@ class EntityGraphPolicy:
         *,
         seed: int = 0,
         device: str | None = None,
+        entity_feature_adapter_version: str = CURRENT_RUST_ENTITY_ADAPTER_VERSION,
     ) -> None:
         import torch
 
@@ -1399,6 +1467,17 @@ class EntityGraphPolicy:
         # checkpoint's own recorded metadata; freshly constructed policies
         # (train_bc.py's own training loop, before its first save) default False.
         self.trained_with_masked_hidden_info: bool = False
+        self.entity_feature_adapter_version = require_known_entity_feature_adapter(
+            entity_feature_adapter_version
+        )
+        self.entity_feature_adapter_binding_source = "new_policy_runtime_binding"
+        # Durable checkpoint provenance.  Fresh policies have no training
+        # attestation; load() fills these from the source checkpoint so a plain
+        # load->save round trip cannot silently erase or reset its information
+        # regime.  Training writers pass replacement values explicitly.
+        self.soft_target_source = ""
+        self.value_training: dict[str, object] | None = None
+        self.training_information_surface: dict[str, object] | None = None
         # Fail closed for new/legacy callers until a corrected-feature training
         # transaction explicitly attests authoritative_v1.  In particular, an
         # old checkpoint loaded and re-saved must not silently opt into a random
@@ -1414,6 +1493,25 @@ class EntityGraphPolicy:
             dtype=torch.float32,
             device=self.device,
         )
+        if bool(getattr(config, "static_action_residual", False)):
+            if self.static_action_features.ndim != 2:
+                raise ValueError(
+                    "static_action_residual requires a rank-2 action catalog, "
+                    f"got {tuple(self.static_action_features.shape)}"
+                )
+            if int(self.static_action_features.shape[0]) < self.action_size:
+                raise ValueError(
+                    "static action catalog has fewer rows than action_size: "
+                    f"{self.static_action_features.shape[0]} < {self.action_size}"
+                )
+            if int(self.static_action_features.shape[1]) < int(
+                STATIC_ACTION_RESIDUAL_SLICE.stop
+            ):
+                raise ValueError(
+                    "static_action_residual requires at least "
+                    f"{STATIC_ACTION_RESIDUAL_SLICE.stop} catalog columns, got "
+                    f"{self.static_action_features.shape[1]}"
+                )
         self.model = EntityGraphNet(config).to(self.device)
 
     @classmethod
@@ -1446,6 +1544,8 @@ class EntityGraphPolicy:
         topology_residual_adapter: bool = False,
         belief_resource_head: bool = False,
         aux_settlement_pointer_head: bool = False,
+        static_action_residual: bool = False,
+        entity_feature_adapter_version: str = CURRENT_RUST_ENTITY_ADAPTER_VERSION,
     ) -> EntityGraphPolicy:
         env = ColonistMultiAgentEnv(env_config or ColonistMultiAgentConfig())
         try:
@@ -1478,8 +1578,15 @@ class EntityGraphPolicy:
                 topology_residual_adapter=bool(topology_residual_adapter),
                 belief_resource_head=bool(belief_resource_head),
                 aux_settlement_pointer_head=bool(aux_settlement_pointer_head),
+                static_action_residual=bool(static_action_residual),
             )
-            return cls(config, static, seed=seed, device=device)
+            return cls(
+                config,
+                static,
+                seed=seed,
+                device=device,
+                entity_feature_adapter_version=entity_feature_adapter_version,
+            )
         finally:
             env.close()
 
@@ -1491,6 +1598,7 @@ class EntityGraphPolicy:
         *,
         return_q: bool = False,
         return_final_vp: bool = True,
+        return_aux_subgoals: bool = False,
         value_trunk_grad_scale: float = 1.0,
     ):
         import torch
@@ -1525,7 +1633,10 @@ class EntityGraphPolicy:
             key: torch.as_tensor(value, device=self.device)
             for key, value in entity_batch.items()
             if (
-                key not in _NON_MODEL_ENTITY_KEYS
+                (
+                    key not in _NON_MODEL_ENTITY_KEYS
+                    and key != "_symmetry_legal_action_ids"
+                )
                 or (needs_topology and key in _RELATIONAL_TOPOLOGY_KEYS)
             )
             and (key != "legal_action_target_ids" or needs_action_targets)
@@ -1538,16 +1649,60 @@ class EntityGraphPolicy:
         action_ids = torch.as_tensor(
             legal_action_ids, dtype=torch.long, device=self.device
         )
+        valid = action_ids >= 0
+        if bool(getattr(self.config, "static_action_residual", False)):
+            catalog_rows = int(self.static_action_features.shape[0])
+            symmetry_catalog_ids = entity_batch.get("_symmetry_legal_action_ids")
+            if symmetry_catalog_ids is None:
+                # Production no-symmetry path reuses the resident legal ids.
+                legal_ids_np = np.asarray(legal_action_ids)
+                if bool(np.any(legal_ids_np[legal_ids_np >= 0] >= catalog_rows)):
+                    raise ValueError("static action catalog id is outside catalog rows")
+                catalog_ids = torch.where(valid, action_ids, 0)
+                catalog_valid = valid
+            else:
+                # D6 relabels catalog identity without reordering legal rows.
+                catalog_ids_np = np.asarray(symmetry_catalog_ids, dtype=np.int64)
+                legal_shape = np.asarray(legal_action_ids).shape
+                if catalog_ids_np.shape != legal_shape:
+                    raise ValueError(
+                        "symmetry/static catalog ids must match legal_action_ids: "
+                        f"{catalog_ids_np.shape} != {legal_shape}"
+                    )
+                catalog_valid_np = catalog_ids_np >= 0
+                if bool(np.any(catalog_ids_np[catalog_valid_np] >= catalog_rows)):
+                    raise ValueError("static action catalog id is outside catalog rows")
+                catalog_ids = torch.as_tensor(
+                    np.where(catalog_valid_np, catalog_ids_np, 0),
+                    dtype=torch.long,
+                    device=self.device,
+                )
+                catalog_valid = torch.as_tensor(
+                    catalog_valid_np, dtype=torch.bool, device=self.device
+                )
+            static_features = self.static_action_features.index_select(
+                0, catalog_ids.reshape(-1)
+            ).reshape(*catalog_ids.shape, -1)
+            static_features = static_features[..., STATIC_ACTION_RESIDUAL_SLICE]
+            static_features = static_features.masked_fill(
+                ~catalog_valid.unsqueeze(-1), 0.0
+            )
+            batch["legal_action_static_features"] = static_features
         model_kwargs = {
             "return_q": return_q,
             "return_final_vp": return_final_vp,
+            # CAT-100 heads are a learner-only regularizer.  Search and ordinary
+            # policy inference discard these tensors, and the settlement pointer
+            # applies an h->h MLP independently to all 54 vertex states.  Keep the
+            # low-level module's historical full-output default for direct callers,
+            # but make the policy/inference API opt in explicitly.
+            "return_aux_subgoals": return_aux_subgoals,
         }
         if float(value_trunk_grad_scale) != 1.0:
             model_kwargs["value_trunk_grad_scale"] = float(
                 value_trunk_grad_scale
             )
         outputs = self.model(batch, **model_kwargs)
-        valid = action_ids >= 0
         outputs["logits"] = outputs["logits"].masked_fill(~valid, -1.0e9)
         return outputs
 
@@ -1693,7 +1848,7 @@ class EntityGraphPolicy:
         self,
         path: str | Path,
         *,
-        mask_hidden_info: bool = False,
+        mask_hidden_info: bool | None = None,
         soft_target_source: str | None = None,
         value_training: dict[str, object] | None = None,
         training_information_surface: dict[str, object] | None = None,
@@ -1706,6 +1861,31 @@ class EntityGraphPolicy:
 
         award_contract = _validate_public_award_feature_contract(
             self.public_award_feature_contract
+        )
+        durable_mask_hidden_info = (
+            bool(self.trained_with_masked_hidden_info)
+            if mask_hidden_info is None
+            else bool(mask_hidden_info)
+        )
+        durable_soft_target_source = (
+            str(self.soft_target_source)
+            if soft_target_source is None
+            else str(soft_target_source)
+        )
+        durable_value_training = (
+            dict(self.value_training)
+            if value_training is None and isinstance(self.value_training, dict)
+            else dict(value_training)
+            if value_training is not None
+            else None
+        )
+        durable_information_surface = (
+            dict(self.training_information_surface)
+            if training_information_surface is None
+            and isinstance(self.training_information_surface, dict)
+            else dict(training_information_surface)
+            if training_information_surface is not None
+            else None
         )
 
         payload = {
@@ -1722,24 +1902,26 @@ class EntityGraphPolicy:
                 # predating this field (legacy checkpoints deserialize as
                 # untrained-with-masking, the safe default -- see
                 # EntityGraphRustEvaluator.__init__'s public_observation guard).
-                "mask_hidden_info": bool(mask_hidden_info),
+                "mask_hidden_info": durable_mask_hidden_info,
+                "entity_feature_adapter": (
+                    checkpoint_entity_feature_adapter_metadata(
+                        self.entity_feature_adapter_version
+                    )
+                ),
                 "public_award_feature_contract": award_contract,
                 # OPT-8 provenance: which soft policy target this run trained
                 # against ("policy" = Gumbel visit counts; "prefer_scores" was the
                 # degenerate-target footgun). Empty string on checkpoints predating
                 # this field. report.json also carries it; this makes the
                 # checkpoint self-describing without the sidecar.
-                "soft_target_source": str(soft_target_source)
-                if soft_target_source is not None
-                else "",
+                "soft_target_source": durable_soft_target_source,
                 "static_action_features_sha256": _array_sha256(
                     self.static_action_features.detach().cpu().numpy()
                 ),
                 "static_action_features": self.static_action_features.detach().cpu(),
                 "model": self.model.state_dict(),
             }
-        if value_training is not None:
-            durable_value_training = dict(value_training)
+        if durable_value_training is not None:
             trained_readouts = tuple(
                 str(readout)
                 for readout in durable_value_training.get(
@@ -1749,10 +1931,8 @@ class EntityGraphPolicy:
             )
             payload["value_training"] = durable_value_training
             payload["trained_value_readouts"] = list(trained_readouts)
-        if training_information_surface is not None:
-            payload["training_information_surface"] = dict(
-                training_information_surface
-            )
+        if durable_information_surface is not None:
+            payload["training_information_surface"] = durable_information_surface
         torch.save(payload, output)
 
     @classmethod
@@ -1762,7 +1942,17 @@ class EntityGraphPolicy:
         *,
         device: str | None = None,
         strict_metadata: bool = True,
+        allow_missing_optional_parameters: bool = False,
     ) -> EntityGraphPolicy:
+        """Load a complete inference checkpoint.
+
+        Config-enabled optional modules are part of the checkpoint's claimed
+        function and therefore must have all of their tensors by default.  A
+        caller preparing a deliberate function-preserving warm start may opt
+        into freshly initialized optional modules explicitly; ordinary
+        inference/evaluation must never turn a truncated or config-only
+        upgrade into a silent zero/random adapter.
+        """
         import torch
 
         from catan_zero.rl.config_serialization import (
@@ -1777,6 +1967,12 @@ class EntityGraphPolicy:
             data = torch.load(checkpoint, map_location=resolved, weights_only=False)
         except TypeError:
             data = torch.load(checkpoint, map_location=resolved)
+        adapter_version, adapter_binding_source = (
+            resolve_checkpoint_entity_feature_adapter(
+                data.get("entity_feature_adapter"),
+                metadata_present="entity_feature_adapter" in data,
+            )
+        )
         static = data["static_action_features"]
         if hasattr(static, "detach"):
             static = static.detach().cpu().numpy()
@@ -1832,7 +2028,12 @@ class EntityGraphPolicy:
                         f"{checkpoint} static_action_features_sha256 mismatch: "
                         f"checkpoint={expected_static_hash} actual={actual_static_hash}"
                     )
-        policy = cls(config, static, device=str(resolved))
+        policy = cls(
+            config,
+            static,
+            device=str(resolved),
+            entity_feature_adapter_version=adapter_version,
+        )
         # f72 safety net (task #76): record whether this checkpoint's training run
         # used --mask-hidden-info. Missing on any checkpoint saved before this field
         # existed -- defaults to False (untrained-with-masking), the safe default:
@@ -1841,6 +2042,7 @@ class EntityGraphPolicy:
         # for it, so an old/legacy checkpoint correctly fails closed rather than
         # silently running mismatched.
         policy.trained_with_masked_hidden_info = bool(data.get("mask_hidden_info", False))
+        policy.entity_feature_adapter_binding_source = adapter_binding_source
         award_contract = str(
             data.get(
                 "public_award_feature_contract",
@@ -1855,9 +2057,16 @@ class EntityGraphPolicy:
         except ValueError as error:
             raise ValueError(f"{checkpoint} has {error}") from error
         policy.public_award_feature_contract = award_contract
+        policy.soft_target_source = str(data.get("soft_target_source", "") or "")
         value_training = data.get("value_training")
         policy.value_training = (
             dict(value_training) if isinstance(value_training, dict) else None
+        )
+        information_surface = data.get("training_information_surface")
+        policy.training_information_surface = (
+            dict(information_surface)
+            if isinstance(information_surface, dict)
+            else None
         )
         raw_trained_readouts = data.get("trained_value_readouts")
         echo_readouts = (
@@ -1958,15 +2167,15 @@ class EntityGraphPolicy:
         # genuinely trained optional head from a config-only warm-start upgrade.
         # The default scalar evaluator ignores this metadata entirely.
         policy._checkpoint_missing_state_keys = tuple(str(key) for key in missing)
-        # Optional aux heads and the f69 action-attention upgrade params are all
-        # absent from checkpoints that predate them, so their freshly-initialised
-        # weights are permitted to be "missing" when warm-starting an upgraded
-        # config. When every optional flag is off none of these modules exist, so
-        # this list is inert and the load is equivalent to strict.
-        allowed_missing_prefixes = (
-            "q_head.",
+        # q_head predates durable architecture metadata and remains an explicit
+        # legacy exception; production search does not request it. Every module
+        # controlled by a config flag is strict for ordinary loads. The larger
+        # allowlist exists only behind the loudly named warm-start opt-in.
+        allowed_missing_prefixes = ("q_head.",)
+        optional_warmstart_prefixes = (
             "value_uncertainty_head.",
             "value_categorical_head.",
+            "value_categorical_support",
             "target_gather_proj.",
             "action_cross_blocks.",
             "value_probe",
@@ -1983,7 +2192,11 @@ class EntityGraphPolicy:
             "aux_robber_target_head.",
             "aux_next_settlement_pointer_head.",
             "belief_resource_head.",
+            "topology_residual_adapter.",
+            "static_action_residual_proj.",
         )
+        if bool(allow_missing_optional_parameters):
+            allowed_missing_prefixes += optional_warmstart_prefixes
         disallowed_missing = [
             key for key in missing if not key.startswith(allowed_missing_prefixes)
         ]

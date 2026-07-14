@@ -2173,12 +2173,18 @@ def test_post_promotion_s1_bridge_is_rejected_outside_exact_v3_handoff(
 
 
 def _historical_v5_compatibility_fixture(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    rust_featurizer_transition: bool = False,
 ) -> tuple[Path, dict, dict, dict]:
     checkpoint = tmp_path / "v5-producer.pt"
     checkpoint.write_bytes(b"v5-producer")
     deployed = {"c_scale": 0.1, "n_full": 128}
     expected = {**deployed, **contract.HISTORICAL_V5_HANDOFF_DEFAULTS}
+    if rust_featurizer_transition:
+        deployed["evaluator_rust_featurize"] = False
+        expected["evaluator_rust_featurize"] = True
     identity = {
         "checkpoint": {
             "path": str(checkpoint),
@@ -2260,6 +2266,63 @@ def test_exact_historical_v5_handoff_projects_only_two_runtime_defaults(
     assert record["producer_search_config"] == deployed
     assert record["producer_search_config_sha256"] == contract._digest_value(deployed)
     assert record["producer_search_identity_compatibility"] == compatibility
+
+
+def test_exact_historical_v5_handoff_requires_authenticated_rust_parity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path, payload, deployed, expected = _historical_v5_compatibility_fixture(
+        tmp_path, monkeypatch, rust_featurizer_transition=True
+    )
+    compatibility = contract._historical_v5_handoff_identity_compatibility(
+        path=path,
+        payload=payload,
+        deployed=deployed,
+        expected=expected,
+    )
+    assert compatibility["schema_version"] == (
+        contract.HISTORICAL_V5_RUST_FEATURIZER_COMPATIBILITY_SCHEMA
+    )
+    transition = compatibility["rust_featurizer_implementation_transition"]
+    assert transition["semantic_identity_changed"] is False
+    assert transition["parity_evidence"]["sha256"] == (
+        contract.RUST_FEATURIZER_PARITY_EVIDENCE_SHA256
+    )
+    assert transition["parity_evidence"]["tensor_parity_tests"] == {
+        "passed": 26,
+        "failed": 0,
+        "skipped": 0,
+    }
+    assert compatibility["normalized_search_config_sha256"] == (
+        contract._digest_value(expected)
+    )
+
+    monkeypatch.setattr(
+        contract,
+        "RUST_FEATURIZER_PARITY_EVIDENCE_SHA256",
+        "sha256:" + "0" * 64,
+    )
+    with pytest.raises(contract.ContractError, match="parity evidence fingerprint"):
+        contract._historical_v5_handoff_identity_compatibility(
+            path=path,
+            payload=payload,
+            deployed=deployed,
+            expected=expected,
+        )
+    monkeypatch.setattr(
+        contract,
+        "RUST_FEATURIZER_PARITY_EVIDENCE_SHA256",
+        transition["parity_evidence"]["sha256"],
+    )
+    drifted = dict(expected)
+    drifted["n_full"] = 64
+    with pytest.raises(contract.ContractError, match="compatibility shape drift"):
+        contract._historical_v5_handoff_identity_compatibility(
+            path=path,
+            payload=payload,
+            deployed=deployed,
+            expected=drifted,
+        )
 
 
 @pytest.mark.parametrize(

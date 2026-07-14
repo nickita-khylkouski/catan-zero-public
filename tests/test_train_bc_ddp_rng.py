@@ -8,8 +8,14 @@ import torch
 from tools import train_bc
 
 
-def _args(*, seed: int, enabled: bool) -> argparse.Namespace:
-    return argparse.Namespace(seed=seed, training_rng_rank_offset=enabled)
+def _args(
+    *, seed: int, enabled: bool, sampler_seed: int | None = None
+) -> argparse.Namespace:
+    return argparse.Namespace(
+        seed=seed,
+        sampler_seed=sampler_seed,
+        training_rng_rank_offset=enabled,
+    )
 
 
 def _dropout_draw() -> torch.Tensor:
@@ -31,6 +37,28 @@ def test_historical_flag_off_does_not_mutate_torch_or_numpy_rng() -> None:
     assert numpy_rng.bit_generator.state == numpy_before
     assert report["effective_torch_seed"] is None
     assert report["rank_offset_enabled"] is False
+    assert report["sampler_seed"] == 7
+    assert report["sampler_seed_explicit"] is False
+
+
+def test_warm_start_rebinds_loader_seed_to_configured_training_seed() -> None:
+    # Reproduce the loader footgun: constructing the policy reset the process RNG
+    # to an internal default unrelated to the learner's configured seed.
+    torch.manual_seed(0)
+    _ = _dropout_draw()
+
+    report = train_bc._initialize_training_rng(
+        _args(seed=137, enabled=False),
+        {"enabled": False, "world_size": 1, "rank": 0, "local_rank": 0},
+        checkpoint_loaded=True,
+    )
+    actual = _dropout_draw()
+
+    torch.manual_seed(137)
+    expected = _dropout_draw()
+    assert torch.equal(actual, expected)
+    assert report["effective_torch_seed"] == 137
+    assert report["post_load_reseeded"] is True
 
 
 def test_rank_offset_makes_dropout_independent_but_reproducible() -> None:
@@ -57,9 +85,11 @@ def test_same_seed_without_rank_offset_reproduces_identical_rank_masks() -> None
     assert torch.equal(draws[0], draws[1])
 
 
-def test_auxiliary_dropout_advances_shared_stream_before_next_trunk_batch() -> None:
+def test_auxiliary_readout_must_not_advance_shared_dropout_stream() -> None:
+    """The auxiliary arm may change gradients, never the common RNG schedule."""
+
     trunk_dropout = torch.nn.Dropout(0.5)
-    auxiliary_dropouts = torch.nn.ModuleList(torch.nn.Dropout(0.5) for _ in range(5))
+    auxiliary_readouts = torch.nn.ModuleList(torch.nn.Identity() for _ in range(5))
     values = torch.ones(4096)
 
     torch.manual_seed(812)
@@ -68,14 +98,12 @@ def test_auxiliary_dropout_advances_shared_stream_before_next_trunk_batch() -> N
 
     torch.manual_seed(812)
     treatment_first = trunk_dropout(values)
-    for auxiliary_dropout in auxiliary_dropouts:
-        auxiliary_dropout(values)
+    for auxiliary_readout in auxiliary_readouts:
+        auxiliary_readout(values)
     treatment_second = trunk_dropout(values)
 
-    # The first shared-trunk call is common-random, but the five CAT-100-style
-    # head dropouts consume the process-global stream and change the next batch.
     assert torch.equal(control_first, treatment_first)
-    assert not torch.equal(control_second, treatment_second)
+    assert torch.equal(control_second, treatment_second)
 
 
 def test_training_rng_flag_is_typed_and_changes_config_hash() -> None:
@@ -83,3 +111,77 @@ def test_training_rng_flag_is_typed_and_changes_config_hash() -> None:
     offset = train_bc.TrainConfig(training_rng_rank_offset=True)
     assert baseline.training_rng_rank_offset is False
     assert baseline.config_hash() != offset.config_hash()
+
+
+def test_sampler_seed_decouples_every_numpy_data_trajectory_from_torch_seed() -> None:
+    left = _args(seed=11, sampler_seed=424242, enabled=True)
+    right = _args(seed=99, sampler_seed=424242, enabled=True)
+    assert train_bc._resolved_sampler_seed(left) == 424242
+    assert train_bc._resolved_sampler_seed(right) == 424242
+
+    ddp = {"enabled": True, "world_size": 2, "rank": 1, "local_rank": 1}
+    left_order = train_bc._epoch_order(
+        np.random.default_rng(train_bc._resolved_sampler_seed(left)),
+        100,
+        8,
+        ddp,
+        data_sharded=False,
+    )
+    right_order = train_bc._epoch_order(
+        np.random.default_rng(train_bc._resolved_sampler_seed(right)),
+        100,
+        8,
+        ddp,
+        data_sharded=False,
+    )
+    assert np.array_equal(left_order, right_order)
+
+    left_aux = np.random.default_rng(
+        np.random.SeedSequence(
+            [train_bc._resolved_sampler_seed(left), 0xA17C1E, 3]
+        )
+    ).integers(0, 1_000_000, size=32)
+    right_aux = np.random.default_rng(
+        np.random.SeedSequence(
+            [train_bc._resolved_sampler_seed(right), 0xA17C1E, 3]
+        )
+    ).integers(0, 1_000_000, size=32)
+    assert np.array_equal(left_aux, right_aux)
+
+    left_symmetry = np.random.default_rng(
+        train_bc._resolved_sampler_seed(left) + 20260705
+    ).integers(12, size=64)
+    right_symmetry = np.random.default_rng(
+        train_bc._resolved_sampler_seed(right) + 20260705
+    ).integers(12, size=64)
+    assert np.array_equal(left_symmetry, right_symmetry)
+
+
+def test_resume_identity_binds_explicit_sampler_and_torch_seeds_independently() -> None:
+    ddp = {
+        "enabled": True,
+        "world_size": 8,
+        "rank": 0,
+        "local_rank": 0,
+    }
+
+    def identity(seed: int, sampler_seed: int | None):
+        args = argparse.Namespace(
+            seed=seed,
+            sampler_seed=sampler_seed,
+            grad_accum_steps=1,
+            ddp_shard_data=False,
+            fsdp=False,
+            policy_aux_active_batch_size=0,
+        )
+        return train_bc._training_resume_recipe_identity(
+            train_bc.TrainConfig(seed=seed), args, ddp
+        )
+
+    legacy = identity(7, None)
+    assert "sampler_seed" not in legacy
+    explicit = identity(7, 424242)
+    assert explicit["model_and_torch_seed"] == 7
+    assert explicit["sampler_seed"] == 424242
+    assert explicit != identity(8, 424242)
+    assert explicit != identity(7, 424243)

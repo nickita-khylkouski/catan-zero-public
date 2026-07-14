@@ -183,6 +183,67 @@ def _neutral_report(checkpoint: Path, seed: int) -> dict:
     }
 
 
+@pytest.mark.parametrize("kind", ["internal", "neutral"])
+def test_complete_report_contract_rejects_zero_game_exit_zero_payload(
+    tmp_path: Path, kind: str
+) -> None:
+    candidate = _checkpoint(tmp_path, "candidate.pt")
+    champion = _checkpoint(tmp_path, "champion.pt")
+    report = (
+        _internal_report(candidate, champion, 9001)
+        if kind == "internal"
+        else _neutral_report(candidate, 9001)
+    )
+    report.update(
+        games=[],
+        games_played=0,
+        games_with_winner=0,
+        complete_pairs=0,
+        candidate_wins=0,
+        baseline_wins=0,
+    )
+    if kind == "neutral":
+        report["games_requested"] = 0
+
+    with pytest.raises(pool.PoolError, match="raw games do not exactly cover"):
+        pool.validate_complete_report(
+            report, kind=kind, expected_pairs=1, where="exit-zero-report"
+        )
+
+
+@pytest.mark.parametrize("kind", ["internal", "neutral"])
+@pytest.mark.parametrize("error_field", ["errors", "worker_errors", "pair_errors"])
+def test_complete_report_contract_rejects_every_error_channel(
+    tmp_path: Path, kind: str, error_field: str
+) -> None:
+    candidate = _checkpoint(tmp_path, "candidate.pt")
+    champion = _checkpoint(tmp_path, "champion.pt")
+    report = (
+        _internal_report(candidate, champion, 9001)
+        if kind == "internal"
+        else _neutral_report(candidate, 9001)
+    )
+    report[error_field] = [{"error": "worker failed before first game"}]
+
+    with pytest.raises(pool.PoolError, match=f"{error_field} must be an empty list"):
+        pool.validate_complete_report(
+            report, kind=kind, expected_pairs=1, where="failed-report"
+        )
+
+
+def test_complete_report_contract_binds_lane_to_planned_pair_count(
+    tmp_path: Path,
+) -> None:
+    candidate = _checkpoint(tmp_path, "candidate.pt")
+    champion = _checkpoint(tmp_path, "champion.pt")
+    report = _internal_report(candidate, champion, 9001)
+
+    with pytest.raises(pool.PoolError, match="differs from planned 2"):
+        pool.validate_complete_report(
+            report, kind="internal", expected_pairs=2, where="short-lane"
+        )
+
+
 def test_internal_pool_reindexes_local_pair_ids_and_recomputes_gate(
     tmp_path: Path,
 ) -> None:
@@ -417,6 +478,60 @@ def test_neutral_pool_recomputes_stats_and_preserves_games(tmp_path: Path) -> No
     assert result["superiority_pentanomial_sprt"] == evaluate_pentanomial_sprt(
         scores, elo0=0.0, elo1=15.0, alpha=0.05, beta=0.05
     )
+
+
+def test_neutral_pool_allows_explicit_disjoint_replication_cohorts(
+    tmp_path: Path,
+) -> None:
+    checkpoint = _checkpoint(tmp_path, "candidate.pt")
+    paths = []
+    for index, seed in enumerate((8101, 9101)):
+        path = tmp_path / f"neutral-disjoint-{index}.json"
+        _write(path, _neutral_report(checkpoint, seed))
+        paths.append(path)
+
+    with pytest.raises(pool.PoolError, match="seed intervals have a gap"):
+        pool.pool_neutral(paths, checkpoint=checkpoint)
+
+    result = pool.pool_neutral(
+        paths,
+        checkpoint=checkpoint,
+        allow_disjoint_cohorts=True,
+    )
+    assert result["complete_pairs"] == 2
+    assert result["fleet_merge"]["disjoint_cohorts"] is True
+    assert [
+        (row["base_seed"], row["end_seed"])
+        for row in result["fleet_merge"]["seed_intervals"]
+    ] == [(8101, 8102), (9101, 9102)]
+
+
+@pytest.mark.parametrize("kind", ["internal", "neutral"])
+def test_pool_separates_wall_time_from_aggregate_lane_seconds(
+    tmp_path: Path, kind: str
+) -> None:
+    candidate = _checkpoint(tmp_path, "candidate.pt")
+    champion = _checkpoint(tmp_path, "champion.pt")
+    reports = []
+    for index, (seed, elapsed) in enumerate(((8101, 10.0), (8102, 30.0))):
+        report = (
+            _internal_report(candidate, champion, seed)
+            if kind == "internal"
+            else _neutral_report(candidate, seed)
+        )
+        report["elapsed_sec"] = elapsed
+        path = tmp_path / f"{kind}-{index}.json"
+        _write(path, report)
+        reports.append(path)
+
+    result = (
+        pool.pool_internal(reports, candidate=candidate, champion=champion)
+        if kind == "internal"
+        else pool.pool_neutral(reports, checkpoint=candidate)
+    )
+
+    assert result["elapsed_sec"] == 30.0
+    assert result["aggregate_compute_sec"] == 40.0
 
 
 def test_neutral_pool_refuses_checkpoint_hash_drift(tmp_path: Path) -> None:

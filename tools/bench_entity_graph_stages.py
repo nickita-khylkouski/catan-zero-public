@@ -176,11 +176,21 @@ def _attributed_forward(
     context: np.ndarray,
     *,
     return_q: bool,
+    return_aux_subgoals: bool,
     recorder: _StageRecorder,
 ) -> tuple[dict[str, Any], dict[str, np.ndarray]]:
     """Semantics-equivalent decomposition of the current eager forward."""
+    from catan_zero.rl.entity_token_policy import _apply_public_award_feature_contract
+
     torch = recorder.torch
     model = policy.model
+    # Exact inference applies the checkpoint-owned public-award compatibility
+    # bridge before any tensor transfer.  Keep attribution on the same inputs;
+    # otherwise legacy checkpoints receive a random, never-trained player
+    # column here and the profiler silently measures a different function.
+    entity = _apply_public_award_feature_contract(
+        entity, policy.public_award_feature_contract
+    )
     batch, action_ids = recorder.run(
         "numpy_to_torch_h2d",
         lambda: _host_to_device(policy, entity, legal_ids, context, torch),
@@ -338,7 +348,7 @@ def _attributed_forward(
                 result["value_categorical_truncation_prob"] = probabilities[..., -1]
             return result
         outputs.update(recorder.run("value_categorical_head", categorical_heads))
-    if model.aux_subgoal_heads:
+    if model.aux_subgoal_heads and return_aux_subgoals:
         def aux_heads():
             result = {
                 "aux_longest_road": model.aux_longest_road_head(state).squeeze(-1),
@@ -391,8 +401,22 @@ def _attributed_forward(
     return outputs, host_outputs
 
 
-def _exact_forward(policy: Any, entity: dict[str, np.ndarray], legal_ids: np.ndarray, context: np.ndarray, *, return_q: bool):
-    outputs = policy.forward_legal_np(entity, legal_ids, context, return_q=return_q)
+def _exact_forward(
+    policy: Any,
+    entity: dict[str, np.ndarray],
+    legal_ids: np.ndarray,
+    context: np.ndarray,
+    *,
+    return_q: bool,
+    return_aux_subgoals: bool,
+):
+    outputs = policy.forward_legal_np(
+        entity,
+        legal_ids,
+        context,
+        return_q=return_q,
+        return_aux_subgoals=return_aux_subgoals,
+    )
     keys = ("logits", "value", "value_uncertainty", "q_values")
     return outputs, {
         key: outputs[key].detach().float().cpu().numpy()
@@ -626,6 +650,12 @@ def main() -> None:
     parser.add_argument("--iterations", type=int, default=100)
     parser.add_argument("--seed", type=int, default=20260710)
     parser.add_argument("--return-q", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--return-aux-subgoals",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Include learner-only CAT-100 outputs in the timed inference window.",
+    )
     parser.add_argument("--player-crop-ab", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--output-json", type=Path)
     args = parser.parse_args()
@@ -655,26 +685,40 @@ def main() -> None:
 
     with torch.inference_mode():
         exact_outputs, _ = _exact_forward(
-            policy, entity, legal_ids, context, return_q=args.return_q
+            policy,
+            entity,
+            legal_ids,
+            context,
+            return_q=args.return_q,
+            return_aux_subgoals=args.return_aux_subgoals,
         )
         parity_recorder = _StageRecorder(torch)
         attributed_outputs, _ = _attributed_forward(
             policy, entity, legal_ids, context,
-            return_q=args.return_q, recorder=parity_recorder,
+            return_q=args.return_q,
+            return_aux_subgoals=args.return_aux_subgoals,
+            recorder=parity_recorder,
         )
         parity_recorder.collect()
         parity = _compare_outputs(exact_outputs, attributed_outputs, torch)
 
         exact = _benchmark_exact(
             lambda: _exact_forward(
-                policy, entity, legal_ids, context, return_q=args.return_q
+                policy,
+                entity,
+                legal_ids,
+                context,
+                return_q=args.return_q,
+                return_aux_subgoals=args.return_aux_subgoals,
             ),
             warmup=args.warmup, iterations=args.iterations, torch=torch,
         )
         attributed = _benchmark_attributed(
             lambda recorder: _attributed_forward(
                 policy, entity, legal_ids, context,
-                return_q=args.return_q, recorder=recorder,
+                return_q=args.return_q,
+                return_aux_subgoals=args.return_aux_subgoals,
+                recorder=recorder,
             ),
             warmup=args.warmup, iterations=args.iterations, torch=torch,
         )
@@ -709,6 +753,7 @@ def main() -> None:
         "warmup": args.warmup,
         "iterations": args.iterations,
         "return_q": args.return_q,
+        "return_aux_subgoals": args.return_aux_subgoals,
         "exact_window": exact,
         "attributed_stages": attributed,
         "attributed_stage_families_cuda_ms": _stage_family_totals(attributed),

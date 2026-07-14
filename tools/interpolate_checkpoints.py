@@ -7,6 +7,10 @@ import json
 from pathlib import Path
 from typing import Any
 
+from catan_zero.rl.entity_token_policy import (
+    PUBLIC_AWARD_FEATURE_CONTRACT_LEGACY_ZERO,
+)
+
 
 # Checkpoints contain both learned parameters and immutable inference inputs.
 # Interpolating the latter is unsafe even when the endpoints are identical:
@@ -192,6 +196,10 @@ def _checkpoint_ref(path: Path) -> dict[str, str]:
 
 
 def _assert_compatible(base: dict[str, Any], candidate: dict[str, Any]) -> None:
+    from catan_zero.rl.entity_feature_adapter import (
+        resolve_checkpoint_entity_feature_adapter,
+    )
+
     structural_keys = {
         "observation_size",
         "action_size",
@@ -206,12 +214,53 @@ def _assert_compatible(base: dict[str, Any], candidate: dict[str, Any]) -> None:
                 f"incompatible checkpoint metadata for {key}: "
                 f"{base.get(key)!r} != {candidate.get(key)!r}"
             )
+    # Entity-graph checkpoints moved their architecture and information-regime
+    # contracts under name-keyed metadata.  Tensor schema alone cannot detect
+    # a same-shape semantic change, and copying the base metadata onto blended
+    # weights would make an invalid mixture look deployable.  Legacy candidate-
+    # policy interpolation remains unchanged because it uses the structural
+    # top-level keys above rather than ``policy_type='entity_graph'``.
+    if "entity_graph" in {base.get("policy_type"), candidate.get("policy_type")}:
+        base_adapter_version, _base_adapter_source = (
+            resolve_checkpoint_entity_feature_adapter(
+                base.get("entity_feature_adapter"),
+                metadata_present="entity_feature_adapter" in base,
+            )
+        )
+        candidate_adapter_version, _candidate_adapter_source = (
+            resolve_checkpoint_entity_feature_adapter(
+                candidate.get("entity_feature_adapter"),
+                metadata_present="entity_feature_adapter" in candidate,
+            )
+        )
+        if base_adapter_version != candidate_adapter_version:
+            raise ValueError(
+                "incompatible entity-graph checkpoint metadata for "
+                "entity_feature_adapter: "
+                f"{base_adapter_version!r} != {candidate_adapter_version!r}"
+            )
+        semantic_keys = (
+            "policy_type",
+            "config",
+            "mask_hidden_info",
+            "action_mask_version",
+            "public_award_feature_contract",
+            "static_action_features_sha256",
+        )
+        for key in semantic_keys:
+            left = _entity_graph_semantic_metadata_value(base, key)
+            right = _entity_graph_semantic_metadata_value(candidate, key)
+            if left != right:
+                raise ValueError(
+                    f"incompatible entity-graph checkpoint metadata for {key}: "
+                    f"{left!r} != {right!r}"
+                )
     base_schema = _tensor_schema(base)
     candidate_schema = _tensor_schema(candidate)
     if base_schema != candidate_schema:
         raise ValueError("checkpoint tensor key/schema sets differ")
     for key, base_value in base.items():
-        if key not in LEARNED_STATE_ROOTS:
+        if key not in LEARNED_STATE_ROOTS and key != "entity_feature_adapter":
             _assert_tensor_values_equal(
                 base_value,
                 candidate.get(key),
@@ -224,6 +273,19 @@ def _assert_compatible(base: dict[str, Any], candidate: dict[str, Any]) -> None:
     # Non-tensor training metadata may legitimately differ.  The structural
     # inference fields above and the complete tensor path/shape/dtype schema
     # are the deployable compatibility boundary.
+
+
+def _entity_graph_semantic_metadata_value(
+    checkpoint: dict[str, Any], key: str
+) -> Any:
+    if key == "mask_hidden_info":
+        return bool(checkpoint.get(key, False))
+    if key == "public_award_feature_contract":
+        return str(
+            checkpoint.get(key, PUBLIC_AWARD_FEATURE_CONTRACT_LEGACY_ZERO)
+            or PUBLIC_AWARD_FEATURE_CONTRACT_LEGACY_ZERO
+        )
+    return checkpoint.get(key)
 
 
 def _blend_checkpoint(

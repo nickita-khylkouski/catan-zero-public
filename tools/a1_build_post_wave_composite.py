@@ -1099,10 +1099,11 @@ def _build_descriptor(
     aux_subgoal_component_ids: list[str] = []
     for component in components:
         component_id = str(component["component_id"])
-        # Historical replay remains valid policy/value supervision but cannot
-        # contribute the pre-v1 settlement/robber labels.  Fresh components
-        # enter the authenticated aux scope only when their byte-bound memmap
-        # metadata proves every row carries the strict-future version.
+        # Historical replay remains valid outcome/value supervision but its
+        # policy was produced by an older, weaker search teacher.  Fresh
+        # components enter the authenticated aux scope only when their
+        # byte-bound memmap metadata proves every row carries the strict-future
+        # version.
         if component_id not in FRESH_SOURCE_GAME_RATIOS:
             continue
         corpus_dir = component.get("corpus_dir")
@@ -1135,12 +1136,13 @@ def _build_descriptor(
             "fresh component aux-subgoal target contract is not uniformly "
             f"strict-future v{AUX_SUBGOAL_TARGET_VERSION}; missing={missing}"
         )
+    fresh_component_ids = list(FRESH_SOURCE_GAME_RATIOS)
     replay_contract = {
         "schema_version": "flywheel-replay-composite-v2",
         "current_checkpoint_version": int(current_version),
         "initializer_checkpoint_path": str(producer_path),
         "initializer_checkpoint_sha256": producer_sha256,
-        "fresh_component_ids": list(FRESH_SOURCE_GAME_RATIOS),
+        "fresh_component_ids": fresh_component_ids,
         "replay_component_ids": [HISTORICAL_REPLAY_CATEGORY],
         "fresh_source_game_ratios": dict(FRESH_SOURCE_GAME_RATIOS),
         "effective_component_sampling_ratios": effective,
@@ -1165,7 +1167,7 @@ def _build_descriptor(
         "learner_recipe_overrides": recipe,
         "learner_recipe_overrides_sha256": canonical_sha256(recipe),
         "policy_kl_anchor_component_ids": [HISTORICAL_REPLAY_CATEGORY],
-        "policy_distillation_component_ids": component_ids,
+        "policy_distillation_component_ids": fresh_component_ids,
         "value_training_component_ids": component_ids,
         "aux_subgoal_component_ids": aux_subgoal_component_ids,
         "flywheel_replay_contract": replay_contract,

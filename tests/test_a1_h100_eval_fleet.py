@@ -996,15 +996,50 @@ def test_launch_command_creates_fresh_tree_and_ignores_ssh_working_directory(
         remote_root / "runs" / "a1-eval-0123456789abcdef" / "internal" / "job-0"
     )
     report = job_dir / "report.json"
+    payload = {
+        "pairs_requested": 1,
+        "base_seed": 42,
+        "games_played": 2,
+        "games_with_winner": 2,
+        "complete_pairs": 1,
+        "games_truncated": 0,
+        "candidate_wins": 2,
+        "baseline_wins": 0,
+        "pair_diagnostics": {
+            "ww_pairs": 1,
+            "split_pairs": 0,
+            "ll_pairs": 0,
+            "incomplete_pairs": 0,
+        },
+        "errors": [],
+        "games": [
+            {
+                "game_seed": 42,
+                "orientation": orientation,
+                "candidate_won": True,
+                "search_won": True,
+                "terminated": True,
+                "truncated": False,
+                "error": None,
+                "engine_divergence": False,
+            }
+            for orientation in ("candidate_red", "candidate_blue")
+        ],
+    }
     job = {
         "job_id": "job-0",
+        "phase": "internal",
+        "pairs": 1,
         "job_dir": str(job_dir),
         "report": str(report),
         "gpu": 0,
         "argv": [
             "python3",
             "-c",
-            f"from pathlib import Path; Path({str(report)!r}).write_text('ok')",
+            (
+                "from pathlib import Path; "
+                f"Path({str(report)!r}).write_text({json.dumps(payload)!r})"
+            ),
         ],
     }
     command = fleet._launch_job_command(  # noqa: SLF001
@@ -1026,10 +1061,127 @@ def test_launch_command_creates_fresh_tree_and_ignores_ssh_working_directory(
     assert completed.returncode == 0, completed.stderr
     assert remote_root.is_dir()
     assert (remote_root / "runs" / "a1-eval-0123456789abcdef" / "internal").is_dir()
-    assert report.read_text(encoding="utf-8") == "ok"
+    assert json.loads(report.read_text(encoding="utf-8")) == payload
     assert (job_dir / ".done").is_file()
     assert (job_dir / ".rc").read_text(encoding="utf-8") == "0\n"
     assert not (job_dir / ".failed").exists()
+
+
+def test_exit_zero_zero_game_report_is_marked_failed_not_done(tmp_path: Path) -> None:
+    remote_repo = tmp_path / "remote repo"
+    launcher = remote_repo / "tools" / "fleet" / "launch_detached.sh"
+    launcher.parent.mkdir(parents=True)
+    launcher.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -u\n"
+        "shift 3\n"
+        "test \"$1\" = --\n"
+        "shift\n"
+        '"$@"\n',
+        encoding="utf-8",
+    )
+    launcher.chmod(0o755)
+    remote_root = tmp_path / "remote output"
+    job_dir = remote_root / "runs" / "a1-eval-deadbeefdeadbeef" / "internal" / "job"
+    report = job_dir / "report.json"
+    invalid = {
+        "pairs_requested": 1,
+        "base_seed": 42,
+        "games_played": 0,
+        "games_with_winner": 0,
+        "complete_pairs": 0,
+        "games_truncated": 0,
+        "candidate_wins": 0,
+        "baseline_wins": 0,
+        "pair_diagnostics": {
+            "ww_pairs": 0,
+            "split_pairs": 0,
+            "ll_pairs": 0,
+            "incomplete_pairs": 1,
+        },
+        "errors": [],
+        "worker_errors": [{"error": "failed before any game"}],
+        "games": [],
+    }
+    job = {
+        "job_id": "job",
+        "phase": "internal",
+        "pairs": 1,
+        "job_dir": str(job_dir),
+        "report": str(report),
+        "gpu": 0,
+        "argv": [
+            "python3",
+            "-c",
+            (
+                "from pathlib import Path; "
+                f"Path({str(report)!r}).write_text({json.dumps(invalid)!r})"
+            ),
+        ],
+    }
+    job_dir.mkdir(parents=True)
+    # Simulate a legacy false-positive completion marker.  Resume must remove
+    # it before starting and must not leave it visible while/after validation.
+    (job_dir / ".done").touch()
+
+    completed = subprocess.run(
+        [
+            "bash",
+            "-lc",
+            fleet._launch_job_command(  # noqa: SLF001
+                {"remote_repo": str(remote_repo), "remote_root": str(remote_root)},
+                job,
+            ),
+        ],
+        check=False,
+        text=True,
+        capture_output=True,
+    )
+
+    assert completed.returncode == 86
+    assert (job_dir / ".failed").is_file()
+    assert (job_dir / ".rc").read_text(encoding="utf-8") == "86\n"
+    assert not (job_dir / ".done").exists()
+
+
+def test_status_downgrades_legacy_done_marker_with_invalid_report(
+    tmp_path: Path,
+) -> None:
+    job_dir = tmp_path / "job"
+    job_dir.mkdir()
+    (job_dir / ".done").touch()
+    report = job_dir / "report.json"
+    report.write_text(
+        json.dumps(
+            {
+                "pairs_requested": 1,
+                "base_seed": 42,
+                "games_played": 0,
+                "errors": [],
+                "worker_errors": [{"error": "no games ran"}],
+                "games": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    job = {
+        "job_id": "job",
+        "phase": "internal",
+        "pairs": 1,
+        "job_dir": str(job_dir),
+        "report": str(report),
+        "argv": ["python3"],
+    }
+
+    completed = subprocess.run(
+        ["bash", "-lc", fleet._status_command([job])],  # noqa: SLF001
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+    assert fleet.parse_status(completed.stdout, alias="host") == [
+        {"job_id": "job", "state": "failed", "pid": None, "alias": "host"}
+    ]
 
 
 def test_launch_refuses_symlinked_remote_root_before_writing_job(
@@ -1047,6 +1199,8 @@ def test_launch_refuses_symlinked_remote_root_before_writing_job(
     job_dir = remote_root / "runs" / "a1-eval-0123456789abcdef" / "internal" / "job-0"
     job = {
         "job_id": "job-0",
+        "phase": "internal",
+        "pairs": 1,
         "job_dir": str(job_dir),
         "report": str(job_dir / "report.json"),
         "gpu": 0,

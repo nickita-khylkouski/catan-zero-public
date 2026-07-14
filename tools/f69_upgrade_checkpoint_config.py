@@ -69,6 +69,7 @@ NEW_PARAM_PREFIXES = (
     "belief_resource_head.",
     "value_categorical_head.",
     "topology_residual_adapter.",
+    "static_action_residual_proj.",
 )
 
 
@@ -117,6 +118,8 @@ def _parse_flags(raw: str) -> dict[str, object]:
             overrides["topology_residual_adapter"] = True
         elif entry in ("belief", "belief_resource_head"):
             overrides["belief_resource_head"] = True
+        elif entry in ("static", "static_action_residual"):
+            overrides["static_action_residual"] = True
         elif entry.startswith("catbins"):
             # CAT-39: build the HL-Gauss categorical value head with N win-loss
             # bins (plus the truncation class, which the config enables by

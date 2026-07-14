@@ -15,12 +15,20 @@ import numpy as np
 
 from catan_zero.rl.action_features import CONTEXT_ACTION_FEATURE_SIZE, _context_vector
 from catan_zero.rl.action_mask import ActionCatalog
+from catan_zero.rl.entity_feature_adapter import (
+    CURRENT_RUST_ENTITY_ADAPTER_VERSION,
+    policy_entity_feature_adapter_version,
+    require_known_entity_feature_adapter,
+)
 from catan_zero.rl.entity_token_features import build_entity_token_features
 from catan_zero.rl.entity_token_policy import EntityGraphPolicy
 from catan_zero.rl.multiagent_env import ColonistMultiAgentConfig, ColonistMultiAgentEnv
 
 
-RUST_ENTITY_ADAPTER_VERSION = "rust_entity_adapter_v2_land_topology_ports_maritime"
+# Backward-compatible public alias used by teacher-data writers.  The canonical
+# definition lives in the dependency-free contract module so policy checkpoint
+# code and search cannot drift or form a circular import.
+RUST_ENTITY_ADAPTER_VERSION = CURRENT_RUST_ENTITY_ADAPTER_VERSION
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,6 +44,7 @@ class EntityGraphRustEvaluatorConfig:
     prior_temperature: float = 1.0
     context_fill: float = 0.0
     cache_size: int = 100_000
+    entity_feature_adapter_version: str = RUST_ENTITY_ADAPTER_VERSION
     # #60 A/B knob. The entity_graph value head is a raw Linear trained with
     # MSE on z in {-1,+1} (no tanh in the model or the loss), so applying
     # tanh at inference double-squashes: monotonic (root argmax and rescaled
@@ -283,6 +292,32 @@ def _assert_public_observation_matches_checkpoint_training(
         )
 
 
+def _assert_feature_adapter_matches_checkpoint(
+    policy: "EntityGraphPolicy", config: "EntityGraphRustEvaluatorConfig"
+) -> None:
+    requested = require_known_entity_feature_adapter(
+        config.entity_feature_adapter_version
+    )
+    if requested != RUST_ENTITY_ADAPTER_VERSION:
+        raise ValueError(
+            "requested entity feature adapter is known but not implemented by "
+            f"this runtime: requested={requested!r} "
+            f"implemented={RUST_ENTITY_ADAPTER_VERSION!r}"
+        )
+    checkpoint_version = policy_entity_feature_adapter_version(policy)
+    if requested != checkpoint_version:
+        source = str(
+            getattr(policy, "entity_feature_adapter_binding_source", "legacy_policy")
+        )
+        raise ValueError(
+            "entity feature adapter/checkpoint mismatch: "
+            f"runtime={requested!r} checkpoint={checkpoint_version!r} "
+            f"checkpoint_binding_source={source!r}. Input tensor shapes can match "
+            "while slot meanings differ; use a checkpoint trained with this exact "
+            "adapter version or explicitly run its versioned legacy adapter."
+        )
+
+
 class EntityGraphRustEvaluator:
     def __init__(
         self,
@@ -292,6 +327,7 @@ class EntityGraphRustEvaluator:
     ) -> None:
         self.policy = policy
         self.config = config or EntityGraphRustEvaluatorConfig()
+        _assert_feature_adapter_matches_checkpoint(policy, self.config)
         _assert_public_observation_matches_checkpoint_training(policy, self.config)
         _assert_value_readout_available(policy, self.config)
         _assert_uncertainty_readout_available(policy, self.config)

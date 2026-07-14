@@ -31,12 +31,14 @@ COMPLETION_SCHEMA = "a1-production-target-gather-retrain-completion-v1"
 FREEZE_MODULES = "trunk,action_encoder,policy_head,value_heads"
 TRAINABLE_PREFIX = "target_gather_proj"
 WORLD_SIZE = 4
-LOCAL_BATCH = 512
-OPTIMIZER_STEPS = 2048
+LOCAL_BATCH = 128
+OPTIMIZER_STEPS = 128
 GLOBAL_DRAWS = WORLD_SIZE * LOCAL_BATCH * OPTIMIZER_STEPS
 DEFAULT_VISIBLE_DEVICES = (0, 1, 2, 3)
-AUX64_VISIBLE_DEVICES = (4, 5, 6, 7)
-AUTHORIZED_POLICY_AUX_ACTIVE_BATCH_SIZES = frozenset((0, 64))
+POLICY_AUX_VISIBLE_DEVICES = (4, 5, 6, 7)
+# Four ranks need 128 active rows/rank to reproduce the experimentally selected
+# eight-rank AUX64 global policy-active dose (512 rows/update).
+AUTHORIZED_POLICY_AUX_ACTIVE_BATCH_SIZES = frozenset((0, 128))
 BOUND_SOURCE_FILES = (
     "tools/a1_production_gather_retrain.py",
     "tools/a1_production_l1_rerun.py",
@@ -170,7 +172,7 @@ def prepare(
     expected_devices = (
         DEFAULT_VISIBLE_DEVICES
         if policy_aux_active_batch_size == 0
-        else AUX64_VISIBLE_DEVICES
+        else POLICY_AUX_VISIBLE_DEVICES
     )
     if visible_devices != expected_devices:
         raise GatherRetrainError(
@@ -265,8 +267,8 @@ def prepare(
         "fresh_optimizer": True,
         "ddp_find_unused_parameters": True,
     }
-    # Keep the historical production operator byte-for-byte unchanged.  The
-    # independently reproducible AUX64 profile adds only its causal dose.
+    # The base profile reproduces the selected 65,536-draw commissioning dose.
+    # The independent policy-active profile adds only its causal active-row dose.
     if policy_aux_active_batch_size:
         operator.update(
             {
@@ -370,10 +372,10 @@ def verify(manifest_path: Path) -> dict[str, Any]:
     if policy_aux_active_batch_size not in AUTHORIZED_POLICY_AUX_ACTIVE_BATCH_SIZES:
         raise GatherRetrainError("unauthorized policy-active auxiliary dose")
     expected_operator = {
-        "world_size": 4,
-        "per_rank_batch_size": 512,
-        "optimizer_steps": 2048,
-        "global_base_draws": 4_194_304,
+        "world_size": WORLD_SIZE,
+        "per_rank_batch_size": LOCAL_BATCH,
+        "optimizer_steps": OPTIMIZER_STEPS,
+        "global_base_draws": GLOBAL_DRAWS,
         "current_fraction": 0.8,
         "current_n128_fraction": 5.0 / 7.0,
         "current_n256_fraction": 2.0 / 7.0,
@@ -431,7 +433,7 @@ def verify(manifest_path: Path) -> dict[str, Any]:
     expected_devices = list(
         DEFAULT_VISIBLE_DEVICES
         if policy_aux_active_batch_size == 0
-        else AUX64_VISIBLE_DEVICES
+        else POLICY_AUX_VISIBLE_DEVICES
     )
     if manifest.get("visible_devices") != expected_devices:
         raise GatherRetrainError(
@@ -731,12 +733,12 @@ def finalize(
         "init_checkpoint_sha256": verified["manifest"]["function_preserving_upgrade"][
             "upgraded_initializer"
         ]["sha256"],
-        "world_size": 4,
-        "batch_size": 512,
-        "effective_global_batch_size": 2048,
-        "max_steps": 2048,
-        "steps_completed": 2048,
-        "training_row_draws": 4_194_304,
+        "world_size": WORLD_SIZE,
+        "batch_size": LOCAL_BATCH,
+        "effective_global_batch_size": WORLD_SIZE * LOCAL_BATCH,
+        "max_steps": OPTIMIZER_STEPS,
+        "steps_completed": OPTIMIZER_STEPS,
+        "training_row_draws": GLOBAL_DRAWS,
         "soft_target_weight": 0.9,
         "value_loss_weight": 0.25,
         "loser_sample_weight": 1.0,

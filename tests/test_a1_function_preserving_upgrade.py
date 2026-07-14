@@ -172,6 +172,59 @@ def _belief_checkpoints(tmp_path: Path, *, seed: int = 73) -> tuple[Path, Path]:
     return source, output
 
 
+def _aux_checkpoints(tmp_path: Path, *, seed: int = 79) -> tuple[Path, Path]:
+    """Build the exact shared auxiliary initializer for both matched arms."""
+
+    from catan_zero.rl.entity_token_policy import EntityGraphConfig, EntityGraphPolicy
+    from catan_zero.rl.self_play import make_env_config
+
+    source = tmp_path / "champion-aux-source.pt"
+    output = tmp_path / "champion-aux.pt"
+    base = EntityGraphPolicy.create(
+        env_config=make_env_config(vps_to_win=3),
+        hidden_size=16,
+        state_layers=1,
+        attention_heads=2,
+        seed=11,
+        device="cpu",
+    )
+    base.save(source, mask_hidden_info=True)
+    values = {
+        field.name: getattr(base.config, field.name)
+        for field in dataclasses.fields(EntityGraphConfig)
+        if hasattr(base.config, field.name)
+    }
+    values["aux_subgoal_heads"] = True
+    aux = EntityGraphPolicy(
+        EntityGraphConfig(**values),
+        base.static_action_features.detach().cpu().numpy(),
+        seed=seed,
+        device="cpu",
+    )
+    missing, unexpected = aux.model.load_state_dict(
+        base.model.state_dict(), strict=False
+    )
+    assert not unexpected
+    assert set(missing) == set(
+        upgrade.ALLOWLIST[upgrade.MODULE_AUX_SUBGOAL_HEADS][
+            "new_parameter_initialization"
+        ]
+    )
+    aux.save(output, mask_hidden_info=True)
+    raw = torch.load(output, map_location="cpu", weights_only=False)
+    raw["upgrade_provenance"] = {
+        "schema_version": "entity-graph-upgrade-v1",
+        "source_checkpoint_sha256": upgrade._sha(source).removeprefix("sha256:"),  # noqa: SLF001
+        "flags": {"aux_subgoal_heads": True},
+        "initialization_seed": seed,
+        "trained_value_readouts_added": [],
+        "forward_max_diff": 0.0,
+        "forward_identical_at_init": True,
+    }
+    torch.save(raw, output)
+    return source, output
+
+
 def _tamper_and_rehash(path: Path, mutate) -> None:
     value = json.loads(path.read_text(encoding="utf-8"))
     mutate(value)
@@ -255,6 +308,43 @@ def test_receipt_replays_seeded_belief_head_upgrade(tmp_path: Path) -> None:
     assert payload["initialization_seed"] == 73
     assert set(verified["seeded_parameter_sha256"]) == expected_seeded
     assert verified["shared_parameters_bit_identical"] is True
+
+
+def test_receipt_replays_shared_seeded_aux_head_upgrade(tmp_path: Path) -> None:
+    source, initializer = _aux_checkpoints(tmp_path)
+    receipt = tmp_path / "aux-upgrade.receipt.json"
+    payload = upgrade.issue_receipt(
+        source,
+        initializer,
+        receipt,
+        module=upgrade.MODULE_AUX_SUBGOAL_HEADS,
+    )
+    verified = upgrade.verify_receipt(receipt)
+    assert verified["module"] == upgrade.MODULE_AUX_SUBGOAL_HEADS
+    assert verified["upgraded_initializer"] == payload["upgraded_initializer"]
+    assert len(verified["new_parameters"]) == 20
+    assert set(verified["seeded_parameter_sha256"]) == set(
+        verified["new_parameters"]
+    )
+
+
+def test_aux_receipt_rejects_substituted_initializer_bytes(tmp_path: Path) -> None:
+    source, initializer = _aux_checkpoints(tmp_path)
+    receipt = tmp_path / "aux-upgrade.receipt.json"
+    upgrade.issue_receipt(
+        source,
+        initializer,
+        receipt,
+        module=upgrade.MODULE_AUX_SUBGOAL_HEADS,
+    )
+    raw = torch.load(initializer, map_location="cpu", weights_only=False)
+    raw["model"]["aux_vp_in_n_head.3.bias"][0] += 0.01
+    torch.save(raw, initializer)
+    with pytest.raises(
+        upgrade.UpgradeError,
+        match="deterministic seeded_torch_default|does not replay exactly",
+    ):
+        upgrade.verify_receipt(receipt)
 
 
 def test_receipt_accepts_belief_head_from_real_seeded_upgrader(

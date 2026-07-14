@@ -11,6 +11,7 @@ import pytest
 from tools import a1_one_dose_train as executor
 from tools import a1_pre_wave_contract as contract
 from catan_zero.rl.entity_token_policy import EntityGraphConfig
+from catan_zero.rl.optim_state import save_training_progress
 
 
 _SHA = "sha256:" + "a" * 64
@@ -62,6 +63,7 @@ def _verified(tmp_path: Path) -> dict:
     ledger = tmp_path / "seed-ledger.tsv"
     ledger.write_text("sealed ledger\n")
     lock = _lock(producer=producer, ledger=ledger)
+    lock["checkpoints"][0]["sha256"] = executor._file_sha256(producer)
     return {
         "lock": lock,
         "lock_path": lock_path,
@@ -85,10 +87,99 @@ def _verified(tmp_path: Path) -> dict:
     }
 
 
+def _fake_aux_upgrade(verified: dict, tmp_path: Path) -> dict:
+    initializer = tmp_path / "shared-aux-initializer.pt"
+    initializer.write_bytes(b"one shared aux initializer")
+    receipt = tmp_path / "shared-aux-upgrade.receipt.json"
+    receipt.write_text("{}")
+    spec = executor.architecture_upgrade.ALLOWLIST[
+        executor.AUX_REGULARIZATION_MODULE
+    ]
+    seeded = {
+        name: "sha256:" + f"{index + 1:064x}"
+        for index, (name, kind) in enumerate(
+            sorted(spec["new_parameter_initialization"].items())
+        )
+        if kind == "seeded_torch_default"
+    }
+    return {
+        "module": executor.AUX_REGULARIZATION_MODULE,
+        "source": dict(verified["producer"]),
+        "upgraded_initializer": {
+            "path": str(initializer.resolve()),
+            "sha256": executor._file_sha256(initializer),
+        },
+        "receipt_sha256": "sha256:" + "4" * 64,
+        "receipt": {
+            "path": str(receipt.resolve()),
+            "sha256": executor._file_sha256(receipt),
+        },
+        "flags": dict(spec["flags"]),
+        "initialization_seed": 20260713,
+        "forward_max_diff": 0.0,
+        "forward_identical_at_init": True,
+        "shared_parameters_bit_identical": True,
+        "shared_parameter_count": 100,
+        "new_parameters": sorted(spec["new_parameter_initialization"]),
+        "new_parameter_initialization": dict(
+            spec["new_parameter_initialization"]
+        ),
+        "effective_source_config_sha256": "sha256:" + "5" * 64,
+        "effective_upgraded_config_sha256": "sha256:" + "6" * 64,
+        "seeded_parameter_sha256": seeded,
+    }
+
+
+def _patch_valid_aux_admission(
+    monkeypatch: pytest.MonkeyPatch, verified: dict
+) -> dict[str, np.ndarray]:
+    rows = int(verified["training_row_count"])
+    data = {
+        "aux_longest_road": np.zeros(rows, dtype=np.float32),
+        "aux_largest_army": np.ones(rows, dtype=np.float32),
+        "aux_vp_in_n": np.zeros(rows, dtype=np.float32),
+        "aux_next_settlement": np.arange(rows, dtype=np.int16) % 54,
+        "aux_robber_target": np.arange(rows, dtype=np.int16) % 19,
+        executor.train_bc.AUX_SUBGOAL_TARGET_VERSION_KEY: np.full(
+            rows,
+            executor.train_bc.AUX_SUBGOAL_TARGET_VERSION,
+            dtype=np.uint8,
+        ),
+    }
+    monkeypatch.setattr(
+        executor.train_bc, "load_teacher_data_memmap", lambda _path: data
+    )
+    monkeypatch.setattr(
+        executor.train_bc,
+        "_load_validation_game_seed_manifest_for_training",
+        lambda *args, **kwargs: {"game_seeds": np.asarray([99], dtype=np.int64)},
+    )
+    monkeypatch.setattr(
+        executor.train_bc,
+        "split_train_validation_indices",
+        lambda *args, **kwargs: {
+            "train": np.arange(rows, dtype=np.int64),
+            "validation": np.empty(0, dtype=np.int64),
+        },
+    )
+    return data
+
+
 def _training_report(
     verified: dict, checkpoint: Path, *, steps_completed: int = 2
 ) -> dict:
     recipe = verified["recipe"]
+    resume_identity = {
+        "schema_version": "train-bc-resume-recipe-v1",
+        "normalized_train_config_sha256": "sha256:" + "9" * 64,
+        "grad_accum_steps": int(recipe["grad_accum_steps"]),
+        "world_size": int(recipe["world_size"]),
+        "ddp_shard_data": False,
+        "fsdp": False,
+        "policy_aux_active_batch_size": int(
+            recipe.get("policy_aux_active_batch_size", 0)
+        ),
+    }
     payload = {
         "arch": "entity_graph",
         **executor.SEALED_A1_MODEL_REPORT,
@@ -151,6 +242,10 @@ def _training_report(
         ),
         "steps_completed": steps_completed,
         "total_training_steps": steps_completed,
+        "training_resume_recipe_identity": resume_identity,
+        "training_resume_recipe_identity_sha256": executor._value_sha256(
+            resume_identity
+        ),
         "require_35m_model": True,
         "parameter_count": 35_000_000,
         "value_training": {
@@ -211,6 +306,39 @@ def _training_report(
             }
         )
     return payload
+
+
+def _write_training_progress(
+    checkpoint: Path,
+    report_payload: dict,
+    *,
+    steps_completed: int = 2,
+) -> None:
+    """Commit a structurally real checkpoint-set marker for executor tests."""
+
+    identity = report_payload["training_resume_recipe_identity"]
+    world_size = int(identity["world_size"])
+    numpy_states = [
+        {"bit_generator": "PCG64", "state": {"state": rank, "inc": rank + 1}}
+        for rank in range(world_size)
+    ]
+    torch_states = [
+        {"rank": rank, "cpu": [rank], "cuda": None}
+        for rank in range(world_size)
+    ]
+    assert save_training_progress(
+        checkpoint,
+        optimizer_step=steps_completed,
+        completed_epochs=1,
+        recipe_identity=identity,
+        rng_state=numpy_states[0],
+        rank_numpy_rng_states=numpy_states,
+        symmetry_rng_state=None,
+        rank_torch_rng_states=torch_states,
+        scalar_training_weight_sum=1.0,
+        categorical_training_weight_sum=0.0,
+        ddp={"rank": 0},
+    ) is not None
 
 
 def _option(command: list[str], flag: str) -> str:
@@ -294,6 +422,9 @@ def _production_composite_meta(tmp_path: Path, producer_sha256: str) -> dict:
             "per_game_policy_weight_mode": "equal",
         },
         "learner_recipe_overrides_sha256": "sha256:" + "4" * 64,
+        "aux_subgoal_target_contract_sha256": "sha256:" + "a" * 64,
+        "public_award_feature_transition_contract_sha256": "sha256:" + "b" * 64,
+        "source_authority_semantic_sha256": "sha256:" + "c" * 64,
         "payload_inventory_sha256": "sha256:" + "5" * 64,
     }
 
@@ -586,6 +717,21 @@ def _ddp_canary_payload(*, created_unix_ns: int) -> dict:
         "local_draws_per_rank": 1_536,
         "gpu_names": ["NVIDIA B200"] * 8,
         "gpu_identities": identities,
+        "runtime_identity": {
+            "schema_version": "a1-b200-learner-runtime-identity-v1",
+            "python": {
+                "implementation": "CPython",
+                "version": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
+                "executable_sha256": executor._file_sha256(
+                    Path(sys.executable).resolve()
+                ),
+            },
+            "torch_version": "test-torch",
+            "torch_cuda_version": "test-cuda",
+            "cudnn_version": 90000,
+            "numpy_version": np.__version__,
+            "nvidia_driver_version": "test-driver",
+        },
         "global_draw_sha256": "sha256:" + "a" * 64,
         "rank_slice_sha256": ["sha256:" + f"{rank + 9:064x}" for rank in range(8)],
         "tool": {
@@ -901,6 +1047,383 @@ def test_policy_aux_active_dose_is_typed_and_command_bound(
     assert executor.train_bc.TrainConfig.from_namespace(
         parsed
     ).policy_aux_active_batch_size == 128
+
+
+def test_pointer_aux_cannot_use_generic_ablation_labels_or_coefficients(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    verified = _verified(tmp_path)
+    verified["reviewed_lock_file_sha256"] = verified["lock_file_sha256"]
+    upgrade = _fake_aux_upgrade(verified, tmp_path)
+    monkeypatch.setattr(
+        executor.architecture_upgrade, "verify_receipt", lambda _path: upgrade
+    )
+    code_sha = "sha256:" + "7" * 64
+    monkeypatch.setattr(
+        executor,
+        "_current_ablation_code_binding",
+        lambda _lock: {"code_tree_sha256": code_sha, "records": []},
+    )
+    upgraded = executor.bind_function_preserving_upgrade(
+        verified, Path(upgrade["receipt"]["path"])
+    )
+    for label, weight in (("aux0", 0.0), ("aux2", 0.02), ("auxt", 0.013)):
+        with pytest.raises(
+            executor.ExecutorError,
+            match="central warmup/geometry/pair authority",
+        ):
+            executor.bind_learner_ablation(
+                upgraded,
+                ablation_id=label,
+                overrides_json=json.dumps(
+                    {"aux_subgoal_loss_weight": weight}
+                ),
+                reviewed_code_tree_sha256=code_sha,
+            )
+
+
+@pytest.mark.parametrize("weight", (0.01, 0.05))
+def test_matched_aux_rejects_unreviewed_weight(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, weight: float
+) -> None:
+    verified = _verified(tmp_path)
+    verified["reviewed_lock_file_sha256"] = verified["lock_file_sha256"]
+    upgrade = _fake_aux_upgrade(verified, tmp_path)
+    monkeypatch.setattr(
+        executor.architecture_upgrade, "verify_receipt", lambda _path: upgrade
+    )
+    code_sha = "sha256:" + "7" * 64
+    monkeypatch.setattr(
+        executor,
+        "_current_ablation_code_binding",
+        lambda _lock: {"code_tree_sha256": code_sha, "records": []},
+    )
+    upgraded = executor.bind_function_preserving_upgrade(
+        verified, Path(upgrade["receipt"]["path"])
+    )
+    with pytest.raises(
+        executor.ExecutorError,
+        match="central warmup/geometry/pair authority",
+    ):
+        executor.bind_learner_ablation(
+            upgraded,
+            ablation_id="aux-bad",
+            overrides_json=json.dumps({"aux_subgoal_loss_weight": weight}),
+            reviewed_code_tree_sha256=code_sha,
+        )
+
+
+def test_aux_loss_ablation_without_shared_upgrade_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    verified = _verified(tmp_path)
+    verified["reviewed_lock_file_sha256"] = verified["lock_file_sha256"]
+    code_sha = "sha256:" + "7" * 64
+    monkeypatch.setattr(
+        executor,
+        "_current_ablation_code_binding",
+        lambda _lock: {"code_tree_sha256": code_sha, "records": []},
+    )
+    with pytest.raises(executor.ExecutorError, match="shared aux-head initializer"):
+        executor.bind_learner_ablation(
+            verified,
+            ablation_id="aux2",
+            overrides_json='{"aux_subgoal_loss_weight":0.02}',
+            reviewed_code_tree_sha256=code_sha,
+        )
+
+
+def _p1_executor_authority(verified: dict, *, code_sha: str) -> dict:
+    recipe = dict(
+        executor.aux_coordinator.canonical_p1_final_lock_authority()["base_recipe"]
+    )
+    recipe.update(
+        {
+            "world_size": 8,
+            "batch_size": 512,
+            "global_batch_size": 4096,
+            "policy_kl_anchor_weight": 0.03,
+            "sampler_seed": executor.aux_coordinator.P1_SAMPLER_SEED,
+            "amp": "none",
+            "epochs": 1,
+            "max_steps": 128,
+            "resume_optimizer": False,
+        }
+    )
+    arm = {
+        "arm_id": "K3",
+        "target_global_equivalent_decimal": "0.03",
+        "eligible_mass_decimal": "1",
+        "policy_kl_anchor_weight_decimal": "0.03",
+        "policy_kl_anchor_weight": 0.03,
+        "effective_recipe": recipe,
+        "effective_recipe_sha256": executor._value_sha256(recipe),
+    }
+    allocation = {"allocation": "test"}
+    claim = {
+        "schema_version": "a1-p1-central-arm-claim-v1",
+        "sweep_id": "sha256:" + "1" * 64,
+        "arm_id": "K3",
+        "prior_authority_sha256": "sha256:" + "2" * 64,
+        "arm": arm,
+        "allocation": allocation,
+        "execution": {},
+    }
+    composite = {
+        "descriptor_sha256": verified["corpus_meta_file_sha256"],
+        "data_fingerprint": verified["data_fingerprint"],
+        "payload_inventory_sha256": verified["payload_inventory_sha256"],
+        "production_sampling_receipt_sha256": verified[
+            "production_sampling_receipt_sha256"
+        ],
+        "validation_split_receipt_sha256": verified[
+            "validation_split_receipt_sha256"
+        ],
+        "training_game_seed_set_sha256": verified[
+            "training_game_seed_set_sha256"
+        ],
+        "validation_game_seed_set_sha256": verified[
+            "validation_game_seed_set_sha256"
+        ],
+        "complete_game_inputs": True,
+        "category_semantics": {
+            "current_producer": {"semantic": "current_producer"},
+            "recent_history": {"semantic": "recovery_reference"},
+            "hard_negative": {"semantic": "hard_negative"},
+        },
+    }
+    authority = {
+        "schema_version": "a1-p1-arm-executor-authority-v1",
+        "sweep_id": claim["sweep_id"],
+        "arm_id": "K3",
+        "sweep_state_sha256": claim["prior_authority_sha256"],
+        "arm_claim": claim,
+        "arm": arm,
+        "current_parent_authority": {"checkpoint_sha256": verified["producer"]["sha256"]},
+        "composite": composite,
+        "kl_eligibility_authority": {
+            "sampler_identity_sha256": "sha256:" + "3" * 64,
+            "sample_order_sha256": "sha256:" + "4" * 64,
+        },
+        "p1_sample_evidence_receipt": {
+            "state_sha256": "sha256:" + "a" * 64,
+            "descriptor_sha256": verified["corpus_meta_file_sha256"],
+            "payload_inventory_sha256": verified["payload_inventory_sha256"],
+            "category_semantics": {"semantic": "test-recovery"},
+            "category_semantics_sha256": executor._value_sha256(
+                {"semantic": "test-recovery"}
+            ),
+            "source_authority": {
+                "path": "/srv/composite/source_authority.json",
+                "file_sha256": "sha256:" + "8" * 64,
+                "authority_sha256": "sha256:" + "9" * 64,
+            },
+            "sampler_identity_sha256": "sha256:" + "3" * 64,
+            "sample_order_sha256": "sha256:" + "4" * 64,
+            "row_set_sha256": "sha256:" + "b" * 64,
+            "unique_row_count": 500_000,
+            "rows_file_sha256": "sha256:" + "c" * 64,
+            "sample_dose": 524_288,
+            "sampler_seed": 424_242,
+            "prior_rows_file_sha256": None,
+            "prior_row_set_sha256": None,
+            "kl_eligible_rows": 100_000,
+            "kl_eligible_mass_decimal": "0.190734863281",
+            "kl_ordered_evidence_sha256": "sha256:" + "d" * 64,
+            "kl_eligible_evidence_sha256": "sha256:" + "e" * 64,
+        },
+        "recovery_authority": {"authority_sha256": "sha256:" + "f" * 64},
+        "recovery_component_semantics": {"semantic": "test-recovery"},
+        "native_runtime_authority": {},
+        "native_learner_admission_receipt": {},
+        "portable_code_identity_sha256": code_sha,
+        "portable_runtime_identity_sha256": "sha256:" + "5" * 64,
+        "allocation": allocation,
+    }
+    authority["authority_sha256"] = executor._value_sha256(authority)
+    authority["state_sha256"] = executor._value_sha256(authority)
+    return authority
+
+
+def _published_authority(tmp_path: Path, authority: dict) -> dict:
+    path = (tmp_path / "p1-15-k3-executor-authority.json").resolve()
+    path.write_text(json.dumps(authority, sort_keys=True) + "\n", encoding="utf-8")
+    path.chmod(0o444)
+    return {
+        "schema_version": executor.aux_coordinator.PUBLISHED_EXECUTOR_AUTHORITY_SCHEMA,
+        "path": str(path),
+        "file_sha256": executor._file_sha256(path),
+        "authority": authority,
+    }
+
+
+def test_central_p1_binds_exact_current_parent_sampler_and_mixed_transition(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    verified = _verified(tmp_path)
+    verified.update(
+        {
+            "data_kind": "production_composite_v2",
+            "production_sampling_receipt_sha256": "sha256:" + "6" * 64,
+            "validation_split_receipt_sha256": "sha256:" + "7" * 64,
+            "reviewed_lock_file_sha256": verified["lock_file_sha256"],
+        }
+    )
+    train_path = Path(executor.train_bc.__file__).resolve()
+    code_binding = {
+        "records": [
+            {
+                "kind": "learner_code",
+                "relative_path": "tools/train_bc.py",
+                "path": str(train_path),
+                "sha256": executor._file_sha256(train_path),
+            }
+        ]
+    }
+    code_binding["code_tree_sha256"] = executor._value_sha256(code_binding)
+    code_sha = code_binding["code_tree_sha256"]
+    authority = _p1_executor_authority(verified, code_sha=code_sha)
+    published = _published_authority(tmp_path, authority)
+    monkeypatch.setattr(
+        executor.aux_coordinator,
+        "verify_current_parent_authority",
+        lambda value, **_kwargs: value,
+    )
+    monkeypatch.setattr(
+        executor.aux_coordinator,
+        "recovery_component_semantics",
+        lambda _value, _semantics: authority["recovery_component_semantics"],
+    )
+    monkeypatch.setattr(
+        executor.aux_coordinator,
+        "verify_published_executor_authority",
+        lambda _path: published,
+    )
+    monkeypatch.setattr(
+        executor.aux_coordinator, "_verify_composite", lambda value: value
+    )
+    monkeypatch.setattr(
+        executor.aux_coordinator, "verify_allocation", lambda value: value
+    )
+    monkeypatch.setattr(
+        executor,
+        "_current_ablation_code_binding",
+        lambda _lock: code_binding,
+    )
+    bound = executor.bind_p1_arm(
+        verified,
+        authority=authority,
+        published_executor_authority=published,
+        reviewed_code_tree_sha256=code_sha,
+    )
+    assert bound["recipe"]["sampler_seed"] == 424242
+    assert bound["learner_ablation"]["diagnostic_only"] is True
+    assert bound["learner_ablation"]["promotion_eligible"] is False
+    assert (
+        bound["learner_ablation"]["promotion_block_reason"]
+        == "requires_independent_final_replication"
+    )
+    command = executor._build_direct_train_command(
+        bound,
+        python=Path(sys.executable),
+        checkpoint=tmp_path / "p1.pt",
+        report=tmp_path / "p1.json",
+    )
+    assert _option(command, "--sampler-seed") == "424242"
+    assert _option(command, "--public-award-feature-contract") == "authoritative_v1"
+    assert command.count("--allow-mixed-public-award-feature-contracts") == 1
+    assert command.count("--no-resume-optimizer") == 1
+    assert command.count("--a1-central-learner-binding-json") == 1
+    assert "--a1-learner-ablation-id" not in command
+    args = executor.train_bc.build_parser().parse_args(command[2:])
+    args.init_checkpoint_sha256 = executor._file_sha256(
+        Path(args.init_checkpoint)
+    )
+    train_bound = {
+        "learner_training_recipe": dict(
+            executor.a1_contract.EXPECTED_LEARNER_TRAINING_RECIPE
+        ),
+        "learner_training_recipe_sha256": executor._value_sha256(
+            executor.a1_contract.EXPECTED_LEARNER_TRAINING_RECIPE
+        ),
+    }
+    effective = executor.train_bc._validate_a1_learner_training_recipe(
+        args,
+        {"world_size": 8, "rank": 0, "local_rank": 0, "enabled": True},
+        train_bound,
+    )
+    assert effective == bound["recipe"]
+    assert train_bound["central_learner_binding"]["stage"] == "P1"
+    assert train_bound["learner_ablation"] is None
+
+
+def test_central_p1_rejects_candidate_chaining_and_sampler_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    verified = _verified(tmp_path)
+    verified.update(
+        {
+            "data_kind": "production_composite_v2",
+            "production_sampling_receipt_sha256": "sha256:" + "6" * 64,
+            "validation_split_receipt_sha256": "sha256:" + "7" * 64,
+            "reviewed_lock_file_sha256": verified["lock_file_sha256"],
+        }
+    )
+    code_sha = "sha256:" + "8" * 64
+    authority = _p1_executor_authority(verified, code_sha=code_sha)
+    published = _published_authority(tmp_path, authority)
+    monkeypatch.setattr(
+        executor.aux_coordinator,
+        "verify_current_parent_authority",
+        lambda value, **_kwargs: value,
+    )
+    monkeypatch.setattr(
+        executor.aux_coordinator,
+        "recovery_component_semantics",
+        lambda _value, _semantics: authority["recovery_component_semantics"],
+    )
+    monkeypatch.setattr(
+        executor.aux_coordinator, "_verify_composite", lambda value: value
+    )
+    monkeypatch.setattr(
+        executor.aux_coordinator, "verify_allocation", lambda value: value
+    )
+    monkeypatch.setattr(
+        executor,
+        "_current_ablation_code_binding",
+        lambda _lock: {"code_tree_sha256": code_sha, "records": []},
+    )
+
+    chained = dict(verified)
+    chained["producer"] = {**verified["producer"], "sha256": "sha256:" + "9" * 64}
+    with pytest.raises(executor.ExecutorError, match="exact current promoted parent"):
+        executor.bind_p1_arm(
+            chained,
+            authority=authority,
+            published_executor_authority=published,
+            reviewed_code_tree_sha256=code_sha,
+        )
+
+    drifted = json.loads(json.dumps(authority))
+    drifted["arm"]["effective_recipe"]["sampler_seed"] = 424244
+    drifted["arm"]["effective_recipe_sha256"] = executor._value_sha256(
+        drifted["arm"]["effective_recipe"]
+    )
+    drifted["arm_claim"]["arm"] = drifted["arm"]
+    unsigned = dict(drifted)
+    unsigned.pop("state_sha256")
+    unsigned.pop("authority_sha256")
+    drifted["authority_sha256"] = executor._value_sha256(unsigned)
+    state_unsigned = dict(drifted)
+    state_unsigned.pop("state_sha256")
+    drifted["state_sha256"] = executor._value_sha256(state_unsigned)
+    with pytest.raises(executor.ExecutorError, match="exact FP32"):
+        executor.bind_p1_arm(
+            verified,
+            authority=drifted,
+            published_executor_authority=published,
+            reviewed_code_tree_sha256=code_sha,
+        )
 
 
 def test_report_binding_seals_exact_base_value_and_policy_doses(
@@ -1445,7 +1968,9 @@ def test_execute_writes_atomic_success_receipt_and_never_resumes(
         checkpoint.parent.mkdir(parents=True, exist_ok=True)
         checkpoint.write_bytes(b"candidate")
         Path(str(checkpoint) + ".optimizer.pt").write_bytes(b"fresh adam state")
-        report.write_text(json.dumps(_training_report(verified, checkpoint)))
+        payload = _training_report(verified, checkpoint)
+        report.write_text(json.dumps(payload))
+        _write_training_progress(checkpoint, payload)
         return subprocess.CompletedProcess(command_arg, 0)
 
     result = executor.execute(
@@ -1802,7 +2327,9 @@ def test_contract_claim_blocks_a_second_receipt_and_output_set(tmp_path: Path) -
             checkpoint.parent.mkdir(parents=True, exist_ok=True)
             checkpoint.write_bytes(b"candidate")
             Path(str(checkpoint) + ".optimizer.pt").write_bytes(b"optimizer")
-            report.write_text(json.dumps(_training_report(verified, checkpoint)))
+            payload = _training_report(verified, checkpoint)
+            report.write_text(json.dumps(payload))
+            _write_training_progress(checkpoint, payload)
             return subprocess.CompletedProcess(command_arg, 0)
 
         executor.execute(
@@ -1839,7 +2366,9 @@ def test_receipt_publication_failure_leaves_terminal_complete_claim(
         checkpoint.parent.mkdir(parents=True, exist_ok=True)
         checkpoint.write_bytes(b"candidate")
         Path(str(checkpoint) + ".optimizer.pt").write_bytes(b"optimizer")
-        report.write_text(json.dumps(_training_report(verified, checkpoint)))
+        payload = _training_report(verified, checkpoint)
+        report.write_text(json.dumps(payload))
+        _write_training_progress(checkpoint, payload)
         return subprocess.CompletedProcess(command_arg, 0)
 
     monkeypatch.setattr(
@@ -1940,6 +2469,7 @@ def test_output_report_must_semantically_prove_the_sealed_dose(
     payload = _training_report(verified, checkpoint)
     payload[field] = bad_value
     report.write_text(json.dumps(payload))
+    _write_training_progress(checkpoint, payload)
     command = [sys.executable, "train_bc.py"]
     execution_binding = executor._execution_binding(
         command=command, environment=executor._child_environment(0)
@@ -1983,7 +2513,9 @@ def test_report_binding_rejects_child_spoof_and_verifier_rejects_drift(
             execution_binding=binding,
         )
 
-    report.write_text(json.dumps(_training_report(verified, checkpoint)))
+    payload = _training_report(verified, checkpoint)
+    report.write_text(json.dumps(payload))
+    _write_training_progress(checkpoint, payload)
     executor._bind_training_report(
         report,
         verified=verified,

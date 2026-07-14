@@ -1,6 +1,6 @@
 {
   "schema_version": "a1-pre-wave-contract-draft-v3",
-  "contract_id": "a1-v5-infoset-n128-p4-12000games-64gpu",
+  "contract_id": "__UNRESOLVED__",
   "promotion_handoff": {
     "mode": "post_promotion",
     "path": "__UNRESOLVED__"
@@ -146,7 +146,7 @@
     {
       "id": "winning_teacher",
       "role": "producer",
-      "path": "/home/ubuntu/catan-zero-production/runs/learner/a1-production-l1-one-dose-20260712-r3/candidate.pt",
+      "path": "__UNRESOLVED__",
       "legacy_scalar_readout_attestation": null
     },
     {
