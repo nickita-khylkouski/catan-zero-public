@@ -8,6 +8,7 @@ import pytest
 from tools import a1_build_post_wave_composite as composite
 from tools import a1_pre_wave_contract as contract
 from tools import search_operator_binding as binding
+from tools import train_bc
 
 
 def _sha(path: Path) -> str:
@@ -180,6 +181,48 @@ def test_mix_and_selected_game_require_exact_recovery_semantic(
     assert selected == {"recent-job": {100}}
     assert owners == {100: ("recent-job", "recent_history")}
     assert normalized == [accepted]
+
+
+def test_trainer_derives_selected_semantics_from_authenticated_records(
+    tmp_path: Path,
+) -> None:
+    lock = _minimal_lock(tmp_path)
+    semantics = lock["category_semantics"]
+    selected = {
+        "records": [
+            {
+                "category": category,
+                "category_semantic": semantic,
+            }
+            for category, semantic in semantics.items()
+        ]
+    }
+    audit = {
+        "category_semantics": semantics,
+        "source_provenance": {
+            category: {"category_semantic": semantic}
+            for category, semantic in semantics.items()
+        },
+    }
+
+    assert train_bc._require_exact_flywheel_category_semantics(  # noqa: SLF001
+        authority={"category_semantics": semantics},
+        contract={"category_semantics": semantics},
+        selected=selected,
+        audit=audit,
+    ) == semantics
+
+    selected["records"][1]["category_semantic"] = {
+        **selected["records"][1]["category_semantic"],
+        "semantic": "recent_history",
+    }
+    with pytest.raises(SystemExit, match="selected-game manifest recent-history"):
+        train_bc._require_exact_flywheel_category_semantics(  # noqa: SLF001
+            authority={"category_semantics": semantics},
+            contract={"category_semantics": semantics},
+            selected=selected,
+            audit=audit,
+        )
 
 
 def test_fresh_source_binding_rejects_semantic_stripping_or_laundering(

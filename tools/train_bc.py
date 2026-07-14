@@ -2647,10 +2647,38 @@ def _require_exact_flywheel_category_semantics(
 ) -> dict[str, object] | None:
     """Join all semantic surfaces, preserving absence for old contracts."""
 
+    selected_semantics = selected.get("category_semantics")
+    selected_records = selected.get("records")
+    if selected_semantics is None and isinstance(selected_records, list):
+        # The sealed post-wave selector binds the semantic object on every game
+        # record instead of duplicating it at the top level.  Reconstruct the
+        # redundant surface only when every record supplies one unambiguous
+        # value; the record digest authenticates these bytes.
+        derived: dict[str, object] = {}
+        for index, record in enumerate(selected_records):
+            category = record.get("category") if isinstance(record, dict) else None
+            semantic = (
+                record.get("category_semantic")
+                if isinstance(record, dict)
+                else None
+            )
+            if category not in _FLYWHEEL_FRESH_CATEGORY_IDS or not isinstance(
+                semantic, dict
+            ):
+                raise SystemExit(
+                    f"selected-game record {index} category semantic was stripped or swapped"
+                )
+            previous = derived.setdefault(str(category), semantic)
+            if previous != semantic:
+                raise SystemExit(
+                    f"selected-game record {index} category semantic was stripped or swapped"
+                )
+        selected_semantics = derived
+
     surfaces = {
         "source authority": authority.get("category_semantics"),
         "current contract": contract.get("category_semantics"),
-        "selected-game manifest": selected.get("category_semantics"),
+        "selected-game manifest": selected_semantics,
         "post-wave audit": audit.get("category_semantics"),
     }
     if all(value is None for value in surfaces.values()):
@@ -2665,7 +2693,6 @@ def _require_exact_flywheel_category_semantics(
         elif checked != canonical:
             raise SystemExit("flywheel category semantics differ across authority surfaces")
     assert canonical is not None
-    selected_records = selected.get("records")
     if not isinstance(selected_records, list) or not selected_records:
         raise SystemExit("selected-game manifest has no semantic record evidence")
     for index, record in enumerate(selected_records):
