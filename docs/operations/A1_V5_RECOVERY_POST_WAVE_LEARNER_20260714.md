@@ -315,6 +315,34 @@ export EVAL_MANIFEST=$GATE/fleet64.eval-source-${EVAL_COMMIT:0:12}.json
   --out "$EVAL_MANIFEST" \
   --go
 
+wait_eval_phase() {
+  local plan="$1"
+  local phase="$2"
+  local status state
+  while true; do
+    status=$("$PY" "$EVAL_CTL" --manifest "$EVAL_MANIFEST" status \
+      --plan "$plan" --phase "$phase")
+    echo "$status"
+    state=$("$PY" -c '
+import json, sys
+x = json.load(sys.stdin)
+c = x["counts"]
+if any(c[name] for name in ("failed", "stale", "missing", "unsafe")):
+    print("failed")
+elif c["done"] == len(x["jobs"]):
+    print("done")
+else:
+    print("active")
+' <<<"$status")
+    case "$state" in
+      done) return 0 ;;
+      failed) echo "evaluation phase $phase failed" >&2; return 1 ;;
+      active) sleep 10 ;;
+      *) echo "unknown evaluation state: $state" >&2; return 1 ;;
+    esac
+  done
+}
+
 # All three plans intentionally share the exact same common-random-number
 # cohort. Only the candidate checkpoint and run identity differ.
 plan_and_run_screen() {
@@ -341,6 +369,7 @@ plan_and_run_screen() {
     --plan "$plan" --phase internal --dry-run
   "$PY" "$EVAL_CTL" --manifest "$EVAL_MANIFEST" launch \
     --plan "$plan" --phase internal --go
+  wait_eval_phase "$plan" internal
   "$PY" "$EVAL_CTL" --manifest "$EVAL_MANIFEST" collect \
     --plan "$plan" --phase internal --output-dir "$collected"
 }
@@ -434,12 +463,11 @@ for phase in internal external; do
     --plan "$PARENT_PLAN" --phase "$phase" --dry-run
   "$PY" "$EVAL_CTL" --manifest "$EVAL_MANIFEST" launch \
     --plan "$PARENT_PLAN" --phase "$phase" --go
+  wait_eval_phase "$PARENT_PLAN" "$phase"
+  "$PY" "$EVAL_CTL" --manifest "$EVAL_MANIFEST" collect \
+    --plan "$PARENT_PLAN" --phase "$phase" \
+    --output-dir "$GATE/exact-v5-collected"
 done
-
-"$PY" "$EVAL_CTL" --manifest "$EVAL_MANIFEST" collect \
-  --plan "$PARENT_PLAN" --phase internal --output-dir "$GATE/exact-v5-collected"
-"$PY" "$EVAL_CTL" --manifest "$EVAL_MANIFEST" collect \
-  --plan "$PARENT_PLAN" --phase external --output-dir "$GATE/exact-v5-collected"
 
 "$PY" "$EVAL_CTL" --manifest "$EVAL_MANIFEST" plan \
   --candidate "$CANDIDATE" \
@@ -462,6 +490,7 @@ done
   --plan "$F7_PLAN" --phase internal --dry-run
 "$PY" "$EVAL_CTL" --manifest "$EVAL_MANIFEST" launch \
   --plan "$F7_PLAN" --phase internal --go
+wait_eval_phase "$F7_PLAN" internal
 "$PY" "$EVAL_CTL" --manifest "$EVAL_MANIFEST" collect \
   --plan "$F7_PLAN" --phase internal --output-dir "$GATE/f7-collected"
 
