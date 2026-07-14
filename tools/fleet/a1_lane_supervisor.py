@@ -782,9 +782,9 @@ def _run_job(lane: dict[str, Any], command: dict[str, Any]) -> dict[str, Any]:
         return _mark_completed(receipt_path, receipt, command)
 
 
-def run_lane(path: Path) -> dict[str, Any]:
+def run_lane(path: Path, *, wait_for_lane_lock: bool = False) -> dict[str, Any]:
     lane = load_lane(path)
-    with _lock(Path(lane["lane_lock"]), blocking=False):
+    with _lock(Path(lane["lane_lock"]), blocking=wait_for_lane_lock):
         receipts = [_run_job(lane, command) for command in lane["commands"]]
     return {"worker_id": lane["worker_id"], "status": "complete", "receipts": receipts}
 
@@ -812,9 +812,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     for name in ("run", "status"):
         item = sub.add_parser(name)
         item.add_argument("--lane", required=True, type=Path)
+        if name == "run":
+            item.add_argument(
+                "--wait-for-lane-lock",
+                action="store_true",
+                help="wait for the active lane supervisor instead of refusing immediately",
+            )
     args = parser.parse_args(argv)
     try:
-        result = run_lane(args.lane) if args.command == "run" else status_lane(args.lane)
+        result = (
+            run_lane(args.lane, wait_for_lane_lock=args.wait_for_lane_lock)
+            if args.command == "run"
+            else status_lane(args.lane)
+        )
     except SupervisorError as error:
         print(f"REFUSING: {error}", file=sys.stderr)
         return 2

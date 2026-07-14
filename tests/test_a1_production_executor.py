@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tarfile
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -1053,6 +1054,51 @@ def test_completed_receipts_are_validated_and_never_rerun(
         Path(lane["receipt_dir"], f"{command['job_id']}.json").write_text(json.dumps(receipt), encoding="utf-8")
     monkeypatch.setattr(supervisor.subprocess, "Popen", lambda *_a, **_k: pytest.fail("completed job reran"))
     assert supervisor.run_lane(lane_path)["status"] == "complete"
+
+
+@pytest.mark.parametrize("wait_for_lane_lock", [False, True])
+def test_run_lane_selects_requested_lane_lock_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    wait_for_lane_lock: bool,
+) -> None:
+    _lock_path, _render_path, _lock_payload, rendered = _fixture(tmp_path)
+    lane_path, lane = _lane(tmp_path, rendered["commands"][:3])
+    observed: list[tuple[Path, bool]] = []
+
+    @contextmanager
+    def record_lock(path: Path, *, blocking: bool):
+        observed.append((path, blocking))
+        yield
+
+    monkeypatch.setattr(supervisor, "_lock", record_lock)
+    monkeypatch.setattr(
+        supervisor,
+        "_run_job",
+        lambda _lane_payload, command: {"job_id": command["job_id"], "status": "complete"},
+    )
+
+    result = supervisor.run_lane(
+        lane_path,
+        wait_for_lane_lock=wait_for_lane_lock,
+    )
+
+    assert result["status"] == "complete"
+    assert observed == [(Path(lane["lane_lock"]), wait_for_lane_lock)]
+
+
+def test_run_cli_enables_lane_lock_wait(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    lane_path = tmp_path / "lane.json"
+    observed: list[tuple[Path, bool]] = []
+
+    def fake_run(path: Path, *, wait_for_lane_lock: bool = False) -> dict[str, str]:
+        observed.append((path, wait_for_lane_lock))
+        return {"status": "complete"}
+
+    monkeypatch.setattr(supervisor, "run_lane", fake_run)
+
+    assert supervisor.main(["run", "--lane", str(lane_path), "--wait-for-lane-lock"]) == 0
+    assert observed == [(lane_path, True)]
 
 
 def test_incomplete_lane_runs_exact_resume_sequentially(
