@@ -284,6 +284,9 @@ def derive_terminal_result(
             "policy_kl_anchor_weight_decimal": arm[
                 "policy_kl_anchor_weight_decimal"
             ],
+            "policy_kl_anchor_eligible_rows": outputs["lineage_dose"][
+                "objective_exposure"
+            ]["anchor_eligible_sampled_rows"],
             "initializer_sha256": central["initializer_sha256"],
             **common,
             "effective_recipe_sha256": arm["effective_recipe_sha256"],

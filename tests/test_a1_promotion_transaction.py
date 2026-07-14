@@ -5,6 +5,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import subprocess
 import sys
 import threading
 from pathlib import Path
@@ -171,17 +172,7 @@ def _write_matched_quick_screen(
     }
     search_sha256 = promotion._digest_value(search_configuration)
     half_points = {step: int(round(points_by_step[step] * 2)) for step in (64, 96, 128)}
-    best_half_points = max(half_points.values())
-    selected_step = min(
-        step
-        for step in (64, 96, 128)
-        if (best_half_points - half_points[step]) * 10_000
-        <= promotion.MATCHED_QUICK_SCREEN_SELECTION_RULE[
-            "max_absolute_win_rate_gap_basis_points"
-        ]
-        * 2
-        * len(ordered_game_keys)
-    )
+    selected_step = promotion._select_matched_quick_screen_step(half_points)  # noqa: SLF001
     reports: dict[int, Path] = {}
     for step in (64, 96, 128):
         wins = int(points_by_step[step])
@@ -2109,15 +2100,61 @@ def test_select_dose_builder_seals_same_trajectory_choice(tmp_path: Path) -> Non
         training_receipt_path=fixture["training_receipt"],
         training_report_path=fixture["report"],
         screen_evidence_path=screen,
-        selected_optimizer_step=64,
+        selected_optimizer_step=128,
         output_path=output,
     )
 
-    assert selection["selected_optimizer_step"] == 64
-    assert selection["selected_checkpoint"]["path"].endswith(
-        "candidate_step0064.pt"
-    )
+    assert selection["selected_optimizer_step"] == 128
+    assert selection["selected_checkpoint"]["path"] == str(fixture["candidate"])
     assert selection["file_sha256"] == promotion._sha256(output)
+
+
+def test_matched_screen_selects_maximum_score_and_only_breaks_exact_ties_early() -> None:
+    assert (
+        promotion._select_matched_quick_screen_step(  # noqa: SLF001
+            {64: 200, 96: 202, 128: 206}
+        )
+        == 128
+    )
+    assert (
+        promotion._select_matched_quick_screen_step(  # noqa: SLF001
+            {64: 200, 96: 206, 128: 206}
+        )
+        == 96
+    )
+
+
+def test_select_dose_rejects_legacy_200bp_selection_artifact(tmp_path: Path) -> None:
+    fixture = _fixture(tmp_path)
+    _receipt, modern = _modernize_one_dose_receipt(
+        fixture, world_size=8, with_intermediate=True
+    )
+    screen = tmp_path / "matched-quick-screen.json"
+    payload = _write_matched_quick_screen(
+        screen,
+        intermediate=modern["intermediate"],
+        terminal=fixture["candidate"],
+        baseline=fixture["champion"],
+        evaluation_binding=fixture["evaluation_binding"],
+        points_by_step={64: 120.0, 96: 121.0, 128: 123.0},
+    )
+    payload["schema_version"] = "a1-matched-quick-screen-v2"
+    payload["selection_rule"] = {
+        "name": "earliest-within-absolute-win-rate-of-best-v1",
+        "max_absolute_win_rate_gap_basis_points": 200,
+        "tie_break": "lowest_optimizer_step",
+    }
+    payload.pop("screen_sha256")
+    payload["screen_sha256"] = promotion._digest_value(payload)
+    _write_json(screen, payload)
+
+    with pytest.raises(promotion.PromotionError, match="policy drifted"):
+        promotion.create_same_trajectory_checkpoint_selection(
+            training_receipt_path=fixture["training_receipt"],
+            training_report_path=fixture["report"],
+            screen_evidence_path=screen,
+            output_path=tmp_path / "checkpoint-selection.json",
+        )
 
 
 def test_select_dose_derives_step_and_rejects_caller_override(tmp_path: Path) -> None:
@@ -2199,10 +2236,10 @@ def test_build_dose_screen_from_three_pooled_reports(tmp_path: Path) -> None:
         output_path=tmp_path / "operator-screen.json",
     )
 
-    assert screen["selected_optimizer_step"] == 64
-    assert screen["candidate_checkpoint_sha256"] == modern["intermediate"][0][
-        "checkpoint_sha256"
-    ]
+    assert screen["selected_optimizer_step"] == 128
+    assert screen["candidate_checkpoint_sha256"] == promotion._sha256(
+        fixture["candidate"]
+    )
     assert screen["file_sha256"] == promotion._sha256(
         tmp_path / "operator-screen.json"
     )
@@ -2295,6 +2332,101 @@ def test_internal_screen_rejects_forged_runtime_and_registry_search_identity(
             step96_report_path=reports[96],
             step128_report_path=reports[128],
             output_path=tmp_path / "search-drift-screen.json",
+        )
+
+
+def _commit_test_repo(repo: Path, message: str) -> str:
+    subprocess.run(("git", "add", "."), cwd=repo, check=True)
+    subprocess.run(
+        (
+            "git",
+            "-c",
+            "user.name=A1 test",
+            "-c",
+            "user.email=a1-test@example.invalid",
+            "commit",
+            "-q",
+            "-m",
+            message,
+        ),
+        cwd=repo,
+        check=True,
+    )
+    return subprocess.check_output(
+        ("git", "rev-parse", "HEAD"), cwd=repo, text=True
+    ).strip()
+
+
+def _test_internal_engine_identity(repo_commit: str) -> dict[str, str]:
+    return {
+        "schema_version": promotion.INTERNAL_H2H_ENGINE_IDENTITY_SCHEMA,
+        "repo_commit": repo_commit,
+        "native_wheel_sha256": "sha256:" + "1" * 64,
+        "evaluator_sha256": "sha256:" + "2" * 64,
+        "native_runtime_sha256": "sha256:" + "3" * 64,
+    }
+
+
+def test_internal_engine_identity_accepts_only_allowlisted_ancestor_diff(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    (repo / "tools").mkdir(parents=True)
+    (repo / "tools/train_bc.py").write_text("old\n", encoding="utf-8")
+    subprocess.run(("git", "init", "-q"), cwd=repo, check=True)
+    report_commit = _commit_test_repo(repo, "report evaluator")
+    (repo / "tools/train_bc.py").write_text("new\n", encoding="utf-8")
+    current_commit = _commit_test_repo(repo, "learner-only fix")
+
+    planned = _test_internal_engine_identity(report_commit)
+    canonical = _test_internal_engine_identity(current_commit)
+    monkeypatch.setattr(promotion, "_REPO_ROOT", repo)
+    monkeypatch.setattr(
+        promotion, "_canonical_internal_h2h_engine_identity", lambda: canonical
+    )
+
+    promotion._verify_internal_h2h_engine_identity(  # noqa: SLF001
+        {"planned_engine_identity": planned, "engine_identity": dict(planned)},
+        where="allowed ancestor",
+    )
+
+
+def test_internal_engine_identity_rejects_nonancestor_or_disallowed_diff(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "base.txt").write_text("base\n", encoding="utf-8")
+    subprocess.run(("git", "init", "-q"), cwd=repo, check=True)
+    report_commit = _commit_test_repo(repo, "report evaluator")
+    (repo / "unrelated.py").write_text("changes behavior\n", encoding="utf-8")
+    disallowed_commit = _commit_test_repo(repo, "unrelated change")
+
+    planned = _test_internal_engine_identity(report_commit)
+    monkeypatch.setattr(promotion, "_REPO_ROOT", repo)
+    monkeypatch.setattr(
+        promotion,
+        "_canonical_internal_h2h_engine_identity",
+        lambda: _test_internal_engine_identity(disallowed_commit),
+    )
+    with pytest.raises(promotion.PromotionError, match="non-allowlisted paths"):
+        promotion._verify_internal_h2h_engine_identity(  # noqa: SLF001
+            {"planned_engine_identity": planned, "engine_identity": dict(planned)},
+            where="disallowed ancestor",
+        )
+
+    subprocess.run(("git", "checkout", "-q", "--detach", report_commit), cwd=repo, check=True)
+    subprocess.run(("git", "checkout", "-q", "--orphan", "sibling"), cwd=repo, check=True)
+    for path in repo.iterdir():
+        if path.name != ".git" and path.is_file():
+            path.unlink()
+    (repo / "sibling.txt").write_text("sibling\n", encoding="utf-8")
+    sibling_commit = _commit_test_repo(repo, "sibling evaluator")
+    sibling = _test_internal_engine_identity(sibling_commit)
+    with pytest.raises(promotion.PromotionError, match="not an ancestor"):
+        promotion._verify_internal_h2h_engine_identity(  # noqa: SLF001
+            {"planned_engine_identity": sibling, "engine_identity": dict(sibling)},
+            where="nonancestor",
         )
 
 
@@ -3653,6 +3785,82 @@ def test_high_regret_report_cannot_launder_sealed_search_config(
     )
 
     with pytest.raises(promotion.PromotionError, match="sealed A1 semantic drift"):
+        _execute(fixture, go=False)
+
+
+def _set_high_regret_source_counts(
+    source: dict, *, ll_pairs: int, split_pairs: int, ww_pairs: int
+) -> None:
+    report_path = Path(source["report"]["path"])
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    pair_ids = sorted({int(game["pair_id"]) for game in report["games"]})
+    assert len(pair_ids) == ll_pairs + split_pairs + ww_pairs
+    outcomes = {
+        pair_id: (
+            (False, False)
+            if index < ll_pairs
+            else (True, False)
+            if index < ll_pairs + split_pairs
+            else (True, True)
+        )
+        for index, pair_id in enumerate(pair_ids)
+    }
+    for game in report["games"]:
+        first, second = outcomes[int(game["pair_id"])]
+        game["candidate_won"] = (
+            first
+            if game["orientation"] in {"candidate_first", "candidate_red"}
+            else second
+        )
+    normalized = [
+        {**game, "search_won": game["candidate_won"]}
+        for game in report["games"]
+    ]
+    scores, diagnostics = promotion.pair_scores_from_h2h_games(normalized)
+    pentanomial = promotion.evaluate_pentanomial_sprt(
+        scores, elo0=-10.0, elo1=15.0, alpha=0.05, beta=0.05
+    )
+    report["pair_diagnostics"] = diagnostics
+    report["pentanomial_sprt"] = pentanomial
+    _write_json(report_path, report)
+    source["verdict"] = pentanomial["decision"]
+    source["pair_diagnostics"] = diagnostics
+    source["pentanomial_sprt"] = pentanomial
+    source["report"]["sha256"] = promotion._sha256(report_path)
+
+
+def test_transaction_accepts_high_regret_continue_as_nonregression(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path)
+
+    def mutate(source: dict) -> None:
+        _set_high_regret_source_counts(
+            source, ll_pairs=60, split_pairs=120, ww_pairs=60
+        )
+        assert source["verdict"] == "continue"
+
+    _mutate_evidence_source(
+        fixture, kind="high_regret", role="high_regret", mutate=mutate
+    )
+
+    assert _execute(fixture, go=False)["status"] == "dry_run"
+
+
+def test_transaction_rejects_high_regret_h0_veto(tmp_path: Path) -> None:
+    fixture = _fixture(tmp_path)
+
+    def mutate(source: dict) -> None:
+        _set_high_regret_source_counts(
+            source, ll_pairs=0, split_pairs=240, ww_pairs=0
+        )
+        assert source["verdict"] == "H0"
+
+    _mutate_evidence_source(
+        fixture, kind="high_regret", role="high_regret", mutate=mutate
+    )
+
+    with pytest.raises(promotion.PromotionError, match="veto reached H0"):
         _execute(fixture, go=False)
 
 

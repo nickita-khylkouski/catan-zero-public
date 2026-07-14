@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import stat
 from pathlib import Path
 
 import numpy as np
@@ -11,6 +13,97 @@ from tools import a1_one_dose_train
 from tools import a1_pre_wave_contract as contract
 from tools import a1_seal_historical_replay_component as historical_sealer
 from catan_zero.rl.entity_feature_adapter import CURRENT_RUST_ENTITY_ADAPTER_VERSION
+
+
+def _payload_component(root: Path, component_id: str) -> dict[str, object]:
+    root.mkdir()
+    (root / "row_offsets.dat").write_bytes(f"{component_id}-offsets".encode())
+    (root / "game_seed.dat").write_bytes(f"{component_id}-seeds".encode())
+    inventory = [
+        {
+            "filename": path.name,
+            "size_bytes": path.stat().st_size,
+            "sha256": "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest(),
+        }
+        for path in sorted(root.glob("*.dat"))
+    ]
+    meta = {
+        "columns": {"game_seed": {"kind": "fixed"}},
+        "payload_inventory_schema": builder.train_bc.MEMMAP_PAYLOAD_INVENTORY_SCHEMA,
+        "payload_inventory": inventory,
+        "payload_inventory_sha256": builder.train_bc._canonical_json_sha256(  # noqa: SLF001
+            inventory
+        ),
+    }
+    meta_path = root / "corpus_meta.json"
+    meta_path.write_text(json.dumps(meta), encoding="utf-8")
+    return {
+        "component_id": component_id,
+        "corpus_dir": str(root.resolve()),
+        "corpus_meta_sha256": builder._file_sha256(meta_path),  # noqa: SLF001
+        "payload_inventory_sha256": meta["payload_inventory_sha256"],
+    }
+
+
+def test_payload_finalization_preserves_bindings_and_enables_auth_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    components = [
+        _payload_component(tmp_path / "fresh", "current_producer"),
+        _payload_component(tmp_path / "recent", "recent_history"),
+        _payload_component(tmp_path / "hard", "hard_negative"),
+        _payload_component(tmp_path / "replay", "historical_replay"),
+    ]
+    before_components = json.loads(json.dumps(components))
+    before_meta = {
+        component["component_id"]: (
+            Path(str(component["corpus_dir"])) / "corpus_meta.json"
+        ).read_bytes()
+        for component in components
+    }
+    before_payloads = {
+        path: hashlib.sha256(path.read_bytes()).hexdigest()
+        for component in components
+        for path in Path(str(component["corpus_dir"])).glob("*.dat")
+    }
+    monkeypatch.setenv(
+        "TRAIN_BC_PAYLOAD_AUTH_CACHE_DIR", str(tmp_path / "payload-auth-cache")
+    )
+
+    builder._finalize_component_payloads_read_only(components)  # noqa: SLF001
+
+    assert components == before_components
+    assert {
+        component["component_id"]: (
+            Path(str(component["corpus_dir"])) / "corpus_meta.json"
+        ).read_bytes()
+        for component in components
+    } == before_meta
+    assert {
+        path: hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in before_payloads
+    } == before_payloads
+    assert all(
+        stat.S_IMODE(path.stat().st_mode) == 0o444 for path in before_payloads
+    )
+    first_events = [
+        json.loads(line) for line in capsys.readouterr().out.splitlines()
+    ]
+    assert [event["status"] for event in first_events] == ["miss"] * 4
+    assert all(event["cache_eligible"] is True for event in first_events)
+
+    for component in components:
+        corpus_dir = Path(str(component["corpus_dir"]))
+        meta = json.loads((corpus_dir / "corpus_meta.json").read_text())
+        builder.train_bc._validate_memmap_payload_inventory(  # noqa: SLF001
+            corpus_dir, meta
+        )
+    reuse_events = [
+        json.loads(line) for line in capsys.readouterr().out.splitlines()
+    ]
+    assert [event["status"] for event in reuse_events] == ["hit"] * 4
 
 
 def _lock(tmp_path: Path) -> dict:

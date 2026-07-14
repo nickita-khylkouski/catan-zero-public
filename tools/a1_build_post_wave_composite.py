@@ -23,6 +23,7 @@ import hashlib
 import json
 import os
 import shutil
+import stat
 import sys
 import uuid
 from collections import Counter, defaultdict
@@ -361,6 +362,180 @@ def _prepare_output_root(path: Path) -> Path:
     if root.resolve(strict=True) != root:
         raise CompositeBuildError(f"output root is not canonical: {root}")
     return root
+
+
+def _finalize_component_payloads_read_only(
+    components: Sequence[Mapping[str, Any]],
+) -> None:
+    """Seal every inventory payload before publishing the composite descriptor.
+
+    The descriptor is the composite's atomic publication boundary.  Keep it
+    absent until every referenced memmap payload has been opened without
+    following symlinks, changed to exactly ``0444`` through that open inode,
+    durably synced, and re-authenticated against the existing byte inventory.
+    Chmod does not alter corpus metadata or payload bytes, so all pre-existing
+    hashes and descriptor semantics remain unchanged.  Holding every file
+    descriptor through the final hash pass also makes pathname replacement a
+    hard failure rather than accidentally sealing a different inode.
+
+    A failed seal may leave an incomplete build tree containing read-only
+    payloads, but it can never publish ``memmap_composite.json``.  This is the
+    intended fail-closed state; the builder already refuses to reuse a nonempty
+    output root.
+    """
+
+    opened: list[tuple[str, Path, int, tuple[int, int, int]]] = []
+    corpora: list[tuple[str, Path, Path, dict[str, Any], str]] = []
+    seen_roots: set[Path] = set()
+    try:
+        for component in components:
+            component_id = str(component.get("component_id", ""))
+            try:
+                corpus_dir = Path(str(component["corpus_dir"])).resolve(strict=True)
+            except (KeyError, OSError) as error:
+                raise CompositeBuildError(
+                    f"cannot resolve {component_id or 'unnamed'} payload corpus: {error}"
+                ) from error
+            if not component_id or corpus_dir in seen_roots:
+                raise CompositeBuildError("component payload corpus identity is ambiguous")
+            seen_roots.add(corpus_dir)
+
+            meta_path = corpus_dir / "corpus_meta.json"
+            meta = _load_json(meta_path)
+            meta_sha = _file_sha256(meta_path)
+            inventory = meta.get("payload_inventory")
+            if (
+                meta_sha != component.get("corpus_meta_sha256")
+                or not isinstance(inventory, list)
+                or not inventory
+                or train_bc._canonical_json_sha256(inventory)  # noqa: SLF001
+                != meta.get("payload_inventory_sha256")
+                or meta.get("payload_inventory_sha256")
+                != component.get("payload_inventory_sha256")
+            ):
+                raise CompositeBuildError(
+                    f"{component_id} payload inventory binding drift"
+                )
+            try:
+                expected_names = sorted(
+                    train_bc._expected_memmap_payload_filenames(meta)  # noqa: SLF001
+                )
+            except SystemExit as error:
+                raise CompositeBuildError(
+                    f"{component_id} payload schema is not finalizable: {error}"
+                ) from error
+            inventory_names = [
+                record.get("filename") if isinstance(record, Mapping) else None
+                for record in inventory
+            ]
+            if inventory_names != expected_names or any(
+                not isinstance(name, str) or Path(name).name != name
+                for name in inventory_names
+            ):
+                raise CompositeBuildError(
+                    f"{component_id} payload inventory differs from its column schema"
+                )
+
+            for filename in expected_names:
+                path = corpus_dir / filename
+                descriptor = -1
+                try:
+                    path_stat = path.lstat()
+                    if stat.S_ISLNK(path_stat.st_mode) or not stat.S_ISREG(
+                        path_stat.st_mode
+                    ):
+                        raise OSError("not a non-symlink regular file")
+                    descriptor = os.open(
+                        path,
+                        os.O_RDONLY
+                        | getattr(os, "O_CLOEXEC", 0)
+                        | getattr(os, "O_NOFOLLOW", 0),
+                    )
+                    opened_stat = os.fstat(descriptor)
+                except OSError as error:
+                    if descriptor >= 0:
+                        os.close(descriptor)
+                    raise CompositeBuildError(
+                        f"cannot bind {component_id} payload {path}: {error}"
+                    ) from error
+                identity = (
+                    int(opened_stat.st_dev),
+                    int(opened_stat.st_ino),
+                    int(opened_stat.st_size),
+                )
+                if identity != (
+                    int(path_stat.st_dev),
+                    int(path_stat.st_ino),
+                    int(path_stat.st_size),
+                ):
+                    os.close(descriptor)
+                    raise CompositeBuildError(
+                        f"{component_id} payload changed while opening: {path}"
+                    )
+                opened.append((component_id, path, descriptor, identity))
+            corpora.append((component_id, corpus_dir, meta_path, meta, meta_sha))
+
+        errors: list[str] = []
+        for component_id, path, descriptor, _identity in opened:
+            try:
+                os.fchmod(descriptor, 0o444)
+                os.fsync(descriptor)
+            except OSError as error:
+                # Attempt every sibling even after one failure; no descriptor
+                # is published unless the complete set succeeds.
+                errors.append(f"{component_id}:{path.name}: {error}")
+        if errors:
+            raise CompositeBuildError(
+                "payload read-only finalization failed: " + "; ".join(errors)
+            )
+
+        for component_id, corpus_dir, meta_path, meta, meta_sha in corpora:
+            try:
+                authenticated = train_bc._validate_memmap_payload_inventory(  # noqa: SLF001
+                    corpus_dir, meta
+                )
+            except (OSError, SystemExit, ValueError) as error:
+                raise CompositeBuildError(
+                    f"{component_id} finalized payload authentication failed: {error}"
+                ) from error
+            if (
+                authenticated != meta["payload_inventory_sha256"]
+                or _file_sha256(meta_path) != meta_sha
+            ):
+                raise CompositeBuildError(
+                    f"{component_id} payload finalization changed bound bytes"
+                )
+
+        # Authentication re-opened the pathnames. Match them back to the
+        # still-open inodes and exact final mode before publishing a descriptor.
+        for component_id, path, descriptor, identity in opened:
+            opened_stat = os.fstat(descriptor)
+            path_stat = path.lstat()
+            if (
+                (
+                    int(opened_stat.st_dev),
+                    int(opened_stat.st_ino),
+                    int(opened_stat.st_size),
+                )
+                != identity
+                or (
+                    int(path_stat.st_dev),
+                    int(path_stat.st_ino),
+                    int(path_stat.st_size),
+                )
+                != identity
+                or stat.S_IMODE(opened_stat.st_mode) != 0o444
+                or stat.S_IMODE(path_stat.st_mode) != 0o444
+            ):
+                raise CompositeBuildError(
+                    f"{component_id} payload did not finalize read-only: {path}"
+                )
+    finally:
+        for _component_id, _path, descriptor, _identity in opened:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
 
 
 def _validated_wave_inputs(
@@ -1640,6 +1815,11 @@ def build_post_wave_composite(
         source_authority=source_authority,
         category_semantics=lock.get("category_semantics"),
     )
+    # This is the last mutation before the descriptor's atomic publication.
+    # Sealing all four component payload inventories here makes the builder's
+    # own descriptor preflight publish an authenticated identity cache, so the
+    # one-dose trainer can reuse it instead of rehashing every payload byte.
+    _finalize_component_payloads_read_only(components)
     descriptor_path = root / "memmap_composite.json"
     _atomic_json(descriptor_path, descriptor)
     try:

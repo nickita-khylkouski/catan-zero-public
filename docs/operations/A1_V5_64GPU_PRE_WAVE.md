@@ -92,10 +92,13 @@ rank-offset PyTorch RNG. The exact production replay mix is 64% current, 12%
 recent history, 4% hard negative, and 20% historical replay. Validation is a
 deterministic 5% whole-game split within every component and acceptance uses
 the matching component-weighted objective, not a raw concatenated-row mean.
-Only the three fresh n128 components supply policy/value/auxiliary targets.
-Historical replay is behavior-anchor-only: forward `KL(prior || candidate)` at
-conditional coefficient `0.006`, with stale replay policy CE and
-policy-conditional return/value supervision disabled.
+The post-wave learner handoff supersedes the provisional replay-objective prose
+that originally lived here. The selected TEMP control trains policy and value
+on all four components, keeps auxiliary targets fresh-only, and uses no replay
+KL anchor (`0.0`). The exact executable authority is
+`docs/operations/A1_V5_RECOVERY_POST_WAVE_LEARNER_20260714.md`; fresh-only
+policy, fresh-only value, and replay KL remain separate causal treatments and
+must not be silently composed into this baseline.
 
 `tools/a1_one_dose_train.py` retains the historical one-GPU B200 path and also
 supports one eight-GPU B200 host at local batch 512 per rank. Both realize the

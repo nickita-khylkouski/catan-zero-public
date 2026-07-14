@@ -25,6 +25,7 @@ import json
 import os
 import re
 import stat
+import subprocess
 import sys
 import threading
 import time
@@ -64,11 +65,12 @@ ADJUDICATION_SCHEMA = "a1-promotion-adjudication-v2"
 PREVIOUS_ADJUDICATION_SCHEMA = "a1-promotion-adjudication-v1"
 BRANCH_CHALLENGE_ADJUDICATION_SCHEMA = "a1-branch-challenge-adjudication-v1"
 CHECKPOINT_SELECTION_SCHEMA = "a1-same-trajectory-checkpoint-selection-v3"
-MATCHED_QUICK_SCREEN_SCHEMA = "a1-matched-quick-screen-v2"
+MATCHED_QUICK_SCREEN_SCHEMA = "a1-matched-quick-screen-v3"
 MATCHED_QUICK_SCREEN_SELECTION_RULE = {
-    "name": "earliest-within-absolute-win-rate-of-best-v1",
-    "max_absolute_win_rate_gap_basis_points": 200,
-    "tie_break": "lowest_optimizer_step",
+    "schema_version": "a1-matched-quick-screen-selection-rule-v2",
+    "name": "maximum-matched-candidate-score-v2",
+    "score": "candidate_half_points",
+    "tie_break": "lowest_optimizer_step_on_exact_tie",
 }
 INTERMEDIATE_CHECKPOINT_SCHEMA = "train-bc-intermediate-checkpoint-v1"
 CHECKPOINT_SELECTION_STEPS = (64, 96, 128)
@@ -89,6 +91,17 @@ BUCKET_VETO_SCHEMA = "a1-bucket-veto-v1"
 HIGH_REGRET_REPORT_SCHEMA = "a1-held-out-high-regret-report-v1"
 HIGH_REGRET_ENGINE_IDENTITY_SCHEMA = "a1-high-regret-engine-identity-v1"
 INTERNAL_H2H_ENGINE_IDENTITY_SCHEMA = "a1-internal-h2h-engine-identity-v1"
+INTERNAL_H2H_ANCESTOR_NON_ENGINE_ALLOWLIST = frozenset(
+    {
+        "docs/operations/A1_V5_RECOVERY_POST_WAVE_LEARNER_20260714.md",
+        "tests/test_a1_one_dose_train.py",
+        "tests/test_a1_promotion_transaction.py",
+        "tests/test_train_bc_a1_preflight_coordination.py",
+        "tools/a1_one_dose_train.py",
+        "tools/a1_promotion_transaction.py",
+        "tools/train_bc.py",
+    }
+)
 ARCHIVED_STATE_RECONSTRUCTION_SCHEMA = "a1-archived-state-reconstruction-v1"
 HIGH_REGRET_SUITE_SCHEMA = SUITE_SCHEMA
 BUCKET_GAME_REPORT_SCHEMA = "a1-bucket-game-report-v1"
@@ -117,6 +130,7 @@ MAX_CALIBRATION_RMSE_REGRESSION = 0.02
 MAX_EXTERNAL_WIN_RATE_REGRESSION = 0.02
 SUPERIORITY_ELO0 = 0.0
 SUPERIORITY_ELO1 = 15.0
+NON_REGRESSION_VETO_PASSING_DECISIONS = frozenset({"continue", "H1"})
 INTERNAL_STRENGTH_RESULT = {
     "regression_protection_verdict": "H1",
     "superiority_verdict": "H1",
@@ -1857,6 +1871,34 @@ def _verify_matched_quick_screen_report(
     }
 
 
+def _select_matched_quick_screen_step(
+    half_points_by_step: Mapping[int, int],
+) -> int:
+    """Select the highest matched-cohort score, preferring earlier exact ties.
+
+    The previous 200-basis-point indifference band was nearly the entire
+    +15-Elo promotion target around a 50% win rate.  It could therefore route
+    the disjoint full gate to an earlier checkpoint that was materially weaker
+    than the best observed checkpoint.  The independent full gate already
+    protects against winner's curse, so the selection screen should preserve
+    the strongest observed score rather than deliberately discarding it.
+    """
+
+    if set(half_points_by_step) != set(CHECKPOINT_SELECTION_STEPS):
+        raise PromotionError("matched quick-screen score set drifted")
+    if any(
+        isinstance(score, bool) or not isinstance(score, int) or score < 0
+        for score in half_points_by_step.values()
+    ):
+        raise PromotionError("matched quick-screen scores must be non-negative integers")
+    best_half_points = max(half_points_by_step.values())
+    return min(
+        step
+        for step in CHECKPOINT_SELECTION_STEPS
+        if half_points_by_step[step] == best_half_points
+    )
+
+
 def _verify_matched_quick_screen(
     path: Path,
     *,
@@ -2065,17 +2107,7 @@ def _verify_matched_quick_screen(
             {**result, "evaluation_report": {**report_ref, "path": str(report_path)}}
         )
 
-    best_half_points = max(half_points_by_step.values())
-    max_gap_basis_points = MATCHED_QUICK_SCREEN_SELECTION_RULE[
-        "max_absolute_win_rate_gap_basis_points"
-    ]
-    game_count = len(ordered_keys)
-    selected_step = min(
-        step
-        for step in CHECKPOINT_SELECTION_STEPS
-        if (best_half_points - half_points_by_step[step]) * 10_000
-        <= max_gap_basis_points * 2 * game_count
-    )
+    selected_step = _select_matched_quick_screen_step(half_points_by_step)
     selected_sha256 = _validate_sha256(
         value["candidate_checkpoint_sha256"],
         where="matched quick-screen.candidate_checkpoint_sha256",
@@ -4503,8 +4535,6 @@ def _canonical_internal_h2h_engine_identity() -> dict[str, str]:
     """Return the evaluator identity promotion trusts in this checkout."""
 
     try:
-        import subprocess
-
         commit = subprocess.check_output(
             ("git", "rev-parse", "HEAD"), cwd=_REPO_ROOT, text=True
         ).strip()
@@ -4551,6 +4581,66 @@ def _canonical_internal_h2h_engine_identity() -> dict[str, str]:
     }
 
 
+def _internal_h2h_ancestor_diff_paths(
+    report_commit: str,
+    current_commit: str,
+) -> frozenset[str]:
+    """Return changed paths for a verified report-commit ancestor.
+
+    Historical internal results are reusable only across the exact recovery
+    changes that cannot affect game execution.  The engine binaries and
+    evaluator are bound separately by hashes; this ancestry check additionally
+    prevents an unrelated old commit from claiming those identities.
+    """
+
+    for commit, label in (
+        (report_commit, "report"),
+        (current_commit, "canonical"),
+    ):
+        if not isinstance(commit, str) or re.fullmatch(r"[0-9a-f]{40}", commit) is None:
+            raise PromotionError(f"internal evaluator {label} commit is malformed")
+    try:
+        ancestor = subprocess.run(
+            ("git", "merge-base", "--is-ancestor", report_commit, current_commit),
+            cwd=_REPO_ROOT,
+            capture_output=True,
+            check=False,
+        )
+    except OSError as error:
+        raise PromotionError("cannot verify internal evaluator ancestry") from error
+    if ancestor.returncode != 0:
+        raise PromotionError(
+            "planned internal evaluator commit is not an ancestor of canonical HEAD"
+        )
+    try:
+        changed = subprocess.run(
+            (
+                "git",
+                "diff",
+                "--name-only",
+                "--no-renames",
+                "-z",
+                f"{report_commit}..{current_commit}",
+                "--",
+            ),
+            cwd=_REPO_ROOT,
+            capture_output=True,
+            check=False,
+        )
+    except OSError as error:
+        raise PromotionError("cannot inspect internal evaluator ancestor diff") from error
+    if changed.returncode != 0:
+        raise PromotionError("cannot inspect internal evaluator ancestor diff")
+    try:
+        return frozenset(
+            raw.decode("utf-8", errors="strict")
+            for raw in changed.stdout.split(b"\0")
+            if raw
+        )
+    except UnicodeError as error:
+        raise PromotionError("internal evaluator ancestor diff is not UTF-8") from error
+
+
 def _verify_internal_h2h_engine_identity(
     payload: Mapping[str, Any], *, where: str
 ) -> None:
@@ -4576,15 +4666,32 @@ def _verify_internal_h2h_engine_identity(
         },
         where=f"{where}.engine_identity",
     )
-    expected = _canonical_internal_h2h_engine_identity()
-    if planned != expected:
-        raise PromotionError(f"{where} planned internal evaluator is not canonical")
     if runtime != planned:
         raise PromotionError(
             f"{where} runtime internal evaluator differs from its plan"
         )
     for key in ("native_wheel_sha256", "evaluator_sha256", "native_runtime_sha256"):
         _validate_sha256(runtime[key], where=f"{where}.engine_identity.{key}")
+    expected = _canonical_internal_h2h_engine_identity()
+    identity_keys = (
+        "schema_version",
+        "native_wheel_sha256",
+        "evaluator_sha256",
+        "native_runtime_sha256",
+    )
+    if any(planned[key] != expected[key] for key in identity_keys):
+        raise PromotionError(f"{where} planned internal evaluator is not canonical")
+    report_commit = planned["repo_commit"]
+    current_commit = expected["repo_commit"]
+    if report_commit == current_commit:
+        return
+    changed_paths = _internal_h2h_ancestor_diff_paths(report_commit, current_commit)
+    disallowed_paths = changed_paths - INTERNAL_H2H_ANCESTOR_NON_ENGINE_ALLOWLIST
+    if disallowed_paths:
+        raise PromotionError(
+            f"{where} internal evaluator ancestor diff changes non-allowlisted paths: "
+            + ", ".join(sorted(disallowed_paths))
+        )
 
 
 def _verify_calibration_source(
@@ -5791,7 +5898,9 @@ def _verify_internal_h2h_source(
                 f"{where} typed config enables forbidden wide budget {key}"
             )
     allowed_decisions = (
-        {"H1"} if verdict_policy == "strict_h1" else {"H1", "continue"}
+        {"H1"}
+        if verdict_policy == "strict_h1"
+        else NON_REGRESSION_VETO_PASSING_DECISIONS
     )
     if payload.get("verdict") not in allowed_decisions:
         raise PromotionError(
@@ -6268,8 +6377,8 @@ def _verify_high_regret_source(
         raise PromotionError(f"{where} has an unexpected high-regret schema/suite")
     if value["held_out"] is not True or value["passed"] is not True:
         raise PromotionError(f"{where} is not a passing held-out high-regret result")
-    if value["verdict"] != "H1":
-        raise PromotionError(f"{where} high-regret verdict is not passing")
+    if value["verdict"] not in NON_REGRESSION_VETO_PASSING_DECISIONS:
+        raise PromotionError(f"{where} high-regret veto reached H0")
     _verify_bound_checkpoint(
         value["candidate"],
         expected_path=candidate,
@@ -6753,7 +6862,7 @@ def _verify_high_regret_source(
         or replayed != value["pentanomial_sprt"]
         or complete_pairs != value["complete_pairs"]
         or replayed["decision"] != value["verdict"]
-        or replayed["decision"] != "H1"
+        or replayed["decision"] not in NON_REGRESSION_VETO_PASSING_DECISIONS
     ):
         raise PromotionError(f"{where} high-regret paired statistics do not replay")
 
@@ -8979,17 +9088,8 @@ def create_matched_quick_screen(
     half_points = {
         step: report["candidate_half_points"] for step, report in reports.items()
     }
-    best_half_points = max(half_points.values())
-    max_gap_basis_points = MATCHED_QUICK_SCREEN_SELECTION_RULE[
-        "max_absolute_win_rate_gap_basis_points"
-    ]
     game_count = len(ordered_game_keys)
-    selected_step = min(
-        step
-        for step in CHECKPOINT_SELECTION_STEPS
-        if (best_half_points - half_points[step]) * 10_000
-        <= max_gap_basis_points * 2 * game_count
-    )
+    selected_step = _select_matched_quick_screen_step(half_points)
     payload = {
         "schema_version": MATCHED_QUICK_SCREEN_SCHEMA,
         "eligible_optimizer_steps": list(CHECKPOINT_SELECTION_STEPS),

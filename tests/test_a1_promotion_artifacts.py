@@ -239,6 +239,38 @@ def _high_regret_report(
     }
 
 
+def _set_high_regret_pair_counts(
+    value: dict, *, ll_pairs: int, split_pairs: int, ww_pairs: int
+) -> None:
+    pairs = sorted({int(game["pair_id"]) for game in value["games"]})
+    assert len(pairs) == ll_pairs + split_pairs + ww_pairs
+    outcomes_by_pair = {
+        pair_id: (
+            (False, False)
+            if index < ll_pairs
+            else (True, False)
+            if index < ll_pairs + split_pairs
+            else (True, True)
+        )
+        for index, pair_id in enumerate(pairs)
+    }
+    for game in value["games"]:
+        first, second = outcomes_by_pair[int(game["pair_id"])]
+        game["candidate_won"] = (
+            first
+            if game["orientation"] in {"candidate_first", "candidate_red"}
+            else second
+        )
+    normalized = [
+        {**game, "search_won": game["candidate_won"]} for game in value["games"]
+    ]
+    scores, diagnostics = promotion.pair_scores_from_h2h_games(normalized)
+    value["pair_diagnostics"] = diagnostics
+    value["pentanomial_sprt"] = promotion.evaluate_pentanomial_sprt(
+        scores, elo0=-10.0, elo1=15.0, alpha=0.05, beta=0.05
+    )
+
+
 def _truncate_high_regret_pair(value: dict, pair_id: int = 0) -> None:
     game = next(
         game
@@ -286,6 +318,48 @@ def test_high_regret_builder_derives_source_from_passing_report(tmp_path: Path) 
         == _high_regret_report(tmp_path, candidate, champion)["suite_manifest"]
     )
     assert value["pair_diagnostics"]["ww_pairs"] == 200
+
+
+def test_high_regret_and_bucket_builders_accept_continue_as_nonregression(
+    tmp_path: Path,
+) -> None:
+    candidate, champion = _checkpoints(tmp_path)
+    raw = _high_regret_report(tmp_path, candidate, champion)
+    _set_high_regret_pair_counts(
+        raw, ll_pairs=50, split_pairs=100, ww_pairs=50
+    )
+    assert raw["pentanomial_sprt"]["decision"] == "continue"
+    report = tmp_path / "high-regret-continue.report.json"
+    _json(report, raw)
+
+    source = artifacts.build_high_regret_source(
+        report_path=report, candidate=candidate, champion=champion
+    )
+    bucket_report = artifacts.build_bucket_game_report(
+        report_path=report, candidate=candidate, champion=champion
+    )
+
+    assert source["passed"] is True
+    assert source["verdict"] == "continue"
+    assert len(bucket_report["games"]) == 400
+
+
+def test_high_regret_and_bucket_builders_reject_h0_veto(tmp_path: Path) -> None:
+    candidate, champion = _checkpoints(tmp_path)
+    raw = _high_regret_report(tmp_path, candidate, champion)
+    _set_high_regret_pair_counts(raw, ll_pairs=0, split_pairs=200, ww_pairs=0)
+    assert raw["pentanomial_sprt"]["decision"] == "H0"
+    report = tmp_path / "high-regret-h0.report.json"
+    _json(report, raw)
+
+    with pytest.raises(artifacts.ArtifactBuildError, match="veto reached H0"):
+        artifacts.build_high_regret_source(
+            report_path=report, candidate=candidate, champion=champion
+        )
+    with pytest.raises(artifacts.ArtifactBuildError, match="veto reached H0"):
+        artifacts.build_bucket_game_report(
+            report_path=report, candidate=candidate, champion=champion
+        )
 
 
 def test_high_regret_builder_excludes_one_legitimate_truncated_pair(

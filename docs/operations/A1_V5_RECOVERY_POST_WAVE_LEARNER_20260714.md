@@ -429,11 +429,13 @@ export CANDIDATE=$("$PY" -c \
 `build-dose-screen` replays the candidate checkpoint bytes in all three pooled
 reports, requires byte-identical baseline/search configuration and identical
 ordered `(game_seed, orientation)` keys, and derives every score from retained
-game outcomes. The sealed rule chooses the earliest dose within 200 basis
-points of the best observed win rate. `select-dose` independently replays the
-screen and binds that derived checkpoint to the one-dose receipt; there is no
-operator-selected step. Add `$DOSE_SCREEN` as a prior diagnostic cohort when
-building the final cohort-exclusions manifest.
+game outcomes. The sealed rule chooses the maximum matched-cohort candidate
+score and uses the earliest dose only for an exact tie. The old 200-basis-point
+indifference rule is forbidden because its tolerance was nearly the entire
+15-Elo promotion target and could select a materially weaker checkpoint.
+`select-dose` independently replays the screen and binds that derived checkpoint
+to the one-dose receipt; there is no operator-selected step. Add `$DOSE_SCREEN`
+as a prior diagnostic cohort when building the final cohort-exclusions manifest.
 
 ## 5. Gate against both required baselines
 
@@ -555,10 +557,17 @@ export F7_REPORT=$GATE/f7-collected/$F7_RUN_ID/pooled/internal.json
 ```
 
 The parent report is the `internal_h2h` source for the ordinary promotion
-evidence graph; its verdict must be strict H1. Build the remaining immutable
-inputs from the selected checkpoint. Calibration uses the trainer's exact
-whole-game validation seed set. The candidate and incumbent calibration jobs
-may run concurrently on B200 GPUs 0 and 1.
+evidence graph; its verdict must be strict H1. The fixed 600-pair cohort is a
+first gate size, not a claim that 600 pairs guarantees power at the +15 Elo
+boundary. Only a replayed `[0,+15]` superiority verdict of H1 authorizes
+promotion. H0 rejects; `continue` at 600 pairs is unresolved and also blocks
+promotion. Do not report `continue` as either proof of +15 Elo or proof that the
+candidate regressed. Any extension must be declared as a fresh disjoint cohort
+and pooled before adjudication.
+
+Build the remaining immutable inputs from the selected checkpoint. Calibration
+uses the trainer's exact whole-game validation seed set. The candidate and
+incumbent calibration jobs may run concurrently on B200 GPUs 0 and 1.
 
 ```bash
 export VAL_SEEDS=${TRAIN_REPORT%.json}.validation_seeds.json
@@ -609,8 +618,14 @@ test "$CAL_V5_RC" -eq 0
   --pairs 240 --out "$SUITE"
 ```
 
-Run the high-regret suite across all eight B200s. It uses the same public
-information-set search surface as the fleet gate and the exact native wheel.
+Run the fixed 240-pair high-regret suite across all eight B200s. It uses the
+same public information-set search surface as the fleet gate and the exact
+native wheel. This panel and its bucket projection are secondary non-regression
+vetoes, not additional superiority gates: H0 rejects, while `continue` or H1
+permits the promotion decision to proceed. The per-bucket 45% floor and minimum
+sample requirements remain independent vetoes. Likewise, the fixed 300-pair f7
+panel permits `continue` or H1 and rejects H0. Strict H1 is required only from
+the exact recovered-v5 parent gate above.
 
 ```bash
 export NATIVE_WHEEL=/home/ubuntu/catan-rnd-audit/dist/catanatron_rs-0.1.8-cp311-cp311-manylinux_2_34_x86_64.whl

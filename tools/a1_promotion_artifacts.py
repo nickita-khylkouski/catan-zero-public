@@ -321,8 +321,11 @@ def build_high_regret_source(
         raise ArtifactBuildError("high-regret report truncation diagnostics do not replay")
     if raw["pair_diagnostics"] != diagnostics or raw["pentanomial_sprt"] != pentanomial:
         raise ArtifactBuildError("high-regret report paired statistics do not replay")
-    if pentanomial["decision"] != "H1":
-        raise ArtifactBuildError("high-regret report has no passing paired verdict")
+    if (
+        pentanomial["decision"]
+        not in promotion.NON_REGRESSION_VETO_PASSING_DECISIONS
+    ):
+        raise ArtifactBuildError("high-regret non-regression veto reached H0")
     return {
         "schema_version": promotion.HIGH_REGRET_SCHEMA,
         "suite": "held_out_high_regret",
@@ -330,7 +333,7 @@ def build_high_regret_source(
         "candidate": candidate_ref,
         "champion": champion_ref,
         "passed": True,
-        "verdict": "H1",
+        "verdict": pentanomial["decision"],
         "complete_pairs": complete_pairs,
         "errors": [],
         "report": _file_ref(report_path, where="high-regret report"),
@@ -784,9 +787,12 @@ def build_bucket_game_report(
         diagnostics["incomplete_pairs"] != truncated_pairs
         or raw["pair_diagnostics"] != diagnostics
         or raw["pentanomial_sprt"] != pentanomial
-        or pentanomial["decision"] != "H1"
+        or pentanomial["decision"]
+        not in promotion.NON_REGRESSION_VETO_PASSING_DECISIONS
     ):
-        raise ArtifactBuildError("bucket extraction paired statistics do not replay")
+        raise ArtifactBuildError(
+            "bucket extraction non-regression veto reached H0 or does not replay"
+        )
     projected: list[dict[str, Any]] = []
     for index, game in enumerate(games):
         identity = _paired_game_identity(game, index=index, where="report.games")

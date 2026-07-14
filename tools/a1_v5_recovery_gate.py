@@ -355,7 +355,10 @@ def verify_recovery_gate(
         )
         if report.get("complete_pairs") != F7_VETO_COMPLETE_PAIRS:
             raise RecoveryGateError("f7 veto must complete exactly 300 pairs")
-        if report.get("verdict") not in {"H1", "continue"}:
+        if (
+            report.get("verdict")
+            not in promotion.NON_REGRESSION_VETO_PASSING_DECISIONS
+        ):
             raise RecoveryGateError("f7 veto reached H0")
         f7_seeds = _exact_f7_seeds(report)
         standard_intervals = _validate_standard_intervals(

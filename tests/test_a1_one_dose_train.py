@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 from pathlib import Path
 import subprocess
@@ -1455,6 +1456,86 @@ def test_policy_aux_active_dose_is_typed_and_command_bound(
     ).policy_aux_active_batch_size == 128
 
 
+def test_policy_game_weight_can_be_isolated_as_a_generic_ablation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    verified = _verified(tmp_path)
+    verified["reviewed_lock_file_sha256"] = verified["lock_file_sha256"]
+    verified["recipe"]["per_game_policy_weight"] = True
+    verified["recipe"]["per_game_policy_weight_mode"] = "equal"
+    code_sha = "sha256:" + "7" * 64
+    monkeypatch.setattr(
+        executor,
+        "_current_ablation_code_binding",
+        lambda _lock: {"code_tree_sha256": code_sha, "records": []},
+    )
+
+    derived = executor.bind_learner_ablation(
+        verified,
+        ablation_id="policy-game-weight-off",
+        overrides_json=(
+            '{"per_game_policy_weight":false,'
+            '"per_game_policy_weight_mode":"equal"}'
+        ),
+        reviewed_code_tree_sha256=code_sha,
+    )
+
+    assert derived["recipe"]["per_game_policy_weight"] is False
+    assert derived["learner_ablation"]["recipe_drift"][
+        "per_game_policy_weight"
+    ] == {"contract": True, "effective": False}
+    command = executor.build_train_command(
+        derived,
+        python=Path(sys.executable),
+        checkpoint=tmp_path / "candidate.pt",
+        report=tmp_path / "report.json",
+    )
+    assert "--per-game-policy-weight" not in command
+    assert "--per-game-policy-weight-mode" not in command
+
+
+def test_long_policy_weight_ablation_retains_dose_frontier(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    verified = _verified(tmp_path)
+    verified["data_kind"] = "production_composite_v2"
+    verified["reviewed_lock_file_sha256"] = verified["lock_file_sha256"]
+    verified["recipe"]["per_game_policy_weight"] = True
+    verified["recipe"]["per_game_policy_weight_mode"] = "equal"
+    code_sha = "sha256:" + "7" * 64
+    monkeypatch.setattr(
+        executor,
+        "_current_ablation_code_binding",
+        lambda _lock: {"code_tree_sha256": code_sha, "records": []},
+    )
+    derived = executor.bind_learner_ablation(
+        verified,
+        ablation_id="policy-game-weight-off-dose-1024",
+        overrides_json=(
+            '{"max_steps":1024,"per_game_policy_weight":false,'
+            '"per_game_policy_weight_mode":"equal"}'
+        ),
+        reviewed_code_tree_sha256=code_sha,
+    )
+    derived["trainer_authority"] = executor._current_production_trainer_authority()
+    derived["event_history_training_contract"] = {
+        "empty_payload_inventory_acknowledgements": [
+            derived["payload_inventory_sha256"]
+        ],
+        "training_event_history_trainable": False,
+        "event_history_end_to_end_usable": False,
+    }
+
+    command = executor.build_train_command(
+        derived,
+        python=Path(sys.executable),
+        checkpoint=tmp_path / "candidate.pt",
+        report=tmp_path / "report.json",
+    )
+    assert _option(command, "--max-steps") == "1024"
+    assert _option(command, "--checkpoint-steps") == "128,256,512"
+
+
 def test_pointer_aux_cannot_use_generic_ablation_labels_or_coefficients(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1556,6 +1637,22 @@ def _p1_executor_authority(verified: dict, *, code_sha: str) -> dict:
             "resume_optimizer": False,
         }
     )
+    derived_descriptor = {"policy_kl_anchor_component_ids": ["historical_replay"]}
+    derived_bytes = (
+        json.dumps(derived_descriptor, indent=2, sort_keys=True).encode("utf-8")
+        + b"\n"
+    )
+    descriptor_authority = {
+        "schema_version": executor.aux_coordinator.P1_TRAINING_DESCRIPTOR_SCHEMA,
+        "kind": "derived_historical_anchor",
+        "filename": "p1-05-k3-training-descriptor.json",
+        "base_descriptor_sha256": verified["corpus_meta_file_sha256"],
+        "descriptor_file_sha256": "sha256:"
+        + hashlib.sha256(derived_bytes).hexdigest(),
+        "descriptor_fingerprint": executor._value_sha256(derived_descriptor),
+        "policy_kl_anchor_component_ids": ["historical_replay"],
+        "expected_policy_kl_anchor_eligible_rows": 100_000,
+    }
     arm = {
         "arm_id": "K3",
         "target_global_equivalent_decimal": "0.03",
@@ -1564,6 +1661,7 @@ def _p1_executor_authority(verified: dict, *, code_sha: str) -> dict:
         "policy_kl_anchor_weight": 0.03,
         "effective_recipe": recipe,
         "effective_recipe_sha256": executor._value_sha256(recipe),
+        "training_descriptor_authority": descriptor_authority,
     }
     allocation = {"allocation": "test"}
     claim = {
@@ -1610,7 +1708,9 @@ def _p1_executor_authority(verified: dict, *, code_sha: str) -> dict:
         "kl_eligibility_authority": {
             "sampler_identity_sha256": "sha256:" + "3" * 64,
             "sample_order_sha256": "sha256:" + "4" * 64,
+            "eligible_rows": 100_000,
         },
+        "training_descriptor_authority": descriptor_authority,
         "p1_sample_evidence_receipt": {
             "state_sha256": "sha256:" + "a" * 64,
             "descriptor_sha256": verified["corpus_meta_file_sha256"],
@@ -1652,6 +1752,18 @@ def _p1_executor_authority(verified: dict, *, code_sha: str) -> dict:
 
 
 def _published_authority(tmp_path: Path, authority: dict) -> dict:
+    descriptor_authority = authority["training_descriptor_authority"]
+    descriptor = tmp_path / descriptor_authority["filename"]
+    descriptor.write_text(
+        json.dumps(
+            {"policy_kl_anchor_component_ids": ["historical_replay"]},
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    descriptor.chmod(0o444)
     path = (tmp_path / "p1-15-k3-executor-authority.json").resolve()
     path.write_text(json.dumps(authority, sort_keys=True) + "\n", encoding="utf-8")
     path.chmod(0o444)
@@ -1666,7 +1778,7 @@ def _published_authority(tmp_path: Path, authority: dict) -> dict:
 def test_central_p1_binds_exact_current_parent_sampler_and_mixed_transition(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    verified = _verified(tmp_path)
+    verified = _production_trainer_verified(tmp_path)
     verified.update(
         {
             "data_kind": "production_composite_v2",
@@ -1724,6 +1836,10 @@ def test_central_p1_binds_exact_current_parent_sampler_and_mixed_transition(
         reviewed_code_tree_sha256=code_sha,
     )
     assert bound["recipe"]["sampler_seed"] == 424242
+    assert bound["data_path"].name == "p1-05-k3-training-descriptor.json"
+    assert bound["p1_training_descriptor_authority"][
+        "policy_kl_anchor_component_ids"
+    ] == ["historical_replay"]
     assert bound["learner_ablation"]["diagnostic_only"] is True
     assert bound["learner_ablation"]["promotion_eligible"] is False
     assert (
@@ -1737,6 +1853,7 @@ def test_central_p1_binds_exact_current_parent_sampler_and_mixed_transition(
         report=tmp_path / "p1.json",
     )
     assert _option(command, "--sampler-seed") == "424242"
+    assert _option(command, "--data") == str(bound["data_path"])
     assert _option(command, "--public-award-feature-contract") == "authoritative_v1"
     assert command.count("--allow-mixed-public-award-feature-contracts") == 1
     assert command.count("--no-resume-optimizer") == 1
@@ -1865,6 +1982,51 @@ def test_report_binding_seals_exact_base_value_and_policy_doses(
         "anchor_eligible_sampled_rows": 0,
     }
     assert dose["current_sampled_rows"] == 4_097
+
+
+def test_report_binding_seals_exact_ordinary_production_objective_dose(
+    tmp_path: Path,
+) -> None:
+    verified = _verified(tmp_path)
+    checkpoint = tmp_path / "candidate.pt"
+    payload = _training_report(verified, checkpoint)
+    payload.update(
+        {
+            "training_row_draws": 4_097,
+            "base_training_row_draws": 4_097,
+            "policy_aux_training_row_draws": 0,
+            "total_training_row_draws": 4_097,
+            "policy_base_active_rows": 777,
+            "policy_aux_active_rows": 0,
+            "policy_total_active_rows": 777,
+            "value_active_rows": 4_097,
+            "policy_kl_anchor_eligible_rows": 0,
+        }
+    )
+    report = tmp_path / "report.json"
+    report.write_text(json.dumps(payload))
+    binding = executor._execution_binding(
+        command=[sys.executable, "train_bc.py"],
+        environment=executor._child_environment(0),
+    )
+
+    executor._bind_training_report(
+        report,
+        verified=verified,
+        execution_binding=binding,
+    )
+
+    dose = json.loads(report.read_text())["a1_lineage_dose"]
+    assert dose["objective_exposure"] == {
+        "measurement_status": "bound_exactly",
+        "measurement_scope": "current_dose",
+        "base_sampled_rows": 4_097,
+        "policy_base_active_sampled_rows": 777,
+        "policy_aux_active_sampled_rows": 0,
+        "policy_active_sampled_rows": 777,
+        "value_active_sampled_rows": 4_097,
+        "anchor_eligible_sampled_rows": 0,
+    }
 
 
 def test_exact_policy_dose_binding_refuses_counter_drift(tmp_path: Path) -> None:
@@ -2436,6 +2598,43 @@ def test_frozen_training_lock_flags_are_atomic(tmp_path: Path) -> None:
             lock_path,
             frozen_repo=tmp_path,
             frozen_verifier_sha256=None,
+        )
+
+
+def test_frozen_training_lock_can_bind_reviewed_post_wave_ablation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lock_path = tmp_path / "lock.json"
+    lock_path.write_text("{}", encoding="utf-8")
+    lock_sha256 = executor._file_sha256(lock_path)
+    frozen_repo = tmp_path / "frozen"
+    frozen_repo.mkdir()
+    lock = _lock()
+    authority = {
+        "schema_version": "a1-frozen-lock-verifier-authority-v1",
+        "lock_file_sha256": lock_sha256,
+    }
+    monkeypatch.setattr(
+        executor.frozen_lock_verifier,
+        "verify_frozen_lock",
+        lambda *_args, **_kwargs: (lock, authority),
+    )
+
+    verified_lock, observed = executor._verify_training_lock(
+        lock_path,
+        reviewed_lock_file_sha256=lock_sha256,
+        frozen_repo=frozen_repo,
+        frozen_verifier_sha256="sha256:" + "8" * 64,
+    )
+    assert verified_lock == lock
+    assert observed == authority
+
+    with pytest.raises(executor.ExecutorError, match="disagree on A1 lock bytes"):
+        executor._verify_training_lock(
+            lock_path,
+            reviewed_lock_file_sha256="sha256:" + "0" * 64,
+            frozen_repo=frozen_repo,
+            frozen_verifier_sha256="sha256:" + "8" * 64,
         )
 
 
@@ -3143,6 +3342,7 @@ def test_receipt_publication_failure_leaves_terminal_complete_claim(
         _write_training_progress(checkpoint, payload)
         return subprocess.CompletedProcess(command_arg, 0)
 
+    receipt_writer = executor._write_receipt_no_clobber
     monkeypatch.setattr(
         executor,
         "_write_receipt_no_clobber",
@@ -3166,6 +3366,26 @@ def test_receipt_publication_failure_leaves_terminal_complete_claim(
     )
     assert state["status"] == "complete"
     assert state["outputs"]["checkpoint_sha256"] == executor._file_sha256(checkpoint)
+    monkeypatch.setattr(executor, "_write_receipt_no_clobber", receipt_writer)
+
+    recovered = executor.execute(
+        verified=verified,
+        command=command,
+        checkpoint=checkpoint,
+        report=report,
+        receipt=receipt,
+        gpu=0,
+        runner=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("terminal receipt recovery must not rerun training")
+        ),
+        probe=lambda _gpu: (_ for _ in ()).throw(
+            AssertionError("terminal receipt recovery must not reprobe a GPU")
+        ),
+    )
+    assert recovered["status"] == "complete"
+    assert recovered["claim_state_sha256"] == state["state_sha256"]
+    assert receipt.is_file()
+    assert receipt.stat().st_mode & 0o777 == 0o444
     with pytest.raises(executor.ExecutorError, match="claim already exists"):
         executor._claim_attempt(
             verified,
@@ -3174,6 +3394,70 @@ def test_receipt_publication_failure_leaves_terminal_complete_claim(
                 "status": "claimed",
                 "contract_sha256": verified["contract_sha256"],
             },
+        )
+
+
+def test_retry_contract_publication_is_immutable(tmp_path: Path) -> None:
+    path = tmp_path / "retry.contract.json"
+    payload = {
+        "schema_version": executor.RETRY_CONTRACT_SCHEMA,
+        "retry_contract_sha256": "sha256:" + "1" * 64,
+    }
+
+    executor._write_retry_contract_no_clobber(path, payload)
+
+    assert json.loads(path.read_text()) == payload
+    assert path.stat().st_mode & 0o777 == 0o444
+    with pytest.raises(executor.ExecutorError, match="refusing to overwrite"):
+        executor._write_retry_contract_no_clobber(path, payload)
+
+
+def test_production_strict_checkpoint_reconstruction_is_mandatory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from catan_zero.rl.entity_token_policy import EntityGraphPolicy
+
+    checkpoint = tmp_path / "candidate.pt"
+    checkpoint.write_bytes(b"not-used-by-mocked-loader")
+
+    class _Parameter:
+        def numel(self) -> int:
+            return 35_041_353
+
+    class _Model:
+        def parameters(self):
+            return [_Parameter()]
+
+    class _Policy:
+        model = _Model()
+
+    observed: dict[str, object] = {}
+
+    def strict_load(path, **kwargs):
+        observed.update({"path": path, **kwargs})
+        return _Policy()
+
+    monkeypatch.setattr(EntityGraphPolicy, "load", strict_load)
+    executor._strict_load_production_entity_checkpoint(
+        checkpoint, where="test production checkpoint"
+    )
+    assert observed == {
+        "path": checkpoint,
+        "device": "cpu",
+        "strict_metadata": True,
+        "allow_missing_optional_parameters": False,
+    }
+
+    monkeypatch.setattr(
+        EntityGraphPolicy,
+        "load",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("missing model tensor")
+        ),
+    )
+    with pytest.raises(executor.ExecutorError, match="cannot strict-load"):
+        executor._strict_load_production_entity_checkpoint(
+            checkpoint, where="test production checkpoint"
         )
 
 

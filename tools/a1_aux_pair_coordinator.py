@@ -60,6 +60,7 @@ P1_RECIPE_DATA_AUTHORITY_SCHEMA = "a1-p1-recipe-data-authority-v1"
 P1_FINAL_LOCK_AUTHORITY_SCHEMA = "a1-p1-final-v3-lock-authority-v1"
 P1_SWEEP_SCHEMA = "a1-p1-central-kl-sweep-v1"
 P1_EVALUATION_PLAN_SCHEMA = "a1-p1-fixed-evaluation-plan-v1"
+P1_TRAINING_DESCRIPTOR_SCHEMA = "a1-p1-training-descriptor-authority-v1"
 AUX_EVALUATION_PLAN_SCHEMA = "a1-aux-fixed-evaluation-plan-v1"
 HANDOFF_PARENT_AUTHORITY_SCHEMA = "a1-current-recovered-parent-authority-v1"
 POINTER_UPGRADE_AUTHORITY_SCHEMA = "a1-aux-pointer-upgrade-authority-v1"
@@ -113,6 +114,7 @@ P1_ARMS = ("K0", "K3", "K10")
 P1_SCHEDULE_SLOTS = {"K0": 0, "K3": 1, "K10": 2}
 P1_TARGET_GLOBAL_DECIMALS = {"K0": "0", "K3": "0.03", "K10": "0.1"}
 P1_COEFFICIENT_QUANTUM = Decimal("0.000000000001")
+P1_HISTORICAL_ANCHOR_COMPONENT_IDS = ("historical_replay",)
 
 # Evaluation is an experiment input, not an operator knob.  These disjoint
 # cohorts live in the reserved validation-only seed band and are deliberately
@@ -419,6 +421,15 @@ def _stable_immutable_file_sha256(path: Path, *, where: str) -> str:
     return "sha256:" + digest.hexdigest()
 
 
+def _immutable_plain_json_snapshot(
+    path: Path, *, where: str
+) -> tuple[str, tuple[int, int, int, int, int], str]:
+    payload, file_sha256, identity = _stable_read_json_artifact(path, where=where)
+    if stat.S_IMODE(path.stat(follow_symlinks=False).st_mode) != 0o444:
+        raise CoordinatorError(f"{where} must be immutable mode 0444")
+    return file_sha256, identity, _digest(payload)
+
+
 def _write_once(path: Path, payload: Mapping[str, Any]) -> dict[str, Any]:
     """Create an immutable artifact, or idempotently replay exact bytes."""
 
@@ -455,6 +466,54 @@ def _write_once(path: Path, payload: Mapping[str, Any]) -> dict[str, Any]:
         finally:
             raise
     return sealed
+
+
+def _write_plain_json_once(path: Path, payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Create one immutable non-coordinator JSON input, idempotently.
+
+    Composite descriptors are consumed directly by ``train_bc`` and therefore
+    cannot carry the coordinator's ``state_sha256`` envelope.  They still need
+    the same O_EXCL, fsync, immutable-mode, and exact-replay guarantees as the
+    surrounding transaction artifacts.
+    """
+
+    value = copy.deepcopy(dict(payload))
+    encoded = json.dumps(value, indent=2, sort_keys=True).encode("utf-8") + b"\n"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.parent.is_symlink():
+        raise CoordinatorError(
+            f"artifact directory may not be a symlink: {path.parent}"
+        )
+    try:
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        existing, existing_sha, _identity = _stable_read_json_artifact(
+            path, where=path.name
+        )
+        expected_sha = "sha256:" + hashlib.sha256(encoded).hexdigest()
+        if (
+            existing != value
+            or existing_sha != expected_sha
+            or stat.S_IMODE(path.stat(follow_symlinks=False).st_mode) != 0o444
+        ):
+            raise CoordinatorError(
+                f"stage already issued with different descriptor: {path.name}"
+            )
+        return existing
+    try:
+        with os.fdopen(descriptor, "wb", closefd=True) as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(path, 0o444)
+        _fsync_directory(path.parent)
+    except BaseException:
+        try:
+            path.unlink(missing_ok=True)
+            _fsync_directory(path.parent)
+        finally:
+            raise
+    return value
 
 
 def _artifact_dir(root: Path, experiment_id: str, *, create: bool) -> Path:
@@ -2497,6 +2556,155 @@ def _p1_arm_recipe(
     return recipe
 
 
+def _p1_training_descriptor_authorities(
+    base_descriptor: Mapping[str, Any],
+    *,
+    base_descriptor_sha256: str,
+    eligible_rows: int,
+) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+    """Derive the exact trainer-visible KL scope for every P1 arm.
+
+    The production descriptor deliberately carries an empty anchor scope for
+    the ordinary K=0 learner.  A non-zero coefficient alone cannot change that
+    authenticated all-false mask.  K3/K10 therefore receive immutable derived
+    descriptors whose *only* semantic delta is the historical replay scope.
+    """
+
+    descriptor = copy.deepcopy(dict(base_descriptor))
+    if descriptor.get("policy_kl_anchor_component_ids") != []:
+        raise CoordinatorError(
+            "P1 base descriptor must carry the ordinary empty KL-anchor scope"
+        )
+    _require_sha(base_descriptor_sha256, "P1 base descriptor")
+    if isinstance(eligible_rows, bool) or not isinstance(eligible_rows, int):
+        raise CoordinatorError("P1 KL eligible-row count must be an integer")
+    if eligible_rows <= 0 or eligible_rows > SHORT_SAMPLE_DOSE:
+        raise CoordinatorError("P1 KL eligible-row count is outside the fixed dose")
+
+    authorities: dict[str, dict[str, Any]] = {}
+    derived_payloads: dict[str, dict[str, Any]] = {}
+    for arm_id in P1_ARMS:
+        anchor_ids = (
+            []
+            if arm_id == "K0"
+            else list(P1_HISTORICAL_ANCHOR_COMPONENT_IDS)
+        )
+        filename = (
+            None
+            if arm_id == "K0"
+            else f"p1-05-{arm_id.lower()}-training-descriptor.json"
+        )
+        if arm_id == "K0":
+            payload = descriptor
+            descriptor_file_sha256 = base_descriptor_sha256
+        else:
+            payload = copy.deepcopy(descriptor)
+            payload["policy_kl_anchor_component_ids"] = anchor_ids
+            encoded = (
+                json.dumps(payload, indent=2, sort_keys=True).encode("utf-8")
+                + b"\n"
+            )
+            descriptor_file_sha256 = (
+                "sha256:" + hashlib.sha256(encoded).hexdigest()
+            )
+            derived_payloads[arm_id] = payload
+        authorities[arm_id] = {
+            "schema_version": P1_TRAINING_DESCRIPTOR_SCHEMA,
+            "kind": "base" if arm_id == "K0" else "derived_historical_anchor",
+            "filename": filename,
+            "base_descriptor_sha256": base_descriptor_sha256,
+            "descriptor_file_sha256": descriptor_file_sha256,
+            "descriptor_fingerprint": _digest(payload),
+            "policy_kl_anchor_component_ids": anchor_ids,
+            "expected_policy_kl_anchor_eligible_rows": (
+                0 if arm_id == "K0" else eligible_rows
+            ),
+        }
+    return authorities, derived_payloads
+
+
+def _verify_p1_training_descriptor_authority(
+    value: Any,
+    *,
+    arm_id: str,
+    composite: Mapping[str, Any],
+    eligibility: Mapping[str, Any],
+) -> dict[str, Any]:
+    descriptor = _require_exact_keys(
+        value,
+        {
+            "schema_version",
+            "kind",
+            "filename",
+            "base_descriptor_sha256",
+            "descriptor_file_sha256",
+            "descriptor_fingerprint",
+            "policy_kl_anchor_component_ids",
+            "expected_policy_kl_anchor_eligible_rows",
+        },
+        f"P1 {arm_id} training descriptor authority",
+    )
+    expected_ids = (
+        [] if arm_id == "K0" else list(P1_HISTORICAL_ANCHOR_COMPONENT_IDS)
+    )
+    expected_filename = (
+        None
+        if arm_id == "K0"
+        else f"p1-05-{arm_id.lower()}-training-descriptor.json"
+    )
+    expected_rows = 0 if arm_id == "K0" else int(eligibility["eligible_rows"])
+    if (
+        descriptor["schema_version"] != P1_TRAINING_DESCRIPTOR_SCHEMA
+        or descriptor["kind"]
+        != ("base" if arm_id == "K0" else "derived_historical_anchor")
+        or descriptor["filename"] != expected_filename
+        or descriptor["base_descriptor_sha256"] != composite["descriptor_sha256"]
+        or descriptor["policy_kl_anchor_component_ids"] != expected_ids
+        or descriptor["expected_policy_kl_anchor_eligible_rows"] != expected_rows
+    ):
+        raise CoordinatorError(f"P1 {arm_id} training descriptor authority drift")
+    for field in (
+        "base_descriptor_sha256",
+        "descriptor_file_sha256",
+        "descriptor_fingerprint",
+    ):
+        _require_sha(descriptor[field], f"P1 {arm_id} training descriptor {field}")
+    if arm_id == "K0" and (
+        descriptor["descriptor_file_sha256"] != composite["descriptor_sha256"]
+    ):
+        raise CoordinatorError("P1 K0 must consume the unchanged base descriptor")
+    return copy.deepcopy(descriptor)
+
+
+def _verify_p1_derived_training_descriptor_file(
+    directory: Path,
+    *,
+    arm_id: str,
+    authority: Mapping[str, Any],
+) -> Path | None:
+    """Replay one immutable derived descriptor named by central authority."""
+
+    if arm_id == "K0":
+        if authority["filename"] is not None:
+            raise CoordinatorError("P1 K0 unexpectedly names a derived descriptor")
+        return None
+    path = (directory / str(authority["filename"])).resolve(strict=True)
+    if path.parent != directory.resolve(strict=True):
+        raise CoordinatorError("P1 derived descriptor escaped its transaction")
+    payload, file_sha256, _identity = _stable_read_json_artifact(
+        path, where=f"P1 {arm_id} derived training descriptor"
+    )
+    if (
+        stat.S_IMODE(path.stat(follow_symlinks=False).st_mode) != 0o444
+        or file_sha256 != authority["descriptor_file_sha256"]
+        or _digest(payload) != authority["descriptor_fingerprint"]
+        or payload.get("policy_kl_anchor_component_ids")
+        != authority["policy_kl_anchor_component_ids"]
+    ):
+        raise CoordinatorError(f"P1 {arm_id} derived training descriptor drift")
+    return path
+
+
 def prepare_p1_sweep(
     root: Path,
     *,
@@ -2543,6 +2751,21 @@ def prepare_p1_sweep(
     ):
         raise CoordinatorError("P1 composite does not bind the replayed physical order")
     eligibility = _kl_authority_from_verified_sample(sample, composite=data)
+    base_descriptor, base_descriptor_sha256, _descriptor_identity = (
+        _stable_read_json_artifact(
+            composite_descriptor_path.expanduser().resolve(strict=True),
+            where="P1 base training descriptor",
+        )
+    )
+    if base_descriptor_sha256 != data["descriptor_sha256"]:
+        raise CoordinatorError("P1 base training descriptor bytes drift")
+    training_descriptors, derived_descriptor_payloads = (
+        _p1_training_descriptor_authorities(
+            base_descriptor,
+            base_descriptor_sha256=base_descriptor_sha256,
+            eligible_rows=int(eligibility["eligible_rows"]),
+        )
+    )
     parent = current_parent_authority_from_recovery(recovery)
     native_receipt, native_runtime = _consume_runtime_admission_receipt(
         native_learner_admission_receipt_path
@@ -2586,6 +2809,9 @@ def prepare_p1_sweep(
             "policy_kl_anchor_weight": float(Decimal(coefficient_decimal)),
             "effective_recipe": recipe,
             "effective_recipe_sha256": _digest(recipe),
+            "training_descriptor_authority": copy.deepcopy(
+                training_descriptors[arm]
+            ),
         }
     identity = {
         "schema_version": P1_SWEEP_SCHEMA,
@@ -2621,6 +2847,10 @@ def prepare_p1_sweep(
     sweep_id = _digest(identity)
     payload = {**identity, "sweep_id": sweep_id}
     directory = _artifact_dir(root, sweep_id, create=True)
+    for arm_id, descriptor_payload in derived_descriptor_payloads.items():
+        filename = training_descriptors[arm_id]["filename"]
+        assert isinstance(filename, str)
+        _write_plain_json_once(directory / filename, descriptor_payload)
     _write_once(
         directory.parent / "a1-p1-central-kl-v1-issuance.json",
         {
@@ -2708,6 +2938,18 @@ def load_p1_arm_executor_authority(
         raise CoordinatorError(f"P1 {arm_id} executor allocation drift")
     claim = _artifact(root, sweep_id, f"p1-10-{arm_id.lower()}-claim.json")
     assert claim is not None
+    training_descriptor_authority = _verify_p1_training_descriptor_authority(
+        sweep["arms"][arm_id].get("training_descriptor_authority"),
+        arm_id=arm_id,
+        composite=sweep["composite"],
+        eligibility=sweep["kl_eligibility_authority"],
+    )
+    directory = _artifact_dir(root, sweep_id, create=False)
+    _verify_p1_derived_training_descriptor_file(
+        directory,
+        arm_id=arm_id,
+        authority=training_descriptor_authority,
+    )
     authority = {
         "schema_version": "a1-p1-arm-executor-authority-v1",
         "sweep_id": sweep_id,
@@ -2718,6 +2960,7 @@ def load_p1_arm_executor_authority(
         "current_parent_authority": copy.deepcopy(sweep["current_parent_authority"]),
         "composite": copy.deepcopy(sweep["composite"]),
         "kl_eligibility_authority": copy.deepcopy(sweep["kl_eligibility_authority"]),
+        "training_descriptor_authority": training_descriptor_authority,
         "p1_sample_evidence_receipt": copy.deepcopy(
             sweep["p1_sample_evidence_receipt"]
         ),
@@ -2734,7 +2977,6 @@ def load_p1_arm_executor_authority(
         "allocation": observed,
     }
     authority["authority_sha256"] = _digest(authority)
-    directory = _artifact_dir(root, sweep_id, create=False)
     return _write_once(
         directory / f"p1-15-{arm_id.lower()}-executor-authority.json",
         authority,
@@ -2763,6 +3005,7 @@ def complete_p1_arm(
             "sweep_id",
             "arm_id",
             "policy_kl_anchor_weight_decimal",
+            "policy_kl_anchor_eligible_rows",
             "initializer_sha256",
             "sampled_rows",
             "optimizer_steps",
@@ -2792,6 +3035,10 @@ def complete_p1_arm(
         or result["arm_id"] != arm_id
         or result["policy_kl_anchor_weight_decimal"]
         != arm["policy_kl_anchor_weight_decimal"]
+        or result["policy_kl_anchor_eligible_rows"]
+        != arm["training_descriptor_authority"][
+            "expected_policy_kl_anchor_eligible_rows"
+        ]
         or result["initializer_sha256"]
         != sweep["current_parent_authority"]["checkpoint_sha256"]
         or result["sampled_rows"] != SHORT_SAMPLE_DOSE
@@ -5188,6 +5435,8 @@ def verify_published_executor_authority(path: Path) -> dict[str, Any]:
     schema = authority.get("schema_version")
     root = resolved.parent.parent
     predecessor_paths: list[Path]
+    plain_predecessor_path: Path | None = None
+    plain_predecessor_snapshot = None
     if schema == "a1-p1-arm-executor-authority-v1":
         sweep_id = authority.get("sweep_id")
         arm_id = authority.get("arm_id")
@@ -5200,6 +5449,16 @@ def verify_published_executor_authority(path: Path) -> dict[str, Any]:
             resolved.parent / f"p1-10-{str(arm_id).lower()}-claim.json",
             resolved,
         ]
+        training_descriptor = authority.get("training_descriptor_authority")
+        if not isinstance(training_descriptor, dict):
+            raise CoordinatorError("P1 executor authority lacks training descriptor")
+        descriptor_filename = training_descriptor.get("filename")
+        if descriptor_filename is not None:
+            plain_predecessor_path = resolved.parent / str(descriptor_filename)
+            plain_predecessor_snapshot = _immutable_plain_json_snapshot(
+                plain_predecessor_path,
+                where="P1 derived training descriptor predecessor",
+            )
         predecessor_snapshot = _immutable_file_snapshot(predecessor_paths)
         _verify_global_issuance(
             predecessor_paths[0],
@@ -5320,12 +5579,21 @@ def verify_published_executor_authority(path: Path) -> dict[str, Any]:
         resolved, where="published executor authority replay"
     )
     after_predecessors = _immutable_file_snapshot(predecessor_paths)
+    after_plain_predecessor = (
+        None
+        if plain_predecessor_path is None
+        else _immutable_plain_json_snapshot(
+            plain_predecessor_path,
+            where="P1 derived training descriptor predecessor replay",
+        )
+    )
     if (
         replay != authority
         or after_authority != authority
         or after_sha != before_sha
         or after_identity != before_identity
         or after_predecessors != predecessor_snapshot
+        or after_plain_predecessor != plain_predecessor_snapshot
     ):
         raise CoordinatorError("published executor authority changed or failed replay")
     return {

@@ -740,6 +740,7 @@ def _p1_input_paths(root: Path) -> tuple[dict[str, Path], dict]:
     }
     descriptor_payload = {
         "category_semantics": semantics,
+        "policy_kl_anchor_component_ids": [],
         "source_authority_manifest": source_ref["path"],
         "source_authority_manifest_sha256": source_ref["file_sha256"],
         "source_authority_sha256": source_ref["authority_sha256"],
@@ -812,6 +813,9 @@ def _p1_result(sweep: dict, arm_id: str, character: str) -> dict:
         "sweep_id": sweep["sweep_id"],
         "arm_id": arm_id,
         "policy_kl_anchor_weight_decimal": arm["policy_kl_anchor_weight_decimal"],
+        "policy_kl_anchor_eligible_rows": arm["training_descriptor_authority"][
+            "expected_policy_kl_anchor_eligible_rows"
+        ],
         "initializer_sha256": _parent()["checkpoint_sha256"],
         "sampled_rows": 524_288,
         "optimizer_steps": 128,
@@ -1782,6 +1786,23 @@ def test_p1_sweep_has_fixed_one_axis_arms_and_central_selection(tmp_path: Path) 
     assert selected["selected_arm"] == "K3"
     assert selected["effective_recipe"]["policy_kl_anchor_weight"] == 0.015
     assert selected["effective_recipe"]["truncated_vp_margin_value_weight"] == 0.25
+    transaction = tmp_path / sweep["sweep_id"].removeprefix("sha256:")
+    for arm_id in coordinator.P1_ARMS:
+        descriptor = sweep["arms"][arm_id]["training_descriptor_authority"]
+        expected_scope = [] if arm_id == "K0" else ["historical_replay"]
+        expected_rows = (
+            0
+            if arm_id == "K0"
+            else sweep["kl_eligibility_authority"]["eligible_rows"]
+        )
+        assert descriptor["policy_kl_anchor_component_ids"] == expected_scope
+        assert descriptor["expected_policy_kl_anchor_eligible_rows"] == expected_rows
+        if arm_id != "K0":
+            path = transaction / descriptor["filename"]
+            assert path.stat().st_mode & 0o777 == 0o444
+            assert json.loads(path.read_text())["policy_kl_anchor_component_ids"] == [
+                "historical_replay"
+            ]
 
 
 @pytest.mark.parametrize(

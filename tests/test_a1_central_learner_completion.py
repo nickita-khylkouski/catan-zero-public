@@ -18,6 +18,9 @@ def _outputs() -> dict:
         "report_sha256": SHA_C,
         "sample_order_sha256": SHA_B,
         "row_set_sha256": SHA_C,
+        "lineage_dose": {
+            "objective_exposure": {"anchor_eligible_sampled_rows": 100_000}
+        },
     }
 
 
@@ -61,6 +64,7 @@ def test_p1_result_is_derived_only_from_authority_and_outputs(monkeypatch):
         "sweep_id",
         "arm_id",
         "policy_kl_anchor_weight_decimal",
+        "policy_kl_anchor_eligible_rows",
         "initializer_sha256",
         "sampled_rows",
         "optimizer_steps",
@@ -83,6 +87,7 @@ def test_p1_result_is_derived_only_from_authority_and_outputs(monkeypatch):
     assert result["arm_id"] == "K3"
     assert result["sampled_rows"] == 524288
     assert result["checkpoint_sha256"] == SHA
+    assert result["policy_kl_anchor_eligible_rows"] == 100_000
 
 
 def test_aux_result_has_no_caller_metrics_or_topology_fields(monkeypatch):

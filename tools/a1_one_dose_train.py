@@ -207,6 +207,7 @@ CHILD_ENVIRONMENT_KEYS = frozenset(
 A1_LEARNER_ABLATION_FIELDS = frozenset(
     {
         "epochs",
+        "max_steps",
         "lr",
         "lr_warmup_steps",
         "lr_schedule",
@@ -224,6 +225,8 @@ A1_LEARNER_ABLATION_FIELDS = frozenset(
         "policy_kl_anchor_weight",
         "policy_surprise_weight",
         "advantage_policy_weighting",
+        "per_game_policy_weight",
+        "per_game_policy_weight_mode",
         "per_game_value_weight",
         "per_game_value_weight_mode",
         "vp_margin_weight",
@@ -818,6 +821,10 @@ def _input_binding(verified: dict[str, Any]) -> dict[str, Any]:
                 ),
             }
         )
+        if "p1_training_descriptor_authority" in verified:
+            payload["p1_training_descriptor_authority"] = copy.deepcopy(
+                verified["p1_training_descriptor_authority"]
+            )
     else:
         payload.update(
             {
@@ -1020,10 +1027,6 @@ def _verify_training_lock(
         raise ExecutorError(
             "--frozen-repo and --frozen-verifier-sha256 are required together"
         )
-    if frozen_repo is not None and reviewed_lock_file_sha256 is not None:
-        raise ExecutorError(
-            "frozen lock authority and reviewed-ablation lock authority are mutually exclusive"
-        )
     if frozen_repo is None:
         return (
             _verify_lock_with_sealed_runtime(
@@ -1034,13 +1037,30 @@ def _verify_training_lock(
         )
     assert frozen_verifier_sha256 is not None
     try:
-        return frozen_lock_verifier.verify_frozen_lock(
+        lock, authority = frozen_lock_verifier.verify_frozen_lock(
             lock_path,
             frozen_repo=frozen_repo,
             expected_verifier_sha256=frozen_verifier_sha256,
         )
     except frozen_lock_verifier.FrozenVerifierError as error:
         raise ExecutorError(f"frozen A1 lock verifier refused: {error}") from error
+    # A post-wave ablation needs two independent authorities: the historical
+    # verifier that can reconstruct the path-bound production lock, and the
+    # reviewed raw lock digest that binds the derived learner recipe.  These
+    # are complementary, not competing, trust claims.  Require both views to
+    # agree on the exact bytes before exposing the reviewed digest downstream.
+    if reviewed_lock_file_sha256 is not None:
+        if not re.fullmatch(r"sha256:[0-9a-f]{64}", reviewed_lock_file_sha256):
+            raise ExecutorError("reviewed A1 lock file sha256 is malformed")
+        actual_lock_sha256 = _file_sha256(lock_path)
+        if (
+            actual_lock_sha256 != reviewed_lock_file_sha256
+            or authority.get("lock_file_sha256") != reviewed_lock_file_sha256
+        ):
+            raise ExecutorError(
+                "frozen verifier and reviewed ablation disagree on A1 lock bytes"
+            )
+    return lock, authority
 
 
 def _require_a1_science(lock: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -2357,6 +2377,7 @@ def bind_learner_ablation(
         effective[key] = value
     numeric_domains: dict[str, tuple[float | None, float | None, bool]] = {
         "epochs": (1.0, None, True),
+        "max_steps": (1.0, None, True),
         "lr": (0.0, None, False),
         "lr_warmup_steps": (0.0, None, True),
         "value_lr_mult": (0.0, None, False),
@@ -2382,6 +2403,7 @@ def bind_learner_ablation(
         "lr_schedule": {"flat", "cosine", "linear"},
         "soft_target_source": {"prefer_policy", "prefer_scores", "policy", "scores"},
         "advantage_policy_weighting": {"none", "outcome_value"},
+        "per_game_policy_weight_mode": {"equal", "sqrt"},
         "per_game_value_weight_mode": {"equal", "sqrt"},
     }
     for key, value in overrides.items():
@@ -2710,6 +2732,92 @@ def _published_executor_authority(
     return published
 
 
+def _bind_p1_training_descriptor(
+    verified: dict[str, Any],
+    *,
+    authority: Mapping[str, Any],
+    published_executor_authority: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Select the centrally issued trainer-visible KL scope for one P1 arm."""
+
+    arm_id = str(authority.get("arm_id"))
+    descriptor_authority = authority.get("training_descriptor_authority")
+    try:
+        descriptor_authority = (
+            aux_coordinator._verify_p1_training_descriptor_authority(  # noqa: SLF001
+                descriptor_authority,
+                arm_id=arm_id,
+                composite=authority["composite"],
+                eligibility=authority["kl_eligibility_authority"],
+            )
+        )
+    except (KeyError, TypeError, aux_coordinator.CoordinatorError) as error:
+        raise ExecutorError(f"P1 training descriptor authority refused: {error}") from error
+
+    if descriptor_authority["kind"] == "base":
+        descriptor_path = Path(verified["data_path"]).expanduser().resolve(strict=True)
+    else:
+        published_path = Path(
+            str(published_executor_authority.get("path", ""))
+        ).expanduser().resolve(strict=True)
+        descriptor_path = (
+            published_path.parent / str(descriptor_authority["filename"])
+        ).resolve(strict=True)
+        if descriptor_path.parent != published_path.parent:
+            raise ExecutorError("P1 derived descriptor escaped the central transaction")
+        try:
+            aux_coordinator._verify_p1_derived_training_descriptor_file(  # noqa: SLF001
+                published_path.parent,
+                arm_id=arm_id,
+                authority=descriptor_authority,
+            )
+        except (OSError, aux_coordinator.CoordinatorError) as error:
+            raise ExecutorError(f"P1 derived training descriptor refused: {error}") from error
+    try:
+        descriptor = json.loads(descriptor_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ExecutorError(f"cannot read P1 training descriptor: {error}") from error
+    if (
+        not isinstance(descriptor, dict)
+        or _file_sha256(descriptor_path)
+        != descriptor_authority["descriptor_file_sha256"]
+        or _value_sha256(descriptor)
+        != descriptor_authority["descriptor_fingerprint"]
+        or descriptor.get("policy_kl_anchor_component_ids")
+        != descriptor_authority["policy_kl_anchor_component_ids"]
+    ):
+        raise ExecutorError("P1 trainer-visible descriptor differs from central authority")
+    if descriptor_authority["base_descriptor_sha256"] != verified[
+        "corpus_meta_file_sha256"
+    ]:
+        raise ExecutorError("P1 derived descriptor does not descend from verified data")
+
+    result = dict(verified)
+    result["p1_training_descriptor_authority"] = copy.deepcopy(
+        descriptor_authority
+    )
+    if descriptor_authority["kind"] != "base":
+        result.update(
+            {
+                "data_path": descriptor_path,
+                "corpus_meta_file_sha256": descriptor_authority[
+                    "descriptor_file_sha256"
+                ],
+                "descriptor_fingerprint": descriptor_authority[
+                    "descriptor_fingerprint"
+                ],
+                "data_fingerprint": train_bc._training_data_fingerprint(  # noqa: SLF001
+                    str(descriptor_path), "memmap"
+                ),
+                "validation_path": descriptor_path,
+                "validation_file_sha256": descriptor_authority[
+                    "descriptor_file_sha256"
+                ],
+            }
+        )
+    return result
+
+
 def bind_p1_arm(
     verified: dict[str, Any],
     *,
@@ -2733,6 +2841,7 @@ def bind_p1_arm(
         "current_parent_authority",
         "composite",
         "kl_eligibility_authority",
+        "training_descriptor_authority",
         "p1_sample_evidence_receipt",
         "recovery_authority",
         "recovery_component_semantics",
@@ -2897,9 +3006,16 @@ def bind_p1_arm(
             "sample_order_sha256": authority["kl_eligibility_authority"][
                 "sample_order_sha256"
             ],
+            "training_descriptor_authority": copy.deepcopy(
+                authority["training_descriptor_authority"]
+            ),
         },
     }
-    result = dict(verified)
+    result = _bind_p1_training_descriptor(
+        verified,
+        authority=authority,
+        published_executor_authority=published_executor_authority,
+    )
     result["bound_recipe"] = base
     result["recipe"] = copy.deepcopy(recipe)
     result["p1_arm_executor_authority"] = copy.deepcopy(authority)
@@ -3778,14 +3894,26 @@ def _build_direct_train_command(
         command.extend(["--sampler-seed", str(recipe["sampler_seed"])])
     if (
         verified.get("data_kind") == "production_composite_v2"
-        and verified.get("learner_ablation") is None
         and verified.get("central_learner_binding") is None
-        and int(recipe.get("max_steps", 0)) == 128
     ):
-        # Preserve the useful part of the dose curve without launching chained
-        # candidates.  Step 64, 96, and the ordinary terminal step 128 all come
-        # from one fresh-Adam trajectory and one authenticated sample order.
-        command.extend(["--checkpoint-steps", "64,96"])
+        max_steps = int(recipe.get("max_steps", 0))
+        if verified.get("learner_ablation") is None and max_steps == 128:
+            # Preserve the useful part of the production dose curve without
+            # launching chained candidates.
+            command.extend(["--checkpoint-steps", "64,96"])
+        elif verified.get("learner_ablation") is not None and max_steps > 128:
+            # Long diagnostic trajectories retain the predeclared short-dose
+            # frontier from the same fresh-Adam/sample-order trajectory. This
+            # makes dose observable without chaining a terminal candidate into
+            # another learner or paying for four redundant prefixes.
+            checkpoints = []
+            step = 128
+            while step < max_steps:
+                checkpoints.append(step)
+                step *= 2
+            command.extend(
+                ["--checkpoint-steps", ",".join(map(str, checkpoints))]
+            )
     if verified.get("data_kind") == "production_composite_v2":
         # The production 64/12/4/20 descriptor has three corrected components
         # plus homogeneous legacy replay. train_bc authenticates and routes
@@ -4707,6 +4835,7 @@ def _write_retry_contract_no_clobber(path: Path, payload: dict[str, Any]) -> Non
             handle.write(json.dumps(payload, indent=2, sort_keys=True).encode("utf-8"))
             handle.write(b"\n")
             handle.flush()
+            os.fchmod(handle.fileno(), 0o444)
             os.fsync(handle.fileno())
         os.link(tmp, path)
         _fsync_directory(path.parent)
@@ -6061,10 +6190,42 @@ def _direct_lineage_dose(
         if int(recipe["world_size"]) == 1
         else steps * global_batch_size
     )
-    # Historical sealed recipes and reports predate exact objective counters.
-    # A derived recipe carrying the typed policy-aux field must use the current
-    # trainer and therefore fails closed unless all exact counters are present.
-    if report_payload is not None and "policy_aux_active_batch_size" in recipe:
+    # Historical sealed reports predate exact objective counters.  Current
+    # trainers emit the full counter set even when the policy-aux sampler is
+    # disabled; bind that evidence whenever any of it is present and refuse a
+    # partial counter surface.  Gating this on a recipe flag silently discarded
+    # the ordinary production learner's exact 65k-policy/524k-value exposure.
+    objective_counter_fields = {
+        "base_training_row_draws",
+        "policy_aux_training_row_draws",
+        "policy_base_active_rows",
+        "policy_aux_active_rows",
+        "policy_total_active_rows",
+        "value_active_rows",
+        "policy_kl_anchor_eligible_rows",
+        "total_training_row_draws",
+    }
+    present_objective_counter_fields = (
+        set(report_payload).intersection(objective_counter_fields)
+        if report_payload is not None
+        else set()
+    )
+    exact_objective_specific_fields = objective_counter_fields - {
+        "base_training_row_draws",
+        "total_training_row_draws",
+    }
+    if present_objective_counter_fields.intersection(
+        exact_objective_specific_fields
+    ):
+        if present_objective_counter_fields != objective_counter_fields:
+            missing = sorted(
+                objective_counter_fields - present_objective_counter_fields
+            )
+            raise ExecutorError(
+                "A1 training report has a partial exact objective-dose surface: "
+                f"missing={missing}"
+            )
+        assert report_payload is not None
         objective_exposure = _exact_objective_exposure(report_payload)
         if int(objective_exposure["base_sampled_rows"]) != sampled_rows:
             raise ExecutorError(
@@ -6190,6 +6351,23 @@ def _bind_training_report(
             "a1_aux_regularization_binding"
         ) != matched_aux:
             raise ExecutorError("central AUX child did not echo pointer-arm authority")
+        if central_binding.get("stage") == "P1":
+            descriptor_authority = verified.get(
+                "p1_training_descriptor_authority"
+            )
+            expected_anchor_rows = (
+                descriptor_authority.get(
+                    "expected_policy_kl_anchor_eligible_rows"
+                )
+                if isinstance(descriptor_authority, dict)
+                else None
+            )
+            if payload.get("policy_kl_anchor_eligible_rows") != expected_anchor_rows:
+                raise ExecutorError(
+                    "P1 trainer-visible KL-anchor rows differ from issued descriptor: "
+                    f"expected={expected_anchor_rows!r} "
+                    f"actual={payload.get('policy_kl_anchor_eligible_rows')!r}"
+                )
         payload["a1_realized_central_sample_evidence_sha256"] = _value_sha256(
             realized
         )
@@ -6463,6 +6641,40 @@ def _verify_matched_aux_torch_artifacts(
         raise ExecutorError(
             f"matched AUX Adam state cannot attach to reconstructed model: {error}"
         ) from error
+
+
+def _strict_load_production_entity_checkpoint(
+    checkpoint: Path, *, where: str
+) -> None:
+    """Reconstruct an ordinary production checkpoint with an exact state load.
+
+    ``torch.load`` proves only that pickle deserialization succeeds.  The
+    completion boundary must also prove that the declared architecture and all
+    enabled parameter tensors form a loadable inference model.  This catches
+    missing, unexpected, or shape-drifted state before a terminal claim can be
+    published.
+    """
+
+    try:
+        from catan_zero.rl.entity_token_policy import EntityGraphPolicy
+
+        policy = EntityGraphPolicy.load(
+            checkpoint,
+            device="cpu",
+            strict_metadata=True,
+            allow_missing_optional_parameters=False,
+        )
+    except Exception as error:
+        raise ExecutorError(
+            f"{where} cannot strict-load as the declared entity model: {error}"
+        ) from error
+    parameter_count = sum(
+        parameter.numel() for parameter in policy.model.parameters()
+    )
+    if not 30_000_000 <= parameter_count <= 40_000_000:
+        raise ExecutorError(
+            f"{where} strict-loaded an unexpected parameter count: {parameter_count}"
+        )
 
 
 def _require_production_event_history_surface(
@@ -7107,6 +7319,10 @@ def _verify_training_outputs(
                     f"production intermediate checkpoint step {step} lost "
                     "award/runtime authority"
                 )
+            _strict_load_production_entity_checkpoint(
+                expected_path,
+                where=f"production intermediate checkpoint step {step}",
+            )
         _fsync_file(expected_path)
         verified_intermediate.append(expected_record)
     if "policy_aux_active_batch_size" in recipe:
@@ -7301,6 +7517,9 @@ def _verify_training_outputs(
             raise ExecutorError(
                 "production terminal checkpoint lost award/runtime authority"
             )
+        _strict_load_production_entity_checkpoint(
+            checkpoint, where="production terminal checkpoint"
+        )
     metrics = report_payload.get("metrics")
     if (
         not isinstance(metrics, list)
@@ -8203,6 +8422,183 @@ def _require_final_matched_aux_command_binding(
         raise ExecutorError("matched AUX command differs from canonical final argv")
 
 
+def _one_dose_claim_and_receipt_schemas(
+    verified: Mapping[str, Any],
+) -> tuple[str, str]:
+    if "retry_contract" in verified:
+        return RETRY_CLAIM_SCHEMA, RETRY_RECEIPT_SCHEMA
+    if isinstance(verified.get("central_learner_binding"), dict):
+        return CENTRAL_CLAIM_SCHEMA, CENTRAL_RECEIPT_SCHEMA
+    if verified.get("learner_ablation") is not None:
+        return ABLATION_CLAIM_SCHEMA, ABLATION_RECEIPT_SCHEMA
+    if verified.get("function_preserving_upgrade") is not None:
+        return UPGRADE_CLAIM_SCHEMA, UPGRADE_RECEIPT_SCHEMA
+    return CLAIM_SCHEMA, RECEIPT_SCHEMA
+
+
+def _recover_terminal_complete_receipt(
+    *,
+    verified: dict[str, Any],
+    command: list[str],
+    checkpoint: Path,
+    report: Path,
+    receipt: Path,
+    gpu: int,
+    publish: bool,
+) -> dict[str, Any] | None:
+    """Recover only the receipt-publication gap after a proven completion.
+
+    This never resumes or re-runs training.  Recovery is available only when
+    the durable claim is already terminal-complete, the receipt is absent, and
+    the current command/input/output replay reproduces every scientific
+    binding and output digest recorded in that claim.
+    """
+
+    claim_path = _claim_path(verified)
+    if not claim_path.exists() and not claim_path.is_symlink():
+        return None
+    if claim_path.is_symlink() or not claim_path.is_file():
+        raise ExecutorError("terminal completion recovery claim must be a regular file")
+    claim_stat = claim_path.stat()
+    if stat.S_IMODE(claim_stat.st_mode) != 0o444:
+        raise ExecutorError("terminal completion recovery claim mode drift")
+    claim_identity = str(
+        verified.get("claim_identity_sha256", verified["contract_sha256"])
+    )
+    claim = _load_claim_state(
+        claim_path,
+        contract_sha256=str(verified["contract_sha256"]),
+        claim_identity_sha256=claim_identity,
+    )
+    if claim.get("status") != "complete":
+        return None
+    if receipt.exists() or receipt.is_symlink():
+        return None
+
+    expected_claim_schema, receipt_schema = _one_dose_claim_and_receipt_schemas(
+        verified
+    )
+    output_namespace = _canonical_one_dose_output_namespace(
+        checkpoint=checkpoint,
+        report=report,
+        receipt=receipt,
+        one_dose_claim=claim_path,
+    )
+    # A different output namespace is a forbidden second dose, not a recovery
+    # attempt.  Let the ordinary claim path produce its established refusal.
+    if claim.get("receipt_target") != output_namespace["receipt"]:
+        return None
+    selected_gpus = _selected_gpus(verified, fallback_gpu=gpu)
+    environment = _child_environment(selected_gpus)
+    execution_binding = _execution_binding(command=command, environment=environment)
+    input_binding = _input_binding(verified)
+    transaction_sha256 = _training_transaction_sha256(
+        command=command, input_binding=input_binding
+    )
+    outputs = claim.get("outputs")
+    expected_static = {
+        "schema_version": expected_claim_schema,
+        "contract_sha256": verified["contract_sha256"],
+        "status": "complete",
+        "lock": str(verified["lock_path"]),
+        "lock_file_sha256": verified["lock_file_sha256"],
+        "corpus": str(verified["data_path"]),
+        "corpus_meta_file_sha256": verified["corpus_meta_file_sha256"],
+        "payload_inventory_sha256": verified["payload_inventory_sha256"],
+        "validation_manifest": str(verified["validation_path"]),
+        "validation_manifest_file_sha256": verified["validation_file_sha256"],
+        "producer_checkpoint_sha256": verified["producer"]["sha256"],
+        "learner_training_recipe_sha256": _value_sha256(
+            verified.get("bound_recipe", verified["recipe"])
+        ),
+        "command": command,
+        "command_sha256": _value_sha256(command),
+        "execution_binding": execution_binding,
+        "input_binding": input_binding,
+        "training_transaction_sha256": transaction_sha256,
+        "trainer_authority": verified.get("trainer_authority"),
+        "lock_verifier_authority": verified.get("lock_verifier_authority"),
+        "world_size": int(verified["recipe"]["world_size"]),
+        "gpu": gpu,
+        "gpus": list(selected_gpus),
+        "training_topology": verified.get("training_topology"),
+        "ddp_canary": verified.get("ddp_canary"),
+        "production_sampling_receipt_sha256": verified.get(
+            "production_sampling_receipt_sha256"
+        ),
+        "validation_split_receipt_sha256": verified.get(
+            "validation_split_receipt_sha256"
+        ),
+        "returncode": 0,
+        "failure": None,
+        "receipt_target": output_namespace["receipt"],
+    }
+    drift = {
+        key: {"expected": value, "actual": claim.get(key)}
+        for key, value in expected_static.items()
+        if claim.get(key) != value
+    }
+    if drift:
+        raise ExecutorError(
+            f"terminal completion recovery binding drift: {drift}"
+        )
+    if (
+        isinstance(claim.get("started_unix_ns"), bool)
+        or not isinstance(claim.get("started_unix_ns"), int)
+        or isinstance(claim.get("finished_unix_ns"), bool)
+        or not isinstance(claim.get("finished_unix_ns"), int)
+        or int(claim["finished_unix_ns"]) < int(claim["started_unix_ns"])
+        or not isinstance(claim.get("gpu_name"), str)
+        or not isinstance(claim.get("gpu_names"), list)
+        or len(claim["gpu_names"]) != len(selected_gpus)
+        or not isinstance(outputs, dict)
+    ):
+        raise ExecutorError("terminal completion recovery runtime/output evidence drift")
+    if (
+        outputs.get("checkpoint") != output_namespace["checkpoint"]
+        or outputs.get("optimizer_sidecar") != output_namespace["optimizer_sidecar"]
+        or outputs.get("training_progress") != output_namespace["training_progress"]
+        or outputs.get("report") != output_namespace["report"]
+    ):
+        raise ExecutorError("terminal completion recovery output namespace drift")
+
+    if claim_identity != str(verified["contract_sha256"]):
+        if claim.get("claim_identity_sha256") != claim_identity:
+            raise ExecutorError("terminal completion recovery derived identity drift")
+    if "retry_contract" in verified:
+        expected_retry = {
+            "path": str(verified["retry_contract_path"]),
+            "file_sha256": verified["retry_contract_file_sha256"],
+            "retry_contract_sha256": verified["retry_contract"][
+                "retry_contract_sha256"
+            ],
+        }
+        if claim.get("retry_contract") != expected_retry:
+            raise ExecutorError("terminal completion recovery retry authority drift")
+
+    reverified_outputs = _verify_training_outputs(
+        checkpoint=checkpoint,
+        report=report,
+        verified=verified,
+        execution_binding=execution_binding,
+        command=command,
+    )
+    if reverified_outputs != outputs or claim.get("lineage_dose") != outputs.get(
+        "lineage_dose"
+    ):
+        raise ExecutorError("terminal completion recovery output evidence drift")
+
+    evidence = dict(claim)
+    evidence.pop("state_sha256", None)
+    evidence.pop("receipt_target", None)
+    evidence["schema_version"] = receipt_schema
+    evidence["claim"] = str(claim_path)
+    evidence["claim_state_sha256"] = claim["state_sha256"]
+    if not publish:
+        return evidence
+    return _write_receipt_no_clobber(receipt, evidence)
+
+
 def _execute_locked(
     *,
     verified: dict[str, Any],
@@ -8540,6 +8936,18 @@ def execute(
 ) -> dict[str, Any]:
     """Execute one dose while owning every physical GPU in its topology."""
 
+    recovered = _recover_terminal_complete_receipt(
+        verified=verified,
+        command=command,
+        checkpoint=checkpoint,
+        report=report,
+        receipt=receipt,
+        gpu=gpu,
+        publish=True,
+    )
+    if recovered is not None:
+        return recovered
+
     kwargs = {
         "verified": verified,
         "command": command,
@@ -8826,15 +9234,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise ExecutorError(
                 "--frozen-repo and --frozen-verifier-sha256 are required together"
             )
-        if frozen_requested and (
-            generic_ablation_requested
-            or aux_requested
-            or p1_requested
-            or final_requested
-        ):
-            raise ExecutorError(
-                "frozen production-lock authority cannot be combined with a reviewed ablation authority"
-            )
         verified = verify_training_inputs(
             lock_path=args.lock,
             data_path=args.data,
@@ -9022,8 +9421,18 @@ def main(argv: Sequence[str] | None = None) -> int:
                 publish=bool(args.go),
             )
         claim = _claim_path(verified)
-        _require_fresh_outputs(checkpoint, report, receipt, claim=claim)
-        _require_unconsumed_contract(verified)
+        recovery_evidence = _recover_terminal_complete_receipt(
+            verified=verified,
+            command=command,
+            checkpoint=checkpoint,
+            report=report,
+            receipt=receipt,
+            gpu=args.gpu,
+            publish=False,
+        )
+        if recovery_evidence is None:
+            _require_fresh_outputs(checkpoint, report, receipt, claim=claim)
+            _require_unconsumed_contract(verified)
         selected_gpus = _selected_gpus(verified, fallback_gpu=args.gpu)
         child_environment = _child_environment(selected_gpus)
         execution_binding = _execution_binding(
@@ -9035,7 +9444,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         plan = {
             "schema_version": PLAN_SCHEMA,
-            "mode": "go" if args.go else "dry-run",
+            "mode": (
+                "recover-terminal-receipt"
+                if recovery_evidence is not None and args.go
+                else "recover-terminal-receipt-dry-run"
+                if recovery_evidence is not None
+                else "go"
+                if args.go
+                else "dry-run"
+            ),
             "contract_sha256": verified["contract_sha256"],
             "claim_identity_sha256": verified.get(
                 "claim_identity_sha256", verified["contract_sha256"]
