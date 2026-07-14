@@ -104,6 +104,12 @@ AUDIT_SCHEMA = "a1-post-wave-audit-v2"
 RELOCATED_AUDIT_SCHEMA = "a1-post-wave-audit-v3"
 DUAL_ARM_AUDIT_SCHEMA = "a1-dual-arm-post-wave-audit-v1"
 DUAL_ARM_SELECTED_GAMES_SCHEMA = "a1-dual-arm-selected-training-games-v1"
+TARGET_ACTIVATION_SCHEMA = "a1-selected-target-activation-v1"
+TARGET_ACTIVATION_CHUNK_SCHEMA = "a1-selected-target-activation-chunk-v1"
+# A two-sided Hoeffding bound is used because the full/fast decision is a
+# Bernoulli draw for every non-forced root.  The bound is family-wise across
+# source categories and deliberately has no fitted/tunable tolerance.
+TARGET_ACTIVATION_FAMILYWISE_ALPHA = 1.0e-6
 HARVEST_RELOCATION_SCHEMA = "a1-fleet-harvest-relocation-v1"
 GUARD_SYNC_SCHEMA = "a1-pre-wave-generation-guard-sync-v1"
 CLAIM_RECEIPT_SCHEMA = "a1-seed-claim-transaction-v1"
@@ -9071,6 +9077,334 @@ def _require_shard_feature_semantics(
     }
 
 
+_TARGET_ACTIVATION_COUNT_KEYS = (
+    "rows",
+    "forced_rows",
+    "non_forced_rows",
+    "full_search_non_forced_rows",
+    "fast_search_non_forced_rows",
+    "policy_active_rows",
+    "policy_inactive_rows",
+    "value_active_rows",
+)
+
+
+def _sha256_labeled_arrays(
+    arrays: Sequence[tuple[str, np.ndarray]],
+) -> str:
+    """Hash typed row evidence without constructing a multi-million-row JSON list."""
+
+    digest = hashlib.sha256()
+    digest.update((TARGET_ACTIVATION_CHUNK_SCHEMA + "\0").encode("ascii"))
+    for label, raw in arrays:
+        value = np.ascontiguousarray(raw)
+        label_bytes = label.encode("ascii")
+        dtype_bytes = value.dtype.str.encode("ascii")
+        digest.update(len(label_bytes).to_bytes(2, "little"))
+        digest.update(label_bytes)
+        digest.update(len(dtype_bytes).to_bytes(2, "little"))
+        digest.update(dtype_bytes)
+        digest.update(value.ndim.to_bytes(1, "little"))
+        for extent in value.shape:
+            digest.update(int(extent).to_bytes(8, "little", signed=False))
+        digest.update(value.tobytes(order="C"))
+    return "sha256:" + digest.hexdigest()
+
+
+def _selected_target_activation_chunk(
+    payload: Any,
+    *,
+    game_seeds: np.ndarray,
+    selected_mask: np.ndarray,
+    where: str,
+) -> dict[str, Any]:
+    """Authenticate the exact selected-row policy/value gradient switches.
+
+    This is intentionally shared by post-wave audit and composite materialization.
+    The producer contract is binary: only non-forced FULL rows train policy and
+    every selected row trains value.  Merely checking non-negative multiplier
+    mass would allow an apparently valid wave to train a materially different
+    objective.
+    """
+
+    required = {
+        "decision_index",
+        "is_forced",
+        "used_full_search",
+        "policy_weight_multiplier",
+        "value_weight_multiplier",
+    }
+    missing = sorted(required.difference(payload.files))
+    if missing:
+        raise ContractError(
+            f"{where}: missing target-activation columns {missing}"
+        )
+    seeds = np.asarray(game_seeds)
+    mask = np.asarray(selected_mask)
+    if seeds.ndim != 1 or mask.shape != seeds.shape or mask.dtype.kind != "b":
+        raise ContractError(f"{where}: selected target-activation mask is malformed")
+
+    raw_forced = np.asarray(payload["is_forced"])
+    raw_full = np.asarray(payload["used_full_search"])
+    if raw_forced.shape != seeds.shape or raw_forced.dtype.kind != "b":
+        raise ContractError(f"{where}: is_forced must be row-aligned boolean")
+    if raw_full.shape != seeds.shape or raw_full.dtype.kind != "b":
+        raise ContractError(
+            f"{where}: used_full_search must be row-aligned boolean"
+        )
+    decision = np.asarray(payload["decision_index"])
+    policy = np.asarray(payload["policy_weight_multiplier"])
+    value = np.asarray(payload["value_weight_multiplier"])
+    for name, raw in (
+        ("decision_index", decision),
+        ("policy_weight_multiplier", policy),
+        ("value_weight_multiplier", value),
+    ):
+        if raw.shape != seeds.shape:
+            raise ContractError(f"{where}: {name} is not row-aligned")
+    if policy.dtype.kind not in "fc" or value.dtype.kind not in "fc":
+        raise ContractError(
+            f"{where}: target-activation multipliers must be floating-point"
+        )
+
+    selected_seeds = np.asarray(seeds[mask], dtype="<i8")
+    selected_decision = np.asarray(decision[mask], dtype="<i8")
+    forced = np.asarray(raw_forced[mask], dtype=np.bool_)
+    used_full = np.asarray(raw_full[mask], dtype=np.bool_)
+    selected_policy = np.asarray(policy[mask], dtype=np.float64)
+    selected_value = np.asarray(value[mask], dtype=np.float64)
+    expected_policy = np.asarray(used_full & ~forced, dtype=np.uint8)
+
+    if np.any(~np.isfinite(selected_policy)) or np.any(
+        (selected_policy != 0.0) & (selected_policy != 1.0)
+    ):
+        raise ContractError(
+            f"{where}: policy_weight_multiplier must be finite and exactly binary"
+        )
+    if not np.array_equal(selected_policy, expected_policy.astype(np.float64)):
+        mismatches = int(
+            np.count_nonzero(
+                selected_policy != expected_policy.astype(np.float64)
+            )
+        )
+        raise ContractError(
+            f"{where}: policy_weight_multiplier disagrees with "
+            f"used_full_search && !is_forced on {mismatches} selected rows"
+        )
+    if np.any(~np.isfinite(selected_value)) or np.any(selected_value != 1.0):
+        raise ContractError(
+            f"{where}: value_weight_multiplier must be finite and exactly 1"
+        )
+
+    rows = int(selected_seeds.size)
+    forced_rows = int(np.count_nonzero(forced))
+    full_rows = int(np.count_nonzero(expected_policy))
+    counts = {
+        "rows": rows,
+        "forced_rows": forced_rows,
+        "non_forced_rows": rows - forced_rows,
+        "full_search_non_forced_rows": full_rows,
+        "fast_search_non_forced_rows": rows - forced_rows - full_rows,
+        "policy_active_rows": full_rows,
+        "policy_inactive_rows": rows - full_rows,
+        "value_active_rows": rows,
+    }
+    row_activation_sha256 = _sha256_labeled_arrays(
+        (
+            ("game_seed", selected_seeds),
+            ("decision_index", selected_decision),
+            ("is_forced", forced.astype(np.uint8)),
+            ("used_full_search", used_full.astype(np.uint8)),
+            ("policy_weight_multiplier", expected_policy),
+            ("value_weight_multiplier", np.ones(rows, dtype=np.uint8)),
+        )
+    )
+    chunk: dict[str, Any] = {
+        "schema_version": TARGET_ACTIVATION_CHUNK_SCHEMA,
+        "counts": counts,
+        "counts_sha256": _digest_value(counts),
+        "row_activation_sha256": row_activation_sha256,
+    }
+    chunk["chunk_sha256"] = _digest_value(chunk)
+    return chunk
+
+
+def _normalize_target_activation_chunk(raw: object) -> dict[str, Any]:
+    if not isinstance(raw, Mapping):
+        raise ContractError("target-activation chunk is not an object")
+    chunk = dict(raw)
+    if set(chunk) != {
+        "schema_version",
+        "job_id",
+        "source_sha256",
+        "counts",
+        "counts_sha256",
+        "row_activation_sha256",
+        "chunk_sha256",
+    }:
+        raise ContractError("target-activation chunk fields differ from schema")
+    counts = chunk.get("counts")
+    if (
+        chunk.get("schema_version") != TARGET_ACTIVATION_CHUNK_SCHEMA
+        or not isinstance(chunk.get("job_id"), str)
+        or not chunk["job_id"]
+        or not isinstance(chunk.get("source_sha256"), str)
+        or re.fullmatch(r"sha256:[0-9a-f]{64}", chunk["source_sha256"]) is None
+        or not isinstance(counts, Mapping)
+        or set(counts) != set(_TARGET_ACTIVATION_COUNT_KEYS)
+        or any(
+            isinstance(value, bool) or not isinstance(value, int) or value < 0
+            for value in counts.values()
+        )
+        or chunk.get("counts_sha256") != _digest_value(dict(counts))
+        or not isinstance(chunk.get("row_activation_sha256"), str)
+        or re.fullmatch(
+            r"sha256:[0-9a-f]{64}", chunk["row_activation_sha256"]
+        )
+        is None
+    ):
+        raise ContractError("target-activation chunk identity/count digest drift")
+    base = {key: value for key, value in chunk.items() if key != "chunk_sha256"}
+    if chunk.get("chunk_sha256") != _digest_value(base):
+        raise ContractError("target-activation chunk digest drift")
+    return chunk
+
+
+def _build_target_activation_report(
+    chunks_by_category: Mapping[str, Sequence[Mapping[str, Any]]],
+    *,
+    categories: Sequence[str],
+    sealed_p_full: float,
+) -> dict[str, Any]:
+    """Aggregate chunks and apply a fixed family-wise Bernoulli contract."""
+
+    expected_categories = tuple(map(str, categories))
+    if set(chunks_by_category) != set(expected_categories):
+        raise ContractError("target-activation categories differ from sealed sources")
+    if not math.isfinite(float(sealed_p_full)) or float(sealed_p_full) != 0.25:
+        raise ContractError(
+            f"target-activation contract requires sealed p_full=0.25, got {sealed_p_full!r}"
+        )
+    category_count = len(expected_categories)
+    if category_count <= 0:
+        raise ContractError("target-activation contract has no source categories")
+    statistical_contract = {
+        "method": "two_sided_hoeffding_familywise_v1",
+        "familywise_alpha": TARGET_ACTIVATION_FAMILYWISE_ALPHA,
+        "category_count": category_count,
+        "expected_non_forced_full_search_rate": 0.25,
+        "allowed_count_deviation_formula": (
+            "ceil(sqrt(n/2*ln(2*category_count/familywise_alpha)))"
+        ),
+    }
+    category_reports: dict[str, Any] = {}
+    all_passed = True
+    for category in expected_categories:
+        chunks = [
+            _normalize_target_activation_chunk(chunk)
+            for chunk in chunks_by_category[category]
+        ]
+        counts = {key: 0 for key in _TARGET_ACTIVATION_COUNT_KEYS}
+        for chunk in chunks:
+            for key in _TARGET_ACTIVATION_COUNT_KEYS:
+                counts[key] += int(chunk["counts"][key])
+        if (
+            counts["forced_rows"] + counts["non_forced_rows"] != counts["rows"]
+            or counts["full_search_non_forced_rows"]
+            + counts["fast_search_non_forced_rows"]
+            != counts["non_forced_rows"]
+            or counts["policy_active_rows"]
+            != counts["full_search_non_forced_rows"]
+            or counts["policy_active_rows"] + counts["policy_inactive_rows"]
+            != counts["rows"]
+            or counts["value_active_rows"] != counts["rows"]
+        ):
+            raise ContractError(
+                f"target-activation counts are internally inconsistent for {category}"
+            )
+        n = counts["non_forced_rows"]
+        observed = counts["full_search_non_forced_rows"]
+        expected = float(n) * 0.25
+        allowed = (
+            0
+            if n == 0
+            else int(
+                math.ceil(
+                    math.sqrt(
+                        float(n)
+                        / 2.0
+                        * math.log(
+                            2.0
+                            * float(category_count)
+                            / TARGET_ACTIVATION_FAMILYWISE_ALPHA
+                        )
+                    )
+                )
+            )
+        )
+        deviation = abs(float(observed) - expected)
+        passed = bool(n > 0 and deviation <= float(allowed))
+        all_passed = all_passed and passed
+        category_report: dict[str, Any] = {
+            "counts": counts,
+            "counts_sha256": _digest_value(counts),
+            "chunks": chunks,
+            "chunks_sha256": _digest_value(chunks),
+            "observed_non_forced_full_search_rate": (
+                float(observed) / float(n) if n else None
+            ),
+            "expected_full_search_count": expected,
+            "observed_count_deviation": deviation,
+            "allowed_count_deviation": allowed,
+            "full_search_rate_passed": passed,
+        }
+        category_report["activation_sha256"] = _digest_value(category_report)
+        category_reports[category] = category_report
+    report: dict[str, Any] = {
+        "schema_version": TARGET_ACTIVATION_SCHEMA,
+        "policy_activation_rule": (
+            "policy_weight_multiplier == int(used_full_search and not is_forced)"
+        ),
+        "value_activation_rule": "value_weight_multiplier == 1.0",
+        "sealed_p_full": 0.25,
+        "statistical_contract": statistical_contract,
+        "categories": category_reports,
+        "categories_sha256": _digest_value(category_reports),
+        "passed": all_passed,
+    }
+    report["target_activation_sha256"] = _digest_value(report)
+    return report
+
+
+def _validate_target_activation_report(
+    raw: object,
+    *,
+    categories: Sequence[str],
+    sealed_p_full: float,
+) -> dict[str, Any]:
+    if not isinstance(raw, Mapping):
+        raise ContractError("post-wave audit has no target-activation contract")
+    category_payload = raw.get("categories")
+    if not isinstance(category_payload, Mapping):
+        raise ContractError("target-activation category report is malformed")
+    chunks_by_category: dict[str, list[Mapping[str, Any]]] = {}
+    for category in categories:
+        value = category_payload.get(str(category))
+        if not isinstance(value, Mapping) or not isinstance(value.get("chunks"), list):
+            raise ContractError(
+                f"target-activation category {category} has no chunk inventory"
+            )
+        chunks_by_category[str(category)] = list(value["chunks"])
+    rebuilt = _build_target_activation_report(
+        chunks_by_category,
+        categories=categories,
+        sealed_p_full=sealed_p_full,
+    )
+    if dict(raw) != rebuilt or rebuilt["passed"] is not True:
+        raise ContractError("target-activation report/digest/statistical contract drift")
+    return rebuilt
+
+
 def audit_outputs(
     lock_path: Path,
     out_path: Path,
@@ -9106,6 +9440,7 @@ def audit_outputs(
                 f"frozen post-wave lock verification failed: {error}"
             ) from error
     game_contract = dict(lock["game_contract"])
+    enforce_target_activation = lock.get("schema_version") == LOCK_SCHEMA
     expected_games = {
         str(key): int(value) for key, value in game_contract["category_games"].items()
     }
@@ -9139,6 +9474,9 @@ def audit_outputs(
     job_selections: list[dict[str, Any]] = []
     selected_game_records: list[dict[str, Any]] = []
     target_information_regimes: Counter[str] = Counter()
+    target_activation_chunks: dict[str, list[dict[str, Any]]] = {
+        name: [] for name in expected_games
+    }
     feature_semantic_rows = 0
     adapter_version_counts: Counter[str] = Counter()
     event_history_width_counts: Counter[int] = Counter()
@@ -9428,6 +9766,7 @@ def audit_outputs(
         # game-level and deterministic; no reserve/truncated row contributes to
         # metrics, the holdout, or the accepted shard-row inventory below.
         job_shards: list[Path] = []
+        job_data_shard_records: dict[Path, dict[str, Any]] = {}
         seed_status: dict[int, tuple[bool, bool]] = {}
         active_seed_run: int | None = None
         active_decision_run: int | None = None
@@ -9473,6 +9812,7 @@ def audit_outputs(
                         ],
                     }
                 shard_records.append(data_shard_record)
+                job_data_shard_records[canonical_shard] = data_shard_record
                 with np.load(canonical_shard, allow_pickle=False) as payload:
                     game_seeds = np.asarray(payload["game_seed"], dtype=np.int64)
                     decision_indices = np.asarray(
@@ -9675,6 +10015,37 @@ def audit_outputs(
                         max_decisions=int(lock["generation"]["max_decisions"]),
                         where=job["job_id"],
                     )
+                    if enforce_target_activation:
+                        activation = _selected_target_activation_chunk(
+                            payload,
+                            game_seeds=game_seeds,
+                            selected_mask=selected_mask,
+                            where=f"{job['job_id']}:{shard.name}",
+                        )
+                        activation_chunk = {
+                            "schema_version": TARGET_ACTIVATION_CHUNK_SCHEMA,
+                            "job_id": str(job["job_id"]),
+                            "source_sha256": job_data_shard_records[shard]["sha256"],
+                            "counts": activation["counts"],
+                            "counts_sha256": activation["counts_sha256"],
+                            "row_activation_sha256": activation[
+                                "row_activation_sha256"
+                            ],
+                        }
+                        activation_chunk["chunk_sha256"] = _digest_value(
+                            activation_chunk
+                        )
+                        target_activation_chunks[str(job["category"])].append(
+                            activation_chunk
+                        )
+                        job_data_shard_records[shard]["target_activation"] = {
+                            "counts": activation_chunk["counts"],
+                            "counts_sha256": activation_chunk["counts_sha256"],
+                            "row_activation_sha256": activation_chunk[
+                                "row_activation_sha256"
+                            ],
+                            "chunk_sha256": activation_chunk["chunk_sha256"],
+                        }
                     forced += int(is_forced.sum())
                     full_active += int(np.sum(used_full & ~is_forced))
                     phases.update(phase.tolist())
@@ -9776,6 +10147,37 @@ def audit_outputs(
             "authenticated-empty event history uses mixed padded widths: "
             f"{dict(event_history_width_counts)}"
         )
+    target_activation_report: dict[str, Any] | None = None
+    if enforce_target_activation:
+        try:
+            search_operator = lock["science"]["search_operator"]
+            if (
+                search_operator.get("wide_roots_always_full") is not False
+                or search_operator.get("n_full_wide") is not None
+            ):
+                raise ContractError(
+                    "selected target-activation p_full proof requires no wide-root "
+                    "full-search override"
+                )
+            target_activation_report = _build_target_activation_report(
+                target_activation_chunks,
+                categories=tuple(expected_games),
+                sealed_p_full=float(search_operator["p_full"]),
+            )
+            if target_activation_report["passed"] is not True:
+                failed = [
+                    category
+                    for category, value in target_activation_report[
+                        "categories"
+                    ].items()
+                    if value["full_search_rate_passed"] is not True
+                ]
+                errors.append(
+                    "selected non-forced full-search rate violates sealed p_full=0.25 "
+                    f"Hoeffding contract for categories {failed}"
+                )
+        except (ContractError, KeyError, TypeError, ValueError) as error:
+            errors.append(f"target-activation contract failed: {error}")
     validation_contract = lock["post_wave_acceptance"]["validation_holdout"]
     validation_seed_manifest_path = out_path.with_suffix(".validation_seeds.json")
     selected_game_manifest_path = out_path.with_suffix(".selected_games.json")
@@ -9955,6 +10357,7 @@ def audit_outputs(
             "counts": dict(target_information_regimes),
         },
         "feature_semantics": feature_semantics_report,
+        "target_activation": target_activation_report,
         "reports": {
             "truncation": {
                 "selected_truncated_games": 0,

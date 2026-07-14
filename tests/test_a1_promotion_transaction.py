@@ -3072,6 +3072,67 @@ def test_calibration_gate_rejects_deployed_transform_drift(tmp_path: Path) -> No
         _execute(fixture, go=False)
 
 
+def test_calibration_accepts_trained_step_checkpoint_before_first_completed_epoch(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path)
+
+    def mark_step_sliced(source: dict) -> None:
+        source["readout_provenance"]["optimizer_steps"] = 64
+        source["readout_provenance"]["completed_epochs"] = 0
+
+    _mutate_evidence_source(
+        fixture,
+        kind="mechanism_calibration",
+        role="candidate_calibration",
+        mutate=mark_step_sliced,
+    )
+
+    plan = _execute(fixture, go=False)
+
+    assert plan["status"] == "dry_run"
+
+
+@pytest.mark.parametrize("invalid", [True, -1, None])
+def test_calibration_rejects_invalid_completed_epochs_for_trained_checkpoint(
+    tmp_path: Path,
+    invalid: object,
+) -> None:
+    fixture = _fixture(tmp_path)
+
+    def corrupt_completed_epochs(source: dict) -> None:
+        source["readout_provenance"]["completed_epochs"] = invalid
+
+    _mutate_evidence_source(
+        fixture,
+        kind="mechanism_calibration",
+        role="candidate_calibration",
+        mutate=corrupt_completed_epochs,
+    )
+
+    with pytest.raises(promotion.PromotionError, match="completed_epochs"):
+        _execute(fixture, go=False)
+
+
+def test_calibration_rejects_missing_completed_epochs_for_trained_checkpoint(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path)
+
+    def remove_completed_epochs(source: dict) -> None:
+        del source["readout_provenance"]["completed_epochs"]
+
+    _mutate_evidence_source(
+        fixture,
+        kind="mechanism_calibration",
+        role="candidate_calibration",
+        mutate=remove_completed_epochs,
+    )
+
+    with pytest.raises(promotion.PromotionError, match="completed_epochs"):
+        _execute(fixture, go=False)
+
+
 def _install_legacy_incumbent_bridge(fixture: dict, tmp_path: Path) -> Path:
     champion = fixture["champion"]
     historical = tmp_path / "gen3-historical-training-report.json"

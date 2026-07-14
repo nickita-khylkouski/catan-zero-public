@@ -44,6 +44,7 @@ def _lock(tmp_path: Path) -> dict:
         },
     ]
     return {
+        "schema_version": contract.LOCK_SCHEMA,
         "contract_sha256": "sha256:" + "a" * 64,
         "checkpoints": checkpoints,
         "source_categories": [
@@ -62,7 +63,14 @@ def _lock(tmp_path: Path) -> dict:
             "late_temperature_decisions": None,
             "late_temperature": 0.0,
         },
-        "science": {"search_operator": {"correct_rust_chance_spectra": True}},
+        "science": {
+            "search_operator": {
+                "correct_rust_chance_spectra": True,
+                "p_full": 0.25,
+                "n_full_wide": None,
+                "wide_roots_always_full": False,
+            }
+        },
         "fleet": {
             "jobs": [
                 {
@@ -121,7 +129,11 @@ def _write_source(path: Path, *, base_seed: int, version: int | None) -> None:
         "game_seed": seeds,
         "terminated": np.ones(2, dtype=bool),
         "truncated": np.zeros(2, dtype=bool),
+        "decision_index": np.zeros(2, dtype=np.int32),
+        "is_forced": np.zeros(2, dtype=bool),
+        "used_full_search": np.asarray([True, False]),
         "policy_weight_multiplier": np.asarray([1.0, 0.0], dtype=np.float32),
+        "value_weight_multiplier": np.ones(2, dtype=np.float32),
     }
     if version is not None:
         players = np.asarray(
@@ -169,6 +181,11 @@ def _write_training_source(
         "truncated": np.zeros(rows, dtype=bool),
         "policy_weight_multiplier": np.tile(
             np.asarray([1.0, 0.0], dtype=np.float32), game_count
+        ),
+        "value_weight_multiplier": np.ones(rows, dtype=np.float32),
+        "is_forced": np.zeros(rows, dtype=bool),
+        "used_full_search": np.tile(
+            np.asarray([True, False]), game_count
         ),
         "adapter_version": np.full(
             rows, CURRENT_RUST_ENTITY_ADAPTER_VERSION, dtype="U64"
@@ -363,7 +380,13 @@ def _historical_reference(
     return reference
 
 
-def _audit_fixture(tmp_path: Path, lock: dict, data_shards: list[dict]) -> dict:
+def _audit_fixture(
+    tmp_path: Path,
+    lock: dict,
+    data_shards: list[dict],
+    *,
+    selected_records: list[dict] | None = None,
+) -> dict:
     raw_records = []
     for job in lock["fleet"]["jobs"]:
         manifest = tmp_path / f"manifest-{job['category']}.json"
@@ -388,31 +411,87 @@ def _audit_fixture(tmp_path: Path, lock: dict, data_shards: list[dict]) -> dict:
                 "category": job["category"],
             }
         )
-    raw_records.extend(
-        {
+    activation_chunks = {
+        category: []
+        for category in ("current_producer", "recent_history", "hard_negative")
+    }
+    data_records = []
+    jobs = {str(job["job_id"]): job for job in lock["fleet"]["jobs"]}
+    if selected_records is None:
+        selected_records = list(_selection(lock)["records"])
+    selected_by_job = {
+        job_id: {
+            int(record["game_seed"])
+            for record in selected_records
+            if str(record["job_id"]) == job_id
+        }
+        for job_id in jobs
+    }
+    for record in data_shards:
+        source = Path(record["path"]).resolve()
+        job = jobs[str(record["job_id"])]
+        with np.load(source, allow_pickle=False) as payload:
+            seeds = np.asarray(payload["game_seed"], dtype=np.int64)
+            selected_mask = np.isin(
+                seeds,
+                np.asarray(sorted(selected_by_job[str(job["job_id"])]), dtype=np.int64),
+            )
+            activation = contract._selected_target_activation_chunk(  # noqa: SLF001
+                payload,
+                game_seeds=seeds,
+                selected_mask=selected_mask,
+                where=str(job["job_id"]),
+            )
+        chunk = {
+            "schema_version": contract.TARGET_ACTIVATION_CHUNK_SCHEMA,
+            "job_id": str(job["job_id"]),
+            "source_sha256": record["sha256"],
+            "counts": activation["counts"],
+            "counts_sha256": activation["counts_sha256"],
+            "row_activation_sha256": activation["row_activation_sha256"],
+        }
+        chunk["chunk_sha256"] = builder._digest(chunk)  # noqa: SLF001
+        activation_chunks[str(job["category"])].append(chunk)
+        data_records.append(
+            {
             "kind": "data_shard",
-            "path": str(Path(record["path"]).resolve()),
+            "path": str(source),
             "sha256": record["sha256"],
             "job_id": record["job_id"],
             "category": record["category"],
+            "target_activation": {
+                "counts": chunk["counts"],
+                "counts_sha256": chunk["counts_sha256"],
+                "row_activation_sha256": chunk["row_activation_sha256"],
+                "chunk_sha256": chunk["chunk_sha256"],
+            },
         }
-        for record in data_shards
+        )
+    raw_records.extend(data_records)
+    target_activation = contract._build_target_activation_report(  # noqa: SLF001
+        activation_chunks,
+        categories=("current_producer", "recent_history", "hard_negative"),
+        sealed_p_full=0.25,
     )
     raw_audit = {
         "contract_sha256": lock["contract_sha256"],
         "shard_inventory_sha256": builder._digest(raw_records),  # noqa: SLF001
         "shards": raw_records,
+        "target_activation": target_activation,
     }
     raw_audit["audit_sha256"] = builder._digest(raw_audit)  # noqa: SLF001
     audit_path = tmp_path / "audit.json"
-    audit_path.write_text(json.dumps(raw_audit))
+    # Production writes canonical sort-key JSON; the activation validator must
+    # not depend on insertion order inside its exact-key count objects.
+    audit_path.write_text(json.dumps(raw_audit, sort_keys=True))
     return {
         "path": audit_path,
         "file_sha256": builder._file_sha256(audit_path),  # noqa: SLF001
         "audit_sha256": raw_audit["audit_sha256"],
         "shard_inventory_sha256": raw_audit["shard_inventory_sha256"],
         "contract_sha256": lock["contract_sha256"],
-        "data_shards": data_shards,
+        "data_shards": data_records,
+        "target_activation": target_activation,
     }
 
 
@@ -473,7 +552,7 @@ def test_filter_wave_shards_binds_job_category_seed_before_expansion(
     }
     audit = _audit_fixture(tmp_path, lock, data_shards)
 
-    filtered, bindings = builder._filter_wave_shards(  # noqa: SLF001
+    filtered, bindings, activation = builder._filter_wave_shards(  # noqa: SLF001
         lock=lock,
         selected=selected_binding,
         audit=audit,
@@ -495,6 +574,12 @@ def test_filter_wave_shards_binds_job_category_seed_before_expansion(
         "hard_negative": 1,
     }
     assert len(bindings) == 3
+    assert activation["passed"] is True
+    assert set(activation["categories"]) == {
+        "current_producer",
+        "recent_history",
+        "hard_negative",
+    }
     for category, records in filtered.items():
         with np.load(records[0]["path"], allow_pickle=False) as payload:
             assert payload["game_seed"].tolist() == [
@@ -865,7 +950,12 @@ def test_real_memmap_composite_is_accepted_by_one_dose_trainer(
         ],
         "a1_contract_sha256": lock["contract_sha256"],
     }
-    audit = _audit_fixture(tmp_path, lock, data_shards)
+    audit = _audit_fixture(
+        tmp_path,
+        lock,
+        data_shards,
+        selected_records=raw_selected["records"],
+    )
     historical_ref = _historical_reference(
         tmp_path,
         current_version=int(producer["version"]),
@@ -962,7 +1052,7 @@ def test_real_memmap_composite_is_accepted_by_one_dose_trainer(
     authority_path = Path(receipt["source_authority"]["path"])
     source_authority = json.loads(authority_path.read_text(encoding="utf-8"))
     assert source_authority["schema_version"] == (
-        "a1-post-wave-composite-source-authority-v2"
+        "a1-post-wave-composite-source-authority-v3"
     )
     assert source_authority["lock_verifier_authorities"] == {
         "current_wave": current_verifier_authority,

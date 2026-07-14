@@ -63,6 +63,7 @@ REPORT_EXECUTION_BINDING_FIELD = "a1_one_dose_execution_binding"
 REPORT_INPUT_BINDING_SCHEMA = "a1-one-dose-input-binding-v1"
 REPORT_INPUT_BINDING_FIELD = "a1_one_dose_input_binding"
 TRAINING_TRANSACTION_SCHEMA = "a1-one-dose-training-transaction-v1"
+PRODUCTION_TRAINER_AUTHORITY_SCHEMA = "a1-production-trainer-authority-v1"
 RETRY_CONTRACT_SCHEMA = "a1-one-dose-learner-retry-contract-v1"
 RETRY_IDENTITY_SCHEMA = "a1-one-dose-learner-retry-identity-v1"
 RETRY_REPAIR_KIND = "entity_graph_graph_layers_default_4_to_checkpoint_6"
@@ -285,6 +286,60 @@ def _stable_canonical_regular_file(
     if before_identity != after_identity:
         raise ExecutorError(f"{where} changed while it was authenticated")
     return resolved, digest
+
+
+def _current_production_trainer_authority() -> dict[str, str]:
+    """Authenticate the reviewed trainer in this executor's checkout.
+
+    A frozen repository supplied on the CLI is authority only for replaying the
+    historical generation lock.  Post-wave composites intentionally train with
+    the reviewed learner in the current immutable checkout, so the executable
+    trainer gets its own independent path-and-byte authority.
+    """
+
+    expected = (_REPO_ROOT / "tools" / "train_bc.py").resolve(strict=True)
+    imported = Path(train_bc.__file__).resolve(strict=True)
+    if imported != expected:
+        raise ExecutorError(
+            "production trainer import does not come from the current executor checkout"
+        )
+    trainer, trainer_sha256 = _stable_canonical_regular_file(
+        expected, where="current production trainer"
+    )
+    authority = {
+        "schema_version": PRODUCTION_TRAINER_AUTHORITY_SCHEMA,
+        "repository_root": str(_REPO_ROOT.resolve(strict=True)),
+        "relative_path": "tools/train_bc.py",
+        "path": str(trainer),
+        "sha256": trainer_sha256,
+    }
+    authority["authority_sha256"] = _value_sha256(authority)
+    return authority
+
+
+def _require_current_production_trainer_authority(
+    verified: Mapping[str, Any], *, command: Sequence[str] | None = None
+) -> dict[str, str] | None:
+    """Reject production trainer path/byte drift before a dose is claimed."""
+
+    if verified.get("data_kind") != "production_composite_v2":
+        return None
+    expected = _current_production_trainer_authority()
+    if verified.get("trainer_authority") != expected:
+        raise ExecutorError(
+            "production trainer authority drifted from the current reviewed trainer"
+        )
+    if command is not None:
+        trainer_tokens = [
+            token
+            for token in command
+            if isinstance(token, str) and Path(token).name == "train_bc.py"
+        ]
+        if trainer_tokens != [expected["path"]]:
+            raise ExecutorError(
+                "production command does not execute the bound current trainer"
+            )
+    return copy.deepcopy(expected)
 
 
 def _repo_relative_code_path(path: str) -> Path:
@@ -672,8 +727,11 @@ def _input_binding(verified: dict[str, Any]) -> dict[str, Any]:
         ),
     }
     if verified.get("data_kind") == "production_composite_v2":
+        trainer_authority = _require_current_production_trainer_authority(verified)
+        assert trainer_authority is not None
         payload.update(
             {
+                "trainer_authority": trainer_authority,
                 "production_mix_contract_sha256": _value_sha256(
                     verified["production_mix_contract"]
                 ),
@@ -1126,10 +1184,17 @@ def _validate_production_composite_build_receipt(
         "verified_descriptor_fingerprint",
         "receipt_sha256",
     }
+    receipt_schema = payload.get("schema_version") if isinstance(payload, dict) else None
+    if receipt_schema == "a1-post-wave-composite-build-v2":
+        expected.add("fresh_target_activation")
     if (
         not isinstance(payload, dict)
         or set(payload) != expected
-        or payload.get("schema_version") != "a1-post-wave-composite-build-v1"
+        or receipt_schema
+        not in {
+            "a1-post-wave-composite-build-v1",
+            "a1-post-wave-composite-build-v2",
+        }
     ):
         raise ExecutorError("composite build receipt fields/schema drift")
     unhashed = dict(payload)
@@ -1180,6 +1245,23 @@ def _validate_production_composite_build_receipt(
         != meta.get("production_mix_contract", {}).get("sampling_receipt")
     ):
         raise ExecutorError("composite build receipt input/sampling binding drift")
+    if receipt_schema == "a1-post-wave-composite-build-v2":
+        activation = payload.get("fresh_target_activation")
+        authority_activation = meta["source_authority"].get(
+            "fresh_target_activation"
+        )
+        audit_ref = payload.get("post_wave_audit")
+        if (
+            not isinstance(activation, dict)
+            or activation != authority_activation
+            or activation.get("passed") is not True
+            or not isinstance(audit_ref, dict)
+            or audit_ref.get("target_activation_sha256")
+            != activation.get("target_activation_sha256")
+        ):
+            raise ExecutorError(
+                "composite build receipt target-activation binding drift"
+            )
     return {
         "path": str(path),
         "file_sha256": _file_sha256(path),
@@ -1415,6 +1497,7 @@ def _verify_production_composite_inputs(
         "producer": producer,
         "data_path": data_path,
         "data_kind": "production_composite_v2",
+        "trainer_authority": _current_production_trainer_authority(),
         "corpus_meta_file_sha256": descriptor_sha,
         "descriptor_fingerprint": meta["descriptor_fingerprint"],
         "learner_recipe_overrides": meta["learner_recipe_overrides"],
@@ -3398,7 +3481,11 @@ def _build_direct_train_command(
     recipe = verified["recipe"]
     initializer = verified.get("architecture_initializer", verified["producer"])
     trainer_path = _REPO_ROOT / "tools" / "train_bc.py"
-    if (
+    if verified.get("data_kind") == "production_composite_v2":
+        trainer_authority = _require_current_production_trainer_authority(verified)
+        assert trainer_authority is not None
+        trainer_path = Path(trainer_authority["path"])
+    elif (
         verified.get("learner_ablation") is None
         and verified.get("central_learner_binding") is None
     ):
@@ -3783,7 +3870,9 @@ def build_train_command(
         checkpoint=checkpoint,
         report=report,
     )
-    return _topologize_train_command(direct, world_size=world_size)
+    command = _topologize_train_command(direct, world_size=world_size)
+    _require_current_production_trainer_authority(verified, command=command)
+    return command
 
 
 def bind_function_preserving_upgrade(
@@ -6617,6 +6706,8 @@ def _execute_locked(
 ) -> dict[str, Any]:
     """Claim, execute, verify, and atomically receipt exactly one A1 dose."""
 
+    _require_current_production_trainer_authority(verified, command=command)
+
     matched_aux = verified.get("learner_ablation", {}).get(
         "matched_aux_regularization"
     )
@@ -6832,6 +6923,7 @@ def _execute_locked(
         "execution_binding": execution_binding,
         "input_binding": input_binding,
         "training_transaction_sha256": training_transaction_sha256,
+        "trainer_authority": verified.get("trainer_authority"),
         "lock_verifier_authority": verified.get("lock_verifier_authority"),
         "world_size": int(verified["recipe"]["world_size"]),
         "gpu": gpu,
@@ -7455,6 +7547,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "command_sha256": _value_sha256(command),
             "input_binding": input_binding,
             "training_transaction_sha256": transaction_sha256,
+            "trainer_authority": verified.get("trainer_authority"),
             "lock_verifier_authority": verified.get(
                 "lock_verifier_authority"
             ),

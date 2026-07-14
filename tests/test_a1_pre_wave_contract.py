@@ -3196,6 +3196,96 @@ def test_post_wave_feature_semantics_reject_drift(
             )
 
 
+@pytest.mark.parametrize(
+    ("column", "replacement", "error"),
+    [
+        (
+            "policy_weight_multiplier",
+            np.asarray([1.0, 0.5, 0.0, 0.0], dtype=np.float32),
+            "exactly binary",
+        ),
+        (
+            "policy_weight_multiplier",
+            np.asarray([0.0, 0.0, 0.0, 0.0], dtype=np.float32),
+            "disagrees with used_full_search",
+        ),
+        (
+            "value_weight_multiplier",
+            np.asarray([1.0, 1.0, 0.0, 1.0], dtype=np.float32),
+            "finite and exactly 1",
+        ),
+    ],
+)
+def test_selected_target_activation_rejects_gradient_switch_drift(
+    tmp_path: Path,
+    column: str,
+    replacement: np.ndarray,
+    error: str,
+) -> None:
+    arrays = {
+        "game_seed": np.asarray([10, 10, 11, 11], dtype=np.int64),
+        "decision_index": np.asarray([0, 1, 0, 1], dtype=np.int32),
+        "is_forced": np.asarray([False, True, False, False]),
+        "used_full_search": np.asarray([True, True, False, False]),
+        "policy_weight_multiplier": np.asarray(
+            [1.0, 0.0, 0.0, 0.0], dtype=np.float32
+        ),
+        "value_weight_multiplier": np.ones(4, dtype=np.float32),
+    }
+    arrays[column] = replacement
+    shard = tmp_path / f"target-activation-{column}.npz"
+    np.savez(shard, **arrays)
+    with np.load(shard, allow_pickle=False) as payload:
+        with pytest.raises(contract.ContractError, match=error):
+            contract._selected_target_activation_chunk(  # noqa: SLF001
+                payload,
+                game_seeds=arrays["game_seed"],
+                selected_mask=np.ones(4, dtype=bool),
+                where="fixture",
+            )
+
+
+def test_target_activation_rate_contract_rejects_full_search_regression(
+    tmp_path: Path,
+) -> None:
+    rows = 1_000
+    arrays = {
+        "game_seed": np.arange(rows, dtype=np.int64),
+        "decision_index": np.zeros(rows, dtype=np.int32),
+        "is_forced": np.zeros(rows, dtype=bool),
+        "used_full_search": np.ones(rows, dtype=bool),
+        "policy_weight_multiplier": np.ones(rows, dtype=np.float32),
+        "value_weight_multiplier": np.ones(rows, dtype=np.float32),
+    }
+    shard = tmp_path / "target-activation-rate.npz"
+    np.savez(shard, **arrays)
+    with np.load(shard, allow_pickle=False) as payload:
+        raw_chunk = contract._selected_target_activation_chunk(  # noqa: SLF001
+            payload,
+            game_seeds=arrays["game_seed"],
+            selected_mask=np.ones(rows, dtype=bool),
+            where="fixture",
+        )
+    chunk = {
+        "schema_version": contract.TARGET_ACTIVATION_CHUNK_SCHEMA,
+        "job_id": "gpu0__current_producer",
+        "source_sha256": "sha256:" + "a" * 64,
+        "counts": raw_chunk["counts"],
+        "counts_sha256": raw_chunk["counts_sha256"],
+        "row_activation_sha256": raw_chunk["row_activation_sha256"],
+    }
+    chunk["chunk_sha256"] = contract._digest_value(chunk)  # noqa: SLF001
+    report = contract._build_target_activation_report(  # noqa: SLF001
+        {"current_producer": [chunk]},
+        categories=("current_producer",),
+        sealed_p_full=0.25,
+    )
+    assert report["passed"] is False
+    assert report["categories"]["current_producer"][
+        "full_search_rate_passed"
+    ] is False
+
+
 def test_single_read_registry_evidence_rejects_in_place_mutation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -3243,6 +3333,8 @@ def test_post_wave_audit_accepts_exact_complete_category_corpus(
             "truncated": np.zeros(n, dtype=bool),
             "is_forced": np.zeros(n, dtype=bool),
             "used_full_search": np.ones(n, dtype=bool),
+            "policy_weight_multiplier": np.ones(n, dtype=np.float32),
+            "value_weight_multiplier": np.ones(n, dtype=np.float32),
             "phase": np.full(n, "MAIN", dtype="U8"),
             "decision_index": np.zeros(n, dtype=np.int32),
             "target_policy": np.ones((n, 1), dtype=np.float32),
@@ -3455,6 +3547,9 @@ def test_post_wave_audit_accepts_exact_complete_category_corpus(
     assert feature_semantics["event_history"]["history_width_row_counts"] == {
         "2": sum(contract.EXPECTED_ATTEMPTS.values())
     }
+    # The issued v2 fixture remains readable without retroactively requiring
+    # the v3 target-activation receipt.
+    assert report["target_activation"] is None
 
     original_create = contract._create_or_verify_readonly
     for crash_after in (1, 2, 3):

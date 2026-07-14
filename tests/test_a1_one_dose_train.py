@@ -88,6 +88,25 @@ def _verified(tmp_path: Path) -> dict:
     }
 
 
+def _production_trainer_verified(tmp_path: Path) -> dict:
+    verified = _verified(tmp_path)
+    verified.update(
+        {
+            "data_kind": "production_composite_v2",
+            "trainer_authority": executor._current_production_trainer_authority(),
+            "production_mix_contract": {},
+            "production_sampling_receipt_sha256": "sha256:" + "6" * 64,
+            "validation_split_receipt": {},
+            "validation_split_receipt_sha256": "sha256:" + "7" * 64,
+            "composite_build_receipt": {},
+            "source_authority_ref": {},
+            "category_semantics": {},
+            "category_semantics_sha256": "sha256:" + "8" * 64,
+        }
+    )
+    return verified
+
+
 def _fake_aux_upgrade(verified: dict, tmp_path: Path) -> dict:
     initializer = tmp_path / "shared-aux-initializer.pt"
     initializer.write_bytes(b"one shared aux initializer")
@@ -611,6 +630,7 @@ def test_b200_8gpu_topology_preserves_global_batch_and_renders_torchrun(
         gpu=0,
     )
     bound["data_kind"] = "production_composite_v2"
+    bound["trainer_authority"] = executor._current_production_trainer_authority()
 
     command = executor.build_train_command(
         bound,
@@ -667,6 +687,7 @@ def test_production_one_dose_emits_same_trajectory_dose_snapshots(
         "per_game_policy_weight_mode": "equal",
     }
     verified["data_kind"] = "production_composite_v2"
+    verified["trainer_authority"] = executor._current_production_trainer_authority()
 
     command = executor._build_direct_train_command(
         verified,
@@ -939,6 +960,119 @@ def test_production_composite_receipts_component_whole_game_split(
     args = executor.train_bc.build_parser().parse_args(command[2:])
     executor.train_bc._validate_composite_learner_recipe_authorization(  # noqa: SLF001
         args, meta
+    )
+
+
+def test_production_composite_uses_current_trainer_not_frozen_lock_provenance(
+    tmp_path: Path,
+) -> None:
+    verified = _production_trainer_verified(tmp_path)
+    frozen_trainer = tmp_path / "frozen/tools/train_bc.py"
+    frozen_trainer.parent.mkdir(parents=True)
+    frozen_trainer.write_text("raise RuntimeError('historical trainer')\n")
+    verified["lock"]["provenance"] = {
+        "learner_code": [{"path": str(frozen_trainer)}]
+    }
+
+    command = executor.build_train_command(
+        verified,
+        python=Path(sys.executable),
+        checkpoint=tmp_path / "candidate.pt",
+        report=tmp_path / "report.json",
+    )
+    authority = verified["trainer_authority"]
+    assert command[1] == authority["path"]
+    assert str(frozen_trainer) not in command
+    assert authority["sha256"] == executor._file_sha256(Path(command[1]))
+
+    input_binding = executor._input_binding(verified)
+    transaction = executor._training_transaction_sha256(
+        command=command, input_binding=input_binding
+    )
+    assert input_binding["trainer_authority"] == authority
+    changed = dict(input_binding)
+    changed["trainer_authority"] = {
+        **authority,
+        "sha256": "sha256:" + "0" * 64,
+    }
+    changed["binding_sha256"] = executor._value_sha256(
+        {key: value for key, value in changed.items() if key != "binding_sha256"}
+    )
+    assert executor._training_transaction_sha256(
+        command=command, input_binding=changed
+    ) != transaction
+
+
+def test_production_trainer_byte_drift_is_rejected_before_claim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    verified = _production_trainer_verified(tmp_path)
+    checkpoint = tmp_path / "candidate.pt"
+    report = tmp_path / "report.json"
+    receipt = tmp_path / "receipt.json"
+    command = executor.build_train_command(
+        verified,
+        python=Path(sys.executable),
+        checkpoint=checkpoint,
+        report=report,
+    )
+    trainer = Path(verified["trainer_authority"]["path"])
+    original_sha = executor._file_sha256
+
+    def drifted_sha(path: Path) -> str:
+        if path.resolve() == trainer:
+            return "sha256:" + "0" * 64
+        return original_sha(path)
+
+    monkeypatch.setattr(executor, "_file_sha256", drifted_sha)
+    with pytest.raises(executor.ExecutorError, match="trainer authority drifted"):
+        executor.execute(
+            verified=verified,
+            command=command,
+            checkpoint=checkpoint,
+            report=report,
+            receipt=receipt,
+            gpu=0,
+            runner=lambda *_args, **_kwargs: pytest.fail("trainer was launched"),
+            probe=lambda _gpu: pytest.fail("hardware was probed"),
+        )
+    assert not executor._claim_path(verified).exists()
+    assert not receipt.exists()
+
+
+def test_production_failure_receipt_binds_current_trainer_authority(
+    tmp_path: Path,
+) -> None:
+    verified = _production_trainer_verified(tmp_path)
+    checkpoint = tmp_path / "candidate.pt"
+    report = tmp_path / "report.json"
+    receipt = tmp_path / "receipt.json"
+    command = executor.build_train_command(
+        verified,
+        python=Path(sys.executable),
+        checkpoint=checkpoint,
+        report=report,
+    )
+
+    with pytest.raises(executor.ExecutorError, match="exited nonzero"):
+        executor.execute(
+            verified=verified,
+            command=command,
+            checkpoint=checkpoint,
+            report=report,
+            receipt=receipt,
+            gpu=0,
+            runner=lambda argv, **_kwargs: subprocess.CompletedProcess(argv, 1),
+            probe=lambda _gpu: "NVIDIA B200",
+        )
+    payload = json.loads(receipt.read_text(encoding="utf-8"))
+    authority = verified["trainer_authority"]
+    assert payload["trainer_authority"] == authority
+    assert payload["input_binding"]["trainer_authority"] == authority
+    assert payload["training_transaction_sha256"] == (
+        executor._training_transaction_sha256(
+            command=command, input_binding=payload["input_binding"]
+        )
     )
 
 
@@ -1333,6 +1467,7 @@ def test_central_p1_binds_exact_current_parent_sampler_and_mixed_transition(
     verified.update(
         {
             "data_kind": "production_composite_v2",
+            "trainer_authority": executor._current_production_trainer_authority(),
             "production_sampling_receipt_sha256": "sha256:" + "6" * 64,
             "validation_split_receipt_sha256": "sha256:" + "7" * 64,
             "reviewed_lock_file_sha256": verified["lock_file_sha256"],

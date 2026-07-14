@@ -4017,6 +4017,12 @@ def _positive_int(value: Any, *, where: str) -> int:
     return value
 
 
+def _nonnegative_int(value: Any, *, where: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise PromotionError(f"{where} must be a non-negative integer")
+    return value
+
+
 def _finite_number(value: Any, *, where: str, minimum: float | None = None) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise PromotionError(f"{where} must be numeric")
@@ -4207,7 +4213,11 @@ def _verify_calibration_source(
     completed_epochs = provenance.get("completed_epochs")
     if isinstance(optimizer_steps, int) and optimizer_steps > 0:
         _positive_int(optimizer_steps, where=f"{where}.optimizer_steps")
-        _positive_int(completed_epochs, where=f"{where}.completed_epochs")
+        # Step-sliced checkpoints (for example the production 64/96/128-dose
+        # screen) are native trained checkpoints even when the first logical
+        # epoch has not completed yet. Optimizer updates prove training;
+        # completed_epochs is only a progress counter and may be zero.
+        _nonnegative_int(completed_epochs, where=f"{where}.completed_epochs")
         if payload.get("legacy_incumbent_provenance") is not None:
             raise PromotionError(
                 f"{where} may not attach a legacy bridge to native provenance"

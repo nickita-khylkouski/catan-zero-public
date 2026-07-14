@@ -61,8 +61,8 @@ from tools import train_bc  # noqa: E402
 
 HISTORICAL_COMPONENT_REF_SCHEMA = "a1-historical-replay-component-ref-v1"
 HISTORICAL_AUTHORITY_SCHEMA = "a1-historical-replay-authority-v1"
-SOURCE_AUTHORITY_SCHEMA = "a1-post-wave-composite-source-authority-v2"
-BUILD_RECEIPT_SCHEMA = "a1-post-wave-composite-build-v1"
+SOURCE_AUTHORITY_SCHEMA = "a1-post-wave-composite-source-authority-v3"
+BUILD_RECEIPT_SCHEMA = "a1-post-wave-composite-build-v2"
 EFFECTIVE_COMPONENT_RATIOS = {
     "current_producer": 0.64,
     "recent_history": 0.12,
@@ -385,6 +385,25 @@ def _validated_wave_inputs(
     raw_selected = _load_json(Path(selected["path"]))
     if raw_selected.get("records_sha256") != selected["records_sha256"]:
         raise CompositeBuildError("selected-game record digest drift")
+    raw_audit = _load_json(Path(audit["path"]))
+    try:
+        search_operator = lock["science"]["search_operator"]
+        if (
+            search_operator.get("wide_roots_always_full") is not False
+            or search_operator.get("n_full_wide") is not None
+        ):
+            raise contract.ContractError(
+                "current-wave target activation requires no wide-root override"
+            )
+        audit["target_activation"] = contract._validate_target_activation_report(  # noqa: SLF001
+            raw_audit.get("target_activation"),
+            categories=tuple(lock["game_contract"]["category_games"]),
+            sealed_p_full=float(search_operator["p_full"]),
+        )
+    except (KeyError, TypeError, ValueError, contract.ContractError) as error:
+        raise CompositeBuildError(
+            f"post-wave target-activation authority failed: {error}"
+        ) from error
     return lock, selected, audit, raw_selected
 
 
@@ -460,6 +479,10 @@ _SOURCE_BINDING_FIELDS = {
     "generation_manifest_path",
     "generation_manifest_sha256",
 }
+_TARGET_ACTIVATION_BINDING_FIELDS = {
+    "target_activation_chunk_sha256",
+    "target_activation_counts_sha256",
+}
 
 
 def _validate_source_bindings(
@@ -470,6 +493,7 @@ def _validate_source_bindings(
     selected_records_sha256: str,
     audit_file_sha256: str,
     audit_sha256: str,
+    require_target_activation: bool = False,
 ) -> list[dict[str, Any]]:
     if not isinstance(bindings, list) or not bindings:
         raise CompositeBuildError("source authority has no source bindings")
@@ -490,6 +514,8 @@ def _validate_source_bindings(
             else contract._sealed_category_semantic(lock, category)  # noqa: SLF001
         )
         expected_fields = set(_SOURCE_BINDING_FIELDS)
+        if require_target_activation:
+            expected_fields.update(_TARGET_ACTIVATION_BINDING_FIELDS)
         if expected_semantic is not None:
             expected_fields.add("category_semantic")
         if set(raw) != expected_fields:
@@ -554,7 +580,11 @@ def _filter_wave_shards(
     raw_selected: dict[str, Any],
     output_root: Path,
     expected_games: Mapping[str, int],
-) -> tuple[dict[str, list[dict[str, Any]]], list[dict[str, Any]]]:
+) -> tuple[
+    dict[str, list[dict[str, Any]]],
+    list[dict[str, Any]],
+    dict[str, Any],
+]:
     selected_by_job, owner_by_seed, _records = _selection_by_job(
         lock, raw_selected, expected_games=expected_games
     )
@@ -628,6 +658,9 @@ def _filter_wave_shards(
         category: [] for category in expected_games
     }
     source_bindings: list[dict[str, Any]] = []
+    activation_chunks: dict[str, list[dict[str, Any]]] = {
+        category: [] for category in expected_games
+    }
     observed_by_job: dict[str, set[int]] = defaultdict(set)
     order_by_category: Counter[str] = Counter()
     for job_id in [str(job["job_id"]) for job in lock["fleet"]["jobs"]]:
@@ -683,12 +716,34 @@ def _filter_wave_shards(
                         raise CompositeBuildError(
                             f"selected source lacks policy_weight_multiplier: {source}"
                         )
-                    policy_mass = np.asarray(
-                        payload["policy_weight_multiplier"], dtype=np.float64
-                    )[selected_mask]
-                    if not np.all(np.isfinite(policy_mass)) or np.any(policy_mass < 0):
+                    activation = contract._selected_target_activation_chunk(  # noqa: SLF001
+                        payload,
+                        game_seeds=seeds,
+                        selected_mask=selected_mask,
+                        where=f"{job_id}:{source.name}",
+                    )
+                    activation_chunk = {
+                        "schema_version": contract.TARGET_ACTIVATION_CHUNK_SCHEMA,
+                        "job_id": job_id,
+                        "source_sha256": before_sha,
+                        "counts": activation["counts"],
+                        "counts_sha256": activation["counts_sha256"],
+                        "row_activation_sha256": activation[
+                            "row_activation_sha256"
+                        ],
+                    }
+                    activation_chunk["chunk_sha256"] = _digest(activation_chunk)
+                    expected_activation = source_record.get("target_activation")
+                    if not isinstance(expected_activation, dict) or expected_activation != {
+                        "counts": activation_chunk["counts"],
+                        "counts_sha256": activation_chunk["counts_sha256"],
+                        "row_activation_sha256": activation_chunk[
+                            "row_activation_sha256"
+                        ],
+                        "chunk_sha256": activation_chunk["chunk_sha256"],
+                    }:
                         raise CompositeBuildError(
-                            f"selected source has invalid policy mass: {source}"
+                            f"audited target activation differs from source rows: {source}"
                         )
                     if category != "current_producer":
                         allowed_versions = {
@@ -752,6 +807,10 @@ def _filter_wave_shards(
                 "generation_manifest_sha256": generation_manifest_by_job[job_id][
                     "sha256"
                 ],
+                "target_activation_chunk_sha256": activation_chunk["chunk_sha256"],
+                "target_activation_counts_sha256": activation_chunk[
+                    "counts_sha256"
+                ],
             }
             source_id = _digest(binding)
             filtered_record = {
@@ -768,6 +827,7 @@ def _filter_wave_shards(
             }
             filtered_records[category].append(filtered_record)
             source_bindings.append({"source_id": source_id, **binding})
+            activation_chunks[category].append(activation_chunk)
             order_by_category[category] += 1
             if _file_sha256(source) != before_sha:
                 raise CompositeBuildError(
@@ -790,7 +850,21 @@ def _filter_wave_shards(
                 "public_award_feature_provenance": public_award_by_category[category],
             },
         )
-    return filtered_records, source_bindings
+    try:
+        rebuilt_activation = contract._build_target_activation_report(  # noqa: SLF001
+            activation_chunks,
+            categories=tuple(expected_games),
+            sealed_p_full=float(lock["science"]["search_operator"]["p_full"]),
+        )
+    except (KeyError, TypeError, ValueError, contract.ContractError) as error:
+        raise CompositeBuildError(
+            f"cannot reconstruct selected target activation: {error}"
+        ) from error
+    if rebuilt_activation != audit.get("target_activation"):
+        raise CompositeBuildError(
+            "composite target-activation replay differs from post-wave audit"
+        )
+    return filtered_records, source_bindings, rebuilt_activation
 
 
 def _build_fresh_component(
@@ -1089,6 +1163,7 @@ def _build_source_authority(
         selected_records_sha256=str(selected["records_sha256"]),
         audit_file_sha256=str(audit["file_sha256"]),
         audit_sha256=str(audit["audit_sha256"]),
+        require_target_activation=True,
     )
     authority_root = output_root / "authority"
 
@@ -1236,7 +1311,11 @@ def _build_source_authority(
             **audit_ref,
             "audit_sha256": audit["audit_sha256"],
             "shard_inventory_sha256": audit["shard_inventory_sha256"],
+            "target_activation_sha256": audit["target_activation"][
+                "target_activation_sha256"
+            ],
         },
+        "fresh_target_activation": audit["target_activation"],
         "fresh_source_bindings": normalized_bindings,
         "fresh_source_bindings_sha256": canonical_sha256(normalized_bindings),
         "fresh_generation_manifests": current_manifests,
@@ -1491,7 +1570,7 @@ def build_post_wave_composite(
     if _file_sha256(producer_path) != producer["sha256"]:
         raise CompositeBuildError("current producer checkpoint bytes drifted")
 
-    records_by_category, source_bindings = _filter_wave_shards(
+    records_by_category, source_bindings, target_activation = _filter_wave_shards(
         lock=lock,
         selected=selected,
         audit=audit,
@@ -1569,7 +1648,11 @@ def build_post_wave_composite(
             "file_sha256": audit["file_sha256"],
             "audit_sha256": audit["audit_sha256"],
             "shard_inventory_sha256": audit["shard_inventory_sha256"],
+            "target_activation_sha256": target_activation[
+                "target_activation_sha256"
+            ],
         },
+        "fresh_target_activation": target_activation,
         "historical_component_reference": {
             "path": str(historical_component_path.expanduser().resolve(strict=True)),
             "file_sha256": _file_sha256(

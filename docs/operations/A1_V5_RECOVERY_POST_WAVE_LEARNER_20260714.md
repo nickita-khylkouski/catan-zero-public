@@ -58,6 +58,12 @@ export TRAIN_REPORT=$LEARNER/train.report.json
 export TRAIN_RECEIPT=$LEARNER/training.receipt.json
 ```
 
+`FROZEN_REPO` is only the historical lock-verifier authority. It never supplies
+the learner executable. For a `production_composite_v2` dose, the executor
+always runs `$LEARNER_CODE_ROOT/tools/train_bc.py` and binds that canonical path
+and its exact SHA-256 into the dry-run plan, training transaction, report, claim,
+and terminal receipt. Any byte or path drift is rejected before the dose claim.
+
 The resolved v5 and f7 SHA-256 identities are fixed:
 
 ```text
@@ -466,21 +472,128 @@ export F7_REPORT=$GATE/f7-collected/$F7_RUN_ID/pooled/internal.json
 ```
 
 The parent report is the `internal_h2h` source for the ordinary promotion
-evidence graph; its verdict must be strict H1. Complete the ordinary
-calibration, external, high-regret, and bucket evidence from the same plan and
-write `$GATE/standard-promotion-adjudication.json`. Build the candidate-bound
-cohort-exclusions manifest at `$GATE/cohort-exclusions.json`; it must enumerate
-every prior diagnostic/selection cohort so the gate can replay that both the
-ordinary final cohorts and the fixed f7 veto cohort are fresh. Then build the
-conjunctive recovery authority with the independently collected `$F7_REPORT`:
+evidence graph; its verdict must be strict H1. Build the remaining immutable
+inputs from the selected checkpoint. Calibration uses the trainer's exact
+whole-game validation seed set. The candidate and incumbent calibration jobs
+may run concurrently on B200 GPUs 0 and 1.
+
+```bash
+export VAL_SEEDS=${TRAIN_REPORT%.json}.validation_seeds.json
+export PROMO=$GATE/promotion-inputs
+mkdir -p "$PROMO"
+export CAND_CAL=$PROMO/candidate.calibration.json
+export V5_CAL=$PROMO/v5.calibration.json
+export REGRET=$PROMO/validation-regret.npz
+export SUITE=$PROMO/high-regret.suite.json
+export HIGH_REPORT=$PROMO/high-regret.report.json
+export PARENT_EXTERNAL_CANDIDATE=$GATE/exact-v5-collected/$PARENT_RUN_ID/pooled/external-candidate.json
+export PARENT_EXTERNAL_CHAMPION=$GATE/exact-v5-collected/$PARENT_RUN_ID/pooled/external-champion.json
+
+"$PY" tools/phase_sliced_value_calibration.py \
+  --shard-dir "$COMPOSITE/filtered_sources" \
+  --checkpoint "$CANDIDATE" --device cuda:0 \
+  --value-readout scalar --deployed-value-scale 1 \
+  --deployed-value-squash tanh \
+  --validation-seed-manifest "$VAL_SEEDS" --require-held-out \
+  --out "$CAND_CAL" &
+CAL_CAND_PID=$!
+
+"$PY" tools/phase_sliced_value_calibration.py \
+  --shard-dir "$COMPOSITE/filtered_sources" \
+  --checkpoint "$V5" --device cuda:1 \
+  --value-readout scalar --deployed-value-scale 1 \
+  --deployed-value-squash tanh \
+  --validation-seed-manifest "$VAL_SEEDS" --require-held-out \
+  --out "$V5_CAL" &
+CAL_V5_PID=$!
+wait "$CAL_CAND_PID"
+wait "$CAL_V5_PID"
+
+"$PY" tools/extract_regret_states.py \
+  --shard-root "$COMPOSITE/filtered_sources" \
+  --validation-seed-manifest "$VAL_SEEDS" \
+  --top-k 200000 --out "$REGRET"
+
+"$PY" tools/a1_promotion_artifacts.py held-out-suite \
+  --manifest "$REGRET" --holdout-fraction 1.0 --holdout-seed 17 \
+  --pairs 240 --out "$SUITE"
+```
+
+Run the high-regret suite across all eight B200s. It uses the same public
+information-set search surface as the fleet gate and the exact native wheel.
+
+```bash
+export NATIVE_WHEEL=/home/ubuntu/catan-rnd-audit/dist/catanatron_rs-0.1.8-cp311-cp311-manylinux_2_34_x86_64.whl
+export NATIVE_WHEEL_SHA256=sha256:f311673efa4d1e697736415cdff38ebb1e7eed3f109b241d5a5097cfb6d7dc2e
+
+"$PY" tools/gumbel_search_cross_net_h2h.py \
+  --candidate "$CANDIDATE" --baseline "$V5" \
+  --held-out-high-regret-suite "$SUITE" \
+  --workers 8 \
+  --devices cuda:0,cuda:1,cuda:2,cuda:3,cuda:4,cuda:5,cuda:6,cuda:7 \
+  --threads-per-worker 1 --n-full 128 --c-visit 50 --c-scale .1 \
+  --candidate-c-scale .1 --baseline-c-scale .1 --sigma-eval .98 \
+  --rescale-noise-floor-c 0 --lazy-interior-chance \
+  --correct-rust-chance-spectra --public-observation \
+  --information-set-search --no-belief-chance-spectra \
+  --determinization-particles 4 --determinization-min-simulations 32 \
+  --symmetry-averaged-eval --symmetry-averaged-eval-threshold 20 \
+  --evaluator-rust-featurize --native-mcts-hot-loop \
+  --value-readout scalar --candidate-value-readout scalar \
+  --baseline-value-readout scalar --value-squash tanh \
+  --candidate-value-squash tanh --baseline-value-squash tanh \
+  --max-depth 80 --max-decisions 600 --max-root-candidates 16 \
+  --max-root-candidates-wide 54 --wide-candidates-threshold 24 \
+  --gameplay-policy-aggregation mean_improved_policy --gate-config flywheel \
+  --engine-repo-commit "$EVAL_COMMIT" \
+  --native-wheel-path "$NATIVE_WHEEL" \
+  --native-wheel-sha256 "$NATIVE_WHEEL_SHA256" \
+  --out "$HIGH_REPORT"
+```
+
+Seal all five ordinary evidence envelopes, the high-regret/bucket sources, the
+matched-screen exclusions, and the standard adjudication in one fresh pack.
+The pack replays both the frozen verifier and the disaster-recovery authority;
+it also binds the selected step-64/96/128 checkpoint to the training receipt.
+
+```bash
+export PACK=$GATE/promotion-pack-r1
+
+"$PY" tools/a1_v5_recovery_promotion_pack.py \
+  --contract-lock "$LOCK" \
+  --frozen-repo "$FROZEN_REPO" \
+  --frozen-verifier-sha256 "$FROZEN_VERIFIER_SHA256" \
+  --recovery-receipt "$RECOVERY_RECEIPT" \
+  --training-receipt "$TRAIN_RECEIPT" \
+  --training-report "$TRAIN_REPORT" \
+  --checkpoint-selection "$CHECKPOINT_SELECTION" \
+  --registry "$RECOVERY_REGISTRY" \
+  --current-pointer "$RECOVERY_POINTER" \
+  --candidate "$CANDIDATE" --candidate-version 6 \
+  --champion "$V5" --champion-version 5 \
+  --candidate-calibration "$CAND_CAL" \
+  --champion-calibration "$V5_CAL" \
+  --internal-h2h "$PARENT_REPORT" \
+  --candidate-panel "$PARENT_EXTERNAL_CANDIDATE" \
+  --champion-panel "$PARENT_EXTERNAL_CHAMPION" \
+  --high-regret-report "$HIGH_REPORT" \
+  --dose-screen "$DOSE_SCREEN" \
+  --out-dir "$PACK"
+
+export STANDARD_ADJUDICATION=$PACK/standard-promotion-adjudication.json
+export COHORT_EXCLUSIONS=$PACK/cohort-exclusions.json
+```
+
+Then build the conjunctive recovery authority with the independently collected
+`$F7_REPORT`:
 
 ```bash
 "$PY" tools/a1_v5_recovery_gate.py \
   --recovery-receipt "$RECOVERY_RECEIPT" \
   --contract-lock "$LOCK" \
-  --standard-adjudication "$GATE/standard-promotion-adjudication.json" \
+  --standard-adjudication "$STANDARD_ADJUDICATION" \
   --training-receipt "$TRAIN_RECEIPT" \
-  --cohort-exclusions "$GATE/cohort-exclusions.json" \
+  --cohort-exclusions "$COHORT_EXCLUSIONS" \
   --registry "$RECOVERY_REGISTRY" \
   --current-pointer "$RECOVERY_POINTER" \
   --f7-nonregression-report "$F7_REPORT" \
@@ -504,9 +617,9 @@ export PROMOTION_RECEIPT=$GATE/recovery-promotion.receipt.json
   --registry "$RECOVERY_REGISTRY" \
   --current-pointer "$RECOVERY_POINTER" \
   --contract-lock "$LOCK" \
-  --adjudication "$GATE/standard-promotion-adjudication.json" \
+  --adjudication "$STANDARD_ADJUDICATION" \
   --training-receipt "$TRAIN_RECEIPT" \
-  --cohort-exclusions "$GATE/cohort-exclusions.json" \
+  --cohort-exclusions "$COHORT_EXCLUSIONS" \
   --recovery-gate-authority "$FULL_GATE" \
   --frozen-repo "$FROZEN_REPO" \
   --frozen-verifier-sha256 "$FROZEN_VERIFIER_SHA256" \
@@ -517,9 +630,9 @@ export PROMOTION_RECEIPT=$GATE/recovery-promotion.receipt.json
   --registry "$RECOVERY_REGISTRY" \
   --current-pointer "$RECOVERY_POINTER" \
   --contract-lock "$LOCK" \
-  --adjudication "$GATE/standard-promotion-adjudication.json" \
+  --adjudication "$STANDARD_ADJUDICATION" \
   --training-receipt "$TRAIN_RECEIPT" \
-  --cohort-exclusions "$GATE/cohort-exclusions.json" \
+  --cohort-exclusions "$COHORT_EXCLUSIONS" \
   --recovery-gate-authority "$FULL_GATE" \
   --frozen-repo "$FROZEN_REPO" \
   --frozen-verifier-sha256 "$FROZEN_VERIFIER_SHA256" \

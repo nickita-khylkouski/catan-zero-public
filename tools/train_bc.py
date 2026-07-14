@@ -2700,8 +2700,13 @@ def _validate_flywheel_source_authority(path: Path) -> dict[str, object]:
     source_authority_schema = (
         payload.get("schema_version") if isinstance(payload, dict) else None
     )
-    if source_authority_schema == "a1-post-wave-composite-source-authority-v2":
+    if source_authority_schema in {
+        "a1-post-wave-composite-source-authority-v2",
+        "a1-post-wave-composite-source-authority-v3",
+    }:
         expected.add("lock_verifier_authorities")
+    if source_authority_schema == "a1-post-wave-composite-source-authority-v3":
+        expected.add("fresh_target_activation")
     if isinstance(payload, dict) and "category_semantics" in payload:
         expected.add("category_semantics")
     if (
@@ -2711,6 +2716,7 @@ def _validate_flywheel_source_authority(path: Path) -> dict[str, object]:
         not in {
             "a1-post-wave-composite-source-authority-v1",
             "a1-post-wave-composite-source-authority-v2",
+            "a1-post-wave-composite-source-authority-v3",
         }
     ):
         raise SystemExit("flywheel source authority fields/schema drift")
@@ -2791,6 +2797,9 @@ def _validate_flywheel_source_authority(path: Path) -> dict[str, object]:
         "audit_sha256",
         "shard_inventory_sha256",
     }
+    current_audit_fields = set(audit_fields)
+    if source_authority_schema == "a1-post-wave-composite-source-authority-v3":
+        current_audit_fields.add("target_activation_sha256")
     _contract_path, current_contract = verified_json_ref(
         payload["current_contract"],
         fields=contract_fields,
@@ -2803,7 +2812,7 @@ def _validate_flywheel_source_authority(path: Path) -> dict[str, object]:
     )
     _audit_path, audit = verified_json_ref(
         payload["post_wave_audit"],
-        fields=audit_fields,
+        fields=current_audit_fields,
         kind="audit",
     )
     if (
@@ -2818,6 +2827,68 @@ def _validate_flywheel_source_authority(path: Path) -> dict[str, object]:
         != audit.get("shard_inventory_sha256")
     ):
         raise SystemExit("flywheel current wave authority chain drift")
+
+    target_activation_chunks: dict[tuple[str, str], dict[str, object]] = {}
+    if source_authority_schema == "a1-post-wave-composite-source-authority-v3":
+        target_activation = payload.get("fresh_target_activation")
+        if (
+            not isinstance(target_activation, dict)
+            or target_activation != audit.get("target_activation")
+            or target_activation.get("schema_version")
+            != "a1-selected-target-activation-v1"
+            or target_activation.get("passed") is not True
+            or payload["post_wave_audit"].get("target_activation_sha256")
+            != target_activation.get("target_activation_sha256")
+        ):
+            raise SystemExit("flywheel fresh target-activation authority drift")
+        unhashed_activation = dict(target_activation)
+        declared_activation = unhashed_activation.pop(
+            "target_activation_sha256", None
+        )
+        categories = target_activation.get("categories")
+        if (
+            declared_activation != _canonical_json_sha256(unhashed_activation)
+            or not isinstance(categories, dict)
+            or target_activation.get("categories_sha256")
+            != _canonical_json_sha256(categories)
+        ):
+            raise SystemExit("flywheel fresh target-activation digest drift")
+        for category, category_report in categories.items():
+            if not isinstance(category_report, dict):
+                raise SystemExit("flywheel target-activation category is malformed")
+            unhashed_category = dict(category_report)
+            declared_category = unhashed_category.pop("activation_sha256", None)
+            chunks = category_report.get("chunks")
+            counts = category_report.get("counts")
+            if (
+                declared_category != _canonical_json_sha256(unhashed_category)
+                or not isinstance(chunks, list)
+                or category_report.get("chunks_sha256")
+                != _canonical_json_sha256(chunks)
+                or not isinstance(counts, dict)
+                or category_report.get("counts_sha256")
+                != _canonical_json_sha256(counts)
+                or category_report.get("full_search_rate_passed") is not True
+            ):
+                raise SystemExit("flywheel target-activation category digest drift")
+            for chunk in chunks:
+                if not isinstance(chunk, dict):
+                    raise SystemExit("flywheel target-activation chunk is malformed")
+                unhashed_chunk = dict(chunk)
+                declared_chunk = unhashed_chunk.pop("chunk_sha256", None)
+                identity = (
+                    str(chunk.get("job_id", "")),
+                    str(chunk.get("source_sha256", "")),
+                )
+                if (
+                    identity in target_activation_chunks
+                    or str(category) == ""
+                    or declared_chunk != _canonical_json_sha256(unhashed_chunk)
+                    or chunk.get("counts_sha256")
+                    != _canonical_json_sha256(chunk.get("counts"))
+                ):
+                    raise SystemExit("flywheel target-activation chunk digest drift")
+                target_activation_chunks[identity] = chunk
 
     category_semantics = _require_exact_flywheel_category_semantics(
         authority=payload,
@@ -2900,6 +2971,7 @@ def _validate_flywheel_source_authority(path: Path) -> dict[str, object]:
         audit_payload: dict[str, object],
         manifests: dict[tuple[str, str, str], dict[str, object]],
         category_semantics: dict[str, object] | None,
+        require_target_activation: bool = False,
     ) -> tuple[list[dict[str, object]], set[str]]:
         if not isinstance(raw, list) or not raw or digest != _canonical_json_sha256(raw):
             raise SystemExit("flywheel source-binding inventory digest drift")
@@ -2914,7 +2986,7 @@ def _validate_flywheel_source_authority(path: Path) -> dict[str, object]:
                 str(value.get("category", "")),
                 str(value.get("path", "")),
                 str(value.get("sha256", "")),
-            )
+            ): value
             for value in raw_audit_records
             if isinstance(value, dict) and value.get("kind") == "data_shard"
         }
@@ -2934,12 +3006,25 @@ def _validate_flywheel_source_authority(path: Path) -> dict[str, object]:
         for index, record in enumerate(raw):
             category = record.get("category") if isinstance(record, dict) else None
             expected_binding_fields = set(binding_fields)
+            if require_target_activation:
+                expected_binding_fields.update(
+                    {
+                        "target_activation_chunk_sha256",
+                        "target_activation_counts_sha256",
+                    }
+                )
             if category_semantics is not None and category in category_semantics:
                 expected_binding_fields.add("category_semantic")
             if not isinstance(record, dict) or set(record) != expected_binding_fields:
                 raise SystemExit(f"flywheel source binding {index} fields drift")
             preimage = dict(record)
             source_id = preimage.pop("source_id")
+            source_identity = (
+                str(record["job_id"]),
+                str(record["category"]),
+                str(record["source_path"]),
+                str(record["source_sha256"]),
+            )
             if (
                 not isinstance(source_id, str)
                 or source_id in seen
@@ -2969,13 +3054,7 @@ def _validate_flywheel_source_authority(path: Path) -> dict[str, object]:
                     str(record["generation_manifest_sha256"]),
                 )
                 not in manifests
-                or (
-                    str(record["job_id"]),
-                    str(record["category"]),
-                    str(record["source_path"]),
-                    str(record["source_sha256"]),
-                )
-                not in audited_sources
+                or source_identity not in audited_sources
                 or (
                     str(record["job_id"]),
                     str(record["category"]),
@@ -2985,6 +3064,31 @@ def _validate_flywheel_source_authority(path: Path) -> dict[str, object]:
                 not in audited_manifests
             ):
                 raise SystemExit(f"flywheel source binding {index} evidence drift")
+            if require_target_activation:
+                chunk = target_activation_chunks.get(
+                    (str(record["job_id"]), str(record["source_sha256"]))
+                )
+                audited_activation = audited_sources[source_identity].get(
+                    "target_activation"
+                )
+                if (
+                    chunk is None
+                    or not isinstance(audited_activation, dict)
+                    or record.get("target_activation_chunk_sha256")
+                    != chunk.get("chunk_sha256")
+                    or record.get("target_activation_counts_sha256")
+                    != chunk.get("counts_sha256")
+                    or audited_activation.get("chunk_sha256")
+                    != chunk.get("chunk_sha256")
+                    or audited_activation.get("counts_sha256")
+                    != chunk.get("counts_sha256")
+                    or audited_activation.get("row_activation_sha256")
+                    != chunk.get("row_activation_sha256")
+                    or audited_activation.get("counts") != chunk.get("counts")
+                ):
+                    raise SystemExit(
+                        f"flywheel source binding {index} target activation drift"
+                    )
             seen.add(source_id)
             normalized.append(record)
         return normalized, seen
@@ -3002,6 +3106,10 @@ def _validate_flywheel_source_authority(path: Path) -> dict[str, object]:
         audit_payload=audit,
         manifests=fresh_manifests,
         category_semantics=category_semantics,
+        require_target_activation=(
+            source_authority_schema
+            == "a1-post-wave-composite-source-authority-v3"
+        ),
     )
 
     historical_authority = payload["historical_replay"]
@@ -3083,7 +3191,10 @@ def _validate_flywheel_source_authority(path: Path) -> dict[str, object]:
         manifests=historical_manifests,
         category_semantics=prior_category_semantics,
     )
-    if source_authority_schema == "a1-post-wave-composite-source-authority-v2":
+    if source_authority_schema in {
+        "a1-post-wave-composite-source-authority-v2",
+        "a1-post-wave-composite-source-authority-v3",
+    }:
         verifier_authorities = payload.get("lock_verifier_authorities")
         if not isinstance(verifier_authorities, dict) or set(
             verifier_authorities
