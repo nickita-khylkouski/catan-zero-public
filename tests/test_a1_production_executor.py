@@ -25,6 +25,66 @@ def _sha(path: Path) -> str:
     return executor._sha256(path)
 
 
+def _registry_record(config: dict[str, object]) -> tuple[bytes, str]:
+    full_hash = supervisor._digest(config)  # noqa: SLF001
+    short_hash = "sha256:" + full_hash.removeprefix("sha256:")[:16]
+    record = {
+        "config_hash": short_hash,
+        "full_config_hash": full_hash,
+        "pipeline": "generate",
+        "timestamp": "2026-07-14T00:00:00+00:00",
+        "purpose": "generate_gumbel_selfplay",
+        "config": config,
+    }
+    return (json.dumps(record, sort_keys=True).encode() + b"\n", short_hash)
+
+
+def test_supervisor_recovers_only_exact_native_hot_loop_render_omission() -> None:
+    expected_config: dict[str, object] = {
+        "schema_version": 12,
+        "pipeline": "generate",
+        "fields": {"native_mcts_hot_loop": False, "n_full": 128},
+    }
+    expected_full = supervisor._digest(expected_config)  # noqa: SLF001
+    expected = {
+        "pipeline": "generate",
+        "config_hash": "sha256:" + expected_full.removeprefix("sha256:")[:16],
+        "full_config_hash": expected_full,
+        "config": expected_config,
+    }
+    expected["provenance_sha256"] = supervisor._digest(expected)  # noqa: SLF001
+    actual_config = json.loads(json.dumps(expected_config))
+    actual_config["fields"]["native_mcts_hot_loop"] = True
+    payload, manifest_hash = _registry_record(actual_config)
+
+    with pytest.raises(supervisor.SupervisorError, match="registry differs"):
+        supervisor._validate_registry_payload(  # noqa: SLF001
+            payload,
+            expected=expected,
+            manifest_hash=manifest_hash,
+            job_id="lane0__current_producer",
+        )
+
+    supervisor._validate_registry_payload(  # noqa: SLF001
+        payload,
+        expected=expected,
+        manifest_hash=manifest_hash,
+        job_id="lane0__current_producer",
+        allow_native_hot_loop_render_compatibility=True,
+    )
+
+    actual_config["fields"]["n_full"] = 256
+    bad_payload, bad_manifest_hash = _registry_record(actual_config)
+    with pytest.raises(supervisor.SupervisorError, match="registry differs"):
+        supervisor._validate_registry_payload(  # noqa: SLF001
+            bad_payload,
+            expected=expected,
+            manifest_hash=bad_manifest_hash,
+            job_id="lane0__current_producer",
+            allow_native_hot_loop_render_compatibility=True,
+        )
+
+
 def _exact_runtime_report() -> dict[str, object]:
     return {
         "python_version": executor.PRODUCTION_RUNTIME["python_version"],

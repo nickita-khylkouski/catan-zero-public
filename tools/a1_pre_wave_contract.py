@@ -8749,6 +8749,9 @@ def _expected_cli_fields(lock: dict[str, Any], job: dict[str, Any]) -> dict[str,
         "exact_budget_sh_min_n": search["exact_budget_sh_min_n"],
         "belief_chance_spectra": search["belief_chance_spectra"],
         "information_set_search": search["information_set_search"],
+        "native_mcts_hot_loop": bool(
+            generation.get("native_mcts_hot_loop", False)
+        ),
         "determinization_particles": search["determinization_particles"],
         "determinization_min_simulations": search[
             "determinization_min_simulations"
