@@ -85,6 +85,54 @@ def test_eval_config_hash_seals_native_hot_loop_choice() -> None:
     assert native.config_hash() != reference.config_hash()
 
 
+def test_h2h_search_seed_is_stable_per_game_and_distinct_by_seat() -> None:
+    red = h2h._game_search_seed(game_seed=6199801000, seat_color="RED")
+    blue = h2h._game_search_seed(game_seed=6199801000, seat_color="BLUE")
+
+    assert red == h2h._game_search_seed(
+        game_seed=6199801000, seat_color="red"
+    )
+    assert red != blue
+    assert red != h2h._game_search_seed(game_seed=6199801001, seat_color="RED")
+    with pytest.raises(ValueError, match="unsupported H2H seat color"):
+        h2h._game_search_seed(game_seed=6199801000, seat_color="GREEN")
+
+
+def test_h2h_search_rng_reset_follows_seat_across_color_swap() -> None:
+    class SeedRecorder:
+        def __init__(self) -> None:
+            self.values: list[int] = []
+
+        def seed(self, value: int) -> None:
+            self.values.append(int(value))
+
+    searches = {
+        "candidate": SimpleNamespace(rng=SeedRecorder()),
+        "baseline": SimpleNamespace(rng=SeedRecorder()),
+    }
+    candidate_red = h2h._reset_game_search_rngs(
+        searches,
+        role_by_color={"RED": "candidate", "BLUE": "baseline"},
+        game_seed=42,
+    )
+    candidate_blue = h2h._reset_game_search_rngs(
+        searches,
+        role_by_color={"RED": "baseline", "BLUE": "candidate"},
+        game_seed=42,
+    )
+
+    assert candidate_red["candidate"] == candidate_blue["baseline"]
+    assert candidate_red["baseline"] == candidate_blue["candidate"]
+    assert searches["candidate"].rng.values == [
+        candidate_red["candidate"],
+        candidate_blue["candidate"],
+    ]
+    assert searches["baseline"].rng.values == [
+        candidate_red["baseline"],
+        candidate_blue["baseline"],
+    ]
+
+
 def test_pinned_replay_scope_is_safe_during_path_aba_hash_and_copy(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
