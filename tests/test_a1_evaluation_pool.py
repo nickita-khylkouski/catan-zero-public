@@ -24,8 +24,9 @@ def _checkpoint(tmp_path: Path, name: str) -> Path:
 
 
 def _games(seed: int, *, orientations: tuple[str, str], won: bool = True) -> list[dict]:
-    return [
-        {
+    games = []
+    for orientation in orientations:
+        game = {
             "pair_id": 0,
             "game_seed": seed,
             "orientation": orientation,
@@ -38,8 +39,19 @@ def _games(seed: int, *, orientations: tuple[str, str], won: bool = True) -> lis
             "engine_divergence": False,
             "decisions": 100,
         }
-        for orientation in orientations
-    ]
+        if orientation in {"candidate_red", "candidate_blue"}:
+            candidate_color = "RED" if orientation == "candidate_red" else "BLUE"
+            baseline_color = "BLUE" if candidate_color == "RED" else "RED"
+            game["search_seeds_by_role"] = {
+                "candidate": promotion._internal_h2h_search_seed(  # noqa: SLF001
+                    game_seed=seed, seat_color=candidate_color
+                ),
+                "baseline": promotion._internal_h2h_search_seed(  # noqa: SLF001
+                    game_seed=seed, seat_color=baseline_color
+                ),
+            }
+        games.append(game)
+    return games
 
 
 def _gate(games: list[dict]) -> tuple[dict, dict]:
@@ -73,6 +85,7 @@ def _internal_report(candidate: Path, champion: Path, seed: int) -> dict:
         "baseline_checkpoint": str(champion.resolve()),
         "baseline_checkpoint_sha256": promotion._sha256(champion),
         "gate_config": "flywheel",
+        "search_rng_contract": promotion.INTERNAL_H2H_SEARCH_RNG_CONTRACT,
         "n_full": 128,
         "config_hash": "sha256:" + digest[:16],
         "full_config_hash": "sha256:" + digest,
@@ -242,6 +255,26 @@ def test_complete_report_contract_binds_lane_to_planned_pair_count(
         pool.validate_complete_report(
             report, kind="internal", expected_pairs=2, where="short-lane"
         )
+
+
+def test_internal_pool_requires_corrected_search_rng_contract(tmp_path: Path) -> None:
+    candidate = _checkpoint(tmp_path, "candidate.pt")
+    champion = _checkpoint(tmp_path, "champion.pt")
+    report = _internal_report(candidate, champion, 9001)
+    report.pop("search_rng_contract")
+
+    with pytest.raises(pool.PoolError, match="corrected per-game/seat"):
+        pool.validate_complete_report(report, kind="internal", where="old-rng")
+
+
+def test_internal_pool_replays_role_to_seat_search_seed(tmp_path: Path) -> None:
+    candidate = _checkpoint(tmp_path, "candidate.pt")
+    champion = _checkpoint(tmp_path, "champion.pt")
+    report = _internal_report(candidate, champion, 9001)
+    report["games"][0]["search_seeds_by_role"]["candidate"] += 1
+
+    with pytest.raises(pool.PoolError, match="role/seat binding"):
+        pool.validate_complete_report(report, kind="internal", where="drifted-rng")
 
 
 def test_internal_pool_reindexes_local_pair_ids_and_recomputes_gate(

@@ -83,7 +83,10 @@ def _contract_shape(lock: Mapping[str, Any]) -> dict[str, Any]:
     profile = topology["profile"]
     if profile == "historical_pre_wave_v2":
         host_count: int | None = EXPECTED_HOSTS
-    elif profile == contract.CURRENT_GAME_CONTRACT_PROFILE:
+    elif profile in {
+        contract.CURRENT_GAME_CONTRACT_PROFILE,
+        contract.SCALE_64K_GAME_CONTRACT_PROFILE,
+    }:
         jobs = lock.get("fleet", {}).get("jobs", [])
         host_count = len(
             {

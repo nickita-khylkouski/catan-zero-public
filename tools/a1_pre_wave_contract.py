@@ -8,8 +8,10 @@ dual-arm wave remains an explicit operator boundary.
 
 The contract uses category-specific jobs rather than a probabilistic opponent
 mix. Historical v2 locks retain their original 40-worker 240/45/15 layout.
-Current v3 locks bind the canonical 64-GPU fleet and distribute the same exact
-9,600/1,800/600 science totals with deterministic balanced-prefix quotas.
+Current v3 locks bind the canonical 64-GPU fleet.  The original profile keeps
+the exact 9,600/1,800/600 science totals; the scale profile binds exactly
+800/150/50 selected games on every GPU (64,000 total) without rewriting issued
+locks.  Both use deterministic, sealed quotas.
 Every job receives a bounded category-specific reserve, and postflight selects
 the lowest-seed complete games before row expansion. The audit rejects an
 insufficient complete quota, duplicate or VAL-ONLY seeds, invalid selected
@@ -134,6 +136,25 @@ CURRENT_FLEET_AUTHORITY = "catan-h100-exact64-v1"
 CURRENT_WORKER_COUNT = 64
 BALANCED_PREFIX_QUOTA_POLICY = "balanced_prefix_v1"
 CURRENT_GAME_CONTRACT_PROFILE = "pre_wave_generation_v3"
+# The scale wave is a new quota/profile identity, not a reinterpretation of the
+# already-issued 12K v3 locks.  Keeping the same draft/lock envelope is safe
+# because ``quota_policy`` and ``game_contract.profile`` are both hashed and
+# verification reconstructs the exact profile selected by the source draft.
+BALANCED_PER_LANE_64K_QUOTA_POLICY = "balanced_per_lane_64k_v1"
+SCALE_64K_GAME_CONTRACT_PROFILE = "pre_wave_generation_v3_64k"
+SCALE_64K_PER_WORKER_GAMES = {
+    "current_producer": 800,
+    "recent_history": 150,
+    "hard_negative": 50,
+}
+SCALE_64K_GAMES = {
+    category: games * CURRENT_WORKER_COUNT
+    for category, games in SCALE_64K_PER_WORKER_GAMES.items()
+}
+AUTHORIZED_CURRENT_QUOTA_POLICIES = {
+    BALANCED_PREFIX_QUOTA_POLICY,
+    BALANCED_PER_LANE_64K_QUOTA_POLICY,
+}
 DUAL_ARM_GAME_CONTRACT_PROFILE = "dual_arm_generation_v1"
 ATTEMPT_RESERVE_PER_JOB = {
     "current_producer": 5,
@@ -597,14 +618,15 @@ def _sealed_game_contract_shape(lock: Mapping[str, Any]) -> dict[str, Any]:
         job_count = 84
     elif schema == LOCK_SCHEMA:
         if (
-            game.get("profile") != CURRENT_GAME_CONTRACT_PROFILE
+            game.get("profile")
+            not in {CURRENT_GAME_CONTRACT_PROFILE, SCALE_64K_GAME_CONTRACT_PROFILE}
             or game.get("worker_count") != CURRENT_WORKER_COUNT
             or game.get("job_count")
             != CURRENT_WORKER_COUNT * len(EXPECTED_GAMES)
             or "arm_id" in game
         ):
-            raise ContractError("current v3 sealed topology drift")
-        profile = CURRENT_GAME_CONTRACT_PROFILE
+            raise ContractError("current v3 sealed topology/profile drift")
+        profile = str(game["profile"])
         arm_id = None
         worker_count = CURRENT_WORKER_COUNT
         job_count = CURRENT_WORKER_COUNT * len(EXPECTED_GAMES)
@@ -2533,6 +2555,8 @@ def _canonical_workers_from_fleet_manifest(
 
 def _balanced_worker_quotas(
     workers: Sequence[Mapping[str, Any]],
+    *,
+    quota_policy: str = BALANCED_PREFIX_QUOTA_POLICY,
 ) -> dict[str, dict[str, int]]:
     """Return exact category quotas in canonical balanced-prefix order."""
 
@@ -2543,17 +2567,40 @@ def _balanced_worker_quotas(
     worker_ids = [str(worker["id"]) for worker in workers]
     if len(set(worker_ids)) != len(worker_ids):
         raise ContractError("balanced v3 quota policy received duplicate worker ids")
+    expected_games = _games_for_quota_policy(quota_policy)
     quotas = {worker_id: {} for worker_id in worker_ids}
-    for category, total in EXPECTED_GAMES.items():
+    for category, total in expected_games.items():
         base, extra = divmod(int(total), len(worker_ids))
         for index, worker_id in enumerate(worker_ids):
             quotas[worker_id][category] = base + int(index < extra)
     if {
         category: sum(worker[category] for worker in quotas.values())
-        for category in EXPECTED_GAMES
-    } != EXPECTED_GAMES:
+        for category in expected_games
+    } != expected_games:
         raise AssertionError("balanced quota construction lost exact science totals")
     return quotas
+
+
+def _games_for_quota_policy(quota_policy: str) -> dict[str, int]:
+    """Return one immutable selected-game profile for a current 64-GPU wave."""
+
+    if quota_policy == BALANCED_PREFIX_QUOTA_POLICY:
+        return dict(EXPECTED_GAMES)
+    if quota_policy == BALANCED_PER_LANE_64K_QUOTA_POLICY:
+        return dict(SCALE_64K_GAMES)
+    raise ContractError(
+        "current fleet quota_policy must be one of "
+        f"{sorted(AUTHORIZED_CURRENT_QUOTA_POLICIES)}, got {quota_policy!r}"
+    )
+
+
+def _profile_for_quota_policy(quota_policy: str) -> str:
+    _games_for_quota_policy(quota_policy)
+    return (
+        SCALE_64K_GAME_CONTRACT_PROFILE
+        if quota_policy == BALANCED_PER_LANE_64K_QUOTA_POLICY
+        else CURRENT_GAME_CONTRACT_PROFILE
+    )
 
 
 def _build_balanced_jobs(
@@ -2563,13 +2610,15 @@ def _build_balanced_jobs(
     block_size: int,
     output_root: str,
     contract_id: str,
+    quota_policy: str = BALANCED_PREFIX_QUOTA_POLICY,
 ) -> tuple[list[dict[str, Any]], dict[str, dict[str, int]]]:
-    quotas = _balanced_worker_quotas(workers)
+    expected_games = _games_for_quota_policy(quota_policy)
+    quotas = _balanced_worker_quotas(workers, quota_policy=quota_policy)
     max_attempts_per_worker = max(
         sum(
             int(quotas[worker_id][category])
             + int(ATTEMPT_RESERVE_PER_JOB[category])
-            for category in EXPECTED_GAMES
+            for category in expected_games
         )
         for worker_id in quotas
     )
@@ -2582,7 +2631,7 @@ def _build_balanced_jobs(
     for worker_index, worker in enumerate(workers):
         cursor = seed_base + worker_index * block_size
         worker_id = str(worker["id"])
-        for category in EXPECTED_GAMES:
+        for category in expected_games:
             games = int(quotas[worker_id][category])
             attempts = games + int(ATTEMPT_RESERVE_PER_JOB[category])
             job_id = f"{worker_id}__{category}"
@@ -6790,6 +6839,8 @@ def build_lock(
             "fleet.output_root must be an absolute path shared by the data lane"
         )
     if draft_schema == LEGACY_DRAFT_SCHEMA:
+        selected_games = dict(EXPECTED_GAMES)
+        quota_policy = BALANCED_PREFIX_QUOTA_POLICY
         workers = list(fleet["workers"])
         jobs = _build_jobs(
             workers,
@@ -6803,11 +6854,8 @@ def build_lock(
             contract_id=contract_id,
         )
     else:
-        if fleet["quota_policy"] != BALANCED_PREFIX_QUOTA_POLICY:
-            raise ContractError(
-                "v3 fleet.quota_policy must be exactly "
-                f"{BALANCED_PREFIX_QUOTA_POLICY!r}"
-            )
+        quota_policy = str(fleet["quota_policy"])
+        selected_games = _games_for_quota_policy(quota_policy)
         fleet_manifest_path = _absolute_ref(
             str(fleet["fleet_manifest"]), base=base
         )
@@ -6825,6 +6873,7 @@ def build_lock(
             block_size=int(fleet["seed_block_size"]),
             output_root=str(output_root),
             contract_id=contract_id,
+            quota_policy=quota_policy,
         )
     if seed_ledger_snapshot is None:
         _validate_against_ledger(jobs, ledger_path)
@@ -6909,7 +6958,7 @@ def build_lock(
             for job in jobs
             if job["category"] == category
         )
-        for category in EXPECTED_GAMES
+        for category in selected_games
     }
     lock_fleet: dict[str, Any] = {
         "workers": workers,
@@ -6928,7 +6977,7 @@ def build_lock(
         lock_fleet.update(
             {
                 "fleet_manifest": fleet_manifest_record,
-                "quota_policy": BALANCED_PREFIX_QUOTA_POLICY,
+                "quota_policy": quota_policy,
                 "worker_quotas": worker_quotas,
                 "worker_quotas_sha256": _digest_value(worker_quotas),
             }
@@ -6974,13 +7023,13 @@ def build_lock(
                 {}
                 if draft_schema == LEGACY_DRAFT_SCHEMA
                 else {
-                    "profile": CURRENT_GAME_CONTRACT_PROFILE,
+                    "profile": _profile_for_quota_policy(quota_policy),
                     "worker_count": CURRENT_WORKER_COUNT,
-                    "job_count": CURRENT_WORKER_COUNT * len(EXPECTED_GAMES),
+                    "job_count": CURRENT_WORKER_COUNT * len(selected_games),
                 }
             ),
-            "total_complete_games": sum(EXPECTED_GAMES.values()),
-            "category_games": dict(EXPECTED_GAMES),
+            "total_complete_games": sum(selected_games.values()),
+            "category_games": dict(selected_games),
             "total_attempts": sum(category_attempts.values()),
             "category_attempts": category_attempts,
             "selection_rule": "lowest_seed_complete_per_job",
@@ -7216,15 +7265,22 @@ def verify_lock(
             raise ContractError("v3 lock fleet manifest record drift")
         if lock["fleet"].get("workers") != canonical_workers:
             raise ContractError("v3 lock worker topology/order drift")
-        if lock["fleet"].get("quota_policy") != BALANCED_PREFIX_QUOTA_POLICY:
-            raise ContractError("v3 lock quota policy drift")
-        expected_quotas = _balanced_worker_quotas(canonical_workers)
+        quota_policy = str(lock["fleet"].get("quota_policy", ""))
+        selected_games = _games_for_quota_policy(quota_policy)
+        expected_profile = _profile_for_quota_policy(quota_policy)
+        if lock["game_contract"].get("profile") != expected_profile:
+            raise ContractError("v3 lock game/quota profile drift")
+        expected_quotas = _balanced_worker_quotas(
+            canonical_workers, quota_policy=quota_policy
+        )
         if (
             lock["fleet"].get("worker_quotas") != expected_quotas
             or lock["fleet"].get("worker_quotas_sha256")
             != _digest_value(expected_quotas)
         ):
             raise ContractError("v3 lock balanced worker quotas drift")
+    else:
+        selected_games = dict(EXPECTED_GAMES)
     jobs = list(lock["fleet"]["jobs"])
     if _digest_value(jobs) != lock["fleet"]["seed_plan_sha256"]:
         raise ContractError("seed plan digest mismatch")
@@ -7236,26 +7292,34 @@ def verify_lock(
             for job in jobs
         ]
     )
-    if Counter({category: 0 for category in EXPECTED_GAMES}) + Counter(
+    if Counter({category: 0 for category in selected_games}) + Counter(
         {
             category: sum(int(j["games"]) for j in jobs if j["category"] == category)
-            for category in EXPECTED_GAMES
+            for category in selected_games
         }
-    ) != Counter(EXPECTED_GAMES):
-        raise ContractError("job category totals drifted from 9600/1800/600")
+    ) != Counter(selected_games):
+        raise ContractError(
+            f"job category totals drifted from sealed profile {selected_games}"
+        )
+    if (
+        lock["game_contract"].get("category_games") != selected_games
+        or lock["game_contract"].get("total_complete_games")
+        != sum(selected_games.values())
+    ):
+        raise ContractError("game-contract selected-game totals drifted")
     observed_attempts = {
         category: sum(
             int(j["attempts"]) for j in jobs if j["category"] == category
         )
-        for category in EXPECTED_GAMES
+        for category in selected_games
     }
     expected_attempts = (
         EXPECTED_ATTEMPTS
         if lock_schema == LEGACY_LOCK_SCHEMA
         else {
-            category: int(EXPECTED_GAMES[category])
+            category: int(selected_games[category])
             + CURRENT_WORKER_COUNT * int(ATTEMPT_RESERVE_PER_JOB[category])
-            for category in EXPECTED_GAMES
+            for category in selected_games
         }
     )
     if Counter(observed_attempts) != Counter(expected_attempts):

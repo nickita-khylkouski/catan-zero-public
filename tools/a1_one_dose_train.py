@@ -31,7 +31,7 @@ import subprocess
 import sys
 import time
 import socket
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 import numpy as np
 
@@ -43,6 +43,7 @@ if str(_TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(_TOOLS_DIR))
 
 from tools import a1_pre_wave_contract as a1_contract  # noqa: E402
+from tools import a1_build_post_wave_composite as composite_builder  # noqa: E402
 from tools import train_bc  # noqa: E402
 from tools import a1_lineage_dose as lineage  # noqa: E402
 from tools import a1_function_preserving_upgrade as architecture_upgrade  # noqa: E402
@@ -1179,6 +1180,17 @@ def _verify_production_composite_inputs(
         or contract.get("effective_component_sampling_ratios") != expected_ratios
         or meta.get("component_game_sampling_ratios")
         != [expected_ratios[value] for value in expected_ids]
+        or meta.get("stored_policy_component_temperatures")
+        != composite_builder.STORED_POLICY_COMPONENT_TEMPERATURES
+        or not isinstance(
+            meta.get("entity_feature_adapter_component_versions"), dict
+        )
+        or set(meta["entity_feature_adapter_component_versions"])
+        != set(expected_ids)
+        or len(
+            set(meta["entity_feature_adapter_component_versions"].values())
+        )
+        != 1
         or not math.isclose(
             float(contract.get("realized_replay_ratio", -1.0)),
             0.20,
@@ -1329,6 +1341,9 @@ def _verify_production_composite_inputs(
         "learner_recipe_overrides_sha256": meta[
             "learner_recipe_overrides_sha256"
         ],
+        "entity_feature_adapter_component_versions": dict(
+            meta["entity_feature_adapter_component_versions"]
+        ),
         "aux_subgoal_target_contract_sha256": meta[
             "aux_subgoal_target_contract_sha256"
         ],
@@ -3454,6 +3469,16 @@ def _build_direct_train_command(
     )
     if "sampler_seed" in recipe:
         command.extend(["--sampler-seed", str(recipe["sampler_seed"])])
+    if (
+        verified.get("data_kind") == "production_composite_v2"
+        and verified.get("learner_ablation") is None
+        and verified.get("central_learner_binding") is None
+        and int(recipe.get("max_steps", 0)) == 128
+    ):
+        # Preserve the useful part of the dose curve without launching chained
+        # candidates.  Step 64, 96, and the ordinary terminal step 128 all come
+        # from one fresh-Adam trajectory and one authenticated sample order.
+        command.extend(["--checkpoint-steps", "64,96"])
     if verified.get("data_kind") == "production_composite_v2":
         # The production 64/12/4/20 descriptor has three corrected components
         # plus homogeneous legacy replay. train_bc authenticates and routes
@@ -5388,6 +5413,90 @@ def _verify_training_outputs(
     }
     if drift:
         raise ExecutorError(f"A1 training report invariant drift: {drift}")
+    checkpoint_step_values = (
+        []
+        if command is None
+        else _literal_option_values(command, "--checkpoint-steps")
+    )
+    if len(checkpoint_step_values) > 1:
+        raise ExecutorError("A1 training command repeats --checkpoint-steps")
+    expected_checkpoint_steps = (
+        ()
+        if not checkpoint_step_values
+        else train_bc._parse_checkpoint_steps(  # noqa: SLF001
+            checkpoint_step_values[0], max_steps=int(recipe["max_steps"])
+        )
+    )
+    intermediate_records = report_payload.get("intermediate_checkpoints", [])
+    if (
+        report_payload.get("checkpoint_steps_requested", [])
+        != list(expected_checkpoint_steps)
+        or not isinstance(intermediate_records, list)
+        or len(intermediate_records) != len(expected_checkpoint_steps)
+    ):
+        raise ExecutorError(
+            "A1 training report lost its same-trajectory intermediate checkpoints"
+        )
+    verified_intermediate: list[dict[str, Any]] = []
+    for step, record in zip(
+        expected_checkpoint_steps, intermediate_records, strict=True
+    ):
+        expected_path = train_bc._step_checkpoint_path(checkpoint, step)  # noqa: SLF001
+        expected_record = {
+            "schema_version": "train-bc-intermediate-checkpoint-v1",
+            "optimizer_step": step,
+            "checkpoint": str(expected_path),
+            "checkpoint_sha256": _file_sha256(expected_path)
+            if expected_path.is_file()
+            else "",
+            "size_bytes": expected_path.stat().st_size
+            if expected_path.is_file()
+            else 0,
+            "same_training_trajectory": True,
+            "optimizer_sidecar": None,
+        }
+        if (
+            record != expected_record
+            or not expected_path.is_file()
+            or expected_path.is_symlink()
+            or Path(str(expected_path) + ".optimizer.pt").exists()
+            or Path(str(expected_path) + ".training-progress.json").exists()
+        ):
+            raise ExecutorError(
+                f"A1 intermediate checkpoint step {step} is missing or malformed"
+            )
+        try:
+            import torch
+
+            snapshot = torch.load(
+                expected_path, map_location="cpu", weights_only=False
+            )
+        except Exception as error:
+            raise ExecutorError(
+                f"cannot load A1 intermediate checkpoint step {step}: {error}"
+            ) from error
+        snapshot_value = snapshot.get("value_training") if isinstance(snapshot, dict) else None
+        if (
+            not isinstance(snapshot, dict)
+            or snapshot.get("policy_type") != "entity_graph"
+            or not isinstance(snapshot.get("model"), dict)
+            or not isinstance(snapshot_value, dict)
+            or snapshot_value.get("optimizer_steps") != step
+            or snapshot_value.get("completed_epochs") != 0
+            or "scalar" not in snapshot_value.get("trained_value_readouts", [])
+            or snapshot_value.get("intermediate_checkpoint")
+            != {
+                "schema_version": "train-bc-intermediate-checkpoint-v1",
+                "optimizer_step": step,
+                "same_training_trajectory": True,
+                "optimizer_sidecar_intentionally_omitted": True,
+            }
+        ):
+            raise ExecutorError(
+                f"A1 intermediate checkpoint step {step} lost training provenance"
+            )
+        _fsync_file(expected_path)
+        verified_intermediate.append(expected_record)
     if "policy_aux_active_batch_size" in recipe:
         exposure = lineage_dose["objective_exposure"]
         expected_draws = {
@@ -5447,6 +5556,12 @@ def _verify_training_outputs(
                 "historical_replay",
             ],
             "component_game_sampling_ratios": [0.64, 0.12, 0.04, 0.20],
+            "stored_policy_component_temperatures": (
+                composite_builder.STORED_POLICY_COMPONENT_TEMPERATURES
+            ),
+            "entity_feature_adapter_component_versions": verified[
+                "entity_feature_adapter_component_versions"
+            ],
             "flywheel_replay_contract": verified["production_mix_contract"],
             "category_semantics": verified.get("category_semantics"),
             "category_semantics_sha256": verified.get(
@@ -5746,6 +5861,11 @@ def _verify_training_outputs(
         ),
         "report": str(report),
         "report_sha256": _file_sha256(report),
+        **(
+            {"intermediate_checkpoints": verified_intermediate}
+            if expected_checkpoint_steps
+            else {}
+        ),
         "sample_receipt_state_sha256": (
             central_binding["sample_binding"]["sample_receipt_state_sha256"]
             if isinstance(central_binding, dict)
@@ -6578,12 +6698,17 @@ def _execute_locked(
             execution_binding=execution_binding,
             command=command,
         )
-        for output_path in (
+        immutable_outputs = [
             checkpoint,
             Path(str(checkpoint) + ".optimizer.pt"),
             Path(str(checkpoint) + ".training-progress.json"),
             report,
-        ):
+        ]
+        immutable_outputs.extend(
+            Path(str(record["checkpoint"]))
+            for record in output_artifacts.get("intermediate_checkpoints", [])
+        )
+        for output_path in immutable_outputs:
             os.chmod(output_path, 0o444)
         for parent in {checkpoint.parent, report.parent}:
             _fsync_directory(parent)

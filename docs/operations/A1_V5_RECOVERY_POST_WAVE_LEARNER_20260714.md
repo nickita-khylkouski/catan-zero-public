@@ -17,7 +17,7 @@ set -euo pipefail
 export REPO=/home/ubuntu/catan-zero-v1
 export PY=$REPO/.venv/bin/python
 export PROD=/home/ubuntu/catan-zero-production
-export WAVE_ID=a1-v5-recovery-n128-p4-12000games-64gpu-20260714-r1
+export WAVE_ID=a1-v5-recovery-n128-p4-64000games-64gpu-20260714-r1
 export WAVE=$PROD/contracts/$WAVE_ID
 export LOCK=$WAVE/lock.json
 export RENDER=$WAVE/render/commands.json
@@ -59,6 +59,13 @@ f7  f7e93dfb8cdb713d647b3e142c949d59083de9f719b6688b6faa6c918ce3eed4
 The f7 path is a safety baseline, not the causal parent. The exact recovered
 v5 bytes are both the wave producer and the learner initializer.
 
+The scale profile selects exactly 1,000 complete games per GPU: 800 current
+v5 self-play, 150 f7 recovery-reference, and 50 hard-negative. Each lane gets
+a 1,024-seed block because the bounded reserves add 5/2/1 attempts, for a
+maximum of 1,008 attempted games per lane. The sealed global selected totals
+are therefore 51,200/9,600/3,200; the 16 unused seed slots per lane are spacing,
+not training games.
+
 ## 1. Harvest the completed 64-H100 wave
 
 The harvest transaction reads the 12 remote hosts directly from the immutable
@@ -80,9 +87,9 @@ cd "$REPO"
 ```
 
 The audit deterministically emits `$WAVE/post-wave-audit.selected_games.json`.
-That selection contains exactly 12,000 complete games: 9,600 current-producer,
-1,800 recovery-reference, and 600 hard-negative games. Reserve attempts do not
-enter the learner.
+That selection contains exactly 64,000 complete games: 51,200 current-producer,
+9,600 recovery-reference, and 3,200 hard-negative games. Reserve attempts do
+not enter the learner.
 
 ## 2. Seal the already-existing 20% replay component
 
@@ -154,7 +161,12 @@ The learner input is `$COMPOSITE/memmap_composite.json`; the required build
 authority is `$COMPOSITE/build_receipt.json`. The descriptor samples games at
 64% current, 12% recovery-reference, 4% hard-negative, and 20% historical
 replay. Fresh search-policy targets train policy; all components retain value
-supervision. Forced rows carry zero policy weight and full value weight.
+supervision. Forced rows carry zero policy weight and full value weight. The
+legacy replay memmap predates preservation of `adapter_version`; the builder
+recovers that identity from the original hash-bound raw NPZs, binds the version
+for every component in the descriptor, and the loader lazily restores only the
+missing legacy column. Mixed, missing, unknown, or checkpoint-incompatible
+adapter semantics still fail closed.
 
 ## 4. Execute one independent 8-B200 dose
 
@@ -207,10 +219,13 @@ The effective production dose is fixed by the lock and topology binder:
 - no train-time D6 augmentation;
 - public-information masking and whole-game component-balanced validation.
 
-The current canonical trainer produces one decisive step-128 checkpoint. It
-does not yet emit step-64/96 snapshots. Do not obtain those by chaining
-candidates or running additional production doses; that would repeat the
-failure mode this recipe was designed to eliminate.
+The canonical trainer emits model-only step-64 and step-96 snapshots plus the
+ordinary resumable step-128 checkpoint. All three come from the same fresh-Adam
+trajectory and authenticated sample order. The intermediate snapshots have no
+optimizer/progress sidecars by design: select among 64/96/128 with a matched
+candidate-vs-v5 screen, then run the full disjoint gate only on the selected
+snapshot. Never initialize another learner from a snapshot or candidate; that
+would repeat the candidate-chaining failure this recipe was designed to remove.
 
 ## 5. Gate against both required baselines
 
@@ -294,8 +309,11 @@ export F7_REPORT=$GATE/f7-collected/$F7_RUN_ID/pooled/internal.json
 The parent report is the `internal_h2h` source for the ordinary promotion
 evidence graph; its verdict must be strict H1. Complete the ordinary
 calibration, external, high-regret, and bucket evidence from the same plan and
-write `$GATE/standard-promotion-adjudication.json`. Then build the conjunctive
-recovery authority with the independently collected `$F7_REPORT`:
+write `$GATE/standard-promotion-adjudication.json`. Build the candidate-bound
+cohort-exclusions manifest at `$GATE/cohort-exclusions.json`; it must enumerate
+every prior diagnostic/selection cohort so the gate can replay that both the
+ordinary final cohorts and the fixed f7 veto cohort are fresh. Then build the
+conjunctive recovery authority with the independently collected `$F7_REPORT`:
 
 ```bash
 "$PY" tools/a1_v5_recovery_gate.py \
@@ -303,6 +321,7 @@ recovery authority with the independently collected `$F7_REPORT`:
   --contract-lock "$LOCK" \
   --standard-adjudication "$GATE/standard-promotion-adjudication.json" \
   --training-receipt "$TRAIN_RECEIPT" \
+  --cohort-exclusions "$GATE/cohort-exclusions.json" \
   --registry "$RECOVERY_REGISTRY" \
   --current-pointer "$RECOVERY_POINTER" \
   --f7-nonregression-report "$F7_REPORT" \

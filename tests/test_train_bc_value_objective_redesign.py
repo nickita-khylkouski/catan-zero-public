@@ -209,6 +209,23 @@ def test_value_training_metadata_never_attests_a_zero_step_or_zero_mass_head() -
     assert zero_mass["trained_value_readouts"] == []
 
 
+def test_value_training_metadata_attests_real_mid_epoch_updates() -> None:
+    midpoint = _value_training_metadata(
+        _args("mse"),
+        scalar_weight=0.25,
+        categorical_weight=0.0,
+        categorical_bins=0,
+        optimizer_steps=64,
+        completed_epochs=0,
+        scalar_training_weight_sum=262_144.0,
+        categorical_training_weight_sum=0.0,
+    )
+
+    assert midpoint["optimizer_steps"] == 64
+    assert midpoint["completed_epochs"] == 0
+    assert midpoint["trained_value_readouts"] == ["scalar"]
+
+
 def test_report_records_requested_and_resolved_value_objective_weights() -> None:
     train_bc_path = Path(__file__).resolve().parents[1] / "tools" / "train_bc.py"
     tree = ast.parse(train_bc_path.read_text(encoding="utf-8"))

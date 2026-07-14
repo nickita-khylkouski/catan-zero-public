@@ -13,6 +13,7 @@ import pytest
 import numpy as np
 
 from tools import a1_promotion_transaction as promotion
+from tools import a1_evaluation_pool as evaluation_pool
 from tools import a1_promotion_artifacts as artifacts
 from tools import a1_one_dose_train as one_dose
 from tools import a1_production_l1_rerun as production_l1
@@ -121,6 +122,51 @@ def _checkpoint_ref(path: Path) -> dict[str, str]:
     return {"path": str(path), "sha256": promotion._sha256(path)}
 
 
+def _make_internal_pool_shard_complete(
+    source: dict, *, candidate: Path, champion: Path
+) -> None:
+    source["candidate_checkpoint_sha256"] = promotion._sha256(candidate)
+    source["baseline_checkpoint_sha256"] = promotion._sha256(champion)
+    source["gate_config"] = "flywheel"
+    for game in source["games"]:
+        game.update(
+            terminated=True,
+            truncated=False,
+            error=None,
+            engine_divergence=False,
+        )
+    source["search_telemetry"] = {
+        "by_role": {
+            role: {
+                "search_calls": 10,
+                "non_forced_search_calls": 8,
+                "search_elapsed_sec": 2.0,
+                "simulations_used": 1_280,
+                "wide_root_calls": 0,
+                "wide_root_simulations_used": 0,
+                "selected_vs_prior_disagreement_calls": 3,
+                "wide_selected_vs_prior_disagreement_calls": 0,
+            }
+            for role in ("candidate", "baseline")
+        }
+    }
+
+
+def _make_external_pool_shard_complete(source: dict, *, checkpoint: Path) -> None:
+    source["candidate_checkpoint_sha256"] = promotion._sha256(checkpoint)
+    source["base_seed"] = min(game["game_seed"] for game in source["games"])
+    source.setdefault("referee_engine", "vendored_python_catanatron")
+    source.setdefault("games_errored", 0)
+    for game in source["games"]:
+        game.update(
+            search_won=game["candidate_won"],
+            terminated=True,
+            truncated=False,
+            error=None,
+            engine_divergence=False,
+        )
+
+
 def _write_one_dose_receipt(
     tmp_path: Path,
     *,
@@ -190,6 +236,228 @@ def _write_one_dose_receipt(
     receipt["receipt_sha256"] = one_dose._value_sha256(receipt)
     _write_json(receipt_path, receipt)
     return receipt_path
+
+
+def _rewrite_one_dose_receipt(receipt_path: Path, receipt: dict) -> None:
+    claim_path = Path(receipt["claim"])
+    claim = {
+        key: value
+        for key, value in receipt.items()
+        if key not in {"claim", "claim_state_sha256", "receipt_sha256"}
+    }
+    claim["schema_version"] = one_dose.CLAIM_SCHEMA
+    claim["receipt_target"] = str(receipt_path)
+    claim["state_sha256"] = one_dose._value_sha256(claim)
+    _write_json(claim_path, claim)
+    receipt["claim_state_sha256"] = claim["state_sha256"]
+    receipt.pop("receipt_sha256", None)
+    receipt["receipt_sha256"] = one_dose._value_sha256(receipt)
+    _write_json(receipt_path, receipt)
+
+
+def _modernize_one_dose_receipt(
+    fixture: dict,
+    *,
+    world_size: int = 8,
+    with_intermediate: bool = False,
+) -> tuple[dict, dict]:
+    receipt_path = fixture["training_receipt"]
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    report_path = fixture["report"]
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    candidate = fixture["candidate"]
+    gpus = list(range(8)) if world_size == 8 else [0]
+    local_batch = 512 if world_size == 8 else 4096
+    topology = {
+        "schema_version": "a1-one-dose-training-topology-v1",
+        "name": (
+            one_dose.B200_8GPU_DDP_TOPOLOGY
+            if world_size == 8
+            else one_dose.LEGACY_SINGLE_GPU_TOPOLOGY
+        ),
+        "world_size": world_size,
+        "physical_gpus": gpus,
+        "local_batch_size": local_batch,
+        "grad_accum_steps": 1,
+        "global_batch_size": 4096,
+        "dose_preserving": True,
+    }
+    command = (
+        [
+            sys.executable,
+            "-m",
+            "torch.distributed.run",
+            "--standalone",
+            "--nproc_per_node=8",
+            str(Path(one_dose.train_bc.__file__).resolve()),
+            "--sealed-a1",
+        ]
+        if world_size == 8
+        else [
+            sys.executable,
+            str(Path(one_dose.train_bc.__file__).resolve()),
+            "--sealed-a1",
+        ]
+    )
+    execution_binding = one_dose._execution_binding(
+        command=command, environment=one_dose._child_environment(gpus)
+    )
+    canary_path = fixture["contract_path"].parent / "ddp-canary.json"
+    canary_path.write_text("{}\n", encoding="utf-8")
+    canary = (
+        {
+            "path": str(canary_path),
+            "file_sha256": promotion._sha256(canary_path),
+            "receipt_sha256": "sha256:" + "c" * 64,
+            "global_draw_sha256": "sha256:" + "d" * 64,
+            "rank_slice_sha256": ["sha256:" + f"{rank:x}" * 64 for rank in range(8)],
+            "semantic_identity": {"world_size": 8},
+            "semantic_identity_sha256": "sha256:" + "e" * 64,
+        }
+        if world_size == 8
+        else None
+    )
+    lineage_dose = {"schema_version": "test-lineage-dose-v1", "current_sampled_rows": 524_288}
+    outputs = receipt["outputs"]
+    progress = Path(str(candidate) + ".training-progress.json")
+    progress.write_text('{"progress_sha256":"sha256:test"}\n', encoding="utf-8")
+    outputs.update(
+        {
+            "training_progress": str(progress),
+            "training_progress_sha256": promotion._sha256(progress),
+            "training_progress_payload_sha256": "sha256:" + "4" * 64,
+            "sample_receipt_state_sha256": None,
+            "sample_order_sha256": None,
+            "row_set_sha256": None,
+            "realized_sample_evidence_sha256": None,
+            "unique_training_rows": None,
+            "base_sampler_draw_events": 524_288,
+            "sampler_draw_events": 524_288,
+            "sampled_rows": 524_288,
+            "lineage_dose": lineage_dose,
+            "production_sampling_receipt_sha256": None,
+            "validation_split_receipt_sha256": None,
+        }
+    )
+    outputs["steps_completed"] = 128 if with_intermediate else 7
+    intermediate_records = []
+    if with_intermediate:
+        import torch
+
+        for step in (64, 96):
+            checkpoint = candidate.with_name(f"candidate_step{step:04d}.pt")
+            torch.save(
+                {
+                    "policy_type": "entity_graph",
+                    "model": {"weight": torch.tensor([float(step)])},
+                    "value_training": {
+                        "optimizer_steps": step,
+                        "completed_epochs": 0,
+                        "trained_value_readouts": ["scalar"],
+                        "intermediate_checkpoint": {
+                            "schema_version": promotion.INTERMEDIATE_CHECKPOINT_SCHEMA,
+                            "optimizer_step": step,
+                            "same_training_trajectory": True,
+                            "optimizer_sidecar_intentionally_omitted": True,
+                        },
+                    },
+                },
+                checkpoint,
+            )
+            intermediate_records.append(
+                {
+                    "schema_version": promotion.INTERMEDIATE_CHECKPOINT_SCHEMA,
+                    "optimizer_step": step,
+                    "checkpoint": str(checkpoint.resolve()),
+                    "checkpoint_sha256": promotion._sha256(checkpoint),
+                    "size_bytes": checkpoint.stat().st_size,
+                    "same_training_trajectory": True,
+                    "optimizer_sidecar": None,
+                }
+            )
+        outputs["intermediate_checkpoints"] = intermediate_records
+        report["checkpoint_steps_requested"] = [64, 96]
+        report["intermediate_checkpoints"] = intermediate_records
+        report["steps_completed"] = 128
+    input_binding = {
+        "schema_version": one_dose.REPORT_INPUT_BINDING_SCHEMA,
+        "contract_sha256": fixture["contract"]["contract_sha256"],
+        "data": receipt["corpus"],
+        "data_kind": "a1_memmap_v1",
+        "data_fingerprint": "sha256:" + "0" * 64,
+        "payload_inventory_sha256": receipt["payload_inventory_sha256"],
+        "corpus_row_count": outputs["corpus_row_count"],
+        "training_row_count": outputs["training_row_count"],
+        "validation_row_count": outputs["validation_row_count"],
+        "sealed_learner_recipe_sha256": receipt["learner_training_recipe_sha256"],
+        "effective_learner_recipe_sha256": promotion._digest_value(
+            {
+                **fixture["contract"]["science"]["learner_training_recipe"],
+                "world_size": world_size,
+                "batch_size": local_batch,
+                "grad_accum_steps": 1,
+                "global_batch_size": 4096,
+            }
+        ),
+        "training_topology": topology,
+        "ddp_canary": canary,
+        "aux_subgoal_preclaim_contract": None,
+        "aux_pair_executor_authority_sha256": None,
+        "p1_arm_executor_authority_sha256": None,
+        "final_replication_executor_authority_sha256": None,
+        "central_published_executor_authority": None,
+        "validation_manifest": receipt["validation_manifest"],
+        "validation_manifest_file_sha256": receipt[
+            "validation_manifest_file_sha256"
+        ],
+        "selected_game_seed_set_sha256": "sha256:" + "5" * 64,
+        "training_game_seed_set_sha256": "sha256:" + "6" * 64,
+        "validation_game_seed_set_sha256": "sha256:" + "7" * 64,
+    }
+    input_binding["binding_sha256"] = promotion._digest_value(input_binding)
+    outputs["input_binding_sha256"] = input_binding["binding_sha256"]
+    outputs["execution_binding_sha256"] = promotion._digest_value(execution_binding)
+    report.update(
+        {
+            one_dose.REPORT_EXECUTION_BINDING_FIELD: execution_binding,
+            one_dose.REPORT_INPUT_BINDING_FIELD: input_binding,
+            "world_size": world_size,
+            "batch_size": local_batch,
+            "grad_accum_steps": 1,
+            "effective_global_batch_size": 4096,
+            "a1_lineage_dose": lineage_dose,
+        }
+    )
+    _write_json(report_path, report)
+    outputs["report_sha256"] = promotion._sha256(report_path)
+    receipt.update(
+        {
+            "command": command,
+            "command_sha256": promotion._digest_value(command),
+            "execution_binding": execution_binding,
+            "input_binding": input_binding,
+            "world_size": world_size,
+            "gpu": 0,
+            "gpus": gpus,
+            "gpu_name": "NVIDIA B200",
+            "gpu_names": ["NVIDIA B200"] * world_size,
+            "training_topology": topology,
+            "ddp_canary": canary,
+            "production_sampling_receipt_sha256": None,
+            "validation_split_receipt_sha256": None,
+            "lineage_dose": lineage_dose,
+            "outputs": outputs,
+        }
+    )
+    _rewrite_one_dose_receipt(receipt_path, receipt)
+    adjudication = json.loads(fixture["adjudication"].read_text(encoding="utf-8"))
+    adjudication["candidate"]["training_report"]["sha256"] = promotion._sha256(
+        report_path
+    )
+    adjudication.pop("adjudication_sha256")
+    adjudication["adjudication_sha256"] = promotion._digest_value(adjudication)
+    _write_json(fixture["adjudication"], adjudication)
+    return receipt, {"canary": canary, "intermediate": intermediate_records}
 
 
 def _write_evidence_envelope(
@@ -426,17 +694,29 @@ def _fixture(
             },
         )
         calibration_sources.append((role, source))
-    internal_games = [
-        {
-            "pair_id": pair,
-            "game_seed": 7_000_000 + pair,
-            "orientation": orientation,
-            "search_won": True,
-            "candidate_won": True,
-        }
-        for pair in range(200)
-        for orientation in ("candidate_first", "candidate_second")
-    ]
+    internal_games = []
+    for pair in range(200):
+        game_seed = 7_000_000 + pair
+        for orientation in ("candidate_red", "candidate_blue"):
+            candidate_color = "RED" if orientation == "candidate_red" else "BLUE"
+            baseline_color = "BLUE" if candidate_color == "RED" else "RED"
+            internal_games.append(
+                {
+                    "pair_id": pair,
+                    "game_seed": game_seed,
+                    "orientation": orientation,
+                    "search_won": True,
+                    "candidate_won": True,
+                    "search_seeds_by_role": {
+                        "candidate": promotion._internal_h2h_search_seed(  # noqa: SLF001
+                            game_seed=game_seed, seat_color=candidate_color
+                        ),
+                        "baseline": promotion._internal_h2h_search_seed(  # noqa: SLF001
+                            game_seed=game_seed, seat_color=baseline_color
+                        ),
+                    },
+                }
+            )
     pair_scores, pair_diagnostics = promotion.pair_scores_from_h2h_games(internal_games)
     pentanomial = promotion.evaluate_pentanomial_sprt(
         pair_scores, elo0=-10.0, elo1=15.0, alpha=0.05, beta=0.05
@@ -482,6 +762,9 @@ def _fixture(
             "typed_config": typed_config,
             "config_hash": "sha256:" + config_digest[:16],
             "full_config_hash": "sha256:" + config_digest,
+            "search_rng_contract": promotion.INTERNAL_H2H_SEARCH_RNG_CONTRACT,
+            "base_seed": 7_000_000,
+            "pairs_requested": 200,
             "candidate_value_readout": "scalar",
             "baseline_value_readout": "scalar",
             "public_observation": True,
@@ -516,8 +799,21 @@ def _fixture(
     if branch_parent is not None:
         second_internal_source = tmp_path / "internal_h2h.cohort2.raw.json"
         second_payload = json.loads(internal_source.read_text(encoding="utf-8"))
+        second_payload["base_seed"] += 10_000
         for game in second_payload["games"]:
             game["game_seed"] += 10_000
+            candidate_color = (
+                "RED" if game["orientation"] == "candidate_red" else "BLUE"
+            )
+            baseline_color = "BLUE" if candidate_color == "RED" else "RED"
+            game["search_seeds_by_role"] = {
+                "candidate": promotion._internal_h2h_search_seed(  # noqa: SLF001
+                    game_seed=game["game_seed"], seat_color=candidate_color
+                ),
+                "baseline": promotion._internal_h2h_search_seed(  # noqa: SLF001
+                    game_seed=game["game_seed"], seat_color=baseline_color
+                ),
+            }
         _write_json(second_internal_source, second_payload)
         branch_internal_sources = [
             ("internal_h2h_cohort_1", internal_source),
@@ -1269,6 +1565,245 @@ def test_dry_run_binds_v3_one_dose_receipt(tmp_path: Path) -> None:
     }
 
 
+def test_dry_run_accepts_exact_authenticated_eight_rank_one_dose_topology(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = _fixture(tmp_path)
+    _receipt, modern = _modernize_one_dose_receipt(fixture, world_size=8)
+    monkeypatch.setattr(
+        one_dose,
+        "_verify_ddp_canary_receipt",
+        lambda _path, *, reference_time_ns: modern["canary"],
+    )
+
+    plan = _execute(fixture, go=False)
+
+    assert plan["candidate"]["sha256"] == promotion._sha256(fixture["candidate"])
+    assert plan["training_receipt"]["execution_binding_sha256"] == json.loads(
+        fixture["training_receipt"].read_text(encoding="utf-8")
+    )["outputs"]["execution_binding_sha256"]
+
+
+def test_eight_rank_one_dose_topology_fails_closed_on_gpu_ownership_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = _fixture(tmp_path)
+    receipt, modern = _modernize_one_dose_receipt(fixture, world_size=8)
+    monkeypatch.setattr(
+        one_dose,
+        "_verify_ddp_canary_receipt",
+        lambda _path, *, reference_time_ns: modern["canary"],
+    )
+    receipt["gpus"] = list(range(7)) + [9]
+    _rewrite_one_dose_receipt(fixture["training_receipt"], receipt)
+
+    with pytest.raises(promotion.PromotionError, match="topology attestation"):
+        _execute(fixture, go=False)
+
+
+def test_post_wave_composite_report_uses_authenticated_outer_ddp_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = _fixture(tmp_path)
+    receipt, modern = _modernize_one_dose_receipt(fixture, world_size=8)
+    monkeypatch.setattr(
+        one_dose,
+        "_verify_ddp_canary_receipt",
+        lambda _path, *, reference_time_ns: modern["canary"],
+    )
+    sampling_sha = "sha256:" + "8" * 64
+    split_sha = "sha256:" + "9" * 64
+    input_binding = receipt["input_binding"]
+    for key in (
+        "validation_manifest",
+        "validation_manifest_file_sha256",
+        "selected_game_seed_set_sha256",
+        "training_game_seed_set_sha256",
+        "validation_game_seed_set_sha256",
+        "binding_sha256",
+    ):
+        input_binding.pop(key)
+    input_binding.update(
+        {
+            "data_kind": "production_composite_v2",
+            "production_mix_contract_sha256": "sha256:" + "a" * 64,
+            "production_sampling_receipt_sha256": sampling_sha,
+            "validation_split_receipt": {"schema_version": "test-split-v1"},
+            "validation_split_receipt_sha256": split_sha,
+            "composite_build_receipt": {"schema_version": "test-build-v1"},
+            "source_authority": None,
+            "category_semantics": {"current_producer": "current"},
+            "category_semantics_sha256": "sha256:" + "b" * 64,
+        }
+    )
+    input_binding["binding_sha256"] = promotion._digest_value(input_binding)
+    receipt["production_sampling_receipt_sha256"] = sampling_sha
+    receipt["validation_split_receipt_sha256"] = split_sha
+    receipt["outputs"]["production_sampling_receipt_sha256"] = sampling_sha
+    receipt["outputs"]["validation_split_receipt_sha256"] = split_sha
+    receipt["outputs"]["input_binding_sha256"] = input_binding["binding_sha256"]
+    report = json.loads(fixture["report"].read_text(encoding="utf-8"))
+    report.update(
+        {
+            "a1_contract_sha256": None,
+            "a1_learner_training_recipe_sha256": None,
+            "a1_bound_learner_training_recipe": None,
+            one_dose.REPORT_INPUT_BINDING_FIELD: input_binding,
+        }
+    )
+    _write_json(fixture["report"], report)
+    receipt["outputs"]["report_sha256"] = promotion._sha256(fixture["report"])
+    _rewrite_one_dose_receipt(fixture["training_receipt"], receipt)
+    adjudication = json.loads(fixture["adjudication"].read_text(encoding="utf-8"))
+    adjudication["candidate"]["training_report"]["sha256"] = promotion._sha256(
+        fixture["report"]
+    )
+    adjudication.pop("adjudication_sha256")
+    adjudication["adjudication_sha256"] = promotion._digest_value(adjudication)
+    _write_json(fixture["adjudication"], adjudication)
+
+    plan = _execute(fixture, go=False)
+
+    assert plan["candidate"]["sha256"] == promotion._sha256(fixture["candidate"])
+
+
+def test_explicit_same_trajectory_checkpoint_selection_replays_64_96_128(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = _fixture(tmp_path)
+    receipt, modern = _modernize_one_dose_receipt(
+        fixture, world_size=8, with_intermediate=True
+    )
+    monkeypatch.setattr(
+        one_dose,
+        "_verify_ddp_canary_receipt",
+        lambda _path, *, reference_time_ns: modern["canary"],
+    )
+    screen = tmp_path / "matched-quick-screen.json"
+    _write_json(screen, {"screen": "same common-random-number cohort"})
+    selected = modern["intermediate"][1]
+    selection = {
+        "schema_version": promotion.CHECKPOINT_SELECTION_SCHEMA,
+        "training_receipt": {
+            "path": str(fixture["training_receipt"]),
+            "sha256": promotion._sha256(fixture["training_receipt"]),
+            "receipt_sha256": receipt["receipt_sha256"],
+        },
+        "training_report": {
+            "path": str(fixture["report"]),
+            "sha256": promotion._sha256(fixture["report"]),
+        },
+        "terminal_checkpoint": _checkpoint_ref(fixture["candidate"]),
+        "eligible_optimizer_steps": [64, 96, 128],
+        "selected_optimizer_step": 96,
+        "selected_checkpoint": {
+            "path": selected["checkpoint"],
+            "sha256": selected["checkpoint_sha256"],
+        },
+        "screen_evidence": _checkpoint_ref(screen),
+        "selection_basis": "matched_quick_screen",
+        "matched_common_random_numbers": True,
+        "full_gate_requires_disjoint_cohort": True,
+        "fresh_adam_single_trajectory": True,
+        "resume_or_candidate_chaining": False,
+    }
+    selection["selection_sha256"] = promotion._digest_value(selection)
+    selection_path = tmp_path / "checkpoint-selection.json"
+    _write_json(selection_path, selection)
+
+    verified = promotion._verify_one_dose_training_receipt(
+        fixture["training_receipt"],
+        contract_lock=fixture["contract_path"],
+        contract=fixture["contract"],
+        candidate_path=Path(selected["checkpoint"]),
+        candidate_sha256=selected["checkpoint_sha256"],
+        training_report_path=fixture["report"],
+        training_report_sha256=promotion._sha256(fixture["report"]),
+        checkpoint_selection_path=selection_path,
+        checkpoint_selection_sha256=promotion._sha256(selection_path),
+    )
+
+    assert verified["checkpoint_selection"]["selected_optimizer_step"] == 96
+    assert verified["report_checkpoint"] == _checkpoint_ref(fixture["candidate"])
+
+
+def test_checkpoint_selection_rejects_candidate_chaining_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = _fixture(tmp_path)
+    receipt, modern = _modernize_one_dose_receipt(
+        fixture, world_size=8, with_intermediate=True
+    )
+    monkeypatch.setattr(
+        one_dose,
+        "_verify_ddp_canary_receipt",
+        lambda _path, *, reference_time_ns: modern["canary"],
+    )
+    screen = tmp_path / "matched-quick-screen.json"
+    _write_json(screen, {"screen": "same common-random-number cohort"})
+    selected = modern["intermediate"][0]
+    selection = {
+        "schema_version": promotion.CHECKPOINT_SELECTION_SCHEMA,
+        "training_receipt": {
+            "path": str(fixture["training_receipt"]),
+            "sha256": promotion._sha256(fixture["training_receipt"]),
+            "receipt_sha256": receipt["receipt_sha256"],
+        },
+        "training_report": _checkpoint_ref(fixture["report"]),
+        "terminal_checkpoint": _checkpoint_ref(fixture["candidate"]),
+        "eligible_optimizer_steps": [64, 96, 128],
+        "selected_optimizer_step": 64,
+        "selected_checkpoint": {
+            "path": selected["checkpoint"],
+            "sha256": selected["checkpoint_sha256"],
+        },
+        "screen_evidence": _checkpoint_ref(screen),
+        "selection_basis": "matched_quick_screen",
+        "matched_common_random_numbers": True,
+        "full_gate_requires_disjoint_cohort": True,
+        "fresh_adam_single_trajectory": True,
+        "resume_or_candidate_chaining": True,
+    }
+    selection["selection_sha256"] = promotion._digest_value(selection)
+    selection_path = tmp_path / "checkpoint-selection.json"
+    _write_json(selection_path, selection)
+
+    with pytest.raises(promotion.PromotionError, match="selection policy drifted"):
+        promotion._verify_one_dose_training_receipt(
+            fixture["training_receipt"],
+            contract_lock=fixture["contract_path"],
+            contract=fixture["contract"],
+            candidate_path=Path(selected["checkpoint"]),
+            candidate_sha256=selected["checkpoint_sha256"],
+            training_report_path=fixture["report"],
+            training_report_sha256=promotion._sha256(fixture["report"]),
+            checkpoint_selection_path=selection_path,
+            checkpoint_selection_sha256=promotion._sha256(selection_path),
+        )
+
+
+def test_select_dose_builder_seals_same_trajectory_choice(tmp_path: Path) -> None:
+    fixture = _fixture(tmp_path)
+    _modernize_one_dose_receipt(fixture, world_size=8, with_intermediate=True)
+    screen = tmp_path / "matched-quick-screen.json"
+    _write_json(screen, {"screen": "same common-random-number cohort"})
+    output = tmp_path / "checkpoint-selection.json"
+
+    selection = promotion.create_same_trajectory_checkpoint_selection(
+        training_receipt_path=fixture["training_receipt"],
+        training_report_path=fixture["report"],
+        screen_evidence_path=screen,
+        selected_optimizer_step=64,
+        output_path=output,
+    )
+
+    assert selection["selected_optimizer_step"] == 64
+    assert selection["selected_checkpoint"]["path"].endswith(
+        "candidate_step0064.pt"
+    )
+    assert selection["file_sha256"] == promotion._sha256(output)
+
+
 def _mutate_cohort_exclusions(fixture: dict, mutate) -> dict:
     path = fixture["cohort_exclusions"]
     payload = json.loads(path.read_text(encoding="utf-8"))
@@ -1328,7 +1863,77 @@ def test_promotion_refuses_final_internal_cohort_without_exact_seeds(
         role="internal_h2h",
         mutate=remove_seed,
     )
-    with pytest.raises(promotion.PromotionError, match="exact seed identity"):
+    with pytest.raises(promotion.PromotionError, match="invalid cohort identity"):
+        _execute(fixture, go=False)
+
+
+def test_ordinary_promotion_refuses_unpaired_internal_orientation(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path)
+
+    def duplicate_orientation(source: dict) -> None:
+        first, second = source["games"][:2]
+        second["orientation"] = first["orientation"]
+        second["search_seeds_by_role"] = dict(first["search_seeds_by_role"])
+
+    _mutate_evidence_source(
+        fixture,
+        kind="internal_h2h",
+        role="internal_h2h",
+        mutate=duplicate_orientation,
+    )
+    with pytest.raises(promotion.PromotionError, match="repeats a paired orientation"):
+        _execute(fixture, go=False)
+
+
+def test_promotion_requires_corrected_schedule_invariant_search_rng(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path)
+
+    def remove_contract(source: dict) -> None:
+        source.pop("search_rng_contract")
+
+    _mutate_evidence_source(
+        fixture,
+        kind="internal_h2h",
+        role="internal_h2h",
+        mutate=remove_contract,
+    )
+    with pytest.raises(promotion.PromotionError, match="corrected per-game/seat"):
+        _execute(fixture, go=False)
+
+
+def test_promotion_replays_each_role_to_seat_search_seed(tmp_path: Path) -> None:
+    fixture = _fixture(tmp_path)
+
+    def drift_seed(source: dict) -> None:
+        source["games"][0]["search_seeds_by_role"]["candidate"] += 1
+
+    _mutate_evidence_source(
+        fixture,
+        kind="internal_h2h",
+        role="internal_h2h",
+        mutate=drift_seed,
+    )
+    with pytest.raises(promotion.PromotionError, match="role/seat binding"):
+        _execute(fixture, go=False)
+
+
+def test_promotion_refuses_partial_exit_zero_internal_report(tmp_path: Path) -> None:
+    fixture = _fixture(tmp_path)
+
+    def claim_larger_assignment(source: dict) -> None:
+        source["pairs_requested"] = source["complete_pairs"] + 100
+
+    _mutate_evidence_source(
+        fixture,
+        kind="internal_h2h",
+        role="internal_h2h",
+        mutate=claim_larger_assignment,
+    )
+    with pytest.raises(promotion.PromotionError, match="completed 200 of 300"):
         _execute(fixture, go=False)
 
 
@@ -1739,38 +2344,19 @@ def test_dry_run_accepts_hash_replayed_fleet_pooled_internal_source(
     shard_path = tmp_path / "internal-h2h-shard.json"
 
     def make_pooled(source: dict) -> None:
+        _make_internal_pool_shard_complete(
+            source,
+            candidate=fixture["candidate"],
+            champion=fixture["champion"],
+        )
         _write_json(shard_path, source)
-        typed = source.pop("typed_config")
-        short_hash = source.pop("config_hash")
-        full_hash = source.pop("full_config_hash")
-        effective = dict(typed["fields"])
-        effective.pop("candidate")
-        effective.pop("baseline")
-        source["candidate_checkpoint_sha256"] = promotion._sha256(fixture["candidate"])
-        source["baseline_checkpoint_sha256"] = promotion._sha256(fixture["champion"])
-        source["effective_search_config"] = effective
-        source["fleet_merge"] = {
-            "schema_version": promotion.FLEET_EVALUATION_POOL_SCHEMA,
-            "kind": "internal_h2h",
-            "candidate": _checkpoint_ref(fixture["candidate"]),
-            "champion": _checkpoint_ref(fixture["champion"]),
-            "sources": [_checkpoint_ref(shard_path)],
-            "seed_intervals": [
-                {
-                    "base_seed": 9_000_000,
-                    "end_seed": 9_000_200,
-                    "path": str(shard_path.resolve()),
-                }
-            ],
-            "shard_config_hashes": [
-                {
-                    "path": str(shard_path.resolve()),
-                    "config_hash": short_hash,
-                    "full_config_hash": full_hash,
-                }
-            ],
-            "effective_search_config_sha256": promotion._digest_value(effective),
-        }
+        pooled = evaluation_pool.pool_internal(
+            [shard_path],
+            candidate=fixture["candidate"],
+            champion=fixture["champion"],
+        )
+        source.clear()
+        source.update(pooled)
 
     _mutate_evidence_source(
         fixture,
@@ -1789,38 +2375,22 @@ def test_fleet_pooled_internal_refuses_effective_config_digest_drift(
     shard_path = tmp_path / "internal-h2h-shard.json"
 
     def make_bad_pool(source: dict) -> None:
+        _make_internal_pool_shard_complete(
+            source,
+            candidate=fixture["candidate"],
+            champion=fixture["champion"],
+        )
         _write_json(shard_path, source)
-        typed = source.pop("typed_config")
-        short_hash = source.pop("config_hash")
-        full_hash = source.pop("full_config_hash")
-        effective = dict(typed["fields"])
-        effective.pop("candidate")
-        effective.pop("baseline")
-        source["candidate_checkpoint_sha256"] = promotion._sha256(fixture["candidate"])
-        source["baseline_checkpoint_sha256"] = promotion._sha256(fixture["champion"])
-        source["effective_search_config"] = effective
-        source["fleet_merge"] = {
-            "schema_version": promotion.FLEET_EVALUATION_POOL_SCHEMA,
-            "kind": "internal_h2h",
-            "candidate": _checkpoint_ref(fixture["candidate"]),
-            "champion": _checkpoint_ref(fixture["champion"]),
-            "sources": [_checkpoint_ref(shard_path)],
-            "seed_intervals": [
-                {
-                    "base_seed": 9_000_000,
-                    "end_seed": 9_000_200,
-                    "path": str(shard_path.resolve()),
-                }
-            ],
-            "shard_config_hashes": [
-                {
-                    "path": str(shard_path.resolve()),
-                    "config_hash": short_hash,
-                    "full_config_hash": full_hash,
-                }
-            ],
-            "effective_search_config_sha256": "sha256:" + "0" * 64,
-        }
+        pooled = evaluation_pool.pool_internal(
+            [shard_path],
+            candidate=fixture["candidate"],
+            champion=fixture["champion"],
+        )
+        pooled["fleet_merge"]["effective_search_config_sha256"] = (
+            "sha256:" + "0" * 64
+        )
+        source.clear()
+        source.update(pooled)
 
     _mutate_evidence_source(
         fixture,
@@ -1830,6 +2400,55 @@ def test_fleet_pooled_internal_refuses_effective_config_digest_drift(
     )
 
     with pytest.raises(promotion.PromotionError, match="effective-search config"):
+        _execute(fixture, go=False)
+
+
+def test_fleet_pooled_internal_replays_raw_games_from_sources(tmp_path: Path) -> None:
+    fixture = _fixture(tmp_path)
+    shard_path = tmp_path / "internal-h2h-shard.json"
+
+    def forge_pooled_outcome(source: dict) -> None:
+        _make_internal_pool_shard_complete(
+            source,
+            candidate=fixture["candidate"],
+            champion=fixture["champion"],
+        )
+        _write_json(shard_path, source)
+        pooled = evaluation_pool.pool_internal(
+            [shard_path],
+            candidate=fixture["candidate"],
+            champion=fixture["champion"],
+        )
+        pooled["games"][0]["candidate_won"] = False
+        pooled["games"][0]["search_won"] = False
+        outcomes = [bool(game["candidate_won"]) for game in pooled["games"]]
+        scores, diagnostics = promotion.pair_scores_from_h2h_games(pooled["games"])
+        pooled["candidate_wins"] = sum(outcomes)
+        pooled["baseline_wins"] = len(outcomes) - sum(outcomes)
+        pooled["candidate_win_rate"] = sum(outcomes) / len(outcomes)
+        pooled["pair_diagnostics"] = diagnostics
+        pooled["pentanomial_sprt"] = promotion.evaluate_pentanomial_sprt(
+            scores, elo0=-10.0, elo1=15.0, alpha=0.05, beta=0.05
+        )
+        pooled["verdict"] = pooled["pentanomial_sprt"]["decision"]
+        pooled["superiority_pentanomial_sprt"] = (
+            promotion.evaluate_pentanomial_sprt(
+                scores, elo0=0.0, elo1=15.0, alpha=0.05, beta=0.05
+            )
+        )
+        pooled["superiority_verdict"] = pooled[
+            "superiority_pentanomial_sprt"
+        ]["decision"]
+        source.clear()
+        source.update(pooled)
+
+    _mutate_evidence_source(
+        fixture,
+        kind="internal_h2h",
+        role="internal_h2h",
+        mutate=forge_pooled_outcome,
+    )
+    with pytest.raises(promotion.PromotionError, match="pooled games do not replay"):
         _execute(fixture, go=False)
 
 
@@ -2623,17 +3242,32 @@ def test_transaction_rejects_regression_h1_without_superiority_h1(
         ):
             for _ in range(pair_count):
                 for orientation, won in zip(
-                    ("candidate_first", "candidate_second"),
+                    ("candidate_red", "candidate_blue"),
                     outcomes,
                     strict=True,
                 ):
+                    candidate_color = (
+                        "RED" if orientation == "candidate_red" else "BLUE"
+                    )
+                    baseline_color = "BLUE" if candidate_color == "RED" else "RED"
+                    game_seed = 7_000_000 + pair_id
                     games.append(
                         {
                             "pair_id": pair_id,
-                            "game_seed": 7_000_000 + pair_id,
+                            "game_seed": game_seed,
                             "orientation": orientation,
                             "search_won": won,
                             "candidate_won": won,
+                            "search_seeds_by_role": {
+                                "candidate": promotion._internal_h2h_search_seed(  # noqa: SLF001
+                                    game_seed=game_seed,
+                                    seat_color=candidate_color,
+                                ),
+                                "baseline": promotion._internal_h2h_search_seed(  # noqa: SLF001
+                                    game_seed=game_seed,
+                                    seat_color=baseline_color,
+                                ),
+                            },
                         }
                     )
                 pair_id += 1
@@ -2649,8 +3283,10 @@ def test_transaction_rejects_regression_h1_without_superiority_h1(
         wins = sum(game["candidate_won"] for game in games)
         source.update(
             {
-                "games": games,
-                "games_played": len(games),
+                    "games": games,
+                    "base_seed": 7_000_000,
+                    "pairs_requested": len(games) // 2,
+                    "games_played": len(games),
                 "games_with_winner": len(games),
                 "complete_pairs": len(games) // 2,
                 "candidate_wins": wins,
@@ -2948,24 +3584,14 @@ def test_external_comparison_accepts_hash_replayed_fleet_pools(
         shard_path = tmp_path / f"{role}.shard.json"
 
         def make_pooled(source: dict, *, _shard=shard_path, _checkpoint=checkpoint):
+            _make_external_pool_shard_complete(source, checkpoint=_checkpoint)
             _write_json(_shard, source)
-            effective = dict(source["search_config"])
-            source["candidate_checkpoint_sha256"] = promotion._sha256(_checkpoint)
-            source["effective_search_config"] = effective
-            source["fleet_merge"] = {
-                "schema_version": promotion.FLEET_EVALUATION_POOL_SCHEMA,
-                "kind": "external_panel",
-                "checkpoint": _checkpoint_ref(_checkpoint),
-                "sources": [_checkpoint_ref(_shard)],
-                "seed_intervals": [
-                    {
-                        "base_seed": 8_100_000,
-                        "end_seed": 8_100_500,
-                        "path": str(_shard.resolve()),
-                    }
-                ],
-                "effective_search_config_sha256": promotion._digest_value(effective),
-            }
+            pooled = evaluation_pool.pool_neutral(
+                [_shard],
+                checkpoint=_checkpoint,
+            )
+            source.clear()
+            source.update(pooled)
 
         _mutate_evidence_source(
             fixture,

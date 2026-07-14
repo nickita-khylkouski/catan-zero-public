@@ -291,6 +291,10 @@ def test_contract_shape_is_schema_bound_for_legacy_current_and_dual_arm(
     }
     assert harvest._contract_shape(current)["job_count"] == 192  # noqa: SLF001
     assert harvest._contract_shape(current)["host_count"] == 12  # noqa: SLF001
+    scaled = json.loads(json.dumps(current))
+    scaled["game_contract"]["profile"] = contract.SCALE_64K_GAME_CONTRACT_PROFILE
+    assert harvest._contract_shape(scaled)["job_count"] == 192  # noqa: SLF001
+    assert harvest._contract_shape(scaled)["host_count"] == 12  # noqa: SLF001
 
     dual_workers = workers[:28]
     dual = {

@@ -50,6 +50,9 @@ from catan_zero.rl.aux_subgoal_targets import (  # noqa: E402
     AUX_SUBGOAL_TARGET_VERSION,
     AUX_SUBGOAL_TARGET_VERSION_KEY,
 )
+from catan_zero.rl.entity_feature_adapter import (  # noqa: E402
+    require_known_entity_feature_adapter,
+)
 from tools import a1_pre_wave_contract as contract  # noqa: E402
 from tools import build_memmap_corpus as memmap_builder  # noqa: E402
 from tools import train_bc  # noqa: E402
@@ -65,6 +68,99 @@ EFFECTIVE_COMPONENT_RATIOS = {
     "hard_negative": 0.04,
     HISTORICAL_REPLAY_CATEGORY: 0.20,
 }
+# The fresh rows in this recovery wave are all produced by the same n128
+# search teacher.  The winning TEMP experiment established the n128 policy
+# target at T=1.0.  ``soft_target_temperature=0.7`` is deliberately inert for
+# stored-policy targets, so bind the source temperatures in the descriptor
+# instead of relying on that easy-to-misread global score-target flag.
+# Historical replay is value-only in this descriptor, but bind its calibrated
+# temperature too so the descriptor remains unambiguous if inspected or
+# replayed by tooling that materializes all component metadata.
+STORED_POLICY_COMPONENT_TEMPERATURES = {
+    "current_producer": 1.0,
+    "recent_history": 1.0,
+    "hard_negative": 1.0,
+    HISTORICAL_REPLAY_CATEGORY: 0.52,
+}
+
+
+def _single_adapter_version(values: Sequence[object], *, source: str) -> str:
+    """Resolve one nonempty, registry-known adapter from authenticated bytes."""
+
+    normalized = {str(value or "") for value in values}
+    if "" in normalized or len(normalized) != 1:
+        raise CompositeBuildError(
+            f"{source} does not bind exactly one nonempty entity adapter: "
+            f"{sorted(normalized)}"
+        )
+    version = next(iter(normalized))
+    try:
+        return require_known_entity_feature_adapter(version)
+    except ValueError as error:
+        raise CompositeBuildError(
+            f"{source} binds an unknown entity adapter {version!r}"
+        ) from error
+
+
+def _memmap_adapter_version(corpus_dir: Path, *, component_id: str) -> str:
+    """Read the adapter identity preserved by one freshly built memmap."""
+
+    try:
+        meta = _load_json(corpus_dir / "corpus_meta.json")
+        schema = meta["columns"]["adapter_version"]
+        categories = schema["categories"]
+    except (KeyError, OSError, TypeError, ValueError) as error:
+        raise CompositeBuildError(
+            f"cannot inspect {component_id} memmap adapter identity: {error}"
+        ) from error
+    if schema.get("kind") != "string" or not isinstance(categories, list):
+        raise CompositeBuildError(
+            f"fresh component {component_id} lost adapter_version during conversion"
+        )
+    return _single_adapter_version(
+        categories, source=f"fresh component {component_id}"
+    )
+
+
+def _historical_raw_adapter_version(
+    bindings: Sequence[Mapping[str, Any]],
+) -> str:
+    """Recover dropped legacy memmap metadata from byte-authenticated raw NPZs.
+
+    Historical conversion omitted ``adapter_version`` even though generation
+    wrote it.  The historical authority already binds every raw shard by hash;
+    read only that bound column and refuse absence/mixed semantics.  This is an
+    authenticated metadata recovery, not an inference from tensor shape or the
+    current runtime default.
+    """
+
+    observed: set[str] = set()
+    for binding in bindings:
+        try:
+            source = Path(str(binding["source_path"])).resolve(strict=True)
+        except (KeyError, OSError) as error:
+            raise CompositeBuildError(
+                f"cannot resolve historical adapter source: {error}"
+            ) from error
+        if _file_sha256(source) != binding.get("source_sha256"):
+            raise CompositeBuildError(
+                f"historical adapter source bytes drifted: {source}"
+            )
+        try:
+            with np.load(source, allow_pickle=False) as payload:
+                if "adapter_version" not in payload.files:
+                    raise CompositeBuildError(
+                        f"historical raw shard lacks adapter_version: {source}"
+                    )
+                values = np.asarray(payload["adapter_version"]).astype(str)
+        except (OSError, ValueError) as error:
+            raise CompositeBuildError(
+                f"cannot read historical adapter_version from {source}: {error}"
+            ) from error
+        observed.update(map(str, np.unique(values).tolist()))
+    return _single_adapter_version(
+        sorted(observed), source="historical raw replay authority"
+    )
 LEARNER_RECIPE_OVERRIDES: dict[str, object] = {
     "forced_action_weight": 0.0,
     "forced_row_value_weight": 1.0,
@@ -849,6 +945,11 @@ def _load_historical_component(
     )
     if authority["source_bindings_sha256"] != canonical_sha256(bindings):
         raise CompositeBuildError("historical replay source-binding digest drift")
+    # The old memmap conversion dropped this column, but the immutable raw NPZ
+    # sources retained it. Recover the semantic identity only from those exact
+    # hash-bound source bytes so the new composite can synthesize the missing
+    # scalar column without weakening mixed-adapter admission.
+    historical_adapter_version = _historical_raw_adapter_version(bindings)
     binding_ids = {str(value["source_id"]) for value in bindings}
     try:
         provenance = train_bc._validate_flywheel_component_provenance(  # noqa: SLF001
@@ -874,6 +975,8 @@ def _load_historical_component(
         != component["payload_inventory_sha256"]
     ):
         raise CompositeBuildError("historical replay authority/component bytes drift")
+    component = dict(component)
+    component["entity_feature_adapter_version"] = historical_adapter_version
     return dict(component), dict(authority)
 
 
@@ -1096,6 +1199,24 @@ def _build_descriptor(
         for component in components
     ]
     sampling_receipt = build_sampling_receipt(components)
+    adapter_versions: dict[str, str] = {}
+    for component in components:
+        component_id = str(component["component_id"])
+        if component_id == HISTORICAL_REPLAY_CATEGORY:
+            version = _single_adapter_version(
+                [component.get("entity_feature_adapter_version")],
+                source="historical replay component",
+            )
+        else:
+            version = _memmap_adapter_version(
+                Path(str(component["corpus_dir"])), component_id=component_id
+            )
+        adapter_versions[component_id] = version
+    if len(set(adapter_versions.values())) != 1:
+        raise CompositeBuildError(
+            "post-wave components mix incompatible entity adapters: "
+            f"{adapter_versions}"
+        )
     aux_subgoal_component_ids: list[str] = []
     for component in components:
         component_id = str(component["component_id"])
@@ -1154,6 +1275,14 @@ def _build_descriptor(
         "sampling_receipt_sha256": canonical_sha256(sampling_receipt),
     }
     recipe = dict(LEARNER_RECIPE_OVERRIDES)
+    descriptor_components = [
+        {
+            key: value
+            for key, value in component.items()
+            if key != "entity_feature_adapter_version"
+        }
+        for component in components
+    ]
     return {
         "schema_version": "memmap_composite_v2",
         "diagnostic_only": False,
@@ -1163,11 +1292,15 @@ def _build_descriptor(
             if category_semantics is None
             else {"category_semantics": dict(category_semantics)}
         ),
-        "components": components,
+        "components": descriptor_components,
         "learner_recipe_overrides": recipe,
         "learner_recipe_overrides_sha256": canonical_sha256(recipe),
         "policy_kl_anchor_component_ids": [HISTORICAL_REPLAY_CATEGORY],
         "policy_distillation_component_ids": fresh_component_ids,
+        "stored_policy_component_temperatures": dict(
+            STORED_POLICY_COMPONENT_TEMPERATURES
+        ),
+        "entity_feature_adapter_component_versions": adapter_versions,
         "value_training_component_ids": component_ids,
         "aux_subgoal_component_ids": aux_subgoal_component_ids,
         "flywheel_replay_contract": replay_contract,
@@ -1189,7 +1322,7 @@ def build_post_wave_composite(
     verify_descriptor_fn: Callable[[Path], dict[str, Any]] = (
         train_bc._preflight_memmap_composite_descriptor  # noqa: SLF001
     ),
-    expected_games: Mapping[str, int] = contract.EXPECTED_GAMES,
+    expected_games: Mapping[str, int] | None = None,
 ) -> dict[str, Any]:
     root = _prepare_output_root(output_root)
     lock, selected, audit, raw_selected = _validated_wave_inputs(
@@ -1198,6 +1331,48 @@ def build_post_wave_composite(
         audit_path,
         verify_lock_fn=verify_lock_fn,
     )
+    # The lock is the quota authority.  The original recovery wave selected
+    # 12k games, while the scale profile selects 64k; retaining a module-level
+    # 12k default here would make an otherwise valid scale wave fail during
+    # corpus construction (or tempt an operator to pass an unauthenticated
+    # override).  An explicit value remains available to focused callers, but
+    # it must agree exactly with the sealed contract.
+    raw_locked_games = lock.get("game_contract", {}).get("category_games")
+    if not isinstance(raw_locked_games, dict):
+        raise CompositeBuildError(
+            "sealed wave lock has no game_contract.category_games quota authority"
+        )
+    if any(
+        isinstance(value, bool) or not isinstance(value, int)
+        for value in raw_locked_games.values()
+    ):
+        raise CompositeBuildError(
+            "sealed wave lock category-game quotas must be exact integers"
+        )
+    try:
+        locked_games = {
+            str(category): int(raw_locked_games[category])
+            for category in FRESH_SOURCE_GAME_RATIOS
+        }
+    except (KeyError, TypeError, ValueError) as error:
+        raise CompositeBuildError(
+            "sealed wave lock has malformed category-game quotas"
+        ) from error
+    if (
+        set(raw_locked_games) != set(FRESH_SOURCE_GAME_RATIOS)
+        or any(value <= 0 for value in locked_games.values())
+        or sum(locked_games.values())
+        != int(lock["game_contract"].get("total_complete_games", -1))
+    ):
+        raise CompositeBuildError(
+            f"sealed wave lock has inconsistent category-game quotas: {raw_locked_games}"
+        )
+    if expected_games is not None and dict(expected_games) != locked_games:
+        raise CompositeBuildError(
+            "caller category-game quotas differ from the sealed wave lock: "
+            f"caller={dict(expected_games)} lock={locked_games}"
+        )
+    expected_games = locked_games
     producer = contract._producer(lock)  # noqa: SLF001
     if isinstance(producer.get("version"), bool) or not isinstance(
         producer.get("version"), int

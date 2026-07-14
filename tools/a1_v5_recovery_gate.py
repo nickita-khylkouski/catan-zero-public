@@ -205,6 +205,7 @@ def verify_recovery_gate(
     contract_lock_path: Path,
     standard_adjudication_path: Path,
     training_receipt_path: Path,
+    cohort_exclusions_path: Path,
     registry_path: Path,
     current_pointer_path: Path,
     f7_nonregression_report_path: Path,
@@ -226,6 +227,9 @@ def verify_recovery_gate(
         ),
         "training_receipt": _existing(
             training_receipt_path, where="one-dose training receipt"
+        ),
+        "cohort_exclusions": _existing(
+            cohort_exclusions_path, where="promotion cohort-exclusions manifest"
         ),
         "registry": _existing(registry_path, where="recovery registry"),
         "current_pointer": _existing(
@@ -300,6 +304,9 @@ def verify_recovery_gate(
         parent_search = producer_identity.get("search_config")
         if not isinstance(parent_search, dict) or not parent_search:
             raise RecoveryGateError("recovered producer has no search identity")
+        promotion._verify_internal_h2h_cohort(  # noqa: SLF001
+            report, where="recovery f7 non-regression veto"
+        )
         promotion._verify_internal_h2h_source(  # noqa: SLF001
             report,
             candidate=Path(candidate["path"]),
@@ -315,9 +322,6 @@ def verify_recovery_gate(
             candidate_parent_search_config=parent_search,
             verdict_policy="non_regression_veto",
         )
-        promotion._verify_internal_h2h_cohort(  # noqa: SLF001
-            report, where="recovery f7 non-regression veto"
-        )
         if report.get("complete_pairs") != F7_VETO_COMPLETE_PAIRS:
             raise RecoveryGateError("f7 veto must complete exactly 300 pairs")
         if report.get("verdict") not in {"H1", "continue"}:
@@ -325,6 +329,17 @@ def verify_recovery_gate(
         f7_seeds = _exact_f7_seeds(report)
         standard_intervals = _validate_standard_intervals(
             verified.get("final_cohort_intervals")
+        )
+        f7_interval = {
+            "kind": "f7_non_regression_veto",
+            "base_seed": F7_VETO_BASE_SEED,
+            "end_seed": F7_VETO_BASE_SEED + F7_VETO_COMPLETE_PAIRS,
+        }
+        cohort_disjointness = promotion._verify_cohort_exclusions(  # noqa: SLF001
+            paths["cohort_exclusions"],
+            contract_sha256=contract["contract_sha256"],
+            candidate_sha256=candidate["sha256"],
+            final_intervals=[*standard_intervals, f7_interval],
         )
         _revalidate(snapshot)
 
@@ -363,6 +378,7 @@ def verify_recovery_gate(
                 "end_seed": F7_VETO_BASE_SEED + F7_VETO_COMPLETE_PAIRS,
                 "seed_cohort_sha256": _digest(f7_seeds),
             },
+            "fresh_cohort_disjointness": cohort_disjointness,
             "policy": {
                 "dual_baseline_conjunctive": True,
                 "strict_h1_over_recovered_parent": True,
@@ -404,6 +420,7 @@ def verify_recovery_gate_authority(
         "contract_lock",
         "standard_adjudication",
         "training_receipt",
+        "cohort_exclusions",
         "registry",
         "current_pointer",
         "f7_report",
@@ -423,6 +440,7 @@ def verify_recovery_gate_authority(
         contract_lock_path=Path(inputs["contract_lock"]["path"]),
         standard_adjudication_path=Path(inputs["standard_adjudication"]["path"]),
         training_receipt_path=Path(inputs["training_receipt"]["path"]),
+        cohort_exclusions_path=Path(inputs["cohort_exclusions"]["path"]),
         registry_path=Path(inputs["registry"]["path"]),
         current_pointer_path=Path(inputs["current_pointer"]["path"]),
         f7_nonregression_report_path=Path(inputs["f7_report"]["path"]),
@@ -478,6 +496,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--contract-lock", type=Path, required=True)
     parser.add_argument("--standard-adjudication", type=Path, required=True)
     parser.add_argument("--training-receipt", type=Path, required=True)
+    parser.add_argument("--cohort-exclusions", type=Path, required=True)
     parser.add_argument("--registry", type=Path, required=True)
     parser.add_argument("--current-pointer", type=Path, required=True)
     parser.add_argument("--f7-nonregression-report", type=Path, required=True)
@@ -495,6 +514,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             contract_lock_path=args.contract_lock,
             standard_adjudication_path=args.standard_adjudication,
             training_receipt_path=args.training_receipt,
+            cohort_exclusions_path=args.cohort_exclusions,
             registry_path=args.registry,
             current_pointer_path=args.current_pointer,
             f7_nonregression_report_path=args.f7_nonregression_report,

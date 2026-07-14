@@ -202,6 +202,13 @@ def validate_complete_report(
         raise PoolError(
             f"{where} retained {len(games)} games, expected {expected_games}"
         )
+    if kind == "internal":
+        try:
+            promotion._verify_internal_h2h_rng_contract(  # noqa: SLF001
+                report, where=where
+            )
+        except promotion.PromotionError as error:
+            raise PoolError(str(error)) from error
 
     def require_count(name: str, expected: int) -> None:
         value = report.get(name)

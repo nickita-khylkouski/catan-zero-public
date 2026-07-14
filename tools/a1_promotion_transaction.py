@@ -58,6 +58,9 @@ from tools.sprt_gate import evaluate_pentanomial_sprt, pair_scores_from_h2h_game
 ADJUDICATION_SCHEMA = "a1-promotion-adjudication-v2"
 PREVIOUS_ADJUDICATION_SCHEMA = "a1-promotion-adjudication-v1"
 BRANCH_CHALLENGE_ADJUDICATION_SCHEMA = "a1-branch-challenge-adjudication-v1"
+CHECKPOINT_SELECTION_SCHEMA = "a1-same-trajectory-checkpoint-selection-v1"
+INTERMEDIATE_CHECKPOINT_SCHEMA = "train-bc-intermediate-checkpoint-v1"
+CHECKPOINT_SELECTION_STEPS = (64, 96, 128)
 BRANCH_CHALLENGE_LINEAGE_SCHEMA = "a1-branch-challenge-lineage-v1"
 RECEIPT_SCHEMA = "a1-promotion-transaction-receipt-v3"
 PREVIOUS_RECEIPT_SCHEMA = "a1-promotion-transaction-receipt-v2"
@@ -78,6 +81,13 @@ ARCHIVED_STATE_RECONSTRUCTION_SCHEMA = "a1-archived-state-reconstruction-v1"
 HIGH_REGRET_SUITE_SCHEMA = SUITE_SCHEMA
 BUCKET_GAME_REPORT_SCHEMA = "a1-bucket-game-report-v1"
 FLEET_EVALUATION_POOL_SCHEMA = "a1-fleet-evaluation-pool-v1"
+INTERNAL_H2H_SEARCH_RNG_DERIVATION = "sha256(game_seed,seat_color)-u64-v1"
+INTERNAL_H2H_SEARCH_RNG_CONTRACT = {
+    "derivation": INTERNAL_H2H_SEARCH_RNG_DERIVATION,
+    "reset_scope": "each_game_orientation",
+    "stream_key": ["game_seed", "seat_color"],
+    "worker_schedule_independent": True,
+}
 LEGACY_INCUMBENT_PROVENANCE_SCHEMA = "a1-legacy-incumbent-provenance-v1"
 LEGACY_CONTRACT_ATTESTATION_SCHEMA = "a1-markerless-v2-promotion-attestation-v1"
 # One immutable pre-promotion contract was sealed before promotion_handoff
@@ -778,6 +788,7 @@ def _verify_training_report(
     production_l1_completion: bool = False,
     production_target_gather_completion: bool = False,
     production_temperature_completion: bool = False,
+    production_composite: bool = False,
 ) -> dict[str, Any]:
     report = _load_json(path)
     if sum((production_l1_completion, production_target_gather_completion,
@@ -986,10 +997,17 @@ def _verify_training_report(
     _verify_symmetry_training_provenance(
         report, recipe, where="candidate training report"
     )
+    report_uses_outer_receipt_authority = is_central_final or production_composite
     required = {
-        "a1_contract_sha256": None if is_central_final else contract_sha256,
-        "a1_learner_training_recipe_sha256": recipe_sha,
-        "a1_bound_learner_training_recipe": None if is_central_final else recipe,
+        "a1_contract_sha256": (
+            None if report_uses_outer_receipt_authority else contract_sha256
+        ),
+        "a1_learner_training_recipe_sha256": (
+            None if production_composite else recipe_sha
+        ),
+        "a1_bound_learner_training_recipe": (
+            None if report_uses_outer_receipt_authority else recipe
+        ),
         "arch": "entity_graph",
         "mask_hidden_info": True,
         "track": "2p_no_trade",
@@ -1541,6 +1559,235 @@ def _verify_central_final_training_receipt(
     }
 
 
+def _verify_intermediate_checkpoint_record(
+    raw: Any,
+    *,
+    step: int,
+    where: str,
+) -> dict[str, Any]:
+    """Replay one immutable model-only snapshot from the original trajectory."""
+
+    record = _require_exact_keys(
+        raw,
+        {
+            "schema_version",
+            "optimizer_step",
+            "checkpoint",
+            "checkpoint_sha256",
+            "size_bytes",
+            "same_training_trajectory",
+            "optimizer_sidecar",
+        },
+        where=where,
+    )
+    if (
+        record["schema_version"] != INTERMEDIATE_CHECKPOINT_SCHEMA
+        or record["optimizer_step"] != step
+        or record["same_training_trajectory"] is not True
+        or record["optimizer_sidecar"] is not None
+        or isinstance(record["size_bytes"], bool)
+        or not isinstance(record["size_bytes"], int)
+        or record["size_bytes"] <= 0
+    ):
+        raise PromotionError(f"{where} is not an authenticated model-only step {step}")
+    checkpoint = _canonical_existing_file(
+        Path(str(record["checkpoint"])), where=f"{where}.checkpoint"
+    )
+    checkpoint_sha256 = _validate_sha256(
+        record["checkpoint_sha256"], where=f"{where}.checkpoint_sha256"
+    )
+    if (
+        checkpoint.stat().st_size != record["size_bytes"]
+        or _sha256(checkpoint) != checkpoint_sha256
+        or Path(str(checkpoint) + ".optimizer.pt").exists()
+        or Path(str(checkpoint) + ".training-progress.json").exists()
+    ):
+        raise PromotionError(f"{where} snapshot bytes/sidecar contract drifted")
+    try:
+        import torch
+
+        payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    except Exception as error:
+        raise PromotionError(f"cannot replay {where}: {error}") from error
+    value_training = payload.get("value_training") if isinstance(payload, dict) else None
+    if (
+        not isinstance(payload, dict)
+        or payload.get("policy_type") != "entity_graph"
+        or not isinstance(payload.get("model"), dict)
+        or not isinstance(value_training, dict)
+        or value_training.get("optimizer_steps") != step
+        or value_training.get("completed_epochs") != 0
+        or "scalar" not in value_training.get("trained_value_readouts", [])
+        or value_training.get("intermediate_checkpoint")
+        != {
+            "schema_version": INTERMEDIATE_CHECKPOINT_SCHEMA,
+            "optimizer_step": step,
+            "same_training_trajectory": True,
+            "optimizer_sidecar_intentionally_omitted": True,
+        }
+    ):
+        raise PromotionError(f"{where} lost its same-trajectory model provenance")
+    return {**record, "checkpoint": str(checkpoint)}
+
+
+def _verify_same_trajectory_checkpoint_selection(
+    path: Path,
+    *,
+    expected_file_sha256: str,
+    training_receipt_path: Path,
+    training_receipt: Mapping[str, Any],
+    outputs: Mapping[str, Any],
+    training_report_path: Path,
+    training_report_sha256: str,
+    candidate_path: Path,
+    candidate_sha256: str,
+) -> dict[str, Any]:
+    """Bind an explicit 64/96/128 choice to one fresh-Adam trajectory.
+
+    The quick screen chooses a checkpoint but is never promotion evidence.  Its
+    source file is immutable and must later appear in the cohort-exclusions
+    manifest, which prevents the full gate from reusing selection games.
+    """
+
+    path = _canonical_existing_file(path, where="checkpoint selection receipt")
+    if _sha256(path) != expected_file_sha256:
+        raise PromotionError("checkpoint selection receipt bytes drifted")
+    value = _require_exact_keys(
+        _load_json(path),
+        {
+            "schema_version",
+            "training_receipt",
+            "training_report",
+            "terminal_checkpoint",
+            "eligible_optimizer_steps",
+            "selected_optimizer_step",
+            "selected_checkpoint",
+            "screen_evidence",
+            "selection_basis",
+            "matched_common_random_numbers",
+            "full_gate_requires_disjoint_cohort",
+            "fresh_adam_single_trajectory",
+            "resume_or_candidate_chaining",
+            "selection_sha256",
+        },
+        where="checkpoint selection receipt",
+    )
+    unhashed = dict(value)
+    declared = _validate_sha256(
+        unhashed.pop("selection_sha256"),
+        where="checkpoint selection receipt.selection_sha256",
+    )
+    if declared != _digest_value(unhashed):
+        raise PromotionError("checkpoint selection semantic digest mismatch")
+    if (
+        value["schema_version"] != CHECKPOINT_SELECTION_SCHEMA
+        or value["eligible_optimizer_steps"] != list(CHECKPOINT_SELECTION_STEPS)
+        or value["selection_basis"] != "matched_quick_screen"
+        or value["matched_common_random_numbers"] is not True
+        or value["full_gate_requires_disjoint_cohort"] is not True
+        or value["fresh_adam_single_trajectory"] is not True
+        or value["resume_or_candidate_chaining"] is not False
+    ):
+        raise PromotionError("checkpoint selection policy drifted")
+    receipt_ref = _require_exact_keys(
+        value["training_receipt"],
+        {"path", "sha256", "receipt_sha256"},
+        where="checkpoint selection receipt.training_receipt",
+    )
+    expected_receipt_ref = {
+        "path": str(training_receipt_path),
+        "sha256": _sha256(training_receipt_path),
+        "receipt_sha256": training_receipt["receipt_sha256"],
+    }
+    if receipt_ref != expected_receipt_ref:
+        raise PromotionError("checkpoint selection binds a different training receipt")
+    report_ref = _require_exact_keys(
+        value["training_report"], {"path", "sha256"},
+        where="checkpoint selection receipt.training_report",
+    )
+    if report_ref != {
+        "path": str(training_report_path),
+        "sha256": training_report_sha256,
+    }:
+        raise PromotionError("checkpoint selection binds a different training report")
+
+    terminal_path = _canonical_existing_file(
+        Path(str(outputs["checkpoint"])), where="terminal one-dose checkpoint"
+    )
+    terminal_ref = _require_exact_keys(
+        value["terminal_checkpoint"], {"path", "sha256"},
+        where="checkpoint selection receipt.terminal_checkpoint",
+    )
+    expected_terminal_ref = {
+        "path": str(terminal_path),
+        "sha256": outputs["checkpoint_sha256"],
+    }
+    if terminal_ref != expected_terminal_ref or _sha256(terminal_path) != terminal_ref["sha256"]:
+        raise PromotionError("checkpoint selection terminal checkpoint drifted")
+    if outputs.get("steps_completed") != CHECKPOINT_SELECTION_STEPS[-1]:
+        raise PromotionError("checkpoint selection requires the exact terminal step 128")
+
+    raw_intermediate = outputs.get("intermediate_checkpoints")
+    if not isinstance(raw_intermediate, list) or len(raw_intermediate) != 2:
+        raise PromotionError("checkpoint selection requires exact step 64/96 snapshots")
+    intermediates = [
+        _verify_intermediate_checkpoint_record(
+            record,
+            step=step,
+            where=f"one-dose intermediate checkpoint[{step}]",
+        )
+        for step, record in zip(CHECKPOINT_SELECTION_STEPS[:2], raw_intermediate, strict=True)
+    ]
+    report = _load_json(training_report_path)
+    if (
+        report.get("checkpoint_steps_requested") != list(CHECKPOINT_SELECTION_STEPS[:2])
+        or report.get("intermediate_checkpoints") != raw_intermediate
+    ):
+        raise PromotionError("training report and receipt disagree on dose snapshots")
+
+    selected_step = value["selected_optimizer_step"]
+    if selected_step not in CHECKPOINT_SELECTION_STEPS:
+        raise PromotionError("selected optimizer step is not one of 64/96/128")
+    selected_ref = _require_exact_keys(
+        value["selected_checkpoint"], {"path", "sha256"},
+        where="checkpoint selection receipt.selected_checkpoint",
+    )
+    if selected_step == CHECKPOINT_SELECTION_STEPS[-1]:
+        expected_selected_ref = expected_terminal_ref
+    else:
+        selected_record = intermediates[CHECKPOINT_SELECTION_STEPS[:2].index(selected_step)]
+        expected_selected_ref = {
+            "path": selected_record["checkpoint"],
+            "sha256": selected_record["checkpoint_sha256"],
+        }
+    if selected_ref != expected_selected_ref:
+        raise PromotionError("checkpoint selection does not bind the selected trajectory step")
+    selected_path = _canonical_existing_file(
+        Path(str(selected_ref["path"])), where="selected trajectory checkpoint"
+    )
+    if (
+        selected_path != candidate_path
+        or selected_ref["sha256"] != candidate_sha256
+        or _sha256(selected_path) != candidate_sha256
+    ):
+        raise PromotionError("adjudicated candidate differs from checkpoint selection")
+
+    screen_path, screen_ref = _validate_file_ref(
+        value["screen_evidence"],
+        base=path.parent,
+        where="checkpoint selection receipt.screen_evidence",
+    )
+    return {
+        "path": str(path),
+        "sha256": expected_file_sha256,
+        "selection_sha256": declared,
+        "selected_optimizer_step": selected_step,
+        "selected_checkpoint": selected_ref,
+        "terminal_checkpoint": expected_terminal_ref,
+        "screen_evidence": {**screen_ref, "path": str(screen_path)},
+    }
+
+
 def _verify_one_dose_training_receipt(
     path: Path,
     *,
@@ -1550,6 +1797,8 @@ def _verify_one_dose_training_receipt(
     candidate_sha256: str,
     training_report_path: Path,
     training_report_sha256: str,
+    checkpoint_selection_path: Path | None = None,
+    checkpoint_selection_sha256: str | None = None,
     legacy_snapshot: _LegacyPromotionSnapshot | None = None,
 ) -> dict[str, Any]:
     """Prove the candidate came from the sealed, environment-bound A1 dose.
@@ -1562,7 +1811,16 @@ def _verify_one_dose_training_receipt(
     """
 
     path = _canonical_existing_file(path, where="A1 one-dose training receipt")
+    if (checkpoint_selection_path is None) != (checkpoint_selection_sha256 is None):
+        raise PromotionError("checkpoint selection path/hash must be supplied together")
+    checkpoint_selection_requested = checkpoint_selection_path is not None
+    if checkpoint_selection_requested and legacy_snapshot is not None:
+        raise PromotionError("legacy promotion snapshots cannot select intermediate doses")
     raw_schema = _load_json(path).get("schema_version")
+    if checkpoint_selection_requested and raw_schema != one_dose.RECEIPT_SCHEMA:
+        raise PromotionError(
+            "same-trajectory checkpoint selection requires an ordinary one-dose receipt"
+        )
     if raw_schema == "a1-production-l1-rerun-completion-v1":
         return _verify_production_l1_completion_receipt(
             path,
@@ -1766,9 +2024,21 @@ def _verify_one_dose_training_receipt(
     receipt_schema = value.get("schema_version")
     is_retry = receipt_schema == one_dose.RETRY_RECEIPT_SCHEMA
     is_upgrade = receipt_schema == one_dose.UPGRADE_RECEIPT_SCHEMA
+    modern_receipt = "input_binding" in value
+    if modern_receipt:
+        expected_keys |= {
+            "input_binding",
+            "gpus",
+            "gpu_names",
+            "training_topology",
+            "ddp_canary",
+            "production_sampling_receipt_sha256",
+            "validation_split_receipt_sha256",
+            "lineage_dose",
+        }
     if is_retry:
         expected_keys |= {"claim_identity_sha256", "retry_contract"}
-    if "lineage_dose" in value:
+    if not modern_receipt and "lineage_dose" in value:
         expected_keys.add("lineage_dose")
     if is_upgrade:
         expected_keys |= {"claim_identity_sha256", "function_preserving_upgrade"}
@@ -1785,11 +2055,14 @@ def _verify_one_dose_training_receipt(
         value["status"] != "complete"
         or value["returncode"] != 0
         or value["failure"] is not None
-        or value["world_size"] != 1
     ):
         raise PromotionError(
             "one-dose training receipt is not a successful direct dose"
         )
+    if (not modern_receipt and value["world_size"] != 1) or (
+        modern_receipt and value["world_size"] not in {1, 8}
+    ):
+        raise PromotionError("one-dose receipt has an unauthorized learner world size")
     if value["contract_sha256"] != contract["contract_sha256"]:
         raise PromotionError("one-dose training receipt binds a different A1 contract")
     if _absolute(value["lock"], base=path.parent) != contract_lock:
@@ -1866,14 +2139,50 @@ def _verify_one_dose_training_receipt(
         if value.get("claim_identity_sha256") != expected_identity:
             raise PromotionError("architecture-upgrade training identity drifted")
     gpu = value["gpu"]
-    if (
-        isinstance(gpu, bool)
-        or not isinstance(gpu, int)
-        or gpu < 0
-        or not isinstance(value["gpu_name"], str)
-        or "B200" not in value["gpu_name"].upper()
-    ):
-        raise PromotionError("one-dose receipt does not attest one physical B200")
+    if isinstance(gpu, bool) or not isinstance(gpu, int) or gpu < 0:
+        raise PromotionError("one-dose receipt has an invalid primary GPU")
+    world_size = value["world_size"]
+    if modern_receipt:
+        if world_size == 8:
+            if gpu != 0:
+                raise PromotionError("8-rank one-dose topology must own GPU 0 as primary")
+            selected_gpus = list(one_dose.B200_8GPU_DDP_GPUS)
+            topology_name = one_dose.B200_8GPU_DDP_TOPOLOGY
+            local_batch_size = 512
+        else:
+            selected_gpus = [gpu]
+            topology_name = one_dose.LEGACY_SINGLE_GPU_TOPOLOGY
+            local_batch_size = 4096
+        expected_topology = {
+            "schema_version": "a1-one-dose-training-topology-v1",
+            "name": topology_name,
+            "world_size": world_size,
+            "physical_gpus": selected_gpus,
+            "local_batch_size": local_batch_size,
+            "grad_accum_steps": 1,
+            "global_batch_size": 4096,
+            "dose_preserving": True,
+        }
+        gpu_names = value["gpu_names"]
+        if (
+            value["gpus"] != selected_gpus
+            or value["training_topology"] != expected_topology
+            or not isinstance(gpu_names, list)
+            or len(gpu_names) != world_size
+            or any(
+                not isinstance(name, str) or "B200" not in name.upper()
+                for name in gpu_names
+            )
+            or value["gpu_name"] != gpu_names[0]
+        ):
+            raise PromotionError("one-dose receipt B200 topology attestation drifted")
+    else:
+        selected_gpus = [gpu]
+        if (
+            not isinstance(value["gpu_name"], str)
+            or "B200" not in value["gpu_name"].upper()
+        ):
+            raise PromotionError("one-dose receipt does not attest one physical B200")
     started = value["started_unix_ns"]
     finished = value["finished_unix_ns"]
     if (
@@ -1885,6 +2194,22 @@ def _verify_one_dose_training_receipt(
         or finished < started
     ):
         raise PromotionError("one-dose receipt timestamps are invalid")
+    if modern_receipt:
+        if world_size == 8:
+            canary = value["ddp_canary"]
+            canary_path = canary.get("path") if isinstance(canary, dict) else None
+            if not isinstance(canary_path, str):
+                raise PromotionError("8-rank one-dose receipt lacks its DDP canary")
+            try:
+                replayed_canary = one_dose._verify_ddp_canary_receipt(  # noqa: SLF001
+                    Path(canary_path), reference_time_ns=started
+                )
+            except one_dose.ExecutorError as error:
+                raise PromotionError(f"8-rank DDP canary replay refused: {error}") from error
+            if replayed_canary != canary:
+                raise PromotionError("8-rank DDP canary binding drifted")
+        elif value["ddp_canary"] is not None:
+            raise PromotionError("single-rank one-dose receipt may not bind a DDP canary")
 
     command = value["command"]
     if (
@@ -1895,6 +2220,34 @@ def _verify_one_dose_training_receipt(
         raise PromotionError("one-dose training receipt command is invalid")
     if value["command_sha256"] != _digest_value(command):
         raise PromotionError("one-dose training receipt command digest mismatch")
+    if modern_receipt:
+        trainer_indices = [
+            index for index, token in enumerate(command) if Path(token).name == "train_bc.py"
+        ]
+        if len(trainer_indices) != 1:
+            raise PromotionError("one-dose command does not contain one canonical trainer")
+        trainer = Path(command[trainer_indices[0]]).resolve(strict=False)
+        if trainer != Path(one_dose.train_bc.__file__).resolve(strict=False):
+            raise PromotionError("one-dose command does not use canonical train_bc.py")
+        if world_size == 8:
+            if (
+                trainer_indices[0] != 5
+                or command[1:5]
+                != [
+                    "-m",
+                    "torch.distributed.run",
+                    "--standalone",
+                    "--nproc_per_node=8",
+                ]
+                or command.count("torch.distributed.run") != 1
+                or command.count("--nproc_per_node=8") != 1
+            ):
+                raise PromotionError("8-rank one-dose command lost exact torchrun topology")
+        elif (
+            "torch.distributed.run" in command
+            or any(token.startswith("--nproc_per_node") for token in command)
+        ):
+            raise PromotionError("single-rank one-dose command unexpectedly uses torchrun")
     execution_binding = value["execution_binding"]
     try:
         one_dose._validate_execution_binding(execution_binding)  # noqa: SLF001
@@ -1905,7 +2258,9 @@ def _verify_one_dose_training_receipt(
     if execution_binding["command_sha256"] != value["command_sha256"]:
         raise PromotionError("one-dose command and execution binding disagree")
     try:
-        expected_environment = one_dose._child_environment(gpu)  # noqa: SLF001
+        expected_environment = one_dose._child_environment(  # noqa: SLF001
+            selected_gpus if modern_receipt else gpu
+        )
     except one_dose.ExecutorError as error:
         raise PromotionError(
             f"cannot reconstruct one-dose child environment: {error}"
@@ -1928,15 +2283,41 @@ def _verify_one_dose_training_receipt(
         "training_row_count",
         "validation_row_count",
     }
-    if isinstance(value.get("outputs"), dict) and "lineage_dose" in value["outputs"]:
+    if modern_receipt:
+        output_keys |= {
+            "training_progress",
+            "training_progress_sha256",
+            "training_progress_payload_sha256",
+            "sample_receipt_state_sha256",
+            "sample_order_sha256",
+            "row_set_sha256",
+            "realized_sample_evidence_sha256",
+            "input_binding_sha256",
+            "unique_training_rows",
+            "base_sampler_draw_events",
+            "sampler_draw_events",
+            "sampled_rows",
+            "lineage_dose",
+            "production_sampling_receipt_sha256",
+            "validation_split_receipt_sha256",
+        }
+        if (
+            isinstance(value.get("outputs"), dict)
+            and "intermediate_checkpoints" in value["outputs"]
+        ):
+            output_keys.add("intermediate_checkpoints")
+    elif isinstance(value.get("outputs"), dict) and "lineage_dose" in value["outputs"]:
         output_keys |= {"lineage_dose", "sampled_rows"}
     outputs = _require_exact_keys(
         value["outputs"],
         output_keys,
         where="one-dose training receipt.outputs",
     )
-    output_checkpoint = _absolute(outputs["checkpoint"], base=path.parent)
-    if (
+    output_checkpoint = _canonical_existing_file(
+        _absolute(outputs["checkpoint"], base=path.parent),
+        where="one-dose terminal checkpoint",
+    )
+    if not checkpoint_selection_requested and (
         output_checkpoint != candidate_path
         or outputs["checkpoint_sha256"] != candidate_sha256
     ):
@@ -1958,6 +2339,16 @@ def _verify_one_dose_training_receipt(
     )
     if _sha256(optimizer) != outputs["optimizer_sidecar_sha256"]:
         raise PromotionError("one-dose optimizer-sidecar bytes drifted")
+    if modern_receipt:
+        progress = _canonical_existing_file(
+            _absolute(outputs["training_progress"], base=path.parent),
+            where="one-dose training-progress marker",
+        )
+        if (
+            _sha256(progress) != outputs["training_progress_sha256"]
+            or not isinstance(outputs["training_progress_payload_sha256"], str)
+        ):
+            raise PromotionError("one-dose training-progress provenance drifted")
     if outputs["execution_binding_sha256"] != _digest_value(execution_binding):
         raise PromotionError("one-dose output execution-binding digest mismatch")
     counts = {
@@ -1992,6 +2383,126 @@ def _verify_one_dose_training_receipt(
         raise PromotionError(
             "candidate training report does not bind the one-dose command/environment"
         )
+    if modern_receipt:
+        input_binding = value["input_binding"]
+        if not isinstance(input_binding, dict):
+            raise PromotionError("modern one-dose receipt lacks an input binding")
+        input_keys = {
+            "schema_version",
+            "contract_sha256",
+            "data",
+            "data_kind",
+            "data_fingerprint",
+            "payload_inventory_sha256",
+            "corpus_row_count",
+            "training_row_count",
+            "validation_row_count",
+            "sealed_learner_recipe_sha256",
+            "effective_learner_recipe_sha256",
+            "training_topology",
+            "ddp_canary",
+            "aux_subgoal_preclaim_contract",
+            "aux_pair_executor_authority_sha256",
+            "p1_arm_executor_authority_sha256",
+            "final_replication_executor_authority_sha256",
+            "central_published_executor_authority",
+            "binding_sha256",
+        }
+        if input_binding.get("data_kind") == "production_composite_v2":
+            input_keys |= {
+                "production_mix_contract_sha256",
+                "production_sampling_receipt_sha256",
+                "validation_split_receipt",
+                "validation_split_receipt_sha256",
+                "composite_build_receipt",
+                "source_authority",
+                "category_semantics",
+                "category_semantics_sha256",
+            }
+        else:
+            input_keys |= {
+                "validation_manifest",
+                "validation_manifest_file_sha256",
+                "selected_game_seed_set_sha256",
+                "training_game_seed_set_sha256",
+                "validation_game_seed_set_sha256",
+            }
+        if set(input_binding) != input_keys:
+            raise PromotionError("modern one-dose input-binding schema drifted")
+        input_unhashed = dict(input_binding)
+        input_digest = input_unhashed.pop("binding_sha256", None)
+        effective_recipe = dict(contract["science"]["learner_training_recipe"])
+        effective_recipe.update(
+            {
+                "world_size": world_size,
+                "batch_size": value["training_topology"]["local_batch_size"],
+                "grad_accum_steps": value["training_topology"]["grad_accum_steps"],
+                "global_batch_size": value["training_topology"]["global_batch_size"],
+            }
+        )
+        if (
+            input_binding.get("schema_version")
+            != one_dose.REPORT_INPUT_BINDING_SCHEMA
+            or input_digest != _digest_value(input_unhashed)
+            or outputs["input_binding_sha256"] != input_digest
+            or report.get(one_dose.REPORT_INPUT_BINDING_FIELD) != input_binding
+            or input_binding.get("contract_sha256") != contract["contract_sha256"]
+            or input_binding.get("data") != value["corpus"]
+            or input_binding.get("payload_inventory_sha256")
+            != value["payload_inventory_sha256"]
+            or input_binding.get("training_topology") != value["training_topology"]
+            or input_binding.get("ddp_canary") != value["ddp_canary"]
+            or input_binding.get("corpus_row_count") != outputs["corpus_row_count"]
+            or input_binding.get("training_row_count")
+            != outputs["training_row_count"]
+            or input_binding.get("validation_row_count")
+            != outputs["validation_row_count"]
+            or input_binding.get("sealed_learner_recipe_sha256")
+            != value["learner_training_recipe_sha256"]
+            or input_binding.get("effective_learner_recipe_sha256")
+            != _digest_value(effective_recipe)
+        ):
+            raise PromotionError("modern one-dose input/report/topology binding drifted")
+        expected_report_topology = {
+            "world_size": world_size,
+            "batch_size": value["training_topology"]["local_batch_size"],
+            "grad_accum_steps": value["training_topology"]["grad_accum_steps"],
+            "effective_global_batch_size": value["training_topology"][
+                "global_batch_size"
+            ],
+        }
+        if any(report.get(key) != expected for key, expected in expected_report_topology.items()):
+            raise PromotionError("modern one-dose report effective topology drifted")
+        if (
+            value["lineage_dose"] != outputs["lineage_dose"]
+            or report.get("a1_lineage_dose") != outputs["lineage_dose"]
+            or outputs["production_sampling_receipt_sha256"]
+            != value["production_sampling_receipt_sha256"]
+            or outputs["validation_split_receipt_sha256"]
+            != value["validation_split_receipt_sha256"]
+            or input_binding.get("production_sampling_receipt_sha256")
+            != value["production_sampling_receipt_sha256"]
+            or input_binding.get("validation_split_receipt_sha256")
+            != value["validation_split_receipt_sha256"]
+        ):
+            raise PromotionError("modern one-dose lineage/data-split provenance drifted")
+        dose_numbers = {
+            key: outputs[key]
+            for key in (
+                "base_sampler_draw_events",
+                "sampler_draw_events",
+                "sampled_rows",
+            )
+        }
+        if (
+            any(
+                isinstance(number, bool) or not isinstance(number, int) or number <= 0
+                for number in dose_numbers.values()
+            )
+            or len(set(dose_numbers.values())) != 1
+            or outputs["unique_training_rows"] is not None
+        ):
+            raise PromotionError("modern one-dose sampler dose provenance drifted")
     if is_upgrade:
         try:
             report_lineage = one_dose.lineage.validate_lineage_dose(
@@ -2023,6 +2534,42 @@ def _verify_one_dose_training_receipt(
     ):
         raise PromotionError("one-dose receipt producer differs from contract")
 
+    if modern_receipt and "intermediate_checkpoints" in outputs:
+        raw_intermediate = outputs["intermediate_checkpoints"]
+        if not isinstance(raw_intermediate, list) or len(raw_intermediate) != 2:
+            raise PromotionError("modern one-dose receipt has malformed dose snapshots")
+        for step, record in zip(
+            CHECKPOINT_SELECTION_STEPS[:2], raw_intermediate, strict=True
+        ):
+            _verify_intermediate_checkpoint_record(
+                record,
+                step=step,
+                where=f"one-dose intermediate checkpoint[{step}]",
+            )
+        if (
+            report.get("checkpoint_steps_requested")
+            != list(CHECKPOINT_SELECTION_STEPS[:2])
+            or report.get("intermediate_checkpoints") != raw_intermediate
+        ):
+            raise PromotionError("one-dose report/receipt dose snapshots drifted")
+    checkpoint_selection: dict[str, Any] | None = None
+    if checkpoint_selection_requested:
+        if not modern_receipt:
+            raise PromotionError("legacy one-dose receipts cannot select an intermediate dose")
+        assert checkpoint_selection_path is not None
+        assert checkpoint_selection_sha256 is not None
+        checkpoint_selection = _verify_same_trajectory_checkpoint_selection(
+            checkpoint_selection_path,
+            expected_file_sha256=checkpoint_selection_sha256,
+            training_receipt_path=path,
+            training_receipt=value,
+            outputs=outputs,
+            training_report_path=training_report_path,
+            training_report_sha256=training_report_sha256,
+            candidate_path=candidate_path,
+            candidate_sha256=candidate_sha256,
+        )
+
     claim_path = _canonical_existing_file(
         _absolute(value["claim"], base=path.parent), where="one-dose durable claim"
     )
@@ -2050,7 +2597,7 @@ def _verify_one_dose_training_receipt(
         )
     ):
         raise PromotionError("one-dose receipt and durable claim disagree")
-    return {
+    result = {
         "path": str(path),
         "sha256": (
             _sha256(path)
@@ -2062,6 +2609,13 @@ def _verify_one_dose_training_receipt(
         "claim_state_sha256": value["claim_state_sha256"],
         "execution_binding_sha256": outputs["execution_binding_sha256"],
     }
+    if checkpoint_selection is not None:
+        result["checkpoint_selection"] = checkpoint_selection
+        result["report_checkpoint"] = {
+            "path": str(output_checkpoint),
+            "sha256": outputs["checkpoint_sha256"],
+        }
+    return result
 
 
 def _verify_production_l1_completion_receipt(
@@ -3085,6 +3639,7 @@ def _verify_fleet_pool_provenance(
         "kind",
         "sources",
         "seed_intervals",
+        "disjoint_cohorts",
         "effective_search_config_sha256",
         *checkpoint_refs,
     }
@@ -3093,6 +3648,8 @@ def _verify_fleet_pool_provenance(
     value = _require_exact_keys(merge, required, where=f"{where}.fleet_merge")
     if value["schema_version"] != FLEET_EVALUATION_POOL_SCHEMA or value["kind"] != kind:
         raise PromotionError(f"{where} has an unexpected fleet-pool schema/kind")
+    if type(value["disjoint_cohorts"]) is not bool:  # noqa: E721
+        raise PromotionError(f"{where} has an invalid disjoint-cohort binding")
     for role, (path, sha256) in checkpoint_refs.items():
         _verify_bound_checkpoint(
             value[role],
@@ -3113,6 +3670,7 @@ def _verify_fleet_pool_provenance(
     ):
         raise PromotionError(f"{where} has incomplete fleet shard provenance")
     source_paths: set[str] = set()
+    ordered_source_paths: list[Path] = []
     for index, source in enumerate(sources):
         path, _ref = _validate_file_ref(
             source, base=Path.cwd(), where=f"{where}.fleet_merge.sources[{index}]"
@@ -3120,6 +3678,7 @@ def _verify_fleet_pool_provenance(
         if str(path) in source_paths:
             raise PromotionError(f"{where} repeats a fleet source report")
         source_paths.add(str(path))
+        ordered_source_paths.append(path)
     cursor: int | None = None
     interval_paths: set[str] = set()
     for index, raw in enumerate(intervals):
@@ -3141,8 +3700,11 @@ def _verify_fleet_pool_provenance(
         path = str(_absolute(interval["path"], base=Path.cwd()))
         if path not in source_paths or path in interval_paths:
             raise PromotionError(f"{where} seed interval does not bind one source")
-        if cursor is not None and lo != cursor:
-            raise PromotionError(f"{where} fleet seed intervals are not contiguous")
+        if cursor is not None:
+            if lo < cursor:
+                raise PromotionError(f"{where} fleet seed intervals overlap or reorder")
+            if lo != cursor and value["disjoint_cohorts"] is not True:
+                raise PromotionError(f"{where} fleet seed intervals are not contiguous")
         cursor = hi
         interval_paths.add(path)
     if interval_paths != source_paths:
@@ -3172,6 +3734,34 @@ def _verify_fleet_pool_provenance(
             hash_paths.add(path)
         if hash_paths != source_paths:
             raise PromotionError(f"{where} shard config hashes omit a source")
+
+    # A list of authentic source hashes is not proof that the pooled raw games
+    # came from those sources.  Replay the canonical pooler from the referenced
+    # reports and require the exact normalized game union and provenance
+    # wrapper.  Without this boundary, a hand-edited pool could cite genuine
+    # shard files while substituting favorable outcomes or unrelated seeds.
+    from tools import a1_evaluation_pool as evaluation_pool
+
+    try:
+        if kind == "internal_h2h":
+            replayed = evaluation_pool.pool_internal(
+                ordered_source_paths,
+                candidate=checkpoint_refs["candidate"][0],
+                champion=checkpoint_refs["champion"][0],
+                allow_disjoint_cohorts=value["disjoint_cohorts"],
+            )
+        else:
+            replayed = evaluation_pool.pool_neutral(
+                ordered_source_paths,
+                checkpoint=checkpoint_refs["checkpoint"][0],
+                allow_disjoint_cohorts=value["disjoint_cohorts"],
+            )
+    except evaluation_pool.PoolError as error:
+        raise PromotionError(f"{where} fleet source replay failed: {error}") from error
+    if value != replayed.get("fleet_merge"):
+        raise PromotionError(f"{where} fleet provenance does not replay from sources")
+    if payload.get("games") != replayed.get("games"):
+        raise PromotionError(f"{where} pooled games do not replay from fleet sources")
 
 
 def _verify_calibration_source(
@@ -3940,6 +4530,62 @@ def _sealed_evaluation_semantics(contract: dict[str, Any]) -> dict[str, Any]:
     return semantics
 
 
+def _internal_h2h_search_seed(*, game_seed: int, seat_color: str) -> int:
+    """Replay the evaluator's schedule-independent per-seat search seed."""
+
+    color = str(seat_color).upper()
+    if color not in {"RED", "BLUE"}:
+        raise PromotionError(f"unsupported internal H2H seat color: {seat_color!r}")
+    payload = f"gumbel-search-cross-net-h2h-v1:{int(game_seed)}:{color}".encode(
+        "ascii"
+    )
+    return int.from_bytes(hashlib.sha256(payload).digest()[:8], "big")
+
+
+def _verify_internal_h2h_rng_contract(
+    payload: dict[str, Any], *, where: str
+) -> None:
+    """Bind promotion evidence to corrected, shard-invariant paired RNG streams.
+
+    The pre-fix evaluator reused one advancing RNG per worker.  Its result for a
+    seed therefore changed with worker count, shard order, and earlier failures.
+    New promotion evidence must attest the corrected contract and retain the
+    exact role-to-seat seed assignment for every orientation so merely copying
+    the top-level attestation cannot launder an old report.
+    """
+
+    if payload.get("search_rng_contract") != INTERNAL_H2H_SEARCH_RNG_CONTRACT:
+        raise PromotionError(
+            f"{where} does not bind the corrected per-game/seat search RNG contract"
+        )
+    games = payload.get("games")
+    if not isinstance(games, list) or not games:
+        raise PromotionError(f"{where} has no games for search RNG verification")
+    for index, game in enumerate(games):
+        if not isinstance(game, dict):
+            raise PromotionError(f"{where}.games[{index}] is not an object")
+        seed = game.get("game_seed")
+        orientation = game.get("orientation")
+        if isinstance(seed, bool) or not isinstance(seed, int):
+            raise PromotionError(f"{where}.games[{index}] has invalid game_seed")
+        if orientation == "candidate_red":
+            role_colors = {"candidate": "RED", "baseline": "BLUE"}
+        elif orientation == "candidate_blue":
+            role_colors = {"candidate": "BLUE", "baseline": "RED"}
+        else:
+            raise PromotionError(
+                f"{where}.games[{index}] does not use the corrected color-swap encoding"
+            )
+        expected = {
+            role: _internal_h2h_search_seed(game_seed=seed, seat_color=color)
+            for role, color in role_colors.items()
+        }
+        if game.get("search_seeds_by_role") != expected:
+            raise PromotionError(
+                f"{where}.games[{index}] search RNG role/seat binding does not replay"
+            )
+
+
 def _verify_internal_h2h_source(
     payload: dict[str, Any],
     *,
@@ -3963,6 +4609,7 @@ def _verify_internal_h2h_source(
         raise PromotionError(
             f"{where} strict superiority cannot be combined with a non-regression veto"
         )
+    _verify_internal_h2h_rng_contract(payload, where=where)
     _verify_evaluation_baseline_binding(
         payload.get("evaluation_binding"),
         champion_path=champion,
@@ -4223,6 +4870,13 @@ def _verify_internal_h2h_source(
     complete_pairs = _positive_int(
         payload.get("complete_pairs"), where=f"{where}.complete_pairs"
     )
+    pairs_requested = _positive_int(
+        payload.get("pairs_requested"), where=f"{where}.pairs_requested"
+    )
+    if pairs_requested != complete_pairs:
+        raise PromotionError(
+            f"{where} completed {complete_pairs} of {pairs_requested} requested pairs"
+        )
     if complete_pairs < 200:
         raise PromotionError(f"{where} has fewer than 200 complete pairs")
     if payload.get("errors") != []:
@@ -4236,6 +4890,18 @@ def _verify_internal_h2h_source(
         raise PromotionError(f"{where} does not retain its complete game evidence")
     if len(games) != int(payload.get("games_with_winner", -1)):
         raise PromotionError(f"{where} has incomplete winner records")
+    if len(games) != 2 * complete_pairs:
+        raise PromotionError(f"{where} does not retain exactly two games per pair")
+    if not pooled:
+        base_seed = payload.get("base_seed")
+        if isinstance(base_seed, bool) or not isinstance(base_seed, int) or base_seed < 0:
+            raise PromotionError(f"{where}.base_seed must be a non-negative integer")
+        actual_seeds = {game.get("game_seed") for game in games}
+        expected_seeds = set(range(base_seed, base_seed + pairs_requested))
+        if actual_seeds != expected_seeds:
+            raise PromotionError(
+                f"{where} does not exactly cover its requested seed interval"
+            )
     outcomes: list[bool] = []
     for index, game in enumerate(games):
         if not isinstance(game, dict):
@@ -4378,6 +5044,7 @@ def _verify_n64_confirmation(
     ref = _require_exact_keys(raw, {"path", "sha256"}, where="nth_confirmation")
     path, verified = _validate_file_ref(ref, base=base, where="nth_confirmation")
     payload = _load_json(path)
+    _verify_internal_h2h_cohort(payload, where="nth_confirmation")
     _verify_internal_h2h_source(
         payload,
         candidate=Path(candidate["path"]),
@@ -4397,7 +5064,6 @@ def _verify_n64_confirmation(
             None if candidate_parent is None else str(candidate_parent["sha256"])
         ),
     )
-    _verify_internal_h2h_cohort(payload, where="nth_confirmation")
     intervals = _contiguous_seed_intervals(
         _explicit_game_seeds(payload, where="nth_confirmation"),
         kind="internal_h2h_n64_confirmation",
@@ -5442,6 +6108,9 @@ def _verify_promotion_evidence(
         if promotion_mode == "promotion_parent":
             if set(source_by_role) != {"internal_h2h"}:
                 raise PromotionError("internal H2H source roles mismatch")
+            _verify_internal_h2h_cohort(
+                source_by_role["internal_h2h"][1], where="internal H2H"
+            )
             _verify_internal_h2h_source(
                 source_by_role["internal_h2h"][1],
                 candidate=candidate_path,
@@ -5485,6 +6154,9 @@ def _verify_promotion_evidence(
             cohort_seed_sets: list[set[int]] = []
             for role in sorted(expected_roles):
                 payload = source_by_role[role][1]
+                _verify_internal_h2h_cohort(
+                    payload, where=f"branch internal H2H {role}"
+                )
                 _verify_internal_h2h_source(
                     payload,
                     candidate=candidate_path,
@@ -5497,9 +6169,6 @@ def _verify_promotion_evidence(
                     candidate_parent_path=Path(str(candidate_parent["path"])),
                     candidate_parent_sha256=str(candidate_parent["sha256"]),
                     require_strict_superiority=True,
-                )
-                _verify_internal_h2h_cohort(
-                    payload, where=f"branch internal H2H {role}"
                 )
                 cohort_seed_sets.append(
                     _explicit_game_seeds(
@@ -6135,11 +6804,18 @@ def _verify_adjudication(
         raise PromotionError("adjudication binds a different sealed A1 contract")
 
     base = path.parent
-    candidate_raw = _require_exact_keys(
-        value["candidate"],
-        {"path", "sha256", "version", "training_report", "agent_identity"},
-        where="candidate",
-    )
+    candidate_keys = {
+        "path",
+        "sha256",
+        "version",
+        "training_report",
+        "agent_identity",
+    }
+    if isinstance(value["candidate"], dict) and "training_checkpoint_selection" in value[
+        "candidate"
+    ]:
+        candidate_keys.add("training_checkpoint_selection")
+    candidate_raw = _require_exact_keys(value["candidate"], candidate_keys, where="candidate")
     candidate_path, candidate_ref = _validate_file_ref(
         {"path": candidate_raw["path"], "sha256": candidate_raw["sha256"]},
         base=base,
@@ -6148,7 +6824,25 @@ def _verify_adjudication(
     training_path, training_ref = _validate_file_ref(
         candidate_raw["training_report"], base=base, where="candidate.training_report"
     )
-    training_receipt_schema = _load_json(training_receipt).get("schema_version")
+    selection_path: Path | None = None
+    selection_ref: dict[str, str] | None = None
+    if "training_checkpoint_selection" in candidate_raw:
+        if branch_challenge:
+            raise PromotionError(
+                "branch challenges cannot select an intermediate one-dose checkpoint"
+            )
+        selection_path, selection_ref = _validate_file_ref(
+            candidate_raw["training_checkpoint_selection"],
+            base=base,
+            where="candidate.training_checkpoint_selection",
+        )
+    training_receipt_preview = _load_json(training_receipt)
+    training_receipt_schema = training_receipt_preview.get("schema_version")
+    preview_input_binding = training_receipt_preview.get("input_binding")
+    production_composite = (
+        isinstance(preview_input_binding, dict)
+        and preview_input_binding.get("data_kind") == "production_composite_v2"
+    )
     production_l1_completion = (
         training_receipt_schema == "a1-production-l1-rerun-completion-v1"
     )
@@ -6160,16 +6854,18 @@ def _verify_adjudication(
         training_receipt_schema
         == "a1-production-temperature-replication-completion-v1"
     )
-    training_report_payload = _verify_training_report(
-        training_path,
-        contract=contract,
-        contract_sha256=contract_sha,
-        candidate_path=candidate_path,
-        candidate_sha256=candidate_ref["sha256"],
-        production_l1_completion=production_l1_completion,
-        production_target_gather_completion=production_target_gather_completion,
-        production_temperature_completion=production_temperature_completion,
-    )
+    if selection_path is None:
+        training_report_payload = _verify_training_report(
+            training_path,
+            contract=contract,
+            contract_sha256=contract_sha,
+            candidate_path=candidate_path,
+            candidate_sha256=candidate_ref["sha256"],
+            production_l1_completion=production_l1_completion,
+            production_target_gather_completion=production_target_gather_completion,
+            production_temperature_completion=production_temperature_completion,
+            production_composite=production_composite,
+        )
     training_receipt_ref = _verify_one_dose_training_receipt(
         training_receipt,
         contract_lock=contract_lock,
@@ -6178,8 +6874,25 @@ def _verify_adjudication(
         candidate_sha256=candidate_ref["sha256"],
         training_report_path=training_path,
         training_report_sha256=training_ref["sha256"],
+        checkpoint_selection_path=selection_path,
+        checkpoint_selection_sha256=(
+            None if selection_ref is None else selection_ref["sha256"]
+        ),
         legacy_snapshot=legacy_snapshot,
     )
+    if selection_path is not None:
+        report_checkpoint = training_receipt_ref["report_checkpoint"]
+        training_report_payload = _verify_training_report(
+            training_path,
+            contract=contract,
+            contract_sha256=contract_sha,
+            candidate_path=Path(str(report_checkpoint["path"])),
+            candidate_sha256=str(report_checkpoint["sha256"]),
+            production_l1_completion=production_l1_completion,
+            production_target_gather_completion=production_target_gather_completion,
+            production_temperature_completion=production_temperature_completion,
+            production_composite=production_composite,
+        )
     champion_raw = _require_exact_keys(
         value["champion"],
         {"path", "sha256", "version", "agent_identity"},
@@ -6442,6 +7155,11 @@ def _verify_adjudication(
             "version": candidate_raw["version"],
             "md5": candidate_binding["md5"],
             "training_report": training_ref,
+            **(
+                {"training_checkpoint_selection": selection_ref}
+                if selection_ref is not None
+                else {}
+            ),
             "agent_identity": candidate_identity,
         },
         "training_receipt": training_receipt_ref,
@@ -6594,6 +7312,17 @@ def prepare_promotion(
         candidate_sha256=verified["candidate"]["sha256"],
         final_intervals=verified["final_cohort_intervals"],
     )
+    checkpoint_selection = verified["training_receipt"].get("checkpoint_selection")
+    if isinstance(checkpoint_selection, dict):
+        screen_ref = checkpoint_selection["screen_evidence"]
+        if not any(
+            source.get("path") == screen_ref["path"]
+            and source.get("sha256") == screen_ref["sha256"]
+            for source in cohort_disjointness["bound_sources"]
+        ):
+            raise PromotionError(
+                "selected-dose quick screen is missing from cohort exclusions"
+            )
     registry_before = registry_path.read_bytes()
     current_before = current_pointer.read_bytes()
     registry_after, promotion_count = _stage_registry(
@@ -6973,6 +7702,114 @@ def recover_transaction(
         return result
 
 
+def create_same_trajectory_checkpoint_selection(
+    *,
+    training_receipt_path: Path,
+    training_report_path: Path,
+    screen_evidence_path: Path,
+    selected_optimizer_step: int,
+    output_path: Path,
+) -> dict[str, Any]:
+    """Create, but do not authorize, one immutable dose-selection receipt."""
+
+    training_receipt_path = _canonical_existing_file(
+        training_receipt_path, where="selection training receipt"
+    )
+    training_report_path = _canonical_existing_file(
+        training_report_path, where="selection training report"
+    )
+    screen_evidence_path = _canonical_existing_file(
+        screen_evidence_path, where="selection screen evidence"
+    )
+    output_path = _canonical_new_file(output_path, where="checkpoint selection receipt")
+    if selected_optimizer_step not in CHECKPOINT_SELECTION_STEPS:
+        raise PromotionError("selected optimizer step must be exactly 64, 96, or 128")
+    receipt = _verify_receipt_digest(_load_json(training_receipt_path))
+    if receipt.get("schema_version") != one_dose.RECEIPT_SCHEMA:
+        raise PromotionError("checkpoint selection requires an ordinary one-dose receipt")
+    outputs = receipt.get("outputs")
+    if not isinstance(outputs, dict) or outputs.get("steps_completed") != 128:
+        raise PromotionError("checkpoint selection requires a completed step-128 dose")
+    if (
+        _absolute(outputs.get("report"), base=training_receipt_path.parent)
+        != training_report_path
+        or outputs.get("report_sha256") != _sha256(training_report_path)
+    ):
+        raise PromotionError("selection training report differs from one-dose receipt")
+    terminal_path = _canonical_existing_file(
+        _absolute(outputs.get("checkpoint"), base=training_receipt_path.parent),
+        where="selection terminal checkpoint",
+    )
+    terminal_ref = {
+        "path": str(terminal_path),
+        "sha256": _sha256(terminal_path),
+    }
+    if terminal_ref["sha256"] != outputs.get("checkpoint_sha256"):
+        raise PromotionError("selection terminal checkpoint bytes drifted")
+    raw_intermediate = outputs.get("intermediate_checkpoints")
+    if not isinstance(raw_intermediate, list) or len(raw_intermediate) != 2:
+        raise PromotionError("selection receipt has no exact step-64/96 snapshots")
+    intermediates = [
+        _verify_intermediate_checkpoint_record(
+            record,
+            step=step,
+            where=f"selection intermediate checkpoint[{step}]",
+        )
+        for step, record in zip(
+            CHECKPOINT_SELECTION_STEPS[:2], raw_intermediate, strict=True
+        )
+    ]
+    report = _load_json(training_report_path)
+    if (
+        report.get("checkpoint_steps_requested")
+        != list(CHECKPOINT_SELECTION_STEPS[:2])
+        or report.get("intermediate_checkpoints") != raw_intermediate
+    ):
+        raise PromotionError("selection report lost its same-trajectory snapshots")
+    if selected_optimizer_step == 128:
+        selected_ref = terminal_ref
+    else:
+        selected = intermediates[
+            CHECKPOINT_SELECTION_STEPS[:2].index(selected_optimizer_step)
+        ]
+        selected_ref = {
+            "path": selected["checkpoint"],
+            "sha256": selected["checkpoint_sha256"],
+        }
+    payload = {
+        "schema_version": CHECKPOINT_SELECTION_SCHEMA,
+        "training_receipt": {
+            "path": str(training_receipt_path),
+            "sha256": _sha256(training_receipt_path),
+            "receipt_sha256": receipt["receipt_sha256"],
+        },
+        "training_report": {
+            "path": str(training_report_path),
+            "sha256": _sha256(training_report_path),
+        },
+        "terminal_checkpoint": terminal_ref,
+        "eligible_optimizer_steps": list(CHECKPOINT_SELECTION_STEPS),
+        "selected_optimizer_step": selected_optimizer_step,
+        "selected_checkpoint": selected_ref,
+        "screen_evidence": {
+            "path": str(screen_evidence_path),
+            "sha256": _sha256(screen_evidence_path),
+        },
+        "selection_basis": "matched_quick_screen",
+        "matched_common_random_numbers": True,
+        "full_gate_requires_disjoint_cohort": True,
+        "fresh_adam_single_trajectory": True,
+        "resume_or_candidate_chaining": False,
+    }
+    payload["selection_sha256"] = _digest_value(payload)
+    _write_new_bytes(output_path, _canonical_bytes(payload) + b"\n")
+    return {
+        **payload,
+        "path": str(output_path),
+        "file_sha256": _sha256(output_path),
+    }
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -6999,6 +7836,16 @@ def build_parser() -> argparse.ArgumentParser:
     recover.add_argument(
         "--go", action="store_true", help="restore; default is dry-run"
     )
+    select = subparsers.add_parser(
+        "select-dose", help="seal an explicit same-trajectory 64/96/128 choice"
+    )
+    select.add_argument("--training-receipt", required=True, type=Path)
+    select.add_argument("--training-report", required=True, type=Path)
+    select.add_argument("--screen-evidence", required=True, type=Path)
+    select.add_argument(
+        "--selected-optimizer-step", required=True, type=int, choices=(64, 96, 128)
+    )
+    select.add_argument("--output", required=True, type=Path)
     return parser
 
 
@@ -7019,11 +7866,19 @@ def main(argv: Sequence[str] | None = None) -> int:
                 lock_path=args.lock_file,
                 go=bool(args.go),
             )
-        else:
+        elif args.command == "recover":
             result = recover_transaction(
                 receipt_path=args.receipt,
                 lock_path=args.lock_file,
                 go=bool(args.go),
+            )
+        else:
+            result = create_same_trajectory_checkpoint_selection(
+                training_receipt_path=args.training_receipt,
+                training_report_path=args.training_report,
+                screen_evidence_path=args.screen_evidence,
+                selected_optimizer_step=args.selected_optimizer_step,
+                output_path=args.output,
             )
     except PromotionError as error:
         print(f"REFUSING: {error}", file=sys.stderr)

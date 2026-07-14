@@ -71,6 +71,7 @@ from catan_zero.rl.entity_token_features import (
 from catan_zero.rl.entity_feature_adapter import (
     checkpoint_entity_feature_adapter_metadata,
     policy_entity_feature_adapter_version,
+    require_known_entity_feature_adapter,
 )
 from catan_zero.rl import optim_state as _checkout_optim_state
 from catan_zero.rl.flywheel.composite_contract import (
@@ -1414,6 +1415,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--report", required=True)
     parser.add_argument("--save-each-epoch", action="store_true")
     parser.add_argument(
+        "--checkpoint-steps",
+        default="",
+        help=(
+            "Comma-separated optimizer steps at which to emit model-only "
+            "checkpoints from the same training trajectory (for example 64,96). "
+            "The terminal --checkpoint is still written normally."
+        ),
+    )
+    parser.add_argument(
         "--progress-every-batches",
         type=int,
         default=50,
@@ -1769,7 +1779,11 @@ def _value_training_metadata(
         mode = "mse"
     primary_readout = "categorical" if mode == "hlgauss" else "scalar"
     trained_readouts: list[str] = []
-    has_updates = int(optimizer_steps) > 0 and int(completed_epochs) > 0
+    # A bounded max-step run can have real optimizer updates before completing
+    # an epoch.  Requiring completed_epochs > 0 made an otherwise valid
+    # intermediate model claim that its value readout was untrained.  Optimizer
+    # steps plus positive objective mass are the actual training evidence.
+    has_updates = int(optimizer_steps) > 0
     if (
         has_updates
         and float(scalar_weight) > 0.0
@@ -3303,6 +3317,7 @@ def _preflight_memmap_composite_descriptor(path: str | Path) -> dict[str, object
             "policy_distillation_component_ids",
             "policy_aux_phase_sampling_weights",
             "stored_policy_component_temperatures",
+            "entity_feature_adapter_component_versions",
             "value_training_component_ids",
             "aux_subgoal_component_ids",
             "flywheel_replay_contract",
@@ -3631,6 +3646,7 @@ def _preflight_memmap_composite_descriptor(path: str | Path) -> dict[str, object
     distillation_scope_explicit = False
     policy_aux_phase_sampling_weights: dict[str, float] | None = None
     stored_policy_component_temperatures: dict[str, float] | None = None
+    entity_feature_adapter_component_versions: dict[str, str] | None = None
     value_training_component_ids: list[str] = []
     value_training_scope_explicit = False
     aux_subgoal_component_ids: list[str] = []
@@ -3742,6 +3758,34 @@ def _preflight_memmap_composite_descriptor(path: str | Path) -> dict[str, object
                     )
                 stored_policy_component_temperatures[component_id] = float(
                     raw_temperature
+                )
+        raw_adapter_versions = descriptor.get(
+            "entity_feature_adapter_component_versions"
+        )
+        if raw_adapter_versions is not None:
+            if (
+                not isinstance(raw_adapter_versions, dict)
+                or set(raw_adapter_versions) != set(component_ids)
+            ):
+                raise SystemExit(
+                    "memmap composite v2 entity-adapter versions must bind "
+                    "every component id exactly"
+                )
+            entity_feature_adapter_component_versions = {}
+            for component_id in component_ids:
+                try:
+                    version = require_known_entity_feature_adapter(
+                        raw_adapter_versions[component_id]
+                    )
+                except ValueError as error:
+                    raise SystemExit(
+                        "memmap composite v2 entity-adapter version is invalid "
+                        f"for {component_id!r}: {error}"
+                    ) from error
+                entity_feature_adapter_component_versions[component_id] = version
+            if len(set(entity_feature_adapter_component_versions.values())) != 1:
+                raise SystemExit(
+                    "memmap composite v2 cannot mix entity feature adapter semantics"
                 )
         raw_value_ids = descriptor.get("value_training_component_ids", component_ids)
         if (
@@ -3998,6 +4042,9 @@ def _preflight_memmap_composite_descriptor(path: str | Path) -> dict[str, object
         "policy_aux_phase_sampling_weights": policy_aux_phase_sampling_weights,
         "stored_policy_component_temperatures": (
             stored_policy_component_temperatures
+        ),
+        "entity_feature_adapter_component_versions": (
+            entity_feature_adapter_component_versions
         ),
         "value_training_component_ids": value_training_component_ids,
         "value_training_scope_explicit": value_training_scope_explicit,
@@ -7945,6 +7992,18 @@ def main(argv: Sequence[str] | None = None) -> None:
         )
     if int(args.max_steps) < 0:
         raise SystemExit("--max-steps must be >= 0")
+    checkpoint_steps = _parse_checkpoint_steps(
+        args.checkpoint_steps, max_steps=int(args.max_steps)
+    )
+    # Snapshots are immutable evidence from one trajectory, not overwriteable
+    # convenience outputs. Refuse before model/data work if a requested path is
+    # already occupied.
+    for step in checkpoint_steps:
+        snapshot_path = _step_checkpoint_path(args.checkpoint, step)
+        if snapshot_path.exists() or snapshot_path.is_symlink():
+            raise SystemExit(
+                f"intermediate checkpoint path already exists: {snapshot_path}"
+            )
     if int(args.policy_aux_active_batch_size) < 0:
         raise SystemExit("--policy-aux-active-batch-size must be >= 0")
     if int(args.policy_aux_active_batch_size) > 0:
@@ -9544,6 +9603,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     optimizer_pre_clip_grad_norm_sum = 0.0
     optimizer_pre_clip_grad_norm_max = 0.0
     total_training_steps = int(args.max_steps) if int(args.max_steps) > 0 else 0
+    intermediate_checkpoints: list[dict[str, object]] = []
+    saved_checkpoint_steps: set[int] = set()
     # C1 gradient accumulation. accum==1 (default) preserves the pre-C1 path
     # exactly: every micro-batch zero-grads, backwards the undivided loss, clips,
     # and steps, and global_step (== optimizer steps) advances once per batch.
@@ -10161,6 +10222,75 @@ def main(argv: Sequence[str] | None = None) -> None:
                 accum_do_step=accum_do_step,
                 optimizer_step_applied=optimizer_step_applied,
             )
+            if (
+                global_step in checkpoint_steps
+                and global_step not in saved_checkpoint_steps
+            ):
+                # These are model-selection snapshots from the SAME optimizer
+                # trajectory.  They deliberately have no optimizer sidecar so
+                # nobody can accidentally turn step 64/96 into a chained second
+                # production dose.  The terminal checkpoint remains the sole
+                # resumable checkpoint set.
+                snapshot_path = _step_checkpoint_path(args.checkpoint, global_step)
+                snapshot_scalar_weight = cumulative_scalar_training_weight + (
+                    _reduce_scalar_sum(
+                        float(epoch_extra_denominators["value_loss"]), ddp
+                    )
+                )
+                snapshot_categorical_weight = (
+                    cumulative_categorical_training_weight
+                    + _reduce_scalar_sum(
+                        float(epoch_extra_denominators["value_categorical_loss"]),
+                        ddp,
+                    )
+                )
+                checkpoint_model = getattr(policy.model, "module", policy.model)
+                checkout_runtime_binding = _assert_checkout_runtime_binding()
+                args.checkout_runtime_binding = checkout_runtime_binding
+                snapshot_value_training = _value_training_metadata(
+                    args,
+                    scalar_weight=resolved_scalar_value_weight,
+                    categorical_weight=resolved_categorical_value_weight,
+                    categorical_bins=int(
+                        getattr(checkpoint_model, "value_categorical_bins", 0) or 0
+                    ),
+                    optimizer_steps=global_step,
+                    completed_epochs=epoch,
+                    scalar_training_weight_sum=snapshot_scalar_weight,
+                    categorical_training_weight_sum=snapshot_categorical_weight,
+                )
+                snapshot_value_training["intermediate_checkpoint"] = {
+                    "schema_version": "train-bc-intermediate-checkpoint-v1",
+                    "optimizer_step": int(global_step),
+                    "same_training_trajectory": True,
+                    "optimizer_sidecar_intentionally_omitted": True,
+                }
+                _save_policy(
+                    policy,
+                    str(snapshot_path),
+                    ddp,
+                    mask_hidden_info=bool(args.mask_hidden_info),
+                    soft_target_source=args.soft_target_source,
+                    value_training=snapshot_value_training,
+                    training_information_surface=training_information_surface,
+                )
+                if bool(ddp["enabled"]):
+                    import torch.distributed as dist
+
+                    dist.barrier()
+                if int(ddp["rank"]) == 0:
+                    intermediate_checkpoints.append(
+                        {
+                            "schema_version": "train-bc-intermediate-checkpoint-v1",
+                            "optimizer_step": int(global_step),
+                            "checkpoint": str(snapshot_path),
+                            "checkpoint_sha256": _sha256_existing_file(snapshot_path),
+                            "size_bytes": int(snapshot_path.stat().st_size),
+                            "same_training_trajectory": True,
+                            "optimizer_sidecar": None,
+                        }
+                    )
+                saved_checkpoint_steps.add(global_step)
             if args.progress_every_batches and batch_number % int(args.progress_every_batches) == 0:
                 _rank0_print(
                     json.dumps(
@@ -10574,6 +10704,11 @@ def main(argv: Sequence[str] | None = None) -> None:
     # collective full-state-dict gather for FSDP (C1). MUST stay unconditional --
     # the FSDP gather is collective, so wrapping in `if rank==0` would deadlock/skip
     # it. OPT-8 soft_target_source provenance kwarg threaded in (recorded in metadata).
+    if saved_checkpoint_steps != set(checkpoint_steps):
+        raise RuntimeError(
+            "training ended before every requested intermediate checkpoint was saved: "
+            f"requested={list(checkpoint_steps)} saved={sorted(saved_checkpoint_steps)}"
+        )
     checkpoint_model = getattr(policy.model, "module", policy.model)
     # The durable identity is the complete runtime actually loaded by the end of
     # training, not merely the smaller module set present during argument parsing.
@@ -10870,6 +11005,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         ),
         "training_information_surface": training_information_surface,
         "checkpoint": args.checkpoint,
+        "checkpoint_steps_requested": list(checkpoint_steps),
+        "intermediate_checkpoints": intermediate_checkpoints,
         "init_checkpoint": args.init_checkpoint or None,
         "init_checkpoint_sha256": str(args.init_checkpoint_sha256) or None,
         "a1_curriculum_parent": getattr(args, "a1_curriculum_parent", None),
@@ -11086,6 +11223,14 @@ def main(argv: Sequence[str] | None = None) -> None:
                 ),
                 "policy_aux_phase_sampling_weights": a1_preflight_meta.get(
                     "policy_aux_phase_sampling_weights"
+                ),
+                "stored_policy_component_temperatures": a1_preflight_meta.get(
+                    "stored_policy_component_temperatures"
+                ),
+                "entity_feature_adapter_component_versions": (
+                    a1_preflight_meta.get(
+                        "entity_feature_adapter_component_versions"
+                    )
                 ),
                 "value_training_component_ids": a1_preflight_meta.get(
                     "value_training_component_ids", []
@@ -14862,8 +15007,20 @@ def load_teacher_data_memmap(
         components = authenticated["components"]
         assert isinstance(components, list)
         dirs = [Path(str(component["corpus_dir"])) for component in components]
+        adapter_versions_by_component = authenticated.get(
+            "entity_feature_adapter_component_versions"
+        )
         corpus = ConcatMemmapCorpus(
-            [MemmapCorpus(component_dir) for component_dir in dirs], dirs=dirs
+            [MemmapCorpus(component_dir) for component_dir in dirs],
+            dirs=dirs,
+            component_adapter_versions=(
+                None
+                if adapter_versions_by_component is None
+                else [
+                    str(adapter_versions_by_component[component_id])
+                    for component_id in authenticated["component_ids"]
+                ]
+            ),
         )
         if authenticated["schema_version"] == "memmap_composite_v2":
             corpus.component_ids = tuple(authenticated["component_ids"])
@@ -14958,6 +15115,18 @@ def load_teacher_data_memmap(
             "component_ids": list(getattr(corpus, "component_ids", tuple())),
             "stored_policy_component_temperatures": getattr(
                 corpus, "stored_policy_component_temperatures", None
+            ),
+            "entity_feature_adapter_component_versions": (
+                None
+                if getattr(corpus, "component_adapter_versions", None) is None
+                else {
+                    component_id: version
+                    for component_id, version in zip(
+                        corpus.component_ids,
+                        corpus.component_adapter_versions,
+                        strict=True,
+                    )
+                }
             ),
         })
     print(json.dumps(load_event, sort_keys=True), flush=True)
@@ -21230,6 +21399,43 @@ def _epoch_checkpoint_path(checkpoint: str, epoch: int) -> Path:
     suffix = "".join(path.suffixes) or ".pt"
     stem = path.name[: -len(suffix)] if path.name.endswith(suffix) else path.stem
     return path.with_name(f"{stem}_epoch{epoch:04d}{suffix}")
+
+
+def _step_checkpoint_path(checkpoint: str | Path, step: int) -> Path:
+    """Return the model-only checkpoint path for one optimizer-step snapshot."""
+
+    path = Path(checkpoint)
+    suffix = "".join(path.suffixes) or ".pt"
+    stem = path.name[: -len(suffix)] if path.name.endswith(suffix) else path.stem
+    return path.with_name(f"{stem}_step{int(step):04d}{suffix}")
+
+
+def _parse_checkpoint_steps(raw: str, *, max_steps: int) -> tuple[int, ...]:
+    """Parse a canonical, strictly increasing set of intermediate steps."""
+
+    value = str(raw or "").strip()
+    if not value:
+        return ()
+    try:
+        steps = tuple(int(part.strip()) for part in value.split(","))
+    except ValueError as error:
+        raise SystemExit("--checkpoint-steps must be comma-separated integers") from error
+    if (
+        not steps
+        or any(step <= 0 for step in steps)
+        or tuple(sorted(set(steps))) != steps
+    ):
+        raise SystemExit(
+            "--checkpoint-steps must be unique positive integers in increasing order"
+        )
+    if int(max_steps) <= 0:
+        raise SystemExit("--checkpoint-steps requires a positive --max-steps")
+    if any(step >= int(max_steps) for step in steps):
+        raise SystemExit(
+            "--checkpoint-steps must be strictly below --max-steps; the terminal "
+            "checkpoint already represents --max-steps"
+        )
+    return steps
 
 
 def _acquire_host_train_lock(lock_file: str, ddp: dict[str, int | bool]):

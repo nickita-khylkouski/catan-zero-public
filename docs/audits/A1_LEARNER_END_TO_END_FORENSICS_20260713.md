@@ -506,6 +506,32 @@ next one-axis arm must independently reload exact f7, use the identical sampled
 rows/order and selected dose, and evaluate against exact f7 under the same
 deployed search operator.
 
+The ordinary production executor now retains model-only step-64 and step-96
+snapshots on the same fresh-Adam trajectory as the terminal step-128 model.
+Promotion does not infer an early stop from filenames or accept a resumed
+candidate. An explicit `a1-same-trajectory-checkpoint-selection-v1` receipt
+must bind the original one-dose receipt, terminal report, exact selected bytes,
+and immutable matched-screen evidence. The screen is diagnostic only and its
+source must appear in the cohort-exclusions manifest, so the full promotion
+gate uses fresh games. Promotion replay also accepts only the exact authenticated
+`b200-8gpu-ddp` geometry (GPUs 0-7, 8x512, global batch 4096, one canonical
+torchrun wrapper, allowlisted child environment, and a start-time-valid DDP
+canary); the historical single-GPU receipt remains a separate exact path.
+Create the immutable selector with:
+
+```bash
+python tools/a1_promotion_transaction.py select-dose \
+  --training-receipt /abs/one-dose.receipt.json \
+  --training-report /abs/train.report.json \
+  --screen-evidence /abs/matched-quick-screen.json \
+  --selected-optimizer-step 64 \
+  --output /abs/checkpoint-selection.json
+```
+
+The adjudication candidate then includes that output as
+`training_checkpoint_selection`; its `path` and file `sha256` are part of the
+adjudication semantic digest.
+
 ### P2 — highest-information learner arms
 
 The matched screen selected the 524,288-row / 128-step dose above. Offline loss

@@ -230,6 +230,11 @@ class _ConcatColumn:
                 merged[str(category)] = merged.get(str(category), 0) + int(count)
         return merged
 
+    def present_values(self) -> set[str]:
+        if self.supports_value_counts:
+            return set(self.value_counts())
+        return set(map(str, np.unique(np.asarray(self)).tolist()))
+
 
 class _ConstantColumn:
     """Lazy scalar column used for semantically absent optional targets."""
@@ -249,6 +254,17 @@ class _ConstantColumn:
         if scalar:
             return np.asarray(self._value, dtype=self.dtype)
         return np.full(indices.shape, self._value, dtype=self.dtype)
+
+    def present_values(self) -> set[str]:
+        return {str(self._value)} if self._n else set()
+
+    def value_counts(self, index: Any = None) -> dict[str, int]:
+        if index is None:
+            count = self._n
+        else:
+            indices, scalar = _normalize_global_index(index, self._n)
+            count = 1 if scalar else int(indices.size)
+        return {str(self._value): count} if count else {}
 
 
 class _DerivedBooleanColumn:
@@ -304,6 +320,7 @@ class ConcatMemmapCorpus:
         corpora: Sequence[Any],
         *,
         dirs: Sequence[str | Path] | None = None,
+        component_adapter_versions: Sequence[str] | None = None,
     ) -> None:
         if len(corpora) < 2:
             raise SystemExit("composite memmap corpus requires at least two components")
@@ -314,12 +331,28 @@ class ConcatMemmapCorpus:
         if self.component_dirs and len(self.component_dirs) != len(self.corpora):
             raise SystemExit("component directory count differs from corpus count")
 
+        adapter_versions = (
+            None
+            if component_adapter_versions is None
+            else tuple(str(value or "") for value in component_adapter_versions)
+        )
+        if adapter_versions is not None and (
+            len(adapter_versions) != len(self.corpora)
+            or any(not value for value in adapter_versions)
+        ):
+            raise SystemExit(
+                "component adapter-version count/value differs from corpus components"
+            )
+
         first = self.corpora[0]
         component_key_sets = [set(corpus.keys()) for corpus in self.corpora]
         union_keys = set.union(*component_key_sets)
+        if adapter_versions is not None:
+            union_keys.add("adapter_version")
         common_keys = set.intersection(*component_key_sets)
         missing_keys = union_keys - common_keys
-        unsupported_missing = missing_keys - SYNTHESIZABLE_COLUMNS
+        adapter_backfill = {"adapter_version"} if adapter_versions is not None else set()
+        unsupported_missing = missing_keys - SYNTHESIZABLE_COLUMNS - adapter_backfill
         if unsupported_missing:
             raise SystemExit(
                 "memmap components are not schema-compatible: unsupported missing "
@@ -339,6 +372,8 @@ class ConcatMemmapCorpus:
                     for part, keys in zip(self.corpora, component_key_sets, strict=True)
                     if key in keys
                 ]
+                if not present_schemas and key == "adapter_version" and adapter_versions:
+                    continue
                 if any(
                     _semantic_column_schema(schema)
                     != _semantic_column_schema(present_schemas[0])
@@ -373,10 +408,19 @@ class ConcatMemmapCorpus:
         self.aux_subgoal_scope_authenticated = False
         self.legal_width = int(first.legal_width)
         self._columns = {
-            key: next(
-                corpus._columns[key]
-                for corpus, keys in zip(self.corpora, component_key_sets, strict=True)
-                if key in keys
+            key: (
+                next(
+                    corpus._columns[key]
+                    for corpus, keys in zip(
+                        self.corpora, component_key_sets, strict=True
+                    )
+                    if key in keys
+                )
+                if any(key in keys for keys in component_key_sets)
+                else {
+                    "kind": "string",
+                    "dtype": f"<U{max(map(len, adapter_versions or ('',)))}",
+                }
             )
             for key in first_keys
         }
@@ -389,10 +433,33 @@ class ConcatMemmapCorpus:
         self._lazy: dict[str, _ConcatColumn] = {}
         row_counts = [int(corpus.row_count) for corpus in self.corpora]
         for key in first_keys:
-            columns = [
-                corpus[key] if key in keys else _synthesized_column(corpus, key)
-                for corpus, keys in zip(self.corpora, component_key_sets, strict=True)
-            ]
+            columns = []
+            for index, (corpus, keys) in enumerate(
+                zip(self.corpora, component_key_sets, strict=True)
+            ):
+                if key in keys:
+                    column = corpus[key]
+                    if key == "adapter_version" and adapter_versions is not None:
+                        present = (
+                            column.present_values()
+                            if callable(getattr(column, "present_values", None))
+                            else set(map(str, np.unique(np.asarray(column)).tolist()))
+                        )
+                        if present != {adapter_versions[index]}:
+                            raise SystemExit(
+                                "component adapter-version descriptor differs from "
+                                f"stored rows: component={index} "
+                                f"descriptor={adapter_versions[index]!r} "
+                                f"stored={sorted(present)}"
+                            )
+                elif key == "adapter_version" and adapter_versions is not None:
+                    value = adapter_versions[index]
+                    column = _ConstantColumn(
+                        corpus.row_count, value, f"<U{max(1, len(value))}"
+                    )
+                else:
+                    column = _synthesized_column(corpus, key)
+                columns.append(column)
             column = _ConcatColumn(columns, row_counts)
             destination = (
                 self._lazy
@@ -422,6 +489,7 @@ class ConcatMemmapCorpus:
         self.stats = {
             "components": [getattr(corpus, "stats", {}) for corpus in self.corpora]
         }
+        self.component_adapter_versions = adapter_versions
 
     def __contains__(self, key: str) -> bool:
         return key in self._eager or key in self._lazy

@@ -90,9 +90,13 @@ No recovered-wave candidate is auto-promoted. The gate is conjunctive:
 2. a separate, fresh, fixed 300-pair f7 panel at base seed `6_199_100_000`;
    f7 H0 vetoes promotion, while H1 or `continue` passes the veto.
 
-The two cohorts must be exact, fresh, and disjoint. Build the replayable gate
-authority with `tools/a1_v5_recovery_gate.py`. Its output is promotion-eligible
-only as a manual recovery authority; `auto_promotion` remains false.
+The two cohorts must be exact, fresh, and disjoint from each other and from all
+prior diagnostic/selection cohorts. Pass the same candidate-bound
+cohort-exclusions manifest used by the ordinary gate to
+`tools/a1_v5_recovery_gate.py`; the recovery gate replays it against both the
+ordinary final intervals and the fixed f7 veto interval. Its output is
+promotion-eligible only as a manual recovery authority; `auto_promotion`
+remains false.
 
 ## No-wave rule
 

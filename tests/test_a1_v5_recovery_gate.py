@@ -47,6 +47,7 @@ def gate_inputs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, An
     contract_path = _write(tmp_path / "contract.json", {})
     adjudication_path = _write(tmp_path / "adjudication.json", {})
     training_path = _write(tmp_path / "training.json", {})
+    cohort_exclusions_path = _write(tmp_path / "cohort-exclusions.json", {})
     games = [
         {
             "pair_id": pair,
@@ -118,10 +119,34 @@ def gate_inputs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, An
     def fake_h2h(_payload: dict[str, Any], **kwargs: Any) -> None:
         observed["h2h"] = kwargs
 
+    def fake_cohort_exclusions(
+        path: Path,
+        *,
+        contract_sha256: str,
+        candidate_sha256: str,
+        final_intervals: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        observed["cohort_exclusions"] = {
+            "path": path,
+            "contract_sha256": contract_sha256,
+            "candidate_sha256": candidate_sha256,
+            "final_intervals": final_intervals,
+        }
+        return {
+            "manifest": {"path": str(path), "sha256": _sha(path)},
+            "final_seed_intervals": final_intervals,
+            "overlap_count": 0,
+        }
+
     monkeypatch.setattr(promotion, "_verify_contract_with_snapshot", fake_contract)
     monkeypatch.setattr(promotion, "_verify_adjudication", fake_adjudication)
     monkeypatch.setattr(promotion, "_verify_internal_h2h_source", fake_h2h)
     monkeypatch.setattr(promotion, "_verify_internal_h2h_cohort", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        promotion,
+        "_verify_cohort_exclusions",
+        fake_cohort_exclusions,
+    )
     monkeypatch.setattr(
         promotion,
         "_sealed_evaluation_semantics",
@@ -133,6 +158,7 @@ def gate_inputs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, An
             "contract_lock_path": contract_path,
             "standard_adjudication_path": adjudication_path,
             "training_receipt_path": training_path,
+            "cohort_exclusions_path": cohort_exclusions_path,
             "registry_path": registry_path,
             "current_pointer_path": pointer,
             "f7_nonregression_report_path": report_path,
@@ -172,6 +198,20 @@ def test_dual_gate_reuses_full_adjudication_and_fixed_f7_veto(
     assert h2h["comparison_mode"] == gate.F7_COMPARISON_MODE
     assert h2h["verdict_policy"] == "non_regression_veto"
     assert h2h["required_n_full"] == 128
+    cohort = gate_inputs["observed"]["cohort_exclusions"]
+    assert cohort["contract_sha256"] == "sha256:" + "a" * 64
+    assert cohort["candidate_sha256"] == _sha(
+        Path(gate_inputs["verified"]["candidate"]["path"])
+    )
+    assert cohort["final_intervals"] == [
+        *gate_inputs["verified"]["final_cohort_intervals"],
+        {
+            "kind": "f7_non_regression_veto",
+            "base_seed": gate.F7_VETO_BASE_SEED,
+            "end_seed": gate.F7_VETO_BASE_SEED
+            + gate.F7_VETO_COMPLETE_PAIRS,
+        },
+    ]
 
     output = tmp_path / "authority.json"
     written = gate.write_recovery_gate_authority(
@@ -213,6 +253,19 @@ def test_f7_cohort_must_be_exact_and_disjoint(gate_inputs: dict[str, Any]) -> No
         }
     ]
     with pytest.raises(gate.RecoveryGateError, match="overlaps ordinary gate"):
+        _verify(gate_inputs)
+
+
+def test_recovery_gate_refuses_prior_cohort_reuse(
+    gate_inputs: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def refuse_reuse(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        raise promotion.PromotionError(
+            "final promotion cohort overlaps a prior diagnostic/adjudication cohort"
+        )
+
+    monkeypatch.setattr(promotion, "_verify_cohort_exclusions", refuse_reuse)
+    with pytest.raises(gate.RecoveryGateError, match="overlaps a prior diagnostic"):
         _verify(gate_inputs)
 
 

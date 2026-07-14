@@ -36,6 +36,10 @@ OPTIMIZER_STEPS = 128
 GLOBAL_DRAWS = WORLD_SIZE * LOCAL_BATCH * OPTIMIZER_STEPS
 DEFAULT_VISIBLE_DEVICES = (0, 1, 2, 3)
 POLICY_AUX_VISIBLE_DEVICES = (4, 5, 6, 7)
+# Historical promotion receipts named this placement after the eight-rank
+# AUX64 dose.  Retain the explicit identity while the current four-rank
+# operator expresses its equivalent active-row budget separately.
+AUX64_VISIBLE_DEVICES = POLICY_AUX_VISIBLE_DEVICES
 # Four ranks need 128 active rows/rank to reproduce the experimentally selected
 # eight-rank AUX64 global policy-active dose (512 rows/update).
 AUTHORIZED_POLICY_AUX_ACTIVE_BATCH_SIZES = frozenset((0, 128))

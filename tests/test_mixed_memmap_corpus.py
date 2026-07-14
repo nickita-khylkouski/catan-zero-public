@@ -220,6 +220,33 @@ def test_unknown_missing_column_still_fails_closed():
         module.ConcatMemmapCorpus([left, right])
 
 
+def test_authenticated_adapter_version_backfills_only_legacy_component():
+    module = _module()
+    version = "rust_entity_adapter_v2_land_topology_ports_maritime"
+    current = _Corpus(0, 2)
+    current._eager["adapter_version"] = np.full(2, version, dtype="U64")
+    current._columns["adapter_version"] = {
+        "kind": "string",
+        "dtype": "int32",
+        "categories": [version],
+    }
+    legacy = _Corpus(2, 3)
+
+    with pytest.raises(SystemExit, match="unsupported missing columns"):
+        module.ConcatMemmapCorpus([current, legacy])
+
+    mixed = module.ConcatMemmapCorpus(
+        [current, legacy], component_adapter_versions=[version, version]
+    )
+    assert mixed["adapter_version"].present_values() == {version}
+    assert np.asarray(mixed["adapter_version"]).tolist() == [version] * 5
+
+    with pytest.raises(SystemExit, match="descriptor differs from stored rows"):
+        module.ConcatMemmapCorpus(
+            [current, legacy], component_adapter_versions=["wrong", "wrong"]
+        )
+
+
 def test_invalid_indices_match_numpy_fail_closed_behavior(composite):
     mixed, _, _ = composite
     with pytest.raises(IndexError):

@@ -10,6 +10,7 @@ from tools import a1_build_post_wave_composite as builder
 from tools import a1_one_dose_train
 from tools import a1_pre_wave_contract as contract
 from tools import a1_seal_historical_replay_component as historical_sealer
+from catan_zero.rl.entity_feature_adapter import CURRENT_RUST_ENTITY_ADAPTER_VERSION
 
 
 def _lock(tmp_path: Path) -> dict:
@@ -168,6 +169,9 @@ def _write_training_source(
         "truncated": np.zeros(rows, dtype=bool),
         "policy_weight_multiplier": np.tile(
             np.asarray([1.0, 0.0], dtype=np.float32), game_count
+        ),
+        "adapter_version": np.full(
+            rows, CURRENT_RUST_ENTITY_ADAPTER_VERSION, dtype="U64"
         ),
         "aux_longest_road": np.zeros(rows, dtype=np.float32),
         "aux_largest_army": np.zeros(rows, dtype=np.float32),
@@ -539,7 +543,17 @@ def test_descriptor_preserves_nested_fresh_mix_and_historical_replay(
         )
         corpus_dir = tmp_path / f"{category}.corpus"
         corpus_dir.mkdir()
-        corpus_meta = {"row_count": 2}
+        corpus_meta = {
+            "row_count": 2,
+            "schema": "memmap_corpus_v1",
+            "legal_width": 2,
+            "columns": {
+                "adapter_version": {
+                    "kind": "string",
+                    "categories": [CURRENT_RUST_ENTITY_ADAPTER_VERSION],
+                }
+            },
+        }
         if category != builder.HISTORICAL_REPLAY_CATEGORY:
             corpus_meta["aux_subgoal_target_contract"] = {
                 "version_key": "aux_subgoal_target_version",
@@ -569,6 +583,15 @@ def test_descriptor_preserves_nested_fresh_mix_and_historical_replay(
                     "mean_game_policy_weight_multiplier": 0.5,
                 },
                 "corpus_dir": str(corpus_dir),
+                **(
+                    {
+                        "entity_feature_adapter_version": (
+                            CURRENT_RUST_ENTITY_ADAPTER_VERSION
+                        )
+                    }
+                    if category == builder.HISTORICAL_REPLAY_CATEGORY
+                    else {}
+                ),
             }
         )
     producer = tmp_path / "producer.pt"
@@ -604,6 +627,21 @@ def test_descriptor_preserves_nested_fresh_mix_and_historical_replay(
         "recent_history",
         "hard_negative",
     ]
+    assert descriptor["stored_policy_component_temperatures"] == {
+        "current_producer": 1.0,
+        "recent_history": 1.0,
+        "hard_negative": 1.0,
+        "historical_replay": 0.52,
+    }
+    assert descriptor["entity_feature_adapter_component_versions"] == {
+        component_id: CURRENT_RUST_ENTITY_ADAPTER_VERSION
+        for component_id in (
+            "current_producer",
+            "recent_history",
+            "hard_negative",
+            "historical_replay",
+        )
+    }
 
     stale_meta_path = tmp_path / "recent_history.corpus" / "corpus_meta.json"
     stale_meta = json.loads(stale_meta_path.read_text())
@@ -640,6 +678,15 @@ def test_real_memmap_composite_is_accepted_by_one_dose_trainer(
     lock = _lock(tmp_path)
     for job in lock["fleet"]["jobs"]:
         job["seed_end"] = int(job["base_seed"]) + 3
+    expected_games = {
+        "current_producer": 2,
+        "recent_history": 2,
+        "hard_negative": 2,
+    }
+    lock["game_contract"] = {
+        "total_complete_games": sum(expected_games.values()),
+        "category_games": dict(expected_games),
+    }
     lock.pop("contract_sha256")
     lock["contract_sha256"] = builder._digest(lock)  # noqa: SLF001
     producer = contract._producer(lock)  # noqa: SLF001
@@ -685,11 +732,6 @@ def test_real_memmap_composite_is_accepted_by_one_dose_trainer(
                 "category": job["category"],
             }
         )
-    expected_games = {
-        "current_producer": 2,
-        "recent_history": 2,
-        "hard_negative": 2,
-    }
     selected_path = tmp_path / "selected.json"
     selected_path.write_text(json.dumps(raw_selected), encoding="utf-8")
     selected = {
@@ -723,7 +765,6 @@ def test_real_memmap_composite_is_accepted_by_one_dose_trainer(
         audit_path=Path(str(audit["path"])),
         historical_component_path=historical_ref,
         output_root=output,
-        expected_games=expected_games,
     )
     descriptor_path = Path(str(receipt["descriptor"]["path"]))
     # A learner B200 receives the filtered composite and authority bundle, not

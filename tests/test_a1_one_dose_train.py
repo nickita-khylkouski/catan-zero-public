@@ -11,6 +11,7 @@ import pytest
 from tools import a1_one_dose_train as executor
 from tools import a1_pre_wave_contract as contract
 from catan_zero.rl.entity_token_policy import EntityGraphConfig
+from catan_zero.rl.entity_feature_adapter import CURRENT_RUST_ENTITY_ADAPTER_VERSION
 from catan_zero.rl.optim_state import save_training_progress
 
 
@@ -407,6 +408,13 @@ def _production_composite_meta(tmp_path: Path, producer_sha256: str) -> dict:
         "promotion_eligible": True,
         "component_ids": component_ids,
         "component_game_sampling_ratios": list(ratios.values()),
+        "stored_policy_component_temperatures": dict(
+            executor.composite_builder.STORED_POLICY_COMPONENT_TEMPERATURES
+        ),
+        "entity_feature_adapter_component_versions": {
+            component_id: CURRENT_RUST_ENTITY_ADAPTER_VERSION
+            for component_id in component_ids
+        },
         "production_mix_contract": contract_payload,
         "components": [
             {
@@ -640,6 +648,44 @@ def test_b200_8gpu_topology_preserves_global_batch_and_renders_torchrun(
     )
     assert executor._effective_global_batch_size(bound["recipe"]) == 4096
     assert executor._expected_optimizer_steps(bound) == 2
+
+
+def test_production_one_dose_emits_same_trajectory_dose_snapshots(
+    tmp_path: Path,
+) -> None:
+    verified = _verified(tmp_path)
+    verified["recipe"] = {
+        **verified["recipe"],
+        "max_steps": 128,
+        "batch_size": 512,
+        "world_size": 8,
+        "global_batch_size": 4096,
+        "training_rng_rank_offset": True,
+        "per_game_policy_weight": True,
+        "per_game_policy_weight_mode": "equal",
+    }
+    verified["data_kind"] = "production_composite_v2"
+
+    command = executor._build_direct_train_command(
+        verified,
+        python=Path(sys.executable),
+        checkpoint=tmp_path / "candidate.pt",
+        report=tmp_path / "report.json",
+    )
+
+    assert _option(command, "--checkpoint-steps") == "64,96"
+    assert executor.train_bc._parse_checkpoint_steps(
+        _option(command, "--checkpoint-steps"), max_steps=128
+    ) == (64, 96)
+
+
+def test_intermediate_checkpoint_steps_fail_closed() -> None:
+    assert executor.train_bc._parse_checkpoint_steps(
+        "64,96", max_steps=128
+    ) == (64, 96)
+    for raw in ("0", "64,64", "96,64", "128", "x"):
+        with pytest.raises(SystemExit):
+            executor.train_bc._parse_checkpoint_steps(raw, max_steps=128)
 
 
 def test_topology_wrapper_refuses_nested_torchrun(tmp_path: Path) -> None:

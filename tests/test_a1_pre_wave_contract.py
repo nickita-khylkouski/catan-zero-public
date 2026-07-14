@@ -1065,6 +1065,49 @@ def test_v3_balanced_jobs_have_exact_selected_and_bounded_attempt_totals(
     }
 
 
+def test_v3_64k_profile_is_exactly_1000_selected_games_per_gpu() -> None:
+    workers, _ = contract._canonical_workers_from_fleet_manifest(  # noqa: SLF001
+        contract.CURRENT_FLEET_MANIFEST
+    )
+
+    with pytest.raises(contract.ContractError, match="maximum 1008 attempts/worker"):
+        contract._build_balanced_jobs(  # noqa: SLF001
+            workers,
+            seed_base=560_000_000_000,
+            block_size=1_000,
+            output_root="/tmp/a1-scale-profile",
+            contract_id="a1-scale-profile",
+            quota_policy=contract.BALANCED_PER_LANE_64K_QUOTA_POLICY,
+        )
+
+    jobs, quotas = contract._build_balanced_jobs(  # noqa: SLF001
+        workers,
+        seed_base=560_000_000_000,
+        block_size=1_024,
+        output_root="/tmp/a1-scale-profile",
+        contract_id="a1-scale-profile",
+        quota_policy=contract.BALANCED_PER_LANE_64K_QUOTA_POLICY,
+    )
+
+    assert len(jobs) == 192
+    assert set(map(tuple, (quota.values() for quota in quotas.values()))) == {
+        (800, 150, 50)
+    }
+    assert all(sum(quota.values()) == 1_000 for quota in quotas.values())
+    assert {
+        category: sum(job["games"] for job in jobs if job["category"] == category)
+        for category in contract.SCALE_64K_GAMES
+    } == contract.SCALE_64K_GAMES
+    assert {
+        category: sum(job["attempts"] for job in jobs if job["category"] == category)
+        for category in contract.SCALE_64K_GAMES
+    } == {
+        "current_producer": 51_520,
+        "recent_history": 9_728,
+        "hard_negative": 3_264,
+    }
+
+
 def test_checked_in_relative_provenance_paths_canonicalize_to_required_files() -> None:
     payload = json.loads(TEMPLATE.read_text(encoding="utf-8"))
     provenance = payload["provenance"]
